@@ -15,10 +15,13 @@
 #   the IOCP calls are Win32 (6).
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
+# slates-vfs (0): the volume core is safe Rust over the arenas and slabs of slates-mem; the block
+#   layout is read and written through byte slices, never a cast.
 
 [budget]
 slates-machine = 43
 slates-mem = 4
 slates-rt = 16
+slates-vfs = 0
 slates-wire = 4
 slates-wire-derive = 0

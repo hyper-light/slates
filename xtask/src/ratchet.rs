@@ -35,6 +35,7 @@ const BENCHES: &[(&str, &str)] = &[
   ("slates-mem", "bench"),
   ("slates-rt", "bench"),
   ("slates-wire", "bench"),
+  ("slates-vfs", "bench"),
 ];
 
 /// One row of one run.

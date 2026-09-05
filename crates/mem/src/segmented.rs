@@ -135,6 +135,15 @@ impl<T> Segmented<T> {
     self.segments.iter().flat_map(|s| s.iter())
   }
 
+  /// Iterates the elements mutably with their indices.
+  pub fn iter_mut_indexed(&mut self) -> impl Iterator<Item = (usize, &mut T)> {
+    self
+      .segments
+      .iter_mut()
+      .flat_map(|s| s.iter_mut())
+      .enumerate()
+  }
+
   const fn split(&self, index: usize) -> (usize, usize) {
     (index >> self.shift, index & (self.segment_len - 1))
   }

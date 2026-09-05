@@ -1,0 +1,20 @@
+[package]
+name = "slates-vfs"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The copy-on-write volume core: namespace, inodes, content, snapshots, clones, accounting, journal (design §4.4, §4.5, D-4, D-5, D-6, D-13)."
+
+[dependencies]
+slates-machine = { workspace = true }
+slates-mem = { workspace = true }
+unicode-normalization = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

@@ -21,8 +21,8 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
 | Machine profile (4.1) | memory-and-system-awareness.md | yes | T-0.* | AC-0.3, 0.5 | yes | specced-untested |
 | Memory (4.2) | memory-and-system-awareness.md; arc-free-rust-architecture.md | yes | T-0.1, 0.2, 0.4, 0.5 | AC-0.4, 0.5 | yes | specced-untested |
 | Runtime (4.3) | low-latency-ipc-and-runtime.md; arc-free-rust-architecture.md | yes | T-0.3, 0.6-0.9 | AC-0.6-0.9 | yes | specced-untested |
-| Volume lifecycle (4.4) | cow-data-structures.md; edenfs-scale-distribution.md | yes | T-1.*, T-2.* | AC-1.*, AC-2.4 | yes | specced-untested |
-| Namespace and content (4.5) | cow-data-structures.md | yes | T-1.* | AC-1.* | yes | specced-untested |
+| Volume lifecycle (4.4) | cow-data-structures.md; edenfs-scale-distribution.md | yes | T-1.*, T-2.* | AC-1.*, AC-2.4 | yes | implemented in `slates-vfs` (Phase 1 tasks 1–9, §8c); AC-1.1, 1.3–1.8 gated; AC-1.2 waits on the Linux tmpfs lane |
+| Namespace and content (4.5) | cow-data-structures.md | yes | T-1.* | AC-1.* | yes | implemented (§8c): inline small directories, block tree, chunk windows, epoch histogram accounting; base plane and landing still specced-untested |
 | Bridges (4.6) | os-filesystem-bridge.md (§7-§8 FSKit) | yes | T-3.*, T-4.* | AC-3.*, AC-4.* | yes | specced-untested; macOS FSKit gated by the Phase 4 spike |
 | IPC (4.7) | low-latency-ipc-and-runtime.md | yes | T-2.* | AC-2.1-2.3, 2.6 | yes | specced-untested |
 | Database, registers and configuration (4.8) | database-design.md (§7); metadata-replication.md (A-6) | yes | T-2.*, T-8.* | AC-2.*, AC-8.* | yes | specced-untested; the register and reconfiguration protocols are model-checked (`models/`, see §10) |
@@ -128,6 +128,8 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
 - Rebase-retry rate on one path region above the derived threshold → the harness is told (contention control lives above the engine, as in hecate MERGE.md §10); slates never serializes work by itself.
 - Holder recomputation mismatch anywhere → not a tripwire: a bug; fatal in CI, alarm in production.
 - Merge-path p99 or verdict p99 change-point → nightly gate failure (Part 6).
+- Destroy slices past the step budget, the clock-check allowance and the measured jitter (the shard's watchdog count, §8c) → a release unit whose cost the weights do not see; re-derive `release_weight` before touching the budget.
+- Heap per file above the counted-object budget of the Phase 1 bench at any tree size → an object the formula does not name; add it to the formula, never to the slack.
 
 ## 8. External dependencies and port hazards
 
@@ -213,6 +215,60 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
   the IPC research §2.4), `memmap2` 0.9 (maps, advice, locks), `toml` (xtask only),
   `iai-callgrind` (dev only; pulls `proc-macro-error2` 2.0.1, which rustc warns will be rejected
   by a future version — a dev-only build dependency, tracked here until iai-callgrind drops it).
+
+## 8c. Phase 1 volume core record (2026-09-05)
+
+What landed: `slates-vfs` (tasks 1–9 of Phase 1): the copy-on-write namespace (radix-16 inode
+trie, directory nodes with an inline two-entry form and a copy-on-write B+-tree of 4 KiB
+slotted blocks in a store slab beyond it), content as chunk windows (open page-multiple extents
+sealed into chunks, copy-on-write per window, holes uncharged), snapshots and clones by birth
+epoch with deadlists and a pruned destroy walk, exact accounting as a histogram of content
+bytes by birth epoch (`referenced_bytes` is its total, `unique_bytes` its suffix past the newest
+shared epoch), bounded and dynamic quotas with pressure events, the op log with a byte budget,
+name folding without allocation, the executable model with proptest state-machine tests, the
+edge and fault tests, and the baseline bench with its three acceptance gates.
+
+Gates in place: AC-1.1 (the model over 10^6 generated operations, counted, `cargo test -p
+slates-vfs --release --test model -- --ignored ac_1_1` in CI), AC-1.3 (snapshot and clone cost
+flat from 10^3 to 10^6 files within the timer's resolution), AC-1.4 (five nodes copied for a
+create five levels down; one extent copied for a write; one page for a fresh window),
+AC-1.5 (heap per file against the counted-object formula at 10^3, 10^5, 10^6), AC-1.6 (inode
+numbers never reused, kept by snapshot and clone), AC-1.7 (both counters equal the model's
+after every generated step), AC-1.8 (destroy of 10^6 files in clock-cut slices; none past the
+budget plus the clock-check allowance plus the measured jitter); T-1.1, 1.2, 1.3, 1.4, 1.5,
+1.7, 1.8, 1.9 as named tests; T-1.6 in its one-shard form (a generated interleaving of two
+clones; the shuttle form arrives with Phase 2's threads).
+
+Open in Phase 1 (owed in this phase, in order): AC-1.2 the differential harness against tmpfs
+with the reviewed equivalence policy (`docs/wip/EQUIVALENCE.md`, Linux CI lane; a macOS RAM
+disk is a system-state change Ada has not authorized, so the local run skips loudly); task 14
+the deriver; task 10 `slates-base`; tasks 11–13 `slates-land`, its oracle and baselines.
+
+Deviations from the §4.5 text, each measured (BENCHMARKS.md, Phase 1 baseline) and applied to
+the design in A-7:
+- `DirNode.parent` is the parent's inode number, not a node handle, and every directory inode
+  carries `Body::Directory(current node)`: a handle held by a node shared with a snapshot goes
+  stale after a copy, and the model found the root losing entries when a stale parent was
+  copied (the second path copy rebuilt the root from the old node).
+- Every node carries its own name, so the path for the op log and the parent re-pointing after
+  a copy cost no scan of the parent.
+- The indexed representation is one tree keyed by `(hash, folded name)`; the hash side index
+  of D-4 is not built because the descent already probes by the leading hash word and the
+  measured lookup is the fold and the compare.
+- The ordered node is a 4 KiB block, not "entries per two cache lines": a block holds the
+  measured directory (36 entries of 49-byte names) whole, and it is the unit the slab hands
+  out and a copy moves; the small form is inline in the node up to the measured cut-over of 2.
+- Clone pins are released by the owner of both volumes (`Volume::unpin`), not by the clone's
+  destroy, because volumes hold no reference to each other (D-8: ownership by handle).
+- `destroy_step` takes a time budget on the volume's clock, not an object count, and weighs a
+  release by what it frees; the count form put 2.5% of slices over budget.
+- The write path charges the materialized delta of the chunk-window rule and the model encodes
+  that rule; a byte-precise charge left the counter drifting from the extents.
+
+Residual literals: none in `src/`; the bench's shape constants (files per directory, name
+bytes, groups, the 4 KiB block) carry their measurements. The example targets of the four
+benched crates share the name `bench`; cargo warns of the output collision and may make it an
+error, so a rename to `<crate>-bench` is owed before the Phase 2 crates add theirs.
 
 ## 9. Blocking order toward first light
 

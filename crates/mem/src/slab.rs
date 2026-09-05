@@ -54,6 +54,11 @@ impl<T> Slab<T> {
     self.len
   }
 
+  /// Slots the slab's segments hold, occupied or free: its memory in slots.
+  pub fn capacity(&self) -> usize {
+    self.slots.capacity()
+  }
+
   /// Whether no slot is occupied.
   pub const fn is_empty(&self) -> bool {
     self.len == 0
@@ -165,6 +170,27 @@ impl<T> Slab<T> {
       Body::Occupied(value) => Ok(value),
       Body::Vacant { .. } => Err(stale(handle)),
     }
+  }
+
+  /// Iterates live entries mutably as (handle, value).
+  pub fn iter_mut_all(&mut self) -> impl Iterator<Item = (Handle<T>, &mut T)> {
+    let generations: Vec<(usize, u32)> = self
+      .slots
+      .iter()
+      .enumerate()
+      .map(|(i, s)| (i, s.generation))
+      .collect();
+    self
+      .slots
+      .iter_mut_indexed()
+      .zip(generations)
+      .filter_map(|((_, slot), (i, generation))| match &mut slot.body {
+        Body::Occupied(value) => Some((
+          Handle::new(u32::try_from(i).unwrap_or(u32::MAX), generation),
+          value,
+        )),
+        Body::Vacant { .. } => None,
+      })
   }
 
   /// Iterates live entries as (handle, value).

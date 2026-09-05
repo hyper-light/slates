@@ -38,6 +38,8 @@ jobs:
         run: cargo xtask literals
       - name: Test
         run: cargo test --workspace
+      - name: AC-1.1 model suite over 10^6 generated operations
+        run: cargo test -p slates-vfs --release --test model -- --ignored ac_1_1
       # The ratchet skips loudly on a machine with no recorded baseline (shared runners have
       # none); on a reference machine with an entry in ratchets.toml it fails on a regression.
       - name: Ratchet

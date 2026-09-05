@@ -1,6 +1,6 @@
 # slates — unified design and phased implementation plan
 
-Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`); no code exists.
+Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 tasks 1–9 (the volume core, `slates-vfs`) are implemented and gated; the rest is design (GAPS §8c).
 This version integrates amendments A-1, A-2, A-4, A-5 and A-6 into the body; the amendment log at
 the end is history, and where the log and the body disagree, the body wins.
 Every decision below cites tiered evidence; every tunable is a measured derivation; every phase
@@ -981,11 +981,13 @@ case on a laptop and the host-pinned case in a fleet.
 
 **Data model.**
 ```rust
-struct DirNode { born: Epoch, entries: DirEntries, parent: Handle<DirNode>, inode: InodeNo,
+struct DirNode { born: Epoch, entries: DirEntries, parent: Option<InodeNo> /* resolved to the head's node through the inode table (A-7) */,
+                 inode: InodeNo, name: Box<str> /* its own name in the parent */,
                  base: BaseDirState /* None | Merged{listing: ListingRef} | Opaque */,
                  origin: Option<PathKey> /* redirect: the base path this directory was renamed from */ }
-enum DirEntries { Small(SortedArray<Entry>), Indexed(OrderedNodes, HashSideIndex) }
-struct Entry { name_hash: u64, name: NameRef, kind: Kind /* Dir | File | Symlink | Whiteout */, child: Handle<DirNode> | InodeNo }
+enum DirEntries { Small(InlineArray<Entry, 2> /* names inline, the measured cut-over */), Indexed(Tree /* CoW B+-tree of 4 KiB slotted blocks in the store's block slab, keyed by (hash, folded name); A-7 */) }
+struct Entry { name_hash: u64, name: NameRef /* into the node or the block */, kind: Kind /* Dir | File | Symlink | Whiteout */, child: Handle<DirNode> | InodeNo }
+enum Body { …, Directory(Handle<DirNode>) /* a directory inode names its current node (A-7) */ }
 struct Inode { no: InodeNo, gen: u32, kind, mode, uid, gid, nlink, size, atime, mtime, ctime, btime,
                body: Body, identity: Option<Blake3>, born: Epoch, flags }
 enum Body { Inline(SmallBytes), Extents(ExtentList), Open(OpenExtent, ExtentList), Symlink(NameRef),
@@ -3621,6 +3623,16 @@ Applied in the same change to: Part 0 (glossary), Part 1.1-1.4, Part 2.1, 2.3, 2
 - Departures, each argued in `research/merge-engine.md` §2 and D-27: the proposer is a leased, epoch-fenced standing writer on green's owner shard rather than a per-session Raft leader (one shared pointer group; partitioned single-writer execution; tripwired); the deriver composes declared operations only (resolving hecate's internal contradiction); splice by extent surgery over fixed page-multiple chunks; placement holders recompute; hard links and symlinks merged per path; validation as an opaque evidence policy; excluded subtrees instead of scratch volumes; no eg-walker.
 - Gaps found and closed in slates: the journal now records byte ranges and per-inode versions; POSIX overwrites and SDK inserts are distinct operation kinds; the SDK gains `edit`; whole-file rewrites conflict conservatively unless identical, and the skills say so; the `Green` and `Work` roles, the merge verbs and refusals exist; merge records are pointers; the fleet parts land in Phase 8.
 - What it does not change: the landing verdict of A-4 (entry-level, because the disk declares nothing); the replication model of A-2; the RAM-only rule; the refusal to resolve any conflict on the agent's behalf.
+
+### A-7 (accepted 2026-09-05) — Volume core as measured: parents by inode number, directory inodes naming their node, nodes carrying their name, an inline small form and a block tree, epoch-histogram accounting, clock-cut destroy slices
+Applied in the same change to: §4.5 (data model), D-4 (realized form), Phase 1 (status), GAPS §1, §7, §8c, BENCHMARKS (Phase 1 baseline), `crates/vfs`.
+- `DirNode.parent` is an inode number resolved through the inode table, and a directory inode's body names its current node; a node's handle held by a shared node goes stale after a copy-on-write copy, and the model-based suite found the root losing entries through such a link (`crates/vfs/tests/model.rs`, 2026-09-05).
+- A node carries its own name in its parent: path building for the op log and re-pointing a parent after a copy are constant, not a scan of the parent (create 2,209 → 1,417 ns in a tree with 434-entry group directories).
+- `DirEntries::Indexed` is a copy-on-write B+-tree of 4 KiB slotted blocks in a slab of the store (`crates/vfs/src/dirtree.rs`), keyed by `(hash, folded name)`; D-4's hash side index is not built (the descent probes by the hash word; the measured lookup is the fold and the compare); the ordered node is a block, not two cache lines, because the measured directory fits one block and the block is what the slab hands out and a copy moves. `Small` is inline in the node up to the measured cut-over (2 entries, 98 name bytes). Measured and rejected: the standard map with heap names (two 2.5 ms `dealloc` stalls per 10^6-file destroy; one name stored twice), and a heap name buffer per directory (growth slack). Numbers in BENCHMARKS.md.
+- Accounting is a histogram of head-reachable content bytes by birth epoch; `referenced_bytes` is its total and `unique_bytes` its suffix past the newest shared epoch (last snapshot or clone origin); a clone starts with its inheritance in one bucket at the origin. Destroying a snapshot needs no recount. The write charge is the materialized delta under the chunk-window rule, which the model encodes.
+- `destroy_step` takes a budget in nanoseconds of the volume's clock and weighs releases by what they free; a clone's destroy walks only nodes born after its origin (the ZFS pruned traversal).
+- Clone pins on a snapshot are released by the owner of both volumes through `Volume::unpin`; a pinned snapshot's destroy is the typed refusal `Pinned` (`EBUSY`).
+- What it does not change: the birth-epoch rule, deadlists, the chunk rule, quotas, the op log, the base plane, landing, the merge verdict.
 
 ### A-6 (accepted 2026-09-04) — Authority and durability: Vertical Paxos II with copyset neighbourhoods, one quorum rule with hedged placement, route by id, per-operation durability scope over mirroring, ownership follows the writer, model-checked
 Applied in the same change to: Part 0 (glossary), Part 1.4, Part 2.1, 2.3, 2.6, D-14 (rewritten), D-16, D-18, D-27, §4.4, §4.8 (rewritten), §4.9, §4.10 (rewritten), §4.16, Phase 2, Phase 8 (rewritten), Part 6, Part 7, Appendix B.6, GAPS, README, `research/metadata-replication.md` (new), `docs/wip/models/` (new).

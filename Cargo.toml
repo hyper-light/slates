@@ -16,6 +16,7 @@ slates-machine = { path = "crates/machine", version = "0.1.0", default-features 
 slates-mem = { path = "crates/mem", version = "0.1.0" }
 slates-rt = { path = "crates/rt", version = "0.1.0" }
 slates-wire = { path = "crates/wire", version = "0.1.0" }
+slates-vfs = { path = "crates/vfs", version = "0.1.0" }
 slates-wire-derive = { path = "crates/wire-derive", version = "0.1.0" }
 
 # Third-party versions are pinned once here. Exact `=` pins only where an ABI contract is
@@ -51,6 +52,10 @@ quote = "1"
 proc-macro2 = "1"
 # Compile-fail tests for the derive's refusals (dev only).
 trybuild = "1"
+# Name folding for the per-volume equivalence policy (APFS folds by normalization and case).
+unicode-normalization = "0.1"
+# Model-based tests with shrinking (D-20; the design names proptest).
+proptest = "1"
 # Instruction-count benches under valgrind (dev only; the runner version must match).
 iai-callgrind = "=0.16.1"
 # ratchets.toml (dev only, in xtask).

@@ -145,6 +145,65 @@ obvious Phase 1 trim (encode into the ring's slot, as §4.7 has it). CRC32C at 6
 single-chain rate of the instruction; a three-way interleave would raise it and Phase 7 measures
 whether the bulk path needs it, though bulk carries the BLAKE3 identity instead (§4.9).
 
+## Phase 1 baseline: the volume core (2026-09-05)
+
+Environment: as above (Apple M5 Max, macOS 26.4.1, Rust 1.98.0, release profile, mains power,
+thread not pinned: macOS refuses affinity on Apple silicon). Command:
+`cargo run --release -p slates-vfs --example bench` (500 ms budget per row; 95% bootstrap
+intervals; heap measured through a counting global allocator in the bench binary; the volume's
+clock is the host clock). Trees have the shape of a `cargo build` output tree measured on this
+workspace: 36 files per directory (40,052 files in 1,117 directories under `target/debug`) and
+49-byte names (the mean over 42,155 files), in 64 groups of leaf directories. The op log
+budget is 64 KiB so it is full at every size and each mutation pays the same eviction.
+
+| Operation | 10^3 files | 10^5 files | 10^6 files | Interval / notes |
+|---|---|---|---|---|
+| Lookup one name in a 36-entry directory (fold policy) | 171 ns | 166 ns | | [171, 177]; [166, 166] |
+| Resolve a three-component path | 312 ns | 333 ns | | [312, 312]; [323, 333] |
+| Readdir of a 36-entry directory (rows borrow the names) | 406 ns | 406 ns | | [406, 427]; [396, 406] |
+| Create a file and unlink it | 1,583 ns | 1,500 ns | | [1,542, 1,666]; [1,500, 1,542]; includes the op-log record with its path |
+| Rename within a directory, there and back (two renames) | 2,750 ns | 2,667 ns | | [2,709, 2,791]; [2,666, 2,708] |
+| Write 4 KiB in place, same epoch | 395 ns | | | [395, 395] |
+| Read 4 KiB | 24 ns | | | [24, 24] |
+| Write 4 KiB into a fresh chunk window, then truncate it away | 666 ns | | | [646, 666]; one page from the buddy and back |
+| Snapshot and destroy the snapshot | 45 ns | 44 ns | 45 ns | [45, 46]; [42, 44]; [44, 46]; AC-1.3: growth 0 ns against the 11 ns timer resolution |
+| Clone and destroy the untouched clone | 265 ns | 260 ns | 244 ns | [265, 270]; [255, 260]; the destroy walk is pruned at the origin epoch |
+| Heap per file (slabs, blocks, names, trie, op log) | 697 B | 472 B | 468 B | AC-1.5 budgets from the counted-object formula: 921, 565, 561 B |
+| Build the tree | 1 ms | 107 ms | 1,038 ms | 1.04 µs per create at 10^6 |
+| Destroy, per release unit | | | 12 ns | 1,152,224 units in 1,932 slices |
+| Destroy slice under the shard's step budget (6,958 ns from the profile) | | | p50 7,083 ns, p99 8,167 ns, longest 24,042 ns | AC-1.8: 0 slices past budget + 16-unit clock-check allowance (6,000 ns) + measured scheduling jitter (16,500 ns); 0 ns of the longest inside `dealloc` |
+| Create burst of 190,000 files (T-1.7), best of 3 | | 1,050 ns per file | | all runs 1,050, 1,053, 1,088 ns; 469 heap bytes per file |
+
+The directory representation probe, from the same command (inline array against the block
+tree, both at the sizes shown; the cut-over is recorded as `dir::MEASURED_CUTOVER = 2`):
+
+| Directory | Lookup | Insert and remove |
+|---|---|---|
+| Inline, 2 entries | 91 ns [88, 91] | 80 ns [78, 85] |
+| Tree, 2 entries | 145 ns [145, 151] | 78 ns [78, 80] |
+| Tree, 4 entries | 156 ns [156, 156] | 75 ns [75, 80] |
+| Tree, 32 entries | 182 ns [177, 187] | 78 ns [78, 80] |
+| Tree, 128 entries (two blocks) | 203 ns [203, 208] | 140 ns [140, 145] |
+
+Measured and rejected on the way, same machine and day, each replaced in the same change:
+
+| Experiment | Reading | Why it lost |
+|---|---|---|
+| Name folding by collecting an NFC string per comparison | lookup 1,208–1,292 ns at every directory size | the fold dominated; the allocation-free fold with an ASCII fast path gives 104 ns on the same rows |
+| `BTreeMap<(hash, Box<str>), Entry>` for indexed directories | 552 B per file; every name stored twice | one copy of each name and a hash-keyed map: 465 B |
+| One `Box<str>` per name, map nodes from the global allocator | destroying 10^6 files: two slices of 2.4 and 2.7 ms, 2,668,955 of 2,698,667 ns inside `dealloc` | the allocator returning pages; blocks in a slab never return per item: longest slice 24 µs with 0 ns in `dealloc` |
+| One `Vec<u8>` name buffer per directory | 516 B per file (growth slack), create 2.2 µs | the block holds names and entries together and the small form is inline: 468 B, 1.04 µs |
+| Path building by scanning the parent for the child's handle | create 2,209 ns in a tree whose group directories hold 434 entries | the node carries its own name: 1,417 ns, and the parent re-pointing after a copy is one keyed update |
+| Snapshot removal by scanning every snapshot slot for `previous` links | snapshot and destroy 49–72 ns, rising with the slab's slot count | doubly linked records: 45 ns, flat across sizes |
+| Destroy slices counted in objects, calibrated on the first percent of the queue | slices of 199 objects; p99 121 µs because directory releases cost 30× a trie node | slices cut by the volume's clock against the step budget, weighted units: p99 8.2 µs |
+
+What it means: a directory operation costs a fold and a probe, not a search; a snapshot is
+forty-five nanoseconds at a million files; the memory per file is within a formula that names
+every object; and a volume of a million files is destroyed in slices the shard can schedule
+between requests, with the allocator out of the picture. The remaining cost in the create path
+is the op-log record and its path string, which §4.16's deriver will read; the readdir rows
+already borrow their names.
+
 ## Ratchets (2026-09-05)
 
 `ratchets.toml` holds the ceilings for this machine (identity `4c62b34d5f545407`, the Apple M5
@@ -166,6 +225,12 @@ The gate caught a real one on 2026-09-05: the first unsafe-reduction commit rais
 from about 30 ns (ceiling 34) to 37–45 ns, the cost of a `RefCell` borrow per phase and a
 control-channel poll per step. Recovered without unsafe (one borrow before the polls and one
 after, the registry entry cached, the channel polled only behind a pending flag): 22–30 ns.
+
+The Phase 1 record run (2026-09-05, `cargo xtask ratchet --tighten`) added 41 volume rows
+(`vfs.*`) and tightened five wire rows; the two destroy-slice rows (p99 and longest) are
+informational because the step budget they are cut to is derived per run from the profile
+(4,875–8,375 ns across the day's runs) and the longest slice follows the scheduler; the
+ac-1.8 verdict inside the bench gates them against a floor it measures itself.
 
 Between-run drift on this laptop, from the record run (the medians of the three runs):
 
