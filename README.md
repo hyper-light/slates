@@ -1,13 +1,18 @@
 # slates
 
-Manage concurrent agent work streams without worktrees, images, or micro VMs.
+Copy-on-write workspaces for concurrent agents, served as host paths or guest filesystems.
 
-slates is a hermetic, purely in-memory, copy-on-write virtual filesystem service in Rust that
-coding agents provision in under 50 µs, see as a normal path, merge through, and land onto disk
-only under a human grant. The design is `docs/wip/SLATES_DESIGN.md`; the project rules are
-`CLAUDE.md` and `AGENTS.md`; the gap ledger is `docs/wip/GAPS.md`.
+Slates is a Rust VFS whose target is isolated RAM-backed edits, cheap clones over retained
+bases, and disk changes only through a human-granted landing. Host tools use native mounts;
+OCI containers and microVMs are planned consumers, with virtio-fs serving Linux guests.
+The provisioning target is under 50 µs; base capture and attachment setup are separate costs.
 
-Status: Phase 0 (foundations) is built: `slates-machine` (boot profile), `slates-mem` (arenas,
-slabs, handles, rings), `slates-rt` (thread-per-core executor and drivers) and `slates-wire`
-(framing and canonical bodies). No release exists yet; `docs/wip/BENCHMARKS.md` has the baselines and `ratchets.toml` the
-per-machine ceilings (`cargo xtask ratchet`).
+Status, 2026-09-05: local core/server/CLI and part of the Linux bridge exist; no release yet.
+Strict capacity reservations, content recovery, complete mounted POSIX behavior, consumer
+isolation and fleet correctness have open findings. MCP, SDKs and guest/native non-Linux
+attachments remain planned. See the [gap ledger](docs/wip/GAPS.md#8i-a-9-contract-correction-and-open-implementation-gaps-2026-09-05).
+
+Read the [unified design](docs/wip/SLATES_DESIGN.md), [current CLI guide](docs/cli.md),
+[Hecate contract review](docs/wip/research/hecate-contract-review.md) and
+[recorded benchmarks](docs/wip/BENCHMARKS.md). Project rules are in [AGENTS.md](AGENTS.md)
+and [CLAUDE.md](CLAUDE.md).

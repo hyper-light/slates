@@ -1,5 +1,9 @@
 # Memory and System Awareness for slates
 
+> **Current contract, A-9 (2026-09-05).** §4.2 requires atomic usable locked capacity, every retained/transient cost and sacred outstanding entitlement; unlocked degradation is not successful strict admission.
+> See [the contract review](hecate-contract-review.md) and [the unified design](../SLATES_DESIGN.md).
+> The rest of this file is dated research evidence; conflicting recommendations are superseded.
+
 Research note. Status: IN PROGRESS (written incrementally; sections appended as completed).
 Date: 2026-09-03. Author: research agent for slates.
 

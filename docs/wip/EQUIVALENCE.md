@@ -1,10 +1,11 @@
 # The equivalence policy of the differential suite (AC-1.2)
 
-Status: reviewed for Phase 1, 2026-09-05. The suite is `crates/vfs/tests/differential.rs`; the
+Status: Phase 1 core differential scope, reviewed 2026-09-05; A-9 clarification below.
+This suite does not certify complete POSIX behavior, native mounts or virtio-fs guests. The suite is `crates/vfs/tests/differential.rs`; the
 histories are those of the model suite (`crates/vfs/tests/common/steps.rs`). This document is
 the reviewed list of what "the same" means when a volume and a host filesystem are compared
-after every step, and of every place the two are allowed to differ. Anything not listed here is
-compared exactly, and a difference there is a bug on one side or the other.
+after every step, and of every place the two are allowed to differ. Within the generated operation domain, anything not listed here is compared exactly.
+Operations and inputs outside that domain remain untested, rather than implicitly passing.
 
 ## 1. What is compared after every step
 
@@ -73,3 +74,30 @@ locally only when `SLATES_TEST_RAMDIR` names a RAM-backed directory, otherwise i
 it skipped and passes. It never writes disk: a RAM disk on macOS or an NTFS RAM VHD is a
 system-state change that needs its own authorization, and the nightly lanes for those targets
 are Phase 4's.
+
+## 8. Required mounted and guest equivalence (A-9)
+
+The exclusions above describe the existing core harness, not permission for a mounted
+filesystem to ignore ownership, modes, timestamps, symlink targets, capacity or snapshots.
+AC-3.10–3.12 and AC-4.11–4.12 extend observation through actual host/OCI/virtio-fs paths;
+AC-9.7 requires transport-specific evidence before a release promises the contract.
+
+Compare operation results and bytes, permissions/uid/gid under matched credentials and umask,
+timestamps under the declared granularity policy, hardlink identity and counts, symlink/path
+resolution, unlink-open lifetime, sparse/truncate behavior, rename flags, fsync/writeback
+boundaries, shared mmap visibility, locking, xattrs and watcher/invalidation semantics. Kernel
+ABI constants and negotiation use an independent oracle; ignored fields cannot count as
+successful operations. `statfs` must report capacity supported by the volume's claim; quota
+exhaustion and competing host claims require their own bounded admission oracle.
+
+Live-base tests change the underlying source between and during lookups and mutations, lose
+watcher events, and clone both locally and remotely. Expect the declared live view for untouched
+entries, stable witnessed edits and typed drift/unavailability. Complete immutable captures
+require a stable source and remain byte-identical after that source changes or disappears.
+Crash tests read acknowledged contents and metadata after daemon recovery, not only IDs.
+
+Mount boundaries remain observable through device identity, mount tables and EXDEV; exact
+host inode numbers, physical allocation and cross-volume rename are not equivalence claims.
+These narrow differences do not excuse missing operations within a volume. Limited native
+NFS/Windows semantics must be declared; a passing Linux guest is not evidence for its host's
+native adapter. A skipped platform lane remains unverified. No suite was run for A-9.

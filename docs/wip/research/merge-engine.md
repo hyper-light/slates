@@ -1,5 +1,9 @@
 # hecate's merge architecture, examined for slates: what carries over, what does not, and why
 
+> **Current contract, A-9 (2026-09-05).** §4.16 requires a complete immutable green base, contributing-client barrier, retained inputs and placed-before-reference. The pure merge core is not the integrated service.
+> See [the contract review](hecate-contract-review.md) and [the unified design](../SLATES_DESIGN.md).
+> The rest of this file is dated research evidence; conflicting recommendations are superseded.
+
 Status: complete (written serially by the architect, 2026-09-04, for amendment A-5). Every hecate
 quotation was read directly from `../hecate/docs` on 2026-09-04 and is cited to file and section
 (line numbers where the grep gave them). Evidence tiers as in `README.md`.

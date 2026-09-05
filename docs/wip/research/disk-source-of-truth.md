@@ -1,5 +1,9 @@
 # Disk as the source of truth: overlay volumes, drift, and landing under a human grant
 
+> **Current contract, A-9 (2026-09-05).** §4.4/§4.15 distinguish live base coverage from complete immutable capture. Every clone retains its base; an arbitrary changing directory cannot be atomically snapshotted by stat scans.
+> See [the contract review](hecate-contract-review.md) and [the unified design](../SLATES_DESIGN.md).
+> The rest of this file is dated research evidence; conflicting recommendations are superseded.
+
 Status: complete (written serially by the architect, 2026-09-04, for accepted amendment A-4).
 Evidence tiers as in `README.md`. Items marked "verify" were not fetched in this session and are
 listed again in §7. Every hecate quotation was read directly from `../hecate/docs` on 2026-09-04

@@ -1,5 +1,9 @@
 # What "EdenFS scale" means, and how large-scale virtual/distributed filesystems are built
 
+> **Current contract, A-9 (2026-09-05).** §4.4/§4.10 preserve delta plus base reference across remote clones and migration; placed deltas do not make an unfetched live source independent of its host.
+> See [the contract review](hecate-contract-review.md) and [the unified design](../SLATES_DESIGN.md).
+> The rest of this file is dated research evidence; conflicting recommendations are superseded.
+
 Research note for `slates` (hermetic in-memory copy-on-write VFS service). Written 2026-09-03.
 Evidence tiers: (A) peer-reviewed paper / thesis, (B) textbook / standard / official docs, (C) deployed implementation source or design doc, (D) engineering blog (flagged; cross-checked where possible).
 

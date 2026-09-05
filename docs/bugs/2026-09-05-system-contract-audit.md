@@ -1,9 +1,17 @@
 # System contract audit, 2026-09-05
 
-Status: open source-review findings at Slates `a1059ed`; no implementation changed and
+Status: source-review findings at Slates `a1059ed`; BUG-12 subsequently fixed in `d9cb6e5`; no implementation was changed by this audit and
 no executable regression was run. These findings are not claims about production
 incidents. The evidence commands were `rg` and `sed` over the named source. The design
 response is A-9; authoritative tracking is `../wip/GAPS.md` §8i.
+
+Workspace update, 2026-09-05: separate archive work committed as `540fb5b` (also including
+the initial audit/review files), followed by the ledger fix `d9cb6e5`. The latter fixes BUG-12's
+acceptance-epoch refresh and removes BUG-13's forced candidate-zero reachability. Its commit
+record reports the regression failing before the fix, passing afterward, and 40 passing DB
+tests (`git show -s --format=%B d9cb6e5`). This docs pass inspected the change but did not rerun
+those tests. BUG-12 is fixed by that separate commit; BUG-13's direct adopted-value assertion
+and the broader protocol evidence remain open. Findings below preserve the `a1059ed` baseline.
 
 ## 1. Findings and exact implementation sites
 
@@ -20,8 +28,8 @@ response is A-9; authoritative tracking is `../wip/GAPS.md` §8i.
 | BUG-9 | Capacity query: free space is derived from current usage rather than the quota and usable reservation. | `VolumeBridge::statfs` sets `blocks = max(2 * used, 1)` and `bfree = used`. Report the claim's capacity and accountable available space. |
 | BUG-10 | RENAME2 carries no-replace or exchange flags: the dispatch drops them and calls ordinary rename. | `bridge.rs` `serve_rename`, `request.rs` `RenameIn`, and `Bridge::rename`. Preserve and implement flags or refuse unsupported semantics before mutation. |
 | BUG-11 | Daemon restart preserves catalog identity but recreates scratch content empty and drops local snapshots. | `crates/server/src/verbs.rs` `rebuild_recovered`, `rebuild_volume`, `reconcile_lost`. Persist content roots, bytes and witnesses in anchor-owned RAM with atomic recovery boundaries; do not describe current recovery as content survival. |
-| BUG-12 | A sequence of minority writes and changing takeover quorums rewrites a committed ledger value. | `crates/db/src/ledger.rs` `Holder::reconcile` skips matching identities without refreshing their accepted epoch; `adopt` selects by that epoch. The trace below is a source-derived counterexample. |
-| BUG-13 | Protocol tests cannot generate the quorum transition in BUG-12. | `crates/db/tests/ledger.rs` oracle `reachable` always includes candidate zero; continuity checks adopted length, not adopted values. Generate arbitrary legal quorums and compare the complete committed prefix over time. |
+| BUG-12 | A sequence of minority writes and changing takeover quorums rewrites a committed ledger value. | `crates/db/src/ledger.rs` `Holder::reconcile` skips matching identities without refreshing their accepted epoch; `adopt` selects by that epoch. The trace below is a source-derived counterexample, fixed by `d9cb6e5` with a recorded regression. |
+| BUG-13 | Protocol tests cannot generate the quorum transition in BUG-12. | `crates/db/tests/ledger.rs` oracle `reachable` always includes candidate zero; continuity checks adopted length, not adopted values. `d9cb6e5` removes the candidate-zero restriction and strengthens generation. The immediate adopted-log check still compares length; direct value comparison and message-level histories remain owed. |
 | BUG-14 | Early failure receiving the mount helper's descriptor returns before waiting for its child. | `crates/bridge-fuse/src/mount.rs`: `receive_device(&ours)?` precedes `child.wait()`. Keep an owner that reaps or cancels the helper on every exit, with a derived handshake deadline. |
 
 Other incompleteness: bridge invalidation encoders are not a demonstrated end-to-end

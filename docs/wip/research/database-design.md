@@ -1,5 +1,9 @@
 # Designing the slates database from scratch: in-memory, async, Arc-free, single-node fast and globally distributed
 
+> **Current contract, A-9 (2026-09-05).** §4.8 requires recovery of acknowledged bytes and references as well as metadata, correct acceptance epochs and safe read authority. The current simulations are not a correctness proof.
+> See [the contract review](hecate-contract-review.md) and [the unified design](../SLATES_DESIGN.md).
+> The rest of this file is dated research evidence; conflicting recommendations are superseded.
+
 Status: research report (work in progress; sections appended as completed). Date: 2026-09-03.
 Author: research agent for the slates project. Evidence tiers: (A) peer-reviewed / thesis; (B) textbook / standard; (C) deployed implementation + design doc / source; (D) blog (gap-filler, flagged).
 
@@ -73,7 +77,7 @@ Terms. *Trie / radix tree*: a tree keyed by successive bytes (or bits) of the ke
 |---|---|---|---|---|
 | Volume catalog (id -> record) | dense u64 | point | ART (single-writer, no sync) or direct-indexed slab | dense keys: ART == hash speed, ordered for listing [A: Leis ICDE'13] |
 | Volume by name (owner, name) | short string | point + prefix listing | ART with path compression | strings, prefix scans, 8.1–52 B/key [A: Leis ICDE'13] |
-| Directory entries (dir_ino, name) -> ino | u64 || bytes | point + ordered readdir | ART (HOT if profiling shows long names dominate) | ordered by name for readdir; 4x faster than Bw-tree, 2x faster than B+tree for point lookups [A: Wang SIGMOD'18] |
+| Directory entries (dir_ino, name) -> ino | u64 \|\| bytes | point + ordered readdir | ART (HOT if profiling shows long names dominate) | ordered by name for readdir; 4x faster than Bw-tree, 2x faster than B+tree for point lookups [A: Wang SIGMOD'18] |
 | Inode table (ino -> attrs) | dense u64 | point | slab/array indexed by ino (generation-checked) | O(1), no tree needed; ART only if ids are sparse |
 | Chunk index (hash -> location, refcount/epoch) | 256-bit random | point | Swiss-table style open addressing keyed by hash bits, sharded by hash prefix across cores | random keys favour hashing 2x over tries [A: Leis ICDE'13]; SIMD probing [C: Abseil] |
 | Lineage DAG (parent -> children) | u64 pairs | point + small scans | ART on (parent_id, child_id) | ordered composite key gives children-of scan for free |

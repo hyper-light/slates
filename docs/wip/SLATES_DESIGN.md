@@ -1,11 +1,24 @@
 # slates — unified design and phased implementation plan
 
-Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 (the volume core, the deriver, the base plane and the landing: `slates-vfs`, `slates-base`, `slates-land`) are implemented and gated; Phase 2 is in progress (tasks 1–8: through the register protocol and the landing-and-grant records — `slates-anchor`, `slates-db`, `slates-ipc`, `slates-server`, `slates-client`, `slates-cli`; the control-channel grant transport and the write execution run in the Linux lane; GAPS §8d). Phase 3 (the Linux FUSE bridge) has begun: the FUSE ABI codec is implemented and gated (`slates-bridge-fuse`; GAPS §8e), with the /dev/fuse transport, mount, cache invalidations, base-file reads and copy-up, and the `slates exec` launcher built (the transport, mount and exec verified in the Linux lane, the codec/dispatch/volume path tested on every host). The conformance and workload suites and the io_uring path remain. Phase 6's pure core is also implemented and gated ahead of the rest of Phase 6 (`slates-merge`; GAPS §8f): the deterministic merge verdict (the accept/identical/conflict decision), the canonical ops document (the declared-operation serialization whose BLAKE3 is half an increment's identity), the whole-volume deriver (every declared operation kind), and the merge engine on one node (submit/verdict/splice/commit with conflicts and rebase), position mapping (an increment's ranges shifted forward through the intervening deltas to head coordinates, with a provenance oracle), and the whole-volume deriver (a journal of content, create, unlink and rename composed into one ops document, with a whole-filesystem reconstruction oracle, directories included), and the splice (accepted ops applied to a base extent list by reference surgery, no byte copied); the deriver composes every operation kind and the engine now merges directory creation, mode, symlink, file rename and directory removal alongside content (directory rename, link and xattr through the engine, per-range identity, and the green chain remain). Phase 7's archive format (the pure core of §2.6: the streamable, content-addressed, self-verifying container, raw encoding, with round-trip, determinism and hostile-input tests) is also implemented and gated ahead of the rest of Phase 7 (`slates-archive`; GAPS §8g). Phase 8's register protocol has begun on top of Phase 2's f=0 core, as pure deterministic simulations that are the implementation-side proof of the §4.8 TLA models (GAPS §8h): the fenced ledger register (the register over time — commit at f+1 of the 2f+1 holders, takeover by epoch bump with a phase-one max-epoch read that adopts the committed prefix; a proptest oracle checks Agreement, NoLoss, TotalOrder, Continuity and StaleNeverCommits), asynchronous mirroring (replaying the committed prefix to a second region in epoch order with an exposed lag, closing `await placed(mirror)`), and reconfiguration (changing the holder set old → joint → new by Raft joint consensus with state transfer and a retirement gate; a proptest oracle checks ReadSafety and NoLoss) — `slates-db/src/{ledger,mirror,reconfig}.rs`. The LZ4 and zstd codecs are in (`slates-archive`; zstd behind a default feature, built here with the system C toolchain), leaving the calibrated cost model, dictionaries and FastCDC as the codec rest of Phase 7. Phases 4, 5, 9, the cost-model/dictionaries/FastCDC rest of Phase 7, the fleet wiring (put path, healer, mirroring, migration, membership) rest of Phase 8, and the rest of Phases 3 and 6 are design.
-This version integrates amendments A-1, A-2, A-4, A-5 and A-6 into the body; the amendment log at
-the end is history, and where the log and the body disagree, the body wins.
-Every decision below cites tiered evidence; every tunable is a measured derivation; every phase
-carries acceptance criteria and test cases written for a human implementer. The gap ledger is
-`docs/wip/GAPS.md`. Working notes are in `docs/wip/ARCHITECT_NOTES.md`.
+Status: DESIGN v3, 2026-09-05. This is the target contract, not a release or a claim that all
+acceptance criteria pass. Source review at `a1059ed` finds foundations, a volume core, local
+metadata/IPC/client/CLI, part of the Linux bridge, and pure merge/archive/protocol components.
+The current implementation does not yet establish strict locked-memory admission, content
+recovery across daemon restart, complete mounted POSIX behavior, authenticated isolation
+between agents sharing a uid, guest attachments, or fleet safety. MCP, SDKs and native
+macOS/Windows bridges remain planned. The ledger's §8i records the blocking gaps, including
+source-level correctness findings in the FUSE ABI and takeover protocol.
+
+A-9 corrects the contract using Ada's requirements and the sibling Hecate specifications.
+[The contract review](research/hecate-contract-review.md) distinguishes source evidence from
+measured results; [the audit](../bugs/2026-09-05-system-contract-audit.md) records the concrete
+findings. No implementation test, benchmark, mounted workload or model checker was run for
+this documentation amendment. Earlier measurements and model runs retain their original dates
+and scope; they do not validate A-9 or close the new regressions.
+
+This version integrates A-1, A-2, A-4, A-5, A-6, A-7, A-8 and A-9 into the body. Existing
+numbered identifiers remain stable. The amendment log is history; the body is authoritative.
+The gap ledger is [GAPS.md](GAPS.md); measurements are [BENCHMARKS.md](BENCHMARKS.md).
 
 Contents: Part 0 how to read; Part 1 what slates is; Part 2 the shape of the system; Part 3 the
 decision ledger (D-1 … D-27); Part 4 subsystem designs (4.1 … 4.16); Part 5 the phased plan
@@ -67,6 +80,10 @@ Every claim that could be wrong carries a bracketed citation with a tier letter:
 - **[C]** a widely deployed implementation and its design documents or source, cited to the file.
 - **[D]** a blog post or an individual benchmark. Gap-filler only; always flagged; never the sole
   support for a decision.
+- **[S]** a local specification or source audit. Hecate at `103c078` is a documentation tree,
+  not a deployed implementation; earlier Hecate citations labelled [C] are specification
+  evidence [S], wherever they occur in this document. They establish intended contracts only.
+- **[M]** a measurement made here, with its command, date, hardware and workload recorded.
 
 Numbers always come with their measurement conditions (hardware, OS and kernel version, year).
 When sources disagree, both are cited and the disagreement is stated. "Must be measured at
@@ -76,9 +93,17 @@ runtime" is written where it applies; it is a design finding, not a gap.
 
 - **Volume**: a named, independently provisioned copy-on-write filesystem tree with its own
   quota, owner, version history, and access mode, whose base is either empty (a scratch volume)
-  or an existing directory on disk (an overlay volume). The unit an agent asks for.
-- **Snapshot**: an immutable, named version of a volume's tree. Taking one costs one pointer
-  copy; it shares every unchanged byte with its parent.
+  or a retained base reference (a live directory or an immutable snapshot). The unit an agent asks for.
+- **Snapshot**: a frozen root with explicit coverage. `Complete` covers the whole logical tree;
+  `DeltaWithLiveBase` freezes the delta and witnesses but retains a live base dependency. The
+  latter is not an immutable view of untouched files. Root publication is O(1); flushing clients,
+  capturing a base, hashing and placement are separately costed operations.
+- **Base reference**: the retained identity and authority needed to resolve untouched entries:
+  empty, an immutable snapshot root, or an enrolled live directory served by its host. A path
+  string on another host is not the same base.
+- **Base capture**: explicit construction of a complete immutable base. Atomic point-in-time
+  capture requires a stable source (quiescence or a supported read-only snapshot facility);
+  scanning an arbitrarily changing directory cannot establish that guarantee.
 - **Clone**: a new volume whose first snapshot is an existing snapshot. O(1) to create; diverges
   by copy-on-write.
 - **Copy-on-write (CoW)**: writing to shared data first copies only the piece being changed, so
@@ -87,17 +112,19 @@ runtime" is written where it applies; it is a design finding, not a gap.
   hash so identical chunks are stored once.
 - **Manifest**: the table of contents of a snapshot: every path with its metadata and the list of
   chunks that make up its content.
-- **Attachment**: the control object created when a consumer (an agent process, a mount) binds to
-  a volume. It pins the version, holds the ownership lease, carries accounting, and is the only
-  way a consumer's view of a volume changes.
+- **Consumer**: an authenticated workload identity enrolled by a trusted human or harness;
+  distinct agents may share one OS uid but must not inherit each other's VFS rights.
+- **Attachment**: a binding of consumer, transport, access rights, view, lease generation and
+  accounting. A snapshot attachment pins its version; a writable attachment follows its owned
+  live head. Attach succeeds only after the requested serving path or device is usable.
 - **Lease**: a time-bounded, renewable right of ownership carrying an epoch number (fencing token).
   Any write presenting a stale epoch is refused. Two kinds exist, both with epochs: the volume
   lease (this entry; a green volume's merge task holds one) and the landing lease (below). A
   "grant" is never a lease: it is a human's permission for one landing.
 - **Epoch (fencing token)**: a monotonically increasing number stamped on a lease; it lets a
   resource reject a writer that paused and woke up after losing ownership.
-- **Bridge**: the per-OS component that makes volumes visible to ordinary programs as normal paths
-  (FUSE on Linux, the chosen mechanism on macOS, WinFsp on Windows).
+- **Bridge**: a transport adapter over the same VFS operations: native host filesystem bridges
+  or a virtio-fs device serving a Linux guest through FUSE-over-virtio.
 - **Root mount**: the single kernel mount point per host (or per user) under which volumes appear
   as directories. Established once; a volume is then a metadata operation.
 - **Chosen path**: the path at which an agent asked for a volume to appear. Honoured per OS by the
@@ -113,8 +140,11 @@ runtime" is written where it applies; it is a design finding, not a gap.
 - **Machine profile**: the set of quantities the daemon measures at boot (page size, cache line,
   cores, memory, wake latency, memcpy and hash bandwidth, and so on) from which every tunable is
   derived.
-- **Bounded volume**: a volume whose full quota is reserved at creation; a write past the quota
-  fails with ENOSPC and never grows the reservation.
+- **Quota**: a limit on a volume's logical referenced bytes, distinct from physical capacity.
+- **Claim**: an admitted entitlement backed by usable, prefaulted, locked capacity on each
+  serving/holding host, including the costs of honoring that entitlement (§4.2).
+- **Bounded volume**: a volume whose full quota is backed at creation; other volumes, caches
+  and snapshots cannot consume its remaining entitlement. Writes past quota return ENOSPC.
 - **Dynamic volume**: a volume whose reservation grows in measured increments against the host's
   measured free memory and pressure signals, with a stated maximum.
 - **Archive**: a sealed, self-verifying byte stream of a snapshot (manifest plus chunks), held in
@@ -196,9 +226,12 @@ runtime" is written where it applies; it is a design finding, not a gap.
 
 ### 1.1 The one-paragraph statement
 
+The following paragraphs state the product target. The status above and GAPS §8i state what
+is implemented and what still prevents these guarantees from being offered.
+
 slates is a hermetic, purely in-memory, copy-on-write virtual filesystem service, written in Rust,
 that coding agents provision on demand. An agent asks for a volume and gets one in under fifty
-microseconds. The volume appears to every ordinary program on the machine (git, cargo, npm,
+microseconds. The volume appears to ordinary programs in the attached namespace (git, cargo, npm,
 python, editors, shells) as a normal path at the place the agent chose, with no wrappers and no
 special tools. Many agents create, read, write, delete, move, snapshot, clone, attach, detach,
 archive, and destroy volumes at the same time. Volumes are either bounded (fixed quota) or dynamic
@@ -246,6 +279,14 @@ over MCP, and raw skills.
 | RQ-18 | Disk is written only on a user permission grant: the only disk-writing verb is a landing under a grant issued by a human outside the agent's channel; RQ-8 is otherwise unchanged. | Ada, 2026-09-04 |
 | RQ-19 | Many agents merge into one shared volume through hecate's merge architecture adapted to slates: green volumes written only by a merge task, increments of declared operations, canonical rebase, a pure verdict with no inferred merge, byte-exact conflict windows, streaming submission. | Ada, 2026-09-04 |
 
+| RQ-20 | Host processes, OCI containers and Linux microVM guests can consume the same VFS; guests use virtio-fs. | Ada, 2026-09-05; Hecate review |
+| RQ-21 | Claims reserve actual usable host capacity atomically and remain sacred under competing allocation, retention and pressure. | Ada, 2026-09-05 |
+| RQ-22 | Local and remote clones retain the complete base reference; accurate live views and immutable complete snapshots have explicit, different guarantees. | Ada, 2026-09-05 |
+| RQ-23 | CLI and MCP share one typed operation contract, actionable refusals, bounded output and explicit attachment capabilities. | Ada, 2026-09-05; Hecate review |
+| RQ-24 | POSIX transparency is verified through real mounts and guest devices; mount boundaries and unsupported host forms are reported honestly. | Ada, 2026-09-05 |
+| RQ-25 | Metadata recovery, fencing, quorum adoption and placement preserve bytes and historical committed values under faults. | Ada, 2026-09-05 |
+| RQ-26 | Different agents are authenticated consumers even on one laptop uid; authority to grant disk writes remains outside their channels. | Ada, 2026-09-05; Hecate review |
+
 ### 1.3 Non-goals
 
 - slates is not a version control system. It provides the storage primitives (snapshots, clones,
@@ -261,7 +302,8 @@ over MCP, and raw skills.
   landing onto the disk that is the source of truth.
 - slates does not provide a shared-mutable volume with multiple simultaneous writers on different
   hosts in its first release. (The consistency model decision in Part 3 records what is offered.)
-- slates does not run inside a microVM guest and does not depend on one.
+- Slates does not own the agent's sandbox, container runtime or VM lifecycle. It serves native
+  host paths and virtio-fs guest devices; guest consumers are first-class, and a VM is optional.
 
 ### 1.4 Scale envelope
 
@@ -417,7 +459,7 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 - **Python SDK** (`slates` on PyPI): PyO3 extension; `async` methods on any event loop through
   file-descriptor readiness; a sync facade.
 - **TypeScript SDK** (`@slates/sdk` on npm): napi-rs addon with platform packages; Promises and
-  async iterators; a pure-TypeScript fallback over the control channel.
+  async iterators; the TypeScript addon over the typed client.
 - **MCP server** (`slates mcp`): the 2026-07-28 stateless protocol with dual-era support; tools,
   resources, and prompts; stdio and loopback Streamable HTTP.
 - **Skills**: one source tree of `SKILL.md` documents published raw (installed into
@@ -487,6 +529,9 @@ startup).
 > budget or whose heartbeat lapses, and re-derives the restart bound from the longest start it
 > measured. Step 4 (bridges) is Phase 3 and 4; step 6 Phase 8; the health plane's refusal to
 > serve before every chokepoint registers arrives with task 6's signals.
+> A-9 correction: rebuilding scratch volumes empty and dropping snapshots is acknowledged
+> content loss (BUG-11), not content recovery. Anchor-owned bytes/roots and validated base
+> identity handoff are required before the design's restart-survival promise can be offered.
 
 ---
 
@@ -502,7 +547,14 @@ plan schedules.
 - Measure: mount cost per kernel; root-mount establishment time at daemon start.
 - Consequence: the bridge namespace's top level is a shard-published array of (name → volume handle); a volume is visible the moment the release store lands.
 
-### D-2 Bridges: own FUSE driver (Linux); an FSKit module first on macOS 26+ with an own NFSv3 loopback fallback for macOS 14.4–15.x; own thin WinFsp binding (Windows)
+### D-2 Bridges: native host adapters and a first-class virtio-fs guest device over one VFS
+- A-9: Linux guests use an owned FUSE-over-virtio device on the custom runtime, with an in-process
+  or inherited-descriptor integration seam for the host VMM. Hecate's libkrun integration is the
+  reference; native host bridges remain necessary for host tools. A container on the host gets
+  the host attachment through its runtime's mount namespace; a container in a guest uses the
+  guest's virtio-fs mount. All forms share the same semantics, authorization and accounting.
+  No new daemon privilege, disk socket, mount directory, runtime or fallback is authorized.
+  Evidence: [S: research/hecate-contract-review.md §2]; integration contract in §4.6.
 - Evidence: FUSE per-request floor is two wakes with the kernel cache answering the hot path; FUSE-over-io_uring gives per-core queues and 2-3x create throughput [A: Vangoor FAST'17; A: Cho FAST'24; C: fuse-io-uring.rst; D: LWN 988186]. FSKit: a sandboxed user-space app extension enabled by one toggle in System Settings, no kernel extension, no Recovery-mode reboot; a complete operation set including xattrs, hard links, a forget call and a readdirplus-shaped enumeration; URL-identified resources from macOS 26; the entitlement ships under Developer ID (macFUSE does exactly this); sandboxed extensions may share POSIX shared memory and sockets with same-team processes through an app group [B: Apple FSKit, FSVolume.Handler, FSGenericURLResource, entitlement and app-group docs; C: macFUSE releases and site; C: FSKitSample]. NFSv3's coherence limits live in Apple's kernel client and cannot be fixed server-side; it lacks xattrs and forget and hangs on daemon death [C: EdenFS macOS.md]. ProjFS and Cloud Files hydrate to NTFS by design [B: Microsoft; C: EdenFS Windows.md]. Every existing Rust bridge crate brings `Arc` and threads or tokio [C: crate sources]. (`research/os-filesystem-bridge.md` §2.1-2.3, §7-§8)
 - Lost: `fuser`/`fuse-backend-rs`/`fuse3` (ownership model); macFUSE's kernel extension (security downgrade, dead in CI); NFSv4.0 on macOS (spec size, serialized OPEN, lease-loss remounts); NFSv3 as the primary macOS bridge (kept as fallback and as the differential oracle); ProjFS; Cloud Files; Dokany; SMB and NFS clients on Windows.
 - Measure: the Phase 4 FSKit spike (per-operation latency, cache and invalidation behaviour, mmap correctness, non-root mount, shim overhead) decides go/no-go and the macOS 15.x path (RAM-disk block resource); the NFS fallback's attribute-cache timeout from loopback RTT.
@@ -553,7 +605,11 @@ plan schedules.
 - Evidence: page sizes differ 4x across targets [B: Apple; B: arm64 Kconfig]; fault costs differ 100x between base and huge pages [A: Panwar ASPLOS'19]; codec throughput differs 10x across CPUs [D: lzbench; D: openzfs]; hyperscale's ~140 hardcoded constants were its weakest point [C: survey-hyperscale.md §8.4]; lmbench methodology and rigorous statistics [A: McVoy USENIX'96; A: Kalibera ISMM'13; A: Mytkowicz ASPLOS'09]. (`research/memory-and-system-awareness.md` §2.6)
 - Consequence: a `Derived constants` table per subsystem (Constant | Formula | Anchors); a bare tuning literal fails review.
 
-### D-12 Memory: pre-sized, pre-faulted, locked arenas; per-shard slabs with message-passing frees; buddy allocation over locked regions for chunks; segmented arrays; RAM-only policy per OS with honest degradation; bounded volumes commit at creation; dynamic volumes grow from measured rates
+### D-12 Memory: claims backed by usable prefaulted locked arenas; bounded entitlement protected from every other allocation
+- A-9: unsuccessful locking is an admission refusal, not successful RAM-only service with
+  swappable content. The host's effective capacity, allocator geometry and every source of
+  retained/transient memory constrain admission. Dynamic growth uses only unpromised capacity.
+  A quota field, anonymous mapping or OS free-memory sample is not a reservation (§4.2).
 - Evidence: Bonwick slabs and magazines, Hoard, snmalloc's message-passing frees [A: USENIX'94/'01; A: ASPLOS'00; A: ISMM'19]; mlock limits and `CAP_IPC_LOCK`, macOS wire limits (108.8 GiB of 128 GiB on the author's machine), Windows `VirtualLock` bounded by the working set [B: mlock(2); M; B: Microsoft Learn]; huge pages help only where measured [A: Gaud ATC'14; A: Panwar ASPLOS'19; A: Hunter OSDI'21]; PSI, memory-pressure sources, memory resource notifications [B: kernel PSI; C: libdispatch; B: Microsoft Learn]. (`research/memory-and-system-awareness.md` §2.2-2.7)
 - Lost: THP `always`; a global allocator on the hot path; fixed growth percentages.
 - Base content cache: base bytes read into arenas are evictable exactly when they can be re-read from disk with the same fingerprint; witnessed, copied-up and pinned bytes are never evicted; the cache budget follows the dynamic-growth formula of §4.2.
@@ -585,14 +641,25 @@ plan schedules.
 - Lost: Brotli, xz, fixed "save 12.5%" rules (sector-rounding artefacts), SHA-256 (not fixed-cost across the matrix), CDC everywhere.
 - Erasure coding: the format carries a fragment record kind from the first release: a chunk may be held as k data and m parity fragments (Reed-Solomon), each fragment with its own BLAKE3, the chunk's identity unchanged, so replication, archive and clone-from-archive all understand fragments from the first release; the policy that codes cold sealed content instead of replicating it is measured in Phase 8 (D-O6): the class boundary comes from measured read rates, the (k, m) from the failure-domain tree, and the reconstruction cost from the profile [A: Rashmi et al., EC-Cache, NSDI 2016; A: Muralidhar et al., f4, OSDI 2014; A: Huang et al., LRC, ATC 2012].
 
-### D-18 Durability statement: "a volume's sealed snapshots are f-fault-tolerant across declared failure domains the moment f+1 of their 2f+1 candidate holders acknowledge them; they reach the mirror region asynchronously in epoch order with a measured, exposed lag, and an operation that needs them there awaits the mirror scope; live edits since the last seal are lost with the owner unless the volume opted into live shipping; the auto-seal cadence bounds that window to a measured, per-volume number; explicit archive export and a granted landing are the only durability beyond the fleet's lifetime; a granted landing writes the diverged entries to the host disk with data and directory syncs, after which the disk is the source of truth for them; on a laptop, process-restart survival through the anchor process plus archive export or a granted landing"
-- Evidence: EdenFS's overlay durability contract ("If the process dies, none of the user's data should be lost", explicitly not power loss) [C: InodeStorage.md]; Commit Cloud's automatic backup of commits and CitC's snapshot-per-save [D: Meta engineering 2022 (flagged); A: CACM 2016]; RAMCloud's argument against DRAM-only replication, FaRM's batteries, Hermes' membership-based acks [A: SOSP'11; A: SOSP'15; A: ASPLOS'20]; systemd fd store, Envoy and nginx hot restart, Microreboot [C; A: OSDI'04]; hecate's "environment-derived durability" [C: survey-hecate.md §3.2]. (`research/database-design.md` §2.4, §7)
-- Consequence: every volume reports `seal_interval`, `last_placed_snapshot_age`, `mirror_age`, and its policy (`snapshot` or `live-shipped`); `await placed(scope)` with `region` or `mirror` is the only durability choice and it is per operation; power loss and correlated failures are designed Degraded cells; nothing pretends.
-- In slates "durable" means "in the RAM of f+1 machines" or "in the anchor segment" until a human grants a landing; `fsync` through a mount never writes a disk (§4.6). After a granted landing the disk holds the landed entries and the volume's witnessed bases advance to them (§4.15).
+### D-18 Durability: explicit client, process, host and region boundaries
+- Client-buffered writes enter a snapshot only after the attachment barrier (§4.6). Local
+  acknowledgement promises daemon-restart survival only when bytes, roots, witnesses,
+  accounting and completion records are recoverable from anchor-owned RAM (§4.8).
+- A complete snapshot is f-fault-tolerant within its declared failure domains only after f+1
+  of 2f+1 eligible holders reserve, verify and retain every referenced object and its record.
+  `DeltaWithLiveBase` placement protects the delta; it does not replicate the host directory.
+- Live owner-local edits since the last placed seal may be lost with that host; live shipping
+  must place bytes and records before acknowledgement to offer a stronger scope. Mirror scope
+  waits for the corresponding verified prefix and content in that region and exposes time lag.
+- RAM replicas do not survive simultaneous loss of all holders. Only explicit export to a
+  caller-owned sink or a granted landing provides persistence beyond their lifetime. A local
+  `fsync` never implies disk or region durability that the volume did not establish.
+- Status: metadata replay and protocol simulations exist; full content recovery, end-to-end
+  placement and the A-9 regressions remain open. Evidence: the contract review and audit.
 
 ### D-19 Agent surfaces: own MCP server (2026-07-28 stateless, dual-era for legacy clients); skills authored once and published raw, as `skill://` resources and prompts, and via a help tool; PyO3 SDK with fd completion; napi-rs SDK with `uv_poll` completion; CLI with `mcp install` and `skills install`
 - Evidence: the 2026-07-28 spec changes and conformance suite; rmcp's tokio/`Arc` coupling; the Agent Skills spec and client install paths; PyO3 free-threading and abi3 facts; Node-API ABI stability; asyncio's Windows limits [B; C as cited]. (`research/mcp-skills-sdks.md`)
-- Lost: rmcp; pyo3-async-runtimes (needs a Rust runtime in the client); pure-Python/TS as the primary path (kept as fallbacks).
+- Lost: rmcp; pyo3-async-runtimes (needs a Rust runtime in the client); parallel pure-Python/TS compatibility implementations (not part of the target).
 
 ### D-20 Testing doctrine: the five-layer pyramid; behaviour only; conformance suites with reviewed expected-failure lists; deterministic simulation; instruction-count gates in CI and change-point-detected latency gates nightly; the <50 µs histogram as a ratcheted permanent gate
 - Evidence: pjdfstest/xfstests/fsx/SibylFS/Metis/CrashMonkey; QuickCheck lineage; loom/shuttle/Miri; FoundationDB simulation; Jepsen/Elle; the failure studies; rigorous benchmarking literature [A; C as cited]. (`research/testing-and-benchmarking.md`)
@@ -600,7 +667,11 @@ plan schedules.
 ### D-21 Documentation and process: hecate's spec skeleton (data model with ownership facts, state machines, networking table, failure matrix, refusal taxonomy, derived constants, worked example, laptop degenerate, integration list, acceptance criteria, test matrix); a gap ledger kept current in the same change; overrules recorded
 - Evidence: `research/survey-hecate.md` §0, §7.
 
-### D-22 Security: peer credentials and per-user namespaces isolate users; volume ownership and attachment leases authorize mutation; ids are never bearer capabilities; no code loading after start; human-only enrollment of servable roots for MCP; human-only grants for disk writes
+### D-22 Security: authenticate each consumer, enforce rights before effects, and keep human grant authority outside agent reach
+- A-9: OS credentials establish the host account; an enrolled, channel-bound consumer identity
+  distinguishes workloads within it. A channel label supplied by a caller cannot establish
+  human authority. A trusted confirmation surface binds its approval to the exact manifest;
+  transport checks supplement that authority check (§4.13).
 - Evidence: `SO_PEERCRED`, `getpeereid`/`LOCAL_PEERTOKEN`, named-pipe client checks [B]; hecate's "an id is never a bearer capability" [C: survey-hecate.md §8.4]; vorpal's MCP enrollment rule [C: survey-vorpal.md §6.1].
 - Grants are created only through the CLI or a confirmation surface a human operates, for the same reason vorpal enrols servable roots by hand: a confirmation delivered through the agent's channel would be answered by the agent. A landing opens the target beneath its own directory descriptor (`openat2` with `RESOLVE_BENEATH` on Linux, `O_NOFOLLOW` chains elsewhere) so it can never write outside the granted directory [B: openat2(2)]; the target must be owned by the calling user and must not lie inside a slates mount.
 
@@ -612,11 +683,11 @@ plan schedules.
 - Evidence: `research/survey-vorpal.md` §1-§9; Appendix B.
 
 ### D-25 Disk is the source of truth: overlay volumes over host directories with lazily served bases, witnessed bases at copy-up, whiteouts and redirects, drift reported and never absorbed
-- The decision: a volume's base is either empty (scratch) or an existing host directory (overlay). Create records the path and nothing else. Untouched entries are served from disk on demand; the first write copies up and records the witnessed base (stat fingerprint plus BLAKE3 of the bytes the edit was based on); deletes are whiteouts; renamed base directories record their origin; drift is detected by fingerprints with the racy-clean rule and reported as a typed event; watchers make reports prompt but are never the truth; a snapshot of an overlay volume is the delta plus the witnessed bases.
+- The decision: a volume's base is either empty (scratch) or an existing host directory (overlay). Create records the path and nothing else. Untouched entries are served from disk on demand; the first write copies up and records the witnessed base (stat fingerprint plus BLAKE3 of the bytes the edit was based on); deletes are whiteouts; renamed base directories record their origin; drift is detected by fingerprints with the racy-clean rule and reported as a typed event; watchers make reports prompt but are never the truth; a snapshot of an overlay volume is the delta, witnessed bases and retained base reference, with coverage `DeltaWithLiveBase`.
 - Evidence: EdenFS's materialization contract ("An inode is not materialized if we have a source control object ID that can be used to fetch the inode contents"; materialization propagates upward; "materialized" on Windows means disk is the source of truth) [C: eden/fs/docs/Inodes.md, Windows.md via `research/edenfs-scale-distribution.md`]; hecate's physical contract ("the overlay contains exactly the materialized-iff-diverged entries (EdenFS's contract)"; "No reconcile operation exists: every write is witnessed at the serving boundary") [C: hecate SESSIONS.md:65-70]; overlayfs's whiteouts, opaque directories, copy-up on first write access, `redirect_dir` for directory renames, and its rule that offline changes to the lower tree make an overlay undefined, which is why slates detects instead of assuming [B: kernel overlayfs.rst]; git's index fingerprint and the racy-clean rule [B: git racy-git]; watcher overflow documented on all three OSes (`IN_Q_OVERFLOW`, `kFSEventStreamEventFlagMustScanSubDirs`, `ReadDirectoryChangesW` zero bytes or `ERROR_NOTIFY_ENUM_DIR`) [B: inotify(7); B: Apple FSEvents; B: Microsoft Learn]; CitC's fewer than ten private files per workspace [A: Potvin & Levenberg CACM 2016]. (`research/disk-source-of-truth.md` §1-§4)
-- Lost: copying the base tree into memory at create (O(tree) provisioning; sylk's `memorySnapshotFS` read every file [C: survey-sylk-vfs.md §1.4]); pinning the base by snapshotting the disk (impossible without a copy); FUSE passthrough in any form (it needs `CAP_SYS_ADMIN`, which slates never requires); watchers as the truth (all three overflow); silent adoption of disk changes into the agent's view of witnessed entries.
+- Lost: copying the base tree into memory at create (O(tree) provisioning; sylk's `memorySnapshotFS` read every file [C: survey-sylk-vfs.md §1.4]); assuming an arbitrary host directory has an available atomic snapshot; FUSE passthrough in any form (it needs `CAP_SYS_ADMIN`, which slates never requires); watchers as the truth (all three overflow); silent adoption of disk changes into the agent's view of witnessed entries.
 - Measure: stat cost per entry and listing cost per directory size on each OS; watcher latency and overflow rate per base; copy-up cost per size class; base cache hit rate; base read cost per page class versus reading the host file directly.
-- Consequence: memory is proportional to touched entries; provisioning stays one ring round trip; `status` reports drift; `rewitness`, `pin` and `read_base` are explicit verbs; overlay volumes are pinned to the host that holds the disk (§4.10).
+- Consequence: memory is proportional to touched entries; provisioning stays one ring round trip; `status` reports drift; `rewitness`, `pin` and `read_base` are explicit verbs; live base service remains on the host that holds the directory; the delta owner may move while retaining that dependency (§4.10).
 
 ### D-26 Disk is written only by a landing under a human grant: a pure per-entry verdict, one holder per target, per-file compare-and-swap against outsiders, delta-only zero-copy parallel write-back with data and directory syncs, and an audit trail
 - The decision: `materialize(snapshot, target)` is the only verb in the system that writes a host path. It plans a landing manifest (work proportional to diverged entries), obtains a grant bound to the manifest's hash from a human through the CLI or a confirmation surface (never through MCP or the SDKs), takes the single-holder landing lease on the canonical target, validates every entry by the verdict (witnessed base versus disk now versus overlay now: apply, skip, accept by identity, conflict), refuses while any conflict is unresolved, writes the delta with per-file compare-and-swap, syncs data then directories, advances the witnessed bases to what was written, clears those overlay entries, and records grant, manifest and outcome in the audit log.
@@ -703,72 +774,110 @@ where per-chunk fixed cost / memcpy cost < a fixed fraction chosen from the meas
 two classes, 128 GiB with 108.8 GiB lockable; the 6 "Super" cores become shards, 12
 "Performance" cores serve bridge work and the control shard; the spin window is the measured
 park/unpark p99. Failure case: a locked-down CI container refuses `mlock`; the profile records
-lock capacity 0, every volume reports `unlocked_bytes = referenced_bytes`, and `require_locked`
-volumes fail creation with `LockCapacityExceeded`.
+lock capacity 0, the diagnostic surface reports why residency cannot be established, and
+volume admission refuses `LockCapacityExceeded`; no unlocked content claim succeeds.
 
 **Laptop degenerate.** The same profile; one node in the failure-domain tree; no cluster fields.
 Same code, zero modes.
 
 ### 4.2 Memory: arenas, slabs, handles, pages, RAM-only guarantees (D-8, D-12, D-13)
 
-**Data model.**
-```rust
-struct Handle<T> { index: u32, generation: u32, _t: PhantomData<T> }   // Copy; never dangles
-struct Slab<T> { slots: Box<[Slot<T>]>, free: Vec<u32>, generation: Vec<u32> } // per shard
-struct ChunkArena { regions: Vec<LockedRegion>, buddy: BuddyTree, class_free: [FreeList; N_CLASSES] }
-struct LockedRegion { base: NonNull<u8>, len: usize, locked: bool, huge: bool, numa_node: u16 }
-```
-Ownership facts: every slab and arena belongs to exactly one shard; a handle is meaningful only on
-its owning shard (the shard id is part of the encoded handle when it crosses shards); freeing a
-slot from another shard is a message to the owner (snmalloc's model); chunk bytes are addressed by
-(arena region, offset, length) and never by raw pointer outside the owning shard's frame.
+> **Status (A-9, 2026-09-05).** Allocator and quota components exist. The server does not
+> establish the reservation below: `require_locked` is recorded without locking its store,
+> mapped length can exceed buddy-allocatable length, and dynamic pressure does not account
+> for competing claims. BUG-1–BUG-4 and GAP-A9-1 remain open.
 
-**Algorithms.** Allocation: pop a free slot (O(1)); if empty, take the next pre-faulted slab from
-the region reserve (O(1)); if the reserve is empty, the shard schedules a pre-fault task on its
-idle time and the request either proceeds from the buddy tree (for chunks) or refuses with
-`ArenaExhausted` (typed, retryable). Chunk extents: buddy allocation rounds to the page-multiple
-class; splitting and coalescing are O(log region). Growth without realloc: tables are segmented
-arrays (Brodnik) so a resize appends a segment. Freeing: the slot's generation increments, so any
-stale handle is refused. RAM-only: regions are locked at creation (mlock / VirtualLock after
-raising the working set / wired on macOS) in priority order (metadata slabs, rings, chunk regions);
-the locked and unlocked byte counts are tracked per shard and rolled up per volume.
+**Ownership and residency.** Each shard owns bounded generational slabs and chunk arenas;
+foreign frees are messages to the owner. Every allocation has a charge owner and a terminal
+release step. Releasing a handle reuses its slot with a new generation; repeated open/close
+cannot grow a vector of tombstones. Segment, slab and buddy geometry report usable capacity,
+not mapping length. Conversion, rounding, counter arithmetic and generation exhaustion are
+checked and refuse before mutation.
 
-**Bounded versus dynamic.** A bounded volume's quota is reserved at creation by transferring
-pre-faulted, locked regions from the shard reserve to the volume's accounting; if the reserve
-cannot cover it the creation is refused with `BudgetExceeded` (never a partial volume). A dynamic
-volume starts with an increment sized from its declared expected size (or the shard's measured
-median volume size) and grows by increments sized so that, at its measured allocation rate, the
-increment outlasts the measured time to pre-fault and lock the next one, and only while projected
-free memory after the grant stays above the reserve derived from the measured peak burst across
-all volumes; otherwise `ENOSPC` with a pressure event.
+Before admitting content, the server prepares and locks the memory that will back it and its
+metadata. This includes rings, logs, parse buffers, decompression, copies, archive construction,
+base caches, guest request buffers and retained versions. An uncharged heap allocation cannot
+sit outside the bound. Failed prefaulting or locking returns `LockCapacityExceeded` or
+`BudgetExceeded`; a requested strict guarantee never silently becomes swappable service.
+OS lock and working-set limits are inputs, not a reason to ask for root. Kernel/client/guest
+caches are separate owners: an end-to-end no-spill claim requires the bridge and harness to
+establish their residency and memory limits too. Report the established boundary precisely;
+absence of explicit file writes alone does not prove absence of swapping.
 
-**Base content cache.** Bytes read from a base directory for an overlay volume land in the
-owner shard's arena in one of two states. *Cached*: the entry's fingerprint still matches the
-disk, so the bytes can be re-read; cached pages are evictable and are the first thing released
-under pressure. *Pinned*: witnessed bases, copied-up bytes, and entries the agent pinned with
-`pin`; never evicted, charged to the volume like any other unique bytes. The cache budget is
-the dynamic-growth formula applied to the host: cached bytes may grow only while projected free
-memory after the growth stays above the reserve derived from the measured peak burst. A cache
-hit is validated by the entry's fingerprint (one `stat`, answered from the kernel's own cache) or
-by a watcher hint that nothing under that directory changed since the last validation.
+**Atomic admission.** For each actual holder host, maintain this invariant:
 
-**Failure matrix.** Lock capacity exhausted: Degraded (unlocked bytes reported per volume;
-`require_locked` refuses). Host pressure high (PSI `some` slope, macOS WARN/CRITICAL, Windows low
-memory): Degraded (dynamic growth paused; cold-chunk compression pass scheduled; typed events).
-Arena exhausted: Refused (`ArenaExhausted`, retryable after growth) never a spill. Stale handle:
-Refused (`StaleHandle`) with the operation's request id, never a crash.
+`physical_used + outstanding_entitlement + operation_headroom + control_reserve <= effective_capacity`
 
-**Derived constants.** Slab size = smallest page multiple ≥ measured p99 burst of allocations per
-operation × slot size; region size = lock-capacity share per shard / number of classes; growth
-increment = max(measured rate × prepare_time × safety, one slab); reserve = measured peak burst.
+`physical_used` includes allocator rounding, metadata and all resident copies. The outstanding
+entitlement is the extra physical cost required to honor admitted logical quotas in the worst
+permitted allocation shape, including future CoW. `operation_headroom` covers bounded temporary
+coexistence during copy-up, seal, compression, transfer, capture and landing. `control_reserve`
+keeps completion, cancellation, teardown and repair progressing. Effective capacity is the
+usable prepared arena capacity constrained by OS/job/cgroup/lock limits and measured pressure;
+raw free RAM and virtual address space do not qualify. Each term has measured or structural
+anchors (§4.1); no percentage or retry count is invented here.
 
-**Worked example.** An agent creates a bounded 4 GiB volume on a shard whose reserve holds 6 GiB
-locked: 4 GiB of regions move to the volume's accounting in O(regions); later a write that would
-push `referenced_bytes` past 4 GiB returns `ENOSPC` from the extent allocator before any byte is
-copied. Failure: the same request on a shard with 3 GiB reserve is refused with
-`BudgetExceeded{available: 3 GiB}` and the SDK reports it; nothing was allocated.
+Admission reserves all required credits or none before publishing a volume or attachment.
+The control owner distributes disjoint capacity credits to shards; the write path consumes
+local credits, with no shared lock or consensus call. Credits cannot be spent twice across
+shards, replay, delayed replies or cancellation. A remote holder makes the same admission
+against its own machine before acknowledging placement. A promise on host A reserves nothing
+on host B. Configuration and holder records expose the actual reservation and generation.
 
-**Laptop degenerate.** One host budget; the same formulas.
+**Resource dimensions.** A byte quota cannot bound arbitrarily many empty files, names,
+xattrs, open handles or snapshots. Admission therefore publishes a resource vector: content
+bytes plus inode/namespace, xattr, handle, in-flight and retention allowances, each derived
+from the requested policy and the prepared arena layout. Every dimension has its own bound
+and refusal; `statfs` includes backed inode availability. The default allowances and their
+cost are visible before admission, not hidden deductions discovered during a write. A write
+within all admitted dimensions retains its entitlement. A create beyond an advertised inode
+allowance may return ENOSPC even when content-byte space remains, just as on a finite filesystem.
+
+The content quota keeps D-13/A-7's charge definition: head-reachable materialized content,
+including shared referenced chunks, charged by the specified chunk-window rule. Unfetched
+live host bytes are an external source dependency, not pre-reserved RAM. They consume cache,
+copy-up or pin credits when fetched/retained. A live base's total logical size is not known
+without a scan; neither create nor statfs invents that total. Complete snapshot roots carry
+known referenced counts for O(1) clone admission. API output distinguishes these content
+charges, metadata limits and external source size.
+
+**Sacred bounded claims.** A bounded claim backs the whole admitted quota, not only current
+usage. Dynamic growth, prefetch, caches and other clients consume only unpromised capacity.
+Dedup charges each volume's logical referenced bytes in full and physical shared bytes once,
+while preserving the capacity needed if all entitled writers diverge. A new retained snapshot
+may require a separate retention charge: it cannot use up a writer's promised future space.
+No admission relies on another user's promised space becoming compressible or evictable.
+
+Grow reserves the additional entitlement atomically. Shrink refuses below retained obligations
+or current logical usage. Destroy/revoke releases credits only after handles, mappings, queued
+operations and all retained references are drained. Pressure first stops new admission and
+reclaims only evictable, unpromised content; it never steals an admitted claim. External OS
+revocation beyond the established resource boundary is reported as loss of that guarantee,
+never hidden as a successful smaller reservation. Admission prevents Slates from exhausting
+its verified host budget; it cannot constrain unrelated privileged allocators on the machine.
+
+**Dynamic volumes and base cache.** Growth increments derive from measured allocation rate
+and arena preparation time, bounded by the declared maximum and unpromised capacity. Cached
+base bytes are evictable only while they can still be re-read from their identified source.
+Witnessed, copied-up and explicitly pinned bytes are retained obligations. Watcher hints speed
+invalidation but cannot prove a cache entry clean; revalidation and the racy-clean rules in
+§4.15 remain authoritative. Cache overflow and pressure have typed results.
+
+**Refusals and status.** `BudgetExceeded{requested, available}`, `LockCapacityExceeded`,
+`ArenaExhausted`, `QuotaExceeded` (ENOSPC at a mount), `RetentionBudgetExceeded`, `StaleHandle`,
+`GenerationExhausted`, `ResourceGuaranteeLost`. Report logical quota/used, physical used,
+reserved remaining, retention, transient/control reserve, locked bytes and evictable bytes
+with freshness. `statfs` derives its result from these counters (§4.6).
+
+**Worked example.** A host has 6 GiB of usable prepared capacity after control and operation
+reserves. A claim whose full physical obligation is 4 GiB leaves at most 2 GiB for every other
+admission combined, even while that volume is empty. A second 3 GiB obligation refuses without
+changing either account. These are illustrative quantities, not tuning constants. Concurrent
+writers to the admitted volume must still be able to consume its remaining entitlement.
+
+**Laptop degenerate.** One host, the same accounting and per-shard credits; the fleet applies
+the invariant independently at every holder. Acceptance is observable competing-allocation,
+pressure, fragmentation, restart and open/close behavior, not assertions on quota fields.
 
 ### 4.3 Runtime: thread-per-core executor, drivers, rings, cancellation (D-7, D-9)
 
@@ -819,7 +928,7 @@ peers.
 **Data model.**
 ```rust
 struct Volume { id: VolumeId, name: Name, owner_shard: u16, policy: VolumePolicy,          // bounded|dynamic, name-equivalence, require_locked
-                base: Base,                                                                 // Scratch | Path
+                base: Base,                                                                 // retained across every clone
                 head: SnapshotId, epoch: Epoch, root: Handle<DirNode>, inodes: Slab<Inode>,
                 referenced_bytes: u64, unique_bytes: u64, quota: Quota,
                 lease: Option<Lease>, attachments: Vec<Attachment>, lineage: LineageEdge,
@@ -827,24 +936,30 @@ struct Volume { id: VolumeId, name: Name, owner_shard: u16, policy: VolumePolicy
 struct VolumePolicy { size: Bounded | Dynamic, names: NameEquivalence, require_locked: bool, role: Role }
 enum Role { Plain, Work { green: VolumeId, base: Version, excluded: FilterId, stream: bool },
             Green { require_evidence: bool, head: Version /* the chain lives in §4.16's records */ } }
-enum Base { Scratch,
+enum Base { Scratch, Immutable { snapshot: SnapshotId }, RemoteLive { reference: BaseRef },
             Path { root: HostDir /* an open directory descriptor, never a string on hot paths */,
                    witnesses: Art<PathKey, Witness>, listings: Art<PathKey, ListingCache>,
                    drift: Art<PathKey, Drift>, watch: Option<WatchHandle>, fs: BaseFsFacts } }
 struct Witness { fingerprint: Fingerprint, identity: Blake3, witnessed_at: Monotonic, racy: bool }
 struct Fingerprint { dev: u64, ino: u64, size: u64, mtime_ns: i128, ctime_ns: i128, mode: u32 }
 struct Snapshot { id: SnapshotId, epoch: Epoch, root: Handle<DirNode>, deadlist: Deadlist, refs: u32, identity: Option<Blake3>,
-                  witnesses: Option<Handle<WitnessSet>> /* overlay volumes: the delta's third leg */ }
+                  witnesses: Option<Handle<WitnessSet>>, base: BaseRef, coverage: SnapshotCoverage }
+enum SnapshotCoverage { Complete, DeltaWithLiveBase }
+// BaseRef includes source identity, serving authority and lifetime, not just a host pathname.
 struct Lease { holder: PrincipalId, epoch: u64 /* fencing token */, expires: Monotonic }
-struct Attachment { id: AttachmentId, consumer: Consumer /* sdk client | bridge mount | launcher */, snapshot: SnapshotId, form: AttachForm, accounting: AttachStats }
+struct Attachment { id: AttachmentId, consumer: ConsumerId, view: AttachedView, form: AttachForm,
+                    rights: Rights, generation: Epoch, state: AttachmentState, accounting: AttachStats }
+enum AttachedView { LiveHead(VolumeId), Frozen(SnapshotId) }
+enum AttachmentState { Binding, Bound, Advancing, Draining, Detached }
 enum VolumeState { Creating, Live, Sealing, Landing, Archived, Restoring, Destroying, Destroyed }
 ```
 Ownership: all fields live on the owner shard; readers on other shards see only published
 snapshot roots (immutable) and the catalog record replicated through the database. `HostDir` is
 opened once at create (`O_DIRECTORY|O_NOFOLLOW`, or the Windows directory handle) and every base
 access is relative to it, so a later rename of the base directory by the user changes nothing.
-The base plane's records (`witnesses`, `drift`, `listings`) are volume state on the owner and are
-journaled into the op log, so they survive a daemon restart through the anchor segment.
+The base plane's records (`witnesses`, `drift`, `listings`) are volume state on the owner and must be recoverable with content and roots from the anchor segment. This is the target;
+current server reconstruction drops content (BUG-11). The sketches above describe the required
+model, not the currently encoded wire schema. All collections have §4.2 bounds.
 
 **State machine.** `Creating → Live` (one release store); `Live ↔ Sealing` (snapshot in
 progress: the head epoch advances, the old head becomes a snapshot record, in-place mutation of
@@ -863,27 +978,39 @@ quota, tombstone the id for the lease horizon).
   a path inside a slates mount, a path the caller does not own, or a path that resolves through a
   symlink out of its parent), records `Base::Path` with empty witness, listing and drift tables,
   and returns. No walk, no hashing, no copy; the cost is one directory open beyond the scratch
-  case. A scratch volume becomes an overlay volume over the directory of its first landing. In
+  case. Initial enrollment/open is separately measured; the <50 µs claim covers the admitted
+metadata provisioning path, not arbitrary host pathname resolution. A scratch volume becomes an overlay volume over the directory of its first landing. In
   a fleet the create is just as local: the id carries the creator host, the owner is the
   creator, the candidate holders are computed from the neighbourhood, the epoch-one head record
   goes to them after the local commit, and the reply carries `placed: false` until f+1 have
   acknowledged; nothing is written to any consensus group.
-- snapshot(volume) → SnapshotId: record {epoch, root, empty deadlist, witness set handle};
-  increment epoch; O(1). `await placed(snapshot, scope)` returns when f+1 candidate holders in
-  the home region hold the sealed content and the head record (`region`), or when the mirror
-  region's f+1 hold them as well (`mirror`); the scope is per call. For an overlay volume the
-  snapshot's identity covers the delta and the witnessed bases; untouched entries are not part
-  of it, which is what "disk is the truth" means.
-- clone(snapshot) → Volume: create with base; O(1) plus the catalog record. A clone of an overlay
-  snapshot shares the same host directory as its base.
-- attach(volume|snapshot, consumer, chosen_path?) → Attachment: validate the lease/read intent;
-  register with the bridge (publish the name under the root, or grant the chosen-path form: a
-  bind mount in a private namespace on Linux, a separate URL-identified FSKit mount on macOS 26+
-  or a second NFS mount on the fallback, a second drive letter on Windows); start prefetch if
-  the base has a learned hot set; O(1) locally except where the OS form needs a mount syscall,
-  whose measured cost is reported in the reply.
-- detach(attachment): flush nothing (writes are already in memory), drop the registration,
-  invalidate bridge caches for the subtree, release the consumer's accounting.
+- snapshot(volume) → SnapshotId: establish the attachment barrier, then publish a frozen root,
+  witness-set handle, retained `BaseRef` and coverage; advance the epoch. The root publication
+  is O(1). With a live base, untouched entries remain live and coverage is `DeltaWithLiveBase`;
+  its identity covers the delta, witnesses and source reference, not unfetched host bytes.
+  With an empty or complete immutable base, the snapshot covers the entire logical tree.
+  `await placed(snapshot, scope)` reports which coverage was placed, never silently upgrading it.
+- capture_base(volume, consistency) → SnapshotId: explicitly capture the whole logical tree
+  and its metadata into a complete immutable root using §4.15's stable-source protocol.
+  Requested atomic point-in-time consistency refuses `ConsistentBaseUnavailable` unless the
+  source can be quiesced or read through a supported immutable snapshot. A before/after stat
+  check is not proof of atomic capture of an arbitrary changing tree. The operation is bounded,
+  cancellable and separately charged; cost is proportional to content examined and retained.
+- clone(snapshot) → Volume: share the delta root, witnesses and complete base reference by
+  handles; add the claim and lineage record. Root cloning is O(1). A remote clone retains the
+  base service dependency or uses an already complete immutable base. It never turns into an
+  empty scratch volume merely because its source directory is remote.
+- attach(volume|snapshot, consumer, transport, chosen_path?) → Attachment: authenticate the
+  consumer and requested access, reserve all costs, pin the view and generation, establish
+  the path or device, then publish `Bound`. Refusal rolls back owned resources. A metadata
+  record with `path: None` is not a successful requested host mount. Mount/device setup time
+  is reported separately from volume provisioning.
+- detach(attachment): enter `Draining`, stop new effects, establish the flush boundary and
+  fence the generation; drain outstanding requests, invalidate caches and revoke mappings,
+  then release view references and credits and enter `Detached`. Failure preserves enough
+  state for retry or explicit failed-consumer cleanup; it never reports a clean flush of
+  data that a crashed client had not submitted.
+
 - resize(volume, quota): bounded → move regions in or out of the reserve (refuse if
   `referenced_bytes > new quota`); dynamic → change the maximum.
 - archive(volume|snapshot) → Archive: seal (hash), compress per the cost model, keep the manifest
@@ -922,6 +1049,15 @@ quota, tombstone the id for the lease horizon).
   that declares a true insert or delete). A mount write to a green volume is `EROFS`; an SDK
   write is `ReadOnlyVolume`.
 
+**Attachment lifecycle.** `Binding → Bound → Draining → Detached`; immutable readers may
+`Bound → Advancing → Bound` only after a requested version is authorized, placed to its required
+scope and ready to serve. `advance` drains old requests, invalidates old caches/mappings and
+publishes the new generation atomically. It cannot combine old names with new bytes. Writable
+attachments follow the one-owner lease; a read-only guest cannot acquire write authority by
+setting FUSE flags. Revocation stops admission before any later device, queue or VFS effect.
+Every request belongs to a live attachment generation; stale work is refused before application.
+The bridge barrier and device teardown obligations are §4.6, including consumer crash.
+
 **Leases and fencing (D-16).** Every mutation carries the caller's attachment id and lease epoch;
 the owner shard compares the epoch with the volume's current lease; lower epoch → `StaleLease`
 (refused, never applied); a lease renews implicitly on activity and expires after a term derived
@@ -937,8 +1073,9 @@ in a fleet: Degraded (the regional configuration group bumps the host's epoch an
 volume to the surviving candidate holder that rendezvous ranks first; that host runs phase one
 across the neighbourhood, adopts the newest head record, and serves; live edits since the last
 seal are reported lost as the volume's stated loss window, or recovered from the shipped log for
-`live-shipped` volumes); an overlay volume cannot be promoted elsewhere because its base is on
-the lost host, so it reports `BaseUnavailable` until that host returns (§4.10).
+`live-shipped` volumes). A delta owner may be promoted, but unfetched paths in a live base on
+the lost host report `BaseUnavailable`; only complete placed snapshots are independent of it
+(§4.10). A replayed id without its bytes must refuse, never return a successful empty tree.
 Lease holder (a client) crash: Degraded (writes refused until the lease expires; the SDK reports
 `LeaseExpired`). Quota exhausted: Refused (`ENOSPC`). Attach with a chosen path that cannot be
 honoured: Refused (`ChosenPathUnavailable{reason}`). Archive with insufficient memory for the
@@ -961,7 +1098,14 @@ plane `ReadOnlyVolume`, `NotGreen`, `NotWork`, `UnknownBase{green, version}`,
 `DuplicateIncrement{original}` (informational), and for the fleet `StaleEpoch{current}` (a
 holder refusing a record below the epoch it has seen), `ConfigurationStale{version}` (a request
 carrying an old configuration version; the reply carries the current one), `NotPlaced{scope}`
-(an `await placed` deadline passed). An uncategorized refusal is a bug.
+(an `await placed` deadline passed).
+A-9 adds `RetentionBudgetExceeded`, `GenerationExhausted`, `ResourceGuaranteeLost`,
+`ConsistentBaseUnavailable`, `RecoveryIncomplete`, `AttachmentUnsupported{transport, reason}`,
+`BarrierIncomplete{attachment, generation}`, `ConsumerNotEnrolled`, `ConsumerRevoked`,
+`GrantIssuerUnverified` and `LeaseUnconfirmed`. `QuotaExceeded` maps to ENOSPC at a mount;
+subsystem-specific wire/transfer errors retain their closed kind through adapters. An
+uncategorized refusal or a false success is a bug. These required variants are not all
+implemented by the current schema.
 
 **Derived constants.** Lease term = k × measured renewal RTT p99 with k chosen so that the
 failover delay (one term) stays under the operator's failover SLO; tombstone horizon = lease term
@@ -989,7 +1133,7 @@ returns `BaseDrift{[src/data.bin]}` instead of torn bytes; the agent's own writt
 intact.
 
 **Laptop degenerate.** Identical; replication queues have no peers; overlay volumes are the common
-case on a laptop and the host-pinned case in a fleet.
+case on a laptop; a live base retains its source-host dependency in a fleet.
 
 ### 4.5 Namespace and content structures (D-4, D-5, D-6, D-25)
 
@@ -1121,19 +1265,18 @@ the verdict that every entry beneath still matches its listing fingerprint.
 
 ### 4.6 OS bridges (D-1, D-2, D-3)
 
-> **Status (2026-09-05).** Phase 3 has begun: `slates-bridge-fuse` (`crates/bridge-fuse`, GAPS
-> §8e) is the FUSE ABI codec — the request parser, the reply encoders, and the `FUSE_INIT`
-> negotiation, all pure and tested on every host with golden vectors and hostile-input tests
-> (§4.9). The `/dev/fuse` transport, `FUSE_DEV_IOC_CLONE`/io_uring channels, mount
-> establishment with the anchor's fd handoff, the `Bridge` implementation over the volume core,
-> `slates exec`, and the conformance and workload suites are the rest of Phase 3, in the Linux
-> CI lane. macOS (FSKit) is Phase 4; Windows (WinFsp) follows.
+> **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
+> exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
+> the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing
+> fsync/link handling, ignored setattr fields/rename flags, incomplete base lookup and invented
+> statfs capacity (BUG-5–BUG-10). Invalidation encoding is not proof of delivered kernel
+> coherence. virtio-fs, macOS and Windows adapters remain planned; no mounted suite was rerun.
 
 **Role.** Present the root mount and every attached volume to the kernel; translate kernel
 requests into shard operations by handle; emit invalidations; read base files for overlay
 volumes; never write to disk.
 
-**Bridge trait (one implementation in the core, three drivers plus the macOS fallback).**
+**Bridge trait (one VFS operation layer, native and virtio-fs transports).**
 `lookup`, `getattr`, `setattr`, `readdir`/`readdirplus`, `open`, `create`, `read`, `write`,
 `flush`, `release`, `forget`, `fsync` (never writes a disk: on a laptop it returns success once
 the operation is in the anchor segment; in a fleet, for a volume whose policy asks for it, it
@@ -1146,13 +1289,20 @@ replies reference arena pages. A mount of a green volume answers every mutating 
 invalidates exactly the paths the manifest diff names.
 
 **Linux (own /dev/fuse driver).** Mount: at daemon start (or restore from the anchor's held fd),
-without `fusermount3` when `CAP_SYS_ADMIN` in the user namespace is available (open `/dev/fuse`,
-new mount API), otherwise via `fusermount3`; options: `default_permissions`, `allow_other` only
+using the OS-installed broker for privileged mount establishment; the daemon itself never
+requires `CAP_SYS_ADMIN`, root or a Slates-owned setuid helper. Namespace attachment capability
+is checked by the launcher and refused when unavailable; it is not a daemon prerequisite. Options: `default_permissions`, `allow_other` only
 if `user_allow_other` is set and the operator asked; `FUSE_INIT` negotiates writeback cache,
 splice, readdirplus, `EXPLICIT_INVAL_DATA`, `EXPIRE_ONLY`, parallel dirops, and `OVER_IO_URING`
 when the kernel offers it; one channel per shard (`FUSE_DEV_IOC_CLONE`, or io_uring per-core
-queues). Cache posture: infinite entry/attr timeouts, explicit invalidation on every mutation of
-a path visible through another attachment, `INC_EPOCH` when supported after snapshot swaps. The
+queues). Cache posture: only negotiated, tested features may be advertised. Infinite cache
+lifetimes require proven invalidation delivery and recovery for every mutation source; a
+notifier encoder alone cannot justify them. Unsupported semantics are explicitly refused.
+Live source names/attributes/content cannot have an indefinite kernel cache lifetime:
+watchers may miss outsider writes. Current-state operations revalidate through the base seam;
+only pinned/immutable views can justify retention without a source check. A transport that
+cannot implement the requested coherence refuses that guarantee. §4.15 supplies the source
+validation rules; finite stale-data TTLs do not silently become exact live-source semantics. The
 launcher (`slates exec`) implements the chosen-path form with `CLONE_NEWUSER|CLONE_NEWNS`,
 recursive-private root, and a bind mount; on AppArmor-restricted hosts it reports the exact
 setting needed. Base files: a read-only `open` of an untouched base file is answered from
@@ -1179,16 +1329,15 @@ System Settings > General > Login Items & Extensions > File System Extensions. C
 attributes are versioned by FSKit's sequence numbers and returned with every handler result;
 invalidation of names and data after writes that arrive through the SDK ring (not through the
 mount) is the spike's central measurement; until it is proven, such writes also touch the
-item's attributes through the mount path so FSKit's own versioning observes the change. The
-Operations protocols (15.4–26) and the Handler protocols (27+) are both implemented behind one
-shim interface. On macOS 15.4–15.x the module can be backed by an `FSBlockDeviceResource` on a
+item's attributes through the mount path so FSKit's own versioning observes the change. The supported FSKit API revision is pinned by the Phase 4 capability/packaging decision;
+no parallel compatibility shim is authorized by this design. On macOS 15.4–15.x the module can be backed by an `FSBlockDeviceResource` on a
 RAM disk (`hdiutil attach -nomount ram://`) whose contents are ignored, if the spike shows the
 form acceptable; otherwise those systems use the fallback.
 
 **macOS fallback (own NFSv3 loopback server; macOS 14.4 and any system where FSKit is
 unavailable or disabled).** One TCP loopback listener held by the anchor; ONC RPC record
-marking; NFSv3 + MOUNT + a minimal portmap responder; the root mount at a user-owned mount point
-created once (or on a RAM disk when `hdiutil attach -nomount ram://` is permitted for the user)
+marking; NFSv3 + MOUNT + a minimal portmap responder; the root mount at an existing user-owned mount point
+(or an already established RAM-backed target)
 with `nfsv3,tcp,port,mountport,soft,intr,locallocks,nosuid,rdirplus` and attribute-cache
 timeouts derived from the measured loopback GETATTR RTT; file handles encode
 `(volume, inode no, gen)`; invalidation by directory attribute change after snapshot swaps
@@ -1208,6 +1357,71 @@ replies from arena pages as for any chunk. Listings use `getattrlistbulk` and
 `NtQueryDirectoryFile` respectively, so a `readdirplus` of a merged directory costs one bulk call
 per directory, not one `stat` per entry.
 
+**virtio-fs and OCI attachment contract (A-9).** The guest transport is FUSE-over-virtio
+served by an owned device integrated with the custom executor. Hecate's in-process libkrun
+integration is the reference, not a requirement to introduce a standalone daemon with a disk
+socket. The seam accepts guest-memory/queue capabilities and completion notification from the
+host VMM through an in-process interface or an inherited descriptor. The harness owns VM and
+container creation; Slates owns the exported attachment and filesystem service. Native host
+mounts remain available without a VM. Evidence: [research/hecate-contract-review.md](research/hecate-contract-review.md) §2.
+
+A host OCI runtime passes the established host attachment into the container mount namespace;
+a Linux guest mounts the exported virtio-fs tag, and OCI containers inside it consume that guest
+path. Capabilities differ by host, kernel, runtime and VMM and must be reported by `attach`
+and `status`: supported transport, target-path constraints, read/write policy, sharing/cache
+semantics, residency boundary and conformance evidence. Requesting an unsupported form returns
+`AttachmentUnsupported{transport, reason}`. A metadata record is insufficient evidence of a
+usable container path or guest device. No disk socket, image construction, target mkdir or
+privilege escalation is implicit in attaching a VFS volume.
+
+Device admission authenticates the consumer before creating a queue, mapping guest memory or
+publishing a tag. Queue descriptors, scatter/gather ranges, arithmetic and chained lengths are
+validated within derived caps before access. In-flight requests, mapped bytes, copy buffers and
+replies consume the attachment's credits; cancellation and revocation reclaim them under an
+owned terminal step. Separate virtqueues alone do not provide §4.9's end-to-end QoS.
+
+DAX, if exposed, may map only verified immutable content while that version is pinned. Every
+page visible to a guest must contain only bytes it is authorized to see, including page padding
+and neighboring chunks; mappings must be revoked before reuse or `advance` completes. Mutable
+content goes through the VFS write boundary so witness, journal, quota and lease checks run.
+The baseline contract does not require DAX; a requested DAX capability cannot be advertised
+until mapping isolation, pinning and teardown have been established for that VMM.
+
+**Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
+the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
+the set of contributing writable attachments, stop admission into the closing generation,
+request the supported client flush, drain accepted requests, and publish the root only after
+all included writes are recorded with their bytes. New writes belong to the next generation;
+no write may straddle both. A failed participant gives a typed incomplete barrier, not a clean
+snapshot. Application buffers not submitted by the process remain outside this guarantee;
+client `fsync` must reach the bridge and its declared durability boundary. Auto-seal of only
+server-visible writes reports that narrower boundary and cannot claim to include dirty guest
+pages. Mount setup and barrier latency are outside the O(1) root publication measurement.
+
+**POSIX and transparency acceptance.** The shared operation layer must preserve hardlinks,
+unlink-while-open, rename replacement/exchange/no-replace flags, symlinks, truncation/sparse
+files, permissions and ownership, timestamps, error codes, descriptor lifetime, `fsync`,
+shared mappings and platform locking semantics. Extended attributes, watcher events and
+platform-specific flags have explicit capability contracts. Never acknowledge an ignored
+`setattr` field or discard a `renameat2` flag. FUSE ABI vectors must be checked against the
+kernel headers independently of the encoder; for example WRITEBACK_CACHE is bit 16, while bit
+8 is FILE_OPS (audit BUG-6). Advertise READDIRPLUS only with its complete handler.
+
+`statfs` reports logical capacity and remaining space that the physical claim can honor,
+using checked block rounding; it must not derive free space from twice current usage. Base
+lookups and metadata mutations go through the same overlay rules as reads and writes.
+Conformance runs through actual host mounts and Linux guests, including namespace-mutating
+base operations, concurrent SDK/kernel writes and invalidation loss. Source-level tests alone
+cannot establish the mount guarantee. A native Windows or NFS adapter must report its actual
+semantics; a Linux guest provides a separate POSIX target, not evidence for those native paths.
+
+A mount is transparent to ordinary path-based tools within the selected namespace, but remains
+a filesystem boundary: `st_dev`, mount tables, cross-boundary links and EXDEV may expose it.
+Attaching over an existing directory hides it in that namespace; the retained base descriptor
+still serves its original contents. Other namespaces need their own attachment. Missing target
+directories are refused because creating one would write disk. Full equivalence to an existing
+physical volume's device identity or cross-volume rename is not promised.
+
 **Failure matrix.** Daemon crash: Linux `ENOTCONN` until the anchor restarts the daemon and hands
 back the fd (Degraded, seconds); macOS FSKit: the extension's forwarding calls fail typed until
 the daemon is back, and the extension survives because it is a separate process (Degraded; the
@@ -1217,7 +1431,8 @@ the volume disappears and reappears (Degraded, open handles error). Extension cr
 FSKit unmounts the volume; the daemon's state is intact; the anchor re-mounts (Degraded).
 Unprivileged user namespaces disabled: Refused for the launcher form with the exact remedy.
 `allow_other` requested but not permitted: Refused with the `/etc/fuse.conf` line. FSKit module
-not enabled: Refused with the exact System Settings path, then the NFS fallback is offered. Base
+not enabled: Refused with the exact System Settings path. Any separately selected limited
+NFS form reports its weaker semantics and cannot satisfy a full-POSIX request. Base
 file unreadable (permissions changed, base unmounted): Refused (`EIO` at the mount, `BaseUnavailable`
 in `status`) for that entry only.
 
@@ -1237,7 +1452,7 @@ chosen path mounts `slates://volume/7/attach/3` at `~/proj/build`; `cargo build`
 a normal directory; `umount ~/proj/build` or `detach` removes it. Failure: the agent asks to
 attach at `/home/u/proj/build` on Linux, which does not exist; the launcher form refuses with
 `ChosenPathUnavailable{missing: "/home/u/proj/build"}` and the SDK falls back to the
-root-relative path if the caller allowed it.
+root-relative path as an explicit alternative; it does not report that the requested path was attached.
 
 **Laptop degenerate.** Identical; one root mount.
 
@@ -1324,39 +1539,16 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 
 ### 4.8 Metadata database, registers and configuration (D-14, D-18)
 
-> **Status (2026-09-05).** The register protocol's f=0 degenerate is implemented (GAPS §8d,
-> Phase 2 task 7): `crates/db/src/register.rs` is the pure core parameterized by the fault
-> tolerance `f` — `Quorum` (`2f+1` candidates, commit at `f+1`), rendezvous candidate selection,
-> the `Fence` (a record under a host epoch below the highest seen is refused `StaleEpoch`), and
-> `Configuration` (the one-voter oracle: a stale version is refused `ConfigurationStale`;
-> `await placed(region|mirror)` returns for the region and refuses the absent mirror). At `f=0` a
-> register's only candidate is the owner, its commit is the local append, `placed` is true the
-> moment the owner holds it, and the configuration never advances — the same code a fleet runs
-> with a larger `f`. Every reply carries the placement from the first version (`PlacedState`:
-> `region`, `mirror_age_ns`, `host_epoch` on `status`; the `await_placed` verb and `slates volume
-> placed`), so Phase 8 changes no interface. The N=1 differential (AC-2.5's register slice)
-> asserts f=0 and a simulated f=1 agree. Phase 8 has begun on top of this core: the fenced ledger
-> register (`crates/db/src/ledger.rs`, GAPS §8h) is the register over time — a `Cohort` of the
-> `2f+1` holders, an `Owner` that appends a record at the next position and commits it at `f+1`
-> acknowledgements, and takeover by epoch bump with a phase-one max-epoch read that adopts the
-> committed prefix. It is a pure, deterministic simulation (holders in memory, a message a direct
-> call), so one body of code is the laptop (`f=0`, the local append) and the fleet, and the
-> simulation is the protocol's proof: a proptest oracle over arbitrary proposal/partition/takeover
-> histories checks Agreement (no position holds two quorum-agreed values), NoLoss and TotalOrder
-> (the committed prefix only extends and never rewrites), Continuity (a takeover adopts at least
-> the committed prefix), and StaleNeverCommits (a fenced owner reaches at most `f` holders), the
-> properties the `FencedRegister` model proved. Asynchronous mirroring is also implemented
-> (`crates/db/src/mirror.rs`): a `Mirror` is a second cohort in another failure domain whose `ship`
-> replays the home region's committed prefix in epoch order through `Owner::replicate` (idempotent,
-> resumable), exposing the lag and answering `await placed(mirror)` — closing the mirror durability
-> scope `register.rs` declared. Reconfiguration is also implemented (`crates/db/src/reconfig.rs`,
-> the port of the `Reconfig` model): a register's holder set changes old → joint → new by Raft joint
-> consensus, with state transfer and a retirement gate, its ReadSafety and NoLoss checked by a
-> proptest over arbitrary histories. Wiring these into the server's put path (hedged placement,
-> recorded holder sets), the healer and probation, the mirror shipper's runtime cadence and
-> cross-region transport, migration on a write-intent attachment, the SWIM membership, and the
-> regional configuration consensus group that carries the membership decisions are the rest of
-> Phase 8.
+> **Status (A-9, 2026-09-05).** Local records, replay/completion transactions and an
+> f-parameterized register core exist. `ledger`, `mirror` and `reconfig` are pure simulations
+> using direct calls. They are not an implementation-side proof of the historical TLA models
+> or a working fleet. BUG-12 exposed a committed-prefix counterexample at `a1059ed`.
+> Separate commit `d9cb6e5` fixes acceptance-epoch refresh and removes BUG-13's candidate-zero
+> reachability restriction; its commit reports a before/after regression and 40 passing DB
+> tests, not rerun here. Direct adoption-value checks and message-level histories remain owed. Mirror simulation does not establish transport, byte placement or time lag.
+> Server wiring, regional configuration consensus and the acceptance gates below remain open.
+> A-9 changes the required §4.8 contract; model refinement/revalidation remains explicitly owed
+> before closure. No checker, tool installation or new CI job is authorized by this amendment.
 
 **Role.** The authoritative record of volumes, snapshots, lineage, leases, attachments,
 accounting, completion records, grants, chains and the operation log; served locally in
@@ -1390,7 +1582,48 @@ Ownership facts: a partition has one writer, its shard; a register has one legal
 owner host, under its current host epoch; a holder accepts a record or a content put only when
 its epoch is at least the highest it has seen for that host; the configuration is written only
 through the regional group, read by every node from its local copy, and versioned, so a request
-that carries a stale version is refused with the current one and succeeds on one retry.
+that carries a stale version is refused with the current one. Redirect retries consume a
+bounded deadline/attempt budget; concurrent reconfiguration can require another refresh.
+
+**Required persistence and protocol invariants (A-9).** Local record recovery must recover
+all reachable bytes, roots, bases, witnesses, rights, reservations and completion records from
+anchor-owned RAM. Persist effect and completion as one recoverable publication; an idempotent
+retry must recover the same result and contents. Rebuilding a scratch volume from only a quota
+and id loses acknowledged data. Live directory handles require an anchor handoff or validated
+reacquisition of the same source identity; reopening a path alone cannot substitute another
+base. Missing resources return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
+
+For each ledger position, distinguish a holder's promised epoch from its accepted
+`(epoch, value)`. Phase one consults an authorized quorum of distinct holders and adopts the
+highest accepted proposal consistent with the committed prefix. Phase-two acceptance at a new
+epoch records that epoch even if the bytes equal the holder's older value. Matching bytes do
+not justify keeping the old ballot: a later quorum could otherwise prefer a conflicting
+proposal from between those epochs (BUG-12). A replicated prefix must be checked for extension,
+not only length, before any mutation. No historical committed value may ever be rewritten.
+
+Epoch allocation derives from configuration authority, not a simulation's access to unreachable
+holders' internal state. Checked counters refuse exhaustion. Quorum counts exclude duplicate,
+stale, foreign-generation and unauthorized acknowledgements. Configuration changes fence old
+writers and complete required state transfer before retiring holders; every head references
+verified content and reservations under a compatible generation. The holder set, record and
+its placed status publish atomically. Network receipt is not acceptance, placement or commit.
+
+Owner-local linearizable reads require an established lease safety argument covering renewal,
+clock bounds, scheduling pauses, expiry and takeover. Failure suspicion alone gives no read
+or write authority. An old owner whose local proof is uncertain returns `LeaseUnconfirmed`;
+the already-designed quorum read must itself validate the epoch and adopted prefix. Neither
+a local timer nor an unqualified majority GET is by itself proof of a latest committed head.
+Configuration ReadIndex remains on the control path; this amendment adds no per-write
+configuration call or lock service. N=1 uses the same state transitions and failure semantics.
+
+Required evidence is an implementation-facing message driver with independently delayed,
+duplicated, dropped and reordered messages; asymmetric partitions; pauses and restarts;
+uncommitted tails; changing reachable majorities; membership changes and stale owners.
+The serial oracle remembers historical committed values, not merely current prefix lengths.
+Every candidate may be unreachable; the test cannot always retain candidate zero. Agreement,
+TotalOrder, Continuity, StaleNeverCommits, ReadSafety and NoLoss must hold with real byte
+references and the audit counterexample. Hecate's consensus bug cases are adapted individually,
+with their applicability recorded; an aggregate simulation count does not close those cases.
 
 **Transactions.** Every operation is one-shot and names its volume; it executes on the owner in
 one step with no awaits inside; cross-partition operations (clone into another owner's quota,
@@ -1430,34 +1663,45 @@ that rendezvous ranks first. Each new owner runs phase one in one batched round 
 class across the neighbourhood: every holder raises its fence for that host to the new epoch
 and reports the highest record it holds for each object; the new owner adopts the newest
 reported record per object (which is at least as new as anything that ever committed under the
-old epoch, because f+1 acknowledgements and f+1 replies intersect) and serves. Content needs no
-transfer: the new owner already holds what it acknowledged and fetches the rest by identity from
-the recorded holders. Background re-replication restores 2f+1 candidates and f+1 copies. A resumed
-stale owner is refused with `StaleEpoch` at the first holder it touches and drops its role. The
-`FencedRegister` model in `docs/wip/models/` checks TotalOrder, Continuity, StaleNeverCommits and
-ReadSafety for this protocol.
+old epoch, because f+1 acknowledgements and f+1 replies intersect), completes safe adoption
+under the new epoch as specified above, and only then serves under confirmed authority.
+No eager whole-tree transfer is required for a metadata handoff; missing referenced content
+must be fetched from verified holders before serving the affected reads. Background re-replication restores 2f+1 candidates and f+1 copies. A resumed
+stale owner is refused by holders that have installed the new fence and cannot obtain a legal
+commit quorum. It drops its role on `StaleEpoch`. The historical `FencedRegister` model checks
+its modeled TotalOrder, Continuity, StaleNeverCommits and ReadSafety transitions; A-9 requires
+refinement and revalidation before those results can be applied to the corrected implementation.
 
 **Neighbourhood changes.** A host's neighbourhood changes only through the group (a member
 left, a fresh member joined, a rebalancing). While a change is in flight the owner writes to a
 quorum of the old candidates and a quorum of the new ones (joint writes); the group retires the
 old set only after the owner has acknowledged the new configuration and the newest committed
 record is held by f+1 of the new candidates; a restarted host rejoins as a new member and holds
-nothing, which is a structural test. The `Reconfig` model checks ReadSafety and NoLoss across
-the change.
+nothing until its generation and retained state are validated. The historical `Reconfig`
+model checks modeled ReadSafety and NoLoss; byte/capacity publication and delayed-message
+integration still require the A-9 tests.
 
-**Leases and reads.** A host's authority is its epoch: while the group has not bumped it, the
-host's writes are accepted, and it serves linearizable reads of what it owns from local state,
-the primary's lease of Vertical Paxos, expressed in each holder's monotonic clock from the last
-membership heartbeat plus the measured drift bound; a host that cannot confirm its membership
-within that bound stops serving reads it cannot prove and refuses with `LeaseUnconfirmed`.
-Snapshot reads by any recorded holder need no lease.
+**Leases and reads.** Epoch fencing alone does not authorize linearizable owner-local reads.
+Use the explicit lease safety obligations above: only an owner with a currently confirmed,
+conservatively bounded lease may serve the latest head locally. Expiry/uncertainty stops those
+reads before a takeover can make them stale. Membership heartbeat arrival is not a lease grant;
+a majority observation must belong to the relevant authority generation. Immutable complete
+snapshot reads need no latest-head lease but still require read rights and verified content.
+
+**Authority scope.** Host failure increments the host epoch and fences every object owned by
+that host. Moving one volume changes that object's ownership generation, recorded in the
+configuration's moved-object exceptions, without fencing unrelated volumes. Requests and
+placement records bind both scopes; cached configuration/attachment generations suffice on
+ordinary writes. A region-home move also carries root-group authority. The id still routes by
+creator plus these exceptions; this adds no global lookup catalog or per-write coordination.
 
 **Lookup.** A volume id carries its creator host. A lookup by id routes to that host, or, when
 the configuration records a takeover of that host, to the candidate that rendezvous ranks first
-among the survivors of its neighbourhood at the takeover generation; a moved home is the one
-entry in the configuration that names a volume. The answer comes from the current owner and is
-authoritative; no index exists anywhere. Names are scoped to a host and user, so a global name is
-(host, user, name) and resolves the same way. Fleet-wide enumeration is a scatter-gather over
+among the survivors of its neighbourhood at the takeover generation; an ownership or home move is a configuration exception naming the affected volume and its
+authority generation. The answer comes from the current owner and is
+authoritative; no global index exists. Names live in an enrolled namespace whose owner is
+routable by id; the CLI resolves `namespace/name` through that owner, defaulting to its current
+context. A name is not a host pathname or a bearer capability. Fleet-wide enumeration is a scatter-gather over
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
 
@@ -1477,18 +1721,20 @@ its bound; exceeding it is a placement bug, not a tripwire.
 
 **Mirroring.** Every committed record and its content is shipped to the mirror region's
 neighbourhood of the owner asynchronously, in epoch and sequence order, by the same put
-machinery; the mirror acknowledges at f+1 of its candidates; `mirror_age` per volume is the age
-of the newest record the mirror has acknowledged; `await placed(mirror)` returns when the named
-snapshot's record and content are acknowledged there and pays one WAN round trip for that call
-only. Region loss promotes the mirror through the root group at operator cadence; the loss
+machinery; the mirror acknowledges at f+1 of its candidates. `mirror_age` is measured on the
+home clock from the oldest home-committed record still lacking mirror acknowledgement, zero
+when caught up; status also reports the mirrored prefix and observation freshness. Lost clock
+or acknowledgement knowledge is unknown, not zero lag. A record count is a separate metric; `await placed(mirror)` returns when the named
+snapshot's record and content are acknowledged there; elapsed time includes any backlog,
+content transfer and quorum acknowledgement, not a guaranteed single WAN round trip. Region loss promotes the mirror through the root group at operator cadence; the loss
 window is the mirror lag at that moment, zero for every operation that awaited the mirror.
 
 **Recovery.** Node restart: the anchor segment replays the local log and `put_wal` into fresh
 indexes; the node rejoins with a new ephemeral id (a restart is a join) and holds nothing for
 others until re-replication fills it; its owned objects are taken over by its neighbours after
-the membership horizon. RAMCloud's recovery-time budget is the target; takeover is one group
-commit plus one batched phase-one round per neighbour, with no data movement on the critical
-path.
+the membership horizon. RAMCloud's recovery-time budget is a reference, not a Slates result;
+metadata takeover uses a configuration decision and phase-one exchange. A read may additionally
+need content fetch and a confirmed lease; measure that complete recovery boundary.
 
 **Failure matrix.** A candidate holder slow: Masked (the hedge completes the put elsewhere;
 the slow holder goes on probation after the derived count and the group replaces it). Fewer than
@@ -1496,11 +1742,13 @@ f+1 candidates reachable: Degraded (the object stays `Local`, `placed = false` i
 writes continue locally). Owner loss: Degraded for the membership horizon, then Masked after
 takeover, with the loss window reported. Configuration group quorum lost: Degraded (no
 takeovers, no neighbourhood changes, no home moves; every owner keeps writing to its candidates
-under its epoch; seals still place). Partition of a minority: Refused for writes by owners on
+under its confirmed authority only while that authority remains valid; seals place only with
+eligible quorums and admitted content). Partition of a minority: Refused for writes by owners on
 the minority side once they cannot confirm membership; snapshot reads continue. Correlated loss
 of all f+1 copies of a snapshot: data loss of that snapshot, documented (D-18); the neighbourhood
 bound makes it as rare as the operator chose. Stale configuration on a request: Refused
-(`ConfigurationStale`) with the current version; one retry.
+(`ConfigurationStale`) with the current version; bounded refresh/retry while the request
+remains live.
 
 **Refusals.** `LeaseUnconfirmed`, `NotOwner{owner}`, `NotPlaced{scope}`, `StaleEpoch{current}`,
 `ConfigurationStale{version}`, `MembershipEpochStale`, `PlacementUnavailable`, `QuorumLost`,
@@ -1545,14 +1793,19 @@ is verified before decode; bodies are canonical encodings generated by a derive 
 carried in the first body word; unknown kinds are refused; append-only evolution within a major.
 
 **Classes.** Control (never shed), Metadata (leases, catalog), Bulk (chunks, archive streams),
-Telemetry (shed first); each class has its own credit pool and queue so no class's latency bound
-contains a term from another class's queue depth.
+Telemetry (shed first). Isolation spans admission credits, queue slots, CPU slices, arena
+headroom, network frames and guest/device queues. Each unit of bulk work has a derived bounded
+quantum so a large transfer cannot monopolize the executor. Reserved control capacity admits
+bounded recovery work even under bulk saturation; "never shed" does not mean an unbounded
+control queue. Repair and teardown carry an authenticated purpose, not a caller-selected high
+priority. Measure metadata/control latency and memory under a saturated bulk producer; separate
+wire labels or queues alone do not establish this guarantee.
 
 **Configuration version.** Every fleet request carries the sender's configuration version and
 every record carries the owner's host epoch; a receiver with a newer configuration refuses with
 `ConfigurationStale{version}` and the current version, and a holder with a higher epoch for the
-sender refuses with `StaleEpoch{current}`; one retry suffices for the former and the latter ends
-the sender's authority.
+sender refuses with `StaleEpoch{current}`. Refreshes consume the operation's bounded retry
+budget; the latter refusal ends the sender's authority.
 
 **Exactly-once.** `(client id, sequence)` request ids; completion records kept until acknowledged
 (the client acknowledges by advancing its sequence window); retries return the original result;
@@ -1561,6 +1814,22 @@ provisioning is therefore safe to retry after any failure.
 **Flow control.** Credit-based, absolute offsets per stream; windows derived from the measured
 bandwidth-delay product and the class's latency budget; the sender never exceeds credit; a
 stalled receiver stalls only its own class.
+
+**Transfer and cancellation.** Immutable named objects use identity, missing-set exchange,
+verified ranges and resumable progress. Do not allocate a whole advertised object before its
+class cap, claim and identity are checked. An unknown-length ingest uses an explicitly bounded
+RAM session with per-consumer credits, checked offsets, cancellation and a terminal expiry.
+A receiver distinguishes received, checksum-verified, identity-verified, placed and referenced;
+only the last two imply retention under the required durability contract. Duplicate frames,
+reconnects, corrupt chunks and canceled producers neither publish partial identities nor leak
+session slots. Compression/decompression workspace is charged before input is accepted.
+Completion records and retained response windows have bounds and acknowledgements; exhaustion
+refuses admission rather than forgetting a live exactly-once obligation.
+
+**Trace context.** The operation envelope carries a request identity for replay, optional
+trace/span context for observation and optional caused-by event identity. These have different
+lifetimes and cannot substitute for one another. Authentication establishes consumer and
+volume tags separately (§4.13–§4.14); trace fields never authorize effects.
 
 **Security.** Between hosts: TLS 1.3 via rustls with certificates provisioned by the operator
 (bulk cost is symmetric crypto at memory speed, and no handshake sits on a hot path); on one host: peer credentials at rendezvous, no encryption.
@@ -1586,8 +1855,9 @@ of f+1 copies, with hedged fragment fetches on read; the class boundary, (k, m) 
 reconstruction budget are derived, never fixed (D-O6).
 
 **Auto-seal.** Each volume seals at its derived cadence (or on explicit `snapshot`, on `detach`,
-on `archive`, and when the owner is asked to drain); a seal is O(1) to take and the hashing and
-the puts run in the background; the volume reports `last_placed_snapshot_age` and `mirror_age`
+on `archive`, and when the owner is asked to drain); publishing a server root is O(1), while
+attachment flush barriers, hashing and puts have separately measured costs. An auto-seal
+without a client barrier covers only server-visible writes (§4.6); the volume reports `last_placed_snapshot_age` and `mirror_age`
 so an agent that needs durability can `await placed(scope)`.
 
 **Remote attach.** An agent on node B attaches a snapshot of a volume owned by A: B routes the id
@@ -1614,7 +1884,7 @@ another host persist for the derived number of operations (the PNUTS rule on the
 last N writes, N from the measured cost of a migration against the measured cross-host write
 cost), ownership migrates there by the planned handoff: the current owner seals, the delta ships
 by identity to the new host (which is usually a candidate holder already), the regional group
-bumps the old host's epoch for that object and names the new owner, the new owner runs phase
+advances that object's ownership generation and names the new owner, the new owner runs phase
 one, and the old owner's later writes are refused `StaleEpoch`. Load never moves ownership;
 holder duty is balanced by neighbourhood changes; operators keep an explicit move.
 
@@ -1629,16 +1899,35 @@ identities per version; a mismatch refuses that version on that holder with an a
 loss takes green over on the candidate that rendezvous ranks first, which already holds the
 ledger; increments in flight retry at the new owner by identity. Submissions from another host
 route the green's id to its owner; a refusal from a non-owner names the current owner and epoch
-so one retry suffices; placement refresh is single-flight per green.
+and refresh/retry consumes the operation's bounded budget; placement refresh is single-flight
+per green.
 
-**Overlay volumes in a fleet.** An overlay volume's base is a directory on one host's disk,
-so its owner is that host and ownership never migrates; its sealed snapshots (delta plus
-witnessed bases) replicate like any other sealed content; a remote attach of such a snapshot
-serves the delta from the holders and untouched entries by read-through to the owner, which
-reads its disk; a clone of an overlay snapshot on another host is a scratch volume seeded with
-the delta (it has no base there) unless that host has the same directory (a network filesystem)
-and the caller names it. Owner loss makes the base unreachable: the volume is not taken over; its
-placed snapshots stay readable; it reports `BaseUnavailable` until the host returns.
+**Overlay volumes in a fleet.** A live base names an enrolled directory identity and its
+serving host. Every local or remote clone retains that `BaseRef` together with the delta and
+witnesses. Unchanged names, metadata and bytes continue to resolve through it; a clone must not
+become a scratch volume seeded only with changed entries. An equal pathname on another host
+is not evidence of source equivalence.
+
+The base service remains on its source host; writable delta ownership can migrate by the same
+fenced handoff used for other volumes while retaining this dependency. Delta replication and
+mirror placement do not replicate unfetched host content. If the base host is unreachable,
+available delta/pinned bytes remain readable and untouched paths return `BaseUnavailable`;
+status explicitly reports partial availability and `DeltaWithLiveBase` coverage. A whole-view
+availability guarantee is possible only for a `Complete` snapshot whose entire reference graph
+has been captured, verified and placed. Taking over a delta never silently changes its base.
+
+An explicit base capture (§4.15) creates that complete immutable source. Thereafter remote
+clones share its manifest/chunks and fault bytes lazily from eligible holders; cloning remains
+O(1) in tree size after admission. This is the preferred delta-plus-base design, not eager
+whole-tree copying per agent. Capture and first-read costs are separate measurements; this
+amendment claims no measured speedup.
+
+**Placement closure.** A holder acknowledges only after reserving actual capacity and verifying
+all required bytes. A version's reference graph, holder generations and placement scope must
+be complete before its record can commit. A list of hashes without corresponding retained
+objects does not satisfy placed-before-referenced. For a green version, holders recompute the
+verdict and resulting manifest before serving; missing inputs or mismatches refuse. Repair
+preserves these obligations across pressure, cancellation and membership changes.
 
 **Mirroring across regions.** Every committed record and its content is shipped in epoch and
 sequence order to the owner's neighbourhood in the mirror region, acknowledged at f+1 there;
@@ -1652,7 +1941,8 @@ hedged). All recorded holders unreachable: Refused (`ContentUnavailable{identity
 read, the rest of the namespace continues. Neighbourhood change mid-attach: Masked (chunks are
 by identity; the head record names holders). Fewer than f+1 candidates reachable: Degraded
 (seals accumulate as `Local`; reported). Owner loss of an overlay volume: Degraded
-(`BaseUnavailable`; the delta's placed snapshots remain readable; no takeover). Green owner
+(`BaseUnavailable` on unresolved base paths; placed delta bytes remain readable and the
+delta owner can be taken over without claiming whole-view availability). Green owner
 loss: Degraded for the membership horizon, then Masked after takeover on a holder of the
 ledger; no version is lost because none commits before placement. Holder recomputation
 mismatch: Refused for that version on that holder, alarm; served from other holders. Migration
@@ -1695,15 +1985,20 @@ the format floor.
 
 ### 4.12 Agent surfaces (D-19)
 
-> **Status (2026-09-05).** The Rust client and the CLI are implemented (GAPS §8d, Phase 2
-> task 5): `crates/client` (`Client`: the rendezvous, one request in flight over the rings with
-> spin-then-park, request ids `(client id, sequence)`, the reply stalled past the derived
-> deadline and the daemon found gone making a reconnect under the same id and a resend, so
-> the retry meets its completion record; `Session` to resume from another process; every verb
-> of §4.4 typed; the grant kind has no method) and `crates/cli` (`slates anchor`, `slates
-> daemon`, `slates profile`, `volume create|list|stat|snapshot|clone|resize|destroy`,
-> `attach`, `detach`, `status [--drift]`, `base read|rewitness|pin`; `docs/cli.md`). The SDKs,
-> the MCP server, the skills and the merge verbs below are Phase 5 and 6.
+> **Status (A-9, 2026-09-05).** The Rust client and a CLI subset exist. `docs/cli.md`
+> documents the actual grammar. `attach` records metadata but does not establish a mounted
+> path; `exec` is Linux-specific and currently needs an externally supplied `SLATES_ROOT`.
+> `--locked` does not establish residency (BUG-1). `slates grant` is absent despite the
+> server-side grant records/control transport; same-uid human authority remains unestablished.
+> MCP, Python/TypeScript SDKs, generated surface parity and user-facing merge/guest flows are
+> planned. Descriptions below are required interfaces, not commands verified to work today.
+
+**One operation contract.** A Rust descriptor per operation defines input/output types,
+authorization, side effects, replay class, cancellation, limits, refusals and documentation.
+It generates the wire body, SDK surface, MCP input/output schemas and CLI help/structured
+output. Each adapter tests the same behavior against it. Separate hand-maintained operation
+lists are not the authority. CLI human grant operations occupy a privileged surface in this
+registry and are structurally excluded from SDK/MCP exports.
 
 **Rust client.** The ring protocol, rendezvous per OS, completion fd, request ids, typed errors.
 
@@ -1729,8 +2024,8 @@ errno.
 
 **TypeScript SDK.** napi-rs addon with platform packages; Promises resolved by `uv_poll` on the
 completion socket/fd; external buffers for zero-copy reads with a copy fallback; async iterators
-for listings and streams; `AbortSignal` cancellation; ESM/CJS; a pure-TypeScript fallback over the
-control channel.
+for listings and streams; `AbortSignal` cancellation; ESM/CJS; the typed addon over the
+client channel.
 
 **MCP server.** `slates mcp`: stdio and loopback Streamable HTTP; the 2026-07-28 stateless
 protocol with per-request `_meta`, `server/discover`, `resultType`, `ttlMs`/`cacheScope`,
@@ -1764,11 +2059,38 @@ refuses), `slates grants list|revoke`, `slates audit [--export]`, `slates merge 
 `slates mcp [install]`,
 `slates skills install`, `slates profile` (prints the machine profile with derivations).
 
+**CLI and MCP behavior contract (A-9).** Human commands accept canonical ids and unambiguous
+names in the current enrolled namespace. Name lookup routes through that namespace's owner;
+there is no global lookup index. Ambiguous names refuse with candidates instead of guessing.
+Every verb supports `--help`; structured operations support consistent `--json`, stable error
+codes and bounded pagination. Raw-byte streams use an explicit stream result. Errors name the
+failed capability or resource, its observed limit, and an action that can actually resolve it.
+A success includes the effective view coverage, claim, attachment form/path or guest tag,
+consumer rights, placement and freshness where applicable.
+
+The intended local flow is enroll a base, create a live overlay, clone work views, attach or
+execute tools, inspect changes/drift, submit declared operations, preview a landing and obtain
+a human grant. A reproducible flow explicitly captures a stable immutable base before cloning.
+A guest flow binds an authorized attachment to the harness's VMM/device before reporting a
+usable guest path. The same volume operations serve all flows; host capability changes the
+available attachment form, not volume semantics. Endpoint/root discovery must be automatic
+from the enrolled context; a required undocumented `SLATES_ROOT` is a gap. Provisioning,
+mount/device setup and base capture timings are displayed separately.
+
+MCP mutations return typed structured results and request identities; long operations expose
+bounded progress and cancellation. Destructive effects and grant requirements are annotated
+from the descriptor. Agent-provided tool text cannot enroll new roots, broaden a consumer's
+rights or issue a human grant. Skills describe only shipped capabilities; future grammar is
+clearly labelled planned. Disk installation of skill/config files cannot bypass R1/R10: it
+requires an explicit user-authorized write through the granted landing path; in-memory help
+and MCP resources need no installation.
+
 ### 4.13 Security and multi-user machines (D-22)
 
-Per-user daemons by default (the rendezvous names include the uid/SID; peer credentials are
-checked at connect); a shared daemon mode for fleet nodes authenticates principals through the
-wire security and records the principal on every lease and attachment; volumes carry an owner
+Rendezvous authenticates the host account using uid/SID or a host certificate. A daemon can
+serve multiple enrolled consumers under that account, on a laptop or a fleet host with the
+same authorization path; no separate shared-daemon mode is needed. Every lease and attachment
+records the consumer established by that authenticated channel; volumes carry an owner
 principal and an access list (read, write, admin); ids are random 128-bit values but never
 authorize by themselves (possession of an id plus a valid principal and lease authorizes);
 the launcher never escalates privileges; the MCP server's servable roots are enrolled by a human
@@ -1781,15 +2103,45 @@ follows a symlink when removing; no code is loaded after start; every refusal is
 
 **Security specification (A-8, 2026-09-05; the spec §3 of GAPS owed before Phase 2).**
 
-*Principals.* A principal is `Principal { kind: Uid(u32) | Sid(Box<str>) | Certificate(Blake3 of the leaf) }`, established once at rendezvous and never carried in a request: on one host the daemon reads the peer's credentials (`SO_PEERCRED` on Linux; the `shm_open` object's uid/gid/mode plus `LOCAL_PEERTOKEN` on the optional control socket on macOS; the section's DACL and `GetNamedPipeClientProcessId` on Windows) and binds them to the client id it hands out; between hosts the TLS 1.3 leaf certificate is the principal. Every lease, attachment, grant, landing record and audit record names the principal it was made for; a request whose client id was bound to another principal is refused `Forbidden` (a new refusal, listed below) before it reaches a shard.
+*Principals.* Host credentials establish `AccountId`; a trusted enrollment establishes
+`ConsumerId` and scoped rights for a workload under that account. A consumer channel is bound
+at rendezvous using a capability delivered and retained outside other agents' reach, for
+example an inherited endpoint from the trusted harness. Per-request identity strings and
+peer uid alone cannot establish consumer identity. Between hosts, authenticated transport
+also binds the delegated consumer scope. Rights are checked before resource admission,
+namespace lookup that reveals protected content, queue creation or any VFS/device effect.
+Replay/session resumption preserves that binding; it cannot change the authenticated consumer.
 
-*Access lists.* `Access { owner: Principal, entries: SmallVec<(Principal, Rights)> }` with `Rights { read, write, admin }`: `read` covers attach-for-read, snapshot reads, `status`, `read_base`, `versions`, `changed_since`, `export`; `write` covers attach-for-write, the mutating verbs, `snapshot`, `clone` (the clone's owner is the caller), `submit`, `rebase`, `pin`, `rewitness`, `materialize` (the grant is a separate, human-only act); `admin` covers `resize`, `destroy`, `archive`, changing the list, and revoking leases. The owner holds every right. A per-user daemon has one principal and every list is `{owner}`; the check still runs (one comparison), so the shared-daemon mode of a fleet node is the same code with more entries (R8). Ids never authorize: a request names an id, a principal and (for mutations) an attachment with its lease epoch; all three must agree.
+This requires a harness boundary when untrusted processes share an OS account. Slates cannot
+prevent an unsandboxed same-uid process from reading other process memory or writing host files
+through unrelated syscalls. It supplies scoped VFS access and grant checks; the harness owns
+process isolation and capability delivery. The product must not call uid-only IPC agent
+isolation. Unsupported secure enrollment refuses, instead of issuing an ambient admin channel.
+
+*Access lists.* `Access { owner: Principal, entries: SmallVec<(Principal, Rights)> }` with `Rights { read, write, admin }`: `read` covers attach-for-read, snapshot reads, `status`, `read_base`, `versions`, `changed_since`, `export`; `write` covers attach-for-write, the mutating verbs, `snapshot`, `clone` (the clone's owner is the caller), `submit`, `rebase`, `pin`, `rewitness`, `materialize` (the grant is a separate, human-only act); `admin` covers `resize`, `destroy`, `archive`, changing the list, and revoking leases. The owner holds every right. Even a per-user daemon can host mutually isolated consumers; its access lists contain their enrolled identities. N=1 runs the same check and never grants every local process owner rights. Ids never authorize: a request names an id, a principal and (for mutations) an attachment with its lease epoch; all three must agree.
 
 *Audit counters.* The audit log (§4.15, §4.14) records grants, manifests and landing outcomes; refusals are counted, never logged with content: `refusals{kind}` per refusal variant of §4.4's taxonomy, `forbidden{verb}` per verb, `grant_kind_refused{channel}` for the grant kind arriving on the ring or MCP channel (AC-2.8), `cross_uid_connect` at rendezvous (T-2.7), `stale_lease{shard}`, `stale_epoch`, `landing_lease_fenced` (a superseded holder refused by generation, AC-2.9). Every counter is a cache-padded per-shard `Relaxed` word summed on read (§3 of CLAUDE.md), exported through `status` with its freshness, and reset only by restart.
 
-*Grants.* A grant is created only by a request whose channel is the CLI's control channel or a registered confirmation surface; the request kind carries the channel in its header class (§4.9) and the server refuses the kind on a ring or MCP channel with `GrantChannelRefused` and increments `grant_kind_refused`. A grant names its principal; a landing may consume only a grant made for its own principal.
+*Grants.* Only an authenticated human confirmation surface holds grant-issuer authority.
+The daemon verifies that authority and the exact manifest hash, target identity, intended
+consumer, scope and validity before accepting a grant. The issuer's protected channel is
+established by trusted enrollment; running a CLI executable, claiming a control header class
+or sharing the human's uid is insufficient. Ring, SDK and MCP grant kinds remain refused even
+when they use a valid workload channel. Replayed, expired, revoked, retargeted or modified-plan
+grants refuse before writing. Refusal to issue a grant never changes the proposed manifest.
+The control transport and the VFS consumer channel have different authority, verified by the
+server, not inferred from command names.
 
-*Refusals added.* `Forbidden{verb}` (the principal lacks the right), `GrantChannelRefused{channel}`; both in the closed taxonomy of §4.4 from this amendment.
+*Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
+`ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
+carried through §4.4's operation refusal taxonomy. A-9 adds these requirements without claiming
+that the current uid-based implementation enforces them.
+
+*Content identity and sharing.* A chunk hash proves bytes, not permission to read them or ask
+whether they exist. Missing-set exchange, caches, archives and dedup obey the consumer's
+sharing scope and reference authorization; cross-scope existence and timing must not reveal
+private data. Slates does not copy Hecate's disk-at-rest layout or salt scheme merely because
+it uses content addressing. The RAM-only trust boundary and any allowed sharing are explicit.
 
 ### 4.14 Observability (D-23)
 
@@ -1808,7 +2160,16 @@ paths a landing touched, which the human already approved.
 
 **Observability specification (A-8, 2026-09-05; the spec §3 of GAPS owed before Phase 2).**
 
-*Span roster.* Seven chokepoints, each a span with the three-id law (request id, volume id, principal id) and a monotonic start and end: `bridge.request{op}` (a bridge call from arrival to reply), `ring.request{kind}` (a ring slot from read to reply written), `shard.op{verb}` (one verb on its owner shard, no awaits inside), `log.append{partition}` (one op-log record appended and published), `ship.record{object}` (one record or content put to its candidates, with the acknowledging count), `consensus.step{group}` (one configuration commit), `archive.chunk{codec}` (one chunk compressed or expanded), plus `land.entry{action}` (one landing entry) and `merge.verdict` (one increment judged). A span is emitted after it ends through the shard's telemetry ring (class Telemetry, shed first) into the control shard's sink; an emitter registers its name at start and the health plane refuses to serve until every name in this roster has registered (§2.6).
+*Span roster.* Nine chokepoints, each a span with the three-id law (request identity, trace id plus span id, caused-by event identity) and a monotonic start and end: `bridge.request{op}` (a bridge call from arrival to reply), `ring.request{kind}` (a ring slot from read to reply written), `shard.op{verb}` (one verb on its owner shard, no awaits inside), `log.append{partition}` (one op-log record appended and published), `ship.record{object}` (one record or content put to its candidates, with the acknowledging count), `consensus.step{group}` (one configuration commit), `archive.chunk{codec}` (one chunk compressed or expanded), plus `land.entry{action}` (one landing entry) and `merge.verdict` (one increment judged). A span is emitted after it ends through the shard's telemetry ring (class Telemetry, shed first) into the control shard's sink; an emitter registers its name at start and the health plane refuses to serve until every name in this roster has registered (§2.6).
+
+*Typed health and trace delivery (A-9).* Signal names form a closed registry. Every signal
+specifies `AbsenceIs` (unknown or degraded as appropriate), freshness horizon, observer and
+expected producer; missing/stale samples never silently mean healthy. Values may be absent
+and must remain distinguishable from numeric zero. Registration does not prove live telemetry.
+Bounded rings report dropped spans and missing causal links explicitly. Request identity is
+for replay; trace/span identity connects work across bridges, rings, shards and holders;
+`caused_by` connects causal events. Consumer and volume are authenticated tags, not substitutes
+for trace context. Status exposes these definitions consistently through CLI/MCP.
 
 *Health signal catalog.* Every signal is `(value, freshness_ns)` and host-observed where a host can observe it: `daemon.alive` (the anchor's view: the child is running and answered its last heartbeat), `daemon.restarts` (the anchor's count), `segment.generation` (the anchor segment's generation word), `shard.loop_lag_ns{shard}` (the driver's measured lateness), `shard.tasks{shard}` (live tasks against the arena), `ring.depth{client}` (command slots pending), `client.parked{client}`, `memory.locked_bytes` and `memory.unlocked_bytes` (per shard and rolled up), `memory.pressure` (PSI slope, macOS level, Windows notification), `catalog.volumes{shard}`, `log.bytes{partition}` and `log.replay_ns` (the last replay's duration against the recovery budget), `lease.expiring` (leases within one term of expiry), `base.watcher{volume}` (live, overflowed, unavailable), `land.active` (landings in flight), `placed.pending` (records awaiting f+1), `mirror_age{volume}`, `config.version`.
 
@@ -1818,22 +2179,41 @@ paths a landing touched, which the human already approved.
 
 ### 4.15 Disk as the source of truth: the base plane and landing under grant (D-25, D-26)
 
-> **Status (2026-09-05).** The base plane and the landing engine are Phase 1 (`slates-vfs`,
-> `slates-base`, `slates-land`; GAPS §8c). Phase 2 task 8 wires them through the server
-> (`crates/server/src/landing.rs`, GAPS §8d): a `Land` request plans the manifest and, without
-> a grant, replies `GrantRequired` with the manifest, its summary and the conflicts a
-> preliminary pass found, recording the plan in the durable audit log; a grant binds the
-> manifest and the landing writes through `OsLand`, persisting the landing record, the lease,
-> the consumed grant and the audit trail (`GrantRecord`, `LandingLeaseRecord`, `LandingRecord`,
-> `AuditRecord`, all §4.8 ops so accountability survives a crash, AC-2.10). The grant is never
-> created on the ring or MCP (R10, AC-2.8): the ring's grant kind is refused, and a grant comes
-> on the control channel through `slates grant`. The `slates land`, `slates grants` and
-> `slates audit` verbs and the client methods are in place. The control-channel grant transport
-> and the write execution are Unix-only (the writer is the `os` module; a landing test writes
-> into a RAM-backed target) and run in the Linux CI lane; the daemon suite here checks the
-> off-ring refusal and the reads. Owed: the control-channel grant transport (the Linux socket
-> reader and `slates grant`), the Linux landing execution test, `slates grant --watch`, and the
-> per-entry audit records (the terminal record and the plan are persisted now).
+> **Status (A-9, 2026-09-05).** The read-only base seam and landing engine exist, as do
+> server records, plan/refusal handling and Unix control transport/write integration. The CLI
+> has `land`, grant listing and audit reads, but no `slates grant` issuance verb. Human issuer
+> authentication, per-entry audit completeness and end-to-end consumer/grant tests remain open.
+> Base data/metadata behavior is not fully connected to every mounted operation (BUG-5 and
+> sibling audit), and restart does not yet recover complete volume contents (BUG-11).
+> Historical tests in GAPS §8c/§8d were not rerun for this amendment.
+
+**Live source and complete capture (A-9).** Creating a live overlay opens and identifies its
+source without walking it. Untouched paths resolve the source's current names, metadata and
+bytes through validated reads; copied-up/pinned entries retain their witnessed version and
+report outsider drift. This is useful for laptop agents, but does not promise an atomic tree
+snapshot across unrelated reads. Every mutation of a base-derived inode, including chmod,
+truncate, link, rename and xattrs, passes through the same witness/copy-up rules. Whiteouts,
+opaque directories, redirects, hardlink identity and open-unlinked handles must survive both
+local and remote cloning. Watcher overflow invalidates affected cache knowledge; hints alone
+never prove a source unchanged. Concurrent source edits may produce a typed retry/refusal,
+not fabricated metadata or silently discarded operations.
+
+A caller requesting a complete immutable point-in-time base uses `capture_base`. Admission
+first reserves capture/retention costs. The source must be quiesced by an authority that can
+actually exclude all writers, or exposed through a supported immutable read facility requiring
+no Slates disk write or new privilege. Enumerate and retain the complete tree, metadata and
+referenced bytes from that stable source, verify identities, then atomically publish its root.
+Cancel or source failure releases uncommitted capture state. A mutable source without that
+facility refuses `ConsistentBaseUnavailable`; repeated stats alone cannot prove that an
+arbitrary multi-file scan corresponds to one instant. Ordinary `pin` can stabilize named
+entries as observed, but is not relabelled atomic whole-tree capture. Report source identity,
+coverage, dependencies, bytes read/retained and elapsed cost.
+
+A verified content digest xattr, if exported, names exactly the current immutable file bytes.
+It is invalidated before any mutation and absent while content is unsealed or unverified;
+missing or stale cache knowledge cannot produce a clean digest. Discovery uses bounded scans
+and cooperative slices. This is a planned optimization, validated by a counter and a byte
+oracle before it supports a fast path; no performance gain is assumed.
 
 **Role.** Make an existing host directory the base of a volume without copying it; keep the
 agent's view honest when the disk moves; and write the agent's diverged entries back to that
@@ -2054,11 +2434,19 @@ stays in the overlay.
 
 **Integration points.** §4.4 (verbs, refusals, states), §4.5 (whiteouts, redirects, witnesses,
 copy-up, drift), §4.6 (base reads, invalidation on drift), §4.8 (grant, lease and
-audit records), §4.10 (host-pinned overlay volumes), §4.12 (surfaces; no grant verb for agents),
+audit records), §4.10 (retained live base dependencies and complete captures), §4.12 (surfaces; no grant verb for agents),
 §4.13 (containment, ownership, human-only grants), §4.14 (audit log), Part 6 (the tracer's
 granted-target exception).
 
 ### 4.16 The merge engine: green volumes, increments, canonical rebase, the deterministic verdict (D-27)
+
+**A-9 integration requirement.** The implemented pure merge core is not a user-facing green
+volume service. Green's immutable version chain starts from scratch or a complete immutable
+base, never an implicitly live host directory. Work volumes preserve that base and their
+witnesses. Submission first establishes the contributing attachment barrier, retains every
+input to the declared-operation verdict, and places those inputs before a distributed merge
+record references them. Role enforcement, CLI/MCP verbs, version-pinned attachments and holder
+recomputation remain explicit integration gates; existing pure-core tests do not close them.
 
 > **Status (2026-09-05).** The pure core is implemented and gated (`slates-merge`, GAPS §8f):
 > the deterministic verdict (the two passes — the sweep-line range verdict and the memcmp — the
@@ -2233,7 +2621,7 @@ Refused (`EvidenceRequired`).
 | Increment size budget | ops records such that measured per-record verdict cost × records stays under the merge-path budget | per-record cost; the ratcheted merge-path p99 |
 | Stream cadence | the auto-seal cadence of §4.8 | mutation rate; loss-window SLO |
 | Submission deadline | measured merge-path p99 × k | merge-path histogram |
-| Placement refresh | single-flight per green; one retry on `ConfigurationStale` with the version the refusal carries | refusal timestamps |
+| Placement refresh | single-flight per green; bounded refresh/retry using the returned configuration version | refusal timestamps and operation deadline |
 | Last-changed index budget | paths touched per green × (key + version) | per-green path counts |
 
 **Worked example.** Green G is at version 42 (a 300k-file repository). Agents A, B and C each
@@ -2355,7 +2743,8 @@ Appendix B; the gap ledger.
 - T-0.3 (concurrency, loom) SPSC and MPSC rings under all interleavings of one producer and one
   consumer (and two producers); expect FIFO, no lost or duplicated slots.
 - T-0.4 (error) Lock capacity exhausted mid-boot; expect the profile records the capacity, the
-  daemon starts, and `locked_bytes < requested` is reported, never a crash.
+  diagnostic control surface starts, and volume admission refuses `LockCapacityExceeded`;
+  no successful claim is backed by unlocked memory and no panic occurs.
 - T-0.5 (edge) A 32-bit target with a 2 GB address space; expect region reservation caps derived
   from `ullAvailVirtual`, and a request above it refused with `BudgetExceeded`.
 - T-0.6 (benchmark) Ring round trip per core pair; expect numbers within the profile's interval
@@ -2372,6 +2761,13 @@ recorded; the gap ledger lists the compio audit result.
 
 **Risks and fallbacks.** io_uring differences across kernels (probe and fall back); Windows
 IOCP driver complexity (keep the seam small; WinFsp integration comes in Phase 4).
+
+**A-9 required acceptance and regression cases (open; 2026-09-05).**
+
+| Acceptance | Test | Required behavior | Do X, expect Y |
+|---|---|---|---|
+| AC-0.10 | T-0.10 | All allocator and temporary-operation costs are bounded and charged to usable locked capacity. | Exercise fragmented/non-power-of-two regions, exhausted locks and saturated bulk/parse work; expect honest admission refusals and bounded control progress, with no uncharged growth. |
+| AC-0.11 | T-0.11 | Health absence and trace identity retain their declared meaning. | Drop a producer and overflow telemetry; expect typed unknown/degraded freshness and loss markers, while request, trace/span and caused-by identities stay distinct. |
 
 ### Phase 1 — Volume core (single node, in-process API)
 
@@ -2541,6 +2937,13 @@ None`), bridges, IPC, database replication.
 
 **Exit criteria.** AC-1.* pass; baselines recorded; the equivalence policy document reviewed.
 
+**A-9 required acceptance and regression cases (open; 2026-09-05).**
+
+| Acceptance | Test | Required behavior | Do X, expect Y |
+|---|---|---|---|
+| AC-1.16 | T-1.20 | Clone preserves delta, witnesses and complete base reference; coverage never overstates immutability. | Clone an overlay with edited and untouched files, mutate the live source, and read both; expect isolated edited bytes, accurate untouched state and explicit live coverage. Capture a quiesced source, change it later, and expect stable complete bytes; refuse atomic capture of an uncontrolled mutable source. |
+| AC-1.17 | T-1.21 | Base metadata mutations and digest caches obey the same witness rules as content writes. | Run lookup-before-readdir, chmod, truncate, rename, links, xattrs, unlink-open and watcher overflow against a host oracle; expect correct metadata/bytes, stable witnessed entries, and no stale clean digest. |
+
 ### Phase 2 — Local server, database, IPC, anchor process, Rust client
 
 **Goal.** Agents on one machine provision volumes through the ring protocol in under 50 µs
@@ -2640,6 +3043,14 @@ SDKs.
 
 **Exit criteria.** AC-2.* pass on Linux and macOS in CI, Windows nightly; the ratchet recorded.
 
+**A-9 required acceptance and regression cases (open; 2026-09-05).**
+
+| Acceptance | Test | Required behavior | Do X, expect Y |
+|---|---|---|---|
+| AC-2.11 | T-2.13 | An admitted bounded claim remains spendable despite all competing allocations. | Reserve a claim, then race other shards, dynamic volumes, snapshots, caches, copy-up and pressure for capacity; expect competitors to refuse before stealing it, and every within-entitlement write to succeed. Repeat through resize, cancellation, destroy and restart. |
+| AC-2.12 | T-2.14 | Daemon restart preserves acknowledged content and its atomic completion. | Write bytes and metadata, snapshot/clone an overlay, kill the daemon at publication boundaries and retry the same request; expect identical bytes, witnesses, roots, claims and result ids, or an explicit incomplete-recovery refusal where no acknowledgement was promised. |
+| AC-2.13 | T-2.15 | Distinct consumers sharing a uid cannot use each other's VFS or grant rights. | Enroll two consumers through a trusted harness, forge/replay ids and channel labels, revoke one and reconnect; expect refusal before any protected lookup, allocation or mutation. A workload invoking the CLI cannot mint grant authority. |
+
 ### Phase 3 — Linux bridge (FUSE) and the launcher
 
 **Goal.** Ordinary Linux programs see volumes at `<root>/<volume>` and at chosen paths through
@@ -2736,6 +3147,14 @@ fd handoff through the anchor, `slates exec`, the conformance and workload harne
 
 **Exit criteria.** AC-3.* pass on the reference Linux kernels (baseline 5.10, io_uring 6.14+).
 
+**A-9 required acceptance and regression cases (open; 2026-09-05).**
+
+| Acceptance | Test | Required behavior | Do X, expect Y |
+|---|---|---|---|
+| AC-3.10 | T-3.13 | Negotiated FUSE features have correct ABI values and complete mounted semantics. | Drive independent kernel vectors and real mounts through READDIRPLUS, FSYNC, LINK, all setattr fields, rename flags and statfs; expect actual effects/capacity or precise unsupported errors, never ignored success. |
+| AC-3.11 | T-3.14 | Snapshot/submit/detach barriers order kernel-buffered writes and view changes. | Race kernel writes and shared mappings with SDK mutations, snapshot and advance; expect every acknowledged included write in the published generation, no mixed-version view, and a typed incomplete barrier on consumer loss. |
+| AC-3.12 | T-3.15 | Attachment handles and helper processes have bounded lifetimes on every exit. | Repeat open/close beyond arena capacity in total operations, then fail the mount descriptor handshake and cancel attach; expect reusable generational slots, bounded memory, no orphan child and no phantom attached path. |
+
 ### Phase 4 — macOS bridges (FSKit first, NFSv3 fallback) and Windows bridge (WinFsp); platform matrix
 
 **Goal.** The same behaviour on macOS and Windows, with each platform's documented Degraded
@@ -2785,18 +3204,19 @@ form; the conformance and workload suites on both platforms.
 - On macOS 26, `attach(volume, at="~/proj/build")` mounts `slates://volume/7/attach/3` through
   the FSKit module at `~/proj/build`; `cargo build` in a terminal sees an ordinary directory;
   Finder shows the volume; xattrs and hard links work; `detach` unmounts.
-- On macOS 15.6, the spike showed the RAM-disk block form acceptable: the same attach creates a
-  RAM disk, mounts the module on it, and the module ignores the disk; if the spike had failed,
-  the same call would use the NFS fallback and the reply would say so in `granted_form`.
+- On an older macOS host, no spike outcome is assumed. A requested FSKit form either has
+  recorded support and an already authorized suitable resource or refuses. A separately
+  selected limited NFS form reports its semantics; it is not an automatic POSIX substitute.
 - Failure: the FSKit extension is not enabled; `attach` refuses with
-  `Unsupported{macos, fskit_disabled}` naming the System Settings path and offering the NFS
-  fallback; nothing is written to disk.
+  `Unsupported{macos, fskit_disabled}` naming the System Settings path; it does not change
+  the requested attachment form or write to disk.
 
 **Acceptance criteria.**
 - AC-4.1 The spike's go/no-go is recorded with numbers; if go, FSKit per-operation latency is
   within the recorded factor of the NFS path or better and the SDK-ring write coherence test
   passes (catches: an unmeasured bet).
-- AC-4.2 macOS FSKit: fsx and the NFS-trimmed pjdfstest pass; workloads pass with outputs
+- AC-4.2 macOS FSKit: fsx and the full applicable pjdfstest set pass, with only reviewed
+  platform-standard differences; the NFS-trimmed set is not its acceptance scope. Workloads pass with outputs
   identical to an APFS RAM disk; two local processes observe each other's writes without a
   remount; xattr and hard-link workloads pass (catches: coherence and conformance).
 - AC-4.3 macOS NFS fallback: the same suites pass with the fallback's reviewed expected-failure
@@ -2804,9 +3224,9 @@ form; the conformance and workload suites on both platforms.
   bridge divergence).
 - AC-4.4 Windows: fsx (WinFsp port) and WinFsp's tests pass; workloads pass identical to an NTFS
   RAM VHD; notifications keep Explorer and watchers current (catches: same).
-- AC-4.5 No disk writes by slates on either platform except the documented one-time mount-point
-  directory on the NFS fallback when no RAM disk is available and entries inside a granted
-  landing target during that landing, verified by the tracer (catches: hermeticity).
+- AC-4.5 No disk writes by slates on either platform outside a granted landing target during
+  that landing; missing mount-point directories are refused, never a one-time exception,
+  verified by the tracer (catches: hermeticity).
 - AC-4.6 The chosen-path forms (FSKit URL mount, NFS second mount, Windows second letter) work
   and refusals are typed (catches: silent fallbacks).
 - AC-4.7 The full nine-target matrix builds and passes unit, conformance, and workload suites
@@ -2850,6 +3270,13 @@ form; the conformance and workload suites on both platforms.
 **Exit criteria.** AC-4.* pass; the platform matrix job green nightly; the spike verdict and the
 15.x path recorded in the gap ledger.
 
+**A-9 required acceptance and regression cases (open; 2026-09-05).**
+
+| Acceptance | Test | Required behavior | Do X, expect Y |
+|---|---|---|---|
+| AC-4.11 | T-4.13 | OCI containers and Linux guests consume real authorized attachments, with virtio-fs for guests. | Attach a host volume into an OCI namespace and export another through the supported VMM seam; run the same filesystem workload inside both and on the host. Expect byte/metadata agreement, isolated edits and typed refusals for unavailable path/device capabilities. |
+| AC-4.12 | T-4.14 | Guest queues and any offered DAX mappings preserve bounds, rights and version lifetime. | Supply malformed descriptor chains, overflow lengths and unauthorized adjacent-page ranges; revoke/advance while requests and mappings are active. Expect refusal before access, no writable immutable mapping, no neighboring-byte exposure and eventual reclamation. Do not advertise DAX without this gate. |
+
 ### Phase 5 — SDKs, MCP server, skills, CLI polish
 
 **Goal.** Agents integrate through async Python and TypeScript SDKs, an MCP server, and skills
@@ -2857,7 +3284,7 @@ published three ways, all speaking the same ring protocol and the same vocabular
 
 **In scope.** `slates-sdk-py` (PyO3, `abi3-py312` and `cp314t` wheels, fd completion, sync
 facade, stubs), `slates-sdk-node` (napi-rs, platform packages, `uv_poll` completion, external
-buffers, pure-TS fallback), `slates mcp` (own server, stdio and loopback HTTP, dual-era), the
+buffers), `slates mcp` (own server, stdio and loopback HTTP, dual-era), the
 skills source tree and `slates skills install`, `slates mcp install`, the Claude Code plugin
 package, examples in three languages.
 
@@ -2866,7 +3293,7 @@ package, examples in three languages.
    buffer-protocol reads; the sync facade; stubs; maturin builds for the wheel matrix; free-
    threaded build with `gil_used = false` and thread-safe `#[pyclass]` state.
 2. TypeScript: the addon; `uv_poll` on the completion fd/socket; external buffers with copy
-   fallback; async iterators and `AbortSignal`; platform packages; the pure-TS fallback.
+   fallback; async iterators and `AbortSignal`; platform packages over the same typed client.
 3. MCP: the stateless protocol with dual-era support; tool catalog with annotations and
    structured content; resources and prompts for skills; `subscriptions/listen` for volume
    events; conformance runs against both requirement sets; `slates mcp install`.
@@ -2939,6 +3366,14 @@ package, examples in three languages.
 
 **Exit criteria.** AC-5.* pass; packages published to a staging registry from the release
 workflow dry run.
+
+**A-9 required acceptance and regression cases (open; 2026-09-05).**
+
+| Acceptance | Test | Required behavior | Do X, expect Y |
+|---|---|---|---|
+| AC-5.9 | T-5.11 | CLI/MCP/SDK adapters conform to one operation descriptor and are navigable. | Execute the same create/clone/base/attach/status/resize flows through each adapter, using ids and scoped names; expect equivalent results/refusals, useful help, stable JSON, bounded cursors and cancellation. |
+| AC-5.10 | T-5.12 | Human grants are authenticated and bound to the exact proposed landing. | Preview a plan, change its filter/target/content, replay or forge approval from an agent channel; expect refusal. Approve the unchanged manifest through the enrolled human surface and expect only its granted effects and audit records. |
+| AC-5.11 | T-5.13 | Users can discover attachment support and complete supported flows without hidden setup. | Start from an enrolled instance on each host, follow CLI help through a live overlay and an immutable-base/guest flow; expect endpoint/root discovery, actual path/tag readiness, clear coverage/reservation/durability output and actionable capability errors. |
 
 ### Phase 6 — Merge engine: green volumes, increments, canonical rebase, the verdict (single node)
 
@@ -3075,6 +3510,12 @@ measured by source, mitigated by `edit` in the skills and by streaming; a high m
 reopens the ergonomics (D-O17). The size budget for increments is derived from measured cost;
 if real increments routinely exceed it, the SDK's per-path split is the fallback.
 
+**A-9 required acceptance and regression cases (open; 2026-09-05).**
+
+| Acceptance | Test | Required behavior | Do X, expect Y |
+|---|---|---|---|
+| AC-6.13 | T-6.15 | Work/Green roles, barriers and the declared-operation merge core form one usable service. | Use CLI/MCP work clones from a complete base, mutate via a mounted client, submit, attach and advance a green reader; expect role refusals, accept/identical/conflict behavior, fixed reader versions and all committed input bytes retained. |
+
 ### Phase 7 — Archive, compression, deduplication, dictionaries
 
 **Goal.** Volumes can be sealed, deduplicated, compressed by a measured cost model, archived in
@@ -3140,15 +3581,23 @@ export stream through the SDKs/MCP, restore.
 
 **Exit criteria.** AC-7.* pass; the cost model's inputs are exported in `slates status`.
 
+**A-9 required acceptance and regression cases (open; 2026-09-05).**
+
+| Acceptance | Test | Required behavior | Do X, expect Y |
+|---|---|---|---|
+| AC-7.7 | T-7.8 | Resumable transfer verifies and bounds every byte before publication. | Interrupt/cancel named-object and unknown-length ingest, send duplicate/corrupt/oversized ranges and resume; expect bounded memory and sessions, missing-set progress, no unverified identity or partial publication, and release of abandoned charges. |
+
 ### Phase 8 — Distribution: membership, the configuration group, neighbourhoods, the register protocol, hedged placement, takeover, migration, mirroring
 
 **Goal.** The same daemon on many nodes across regions: sealed content and records placed to
 candidate holders under one quorum rule with hedged puts, fenced by host epochs; configuration
 through a regional consensus group and a root group; takeover by epoch bump and batched
-promotion with no data movement on the critical path; ownership following the writer; mirroring
+promotion without eager whole-tree transfer, with fetched content verified before reads;
+ownership following the writer; mirroring
 across regions with a per-operation durability scope; remote attach by id routing with lazy
-fetch and learned prefetch; tested in deterministic simulation, against real processes, and by
-model checking.
+fetch and learned prefetch; verified through message-level simulation and real processes.
+Historical models are architecture evidence with A-9 refinement/revalidation still owed under
+separate tooling authorization; no checker is added to the implementation or CI.
 
 **In scope.** `slates-cluster` (SWIM/Lifeguard, the configuration group's state machine and
 its root counterpart, neighbourhoods with derived scatter width, rendezvous within
@@ -3179,8 +3628,9 @@ checkers.
    resumed stale owner refused; measured takeover time against the recovery budget.
 6. Neighbourhood changes with joint writes and the retirement rule; the restart-identity
    invariant as a structural test.
-7. Id routing: creator host in the id; successor computation from the configuration; one
-   retry on `ConfigurationStale`; scatter-gather enumeration labelled with the version.
+7. Id routing: creator host in the id; successor and moved-object generation from the
+   configuration; bounded refresh/retry on `ConfigurationStale`; scatter-gather enumeration
+   labelled with the version.
 8. Auto-seal scheduling with the derived cadence; `placed` and `await placed(region)`; the
    loss-window report; opt-in live shipping with credit backpressure and takeover without a
    loss window.
@@ -3191,8 +3641,10 @@ checkers.
 11. Green volumes in the fleet (D-27): merge records as ledger entries under the host epoch with
     the placed precondition; holder recomputation before serving and head-identity comparison
     per version; the lying-proposer and resolver-storm tests.
-12. Overlay volumes in the fleet: host-pinned ownership; remote attach with read-through to the
-    owner; `BaseUnavailable` on owner loss with no takeover.
+12. Overlay volumes in the fleet: retain the live base identity/serving host through every
+    clone and delta-owner migration; report `BaseUnavailable` on unfetched source paths after
+    source loss. Capture a stable complete base explicitly when source-independent reads are
+    required; delta placement alone never promises whole-view availability.
 13. Remote attach; lazy hedged fetch; prefetch learning (observe-first).
 14. Simulation harness with nemeses; histories; checkers; Jepsen-style real-process runs. The
     TLA+ models in `docs/wip/models/` are architecture artifacts: they were checked when the
@@ -3242,10 +3694,10 @@ checkers.
   holder within the derived count (catches: silent under-placement).
 - AC-8.9 Live shipping bounds memory on the owner through credit backpressure (catches:
   unbounded queues).
-- AC-8.10 An overlay volume is never taken over away from its host; after owner loss its placed
-  snapshots read from any recorded holder and its live verbs refuse `BaseUnavailable`; two nodes
-  cannot hold the landing lease for one target (catches: a base on the wrong host; disk
-  split-brain across nodes).
+- AC-8.10 A live base stays bound to its identified source while the delta owner may move.
+  After source loss, available placed delta bytes still read and unfetched base paths refuse
+  `BaseUnavailable`; only complete placed snapshots remain wholly readable. Two nodes cannot
+  hold the landing lease for one target (catches: substituted bases and disk split-brain).
 - AC-8.11 Green in the fleet: no merge record commits under a stale epoch or with an unplaced
   reference; every holder's recomputation matches at every version under the nemesis library;
   an injected lying proposer is refused by every holder before any read; owner loss takes green
@@ -3255,13 +3707,15 @@ checkers.
 - AC-8.12 Straggler immunity: an injected slow candidate never delays `placed` beyond the hedge
   delay plus one put, measured; the hedge rate stays within its derived cap under the measured
   put latency distribution (catches: the write-all stall returning; hedge storms).
-- AC-8.13 Fencing: a resumed owner with a bumped epoch is refused at every holder, never
+- AC-8.13 Fencing: a resumed owner with a bumped epoch is refused by every holder that has
+  installed that fence, never
   commits a record, and the successor's base is at least as new as every record that ever
   committed under the old epoch, checked against the model in simulation (catches: lineage
   forks).
-- AC-8.14 Id routing: every lookup by id is served by the current owner with at most one retry
-  on `ConfigurationStale`, including during takeover and migration; no index exists in the
-  code (structural test) (catches: catalog inconsistency; index creep).
+- AC-8.14 Id routing: after one stable configuration change a stale lookup refreshes once;
+  under continuing takeover/migration, bounded retries yield the current owner's answer or a
+  typed deadline refusal. No global lookup index exists (catches: catalog inconsistency,
+  unbounded redirects and index creep).
 - AC-8.15 Mirroring: `mirror_age` tracks the injected WAN delay; `await placed(mirror)` never
   returns before the mirror's f+1 hold the record and content; region loss promotes with a loss
   window equal to the lag at the moment of loss and zero for awaited operations (catches:
@@ -3285,7 +3739,8 @@ checkers.
 - T-8.5 (simulation) Membership churn storm (join/leave 100 nodes); expect convergence within the
   derived bound, no false deaths, and neighbourhoods changed with joint writes and no loss.
 - T-8.6 (simulation) A resumed owner after a takeover issues records with its old epoch; expect
-  every holder to refuse, no commit, and the model's Continuity to hold.
+  holders with the new fence to refuse, no stale quorum commit, and exact historical-prefix
+  Continuity to hold.
 - T-8.7 (real) Three-process cluster on one machine with iptables/pf partitions; expect the same
   outcomes as simulation.
 - T-8.8 (benchmark) Seal cost versus tree size (must be O(changed)); put throughput; record
@@ -3302,7 +3757,8 @@ checkers.
   on retry, stale records refused, a single version lineage, and takeover at the membership
   horizon with no replay on the critical path.
 - T-8.12 (simulation) Lookups by id during takeover and migration from every node; expect the
-  current owner's answer with at most one retry each.
+  one refresh after a stable change, or a typed deadline refusal under continuing churn;
+  successful answers carry current authority.
 - T-8.13 (simulation) Injected WAN delay and a region loss; expect `mirror_age` to track the
   delay, awaited operations intact after promotion, and the loss window equal to the lag.
 - T-8.14 (simulation) An agent's attachments move to another host; expect migration after the
@@ -3311,6 +3767,15 @@ checkers.
   simulation histories, on every nemesis seed; a violation fails the build.
 
 **Exit criteria.** AC-8.* pass; the simulation seed budget runs nightly.
+
+**A-9 required acceptance and regression cases (open; 2026-09-05).**
+
+| Acceptance | Test | Required behavior | Do X, expect Y |
+|---|---|---|---|
+| AC-8.18 | T-8.16 | Takeover preserves every historically committed value across changing quorums. | Run BUG-12 then generated minority writes, arbitrary majorities, repeated takeovers and non-extension replication; expect refreshed acceptance epochs and exact committed-prefix continuity. Deliver messages independently and never require candidate zero reachable. |
+| AC-8.19 | T-8.17 | Placement and mirroring require verified retained bytes and host-local reservations. | Commit versions while injecting missing chunks, corrupt data, full holders, generation changes and region loss; expect no reference before its required placement, holder recomputation before serving, and truthful time lag/availability rather than identity-only success. |
+| AC-8.20 | T-8.18 | Configuration and local-read authority hold under pauses, partitions and membership changes. | Adapt Hecate CS1–CS12 individually to the configuration core, recording applicability; inject stale leaders, duplicate replies, delayed renewal, clock-bound loss, reconfiguration and epoch exhaustion. Expect safe authority refusal, distinct-member quorums and no per-write configuration call; revalidate the model refinement before closure. |
+| AC-8.21 | T-8.19 | Remote clones preserve local-source semantics and dependency loss honestly. | Clone a live overlay on another host, change the source, migrate the delta owner and lose the base host; expect correct untouched reads while reachable and BaseUnavailable afterward. Repeat with a complete placed base and expect source-independent reads. |
 
 ### Phase 9 — Scale, soak, chaos, hardening, release
 
@@ -3345,6 +3810,12 @@ matrix; a fresh-machine install test per OS (daemon start, first volume, first a
 tool run) with wall time recorded.
 
 **Exit criteria.** Release.
+
+**A-9 required acceptance and regression cases (open; 2026-09-05).**
+
+| Acceptance | Test | Required behavior | Do X, expect Y |
+|---|---|---|---|
+| AC-9.7 | T-9.1 | Advertised release guarantees have end-to-end evidence on every offered transport. | Run the required POSIX/workload, hermeticity, pressure and failure suites through native, OCI and virtio-fs attachments; trace zero writes outside granted targets, check residency within each claimed boundary, and publish capability-specific results. A skipped lane or pure simulation cannot close its transport guarantee. |
 
 ### Dependency and ordering summary
 
@@ -3384,8 +3855,8 @@ field.
 **Benchmark suite (all recorded with the exact command, hardware, dataset, load discipline).**
 Provisioning latency end-to-end from each SDK (spinning and parked forms; p50/p99/p999/max);
 bridge per-operation latency versus the host per OS; git/cargo/npm/pytest/rg/rsync wall time
-versus the host; bytes per file and per volume; snapshot cost (must be O(1)) and clone cost (must
-be O(1)) versus tree size; write amplification per mutation; dedup and compression ratios per
+versus the host; bytes per file and per volume; snapshot root-publication cost and clone
+root-sharing cost (both O(1)); separately measure client barriers, capture, hashing and placement versus tree size; write amplification per mutation; dedup and compression ratios per
 corpus; archive throughput; replication lag; recovery time; memory per shard idle and loaded;
 listing cost per directory size per OS; copy-up cost per class; drift check cost; landing
 throughput and time per entry versus `cp -r`, `rsync` and `git checkout` of the same delta; the
@@ -3536,10 +4007,10 @@ Closed questions are recorded in `docs/wip/GAPS.md` §2 with their dates and rea
   the listing cache is keyed by the directory's change time and the tripwire is armed.
 - A human must be reachable to land: headless runs carry pre-issued session grants or do not
   land; there is no headless default that writes.
-- Authority is a host epoch checked at every holder, with the configuration group deciding only
-  who holds which epoch: the CockroachDB split class cannot arise because the owner is the only
-  proposer of its own registers, and a resumed stale owner is refused at the first holder; the
-  model checks it and the simulation keeps checking it.
+- Authority depends on correct accepted epochs, quorum adoption, scoped generations and read
+  leases. BUG-12 demonstrates that a single-writer intention does not exclude committed data
+  loss. The named consensus cases, full historical-prefix oracle and implementation/model
+  refinement are required; no safety class is declared impossible merely from the architecture.
 - Hedged puts spend a bounded, measured fraction of extra copies transiently; the cap is
   derived from the put latency distribution and hedging is disabled under overload, as Dean and
   Barroso prescribe.
@@ -3707,10 +4178,11 @@ slates/
     store/                   content-addressed chunk index, dedup, compression, archive format
     db/                      metadata database: catalog, lineage, leases, log, registers, held records
     bridge-fuse/             Linux /dev/fuse driver
+    bridge-virtiofs/         planned owned FUSE-over-virtio device; custom runtime and VMM seam
     bridge-<macos>/          macOS bridge (decided in Part 3)
     bridge-winfsp/           Windows WinFsp binding
     anchor/                  the anchor process's library: the shared segment's layout (profile,
-                             op logs, catalog snapshots, the audit log, landing manifests, held
+                             recoverable content/roots, op logs, catalog snapshots, audit, landing manifests, held
                              descriptors), attach, replay hand-off, supervision of the daemon
     ipc/                     local rendezvous per OS, shared-memory rings, wake primitives
     server/                  request handling, admission, accounting, lifecycle verbs
@@ -3730,8 +4202,9 @@ slates/
 ### B.7 macOS packaging
 
 On macOS the release artifact is `Slates.app` (a zip or dmg from the release workflow) containing
-the daemon, the `slates` command (installed as a thin launcher symlinked onto the user's PATH by
-`slates install`), and the FSKit app extension; all signed with one team identifier, the
+the daemon, the `slates` command and the FSKit app extension. Installation is an explicit
+human operation; the running service creates no PATH symlink or mount directory. Slates-owned
+installation writes, if offered, must use the granted landing contract. The artifacts are signed with one team identifier, the
 extension carrying `com.apple.developer.fskit.fsmodule`, the daemon and extension sharing an app
 group in the `<team identifier>.slates` form (no registration needed); notarized for Developer
 ID distribution. The raw-binary asset is still published for the CLI and for the NFS fallback
@@ -3742,6 +4215,12 @@ lines by forwarding every operation to the Rust core.
 ---
 
 ## Appendix C — Cross-platform constraint list
+
+A-9: this is a design constraint list, not a verified support matrix. Native host mount,
+OCI namespace handoff and guest virtio-fs support must each report their own tested semantics.
+The Linux guest target is POSIX on supported VMM hosts; this does not certify native Windows
+or the limited NFS adapter. No automatic substitution may claim to satisfy an unsupported
+requested form. The virtio-fs backend, device residency and mapping matrix are Phase 4 work.
 
 | Constraint | Consequence in the design |
 |---|---|
@@ -3820,3 +4299,31 @@ Applied in the same change to: Part 0 (glossary), Part 1.4, Part 2.1, 2.3, 2.6, 
 - Closes: D-O12 (no pointer group to shard), D-O13 (A-3's remaining parts resolved: heads as fenced records in the Vertical Paxos form; hedged placement adopted; pre-granted blocks unnecessary), D-O18 (the writer is the proposer of its own registers, per object).
 - Evidence: `research/metadata-replication.md` §1-§9 (Vertical Paxos read in full; FaRM, RAMCloud, Ceph, BookKeeper, Kafka and KIP-101, Chubby, PNUTS, CockroachDB, Hermes, Paxos Quorum Leases, Copysets, Spanner, The Tail at Scale, CRUSH) and the two TLA+ models with their TLC results recorded in GAPS.
 - What it does not change: owner-local live state and auto-seal; the volume core; the bridges; the landing gate; the merge verdict; the RAM-only rule.
+
+### A-9 (accepted 2026-09-05) — Correct the VFS, attachment, capacity and distributed contracts
+
+- Authorization: Ada requested documentation/design corrections for all preceding feedback;
+  this change implements no Rust behavior and closes no implementation gap. Source review is
+  at Slates `a1059ed` and Hecate `103c078`; the latter is specification evidence, not deployed
+  virtio-fs or consensus code. The fourteen source findings are recorded in the audit.
+- Decisions: preserve delta plus retained base reference; distinguish live coverage from complete
+  immutable capture; make virtio-fs first-class alongside host and OCI attachments; require
+  authenticated consumers and a protected human issuer; reserve actual usable locked capacity
+  including retention/transient costs; establish writeback barriers and truthful POSIX/capability
+  reporting; require byte-complete recovery, correct accepted epochs, safe read authority and
+  placement-before-reference; carry Hecate's bounded transfer, QoS, health and trace contracts.
+- Performance: O(1) root operations and the sub-50 µs provisioning target remain. Source capture,
+  mount/device creation, barriers, hashing and replication have separate costs; no new speedup
+  or latency result is claimed. No implementation tests, mounted workloads or model checker ran.
+- Separate implementation progress during this docs pass: `d9cb6e5` fixes BUG-12 and removes
+  BUG-13's reachability restriction with recorded regression evidence. A-9 records this without
+  claiming to have performed that fix or rerun its tests; broader protocol gates stay open.
+- Verification owed: new AC/T rows in every affected phase and GAPS §8i. Historical TLA runs
+  cover only their original models and finite configurations. §4.8 refinement/revalidation is
+  required before closure under the explicit tooling authorization rules; no install or new
+  CI dependency is added. Existing benchmark records are unchanged.
+- Applied in the same change to: this document's status, glossary, requirements, architecture,
+  D-2/D-12/D-18/D-22/D-25 and affected subsystem contracts, all phase acceptance additions,
+  Appendix B/C; GAPS.md; README.md; docs/cli.md; docs/wip/README.md; EQUIVALENCE.md;
+  research/hecate-contract-review.md and survey-hecate.md; current-contract notes in the
+  affected research documents; docs/bugs/2026-09-05-system-contract-audit.md.

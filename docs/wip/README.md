@@ -1,22 +1,29 @@
 # docs/wip — work-in-progress architecture for slates
 
 This directory holds the design work for slates: a hermetic, purely in-memory, copy-on-write
-virtual filesystem service written in Rust that coding agents provision on demand. Nothing here is
-final until it is promoted out of `wip/`.
+virtual filesystem service written in Rust that coding agents provision on demand.
+`SLATES_DESIGN.md` is the authoritative design even while it lives under `wip/`. Research
+notes are evidence and history, not competing specifications. Implementation status is explicit.
 
 ## Read this first
 
-- `SLATES_DESIGN.md` — the unified design and phased implementation plan (the deliverable; v2 of 2026-09-05 integrates amendments A-1, A-2, A-4, A-5 and A-6 into the body, with the amendment log kept as history).
+- `SLATES_DESIGN.md` — the unified design and phased implementation plan (the deliverable; v3 of 2026-09-05 integrates A-1 through A-9 as listed in the design, including the Hecate contract correction, with the amendment log kept as history).
 - `GAPS.md` — the gap ledger: what is specced, what is open, what is owed, armed tripwires.
 - `ARCHITECT_NOTES.md` — running notes taken while reading the research (inputs, not decisions).
-- `models/` — TLA+ models of the fenced register and of holder-set reconfiguration with TLC configurations; architecture artifacts, checked on 2026-09-04 with results in `GAPS.md` §10; re-run only when §4.8's protocol changes, never in CI.
+- `models/` — TLA+ models of the fenced register and of holder-set reconfiguration with TLC configurations; architecture artifacts, checked on 2026-09-04 with results in `GAPS.md` §10; A-9 changes the required §4.8 contract, so refinement/revalidation is owed before closure; no checker was run or installation authorized. Never CI jobs.
 
 ## Research (evidence for every decision)
+
+"Complete" below means that dated reading note was written. It does not mean the implementation
+is complete or that external API facts and measurements have been revalidated. A-9 notes at
+the top of affected files point to the corrected current contract. Hecate at `103c078` contains
+design documents, not a deployed implementation.
 
 | File | What it covers | Status |
 |---|---|---|
 | `research/survey-sylk-vfs.md` | sylk's Go CoW VFS layers, chunk arena, brokers, WAL, skills; KEEP/AVOID/IMPROVE | complete |
 | `research/survey-sylk-docs-corpus.md` | verbatim helper report over sylk's VFS design docs | complete |
+| `research/hecate-contract-review.md` | A-9: virtio-fs, retained bases, claims, consumer authority, protocol evidence and all carried contracts | source review 2026-09-05; implementation open |
 | `research/survey-hecate.md` | hecate's ratified decisions, vocabulary, spec style; what it left open | complete |
 | `research/survey-hyperscale.md` | hyperscale's SWIM/Raft/WAL/backpressure patterns; PORT/ADAPT/AVOID; constants table | complete |
 | `research/survey-hyperscale-architecture-ranges.md` | verbatim helper reports over hyperscale `architecture.md` line ranges | complete |

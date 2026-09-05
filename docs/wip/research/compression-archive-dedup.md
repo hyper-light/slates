@@ -1,5 +1,9 @@
 # Compression, deduplication, hashing, and the archive format for slates
 
+> **Current contract, A-9 (2026-09-05).** §4.2/§4.9 require bounded charged transfer/decompression and verification before publication; §4.13 scopes identity lookup and sharing to authorized consumers.
+> See [the contract review](hecate-contract-review.md) and [the unified design](../SLATES_DESIGN.md).
+> The rest of this file is dated research evidence; conflicting recommendations are superseded.
+
 Status: research note (work in progress, written incrementally). Date: 2026-09-03.
 Scope: an in-memory, copy-on-write, hermetic VFS ("slates") that must archive/compress volumes into RAM
 and export them as byte streams, clone, and replicate across machines. No disk writes by us.

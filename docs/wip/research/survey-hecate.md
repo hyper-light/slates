@@ -1,5 +1,9 @@
 # SURVEY: hecate — decisions, vocabulary, and documentation style slates can reuse
 
+> **Current contract, A-9 (2026-09-05).** Guest serving and storage admission apply; §8.1 is corrected. The current design is §4.2, §4.6 and §4.8–4.16.
+> See [the contract review](hecate-contract-review.md) and [the unified design](../SLATES_DESIGN.md).
+> The rest of this file is dated research evidence; conflicting recommendations are superseded.
+
 Status: research survey, 2026-09-03 (consolidated from two survey passes the same day;
 every GRILLING.md and spec citation below was re-verified by direct read on 2026-09-03 —
 see Appendix B). Source repo: `/Users/adalundhe/Projects/hecate`
@@ -1443,39 +1447,34 @@ boot-validated?".
 
 ## 8. What is inapplicable to slates, what hecate left undecided, and what looks wrong for an in-memory hermetic VFS
 
-### 8.1 Inapplicable (and why)
+### 8.1 Applicability corrected by A-9 (2026-09-05)
 
-- **MicroVM isolation and everything inside the pod** — ADR-0001/0006, `PODS.md`,
-  `MONITORING.md` §§1–6, 9–10, `WIRE_SECURITY.md` §§2, 5 (the egress staging device, guest
-  receive path), the warden/sensor, `hecate-init`, virtio-fs/DAX/mapping engine
-  (`SERVING.md` §7), the two-container interior. Slates serves host processes; there is no
-  guest, so "the VM boundary is the isolation guarantee" (`SUMMONING.md:37-39`) has no
-  analogue and the entire "in-guest paths are simply real" argument (`SUMMONING.md:109-112`)
-  inverts: slates *must* solve host-path presentation.
-- **The agent roster, offices, rank, Scribe, Guardian judgment** — `AGENTS.md`, `RANK.md`,
-  `PLATFORM.md` §§1–6, `HANDOFF.md`, the history ring. Slates has agents as *clients*, not
-  as harness participants.
-- **The claims ledger and its machinery** — `LEDGER.md`, `LEDGER_CORE.md`,
-  `LEDGER_SUBSTRATE.md`, `MATERIALIZER.md`, `QUEUE`/`FANOUT` as ledger transport, summon-as-
-  claim. Slates' provisioning is a request to a server, not "a claim ... executed by the
-  scheduler" (`CONTEXT.md:53-55`). The *shape* (typed requests, typed dispositions
-  `retryable | terminal`, `LEDGER.md:62-69`) is worth keeping.
-- **Green, the merge gate, the landing engine, conflict values** — ADR-0003/0005,
-  `MERGE.md`, `SESSIONS.md` §§5–7. These exist because hecate refuses shared mutable volumes
-  and reconciles per-pod overlays through a serializer. If slates offers shared writable
-  volumes it needs none of this; if it offers per-agent overlays it needs *some* merge
-  story and should read ADR-0005's "Why reject at all" (`0005:24-33`).
-- **IAM as a global authority plane** (`IAM.md`) — 614 lines of Zanzibar-class design for
-  users/orgs/regions; slates needs at most a principal + scope + capability-atom model
-  (`IAM.md:164-183` the `volume` resource actions `claim(role, access_mode)`, `attach`,
-  `read`, `write`, `seal`, `snapshot_read` are a reasonable starting vocabulary).
-- **Consensus, the meta tree, cross-region** — only relevant if slates replicates volumes
-  across nodes. For a purely in-memory service, replication is the *only* durability, so
-  this may be relevant after all (see 8.3).
-- **Object tier NVMe tiers, pack volumes, scrub, EC, flash cache** — `OBJECT_TIER.md`
-  §§2, 4–5, `CACHE.md` §8: all disk. Only the identity/manifest/ladder-ordering ideas
-  transfer.
-- **Provider egress, registry, forest/vector, scheduler bands** — no analogue.
+The earlier conclusion that virtio-fs, merge and consensus were inapplicable was wrong for
+Ada's intended system. [The current contract review](hecate-contract-review.md) supersedes
+that conclusion. Hecate at `103c078` is a docs-only reference, so these are design contracts,
+not claims of an implemented or benchmarked backend.
+
+- **Guest serving applies.** Carry the owned FUSE-over-virtio device, custom runtime seam,
+  pinned attachments, pre-effect authorization, writeback barriers and immutable mapping
+  constraints. Native host paths are also required; the two serve different consumers.
+  VM/container lifecycle and the pod's internal agent processes belong to the harness.
+- **Claims need disambiguation.** Slates does not need Hecate's entire workflow ledger to
+  provision a volume. Its storage claim must nevertheless atomically reserve actual host
+  capacity, account for every resource cost and preserve accepted entitlement. A quota field
+  is insufficient. Adopt admission principles without importing disk-backed infrastructure.
+- **Green/merge/landing apply.** A-5 already adopted declared-operation merge through green
+  volumes, a pure verdict and human-granted landing. Their end-to-end integration remains open.
+- **Consensus and cross-region contracts apply.** A-6 selected configuration-only consensus
+  with fenced registers and placement; its implementation still needs safe adoption, read
+  authority and message-level fault tests. Hecate's named consensus cases are evidence to adapt.
+- **Identity/rights apply.** Full organization-wide IAM and agent ranks are outside Slates,
+  but consumer identity, scope, pre-effect checks and protected human authority are essential,
+  including two agents on one uid. Ids and channel labels do not authorize by themselves.
+- **Disk tiers remain excluded.** NVMe WAL, disk pack volumes and flash cache conflict with
+  RAM-only Slates. Transfer verification, publication ordering, repair and capacity accounting
+  still apply. Likewise, flow classes must carry through memory, CPU and device queues.
+- **Agent governance and unrelated indexes remain outside scope.** Scribe/Guardian/rank,
+  provider egress policy and forest/vector services are harness/application responsibilities.
 
 ### 8.2 Decided by hecate, directly reusable
 
@@ -1486,7 +1485,12 @@ runtime doctrine (§3.8 above), hecate-wire's canonical encoding and evolution r
 FAULTS Masked/Degraded/Refused matrix, AbsenceIs, the content-free law, chokepoint-span
 tracing, the façade-first MCP skill model, and the documentation skeleton.
 
-### 8.3 Left undecided by hecate — slates must decide
+### 8.3 Historical open questions from the initial survey
+
+A-5/A-6 settled Slates' merge and configuration architecture; A-9 settles the corrected
+base/attachment/capacity contracts. The source questions below remain useful reading history,
+not a reopening of those decisions. Hecate's unfinished attachment lifecycle is still not
+implementation evidence.
 
 1. **Host-OS mount technology.** Zero decisions (§2.9). Per-OS candidates (FUSE / macFUSE or
    FSKit / WinFsp or ProjFS / NFS or SMB loopback) are exactly EdenFS's "three-protocol

@@ -6,6 +6,14 @@ robust metadata servers; RAM-only volume storage; POSIX paths for host processes
 OCI containers and MicroVMs; accurate local and remote bases; protected capacity
 claims; and the correction that delta storage is preferred when it retains its base.
 
+Workspace update, 2026-09-05: separate archive work committed as `540fb5b` (also including
+the initial audit/review files), followed by the ledger fix `d9cb6e5`. The latter fixes BUG-12's
+acceptance-epoch refresh and removes BUG-13's forced candidate-zero reachability. Its commit
+record reports the regression failing before the fix, passing afterward, and 40 passing DB
+tests (`git show -s --format=%B d9cb6e5`). This docs pass inspected the change but did not rerun
+those tests. BUG-12 is fixed by that separate commit; BUG-13's direct adopted-value assertion
+and the broader protocol evidence remain open. Findings below preserve the `a1059ed` baseline.
+
 ## 1. Evidence and limits
 
 The reference is `../../../../hecate` at commit `103c078`. Its `docs/GAPS.md` §0
@@ -78,3 +86,29 @@ importing Hecate's at-rest encryption design merely because it exists.
 - [mlock semantics](https://man7.org/linux/man-pages/man2/mlock.2.html): an anonymous
   mapping alone is not a residency guarantee. Locking and full accounting are separate
   from avoiding explicit filesystem writes.
+
+## 6. Named consensus conformance mapping
+
+Hecate `docs/specs/CONSENSUS.md` §9 lists CS1–CS12. All are open Slates gates under
+AC-8.20/T-8.18; they apply to the configuration core, not a new consensus call per VFS write.
+The persistence cases use anchor-owned RAM and declared host-loss scopes instead of disk WAL.
+
+| Hecate case | Required Slates scenario and result |
+|---|---|
+| CS1 | Promote/demote voters while their configuration knowledge lags; configuration-commit metadata prevents a leaderless unsafe membership transition. |
+| CS2 | Rejoin an isolated lower-term node; PreVote permits catch-up rather than a stuck election state. |
+| CS3 | Give a replica a higher term but shorter log; elections still converge without sacrificing the committed prefix. |
+| CS4 | Issue a configuration ReadIndex through a learner; return only a confirmed read boundary. |
+| CS5 | Reorder log probe/reject/hint messages; replication converges without an unbounded rejection loop. |
+| CS6 | Transfer leadership while PreVote/CheckQuorum are active; the authorized transfer completes without weakening ordinary election checks. |
+| CS7 | Change individual voters across a term boundary; disjoint quorums cannot each commit a conflicting configuration. |
+| CS8 | Exercise partial connectivity, a leader cut off from a majority and asymmetric per-link partitions; preserve safety and reach stable leadership when the declared liveness conditions return. |
+| CS9 | Crash between entry storage and authority/hard-state publication; recovery never references an entry whose bytes were not retained in the promised RAM scope. |
+| CS10 | Crash at every apply/watermark boundary at N=1 and N=3; recovery neither skips a committed effect nor applies it twice. |
+| CS11 | Leave a group idle; host-observed node liveness reports actual peer state rather than mistaking no traffic for failure. |
+| CS12 | Step down through support loss, transfer and joint-configuration exit; revoke all prior support/read authority before another leader relies on it. |
+
+A test that is inapplicable to the final configuration dialect must record the exact replaced
+mechanism and its equivalent safety/liveness test. A blanket "covered by simulation" is not a
+disposition. BUG-12/13's ledger histories and byte-complete placement tests remain additional
+obligations; these configuration cases do not establish them.

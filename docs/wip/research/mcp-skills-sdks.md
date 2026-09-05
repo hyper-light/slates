@@ -1,5 +1,9 @@
 # Agent integration surfaces for slates: MCP, skills, and async Python/TypeScript SDKs
 
+> **Current contract, A-9 (2026-09-05).** §4.12/§4.13 require one operation descriptor, usable host/guest flows and enrolled consumer/human authority. MCP/SDKs and CLI grant issuance remain unimplemented.
+> See [the contract review](hecate-contract-review.md) and [the unified design](../SLATES_DESIGN.md).
+> The rest of this file is dated research evidence; conflicting recommendations are superseded.
+
 Research memo. Date of research: 2026-09-03. Author: research agent (evidence gathering only; no implementation).
 
 Evidence tiers used in citations: [A] peer-reviewed paper; [B] official specification or vendor documentation; [C] widely deployed implementation, its source, or its README; [D] blog or secondary source (gap-filler, flagged).

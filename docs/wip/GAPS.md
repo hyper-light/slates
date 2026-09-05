@@ -6,35 +6,36 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
 
 ## 0. The one global fact
 
-- Phase 0 is in progress (2026-09-04): the workspace exists with the lint wall, the structural
-  test and the literal check (`cargo xtask check`); `slates-machine` measures the boot profile,
-  `slates-mem` holds the arenas, slabs, handles and rings, and `slates-rt` runs the executor on
-  kqueue, epoll or io_uring, IOCP and the simulation (BENCHMARKS.md records the baselines).
-  `slates-wire` frames, checksums and canonically encodes with a compile-time schema hash.
-  Phase 0's crates exist; Phase 1 is next; nothing below is closed by code until its phase says
-  so.
+A-9, 2026-09-05: the system has substantial component source and historical tests, but it
+cannot yet offer the complete product contract. This status is based on read-only review of
+Slates `a1059ed` and Hecate `103c078`, not a new test run. Fourteen source findings and their
+triggers are in [the audit](../bugs/2026-09-05-system-contract-audit.md); §8i is the current
+closure ledger. Design corrections are implemented in docs only. They do not fix the code.
+
+Sections §8a–§8h preserve dated implementation records. An earlier "gated" claim applies only
+to the named test and its original scope; it does not close the A-9 integration or correctness
+gaps. The TLA runs in §10 are historical, bounded model evidence, not a proof of current Rust.
 
 ## 1. Component inventory
 
-| Subsystem (design §) | Research on file | Spec section | Tests named | ACs | Laptop degenerate | Status |
-|---|---|---|---|---|---|---|
-| Machine profile (4.1) | memory-and-system-awareness.md | yes | T-0.* | AC-0.3, 0.5 | yes | specced-untested |
-| Memory (4.2) | memory-and-system-awareness.md; arc-free-rust-architecture.md | yes | T-0.1, 0.2, 0.4, 0.5 | AC-0.4, 0.5 | yes | specced-untested |
-| Runtime (4.3) | low-latency-ipc-and-runtime.md; arc-free-rust-architecture.md | yes | T-0.3, 0.6-0.9 | AC-0.6-0.9 | yes | specced-untested |
-| Volume lifecycle (4.4) | cow-data-structures.md; edenfs-scale-distribution.md | yes | T-1.*, T-2.* | AC-1.*, AC-2.4 | yes | implemented in `slates-vfs` (Phase 1 tasks 1–9, §8c); AC-1.1, 1.3–1.8 gated; AC-1.2 waits on the Linux tmpfs lane |
-| Namespace and content (4.5) | cow-data-structures.md | yes | T-1.* | AC-1.* | yes | implemented (§8c): inline small directories, block tree, chunk windows, epoch histogram accounting; base plane and landing still specced-untested |
-| Bridges (4.6) | os-filesystem-bridge.md (§7-§8 FSKit) | yes | T-3.*, T-4.* | AC-3.*, AC-4.* | yes | specced-untested; macOS FSKit gated by the Phase 4 spike |
-| IPC (4.7) | low-latency-ipc-and-runtime.md | yes | T-2.* | AC-2.1-2.3, 2.6 | yes | specced-untested |
-| Database, registers and configuration (4.8) | database-design.md (§7); metadata-replication.md (A-6) | yes | T-2.*, T-8.* | AC-2.*, AC-8.* | yes | specced-untested; the register and reconfiguration protocols are model-checked (`models/`, see §10) |
-| Wire (4.9) | database-design.md; survey-hecate.md; survey-vorpal.md | yes | T-0.8, T-8.* | AC-0.8 | yes | specced-untested |
-| Distribution (4.10) | edenfs-scale-distribution.md; metadata-replication.md | yes | T-8.* | AC-8.* | yes | specced-untested |
-| Compression/archive (4.11) | compression-archive-dedup.md | yes | T-7.* | AC-7.* | yes | specced-untested |
-| Agent surfaces (4.12) | mcp-skills-sdks.md | yes | T-5.* | AC-5.* | n/a | specced-untested |
-| Security (4.13) | mcp-skills-sdks.md; survey-hecate.md | prose | T-2.7 | — | n/a | designed-unspecced |
-| Observability (4.14) | survey-hecate.md §5 | prose | — | — | n/a | designed-unspecced |
-| Base plane (4.15, D-25) | disk-source-of-truth.md; edenfs-scale-distribution.md | yes | T-1.10-1.13, T-3.10-3.11, T-4.11-4.12 | AC-1.9-1.11, AC-3.8-3.9 | yes | specced-untested |
-| Landing (4.15, D-26) | disk-source-of-truth.md; survey-hecate.md | yes | T-1.14-1.17, T-2.10-2.12, T-3.12, T-5.9-5.10, T-8.10 | AC-1.12-1.14, AC-2.8-2.10, AC-4.10, AC-5.7-5.8, AC-8.10, AC-9.6 | yes | specced-untested |
-| Merge engine (4.16, D-27) | merge-engine.md; survey-hecate.md | yes | T-1.18-1.19, T-6.1-6.14, T-8.11 | AC-1.15, AC-6.1-6.12, AC-8.11 | yes | specced-untested |
+| Subsystem (design §) | Current source status, 2026-09-05 | Open contract and acceptance |
+|---|---|---|
+| Machine/memory/runtime (4.1–4.3) | Foundation crates and historical measurements exist. Admission/residency integration incomplete. | GAP-A9-1, GAP-A9-11; AC-0.10–0.11, AC-2.11 |
+| Volume/namespace/base (4.4–4.5, 4.15) | Core CoW, host seam and witnesses exist; mounted base routing and snapshot coverage incomplete. | GAP-A9-2, GAP-A9-3, GAP-A9-13; AC-1.16–1.17 |
+| Bridges (4.6) | Linux codec, dispatch, transport and launcher source; concrete ABI/operation gaps. Other adapters absent. | GAP-A9-3–5; AC-3.10–3.12, AC-4.11–4.12 |
+| IPC/local database (4.7–4.8) | Rendezvous, metadata replay and completion transactions exist; content recovery incomplete. | GAP-A9-6, GAP-A9-9; AC-2.12–2.13 |
+| Registers/configuration (4.8) | Pure register, ledger, mirror and reconfiguration simulations; BUG-12 fixed in `d9cb6e5`, broader BUG-13/protocol evidence open; configuration group unwired. | GAP-A9-7; AC-8.18, AC-8.20 |
+| Wire/distribution (4.9–4.10) | Framing/canonical bodies and protocol primitives; fleet transport/placement unbuilt. | GAP-A9-8, GAP-A9-11; AC-7.7, AC-8.19–8.21 |
+| Archive/compression (4.11) | Pure archive/raw-format and missing-set helpers; separate pre-existing archive edits outside A-9 review. | GAP-A9-8, GAP-A9-11; AC-7.7; compression/dedup rest remains planned |
+| Agent surfaces (4.12) | Rust client and CLI subset; no MCP or Python/TypeScript SDK implementation. | GAP-A9-10; AC-5.9–5.11 |
+| Security (4.13) | OS credential and channel checks; enrolled consumer/human issuer boundary incomplete. | GAP-A9-9; AC-2.13, AC-5.10 |
+| Observability (4.14) | Partial signals/counters; typed absence and causal context not established end to end. | GAP-A9-12; AC-0.11 |
+| Landing (4.15) | Engine, server records and Unix control/write integration; CLI issuance and trusted issuer incomplete. | GAP-A9-9–10; AC-5.10 |
+| Merge (4.16) | Pure verdict, deriver and splice/engine components; Green/Work service and fleet integration incomplete. | GAP-A9-14; AC-6.13, AC-8.19 |
+
+Research is indexed in [README.md](README.md); the canonical subsystem sections and original
+acceptance criteria remain in [SLATES_DESIGN.md](SLATES_DESIGN.md). New acceptance rows supplement
+them rather than renumbering or weakening the original gates.
 
 ## 2. Decision-open (named owners: the phase that closes each)
 
@@ -59,15 +60,20 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
 
 ## 3. Undesigned (charter only)
 
-- Security spec (principals, access lists, audit counters) — CLOSED 2026-09-05 by A-8 (§4.13's specification).
-- Observability spec (span roster, health signal catalog, metric names) — CLOSED 2026-09-05 by A-8 (§4.14's specification).
+- Security spec — A-8 defined account credentials; A-9 adds enrolled consumers and protected human issuer authority (§4.13). Implementation remains open in GAP-A9-9.
+- Observability spec — A-9 corrects trace identities and adds typed absence/freshness (§4.14). Implementation remains open in GAP-A9-12.
 - Skills content (the seven SKILL.md documents, including `slates-landing` and `slates-merge`) — owed in Phase 5 and Phase 6.
 - The confirmation-surface contract for harnesses other than the terminal (the request stream a harness renders, answered only by a human-operated process through the control channel) — owed in Phase 5 with the terminal surface as the reference.
 - Operator documentation (fleet configuration: failure-domain tree, regions and mirror regions, neighbourhood sizing inputs, certificates) — owed in Phase 8.
 
 ## 4. Drift (owed-and-forgotten)
 
-- None. A-1, A-2, A-4, A-5 and A-6 were applied to every affected section in the same change (see the amendment log in SLATES_DESIGN.md for the lists), and the v2 consolidation of 2026-09-05 integrated them into the body text: the amendment tags left the headings and labels, four statements that still described merge records as consensus entries or pointers were corrected to ledger-register entries (§2.3, §4.15, §4.16), the Phase 5 task order and the Phase 9 acceptance order were fixed, and Part 7's open questions were renumbered with the closed ones recorded here.
+A-9 corrects documentation drift: the remote delta-only clone, exclusion of virtio-fs,
+quota-as-reservation language, implicit whole-tree snapshot claims, uid-as-consumer authority,
+missing writeback barriers, overstated recovery and protocol proof, and CLI grant availability.
+The corrected design is still ahead of implementation; every item remains open in §8i until
+its observable regression and integration gate pass. Historical source/measurement records
+are retained with their scope; no documentation edit is an implementation acceptance.
 
 ## 5. Residual literals against the derivation doctrine
 
@@ -109,7 +115,7 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
 - Rename rate high enough that per-volume serialization is visible → reopen D-7 (shared index escape hatch).
 - Volume skew across shards → reopen D-7 (Silo-style shared index).
 - Loss windows exceeding the operator SLO, or put quorums frequently unreachable → reopen D-14 (make live shipping the default for the affected class).
-- Pointer commit rate approaching group capacity → engage the measured sharding (D-O12), not a constant.
+- Configuration commits growing with ordinary write traffic → fail the D-14 control-path invariant; D-O12 remains closed because there is no pointer group.
 - FSKit spike fails its go criteria → NFSv3 remains primary on macOS and D-2 is reopened next macOS release.
 - NFS fallback coherence test fails at the derived `actimeo` → reopen the fallback's cache posture.
 - Hashing backlog persistent → reopen D-6 (hash-on-seal policy).
@@ -1002,20 +1008,89 @@ Resumable transfer by the missing set landed the same day (`transfer.rs`; §2.6)
 
 ## 8h. Phase 8 groundwork (2026-09-05)
 
-The fenced ledger register landed 2026-09-05 as `crates/db/src/ledger.rs`, the register over time built on Phase 2's f=0 register primitives (§8d task 7, `register.rs`), ahead of the rest of Phase 8, because the protocol — §4.8 "Promotion and takeover" and §4.16's "merge record as a fenced ledger entry; holders recompute" — is a pure, deterministic state machine that needs none of the networking, membership or server work to be correct and directly confirmable, and §10 already names the implementation's proof as "the Rust simulation harness with the same invariants encoded as checks (AC-8.1, T-8.15)." A register is not one value but a growing log. A `Cohort` owns the object's `2f+1` candidate holders (from the rendezvous placement of `register.rs`) keyed by host id, each a `Fence` (the highest host epoch it has accepted under) and a dense log of `Record`s (an epoch and a payload identity). An `Owner` is a small proposer view — its host id, the epoch it proposes under, and its log — that acts against a cohort by `&mut` (ownership by handle, sharing by move, no `Arc`, R2). `propose` appends a record at the next position, offers the whole log to the reachable holders under the owner's epoch (each reconciles: the agreeing prefix skipped, divergent or missing positions overwritten or appended, a stale tail dropped), and commits the moment `f+1` acknowledge; a superseded owner, its epoch below the holders' fences, is refused by every fenced holder and so reaches at most `f` — it never commits. `take_over` is the Vertical Paxos II recovery round: it fences and reads a reachable quorum (refused `NoQuorum` below `f+1`, rather than splitting the register), bumps the epoch to the successor of the highest any holder has seen (a structural increment, as `2f+1` and `f+1` are — not a tuning constant), and adopts, per position, the record carried under the highest epoch it read. Safety is quorum intersection: a committed record reached `f+1` holders and the read quorum is `f+1`, so the read intersects every commit quorum and sees every committed record; no later owner ever proposes a different record at a committed position (adoption keeps the committed value there), so the highest-epoch record at a committed position is the committed one. A record acknowledged by fewer than `f+1` holders before a takeover has not committed and may be adopted or dropped — either is safe, because the owner that proposed it is fenced and no reader saw it commit (the Continuity subtlety the `FencedRegister` model exposed, §10). It is a pure simulation (R8): holders are in memory, a message is a direct call, so one body of code is the laptop (`f=0`: one holder, a commit of one, the local append) and the fleet (`f>0`), with no network, no clock, no randomness, no mode switch.
+`crates/db/src/ledger.rs`, `mirror.rs` and `reconfig.rs` contain pure, direct-call simulations
+of ledger adoption, prefix shipping and holder-set changes. The earlier record lists 10 ledger,
+6 mirror and 7 reconfiguration tests; those counts were not rerun for A-9. The tests are useful
+component evidence but do not establish a correct fleet or a refinement of the TLA models.
 
-Gated (`crates/db/tests/ledger.rs`, 10 tests, every host): three proposals to a full cohort commit and read back as the committed prefix (T-8.15); `f=0` is the local append (one candidate, a commit of one — the same code as the fleet, AC-8.1); a minority partition still commits (two of three) and a majority does not (one of three); a takeover is refused below a quorum (`NoQuorum`); a takeover fences the old owner, bumps the epoch, and adopts the committed prefix; a superseded owner never commits while the new owner does, and no position diverges (StaleNeverCommits); a partial write acknowledged only by the owner is dropped by a takeover whose read quorum lacks it, while every committed record survives (Continuity); and the commit outcome is the same at f=0 and f=1 (the N=1 differential). The proptest oracle drives arbitrary histories of proposals, partitions and takeovers at f in {0,1,2} — generated as plain tuples so the strategy needs no `Arc`-backed `prop_oneof` — with a guaranteed leading full-cohort commit for non-vacuity, and asserts Agreement (no position holds two quorum-agreed identities), NoLoss and TotalOrder (the committed prefix only extends and never rewrites a committed value), and Continuity (a takeover adopts at least the committed prefix) after every step. These are the properties the `FencedRegister` TLA+ model proved (§10); the simulation is their implementation-side proof.
+The audit at `a1059ed` found a committed-prefix counterexample in `Holder::reconcile`: an
+identical record retained its older accepted epoch, allowing later adoption of a conflicting
+intermediate-epoch proposal (BUG-12). Separate commit `d9cb6e5` fixes that refresh and reports
+its before/after regression plus 40 passing DB tests. It also removes the forced candidate-zero
+reachability restriction (BUG-13) and pins a shrunk seed. The direct check immediately after
+takeover still compares adopted length rather than values; later committed-prefix comparison
+exists. Message-level histories and complete adoption checks remain owed. No tests were rerun
+in this documentation pass. `Owner::replicate` also needs its extension precondition enforced. Highest epoch
+cannot be learned from unavailable holders' hidden state in a real protocol.
 
-Asynchronous mirroring landed the same day (`crates/db/src/mirror.rs`), the shipper of D-18's durability statement ("committed records reach the mirror region asynchronously in epoch order with a measured, exposed lag; an operation that needs them there awaits the mirror scope"). A `Mirror` is a second `Cohort` in another failure domain with its own writer; `ship` replays the home region's committed prefix onto it through `Owner::replicate` — offering the authoritative prefix whole, so it catches up a returned holder and appends the new tail without rewriting a committed position (idempotent and resumable). Replaying the committed prefix is epoch order (positions commit in order, epochs never decrease), so the mirror commits a dense prefix and never a record the home did not, and it can lag but never diverge. `lag` exposes the count of records committed at home but not yet mirrored, and `placed_through` is `await placed(mirror)` for a record. This closes the `DurabilityScope::Mirror` that `register.rs` declared but refused at f=0. Gated (`crates/db/tests/mirror.rs`, 6 tests, every host): a reachable mirror catches up and the lag falls to zero; `await placed(mirror)` follows shipping; a minority partition of the mirror's own holders still ships (a quorum reachable) and a majority holds the lag then resumes on the next ship after healing (replaying the same prefix); mirroring tracks new home commits incrementally; and f=0 is a single mirror holder (the same code as a fleet mirror, R8). `Owner::replicate` is the primitive the healer will reuse to bring a lagging holder current.
+`Mirror::lag` is a count of records, not a duration; identity-only shipping does not close
+`await placed(mirror)` for filesystem contents. Reconfiguration simulations cover their local
+transition model; message delay, consumer/read leases, bytes, host-local capacity, state-transfer
+publication and configuration consensus wiring remain open. These modules provide starting
+points for the same N=1/fleet semantics, not proof that all integration work is transport only.
 
-Reconfiguration landed the same day (`crates/db/src/reconfig.rs`), the faithful port of the `Reconfig` model (§10): changing a register's holder set from an old configuration to a new one while the owner keeps writing, Raft's joint consensus / Vertical Paxos I made concrete. Three phases — old (commit at a majority of the old set), joint (after `announce`, commit at a majority of the old set *and* the new set, both active, a departed holder never accepting again and a fresh one starting empty), and new (after `retire`, a majority of the new set) — with state transfer (`transfer` copies the newest committed record into a lagging new-set holder) and a retirement gate (only after the owner acknowledged the change and the newest committed record is held by a majority of the new set). The register here is a single newest-wins value (a head, a chain version, a lease), the shape the model checks, distinct from the growing log of the fenced ledger register. Gated (`crates/db/tests/reconfig.rs`, 7 tests, every host): the old phase commits at an old majority; a departed holder cannot accept; the joint phase needs both majorities; state transfer carries the newest to a fresh holder; retirement is gated (refused outside joint and before owner-ack); a full reconfiguration preserves the joint-committed record (NoLoss, non-vacuous); and a proptest oracle over arbitrary histories of issue/accept/announce/owner-ack/transfer/retire (tuple-generated, no `Arc`-backed `prop_oneof`) asserts ReadSafety (every read majority — of whichever configuration a reader knows, which may lag one phase — holds a record at least as new as every committed one, computed by enumerating the majorities) in every reachable state and NoLoss once retired. These are the two properties the `Reconfig` TLA model proved; the simulation is their implementation-side proof.
+## 8i. A-9 contract correction and open implementation gaps (2026-09-05)
 
-Owed (the rest of Phase 8): wiring the register into the server's put path (hedging content to `f+1` with tied requests to the rest after the measured p95, the acknowledging set recorded in the head record), the healer and probation for a lagging or returned holder (over `replicate`), driving the mirror shipper from the runtime on a cadence with a real cross-region transport and a time-based lag, migration of ownership on a write-intent attachment, the SWIM membership feeding the neighbourhood and host epochs, and the regional configuration consensus group (the hecate Raft dialect) that carries the membership decisions the fenced register, mirror and reconfiguration simulations already implement at the protocol level (assigning epochs at takeover, announcing and retiring configurations); the auto-seal cadence constants remain measured in Phase 8 (D-O12). The simulations stand in for all of these at the protocol level; the runtime carries the same code with a real transport.
+Separate workspace work advanced HEAD through archive commit `540fb5b` and ledger fix
+`d9cb6e5` during this pass. BUG-12 is fixed there with recorded before/after regression evidence;
+BUG-13's reachability restriction is removed, but direct adoption-value/message-level checks
+remain owed. This docs pass inspected those changes and the commit's reported tests without
+rerunning them. Source findings retain their explicit `a1059ed` baseline.
+
+All rows below are **open**. Their design is now specified in A-9; acceptance requires the
+named behavior tests and relevant original phase gates. Source findings BUG-1–BUG-14 are in
+[the audit](../bugs/2026-09-05-system-contract-audit.md). Hecate applicability and deliberate
+departures are in [the contract review](research/hecate-contract-review.md). No new measurement
+or executable regression was performed by this docs change.
+
+| Id | Gap and source finding | Design contract | Closure gate / owning phase |
+|---|---|---|---|
+| GAP-A9-1 | Locked flag without locked store, mapped-vs-usable capacity, dynamic allocations competing with bounded claims (BUG-1–3). Uncharged metadata/transient/retained bytes can defeat the cap. | §4.2: atomic all-cost per-host admission; disjoint shard credits; protect outstanding entitlement through resize, pressure and recovery. | AC-0.10/T-0.10; AC-2.11/T-2.13; Phases 0/2. |
+| GAP-A9-2 | Live bases and immutable complete snapshots conflated; remote delta-only clone drops untouched state; base capture not implemented. | §4.4/§4.15/§4.10: retained BaseRef and explicit coverage; stable-source requirement for complete atomic capture. | AC-1.16/T-1.20; AC-8.21/T-8.19; Phases 1/8. |
+| GAP-A9-3 | Base lookup depends on listing, FUSE flag mismatch, undispatched advertised operations, ignored metadata/rename flags, false statfs (BUG-5–10); coherence delivery and metadata copy-up need sweep. | §4.5–§4.6: complete shared operations, independent ABI checks, truthful capacity, real invalidations and mounted conformance. | AC-1.17/T-1.21; AC-3.10/T-3.13; Phases 1/3. |
+| GAP-A9-4 | Attachment record is not a mounted path; dirty client caches lack a seal barrier; handles grow and helper error exits can orphan children (BUG-4/14). | §4.4/§4.6: authenticated binding, ready path/device, barriers, generations, bounded drain/revoke/reuse. | AC-3.11–3.12/T-3.14–3.15; Phase 3. |
+| GAP-A9-5 | No virtio-fs device or demonstrated OCI/VMM integration; native macOS/Windows remain unimplemented. | §4.6: owned FUSE-over-virtio/custom-runtime seam, host and guest containers, device admission, immutable-only isolated DAX if offered. | AC-4.11–4.12/T-4.13–4.14; Phase 4. |
+| GAP-A9-6 | Restart reconstructs empty scratch contents and loses local snapshots (BUG-11). Metadata completion tests cannot establish filesystem recovery. | §2.6/§4.8/D-18: recover bytes, roots, witnesses, source identity, rights and capacity with effect/completion publication. | AC-2.12/T-2.14; Phase 2. |
+| GAP-A9-7 | BUG-12 acceptance-epoch fix and BUG-13 reachability correction landed separately in `d9cb6e5`; complete adoption-value/extension checks, message faults, read authority and real configuration core remain unestablished. | §4.8: accepted/proposed/promise separation, exact historical prefix, distinct quorums, safe leases and bounded epochs; configuration only on cold changes. | AC-8.18/T-8.16; AC-8.20/T-8.18; Phase 8. Model refinement/revalidation also owed, not run. |
+| GAP-A9-8 | Identity-only replication, mirror lag in records, no byte-complete holder admission, repair or cross-region service. | §4.10/§4.16: verified placed reference graph, real holder capacity, atomic generations, recomputation and time lag. | AC-8.19/T-8.17; original fleet gates; Phase 8. |
+| GAP-A9-9 | Same-uid agents share ambient authority; channel class is not evidence of a human approval. | §4.13: trusted consumer enrollment, scoped rights before effects, protected grant issuer and manifest-bound approval; private content sharing scopes. | AC-2.13/T-2.15; AC-5.10/T-5.12; Phases 2/5. |
+| GAP-A9-10 | No MCP/SDKs; CLI ids/manual root setup, partial help/output and no grant issuance; schema parity and actual path readiness incomplete. | §4.12: one operation descriptor; scoped names, consistent JSON/help/errors/cursors; discoverable native/guest flows and exact capability status. | AC-5.9–5.11/T-5.11–5.13; Phase 5. |
+| GAP-A9-11 | Separate frame classes do not bound CPU, device, arena or full-object transfer costs; resumable helper is not bounded end-to-end ingest. | §4.2/§4.9: all-resource QoS, bounded quanta/credits, verified named and unknown-length transfer, cancellation and release. | AC-0.10/T-0.10; AC-7.7/T-7.8; Phases 0/7/8. |
+| GAP-A9-12 | Signal names/absence and request-vs-trace causation not enforced end to end; nine spans were called seven. | §4.14: closed registry, absence/freshness semantics, distinct identities and telemetry loss markers. | AC-0.11/T-0.11; Phase 0 foundation with surface/fleet integration. |
+| GAP-A9-13 | Clean-file digest export and bounded cache discovery not implemented; stale source knowledge must not imply clean content. | §4.15: verified current digest only; invalidate before mutation; watcher hints backed by revalidation. | AC-1.17/T-1.21; Phase 1 core and bridge integration. |
+| GAP-A9-14 | Pure merge core lacks service-level Work/Green roles, CLI/MCP flow, pinned attachments and distributed recomputation. | §4.16: complete immutable green base, writeback barrier, declared operations only, input retention and placed-before-reference. | AC-6.13/T-6.15; AC-8.19/T-8.17; Phases 6/8. |
+| GAP-A9-15 | Native/guest POSIX, strict RAM residency and grant-only disk effects lack complete transport-specific evidence. Historical stages overstate coverage. | §4.6, Part 6 and EQUIVALENCE.md: explicit semantics/boundaries; report skipped lanes and limited adapters honestly. | AC-9.7/T-9.1 plus original conformance/workload gates; Phase 9, prerequisite gates run in their owning phase. |
+
+**Additional decisions/evidence owed.** Phase 4 must establish the supported VMM/device seam,
+immutable mapping capability and guest cache residency for each host; no guessed support
+matrix. Phase 1/4 must establish which read-only source facilities can produce complete atomic
+bases without a write or privilege, otherwise refuse that request. Phase 2/5 must establish
+the protected enrollment/confirmation channel with the harness; a uid-only demonstration
+cannot close it. Derived headroom/retention bounds and provisioning costs need new measured
+records; the formulas in the design are contracts, not measurements.
+
+**Prohibited-path review.** Old research recommendations of parallel pure-TS SDK fallbacks,
+FSKit compatibility shims or automatic degraded bridge substitution are not authorization to
+implement them. Remove such runtime paths if found; requested semantics must be met or refused.
+A limited NFS adapter cannot satisfy the full POSIX contract by expanding an expected-failure
+list. No subagent, external runtime, checker installation, privilege or disk write is approved
+by this ledger.
 
 ## 9. Blocking order toward first light
 
-Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3
-(Linux bridge). First light = a tool running against a volume on Linux through `slates exec`.
+1. Correct capacity/residency admission and acknowledged-content recovery (GAP-A9-1/6).
+2. Complete base routing, FUSE semantics, barriers and owned attachment teardown (2/3/4).
+3. Establish trusted consumer/grant boundaries and a usable local CLI flow (9/10). First light
+   means a real tool at an actual attached path with correct bytes and isolation, not an
+   attachment row. It does not by itself certify full POSIX or fleet durability.
+4. Add the virtio-fs/VMM and OCI attachment forms over that same core (5), then the native
+   platform-specific gates. Complete Work/Green and MCP/SDK flows with their phase prerequisites.
+5. Retain the fixed takeover regression and complete the protocol oracle before fleet wiring (7), then
+   verify byte placement, capacity, mirroring and remote bases (8), with bounded transfer/QoS.
+6. Close transport-specific conformance, workload, fault, residency and release evidence (15).
+
+These are dependencies for implementation, not work authorized by the documentation request.
+Every phase retains its original acceptance gates plus the A-9 additions.
 
 ## 10. Model-checking record (A-6)
 
@@ -1025,10 +1100,11 @@ Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, I
 | `models/FencedRegister.tla` | 3 holders, 2 hosts, 2 epochs, 2 records per epoch | no error (TotalOrder, Continuity, StaleNeverCommits, ReadSafety, TypeOK) | 1,432,929 distinct | 27 | 2026-09-04 |
 | `models/FencedRegister.tla` | 3 holders, 2 hosts, 3 epochs, 2 records per epoch | not completed: stopped after 3 h 7 min with 83 GB of queued states on disk; needs symmetry reduction (TLC symmetry sets over Acceptors and Hosts) and a bounded record alphabet before it is feasible; the two-epoch result stands (one takeover plus a resumed stale owner) | — | — | 2026-09-04 |
 
-The models are architecture artifacts, not CI jobs: this is a Rust project, and the
-implementation's proof is the Rust simulation harness with the same invariants encoded as checks
-(AC-8.1, T-8.15). Re-run TLC only when the protocol in §4.8 changes, and always with `-metadir` pointing outside
-the project tree: TLC's disk-backed state queue otherwise lands in `docs/wip/models/states`, which
+The models are architecture artifacts, not CI jobs. These historical runs apply only to the
+listed models and configurations. The Rust simulations are evidence with known gaps, not a
+proof or established refinement (BUG-12/13). A-9 corrects §4.8; refinement/revalidation remains
+owed before GAP-A9-7 closes. Running a checker requires separate explicit tooling authorization;
+none ran for A-9. Any authorized rerun must bound work and keep state outside the project tree: TLC's disk-backed state queue otherwise lands in `docs/wip/models/states`, which
 is what happened on 2026-09-04 (83 GB, removed).
 
 Two modelling bugs were found and fixed before the runs passed: the first draft let an owner issue two

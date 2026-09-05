@@ -1,5 +1,9 @@
 # Authority and durability for heads, chains and placement: the maximal design for a laptop-to-multi-datacenter VFS
 
+> **Current contract, A-9 (2026-09-05).** §4.8/§4.10 add the takeover counterexample, arbitrary message histories, real holder reservations and byte-complete placement. Historical model runs do not validate A-9 or the Rust implementation.
+> See [the contract review](hecate-contract-review.md) and [the unified design](../SLATES_DESIGN.md).
+> The rest of this file is dated research evidence; conflicting recommendations are superseded.
+
 Status: complete (written serially by the architect, 2026-09-04, for the A-6 proposal). Every
 quotation below was fetched or read from the primary source on 2026-09-04 unless marked "verify".
 Evidence tiers as in `README.md`.
