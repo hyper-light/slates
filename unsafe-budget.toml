@@ -19,6 +19,9 @@
 #   registration and one drain of the macOS/BSD directory watcher.
 # slates-vfs (0): the volume core is safe Rust over the arenas and slabs of slates-mem; the block
 #   layout is read and written through byte slices, never a cast.
+# slates-land (3): the macOS libc calls rustix does not wrap, each on a descriptor the writer
+#   owns: fcntl(F_BARRIERFSYNC) as the data barrier, fcntl(F_FULLFSYNC) as the media barrier,
+#   renameatx_np(RENAME_SWAP) as the exchange.
 
 [budget]
 slates-machine = 43
@@ -26,5 +29,6 @@ slates-mem = 4
 slates-rt = 16
 slates-base = 2
 slates-vfs = 0
+slates-land = 3
 slates-wire = 4
 slates-wire-derive = 0

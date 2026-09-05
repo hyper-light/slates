@@ -33,6 +33,9 @@ use crate::inode::{BaseBody, Body, Fingerprint, Home, Inode, Kind, Witness};
 use crate::journal::Op;
 use crate::volume::{DirRow, Located, Store, Volume, VolumeConfig};
 
+/// Format: a directory's own two links (`.` and its name); each subdirectory adds one (POSIX).
+const ROOT_LINKS: u32 = 2;
+
 /// How an overlay volume is created: the root directory handle the caller opened, the host's
 /// facts about it, and the large-file class boundary.
 #[derive(Clone, Copy, Debug)]
@@ -136,6 +139,12 @@ pub struct BasePlane {
   drift: BTreeMap<InodeNo, DriftKind>,
   /// Open file descriptors by inode number (large-class copies and read-through).
   descriptors: BTreeMap<InodeNo, HostFile>,
+  /// The base entry each whiteout hides, by (directory inode, name): its fingerprint at the
+  /// removal, the landing's witnessed base for a delete (§4.15).
+  whiteouts: BTreeMap<(InodeNo, Box<str>), Fingerprint>,
+  /// The base directory each redirect moved, by the directory's inode: its fingerprint at the
+  /// rename, the landing's witnessed base for the rename.
+  redirects: BTreeMap<InodeNo, Fingerprint>,
   watch: WatchState,
   /// Directories whose listings a hint invalidated and whose witnessed entries want a check.
   recheck: BTreeSet<InodeNo>,
@@ -164,6 +173,8 @@ impl BasePlane {
       witness_homes: BTreeMap::new(),
       drift: BTreeMap::new(),
       descriptors: BTreeMap::new(),
+      whiteouts: BTreeMap::new(),
+      redirects: BTreeMap::new(),
       watch: WatchState::Unavailable,
       recheck: BTreeSet::new(),
       recheck_all: false,
@@ -182,6 +193,8 @@ impl BasePlane {
     );
     plane.witnesses = self.witnesses.clone();
     plane.witness_homes = self.witness_homes.clone();
+    plane.whiteouts = self.whiteouts.clone();
+    plane.redirects = self.redirects.clone();
     plane
   }
 
@@ -289,6 +302,32 @@ impl Volume {
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
+  }
+
+  /// The fingerprint of the base entry a whiteout at `dir/name` hides, recorded at the
+  /// removal (the landing's witnessed base for a delete).
+  pub fn whiteout_witness(&self, store: &Store, dir: &str, name: &str) -> Option<Fingerprint> {
+    let located = self.resolve(store, dir).ok()?;
+    let Child::Dir(h) = located.child else {
+      return None;
+    };
+    let dir_no = store.dirs.get(h).ok()?.inode;
+    self
+      .base
+      .as_ref()?
+      .whiteouts
+      .get(&(dir_no, name.into()))
+      .copied()
+  }
+
+  /// The fingerprint of the base directory a redirect at `path` moved, recorded at the rename.
+  pub fn redirect_witness(&self, store: &Store, path: &str) -> Option<Fingerprint> {
+    let located = self.resolve(store, path).ok()?;
+    let Child::Dir(h) = located.child else {
+      return None;
+    };
+    let no = store.dirs.get(h).ok()?.inode;
+    self.base.as_ref()?.redirects.get(&no).copied()
   }
 
   /// Whether the base beneath `dir` holds `name` (loaded listing only; the caller loads it).
@@ -401,7 +440,52 @@ impl Overlay<'_> {
     listing.fingerprint = Some(fingerprint);
     listing.read_at_ns = now;
     listing.entries = Some(entries);
-    self.prune_unloaded(store, dir)
+    self.prune_unloaded(store, dir)?;
+    self.refresh_dir_nlink(store, dir)
+  }
+
+  /// A merged directory's link count is two plus its subdirectories, overlay and base alike
+  /// (POSIX); it is known once the listing is, and the core keeps it in step from then on.
+  /// Found by the landing oracle (2026-09-05): a base directory materialized with a count of
+  /// two lost its last link when its base subdirectory was removed, and its own `rmdir` then
+  /// refused `NotFound`.
+  fn refresh_dir_nlink(&mut self, store: &mut Store, dir: Handle<DirNode>) -> Result<(), VfsError> {
+    let dir = self.vol.head_dir(store, dir)?;
+    let policy = self.vol.policy;
+    let (dir_no, mut count) = {
+      let node = store.dirs.get(dir)?;
+      let own = node
+        .iter(&store.blocks)
+        .filter(|e| matches!(e.child, Child::Dir(_)))
+        .count();
+      (
+        node.inode,
+        ROOT_LINKS.saturating_add(u32::try_from(own).unwrap_or(u32::MAX)),
+      )
+    };
+    let base_subdirs: Vec<Box<str>> = self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|b| b.listings.get(&dir_no))
+      .and_then(|l| l.entries.as_ref())
+      .map(|entries| {
+        entries
+          .iter()
+          .filter(|e| e.kind == HostKind::Dir)
+          .map(|e| e.name.clone())
+          .collect()
+      })
+      .unwrap_or_default();
+    let node = store.dirs.get(dir)?;
+    for name in &base_subdirs {
+      if node.lookup(&store.blocks, policy, name).is_none() {
+        count = count.saturating_add(1);
+      }
+    }
+    let handle = self.vol.make_current_inode(store, dir_no)?;
+    store.inodes.get_mut(handle)?.attrs.nlink = count;
+    Ok(())
   }
 
   /// Brings a node's unwitnessed base entries in line with the fresh listing: an untouched
@@ -530,6 +614,12 @@ impl Overlay<'_> {
   /// validated and its descriptor `fstat`ed), as a bridge's `getattr` needs them.
   pub fn stat(&mut self, store: &mut Store, no: InodeNo) -> Result<crate::inode::Attrs, VfsError> {
     self.follow_live_disk(store, no)?;
+    // A merged directory's link count is known once its listing is (`refresh_dir_nlink`).
+    if let Body::Directory(dir) = self.vol.inode(store, no)?.body
+      && store.dirs.get(dir)?.base == BaseDirState::Merged
+    {
+      self.load_listing(store, dir)?;
+    }
     self.vol.stat(store, no)
   }
 
@@ -877,8 +967,35 @@ impl Overlay<'_> {
       return Err(VfsError::IsDirectory);
     }
     let dir = self.vol.head_dir(store, dir)?;
-    let _ = self.base_entry(store, dir, name)?;
-    self.vol.unlink(store, dir, name)
+    let base = self.base_entry(store, dir, name)?;
+    self.vol.unlink(store, dir, name)?;
+    self.remember_whiteout(store, dir, name, base.as_ref());
+    Ok(())
+  }
+
+  /// Records the fingerprint a whiteout hides, when the removal left one.
+  fn remember_whiteout(
+    &mut self,
+    store: &Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    base: Option<&BaseEntry>,
+  ) {
+    let Some(entry) = base else { return };
+    let Ok(dir) = self.vol.head_dir(store, dir) else {
+      return;
+    };
+    let Ok(node) = store.dirs.get(dir) else {
+      return;
+    };
+    let left = node
+      .lookup(&store.blocks, self.vol.policy, name)
+      .is_some_and(|e| e.child == Child::Whiteout);
+    if left && let Some(plane) = self.vol.base.as_mut() {
+      plane
+        .whiteouts
+        .insert((node.inode, name.into()), entry.fingerprint);
+    }
   }
 
   /// `rmdir` over a merged directory: empty means no live overlay entry and every base name
@@ -901,13 +1018,15 @@ impl Overlay<'_> {
       return Err(VfsError::NotEmpty);
     }
     let dir = self.vol.head_dir(store, dir)?;
-    let _ = self.base_entry(store, dir, name)?;
+    let base = self.base_entry(store, dir, name)?;
     let removed_no = located.inode;
     self.vol.rmdir(store, dir, name)?;
-    if let Some(plane) = self.vol.base.as_mut()
-      && let Some(l) = plane.listings.remove(&removed_no)
-    {
-      self.host.close_dir(l.dir);
+    self.remember_whiteout(store, dir, name, base.as_ref());
+    if let Some(plane) = self.vol.base.as_mut() {
+      plane.redirects.remove(&removed_no);
+      if let Some(l) = plane.listings.remove(&removed_no) {
+        self.host.close_dir(l.dir);
+      }
     }
     Ok(())
   }
@@ -943,11 +1062,15 @@ impl Overlay<'_> {
     self
       .vol
       .rename(store, from_dir, from_name, to_dir, to_name)?;
+    self.remember_whiteout(store, from_dir, from_name, from_base.as_ref());
     if let Some(from) = origin {
       let moved = self.vol.lookup(store, to_dir, to_name)?;
       if let Child::Dir(h) = moved.child {
         let h = self.vol.make_current_dir_node(store, h)?;
         store.dirs.get_mut(h)?.origin = Some(from.clone().into());
+        if let (Some(entry), Some(plane)) = (from_base.as_ref(), self.vol.base.as_mut()) {
+          plane.redirects.insert(moved.inode, entry.fingerprint);
+        }
         let to_path = self.vol.path_of(store, to_dir, to_name);
         self.vol.record(
           Op::Redirect { from: from.into() },
@@ -1495,6 +1618,130 @@ impl Overlay<'_> {
       let _ = self.check_drift(store, no);
     }
     Ok(())
+  }
+
+  // ---------------------------------------------------------------- landing
+
+  /// After a landing (§4.15 step 9): every path that landed leaves the overlay. A written file
+  /// becomes an untouched base entry again (the disk holds it now; the next read comes from
+  /// there), a landed whiteout or opaque marker is forgotten, a landed redirect clears its
+  /// origin. A scratch volume becomes an overlay over the target (`Base::Path`) first.
+  pub fn land_advance(
+    &mut self,
+    store: &mut Store,
+    landed: &[String],
+    base: Option<BaseConfig>,
+  ) -> Result<(), VfsError> {
+    if self.vol.base.is_none() {
+      let base = base.ok_or(VfsError::NotOverlay)?;
+      let root = self.vol.root();
+      store.dirs.get_mut(root)?.base = BaseDirState::Merged;
+      let root_no = store.dirs.get(root)?.inode;
+      self.vol.base = Some(BasePlane::new(base, root_no));
+    }
+    for path in landed {
+      self.forget_landed(store, path)?;
+    }
+    // Every listing is stale: the landing changed the directories beneath.
+    if let Some(plane) = self.vol.base.as_mut() {
+      for l in plane.listings.values_mut() {
+        l.entries = None;
+      }
+    }
+    Ok(())
+  }
+
+  /// One landed path leaves the overlay.
+  fn forget_landed(&mut self, store: &mut Store, path: &str) -> Result<(), VfsError> {
+    let (dir_path, name) = match path.rfind('/') {
+      Some(0) => ("/", &path[1..]),
+      Some(i) => (&path[..i], &path[i + 1..]),
+      None => ("/", path),
+    };
+    let Ok(dir_located) = self.vol.resolve(store, dir_path) else {
+      return Ok(());
+    };
+    let Child::Dir(dir) = dir_located.child else {
+      return Ok(());
+    };
+    let dir = self.vol.head_dir(store, dir)?;
+    let dir_no = store.dirs.get(dir)?.inode;
+    let Some(entry) = store
+      .dirs
+      .get(dir)?
+      .lookup(&store.blocks, self.vol.policy, name)
+    else {
+      return Ok(());
+    };
+    match entry.child {
+      Child::Whiteout => {
+        // The base no longer has the name: nothing to hide.
+        self.drop_entry(store, dir, name)?;
+        if let Some(plane) = self.vol.base.as_mut() {
+          plane.whiteouts.remove(&(dir_no, name.into()));
+        }
+      }
+      Child::Dir(h) => {
+        let h = self.vol.make_current_dir_node(store, h)?;
+        let node = store.dirs.get_mut(h)?;
+        node.origin = None;
+        node.base = BaseDirState::Merged;
+        let no = node.inode;
+        if let Some(plane) = self.vol.base.as_mut() {
+          plane.redirects.remove(&no);
+          plane.whiteouts.remove(&(dir_no, name.into()));
+          // The directory is on the disk now: its listing is read from there.
+          if !plane.listings.contains_key(&no)
+            && let Some(parent) = plane.listings.get(&dir_no).map(|l| l.dir)
+            && let Ok(opened) = self.host.open_dir(parent, name)
+          {
+            plane.listings.insert(
+              no,
+              Listing {
+                dir: opened,
+                fingerprint: None,
+                entries: None,
+                read_at_ns: 0,
+                watch: WatchState::Unavailable,
+              },
+            );
+          }
+        }
+      }
+      Child::File(no) | Child::Symlink(no) => {
+        // The disk holds the bytes: the entry leaves the overlay. The next lookup reloads it
+        // from the listing as an untouched base entry, and its cached bytes go with it.
+        if let Some(f) = self.vol.base_forget(no) {
+          self.host.close_file(f);
+        }
+        self.drop_entry(store, dir, name)?;
+        self.vol.drop_link(store, no)?;
+      }
+    }
+    Ok(())
+  }
+
+  /// Removes an entry from a node without a whiteout or a journal record.
+  fn drop_entry(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+  ) -> Result<(), VfsError> {
+    let d = self.vol.make_current_dir(store, dir)?;
+    let mut retired = crate::dirtree::Retired::new();
+    let epoch = self.vol.epoch;
+    let policy = self.vol.policy;
+    let cutover = store.dir_cutover;
+    let _ = store.dirs.get_mut(d)?.remove(
+      &mut store.blocks,
+      epoch,
+      &mut retired,
+      policy,
+      name,
+      cutover,
+    )?;
+    self.vol.retire_blocks(store, retired)
   }
 
   // ---------------------------------------------------------------- verbs

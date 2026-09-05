@@ -2,7 +2,7 @@
 //! entry, and hints from inotify (Linux) or `EVFILT_VNODE` on a kqueue (macOS, BSD).
 
 use std::collections::BTreeMap;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat};
@@ -112,6 +112,29 @@ impl OsHost {
   /// Open handles, for leak checks.
   pub fn open_handles(&self) -> usize {
     self.dirs.len() + self.files.len()
+  }
+
+  /// The descriptor behind a directory handle, for the landing crate's write verbs.
+  pub fn dir_fd(&self, dir: HostDir) -> Result<BorrowedFd<'_>, HostError> {
+    self.dir(dir).map(AsFd::as_fd)
+  }
+
+  /// The descriptor behind a file handle.
+  pub fn file_fd(&self, file: HostFile) -> Result<BorrowedFd<'_>, HostError> {
+    self.file(file).map(AsFd::as_fd)
+  }
+
+  /// Takes ownership of a directory descriptor the caller opened (with containment).
+  pub fn adopt_dir(&mut self, fd: OwnedFd) -> HostDir {
+    self.keep_dir(fd)
+  }
+
+  /// Takes ownership of a file descriptor the caller opened (a temporary).
+  pub fn adopt_file(&mut self, fd: OwnedFd) -> HostFile {
+    let h = self.next;
+    self.next += 1;
+    self.files.insert(h, fd);
+    HostFile(h)
   }
 }
 

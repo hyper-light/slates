@@ -46,6 +46,14 @@ jobs:
       - name: Host semantics over tmpfs (Linux)
         if: runner.os == 'Linux'
         run: SLATES_TEST_RAMDIR=/dev/shm cargo test -p slates-base --test host -- --nocapture
+      - name: Landing over tmpfs, with kill -9 (Linux)
+        if: runner.os == 'Linux'
+        run: SLATES_TEST_RAMDIR=/dev/shm cargo test -p slates-land --release --test os -- --nocapture
+      # T-1.17: the 10k-entry delta into a 10^6-entry tree against cp -r; informational on a
+      # shared runner (no ratchet baseline), the numbers land in the job log.
+      - name: Landing bench over tmpfs (Linux)
+        if: runner.os == 'Linux'
+        run: SLATES_TEST_RAMDIR=/dev/shm cargo run --release -p slates-land --example land_bench
       # The ratchet skips loudly on a machine with no recorded baseline (shared runners have
       # none); on a reference machine with an entry in ratchets.toml it fails on a regression.
       - name: Ratchet

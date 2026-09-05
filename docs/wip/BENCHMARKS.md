@@ -236,6 +236,36 @@ small file up, and a hash of the whole file for a large one. The per-entry `stat
 listing's cost on macOS; `getattrlistbulk` is the bulk call the design names for this platform
 and its gain is an owed measurement (GAPS §8c).
 
+## Phase 1 baseline: the landing (2026-09-05)
+
+Environment: as above (Apple M5 Max, macOS 26.4.1, Rust 1.98.0, release profile). Command:
+`cargo run --release -p slates-land --example land_bench` (best of 5 runs, all shown; the row is
+the median with the lowest and highest run as its edges). The simulated rows run the engine over
+`SimHost` (an in-memory disk), so they measure the engine's own work per entry: plan, the
+verdict pass, the temporary, the exchange, the verify, the syncs, the advance. The OS rows
+(T-1.17: a 10k-entry delta into a 10^6-entry tree by the OS writer against `cp -r` of the same
+delta, with the ramp's settled depth) run only where `SLATES_TEST_RAMDIR` names a RAM-backed
+directory (the Linux lane, `/dev/shm`); a macOS RAM disk is a system-state change Ada has not
+authorized, so their first numbers are the lane's.
+
+| Operation | Median | Runs | Notes |
+|---|---|---|---|
+| Plan, per diverged entry (1,000 replacements over a 100,000-entry base) | 594 ns | [579, 579, 594, 615, 656] | the diverged walk, the bytes read and hashed for the identity, the canonical encoding |
+| Land, per entry, engine only (the same delta; verdict pass, temporary, exchange, verify, syncs, advance) | 5,633 ns | [5,482, 5,531, 5,633, 5,658, 5,772] | every seam call is an in-memory map operation here; the disk's share arrives with the OS rows |
+| Re-plan after the landing (nothing diverged) | 1,583 ns | [1,167, 1,250, 1,583, 1,750, 1,875] | the walk over the loaded nodes finds nothing; the idempotent re-run's cost |
+
+Measured on the way (2026-09-05): the first run of the land row read 813 µs per entry, and the
+second 166 µs, both the simulated host's cost, not the engine's: its `fstat` looked an open
+descriptor's inode up by walking the whole 100,000-node tree, first for every verify (the
+displaced file sits under its hidden name after the exchange) and then for every read. The
+descriptor now remembers where it was opened and looks there first, then among that
+directory's siblings, then walks; the row fell to 5.6 µs. A simulated host on the oracle's leg
+must not be the slow leg, or the bench measures it.
+
+The workspace's own tree served as the proportionality check (AC-1.14, in the oracle): the
+worked example's sixteen entries take the same number of seam calls over a 1,000-entry base
+and a 100,000-entry one.
+
 ## Ratchets (2026-09-05)
 
 `ratchets.toml` holds the ceilings for this machine (identity `4c62b34d5f545407`, the Apple M5
@@ -257,6 +287,13 @@ The gate caught a real one on 2026-09-05: the first unsafe-reduction commit rais
 from about 30 ns (ceiling 34) to 37–45 ns, the cost of a `RefCell` borrow per phase and a
 control-channel poll per step. Recovered without unsafe (one borrow before the polls and one
 after, the registry entry cached, the channel polled only behind a pending flag): 22–30 ns.
+
+A raised ceiling, 2026-09-05: the landing commit moved `vfs.readdir_of_a_36_entry_dir` from
+406 to 468–489 ns with no source change on its path (two runs of each binary in one session,
+the previous commit built in a scratch checkout; `otool -tv` shows the directory iterator and
+the lookup instruction-identical, readdir itself inlined into the bench). A code-placement
+shift; the ceiling is raised to the widest edge measured, with the reason in the file, and
+tightens again when that path is next touched. The same run tightened eleven other rows.
 
 The rule gained a condition on 2026-09-05: a ceiling tightens only when the improvement is
 larger than the row's own between-run drift. Before that, three rows tightened by a cold run

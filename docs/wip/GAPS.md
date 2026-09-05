@@ -292,8 +292,80 @@ Deviations and owed items from task 10:
   identity (hashed at seal or landing) is the change it would trigger.
 - `slates-base` carries two `unsafe` sites (rustix's `kevent`), budgeted.
 
-Open in Phase 1 (owed in this phase, in order): tasks 11–13 `slates-land`, its oracle and
-baselines. AC-1.2's harness (`crates/vfs/tests/differential.rs`)
+Tasks 11–13 (the landing) landed 2026-09-05: `slates-land` (`crates/land`), the only crate
+that links a write-capable syscall (the structural test's allow-list): the manifest with its
+canonical encoding and BLAKE3 hash (`manifest.rs`: creates, replacements and deletes with their
+witnessed base, directory renames as one rename, directory creates, recursive removals, a
+`Clear` for a base directory the overlay removed and recreated opaque, symlinks; the filter;
+the summary), the pure verdict of §4.15's table (`verdict.rs`, every row and every conflict
+class in one table test), in-process grants and the single-holder lease (`grant.rs`; a session
+grant covers later landings of the same volume into the same target), the online ramp policy
+(`ramp.rs`), the state machine (`engine.rs`: present with a preliminary verdict pass, grant,
+lease, capability probe inside the granted target, validate, sweep, write by class, sync,
+advance, report, with an audit ring), and the write seam over the operating system (`os.rs`:
+`O_TMPFILE` linked through `/proc/self/fd` on Linux and hidden-name temporaries elsewhere,
+`renameat2(RENAME_EXCHANGE)` and `renameatx_np(RENAME_SWAP)`, `fdatasync` and
+`F_BARRIERFSYNC`, `F_FULLFSYNC` as the media barrier, `futimens`, `fchmod`, containment by
+`O_NOFOLLOW` per component with the ownership check). The seam gained the write verbs
+(`LandFs`) and `SimHost` implements them with crash injection at every write instruction,
+a switch for the exchange and one for unnamed temporaries, and a count of every seam call.
+
+Gated (`crates/land/tests/oracle.rs`, over `SimHost`): the worked example of §4.15 with both
+of its failures (a conflict refused with nothing written, then `read_base`, rewrite,
+`rewitness`, a new manifest; a compare-and-swap lost to an outsider, exchanged back, `Undone`,
+the report `Partial`, the outsider's bytes kept, the entry still in the overlay); AC-1.14 (the
+sixteen entries take the same seam calls over 10^3 and 10^5 base entries); T-1.14 (eight
+seeded runs of random outsider rewrites in both forms, every loss detected at the swap, none
+silently applied); T-1.15 and AC-1.13 (a crash at every one of the writer's 96 write
+instructions over a delta with every action class: every path old or new after each, the
+resume with the same landing id sweeps the siblings, reaches the reference disk, and a
+further plan is empty); T-1.16 (no exchange: verify-then-rename, the window in the outcome,
+`NoExchange` reported, an outsider edit still refused at the verify); T-1.12 (the 40k-entry
+directory: one `Clear` and two creates, exactly two entries after); stage-and-exchange for an
+empty target (1,010 entries in a hidden sibling, one exchange, the scratch volume an overlay
+after, reads then following the disk); a populated target in place with `CreateCreate`;
+grant mismatch, held lease, consumed and session grants, the audit log. Over a real
+directory (`crates/land/tests/os.rs`, Linux lane on `/dev/shm`, loud skip elsewhere): the
+worked example's shape on the disk, containment refusals, staging, and T-1.15's real `kill -9`
+(a child lands round after round until killed; every file is a whole round; the parent resumes
+with the child's landing id and sweeps). Baselines in BENCHMARKS.md (Phase 1 baseline: the
+landing).
+
+Found by the landing oracle and fixed as rules (each with its test): a merged directory's link
+count ignored its base subdirectories, so removing a base subtree bottom-up drove the parent's
+count to zero one step early and its own `rmdir` refused `NotFound` (the count is now two plus
+the subdirectories, overlay and base, at listing load); a cleared directory renamed aside then
+recreated left the name absent between the two steps (now a fresh directory exchanged with the
+old one, verified, the displaced tree removed); a resumed landing met its own fresh directory
+and its finished rename and called them conflicts (the verdict now knows a directory holding
+only what the manifest creates beneath it, and a rename whose destination holds the witnessed
+directory); a crash inside the directory syncs reported `Done` (a failed sync now aborts, an
+aborted landing advances nothing, and every entry's directory is synced on the resume); the
+simulated host's `st_mode` lacked the type bits a real `stat` carries, so a removed directory
+planned as a file delete.
+
+Deviations and owed items from tasks 11–13:
+- Entries run one at a time; the ramp records the depth it would have chosen (`ramp_depth` in
+  the report). Concurrent entries arrive with the runtime's pool in Phase 2; the linked
+  io_uring chains and arena-page writes with Phase 4's Linux bridge (bytes are read from the
+  volume into a buffer and written through the seam until then).
+- Stage-and-exchange runs for an empty target only. A populated target needs every existing
+  entry linked into the stage, a hard-link verb the seam gains with its measured cost (the
+  break-even policy `LandingCosts::prefers_staging` is written and tested against the
+  formula; the remembered costs come from each landing's report).
+- Reflinks are not used (`LandCapabilities.reflink` is probed as `false`); `FICLONE` and
+  `clonefile` arrive with the manifest's own hash index of identical files.
+- The directory sync strategy is one `fsync` per touched directory; the `syncfs` alternative
+  waits on the measured per-directory cost the report now carries (`Durability.dir_sync_ns`).
+- Windows has no OS writer yet (`FileRenameInfoEx` with `POSIX_SEMANTICS`, the sharing-mode
+  verify): the Windows bridge of Phase 4; the crate compiles there without the `os` module.
+- `TargetIsVolume` is not checked: there is no mount table before Phase 3.
+- The real-target tests and the OS rows of the bench run in the Linux lane; on this machine
+  they skip loudly (no RAM disk authorized), so their first numbers are the lane's.
+- `slates-land` carries three `unsafe` sites (the macOS libc calls rustix does not wrap:
+  `F_BARRIERFSYNC`, `F_FULLFSYNC`, `renameatx_np`), budgeted.
+
+Open in Phase 1: none. AC-1.2's harness (`crates/vfs/tests/differential.rs`)
 and policy (`docs/wip/EQUIVALENCE.md`) are written; it runs in the Linux lane against
 `/dev/shm` (2,000 histories) and skips loudly elsewhere, since a macOS RAM disk is a
 system-state change Ada has not authorized; its first run is the lane's, not a local one.

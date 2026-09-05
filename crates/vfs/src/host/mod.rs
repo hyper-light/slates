@@ -130,3 +130,62 @@ pub trait HostFs {
   /// Drains the hints that arrived since the last call (never blocks).
   fn hints(&mut self) -> Vec<Hint>;
 }
+
+/// What a target filesystem offers the landing, probed inside the granted target (§4.15
+/// "Exchange fallback"; never at boot).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LandCapabilities {
+  /// An atomic exchange of two names exists (`RENAME_EXCHANGE`, `RENAME_SWAP`).
+  pub exchange: bool,
+  /// Reflinks exist (`FICLONE`, `clonefile`).
+  pub reflink: bool,
+  /// Unnamed temporaries exist (`O_TMPFILE`); otherwise a hidden sibling name is used.
+  pub unnamed_temporaries: bool,
+}
+
+/// The write side of the seam, for the landing engine only (D-26): every verb is relative to
+/// a directory handle inside the granted target, and the only crate that implements it over
+/// the operating system is `slates-land`. The simulated host implements it too, with crash and
+/// outsider-edit injection, so the landing oracle runs without a disk.
+pub trait LandFs: HostFs {
+  /// What the filesystem under `dir` supports.
+  fn capabilities(&mut self, dir: HostDir) -> Result<LandCapabilities, HostError>;
+  /// A new, empty, writable file under `dir`: unnamed where the filesystem allows, else at the
+  /// hidden sibling `name`; it becomes visible only through [`LandFs::place`].
+  fn create_temp(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError>;
+  /// Writes at an offset (the whole buffer, or a refusal).
+  fn write_at(&mut self, file: HostFile, off: u64, bytes: &[u8]) -> Result<(), HostError>;
+  /// Makes the file's data durable (`fdatasync`, or the platform's barrier).
+  fn sync_file(&mut self, file: HostFile) -> Result<(), HostError>;
+  /// Sets the file's mode.
+  fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError>;
+  /// Sets the file's modification time in nanoseconds.
+  fn set_mtime(&mut self, file: HostFile, mtime_ns: i64) -> Result<(), HostError>;
+  /// Gives the temporary the hidden sibling name `name` under `dir` (a link for an unnamed
+  /// temporary; nothing for one created by name).
+  fn place(&mut self, file: HostFile, dir: HostDir, name: &str) -> Result<(), HostError>;
+  /// Atomically exchanges the entries `a` and `b` under `dir` (both must exist).
+  fn exchange(&mut self, dir: HostDir, a: &str, b: &str) -> Result<(), HostError>;
+  /// Renames `from` under `dir` to `to` under `to_dir`, replacing an entry there.
+  fn rename(
+    &mut self,
+    dir: HostDir,
+    from: &str,
+    to_dir: HostDir,
+    to: &str,
+  ) -> Result<(), HostError>;
+  /// Removes a file or symlink.
+  fn unlink(&mut self, dir: HostDir, name: &str) -> Result<(), HostError>;
+  /// Creates a directory.
+  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32) -> Result<(), HostError>;
+  /// Removes an empty directory.
+  fn rmdir(&mut self, dir: HostDir, name: &str) -> Result<(), HostError>;
+  /// Creates a symlink.
+  fn symlink(&mut self, dir: HostDir, name: &str, target: &str) -> Result<(), HostError>;
+  /// Makes the directory's entries durable (`fsync` on its descriptor).
+  fn sync_dir(&mut self, dir: HostDir) -> Result<(), HostError>;
+  /// One media barrier on the target after the entries' data syncs (§4.15 step 8: macOS
+  /// `F_FULLFSYNC`, elsewhere the directory sync already reaches the media), when the grant
+  /// asked for media durability.
+  fn sync_media(&mut self, dir: HostDir) -> Result<(), HostError>;
+}

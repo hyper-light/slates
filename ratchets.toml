@@ -15,6 +15,13 @@
 # AC-1.8); vfs.insert_and_remove_in_a_tree_dir_of_128 151 ns [145, 151] (was 140; the tree code
 # on that path unchanged, a code-layout shift); vfs.destroy_per_unit_in_one_slice 14 ns (12
 # before the clock read every sixteen units).
+# Raised 2026-09-05: vfs.readdir_of_a_36_entry_dir 416 -> 500. Between 6d56f74 and the landing
+# commit the row moved from 406 to 468-489 ns (two runs of each binary, same session) with no
+# source change on its path; `otool -tv` of both bench binaries shows the directory iterator and
+# the lookup instruction-identical (readdir itself is inlined into the bench). A code-placement
+# shift, not a change of the code; the ceiling is the widest upper edge measured and tightens
+# again when the path is next touched. The same run tightened eleven rows and recorded the three
+# landing rows (land.*).
 
 [machine.4c62b34d5f545407]
 identity = "Apple M5 Max | macOS 26.4.1 (25E253) | aarch64 | 18 cores | 137438953472 bytes | 16384 page"
@@ -25,7 +32,10 @@ runs = 3
 "base.copy_up_small_class_4_kib_file_on_first_write" = 30667
 "base.fingerprint_a_directory" = 218
 "base.open_and_fstat_a_file_the_drift_check" = 7667
-"base.pread_up_to_4_kib" = 307
+"base.pread_up_to_4_kib" = 265
+"land.land_per_entry_sim_1000_of_100000_engine_only" = 7268
+"land.plan_per_entry_sim_1000_of_100000" = 805
+"land.replan_after_landing_nothing_diverged" = 2417
 "mem.buddy_alloc_free_64_pages_split_and_coalesce" = 65
 "mem.buddy_alloc_free_one_page" = 56
 "mem.slab_insert_remove_64_byte_slot" = 13
@@ -35,11 +45,11 @@ runs = 3
 "rt.run_until_idle_with_nothing_to_do" = 42
 "rt.spawn_a_trivial_task_and_detach_it_without_running_admission_only" = 28
 "rt.spawn_one_trivial_task_and_run_it_to_completion" = 184
-"rt.timer_lateness_p99" = 212833
-"vfs.clone_and_destroy_the_clone_at_1000000_files" = 270
-"vfs.clone_and_destroy_the_clone_at_100000_files" = 286
+"rt.timer_lateness_p99" = 150584
+"vfs.clone_and_destroy_the_clone_at_1000000_files" = 255
+"vfs.clone_and_destroy_the_clone_at_100000_files" = 260
 "vfs.clone_and_destroy_the_clone_at_1000_files" = 276
-"vfs.create_and_unlink_in_a_100000_file_tree" = 1667
+"vfs.create_and_unlink_in_a_100000_file_tree" = 1625
 "vfs.create_and_unlink_in_a_1000_file_tree" = 1750
 "vfs.create_burst_of_190000_files_heap_per_file" = 420
 "vfs.create_burst_of_190000_files_per_file" = 1106
@@ -49,28 +59,28 @@ runs = 3
 "vfs.heap_bytes_per_file_at_1000_files" = 646
 "vfs.insert_and_remove_in_a_tree_dir_of_128" = 145
 "vfs.insert_and_remove_in_a_tree_dir_of_16" = 80
-"vfs.insert_and_remove_in_a_tree_dir_of_2" = 80
+"vfs.insert_and_remove_in_a_tree_dir_of_2" = 78
 "vfs.insert_and_remove_in_a_tree_dir_of_32" = 78
 "vfs.insert_and_remove_in_a_tree_dir_of_4" = 80
 "vfs.insert_and_remove_in_a_tree_dir_of_64" = 156
 "vfs.insert_and_remove_in_a_tree_dir_of_8" = 79
 "vfs.insert_and_remove_in_an_inline_dir_of_2" = 85
-"vfs.lookup_in_a_tree_dir_of_128" = 224
+"vfs.lookup_in_a_tree_dir_of_128" = 218
 "vfs.lookup_in_a_tree_dir_of_16" = 182
-"vfs.lookup_in_a_tree_dir_of_2" = 166
+"vfs.lookup_in_a_tree_dir_of_2" = 158
 "vfs.lookup_in_a_tree_dir_of_32" = 192
 "vfs.lookup_in_a_tree_dir_of_4" = 171
-"vfs.lookup_in_a_tree_dir_of_64" = 224
+"vfs.lookup_in_a_tree_dir_of_64" = 218
 "vfs.lookup_in_a_tree_dir_of_8" = 179
 "vfs.lookup_in_an_inline_dir_of_2" = 96
 "vfs.lookup_one_name_in_a_36_entry_dir_of_a_100000_file_tree" = 171
 "vfs.lookup_one_name_in_a_36_entry_dir_of_a_1000_file_tree" = 182
 "vfs.read_4_kib" = 26
-"vfs.readdir_of_a_36_entry_dir" = 416
-"vfs.rename_within_a_dir_there_and_back" = 2875
+"vfs.readdir_of_a_36_entry_dir" = 500
+"vfs.rename_within_a_dir_there_and_back" = 2833
 "vfs.resolve_a_three_component_path_in_a_100000_file_tree" = 343
 "vfs.resolve_a_three_component_path_in_a_1000_file_tree" = 323
-"vfs.snapshot_and_destroy_it_at_1000000_files" = 52
+"vfs.snapshot_and_destroy_it_at_1000000_files" = 46
 "vfs.snapshot_and_destroy_it_at_100000_files" = 46
 "vfs.snapshot_and_destroy_it_at_1000_files" = 49
 "vfs.write_4_kib_in_place_same_epoch" = 406

@@ -7,18 +7,27 @@
 use std::collections::BTreeMap;
 
 use super::{
-  BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, WatchState,
+  BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, LandCapabilities,
+  LandFs, WatchState,
 };
 use crate::inode::Fingerprint;
 
 /// Format: the device number every simulated file reports.
 const SIM_DEV: u64 = 1;
-/// Format: POSIX mode bits of a simulated directory (`rwxr-xr-x`).
-const DIR_MODE: u32 = 0o755;
-/// Format: POSIX mode bits of a simulated file (`rw-r--r--`).
-const FILE_MODE: u32 = 0o644;
-/// Format: POSIX mode bits of a symlink (`rwxrwxrwx`, unused by every filesystem).
-const SYMLINK_MODE: u32 = 0o777;
+/// Format: the errno a crashed simulated host reports (`EIO`).
+const SIM_EIO: i32 = 5;
+/// Format: the errno for a missing exchange (`EINVAL`).
+const SIM_EINVAL: i32 = 22;
+/// Format: the errno the simulated host reports for a name already taken (`EEXIST`, 17 on
+/// Linux and macOS).
+const SIM_EEXIST: i32 = 17;
+/// Format: the `st_mode` of a simulated directory: the `S_IFDIR` type bits over `rwxr-xr-x`,
+/// as `stat` reports it (the landing tells a removed directory from a removed file by them).
+const DIR_MODE: u32 = 0o040_755;
+/// Format: the `st_mode` of a simulated file: `S_IFREG` over `rw-r--r--`.
+const FILE_MODE: u32 = 0o100_644;
+/// Format: the `st_mode` of a symlink: `S_IFLNK` over `rwxrwxrwx` (unused by every filesystem).
+const SYMLINK_MODE: u32 = 0o120_777;
 
 /// One node of the simulated disk.
 #[derive(Clone, Debug)]
@@ -52,10 +61,22 @@ impl SimNode {
 
 /// An open handle: the path it was opened at, and for files the inode it pinned (a file
 /// replaced on disk keeps serving the old bytes through the old handle, as a descriptor does).
+/// A temporary made by the landing is a file with no name until it is placed.
 #[derive(Clone, Debug)]
 enum Open {
   Dir(Vec<Box<str>>),
-  File { ino: u64, snapshot: SimNode },
+  File {
+    ino: u64,
+    snapshot: SimNode,
+    /// Where the file was opened: the first place to look for its inode (a rename or a
+    /// replacement moves it, and the tree walk then finds it wherever it sits).
+    path: Vec<Box<str>>,
+  },
+  /// An unnamed writable temporary: its bytes live here until `place` links it.
+  Temp {
+    node: SimNode,
+    placed: Option<Vec<Box<str>>>,
+  },
 }
 
 /// The simulated host.
@@ -72,6 +93,21 @@ pub struct SimHost {
   watch_state: WatchState,
   /// Files replaced or unlinked while a handle held them: their last bytes, by inode.
   retired: BTreeMap<u64, SimNode>,
+  /// Write verbs performed so far, for crash injection: the landing crashes when the count
+  /// reaches `crash_at`, and every write verb after that refuses.
+  write_steps: u64,
+  crash_at: Option<u64>,
+  crashed: bool,
+  /// Whether the simulated filesystem offers an atomic exchange (a mocked `EINVAL` when not).
+  exchange_supported: bool,
+  /// Whether it offers unnamed temporaries.
+  unnamed_temporaries: bool,
+  /// Directories synced since the last drain, by handle.
+  synced_dirs: Vec<u64>,
+  /// Files synced since the last drain.
+  synced_files: Vec<u64>,
+  /// Every seam call so far, read or write, for proportionality checks (AC-1.14).
+  calls: u64,
 }
 
 impl Default for SimHost {
@@ -103,7 +139,101 @@ impl SimHost {
       hints: Vec::new(),
       watch_state: WatchState::Live,
       retired: BTreeMap::new(),
+      write_steps: 0,
+      crash_at: None,
+      crashed: false,
+      exchange_supported: true,
+      unnamed_temporaries: true,
+      synced_dirs: Vec::new(),
+      synced_files: Vec::new(),
+      calls: 0,
     }
+  }
+
+  /// Seam calls so far.
+  pub fn calls(&self) -> u64 {
+    self.calls
+  }
+
+  // ---------------------------------------------------------------- landing controls
+
+  /// Crashes the host at the `n`-th write verb from now (0 is the very next): that verb and
+  /// every later one refuse with `EIO`, and the disk keeps whatever the earlier ones did.
+  pub fn crash_at_write(&mut self, n: u64) {
+    self.write_steps = 0;
+    self.crash_at = Some(n);
+    self.crashed = false;
+  }
+
+  /// Clears a crash: the host serves again (a restart).
+  pub fn recover(&mut self) {
+    self.crash_at = None;
+    self.crashed = false;
+    self.write_steps = 0;
+  }
+
+  /// Whether the crash point was reached.
+  pub fn crashed(&self) -> bool {
+    self.crashed
+  }
+
+  /// Write verbs performed since the last crash point was set (the writer's instruction count
+  /// for T-1.15's "every instruction").
+  pub fn write_steps(&self) -> u64 {
+    self.write_steps
+  }
+
+  /// Takes the atomic exchange away (the mocked `EINVAL` of T-1.16).
+  pub fn set_exchange_supported(&mut self, supported: bool) {
+    self.exchange_supported = supported;
+  }
+
+  /// Takes unnamed temporaries away (a filesystem without `O_TMPFILE`).
+  pub fn set_unnamed_temporaries(&mut self, supported: bool) {
+    self.unnamed_temporaries = supported;
+  }
+
+  /// The directory handles synced since the last call.
+  pub fn take_synced_dirs(&mut self) -> Vec<HostDir> {
+    std::mem::take(&mut self.synced_dirs)
+      .into_iter()
+      .map(HostDir)
+      .collect()
+  }
+
+  /// The file handles synced since the last call.
+  pub fn take_synced_files(&mut self) -> Vec<HostFile> {
+    std::mem::take(&mut self.synced_files)
+      .into_iter()
+      .map(HostFile)
+      .collect()
+  }
+
+  /// One write verb: refuses once the crash point is reached.
+  fn write_step(&mut self) -> Result<(), HostError> {
+    self.calls += 1;
+    if self.crashed {
+      return Err(HostError::Unavailable(SIM_EIO));
+    }
+    if let Some(at) = self.crash_at
+      && self.write_steps >= at
+    {
+      self.crashed = true;
+      return Err(HostError::Unavailable(SIM_EIO));
+    }
+    self.write_steps += 1;
+    Ok(())
+  }
+
+  fn parent_and_name(dir_parts: &[Box<str>], name: &str) -> (Vec<Box<str>>, Box<str>) {
+    (dir_parts.to_vec(), name.into())
+  }
+
+  /// The entry `name` under the directory handle, if it exists.
+  fn entry_parts(&self, dir: HostDir, name: &str) -> Result<Vec<Box<str>>, HostError> {
+    let mut parts = self.dir_parts(dir)?;
+    parts.push(name.into());
+    Ok(parts)
   }
 
   /// Sets the filesystem's timestamp granularity (one second for HFS+, two for FAT).
@@ -372,6 +502,7 @@ impl SimHost {
 
 impl HostFs for SimHost {
   fn facts(&mut self, dir: HostDir) -> Result<HostFacts, HostError> {
+    self.calls += 1;
     self.dir_parts(dir)?;
     Ok(HostFacts {
       timestamp_granularity_ns: self.granularity_ns,
@@ -379,6 +510,7 @@ impl HostFs for SimHost {
   }
 
   fn fingerprint_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {
+    self.calls += 1;
     let parts = self.dir_parts(dir)?;
     self
       .node(&parts)
@@ -387,6 +519,7 @@ impl HostFs for SimHost {
   }
 
   fn list(&mut self, dir: HostDir) -> Result<Vec<BaseEntry>, HostError> {
+    self.calls += 1;
     let parts = self.dir_parts(dir)?;
     let node = self.node(&parts).ok_or(HostError::NotFound)?;
     if node.kind != HostKind::Dir {
@@ -406,6 +539,7 @@ impl HostFs for SimHost {
   }
 
   fn open_dir(&mut self, parent: HostDir, name: &str) -> Result<HostDir, HostError> {
+    self.calls += 1;
     let mut parts = self.dir_parts(parent)?;
     parts.push(name.into());
     match self.node(&parts) {
@@ -420,6 +554,7 @@ impl HostFs for SimHost {
   }
 
   fn open_file(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    self.calls += 1;
     let mut parts = self.dir_parts(dir)?;
     parts.push(name.into());
     let node = match self.node(&parts) {
@@ -434,36 +569,20 @@ impl HostFs for SimHost {
       Open::File {
         ino: node.ino,
         snapshot: node,
+        path: parts,
       },
     );
     Ok(HostFile(h))
   }
 
   fn fstat(&mut self, file: HostFile) -> Result<Fingerprint, HostError> {
-    let (ino, snapshot) = match self.opens.get(&file.0) {
-      Some(Open::File { ino, snapshot }) => (*ino, snapshot.clone()),
-      _ => return Err(HostError::StaleHandle),
-    };
-    // The live inode if it still sits somewhere on the disk, else the retired copy the
-    // descriptor keeps alive.
-    Ok(
-      self
-        .find_ino(ino)
-        .or_else(|| self.retired.get(&ino).cloned())
-        .unwrap_or(snapshot)
-        .fingerprint(),
-    )
+    self.calls += 1;
+    Ok(self.live_node(file)?.fingerprint())
   }
 
   fn read_at(&mut self, file: HostFile, off: u64, buf: &mut [u8]) -> Result<usize, HostError> {
-    let (ino, snapshot) = match self.opens.get(&file.0) {
-      Some(Open::File { ino, snapshot }) => (*ino, snapshot.clone()),
-      _ => return Err(HostError::StaleHandle),
-    };
-    let node = self
-      .find_ino(ino)
-      .or_else(|| self.retired.get(&ino).cloned())
-      .unwrap_or(snapshot);
+    self.calls += 1;
+    let node = self.live_node(file)?;
     let off = usize::try_from(off).unwrap_or(usize::MAX);
     if off >= node.bytes.len() {
       return Ok(0);
@@ -474,6 +593,7 @@ impl HostFs for SimHost {
   }
 
   fn read_link(&mut self, dir: HostDir, name: &str) -> Result<Box<str>, HostError> {
+    self.calls += 1;
     let mut parts = self.dir_parts(dir)?;
     parts.push(name.into());
     match self.node(&parts) {
@@ -505,6 +625,42 @@ impl HostFs for SimHost {
 }
 
 impl SimHost {
+  /// What an open descriptor serves: the inode where it was opened if it still sits there,
+  /// else wherever the inode moved to, else the retired copy the descriptor keeps alive, else
+  /// the snapshot taken at the open.
+  fn live_node(&self, file: HostFile) -> Result<SimNode, HostError> {
+    let (ino, snapshot, path) = match self.opens.get(&file.0) {
+      Some(Open::File {
+        ino,
+        snapshot,
+        path,
+      }) => (*ino, snapshot, path),
+      _ => return Err(HostError::StaleHandle),
+    };
+    Ok(
+      self
+        .node(path)
+        .filter(|n| n.ino == ino)
+        .cloned()
+        .or_else(|| self.sibling_with_ino(path, ino))
+        .or_else(|| self.find_ino(ino))
+        .or_else(|| self.retired.get(&ino).cloned())
+        .unwrap_or_else(|| snapshot.clone()),
+    )
+  }
+
+  /// The inode under another name in the same directory (an exchange or a rename within the
+  /// directory moved it there): the directory's entries, not the whole tree.
+  fn sibling_with_ino(&self, path: &[Box<str>], ino: u64) -> Option<SimNode> {
+    let parent = path.split_last().map(|(_, p)| p)?;
+    self
+      .node(parent)?
+      .children
+      .values()
+      .find(|n| n.ino == ino)
+      .cloned()
+  }
+
   /// The live node with inode `ino`, wherever it sits now (a rename keeps the inode).
   fn find_ino(&self, ino: u64) -> Option<SimNode> {
     let mut stack = vec![&self.root];
@@ -517,5 +673,293 @@ impl SimHost {
       }
     }
     None
+  }
+}
+
+impl LandFs for SimHost {
+  fn capabilities(&mut self, dir: HostDir) -> Result<LandCapabilities, HostError> {
+    self.dir_parts(dir)?;
+    Ok(LandCapabilities {
+      exchange: self.exchange_supported,
+      reflink: false,
+      unnamed_temporaries: self.unnamed_temporaries,
+    })
+  }
+
+  fn create_temp(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    self.write_step()?;
+    let parts = self.dir_parts(dir)?;
+    let node = self.fresh(HostKind::File);
+    let h = self.next_handle;
+    self.next_handle += 1;
+    if self.unnamed_temporaries {
+      self.opens.insert(h, Open::Temp { node, placed: None });
+    } else {
+      // A hidden sibling name: visible in listings from now on, like a real one.
+      let (parent, name) = Self::parent_and_name(&parts, name);
+      let ino = node.ino;
+      if let Some(p) = self.node_mut(&parent) {
+        p.children.insert(name.clone(), node.clone());
+      }
+      let mut placed = parent;
+      placed.push(name);
+      self.opens.insert(
+        h,
+        Open::Temp {
+          node: SimNode { ino, ..node },
+          placed: Some(placed),
+        },
+      );
+      self.touch_parent(&parts);
+    }
+    Ok(HostFile(h))
+  }
+
+  fn write_at(&mut self, file: HostFile, off: u64, bytes: &[u8]) -> Result<(), HostError> {
+    self.write_step()?;
+    let now = self.now_ns;
+    let off = usize::try_from(off).map_err(|_| HostError::Unavailable(SIM_EINVAL))?;
+    let (node_ino, placed) = match self.opens.get_mut(&file.0) {
+      Some(Open::Temp { node, placed }) => {
+        if node.bytes.len() < off + bytes.len() {
+          node.bytes.resize(off + bytes.len(), 0);
+        }
+        node.bytes[off..off + bytes.len()].copy_from_slice(bytes);
+        node.mtime_ns = now;
+        node.ctime_ns = now;
+        (node.ino, placed.clone())
+      }
+      Some(Open::File { .. }) => return Err(HostError::Unavailable(SIM_EINVAL)),
+      _ => return Err(HostError::StaleHandle),
+    };
+    // A named temporary's bytes live in the tree too.
+    if let Some(parts) = placed
+      && let Some(n) = self.node_mut(&parts)
+      && n.ino == node_ino
+    {
+      if n.bytes.len() < off + bytes.len() {
+        n.bytes.resize(off + bytes.len(), 0);
+      }
+      n.bytes[off..off + bytes.len()].copy_from_slice(bytes);
+      n.mtime_ns = now;
+    }
+    Ok(())
+  }
+
+  fn sync_file(&mut self, file: HostFile) -> Result<(), HostError> {
+    self.write_step()?;
+    if !self.opens.contains_key(&file.0) {
+      return Err(HostError::StaleHandle);
+    }
+    self.synced_files.push(file.0);
+    Ok(())
+  }
+
+  fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
+    self.write_step()?;
+    let now = self.now_ns;
+    match self.opens.get_mut(&file.0) {
+      Some(Open::Temp { node, placed }) => {
+        node.mode = mode;
+        node.ctime_ns = now;
+        let placed = placed.clone();
+        let ino = node.ino;
+        if let Some(parts) = placed
+          && let Some(n) = self.node_mut(&parts)
+          && n.ino == ino
+        {
+          n.mode = mode;
+        }
+        Ok(())
+      }
+      Some(Open::File { ino, .. }) => {
+        let ino = *ino;
+        if let Some(n) = self.node_by_ino_mut(ino) {
+          n.mode = mode;
+          n.ctime_ns = now;
+        }
+        Ok(())
+      }
+      _ => Err(HostError::StaleHandle),
+    }
+  }
+
+  fn set_mtime(&mut self, file: HostFile, mtime_ns: i64) -> Result<(), HostError> {
+    self.write_step()?;
+    match self.opens.get_mut(&file.0) {
+      Some(Open::Temp { node, placed }) => {
+        node.mtime_ns = mtime_ns;
+        let placed = placed.clone();
+        let ino = node.ino;
+        if let Some(parts) = placed
+          && let Some(n) = self.node_mut(&parts)
+          && n.ino == ino
+        {
+          n.mtime_ns = mtime_ns;
+        }
+        Ok(())
+      }
+      Some(Open::File { ino, .. }) => {
+        let ino = *ino;
+        if let Some(n) = self.node_by_ino_mut(ino) {
+          n.mtime_ns = mtime_ns;
+        }
+        Ok(())
+      }
+      _ => Err(HostError::StaleHandle),
+    }
+  }
+
+  fn place(&mut self, file: HostFile, dir: HostDir, name: &str) -> Result<(), HostError> {
+    self.write_step()?;
+    let parts = self.dir_parts(dir)?;
+    let (node, already) = match self.opens.get(&file.0) {
+      Some(Open::Temp { node, placed }) => (node.clone(), placed.clone()),
+      _ => return Err(HostError::StaleHandle),
+    };
+    let mut placed = parts.clone();
+    placed.push(name.into());
+    if already.as_ref() == Some(&placed) {
+      // Placed at the name it was created with: nothing to do.
+      return Ok(());
+    }
+    // A named temporary gains a second link at `name` (the current bytes, same inode); an
+    // unnamed one is linked for the first time. An existing name refuses, as `linkat` does.
+    let node = match already {
+      Some(path) => self.node(&path).cloned().ok_or(HostError::StaleHandle)?,
+      None => node,
+    };
+    if let Some(p) = self.node_mut(&parts) {
+      if p.children.contains_key(name) {
+        return Err(HostError::Unavailable(SIM_EEXIST));
+      }
+      p.children.insert(name.into(), node);
+    }
+    if let Some(Open::Temp { placed: slot, .. }) = self.opens.get_mut(&file.0) {
+      *slot = Some(placed);
+    }
+    self.touch_parent(&parts);
+    Ok(())
+  }
+
+  fn exchange(&mut self, dir: HostDir, a: &str, b: &str) -> Result<(), HostError> {
+    self.write_step()?;
+    if !self.exchange_supported {
+      return Err(HostError::Unavailable(SIM_EINVAL));
+    }
+    let parts = self.dir_parts(dir)?;
+    let Some(p) = self.node_mut(&parts) else {
+      return Err(HostError::NotFound);
+    };
+    let (Some(na), Some(nb)) = (p.children.remove(a), p.children.remove(b)) else {
+      return Err(HostError::NotFound);
+    };
+    p.children.insert(a.into(), nb);
+    p.children.insert(b.into(), na);
+    self.touch_parent(&parts);
+    Ok(())
+  }
+
+  fn rename(
+    &mut self,
+    dir: HostDir,
+    from: &str,
+    to_dir: HostDir,
+    to: &str,
+  ) -> Result<(), HostError> {
+    self.write_step()?;
+    let f = self.entry_parts(dir, from)?;
+    let t = self.entry_parts(to_dir, to)?;
+    let from_path = format!("/{}", f.join("/"));
+    let to_path = format!("/{}", t.join("/"));
+    if self.node(&f).is_none() {
+      return Err(HostError::NotFound);
+    }
+    SimHost::rename(self, &from_path, &to_path);
+    Ok(())
+  }
+
+  fn unlink(&mut self, dir: HostDir, name: &str) -> Result<(), HostError> {
+    self.write_step()?;
+    let parts = self.entry_parts(dir, name)?;
+    match self.node(&parts) {
+      None => return Err(HostError::NotFound),
+      Some(n) if n.kind == HostKind::Dir => return Err(HostError::NotFile),
+      Some(_) => {}
+    }
+    let path = format!("/{}", parts.join("/"));
+    self.remove(&path);
+    Ok(())
+  }
+
+  fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32) -> Result<(), HostError> {
+    self.write_step()?;
+    let parts = self.entry_parts(dir, name)?;
+    if self.node(&parts).is_some() {
+      return Err(HostError::Unavailable(SIM_EEXIST));
+    }
+    let path = format!("/{}", parts.join("/"));
+    SimHost::mkdir(self, &path);
+    if let Some(n) = self.node_mut(&parts) {
+      n.mode = mode;
+    }
+    Ok(())
+  }
+
+  fn rmdir(&mut self, dir: HostDir, name: &str) -> Result<(), HostError> {
+    self.write_step()?;
+    let parts = self.entry_parts(dir, name)?;
+    match self.node(&parts) {
+      None => return Err(HostError::NotFound),
+      Some(n) if n.kind != HostKind::Dir => return Err(HostError::NotDirectory),
+      Some(n) if !n.children.is_empty() => return Err(HostError::Unavailable(SIM_EINVAL)),
+      Some(_) => {}
+    }
+    let path = format!("/{}", parts.join("/"));
+    self.remove(&path);
+    Ok(())
+  }
+
+  fn symlink(&mut self, dir: HostDir, name: &str, target: &str) -> Result<(), HostError> {
+    self.write_step()?;
+    let parts = self.entry_parts(dir, name)?;
+    if self.node(&parts).is_some() {
+      return Err(HostError::Unavailable(SIM_EEXIST));
+    }
+    let path = format!("/{}", parts.join("/"));
+    SimHost::symlink(self, &path, target);
+    Ok(())
+  }
+
+  fn sync_media(&mut self, dir: HostDir) -> Result<(), HostError> {
+    self.write_step()?;
+    self.dir_parts(dir)?;
+    self.synced_dirs.push(dir.0);
+    Ok(())
+  }
+
+  fn sync_dir(&mut self, dir: HostDir) -> Result<(), HostError> {
+    self.write_step()?;
+    self.dir_parts(dir)?;
+    self.synced_dirs.push(dir.0);
+    Ok(())
+  }
+}
+
+impl SimHost {
+  /// The live node with inode `ino`, mutably.
+  fn node_by_ino_mut(&mut self, ino: u64) -> Option<&mut SimNode> {
+    fn find(node: &mut SimNode, ino: u64) -> Option<&mut SimNode> {
+      if node.ino == ino {
+        return Some(node);
+      }
+      for child in node.children.values_mut() {
+        if let Some(found) = find(child, ino) {
+          return Some(found);
+        }
+      }
+      None
+    }
+    find(&mut self.root, ino)
   }
 }

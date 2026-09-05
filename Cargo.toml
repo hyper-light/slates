@@ -18,6 +18,7 @@ slates-rt = { path = "crates/rt", version = "0.1.0" }
 slates-wire = { path = "crates/wire", version = "0.1.0" }
 slates-vfs = { path = "crates/vfs", version = "0.1.0" }
 slates-base = { path = "crates/base", version = "0.1.0" }
+slates-land = { path = "crates/land", version = "0.1.0" }
 slates-wire-derive = { path = "crates/wire-derive", version = "0.1.0" }
 
 # Third-party versions are pinned once here. Exact `=` pins only where an ABI contract is

@@ -1,6 +1,6 @@
 # slates — unified design and phased implementation plan
 
-Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 tasks 1–10 and 14 (the volume core, the deriver and the base plane: `slates-vfs`, `slates-base`) are implemented and gated; the rest is design (GAPS §8c).
+Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 (the volume core, the deriver, the base plane and the landing: `slates-vfs`, `slates-base`, `slates-land`) are implemented and gated; the rest is design (GAPS §8c).
 This version integrates amendments A-1, A-2, A-4, A-5 and A-6 into the body; the amendment log at
 the end is history, and where the log and the body disagree, the body wins.
 Every decision below cites tiered evidence; every tunable is a measured derivation; every phase
@@ -1909,6 +1909,17 @@ the new inode, its fingerprint is not the witness, the landing exchanges back an
 stays in the overlay.
 
 **Laptop degenerate.** Identical; the landing lease is a partition record with no peers.
+
+> **Status (2026-09-05).** Implemented in `crates/land` (GAPS §8c, Phase 1 tasks 11–13):
+> steps 1–6, 8, 9 and 11 as written, with grants, leases and the audit log as in-process
+> records until Phase 2; step 7's ramp as a recorded policy (entries run one at a time until
+> the runtime's pool); step 10 for an empty target (a populated target waits on a hard-link
+> verb in the seam); reflinks and `syncfs` waiting on their measured costs; Windows waiting on
+> Phase 4. Two additions the oracle forced: a `Clear` action (a base directory the overlay
+> removed and recreated opaque: a fresh directory exchanged with the old one, the displaced
+> tree removed), and a resumed landing's recognition of its own finished work (a directory
+> holding only what the manifest creates beneath it; a rename whose destination holds the
+> witnessed directory), so the re-run is idempotent for directories as it is for files.
 
 **Integration points.** §4.4 (verbs, refusals, states), §4.5 (whiteouts, redirects, witnesses,
 copy-up, drift), §4.6 (base reads, invalidation on drift), §4.8 (grant, lease and

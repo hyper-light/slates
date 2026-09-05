@@ -664,6 +664,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-land"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "libc",
+ "proptest",
+ "rustix",
+ "slates-base",
+ "slates-machine",
+ "slates-mem",
+ "slates-vfs",
+]
+
+[[package]]
 name = "slates-machine"
 version = "0.1.0"
 dependencies = [
