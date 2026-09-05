@@ -22,11 +22,16 @@
 //! - **Remove** a file: accepted (or a no-op if already gone); a delete/modify conflict if an
 //!   intervening change modified it since the base.
 //!
-//! Per-range identity within a mixed file is owed. So is the whole namespace merge for directories,
-//! renames and links through this pipeline; the deriver composes those, and wiring their tree-level
-//! verdict here is the engine's next step.
+//! The namespace merges alongside the content, as independent dimensions (the deriver composes them
+//! the same way, §4.16): a directory creation (`Mkdir`) and a mode change (`SetMode`) each merge per
+//! path with their own conflict classes — a file and a directory at one path is a `TypeChanged`
+//! conflict, two differing mode changes are a `MetaMeta` conflict, and an identical one accepts.
+//! Directory removal (needing emptiness), renames and links (cross-path effects), symlinks and
+//! xattrs are the continuing step; the deriver already composes them.
+//!
+//! Per-range identity within a mixed file is owed.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops_doc::{Op, OpKind};
 use crate::range::Range;
@@ -50,6 +55,13 @@ pub enum PathChange {
   },
   /// Remove the file.
   Remove,
+  /// Create a directory at the path.
+  Mkdir,
+  /// Set the mode of a file or directory at the path.
+  SetMode {
+    /// The new mode bits.
+    mode: u32,
+  },
 }
 
 /// An increment submitted against a base version.
@@ -94,8 +106,11 @@ pub enum Outcome {
 #[derive(Debug, Default)]
 pub struct Green {
   content: BTreeMap<String, Vec<u8>>,
+  dirs: BTreeSet<String>,
+  modes: BTreeMap<String, u32>,
   deltas: Vec<BTreeMap<String, Vec<Op>>>,
   last_changed: BTreeMap<String, u64>,
+  mode_changed: BTreeMap<String, u64>,
   seen: BTreeMap<[u8; 32], Outcome>,
   fast_path_hits: u64,
 }
@@ -152,6 +167,10 @@ enum PathMerge {
   Set(Vec<u8>, Vec<Op>),
   /// Remove the file.
   Remove,
+  /// Create a directory at the path.
+  MakeDir,
+  /// Set the path's mode.
+  Mode(u32),
   /// No net change to the file.
   Unchanged,
 }
@@ -170,6 +189,16 @@ impl Green {
   /// A file's current bytes, or `None` when it is absent.
   pub fn content(&self, path: &str) -> Option<&[u8]> {
     self.content.get(path).map(Vec::as_slice)
+  }
+
+  /// Whether a directory exists at the path.
+  pub fn is_dir(&self, path: &str) -> bool {
+    self.dirs.contains(path)
+  }
+
+  /// A path's current mode, or `None` when none has been set.
+  pub fn mode(&self, path: &str) -> Option<u32> {
+    self.modes.get(path).copied()
   }
 
   /// The number of paths merged through the fast path (the non-vacuity counter).
@@ -204,6 +233,10 @@ impl Green {
     post_state: &[u8],
   ) -> Result<PathMerge, ConflictWindow> {
     if !self.content.contains_key(path) {
+      if self.dirs.contains(path) {
+        // An intervening change replaced the file with a directory.
+        return Err(Green::window(path, MergeConflictClass::TypeChanged));
+      }
       // The agent edited a file an intervening change deleted.
       return Err(Green::window(path, MergeConflictClass::DeleteModify));
     }
@@ -249,6 +282,10 @@ impl Green {
 
   /// Merges a create.
   fn merge_create(&self, path: &str, post_state: &[u8]) -> Result<PathMerge, ConflictWindow> {
+    if self.dirs.contains(path) {
+      // An intervening change made this path a directory.
+      return Err(Green::window(path, MergeConflictClass::TypeChanged));
+    }
     match self.content.get(path) {
       // Already created by an intervening increment: identical bytes accept, else conflict.
       Some(current) if current.as_slice() == post_state => Ok(PathMerge::Unchanged),
@@ -280,6 +317,35 @@ impl Green {
     Ok(PathMerge::Remove)
   }
 
+  /// Merges a directory creation. A file at the path is a type conflict; an existing directory is an
+  /// identical accept (both agents made it); otherwise the directory is created.
+  fn merge_mkdir(&self, path: &str) -> Result<PathMerge, ConflictWindow> {
+    if self.content.contains_key(path) {
+      return Err(Green::window(path, MergeConflictClass::TypeChanged));
+    }
+    if self.dirs.contains(path) {
+      return Ok(PathMerge::Unchanged);
+    }
+    Ok(PathMerge::MakeDir)
+  }
+
+  /// Merges a mode change. The path must be present (a file or a directory); if an intervening
+  /// change set a different mode it is a metadata conflict, an equal one an identical accept.
+  fn merge_setmode(&self, path: &str, base: u64, mode: u32) -> Result<PathMerge, ConflictWindow> {
+    if !self.content.contains_key(path) && !self.dirs.contains(path) {
+      // The path an intervening change removed cannot take a mode.
+      return Err(Green::window(path, MergeConflictClass::DeleteModify));
+    }
+    let changed = self.mode_changed.get(path).copied().unwrap_or(0);
+    if changed > base {
+      if self.modes.get(path).copied() == Some(mode) {
+        return Ok(PathMerge::Unchanged);
+      }
+      return Err(Green::window(path, MergeConflictClass::MetaMeta));
+    }
+    Ok(PathMerge::Mode(mode))
+  }
+
   /// Merges one file's change.
   fn merge_path(
     &mut self,
@@ -291,6 +357,8 @@ impl Green {
       PathChange::Modify { ops, post_state } => self.merge_modify(path, base, ops, post_state),
       PathChange::Create { post_state } => self.merge_create(path, post_state),
       PathChange::Remove => self.merge_remove(path, base),
+      PathChange::Mkdir => self.merge_mkdir(path),
+      PathChange::SetMode { mode } => self.merge_setmode(path, base, *mode),
     }
   }
 
@@ -302,6 +370,8 @@ impl Green {
     }
     let mut sets: BTreeMap<String, (Vec<u8>, Vec<Op>)> = BTreeMap::new();
     let mut removes: Vec<String> = Vec::new();
+    let mut mkdirs: Vec<String> = Vec::new();
+    let mut set_modes: Vec<(String, u32)> = Vec::new();
     let mut windows = Vec::new();
     for (path, change) in &increment.changes {
       match self.merge_path(path, increment.base, change) {
@@ -309,6 +379,8 @@ impl Green {
           sets.insert(path.clone(), (content, ops));
         }
         Ok(PathMerge::Remove) => removes.push(path.clone()),
+        Ok(PathMerge::MakeDir) => mkdirs.push(path.clone()),
+        Ok(PathMerge::Mode(mode)) => set_modes.push((path.clone(), mode)),
         Ok(PathMerge::Unchanged) => {}
         Err(window) => windows.push(window),
       }
@@ -328,6 +400,13 @@ impl Green {
     for path in removes {
       self.content.remove(&path);
       self.last_changed.insert(path, version);
+    }
+    for path in mkdirs {
+      self.dirs.insert(path);
+    }
+    for (path, mode) in set_modes {
+      self.modes.insert(path.clone(), mode);
+      self.mode_changed.insert(path, version);
     }
     self.deltas.push(delta);
     let outcome = Outcome::Accepted { version };

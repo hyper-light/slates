@@ -297,3 +297,152 @@ fn remove_of_a_modified_file_conflicts() {
     "removing a modified file conflicts"
   );
 }
+
+/// A change that creates a directory at the path.
+fn mkdir() -> PathChange {
+  PathChange::Mkdir
+}
+
+/// A change that sets the mode of the path.
+fn set_mode(mode: u32) -> PathChange {
+  PathChange::SetMode { mode }
+}
+
+/// A mkdir creates a directory.
+#[test]
+fn mkdir_creates_a_directory() {
+  let mut green = Green::new();
+  let outcome = green.submit(&increment(1, 0, "d", mkdir()));
+  assert_eq!(outcome, Outcome::Accepted { version: 1 });
+  assert!(green.is_dir("d"));
+}
+
+/// Two agents making the same directory: the second accepts as a no-op (both made it).
+#[test]
+fn two_mkdirs_of_the_same_path_accept() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "d", mkdir()));
+  let again = green.submit(&increment(2, 0, "d", mkdir()));
+  assert_eq!(again, Outcome::Accepted { version: 2 });
+  assert!(green.is_dir("d"));
+}
+
+/// A mkdir where an intervening change created a file is a type conflict.
+#[test]
+fn mkdir_over_a_file_conflicts() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "a", create(b"file")));
+  let outcome = green.submit(&increment(2, 1, "a", mkdir()));
+  match outcome {
+    Outcome::Conflict { windows } => assert_eq!(
+      windows[0].class,
+      slates_merge::verdict::MergeConflictClass::TypeChanged
+    ),
+    other => panic!("expected a type conflict, got {other:?}"),
+  }
+}
+
+/// A create where an intervening change made the path a directory is a type conflict.
+#[test]
+fn create_over_a_directory_conflicts() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "d", mkdir()));
+  let outcome = green.submit(&increment(2, 1, "d", create(b"file")));
+  match outcome {
+    Outcome::Conflict { windows } => assert_eq!(
+      windows[0].class,
+      slates_merge::verdict::MergeConflictClass::TypeChanged
+    ),
+    other => panic!("expected a type conflict, got {other:?}"),
+  }
+}
+
+/// A setmode sets the mode of a file, and of a directory.
+#[test]
+fn setmode_sets_the_mode() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "f", create(b"x")));
+  green.submit(&increment(2, 1, "f", set_mode(0o644)));
+  assert_eq!(green.mode("f"), Some(0o644));
+  green.submit(&increment(3, 2, "d", mkdir()));
+  green.submit(&increment(4, 3, "d", set_mode(0o755)));
+  assert_eq!(green.mode("d"), Some(0o755));
+}
+
+/// Two agents setting differing modes on one path from the same base: the second conflicts.
+#[test]
+fn two_differing_setmodes_conflict() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "f", create(b"x")));
+  let a = green.submit(&increment(2, 1, "f", set_mode(0o600)));
+  assert_eq!(a, Outcome::Accepted { version: 2 });
+  let b = green.submit(&increment(3, 1, "f", set_mode(0o644)));
+  match b {
+    Outcome::Conflict { windows } => assert_eq!(
+      windows[0].class,
+      slates_merge::verdict::MergeConflictClass::MetaMeta
+    ),
+    other => panic!("expected a metadata conflict, got {other:?}"),
+  }
+  assert_eq!(green.mode("f"), Some(0o600), "the first mode stands");
+}
+
+/// Two agents setting the identical mode: the second accepts as a no-op.
+#[test]
+fn identical_setmodes_accept() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "f", create(b"x")));
+  green.submit(&increment(2, 1, "f", set_mode(0o600)));
+  let same = green.submit(&increment(3, 1, "f", set_mode(0o600)));
+  assert_eq!(same, Outcome::Accepted { version: 3 });
+}
+
+/// A setmode on a file an intervening change deleted is a delete/modify conflict.
+#[test]
+fn setmode_on_a_deleted_file_conflicts() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "f", create(b"x")));
+  green.submit(&increment(2, 1, "f", remove()));
+  let b = green.submit(&increment(3, 1, "f", set_mode(0o600)));
+  match b {
+    Outcome::Conflict { windows } => assert_eq!(
+      windows[0].class,
+      slates_merge::verdict::MergeConflictClass::DeleteModify
+    ),
+    other => panic!("expected a delete/modify conflict, got {other:?}"),
+  }
+}
+
+/// A content edit and a mode change are independent dimensions: an intervening mode change does not
+/// conflict with a content edit unchanged since its base.
+#[test]
+fn a_content_edit_and_a_mode_change_are_independent() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "f", create(b"0123456789")));
+  // Agent A sets the mode at version 2.
+  green.submit(&increment(2, 1, "f", set_mode(0o600)));
+  // Agent B (based on 1) edits the content — the mode change is a different dimension.
+  let outcome = green.submit(&increment(3, 1, "f", overwrite(b"0123456789", 0, b"AB")));
+  assert_eq!(
+    outcome,
+    Outcome::Accepted { version: 3 },
+    "independent dimensions do not conflict"
+  );
+  assert_eq!(&green.content("f").expect("present")[0..2], b"AB");
+  assert_eq!(green.mode("f"), Some(0o600), "the mode is retained");
+}
+
+/// A modify of a path an intervening change turned into a directory is a type conflict.
+#[test]
+fn modify_of_a_path_now_a_directory_conflicts() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "x", mkdir()));
+  let outcome = green.submit(&increment(2, 1, "x", overwrite(b"", 0, b"")));
+  match outcome {
+    Outcome::Conflict { windows } => assert_eq!(
+      windows[0].class,
+      slates_merge::verdict::MergeConflictClass::TypeChanged
+    ),
+    other => panic!("expected a type conflict, got {other:?}"),
+  }
+}
