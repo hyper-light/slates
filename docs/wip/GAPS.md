@@ -259,8 +259,41 @@ document keys content by post-state path with an explicit base reference rather 
 so a rename over a base path and a rewrite in place read the same; hard-linked inodes are
 listed at every path (conservative, as D-27 says).
 
-Open in Phase 1 (owed in this phase, in order): task 10 `slates-base`; tasks 11–13
-`slates-land`, its oracle and baselines. AC-1.2's harness (`crates/vfs/tests/differential.rs`)
+Task 10 (the base plane) landed 2026-09-05: the read-only host seam (`crates/vfs/src/host`)
+with opaque handles, bulk listings carrying fingerprints, `O_NOFOLLOW` opens and watcher hints;
+`SimHost`, an in-memory host with outsider edits, a controllable clock and watcher overflow, the
+disk leg of the (disk, overlay, witnesses) oracle; the volume's base plane (`crates/vfs/src/base.rs`):
+merged lookups and listings validated by the directory's fingerprint on every use, base
+entries given inodes on first touch and dropped when the disk loses them, copy-up by size class
+with the racy rule, whiteouts and redirects journaled, drift checked first on what the held
+descriptor serves (an in-place change marks the body lost and reads refuse with `BaseDrift`)
+and then on the path (deleted, replaced, retyped: reported, still served from the held inode),
+`read_base`, `rewitness`, `pin`, `status`, hints and overflow re-checks, the diverged set over
+loaded nodes; and `slates-base` (`crates/base`), the operating-system host: descriptor-relative
+rustix calls on Unix, inotify on Linux and `EVFILT_VNODE` on macOS behind the seam, a
+path-relative standard-library form on Windows. Gated: AC-1.9 (one open and one node at 10^3,
+10^5 and 10^6 files, and over the workspace's own tree), AC-1.10 and T-1.10 (150 generated
+histories of agent and outsider moves over random bases, the diverged set, the drift list and
+every readable file compared after each step), AC-1.11, T-1.11, T-1.12 (40,000 entries), T-1.13;
+the host's own tests over `crates/` and, in the Linux lane, over tmpfs (descriptor semantics,
+`O_NOFOLLOW`, hints). Baselines in BENCHMARKS.md (Phase 1 baseline: the base plane).
+
+Deviations and owed items from task 10:
+- The Windows host is path-relative through the standard library and reports no watcher
+  (fingerprints alone, the failure matrix's Masked cell); the directory-handle form with
+  `FILE_FLAG_OPEN_REPARSE_POINT` opens and `ReadDirectoryChangesW` arrive with the Windows bridge
+  (Phase 4). Its timestamp granularity is the table's coarsest until the volume is queried
+  through that handle. Compile-checked in the cross-target lint lane; not run here.
+- Listings on macOS use `getdents` plus one `statat` per entry (3.4 µs per entry measured);
+  `getattrlistbulk` is the design's bulk call for the platform and its gain is owed as a
+  measurement before Phase 3's bridge, where listings sit on the `readdirplus` path.
+- A large-class copy-up hashes the whole file for its witness identity (6.8 ms measured on a
+  file of a few megabytes); D-6's tripwire on large-class copy-up cost stands, and a lazy
+  identity (hashed at seal or landing) is the change it would trigger.
+- `slates-base` carries two `unsafe` sites (rustix's `kevent`), budgeted.
+
+Open in Phase 1 (owed in this phase, in order): tasks 11–13 `slates-land`, its oracle and
+baselines. AC-1.2's harness (`crates/vfs/tests/differential.rs`)
 and policy (`docs/wip/EQUIVALENCE.md`) are written; it runs in the Linux lane against
 `/dev/shm` (2,000 histories) and skips loudly elsewhere, since a macOS RAM disk is a
 system-state change Ada has not authorized; its first run is the lane's, not a local one.

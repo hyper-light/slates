@@ -1324,7 +1324,9 @@ impl Volume {
         }
         _ => match self.origin_epoch {
           Some(origin) if dead.born() <= origin => {}
-          _ => release_dead(store, *dead)?,
+          _ => {
+            release_dead(store, *dead)?;
+          }
         },
       }
     }
@@ -1401,6 +1403,10 @@ impl Volume {
     let mut since_check = 0;
     loop {
       let Some(dead) = self.destroy_queue.pop() else {
+        // The queue emptied in this slice: report its units; the next call says `Done`.
+        if released > 0 {
+          return Ok(DestroyProgress::Released(released));
+        }
         self.state = VolumeState::Destroyed;
         self.bytes = ByEpoch::default();
         return Ok(DestroyProgress::Done);
@@ -1411,9 +1417,7 @@ impl Volume {
       let weight = if shared {
         1
       } else {
-        let weight = release_weight(store, dead);
-        release_dead(store, dead)?;
-        weight
+        release_dead(store, dead)?
       };
       released += weight;
       since_check += weight;
@@ -1535,7 +1539,7 @@ impl Volume {
         }
         Ok(())
       }
-      _ => release_dead(store, dead),
+      _ => release_dead(store, dead).map(drop),
     }
   }
 
@@ -1814,7 +1818,7 @@ impl Volume {
     &mut self,
     store: &mut Store,
     dir: Handle<DirNode>,
-    now: i128,
+    now: i64,
   ) -> Result<(), VfsError> {
     let no = store.dirs.get(dir)?.inode;
     let handle = self.make_current_inode(store, no)?;
@@ -2296,7 +2300,7 @@ fn snapshot_handle(id: SnapshotId) -> Handle<Snapshot> {
   Handle::from_raw(id.index, id.generation)
 }
 
-pub(crate) fn stamp_all(attrs: &mut Attrs, now: i128) {
+pub(crate) fn stamp_all(attrs: &mut Attrs, now: i64) {
   attrs.atime = now;
   attrs.mtime = now;
   attrs.ctime = now;
@@ -2424,68 +2428,52 @@ fn block_segment_slots(page: usize) -> Derived<usize> {
 /// Shape: pages of block slots per slab segment.
 const BLOCK_SEGMENT_PAGES: usize = 64;
 
-/// Releases a dead object's storage.
-/// The work units a release costs, so a destroy slice's budget counts what is freed rather
-/// than how many handles it touched: a directory node frees one name buffer and its map (one
-/// unit per entry), an inode its extents, a trie node or a chunk one block.
-fn release_weight(store: &Store, dead: Dead) -> usize {
-  match dead {
-    Dead::Dir(..) => 1,
-    Dead::Inode(h, _) => {
-      1 + store.inodes.get(h).map_or(0, |inode| match &inode.body {
-        Body::Sealed(extents) => extents.len(),
-        Body::Open { sealed, .. } => sealed.len() + 1,
-        Body::Base(b) => b.pinned.len(),
-        _ => 0,
-      })
-    }
-    Dead::Trie(..) | Dead::Chunk(..) | Dead::DirBlock(..) => 1,
-  }
-}
-
-fn release_dead(store: &mut Store, dead: Dead) -> Result<(), VfsError> {
+/// Releases a dead object and returns the work units it cost, so a destroy slice's budget
+/// counts what is freed rather than how many handles it touched: an inode one unit per extent
+/// plus one, a directory node, a block, a trie node or a chunk one unit (their slots are
+/// vacated in place, never copied out).
+fn release_dead(store: &mut Store, dead: Dead) -> Result<usize, VfsError> {
   match dead {
     Dead::Dir(h, _) => {
-      let _ = store.dirs.remove(h);
+      let _ = store.dirs.discard(h);
+      Ok(1)
     }
     Dead::DirBlock(h, _) => {
-      let _ = store.blocks.remove(h);
+      let _ = store.blocks.discard(h);
+      Ok(1)
     }
     Dead::Inode(h, _) => {
-      if let Ok(inode) = store.inodes.remove(h) {
-        match inode.body {
-          Body::Sealed(extents) => {
-            for e in extents {
-              if let ExtentSrc::Chunk { chunk, .. } = e.src {
-                let _ = store.content.free_chunk(chunk);
-              }
-            }
-          }
-          Body::Open { open, sealed } => {
-            let _ = store.content.release_open(open);
-            for e in sealed {
-              if let ExtentSrc::Chunk { chunk, .. } = e.src {
-                let _ = store.content.free_chunk(chunk);
-              }
-            }
-          }
-          Body::Base(b) => {
-            for e in b.pinned {
-              if let ExtentSrc::Chunk { chunk, .. } = e.src {
-                let _ = store.content.free_chunk(chunk);
-              }
-            }
-          }
-          _ => {}
+      let Ok(inode) = store.inodes.remove(h) else {
+        return Ok(1);
+      };
+      let extents = match inode.body {
+        Body::Sealed(extents) => free_extents(store, &extents),
+        Body::Open { open, sealed } => {
+          let _ = store.content.release_open(open);
+          free_extents(store, &sealed) + 1
         }
-      }
+        Body::Base(b) => free_extents(store, &b.pinned),
+        _ => 0,
+      };
+      Ok(1 + extents)
     }
     Dead::Trie(h, _) => {
-      let _ = store.tries.remove(h);
+      let _ = store.tries.discard(h);
+      Ok(1)
     }
     Dead::Chunk(h, _) => {
       let _ = store.content.free_chunk(h);
+      Ok(1)
     }
   }
-  Ok(())
+}
+
+/// Frees the chunks of sealed extents; returns how many there were.
+fn free_extents(store: &mut Store, extents: &[Extent]) -> usize {
+  for e in extents {
+    if let ExtentSrc::Chunk { chunk, .. } = e.src {
+      let _ = store.content.free_chunk(chunk);
+    }
+  }
+  extents.len()
 }

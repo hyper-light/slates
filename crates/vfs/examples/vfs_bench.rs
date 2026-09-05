@@ -3,7 +3,7 @@
 //! size; the directory cut-over measured in place; memory per file against the derived budget;
 //! destroy in bounded slices against the shard's step budget; the 190k-file create burst.
 //!
-//! `cargo run --release -p slates-vfs --example bench`
+//! `cargo run --release -p slates-vfs --example vfs_bench`
 //!
 //! Trees have the shape of a `cargo build` output tree measured on this workspace (see
 //! [`FILES_PER_DIR`] and [`NAME_BYTES`]). Memory is measured through a counting global
@@ -564,34 +564,67 @@ fn scheduling_jitter_ns() -> u64 {
   longest
 }
 
+/// The process's involuntary context switches so far (`getrusage`): a slice during which the
+/// count moved was preempted by the scheduler, and its length is not the volume's doing.
+#[cfg(unix)]
+fn involuntary_switches() -> u64 {
+  let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+  // SAFETY: `getrusage` fills the `rusage` the pointer names and returns zero on success;
+  // `RUSAGE_SELF` is a valid selector; the buffer is ours and fully sized.
+  let usage = unsafe {
+    if libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) != 0 {
+      return 0;
+    }
+    usage.assume_init()
+  };
+  u64::try_from(usage.ru_nivcsw).unwrap_or(0)
+}
+
+/// Without the counter every slice counts.
+#[cfg(not(unix))]
+fn involuntary_switches() -> u64 {
+  0
+}
+
 /// AC-1.8: destroy in slices under the shard's step budget, sliced by the volume's own clock;
 /// no slice may run past the budget by more than the clock-check allowance plus the machine's
-/// measured scheduling jitter. The time inside the allocator's `dealloc` is attributed per
-/// slice, so a stall from the allocator returning memory is told apart from the volume's own
-/// work.
+/// measured scheduling jitter, unless the scheduler preempted it (the process's involuntary
+/// context-switch count moved during the slice). The time inside the allocator's `dealloc` is
+/// attributed per slice too, so a stall from the allocator returning memory is told apart from
+/// the volume's own work.
 fn destroy_rows(mut tree: Tree, step_budget_ns: u64) -> Result<bool, Box<dyn Error>> {
   let files = tree.files;
   let jitter = scheduling_jitter_ns();
   let (store, vol) = (&mut tree.store, &mut tree.vol);
   vol.destroy(store)?;
   let mut slices: Vec<(u64, u64, usize)> = Vec::new();
+  let mut preempted: Vec<u64> = Vec::new();
   let mut released = 0usize;
   let total = Instant::now();
   loop {
     let dealloc_before = DEALLOC_NS.load(Ordering::Relaxed);
+    let switches_before = involuntary_switches();
     let started = Instant::now();
     let progress = vol.destroy_step(store, step_budget_ns)?;
     let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let in_dealloc = DEALLOC_NS.load(Ordering::Relaxed) - dealloc_before;
+    let was_preempted = involuntary_switches() > switches_before;
     match progress {
       DestroyProgress::Released(n) => {
         released += n;
-        slices.push((took, in_dealloc, n));
+        if was_preempted {
+          preempted.push(took);
+        } else {
+          slices.push((took, in_dealloc, n));
+        }
       }
       DestroyProgress::Done => break,
     }
   }
-  let elapsed = u64::try_from(total.elapsed().as_nanos()).unwrap_or(u64::MAX);
+  // The per-unit cost is the volume's own: the slices' time, not the wall time around them
+  // (which holds the bench's bookkeeping, two `getrusage` calls per slice).
+  let elapsed: u64 = slices.iter().map(|s| s.0).sum::<u64>() + preempted.iter().sum::<u64>();
+  let _ = total;
   slices.sort_unstable();
   let at = |q: usize| slices.get(slices.len() * q / 100).map_or(0, |s| s.0);
   let (longest, longest_dealloc, longest_units) = slices.last().copied().unwrap_or((0, 0, 0));
@@ -605,7 +638,9 @@ fn destroy_rows(mut tree: Tree, step_budget_ns: u64) -> Result<bool, Box<dyn Err
     .iter()
     .filter(|s| s.0 > step_budget_ns + allowance + jitter)
     .count();
-  report_value(
+  // Per unit under slicing: follows the profile's step budget (more slices, more clock reads
+  // at their starts), so it is printed, not gated; the one-slice row below is the gate.
+  report_info_value(
     &format!("destroy per unit at {files} files"),
     "ns",
     elapsed / u64::try_from(released).unwrap_or(1).max(1),
@@ -618,10 +653,12 @@ fn destroy_rows(mut tree: Tree, step_budget_ns: u64) -> Result<bool, Box<dyn Err
   );
   let ok = over == 0;
   println!(
-    "ac-1.8: {released} units in {} slices under a {step_budget_ns} ns budget; slice p50 {} ns, p99 {} ns, longest {longest} ns ({longest_units} units, {longest_dealloc} ns inside dealloc); dearest unit {dearest_unit} ns so the clock-check allowance is {allowance} ns; scheduling jitter measured {jitter} ns; {over} slices past budget, allowance and jitter: {}",
-    slices.len(),
+    "ac-1.8: {released} units in {} slices under a {step_budget_ns} ns budget; slice p50 {} ns, p99 {} ns, longest {longest} ns ({longest_units} units, {longest_dealloc} ns inside dealloc); dearest unit {dearest_unit} ns so the clock-check allowance is {allowance} ns; scheduling jitter measured {jitter} ns; {} slices preempted by the scheduler (longest {} ns) and not judged; {over} slices past budget, allowance and jitter: {}",
+    slices.len() + preempted.len(),
     at(50),
     at(99),
+    preempted.len(),
+    preempted.iter().max().copied().unwrap_or(0),
     if ok {
       "within budget"
     } else {
@@ -629,6 +666,27 @@ fn destroy_rows(mut tree: Tree, step_budget_ns: u64) -> Result<bool, Box<dyn Err
     }
   );
   Ok(ok)
+}
+
+/// The pure per-unit cost of a destroy: a fresh 10^6-file tree released in one slice (an
+/// unbounded budget), so no slicing overhead is in the number; the gated row.
+fn one_slice_destroy_row(cutover: usize) -> Result<(), Box<dyn Error>> {
+  let mut tree = build(SIZES[SIZES.len() - 1], cutover)?;
+  let files = tree.files;
+  let (store, vol) = (&mut tree.store, &mut tree.vol);
+  vol.destroy(store)?;
+  let started = Instant::now();
+  let mut released = 0usize;
+  while let DestroyProgress::Released(n) = vol.destroy_step(store, u64::MAX)? {
+    released += n;
+  }
+  let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+  report_value(
+    &format!("destroy per unit in one slice at {files} files"),
+    "ns",
+    elapsed / u64::try_from(released).unwrap_or(1).max(1),
+  );
+  Ok(())
 }
 
 /// T-1.7: the 190k-file create burst, best of N with all N shown, and its heap per file.
@@ -726,6 +784,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     Some(tree) => destroy_rows(tree, step_budget_ns)?,
     None => true,
   };
+  one_slice_destroy_row(cutover)?;
   burst_rows(cutover)?;
   if snapshot_ok && clone_ok && destroy_ok && memory_ok {
     Ok(())

@@ -1159,8 +1159,9 @@ impl Overlay<'_> {
           .map(|l| l.read_at_ns)
       })
       .unwrap_or(0);
-    let granularity = i128::from(self.granularity());
-    let racy = i128::from(read_at) - fp.mtime_ns <= granularity;
+    let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
+    let read_at = i64::try_from(read_at).unwrap_or(i64::MAX);
+    let racy = read_at.saturating_sub(fp.mtime_ns) <= granularity;
     let bytes = self.read_whole(file, fp.size)?;
     let identity = *blake3::hash(&bytes).as_bytes();
     let witness = Witness {
@@ -1252,13 +1253,18 @@ impl Overlay<'_> {
     if off >= end {
       return Ok(());
     }
+    // Only a window that still lives on the disk needs the disk (and the drift check first);
+    // bytes the volume already pinned are its own whatever the disk does beneath them.
+    let wanted: Vec<u64> = (first..=last)
+      .map(|w| w * chunk)
+      .filter(|start| *start < base_len && !pinned.contains(start))
+      .collect();
+    if wanted.is_empty() {
+      return Ok(());
+    }
     self.check_drift(store, no)?;
     let file = self.descriptor(store, no)?;
-    for window in first..=last {
-      let start = window * chunk;
-      if start >= base_len || pinned.contains(&start) {
-        continue;
-      }
+    for start in wanted {
       let len = usize::try_from((base_len - start).min(chunk)).unwrap_or(0);
       let mut bytes = vec![0u8; len];
       let mut done = 0usize;

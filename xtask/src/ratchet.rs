@@ -13,8 +13,10 @@
 //! Ceilings are keyed by the machine identity hash the profile computes, because a number
 //! measured on one machine says nothing about another. A machine without an entry skips loudly;
 //! `--record` writes a first baseline for the current machine; `--tighten` lowers ceilings to a
-//! better run and never raises one; `--reset` rebuilds the current machine's entry from scratch
-//! (a deliberate act, for when the rule or the benches change); `--runs N` sets N.
+//! better run, and only when the improvement is larger than the row's own between-run drift,
+//! so a lucky cold run never sets a bar a warm run fails; it never raises one; `--reset`
+//! rebuilds the current machine's entry from scratch (a deliberate act, for when the rule or
+//! the benches change); `--runs N` sets N.
 //!
 //! N defaults to a ratified shape constant: three is the smallest count with a middle run, which
 //! is what "best of N with all N shown" (CLAUDE.md §5) needs to show whether the best was a fluke.
@@ -32,10 +34,11 @@ const DEFAULT_RUNS: usize = 3;
 
 /// The bench examples, as `(crate, example)`.
 const BENCHES: &[(&str, &str)] = &[
-  ("slates-mem", "bench"),
-  ("slates-rt", "bench"),
-  ("slates-wire", "bench"),
-  ("slates-vfs", "bench"),
+  ("slates-mem", "mem_bench"),
+  ("slates-rt", "rt_bench"),
+  ("slates-wire", "wire_bench"),
+  ("slates-vfs", "vfs_bench"),
+  ("slates-base", "base_bench"),
 ];
 
 /// One row of one run.
@@ -65,6 +68,16 @@ struct Across {
 impl Across {
   fn best_median(&self) -> u64 {
     self.medians.iter().copied().min().unwrap_or(0)
+  }
+
+  /// Whether this measurement improves on `ceiling` by more than its own between-run drift
+  /// (parts per thousand of the best median), so tightening never follows a lucky run.
+  fn clears(&self, ceiling: u64) -> bool {
+    /// Format: parts per thousand.
+    const PERMILLE: u64 = 1000;
+    self.max_upper < ceiling
+      && (ceiling - self.max_upper).saturating_mul(PERMILLE)
+        > ceiling.saturating_mul(self.drift_permille())
   }
 
   /// The between-run drift: the spread of the run medians as parts per thousand of the best.
@@ -171,7 +184,10 @@ pub(crate) fn run(root: &Path, flags: Flags) -> Result<(), Failure> {
         ));
         "REGRESSION"
       }
-      Some(c) if (flags.tighten || flags.record) && a.max_upper < c => {
+      // A ceiling tightens only when the improvement clears the row's own between-run drift:
+      // a lucky cold run must not set a bar a warm run then fails (measured 2026-09-05: three
+      // rows, one in a crate untouched since Phase 0, "regressed" by 1-5% after such a run).
+      Some(c) if (flags.tighten || flags.record) && a.clears(c) => {
         entry.ceilings.insert(key.clone(), a.max_upper);
         tightened += 1;
         "tightened"

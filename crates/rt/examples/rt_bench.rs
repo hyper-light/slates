@@ -1,7 +1,7 @@
 //! The Phase 0 runtime baseline: task spawn-to-completion, a local wake (yield), a timer's
 //! lateness, and a cross-shard wake round trip, each with the machine harness's interval.
 //!
-//! `cargo run --release -p slates-rt --example bench`
+//! `cargo run --release -p slates-rt --example rt_bench`
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::channel;

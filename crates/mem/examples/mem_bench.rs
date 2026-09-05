@@ -1,7 +1,7 @@
 //! The Phase 0 memory baseline: slab insert+remove, buddy alloc+free, ring push+pop, each with
 //! the bootstrap interval the machine harness reports (Phase 0 task 7; BENCHMARKS.md).
 //!
-//! `cargo run --release -p slates-mem --example bench`
+//! `cargo run --release -p slates-mem --example mem_bench`
 
 use std::time::Duration;
 

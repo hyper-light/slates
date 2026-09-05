@@ -1,7 +1,7 @@
 //! The Phase 0 wire baseline: header encode and decode, a sample body's encode and decode, a
 //! whole frame's encode and decode, and CRC32C throughput.
 //!
-//! `cargo run --release -p slates-wire --example bench`
+//! `cargo run --release -p slates-wire --example wire_bench`
 
 use std::time::Duration;
 

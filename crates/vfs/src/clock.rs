@@ -7,7 +7,7 @@ pub trait Clock {
   /// Monotonic nanoseconds.
   fn monotonic_ns(&mut self) -> u64;
   /// Wall-clock nanoseconds since the Unix epoch, for `atime`, `mtime`, `ctime` and `btime`.
-  fn wall_ns(&mut self) -> i128;
+  fn wall_ns(&mut self) -> i64;
 }
 
 /// The host's clocks.
@@ -36,10 +36,10 @@ impl Clock for HostClock {
     u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
   }
 
-  fn wall_ns(&mut self) -> i128 {
+  fn wall_ns(&mut self) -> i64 {
     std::time::SystemTime::now()
       .duration_since(std::time::UNIX_EPOCH)
-      .map(|d| i128::try_from(d.as_nanos()).unwrap_or(i128::MAX))
+      .map(|d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
       .unwrap_or(0)
   }
 }
@@ -64,7 +64,7 @@ impl Clock for StepClock {
     self.now
   }
 
-  fn wall_ns(&mut self) -> i128 {
-    i128::from(self.monotonic_ns())
+  fn wall_ns(&mut self) -> i64 {
+    i64::try_from(self.monotonic_ns()).unwrap_or(i64::MAX)
   }
 }

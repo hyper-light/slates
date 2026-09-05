@@ -27,7 +27,7 @@ pub const NAME_MAX: usize = 255;
 /// ASCII-lowercased bytes for an ASCII name under folding (NFC is the identity on ASCII), and
 /// the NFC-normalized, lowercased characters otherwise. No allocation on any path, so a lookup
 /// costs the scan and nothing else (measured: the allocating fold cost 1.2 µs per lookup on
-/// 49-byte names, 2026-09-05, `cargo run --release -p slates-vfs --example bench`).
+/// 49-byte names, 2026-09-05, `cargo run --release -p slates-vfs --example vfs_bench`).
 pub enum Folded<'a> {
   /// Bytes as given.
   Exact(std::str::Chars<'a>),

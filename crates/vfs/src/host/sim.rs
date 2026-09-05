@@ -13,6 +13,12 @@ use crate::inode::Fingerprint;
 
 /// Format: the device number every simulated file reports.
 const SIM_DEV: u64 = 1;
+/// Format: POSIX mode bits of a simulated directory (`rwxr-xr-x`).
+const DIR_MODE: u32 = 0o755;
+/// Format: POSIX mode bits of a simulated file (`rw-r--r--`).
+const FILE_MODE: u32 = 0o644;
+/// Format: POSIX mode bits of a symlink (`rwxrwxrwx`, unused by every filesystem).
+const SYMLINK_MODE: u32 = 0o777;
 
 /// One node of the simulated disk.
 #[derive(Clone, Debug)]
@@ -22,8 +28,8 @@ struct SimNode {
   mode: u32,
   bytes: Vec<u8>,
   target: Box<str>,
-  mtime_ns: i128,
-  ctime_ns: i128,
+  mtime_ns: i64,
+  ctime_ns: i64,
   children: BTreeMap<Box<str>, SimNode>,
 }
 
@@ -57,7 +63,7 @@ enum Open {
 pub struct SimHost {
   root: SimNode,
   next_ino: u64,
-  now_ns: i128,
+  now_ns: i64,
   granularity_ns: u64,
   opens: BTreeMap<u64, Open>,
   next_handle: u64,
@@ -81,7 +87,7 @@ impl SimHost {
       root: SimNode {
         kind: HostKind::Dir,
         ino: 1,
-        mode: 0o755,
+        mode: DIR_MODE,
         bytes: Vec::new(),
         target: "".into(),
         mtime_ns: 0,
@@ -106,12 +112,12 @@ impl SimHost {
   }
 
   /// Advances the simulated clock.
-  pub fn advance_ns(&mut self, ns: i128) {
+  pub fn advance_ns(&mut self, ns: i64) {
     self.now_ns += ns;
   }
 
   /// The simulated clock, monotonic ns.
-  pub fn now_ns(&self) -> i128 {
+  pub fn now_ns(&self) -> i64 {
     self.now_ns
   }
 
@@ -153,7 +159,11 @@ impl SimHost {
     SimNode {
       kind,
       ino,
-      mode: if kind == HostKind::Dir { 0o755 } else { 0o644 },
+      mode: if kind == HostKind::Dir {
+        DIR_MODE
+      } else {
+        FILE_MODE
+      },
       bytes: Vec::new(),
       target: "".into(),
       mtime_ns: self.now_ns,
@@ -226,7 +236,7 @@ impl SimHost {
 
   /// Overwrites a file in place, same inode, timestamps advanced by `dt_ns` (zero keeps them,
   /// which is the racy case of T-1.11).
-  pub fn write_in_place(&mut self, path: &str, bytes: &[u8], dt_ns: i128) {
+  pub fn write_in_place(&mut self, path: &str, bytes: &[u8], dt_ns: i64) {
     let parts = Self::split(path);
     self.now_ns += dt_ns;
     let now = self.now_ns;
@@ -248,7 +258,7 @@ impl SimHost {
       .unwrap_or_default();
     let mut node = self.fresh(HostKind::Symlink);
     node.target = target.into();
-    node.mode = 0o777;
+    node.mode = SYMLINK_MODE;
     if let Some(p) = self.node_mut(&parent) {
       p.children.insert(name, node);
     }

@@ -21,7 +21,7 @@ use crate::names::NameEquivalence;
 /// Measured: the entry count up to which the sorted array beats the map. The bench probes
 /// insert-and-remove in both representations at 4, 8, 16, 32, 64 and 128 entries; the map's
 /// insert first won at 4 entries (49 ns against 59 ns, Apple M5 Max, 2026-09-05, `cargo run
-/// --release -p slates-vfs --example bench`), so the array is kept up to 2, which is also the
+/// --release -p slates-vfs --example vfs_bench`), so the array is kept up to 2, which is also the
 /// median directory size of the cited study.
 pub const MEASURED_CUTOVER: usize = 2;
 

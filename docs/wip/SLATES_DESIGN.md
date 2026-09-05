@@ -1,6 +1,6 @@
 # slates — unified design and phased implementation plan
 
-Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 tasks 1–9 (the volume core, `slates-vfs`) are implemented and gated; the rest is design (GAPS §8c).
+Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 tasks 1–10 and 14 (the volume core, the deriver and the base plane: `slates-vfs`, `slates-base`) are implemented and gated; the rest is design (GAPS §8c).
 This version integrates amendments A-1, A-2, A-4, A-5 and A-6 into the body; the amendment log at
 the end is history, and where the log and the body disagree, the body wins.
 Every decision below cites tiered evidence; every tunable is a measured derivation; every phase

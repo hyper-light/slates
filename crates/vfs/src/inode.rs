@@ -34,13 +34,13 @@ pub struct Attrs {
   /// Size in bytes (the file length; a directory reports 0).
   pub size: u64,
   /// Access time, ns since the Unix epoch.
-  pub atime: i128,
+  pub atime: i64,
   /// Modification time.
-  pub mtime: i128,
+  pub mtime: i64,
   /// Change time.
-  pub ctime: i128,
+  pub ctime: i64,
   /// Birth time.
-  pub btime: i128,
+  pub btime: i64,
 }
 
 /// The base-plane fields of a base-backed body (§4.5 `Body::Base`), filled in by `slates-base`.
@@ -81,9 +81,9 @@ pub struct Fingerprint {
   /// Size.
   pub size: u64,
   /// Modification time, ns.
-  pub mtime_ns: i128,
+  pub mtime_ns: i64,
   /// Change time, ns.
-  pub ctime_ns: i128,
+  pub ctime_ns: i64,
   /// Mode.
   pub mode: u32,
 }

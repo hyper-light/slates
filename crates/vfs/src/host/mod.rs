@@ -87,6 +87,20 @@ pub enum HostError {
   Unavailable(i32),
 }
 
+impl std::fmt::Display for HostError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::NotFound => f.write_str("not found"),
+      Self::NotDirectory => f.write_str("not a directory"),
+      Self::NotFile => f.write_str("not a regular file"),
+      Self::StaleHandle => f.write_str("stale host handle"),
+      Self::Unavailable(errno) => write!(f, "host unavailable (errno {errno})"),
+    }
+  }
+}
+
+impl std::error::Error for HostError {}
+
 /// The seam. Every call is relative to a handle the host handed out, never to a path string,
 /// so a rename of the base directory by the user changes nothing (§4.4).
 pub trait HostFs {

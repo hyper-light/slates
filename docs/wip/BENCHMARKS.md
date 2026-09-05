@@ -53,7 +53,7 @@ corpus is the small class (64 pages) and Phase 7 measures the large class itself
 ## Phase 0 baseline: memory (2026-09-04)
 
 Environment: as above (Apple M5 Max, macOS 26.4.1, Rust 1.98.0, release profile).
-Command: `cargo run --release -p slates-mem --example bench` (500 ms budget per row; 95%
+Command: `cargo run --release -p slates-mem --example mem_bench` (500 ms budget per row; 95%
 bootstrap intervals; the harness batches sub-microsecond operations, batch shown).
 
 | Operation | Median | Interval | p99 | Batch |
@@ -77,7 +77,7 @@ cross-shard wake before the kick syscall (§4.3; the runtime baseline adds the k
 
 Environment: as above (Apple M5 Max, macOS 26.4.1, Rust 1.98.0, release profile); the kqueue
 driver; one shard on the calling thread unless stated. Command:
-`cargo run --release -p slates-rt --example bench` (500 ms budget per row; 95% bootstrap intervals).
+`cargo run --release -p slates-rt --example rt_bench` (500 ms budget per row; 95% bootstrap intervals).
 
 | Operation | Median | Interval | p99 |
 |---|---|---|---|
@@ -118,7 +118,7 @@ which is why it is gated on a client being active rather than always on.
 ## Phase 0 baseline: wire (2026-09-04)
 
 Environment: as above (Apple M5 Max, macOS 26.4.1, Rust 1.98.0, release profile). Command:
-`cargo run --release -p slates-wire --example bench` (400 ms budget per row; 95% bootstrap
+`cargo run --release -p slates-wire --example wire_bench` (400 ms budget per row; 95% bootstrap
 intervals; inputs made opaque to the optimizer).
 
 | Operation | Median | Interval | p99 |
@@ -149,7 +149,7 @@ whether the bulk path needs it, though bulk carries the BLAKE3 identity instead 
 
 Environment: as above (Apple M5 Max, macOS 26.4.1, Rust 1.98.0, release profile, mains power,
 thread not pinned: macOS refuses affinity on Apple silicon). Command:
-`cargo run --release -p slates-vfs --example bench` (500 ms budget per row; 95% bootstrap
+`cargo run --release -p slates-vfs --example vfs_bench` (500 ms budget per row; 95% bootstrap
 intervals; heap measured through a counting global allocator in the bench binary; the volume's
 clock is the host clock). Trees have the shape of a `cargo build` output tree measured on this
 workspace: 36 files per directory (40,052 files in 1,117 directories under `target/debug`) and
@@ -170,7 +170,7 @@ budget is 64 KiB so it is full at every size and each mutation pays the same evi
 | Clone and destroy the untouched clone | 265 ns | 260 ns | 244 ns | [265, 270]; [255, 260]; the destroy walk is pruned at the origin epoch |
 | Heap per file (slabs, blocks, names, trie, op log) | 697 B | 472 B | 468 B | AC-1.5 budgets from the counted-object formula: 921, 565, 561 B |
 | Build the tree | 1 ms | 107 ms | 1,038 ms | 1.04 µs per create at 10^6 |
-| Destroy, per release unit | | | 12 ns | 1,152,224 units in 1,932 slices |
+| Destroy, per release unit | | | 14 ns in one slice; 15 ns under 6 µs slices | 1,152,317 units; the slices' clock read every sixteen units costs about 1.5 ns per unit (re-measured 2026-09-05 after the base plane and the 64-bit timestamps; 12 ns before the time-budgeted slices) |
 | Destroy slice under the shard's step budget (6,958 ns from the profile) | | | p50 7,083 ns, p99 8,167 ns, longest 24,042 ns | AC-1.8: 0 slices past budget + 16-unit clock-check allowance (6,000 ns) + measured scheduling jitter (16,500 ns); 0 ns of the longest inside `dealloc` |
 | Create burst of 190,000 files (T-1.7), best of 3 | | 1,050 ns per file | | all runs 1,050, 1,053, 1,088 ns; 469 heap bytes per file |
 
@@ -204,6 +204,38 @@ between requests, with the allocator out of the picture. The remaining cost in t
 is the op-log record and its path string, which §4.16's deriver will read; the readdir rows
 already borrow their names.
 
+## Phase 1 baseline: the base plane (2026-09-05)
+
+Environment: as above (Apple M5 Max, macOS 26.4.1 on APFS, Rust 1.98.0, release profile).
+Command: `cargo run --release -p slates-base --example base_bench` (500 ms budget per row; 95%
+bootstrap intervals). The directory under test is this workspace's own `target/debug/deps`
+(44,602 entries after `cargo test --workspace`), read only; the copy-up rows run an overlay
+volume over `target/debug` (a dozen entries) so a sample pays the copy-up, not a listing.
+
+| Operation | Median | Interval | Notes |
+|---|---|---|---|
+| List a 44,602-entry directory, per entry (`getdents` plus one `statat` per entry) | 3,337 ns | [3,332, 3,809] | informational (the directory's size follows the build); a whole listing is about 150 ms and is cached until the directory's fingerprint moves |
+| Fingerprint a directory (`fstat` of its descriptor) | 218 ns | [213, 218] | paid once per lookup or read of an untouched entry |
+| Open and `fstat` a file, then close (the drift check) | 7,250 ns | [6,958, 7,583] | |
+| `pread` up to 4 KiB | 260 ns | [260, 260] | |
+| Copy up a small-class file (up to 4 KiB) on its first write | 30,542 ns | [29,834, 31,416] | volume create, the listing, open, `fstat`, read, BLAKE3, witness, the write |
+| Copy up a large-class file, one window, on its first write | 6,768,875 ns | [6,751,875, 6,793,916] | informational; the file is 5,572,600 bytes and the witness hashes it whole, so the row is the hash and the read of the file, proportional to its size (D-6's tripwire) |
+
+Measured on the way (2026-09-05): the 128-bit timestamps the inode and the fingerprint
+carried cost 32 bytes per inode; as 64-bit nanoseconds (good to the year 2262, saturating) the
+inode is 264 bytes and the heap per file at 10^6 files fell from 468 to 418 bytes even after
+the deriver's 24-byte home was added. The destroy gate (AC-1.8) now excludes slices during
+which the process's involuntary context-switch count moved (`getrusage`): in two runs the
+scheduler preempted two and three slices of about 25 µs each, and every other slice sat within
+the budget plus the clock-check allowance (longest 8.8 µs and 6.5 µs against budgets of 6.7 µs
+and 2.5 µs).
+
+What it means: an overlay volume pays a directory `fstat` per untouched lookup, a listing per
+directory it enters (once, until the directory changes), about thirty microseconds to copy a
+small file up, and a hash of the whole file for a large one. The per-entry `statat` is the
+listing's cost on macOS; `getattrlistbulk` is the bulk call the design names for this platform
+and its gain is an owed measurement (GAPS §8c).
+
 ## Ratchets (2026-09-05)
 
 `ratchets.toml` holds the ceilings for this machine (identity `4c62b34d5f545407`, the Apple M5
@@ -225,6 +257,13 @@ The gate caught a real one on 2026-09-05: the first unsafe-reduction commit rais
 from about 30 ns (ceiling 34) to 37–45 ns, the cost of a `RefCell` borrow per phase and a
 control-channel poll per step. Recovered without unsafe (one borrow before the polls and one
 after, the registry entry cached, the channel polled only behind a pending flag): 22–30 ns.
+
+The rule gained a condition on 2026-09-05: a ceiling tightens only when the improvement is
+larger than the row's own between-run drift. Before that, three rows tightened by a cold run
+"regressed" by 1-5% on warm runs, one of them in the memory crate, untouched since Phase 0
+(the buddy split-and-coalesce row: 71 ns recorded, then 72-75 ns in every run). The baseline
+was reset under the new rule (60 gated rows, 10 informational, 0 regressions); the facts the
+old ceilings had recorded are kept in the file's header.
 
 The Phase 1 record run (2026-09-05, `cargo xtask ratchet --tighten`) added 41 volume rows
 (`vfs.*`) and tightened five wire rows; the two destroy-slice rows (p99 and longest) are

@@ -391,8 +391,33 @@ pub fn derive(vol: &Volume, store: &Store, base: SnapshotId) -> Result<OpsDocume
   };
   d.fold(&records);
   let mut doc = OpsDocument::default();
-  for path in &d.touched {
-    d.classify_path(path, &mut doc)?;
+  let mut classified: BTreeSet<String> = BTreeSet::new();
+  for path in d.touched.clone() {
+    d.classify_once(&path, &mut doc, &mut classified)?;
+  }
+  // Entries beneath a created or renamed directory were journaled under old names or not at
+  // all (a directory created empty and filled later, then moved); the head's subtree says
+  // what is there now. What moved unchanged with a renamed parent is skipped: the rename
+  // carries it.
+  let mut queue: Vec<(String, Option<String>)> = doc
+    .dirs_created
+    .iter()
+    .map(|p| (p.to_string(), None))
+    .chain(
+      doc
+        .dirs_renamed
+        .iter()
+        .map(|(from, to)| (to.to_string(), Some(from.to_string()))),
+    )
+    .collect();
+  while let Some((head_dir, base_dir)) = queue.pop() {
+    d.walk_subtree(
+      &head_dir,
+      base_dir.as_deref(),
+      &mut doc,
+      &mut classified,
+      &mut queue,
+    )?;
   }
   doc.dirs_renamed.sort();
   let sources: Vec<Box<str>> = doc
@@ -402,9 +427,90 @@ pub fn derive(vol: &Volume, store: &Store, base: SnapshotId) -> Result<OpsDocume
     .collect();
   doc.dirs_removed.retain(|p| !sources.contains(p));
   doc.dirs_created.sort();
+  doc.dirs_created.dedup();
   doc.dirs_removed.sort();
+  doc.dirs_removed.dedup();
   doc.removed.sort();
+  doc.removed.dedup();
   doc.symlinks.sort_by(|a, b| a.path.cmp(&b.path));
   doc.files.sort_by(|a, b| a.path.cmp(&b.path));
   Ok(doc)
+}
+
+impl Deriver<'_> {
+  /// Classifies a path once.
+  fn classify_once(
+    &self,
+    path: &str,
+    doc: &mut OpsDocument,
+    classified: &mut BTreeSet<String>,
+  ) -> Result<(), VfsError> {
+    if classified.insert(path.to_owned()) {
+      self.classify_path(path, doc)?;
+    }
+    Ok(())
+  }
+
+  /// One level of a head subtree: every entry is classified unless it moved unchanged with a
+  /// renamed parent (`base_dir` is the parent's base path then); subdirectories queue up.
+  fn walk_subtree(
+    &self,
+    head_dir: &str,
+    base_dir: Option<&str>,
+    doc: &mut OpsDocument,
+    classified: &mut BTreeSet<String>,
+    queue: &mut Vec<(String, Option<String>)>,
+  ) -> Result<(), VfsError> {
+    let Ok(located) = self.vol.resolve(self.store, head_dir) else {
+      return Ok(());
+    };
+    let Child::Dir(dir) = located.child else {
+      return Ok(());
+    };
+    let rows: Vec<(String, Child, InodeNo)> = self
+      .vol
+      .readdir(self.store, dir)?
+      .iter()
+      .map(|r| {
+        let child = match r.kind {
+          crate::inode::Kind::Dir => Child::Whiteout,
+          crate::inode::Kind::File => Child::File(r.inode),
+          crate::inode::Kind::Symlink => Child::Symlink(r.inode),
+        };
+        (r.name.to_owned(), child, r.inode)
+      })
+      .collect();
+    for (name, child, no) in rows {
+      let head_path = format!("{}/{name}", head_dir.trim_end_matches('/'));
+      let base_path = base_dir.map(|b| format!("{}/{name}", b.trim_end_matches('/')));
+      match child {
+        Child::Whiteout => {
+          // A subdirectory: moved with its parent when its base path is the parent's
+          // counterpart, else created or renamed on its own.
+          let own = self.vol.path_of_dir_in(self.store, self.base, no);
+          if own.is_some() && own == base_path {
+            queue.push((head_path, base_path));
+          } else {
+            self.classify_once(&head_path, doc, classified)?;
+            let mapping = own.filter(|p| p != &head_path);
+            queue.push((head_path, mapping));
+          }
+        }
+        Child::File(_) | Child::Symlink(_) => {
+          let unchanged = base_path.as_deref().is_some_and(|bp| {
+            !self.maps.contains_key(&no)
+              && self
+                .vol
+                .resolve_in(self.store, self.base, bp)
+                .is_ok_and(|l| l.inode == no)
+          });
+          if !unchanged {
+            self.classify_once(&head_path, doc, classified)?;
+          }
+        }
+        Child::Dir(_) => {}
+      }
+    }
+    Ok(())
+  }
 }

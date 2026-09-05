@@ -10,7 +10,7 @@
 //! Why not a map from the standard library: its nodes come from the global allocator, and the
 //! Phase 1 bench measured destroying a 10^6-file tree spending 2.5 ms inside `dealloc` twice
 //! (the allocator returning pages), which no slice budget can hide (2026-09-05, `cargo run
-//! --release -p slates-vfs --example bench`). Slab slots are never returned per item.
+//! --release -p slates-vfs --example vfs_bench`). Slab slots are never returned per item.
 //!
 //! The design's hash side index is not built: the leading key word is the hash, so the descent
 //! already probes by hash, and the measured lookup (104 ns) is the fold and the compare, not

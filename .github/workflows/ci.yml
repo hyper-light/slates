@@ -43,6 +43,9 @@ jobs:
       - name: AC-1.2 differential suite against tmpfs (Linux)
         if: runner.os == 'Linux'
         run: SLATES_TEST_RAMDIR=/dev/shm PROPTEST_CASES=2000 cargo test -p slates-vfs --release --test differential -- --nocapture
+      - name: Host semantics over tmpfs (Linux)
+        if: runner.os == 'Linux'
+        run: SLATES_TEST_RAMDIR=/dev/shm cargo test -p slates-base --test host -- --nocapture
       # The ratchet skips loudly on a machine with no recorded baseline (shared runners have
       # none); on a reference machine with an entry in ratchets.toml it fails on a regression.
       - name: Ratchet
