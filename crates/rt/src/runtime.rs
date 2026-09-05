@@ -36,37 +36,63 @@ pub struct RuntimeConfig {
   pub batch: usize,
   /// Whether to pin shard threads to cores.
   pub pin: bool,
+  /// The core ids shard threads are pinned to, in shard order (empty: the OS chooses).
+  pub cores: Vec<u32>,
   /// The base page in bytes, for sizing the task slab's segments.
   pub page_bytes: usize,
+  /// How long an idle shard spins checking its rings before parking, while a client is active
+  /// (the 2-competitive bound: the measured wake cost).
+  pub spin_ns: u64,
 }
 
 impl RuntimeConfig {
-  /// A configuration from the profile: tick, step budget and ring size from its derived
-  /// constants; the task and timer limits from the caller's measurements.
+  /// A configuration from the profile: the shard count and their cores from the core classes,
+  /// the tick, step budget, spin window and ring size from the derived constants, and the batch
+  /// bound calibrated against `latency_budget_ns` (see [`RuntimeConfig::calibrate_batch`]). The
+  /// task and timer limits come from the caller's measurements (Little's law, [`admission_limit`]).
   pub fn from_profile(
     profile: &MachineProfile,
-    shards: u16,
     tasks_per_shard: usize,
     timers_per_shard: usize,
+    latency_budget_ns: u64,
   ) -> Self {
     let d = profile.derived();
     let ring_entries = usize::try_from(d.ring_entries.get()).unwrap_or(usize::MAX);
-    Self {
-      shards,
+    let (shards, cores) = shard_cores(profile);
+    let mut config = Self {
+      shards: shards.get(),
       tasks_per_shard,
       timers_per_shard,
       ring_entries,
       step_budget_ns: d.task_step_budget_ns.get(),
       timer_tick_ns: d.timer_tick_ns.get(),
-      batch: derived!(
-        ring_entries,
-        "one inbound ring per phase until the per-item cost is measured (§4.3)",
-        ["rt.ring_entries"]
-      )
-      .get(),
+      batch: ring_entries,
       pin: true,
+      cores,
       page_bytes: usize::try_from(profile.facts.page.base).unwrap_or(1),
-    }
+      spin_ns: d.spin_before_park_ns.get(),
+    };
+    config.batch = config.calibrate_batch(latency_budget_ns).get();
+    config
+  }
+
+  /// The batch bound: the latency budget divided by the measured cost of one loop item (a task
+  /// poll of a trivial future through the whole loop), measured here and now on a simulated
+  /// shard, so the bound is never a guess (§4.3, "batch bound = latency budget / measured
+  /// per-item cost").
+  pub fn calibrate_batch(&self, latency_budget_ns: u64) -> Derived<usize> {
+    let per_item_ns = measured_item_cost_ns(self);
+    derived!(
+      usize::try_from(latency_budget_ns / per_item_ns.max(1))
+        .unwrap_or(usize::MAX)
+        .clamp(1, self.ring_entries.max(1)),
+      "latency budget / measured per-item loop cost, clamped to [1, ring entries]",
+      [
+        "rt.latency_budget_ns",
+        "rt.item_cost_ns (measured at start)",
+        "rt.ring_entries"
+      ]
+    )
   }
 
   /// Task slots per slab segment: one base page of slots.
@@ -78,6 +104,60 @@ impl RuntimeConfig {
     )
     .get()
   }
+}
+
+/// The shard count and the cores they pin to: every core of the fastest class the OS reports,
+/// less one kept for the control shard and the OS (§4.3 "Shards = performance cores"; the design's
+/// worked example: 6 Super cores give 5 shards); at least one shard.
+pub fn shard_cores(profile: &MachineProfile) -> (Derived<u16>, Vec<u32>) {
+  let best_level = profile
+    .facts
+    .cores
+    .iter()
+    .map(|c| c.level)
+    .min()
+    .unwrap_or(0);
+  let mut cores: Vec<u32> = profile
+    .facts
+    .cores
+    .iter()
+    .filter(|c| c.level == best_level)
+    .map(|c| c.id)
+    .collect();
+  if cores.len() > 1 {
+    cores.remove(0);
+  }
+  let count = u16::try_from(cores.len()).unwrap_or(u16::MAX).max(1);
+  (
+    derived!(
+      count,
+      "cores of the fastest class minus one for control, at least one",
+      ["cores.class", "cores.level"]
+    ),
+    cores,
+  )
+}
+
+/// Measures the cost of one loop item on a simulated shard: spawn a trivial task, run it to
+/// completion, reap it. The simulation driver has no OS resources, so this costs microseconds.
+fn measured_item_cost_ns(config: &RuntimeConfig) -> u64 {
+  let probe = RuntimeConfig {
+    shards: 1,
+    ..config.clone()
+  };
+  let Ok(mut sim) = crate::sim::SimRuntime::new(&probe, 0) else {
+    return 1;
+  };
+  let shard = sim.shard_ids().first().copied();
+  let Some(shard) = shard else { return 1 };
+  let started = std::time::Instant::now();
+  /// Shape: enough items to amortize the clock reads (two per batch) below one percent.
+  const ITEMS: u64 = 4096;
+  for _ in 0..ITEMS {
+    let _ = sim.spawn_on(shard, async {});
+    sim.run_until_idle();
+  }
+  u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX) / ITEMS
 }
 
 /// Little's law: the tasks in flight at a measured request rate and p99 service time.
@@ -144,12 +224,15 @@ impl Runtime {
     connect_pairs(&mut contexts, &ids)?;
     let mut threads = Vec::new();
     for (index, ctx) in contexts.into_iter().enumerate() {
-      let pin = config.pin;
-      let core = u32::try_from(index).unwrap_or(0);
+      let core = if config.pin {
+        config.cores.get(index).copied()
+      } else {
+        None
+      };
       let thread = std::thread::Builder::new()
         .name(format!("slates-shard-{}", ctx.id))
         .spawn(move || {
-          if pin {
+          if let Some(core) = core {
             let _ = slates_machine::probes::pin_current_thread(core);
           }
           ctx.run();
@@ -182,6 +265,11 @@ impl Runtime {
   pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(&self, shard: ShardId, future: F) {
     let request = Box::new(SpawnRequest::new(Box::pin(future), None));
     registry::send_foreign(shard.0, Msg::Spawn(request).into_word());
+  }
+
+  /// Tells a shard whether a client is active, which enables the idle spin before parking.
+  pub fn set_active(&self, shard: ShardId, active: bool) {
+    registry::send_foreign(shard.0, Msg::Active(active).into_word());
   }
 
   /// Requests a task's cancellation from any thread.

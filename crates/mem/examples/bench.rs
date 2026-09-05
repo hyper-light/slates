@@ -12,6 +12,13 @@ use slates_mem::slab::Slab;
 
 fn report(name: &str, m: Measurement) {
   println!(
+    "ratchet\t{}\t{}\t{}\t{}",
+    key(name),
+    m.interval.lower,
+    m.median_ns(),
+    m.interval.upper
+  );
+  println!(
     "{name}: median {} ns [{}, {}] p99 {} ns, {} samples × batch {}{}",
     m.median_ns(),
     m.interval.lower,
@@ -21,6 +28,16 @@ fn report(name: &str, m: Measurement) {
     m.batch,
     if m.quick { " (quick)" } else { "" }
   );
+}
+
+/// The ratchet key of a row: `mem.` plus the row's name in snake case, whole, so two rows
+/// that share their first words stay distinct.
+fn key(name: &str) -> String {
+  let words: Vec<&str> = name
+    .split(|c: char| !c.is_ascii_alphanumeric())
+    .filter(|w| !w.is_empty())
+    .collect();
+  format!("mem.{}", words.join("_").to_ascii_lowercase())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

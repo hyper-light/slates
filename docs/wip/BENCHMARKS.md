@@ -96,13 +96,24 @@ terminal completion and the shard exits; a finishing parent cancels and joins it
 OS shards wake each other through the pair rings and the kick (`tests/cross_shard.rs`); 10,000
 timers with random deadlines fire in order within one tick.
 
+Idle spin (2026-09-05, the same command): with a client active a shard spins for the profile's
+window (the measured wake p50, 1.3 µs here) before parking.
+
+| Operation | Median | Interval | p99 |
+|---|---|---|---|
+| Cross-shard wake round trip, two tasks waking each other through the pair rings, both shards parking | 6.25 µs | [6.25, 6.25] | 8.2 µs |
+| The same with both shards spinning (514 hits, 4 misses in 2,000 rounds) | 500 ns | [500, 541] | 708 ns |
+| Foreign spawn and channel reply with the shard spinning (the bench thread's own hop exceeds the window: 0 hits) | 6.1 µs | [5.8, 6.4] | 7.6 µs |
+
 What it means: the shard loop's fixed cost is below a cache miss and a task's whole life is under
 two hundred nanoseconds, so the fifty-microsecond provisioning budget of §1.1 is spent elsewhere
-(the IPC and the bridge). Two measured OS facts shape Phase 1: a `kevent` poll costs fifteen
-microseconds on this macOS, so the idle loop never polls the driver when it knows nothing is
-pending (the `has_pending` seam), and a kernel timeout wake lands about one wheel tick late,
-which is what the idle-spin window of §4.3 (spin for the measured wake cost before parking) is
-for; it is a Phase 1 item once a "client active" signal exists.
+(the IPC and the bridge). A cross-shard wake is one cache-line handoff plus the kick, as §4.3's
+worked example says, and the spin removes the kick: twelve times faster between active shards.
+Two measured OS facts shape Phase 1: a `kevent` poll costs fifteen microseconds on this macOS, so
+the idle loop never polls the driver when it knows nothing is pending (the `has_pending` seam),
+and a kernel timeout wake lands about one wheel tick late, which the spin absorbs for deadlines
+inside the window. The spin is worth nothing to a peer slower than the window (the channel row),
+which is why it is gated on a client being active rather than always on.
 
 ## Phase 0 baseline: wire (2026-09-04)
 
@@ -133,3 +144,32 @@ check, against a fifty-microsecond provisioning budget; the encode side's two al
 obvious Phase 1 trim (encode into the ring's slot, as §4.7 has it). CRC32C at 6 GB/s is the
 single-chain rate of the instruction; a three-way interleave would raise it and Phase 7 measures
 whether the bulk path needs it, though bulk carries the BLAKE3 identity instead (§4.9).
+
+## Ratchets (2026-09-05)
+
+`ratchets.toml` holds the ceilings for this machine (identity `4c62b34d5f545407`, the Apple M5
+Max above): 22 rows, each the highest upper interval edge across three runs of its bench
+example. `cargo xtask ratchet` runs each example three more times and fails when a row's lowest
+lower edge lies above its ceiling, so a regression must clear every recorded run to count; the
+planted ceiling of 1 ns on the slab row was reported as a regression before the file was
+restored. Ceilings only tighten (`--tighten`); `--reset` rebuilds the entry and is a deliberate
+act; a raised ceiling is an edit with a reason in the file.
+
+Between-run drift on this laptop, from the record run (the medians of the three runs):
+
+| Row | Run medians | Drift |
+|---|---|---|
+| Slab insert+remove | 13, 13, 13 ns | 0 |
+| Buddy alloc+free, one page | 56, 56, 56 ns | 0 |
+| Ring round trip, two threads | 354, 349, 349 ns | 1.4% |
+| Cross-shard wake, both parking | 6292, 6250, 6250 ns | 0.7% |
+| Cross-shard wake, both spinning | 500, 459, 584 ns | 27% |
+| One local wake | 208, 250, 177 ns | 41% |
+| Spawn and run a trivial task | 132, 156, 112 ns | 39% |
+| CRC32C over 1 MiB | 152, 137, 124 µs | 23% |
+| Header encode | 2, 2, 1 ns | one step (nanosecond quantization) |
+
+What it means: the wall clock on a laptop resolves a regression of a few percent on the
+microsecond rows and only a large one on the nanosecond rows, because the machine itself moves
+that much between processes. The design's instruction-count gate (D-20) is what sees the small
+change; it waits on valgrind (GAPS §8a).

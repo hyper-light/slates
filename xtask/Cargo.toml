@@ -10,6 +10,10 @@ description = "Workspace tasks: the structural test (R1/R2 by construction) and 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The ratchet task keys ceilings by the machine identity the profile computes.
+slates-machine = { workspace = true }
+# ratchets.toml is read and rewritten by the ratchet task.
+toml = { workspace = true }
 
 # xtask is a development tool, not shipped code: it reads sources and runs cargo, so the
 # workspace lints that forbid std::fs and panics are relaxed here, with the reasons in main.rs.

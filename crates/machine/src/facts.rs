@@ -660,6 +660,8 @@ mod platform {
     // SAFETY: `info` is a writable sysinfo struct.
     let rc = unsafe { libc::sysinfo(&raw mut info) };
     let unit = u64::from(info.mem_unit).max(1);
+    // c_ulong is u32 on i686 and u64 elsewhere; the conversion is for the former.
+    #[allow(clippy::useless_conversion)]
     let (total, free) = if rc == 0 {
       (
         u64::from(info.totalram).saturating_mul(unit),

@@ -1,0 +1,37 @@
+# Performance ratchets (design R4, Part 6; Phase 0 task 7).
+#
+# A ceiling is the upper edge of the 95% bootstrap interval of the best of N runs on the machine
+# named by the identity hash below; `cargo xtask ratchet` re-runs the benches and fails when a
+# row's best lower edge lies above its ceiling (the two intervals no longer overlap, so the
+# regression is distinguishable from noise). Ceilings only tighten: `cargo xtask ratchet --tighten`
+# lowers them to a better run; raising one is a deliberate edit that names its reason here.
+# A machine with no entry skips loudly; `cargo xtask ratchet --record` writes its first baseline.
+
+[machine.4c62b34d5f545407]
+identity = "Apple M5 Max | macOS 26.4.1 (25E253) | aarch64 | 18 cores | 137438953472 bytes | 16384 page"
+recorded = "2026-09-05"
+runs = 3
+
+[machine.4c62b34d5f545407.ceilings]
+"mem.buddy_alloc_free_64_pages_split_and_coalesce" = 70
+"mem.buddy_alloc_free_one_page" = 56
+"mem.slab_insert_remove_64_byte_slot" = 13
+"mem.spsc_ring_round_trip_between_two_threads" = 354
+"rt.cross_shard_wake_round_trip_with_both_shards_parking" = 6292
+"rt.cross_shard_wake_round_trip_with_both_shards_spinning" = 584
+"rt.foreign_spawn_and_reply_with_the_shard_spinning_before_it_parks" = 6500
+"rt.foreign_spawn_onto_a_shard_thread_and_a_reply_over_a_channel_ring_kick_poll_send" = 4000
+"rt.one_local_wake_a_task_yields_once_and_resumes" = 250
+"rt.one_step_with_nothing_to_do" = 34
+"rt.one_zero_timeout_park_in_the_os_driver" = 14667
+"rt.run_until_idle_with_nothing_to_do" = 38
+"rt.spawn_a_trivial_task_and_detach_it_without_running_admission_only" = 25
+"rt.spawn_one_trivial_task_and_run_it_to_completion" = 158
+"rt.timer_lateness_p99" = 105500
+"wire.body_decode_sample" = 102
+"wire.body_encode_sample_into_a_reused_buffer" = 9
+"wire.crc32c_1mib" = 152458
+"wire.frame_decode_checks_crc32c_schema_word_body_bytes_copied" = 35
+"wire.frame_encode_header_schema_word_body_crc32c" = 260
+"wire.header_decode" = 2
+"wire.header_encode_32_bytes" = 2

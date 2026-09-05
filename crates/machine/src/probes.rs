@@ -409,7 +409,9 @@ pub fn hash(bytes: u64, budget: Duration) -> HashThroughput {
 
 /// Measures LZ4 and zstd at each candidate level over a synthetic corpus of `bytes`: half
 /// text-like (words drawn by a seeded generator) and half incompressible, so both ends of the
-/// cost model's input space are represented.
+/// cost model's input space are represented. Without the `codecs` feature the list is empty and
+/// the profile's notes say so.
+#[cfg(feature = "codecs")]
 pub fn codecs(bytes: u64, budget: Duration) -> Vec<CodecPoint> {
   let corpus = corpus(usize::try_from(bytes).unwrap_or(0));
   let points = 1 + ZSTD_LEVELS.len();
@@ -422,6 +424,13 @@ pub fn codecs(bytes: u64, budget: Duration) -> Vec<CodecPoint> {
   out
 }
 
+/// The codec probe when the codecs were not compiled in.
+#[cfg(not(feature = "codecs"))]
+pub fn codecs(_bytes: u64, _budget: Duration) -> Vec<CodecPoint> {
+  Vec::new()
+}
+
+#[cfg(feature = "codecs")]
 fn lz4_point(corpus: &[u8], budget: Duration) -> CodecPoint {
   let compressed = lz4_flex::block::compress_prepend_size(corpus);
   let compress = measure(
@@ -441,6 +450,7 @@ fn lz4_point(corpus: &[u8], budget: Duration) -> CodecPoint {
   point("lz4", 0, corpus, &compressed, compress, decompress)
 }
 
+#[cfg(feature = "codecs")]
 fn zstd_point(corpus: &[u8], level: i32, budget: Duration) -> CodecPoint {
   let compressed = zstd::bulk::compress(corpus, level).unwrap_or_default();
   let compress = measure(
@@ -458,7 +468,7 @@ fn zstd_point(corpus: &[u8], level: i32, budget: Duration) -> CodecPoint {
   );
   point("zstd", level, corpus, &compressed, compress, decompress)
 }
-
+#[cfg(feature = "codecs")]
 fn point(
   codec: &str,
   level: i32,
@@ -825,11 +835,12 @@ mod platform {
   use std::time::Duration;
   use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
   use windows_sys::Win32::System::Memory::{
-    GetProcessWorkingSetSize, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
-    VirtualFree, VirtualLock, VirtualUnlock,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualLock,
+    VirtualUnlock,
   };
   use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, GetCurrentThread, SetEvent, SetThreadAffinityMask,
+    CreateEventW, GetCurrentProcess, GetCurrentThread, GetProcessWorkingSetSize, SetEvent,
+    SetThreadAffinityMask,
   };
 
   fn event() -> HANDLE {
@@ -1017,6 +1028,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(feature = "codecs")]
   fn hashing_and_codecs_report_throughput_and_a_ratio_between_the_halves() {
     let h = hash(64 * 1024, short());
     assert!(h.blake3_bytes_per_second > 0, "{h:?}");

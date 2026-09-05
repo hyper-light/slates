@@ -12,7 +12,7 @@ rust-version = "1.98"
 readme = "README.md"
 
 [workspace.dependencies]
-slates-machine = { path = "crates/machine", version = "0.1.0" }
+slates-machine = { path = "crates/machine", version = "0.1.0", default-features = false }
 slates-mem = { path = "crates/mem", version = "0.1.0" }
 slates-rt = { path = "crates/rt", version = "0.1.0" }
 slates-wire = { path = "crates/wire", version = "0.1.0" }
@@ -29,6 +29,7 @@ windows-sys = { version = "0.60", features = [
   "Win32_System_Power",
   "Win32_System_Performance",
   "Win32_System_IO",
+  "Win32_Security",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -44,6 +45,8 @@ quote = "1"
 proc-macro2 = "1"
 # Compile-fail tests for the derive's refusals (dev only).
 trybuild = "1"
+# ratchets.toml (dev only, in xtask).
+toml = "0.8"
 
 # Lints are the enforcement of Part 0's rules, not a style preference. Every crate opts in
 # with `[lints] workspace = true`. Allowed exceptions live in clippy.toml with their reason.

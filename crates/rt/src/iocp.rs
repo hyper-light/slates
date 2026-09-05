@@ -20,11 +20,19 @@ const NOP_KEY: usize = usize::MAX - 1;
 const EVENTS_PER_WAIT: usize = 64;
 
 /// The driver.
-#[derive(Debug)]
 pub struct IocpDriver {
   port: HANDLE,
   epoch: Instant,
   entries: Vec<OVERLAPPED_ENTRY>,
+}
+
+impl std::fmt::Debug for IocpDriver {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("IocpDriver")
+      .field("port", &self.port)
+      .field("entries", &self.entries.len())
+      .finish()
+  }
 }
 
 impl IocpDriver {

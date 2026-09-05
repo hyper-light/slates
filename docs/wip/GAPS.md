@@ -153,17 +153,29 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
   are no-ops, so nothing is lost. Revisit when it stabilizes (a `ContextBuilder` change only).
 - io-uring crate 0.7.14 (tokio-rs): thin syscall wrapper, no reference counting in its core types;
   adopted for the Linux driver with the probe-and-fall-back sequence of D-9.
-- Miri: ships only with nightly, which this machine does not have; CI's `miri-and-loom` lane runs
-  it on nightly for the `slates-mem` and `slates-wire` unit tests (`slates-rt`'s unit tests open a
-  kqueue or an eventfd, which Miri does not model; its simulation-driver tests are the candidates
-  for a later Miri run). Local runs are loom-only.
-- Ratchets (Phase 0 task 7): BENCHMARKS.md records every baseline with its interval on the M5 Max;
-  the ratchet that fails CI on a regression needs the reference machines of Phase 1 (CI runners
-  are shared and unpinned, so a number measured there is not a ratchet). Until then a regression is
-  caught by re-running the three bench examples and comparing by hand, which the phase's exit
-  criteria name.
-- Windows: the IOCP driver, the section-backed profile segment and the Win32 facts compile only in
-  CI's nightly-cadence Windows lane; nothing on Windows has run yet.
+- Miri: ships only with nightly, which this machine does not have. Installing nightly is a tool
+  install and needs Ada's explicit authorization (asked 2026-09-05); until then CI's
+  `miri-and-loom` lane runs it on nightly for the `slates-mem` and `slates-wire` unit tests
+  (`slates-rt`'s unit tests open a kqueue or an eventfd, which Miri does not model). Local runs
+  are loom-only.
+- Instruction-count gates (D-20, "iai-callgrind in CI"): iai-callgrind needs valgrind, which is
+  non-Rust tooling and therefore banned from CI and this machine without Ada's explicit
+  authorization (asked 2026-09-05). The ratchet that exists is `cargo xtask ratchet`
+  (`ratchets.toml`): wall-time ceilings keyed by machine identity, hierarchical over runs the
+  way Kalibera and Jones prescribe (a ceiling is the highest upper edge across three runs; a
+  check fails only when the lowest lower edge across three fresh runs lies above it), tightening
+  only; 22 rows recorded on the M5 Max on 2026-09-05 and proven to fail on a planted ceiling.
+  Its resolution is the machine's between-run drift, which it prints: on this laptop up to 40%
+  on rows under 100 ns (frequency and thermal state between processes) and a full step on the
+  1–2 ns header rows (nanosecond quantization), under 3% on rows above a microsecond. That is
+  the case for the instruction-count gate: it sees a 1% change the wall clock cannot.
+- Cross-target checks: the four shipped crates lint clean for `x86_64-unknown-linux-gnu` and
+  `x86_64-pc-windows-msvc` from this machine (the targets were installed; the C dependencies are
+  off for those checks behind `slates-machine`'s `codecs` and `pure-hash` features), and CI's
+  `cross-lint` lane repeats it. This caught two real defects on 2026-09-05: three Windows imports
+  behind an unrequested `Win32_Security` feature and a working-set call in the wrong module.
+  Nothing on Windows or Linux has *run* yet: that needs those machines (Phase 1's reference
+  boxes).
 
 ## 9. Blocking order toward first light
 

@@ -17,13 +17,22 @@ use crate::error::RtError;
 const KICK_TAG: u64 = u64::MAX;
 
 /// The driver.
-#[derive(Debug)]
 pub struct UringDriver {
   ring: IoUring,
   efd: RawFd,
   epoch: Instant,
   notes: Vec<String>,
   multishot: bool,
+}
+
+impl std::fmt::Debug for UringDriver {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("UringDriver")
+      .field("efd", &self.efd)
+      .field("notes", &self.notes)
+      .field("multishot", &self.multishot)
+      .finish()
+  }
 }
 
 impl UringDriver {

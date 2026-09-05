@@ -101,6 +101,13 @@ impl<T: Copy> MpscRing<T> {
     }
   }
 
+  /// Whether no word is waiting (a racy read for spin loops; the consumer's `pop` is exact).
+  pub fn is_empty(&self) -> bool {
+    let head = self.head.0.load(Ordering::Acquire);
+    let slot = &self.slots[head & self.mask];
+    slot.sequence.load(Ordering::Acquire) != head.wrapping_add(1)
+  }
+
   /// The consumer half; there must be exactly one at a time.
   pub const fn consumer(&self) -> Consumer<'_, T> {
     Consumer { ring: self }

@@ -94,6 +94,12 @@ pub struct Counters {
   pub nested_borrows: u64,
   /// Admissions refused because the arena was full.
   pub admission_refused: u64,
+  /// Idle spins that ended with work arriving.
+  pub spin_hits: u64,
+  /// Idle spins that ran out and parked.
+  pub spin_misses: u64,
+  /// Idle spins ended by a timer falling due.
+  pub spin_deadlines: u64,
 }
 
 /// The mutable state behind the borrow flag.
@@ -119,6 +125,7 @@ pub struct ShardContext {
   current_task: Cell<Option<u32>>,
   borrowed: Cell<bool>,
   exited: Cell<bool>,
+  active: Cell<bool>,
   pair_full_events: Cell<u64>,
   inner: UnsafeCell<ShardInner>,
 }
@@ -165,6 +172,7 @@ impl ShardContext {
       current_task: Cell::new(None),
       borrowed: Cell::new(false),
       exited: Cell::new(false),
+      active: Cell::new(false),
       pair_full_events: Cell::new(0),
       inner: UnsafeCell::new(ShardInner {
         arena,
@@ -207,6 +215,27 @@ impl ShardContext {
   /// Whether the shard left its loop.
   pub fn exited(&self) -> bool {
     self.exited.get()
+  }
+
+  /// Whether a client is active (the idle spin is enabled).
+  pub fn active(&self) -> bool {
+    self.active.get()
+  }
+
+  /// Sets the active flag on this shard's thread (the runtime sends a message from elsewhere).
+  pub fn set_active(&self, active: bool) {
+    self.active.set(active);
+  }
+
+  /// Whether any inbound ring holds a word (a check without a syscall).
+  pub fn has_inbound(&self) -> bool {
+    if registry::entry(self.id).is_some_and(|e| !e.inbound.is_empty()) {
+      return true;
+    }
+    self.inbound.iter().any(|ring| {
+      // SAFETY: pair rings are leaked for the process; reading emptiness needs no exclusivity.
+      !unsafe { ring.as_ref() }.is_empty()
+    })
   }
 
   /// The task being polled on this shard right now.
@@ -392,7 +421,9 @@ impl ShardContext {
 
   // ------------------------------------------------------------------ the loop
 
-  /// Runs the loop on the calling thread until shutdown completes.
+  /// Runs the loop on the calling thread until shutdown completes. When idle and a client is
+  /// active, the shard spins for the configured window checking its rings before it parks: a
+  /// wake that lands during the spin costs a cache-line transfer instead of a kernel wake.
   pub fn run(&self) {
     registry::set_current(Some(NonNull::from(self)));
     loop {
@@ -400,16 +431,54 @@ impl ShardContext {
       if outcome.exit {
         break;
       }
-      if !outcome.did_work {
-        self.park(outcome.next_deadline_ns);
+      if outcome.did_work {
+        continue;
       }
+      if self.active.get() && self.spin_until_work(outcome.next_deadline_ns) {
+        continue;
+      }
+      self.park(outcome.next_deadline_ns);
     }
     registry::set_current(None);
     self.exited.set(true);
   }
 
+  /// Spins for the configured window watching the rings and the driver; true when something
+  /// arrived or a timer fell due during the spin (either is work for the next step), false when
+  /// the window ran out with nothing to do.
+  fn spin_until_work(&self, deadline_ns: Option<u64>) -> bool {
+    let (spin_ns, now) = self
+      .with_inner(|inner| (inner.config.spin_ns, inner.driver.now_ns()))
+      .unwrap_or((0, 0));
+    if spin_ns == 0 {
+      return false;
+    }
+    let spin_end = now.saturating_add(spin_ns);
+    loop {
+      if self.has_inbound()
+        || self
+          .with_inner(|inner| inner.driver.has_pending())
+          .unwrap_or(false)
+      {
+        self.with_inner(|inner| inner.counters.spin_hits += 1);
+        return true;
+      }
+      let now = self.now_ns();
+      if deadline_ns.is_some_and(|d| now >= d) {
+        self.with_inner(|inner| inner.counters.spin_deadlines += 1);
+        return true;
+      }
+      if now >= spin_end {
+        self.with_inner(|inner| inner.counters.spin_misses += 1);
+        return false;
+      }
+      std::hint::spin_loop();
+    }
+  }
+
   /// Steps until no task, timer or message is pending, parking for timers as needed; returns
-  /// when the shard is idle or has exited.
+  /// when the shard is idle or has exited. The driver is polled only when it may hold something
+  /// (a zero-timeout poll costs a syscall the idle path must not pay for nothing).
   pub fn run_until_idle(&self) {
     registry::set_current(Some(NonNull::from(self)));
     loop {
@@ -610,6 +679,7 @@ impl ShardContext {
         inner.shutting_down = true;
         cancel_all(&mut inner.arena, &self.local);
       }
+      Msg::Active(active) => self.active.set(active),
     }
   }
 

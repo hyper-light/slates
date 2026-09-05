@@ -14,7 +14,12 @@ const KIND_SHIFT: u32 = 62;
 const KIND_WAKE: u64 = 0;
 const KIND_SPAWN: u64 = 1;
 const KIND_CANCEL: u64 = 2;
-const KIND_SHUTDOWN: u64 = 3;
+/// Format: control words share kind 3: payload 0 = shutdown, 1 = inactive, 2 = active.
+const KIND_CONTROL: u64 = 3;
+/// Format: the control payloads.
+const CONTROL_SHUTDOWN: u64 = 0;
+const CONTROL_INACTIVE: u64 = 1;
+const CONTROL_ACTIVE: u64 = 2;
 /// Format: the payload mask (62 bits).
 const PAYLOAD_MASK: u64 = (1 << KIND_SHIFT) - 1;
 
@@ -29,6 +34,8 @@ pub enum Msg {
   Cancel(Encoded),
   /// Finish every task and exit the loop.
   Shutdown,
+  /// A client became active (true) or inactive (false): spin before parking while active.
+  Active(bool),
 }
 
 impl Msg {
@@ -42,7 +49,9 @@ impl Msg {
         (KIND_SPAWN << KIND_SHIFT) | (addr & PAYLOAD_MASK)
       }
       Msg::Cancel(e) => (KIND_CANCEL << KIND_SHIFT) | (e.word() & PAYLOAD_MASK),
-      Msg::Shutdown => KIND_SHUTDOWN << KIND_SHIFT,
+      Msg::Shutdown => (KIND_CONTROL << KIND_SHIFT) | CONTROL_SHUTDOWN,
+      Msg::Active(true) => (KIND_CONTROL << KIND_SHIFT) | CONTROL_ACTIVE,
+      Msg::Active(false) => (KIND_CONTROL << KIND_SHIFT) | CONTROL_INACTIVE,
     }
   }
 
@@ -63,7 +72,11 @@ impl Msg {
         Msg::Spawn(request)
       }
       KIND_CANCEL => Msg::Cancel(Encoded::from_word(payload)),
-      KIND_SHUTDOWN => Msg::Shutdown,
+      KIND_CONTROL => match payload {
+        CONTROL_ACTIVE => Msg::Active(true),
+        CONTROL_INACTIVE => Msg::Active(false),
+        _ => Msg::Shutdown,
+      },
       _ => Msg::Wake(Encoded::from_word(payload)),
     }
   }

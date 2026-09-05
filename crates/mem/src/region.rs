@@ -145,6 +145,30 @@ impl Drop for Region {
   }
 }
 
+/// Whether huge pages pay on this machine: the profile measured a transparent-huge-page region
+/// faulting cheaper per base page than base pages do (Linux only; elsewhere the OS offers none).
+pub fn huge_pages_beneficial(
+  profile: &slates_machine::MachineProfile,
+) -> slates_machine::Derived<bool> {
+  let base = profile.faults.base_ns.max(1);
+  slates_machine::derived!(
+    profile.faults.huge_ns.is_some_and(|huge| huge < base),
+    "huge-page fault cost per base page < base-page fault cost",
+    ["faults.huge_ns", "faults.base_ns"]
+  )
+}
+
+impl Region {
+  /// Maps a region with the page facts and the huge-page decision taken from the profile.
+  pub fn map_for_profile(
+    len: usize,
+    profile: &slates_machine::MachineProfile,
+  ) -> Result<Region, MemError> {
+    let page = usize::try_from(profile.facts.page.base).unwrap_or(1);
+    Region::map(len, page, huge_pages_beneficial(profile).get())
+  }
+}
+
 /// What the OS reports as locked for this process, for the AC-0.5 cross-check (the query
 /// lives in `slates-machine`, the crate allowed to read the kernel's pseudo-files).
 pub fn os_locked_bytes() -> Option<u64> {
@@ -219,10 +243,12 @@ mod os {
   use std::ffi::c_void;
   use std::ptr::NonNull;
   use windows_sys::Win32::System::Memory::{
-    GetProcessWorkingSetSize, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
-    SetProcessWorkingSetSize, VirtualAlloc, VirtualFree, VirtualLock, VirtualUnlock,
+    MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualLock,
+    VirtualUnlock,
   };
-  use windows_sys::Win32::System::Threading::GetCurrentProcess;
+  use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetProcessWorkingSetSize, SetProcessWorkingSetSize,
+  };
 
   pub(super) fn map(len: usize) -> Result<NonNull<u8>, MemError> {
     // SAFETY: a fresh committed read/write region; the result is checked.
@@ -301,6 +327,25 @@ mod tests {
     assert_eq!(r.numa_node(), 0);
     r.set_numa_node(1);
     assert_eq!(r.numa_node(), 1);
+  }
+
+  #[test]
+  fn the_huge_page_decision_follows_the_measured_fault_costs() {
+    let options = slates_machine::ProfileOptions {
+      budget_per_probe: std::time::Duration::from_millis(20),
+      codecs: false,
+      core_matrix: false,
+    };
+    let mut profile = slates_machine::MachineProfile::measure(options);
+    profile.faults.base_ns = 1000;
+    profile.faults.huge_ns = Some(100);
+    assert!(huge_pages_beneficial(&profile).get());
+    profile.faults.huge_ns = Some(1000);
+    assert!(!huge_pages_beneficial(&profile).get());
+    profile.faults.huge_ns = None;
+    assert!(!huge_pages_beneficial(&profile).get());
+    let r = Region::map_for_profile(1, &profile).unwrap();
+    assert_eq!(r.len(), usize::try_from(profile.facts.page.base).unwrap());
   }
 
   #[test]

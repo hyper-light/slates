@@ -9,4 +9,5 @@ only under a human grant. The design is `docs/wip/SLATES_DESIGN.md`; the project
 
 Status: Phase 0 (foundations) is built: `slates-machine` (boot profile), `slates-mem` (arenas,
 slabs, handles, rings), `slates-rt` (thread-per-core executor and drivers) and `slates-wire`
-(framing and canonical bodies). No release exists yet; `docs/wip/BENCHMARKS.md` has the baselines.
+(framing and canonical bodies). No release exists yet; `docs/wip/BENCHMARKS.md` has the baselines and `ratchets.toml` the
+per-machine ceilings (`cargo xtask ratchet`).

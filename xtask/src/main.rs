@@ -12,6 +12,8 @@
 //!   and 2; bit widths in shifts and type contexts; attributes; array indices. Everything else
 //!   fails with its file and line.
 //! - `cargo xtask check` — both.
+//! - `cargo xtask ratchet [--record] [--tighten] [--reset] [--runs N]` — the performance
+//!   ratchet over the bench examples, keyed by machine identity (see `ratchet.rs`).
 //!
 //! This is a development tool, not shipped code. It reads sources and runs cargo, so it is the one
 //! place in the workspace where `std::fs` reads and `std::process` are ordinary; it still obeys the
@@ -21,9 +23,11 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod ratchet;
+
 /// A task failure with a plain-English message; printed and turned into a non-zero exit code.
 #[derive(Debug)]
-struct Failure(String);
+pub(crate) struct Failure(pub(crate) String);
 
 impl fmt::Display for Failure {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -50,8 +54,22 @@ fn main() -> ExitCode {
     "structural" => structural::run(),
     "literals" => literals::run(),
     "check" => structural::run().and_then(|()| literals::run()),
+    "ratchet" => workspace_root().and_then(|root| {
+      let runs = args
+        .iter()
+        .position(|a| a == "--runs")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|n| n.parse().ok());
+      let flags = ratchet::Flags {
+        record: args.iter().any(|a| a == "--record"),
+        tighten: args.iter().any(|a| a == "--tighten"),
+        reset: args.iter().any(|a| a == "--reset"),
+        runs,
+      };
+      ratchet::run(&root, flags)
+    }),
     other => Err(Failure(format!(
-      "unknown task `{other}`; tasks: structural, literals, check"
+      "unknown task `{other}`; tasks: structural, literals, check, ratchet"
     ))),
   };
   match outcome {
@@ -311,6 +329,10 @@ mod structural {
     "std::fs::copy",
     "std::fs::set_permissions",
     "std::fs::File::set_len",
+    // R1/D-3: slates never creates a symlink (the clippy list cannot name a unix-only path on Windows).
+    "std::os::unix::fs::symlink",
+    "std::os::windows::fs::symlink_file",
+    "std::os::windows::fs::symlink_dir",
   ];
 
   const WRITE_ALLOWED: &[&str] = &["slates-land"];

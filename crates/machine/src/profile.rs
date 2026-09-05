@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::bench::{Measurement, PROBE_WALL_BUDGET, TIMER_OVERHEAD_FACTOR, timer_overhead_ns};
 use crate::derived::Derived;
 use crate::facts::Facts;
+#[cfg(test)]
+use crate::facts::PowerState;
 use crate::probes::{
   CodecPoint, CorePairRtt, FaultCosts, HashThroughput, LockCapacity, MemcpyPoint, Pinning,
   WakeLatency,
@@ -94,8 +96,15 @@ impl MachineProfile {
     let cap = memcpy_cap(&facts);
     let memcpy = probes::memcpy_curve(facts.cache_line, cap, budget);
     let hash = probes::hash(hash_bytes(&facts), budget);
+    let mut facts = facts;
     let codecs = if options.codecs {
-      probes::codecs(codec_bytes(&facts), budget)
+      let points = probes::codecs(codec_bytes(&facts), budget);
+      if points.is_empty() {
+        facts
+          .notes
+          .push("codec probe not compiled in (feature `codecs` off)".to_owned());
+      }
+      points
     } else {
       Vec::new()
     };
@@ -119,6 +128,21 @@ impl MachineProfile {
     profile.quick = !profile.quick_probes().is_empty();
     profile.elapsed_ns = crate::bench::nanos(started.elapsed());
     profile
+  }
+
+  /// Whether the machine's power state differs from the one the profile was measured under
+  /// (one OS query; the daemon polls it on its slow timer and re-measures when it flips).
+  pub fn power_changed(&self) -> bool {
+    Facts::query().power != self.facts.power
+  }
+
+  /// Re-measures the cheap subset if the power state changed; returns whether it did.
+  pub fn refresh_if_power_changed(&mut self, budget: Duration) -> bool {
+    if !self.power_changed() {
+      return false;
+    }
+    self.refresh_cheap(budget);
+    true
   }
 
   /// Re-measures the cheap, power-sensitive subset (timer, syscall, wake) and the power state,
@@ -390,6 +414,29 @@ mod tests {
     profile.refresh_cheap(Duration::from_millis(20));
     assert_eq!(profile.faults, faults);
     assert!(profile.wake.p50_ns > 0);
+  }
+
+  #[test]
+  fn a_power_state_change_is_detected_and_triggers_a_refresh() {
+    let mut profile = MachineProfile::measure(quick_options());
+    assert!(
+      !profile.power_changed(),
+      "the state has not moved since the profile"
+    );
+    assert!(!profile.refresh_if_power_changed(Duration::from_millis(10)));
+    // Pretend the profile was taken on the other source: the next check must refresh.
+    profile.facts.power = match profile.facts.power {
+      PowerState::Mains => PowerState::Battery,
+      _ => PowerState::Mains,
+    };
+    let before = profile.syscall;
+    assert!(profile.power_changed());
+    assert!(profile.refresh_if_power_changed(Duration::from_millis(10)));
+    assert!(
+      !profile.power_changed(),
+      "the refresh recorded the current state"
+    );
+    let _ = before;
   }
 
   #[test]

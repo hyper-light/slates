@@ -21,7 +21,9 @@ fn config(shards: u16) -> RuntimeConfig {
     timer_tick_ns: 100_000,
     batch: 64,
     pin: false,
+    cores: Vec::new(),
     page_bytes: 4096,
+    spin_ns: 0,
   }
 }
 
