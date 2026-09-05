@@ -122,6 +122,8 @@ pub enum ArchiveError {
     /// The chunk's position in the archive.
     index: u64,
   },
+  /// A manifest extent names a chunk the archive does not hold (a malformed archive).
+  MissingChunk,
 }
 
 impl core::fmt::Display for ArchiveError {
@@ -138,6 +140,7 @@ impl core::fmt::Display for ArchiveError {
       Self::BadSeekTable => f.write_str("archive seek table is malformed"),
       Self::BadLength => f.write_str("archive declares a length past its end"),
       Self::BadPayload { index } => write!(f, "chunk {index} has an undecodable payload"),
+      Self::MissingChunk => f.write_str("a manifest extent names a chunk not in the archive"),
     }
   }
 }
