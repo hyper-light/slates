@@ -1,0 +1,18 @@
+[package]
+name = "slates-archive"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The archive format (D-17, §4.16 archive, research/compression-archive-dedup.md §2.6): a single-pass, streamable, content-addressed, self-verifying byte stream of a snapshot — header, chunk records, manifest, seek table and trailer, each chunk BLAKE3-verified before use (Phase 7). Never written to disk by slates."
+
+[dependencies]
+blake3 = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

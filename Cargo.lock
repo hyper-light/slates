@@ -663,6 +663,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-archive"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "proptest",
+]
+
+[[package]]
 name = "slates-base"
 version = "0.1.0"
 dependencies = [
