@@ -1,0 +1,7 @@
+[toolchain]
+# Exact version, deliberately (not "stable"): the channel name resolves differently on every
+# machine, so CI's runner and a laptop can be several stables apart, which makes a
+# `clippy -D warnings` gate unreproducible (vorpal learned this; Appendix B.1). Bump this file
+# and the matching pins in .github/workflows/ in one commit, after a local `cargo clippy` pass.
+channel = "1.98.0"
+components = ["rustfmt", "clippy", "miri"]

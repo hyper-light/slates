@@ -1,0 +1,61 @@
+# The nine-target release lane (Appendix B.2). In Phase 0 this is a dry run: every target
+# builds the workspace in release mode; the binary and asset steps arrive with the `slates`
+# CLI in Phase 2. A `guard` job asserts the git tag equals the workspace version.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  guard:
+    name: tag equals workspace version
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          test "v$version" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != v$version"; exit 1; }
+
+  build:
+    name: ${{ matrix.target }}
+    needs: [guard]
+    if: always() && (needs.guard.result == 'success' || needs.guard.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, runner: macos-latest }
+          - { target: x86_64-apple-darwin, runner: macos-latest }
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+          - { target: x86_64-unknown-linux-musl, runner: ubuntu-latest, musl: true }
+          - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, musl: true }
+          - { target: x86_64-pc-windows-msvc, runner: windows-latest }
+          - { target: aarch64-pc-windows-msvc, runner: windows-latest }
+          - { target: i686-pc-windows-msvc, runner: windows-latest }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ !matrix.musl }}
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          targets: ${{ matrix.target }}
+      - name: Build (native or cross via --target)
+        if: ${{ !matrix.musl }}
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+      # musl lanes build inside the official rust:alpine container, native per arch, with
+      # +crt-static for binaries; cdylibs get -crt-static from .cargo/config.toml (B.2).
+      - name: Build (musl, in the rust:1.98-alpine container)
+        if: ${{ matrix.musl }}
+        run: |
+          docker run --rm -v "$PWD":/work -w /work rust:1.98-alpine sh -c '
+            apk add --no-cache build-base &&
+            RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --workspace --target ${{ matrix.target }}'

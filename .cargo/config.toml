@@ -1,0 +1,9 @@
+[alias]
+xtask = "run --manifest-path ./xtask/Cargo.toml --"
+
+# musl lanes: static binaries, but cdylib bindings must be built with -crt-static (Appendix B.2).
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=-crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=-crt-static"]

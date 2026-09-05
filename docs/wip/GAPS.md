@@ -6,9 +6,10 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
 
 ## 0. The one global fact
 
-No code exists (2026-09-04). Every subsystem in `SLATES_DESIGN.md` Part 4 is therefore
-**specced-untested**; every acceptance criterion in Part 5 is an obligation, not a fact. The
-first CI baseline (Phase 0) is the fit-before-influence milestone every ratchet depends on.
+- Phase 0 is in progress (2026-09-04): the workspace exists with the lint wall, the structural
+  test and the literal check (`cargo xtask check`), and `slates-machine` measures the boot profile
+  (BENCHMARKS.md records the first baseline). No other crate exists; nothing below is closed by
+  code until its phase says so.
 
 ## 1. Component inventory
 
@@ -67,9 +68,18 @@ first CI baseline (Phase 0) is the fit-before-influence milestone every ratchet 
 
 ## 5. Residual literals against the derivation doctrine
 
-- The Kalibera-Jones stopping fraction and the microbenchmark wall-time bound in §4.1 are shape
-  constants; each must gain a derivation at its definition site or be ratified as a shape constant
-  in Phase 0.
+- Ratified in Phase 0 (2026-09-04), each at its definition site with a `Shape:` doc line that
+  the literal check reads (`crates/machine`): the Kalibera-Jones stopping width (one tenth of the
+  median, `stats::CONVERGED_WIDTH_PERMILLE`), the bootstrap resample count (1,000,
+  `stats::BOOTSTRAP_RESAMPLES`), the smallest accepted sample (16, `bench::MIN_SAMPLES`), the
+  per-probe wall bound (250 ms, `bench::PROBE_WALL_BUDGET`; the whole profile took 472 ms on the
+  M5 Max, BENCHMARKS.md), the timer-overhead factor (100, lmbench's one-percent rule,
+  `bench::TIMER_OVERHEAD_FACTOR`), the fault probe's region (256 base pages,
+  `probes::FAULT_REGION_PAGES`), the full-matrix core limit (32, from §4.1's text), the wake
+  probe's convergence batch (64), the zstd candidate levels (1, 3, 9, 19), the cache-line fallback
+  (128 B, only when the OS refuses), the hash corpus (1,024 base pages, the large chunk class) and
+  the codec corpus (64 base pages, the small class), and clippy's cognitive-complexity threshold
+  (10, `clippy.toml`). Every other number in the crate is `Format:` (a layout fact) or derived.
 - "10 × broadcast RTT p99" for election timeouts is Raft's published rule; ratified as a shape
   constant with the citation.
 - The format floor for compression (savings must exceed the chunk's metadata overhead) is

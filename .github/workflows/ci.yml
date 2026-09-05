@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    name: fmt + clippy + structural + literals + test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # slates has no inherited code, so the format gate is appropriate from day one
+      # (Appendix B.1). A red-forever check is worse than no check: never let it rot.
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (the lint wall)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # R1/R2 by construction: forbidden symbols, forbidden dependencies, and write-capable
+      # syscalls outside the landing crate fail the build (AC-0.1).
+      - name: Structural test
+        run: cargo xtask structural
+      # R3: every numeric literal in a tuning position carries its derivation (AC-0.2).
+      - name: Literal check
+        run: cargo xtask literals
+      - name: Test
+        run: cargo test --workspace
+
+  windows-nightly:
+    name: windows (nightly cadence)
+    if: github.event_name == 'push'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace

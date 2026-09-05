@@ -1,0 +1,72 @@
+[workspace]
+members = ["crates/*", "xtask"]
+default-members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+authors = ["Ada Lundhe <info@lundhe.audio>"]
+edition = "2024"
+license = "MIT"
+rust-version = "1.98"
+readme = "README.md"
+
+[workspace.dependencies]
+slates-machine = { path = "crates/machine", version = "0.1.0" }
+
+# Third-party versions are pinned once here. Exact `=` pins only where an ABI contract is
+# version-specific, each with a comment saying why (Appendix B.1).
+libc = "0.2"
+windows-sys = { version = "0.60", features = [
+  "Win32_Foundation",
+  "Win32_System_SystemInformation",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+  "Win32_System_Power",
+  "Win32_System_Performance",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode", "frame"] }
+zstd = "0.13"
+
+# Lints are the enforcement of Part 0's rules, not a style preference. Every crate opts in
+# with `[lints] workspace = true`. Allowed exceptions live in clippy.toml with their reason.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "deny"
+unused_must_use = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+# R1, R2, D-7, D-8: the disallowed types and methods are listed in clippy.toml with reasons.
+disallowed_types = "deny"
+disallowed_methods = "deny"
+# Every unsafe block carries a `// SAFETY:` line stating the invariant that makes it sound.
+undocumented_unsafe_blocks = "deny"
+# The no-panic law: typed refusals, never panics, outside tests (clippy.toml allows tests).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+dbg_macro = "deny"
+# Integers are checked: a narrowing `as` is a review failure; use `try_from`.
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"
+cast_possible_wrap = "deny"
+# Bounded functions: the threshold is a ratified shape constant in clippy.toml.
+cognitive_complexity = "deny"
+mem_forget = "deny"
+missing_safety_doc = "deny"
+missing_panics_doc = "deny"
+
+[profile.release]
+lto = true
+# No unwinding in release: allocation exhaustion and every other failure is a typed refusal,
+# and a panic is a bug that must stop the process (Appendix B.1, hecate's no-panic law).
+panic = "abort"
+# codegen-units stays at the default until a measured build shows a gain (Appendix B.1).

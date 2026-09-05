@@ -1,0 +1,44 @@
+# Lint configuration for the workspace. Every entry is a rule from Part 0 of the design with
+# its reason; a change here is a design change and goes through the amendment log.
+
+# Shape constant ratified in Phase 0 (GAPS §5): the lowest threshold the reference crates pass.
+# It only ratchets down. A function above it is split, never allowed.
+cognitive-complexity-threshold = 10
+
+# The no-panic law applies to shipped code; tests may unwrap, expect, panic and dbg.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-dbg-in-tests = true
+
+# R2 and D-7/D-8: no atomic reference counting and no locks on data paths. The only allowed
+# sites are named FFI edge modules (bindings objects a GC may drop mid-call; foreign APIs that
+# take Arc by signature; test harnesses), each with a comment naming the two owners.
+disallowed-types = [
+  { path = "std::sync::Arc", reason = "R2/D-8: ownership is by arena and generational handle; sharing is a move over a bounded channel or an epoch-published immutable root. Allowed only in a named FFI edge module with a comment naming the two owners." },
+  { path = "std::rc::Rc", reason = "R2/D-8: same rule as Arc." },
+  { path = "std::sync::Mutex", reason = "D-7: no locks on data paths; one owning shard per volume. A cold-path lock needs a documented allow that recovers from poisoning." },
+  { path = "std::sync::RwLock", reason = "D-7: same rule as Mutex." },
+  { path = "std::sync::Condvar", reason = "D-9/D-10: parking goes through the runtime's wake words, never a condvar." },
+]
+
+# R1: no disk writes outside the landing crate under a grant, and never /tmp. Reads of the
+# kernel's pseudo-files are queries and are allowed where the structural test lists them.
+disallowed-methods = [
+  { path = "std::fs::write", reason = "R1: the landing crate is the only writer of host paths." },
+  { path = "std::fs::create_dir", reason = "R1." },
+  { path = "std::fs::create_dir_all", reason = "R1." },
+  { path = "std::fs::remove_file", reason = "R1." },
+  { path = "std::fs::remove_dir", reason = "R1." },
+  { path = "std::fs::remove_dir_all", reason = "R1." },
+  { path = "std::fs::rename", reason = "R1." },
+  { path = "std::fs::hard_link", reason = "R1." },
+  { path = "std::fs::copy", reason = "R1." },
+  { path = "std::fs::set_permissions", reason = "R1." },
+  { path = "std::fs::File::create", reason = "R1." },
+  { path = "std::fs::File::create_new", reason = "R1." },
+  { path = "std::fs::File::set_len", reason = "R1." },
+  { path = "std::os::unix::fs::symlink", reason = "R1/D-3: slates never creates a symlink." },
+  { path = "std::env::temp_dir", reason = "R1: no /tmp, ever; tests use RAM-backed directories they name." },
+  { path = "std::thread::sleep", reason = "D-9: no blocking sleeps in shipped code; time goes through the timing wheel. Tests and the machine probes may allow it in place with a reason." },
+]
