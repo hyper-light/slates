@@ -17,12 +17,15 @@
 //!
 //! Modules: [`art`] (the adaptive radix tree of the indexes), [`catalog`] (the records),
 //! [`op`] (the operations), [`partition`] (the state and its deterministic `apply`),
-//! [`record`] (the log record format over the segment's ring), [`replay`] (recovery and the
-//! snapshot policy), [`error`].
+//! [`record`] (the log record format over the segment's ring), [`register`] (the register
+//! primitives of §4.8 — the quorum, the fence, rendezvous placement, the configuration oracle),
+//! [`ledger`] (the fenced ledger register: the register over time, commit at `f + 1`, and takeover
+//! by phase-one adoption), [`replay`] (recovery and the snapshot policy), [`error`].
 
 pub mod art;
 pub mod catalog;
 pub mod error;
+pub mod ledger;
 pub mod op;
 pub mod partition;
 pub mod record;
@@ -31,6 +34,7 @@ pub mod replay;
 
 pub use art::Art;
 pub use error::DbError;
+pub use ledger::{Cohort, Commit, Owner, Reach, Record, TakeoverError};
 pub use op::Op;
 pub use partition::Partition;
 pub use register::{Configuration, DurabilityScope, Fence, HostEpoch, HostId, Placement, Quorum};
