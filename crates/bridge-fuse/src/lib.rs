@@ -23,6 +23,7 @@ pub mod error;
 pub mod init;
 pub mod reply;
 pub mod request;
+pub mod volume_bridge;
 pub mod wire;
 
 pub use abi::{FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, Opcode};
@@ -31,3 +32,4 @@ pub use error::FuseError;
 pub use init::{InitNegotiation, negotiate};
 pub use reply::{Attr, EntryOut, OpenOut, ReplyHeader, WriteOut};
 pub use request::{InHeader, Request};
+pub use volume_bridge::VolumeBridge;

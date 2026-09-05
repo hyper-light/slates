@@ -423,6 +423,46 @@ impl Volume {
     Ok(rows)
   }
 
+  /// The root directory's inode number, the bridge's node id 1 (§4.6).
+  pub fn root_inode(&self, store: &Store) -> Result<InodeNo, VfsError> {
+    Ok(
+      store
+        .dirs
+        .get(self.root)
+        .map_err(|_| VfsError::StaleHandle)?
+        .inode,
+    )
+  }
+
+  /// Looks `name` up in the directory named by inode number `dir_no` (the bridge speaks inode
+  /// numbers, not handles).
+  pub fn lookup_no(&self, store: &Store, dir_no: InodeNo, name: &str) -> Result<Located, VfsError> {
+    let dir = self.current_dir(store, dir_no)?;
+    self.lookup(store, dir, name)
+  }
+
+  /// The entries of the directory named by inode number `dir_no`.
+  pub fn readdir_no<'s>(
+    &self,
+    store: &'s Store,
+    dir_no: InodeNo,
+  ) -> Result<Vec<DirRow<'s>>, VfsError> {
+    let dir = self.current_dir(store, dir_no)?;
+    self.readdir(store, dir)
+  }
+
+  /// Creates a file named `name` in the directory named by inode number `dir_no`.
+  pub fn create_file_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    mode: u32,
+  ) -> Result<InodeNo, VfsError> {
+    let dir = self.current_dir(store, dir_no)?;
+    self.create_file(store, dir, name, mode)
+  }
+
   /// The target of a symlink.
   pub fn readlink(&self, store: &Store, no: InodeNo) -> Result<Box<str>, VfsError> {
     match &self.inode(store, no)?.body {

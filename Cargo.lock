@@ -679,6 +679,8 @@ name = "slates-bridge-fuse"
 version = "0.1.0"
 dependencies = [
  "slates-machine",
+ "slates-mem",
+ "slates-vfs",
 ]
 
 [[package]]

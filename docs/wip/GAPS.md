@@ -843,6 +843,20 @@ file, READDIR packing an entry, INIT negotiating, FORGET reaching the bridge wit
 an unserved opcode answered ENOSYS. The transport (the `/dev/fuse` read/write loop) is the thin
 Linux-only layer over this dispatch.
 
+The Bridge implementation over the volume core landed 2026-09-05 (still Phase 3 task 1, pure):
+`volume_bridge.rs` (`VolumeBridge`) borrows a `Volume` and its `Store` and turns the kernel's
+requests, by FUSE node id (the inode number, node id 1 the root), into volume operations —
+lookup, getattr, open/opendir, read, write, readdir, create, release, forget, flush — with a
+small file-handle table naming the inode a handle was opened on, and the volume core's refusals
+mapped to the Linux errno the kernel expects. The volume core gained by-inode-number wrappers
+(`root_inode`, `lookup_no`, `readdir_no`, `create_file_no`) so the bridge speaks inode numbers,
+not handles. Gated (`crates/bridge-fuse/tests/volume_bridge.rs`, 2 tests, every host — a scratch
+volume is pure RAM): a whole FUSE round trip through the real volume core (CREATE a file, WRITE
+to it, LOOKUP it, GETATTR its size, OPEN and READ the bytes back, READDIR the root lists it) and
+the typed errnos (a missing name is ENOENT, a stale handle is EINVAL). Owed: generation-tracked
+node-id reuse after `forget` (§4.6 `(no, gen)`), setattr/mkdir/unlink/rename/symlink/link/statfs
+dispatch, and the kernel invalidation notifications — all with the transport.
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3
