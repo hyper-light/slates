@@ -941,7 +941,8 @@ witnessed and pinned entries keep serving. Drift under a witnessed entry: Degrad
 planes `BaseUnavailable{path, errno}`, `BaseDrift{entries}`, `TargetNotOwned{path}`,
 `TargetIsVolume{path}`, `EscapesTarget{path}`, `GrantRequired{request_id, manifest_hash}`,
 `GrantMismatch{expected, got}`, `GrantExpired`, `GrantRefused`, `Conflict{entries}`, `TargetInUse{path}`,
-`LandingLeaseHeld{holder, generation}`, `LandingPartial{manifest, failures}`, and for the merge
+`LandingLeaseHeld{holder, generation}`, `LandingPartial{manifest, failures}`, `Forbidden{verb}`,
+`GrantChannelRefused{channel}` (A-8), and for the merge
 plane `ReadOnlyVolume`, `NotGreen`, `NotWork`, `UnknownBase{green, version}`,
 `MergeConflict{windows}`, `IncrementTooLarge{limit}`, `EvidenceRequired`,
 `DuplicateIncrement{original}` (informational), and for the fleet `StaleEpoch{current}` (a
@@ -1687,6 +1688,18 @@ junction planted in the target can redirect a write outside it, refuses targets 
 not own and targets inside a slates mount, never changes ownership of what it writes, and never
 follows a symlink when removing; no code is loaded after start; every refusal is typed and counted.
 
+**Security specification (A-8, 2026-09-05; the spec §3 of GAPS owed before Phase 2).**
+
+*Principals.* A principal is `Principal { kind: Uid(u32) | Sid(Box<str>) | Certificate(Blake3 of the leaf) }`, established once at rendezvous and never carried in a request: on one host the daemon reads the peer's credentials (`SO_PEERCRED` on Linux; the `shm_open` object's uid/gid/mode plus `LOCAL_PEERTOKEN` on the optional control socket on macOS; the section's DACL and `GetNamedPipeClientProcessId` on Windows) and binds them to the client id it hands out; between hosts the TLS 1.3 leaf certificate is the principal. Every lease, attachment, grant, landing record and audit record names the principal it was made for; a request whose client id was bound to another principal is refused `Forbidden` (a new refusal, listed below) before it reaches a shard.
+
+*Access lists.* `Access { owner: Principal, entries: SmallVec<(Principal, Rights)> }` with `Rights { read, write, admin }`: `read` covers attach-for-read, snapshot reads, `status`, `read_base`, `versions`, `changed_since`, `export`; `write` covers attach-for-write, the mutating verbs, `snapshot`, `clone` (the clone's owner is the caller), `submit`, `rebase`, `pin`, `rewitness`, `materialize` (the grant is a separate, human-only act); `admin` covers `resize`, `destroy`, `archive`, changing the list, and revoking leases. The owner holds every right. A per-user daemon has one principal and every list is `{owner}`; the check still runs (one comparison), so the shared-daemon mode of a fleet node is the same code with more entries (R8). Ids never authorize: a request names an id, a principal and (for mutations) an attachment with its lease epoch; all three must agree.
+
+*Audit counters.* The audit log (§4.15, §4.14) records grants, manifests and landing outcomes; refusals are counted, never logged with content: `refusals{kind}` per refusal variant of §4.4's taxonomy, `forbidden{verb}` per verb, `grant_kind_refused{channel}` for the grant kind arriving on the ring or MCP channel (AC-2.8), `cross_uid_connect` at rendezvous (T-2.7), `stale_lease{shard}`, `stale_epoch`, `landing_lease_fenced` (a superseded holder refused by generation, AC-2.9). Every counter is a cache-padded per-shard `Relaxed` word summed on read (§3 of CLAUDE.md), exported through `status` with its freshness, and reset only by restart.
+
+*Grants.* A grant is created only by a request whose channel is the CLI's control channel or a registered confirmation surface; the request kind carries the channel in its header class (§4.9) and the server refuses the kind on a ring or MCP channel with `GrantChannelRefused` and increments `grant_kind_refused`. A grant names its principal; a landing may consume only a grant made for its own principal.
+
+*Refusals added.* `Forbidden{verb}` (the principal lacks the right), `GrantChannelRefused{channel}`; both in the closed taxonomy of §4.4 from this amendment.
+
 ### 4.14 Observability (D-23)
 
 Chokepoint spans (bridge request, ring request, shard operation, log append, replication ship,
@@ -1701,6 +1714,16 @@ source, rebase-retry rate, base-lag p99, `StaleEpoch` refusals, holder recomputa
 are readable through the SDK and MCP status tool; the audit log (grants, landing manifests,
 outcomes) is a separate append-only stream readable through the CLI, content-free except for the
 paths a landing touched, which the human already approved.
+
+**Observability specification (A-8, 2026-09-05; the spec §3 of GAPS owed before Phase 2).**
+
+*Span roster.* Seven chokepoints, each a span with the three-id law (request id, volume id, principal id) and a monotonic start and end: `bridge.request{op}` (a bridge call from arrival to reply), `ring.request{kind}` (a ring slot from read to reply written), `shard.op{verb}` (one verb on its owner shard, no awaits inside), `log.append{partition}` (one op-log record appended and published), `ship.record{object}` (one record or content put to its candidates, with the acknowledging count), `consensus.step{group}` (one configuration commit), `archive.chunk{codec}` (one chunk compressed or expanded), plus `land.entry{action}` (one landing entry) and `merge.verdict` (one increment judged). A span is emitted after it ends through the shard's telemetry ring (class Telemetry, shed first) into the control shard's sink; an emitter registers its name at start and the health plane refuses to serve until every name in this roster has registered (§2.6).
+
+*Health signal catalog.* Every signal is `(value, freshness_ns)` and host-observed where a host can observe it: `daemon.alive` (the anchor's view: the child is running and answered its last heartbeat), `daemon.restarts` (the anchor's count), `segment.generation` (the anchor segment's generation word), `shard.loop_lag_ns{shard}` (the driver's measured lateness), `shard.tasks{shard}` (live tasks against the arena), `ring.depth{client}` (command slots pending), `client.parked{client}`, `memory.locked_bytes` and `memory.unlocked_bytes` (per shard and rolled up), `memory.pressure` (PSI slope, macOS level, Windows notification), `catalog.volumes{shard}`, `log.bytes{partition}` and `log.replay_ns` (the last replay's duration against the recovery budget), `lease.expiring` (leases within one term of expiry), `base.watcher{volume}` (live, overflowed, unavailable), `land.active` (landings in flight), `placed.pending` (records awaiting f+1), `mirror_age{volume}`, `config.version`.
+
+*Metric names.* One namespace, dotted, unit-suffixed, labels in braces; counters end in `_total`, histograms in `_ns` or `_bytes`. Per host: `slates.requests_total{kind,outcome}`, `slates.refusals_total{kind}`, `slates.provision_ns` (the AC-2.1 histogram: p50, p99, p999, max, spinning and parked), `slates.ring_wait_ns{client}`, `slates.wake_ns`, `slates.spin_to_park_ratio`. Per shard: `slates.shard.step_ns`, `slates.shard.batch`, `slates.shard.parks_total`, `slates.shard.kicks_total`, `slates.shard.arena_exhausted_total`. Per volume (readable through `status`): `referenced_bytes`, `unique_bytes`, `locked_bytes`, `unlocked_bytes`, `hashing_backlog_bytes`, `dedup_hit_ratio`, `compression_ratio`, `lease_epoch`, `attachments`, `base_cache_hit_ratio`, `drifted_entries`, `watcher_state`; per green: `head_version`, `merges_per_s`, `verdict_p99_ns`, `merge_path_p99_ns`, `conflict_rate{source}`, `rebase_retry_rate`, `base_lag_p99_ns`, `stale_epoch_refusals_total`, `holder_mismatch_total`. Per landing (in the report and the audit log): `entries{outcome}`, `bytes_written`, `dir_sync_ns`, `window_ns_max`, `ramp_depth`. The machine profile and every derived constant are exported as `slates.derived{name}` with their inputs.
+
+*Content-freedom.* No metric, span or health signal carries a path, a name or file content; the audit log carries the paths a landing touched and nothing else; a test in the observability crate asserts every emitted label against this rule.
 
 ### 4.15 Disk as the source of truth: the base plane and landing under grant (D-25, D-26)
 
@@ -3550,6 +3573,9 @@ slates/
     bridge-fuse/             Linux /dev/fuse driver
     bridge-<macos>/          macOS bridge (decided in Part 3)
     bridge-winfsp/           Windows WinFsp binding
+    anchor/                  the anchor process's library: the shared segment's layout (profile,
+                             op logs, catalog snapshots, the audit log, landing manifests, held
+                             descriptors), attach, replay hand-off, supervision of the daemon
     ipc/                     local rendezvous per OS, shared-memory rings, wake primitives
     server/                  request handling, admission, accounting, lifecycle verbs
     cluster/                 membership, the configuration group, neighbourhoods, the register and
@@ -3644,6 +3670,13 @@ Applied in the same change to: §4.5 (data model), D-4 (realized form), Phase 1 
 - `destroy_step` takes a budget in nanoseconds of the volume's clock and weighs releases by what they free; a clone's destroy walks only nodes born after its origin (the ZFS pruned traversal).
 - Clone pins on a snapshot are released by the owner of both volumes through `Volume::unpin`; a pinned snapshot's destroy is the typed refusal `Pinned` (`EBUSY`).
 - What it does not change: the birth-epoch rule, deadlists, the chunk rule, quotas, the op log, the base plane, landing, the merge verdict.
+
+### A-8 (accepted 2026-09-05) — The security and observability specifications owed before Phase 2
+Applied in the same change to: §4.13 (security specification), §4.14 (observability specification), §4.4 (refusal taxonomy: `Forbidden`, `GrantChannelRefused`), Appendix B.6 (the `anchor` crate), GAPS §3.
+- Security: principals established at rendezvous and never carried in a request; access lists with read, write and admin rights per verb; ids never authorize; audit counters per refusal kind, per forbidden verb, for the grant kind on a ring or MCP channel, for cross-uid connects and for fenced landing holders; grants only through the CLI's control channel or a registered confirmation surface, bound to the principal.
+- Observability: the span roster (nine chokepoints with the three-id law, registered at start), the health signal catalog (every signal `(value, freshness)`, host-observed by the anchor where it can be), the metric namespace with units and labels, and the content-freedom rule as a test.
+- The anchor's library gets its own crate so the daemon, the client and the CLI share one segment layout without linking the server.
+- What it does not change: the rules R1–R10; the refusal taxonomy elsewhere; the wire format (the channel is already the header's class).
 
 ### A-6 (accepted 2026-09-04) — Authority and durability: Vertical Paxos II with copyset neighbourhoods, one quorum rule with hedged placement, route by id, per-operation durability scope over mirroring, ownership follows the writer, model-checked
 Applied in the same change to: Part 0 (glossary), Part 1.4, Part 2.1, 2.3, 2.6, D-14 (rewritten), D-16, D-18, D-27, §4.4, §4.8 (rewritten), §4.9, §4.10 (rewritten), §4.16, Phase 2, Phase 8 (rewritten), Part 6, Part 7, Appendix B.6, GAPS, README, `research/metadata-replication.md` (new), `docs/wip/models/` (new).

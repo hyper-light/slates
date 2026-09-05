@@ -59,8 +59,8 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
 
 ## 3. Undesigned (charter only)
 
-- Security spec (principals, access lists, audit counters) beyond §4.13 prose — owed before Phase 2.
-- Observability spec (span roster, health signal catalog, metric names) beyond §4.14 prose — owed before Phase 2.
+- Security spec (principals, access lists, audit counters) — CLOSED 2026-09-05 by A-8 (§4.13's specification).
+- Observability spec (span roster, health signal catalog, metric names) — CLOSED 2026-09-05 by A-8 (§4.14's specification).
 - Skills content (the seven SKILL.md documents, including `slates-landing` and `slates-merge`) — owed in Phase 5 and Phase 6.
 - The confirmation-surface contract for harnesses other than the terminal (the request stream a harness renders, answered only by a human-operated process through the control channel) — owed in Phase 5 with the terminal surface as the reference.
 - Operator documentation (fleet configuration: failure-domain tree, regions and mirror regions, neighbourhood sizing inputs, certificates) — owed in Phase 8.
