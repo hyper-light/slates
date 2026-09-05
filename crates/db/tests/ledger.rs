@@ -201,13 +201,11 @@ mod oracle {
   use super::*;
   use proptest::prelude::*;
 
-  /// Whether candidate `index` is reachable under `mask`: the owner (index 0) always is, so a
-  /// proposal reaches its proposer; every other candidate is reachable when its bit is set. The
-  /// index is a small candidate position (at most `2f`), so the shift never overflows the mask.
+  /// Whether candidate `index` is reachable under `mask`: each candidate's own bit. No candidate is
+  /// forced reachable — the source audit's BUG-13 showed that forcing candidate 0 reachable hid the
+  /// adversarial quorum transitions of BUG-12 from the oracle. The index is a small candidate
+  /// position (at most `2f`), so the shift never overflows the mask.
   fn reachable(mask: u8, index: usize) -> bool {
-    if index == 0 {
-      return true;
-    }
     match u32::try_from(index)
       .ok()
       .and_then(|shift| 1u8.checked_shl(shift))
@@ -217,25 +215,39 @@ mod oracle {
     }
   }
 
-  /// A reach from a bitmask over the cohort's candidate positions.
-  fn reach_of(cohort: &Cohort, mask: u8) -> Reach {
-    let set: BTreeSet<HostId> = cohort
+  /// The set of candidates reachable under `mask`.
+  fn reach_set(cohort: &Cohort, mask: u8) -> BTreeSet<HostId> {
+    cohort
       .candidates()
       .iter()
       .enumerate()
       .filter(|(i, _)| reachable(mask, *i))
       .map(|(_, host)| *host)
-      .collect();
+      .collect()
+  }
+
+  /// A propose always reaches the owner's own holder (the owner writes locally), plus whatever else
+  /// `mask` reaches.
+  fn propose_reach(cohort: &Cohort, mask: u8, owner: HostId) -> Reach {
+    let mut set = reach_set(cohort, mask);
+    set.insert(owner);
     Reach::Only(set)
   }
 
   proptest! {
+    // A high case count: the adversarial quorum transitions of the source audit's BUG-12 are a
+    // sparse needle, so the default 256 cases misses them; 16384 reliably exercises the class in a
+    // fraction of a second (the deterministic regression above is the guaranteed guard).
+    #![proptest_config(ProptestConfig { cases: 16384, ..ProptestConfig::default() })]
+
     /// Over any history at f in {0,1,2}, the register never violates its safety properties:
     /// Agreement (no position holds two quorum-agreed identities), NoLoss and TotalOrder (the
     /// committed prefix only extends and never rewrites a committed value), Continuity (a takeover
     /// adopts at least the committed prefix), and non-vacuity (the leading full-cohort proposal
     /// always commits, so a dead protocol cannot pass). Each step is `(is_takeover, byte, mask)`,
     /// generated as plain tuples so the strategy needs no `prop_oneof` (which is `Arc`-backed, R2).
+    /// Quorums are arbitrary (no candidate is forced reachable), so the BUG-12 transitions the
+    /// candidate-0 forcing once hid are now generatable (the audit's BUG-13).
     #[test]
     fn arbitrary_histories_preserve_safety(
       f in 0u32..=2,
@@ -249,15 +261,21 @@ mod oracle {
       prop_assert_eq!(committed.clone(), vec![id(200)]);
 
       for (is_takeover, byte, mask) in steps {
-        let reach = reach_of(&cohort, mask);
         if is_takeover {
-          if let Ok(new_owner) = Owner::take_over(&mut cohort, HostId(9), &reach) {
+          // Takeover reads an arbitrary reachable subset and promotes a reachable candidate.
+          let set = reach_set(&cohort, mask);
+          let reach = Reach::Only(set.clone());
+          if let Some(new_id) = set.iter().next().copied()
+            && let Ok(new_owner) = Owner::take_over(&mut cohort, new_id, &reach)
+          {
             // Continuity: the adopted log begins with everything committed at takeover.
             let prefix = cohort.committed_prefix();
             prop_assert!(new_owner.len() >= prefix.len(), "adopts at least the committed prefix");
             owner = new_owner;
           }
         } else {
+          // A propose always reaches the owner's own holder, plus whatever else `mask` reaches.
+          let reach = propose_reach(&cohort, mask, owner.id);
           let _ = owner.propose(&mut cohort, id(byte), &reach);
         }
 
@@ -277,4 +295,44 @@ mod oracle {
       }
     }
   }
+}
+
+/// Regression for the source audit's BUG-12 (2026-09-05): a committed value must never be
+/// overwritten by a later takeover. The counterexample: a value committed under a high epoch whose
+/// holder copy still carries a low accepted epoch (because reconcile skipped refreshing it) can be
+/// beaten in a later phase-one read by a stale-but-higher-epoch value on another holder.
+#[test]
+fn a_committed_value_survives_adversarial_takeovers() {
+  let (mut cohort, mut owner) = fleet(1);
+  // Precompute the reachabilities (candidates are fixed) to avoid borrowing the cohort mid-call.
+  let only_a = only(&cohort, &[0]);
+  let only_b = only(&cohort, &[1]);
+  let b_and_c = only(&cohort, &[1, 2]);
+  let a_and_c = only(&cohort, &[0, 2]);
+  let a_and_b = only(&cohort, &[0, 1]);
+  let host_b = cohort.candidates()[1];
+  let host_a = cohort.candidates()[0];
+
+  // Step 1: epoch 1 proposes X to A only — not committed.
+  owner.propose(&mut cohort, id(b'X'), &only_a);
+  // Step 2: takeover via B+C (empty), propose Y to B only — not committed.
+  let mut o2 = Owner::take_over(&mut cohort, host_b, &b_and_c).expect("quorum");
+  o2.propose(&mut cohort, id(b'Y'), &only_b);
+  // Step 3: takeover via A+C adopts X, then proposes Z via A+C — X and Z commit.
+  let mut o3 = Owner::take_over(&mut cohort, host_a, &a_and_c).expect("quorum");
+  o3.propose(&mut cohort, id(b'Z'), &a_and_c);
+  let committed_before = cohort.committed_prefix();
+  assert_eq!(
+    committed_before.first(),
+    Some(&id(b'X')),
+    "X is committed at position 0"
+  );
+  // Step 4: takeover via A+B, then the new owner proposes W via A+B (reconciles the holders).
+  let mut o4 = Owner::take_over(&mut cohort, host_a, &a_and_b).expect("quorum");
+  o4.propose(&mut cohort, id(b'W'), &a_and_b);
+  let committed_after = cohort.committed_prefix();
+  assert!(
+    committed_after.starts_with(&committed_before),
+    "a committed value was overwritten across takeovers: was {committed_before:?}, now {committed_after:?}"
+  );
 }

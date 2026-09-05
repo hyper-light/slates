@@ -68,25 +68,25 @@ impl Holder {
   /// overwritten or appended under `epoch`; a stale tail beyond `log` (uncommitted records from a
   /// superseded owner, always under a lower epoch) is dropped. Overwriting is sound: the fence was
   /// raised to `epoch` first, so `epoch` is at least every epoch already stored here.
+  ///
+  /// Every position's accepted epoch is refreshed to `epoch`, including positions whose identity is
+  /// unchanged. This is load-bearing, not an inefficiency to skip: a holder accepts the whole
+  /// offered log under the owner's current epoch, so a record re-committed by a new owner must carry
+  /// that new epoch. Skipping the matching prefix (leaving a committed record at its original low
+  /// epoch) let a later phase-one `adopt` — which picks the highest epoch per position — prefer a
+  /// stale-but-higher-epoch value on another holder and overwrite the committed one (the source
+  /// audit's BUG-12, 2026-09-05: a NoLoss/TotalOrder violation).
   fn reconcile(&mut self, epoch: HostEpoch, log: &[[u8; 32]]) {
-    let mut position = 0usize;
-    while position < log.len()
-      && position < self.log.len()
-      && self.log[position].identity == log[position]
-    {
-      position += 1;
-    }
-    while position < log.len() {
+    for (position, identity) in log.iter().enumerate() {
       let record = Record {
         epoch,
-        identity: log[position],
+        identity: *identity,
       };
       if position < self.log.len() {
         self.log[position] = record;
       } else {
         self.log.push(record);
       }
-      position += 1;
     }
     self.log.truncate(log.len());
   }
