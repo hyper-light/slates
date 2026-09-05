@@ -12,11 +12,15 @@
 //! `mount_nfs`.
 //!
 //! Modules: [`xdr`] (the External Data Representation reader and writer, RFC 4506 — big-endian,
-//! four-byte aligned, bounds-checked) and [`rpc`] (ONC RPC, RFC 1057/5531 — record marking over
-//! TCP, the call and reply messages, and the `AUTH_NONE` credential the loopback server uses).
+//! four-byte aligned, bounds-checked), [`rpc`] (ONC RPC, RFC 1057/5531 — record marking over TCP,
+//! the call and reply messages, and the `AUTH_NONE` credential the loopback server uses), and
+//! [`nfs`] (the NFSv3 core data types of RFC 1813 — status codes, file types, times, attributes and
+//! file handles).
 
+pub mod nfs;
 pub mod rpc;
 pub mod xdr;
 
+pub use nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3};
 pub use rpc::{AcceptStatus, RpcCall, RpcError, read_record, reply_bytes, write_record};
 pub use xdr::{XdrError, XdrReader, XdrWriter};
