@@ -31,11 +31,11 @@
 //! journal's declaration order.
 //!
 //! Scope: content, create, unlink and rename of regular files, directory create and remove, and
-//! the mode of a file or directory (`SetMode`, composed independently against the base mode; a
-//! mode set to the base mode declares nothing). Hard links, symlinks and xattrs, a file/directory
-//! transition at one path, chmod then rename of one path, and the rare rename onto a base path
-//! already consumed this increment are the deriver's remaining piece (owed; GAPS §8f), each a
-//! typed [`DeriveError`]. An operation a valid volume could not
+//! the mode of a file or directory (`SetMode`), and symbolic links (`Symlink`, composed
+//! independently; the target is stored in the path table). Hard links and xattrs, a file/directory
+//! transition at one path, chmod then rename of one path, symlink rename, and the rare rename onto
+//! a base path already consumed this increment are the deriver's remaining piece (owed; GAPS §8f),
+//! each a typed [`DeriveError`]. An operation a valid volume could not
 //! have produced — content on a missing file, a create over an existing one, an unlink, rename or
 //! rmdir of a missing one, a mkdir over an existing directory — is a typed [`DeriveError`] too,
 //! never a panic. This module is pure: no I/O, no clock, no randomness.
@@ -124,6 +124,13 @@ pub enum VolumeOp {
     /// The new mode.
     mode: u32,
   },
+  /// A symbolic link created at `path` pointing at `target`.
+  Symlink {
+    /// The link's path.
+    path: String,
+    /// The link's target (an opaque byte string).
+    target: String,
+  },
 }
 
 impl VolumeOp {
@@ -140,13 +147,19 @@ impl VolumeOp {
       | VolumeOp::Rename { .. }
       | VolumeOp::Mkdir { .. }
       | VolumeOp::Rmdir { .. }
-      | VolumeOp::SetMode { .. } => None,
+      | VolumeOp::SetMode { .. }
+      | VolumeOp::Symlink { .. } => None,
     }
   }
 
   /// Whether this is a directory operation (`Mkdir` or `Rmdir`).
   fn is_directory(&self) -> bool {
     matches!(self, VolumeOp::Mkdir { .. } | VolumeOp::Rmdir { .. })
+  }
+
+  /// Whether this is a symlink create (`Symlink`).
+  fn is_symlink(&self) -> bool {
+    matches!(self, VolumeOp::Symlink { .. })
   }
 
   /// The single file path a content, create or unlink operation targets (a rename has two, and a
@@ -163,7 +176,8 @@ impl VolumeOp {
       VolumeOp::Rename { .. }
       | VolumeOp::Mkdir { .. }
       | VolumeOp::Rmdir { .. }
-      | VolumeOp::SetMode { .. } => None,
+      | VolumeOp::SetMode { .. }
+      | VolumeOp::Symlink { .. } => None,
     }
   }
 }
@@ -192,6 +206,11 @@ pub enum DeriveError {
   PathIsFileAndDirectory(String),
   /// A `SetMode` on a path with no file or directory present at seal.
   SetModeMissing(String),
+  /// A `Symlink` on a path that already holds a symlink.
+  SymlinkOverExisting(String),
+  /// One path was used as conflicting kinds this increment (file, directory and/or symlink), a
+  /// transition whose composition is owed.
+  PathKindConflict(String),
 }
 
 impl std::fmt::Display for DeriveError {
@@ -213,6 +232,8 @@ impl std::fmt::Display for DeriveError {
         write!(f, "path {path} is used as both a file and a directory")
       }
       Self::SetModeMissing(path) => write!(f, "set mode on missing path {path}"),
+      Self::SymlinkOverExisting(path) => write!(f, "symlink over existing symlink {path}"),
+      Self::PathKindConflict(path) => write!(f, "path {path} is used as conflicting kinds"),
     }
   }
 }
@@ -230,6 +251,8 @@ pub struct Base {
   pub dirs: Vec<String>,
   /// The base mode of a path (file or directory), where known.
   pub modes: Vec<(String, u32)>,
+  /// The base symlinks and their targets.
+  pub symlinks: Vec<(String, String)>,
 }
 
 impl Base {
@@ -239,8 +262,18 @@ impl Base {
       files,
       dirs: Vec::new(),
       modes: Vec::new(),
+      symlinks: Vec::new(),
     }
   }
+}
+
+/// The base symlink target of `path`, if the base has a symlink there.
+fn base_symlink_target<'a>(base: &'a Base, path: &str) -> Option<&'a str> {
+  base
+    .symlinks
+    .iter()
+    .find(|(candidate, _)| candidate == path)
+    .map(|(_, target)| target.as_str())
 }
 
 /// The base mode of `path`, if the base recorded one.
@@ -400,9 +433,13 @@ fn apply_rename(
   if let Some(dst) = destination {
     entities[dst].live = false;
     entities[dst].clobbered = true;
-    let dst_is_base = entities[dst].origin.is_some();
+    // Only a base file at its *own* path is a write-and-rename target: replacing it is a content
+    // change to that base file. A base file that was itself renamed here is not a base path, so
+    // the source is just a new file at `to`, and the clobbered file's original name is orphaned
+    // (unlinked at seal by the survivor rule).
+    let dst_at_own_base = entities[dst].origin.as_deref() == Some(to);
     let dst_base_len = entities[dst].base_len;
-    if dst_is_base && entities[source].origin.is_none() {
+    if dst_at_own_base && entities[source].origin.is_none() {
       // A new file renamed over a base file: the destination's content is replaced (a delete of
       // the base and the new bytes), so re-root the source at the destination's base.
       entities[source].origin = Some(to.to_owned());
@@ -501,6 +538,90 @@ fn set_mode_op(path: u16, mode: u32) -> Op {
   }
 }
 
+/// A symlink the increment declares.
+enum SymlinkEmission {
+  /// A symlink at this path pointing at this target (a new or retargeted symlink).
+  Made(String, String),
+  /// A base symlink removed at this path.
+  Removed(String),
+}
+
+/// The paths this increment treats as symlinks: those a `Symlink` op names, and the base symlinks.
+fn symlink_paths(base: &Base, journal: &[VolumeOp]) -> std::collections::BTreeSet<String> {
+  let mut paths: std::collections::BTreeSet<String> =
+    base.symlinks.iter().map(|(path, _)| path.clone()).collect();
+  for op in journal {
+    if let VolumeOp::Symlink { path, .. } = op {
+      paths.insert(path.clone());
+    }
+  }
+  paths
+}
+
+/// Composes the symlink operations — `Symlink`, and `Unlink` on a symlink path — per symlink path.
+/// A new or retargeted symlink is one `Symlink`; a base symlink removed is one `Unlink`; a symlink
+/// created then unlinked, or a base symlink removed then recreated to the same target, is nothing.
+/// A symlink over a present symlink, or an unlink of an absent one, is a typed refusal.
+fn compose_symlinks(
+  base: &Base,
+  journal: &[VolumeOp],
+  paths: &std::collections::BTreeSet<String>,
+) -> Result<Vec<SymlinkEmission>, DeriveError> {
+  // Per symlink path: whether it is present and, if so, its target.
+  let mut state: std::collections::BTreeMap<String, (bool, String)> =
+    std::collections::BTreeMap::new();
+  let initial = |path: &str| -> (bool, String) {
+    match base_symlink_target(base, path) {
+      Some(target) => (true, target.to_owned()),
+      None => (false, String::new()),
+    }
+  };
+  for op in journal {
+    match op {
+      VolumeOp::Symlink { path, target } => {
+        let here = state.entry(path.clone()).or_insert_with(|| initial(path));
+        if here.0 {
+          return Err(DeriveError::SymlinkOverExisting(path.clone()));
+        }
+        here.0 = true;
+        here.1 = target.clone();
+      }
+      VolumeOp::Unlink { path } if paths.contains(path) => {
+        let here = state.entry(path.clone()).or_insert_with(|| initial(path));
+        if !here.0 {
+          return Err(DeriveError::UnlinkMissing(path.clone()));
+        }
+        here.0 = false;
+      }
+      _ => {}
+    }
+  }
+  let mut emissions = Vec::new();
+  for (path, (here, target)) in state {
+    let base_target = base_symlink_target(base, &path);
+    if here {
+      if base_target != Some(target.as_str()) {
+        emissions.push(SymlinkEmission::Made(path, target));
+      }
+    } else if base_target.is_some() {
+      emissions.push(SymlinkEmission::Removed(path));
+    }
+  }
+  Ok(emissions)
+}
+
+/// A `Symlink` op: `path` is the link's index, `src` the target string's index into the table.
+fn symlink_op(link: u16, target: u16) -> Op {
+  Op {
+    kind: OpKind::Symlink,
+    flags: 0,
+    path: link,
+    at: 0,
+    len: 0,
+    src: u64::from(target),
+  }
+}
+
 /// A namespace op with a path index and empty coordinates.
 fn namespace_op(kind: OpKind, path: u16) -> Op {
   Op {
@@ -537,9 +658,17 @@ fn adds_content(kind: OpKind) -> bool {
 pub fn compose_volume(base: &Base, journal: &[VolumeOp]) -> Result<OpsDoc, DeriveError> {
   check_no_file_directory_collision(base, journal)?;
   let directories = compose_directories(base, journal)?;
+  let sym_paths = symlink_paths(base, journal);
+  let symlinks = compose_symlinks(base, journal, &sym_paths)?;
   let mut entities: Vec<Entity> = Vec::new();
   for op in journal {
-    if op.is_directory() {
+    if op.is_directory() || op.is_symlink() {
+      continue;
+    }
+    // An unlink on a symlink path is a symlink removal, composed above; skip it here.
+    if let VolumeOp::Unlink { path } = op
+      && sym_paths.contains(path.as_str())
+    {
       continue;
     }
     apply_op(&mut entities, base, op)?;
@@ -570,7 +699,7 @@ pub fn compose_volume(base: &Base, journal: &[VolumeOp]) -> Result<OpsDoc, Deriv
     .collect();
   let present_dirs = present_directories(base, journal);
   let modes = compose_modes(base, journal, &survivors, &renamed_away, &present_dirs)?;
-  Ok(seal(entities, directories, modes))
+  Ok(seal(entities, directories, modes, symlinks))
 }
 
 /// A directory the increment declares: a create or a remove.
@@ -584,17 +713,24 @@ enum DirectoryEmission {
 /// Refuses when any path is used as both a file and a directory this increment (including against
 /// the base's kinds): a file/directory transition at a path, whose composition is owed.
 fn check_no_file_directory_collision(base: &Base, journal: &[VolumeOp]) -> Result<(), DeriveError> {
+  let sym_paths = symlink_paths(base, journal);
   let mut file_paths: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
   let mut dir_paths: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+  let mut sym_intent: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
   for op in journal {
     match op {
       VolumeOp::Mkdir { path } | VolumeOp::Rmdir { path } => {
         dir_paths.insert(path);
       }
+      VolumeOp::Symlink { path, .. } => {
+        sym_intent.insert(path);
+      }
       VolumeOp::Rename { from, to } => {
         file_paths.insert(from);
         file_paths.insert(to);
       }
+      // An unlink on a symlink path is a symlink removal, not a file operation; do not count it.
+      VolumeOp::Unlink { path } if sym_paths.contains(path.as_str()) => {}
       other => {
         if let Some(path) = other.single_path() {
           file_paths.insert(path);
@@ -602,14 +738,26 @@ fn check_no_file_directory_collision(base: &Base, journal: &[VolumeOp]) -> Resul
       }
     }
   }
-  for path in &dir_paths {
-    if file_paths.contains(path) || base.files.iter().any(|(file, _)| file == path) {
+  let base_file = |path: &str| base.files.iter().any(|(file, _)| file == path);
+  let base_dir = |path: &str| base.dirs.iter().any(|dir| dir == path);
+  let base_sym = |path: &str| base.symlinks.iter().any(|(link, _)| link == path);
+  // A file operation must not fall on a base directory or symlink.
+  for path in &file_paths {
+    if dir_paths.contains(path) || base_dir(path) || base_sym(path) {
       return Err(DeriveError::PathIsFileAndDirectory((*path).to_owned()));
     }
   }
-  for path in &file_paths {
-    if base.dirs.iter().any(|dir| dir == path) {
+  // A directory operation must not fall on a base file or symlink, nor share a path with one.
+  for path in &dir_paths {
+    if file_paths.contains(path) || base_file(path) || base_sym(path) {
       return Err(DeriveError::PathIsFileAndDirectory((*path).to_owned()));
+    }
+  }
+  // A symlink create must not fall on a base file or directory, nor share a path with a file or
+  // directory operation.
+  for path in &sym_intent {
+    if file_paths.contains(path) || dir_paths.contains(path) || base_file(path) || base_dir(path) {
+      return Err(DeriveError::PathKindConflict((*path).to_owned()));
     }
   }
   Ok(())
@@ -720,6 +868,7 @@ fn document_names(
   removed: &[String],
   directories: &[DirectoryEmission],
   modes: &[(String, u32)],
+  symlinks: &[SymlinkEmission],
 ) -> Vec<String> {
   let mut names: Vec<String> = Vec::new();
   for emission in emissions {
@@ -737,18 +886,73 @@ fn document_names(
   for (path, _) in modes {
     names.push(path.clone());
   }
+  for symlink in symlinks {
+    match symlink {
+      SymlinkEmission::Made(path, target) => {
+        names.push(path.clone());
+        names.push(target.clone());
+      }
+      SymlinkEmission::Removed(path) => names.push(path.clone()),
+    }
+  }
   names.sort_unstable();
   names.dedup();
   names
+}
+
+/// Emits the namespace operations — unlinks of removed base files, directory create/remove, mode
+/// changes, and symlink create/remove — into the document, resolving each path to its table index.
+fn emit_namespace(
+  doc: &mut OpsDoc,
+  names: &[String],
+  removed: Vec<String>,
+  directories: Vec<DirectoryEmission>,
+  modes: Vec<(String, u32)>,
+  symlinks: Vec<SymlinkEmission>,
+) {
+  let index_of = |name: &str| -> u16 {
+    names
+      .binary_search_by(|candidate| candidate.as_str().cmp(name))
+      .map_or(u16::MAX, |position| {
+        u16::try_from(position).unwrap_or(u16::MAX)
+      })
+  };
+  for origin in removed {
+    doc
+      .ops
+      .push(namespace_op(OpKind::Unlink, index_of(&origin)));
+  }
+  for directory in directories {
+    match directory {
+      DirectoryEmission::Made(path) => doc.ops.push(namespace_op(OpKind::Mkdir, index_of(&path))),
+      DirectoryEmission::Removed(path) => {
+        doc.ops.push(namespace_op(OpKind::Rmdir, index_of(&path)));
+      }
+    }
+  }
+  for (path, mode) in modes {
+    doc.ops.push(set_mode_op(index_of(&path), mode));
+  }
+  for symlink in symlinks {
+    match symlink {
+      SymlinkEmission::Made(path, target) => {
+        doc.ops.push(symlink_op(index_of(&path), index_of(&target)));
+      }
+      SymlinkEmission::Removed(path) => {
+        doc.ops.push(namespace_op(OpKind::Unlink, index_of(&path)));
+      }
+    }
+  }
 }
 
 fn seal(
   entities: Vec<Entity>,
   directories: Vec<DirectoryEmission>,
   modes: Vec<(String, u32)>,
+  symlinks: Vec<SymlinkEmission>,
 ) -> OpsDoc {
   let (mut emissions, removed) = classify(entities);
-  let names = document_names(&emissions, &removed, &directories, &modes);
+  let names = document_names(&emissions, &removed, &directories, &modes, &symlinks);
 
   let mut doc = OpsDoc::new();
   for name in &names {
@@ -775,23 +979,7 @@ fn seal(
     push_content(&mut doc, emission.ops, destination, region_offset);
     region_offset = region_offset.saturating_add(emission.final_len);
   }
-  for origin in removed {
-    let index = index_of(&origin);
-    doc.ops.push(namespace_op(OpKind::Unlink, index));
-  }
-  for directory in directories {
-    match directory {
-      DirectoryEmission::Made(path) => {
-        doc.ops.push(namespace_op(OpKind::Mkdir, index_of(&path)));
-      }
-      DirectoryEmission::Removed(path) => {
-        doc.ops.push(namespace_op(OpKind::Rmdir, index_of(&path)));
-      }
-    }
-  }
-  for (path, mode) in modes {
-    doc.ops.push(set_mode_op(index_of(&path), mode));
-  }
+  emit_namespace(&mut doc, &names, removed, directories, modes, symlinks);
   doc.canonicalize();
   doc
 }

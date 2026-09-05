@@ -511,6 +511,7 @@ fn removing_a_base_directory_is_one_rmdir() {
     files: Vec::new(),
     dirs: vec!["d".to_owned()],
     modes: Vec::new(),
+    symlinks: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -549,6 +550,7 @@ fn removing_then_recreating_a_base_directory_is_nothing() {
     files: Vec::new(),
     dirs: vec!["d".to_owned()],
     modes: Vec::new(),
+    symlinks: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -592,6 +594,7 @@ fn mkdir_over_a_base_directory_refuses() {
     files: Vec::new(),
     dirs: vec!["d".to_owned()],
     modes: Vec::new(),
+    symlinks: Vec::new(),
   };
   assert!(matches!(
     compose_volume(
@@ -659,6 +662,7 @@ proptest! {
       files: Vec::new(),
       dirs: base_dirs.clone(),
       modes: Vec::new(),
+      symlinks: Vec::new(),
     };
     let doc = compose_volume(&base, &journal).expect("a valid directory journal composes");
     // Reconstruct: start from the base directories, apply the document's Mkdir/Rmdir.
@@ -684,6 +688,7 @@ fn setting_a_base_file_mode_is_one_set_mode() {
     files: vec![("f".to_owned(), 4)],
     dirs: Vec::new(),
     modes: vec![("f".to_owned(), 0o644)],
+    symlinks: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -709,6 +714,7 @@ fn setting_a_mode_to_the_base_mode_is_nothing() {
     files: vec![("f".to_owned(), 4)],
     dirs: Vec::new(),
     modes: vec![("f".to_owned(), 0o644)],
+    symlinks: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -728,6 +734,7 @@ fn the_last_set_mode_wins() {
     files: vec![("f".to_owned(), 4)],
     dirs: Vec::new(),
     modes: vec![("f".to_owned(), 0o644)],
+    symlinks: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -758,6 +765,7 @@ fn setting_a_base_directory_mode() {
     files: Vec::new(),
     dirs: vec!["d".to_owned()],
     modes: vec![("d".to_owned(), 0o755)],
+    symlinks: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -822,6 +830,7 @@ fn set_mode_then_rename_refuses() {
     files: vec![("a".to_owned(), 4)],
     dirs: Vec::new(),
     modes: vec![("a".to_owned(), 0o644)],
+    symlinks: Vec::new(),
   };
   let result = compose_volume(
     &base,
@@ -837,4 +846,190 @@ fn set_mode_then_rename_refuses() {
     ],
   );
   assert!(matches!(result, Err(DeriveError::Unsupported(_))));
+}
+
+// --- Symlink composition ---
+
+/// The target string a Symlink op names (via its `src` index into the path table).
+fn symlink_target<'a>(doc: &'a OpsDoc, op: &Op) -> Option<&'a str> {
+  doc.paths.path(u16::try_from(op.src).unwrap_or(u16::MAX))
+}
+
+/// Creating a symlink is one `Symlink` op naming its target.
+#[test]
+fn creating_a_symlink_is_one_symlink() {
+  let doc = compose_volume(
+    &Base::default(),
+    &[VolumeOp::Symlink {
+      path: "link".to_owned(),
+      target: "target/path".to_owned(),
+    }],
+  )
+  .expect("valid");
+  let op = doc
+    .ops
+    .iter()
+    .find(|op| op.kind == OpKind::Symlink)
+    .expect("a symlink");
+  assert_eq!(doc.paths.path(op.path), Some("link"));
+  assert_eq!(symlink_target(&doc, op), Some("target/path"));
+}
+
+/// A symlink created then unlinked cancels.
+#[test]
+fn symlink_then_unlink_cancels() {
+  let doc = compose_volume(
+    &Base::default(),
+    &[
+      VolumeOp::Symlink {
+        path: "l".to_owned(),
+        target: "t".to_owned(),
+      },
+      VolumeOp::Unlink {
+        path: "l".to_owned(),
+      },
+    ],
+  )
+  .expect("valid");
+  assert!(doc.ops.is_empty());
+}
+
+/// Removing a base symlink is one `Unlink`.
+#[test]
+fn removing_a_base_symlink_is_one_unlink() {
+  let base = Base {
+    files: Vec::new(),
+    dirs: Vec::new(),
+    modes: Vec::new(),
+    symlinks: vec![("l".to_owned(), "t".to_owned())],
+  };
+  let doc = compose_volume(
+    &base,
+    &[VolumeOp::Unlink {
+      path: "l".to_owned(),
+    }],
+  )
+  .expect("valid");
+  assert_eq!(doc.ops.len(), 1);
+  assert_eq!(doc.ops[0].kind, OpKind::Unlink);
+  assert_eq!(doc.paths.path(doc.ops[0].path), Some("l"));
+}
+
+/// Retargeting a base symlink (unlink then symlink to a new target) is one `Symlink`, not an
+/// unlink and a symlink (the removal is covered by the recreation).
+#[test]
+fn retargeting_a_base_symlink_is_one_symlink() {
+  let base = Base {
+    files: Vec::new(),
+    dirs: Vec::new(),
+    modes: Vec::new(),
+    symlinks: vec![("l".to_owned(), "old".to_owned())],
+  };
+  let doc = compose_volume(
+    &base,
+    &[
+      VolumeOp::Unlink {
+        path: "l".to_owned(),
+      },
+      VolumeOp::Symlink {
+        path: "l".to_owned(),
+        target: "new".to_owned(),
+      },
+    ],
+  )
+  .expect("valid");
+  assert!(
+    !doc.ops.iter().any(|op| op.kind == OpKind::Unlink),
+    "no unlink — the recreation covers it"
+  );
+  let op = doc
+    .ops
+    .iter()
+    .find(|op| op.kind == OpKind::Symlink)
+    .expect("a symlink");
+  assert_eq!(symlink_target(&doc, op), Some("new"));
+}
+
+/// A base symlink removed then recreated to the same target is nothing.
+#[test]
+fn recreating_a_base_symlink_to_the_same_target_is_nothing() {
+  let base = Base {
+    files: Vec::new(),
+    dirs: Vec::new(),
+    modes: Vec::new(),
+    symlinks: vec![("l".to_owned(), "t".to_owned())],
+  };
+  let doc = compose_volume(
+    &base,
+    &[
+      VolumeOp::Unlink {
+        path: "l".to_owned(),
+      },
+      VolumeOp::Symlink {
+        path: "l".to_owned(),
+        target: "t".to_owned(),
+      },
+    ],
+  )
+  .expect("valid");
+  assert!(doc.ops.is_empty(), "net unchanged");
+}
+
+/// A symlink over an existing symlink is refused.
+#[test]
+fn symlink_over_an_existing_symlink_refuses() {
+  let base = Base {
+    files: Vec::new(),
+    dirs: Vec::new(),
+    modes: Vec::new(),
+    symlinks: vec![("l".to_owned(), "t".to_owned())],
+  };
+  assert!(matches!(
+    compose_volume(
+      &base,
+      &[VolumeOp::Symlink {
+        path: "l".to_owned(),
+        target: "u".to_owned()
+      }]
+    ),
+    Err(DeriveError::SymlinkOverExisting(_))
+  ));
+}
+
+/// A symlink at a base file path is a kind conflict.
+#[test]
+fn symlink_at_a_base_file_path_conflicts() {
+  let base = Base::of_files(vec![("f".to_owned(), 4)]);
+  assert!(matches!(
+    compose_volume(
+      &base,
+      &[VolumeOp::Symlink {
+        path: "f".to_owned(),
+        target: "t".to_owned()
+      }]
+    ),
+    Err(DeriveError::PathKindConflict(_))
+  ));
+}
+
+/// A write to a base symlink path is a kind conflict (a file operation on a symlink).
+#[test]
+fn a_write_on_a_base_symlink_conflicts() {
+  let base = Base {
+    files: Vec::new(),
+    dirs: Vec::new(),
+    modes: Vec::new(),
+    symlinks: vec![("l".to_owned(), "t".to_owned())],
+  };
+  assert!(matches!(
+    compose_volume(
+      &base,
+      &[VolumeOp::Overwrite {
+        path: "l".to_owned(),
+        at: 0,
+        len: 1
+      }]
+    ),
+    Err(DeriveError::PathIsFileAndDirectory(_))
+  ));
 }
