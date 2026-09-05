@@ -14,14 +14,15 @@
 //! This module is pure: it builds and reads byte buffers. slates never writes an archive to disk
 //! (R1); it lives in RAM, is handed to a caller, or is the replication/clone container.
 //!
-//! Scope: raw-encoded chunks. The codec pass (LZ4, zstd, dictionaries) and the manifest tree's
-//! structure are later Phase 7 work (owed); the format reserves their fields so an archive written
-//! then stays readable now.
+//! Scope: raw- and LZ4-encoded chunks, with the manifest a Merkle tree ([`crate::manifest`]).
+//! zstd, dictionaries, the cost model and export/restore are later Phase 7 work (owed); the format
+//! reserves their fields so an archive written then stays readable now.
 
 use crate::format::{
   ArchiveError, Chunk, Encoding, FORMAT_MAJOR, FORMAT_MINOR, MAGIC, SEEK_TABLE_MAGIC,
   TRAILER_MAGIC, flag,
 };
+use crate::manifest::Node;
 use crate::wire::{Reader, Writer};
 
 /// Format: the header is a fixed set of little-endian fields (major 1 has no variable-length
@@ -75,8 +76,8 @@ pub struct Archive {
   pub name_policy_id: u32,
   /// The Unicode version the policy used.
   pub unicode_version: u32,
-  /// The manifest bytes (the snapshot's tree; opaque here).
-  pub manifest: Vec<u8>,
+  /// The manifest tree (the snapshot's canonical, Merkle-hashed directory tree).
+  pub manifest: Node,
   /// The chunks, in manifest order.
   pub chunks: Vec<Chunk>,
 }
@@ -140,7 +141,8 @@ impl Archive {
   /// Encodes the archive to its byte stream. Deterministic: the same snapshot yields the same
   /// bytes on every platform (the identity gate).
   pub fn encode(&self) -> Vec<u8> {
-    let manifest_hash = hash_of(&self.manifest);
+    let manifest_bytes = self.manifest.encode();
+    let manifest_hash = self.manifest.identity();
     let raw_bytes: u64 = self.chunks.iter().map(|chunk| chunk.raw_len).sum();
     let stored_bytes: u64 = self.chunks.iter().map(|chunk| chunk.stored_len).sum();
 
@@ -180,8 +182,8 @@ impl Archive {
 
     // Manifest.
     let manifest_offset = writer.position();
-    writer.u64(self.manifest.len() as u64);
-    writer.raw(&self.manifest);
+    writer.u64(manifest_bytes.len() as u64);
+    writer.raw(&manifest_bytes);
 
     // Seek table: a zstd skippable frame (magic, frame size, then the entries).
     let seek_offset = writer.position();
@@ -223,8 +225,9 @@ impl Archive {
 
     let mut manifest_reader = Reader::at(bytes, sections.manifest_offset)?;
     let manifest_len = usize::try_from(manifest_reader.u64()?).unwrap_or(usize::MAX);
-    let manifest = manifest_reader.raw(manifest_len)?.to_vec();
-    if hash_of(&manifest) != header.manifest_hash {
+    let manifest_bytes = manifest_reader.raw(manifest_len)?;
+    let manifest = Node::decode(manifest_bytes).map_err(|_| ArchiveError::ManifestHashMismatch)?;
+    if manifest.identity() != header.manifest_hash {
       return Err(ArchiveError::ManifestHashMismatch);
     }
 

@@ -5,6 +5,7 @@
 
 use slates_archive::archive::Archive;
 use slates_archive::format::{ArchiveError, Chunk, Encoding};
+use slates_archive::manifest::{Entry, Node};
 
 use proptest::prelude::*;
 
@@ -24,7 +25,10 @@ fn sample() -> Archive {
     snapshot_id: 42,
     name_policy_id: 1,
     unicode_version: 15,
-    manifest: b"manifest tree bytes".to_vec(),
+    manifest: Node::Directory(vec![Entry {
+      name: "f".to_owned(),
+      node: Node::File(Vec::new()),
+    }]),
     chunks,
   }
 }
@@ -85,7 +89,7 @@ fn a_chunk_that_fails_its_identity_is_refused() {
     snapshot_id: 1,
     name_policy_id: 1,
     unicode_version: 15,
-    manifest: b"m".to_vec(),
+    manifest: Node::Directory(Vec::new()),
     chunks: vec![bogus],
   };
   let bytes = archive.encode();
@@ -194,7 +198,7 @@ fn compressible_data_is_stored_lz4() {
     snapshot_id: 1,
     name_policy_id: 1,
     unicode_version: 15,
-    manifest: b"m".to_vec(),
+    manifest: Node::Directory(Vec::new()),
     chunks: vec![chunk],
   };
   let bytes = archive.encode();
