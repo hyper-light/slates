@@ -16,7 +16,9 @@
 //! the ops document ([`ops_doc`]) serializes an increment's ops into the bytes whose BLAKE3 is
 //! half its identity, and the position mapping ([`map`]) shifts an increment's ranges forward
 //! through the intervening deltas to head coordinates for the verdict and the splice; the
-//! splice, the chain and the fleet commit are the engine's other pieces, built on these.
+//! splice ([`splice`]) applies a path's accepted ops to its base extent list by reference
+//! surgery (no byte copied); the chain and the fleet commit are the engine's other pieces, built
+//! on these.
 //!
 //! The fast path: when every path the increment touches was last changed at or before the
 //! increment's base version, the verdict is `Accept` with no range work — what a fresh basis
@@ -27,6 +29,7 @@ pub mod increment;
 pub mod map;
 pub mod ops_doc;
 pub mod range;
+pub mod splice;
 pub mod verdict;
 
 pub use derive::{ContentOp, compose_content, compose_content_sized};
@@ -34,6 +37,7 @@ pub use increment::{DeriveError, VolumeOp, compose_volume};
 pub use map::{Mapped, map_range};
 pub use ops_doc::{Op, OpKind, OpsDoc, PathTable};
 pub use range::{Range, RangeSet};
+pub use splice::{Extent, Source, splice};
 pub use verdict::{
   MergeConflictClass, PathVerdict, Verdict, compare_bytes, fast_path, path_verdict,
 };
