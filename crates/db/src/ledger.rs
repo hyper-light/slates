@@ -306,6 +306,19 @@ impl Owner {
     }
   }
 
+  /// Replicates `log` onto the reachable holders under this owner's epoch and returns the committed
+  /// prefix length. `log` must extend this owner's current log — the same values at every position
+  /// it already holds — so offering it whole catches up a returned holder and appends the new tail
+  /// without ever rewriting a committed position (the values agree there). It is idempotent and
+  /// resumable: re-offering the same log to a newly reachable holder simply completes it. The mirror
+  /// shipper replays the home region's committed prefix this way, and the healer brings a lagging
+  /// holder current, neither proposing a new record.
+  pub fn replicate(&mut self, cohort: &mut Cohort, log: &[[u8; 32]], reachable: &Reach) -> usize {
+    self.log = log.to_vec();
+    let _ = cohort.offer(self.epoch, &self.log, reachable);
+    cohort.committed_prefix().len()
+  }
+
   /// Takes over the register as `new_id`: fences and reads a reachable quorum (phase one), then
   /// adopts, per position, the record carried under the highest epoch read. The new epoch is the
   /// successor of the highest any holder has seen, so it fences the superseded owner on the quorum

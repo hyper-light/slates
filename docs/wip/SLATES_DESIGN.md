@@ -1345,9 +1345,14 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 > histories checks Agreement (no position holds two quorum-agreed values), NoLoss and TotalOrder
 > (the committed prefix only extends and never rewrites), Continuity (a takeover adopts at least
 > the committed prefix), and StaleNeverCommits (a fenced owner reaches at most `f` holders), the
-> properties the `FencedRegister` model proved. Wiring this into the server's put path (hedged
-> placement, recorded holder sets), the healer and probation, mirroring, migration on a
-> write-intent attachment, and the SWIM membership are the rest of Phase 8.
+> properties the `FencedRegister` model proved. Asynchronous mirroring is also implemented
+> (`crates/db/src/mirror.rs`): a `Mirror` is a second cohort in another failure domain whose `ship`
+> replays the home region's committed prefix in epoch order through `Owner::replicate` (idempotent,
+> resumable), exposing the lag and answering `await placed(mirror)` — closing the mirror durability
+> scope `register.rs` declared. Wiring this into the server's put path (hedged placement, recorded
+> holder sets), the healer and probation, the mirror shipper's runtime cadence and cross-region
+> transport, migration on a write-intent attachment, the SWIM membership, and the configuration
+> group's reconfiguration are the rest of Phase 8.
 
 **Role.** The authoritative record of volumes, snapshots, lineage, leases, attachments,
 accounting, completion records, grants, chains and the operation log; served locally in

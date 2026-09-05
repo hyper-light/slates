@@ -20,12 +20,15 @@
 //! [`record`] (the log record format over the segment's ring), [`register`] (the register
 //! primitives of §4.8 — the quorum, the fence, rendezvous placement, the configuration oracle),
 //! [`ledger`] (the fenced ledger register: the register over time, commit at `f + 1`, and takeover
-//! by phase-one adoption), [`replay`] (recovery and the snapshot policy), [`error`].
+//! by phase-one adoption), [`mirror`] (asynchronous mirroring of the committed prefix to a second
+//! region in epoch order with an exposed lag), [`replay`] (recovery and the snapshot policy),
+//! [`error`].
 
 pub mod art;
 pub mod catalog;
 pub mod error;
 pub mod ledger;
+pub mod mirror;
 pub mod op;
 pub mod partition;
 pub mod record;
@@ -35,6 +38,7 @@ pub mod replay;
 pub use art::Art;
 pub use error::DbError;
 pub use ledger::{Cohort, Commit, Owner, Reach, Record, TakeoverError};
+pub use mirror::Mirror;
 pub use op::Op;
 pub use partition::Partition;
 pub use register::{Configuration, DurabilityScope, Fence, HostEpoch, HostId, Placement, Quorum};
