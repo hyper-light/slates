@@ -30,7 +30,7 @@ pub mod range;
 pub mod verdict;
 
 pub use derive::{ContentOp, compose_content, compose_content_sized};
-pub use increment::{FileOp, compose_increment};
+pub use increment::{DeriveError, VolumeOp, compose_volume};
 pub use map::{Mapped, map_range};
 pub use ops_doc::{Op, OpKind, OpsDoc, PathTable};
 pub use range::{Range, RangeSet};

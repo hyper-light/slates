@@ -1,139 +1,149 @@
-//! Oracle and worked-case tests for the increment assembler (§4.16 "Composition at seal";
-//! T-6.x). A whole-volume content journal composes into one ops document whose per-path ops name
-//! added bytes by their offset in the increment's post-state (the paths' final contents
-//! concatenated in sorted order). The property: reconstructing each path from its base version
-//! and its net ops — drawing added bytes from the post-state at the global source offset —
-//! reproduces that path's final content, for every path.
+//! Oracle and worked-case tests for the whole-volume deriver (§4.16 "Composition at seal";
+//! T-6.x). A journal of content, create and unlink operations composes into one ops document. The
+//! property: reconstructing the final filesystem from the base version and the document — creating
+//! where a `Create` says, removing where an `Unlink` says, applying content ops and drawing added
+//! bytes from the post-state — reproduces the model filesystem the journal actually produced.
 //!
-//! The oracle simulates each file's journal at the byte level to get its final content, lays out
-//! the post-state exactly as the assembler does, then reconstructs from the ops document and
-//! compares. Base bytes (values 0–127) and added bytes (values 128–255) are drawn from disjoint
-//! ranges, so any op placed on the wrong path, at the wrong offset, or with the wrong source
-//! offset diverges.
+//! The oracle keeps a byte-level model of the filesystem, applies the journal to it (only ever
+//! generating valid operations, so the deriver never refuses), lays out the post-state as the
+//! deriver does, then reconstructs from the document and compares. Base bytes (values 0–127) and
+//! added bytes (values 128–255) are disjoint, so a misplaced op, a wrong length, a wrong source,
+//! or a missing create/unlink diverges.
 
-use slates_merge::increment::{FileOp, compose_increment};
-use slates_merge::ops_doc::{Op, OpKind};
+use std::collections::BTreeMap;
+
+use slates_merge::increment::{VolumeOp, compose_volume};
+use slates_merge::ops_doc::{Op, OpKind, OpsDoc};
 
 use proptest::prelude::*;
 
 /// Shape: the largest run a generated add contributes.
 const MAX_ADD: u64 = 16;
 
-/// A base byte for a path `seed` at position `index`: a value in 0..=127.
+/// The fixed paths a journal touches.
+const PATHS: [&str; 3] = ["a", "b", "c"];
+
+/// A base byte for path `seed` at position `index`: a value in 0..=127.
 fn base_byte(seed: u64, index: u64) -> u8 {
   u8::try_from((seed.wrapping_mul(31).wrapping_add(index.wrapping_mul(7))) & 0x7f).unwrap_or(0)
 }
 
-/// The next added byte: a value in 128..=255, varying by the global counter so a wrong source
-/// offset picks up visibly different bytes.
+/// The next added byte: a value in 128..=255, varying by the global counter.
 fn add_byte(counter: &mut u64) -> u8 {
   let value = 0x80 | (*counter & 0x7f);
   *counter = counter.wrapping_add(1);
   u8::try_from(value).unwrap_or(0x80)
 }
 
-/// A raw op the strategy generates for one path, interpreted against that path's running length.
+/// The seed (and base-byte pattern) for a path name.
+fn seed_of(path: &str) -> u64 {
+  u64::try_from(PATHS.iter().position(|p| *p == path).unwrap_or(0)).unwrap_or(0)
+}
+
+/// A raw op the strategy generates.
 #[derive(Clone, Copy, Debug)]
 struct Raw {
+  path: u8,
   kind: u8,
   a: u64,
   b: u64,
 }
 
-/// Simulates one path's journal at the byte level, returning its declared content ops and its
-/// final content. `counter` is shared across paths so added bytes are globally distinct.
-fn simulate_path(
-  seed: u64,
-  base_len: u64,
-  raw_ops: &[Raw],
-  counter: &mut u64,
-) -> (Vec<FileOp>, Vec<u8>) {
-  let path = format!("f{seed}");
-  let mut file: Vec<u8> = (0..base_len).map(|i| base_byte(seed, i)).collect();
-  let mut ops = Vec::new();
-  for raw in raw_ops {
-    let current = file.len() as u64;
-    match raw.kind % 5 {
-      0 => {
-        if current == 0 {
-          continue;
-        }
-        let at = raw.a % current;
-        let len = 1 + raw.b % (current - at);
-        for offset in 0..len {
-          let index = usize::try_from(at + offset).unwrap_or(0);
-          file[index] = add_byte(counter);
-        }
-        ops.push(FileOp::Overwrite {
-          path: path.clone(),
-          at,
-          len,
-        });
+/// The oracle's model: the present files and their bytes.
+type Model = BTreeMap<String, Vec<u8>>;
+
+/// Applies one raw op to a present file, mutating its bytes, and returns the content `VolumeOp`
+/// it stands for (or `None` when the raw op is skipped, e.g. an overwrite of an empty file).
+fn content_op(file: &mut Vec<u8>, path: String, raw: &Raw, counter: &mut u64) -> Option<VolumeOp> {
+  let current = file.len() as u64;
+  match raw.kind % 6 {
+    0 if current > 0 => {
+      let at = raw.a % current;
+      let len = 1 + raw.b % (current - at);
+      for offset in 0..len {
+        let index = usize::try_from(at + offset).unwrap_or(0);
+        file[index] = add_byte(counter);
       }
-      1 => {
-        let len = 1 + raw.b % MAX_ADD;
-        let at = current;
-        for _ in 0..len {
-          let byte = add_byte(counter);
-          file.push(byte);
-        }
-        ops.push(FileOp::Extend {
-          path: path.clone(),
-          at,
-          len,
-        });
-      }
-      2 => {
-        let len = raw.a % (current + MAX_ADD + 1);
-        if len < current {
-          file.truncate(usize::try_from(len).unwrap_or(0));
-        } else if len > current {
-          file.resize(usize::try_from(len).unwrap_or(0), 0);
-        }
-        ops.push(FileOp::Truncate {
-          path: path.clone(),
-          len,
-        });
-      }
-      3 => {
-        let at = raw.a % (current + 1);
-        let len = 1 + raw.b % MAX_ADD;
-        let mut bytes = Vec::new();
-        for _ in 0..len {
-          bytes.push(add_byte(counter));
-        }
-        let tail = file.split_off(usize::try_from(at).unwrap_or(0));
-        file.extend_from_slice(&bytes);
-        file.extend_from_slice(&tail);
-        ops.push(FileOp::Insert {
-          path: path.clone(),
-          at,
-          len,
-        });
-      }
-      _ => {
-        if current == 0 {
-          continue;
-        }
-        let at = raw.a % current;
-        let len = 1 + raw.b % (current - at);
-        let start = usize::try_from(at).unwrap_or(0);
-        let end = usize::try_from(at + len).unwrap_or(start);
-        file.drain(start..end);
-        ops.push(FileOp::Delete {
-          path: path.clone(),
-          at,
-          len,
-        });
-      }
+      Some(VolumeOp::Overwrite { path, at, len })
     }
+    1 => {
+      let len = 1 + raw.b % MAX_ADD;
+      let at = current;
+      for _ in 0..len {
+        let byte = add_byte(counter);
+        file.push(byte);
+      }
+      Some(VolumeOp::Extend { path, at, len })
+    }
+    2 => {
+      let len = raw.a % (current + MAX_ADD + 1);
+      if len < current {
+        file.truncate(usize::try_from(len).unwrap_or(0));
+      } else if len > current {
+        file.resize(usize::try_from(len).unwrap_or(0), 0);
+      }
+      Some(VolumeOp::Truncate { path, len })
+    }
+    3 => {
+      let at = raw.a % (current + 1);
+      let len = 1 + raw.b % MAX_ADD;
+      let mut bytes = Vec::new();
+      for _ in 0..len {
+        bytes.push(add_byte(counter));
+      }
+      let tail = file.split_off(usize::try_from(at).unwrap_or(0));
+      file.extend_from_slice(&bytes);
+      file.extend_from_slice(&tail);
+      Some(VolumeOp::Insert { path, at, len })
+    }
+    4 if current > 0 => {
+      let at = raw.a % current;
+      let len = 1 + raw.b % (current - at);
+      let start = usize::try_from(at).unwrap_or(0);
+      let end = usize::try_from(at + len).unwrap_or(start);
+      file.drain(start..end);
+      Some(VolumeOp::Delete { path, at, len })
+    }
+    _ => None,
   }
-  (ops, file)
 }
 
-/// Reconstructs one path's final content from its base bytes and its net ops (those of the ops
-/// document with this path index), drawing added bytes from the global post-state at each op's
-/// source offset. The ops are in base coordinates and non-decreasing by `at`.
+/// Applies the raw ops to a model built from `base`, generating only valid `VolumeOp`s, and
+/// returns the journal and the final model.
+fn simulate(base: &[(String, u64)], raw_ops: &[Raw]) -> (Vec<VolumeOp>, Model) {
+  let mut model: Model = base
+    .iter()
+    .map(|(path, len)| {
+      let seed = seed_of(path);
+      (
+        path.clone(),
+        (0..*len).map(|i| base_byte(seed, i)).collect(),
+      )
+    })
+    .collect();
+  let mut journal = Vec::new();
+  let mut counter = 0u64;
+  for raw in raw_ops {
+    let path = PATHS[usize::from(raw.path) % PATHS.len()].to_owned();
+    if !model.contains_key(&path) {
+      // Only a create is valid on an absent path.
+      model.insert(path.clone(), Vec::new());
+      journal.push(VolumeOp::Create { path });
+    } else if raw.kind % 6 == 5 {
+      model.remove(&path);
+      journal.push(VolumeOp::Unlink { path });
+    } else if let Some(file) = model.get_mut(&path)
+      && let Some(op) = content_op(file, path, raw, &mut counter)
+    {
+      journal.push(op);
+    }
+  }
+  (journal, model)
+}
+
+/// Reconstructs one path's content from its base bytes and its net ops, drawing added bytes from
+/// the post-state. The ops are in base coordinates and non-decreasing by `at`; `Create` and
+/// `Unlink` carry no content and are handled by the caller.
 fn apply_net(base: &[u8], net: &[Op], post_state: &[u8], base_len: u64) -> Vec<u8> {
   let mut out = Vec::new();
   let mut base_pos = 0u64;
@@ -169,178 +179,206 @@ fn apply_net(base: &[u8], net: &[Op], post_state: &[u8], base_len: u64) -> Vec<u
   out
 }
 
-/// Round-robins the per-path op lists into one journal, preserving each path's own order (which is
-/// all the assembler depends on).
-fn interleave(per_path: &[Vec<FileOp>]) -> Vec<FileOp> {
-  let mut journal = Vec::new();
-  let longest = per_path.iter().map(Vec::len).max().unwrap_or(0);
-  for step in 0..longest {
-    for ops in per_path {
-      if let Some(op) = ops.get(step) {
-        journal.push(op.clone());
-      }
-    }
-  }
-  journal
-}
+/// Reconstructs the whole filesystem from the base and the ops document, and asserts it equals
+/// the model the journal produced.
+fn check(base: &[(String, u64)], doc: &OpsDoc, model: &Model) {
+  let base_len_of = |path: &str| base.iter().find(|(p, _)| p == path).map_or(0, |(_, l)| *l);
 
-/// Runs the oracle. The document's path table is authoritative: it holds exactly the paths the
-/// journal touched, in sorted order, which is also the post-state layout. A path with no
-/// operations is absent from the document, and its final content equals its base.
-fn check(paths: &[(u64, u64, Vec<u8>)], journal: &[FileOp]) {
-  let base: Vec<(String, u64)> = paths
-    .iter()
-    .map(|(seed, base_len, _)| (format!("f{seed}"), *base_len))
-    .collect();
-  let doc = compose_increment(&base, journal);
-  // Look up a path's model record by its name.
-  let record = |name: &str| paths.iter().find(|(seed, _, _)| format!("f{seed}") == name);
-
-  // The post-state: the final content of every path in the document, in its path-table order.
+  // The post-state: the final content of every path in the document that survives, in path-table
+  // order (the deriver's region layout).
   let mut post_state = Vec::new();
   for name in doc.paths.paths() {
-    if let Some((_, _, final_bytes)) = record(name) {
-      post_state.extend_from_slice(final_bytes);
+    if let Some(content) = model.get(name) {
+      post_state.extend_from_slice(content);
     }
   }
-  // Each path in the document reconstructs from its base and its net ops.
+
+  // Reconstruct each path the document names.
+  let mut reconstructed: Model = BTreeMap::new();
   for (path_index, name) in doc.paths.paths().iter().enumerate() {
-    let Some((seed, base_len, final_bytes)) = record(name) else {
-      continue;
-    };
-    let base_bytes: Vec<u8> = (0..*base_len).map(|i| base_byte(*seed, i)).collect();
     let index = u16::try_from(path_index).unwrap_or(u16::MAX);
-    let net: Vec<Op> = doc
+    let ops: Vec<Op> = doc
       .ops
       .iter()
       .copied()
       .filter(|op| op.path == index)
       .collect();
-    let reconstructed = apply_net(&base_bytes, &net, &post_state, *base_len);
-    assert_eq!(&reconstructed, final_bytes, "path {name} reconstructs");
+    if ops.iter().any(|op| op.kind == OpKind::Unlink) {
+      continue; // removed
+    }
+    let created = ops.iter().any(|op| op.kind == OpKind::Create);
+    let content: Vec<Op> = ops
+      .into_iter()
+      .filter(|op| op.kind != OpKind::Create)
+      .collect();
+    let (base_bytes, base_len) = if created {
+      (Vec::new(), 0u64)
+    } else {
+      let seed = seed_of(name);
+      let len = base_len_of(name);
+      ((0..len).map(|i| base_byte(seed, i)).collect(), len)
+    };
+    reconstructed.insert(
+      name.clone(),
+      apply_net(&base_bytes, &content, &post_state, base_len),
+    );
   }
-  // A path the journal never touched is absent from the document, and its final equals its base.
-  for (seed, base_len, final_bytes) in paths {
-    let name = format!("f{seed}");
-    if !doc.paths.paths().iter().any(|p| p == &name) {
-      let base_bytes: Vec<u8> = (0..*base_len).map(|i| base_byte(*seed, i)).collect();
-      assert_eq!(
-        final_bytes, &base_bytes,
-        "untouched path {name} equals its base"
+
+  // Base paths the document does not name are unchanged from the base.
+  for (path, len) in base {
+    if !doc.paths.paths().iter().any(|p| p == path) {
+      let seed = seed_of(path);
+      reconstructed.insert(
+        path.clone(),
+        (0..*len).map(|i| base_byte(seed, i)).collect(),
       );
     }
   }
-}
 
-/// Two independent files, each edited, assemble into one document; both reconstruct.
-#[test]
-fn two_files_assemble_and_each_reconstructs() {
-  let mut counter = 0u64;
-  let (ops_a, final_a) = simulate_path(
-    0,
-    10,
-    &[Raw {
-      kind: 0,
-      a: 2,
-      b: 3,
-    }],
-    &mut counter,
+  assert_eq!(
+    &reconstructed, model,
+    "the reconstructed filesystem equals the model"
   );
-  let (ops_b, final_b) = simulate_path(
-    1,
-    6,
-    &[Raw {
-      kind: 3,
-      a: 3,
-      b: 4,
-    }],
-    &mut counter,
-  );
-  let journal = interleave(&[ops_a, ops_b]);
-  check(&[(0, 10, final_a), (1, 6, final_b)], &journal);
 }
 
-/// The assembler names each path; the document's path table holds them sorted.
+/// A create then an unlink of a new file cancels: nothing is declared.
 #[test]
-fn the_path_table_holds_the_touched_paths_sorted() {
-  let journal = vec![
-    FileOp::Overwrite {
-      path: "z".to_owned(),
-      at: 0,
-      len: 1,
-    },
-    FileOp::Overwrite {
-      path: "a".to_owned(),
-      at: 0,
-      len: 1,
-    },
-  ];
-  let doc = compose_increment(&[("z".to_owned(), 4), ("a".to_owned(), 4)], &journal);
-  assert_eq!(doc.paths.paths(), &["a".to_owned(), "z".to_owned()]);
-}
-
-/// The identity is independent of the order paths (and their operations) were declared in: the
-/// same per-path work in two interleavings yields the same ops document identity (the sorted
-/// post-state layout is what makes this hold).
-#[test]
-fn the_identity_is_independent_of_declaration_order() {
-  let mut counter = 0u64;
-  let (ops_a, _fa) = simulate_path(
-    0,
-    8,
+fn a_create_then_unlink_cancels() {
+  let doc = compose_volume(
+    &[],
     &[
-      Raw {
-        kind: 3,
-        a: 2,
-        b: 5,
+      VolumeOp::Create {
+        path: "n".to_owned(),
       },
-      Raw {
-        kind: 0,
-        a: 1,
-        b: 2,
+      VolumeOp::Unlink {
+        path: "n".to_owned(),
       },
     ],
-    &mut counter,
-  );
-  let (ops_b, _fb) = simulate_path(
-    1,
-    5,
-    &[Raw {
-      kind: 1,
-      a: 0,
-      b: 3,
+  )
+  .expect("valid");
+  assert!(doc.ops.is_empty(), "create then unlink declares nothing");
+  assert!(doc.paths.paths().is_empty());
+}
+
+/// Unlinking a base file is one `Unlink`.
+#[test]
+fn unlinking_a_base_file_is_one_unlink() {
+  let doc = compose_volume(
+    &[("d".to_owned(), 8)],
+    &[VolumeOp::Unlink {
+      path: "d".to_owned(),
     }],
-    &mut counter,
+  )
+  .expect("valid");
+  assert_eq!(doc.ops.len(), 1);
+  assert_eq!(doc.ops[0].kind, OpKind::Unlink);
+  assert_eq!(doc.paths.path(doc.ops[0].path), Some("d"));
+}
+
+/// Creating a file and writing it is a `Create` and its bytes as an insert.
+#[test]
+fn creating_and_writing_a_file_is_create_then_insert() {
+  let doc = compose_volume(
+    &[],
+    &[
+      VolumeOp::Create {
+        path: "n".to_owned(),
+      },
+      VolumeOp::Extend {
+        path: "n".to_owned(),
+        at: 0,
+        len: 5,
+      },
+    ],
+  )
+  .expect("valid");
+  assert_eq!(doc.ops.len(), 2, "a create and one content op");
+  assert!(
+    doc.ops.iter().any(|op| op.kind == OpKind::Create),
+    "the new file is declared with a create"
   );
-  let base = vec![("f0".to_owned(), 8), ("f1".to_owned(), 5)];
-  let forward = interleave(&[ops_a.clone(), ops_b.clone()]);
-  let backward = interleave(&[ops_b, ops_a]);
-  let first = compose_increment(&base, &forward);
-  let second = compose_increment(&base, &backward);
-  assert_eq!(first.identity(), second.identity());
+  let content = doc
+    .ops
+    .iter()
+    .find(|op| matches!(op.kind, OpKind::Insert | OpKind::Extend))
+    .expect("the written bytes are an insert or extend");
+  assert_eq!(content.len, 5);
+}
+
+/// Unlinking a base file then recreating and writing it replaces its content: a delete of the
+/// base and the new bytes, with no `Create` (the path existed at base).
+#[test]
+fn recreating_a_base_file_replaces_its_content() {
+  let doc = compose_volume(
+    &[("d".to_owned(), 10)],
+    &[
+      VolumeOp::Unlink {
+        path: "d".to_owned(),
+      },
+      VolumeOp::Create {
+        path: "d".to_owned(),
+      },
+      VolumeOp::Extend {
+        path: "d".to_owned(),
+        at: 0,
+        len: 4,
+      },
+    ],
+  )
+  .expect("valid");
+  assert!(
+    !doc.ops.iter().any(|op| op.kind == OpKind::Create),
+    "a replaced base path declares no create"
+  );
+  assert!(doc.ops.iter().any(|op| op.kind == OpKind::Delete));
+  assert!(
+    doc
+      .ops
+      .iter()
+      .any(|op| matches!(op.kind, OpKind::Insert | OpKind::Extend))
+  );
+}
+
+/// Content on a missing file is a typed refusal, not a panic.
+#[test]
+fn content_on_a_missing_file_refuses() {
+  let result = compose_volume(
+    &[],
+    &[VolumeOp::Overwrite {
+      path: "gone".to_owned(),
+      at: 0,
+      len: 1,
+    }],
+  );
+  assert!(matches!(
+    result,
+    Err(slates_merge::increment::DeriveError::ContentOnMissing(_))
+  ));
 }
 
 proptest! {
-  /// T-6.6 (the assembler oracle): for any three files with any base lengths and any in-bounds
-  /// journals, every path reconstructs from its base and its net ops drawing from the post-state.
+  /// T-6.7 (the whole-volume oracle): for any base and any valid journal of content, create and
+  /// unlink across three paths, reconstructing the filesystem from the increment reproduces the
+  /// model the journal produced.
   #[test]
-  fn every_path_reconstructs_from_the_increment(
-    base_lens in prop::array::uniform3(0u64..40),
-    raws in prop::array::uniform3(proptest::collection::vec(
-      (any::<u8>(), 0u64..80, 0u64..80).prop_map(|(kind, a, b)| Raw { kind, a, b }),
-      0..12,
-    )),
+  fn the_increment_reconstructs_the_filesystem(
+    base_present in prop::array::uniform3(any::<bool>()),
+    base_lens in prop::array::uniform3(0u64..24),
+    raw in proptest::collection::vec(
+      (0u8..3, any::<u8>(), 0u64..64, 0u64..64)
+        .prop_map(|(path, kind, a, b)| Raw { path, kind, a, b }),
+      0..24,
+    ),
   ) {
-    let mut counter = 0u64;
-    let mut per_path = Vec::new();
-    let mut paths = Vec::new();
-    for seed in 0u64..3 {
-      let index = usize::try_from(seed).unwrap_or(0);
-      let (ops, final_bytes) = simulate_path(seed, base_lens[index], &raws[index], &mut counter);
-      per_path.push(ops);
-      paths.push((seed, base_lens[index], final_bytes));
-    }
-    let journal = interleave(&per_path);
-    check(&paths, &journal);
+    let base: Vec<(String, u64)> = PATHS
+      .iter()
+      .enumerate()
+      .filter(|(i, _)| base_present[*i])
+      .map(|(i, name)| ((*name).to_owned(), base_lens[i]))
+      .collect();
+    let (journal, model) = simulate(&base, &raw);
+    let composed = compose_volume(&base, &journal);
+    prop_assert!(composed.is_ok(), "a generated journal composes");
+    check(&base, &composed.unwrap_or_default(), &model);
   }
 }
