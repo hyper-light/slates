@@ -168,8 +168,10 @@ fn the_restart_policy_derives_from_the_recovery_budget() {
 }
 
 /// The child: attaches from the environment, beats `CHILD_BEATS` times, exits with
-/// `CHILD_EXIT`. Passes trivially when not spawned as the child.
+/// `CHILD_EXIT`. Ignored so `cargo test` never runs it as an in-process thread (the parent's
+/// env mutation would race into it); the parent spawns it with `--ignored --exact`.
 #[test]
+#[ignore = "the supervised child; run by a_crashing_daemon_... with --ignored"]
 fn supervised_child() {
   let Ok(beats) = std::env::var(CHILD_BEATS) else {
     return;
@@ -228,6 +230,7 @@ fn a_crashing_daemon_is_restarted_until_the_derived_bound_and_the_segment_says_s
     .to_string_lossy()
     .into_owned();
   let args = vec![
+    "--ignored".to_owned(),
     "--exact".to_owned(),
     "supervised_child".to_owned(),
     "--nocapture".to_owned(),

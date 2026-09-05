@@ -205,6 +205,49 @@ impl WriteOut {
   }
 }
 
+/// A `STATFS` reply (`struct fuse_statfs_out` wrapping `fuse_kstatfs`): blocks, bfree, bavail,
+/// files, ffree, bsize, namelen, frsize, then padding and spare words.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StatfsOut {
+  /// Total data blocks.
+  pub blocks: u64,
+  /// Free blocks.
+  pub bfree: u64,
+  /// Free blocks available to the caller.
+  pub bavail: u64,
+  /// Total file nodes.
+  pub files: u64,
+  /// Free file nodes.
+  pub ffree: u64,
+  /// The block size.
+  pub bsize: u32,
+  /// The maximum name length.
+  pub namelen: u32,
+  /// The fragment size.
+  pub frsize: u32,
+}
+
+impl StatfsOut {
+  /// Shape: the spare words `fuse_kstatfs` reserves (six 32-bit words) left zero.
+  const SPARE_WORDS: usize = 6 * size_of::<u32>();
+
+  /// The reply as a byte block.
+  pub fn to_bytes(&self) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u64(self.blocks);
+    w.u64(self.bfree);
+    w.u64(self.bavail);
+    w.u64(self.files);
+    w.u64(self.ffree);
+    w.u32(self.bsize);
+    w.u32(self.namelen);
+    w.u32(self.frsize);
+    w.pad(size_of::<u32>()); // padding
+    w.pad(Self::SPARE_WORDS);
+    w.into_bytes()
+  }
+}
+
 /// Builds a `readdir` reply buffer one entry at a time (`struct fuse_dirent`: ino, off,
 /// namelen, type, then the name, each entry padded to an 8-byte boundary). The kernel gave a
 /// maximum size in the read request; entries are added until the next would exceed it, so the

@@ -136,6 +136,30 @@ impl Bridge for Mock {
   fn flush(&mut self, _nodeid: u64, _fh: u64) -> Result<(), i32> {
     Ok(())
   }
+  fn mkdir(&mut self, _parent: u64, _name: &str, _mode: u32) -> Result<EntryOut, i32> {
+    Err(ENOSYS)
+  }
+  fn unlink(&mut self, _parent: u64, _name: &str) -> Result<(), i32> {
+    Err(ENOSYS)
+  }
+  fn rmdir(&mut self, _parent: u64, _name: &str) -> Result<(), i32> {
+    Err(ENOSYS)
+  }
+  fn symlink(&mut self, _parent: u64, _name: &str, _target: &str) -> Result<EntryOut, i32> {
+    Err(ENOSYS)
+  }
+  fn readlink(&mut self, _nodeid: u64) -> Result<String, i32> {
+    Err(ENOSYS)
+  }
+  fn rename(&mut self, _op: u64, _on: &str, _np: u64, _nn: &str) -> Result<(), i32> {
+    Err(ENOSYS)
+  }
+  fn setattr(&mut self, _nodeid: u64, _valid: u32, _size: u64, _mode: u32) -> Result<Attr, i32> {
+    Err(ENOSYS)
+  }
+  fn statfs(&mut self, _nodeid: u64) -> Result<slates_bridge_fuse::reply::StatfsOut, i32> {
+    Err(ENOSYS)
+  }
 }
 
 fn message(opcode: u32, unique: u64, nodeid: u64, body: &[u8]) -> Vec<u8> {

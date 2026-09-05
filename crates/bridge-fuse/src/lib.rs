@@ -30,6 +30,6 @@ pub use abi::{FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, Opcode};
 pub use bridge::{Bridge, DirEntry, dispatch};
 pub use error::FuseError;
 pub use init::{InitNegotiation, negotiate};
-pub use reply::{Attr, EntryOut, OpenOut, ReplyHeader, WriteOut};
+pub use reply::{Attr, EntryOut, OpenOut, ReplyHeader, StatfsOut, WriteOut};
 pub use request::{InHeader, Request};
 pub use volume_bridge::VolumeBridge;

@@ -463,6 +463,75 @@ impl Volume {
     self.create_file(store, dir, name, mode)
   }
 
+  /// Creates a directory named `name` in the directory named by inode number `dir_no`; the new
+  /// directory's inode number.
+  pub fn mkdir_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    mode: u32,
+  ) -> Result<InodeNo, VfsError> {
+    let dir = self.current_dir(store, dir_no)?;
+    let handle = self.mkdir(store, dir, name, mode)?;
+    Ok(
+      store
+        .dirs
+        .get(handle)
+        .map_err(|_| VfsError::StaleHandle)?
+        .inode,
+    )
+  }
+
+  /// Creates a symlink named `name` (to `target`) in the directory named by `dir_no`.
+  pub fn symlink_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    target: &str,
+  ) -> Result<InodeNo, VfsError> {
+    let dir = self.current_dir(store, dir_no)?;
+    self.symlink(store, dir, name, target)
+  }
+
+  /// Unlinks `name` from the directory named by inode number `dir_no`.
+  pub fn unlink_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+  ) -> Result<(), VfsError> {
+    let dir = self.current_dir(store, dir_no)?;
+    self.unlink(store, dir, name)
+  }
+
+  /// Removes the directory `name` from the directory named by inode number `dir_no`.
+  pub fn rmdir_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+  ) -> Result<(), VfsError> {
+    let dir = self.current_dir(store, dir_no)?;
+    self.rmdir(store, dir, name)
+  }
+
+  /// Renames `from_name` under `from_dir_no` to `to_name` under `to_dir_no` (both inode
+  /// numbers).
+  pub fn rename_no(
+    &mut self,
+    store: &mut Store,
+    from_dir_no: InodeNo,
+    from_name: &str,
+    to_dir_no: InodeNo,
+    to_name: &str,
+  ) -> Result<(), VfsError> {
+    let from = self.current_dir(store, from_dir_no)?;
+    let to = self.current_dir(store, to_dir_no)?;
+    self.rename(store, from, from_name, to, to_name)
+  }
+
   /// The target of a symlink.
   pub fn readlink(&self, store: &Store, no: InodeNo) -> Result<Box<str>, VfsError> {
     match &self.inode(store, no)?.body {

@@ -853,9 +853,19 @@ mapped to the Linux errno the kernel expects. The volume core gained by-inode-nu
 not handles. Gated (`crates/bridge-fuse/tests/volume_bridge.rs`, 2 tests, every host — a scratch
 volume is pure RAM): a whole FUSE round trip through the real volume core (CREATE a file, WRITE
 to it, LOOKUP it, GETATTR its size, OPEN and READ the bytes back, READDIR the root lists it) and
-the typed errnos (a missing name is ENOENT, a stale handle is EINVAL). Owed: generation-tracked
-node-id reuse after `forget` (§4.6 `(no, gen)`), setattr/mkdir/unlink/rename/symlink/link/statfs
-dispatch, and the kernel invalidation notifications — all with the transport.
+the typed errnos (a missing name is ENOENT, a stale handle is EINVAL). The metadata ops followed the same day: the Bridge trait, the dispatch and the VolumeBridge
+gained mkdir, unlink, rmdir, rename (and rename2), symlink, readlink, setattr (size → truncate,
+mode → chmod, by the `valid` mask) and statfs, with the volume core's by-inode-number wrappers
+(`mkdir_no`, `symlink_no`, `unlink_no`, `rmdir_no`, `rename_no`) and the setattr/rename/statfs
+codec. Gated (two more tests in `volume_bridge.rs`): mkdir then a file inside it, rmdir refused
+non-empty (ENOTEMPTY), unlink then rmdir; and rename moving a file, setattr truncating it, and
+statfs answering. The FUSE bridge's semantic surface is now complete and pure-tested; the
+`/dev/fuse` transport (Linux) is the only remainder of task 1. A pre-existing anchor
+test-isolation bug was fixed in the same change: `supervised_child` set process-global env vars
+that raced into its own in-process test thread under a concurrent `cargo test --workspace`; it
+is now `#[ignore]`d and the parent spawns it with `--ignored`, so cargo never runs it in
+process. Owed: generation-tracked node-id reuse after `forget` (§4.6 `(no, gen)`), `link` and
+xattrs, and the kernel invalidation notifications — all with the transport.
 
 ## 9. Blocking order toward first light
 

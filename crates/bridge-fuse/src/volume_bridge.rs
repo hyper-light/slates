@@ -12,6 +12,7 @@ use slates_vfs::inode::{Attrs, Kind};
 use slates_vfs::volume::{Store, Volume};
 
 use crate::bridge::{Bridge, DirEntry};
+
 use crate::reply::{Attr, EntryOut};
 
 /// Format: the FUSE node id of the root directory.
@@ -52,6 +53,8 @@ const ENOTEMPTY: i32 = 39;
 const BYTES_PER_BLOCK: u64 = 512;
 /// Shape: the block size reported to the kernel: one page, the volume core's chunk unit.
 const BLKSIZE: u32 = 4096;
+/// Format: the maximum name length the volume core allows (§4.5's name cap).
+const NAME_MAX: u32 = 255;
 
 /// The `Bridge` over one volume.
 pub struct VolumeBridge<'v> {
@@ -108,6 +111,21 @@ impl<'v> VolumeBridge<'v> {
     let index = self.handles.len();
     self.handles.push(Some(inode));
     u64::try_from(index).unwrap_or(u64::MAX)
+  }
+
+  /// The `fuse_entry_out` for an inode number (its attributes, cached forever).
+  fn entry_of(&self, no: u64) -> Result<EntryOut, i32> {
+    let attrs = self
+      .volume
+      .stat(self.store, slates_vfs::ids::InodeNo(no))
+      .map_err(errno)?;
+    Ok(EntryOut {
+      nodeid: no,
+      generation: 0,
+      entry_valid: CACHE_FOREVER,
+      attr_valid: CACHE_FOREVER,
+      attr: attr_of(no, &attrs),
+    })
   }
 
   /// The inode a handle names, or an error when it is stale.
@@ -315,5 +333,104 @@ impl Bridge for VolumeBridge<'_> {
   fn flush(&mut self, _nodeid: u64, _fh: u64) -> Result<(), i32> {
     // No disk write: the data is already in the anchor segment (§4.6). Success.
     Ok(())
+  }
+
+  fn mkdir(&mut self, parent: u64, name: &str, mode: u32) -> Result<EntryOut, i32> {
+    let dir = self.inode_of(parent)?;
+    let no = self
+      .volume
+      .mkdir_no(self.store, slates_vfs::ids::InodeNo(dir), name, mode)
+      .map_err(errno)?;
+    self.entry_of(no.0)
+  }
+
+  fn unlink(&mut self, parent: u64, name: &str) -> Result<(), i32> {
+    let dir = self.inode_of(parent)?;
+    self
+      .volume
+      .unlink_no(self.store, slates_vfs::ids::InodeNo(dir), name)
+      .map_err(errno)
+  }
+
+  fn rmdir(&mut self, parent: u64, name: &str) -> Result<(), i32> {
+    let dir = self.inode_of(parent)?;
+    self
+      .volume
+      .rmdir_no(self.store, slates_vfs::ids::InodeNo(dir), name)
+      .map_err(errno)
+  }
+
+  fn symlink(&mut self, parent: u64, name: &str, target: &str) -> Result<EntryOut, i32> {
+    let dir = self.inode_of(parent)?;
+    let no = self
+      .volume
+      .symlink_no(self.store, slates_vfs::ids::InodeNo(dir), name, target)
+      .map_err(errno)?;
+    self.entry_of(no.0)
+  }
+
+  fn readlink(&mut self, nodeid: u64) -> Result<String, i32> {
+    let no = self.inode_of(nodeid)?;
+    self
+      .volume
+      .readlink(self.store, slates_vfs::ids::InodeNo(no))
+      .map(|t| t.into_string())
+      .map_err(errno)
+  }
+
+  fn rename(
+    &mut self,
+    old_parent: u64,
+    old_name: &str,
+    new_parent: u64,
+    new_name: &str,
+  ) -> Result<(), i32> {
+    let from = self.inode_of(old_parent)?;
+    let to = self.inode_of(new_parent)?;
+    self
+      .volume
+      .rename_no(
+        self.store,
+        slates_vfs::ids::InodeNo(from),
+        old_name,
+        slates_vfs::ids::InodeNo(to),
+        new_name,
+      )
+      .map_err(errno)
+  }
+
+  fn setattr(&mut self, nodeid: u64, valid: u32, size: u64, mode: u32) -> Result<Attr, i32> {
+    let no = self.inode_of(nodeid)?;
+    let inode = slates_vfs::ids::InodeNo(no);
+    if valid & crate::request::SetAttrIn::FATTR_SIZE != 0 {
+      self
+        .volume
+        .truncate(self.store, inode, size)
+        .map_err(errno)?;
+    }
+    if valid & crate::request::SetAttrIn::FATTR_MODE != 0 {
+      self.volume.chmod(self.store, inode, mode).map_err(errno)?;
+    }
+    let attrs = self.volume.stat(self.store, inode).map_err(errno)?;
+    Ok(attr_of(no, &attrs))
+  }
+
+  fn statfs(&mut self, _nodeid: u64) -> Result<crate::reply::StatfsOut, i32> {
+    let accounting = self.volume.accounting();
+    // Blocks are the volume's referenced bytes over the block size; the volume core does not
+    // expose a hard cap here (a dynamic volume grows), so free is reported generously and the
+    // quota is enforced on write, not by statfs. The kernel uses this only for `df`.
+    let block = u64::from(BLKSIZE);
+    let used = accounting.referenced_bytes.div_ceil(block);
+    Ok(crate::reply::StatfsOut {
+      blocks: used.saturating_mul(2).max(1),
+      bfree: used,
+      bavail: used,
+      files: 0,
+      ffree: 0,
+      bsize: BLKSIZE,
+      namelen: NAME_MAX,
+      frsize: BLKSIZE,
+    })
   }
 }

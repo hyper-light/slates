@@ -13,7 +13,7 @@
 use crate::abi::Opcode;
 use crate::init::negotiate;
 use crate::reply::{Attr, AttrOut, DirBuffer, EntryOut, OpenOut, ReplyHeader, WriteOut};
-use crate::request::{ReadIn, Request, WriteIn, parse_name};
+use crate::request::{ReadIn, RenameIn, Request, SetAttrIn, WriteIn, parse_name};
 
 /// Format: `ENOSYS`, the errno for an opcode the bridge does not implement.
 pub const ENOSYS: i32 = 38;
@@ -74,6 +74,28 @@ pub trait Bridge {
   fn forget(&mut self, nodeid: u64, nlookup: u64);
   /// Flush handle `fh` of `nodeid` (no disk write; success once the data is in the anchor).
   fn flush(&mut self, nodeid: u64, fh: u64) -> Result<(), i32>;
+  /// Create directory `name` in `parent`; the entry.
+  fn mkdir(&mut self, parent: u64, name: &str, mode: u32) -> Result<EntryOut, i32>;
+  /// Remove `name` from `parent`.
+  fn unlink(&mut self, parent: u64, name: &str) -> Result<(), i32>;
+  /// Remove directory `name` from `parent`.
+  fn rmdir(&mut self, parent: u64, name: &str) -> Result<(), i32>;
+  /// Create a symlink `name` in `parent` pointing at `target`; the entry.
+  fn symlink(&mut self, parent: u64, name: &str, target: &str) -> Result<EntryOut, i32>;
+  /// The target of symlink `nodeid`.
+  fn readlink(&mut self, nodeid: u64) -> Result<String, i32>;
+  /// Rename `old_name` under `old_parent` to `new_name` under `new_parent`.
+  fn rename(
+    &mut self,
+    old_parent: u64,
+    old_name: &str,
+    new_parent: u64,
+    new_name: &str,
+  ) -> Result<(), i32>;
+  /// Set the size and/or mode of `nodeid` (the bits `valid` names); the new attributes.
+  fn setattr(&mut self, nodeid: u64, valid: u32, size: u64, mode: u32) -> Result<Attr, i32>;
+  /// Filesystem statistics.
+  fn statfs(&mut self, nodeid: u64) -> Result<crate::reply::StatfsOut, i32>;
 }
 
 /// Dispatches one parsed message to `bridge`, writing the reply into `out`; returns the bytes
@@ -109,10 +131,120 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, out: &mut [u8]) -> usiz
     Opcode::Release | Opcode::ReleaseDir => serve_release(bridge, &request, out),
     Opcode::Flush => serve_flush(bridge, &request, out),
     Opcode::Forget => serve_forget(bridge, &request),
+    Opcode::MkDir => serve_mkdir(bridge, &request, out),
+    Opcode::Unlink => serve_unlink(bridge, &request, false, out),
+    Opcode::RmDir => serve_unlink(bridge, &request, true, out),
+    Opcode::SymLink => serve_symlink(bridge, &request, out),
+    Opcode::ReadLink => serve_readlink(bridge, &request, out),
+    Opcode::Rename => serve_rename(bridge, &request, false, out),
+    Opcode::Rename2 => serve_rename(bridge, &request, true, out),
+    Opcode::SetAttr => serve_setattr(bridge, &request, out),
+    Opcode::StatFs => serve_statfs(bridge, &request, out),
     // The rest of the Bridge trait is dispatched as the driver grows; until then the kernel
     // is told the operation is not implemented, never left waiting.
     _ => write_or_drop(ReplyHeader::write_error(unique, ENOSYS, out), out),
   }
+}
+
+fn serve_mkdir(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
+  // `fuse_mkdir_in`: mode (4), umask (4), then the name.
+  const HEAD: usize = 2 * size_of::<u32>();
+  if req.body.len() < HEAD {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  }
+  let mode = u32::from_le_bytes(req.body[..size_of::<u32>()].try_into().unwrap_or_default());
+  let Ok(name) = parse_name(&req.body[HEAD..]) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  reply(
+    req.header.unique,
+    bridge.mkdir(req.header.nodeid, name, mode),
+    |e| e.to_bytes(),
+    out,
+  )
+}
+
+fn serve_unlink(bridge: &mut dyn Bridge, req: &Request<'_>, is_dir: bool, out: &mut [u8]) -> usize {
+  let Ok(name) = parse_name(req.body) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  let result = if is_dir {
+    bridge.rmdir(req.header.nodeid, name)
+  } else {
+    bridge.unlink(req.header.nodeid, name)
+  };
+  reply(req.header.unique, result, |()| Vec::new(), out)
+}
+
+fn serve_symlink(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
+  // The body is name\0 target\0.
+  let Ok(name) = parse_name(req.body) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  let rest = &req.body[name.len() + 1..];
+  let Ok(target) = parse_name(rest) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  reply(
+    req.header.unique,
+    bridge.symlink(req.header.nodeid, name, target),
+    |e| e.to_bytes(),
+    out,
+  )
+}
+
+fn serve_readlink(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
+  match bridge.readlink(req.header.nodeid) {
+    Ok(target) => write_or_drop(
+      ReplyHeader::write_ok(req.header.unique, target.as_bytes(), out),
+      out,
+    ),
+    Err(errno) => write_or_drop(ReplyHeader::write_error(req.header.unique, errno, out), out),
+  }
+}
+
+fn serve_rename(
+  bridge: &mut dyn Bridge,
+  req: &Request<'_>,
+  flagged: bool,
+  out: &mut [u8],
+) -> usize {
+  let opcode = if flagged {
+    Opcode::Rename2.to_wire()
+  } else {
+    Opcode::Rename.to_wire()
+  };
+  let Ok(r) = RenameIn::parse(opcode, req.body, flagged) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  reply(
+    req.header.unique,
+    bridge.rename(req.header.nodeid, r.old_name, r.newdir, r.new_name),
+    |()| Vec::new(),
+    out,
+  )
+}
+
+fn serve_setattr(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
+  let Ok(s) = SetAttrIn::parse(req.body) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  let result = bridge
+    .setattr(req.header.nodeid, s.valid, s.size, s.mode)
+    .map(|attr| AttrOut {
+      attr_valid: CACHE_FOREVER,
+      attr,
+    });
+  reply(req.header.unique, result, |a| a.to_bytes(), out)
+}
+
+fn serve_statfs(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
+  reply(
+    req.header.unique,
+    bridge.statfs(req.header.nodeid),
+    |s| s.to_bytes(),
+    out,
+  )
 }
 
 /// Writes the reply the codec produced, or drops it (returns 0) when even the header did not

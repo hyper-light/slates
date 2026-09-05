@@ -229,3 +229,133 @@ fn missing_names_and_stale_handles_are_typed_errnos() {
     "EINVAL"
   );
 }
+
+/// A `fuse_mkdir_in` body: mode, umask, then the name.
+fn mkdir_body(mode: u32, name: &str) -> Vec<u8> {
+  let mut b = vec![0u8; 8];
+  b[0..4].copy_from_slice(&mode.to_le_bytes());
+  b.extend_from_slice(&name_body(name));
+  b
+}
+
+/// A `fuse_rename_in` body: newdir, then oldname NUL newname NUL.
+fn rename_body(newdir: u64, old: &str, new: &str) -> Vec<u8> {
+  let mut b = newdir.to_le_bytes().to_vec();
+  b.extend_from_slice(&name_body(old));
+  b.extend_from_slice(&name_body(new));
+  b
+}
+
+/// A `fuse_setattr_in` body setting the size: valid (FATTR_SIZE), padding, fh, size, then the
+/// rest zero.
+fn setattr_size_body(size: u64) -> Vec<u8> {
+  let mut b = vec![0u8; 88];
+  b[0..4].copy_from_slice(&(1u32 << 3).to_le_bytes()); // FATTR_SIZE
+  b[16..24].copy_from_slice(&size.to_le_bytes()); // size (after valid, padding, fh)
+  b
+}
+
+/// mkdir then create a file inside it, then rmdir refuses (not empty), unlink the file, rmdir.
+#[test]
+fn mkdir_unlink_and_rmdir_dispatch_to_the_volume() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
+  let mut out = vec![0u8; 1 << 16];
+
+  dispatch(
+    &message(Opcode::MkDir.to_wire(), 1, 1, &mkdir_body(0o040_755, "sub")),
+    &mut bridge,
+    &mut out,
+  );
+  assert!(ok(&out), "mkdir ok");
+  let sub = reply_nodeid(&out);
+
+  // create a file in the subdirectory.
+  dispatch(
+    &message(
+      Opcode::Create.to_wire(),
+      2,
+      sub,
+      &create_body(0o100_644, "f"),
+    ),
+    &mut bridge,
+    &mut out,
+  );
+  assert!(ok(&out), "create in sub ok");
+
+  // rmdir the non-empty subdirectory is refused.
+  dispatch(
+    &message(Opcode::RmDir.to_wire(), 3, 1, &name_body("sub")),
+    &mut bridge,
+    &mut out,
+  );
+  assert_eq!(
+    i32::from_le_bytes(out[4..8].try_into().unwrap()),
+    -39,
+    "ENOTEMPTY"
+  );
+
+  // unlink the file, then rmdir succeeds.
+  dispatch(
+    &message(Opcode::Unlink.to_wire(), 4, sub, &name_body("f")),
+    &mut bridge,
+    &mut out,
+  );
+  assert!(ok(&out), "unlink ok");
+  dispatch(
+    &message(Opcode::RmDir.to_wire(), 5, 1, &name_body("sub")),
+    &mut bridge,
+    &mut out,
+  );
+  assert!(ok(&out), "rmdir ok");
+}
+
+/// rename moves a file; setattr truncates it; statfs answers.
+#[test]
+fn rename_setattr_and_statfs_dispatch_to_the_volume() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
+  let mut out = vec![0u8; 1 << 16];
+
+  let (file, fh) = create(&mut bridge, &mut out);
+  write(&mut bridge, file, fh, b"0123456789", &mut out);
+
+  // rename build.rs -> main.rs within the root.
+  dispatch(
+    &message(
+      Opcode::Rename.to_wire(),
+      1,
+      1,
+      &rename_body(1, "build.rs", "main.rs"),
+    ),
+    &mut bridge,
+    &mut out,
+  );
+  assert!(ok(&out), "rename ok");
+  dispatch(
+    &message(Opcode::Lookup.to_wire(), 2, 1, &name_body("main.rs")),
+    &mut bridge,
+    &mut out,
+  );
+  assert!(ok(&out), "the renamed name resolves");
+  assert_eq!(reply_nodeid(&out), file);
+
+  // setattr truncates to 4 bytes.
+  dispatch(
+    &message(Opcode::SetAttr.to_wire(), 3, file, &setattr_size_body(4)),
+    &mut bridge,
+    &mut out,
+  );
+  assert!(ok(&out), "setattr ok");
+  assert_eq!(getattr_size(&mut bridge, file, &mut out), 4);
+
+  // statfs answers with a page block size.
+  let n = dispatch(
+    &message(Opcode::StatFs.to_wire(), 4, 1, &[]),
+    &mut bridge,
+    &mut out,
+  );
+  assert!(ok(&out) && n > OUT_HEADER_LEN, "statfs ok");
+}
