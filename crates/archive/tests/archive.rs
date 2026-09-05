@@ -171,3 +171,45 @@ proptest! {
     prop_assert!(true);
   }
 }
+
+/// Highly compressible data is stored LZ4 (smaller than raw), round-trips, and decodes to the
+/// original bytes.
+#[test]
+fn compressible_data_is_stored_lz4() {
+  let raw = vec![0x41u8; 1000];
+  let chunk = Archive::compressed_chunk(raw.clone());
+  assert_eq!(chunk.encoding, Encoding::Lz4);
+  assert!(
+    chunk.stored_len < chunk.raw_len,
+    "LZ4 shrinks a repetitive blob"
+  );
+  assert_eq!(Archive::content(&chunk).expect("decodes"), raw);
+
+  let archive = Archive {
+    base_page_size: 4096,
+    chunk_min: 4096,
+    chunk_max: 65_536,
+    created_unix: 0,
+    volume_id: 1,
+    snapshot_id: 1,
+    name_policy_id: 1,
+    unicode_version: 15,
+    manifest: b"m".to_vec(),
+    chunks: vec![chunk],
+  };
+  let bytes = archive.encode();
+  let decoded = Archive::decode(&bytes).expect("a valid LZ4 archive decodes");
+  assert_eq!(decoded, archive);
+  assert_eq!(Archive::content(&decoded.chunks[0]).expect("decodes"), raw);
+}
+
+/// Incompressible (tiny, unique) data stays raw, because LZ4 would not save space (the format
+/// floor).
+#[test]
+fn incompressible_data_stays_raw() {
+  let raw = b"xyz".to_vec();
+  let chunk = Archive::compressed_chunk(raw.clone());
+  assert_eq!(chunk.encoding, Encoding::Raw);
+  assert_eq!(chunk.stored_len, chunk.raw_len);
+  assert_eq!(Archive::content(&chunk).expect("decodes"), raw);
+}

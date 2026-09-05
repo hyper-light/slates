@@ -667,6 +667,7 @@ name = "slates-archive"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "lz4_flex",
  "proptest",
 ]
 

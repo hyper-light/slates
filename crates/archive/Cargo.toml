@@ -10,6 +10,7 @@ description = "The archive format (D-17, §4.16 archive, research/compression-ar
 
 [dependencies]
 blake3 = { workspace = true }
+lz4_flex = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

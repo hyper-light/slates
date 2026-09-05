@@ -117,6 +117,11 @@ pub enum ArchiveError {
   BadSeekTable,
   /// A declared count or length is larger than the stream can hold.
   BadLength,
+  /// A chunk's encoded payload could not be decoded (a corrupt LZ4/zstd frame).
+  BadPayload {
+    /// The chunk's position in the archive.
+    index: u64,
+  },
 }
 
 impl core::fmt::Display for ArchiveError {
@@ -132,6 +137,7 @@ impl core::fmt::Display for ArchiveError {
       Self::ManifestHashMismatch => f.write_str("manifest fails its identity"),
       Self::BadSeekTable => f.write_str("archive seek table is malformed"),
       Self::BadLength => f.write_str("archive declares a length past its end"),
+      Self::BadPayload { index } => write!(f, "chunk {index} has an undecodable payload"),
     }
   }
 }

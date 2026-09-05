@@ -102,6 +102,41 @@ impl Archive {
     }
   }
 
+  /// A chunk record with the compress-or-not decision (D-17): compress with LZ4 and keep the
+  /// compressed form only when it is smaller than the raw bytes (the format-derived floor — a
+  /// compressed chunk must save space); otherwise store raw. The identity is always the BLAKE3 of
+  /// the raw bytes. The calibrated cost model, the Btrfs sampler, the LZ4-to-zstd regression and
+  /// zstd are the rest of the codec pass (owed; GAPS §8g).
+  pub fn compressed_chunk(bytes: Vec<u8>) -> Chunk {
+    let identity = hash_of(&bytes);
+    let raw_len = bytes.len() as u64;
+    let compressed = lz4_flex::block::compress(&bytes);
+    if (compressed.len() as u64) < raw_len {
+      Chunk {
+        identity,
+        raw_len,
+        stored_len: compressed.len() as u64,
+        encoding: Encoding::Lz4,
+        level: 0,
+        dictionary: [0u8; 32],
+        payload: compressed,
+      }
+    } else {
+      Self::raw_chunk(bytes)
+    }
+  }
+
+  /// The chunk's raw content, decoding the payload by its encoding. A raw chunk returns its bytes;
+  /// an LZ4 chunk is decompressed to its declared raw length. A payload that will not decode, or
+  /// whose decoded content fails the chunk's identity, is a typed refusal.
+  pub fn content(chunk: &Chunk) -> Result<Vec<u8>, ArchiveError> {
+    let bytes = decode_payload(chunk, 0)?;
+    if hash_of(&bytes) != chunk.identity {
+      return Err(ArchiveError::ChunkIdentityMismatch { index: 0 });
+    }
+    Ok(bytes)
+  }
+
   /// Encodes the archive to its byte stream. Deterministic: the same snapshot yields the same
   /// bytes on every platform (the identity gate).
   pub fn encode(&self) -> Vec<u8> {
@@ -362,11 +397,7 @@ fn read_chunk(reader: &mut Reader<'_>, index: u64) -> Result<Chunk, ArchiveError
   let dictionary = reader.hash()?;
   let stored = usize::try_from(stored_len).unwrap_or(usize::MAX);
   let payload = reader.raw(stored)?.to_vec();
-  // A raw chunk is content-addressed by the BLAKE3 of its bytes; verify before any use.
-  if encoding == Encoding::Raw && hash_of(&payload) != identity {
-    return Err(ArchiveError::ChunkIdentityMismatch { index });
-  }
-  Ok(Chunk {
+  let chunk = Chunk {
     identity,
     raw_len,
     stored_len,
@@ -374,5 +405,27 @@ fn read_chunk(reader: &mut Reader<'_>, index: u64) -> Result<Chunk, ArchiveError
     level,
     dictionary,
     payload,
-  })
+  };
+  // A chunk is content-addressed by the BLAKE3 of its decoded bytes; decode and verify before any
+  // use (a raw chunk decodes to itself).
+  let content = decode_payload(&chunk, index)?;
+  if hash_of(&content) != identity {
+    return Err(ArchiveError::ChunkIdentityMismatch { index });
+  }
+  Ok(chunk)
+}
+
+/// Decodes a chunk's stored payload to its raw bytes by its encoding: a raw chunk is its bytes; an
+/// LZ4 chunk is decompressed to its declared raw length; a zstd chunk is owed. A payload that will
+/// not decode is a typed refusal naming the chunk.
+fn decode_payload(chunk: &Chunk, index: u64) -> Result<Vec<u8>, ArchiveError> {
+  match chunk.encoding {
+    Encoding::Raw => Ok(chunk.payload.clone()),
+    Encoding::Lz4 => {
+      let raw_len = usize::try_from(chunk.raw_len).unwrap_or(usize::MAX);
+      lz4_flex::block::decompress(&chunk.payload, raw_len)
+        .map_err(|_| ArchiveError::BadPayload { index })
+    }
+    Encoding::Zstd => Err(ArchiveError::BadPayload { index }),
+  }
 }
