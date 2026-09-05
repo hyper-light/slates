@@ -22,6 +22,11 @@
 # shift, not a change of the code; the ceiling is the widest upper edge measured and tightens
 # again when the path is next touched. The same run tightened eleven rows and recorded the three
 # landing rows (land.*).
+# Raised 2026-09-05: wire.frame_decode_checks_crc32c_schema_word_body_bytes_copied 33 -> 42. A
+# tightening run had set 33; the row then measured 38-42 ns, and the previous commit (b80e8c8),
+# built in a scratch checkout with the same decode code, measured 36-39 ns in two runs. A
+# machine-state shift on a 35 ns row, not a change of the code; the ceiling is the widest edge
+# measured and tightens again when the wire's decode path is next touched.
 
 [machine.4c62b34d5f545407]
 identity = "Apple M5 Max | macOS 26.4.1 (25E253) | aarch64 | 18 cores | 137438953472 bytes | 16384 page"
@@ -97,7 +102,7 @@ runs = 3
 "wire.body_decode_sample" = 97
 "wire.body_encode_sample_into_a_reused_buffer" = 10
 "wire.crc32c_1mib" = 152417
-"wire.frame_decode_checks_crc32c_schema_word_body_bytes_copied" = 33
+"wire.frame_decode_checks_crc32c_schema_word_body_bytes_copied" = 42
 "wire.frame_encode_header_schema_word_body_crc32c" = 286
 "wire.header_decode" = 2
 "wire.header_encode_32_bytes" = 2

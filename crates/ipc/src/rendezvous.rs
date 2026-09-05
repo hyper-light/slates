@@ -310,8 +310,9 @@ pub mod platform {
     let region_fd = fds.pop().ok_or(IpcError::Layout {
       reason: "no region fd",
     })?;
-    let len =
-      usize::try_from(u64::from_le_bytes(body[4..12].try_into().unwrap_or([0; 8]))).unwrap_or(0);
+    let mut len_word = [0u8; size_of::<u64>()];
+    len_word.copy_from_slice(&body[HANDOFF_AT_LEN..HANDOFF_BYTES]);
+    let len = usize::try_from(u64::from_le_bytes(len_word)).unwrap_or(0);
     let raw = std::os::fd::IntoRawFd::into_raw_fd(region_fd);
     let region = ClientRegion::open(&Handoff::Descriptor(raw), len)?;
     Ok((region, Some(ClientControl { socket, completion })))
