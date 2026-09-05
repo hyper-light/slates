@@ -131,6 +131,23 @@ pub struct Inode {
   pub body: Body,
   /// The per-inode version counter the journal records (`prev_version`).
   pub version: u64,
+  /// Where a file or symlink hangs: its parent directory and the hash of its name there, so
+  /// the deriver finds its path without walking the tree (§4.16). Kept current by create,
+  /// link and rename; `None` for directories and the root.
+  pub home: Option<Home>,
+  /// Whether the inode has ever had more than one link since it was made; then `home` names
+  /// one of its paths and the deriver walks for the rest.
+  pub multi: bool,
+}
+
+/// A file's place in the namespace: the parent directory's inode number and the hash of the
+/// entry's folded name in it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Home {
+  /// The parent directory.
+  pub parent: InodeNo,
+  /// The hash of the entry's name under the volume's policy.
+  pub hash: u64,
 }
 
 impl Inode {
@@ -154,6 +171,8 @@ impl Inode {
       },
       body,
       version: 0,
+      home: None,
+      multi: false,
     }
   }
 }

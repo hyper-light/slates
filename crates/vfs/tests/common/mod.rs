@@ -3,6 +3,7 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod drive;
 pub(crate) mod steps;
 
 use slates_mem::arena::ChunkArena;

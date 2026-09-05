@@ -9,6 +9,7 @@ readme.workspace = true
 description = "The copy-on-write volume core: namespace, inodes, content, snapshots, clones, accounting, journal (design §4.4, §4.5, D-4, D-5, D-6, D-13)."
 
 [dependencies]
+blake3 = { workspace = true }
 slates-machine = { workspace = true }
 slates-mem = { workspace = true }
 unicode-normalization = { workspace = true }

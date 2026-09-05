@@ -95,6 +95,8 @@ pub struct Snapshot {
   pub next: Option<SnapshotId>,
   /// `referenced_bytes` at the snapshot.
   pub referenced_bytes: u64,
+  /// The op log's head sequence at the snapshot: the deriver reads the records after it.
+  pub seq: u64,
   /// The Merkle identity, computed lazily (Phase 7) and `None` until then.
   pub identity: Option<[u8; 32]>,
 }

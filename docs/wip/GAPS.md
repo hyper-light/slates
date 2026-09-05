@@ -239,12 +239,31 @@ budget plus the clock-check allowance plus the measured jitter); T-1.1, 1.2, 1.3
 1.7, 1.8, 1.9 as named tests; T-1.6 in its one-shard form (a generated interleaving of two
 clones; the shuttle form arrives with Phase 2's threads).
 
-Open in Phase 1 (owed in this phase, in order): task 14 the deriver; task 10 `slates-base`;
-tasks 11–13 `slates-land`, its oracle and baselines. AC-1.2's harness
-(`crates/vfs/tests/differential.rs`) and policy (`docs/wip/EQUIVALENCE.md`) are written; it
-runs in the Linux lane against `/dev/shm` (2,000 histories) and skips loudly elsewhere, since a
-macOS RAM disk is a system-state change Ada has not authorized; its first run is the lane's,
-not a local one.
+Task 14 (the deriver) landed 2026-09-05: the interval algebra as a pure module
+(`crates/vfs/src/algebra.rs`: a content map of base and new runs, every declared operation a
+splice, hunks as the unique minimal edit against the surviving base runs, 2,000 generated
+histories against a byte-level reference applier, disjoint operations proven to commute); the
+SDK `edit` on the volume (delete then insert with true positions, journaled as such; the tail
+is rewritten, the zero-copy splice is Phase 6's); the deriver (`crates/vfs/src/derive.rs`: the
+journal since the base snapshot folded into per-inode maps, the touched paths resolved in both
+trees, a state delta over paths with base references, sorted, encoded little-endian, identified
+by BLAKE3); a file inode's home (parent and name hash) so a written inode's path costs no walk;
+`readdir_in`, `lookup_in`, `resolve_in`, `stat_in`, `readlink_in` reading a snapshot as it was
+(`lookup_in` had resolved to the head's node: a latent bug, fixed). Gated: T-1.18 (300 random
+histories over random bases: net-apply reproduces the head's files, symlinks and directories
+byte for byte; every hunk inside its sources; deriving twice gives the same bytes), T-1.19
+(truncate-and-write and write-and-rename give one hunk of the base length and the new length
+and byte-identical documents), AC-1.15 (a fixed history's identity
+`11476fb81b5bc32d474f28cd2afd2f65b1609c7dc070e1ade41f3c5df4d955c4` pinned for every lane). The
+document keys content by post-state path with an explicit base reference rather than by inode,
+so a rename over a base path and a rewrite in place read the same; hard-linked inodes are
+listed at every path (conservative, as D-27 says).
+
+Open in Phase 1 (owed in this phase, in order): task 10 `slates-base`; tasks 11–13
+`slates-land`, its oracle and baselines. AC-1.2's harness (`crates/vfs/tests/differential.rs`)
+and policy (`docs/wip/EQUIVALENCE.md`) are written; it runs in the Linux lane against
+`/dev/shm` (2,000 histories) and skips loudly elsewhere, since a macOS RAM disk is a
+system-state change Ada has not authorized; its first run is the lane's, not a local one.
 
 Deviations from the §4.5 text, each measured (BENCHMARKS.md, Phase 1 baseline) and applied to
 the design in A-7:

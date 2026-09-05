@@ -416,6 +416,46 @@ impl Tree {
     Some((hash, s.to_child(), leaf.name(s)))
   }
 
+  /// The name of the entry with `hash` whose child satisfies `wanted`, searching the leaf the
+  /// hash descends to (a run of one hash that spans two leaves is not followed; the caller
+  /// falls back to a walk).
+  pub fn name_of<'b>(
+    &self,
+    blocks: &'b Slab<DirBlock>,
+    hash: u64,
+    wanted: &dyn Fn(Child) -> bool,
+  ) -> Option<&'b str> {
+    let mut block = self.root;
+    for _ in 1..self.height {
+      let b = blocks.get(block).ok()?;
+      let at = b.child_for(NameEquivalence::Exact, hash, "");
+      block = handle_from_word(b.slot(at).child);
+    }
+    let leaf = blocks.get(block).ok()?;
+    let count = leaf.count();
+    let (mut lo, mut hi) = (0usize, count);
+    while lo < hi {
+      let mid = lo + (hi - lo) / 2;
+      if leaf.slot(mid).hash < hash {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    let mut at = lo;
+    while at < count {
+      let s = leaf.slot(at);
+      if s.hash != hash {
+        break;
+      }
+      if wanted(s.to_child()) {
+        return Some(leaf.name(s));
+      }
+      at += 1;
+    }
+    None
+  }
+
   /// Every block of the tree with its birth epoch, for release and destroy walks.
   pub fn blocks(&self, blocks: &Slab<DirBlock>, out: &mut Vec<(Handle<DirBlock>, Epoch)>) {
     let mut stack = vec![(self.root, 1u8)];

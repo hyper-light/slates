@@ -20,6 +20,9 @@ pub(crate) enum Step {
   Link(Vec<String>, String, u8),
   Write(u8, u16, Vec<u8>),
   Truncate(u8, u16),
+  /// An SDK edit on a picked file: at an offset (clamped to the size by the harness), delete
+  /// up to this many bytes and insert these.
+  Edit(u8, u16, u8, Vec<u8>),
   Snapshot,
 }
 
@@ -59,6 +62,13 @@ pub(crate) fn step() -> impl Strategy<Value = Step> {
     )
       .prop_map(|(i, o, b)| Step::Write(i, o, b)),
     (any::<u8>(), any::<u16>()).prop_map(|(i, l)| Step::Truncate(i, l)),
+    (
+      any::<u8>(),
+      any::<u16>(),
+      any::<u8>(),
+      prop::collection::vec(any::<u8>(), 0..24)
+    )
+      .prop_map(|(i, at, del, b)| Step::Edit(i, at, del, b)),
     Just(Step::Snapshot),
   ]
 }

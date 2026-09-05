@@ -18,7 +18,7 @@ use crate::dir::{BaseDirState, Child, DirNode};
 use crate::dirtree::{DirBlock, Retired};
 use crate::error::VfsError;
 use crate::ids::{Epoch, InodeNo, SnapshotId};
-use crate::inode::{Attrs, Body, Inode, Kind};
+use crate::inode::{Attrs, Body, Home, Inode, Kind};
 use crate::journal::{Op, OpLog};
 use crate::names::{self, NameEquivalence};
 use crate::quota::{Accounting, Quota};
@@ -483,6 +483,10 @@ impl Volume {
     let no = self.next_no();
     let now = self.clock.wall_ns();
     let mut inode = Inode::new(no, self.epoch, Kind::File, mode, Body::Inline(Vec::new()));
+    inode.home = Some(Home {
+      parent: store.dirs.get(dir)?.inode,
+      hash: self.policy.hash(name),
+    });
     stamp_all(&mut inode.attrs, now);
     let handle = store.inodes.insert(inode)?;
     self.table_set(store, no, handle)?;
@@ -560,6 +564,10 @@ impl Volume {
       Body::Symlink(target.into()),
     );
     inode.attrs.size = u64::try_from(target.len()).unwrap_or(0);
+    inode.home = Some(Home {
+      parent: store.dirs.get(dir)?.inode,
+      hash: self.policy.hash(name),
+    });
     stamp_all(&mut inode.attrs, now);
     let handle = store.inodes.insert(inode)?;
     self.table_set(store, no, handle)?;
@@ -604,6 +612,9 @@ impl Volume {
     };
     self.dir_insert(store, dir, name, child)?;
     self.adjust_nlink(store, target, 1)?;
+    // From now on the inode has had more than one path; the deriver walks for them.
+    let handle = self.make_current_inode(store, target)?;
+    store.inodes.get_mut(handle)?.multi = true;
     self.touch_dir(store, dir, now)?;
     let path = self.path_of(store, dir, name);
     let prev = self.inode(store, target)?.version;
@@ -732,7 +743,17 @@ impl Volume {
         }
         Child::Dir(moving)
       }
-      other => other,
+      Child::File(no) | Child::Symlink(no) => {
+        // The file's home follows it.
+        let to_no = store.dirs.get(to_dir)?.inode;
+        let handle = self.make_current_inode(store, no)?;
+        store.inodes.get_mut(handle)?.home = Some(Home {
+          parent: to_no,
+          hash: self.policy.hash(to_name),
+        });
+        moved
+      }
+      Child::Whiteout => moved,
     };
     self.dir_insert(store, to_dir, to_name, moved_child)?;
     self.touch_dir(store, from_dir, now)?;
@@ -849,6 +870,7 @@ impl Volume {
       previous: self.last_snapshot,
       next: None,
       referenced_bytes: self.bytes.total(),
+      seq: self.journal.head_seq(),
       identity: None,
     };
     let handle = self.snapshots.insert(record)?;
@@ -883,7 +905,20 @@ impl Volume {
     dir: Handle<DirNode>,
     name: &str,
   ) -> Result<Located, VfsError> {
-    self.lookup(store, dir, name)
+    // The given node, as it was: never resolved to the head's current node.
+    let node = store.dirs.get(dir).map_err(|_| VfsError::StaleHandle)?;
+    let entry = node
+      .lookup(&store.blocks, self.policy, name)
+      .ok_or(VfsError::NotFound)?;
+    let inode = match entry.child {
+      Child::Dir(h) => store.dirs.get(h).map_err(|_| VfsError::StaleHandle)?.inode,
+      Child::File(no) | Child::Symlink(no) => no,
+      Child::Whiteout => return Err(VfsError::NotFound),
+    };
+    Ok(Located {
+      child: entry.child,
+      inode,
+    })
   }
 
   /// Reads from an inode as a snapshot's inode table has it.
@@ -929,6 +964,251 @@ impl Volume {
       _ => {}
     }
     Ok(want)
+  }
+
+  /// A symlink's target as a snapshot holds it.
+  pub fn readlink_in(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    no: InodeNo,
+  ) -> Result<Box<str>, VfsError> {
+    match &self.inode_in(store, id, no)?.body {
+      Body::Symlink(target) => Ok(target.clone()),
+      _ => Err(VfsError::Invalid),
+    }
+  }
+
+  /// The attributes of an inode as a snapshot holds them.
+  pub fn stat_in(&self, store: &Store, id: SnapshotId, no: InodeNo) -> Result<Attrs, VfsError> {
+    Ok(self.inode_in(store, id, no)?.attrs)
+  }
+
+  /// The inode record a snapshot holds for `no`.
+  fn inode_in<'s>(
+    &self,
+    store: &'s Store,
+    id: SnapshotId,
+    no: InodeNo,
+  ) -> Result<&'s Inode, VfsError> {
+    let snap = self
+      .snapshots
+      .get(snapshot_handle(id))
+      .map_err(|_| VfsError::StaleHandle)?;
+    let handle = trie::get(&store.tries, snap.inode_root, no).ok_or(VfsError::NotFound)?;
+    store.inodes.get(handle).map_err(VfsError::from)
+  }
+
+  /// Resolves an absolute path in a snapshot.
+  pub fn resolve_in(&self, store: &Store, id: SnapshotId, path: &str) -> Result<Located, VfsError> {
+    let (_, root) = self.snapshot_info(id)?;
+    let mut last = Located {
+      child: Child::Dir(root),
+      inode: store.dirs.get(root)?.inode,
+    };
+    for part in path.split('/').filter(|p| !p.is_empty()) {
+      let Child::Dir(d) = last.child else {
+        return Err(VfsError::NotDirectory);
+      };
+      last = self.lookup_in(store, d, part)?;
+    }
+    Ok(last)
+  }
+
+  /// The path of a file or symlink inode in the head, through its home; `None` when the inode
+  /// has no home (a directory, or a link the home does not name) or the home's entry is gone.
+  pub fn path_of_inode(&self, store: &Store, no: InodeNo) -> Option<String> {
+    let inode = self.inode(store, no).ok()?;
+    let home = inode.home?;
+    let dir = self.current_dir(store, home.parent).ok()?;
+    let node = store.dirs.get(dir).ok()?;
+    let name = node.name_of(&store.blocks, home.hash, no)?;
+    Some(self.path_of(store, dir, name))
+  }
+
+  /// The path of a file or symlink inode in a snapshot, through the home it had then.
+  pub fn path_of_inode_in(&self, store: &Store, id: SnapshotId, no: InodeNo) -> Option<String> {
+    let inode = self.inode_in(store, id, no).ok()?;
+    let home = inode.home?;
+    let parent = self.inode_in(store, id, home.parent).ok()?;
+    let Body::Directory(dir) = parent.body else {
+      return None;
+    };
+    let node = store.dirs.get(dir).ok()?;
+    let name = node.name_of(&store.blocks, home.hash, no)?;
+    let mut parts: Vec<Box<str>> = vec![name.into()];
+    let mut current = dir;
+    let mut guard = 0usize;
+    while let Ok(node) = store.dirs.get(current) {
+      let Some(parent_no) = node.parent else { break };
+      parts.push(node.name.clone());
+      let Ok(p) = self.inode_in(store, id, parent_no) else {
+        break;
+      };
+      let Body::Directory(d) = p.body else { break };
+      current = d;
+      guard += 1;
+      if guard > usize::from(u16::MAX) {
+        break;
+      }
+    }
+    parts.reverse();
+    Some(format!("/{}", parts.join("/")))
+  }
+
+  /// Every path of an inode under `root` (a full walk: the fallback for inodes that have had
+  /// more than one link, or whose home no longer names them).
+  pub fn paths_of_inode_walk(
+    &self,
+    store: &Store,
+    root: Handle<DirNode>,
+    no: InodeNo,
+  ) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![(String::new(), root)];
+    while let Some((prefix, dir)) = stack.pop() {
+      let Ok(node) = store.dirs.get(dir) else {
+        continue;
+      };
+      for e in node.iter(&store.blocks) {
+        match e.child {
+          Child::Dir(h) => stack.push((format!("{prefix}/{}", e.name), h)),
+          Child::File(n) | Child::Symlink(n) if n == no => out.push(format!("{prefix}/{}", e.name)),
+          _ => {}
+        }
+      }
+    }
+    out.sort();
+    out
+  }
+
+  /// The SDK edit (§4.16): removes `delete_len` bytes at `at` and inserts `bytes` there, with
+  /// the rest of the file shifting; declared as a `Delete` and an `Insert` with true positions.
+  /// `at` past the end is refused (`EINVAL`). The tail after the edit is rewritten, so an edit
+  /// costs the tail's bytes; the merge's splice by extent surgery (Phase 6) is the zero-copy
+  /// path for versions, not for a work volume's edits.
+  pub fn edit(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    at: u64,
+    delete_len: u64,
+    bytes: &[u8],
+  ) -> Result<(), VfsError> {
+    self.live()?;
+    if self.kind(store, no)? == Kind::Dir {
+      return Err(VfsError::IsDirectory);
+    }
+    let size = self.inode(store, no)?.attrs.size;
+    if at > size {
+      return Err(VfsError::Invalid);
+    }
+    let delete_len = delete_len.min(size - at);
+    let tail_len = usize::try_from(size - at - delete_len).map_err(|_| VfsError::FileTooLarge)?;
+    let mut tail = vec![0u8; tail_len];
+    let read = self.read(store, no, at + delete_len, &mut tail)?;
+    tail.truncate(read);
+    let inserted = u64::try_from(bytes.len()).map_err(|_| VfsError::FileTooLarge)?;
+    let end = at
+      .checked_add(inserted)
+      .and_then(|e| e.checked_add(u64::try_from(tail.len()).unwrap_or(u64::MAX)))
+      .ok_or(VfsError::FileTooLarge)?;
+    let charge = self.write_charge(store, no, at, end)?;
+    if !self.quota.admit(self.bytes.total(), charge) {
+      return Err(VfsError::NoSpace);
+    }
+    let handle = self.make_current_inode(store, no)?;
+    let prev_version = store.inodes.get(handle)?.version;
+    self.apply_truncate(store, handle, at)?;
+    store.inodes.get_mut(handle)?.attrs.size = at;
+    if !bytes.is_empty() {
+      self.apply_write(store, handle, at, bytes)?;
+    }
+    if !tail.is_empty() {
+      self.apply_write(store, handle, at + inserted, &tail)?;
+    }
+    let now = self.clock.wall_ns();
+    let inode = store.inodes.get_mut(handle)?;
+    inode.attrs.size = end;
+    inode.attrs.mtime = now;
+    inode.attrs.ctime = now;
+    inode.version += 1;
+    if delete_len > 0 {
+      self.record(
+        Op::Delete {
+          at,
+          len: delete_len,
+        },
+        "",
+        Some(no),
+        prev_version,
+      );
+    }
+    if inserted > 0 {
+      self.record(Op::Insert { at, len: inserted }, "", Some(no), prev_version);
+    }
+    Ok(())
+  }
+
+  /// Whether an inode has ever had more than one link (its home then names one path).
+  pub fn inode_multi(&self, store: &Store, no: InodeNo) -> Result<bool, VfsError> {
+    Ok(self.inode(store, no)?.multi)
+  }
+
+  /// [`Volume::inode_multi`] as a snapshot holds it.
+  pub fn inode_multi_in(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    no: InodeNo,
+  ) -> Result<bool, VfsError> {
+    Ok(self.inode_in(store, id, no)?.multi)
+  }
+
+  /// The entries of a directory node as a snapshot holds it (never the head's current node).
+  pub fn readdir_in<'s>(
+    &self,
+    store: &'s Store,
+    dir: Handle<DirNode>,
+  ) -> Result<Vec<DirRow<'s>>, VfsError> {
+    let node = store.dirs.get(dir).map_err(|_| VfsError::StaleHandle)?;
+    let mut rows = Vec::with_capacity(node.len());
+    for entry in node.iter(&store.blocks) {
+      let (kind, inode) = match entry.child {
+        Child::Dir(h) => (
+          Kind::Dir,
+          store.dirs.get(h).map_err(|_| VfsError::StaleHandle)?.inode,
+        ),
+        Child::File(no) => (Kind::File, no),
+        Child::Symlink(no) => (Kind::Symlink, no),
+        Child::Whiteout => continue,
+      };
+      rows.push(DirRow {
+        name: entry.name,
+        kind,
+        inode,
+      });
+    }
+    Ok(rows)
+  }
+
+  /// The ops document of the work since `base` (§4.16; [`crate::derive`]).
+  pub fn derive(
+    &self,
+    store: &Store,
+    base: SnapshotId,
+  ) -> Result<crate::derive::OpsDocument, VfsError> {
+    crate::derive::derive(self, store, base)
+  }
+
+  /// The op log records after a snapshot (the deriver's input).
+  pub fn records_since(&self, id: SnapshotId) -> Result<Vec<crate::journal::OpRecord>, VfsError> {
+    let snap = self
+      .snapshots
+      .get(snapshot_handle(id))
+      .map_err(|_| VfsError::StaleHandle)?;
+    let seq = snap.seq;
+    Ok(self.journal.since(seq).cloned().collect())
   }
 
   /// Releases one clone's pin on a snapshot. The owner of both volumes (the shard, §4.5) calls

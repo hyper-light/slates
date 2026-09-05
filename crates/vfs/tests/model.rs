@@ -314,6 +314,45 @@ impl Model {
     Ok(())
   }
 
+  /// An SDK edit: the volume truncates at `at`, writes the new bytes, then the old tail; the
+  /// model composes the same three rules (T-1.18's model side).
+  fn edit(&mut self, ino: u64, at: usize, delete_len: usize, bytes: &[u8]) -> Result<(), VfsError> {
+    let file = self.files.get(&ino).ok_or(VfsError::NotFound)?;
+    let size = file.bytes.len();
+    if at > size {
+      return Err(VfsError::Invalid);
+    }
+    let delete_len = delete_len.min(size - at);
+    let tail = file.bytes[at + delete_len..].to_vec();
+    // The quota is checked once, on the final length, before anything changes.
+    let end = u64::try_from(at + bytes.len() + tail.len()).unwrap();
+    let epoch = self.epoch;
+    let probe = file.windows_after(
+      u64::try_from(at).unwrap(),
+      end,
+      self.chunk,
+      self.inline,
+      epoch,
+    );
+    let after = probe.as_ref().map_or(end.max(file.materialized()), |w| {
+      w.values().map(|(m, _)| m).sum()
+    });
+    if self.referenced() + after.saturating_sub(file.materialized()) > self.quota {
+      return Err(VfsError::NoSpace);
+    }
+    self.truncate(ino, at)?;
+    if let Some(f) = self.files.get_mut(&ino) {
+      f.inline_born = epoch;
+    }
+    if !bytes.is_empty() {
+      self.write(ino, at, bytes)?;
+    }
+    if !tail.is_empty() {
+      self.write(ino, at + bytes.len(), &tail)?;
+    }
+    Ok(())
+  }
+
   fn truncate(&mut self, ino: u64, len: usize) -> Result<(), VfsError> {
     let chunk = self.chunk;
     let epoch = self.epoch;
@@ -385,11 +424,21 @@ impl Model {
     }
     let fd = self.dir_mut(from_dir).unwrap();
     let node = fd.remove(&from_key).unwrap();
+    let moved_ino = match &node {
+      Node::File { ino } | Node::Symlink { ino, .. } => Some(*ino),
+      Node::Dir(_) => None,
+    };
     let td = self.dir_mut(to_dir).unwrap();
     if let Some(k) = to_key {
       td.remove(&k);
     }
     td.insert(to.to_owned(), node);
+    // The moved file's record is copied (its home follows it), so its inline bytes are reborn.
+    if let Some(ino) = moved_ino
+      && let Some(f) = self.files.get_mut(&ino)
+    {
+      f.inline_born = self.epoch;
+    }
     Ok(())
   }
 
@@ -507,7 +556,7 @@ type Outcomes = (Result<(), VfsError>, Result<(), VfsError>);
 /// One step against both the volume and the model.
 fn apply(step: &Step, vol: &mut Volume, store: &mut Store, model: &mut Model) -> Option<Outcomes> {
   match step {
-    Step::Link(..) | Step::Write(..) | Step::Truncate(..) | Step::Snapshot => {
+    Step::Link(..) | Step::Write(..) | Step::Truncate(..) | Step::Edit(..) | Step::Snapshot => {
       apply_content(step, vol, store, model)
     }
     _ => Some(apply_names(step, vol, store, model)),
@@ -581,6 +630,23 @@ fn apply_content(
       (
         vol.truncate(store, InodeNo::compose(7, ino), u64::from(*len)),
         model.truncate(ino, usize::from(*len)),
+      )
+    }
+    Step::Edit(pick, at, del, bytes) => {
+      let ino = ino_of(model, *pick)?;
+      // The offset is clamped to the size: an edit past the end is a refusal both sides agree
+      // on, and the interesting histories are the ones inside the file.
+      let size = model.files.get(&ino).map_or(0, |f| f.bytes.len());
+      let at = usize::from(*at) % (size + 1);
+      (
+        vol.edit(
+          store,
+          InodeNo::compose(7, ino),
+          u64::try_from(at).unwrap(),
+          u64::from(*del),
+          bytes,
+        ),
+        model.edit(ino, at, usize::from(*del), bytes),
       )
     }
     Step::Snapshot => {

@@ -23,8 +23,10 @@
 //! Modules: [`ids`], [`names`], [`clock`], [`error`], [`trie`], [`dir`], [`inode`], [`content`],
 //! [`snapshot`], [`quota`], [`journal`], [`volume`].
 
+pub mod algebra;
 pub mod clock;
 pub mod content;
+pub mod derive;
 pub mod dir;
 pub mod dirtree;
 pub mod error;

@@ -397,6 +397,24 @@ impl DirNode {
     }
   }
 
+  /// The name of the entry with hash `hash` whose child is inode `no`, for a file's home.
+  pub fn name_of<'a>(
+    &'a self,
+    blocks: &'a Slab<DirBlock>,
+    hash: u64,
+    no: InodeNo,
+  ) -> Option<&'a str> {
+    let wanted = |c: Child| matches!(c, Child::File(n) | Child::Symlink(n) if n == no);
+    match &self.entries {
+      DirEntries::Small(s) => s
+        .entries()
+        .iter()
+        .find(|e| e.hash == hash && wanted(e.child))
+        .map(|e| s.name(*e)),
+      DirEntries::Indexed(t) => t.name_of(blocks, hash, &wanted),
+    }
+  }
+
   /// The tree blocks this node reaches, with their birth epochs (none for the small form).
   pub fn blocks(&self, blocks: &Slab<DirBlock>, out: &mut Vec<(Handle<DirBlock>, Epoch)>) {
     if let DirEntries::Indexed(t) = &self.entries {

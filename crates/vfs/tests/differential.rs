@@ -29,15 +29,13 @@ use std::path::{Path, PathBuf};
 
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestRunner};
-use slates_vfs::dir::Child;
 use slates_vfs::error::VfsError;
-use slates_vfs::ids::InodeNo;
-use slates_vfs::inode::Kind;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::Quota;
 use slates_vfs::volume::{Store, Volume};
 
 mod common;
+use common::drive::{apply_volume, head_state, pick_file};
 use common::steps::{Step, step};
 use common::{store, volume_with};
 
@@ -179,17 +177,18 @@ fn apply_host(step: &Step, root: &Path, files: &[String]) -> Option<io::Result<(
         .open(root.join(target))
         .and_then(|f| f.set_len(u64::from(*len)))
     }
+    Step::Edit(pick, at, del, bytes) => {
+      let target = pick_file(files, *pick)?;
+      let path = root.join(target);
+      fs::read(&path).and_then(|mut content| {
+        let at = usize::from(*at) % (content.len() + 1);
+        let end = (at + usize::from(*del)).min(content.len());
+        content.splice(at..end, bytes.iter().copied());
+        fs::write(&path, content)
+      })
+    }
     Step::Snapshot => Ok(()),
   })
-}
-
-/// The `pick`-th regular file by sorted path, wrapping; none when there are no files.
-fn pick_file(files: &[String], pick: u8) -> Option<&str> {
-  if files.is_empty() {
-    None
-  } else {
-    Some(&files[usize::from(pick) % files.len()])
-  }
 }
 
 /// The host's abstract state: per directory the sorted names with their kinds; per regular
@@ -236,122 +235,10 @@ fn host_state(root: &Path) -> HostState {
 
 // ------------------------------------------------------------------ the volume side
 
-/// The directory at `path`, distinguishing a missing component from one that is not a
-/// directory (`ENOTDIR`), as the host does.
-fn dir_at(
-  vol: &Volume,
-  store: &Store,
-  path: &[String],
-) -> Result<slates_mem::Handle<slates_vfs::dir::DirNode>, VfsError> {
-  let mut dir = vol.root();
-  for p in path {
-    match vol.lookup(store, dir, p)?.child {
-      Child::Dir(h) => dir = h,
-      _ => return Err(VfsError::NotDirectory),
-    }
-  }
-  Ok(dir)
-}
-
-fn file_at(vol: &Volume, store: &Store, path: &str) -> Result<InodeNo, VfsError> {
-  let located = vol.resolve(store, path)?;
-  match located.child {
-    Child::File(no) => Ok(no),
-    Child::Dir(_) => Err(VfsError::IsDirectory),
-    _ => Err(VfsError::Invalid),
-  }
-}
-
-/// An operation on a resolved directory.
-type DirOp<'a> = &'a mut dyn FnMut(
-  &mut Volume,
-  &mut Store,
-  slates_mem::Handle<slates_vfs::dir::DirNode>,
-) -> Result<(), VfsError>;
-
-fn apply_volume(
-  step: &Step,
-  vol: &mut Volume,
-  store: &mut Store,
-  files: &[String],
-) -> Option<Result<(), VfsError>> {
-  let dir_then = |vol: &mut Volume, store: &mut Store, p: &[String], op: DirOp| {
-    let d = dir_at(vol, store, p)?;
-    op(vol, store, d)
-  };
-  Some(match step {
-    Step::Create(p, n) => dir_then(vol, store, p, &mut |v, s, d| {
-      v.create_file(s, d, n, 0o644).map(drop)
-    }),
-    Step::Mkdir(p, n) => dir_then(vol, store, p, &mut |v, s, d| {
-      v.mkdir(s, d, n, 0o755).map(drop)
-    }),
-    Step::Symlink(p, n) => dir_then(vol, store, p, &mut |v, s, d| {
-      v.symlink(s, d, n, ".anchor").map(drop)
-    }),
-    Step::Unlink(p, n) => dir_then(vol, store, p, &mut |v, s, d| v.unlink(s, d, n)),
-    Step::Rmdir(p, n) => dir_then(vol, store, p, &mut |v, s, d| v.rmdir(s, d, n)),
-    Step::Rename(fp, fnm, tp, tn) => match (dir_at(vol, store, fp), dir_at(vol, store, tp)) {
-      (Ok(f), Ok(t)) => vol.rename(store, f, fnm, t, tn),
-      (Err(e), _) | (_, Err(e)) => Err(e),
-    },
-    Step::Link(p, n, pick) => {
-      let target = pick_file(files, *pick)?;
-      match file_at(vol, store, target) {
-        Ok(no) => dir_then(vol, store, p, &mut |v, s, d| v.link(s, d, n, no)),
-        Err(e) => Err(e),
-      }
-    }
-    Step::Write(pick, off, bytes) => {
-      let target = pick_file(files, *pick)?;
-      file_at(vol, store, target)
-        .and_then(|no| vol.write(store, no, u64::from(*off), bytes).map(drop))
-    }
-    Step::Truncate(pick, len) => {
-      let target = pick_file(files, *pick)?;
-      file_at(vol, store, target).and_then(|no| vol.truncate(store, no, u64::from(*len)))
-    }
-    Step::Snapshot => vol.snapshot(store).map(drop),
-  })
-}
-
 /// The volume's abstract state in the host's shape.
 fn volume_state(vol: &Volume, store: &Store) -> HostState {
-  let mut dirs = Vec::new();
-  let mut files = BTreeMap::new();
-  let mut stack = vec![(String::new(), vol.root())];
-  while let Some((prefix, dir)) = stack.pop() {
-    let rows = vol.readdir(store, dir).unwrap();
-    let mut names = Vec::new();
-    for row in &rows {
-      let kind = match row.kind {
-        Kind::Dir => 'd',
-        Kind::File => 'f',
-        Kind::Symlink => 'l',
-      };
-      names.push((row.name.to_string(), kind));
-      let path = format!("{prefix}/{}", row.name);
-      match row.kind {
-        Kind::Dir => {
-          if let Child::Dir(h) = vol.lookup(store, dir, row.name).unwrap().child {
-            stack.push((path, h));
-          }
-        }
-        Kind::File => {
-          let attrs = vol.stat(store, row.inode).unwrap();
-          let mut buf = vec![0u8; usize::try_from(attrs.size).unwrap()];
-          let n = vol.read(store, row.inode, 0, &mut buf).unwrap();
-          buf.truncate(n);
-          files.insert(path, (buf, u64::from(attrs.nlink)));
-        }
-        Kind::Symlink => {}
-      }
-    }
-    names.sort();
-    dirs.push((prefix, names));
-  }
-  dirs.sort();
-  (dirs, files)
+  let s = head_state(vol, store);
+  (s.dirs, s.files)
 }
 
 // ------------------------------------------------------------------ the run
