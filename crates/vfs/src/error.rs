@@ -36,6 +36,13 @@ pub enum VfsError {
   Destroying,
   /// The snapshot is pinned by a live clone; destroy the clone (and unpin) first.
   Pinned,
+  /// The base beneath an overlay entry cannot be served: the host's errno.
+  BaseUnavailable(i32),
+  /// A witnessed base entry changed on disk beneath an unpinned range: the read refuses rather
+  /// than return torn bytes; `status` lists the drift.
+  BaseDrift,
+  /// A base-plane verb on a scratch volume, or a path the base does not hold.
+  NotOverlay,
   /// The volume is archived.
   Archived,
   /// The name-equivalence policy of the two volumes differs (clone into a policy is refused).
@@ -62,6 +69,8 @@ impl VfsError {
       Self::CrossVolumeMove => "EXDEV",
       Self::StaleHandle => "ESTALE",
       Self::Destroying | Self::Archived | Self::Pinned => "EBUSY",
+      Self::BaseUnavailable(_) | Self::BaseDrift => "EIO",
+      Self::NotOverlay => "ENODEV",
       Self::PolicyMismatch => "EINVAL",
       Self::Memory(_) => "ENOMEM",
     }

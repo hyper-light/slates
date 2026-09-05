@@ -234,9 +234,17 @@ impl DirNode {
     }
   }
 
-  /// Whether the directory has no entries.
+  /// Whether the directory has no entries (whiteouts included; see `live_len`).
   pub fn is_empty(&self) -> bool {
     self.len() == 0
+  }
+
+  /// The entries that are not whiteouts.
+  pub fn live_len(&self, blocks: &Slab<DirBlock>) -> usize {
+    self
+      .iter(blocks)
+      .filter(|e| e.child != Child::Whiteout)
+      .count()
   }
 
   /// Whether the entries are in the indexed representation.

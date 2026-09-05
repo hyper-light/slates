@@ -34,7 +34,16 @@ fn drive(vol: &mut Volume, store: &mut Store, steps: &[Step]) {
 /// taking new bytes from the head (the sealed post-state) at the hunks' post offsets.
 fn apply_document(doc: &OpsDocument, base: &PathState, head: &PathState) -> Option<PathState> {
   let mut out = base.clone();
+  // Renamed subtrees are detached first, removals apply, then the subtrees attach at their
+  // new paths: a rename over a removed directory and a rename out of one both read right.
+  let mut detached = Vec::new();
+  for (from, to) in &doc.dirs_renamed {
+    detached.push((detach_dir(&mut out, from), to.clone()));
+  }
   remove_paths(&mut out, doc);
+  for (subtree, to) in detached {
+    attach_dir(&mut out, subtree, &to);
+  }
   for s in &doc.symlinks {
     out
       .symlinks
@@ -50,6 +59,84 @@ fn apply_document(doc: &OpsDocument, base: &PathState, head: &PathState) -> Opti
     out.files.insert(path, (bytes, nlink));
   }
   Some(out)
+}
+
+/// A directory and everything beneath it, with paths relative to it (the directory itself
+/// is the empty relative path).
+type Subtree = (
+  Vec<(String, Vec<(String, char)>)>,
+  BTreeMap<String, (Vec<u8>, u64)>,
+  BTreeMap<String, String>,
+);
+
+/// Takes a directory and everything beneath it out of the view.
+fn detach_dir(out: &mut PathState, from: &str) -> Subtree {
+  let prefix = format!("{from}/");
+  let rel = |k: &str| -> Option<String> {
+    if k == from {
+      Some(String::new())
+    } else {
+      k.strip_prefix(&prefix).map(str::to_owned)
+    }
+  };
+  let mut sub: Subtree = Default::default();
+  out.files = std::mem::take(&mut out.files)
+    .into_iter()
+    .filter_map(|(k, v)| match rel(&k) {
+      Some(r) => {
+        sub.1.insert(r, v);
+        None
+      }
+      None => Some((k, v)),
+    })
+    .collect();
+  out.symlinks = std::mem::take(&mut out.symlinks)
+    .into_iter()
+    .filter_map(|(k, v)| match rel(&k) {
+      Some(r) => {
+        sub.2.insert(r, v);
+        None
+      }
+      None => Some((k, v)),
+    })
+    .collect();
+  out.dirs = std::mem::take(&mut out.dirs)
+    .into_iter()
+    .filter_map(|(k, v)| match rel(&k) {
+      Some(r) => {
+        sub.0.push((r, v));
+        None
+      }
+      None => Some((k, v)),
+    })
+    .collect();
+  sub
+}
+
+/// Puts a detached subtree back at `to`, replacing whatever was there.
+fn attach_dir(out: &mut PathState, sub: Subtree, to: &str) {
+  let abs = |r: &str| -> String {
+    if r.is_empty() {
+      to.to_owned()
+    } else {
+      format!("{to}/{r}")
+    }
+  };
+  let prefix = format!("{to}/");
+  out.files.retain(|k, _| k != to && !k.starts_with(&prefix));
+  out
+    .symlinks
+    .retain(|k, _| k != to && !k.starts_with(&prefix));
+  out.dirs.retain(|(k, _)| k != to && !k.starts_with(&prefix));
+  for (r, v) in sub.1 {
+    out.files.insert(abs(&r), v);
+  }
+  for (r, v) in sub.2 {
+    out.symlinks.insert(abs(&r), v);
+  }
+  for (r, v) in sub.0 {
+    out.dirs.push((abs(&r), v));
+  }
 }
 
 fn remove_paths(out: &mut PathState, doc: &OpsDocument) {
@@ -253,4 +340,4 @@ fn a_fixed_history_has_a_golden_identity() {
 }
 
 /// Format: the identity of the fixed history above, recorded on 2026-09-05 (macOS, aarch64).
-const GOLDEN_IDENTITY: &str = "11476fb81b5bc32d474f28cd2afd2f65b1609c7dc070e1ade41f3c5df4d955c4";
+const GOLDEN_IDENTITY: &str = "0899b4cbb4dfb4aac43d00de3d87c239e658d9bd7e5ee89f3f525a4acaeee531";

@@ -144,22 +144,24 @@ pub struct VolumeConfig {
 
 /// The volume.
 pub struct Volume {
-  prefix: u16,
-  policy: NameEquivalence,
-  clock: Box<dyn Clock>,
-  epoch: Epoch,
-  root: Handle<DirNode>,
-  inode_root: Handle<TrieNode>,
-  next_counter: u64,
-  snapshots: Slab<Snapshot>,
-  last_snapshot: Option<SnapshotId>,
-  origin_epoch: Option<Epoch>,
-  quota: Quota,
+  pub(crate) prefix: u16,
+  pub(crate) policy: NameEquivalence,
+  pub(crate) clock: Box<dyn Clock>,
+  pub(crate) epoch: Epoch,
+  pub(crate) root: Handle<DirNode>,
+  pub(crate) inode_root: Handle<TrieNode>,
+  pub(crate) next_counter: u64,
+  pub(crate) snapshots: Slab<Snapshot>,
+  pub(crate) last_snapshot: Option<SnapshotId>,
+  pub(crate) origin_epoch: Option<Epoch>,
+  pub(crate) quota: Quota,
+  /// The base plane of an overlay volume (§4.5, D-25); `None` for a scratch volume.
+  pub(crate) base: Option<crate::base::BasePlane>,
   /// Head-reachable content bytes by birth epoch; the two public counters are sums of it.
-  bytes: ByEpoch,
-  journal: OpLog,
-  state: VolumeState,
-  destroy_queue: Vec<Dead>,
+  pub(crate) bytes: ByEpoch,
+  pub(crate) journal: OpLog,
+  pub(crate) state: VolumeState,
+  pub(crate) destroy_queue: Vec<Dead>,
 }
 
 impl std::fmt::Debug for Volume {
@@ -239,6 +241,7 @@ impl Volume {
       last_snapshot: None,
       origin_epoch: None,
       quota: config.quota,
+      base: None,
       bytes: ByEpoch::default(),
       journal: OpLog::new(config.journal_bytes),
       state: VolumeState::Live,
@@ -285,6 +288,10 @@ impl Volume {
       last_snapshot: None,
       origin_epoch: Some(epoch),
       quota: config.quota,
+      base: origin
+        .base
+        .as_ref()
+        .map(|b| b.for_clone(InodeNo::compose(config.prefix, 1))),
       bytes: ByEpoch::inherited(epoch, referenced),
       journal: OpLog::new(config.journal_bytes),
       state: VolumeState::Live,
@@ -454,7 +461,26 @@ impl Volume {
         }
         copy_range(store.content.open_bytes(open), open.off, off, out);
       }
-      Body::None | Body::Directory(_) | Body::Symlink(_) | Body::Base(_) => {}
+      Body::Base(b) => {
+        if b.lost {
+          return Err(VfsError::BaseDrift);
+        }
+        // Unpinned disk bytes need the host: `Overlay::read` serves them.
+        let unpinned = off < b.base_len
+          && !b
+            .pinned
+            .iter()
+            .any(|e| e.off <= off && off + u64::try_from(want).unwrap_or(0) <= e.off + e.len);
+        if unpinned {
+          return Err(VfsError::BaseUnavailable(0));
+        }
+        for e in &b.pinned {
+          if let Some(bytes) = store.content.extent_bytes(e) {
+            copy_range(bytes, e.off, off, out);
+          }
+        }
+      }
+      Body::None | Body::Directory(_) | Body::Symlink(_) => {}
     }
     Ok(want)
   }
@@ -641,6 +667,7 @@ impl Volume {
     self.drop_link(store, located.inode)?;
     self.touch_dir(store, dir, now)?;
     self.record(Op::Unlink, &path, Some(located.inode), 0);
+    self.record_whiteout(store, dir, name, &path)?;
     Ok(())
   }
 
@@ -656,7 +683,7 @@ impl Volume {
     let Child::Dir(child) = located.child else {
       return Err(VfsError::NotDirectory);
     };
-    if !store.dirs.get(child)?.is_empty() {
+    if !self.empty_for_rmdir(store, child)? {
       return Err(VfsError::NotEmpty);
     }
     let dir = self.make_current_dir(store, dir)?;
@@ -669,6 +696,7 @@ impl Volume {
     self.adjust_nlink(store, store.dirs.get(dir)?.inode, -1)?;
     self.touch_dir(store, dir, now)?;
     self.record(Op::Rmdir, &path, Some(located.inode), 0);
+    self.record_whiteout(store, dir, name, &path)?;
     Ok(())
   }
 
@@ -985,7 +1013,7 @@ impl Volume {
   }
 
   /// The inode record a snapshot holds for `no`.
-  fn inode_in<'s>(
+  pub(crate) fn inode_in<'s>(
     &self,
     store: &'s Store,
     id: SnapshotId,
@@ -1037,6 +1065,33 @@ impl Volume {
     let node = store.dirs.get(dir).ok()?;
     let name = node.name_of(&store.blocks, home.hash, no)?;
     let mut parts: Vec<Box<str>> = vec![name.into()];
+    let mut current = dir;
+    let mut guard = 0usize;
+    while let Ok(node) = store.dirs.get(current) {
+      let Some(parent_no) = node.parent else { break };
+      parts.push(node.name.clone());
+      let Ok(p) = self.inode_in(store, id, parent_no) else {
+        break;
+      };
+      let Body::Directory(d) = p.body else { break };
+      current = d;
+      guard += 1;
+      if guard > usize::from(u16::MAX) {
+        break;
+      }
+    }
+    parts.reverse();
+    Some(format!("/{}", parts.join("/")))
+  }
+
+  /// The path of a directory inode as a snapshot held it, through the node's own name and
+  /// parent chain; `None` when the snapshot did not hold it.
+  pub fn path_of_dir_in(&self, store: &Store, id: SnapshotId, no: InodeNo) -> Option<String> {
+    let inode = self.inode_in(store, id, no).ok()?;
+    let Body::Directory(dir) = inode.body else {
+      return None;
+    };
+    let mut parts: Vec<Box<str>> = Vec::new();
     let mut current = dir;
     let mut guard = 0usize;
     while let Ok(node) = store.dirs.get(current) {
@@ -1423,25 +1478,25 @@ impl Volume {
 
   // ------------------------------------------------------------------ internals
 
-  fn live(&self) -> Result<(), VfsError> {
+  pub(crate) fn live(&self) -> Result<(), VfsError> {
     match self.state {
       VolumeState::Live => Ok(()),
       VolumeState::Destroying | VolumeState::Destroyed => Err(VfsError::Destroying),
     }
   }
 
-  fn next_no(&mut self) -> InodeNo {
+  pub(crate) fn next_no(&mut self) -> InodeNo {
     let no = InodeNo::compose(self.prefix, self.next_counter);
     self.next_counter += 1;
     no
   }
 
-  fn inode<'s>(&self, store: &'s Store, no: InodeNo) -> Result<&'s Inode, VfsError> {
+  pub(crate) fn inode<'s>(&self, store: &'s Store, no: InodeNo) -> Result<&'s Inode, VfsError> {
     let handle = trie::get(&store.tries, self.inode_root, no).ok_or(VfsError::NotFound)?;
     store.inodes.get(handle).map_err(|_| VfsError::StaleHandle)
   }
 
-  fn last_snapshot_epoch(&self) -> Option<Epoch> {
+  pub(crate) fn last_snapshot_epoch(&self) -> Option<Epoch> {
     self
       .last_snapshot
       .and_then(|id| {
@@ -1454,7 +1509,7 @@ impl Volume {
       .or(self.origin_epoch)
   }
 
-  fn deadlist_mut(&mut self) -> Option<&mut Deadlist> {
+  pub(crate) fn deadlist_mut(&mut self) -> Option<&mut Deadlist> {
     let id = self.last_snapshot?;
     self
       .snapshots
@@ -1465,7 +1520,7 @@ impl Volume {
 
   /// Reports an object the head no longer reaches: onto the newest snapshot's deadlist when a
   /// snapshot (or the clone origin) still reaches it, else released now.
-  fn retire(&mut self, store: &mut Store, dead: Dead) -> Result<(), VfsError> {
+  pub(crate) fn retire(&mut self, store: &mut Store, dead: Dead) -> Result<(), VfsError> {
     let born = dead.born();
     if let Some(origin) = self.origin_epoch
       && born <= origin
@@ -1484,7 +1539,7 @@ impl Volume {
     }
   }
 
-  fn table_set(
+  pub(crate) fn table_set(
     &mut self,
     store: &mut Store,
     no: InodeNo,
@@ -1527,7 +1582,7 @@ impl Volume {
   }
 
   /// The current-epoch version of an inode, copying an older version and re-pointing the table.
-  fn make_current_inode(
+  pub(crate) fn make_current_inode(
     &mut self,
     store: &mut Store,
     no: InodeNo,
@@ -1569,7 +1624,7 @@ impl Volume {
 
   /// Makes a directory and its ancestors current-epoch, re-pointing entries and returning the
   /// current handle for `dir`.
-  fn make_current_dir(
+  pub(crate) fn make_current_dir(
     &mut self,
     store: &mut Store,
     dir: Handle<DirNode>,
@@ -1577,7 +1632,7 @@ impl Volume {
     self.make_current_dir_node(store, dir)
   }
 
-  fn make_current_dir_node(
+  pub(crate) fn make_current_dir_node(
     &mut self,
     store: &mut Store,
     dir: Handle<DirNode>,
@@ -1624,7 +1679,11 @@ impl Volume {
   }
 
   /// The head's current node of directory inode `no`, through the inode table.
-  fn current_dir(&self, store: &Store, no: InodeNo) -> Result<Handle<DirNode>, VfsError> {
+  pub(crate) fn current_dir(
+    &self,
+    store: &Store,
+    no: InodeNo,
+  ) -> Result<Handle<DirNode>, VfsError> {
     let handle = trie::get(&store.tries, self.inode_root, no).ok_or(VfsError::NotFound)?;
     match store.inodes.get(handle)?.body {
       Body::Directory(dir) => Ok(dir),
@@ -1633,7 +1692,11 @@ impl Volume {
   }
 
   /// The head's current node for a directory handle a caller holds (which may predate a copy).
-  fn head_dir(&self, store: &Store, dir: Handle<DirNode>) -> Result<Handle<DirNode>, VfsError> {
+  pub(crate) fn head_dir(
+    &self,
+    store: &Store,
+    dir: Handle<DirNode>,
+  ) -> Result<Handle<DirNode>, VfsError> {
     let no = store
       .dirs
       .get(dir)
@@ -1642,7 +1705,7 @@ impl Volume {
     self.current_dir(store, no)
   }
 
-  fn dir_insert(
+  pub(crate) fn dir_insert(
     &mut self,
     store: &mut Store,
     dir: Handle<DirNode>,
@@ -1673,15 +1736,39 @@ impl Volume {
     self.retire_blocks(store, retired)
   }
 
+  /// Journals a whiteout when the removal of `name` left one (a base name, §4.5).
+  fn record_whiteout(
+    &mut self,
+    store: &Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    path: &str,
+  ) -> Result<(), VfsError> {
+    let dir = self.head_dir(store, dir)?;
+    let left = store
+      .dirs
+      .get(dir)?
+      .lookup(&store.blocks, self.policy, name)
+      .is_some_and(|e| e.child == Child::Whiteout);
+    if left {
+      self.record(Op::Whiteout, path, None, 0);
+    }
+    Ok(())
+  }
+
   /// Retires blocks a directory mutation replaced or dropped, by the epoch rule.
-  fn retire_blocks(&mut self, store: &mut Store, retired: Retired) -> Result<(), VfsError> {
+  pub(crate) fn retire_blocks(
+    &mut self,
+    store: &mut Store,
+    retired: Retired,
+  ) -> Result<(), VfsError> {
     for (block, born) in retired {
       self.retire(store, Dead::DirBlock(block, born))?;
     }
     Ok(())
   }
 
-  fn dir_remove(
+  pub(crate) fn dir_remove(
     &mut self,
     store: &mut Store,
     dir: Handle<DirNode>,
@@ -1692,7 +1779,10 @@ impl Volume {
     let policy = self.policy;
     let mut retired = Retired::new();
     let node = store.dirs.get_mut(dir)?;
-    let removed = if node.base == BaseDirState::None {
+    let dir_no = node.inode;
+    let in_base = node.base == BaseDirState::Merged && self.base_listing_has(dir_no, name);
+    let node = store.dirs.get_mut(dir)?;
+    let removed = if !in_base {
       node.remove(
         &mut store.blocks,
         epoch,
@@ -1702,7 +1792,7 @@ impl Volume {
         cutover,
       )?
     } else {
-      // A base-backed directory keeps a whiteout so the base name stays hidden (§4.5).
+      // A base-backed name keeps a whiteout so the base entry stays hidden (§4.5).
       let child = node.lookup(&store.blocks, policy, name).map(|e| e.child);
       if child.is_some() {
         node.set_child(
@@ -1720,7 +1810,7 @@ impl Volume {
     removed.ok_or(VfsError::NotFound)
   }
 
-  fn touch_dir(
+  pub(crate) fn touch_dir(
     &mut self,
     store: &mut Store,
     dir: Handle<DirNode>,
@@ -1735,7 +1825,12 @@ impl Volume {
     Ok(())
   }
 
-  fn adjust_nlink(&mut self, store: &mut Store, no: InodeNo, delta: i32) -> Result<(), VfsError> {
+  pub(crate) fn adjust_nlink(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    delta: i32,
+  ) -> Result<(), VfsError> {
     let handle = self.make_current_inode(store, no)?;
     let inode = store.inodes.get_mut(handle)?;
     inode.attrs.nlink = u32::try_from(i64::from(inode.attrs.nlink) + i64::from(delta)).unwrap_or(0);
@@ -1745,7 +1840,7 @@ impl Volume {
 
   /// Drops one link; at zero the inode's content leaves the head's accounting and the version
   /// is retired.
-  fn drop_link(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+  pub(crate) fn drop_link(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
     let handle = self.make_current_inode(store, no)?;
     let nlink = {
       let inode = store.inodes.get_mut(handle)?;
@@ -1759,10 +1854,17 @@ impl Volume {
     self.release_body(store, handle)?;
     self.table_remove(store, no)?;
     self.retire(store, Dead::Inode(handle, born))?;
+    // The base plane's descriptor, if one was held, is closed by the owner of the host at its
+    // next `process_hints`; the tables forget the inode now.
+    let _ = self.base_forget(no);
     Ok(())
   }
 
-  fn release_dir_node(&mut self, store: &mut Store, dir: Handle<DirNode>) -> Result<(), VfsError> {
+  pub(crate) fn release_dir_node(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+  ) -> Result<(), VfsError> {
     let born = store.dirs.get(dir)?.born;
     let mut blocks = Retired::new();
     store.dirs.get(dir)?.blocks(&store.blocks, &mut blocks);
@@ -1771,7 +1873,11 @@ impl Volume {
   }
 
   /// Releases an inode's content by the epoch rule (the head no longer references it).
-  fn release_body(&mut self, store: &mut Store, handle: Handle<Inode>) -> Result<(), VfsError> {
+  pub(crate) fn release_body(
+    &mut self,
+    store: &mut Store,
+    handle: Handle<Inode>,
+  ) -> Result<(), VfsError> {
     for (epoch, len) in content_by_epoch(store, handle) {
       self.bytes.sub(epoch, len);
     }
@@ -1779,21 +1885,12 @@ impl Volume {
     let last = self.last_snapshot_epoch();
     let mut dead = Deadlist::default();
     match body {
-      Body::Sealed(extents) => {
-        for e in extents {
-          if let ExtentSrc::Chunk { chunk, .. } = e.src {
-            store.content.release_chunk(chunk, last, &mut dead)?;
-          }
-        }
-      }
+      Body::Sealed(extents) => release_extents(store, &extents, last, &mut dead)?,
       Body::Open { open, sealed } => {
         store.content.release_open(open)?;
-        for e in sealed {
-          if let ExtentSrc::Chunk { chunk, .. } = e.src {
-            store.content.release_chunk(chunk, last, &mut dead)?;
-          }
-        }
+        release_extents(store, &sealed, last, &mut dead)?;
       }
+      Body::Base(b) => release_extents(store, &b.pinned, last, &mut dead)?,
       _ => {}
     }
     for d in dead.take() {
@@ -1809,7 +1906,13 @@ impl Volume {
   /// materializes the window from its start to the write's end, so `materialized(window) =
   /// max(existing, end within window)`; inline content is materialized byte for byte until a
   /// write ends past the inline threshold, when it spills into the first window.
-  fn write_charge(&self, store: &Store, no: InodeNo, off: u64, end: u64) -> Result<u64, VfsError> {
+  pub(crate) fn write_charge(
+    &self,
+    store: &Store,
+    no: InodeNo,
+    off: u64,
+    end: u64,
+  ) -> Result<u64, VfsError> {
     let inode = self.inode(store, no)?;
     let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
     let inline = u64::try_from(store.inline_bytes).unwrap_or(0);
@@ -1838,7 +1941,7 @@ impl Volume {
     Ok(total_after.saturating_sub(total_before))
   }
 
-  fn apply_write(
+  pub(crate) fn apply_write(
     &mut self,
     store: &mut Store,
     handle: Handle<Inode>,
@@ -1879,6 +1982,19 @@ impl Volume {
         mut open,
         mut sealed,
       } => self.write_into(store, &mut open, &mut sealed, off, bytes)?,
+      Body::Base(mut b) => {
+        // The touched windows were pinned by `Overlay::write`; the write goes into them, and
+        // beyond the base's bytes into fresh windows, then everything seals back into `pinned`.
+        let mut open = self.open_window(store, &mut b.pinned, off, bytes.len())?;
+        let written = self.write_into(store, &mut open, &mut b.pinned, off, bytes)?;
+        if let Body::Open { open, sealed } = written {
+          b.pinned = sealed;
+          if let Some(e) = store.content.seal(open)? {
+            insert_extent(&mut b.pinned, e);
+          }
+        }
+        Body::Base(b)
+      }
       other => other,
     };
     store.inodes.get_mut(handle)?.body = new_body;
@@ -1887,7 +2003,7 @@ impl Volume {
   }
 
   /// Moves the histogram from one by-epoch view of an inode's content to the next.
-  fn reconcile(&mut self, before: Vec<(Epoch, u64)>, after: Vec<(Epoch, u64)>) {
+  pub(crate) fn reconcile(&mut self, before: Vec<(Epoch, u64)>, after: Vec<(Epoch, u64)>) {
     for (epoch, len) in before {
       self.bytes.sub(epoch, len);
     }
@@ -1902,7 +2018,7 @@ impl Volume {
   /// has one, is reopened (copied, its chunk retired by the epoch rule), else a fresh extent
   /// starts at the window's start. Every extent thus begins at a window boundary and a window
   /// has at most one extent, which is what the chunk rule of §4.5 charges.
-  fn open_window(
+  pub(crate) fn open_window(
     &mut self,
     store: &mut Store,
     sealed: &mut Vec<Extent>,
@@ -1930,7 +2046,7 @@ impl Volume {
     Ok(open)
   }
 
-  fn write_into(
+  pub(crate) fn write_into(
     &mut self,
     store: &mut Store,
     open: &mut OpenExtent,
@@ -1969,7 +2085,7 @@ impl Volume {
     })
   }
 
-  fn apply_truncate(
+  pub(crate) fn apply_truncate(
     &mut self,
     store: &mut Store,
     handle: Handle<Inode>,
@@ -2005,6 +2121,12 @@ impl Volume {
           ChunkStore::truncate_open(&mut open, keep);
           Body::Open { open, sealed }
         }
+      }
+      Body::Base(mut b) => {
+        clip_extents(store, &mut b.pinned, len, last, &mut dead)?;
+        // Disk bytes past the cut are no longer the file's; a later extension is a hole.
+        b.base_len = b.base_len.min(len);
+        Body::Base(b)
       }
       other => other,
     };
@@ -2048,7 +2170,7 @@ impl Volume {
     Ok(false)
   }
 
-  fn record(&mut self, op: Op, path: &str, inode: Option<InodeNo>, prev_version: u64) {
+  pub(crate) fn record(&mut self, op: Op, path: &str, inode: Option<InodeNo>, prev_version: u64) {
     let at = self.clock.monotonic_ns();
     self
       .journal
@@ -2062,7 +2184,7 @@ impl Volume {
 /// object born at or before the origin is shared, so their exact epochs do not matter and
 /// releases of them land in the same bucket.
 #[derive(Clone, Debug, Default)]
-struct ByEpoch {
+pub(crate) struct ByEpoch {
   /// Bytes born at each epoch, indexed by epoch number minus the floor.
   buckets: Vec<u64>,
   /// The epoch the first bucket stands for.
@@ -2098,7 +2220,7 @@ impl ByEpoch {
     }
   }
 
-  fn total(&self) -> u64 {
+  pub(crate) fn total(&self) -> u64 {
     self.buckets.iter().sum()
   }
 
@@ -2114,7 +2236,7 @@ impl ByEpoch {
 
 /// An inode's content bytes by birth epoch: inline bytes are born with the record, an extent's
 /// bytes with its chunk, an open extent's with the extent.
-fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> Vec<(Epoch, u64)> {
+pub(crate) fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> Vec<(Epoch, u64)> {
   let Ok(inode) = store.inodes.get(handle) else {
     return Vec::new();
   };
@@ -2136,6 +2258,11 @@ fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> Vec<(Epoch, u64)> {
       out.push((open.born, open.len));
       out
     }
+    Body::Base(b) => b
+      .pinned
+      .iter()
+      .filter_map(|e| sealed_born(e).map(|born| (born, chunk_len(e))))
+      .collect(),
     _ => Vec::new(),
   }
 }
@@ -2159,6 +2286,7 @@ fn materialized_windows(body: &Body, chunk: u64) -> std::collections::BTreeMap<u
       sealed.iter().for_each(|e| add(e.off, e.len));
       add(open.off, open.len);
     }
+    Body::Base(b) => b.pinned.iter().for_each(|e| add(e.off, e.len)),
     _ => {}
   }
   map
@@ -2168,14 +2296,14 @@ fn snapshot_handle(id: SnapshotId) -> Handle<Snapshot> {
   Handle::from_raw(id.index, id.generation)
 }
 
-fn stamp_all(attrs: &mut Attrs, now: i128) {
+pub(crate) fn stamp_all(attrs: &mut Attrs, now: i128) {
   attrs.atime = now;
   attrs.mtime = now;
   attrs.ctime = now;
   attrs.btime = now;
 }
 
-fn chunk_len(e: &Extent) -> u64 {
+pub(crate) fn chunk_len(e: &Extent) -> u64 {
   match e.src {
     ExtentSrc::Chunk { .. } => e.len,
     ExtentSrc::Zero => 0,
@@ -2183,7 +2311,7 @@ fn chunk_len(e: &Extent) -> u64 {
 }
 
 /// Copies the overlap of `bytes` (at file offset `base`) into `out` (at file offset `off`).
-fn copy_range(bytes: &[u8], base: u64, off: u64, out: &mut [u8]) {
+pub(crate) fn copy_range(bytes: &[u8], base: u64, off: u64, out: &mut [u8]) {
   let src_end = base + u64::try_from(bytes.len()).unwrap_or(0);
   let dst_end = off + u64::try_from(out.len()).unwrap_or(0);
   let start = base.max(off);
@@ -2202,14 +2330,29 @@ fn copy_range(bytes: &[u8], base: u64, off: u64, out: &mut [u8]) {
   out[d0..d1].copy_from_slice(&bytes[s..e]);
 }
 
+/// Releases the chunks of sealed extents by the epoch rule.
+fn release_extents(
+  store: &mut Store,
+  extents: &[Extent],
+  last: Option<Epoch>,
+  dead: &mut Deadlist,
+) -> Result<(), VfsError> {
+  for e in extents {
+    if let ExtentSrc::Chunk { chunk, .. } = e.src {
+      store.content.release_chunk(chunk, last, dead)?;
+    }
+  }
+  Ok(())
+}
+
 /// Inserts a sealed extent, keeping the list ascending by offset.
-fn insert_extent(list: &mut Vec<Extent>, e: Extent) {
+pub(crate) fn insert_extent(list: &mut Vec<Extent>, e: Extent) {
   let at = list.partition_point(|x| x.off < e.off);
   list.insert(at, e);
 }
 
 /// Clips extents to `len`, releasing the chunks fully beyond it; returns bytes freed.
-fn clip_extents(
+pub(crate) fn clip_extents(
   store: &mut Store,
   extents: &mut Vec<Extent>,
   len: u64,
@@ -2292,6 +2435,7 @@ fn release_weight(store: &Store, dead: Dead) -> usize {
       1 + store.inodes.get(h).map_or(0, |inode| match &inode.body {
         Body::Sealed(extents) => extents.len(),
         Body::Open { sealed, .. } => sealed.len() + 1,
+        Body::Base(b) => b.pinned.len(),
         _ => 0,
       })
     }
@@ -2320,6 +2464,13 @@ fn release_dead(store: &mut Store, dead: Dead) -> Result<(), VfsError> {
           Body::Open { open, sealed } => {
             let _ = store.content.release_open(open);
             for e in sealed {
+              if let ExtentSrc::Chunk { chunk, .. } = e.src {
+                let _ = store.content.free_chunk(chunk);
+              }
+            }
+          }
+          Body::Base(b) => {
+            for e in b.pinned {
               if let ExtentSrc::Chunk { chunk, .. } = e.src {
                 let _ = store.content.free_chunk(chunk);
               }

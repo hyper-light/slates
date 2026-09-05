@@ -14,6 +14,11 @@
 //! Cost is proportional to the touched paths, not the tree: the journal is read once, each
 //! touched path is resolved in both trees, and only an inode that has had more than one link
 //! (or whose home no longer names it) costs a walk.
+//!
+//! An applier reads the document as a set with one order: renamed directories are detached
+//! from their base paths, then removals apply, then the detached subtrees attach at their new
+//! paths, then directories are created, then symlinks, then files; a file's base reference
+//! names its base path before any of that, so it is looked up in the base as it was.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -63,6 +68,10 @@ pub struct SymlinkDelta {
 /// The ops document of an increment.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OpsDocument {
+  /// Directories renamed, with everything beneath them, as `(base path, post-state path)`;
+  /// applied first, so a path beneath a renamed directory is named by its post-state path
+  /// everywhere else in the document (§4.15's one rename per directory; §4.16's remapping).
+  pub dirs_renamed: Vec<(Box<str>, Box<str>)>,
   /// Directories the post-state has and the base did not.
   pub dirs_created: Vec<Box<str>>,
   /// Directories the base had and the post-state does not.
@@ -81,6 +90,11 @@ impl OpsDocument {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
+    put_count(&mut out, self.dirs_renamed.len());
+    for (from, to) in &self.dirs_renamed {
+      put_str(&mut out, from);
+      put_str(&mut out, to);
+    }
     put_paths(&mut out, &self.dirs_created);
     put_paths(&mut out, &self.dirs_removed);
     put_paths(&mut out, &self.removed);
@@ -119,7 +133,8 @@ impl OpsDocument {
 
   /// Whether the increment changes nothing.
   pub fn is_empty(&self) -> bool {
-    self.dirs_created.is_empty()
+    self.dirs_renamed.is_empty()
+      && self.dirs_created.is_empty()
       && self.dirs_removed.is_empty()
       && self.removed.is_empty()
       && self.symlinks.is_empty()
@@ -147,7 +162,7 @@ fn put_paths(out: &mut Vec<u8>, paths: &[Box<str>]) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Entry {
   None,
-  Dir,
+  Dir(InodeNo),
   File(InodeNo),
   Symlink(InodeNo),
 }
@@ -155,7 +170,7 @@ enum Entry {
 fn classify(located: Result<crate::volume::Located, VfsError>) -> Entry {
   match located {
     Ok(l) => match l.child {
-      Child::Dir(_) => Entry::Dir,
+      Child::Dir(_) => Entry::Dir(l.inode),
       Child::File(no) => Entry::File(no),
       Child::Symlink(no) => Entry::Symlink(no),
       Child::Whiteout => Entry::None,
@@ -262,19 +277,29 @@ impl Deriver<'_> {
     let base = classify(self.vol.resolve_in(self.store, self.base, path));
     let head = classify(self.vol.resolve(self.store, path));
     match (base, head) {
-      (Entry::None, Entry::None) | (Entry::Dir, Entry::Dir) => {}
-      (_, Entry::Dir) => {
-        self.removed_side(base, path, doc);
-        doc.dirs_created.push(path.into());
+      (Entry::None, Entry::None) => {}
+      (Entry::Dir(b), Entry::Dir(h)) if b == h => {}
+      (_, Entry::Dir(no)) => {
+        // A directory the base held at another path moved here with its subtree.
+        match self.vol.path_of_dir_in(self.store, self.base, no) {
+          Some(from) if from != path => {
+            self.removed_side(base, path, doc);
+            doc.dirs_renamed.push((from.into(), path.into()));
+          }
+          _ => {
+            self.removed_side(base, path, doc);
+            doc.dirs_created.push(path.into());
+          }
+        }
       }
-      (Entry::Dir, Entry::None) => doc.dirs_removed.push(path.into()),
+      (Entry::Dir(_), Entry::None) => doc.dirs_removed.push(path.into()),
       (Entry::File(_) | Entry::Symlink(_), Entry::None) => doc.removed.push(path.into()),
       (_, Entry::Symlink(no)) => {
         let target = self.vol.readlink(self.store, no)?;
         let same = matches!(base, Entry::Symlink(b) if self.vol.readlink(self.store, b).as_deref() == Ok(&target));
         if !same {
           match base {
-            Entry::Dir => doc.dirs_removed.push(path.into()),
+            Entry::Dir(_) => doc.dirs_removed.push(path.into()),
             // A file gave way to a symlink; a symlink with another target is replaced by
             // the new one below.
             Entry::File(_) => doc.removed.push(path.into()),
@@ -288,7 +313,7 @@ impl Deriver<'_> {
       }
       (_, Entry::File(no)) => {
         match base {
-          Entry::Dir => doc.dirs_removed.push(path.into()),
+          Entry::Dir(_) => doc.dirs_removed.push(path.into()),
           // A symlink gave way to a file; a file is replaced through the delta's base.
           Entry::Symlink(_) => doc.removed.push(path.into()),
           Entry::File(_) | Entry::None => {}
@@ -302,7 +327,8 @@ impl Deriver<'_> {
   fn removed_side(&self, base: Entry, path: &str, doc: &mut OpsDocument) {
     match base {
       Entry::File(_) | Entry::Symlink(_) => doc.removed.push(path.into()),
-      Entry::Dir | Entry::None => {}
+      Entry::Dir(_) => doc.dirs_removed.push(path.into()),
+      Entry::None => {}
     }
   }
 
@@ -368,6 +394,13 @@ pub fn derive(vol: &Volume, store: &Store, base: SnapshotId) -> Result<OpsDocume
   for path in &d.touched {
     d.classify_path(path, &mut doc)?;
   }
+  doc.dirs_renamed.sort();
+  let sources: Vec<Box<str>> = doc
+    .dirs_renamed
+    .iter()
+    .map(|(from, _)| from.clone())
+    .collect();
+  doc.dirs_removed.retain(|p| !sources.contains(p));
   doc.dirs_created.sort();
   doc.dirs_removed.sort();
   doc.removed.sort();

@@ -24,12 +24,14 @@
 //! [`snapshot`], [`quota`], [`journal`], [`volume`].
 
 pub mod algebra;
+pub mod base;
 pub mod clock;
 pub mod content;
 pub mod derive;
 pub mod dir;
 pub mod dirtree;
 pub mod error;
+pub mod host;
 pub mod ids;
 pub mod inode;
 pub mod journal;
