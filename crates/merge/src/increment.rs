@@ -31,11 +31,12 @@
 //! journal's declaration order.
 //!
 //! Scope: content, create, unlink and rename of regular files, directory create and remove, and
-//! the mode of a file or directory (`SetMode`), and symbolic links (`Symlink`, composed
-//! independently; the target is stored in the path table). Hard links and xattrs, a file/directory
-//! transition at one path, chmod then rename of one path, symlink rename, and the rare rename onto
-//! a base path already consumed this increment are the deriver's remaining piece (owed; GAPS §8f),
-//! each a typed [`DeriveError`]. An operation a valid volume could not
+//! the mode of a file or directory (`SetMode`), symbolic links (`Symlink`; the target is stored
+//! in the path table), and extended attributes (`SetXattr`/`RemoveXattr`, composed against the
+//! base value; the value is laid out in the post-state after the file content, the name in the
+//! path table). Hard links, a file/directory transition at one path, chmod/xattr then rename of
+//! one path, symlink rename, and the rare rename onto a base path already consumed this increment
+//! are the deriver's remaining piece (owed; GAPS §8f), each a typed [`DeriveError`]. An operation a valid volume could not
 //! have produced — content on a missing file, a create over an existing one, an unlink, rename or
 //! rmdir of a missing one, a mkdir over an existing directory — is a typed [`DeriveError`] too,
 //! never a panic. This module is pure: no I/O, no clock, no randomness.
@@ -131,6 +132,22 @@ pub enum VolumeOp {
     /// The link's target (an opaque byte string).
     target: String,
   },
+  /// An extended attribute `name` on `path` set to `value`.
+  SetXattr {
+    /// The path.
+    path: String,
+    /// The attribute name.
+    name: String,
+    /// The attribute value (opaque bytes).
+    value: Vec<u8>,
+  },
+  /// The extended attribute `name` removed from `path`.
+  RemoveXattr {
+    /// The path.
+    path: String,
+    /// The attribute name.
+    name: String,
+  },
 }
 
 impl VolumeOp {
@@ -148,7 +165,9 @@ impl VolumeOp {
       | VolumeOp::Mkdir { .. }
       | VolumeOp::Rmdir { .. }
       | VolumeOp::SetMode { .. }
-      | VolumeOp::Symlink { .. } => None,
+      | VolumeOp::Symlink { .. }
+      | VolumeOp::SetXattr { .. }
+      | VolumeOp::RemoveXattr { .. } => None,
     }
   }
 
@@ -177,7 +196,9 @@ impl VolumeOp {
       | VolumeOp::Mkdir { .. }
       | VolumeOp::Rmdir { .. }
       | VolumeOp::SetMode { .. }
-      | VolumeOp::Symlink { .. } => None,
+      | VolumeOp::Symlink { .. }
+      | VolumeOp::SetXattr { .. }
+      | VolumeOp::RemoveXattr { .. } => None,
     }
   }
 }
@@ -211,6 +232,8 @@ pub enum DeriveError {
   /// One path was used as conflicting kinds this increment (file, directory and/or symlink), a
   /// transition whose composition is owed.
   PathKindConflict(String),
+  /// An xattr operation on a path with no file or directory present at seal.
+  XattrMissing(String),
 }
 
 impl std::fmt::Display for DeriveError {
@@ -234,6 +257,7 @@ impl std::fmt::Display for DeriveError {
       Self::SetModeMissing(path) => write!(f, "set mode on missing path {path}"),
       Self::SymlinkOverExisting(path) => write!(f, "symlink over existing symlink {path}"),
       Self::PathKindConflict(path) => write!(f, "path {path} is used as conflicting kinds"),
+      Self::XattrMissing(path) => write!(f, "xattr operation on missing path {path}"),
     }
   }
 }
@@ -253,6 +277,8 @@ pub struct Base {
   pub modes: Vec<(String, u32)>,
   /// The base symlinks and their targets.
   pub symlinks: Vec<(String, String)>,
+  /// The base extended attributes: `(path, name, value)`.
+  pub xattrs: Vec<(String, String, Vec<u8>)>,
 }
 
 impl Base {
@@ -263,8 +289,18 @@ impl Base {
       dirs: Vec::new(),
       modes: Vec::new(),
       symlinks: Vec::new(),
+      xattrs: Vec::new(),
     }
   }
+}
+
+/// The base value of the xattr `name` on `path`, if the base recorded one.
+fn base_xattr<'a>(base: &'a Base, path: &str, name: &str) -> Option<&'a [u8]> {
+  base
+    .xattrs
+    .iter()
+    .find(|(candidate_path, candidate_name, _)| candidate_path == path && candidate_name == name)
+    .map(|(_, _, value)| value.as_slice())
 }
 
 /// The base symlink target of `path`, if the base has a symlink there.
@@ -526,6 +562,91 @@ fn compose_modes(
   Ok(emissions)
 }
 
+/// An xattr the increment declares.
+enum XattrEmission {
+  /// Set the xattr `name` on the path to `value`.
+  Set(String, String, Vec<u8>),
+  /// Remove the xattr `name` from the path.
+  Removed(String, String),
+}
+
+/// Composes the xattr operations into a final state per `(path, name)`, emitting a `SetXattr` only
+/// where the value differs from the base and a `RemoveXattr` only where a base xattr is removed,
+/// and only where the path is present at seal (a surviving file or a present directory). An xattr
+/// on a renamed-away path is the owed `Unsupported` refusal; one on a path present nowhere is
+/// `XattrMissing`.
+fn compose_xattrs(
+  base: &Base,
+  journal: &[VolumeOp],
+  survivors: &std::collections::BTreeSet<String>,
+  renamed_away: &std::collections::BTreeSet<String>,
+  present_dirs: &std::collections::BTreeSet<String>,
+) -> Result<Vec<XattrEmission>, DeriveError> {
+  // The final state of each attribute: `Some(value)` set, `None` removed. Keyed sorted so the
+  // emissions (and the post-state layout of the values) are deterministic.
+  let mut state: std::collections::BTreeMap<(String, String), Option<Vec<u8>>> =
+    std::collections::BTreeMap::new();
+  for op in journal {
+    match op {
+      VolumeOp::SetXattr { path, name, value } => {
+        state.insert((path.clone(), name.clone()), Some(value.clone()));
+      }
+      VolumeOp::RemoveXattr { path, name } => {
+        state.insert((path.clone(), name.clone()), None);
+      }
+      _ => {}
+    }
+  }
+  let mut emissions = Vec::new();
+  for ((path, name), final_value) in state {
+    if renamed_away.contains(&path) {
+      return Err(DeriveError::Unsupported(path));
+    }
+    if !survivors.contains(&path) && !present_dirs.contains(&path) {
+      return Err(DeriveError::XattrMissing(path));
+    }
+    let base_value = base_xattr(base, &path, &name);
+    match final_value {
+      Some(value) => {
+        if base_value != Some(value.as_slice()) {
+          emissions.push(XattrEmission::Set(path, name, value));
+        }
+      }
+      None => {
+        if base_value.is_some() {
+          emissions.push(XattrEmission::Removed(path, name));
+        }
+      }
+    }
+  }
+  Ok(emissions)
+}
+
+/// A `SetXattr` op: `path` is the file's index, `at` the name's index into the table, and the
+/// value is `len` bytes at post-state offset `src`.
+fn set_xattr_op(path: u16, name: u16, value_offset: u64, value_len: u64) -> Op {
+  Op {
+    kind: OpKind::SetXattr,
+    flags: 0,
+    path,
+    at: u64::from(name),
+    len: value_len,
+    src: value_offset,
+  }
+}
+
+/// A `RemoveXattr` op: `path` is the file's index, `at` the name's index into the table.
+fn remove_xattr_op(path: u16, name: u16) -> Op {
+  Op {
+    kind: OpKind::RemoveXattr,
+    flags: 0,
+    path,
+    at: u64::from(name),
+    len: 0,
+    src: u64::MAX,
+  }
+}
+
 /// A `SetMode` op: the new mode is carried in `len` (§4.16 `OpRecord`).
 fn set_mode_op(path: u16, mode: u32) -> Op {
   Op {
@@ -699,7 +820,8 @@ pub fn compose_volume(base: &Base, journal: &[VolumeOp]) -> Result<OpsDoc, Deriv
     .collect();
   let present_dirs = present_directories(base, journal);
   let modes = compose_modes(base, journal, &survivors, &renamed_away, &present_dirs)?;
-  Ok(seal(entities, directories, modes, symlinks))
+  let xattrs = compose_xattrs(base, journal, &survivors, &renamed_away, &present_dirs)?;
+  Ok(seal(entities, directories, modes, symlinks, xattrs))
 }
 
 /// A directory the increment declares: a create or a remove.
@@ -869,6 +991,7 @@ fn document_names(
   directories: &[DirectoryEmission],
   modes: &[(String, u32)],
   symlinks: &[SymlinkEmission],
+  xattrs: &[XattrEmission],
 ) -> Vec<String> {
   let mut names: Vec<String> = Vec::new();
   for emission in emissions {
@@ -893,6 +1016,14 @@ fn document_names(
         names.push(target.clone());
       }
       SymlinkEmission::Removed(path) => names.push(path.clone()),
+    }
+  }
+  for xattr in xattrs {
+    match xattr {
+      XattrEmission::Set(path, name, _) | XattrEmission::Removed(path, name) => {
+        names.push(path.clone());
+        names.push(name.clone());
+      }
     }
   }
   names.sort_unstable();
@@ -950,9 +1081,17 @@ fn seal(
   directories: Vec<DirectoryEmission>,
   modes: Vec<(String, u32)>,
   symlinks: Vec<SymlinkEmission>,
+  xattrs: Vec<XattrEmission>,
 ) -> OpsDoc {
   let (mut emissions, removed) = classify(entities);
-  let names = document_names(&emissions, &removed, &directories, &modes, &symlinks);
+  let names = document_names(
+    &emissions,
+    &removed,
+    &directories,
+    &modes,
+    &symlinks,
+    &xattrs,
+  );
 
   let mut doc = OpsDoc::new();
   for name in &names {
@@ -978,6 +1117,26 @@ fn seal(
     }
     push_content(&mut doc, emission.ops, destination, region_offset);
     region_offset = region_offset.saturating_add(emission.final_len);
+  }
+  // Xattr values are laid out in the post-state after the file content, in sorted order.
+  for xattr in xattrs {
+    match xattr {
+      XattrEmission::Set(path, name, value) => {
+        let value_len = value.len() as u64;
+        doc.ops.push(set_xattr_op(
+          index_of(&path),
+          index_of(&name),
+          region_offset,
+          value_len,
+        ));
+        region_offset = region_offset.saturating_add(value_len);
+      }
+      XattrEmission::Removed(path, name) => {
+        doc
+          .ops
+          .push(remove_xattr_op(index_of(&path), index_of(&name)));
+      }
+    }
   }
   emit_namespace(&mut doc, &names, removed, directories, modes, symlinks);
   doc.canonicalize();

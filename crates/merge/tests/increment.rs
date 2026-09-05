@@ -512,6 +512,7 @@ fn removing_a_base_directory_is_one_rmdir() {
     dirs: vec!["d".to_owned()],
     modes: Vec::new(),
     symlinks: Vec::new(),
+    xattrs: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -551,6 +552,7 @@ fn removing_then_recreating_a_base_directory_is_nothing() {
     dirs: vec!["d".to_owned()],
     modes: Vec::new(),
     symlinks: Vec::new(),
+    xattrs: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -595,6 +597,7 @@ fn mkdir_over_a_base_directory_refuses() {
     dirs: vec!["d".to_owned()],
     modes: Vec::new(),
     symlinks: Vec::new(),
+    xattrs: Vec::new(),
   };
   assert!(matches!(
     compose_volume(
@@ -663,6 +666,7 @@ proptest! {
       dirs: base_dirs.clone(),
       modes: Vec::new(),
       symlinks: Vec::new(),
+      xattrs: Vec::new(),
     };
     let doc = compose_volume(&base, &journal).expect("a valid directory journal composes");
     // Reconstruct: start from the base directories, apply the document's Mkdir/Rmdir.
@@ -689,6 +693,7 @@ fn setting_a_base_file_mode_is_one_set_mode() {
     dirs: Vec::new(),
     modes: vec![("f".to_owned(), 0o644)],
     symlinks: Vec::new(),
+    xattrs: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -715,6 +720,7 @@ fn setting_a_mode_to_the_base_mode_is_nothing() {
     dirs: Vec::new(),
     modes: vec![("f".to_owned(), 0o644)],
     symlinks: Vec::new(),
+    xattrs: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -735,6 +741,7 @@ fn the_last_set_mode_wins() {
     dirs: Vec::new(),
     modes: vec![("f".to_owned(), 0o644)],
     symlinks: Vec::new(),
+    xattrs: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -766,6 +773,7 @@ fn setting_a_base_directory_mode() {
     dirs: vec!["d".to_owned()],
     modes: vec![("d".to_owned(), 0o755)],
     symlinks: Vec::new(),
+    xattrs: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -831,6 +839,7 @@ fn set_mode_then_rename_refuses() {
     dirs: Vec::new(),
     modes: vec![("a".to_owned(), 0o644)],
     symlinks: Vec::new(),
+    xattrs: Vec::new(),
   };
   let result = compose_volume(
     &base,
@@ -902,6 +911,7 @@ fn removing_a_base_symlink_is_one_unlink() {
     dirs: Vec::new(),
     modes: Vec::new(),
     symlinks: vec![("l".to_owned(), "t".to_owned())],
+    xattrs: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -924,6 +934,7 @@ fn retargeting_a_base_symlink_is_one_symlink() {
     dirs: Vec::new(),
     modes: Vec::new(),
     symlinks: vec![("l".to_owned(), "old".to_owned())],
+    xattrs: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -958,6 +969,7 @@ fn recreating_a_base_symlink_to_the_same_target_is_nothing() {
     dirs: Vec::new(),
     modes: Vec::new(),
     symlinks: vec![("l".to_owned(), "t".to_owned())],
+    xattrs: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -983,6 +995,7 @@ fn symlink_over_an_existing_symlink_refuses() {
     dirs: Vec::new(),
     modes: Vec::new(),
     symlinks: vec![("l".to_owned(), "t".to_owned())],
+    xattrs: Vec::new(),
   };
   assert!(matches!(
     compose_volume(
@@ -1020,6 +1033,7 @@ fn a_write_on_a_base_symlink_conflicts() {
     dirs: Vec::new(),
     modes: Vec::new(),
     symlinks: vec![("l".to_owned(), "t".to_owned())],
+    xattrs: Vec::new(),
   };
   assert!(matches!(
     compose_volume(
@@ -1031,5 +1045,147 @@ fn a_write_on_a_base_symlink_conflicts() {
       }]
     ),
     Err(DeriveError::PathIsFileAndDirectory(_))
+  ));
+}
+
+// --- Xattr composition ---
+
+/// Builds a base with one file and one xattr on it.
+fn base_with_xattr(path: &str, name: &str, value: &[u8]) -> Base {
+  Base {
+    files: vec![(path.to_owned(), 4)],
+    dirs: Vec::new(),
+    modes: Vec::new(),
+    symlinks: Vec::new(),
+    xattrs: vec![(path.to_owned(), name.to_owned(), value.to_vec())],
+  }
+}
+
+/// Setting an xattr to a new value emits one `SetXattr` (path index in `path`, name index in `at`,
+/// value length in `len`).
+#[test]
+fn setting_an_xattr_to_a_new_value() {
+  let base = base_with_xattr("f", "user.a", b"old");
+  let doc = compose_volume(
+    &base,
+    &[VolumeOp::SetXattr {
+      path: "f".to_owned(),
+      name: "user.a".to_owned(),
+      value: b"newer".to_vec(),
+    }],
+  )
+  .expect("valid");
+  let op = doc
+    .ops
+    .iter()
+    .find(|op| op.kind == OpKind::SetXattr)
+    .expect("a set-xattr");
+  assert_eq!(doc.paths.path(op.path), Some("f"));
+  assert_eq!(
+    doc.paths.path(u16::try_from(op.at).unwrap_or(u16::MAX)),
+    Some("user.a")
+  );
+  assert_eq!(op.len, 5, "the value length");
+}
+
+/// Setting an xattr to its base value declares nothing (minimality).
+#[test]
+fn setting_an_xattr_to_the_base_value_is_nothing() {
+  let base = base_with_xattr("f", "user.a", b"same");
+  let doc = compose_volume(
+    &base,
+    &[VolumeOp::SetXattr {
+      path: "f".to_owned(),
+      name: "user.a".to_owned(),
+      value: b"same".to_vec(),
+    }],
+  )
+  .expect("valid");
+  assert!(doc.ops.is_empty(), "no net change");
+}
+
+/// Removing a base xattr emits one `RemoveXattr`.
+#[test]
+fn removing_a_base_xattr() {
+  let base = base_with_xattr("f", "user.a", b"v");
+  let doc = compose_volume(
+    &base,
+    &[VolumeOp::RemoveXattr {
+      path: "f".to_owned(),
+      name: "user.a".to_owned(),
+    }],
+  )
+  .expect("valid");
+  let op = doc
+    .ops
+    .iter()
+    .find(|op| op.kind == OpKind::RemoveXattr)
+    .expect("a remove-xattr");
+  assert_eq!(doc.paths.path(op.path), Some("f"));
+  assert_eq!(
+    doc.paths.path(u16::try_from(op.at).unwrap_or(u16::MAX)),
+    Some("user.a")
+  );
+}
+
+/// Setting a new xattr not present at base emits a `SetXattr`, and its value is at the declared
+/// post-state offset (here 0, the only content).
+#[test]
+fn setting_a_new_xattr_lays_the_value_in_the_post_state() {
+  let base = Base::of_files(vec![("f".to_owned(), 4)]);
+  let doc = compose_volume(
+    &base,
+    &[VolumeOp::SetXattr {
+      path: "f".to_owned(),
+      name: "user.new".to_owned(),
+      value: b"value".to_vec(),
+    }],
+  )
+  .expect("valid");
+  let op = doc
+    .ops
+    .iter()
+    .find(|op| op.kind == OpKind::SetXattr)
+    .expect("a set-xattr");
+  assert_eq!(op.src, 0, "the only post-state content, at offset 0");
+  assert_eq!(op.len, 5);
+}
+
+/// Setting then removing an xattr that the base had emits a `RemoveXattr`.
+#[test]
+fn set_then_remove_a_base_xattr() {
+  let base = base_with_xattr("f", "user.a", b"v");
+  let doc = compose_volume(
+    &base,
+    &[
+      VolumeOp::SetXattr {
+        path: "f".to_owned(),
+        name: "user.a".to_owned(),
+        value: b"w".to_vec(),
+      },
+      VolumeOp::RemoveXattr {
+        path: "f".to_owned(),
+        name: "user.a".to_owned(),
+      },
+    ],
+  )
+  .expect("valid");
+  assert!(doc.ops.iter().any(|op| op.kind == OpKind::RemoveXattr));
+  assert!(!doc.ops.iter().any(|op| op.kind == OpKind::SetXattr));
+}
+
+/// An xattr on a path present nowhere is refused.
+#[test]
+fn xattr_on_a_missing_path_refuses() {
+  assert!(matches!(
+    compose_volume(
+      &Base::default(),
+      &[VolumeOp::SetXattr {
+        path: "gone".to_owned(),
+        name: "n".to_owned(),
+        value: b"v".to_vec()
+      }]
+    ),
+    Err(DeriveError::XattrMissing(_))
   ));
 }
