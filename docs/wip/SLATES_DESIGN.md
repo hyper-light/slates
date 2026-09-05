@@ -1,6 +1,6 @@
 # slates — unified design and phased implementation plan
 
-Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 (the volume core, the deriver, the base plane and the landing: `slates-vfs`, `slates-base`, `slates-land`) are implemented and gated; Phase 2 is in progress (tasks 1–8: through the register protocol and the landing-and-grant records — `slates-anchor`, `slates-db`, `slates-ipc`, `slates-server`, `slates-client`, `slates-cli`; the control-channel grant transport and the write execution run in the Linux lane; GAPS §8d). Phase 3 (the Linux FUSE bridge) has begun: the FUSE ABI codec is implemented and gated (`slates-bridge-fuse`; GAPS §8e), with the /dev/fuse transport, mount, cache invalidations, base-file reads and copy-up, and the `slates exec` launcher built (the transport, mount and exec verified in the Linux lane, the codec/dispatch/volume path tested on every host). The conformance and workload suites and the io_uring path remain. Phase 6's pure core is also implemented and gated ahead of the rest of Phase 6 (`slates-merge`; GAPS §8f): the deterministic merge verdict (the accept/identical/conflict decision), the canonical ops document (the declared-operation serialization whose BLAKE3 is half an increment's identity), and the content deriver (one path's declared operations composed into the net op set by interval algebra, never a diff, with a byte-level oracle). Phases 4, 5, 7, 8, 9 and the rest of Phases 3 and 6 are design.
+Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 (the volume core, the deriver, the base plane and the landing: `slates-vfs`, `slates-base`, `slates-land`) are implemented and gated; Phase 2 is in progress (tasks 1–8: through the register protocol and the landing-and-grant records — `slates-anchor`, `slates-db`, `slates-ipc`, `slates-server`, `slates-client`, `slates-cli`; the control-channel grant transport and the write execution run in the Linux lane; GAPS §8d). Phase 3 (the Linux FUSE bridge) has begun: the FUSE ABI codec is implemented and gated (`slates-bridge-fuse`; GAPS §8e), with the /dev/fuse transport, mount, cache invalidations, base-file reads and copy-up, and the `slates exec` launcher built (the transport, mount and exec verified in the Linux lane, the codec/dispatch/volume path tested on every host). The conformance and workload suites and the io_uring path remain. Phase 6's pure core is also implemented and gated ahead of the rest of Phase 6 (`slates-merge`; GAPS §8f): the deterministic merge verdict (the accept/identical/conflict decision), the canonical ops document (the declared-operation serialization whose BLAKE3 is half an increment's identity), the content deriver (one path's declared operations composed into the net op set by interval algebra, never a diff, with a byte-level oracle), and position mapping (an increment's ranges shifted forward through the intervening deltas to head coordinates, with a provenance oracle). Phases 4, 5, 7, 8, 9 and the rest of Phases 3 and 6 are design.
 This version integrates amendments A-1, A-2, A-4, A-5 and A-6 into the body; the amendment log at
 the end is history, and where the log and the body disagree, the body wins.
 Every decision below cites tiered evidence; every tunable is a measured derivation; every phase
@@ -2045,10 +2045,12 @@ granted-target exception).
 > range cases), the canonical ops document (the declared-operation serialization whose BLAKE3 is
 > half an increment's identity, determinism-gated), and the content deriver (one path's declared
 > content operations composed into the canonical net op set by interval algebra, never a diff,
-> with a byte-level oracle that reconstructs the post-state from the net ops). All on every host.
-> The deriver's namespace composition and multi-path assembly into the ops document, the
-> canonical deltas and position mapping, the splice by extent surgery, the green chain and the
-> fenced ledger register, and holder recomputation are the rest of Phase 6.
+> with a byte-level oracle that reconstructs the post-state from the net ops), and position
+> mapping (an increment's ranges shifted forward through the intervening deltas to head
+> coordinates, overlaps handed to the verdict, with a provenance oracle). All on every host. The
+> deriver's namespace composition and multi-path assembly into the ops document, the checkpoint
+> folding of the canonical deltas, the splice by extent surgery, the green chain and the fenced
+> ledger register, and holder recomputation are the rest of Phase 6.
 
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an
