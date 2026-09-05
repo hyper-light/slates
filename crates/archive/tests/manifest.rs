@@ -239,3 +239,19 @@ fn metadata_changes_the_identity() {
     "identical trees have one identity"
   );
 }
+
+/// Golden vector: the sample tree hashes to a pinned Merkle root, so any change to the node
+/// encoding (including the per-node metadata) is caught across versions, not only within a run.
+/// Regenerate deliberately on a format change (the archive minor version tracks it).
+#[test]
+fn the_manifest_identity_matches_its_golden_vector() {
+  let hex: String = sample()
+    .identity()
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect();
+  assert_eq!(
+    hex, "1a1634ffea3c563d1fe178b6495b5f17f12068db83944c5374ba9a72633b10d6",
+    "the manifest identity changed; regenerate the golden vector only for a deliberate format change"
+  );
+}

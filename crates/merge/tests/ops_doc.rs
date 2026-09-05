@@ -99,3 +99,21 @@ fn interning_is_stable_and_canonicalize_sorts() {
   assert_eq!(d.paths.path(d.ops[0].path), Some("a"));
   assert_eq!(d.paths.path(d.ops[1].path), Some("z"));
 }
+
+/// Golden vector (§4.16 "its identity is the test"): a fixed ops document hashes to a pinned
+/// identity, so any change to the canonical encoding is caught across versions, not only within a
+/// single run. If the format changes deliberately, regenerate this value (the encoding is what an
+/// increment's identity is built on, so a silent change here would silently change every id).
+#[test]
+fn the_ops_document_identity_matches_its_golden_vector() {
+  let d = doc(&[
+    ("build.rs", OpKind::Create, 0, 0),
+    ("src/lib.rs", OpKind::Overwrite, 0, 10),
+    ("src/lib.rs", OpKind::Insert, 100, 5),
+  ]);
+  let hex: String = d.identity().iter().map(|b| format!("{b:02x}")).collect();
+  assert_eq!(
+    hex, "67613f8e50666f0237f6bef56196280d8e270d1fda3465ccc44f3b88f19b677d",
+    "the ops document identity changed; regenerate the golden vector only for a deliberate format change"
+  );
+}
