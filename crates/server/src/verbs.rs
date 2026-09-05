@@ -35,9 +35,6 @@ use slates_wire::request::{RequestId, Seen};
 use crate::error::{refusal_of_db, refusal_of_vfs};
 use crate::state::{ClientSlot, ShardState, VolumeSlot};
 
-/// Shape: the operator's failover SLO, the lease term's ceiling (Gray & Cheriton: seconds;
-/// §4.4 "Derived constants"): ten seconds until the CLI takes the operator's value.
-const FAILOVER_SLO_NS: u64 = 10_000_000_000;
 /// Shape: the share of a volume's quota its journal may take, parts per thousand (ratified
 /// GAPS §5: the op log of a bounded volume stays a small fraction of its bytes).
 const JOURNAL_SHARE_PERMILLE: u64 = 10;
@@ -859,9 +856,9 @@ fn attach(
         None => 1,
       };
       let term = derived!(
-        FAILOVER_SLO_NS,
+        state.config.failover_slo_ns,
         "the operator's failover SLO (the renewal round trip is microseconds, so one term is the SLO)",
-        ["FAILOVER_SLO_NS"]
+        ["failover_slo_ns"]
       );
       let lease = LeaseRecord {
         holder: principal.clone(),
@@ -1281,20 +1278,96 @@ pub fn serve_round(state: &mut ShardState) -> bool {
   let mut any = retry_deferred(state);
   let handles: Vec<(u32, Handle<ClientSlot>)> =
     state.clients.iter().map(|(h, _)| (h.index(), h)).collect();
+  // One clock read per round marks every client served in it (the reap's silence clock).
+  let now = state.clock.monotonic_ns();
   for (index, handle) in handles {
-    any |= serve_client(state, index, handle);
+    any |= serve_client(state, index, handle, now);
   }
   any |= step_destroys(state);
-  let now = state.clock.monotonic_ns();
-  for expired in state.db.partition_mut().expired_leases(now) {
-    let _ = state.db.mutate(
-      &mut state.segment,
-      &Op::LeaseReleased { volume: expired },
-      now,
-    );
-    any = true;
-  }
+  any |= expire_leases(state) > 0;
   any
+}
+
+/// Releases every lease whose term passed (the wheel pops; nothing scans); the count.
+pub fn expire_leases(state: &mut ShardState) -> usize {
+  let now = state.clock.monotonic_ns();
+  let expired = state.db.partition_mut().expired_leases(now);
+  let count = expired.len();
+  for volume in expired {
+    let _ = state
+      .db
+      .mutate(&mut state.segment, &Op::LeaseReleased { volume }, now);
+  }
+  count
+}
+
+/// What one sweep for dead clients did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reaped {
+  /// Clients found gone and reclaimed.
+  pub clients: usize,
+  /// Their attachments removed.
+  pub attachments: usize,
+}
+
+/// Asks about every client silent past `silence_ns` and reclaims the gone ones (§4.7 "Failure
+/// matrix"): its attachments leave the catalog as recorded operations, its region and control
+/// channel are dropped, its id is returned to the control shard's live set, and its leases
+/// keep their terms (a paused client is not a dead one; the term is the fence, D-16). Other
+/// clients are untouched.
+pub fn reap_dead_clients(state: &mut ShardState, silence_ns: u64) -> Reaped {
+  let now = state.clock.monotonic_ns();
+  let silent: Vec<(Handle<ClientSlot>, u32)> = state
+    .clients
+    .iter()
+    .filter(|(_, c)| now.saturating_sub(c.last_seen_ns) >= silence_ns)
+    .map(|(h, c)| (h, c.client_id))
+    .collect();
+  let mut reaped = Reaped::default();
+  for (handle, client_id) in silent {
+    let gone = state
+      .clients
+      .get(handle)
+      .is_ok_and(|c| crate::peer::peer_gone(c.control.as_ref(), c.pid));
+    if !gone {
+      continue;
+    }
+    reaped.attachments += reap_client(state, handle, client_id);
+    reaped.clients += 1;
+  }
+  reaped
+}
+
+/// Reclaims one client; its attachments removed, counted.
+fn reap_client(state: &mut ShardState, handle: Handle<ClientSlot>, client_id: u32) -> usize {
+  let now = state.clock.monotonic_ns();
+  let mut removed = 0;
+  for id in state.db.partition().attachments_of_client(client_id) {
+    if state
+      .db
+      .mutate(&mut state.segment, &Op::AttachmentRemoved { id }, now)
+      .is_ok()
+    {
+      removed += 1;
+    }
+  }
+  let index = handle.index();
+  state.deferred.retain(|(client, _, _)| *client != index);
+  // The slot goes last: the region's mapping and the control channel close with it.
+  let _ = state.clients.remove(handle);
+  // The id returns to the control shard's live set as a task there (sharing by move).
+  if let Some(control) = state.shards.first().copied() {
+    let forget = Box::new(SpawnRequest::new(
+      Box::pin(async move {
+        crate::state::with_handed(|handed| {
+          handed.remove(&client_id);
+        });
+      }),
+      None,
+    ));
+    let _ = slates_rt::registry::send_control(control, Control::Spawn(forget));
+  }
+  removed
 }
 
 /// Deferred replies first: a reply back from another shard (recorded as a completion here,
@@ -1318,7 +1391,7 @@ fn retry_deferred(state: &mut ShardState) -> bool {
 }
 
 /// Up to a batch of one client's requests.
-fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>) -> bool {
+fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, now: u64) -> bool {
   let mut any = false;
   let batch = state.config.runtime.batch.max(1);
   for _ in 0..batch {
@@ -1335,6 +1408,9 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>) 
       }
     };
     any = true;
+    if let Ok(c) = state.clients.get_mut(handle) {
+      c.last_seen_ns = now;
+    }
     if matches!(request.kind, SlotKind::Heartbeat | SlotKind::Cancel) {
       continue;
     }

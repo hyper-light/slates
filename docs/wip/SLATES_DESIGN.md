@@ -1243,8 +1243,12 @@ root-relative path if the caller allowed it.
 > past the deadline; the rendezvous carries the id a reconnecting client wants (a 4-byte hello
 > on Linux; the claim slot's id field elsewhere) and the daemon honours it when no live client
 > holds it; a client's shard is its id's residue over the partitions, so a reconnect lands on
-> the partition holding its completion records. The daemon side of a dead client (the socket's
-> close, the heartbeat lapse, the reclaim) is owed to task 6 with T-2.3.
+> the partition holding its completion records. The daemon side: every shard sweeps at the
+> liveness cadence, asks about clients silent for the budget (the control socket's end of
+> stream on Linux; the process id probed on macOS and Windows), and reclaims a gone client's
+> attachments, region, control channel and id, leaving its leases to expire by their terms
+> (T-2.3 in `crates/client/tests/reap.rs`). The heartbeat slot stays the SDKs' way to be seen
+> alive without a request (Phase 5); a sync client is seen through its process.
 
 **Data model.**
 ```rust

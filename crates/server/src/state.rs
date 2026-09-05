@@ -25,6 +25,11 @@ pub struct ClientSlot {
   pub principal: Principal,
   /// The client id.
   pub client_id: u32,
+  /// The client's process id (the liveness probe's input where no socket closes).
+  pub pid: u32,
+  /// When the client last wrote a slot (any kind); a client silent past the liveness budget
+  /// is asked about.
+  pub last_seen_ns: u64,
   /// The control channel, where the platform has one (Linux: the socket whose close is how
   /// the daemon learns of a dead client, and whose peer end closing tells the client the
   /// daemon died; held for the client's life).
@@ -115,6 +120,15 @@ impl std::fmt::Debug for ShardState {
 
 thread_local! {
   static STATE: RefCell<Option<ShardState>> = const { RefCell::new(None) };
+  /// The control shard's set of live client ids (handed out and not yet reclaimed), so a
+  /// wanted id that is live is not given twice; bounded by the daemon's client capacity.
+  static HANDED: RefCell<std::collections::BTreeSet<u32>> =
+    const { RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+/// Borrows the control shard's set of live client ids (on the calling thread).
+pub fn with_handed<R>(f: impl FnOnce(&mut std::collections::BTreeSet<u32>) -> R) -> R {
+  HANDED.with(|cell| f(&mut cell.borrow_mut()))
 }
 
 /// Installs the state on the calling shard thread.

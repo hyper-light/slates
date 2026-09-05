@@ -19,8 +19,9 @@ use slates_wire::request::{ClientWindow, Seen};
 
 use crate::Art;
 use crate::catalog::{
-  AttachmentRecord, AuditRecord, CompletionRecord, GrantRecord, LandingLeaseRecord, LandingRecord,
-  LeaseRecord, LineageEdge, Principal, SnapshotId, SnapshotRecord, VolumeId, VolumeRecord,
+  AttachmentRecord, AuditRecord, CompletionRecord, Consumer, GrantRecord, LandingLeaseRecord,
+  LandingRecord, LeaseRecord, LineageEdge, Principal, SnapshotId, SnapshotRecord, VolumeId,
+  VolumeRecord,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -200,6 +201,17 @@ impl Partition {
   /// The volume a principal holds a lease on.
   pub fn lease_of(&self, holder: &Principal) -> Option<VolumeId> {
     self.leases_by_holder.get(&holder.key()).copied()
+  }
+
+  /// The attachment ids held by one SDK client (a walk of the table, bounded by its cap; the
+  /// reclaim of a dead client asks, never a hot path).
+  pub fn attachments_of_client(&self, client: u32) -> Vec<u64> {
+    self
+      .attachments
+      .iter()
+      .filter(|(_, a)| matches!(a.consumer, Consumer::Sdk { client: c } if c == client))
+      .map(|(_, a)| a.id)
+      .collect()
   }
 
   /// The attachments of a volume (a walk of the table, bounded by its cap; a detach and a

@@ -80,6 +80,8 @@ pub static HANDOFF_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 pub static RECOVERY_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Connects refused at the daemon's derived client bound (a health signal, AC-2.6).
 pub static CLIENTS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Clients found dead and reclaimed (a health signal; T-2.3).
+pub static CLIENTS_REAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Daemon {
   /// Starts the daemon from a profile.
@@ -284,7 +286,37 @@ fn init_shard(
   if let Ok(task) = futures::spawn(serve_loop()) {
     let _ = futures::detach(task);
   }
+  if let Ok(task) = futures::spawn(reap_loop()) {
+    let _ = futures::detach(task);
+  }
   Ok(())
+}
+
+/// The shard's sweep for dead clients and expired leases, at the liveness cadence: the same
+/// budget the anchor allows the daemon's own heartbeat, so a peer silent that long is asked
+/// about (§4.7 "Failure matrix"). Derived: the cadence is the budget; a client is asked about
+/// once silent for the budget, so a death is seen within two budgets at most.
+async fn reap_loop() {
+  let cadence = derived!(
+    LIVENESS_BUDGET_NS,
+    "the liveness budget (the anchor's question of the daemon, asked of the daemon's clients)",
+    ["LIVENESS_BUDGET_NS"]
+  )
+  .get();
+  loop {
+    futures::sleep(cadence).await;
+    let reaped = state::with_state(|s| {
+      let _ = verbs::expire_leases(s);
+      verbs::reap_dead_clients(s, cadence)
+    })
+    .unwrap_or_default();
+    if reaped.clients > 0 {
+      CLIENTS_REAPED.fetch_add(
+        u64::try_from(reaped.clients).unwrap_or(u64::MAX),
+        Ordering::AcqRel,
+      );
+    }
+  }
 }
 
 /// The shard's server loop: a poller of its clients' rings; serves while there is work,
@@ -343,42 +375,48 @@ async fn control_loop(
     ["clients_per_shard", "shards"]
   )
   .get();
-  let mut handed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
   loop {
-    let accepted = listener.accept_pending(&|id| handed.contains(&id), &mut |client_id| {
-      if handed.len() >= bound {
-        CLIENTS_REFUSED.fetch_add(1, Ordering::AcqRel);
-        return Err(slates_ipc::IpcError::TooManyClients { limit: bound });
-      }
-      let shard = shards[usize::try_from(client_id).unwrap_or(0) % shards.len().max(1)];
-      let region = ClientRegion::create(
-        &format!("slates-cr-{}-{client_id}", config.instance),
-        client_id,
-        shard.0,
-        config.region,
-      )?;
-      Ok(Prepared {
-        region,
-        kick_fd: kick_fd_of(shard),
-      })
-    });
+    let accepted = listener.accept_pending(
+      &|id| state::with_handed(|h| h.contains(&id)),
+      &mut |client_id| {
+        if state::with_handed(|h| h.len()) >= bound {
+          CLIENTS_REFUSED.fetch_add(1, Ordering::AcqRel);
+          return Err(slates_ipc::IpcError::TooManyClients { limit: bound });
+        }
+        let shard = shards[usize::try_from(client_id).unwrap_or(0) % shards.len().max(1)];
+        let region = ClientRegion::create(
+          &format!("slates-cr-{}-{client_id}", config.instance),
+          client_id,
+          shard.0,
+          config.region,
+        )?;
+        Ok(Prepared {
+          region,
+          kick_fd: kick_fd_of(shard),
+        })
+      },
+    );
     if let Ok(accepted) = accepted {
       for a in accepted {
         let shard = ShardId(a.region.shard());
         let principal = Principal::Uid { uid: a.uid };
         let client_id = a.client_id;
-        handed.insert(client_id);
+        state::with_handed(|h| h.insert(client_id));
         let control = a.control;
+        let pid = a.pid;
         let end = slates_ipc::DaemonEnd::new(a.region);
         let request = Box::new(SpawnRequest::new(
           Box::pin(async move {
             // The server task may be idle with its parked flags set on the clients it knew;
             // a wake makes it mark the new client too before it idles again.
             let server = state::with_state(|s| {
+              let last_seen_ns = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
               if let Err(e) = s.clients.insert(ClientSlot {
                 end,
                 principal,
                 client_id,
+                pid,
+                last_seen_ns,
                 control,
               }) {
                 eprintln!("slates-server: client {client_id} refused by the shard's table: {e}");

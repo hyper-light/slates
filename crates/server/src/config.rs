@@ -86,9 +86,15 @@ pub struct DaemonConfig {
   pub page: usize,
   /// The rendezvous instance name.
   pub instance: String,
+  /// The operator's failover SLO, the lease term's ceiling (§4.4 "Derived constants", D-16).
+  pub failover_slo_ns: u64,
   /// Every derivation, for the boot log.
   pub derivations: Vec<String>,
 }
+
+/// Shape: the operator's failover SLO (Gray & Cheriton: seconds): ten seconds until the
+/// operator gives `slates anchor` a value.
+pub const FAILOVER_SLO_NS: u64 = 10_000_000_000;
 
 impl DaemonConfig {
   /// The configuration from a profile, for `instance`.
@@ -230,12 +236,19 @@ impl DaemonConfig {
         .max(1),
       page: usize::try_from(page).unwrap_or(1).max(1),
       instance: instance.to_owned(),
+      failover_slo_ns: FAILOVER_SLO_NS,
       derivations,
     }
   }
 }
 
 impl DaemonConfig {
+  /// The same configuration with the operator's failover SLO (the lease term's ceiling).
+  pub fn with_failover_slo(mut self, failover_slo_ns: u64) -> DaemonConfig {
+    self.failover_slo_ns = failover_slo_ns.max(1);
+    self
+  }
+
   /// The same configuration over `shards` shards, unpinned (tests and benches that share a
   /// machine with other daemons); the segment's partitions follow.
   pub fn with_shards(mut self, shards: u16) -> DaemonConfig {

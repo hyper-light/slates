@@ -57,6 +57,8 @@ pub struct Accepted {
   pub client_id: u32,
   /// The peer's uid.
   pub uid: u32,
+  /// The peer's process id (the liveness probe's input where no socket closes).
+  pub pid: u32,
   /// The daemon's mapping of the region.
   pub region: ClientRegion,
   /// The control channel and completion signal, where the platform has one.
@@ -450,6 +452,7 @@ pub mod platform {
       Ok(Some(Accepted {
         client_id,
         uid,
+        pid: u32::try_from(cred.pid.as_raw_nonzero().get()).unwrap_or(0),
         region,
         control: Some(Control {
           socket: peer,
@@ -707,7 +710,7 @@ pub mod platform {
               });
             }
             let at = slot_at(i);
-            let uid = {
+            let pid = {
               let bytes = self.object.bytes();
               u32::from_le_bytes([
                 bytes[at + AT_PID],
@@ -727,12 +730,12 @@ pub mod platform {
             let word = state(&self.object, i)?;
             word.store(READY, Ordering::Release);
             wake::wake_one(word)?;
-            let _ = uid;
             return Ok(Some(Accepted {
               client_id,
               // The object's mode and per-user name are the authentication: whoever opened
               // it is the daemon's user (the kernel refused everyone else).
               uid: current_uid(),
+              pid,
               region,
               control: Some(Control),
             }));

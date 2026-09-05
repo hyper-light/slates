@@ -33,8 +33,10 @@
 #   safe wrapper (`wake.rs`), each on a live word of a shared mapping (2); the Linux rendezvous
 #   adopting the region descriptor it duplicated for the handoff before sending it (1) and
 #   borrowing the shard's leaked kick descriptor to duplicate it for the client (1).
-# slates-server (1): the Linux doorbell thread borrowing the daemon's listening socket by
-#   number for one readiness poll (`doorbell.rs`).
+# slates-server (4): the Linux doorbell thread borrowing the daemon's listening socket by
+#   number for one readiness poll (`doorbell.rs`); the Windows liveness probe of a client's
+#   process (`peer.rs`, added 2026-09-05 with the dead-client reclaim): open, wait with a zero
+#   timeout, close (3), compiled only for Windows.
 # slates-db (0): records, indexes and the log are safe Rust over the segment's byte slices.
 # slates-client (0): the rings and the rendezvous are slates-ipc's; the client is safe Rust.
 # slates-cli (3): the stop flag's handlers (`signal.rs`): `signal(2)` for SIGINT and SIGTERM on
@@ -54,7 +56,7 @@ slates-land = 3
 slates-anchor = 6
 slates-db = 0
 slates-ipc = 4
-slates-server = 1
+slates-server = 4
 slates-client = 0
 slates-cli = 3
 slates-wire = 4

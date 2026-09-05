@@ -623,9 +623,30 @@ not map the segment on its shards and exited, which the anchor restarted and the
 crash loop, exercising that path for real; (4) `detach` found a holder's other attachments by
 encoding the whole partition (`to_snapshot`), replaced by `attachments_of`.
 
-Owed from task 5: the daemon's side of a dead client (the control socket's close on Linux, the
-heartbeat slot's lapse on macOS and Windows, the reclaim of the region, the client's leases
-after expiry and its id from the in-use set) with task 6 and T-2.3; the CLI's grant surface
+The dead-client reclaim landed 2026-09-05 (the daemon's side of §4.7's failure matrix, T-2.3):
+the rendezvous carries the peer's process id (`SO_PEERCRED` on Linux; the claim slot's pid
+elsewhere); every shard runs a sweep task at the liveness cadence (`reap_loop`, the same
+budget the anchor allows the daemon's heartbeat) that expires leases by the wheel with nobody
+asking and asks about every client silent for the budget: `peer.rs` (paired `#[cfg]`) peeks
+the control socket on Linux (end of stream is the kernel closing the dead client's end),
+probes the pid with signal 0 on macOS (`ESRCH` dead, `EPERM` reused by another user), and
+waits on the process handle with a zero timeout on Windows. A gone client's attachments leave
+the catalog as recorded operations, its deferred replies are dropped, its region and control
+channel close with its slot, and its id returns to the control shard's live set (a thread-local
+on that shard, reached by a spawned task: sharing by move); its leases keep their terms and
+expire by the wheel, since a paused client is not a dead one and the term is the fence (D-16).
+The operator's failover SLO moved into `DaemonConfig` (`failover_slo_ns`, ten seconds until
+`slates anchor` takes a value; `with_failover_slo` for tests). The clock is read once per serve
+round to mark the clients served in it. Gated (`crates/client/tests/reap.rs`, 3.8 s): the test
+binary re-invoked as the victim connects, attaches for writing (epoch 1), prints its id and
+parks; the parent kills it with `SIGKILL`; the attachment is reclaimed inside the lease term
+(observed within two liveness budgets), the lease still shows epoch 1 after the reclaim, the
+daemon's reaped counter moved by one, a session under the victim's id resumes (the id is free
+again), the lease then expires by its three-second test term with nobody asking, and the
+observing client never reconnected. Gotcha kept in the test: a re-invoked test binary prints
+libtest's banner on stdout before the role runs, so the victim's line is tagged.
+
+Owed from task 5: the CLI's grant surface
 (`slates grant`, `grants`, `land`, `audit`) with task 8; a daemon-wide `slates status` with
 task 6's health signals (`CLIENTS_REFUSED`, `RECOVERY_SKIPPED`, `HANDOFF_LOST`,
 `INIT_FAILURES` are counted now and printed nowhere); the daemon start p99 for the restart

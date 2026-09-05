@@ -23,6 +23,7 @@ pub mod config;
 pub mod daemon;
 pub mod doorbell;
 pub mod error;
+pub mod peer;
 pub mod state;
 pub mod verbs;
 
