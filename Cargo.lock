@@ -675,6 +675,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-bridge-fuse"
+version = "0.1.0"
+dependencies = [
+ "slates-machine",
+]
+
+[[package]]
 name = "slates-cli"
 version = "0.1.0"
 dependencies = [

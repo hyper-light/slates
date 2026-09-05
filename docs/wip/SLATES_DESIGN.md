@@ -1,6 +1,6 @@
 # slates — unified design and phased implementation plan
 
-Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 (the volume core, the deriver, the base plane and the landing: `slates-vfs`, `slates-base`, `slates-land`) are implemented and gated; Phase 2 is in progress (tasks 1–8: through the register protocol and the landing-and-grant records — `slates-anchor`, `slates-db`, `slates-ipc`, `slates-server`, `slates-client`, `slates-cli`; the control-channel grant transport and the write execution run in the Linux lane; GAPS §8d); the rest is design.
+Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 (the volume core, the deriver, the base plane and the landing: `slates-vfs`, `slates-base`, `slates-land`) are implemented and gated; Phase 2 is in progress (tasks 1–8: through the register protocol and the landing-and-grant records — `slates-anchor`, `slates-db`, `slates-ipc`, `slates-server`, `slates-client`, `slates-cli`; the control-channel grant transport and the write execution run in the Linux lane; GAPS §8d). Phase 3 (the Linux FUSE bridge) has begun: the FUSE ABI codec is implemented and gated (`slates-bridge-fuse`; GAPS §8e), with the /dev/fuse transport, mount and driver in the Linux lane. The rest is design.
 This version integrates amendments A-1, A-2, A-4, A-5 and A-6 into the body; the amendment log at
 the end is history, and where the log and the body disagree, the body wins.
 Every decision below cites tiered evidence; every tunable is a measured derivation; every phase
@@ -1120,6 +1120,14 @@ the verdict that every entry beneath still matches its listing fingerprint.
 **Laptop degenerate.** Identical.
 
 ### 4.6 OS bridges (D-1, D-2, D-3)
+
+> **Status (2026-09-05).** Phase 3 has begun: `slates-bridge-fuse` (`crates/bridge-fuse`, GAPS
+> §8e) is the FUSE ABI codec — the request parser, the reply encoders, and the `FUSE_INIT`
+> negotiation, all pure and tested on every host with golden vectors and hostile-input tests
+> (§4.9). The `/dev/fuse` transport, `FUSE_DEV_IOC_CLONE`/io_uring channels, mount
+> establishment with the anchor's fd handoff, the `Bridge` implementation over the volume core,
+> `slates exec`, and the conformance and workload suites are the rest of Phase 3, in the Linux
+> CI lane. macOS (FSKit) is Phase 4; Windows (WinFsp) follows.
 
 **Role.** Present the root mount and every attached volume to the kernel; translate kernel
 requests into shard operations by handle; emit invalidations; read base files for overlay

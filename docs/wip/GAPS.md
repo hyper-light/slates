@@ -795,6 +795,41 @@ ratchet` (it spawns a daemon and needs a quiescent machine; back-to-back with th
 its p99 measured contention, not the path) and is its own recorded command / CI lane for
 AC-2.1; its rows were removed from `ratchets.toml`.
 
+## 8e. Phase 3 record (2026-09-05)
+
+Phase 3 (the Linux FUSE bridge) task 1's first piece landed 2026-09-05: `slates-bridge-fuse`
+(`crates/bridge-fuse`), the FUSE ABI codec — the pure, transport-free layer. It parses the
+kernel's `fuse_in_header` and the opcode-specific bodies slates serves (`request.rs`,
+`abi.rs`: the opcode set as `#[repr(u32)]` discriminants that are the wire values, so an
+unserved opcode is a typed miss the daemon answers `ENOSYS`), encodes the daemon's replies
+(`reply.rs`: `fuse_out_header`, `fuse_attr`, `fuse_entry_out`, `fuse_attr_out`, `fuse_open_out`,
+`fuse_write_out`, and a bounded `readdir` buffer), and computes the `FUSE_INIT` negotiation
+(`init.rs`: the intersection of the flags slates wants — writeback cache, parallel dirops,
+readdirplus, explicit data invalidation, big writes — and the kernel's, the minor version
+bounded to slates' 7.31 floor, and the sizes it will use). Every field is read and written in
+order through a bounds-checked sequential reader/writer (`wire.rs`), so no byte offset is a
+literal and a truncated or oversized message is a typed refusal, never a panic or an
+out-of-bounds read; the crate holds no `unsafe`.
+
+Gated (`crates/bridge-fuse/tests/codec.rs`, 12 tests, on every host — the codec is pure): a
+`LOOKUP` parses to its header and name; an unserved opcode is `None` not a panic; hostile
+headers (truncated, a length below the header, a length past the buffer) and hostile bodies (an
+unterminated name, a short read, a write whose declared data runs past the body) are refused
+without a panic (§4.9); read and write bodies parse; error and success replies encode to the
+exact wire bytes with an undersized buffer refused; the `readdir` buffer packs 8-byte-padded
+entries and stops before it exceeds the request's size; `FUSE_INIT` keeps the flag intersection
+and handles a version mismatch and a short body. Golden byte checks stand in for kernel vectors
+until the transport test runs a real mount.
+
+Owed from Phase 3 task 1 (the rest of the driver, all Linux-only, CI lane): the `/dev/fuse`
+transport (request read, reply write, notifications), `FUSE_DEV_IOC_CLONE` per shard and the
+io_uring command path with the read/write fallback, mount establishment (the new mount API when
+permitted, `fusermount3` otherwise) with the fd held by the anchor and the restart handoff, the
+`Bridge` trait implementation over the volume core with inode `(no, gen)` and invalidation on
+every mutation, `slates exec` (the launcher), the conformance suites (pjdfstest, fsx, fsstress)
+and the workload harnesses, and the base-files read path through the mount. These are Phase 3
+tasks 1b–8; the codec is the foundation they build on.
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3

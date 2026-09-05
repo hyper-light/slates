@@ -1,0 +1,15 @@
+[package]
+name = "slates-bridge-fuse"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The Linux FUSE bridge: the /dev/fuse ABI codec, FUSE_INIT negotiation, per-shard channels and the driver that turns kernel requests into shard operations (design §4.6, D-1, D-2, D-3; Phase 3)."
+
+[dependencies]
+slates-machine = { workspace = true }
+
+[lints]
+workspace = true

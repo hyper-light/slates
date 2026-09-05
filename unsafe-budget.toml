@@ -42,6 +42,9 @@
 # slates-cli (3): the stop flag's handlers (`signal.rs`): `signal(2)` for SIGINT and SIGTERM on
 #   Unix (1), and on Windows the console control handler, an `unsafe extern` function by
 #   signature and its registration (2).
+# slates-bridge-fuse (0): the FUSE ABI codec is byte slices read and written in field order
+#   through a sequential reader/writer (`wire.rs`), never a cast; the /dev/fuse transport and
+#   mount (Unix, added later) will carry their own budgeted sites.
 # slates-land (3): the macOS libc calls rustix does not wrap, each on a descriptor the writer
 #   owns: fcntl(F_BARRIERFSYNC) as the data barrier, fcntl(F_FULLFSYNC) as the media barrier,
 #   renameatx_np(RENAME_SWAP) as the exchange.
@@ -60,4 +63,5 @@ slates-server = 4
 slates-client = 0
 slates-cli = 3
 slates-wire = 4
+slates-bridge-fuse = 0
 slates-wire-derive = 0
