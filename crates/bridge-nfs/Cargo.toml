@@ -9,7 +9,12 @@ readme.workspace = true
 description = "The macOS NFSv3 loopback bridge (the FSKit fallback and differential oracle): the XDR and ONC RPC wire codec, the NFSv3, MOUNT and portmap procedures, a TCP loopback listener, and the driver that turns RPC calls into shard operations (design §4.6, D-2; Phase 4)."
 
 [dependencies]
+slates-bridge-core = { workspace = true }
 slates-db = { workspace = true }
+slates-vfs = { workspace = true }
+
+[dev-dependencies]
+slates-mem = { workspace = true }
 
 [lints]
 workspace = true
