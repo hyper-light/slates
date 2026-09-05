@@ -13,6 +13,7 @@ readme = "README.md"
 
 [workspace.dependencies]
 slates-machine = { path = "crates/machine", version = "0.1.0" }
+slates-mem = { path = "crates/mem", version = "0.1.0" }
 
 # Third-party versions are pinned once here. Exact `=` pins only where an ABI contract is
 # version-specific, each with a comment saying why (Appendix B.1).
@@ -38,6 +39,8 @@ unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "deny"
 unused_must_use = "deny"
 unreachable_pub = "warn"
+# `--cfg loom` selects loom's atomics for the interleaving tests (AC-0.7).
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)"] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

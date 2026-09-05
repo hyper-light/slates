@@ -88,6 +88,12 @@ pub fn measure<F: FnMut()>(mut op: F, budget: Duration) -> Measurement {
       batch *= 2;
       continue;
     }
+    if elapsed < floor {
+      // The operation is unmeasurable at any batch (it was optimized away or costs nothing);
+      // report what was seen, marked quick, rather than a converged zero.
+      sample.push(elapsed / u64::from(batch));
+      break;
+    }
     sample.push(elapsed / u64::from(batch));
     if sample.len() >= MIN_SAMPLES
       && let Some(interval) = bootstrap_interval(&sample, &mut rng)

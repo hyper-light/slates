@@ -39,6 +39,26 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # AC-0.7: Miri on the unit tests of the crates that hold unsafe code. Miri ships only with the
+  # nightly toolchain, which CI installs for this job alone; the pinned stable toolchain builds
+  # everything else. loom runs under stable with `--cfg loom`.
+  miri-and-loom:
+    name: miri + loom (mem, rt, wire)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: loom (every interleaving of the ring)
+        run: RUSTFLAGS="--cfg loom" cargo test -p slates-mem --lib --release loom
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Miri
+        run: cargo +nightly miri test -p slates-mem --lib
+
   windows-nightly:
     name: windows (nightly cadence)
     if: github.event_name == 'push'

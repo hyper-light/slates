@@ -1,0 +1,25 @@
+[package]
+name = "slates-mem"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "Memory: pre-faulted locked arenas, per-shard slabs and generational handles, buddy chunk allocation, segmented arrays, message-passing frees (design §4.2, D-8, D-12)."
+
+[dependencies]
+slates-machine = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+# loom builds only under `RUSTFLAGS="--cfg loom"` for the ring's interleaving tests (AC-0.7).
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints]
+workspace = true

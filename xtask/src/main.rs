@@ -155,7 +155,7 @@ fn lines_with_test_flag(source: &str) -> Vec<(usize, &str, bool)> {
   let mut armed = false;
   for (index, line) in source.lines().enumerate() {
     let trimmed = line.trim_start();
-    if trimmed.starts_with("#[cfg(test)]") {
+    if trimmed.starts_with("#[cfg(") && trimmed.contains("test") {
       armed = true;
     } else if armed && trimmed.starts_with("mod ") {
       in_test = true;

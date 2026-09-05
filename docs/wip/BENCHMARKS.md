@@ -49,3 +49,26 @@ beats remapping at every size the curve covers, which settles the copy-versus-re
 codec table is the first input to the cost model of §4.11; zstd 9 and 19 are an order of
 magnitude too slow for a boot-time probe over the large chunk class, which is why the codec
 corpus is the small class (64 pages) and Phase 7 measures the large class itself.
+
+## Phase 0 baseline: memory (2026-09-04)
+
+Environment: as above (Apple M5 Max, macOS 26.4.1, Rust 1.98.0, release profile).
+Command: `cargo run --release -p slates-mem --example bench` (500 ms budget per row; 95%
+bootstrap intervals; the harness batches sub-microsecond operations, batch shown).
+
+| Operation | Median | Interval | p99 | Batch |
+|---|---|---|---|---|
+| Slab insert+remove, 64-byte slot (free-list pop, generation bump, push) | 12 ns | [12, 12] | 13 ns | 256 |
+| Buddy alloc+free, one 16 KiB page (no split) | 62 ns | [62, 62] | 63 ns | 64 |
+| Buddy alloc+free, 64 pages beside a held page (split 6 levels, coalesce back) | 71 ns | [70, 71] | 75 ns | 64 |
+| SPSC ring round trip between two threads (push, handoff, echo, pop) | 348 ns | [343, 349] | 354 ns | 8 |
+
+Also proven, not timed: the zero-allocation test (`crates/mem/tests/no_alloc.rs`) counts system
+allocator calls across eight rounds of 1,024 slab inserts and removes and 12 buddy allocations
+and frees and finds none; loom explores every interleaving of the SPSC ring (one producer, one
+consumer) and the MPSC ring (two producers, one consumer) and finds no lost or reordered word.
+
+What it means: a slab operation costs a tenth of a syscall and a buddy operation a third; the
+ring round trip is about two and a half core-to-core cache-line transfers on this machine
+(the profile's ring matrix measured 132–190 ns per pair), which is the cost floor for a
+cross-shard wake before the kick syscall (§4.3; the runtime baseline adds the kick).

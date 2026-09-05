@@ -164,6 +164,13 @@ impl Facts {
   }
 }
 
+/// What the OS reports as locked (wired) for this process, for cross-checking a locking
+/// sequence against the OS (AC-0.5): Linux `VmLck` from `/proc/self/status`, macOS `ri_wired_size`
+/// from `proc_pid_rusage`; `None` where the OS has no such report.
+pub fn locked_bytes() -> Option<u64> {
+  platform::locked_bytes()
+}
+
 /// Shape: the largest cache line on any target we build for (Apple silicon's 128 bytes), used
 /// only when the OS refuses to say; crossbeam's `CachePadded` uses the same fallback reasoning.
 pub const CACHE_LINE_FALLBACK: u64 = 128;
@@ -445,6 +452,40 @@ mod platform {
     }
   }
 
+  #[repr(C)]
+  struct RusageInfoV0 {
+    // Format: the layout of rusage_info_v0 (sys/resource.h): a 16-byte uuid, then ten u64s.
+    uuid: [u8; 16],
+    user_time: u64,
+    system_time: u64,
+    pkg_idle_wkups: u64,
+    interrupt_wkups: u64,
+    pageins: u64,
+    wired_size: u64,
+    resident_size: u64,
+    phys_footprint: u64,
+    proc_start_abstime: u64,
+    proc_exit_abstime: u64,
+  }
+
+  unsafe extern "C" {
+    fn proc_pid_rusage(
+      pid: libc::c_int,
+      flavor: libc::c_int,
+      buffer: *mut RusageInfoV0,
+    ) -> libc::c_int;
+  }
+
+  pub(super) fn locked_bytes() -> Option<u64> {
+    /// Format: RUSAGE_INFO_V0 (sys/resource.h).
+    const RUSAGE_INFO_V0: libc::c_int = 0;
+    // SAFETY: an all-zero rusage_info_v0 is a valid buffer for the call to fill.
+    let mut info: RusageInfoV0 = unsafe { std::mem::zeroed() };
+    // SAFETY: our own pid, the V0 flavor, and a writable buffer of the V0 layout.
+    let rc = unsafe { proc_pid_rusage(libc::getpid(), RUSAGE_INFO_V0, &raw mut info) };
+    if rc == 0 { Some(info.wired_size) } else { None }
+  }
+
   pub(super) fn identity(notes: &mut Vec<String>) -> (String, String) {
     let cpu = sysctl_string(c"machdep.cpu.brand_string").unwrap_or_else(|| {
       notes.push("machdep.cpu.brand_string refused; recorded hw.model".to_owned());
@@ -669,6 +710,15 @@ mod platform {
     }
   }
 
+  pub(super) fn locked_bytes() -> Option<u64> {
+    let status = read("/proc/self/status")?;
+    let line = status.lines().find(|l| l.starts_with("VmLck:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    /// Format: VmLck is printed in kibibytes.
+    const KIB: u64 = 1024;
+    Some(kib.saturating_mul(KIB))
+  }
+
   pub(super) fn identity(notes: &mut Vec<String>) -> (String, String) {
     let cpu = read("/proc/cpuinfo")
       .and_then(|text| {
@@ -845,6 +895,10 @@ mod platform {
       0 => PowerState::Battery,
       _ => PowerState::Unknown,
     }
+  }
+
+  pub(super) fn locked_bytes() -> Option<u64> {
+    None
   }
 
   pub(super) fn identity(_notes: &mut Vec<String>) -> (String, String) {
