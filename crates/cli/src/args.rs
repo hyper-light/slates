@@ -29,6 +29,9 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   base read ID PATH
   base rewitness ID [PATH ...]
   base pin ID [PATH ...]
+  land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N]
+  grants
+  audit [--since N]
 ";
 
 /// Format: the usage notes: the size grammar's examples, the instance's discovery, the exit codes.
@@ -192,6 +195,26 @@ pub(crate) enum Verb {
     /// The paths, or the whole base.
     paths: Option<Vec<String>>,
   },
+  /// Land (`land`).
+  Land {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// A snapshot, or the head when none.
+    snapshot: Option<slates_client::SnapshotId>,
+    /// The host directory to write into.
+    target: String,
+    /// The filter.
+    filter: slates_client::Filter,
+    /// A grant the caller holds.
+    grant: Option<u64>,
+  },
+  /// The caller's grants (`grants`).
+  Grants,
+  /// The audit log (`audit`).
+  Audit {
+    /// Every record at or after this sequence.
+    since: u64,
+  },
 }
 
 /// A client request: the instance and the verb.
@@ -224,6 +247,10 @@ const VALUES: &[&str] = &[
   "--dynamic",
   "--base",
   "--snapshot",
+  "--grant",
+  "--since",
+  "--include",
+  "--exclude",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
@@ -475,6 +502,66 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
       Ok(client(&taken, Verb::DaemonStatus))
     }
     ["base", rest @ ..] => parse_base(&taken, rest),
+    ["land", id, target] => {
+      taken.only(&Spec {
+        values: &["--snapshot", "--grant", "--include", "--exclude"],
+        switches: &[],
+      })?;
+      let snapshot = taken.value("--snapshot").map(snapshot).transpose()?;
+      let grant = taken
+        .value("--grant")
+        .map(|s| {
+          s.parse::<u64>().map_err(|e| ParseError::BadValue {
+            what: "--grant",
+            reason: e.to_string(),
+          })
+        })
+        .transpose()?;
+      let filter = slates_client::Filter {
+        include: taken
+          .value("--include")
+          .map(str::to_owned)
+          .into_iter()
+          .collect(),
+        exclude: taken
+          .value("--exclude")
+          .map(str::to_owned)
+          .into_iter()
+          .collect(),
+      };
+      Ok(client(
+        &taken,
+        Verb::Land {
+          volume: volume(id)?,
+          snapshot,
+          target: (*target).to_owned(),
+          filter,
+          grant,
+        },
+      ))
+    }
+    ["land", ..] => Err(ParseError::Missing("ID TARGET")),
+    ["grants"] => {
+      taken.only(&NONE)?;
+      Ok(client(&taken, Verb::Grants))
+    }
+    ["audit"] => {
+      taken.only(&Spec {
+        values: &["--since"],
+        switches: &[],
+      })?;
+      let since = taken
+        .value("--since")
+        .map(|s| {
+          s.parse::<u64>().map_err(|e| ParseError::BadValue {
+            what: "--since",
+            reason: e.to_string(),
+          })
+        })
+        .transpose()?
+        .unwrap_or(0);
+      Ok(client(&taken, Verb::Audit { since }))
+    }
     [verb, rest @ ..]
       if matches!(
         *verb,

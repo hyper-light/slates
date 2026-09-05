@@ -131,8 +131,73 @@ fn serve(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
     Verb::Pin { volume, paths } => {
       println!("pinned: {}", client.pin(*volume, paths.clone())?);
     }
+    Verb::Land {
+      volume,
+      snapshot,
+      target,
+      filter,
+      grant,
+    } => print_landing(client.land(*volume, *snapshot, target, filter.clone(), *grant)?),
+    Verb::Grants => {
+      for grant in client.grants()? {
+        println!(
+          "{} {} {} {:?} {}",
+          grant.id,
+          volume_id_text(grant.volume),
+          grant.target,
+          grant.scope,
+          grant.state
+        );
+      }
+    }
+    Verb::Audit { since } => {
+      for record in client.audit(*since)? {
+        println!(
+          "{} {} {} grant={:?} landing={:?} outcome={:?}",
+          record.seq, record.at_ns, record.kind, record.grant, record.landing, record.outcome
+        );
+      }
+    }
   }
   Ok(())
+}
+
+/// Prints a landing's outcome, or the grant it needs.
+fn print_landing(landing: slates_client::Landing) {
+  match landing {
+    slates_client::Landing::Landed(outcome) => {
+      println!("landing: {}", outcome.landing);
+      println!("state: {}", outcome.state);
+      println!("written: {}", outcome.written);
+      println!("skipped: {}", outcome.skipped);
+      println!("conflicts: {}", outcome.conflicts);
+      println!("failed: {}", outcome.failed);
+      println!("bytes_written: {}", outcome.bytes_written);
+    }
+    slates_client::Landing::GrantRequired {
+      landing,
+      manifest,
+      summary,
+      conflicts,
+    } => {
+      println!("landing: {landing}");
+      println!("manifest: {}", hex32(&manifest));
+      for action in &summary.by_action {
+        println!("action {}: {}", action.action, action.count);
+      }
+      println!("bytes: {}", summary.bytes);
+      println!("filtered_out: {}", summary.filtered_out);
+      for path in &conflicts {
+        println!("conflict: {path}");
+      }
+      println!("grant with: slates grant {landing}");
+    }
+  }
+}
+
+/// Format: a 32-byte hash printed as 64 hexadecimal characters.
+fn hex32(bytes: &[u8; 32]) -> String {
+  bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn option_text<T: std::fmt::Display>(value: Option<T>) -> String {

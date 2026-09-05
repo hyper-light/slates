@@ -27,9 +27,10 @@
 pub mod client;
 pub mod error;
 
-pub use client::{Attachment, Client, CreateSpec, Deadlines, Session};
+pub use client::{Attachment, Client, CreateSpec, Deadlines, Landing, Session};
 pub use error::ClientError;
 pub use slates_ipc::protocol::{
-  DaemonReport, Intent, NamePolicy, PlacedState, Refusal, RefusalCount, Scope, ShardReport, Signal,
+  ActionCount, AuditEntry, DaemonReport, Filter, GrantScope, GrantSummary, Intent, LandingOutcome,
+  LandingSummary, NamePolicy, PlacedState, Refusal, RefusalCount, Scope, ShardReport, Signal,
   SizeClass, SnapshotId, StatusReport, VolumeId, VolumeSummary,
 };

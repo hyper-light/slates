@@ -239,6 +239,16 @@ impl Partition {
       .map_or(Seen::New, |w| w.lookup(sequence))
   }
 
+  /// The grants made for a principal (a walk of the table; a `slates grants` read, never a
+  /// hot path).
+  pub fn grants_of(&self, principal: &Principal) -> Vec<&GrantRecord> {
+    self
+      .grants
+      .values()
+      .filter(|g| &g.principal == principal)
+      .collect()
+  }
+
   /// A grant.
   pub fn grant(&self, id: u64) -> Option<&GrantRecord> {
     self.grants.get(&id)

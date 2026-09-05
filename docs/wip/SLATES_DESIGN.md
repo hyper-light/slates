@@ -1,6 +1,6 @@
 # slates — unified design and phased implementation plan
 
-Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 (the volume core, the deriver, the base plane and the landing: `slates-vfs`, `slates-base`, `slates-land`) are implemented and gated; Phase 2 is in progress (tasks 1–7: the anchor, the database, the IPC, the server, the Rust client, the `slates` command, the provisioning histogram, and the register protocol at f=0 — `slates-anchor`, `slates-db`, `slates-ipc`, `slates-server`, `slates-client`, `slates-cli`; GAPS §8d); the rest is design.
+Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 (the volume core, the deriver, the base plane and the landing: `slates-vfs`, `slates-base`, `slates-land`) are implemented and gated; Phase 2 is in progress (tasks 1–8: through the register protocol and the landing-and-grant records — `slates-anchor`, `slates-db`, `slates-ipc`, `slates-server`, `slates-client`, `slates-cli`; the control-channel grant transport and the write execution run in the Linux lane; GAPS §8d); the rest is design.
 This version integrates amendments A-1, A-2, A-4, A-5 and A-6 into the body; the amendment log at
 the end is history, and where the log and the body disagree, the body wins.
 Every decision below cites tiered evidence; every tunable is a measured derivation; every phase
@@ -1788,6 +1788,23 @@ paths a landing touched, which the human already approved.
 *Content-freedom.* No metric, span or health signal carries a path, a name or file content; the audit log carries the paths a landing touched and nothing else; a test in the observability crate asserts every emitted label against this rule.
 
 ### 4.15 Disk as the source of truth: the base plane and landing under grant (D-25, D-26)
+
+> **Status (2026-09-05).** The base plane and the landing engine are Phase 1 (`slates-vfs`,
+> `slates-base`, `slates-land`; GAPS §8c). Phase 2 task 8 wires them through the server
+> (`crates/server/src/landing.rs`, GAPS §8d): a `Land` request plans the manifest and, without
+> a grant, replies `GrantRequired` with the manifest, its summary and the conflicts a
+> preliminary pass found, recording the plan in the durable audit log; a grant binds the
+> manifest and the landing writes through `OsLand`, persisting the landing record, the lease,
+> the consumed grant and the audit trail (`GrantRecord`, `LandingLeaseRecord`, `LandingRecord`,
+> `AuditRecord`, all §4.8 ops so accountability survives a crash, AC-2.10). The grant is never
+> created on the ring or MCP (R10, AC-2.8): the ring's grant kind is refused, and a grant comes
+> on the control channel through `slates grant`. The `slates land`, `slates grants` and
+> `slates audit` verbs and the client methods are in place. The control-channel grant transport
+> and the write execution are Unix-only (the writer is the `os` module; a landing test writes
+> into a RAM-backed target) and run in the Linux CI lane; the daemon suite here checks the
+> off-ring refusal and the reads. Owed: the control-channel grant transport (the Linux socket
+> reader and `slates grant`), the Linux landing execution test, `slates grant --watch`, and the
+> per-entry audit records (the terminal record and the plan are persisted now).
 
 **Role.** Make an existing host directory the base of a volume without copying it; keep the
 agent's view honest when the disk moves; and write the agent's diverged entries back to that

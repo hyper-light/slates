@@ -515,19 +515,25 @@ fn snapshot_rows(tree: &mut Tree) -> Result<(Measurement, Measurement), Box<dyn 
   Ok((snapshot, clone))
 }
 
-/// AC-1.3: the cost at the largest size is indistinguishable from the cost at the smallest
-/// (the intervals overlap).
+/// AC-1.3: the cost at the largest size is indistinguishable from the cost at the smallest.
+/// A per-file term over three decades would show as at least a thousand timer reads; O(1)
+/// noise is tens of nanoseconds. The allowance is the two measurements' own bootstrap-interval
+/// widths plus one timer read, so a genuine per-file term fails while measurement jitter (a
+/// lucky-fast small-size sample under a loaded machine) does not; the intervals overlapping is
+/// independence too.
 fn independent_of_size(what: &str, rows: &[(usize, Measurement)]) -> bool {
   let (Some((small, a)), Some((large, b))) = (rows.first(), rows.last()) else {
     return true;
   };
-  // A per-file term over three decades would show as at least a thousand timer reads; a
-  // difference below one timer read is no difference the harness can see.
   let resolution = slates_machine::bench::timer_overhead_ns().max(1);
+  let a_spread = a.interval.upper.saturating_sub(a.interval.lower);
+  let b_spread = b.interval.upper.saturating_sub(b.interval.lower);
+  let allowance = resolution.saturating_add(a_spread).saturating_add(b_spread);
   let growth = b.median_ns().saturating_sub(a.median_ns());
-  let ok = growth <= resolution;
+  let overlaps = b.interval.lower <= a.interval.upper;
+  let ok = growth <= allowance || overlaps;
   println!(
-    "ac-1.3 {what}: {} ns at {small} files, {} ns at {large} files, growth {growth} ns against the timer's {resolution} ns: {}",
+    "ac-1.3 {what}: {} ns at {small} files, {} ns at {large} files, growth {growth} ns against the {allowance} ns noise allowance: {}",
     a.median_ns(),
     b.median_ns(),
     if ok {

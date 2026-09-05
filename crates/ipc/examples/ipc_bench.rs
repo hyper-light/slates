@@ -118,7 +118,15 @@ fn main() {
       PARKED_TRIPS,
       "every trip woke the client"
     );
-    assert_eq!(client.park_ratio().0, PARKED_TRIPS);
+    // The parked path dominates this loop (the daemon replies only after the client parks),
+    // so most trips park; a trip whose reply lands in the pre-park re-check does not count a
+    // park, and a spurious wakeup adds one, so the exact count is not fixed. At least half the
+    // trips parking proves the measurement is the parked path, not the spinning one.
+    assert!(
+      client.park_ratio().0 >= PARKED_TRIPS / 2,
+      "the parked path is what was measured ({} parks over {PARKED_TRIPS} trips)",
+      client.park_ratio().0
+    );
   }
   row("ipc.ring_round_trip_spinning", spinning);
   row("ipc.ring_round_trip_parked_and_woken", parked);

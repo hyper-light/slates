@@ -3,8 +3,9 @@
 use std::time::Instant;
 
 use slates_ipc::protocol::{
-  DaemonReport, Direction, Intent, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass,
-  SnapshotId, StatusReport, VolumeId, VolumeSummary, pack, unpack,
+  AuditEntry, DaemonReport, Direction, Filter, GrantSummary, Intent, LandingOutcome,
+  LandingSummary, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass, SnapshotId, StatusReport,
+  VolumeId, VolumeSummary, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect_as};
 use slates_machine::{Derived, derived};
@@ -61,6 +62,24 @@ pub struct CreateSpec {
   pub require_locked: bool,
   /// A host directory to overlay, or nothing for a scratch volume.
   pub base: Option<String>,
+}
+
+/// What a `land` call returns: the landing ran, or it needs a grant a human must make.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Landing {
+  /// The landing finished (or partially).
+  Landed(LandingOutcome),
+  /// A grant is required first; the manifest the human must see.
+  GrantRequired {
+    /// The landing id `slates grant` names.
+    landing: u64,
+    /// The manifest hash the grant must bind.
+    manifest: [u8; 32],
+    /// The summary of what would be written.
+    summary: LandingSummary,
+    /// Conflicts found before any write.
+    conflicts: Vec<String>,
+  },
 }
 
 /// What `attach` returns.
@@ -472,6 +491,55 @@ impl Client {
     match self.call(&RequestBody::List)? {
       ReplyBody::Listed { volumes } => Ok(volumes),
       _ => Err(ClientError::UnexpectedReply { verb: "list" }),
+    }
+  }
+
+  /// Lands a snapshot's diverged entries onto a host directory (§4.15). Without a grant the
+  /// result is `Landing::GrantRequired`; with one, `Landing::Landed`.
+  pub fn land(
+    &mut self,
+    volume: VolumeId,
+    snapshot: Option<SnapshotId>,
+    target: &str,
+    filter: Filter,
+    grant: Option<u64>,
+  ) -> Result<Landing, ClientError> {
+    match self.call(&RequestBody::Land {
+      volume,
+      snapshot,
+      target: target.to_owned(),
+      filter,
+      grant,
+    })? {
+      ReplyBody::Landed { outcome } => Ok(Landing::Landed(outcome)),
+      ReplyBody::GrantRequired {
+        landing,
+        manifest,
+        summary,
+        conflicts,
+      } => Ok(Landing::GrantRequired {
+        landing,
+        manifest,
+        summary,
+        conflicts,
+      }),
+      _ => Err(ClientError::UnexpectedReply { verb: "land" }),
+    }
+  }
+
+  /// The caller's grants.
+  pub fn grants(&mut self) -> Result<Vec<GrantSummary>, ClientError> {
+    match self.call(&RequestBody::Grants)? {
+      ReplyBody::Grants { grants } => Ok(grants),
+      _ => Err(ClientError::UnexpectedReply { verb: "grants" }),
+    }
+  }
+
+  /// The audit log from `since`.
+  pub fn audit(&mut self, since: u64) -> Result<Vec<AuditEntry>, ClientError> {
+    match self.call(&RequestBody::Audit { since })? {
+      ReplyBody::Audit { records } => Ok(records),
+      _ => Err(ClientError::UnexpectedReply { verb: "audit" }),
     }
   }
 

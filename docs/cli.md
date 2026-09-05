@@ -29,6 +29,9 @@ slates volume clone ID SNAPSHOT NAME
 slates volume resize ID (--bounded SIZE | --dynamic MAX)
 slates volume destroy ID
 slates volume placed ID [--snapshot N] [--mirror]
+slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N]
+slates grants
+slates audit [--since N]
 slates attach ID [--read | --write] [--snapshot N]
 slates detach ATTACHMENT
 slates status ID [--drift]

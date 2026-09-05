@@ -791,6 +791,7 @@ dependencies = [
  "slates-base",
  "slates-db",
  "slates-ipc",
+ "slates-land",
  "slates-machine",
  "slates-mem",
  "slates-rt",

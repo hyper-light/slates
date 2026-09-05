@@ -396,3 +396,21 @@ after the log record became a `LogEntry` (a verb's effects and its completion in
 One ceiling was raised with a dated reason (vfs.create_burst 1082 -> 1091: a loaded back-to-back
 ratchet run drifted the row 0.2% over its ceiling; three isolated runs measured 1077-1091 ns on
 code untouched since Phase 1).
+
+The Phase 2 task 8 change (2026-09-05) pulled the provisioning histogram out of the omnibus
+`cargo xtask ratchet`. The histogram spawns a daemon (several shard threads that spin) and one
+client thread per concurrency level; run back-to-back with the deterministic microbenches on a
+loaded laptop, its p99 measured scheduler contention, not the provisioning path (a single-client
+p99 of 25 us in isolation read as 1.5 ms under the omnibus). It is now its own recorded command,
+run on a quiescent machine and, on the reference machines, as its own CI lane (AC-2.1, R9):
+
+```
+cargo run --release -q -p slates-client --example provision_bench
+```
+
+Its rows were removed from `ratchets.toml` (the omnibus ratchet gates the deterministic
+microbenches; the provisioning histogram is the daemon-level AC-2.1 gate). A bench-harness flake
+was fixed the same day: `vfs_bench`'s size-independence check (ac-1.3) now allows the
+measurements' own bootstrap-interval widths rather than the bare timer resolution, so a
+lucky-fast small-size sample under load no longer reads as per-file scaling; and `ipc_bench`'s
+parked round trip asserts at least one park per trip (a spurious futex wakeup can add one).

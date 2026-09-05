@@ -341,6 +341,42 @@ fn grant_scenario() {
   daemon.stop();
 }
 
+/// Landings and grants through the server (§4.15, task 8): a grant cannot be created on the
+/// ring (its kind is refused); a landing into a target that cannot be opened is refused with
+/// no write; the caller's grants and the audit log read empty before any landing. The full
+/// plan-present-grant-execute flow needs a real target and the control channel, so it runs in
+/// the Linux CI lane (`crates/server/tests/landing.rs`), not here.
+fn landing_refusal_scenario() {
+  let (daemon, instance) = daemon("landing");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("work")) else {
+    panic!("create");
+  };
+  // A target that does not exist is refused before any write (no filesystem entry created).
+  assert!(matches!(
+    client.call(&RequestBody::Land {
+      volume: id,
+      snapshot: None,
+      target: "/nonexistent/slates/land/target".to_owned(),
+      filter: slates_ipc::protocol::Filter::default(),
+      grant: None,
+    }),
+    ReplyBody::Refused {
+      refusal: Refusal::TargetUnavailable { .. }
+    }
+  ));
+  // The caller has no grants and the audit log is empty (the refused landing recorded nothing).
+  assert!(matches!(
+    client.call(&RequestBody::Grants),
+    ReplyBody::Grants { grants } if grants.is_empty()
+  ));
+  assert!(matches!(
+    client.call(&RequestBody::Audit { since: 0 }),
+    ReplyBody::Audit { records } if records.is_empty()
+  ));
+  daemon.stop();
+}
+
 /// A request larger than a slot's payload travels through the bulk area: a long name and
 /// an overlay over this workspace's own source tree (read only).
 fn bulk_and_overlay_scenario() {
@@ -420,5 +456,6 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
   rifl_scenario();
   lease_scenario();
   grant_scenario();
+  landing_refusal_scenario();
   bulk_and_overlay_scenario();
 }

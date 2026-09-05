@@ -49,6 +49,26 @@ pub enum NamePolicy {
   Fold,
 }
 
+/// A landing filter (§4.15 step 1): path prefixes to keep, and to leave out.
+#[derive(Wire, Clone, Debug, PartialEq, Eq, Default)]
+pub struct Filter {
+  /// Path prefixes to keep (empty keeps all).
+  pub include: Vec<String>,
+  /// Path prefixes to leave out.
+  pub exclude: Vec<String>,
+}
+
+/// A grant's scope (§4.15 step 3): one landing of the bound manifest, or every landing of the
+/// volume into the target for the session.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantScope {
+  /// A single landing of exactly the manifest the human saw.
+  Once,
+  /// Every landing of the volume into the target for the session (each still presents its
+  /// manifest and still refuses on a conflict).
+  Session,
+}
+
 /// The durability scope of `await placed` (§4.8 D-18): the owner's region, or the mirror.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -176,6 +196,29 @@ pub enum RequestBody {
     /// The scope.
     scope: Scope,
   },
+  /// Land a snapshot's diverged entries onto a host directory (§4.15). Without a grant the
+  /// reply is `GrantRequired` with the manifest and its summary; with a grant that binds the
+  /// manifest the landing runs and the reply is `Landed`. The grant itself is never created
+  /// on this channel (§4.13, R10): it comes on the control channel through `slates grant`.
+  Land {
+    /// The volume.
+    volume: VolumeId,
+    /// A snapshot, or the head when none.
+    snapshot: Option<SnapshotId>,
+    /// The host directory to write into.
+    target: String,
+    /// The filter over the diverged entries.
+    filter: Filter,
+    /// A grant the caller already holds (from `slates grant`), or none to be presented.
+    grant: Option<u64>,
+  },
+  /// The caller's grants (a read; creating a grant is off-ring).
+  Grants,
+  /// The audit log from a sequence (a read).
+  Audit {
+    /// Every record at or after this sequence.
+    since: u64,
+  },
 }
 
 /// A health signal (§4.14): a value and how old it is.
@@ -299,6 +342,81 @@ pub struct StatusReport {
   pub placed: PlacedState,
 }
 
+/// An action name and how many entries take it.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct ActionCount {
+  /// The action name.
+  pub action: String,
+  /// The count.
+  pub count: u64,
+}
+
+/// A landing manifest's summary (§4.15 step 2).
+#[derive(Wire, Clone, Debug, PartialEq, Eq, Default)]
+pub struct LandingSummary {
+  /// Entries per action name.
+  pub by_action: Vec<ActionCount>,
+  /// Bytes the landing writes.
+  pub bytes: u64,
+  /// Entries the filter left out.
+  pub filtered_out: u64,
+}
+
+/// A finished landing's outcome (§4.15).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LandingOutcome {
+  /// The landing id.
+  pub landing: u64,
+  /// The terminal state name (`done`, `partial`, `refused`, `aborted`).
+  pub state: String,
+  /// Entries written.
+  pub written: u64,
+  /// Entries skipped or accepted without a write.
+  pub skipped: u64,
+  /// Entries that lost their compare-and-swap.
+  pub conflicts: u64,
+  /// Entries the host refused.
+  pub failed: u64,
+  /// Bytes written to the disk.
+  pub bytes_written: u64,
+}
+
+/// A grant in a listing (§4.13, §4.15).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct GrantSummary {
+  /// The id.
+  pub id: u64,
+  /// The volume.
+  pub volume: VolumeId,
+  /// The target.
+  pub target: String,
+  /// The manifest hash it binds.
+  pub manifest: [u8; 32],
+  /// The scope.
+  pub scope: GrantScope,
+  /// The state name (`issued`, `consumed`, `expired`, `revoked`).
+  pub state: String,
+}
+
+/// An audit record on the wire (§4.15).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct AuditEntry {
+  /// The sequence.
+  pub seq: u64,
+  /// Monotonic ns.
+  pub at_ns: u64,
+  /// The kind name.
+  pub kind: String,
+  /// The grant, when bound.
+  pub grant: Option<u64>,
+  /// The landing, when bound.
+  pub landing: Option<u64>,
+  /// The manifest, when bound.
+  pub manifest: Option<[u8; 32]>,
+  /// The terminal state, for a finished landing.
+  pub outcome: Option<String>,
+}
+
 /// The closed refusal taxonomy on the wire (§4.4, §4.13).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -371,6 +489,25 @@ pub enum Refusal {
     /// What was wrong.
     reason: String,
   },
+  /// The landing target directory cannot be opened, or escapes containment (§4.15 step 4).
+  TargetUnavailable {
+    /// What was wrong.
+    reason: String,
+  },
+  /// The landing hit conflicts; nothing was written (§4.15 step 4).
+  LandingConflict {
+    /// The conflicting entries.
+    entries: Vec<String>,
+  },
+  /// Another session holds the target's landing lease (§4.15, AC-2.9).
+  LandingLeaseHeld {
+    /// The holder.
+    holder: u64,
+  },
+  /// The grant does not bind the manifest about to be written (§4.15 step 3, AC-2.8).
+  GrantMismatch,
+  /// The grant is missing, expired or revoked.
+  GrantInvalid,
 }
 
 /// A reply body.
@@ -449,6 +586,33 @@ pub enum ReplyBody {
     placed: bool,
     /// The mirror's lag, for a mirror scope.
     mirror_age_ns: Option<u64>,
+  },
+  /// A landing needs a grant: the manifest the human must see, its hash, and the conflicts a
+  /// preliminary verdict pass found (§4.15 step 2).
+  GrantRequired {
+    /// The landing id (what `slates grant` names).
+    landing: u64,
+    /// The manifest hash the grant must bind.
+    manifest: [u8; 32],
+    /// The summary of what would be written.
+    summary: LandingSummary,
+    /// Conflicts found before any write (empty when the landing is clean).
+    conflicts: Vec<String>,
+  },
+  /// A landing finished (or partially).
+  Landed {
+    /// The outcome.
+    outcome: LandingOutcome,
+  },
+  /// The caller's grants.
+  Grants {
+    /// The grants.
+    grants: Vec<GrantSummary>,
+  },
+  /// The audit log.
+  Audit {
+    /// The records.
+    records: Vec<AuditEntry>,
   },
 }
 

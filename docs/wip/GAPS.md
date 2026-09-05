@@ -750,6 +750,51 @@ f-parameterized so they raise `f` without a new shape); the host epoch is persis
 constant 1 until a takeover can bump it (Phase 8); a chain is a register written in sequence,
 which arrives with the merge engine (Phase 6).
 
+Task 8 (grants and landings through the server) — the durable records, the ring verbs and the
+CLI landed 2026-09-05; the control-channel grant transport and the write execution are in the
+Linux lane. `crates/server/src/landing.rs` wires the Phase 1 landing engine (`slates-land`)
+through the server: a `RequestBody::Land` plans the manifest from the snapshot's diverged
+entries and, without a grant, replies `GrantRequired` with the manifest hash, its summary and
+the preliminary conflicts, recording a `LandingRecord` (AwaitingGrant) and a `LandingPlanned`
+audit record; a grant that binds the manifest lets the landing take the target's lease (one
+holder per target, AC-2.9), validate and write through `OsLand`, after which the landing
+record, the consumed grant and the audit trail are persisted (all §4.8 ops, so the
+accountability replays after a crash, AC-2.10). The grant is never created on the ring or MCP
+(R10, AC-2.8): the ring's grant kind stays refused, and `issue_grant` (the control-channel
+entry) binds the manifest a human saw, refusing `GrantMismatch` when a re-planned landing's
+hash differs. The wire gained `Land`/`Grants`/`Audit` requests, `GrantRequired`/`Landed`
+replies, the `LandingSummary`/`LandingOutcome`/`GrantSummary`/`AuditEntry` shapes, the `Filter`
+and `GrantScope`, and the refusals `TargetUnavailable`, `LandingConflict`, `LandingLeaseHeld`,
+`GrantMismatch`, `GrantInvalid`. The client has `land`/`grants`/`audit`; the CLI has `slates
+land ID TARGET`, `slates grants`, `slates audit`. The landing execution and the `os` writer are
+Unix-only, so the write path's test runs in the Linux CI lane; the daemon suite here checks the
+off-ring refusal, a landing into a target that cannot be opened (refused `TargetUnavailable`
+with no write), and the empty grants and audit reads.
+
+Found while wiring: `detach`'s cross-shard routing bug (task 7) had a sibling — a landing id, a
+grant id and an attachment id all need to route to the partition that holds their record;
+attachment ids now carry the owner partition (task 7), and the landing/grant records live on
+the volume's owner shard, reached by the volume-bound `Land` request. A bench-harness flake
+surfaced under the omnibus ratchet on a loaded machine and was fixed: the size-independence
+check (`vfs_bench` ac-1.3) compared the median growth against the bare timer resolution, so a
+lucky-fast small-size sample read as per-file scaling; it now allows the two measurements' own
+bootstrap-interval widths (a real per-file term over three decades still fails). The IPC
+parked-round-trip bench asserted the client parked exactly once per trip; a spurious futex
+wakeup can add a park, so it now asserts at least once per trip.
+
+Owed from task 8: the control-channel grant transport (the Linux control socket reader in the
+daemon and `slates grant`/`slates grant --watch`; the socket is the rendezvous control channel,
+Unix, with macOS and Windows on Phase 5's control socket) and the Linux landing execution test
+(the full plan-grant-write flow into `/dev/shm`, AC-2.9's two-session serialization, and
+AC-2.10's audit replay after `kill -9`); the per-entry audit records (`EntryWritten`,
+`EntryRefused`) beyond the plan and the terminal record; the grant scatter for a daemon-wide
+`slates grants`/`slates audit` (served on the shard now); the write-tracer hermeticity
+assertion (AC-2.2, T-2.9) with the chaos harness. The provisioning histogram
+(`crates/client/examples/provision_bench.rs`) was pulled out of the omnibus `cargo xtask
+ratchet` (it spawns a daemon and needs a quiescent machine; back-to-back with the microbenches
+its p99 measured contention, not the path) and is its own recorded command / CI lane for
+AC-2.1; its rows were removed from `ratchets.toml`.
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3

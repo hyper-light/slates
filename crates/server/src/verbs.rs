@@ -62,7 +62,7 @@ impl PressureSource for HostPressure {
   }
 }
 
-fn to_db_volume(id: VolumeId) -> DbVolumeId {
+pub(crate) fn to_db_volume(id: VolumeId) -> DbVolumeId {
   DbVolumeId { bytes: id.bytes }
 }
 
@@ -70,7 +70,7 @@ fn to_wire_volume(id: DbVolumeId) -> VolumeId {
   VolumeId { bytes: id.bytes }
 }
 
-fn to_db_snapshot(id: SnapshotId) -> DbSnapshotId {
+pub(crate) fn to_db_snapshot(id: SnapshotId) -> DbSnapshotId {
   DbSnapshotId { value: id.value }
 }
 
@@ -100,7 +100,7 @@ fn fresh_volume_id(state: &mut ShardState) -> DbVolumeId {
 }
 
 /// The rights a principal holds on a volume (§4.13): the owner holds every right.
-fn rights_of(record: &VolumeRecord, principal: &Principal) -> Rights {
+pub(crate) fn rights_of(record: &VolumeRecord, principal: &Principal) -> Rights {
   if &record.owner == principal {
     return Rights {
       read: true,
@@ -115,7 +115,7 @@ fn rights_of(record: &VolumeRecord, principal: &Principal) -> Rights {
     .map_or(Rights::default(), |e| e.rights)
 }
 
-fn forbidden(verb: &str) -> ReplyBody {
+pub(crate) fn forbidden(verb: &str) -> ReplyBody {
   ReplyBody::Refused {
     refusal: Refusal::Forbidden {
       verb: verb.to_owned(),
@@ -123,7 +123,7 @@ fn forbidden(verb: &str) -> ReplyBody {
   }
 }
 
-fn refused(refusal: Refusal) -> ReplyBody {
+pub(crate) fn refused(refusal: Refusal) -> ReplyBody {
   ReplyBody::Refused { refusal }
 }
 
@@ -193,11 +193,14 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::ReadBase { volume, .. }
     | RequestBody::Rewitness { volume, .. }
     | RequestBody::Pin { volume, .. }
-    | RequestBody::AwaitPlaced { volume, .. } => Some(*volume),
+    | RequestBody::AwaitPlaced { volume, .. }
+    | RequestBody::Land { volume, .. } => Some(*volume),
     RequestBody::Create { .. }
     | RequestBody::Detach { .. }
     | RequestBody::List
     | RequestBody::DaemonStatus
+    | RequestBody::Grants
+    | RequestBody::Audit { .. }
     | RequestBody::Acknowledge { .. }
     | RequestBody::Grant { .. } => None,
   }
@@ -772,6 +775,11 @@ fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::TooManyClients => "too_many_clients",
     Refusal::Overloaded { .. } => "overloaded",
     Refusal::BadRequest { .. } => "bad_request",
+    Refusal::TargetUnavailable { .. } => "target_unavailable",
+    Refusal::LandingConflict { .. } => "landing_conflict",
+    Refusal::LandingLeaseHeld { .. } => "landing_lease_held",
+    Refusal::GrantMismatch => "grant_mismatch",
+    Refusal::GrantInvalid => "grant_invalid",
   }
 }
 
@@ -822,6 +830,15 @@ fn dispatch(
       snapshot,
       scope,
     } => await_placed(state, principal, volume, snapshot, scope),
+    RequestBody::Land {
+      volume,
+      snapshot,
+      target,
+      filter,
+      grant,
+    } => crate::landing::land_verb(state, principal, volume, snapshot, &target, &filter, grant),
+    RequestBody::Grants => crate::landing::grants_verb(state, principal),
+    RequestBody::Audit { since } => crate::landing::audit_verb(state, since),
     RequestBody::Acknowledge { up_to } => acknowledge(state, client_id, up_to),
     RequestBody::ReadBase { volume, path } => read_base(state, principal, volume, &path),
     RequestBody::Rewitness { volume, paths } => {
@@ -838,7 +855,7 @@ fn dispatch(
 }
 
 /// The volume slot and its record, or the refusal.
-fn find(
+pub(crate) fn find(
   state: &ShardState,
   volume: VolumeId,
 ) -> Result<(Handle<VolumeSlot>, VolumeRecord), Box<ReplyBody>> {

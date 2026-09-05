@@ -79,6 +79,9 @@ pub struct ShardState {
   /// The register configuration (§4.8): the owner host, its epoch, its neighbourhood and
   /// the quorum; `Configuration::solo` at `f = 0`, the same type a fleet uses.
   pub config_register: slates_db::Configuration,
+  /// The landing runtime: grants, leases and the audit log (§4.15), mirrored to the
+  /// database's durable records.
+  pub landing: crate::landing::LandingState,
   /// The store.
   pub store: Store,
   /// The volumes.

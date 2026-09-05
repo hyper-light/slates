@@ -267,6 +267,7 @@ fn init_shard(
     segment,
     db,
     config_register,
+    landing: crate::landing::LandingState::default(),
     store,
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),
     by_id: std::collections::BTreeMap::new(),
