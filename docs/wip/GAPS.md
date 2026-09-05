@@ -460,6 +460,44 @@ Owed from task 2: the register and held-record tables of §4.8 arrive with task 
 Phase 8; the `put_wal` with Phase 8; the chains, deltas and last-changed index with Phase 6;
 the recovery budget is a ratified default (GAPS §5) until the CLI takes the operator's value.
 
+Task 3 (the IPC) landed 2026-09-05: `slates-ipc` (`crates/ipc`): the 64-byte slot (sequence
+word, kind, length, request word, 40 payload bytes) and the single-producer single-consumer
+ring of slots with per-slot sequences (`slot.rs`; a hostile kind or length is a typed refusal
+and the slot is released, so a bad message never wedges the ring; an oversized payload is
+refused before the ring is touched); the client region over a shared object (`region.rs`: a
+header with the geometry the daemon derived, the wake word, the client's and the daemon's
+parked flags, the doorbell, the command and completion rings, the bulk area); the wake word
+per OS (`wake.rs`: a shared futex on Linux; `os_sync_wait_on_address(SHARED)` on macOS, two
+`unsafe` sites budgeted; Windows waits on the named Event of Phase 4); the two ends
+(`endpoint.rs`: the client spins for the published window, sets its parked flag, re-checks the
+slot to close the race, and waits on the word; the daemon bumps the word per reply and wakes
+only a parked client; the client rings the doorbell per request while the daemon's shard is
+parked); and the rendezvous per OS (`rendezvous.rs`: Linux, an abstract-namespace socket named
+from the uid and the instance, `SO_PEERCRED` refusing another uid and counting it, the region
+descriptor and the completion eventfd sent with `SCM_RIGHTS`, the socket kept as the control
+channel; macOS and Windows, a bootstrap object with claim slots taken by compare-and-swap, the
+object's per-user name and mode as the authentication, the region's name and length written
+into the slot and released to the waiting client). Discovery: `SLATES_ENDPOINT`, then
+`default`.
+
+Gated (`crates/ipc/tests/rings.rs`, two mappings of one region on two threads): the round trip
+while spinning (no park, no wake), the late reply (one park, one wake), the ring's credit
+(`RingFull`, nothing dropped, the order kept), the hostile slot (refused, released, the ring
+flows), the deadline, the doorbell; (`crates/ipc/tests/rendezvous.rs`) the test binary
+re-invoked as the client connects through the real rendezvous, receives its region, completes
+a round trip and exits 0, and a client with no daemon is refused `DaemonUnavailable` quickly.
+Both branches lint clean for Linux and Windows from this machine (the Linux tests run in the
+CI lane). Baselines in BENCHMARKS.md (Phase 2 baseline: IPC): 278 ns per spinning round trip,
+1.05 µs per parked-and-woken round trip.
+
+Owed from task 3: the completion fd on macOS and Windows (Phase 5's optional control socket;
+the Rust client parks on the word and needs none); the Windows named Event per client (Phase
+4, with the section-and-Event rendezvous compile-checked now); the doorbell thread that turns a
+client's wake of a parked macOS shard into the driver's kick, and the heartbeat slot that
+tells the daemon a client died where no socket closes, both with the server's integration in
+task 4; the bulk region's use by streams (Phase 5); ring depth and spin window are the
+daemon's derivation at rendezvous (task 4 wires the profile in).
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3

@@ -1,0 +1,24 @@
+[package]
+name = "slates-ipc"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "Local IPC: shared-memory command and completion rings per client, the wake word per OS, the rendezvous that creates no filesystem entry, peer authentication, the completion fd (design §4.7, D-10; Phase 2 task 3)."
+
+[dependencies]
+slates-machine = { workspace = true }
+slates-mem = { workspace = true }
+slates-wire = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[lints]
+workspace = true

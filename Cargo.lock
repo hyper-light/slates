@@ -685,6 +685,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-ipc"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
+ "slates-machine",
+ "slates-mem",
+ "slates-wire",
+ "windows-sys",
+]
+
+[[package]]
 name = "slates-land"
 version = "0.1.0"
 dependencies = [

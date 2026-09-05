@@ -64,6 +64,12 @@ impl SharedObject {
     Ok(SharedObject { inner, len })
   }
 
+  /// The handoff another process uses to open an object created under `name` on a platform
+  /// that shares by name (macOS, Windows); on Linux objects are shared by descriptor only.
+  pub fn handoff_for_name(name: &str) -> Option<Handoff> {
+    platform::handoff_for_name(name)
+  }
+
   /// What to hand a child process so it can [`SharedObject::open`] this object. On Linux the
   /// descriptor is duplicated without `CLOEXEC` so a spawned child inherits it; the caller
   /// closes nothing (the duplicate lives in the child).
@@ -248,6 +254,16 @@ mod platform {
   }
 
   #[cfg(target_os = "macos")]
+  pub(super) fn handoff_for_name(name: &str) -> Option<Handoff> {
+    Some(Handoff::Name(object_name(name)))
+  }
+
+  #[cfg(not(target_os = "macos"))]
+  pub(super) fn handoff_for_name(_name: &str) -> Option<Handoff> {
+    None
+  }
+
+  #[cfg(target_os = "macos")]
   fn create_object(name: &str) -> Result<Created, MemError> {
     use rustix::fs::Mode;
     use rustix::shm::OFlags;
@@ -322,14 +338,12 @@ mod platform {
 
     #[cfg(target_os = "linux")]
     pub(super) fn handoff(&self) -> Result<Handoff, MemError> {
-      use std::os::fd::{AsFd, AsRawFd};
+      use std::os::fd::{AsFd, IntoRawFd};
       // A duplicate without CLOEXEC, for a child to inherit; the number is what it receives.
       let dup = rustix::io::dup(self.fd.as_fd()).map_err(|e| refused("dup", e))?;
       rustix::io::fcntl_setfd(&dup, rustix::io::FdFlags::empty())
         .map_err(|e| refused("fcntl", e))?;
-      let raw = dup.as_raw_fd();
-      std::mem::forget(dup);
-      Ok(Handoff::Descriptor(raw))
+      Ok(Handoff::Descriptor(dup.into_raw_fd()))
     }
 
     #[cfg(target_os = "macos")]
@@ -410,6 +424,10 @@ mod platform {
       return Err(err);
     }
     Ok(view.Value)
+  }
+
+  pub(super) fn handoff_for_name(name: &str) -> Option<Handoff> {
+    Some(Handoff::Name(name.to_owned()))
   }
 
   pub(super) fn create(name: &str, len: usize) -> Result<Inner, MemError> {

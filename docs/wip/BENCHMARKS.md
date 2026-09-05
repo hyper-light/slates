@@ -286,6 +286,24 @@ What it means: at 206 ns a mutation is under a percent of the 50 µs provisionin
 partition of 10^4 volumes recovers in a tenth of the budget from a million records, and the
 snapshot cadence the measurement derives keeps any log tail inside that budget.
 
+## Phase 2 baseline: IPC (2026-09-05)
+
+Environment: as above (Apple M5 Max, macOS 26.4.1, Rust 1.98.0, release profile). Command:
+`cargo run --release -p slates-ipc --example ipc_bench` (best of 5 runs, all shown; the row is
+the median with the lowest and highest run as its edges). Two threads over two mappings of
+one client region (an `shm_open` object): the client end and the daemon end; the OS places the
+threads (macOS refuses pinning), so a cross-cluster placement widens the spread, as the
+runtime's ring rows already record.
+
+| Operation | Median | Runs | Notes |
+|---|---|---|---|
+| One ring round trip, both ends spinning | 278 ns | [241, 253, 278, 302, 708] | a request slot and a reply slot: two cache-line transfers and the per-slot sequence stores; the 708 ns run is a cross-cluster placement |
+| One ring round trip, the client parked and woken | 1,051 ns | [924, 1,006, 1,051, 1,122, 1,154] | `os_sync_wait_on_address(SHARED)` and the wake: the cost the spin window is measured against (the profile's wake p99 is the published window) |
+
+What it means: the ring's floor is under 0.3 µs of the 50 µs provisioning budget, and a park
+costs about a microsecond here, so the 2-competitive spin window keeps the parked path rare
+under load and cheap when taken.
+
 ## Ratchets (2026-09-05)
 
 `ratchets.toml` holds the ceilings for this machine (identity `4c62b34d5f545407`, the Apple M5
