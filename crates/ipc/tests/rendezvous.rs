@@ -65,7 +65,7 @@ fn a_client_process_connects_and_completes_a_round_trip() {
   let pid = std::process::id();
   while started.elapsed() < Duration::from_millis(SERVE_MS) && !served {
     let accepted = listener
-      .accept_pending(&mut |client_id| {
+      .accept_pending(&|_| false, &mut |client_id| {
         Ok(Prepared {
           region: ClientRegion::create(
             &format!("slates-cr-{pid}-{client_id}"),

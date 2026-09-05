@@ -53,6 +53,11 @@ pub enum IpcError {
   },
   /// A wait ended at its deadline.
   DeadlineExceeded,
+  /// The daemon's derived client bound is reached (§4.7 admission, AC-2.6).
+  TooManyClients {
+    /// The bound.
+    limit: usize,
+  },
 }
 
 impl fmt::Display for IpcError {
@@ -73,6 +78,7 @@ impl fmt::Display for IpcError {
       Self::Memory(e) => write!(f, "shared memory: {e}"),
       Self::Unsupported { feature } => write!(f, "unsupported here: {feature}"),
       Self::DeadlineExceeded => f.write_str("deadline exceeded"),
+      Self::TooManyClients { limit } => write!(f, "too many clients (the bound is {limit})"),
     }
   }
 }

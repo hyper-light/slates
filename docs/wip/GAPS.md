@@ -559,6 +559,80 @@ re-derived from measured rates at the first `status` (task 6 measures); `TargetI
 and the bridge path in `Attached` (Phase 3); the health signals of §4.14 exported through
 `status` (task 6 with the histogram).
 
+Task 5 (the Rust client and the CLI) landed 2026-09-05: `slates-client` (`crates/client`):
+`Client::connect` through the rendezvous, one request in flight (the body framed inline or
+through the slot's bulk chunk, the client spinning for the daemon's published window and then
+parked on the wake word), request ids `(client id, sequence)`, and the two uses of exactly-once
+(§4.9): a reply stalled past the reply deadline with the daemon found gone (`Liveness`, §4.7's
+"control channel reset": the Linux control socket's peer end, or the bootstrap object's start
+stamp on macOS and Windows) makes the client reconnect under its own id and resend, so the
+retry meets its completion record; and `Session` lets a later process resume the id and the
+sequence. Deadlines are derived (`Deadlines::derive`: the reply deadline is the anchor's
+liveness budget, the reconnect budget the recovery budget plus one reply). Every verb of §4.4
+is a typed method; refusals are the wire taxonomy as `ClientError::Refused`; the channel's
+own refusals are `Stalled`, `DaemonGone` and `SessionTaken`. The rendezvous gained the wanted
+id (`connect_as`; the daemon's `accept_pending` takes an in-use predicate and honours a free
+id), the typed `TooManyClients` at the daemon's derived client bound (AC-2.6), and the
+liveness check. `slates-cli` (`crates/cli`, the `slates` binary): `anchor` (the profile
+measured, the segment created, the profile published, `slates daemon` supervised with the
+segment and the anchor's pid in its environment; a daemon that never beats inside the recovery
+budget or whose heartbeat lapses is killed and the policy decides; the restart bound
+re-derived from the longest measured start), `daemon` (attaches and reads the published
+profile, or measures and creates a segment when run alone; leaves when its anchor dies:
+`PR_SET_PDEATHSIG` on Linux, a parent watch at the heartbeat cadence, a job object on
+Windows), `profile`, and the client verbs with a stable plain output (one `key: value` per
+line, one record per line for `list`) and exit codes for the taxonomy (0 done, 1 refused, 2
+usage, 3 no daemon, 4 failed); a hand-written grammar with every flag listed once
+(`args.rs`). The server gained `SegmentSource::Handoff` (an anchor in the same process), the
+control channel held for a client's life, the client → shard mapping by the id's residue over
+the partitions (a reconnect lands on the partition holding its records), routing by the
+persistent partition index rather than the runtime's shard id, the name's owner partition by a
+stable hash (`owner_of_name`, FNV-1a; every create of one name lands on one partition, so
+uniqueness is that partition's to keep, with no global index), and the rebuild of recovered
+volumes at start (`rebuild_recovered`: a live tree again, the reservation retaken, local-only
+snapshots and attachments reconciled out of the catalog as recorded operations). `slates-mem`
+keeps the object's name on macOS for opened objects, so an attached process can hand the
+segment on.
+
+Gated (`crates/client/tests/client.rs`, 2 tests, 1.2 s): the typed verbs over a two-shard
+daemon (create, the duplicate refused with the original's id, snapshot, clone, attach with
+epoch 1, status, list, detach, resize, destroy in slices, acknowledge; parks never exceed
+replies); and a session outliving a daemon restart over one segment with the test as the
+anchor: the first daemon stopped, a second started over the same handoff, the client's next
+call stalling, finding the daemon gone, reconnecting under its id (one reconnect counted) and
+served by the restarted daemon with the volume rebuilt, the retry of its earlier create
+answered from the replayed completion record with the same id and no second volume, the
+local-only snapshot reconciled away, new work continuing under the session's sequence, and a
+second client refused the live session. (`crates/cli/tests/cli.rs`, 2 tests, 1.2 s): a real
+`slates anchor` supervising a real `slates daemon`, the binary driven through create (the id
+and the path line), the duplicate refused with exit 1, list, snapshot, clone, stat, attach,
+status with and without `--drift`, detach, resize, destroy, the usage refusals with exit 2, a
+missing volume with exit 1, then the anchor killed with SIGKILL and the daemon leaving so the
+instance answers exit 3; `profile --quick` and the usage. The grammar and the value formats
+have unit tests. All gates green on 2026-09-05 (`cargo xtask ratchet`: 82 rows, 0
+regressions).
+
+Found by the tests on their first runs: (1) routing used the runtime's shard id, which is
+process-local (a second runtime in one process numbers its shards after the first's), so a
+restarted daemon could reach none of its recovered volumes; volume ids and client ids now
+route by the partition index, which recovery keeps (`ShardState::partition`); (2) a volume's
+name was unique per shard only: two clients on different shards created one name twice
+(T-2.1 across clients), which is what the CLI does on every invocation; (3) on macOS a shared
+object opened by name refused to hand itself on, so a daemon attached from the anchor could
+not map the segment on its shards and exited, which the anchor restarted and then refused as a
+crash loop, exercising that path for real; (4) `detach` found a holder's other attachments by
+encoding the whole partition (`to_snapshot`), replaced by `attachments_of`.
+
+Owed from task 5: the daemon's side of a dead client (the control socket's close on Linux, the
+heartbeat slot's lapse on macOS and Windows, the reclaim of the region, the client's leases
+after expiry and its id from the in-use set) with task 6 and T-2.3; the CLI's grant surface
+(`slates grant`, `grants`, `land`, `audit`) with task 8; a daemon-wide `slates status` with
+task 6's health signals (`CLIENTS_REFUSED`, `RECOVERY_SKIPPED`, `HANDOFF_LOST`,
+`INIT_FAILURES` are counted now and printed nowhere); the daemon start p99 for the restart
+bound is the longest start measured in this anchor's life until a histogram of starts exists;
+the Windows console handler, job object and section-and-Event paths are lint-checked from this
+machine and run first in the Windows lane.
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3

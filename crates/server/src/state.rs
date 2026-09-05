@@ -25,6 +25,10 @@ pub struct ClientSlot {
   pub principal: Principal,
   /// The client id.
   pub client_id: u32,
+  /// The control channel, where the platform has one (Linux: the socket whose close is how
+  /// the daemon learns of a dead client, and whose peer end closing tells the client the
+  /// daemon died; held for the client's life).
+  pub control: Option<slates_ipc::rendezvous::platform::Control>,
 }
 
 impl std::fmt::Debug for ClientSlot {
@@ -56,8 +60,11 @@ impl std::fmt::Debug for VolumeSlot {
 
 /// The shard's state.
 pub struct ShardState {
-  /// The shard.
+  /// The shard: the runtime's id, what messages are addressed to (process-local).
   pub shard: u16,
+  /// The partition: this shard's index among the daemon's, what volume ids and client ids
+  /// route by (persistent: a restarted daemon's partition holds the same records).
+  pub partition: u16,
   /// The configuration.
   pub config: DaemonConfig,
   /// The segment (this shard's mapping).

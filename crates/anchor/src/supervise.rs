@@ -17,6 +17,11 @@ use slates_machine::{Derived, derived};
 use crate::error::AnchorError;
 use crate::segment::AnchorSegment;
 
+/// Format: the environment variable carrying the anchor's process id to the daemon, so the
+/// daemon can watch its supervisor and leave with it (a daemon outliving a dead anchor would
+/// hold a segment nobody supervises).
+pub const ENV_ANCHOR_PID: &str = "SLATES_ANCHOR_PID";
+
 /// The restart policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RestartPolicy {
@@ -74,6 +79,10 @@ pub struct Supervisor {
   child: Option<Child>,
   restarts_at_ns: VecDeque<u64>,
   crash_loop: bool,
+  /// Ties the daemon's life to the anchor's where the OS offers it (Windows: a job object
+  /// that kills its processes when its last handle closes; Linux: the daemon asks for the
+  /// parent-death signal itself; macOS: the daemon watches its parent's id).
+  lifetime: lifetime::Tie,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -102,7 +111,13 @@ impl Supervisor {
       child: None,
       restarts_at_ns: VecDeque::new(),
       crash_loop: false,
+      lifetime: lifetime::Tie::new(),
     }
+  }
+
+  /// Replaces the policy (the anchor re-derives it as daemon starts are measured).
+  pub fn set_policy(&mut self, policy: RestartPolicy) {
+    self.policy = policy;
   }
 
   /// The segment.
@@ -120,7 +135,8 @@ impl Supervisor {
     if self.child.is_some() {
       return Ok(());
     }
-    let env = self.segment.handoff_env()?;
+    let mut env = self.segment.handoff_env()?;
+    env.push((ENV_ANCHOR_PID.to_owned(), std::process::id().to_string()));
     let child = Command::new(&self.program)
       .args(&self.args)
       .envs(env)
@@ -128,6 +144,7 @@ impl Supervisor {
       .map_err(|e| AnchorError::Spawn {
         code: e.raw_os_error(),
       })?;
+    self.lifetime.tie(&child)?;
     let restart = self.segment.supervision()?.generation() > 0;
     self
       .segment
@@ -178,6 +195,18 @@ impl Supervisor {
     })
   }
 
+  /// Kills the daemon without taking it (the anchor found its heartbeat lapsed, §4.14
+  /// `daemon.alive`): the next `step` sees the exit and applies the policy, so a wedged
+  /// daemon counts as a failure like a crashed one.
+  pub fn kill(&mut self) -> Result<(), AnchorError> {
+    if let Some(child) = self.child.as_mut() {
+      child.kill().map_err(|e| AnchorError::Spawn {
+        code: e.raw_os_error(),
+      })?;
+    }
+    Ok(())
+  }
+
   /// Stops the daemon (the owner asked): kills it and records the stop.
   pub fn stop(&mut self) -> Result<(), AnchorError> {
     if let Some(mut child) = self.child.take() {
@@ -196,5 +225,117 @@ impl Supervisor {
   /// The policy.
   pub fn policy(&self) -> RestartPolicy {
     self.policy
+  }
+}
+
+#[cfg(windows)]
+mod lifetime {
+  //! Windows: a job object with `KILL_ON_JOB_CLOSE`; the daemon is assigned to it right after
+  //! the spawn, so the anchor's death (the last handle closing) ends the daemon.
+
+  use std::process::Child;
+
+  use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+  use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
+  };
+
+  use crate::error::AnchorError;
+
+  /// The job object, created once per supervisor.
+  pub(super) struct Tie {
+    job: HANDLE,
+  }
+
+  fn spawn_error() -> AnchorError {
+    AnchorError::Spawn {
+      code: std::io::Error::last_os_error().raw_os_error(),
+    }
+  }
+
+  impl Tie {
+    pub(super) fn new() -> Tie {
+      Tie {
+        job: std::ptr::null_mut(),
+      }
+    }
+
+    fn create(&mut self) -> Result<(), AnchorError> {
+      if !self.job.is_null() {
+        return Ok(());
+      }
+      // SAFETY: an anonymous job object; the handle is checked before use and closed on drop.
+      let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+      if job.is_null() {
+        return Err(spawn_error());
+      }
+      let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION =
+        // SAFETY: a plain-data record the call fills; every zero is a valid field value.
+        unsafe { std::mem::zeroed() };
+      limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+      let size = u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).unwrap_or(0);
+      // SAFETY: `limits` is the record the information class names, of the size passed.
+      let ok = unsafe {
+        SetInformationJobObject(
+          job,
+          JobObjectExtendedLimitInformation,
+          std::ptr::from_ref(&limits).cast(),
+          size,
+        )
+      };
+      if ok == 0 {
+        // SAFETY: a handle this function created and nobody else holds.
+        unsafe { CloseHandle(job) };
+        return Err(spawn_error());
+      }
+      self.job = job;
+      Ok(())
+    }
+
+    pub(super) fn tie(&mut self, child: &Child) -> Result<(), AnchorError> {
+      use std::os::windows::io::AsRawHandle;
+      self.create()?;
+      // SAFETY: both handles are live: the job is ours and the child's is held by `child`.
+      let ok = unsafe { AssignProcessToJobObject(self.job, child.as_raw_handle().cast()) };
+      if ok == 0 {
+        return Err(spawn_error());
+      }
+      Ok(())
+    }
+  }
+
+  impl Drop for Tie {
+    fn drop(&mut self) {
+      if !self.job.is_null() {
+        // SAFETY: the handle this object created; closing the last handle ends the job's
+        // processes, which is the point.
+        unsafe { CloseHandle(self.job) };
+      }
+    }
+  }
+}
+
+#[cfg(not(windows))]
+mod lifetime {
+  //! Unix: nothing to tie here; the daemon watches its parent (`ENV_ANCHOR_PID`) and, on
+  //! Linux, asks the kernel for the parent-death signal.
+
+  use std::process::Child;
+
+  use crate::error::AnchorError;
+
+  /// Nothing held.
+  pub(super) struct Tie;
+
+  impl Tie {
+    pub(super) fn new() -> Tie {
+      Tie
+    }
+
+    pub(super) fn tie(&mut self, _child: &Child) -> Result<(), AnchorError> {
+      Ok(())
+    }
   }
 }

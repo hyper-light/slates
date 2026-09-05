@@ -28,7 +28,7 @@ use crate::verbs;
 
 /// Shape: the heartbeat cadence the control shard beats the anchor's word at (§4.14
 /// `daemon.alive`): a tenth of the anchor's liveness budget, so nine beats fit inside it.
-const HEARTBEAT_NS: u64 = 100_000_000;
+pub const HEARTBEAT_NS: u64 = 100_000_000;
 /// Shape: the anchor's liveness budget for `daemon.alive` (a second; the supervisor's
 /// input until the CLI takes the operator's value).
 pub const LIVENESS_BUDGET_NS: u64 = 1_000_000_000;
@@ -43,6 +43,13 @@ pub enum SegmentSource {
   },
   /// Attach the segment the anchor handed over in the environment.
   FromEnv,
+  /// Attach a segment by its handoff (an anchor in this process: tests, embeddings).
+  Handoff {
+    /// The handoff.
+    handoff: Handoff,
+    /// The mapped length.
+    len: usize,
+  },
 }
 
 /// The daemon.
@@ -69,6 +76,10 @@ static DOORBELL_RANG: AtomicBool = AtomicBool::new(false);
 pub static INIT_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Clients handed to a shard that had no state to take them (a health signal).
 pub static HANDOFF_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Volumes the recovered catalog holds that a shard could not rebuild (a health signal).
+pub static RECOVERY_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Connects refused at the daemon's derived client bound (a health signal, AC-2.6).
+pub static CLIENTS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl Daemon {
   /// Starts the daemon from a profile.
@@ -81,6 +92,7 @@ impl Daemon {
     let mut segment = match source {
       SegmentSource::Create { name } => AnchorSegment::create(&name, &identity, config.geometry)?,
       SegmentSource::FromEnv => AnchorSegment::attach_from_env(&identity)?,
+      SegmentSource::Handoff { handoff, len } => AnchorSegment::attach(&handoff, len, &identity)?,
     };
     if let Ok(json) = profile.to_json() {
       segment.publish(RegionKind::Profile, json.as_bytes())?;
@@ -230,8 +242,9 @@ fn init_shard(
     ["reserve_per_shard", "clients_per_shard"]
   );
   let shard = registry::current_shard().unwrap_or(partition);
-  let state = ShardState {
+  let mut state = ShardState {
     shard,
+    partition,
     config: config.clone(),
     segment,
     db,
@@ -240,7 +253,7 @@ fn init_shard(
     by_id: std::collections::BTreeMap::new(),
     clients: Slab::new(config.caps.segment_slots, config.clients_per_shard),
     budget: ShardBudget::new(config.reserve_per_shard, peak_burst.get()),
-    next_prefix: shard
+    next_prefix: partition
       .saturating_mul(u16::try_from(config.caps.segment_slots).unwrap_or(u16::MAX))
       .max(1),
     next_attachment: 1,
@@ -252,6 +265,19 @@ fn init_shard(
     scatters: std::collections::BTreeMap::new(),
     shards: config_shards.to_vec(),
   };
+  let rebuilt = verbs::rebuild_recovered(&mut state);
+  if rebuilt.skipped > 0 {
+    RECOVERY_SKIPPED.fetch_add(
+      u64::try_from(rebuilt.skipped).unwrap_or(u64::MAX),
+      Ordering::AcqRel,
+    );
+  }
+  if rebuilt != verbs::Rebuilt::default() {
+    eprintln!(
+      "slates-server: shard {shard}: recovered {} volumes ({} skipped), reconciled {} local snapshots and {} attachments",
+      rebuilt.volumes, rebuilt.skipped, rebuilt.snapshots_dropped, rebuilt.attachments_dropped
+    );
+  }
   state::install(state);
   // Detached: the loop lives as long as the shard; nothing joins it (a joinable task stays in
   // the arena after it ends, which would hold the shard's shutdown).
@@ -307,11 +333,24 @@ async fn control_loop(
   if let Ok(task) = futures::spawn(heartbeat_loop(segment)) {
     let _ = futures::detach(task);
   }
-  let mut next_shard = 0usize;
+  // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
+  // by the daemon's client capacity, refused typed beyond it (AC-2.6). A client's shard is
+  // its id's residue, so a client reconnecting under its old id after a restart lands on the
+  // shard that holds its completion records (§4.9), with fresh ids still round-robin.
+  let bound = derived!(
+    config.clients_per_shard.saturating_mul(shards.len()),
+    "clients_per_shard × shards",
+    ["clients_per_shard", "shards"]
+  )
+  .get();
+  let mut handed: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
   loop {
-    let accepted = listener.accept_pending(&mut |client_id| {
-      let shard = shards[next_shard % shards.len().max(1)];
-      next_shard += 1;
+    let accepted = listener.accept_pending(&|id| handed.contains(&id), &mut |client_id| {
+      if handed.len() >= bound {
+        CLIENTS_REFUSED.fetch_add(1, Ordering::AcqRel);
+        return Err(slates_ipc::IpcError::TooManyClients { limit: bound });
+      }
+      let shard = shards[usize::try_from(client_id).unwrap_or(0) % shards.len().max(1)];
       let region = ClientRegion::create(
         &format!("slates-cr-{}-{client_id}", config.instance),
         client_id,
@@ -328,6 +367,8 @@ async fn control_loop(
         let shard = ShardId(a.region.shard());
         let principal = Principal::Uid { uid: a.uid };
         let client_id = a.client_id;
+        handed.insert(client_id);
+        let control = a.control;
         let end = slates_ipc::DaemonEnd::new(a.region);
         let request = Box::new(SpawnRequest::new(
           Box::pin(async move {
@@ -338,6 +379,7 @@ async fn control_loop(
                 end,
                 principal,
                 client_id,
+                control,
               }) {
                 eprintln!("slates-server: client {client_id} refused by the shard's table: {e}");
               }

@@ -210,6 +210,11 @@ impl AnchorSegment {
     Self::attach(&handoff, len, identity)
   }
 
+  /// The handoff and the length an attach in this process (or a child) needs.
+  pub fn handoff(&self) -> Result<(Handoff, usize), AnchorError> {
+    Ok((self.object.handoff()?, self.object.len()))
+  }
+
   /// The environment a child needs to attach.
   pub fn handoff_env(&self) -> Result<Vec<(String, String)>, AnchorError> {
     let handoff = match self.object.handoff()? {

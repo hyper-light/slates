@@ -32,6 +32,7 @@ pub use endpoint::{ClientEnd, DaemonEnd, Reply, Request};
 pub use error::IpcError;
 pub use region::{ClientRegion, RegionGeometry};
 pub use rendezvous::{
-  Accepted, Connected, Doorbell, Listener, Prepared, connect, instance_from_env,
+  Accepted, Connected, Doorbell, Listener, Liveness, Prepared, connect, connect_as,
+  instance_from_env,
 };
 pub use slot::{PAYLOAD_BYTES, Slot, SlotKind};

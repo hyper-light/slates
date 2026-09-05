@@ -38,6 +38,7 @@ pub struct Reply {
 pub struct ClientEnd {
   region: ClientRegion,
   doorbell: Option<crate::rendezvous::Doorbell>,
+  liveness: Option<crate::rendezvous::Liveness>,
   next_request: u64,
   next_reply: u64,
   /// Wakes the client had to park for (the spin-to-park ratio's numerator).
@@ -61,6 +62,7 @@ impl ClientEnd {
     ClientEnd {
       region,
       doorbell: None,
+      liveness: None,
       next_request: 0,
       next_reply: 0,
       parks: 0,
@@ -73,6 +75,21 @@ impl ClientEnd {
     let mut end = ClientEnd::new(region);
     end.doorbell = Some(doorbell);
     end
+  }
+
+  /// The client's end over everything the rendezvous handed over: the region, the doorbell
+  /// and the liveness check.
+  pub fn connected(connected: crate::rendezvous::Connected) -> ClientEnd {
+    let mut end = ClientEnd::new(connected.region);
+    end.doorbell = Some(connected.doorbell);
+    end.liveness = Some(connected.liveness);
+    end
+  }
+
+  /// Whether the daemon this end was connected to is gone (dead or restarted); true for an
+  /// end that has no liveness check, so a caller reconnects rather than waits forever.
+  pub fn daemon_gone(&self) -> bool {
+    self.liveness.as_ref().is_none_or(|l| l.daemon_gone())
   }
 
   /// The region.

@@ -369,3 +369,11 @@ What it means: the wall clock on a laptop resolves a regression of a few percent
 microsecond rows and only a large one on the nanosecond rows, because the machine itself moves
 that much between processes. The design's instruction-count gate (D-20) is what sees the small
 change; it runs in CI's `callgrind` lane under valgrind (GAPS §8b).
+
+The Phase 2 task 5 run (2026-09-05, `cargo xtask ratchet` after the client and the CLI landed):
+82 rows against the baseline, 0 regressions; no new rows, since the client's cost is the IPC
+round trip already gated (`ipc.*`) and the CLI's is a process start plus one rendezvous. The
+suites themselves are the facts of the day: `cargo test -p slates-client --test client` 1.2 s
+for two daemons and a restart; `cargo test -p slates-cli --test cli` 1.2 s for a real anchor,
+a real daemon, fourteen verbs through the binary, and the daemon leaving after the anchor is
+killed (Apple M5 Max, macOS 26.4.1). The provisioning histogram (AC-2.1, T-2.6) is task 6's.

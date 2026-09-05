@@ -100,18 +100,31 @@ impl Listener {
   }
 
   /// Serves every pending connection without blocking: for each, `make_region` builds the
-  /// client's region (the daemon's derivation of its geometry and shard), and the handoff is
-  /// completed. A refused peer is counted and skipped.
+  /// client's region (the daemon's derivation of its geometry and shard) for the id the
+  /// daemon assigns (the peer's wanted id when `in_use` says it is free, else a fresh one),
+  /// and the handoff is completed. A refused peer is counted and skipped.
   pub fn accept_pending(
     &mut self,
+    in_use: &dyn Fn(u32) -> bool,
     make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
   ) -> Result<Vec<Accepted>, IpcError> {
     let mut out = Vec::new();
     loop {
-      let client_id = self.next_client;
-      match self.inner.accept_one(client_id, make_region) {
+      let fresh = self.next_client;
+      let mut assign = |wanted: u32| -> u32 {
+        if wanted != 0 && !in_use(wanted) {
+          wanted
+        } else {
+          fresh
+        }
+      };
+      match self.inner.accept_one(&mut assign, make_region) {
         Ok(Some(accepted)) => {
-          self.next_client = self.next_client.wrapping_add(1);
+          if accepted.client_id == fresh {
+            self.next_client = self.next_client.wrapping_add(1);
+          } else if accepted.client_id >= self.next_client {
+            self.next_client = accepted.client_id.wrapping_add(1);
+          }
           out.push(accepted);
         }
         Ok(None) => break,
@@ -186,9 +199,17 @@ impl Doorbell {
   }
 }
 
-/// The client's side: connects to `instance` and returns its region.
+/// The client's side: connects to `instance` and returns its region, the doorbell for a parked
+/// shard, and the platform's control channel where one exists.
 pub fn connect(instance: &str) -> Result<Connected, IpcError> {
-  platform::connect(instance)
+  platform::connect(instance, 0)
+}
+
+/// Connects asking for a client id it held before (a reconnect after the daemon restarted, so
+/// its retries under the old request ids meet their completion records, §4.9); the daemon
+/// honours the id when no live client holds it, else assigns a fresh one.
+pub fn connect_as(instance: &str, wanted: u32) -> Result<Connected, IpcError> {
+  platform::connect(instance, wanted)
 }
 
 /// What a client holds after the rendezvous.
@@ -197,8 +218,33 @@ pub struct Connected {
   pub region: ClientRegion,
   /// The doorbell.
   pub doorbell: Doorbell,
+  /// How the client tells a dead daemon from a slow one.
+  pub liveness: Liveness,
   /// The control channel, where the platform has one.
   pub control: Option<platform::ClientControl>,
+}
+
+/// How a client tells a dead daemon from a slow one (§4.7 "Failure matrix": a stalled reply
+/// and "the control channel reset" mean the daemon died and the client reconnects; a stalled
+/// reply alone means it is slow). Linux: the control socket, whose peer end the kernel closes
+/// when the daemon dies. macOS and Windows: the bootstrap object's start stamp, which a
+/// restarted daemon rewrites and a dead one leaves unreachable.
+pub struct Liveness {
+  inner: platform::Liveness,
+}
+
+impl std::fmt::Debug for Liveness {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str("Liveness")
+  }
+}
+
+impl Liveness {
+  /// Whether the daemon the client connected to is gone (dead, or restarted since). A cold
+  /// path: asked only after a reply has stalled past the client's deadline.
+  pub fn daemon_gone(&self) -> bool {
+    self.inner.daemon_gone()
+  }
 }
 
 impl std::fmt::Debug for Connected {
@@ -237,6 +283,8 @@ pub mod platform {
 
   /// Format: the handoff message: client id (4), region length (8).
   const HANDOFF_BYTES: usize = 12;
+  /// Format: the client's hello: the id it wants (4), zero for a fresh one.
+  const HELLO_BYTES: usize = 4;
   /// Format: the client id's offset in the handoff message.
   const HANDOFF_AT_CLIENT: usize = 0;
   /// Format: the region length's offset in the handoff message.
@@ -263,12 +311,33 @@ pub mod platform {
     pub completion: OwnedFd,
   }
 
-  /// The client's control channel: the socket and the completion eventfd to poll.
+  /// The client's control channel: the completion eventfd an SDK event loop polls.
   pub struct ClientControl {
-    /// The socket.
-    pub socket: OwnedFd,
     /// The completion eventfd.
     pub completion: OwnedFd,
+  }
+
+  /// The client's liveness check: the control socket; its peer end closes with the daemon.
+  pub struct Liveness {
+    socket: OwnedFd,
+  }
+
+  impl Liveness {
+    pub(super) fn daemon_gone(&self) -> bool {
+      let mut probe = [0u8; 1];
+      match rustix::net::recv(
+        &self.socket,
+        &mut probe,
+        RecvFlags::PEEK | RecvFlags::DONTWAIT,
+      ) {
+        // End of stream: the peer closed.
+        Ok((0, _)) => true,
+        // Bytes waiting, or nothing yet: the peer is there.
+        Ok(_) | Err(rustix::io::Errno::AGAIN) => false,
+        // Reset, or an unusable descriptor: the channel is gone either way.
+        Err(_) => true,
+      }
+    }
   }
 
   pub(super) struct Listener {
@@ -316,7 +385,7 @@ pub mod platform {
 
     pub(super) fn accept_one(
       &mut self,
-      client_id: u32,
+      assign: &mut dyn FnMut(u32) -> u32,
       make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
     ) -> Result<Option<Accepted>, IpcError> {
       let peer = match rustix::net::accept_with(&self.socket, SocketFlags::CLOEXEC) {
@@ -329,6 +398,15 @@ pub mod platform {
       if uid != self.uid {
         return Err(IpcError::PeerRefused { uid });
       }
+      let mut hello = [0u8; HELLO_BYTES];
+      let got =
+        rustix::net::recv(&peer, &mut hello, RecvFlags::empty()).map_err(|e| refused("recv", e))?;
+      let wanted = if got.0 == HELLO_BYTES {
+        u32::from_le_bytes(hello)
+      } else {
+        0
+      };
+      let client_id = assign(wanted);
       let Prepared { region, kick_fd } = make_region(client_id)?;
       let (handoff, len) = region.handoff()?;
       let Handoff::Descriptor(raw) = handoff else {
@@ -381,7 +459,7 @@ pub mod platform {
     }
   }
 
-  pub(super) fn connect(instance: &str) -> Result<Connected, IpcError> {
+  pub(super) fn connect(instance: &str, wanted: u32) -> Result<Connected, IpcError> {
     let socket = rustix::net::socket_with(
       AddressFamily::UNIX,
       SocketType::STREAM,
@@ -394,6 +472,8 @@ pub mod platform {
         endpoint: instance.to_owned(),
       }
     })?;
+    rustix::net::send(&socket, &wanted.to_le_bytes(), SendFlags::empty())
+      .map_err(|e| refused("send", e))?;
     let mut body = [0u8; HANDOFF_BYTES];
     let mut space =
       [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(HANDOFF_FDS))];
@@ -438,7 +518,10 @@ pub mod platform {
     Ok(Connected {
       region,
       doorbell: Doorbell::Eventfd(kick),
-      control: Some(ClientControl { socket, completion }),
+      liveness: super::Liveness {
+        inner: Liveness { socket },
+      },
+      control: Some(ClientControl { completion }),
     })
   }
 }
@@ -459,10 +542,14 @@ pub mod platform {
   /// Format: the bootstrap object's magic, `SLBT` in little-endian ASCII.
   const MAGIC: u32 = 0x5442_4C53;
   /// Format: the bootstrap header: magic (4), slots (4), the daemon-wide doorbell word (4),
-  /// padding to a cache line.
+  /// padding (4), the daemon's start stamp (8), padding to a cache line.
   const HEADER_BYTES: usize = 64;
   /// Format: the doorbell word's offset in the header.
   pub const AT_DOORBELL: usize = 8;
+  /// Format: the start stamp's offset in the header: the wall clock in nanoseconds when the
+  /// daemon opened the object, so a client that remembers it tells a restarted daemon (a new
+  /// stamp) from a slow one (the same stamp).
+  const AT_GENERATION: usize = 16;
   /// Shape: claim slots in the bootstrap object: clients connecting inside one control-shard
   /// loop; the loop drains them, so the table only covers one loop of arrivals.
   const SLOTS: usize = 64;
@@ -501,6 +588,47 @@ pub mod platform {
   /// No client control channel on these platforms in Phase 2.
   pub struct ClientControl;
 
+  /// The client's liveness check: the start stamp it saw, compared to the one the bootstrap
+  /// object holds now (none when no daemon holds the object).
+  pub struct Liveness {
+    instance: String,
+    generation: u64,
+  }
+
+  impl Liveness {
+    pub(super) fn daemon_gone(&self) -> bool {
+      generation_of(&self.instance).is_none_or(|now| now != self.generation)
+    }
+  }
+
+  /// The start stamp of the daemon holding `instance`'s bootstrap object, if one does.
+  fn generation_of(instance: &str) -> Option<u64> {
+    let handoff = SharedObject::handoff_for_name(&rendezvous_name(instance))?;
+    let object = SharedObject::open(&handoff, HEADER_BYTES + SLOTS * SLOT_BYTES).ok()?;
+    let bytes = object.bytes();
+    let magic = u32::from_le_bytes(
+      bytes[..size_of::<u32>()]
+        .try_into()
+        .unwrap_or([0; size_of::<u32>()]),
+    );
+    if magic != MAGIC {
+      return None;
+    }
+    Some(u64::from_le_bytes(
+      bytes[AT_GENERATION..AT_GENERATION + 8]
+        .try_into()
+        .unwrap_or([0; 8]),
+    ))
+  }
+
+  /// The wall clock in nanoseconds, the start stamp of a daemon opening the object now.
+  fn stamp_now() -> u64 {
+    std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+      .unwrap_or(0)
+  }
+
   pub(super) struct Listener {
     object: SharedObject,
   }
@@ -523,6 +651,7 @@ pub mod platform {
         let bytes = object.bytes_mut();
         bytes[..4].copy_from_slice(&MAGIC.to_le_bytes());
         bytes[4..8].copy_from_slice(&u32::try_from(SLOTS).unwrap_or(u32::MAX).to_le_bytes());
+        bytes[AT_GENERATION..AT_GENERATION + 8].copy_from_slice(&stamp_now().to_le_bytes());
       }
       for i in 0..SLOTS {
         state(&object, i)?.store(FREE, Ordering::Release);
@@ -546,7 +675,7 @@ pub mod platform {
 
     pub(super) fn accept_one(
       &mut self,
-      client_id: u32,
+      assign: &mut dyn FnMut(u32) -> u32,
       make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
     ) -> Result<Option<Accepted>, IpcError> {
       for i in 0..SLOTS {
@@ -554,6 +683,17 @@ pub mod platform {
         match word.load(Ordering::Acquire) {
           DONE => word.store(FREE, Ordering::Release),
           CLAIMED => {
+            let wanted = {
+              let at = slot_at(i);
+              let b = self.object.bytes();
+              u32::from_le_bytes([
+                b[at + AT_CLIENT],
+                b[at + AT_CLIENT + 1],
+                b[at + AT_CLIENT + 2],
+                b[at + AT_CLIENT + 3],
+              ])
+            };
+            let client_id = assign(wanted);
             let Prepared { region, .. } = make_region(client_id)?;
             let (handoff, len) = region.handoff()?;
             let Handoff::Name(name) = handoff else {
@@ -627,7 +767,7 @@ pub mod platform {
     std::process::id()
   }
 
-  pub(super) fn connect(instance: &str) -> Result<Connected, IpcError> {
+  pub(super) fn connect(instance: &str, wanted: u32) -> Result<Connected, IpcError> {
     let handoff =
       SharedObject::handoff_for_name(&rendezvous_name(instance)).ok_or(IpcError::Unsupported {
         feature: "rendezvous by name",
@@ -648,6 +788,11 @@ pub mod platform {
         reason: "bootstrap object has the wrong magic",
       });
     }
+    let generation = u64::from_le_bytes(
+      object.bytes()[AT_GENERATION..AT_GENERATION + 8]
+        .try_into()
+        .unwrap_or([0; 8]),
+    );
     // Claim a free slot.
     let mut claimed = None;
     for i in 0..SLOTS {
@@ -670,6 +815,9 @@ pub mod platform {
       let mut object = object;
       object.bytes_mut()[at + AT_PID..at + AT_PID + 4]
         .copy_from_slice(&current_pid().to_le_bytes());
+      // The id the client wants back (zero: a fresh one); the daemon overwrites it with the
+      // id it assigns.
+      object.bytes_mut()[at + AT_CLIENT..at + AT_CLIENT + 4].copy_from_slice(&wanted.to_le_bytes());
       // Ring the daemon-wide doorbell so a parked control shard sees the claim.
       if let Ok(bell) = object.atomic_u32(AT_DOORBELL) {
         bell.fetch_add(1, Ordering::AcqRel);
@@ -712,6 +860,12 @@ pub mod platform {
           object,
           offset: AT_DOORBELL,
         },
+        liveness: super::Liveness {
+          inner: Liveness {
+            instance: instance.to_owned(),
+            generation,
+          },
+        },
         control: Some(ClientControl),
       })
     }
@@ -730,6 +884,14 @@ pub mod platform {
   pub struct Control;
   /// No client control channel.
   pub struct ClientControl;
+  /// No liveness check: no daemon to connect to.
+  pub struct Liveness;
+
+  impl Liveness {
+    pub(super) fn daemon_gone(&self) -> bool {
+      true
+    }
+  }
 
   pub(super) struct Listener;
 
@@ -756,7 +918,7 @@ pub mod platform {
 
     pub(super) fn accept_one(
       &mut self,
-      _client_id: u32,
+      _assign: &mut dyn FnMut(u32) -> u32,
       _make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
     ) -> Result<Option<Accepted>, IpcError> {
       let _ = ClientRegion::open;
@@ -764,7 +926,7 @@ pub mod platform {
     }
   }
 
-  pub(super) fn connect(instance: &str) -> Result<Connected, IpcError> {
+  pub(super) fn connect(instance: &str, _wanted: u32) -> Result<Connected, IpcError> {
     Err(IpcError::DaemonUnavailable {
       endpoint: instance.to_owned(),
     })

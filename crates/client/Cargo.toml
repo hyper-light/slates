@@ -1,0 +1,23 @@
+[package]
+name = "slates-client"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The Rust client: the rendezvous, one request in flight over the rings with spin-then-park, request ids with exactly-once retries across a daemon restart, and the lifecycle verbs of §4.4 as typed calls (design §4.4, §4.7, §4.9; Phase 2 task 5)."
+
+[dependencies]
+slates-machine = { workspace = true }
+slates-ipc = { workspace = true }
+slates-wire = { workspace = true }
+
+[dev-dependencies]
+slates-server = { workspace = true }
+slates-anchor = { workspace = true }
+slates-mem = { workspace = true }
+slates-db = { workspace = true }
+
+[lints]
+workspace = true

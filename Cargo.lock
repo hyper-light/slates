@@ -659,6 +659,7 @@ dependencies = [
  "slates-machine",
  "slates-mem",
  "slates-wire",
+ "windows-sys",
 ]
 
 [[package]]
@@ -671,6 +672,35 @@ dependencies = [
  "slates-mem",
  "slates-vfs",
  "windows-sys",
+]
+
+[[package]]
+name = "slates-cli"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
+ "slates-anchor",
+ "slates-client",
+ "slates-db",
+ "slates-ipc",
+ "slates-machine",
+ "slates-server",
+ "slates-vfs",
+ "windows-sys",
+]
+
+[[package]]
+name = "slates-client"
+version = "0.1.0"
+dependencies = [
+ "slates-anchor",
+ "slates-db",
+ "slates-ipc",
+ "slates-machine",
+ "slates-mem",
+ "slates-server",
+ "slates-wire",
 ]
 
 [[package]]

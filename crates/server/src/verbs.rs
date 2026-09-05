@@ -93,7 +93,7 @@ fn core_snapshot(id: SnapshotId) -> slates_vfs::ids::SnapshotId {
 /// clock and a counter below, so ids never repeat on this host.
 fn fresh_volume_id(state: &mut ShardState) -> DbVolumeId {
   let mut bytes = [0u8; 16];
-  bytes[..2].copy_from_slice(&state.shard.to_be_bytes());
+  bytes[..2].copy_from_slice(&state.partition.to_be_bytes());
   bytes[2..10].copy_from_slice(&state.clock.monotonic_ns().to_be_bytes());
   let count = state.db.next_seq();
   bytes[10..].copy_from_slice(&count.to_be_bytes()[2..]);
@@ -141,6 +141,30 @@ pub enum Served {
 /// owners, no index).
 pub fn owner_of(volume: VolumeId) -> u16 {
   u16::from_be_bytes([volume.bytes[0], volume.bytes[1]])
+}
+
+/// Format: the FNV-1a 64-bit offset basis (Fowler, Noll, Vo; the reference constants).
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+/// Format: the FNV-1a 64-bit prime.
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// The partition that owns a name: a stable hash of the name over the daemon's partitions,
+/// so every create of one name lands on one partition and the name's uniqueness is that
+/// partition's to keep (§4.8 "Lookup": ids route to owners; no global index). The same
+/// function on every restart, so a recovered partition still owns its names.
+pub fn owner_of_name(name: &str, partitions: usize) -> u16 {
+  let mut hash = FNV_OFFSET;
+  for byte in name.bytes() {
+    hash ^= u64::from(byte);
+    hash = hash.wrapping_mul(FNV_PRIME);
+  }
+  let count = u64::try_from(partitions.max(1)).unwrap_or(u64::MAX);
+  u16::try_from(hash % count).unwrap_or(u16::MAX)
+}
+
+/// The runtime shard a partition lives on in this process.
+fn shard_of_partition(state: &ShardState, partition: u16) -> Option<u16> {
+  state.shards.get(usize::from(partition)).copied()
 }
 
 /// The volume a request is about, when it is about one.
@@ -210,9 +234,16 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   if let RequestBody::List = body {
     return scatter_list(state, client.index(), request.request, principal);
   }
-  if let Some(volume) = volume_of(&body)
-    && owner_of(volume) != state.shard
+  let owner = match &body {
+    RequestBody::Create { name, .. } => Some(owner_of_name(name, state.shards.len())),
+    other => volume_of(other).map(owner_of),
+  };
+  if let Some(owner) = owner
+    && owner != state.partition
   {
+    let Some(shard) = shard_of_partition(state, owner) else {
+      return Served::Reply(record_completion(state, id, refused(Refusal::NotFound)));
+    };
     return forward(
       state,
       client.index(),
@@ -220,7 +251,7 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       client_id,
       principal,
       body,
-      owner_of(volume),
+      shard,
     );
   }
   let reply = dispatch(state, client_id, &principal, body);
@@ -482,6 +513,13 @@ fn quota_for(state: &ShardState, size: SizeClass) -> Quota {
   }
 }
 
+fn wire_size(size: DbSizeClass) -> SizeClass {
+  match size {
+    DbSizeClass::Bounded { limit } => SizeClass::Bounded { limit },
+    DbSizeClass::Dynamic { max } => SizeClass::Dynamic { max },
+  }
+}
+
 fn db_size(size: SizeClass) -> DbSizeClass {
   match size {
     SizeClass::Bounded { limit } => DbSizeClass::Bounded { limit },
@@ -538,7 +576,7 @@ fn create(
   let record = VolumeRecord {
     id,
     name: name.to_owned(),
-    owner_shard: state.shard,
+    owner_shard: state.partition,
     policy: PolicyRecord {
       size: db_size(size),
       names: match names {
@@ -884,10 +922,9 @@ fn detach(state: &mut ShardState, principal: &Principal, attachment: u64) -> Rep
   let holds_another = state
     .db
     .partition()
-    .to_snapshot(0)
-    .attachments
+    .attachments_of(record.volume)
     .iter()
-    .any(|a| a.volume == record.volume && &a.principal == principal);
+    .any(|a| &a.principal == principal);
   let lease_is_ours = state
     .db
     .partition()
@@ -1381,4 +1418,146 @@ pub fn mark_parked(state: &ShardState, parked: bool) {
     let _ = c.end.set_parked(parked);
   }
   let _ = Ordering::Relaxed;
+}
+
+/// What recovery rebuilt on this shard (§2.6 step 2; §4.8 "replay on start").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rebuilt {
+  /// Volumes given a live tree again.
+  pub volumes: usize,
+  /// Volumes the catalog holds that could not be rebuilt (logged with the reason; a health
+  /// signal, `RECOVERY_SKIPPED`).
+  pub skipped: usize,
+  /// Snapshots the daemon's memory alone held, reconciled out of the catalog.
+  pub snapshots_dropped: usize,
+  /// Attachments reconciled out of the catalog (their clients attach again).
+  pub attachments_dropped: usize,
+}
+
+/// Rebuilds the recovered catalog's volumes into live state after a daemon start over a
+/// segment with history: each volume that is not destroyed gets a live tree again (an
+/// overlay's base re-opened from the recorded path, a scratch empty; RAM only, so what the
+/// old process held is gone: R1, D-26), its reservation taken again, and what only that
+/// process's memory held is reconciled in the log so the catalog stays true: snapshots
+/// placed nowhere but locally are destroyed and the head reset, attachments removed.
+/// Leases keep their terms (the wheel was rebuilt by recovery) and expire on their own.
+pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
+  let records: Vec<VolumeRecord> = state
+    .db
+    .partition()
+    .volumes()
+    .into_iter()
+    .filter(|v| !matches!(v.state, VolumeState::Destroying | VolumeState::Destroyed))
+    .cloned()
+    .collect();
+  let mut rebuilt = Rebuilt::default();
+  for record in &records {
+    match rebuild_volume(state, record) {
+      Ok(()) => rebuilt.volumes += 1,
+      Err(reason) => {
+        rebuilt.skipped += 1;
+        eprintln!(
+          "slates-server: partition {}: volume {} not rebuilt: {reason}",
+          state.partition, record.name
+        );
+        continue;
+      }
+    }
+    let (snapshots, attachments) = reconcile_lost(state, record);
+    rebuilt.snapshots_dropped += snapshots;
+    rebuilt.attachments_dropped += attachments;
+  }
+  rebuilt
+}
+
+/// One recovered volume's live tree, reservation and slot.
+fn rebuild_volume(state: &mut ShardState, record: &VolumeRecord) -> Result<(), String> {
+  let size = wire_size(record.policy.size);
+  let names = match record.policy.names {
+    DbNamePolicy::Exact => NamePolicy::Exact,
+    DbNamePolicy::Fold => NamePolicy::Fold,
+  };
+  let reservation = match size {
+    SizeClass::Bounded { limit } => Some(state.budget.reserve(limit).map_err(|e| e.to_string())?),
+    SizeClass::Dynamic { .. } => None,
+  };
+  let quota = quota_for(state, size);
+  let config = volume_config(state, names, quota);
+  let built = match &record.base {
+    BaseRecord::Scratch => Volume::create(&mut state.store, config)
+      .map(|v| (v, None))
+      .map_err(|e| e.to_string()),
+    BaseRecord::Path { path } => open_base(state, path, config).map_err(|reply| match *reply {
+      ReplyBody::Refused { refusal } => refusal_name(&refusal).to_owned(),
+      _ => "refused".to_owned(),
+    }),
+  };
+  let (volume, host) = match built {
+    Ok(pair) => pair,
+    Err(reason) => {
+      if let Some(r) = reservation {
+        state.budget.release(r);
+      }
+      return Err(reason);
+    }
+  };
+  let slot = VolumeSlot {
+    id: record.id,
+    volume,
+    host,
+    reservation,
+  };
+  let handle = state.volumes.insert(slot).map_err(|e| e.to_string())?;
+  state.by_id.insert(record.id, handle);
+  Ok(())
+}
+
+/// Reconciles what the old process's memory alone held: local-only snapshots (and the head
+/// they may have been) and attachments; each a recorded operation, so replay agrees.
+fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usize) {
+  let now = state.clock.monotonic_ns();
+  let lost: Vec<DbSnapshotId> = state
+    .db
+    .partition()
+    .snapshots_of(record.id)
+    .iter()
+    .filter(|s| matches!(s.placed, PlacementState::Local))
+    .map(|s| s.id)
+    .collect();
+  let mut snapshots = 0;
+  for id in &lost {
+    let op = Op::SnapshotDestroyed {
+      volume: record.id,
+      id: *id,
+    };
+    if state.db.mutate(&mut state.segment, &op, now).is_ok() {
+      snapshots += 1;
+    }
+  }
+  if lost.contains(&record.head) {
+    let op = Op::VolumeHeadAdvanced {
+      id: record.id,
+      head: DbSnapshotId::default(),
+      epoch: record.epoch.saturating_add(1),
+    };
+    let _ = state.db.mutate(&mut state.segment, &op, now);
+  }
+  let attached: Vec<u64> = state
+    .db
+    .partition()
+    .attachments_of(record.id)
+    .iter()
+    .map(|a| a.id)
+    .collect();
+  let mut attachments = 0;
+  for id in attached {
+    if state
+      .db
+      .mutate(&mut state.segment, &Op::AttachmentRemoved { id }, now)
+      .is_ok()
+    {
+      attachments += 1;
+    }
+  }
+  (snapshots, attachments)
 }

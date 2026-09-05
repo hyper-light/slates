@@ -151,15 +151,20 @@ mod platform {
   pub(super) struct Inner {
     map: MmapMut,
     fd: OwnedFd,
+    /// The object's name (macOS: what a handoff carries, known to the creator and to an
+    /// opener alike, so an attached process can hand the object on again).
     #[cfg(target_os = "macos")]
-    name: Option<String>,
+    name: String,
+    /// Whether this process created the object (macOS: the creator unlinks the name on drop).
+    #[cfg(target_os = "macos")]
+    creator: bool,
   }
 
   #[cfg(target_os = "macos")]
   impl Drop for Inner {
     fn drop(&mut self) {
-      if let Some(name) = &self.name {
-        let _ = rustix::shm::unlink(name.as_str());
+      if self.creator {
+        let _ = rustix::shm::unlink(self.name.as_str());
       }
     }
   }
@@ -196,6 +201,8 @@ mod platform {
       fd: created.fd,
       #[cfg(target_os = "macos")]
       name: created.name,
+      #[cfg(target_os = "macos")]
+      creator: true,
     })
   }
 
@@ -206,14 +213,19 @@ mod platform {
       map,
       fd,
       #[cfg(target_os = "macos")]
-      name: None,
+      name: match handoff {
+        Handoff::Name(name) => name.clone(),
+        Handoff::Descriptor(_) => String::new(),
+      },
+      #[cfg(target_os = "macos")]
+      creator: false,
     })
   }
 
   struct Created {
     fd: OwnedFd,
     #[cfg(target_os = "macos")]
-    name: Option<String>,
+    name: String,
   }
 
   #[cfg(target_os = "linux")]
@@ -278,10 +290,7 @@ mod platform {
       Mode::RUSR | Mode::WUSR,
     )
     .map_err(|e| refused("shm_open", e))?;
-    Ok(Created {
-      fd,
-      name: Some(name),
-    })
+    Ok(Created { fd, name })
   }
 
   #[cfg(target_os = "macos")]
@@ -349,14 +358,13 @@ mod platform {
     #[cfg(target_os = "macos")]
     pub(super) fn handoff(&self) -> Result<Handoff, MemError> {
       let _ = &self.fd;
-      self
-        .name
-        .clone()
-        .map(Handoff::Name)
-        .ok_or(MemError::OsRefused {
-          call: "handoff of an opened object",
+      if self.name.is_empty() {
+        return Err(MemError::OsRefused {
+          call: "handoff of an object opened without a name",
           code: None,
-        })
+        });
+      }
+      Ok(Handoff::Name(self.name.clone()))
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]

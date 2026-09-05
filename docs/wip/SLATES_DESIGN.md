@@ -1,6 +1,6 @@
 # slates — unified design and phased implementation plan
 
-Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 (the volume core, the deriver, the base plane and the landing: `slates-vfs`, `slates-base`, `slates-land`) are implemented and gated; Phase 2 is in progress (tasks 1–4, the anchor, the database, the IPC and the server: `slates-anchor`, `slates-db`, `slates-ipc`, `slates-server`; GAPS §8d); the rest is design.
+Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 (the volume core, the deriver, the base plane and the landing: `slates-vfs`, `slates-base`, `slates-land`) are implemented and gated; Phase 2 is in progress (tasks 1–5, the anchor, the database, the IPC, the server, the Rust client and the `slates` command: `slates-anchor`, `slates-db`, `slates-ipc`, `slates-server`, `slates-client`, `slates-cli`; GAPS §8d); the rest is design.
 This version integrates amendments A-1, A-2, A-4, A-5 and A-6 into the body; the amendment log at
 the end is history, and where the log and the body disagree, the body wins.
 Every decision below cites tiered evidence; every tunable is a measured derivation; every phase
@@ -474,6 +474,19 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 The health plane observes all of the above from the outside (host-observed, never self-reported
 only) and refuses to serve until every chokepoint has registered (an unregistered emitter fails
 startup).
+
+> **Status (2026-09-05).** Steps 1, 2, 3 and 5 are implemented for one host (GAPS §8d):
+> `slates anchor` measures the profile, creates the segment, publishes the profile and
+> supervises `slates daemon` as a child with the segment in its environment; the daemon
+> attaches, replays each partition, rebuilds the recovered volumes' live trees (an overlay's
+> base re-opened, a scratch empty; snapshots placed only in the dead process's memory and its
+> attachments reconciled out of the catalog as recorded operations), logs every derived
+> constant with its inputs, and publishes the rendezvous. The daemon leaves when its anchor
+> dies (the parent-death signal on Linux, a parent watch at the heartbeat cadence elsewhere,
+> a job object on Windows); the anchor kills a daemon that never beats inside the recovery
+> budget or whose heartbeat lapses, and re-derives the restart bound from the longest start it
+> measured. Step 4 (bridges) is Phase 3 and 4; step 6 Phase 8; the health plane's refusal to
+> serve before every chokepoint registers arrives with task 6's signals.
 
 ---
 
@@ -1222,6 +1235,17 @@ root-relative path if the caller allowed it.
 
 ### 4.7 IPC and the provisioning fast path (D-10)
 
+> **Status (2026-09-05).** Implemented in `crates/ipc` and `crates/server` (GAPS §8d, Phase 2
+> tasks 3–5). As built, the failure matrix's client side: a client tells a dead daemon from a
+> slow one through `Liveness` (Linux: the control socket's peer end, closed by the kernel with
+> the daemon; macOS and Windows: a start stamp in the bootstrap object's header, rewritten by
+> a restarted daemon and unreachable after a dead one), asked only after a reply has stalled
+> past the deadline; the rendezvous carries the id a reconnecting client wants (a 4-byte hello
+> on Linux; the claim slot's id field elsewhere) and the daemon honours it when no live client
+> holds it; a client's shard is its id's residue over the partitions, so a reconnect lands on
+> the partition holding its completion records. The daemon side of a dead client (the socket's
+> close, the heartbeat lapse, the reclaim) is owed to task 6 with T-2.3.
+
 **Data model.**
 ```rust
 #[repr(C, align(64))] struct Slot { seq: AtomicU64, kind: u16, len: u16, payload: [u8; 44], pad: [u8; 4] }
@@ -1613,6 +1637,16 @@ rest restores. Insufficient memory to hold a compressed copy: Refused before wor
 the format floor.
 
 ### 4.12 Agent surfaces (D-19)
+
+> **Status (2026-09-05).** The Rust client and the CLI are implemented (GAPS §8d, Phase 2
+> task 5): `crates/client` (`Client`: the rendezvous, one request in flight over the rings with
+> spin-then-park, request ids `(client id, sequence)`, the reply stalled past the derived
+> deadline and the daemon found gone making a reconnect under the same id and a resend, so
+> the retry meets its completion record; `Session` to resume from another process; every verb
+> of §4.4 typed; the grant kind has no method) and `crates/cli` (`slates anchor`, `slates
+> daemon`, `slates profile`, `volume create|list|stat|snapshot|clone|resize|destroy`,
+> `attach`, `detach`, `status [--drift]`, `base read|rewitness|pin`; `docs/cli.md`). The SDKs,
+> the MCP server, the skills and the merge verbs below are Phase 5 and 6.
 
 **Rust client.** The ring protocol, rendezvous per OS, completion fd, request ids, typed errors.
 

@@ -202,6 +202,17 @@ impl Partition {
     self.leases_by_holder.get(&holder.key()).copied()
   }
 
+  /// The attachments of a volume (a walk of the table, bounded by its cap; a detach and a
+  /// recovery ask, never a hot path).
+  pub fn attachments_of(&self, volume: VolumeId) -> Vec<&AttachmentRecord> {
+    self
+      .attachments
+      .iter()
+      .filter(|(_, a)| a.volume == volume)
+      .map(|(_, a)| a)
+      .collect()
+  }
+
   /// An attachment.
   pub fn attachment(&self, id: u64) -> Option<&AttachmentRecord> {
     let h = *self.attachment_index.get(&id.to_be_bytes())?;
