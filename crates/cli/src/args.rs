@@ -32,6 +32,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N]
   grants
   audit [--since N]
+  exec --volume V --at PATH -- CMD [ARG ...]        run CMD with the volume at PATH
 ";
 
 /// Format: the usage notes: the size grammar's examples, the instance's discovery, the exit codes.
@@ -226,9 +227,22 @@ pub(crate) struct ClientRequest {
   pub verb: Verb,
 }
 
+/// A `slates exec` request: the volume, the path to show it at, and the command to run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExecRequest {
+  /// The volume to make visible.
+  pub volume: String,
+  /// The path to make it visible at.
+  pub at: String,
+  /// The command and its arguments.
+  pub command: Vec<String>,
+}
+
 /// The parsed command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
+  /// The launcher.
+  Exec(ExecRequest),
   /// The anchor.
   Anchor(ProcessOptions),
   /// The daemon.
@@ -251,11 +265,43 @@ const VALUES: &[&str] = &[
   "--since",
   "--include",
   "--exclude",
+  "--volume",
+  "--at",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
   "--quick", "--json", "--fold", "--locked", "--read", "--write", "--drift", "--mirror",
 ];
+
+/// Parses `exec --volume V --at PATH -- CMD ...`: the flags before `--`, the command after it.
+fn parse_exec(rest: &[String]) -> Result<Command, ParseError> {
+  let split = rest.iter().position(|a| a == "--");
+  let (head, command) = match split {
+    Some(i) => (&rest[..i], rest[i + 1..].to_vec()),
+    None => return Err(ParseError::Missing("`--` then the command")),
+  };
+  if command.is_empty() {
+    return Err(ParseError::Missing("a command after `--`"));
+  }
+  let taken = take(head)?;
+  taken.only(&Spec {
+    values: &["--volume", "--at"],
+    switches: &[],
+  })?;
+  let volume = taken
+    .value("--volume")
+    .ok_or(ParseError::Missing("--volume"))?
+    .to_owned();
+  let at = taken
+    .value("--at")
+    .ok_or(ParseError::Missing("--at"))?
+    .to_owned();
+  Ok(Command::Exec(ExecRequest {
+    volume,
+    at,
+    command,
+  }))
+}
 
 /// The flags one verb takes: those with a value and the switches (the instance is every
 /// verb's).
@@ -421,6 +467,9 @@ const NONE: Spec = Spec {
 
 /// Parses the arguments (without the program name).
 pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
+  if arguments.first().map(String::as_str) == Some("exec") {
+    return parse_exec(&arguments[1..]);
+  }
   let taken = take(arguments)?;
   let words: Vec<&str> = taken.words.iter().map(String::as_str).collect();
   match words.as_slice() {
@@ -806,5 +855,32 @@ mod tests {
       Err(ParseError::Extra("extra".into()))
     );
     assert_eq!(parse(&[]), Err(ParseError::Help));
+  }
+
+  /// `exec` splits at `--`: the flags before it, the command after; a missing `--` or an empty
+  /// command is refused.
+  #[test]
+  fn exec_splits_the_flags_from_the_command() {
+    let Command::Exec(request) = parse(&args(
+      "exec --volume scratch --at /home/u/build -- cargo build --release",
+    ))
+    .unwrap() else {
+      panic!("exec");
+    };
+    assert_eq!(request.volume, "scratch");
+    assert_eq!(request.at, "/home/u/build");
+    assert_eq!(request.command, vec!["cargo", "build", "--release"]);
+    assert!(matches!(
+      parse(&args("exec --volume v --at /p cargo build")),
+      Err(ParseError::Missing("`--` then the command"))
+    ));
+    assert!(matches!(
+      parse(&args("exec --volume v --at /p --")),
+      Err(ParseError::Missing("a command after `--`"))
+    ));
+    assert!(matches!(
+      parse(&args("exec --at /p -- cmd")),
+      Err(ParseError::Missing("--volume"))
+    ));
   }
 }

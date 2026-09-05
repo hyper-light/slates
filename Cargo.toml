@@ -33,7 +33,7 @@ slates-wire-derive = { path = "crates/wire-derive", version = "0.1.0" }
 libc = "0.2"
 # The design's syscall surface (§2.4 of the IPC research): safe, I/O-safe wrappers; raw libc stays
 # only where rustix has no call (Apple sysctl, mach, IOKit).
-rustix = { version = "1", features = ["mm", "fs", "event", "process", "shm", "param", "system", "std", "pipe", "thread", "time", "net"] }
+rustix = { version = "1", features = ["mm", "fs", "event", "process", "shm", "param", "system", "std", "pipe", "thread", "time", "net", "mount"] }
 # Memory maps with a safe surface (map_anon, advise, lock, Deref to [u8]); the raw mmap calls
 # that remain are the file-backed ones in the profile segment.
 memmap2 = "0.9"

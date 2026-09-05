@@ -32,6 +32,7 @@ slates volume placed ID [--snapshot N] [--mirror]
 slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N]
 slates grants
 slates audit [--since N]
+slates exec --volume V --at PATH -- CMD [ARG ...]
 slates attach ID [--read | --write] [--snapshot N]
 slates detach ATTACHMENT
 slates status ID [--drift]

@@ -114,8 +114,33 @@ fn count_unsafe(src: &Path) -> Result<usize, Failure> {
         continue;
       }
       let code = code_only(line);
-      count += code.matches("unsafe").count();
+      count += keyword_occurrences(&code, "unsafe");
     }
   }
   Ok(count)
+}
+
+/// Counts occurrences of `word` as a whole identifier token, so a substring inside a longer
+/// identifier (for example `unsafe` inside `unshare_unsafe` or `unsafe_op_in_unsafe_fn`) does
+/// not count. A token boundary is a non-identifier character (or the string's edge).
+fn keyword_occurrences(code: &str, word: &str) -> usize {
+  let bytes = code.as_bytes();
+  let mut count = 0;
+  let mut from = 0;
+  while let Some(rel) = code[from..].find(word) {
+    let start = from + rel;
+    let end = start + word.len();
+    let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+    let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+    if before_ok && after_ok {
+      count += 1;
+    }
+    from = end;
+  }
+  count
+}
+
+/// Whether a byte can be part of a Rust identifier (so a token boundary is where it is not).
+fn is_ident_byte(b: u8) -> bool {
+  b.is_ascii_alphanumeric() || b == b'_'
 }

@@ -21,6 +21,8 @@ use std::process::ExitCode;
 mod anchor;
 mod args;
 mod daemon;
+#[cfg(target_os = "linux")]
+mod exec;
 mod format;
 mod parent;
 mod signal;
@@ -55,6 +57,7 @@ fn main() -> ExitCode {
     Command::Daemon(options) => daemon::run(&options),
     Command::Profile(options) => verbs::profile(&options),
     Command::Client(request) => verbs::run(&request),
+    Command::Exec(request) => run_exec(&request),
   };
   match outcome {
     Ok(()) => ExitCode::SUCCESS,
@@ -71,6 +74,21 @@ fn main() -> ExitCode {
       ExitCode::from(EXIT_FAILED)
     }
   }
+}
+
+/// Runs the launcher on Linux; elsewhere the namespaces it needs do not exist.
+#[cfg(target_os = "linux")]
+fn run_exec(request: &args::ExecRequest) -> Result<(), Failure> {
+  exec::run(request)
+}
+
+/// The launcher is Linux-only (user and mount namespaces); other platforms refuse it.
+#[cfg(not(target_os = "linux"))]
+fn run_exec(_request: &args::ExecRequest) -> Result<(), Failure> {
+  Err(Failure::Failed(
+    "slates exec needs Linux user and mount namespaces; it is not available on this platform"
+      .to_owned(),
+  ))
 }
 
 /// How a command ends other than well; each maps to one exit code.

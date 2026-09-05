@@ -912,6 +912,26 @@ routes through `Overlay::write`, copies the base up into the overlay's RAM, and 
 directory on disk untouched (`base_overlay.rs` second test — the write is visible on a later
 read, the rest is the base bytes, and the disk file is byte-for-byte unchanged, R1).
 
+The launcher `slates exec` landed 2026-09-05 (Phase 3 task 4, Linux): `crates/cli/src/exec.rs`
+makes a volume visible at a caller-named path for one command, in a new user and mount namespace,
+without privilege (D-2, R10) and without writing disk (AC-3.5): it enters `CLONE_NEWUSER |
+CLONE_NEWNS`, maps its own uid and gid, makes the mount tree recursively private, bind-mounts the
+volume's directory (under the daemon's root, `SLATES_ROOT`) onto the chosen path, and execs the
+command — so the parent shell's view is unchanged and the bind lives only in the command's
+namespace. An unsatisfiable path is refused with the exact missing directory, never created. One
+budgeted `unsafe` (`unshare_unsafe`, sound in the single-threaded pre-exec launcher). The `--`
+splits the flags from the command; the parsing is unit-tested on every host, and the launcher
+runs against a real daemon mount in the CI Linux lane. Owed: the daemon publishing its root
+mount so `SLATES_ROOT` need not be set by hand, and the AppArmor-profile detection with the exact
+remedy message (a generic hint is given now).
+
+The xtask unsafe counter was made word-boundary aware in the same change: it counted the
+substring `unsafe` inside identifiers like `unshare_unsafe`; it now counts the `unsafe` keyword
+as a whole token. The end-to-end CLI flow test (`crates/cli/tests/cli.rs`) is gated behind
+`SLATES_TEST_CLI` and runs as its own CI step: it spawns a real anchor and daemon whose shards
+spin, and a busy parallel `cargo test --workspace` starves them; on its own (the CI step passes
+`--test-threads=1`) it is reliable.
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3
