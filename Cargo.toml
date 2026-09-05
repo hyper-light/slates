@@ -14,6 +14,7 @@ readme = "README.md"
 [workspace.dependencies]
 slates-machine = { path = "crates/machine", version = "0.1.0" }
 slates-mem = { path = "crates/mem", version = "0.1.0" }
+slates-rt = { path = "crates/rt", version = "0.1.0" }
 
 # Third-party versions are pinned once here. Exact `=` pins only where an ABI contract is
 # version-specific, each with a comment saying why (Appendix B.1).
@@ -25,12 +26,16 @@ windows-sys = { version = "0.60", features = [
   "Win32_System_Threading",
   "Win32_System_Power",
   "Win32_System_Performance",
+  "Win32_System_IO",
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode", "frame"] }
 zstd = "0.13"
+# The io_uring syscall wrapper (tokio-rs/io-uring): thin, no reference counting in its core types;
+# the driver probes setup flags at boot and falls back to epoll (D-9).
+io-uring = "0.7"
 
 # Lints are the enforcement of Part 0's rules, not a style preference. Every crate opts in
 # with `[lints] workspace = true`. Allowed exceptions live in clippy.toml with their reason.

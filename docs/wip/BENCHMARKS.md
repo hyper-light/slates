@@ -72,3 +72,34 @@ What it means: a slab operation costs a tenth of a syscall and a buddy operation
 ring round trip is about two and a half core-to-core cache-line transfers on this machine
 (the profile's ring matrix measured 132–190 ns per pair), which is the cost floor for a
 cross-shard wake before the kick syscall (§4.3; the runtime baseline adds the kick).
+
+## Phase 0 baseline: runtime (2026-09-04)
+
+Environment: as above (Apple M5 Max, macOS 26.4.1, Rust 1.98.0, release profile); the kqueue
+driver; one shard on the calling thread unless stated. Command:
+`cargo run --release -p slates-rt --example bench` (500 ms budget per row; 95% bootstrap intervals).
+
+| Operation | Median | Interval | p99 |
+|---|---|---|---|
+| One loop step with nothing to do (drain rings, expire timers, no task) | 35 ns | [35, 35] | 35 ns |
+| Admission only (spawn a trivial task, cancel, detach) | 24 ns | [24, 25] | 43 ns |
+| Spawn a trivial task and run it to completion | 179 ns | [177, 184] | 187 ns |
+| One local wake (a task yields once and resumes) | 281 ns | [281, 281] | 302 ns |
+| A zero-timeout `kevent` (the driver's poll) | 15.1 µs | [14.4, 15.7] | 16.3 µs |
+| Timer lateness after a one-tick (100 µs) sleep, 200 runs | p50 99.8 µs | | p99 102.8 µs, max 107 µs |
+| Foreign spawn onto a shard thread and a reply over a channel (two thread hops) | 8.7 µs | [8.6, 9.3] | 12.6 µs (5.0 µs on another run) |
+
+Also proven, not timed: the same task program (children with yields, a sleep, joins in a fixed
+order, a cancel) produces an identical trace on the kqueue driver and the simulation driver
+(`crates/rt/tests/differential.rs`, AC-0.6 and AC-0.9); a lost driver cancels every task with a
+terminal completion and the shard exits; a finishing parent cancels and joins its children; two
+OS shards wake each other through the pair rings and the kick (`tests/cross_shard.rs`); 10,000
+timers with random deadlines fire in order within one tick.
+
+What it means: the shard loop's fixed cost is below a cache miss and a task's whole life is under
+two hundred nanoseconds, so the fifty-microsecond provisioning budget of §1.1 is spent elsewhere
+(the IPC and the bridge). Two measured OS facts shape Phase 1: a `kevent` poll costs fifteen
+microseconds on this macOS, so the idle loop never polls the driver when it knows nothing is
+pending (the `has_pending` seam), and a kernel timeout wake lands about one wheel tick late,
+which is what the idle-spin window of §4.3 (spin for the measured wake cost before parking) is
+for; it is a Phase 1 item once a "client active" signal exists.

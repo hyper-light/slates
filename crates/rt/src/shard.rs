@@ -1,0 +1,875 @@
+//! The shard: one thread, one task arena, one run queue, one timing wheel, one driver, and the
+//! loop that ties them (§4.3, "Loop").
+//!
+//! Each iteration: drain the inbound rings (wakes, spawns, cancels, shutdown) and the driver's
+//! completions into the run queue; expire timers; run ready tasks to their next await, at most a
+//! batch of them; then, if nothing is ready, park in the driver until a kick, a completion or the
+//! next deadline. Cancellation is a message that guarantees a terminal completion: the future is
+//! dropped at the next poll boundary, the task's children are cancelled and joined, and whoever
+//! joins it sees `Cancelled`. The watchdog counts polls that exceed the step budget derived from
+//! the measured wake cost (a step longer than a peer's wake starves the shard).
+//!
+//! Aliasing discipline (Miri-clean by construction): the shard's mutable state lives behind one
+//! borrow flag; a task is polled with its future taken out of the slot and no borrow held, so a
+//! waker, a spawn or a join called from inside the poll takes its own short borrow. A nested
+//! borrow is refused with a counter, never an aliased `&mut`.
+
+use std::cell::{Cell, UnsafeCell};
+use std::pin::Pin;
+use std::ptr::NonNull;
+use std::task::{Context, Poll};
+
+use slates_mem::{Encoded, Handle, Slab, SpscRing};
+
+use crate::driver::{Completion, Driver};
+use crate::error::RtError;
+use crate::msg::Msg;
+use crate::queue::LocalQueue;
+use crate::registry::{self, MAX_SHARDS};
+use crate::runtime::RuntimeConfig;
+use crate::task::{BoxedFuture, NO_LINK, Outcome, SpawnRequest, State, TaskSlot};
+use crate::timer::Wheel;
+use crate::waker::waker_for;
+
+/// A shard's process-wide id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ShardId(pub u16);
+
+/// A task's id: its packed word (shard, slot, generation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TaskId(pub Encoded);
+
+impl TaskId {
+  /// The owning shard.
+  pub fn shard(&self) -> ShardId {
+    ShardId(self.0.shard())
+  }
+}
+
+/// What one loop iteration did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StepOutcome {
+  /// Whether any message, timer or task was processed.
+  pub did_work: bool,
+  /// The next timer deadline, in the driver's nanoseconds.
+  pub next_deadline_ns: Option<u64>,
+  /// Whether the shard finished its shutdown and left the loop.
+  pub exit: bool,
+}
+
+/// The shard's counters (the tripwires of GAPS §7 read them).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counters {
+  /// Loop iterations.
+  pub steps: u64,
+  /// Task polls.
+  pub polls: u64,
+  /// Polls longer than the step budget.
+  pub long_steps: u64,
+  /// The longest poll, in nanoseconds.
+  pub longest_step_ns: u64,
+  /// Tasks admitted.
+  pub spawns: u64,
+  /// Tasks whose future returned.
+  pub completed: u64,
+  /// Tasks whose future was dropped.
+  pub cancelled: u64,
+  /// Wakes that arrived over a shard-pair ring.
+  pub wakes_pair: u64,
+  /// Wakes that arrived over the foreign ring.
+  pub wakes_foreign: u64,
+  /// Wakes whose generation no longer matched.
+  pub stale_wakes: u64,
+  /// Timers fired.
+  pub timers_fired: u64,
+  /// Driver waits.
+  pub waits: u64,
+  /// Driver completions delivered.
+  pub completions: u64,
+  /// Times the driver was lost.
+  pub driver_lost: u64,
+  /// Driver errors other than loss.
+  pub driver_errors: u64,
+  /// Refused nested borrows (a bug signal).
+  pub nested_borrows: u64,
+  /// Admissions refused because the arena was full.
+  pub admission_refused: u64,
+}
+
+/// The mutable state behind the borrow flag.
+pub struct ShardInner {
+  arena: Slab<TaskSlot>,
+  timers: Wheel,
+  driver: Box<dyn Driver>,
+  config: RuntimeConfig,
+  counters: Counters,
+  shutting_down: bool,
+  fired: Vec<u64>,
+  completions: Vec<Completion>,
+}
+
+/// The shard's context: what its thread, its wakers and its tasks see.
+pub struct ShardContext {
+  /// The shard id.
+  pub id: u16,
+  /// The local run queue.
+  pub local: LocalQueue,
+  outbound: Vec<Option<NonNull<SpscRing<u64>>>>,
+  inbound: Vec<NonNull<SpscRing<u64>>>,
+  current_task: Cell<Option<u32>>,
+  borrowed: Cell<bool>,
+  exited: Cell<bool>,
+  pair_full_events: Cell<u64>,
+  inner: UnsafeCell<ShardInner>,
+}
+
+// SAFETY: a context is built on one thread and then used only by the shard's own thread; the
+// runtime moves it there before any use, and the registry hands other threads only the kick and
+// the ring pointers, both designed for that.
+unsafe impl Send for ShardContext {}
+
+impl std::fmt::Debug for ShardContext {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ShardContext")
+      .field("id", &self.id)
+      .finish()
+  }
+}
+
+impl ShardContext {
+  /// Builds a shard over `driver`, registering it in the process registry.
+  pub fn new(
+    config: &RuntimeConfig,
+    driver: Box<dyn Driver>,
+  ) -> Result<Box<ShardContext>, RtError> {
+    let id = registry::register(config.ring_entries, driver.kick_handle())?;
+    let mut arena = Slab::new(
+      config.tasks_per_shard.min(config.segment_tasks()),
+      config.tasks_per_shard,
+    );
+    arena.reserve_segments(
+      config
+        .tasks_per_shard
+        .div_ceil(config.segment_tasks().max(1)),
+    );
+    let timers = Wheel::new(
+      config.timer_tick_ns,
+      config.timers_per_shard,
+      driver.now_ns(),
+    );
+    Ok(Box::new(ShardContext {
+      id,
+      local: LocalQueue::new(config.tasks_per_shard),
+      outbound: vec![None; MAX_SHARDS],
+      inbound: Vec::new(),
+      current_task: Cell::new(None),
+      borrowed: Cell::new(false),
+      exited: Cell::new(false),
+      pair_full_events: Cell::new(0),
+      inner: UnsafeCell::new(ShardInner {
+        arena,
+        timers,
+        driver,
+        config: config.clone(),
+        counters: Counters::default(),
+        shutting_down: false,
+        fired: Vec::with_capacity(config.timers_per_shard),
+        completions: Vec::with_capacity(config.ring_entries),
+      }),
+    }))
+  }
+
+  /// Connects the single-producer ring this shard sends on to `target`.
+  pub(crate) fn set_outbound(&mut self, target: u16, ring: NonNull<SpscRing<u64>>) {
+    if let Some(slot) = self.outbound.get_mut(usize::from(target)) {
+      *slot = Some(ring);
+    }
+  }
+
+  /// Connects the single-producer ring this shard receives on from `source`.
+  pub(crate) fn set_inbound(&mut self, _source: u16, ring: NonNull<SpscRing<u64>>) {
+    self.inbound.push(ring);
+  }
+
+  /// Runs `f` with the mutable state, or refuses a nested borrow.
+  pub fn with_inner<R>(&self, f: impl FnOnce(&mut ShardInner) -> R) -> Option<R> {
+    if self.borrowed.replace(true) {
+      return None;
+    }
+    // SAFETY: the flag guarantees this is the only live reference; the context is used by one
+    // thread.
+    let inner = unsafe { &mut *self.inner.get() };
+    let r = f(inner);
+    self.borrowed.set(false);
+    Some(r)
+  }
+
+  /// Whether the shard left its loop.
+  pub fn exited(&self) -> bool {
+    self.exited.get()
+  }
+
+  /// The task being polled on this shard right now.
+  pub fn current_task(&self) -> Option<TaskId> {
+    let slot = self.current_task.get()?;
+    let generation = self
+      .with_inner(|inner| inner.arena.generation_at(slot))
+      .flatten()?;
+    Encoded::pack(self.id, slot, generation).map(TaskId)
+  }
+
+  /// The counters.
+  pub fn counters(&self) -> Counters {
+    let mut c = self.with_inner(|inner| inner.counters).unwrap_or_default();
+    c.nested_borrows = c
+      .nested_borrows
+      .max(self.with_inner(|i| i.counters.nested_borrows).unwrap_or(0));
+    c
+  }
+
+  /// The driver's clock.
+  pub fn now_ns(&self) -> u64 {
+    self.with_inner(|inner| inner.driver.now_ns()).unwrap_or(0)
+  }
+
+  /// Times a shard-pair ring was full and the sender spun.
+  pub fn pair_full_events(&self) -> u64 {
+    self.pair_full_events.get()
+  }
+
+  /// Sends a word to `target` over the pair ring, if one exists; kicks the target.
+  pub fn send_to(&self, target: u16, word: u64) -> bool {
+    let Some(Some(ring)) = self.outbound.get(usize::from(target)) else {
+      return false;
+    };
+    // SAFETY: pair rings are leaked for the process; this shard is the ring's only producer.
+    let ring = unsafe { ring.as_ref() };
+    let (mut producer, _) = ring.split();
+    let mut pending = word;
+    loop {
+      match producer.push(pending) {
+        Ok(()) => break,
+        Err(back) => {
+          pending = back;
+          self.pair_full_events.set(self.pair_full_events.get() + 1);
+          if let Some(entry) = registry::entry(target) {
+            entry.kick.kick();
+          }
+          std::thread::yield_now();
+        }
+      }
+    }
+    if let Some(entry) = registry::entry(target) {
+      entry.kick.kick();
+    }
+    true
+  }
+
+  // ------------------------------------------------------------------ admission
+
+  /// Admits a spawn request (from any thread's message, or the runtime): detached.
+  pub fn spawn_request(&self, request: SpawnRequest) -> Result<TaskId, RtError> {
+    let SpawnRequest { future, parent } = request;
+    let parent = parent.filter(|p| p.shard() == self.id).map(|p| p.slot());
+    self.admit(future, parent, false)
+  }
+
+  /// Admits a local future under `parent`, joinable.
+  pub fn spawn_local(&self, future: BoxedFuture, parent: Option<u32>) -> Result<TaskId, RtError> {
+    self.admit(future, parent, true)
+  }
+
+  fn admit(
+    &self,
+    future: BoxedFuture,
+    parent: Option<u32>,
+    joinable: bool,
+  ) -> Result<TaskId, RtError> {
+    let id = self
+      .with_inner(|inner| -> Result<TaskId, RtError> {
+        let handle = match inner.arena.insert(TaskSlot::new(future, parent, joinable)) {
+          Ok(h) => h,
+          Err(slates_mem::MemError::SlabFull { capacity }) => {
+            inner.counters.admission_refused += 1;
+            return Err(RtError::TooManyTasks { capacity });
+          }
+          Err(e) => return Err(RtError::Mem(e)),
+        };
+        let slot = handle.index();
+        if let Some(p) = parent {
+          link_child(&mut inner.arena, p, slot);
+        }
+        if let Ok(task) = inner.arena.get_mut(handle) {
+          task.state = State::Queued;
+        }
+        inner.counters.spawns += 1;
+        Encoded::pack(self.id, slot, handle.generation())
+          .map(TaskId)
+          .ok_or(RtError::TooManyTasks {
+            capacity: inner.config.tasks_per_shard,
+          })
+      })
+      .ok_or(RtError::NotOnShardThread)??;
+    self.local.push(id.0.slot());
+    Ok(id)
+  }
+
+  /// Requests cancellation; the task terminates at its next poll boundary.
+  pub fn cancel(&self, id: TaskId) -> Result<(), RtError> {
+    let handle = handle_of(id);
+    self
+      .with_inner(|inner| -> Result<(), RtError> {
+        let task = inner.arena.get_mut(handle).map_err(|_| stale(id))?;
+        task.cancel_requested = true;
+        Ok(())
+      })
+      .ok_or(RtError::NotOnShardThread)??;
+    self.local.push(id.0.slot());
+    Ok(())
+  }
+
+  /// Marks a joinable task detached: its slot is reaped at termination (or now, if terminal).
+  pub fn detach(&self, id: TaskId) -> Result<(), RtError> {
+    let handle = handle_of(id);
+    self
+      .with_inner(|inner| -> Result<(), RtError> {
+        let task = inner.arena.get_mut(handle).map_err(|_| stale(id))?;
+        task.joinable = false;
+        if task.is_done() {
+          let parent = task.parent;
+          if let Some(p) = parent {
+            unlink_child(&mut inner.arena, p, id.0.slot());
+          }
+          let _ = inner.arena.remove(handle);
+        }
+        Ok(())
+      })
+      .ok_or(RtError::NotOnShardThread)?
+  }
+
+  /// Polls a join: `Ready(outcome)` once the task is terminal (its slot is reaped then), else
+  /// `Pending` with `waker` recorded.
+  pub fn poll_join(&self, id: TaskId, waker: &std::task::Waker) -> Poll<Result<Outcome, RtError>> {
+    let handle = handle_of(id);
+    self
+      .with_inner(|inner| match inner.arena.get_mut(handle) {
+        Err(_) => Poll::Ready(Err(stale(id))),
+        Ok(task) if task.is_done() => {
+          let outcome = task.outcome.unwrap_or(Outcome::Cancelled);
+          let parent = task.parent;
+          if let Some(p) = parent {
+            unlink_child(&mut inner.arena, p, id.0.slot());
+          }
+          let _ = inner.arena.remove(handle);
+          Poll::Ready(Ok(outcome))
+        }
+        Ok(task) => {
+          task.join_waker = Some(waker.clone());
+          Poll::Pending
+        }
+      })
+      .unwrap_or(Poll::Ready(Err(RtError::NotOnShardThread)))
+  }
+
+  /// Arms a timer for `word` at `deadline_ns`.
+  pub fn arm_timer(&self, deadline_ns: u64, word: u64) -> Result<crate::timer::TimerId, RtError> {
+    self
+      .with_inner(|inner| inner.timers.insert(deadline_ns, word))
+      .ok_or(RtError::NotOnShardThread)?
+  }
+
+  /// Disarms a timer.
+  pub fn disarm_timer(&self, id: crate::timer::TimerId) -> Result<(), RtError> {
+    self
+      .with_inner(|inner| inner.timers.cancel(id))
+      .ok_or(RtError::NotOnShardThread)?
+  }
+
+  /// Live tasks in the arena.
+  pub fn live_tasks(&self) -> usize {
+    self.with_inner(|inner| inner.arena.len()).unwrap_or(0)
+  }
+
+  // ------------------------------------------------------------------ the loop
+
+  /// Runs the loop on the calling thread until shutdown completes.
+  pub fn run(&self) {
+    registry::set_current(Some(NonNull::from(self)));
+    loop {
+      let outcome = self.step();
+      if outcome.exit {
+        break;
+      }
+      if !outcome.did_work {
+        self.park(outcome.next_deadline_ns);
+      }
+    }
+    registry::set_current(None);
+    self.exited.set(true);
+  }
+
+  /// Steps until no task, timer or message is pending, parking for timers as needed; returns
+  /// when the shard is idle or has exited.
+  pub fn run_until_idle(&self) {
+    registry::set_current(Some(NonNull::from(self)));
+    loop {
+      let outcome = self.step();
+      if outcome.exit {
+        self.exited.set(true);
+        break;
+      }
+      if outcome.did_work {
+        continue;
+      }
+      match outcome.next_deadline_ns {
+        Some(deadline) => self.park(Some(deadline)),
+        None => {
+          let pending = self
+            .with_inner(|inner| inner.driver.has_pending())
+            .unwrap_or(false);
+          if !pending {
+            break;
+          }
+          self.park(Some(self.now_ns()));
+          if !self.step().did_work {
+            break;
+          }
+        }
+      }
+    }
+    registry::set_current(None);
+  }
+
+  /// One loop iteration without blocking.
+  pub fn step(&self) -> StepOutcome {
+    if self.exited.get() {
+      return StepOutcome {
+        did_work: false,
+        next_deadline_ns: None,
+        exit: true,
+      };
+    }
+    registry::set_current(Some(NonNull::from(self)));
+    let mut did_work = false;
+    let drained = self.with_inner(|inner| {
+      inner.counters.steps += 1;
+      let mut work = self.drain_inbound(inner);
+      work |= self.expire_timers(inner);
+      work
+    });
+    did_work |= drained.unwrap_or(false);
+    let ready = self.local.take_ready();
+    let batch = self
+      .with_inner(|inner| inner.config.batch)
+      .unwrap_or(ready.len())
+      .max(1);
+    for (i, slot) in ready.iter().enumerate() {
+      if i < batch {
+        did_work = true;
+        self.poll_slot(*slot);
+      } else {
+        self.local.clear_pending(*slot);
+        self.local.push(*slot);
+      }
+    }
+    self.local.finish_drain(ready);
+    let (exit, next_deadline_ns) = self
+      .with_inner(|inner| {
+        (
+          inner.shutting_down && inner.arena.is_empty(),
+          inner.timers.next_deadline_ns(),
+        )
+      })
+      .unwrap_or((false, None));
+    if exit {
+      self.exited.set(true);
+    }
+    StepOutcome {
+      did_work,
+      next_deadline_ns,
+      exit,
+    }
+  }
+
+  /// Parks in the driver until a kick, a completion or `deadline_ns`.
+  pub fn park(&self, deadline_ns: Option<u64>) {
+    let lost = self
+      .with_inner(|inner| {
+        inner.counters.waits += 1;
+        let timeout = deadline_ns.map(|d| d.saturating_sub(inner.driver.now_ns()));
+        let mut completions = std::mem::take(&mut inner.completions);
+        let result = inner.driver.wait(timeout, &mut completions);
+        for c in completions.drain(..) {
+          inner.counters.completions += 1;
+          self.local.push(Encoded::from_word(c.user_data).slot());
+        }
+        inner.completions = completions;
+        match result {
+          Ok(()) => false,
+          Err(RtError::DriverLost) => {
+            inner.counters.driver_lost += 1;
+            true
+          }
+          Err(_) => {
+            inner.counters.driver_errors += 1;
+            false
+          }
+        }
+      })
+      .unwrap_or(false);
+    if lost {
+      self.fail_all();
+    }
+  }
+
+  /// Cancels every task with a terminal completion and exits: the driver is gone.
+  fn fail_all(&self) {
+    self.with_inner(|inner| {
+      inner.shutting_down = true;
+      cancel_all(&mut inner.arena, &self.local);
+    });
+    let mut bound = self.live_tasks().saturating_mul(2).saturating_add(1);
+    while !self.exited.get() && bound > 0 {
+      let outcome = self.step();
+      bound -= 1;
+      if outcome.exit {
+        break;
+      }
+    }
+    self.exited.set(true);
+  }
+
+  fn drain_inbound(&self, inner: &mut ShardInner) -> bool {
+    let mut any = false;
+    let batch = inner.config.batch.max(1);
+    if let Some(entry) = registry::entry(self.id) {
+      let mut consumer = entry.inbound.consumer();
+      for _ in 0..batch {
+        let Some(word) = consumer.pop() else { break };
+        any = true;
+        inner.counters.wakes_foreign += 1;
+        // SAFETY: every word in an inbound ring came from `Msg::into_word` and is unpacked once.
+        self.handle_msg(inner, unsafe { Msg::from_word(word) });
+      }
+    }
+    for ring in &self.inbound {
+      // SAFETY: pair rings are leaked for the process; this shard is the ring's only consumer.
+      let ring = unsafe { ring.as_ref() };
+      let (_, mut consumer) = ring.split();
+      for _ in 0..batch {
+        let Some(word) = consumer.pop() else { break };
+        any = true;
+        inner.counters.wakes_pair += 1;
+        // SAFETY: as above.
+        self.handle_msg(inner, unsafe { Msg::from_word(word) });
+      }
+    }
+    any
+  }
+
+  fn handle_msg(&self, inner: &mut ShardInner, msg: Msg) {
+    match msg {
+      Msg::Wake(word) => {
+        if inner
+          .arena
+          .generation_at(word.slot())
+          .is_some_and(|g| g & GENERATION_MASK == word.generation())
+        {
+          self.local.push(word.slot());
+        } else {
+          inner.counters.stale_wakes += 1;
+        }
+      }
+      Msg::Spawn(request) => {
+        let SpawnRequest { future, parent } = *request;
+        let parent = parent.filter(|p| p.shard() == self.id).map(|p| p.slot());
+        match inner.arena.insert(TaskSlot::new(future, parent, false)) {
+          Ok(handle) => {
+            if let Some(p) = parent {
+              link_child(&mut inner.arena, p, handle.index());
+            }
+            if let Ok(task) = inner.arena.get_mut(handle) {
+              task.state = State::Queued;
+            }
+            inner.counters.spawns += 1;
+            self.local.push(handle.index());
+          }
+          Err(_) => inner.counters.admission_refused += 1,
+        }
+      }
+      Msg::Cancel(word) => {
+        if let Ok(task) = inner
+          .arena
+          .get_mut(Handle::from_raw(word.slot(), word.generation()))
+        {
+          task.cancel_requested = true;
+          self.local.push(word.slot());
+        }
+      }
+      Msg::Shutdown => {
+        inner.shutting_down = true;
+        cancel_all(&mut inner.arena, &self.local);
+      }
+    }
+  }
+
+  fn expire_timers(&self, inner: &mut ShardInner) -> bool {
+    let now = inner.driver.now_ns();
+    let mut fired = std::mem::take(&mut inner.fired);
+    inner.timers.advance(now, &mut fired);
+    let any = !fired.is_empty();
+    for word in fired.drain(..) {
+      inner.counters.timers_fired += 1;
+      self.local.push(Encoded::from_word(word).slot());
+    }
+    inner.fired = fired;
+    any
+  }
+
+  fn poll_slot(&self, slot: u32) {
+    self.local.clear_pending(slot);
+    let taken = self.with_inner(|inner| take_future(inner, slot)).flatten();
+    let Some((mut future, generation, cancelled)) = taken else {
+      return;
+    };
+    if cancelled {
+      // The future is dropped outside any borrow: destructors may wake other tasks.
+      drop(future);
+      self.with_inner(|inner| finish(inner, &self.local, slot, Outcome::Cancelled));
+      return;
+    }
+    let word = Encoded::pack(self.id, slot, generation).unwrap_or(Encoded::from_word(0));
+    let waker = waker_for(word);
+    let mut cx = Context::from_waker(&waker);
+    self.current_task.set(Some(slot));
+    let start = self.now_ns();
+    let poll = future.as_mut().poll(&mut cx);
+    let elapsed = self.now_ns().saturating_sub(start);
+    self.current_task.set(None);
+    let done = matches!(poll, Poll::Ready(()));
+    let dropped =
+      self.with_inner(|inner| after_poll(inner, &self.local, slot, future, elapsed, done));
+    drop(dropped);
+  }
+}
+
+impl ShardInner {
+  /// Entries per inbound ring.
+  pub fn ring_entries(&self) -> usize {
+    self.config.ring_entries
+  }
+}
+
+/// Format: the generation bits an inbound wake carries (the low 24 of the slot's 32).
+const GENERATION_MASK: u32 = (1 << 24) - 1;
+
+fn handle_of(id: TaskId) -> Handle<TaskSlot> {
+  Handle::from_raw(id.0.slot(), id.0.generation())
+}
+
+fn stale(id: TaskId) -> RtError {
+  RtError::StaleTask {
+    slot: id.0.slot(),
+    generation: id.0.generation(),
+  }
+}
+
+fn handle_at(arena: &Slab<TaskSlot>, slot: u32) -> Option<Handle<TaskSlot>> {
+  arena.generation_at(slot).map(|g| Handle::from_raw(slot, g))
+}
+
+/// Takes the future out of a live slot: `(future, generation, cancelled)`.
+fn take_future(inner: &mut ShardInner, slot: u32) -> Option<(BoxedFuture, u32, bool)> {
+  let handle = handle_at(&inner.arena, slot)?;
+  let task = inner.arena.get_mut(handle).ok()?;
+  if matches!(task.state, State::Finishing | State::Done | State::Running) {
+    return None;
+  }
+  let future = task.future.take()?;
+  if task.cancel_requested {
+    task.state = State::Finishing;
+    return Some((future, handle.generation(), true));
+  }
+  task.state = State::Running;
+  Some((future, handle.generation(), false))
+}
+
+/// Records the poll and either stores the future back or finishes the task; returns a future to
+/// drop outside the borrow, if any.
+fn after_poll(
+  inner: &mut ShardInner,
+  local: &LocalQueue,
+  slot: u32,
+  future: BoxedFuture,
+  elapsed: u64,
+  done: bool,
+) -> Option<BoxedFuture> {
+  let budget = inner.config.step_budget_ns;
+  inner.counters.polls += 1;
+  if elapsed > budget {
+    inner.counters.long_steps += 1;
+  }
+  inner.counters.longest_step_ns = inner.counters.longest_step_ns.max(elapsed);
+  let Some(handle) = handle_at(&inner.arena, slot) else {
+    return Some(future);
+  };
+  let Ok(task) = inner.arena.get_mut(handle) else {
+    return Some(future);
+  };
+  task.polls += 1;
+  if elapsed > budget {
+    task.long_steps += 1;
+  }
+  task.longest_step_ns = task.longest_step_ns.max(elapsed);
+  if done {
+    finish(inner, local, slot, Outcome::Completed);
+    return Some(future);
+  }
+  if task.cancel_requested {
+    finish(inner, local, slot, Outcome::Cancelled);
+    return Some(future);
+  }
+  task.future = Some(future);
+  task.state = State::Idle;
+  None
+}
+
+/// Moves a task to `Finishing`, joins its children (cancelling the live ones, reaping the done
+/// ones), and completes it when none is live.
+fn finish(inner: &mut ShardInner, local: &LocalQueue, slot: u32, outcome: Outcome) {
+  let Some(handle) = handle_at(&inner.arena, slot) else {
+    return;
+  };
+  let (children, first_child) = match inner.arena.get_mut(handle) {
+    Ok(task) => {
+      task.state = State::Finishing;
+      task.outcome = Some(outcome);
+      task.future = None;
+      (task.children, task.first_child)
+    }
+    Err(_) => return,
+  };
+  match outcome {
+    Outcome::Completed => inner.counters.completed += 1,
+    Outcome::Cancelled => inner.counters.cancelled += 1,
+  }
+  let mut child = first_child;
+  while child != NO_LINK {
+    let Some(child_handle) = handle_at(&inner.arena, child) else {
+      break;
+    };
+    let (next, done) = match inner.arena.get_mut(child_handle) {
+      Ok(task) => {
+        task.joinable = false;
+        task.cancel_requested = true;
+        (task.next_sibling, task.is_done())
+      }
+      Err(_) => (NO_LINK, false),
+    };
+    if done {
+      unlink_child(&mut inner.arena, slot, child);
+      let _ = inner.arena.remove(child_handle);
+    } else {
+      local.push(child);
+    }
+    child = next;
+  }
+  if children == 0 {
+    complete(inner, slot);
+  }
+}
+
+/// Marks a task terminal, wakes its joiner, unlinks it from its parent, reaps it if detached, and
+/// completes the parent if it was waiting on this child.
+fn complete(inner: &mut ShardInner, slot: u32) {
+  let mut current = Some(slot);
+  while let Some(slot) = current {
+    current = None;
+    let Some(handle) = handle_at(&inner.arena, slot) else {
+      break;
+    };
+    let (parent, joinable, joiner) = match inner.arena.get_mut(handle) {
+      Ok(task) => {
+        task.state = State::Done;
+        (task.parent, task.joinable, task.join_waker.take())
+      }
+      Err(_) => break,
+    };
+    if let Some(waker) = joiner {
+      waker.wake();
+    }
+    if let Some(p) = parent {
+      // A joinable task keeps its parent link until it is joined or its parent finishes, so the
+      // parent can reap it; a detached one leaves the list now.
+      if !joinable {
+        unlink_child(&mut inner.arena, p, slot);
+      }
+      if let Some(parent_task) =
+        handle_at(&inner.arena, p).and_then(|h| inner.arena.get_mut(h).ok())
+      {
+        parent_task.children = parent_task.children.saturating_sub(1);
+        if parent_task.state == State::Finishing && parent_task.children == 0 {
+          current = Some(p);
+        }
+      }
+    }
+    if !joinable {
+      let _ = inner.arena.remove(handle);
+    }
+  }
+}
+
+fn cancel_all(arena: &mut Slab<TaskSlot>, local: &LocalQueue) {
+  let slots: Vec<u32> = arena.iter().map(|(h, _)| h.index()).collect();
+  for slot in slots {
+    if let Some(task) = handle_at(arena, slot).and_then(|h| arena.get_mut(h).ok()) {
+      task.cancel_requested = true;
+    }
+    local.push(slot);
+  }
+}
+
+fn link_child(arena: &mut Slab<TaskSlot>, parent: u32, child: u32) {
+  let old_first = match handle_at(arena, parent).and_then(|h| arena.get_mut(h).ok()) {
+    Some(p) => {
+      let old = p.first_child;
+      p.first_child = child;
+      p.children = p.children.saturating_add(1);
+      old
+    }
+    None => return,
+  };
+  if let Some(c) = handle_at(arena, child).and_then(|h| arena.get_mut(h).ok()) {
+    c.next_sibling = old_first;
+    c.prev_sibling = NO_LINK;
+  }
+  if old_first != NO_LINK
+    && let Some(next) = handle_at(arena, old_first).and_then(|h| arena.get_mut(h).ok())
+  {
+    next.prev_sibling = child;
+  }
+}
+
+fn unlink_child(arena: &mut Slab<TaskSlot>, parent: u32, child: u32) {
+  let (prev, next) = match handle_at(arena, child).and_then(|h| arena.get_mut(h).ok()) {
+    Some(c) => (c.prev_sibling, c.next_sibling),
+    None => return,
+  };
+  if prev == NO_LINK {
+    if let Some(p) = handle_at(arena, parent).and_then(|h| arena.get_mut(h).ok()) {
+      p.first_child = next;
+    }
+  } else if let Some(pv) = handle_at(arena, prev).and_then(|h| arena.get_mut(h).ok()) {
+    pv.next_sibling = next;
+  }
+  if next != NO_LINK
+    && let Some(nx) = handle_at(arena, next).and_then(|h| arena.get_mut(h).ok())
+  {
+    nx.prev_sibling = prev;
+  }
+}
+
+/// Pins a boxed future for admission.
+pub fn boxed<F: std::future::Future<Output = ()> + 'static>(future: F) -> BoxedFuture {
+  Box::pin(future) as Pin<Box<dyn std::future::Future<Output = ()>>>
+}

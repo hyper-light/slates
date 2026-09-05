@@ -131,6 +131,15 @@ impl<T> Slab<T> {
     }
   }
 
+  /// The current generation of a slot by index (occupied or vacant), for structures that link
+  /// slots by index and rebuild the handle to check liveness; `None` beyond the slots created.
+  pub fn generation_at(&self, index: u32) -> Option<u32> {
+    self
+      .slots
+      .get(usize::try_from(index).unwrap_or(usize::MAX))
+      .map(|slot| slot.generation)
+  }
+
   /// Whether the handle is live.
   pub fn contains(&self, handle: Handle<T>) -> bool {
     self.get(handle).is_ok()

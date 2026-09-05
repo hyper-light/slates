@@ -557,6 +557,12 @@ pub fn corpus(len: usize) -> Vec<u8> {
   out
 }
 
+/// Pins the calling thread to `core` where the OS pins (Linux, Windows), hints where it only
+/// hints (macOS), and reports which.
+pub fn pin_current_thread(core: u32) -> Pinning {
+  platform::pin_current(core)
+}
+
 /// Queries the lock capacity: the OS's stated limit, confirmed with one small lock.
 pub fn lock_capacity(facts: &Facts) -> LockCapacity {
   platform::lock_capacity(facts)

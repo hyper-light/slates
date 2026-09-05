@@ -21,6 +21,12 @@ pub struct Handle<T> {
 }
 
 impl<T> Handle<T> {
+  /// Rebuilds a handle from its parts, for structures that link slots by index and carry the
+  /// generation beside the index; the slab still refuses a stale one.
+  pub const fn from_raw(index: u32, generation: u32) -> Self {
+    Self::new(index, generation)
+  }
+
   /// Builds a handle; slabs are the only callers.
   pub(crate) const fn new(index: u32, generation: u32) -> Self {
     Self {

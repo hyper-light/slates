@@ -7,9 +7,10 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
 ## 0. The one global fact
 
 - Phase 0 is in progress (2026-09-04): the workspace exists with the lint wall, the structural
-  test and the literal check (`cargo xtask check`), and `slates-machine` measures the boot profile
-  (BENCHMARKS.md records the first baseline). No other crate exists; nothing below is closed by
-  code until its phase says so.
+  test and the literal check (`cargo xtask check`); `slates-machine` measures the boot profile,
+  `slates-mem` holds the arenas, slabs, handles and rings, and `slates-rt` runs the executor on
+  kqueue, epoll or io_uring, IOCP and the simulation (BENCHMARKS.md records the baselines).
+  `slates-wire` is next; nothing below is closed by code until its phase says so.
 
 ## 1. Component inventory
 
@@ -127,6 +128,24 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
 - C toolchains for `zstd-sys` on all nine targets.
 - The merge engine (A-5) depends on nothing external: fixed-layer ops documents use `slates-wire`; the fleet parts use the consensus group already chosen. Read directly from hecate on 2026-09-04: `MERGE.md`, ADR-0003, ADR-0005, `SERVING.md` §2-§4, `VFS.md` §5, `CONSENSUS.md` §6; hecate's own contradiction on the deriver (`SERVING.md`/`VFS.md` diff versus `MERGE.md` never-diff) is recorded in `research/merge-engine.md` §2 and resolved for never-diff.
 - Base and landing primitives (A-4): Linux filesystems with `RENAME_EXCHANGE` and `O_TMPFILE` (ext4, XFS, Btrfs, tmpfs; others fall back); `openat2` (5.6, under the floor); FUSE passthrough only with `CAP_SYS_ADMIN` (6.9+); macOS `RENAME_SWAP` and `clonefile` by volume capability (APFS); Windows 10 1607+ NTFS for POSIX-semantics rename; ReFS for block clone. Items marked "verify" in `research/disk-source-of-truth.md` §7 (batched `statx`, `NtQueryDirectoryFile` classes, `FlushFileBuffers` on directories, fanotify marks, reparse-tag checks, the timestamp-granularity table, `FSCTL_SET_SPARSE`, `F_PREALLOCATE`) are owed verification in Phase 1 and Phase 4.
+
+## 8a. Phase 0 audits (task 6)
+
+- compio (audited 2026-09-04 from its `master` sources): `compio-runtime` holds `Rc<Executor>`,
+  `Rc<RefCell<Proactor>>` and `Rc<RefCell<TimerRuntime>>`, and is a thread-local runtime that a
+  user assembles into thread-per-core; `compio-driver` stores every operation in a
+  `ThinCell<RawOp<dyn Carry>>` (a reference-counted cell, one heap allocation per operation) and
+  hands out `std::task::Waker`s from the proactor. That is a reference count and an allocation on
+  the request path, which D-8 forbids, and there is no seam for FUSE-over-io_uring or our rings.
+  Result: not adopted; the custom executor of `crates/rt` is the plan of record. Re-check per
+  release only if compio publishes an allocation-free operation path.
+- `LocalWaker` on Rust 1.98.0: still nightly-only (`local_waker`, #118959). The executor uses
+  `Waker` with a vtable that is thread-safe by construction over a `Copy` word; `clone` and `drop`
+  are no-ops, so nothing is lost. Revisit when it stabilizes (a `ContextBuilder` change only).
+- io-uring crate 0.7.14 (tokio-rs): thin syscall wrapper, no reference counting in its core types;
+  adopted for the Linux driver with the probe-and-fall-back sequence of D-9.
+- Miri: ships only with nightly, which this machine does not have; CI's `miri-and-loom` lane runs
+  it on nightly for `slates-mem` (and `rt`, `wire` as they land). Local runs are loom-only.
 
 ## 9. Blocking order toward first light
 
