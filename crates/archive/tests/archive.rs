@@ -218,3 +218,65 @@ fn incompressible_data_stays_raw() {
   assert_eq!(chunk.stored_len, chunk.raw_len);
   assert_eq!(Archive::content(&chunk).expect("decodes"), raw);
 }
+
+/// Highly compressible data is stored zstd (smaller than raw), round-trips through `content` and
+/// through the whole-archive encode/decode, and decodes to the original bytes.
+#[cfg(feature = "zstd")]
+#[test]
+fn compressible_data_is_stored_zstd() {
+  let raw = vec![0x41u8; 1000];
+  let chunk = Archive::zstd_chunk(raw.clone());
+  assert_eq!(chunk.encoding, Encoding::Zstd);
+  assert!(
+    chunk.stored_len < chunk.raw_len,
+    "zstd shrinks a repetitive blob"
+  );
+  assert_eq!(Archive::content(&chunk).expect("decodes"), raw);
+
+  let archive = Archive {
+    base_page_size: 4096,
+    chunk_min: 4096,
+    chunk_max: 65_536,
+    created_unix: 0,
+    volume_id: 1,
+    snapshot_id: 1,
+    name_policy_id: 1,
+    unicode_version: 15,
+    manifest: Node::Directory(Vec::new()),
+    chunks: vec![chunk],
+  };
+  let decoded = Archive::decode(&archive.encode()).expect("a valid zstd archive decodes");
+  assert_eq!(decoded, archive);
+  assert_eq!(Archive::content(&decoded.chunks[0]).expect("decodes"), raw);
+}
+
+/// Incompressible (tiny, unique) data stays raw under zstd too (the format floor).
+#[cfg(feature = "zstd")]
+#[test]
+fn incompressible_data_stays_raw_under_zstd() {
+  let raw = b"xyz".to_vec();
+  let chunk = Archive::zstd_chunk(raw.clone());
+  assert_eq!(chunk.encoding, Encoding::Raw);
+  assert_eq!(Archive::content(&chunk).expect("decodes"), raw);
+}
+
+/// On structured, larger data zstd reaches a smaller stored size than LZ4 (its ratio advantage,
+/// D-17), a non-vacuity check that the zstd path is really compressing.
+#[cfg(feature = "zstd")]
+#[test]
+fn zstd_beats_lz4_on_structured_data() {
+  let mut raw = Vec::new();
+  for i in 0..4000u32 {
+    raw.extend_from_slice(format!("line {} of a structured document\n", i % 97).as_bytes());
+  }
+  let lz4 = Archive::compressed_chunk(raw.clone());
+  let zstd = Archive::zstd_chunk(raw.clone());
+  assert_eq!(zstd.encoding, Encoding::Zstd);
+  assert!(
+    zstd.stored_len < lz4.stored_len,
+    "zstd ({}) beats lz4 ({}) on structured data",
+    zstd.stored_len,
+    lz4.stored_len
+  );
+  assert_eq!(Archive::content(&zstd).expect("decodes"), raw);
+}

@@ -127,9 +127,33 @@ impl Archive {
     }
   }
 
+  /// A chunk record compressed with zstd (D-17's ratio-bearing codec), kept only when it is smaller
+  /// than the raw bytes (the format-derived floor); otherwise stored raw. The identity is always the
+  /// BLAKE3 of the raw bytes. Level 0 selects zstd's default level; the calibrated per-chunk level
+  /// and the LZ4-vs-zstd-vs-raw cost model are the rest of the codec pass (owed; GAPS §8g, they need
+  /// the boot profile so R3 forbids fixing them here). Behind the `zstd` feature (on by default).
+  #[cfg(feature = "zstd")]
+  pub fn zstd_chunk(bytes: Vec<u8>) -> Chunk {
+    let identity = hash_of(&bytes);
+    let raw_len = bytes.len() as u64;
+    // Format: zstd level 0 is the library's default level; the cost model chooses the real level.
+    match zstd::bulk::compress(&bytes, 0) {
+      Ok(compressed) if (compressed.len() as u64) < raw_len => Chunk {
+        identity,
+        raw_len,
+        stored_len: compressed.len() as u64,
+        encoding: Encoding::Zstd,
+        level: 0,
+        dictionary: [0u8; 32],
+        payload: compressed,
+      },
+      _ => Self::raw_chunk(bytes),
+    }
+  }
+
   /// The chunk's raw content, decoding the payload by its encoding. A raw chunk returns its bytes;
-  /// an LZ4 chunk is decompressed to its declared raw length. A payload that will not decode, or
-  /// whose decoded content fails the chunk's identity, is a typed refusal.
+  /// an LZ4 or zstd chunk is decompressed to its declared raw length. A payload that will not
+  /// decode, or whose decoded content fails the chunk's identity, is a typed refusal.
   pub fn content(chunk: &Chunk) -> Result<Vec<u8>, ArchiveError> {
     let bytes = decode_payload(chunk, 0)?;
     if hash_of(&bytes) != chunk.identity {
@@ -429,6 +453,22 @@ fn decode_payload(chunk: &Chunk, index: u64) -> Result<Vec<u8>, ArchiveError> {
       lz4_flex::block::decompress(&chunk.payload, raw_len)
         .map_err(|_| ArchiveError::BadPayload { index })
     }
-    Encoding::Zstd => Err(ArchiveError::BadPayload { index }),
+    Encoding::Zstd => decode_zstd(chunk, index),
   }
+}
+
+/// Decodes a zstd chunk to its declared raw length. With the `zstd` feature (default) this is the
+/// C-backed decoder; without it (a target with no C toolchain, e.g. the cross-compile lint gate)
+/// zstd content cannot be decoded here and is a typed refusal — the `ruzstd` decode-only fallback is
+/// owed (GAPS §8g).
+#[cfg(feature = "zstd")]
+fn decode_zstd(chunk: &Chunk, index: u64) -> Result<Vec<u8>, ArchiveError> {
+  let raw_len = usize::try_from(chunk.raw_len).unwrap_or(usize::MAX);
+  zstd::bulk::decompress(&chunk.payload, raw_len).map_err(|_| ArchiveError::BadPayload { index })
+}
+
+/// Without the `zstd` feature, a zstd chunk cannot be decoded (owed `ruzstd` fallback).
+#[cfg(not(feature = "zstd"))]
+fn decode_zstd(_chunk: &Chunk, index: u64) -> Result<Vec<u8>, ArchiveError> {
+  Err(ArchiveError::BadPayload { index })
 }

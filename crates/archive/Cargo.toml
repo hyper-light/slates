@@ -11,6 +11,15 @@ description = "The archive format (D-17, §4.16 archive, research/compression-ar
 [dependencies]
 blake3 = { workspace = true }
 lz4_flex = { workspace = true }
+# zstd is the C-backed ratio codec (D-17). It is a default feature so native builds use it, but the
+# cross-compile lint gate runs `--no-default-features` and so does not need a C cross-toolchain for
+# the Windows/Linux targets; a `ruzstd` decode-only fallback for those builds is owed (GAPS §8g).
+zstd = { workspace = true, optional = true }
+
+[features]
+default = ["zstd"]
+# The zstd codec (encode and decode); off on targets without a C toolchain.
+zstd = ["dep:zstd"]
 
 [dev-dependencies]
 proptest = { workspace = true }

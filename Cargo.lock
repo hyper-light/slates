@@ -669,6 +669,7 @@ dependencies = [
  "blake3",
  "lz4_flex",
  "proptest",
+ "zstd",
 ]
 
 [[package]]
