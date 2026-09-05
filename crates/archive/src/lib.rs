@@ -14,18 +14,22 @@
 //! `std::fs`, no `std::net`, no `unsafe`.
 //!
 //! The crate also holds the content-addressed store with deduplication ([`store::ContentStore`]),
-//! the pure core of the runtime's per-shard content index.
+//! the pure core of the runtime's per-shard content index, and the manifest tree
+//! ([`manifest::Node`]), the archive's canonical, sorted, Merkle-hashed directory tree.
 //!
-//! Scope: raw- and LZ4-encoded chunks and an opaque manifest blob. The rest of the codec pass
-//! (zstd with static contexts, dictionaries, the calibrated cost model, FastCDC), the identity
-//! pass, and the manifest tree's structure are later Phase 7 work (owed); the format reserves
-//! their fields, so an archive written then is readable now.
+//! Scope: raw- and LZ4-encoded chunks, the manifest tree ([`manifest::Node`]), and the dedup
+//! store. The rest of the codec pass (zstd with static contexts, dictionaries, the calibrated
+//! cost model, FastCDC), the background identity pass, embedding the manifest tree in the archive
+//! container (which still stores an opaque manifest blob), and export/restore are later Phase 7
+//! work (owed).
 
 pub mod archive;
 pub mod format;
+pub mod manifest;
 pub mod store;
 pub mod wire;
 
 pub use archive::Archive;
 pub use format::{ArchiveError, Chunk, Encoding};
+pub use manifest::{Entry, Extent, ManifestError, Node};
 pub use store::ContentStore;
