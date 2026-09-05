@@ -18,9 +18,11 @@
 //! increment's base version, the verdict is `Accept` with no range work — what a fresh basis
 //! buys, and it never decides a conflict.
 
+pub mod ops_doc;
 pub mod range;
 pub mod verdict;
 
+pub use ops_doc::{Op, OpKind, OpsDoc, PathTable};
 pub use range::{Range, RangeSet};
 pub use verdict::{
   MergeConflictClass, PathVerdict, Verdict, compare_bytes, fast_path, path_verdict,

@@ -8,5 +8,8 @@ rust-version.workspace = true
 readme.workspace = true
 description = "The merge engine (D-27, §4.16): the deterministic two-pass verdict over declared operations — accept, accept-identical, or a byte-exact conflict, never an inferred merge (Phase 6)."
 
+[dependencies]
+blake3 = { workspace = true }
+
 [lints]
 workspace = true

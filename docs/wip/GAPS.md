@@ -955,8 +955,11 @@ M-matrix as range cases): disjoint accepts, no-intervening-change accepts, overl
 containment conflict, an identical span becomes a candidate that pass two resolves to
 identical-or-conflict, an insert inside a change conflicts while one at the edge accepts, two
 inserts at one point are resolved by pass two, every structural class is returned directly, and
-the fast path accepts an untouched basis. Owed (the rest of Phase 6): declared operations and
-the deriver (compose the journal into a net op set, never a diff), the canonical deltas and
+the fast path accepts an untouched basis.
+
+The ops document — the canonical serialization of an increment's declared operations, whose BLAKE3 is half the increment's identity (§4.16 "Data model", "its identity is the test") — landed the same day (`ops_doc.rs`). It is the fixed op kinds (§4.16 `OpKind`, wire values 0–14; `from_wire` reads them off the kinds' own list, so no arm is a bare number), a per-document path table that interns paths in insertion order while building and sorts them canonically at `canonicalize` (remapping every op's path index), and one fixed little-endian record per operation (kind, flags, path index, offset, length, source offset). Bytes are never in the document; content an operation adds is named by a source offset into the post-state chunks the splice resolves later. `encode` is a sequential writer, never a struct transmute, so no host-dependent padding enters; `identity` is the BLAKE3 of that encoding. Gated (`crates/merge/tests/ops_doc.rs`, 5 tests, every host): the same operations declared in different orders produce byte-identical encodings and one identity (the determinism gate), encoding is stable and the identity is its hash, different work has a different identity, every op kind round-trips through its wire value, and interning is stable while canonicalize sorts the table and remaps the ops. A caller canonicalizes before taking the identity; the deriver's terminal step will, and that property is what the determinism test pins.
+
+Owed (the rest of Phase 6): the deriver (compose the journal into a net op set, never a diff, emitting these ops), the canonical deltas and
 position mapping through (base, head] with checkpoints, the splice by extent surgery, the green
 chain and the fenced ledger register, and holder recomputation in a fleet; these build on the
 green-volume data model (§4.5's journal is in place; the version chain is not yet).
