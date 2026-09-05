@@ -100,6 +100,32 @@ fn create_snapshot_clone(client: &mut Client) -> slates_client::VolumeId {
   id
 }
 
+/// The register at f=0 (§4.8 task 7): the head is placed on the local append, the host epoch
+/// is the first, no mirror exists; `await placed(region)` returns and the mirror is refused.
+fn assert_register_at_f0(
+  client: &mut Client,
+  id: slates_client::VolumeId,
+  report: &slates_client::StatusReport,
+) {
+  assert!(report.placed.region, "the head is placed at f=0");
+  assert_eq!(report.placed.host_epoch, 1);
+  assert_eq!(report.placed.mirror_age_ns, None);
+  assert_eq!(
+    client
+      .await_placed(id, None, slates_client::Scope::Region)
+      .unwrap(),
+    (true, None),
+    "await placed(region) is the local append"
+  );
+  assert_eq!(
+    client.await_placed(id, None, slates_client::Scope::Mirror),
+    Err(slates_client::ClientError::Refused(Refusal::Unsupported {
+      feature: "mirror".to_owned()
+    })),
+    "no mirror on a laptop"
+  );
+}
+
 /// Attach for writing takes the lease; status shows it; detach releases it.
 fn attach_status_detach(client: &mut Client, id: slates_client::VolumeId) {
   let attached = client.attach(id, None, Intent::Write).unwrap();
@@ -108,6 +134,7 @@ fn attach_status_detach(client: &mut Client, id: slates_client::VolumeId) {
   assert_eq!(report.name, "one");
   assert_eq!(report.attachments, 1);
   assert_eq!(report.snapshots, 1);
+  assert_register_at_f0(client, id, &report);
   wait_until_listed(client, &["one", "one-clone"]);
   client.detach(attached.attachment).unwrap();
   assert_eq!(client.status(id).unwrap().lease_epoch, None);

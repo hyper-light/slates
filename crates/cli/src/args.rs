@@ -21,6 +21,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   volume clone ID SNAPSHOT NAME
   volume resize ID (--bounded SIZE | --dynamic MAX)
   volume destroy ID
+  volume placed ID [--snapshot N] [--mirror]         await a durability scope
   attach ID [--read | --write] [--snapshot N]
   detach ATTACHMENT
   status                                           the daemon's status
@@ -126,6 +127,15 @@ pub(crate) enum Verb {
     /// The volume.
     volume: slates_client::VolumeId,
   },
+  /// Await a durability scope (`volume placed`).
+  Placed {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// A snapshot, or the head when none.
+    snapshot: Option<slates_client::SnapshotId>,
+    /// The scope.
+    scope: slates_client::Scope,
+  },
   /// Clone.
   Clone {
     /// The volume.
@@ -217,7 +227,7 @@ const VALUES: &[&str] = &[
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
-  "--quick", "--json", "--fold", "--locked", "--read", "--write", "--drift",
+  "--quick", "--json", "--fold", "--locked", "--read", "--write", "--drift", "--mirror",
 ];
 
 /// The flags one verb takes: those with a value and the switches (the instance is every
@@ -552,6 +562,26 @@ fn parse_volume(taken: &Taken, words: &[&str]) -> Result<Command, ParseError> {
         },
       ))
     }
+    ["placed", id] => {
+      taken.only(&Spec {
+        values: &["--snapshot"],
+        switches: &["--mirror"],
+      })?;
+      let snapshot = taken.value("--snapshot").map(snapshot).transpose()?;
+      let scope = if taken.switch("--mirror") {
+        slates_client::Scope::Mirror
+      } else {
+        slates_client::Scope::Region
+      };
+      Ok(client(
+        taken,
+        Verb::Placed {
+          volume: volume(id)?,
+          snapshot,
+          scope,
+        },
+      ))
+    }
     ["destroy", id] => {
       taken.only(&NONE)?;
       Ok(client(
@@ -561,12 +591,14 @@ fn parse_volume(taken: &Taken, words: &[&str]) -> Result<Command, ParseError> {
         },
       ))
     }
-    ["stat" | "snapshot" | "resize" | "destroy"] => Err(ParseError::Missing("volume ID")),
+    ["stat" | "snapshot" | "resize" | "destroy" | "placed"] => {
+      Err(ParseError::Missing("volume ID"))
+    }
     ["clone", ..] => Err(ParseError::Missing("ID SNAPSHOT NAME")),
     [sub, rest @ ..]
       if matches!(
         *sub,
-        "create" | "list" | "stat" | "snapshot" | "resize" | "destroy"
+        "create" | "list" | "stat" | "snapshot" | "resize" | "destroy" | "placed"
       ) =>
     {
       Err(ParseError::Extra(

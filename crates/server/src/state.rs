@@ -76,6 +76,9 @@ pub struct ShardState {
   pub segment: AnchorSegment,
   /// The partition.
   pub db: Db,
+  /// The register configuration (§4.8): the owner host, its epoch, its neighbourhood and
+  /// the quorum; `Configuration::solo` at `f = 0`, the same type a fleet uses.
+  pub config_register: slates_db::Configuration,
   /// The store.
   pub store: Store,
   /// The volumes.

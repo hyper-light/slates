@@ -131,6 +131,22 @@ fn snapshot_clone_stat(instance: &str, id: &str) {
   assert_eq!(value_of(&out, "snapshots"), "1");
 }
 
+/// The register at f=0 (task 7): the head is placed on the local append, the host epoch is 1,
+/// no mirror; `volume placed` awaits the region, and the mirror is refused.
+fn placement_at_f0(instance: &str, id: &str) {
+  let (code, out, _) = run(instance, &["volume", "stat", id]);
+  assert_eq!(code, 0);
+  assert_eq!(value_of(&out, "placed"), "true");
+  assert_eq!(value_of(&out, "host_epoch"), "1");
+  assert_eq!(value_of(&out, "mirror_age_ns"), "none");
+  let (code, out, _) = run(instance, &["volume", "placed", id]);
+  assert_eq!(code, 0);
+  assert_eq!(value_of(&out, "placed"), "true");
+  let (code, _, err) = run(instance, &["volume", "placed", id, "--mirror"]);
+  assert_eq!(code, 1, "no mirror on a laptop: {err}");
+  assert!(err.contains("Unsupported"), "{err}");
+}
+
 /// attach for writing, the volume's status, detach.
 fn attach_status_detach(instance: &str, id: &str) {
   let (code, out, _) = run(instance, &["attach", id, "--write"]);
@@ -143,8 +159,8 @@ fn attach_status_detach(instance: &str, id: &str) {
   let (code, out, _) = run(instance, &["status", id, "--drift"]);
   assert_eq!(code, 0);
   assert!(out.is_empty(), "a scratch volume drifts nowhere: {out:?}");
-  let (code, _, _) = run(instance, &["detach", &attachment]);
-  assert_eq!(code, 0);
+  let (code, _, err) = run(instance, &["detach", &attachment]);
+  assert_eq!(code, 0, "detach: {err}");
 }
 
 /// The daemon's own status: the daemon's lines and one block per shard.
@@ -196,6 +212,7 @@ fn the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_th
   let anchor = start_anchor(&instance);
   let id = create_and_list(&instance);
   snapshot_clone_stat(&instance, &id);
+  placement_at_f0(&instance, &id);
   attach_status_detach(&instance, &id);
   daemon_status(&instance);
   resize_destroy_and_refusals(&instance, &id);

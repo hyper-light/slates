@@ -3,8 +3,8 @@
 use std::time::Instant;
 
 use slates_ipc::protocol::{
-  DaemonReport, Direction, Intent, NamePolicy, ReplyBody, RequestBody, SizeClass, SnapshotId,
-  StatusReport, VolumeId, VolumeSummary, pack, unpack,
+  DaemonReport, Direction, Intent, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass,
+  SnapshotId, StatusReport, VolumeId, VolumeSummary, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect_as};
 use slates_machine::{Derived, derived};
@@ -439,6 +439,30 @@ impl Client {
       ReplyBody::DaemonStatus { report } => Ok(report),
       _ => Err(ClientError::UnexpectedReply {
         verb: "daemon_status",
+      }),
+    }
+  }
+
+  /// Awaits a durability scope for a volume's head, or a snapshot (§4.8 D-18): the region
+  /// commit returns whether the head is placed (true at `f = 0`, the local append); the
+  /// mirror is refused `Unsupported` where none exists. Returns `(placed, mirror_age_ns)`.
+  pub fn await_placed(
+    &mut self,
+    volume: VolumeId,
+    snapshot: Option<SnapshotId>,
+    scope: Scope,
+  ) -> Result<(bool, Option<u64>), ClientError> {
+    match self.call(&RequestBody::AwaitPlaced {
+      volume,
+      snapshot,
+      scope,
+    })? {
+      ReplyBody::Placed {
+        placed,
+        mirror_age_ns,
+      } => Ok((placed, mirror_age_ns)),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "await_placed",
       }),
     }
   }

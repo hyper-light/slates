@@ -49,6 +49,15 @@ pub enum NamePolicy {
   Fold,
 }
 
+/// The durability scope of `await placed` (§4.8 D-18): the owner's region, or the mirror.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+  /// The home region: `f + 1` of the owner's candidates (the local append at `f = 0`).
+  Region,
+  /// The mirror region (absent at `f = 0`, refused `Unsupported`).
+  Mirror,
+}
+
 /// What a client attaches for.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Intent {
@@ -156,6 +165,17 @@ pub enum RequestBody {
   /// The daemon's own status (§4.14 `slates.status`: every shard's counters and health
   /// signals, and the anchor's view of the daemon as the segment holds it).
   DaemonStatus,
+  /// Await a durability scope for a volume's head, or a snapshot (§4.8 D-18): returns when the
+  /// scope is placed. At `f = 0` the region is the local append (already placed) and the
+  /// mirror is refused `Unsupported`.
+  AwaitPlaced {
+    /// The volume.
+    volume: VolumeId,
+    /// A snapshot, or the head when none.
+    snapshot: Option<SnapshotId>,
+    /// The scope.
+    scope: Scope,
+  },
 }
 
 /// A health signal (§4.14): a value and how old it is.
@@ -239,6 +259,19 @@ pub struct VolumeSummary {
   pub overlay: bool,
 }
 
+/// A volume's placement (§4.8, D-18): every reply carries it from the first version, so the
+/// fleet parts of Phase 8 change no interface. At `f = 0` a volume's head is placed the moment
+/// the owner holds it and the mirror does not exist.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlacedState {
+  /// Whether the head is placed in the region (`f + 1` regional acknowledgements).
+  pub region: bool,
+  /// The age of the newest record the mirror acknowledged, or nothing where no mirror exists.
+  pub mirror_age_ns: Option<u64>,
+  /// The owner's host epoch (its authority; 1 on a laptop).
+  pub host_epoch: u64,
+}
+
 /// A volume's status (§4.4 `status`).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct StatusReport {
@@ -262,6 +295,8 @@ pub struct StatusReport {
   pub watcher: String,
   /// Snapshots held.
   pub snapshots: u32,
+  /// The placement of the head (§4.8, D-18).
+  pub placed: PlacedState,
 }
 
 /// The closed refusal taxonomy on the wire (§4.4, §4.13).
@@ -407,6 +442,13 @@ pub enum ReplyBody {
   DaemonStatus {
     /// The report.
     report: DaemonReport,
+  },
+  /// The awaited scope's placement.
+  Placed {
+    /// Whether the scope is placed.
+    placed: bool,
+    /// The mirror's lag, for a mirror scope.
+    mirror_age_ns: Option<u64>,
   },
 }
 

@@ -71,6 +71,15 @@ fn serve(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
     Verb::Snapshot { volume } => {
       println!("snapshot: {}", client.snapshot(*volume)?.value);
     }
+    Verb::Placed {
+      volume,
+      snapshot,
+      scope,
+    } => {
+      let (placed, mirror_age_ns) = client.await_placed(*volume, *snapshot, *scope)?;
+      println!("placed: {placed}");
+      println!("mirror_age_ns: {}", option_text(mirror_age_ns));
+    }
     Verb::Clone {
       volume,
       snapshot,
@@ -156,6 +165,11 @@ fn status_text(report: &StatusReport) -> String {
     report.snapshots,
     report.watcher,
     report.drifted.len()
+  ) + &format!(
+    "placed: {}\nmirror_age_ns: {}\nhost_epoch: {}\n",
+    report.placed.region,
+    option_text(report.placed.mirror_age_ns),
+    report.placed.host_epoch
   )
 }
 

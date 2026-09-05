@@ -6,6 +6,7 @@
 use std::sync::atomic::Ordering;
 
 use slates_base::OsHost;
+use slates_db::DurabilityScope;
 use slates_db::Op;
 use slates_db::catalog::{
   AccessEntry, AttachForm, AttachmentRecord, BaseRecord, CompletionRecord, Consumer, LeaseRecord,
@@ -14,8 +15,9 @@ use slates_db::catalog::{
   VolumeRecord, VolumeState,
 };
 use slates_ipc::protocol::{
-  DaemonReport, Direction, Intent, NamePolicy, Refusal, RefusalCount, ReplyBody, RequestBody,
-  ShardReport, Signal, SizeClass, SnapshotId, StatusReport, VolumeId, VolumeSummary, pack, unpack,
+  DaemonReport, Direction, Intent, NamePolicy, PlacedState, Refusal, RefusalCount, ReplyBody,
+  RequestBody, Scope, ShardReport, Signal, SizeClass, SnapshotId, StatusReport, VolumeId,
+  VolumeSummary, pack, unpack,
 };
 use slates_ipc::slot::SlotKind;
 use slates_ipc::{IpcError, Request};
@@ -164,6 +166,21 @@ fn shard_of_partition(state: &ShardState, partition: u16) -> Option<u16> {
   state.shards.get(usize::from(partition)).copied()
 }
 
+/// Format: an attachment id carries its owner partition in the high 16 bits and a per-partition
+/// counter below, so a detach routes to the partition that holds the record (§4.8 "Lookup":
+/// ids route to owners, no global index).
+const ATTACHMENT_PARTITION_SHIFT: u64 = 48;
+
+/// The attachment id for a counter on `partition`.
+fn attachment_id(partition: u16, counter: u64) -> u64 {
+  (u64::from(partition) << ATTACHMENT_PARTITION_SHIFT) | counter
+}
+
+/// The partition that owns an attachment id.
+pub fn owner_of_attachment(id: u64) -> u16 {
+  u16::try_from(id >> ATTACHMENT_PARTITION_SHIFT).unwrap_or(0)
+}
+
 /// The volume a request is about, when it is about one.
 fn volume_of(body: &RequestBody) -> Option<VolumeId> {
   match body {
@@ -175,7 +192,8 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::Status { volume }
     | RequestBody::ReadBase { volume, .. }
     | RequestBody::Rewitness { volume, .. }
-    | RequestBody::Pin { volume, .. } => Some(*volume),
+    | RequestBody::Pin { volume, .. }
+    | RequestBody::AwaitPlaced { volume, .. } => Some(*volume),
     RequestBody::Create { .. }
     | RequestBody::Detach { .. }
     | RequestBody::List
@@ -240,6 +258,7 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   }
   let owner = match &body {
     RequestBody::Create { name, .. } => Some(owner_of_name(name, state.shards.len())),
+    RequestBody::Detach { attachment } => Some(owner_of_attachment(*attachment)),
     other => volume_of(other).map(owner_of),
   };
   if let Some(owner) = owner
@@ -798,6 +817,11 @@ fn dispatch(
       let mine = shard_report(state);
       daemon_report(state, vec![mine])
     }
+    RequestBody::AwaitPlaced {
+      volume,
+      snapshot,
+      scope,
+    } => await_placed(state, principal, volume, snapshot, scope),
     RequestBody::Acknowledge { up_to } => acknowledge(state, client_id, up_to),
     RequestBody::ReadBase { volume, path } => read_base(state, principal, volume, &path),
     RequestBody::Rewitness { volume, paths } => {
@@ -1064,7 +1088,7 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
         volume: record.id,
         epoch: record.epoch.saturating_add(1),
         identity: None,
-        placed: PlacementState::Local,
+        placed: placement_of(state, to_db_snapshot(id)),
         taken_ns: now,
       },
     },
@@ -1239,7 +1263,7 @@ fn attach(
       Some(epoch)
     }
   };
-  let attachment = state.next_attachment;
+  let attachment = attachment_id(state.partition, state.next_attachment);
   state.next_attachment += 1;
   let op = Op::AttachmentAdded {
     record: AttachmentRecord {
@@ -1487,7 +1511,88 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       drifted,
       watcher,
       snapshots: u32::try_from(slot.volume.snapshot_count()).unwrap_or(u32::MAX),
+      placed: placed_state(state, record.id, record.head),
     },
+  }
+}
+
+/// The placement of a snapshot as the register configuration computes it: at `f = 0` the
+/// owner alone, committed on the local append (§4.8 "Laptop degenerate").
+fn placement_of(state: &ShardState, snapshot: DbSnapshotId) -> PlacementState {
+  let placement = state.config_register.place(snapshot.value);
+  if state.config_register.region_placed(&placement) {
+    PlacementState::Placed {
+      region: placement.acked.iter().map(|h| h.0).collect(),
+      mirror: None,
+    }
+  } else {
+    PlacementState::Local
+  }
+}
+
+/// A volume's head placement for a status reply (§4.8, D-18): whether the head is placed in
+/// the region, the mirror's lag (none at `f = 0`), and the owner's host epoch.
+fn placed_state(state: &ShardState, volume: DbVolumeId, head: DbSnapshotId) -> PlacedState {
+  let region = if head == DbSnapshotId::default() {
+    // No snapshot yet: the catalog register itself is locally committed, so at `f = 0` the
+    // head is placed (nothing to replicate until a seal).
+    let object = u64::from_be_bytes([
+      volume.bytes[0],
+      volume.bytes[1],
+      volume.bytes[2],
+      volume.bytes[3],
+      volume.bytes[4],
+      volume.bytes[5],
+      volume.bytes[6],
+      volume.bytes[7],
+    ]);
+    state
+      .config_register
+      .region_placed(&state.config_register.place(object))
+  } else {
+    match state.db.partition().snapshot(volume, head) {
+      Some(record) => matches!(record.placed, PlacementState::Placed { .. }),
+      None => false,
+    }
+  };
+  PlacedState {
+    region,
+    mirror_age_ns: None,
+    host_epoch: state.config_register.host_epoch.0,
+  }
+}
+
+/// Awaits a durability scope for a volume's head (or a snapshot): at `f = 0` the region is the
+/// local append (already placed) and the mirror is refused `Unsupported` (§4.8 D-18).
+fn await_placed(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  snapshot: Option<SnapshotId>,
+  scope: Scope,
+) -> ReplyBody {
+  let (_, record) = match find(state, volume) {
+    Ok(x) => x,
+    Err(r) => return *r,
+  };
+  if !rights_of(&record, principal).read {
+    return forbidden("await_placed");
+  }
+  let target = snapshot.map_or(record.head, to_db_snapshot);
+  let placement = state.config_register.place(target.value);
+  let db_scope = match scope {
+    Scope::Region => DurabilityScope::Region,
+    Scope::Mirror => DurabilityScope::Mirror,
+  };
+  match state.config_register.await_placed(db_scope, &placement) {
+    Ok(placed) => ReplyBody::Placed {
+      placed,
+      mirror_age_ns: None,
+    },
+    Err(slates_db::register::RegisterError::Unsupported { .. }) => refused(Refusal::Unsupported {
+      feature: "mirror".to_owned(),
+    }),
+    Err(_) => refused(Refusal::NotFound),
   }
 }
 

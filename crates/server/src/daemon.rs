@@ -189,6 +189,14 @@ impl Drop for Daemon {
   }
 }
 
+/// The node's host id: the first eight bytes of the machine identity's hash.
+fn host_id_of(identity: &Identity) -> u64 {
+  let hash = identity.hash();
+  u64::from_le_bytes([
+    hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+  ])
+}
+
 fn handoff_of(env: &[(String, String)]) -> Result<(Handoff, usize), ServerError> {
   let handoff = env
     .iter()
@@ -247,12 +255,18 @@ fn init_shard(
     ["reserve_per_shard", "clients_per_shard"]
   );
   let shard = registry::current_shard().unwrap_or(partition);
+  // The node's host id: the machine identity's hash, stable across restarts, distinct per
+  // machine, so a recorded holder set and a volume id's creator-host bits mean the same
+  // thing when Phase 8 adds peers. One host, `f = 0`, on a laptop.
+  let host = slates_db::HostId(host_id_of(identity));
+  let config_register = slates_db::Configuration::solo(host);
   let mut state = ShardState {
     shard,
     partition,
     config: config.clone(),
     segment,
     db,
+    config_register,
     store,
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),
     by_id: std::collections::BTreeMap::new(),

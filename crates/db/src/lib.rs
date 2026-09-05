@@ -26,10 +26,12 @@ pub mod error;
 pub mod op;
 pub mod partition;
 pub mod record;
+pub mod register;
 pub mod replay;
 
 pub use art::Art;
 pub use error::DbError;
 pub use op::Op;
 pub use partition::Partition;
+pub use register::{Configuration, DurabilityScope, Fence, HostEpoch, HostId, Placement, Quorum};
 pub use replay::{Db, Recovered, SnapshotPolicy};
