@@ -15,14 +15,18 @@
 //! four-byte aligned, bounds-checked), [`rpc`] (ONC RPC, RFC 1057/5531 — record marking over TCP,
 //! the call and reply messages, and the `AUTH_NONE` credential the loopback server uses), and
 //! [`nfs`] (the NFSv3 core data types of RFC 1813 — status codes, file types, times, attributes and
-//! file handles), and [`handle`] (slates' private encoding of a volume object's durable identity into an opaque file handle: `(volume, inode, gen)`).
+//! file handles), and [`handle`] (slates' private encoding of a volume object's durable identity into an opaque file handle: `(volume, inode, gen)`). [`mount`] (the NFSv3 MOUNT protocol, RFC 1813 Appendix I — the `MNT` request and the `mountres3` reply that hands a client the export's root handle) and [`portmap`] (the minimal portmap responder, RFC 1833) are the two helper RPC programs the server answers alongside NFS.
 
 pub mod handle;
+pub mod mount;
 pub mod nfs;
+pub mod portmap;
 pub mod rpc;
 pub mod xdr;
 
 pub use handle::{FileHandle, FileHandleError};
+pub use mount::{MountReply, Mountstat3};
 pub use nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3};
+pub use portmap::Mapping;
 pub use rpc::{AcceptStatus, RpcCall, RpcError, read_record, reply_bytes, write_record};
 pub use xdr::{XdrError, XdrReader, XdrWriter};
