@@ -71,6 +71,8 @@ slates-client = 0
 slates-cli = 4
 slates-wire = 4
 slates-bridge-fuse = 0
+# slates-bridge-nfs (0): the XDR/RPC codec is bounds-checked byte slices; the socket uses safe std::net.
+slates-bridge-nfs = 0
 slates-merge = 0
 slates-archive = 0
 slates-wire-derive = 0

@@ -1,0 +1,14 @@
+[package]
+name = "slates-bridge-nfs"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The macOS NFSv3 loopback bridge (the FSKit fallback and differential oracle): the XDR and ONC RPC wire codec, the NFSv3, MOUNT and portmap procedures, a TCP loopback listener, and the driver that turns RPC calls into shard operations (design §4.6, D-2; Phase 4)."
+
+[dependencies]
+
+[lints]
+workspace = true

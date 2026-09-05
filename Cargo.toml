@@ -24,6 +24,7 @@ slates-db = { path = "crates/db", version = "0.1.0" }
 slates-ipc = { path = "crates/ipc", version = "0.1.0" }
 slates-server = { path = "crates/server", version = "0.1.0" }
 slates-bridge-fuse = { path = "crates/bridge-fuse", version = "0.1.0" }
+slates-bridge-nfs = { path = "crates/bridge-nfs", version = "0.1.0" }
 slates-merge = { path = "crates/merge", version = "0.1.0" }
 slates-client = { path = "crates/client", version = "0.1.0" }
 slates-cli = { path = "crates/cli", version = "0.1.0" }
