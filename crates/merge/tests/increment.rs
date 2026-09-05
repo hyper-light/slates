@@ -513,6 +513,7 @@ fn removing_a_base_directory_is_one_rmdir() {
     modes: Vec::new(),
     symlinks: Vec::new(),
     xattrs: Vec::new(),
+    hardlinks: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -553,6 +554,7 @@ fn removing_then_recreating_a_base_directory_is_nothing() {
     modes: Vec::new(),
     symlinks: Vec::new(),
     xattrs: Vec::new(),
+    hardlinks: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -598,6 +600,7 @@ fn mkdir_over_a_base_directory_refuses() {
     modes: Vec::new(),
     symlinks: Vec::new(),
     xattrs: Vec::new(),
+    hardlinks: Vec::new(),
   };
   assert!(matches!(
     compose_volume(
@@ -667,6 +670,7 @@ proptest! {
       modes: Vec::new(),
       symlinks: Vec::new(),
       xattrs: Vec::new(),
+      hardlinks: Vec::new(),
     };
     let doc = compose_volume(&base, &journal).expect("a valid directory journal composes");
     // Reconstruct: start from the base directories, apply the document's Mkdir/Rmdir.
@@ -694,6 +698,7 @@ fn setting_a_base_file_mode_is_one_set_mode() {
     modes: vec![("f".to_owned(), 0o644)],
     symlinks: Vec::new(),
     xattrs: Vec::new(),
+    hardlinks: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -721,6 +726,7 @@ fn setting_a_mode_to_the_base_mode_is_nothing() {
     modes: vec![("f".to_owned(), 0o644)],
     symlinks: Vec::new(),
     xattrs: Vec::new(),
+    hardlinks: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -742,6 +748,7 @@ fn the_last_set_mode_wins() {
     modes: vec![("f".to_owned(), 0o644)],
     symlinks: Vec::new(),
     xattrs: Vec::new(),
+    hardlinks: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -774,6 +781,7 @@ fn setting_a_base_directory_mode() {
     modes: vec![("d".to_owned(), 0o755)],
     symlinks: Vec::new(),
     xattrs: Vec::new(),
+    hardlinks: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -840,6 +848,7 @@ fn set_mode_then_rename_refuses() {
     modes: vec![("a".to_owned(), 0o644)],
     symlinks: Vec::new(),
     xattrs: Vec::new(),
+    hardlinks: Vec::new(),
   };
   let result = compose_volume(
     &base,
@@ -912,6 +921,7 @@ fn removing_a_base_symlink_is_one_unlink() {
     modes: Vec::new(),
     symlinks: vec![("l".to_owned(), "t".to_owned())],
     xattrs: Vec::new(),
+    hardlinks: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -935,6 +945,7 @@ fn retargeting_a_base_symlink_is_one_symlink() {
     modes: Vec::new(),
     symlinks: vec![("l".to_owned(), "old".to_owned())],
     xattrs: Vec::new(),
+    hardlinks: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -970,6 +981,7 @@ fn recreating_a_base_symlink_to_the_same_target_is_nothing() {
     modes: Vec::new(),
     symlinks: vec![("l".to_owned(), "t".to_owned())],
     xattrs: Vec::new(),
+    hardlinks: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -996,6 +1008,7 @@ fn symlink_over_an_existing_symlink_refuses() {
     modes: Vec::new(),
     symlinks: vec![("l".to_owned(), "t".to_owned())],
     xattrs: Vec::new(),
+    hardlinks: Vec::new(),
   };
   assert!(matches!(
     compose_volume(
@@ -1034,6 +1047,7 @@ fn a_write_on_a_base_symlink_conflicts() {
     modes: Vec::new(),
     symlinks: vec![("l".to_owned(), "t".to_owned())],
     xattrs: Vec::new(),
+    hardlinks: Vec::new(),
   };
   assert!(matches!(
     compose_volume(
@@ -1058,6 +1072,7 @@ fn base_with_xattr(path: &str, name: &str, value: &[u8]) -> Base {
     modes: Vec::new(),
     symlinks: Vec::new(),
     xattrs: vec![(path.to_owned(), name.to_owned(), value.to_vec())],
+    hardlinks: Vec::new(),
   }
 }
 
@@ -1188,4 +1203,115 @@ fn xattr_on_a_missing_path_refuses() {
     ),
     Err(DeriveError::XattrMissing(_))
   ));
+}
+
+// --- Hard link composition ---
+
+/// Creating a hard link is one `Link` op naming its target.
+#[test]
+fn creating_a_hard_link_is_one_link() {
+  let base = Base::of_files(vec![("a".to_owned(), 4)]);
+  let doc = compose_volume(
+    &base,
+    &[VolumeOp::Link {
+      path: "b".to_owned(),
+      target: "a".to_owned(),
+    }],
+  )
+  .expect("valid");
+  let op = doc
+    .ops
+    .iter()
+    .find(|op| op.kind == OpKind::Link)
+    .expect("a link");
+  assert_eq!(doc.paths.path(op.path), Some("b"), "the new name");
+  assert_eq!(
+    doc.paths.path(u16::try_from(op.src).unwrap_or(u16::MAX)),
+    Some("a"),
+    "the target"
+  );
+}
+
+/// A hard link created then unlinked cancels.
+#[test]
+fn hard_link_then_unlink_cancels() {
+  let base = Base::of_files(vec![("a".to_owned(), 4)]);
+  let doc = compose_volume(
+    &base,
+    &[
+      VolumeOp::Link {
+        path: "b".to_owned(),
+        target: "a".to_owned(),
+      },
+      VolumeOp::Unlink {
+        path: "b".to_owned(),
+      },
+    ],
+  )
+  .expect("valid");
+  assert!(doc.ops.is_empty());
+}
+
+/// Removing a base hard link is one `Unlink`.
+#[test]
+fn removing_a_base_hard_link_is_one_unlink() {
+  let base = Base {
+    files: vec![("a".to_owned(), 4)],
+    dirs: Vec::new(),
+    modes: Vec::new(),
+    symlinks: Vec::new(),
+    xattrs: Vec::new(),
+    hardlinks: vec![("b".to_owned(), "a".to_owned())],
+  };
+  let doc = compose_volume(
+    &base,
+    &[VolumeOp::Unlink {
+      path: "b".to_owned(),
+    }],
+  )
+  .expect("valid");
+  assert_eq!(doc.ops.len(), 1);
+  assert_eq!(doc.ops[0].kind, OpKind::Unlink);
+  assert_eq!(doc.paths.path(doc.ops[0].path), Some("b"));
+}
+
+/// A hard link over an existing hard link is refused.
+#[test]
+fn hard_link_over_an_existing_link_refuses() {
+  let base = Base {
+    files: vec![("a".to_owned(), 4)],
+    dirs: Vec::new(),
+    modes: Vec::new(),
+    symlinks: Vec::new(),
+    xattrs: Vec::new(),
+    hardlinks: vec![("b".to_owned(), "a".to_owned())],
+  };
+  assert!(matches!(
+    compose_volume(
+      &base,
+      &[VolumeOp::Link {
+        path: "b".to_owned(),
+        target: "a".to_owned()
+      }]
+    ),
+    Err(DeriveError::LinkOverExisting(_))
+  ));
+}
+
+/// A hard link and a file at one path conflict.
+#[test]
+fn hard_link_at_a_file_path_conflicts() {
+  let doc = compose_volume(
+    &Base::default(),
+    &[
+      VolumeOp::Create {
+        path: "x".to_owned(),
+      },
+      VolumeOp::Link {
+        path: "x".to_owned(),
+        target: "a".to_owned(),
+      },
+    ],
+  );
+  assert!(matches!(doc, Err(DeriveError::PathKindConflict(_))));
 }
