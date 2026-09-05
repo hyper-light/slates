@@ -5,7 +5,7 @@
 
 use slates_archive::archive::Archive;
 use slates_archive::format::{ArchiveError, Chunk, Encoding};
-use slates_archive::manifest::{Entry, Node};
+use slates_archive::manifest::{Entry, Node, NodeMeta};
 
 use proptest::prelude::*;
 
@@ -27,6 +27,7 @@ fn sample() -> Archive {
     unicode_version: 15,
     manifest: Node::Directory(vec![Entry {
       name: "f".to_owned(),
+      meta: NodeMeta::default(),
       node: Node::File(Vec::new()),
     }]),
     chunks,

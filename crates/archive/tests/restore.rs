@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use slates_archive::archive::Archive;
 use slates_archive::format::ArchiveError;
-use slates_archive::manifest::{Entry, Extent, Node};
+use slates_archive::manifest::{Entry, Extent, Node, NodeMeta};
 use slates_archive::restore::restore;
 
 /// Builds a flat archive: one raw chunk per file, and a manifest directory with one whole-file
@@ -25,6 +25,7 @@ fn archive_of(files: &[(&str, Vec<u8>)]) -> Archive {
     };
     entries.push(Entry {
       name: (*name).to_owned(),
+      meta: NodeMeta::default(),
       node: Node::File(vec![extent]),
     });
     chunks.push(chunk);
@@ -67,6 +68,7 @@ fn a_hole_restores_as_zeros() {
     unicode_version: 15,
     manifest: Node::Directory(vec![Entry {
       name: "sparse".to_owned(),
+      meta: NodeMeta::default(),
       node: Node::File(vec![Extent {
         offset: 0,
         len: 64,
@@ -87,6 +89,7 @@ fn a_multi_extent_file_concatenates_its_chunks() {
   let second = Archive::raw_chunk(b"wxyz".to_vec());
   let manifest = Node::Directory(vec![Entry {
     name: "joined".to_owned(),
+    meta: NodeMeta::default(),
     node: Node::File(vec![
       Extent {
         offset: 0,
@@ -124,8 +127,10 @@ fn a_tree_restores_files_and_directories() {
   let lib = Archive::raw_chunk(b"pub fn f() {}".to_vec());
   let manifest = Node::Directory(vec![Entry {
     name: "src".to_owned(),
+    meta: NodeMeta::default(),
     node: Node::Directory(vec![Entry {
       name: "lib.rs".to_owned(),
+      meta: NodeMeta::default(),
       node: Node::File(vec![Extent {
         offset: 0,
         len: lib.raw_len,
@@ -159,6 +164,7 @@ fn a_tree_restores_files_and_directories() {
 fn a_missing_chunk_is_refused() {
   let manifest = Node::Directory(vec![Entry {
     name: "orphan".to_owned(),
+    meta: NodeMeta::default(),
     node: Node::File(vec![Extent {
       offset: 0,
       len: 4,
@@ -200,6 +206,7 @@ fn restore_decodes_compressed_chunks() {
   assert_eq!(chunk.encoding, slates_archive::format::Encoding::Lz4);
   let manifest = Node::Directory(vec![Entry {
     name: "z".to_owned(),
+    meta: NodeMeta::default(),
     node: Node::File(vec![Extent {
       offset: 0,
       len: raw.len() as u64,

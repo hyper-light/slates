@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 
 use slates_archive::archive::Archive;
-use slates_archive::manifest::{Entry, Extent, Node};
+use slates_archive::manifest::{Entry, Extent, Node, NodeMeta};
 use slates_archive::restore::restore;
 use slates_archive::transfer::{chunks_for, missing_set};
 
@@ -17,6 +17,7 @@ fn archive_of(files: &[(&str, Vec<u8>)]) -> Archive {
     let chunk = Archive::raw_chunk(bytes.clone());
     entries.push(Entry {
       name: (*name).to_owned(),
+      meta: NodeMeta::default(),
       node: Node::File(vec![Extent {
         offset: 0,
         len: bytes.len() as u64,

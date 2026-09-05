@@ -13,10 +13,18 @@
 //! truncated or malformed tree is a typed refusal, never a panic (§4.9). This module is pure: no
 //! I/O, no clock, no randomness.
 //!
-//! Scope: the tree shape (directories, files, extents) and its Merkle identity. Per-node metadata
-//! (mode, times, size, nlink, xattr flags) is a documented extension of the node encoding (owed;
-//! GAPS §8g); adding it changes the node encoding and therefore the identity, so it is versioned
-//! with the archive format.
+//! Each directory entry carries its child's per-node metadata (inode number, mode, modification
+//! and change times, size, link count, and a flag for whether the child has extended attributes),
+//! the field list of §2.6 item 4 (`research/compression-archive-dedup.md` §"Manifest"). The
+//! metadata is written into both encodings and hashed into the Merkle identity, so a change to any
+//! entry's mode or times changes the root identity exactly as a change to its content does. This
+//! addition is why the format's minor version is 1 (the root identity of a v1.0 tree and a v1.1
+//! tree of the same shape differ). The root directory has no entry naming it, so its own metadata is
+//! not carried; every named node's is.
+//!
+//! Scope: the tree shape (directories, files, extents), each entry's metadata, and the Merkle
+//! identity over both. Restoring the metadata onto a host path is the landing engine's job under a
+//! grant (§4.15), not the archive's; the archive carries, hashes and round-trips it.
 
 use crate::wire::{Reader, Writer};
 
@@ -39,11 +47,36 @@ pub struct Extent {
   pub chunk_offset: u64,
 }
 
-/// One entry in a directory: a name and the child it points to.
+/// A named node's metadata (§2.6 item 4): the fields a restore needs to reproduce the entry and a
+/// fingerprint needs to detect drift. Times are nanoseconds since the Unix epoch. `xattr_flags` is
+/// nonzero when the node carries extended attributes (the attributes themselves are chunks, not
+/// manifest bytes). Carried and hashed by the archive; applied to a host path only by a granted
+/// landing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeMeta {
+  /// The inode number the entry had in the volume (identity across renames, not a host inode).
+  pub ino: u64,
+  /// The permission and type bits.
+  pub mode: u32,
+  /// The modification time, nanoseconds since the Unix epoch.
+  pub mtime_ns: u64,
+  /// The change time, nanoseconds since the Unix epoch.
+  pub ctime_ns: u64,
+  /// The size in bytes (the file's length; a directory's is the archiver's own value).
+  pub size: u64,
+  /// The hard-link count.
+  pub nlink: u32,
+  /// Nonzero when the node has extended attributes.
+  pub xattr_flags: u32,
+}
+
+/// One entry in a directory: a name, the child's metadata, and the child it points to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
   /// The entry's name (one path component).
   pub name: String,
+  /// The child's per-node metadata.
+  pub meta: NodeMeta,
   /// The child node.
   pub node: Node,
 }
@@ -105,6 +138,37 @@ fn read_extent(reader: &mut Reader<'_>) -> Result<Extent, ManifestError> {
   })
 }
 
+/// Writes an entry's metadata fields in canonical order.
+fn write_meta(writer: &mut Writer, meta: &NodeMeta) {
+  writer.u64(meta.ino);
+  writer.u32(meta.mode);
+  writer.u64(meta.mtime_ns);
+  writer.u64(meta.ctime_ns);
+  writer.u64(meta.size);
+  writer.u32(meta.nlink);
+  writer.u32(meta.xattr_flags);
+}
+
+/// Reads an entry's metadata fields, refusing a truncated stream.
+fn read_meta(reader: &mut Reader<'_>) -> Result<NodeMeta, ManifestError> {
+  let ino = reader.u64().map_err(|_| ManifestError::Truncated)?;
+  let mode = reader.u32().map_err(|_| ManifestError::Truncated)?;
+  let mtime_ns = reader.u64().map_err(|_| ManifestError::Truncated)?;
+  let ctime_ns = reader.u64().map_err(|_| ManifestError::Truncated)?;
+  let size = reader.u64().map_err(|_| ManifestError::Truncated)?;
+  let nlink = reader.u32().map_err(|_| ManifestError::Truncated)?;
+  let xattr_flags = reader.u32().map_err(|_| ManifestError::Truncated)?;
+  Ok(NodeMeta {
+    ino,
+    mode,
+    mtime_ns,
+    ctime_ns,
+    size,
+    nlink,
+    xattr_flags,
+  })
+}
+
 /// The directory entries in canonical (sorted-by-name) order.
 fn sorted_entries(entries: &[Entry]) -> Vec<&Entry> {
   let mut sorted: Vec<&Entry> = entries.iter().collect();
@@ -126,6 +190,7 @@ impl Node {
         for entry in sorted {
           writer.u32(u32::try_from(entry.name.len()).unwrap_or(u32::MAX));
           writer.raw(entry.name.as_bytes());
+          write_meta(&mut writer, &entry.meta);
           // The child is named by its identity — the Merkle step.
           writer.hash(&entry.node.identity());
         }
@@ -159,6 +224,7 @@ impl Node {
         for entry in sorted {
           writer.u32(u32::try_from(entry.name.len()).unwrap_or(u32::MAX));
           writer.raw(entry.name.as_bytes());
+          write_meta(writer, &entry.meta);
           entry.node.write(writer);
         }
       }
@@ -198,8 +264,9 @@ impl Node {
           let name = std::str::from_utf8(name_bytes)
             .map_err(|_| ManifestError::BadNode)?
             .to_owned();
+          let meta = read_meta(reader)?;
           let node = Node::read(reader)?;
-          entries.push(Entry { name, node });
+          entries.push(Entry { name, meta, node });
         }
         Ok(Node::Directory(entries))
       }

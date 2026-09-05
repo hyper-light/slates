@@ -33,7 +33,7 @@ pub mod wire;
 
 pub use archive::Archive;
 pub use format::{ArchiveError, Chunk, Encoding};
-pub use manifest::{Entry, Extent, ManifestError, Node};
+pub use manifest::{Entry, Extent, ManifestError, Node, NodeMeta};
 pub use restore::{Restored, restore};
 pub use store::ContentStore;
 pub use transfer::{chunks_for, missing_set};

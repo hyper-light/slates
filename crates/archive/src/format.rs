@@ -20,8 +20,9 @@ pub const SEEK_TABLE_MAGIC: u32 = 0x184d_2a5e;
 pub const FORMAT_MAJOR: u16 = 1;
 
 /// Format: the format minor version. A reader accepts a newer minor of a known major, ignoring
-/// optional sections it does not know.
-pub const FORMAT_MINOR: u16 = 0;
+/// optional sections it does not know. Minor 1 added per-entry node metadata to the manifest
+/// (`manifest::NodeMeta`), which changes a tree's Merkle identity.
+pub const FORMAT_MINOR: u16 = 1;
 
 /// Format: header flags. Bit 0 the manifest is compressed; bit 1 dictionaries are present; bit 2
 /// a seek table is present.
