@@ -15,12 +15,14 @@
 //! four-byte aligned, bounds-checked), [`rpc`] (ONC RPC, RFC 1057/5531 — record marking over TCP,
 //! the call and reply messages, and the `AUTH_NONE` credential the loopback server uses), and
 //! [`nfs`] (the NFSv3 core data types of RFC 1813 — status codes, file types, times, attributes and
-//! file handles).
+//! file handles), and [`handle`] (slates' private encoding of a volume object's durable identity into an opaque file handle: `(volume, inode, gen)`).
 
+pub mod handle;
 pub mod nfs;
 pub mod rpc;
 pub mod xdr;
 
+pub use handle::{FileHandle, FileHandleError};
 pub use nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3};
 pub use rpc::{AcceptStatus, RpcCall, RpcError, read_record, reply_bytes, write_record};
 pub use xdr::{XdrError, XdrReader, XdrWriter};
