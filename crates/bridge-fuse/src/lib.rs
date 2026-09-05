@@ -23,6 +23,8 @@ pub mod bridge;
 pub mod channel;
 pub mod error;
 pub mod init;
+#[cfg(target_os = "linux")]
+pub mod mount;
 pub mod reply;
 pub mod request;
 pub mod volume_bridge;

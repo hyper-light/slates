@@ -872,11 +872,21 @@ I/O (a disconnect is `ENODEV`, typed), and `serve_blocking` is the fallback loop
 names: read a request, `dispatch` it to the bridge, write the reply, until the kernel unmounts.
 No `unsafe` (rustix's I/O-safe wrappers over the owned descriptor). It compiles and cross-lints
 for Linux from this machine; the serve loop runs against a real mount in the CI Linux lane. Owed
-with the rest of the driver: the mount establishment (the new mount API, or `fusermount3`; task
-2), `FUSE_DEV_IOC_CLONE` per shard and the io_uring command path (which drops the request copy
+with the rest of the driver: the io_uring command path, `FUSE_DEV_IOC_CLONE` per shard and the io_uring command path (which drops the request copy
 the blocking loop makes), generation-tracked node-id reuse after `forget` (§4.6 `(no, gen)`),
 `link` and xattrs, the kernel invalidation notifications, `slates exec`, and the conformance and
 workload suites.
+
+Mount establishment landed 2026-09-05 (Phase 3 task 2, Linux): `mount.rs` mounts a slates
+connection through `fusermount3`, the OS-shipped setuid helper, so no privilege is required
+(R10, D-2): the daemon makes a socket pair, spawns `fusermount3 -o default_permissions,fsname=…`
+with one end in `_FUSE_COMMFD`, and receives the `/dev/fuse` descriptor the helper sends back
+with `SCM_RIGHTS` (the same fd-passing rustix path the rendezvous uses), returning a `Mount`
+whose `FuseChannel` serves it; `unmount` tears it down with `fusermount3 -u`. No `unsafe`. It
+compiles and cross-lints for Linux here; the handshake runs against a real `fusermount3` in the
+CI Linux lane. Owed: the new mount API (`fsopen`/`fsconfig`/`fsmount`/`move_mount`) where the
+daemon has `CAP_SYS_ADMIN` in its user namespace, and the anchor holding the fd across a
+restart (§2.6 step 4).
 
 ## 9. Blocking order toward first light
 
