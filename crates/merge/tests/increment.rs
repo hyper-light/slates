@@ -12,10 +12,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use slates_merge::increment::{VolumeOp, compose_volume};
+use slates_merge::increment::{Base, DeriveError, VolumeOp, compose_volume};
 use slates_merge::ops_doc::{Op, OpKind, OpsDoc};
 
 use proptest::prelude::*;
+
+/// Derives an increment from a file-only base (the common case in these tests).
+fn derive(
+  files: &[(String, u64)],
+  journal: &[VolumeOp],
+) -> Result<slates_merge::ops_doc::OpsDoc, DeriveError> {
+  compose_volume(&Base::of_files(files.to_vec()), journal)
+}
 
 /// Shape: the largest run a generated add contributes.
 const MAX_ADD: u64 = 16;
@@ -293,7 +301,7 @@ fn check(base: &[(String, u64)], doc: &OpsDoc, model: &Model) {
 /// A create then an unlink of a new file cancels.
 #[test]
 fn a_create_then_unlink_cancels() {
-  let doc = compose_volume(
+  let doc = derive(
     &[],
     &[
       VolumeOp::Create {
@@ -312,7 +320,7 @@ fn a_create_then_unlink_cancels() {
 /// Unlinking a base file is one `Unlink`.
 #[test]
 fn unlinking_a_base_file_is_one_unlink() {
-  let doc = compose_volume(
+  let doc = derive(
     &[("d".to_owned(), 8)],
     &[VolumeOp::Unlink {
       path: "d".to_owned(),
@@ -327,7 +335,7 @@ fn unlinking_a_base_file_is_one_unlink() {
 /// Creating and writing a file is a `Create` and its bytes.
 #[test]
 fn creating_and_writing_a_file_is_create_then_insert() {
-  let doc = compose_volume(
+  let doc = derive(
     &[],
     &[
       VolumeOp::Create {
@@ -358,7 +366,7 @@ fn renaming_a_base_file_to_a_fresh_path() {
     from: "a".to_owned(),
     to: "z".to_owned(),
   }];
-  let doc = compose_volume(&base, &journal).expect("valid");
+  let doc = derive(&base, &journal).expect("valid");
   let rename = doc
     .ops
     .iter()
@@ -396,7 +404,7 @@ fn write_and_rename_replaces_the_destination_content() {
       to: "out".to_owned(),
     },
   ];
-  let doc = compose_volume(&base, &journal).expect("valid");
+  let doc = derive(&base, &journal).expect("valid");
   assert!(
     !doc.ops.iter().any(|op| op.kind == OpKind::Rename),
     "write-and-rename is not a rename"
@@ -433,7 +441,7 @@ fn write_and_rename_replaces_the_destination_content() {
 /// Content on a missing file is a typed refusal.
 #[test]
 fn content_on_a_missing_file_refuses() {
-  let result = compose_volume(
+  let result = derive(
     &[],
     &[VolumeOp::Overwrite {
       path: "gone".to_owned(),
@@ -468,10 +476,194 @@ proptest! {
       .map(|(i, name)| ((*name).to_owned(), base_lens[i]))
       .collect();
     let (journal, model) = simulate(&base, &raw);
-    match compose_volume(&base, &journal) {
+    match derive(&base, &journal) {
       Ok(doc) => check(&base, &doc, &model),
       // The rare rename onto a reused base path is an owed refusal, not a failure; skip it.
       Err(_) => prop_assume!(false),
     }
+  }
+}
+
+// --- Directory composition (Mkdir/Rmdir) ---
+
+/// The directory paths a directory journal touches (disjoint from the file paths above).
+const DIRS: [&str; 2] = ["d", "e"];
+
+/// Making a new directory is one `Mkdir`.
+#[test]
+fn making_a_new_directory_is_one_mkdir() {
+  let doc = compose_volume(
+    &Base::default(),
+    &[VolumeOp::Mkdir {
+      path: "d".to_owned(),
+    }],
+  )
+  .expect("valid");
+  assert_eq!(doc.ops.len(), 1);
+  assert_eq!(doc.ops[0].kind, OpKind::Mkdir);
+  assert_eq!(doc.paths.path(doc.ops[0].path), Some("d"));
+}
+
+/// Removing a base directory is one `Rmdir`.
+#[test]
+fn removing_a_base_directory_is_one_rmdir() {
+  let base = Base {
+    files: Vec::new(),
+    dirs: vec!["d".to_owned()],
+  };
+  let doc = compose_volume(
+    &base,
+    &[VolumeOp::Rmdir {
+      path: "d".to_owned(),
+    }],
+  )
+  .expect("valid");
+  assert_eq!(doc.ops.len(), 1);
+  assert_eq!(doc.ops[0].kind, OpKind::Rmdir);
+  assert_eq!(doc.paths.path(doc.ops[0].path), Some("d"));
+}
+
+/// A mkdir then an rmdir of a new directory cancels.
+#[test]
+fn mkdir_then_rmdir_cancels() {
+  let doc = compose_volume(
+    &Base::default(),
+    &[
+      VolumeOp::Mkdir {
+        path: "d".to_owned(),
+      },
+      VolumeOp::Rmdir {
+        path: "d".to_owned(),
+      },
+    ],
+  )
+  .expect("valid");
+  assert!(doc.ops.is_empty());
+}
+
+/// Removing then recreating a base directory is nothing (directories have no content).
+#[test]
+fn removing_then_recreating_a_base_directory_is_nothing() {
+  let base = Base {
+    files: Vec::new(),
+    dirs: vec!["d".to_owned()],
+  };
+  let doc = compose_volume(
+    &base,
+    &[
+      VolumeOp::Rmdir {
+        path: "d".to_owned(),
+      },
+      VolumeOp::Mkdir {
+        path: "d".to_owned(),
+      },
+    ],
+  )
+  .expect("valid");
+  assert!(doc.ops.is_empty());
+}
+
+/// One path used as both a file and a directory is refused.
+#[test]
+fn a_file_and_directory_at_one_path_refuses() {
+  let result = compose_volume(
+    &Base::default(),
+    &[
+      VolumeOp::Create {
+        path: "x".to_owned(),
+      },
+      VolumeOp::Mkdir {
+        path: "x".to_owned(),
+      },
+    ],
+  );
+  assert!(matches!(
+    result,
+    Err(DeriveError::PathIsFileAndDirectory(_))
+  ));
+}
+
+/// A mkdir over a base directory is refused.
+#[test]
+fn mkdir_over_a_base_directory_refuses() {
+  let base = Base {
+    files: Vec::new(),
+    dirs: vec!["d".to_owned()],
+  };
+  assert!(matches!(
+    compose_volume(
+      &base,
+      &[VolumeOp::Mkdir {
+        path: "d".to_owned()
+      }]
+    ),
+    Err(DeriveError::MkdirOverExisting(_))
+  ));
+}
+
+/// An rmdir of a missing directory is refused.
+#[test]
+fn rmdir_of_a_missing_directory_refuses() {
+  assert!(matches!(
+    compose_volume(
+      &Base::default(),
+      &[VolumeOp::Rmdir {
+        path: "d".to_owned()
+      }]
+    ),
+    Err(DeriveError::RmdirMissing(_))
+  ));
+}
+
+/// Generates a valid directory journal over [`DIRS`] against a set of base directories, tracking
+/// the resulting present set.
+fn simulate_dirs(base_dirs: &[String], raw_ops: &[Raw]) -> (Vec<VolumeOp>, BTreeSet<String>) {
+  let mut present: BTreeSet<String> = base_dirs.iter().cloned().collect();
+  let mut journal = Vec::new();
+  for raw in raw_ops {
+    let path = DIRS[usize::from(raw.path) % DIRS.len()].to_owned();
+    if present.contains(&path) {
+      present.remove(&path);
+      journal.push(VolumeOp::Rmdir { path });
+    } else {
+      present.insert(path.clone());
+      journal.push(VolumeOp::Mkdir { path });
+    }
+  }
+  (journal, present)
+}
+
+proptest! {
+  /// T-6.10 (the directory oracle): for any base directories and any valid mkdir/rmdir journal,
+  /// applying the document's Mkdir and Rmdir ops to the base directory set yields the set the
+  /// journal actually produced.
+  #[test]
+  fn the_directory_increment_reconstructs(
+    base_present in prop::array::uniform2(any::<bool>()),
+    raw in proptest::collection::vec(
+      (0u8..2, any::<u8>(), 0u64..8, 0u64..8).prop_map(|(path, kind, a, b)| Raw { path, kind, a, b }),
+      0..12,
+    ),
+  ) {
+    let base_dirs: Vec<String> = DIRS
+      .iter()
+      .enumerate()
+      .filter(|(i, _)| base_present[*i])
+      .map(|(_, name)| (*name).to_owned())
+      .collect();
+    let (journal, model) = simulate_dirs(&base_dirs, &raw);
+    let base = Base { files: Vec::new(), dirs: base_dirs.clone() };
+    let doc = compose_volume(&base, &journal).expect("a valid directory journal composes");
+    // Reconstruct: start from the base directories, apply the document's Mkdir/Rmdir.
+    let mut reconstructed: BTreeSet<String> = base_dirs.into_iter().collect();
+    for op in &doc.ops {
+      let name = doc.paths.path(op.path).unwrap_or("").to_owned();
+      match op.kind {
+        OpKind::Mkdir => { reconstructed.insert(name); }
+        OpKind::Rmdir => { reconstructed.remove(&name); }
+        _ => {}
+      }
+    }
+    prop_assert_eq!(reconstructed, model);
   }
 }

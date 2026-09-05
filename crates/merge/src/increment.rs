@@ -30,12 +30,14 @@
 //! the region's base offset. Sorting makes the layout, and the identity, independent of the
 //! journal's declaration order.
 //!
-//! Scope: content, create, unlink and rename of regular files. Directories, hard links, symlinks
-//! and metadata (mode, xattrs), and the rare rename onto a base path already consumed this
-//! increment, are the deriver's remaining piece (owed; GAPS §8f): the last is a typed
-//! [`DeriveError`]. An operation a valid volume could not have produced — content on a missing
-//! file, a create over an existing one, an unlink or rename of a missing one — is a typed
-//! [`DeriveError`] too, never a panic. This module is pure: no I/O, no clock, no randomness.
+//! Scope: content, create, unlink and rename of regular files, and directory create and remove
+//! (composed independently; a mkdir then rmdir cancels, a base directory removed is one `Rmdir`).
+//! Hard links, symlinks and metadata (mode, xattrs), a file/directory transition at one path, and
+//! the rare rename onto a base path already consumed this increment are the deriver's remaining
+//! piece (owed; GAPS §8f), each a typed [`DeriveError`]. An operation a valid volume could not
+//! have produced — content on a missing file, a create over an existing one, an unlink, rename or
+//! rmdir of a missing one, a mkdir over an existing directory — is a typed [`DeriveError`] too,
+//! never a panic. This module is pure: no I/O, no clock, no randomness.
 
 use crate::derive::{ContentOp, compose_content_sized};
 use crate::ops_doc::{Op, OpKind, OpsDoc};
@@ -104,6 +106,16 @@ pub enum VolumeOp {
     /// The destination name.
     to: String,
   },
+  /// A new, empty directory created at `path`.
+  Mkdir {
+    /// The directory.
+    path: String,
+  },
+  /// The empty directory `path` removed.
+  Rmdir {
+    /// The directory.
+    path: String,
+  },
 }
 
 impl VolumeOp {
@@ -115,12 +127,21 @@ impl VolumeOp {
       VolumeOp::Truncate { len, .. } => Some(ContentOp::Truncate { len }),
       VolumeOp::Insert { at, len, .. } => Some(ContentOp::Insert { at, len }),
       VolumeOp::Delete { at, len, .. } => Some(ContentOp::Delete { at, len }),
-      VolumeOp::Create { .. } | VolumeOp::Unlink { .. } | VolumeOp::Rename { .. } => None,
+      VolumeOp::Create { .. }
+      | VolumeOp::Unlink { .. }
+      | VolumeOp::Rename { .. }
+      | VolumeOp::Mkdir { .. }
+      | VolumeOp::Rmdir { .. } => None,
     }
   }
 
-  /// The single path a content, create or unlink operation targets (a rename has two, handled
-  /// separately).
+  /// Whether this is a directory operation (`Mkdir` or `Rmdir`).
+  fn is_directory(&self) -> bool {
+    matches!(self, VolumeOp::Mkdir { .. } | VolumeOp::Rmdir { .. })
+  }
+
+  /// The single file path a content, create or unlink operation targets (a rename has two, and a
+  /// directory operation is not a file operation).
   fn single_path(&self) -> Option<&str> {
     match self {
       VolumeOp::Overwrite { path, .. }
@@ -130,7 +151,7 @@ impl VolumeOp {
       | VolumeOp::Delete { path, .. }
       | VolumeOp::Create { path }
       | VolumeOp::Unlink { path } => Some(path),
-      VolumeOp::Rename { .. } => None,
+      VolumeOp::Rename { .. } | VolumeOp::Mkdir { .. } | VolumeOp::Rmdir { .. } => None,
     }
   }
 }
@@ -150,6 +171,13 @@ pub enum DeriveError {
   /// A namespace combination whose composition is owed: a rename onto, or a create at, a base
   /// path already consumed this increment (its base was renamed away).
   Unsupported(String),
+  /// A `Mkdir` on a path that already holds a directory.
+  MkdirOverExisting(String),
+  /// An `Rmdir` of a path with no directory present.
+  RmdirMissing(String),
+  /// One path was used as both a file and a directory this increment (a file/directory transition
+  /// at a path); its composition is owed.
+  PathIsFileAndDirectory(String),
 }
 
 impl std::fmt::Display for DeriveError {
@@ -165,11 +193,37 @@ impl std::fmt::Display for DeriveError {
           "a namespace combination on the reused base path {path} is not yet composed"
         )
       }
+      Self::MkdirOverExisting(path) => write!(f, "mkdir over existing directory {path}"),
+      Self::RmdirMissing(path) => write!(f, "rmdir of missing directory {path}"),
+      Self::PathIsFileAndDirectory(path) => {
+        write!(f, "path {path} is used as both a file and a directory")
+      }
     }
   }
 }
 
 impl std::error::Error for DeriveError {}
+
+/// The base version's state the deriver composes against: the files present at base (with their
+/// content lengths) and the directories present at base. A richer base (modes, xattrs, symlinks,
+/// hard links) is the deriver's remaining metadata work (owed; GAPS §8f).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Base {
+  /// The base files and their content lengths.
+  pub files: Vec<(String, u64)>,
+  /// The base directory paths.
+  pub dirs: Vec<String>,
+}
+
+impl Base {
+  /// A base with the given files and no directories (the common file-only case).
+  pub fn of_files(files: Vec<(String, u64)>) -> Base {
+    Base {
+      files,
+      dirs: Vec::new(),
+    }
+  }
+}
 
 /// One file tracked during replay.
 #[derive(Clone)]
@@ -195,8 +249,9 @@ fn live_index(entities: &[Entity], path: &str) -> Option<usize> {
 }
 
 /// The base content length of `path`, if it existed at base.
-fn base_len_of(base: &[(String, u64)], path: &str) -> Option<u64> {
+fn base_len_of(base: &Base, path: &str) -> Option<u64> {
   base
+    .files
     .iter()
     .find(|(candidate, _)| candidate == path)
     .map(|(_, len)| *len)
@@ -210,11 +265,7 @@ fn consumed(entities: &[Entity], path: &str) -> bool {
 
 /// Materializes an untouched base file into a live entity and returns its index, or `None` when
 /// `path` is not an untouched base file (not at base, or already consumed).
-fn materialize_base(
-  entities: &mut Vec<Entity>,
-  base: &[(String, u64)],
-  path: &str,
-) -> Option<usize> {
+fn materialize_base(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Option<usize> {
   if consumed(entities, path) {
     return None;
   }
@@ -231,11 +282,7 @@ fn materialize_base(
 }
 
 /// Applies one operation to the entity set.
-fn apply_op(
-  entities: &mut Vec<Entity>,
-  base: &[(String, u64)],
-  op: &VolumeOp,
-) -> Result<(), DeriveError> {
+fn apply_op(entities: &mut Vec<Entity>, base: &Base, op: &VolumeOp) -> Result<(), DeriveError> {
   if let Some(content) = op.content() {
     let path = op.single_path().unwrap_or("");
     let index = live_index(entities, path)
@@ -254,11 +301,7 @@ fn apply_op(
 
 /// A `Create`: refuses over a live or untouched-base file; recreates an in-place-unlinked base
 /// file as a content replacement; otherwise makes a fresh new file.
-fn apply_create(
-  entities: &mut Vec<Entity>,
-  base: &[(String, u64)],
-  path: &str,
-) -> Result<(), DeriveError> {
+fn apply_create(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Result<(), DeriveError> {
   if live_index(entities, path).is_some() {
     return Err(DeriveError::CreateOverExisting(path.to_owned()));
   }
@@ -304,11 +347,7 @@ fn apply_create(
 }
 
 /// An `Unlink`: kills the live (or materialized-base) entity at `path`.
-fn apply_unlink(
-  entities: &mut Vec<Entity>,
-  base: &[(String, u64)],
-  path: &str,
-) -> Result<(), DeriveError> {
+fn apply_unlink(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Result<(), DeriveError> {
   let index = live_index(entities, path)
     .or_else(|| materialize_base(entities, base, path))
     .ok_or_else(|| DeriveError::UnlinkMissing(path.to_owned()))?;
@@ -320,7 +359,7 @@ fn apply_unlink(
 /// A `Rename`: moves the source entity to `to`, replacing whatever was there.
 fn apply_rename(
   entities: &mut Vec<Entity>,
-  base: &[(String, u64)],
+  base: &Base,
   from: &str,
   to: &str,
 ) -> Result<(), DeriveError> {
@@ -357,7 +396,7 @@ fn apply_rename(
 /// typed refusal (owed).
 fn resolve_rename_target(
   entities: &mut Vec<Entity>,
-  base: &[(String, u64)],
+  base: &Base,
   to: &str,
 ) -> Result<Option<usize>, DeriveError> {
   if let Some(index) = live_index(entities, to) {
@@ -405,12 +444,100 @@ fn adds_content(kind: OpKind) -> bool {
 /// Composes a work volume's journal into one increment's ops document, or refuses with a typed
 /// error. `base` gives the base content length of every path that existed at the increment's base
 /// version.
-pub fn compose_volume(base: &[(String, u64)], journal: &[VolumeOp]) -> Result<OpsDoc, DeriveError> {
+pub fn compose_volume(base: &Base, journal: &[VolumeOp]) -> Result<OpsDoc, DeriveError> {
+  check_no_file_directory_collision(base, journal)?;
+  let directories = compose_directories(base, journal)?;
   let mut entities: Vec<Entity> = Vec::new();
   for op in journal {
+    if op.is_directory() {
+      continue;
+    }
     apply_op(&mut entities, base, op)?;
   }
-  Ok(seal(entities))
+  Ok(seal(entities, directories))
+}
+
+/// A directory the increment declares: a create or a remove.
+enum DirectoryEmission {
+  /// A new directory at this path.
+  Made(String),
+  /// A base directory removed at this path.
+  Removed(String),
+}
+
+/// Refuses when any path is used as both a file and a directory this increment (including against
+/// the base's kinds): a file/directory transition at a path, whose composition is owed.
+fn check_no_file_directory_collision(base: &Base, journal: &[VolumeOp]) -> Result<(), DeriveError> {
+  let mut file_paths: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+  let mut dir_paths: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+  for op in journal {
+    match op {
+      VolumeOp::Mkdir { path } | VolumeOp::Rmdir { path } => {
+        dir_paths.insert(path);
+      }
+      VolumeOp::Rename { from, to } => {
+        file_paths.insert(from);
+        file_paths.insert(to);
+      }
+      other => {
+        if let Some(path) = other.single_path() {
+          file_paths.insert(path);
+        }
+      }
+    }
+  }
+  for path in &dir_paths {
+    if file_paths.contains(path) || base.files.iter().any(|(file, _)| file == path) {
+      return Err(DeriveError::PathIsFileAndDirectory((*path).to_owned()));
+    }
+  }
+  for path in &file_paths {
+    if base.dirs.iter().any(|dir| dir == path) {
+      return Err(DeriveError::PathIsFileAndDirectory((*path).to_owned()));
+    }
+  }
+  Ok(())
+}
+
+/// Composes the directory operations into a create or remove per touched directory path: a base
+/// directory removed is a `Rmdir`; a new directory that survives is a `Mkdir`; a mkdir then an
+/// rmdir cancels, and a base directory removed then recreated is unchanged (directories have no
+/// content). A mkdir over a present directory, or an rmdir of an absent one, is a typed refusal.
+fn compose_directories(
+  base: &Base,
+  journal: &[VolumeOp],
+) -> Result<Vec<DirectoryEmission>, DeriveError> {
+  let mut present: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+  for op in journal {
+    let (path, making) = match op {
+      VolumeOp::Mkdir { path } => (path, true),
+      VolumeOp::Rmdir { path } => (path, false),
+      _ => continue,
+    };
+    let base_is_dir = base.dirs.iter().any(|dir| dir == path);
+    let here = present.entry(path.clone()).or_insert(base_is_dir);
+    if making {
+      if *here {
+        return Err(DeriveError::MkdirOverExisting(path.clone()));
+      }
+      *here = true;
+    } else {
+      if !*here {
+        return Err(DeriveError::RmdirMissing(path.clone()));
+      }
+      *here = false;
+    }
+  }
+  let mut emissions = Vec::new();
+  for (path, here) in present {
+    let base_is_dir = base.dirs.iter().any(|dir| dir == &path);
+    if here && !base_is_dir {
+      emissions.push(DirectoryEmission::Made(path));
+    } else if !here && base_is_dir {
+      emissions.push(DirectoryEmission::Removed(path));
+    }
+  }
+  Ok(emissions)
 }
 
 /// One surviving file's emission: what it declares and the bytes it contributes to the post-state.
@@ -468,22 +595,36 @@ fn classify(entities: Vec<Entity>) -> (Vec<Emission>, Vec<String>) {
   (emissions, removed)
 }
 
-fn seal(entities: Vec<Entity>) -> OpsDoc {
-  let (mut emissions, removed) = classify(entities);
-
-  // Pre-intern, sorted, every path the document names — the emissions' final paths, their rename
-  // sources, and the removed paths — so the path table is sorted and the indices are stable (a
-  // rename's source index is a table index, which the sorted table keeps valid).
+/// Every path the document names — the emissions' final paths, their rename sources, the removed
+/// paths, and the directory paths — sorted and deduplicated, so the path table is sorted and the
+/// indices are stable (a rename's source index is a table index, which the sorted table keeps
+/// valid).
+fn document_names(
+  emissions: &[Emission],
+  removed: &[String],
+  directories: &[DirectoryEmission],
+) -> Vec<String> {
   let mut names: Vec<String> = Vec::new();
-  for emission in &emissions {
+  for emission in emissions {
     names.push(emission.final_path.clone());
     if let Some(source) = &emission.source {
       names.push(source.clone());
     }
   }
   names.extend(removed.iter().cloned());
+  for directory in directories {
+    match directory {
+      DirectoryEmission::Made(path) | DirectoryEmission::Removed(path) => names.push(path.clone()),
+    }
+  }
   names.sort_unstable();
   names.dedup();
+  names
+}
+
+fn seal(entities: Vec<Entity>, directories: Vec<DirectoryEmission>) -> OpsDoc {
+  let (mut emissions, removed) = classify(entities);
+  let names = document_names(&emissions, &removed, &directories);
 
   let mut doc = OpsDoc::new();
   for name in &names {
@@ -513,6 +654,16 @@ fn seal(entities: Vec<Entity>) -> OpsDoc {
   for origin in removed {
     let index = index_of(&origin);
     doc.ops.push(namespace_op(OpKind::Unlink, index));
+  }
+  for directory in directories {
+    match directory {
+      DirectoryEmission::Made(path) => {
+        doc.ops.push(namespace_op(OpKind::Mkdir, index_of(&path)));
+      }
+      DirectoryEmission::Removed(path) => {
+        doc.ops.push(namespace_op(OpKind::Rmdir, index_of(&path)));
+      }
+    }
   }
   doc.canonicalize();
   doc
