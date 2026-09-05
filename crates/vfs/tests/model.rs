@@ -17,6 +17,7 @@ use slates_vfs::inode::Kind;
 use slates_vfs::names::NameEquivalence;
 
 mod common;
+use common::steps::{Step, step};
 use common::{clone_config, store, volume};
 use slates_vfs::volume::{Store, Volume};
 
@@ -152,28 +153,37 @@ impl Model {
     self.epoch += 1;
   }
 
-  fn dir_mut(&mut self, path: &[String]) -> Option<&mut BTreeMap<String, Node>> {
+  /// The directory at `path`: a missing component is `ENOENT`, one that is not a directory
+  /// is `ENOTDIR`, as POSIX resolves paths.
+  fn dir_mut(&mut self, path: &[String]) -> Result<&mut BTreeMap<String, Node>, VfsError> {
     let mut cur = &mut self.root;
     for p in path {
-      let key = cur.keys().find(|k| self.policy.same(k, p))?.clone();
-      match cur.get_mut(&key)? {
-        Node::Dir(d) => cur = d,
-        _ => return None,
+      let key = cur
+        .keys()
+        .find(|k| self.policy.same(k, p))
+        .cloned()
+        .ok_or(VfsError::NotFound)?;
+      match cur.get_mut(&key) {
+        Some(Node::Dir(d)) => cur = d,
+        _ => return Err(VfsError::NotDirectory),
       }
     }
-    Some(cur)
+    Ok(cur)
   }
 
-  fn dir(&self, path: &[String]) -> Option<&BTreeMap<String, Node>> {
+  fn dir(&self, path: &[String]) -> Result<&BTreeMap<String, Node>, VfsError> {
     let mut cur = &self.root;
     for p in path {
-      let key = cur.keys().find(|k| self.policy.same(k, p))?;
-      match cur.get(key)? {
-        Node::Dir(d) => cur = d,
-        _ => return None,
+      let key = cur
+        .keys()
+        .find(|k| self.policy.same(k, p))
+        .ok_or(VfsError::NotFound)?;
+      match cur.get(key) {
+        Some(Node::Dir(d)) => cur = d,
+        _ => return Err(VfsError::NotDirectory),
       }
     }
-    Some(cur)
+    Ok(cur)
   }
 
   fn find_key(dir: &BTreeMap<String, Node>, policy: NameEquivalence, name: &str) -> Option<String> {
@@ -183,7 +193,7 @@ impl Model {
   fn create(&mut self, dir: &[String], name: &str) -> Result<u64, VfsError> {
     let policy = self.policy;
     let ino = self.next_ino;
-    let d = self.dir_mut(dir).ok_or(VfsError::NotFound)?;
+    let d = self.dir_mut(dir)?;
     if Self::find_key(d, policy, name).is_some() {
       return Err(VfsError::AlreadyExists);
     }
@@ -203,7 +213,7 @@ impl Model {
   fn symlink(&mut self, dir: &[String], name: &str, target: &str) -> Result<(), VfsError> {
     let policy = self.policy;
     let ino = self.next_ino;
-    let d = self.dir_mut(dir).ok_or(VfsError::NotFound)?;
+    let d = self.dir_mut(dir)?;
     if Self::find_key(d, policy, name).is_some() {
       return Err(VfsError::AlreadyExists);
     }
@@ -221,7 +231,7 @@ impl Model {
 
   fn mkdir(&mut self, dir: &[String], name: &str) -> Result<(), VfsError> {
     let policy = self.policy;
-    let d = self.dir_mut(dir).ok_or(VfsError::NotFound)?;
+    let d = self.dir_mut(dir)?;
     if Self::find_key(d, policy, name).is_some() {
       return Err(VfsError::AlreadyExists);
     }
@@ -232,7 +242,7 @@ impl Model {
 
   fn unlink(&mut self, dir: &[String], name: &str) -> Result<(), VfsError> {
     let policy = self.policy;
-    let d = self.dir_mut(dir).ok_or(VfsError::NotFound)?;
+    let d = self.dir_mut(dir)?;
     let key = Self::find_key(d, policy, name).ok_or(VfsError::NotFound)?;
     let ino = match d.get(&key) {
       Some(Node::Dir(_)) => return Err(VfsError::IsDirectory),
@@ -254,7 +264,7 @@ impl Model {
 
   fn rmdir(&mut self, dir: &[String], name: &str) -> Result<(), VfsError> {
     let policy = self.policy;
-    let d = self.dir_mut(dir).ok_or(VfsError::NotFound)?;
+    let d = self.dir_mut(dir)?;
     let key = Self::find_key(d, policy, name).ok_or(VfsError::NotFound)?;
     match d.get(&key) {
       Some(Node::Dir(inner)) if inner.is_empty() => {
@@ -328,10 +338,11 @@ impl Model {
     to: &str,
   ) -> Result<(), VfsError> {
     let policy = self.policy;
-    let fd = self.dir(from_dir).ok_or(VfsError::NotFound)?;
+    // Both parent paths resolve before the source name is checked, as `renameat2` does.
+    let fd = self.dir(from_dir)?;
+    let td = self.dir(to_dir)?;
     let from_key = Self::find_key(fd, policy, from).ok_or(VfsError::NotFound)?;
     let node = fd.get(&from_key).cloned().unwrap();
-    let td = self.dir(to_dir).ok_or(VfsError::NotFound)?;
     let to_key = Self::find_key(td, policy, to);
     if from_dir == to_dir && policy.same(from, to) {
       return Ok(());
@@ -387,7 +398,7 @@ impl Model {
     if !self.files.contains_key(&ino) {
       return Err(VfsError::NotFound);
     }
-    let d = self.dir_mut(dir).ok_or(VfsError::NotFound)?;
+    let d = self.dir_mut(dir)?;
     if Self::find_key(d, policy, name).is_some() {
       return Err(VfsError::AlreadyExists);
     }
@@ -426,56 +437,6 @@ impl Model {
 }
 
 // ------------------------------------------------------------------ the driver
-
-#[derive(Clone, Debug)]
-enum Step {
-  Create(Vec<String>, String),
-  Mkdir(Vec<String>, String),
-  Symlink(Vec<String>, String),
-  Unlink(Vec<String>, String),
-  Rmdir(Vec<String>, String),
-  Rename(Vec<String>, String, Vec<String>, String),
-  Link(Vec<String>, String, u8),
-  Write(u8, u16, Vec<u8>),
-  Truncate(u8, u16),
-  Snapshot,
-}
-
-fn name() -> impl Strategy<Value = String> {
-  prop_oneof![
-    Just("a"),
-    Just("b"),
-    Just("C"),
-    Just("d"),
-    Just("e"),
-    Just("A")
-  ]
-  .prop_map(str::to_owned)
-}
-
-fn path() -> impl Strategy<Value = Vec<String>> {
-  prop::collection::vec(name(), 0..3)
-}
-
-fn step() -> impl Strategy<Value = Step> {
-  prop_oneof![
-    (path(), name()).prop_map(|(p, n)| Step::Create(p, n)),
-    (path(), name()).prop_map(|(p, n)| Step::Mkdir(p, n)),
-    (path(), name()).prop_map(|(p, n)| Step::Symlink(p, n)),
-    (path(), name()).prop_map(|(p, n)| Step::Unlink(p, n)),
-    (path(), name()).prop_map(|(p, n)| Step::Rmdir(p, n)),
-    (path(), name(), path(), name()).prop_map(|(a, b, c, d)| Step::Rename(a, b, c, d)),
-    (path(), name(), any::<u8>()).prop_map(|(p, n, i)| Step::Link(p, n, i)),
-    (
-      any::<u8>(),
-      any::<u16>(),
-      prop::collection::vec(any::<u8>(), 0..40)
-    )
-      .prop_map(|(i, o, b)| Step::Write(i, o, b)),
-    (any::<u8>(), any::<u16>()).prop_map(|(i, l)| Step::Truncate(i, l)),
-    Just(Step::Snapshot),
-  ]
-}
 
 /// The real volume's view: directory listings and file bytes by inode counter.
 fn real_state(vol: &Volume, store: &Store) -> AbstractState {
@@ -523,19 +484,21 @@ fn ino_of(model: &Model, pick: u8) -> Option<u64> {
   }
 }
 
+/// The directory at `path`, or the refusal path resolution gives: `ENOENT` for a missing
+/// component, `ENOTDIR` for one that is not a directory.
 fn dir_handle(
   vol: &Volume,
   store: &Store,
   path: &[String],
-) -> Option<slates_mem::Handle<slates_vfs::dir::DirNode>> {
+) -> Result<slates_mem::Handle<slates_vfs::dir::DirNode>, VfsError> {
   let mut dir = vol.root();
   for p in path {
-    match vol.lookup(store, dir, p).ok()?.child {
+    match vol.lookup(store, dir, p)?.child {
       Child::Dir(h) => dir = h,
-      _ => return None,
+      _ => return Err(VfsError::NotDirectory),
     }
   }
-  Some(dir)
+  Ok(dir)
 }
 
 /// The real and the expected outcome of one step.
@@ -579,8 +542,8 @@ fn apply_names(step: &Step, vol: &mut Volume, store: &mut Store, model: &mut Mod
     ),
     Step::Rename(fp, fnm, tp, tn) => (
       match (dir_handle(vol, store, fp), dir_handle(vol, store, tp)) {
-        (Some(f), Some(t)) => vol.rename(store, f, fnm, t, tn),
-        _ => Err(VfsError::NotFound),
+        (Ok(f), Ok(t)) => vol.rename(store, f, fnm, t, tn),
+        (Err(e), _) | (_, Err(e)) => Err(e),
       },
       model.rename(fp, fnm, tp, tn),
     ),
@@ -639,7 +602,7 @@ fn with_dir(
     slates_mem::Handle<slates_vfs::dir::DirNode>,
   ) -> Result<(), VfsError>,
 ) -> Result<(), VfsError> {
-  let dir = dir_handle(vol, store, path).ok_or(VfsError::NotFound)?;
+  let dir = dir_handle(vol, store, path)?;
   op(vol, store, dir)
 }
 
@@ -674,7 +637,7 @@ fn run(steps: Vec<Step>, quota: u64) {
 }
 
 proptest! {
-  #![proptest_config(ProptestConfig { cases: 400, max_shrink_iters: 4000, .. ProptestConfig::default() })]
+  #![proptest_config(ProptestConfig { cases: 400, max_shrink_iters: 4000, failure_persistence: None, .. ProptestConfig::default() })]
 
   #[test]
   fn the_volume_equals_the_model_on_every_history(steps in prop::collection::vec(step(), 1..40)) {
@@ -702,6 +665,8 @@ fn ac_1_1_one_million_generated_operations_agree_with_the_model() {
   let mut runner = TestRunner::new(Config {
     cases: CASES_PER_CALL,
     max_shrink_iters: 4000,
+    // Never write a regression file into the tree (CLAUDE.md §4).
+    failure_persistence: None,
     ..Config::default()
   });
   let strategy = prop::collection::vec(step(), 1..40);

@@ -28,7 +28,7 @@ fn names(vol: &Volume, store: &slates_vfs::volume::Store) -> Vec<String> {
 }
 
 proptest! {
-  #![proptest_config(ProptestConfig { cases: 200, .. ProptestConfig::default() })]
+  #![proptest_config(ProptestConfig { cases: 200, failure_persistence: None, .. ProptestConfig::default() })]
 
   /// T-1.6: under any interleaving, each clone sees only its own writes and creates, the
   /// snapshot and the origin head still read the base bytes and list only the base file.

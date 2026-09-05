@@ -239,10 +239,12 @@ budget plus the clock-check allowance plus the measured jitter); T-1.1, 1.2, 1.3
 1.7, 1.8, 1.9 as named tests; T-1.6 in its one-shard form (a generated interleaving of two
 clones; the shuttle form arrives with Phase 2's threads).
 
-Open in Phase 1 (owed in this phase, in order): AC-1.2 the differential harness against tmpfs
-with the reviewed equivalence policy (`docs/wip/EQUIVALENCE.md`, Linux CI lane; a macOS RAM
-disk is a system-state change Ada has not authorized, so the local run skips loudly); task 14
-the deriver; task 10 `slates-base`; tasks 11–13 `slates-land`, its oracle and baselines.
+Open in Phase 1 (owed in this phase, in order): task 14 the deriver; task 10 `slates-base`;
+tasks 11–13 `slates-land`, its oracle and baselines. AC-1.2's harness
+(`crates/vfs/tests/differential.rs`) and policy (`docs/wip/EQUIVALENCE.md`) are written; it
+runs in the Linux lane against `/dev/shm` (2,000 histories) and skips loudly elsewhere, since a
+macOS RAM disk is a system-state change Ada has not authorized; its first run is the lane's,
+not a local one.
 
 Deviations from the §4.5 text, each measured (BENCHMARKS.md, Phase 1 baseline) and applied to
 the design in A-7:

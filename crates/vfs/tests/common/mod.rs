@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod steps;
+
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
 use slates_vfs::clock::StepClock;

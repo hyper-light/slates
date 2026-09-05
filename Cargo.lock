@@ -697,6 +697,7 @@ dependencies = [
 name = "slates-vfs"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "proptest",
  "slates-machine",
  "slates-mem",
