@@ -830,6 +830,19 @@ every mutation, `slates exec` (the launcher), the conformance suites (pjdfstest,
 and the workload harnesses, and the base-files read path through the mount. These are Phase 3
 tasks 1b–8; the codec is the foundation they build on.
 
+The bridge dispatch landed 2026-09-05 (still Phase 3 task 1, pure): `bridge.rs` defines the
+`Bridge` trait (§4.6's methods, one real implementation to come in the daemon over the volume
+core) and `dispatch(message, bridge, out)` — the seam between the wire and the semantics. It
+parses a request, calls the matching method, and encodes the reply or the errno: `INIT`
+negotiates, `LOOKUP`/`GETATTR`/`OPEN`/`OPENDIR`/`READ`/`WRITE`/`READDIR`/`CREATE`/`RELEASE`/
+`FLUSH`/`FORGET` reach the bridge, a `Result::Err(errno)` becomes the kernel's negated errno, a
+parse failure is `EIO`, and an unserved opcode is `ENOSYS` without reaching the bridge. Gated
+(`crates/bridge-fuse/tests/dispatch.rs`, 3 tests, every host): a mock one-file bridge driven
+through the dispatch — LOOKUP and its ENOENT, READ returning a slice and WRITE mutating the
+file, READDIR packing an entry, INIT negotiating, FORGET reaching the bridge with no reply, and
+an unserved opcode answered ENOSYS. The transport (the `/dev/fuse` read/write loop) is the thin
+Linux-only layer over this dispatch.
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3

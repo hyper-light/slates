@@ -18,6 +18,7 @@
 //! to whatever the kernel offers.
 
 pub mod abi;
+pub mod bridge;
 pub mod error;
 pub mod init;
 pub mod reply;
@@ -25,6 +26,7 @@ pub mod request;
 pub mod wire;
 
 pub use abi::{FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, Opcode};
+pub use bridge::{Bridge, DirEntry, dispatch};
 pub use error::FuseError;
 pub use init::{InitNegotiation, negotiate};
 pub use reply::{Attr, EntryOut, OpenOut, ReplyHeader, WriteOut};
