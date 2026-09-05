@@ -315,6 +315,11 @@ the lookup instruction-identical, readdir itself inlined into the bench). A code
 shift; the ceiling is raised to the widest edge measured, with the reason in the file, and
 tightens again when that path is next touched. The same run tightened eleven other rows.
 
+The database rows were recorded 2026-09-05 (7 rows; 12 others tightened in the same run). A
+first attempt aborted because the volume-core bench's own acceptance gate (AC-1.3 or AC-1.8,
+timing-sensitive) failed once under the ratchet's load and passed when the bench ran alone;
+the ratchet now prints a failing bench's `ac-` lines so the gate is named, not guessed.
+
 The rule gained a condition on 2026-09-05: a ceiling tightens only when the improvement is
 larger than the row's own between-run drift. Before that, three rows tightened by a cold run
 "regressed" by 1-5% on warm runs, one of them in the memory crate, untouched since Phase 0

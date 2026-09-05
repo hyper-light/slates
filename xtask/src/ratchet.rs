@@ -260,9 +260,16 @@ fn measure_all(root: &Path, runs: usize) -> Result<BTreeMap<String, Across>, Fai
         .current_dir(root)
         .output()?;
       if !output.status.success() {
+        // The bench's own acceptance lines are on stdout; the last of them names the gate.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let gates: Vec<&str> = stdout
+          .lines()
+          .filter(|l| l.starts_with("ac-") || l.starts_with("gate"))
+          .collect();
         return Err(Failure(format!(
-          "{krate} bench failed: {}",
-          String::from_utf8_lossy(&output.stderr)
+          "{krate} bench failed: {}\n{}",
+          String::from_utf8_lossy(&output.stderr).trim(),
+          gates.join("\n")
         )));
       }
       let rows = parse(&String::from_utf8_lossy(&output.stdout));
