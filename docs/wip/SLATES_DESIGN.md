@@ -2470,10 +2470,12 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > metadata, differing-target, rename/rename and not-empty conflicts; a rename captures the source
 > content so an intervening edit follows the move, removes apply before sets so a chained rename
 > rotates correctly, and a directory is removable once the increment's own removals empty it).
-> Directory rename, hard link and xattr merges through the engine (these and the fully general
-> intra-increment coordination need the engine to consume the whole ops document), per-range
-> identity, the checkpoint folding of the canonical deltas, and the green chain are the rest of
-> Phase 6; the fleet register, mirror and reconfiguration protocols are now simulated (§4.8 status,
+> The engine now consumes the whole ops document (`Increment { doc, post_state }`) rather than one
+> change per path, so directory rename (as the deriver's child ops), hard link (a namespace edge)
+> and xattr merge too, and several dimensions on one path in one increment merge together. The fully
+> general intra-increment coordination (a path both renamed away and recreated in one increment),
+> per-range identity, the checkpoint folding of the canonical deltas, and the green chain are the
+> rest of Phase 6; the fleet register, mirror and reconfiguration protocols are now simulated (§4.8 status,
 > GAPS §8h).
 
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
