@@ -1,6 +1,6 @@
 # slates — unified design and phased implementation plan
 
-Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 (the volume core, the deriver, the base plane and the landing: `slates-vfs`, `slates-base`, `slates-land`) are implemented and gated; Phase 2 is in progress (tasks 1–5, the anchor, the database, the IPC, the server, the Rust client and the `slates` command: `slates-anchor`, `slates-db`, `slates-ipc`, `slates-server`, `slates-client`, `slates-cli`; GAPS §8d); the rest is design.
+Status: DESIGN v2, 2026-09-05. Research complete (see `docs/wip/research/`). Phase 0 (foundations) and Phase 1 (the volume core, the deriver, the base plane and the landing: `slates-vfs`, `slates-base`, `slates-land`) are implemented and gated; Phase 2 is in progress (tasks 1–7: the anchor, the database, the IPC, the server, the Rust client, the `slates` command, the provisioning histogram, and the register protocol at f=0 — `slates-anchor`, `slates-db`, `slates-ipc`, `slates-server`, `slates-client`, `slates-cli`; GAPS §8d); the rest is design.
 This version integrates amendments A-1, A-2, A-4, A-5 and A-6 into the body; the amendment log at
 the end is history, and where the log and the body disagree, the body wins.
 Every decision below cites tiered evidence; every tunable is a measured derivation; every phase
@@ -1315,6 +1315,19 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 **Laptop degenerate.** Identical.
 
 ### 4.8 Metadata database, registers and configuration (D-14, D-18)
+
+> **Status (2026-09-05).** The register protocol's f=0 degenerate is implemented (GAPS §8d,
+> Phase 2 task 7): `crates/db/src/register.rs` is the pure core parameterized by the fault
+> tolerance `f` — `Quorum` (`2f+1` candidates, commit at `f+1`), rendezvous candidate selection,
+> the `Fence` (a record under a host epoch below the highest seen is refused `StaleEpoch`), and
+> `Configuration` (the one-voter oracle: a stale version is refused `ConfigurationStale`;
+> `await placed(region|mirror)` returns for the region and refuses the absent mirror). At `f=0` a
+> register's only candidate is the owner, its commit is the local append, `placed` is true the
+> moment the owner holds it, and the configuration never advances — the same code a fleet runs
+> with a larger `f`. Every reply carries the placement from the first version (`PlacedState`:
+> `region`, `mirror_age_ns`, `host_epoch` on `status`; the `await_placed` verb and `slates volume
+> placed`), so Phase 8 changes no interface. The N=1 differential (AC-2.5's register slice)
+> asserts f=0 and a simulated f=1 agree. Holders, takeover, mirroring and migration are Phase 8.
 
 **Role.** The authoritative record of volumes, snapshots, lineage, leases, attachments,
 accounting, completion records, grants, chains and the operation log; served locally in

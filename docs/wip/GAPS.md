@@ -709,6 +709,47 @@ every instruction (AC-2.3's simulation half) arrive with the chaos harness; the 
 security test (T-2.7) needs a second uid, gated on CI (the rendezvous refuses and counts it
 now); a completion fd for parked SDK event loops is Phase 5.
 
+Task 7 (the register protocol at f=0) landed 2026-09-05: `crates/db/src/register.rs`, the pure
+core of §4.8 parameterized by the fault tolerance `f` so the laptop is the degenerate of one
+formula (R8), never a mode: `Quorum` (`2f+1` candidates, commit at `f+1`, `f=0` giving one
+candidate and a commit of one, the local append); rendezvous (highest-random-weight) candidate
+selection, owner-first and deterministic, so every host computes the same holder set from an
+object id with no directory; `Fence`, a holder's monotonic authority for a host (a record under
+a host epoch below the highest seen is refused `StaleEpoch`, so a resumed stale owner never
+commits); and `Configuration`, the one-voter oracle (`solo`: version 0, one member, `f=0`, no
+mirror; `check_version` refuses a stale version with the current one; `await_placed(scope)`
+returns for the region — the local append at f=0 — and refuses the absent mirror `Unsupported`).
+Every reply carries the placement from the first version so Phase 8 changes no interface: the
+wire gained `PlacedState` (`region`, `mirror_age_ns`, `host_epoch`) on `StatusReport`, the
+`Scope` enum, and the `AwaitPlaced` request with the `Placed` reply; the server holds a
+`Configuration::solo` per shard built from the machine identity's host id, records a snapshot's
+placement through it (placed at f=0), reports the head's placement and the host epoch in
+`status`, and serves `await_placed`; the client has `await_placed` and the CLI `slates volume
+placed ID [--snapshot N] [--mirror]` with the placement fields in `status`.
+
+Gated (`crates/db/src/register.rs` tests): the commit rule is the same code at f=0 and a
+simulated f=1 (one candidate vs three, both `placed`), the observable differing only by the
+quorum's own count (AC-2.5's register slice); a stale host epoch is refused at every f
+(`StaleNeverCommits`); a stale configuration version is refused with the current one; `await
+placed(region)` returns and the absent mirror is refused; rendezvous placement is
+deterministic, owner-first and spread. The client and CLI tests assert the f=0 placement over
+the real rings: `status` shows `placed=true`, `host_epoch=1`, no mirror; `await_placed(region)`
+returns `(true, None)` and the mirror is refused `Unsupported`.
+
+Found by the CLI test on its first run: `detach` carried only an attachment id and ran on the
+detaching client's shard, but the attachment record lives on the volume's owner shard; it had
+passed only because earlier client ids happened to land on the owner shard, and task 7's extra
+clients shifted them. Attachment ids now carry their owner partition in the high 16 bits
+(`attachment_id`/`owner_of_attachment`) and `detach` routes to it, like a volume id (§4.8
+'ids route to owners, no global index'); a latent cross-shard `detach` bug closed.
+
+Owed from task 7: the holders, the put with hedging and recorded holder sets, takeover and
+phase-one adoption, the healer and probation, mirroring and `await placed(mirror)`, migration
+on a write-intent attachment, and the SWIM membership are Phase 8 (the register core is
+f-parameterized so they raise `f` without a new shape); the host epoch is persisted only as the
+constant 1 until a takeover can bump it (Phase 8); a chain is a register written in sequence,
+which arrives with the merge engine (Phase 6).
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3
