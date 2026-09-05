@@ -3,7 +3,9 @@
 //! normal extent reads its bytes from the named chunk (decoded and identity-verified), a
 //! zero-chunk extent is a hole that reads as zeros. A file whose extent names a chunk the archive
 //! does not hold is a typed refusal, and every chunk is verified before its bytes are used, so a
-//! corrupt chunk is caught and named (AC-7.3).
+//! corrupt chunk is caught and named (AC-7.3). Each named node's metadata (mode, times, size,
+//! nlink, xattr flags) is surfaced by path alongside the files and directories, for a granted
+//! landing to apply to the host path; restore itself reconstructs only the in-memory tree.
 //!
 //! This is the eager, whole-tree restore. Lazy restore — attaching after a metadata-only pass and
 //! decompressing each chunk on first read (AC-7.4) — is the runtime's job on top of this and is
@@ -13,15 +15,19 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::archive::Archive;
 use crate::format::{ArchiveError, Chunk};
-use crate::manifest::{Extent, Node};
+use crate::manifest::{Extent, Node, NodeMeta};
 
-/// A restored volume: the files' contents by path, and the directories present.
+/// A restored volume: the files' contents by path, the directories present, and each named node's
+/// metadata. The metadata is what a granted landing applies to the host path (mode, times); restore
+/// itself only reconstructs the in-memory tree.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Restored {
   /// Each file's path and its reconstructed bytes.
   pub files: BTreeMap<String, Vec<u8>>,
   /// The directory paths.
   pub directories: BTreeSet<String>,
+  /// Each named node's metadata, by path (the root has no naming entry, so no entry for it).
+  pub metadata: BTreeMap<String, NodeMeta>,
 }
 
 /// A lookup from chunk identity to the chunk, built once from the archive's chunks so restore does
@@ -82,6 +88,7 @@ fn walk(
         } else {
           format!("{prefix}/{}", entry.name)
         };
+        restored.metadata.insert(child.clone(), entry.meta);
         walk(index, &child, &entry.node, restored)?;
       }
     }

@@ -229,3 +229,50 @@ fn restore_decodes_compressed_chunks() {
   let restored = restore(&archive).expect("restores");
   assert_eq!(restored.files.get("z"), Some(&raw));
 }
+
+/// Restore surfaces each named node's metadata by path (for a granted landing to apply).
+#[test]
+fn restore_surfaces_node_metadata() {
+  let chunk = Archive::raw_chunk(b"hi".to_vec());
+  let meta = NodeMeta {
+    ino: 7,
+    mode: 0o600,
+    mtime_ns: 123,
+    ctime_ns: 456,
+    size: 2,
+    nlink: 1,
+    xattr_flags: 0,
+  };
+  let manifest = Node::Directory(vec![Entry {
+    name: "secret".to_owned(),
+    meta,
+    node: Node::File(vec![Extent {
+      offset: 0,
+      len: 2,
+      chunk: chunk.identity,
+      chunk_offset: 0,
+    }]),
+  }]);
+  let archive = Archive {
+    base_page_size: 4096,
+    chunk_min: 4096,
+    chunk_max: 65_536,
+    created_unix: 0,
+    volume_id: 1,
+    snapshot_id: 1,
+    name_policy_id: 1,
+    unicode_version: 15,
+    manifest,
+    chunks: vec![chunk],
+  };
+  let restored = restore(&archive).expect("restores");
+  assert_eq!(restored.metadata.get("secret"), Some(&meta));
+  // The metadata survives an encode/decode round trip through the archive stream.
+  let decoded = Archive::decode(&archive.encode()).expect("decodes");
+  let restored = restore(&decoded).expect("restores");
+  assert_eq!(
+    restored.metadata.get("secret"),
+    Some(&meta),
+    "metadata survives the stream"
+  );
+}
