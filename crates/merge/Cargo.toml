@@ -11,5 +11,8 @@ description = "The merge engine (D-27, §4.16): the deterministic two-pass verdi
 [dependencies]
 blake3 = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 [lints]
 workspace = true
