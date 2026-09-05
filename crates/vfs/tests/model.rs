@@ -722,29 +722,40 @@ proptest! {
 #[test]
 #[ignore = "AC-1.1: 10^6 operations; CI runs it with --ignored"]
 fn ac_1_1_one_million_generated_operations_agree_with_the_model() {
-  use proptest::test_runner::{Config, TestRunner};
+  use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
   /// Format: the design's operation count for AC-1.1.
   const OPERATIONS: u64 = 1_000_000;
-  /// Shape: cases per runner call; the loop calls the runner until the count is reached.
-  const CASES_PER_CALL: u32 = 1000;
+  /// Shape: cases per runner; a runner keeps its success count, so each batch gets a fresh
+  /// one, seeded from the batch number so a failing batch can be rerun.
+  const CASES_PER_BATCH: u32 = 1000;
   let applied = std::cell::Cell::new(0u64);
-  let mut runner = TestRunner::new(Config {
-    cases: CASES_PER_CALL,
-    max_shrink_iters: 4000,
-    // Never write a regression file into the tree (CLAUDE.md §4).
-    failure_persistence: None,
-    ..Config::default()
-  });
   let strategy = prop::collection::vec(step(), 1..40);
+  let mut batch = 0u64;
   while applied.get() < OPERATIONS {
+    let mut seed = [0u8; 32];
+    seed[..8].copy_from_slice(&batch.to_le_bytes());
+    let mut runner = TestRunner::new_with_rng(
+      Config {
+        cases: CASES_PER_BATCH,
+        max_shrink_iters: 4000,
+        // Never write a regression file into the tree (CLAUDE.md §4).
+        failure_persistence: None,
+        ..Config::default()
+      },
+      TestRng::from_seed(RngAlgorithm::ChaCha, &seed),
+    );
     let result = runner.run(&strategy, |steps| {
       applied.set(applied.get() + u64::try_from(steps.len()).unwrap());
       run(steps, 1 << 20);
       Ok(())
     });
     if let Err(e) = result {
-      panic!("AC-1.1 failed after {} operations: {e}", applied.get());
+      panic!(
+        "AC-1.1 failed in batch {batch} after {} operations: {e}",
+        applied.get()
+      );
     }
+    batch += 1;
   }
   println!(
     "AC-1.1: {} generated operations agreed with the model",
