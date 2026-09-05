@@ -29,10 +29,17 @@
 //! mode changes are a `MetaMeta` conflict and two differing symlink targets a `CreateCreate`
 //! conflict, while an identical one on either accepts.
 //!
-//! Directory removal (needing emptiness), rename and link (cross-path effects) and xattrs (keyed by
-//! path and name, so several per path) are the continuing step; the deriver already composes them,
-//! and carrying them here needs the engine to consume the whole ops document rather than one change
-//! per path. Per-range identity within a mixed file is owed.
+//! A file **rename** merges too, keyed at the destination and naming its source (`Rename { from }`):
+//! the source's current content is captured (so an intervening edit to the source follows the move),
+//! and the source is removed. A source an intervening change renamed away or removed, or a
+//! destination an intervening change occupied, is a `RenameRename` conflict; a destination that is a
+//! directory or symlink is a `TypeChanged` conflict. Removes apply before sets in a commit, so an
+//! increment that renames a file away and recreates one at the old path keeps both.
+//!
+//! Directory removal (needing emptiness), directory rename (children move), hard link, and xattr
+//! (keyed by path and name, so several per path) merges are the continuing step; those and the fully
+//! general intra-increment coordination need the engine to consume the whole ops document. Per-range
+//! identity within a mixed file is owed.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -69,6 +76,12 @@ pub enum PathChange {
   Symlink {
     /// The link's target.
     target: String,
+  },
+  /// Rename a file to this path (the change is keyed at the destination), moving the source file's
+  /// current content here and removing the source. File renames only for now.
+  Rename {
+    /// The source path the file is moving from.
+    from: String,
   },
 }
 
@@ -183,6 +196,13 @@ enum PathMerge {
   Mode(u32),
   /// Create or retarget a symbolic link at the path with this target.
   MakeSymlink(String),
+  /// Move a file: set the destination (the merged path) to `dst_content` and remove `source`.
+  Rename {
+    /// The content to place at the destination (the source's content, captured at merge time).
+    dst_content: Vec<u8>,
+    /// The source path to remove.
+    source: String,
+  },
   /// No net change to the file.
   Unchanged,
 }
@@ -385,6 +405,32 @@ impl Green {
     Ok(PathMerge::Mode(mode))
   }
 
+  /// Merges a file rename to `dst` from `from`. The source must be a file present now; a source an
+  /// intervening change renamed away or removed is a rename/rename conflict, as is a destination an
+  /// intervening change occupied. The source's current content is captured (so an intervening edit
+  /// to the source follows the rename), and the source is removed at commit.
+  fn merge_rename(&self, dst: &str, base: u64, from: &str) -> Result<PathMerge, ConflictWindow> {
+    if from == dst {
+      return Ok(PathMerge::Unchanged);
+    }
+    let Some(source_content) = self.content.get(from) else {
+      // The source is gone (renamed or removed by an intervening change) or is not a file.
+      return Err(Green::window(dst, MergeConflictClass::RenameRename));
+    };
+    if self.dirs.contains(dst) || self.symlinks.contains_key(dst) {
+      return Err(Green::window(dst, MergeConflictClass::TypeChanged));
+    }
+    let dst_changed = self.last_changed.get(dst).copied().unwrap_or(0);
+    if dst_changed > base {
+      // An intervening change created or wrote the destination.
+      return Err(Green::window(dst, MergeConflictClass::RenameRename));
+    }
+    Ok(PathMerge::Rename {
+      dst_content: source_content.clone(),
+      source: from.to_owned(),
+    })
+  }
+
   /// Merges one file's change.
   fn merge_path(
     &mut self,
@@ -399,6 +445,7 @@ impl Green {
       PathChange::Mkdir => self.merge_mkdir(path),
       PathChange::SetMode { mode } => self.merge_setmode(path, base, *mode),
       PathChange::Symlink { target } => self.merge_symlink(path, base, target),
+      PathChange::Rename { from } => self.merge_rename(path, base, from),
     }
   }
 
@@ -423,6 +470,21 @@ impl Green {
         Ok(PathMerge::MakeDir) => mkdirs.push(path.clone()),
         Ok(PathMerge::Mode(mode)) => set_modes.push((path.clone(), mode)),
         Ok(PathMerge::MakeSymlink(target)) => set_symlinks.push((path.clone(), target)),
+        Ok(PathMerge::Rename {
+          dst_content,
+          source,
+        }) => {
+          let ops = vec![Op {
+            kind: OpKind::Insert,
+            flags: 0,
+            path: 0,
+            at: 0,
+            len: dst_content.len() as u64,
+            src: 0,
+          }];
+          sets.insert(path.clone(), (dst_content, ops));
+          removes.push(source);
+        }
         Ok(PathMerge::Unchanged) => {}
         Err(window) => windows.push(window),
       }
@@ -434,14 +496,16 @@ impl Green {
     }
     let version = self.head() + 1;
     let mut delta: BTreeMap<String, Vec<Op>> = BTreeMap::new();
+    // Removes apply before sets, so a rename's source removal never deletes a file the same
+    // increment recreates or renames into at that path.
+    for path in removes {
+      self.content.remove(&path);
+      self.last_changed.insert(path, version);
+    }
     for (path, (content, ops)) in sets {
       self.content.insert(path.clone(), content);
       self.last_changed.insert(path.clone(), version);
       delta.insert(path, ops);
-    }
-    for path in removes {
-      self.content.remove(&path);
-      self.last_changed.insert(path, version);
     }
     for path in mkdirs {
       self.dirs.insert(path);

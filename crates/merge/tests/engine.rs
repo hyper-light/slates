@@ -507,3 +507,109 @@ fn symlink_and_file_at_one_path_conflict() {
     "a file over a symlink is a type conflict"
   );
 }
+
+/// A change that renames a file to the keyed path from `from`.
+fn rename(from: &str) -> PathChange {
+  PathChange::Rename {
+    from: from.to_owned(),
+  }
+}
+
+/// A rename moves a file's content to the destination and removes the source.
+#[test]
+fn rename_moves_a_file() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "a", create(b"payload")));
+  let outcome = green.submit(&increment(2, 1, "b", rename("a")));
+  assert_eq!(outcome, Outcome::Accepted { version: 2 });
+  assert_eq!(green.content("b"), Some(b"payload".as_slice()));
+  assert_eq!(green.content("a"), None, "the source is gone");
+}
+
+/// A rename moves the source's current content, so an intervening edit follows the move.
+#[test]
+fn rename_carries_an_intervening_edit() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "a", create(b"0123456789")));
+  // Agent A edits "a" at version 2.
+  green.submit(&increment(2, 1, "a", overwrite(b"0123456789", 0, b"XX")));
+  // Agent B (based on 1) renames a -> b; the rename moves a's current (edited) content.
+  let outcome = green.submit(&increment(3, 1, "b", rename("a")));
+  assert_eq!(outcome, Outcome::Accepted { version: 3 });
+  assert_eq!(green.content("b"), Some(b"XX23456789".as_slice()));
+  assert_eq!(green.content("a"), None);
+}
+
+/// Two agents renaming the same source conflict: the second finds the source already gone.
+#[test]
+fn rename_of_a_moved_source_conflicts() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "a", create(b"x")));
+  let first = green.submit(&increment(2, 1, "b", rename("a")));
+  assert_eq!(first, Outcome::Accepted { version: 2 });
+  let second = green.submit(&increment(3, 1, "c", rename("a")));
+  match second {
+    Outcome::Conflict { windows } => assert_eq!(
+      windows[0].class,
+      slates_merge::verdict::MergeConflictClass::RenameRename
+    ),
+    other => panic!("expected a rename/rename conflict, got {other:?}"),
+  }
+}
+
+/// A rename whose destination an intervening change occupied conflicts.
+#[test]
+fn rename_onto_an_occupied_destination_conflicts() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "a", create(b"aaa")));
+  // Agent A creates "b" at version 2.
+  green.submit(&increment(2, 1, "b", create(b"other")));
+  // Agent B (based on 1) renames a -> b, but b was created intervening.
+  let outcome = green.submit(&increment(3, 1, "b", rename("a")));
+  assert!(
+    matches!(outcome, Outcome::Conflict { .. }),
+    "an occupied destination conflicts"
+  );
+}
+
+/// Renaming over a file that existed at the base replaces it.
+#[test]
+fn rename_over_a_base_file_replaces_it() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "a", create(b"from-a")));
+  green.submit(&increment(2, 1, "b", create(b"old-b")));
+  // Based on version 2, both a and b exist; rename a -> b replaces b.
+  let outcome = green.submit(&increment(3, 2, "b", rename("a")));
+  assert_eq!(outcome, Outcome::Accepted { version: 3 });
+  assert_eq!(green.content("b"), Some(b"from-a".as_slice()));
+  assert_eq!(green.content("a"), None);
+}
+
+/// A chained rename in one increment (a→b and b→c) rotates correctly: removes apply before sets, so
+/// renaming into a path another rename is vacating does not lose the moved content.
+#[test]
+fn a_chained_rename_in_one_increment_is_correct() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "a", create(b"A")));
+  green.submit(&increment(2, 1, "b", create(b"B")));
+  let mut changes = BTreeMap::new();
+  changes.insert("c".to_owned(), rename("b")); // b -> c
+  changes.insert("b".to_owned(), rename("a")); // a -> b
+  let outcome = green.submit(&Increment {
+    id: [9; 32],
+    base: 2,
+    changes,
+  });
+  assert_eq!(outcome, Outcome::Accepted { version: 3 });
+  assert_eq!(
+    green.content("c"),
+    Some(b"B".as_slice()),
+    "c holds b's content"
+  );
+  assert_eq!(
+    green.content("b"),
+    Some(b"A".as_slice()),
+    "b holds a's content"
+  );
+  assert_eq!(green.content("a"), None, "a is vacated");
+}
