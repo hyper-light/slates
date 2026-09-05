@@ -1085,6 +1085,27 @@ impl Overlay<'_> {
 
   // ---------------------------------------------------------------- content
 
+  /// Looks `name` up in the directory named by inode number `dir_no`, serving base entries.
+  pub fn lookup_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+  ) -> Result<Located, VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.lookup(store, dir, name)
+  }
+
+  /// The entries of the directory named by inode number `dir_no`, base entries merged.
+  pub fn readdir_no<'s>(
+    &mut self,
+    store: &'s mut Store,
+    dir_no: InodeNo,
+  ) -> Result<Vec<DirRow<'s>>, VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.readdir(store, dir)
+  }
+
   /// Reads through pinned extents and the disk; a witnessed entry's disk bytes are read only
   /// after an `fstat` matches the witness, else `BaseDrift` (AC-1.11).
   pub fn read(

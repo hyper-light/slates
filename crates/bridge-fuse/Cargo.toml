@@ -12,6 +12,7 @@ description = "The Linux FUSE bridge: the /dev/fuse ABI codec, FUSE_INIT negotia
 slates-machine = { workspace = true }
 slates-vfs = { workspace = true }
 slates-mem = { workspace = true }
+slates-base = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true }

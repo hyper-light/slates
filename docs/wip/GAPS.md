@@ -897,6 +897,18 @@ golden byte checks (4 tests). The driver writes them before it acknowledges a mu
 so a second process never reads stale attributes after the mutating call returns (AC-3.3); wiring
 them into the mutating dispatch paths is the driver's, with the transport.
 
+Base files through the bridge landed 2026-09-05 (Phase 3 task 8's read path, §4.6 "Base files",
+AC-3.9): `VolumeBridge::with_base` holds the overlay's read-only `OsHost`, and lookup, getattr,
+readdir and read route through `Volume::with_host` (the overlay path that serves untouched base
+entries from the disk), the volume core gaining `Overlay::lookup_no`/`readdir_no`. Gated
+(`crates/bridge-fuse/tests/base_overlay.rs`, on any Unix host — the base is a real read-only
+directory, this crate's own `src`): an overlay over `src`, served through the bridge, lists its
+base files, looks `lib.rs` up, and reads it back byte-identical to reading the file straight
+from disk, writing nothing. Owed: a standalone `LOOKUP` of an unlisted base entry loads the
+directory's base listing on demand (today the listing loads on `readdir`, which the kernel does
+first; the realistic sequence is verified); base writes' copy-up through the mount, `mmap` of a
+base file, and the splice reply path — all with the transport.
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3

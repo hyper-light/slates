@@ -7,6 +7,7 @@
 //! lives entirely in RAM, so this is exercised on every host without a mount or a bridge
 //! transport.
 
+use slates_base::OsHost;
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::{Attrs, Kind};
 use slates_vfs::volume::{Store, Volume};
@@ -60,6 +61,9 @@ const NAME_MAX: u32 = 255;
 pub struct VolumeBridge<'v> {
   volume: &'v mut Volume,
   store: &'v mut Store,
+  /// The read-only host of the base directory, for an overlay volume; `None` for a scratch
+  /// volume. Base entries (§4.5) are looked up, listed, stat-ed and read through it.
+  host: Option<OsHost>,
   /// Open handles: the index is the handle, the value the inode it names (files and dirs share
   /// one space; the kernel never confuses them, and the table is bounded by open files).
   handles: Vec<Option<u64>>,
@@ -88,6 +92,19 @@ impl<'v> VolumeBridge<'v> {
     VolumeBridge {
       volume,
       store,
+      host: None,
+      handles: Vec::new(),
+      max_read: MAX_READ,
+    }
+  }
+
+  /// A bridge over an overlay `volume` whose base is served through `host` (§4.5, §4.6 "Base
+  /// files"): untouched base entries are looked up, listed, stat-ed and read from the disk.
+  pub fn with_base(volume: &'v mut Volume, store: &'v mut Store, host: OsHost) -> VolumeBridge<'v> {
+    VolumeBridge {
+      volume,
+      store,
+      host: Some(host),
       handles: Vec::new(),
       max_read: MAX_READ,
     }
@@ -209,10 +226,12 @@ impl Bridge for VolumeBridge<'_> {
 
   fn getattr(&mut self, nodeid: u64) -> Result<Attr, i32> {
     let no = self.inode_of(nodeid)?;
-    let attrs = self
-      .volume
-      .stat(self.store, slates_vfs::ids::InodeNo(no))
-      .map_err(errno)?;
+    let inode = slates_vfs::ids::InodeNo(no);
+    let attrs = match self.host.as_mut() {
+      Some(host) => self.volume.with_host(host).stat(self.store, inode),
+      None => self.volume.stat(self.store, inode),
+    }
+    .map_err(errno)?;
     Ok(attr_of(no, &attrs))
   }
 
@@ -241,10 +260,15 @@ impl Bridge for VolumeBridge<'_> {
     let no = self.handle_inode(fh)?;
     let want = usize::try_from(size).unwrap_or(0).min(self.max_read);
     let mut buf = vec![0u8; want];
-    let read = self
-      .volume
-      .read(self.store, slates_vfs::ids::InodeNo(no), offset, &mut buf)
-      .map_err(errno)?;
+    let inode = slates_vfs::ids::InodeNo(no);
+    let read = match self.host.as_mut() {
+      Some(host) => self
+        .volume
+        .with_host(host)
+        .read(self.store, inode, offset, &mut buf),
+      None => self.volume.read(self.store, inode, offset, &mut buf),
+    }
+    .map_err(errno)?;
     out.extend_from_slice(&buf[..read]);
     Ok(())
   }
@@ -273,10 +297,12 @@ impl Bridge for VolumeBridge<'_> {
 
   fn readdir(&mut self, nodeid: u64, _fh: u64, offset: u64) -> Result<Vec<DirEntry>, i32> {
     let no = self.inode_of(nodeid)?;
-    let rows = self
-      .volume
-      .readdir_no(self.store, slates_vfs::ids::InodeNo(no))
-      .map_err(errno)?;
+    let dir_no = slates_vfs::ids::InodeNo(no);
+    let rows = match self.host.as_mut() {
+      Some(host) => self.volume.with_host(host).readdir_no(self.store, dir_no),
+      None => self.volume.readdir_no(self.store, dir_no),
+    }
+    .map_err(errno)?;
     let start = usize::try_from(offset).unwrap_or(0);
     Ok(
       rows
