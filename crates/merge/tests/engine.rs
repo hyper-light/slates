@@ -446,3 +446,64 @@ fn modify_of_a_path_now_a_directory_conflicts() {
     other => panic!("expected a type conflict, got {other:?}"),
   }
 }
+
+/// A change that creates or retargets a symlink at the path.
+fn symlink(target: &str) -> PathChange {
+  PathChange::Symlink {
+    target: target.to_owned(),
+  }
+}
+
+/// A symlink creates a link with its target.
+#[test]
+fn symlink_creates_a_link() {
+  let mut green = Green::new();
+  let outcome = green.submit(&increment(1, 0, "l", symlink("target")));
+  assert_eq!(outcome, Outcome::Accepted { version: 1 });
+  assert_eq!(green.symlink("l"), Some("target"));
+}
+
+/// Two agents making the same symlink accept (identical target).
+#[test]
+fn identical_symlinks_accept() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "l", symlink("t")));
+  let again = green.submit(&increment(2, 1, "l", symlink("t")));
+  assert_eq!(again, Outcome::Accepted { version: 2 });
+}
+
+/// Two agents pointing one symlink at differing targets from the same base conflict.
+#[test]
+fn differing_symlink_targets_conflict() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "seed", create(b"x")));
+  let a = green.submit(&increment(2, 1, "l", symlink("one")));
+  assert_eq!(a, Outcome::Accepted { version: 2 });
+  let b = green.submit(&increment(3, 1, "l", symlink("two")));
+  match b {
+    Outcome::Conflict { windows } => assert_eq!(
+      windows[0].class,
+      slates_merge::verdict::MergeConflictClass::CreateCreate
+    ),
+    other => panic!("expected a create/create conflict, got {other:?}"),
+  }
+  assert_eq!(green.symlink("l"), Some("one"), "the first target stands");
+}
+
+/// A symlink where an intervening change created a file is a type conflict, and the reverse.
+#[test]
+fn symlink_and_file_at_one_path_conflict() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "a", create(b"file")));
+  let over_file = green.submit(&increment(2, 1, "a", symlink("t")));
+  assert!(
+    matches!(over_file, Outcome::Conflict { .. }),
+    "a symlink over a file is a type conflict"
+  );
+  green.submit(&increment(3, 2, "b", symlink("t")));
+  let over_link = green.submit(&increment(4, 3, "b", create(b"file")));
+  assert!(
+    matches!(over_link, Outcome::Conflict { .. }),
+    "a file over a symlink is a type conflict"
+  );
+}

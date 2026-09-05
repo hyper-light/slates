@@ -23,13 +23,16 @@
 //!   intervening change modified it since the base.
 //!
 //! The namespace merges alongside the content, as independent dimensions (the deriver composes them
-//! the same way, §4.16): a directory creation (`Mkdir`) and a mode change (`SetMode`) each merge per
-//! path with their own conflict classes — a file and a directory at one path is a `TypeChanged`
-//! conflict, two differing mode changes are a `MetaMeta` conflict, and an identical one accepts.
-//! Directory removal (needing emptiness), renames and links (cross-path effects), symlinks and
-//! xattrs are the continuing step; the deriver already composes them.
+//! the same way, §4.16): a directory creation (`Mkdir`), a mode change (`SetMode`) and a symbolic
+//! link (`Symlink`) each merge per path with their own conflict classes. A path that is a file on
+//! one side and a directory or a symlink on the other is a `TypeChanged` conflict; two differing
+//! mode changes are a `MetaMeta` conflict and two differing symlink targets a `CreateCreate`
+//! conflict, while an identical one on either accepts.
 //!
-//! Per-range identity within a mixed file is owed.
+//! Directory removal (needing emptiness), rename and link (cross-path effects) and xattrs (keyed by
+//! path and name, so several per path) are the continuing step; the deriver already composes them,
+//! and carrying them here needs the engine to consume the whole ops document rather than one change
+//! per path. Per-range identity within a mixed file is owed.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -61,6 +64,11 @@ pub enum PathChange {
   SetMode {
     /// The new mode bits.
     mode: u32,
+  },
+  /// Create or retarget a symbolic link at the path.
+  Symlink {
+    /// The link's target.
+    target: String,
   },
 }
 
@@ -108,9 +116,11 @@ pub struct Green {
   content: BTreeMap<String, Vec<u8>>,
   dirs: BTreeSet<String>,
   modes: BTreeMap<String, u32>,
+  symlinks: BTreeMap<String, String>,
   deltas: Vec<BTreeMap<String, Vec<Op>>>,
   last_changed: BTreeMap<String, u64>,
   mode_changed: BTreeMap<String, u64>,
+  symlink_changed: BTreeMap<String, u64>,
   seen: BTreeMap<[u8; 32], Outcome>,
   fast_path_hits: u64,
 }
@@ -171,6 +181,8 @@ enum PathMerge {
   MakeDir,
   /// Set the path's mode.
   Mode(u32),
+  /// Create or retarget a symbolic link at the path with this target.
+  MakeSymlink(String),
   /// No net change to the file.
   Unchanged,
 }
@@ -199,6 +211,11 @@ impl Green {
   /// A path's current mode, or `None` when none has been set.
   pub fn mode(&self, path: &str) -> Option<u32> {
     self.modes.get(path).copied()
+  }
+
+  /// A symbolic link's target at the path, or `None` when the path is not a symlink.
+  pub fn symlink(&self, path: &str) -> Option<&str> {
+    self.symlinks.get(path).map(String::as_str)
   }
 
   /// The number of paths merged through the fast path (the non-vacuity counter).
@@ -233,8 +250,8 @@ impl Green {
     post_state: &[u8],
   ) -> Result<PathMerge, ConflictWindow> {
     if !self.content.contains_key(path) {
-      if self.dirs.contains(path) {
-        // An intervening change replaced the file with a directory.
+      if self.dirs.contains(path) || self.symlinks.contains_key(path) {
+        // An intervening change replaced the file with a directory or a symlink.
         return Err(Green::window(path, MergeConflictClass::TypeChanged));
       }
       // The agent edited a file an intervening change deleted.
@@ -282,8 +299,8 @@ impl Green {
 
   /// Merges a create.
   fn merge_create(&self, path: &str, post_state: &[u8]) -> Result<PathMerge, ConflictWindow> {
-    if self.dirs.contains(path) {
-      // An intervening change made this path a directory.
+    if self.dirs.contains(path) || self.symlinks.contains_key(path) {
+      // An intervening change made this path a directory or a symlink.
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     match self.content.get(path) {
@@ -320,13 +337,35 @@ impl Green {
   /// Merges a directory creation. A file at the path is a type conflict; an existing directory is an
   /// identical accept (both agents made it); otherwise the directory is created.
   fn merge_mkdir(&self, path: &str) -> Result<PathMerge, ConflictWindow> {
-    if self.content.contains_key(path) {
+    if self.content.contains_key(path) || self.symlinks.contains_key(path) {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     if self.dirs.contains(path) {
       return Ok(PathMerge::Unchanged);
     }
     Ok(PathMerge::MakeDir)
+  }
+
+  /// Merges a symbolic link. A file or directory at the path is a type conflict; an intervening
+  /// symlink with the same target is an identical accept, a differing one a conflict; otherwise the
+  /// link is created or retargeted.
+  fn merge_symlink(
+    &self,
+    path: &str,
+    base: u64,
+    target: &str,
+  ) -> Result<PathMerge, ConflictWindow> {
+    if self.content.contains_key(path) || self.dirs.contains(path) {
+      return Err(Green::window(path, MergeConflictClass::TypeChanged));
+    }
+    let changed = self.symlink_changed.get(path).copied().unwrap_or(0);
+    if changed > base {
+      if self.symlinks.get(path).map(String::as_str) == Some(target) {
+        return Ok(PathMerge::Unchanged);
+      }
+      return Err(Green::window(path, MergeConflictClass::CreateCreate));
+    }
+    Ok(PathMerge::MakeSymlink(target.to_owned()))
   }
 
   /// Merges a mode change. The path must be present (a file or a directory); if an intervening
@@ -359,6 +398,7 @@ impl Green {
       PathChange::Remove => self.merge_remove(path, base),
       PathChange::Mkdir => self.merge_mkdir(path),
       PathChange::SetMode { mode } => self.merge_setmode(path, base, *mode),
+      PathChange::Symlink { target } => self.merge_symlink(path, base, target),
     }
   }
 
@@ -372,6 +412,7 @@ impl Green {
     let mut removes: Vec<String> = Vec::new();
     let mut mkdirs: Vec<String> = Vec::new();
     let mut set_modes: Vec<(String, u32)> = Vec::new();
+    let mut set_symlinks: Vec<(String, String)> = Vec::new();
     let mut windows = Vec::new();
     for (path, change) in &increment.changes {
       match self.merge_path(path, increment.base, change) {
@@ -381,6 +422,7 @@ impl Green {
         Ok(PathMerge::Remove) => removes.push(path.clone()),
         Ok(PathMerge::MakeDir) => mkdirs.push(path.clone()),
         Ok(PathMerge::Mode(mode)) => set_modes.push((path.clone(), mode)),
+        Ok(PathMerge::MakeSymlink(target)) => set_symlinks.push((path.clone(), target)),
         Ok(PathMerge::Unchanged) => {}
         Err(window) => windows.push(window),
       }
@@ -407,6 +449,10 @@ impl Green {
     for (path, mode) in set_modes {
       self.modes.insert(path.clone(), mode);
       self.mode_changed.insert(path, version);
+    }
+    for (path, target) in set_symlinks {
+      self.symlinks.insert(path.clone(), target);
+      self.symlink_changed.insert(path, version);
     }
     self.deltas.push(delta);
     let outcome = Outcome::Accepted { version };
