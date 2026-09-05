@@ -23,12 +23,14 @@
 //! buys, and it never decides a conflict.
 
 pub mod derive;
+pub mod increment;
 pub mod map;
 pub mod ops_doc;
 pub mod range;
 pub mod verdict;
 
-pub use derive::{ContentOp, compose_content};
+pub use derive::{ContentOp, compose_content, compose_content_sized};
+pub use increment::{FileOp, compose_increment};
 pub use map::{Mapped, map_range};
 pub use ops_doc::{Op, OpKind, OpsDoc, PathTable};
 pub use range::{Range, RangeSet};

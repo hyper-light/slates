@@ -208,6 +208,14 @@ fn op(kind: OpKind, at: u64, len: u64, src: u64) -> Op {
 /// within it an `Insert`; a removal that runs to the base end is a `Truncate`, one within it a
 /// `Delete`.
 pub fn compose_content(base_len: u64, journal: &[ContentOp]) -> Vec<Op> {
+  compose_content_sized(base_len, journal).0
+}
+
+/// Composes as [`compose_content`] does and also returns the final content length (the bytes the
+/// path holds at seal). The multi-path assembler needs it to lay out the increment's post-state:
+/// each path occupies a contiguous region of the post-state, and an op's `src` is its offset
+/// within that region plus the region's base offset.
+pub fn compose_content_sized(base_len: u64, journal: &[ContentOp]) -> (Vec<Op>, u64) {
   let mut pieces = Vec::new();
   if base_len > 0 {
     pieces.push(Piece::Base {
@@ -218,7 +226,8 @@ pub fn compose_content(base_len: u64, journal: &[ContentOp]) -> Vec<Op> {
   for declared in journal {
     apply(&mut pieces, declared);
   }
-  read_out(base_len, &pieces)
+  let final_len = total_len(&pieces);
+  (read_out(base_len, &pieces), final_len)
 }
 
 /// Walks the composed piece list once, left to right, and emits the net ops. `base_cursor` is
