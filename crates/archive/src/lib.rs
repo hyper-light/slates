@@ -28,6 +28,7 @@ pub mod format;
 pub mod manifest;
 pub mod restore;
 pub mod store;
+pub mod transfer;
 pub mod wire;
 
 pub use archive::Archive;
@@ -35,3 +36,4 @@ pub use format::{ArchiveError, Chunk, Encoding};
 pub use manifest::{Entry, Extent, ManifestError, Node};
 pub use restore::{Restored, restore};
 pub use store::ContentStore;
+pub use transfer::{chunks_for, missing_set};
