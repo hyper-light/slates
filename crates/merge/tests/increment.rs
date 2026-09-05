@@ -510,6 +510,7 @@ fn removing_a_base_directory_is_one_rmdir() {
   let base = Base {
     files: Vec::new(),
     dirs: vec!["d".to_owned()],
+    modes: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -547,6 +548,7 @@ fn removing_then_recreating_a_base_directory_is_nothing() {
   let base = Base {
     files: Vec::new(),
     dirs: vec!["d".to_owned()],
+    modes: Vec::new(),
   };
   let doc = compose_volume(
     &base,
@@ -589,6 +591,7 @@ fn mkdir_over_a_base_directory_refuses() {
   let base = Base {
     files: Vec::new(),
     dirs: vec!["d".to_owned()],
+    modes: Vec::new(),
   };
   assert!(matches!(
     compose_volume(
@@ -652,7 +655,11 @@ proptest! {
       .map(|(_, name)| (*name).to_owned())
       .collect();
     let (journal, model) = simulate_dirs(&base_dirs, &raw);
-    let base = Base { files: Vec::new(), dirs: base_dirs.clone() };
+    let base = Base {
+      files: Vec::new(),
+      dirs: base_dirs.clone(),
+      modes: Vec::new(),
+    };
     let doc = compose_volume(&base, &journal).expect("a valid directory journal composes");
     // Reconstruct: start from the base directories, apply the document's Mkdir/Rmdir.
     let mut reconstructed: BTreeSet<String> = base_dirs.into_iter().collect();
@@ -666,4 +673,168 @@ proptest! {
     }
     prop_assert_eq!(reconstructed, model);
   }
+}
+
+// --- Mode composition (SetMode) ---
+
+/// Setting a base file's mode to a new value is one `SetMode` carrying the mode.
+#[test]
+fn setting_a_base_file_mode_is_one_set_mode() {
+  let base = Base {
+    files: vec![("f".to_owned(), 4)],
+    dirs: Vec::new(),
+    modes: vec![("f".to_owned(), 0o644)],
+  };
+  let doc = compose_volume(
+    &base,
+    &[VolumeOp::SetMode {
+      path: "f".to_owned(),
+      mode: 0o755,
+    }],
+  )
+  .expect("valid");
+  let op = doc
+    .ops
+    .iter()
+    .find(|op| op.kind == OpKind::SetMode)
+    .expect("a set-mode");
+  assert_eq!(doc.paths.path(op.path), Some("f"));
+  assert_eq!(op.len, 0o755, "the new mode is carried in len");
+}
+
+/// Setting a base file's mode to its existing mode declares nothing (minimality).
+#[test]
+fn setting_a_mode_to_the_base_mode_is_nothing() {
+  let base = Base {
+    files: vec![("f".to_owned(), 4)],
+    dirs: Vec::new(),
+    modes: vec![("f".to_owned(), 0o644)],
+  };
+  let doc = compose_volume(
+    &base,
+    &[VolumeOp::SetMode {
+      path: "f".to_owned(),
+      mode: 0o644,
+    }],
+  )
+  .expect("valid");
+  assert!(doc.ops.is_empty(), "no net change");
+}
+
+/// The last SetMode on a path wins.
+#[test]
+fn the_last_set_mode_wins() {
+  let base = Base {
+    files: vec![("f".to_owned(), 4)],
+    dirs: Vec::new(),
+    modes: vec![("f".to_owned(), 0o644)],
+  };
+  let doc = compose_volume(
+    &base,
+    &[
+      VolumeOp::SetMode {
+        path: "f".to_owned(),
+        mode: 0o600,
+      },
+      VolumeOp::SetMode {
+        path: "f".to_owned(),
+        mode: 0o640,
+      },
+    ],
+  )
+  .expect("valid");
+  let op = doc
+    .ops
+    .iter()
+    .find(|op| op.kind == OpKind::SetMode)
+    .expect("a set-mode");
+  assert_eq!(op.len, 0o640);
+}
+
+/// Setting the mode of a base directory is one `SetMode`.
+#[test]
+fn setting_a_base_directory_mode() {
+  let base = Base {
+    files: Vec::new(),
+    dirs: vec!["d".to_owned()],
+    modes: vec![("d".to_owned(), 0o755)],
+  };
+  let doc = compose_volume(
+    &base,
+    &[VolumeOp::SetMode {
+      path: "d".to_owned(),
+      mode: 0o700,
+    }],
+  )
+  .expect("valid");
+  let op = doc
+    .ops
+    .iter()
+    .find(|op| op.kind == OpKind::SetMode)
+    .expect("a set-mode");
+  assert_eq!(doc.paths.path(op.path), Some("d"));
+  assert_eq!(op.len, 0o700);
+}
+
+/// Setting the mode of a newly created file emits a `SetMode` (the base had no mode there).
+#[test]
+fn setting_a_new_file_mode() {
+  let doc = compose_volume(
+    &Base::default(),
+    &[
+      VolumeOp::Create {
+        path: "n".to_owned(),
+      },
+      VolumeOp::SetMode {
+        path: "n".to_owned(),
+        mode: 0o600,
+      },
+    ],
+  )
+  .expect("valid");
+  assert!(
+    doc
+      .ops
+      .iter()
+      .any(|op| op.kind == OpKind::SetMode && op.len == 0o600)
+  );
+}
+
+/// Setting the mode of a path present nowhere is refused.
+#[test]
+fn set_mode_on_a_missing_path_refuses() {
+  assert!(matches!(
+    compose_volume(
+      &Base::default(),
+      &[VolumeOp::SetMode {
+        path: "gone".to_owned(),
+        mode: 0o644
+      }]
+    ),
+    Err(DeriveError::SetModeMissing(_))
+  ));
+}
+
+/// A mode set then the path renamed away is the owed chmod-then-rename case, refused.
+#[test]
+fn set_mode_then_rename_refuses() {
+  let base = Base {
+    files: vec![("a".to_owned(), 4)],
+    dirs: Vec::new(),
+    modes: vec![("a".to_owned(), 0o644)],
+  };
+  let result = compose_volume(
+    &base,
+    &[
+      VolumeOp::SetMode {
+        path: "a".to_owned(),
+        mode: 0o600,
+      },
+      VolumeOp::Rename {
+        from: "a".to_owned(),
+        to: "b".to_owned(),
+      },
+    ],
+  );
+  assert!(matches!(result, Err(DeriveError::Unsupported(_))));
 }

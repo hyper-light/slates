@@ -30,11 +30,12 @@
 //! the region's base offset. Sorting makes the layout, and the identity, independent of the
 //! journal's declaration order.
 //!
-//! Scope: content, create, unlink and rename of regular files, and directory create and remove
-//! (composed independently; a mkdir then rmdir cancels, a base directory removed is one `Rmdir`).
-//! Hard links, symlinks and metadata (mode, xattrs), a file/directory transition at one path, and
-//! the rare rename onto a base path already consumed this increment are the deriver's remaining
-//! piece (owed; GAPS §8f), each a typed [`DeriveError`]. An operation a valid volume could not
+//! Scope: content, create, unlink and rename of regular files, directory create and remove, and
+//! the mode of a file or directory (`SetMode`, composed independently against the base mode; a
+//! mode set to the base mode declares nothing). Hard links, symlinks and xattrs, a file/directory
+//! transition at one path, chmod then rename of one path, and the rare rename onto a base path
+//! already consumed this increment are the deriver's remaining piece (owed; GAPS §8f), each a
+//! typed [`DeriveError`]. An operation a valid volume could not
 //! have produced — content on a missing file, a create over an existing one, an unlink, rename or
 //! rmdir of a missing one, a mkdir over an existing directory — is a typed [`DeriveError`] too,
 //! never a panic. This module is pure: no I/O, no clock, no randomness.
@@ -116,6 +117,13 @@ pub enum VolumeOp {
     /// The directory.
     path: String,
   },
+  /// The mode of a file or directory set to `mode`.
+  SetMode {
+    /// The path.
+    path: String,
+    /// The new mode.
+    mode: u32,
+  },
 }
 
 impl VolumeOp {
@@ -131,7 +139,8 @@ impl VolumeOp {
       | VolumeOp::Unlink { .. }
       | VolumeOp::Rename { .. }
       | VolumeOp::Mkdir { .. }
-      | VolumeOp::Rmdir { .. } => None,
+      | VolumeOp::Rmdir { .. }
+      | VolumeOp::SetMode { .. } => None,
     }
   }
 
@@ -151,7 +160,10 @@ impl VolumeOp {
       | VolumeOp::Delete { path, .. }
       | VolumeOp::Create { path }
       | VolumeOp::Unlink { path } => Some(path),
-      VolumeOp::Rename { .. } | VolumeOp::Mkdir { .. } | VolumeOp::Rmdir { .. } => None,
+      VolumeOp::Rename { .. }
+      | VolumeOp::Mkdir { .. }
+      | VolumeOp::Rmdir { .. }
+      | VolumeOp::SetMode { .. } => None,
     }
   }
 }
@@ -178,6 +190,8 @@ pub enum DeriveError {
   /// One path was used as both a file and a directory this increment (a file/directory transition
   /// at a path); its composition is owed.
   PathIsFileAndDirectory(String),
+  /// A `SetMode` on a path with no file or directory present at seal.
+  SetModeMissing(String),
 }
 
 impl std::fmt::Display for DeriveError {
@@ -198,6 +212,7 @@ impl std::fmt::Display for DeriveError {
       Self::PathIsFileAndDirectory(path) => {
         write!(f, "path {path} is used as both a file and a directory")
       }
+      Self::SetModeMissing(path) => write!(f, "set mode on missing path {path}"),
     }
   }
 }
@@ -213,16 +228,28 @@ pub struct Base {
   pub files: Vec<(String, u64)>,
   /// The base directory paths.
   pub dirs: Vec<String>,
+  /// The base mode of a path (file or directory), where known.
+  pub modes: Vec<(String, u32)>,
 }
 
 impl Base {
-  /// A base with the given files and no directories (the common file-only case).
+  /// A base with the given files and no directories or recorded modes (the common file-only case).
   pub fn of_files(files: Vec<(String, u64)>) -> Base {
     Base {
       files,
       dirs: Vec::new(),
+      modes: Vec::new(),
     }
   }
+}
+
+/// The base mode of `path`, if the base recorded one.
+fn base_mode_of(base: &Base, path: &str) -> Option<u32> {
+  base
+    .modes
+    .iter()
+    .find(|(candidate, _)| candidate == path)
+    .map(|(_, mode)| *mode)
 }
 
 /// One file tracked during replay.
@@ -411,6 +438,69 @@ fn resolve_rename_target(
   Ok(None)
 }
 
+/// The directories present at seal: the base directories, with the journal's mkdir/rmdir applied.
+/// (Validity — no mkdir over an existing directory, no rmdir of an absent one — is checked by
+/// [`compose_directories`], which runs first.)
+fn present_directories(base: &Base, journal: &[VolumeOp]) -> std::collections::BTreeSet<String> {
+  let mut present: std::collections::BTreeSet<String> = base.dirs.iter().cloned().collect();
+  for op in journal {
+    match op {
+      VolumeOp::Mkdir { path } => {
+        present.insert(path.clone());
+      }
+      VolumeOp::Rmdir { path } => {
+        present.remove(path);
+      }
+      _ => {}
+    }
+  }
+  present
+}
+
+/// Composes the `SetMode` operations into a mode per path (last one wins), emitting a `SetMode`
+/// only where the mode differs from the base and the path is present at seal (a surviving file or
+/// a present directory). A mode set on a renamed-away path (chmod then rename) is a typed
+/// `Unsupported` refusal (owed); a mode on a path present nowhere is `SetModeMissing`.
+fn compose_modes(
+  base: &Base,
+  journal: &[VolumeOp],
+  survivors: &std::collections::BTreeSet<String>,
+  renamed_away: &std::collections::BTreeSet<String>,
+  present_dirs: &std::collections::BTreeSet<String>,
+) -> Result<Vec<(String, u32)>, DeriveError> {
+  let mut final_mode: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+  for op in journal {
+    if let VolumeOp::SetMode { path, mode } = op {
+      final_mode.insert(path.clone(), *mode);
+    }
+  }
+  let mut emissions = Vec::new();
+  for (path, mode) in final_mode {
+    if renamed_away.contains(&path) {
+      return Err(DeriveError::Unsupported(path));
+    }
+    if !survivors.contains(&path) && !present_dirs.contains(&path) {
+      return Err(DeriveError::SetModeMissing(path));
+    }
+    if base_mode_of(base, &path) != Some(mode) {
+      emissions.push((path, mode));
+    }
+  }
+  Ok(emissions)
+}
+
+/// A `SetMode` op: the new mode is carried in `len` (§4.16 `OpRecord`).
+fn set_mode_op(path: u16, mode: u32) -> Op {
+  Op {
+    kind: OpKind::SetMode,
+    flags: 0,
+    path,
+    at: 0,
+    len: u64::from(mode),
+    src: u64::MAX,
+  }
+}
+
 /// A namespace op with a path index and empty coordinates.
 fn namespace_op(kind: OpKind, path: u16) -> Op {
   Op {
@@ -454,7 +544,33 @@ pub fn compose_volume(base: &Base, journal: &[VolumeOp]) -> Result<OpsDoc, Deriv
     }
     apply_op(&mut entities, base, op)?;
   }
-  Ok(seal(entities, directories))
+  // The files present at seal: the live entities' final paths, plus base files no entity ever
+  // touched (still present, e.g. a base file that was only chmod'd).
+  let entity_origins: std::collections::BTreeSet<&str> = entities
+    .iter()
+    .filter_map(|entity| entity.origin.as_deref())
+    .collect();
+  let mut survivors: std::collections::BTreeSet<String> = entities
+    .iter()
+    .filter(|entity| entity.live)
+    .map(|entity| entity.final_path.clone())
+    .collect();
+  for (path, _) in &base.files {
+    if !entity_origins.contains(path.as_str()) {
+      survivors.insert(path.clone());
+    }
+  }
+  let renamed_away: std::collections::BTreeSet<String> = entities
+    .iter()
+    .filter(|entity| entity.live)
+    .filter_map(|entity| match &entity.origin {
+      Some(origin) if origin != &entity.final_path => Some(origin.clone()),
+      _ => None,
+    })
+    .collect();
+  let present_dirs = present_directories(base, journal);
+  let modes = compose_modes(base, journal, &survivors, &renamed_away, &present_dirs)?;
+  Ok(seal(entities, directories, modes))
 }
 
 /// A directory the increment declares: a create or a remove.
@@ -603,6 +719,7 @@ fn document_names(
   emissions: &[Emission],
   removed: &[String],
   directories: &[DirectoryEmission],
+  modes: &[(String, u32)],
 ) -> Vec<String> {
   let mut names: Vec<String> = Vec::new();
   for emission in emissions {
@@ -617,14 +734,21 @@ fn document_names(
       DirectoryEmission::Made(path) | DirectoryEmission::Removed(path) => names.push(path.clone()),
     }
   }
+  for (path, _) in modes {
+    names.push(path.clone());
+  }
   names.sort_unstable();
   names.dedup();
   names
 }
 
-fn seal(entities: Vec<Entity>, directories: Vec<DirectoryEmission>) -> OpsDoc {
+fn seal(
+  entities: Vec<Entity>,
+  directories: Vec<DirectoryEmission>,
+  modes: Vec<(String, u32)>,
+) -> OpsDoc {
   let (mut emissions, removed) = classify(entities);
-  let names = document_names(&emissions, &removed, &directories);
+  let names = document_names(&emissions, &removed, &directories, &modes);
 
   let mut doc = OpsDoc::new();
   for name in &names {
@@ -664,6 +788,9 @@ fn seal(entities: Vec<Entity>, directories: Vec<DirectoryEmission>) -> OpsDoc {
         doc.ops.push(namespace_op(OpKind::Rmdir, index_of(&path)));
       }
     }
+  }
+  for (path, mode) in modes {
+    doc.ops.push(set_mode_op(index_of(&path), mode));
   }
   doc.canonicalize();
   doc
