@@ -15,6 +15,8 @@ readme = "README.md"
 slates-machine = { path = "crates/machine", version = "0.1.0" }
 slates-mem = { path = "crates/mem", version = "0.1.0" }
 slates-rt = { path = "crates/rt", version = "0.1.0" }
+slates-wire = { path = "crates/wire", version = "0.1.0" }
+slates-wire-derive = { path = "crates/wire-derive", version = "0.1.0" }
 
 # Third-party versions are pinned once here. Exact `=` pins only where an ABI contract is
 # version-specific, each with a comment saying why (Appendix B.1).
@@ -36,6 +38,12 @@ zstd = "0.13"
 # The io_uring syscall wrapper (tokio-rs/io-uring): thin, no reference counting in its core types;
 # the driver probes setup flags at boot and falls back to epoll (D-9).
 io-uring = "0.7"
+# The derive macro's parser and emitter (the standard trio); build-time only.
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"
+# Compile-fail tests for the derive's refusals (dev only).
+trybuild = "1"
 
 # Lints are the enforcement of Part 0's rules, not a style preference. Every crate opts in
 # with `[lints] workspace = true`. Allowed exceptions live in clippy.toml with their reason.

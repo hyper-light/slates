@@ -1,0 +1,5 @@
+error: Wire: usize and isize do not exist on the wire; use u32 or u64
+ --> tests/ui/usize_field.rs:5:10
+  |
+5 |   count: usize,
+  |          ^^^^^

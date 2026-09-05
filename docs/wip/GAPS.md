@@ -10,7 +10,9 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
   test and the literal check (`cargo xtask check`); `slates-machine` measures the boot profile,
   `slates-mem` holds the arenas, slabs, handles and rings, and `slates-rt` runs the executor on
   kqueue, epoll or io_uring, IOCP and the simulation (BENCHMARKS.md records the baselines).
-  `slates-wire` is next; nothing below is closed by code until its phase says so.
+  `slates-wire` frames, checksums and canonically encodes with a compile-time schema hash.
+  Phase 0's crates exist; Phase 1 is next; nothing below is closed by code until its phase says
+  so.
 
 ## 1. Component inventory
 
@@ -81,6 +83,13 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
   (128 B, only when the OS refuses), the hash corpus (1,024 base pages, the large chunk class) and
   the codec corpus (64 base pages, the small class), and clippy's cognitive-complexity threshold
   (10, `clippy.toml`). Every other number in the crate is `Format:` (a layout fact) or derived.
+- Ratified in Phase 0 for the runtime and the wire, each at its definition site: the registry's
+  shard bound (1,024, `rt::registry::MAX_SHARDS`), the timing wheel's shape (6 levels of 64 slots,
+  `rt::timer`, a `Format:` because it fixes the deadline arithmetic), the events drained per driver
+  wait (64, the kqueue, epoll and IOCP drivers; it bounds latency, not correctness), and the
+  wire's header layout, class words and schema-hash constants (`Format:`). The runtime's tick,
+  step budget and ring size come from the profile; the batch bound is one ring until the per-item
+  cost is measured (§4.3), which `RuntimeConfig::from_profile` says in its formula string.
 - "10 × broadcast RTT p99" for election timeouts is Raft's published rule; ratified as a shape
   constant with the citation.
 - The format floor for compression (savings must exceed the chunk's metadata overhead) is
@@ -145,7 +154,16 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
 - io-uring crate 0.7.14 (tokio-rs): thin syscall wrapper, no reference counting in its core types;
   adopted for the Linux driver with the probe-and-fall-back sequence of D-9.
 - Miri: ships only with nightly, which this machine does not have; CI's `miri-and-loom` lane runs
-  it on nightly for `slates-mem` (and `rt`, `wire` as they land). Local runs are loom-only.
+  it on nightly for the `slates-mem` and `slates-wire` unit tests (`slates-rt`'s unit tests open a
+  kqueue or an eventfd, which Miri does not model; its simulation-driver tests are the candidates
+  for a later Miri run). Local runs are loom-only.
+- Ratchets (Phase 0 task 7): BENCHMARKS.md records every baseline with its interval on the M5 Max;
+  the ratchet that fails CI on a regression needs the reference machines of Phase 1 (CI runners
+  are shared and unpinned, so a number measured there is not a ratchet). Until then a regression is
+  caught by re-running the three bench examples and comparing by hand, which the phase's exit
+  criteria name.
+- Windows: the IOCP driver, the section-backed profile segment and the Win32 facts compile only in
+  CI's nightly-cadence Windows lane; nothing on Windows has run yet.
 
 ## 9. Blocking order toward first light
 

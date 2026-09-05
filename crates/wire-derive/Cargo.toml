@@ -1,0 +1,22 @@
+[package]
+name = "slates-wire-derive"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The #[derive(Wire)] macro: canonical encode and decode with a compile-time schema reflection and hash (design §4.9, D-15)."
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { workspace = true }
+quote = { workspace = true }
+proc-macro2 = { workspace = true }
+
+# A build-time macro: it runs in the compiler, not in slates; the workspace lints apply except
+# the ones that assume a runtime (no unsafe here at all).
+[lints]
+workspace = true

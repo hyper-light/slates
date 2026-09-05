@@ -7,4 +7,6 @@ coding agents provision in under 50 µs, see as a normal path, merge through, an
 only under a human grant. The design is `docs/wip/SLATES_DESIGN.md`; the project rules are
 `CLAUDE.md` and `AGENTS.md`; the gap ledger is `docs/wip/GAPS.md`.
 
-Status: Phase 0 (foundations) in progress. No release exists yet.
+Status: Phase 0 (foundations) is built: `slates-machine` (boot profile), `slates-mem` (arenas,
+slabs, handles, rings), `slates-rt` (thread-per-core executor and drivers) and `slates-wire`
+(framing and canonical bodies). No release exists yet; `docs/wip/BENCHMARKS.md` has the baselines.

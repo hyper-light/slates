@@ -1,0 +1,19 @@
+[package]
+name = "slates-wire"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "Wire protocol: the 32-byte header, CRC32C, canonical derive-generated bodies with a schema hash, per-class frame caps, credit windows, and RIFL request ids (design §4.9, D-15)."
+
+[dependencies]
+slates-machine = { workspace = true }
+slates-wire-derive = { workspace = true }
+
+[dev-dependencies]
+trybuild = { workspace = true }
+
+[lints]
+workspace = true

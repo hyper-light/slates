@@ -57,7 +57,7 @@ jobs:
         with:
           components: miri
       - name: Miri
-        run: cargo +nightly miri test -p slates-mem --lib
+        run: cargo +nightly miri test -p slates-mem -p slates-wire --lib
 
   windows-nightly:
     name: windows (nightly cadence)

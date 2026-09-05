@@ -103,3 +103,33 @@ microseconds on this macOS, so the idle loop never polls the driver when it know
 pending (the `has_pending` seam), and a kernel timeout wake lands about one wheel tick late,
 which is what the idle-spin window of §4.3 (spin for the measured wake cost before parking) is
 for; it is a Phase 1 item once a "client active" signal exists.
+
+## Phase 0 baseline: wire (2026-09-04)
+
+Environment: as above (Apple M5 Max, macOS 26.4.1, Rust 1.98.0, release profile). Command:
+`cargo run --release -p slates-wire --example bench` (400 ms budget per row; 95% bootstrap
+intervals; inputs made opaque to the optimizer).
+
+| Operation | Median | Interval | p99 |
+|---|---|---|---|
+| Header encode (32 bytes) | 2 ns | [2, 2] | 2 ns |
+| Header decode (magic, major, class checks) | 2 ns | [2, 2] | 2 ns |
+| Body encode, 73-byte sample (a string, a 16-byte id, a u64, four u32s, an optional string) into a reused buffer | 8 ns | [8, 8] | 8 ns |
+| Body decode of the same sample (two string allocations, one vector) | 96 ns | [95, 97] | 104 ns |
+| Frame encode (header, schema word, body, CRC32C; two allocations) | 265 ns | [247, 273] | 494 ns |
+| Frame decode (cap, kind, CRC32C, schema checks; body bytes copied) | 38 ns | [37, 39] | 41 ns |
+| CRC32C over 1 MiB, hardware `crc32cx` | 172 µs | | 6.1 GB/s |
+
+Also proven, not timed: the golden vector of the sample message and the recorded reflections
+(`crates/wire/tests/golden.rs`) freeze the encoding for the major; every hostile shape (length
+`u32::MAX`, truncated header, truncated body, a bit flip, an unknown kind, a foreign schema, an
+oversized body at encode time) is a typed refusal that allocates nothing (AC-0.8, T-0.8); the
+derive refuses `usize`, tuple structs and generics at compile time with the reason spelled out
+(trybuild, `tests/ui`); the CRC32C check value matches RFC 3720 and the hardware path matches the
+table path on ten thousand bytes.
+
+What it means: a control frame costs a third of a microsecond to build and forty nanoseconds to
+check, against a fifty-microsecond provisioning budget; the encode side's two allocations are the
+obvious Phase 1 trim (encode into the ring's slot, as §4.7 has it). CRC32C at 6 GB/s is the
+single-chain rate of the instruction; a three-way interleave would raise it and Phase 7 measures
+whether the bulk path needs it, though bulk carries the BLAKE3 identity instead (§4.9).

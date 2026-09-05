@@ -1,0 +1,5 @@
+error: Wire: a struct must use named fields (tuple fields have no stable names in the schema)
+ --> tests/ui/tuple_struct.rs:4:11
+  |
+4 | struct Bad(u32, u32);
+  |           ^^^^^^^^^^

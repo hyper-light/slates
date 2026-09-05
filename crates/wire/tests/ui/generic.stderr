@@ -1,0 +1,5 @@
+error: Wire: generic types have no single schema; write a concrete type
+ --> tests/ui/generic.rs:4:11
+  |
+4 | struct Bad<T> {
+  |           ^
