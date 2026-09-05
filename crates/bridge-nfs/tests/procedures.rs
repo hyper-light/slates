@@ -10,7 +10,9 @@
 use slates_bridge_core::{Bridge, VolumeBridge};
 use slates_bridge_nfs::mount::MountReply;
 use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
-use slates_bridge_nfs::procedures::{Export, NFSPROC3_GETATTR, NFSPROC3_NULL};
+use slates_bridge_nfs::procedures::{
+  Export, NFSPROC3_ACCESS, NFSPROC3_FSINFO, NFSPROC3_FSSTAT, NFSPROC3_GETATTR, NFSPROC3_NULL,
+};
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_db::catalog::VolumeId;
 use slates_mem::arena::ChunkArena;
@@ -166,4 +168,67 @@ fn a_missing_name_is_noent() {
     Nfsstat3::Noent.wire(),
     "a missing name is ENOENT"
   );
+}
+
+/// The post-mount queries answer over the root handle: FSINFO reports transfer sizes and the
+/// symlink capability, ACCESS grants what it is asked, and FSSTAT reports the volume's space.
+#[test]
+fn the_post_mount_queries_answer_over_the_root() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
+  let mut export = Export::new(&mut bridge, VolumeId { bytes: [0x11; 16] });
+  let root_fh = match export.mnt("/") {
+    MountReply::Ok { handle, .. } => handle,
+    MountReply::Err(status) => panic!("MNT failed: {status:?}"),
+  };
+
+  // FSINFO: OK, then the object attrs, then the transfer sizes and the properties word.
+  let mut args = XdrWriter::new();
+  root_fh.encode(&mut args);
+  let reply = export
+    .serve_nfs(NFSPROC3_FSINFO, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire());
+  PostOpAttr::decode(&mut r).unwrap();
+  assert_eq!(r.u32().unwrap(), 256 * 1024, "rtmax is one arena chunk");
+  for _ in 0..6 {
+    r.u32().unwrap(); // rtpref, rtmult, wtmax, wtpref, wtmult, dtpref
+  }
+  r.u64().unwrap(); // maxfilesize
+  r.u32().unwrap(); // time_delta seconds
+  r.u32().unwrap(); // time_delta nseconds
+  let properties = r.u32().unwrap();
+  assert!(
+    properties & 0x2 != 0,
+    "the server advertises symlink support"
+  );
+
+  // ACCESS: the requested bits are granted.
+  let mut args = XdrWriter::new();
+  root_fh.encode(&mut args);
+  args.u32(0x1 | 0x2); // ACCESS3_READ | ACCESS3_LOOKUP
+  let reply = export
+    .serve_nfs(NFSPROC3_ACCESS, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire());
+  PostOpAttr::decode(&mut r).unwrap();
+  assert_eq!(
+    r.u32().unwrap(),
+    0x1 | 0x2,
+    "the requested access is granted"
+  );
+
+  // FSSTAT: the volume reports some total space.
+  let mut args = XdrWriter::new();
+  root_fh.encode(&mut args);
+  let reply = export
+    .serve_nfs(NFSPROC3_FSSTAT, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire());
+  PostOpAttr::decode(&mut r).unwrap();
+  assert!(r.u64().unwrap() > 0, "the volume reports total space");
 }

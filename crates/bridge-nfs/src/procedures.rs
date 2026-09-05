@@ -11,7 +11,7 @@
 //! design keys by inode but the current `Bridge` keys by an open handle, are the next slice (owed);
 //! so are the remaining namespace and directory procedures.
 
-use slates_bridge_core::{Bridge, NodeAttr};
+use slates_bridge_core::{Bridge, FsStat, NodeAttr};
 use slates_db::catalog::VolumeId;
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
@@ -31,6 +31,12 @@ pub const NFSPROC3_NULL: u32 = 0;
 pub const NFSPROC3_GETATTR: u32 = 1;
 /// Format: NFSPROC3_LOOKUP — resolve a name in a directory to a handle.
 pub const NFSPROC3_LOOKUP: u32 = 3;
+/// Format: NFSPROC3_ACCESS — which operations the caller may perform on an object.
+pub const NFSPROC3_ACCESS: u32 = 4;
+/// Format: NFSPROC3_FSSTAT — dynamic filesystem statistics (space and file counts).
+pub const NFSPROC3_FSSTAT: u32 = 18;
+/// Format: NFSPROC3_FSINFO — static filesystem limits and capabilities.
+pub const NFSPROC3_FSINFO: u32 = 19;
 /// Format: the maximum bytes in a filename slates resolves (§4.5's name cap), refused before
 /// allocating.
 pub const NFS_MAXNAMELEN: usize = 255;
@@ -38,6 +44,19 @@ pub const NFS_MAXNAMELEN: usize = 255;
 const AUTH_SYS: u32 = 1;
 /// Format: the `AUTH_NONE` authentication flavor (RFC 5531).
 const AUTH_NONE: u32 = 0;
+/// Shape: the largest transfer the server offers, one arena chunk (256 KiB), matched to the volume
+/// core's read cap and the design's "readahead = large chunk size" (§4.6).
+const MAX_TRANSFER: u32 = 256 * 1024;
+/// Format: the transfer-size multiple the server prefers (one page).
+const TRANSFER_MULTIPLE: u32 = 4096;
+/// Format: FSF3_LINK, the filesystem supports hard links.
+const FSF3_LINK: u32 = 0x1;
+/// Format: FSF3_SYMLINK, the filesystem supports symbolic links.
+const FSF3_SYMLINK: u32 = 0x2;
+/// Format: FSF3_HOMOGENEOUS, PATHCONF is uniform across the filesystem.
+const FSF3_HOMOGENEOUS: u32 = 0x8;
+/// Format: FSF3_CANSETTIME, the server can set times through SETATTR.
+const FSF3_CANSETTIME: u32 = 0x10;
 
 /// An NFSv3 export of one volume over the shared operation layer. Handles it mints and accepts name
 /// objects of `volume`; a handle for another volume is refused stale.
@@ -120,6 +139,9 @@ impl<'b> Export<'b> {
       NFSPROC3_NULL => Some(Vec::new()),
       NFSPROC3_GETATTR => Some(self.getattr(args)),
       NFSPROC3_LOOKUP => Some(self.lookup(args)),
+      NFSPROC3_ACCESS => Some(self.access(args)),
+      NFSPROC3_FSSTAT => Some(self.fsstat(args)),
+      NFSPROC3_FSINFO => Some(self.fsinfo(args)),
       _ => None,
     }
   }
@@ -138,6 +160,11 @@ impl<'b> Export<'b> {
   }
 
   fn getattr_result(&mut self, args: &mut XdrReader<'_>) -> Result<Fattr3, Nfsstat3> {
+    self.object_attr(args)
+  }
+
+  /// The `fattr3` of the object a leading file handle in `args` names.
+  fn object_attr(&mut self, args: &mut XdrReader<'_>) -> Result<Fattr3, Nfsstat3> {
     let handle = Nfsfh3::decode(args).map_err(|_| Nfsstat3::Badhandle)?;
     let inode = self.inode_of(&handle)?;
     let node = self.bridge.getattr(inode).map_err(|e| nfsstat_of(&e))?;
@@ -184,6 +211,99 @@ impl<'b> Export<'b> {
     let handle = self.handle_for(child.ino, child.generation);
     let object = self.fattr3(&child);
     Ok((handle, object, dir_attr))
+  }
+
+  /// NFSPROC3_ACCESS: which requested operations the caller may perform. slates is not a sandbox
+  /// (a non-goal) — it serves the filesystem and leaves process isolation to the harness — so it
+  /// grants the access requested on an object the caller can already name; the reply carries the
+  /// object's attributes so the client caches them.
+  pub fn access(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    match self.access_result(args) {
+      Ok((attr, granted)) => {
+        Nfsstat3::Ok.encode(&mut writer);
+        PostOpAttr(Some(attr)).encode(&mut writer);
+        writer.u32(granted);
+      }
+      Err(status) => {
+        status.encode(&mut writer);
+        PostOpAttr(None).encode(&mut writer);
+      }
+    }
+    writer.into_bytes()
+  }
+
+  fn access_result(&mut self, args: &mut XdrReader<'_>) -> Result<(Fattr3, u32), Nfsstat3> {
+    let handle = Nfsfh3::decode(args).map_err(|_| Nfsstat3::Badhandle)?;
+    let requested = args.u32().map_err(|_| Nfsstat3::Inval)?;
+    let inode = self.inode_of(&handle)?;
+    let node = self.bridge.getattr(inode).map_err(|e| nfsstat_of(&e))?;
+    Ok((self.fattr3(&node), requested))
+  }
+
+  /// NFSPROC3_FSSTAT: the volume's dynamic statistics — space and file counts — from the shared
+  /// seam's `statfs`, in the bytes and counts NFS reports.
+  pub fn fsstat(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    match self.fsstat_result(args) {
+      Ok((attr, stat)) => {
+        Nfsstat3::Ok.encode(&mut writer);
+        PostOpAttr(Some(attr)).encode(&mut writer);
+        let block = u64::from(stat.bsize);
+        writer.u64(stat.blocks.saturating_mul(block)); // tbytes
+        writer.u64(stat.bfree.saturating_mul(block)); // fbytes
+        writer.u64(stat.bavail.saturating_mul(block)); // abytes
+        writer.u64(stat.files); // tfiles
+        writer.u64(stat.ffree); // ffiles
+        writer.u64(stat.ffree); // afiles
+        writer.u32(0); // invarsec: statistics may change at any time
+      }
+      Err(status) => {
+        status.encode(&mut writer);
+        PostOpAttr(None).encode(&mut writer);
+      }
+    }
+    writer.into_bytes()
+  }
+
+  fn fsstat_result(&mut self, args: &mut XdrReader<'_>) -> Result<(Fattr3, FsStat), Nfsstat3> {
+    let handle = Nfsfh3::decode(args).map_err(|_| Nfsstat3::Badhandle)?;
+    let inode = self.inode_of(&handle)?;
+    let node = self.bridge.getattr(inode).map_err(|e| nfsstat_of(&e))?;
+    let stat = self.bridge.statfs(inode).map_err(|e| nfsstat_of(&e))?;
+    Ok((self.fattr3(&node), stat))
+  }
+
+  /// NFSPROC3_FSINFO: the server's static limits and capabilities — transfer sizes, the maximum
+  /// file size, the time granularity, and the supported features — that a client reads once at
+  /// mount to size its I/O.
+  pub fn fsinfo(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    match self.object_attr(args) {
+      Ok(attr) => {
+        Nfsstat3::Ok.encode(&mut writer);
+        PostOpAttr(Some(attr)).encode(&mut writer);
+        writer.u32(MAX_TRANSFER); // rtmax
+        writer.u32(MAX_TRANSFER); // rtpref
+        writer.u32(TRANSFER_MULTIPLE); // rtmult
+        writer.u32(MAX_TRANSFER); // wtmax
+        writer.u32(MAX_TRANSFER); // wtpref
+        writer.u32(TRANSFER_MULTIPLE); // wtmult
+        writer.u32(MAX_TRANSFER); // dtpref (readdir)
+        writer.u64(u64::MAX); // maxfilesize
+        Nfstime3 {
+          seconds: 0,
+          nseconds: 1,
+        }
+        .encode(&mut writer); // time_delta: one-nanosecond granularity
+        writer.u32(FSF3_LINK | FSF3_SYMLINK | FSF3_HOMOGENEOUS | FSF3_CANSETTIME); // properties
+      }
+      Err(status) => {
+        status.encode(&mut writer);
+        PostOpAttr(None).encode(&mut writer);
+      }
+    }
+    writer.into_bytes()
   }
 }
 
