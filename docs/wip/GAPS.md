@@ -418,6 +418,48 @@ segment). Owed from task 1: the profile is published by the daemon's boot (task 
 `MachineProfile` in); `slates anchor` as a CLI command arrives with task 5; held descriptors
 (the FUSE fd, the NFS socket) with Phases 3 and 4.
 
+Task 2 (the database) landed 2026-09-05: `slates-db` (`crates/db`): the records of §4.8 with
+one canonical `Wire` encoding each (`catalog.rs`: volumes with policy, base path, head, epoch,
+accounting, state, lease, owner and access list; snapshots with placement; lineage edges;
+attachments; completion records; grants; landing leases; landing records; audit records);
+the operations (`op.rs`, 24 kinds, every local mutation); the adaptive radix tree of the
+indexes (`art.rs`: four node shapes growing and shrinking, path compression, values at inner
+nodes so keys need not be prefix-free; model-tested against an ordered map over 400
+histories); the partition (`partition.rs`) with the guard-then-apply split: `check` refuses
+what the log must never record (a duplicate name, a missing record, a held or stale lease, a
+stale completion) and `apply` is the unconditional transition both the live path and replay
+run, so a recorded operation applies the same way forever; leases indexed by holder with the
+runtime's timing wheel for expiry; the log record over the segment's ring (`record.rs`: a
+32-byte header with magic, length, sequence, CRC32C over sequence, schema and body, the
+schema hash; records wrap; the tail is released after the bytes; replay verifies each and
+stops at the first that fails); recovery (`replay.rs`: the newest valid snapshot slot then the
+records after its sequence, the torn tail cut and overwritten, the replay timed) and the
+snapshot cadence derived from the recovery budget and the measured replay throughput
+(`SnapshotPolicy`, bytes per microsecond), with a full ring snapshotting and retrying rather
+than refusing.
+
+Gated (`crates/db/tests/model.rs`): 60 generated histories of every operation kind with the
+database dropped and recovered at random points and random snapshot cadences, the recovered
+partition equal to the live one after every crash and refused operations never recorded
+(AC-2.3's durability half); the torn tail (a byte flipped in the last record: cut off, the
+sequence reused, the next mutation lands over it); four hostile record shapes (a length of
+`u32::MAX`, a foreign magic, a bad checksum, a truncated header) refused with everything
+earlier intact; lease fencing and expiry through the wheel with epoch + 1 for the next holder
+and the wheel rebuilt by recovery (AC-2.4's core); completions exactly-once across recovery;
+snapshots trimming the log and recovery restoring a snapshot plus its tail. Baselines in
+BENCHMARKS.md (Phase 2 baseline: the database): recovery of 10^4 volumes from 10^6 records in
+96 ms against the 1 s budget (AC-2.7), 206 ns per mutation, 95 ns per replayed record, the
+tree at 53 ns per insert and 18 ns per lookup at 10^5 keys.
+
+Found by the model test on its first run: a completion recorded at a sequence the client had
+already acknowledged (a stale retry) was retained live but released when the state was
+restored from a snapshot, so a recovery differed from the live partition. The guard now
+refuses it (`StaleCompletion`) and the window itself drops such a record.
+
+Owed from task 2: the register and held-record tables of §4.8 arrive with task 7 (f=0) and
+Phase 8; the `put_wal` with Phase 8; the chains, deltas and last-changed index with Phase 6;
+the recovery budget is a ratified default (GAPS §5) until the CLI takes the operator's value.
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3

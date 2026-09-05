@@ -673,6 +673,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-db"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "slates-anchor",
+ "slates-machine",
+ "slates-mem",
+ "slates-rt",
+ "slates-wire",
+]
+
+[[package]]
 name = "slates-land"
 version = "0.1.0"
 dependencies = [

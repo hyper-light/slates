@@ -71,8 +71,15 @@ impl<T: Clone> ClientWindow<T> {
     }
   }
 
-  /// Records a completion.
+  /// Records a completion; one at or below the acknowledged sequence is a stale retry the
+  /// client can never ask for again, so it is not retained.
   pub fn record(&mut self, sequence: u32, result: T) {
+    if self
+      .acknowledged_up_to
+      .is_some_and(|up_to| sequence <= up_to)
+    {
+      return;
+    }
     self.completions.insert(sequence, result);
   }
 
@@ -86,6 +93,16 @@ impl<T: Clone> ClientWindow<T> {
   /// Completions retained.
   pub fn retained(&self) -> usize {
     self.completions.len()
+  }
+
+  /// The highest sequence the client acknowledged, when it acknowledged any.
+  pub fn acknowledged_up_to(&self) -> Option<u32> {
+    self.acknowledged_up_to
+  }
+
+  /// The retained completions, by sequence (what a snapshot of the window carries).
+  pub fn retained_entries(&self) -> impl Iterator<Item = (u32, &T)> {
+    self.completions.iter().map(|(s, r)| (*s, r))
   }
 }
 

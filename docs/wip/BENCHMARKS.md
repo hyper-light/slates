@@ -266,6 +266,26 @@ The workspace's own tree served as the proportionality check (AC-1.14, in the or
 worked example's sixteen entries take the same number of seam calls over a 1,000-entry base
 and a 100,000-entry one.
 
+## Phase 2 baseline: the database (2026-09-05)
+
+Environment: as above (Apple M5 Max, macOS 26.4.1, Rust 1.98.0, release profile). Command:
+`cargo run --release -p slates-db --example db_bench` (best of 5 runs, all shown; the row is
+the median with the lowest and highest run as its edges). The segment is a 128 MiB `shm_open`
+object; the recovery row builds 10,000 volumes and 1,000,000 accounting records (69.5 MB of
+log) with snapshots off, drops the database, and recovers it from the log alone.
+
+| Operation | Median | Runs | Notes |
+|---|---|---|---|
+| Adaptive radix tree insert, per key, 10^5 sixteen-byte keys | 53 ns | [47, 50, 53, 59, 70] | one node allocation per key; the prefix compare |
+| Adaptive radix tree lookup, per key, 10^5 keys | 18 ns | [17, 18, 18, 18, 23] | one node per key byte at most |
+| One mutation (guard, encode, append to the ring, apply) | 206 ns | [206, 206, 206, 208, 217] | an accounting record; the checksum is the CRC32C of §4.9 |
+| Recovery of 10^4 volumes from 10^6 records (AC-2.7) | 96 ms | [76, 86, 96, 97, 104] ms | the 1 s budget of §4.8; 720 bytes per µs replayed, so the derived cadence snapshots every 720 MB of log |
+| Replay, per record | 95 ns | [75, 84, 95, 95, 102] | verify (magic, length, sequence, schema, CRC32C), decode, apply |
+
+What it means: at 206 ns a mutation is under a percent of the 50 µs provisioning budget; a
+partition of 10^4 volumes recovers in a tenth of the budget from a million records, and the
+snapshot cadence the measurement derives keeps any log tail inside that budget.
+
 ## Ratchets (2026-09-05)
 
 `ratchets.toml` holds the ceilings for this machine (identity `4c62b34d5f545407`, the Apple M5

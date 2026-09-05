@@ -24,6 +24,7 @@
 # slates-vfs (0): the volume core is safe Rust over the arenas and slabs of slates-mem; the block
 #   layout is read and written through byte slices, never a cast.
 # slates-anchor (0): the segment is byte slices and the atomic views of slates-mem.
+# slates-db (0): records, indexes and the log are safe Rust over the segment's byte slices.
 # slates-land (3): the macOS libc calls rustix does not wrap, each on a descriptor the writer
 #   owns: fcntl(F_BARRIERFSYNC) as the data barrier, fcntl(F_FULLFSYNC) as the media barrier,
 #   renameatx_np(RENAME_SWAP) as the exchange.
@@ -36,5 +37,6 @@ slates-base = 2
 slates-vfs = 0
 slates-land = 3
 slates-anchor = 0
+slates-db = 0
 slates-wire = 4
 slates-wire-derive = 0
