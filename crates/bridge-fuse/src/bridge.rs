@@ -1,19 +1,24 @@
-//! The bridge semantics and the codec-to-bridge dispatch (§4.6). The kernel's requests, once
-//! parsed by the codec, are turned into calls on a [`Bridge`] — the trait with one real
-//! implementation in the daemon (over the volume core) and a mock in the tests here. The
-//! [`dispatch`] function is the seam between the wire and the semantics: it parses a request,
-//! calls the matching method, and encodes the reply or the error, so the transport (the
-//! `/dev/fuse` read/write loop, Linux only) is a thin loop over it and the semantics are tested
-//! on every host without a mount.
-//!
-//! Every reply is written into a caller buffer; a method returns either the reply value or a
-//! POSIX errno (positive), which becomes the negated errno the kernel expects. An opcode slates
-//! does not serve is answered `ENOSYS` without reaching the bridge.
+//! The FUSE wire edge over the shared operation layer (§4.6). The kernel's requests, once parsed
+//! by the codec, are turned into calls on the transport-independent [`Bridge`] trait, which lives
+//! in `slates-bridge-core` and has one implementation over the volume core (and a mock in the
+//! tests here). This module is the seam between the FUSE wire and those neutral semantics: it
+//! parses a request, resolves the kernel's node id to a real inode number (node id 1 is the
+//! root, resolved through [`Bridge::root`]), calls the matching method, maps the volume core's
+//! typed [`VfsError`] to the Linux errno the kernel expects, and encodes the neutral result
+//! ([`NodeAttr`], [`DirEntry`], [`FsStat`]) into the FUSE reply. So the transport (the
+//! `/dev/fuse` read/write loop, Linux only) is a thin loop over [`dispatch`], and the semantics
+//! are tested on every host without a mount. An opcode slates does not serve is answered
+//! `ENOSYS` without reaching the bridge.
 
 use crate::abi::Opcode;
 use crate::init::negotiate;
-use crate::reply::{Attr, AttrOut, DirBuffer, EntryOut, OpenOut, ReplyHeader, WriteOut};
+use crate::reply::{Attr, AttrOut, DirBuffer, EntryOut, OpenOut, ReplyHeader, StatfsOut, WriteOut};
 use crate::request::{ReadIn, RenameIn, Request, SetAttrIn, WriteIn, parse_name};
+
+pub use slates_bridge_core::{Bridge, DirEntry};
+use slates_bridge_core::{FsStat, NodeAttr, RenameFlags, SetAttr};
+use slates_vfs::error::VfsError;
+use slates_vfs::inode::Kind;
 
 /// Format: `ENOSYS`, the errno for an opcode the bridge does not implement.
 pub const ENOSYS: i32 = 38;
@@ -22,87 +27,47 @@ pub const EIO: i32 = 5;
 /// Format: how long the kernel may cache an entry or attributes: forever, since slates
 /// invalidates explicitly on every mutation (§4.6 "Cache posture").
 pub const CACHE_FOREVER: u64 = u64::MAX;
-
-/// One directory entry a `readdir` yields.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DirEntry {
-  /// The inode number.
-  pub ino: u64,
-  /// The entry kind as a Unix `d_type` (`DT_REG`, `DT_DIR`, `DT_LNK`).
-  pub kind: u32,
-  /// The name.
-  pub name: String,
-}
-
-/// What the daemon presents to the kernel (§4.6 "Bridge trait"). One implementation over the
-/// volume core lives in the daemon; a `Result::Err(errno)` becomes the kernel's negated errno.
-/// Only the methods the codec dispatches are here; the rest of the trait grows with the driver.
-pub trait Bridge {
-  /// Look `name` up in directory `parent`; the entry (node id, generation, attributes).
-  fn lookup(&mut self, parent: u64, name: &str) -> Result<EntryOut, i32>;
-  /// The attributes of `nodeid`.
-  fn getattr(&mut self, nodeid: u64) -> Result<Attr, i32>;
-  /// Open `nodeid`; the file handle.
-  fn open(&mut self, nodeid: u64, flags: u32) -> Result<u64, i32>;
-  /// Read `size` bytes at `offset` from handle `fh` of `nodeid` into `out`; the bytes read.
-  fn read(
-    &mut self,
-    nodeid: u64,
-    fh: u64,
-    offset: u64,
-    size: u32,
-    out: &mut Vec<u8>,
-  ) -> Result<(), i32>;
-  /// Write `data` at `offset` to handle `fh` of `nodeid`; the bytes written.
-  fn write(&mut self, nodeid: u64, fh: u64, offset: u64, data: &[u8]) -> Result<u32, i32>;
-  /// Open directory `nodeid`; the handle.
-  fn opendir(&mut self, nodeid: u64) -> Result<u64, i32>;
-  /// The entries of directory `nodeid` from `offset` (each entry's `off` is the cookie to
-  /// resume from).
-  fn readdir(&mut self, nodeid: u64, fh: u64, offset: u64) -> Result<Vec<DirEntry>, i32>;
-  /// Create `name` in `parent` and open it; the entry and the handle.
-  fn create(
-    &mut self,
-    parent: u64,
-    name: &str,
-    mode: u32,
-    flags: u32,
-  ) -> Result<(EntryOut, u64), i32>;
-  /// Release handle `fh` of `nodeid`.
-  fn release(&mut self, nodeid: u64, fh: u64) -> Result<(), i32>;
-  /// The kernel drops `nlookup` references to `nodeid`.
-  fn forget(&mut self, nodeid: u64, nlookup: u64);
-  /// Flush handle `fh` of `nodeid` (no disk write; success once the data is in the anchor).
-  fn flush(&mut self, nodeid: u64, fh: u64) -> Result<(), i32>;
-  /// Create directory `name` in `parent`; the entry.
-  fn mkdir(&mut self, parent: u64, name: &str, mode: u32) -> Result<EntryOut, i32>;
-  /// Remove `name` from `parent`.
-  fn unlink(&mut self, parent: u64, name: &str) -> Result<(), i32>;
-  /// Remove directory `name` from `parent`.
-  fn rmdir(&mut self, parent: u64, name: &str) -> Result<(), i32>;
-  /// Create a symlink `name` in `parent` pointing at `target`; the entry.
-  fn symlink(&mut self, parent: u64, name: &str, target: &str) -> Result<EntryOut, i32>;
-  /// The target of symlink `nodeid`.
-  fn readlink(&mut self, nodeid: u64) -> Result<String, i32>;
-  /// Rename `old_name` under `old_parent` to `new_name` under `new_parent`.
-  fn rename(
-    &mut self,
-    old_parent: u64,
-    old_name: &str,
-    new_parent: u64,
-    new_name: &str,
-  ) -> Result<(), i32>;
-  /// Set the size and/or mode of `nodeid` (the bits `valid` names); the new attributes.
-  fn setattr(&mut self, nodeid: u64, valid: u32, size: u64, mode: u32) -> Result<Attr, i32>;
-  /// Filesystem statistics.
-  fn statfs(&mut self, nodeid: u64) -> Result<crate::reply::StatfsOut, i32>;
-}
+/// Format: the FUSE node id of the root directory; the kernel always names the root by it, and
+/// the edge resolves it to the volume's real root inode number.
+const FUSE_ROOT_ID: u64 = 1;
+/// Format: the Unix `d_type` values a `readdir` entry carries.
+const DT_DIR: u32 = 4;
+const DT_REG: u32 = 8;
+const DT_LNK: u32 = 10;
+// The Linux errno values the volume core's refusals map to (the FUSE ABI is Linux, so the
+// numbers are the kernel's regardless of the host the codec is tested on; the dispatch negates
+// them). Each is a Format constant.
+/// Format: ENOENT, no such file or directory.
+const ENOENT: i32 = 2;
+/// Format: EPERM, operation not permitted.
+const EPERM: i32 = 1;
+/// Format: EEXIST, the name already exists.
+const EEXIST: i32 = 17;
+/// Format: ENOTDIR, not a directory.
+const ENOTDIR: i32 = 20;
+/// Format: EISDIR, is a directory.
+const EISDIR: i32 = 21;
+/// Format: EINVAL, invalid argument.
+const EINVAL: i32 = 22;
+/// Format: EFBIG, file too large.
+const EFBIG: i32 = 27;
+/// Format: ENOSPC, no space left.
+const ENOSPC: i32 = 28;
+/// Format: EMLINK, too many links.
+const EMLINK: i32 = 31;
+/// Format: ENOTEMPTY, directory not empty.
+const ENOTEMPTY: i32 = 39;
+/// Format: EMFILE, too many open files (the bridge's handle table is full).
+const EMFILE: i32 = 24;
+/// Format: the block unit `fuse_attr.blocks` counts in (512-byte blocks, the stat convention).
+const BYTES_PER_BLOCK: u64 = 512;
+/// Shape: the block size reported to the kernel: one page, the volume core's chunk unit.
+const BLKSIZE: u32 = 4096;
 
 /// Dispatches one parsed message to `bridge`, writing the reply into `out`; returns the bytes
-/// written. A parse failure replies `EIO`; an unserved opcode replies `ENOSYS`; a method's
-/// `Err(errno)` replies that errno. `INIT` is answered here (it negotiates, it is not a Bridge
-/// method). The transport calls this for every message and writes `out[..n]` back to the
-/// kernel.
+/// written. A parse failure replies `EIO`; an unserved opcode replies `ENOSYS`; a refusal
+/// replies its mapped errno. `INIT` is answered here (it negotiates, it is not a Bridge method).
+/// The transport calls this for every message and writes `out[..n]` back to the kernel.
 pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, out: &mut [u8]) -> usize {
   let request = match Request::parse(message) {
     Ok(r) => r,
@@ -146,105 +111,99 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, out: &mut [u8]) -> usiz
   }
 }
 
-fn serve_mkdir(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
-  // `fuse_mkdir_in`: mode (4), umask (4), then the name.
-  const HEAD: usize = 2 * size_of::<u32>();
-  if req.body.len() < HEAD {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
-  }
-  let mode = u32::from_le_bytes(req.body[..size_of::<u32>()].try_into().unwrap_or_default());
-  let Ok(name) = parse_name(&req.body[HEAD..]) else {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
-  };
-  reply(
-    req.header.unique,
-    bridge.mkdir(req.header.nodeid, name, mode),
-    |e| e.to_bytes(),
-    out,
-  )
-}
-
-fn serve_unlink(bridge: &mut dyn Bridge, req: &Request<'_>, is_dir: bool, out: &mut [u8]) -> usize {
-  let Ok(name) = parse_name(req.body) else {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
-  };
-  let result = if is_dir {
-    bridge.rmdir(req.header.nodeid, name)
+/// The real inode number the kernel's node id names: node id 1 is the root (resolved through the
+/// bridge), every other node id is already the inode number.
+fn resolve(bridge: &mut dyn Bridge, nodeid: u64) -> Result<u64, VfsError> {
+  if nodeid == FUSE_ROOT_ID {
+    bridge.root()
   } else {
-    bridge.unlink(req.header.nodeid, name)
-  };
-  reply(req.header.unique, result, |()| Vec::new(), out)
-}
-
-fn serve_symlink(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
-  // The body is name\0 target\0.
-  let Ok(name) = parse_name(req.body) else {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
-  };
-  let rest = &req.body[name.len() + 1..];
-  let Ok(target) = parse_name(rest) else {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
-  };
-  reply(
-    req.header.unique,
-    bridge.symlink(req.header.nodeid, name, target),
-    |e| e.to_bytes(),
-    out,
-  )
-}
-
-fn serve_readlink(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
-  match bridge.readlink(req.header.nodeid) {
-    Ok(target) => write_or_drop(
-      ReplyHeader::write_ok(req.header.unique, target.as_bytes(), out),
-      out,
-    ),
-    Err(errno) => write_or_drop(ReplyHeader::write_error(req.header.unique, errno, out), out),
+    Ok(nodeid)
   }
 }
 
-fn serve_rename(
-  bridge: &mut dyn Bridge,
-  req: &Request<'_>,
-  flagged: bool,
-  out: &mut [u8],
-) -> usize {
-  let opcode = if flagged {
-    Opcode::Rename2.to_wire()
-  } else {
-    Opcode::Rename.to_wire()
-  };
-  let Ok(r) = RenameIn::parse(opcode, req.body, flagged) else {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
-  };
-  reply(
-    req.header.unique,
-    bridge.rename(req.header.nodeid, r.old_name, r.newdir, r.new_name),
-    |()| Vec::new(),
-    out,
-  )
+/// Maps a volume refusal to its POSIX errno. This is the FUSE edge's error vocabulary; each other
+/// transport maps the same [`VfsError`] to its own wire error.
+fn errno(e: VfsError) -> i32 {
+  match e {
+    VfsError::NotFound => ENOENT,
+    VfsError::AlreadyExists => EEXIST,
+    VfsError::NotDirectory => ENOTDIR,
+    VfsError::IsDirectory => EISDIR,
+    VfsError::NotEmpty => ENOTEMPTY,
+    VfsError::NoSpace => ENOSPC,
+    VfsError::FileTooLarge => EFBIG,
+    VfsError::TooManyLinks => EMLINK,
+    VfsError::NotPermitted => EPERM,
+    VfsError::Invalid | VfsError::InvalidName => EINVAL,
+    VfsError::BaseUnavailable(code) => code,
+    // The bridge's open-handle table is full (audit BUG-4); the kernel's errno for it is EMFILE.
+    VfsError::Memory(slates_mem::MemError::SlabFull { .. }) => EMFILE,
+    _ => EIO,
+  }
 }
 
-fn serve_setattr(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
-  let Ok(s) = SetAttrIn::parse(req.body) else {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
-  };
-  let result = bridge
-    .setattr(req.header.nodeid, s.valid, s.size, s.mode)
-    .map(|attr| AttrOut {
-      attr_valid: CACHE_FOREVER,
-      attr,
-    });
-  reply(req.header.unique, result, |a| a.to_bytes(), out)
+/// The FUSE `d_type` for a volume entry kind.
+fn dtype(kind: Kind) -> u32 {
+  match kind {
+    Kind::Dir => DT_DIR,
+    Kind::File => DT_REG,
+    Kind::Symlink => DT_LNK,
+  }
 }
 
-fn serve_statfs(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
-  reply(
-    req.header.unique,
-    bridge.statfs(req.header.nodeid),
-    |s| s.to_bytes(),
-    out,
-  )
+/// Splits a signed nanosecond time into (seconds, nanoseconds), clamping a negative time to
+/// zero (the kernel takes unsigned seconds).
+fn split_ns(ns: i64) -> (u64, u32) {
+  /// Format: nanoseconds per second, splitting a time into (seconds, nanoseconds).
+  const NS_PER_SEC: u64 = 1_000_000_000;
+  let ns = u64::try_from(ns).unwrap_or(0);
+  (ns / NS_PER_SEC, u32::try_from(ns % NS_PER_SEC).unwrap_or(0))
+}
+
+/// A FUSE `fuse_attr` from neutral attributes. Preserves the pre-extraction mapping exactly,
+/// including the wire change time taken from the modification time — a quirk carried unchanged
+/// for the GAP-A9-3 bridge sweep to correct (NFS reads the true change time from the neutral
+/// attributes, so the quirk does not spread).
+fn fuse_attr(node: &NodeAttr) -> Attr {
+  Attr {
+    ino: node.ino,
+    size: node.size,
+    blocks: node.size.div_ceil(BYTES_PER_BLOCK),
+    mtime: split_ns(node.mtime),
+    ctime: split_ns(node.mtime),
+    atime: split_ns(node.atime),
+    mode: node.mode,
+    nlink: node.nlink,
+    uid: node.uid,
+    gid: node.gid,
+    blksize: BLKSIZE,
+  }
+}
+
+/// A FUSE `fuse_entry_out` from neutral attributes, cached forever (slates invalidates on every
+/// mutation, §4.6).
+fn entry_out(node: &NodeAttr) -> EntryOut {
+  EntryOut {
+    nodeid: node.ino,
+    generation: node.generation,
+    entry_valid: CACHE_FOREVER,
+    attr_valid: CACHE_FOREVER,
+    attr: fuse_attr(node),
+  }
+}
+
+/// A FUSE `fuse_statfs_out` from neutral filesystem statistics.
+fn statfs_out(fs: &FsStat) -> StatfsOut {
+  StatfsOut {
+    blocks: fs.blocks,
+    bfree: fs.bfree,
+    bavail: fs.bavail,
+    files: fs.files,
+    ffree: fs.ffree,
+    bsize: fs.bsize,
+    namelen: fs.namelen,
+    frsize: fs.frsize,
+  }
 }
 
 /// Writes the reply the codec produced, or drops it (returns 0) when even the header did not
@@ -271,35 +230,48 @@ fn serve_init(body: &[u8], unique: u64, out: &mut [u8]) -> usize {
   }
 }
 
-/// Replies with a body the bridge produced, or the errno it refused with.
+/// Replies with a body the bridge produced, or the errno its refusal maps to.
 fn reply<T>(
   unique: u64,
-  result: Result<T, i32>,
+  result: Result<T, VfsError>,
   encode: impl FnOnce(&T) -> Vec<u8>,
   out: &mut [u8],
 ) -> usize {
   match result {
     Ok(value) => write_or_drop(ReplyHeader::write_ok(unique, &encode(&value), out), out),
-    Err(errno) => write_or_drop(ReplyHeader::write_error(unique, errno, out), out),
+    Err(e) => write_or_drop(ReplyHeader::write_error(unique, errno(e), out), out),
   }
+}
+
+/// Replies with only an error (no body).
+fn reply_err(unique: u64, e: VfsError, out: &mut [u8]) -> usize {
+  write_or_drop(ReplyHeader::write_error(unique, errno(e), out), out)
 }
 
 fn serve_lookup(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
   let Ok(name) = parse_name(req.body) else {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   };
+  let parent = match resolve(bridge, req.header.nodeid) {
+    Ok(no) => no,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
   reply(
     req.header.unique,
-    bridge.lookup(req.header.nodeid, name),
-    |e| e.to_bytes(),
+    bridge.lookup(parent, name),
+    |n| entry_out(n).to_bytes(),
     out,
   )
 }
 
 fn serve_getattr(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
-  let result = bridge.getattr(req.header.nodeid).map(|attr| AttrOut {
+  let ino = match resolve(bridge, req.header.nodeid) {
+    Ok(no) => no,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
+  let result = bridge.getattr(ino).map(|n| AttrOut {
     attr_valid: CACHE_FOREVER,
-    attr,
+    attr: fuse_attr(&n),
   });
   reply(req.header.unique, result, |a| a.to_bytes(), out)
 }
@@ -311,10 +283,14 @@ fn serve_open(bridge: &mut dyn Bridge, req: &Request<'_>, opcode: Opcode, out: &
     .get(..size_of::<u32>())
     .map(|b| u32::from_le_bytes(b.try_into().unwrap_or_default()))
     .unwrap_or(0);
+  let ino = match resolve(bridge, req.header.nodeid) {
+    Ok(no) => no,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
   let opened = if opcode == Opcode::OpenDir {
-    bridge.opendir(req.header.nodeid)
+    bridge.opendir(ino)
   } else {
-    bridge.open(req.header.nodeid, flags)
+    bridge.open(ino, flags)
   };
   reply(
     req.header.unique,
@@ -331,7 +307,7 @@ fn serve_read(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usi
   let mut data = Vec::new();
   match bridge.read(req.header.nodeid, r.fh, r.offset, r.size, &mut data) {
     Ok(()) => write_or_drop(ReplyHeader::write_ok(req.header.unique, &data, out), out),
-    Err(errno) => write_or_drop(ReplyHeader::write_error(req.header.unique, errno, out), out),
+    Err(e) => reply_err(req.header.unique, e, out),
   }
 }
 
@@ -353,13 +329,17 @@ fn serve_readdir(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> 
   let Ok(r) = ReadIn::parse(Opcode::ReadDir.to_wire(), req.body) else {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   };
-  match bridge.readdir(req.header.nodeid, r.fh, r.offset) {
+  let ino = match resolve(bridge, req.header.nodeid) {
+    Ok(no) => no,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
+  match bridge.readdir(ino, r.fh, r.offset) {
     Ok(entries) => {
       let mut dir = DirBuffer::new(usize::try_from(r.size).unwrap_or(0));
       for (index, entry) in entries.iter().enumerate() {
         // The cookie is the one-based index, so the next readdir resumes after this entry.
         let cookie = r.offset.saturating_add(index as u64).saturating_add(1);
-        if !dir.push(entry.ino, cookie, entry.kind, &entry.name) {
+        if !dir.push(entry.ino, cookie, dtype(entry.kind), &entry.name) {
           break;
         }
       }
@@ -368,7 +348,7 @@ fn serve_readdir(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> 
         out,
       )
     }
-    Err(errno) => write_or_drop(ReplyHeader::write_error(req.header.unique, errno, out), out),
+    Err(e) => reply_err(req.header.unique, e, out),
   }
 }
 
@@ -387,13 +367,17 @@ fn serve_create(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> u
   let Ok(name) = parse_name(&req.body[HEAD..]) else {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   };
-  match bridge.create(req.header.nodeid, name, mode, flags) {
-    Ok((entry, fh)) => {
-      let mut body = entry.to_bytes();
+  let parent = match resolve(bridge, req.header.nodeid) {
+    Ok(no) => no,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
+  match bridge.create(parent, name, mode, flags) {
+    Ok((node, fh)) => {
+      let mut body = entry_out(&node).to_bytes();
       body.extend_from_slice(&OpenOut { fh, open_flags: 0 }.to_bytes());
       write_or_drop(ReplyHeader::write_ok(req.header.unique, &body, out), out)
     }
-    Err(errno) => write_or_drop(ReplyHeader::write_error(req.header.unique, errno, out), out),
+    Err(e) => reply_err(req.header.unique, e, out),
   }
 }
 
@@ -435,4 +419,148 @@ fn serve_forget(bridge: &mut dyn Bridge, req: &Request<'_>) -> usize {
     .unwrap_or(0);
   bridge.forget(req.header.nodeid, nlookup);
   0
+}
+
+fn serve_mkdir(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
+  // `fuse_mkdir_in`: mode (4), umask (4), then the name.
+  const HEAD: usize = 2 * size_of::<u32>();
+  if req.body.len() < HEAD {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  }
+  let mode = u32::from_le_bytes(req.body[..size_of::<u32>()].try_into().unwrap_or_default());
+  let Ok(name) = parse_name(&req.body[HEAD..]) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  let parent = match resolve(bridge, req.header.nodeid) {
+    Ok(no) => no,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
+  reply(
+    req.header.unique,
+    bridge.mkdir(parent, name, mode),
+    |n| entry_out(n).to_bytes(),
+    out,
+  )
+}
+
+fn serve_unlink(bridge: &mut dyn Bridge, req: &Request<'_>, is_dir: bool, out: &mut [u8]) -> usize {
+  let Ok(name) = parse_name(req.body) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  let parent = match resolve(bridge, req.header.nodeid) {
+    Ok(no) => no,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
+  let result = if is_dir {
+    bridge.rmdir(parent, name)
+  } else {
+    bridge.unlink(parent, name)
+  };
+  reply(req.header.unique, result, |()| Vec::new(), out)
+}
+
+fn serve_symlink(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
+  // The body is name\0 target\0.
+  let Ok(name) = parse_name(req.body) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  let rest = &req.body[name.len() + 1..];
+  let Ok(target) = parse_name(rest) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  let parent = match resolve(bridge, req.header.nodeid) {
+    Ok(no) => no,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
+  reply(
+    req.header.unique,
+    bridge.symlink(parent, name, target),
+    |n| entry_out(n).to_bytes(),
+    out,
+  )
+}
+
+fn serve_readlink(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
+  let ino = match resolve(bridge, req.header.nodeid) {
+    Ok(no) => no,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
+  match bridge.readlink(ino) {
+    Ok(target) => write_or_drop(
+      ReplyHeader::write_ok(req.header.unique, target.as_bytes(), out),
+      out,
+    ),
+    Err(e) => reply_err(req.header.unique, e, out),
+  }
+}
+
+fn serve_rename(
+  bridge: &mut dyn Bridge,
+  req: &Request<'_>,
+  flagged: bool,
+  out: &mut [u8],
+) -> usize {
+  let opcode = if flagged {
+    Opcode::Rename2.to_wire()
+  } else {
+    Opcode::Rename.to_wire()
+  };
+  let Ok(r) = RenameIn::parse(opcode, req.body, flagged) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  let from = match resolve(bridge, req.header.nodeid) {
+    Ok(no) => no,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
+  let to = match resolve(bridge, r.newdir) {
+    Ok(no) => no,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
+  let flags = RenameFlags {
+    no_replace: r.flags & RenameIn::RENAME_NOREPLACE != 0,
+    exchange: r.flags & RenameIn::RENAME_EXCHANGE != 0,
+  };
+  reply(
+    req.header.unique,
+    bridge.rename(from, r.old_name, to, r.new_name, flags),
+    |()| Vec::new(),
+    out,
+  )
+}
+
+fn serve_setattr(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
+  let Ok(s) = SetAttrIn::parse(req.body) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  let ino = match resolve(bridge, req.header.nodeid) {
+    Ok(no) => no,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
+  // Translate the FUSE `valid` bitmask into the neutral "which fields to set".
+  let changes = SetAttr {
+    size: (s.valid & SetAttrIn::FATTR_SIZE != 0).then_some(s.size),
+    mode: (s.valid & SetAttrIn::FATTR_MODE != 0).then_some(s.mode),
+    uid: (s.valid & SetAttrIn::FATTR_UID != 0).then_some(s.uid),
+    gid: (s.valid & SetAttrIn::FATTR_GID != 0).then_some(s.gid),
+    atime: (s.valid & SetAttrIn::FATTR_ATIME != 0).then_some(s.atime),
+    mtime: (s.valid & SetAttrIn::FATTR_MTIME != 0).then_some(s.mtime),
+  };
+  let result = bridge.setattr(ino, changes).map(|n| AttrOut {
+    attr_valid: CACHE_FOREVER,
+    attr: fuse_attr(&n),
+  });
+  reply(req.header.unique, result, |a| a.to_bytes(), out)
+}
+
+fn serve_statfs(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
+  let ino = match resolve(bridge, req.header.nodeid) {
+    Ok(no) => no,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
+  reply(
+    req.header.unique,
+    bridge.statfs(ino).map(|fs| statfs_out(&fs)),
+    |s| s.to_bytes(),
+    out,
+  )
 }

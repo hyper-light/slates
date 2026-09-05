@@ -1,0 +1,17 @@
+[package]
+name = "slates-bridge-core"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The one transport-independent VFS operation layer (the Bridge trait) and its single implementation over the volume core, shared by every OS bridge (FUSE, FSKit, NFS, WinFsp, virtio-fs) so the filesystem semantics are written and tested once (design §4.6, D-1/D-2/D-3)."
+
+[dependencies]
+slates-vfs = { workspace = true }
+slates-base = { workspace = true }
+slates-mem = { workspace = true }
+
+[lints]
+workspace = true

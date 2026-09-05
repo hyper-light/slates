@@ -1,24 +1,25 @@
 //! The dispatch's tests (Phase 3 task 1; §4.6): a mock in-memory bridge is driven through the
-//! codec-to-bridge dispatch, so the wire-to-semantics seam is exercised on every host without
-//! a mount. INIT negotiates, LOOKUP/GETATTR/OPEN/READ/WRITE/CREATE/READDIR reach the bridge and
-//! their replies decode, a bridge refusal becomes the kernel's negated errno, and an unserved
-//! opcode is answered ENOSYS.
+//! FUSE-wire-to-operation-layer dispatch, so the seam is exercised on every host without a mount.
+//! INIT negotiates, LOOKUP/GETATTR/OPEN/READ/WRITE/CREATE/READDIR reach the bridge and their
+//! replies decode, a bridge refusal becomes the kernel's negated errno, and an unserved opcode is
+//! answered ENOSYS. The mock implements the shared `slates-bridge-core` trait (neutral attributes
+//! and typed refusals); the dispatch converts them to the FUSE wire.
 // Test harness code: an unwrap here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use slates_bridge_core::{FsStat, NodeAttr, RenameFlags, SetAttr};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use slates_bridge_fuse::bridge::{Bridge, DirEntry, ENOSYS, dispatch};
-use slates_bridge_fuse::reply::{Attr, EntryOut};
+use slates_bridge_fuse::reply::EntryOut;
+use slates_vfs::error::VfsError;
+use slates_vfs::inode::Kind;
 
-/// A one-file mock: the root directory (nodeid 1) holds "hello" (nodeid 2) with some bytes.
+/// A one-file mock: the root directory (inode 1) holds "hello" (inode 2) with some bytes.
 struct Mock {
   content: Vec<u8>,
   forgotten: u64,
 }
 
-/// Format: `DT_REG` and `DT_DIR`, the directory-entry kinds.
-// Format: DT_REG, the regular-file directory-entry kind.
-const DT_REG: u32 = 8;
 /// Format: the file mode of a regular file, and of a directory.
 const FILE_MODE: u32 = 0o100_644;
 const DIR_MODE: u32 = 0o040_755;
@@ -26,54 +27,68 @@ const DIR_MODE: u32 = 0o040_755;
 const ENOENT: i32 = 2;
 
 impl Mock {
-  fn file_attr(&self) -> Attr {
-    Attr {
+  fn file_attr(&self) -> NodeAttr {
+    NodeAttr {
       ino: 2,
-      size: self.content.len() as u64,
+      generation: 1,
+      kind: Kind::File,
       mode: FILE_MODE,
       nlink: 1,
-      ..Attr::default()
+      uid: 0,
+      gid: 0,
+      size: self.content.len() as u64,
+      atime: 0,
+      mtime: 0,
+      ctime: 0,
     }
   }
 }
 
 impl Bridge for Mock {
-  fn lookup(&mut self, parent: u64, name: &str) -> Result<EntryOut, i32> {
+  fn root(&mut self) -> Result<u64, VfsError> {
+    Ok(1)
+  }
+  fn lookup(&mut self, parent: u64, name: &str) -> Result<NodeAttr, VfsError> {
     if parent == 1 && name == "hello" {
-      Ok(EntryOut {
-        nodeid: 2,
-        generation: 1,
-        entry_valid: u64::MAX,
-        attr_valid: u64::MAX,
-        attr: self.file_attr(),
-      })
+      Ok(self.file_attr())
     } else {
-      Err(ENOENT)
+      Err(VfsError::NotFound)
     }
   }
-  fn getattr(&mut self, nodeid: u64) -> Result<Attr, i32> {
-    match nodeid {
-      1 => Ok(Attr {
+  fn getattr(&mut self, ino: u64) -> Result<NodeAttr, VfsError> {
+    match ino {
+      1 => Ok(NodeAttr {
         ino: 1,
+        generation: 0,
+        kind: Kind::Dir,
         mode: DIR_MODE,
         nlink: 2,
-        ..Attr::default()
+        uid: 0,
+        gid: 0,
+        size: 0,
+        atime: 0,
+        mtime: 0,
+        ctime: 0,
       }),
       2 => Ok(self.file_attr()),
-      _ => Err(ENOENT),
+      _ => Err(VfsError::NotFound),
     }
   }
-  fn open(&mut self, nodeid: u64, _flags: u32) -> Result<u64, i32> {
-    if nodeid == 2 { Ok(7) } else { Err(ENOENT) }
+  fn open(&mut self, ino: u64, _flags: u32) -> Result<u64, VfsError> {
+    if ino == 2 {
+      Ok(7)
+    } else {
+      Err(VfsError::NotFound)
+    }
   }
   fn read(
     &mut self,
-    _nodeid: u64,
+    _ino: u64,
     _fh: u64,
     offset: u64,
     size: u32,
     out: &mut Vec<u8>,
-  ) -> Result<(), i32> {
+  ) -> Result<(), VfsError> {
     let start = usize::try_from(offset)
       .unwrap_or(usize::MAX)
       .min(self.content.len());
@@ -83,7 +98,7 @@ impl Bridge for Mock {
     out.extend_from_slice(&self.content[start..end]);
     Ok(())
   }
-  fn write(&mut self, _nodeid: u64, _fh: u64, offset: u64, data: &[u8]) -> Result<u32, i32> {
+  fn write(&mut self, _ino: u64, _fh: u64, offset: u64, data: &[u8]) -> Result<u32, VfsError> {
     let at = usize::try_from(offset).unwrap_or(0);
     if self.content.len() < at + data.len() {
       self.content.resize(at + data.len(), 0);
@@ -91,16 +106,20 @@ impl Bridge for Mock {
     self.content[at..at + data.len()].copy_from_slice(data);
     Ok(u32::try_from(data.len()).unwrap_or(u32::MAX))
   }
-  fn opendir(&mut self, nodeid: u64) -> Result<u64, i32> {
-    if nodeid == 1 { Ok(9) } else { Err(ENOENT) }
+  fn opendir(&mut self, ino: u64) -> Result<u64, VfsError> {
+    if ino == 1 {
+      Ok(9)
+    } else {
+      Err(VfsError::NotFound)
+    }
   }
-  fn readdir(&mut self, _nodeid: u64, _fh: u64, offset: u64) -> Result<Vec<DirEntry>, i32> {
+  fn readdir(&mut self, _ino: u64, _fh: u64, offset: u64) -> Result<Vec<DirEntry>, VfsError> {
     if offset > 0 {
       return Ok(Vec::new());
     }
     Ok(vec![DirEntry {
       ino: 2,
-      kind: DT_REG,
+      kind: Kind::File,
       name: "hello".to_owned(),
     }])
   }
@@ -110,55 +129,64 @@ impl Bridge for Mock {
     _name: &str,
     _mode: u32,
     _flags: u32,
-  ) -> Result<(EntryOut, u64), i32> {
+  ) -> Result<(NodeAttr, u64), VfsError> {
     Ok((
-      EntryOut {
-        nodeid: 3,
+      NodeAttr {
+        ino: 3,
         generation: 1,
-        entry_valid: u64::MAX,
-        attr_valid: u64::MAX,
-        attr: Attr {
-          ino: 3,
-          mode: FILE_MODE,
-          nlink: 1,
-          ..Attr::default()
-        },
+        kind: Kind::File,
+        mode: FILE_MODE,
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        size: 0,
+        atime: 0,
+        mtime: 0,
+        ctime: 0,
       },
       8,
     ))
   }
-  fn release(&mut self, _nodeid: u64, _fh: u64) -> Result<(), i32> {
+  fn release(&mut self, _ino: u64, _fh: u64) -> Result<(), VfsError> {
     Ok(())
   }
-  fn forget(&mut self, _nodeid: u64, nlookup: u64) {
+  fn forget(&mut self, _ino: u64, nlookup: u64) {
     self.forgotten = self.forgotten.saturating_add(nlookup);
   }
-  fn flush(&mut self, _nodeid: u64, _fh: u64) -> Result<(), i32> {
+  fn flush(&mut self, _ino: u64, _fh: u64) -> Result<(), VfsError> {
     Ok(())
   }
-  fn mkdir(&mut self, _parent: u64, _name: &str, _mode: u32) -> Result<EntryOut, i32> {
-    Err(ENOSYS)
+  // The operations below are not exercised by these dispatch tests; the mock refuses them.
+  fn mkdir(&mut self, _parent: u64, _name: &str, _mode: u32) -> Result<NodeAttr, VfsError> {
+    Err(VfsError::Invalid)
   }
-  fn unlink(&mut self, _parent: u64, _name: &str) -> Result<(), i32> {
-    Err(ENOSYS)
+  fn unlink(&mut self, _parent: u64, _name: &str) -> Result<(), VfsError> {
+    Err(VfsError::Invalid)
   }
-  fn rmdir(&mut self, _parent: u64, _name: &str) -> Result<(), i32> {
-    Err(ENOSYS)
+  fn rmdir(&mut self, _parent: u64, _name: &str) -> Result<(), VfsError> {
+    Err(VfsError::Invalid)
   }
-  fn symlink(&mut self, _parent: u64, _name: &str, _target: &str) -> Result<EntryOut, i32> {
-    Err(ENOSYS)
+  fn symlink(&mut self, _parent: u64, _name: &str, _target: &str) -> Result<NodeAttr, VfsError> {
+    Err(VfsError::Invalid)
   }
-  fn readlink(&mut self, _nodeid: u64) -> Result<String, i32> {
-    Err(ENOSYS)
+  fn readlink(&mut self, _ino: u64) -> Result<String, VfsError> {
+    Err(VfsError::Invalid)
   }
-  fn rename(&mut self, _op: u64, _on: &str, _np: u64, _nn: &str) -> Result<(), i32> {
-    Err(ENOSYS)
+  fn rename(
+    &mut self,
+    _op: u64,
+    _on: &str,
+    _np: u64,
+    _nn: &str,
+    _flags: RenameFlags,
+  ) -> Result<(), VfsError> {
+    Err(VfsError::Invalid)
   }
-  fn setattr(&mut self, _nodeid: u64, _valid: u32, _size: u64, _mode: u32) -> Result<Attr, i32> {
-    Err(ENOSYS)
+  fn setattr(&mut self, _ino: u64, _changes: SetAttr) -> Result<NodeAttr, VfsError> {
+    Err(VfsError::Invalid)
   }
-  fn statfs(&mut self, _nodeid: u64) -> Result<slates_bridge_fuse::reply::StatfsOut, i32> {
-    Err(ENOSYS)
+  fn statfs(&mut self, _ino: u64) -> Result<FsStat, VfsError> {
+    Err(VfsError::Invalid)
   }
 }
 

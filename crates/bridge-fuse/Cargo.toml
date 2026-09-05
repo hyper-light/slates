@@ -11,6 +11,7 @@ description = "The Linux FUSE bridge: the /dev/fuse ABI codec, FUSE_INIT negotia
 [dependencies]
 slates-machine = { workspace = true }
 slates-vfs = { workspace = true }
+slates-bridge-core = { workspace = true }
 slates-mem = { workspace = true }
 slates-base = { workspace = true }
 

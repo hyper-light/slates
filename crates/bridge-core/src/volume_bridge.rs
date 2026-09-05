@@ -1,0 +1,390 @@
+//! The one [`Bridge`] implementation over the volume core (§4.6 "one implementation in the
+//! core"). A [`VolumeBridge`] borrows a `Volume` and its `Store` and turns a transport's
+//! requests, by real inode number, into volume operations. Inode number is the volume's own
+//! (node id 1 is a FUSE convention resolved to [`VolumeBridge::root`] at the FUSE edge, not here).
+//! File handles are a small counter into a table naming the inode they were opened on, so a read
+//! or write finds its inode in O(1). Nothing here writes a host path; a scratch volume lives
+//! entirely in RAM, so this is exercised on every host without a mount or a bridge transport, and
+//! every transport shares the semantics it proves.
+
+use slates_base::OsHost;
+use slates_mem::{Handle, Slab};
+use slates_vfs::error::VfsError;
+use slates_vfs::inode::{Attrs, Kind};
+use slates_vfs::volume::{Store, Volume};
+
+use crate::{Bridge, DirEntry, FsStat, NodeAttr, RenameFlags, SetAttr};
+
+/// Shape: the read cap, one arena chunk (256 KiB), matched to the INIT negotiation; here it
+/// bounds a single reply buffer.
+const MAX_READ: usize = 256 * 1024;
+/// Shape: the block size reported in filesystem statistics: one page, the volume core's chunk unit.
+const BLOCK_SIZE: u32 = 4096;
+/// Format: the maximum name length the volume core allows (§4.5's name cap).
+const NAME_MAX: u32 = 255;
+/// Shape: the bound on concurrently open handles per bridge — more than any realistic
+/// concurrent-open working set (a large build holds a few thousand files open at once), few
+/// enough that the handle table stays about a mebibyte, so a runaway is a typed
+/// `MemError::SlabFull` refusal rather than unbounded growth (audit BUG-4). The precise
+/// per-volume budget-derived cap is owed to the §4.2 admission wiring (GAP-A9-1).
+const MAX_OPEN_HANDLES: usize = 1 << 16;
+/// Shape: the handle slab's segment size — about one page of slots, so the table grows a page at
+/// a time up to [`MAX_OPEN_HANDLES`] and an idle bridge holds one small segment.
+const HANDLE_SEGMENT: usize = 256;
+
+/// The `Bridge` over one volume.
+pub struct VolumeBridge<'v> {
+  volume: &'v mut Volume,
+  store: &'v mut Store,
+  /// The read-only host of the base directory, for an overlay volume; `None` for a scratch
+  /// volume. Base entries (§4.5) are looked up, listed, stat-ed and read through it.
+  host: Option<OsHost>,
+  /// Open handles: a bounded generational slab whose value is the inode the handle names (files
+  /// and dirs share one space; a transport never confuses them). A released handle's slot is
+  /// reused and its generation bumped, so repeated open/close does not grow memory (audit BUG-4)
+  /// and a stale handle is a typed miss, never a wrong inode. The wire handle packs the slot index
+  /// and generation into one word.
+  handles: Slab<u64>,
+  /// Shape: the size a read is capped at when a request asks for more than one arena chunk.
+  max_read: usize,
+}
+
+impl std::fmt::Debug for VolumeBridge<'_> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("VolumeBridge")
+      .field("open_handles", &self.handles.len())
+      .finish()
+  }
+}
+
+impl<'v> VolumeBridge<'v> {
+  /// A bridge over `volume` and its `store`.
+  pub fn new(volume: &'v mut Volume, store: &'v mut Store) -> VolumeBridge<'v> {
+    VolumeBridge {
+      volume,
+      store,
+      host: None,
+      handles: Slab::new(HANDLE_SEGMENT, MAX_OPEN_HANDLES),
+      max_read: MAX_READ,
+    }
+  }
+
+  /// A bridge over an overlay `volume` whose base is served through `host` (§4.5, §4.6 "Base
+  /// files"): untouched base entries are looked up, listed, stat-ed and read from the disk.
+  pub fn with_base(volume: &'v mut Volume, store: &'v mut Store, host: OsHost) -> VolumeBridge<'v> {
+    VolumeBridge {
+      volume,
+      store,
+      host: Some(host),
+      handles: Slab::new(HANDLE_SEGMENT, MAX_OPEN_HANDLES),
+      max_read: MAX_READ,
+    }
+  }
+
+  /// Assigns a handle naming `inode`, or a typed refusal (`MemError::SlabFull`) once the bridge
+  /// already holds [`MAX_OPEN_HANDLES`] (audit BUG-4). The wire handle packs the slot and its
+  /// generation.
+  fn open_handle(&mut self, inode: u64) -> Result<u64, VfsError> {
+    Ok(pack_handle(self.handles.insert(inode)?))
+  }
+
+  /// The inode a handle names. A word that names no open slot — never opened, or released and
+  /// the slot's generation moved on — is an invalid argument (`EINVAL` at the FUSE edge, the
+  /// tested behavior; the NFS edge maps the same miss to a stale-handle status).
+  fn handle_inode(&self, fh: u64) -> Result<u64, VfsError> {
+    self
+      .handles
+      .get(unpack_handle(fh))
+      .copied()
+      .map_err(|_| VfsError::Invalid)
+  }
+
+  /// The neutral attributes of inode `no`: its stat (through the host for an overlay's base
+  /// entry) and its kind (structural, always in the store).
+  fn attr_of(&mut self, no: u64) -> Result<NodeAttr, VfsError> {
+    let inode = slates_vfs::ids::InodeNo(no);
+    let attrs = match self.host.as_mut() {
+      Some(host) => self.volume.with_host(host).stat(self.store, inode),
+      None => self.volume.stat(self.store, inode),
+    }?;
+    let kind = self.volume.kind(self.store, inode)?;
+    Ok(node_attr(no, kind, &attrs))
+  }
+}
+
+/// A neutral [`NodeAttr`] from the volume's attributes, kind and inode number. Generation is 0
+/// until generation-tracked reuse lands (§4.6 `(no, gen)`).
+fn node_attr(no: u64, kind: Kind, attrs: &Attrs) -> NodeAttr {
+  NodeAttr {
+    ino: no,
+    generation: 0,
+    kind,
+    mode: attrs.mode,
+    nlink: attrs.nlink,
+    uid: attrs.uid,
+    gid: attrs.gid,
+    size: attrs.size,
+    atime: attrs.atime,
+    mtime: attrs.mtime,
+    ctime: attrs.ctime,
+  }
+}
+
+/// Packs a slab handle into one wire word: the slot index in the high half, the generation in the
+/// low half. The inverse is [`unpack_handle`]; the slab's generation check refuses a stale word.
+fn pack_handle(handle: Handle<u64>) -> u64 {
+  (u64::from(handle.index()) << u32::BITS) | u64::from(handle.generation())
+}
+
+/// Unpacks a wire word into a slab handle.
+fn unpack_handle(word: u64) -> Handle<u64> {
+  let index = u32::try_from(word >> u32::BITS).unwrap_or(u32::MAX);
+  let generation = u32::try_from(word & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+  Handle::from_raw(index, generation)
+}
+
+impl Bridge for VolumeBridge<'_> {
+  fn root(&mut self) -> Result<u64, VfsError> {
+    self.volume.root_inode(self.store).map(|no| no.0)
+  }
+
+  fn lookup(&mut self, parent: u64, name: &str) -> Result<NodeAttr, VfsError> {
+    let located = self
+      .volume
+      .lookup_no(self.store, slates_vfs::ids::InodeNo(parent), name)?;
+    self.attr_of(located.inode.0)
+  }
+
+  fn getattr(&mut self, ino: u64) -> Result<NodeAttr, VfsError> {
+    self.attr_of(ino)
+  }
+
+  fn open(&mut self, ino: u64, _flags: u32) -> Result<u64, VfsError> {
+    // A directory is opened through opendir; open refuses it.
+    if self
+      .volume
+      .kind(self.store, slates_vfs::ids::InodeNo(ino))?
+      == Kind::Dir
+    {
+      return Err(VfsError::IsDirectory);
+    }
+    self.open_handle(ino)
+  }
+
+  fn read(
+    &mut self,
+    _ino: u64,
+    fh: u64,
+    offset: u64,
+    size: u32,
+    out: &mut Vec<u8>,
+  ) -> Result<(), VfsError> {
+    let no = self.handle_inode(fh)?;
+    let want = usize::try_from(size).unwrap_or(0).min(self.max_read);
+    let mut buf = vec![0u8; want];
+    let inode = slates_vfs::ids::InodeNo(no);
+    let read = match self.host.as_mut() {
+      Some(host) => self
+        .volume
+        .with_host(host)
+        .read(self.store, inode, offset, &mut buf),
+      None => self.volume.read(self.store, inode, offset, &mut buf),
+    }?;
+    out.extend_from_slice(&buf[..read]);
+    Ok(())
+  }
+
+  fn write(&mut self, _ino: u64, fh: u64, offset: u64, data: &[u8]) -> Result<u32, VfsError> {
+    let no = self.handle_inode(fh)?;
+    let inode = slates_vfs::ids::InodeNo(no);
+    // An overlay write copies the base up first (through the host); a scratch write does not.
+    let written = match self.host.as_mut() {
+      Some(host) => self
+        .volume
+        .with_host(host)
+        .write(self.store, inode, offset, data),
+      None => self.volume.write(self.store, inode, offset, data),
+    }?;
+    u32::try_from(written).map_err(|_| VfsError::FileTooLarge)
+  }
+
+  fn opendir(&mut self, ino: u64) -> Result<u64, VfsError> {
+    if self
+      .volume
+      .kind(self.store, slates_vfs::ids::InodeNo(ino))?
+      != Kind::Dir
+    {
+      return Err(VfsError::NotDirectory);
+    }
+    self.open_handle(ino)
+  }
+
+  fn readdir(&mut self, ino: u64, _fh: u64, offset: u64) -> Result<Vec<DirEntry>, VfsError> {
+    let dir_no = slates_vfs::ids::InodeNo(ino);
+    let rows = match self.host.as_mut() {
+      Some(host) => self.volume.with_host(host).readdir_no(self.store, dir_no),
+      None => self.volume.readdir_no(self.store, dir_no),
+    }?;
+    let start = usize::try_from(offset).unwrap_or(0);
+    Ok(
+      rows
+        .into_iter()
+        .skip(start)
+        .map(|row| DirEntry {
+          ino: row.inode.0,
+          kind: row.kind,
+          name: row.name.to_owned(),
+        })
+        .collect(),
+    )
+  }
+
+  fn create(
+    &mut self,
+    parent: u64,
+    name: &str,
+    mode: u32,
+    _flags: u32,
+  ) -> Result<(NodeAttr, u64), VfsError> {
+    let no =
+      self
+        .volume
+        .create_file_no(self.store, slates_vfs::ids::InodeNo(parent), name, mode)?;
+    let attrs = self.volume.stat(self.store, no)?;
+    let entry = node_attr(no.0, Kind::File, &attrs);
+    let fh = self.open_handle(no.0)?;
+    Ok((entry, fh))
+  }
+
+  fn release(&mut self, _ino: u64, fh: u64) -> Result<(), VfsError> {
+    // Removing the slot frees it for reuse and bumps its generation; an unknown or already-freed
+    // handle is a no-op, because the kernel may release a handle the bridge has already dropped.
+    let _ = self.handles.remove(unpack_handle(fh));
+    Ok(())
+  }
+
+  fn forget(&mut self, _ino: u64, _nlookup: u64) {
+    // Inode numbers are never reclaimed while the volume lives; a forget is a hint the transport
+    // dropped its cache. Generation-tracked reuse is owed (§4.6 `(no, gen)`).
+  }
+
+  fn flush(&mut self, _ino: u64, _fh: u64) -> Result<(), VfsError> {
+    // No disk write: the data is already in the anchor segment (§4.6). Success.
+    Ok(())
+  }
+
+  fn mkdir(&mut self, parent: u64, name: &str, mode: u32) -> Result<NodeAttr, VfsError> {
+    let no = self
+      .volume
+      .mkdir_no(self.store, slates_vfs::ids::InodeNo(parent), name, mode)?;
+    let attrs = self.volume.stat(self.store, no)?;
+    Ok(node_attr(no.0, Kind::Dir, &attrs))
+  }
+
+  fn unlink(&mut self, parent: u64, name: &str) -> Result<(), VfsError> {
+    self
+      .volume
+      .unlink_no(self.store, slates_vfs::ids::InodeNo(parent), name)
+  }
+
+  fn rmdir(&mut self, parent: u64, name: &str) -> Result<(), VfsError> {
+    self
+      .volume
+      .rmdir_no(self.store, slates_vfs::ids::InodeNo(parent), name)
+  }
+
+  fn symlink(&mut self, parent: u64, name: &str, target: &str) -> Result<NodeAttr, VfsError> {
+    let no = self
+      .volume
+      .symlink_no(self.store, slates_vfs::ids::InodeNo(parent), name, target)?;
+    let attrs = self.volume.stat(self.store, no)?;
+    Ok(node_attr(no.0, Kind::Symlink, &attrs))
+  }
+
+  fn readlink(&mut self, ino: u64) -> Result<String, VfsError> {
+    self
+      .volume
+      .readlink(self.store, slates_vfs::ids::InodeNo(ino))
+      .map(|t| t.into_string())
+  }
+
+  fn rename(
+    &mut self,
+    old_parent: u64,
+    old_name: &str,
+    new_parent: u64,
+    new_name: &str,
+    flags: RenameFlags,
+  ) -> Result<(), VfsError> {
+    // EXCHANGE (atomically swap two existing entries) is not yet expressible over the volume
+    // core; it is refused, never silently downgraded to a plain rename (audit BUG-10). `EINVAL`
+    // is the errno `renameat2` itself returns where a flag is unsupported (D-26).
+    if flags.exchange {
+      return Err(VfsError::Invalid);
+    }
+    let to_dir = slates_vfs::ids::InodeNo(new_parent);
+    // NOREPLACE must fail if the destination exists rather than replacing it. The owning shard
+    // runs one operation at a time, so this check and the rename are atomic against other work.
+    if flags.no_replace && self.volume.lookup_no(self.store, to_dir, new_name).is_ok() {
+      return Err(VfsError::AlreadyExists);
+    }
+    self.volume.rename_no(
+      self.store,
+      slates_vfs::ids::InodeNo(old_parent),
+      old_name,
+      to_dir,
+      new_name,
+    )
+  }
+
+  fn setattr(&mut self, ino: u64, changes: SetAttr) -> Result<NodeAttr, VfsError> {
+    let inode = slates_vfs::ids::InodeNo(ino);
+    if let Some(size) = changes.size {
+      self.volume.truncate(self.store, inode, size)?;
+    }
+    if let Some(mode) = changes.mode {
+      self.volume.chmod(self.store, inode, mode)?;
+    }
+    // Ownership and times honor each requested field, filling the unset half of a pair from the
+    // current attributes, so setting only the uid (or only the mtime) leaves the other unchanged;
+    // an ignored field is never acknowledged (§4.6; audit BUG-8).
+    if changes.uid.is_some() || changes.gid.is_some() {
+      let current = self.volume.stat(self.store, inode)?;
+      self.volume.chown(
+        self.store,
+        inode,
+        changes.uid.unwrap_or(current.uid),
+        changes.gid.unwrap_or(current.gid),
+      )?;
+    }
+    if changes.atime.is_some() || changes.mtime.is_some() {
+      let current = self.volume.stat(self.store, inode)?;
+      self.volume.set_times(
+        self.store,
+        inode,
+        changes.atime.unwrap_or(current.atime),
+        changes.mtime.unwrap_or(current.mtime),
+      )?;
+    }
+    self.attr_of(ino)
+  }
+
+  fn statfs(&mut self, _ino: u64) -> Result<FsStat, VfsError> {
+    let accounting = self.volume.accounting();
+    // Blocks are the volume's referenced bytes over the block size; the volume core does not
+    // expose a hard cap here (a dynamic volume grows), so free is reported generously and the
+    // quota is enforced on write, not by statfs. A transport uses this only for `df`.
+    let block = u64::from(BLOCK_SIZE);
+    let used = accounting.referenced_bytes.div_ceil(block);
+    Ok(FsStat {
+      blocks: used.saturating_mul(2).max(1),
+      bfree: used,
+      bavail: used,
+      files: 0,
+      ffree: 0,
+      bsize: BLOCK_SIZE,
+      namelen: NAME_MAX,
+      frsize: BLOCK_SIZE,
+    })
+  }
+}

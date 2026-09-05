@@ -999,6 +999,53 @@ impl Volume {
     Ok(())
   }
 
+  /// Sets the owner uid and gid (a `chown`), so a bridge honors a `setattr` of ownership instead
+  /// of ignoring it (§4.6 "never acknowledge an ignored setattr field"). Copy-on-write; the
+  /// change time advances, as POSIX requires for an attribute change.
+  pub fn chown(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    uid: u32,
+    gid: u32,
+  ) -> Result<(), VfsError> {
+    self.live()?;
+    let handle = self.make_current_inode(store, no)?;
+    let now = self.clock.wall_ns();
+    let inode = store.inodes.get_mut(handle)?;
+    let prev = inode.version;
+    inode.attrs.uid = uid;
+    inode.attrs.gid = gid;
+    inode.attrs.ctime = now;
+    inode.version += 1;
+    self.record(Op::Setattr, "", Some(no), prev);
+    Ok(())
+  }
+
+  /// Sets the access and modification times (a `utimens`), so a bridge honors a `setattr` of times
+  /// instead of ignoring it (§4.6). Times are nanoseconds since the Unix epoch. Copy-on-write; the
+  /// change time advances. `UTIME_NOW`/`UTIME_OMIT` resolution belongs to the transport that
+  /// carries those flags (owed, AC-3.10); this takes explicit values.
+  pub fn set_times(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    atime: i64,
+    mtime: i64,
+  ) -> Result<(), VfsError> {
+    self.live()?;
+    let handle = self.make_current_inode(store, no)?;
+    let now = self.clock.wall_ns();
+    let inode = store.inodes.get_mut(handle)?;
+    let prev = inode.version;
+    inode.attrs.atime = atime;
+    inode.attrs.mtime = mtime;
+    inode.attrs.ctime = now;
+    inode.version += 1;
+    self.record(Op::Setattr, "", Some(no), prev);
+    Ok(())
+  }
+
   // ------------------------------------------------------------------ snapshots and clones
 
   /// Takes a snapshot: one record; O(1).

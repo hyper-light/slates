@@ -131,51 +131,101 @@ impl ReadIn {
 /// says which the kernel set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SetAttrIn {
-  /// Which fields the kernel set.
+  /// Which fields the kernel set (the `FATTR_*` bits).
   pub valid: u32,
-  /// The new size (when `valid` has the size bit).
+  /// The new size (when `valid` has [`SetAttrIn::FATTR_SIZE`]).
   pub size: u64,
-  /// The new mode (when `valid` has the mode bit).
+  /// The new mode (when `valid` has [`SetAttrIn::FATTR_MODE`]).
   pub mode: u32,
+  /// The new owner uid (when `valid` has [`SetAttrIn::FATTR_UID`]).
+  pub uid: u32,
+  /// The new owner gid (when `valid` has [`SetAttrIn::FATTR_GID`]).
+  pub gid: u32,
+  /// The new access time in nanoseconds since the Unix epoch (when `valid` has
+  /// [`SetAttrIn::FATTR_ATIME`]).
+  pub atime: i64,
+  /// The new modification time in nanoseconds since the Unix epoch (when `valid` has
+  /// [`SetAttrIn::FATTR_MTIME`]).
+  pub mtime: i64,
 }
 
 impl SetAttrIn {
   /// Format: `FATTR_MODE`, the `valid` bit for the mode.
   pub const FATTR_MODE: u32 = 1 << 0;
+  /// Format: `FATTR_UID`, the `valid` bit for the owner uid.
+  pub const FATTR_UID: u32 = 1 << 1;
+  /// Format: `FATTR_GID`, the `valid` bit for the owner gid.
+  pub const FATTR_GID: u32 = 1 << 2;
   /// Format: `FATTR_SIZE`, the `valid` bit for the size.
   pub const FATTR_SIZE: u32 = 1 << 3;
-  /// Format: the offsets of the fields slates reads within `fuse_setattr_in`: valid at 0, size
-  /// after valid, padding and fh (three u32-or-u64 words), mode after size and lock_owner.
-  fn parse_fields(body: &[u8]) -> Option<(u32, u64, u32)> {
-    // valid (4), padding (4), fh (8), size (8), lock_owner (8), atime (8), mtime (8), ctime
-    // (8), atimensec (4), mtimensec (4), ctimensec (4), mode (4), ...
+  /// Format: `FATTR_ATIME`, the `valid` bit for the access time.
+  pub const FATTR_ATIME: u32 = 1 << 4;
+  /// Format: `FATTR_MTIME`, the `valid` bit for the modification time.
+  pub const FATTR_MTIME: u32 = 1 << 5;
+
+  /// Reads the fields slates honors from `fuse_setattr_in`, in wire order. The struct is valid
+  /// (4), padding (4), fh (8), size (8), lock_owner (8), atime (8), mtime (8), ctime (8),
+  /// atimensec (4), mtimensec (4), ctimensec (4), mode (4), unused4 (4), uid (4), gid (4),
+  /// unused5 (4). Times are seconds plus a nanosecond part, combined into the volume core's
+  /// nanosecond form.
+  #[allow(clippy::type_complexity)]
+  fn parse_fields(body: &[u8]) -> Option<(u32, u64, i64, i64, u32, u32, u32)> {
     let mut r = Reader::new(body);
     let op = Opcode::SetAttr.to_wire();
     let valid = r.u32(op).ok()?;
     r.skip(size_of::<u32>() + size_of::<u64>(), op).ok()?; // padding, fh
     let size = r.u64(op).ok()?;
-    // Format: before `mode` come four 64-bit fields (lock_owner, atime, mtime, ctime) and
-    // three 32-bit nsec fields (atimensec, mtimensec, ctimensec).
-    const WORDS_64_BEFORE_MODE: usize = 4;
-    const WORDS_32_BEFORE_MODE: usize = 3;
-    r.skip(
-      WORDS_64_BEFORE_MODE * size_of::<u64>() + WORDS_32_BEFORE_MODE * size_of::<u32>(),
-      op,
-    )
-    .ok()?;
+    r.skip(size_of::<u64>(), op).ok()?; // lock_owner
+    let atime_sec = r.u64(op).ok()?;
+    let mtime_sec = r.u64(op).ok()?;
+    r.skip(size_of::<u64>(), op).ok()?; // ctime
+    let atime_nsec = r.u32(op).ok()?;
+    let mtime_nsec = r.u32(op).ok()?;
+    r.skip(size_of::<u32>(), op).ok()?; // ctimensec
     let mode = r.u32(op).ok()?;
-    Some((valid, size, mode))
+    r.skip(size_of::<u32>(), op).ok()?; // unused4
+    let uid = r.u32(op).ok()?;
+    let gid = r.u32(op).ok()?;
+    Some((
+      valid,
+      size,
+      combine_time(atime_sec, atime_nsec),
+      combine_time(mtime_sec, mtime_nsec),
+      mode,
+      uid,
+      gid,
+    ))
   }
 
   /// Parses a setattr body; refuses one too short for the fields.
   pub fn parse(body: &[u8]) -> Result<SetAttrIn, FuseError> {
-    let (valid, size, mode) = Self::parse_fields(body).ok_or(FuseError::ShortBody {
-      opcode: Opcode::SetAttr.to_wire(),
-      have: body.len(),
-      need: body.len().saturating_add(1),
-    })?;
-    Ok(SetAttrIn { valid, size, mode })
+    let (valid, size, atime, mtime, mode, uid, gid) =
+      Self::parse_fields(body).ok_or(FuseError::ShortBody {
+        opcode: Opcode::SetAttr.to_wire(),
+        have: body.len(),
+        need: body.len().saturating_add(1),
+      })?;
+    Ok(SetAttrIn {
+      valid,
+      size,
+      mode,
+      uid,
+      gid,
+      atime,
+      mtime,
+    })
   }
+}
+
+/// Combines a POSIX `(seconds, nanoseconds)` time into nanoseconds since the Unix epoch, the
+/// volume core's form, saturating rather than overflowing on a far-future value.
+fn combine_time(seconds: u64, nanoseconds: u32) -> i64 {
+  /// Format: nanoseconds per second.
+  const NS_PER_SEC: i64 = 1_000_000_000;
+  i64::try_from(seconds)
+    .unwrap_or(i64::MAX)
+    .saturating_mul(NS_PER_SEC)
+    .saturating_add(i64::from(nanoseconds))
 }
 
 /// A `RENAME` body (`struct fuse_rename_in`: newdir (8), then oldname\0 newname\0) or a
@@ -185,10 +235,19 @@ impl SetAttrIn {
 pub struct RenameIn<'a> {
   /// The destination directory (a FUSE node id).
   pub newdir: u64,
+  /// The `renameat2` flags (`RENAME2` only; zero for an ordinary rename).
+  pub flags: u32,
   /// The old name.
   pub old_name: &'a str,
   /// The new name.
   pub new_name: &'a str,
+}
+
+impl RenameIn<'_> {
+  /// Format: `RENAME_NOREPLACE`, fail if the destination exists.
+  pub const RENAME_NOREPLACE: u32 = 1 << 0;
+  /// Format: `RENAME_EXCHANGE`, atomically exchange the two paths.
+  pub const RENAME_EXCHANGE: u32 = 1 << 1;
 }
 
 impl<'a> RenameIn<'a> {
@@ -207,6 +266,16 @@ impl<'a> RenameIn<'a> {
       });
     }
     let newdir = u64::from_le_bytes(body[..size_of::<u64>()].try_into().unwrap_or_default());
+    // `fuse_rename2_in` carries the flags word right after `newdir`; an ordinary rename has none.
+    let flags = if flagged {
+      u32::from_le_bytes(
+        body[size_of::<u64>()..size_of::<u64>() + size_of::<u32>()]
+          .try_into()
+          .unwrap_or_default(),
+      )
+    } else {
+      0
+    };
     let names = &body[head..];
     let split = names
       .iter()
@@ -221,6 +290,7 @@ impl<'a> RenameIn<'a> {
     let new_name = std::str::from_utf8(&rest[..end]).map_err(|_| FuseError::UnterminatedName)?;
     Ok(RenameIn {
       newdir,
+      flags,
       old_name,
       new_name,
     })

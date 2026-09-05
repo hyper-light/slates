@@ -70,6 +70,9 @@ slates-server = 4
 slates-client = 0
 slates-cli = 4
 slates-wire = 4
+# slates-bridge-core (0): the operation layer is the trait, neutral data structs and the
+# volume-core implementation; no syscalls, no unsafe.
+slates-bridge-core = 0
 slates-bridge-fuse = 0
 # slates-bridge-nfs (0): the XDR/RPC codec is bounds-checked byte slices; the socket uses safe std::net.
 slates-bridge-nfs = 0
