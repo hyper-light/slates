@@ -34,7 +34,7 @@ pub mod splice;
 pub mod verdict;
 
 pub use derive::{ContentOp, compose_content, compose_content_sized};
-pub use engine::{Green, Increment, Outcome, PathChange};
+pub use engine::{ConflictWindow, Green, Increment, Outcome};
 pub use increment::{Base, DeriveError, VolumeOp, compose_volume};
 pub use map::{Mapped, map_range};
 pub use ops_doc::{Op, OpKind, OpsDoc, PathTable};

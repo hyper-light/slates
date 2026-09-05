@@ -1,65 +1,186 @@
-//! Tests for the single-node merge engine (§4.16; T-6.x). Increments based on a version are
-//! submitted against the green; disjoint edits merge, overlapping ones conflict unless identical,
-//! the fast path skips range work when a path is unchanged since the base, and retries are
-//! idempotent by identity.
+//! Tests for the single-node merge engine (§4.16; T-6.x). An increment is the deriver's ops
+//! document plus its sealed post-state; the engine resolves it and decides every dimension against
+//! the intervening history. These tests build increments with a small builder that lays out an ops
+//! document and a consistent post-state the way the deriver does (paths interned, content named by
+//! post-state offsets), then submit them: disjoint edits merge, overlapping ones conflict unless
+//! identical, namespace changes (create, unlink, mkdir, rmdir, mode, symlink, hard link, rename,
+//! xattr) merge per path with their conflict classes, several dimensions merge on one path in one
+//! increment, a directory move merges as its child ops, and retries are idempotent by identity.
 
-use std::collections::BTreeMap;
+use slates_merge::engine::{Green, Increment, Outcome};
+use slates_merge::ops_doc::{Op, OpKind, OpsDoc};
+use slates_merge::verdict::MergeConflictClass;
 
-use slates_merge::engine::{Green, Increment, Outcome, PathChange};
-use slates_merge::ops_doc::{Op, OpKind};
+/// Builds an increment: an ops document with a consistent post-state (content and xattr bytes are
+/// appended to the post-state and named by their offset). Paths are interned in use order; the
+/// document is left un-canonicalized (the engine resolves by index, which the order does not
+/// affect), and the identity is supplied by the test.
+#[derive(Default)]
+struct Build {
+  doc: OpsDoc,
+  post: Vec<u8>,
+}
 
-/// An op with a path index of zero (the engine keys by the change's path, not the op's index).
-fn op(kind: OpKind, at: u64, len: u64, src: u64) -> Op {
-  Op {
-    kind,
-    flags: 0,
-    path: 0,
-    at,
-    len,
-    src,
+impl Build {
+  fn new() -> Build {
+    Build::default()
+  }
+
+  fn idx(&mut self, path: &str) -> u16 {
+    self.doc.paths.intern(path)
+  }
+
+  fn stash(&mut self, bytes: &[u8]) -> u64 {
+    let offset = self.post.len() as u64;
+    self.post.extend_from_slice(bytes);
+    offset
+  }
+
+  fn content(&mut self, kind: OpKind, path: &str, at: u64, bytes: &[u8]) -> &mut Build {
+    let path_idx = self.idx(path);
+    let src = self.stash(bytes);
+    self.doc.ops.push(Op {
+      kind,
+      flags: 0,
+      path: path_idx,
+      at,
+      len: bytes.len() as u64,
+      src,
+    });
+    self
+  }
+
+  fn create(&mut self, path: &str, bytes: &[u8]) -> &mut Build {
+    let path_idx = self.idx(path);
+    self.doc.ops.push(Op {
+      kind: OpKind::Create,
+      flags: 0,
+      path: path_idx,
+      at: 0,
+      len: 0,
+      src: u64::MAX,
+    });
+    self.content(OpKind::Insert, path, 0, bytes)
+  }
+
+  fn overwrite(&mut self, path: &str, at: u64, bytes: &[u8]) -> &mut Build {
+    self.content(OpKind::Overwrite, path, at, bytes)
+  }
+
+  fn insert(&mut self, path: &str, at: u64, bytes: &[u8]) -> &mut Build {
+    self.content(OpKind::Insert, path, at, bytes)
+  }
+
+  fn edge(&mut self, kind: OpKind, path: &str, target: &str) -> &mut Build {
+    let path_idx = self.idx(path);
+    let target_idx = self.idx(target);
+    self.doc.ops.push(Op {
+      kind,
+      flags: 0,
+      path: path_idx,
+      at: 0,
+      len: 0,
+      src: u64::from(target_idx),
+    });
+    self
+  }
+
+  fn rename(&mut self, from: &str, to: &str) -> &mut Build {
+    // The rename op is keyed at the destination; its source is the `src` path index.
+    self.edge(OpKind::Rename, to, from)
+  }
+
+  fn symlink(&mut self, path: &str, target: &str) -> &mut Build {
+    self.edge(OpKind::Symlink, path, target)
+  }
+
+  fn link(&mut self, path: &str, target: &str) -> &mut Build {
+    self.edge(OpKind::Link, path, target)
+  }
+
+  fn name_op(&mut self, kind: OpKind, path: &str) -> &mut Build {
+    let path_idx = self.idx(path);
+    self.doc.ops.push(Op {
+      kind,
+      flags: 0,
+      path: path_idx,
+      at: 0,
+      len: 0,
+      src: u64::MAX,
+    });
+    self
+  }
+
+  fn remove(&mut self, path: &str) -> &mut Build {
+    self.name_op(OpKind::Unlink, path)
+  }
+
+  fn mkdir(&mut self, path: &str) -> &mut Build {
+    self.name_op(OpKind::Mkdir, path)
+  }
+
+  fn rmdir(&mut self, path: &str) -> &mut Build {
+    self.name_op(OpKind::Rmdir, path)
+  }
+
+  fn setmode(&mut self, path: &str, mode: u32) -> &mut Build {
+    let path_idx = self.idx(path);
+    self.doc.ops.push(Op {
+      kind: OpKind::SetMode,
+      flags: 0,
+      path: path_idx,
+      at: 0,
+      len: u64::from(mode),
+      src: u64::MAX,
+    });
+    self
+  }
+
+  fn setxattr(&mut self, path: &str, name: &str, value: &[u8]) -> &mut Build {
+    let path_idx = self.idx(path);
+    let name_idx = self.idx(name);
+    let src = self.stash(value);
+    self.doc.ops.push(Op {
+      kind: OpKind::SetXattr,
+      flags: 0,
+      path: path_idx,
+      at: u64::from(name_idx),
+      len: value.len() as u64,
+      src,
+    });
+    self
+  }
+
+  fn removexattr(&mut self, path: &str, name: &str) -> &mut Build {
+    let path_idx = self.idx(path);
+    let name_idx = self.idx(name);
+    self.doc.ops.push(Op {
+      kind: OpKind::RemoveXattr,
+      flags: 0,
+      path: path_idx,
+      at: u64::from(name_idx),
+      len: 0,
+      src: u64::MAX,
+    });
+    self
+  }
+
+  fn at(&self, id: u8, base: u64) -> Increment {
+    Increment {
+      id: [id; 32],
+      base,
+      doc: self.doc.clone(),
+      post_state: self.post.clone(),
+    }
   }
 }
 
-/// A change that creates a file with `bytes`.
-fn create(bytes: &[u8]) -> PathChange {
-  PathChange::Create {
-    post_state: bytes.to_vec(),
-  }
-}
-
-/// A change that overwrites `base[at .. at + new.len())` in place with `new`.
-fn overwrite(base: &[u8], at: usize, new: &[u8]) -> PathChange {
-  let mut post_state = base.to_vec();
-  post_state[at..at + new.len()].copy_from_slice(new);
-  PathChange::Modify {
-    ops: vec![op(
-      OpKind::Overwrite,
-      at as u64,
-      new.len() as u64,
-      at as u64,
-    )],
-    post_state,
-  }
-}
-
-/// A change that inserts `new` at `at` in `base`.
-fn insert(base: &[u8], at: usize, new: &[u8]) -> PathChange {
-  let mut post_state = base.to_vec();
-  post_state.splice(at..at, new.iter().copied());
-  PathChange::Modify {
-    ops: vec![op(OpKind::Insert, at as u64, new.len() as u64, at as u64)],
-    post_state,
-  }
-}
-
-/// An increment over one path.
-fn increment(id: u8, base: u64, path: &str, change: PathChange) -> Increment {
-  let mut changes = BTreeMap::new();
-  changes.insert(path.to_owned(), change);
-  Increment {
-    id: [id; 32],
-    base,
-    changes,
+/// The class of the first conflict window, or `None` when the outcome is not a conflict (so an
+/// unexpected accept fails the comparison rather than needing a panic in this helper).
+fn conflict_class(outcome: &Outcome) -> Option<MergeConflictClass> {
+  match outcome {
+    Outcome::Conflict { windows } => windows.first().map(|window| window.class),
+    Outcome::Accepted { .. } => None,
   }
 }
 
@@ -67,7 +188,7 @@ fn increment(id: u8, base: u64, path: &str, change: PathChange) -> Increment {
 #[test]
 fn a_submit_accepts_and_updates_the_green() {
   let mut green = Green::new();
-  let outcome = green.submit(&increment(1, 0, "a", create(b"hello")));
+  let outcome = green.submit(&Build::new().create("a", b"hello").at(1, 0));
   assert_eq!(outcome, Outcome::Accepted { version: 1 });
   assert_eq!(green.content("a"), Some(b"hello".as_slice()));
   assert_eq!(green.head(), 1);
@@ -77,24 +198,22 @@ fn a_submit_accepts_and_updates_the_green() {
 #[test]
 fn disjoint_files_both_accept() {
   let mut green = Green::new();
-  green.submit(&increment(1, 0, "a", create(b"aaaa")));
-  green.submit(&increment(2, 0, "b", create(b"bbbb")));
+  green.submit(&Build::new().create("a", b"aaaa").at(1, 0));
+  green.submit(&Build::new().create("b", b"bbbb").at(2, 0));
   assert_eq!(green.content("a"), Some(b"aaaa".as_slice()));
   assert_eq!(green.content("b"), Some(b"bbbb".as_slice()));
   assert_eq!(green.head(), 2);
 }
 
 /// Two increments editing disjoint ranges of the same file, both based on the same version, both
-/// accept — the second's edit is applied at the position shifted past the first (the range merge).
+/// accept — the second's edit lands at the position shifted past the first (the range merge).
 #[test]
 fn disjoint_ranges_of_one_file_both_accept() {
   let mut green = Green::new();
-  green.submit(&increment(1, 0, "f", create(b"....................")));
-  // Two agents clone version 1 and edit disjoint spans.
-  let base = b"....................".to_vec();
-  let first = green.submit(&increment(2, 1, "f", overwrite(&base, 0, b"AAAA")));
+  green.submit(&Build::new().create("f", b"....................").at(1, 0));
+  let first = green.submit(&Build::new().overwrite("f", 0, b"AAAA").at(2, 1));
   assert_eq!(first, Outcome::Accepted { version: 2 });
-  let second = green.submit(&increment(3, 1, "f", overwrite(&base, 10, b"BBBB")));
+  let second = green.submit(&Build::new().overwrite("f", 10, b"BBBB").at(3, 1));
   assert_eq!(
     second,
     Outcome::Accepted { version: 3 },
@@ -109,16 +228,13 @@ fn disjoint_ranges_of_one_file_both_accept() {
 #[test]
 fn overlapping_edits_conflict() {
   let mut green = Green::new();
-  green.submit(&increment(1, 0, "f", create(b"....................")));
-  let base = b"....................".to_vec();
-  let first = green.submit(&increment(2, 1, "f", overwrite(&base, 5, b"AAAA")));
-  assert_eq!(first, Outcome::Accepted { version: 2 });
-  let second = green.submit(&increment(3, 1, "f", overwrite(&base, 5, b"BBBB")));
+  green.submit(&Build::new().create("f", b"....................").at(1, 0));
+  green.submit(&Build::new().overwrite("f", 5, b"AAAA").at(2, 1));
+  let second = green.submit(&Build::new().overwrite("f", 5, b"BBBB").at(3, 1));
   assert!(
     matches!(second, Outcome::Conflict { .. }),
     "same range conflicts"
   );
-  // The green kept the first edit; the second changed nothing.
   assert_eq!(&green.content("f").expect("present")[5..9], b"AAAA");
   assert_eq!(green.head(), 2);
 }
@@ -128,10 +244,9 @@ fn overlapping_edits_conflict() {
 #[test]
 fn an_identical_edit_accepts() {
   let mut green = Green::new();
-  green.submit(&increment(1, 0, "f", create(b"....................")));
-  let base = b"....................".to_vec();
-  green.submit(&increment(2, 1, "f", overwrite(&base, 5, b"AAAA")));
-  let same = green.submit(&increment(3, 1, "f", overwrite(&base, 5, b"AAAA")));
+  green.submit(&Build::new().create("f", b"....................").at(1, 0));
+  green.submit(&Build::new().overwrite("f", 5, b"AAAA").at(2, 1));
+  let same = green.submit(&Build::new().overwrite("f", 5, b"AAAA").at(3, 1));
   assert_eq!(
     same,
     Outcome::Accepted { version: 3 },
@@ -143,14 +258,10 @@ fn an_identical_edit_accepts() {
 #[test]
 fn an_intervening_insert_shifts_a_later_edit() {
   let mut green = Green::new();
-  green.submit(&increment(1, 0, "f", create(b"0123456789")));
-  let base = b"0123456789".to_vec();
-  // Agent A inserts "XX" at 0 (shifts everything right by 2).
-  green.submit(&increment(2, 1, "f", insert(&base, 0, b"XX")));
-  // Agent B (based on 1) overwrites [8,10) — disjoint from A's insert at 0.
-  let outcome = green.submit(&increment(3, 1, "f", overwrite(&base, 8, b"YY")));
+  green.submit(&Build::new().create("f", b"0123456789").at(1, 0));
+  green.submit(&Build::new().insert("f", 0, b"XX").at(2, 1));
+  let outcome = green.submit(&Build::new().overwrite("f", 8, b"YY").at(3, 1));
   assert_eq!(outcome, Outcome::Accepted { version: 3 });
-  // The green is "XX" + "01234567" + "YY" (B's edit shifted right by 2).
   assert_eq!(green.content("f"), Some(b"XX01234567YY".as_slice()));
 }
 
@@ -158,11 +269,10 @@ fn an_intervening_insert_shifts_a_later_edit() {
 #[test]
 fn the_fast_path_fires_for_an_unchanged_path() {
   let mut green = Green::new();
-  green.submit(&increment(1, 0, "a", create(b"aaaa")));
-  green.submit(&increment(2, 1, "b", create(b"bbbb")));
+  green.submit(&Build::new().create("a", b"aaaa").at(1, 0));
+  green.submit(&Build::new().create("b", b"bbbb").at(2, 1));
   let before = green.fast_path_hits();
-  // Editing "a" based on version 2: "a" was last changed at version 1 <= 2, so the fast path.
-  green.submit(&increment(3, 2, "a", overwrite(b"aaaa", 0, b"AA")));
+  green.submit(&Build::new().overwrite("a", 0, b"AA").at(3, 2));
   assert!(green.fast_path_hits() > before, "the fast path was taken");
   assert_eq!(green.content("a"), Some(b"AAaa".as_slice()));
 }
@@ -171,7 +281,7 @@ fn the_fast_path_fires_for_an_unchanged_path() {
 #[test]
 fn a_resubmit_is_idempotent() {
   let mut green = Green::new();
-  let inc = increment(1, 0, "a", create(b"hello"));
+  let inc = Build::new().create("a", b"hello").at(1, 0);
   let first = green.submit(&inc);
   let again = green.submit(&inc);
   assert_eq!(first, again);
@@ -182,52 +292,33 @@ fn a_resubmit_is_idempotent() {
 #[test]
 fn rebase_after_a_conflict_accepts() {
   let mut green = Green::new();
-  green.submit(&increment(1, 0, "f", create(b"....................")));
-  let base = b"....................".to_vec();
-  green.submit(&increment(2, 1, "f", overwrite(&base, 5, b"AAAA")));
-  let conflict = green.submit(&increment(3, 1, "f", overwrite(&base, 5, b"BBBB")));
+  green.submit(&Build::new().create("f", b"....................").at(1, 0));
+  green.submit(&Build::new().overwrite("f", 5, b"AAAA").at(2, 1));
+  let conflict = green.submit(&Build::new().overwrite("f", 5, b"BBBB").at(3, 1));
   assert!(matches!(conflict, Outcome::Conflict { .. }));
-  // The agent reads the head, rewrites its bytes onto it, and resubmits based on the head.
-  let head = green.content("f").expect("present").to_vec();
-  let rebased = green.submit(&increment(
-    4,
-    green.head(),
-    "f",
-    overwrite(&head, 5, b"BBBB"),
-  ));
+  let head = green.head();
+  let rebased = green.submit(&Build::new().overwrite("f", 5, b"BBBB").at(4, head));
   assert_eq!(rebased, Outcome::Accepted { version: 3 });
   assert_eq!(&green.content("f").expect("present")[5..9], b"BBBB");
-}
-
-/// A `remove` change.
-fn remove() -> PathChange {
-  PathChange::Remove
 }
 
 /// Two agents creating the same path with different bytes: the second conflicts (create/create).
 #[test]
 fn create_create_conflicts() {
   let mut green = Green::new();
-  green.submit(&increment(1, 0, "seed", create(b"x")));
-  let a = green.submit(&increment(2, 1, "new", create(b"from A")));
-  assert_eq!(a, Outcome::Accepted { version: 2 });
-  let b = green.submit(&increment(3, 1, "new", create(b"from B")));
-  match b {
-    Outcome::Conflict { windows } => assert_eq!(
-      windows[0].class,
-      slates_merge::verdict::MergeConflictClass::CreateCreate
-    ),
-    other => panic!("expected create/create conflict, got {other:?}"),
-  }
+  green.submit(&Build::new().create("seed", b"x").at(1, 0));
+  green.submit(&Build::new().create("new", b"from A").at(2, 1));
+  let b = green.submit(&Build::new().create("new", b"from B").at(3, 1));
+  assert_eq!(conflict_class(&b), Some(MergeConflictClass::CreateCreate));
 }
 
 /// Two agents creating the same path with identical bytes: the second accepts (no-op).
 #[test]
 fn identical_create_accepts() {
   let mut green = Green::new();
-  green.submit(&increment(1, 0, "seed", create(b"x")));
-  green.submit(&increment(2, 1, "new", create(b"same")));
-  let b = green.submit(&increment(3, 1, "new", create(b"same")));
+  green.submit(&Build::new().create("seed", b"x").at(1, 0));
+  green.submit(&Build::new().create("new", b"same").at(2, 1));
+  let b = green.submit(&Build::new().create("new", b"same").at(3, 1));
   assert_eq!(b, Outcome::Accepted { version: 3 });
   assert_eq!(green.content("new"), Some(b"same".as_slice()));
 }
@@ -236,476 +327,248 @@ fn identical_create_accepts() {
 #[test]
 fn delete_versus_modify_conflicts() {
   let mut green = Green::new();
-  green.submit(&increment(1, 0, "f", create(b"hello world")));
-  // Agent A removes f at version 2.
-  let a = green.submit(&increment(2, 1, "f", remove()));
+  green.submit(&Build::new().create("f", b"hello world").at(1, 0));
+  let a = green.submit(&Build::new().remove("f").at(2, 1));
   assert_eq!(a, Outcome::Accepted { version: 2 });
-  assert_eq!(green.content("f"), None, "f is gone");
-  // Agent B (based on 1) modifies f — but f was deleted.
-  let b = green.submit(&increment(
-    3,
-    1,
-    "f",
-    overwrite(b"hello world", 0, b"HELLO"),
-  ));
-  match b {
-    Outcome::Conflict { windows } => assert_eq!(
-      windows[0].class,
-      slates_merge::verdict::MergeConflictClass::DeleteModify
-    ),
-    other => panic!("expected delete/modify conflict, got {other:?}"),
-  }
-}
-
-/// Removing a file unchanged since the base accepts.
-#[test]
-fn a_remove_accepts() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "f", create(b"bye")));
-  let outcome = green.submit(&increment(2, 1, "f", remove()));
-  assert_eq!(outcome, Outcome::Accepted { version: 2 });
   assert_eq!(green.content("f"), None);
+  let b = green.submit(&Build::new().overwrite("f", 0, b"HELLO").at(3, 1));
+  assert_eq!(conflict_class(&b), Some(MergeConflictClass::DeleteModify));
 }
 
-/// Removing an already-removed file is a no-op accept (both agents deleted it).
+/// Removing a file unchanged since the base accepts; removing an already-gone file is a no-op.
 #[test]
-fn removing_an_already_removed_file_is_a_no_op() {
+fn removes_accept() {
   let mut green = Green::new();
-  green.submit(&increment(1, 0, "f", create(b"bye")));
-  green.submit(&increment(2, 1, "f", remove()));
-  let again = green.submit(&increment(3, 1, "f", remove()));
-  assert_eq!(again, Outcome::Accepted { version: 3 });
-  assert_eq!(green.content("f"), None);
-}
-
-/// An agent removes a file another modified since the base: delete/modify conflict.
-#[test]
-fn remove_of_a_modified_file_conflicts() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "f", create(b"hello world")));
-  // Agent A modifies f at version 2.
-  green.submit(&increment(
-    2,
-    1,
-    "f",
-    overwrite(b"hello world", 0, b"HELLO"),
-  ));
-  // Agent B (based on 1) removes f — but f was modified intervening.
-  let b = green.submit(&increment(3, 1, "f", remove()));
-  assert!(
-    matches!(b, Outcome::Conflict { .. }),
-    "removing a modified file conflicts"
-  );
-}
-
-/// A change that creates a directory at the path.
-fn mkdir() -> PathChange {
-  PathChange::Mkdir
-}
-
-/// A change that sets the mode of the path.
-fn set_mode(mode: u32) -> PathChange {
-  PathChange::SetMode { mode }
-}
-
-/// A mkdir creates a directory.
-#[test]
-fn mkdir_creates_a_directory() {
-  let mut green = Green::new();
-  let outcome = green.submit(&increment(1, 0, "d", mkdir()));
-  assert_eq!(outcome, Outcome::Accepted { version: 1 });
-  assert!(green.is_dir("d"));
-}
-
-/// Two agents making the same directory: the second accepts as a no-op (both made it).
-#[test]
-fn two_mkdirs_of_the_same_path_accept() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "d", mkdir()));
-  let again = green.submit(&increment(2, 0, "d", mkdir()));
-  assert_eq!(again, Outcome::Accepted { version: 2 });
-  assert!(green.is_dir("d"));
-}
-
-/// A mkdir where an intervening change created a file is a type conflict.
-#[test]
-fn mkdir_over_a_file_conflicts() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "a", create(b"file")));
-  let outcome = green.submit(&increment(2, 1, "a", mkdir()));
-  match outcome {
-    Outcome::Conflict { windows } => assert_eq!(
-      windows[0].class,
-      slates_merge::verdict::MergeConflictClass::TypeChanged
-    ),
-    other => panic!("expected a type conflict, got {other:?}"),
-  }
-}
-
-/// A create where an intervening change made the path a directory is a type conflict.
-#[test]
-fn create_over_a_directory_conflicts() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "d", mkdir()));
-  let outcome = green.submit(&increment(2, 1, "d", create(b"file")));
-  match outcome {
-    Outcome::Conflict { windows } => assert_eq!(
-      windows[0].class,
-      slates_merge::verdict::MergeConflictClass::TypeChanged
-    ),
-    other => panic!("expected a type conflict, got {other:?}"),
-  }
-}
-
-/// A setmode sets the mode of a file, and of a directory.
-#[test]
-fn setmode_sets_the_mode() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "f", create(b"x")));
-  green.submit(&increment(2, 1, "f", set_mode(0o644)));
-  assert_eq!(green.mode("f"), Some(0o644));
-  green.submit(&increment(3, 2, "d", mkdir()));
-  green.submit(&increment(4, 3, "d", set_mode(0o755)));
-  assert_eq!(green.mode("d"), Some(0o755));
-}
-
-/// Two agents setting differing modes on one path from the same base: the second conflicts.
-#[test]
-fn two_differing_setmodes_conflict() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "f", create(b"x")));
-  let a = green.submit(&increment(2, 1, "f", set_mode(0o600)));
-  assert_eq!(a, Outcome::Accepted { version: 2 });
-  let b = green.submit(&increment(3, 1, "f", set_mode(0o644)));
-  match b {
-    Outcome::Conflict { windows } => assert_eq!(
-      windows[0].class,
-      slates_merge::verdict::MergeConflictClass::MetaMeta
-    ),
-    other => panic!("expected a metadata conflict, got {other:?}"),
-  }
-  assert_eq!(green.mode("f"), Some(0o600), "the first mode stands");
-}
-
-/// Two agents setting the identical mode: the second accepts as a no-op.
-#[test]
-fn identical_setmodes_accept() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "f", create(b"x")));
-  green.submit(&increment(2, 1, "f", set_mode(0o600)));
-  let same = green.submit(&increment(3, 1, "f", set_mode(0o600)));
-  assert_eq!(same, Outcome::Accepted { version: 3 });
-}
-
-/// A setmode on a file an intervening change deleted is a delete/modify conflict.
-#[test]
-fn setmode_on_a_deleted_file_conflicts() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "f", create(b"x")));
-  green.submit(&increment(2, 1, "f", remove()));
-  let b = green.submit(&increment(3, 1, "f", set_mode(0o600)));
-  match b {
-    Outcome::Conflict { windows } => assert_eq!(
-      windows[0].class,
-      slates_merge::verdict::MergeConflictClass::DeleteModify
-    ),
-    other => panic!("expected a delete/modify conflict, got {other:?}"),
-  }
-}
-
-/// A content edit and a mode change are independent dimensions: an intervening mode change does not
-/// conflict with a content edit unchanged since its base.
-#[test]
-fn a_content_edit_and_a_mode_change_are_independent() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "f", create(b"0123456789")));
-  // Agent A sets the mode at version 2.
-  green.submit(&increment(2, 1, "f", set_mode(0o600)));
-  // Agent B (based on 1) edits the content — the mode change is a different dimension.
-  let outcome = green.submit(&increment(3, 1, "f", overwrite(b"0123456789", 0, b"AB")));
+  green.submit(&Build::new().create("f", b"bye").at(1, 0));
   assert_eq!(
-    outcome,
+    green.submit(&Build::new().remove("f").at(2, 1)),
+    Outcome::Accepted { version: 2 }
+  );
+  assert_eq!(green.content("f"), None);
+  let again = green.submit(&Build::new().remove("f").at(3, 1));
+  assert_eq!(
+    again,
     Outcome::Accepted { version: 3 },
-    "independent dimensions do not conflict"
+    "already gone is a no-op"
   );
+}
+
+/// mkdir accepts, two mkdirs accept, and a file and directory at one path is a type conflict.
+#[test]
+fn mkdir_and_type_conflicts() {
+  let mut green = Green::new();
+  assert_eq!(
+    green.submit(&Build::new().mkdir("d").at(1, 0)),
+    Outcome::Accepted { version: 1 }
+  );
+  assert!(green.is_dir("d"));
+  assert_eq!(
+    green.submit(&Build::new().mkdir("d").at(2, 1)),
+    Outcome::Accepted { version: 2 }
+  );
+  green.submit(&Build::new().create("a", b"file").at(3, 2));
+  assert_eq!(
+    conflict_class(&green.submit(&Build::new().mkdir("a").at(4, 3))),
+    Some(MergeConflictClass::TypeChanged)
+  );
+}
+
+/// A mode change; two differing changes conflict, an identical one accepts, and it is independent
+/// of a content edit.
+#[test]
+fn mode_merges() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("f", b"0123456789").at(1, 0));
+  green.submit(&Build::new().setmode("f", 0o600).at(2, 1));
+  assert_eq!(green.mode("f"), Some(0o600));
+  assert_eq!(
+    conflict_class(&green.submit(&Build::new().setmode("f", 0o644).at(3, 1))),
+    Some(MergeConflictClass::MetaMeta)
+  );
+  assert_eq!(
+    green.submit(&Build::new().setmode("f", 0o600).at(4, 1)),
+    Outcome::Accepted { version: 3 }
+  );
+  // A content edit based on version 1 does not conflict with the intervening mode change.
+  let edit = green.submit(&Build::new().overwrite("f", 0, b"AB").at(5, 1));
+  assert_eq!(edit, Outcome::Accepted { version: 4 });
   assert_eq!(&green.content("f").expect("present")[0..2], b"AB");
-  assert_eq!(green.mode("f"), Some(0o600), "the mode is retained");
+  assert_eq!(green.mode("f"), Some(0o600));
 }
 
-/// A modify of a path an intervening change turned into a directory is a type conflict.
+/// Symlink merges: identical accepts, differing conflicts, file/symlink is a type conflict.
 #[test]
-fn modify_of_a_path_now_a_directory_conflicts() {
+fn symlink_merges() {
   let mut green = Green::new();
-  green.submit(&increment(1, 0, "x", mkdir()));
-  let outcome = green.submit(&increment(2, 1, "x", overwrite(b"", 0, b"")));
-  match outcome {
-    Outcome::Conflict { windows } => assert_eq!(
-      windows[0].class,
-      slates_merge::verdict::MergeConflictClass::TypeChanged
-    ),
-    other => panic!("expected a type conflict, got {other:?}"),
-  }
-}
-
-/// A change that creates or retargets a symlink at the path.
-fn symlink(target: &str) -> PathChange {
-  PathChange::Symlink {
-    target: target.to_owned(),
-  }
-}
-
-/// A symlink creates a link with its target.
-#[test]
-fn symlink_creates_a_link() {
-  let mut green = Green::new();
-  let outcome = green.submit(&increment(1, 0, "l", symlink("target")));
-  assert_eq!(outcome, Outcome::Accepted { version: 1 });
+  green.submit(&Build::new().symlink("l", "target").at(1, 0));
   assert_eq!(green.symlink("l"), Some("target"));
-}
-
-/// Two agents making the same symlink accept (identical target).
-#[test]
-fn identical_symlinks_accept() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "l", symlink("t")));
-  let again = green.submit(&increment(2, 1, "l", symlink("t")));
-  assert_eq!(again, Outcome::Accepted { version: 2 });
-}
-
-/// Two agents pointing one symlink at differing targets from the same base conflict.
-#[test]
-fn differing_symlink_targets_conflict() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "seed", create(b"x")));
-  let a = green.submit(&increment(2, 1, "l", symlink("one")));
-  assert_eq!(a, Outcome::Accepted { version: 2 });
-  let b = green.submit(&increment(3, 1, "l", symlink("two")));
-  match b {
-    Outcome::Conflict { windows } => assert_eq!(
-      windows[0].class,
-      slates_merge::verdict::MergeConflictClass::CreateCreate
-    ),
-    other => panic!("expected a create/create conflict, got {other:?}"),
-  }
-  assert_eq!(green.symlink("l"), Some("one"), "the first target stands");
-}
-
-/// A symlink where an intervening change created a file is a type conflict, and the reverse.
-#[test]
-fn symlink_and_file_at_one_path_conflict() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "a", create(b"file")));
-  let over_file = green.submit(&increment(2, 1, "a", symlink("t")));
-  assert!(
-    matches!(over_file, Outcome::Conflict { .. }),
-    "a symlink over a file is a type conflict"
+  assert_eq!(
+    green.submit(&Build::new().symlink("l", "target").at(2, 1)),
+    Outcome::Accepted { version: 2 }
   );
-  green.submit(&increment(3, 2, "b", symlink("t")));
-  let over_link = green.submit(&increment(4, 3, "b", create(b"file")));
-  assert!(
-    matches!(over_link, Outcome::Conflict { .. }),
-    "a file over a symlink is a type conflict"
+  assert_eq!(
+    conflict_class(&green.submit(&Build::new().symlink("l", "other").at(3, 1))),
+    Some(MergeConflictClass::CreateCreate)
+  );
+  green.submit(&Build::new().create("a", b"file").at(4, 2));
+  assert_eq!(
+    conflict_class(&green.submit(&Build::new().symlink("a", "t").at(5, 4))),
+    Some(MergeConflictClass::TypeChanged)
   );
 }
 
-/// A change that renames a file to the keyed path from `from`.
-fn rename(from: &str) -> PathChange {
-  PathChange::Rename {
-    from: from.to_owned(),
-  }
-}
-
-/// A rename moves a file's content to the destination and removes the source.
+/// A file rename moves the content and removes the source; a moved source conflicts.
 #[test]
-fn rename_moves_a_file() {
+fn rename_merges() {
   let mut green = Green::new();
-  green.submit(&increment(1, 0, "a", create(b"payload")));
-  let outcome = green.submit(&increment(2, 1, "b", rename("a")));
-  assert_eq!(outcome, Outcome::Accepted { version: 2 });
+  green.submit(&Build::new().create("a", b"payload").at(1, 0));
+  assert_eq!(
+    green.submit(&Build::new().rename("a", "b").at(2, 1)),
+    Outcome::Accepted { version: 2 }
+  );
   assert_eq!(green.content("b"), Some(b"payload".as_slice()));
-  assert_eq!(green.content("a"), None, "the source is gone");
+  assert_eq!(green.content("a"), None);
+  green.submit(&Build::new().create("c", b"x").at(3, 2));
+  green.submit(&Build::new().rename("c", "d").at(4, 3));
+  assert_eq!(
+    conflict_class(&green.submit(&Build::new().rename("c", "e").at(5, 3))),
+    Some(MergeConflictClass::RenameRename)
+  );
 }
 
-/// A rename moves the source's current content, so an intervening edit follows the move.
+/// A rename moves the source's current content, so an intervening edit to the source follows it.
 #[test]
 fn rename_carries_an_intervening_edit() {
   let mut green = Green::new();
-  green.submit(&increment(1, 0, "a", create(b"0123456789")));
-  // Agent A edits "a" at version 2.
-  green.submit(&increment(2, 1, "a", overwrite(b"0123456789", 0, b"XX")));
-  // Agent B (based on 1) renames a -> b; the rename moves a's current (edited) content.
-  let outcome = green.submit(&increment(3, 1, "b", rename("a")));
+  green.submit(&Build::new().create("a", b"0123456789").at(1, 0));
+  green.submit(&Build::new().overwrite("a", 0, b"XX").at(2, 1));
+  let outcome = green.submit(&Build::new().rename("a", "b").at(3, 1));
   assert_eq!(outcome, Outcome::Accepted { version: 3 });
   assert_eq!(green.content("b"), Some(b"XX23456789".as_slice()));
   assert_eq!(green.content("a"), None);
 }
 
-/// Two agents renaming the same source conflict: the second finds the source already gone.
+/// rmdir removes an empty directory, a directory emptied by this increment, but conflicts on a live
+/// child (including one an intervening change added).
 #[test]
-fn rename_of_a_moved_source_conflicts() {
+fn rmdir_merges() {
   let mut green = Green::new();
-  green.submit(&increment(1, 0, "a", create(b"x")));
-  let first = green.submit(&increment(2, 1, "b", rename("a")));
-  assert_eq!(first, Outcome::Accepted { version: 2 });
-  let second = green.submit(&increment(3, 1, "c", rename("a")));
-  match second {
-    Outcome::Conflict { windows } => assert_eq!(
-      windows[0].class,
-      slates_merge::verdict::MergeConflictClass::RenameRename
-    ),
-    other => panic!("expected a rename/rename conflict, got {other:?}"),
-  }
-}
-
-/// A rename whose destination an intervening change occupied conflicts.
-#[test]
-fn rename_onto_an_occupied_destination_conflicts() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "a", create(b"aaa")));
-  // Agent A creates "b" at version 2.
-  green.submit(&increment(2, 1, "b", create(b"other")));
-  // Agent B (based on 1) renames a -> b, but b was created intervening.
-  let outcome = green.submit(&increment(3, 1, "b", rename("a")));
-  assert!(
-    matches!(outcome, Outcome::Conflict { .. }),
-    "an occupied destination conflicts"
-  );
-}
-
-/// Renaming over a file that existed at the base replaces it.
-#[test]
-fn rename_over_a_base_file_replaces_it() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "a", create(b"from-a")));
-  green.submit(&increment(2, 1, "b", create(b"old-b")));
-  // Based on version 2, both a and b exist; rename a -> b replaces b.
-  let outcome = green.submit(&increment(3, 2, "b", rename("a")));
-  assert_eq!(outcome, Outcome::Accepted { version: 3 });
-  assert_eq!(green.content("b"), Some(b"from-a".as_slice()));
-  assert_eq!(green.content("a"), None);
-}
-
-/// A chained rename in one increment (a→b and b→c) rotates correctly: removes apply before sets, so
-/// renaming into a path another rename is vacating does not lose the moved content.
-#[test]
-fn a_chained_rename_in_one_increment_is_correct() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "a", create(b"A")));
-  green.submit(&increment(2, 1, "b", create(b"B")));
-  let mut changes = BTreeMap::new();
-  changes.insert("c".to_owned(), rename("b")); // b -> c
-  changes.insert("b".to_owned(), rename("a")); // a -> b
-  let outcome = green.submit(&Increment {
-    id: [9; 32],
-    base: 2,
-    changes,
-  });
-  assert_eq!(outcome, Outcome::Accepted { version: 3 });
+  green.submit(&Build::new().mkdir("d").at(1, 0));
   assert_eq!(
-    green.content("c"),
-    Some(b"B".as_slice()),
-    "c holds b's content"
+    green.submit(&Build::new().rmdir("d").at(2, 1)),
+    Outcome::Accepted { version: 2 }
   );
-  assert_eq!(
-    green.content("b"),
-    Some(b"A".as_slice()),
-    "b holds a's content"
-  );
-  assert_eq!(green.content("a"), None, "a is vacated");
-}
-
-/// A change that removes a directory.
-fn rmdir() -> PathChange {
-  PathChange::Rmdir
-}
-
-/// An increment with two changes.
-fn increment2(id: u8, base: u64, a: (&str, PathChange), b: (&str, PathChange)) -> Increment {
-  let mut changes = BTreeMap::new();
-  changes.insert(a.0.to_owned(), a.1);
-  changes.insert(b.0.to_owned(), b.1);
-  Increment {
-    id: [id; 32],
-    base,
-    changes,
-  }
-}
-
-/// An rmdir removes an empty directory.
-#[test]
-fn rmdir_removes_an_empty_directory() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "d", mkdir()));
-  let outcome = green.submit(&increment(2, 1, "d", rmdir()));
-  assert_eq!(outcome, Outcome::Accepted { version: 2 });
   assert!(!green.is_dir("d"));
-}
-
-/// A directory emptied within the same increment can be removed (removing its child and the
-/// directory together accepts).
-#[test]
-fn rmdir_of_a_directory_emptied_in_the_same_increment() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "d", mkdir()));
-  green.submit(&increment(2, 1, "d/f", create(b"x")));
-  let outcome = green.submit(&increment2(3, 2, ("d/f", remove()), ("d", rmdir())));
-  assert_eq!(outcome, Outcome::Accepted { version: 3 });
-  assert!(!green.is_dir("d"), "the directory is removed");
-  assert_eq!(green.content("d/f"), None, "the child is removed");
-}
-
-/// Removing a non-empty directory (a live child this increment does not clear) conflicts.
-#[test]
-fn rmdir_of_a_nonempty_directory_conflicts() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "d", mkdir()));
-  green.submit(&increment(2, 1, "d/f", create(b"x")));
-  let outcome = green.submit(&increment(3, 2, "d", rmdir()));
-  match outcome {
-    Outcome::Conflict { windows } => assert_eq!(
-      windows[0].class,
-      slates_merge::verdict::MergeConflictClass::DeleteModify
-    ),
-    other => panic!("expected a not-empty conflict, got {other:?}"),
-  }
-  assert!(green.is_dir("d"), "the directory stands");
-}
-
-/// An rmdir of a path that is a file is a type conflict.
-#[test]
-fn rmdir_of_a_file_conflicts() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "f", create(b"x")));
-  let outcome = green.submit(&increment(2, 1, "f", rmdir()));
-  match outcome {
-    Outcome::Conflict { windows } => assert_eq!(
-      windows[0].class,
-      slates_merge::verdict::MergeConflictClass::TypeChanged
-    ),
-    other => panic!("expected a type conflict, got {other:?}"),
-  }
-}
-
-/// An rmdir of an absent directory is a no-op accept.
-#[test]
-fn rmdir_of_an_absent_directory_is_a_noop() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "seed", create(b"x")));
-  let outcome = green.submit(&increment(2, 1, "gone", rmdir()));
-  assert_eq!(outcome, Outcome::Accepted { version: 2 });
-}
-
-/// An rmdir conflicts when an intervening change added a child to the directory.
-#[test]
-fn rmdir_with_an_intervening_child_conflicts() {
-  let mut green = Green::new();
-  green.submit(&increment(1, 0, "d", mkdir()));
-  // Agent A adds a child at version 2.
-  green.submit(&increment(2, 1, "d/f", create(b"x")));
-  // Agent B (based on 1) removes d, but a child was added intervening.
-  let outcome = green.submit(&increment(3, 1, "d", rmdir()));
-  assert!(
-    matches!(outcome, Outcome::Conflict { .. }),
-    "an intervening child blocks the removal"
+  // Emptied in the same increment (remove the child and the directory together).
+  green.submit(&Build::new().mkdir("e").at(3, 2));
+  green.submit(&Build::new().create("e/f", b"x").at(4, 3));
+  let together = green.submit(&Build::new().remove("e/f").rmdir("e").at(5, 4));
+  assert_eq!(together, Outcome::Accepted { version: 5 });
+  assert!(!green.is_dir("e"));
+  // A live child blocks removal.
+  green.submit(&Build::new().mkdir("g").at(6, 5));
+  green.submit(&Build::new().create("g/f", b"x").at(7, 6));
+  assert_eq!(
+    conflict_class(&green.submit(&Build::new().rmdir("g").at(8, 6))),
+    Some(MergeConflictClass::DeleteModify)
   );
+}
+
+/// A hard link merges as a namespace edge: identical accepts, differing conflicts, file/link is a
+/// type conflict.
+#[test]
+fn hard_link_merges() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("f", b"shared").at(1, 0));
+  assert_eq!(
+    green.submit(&Build::new().link("l", "f").at(2, 1)),
+    Outcome::Accepted { version: 2 }
+  );
+  assert_eq!(green.hardlink("l"), Some("f"));
+  assert_eq!(
+    green.submit(&Build::new().link("l", "f").at(3, 2)),
+    Outcome::Accepted { version: 3 },
+    "identical link accepts"
+  );
+  assert_eq!(
+    conflict_class(&green.submit(&Build::new().link("l", "other").at(4, 2))),
+    Some(MergeConflictClass::CreateCreate)
+  );
+  assert_eq!(
+    conflict_class(&green.submit(&Build::new().create("l", b"file").at(5, 3))),
+    Some(MergeConflictClass::TypeChanged)
+  );
+}
+
+/// Xattrs merge per (path, name): a set, an identical re-set, a differing conflict, independence
+/// across names, and a removal.
+#[test]
+fn xattr_merges() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("f", b"body").at(1, 0));
+  assert_eq!(
+    green.submit(&Build::new().setxattr("f", "user.a", b"1").at(2, 1)),
+    Outcome::Accepted { version: 2 }
+  );
+  assert_eq!(green.xattr("f", "user.a"), Some(b"1".as_slice()));
+  assert_eq!(
+    green.submit(&Build::new().setxattr("f", "user.a", b"1").at(3, 1)),
+    Outcome::Accepted { version: 3 }
+  );
+  assert_eq!(
+    conflict_class(&green.submit(&Build::new().setxattr("f", "user.a", b"2").at(4, 1))),
+    Some(MergeConflictClass::MetaMeta)
+  );
+  // A different name is independent (based on version 1, before user.a existed).
+  let other = green.submit(&Build::new().setxattr("f", "user.b", b"z").at(5, 1));
+  assert_eq!(other, Outcome::Accepted { version: 4 });
+  assert_eq!(green.xattr("f", "user.b"), Some(b"z".as_slice()));
+  // A removal.
+  let head = green.head();
+  assert_eq!(
+    green.submit(&Build::new().removexattr("f", "user.a").at(6, head)),
+    Outcome::Accepted { version: 5 }
+  );
+  assert_eq!(green.xattr("f", "user.a"), None);
+}
+
+/// One increment that edits a file, changes its mode, and sets an xattr — several dimensions merge
+/// together (only the ops document can express this).
+#[test]
+fn several_dimensions_on_one_path_in_one_increment() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("f", b"0123456789").at(1, 0));
+  let combined = green.submit(
+    &Build::new()
+      .overwrite("f", 0, b"AB")
+      .setmode("f", 0o640)
+      .setxattr("f", "user.k", b"v")
+      .at(2, 1),
+  );
+  assert_eq!(combined, Outcome::Accepted { version: 2 });
+  assert_eq!(&green.content("f").expect("present")[0..2], b"AB");
+  assert_eq!(green.mode("f"), Some(0o640));
+  assert_eq!(green.xattr("f", "user.k"), Some(b"v".as_slice()));
+}
+
+/// A directory move is the deriver's child ops (a file rename plus mkdir and rmdir); the engine
+/// merges it with no directory-rename special case.
+#[test]
+fn a_directory_move_merges_as_child_ops() {
+  let mut green = Green::new();
+  green.submit(&Build::new().mkdir("dir1").at(1, 0));
+  green.submit(&Build::new().create("dir1/f", b"content").at(2, 1));
+  // mv dir1 dir2 == mkdir dir2, rename dir1/f -> dir2/f, rmdir dir1.
+  let moved = green.submit(
+    &Build::new()
+      .mkdir("dir2")
+      .rename("dir1/f", "dir2/f")
+      .rmdir("dir1")
+      .at(3, 2),
+  );
+  assert_eq!(moved, Outcome::Accepted { version: 3 });
+  assert!(green.is_dir("dir2"));
+  assert!(!green.is_dir("dir1"));
+  assert_eq!(green.content("dir2/f"), Some(b"content".as_slice()));
+  assert_eq!(green.content("dir1/f"), None);
 }
