@@ -21,8 +21,9 @@
 //! primitives of §4.8 — the quorum, the fence, rendezvous placement, the configuration oracle),
 //! [`ledger`] (the fenced ledger register: the register over time, commit at `f + 1`, and takeover
 //! by phase-one adoption), [`mirror`] (asynchronous mirroring of the committed prefix to a second
-//! region in epoch order with an exposed lag), [`replay`] (recovery and the snapshot policy),
-//! [`error`].
+//! region in epoch order with an exposed lag), [`reconfig`] (changing a register's holder set by
+//! joint consensus, preserving ReadSafety and NoLoss), [`replay`] (recovery and the snapshot
+//! policy), [`error`].
 
 pub mod art;
 pub mod catalog;
@@ -31,6 +32,7 @@ pub mod ledger;
 pub mod mirror;
 pub mod op;
 pub mod partition;
+pub mod reconfig;
 pub mod record;
 pub mod register;
 pub mod replay;
@@ -41,5 +43,6 @@ pub use ledger::{Cohort, Commit, Owner, Reach, Record, TakeoverError};
 pub use mirror::Mirror;
 pub use op::Op;
 pub use partition::Partition;
+pub use reconfig::{Phase, Reconfiguration, RetireError};
 pub use register::{Configuration, DurabilityScope, Fence, HostEpoch, HostId, Placement, Quorum};
 pub use replay::{Db, Recovered, SnapshotPolicy};
