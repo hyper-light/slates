@@ -25,6 +25,7 @@
 //! buys, and it never decides a conflict.
 
 pub mod derive;
+pub mod engine;
 pub mod increment;
 pub mod map;
 pub mod ops_doc;
@@ -33,6 +34,7 @@ pub mod splice;
 pub mod verdict;
 
 pub use derive::{ContentOp, compose_content, compose_content_sized};
+pub use engine::{Green, Increment, Outcome, PathChange};
 pub use increment::{Base, DeriveError, VolumeOp, compose_volume};
 pub use map::{Mapped, map_range};
 pub use ops_doc::{Op, OpKind, OpsDoc, PathTable};
