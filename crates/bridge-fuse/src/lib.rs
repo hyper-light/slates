@@ -19,6 +19,8 @@
 
 pub mod abi;
 pub mod bridge;
+#[cfg(target_os = "linux")]
+pub mod channel;
 pub mod error;
 pub mod init;
 pub mod reply;

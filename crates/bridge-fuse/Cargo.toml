@@ -13,6 +13,9 @@ slates-machine = { workspace = true }
 slates-vfs = { workspace = true }
 slates-mem = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 slates-vfs = { workspace = true }
 

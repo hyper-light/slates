@@ -864,8 +864,19 @@ statfs answering. The FUSE bridge's semantic surface is now complete and pure-te
 test-isolation bug was fixed in the same change: `supervised_child` set process-global env vars
 that raced into its own in-process test thread under a concurrent `cargo test --workspace`; it
 is now `#[ignore]`d and the parent spawns it with `--ignored`, so cargo never runs it in
-process. Owed: generation-tracked node-id reuse after `forget` (§4.6 `(no, gen)`), `link` and
-xattrs, and the kernel invalidation notifications — all with the transport.
+process. The `/dev/fuse` transport landed 2026-09-05 (Phase 3 task 1b, Linux): `channel.rs` (Linux-only)
+owns the device descriptor and turns it into the request/reply stream — `FuseChannel::open`
+opens `/dev/fuse` (a character device, structurally allowed as a non-disk-file open), `from_device`
+adopts the fd the anchor hands back on a restart, `read_request`/`write_reply` are the device
+I/O (a disconnect is `ENODEV`, typed), and `serve_blocking` is the fallback loop the design
+names: read a request, `dispatch` it to the bridge, write the reply, until the kernel unmounts.
+No `unsafe` (rustix's I/O-safe wrappers over the owned descriptor). It compiles and cross-lints
+for Linux from this machine; the serve loop runs against a real mount in the CI Linux lane. Owed
+with the rest of the driver: the mount establishment (the new mount API, or `fusermount3`; task
+2), `FUSE_DEV_IOC_CLONE` per shard and the io_uring command path (which drops the request copy
+the blocking loop makes), generation-tracked node-id reuse after `forget` (§4.6 `(no, gen)`),
+`link` and xattrs, the kernel invalidation notifications, `slates exec`, and the conformance and
+workload suites.
 
 ## 9. Blocking order toward first light
 
