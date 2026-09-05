@@ -2,18 +2,20 @@
 //! slot, so a task woken many times between polls appears once and the list never grows past
 //! the arena (§4.3, "intrusive run queue"; no allocation on the wake path).
 //!
-//! Single-threaded by construction: only the owning shard's thread pushes and drains. The
+//! Single-threaded by construction: only the owning shard's thread pushes and drains, so the
+//! lists sit in `RefCell`s and a re-entrant access is refused (counted), never undefined. The
 //! draining swap uses a second pre-sized list so wakes that arrive while ready tasks run (a task
 //! waking another) land in the next batch, which bounds one loop iteration's work.
 
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell};
 
 /// The queue.
 pub struct LocalQueue {
   pending: Box<[Cell<bool>]>,
-  ready: UnsafeCell<Vec<u32>>,
-  draining: UnsafeCell<Vec<u32>>,
+  ready: RefCell<Vec<u32>>,
+  draining: RefCell<Vec<u32>>,
   overflow: Cell<u64>,
+  refused: Cell<u64>,
 }
 
 impl std::fmt::Debug for LocalQueue {
@@ -29,9 +31,10 @@ impl LocalQueue {
   pub fn new(capacity: usize) -> Self {
     Self {
       pending: (0..capacity).map(|_| Cell::new(false)).collect(),
-      ready: UnsafeCell::new(Vec::with_capacity(capacity)),
-      draining: UnsafeCell::new(Vec::with_capacity(capacity)),
+      ready: RefCell::new(Vec::with_capacity(capacity)),
+      draining: RefCell::new(Vec::with_capacity(capacity)),
       overflow: Cell::new(0),
+      refused: Cell::new(0),
     }
   }
 
@@ -48,28 +51,43 @@ impl LocalQueue {
     if flag.replace(true) {
       return;
     }
-    // SAFETY: single-threaded by construction; no reference into `ready` is live across a push
-    // (the drain swaps the vector out before iterating).
-    unsafe { (*self.ready.get()).push(slot) };
+    match self.ready.try_borrow_mut() {
+      Ok(mut ready) => ready.push(slot),
+      Err(_) => {
+        flag.set(false);
+        self.refused.set(self.refused.get() + 1);
+      }
+    }
   }
 
-  /// Takes the ready list for one iteration; the caller iterates the returned slice and calls
+  /// Takes the ready list for one iteration; the caller iterates the returned list and calls
   /// `finish_drain` afterwards so the buffer returns for reuse.
   pub fn take_ready(&self) -> Vec<u32> {
-    // SAFETY: single-threaded; the two vectors are swapped, not borrowed across calls.
-    unsafe {
-      let ready = &mut *self.ready.get();
-      let draining = &mut *self.draining.get();
-      std::mem::swap(ready, draining);
-      std::mem::take(draining)
+    if self.ready.try_borrow().is_ok_and(|r| r.is_empty()) {
+      return Vec::new();
+    }
+    match (self.ready.try_borrow_mut(), self.draining.try_borrow_mut()) {
+      (Ok(mut ready), Ok(mut draining)) => {
+        std::mem::swap(&mut *ready, &mut *draining);
+        std::mem::take(&mut *draining)
+      }
+      _ => {
+        self.refused.set(self.refused.get() + 1);
+        Vec::new()
+      }
     }
   }
 
   /// Returns the list taken by `take_ready`, cleared, so the next drain allocates nothing.
   pub fn finish_drain(&self, mut list: Vec<u32>) {
+    if list.capacity() == 0 {
+      // The empty fast path of `take_ready` handed out no buffer; keep the pre-sized one.
+      return;
+    }
     list.clear();
-    // SAFETY: single-threaded; `draining` is empty (taken) and receives the buffer back.
-    unsafe { *self.draining.get() = list };
+    if let Ok(mut draining) = self.draining.try_borrow_mut() {
+      *draining = list;
+    }
   }
 
   /// Clears a slot's pending flag when its poll begins, so a wake during the poll re-queues it.
@@ -84,19 +102,22 @@ impl LocalQueue {
 
   /// Whether nothing is ready.
   pub fn is_empty(&self) -> bool {
-    // SAFETY: single-threaded read of the length.
-    unsafe { (*self.ready.get()).is_empty() }
+    self.ready.try_borrow().is_ok_and(|r| r.is_empty())
   }
 
   /// Ready entries.
   pub fn len(&self) -> usize {
-    // SAFETY: single-threaded read of the length.
-    unsafe { (*self.ready.get()).len() }
+    self.ready.try_borrow().map_or(0, |r| r.len())
   }
 
   /// Wakes for slots beyond the arena, ignored.
   pub fn overflow(&self) -> u64 {
     self.overflow.get()
+  }
+
+  /// Accesses refused because the list was already borrowed (a bug signal).
+  pub fn refused(&self) -> u64 {
+    self.refused.get()
   }
 }
 
@@ -121,6 +142,7 @@ mod tests {
     q.finish_drain(list);
     q.push(2);
     assert_eq!(q.take_ready(), vec![2]);
+    assert_eq!(q.refused(), 0);
   }
 
   #[test]

@@ -1,31 +1,33 @@
 //! The shard: one thread, one task arena, one run queue, one timing wheel, one driver, and the
 //! loop that ties them (§4.3, "Loop").
 //!
-//! Each iteration: drain the inbound rings (wakes, spawns, cancels, shutdown) and the driver's
-//! completions into the run queue; expire timers; run ready tasks to their next await, at most a
-//! batch of them; then, if nothing is ready, park in the driver until a kick, a completion or the
+//! Each iteration: drain the control channel and the inbound rings (spawns, cancels, shutdown,
+//! wakes) and the driver's completions into the run queue; expire timers; run ready tasks to
+//! their next await, at most a batch of them; then, if nothing is ready, spin for the configured
+//! window while a client is active, and park in the driver until a kick, a completion or the
 //! next deadline. Cancellation is a message that guarantees a terminal completion: the future is
 //! dropped at the next poll boundary, the task's children are cancelled and joined, and whoever
 //! joins it sees `Cancelled`. The watchdog counts polls that exceed the step budget derived from
 //! the measured wake cost (a step longer than a peer's wake starves the shard).
 //!
-//! Aliasing discipline (Miri-clean by construction): the shard's mutable state lives behind one
-//! borrow flag; a task is polled with its future taken out of the slot and no borrow held, so a
-//! waker, a spawn or a join called from inside the poll takes its own short borrow. A nested
-//! borrow is refused with a counter, never an aliased `&mut`.
+//! Ownership: a context is built on its own thread from a [`ShardSeed`] and leaked, so every
+//! reference to it is `&'static` and the thread-local the wakers route through holds a plain
+//! reference; the mutable state sits in a `RefCell`, so a task's poll runs with no borrow held
+//! and a waker, spawn or join from inside the poll takes its own short borrow; a nested borrow
+//! is refused and counted, never undefined. There is no unsafe code in this module.
 
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell};
 use std::pin::Pin;
-use std::ptr::NonNull;
+use std::sync::mpsc::Receiver;
 use std::task::{Context, Poll};
 
 use slates_mem::{Encoded, Handle, Slab, SpscRing};
 
-use crate::driver::{Completion, Driver};
+use crate::control::Control;
+use crate::driver::{Completion, Driver, DriverSeed, Kick};
 use crate::error::RtError;
-use crate::msg::Msg;
 use crate::queue::LocalQueue;
-use crate::registry::{self, MAX_SHARDS};
+use crate::registry::{self, Entry, MAX_SHARDS};
 use crate::runtime::RuntimeConfig;
 use crate::task::{BoxedFuture, NO_LINK, Outcome, SpawnRequest, State, TaskSlot};
 use crate::timer::Wheel;
@@ -78,6 +80,8 @@ pub struct Counters {
   pub wakes_pair: u64,
   /// Wakes that arrived over the foreign ring.
   pub wakes_foreign: u64,
+  /// Control messages received.
+  pub controls: u64,
   /// Wakes whose generation no longer matched.
   pub stale_wakes: u64,
   /// Timers fired.
@@ -102,16 +106,79 @@ pub struct Counters {
   pub spin_deadlines: u64,
 }
 
-/// The mutable state behind the borrow flag.
+/// What a shard is built from: everything is `Send`, so the runtime assembles seeds on its own
+/// thread and each shard thread builds its context from one.
+pub struct ShardSeed {
+  /// The registered id.
+  pub id: u16,
+  /// Builds the driver on the shard's thread.
+  pub driver: DriverSeed,
+  /// The kick the driver answers to.
+  pub kick: Kick,
+  /// The control channel's receiving end.
+  pub control: Receiver<Control>,
+  /// The configuration.
+  pub config: RuntimeConfig,
+  outbound: Vec<Option<&'static SpscRing>>,
+  inbound: Vec<&'static SpscRing>,
+}
+
+impl std::fmt::Debug for ShardSeed {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ShardSeed").field("id", &self.id).finish()
+  }
+}
+
+impl ShardSeed {
+  /// Registers a shard over `driver` in the process registry and returns its seed.
+  pub fn register(
+    config: &RuntimeConfig,
+    driver: DriverSeed,
+    kick: Kick,
+  ) -> Result<ShardSeed, RtError> {
+    let (id, control) = registry::register(config.ring_entries, config.tasks_per_shard, kick)?;
+    Ok(ShardSeed {
+      id,
+      driver,
+      kick,
+      control,
+      config: config.clone(),
+      outbound: vec![None; MAX_SHARDS],
+      inbound: Vec::new(),
+    })
+  }
+
+  /// Connects the single-producer ring this shard sends on to `target`.
+  pub(crate) fn set_outbound(&mut self, target: u16, ring: &'static SpscRing) {
+    if let Some(slot) = self.outbound.get_mut(usize::from(target)) {
+      *slot = Some(ring);
+    }
+  }
+
+  /// Connects the single-producer ring this shard receives on.
+  pub(crate) fn set_inbound(&mut self, ring: &'static SpscRing) {
+    self.inbound.push(ring);
+  }
+}
+
+/// The mutable state behind the borrow.
 pub struct ShardInner {
   arena: Slab<TaskSlot>,
   timers: Wheel,
   driver: Box<dyn Driver>,
+  control: Receiver<Control>,
   config: RuntimeConfig,
   counters: Counters,
   shutting_down: bool,
   fired: Vec<u64>,
   completions: Vec<Completion>,
+}
+
+impl ShardInner {
+  /// Entries per inbound ring.
+  pub fn ring_entries(&self) -> usize {
+    self.config.ring_entries
+  }
 }
 
 /// The shard's context: what its thread, its wakers and its tasks see.
@@ -120,20 +187,16 @@ pub struct ShardContext {
   pub id: u16,
   /// The local run queue.
   pub local: LocalQueue,
-  outbound: Vec<Option<NonNull<SpscRing<u64>>>>,
-  inbound: Vec<NonNull<SpscRing<u64>>>,
+  outbound: Vec<Option<&'static SpscRing>>,
+  inbound: Vec<&'static SpscRing>,
   current_task: Cell<Option<u32>>,
-  borrowed: Cell<bool>,
   exited: Cell<bool>,
   active: Cell<bool>,
   pair_full_events: Cell<u64>,
-  inner: UnsafeCell<ShardInner>,
+  nested_borrows: Cell<u64>,
+  entry: Option<&'static Entry>,
+  inner: RefCell<ShardInner>,
 }
-
-// SAFETY: a context is built on one thread and then used only by the shard's own thread; the
-// runtime moves it there before any use, and the registry hands other threads only the kick and
-// the ring pointers, both designed for that.
-unsafe impl Send for ShardContext {}
 
 impl std::fmt::Debug for ShardContext {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -144,12 +207,12 @@ impl std::fmt::Debug for ShardContext {
 }
 
 impl ShardContext {
-  /// Builds a shard over `driver`, registering it in the process registry.
-  pub fn new(
-    config: &RuntimeConfig,
-    driver: Box<dyn Driver>,
-  ) -> Result<Box<ShardContext>, RtError> {
-    let id = registry::register(config.ring_entries, driver.kick_handle())?;
+  /// Builds the context from its seed on the calling thread (which builds the driver too) and
+  /// leaks it: a shard lives for the process (one runtime in production), and the leak is what
+  /// lets every reference to it be a plain `&'static` with no unsafe code.
+  pub fn build(seed: ShardSeed) -> Result<&'static ShardContext, RtError> {
+    let config = seed.config;
+    let driver = (seed.driver)()?;
     let mut arena = Slab::new(
       config.tasks_per_shard.min(config.segment_tasks()),
       config.tasks_per_shard,
@@ -164,52 +227,40 @@ impl ShardContext {
       config.timers_per_shard,
       driver.now_ns(),
     );
-    Ok(Box::new(ShardContext {
-      id,
+    Ok(Box::leak(Box::new(ShardContext {
+      id: seed.id,
       local: LocalQueue::new(config.tasks_per_shard),
-      outbound: vec![None; MAX_SHARDS],
-      inbound: Vec::new(),
+      outbound: seed.outbound,
+      inbound: seed.inbound,
       current_task: Cell::new(None),
-      borrowed: Cell::new(false),
       exited: Cell::new(false),
       active: Cell::new(false),
       pair_full_events: Cell::new(0),
-      inner: UnsafeCell::new(ShardInner {
+      nested_borrows: Cell::new(0),
+      entry: registry::entry(seed.id),
+      inner: RefCell::new(ShardInner {
         arena,
         timers,
         driver,
-        config: config.clone(),
-        counters: Counters::default(),
-        shutting_down: false,
+        control: seed.control,
         fired: Vec::with_capacity(config.timers_per_shard),
         completions: Vec::with_capacity(config.ring_entries),
+        config,
+        counters: Counters::default(),
+        shutting_down: false,
       }),
-    }))
+    })))
   }
 
-  /// Connects the single-producer ring this shard sends on to `target`.
-  pub(crate) fn set_outbound(&mut self, target: u16, ring: NonNull<SpscRing<u64>>) {
-    if let Some(slot) = self.outbound.get_mut(usize::from(target)) {
-      *slot = Some(ring);
-    }
-  }
-
-  /// Connects the single-producer ring this shard receives on from `source`.
-  pub(crate) fn set_inbound(&mut self, _source: u16, ring: NonNull<SpscRing<u64>>) {
-    self.inbound.push(ring);
-  }
-
-  /// Runs `f` with the mutable state, or refuses a nested borrow.
+  /// Runs `f` with the mutable state, or refuses a nested borrow (counted).
   pub fn with_inner<R>(&self, f: impl FnOnce(&mut ShardInner) -> R) -> Option<R> {
-    if self.borrowed.replace(true) {
-      return None;
+    match self.inner.try_borrow_mut() {
+      Ok(mut inner) => Some(f(&mut inner)),
+      Err(_) => {
+        self.nested_borrows.set(self.nested_borrows.get() + 1);
+        None
+      }
     }
-    // SAFETY: the flag guarantees this is the only live reference; the context is used by one
-    // thread.
-    let inner = unsafe { &mut *self.inner.get() };
-    let r = f(inner);
-    self.borrowed.set(false);
-    Some(r)
   }
 
   /// Whether the shard left its loop.
@@ -229,13 +280,12 @@ impl ShardContext {
 
   /// Whether any inbound ring holds a word (a check without a syscall).
   pub fn has_inbound(&self) -> bool {
-    if registry::entry(self.id).is_some_and(|e| !e.inbound.is_empty()) {
+    if self.entry.is_some_and(|e| {
+      !e.inbound.is_empty() || e.control_pending.load(std::sync::atomic::Ordering::Acquire)
+    }) {
       return true;
     }
-    self.inbound.iter().any(|ring| {
-      // SAFETY: pair rings are leaked for the process; reading emptiness needs no exclusivity.
-      !unsafe { ring.as_ref() }.is_empty()
-    })
+    self.inbound.iter().any(|ring| !ring.is_empty())
   }
 
   /// The task being polled on this shard right now.
@@ -250,9 +300,7 @@ impl ShardContext {
   /// The counters.
   pub fn counters(&self) -> Counters {
     let mut c = self.with_inner(|inner| inner.counters).unwrap_or_default();
-    c.nested_borrows = c
-      .nested_borrows
-      .max(self.with_inner(|i| i.counters.nested_borrows).unwrap_or(0));
+    c.nested_borrows = self.nested_borrows.get();
     c
   }
 
@@ -271,8 +319,6 @@ impl ShardContext {
     let Some(Some(ring)) = self.outbound.get(usize::from(target)) else {
       return false;
     };
-    // SAFETY: pair rings are leaked for the process; this shard is the ring's only producer.
-    let ring = unsafe { ring.as_ref() };
     let (mut producer, _) = ring.split();
     let mut pending = word;
     loop {
@@ -424,8 +470,8 @@ impl ShardContext {
   /// Runs the loop on the calling thread until shutdown completes. When idle and a client is
   /// active, the shard spins for the configured window checking its rings before it parks: a
   /// wake that lands during the spin costs a cache-line transfer instead of a kernel wake.
-  pub fn run(&self) {
-    registry::set_current(Some(NonNull::from(self)));
+  pub fn run(&'static self) {
+    registry::set_current(Some(self));
     loop {
       let outcome = self.step();
       if outcome.exit {
@@ -479,8 +525,8 @@ impl ShardContext {
   /// Steps until no task, timer or message is pending, parking for timers as needed; returns
   /// when the shard is idle or has exited. The driver is polled only when it may hold something
   /// (a zero-timeout poll costs a syscall the idle path must not pay for nothing).
-  pub fn run_until_idle(&self) {
-    registry::set_current(Some(NonNull::from(self)));
+  pub fn run_until_idle(&'static self) {
+    registry::set_current(Some(self));
     loop {
       let outcome = self.step();
       if outcome.exit {
@@ -510,7 +556,7 @@ impl ShardContext {
   }
 
   /// One loop iteration without blocking.
-  pub fn step(&self) -> StepOutcome {
+  pub fn step(&'static self) -> StepOutcome {
     if self.exited.get() {
       return StepOutcome {
         did_work: false,
@@ -518,20 +564,20 @@ impl ShardContext {
         exit: true,
       };
     }
-    registry::set_current(Some(NonNull::from(self)));
+    registry::set_current(Some(self));
     let mut did_work = false;
-    let drained = self.with_inner(|inner| {
-      inner.counters.steps += 1;
-      let mut work = self.drain_inbound(inner);
-      work |= self.expire_timers(inner);
-      work
-    });
-    did_work |= drained.unwrap_or(false);
+    let (drained, batch) = self
+      .with_inner(|inner| {
+        inner.counters.steps += 1;
+        let mut work = self.drain_control(inner);
+        work |= self.drain_inbound(inner);
+        work |= self.expire_timers(inner);
+        (work, inner.config.batch)
+      })
+      .unwrap_or((false, 1));
+    did_work |= drained;
     let ready = self.local.take_ready();
-    let batch = self
-      .with_inner(|inner| inner.config.batch)
-      .unwrap_or(ready.len())
-      .max(1);
+    let batch = batch.max(1);
     for (i, slot) in ready.iter().enumerate() {
       if i < batch {
         did_work = true;
@@ -561,7 +607,7 @@ impl ShardContext {
   }
 
   /// Parks in the driver until a kick, a completion or `deadline_ns`.
-  pub fn park(&self, deadline_ns: Option<u64>) {
+  pub fn park(&'static self, deadline_ns: Option<u64>) {
     let lost = self
       .with_inner(|inner| {
         inner.counters.waits += 1;
@@ -592,7 +638,7 @@ impl ShardContext {
   }
 
   /// Cancels every task with a terminal completion and exits: the driver is gone.
-  fn fail_all(&self) {
+  fn fail_all(&'static self) {
     self.with_inner(|inner| {
       inner.shutting_down = true;
       cancel_all(&mut inner.arena, &self.local);
@@ -608,48 +654,73 @@ impl ShardContext {
     self.exited.set(true);
   }
 
+  fn drain_control(&self, inner: &mut ShardInner) -> bool {
+    let Some(entry) = self.entry else {
+      return false;
+    };
+    if !entry
+      .control_pending
+      .load(std::sync::atomic::Ordering::Acquire)
+    {
+      return false;
+    }
+    // Clear before draining: a send that lands during the drain sets the flag again and is
+    // seen on the next step at the latest.
+    entry
+      .control_pending
+      .store(false, std::sync::atomic::Ordering::Release);
+    let mut any = false;
+    let batch = inner.config.batch.max(1);
+    for _ in 0..batch {
+      let Ok(message) = inner.control.try_recv() else {
+        break;
+      };
+      any = true;
+      inner.counters.controls += 1;
+      self.handle_control(inner, message);
+    }
+    any
+  }
+
   fn drain_inbound(&self, inner: &mut ShardInner) -> bool {
     let mut any = false;
     let batch = inner.config.batch.max(1);
-    if let Some(entry) = registry::entry(self.id) {
+    if let Some(entry) = self.entry {
       let mut consumer = entry.inbound.consumer();
       for _ in 0..batch {
         let Some(word) = consumer.pop() else { break };
         any = true;
         inner.counters.wakes_foreign += 1;
-        // SAFETY: every word in an inbound ring came from `Msg::into_word` and is unpacked once.
-        self.handle_msg(inner, unsafe { Msg::from_word(word) });
+        self.handle_wake(inner, Encoded::from_word(word));
       }
     }
     for ring in &self.inbound {
-      // SAFETY: pair rings are leaked for the process; this shard is the ring's only consumer.
-      let ring = unsafe { ring.as_ref() };
       let (_, mut consumer) = ring.split();
       for _ in 0..batch {
         let Some(word) = consumer.pop() else { break };
         any = true;
         inner.counters.wakes_pair += 1;
-        // SAFETY: as above.
-        self.handle_msg(inner, unsafe { Msg::from_word(word) });
+        self.handle_wake(inner, Encoded::from_word(word));
       }
     }
     any
   }
 
-  fn handle_msg(&self, inner: &mut ShardInner, msg: Msg) {
-    match msg {
-      Msg::Wake(word) => {
-        if inner
-          .arena
-          .generation_at(word.slot())
-          .is_some_and(|g| g & GENERATION_MASK == word.generation())
-        {
-          self.local.push(word.slot());
-        } else {
-          inner.counters.stale_wakes += 1;
-        }
-      }
-      Msg::Spawn(request) => {
+  fn handle_wake(&self, inner: &mut ShardInner, word: Encoded) {
+    if inner
+      .arena
+      .generation_at(word.slot())
+      .is_some_and(|g| g & GENERATION_MASK == word.generation())
+    {
+      self.local.push(word.slot());
+    } else {
+      inner.counters.stale_wakes += 1;
+    }
+  }
+
+  fn handle_control(&self, inner: &mut ShardInner, message: Control) {
+    match message {
+      Control::Spawn(request) => {
         let SpawnRequest { future, parent } = *request;
         let parent = parent.filter(|p| p.shard() == self.id).map(|p| p.slot());
         match inner.arena.insert(TaskSlot::new(future, parent, false)) {
@@ -666,7 +737,7 @@ impl ShardContext {
           Err(_) => inner.counters.admission_refused += 1,
         }
       }
-      Msg::Cancel(word) => {
+      Control::Cancel(word) => {
         if let Ok(task) = inner
           .arena
           .get_mut(Handle::from_raw(word.slot(), word.generation()))
@@ -675,11 +746,11 @@ impl ShardContext {
           self.local.push(word.slot());
         }
       }
-      Msg::Shutdown => {
+      Control::Shutdown => {
         inner.shutting_down = true;
         cancel_all(&mut inner.arena, &self.local);
       }
-      Msg::Active(active) => self.active.set(active),
+      Control::Active(active) => self.active.set(active),
     }
   }
 
@@ -720,13 +791,6 @@ impl ShardContext {
     let dropped =
       self.with_inner(|inner| after_poll(inner, &self.local, slot, future, elapsed, done));
     drop(dropped);
-  }
-}
-
-impl ShardInner {
-  /// Entries per inbound ring.
-  pub fn ring_entries(&self) -> usize {
-    self.config.ring_entries
   }
 }
 
@@ -849,8 +913,8 @@ fn finish(inner: &mut ShardInner, local: &LocalQueue, slot: u32, outcome: Outcom
   }
 }
 
-/// Marks a task terminal, wakes its joiner, unlinks it from its parent, reaps it if detached, and
-/// completes the parent if it was waiting on this child.
+/// Marks a task terminal, wakes its joiner, unlinks it from its parent when detached, reaps it if
+/// detached, and completes the parent if it was waiting on this child.
 fn complete(inner: &mut ShardInner, slot: u32) {
   let mut current = Some(slot);
   while let Some(slot) = current {

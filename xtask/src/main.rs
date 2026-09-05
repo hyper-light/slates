@@ -11,7 +11,9 @@
 //!   lines after a doc line marked `Derived:`, `Measured:`, `Format:` or `Shape:`; the values 0, 1
 //!   and 2; bit widths in shifts and type contexts; attributes; array indices. Everything else
 //!   fails with its file and line.
-//! - `cargo xtask check` — both.
+//! - `cargo xtask unsafe [--tighten]` — the unsafe budget per crate (`unsafe-budget.toml`),
+//!   which only tightens.
+//! - `cargo xtask check` — structural, literals and the unsafe budget.
 //! - `cargo xtask ratchet [--record] [--tighten] [--reset] [--runs N]` — the performance
 //!   ratchet over the bench examples, keyed by machine identity (see `ratchet.rs`).
 //!
@@ -24,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 mod ratchet;
+mod unsafe_budget;
 
 /// A task failure with a plain-English message; printed and turned into a non-zero exit code.
 #[derive(Debug)]
@@ -53,7 +56,11 @@ fn main() -> ExitCode {
   let outcome = match task {
     "structural" => structural::run(),
     "literals" => literals::run(),
-    "check" => structural::run().and_then(|()| literals::run()),
+    "unsafe" => workspace_root()
+      .and_then(|root| unsafe_budget::run(&root, args.iter().any(|a| a == "--tighten"))),
+    "check" => structural::run()
+      .and_then(|()| literals::run())
+      .and_then(|()| workspace_root().and_then(|root| unsafe_budget::run(&root, false))),
     "ratchet" => workspace_root().and_then(|root| {
       let runs = args
         .iter()
@@ -69,7 +76,7 @@ fn main() -> ExitCode {
       ratchet::run(&root, flags)
     }),
     other => Err(Failure(format!(
-      "unknown task `{other}`; tasks: structural, literals, check, ratchet"
+      "unknown task `{other}`; tasks: structural, literals, unsafe, check, ratchet"
     ))),
   };
   match outcome {

@@ -583,66 +583,45 @@ mod platform {
   use super::{LockCapacity, Pinning, Touch};
   use crate::bench::Measurement;
   use crate::facts::{Facts, PageFacts};
-  use std::ffi::c_void;
+  use memmap2::MmapMut;
   use std::time::Duration;
 
   pub(super) fn null_syscall() {
-    // SAFETY: getppid has no preconditions and cannot fail.
-    std::hint::black_box(unsafe { libc::getppid() });
+    std::hint::black_box(rustix::process::getppid());
   }
 
-  fn map(len: usize, extra_flags: libc::c_int) -> Option<*mut u8> {
-    // SAFETY: an anonymous private mapping with no address hint; the result is checked.
-    let p = unsafe {
-      libc::mmap(
-        std::ptr::null_mut(),
-        len,
-        libc::PROT_READ | libc::PROT_WRITE,
-        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | extra_flags,
-        -1,
-        0,
-      )
-    };
-    if p == libc::MAP_FAILED {
-      None
-    } else {
-      Some(p.cast::<u8>())
-    }
-  }
-
-  fn unmap(p: *mut u8, len: usize) {
-    // SAFETY: `p` came from `map` with the same `len`.
-    unsafe { libc::munmap(p.cast::<c_void>(), len) };
-  }
-
-  fn touch_every(p: *mut u8, len: usize, page: usize) {
+  fn touch_every(map: &mut MmapMut, page: usize) {
+    let len = map.len();
     let mut at = 0;
     while at < len {
-      // SAFETY: `at < len` and the mapping is writable.
-      unsafe { p.add(at).write_volatile(1) };
+      map[at] = 1;
       at += page.max(1);
     }
+    std::hint::black_box(&map[..]);
   }
 
   pub(super) fn map_touch_unmap(region: u64, page: u64, touch: Touch) {
     let len = usize::try_from(region).unwrap_or(0);
-    let Some(p) = map(len, 0) else { return };
+    let Ok(mut map) = MmapMut::map_anon(len) else {
+      return;
+    };
     if touch == Touch::Every {
-      touch_every(p, len, usize::try_from(page).unwrap_or(1));
+      touch_every(&mut map, usize::try_from(page).unwrap_or(1));
     }
-    unmap(p, len);
+    drop(map);
   }
 
   #[cfg(target_os = "linux")]
   pub(super) fn populated(region: u64, page: u64, budget: Duration) -> Option<Measurement> {
+    use memmap2::MmapOptions;
     let len = usize::try_from(region).unwrap_or(0);
     let page = usize::try_from(page).unwrap_or(1);
-    map(len, libc::MAP_POPULATE).map(|p| unmap(p, len))?;
+    MmapOptions::new().len(len).populate().map_anon().ok()?;
     Some(crate::bench::measure(
       || {
-        if let Some(p) = map(len, libc::MAP_POPULATE) {
-          touch_every(p, len, page);
-          unmap(p, len);
+        if let Ok(mut map) = MmapOptions::new().len(len).populate().map_anon() {
+          touch_every(&mut map, page);
+          drop(map);
         }
       },
       budget,
@@ -670,19 +649,17 @@ mod platform {
     Some((
       crate::bench::measure(
         || {
-          if let Some(p) = map(len, 0) {
-            let aligned = (p as usize).next_multiple_of(huge_usize);
+          if let Ok(mut map) = MmapMut::map_anon(len) {
+            let _ = map.advise(memmap2::Advice::HugePage);
+            let start = map.as_ptr().addr().next_multiple_of(huge_usize) - map.as_ptr().addr();
             let span = huge_usize * 2;
-            // SAFETY: `aligned + span <= p + len` because the mapping is one huge page longer.
-            unsafe {
-              libc::madvise(
-                (aligned as *mut u8).cast::<c_void>(),
-                span,
-                libc::MADV_HUGEPAGE,
-              );
+            let mut at = start;
+            while at < start + span {
+              map[at] = 1;
+              at += base;
             }
-            touch_every(aligned as *mut u8, span, base);
-            unmap(p, len);
+            std::hint::black_box(&map[..]);
+            drop(map);
           }
         },
         budget,
@@ -698,23 +675,16 @@ mod platform {
 
   #[cfg(target_os = "linux")]
   pub(super) fn pin_current(core: u32) -> Pinning {
-    // SAFETY: an all-zero libc::cpu_set_t is a valid, if empty, value for the call below to fill.
-    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    let index = usize::try_from(core).unwrap_or(0);
-    // SAFETY: CPU_SET on a zeroed set with an index below the set's capacity.
-    unsafe {
-      if index >= usize::try_from(libc::CPU_SETSIZE).unwrap_or(0) {
-        return Pinning::Refused;
-      }
-      libc::CPU_SET(index, &mut set);
+    use rustix::thread::{CpuSet, sched_setaffinity};
+    let index = usize::try_from(core).unwrap_or(usize::MAX);
+    if index >= CpuSet::MAX_CPU {
+      return Pinning::Refused;
     }
-    // SAFETY: a valid cpu_set_t of the stated size for the calling thread.
-    let rc =
-      unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &raw const set) };
-    if rc == 0 {
-      Pinning::Pinned
-    } else {
-      Pinning::Refused
+    let mut set = CpuSet::new();
+    set.set(index);
+    match sched_setaffinity(None, &set) {
+      Ok(()) => Pinning::Pinned,
+      Err(_) => Pinning::Refused,
     }
   }
 
@@ -756,18 +726,10 @@ mod platform {
   }
 
   pub(super) fn lock_capacity(facts: &Facts) -> LockCapacity {
-    let mut limit = libc::rlimit {
-      rlim_cur: 0,
-      rlim_max: 0,
-    };
-    // SAFETY: `limit` is a writable rlimit.
-    let rc = unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &raw mut limit) };
-    let (bytes, source) = if rc != 0 {
-      (0, "getrlimit(RLIMIT_MEMLOCK) refused".to_owned())
-    } else if limit.rlim_cur == libc::RLIM_INFINITY {
-      platform_wire_limit(facts)
-    } else {
-      (limit.rlim_cur, "RLIMIT_MEMLOCK soft limit".to_owned())
+    let limit = rustix::process::getrlimit(rustix::process::Resource::Memlock);
+    let (bytes, source) = match limit.current {
+      None => platform_wire_limit(facts),
+      Some(current) => (current, "RLIMIT_MEMLOCK soft limit".to_owned()),
     };
     let confirmed = confirm_lock(facts.page.base);
     LockCapacity {
@@ -779,28 +741,15 @@ mod platform {
 
   #[cfg(target_os = "macos")]
   fn platform_wire_limit(facts: &Facts) -> (u64, String) {
-    let mut value: u64 = 0;
-    let mut len = std::mem::size_of::<u64>();
-    // SAFETY: a NUL-terminated name and a writable u64 of the stated length.
-    let rc = unsafe {
-      libc::sysctlbyname(
-        c"vm.user_wire_limit".as_ptr(),
-        (&raw mut value).cast::<c_void>(),
-        &raw mut len,
-        std::ptr::null_mut(),
-        0,
-      )
-    };
-    if rc == 0 && value > 0 {
-      (
+    match crate::facts::sysctl_u64(c"vm.user_wire_limit") {
+      Some(value) if value > 0 => (
         value.min(facts.memory.total),
         "vm.user_wire_limit".to_owned(),
-      )
-    } else {
-      (
+      ),
+      _ => (
         facts.memory.available,
         "RLIMIT_MEMLOCK unlimited; recorded available memory".to_owned(),
-      )
+      ),
     }
   }
 
@@ -814,14 +763,13 @@ mod platform {
 
   fn confirm_lock(page: u64) -> bool {
     let len = usize::try_from(page).unwrap_or(0);
-    let Some(p) = map(len, 0) else { return false };
-    // SAFETY: `p` is a mapping of `len` bytes.
-    let ok = unsafe { libc::mlock(p.cast::<c_void>(), len) } == 0;
+    let Ok(map) = MmapMut::map_anon(len) else {
+      return false;
+    };
+    let ok = map.lock().is_ok();
     if ok {
-      // SAFETY: the same mapping, locked above.
-      unsafe { libc::munlock(p.cast::<c_void>(), len) };
+      let _ = map.unlock();
     }
-    unmap(p, len);
     ok
   }
 }

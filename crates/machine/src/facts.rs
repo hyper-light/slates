@@ -129,6 +129,10 @@ pub struct Facts {
   pub notes: Vec<String>,
 }
 
+/// The macOS `sysctlbyname` reader, shared with the probes.
+#[cfg(target_os = "macos")]
+pub(crate) use platform::sysctl_u64;
+
 impl Facts {
   /// Queries every fact from the OS.
   pub fn query() -> Facts {
@@ -209,7 +213,7 @@ mod platform {
   };
   use std::ffi::{CStr, c_void};
 
-  fn sysctl_u64(name: &CStr) -> Option<u64> {
+  pub(crate) fn sysctl_u64(name: &CStr) -> Option<u64> {
     let mut value: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
     // SAFETY: `name` is NUL-terminated; `value` is a writable u64 and `len` its size; sysctl
@@ -524,12 +528,8 @@ mod platform {
     names
   }
 
-  pub(super) fn page(notes: &mut Vec<String>) -> PageFacts {
-    // SAFETY: sysconf has no preconditions.
-    let base = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or_else(|_| {
-      notes.push("sysconf(_SC_PAGESIZE) refused; recorded 0".to_owned());
-      0
-    });
+  pub(super) fn page(_notes: &mut Vec<String>) -> PageFacts {
+    let base = u64::try_from(rustix::param::page_size()).unwrap_or(0);
     let mut huge: Vec<u64> = list("/sys/kernel/mm/hugepages")
       .iter()
       .filter_map(|name| name.strip_prefix("hugepages-").and_then(parse_size))
@@ -546,12 +546,6 @@ mod platform {
   }
 
   pub(super) fn cache_line(notes: &mut Vec<String>) -> u64 {
-    // SAFETY: sysconf has no preconditions; musl answers 0, which the fallback chain handles.
-    let from_sysconf =
-      u64::try_from(unsafe { libc::sysconf(libc::_SC_LEVEL1_DCACHE_LINESIZE) }).unwrap_or(0);
-    if from_sysconf > 0 {
-      return from_sysconf;
-    }
     read("/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size")
       .and_then(|s| s.parse::<u64>().ok())
       .filter(|v| *v > 0)
@@ -654,23 +648,15 @@ mod platform {
     0
   }
 
-  pub(super) fn memory(notes: &mut Vec<String>) -> MemoryFacts {
-    // SAFETY: an all-zero libc::sysinfo is a valid, if empty, value for the call below to fill.
-    let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
-    // SAFETY: `info` is a writable sysinfo struct.
-    let rc = unsafe { libc::sysinfo(&raw mut info) };
+  pub(super) fn memory(_notes: &mut Vec<String>) -> MemoryFacts {
+    let info = rustix::system::sysinfo();
     let unit = u64::from(info.mem_unit).max(1);
     // c_ulong is u32 on i686 and u64 elsewhere; the conversion is for the former.
     #[allow(clippy::useless_conversion)]
-    let (total, free) = if rc == 0 {
-      (
-        u64::from(info.totalram).saturating_mul(unit),
-        u64::from(info.freeram).saturating_mul(unit),
-      )
-    } else {
-      notes.push("sysinfo refused; recorded 0".to_owned());
-      (0, 0)
-    };
+    let (total, free) = (
+      u64::from(info.totalram).saturating_mul(unit),
+      u64::from(info.freeram).saturating_mul(unit),
+    );
     let available = read("/proc/meminfo")
       .and_then(|text| {
         text
@@ -735,20 +721,12 @@ mod platform {
         notes.push("/proc/cpuinfo has no model line; recorded unknown cpu".to_owned());
         "unknown cpu".to_owned()
       });
-    // SAFETY: an all-zero libc::utsname is a valid, if empty, value for the call below to fill.
-    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
-    // SAFETY: `uts` is a writable utsname.
-    let os = if unsafe { libc::uname(&raw mut uts) } == 0 {
-      let field = |f: &[libc::c_char]| {
-        // SAFETY: uname NUL-terminates each field within its array.
-        unsafe { std::ffi::CStr::from_ptr(f.as_ptr()) }
-          .to_string_lossy()
-          .into_owned()
-      };
-      format!("{} {}", field(&uts.sysname), field(&uts.release))
-    } else {
-      "linux (uname refused)".to_owned()
-    };
+    let uts = rustix::system::uname();
+    let os = format!(
+      "{} {}",
+      uts.sysname().to_string_lossy(),
+      uts.release().to_string_lossy()
+    );
     (cpu, os)
   }
 }

@@ -41,6 +41,16 @@ pub enum RtError {
     /// Which value.
     what: &'static str,
   },
+  /// A shard's control channel is full: its admission limit of spawns is pending.
+  ControlFull {
+    /// The shard.
+    shard: u16,
+  },
+  /// The shard named no longer runs (or never existed).
+  ShardGone {
+    /// The shard.
+    shard: u16,
+  },
   /// A memory refusal beneath the runtime.
   Mem(MemError),
 }
@@ -57,6 +67,8 @@ impl fmt::Display for RtError {
       Self::DriverLost => f.write_str("the driver was lost while waiting"),
       Self::NotOnShardThread => f.write_str("not on a shard thread"),
       Self::BadConfig { what } => write!(f, "bad configuration: {what}"),
+      Self::ControlFull { shard } => write!(f, "shard {shard}'s control channel is full"),
+      Self::ShardGone { shard } => write!(f, "shard {shard} is gone"),
       Self::Mem(e) => write!(f, "memory: {e}"),
     }
   }

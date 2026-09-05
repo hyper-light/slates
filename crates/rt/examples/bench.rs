@@ -13,8 +13,23 @@ use slates_rt::futures::{sleep, yield_now};
 use slates_rt::runtime::{LocalRuntime, Runtime, RuntimeConfig};
 
 fn report(name: &str, m: Measurement) {
+  report_line("ratchet", name, m);
+}
+
+/// A row whose cost depends on which cores the OS placed two threads on: gated where the OS
+/// pins threads (Linux, Windows), informational where it only hints or refuses (macOS), because a
+/// cross-cluster placement is not a regression of the code.
+fn report_placed(name: &str, m: Measurement) {
+  let pinned = matches!(
+    slates_machine::probes::pin_current_thread(0),
+    slates_machine::probes::Pinning::Pinned
+  );
+  report_line(if pinned { "ratchet" } else { "ratchet-info" }, name, m);
+}
+
+fn report_line(tag: &str, name: &str, m: Measurement) {
   println!(
-    "ratchet\t{}\t{}\t{}\t{}",
+    "{tag}	{}	{}	{}	{}",
     key(name),
     m.interval.lower,
     m.median_ns(),
@@ -155,12 +170,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let two = Runtime::start(&config(2))?;
   let target = two.shard_ids()[1];
   let (tx, rx) = channel::<u64>();
-  report(
+  report_placed(
     "foreign spawn onto a shard thread and a reply over a channel (ring, kick, poll, send)",
     measure(
       || {
         let tx = tx.clone();
-        two.spawn_on(target, async move {
+        let _ = two.spawn_on(target, async move {
           let _ = tx.send(PINGS.fetch_add(1, Ordering::Relaxed));
         });
         let _ = rx.recv();
@@ -182,14 +197,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   spinning.spin_ns = profile.derived().spin_before_park_ns.get();
   let two = Runtime::start(&spinning)?;
   let target = two.shard_ids()[1];
-  two.set_active(target, true);
+  let _ = two.set_active(target, true);
   let (tx, rx) = channel::<u64>();
-  report(
+  report_placed(
     "foreign spawn and reply with the shard spinning before it parks",
     measure(
       || {
         let tx = tx.clone();
-        two.spawn_on(target, async move {
+        let _ = two.spawn_on(target, async move {
           let _ = tx.send(PINGS.fetch_add(1, Ordering::Relaxed));
         });
         let _ = rx.recv();
@@ -223,7 +238,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       batch: 1,
       quick: false,
     };
-    report(
+    report_placed(
       &format!("cross-shard wake round trip with both shards {label}"),
       m,
     );
@@ -274,11 +289,11 @@ fn ping_pong(cfg: &RuntimeConfig, active: bool) -> (Sample, u64, u64) {
   };
   let ids = rt.shard_ids().to_vec();
   if active {
-    rt.set_active(ids[0], true);
-    rt.set_active(ids[1], true);
+    let _ = rt.set_active(ids[0], true);
+    let _ = rt.set_active(ids[1], true);
   }
   let (tx, rx) = channel::<Vec<u64>>();
-  rt.spawn_on(ids[1], async move {
+  let _ = rt.spawn_on(ids[1], async move {
     // Side 1 echoes: wait for its turn, hand the turn back, and wake side 0.
     loop {
       AwaitTurn { side: 1 }.await;
@@ -289,7 +304,7 @@ fn ping_pong(cfg: &RuntimeConfig, active: bool) -> (Sample, u64, u64) {
       wake_side(0);
     }
   });
-  rt.spawn_on(ids[0], async move {
+  let _ = rt.spawn_on(ids[0], async move {
     // Side 0 drives: register, wait until side 1 registered, then time each round trip.
     AwaitTurn { side: 0 }.await;
     while REGISTERED.load(Ordering::Acquire) & 2 == 0 {

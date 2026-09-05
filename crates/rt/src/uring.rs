@@ -3,14 +3,13 @@
 //! [B: io_uring_setup(2); D-9]. Kicks are an eventfd watched by a multishot poll on the ring, so
 //! any thread's write becomes a completion the waiting `io_uring_enter` returns for.
 
-use std::ffi::c_void;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Instant;
 
 use io_uring::types::{Fd, SubmitArgs, Timespec};
 use io_uring::{IoUring, opcode};
 
-use crate::driver::{Completion, Driver, DriverKind, Kick, nanos_since};
+use crate::driver::{Completion, Driver, DriverKind, Kick, nanos_since, refused};
 use crate::error::RtError;
 
 /// Format: the user word of the kick poll.
@@ -19,7 +18,7 @@ const KICK_TAG: u64 = u64::MAX;
 /// The driver.
 pub struct UringDriver {
   ring: IoUring,
-  efd: RawFd,
+  efd: &'static OwnedFd,
   epoch: Instant,
   notes: Vec<String>,
   multishot: bool,
@@ -28,54 +27,75 @@ pub struct UringDriver {
 impl std::fmt::Debug for UringDriver {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("UringDriver")
-      .field("efd", &self.efd)
+      .field("efd", &self.efd.as_raw_fd())
       .field("notes", &self.notes)
       .field("multishot", &self.multishot)
       .finish()
   }
 }
 
-impl UringDriver {
-  /// Sets up a ring of `entries`, probing the low-jitter flags first.
-  pub fn new(entries: u32) -> Result<UringDriver, RtError> {
-    let entries = entries.max(1).next_power_of_two();
-    let mut notes = Vec::new();
-    let ring = match IoUring::builder()
-      .setup_single_issuer()
-      .setup_defer_taskrun()
-      .build(entries)
-    {
-      Ok(ring) => {
-        notes.push("io_uring = SINGLE_ISSUER | DEFER_TASKRUN".to_owned());
-        ring
-      }
-      Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
-        notes
-          .push("io_uring = plain (the kernel refused SINGLE_ISSUER | DEFER_TASKRUN)".to_owned());
-        IoUring::builder()
-          .build(entries)
-          .map_err(|e| RtError::DriverRefused {
-            call: "io_uring_setup",
-            code: e.raw_os_error(),
-          })?
-      }
-      Err(e) => {
-        return Err(RtError::DriverRefused {
-          call: "io_uring_setup",
-          code: e.raw_os_error(),
-        });
-      }
-    };
-    // SAFETY: no preconditions; the result is checked.
-    let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if efd < 0 {
-      return Err(RtError::os("eventfd"));
+/// Creates the kick eventfd, leaked for the process (see the epoll driver for why).
+pub fn prepare_eventfd() -> Result<&'static OwnedFd, RtError> {
+  Ok(Box::leak(Box::new(
+    rustix::event::eventfd(
+      0,
+      rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+    )
+    .map_err(|e| refused("eventfd", e))?,
+  )))
+}
+
+/// Probes whether io_uring is available, recording which flags the kernel accepts; a refusal
+/// (seccomp, an old kernel) selects epoll.
+pub fn probe(entries: u32, notes: &mut Vec<String>) -> bool {
+  match build_ring(entries) {
+    Ok((_, flags)) => {
+      notes.push(format!("io_uring = {flags}"));
+      true
     }
+    Err(e) => {
+      notes.push(format!("io_uring = unavailable({e}); using epoll"));
+      false
+    }
+  }
+}
+
+fn build_ring(entries: u32) -> Result<(IoUring, &'static str), RtError> {
+  let entries = entries.max(1).next_power_of_two();
+  match IoUring::builder()
+    .setup_single_issuer()
+    .setup_defer_taskrun()
+    .build(entries)
+  {
+    Ok(ring) => Ok((ring, "SINGLE_ISSUER | DEFER_TASKRUN")),
+    Err(e) if e.raw_os_error() == Some(libc::EINVAL) => IoUring::builder()
+      .build(entries)
+      .map(|ring| {
+        (
+          ring,
+          "plain (the kernel refused SINGLE_ISSUER | DEFER_TASKRUN)",
+        )
+      })
+      .map_err(|e| RtError::DriverRefused {
+        call: "io_uring_setup",
+        code: e.raw_os_error(),
+      }),
+    Err(e) => Err(RtError::DriverRefused {
+      call: "io_uring_setup",
+      code: e.raw_os_error(),
+    }),
+  }
+}
+
+impl UringDriver {
+  /// Builds the driver over a prepared eventfd, on the shard's thread.
+  pub fn with_eventfd(efd: &'static OwnedFd, entries: u32) -> Result<UringDriver, RtError> {
+    let (ring, flags) = build_ring(entries)?;
     let mut driver = UringDriver {
       ring,
       efd,
       epoch: Instant::now(),
-      notes,
+      notes: vec![format!("io_uring = {flags}")],
       multishot: true,
     };
     driver.arm_kick()?;
@@ -88,10 +108,13 @@ impl UringDriver {
   }
 
   fn arm_kick(&mut self) -> Result<(), RtError> {
-    let poll = opcode::PollAdd::new(Fd(self.efd), u32::try_from(libc::POLLIN).unwrap_or(0))
-      .multi(self.multishot)
-      .build()
-      .user_data(KICK_TAG);
+    let poll = opcode::PollAdd::new(
+      Fd(self.efd.as_raw_fd()),
+      u32::try_from(libc::POLLIN).unwrap_or(0),
+    )
+    .multi(self.multishot)
+    .build()
+    .user_data(KICK_TAG);
     // SAFETY: the eventfd outlives the ring (it is leaked, see Drop) and the entry is valid.
     unsafe { self.ring.submission().push(&poll) }.map_err(|_| RtError::DriverRefused {
       call: "sq push(poll)",
@@ -105,21 +128,8 @@ impl UringDriver {
   }
 
   fn drain_kick(&self) {
-    let mut word: u64 = 0;
-    // SAFETY: an open non-blocking eventfd and an eight-byte buffer.
-    unsafe {
-      libc::read(
-        self.efd,
-        (&raw mut word).cast::<c_void>(),
-        std::mem::size_of::<u64>(),
-      )
-    };
-  }
-}
-
-impl Drop for UringDriver {
-  fn drop(&mut self) {
-    // The eventfd is leaked on purpose (see the epoll driver); the ring closes with the struct.
+    let mut word = [0u8; size_of::<u64>()];
+    let _ = rustix::io::read(self.efd, &mut word);
   }
 }
 

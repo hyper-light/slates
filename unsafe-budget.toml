@@ -1,0 +1,24 @@
+# The unsafe budget (Phase 0, 2026-09-05; Ada: "we SHOULD find a way to minimize unsafe blocks").
+#
+# `cargo xtask unsafe` counts `unsafe` blocks, functions and impls in each shipped crate's sources
+# (comments and tests excluded) and fails when a crate exceeds its budget; `--tighten` lowers a
+# budget to the current count. A budget only goes down. Raising one is an edit here that names the
+# new site and its reason. What each crate still holds, as of the counts below:
+#
+# slates-machine (43): Apple sysctl, mach host statistics and IOKit power queries, for which no
+#   safe wrapper exists (7 sites, one helper each); the macOS thread-affinity hint (1); the
+#   file-backed map of the profile segment (1); the Win32 facts, probes and section (the rest,
+#   compiled only for Windows).
+# slates-mem (4): the Windows working-set raise and VirtualLock/VirtualUnlock (memmap2 covers Unix).
+# slates-rt (16): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
+#   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
+#   the IOCP calls are Win32 (6).
+# slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
+# slates-wire-derive (0).
+
+[budget]
+slates-machine = 43
+slates-mem = 4
+slates-rt = 16
+slates-wire = 4
+slates-wire-derive = 0

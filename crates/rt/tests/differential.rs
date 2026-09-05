@@ -108,6 +108,7 @@ fn run_on_sim() -> Vec<String> {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // the OS half opens a kqueue or an eventfd, which Miri does not model
 fn the_program_produces_the_same_trace_on_the_os_driver_and_the_simulation() {
   let os = run_on_os();
   let sim = run_on_sim();
@@ -180,6 +181,7 @@ fn a_parent_finishing_cancels_and_joins_its_children() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)] // uses the OS driver
 fn admission_is_refused_at_the_arena_bound_never_silently() {
   let mut cfg = config();
   cfg.tasks_per_shard = 2;

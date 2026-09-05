@@ -1,12 +1,14 @@
 //! The epoll driver (Linux fallback when io_uring is refused, as in containers whose seccomp
 //! profile blocks it): an eventfd for kicks registered on an epoll instance, `epoll_wait` with a
-//! timeout for the wait [B: epoll(7); B: eventfd(2)].
+//! timeout for the wait [B: epoll(7); B: eventfd(2)], through rustix's safe wrappers, so this
+//! module holds no unsafe code.
 
-use std::ffi::c_void;
-use std::os::fd::RawFd;
+use std::os::fd::OwnedFd;
 use std::time::Instant;
 
-use crate::driver::{Completion, Driver, DriverKind, Kick, nanos_since};
+use rustix::event::epoll::{self, CreateFlags, EventData, EventFlags};
+
+use crate::driver::{Completion, Driver, DriverKind, Kick, nanos_since, refused};
 use crate::error::RtError;
 
 /// Format: the user word that marks the kick eventfd in epoll events.
@@ -16,75 +18,42 @@ const KICK_TAG: u64 = u64::MAX;
 const EVENTS_PER_WAIT: usize = 64;
 
 /// The driver.
-#[derive(Debug)]
 pub struct EpollDriver {
-  epfd: RawFd,
-  efd: RawFd,
+  epfd: OwnedFd,
+  efd: &'static OwnedFd,
   epoch: Instant,
-  events: Vec<libc::epoll_event>,
+  events: Vec<epoll::Event>,
   nops: Vec<u64>,
 }
 
+impl std::fmt::Debug for EpollDriver {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("EpollDriver")
+      .field("events_capacity", &self.events.capacity())
+      .finish()
+  }
+}
+
 impl EpollDriver {
-  /// Creates the instance and the kick eventfd.
-  pub fn new() -> Result<EpollDriver, RtError> {
-    // SAFETY: no preconditions; results are checked.
-    let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
-    if epfd < 0 {
-      return Err(RtError::os("epoll_create1"));
-    }
-    // SAFETY: as above.
-    let efd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    if efd < 0 {
-      let err = RtError::os("eventfd");
-      // SAFETY: ours to close.
-      unsafe { libc::close(epfd) };
-      return Err(err);
-    }
-    let mut ev = libc::epoll_event {
-      events: u32::try_from(libc::EPOLLIN).unwrap_or(0),
-      u64: KICK_TAG,
-    };
-    // SAFETY: registering an open descriptor on an open instance with a valid event record.
-    if unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, efd, &raw mut ev) } < 0 {
-      let err = RtError::os("epoll_ctl(ADD eventfd)");
-      // SAFETY: ours to close.
-      unsafe {
-        libc::close(efd);
-        libc::close(epfd);
-      }
-      return Err(err);
-    }
+  /// Creates the instance over a prepared kick eventfd (leaked for the process so the registry's
+  /// kick handle can name it after the driver is gone; a write into a reused descriptor number
+  /// would otherwise be a fault in someone else's file).
+  pub fn with_eventfd(efd: &'static OwnedFd) -> Result<EpollDriver, RtError> {
+    let epfd = epoll::create(CreateFlags::CLOEXEC).map_err(|e| refused("epoll_create1", e))?;
+    epoll::add(&epfd, efd, EventData::new_u64(KICK_TAG), EventFlags::IN)
+      .map_err(|e| refused("epoll_ctl(ADD eventfd)", e))?;
     Ok(EpollDriver {
       epfd,
       efd,
       epoch: Instant::now(),
-      events: (0..EVENTS_PER_WAIT)
-        .map(|_| libc::epoll_event { events: 0, u64: 0 })
-        .collect(),
+      events: Vec::with_capacity(EVENTS_PER_WAIT),
       nops: Vec::new(),
     })
   }
 
   fn drain_kick(&self) {
-    let mut word: u64 = 0;
-    // SAFETY: an open non-blocking eventfd and an eight-byte buffer; EAGAIN is fine.
-    unsafe {
-      libc::read(
-        self.efd,
-        (&raw mut word).cast::<c_void>(),
-        std::mem::size_of::<u64>(),
-      )
-    };
-  }
-}
-
-impl Drop for EpollDriver {
-  fn drop(&mut self) {
-    // The eventfd is leaked on purpose: the registry's kick handle may still name it, and a
-    // write into a reused descriptor number would be a fault in someone else's file.
-    // SAFETY: ours to close.
-    unsafe { libc::close(self.epfd) };
+    let mut word = [0u8; size_of::<u64>()];
+    let _ = rustix::io::read(self.efd, &mut word);
   }
 }
 
@@ -102,37 +71,42 @@ impl Driver for EpollDriver {
   }
 
   fn wait(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError> {
-    let mut timeout_ms = timeout_ns.map_or(-1, millis_ceil);
+    let mut timeout = timeout_ns.map(timespec);
     if !self.nops.is_empty() {
       out.extend(self.nops.drain(..).map(|user_data| Completion {
         user_data,
         result: 0,
       }));
-      timeout_ms = 0;
+      timeout = Some(timespec(0));
     }
-    let capacity = libc::c_int::try_from(self.events.len()).unwrap_or(libc::c_int::MAX);
-    // SAFETY: the output buffer holds `capacity` records.
-    let n = unsafe { libc::epoll_wait(self.epfd, self.events.as_mut_ptr(), capacity, timeout_ms) };
-    if n < 0 {
-      let code = std::io::Error::last_os_error().raw_os_error();
-      return match code {
-        Some(libc::EINTR) => Ok(()),
-        Some(libc::EBADF) => Err(RtError::DriverLost),
-        _ => Err(RtError::DriverRefused {
-          call: "epoll_wait",
-          code,
-        }),
+    self.events.clear();
+    let outcome = epoll::wait(
+      &self.epfd,
+      rustix::buffer::spare_capacity(&mut self.events),
+      timeout.as_ref(),
+    );
+    if let Err(e) = outcome {
+      return match e {
+        rustix::io::Errno::INTR => Ok(()),
+        rustix::io::Errno::BADF => Err(RtError::DriverLost),
+        other => Err(refused("epoll_wait", other)),
       };
     }
-    for ev in self.events.iter().take(usize::try_from(n).unwrap_or(0)) {
-      if ev.u64 == KICK_TAG {
-        self.drain_kick();
+    let mut kicked = false;
+    for ev in &self.events {
+      // The event record is packed: copy the fields out before touching them.
+      let (data, flags) = (ev.data, ev.flags);
+      if data.u64() == KICK_TAG {
+        kicked = true;
       } else {
         out.push(Completion {
-          user_data: ev.u64,
-          result: i32::try_from(ev.events).unwrap_or(0),
+          user_data: data.u64(),
+          result: i32::try_from(flags.bits()).unwrap_or(0),
         });
       }
+    }
+    if kicked {
+      self.drain_kick();
     }
     Ok(())
   }
@@ -147,9 +121,11 @@ impl Driver for EpollDriver {
   }
 }
 
-/// Milliseconds rounded up, so a wait never returns before its deadline.
-fn millis_ceil(ns: u64) -> libc::c_int {
-  /// Format: nanoseconds per millisecond.
-  const NANOS_PER_MILLI: u64 = 1_000_000;
-  libc::c_int::try_from(ns.div_ceil(NANOS_PER_MILLI)).unwrap_or(libc::c_int::MAX)
+fn timespec(ns: u64) -> rustix::event::Timespec {
+  /// Format: nanoseconds per second.
+  const NANOS_PER_SECOND: u64 = 1_000_000_000;
+  rustix::event::Timespec {
+    tv_sec: i64::try_from(ns / NANOS_PER_SECOND).unwrap_or(i64::MAX),
+    tv_nsec: i64::try_from(ns % NANOS_PER_SECOND).unwrap_or(0),
+  }
 }

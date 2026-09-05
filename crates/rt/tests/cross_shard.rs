@@ -63,7 +63,8 @@ fn a_task_on_one_shard_is_woken_by_a_task_on_another() {
   rt.spawn_on(ids[0], async move {
     WaitForFlag.await;
     let _ = tx_waiter.send("waiter woke on shard 0");
-  });
+  })
+  .unwrap();
   rt.spawn_on(ids[1], async move {
     // Give the waiter time to register its waker, then flip the flag and wake it across shards.
     while REGISTERED.load(Ordering::Acquire) == 0 {
@@ -73,7 +74,8 @@ fn a_task_on_one_shard_is_woken_by_a_task_on_another() {
     let word = slates_mem::Encoded::from_word(WAITER.load(Ordering::Acquire));
     slates_rt::registry::wake(word);
     let _ = tx.send("signaller done on shard 1");
-  });
+  })
+  .unwrap();
   let mut received = Vec::new();
   for _ in 0..2 {
     match rx.recv_timeout(std::time::Duration::from_secs(5)) {
@@ -114,7 +116,8 @@ fn shutdown_cancels_running_tasks_and_joins_the_threads() {
   for id in rt.shard_ids().to_vec() {
     rt.spawn_on(id, async {
       sleep(60_000_000_000).await;
-    });
+    })
+    .unwrap();
   }
   // Let the spawns land before the shutdown message.
   std::thread::yield_now();

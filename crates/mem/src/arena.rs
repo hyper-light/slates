@@ -182,6 +182,10 @@ mod tests {
   use super::*;
 
   fn page() -> usize {
+    if cfg!(miri) {
+      // Miri cannot call sysctl; a common base page is enough for the arithmetic under test.
+      return 4096;
+    }
     usize::try_from(slates_machine::facts::Facts::query().page.base).unwrap()
   }
 

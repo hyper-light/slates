@@ -21,6 +21,12 @@ slates-wire-derive = { path = "crates/wire-derive", version = "0.1.0" }
 # Third-party versions are pinned once here. Exact `=` pins only where an ABI contract is
 # version-specific, each with a comment saying why (Appendix B.1).
 libc = "0.2"
+# The design's syscall surface (§2.4 of the IPC research): safe, I/O-safe wrappers; raw libc stays
+# only where rustix has no call (Apple sysctl, mach, IOKit).
+rustix = { version = "1", features = ["mm", "fs", "event", "process", "shm", "param", "system", "std", "pipe", "thread"] }
+# Memory maps with a safe surface (map_anon, advise, lock, Deref to [u8]); the raw mmap calls
+# that remain are the file-backed ones in the profile segment.
+memmap2 = "0.9"
 windows-sys = { version = "0.60", features = [
   "Win32_Foundation",
   "Win32_System_SystemInformation",
@@ -45,6 +51,8 @@ quote = "1"
 proc-macro2 = "1"
 # Compile-fail tests for the derive's refusals (dev only).
 trybuild = "1"
+# Instruction-count benches under valgrind (dev only; the runner version must match).
+iai-callgrind = "=0.16.1"
 # ratchets.toml (dev only, in xtask).
 toml = "0.8"
 

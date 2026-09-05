@@ -1,22 +1,23 @@
-//! A bounded single-producer single-consumer ring of `Copy` words: the carrier for cross-shard
-//! wakes and message-passing frees (§4.2 "freeing a slot from another shard is a message to the
-//! owner"; §4.3 `inbound: [SpscRing<Msg>; N_SHARDS]`).
+//! A bounded single-producer single-consumer ring of words: the carrier for cross-shard wakes and
+//! message-passing frees (§4.2 "freeing a slot from another shard is a message to the owner";
+//! §4.3 `inbound: [SpscRing<Msg>; N_SHARDS]`).
 //!
 //! Lamport's ring [A: Lamport, "Proving the correctness of multiprocess programs", 1977] with
 //! head and tail on separate cache lines and a power-of-two capacity so the index wraps by mask.
-//! The producer writes the slot then publishes the tail with release; the consumer reads the
-//! tail with acquire, reads the slot, then publishes the head with release. Under `--cfg loom`
-//! the atomics are loom's and the test below explores every interleaving (AC-0.7, T-0.3).
+//! Every slot is an atomic word, so the ring holds no `UnsafeCell` and no unsafe code at all: the
+//! producer stores the slot (relaxed) and publishes the tail (release); the consumer reads the tail
+//! (acquire), loads the slot (relaxed), and publishes the head (release). The release/acquire pair
+//! on the indices orders the slot accesses; the slot's own atomicity only rules out torn words.
+//! Under `--cfg loom` the atomics are loom's and the test explores every interleaving (AC-0.7,
+//! T-0.3).
 //!
 //! The ring is `Sync` for exactly one producer and one consumer at a time; the [`Producer`] and
 //! [`Consumer`] halves enforce that in the type system and are what shards hold.
 
-use std::cell::UnsafeCell;
-
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::error::MemError;
 
@@ -29,28 +30,20 @@ struct Padded<T>(T);
 
 /// The ring.
 #[derive(Debug)]
-pub struct SpscRing<T: Copy> {
-  slots: Box<[UnsafeCell<T>]>,
+pub struct SpscRing {
+  slots: Box<[AtomicU64]>,
   mask: usize,
   head: Padded<AtomicUsize>,
   tail: Padded<AtomicUsize>,
 }
 
-// SAFETY: slots are accessed by one producer and one consumer whose indices never overlap
-// (the tail/head protocol), which the split halves enforce.
-unsafe impl<T: Copy + Send> Sync for SpscRing<T> {}
-// SAFETY: a ring of Send words may move between threads.
-unsafe impl<T: Copy + Send> Send for SpscRing<T> {}
-
-impl<T: Copy + Default> SpscRing<T> {
+impl SpscRing {
   /// A ring of `capacity` slots (a power of two, at least one).
   pub fn new(capacity: usize) -> Result<Self, MemError> {
     if capacity == 0 || !capacity.is_power_of_two() {
       return Err(MemError::BadCapacity { capacity });
     }
-    let slots: Vec<UnsafeCell<T>> = (0..capacity)
-      .map(|_| UnsafeCell::new(T::default()))
-      .collect();
+    let slots: Vec<AtomicU64> = (0..capacity).map(|_| AtomicU64::new(0)).collect();
     Ok(Self {
       slots: slots.into_boxed_slice(),
       mask: capacity - 1,
@@ -58,20 +51,18 @@ impl<T: Copy + Default> SpscRing<T> {
       tail: Padded(AtomicUsize::new(0)),
     })
   }
-}
 
-impl<T: Copy> SpscRing<T> {
   /// Slots.
   pub const fn capacity(&self) -> usize {
     self.mask + 1
   }
 
   /// Splits the ring into its producer and consumer halves.
-  pub fn split(&self) -> (Producer<'_, T>, Consumer<'_, T>) {
+  pub fn split(&self) -> (Producer<'_>, Consumer<'_>) {
     (Producer { ring: self }, Consumer { ring: self })
   }
 
-  /// Items waiting.
+  /// Words waiting.
   pub fn len(&self) -> usize {
     self
       .tail
@@ -88,28 +79,25 @@ impl<T: Copy> SpscRing<T> {
 
 /// The producer half.
 #[derive(Debug)]
-pub struct Producer<'a, T: Copy> {
-  ring: &'a SpscRing<T>,
+pub struct Producer<'a> {
+  ring: &'a SpscRing,
 }
 
 /// The consumer half.
 #[derive(Debug)]
-pub struct Consumer<'a, T: Copy> {
-  ring: &'a SpscRing<T>,
+pub struct Consumer<'a> {
+  ring: &'a SpscRing,
 }
 
-impl<T: Copy> Producer<'_, T> {
+impl Producer<'_> {
   /// Pushes a word; returns it back when the ring is full.
-  pub fn push(&mut self, value: T) -> Result<(), T> {
+  pub fn push(&mut self, word: u64) -> Result<(), u64> {
     let tail = self.ring.tail.0.load(Ordering::Relaxed);
     let head = self.ring.head.0.load(Ordering::Acquire);
     if tail.wrapping_sub(head) == self.ring.capacity() {
-      return Err(value);
+      return Err(word);
     }
-    let slot = &self.ring.slots[tail & self.ring.mask];
-    // SAFETY: the slot at `tail` is unobservable by the consumer until the tail is published
-    // below, and only this producer writes slots.
-    unsafe { slot.get().write(value) };
+    self.ring.slots[tail & self.ring.mask].store(word, Ordering::Relaxed);
     self
       .ring
       .tail
@@ -119,24 +107,21 @@ impl<T: Copy> Producer<'_, T> {
   }
 }
 
-impl<T: Copy> Consumer<'_, T> {
+impl Consumer<'_> {
   /// Pops the oldest word, if any.
-  pub fn pop(&mut self) -> Option<T> {
+  pub fn pop(&mut self) -> Option<u64> {
     let head = self.ring.head.0.load(Ordering::Relaxed);
     let tail = self.ring.tail.0.load(Ordering::Acquire);
     if head == tail {
       return None;
     }
-    let slot = &self.ring.slots[head & self.ring.mask];
-    // SAFETY: the producer published `tail > head`, so the slot at `head` holds a written word
-    // the producer will not touch again until the head is published past it below.
-    let value = unsafe { slot.get().read() };
+    let word = self.ring.slots[head & self.ring.mask].load(Ordering::Relaxed);
     self
       .ring
       .head
       .0
       .store(head.wrapping_add(1), Ordering::Release);
-    Some(value)
+    Some(word)
   }
 }
 
@@ -147,19 +132,19 @@ mod tests {
   #[test]
   fn capacity_must_be_a_power_of_two() {
     assert!(matches!(
-      SpscRing::<u64>::new(0),
+      SpscRing::new(0),
       Err(MemError::BadCapacity { capacity: 0 })
     ));
     assert!(matches!(
-      SpscRing::<u64>::new(6),
+      SpscRing::new(6),
       Err(MemError::BadCapacity { capacity: 6 })
     ));
-    assert_eq!(SpscRing::<u64>::new(8).unwrap().capacity(), 8);
+    assert_eq!(SpscRing::new(8).unwrap().capacity(), 8);
   }
 
   #[test]
   fn fifo_with_wraparound_and_full_and_empty_refusals() {
-    let ring = SpscRing::<u32>::new(4).unwrap();
+    let ring = SpscRing::new(4).unwrap();
     let (mut p, mut c) = ring.split();
     assert_eq!(c.pop(), None);
     for i in 0..4 {
@@ -169,10 +154,10 @@ mod tests {
     assert_eq!(ring.len(), 4);
     assert_eq!(c.pop(), Some(0));
     p.push(4).unwrap();
-    let drained: Vec<u32> = std::iter::from_fn(|| c.pop()).collect();
+    let drained: Vec<u64> = std::iter::from_fn(|| c.pop()).collect();
     assert_eq!(drained, vec![1, 2, 3, 4]);
     assert!(ring.is_empty());
-    for round in 0..1000u32 {
+    for round in 0..1000u64 {
       p.push(round).unwrap();
       assert_eq!(c.pop(), Some(round));
     }
@@ -180,7 +165,7 @@ mod tests {
 
   #[test]
   fn one_producer_and_one_consumer_thread_see_every_word_in_order() {
-    let ring = SpscRing::<u64>::new(64).unwrap();
+    let ring = SpscRing::new(64).unwrap();
     let total = 100_000u64;
     std::thread::scope(|s| {
       let (mut p, mut c) = ring.split();
@@ -211,10 +196,10 @@ mod loom_tests {
   #[test]
   fn every_interleaving_of_one_producer_and_one_consumer_is_fifo_without_loss() {
     loom::model(|| {
-      let ring: &'static SpscRing<u8> = Box::leak(Box::new(SpscRing::new(2).unwrap()));
+      let ring: &'static SpscRing = Box::leak(Box::new(SpscRing::new(2).unwrap()));
       let (mut p, mut c) = ring.split();
       let producer = loom::thread::spawn(move || {
-        for i in 1..=3u8 {
+        for i in 1..=3u64 {
           while p.push(i).is_err() {
             loom::thread::yield_now();
           }

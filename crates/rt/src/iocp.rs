@@ -35,23 +35,29 @@ impl std::fmt::Debug for IocpDriver {
   }
 }
 
+/// Creates the port with one concurrent thread (the shard); returns its exposed address, which
+/// the kick carries and the shard's thread builds the driver from.
+pub fn prepare() -> Result<usize, RtError> {
+  // SAFETY: creating a fresh port; the result is checked.
+  let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
+  if port.is_null() {
+    return Err(RtError::os("CreateIoCompletionPort"));
+  }
+  Ok(port.expose_provenance())
+}
+
 impl IocpDriver {
-  /// Creates the port with one concurrent thread (the shard).
-  pub fn new() -> Result<IocpDriver, RtError> {
-    // SAFETY: creating a fresh port; the result is checked.
-    let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
-    if port.is_null() {
-      return Err(RtError::os("CreateIoCompletionPort"));
-    }
+  /// Builds the driver over a prepared port, on the shard's thread.
+  pub fn from_prepared(port: usize) -> IocpDriver {
     // SAFETY: an all-zero OVERLAPPED_ENTRY is a valid, empty record.
     let entries = (0..EVENTS_PER_WAIT)
       .map(|_| unsafe { std::mem::zeroed() })
       .collect();
-    Ok(IocpDriver {
-      port,
+    IocpDriver {
+      port: std::ptr::with_exposed_provenance_mut(port),
       epoch: Instant::now(),
       entries,
-    })
+    }
   }
 }
 

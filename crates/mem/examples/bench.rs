@@ -11,8 +11,23 @@ use slates_mem::ring::SpscRing;
 use slates_mem::slab::Slab;
 
 fn report(name: &str, m: Measurement) {
+  report_line("ratchet", name, m);
+}
+
+/// A row whose cost depends on which cores the OS placed two threads on: gated where the OS
+/// pins threads (Linux, Windows), informational where it only hints or refuses (macOS), because a
+/// cross-cluster placement is not a regression of the code.
+fn report_placed(name: &str, m: Measurement) {
+  let pinned = matches!(
+    slates_machine::probes::pin_current_thread(0),
+    slates_machine::probes::Pinning::Pinned
+  );
+  report_line(if pinned { "ratchet" } else { "ratchet-info" }, name, m);
+}
+
+fn report_line(tag: &str, name: &str, m: Measurement) {
   println!(
-    "ratchet\t{}\t{}\t{}\t{}",
+    "{tag}	{}	{}	{}	{}",
     key(name),
     m.interval.lower,
     m.median_ns(),
@@ -88,8 +103,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
   // The ring round trip that matters: two rings between two threads, the peer echoing each
   // word back; one round trip is a push, a cross-core handoff, an echo push and a pop.
-  let to_peer = SpscRing::<u64>::new(1024)?;
-  let from_peer = SpscRing::<u64>::new(1024)?;
+  let to_peer = SpscRing::new(1024)?;
+  let from_peer = SpscRing::new(1024)?;
   let stop = std::sync::atomic::AtomicBool::new(false);
   let mut round_trip = None;
   std::thread::scope(|scope| {
@@ -123,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     round_trip = Some(m);
   });
   if let Some(m) = round_trip {
-    report("spsc ring round trip between two threads", m);
+    report_placed("spsc ring round trip between two threads", m);
   }
   Ok(())
 }

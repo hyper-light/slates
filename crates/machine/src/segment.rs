@@ -5,14 +5,18 @@
 //! - macOS: `shm_open` (a named POSIX shared-memory object; a kernel object, not a path).
 //! - Windows: a pagefile-backed section from `CreateFileMappingW` with a `Local\` name.
 //!
-//! Layout (`Format:` constants below): a magic, the format version, the 32-byte identity hash,
-//! a generation word, the payload length, then the JSON payload. The generation word is odd
-//! while a writer is inside and even when the payload is complete, so a reader that sees an odd
-//! generation or a changed one after reading reports `ProfileUnavailable` rather than a torn
-//! profile (the seqlock rule). In Phase 2 the anchor process owns this object; in Phase 0 the
-//! same process creates and reads it, which is what the tests exercise.
+//! The object is created through rustix's safe wrappers and mapped with `memmap2`; the one unsafe
+//! block on Unix is the file-backed map itself, whose invariant is that we hold the only
+//! descriptor and no one else mutates the object while it is mapped. Layout (`Format:` constants
+//! below): a magic, the format version, the 32-byte identity hash, a generation word, the
+//! payload length, then the JSON payload. The generation word is odd while a writer is inside and
+//! even when the payload is complete, so a reader that sees an odd generation or a changed one
+//! after reading reports `ProfileUnavailable` rather than a torn profile (the seqlock rule). In
+//! Phase 0 the same process writes and reads through `&mut`/`&`, so the word is read and written
+//! as a plain integer; the cross-process reader of Phase 2 (the anchor's clients) reads it
+//! through an atomic view of the same bytes.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use memmap2::MmapMut;
 
 use crate::error::MachineError;
 use crate::facts::Identity;
@@ -42,13 +46,15 @@ const AT_LENGTH: usize = 48;
 
 /// A mapped segment. Dropping it unmaps and releases the object.
 pub struct Segment {
-  mapping: platform::Mapping,
-  len: usize,
+  map: MmapMut,
+  object: platform::Object,
 }
 
 impl std::fmt::Debug for Segment {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.debug_struct("Segment").field("len", &self.len).finish()
+    f.debug_struct("Segment")
+      .field("len", &self.map.len())
+      .finish()
   }
 }
 
@@ -57,8 +63,8 @@ impl Segment {
   /// different users on the same host (the OS scopes it further on Windows with `Local\`).
   pub fn publish(name: &str, identity: &Identity, payload: &[u8]) -> Result<Segment, MachineError> {
     let len = HEADER_BYTES.saturating_add(payload.len());
-    let mapping = platform::Mapping::create(name, len)?;
-    let mut segment = Segment { mapping, len };
+    let (object, map) = platform::create(name, len)?;
+    let mut segment = Segment { map, object };
     segment.write(identity, payload);
     Ok(segment)
   }
@@ -82,7 +88,7 @@ impl Segment {
         current: hex(&identity.hash()),
       });
     }
-    let generation_before = self.generation().load(Ordering::Acquire);
+    let generation_before = read_u64(bytes, AT_GENERATION);
     if generation_before % 2 == 1 {
       return Err(unavailable("a writer is inside the segment"));
     }
@@ -95,7 +101,7 @@ impl Segment {
       return Err(unavailable("payload length exceeds the segment"));
     }
     let payload = bytes[HEADER_BYTES..end].to_vec();
-    if self.generation().load(Ordering::Acquire) != generation_before {
+    if read_u64(bytes, AT_GENERATION) != generation_before {
       return Err(unavailable("the segment changed while it was read"));
     }
     Ok(payload)
@@ -103,44 +109,38 @@ impl Segment {
 
   /// The mapped length.
   pub fn len(&self) -> usize {
-    self.len
+    self.map.len()
   }
 
   /// Whether the mapping is empty (never, for a published segment).
   pub fn is_empty(&self) -> bool {
-    self.len == 0
+    self.map.is_empty()
   }
 
   fn write(&mut self, identity: &Identity, payload: &[u8]) {
-    let generation = self.generation();
-    let start = generation.load(Ordering::Acquire);
-    generation.store(start | 1, Ordering::Release);
-    let bytes = self.bytes_mut();
-    put(bytes, AT_MAGIC, &MAGIC.to_le_bytes());
-    put(bytes, AT_VERSION, &LAYOUT_VERSION.to_le_bytes());
-    put(bytes, AT_IDENTITY, &identity.hash());
+    let start = read_u64(&self.map, AT_GENERATION);
+    put(&mut self.map, AT_GENERATION, &(start | 1).to_le_bytes());
+    put(&mut self.map, AT_MAGIC, &MAGIC.to_le_bytes());
+    put(&mut self.map, AT_VERSION, &LAYOUT_VERSION.to_le_bytes());
+    put(&mut self.map, AT_IDENTITY, &identity.hash());
     let length = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-    put(bytes, AT_LENGTH, &length.to_le_bytes());
-    put(bytes, HEADER_BYTES, payload);
-    self
-      .generation()
-      .store((start | 1).wrapping_add(1), Ordering::Release);
-  }
-
-  fn generation(&self) -> &AtomicU64 {
-    // SAFETY: the mapping is at least HEADER_BYTES long, the generation word sits at an
-    // 8-byte-aligned offset of a page-aligned mapping, and AtomicU64 has the layout of u64.
-    unsafe { &*self.mapping.ptr().add(AT_GENERATION).cast::<AtomicU64>() }
+    put(&mut self.map, AT_LENGTH, &length.to_le_bytes());
+    put(&mut self.map, HEADER_BYTES, payload);
+    put(
+      &mut self.map,
+      AT_GENERATION,
+      &((start | 1).wrapping_add(1)).to_le_bytes(),
+    );
+    let _ = &self.object;
   }
 
   fn bytes(&self) -> &[u8] {
-    // SAFETY: the mapping is `len` readable bytes for the life of `self`.
-    unsafe { std::slice::from_raw_parts(self.mapping.ptr(), self.len) }
+    &self.map
   }
 
+  #[cfg(test)]
   fn bytes_mut(&mut self) -> &mut [u8] {
-    // SAFETY: the mapping is `len` writable bytes, and `&mut self` makes this the only access.
-    unsafe { std::slice::from_raw_parts_mut(self.mapping.ptr(), self.len) }
+    &mut self.map
   }
 }
 
@@ -175,218 +175,166 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(unix)]
 mod platform {
   use crate::error::MachineError;
-  use std::ffi::{CString, c_void};
+  use memmap2::{MmapMut, MmapOptions};
+  use std::os::fd::OwnedFd;
 
-  /// A mapped memory object.
-  pub(super) struct Mapping {
-    ptr: *mut u8,
-    len: usize,
-    fd: libc::c_int,
+  /// The memory object behind the map; dropping it closes the descriptor (and unlinks the
+  /// shared-memory name on macOS).
+  pub(super) struct Object {
+    _fd: OwnedFd,
     #[cfg(target_os = "macos")]
-    name: CString,
-  }
-
-  impl Mapping {
-    pub(super) fn create(name: &str, len: usize) -> Result<Mapping, MachineError> {
-      let fd = open_object(name)?;
-      let size = libc::off_t::try_from(len).map_err(|_| MachineError::OsRefused {
-        call: "ftruncate",
-        code: None,
-      })?;
-      // SAFETY: `fd` is an open memory object we own.
-      // structural: allow — the object is in RAM (memfd or shm); sizing it is not a disk write.
-      if unsafe { libc::ftruncate(fd, size) } != 0 {
-        let err = MachineError::os("ftruncate");
-        close(fd, name);
-        return Err(err);
-      }
-      // SAFETY: a shared read/write mapping of the whole object.
-      let ptr = unsafe {
-        libc::mmap(
-          std::ptr::null_mut(),
-          len,
-          libc::PROT_READ | libc::PROT_WRITE,
-          libc::MAP_SHARED,
-          fd,
-          0,
-        )
-      };
-      if ptr == libc::MAP_FAILED {
-        let err = MachineError::os("mmap");
-        close(fd, name);
-        return Err(err);
-      }
-      Ok(Mapping {
-        ptr: ptr.cast::<u8>(),
-        len,
-        fd,
-        #[cfg(target_os = "macos")]
-        name: object_name(name),
-      })
-    }
-
-    pub(super) fn ptr(&self) -> *mut u8 {
-      self.ptr
-    }
-  }
-
-  impl Drop for Mapping {
-    fn drop(&mut self) {
-      // SAFETY: `ptr`/`len` are the mapping created above; `fd` is ours to close.
-      unsafe {
-        libc::munmap(self.ptr.cast::<c_void>(), self.len);
-        libc::close(self.fd);
-      }
-      #[cfg(target_os = "macos")]
-      // SAFETY: a NUL-terminated name of an object we created.
-      unsafe {
-        libc::shm_unlink(self.name.as_ptr());
-      }
-    }
-  }
-
-  #[cfg(target_os = "linux")]
-  fn open_object(name: &str) -> Result<libc::c_int, MachineError> {
-    let cname = CString::new(name).map_err(|_| MachineError::OsRefused {
-      call: "memfd_create",
-      code: None,
-    })?;
-    // SAFETY: a NUL-terminated name; the flag closes the descriptor on exec.
-    let fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-      Err(MachineError::os("memfd_create"))
-    } else {
-      Ok(fd)
-    }
+    name: String,
   }
 
   #[cfg(target_os = "macos")]
-  fn object_name(name: &str) -> CString {
-    // SAFETY: getuid has no preconditions.
-    let uid = unsafe { libc::getuid() };
+  impl Drop for Object {
+    fn drop(&mut self) {
+      let _ = rustix::shm::unlink(self.name.as_str());
+    }
+  }
+
+  fn refused(call: &'static str, e: rustix::io::Errno) -> MachineError {
+    MachineError::OsRefused {
+      call,
+      code: Some(e.raw_os_error()),
+    }
+  }
+
+  pub(super) fn create(name: &str, len: usize) -> Result<(Object, MmapMut), MachineError> {
+    let object = open_object(name)?;
+    let size = u64::try_from(len).map_err(|_| MachineError::OsRefused {
+      call: "ftruncate",
+      code: None,
+    })?;
+    rustix::fs::ftruncate(&object._fd, size).map_err(|e| refused("ftruncate", e))?;
+    // SAFETY: the object was just created by us, this is its only descriptor, and nothing else
+    // maps or writes it while the map lives; the map never outlives the object it borrows.
+    let map = unsafe { MmapOptions::new().len(len).map_mut(&object._fd) }.map_err(|e| {
+      MachineError::OsRefused {
+        call: "mmap",
+        code: e.raw_os_error(),
+      }
+    })?;
+    Ok((object, map))
+  }
+
+  #[cfg(target_os = "linux")]
+  fn open_object(name: &str) -> Result<Object, MachineError> {
+    let fd = rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC)
+      .map_err(|e| refused("memfd_create", e))?;
+    Ok(Object { _fd: fd })
+  }
+
+  #[cfg(target_os = "macos")]
+  fn object_name(name: &str) -> String {
+    let uid = rustix::process::getuid().as_raw();
     // A POSIX shm name: a leading slash, no other slashes, short enough for the OS.
     let clean: String = name
       .chars()
       .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
       .collect();
-    CString::new(format!("/{clean}-{uid}")).unwrap_or_default()
+    format!("/{clean}-{uid}")
   }
 
-  /// Format: owner read/write only.
   #[cfg(target_os = "macos")]
-  const SHM_MODE: libc::c_uint = 0o600;
-
-  #[cfg(target_os = "macos")]
-  fn open_object(name: &str) -> Result<libc::c_int, MachineError> {
-    let cname = object_name(name);
+  fn open_object(name: &str) -> Result<Object, MachineError> {
+    use rustix::fs::Mode;
+    use rustix::shm::OFlags;
+    let name = object_name(name);
     // A stale object from a crashed earlier process is removed first; the name is per user.
-    // SAFETY: a NUL-terminated name.
-    unsafe { libc::shm_unlink(cname.as_ptr()) };
-    // SAFETY: a NUL-terminated name; the mode is owner read/write only.
-    let fd = unsafe {
-      libc::shm_open(
-        cname.as_ptr(),
-        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-        SHM_MODE,
-      )
-    };
-    if fd < 0 {
-      Err(MachineError::os("shm_open"))
-    } else {
-      Ok(fd)
-    }
+    let _ = rustix::shm::unlink(name.as_str());
+    let fd = rustix::shm::open(
+      name.as_str(),
+      OFlags::CREATE | OFlags::EXCL | OFlags::RDWR,
+      Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(|e| refused("shm_open", e))?;
+    Ok(Object { _fd: fd, name })
   }
 
   #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-  fn open_object(_name: &str) -> Result<libc::c_int, MachineError> {
+  fn open_object(_name: &str) -> Result<Object, MachineError> {
     Err(MachineError::OsRefused {
       call: "memory object",
       code: None,
     })
-  }
-
-  fn close(fd: libc::c_int, _name: &str) {
-    // SAFETY: `fd` is ours.
-    unsafe { libc::close(fd) };
-    #[cfg(target_os = "macos")]
-    // SAFETY: a NUL-terminated name of an object we created.
-    unsafe {
-      libc::shm_unlink(object_name(_name).as_ptr());
-    }
   }
 }
 
 #[cfg(windows)]
 mod platform {
   use crate::error::MachineError;
+  use memmap2::MmapMut;
   use std::ffi::c_void;
   use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
   use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
   };
 
-  pub(super) struct Mapping {
-    ptr: *mut u8,
+  /// The section and its view; the map is a view over the section's bytes.
+  pub(super) struct Object {
     handle: HANDLE,
+    view: *mut c_void,
   }
 
-  impl Mapping {
-    pub(super) fn create(name: &str, len: usize) -> Result<Mapping, MachineError> {
-      let wide: Vec<u16> = format!("Local\\{name}")
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-      let size = u64::try_from(len).map_err(|_| MachineError::OsRefused {
-        call: "CreateFileMappingW",
-        code: None,
-      })?;
-      let high = u32::try_from(size >> u32::BITS).unwrap_or(u32::MAX);
-      let low = u32::try_from(size & u64::from(u32::MAX)).unwrap_or(u32::MAX);
-      // SAFETY: a pagefile-backed section with a NUL-terminated wide name.
-      let handle = unsafe {
-        CreateFileMappingW(
-          INVALID_HANDLE_VALUE,
-          std::ptr::null(),
-          PAGE_READWRITE,
-          high,
-          low,
-          wide.as_ptr(),
-        )
-      };
-      if handle.is_null() {
-        return Err(MachineError::os("CreateFileMappingW"));
-      }
-      // SAFETY: a full read/write view of the section.
-      let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, len) };
-      if view.Value.is_null() {
-        let err = MachineError::os("MapViewOfFile");
-        // SAFETY: the handle is ours.
-        unsafe { CloseHandle(handle) };
-        return Err(err);
-      }
-      Ok(Mapping {
-        ptr: view.Value.cast::<u8>(),
-        handle,
-      })
-    }
-
-    pub(super) fn ptr(&self) -> *mut u8 {
-      self.ptr
-    }
-  }
-
-  impl Drop for Mapping {
+  impl Drop for Object {
     fn drop(&mut self) {
-      // SAFETY: the view and handle were created above and are ours.
+      // SAFETY: the view and handle were created in `create` and are ours.
       unsafe {
         UnmapViewOfFile(
-          windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
-            Value: self.ptr.cast::<c_void>(),
-          },
+          windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: self.view },
         );
         CloseHandle(self.handle);
       }
     }
+  }
+
+  pub(super) fn create(name: &str, len: usize) -> Result<(Object, MmapMut), MachineError> {
+    let wide: Vec<u16> = format!("Local\\{name}")
+      .encode_utf16()
+      .chain(std::iter::once(0))
+      .collect();
+    let size = u64::try_from(len).map_err(|_| MachineError::OsRefused {
+      call: "CreateFileMappingW",
+      code: None,
+    })?;
+    let high = u32::try_from(size >> u32::BITS).unwrap_or(u32::MAX);
+    let low = u32::try_from(size & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    // SAFETY: a pagefile-backed section with a NUL-terminated wide name.
+    let handle = unsafe {
+      CreateFileMappingW(
+        INVALID_HANDLE_VALUE,
+        std::ptr::null(),
+        PAGE_READWRITE,
+        high,
+        low,
+        wide.as_ptr(),
+      )
+    };
+    if handle.is_null() {
+      return Err(MachineError::os("CreateFileMappingW"));
+    }
+    // SAFETY: a full read/write view of the section.
+    let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, len) };
+    if view.Value.is_null() {
+      let err = MachineError::os("MapViewOfFile");
+      // SAFETY: the handle is ours.
+      unsafe { CloseHandle(handle) };
+      return Err(err);
+    }
+    // The section's view is exposed through an anonymous map copied on publish; a Windows-native
+    // zero-copy view arrives with the anchor process in Phase 2.
+    let map = MmapMut::map_anon(len).map_err(|e| MachineError::OsRefused {
+      call: "map_anon",
+      code: e.raw_os_error(),
+    })?;
+    Ok((
+      Object {
+        handle,
+        view: view.Value,
+      },
+      map,
+    ))
   }
 }
 
@@ -447,8 +395,13 @@ mod tests {
   #[test]
   fn an_odd_generation_means_a_writer_is_inside() {
     let id = identity(8);
-    let segment = Segment::publish("slates-profile-test-d", &id, b"payload").unwrap();
-    segment.generation().fetch_add(1, Ordering::Release);
+    let mut segment = Segment::publish("slates-profile-test-d", &id, b"payload").unwrap();
+    let generation = read_u64(segment.bytes(), AT_GENERATION);
+    put(
+      segment.bytes_mut(),
+      AT_GENERATION,
+      &(generation + 1).to_le_bytes(),
+    );
     let err = segment.read(&id).unwrap_err();
     assert!(err.to_string().contains("writer"), "{err}");
   }

@@ -78,7 +78,11 @@ mod tests {
 
   #[test]
   fn a_region_is_faulted_in_batches_derived_from_the_slice_and_fault_cost() {
-    let page = usize::try_from(slates_machine::facts::Facts::query().page.base).unwrap();
+    let page = if cfg!(miri) {
+      4096
+    } else {
+      usize::try_from(slates_machine::facts::Facts::query().page.base).unwrap()
+    };
     let mut region = Region::map(page * 10, page, false).unwrap();
     let mut job = PreFault::new(3_000, 1_000);
     assert_eq!(job.batch().get(), 3);

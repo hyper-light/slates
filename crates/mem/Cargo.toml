@@ -9,10 +9,12 @@ readme.workspace = true
 description = "Memory: pre-faulted locked arenas, per-shard slabs and generational handles, buddy chunk allocation, segmented arrays, message-passing frees (design §4.2, D-8, D-12)."
 
 [dependencies]
+memmap2 = { workspace = true }
 slates-machine = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+rustix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
@@ -20,6 +22,13 @@ windows-sys = { workspace = true }
 # loom builds only under `RUSTFLAGS="--cfg loom"` for the ring's interleaving tests (AC-0.7).
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
+
+[dev-dependencies]
+iai-callgrind = { workspace = true }
+
+[[bench]]
+name = "callgrind"
+harness = false
 
 [lints]
 workspace = true

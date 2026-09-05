@@ -148,12 +148,24 @@ whether the bulk path needs it, though bulk carries the BLAKE3 identity instead 
 ## Ratchets (2026-09-05)
 
 `ratchets.toml` holds the ceilings for this machine (identity `4c62b34d5f545407`, the Apple M5
-Max above): 22 rows, each the highest upper interval edge across three runs of its bench
-example. `cargo xtask ratchet` runs each example three more times and fails when a row's lowest
-lower edge lies above its ceiling, so a regression must clear every recorded run to count; the
-planted ceiling of 1 ns on the slab row was reported as a regression before the file was
-restored. Ceilings only tighten (`--tighten`); `--reset` rebuilds the entry and is a deliberate
-act; a raised ceiling is an edit with a reason in the file.
+Max above): one per gated row, each the highest upper interval edge across three runs of its
+bench example. `cargo xtask ratchet` runs each example three more times and fails when a row's
+lowest lower edge lies above its ceiling, so a regression must clear every recorded run to
+count; the planted ceiling of 1 ns on the slab row was reported as a regression before the file
+was restored. Ceilings only tighten (`--tighten`); `--reset` rebuilds the entry and is a
+deliberate act; a raised ceiling is an edit with a reason in the file.
+
+Rows whose cost depends on where the OS placed two threads (the two-thread ring round trip, the
+cross-shard wakes, the foreign spawn round trips) are gated only where the OS pins threads
+(Linux, Windows). macOS on Apple silicon refuses pinning, so here they are informational: the
+same ring binary measured 239, 364 and 364 ns in three runs, and 322, 447 and 520 ns in three
+others, as the scheduler placed the pair within or across core clusters; a cross-cluster
+placement is not a regression of the code, and the gate must not say it is.
+
+The gate caught a real one on 2026-09-05: the first unsafe-reduction commit raised the idle step
+from about 30 ns (ceiling 34) to 37–45 ns, the cost of a `RefCell` borrow per phase and a
+control-channel poll per step. Recovered without unsafe (one borrow before the polls and one
+after, the registry entry cached, the channel polled only behind a pending flag): 22–30 ns.
 
 Between-run drift on this laptop, from the record run (the medians of the three runs):
 
@@ -161,9 +173,9 @@ Between-run drift on this laptop, from the record run (the medians of the three 
 |---|---|---|
 | Slab insert+remove | 13, 13, 13 ns | 0 |
 | Buddy alloc+free, one page | 56, 56, 56 ns | 0 |
-| Ring round trip, two threads | 354, 349, 349 ns | 1.4% |
-| Cross-shard wake, both parking | 6292, 6250, 6250 ns | 0.7% |
-| Cross-shard wake, both spinning | 500, 459, 584 ns | 27% |
+| Ring round trip, two threads (informational here) | 364, 364, 239 ns | 52% |
+| Cross-shard wake, both parking (informational here) | 6292, 6250, 6250 ns | 0.7% |
+| Cross-shard wake, both spinning (informational here) | 500, 459, 584 ns | 27% |
 | One local wake | 208, 250, 177 ns | 41% |
 | Spawn and run a trivial task | 132, 156, 112 ns | 39% |
 | CRC32C over 1 MiB | 152, 137, 124 µs | 23% |
@@ -172,4 +184,4 @@ Between-run drift on this laptop, from the record run (the medians of the three 
 What it means: the wall clock on a laptop resolves a regression of a few percent on the
 microsecond rows and only a large one on the nanosecond rows, because the machine itself moves
 that much between processes. The design's instruction-count gate (D-20) is what sees the small
-change; it waits on valgrind (GAPS §8a).
+change; it runs in CI's `callgrind` lane under valgrind (GAPS §8b).

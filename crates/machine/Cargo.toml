@@ -17,6 +17,7 @@ codecs = ["dep:lz4_flex", "dep:zstd"]
 pure-hash = ["blake3/pure"]
 
 [dependencies]
+memmap2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
@@ -25,6 +26,7 @@ zstd = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+rustix = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

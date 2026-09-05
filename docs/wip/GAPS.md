@@ -177,6 +177,43 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
   Nothing on Windows or Linux has *run* yet: that needs those machines (Phase 1's reference
   boxes).
 
+## 8b. Unsafe, Miri and instruction counts (2026-09-05)
+
+- Unsafe surface, measured by `cargo xtask unsafe` (blocks, functions and impls in shipped
+  sources, comments and tests excluded): 161 mentions and 8 `unsafe impl` before the reduction,
+  76 sites and 0 `unsafe impl` after. What did it: the rings hold atomic words instead of
+  `UnsafeCell` slots (zero unsafe, loom still explores every interleaving); the shard's mutable
+  state sits in a `RefCell` with refused, counted nesting instead of a raw pointer behind a flag;
+  shard contexts, pair rings, registry entries and the simulation's shared state are leaked
+  process-lifetime objects reached through plain `&'static` references; control messages (spawn,
+  cancel, shutdown, active) ride a bounded standard channel instead of pointers packed into ring
+  words; drivers are built on their own shard's thread from a `Send` seed instead of being sent
+  across; `rustix` (the design's syscall surface) replaces raw `libc` for everything it wraps
+  and `memmap2` replaces the raw maps, advice and locks. What remains, per crate, is listed with
+  its reason in `unsafe-budget.toml`: FFI without a safe wrapper (Apple sysctl, mach, IOKit,
+  Win32), the CRC32C intrinsics, the `RawWaker` vtable, and wrappers that are unsafe by signature
+  (`kevent`, io_uring's `push`, the file-backed map of the profile segment). The budget only
+  tightens. The reduction cost nothing measurable after one recovery: the wall-clock ratchet
+  caught the idle step rising from 30 to 37–45 ns (a borrow per phase, a channel poll per step)
+  and the step is back at 22–30 ns with one borrow before the polls and one after, the registry
+  entry cached, and the control channel polled only behind a pending flag (BENCHMARKS.md).
+- Miri (nightly `miri 0.1.0 (0ed41eb414 2026-09-04)`, authorized and installed 2026-09-05):
+  `slates-mem` 28 tests and `slates-wire` 19 tests pass with the leak check on; `slates-rt`'s 12
+  unit tests and 2 simulation tests pass with `-Zmiri-ignore-leaks`, because the runtime leaks
+  its contexts, rings and registry entries on purpose (that is what makes their references
+  `&'static` without unsafe code). Tests that need `sysctl`, `mlock` or a kqueue are marked
+  ignored under Miri (3 in `mem`, 3 in `rt`). No undefined behaviour was found. CI's
+  `miri-and-loom` lane runs the same commands.
+- Instruction counts (D-20): `benches/callgrind.rs` in `mem`, `rt` and `wire` under iai-callgrind
+  0.16.1, run by CI's `callgrind` lane on Ubuntu with valgrind (authorized 2026-09-05); valgrind
+  has no port for macOS on Apple silicon, so the lane is the only place they run. The benches
+  compile here (`cargo bench --workspace --bench callgrind --no-run`). The lane prints the counts;
+  the comparison against a recorded baseline is the next step once the first run exists.
+- New dependencies, accepted for the unsafe reduction: `rustix` 1.1 (the syscall surface named in
+  the IPC research §2.4), `memmap2` 0.9 (maps, advice, locks), `toml` (xtask only),
+  `iai-callgrind` (dev only; pulls `proc-macro-error2` 2.0.1, which rustc warns will be rejected
+  by a future version — a dev-only build dependency, tracked here until iai-callgrind drops it).
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3

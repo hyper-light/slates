@@ -2,11 +2,10 @@
 //! completions as `(user_data, result)` pairs; a `Kick` is the thread-safe handle any thread
 //! uses to wake a shard's driver (§4.3, "the three OS drivers with a common completion seam").
 //!
-//! Phase 0 carries the seam itself, the kick, the wait with a deadline, and a no-op operation
-//! whose completion proves the path; sockets, files and the bridge queues arrive with their
-//! phases and use the same `wait`.
-
-use std::ptr::NonNull;
+//! Phase 0 carries the seam itself, the kick, the wait with a deadline, a pending check, and a
+//! no-op operation whose completion proves the path; sockets, files and the bridge queues arrive
+//! with their phases and use the same `wait`. The descriptors a kick names are leaked for the
+//! process, so a kick is a `Copy` of a `&'static` handle and needs no unsafe code.
 
 use crate::error::RtError;
 use crate::sim::SimShared;
@@ -53,25 +52,18 @@ impl DriverKind {
 pub enum Kick {
   /// Write eight bytes to an eventfd (Linux; io_uring and epoll).
   #[cfg(target_os = "linux")]
-  Eventfd(std::os::fd::RawFd),
+  Eventfd(&'static std::os::fd::OwnedFd),
   /// Trigger the `EVFILT_USER` event on a kqueue (macOS / BSD).
   #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-  Kqueue(std::os::fd::RawFd),
+  Kqueue(&'static std::os::fd::OwnedFd),
   /// Post a completion packet to a port (Windows), by its exposed address.
   #[cfg(target_os = "windows")]
   Iocp(usize),
-  /// Set the simulation's kicked flag (single-threaded by construction).
-  Sim(NonNull<SimShared>),
+  /// Set the simulation's kicked flag.
+  Sim(&'static SimShared),
   /// No driver to kick (registry entries in tests).
   None,
 }
-
-// SAFETY: every variant is an OS handle the kernel serializes, or the simulation pointer, which
-// is only ever used from the simulation's single thread (documented in `sim`).
-unsafe impl Send for Kick {}
-// SAFETY: as above; kicks are idempotent and racy by design (a lost race costs one spurious
-// wake, never a lost one, because the ring is checked after every wait).
-unsafe impl Sync for Kick {}
 
 impl Kick {
   /// A kick that does nothing.
@@ -85,31 +77,20 @@ impl Kick {
     match self {
       #[cfg(target_os = "linux")]
       Kick::Eventfd(fd) => {
-        let one: u64 = 1;
-        // SAFETY: an open eventfd and eight bytes from a u64.
-        unsafe {
-          libc::write(
-            *fd,
-            (&raw const one).cast::<std::ffi::c_void>(),
-            std::mem::size_of::<u64>(),
-          )
-        };
+        let _ = rustix::io::write(fd, &1u64.to_ne_bytes());
       }
       #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-      Kick::Kqueue(kq) => crate::kqueue::trigger(*kq),
+      Kick::Kqueue(kq) => crate::kqueue::trigger(kq),
       #[cfg(target_os = "windows")]
       Kick::Iocp(port) => crate::iocp::post_kick(*port),
-      Kick::Sim(shared) => {
-        // SAFETY: the simulation's shared state is leaked for the process and used only on the
-        // simulation thread.
-        unsafe { shared.as_ref() }.set_kicked();
-      }
+      Kick::Sim(shared) => shared.set_kicked(),
       Kick::None => {}
     }
   }
 }
 
-/// The seam every driver implements.
+/// The seam every driver implements. A driver is built on the thread that runs it, from a
+/// [`DriverSeed`] the runtime prepared, so it may hold buffers of raw kernel records.
 pub trait Driver {
   /// Which driver this is.
   fn kind(&self) -> DriverKind;
@@ -133,32 +114,72 @@ pub trait Driver {
   fn has_pending(&self) -> bool;
 }
 
-/// Builds the OS driver for this platform, probing and falling back as D-9 says.
-#[cfg(target_os = "linux")]
-pub fn os_driver(ring_entries: u32) -> Result<(Box<dyn Driver>, Vec<String>), RtError> {
-  let mut notes = Vec::new();
-  match crate::uring::UringDriver::new(ring_entries) {
-    Ok(driver) => {
-      notes.extend(driver.notes().iter().cloned());
-      Ok((Box::new(driver), notes))
-    }
-    Err(e) => {
-      notes.push(format!("io_uring = unavailable({e}); using epoll"));
-      Ok((Box::new(crate::epoll::EpollDriver::new()?), notes))
-    }
+/// What builds a driver on the shard's thread: a closure the runtime prepared with the OS
+/// resources the kick needs (created up front, so the kick is known before the thread exists).
+pub type DriverSeed = Box<dyn FnOnce() -> Result<Box<dyn Driver>, RtError> + Send>;
+
+/// A prepared driver: the seed, the kick it will answer to, and the notes of the probe.
+pub struct Prepared {
+  /// Builds the driver on the shard's thread.
+  pub seed: DriverSeed,
+  /// The kick that wakes it.
+  pub kick: Kick,
+  /// Which driver and which flags the probe settled on.
+  pub notes: Vec<String>,
+}
+
+impl std::fmt::Debug for Prepared {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Prepared")
+      .field("notes", &self.notes)
+      .finish()
   }
 }
 
-/// Builds the OS driver for this platform.
-#[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub fn os_driver(_ring_entries: u32) -> Result<(Box<dyn Driver>, Vec<String>), RtError> {
-  Ok((Box::new(crate::kqueue::KqueueDriver::new()?), Vec::new()))
+/// Prepares the OS driver for this platform, probing and falling back as D-9 says.
+#[cfg(target_os = "linux")]
+pub fn os_driver(ring_entries: u32) -> Result<Prepared, RtError> {
+  let efd = crate::uring::prepare_eventfd()?;
+  let mut notes = Vec::new();
+  let uring = crate::uring::probe(ring_entries, &mut notes);
+  let seed: DriverSeed = if uring {
+    Box::new(move || {
+      Ok(Box::new(crate::uring::UringDriver::with_eventfd(efd, ring_entries)?) as Box<dyn Driver>)
+    })
+  } else {
+    Box::new(move || Ok(Box::new(crate::epoll::EpollDriver::with_eventfd(efd)?) as Box<dyn Driver>))
+  };
+  Ok(Prepared {
+    seed,
+    kick: Kick::Eventfd(efd),
+    notes,
+  })
 }
 
-/// Builds the OS driver for this platform.
+/// Prepares the OS driver for this platform.
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+pub fn os_driver(_ring_entries: u32) -> Result<Prepared, RtError> {
+  let kq = crate::kqueue::prepare()?;
+  Ok(Prepared {
+    seed: Box::new(move || {
+      Ok(Box::new(crate::kqueue::KqueueDriver::from_prepared(kq)) as Box<dyn Driver>)
+    }),
+    kick: Kick::Kqueue(kq),
+    notes: Vec::new(),
+  })
+}
+
+/// Prepares the OS driver for this platform.
 #[cfg(target_os = "windows")]
-pub fn os_driver(_ring_entries: u32) -> Result<(Box<dyn Driver>, Vec<String>), RtError> {
-  Ok((Box::new(crate::iocp::IocpDriver::new()?), Vec::new()))
+pub fn os_driver(_ring_entries: u32) -> Result<Prepared, RtError> {
+  let port = crate::iocp::prepare()?;
+  Ok(Prepared {
+    seed: Box::new(move || {
+      Ok(Box::new(crate::iocp::IocpDriver::from_prepared(port)) as Box<dyn Driver>)
+    }),
+    kick: Kick::Iocp(port),
+    notes: Vec::new(),
+  })
 }
 
 /// Monotonic nanoseconds since `epoch`, saturating.
@@ -166,13 +187,25 @@ pub fn nanos_since(epoch: std::time::Instant) -> u64 {
   u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// A rustix refusal as the driver's typed error.
+#[cfg(unix)]
+pub(crate) fn refused(call: &'static str, e: rustix::io::Errno) -> RtError {
+  RtError::DriverRefused {
+    call,
+    code: Some(e.raw_os_error()),
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
 
   #[test]
+  #[cfg_attr(miri, ignore)]
   fn the_os_driver_wakes_on_a_kick_and_delivers_a_nop() {
-    let (mut driver, notes) = os_driver(64).unwrap();
+    let prepared = os_driver(64).unwrap();
+    let notes = prepared.notes.clone();
+    let mut driver = (prepared.seed)().unwrap();
     eprintln!("driver {} notes {notes:?}", driver.kind().name());
     let kick = driver.kick_handle();
     let mut out = Vec::new();

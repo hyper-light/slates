@@ -70,10 +70,15 @@ mod tests {
   use super::*;
 
   fn page() -> usize {
+    if cfg!(miri) {
+      // Miri cannot call sysctl; a common base page is enough for the arithmetic under test.
+      return 4096;
+    }
     usize::try_from(slates_machine::facts::Facts::query().page.base).unwrap()
   }
 
   #[test]
+  #[cfg_attr(miri, ignore)] // mlock is not modelled by Miri
   fn regions_lock_in_priority_order_within_capacity_and_report_the_rest() {
     let p = page();
     let mut chunks = Region::map(p * 8, p, false).unwrap();

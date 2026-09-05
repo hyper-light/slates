@@ -3,17 +3,16 @@
 //! ring wiring both share with the simulation (§4.3).
 
 use std::future::Future;
-use std::ptr::NonNull;
 use std::thread::JoinHandle;
 
 use slates_machine::{Derived, MachineProfile, derived};
 use slates_mem::SpscRing;
 
-use crate::driver::{Driver, os_driver};
+use crate::control::Control;
+use crate::driver::{DriverSeed, Kick, os_driver};
 use crate::error::RtError;
-use crate::msg::Msg;
 use crate::registry;
-use crate::shard::{Counters, ShardContext, ShardId, TaskId};
+use crate::shard::{Counters, ShardContext, ShardId, ShardSeed, TaskId};
 use crate::task::SpawnRequest;
 
 /// The runtime's configuration; every number is derived or measured by the caller.
@@ -172,21 +171,19 @@ pub fn admission_limit(requests_per_second: u64, p99_service_ns: u64) -> Derived
   )
 }
 
-/// Wires the single-producer rings between every ordered pair of shards; rings are leaked for
+/// Wires the single-producer rings between every ordered pair of seeds; rings are leaked for
 /// the process (bounded by shards²).
-pub(crate) fn connect_pairs(shards: &mut [Box<ShardContext>], ids: &[u16]) -> Result<(), RtError> {
-  let entries = shards
-    .first()
-    .map_or(1, |s| s.with_inner(|i| i.ring_entries()).unwrap_or(1));
-  for a in 0..shards.len() {
-    for b in 0..shards.len() {
+pub(crate) fn connect_pairs(seeds: &mut [ShardSeed]) -> Result<(), RtError> {
+  let entries = seeds.first().map_or(1, |s| s.config.ring_entries);
+  let ids: Vec<u16> = seeds.iter().map(|s| s.id).collect();
+  for a in 0..seeds.len() {
+    for b in 0..seeds.len() {
       if a == b {
         continue;
       }
-      let ring: NonNull<SpscRing<u64>> =
-        NonNull::from(Box::leak(Box::new(SpscRing::new(entries)?)));
-      shards[a].set_outbound(ids[b], ring);
-      shards[b].set_inbound(ids[a], ring);
+      let ring: &'static SpscRing = Box::leak(Box::new(SpscRing::new(entries)?));
+      seeds[a].set_outbound(ids[b], ring);
+      seeds[b].set_inbound(ring);
     }
   }
   Ok(())
@@ -210,31 +207,31 @@ impl std::fmt::Debug for Runtime {
 impl Runtime {
   /// Starts `config.shards` shard threads on the OS drivers.
   pub fn start(config: &RuntimeConfig) -> Result<Runtime, RtError> {
-    let mut contexts = Vec::new();
-    let mut ids = Vec::new();
+    let mut seeds = Vec::new();
     let mut notes = Vec::new();
     for _ in 0..config.shards {
-      let (driver, driver_notes) =
-        os_driver(u32::try_from(config.ring_entries).unwrap_or(u32::MAX))?;
-      notes.extend(driver_notes);
-      let ctx = ShardContext::new(config, driver)?;
-      ids.push(ctx.id);
-      contexts.push(ctx);
+      let prepared = os_driver(u32::try_from(config.ring_entries).unwrap_or(u32::MAX))?;
+      notes.extend(prepared.notes);
+      seeds.push(ShardSeed::register(config, prepared.seed, prepared.kick)?);
     }
-    connect_pairs(&mut contexts, &ids)?;
+    connect_pairs(&mut seeds)?;
+    let ids: Vec<ShardId> = seeds.iter().map(|s| ShardId(s.id)).collect();
     let mut threads = Vec::new();
-    for (index, ctx) in contexts.into_iter().enumerate() {
+    for (index, seed) in seeds.into_iter().enumerate() {
       let core = if config.pin {
         config.cores.get(index).copied()
       } else {
         None
       };
       let thread = std::thread::Builder::new()
-        .name(format!("slates-shard-{}", ctx.id))
+        .name(format!("slates-shard-{}", seed.id))
         .spawn(move || {
           if let Some(core) = core {
             let _ = slates_machine::probes::pin_current_thread(core);
           }
+          let Ok(ctx) = ShardContext::build(seed) else {
+            return Counters::default();
+          };
           ctx.run();
           ctx.counters()
         })
@@ -246,7 +243,7 @@ impl Runtime {
     }
     Ok(Runtime {
       threads,
-      ids: ids.into_iter().map(ShardId).collect(),
+      ids,
       notes,
     })
   }
@@ -261,26 +258,31 @@ impl Runtime {
     &self.notes
   }
 
-  /// Spawns a detached task on a shard from any thread.
-  pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(&self, shard: ShardId, future: F) {
+  /// Spawns a detached task on a shard from any thread; refused when the shard's control
+  /// channel is full (its admission limit) or the shard is gone.
+  pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(
+    &self,
+    shard: ShardId,
+    future: F,
+  ) -> Result<(), RtError> {
     let request = Box::new(SpawnRequest::new(Box::pin(future), None));
-    registry::send_foreign(shard.0, Msg::Spawn(request).into_word());
+    registry::send_control(shard.0, Control::Spawn(request))
   }
 
   /// Tells a shard whether a client is active, which enables the idle spin before parking.
-  pub fn set_active(&self, shard: ShardId, active: bool) {
-    registry::send_foreign(shard.0, Msg::Active(active).into_word());
+  pub fn set_active(&self, shard: ShardId, active: bool) -> Result<(), RtError> {
+    registry::send_control(shard.0, Control::Active(active))
   }
 
   /// Requests a task's cancellation from any thread.
-  pub fn cancel(&self, task: TaskId) {
-    registry::send_foreign(task.0.shard(), Msg::Cancel(task.0).into_word());
+  pub fn cancel(&self, task: TaskId) -> Result<(), RtError> {
+    registry::send_control(task.0.shard(), Control::Cancel(task.0))
   }
 
   /// Shuts every shard down (cancelling what runs) and joins the threads; returns the counters.
   pub fn shutdown(self) -> Vec<Counters> {
     for id in &self.ids {
-      registry::send_foreign(id.0, Msg::Shutdown.into_word());
+      let _ = registry::send_control(id.0, Control::Shutdown);
     }
     self
       .threads
@@ -292,7 +294,7 @@ impl Runtime {
 
 /// One shard on the calling thread with the OS driver (tests, benches, the CLI's own work).
 pub struct LocalRuntime {
-  ctx: Box<ShardContext>,
+  ctx: &'static ShardContext,
   notes: Vec<String>,
 }
 
@@ -307,20 +309,21 @@ impl std::fmt::Debug for LocalRuntime {
 impl LocalRuntime {
   /// Builds the shard.
   pub fn new(config: &RuntimeConfig) -> Result<LocalRuntime, RtError> {
-    let (driver, notes) = os_driver(u32::try_from(config.ring_entries).unwrap_or(u32::MAX))?;
+    let prepared = os_driver(u32::try_from(config.ring_entries).unwrap_or(u32::MAX))?;
     Ok(LocalRuntime {
-      ctx: ShardContext::new(config, driver)?,
-      notes,
+      ctx: ShardContext::build(ShardSeed::register(config, prepared.seed, prepared.kick)?)?,
+      notes: prepared.notes,
     })
   }
 
   /// Builds the shard over a given driver (the simulation, or a test double).
   pub fn with_driver(
     config: &RuntimeConfig,
-    driver: Box<dyn Driver>,
+    driver: DriverSeed,
+    kick: Kick,
   ) -> Result<LocalRuntime, RtError> {
     Ok(LocalRuntime {
-      ctx: ShardContext::new(config, driver)?,
+      ctx: ShardContext::build(ShardSeed::register(config, driver, kick)?)?,
       notes: Vec::new(),
     })
   }
@@ -346,7 +349,7 @@ impl LocalRuntime {
   }
 
   /// The shard's context, for counters and joins.
-  pub fn context(&self) -> &ShardContext {
-    &self.ctx
+  pub fn context(&self) -> &'static ShardContext {
+    self.ctx
   }
 }

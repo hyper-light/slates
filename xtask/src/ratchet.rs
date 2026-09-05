@@ -43,11 +43,16 @@ struct Row {
   lower: u64,
   median: u64,
   upper: u64,
+  /// False for `ratchet-info` rows: printed, never gated (their cost depends on thread
+  /// placement the OS refused to control).
+  gated: bool,
 }
 
 /// One row across the runs.
 #[derive(Clone, Debug)]
 struct Across {
+  /// Whether the row is gated.
+  gated: bool,
   /// The lowest lower edge of any run.
   min_lower: u64,
   /// The run medians, in run order.
@@ -148,6 +153,10 @@ pub(crate) fn run(root: &Path, flags: Flags) -> Result<(), Failure> {
   for (key, a) in &across {
     let ceiling = entry.ceilings.get(key).copied();
     let verdict = match ceiling {
+      _ if !a.gated => {
+        entry.ceilings.remove(key);
+        "informational (thread placement not controllable here)"
+      }
       None if writing => {
         entry.ceilings.insert(key.clone(), a.max_upper);
         recorded += 1;
@@ -245,6 +254,7 @@ fn measure_all(root: &Path, runs: usize) -> Result<BTreeMap<String, Across>, Fai
           row.median, row.lower, row.upper
         );
         let a = across.entry(key).or_insert(Across {
+          gated: row.gated,
           min_lower: u64::MAX,
           medians: Vec::new(),
           max_upper: 0,
@@ -262,9 +272,11 @@ fn parse(stdout: &str) -> BTreeMap<String, Row> {
   let mut rows = BTreeMap::new();
   for line in stdout.lines() {
     let mut parts = line.split('\t');
-    if parts.next() != Some("ratchet") {
-      continue;
-    }
+    let gated = match parts.next() {
+      Some("ratchet") => true,
+      Some("ratchet-info") => false,
+      _ => continue,
+    };
     let (Some(key), Some(lower), Some(median), Some(upper)) =
       (parts.next(), parts.next(), parts.next(), parts.next())
     else {
@@ -277,6 +289,7 @@ fn parse(stdout: &str) -> BTreeMap<String, Row> {
           lower,
           median,
           upper,
+          gated,
         },
       );
     }

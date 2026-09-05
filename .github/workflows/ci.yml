@@ -64,7 +64,26 @@ jobs:
               --no-default-features --features slates-machine/pure-hash --target "$target" -- -D warnings
           done
 
-  # AC-0.7: Miri on the unit tests of the crates that hold unsafe code. Miri ships only with the
+  # D-20: instruction-count gates. callgrind counts are deterministic for a given binary, so
+  # they see the one-percent change the wall clock cannot. valgrind is non-Rust tooling, admitted
+  # for this lane by explicit authorization (2026-09-05); the runner version must equal the crate's.
+  callgrind:
+    name: instruction counts (iai-callgrind)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: valgrind
+        run: sudo apt-get update && sudo apt-get install -y valgrind
+      - name: iai-callgrind-runner (the version pinned in Cargo.toml)
+        run: cargo install iai-callgrind-runner --version 0.16.1 --locked
+      - name: Benches
+        run: cargo bench --workspace --bench callgrind
+
+ on the unit tests of the crates that hold unsafe code. Miri ships only with the
   # nightly toolchain, which CI installs for this job alone; the pinned stable toolchain builds
   # everything else. loom runs under stable with `--cfg loom`.
   miri-and-loom:
@@ -81,8 +100,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      - name: Miri
+      - name: Miri (memory and wire: leak check on)
         run: cargo +nightly miri test -p slates-mem -p slates-wire --lib
+      # The runtime leaks its shard contexts, rings and registry entries on purpose (they live
+      # for the process; the leak is what makes every reference to them a plain `&'static`), so
+      # Miri's leak check is off for it; every other check stays on. The OS-driver tests are
+      # marked ignored under Miri, which cannot model kqueue or eventfd.
+      - name: Miri (runtime: simulation tests, intentional leaks ignored)
+        run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib --test differential
 
   windows-nightly:
     name: windows (nightly cadence)
