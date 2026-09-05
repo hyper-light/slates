@@ -654,6 +654,61 @@ bound is the longest start measured in this anchor's life until a histogram of s
 the Windows console handler, job object and section-and-Event paths are lint-checked from this
 machine and run first in the Windows lane.
 
+Task 6 (the provisioning histogram, exactly-once as a durable atom, admission and the wake
+strategy) landed 2026-09-05. `crates/client/examples/provision_bench.rs` (R9, AC-2.1, T-2.6):
+a volume created from the Rust client through the real rendezvous and rings against an
+in-process daemon, sampled p50/p99/p999/max in a spinning form (the client spins for the 50 us
+floor, so the reply lands without a wake when the daemon meets it) and a parked form (paced
+past the shard's park, so each pays the doorbell and two wakes), at 1, 8 and 64 concurrent
+clients. The 50 us floor is gated on the single-client spinning p99 (the latency claim); every
+runnable concurrency's rows are recorded so the ratchet catches regressions; a run with more
+client threads than the machine has cores past its shards is informational (it measures the
+scheduler, not the path). Baselines (Apple M5 Max, macOS 26.4.1, best-of-3, all shown): one
+client p50 9 us / p99 25 us / p999 31 us against the floor; eight clients p99 34-45 us;
+sixty-four (oversubscribing thirteen runnable cores) p99 about 2 ms, not gated; the parked form
+p99 about 250 us; a status round trip p99 about 9 us. The ratchet holds 102 rows.
+
+Exactly-once became a durable atom: a verb's effects and its completion record now go into one
+log record (`Db::begin` opens a transaction over the partition, `mutate` inside it applies and
+queues, `commit` writes one `LogEntry` of every queued operation, a full log snapshots
+instead), so `kill -9` between the effect and the record can no longer leave one without the
+other (AC-2.3). A forwarded verb records its completion at its owner partition, and the reply
+travels back already recorded; an acknowledgement is a scatter over every partition that may
+hold the client's records; the client acknowledges on its own every half ring of replies, so
+the daemon's retained records stay bounded without the caller (§4.9).
+
+Admission and backpressure (AC-2.6): `clients_per_shard` is the client share of the shard's
+reserve over a region's bytes (not the request rate, which sizes only what one client holds in
+flight); the task arena and control channel are sized from that times the cross-shard traffic
+per client plus the shard's own loops; a connect past the daemon-wide bound is refused
+`TooManyClients`; a full owner-shard control channel makes a forward wait in the bounded
+`pending_forwards` (retried each round) and, past the clients' credit, refuses
+`Overloaded{shard}` without starting the verb. The daemon raises its descriptor soft limit to
+the hard one at start (no privilege). A daemon-wide `slates status` (a scatter-gather like
+`list`) reports each shard's counters and the health signals of 4.14 and the anchor's view.
+
+The wake strategy was completed (4.7): a runtime shard sets a parked flag before it waits and
+re-checks its inbox, and a sender kicks only a parked shard, so a message to a spinning shard
+costs no syscall (the flag and the message are sequentially consistent, so a lost wake needs
+both to miss, which the total order forbids); the server loop keeps polling for a derived idle
+window after its last work, so an active client's next request never pays a wake; the client
+can spin for a latency floor of its own (`Client::spin_for`).
+
+Found under the histogram: (1) the create verb's completion record and its effect were two log
+records, a `kill -9` between them a durability hole, closed by the transaction; (2) a shared
+object whose name exceeded the macOS 31-character limit was truncated, so two clients' regions
+could collapse onto one object under the bench's long names, now hashed when they would not fit
+(`crates/mem/src/shared.rs`); (3) `status` and `detach` walked the whole partition
+(`to_snapshot`) to count a volume's attachments, replaced by `attachments_of`; (4) a burst of
+concurrent connects exhausted the bootstrap object's claim slots, so the client retries the
+rendezvous on `RingFull` as on `DaemonUnavailable`.
+
+Owed from task 6: the histogram runs on the reference machines in CI (this baseline is the
+laptop's); the write-tracer hermeticity assertion (AC-2.2, T-2.9) and the simulation crash at
+every instruction (AC-2.3's simulation half) arrive with the chaos harness; the cross-uid
+security test (T-2.7) needs a second uid, gated on CI (the rendezvous refuses and counts it
+now); a completion fd for parked SDK event loops is Phase 5.
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3

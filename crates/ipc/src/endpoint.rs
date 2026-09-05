@@ -39,6 +39,9 @@ pub struct ClientEnd {
   region: ClientRegion,
   doorbell: Option<crate::rendezvous::Doorbell>,
   liveness: Option<crate::rendezvous::Liveness>,
+  /// A spin window the caller chose over the daemon's published one (a caller that wants
+  /// the reply without a wake spins for its own latency floor).
+  spin_override_ns: Option<u64>,
   next_request: u64,
   next_reply: u64,
   /// Wakes the client had to park for (the spin-to-park ratio's numerator).
@@ -63,6 +66,7 @@ impl ClientEnd {
       region,
       doorbell: None,
       liveness: None,
+      spin_override_ns: None,
       next_request: 0,
       next_reply: 0,
       parks: 0,
@@ -100,6 +104,11 @@ impl ClientEnd {
   /// The region, mutably (the bulk area).
   pub fn region_mut(&mut self) -> &mut ClientRegion {
     &mut self.region
+  }
+
+  /// Chooses the spin window (`None`: the daemon's published one, the measured wake cost).
+  pub fn set_spin_ns(&mut self, spin_ns: Option<u64>) {
+    self.spin_override_ns = spin_ns;
   }
 
   /// Parks so far and replies so far (the measured spin-to-park ratio).
@@ -149,7 +158,9 @@ impl ClientEnd {
   /// arrives or `deadline_ns` (from the call) passes.
   pub fn wait(&mut self, deadline_ns: Option<u64>) -> Result<Reply, IpcError> {
     let started = Instant::now();
-    let spin_ns = u64::from(self.region.spin_ns());
+    let spin_ns = self
+      .spin_override_ns
+      .unwrap_or_else(|| u64::from(self.region.spin_ns()));
     loop {
       if let Some(reply) = self.try_take()? {
         return Ok(reply);

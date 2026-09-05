@@ -131,7 +131,7 @@ fn snapshot_clone_stat(instance: &str, id: &str) {
   assert_eq!(value_of(&out, "snapshots"), "1");
 }
 
-/// attach for writing, status with and without --drift, detach.
+/// attach for writing, the volume's status, detach.
 fn attach_status_detach(instance: &str, id: &str) {
   let (code, out, _) = run(instance, &["attach", id, "--write"]);
   assert_eq!(code, 0);
@@ -145,6 +145,15 @@ fn attach_status_detach(instance: &str, id: &str) {
   assert!(out.is_empty(), "a scratch volume drifts nowhere: {out:?}");
   let (code, _, _) = run(instance, &["detach", &attachment]);
   assert_eq!(code, 0);
+}
+
+/// The daemon's own status: the daemon's lines and one block per shard.
+fn daemon_status(instance: &str) {
+  let (code, out, err) = run(instance, &["status"]);
+  assert_eq!(code, 0, "{err}");
+  assert_eq!(value_of(&out, "shards"), SHARDS);
+  assert!(out.contains("shard 0: clients="), "{out}");
+  assert!(out.contains("shard 1 catalog.volumes: "), "{out}");
 }
 
 /// resize and destroy; then the usage refusals (exit 2) and a missing volume (exit 1).
@@ -188,6 +197,7 @@ fn the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_th
   let id = create_and_list(&instance);
   snapshot_clone_stat(&instance, &id);
   attach_status_detach(&instance, &id);
+  daemon_status(&instance);
   resize_destroy_and_refusals(&instance, &id);
   kill_anchor_and_wait_for_the_daemon_to_leave(&instance, anchor);
 }

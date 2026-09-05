@@ -28,8 +28,24 @@ const MEMORY_CLASSES: u64 = 3;
 /// Shape: the share of a shard's metadata reserve the volume tables may take (the rest is the
 /// store's own slabs); ratified in GAPS §5.
 const TABLE_SHARE_PERMILLE: u64 = 250;
+/// Shape: the share of a shard's reserve the client regions may take (their pages are
+/// populated only as bodies need them, so the share bounds the worst case); ratified in GAPS
+/// §5 with the table share.
+const CLIENT_SHARE_PERMILLE: u64 = 250;
 /// Format: parts per thousand.
 const PERMILLE: u64 = 1000;
+/// Shape: tasks a client may need across shards at once: its request forwarded to the owner
+/// and the reply carried back (a synchronous client has one request in flight; an
+/// asynchronous one is bounded by its ring's credit, which the ring's slots cap).
+const TASKS_PER_CLIENT: usize = 2;
+/// Shape: the shard's own perpetual tasks: the server loop, the reap loop, the control loop
+/// and the heartbeat, plus a spare for a shutdown message.
+const LOOP_TASKS_PER_SHARD: usize = 5;
+/// Shape: the idle window as a multiple of the spin window (the measured wake cost): a shard
+/// keeps polling this long after its last work, so a client that pauses to think between
+/// requests finds it awake; ratified in GAPS §5 until the spin-to-park ratio is measured
+/// against the histogram's parked form.
+pub const IDLE_WINDOW_RATIO: u64 = 100;
 /// Shape: the divisor between a shard's reserve and one table's slots: the reserve is split
 /// among the inode table, the directory table and content (three classes, §4.2), and each
 /// table keeps half of its class for growth headroom.
@@ -70,7 +86,8 @@ pub struct DaemonConfig {
   pub caps: PartitionCaps,
   /// The client region's geometry.
   pub region: RegionGeometry,
-  /// Derived: clients per shard, the admission limit.
+  /// Derived: clients per shard, the admission limit (AC-2.6): what the client share of the
+  /// reserve holds in regions.
   pub clients_per_shard: usize,
   /// Derived: the shard's reserve in bytes.
   pub reserve_per_shard: u64,
@@ -102,8 +119,8 @@ impl DaemonConfig {
     let mut derivations = Vec::new();
     let d = profile.derived();
     let admission = admission_limit(ASSUMED_REQUESTS_PER_SECOND, ASSUMED_SERVICE_P99_NS);
-    derivations.push(note("clients_per_shard", &admission));
-    let runtime =
+    derivations.push(note("requests_in_flight_per_shard", &admission));
+    let mut runtime =
       RuntimeConfig::from_profile(profile, admission.get(), admission.get(), LATENCY_BUDGET_NS);
     let shards = u64::from(runtime.shards.max(1));
     let reserve = region_bytes(profile.lock.bytes, shards, MEMORY_CLASSES);
@@ -221,12 +238,52 @@ impl DaemonConfig {
         .saturating_mul(BULK_CHUNK_BYTES),
       page,
     };
+    let region_bytes = u64::try_from(region.total_bytes())
+      .unwrap_or(u64::MAX)
+      .max(1);
+    let clients: Derived<usize> = derived!(
+      usize::try_from(
+        reserve.get().saturating_mul(CLIENT_SHARE_PERMILLE) / PERMILLE / region_bytes
+      )
+      .unwrap_or(usize::MAX)
+      .max(1),
+      "reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / region_bytes",
+      ["reserve_per_shard", "region_bytes"]
+    );
+    derivations.push(note("clients_per_shard", &clients));
+    // The task arena and the control channel hold the cross-shard traffic of the clients:
+    // one task per forwarded request at its owner and one for its reply at the origin, and
+    // the shard's own loops; the admission value above sizes only what one client may hold
+    // in flight.
+    let tasks: Derived<usize> = derived!(
+      clients
+        .get()
+        .saturating_mul(TASKS_PER_CLIENT)
+        .saturating_add(LOOP_TASKS_PER_SHARD),
+      "clients_per_shard × TASKS_PER_CLIENT + LOOP_TASKS_PER_SHARD",
+      ["clients_per_shard"]
+    );
+    derivations.push(note("tasks_per_shard", &tasks));
+    runtime.tasks_per_shard = tasks.get();
+    runtime.timers_per_shard = tasks.get();
+    // The shard polls for the idle window after its last work before parking (§4.7 "Shards
+    // poll rings while any client has activity within the measured idle window"), so a
+    // request from an active client, or a forward from another shard, never pays a wake.
+    let idle_window: Derived<u64> = derived!(
+      d.spin_before_park_ns
+        .get()
+        .saturating_mul(IDLE_WINDOW_RATIO),
+      "spin_before_park_ns × IDLE_WINDOW_RATIO",
+      ["wake.p99_ns", "IDLE_WINDOW_RATIO"]
+    );
+    derivations.push(note("idle_window_ns", &idle_window));
+    runtime.spin_ns = idle_window.get();
     DaemonConfig {
       runtime,
       geometry,
       caps,
       region,
-      clients_per_shard: admission.get(),
+      clients_per_shard: clients.get(),
       reserve_per_shard: reserve.get(),
       large_class_bytes: d.arena_region_bytes.get(),
       store,

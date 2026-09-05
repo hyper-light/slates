@@ -377,3 +377,22 @@ suites themselves are the facts of the day: `cargo test -p slates-client --test 
 for two daemons and a restart; `cargo test -p slates-cli --test cli` 1.2 s for a real anchor,
 a real daemon, fourteen verbs through the binary, and the daemon leaving after the anchor is
 killed (Apple M5 Max, macOS 26.4.1). The provisioning histogram (AC-2.1, T-2.6) is task 6's.
+
+The Phase 2 task 6 run (2026-09-05, `cargo xtask ratchet`, Apple M5 Max, macOS 26.4.1, 18
+cores, best-of-3 with all three shown by the tool) added the provisioning histogram
+(`provision.*`) and raised the row count to 102. Provisioning is measured from the Rust client
+through the real rendezvous and rings against an in-process daemon:
+
+| Row (spinning, 1 client) | p50 | p99 | p999 |
+|---|---|---|---|
+| provision.spinning_1 | ~9 us | ~25 us | ~31 us |
+
+The 50 us floor (R9, AC-2.1) is gated on that single-client p99. Eight clients spinning measure
+p99 34-45 us (recorded, ratcheted); sixty-four oversubscribe the laptop's runnable cores
+(thirteen, past five shards) and are informational at p99 ~2 ms; the parked form is p99 ~250 us,
+reported separately as AC-2.1 asks. A status round trip (the ring plus the completion record) is
+p99 ~9 us. Recovery held at ~92 ms for 10^4 volumes from 10^6 records against the 1 s budget
+after the log record became a `LogEntry` (a verb's effects and its completion in one record).
+One ceiling was raised with a dated reason (vfs.create_burst 1082 -> 1091: a loaded back-to-back
+ratchet run drifted the row 0.2% over its ceiling; three isolated runs measured 1077-1091 ns on
+code untouched since Phase 1).

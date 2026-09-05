@@ -1,6 +1,8 @@
 //! The client verbs: one connection, one request, the reply printed in a stable plain form.
 
-use slates_client::{Client, ClientError, CreateSpec, Deadlines, StatusReport, VolumeSummary};
+use slates_client::{
+  Client, ClientError, CreateSpec, DaemonReport, Deadlines, StatusReport, VolumeSummary,
+};
 use slates_db::replay::RECOVERY_BUDGET_NS;
 use slates_server::daemon::LIVENESS_BUDGET_NS;
 
@@ -52,6 +54,9 @@ fn serve(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
       for volume in client.list()? {
         println!("{}", summary_line(&volume));
       }
+    }
+    Verb::DaemonStatus => {
+      print!("{}", daemon_status_text(&client.daemon_status()?));
     }
     Verb::Status { volume, drift } => {
       let report = client.status(*volume)?;
@@ -152,6 +157,47 @@ fn status_text(report: &StatusReport) -> String {
     report.watcher,
     report.drifted.len()
   )
+}
+
+/// The daemon's status: the daemon's lines, then one block per shard.
+fn daemon_status_text(report: &DaemonReport) -> String {
+  let mut out = format!(
+    "pid: {}\ngeneration: {}\nrestarts: {}\nheartbeat_age_ns: {}\nclients_reaped: {}\nclients_refused: {}\nshards: {}\n",
+    report.pid,
+    report.generation,
+    report.restarts,
+    report.heartbeat_age_ns,
+    report.clients_reaped,
+    report.clients_refused,
+    report.shards.len()
+  );
+  for shard in &report.shards {
+    out.push_str(&format!(
+      "shard {}: clients={} volumes={} served={} replayed={} replay_ns={} torn={} reserve={} committed={}\n",
+      shard.partition,
+      shard.clients,
+      shard.volumes,
+      shard.served,
+      shard.replayed_records,
+      shard.replay_ns,
+      shard.torn_tail,
+      shard.reserve_bytes,
+      shard.committed_bytes
+    ));
+    for refusal in &shard.refusals {
+      out.push_str(&format!(
+        "shard {} refused {}: {}\n",
+        shard.partition, refusal.kind, refusal.count
+      ));
+    }
+    for signal in &shard.signals {
+      out.push_str(&format!(
+        "shard {} {}: {} (age {} ns)\n",
+        shard.partition, signal.name, signal.value, signal.freshness_ns
+      ));
+    }
+  }
+  out
 }
 
 /// `slates profile`: the machine profile, as its derived constants or as JSON.

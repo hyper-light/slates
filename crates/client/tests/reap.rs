@@ -11,7 +11,9 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use slates_client::{Client, Deadlines, Intent, NamePolicy, Session, SizeClass, VolumeId};
+use slates_client::{
+  Client, ClientError, Deadlines, Intent, NamePolicy, Session, SizeClass, VolumeId,
+};
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::daemon::{CLIENTS_REAPED, LIVENESS_BUDGET_NS};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -72,6 +74,25 @@ fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
   while !condition() {
     assert!(started.elapsed() < WAIT, "{what}");
     pause();
+  }
+}
+
+/// Resumes a session under `client_id`, retrying the rendezvous while the daemon settles.
+fn resume_when_free(instance: &str, client_id: u32) -> Result<Client, ClientError> {
+  let session = Session {
+    client_id,
+    next_sequence: 1,
+  };
+  let started = Instant::now();
+  loop {
+    match Client::resume(instance, session, deadlines()) {
+      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
+        if started.elapsed() < WAIT =>
+      {
+        pause();
+      }
+      other => return other,
+    }
   }
 }
 
@@ -159,15 +180,7 @@ fn a_killed_client_is_reclaimed_and_its_lease_expires_by_its_term() {
     "one client reaped"
   );
   // The id is free again: a session under it resumes instead of being refused.
-  let resumed = Client::resume(
-    &instance,
-    Session {
-      client_id: victim_id,
-      next_sequence: 1,
-    },
-    deadlines(),
-  );
-  assert!(resumed.is_ok(), "{resumed:?}");
+  assert!(resume_when_free(&instance, victim_id).is_ok());
   // The lease expires by its term, with nobody asking.
   wait_until("the lease expires", || {
     observer.status(volume).unwrap().lease_epoch.is_none()

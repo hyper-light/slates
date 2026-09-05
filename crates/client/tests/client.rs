@@ -137,6 +137,27 @@ fn the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed() {
   client.destroy(id).unwrap();
   wait_until_listed(&mut client, &["one-clone"]);
   client.acknowledge_all().unwrap();
+  let report = client.daemon_status().unwrap();
+  assert_eq!(report.pid, std::process::id(), "the daemon is this process");
+  assert_eq!(report.shards.len(), usize::from(TEST_SHARDS));
+  assert_eq!(
+    report.shards.iter().map(|s| s.clients).sum::<u32>(),
+    1,
+    "one live client"
+  );
+  assert!(
+    report.shards.iter().map(|s| s.served).sum::<u64>() >= 10,
+    "the calls were served"
+  );
+  assert!(
+    report
+      .shards
+      .iter()
+      .flat_map(|s| s.refusals.iter())
+      .any(|r| r.kind == "already_exists" && r.count == 1),
+    "the duplicate was counted: {:?}",
+    report.shards
+  );
   assert_eq!(client.reconnects(), 0, "nothing made the client reconnect");
   let (parks, replies) = client.park_ratio();
   assert!(replies >= 10, "every call was a reply: {replies}");

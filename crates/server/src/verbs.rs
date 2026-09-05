@@ -14,8 +14,8 @@ use slates_db::catalog::{
   VolumeRecord, VolumeState,
 };
 use slates_ipc::protocol::{
-  Direction, Intent, NamePolicy, Refusal, ReplyBody, RequestBody, SizeClass, SnapshotId,
-  StatusReport, VolumeId, VolumeSummary, pack, unpack,
+  DaemonReport, Direction, Intent, NamePolicy, Refusal, RefusalCount, ReplyBody, RequestBody,
+  ShardReport, Signal, SizeClass, SnapshotId, StatusReport, VolumeId, VolumeSummary, pack, unpack,
 };
 use slates_ipc::slot::SlotKind;
 use slates_ipc::{IpcError, Request};
@@ -33,7 +33,7 @@ use slates_wire::Wire;
 use slates_wire::request::{RequestId, Seen};
 
 use crate::error::{refusal_of_db, refusal_of_vfs};
-use crate::state::{ClientSlot, ShardState, VolumeSlot};
+use crate::state::{ClientSlot, Deferred, PendingForward, ShardState, VolumeSlot};
 
 /// Shape: the share of a volume's quota its journal may take, parts per thousand (ratified
 /// GAPS §5: the op log of a bounded volume stays a small fraction of its bytes).
@@ -179,6 +179,7 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     RequestBody::Create { .. }
     | RequestBody::Detach { .. }
     | RequestBody::List
+    | RequestBody::DaemonStatus
     | RequestBody::Acknowledge { .. }
     | RequestBody::Grant { .. } => None,
   }
@@ -231,6 +232,12 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   if let RequestBody::List = body {
     return scatter_list(state, client.index(), request.request, principal);
   }
+  if let RequestBody::DaemonStatus = body {
+    return scatter_status(state, client.index(), request.request);
+  }
+  if let RequestBody::Acknowledge { up_to } = body {
+    return scatter_acknowledge(state, client.index(), request.request, client_id, up_to);
+  }
   let owner = match &body {
     RequestBody::Create { name, .. } => Some(owner_of_name(name, state.shards.len())),
     other => volume_of(other).map(owner_of),
@@ -251,8 +258,45 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       shard,
     );
   }
-  let reply = dispatch(state, client_id, &principal, body);
-  Served::Reply(record_completion(state, id, reply))
+  Served::Reply(run_recorded(state, id, client_id, &principal, body))
+}
+
+/// Runs a verb on this shard with its effects and its completion record in one durable step
+/// (`Db::begin` … `commit`: one log record, so a crash leaves both or neither, AC-2.3).
+fn run_recorded(
+  state: &mut ShardState,
+  id: RequestId,
+  client_id: u32,
+  principal: &Principal,
+  body: RequestBody,
+) -> ReplyBody {
+  state.db.begin();
+  let reply = dispatch(state, client_id, principal, body);
+  let reply = record_completion(state, id, reply);
+  match state.db.commit(&mut state.segment) {
+    Ok(_) => reply,
+    Err(e) => refused(refusal_of_db(&e)),
+  }
+}
+
+/// The owner's side of a forwarded verb: its own completion window first (a retry of a
+/// verb this partition already ran answers from the record), then the verb and its record
+/// in one step.
+fn run_forwarded(
+  state: &mut ShardState,
+  id: RequestId,
+  client_id: u32,
+  principal: &Principal,
+  body: RequestBody,
+) -> ReplyBody {
+  match state.db.partition().completion(id.client, id.sequence) {
+    Seen::Completed(bytes) => {
+      return ReplyBody::from_bytes(&bytes).unwrap_or_else(|_| refused(Refusal::DuplicateRequest));
+    }
+    Seen::Acknowledged => return refused(Refusal::DuplicateRequest),
+    Seen::New => {}
+  }
+  run_recorded(state, id, client_id, principal, body)
 }
 
 /// Records the completion (RIFL) and counts the refusal; the reply is then durable and may be
@@ -287,14 +331,63 @@ fn forward(
   body: RequestBody,
   owner: u16,
 ) -> Served {
-  let origin = state.shard;
+  match send_forward(
+    state.shard,
+    client_index,
+    request,
+    client_id,
+    &principal,
+    &body,
+    owner,
+  ) {
+    Ok(()) => Served::Forwarded,
+    Err(slates_rt::RtError::ControlFull { .. }) => {
+      // Backpressure, never a drop: kept and retried next round; the clients' credit bounds
+      // the queue, and past that bound the request is refused typed and not started.
+      let bound = state
+        .config
+        .clients_per_shard
+        .saturating_mul(usize::try_from(state.config.region.slots).unwrap_or(1));
+      if state.pending_forwards.len() >= bound {
+        return Served::Reply(refused(Refusal::Overloaded { shard: owner }));
+      }
+      state.pending_forwards.push_back(PendingForward {
+        client_index,
+        request,
+        client_id,
+        principal,
+        body,
+        owner,
+      });
+      Served::Forwarded
+    }
+    Err(_) => Served::Reply(refused(Refusal::NotFound)),
+  }
+}
+
+/// Spawns the owner's task for one forward; the reply comes back as a task on `origin`.
+fn send_forward(
+  origin: u16,
+  client_index: u32,
+  request: u64,
+  client_id: u32,
+  principal: &Principal,
+  body: &RequestBody,
+  owner: u16,
+) -> Result<(), slates_rt::RtError> {
+  let principal = principal.clone();
+  let body = body.clone();
   let task = SpawnRequest::new(
     Box::pin(async move {
-      let reply = crate::state::with_state(|s| dispatch(s, client_id, &principal, body))
-        .unwrap_or_else(|| refused(Refusal::NotFound));
+      let id = RequestId::from_word(request);
+      let reply = crate::state::with_state(|s| {
+        s.last_work_ns = s.clock.monotonic_ns();
+        run_forwarded(s, id, client_id, &principal, body)
+      })
+      .unwrap_or_else(|| refused(Refusal::NotFound));
       let back = SpawnRequest::new(
         Box::pin(async move {
-          crate::state::deliver(client_index, request, reply);
+          crate::state::deliver(client_index, request, reply, true);
         }),
         None,
       );
@@ -302,10 +395,39 @@ fn forward(
     }),
     None,
   );
-  match slates_rt::registry::send_control(owner, Control::Spawn(Box::new(task))) {
-    Ok(()) => Served::Forwarded,
-    Err(_) => Served::Reply(refused(Refusal::NotFound)),
+  slates_rt::registry::send_control(owner, Control::Spawn(Box::new(task)))
+}
+
+/// Retries the forwards a full control channel refused; whether any went out.
+fn retry_forwards(state: &mut ShardState) -> bool {
+  let mut any = false;
+  while let Some(pending) = state.pending_forwards.pop_front() {
+    match send_forward(
+      state.shard,
+      pending.client_index,
+      pending.request,
+      pending.client_id,
+      &pending.principal,
+      &pending.body,
+      pending.owner,
+    ) {
+      Ok(()) => any = true,
+      Err(slates_rt::RtError::ControlFull { .. }) => {
+        state.pending_forwards.push_front(pending);
+        break;
+      }
+      Err(_) => {
+        state.deferred.push(Deferred {
+          client_index: pending.client_index,
+          request: pending.request,
+          reply: refused(Refusal::NotFound),
+          recorded: false,
+        });
+        any = true;
+      }
+    }
   }
+  any
 }
 
 /// A listing is a scatter-gather over every shard: each answers with what it owns; the origin
@@ -358,6 +480,240 @@ fn scatter_list(
   Served::Forwarded
 }
 
+/// The daemon's status is a scatter-gather like a listing: every shard reports its part and
+/// the origin assembles the daemon's view (§4.14 `slates.status`).
+fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Served {
+  let others: Vec<u16> = state
+    .shards
+    .iter()
+    .copied()
+    .filter(|s| *s != state.shard)
+    .collect();
+  let mine = shard_report(state);
+  if others.is_empty() {
+    return Served::Reply(daemon_report(state, vec![mine]));
+  }
+  state
+    .status_scatters
+    .insert(request, (client_index, others.len(), vec![mine]));
+  let origin = state.shard;
+  for shard in others {
+    let task = SpawnRequest::new(
+      Box::pin(async move {
+        let part = crate::state::with_state(shard_report);
+        let back = SpawnRequest::new(
+          Box::pin(async move {
+            gather_status(request, part);
+          }),
+          None,
+        );
+        let _ = slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)));
+      }),
+      None,
+    );
+    if slates_rt::registry::send_control(shard, Control::Spawn(Box::new(task))).is_err() {
+      gather_status(request, None);
+    }
+  }
+  Served::Forwarded
+}
+
+/// An acknowledgement releases the client's records on every partition that may hold them
+/// (a forwarded verb's record lives at its owner): a scatter, gathered as a count.
+fn scatter_acknowledge(
+  state: &mut ShardState,
+  client_index: u32,
+  request: u64,
+  client_id: u32,
+  up_to: u32,
+) -> Served {
+  let others: Vec<u16> = state
+    .shards
+    .iter()
+    .copied()
+    .filter(|s| *s != state.shard)
+    .collect();
+  let mine = acknowledge(state, client_id, up_to);
+  if others.is_empty() {
+    return Served::Reply(mine);
+  }
+  state
+    .ack_scatters
+    .insert(request, (client_index, others.len(), mine));
+  let origin = state.shard;
+  for shard in others {
+    let task = SpawnRequest::new(
+      Box::pin(async move {
+        let part = crate::state::with_state(|s| acknowledge(s, client_id, up_to))
+          .unwrap_or_else(|| refused(Refusal::NotFound));
+        let back = SpawnRequest::new(
+          Box::pin(async move {
+            gather_acknowledge(request, part);
+          }),
+          None,
+        );
+        let _ = slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)));
+      }),
+      None,
+    );
+    if slates_rt::registry::send_control(shard, Control::Spawn(Box::new(task))).is_err() {
+      gather_acknowledge(request, refused(Refusal::NotFound));
+    }
+  }
+  Served::Forwarded
+}
+
+/// Gathers one shard's acknowledgement; the last delivers the reply (a refusal anywhere
+/// is the reply, so the client knows records may remain).
+fn gather_acknowledge(request: u64, part: ReplyBody) {
+  let done = crate::state::with_state(|s| {
+    let entry = s.ack_scatters.get_mut(&request)?;
+    if matches!(part, ReplyBody::Refused { .. }) {
+      entry.2 = part;
+    }
+    entry.1 = entry.1.saturating_sub(1);
+    if entry.1 == 0 {
+      s.ack_scatters.remove(&request)
+    } else {
+      None
+    }
+  })
+  .flatten();
+  if let Some((client_index, _, reply)) = done {
+    crate::state::deliver(client_index, request, reply, false);
+  }
+}
+
+/// Gathers one shard's part of a status; the last part delivers the whole.
+fn gather_status(request: u64, part: Option<ShardReport>) {
+  let done = crate::state::with_state(|s| {
+    let entry = s.status_scatters.get_mut(&request)?;
+    entry.2.extend(part);
+    entry.1 = entry.1.saturating_sub(1);
+    if entry.1 == 0 {
+      s.status_scatters.remove(&request)
+    } else {
+      None
+    }
+  })
+  .flatten();
+  if let Some((client_index, _, mut shards)) = done {
+    shards.sort_by_key(|r| r.partition);
+    let reply = crate::state::with_state(|s| daemon_report(s, shards))
+      .unwrap_or_else(|| refused(Refusal::NotFound));
+    crate::state::deliver(client_index, request, reply, false);
+  }
+}
+
+/// This shard's part of the status: its counters and its health signals (§4.14 catalog).
+pub fn shard_report(state: &mut ShardState) -> ShardReport {
+  let now = state.clock.monotonic_ns();
+  let since_boot = now.saturating_sub(state.booted_ns);
+  let ring_depth: u64 = state
+    .clients
+    .iter()
+    .map(|(_, c)| {
+      c.end
+        .region()
+        .cmd()
+        .depth(c.end.region().object())
+        .unwrap_or(0)
+    })
+    .sum();
+  let term = state.config.failover_slo_ns;
+  let expiring = state
+    .db
+    .partition()
+    .volumes()
+    .iter()
+    .filter(|v| {
+      v.lease
+        .as_ref()
+        .is_some_and(|l| l.expires_ns.saturating_sub(now) <= term)
+    })
+    .count();
+  let signal = |name: &str, value: u64, freshness_ns: u64| Signal {
+    name: name.to_owned(),
+    value,
+    freshness_ns,
+  };
+  let signals = vec![
+    signal(
+      "catalog.volumes",
+      u64::try_from(state.by_id.len()).unwrap_or(u64::MAX),
+      0,
+    ),
+    signal("log.replay_ns", state.recovered.replay_ns, since_boot),
+    signal(
+      "lease.expiring",
+      u64::try_from(expiring).unwrap_or(u64::MAX),
+      0,
+    ),
+    signal("ring.depth", ring_depth, 0),
+    signal(
+      "shard.clients",
+      u64::try_from(state.clients.iter().count()).unwrap_or(u64::MAX),
+      0,
+    ),
+    signal(
+      "shard.deferred",
+      u64::try_from(state.deferred.len()).unwrap_or(u64::MAX),
+      0,
+    ),
+  ];
+  ShardReport {
+    partition: state.partition,
+    clients: u32::try_from(state.clients.iter().count()).unwrap_or(u32::MAX),
+    volumes: u64::try_from(state.by_id.len()).unwrap_or(u64::MAX),
+    served: state.served,
+    refusals: state
+      .refusals
+      .iter()
+      .map(|(kind, count)| RefusalCount {
+        kind: (*kind).to_owned(),
+        count: *count,
+      })
+      .collect(),
+    replayed_records: state.recovered.replayed_records,
+    replay_ns: state.recovered.replay_ns,
+    torn_tail: state.recovered.torn,
+    reserve_bytes: state
+      .budget
+      .available()
+      .saturating_add(state.budget.committed()),
+    committed_bytes: state.budget.committed(),
+    signals,
+  }
+}
+
+/// The daemon's view: the anchor's words in the segment and the process-wide counters, over
+/// every shard's part.
+fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody {
+  let now = state.clock.monotonic_ns();
+  let (generation, restarts, heartbeat_age_ns) = state
+    .segment
+    .supervision()
+    .map(|s| {
+      (
+        s.generation(),
+        s.restarts(),
+        now.saturating_sub(s.heartbeat_ns()),
+      )
+    })
+    .unwrap_or((0, 0, 0));
+  ReplyBody::DaemonStatus {
+    report: DaemonReport {
+      pid: std::process::id(),
+      generation,
+      restarts,
+      heartbeat_age_ns,
+      clients_reaped: crate::daemon::CLIENTS_REAPED.load(Ordering::Acquire),
+      clients_refused: crate::daemon::CLIENTS_REFUSED.load(Ordering::Acquire),
+      shards,
+    },
+  }
+}
+
 /// One shard's part of a listing arrives at the origin; the last part completes the reply.
 fn gather(request: u64, part: Vec<VolumeSummary>) {
   let done = crate::state::with_state(|s| {
@@ -373,7 +729,7 @@ fn gather(request: u64, part: Vec<VolumeSummary>) {
   .flatten();
   if let Some((client_index, _, mut volumes)) = done {
     volumes.sort_by(|a, b| a.name.cmp(&b.name));
-    crate::state::deliver(client_index, request, ReplyBody::Listed { volumes });
+    crate::state::deliver(client_index, request, ReplyBody::Listed { volumes }, false);
   }
 }
 
@@ -395,6 +751,7 @@ fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::DuplicateRequest => "duplicate_request",
     Refusal::Unsupported { .. } => "unsupported",
     Refusal::TooManyClients => "too_many_clients",
+    Refusal::Overloaded { .. } => "overloaded",
     Refusal::BadRequest { .. } => "bad_request",
   }
 }
@@ -437,6 +794,10 @@ fn dispatch(
     RequestBody::Destroy { volume } => destroy(state, principal, volume),
     RequestBody::Status { volume } => status(state, principal, volume),
     RequestBody::List => list(state, principal),
+    RequestBody::DaemonStatus => {
+      let mine = shard_report(state);
+      daemon_report(state, vec![mine])
+    }
     RequestBody::Acknowledge { up_to } => acknowledge(state, client_id, up_to),
     RequestBody::ReadBase { volume, path } => read_base(state, principal, volume, &path),
     RequestBody::Rewitness { volume, paths } => {
@@ -1111,14 +1472,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
     },
     None => (Vec::new(), "scratch".to_owned()),
   };
-  let attachments = state
-    .db
-    .partition()
-    .to_snapshot(0)
-    .attachments
-    .iter()
-    .filter(|a| a.volume == record.id)
-    .count();
+  let attachments = state.db.partition().attachments_of(record.id).len();
   ReplyBody::Status {
     report: StatusReport {
       id: volume,
@@ -1275,7 +1629,8 @@ fn pin(
 /// Serves every ready request of every client, retries deferred replies, steps destroys and
 /// expires leases; returns whether anything was done.
 pub fn serve_round(state: &mut ShardState) -> bool {
-  let mut any = retry_deferred(state);
+  let mut any = retry_forwards(state);
+  any |= retry_deferred(state);
   let handles: Vec<(u32, Handle<ClientSlot>)> =
     state.clients.iter().map(|(h, _)| (h.index(), h)).collect();
   // One clock read per round marks every client served in it (the reap's silence clock).
@@ -1352,7 +1707,7 @@ fn reap_client(state: &mut ShardState, handle: Handle<ClientSlot>, client_id: u3
     }
   }
   let index = handle.index();
-  state.deferred.retain(|(client, _, _)| *client != index);
+  state.deferred.retain(|d| d.client_index != index);
   // The slot goes last: the region's mapping and the control channel close with it.
   let _ = state.clients.remove(handle);
   // The id returns to the control shard's live set as a task there (sharing by move).
@@ -1375,16 +1730,31 @@ fn reap_client(state: &mut ShardState, handle: Handle<ClientSlot>, client_id: u3
 fn retry_deferred(state: &mut ShardState) -> bool {
   let mut any = false;
   let deferred = std::mem::take(&mut state.deferred);
-  for (client_index, request, reply) in deferred {
+  for entry in deferred {
+    let Deferred {
+      client_index,
+      request,
+      reply,
+      recorded,
+    } = entry;
     let id = RequestId::from_word(request);
-    let reply = match state.db.partition().completion(id.client, id.sequence) {
-      Seen::New => record_completion(state, id, reply),
-      _ => reply,
+    let reply = if recorded {
+      reply
+    } else {
+      match state.db.partition().completion(id.client, id.sequence) {
+        Seen::New => record_completion(state, id, reply),
+        _ => reply,
+      }
     };
     if send_reply(state, client_index, request, &reply) {
       any = true;
     } else {
-      state.deferred.push((client_index, request, reply));
+      state.deferred.push(Deferred {
+        client_index,
+        request,
+        reply,
+        recorded: true,
+      });
     }
   }
   any
@@ -1417,7 +1787,12 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     match serve(state, handle, &request) {
       Served::Reply(reply) => {
         if !send_reply(state, index, request.request, &reply) {
-          state.deferred.push((index, request.request, reply));
+          state.deferred.push(Deferred {
+            client_index: index,
+            request: request.request,
+            reply,
+            recorded: true,
+          });
         }
       }
       Served::Forwarded => {}

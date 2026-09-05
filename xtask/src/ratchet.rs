@@ -42,6 +42,7 @@ const BENCHES: &[(&str, &str)] = &[
   ("slates-land", "land_bench"),
   ("slates-db", "db_bench"),
   ("slates-ipc", "ipc_bench"),
+  ("slates-client", "provision_bench"),
 ];
 
 /// One row of one run.

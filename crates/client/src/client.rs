@@ -3,8 +3,8 @@
 use std::time::Instant;
 
 use slates_ipc::protocol::{
-  Direction, Intent, NamePolicy, ReplyBody, RequestBody, SizeClass, SnapshotId, StatusReport,
-  VolumeId, VolumeSummary, pack, unpack,
+  DaemonReport, Direction, Intent, NamePolicy, ReplyBody, RequestBody, SizeClass, SnapshotId,
+  StatusReport, VolumeId, VolumeSummary, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect_as};
 use slates_machine::{Derived, derived};
@@ -84,6 +84,23 @@ pub struct Client {
   deadlines: Deadlines,
   /// Reconnects made (a non-vacuity counter for the tests of the restart path).
   reconnects: u64,
+  /// The highest sequence acknowledged (its completion records released, §4.9).
+  acknowledged: u32,
+  /// Derived: how many replies the client receives before it acknowledges them: half the
+  /// ring's slots, so the daemon retains at most one ring of records per client while the
+  /// acknowledgement costs one request in that many.
+  ack_every: u32,
+}
+
+fn ack_every_of(end: &ClientEnd) -> u32 {
+  derived!(
+    u32::try_from(end.region().cmd().slots() / 2)
+      .unwrap_or(u32::MAX)
+      .max(1),
+    "slots / 2",
+    ["region.slots"]
+  )
+  .get()
 }
 
 impl std::fmt::Debug for Client {
@@ -119,13 +136,17 @@ impl Client {
   pub fn connect(instance: &str, deadlines: Deadlines) -> Result<Client, ClientError> {
     let connected = connect_as(instance, 0)?;
     let client_id = connected.region.client_id();
+    let end = ClientEnd::connected(connected);
+    let ack_every = ack_every_of(&end);
     Ok(Client {
       instance: instance.to_owned(),
-      end: ClientEnd::connected(connected),
+      end,
       client_id,
       sequence: 0,
       deadlines,
       reconnects: 0,
+      acknowledged: 0,
+      ack_every,
     })
   }
 
@@ -142,13 +163,17 @@ impl Client {
     if assigned != session.client_id {
       return Err(ClientError::SessionTaken { assigned });
     }
+    let end = ClientEnd::connected(connected);
+    let ack_every = ack_every_of(&end);
     Ok(Client {
       instance: instance.to_owned(),
-      end: ClientEnd::connected(connected),
+      end,
       client_id: session.client_id,
       sequence: session.next_sequence.saturating_sub(1),
       deadlines,
       reconnects: 0,
+      acknowledged: 0,
+      ack_every,
     })
   }
 
@@ -173,6 +198,13 @@ impl Client {
     }
   }
 
+  /// Spins this long for a reply before parking (`None`: the daemon's published window, the
+  /// measured wake cost; the 2-competitive choice for CPU). A caller with a latency floor of
+  /// its own spins for it and never pays a wake when the daemon meets it.
+  pub fn spin_for(&mut self, spin_ns: Option<u64>) {
+    self.end.set_spin_ns(spin_ns);
+  }
+
   /// Reconnects made so far.
   pub fn reconnects(&self) -> u64 {
     self.reconnects
@@ -185,6 +217,17 @@ impl Client {
 
   /// Sends `body` as the next request and returns the reply body, refusals typed.
   pub fn call(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
+    // Every `ack_every` replies, the client acknowledges them first (one request), so the
+    // daemon's retained records stay bounded without the caller's help (§4.9).
+    if self.sequence.wrapping_sub(self.acknowledged) >= self.ack_every {
+      let up_to = self.sequence;
+      self.acknowledge(up_to)?;
+    }
+    self.call_plain(body)
+  }
+
+  /// One request under the next sequence, without the automatic acknowledgement.
+  fn call_plain(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
     self.sequence = self.sequence.wrapping_add(1);
     let id = RequestId {
       client: self.client_id,
@@ -390,6 +433,16 @@ impl Client {
     }
   }
 
+  /// The daemon's status (§4.14 `slates.status`).
+  pub fn daemon_status(&mut self) -> Result<DaemonReport, ClientError> {
+    match self.call(&RequestBody::DaemonStatus)? {
+      ReplyBody::DaemonStatus { report } => Ok(report),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "daemon_status",
+      }),
+    }
+  }
+
   /// The caller's volumes.
   pub fn list(&mut self) -> Result<Vec<VolumeSummary>, ClientError> {
     match self.call(&RequestBody::List)? {
@@ -400,12 +453,20 @@ impl Client {
 
   /// Acknowledges every completion up to `up_to` (releases their records).
   pub fn acknowledge(&mut self, up_to: u32) -> Result<(), ClientError> {
-    match self.call(&RequestBody::Acknowledge { up_to })? {
-      ReplyBody::Acknowledged => Ok(()),
+    match self.call_plain(&RequestBody::Acknowledge { up_to })? {
+      ReplyBody::Acknowledged => {
+        self.acknowledged = self.acknowledged.max(up_to);
+        Ok(())
+      }
       _ => Err(ClientError::UnexpectedReply {
         verb: "acknowledge",
       }),
     }
+  }
+
+  /// The highest sequence acknowledged so far.
+  pub fn acknowledged(&self) -> u32 {
+    self.acknowledged
   }
 
   /// Acknowledges everything this client has received so far.

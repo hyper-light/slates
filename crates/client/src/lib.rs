@@ -30,5 +30,6 @@ pub mod error;
 pub use client::{Attachment, Client, CreateSpec, Deadlines, Session};
 pub use error::ClientError;
 pub use slates_ipc::protocol::{
-  Intent, NamePolicy, Refusal, SizeClass, SnapshotId, StatusReport, VolumeId, VolumeSummary,
+  DaemonReport, Intent, NamePolicy, Refusal, RefusalCount, ShardReport, Signal, SizeClass,
+  SnapshotId, StatusReport, VolumeId, VolumeSummary,
 };

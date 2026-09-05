@@ -97,8 +97,10 @@ pub struct ShardState {
   pub served: u64,
   /// Refusals by kind name.
   pub refusals: BTreeMap<&'static str, u64>,
-  /// Replies waiting because a client's completion ring was full, by client slot.
-  pub deferred: Vec<(u32, u64, ReplyBody)>,
+  /// Replies waiting for the client's ring (full, or the reply came from another shard), by
+  /// client slot; `recorded` says the completion record already exists (at the owner
+  /// partition of a forwarded verb), so this shard must not record it again.
+  pub deferred: Vec<Deferred>,
   /// The shard's server task, woken when a client is added while it idles.
   pub server_task: Option<slates_rt::TaskId>,
   /// Listings in flight: by request word, the client slot, the shards still to answer, and
@@ -106,6 +108,60 @@ pub struct ShardState {
   pub scatters: BTreeMap<u64, (u32, usize, Vec<slates_ipc::protocol::VolumeSummary>)>,
   /// Every shard of the daemon, for the scatter.
   pub shards: Vec<u16>,
+  /// What the last start's recovery found (the status reports it).
+  pub recovered: slates_db::replay::Recovered,
+  /// When this shard's state was installed (the freshness of what recovery measured).
+  pub booted_ns: u64,
+  /// Daemon status requests in flight: by request word, the client slot, the shards still
+  /// to answer, and the parts so far.
+  pub status_scatters: BTreeMap<u64, (u32, usize, Vec<slates_ipc::protocol::ShardReport>)>,
+  /// Acknowledgements in flight: by request word, the client slot, the shards still to
+  /// answer, and the reply so far.
+  pub ack_scatters: BTreeMap<u64, (u32, usize, ReplyBody)>,
+  /// When this shard last did work for a client (served, forwarded, or ran a forwarded verb);
+  /// the server loop polls for the idle window past it before parking (§4.7).
+  pub last_work_ns: u64,
+  /// Forwards refused by a full control channel, kept to retry (backpressure, never a drop);
+  /// bounded by the clients' credit, refused typed beyond it.
+  pub pending_forwards: std::collections::VecDeque<PendingForward>,
+}
+
+/// A reply waiting to be written into a client's ring.
+#[derive(Clone, Debug)]
+pub struct Deferred {
+  /// The client's slot index.
+  pub client_index: u32,
+  /// The request word.
+  pub request: u64,
+  /// The reply.
+  pub reply: ReplyBody,
+  /// Whether its completion record exists already (the owner partition recorded it).
+  pub recorded: bool,
+}
+
+/// A forward waiting for room on the owner shard's control channel.
+pub struct PendingForward {
+  /// The client's slot index.
+  pub client_index: u32,
+  /// The request word.
+  pub request: u64,
+  /// The client id.
+  pub client_id: u32,
+  /// The principal.
+  pub principal: Principal,
+  /// The body.
+  pub body: slates_ipc::protocol::RequestBody,
+  /// The owner shard (the runtime's id).
+  pub owner: u16,
+}
+
+impl std::fmt::Debug for PendingForward {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("PendingForward")
+      .field("client_id", &self.client_id)
+      .field("owner", &self.owner)
+      .finish()
+  }
 }
 
 impl std::fmt::Debug for ShardState {
@@ -166,9 +222,14 @@ pub fn any_ring_ready() -> bool {
 
 /// A reply that came back from another shard (or a scatter's part): queued for the client's
 /// ring and the server task woken.
-pub fn deliver(client_index: u32, request: u64, reply: ReplyBody) {
+pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool) {
   let server = with_state(|s| {
-    s.deferred.push((client_index, request, reply));
+    s.deferred.push(Deferred {
+      client_index,
+      request,
+      reply,
+      recorded,
+    });
     s.server_task
   })
   .flatten();

@@ -99,6 +99,9 @@ impl Daemon {
     if let Ok(json) = profile.to_json() {
       segment.publish(RegionKind::Profile, json.as_bytes())?;
     }
+    if let Some((was, now)) = limits::raise_descriptor_limit() {
+      eprintln!("slates-server: descriptor limit raised from {was} to {now}");
+    }
     let runtime = Runtime::start(&config.runtime)?;
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
     for (index, shard) in shards.iter().enumerate() {
@@ -217,7 +220,7 @@ fn init_shard(
   let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
   let mut clock = HostClock::new();
   let now = slates_vfs::clock::Clock::monotonic_ns(&mut clock);
-  let (db, _recovered) = slates_db::replay::recover(&mut segment, partition, config.caps, now)?;
+  let (db, recovered) = slates_db::replay::recover(&mut segment, partition, config.caps, now)?;
   let mut arena = ChunkArena::new(config.page);
   let region_len = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX);
   arena.add_region(Region::map(
@@ -266,6 +269,12 @@ fn init_shard(
     server_task: None,
     scatters: std::collections::BTreeMap::new(),
     shards: config_shards.to_vec(),
+    recovered,
+    booted_ns: now,
+    status_scatters: std::collections::BTreeMap::new(),
+    last_work_ns: now,
+    pending_forwards: std::collections::VecDeque::new(),
+    ack_scatters: std::collections::BTreeMap::new(),
   };
   let rebuilt = verbs::rebuild_recovered(&mut state);
   if rebuilt.skipped > 0 {
@@ -319,17 +328,35 @@ async fn reap_loop() {
   }
 }
 
-/// The shard's server loop: a poller of its clients' rings; serves while there is work,
-/// idles otherwise.
+/// The shard's server loop: a poller of its clients' rings; serves while there is work, keeps
+/// polling for the idle window after its last work (§4.7 "Wake strategy": a shard polls while
+/// any client has activity within the window), and idles past it.
 async fn serve_loop() {
   if let Some(task) = futures::current_task() {
     let _ =
       registry::with_current(|ctx| ctx.register_poller(task, Box::new(state::any_ring_ready)));
     state::with_state(|s| s.server_task = Some(task));
   }
+  let idle_window_ns = state::with_state(|s| {
+    derived!(
+      u64::from(s.config.region.spin_ns).saturating_mul(crate::config::IDLE_WINDOW_RATIO),
+      "spin_ns × IDLE_WINDOW_RATIO",
+      ["wake.p99_ns", "IDLE_WINDOW_RATIO"]
+    )
+    .get()
+  })
+  .unwrap_or(0);
   loop {
-    let did = state::with_state(verbs::serve_round).unwrap_or(false);
-    if did {
+    let (did, within_window) = state::with_state(|s| {
+      let did = verbs::serve_round(s);
+      let now = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
+      if did {
+        s.last_work_ns = now;
+      }
+      (did, now.saturating_sub(s.last_work_ns) < idle_window_ns)
+    })
+    .unwrap_or((false, false));
+    if did || within_window {
       futures::yield_now().await;
     } else {
       state::with_state(|s| verbs::mark_parked(s, true));
@@ -474,4 +501,55 @@ fn kick_fd_of(shard: ShardId) -> Option<i32> {
 #[cfg(not(target_os = "linux"))]
 fn kick_fd_of(_shard: ShardId) -> Option<i32> {
   None
+}
+
+mod limits {
+  //! The process's descriptor limit: every client costs descriptors (its region, its control
+  //! channel, its completion signal), and the derived client bound (AC-2.6) is far above the
+  //! soft limit a shell hands out; the daemon raises its own soft limit to the hard one, which
+  //! needs no privilege. Paired `#[cfg]` functions, one signature.
+
+  /// Raises the soft limit to the hard one; `(before, after)` when it changed.
+  #[cfg(unix)]
+  pub(super) fn raise_descriptor_limit() -> Option<(u64, u64)> {
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+    let limit = getrlimit(Resource::Nofile);
+    let current = limit.current?;
+    let maximum = limit.maximum.unwrap_or(u64::MAX);
+    let wanted = platform_cap(maximum);
+    if wanted <= current {
+      return None;
+    }
+    setrlimit(
+      Resource::Nofile,
+      Rlimit {
+        current: Some(wanted),
+        maximum: limit.maximum,
+      },
+    )
+    .ok()?;
+    Some((current, wanted))
+  }
+
+  /// Format: macOS `OPEN_MAX` (`<sys/syslimits.h>`): `setrlimit` refuses a soft descriptor
+  /// limit above it even when the hard limit is unlimited.
+  #[cfg(target_os = "macos")]
+  const MACOS_OPEN_MAX: u64 = 10_240;
+
+  /// macOS caps the soft limit at `OPEN_MAX`.
+  #[cfg(target_os = "macos")]
+  fn platform_cap(maximum: u64) -> u64 {
+    maximum.min(MACOS_OPEN_MAX)
+  }
+
+  #[cfg(all(unix, not(target_os = "macos")))]
+  fn platform_cap(maximum: u64) -> u64 {
+    maximum
+  }
+
+  /// Windows has no per-process handle limit to raise.
+  #[cfg(not(unix))]
+  pub(super) fn raise_descriptor_limit() -> Option<(u64, u64)> {
+    None
+  }
 }

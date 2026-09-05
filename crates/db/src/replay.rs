@@ -18,7 +18,7 @@ use slates_wire::Wire;
 use crate::error::DbError;
 use crate::op::Op;
 use crate::partition::{Partition, PartitionCaps, PartitionSnapshot};
-use crate::record::LogRing;
+use crate::record::{LogEntry, LogRing};
 
 /// Shape: the recovery budget, RAMCloud's target of about a second for a crashed node
 /// [A: Ongaro et al., SOSP'11: 35 GB in 1.6 s]; an operator input in Phase 2's CLI, ratified
@@ -51,7 +51,7 @@ impl SnapshotPolicy {
 }
 
 /// What recovery found.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Recovered {
   /// The snapshot slot restored, and its sequence.
   pub snapshot: Option<(u8, u64)>,
@@ -84,6 +84,8 @@ pub struct Db {
   since_snapshot_bytes: u64,
   next_slot: u8,
   snapshots_taken: u64,
+  /// Operations applied since `begin`, waiting to go into one record at `commit`.
+  pending: Option<Vec<Op>>,
 }
 
 impl std::fmt::Debug for Db {
@@ -139,8 +141,10 @@ pub fn recover(
   };
   let replayed = log.replay(segment, from_seq)?;
   let mut records = 0u64;
-  for (_, op) in &replayed.ops {
-    partition.apply(op)?;
+  for (_, entry) in &replayed.ops {
+    for op in entry.ops() {
+      partition.apply(op)?;
+    }
     records += 1;
   }
   if replayed.torn {
@@ -165,6 +169,7 @@ pub fn recover(
     since_snapshot_bytes: replayed.bytes,
     next_slot: snapshot.map_or(0, |(slot, _)| (slot + 1) % 2),
     snapshots_taken: 0,
+    pending: None,
   };
   Ok((db, recovered))
 }
@@ -209,13 +214,22 @@ impl Db {
     now_ns: u64,
   ) -> Result<u64, DbError> {
     self.partition.check(op, now_ns)?;
+    if let Some(pending) = self.pending.as_mut() {
+      // Inside a transaction: applied now (later operations see it), logged at the commit.
+      self.partition.apply(op)?;
+      pending.push(op.clone());
+      return Ok(self.next_seq);
+    }
     let seq = self.next_seq;
-    let bytes = match self.log.append(segment, seq, op) {
+    let entry = LogEntry {
+      ops: vec![op.clone()],
+    };
+    let bytes = match self.log.append(segment, seq, &entry) {
       Ok(bytes) => bytes,
       Err(DbError::LogFull { .. }) => {
         // A full ring: the snapshot releases everything before it, then the append retries.
         self.snapshot(segment)?;
-        self.log.append(segment, seq, op)?
+        self.log.append(segment, seq, &entry)?
       }
       Err(e) => return Err(e),
     };
@@ -226,6 +240,53 @@ impl Db {
       self.snapshot(segment)?;
     }
     Ok(seq)
+  }
+
+  /// Opens a transaction: every `mutate` until `commit` is checked and applied at once but
+  /// logged together as one `Op::Batch` record, so replay sees all of them or none (a verb's
+  /// effects and its completion record are one durable step, §4.9). A transaction that is
+  /// never committed logs nothing; its applied effects die with the process, as replay would
+  /// have it.
+  pub fn begin(&mut self) {
+    if self.pending.is_none() {
+      self.pending = Some(Vec::new());
+    }
+  }
+
+  /// Commits the transaction: one record for every operation applied since `begin` (none
+  /// when nothing was applied). A full log takes a snapshot instead, which already holds the
+  /// applied effects, so the record is not needed and the sequence moves past it.
+  pub fn commit(&mut self, segment: &mut AnchorSegment) -> Result<Option<u64>, DbError> {
+    let Some(ops) = self.pending.take() else {
+      return Ok(None);
+    };
+    if ops.is_empty() {
+      return Ok(None);
+    }
+    let entry = LogEntry { ops };
+    let seq = self.next_seq;
+    let bytes = match self.log.append(segment, seq, &entry) {
+      Ok(bytes) => bytes,
+      Err(DbError::LogFull { .. }) => {
+        // The snapshot carries the applied effects; the sequence moves past the record that
+        // is not written, so a replay from the snapshot continues at the right place.
+        self.next_seq = seq.saturating_add(1);
+        self.snapshot(segment)?;
+        return Ok(Some(seq));
+      }
+      Err(e) => return Err(e),
+    };
+    self.next_seq = seq.saturating_add(1);
+    self.since_snapshot_bytes = self.since_snapshot_bytes.saturating_add(bytes);
+    if self.since_snapshot_bytes >= self.policy.bytes_between_snapshots {
+      self.snapshot(segment)?;
+    }
+    Ok(Some(seq))
+  }
+
+  /// Whether a transaction is open.
+  pub fn in_transaction(&self) -> bool {
+    self.pending.is_some()
   }
 
   /// Publishes the partition into the alternate snapshot slot and trims the log behind it.

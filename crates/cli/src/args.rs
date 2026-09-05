@@ -23,6 +23,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   volume destroy ID
   attach ID [--read | --write] [--snapshot N]
   detach ATTACHMENT
+  status                                           the daemon's status
   status ID [--drift]
   base read ID PATH
   base rewitness ID [PATH ...]
@@ -111,7 +112,9 @@ pub(crate) enum Verb {
   },
   /// List.
   List,
-  /// Status (`volume stat`, `status`).
+  /// The daemon's status (`status` with no volume).
+  DaemonStatus,
+  /// Status (`volume stat`, `status ID`).
   Status {
     /// The volume.
     volume: slates_client::VolumeId,
@@ -457,7 +460,10 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
         },
       ))
     }
-    ["status"] => Err(ParseError::Missing("volume ID")),
+    ["status"] => {
+      taken.only(&NONE)?;
+      Ok(client(&taken, Verb::DaemonStatus))
+    }
     ["base", rest @ ..] => parse_base(&taken, rest),
     [verb, rest @ ..]
       if matches!(

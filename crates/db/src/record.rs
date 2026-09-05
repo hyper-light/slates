@@ -34,11 +34,27 @@ const AT_CRC: usize = 16;
 /// Format: the schema hash's offset.
 const AT_SCHEMA: usize = 24;
 
+/// What one log record holds: one or more operations applied together on replay or not at
+/// all (a verb's effects and its completion record as one durable step, §4.9, AC-2.3). A
+/// separate type from `Op`, so the schema stays finite.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct LogEntry {
+  /// The operations, in order.
+  pub ops: Vec<Op>,
+}
+
+impl LogEntry {
+  /// The operations, in order.
+  pub fn ops(&self) -> &[Op] {
+    &self.ops
+  }
+}
+
 /// What a replay found.
 #[derive(Debug)]
 pub struct Replayed {
   /// The records in sequence order, from the first at or after the requested sequence.
-  pub ops: Vec<(u64, Op)>,
+  pub ops: Vec<(u64, LogEntry)>,
   /// The bytes walked.
   pub bytes: u64,
   /// Whether the walk ended at a record that did not verify (the torn tail); the ring's tail
@@ -88,16 +104,21 @@ impl LogRing {
   }
 
   /// The bytes a record for `op` takes.
-  pub fn record_bytes(op: &Op) -> u64 {
-    let body = u64::try_from(op.to_bytes().len()).unwrap_or(u64::MAX);
+  pub fn record_bytes(entry: &LogEntry) -> u64 {
+    let body = u64::try_from(entry.to_bytes().len()).unwrap_or(u64::MAX);
     body.saturating_add(u64::try_from(RECORD_HEADER).unwrap_or(u64::MAX))
   }
 
   /// Appends `op` as record `seq`; refuses `LogFull` with nothing written when the ring cannot
   /// hold it. Returns the bytes appended.
-  pub fn append(&self, segment: &mut AnchorSegment, seq: u64, op: &Op) -> Result<u64, DbError> {
+  pub fn append(
+    &self,
+    segment: &mut AnchorSegment,
+    seq: u64,
+    entry: &LogEntry,
+  ) -> Result<u64, DbError> {
     let w = self.words(segment)?;
-    let body = op.to_bytes();
+    let body = entry.to_bytes();
     let total = u64::try_from(RECORD_HEADER + body.len()).unwrap_or(u64::MAX);
     let free = w.capacity.saturating_sub(w.tail.saturating_sub(w.head));
     if total > free {
@@ -114,11 +135,11 @@ impl LogRing {
     put(&mut header, AT_MAGIC, &RECORD_MAGIC.to_le_bytes());
     put(&mut header, AT_LEN, &len.to_le_bytes());
     put(&mut header, AT_SEQ, &seq.to_le_bytes());
-    put(&mut header, AT_SCHEMA, &Op::SCHEMA_HASH.to_le_bytes());
+    put(&mut header, AT_SCHEMA, &LogEntry::SCHEMA_HASH.to_le_bytes());
     put(
       &mut header,
       AT_CRC,
-      &checksum(seq, Op::SCHEMA_HASH, &body).to_le_bytes(),
+      &checksum(seq, LogEntry::SCHEMA_HASH, &body).to_le_bytes(),
     );
     let ring = segment.region_bytes_mut(self.kind)?;
     let ring = &mut ring[slates_anchor::layout::RING_BYTES..];
@@ -178,7 +199,7 @@ impl LogRing {
     w: Words,
     at: u64,
     expect_seq: u64,
-  ) -> Result<(u64, Op, u64), DbError> {
+  ) -> Result<(u64, LogEntry, u64), DbError> {
     let header_len = u64::try_from(RECORD_HEADER).unwrap_or(u64::MAX);
     if w.tail.saturating_sub(at) < header_len {
       return Err(DbError::Corrupt {
@@ -209,7 +230,7 @@ impl LogRing {
       });
     }
     let schema = read_u64(&header, AT_SCHEMA);
-    if schema != Op::SCHEMA_HASH {
+    if schema != LogEntry::SCHEMA_HASH {
       return Err(DbError::Corrupt {
         seq,
         reason: "schema mismatch",
@@ -223,8 +244,8 @@ impl LogRing {
         reason: "checksum mismatch",
       });
     }
-    let op = Op::from_bytes(&body)?;
-    Ok((seq, op, header_len.saturating_add(len)))
+    let entry = LogEntry::from_bytes(&body)?;
+    Ok((seq, entry, header_len.saturating_add(len)))
   }
 
   /// After a replay found a torn tail: the tail returns to the last verified byte so the next

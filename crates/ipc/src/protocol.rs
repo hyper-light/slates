@@ -153,6 +153,75 @@ pub enum RequestBody {
     /// The request the grant would cover.
     request: u64,
   },
+  /// The daemon's own status (§4.14 `slates.status`: every shard's counters and health
+  /// signals, and the anchor's view of the daemon as the segment holds it).
+  DaemonStatus,
+}
+
+/// A health signal (§4.14): a value and how old it is.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct Signal {
+  /// The name, dotted (`catalog.volumes`).
+  pub name: String,
+  /// The value.
+  pub value: u64,
+  /// How old the value is, in nanoseconds (zero for one computed now).
+  pub freshness_ns: u64,
+}
+
+/// A refusal kind's count.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct RefusalCount {
+  /// The kind's name.
+  pub kind: String,
+  /// Refusals of it.
+  pub count: u64,
+}
+
+/// One shard's part of the daemon's status.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct ShardReport {
+  /// The partition.
+  pub partition: u16,
+  /// Live clients.
+  pub clients: u32,
+  /// Volumes owned.
+  pub volumes: u64,
+  /// Requests served (completions recorded).
+  pub served: u64,
+  /// Refusals by kind.
+  pub refusals: Vec<RefusalCount>,
+  /// Records replayed at the last start.
+  pub replayed_records: u64,
+  /// The last replay's duration.
+  pub replay_ns: u64,
+  /// Whether the last replay cut a torn tail.
+  pub torn_tail: bool,
+  /// The shard's reserve.
+  pub reserve_bytes: u64,
+  /// Bytes committed to bounded volumes.
+  pub committed_bytes: u64,
+  /// The health signals.
+  pub signals: Vec<Signal>,
+}
+
+/// The daemon's status.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct DaemonReport {
+  /// The daemon's process id.
+  pub pid: u32,
+  /// The segment's generation (daemon starts over it).
+  pub generation: u64,
+  /// Restarts the anchor made.
+  pub restarts: u64,
+  /// The age of the daemon's last heartbeat in the segment.
+  pub heartbeat_age_ns: u64,
+  /// Clients found dead and reclaimed.
+  pub clients_reaped: u64,
+  /// Connects refused at the client bound.
+  pub clients_refused: u64,
+  /// Every shard's part, by partition.
+  pub shards: Vec<ShardReport>,
 }
 
 /// A volume's summary in a listing.
@@ -256,6 +325,12 @@ pub enum Refusal {
   },
   /// The shard's client or task capacity is reached.
   TooManyClients,
+  /// A shard's cross-shard queue is at its bound; the request was not started and may be
+  /// retried (the client's credit bounds what it can have in flight).
+  Overloaded {
+    /// The shard whose queue is full.
+    shard: u16,
+  },
   /// A malformed request.
   BadRequest {
     /// What was wrong.
@@ -327,6 +402,11 @@ pub enum ReplyBody {
   Refused {
     /// The refusal.
     refusal: Refusal,
+  },
+  /// The daemon's status.
+  DaemonStatus {
+    /// The report.
+    report: DaemonReport,
   },
 }
 

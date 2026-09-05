@@ -1236,7 +1236,7 @@ root-relative path if the caller allowed it.
 ### 4.7 IPC and the provisioning fast path (D-10)
 
 > **Status (2026-09-05).** Implemented in `crates/ipc` and `crates/server` (GAPS §8d, Phase 2
-> tasks 3–5). As built, the failure matrix's client side: a client tells a dead daemon from a
+> tasks 3–6). As built, the failure matrix's client side: a client tells a dead daemon from a
 > slow one through `Liveness` (Linux: the control socket's peer end, closed by the kernel with
 > the daemon; macOS and Windows: a start stamp in the bootstrap object's header, rewritten by
 > a restarted daemon and unreachable after a dead one), asked only after a reply has stalled
@@ -1249,6 +1249,17 @@ root-relative path if the caller allowed it.
 > attachments, region, control channel and id, leaving its leases to expire by their terms
 > (T-2.3 in `crates/client/tests/reap.rs`). The heartbeat slot stays the SDKs' way to be seen
 > alive without a request (Phase 5); a sync client is seen through its process.
+>
+> Provisioning is measured end to end from the Rust client through the real rendezvous and
+> rings (`crates/client/examples/provision_bench.rs`, AC-2.1, T-2.6): one client spinning
+> provisions a volume at a p99 of about 25 µs against the 50 µs floor on the reference laptop;
+> the 1/8/64 histogram and a parked form are recorded and ratcheted (the floor is held on the
+> single-client latency; the concurrency tails are contention on shared owner shards). A verb's
+> effects and its completion record are one log record (`Db::begin` … `commit`), so a crash
+> leaves both or neither (AC-2.3). Admission is bounded (AC-2.6): a connect past the derived
+> per-daemon client bound is refused `TooManyClients`, a forward to a saturated owner shard
+> waits in a bounded queue and past the clients' credit is refused `Overloaded`, and a shard
+> kicks another only when it is parked (a message to a spinning shard costs no syscall).
 
 **Data model.**
 ```rust

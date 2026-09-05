@@ -251,18 +251,32 @@ mod platform {
     }
   }
 
+  /// The object's kernel name: the caller's name cleaned, with the uid as the per-user
+  /// suffix; a name that would not fit the limit is replaced by a 64-bit hash of the whole
+  /// name (truncation once made two clients' regions one object: GAPS §8d).
   #[cfg(target_os = "macos")]
   fn object_name(name: &str) -> String {
     /// Format: the POSIX shared-memory name limit on macOS (`PSHMNAMLEN`, 31).
     const NAME_LIMIT: usize = 31;
+    /// Format: the FNV-1a 64-bit offset basis and prime (Fowler, Noll, Vo).
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    /// Format: the FNV-1a 64-bit prime.
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let uid = rustix::process::getuid().as_raw();
     let suffix = format!("-{uid}");
     let clean: String = name
       .chars()
       .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-      .take(NAME_LIMIT.saturating_sub(1 + suffix.len()))
       .collect();
-    format!("/{clean}{suffix}")
+    if 1 + clean.len() + suffix.len() <= NAME_LIMIT {
+      return format!("/{clean}{suffix}");
+    }
+    let mut hash = FNV_OFFSET;
+    for byte in name.bytes() {
+      hash ^= u64::from(byte);
+      hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("/{hash:016x}{suffix}")
   }
 
   #[cfg(target_os = "macos")]
