@@ -613,3 +613,99 @@ fn a_chained_rename_in_one_increment_is_correct() {
   );
   assert_eq!(green.content("a"), None, "a is vacated");
 }
+
+/// A change that removes a directory.
+fn rmdir() -> PathChange {
+  PathChange::Rmdir
+}
+
+/// An increment with two changes.
+fn increment2(id: u8, base: u64, a: (&str, PathChange), b: (&str, PathChange)) -> Increment {
+  let mut changes = BTreeMap::new();
+  changes.insert(a.0.to_owned(), a.1);
+  changes.insert(b.0.to_owned(), b.1);
+  Increment {
+    id: [id; 32],
+    base,
+    changes,
+  }
+}
+
+/// An rmdir removes an empty directory.
+#[test]
+fn rmdir_removes_an_empty_directory() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "d", mkdir()));
+  let outcome = green.submit(&increment(2, 1, "d", rmdir()));
+  assert_eq!(outcome, Outcome::Accepted { version: 2 });
+  assert!(!green.is_dir("d"));
+}
+
+/// A directory emptied within the same increment can be removed (removing its child and the
+/// directory together accepts).
+#[test]
+fn rmdir_of_a_directory_emptied_in_the_same_increment() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "d", mkdir()));
+  green.submit(&increment(2, 1, "d/f", create(b"x")));
+  let outcome = green.submit(&increment2(3, 2, ("d/f", remove()), ("d", rmdir())));
+  assert_eq!(outcome, Outcome::Accepted { version: 3 });
+  assert!(!green.is_dir("d"), "the directory is removed");
+  assert_eq!(green.content("d/f"), None, "the child is removed");
+}
+
+/// Removing a non-empty directory (a live child this increment does not clear) conflicts.
+#[test]
+fn rmdir_of_a_nonempty_directory_conflicts() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "d", mkdir()));
+  green.submit(&increment(2, 1, "d/f", create(b"x")));
+  let outcome = green.submit(&increment(3, 2, "d", rmdir()));
+  match outcome {
+    Outcome::Conflict { windows } => assert_eq!(
+      windows[0].class,
+      slates_merge::verdict::MergeConflictClass::DeleteModify
+    ),
+    other => panic!("expected a not-empty conflict, got {other:?}"),
+  }
+  assert!(green.is_dir("d"), "the directory stands");
+}
+
+/// An rmdir of a path that is a file is a type conflict.
+#[test]
+fn rmdir_of_a_file_conflicts() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "f", create(b"x")));
+  let outcome = green.submit(&increment(2, 1, "f", rmdir()));
+  match outcome {
+    Outcome::Conflict { windows } => assert_eq!(
+      windows[0].class,
+      slates_merge::verdict::MergeConflictClass::TypeChanged
+    ),
+    other => panic!("expected a type conflict, got {other:?}"),
+  }
+}
+
+/// An rmdir of an absent directory is a no-op accept.
+#[test]
+fn rmdir_of_an_absent_directory_is_a_noop() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "seed", create(b"x")));
+  let outcome = green.submit(&increment(2, 1, "gone", rmdir()));
+  assert_eq!(outcome, Outcome::Accepted { version: 2 });
+}
+
+/// An rmdir conflicts when an intervening change added a child to the directory.
+#[test]
+fn rmdir_with_an_intervening_child_conflicts() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "d", mkdir()));
+  // Agent A adds a child at version 2.
+  green.submit(&increment(2, 1, "d/f", create(b"x")));
+  // Agent B (based on 1) removes d, but a child was added intervening.
+  let outcome = green.submit(&increment(3, 1, "d", rmdir()));
+  assert!(
+    matches!(outcome, Outcome::Conflict { .. }),
+    "an intervening child blocks the removal"
+  );
+}

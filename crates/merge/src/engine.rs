@@ -36,10 +36,16 @@
 //! directory or symlink is a `TypeChanged` conflict. Removes apply before sets in a commit, so an
 //! increment that renames a file away and recreates one at the old path keeps both.
 //!
-//! Directory removal (needing emptiness), directory rename (children move), hard link, and xattr
-//! (keyed by path and name, so several per path) merges are the continuing step; those and the fully
-//! general intra-increment coordination need the engine to consume the whole ops document. Per-range
-//! identity within a mixed file is owed.
+//! A directory **removal** (`Rmdir`) merges too: the directory must be empty once this increment's
+//! own removals apply, so a directory whose children the same increment removes, rmdirs or renames
+//! away can be removed, while a live child it does not clear is a delete/modify conflict (the
+//! directory is not empty). A file or symlink at the path is a `TypeChanged` conflict.
+//!
+//! Directory rename (children move), hard link (a shared inode the per-path content map does not
+//! model), and xattr (keyed by path and name, so several per path) merges are the continuing step;
+//! those and the fully general intra-increment coordination (a path both renamed away and recreated
+//! in one increment) need the engine to consume the whole ops document. Per-range identity within a
+//! mixed file is owed.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -83,6 +89,9 @@ pub enum PathChange {
     /// The source path the file is moving from.
     from: String,
   },
+  /// Remove a directory at the path. It must be empty once this increment's own removals are
+  /// applied (a child this increment removes, rmdirs, or renames away does not block it).
+  Rmdir,
 }
 
 /// An increment submitted against a base version.
@@ -175,6 +184,25 @@ fn apply(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
   out
 }
 
+/// The paths an increment removes: explicit removes, directory removals, and rename sources. A
+/// directory removal's emptiness check consults this so a directory emptied within the same
+/// increment can be removed.
+fn cleared_paths(increment: &Increment) -> BTreeSet<String> {
+  let mut cleared = BTreeSet::new();
+  for (path, change) in &increment.changes {
+    match change {
+      PathChange::Remove | PathChange::Rmdir => {
+        cleared.insert(path.clone());
+      }
+      PathChange::Rename { from } => {
+        cleared.insert(from.clone());
+      }
+      _ => {}
+    }
+  }
+  cleared
+}
+
 /// Appends `len` bytes at `src` of `from` to `out`, clamped to `from`'s bounds.
 fn push_slice(out: &mut Vec<u8>, from: &[u8], src: u64, len: u64) {
   let start = usize::try_from(src).unwrap_or(usize::MAX).min(from.len());
@@ -203,6 +231,8 @@ enum PathMerge {
     /// The source path to remove.
     source: String,
   },
+  /// Remove a directory at the path.
+  RmDir,
   /// No net change to the file.
   Unchanged,
 }
@@ -431,12 +461,42 @@ impl Green {
     })
   }
 
-  /// Merges one file's change.
+  /// Whether any file, directory or symlink under `prefix` survives this increment's removals.
+  fn has_live_child(&self, prefix: &str, cleared: &BTreeSet<String>) -> bool {
+    let live = |path: &String| path.starts_with(prefix) && !cleared.contains(path);
+    self.content.keys().any(live) || self.dirs.iter().any(live) || self.symlinks.keys().any(live)
+  }
+
+  /// Merges a directory removal. A file or symlink at the path is a type conflict; a path that is
+  /// not a directory is a no-op (already gone). The directory must be empty once this increment's
+  /// own removals (`cleared`) are applied — a live child this increment does not remove, rmdir or
+  /// rename away is a delete/modify conflict (the directory is not empty).
+  fn merge_rmdir(
+    &self,
+    dst: &str,
+    cleared: &BTreeSet<String>,
+  ) -> Result<PathMerge, ConflictWindow> {
+    if self.content.contains_key(dst) || self.symlinks.contains_key(dst) {
+      return Err(Green::window(dst, MergeConflictClass::TypeChanged));
+    }
+    if !self.dirs.contains(dst) {
+      return Ok(PathMerge::Unchanged);
+    }
+    let prefix = format!("{dst}/");
+    if self.has_live_child(&prefix, cleared) {
+      return Err(Green::window(dst, MergeConflictClass::DeleteModify));
+    }
+    Ok(PathMerge::RmDir)
+  }
+
+  /// Merges one file's change. `cleared` is the set of paths this increment removes (removes, rmdirs
+  /// and rename sources), which a directory removal consults for its emptiness check.
   fn merge_path(
     &mut self,
     path: &str,
     base: u64,
     change: &PathChange,
+    cleared: &BTreeSet<String>,
   ) -> Result<PathMerge, ConflictWindow> {
     match change {
       PathChange::Modify { ops, post_state } => self.merge_modify(path, base, ops, post_state),
@@ -446,6 +506,7 @@ impl Green {
       PathChange::SetMode { mode } => self.merge_setmode(path, base, *mode),
       PathChange::Symlink { target } => self.merge_symlink(path, base, target),
       PathChange::Rename { from } => self.merge_rename(path, base, from),
+      PathChange::Rmdir => self.merge_rmdir(path, cleared),
     }
   }
 
@@ -460,9 +521,11 @@ impl Green {
     let mut mkdirs: Vec<String> = Vec::new();
     let mut set_modes: Vec<(String, u32)> = Vec::new();
     let mut set_symlinks: Vec<(String, String)> = Vec::new();
+    let mut rmdirs: Vec<String> = Vec::new();
     let mut windows = Vec::new();
+    let cleared = cleared_paths(increment);
     for (path, change) in &increment.changes {
-      match self.merge_path(path, increment.base, change) {
+      match self.merge_path(path, increment.base, change, &cleared) {
         Ok(PathMerge::Set(content, ops)) => {
           sets.insert(path.clone(), (content, ops));
         }
@@ -485,6 +548,7 @@ impl Green {
           sets.insert(path.clone(), (dst_content, ops));
           removes.push(source);
         }
+        Ok(PathMerge::RmDir) => rmdirs.push(path.clone()),
         Ok(PathMerge::Unchanged) => {}
         Err(window) => windows.push(window),
       }
@@ -509,6 +573,9 @@ impl Green {
     }
     for path in mkdirs {
       self.dirs.insert(path);
+    }
+    for path in rmdirs {
+      self.dirs.remove(&path);
     }
     for (path, mode) in set_modes {
       self.modes.insert(path.clone(), mode);
