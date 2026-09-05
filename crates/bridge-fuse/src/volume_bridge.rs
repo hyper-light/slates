@@ -275,10 +275,16 @@ impl Bridge for VolumeBridge<'_> {
 
   fn write(&mut self, _nodeid: u64, fh: u64, offset: u64, data: &[u8]) -> Result<u32, i32> {
     let no = self.handle_inode(fh)?;
-    let written = self
-      .volume
-      .write(self.store, slates_vfs::ids::InodeNo(no), offset, data)
-      .map_err(errno)?;
+    let inode = slates_vfs::ids::InodeNo(no);
+    // An overlay write copies the base up first (through the host); a scratch write does not.
+    let written = match self.host.as_mut() {
+      Some(host) => self
+        .volume
+        .with_host(host)
+        .write(self.store, inode, offset, data),
+      None => self.volume.write(self.store, inode, offset, data),
+    }
+    .map_err(errno)?;
     u32::try_from(written).map_err(|_| EIO)
   }
 

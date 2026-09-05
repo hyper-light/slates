@@ -906,8 +906,11 @@ directory, this crate's own `src`): an overlay over `src`, served through the br
 base files, looks `lib.rs` up, and reads it back byte-identical to reading the file straight
 from disk, writing nothing. Owed: a standalone `LOOKUP` of an unlisted base entry loads the
 directory's base listing on demand (today the listing loads on `readdir`, which the kernel does
-first; the realistic sequence is verified); base writes' copy-up through the mount, `mmap` of a
-base file, and the splice reply path — all with the transport.
+first; the realistic sequence is verified); `mmap` of a base file and the splice reply path (both with the
+transport). Base writes' copy-up through the bridge is done and verified: a write to a base file
+routes through `Overlay::write`, copies the base up into the overlay's RAM, and leaves the base
+directory on disk untouched (`base_overlay.rs` second test — the write is visible on a later
+read, the rest is the base bytes, and the disk file is byte-for-byte unchanged, R1).
 
 ## 9. Blocking order toward first light
 
