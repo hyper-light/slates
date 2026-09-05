@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use slates_vfs::host::{
@@ -36,19 +35,89 @@ fn refusal(e: &std::io::Error) -> HostError {
   }
 }
 
-fn fingerprint(meta: &std::fs::Metadata) -> Fingerprint {
-  Fingerprint {
-    dev: u64::from(meta.volume_serial_number().unwrap_or(0)),
-    ino: meta.file_index().unwrap_or(0),
-    size: meta.file_size(),
-    mtime_ns: i64::try_from(meta.last_write_time())
-      .unwrap_or(i64::MAX)
-      .saturating_mul(HUNDRED_NS),
-    ctime_ns: i64::try_from(meta.change_time().unwrap_or(0))
-      .unwrap_or(i64::MAX)
-      .saturating_mul(HUNDRED_NS),
-    mode: meta.file_attributes(),
+/// Format: `FILE_FLAG_BACKUP_SEMANTICS`, which lets `CreateFileW` open a directory handle.
+const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+/// Format: `FILE_FLAG_OPEN_REPARSE_POINT`, which opens a reparse point itself, never its target
+/// (R1/D-3: a symlink is never followed).
+const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+/// Format: the `FileBasicInfo` class of `GetFileInformationByHandleEx`.
+const FILE_BASIC_INFO: i32 = 0;
+
+/// The fingerprint of an open handle: the volume serial as the device, the file index as the
+/// inode, the size, the last write and change times, and the attributes as the mode; the
+/// stable Win32 calls, since the standard library's `volume_serial_number`, `file_index` and
+/// `change_time` are unstable (`windows_by_handle`, `windows_change_time`).
+fn fingerprint_of_handle(
+  handle: std::os::windows::io::RawHandle,
+) -> Result<Fingerprint, HostError> {
+  use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, GetFileInformationByHandle,
+    GetFileInformationByHandleEx,
+  };
+  // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value for the call to fill.
+  let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+  // SAFETY: `handle` is an open handle this host holds for the call's duration; `info` is a
+  // writable record of the type the call fills.
+  let ok = unsafe { GetFileInformationByHandle(handle.cast(), &mut info) };
+  if ok == 0 {
+    return Err(HostError::Unavailable(
+      std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+    ));
   }
+  // SAFETY: an all-zero FILE_BASIC_INFO is a valid value for the call to fill.
+  let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+  let basic_len = u32::try_from(size_of::<FILE_BASIC_INFO>()).unwrap_or(0);
+  // SAFETY: `handle` is open for the call's duration; `basic` is a writable record of the
+  // class named, of the length passed.
+  let ok = unsafe {
+    GetFileInformationByHandleEx(
+      handle.cast(),
+      FILE_BASIC_INFO,
+      (&raw mut basic).cast(),
+      basic_len,
+    )
+  };
+  let change_time = if ok == 0 {
+    filetime_ns(
+      info.ftLastWriteTime.dwHighDateTime,
+      info.ftLastWriteTime.dwLowDateTime,
+    )
+  } else {
+    basic.ChangeTime.saturating_mul(HUNDRED_NS)
+  };
+  Ok(Fingerprint {
+    dev: u64::from(info.dwVolumeSerialNumber),
+    ino: (u64::from(info.nFileIndexHigh) << u32::BITS) | u64::from(info.nFileIndexLow),
+    size: (u64::from(info.nFileSizeHigh) << u32::BITS) | u64::from(info.nFileSizeLow),
+    mtime_ns: filetime_ns(
+      info.ftLastWriteTime.dwHighDateTime,
+      info.ftLastWriteTime.dwLowDateTime,
+    ),
+    ctime_ns: change_time,
+    mode: info.dwFileAttributes,
+  })
+}
+
+/// A `FILETIME` as nanoseconds.
+fn filetime_ns(high: u32, low: u32) -> i64 {
+  let ticks = (u64::from(high) << u32::BITS) | u64::from(low);
+  i64::try_from(ticks)
+    .unwrap_or(i64::MAX)
+    .saturating_mul(HUNDRED_NS)
+}
+
+/// The fingerprint of the entry at `path` itself (a reparse point is not followed), through a
+/// handle opened for attributes only.
+fn fingerprint_of_path(path: &Path) -> Result<Fingerprint, HostError> {
+  use std::os::windows::fs::OpenOptionsExt;
+  use std::os::windows::io::AsRawHandle;
+  // structural: allow — a read-only open for the entry's attributes; nothing is written (R1).
+  let file = std::fs::OpenOptions::new()
+    .read(true)
+    .custom_flags(BACKUP_SEMANTICS | OPEN_REPARSE_POINT)
+    .open(path)
+    .map_err(|e| refusal(&e))?;
+  fingerprint_of_handle(file.as_raw_handle())
 }
 
 fn kind_of(meta: &std::fs::Metadata) -> HostKind {
@@ -105,9 +174,7 @@ impl HostFs for OsHost {
 
   fn fingerprint_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {
     let path = self.dir(dir)?;
-    std::fs::symlink_metadata(path)
-      .map(|m| fingerprint(&m))
-      .map_err(|e| refusal(&e))
+    fingerprint_of_path(path)
   }
 
   fn list(&mut self, dir: HostDir) -> Result<Vec<BaseEntry>, HostError> {
@@ -121,10 +188,15 @@ impl HostFs for OsHost {
         Err(e) => return Err(refusal(&e)),
       };
       let name = entry.file_name().to_string_lossy().into_owned();
+      let fingerprint = match fingerprint_of_path(&entry.path()) {
+        Ok(fp) => fp,
+        Err(HostError::NotFound) => continue,
+        Err(e) => return Err(e),
+      };
       out.push(BaseEntry {
         name: name.into(),
         kind: kind_of(&meta),
-        fingerprint: fingerprint(&meta),
+        fingerprint,
       });
     }
     Ok(out)
@@ -156,10 +228,9 @@ impl HostFs for OsHost {
   }
 
   fn fstat(&mut self, file: HostFile) -> Result<Fingerprint, HostError> {
+    use std::os::windows::io::AsRawHandle;
     let f = self.files.get(&file.0).ok_or(HostError::StaleHandle)?;
-    f.metadata()
-      .map(|m| fingerprint(&m))
-      .map_err(|e| refusal(&e))
+    fingerprint_of_handle(f.as_raw_handle())
   }
 
   fn read_at(&mut self, file: HostFile, off: u64, buf: &mut [u8]) -> Result<usize, HostError> {

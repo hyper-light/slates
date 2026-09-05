@@ -316,6 +316,13 @@ impl Volume {
     self.state
   }
 
+  /// Resizes the quota (§4.4 `resize`): refused with `ENOSPC` when the referenced bytes
+  /// already exceed the new limit; nothing else changes.
+  pub fn resize(&mut self, new_limit: u64) -> Result<(), VfsError> {
+    self.live()?;
+    self.quota.resize(self.bytes.total(), new_limit)
+  }
+
   /// Growth requests the quota's pressure source refused (pressure events, T-1.5).
   pub fn growth_denials(&self) -> u64 {
     self.quota.denials()

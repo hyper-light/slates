@@ -37,6 +37,7 @@ pub struct Reply {
 /// The client's end.
 pub struct ClientEnd {
   region: ClientRegion,
+  doorbell: Option<crate::rendezvous::Doorbell>,
   next_request: u64,
   next_reply: u64,
   /// Wakes the client had to park for (the spin-to-park ratio's numerator).
@@ -59,11 +60,19 @@ impl ClientEnd {
   pub fn new(region: ClientRegion) -> ClientEnd {
     ClientEnd {
       region,
+      doorbell: None,
       next_request: 0,
       next_reply: 0,
       parks: 0,
       replies: 0,
     }
+  }
+
+  /// The client's end with the doorbell the rendezvous handed over.
+  pub fn with_doorbell(region: ClientRegion, doorbell: crate::rendezvous::Doorbell) -> ClientEnd {
+    let mut end = ClientEnd::new(region);
+    end.doorbell = Some(doorbell);
+    end
   }
 
   /// The region.
@@ -81,6 +90,11 @@ impl ClientEnd {
     (self.parks, self.replies)
   }
 
+  /// The ring index the next request takes (its bulk chunk is chosen by it).
+  pub fn next_request_index(&self) -> u64 {
+    self.next_request
+  }
+
   /// Writes a request slot; `RingFull` when the daemon has not taken the slot the ring wraps
   /// onto (the caller blocks on credit and retries; nothing is dropped). Rings the doorbell
   /// when the daemon's shard is parked.
@@ -88,8 +102,12 @@ impl ClientEnd {
     let cmd = self.region.cmd();
     cmd.push(self.region.object_mut(), self.next_request, slot)?;
     self.next_request = self.next_request.wrapping_add(1);
-    if self.region.daemon_parked()?.load(Ordering::Acquire) != 0 {
+    let parked = self.region.daemon_parked()?.load(Ordering::Acquire) != 0;
+    if parked {
       self.region.doorbell()?.fetch_add(1, Ordering::AcqRel);
+      if let Some(bell) = &self.doorbell {
+        bell.ring()?;
+      }
     }
     Ok(())
   }
@@ -190,6 +208,11 @@ impl DaemonEnd {
   /// Wakes issued so far.
   pub fn wakes(&self) -> u64 {
     self.wakes
+  }
+
+  /// The ring index the next reply takes (its bulk chunk is chosen by it).
+  pub fn next_reply_index(&self) -> u64 {
+    self.next_reply
   }
 
   /// Takes the next request if one is there. A hostile slot is released and reported.

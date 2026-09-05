@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use slates_ipc::region::{ClientRegion, RegionGeometry};
 use slates_ipc::slot::Slot;
-use slates_ipc::{ClientEnd, DaemonEnd, IpcError, Listener, connect};
+use slates_ipc::{ClientEnd, DaemonEnd, IpcError, Listener, Prepared, connect};
 
 /// Format: the environment variable that turns this binary into the client.
 const CHILD_ROLE: &str = "SLATES_IPC_TEST_CLIENT";
@@ -36,8 +36,8 @@ fn rendezvous_client() {
   let Ok(instance) = std::env::var(CHILD_ROLE) else {
     return;
   };
-  let (region, _control) = connect(&instance).unwrap();
-  let mut client = ClientEnd::new(region);
+  let connected = connect(&instance).unwrap();
+  let mut client = ClientEnd::with_doorbell(connected.region, connected.doorbell);
   client
     .send(&Slot::inline(0x0007_0000_0000_0001, b"hello").unwrap())
     .unwrap();
@@ -66,12 +66,15 @@ fn a_client_process_connects_and_completes_a_round_trip() {
   while started.elapsed() < Duration::from_millis(SERVE_MS) && !served {
     let accepted = listener
       .accept_pending(&mut |client_id| {
-        ClientRegion::create(
-          &format!("slates-cr-{pid}-{client_id}"),
-          client_id,
-          0,
-          geometry(),
-        )
+        Ok(Prepared {
+          region: ClientRegion::create(
+            &format!("slates-cr-{pid}-{client_id}"),
+            client_id,
+            0,
+            geometry(),
+          )?,
+          kick_fd: None,
+        })
       })
       .unwrap();
     for a in accepted {

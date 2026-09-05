@@ -285,6 +285,7 @@ mod tests {
   #[test]
   #[cfg_attr(miri, ignore)] // mlock and the OS's locked-byte report are not modelled by Miri
   fn locking_a_small_region_is_reported_by_the_os_within_one_page() {
+    let _serial = crate::test_serial::Guard::take();
     let page = page();
     let mut r = Region::map(page * 64, page, false).unwrap();
     r.touch_pages(0, r.pages());

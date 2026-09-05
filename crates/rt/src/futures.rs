@@ -93,6 +93,30 @@ impl Future for YieldNow {
   }
 }
 
+/// Yields without re-queueing: the task resumes only when something wakes it (a registered
+/// poller's ring, a foreign wake, a cancellation). The idle form of a ring-polling task.
+pub fn idle() -> Idle {
+  Idle { yielded: false }
+}
+
+/// The idle future.
+#[derive(Debug)]
+pub struct Idle {
+  yielded: bool,
+}
+
+impl Future for Idle {
+  type Output = ();
+
+  fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+    if self.yielded {
+      return Poll::Ready(());
+    }
+    self.yielded = true;
+    Poll::Pending
+  }
+}
+
 /// Sleeps for `ns` on the shard's wheel (accuracy: one tick).
 pub fn sleep(ns: u64) -> Sleep {
   Sleep {

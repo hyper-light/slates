@@ -119,6 +119,19 @@ impl Quota {
     }
   }
 
+  /// Resizes (§4.4 `resize`): a bounded quota takes the new limit unless `referenced` already
+  /// exceeds it; a dynamic quota takes the new maximum.
+  pub fn resize(&mut self, referenced: u64, new_limit: u64) -> Result<(), crate::error::VfsError> {
+    if referenced > new_limit {
+      return Err(crate::error::VfsError::NoSpace);
+    }
+    match self {
+      Self::Bounded { limit } => *limit = new_limit,
+      Self::Dynamic { max, .. } => *max = new_limit,
+    }
+    Ok(())
+  }
+
   /// The quota's ceiling.
   pub fn limit(&self) -> u64 {
     match self {

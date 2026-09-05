@@ -15,12 +15,13 @@
 //! parked flag, re-checks the slot to close the race, and waits on the wake word; the daemon,
 //! after writing a reply, bumps the word and wakes only when the flag is set.
 //!
-//! Modules: [`slot`] (the slot and the ring), [`region`] (the client region's layout over a
+//! Modules: [`protocol`] (the bodies and their framing), [`slot`] (the slot and the ring), [`region`] (the client region's layout over a
 //! shared object), [`wake`] (the wake word per OS), [`rendezvous`] (per OS), [`endpoint`]
 //! (the daemon's and the client's ends), [`error`].
 
 pub mod endpoint;
 pub mod error;
+pub mod protocol;
 pub mod region;
 pub mod rendezvous;
 
@@ -30,5 +31,7 @@ pub mod wake;
 pub use endpoint::{ClientEnd, DaemonEnd, Reply, Request};
 pub use error::IpcError;
 pub use region::{ClientRegion, RegionGeometry};
-pub use rendezvous::{Accepted, Listener, connect, instance_from_env};
+pub use rendezvous::{
+  Accepted, Connected, Doorbell, Listener, Prepared, connect, instance_from_env,
+};
 pub use slot::{PAYLOAD_BYTES, Slot, SlotKind};

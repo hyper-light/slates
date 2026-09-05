@@ -45,3 +45,33 @@ pub use ring::SpscRing;
 pub use segmented::Segmented;
 pub use shared::{Handoff, SharedObject};
 pub use slab::Slab;
+
+/// Tests that observe the OS's locked-byte counter run one at a time: the counter is
+/// process-wide, and two of them locking at once read each other's bytes.
+#[cfg(test)]
+pub(crate) mod test_serial {
+  use std::sync::atomic::{AtomicBool, Ordering};
+
+  static BUSY: AtomicBool = AtomicBool::new(false);
+
+  /// Held for the test's duration; taken by spinning (a test harness, not a data path).
+  pub(crate) struct Guard;
+
+  impl Guard {
+    pub(crate) fn take() -> Guard {
+      while BUSY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+      {
+        std::hint::spin_loop();
+      }
+      Guard
+    }
+  }
+
+  impl Drop for Guard {
+    fn drop(&mut self) {
+      BUSY.store(false, Ordering::Release);
+    }
+  }
+}

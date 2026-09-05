@@ -76,7 +76,7 @@ jobs:
       - name: Clippy per target
         run: |
           for target in x86_64-unknown-linux-gnu x86_64-pc-windows-msvc aarch64-apple-darwin; do
-            cargo clippy -p slates-machine -p slates-mem -p slates-rt -p slates-wire --all-targets \
+            cargo clippy --workspace --exclude xtask --lib --bins \
               --no-default-features --features slates-machine/pure-hash --target "$target" -- -D warnings
           done
 

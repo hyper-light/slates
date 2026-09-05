@@ -18,5 +18,8 @@ libc = { workspace = true }
 [dev-dependencies]
 slates-mem = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 [lints]
 workspace = true

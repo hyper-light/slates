@@ -498,6 +498,67 @@ tells the daemon a client died where no socket closes, both with the server's in
 task 4; the bulk region's use by streams (Phase 5); ring depth and spin window are the
 daemon's derivation at rendezvous (task 4 wires the profile in).
 
+Task 4 (the server) landed 2026-09-05: `slates-server` (`crates/server`): the daemon's
+configuration as derivations from the profile (`config.rs`: clients per shard from Little's
+law, the shard reserve, the table and store caps, ring slots and the spin window, the segment
+geometry; every derivation logged with its inputs); the shard state in a thread-local cell on
+its shard's thread (`state.rs`: volumes with their base host and reservation, the partition,
+the store, the clients, the reserve, the deferred replies, the listings in flight); the verbs
+of §4.4 (`verbs.rs`: create scratch and overlay with the bounded reservation or the host's
+live memory as the dynamic quota's pressure source, snapshot, clone, attach with the lease
+taken or renewed under D-16's epoch rule and a read intent needing none, detach releasing the
+holder's last lease, resize moving the reservation, destroy in cooperative slices of half the
+step budget, status with the drift list, list as a scatter-gather over every shard, base
+verbs, acknowledgement, and the grant kind refused by channel and counted); the completion
+record of every reply appended before it is sent (RIFL); the rights of §4.13 checked per verb;
+a volume-bound verb from a client on another shard forwarded to the owner shard named by the
+id's first bytes and the reply routed back (route by id, no index); the daemon (`daemon.rs`:
+the segment created or attached from the anchor's environment, one mapping per shard, the
+profile published, each shard's partition recovered and its state installed by a task on that
+shard, the server loop as a poller of its clients' rings that idles otherwise and marks its
+clients' regions parked, the control shard's rendezvous loop woken by the doorbell thread and
+handing a client to its shard as a spawned task, the heartbeat at a tenth of the liveness
+budget, stop joining everything); the doorbell thread (`doorbell.rs`: Linux waits on the
+listening socket's readiness; macOS and Windows wait on the bootstrap object's word and kick
+every shard; the value last acted on is what the wait compares against, so a ring during a
+kick is never lost). The runtime gained pollers (`ShardContext::register_poller`: a task woken
+by the loop whenever its ring says so) and `futures::idle` (yield without re-queue); the IPC a
+shared protocol (`protocol.rs`: the bodies with one schema hash each, inline or through the
+bulk chunk the slot's ring index owns) and the doorbell handed at rendezvous (the shard's kick
+descriptor on Linux; the bootstrap word elsewhere); the volume core a `resize`.
+
+Gated (`crates/server/tests/daemon.rs`, a two-shard daemon in the test process over a fresh
+segment, one client at a time through the real rendezvous): the lifecycle (create, the
+duplicate refused with the original's id, snapshot, clone, attach with epoch 1, status, list,
+detach releasing the lease, resize, destroy completing in slices with the clone surviving);
+exactly-once (a retry under the same id returns the retained reply without executing, an
+acknowledgement releases it and a later retry is a stale duplicate); leases (a read attachment
+takes none; the same principal renews with its epoch); AC-2.8 (the grant kind refused on the
+ring and counted); a 200-byte name and an overlay over this crate's own source tree through
+the bulk area, `read_base` reading the disk, `pin`, and a missing base refused
+`BaseUnavailable`. Linux and Windows branches of the new crates lint clean from this machine.
+
+Found by the daemon's tests and fixed: a task spawned from a task is joinable and stays in
+the arena after it ends, so a daemon's perpetual tasks held its shutdown (they are detached at
+spawn now); the doorbell thread re-read its word before each wait and lost a ring that landed
+while it was kicking (it compares against the value last acted on); a client handed to a shard
+whose loop already idled found the parked flag clear on its fresh region and never rang (the
+hand-off wakes the loop, which marks the new client before idling again); a volume-bound verb
+from a client on another shard was refused `NotFound` (forwarded to the owner now).
+
+Found by the first cross-target lint of the Phase 1 base crate (a lane the Phase 0 crates had
+and Phase 1's did not): on Linux rustix's `stat` nanosecond fields are unsigned and the
+fingerprint's widening refused to compile; on Windows the fingerprint used unstable
+standard-library metadata (`windows_by_handle`, `windows_change_time`). Both fixed in the
+same change, and the cross-target lane now lints every shipped crate.
+
+Owed from task 4: the file verbs over the ring (Phase 5's SDKs; until then content is
+reachable in-process only); the Windows named-Event wake (Phase 4); one principal per uid
+until the fleet's certificates (Phase 8); the clients-per-shard and ring-depth derivations
+re-derived from measured rates at the first `status` (task 6 measures); `TargetIsVolume`
+and the bridge path in `Attached` (Phase 3); the health signals of §4.14 exported through
+`status` (task 6 with the histogram).
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3

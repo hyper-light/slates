@@ -670,6 +670,7 @@ dependencies = [
  "slates-machine",
  "slates-mem",
  "slates-vfs",
+ "windows-sys",
 ]
 
 [[package]]
@@ -749,6 +750,22 @@ dependencies = [
  "slates-machine",
  "slates-mem",
  "windows-sys",
+]
+
+[[package]]
+name = "slates-server"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "slates-anchor",
+ "slates-base",
+ "slates-db",
+ "slates-ipc",
+ "slates-machine",
+ "slates-mem",
+ "slates-rt",
+ "slates-vfs",
+ "slates-wire",
 ]
 
 [[package]]

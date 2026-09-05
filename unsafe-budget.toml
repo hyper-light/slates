@@ -19,14 +19,19 @@
 #   the IOCP calls are Win32 (6).
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
-# slates-base (2): rustix marks kevent unsafe because the kernel fills the output list; one
-#   registration and one drain of the macOS/BSD directory watcher.
+# slates-base (6): rustix marks kevent unsafe because the kernel fills the output list; one
+#   registration and one drain of the macOS/BSD directory watcher (2); the Windows fingerprint
+#   through the stable Win32 file-information calls (two zeroed records, two calls: 4), since
+#   the standard library's handle metadata is unstable on 1.98.
 # slates-vfs (0): the volume core is safe Rust over the arenas and slabs of slates-mem; the block
 #   layout is read and written through byte slices, never a cast.
 # slates-anchor (0): the segment is byte slices and the atomic views of slates-mem.
-# slates-ipc (3): the macOS wait-on-address and wake-by-address calls libc exposes without a
+# slates-ipc (4): the macOS wait-on-address and wake-by-address calls libc exposes without a
 #   safe wrapper (`wake.rs`), each on a live word of a shared mapping (2); the Linux rendezvous
-#   adopting the region descriptor it duplicated for the handoff before sending it (1).
+#   adopting the region descriptor it duplicated for the handoff before sending it (1) and
+#   borrowing the shard's leaked kick descriptor to duplicate it for the client (1).
+# slates-server (1): the Linux doorbell thread borrowing the daemon's listening socket by
+#   number for one readiness poll (`doorbell.rs`).
 # slates-db (0): records, indexes and the log are safe Rust over the segment's byte slices.
 # slates-land (3): the macOS libc calls rustix does not wrap, each on a descriptor the writer
 #   owns: fcntl(F_BARRIERFSYNC) as the data barrier, fcntl(F_FULLFSYNC) as the media barrier,
@@ -36,11 +41,12 @@
 slates-machine = 43
 slates-mem = 16
 slates-rt = 16
-slates-base = 2
+slates-base = 6
 slates-vfs = 0
 slates-land = 3
 slates-anchor = 0
 slates-db = 0
-slates-ipc = 3
+slates-ipc = 4
+slates-server = 1
 slates-wire = 4
 slates-wire-derive = 0

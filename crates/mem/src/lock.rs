@@ -80,6 +80,7 @@ mod tests {
   #[test]
   #[cfg_attr(miri, ignore)] // mlock is not modelled by Miri
   fn regions_lock_in_priority_order_within_capacity_and_report_the_rest() {
+    let _serial = crate::test_serial::Guard::take();
     let p = page();
     let mut chunks = Region::map(p * 8, p, false).unwrap();
     let mut meta = Region::map(p * 2, p, false).unwrap();
@@ -104,6 +105,7 @@ mod tests {
 
   #[test]
   fn zero_capacity_locks_nothing_and_crashes_nothing() {
+    let _serial = crate::test_serial::Guard::take();
     let p = page();
     let mut r = Region::map(p, p, false).unwrap();
     let mut list = [(Priority::Metadata, &mut r)];

@@ -100,6 +100,8 @@ pub struct Counters {
   pub admission_refused: u64,
   /// Idle spins that ended with work arriving.
   pub spin_hits: u64,
+  /// Pollers woken because their ring had something (client command rings).
+  pub poller_wakes: u64,
   /// Idle spins that ran out and parked.
   pub spin_misses: u64,
   /// Idle spins ended by a timer falling due.
@@ -161,6 +163,22 @@ impl ShardSeed {
   }
 }
 
+/// A poller: a task that owns an inbound ring the loop cannot see (a client's command ring
+/// in shared memory, §4.3 "drain inbound rings (client command rings, ...)"). The loop asks
+/// `ready` each step and during the idle spin, and wakes the task when it says so; the task
+/// yields with [`crate::futures::idle`] and is polled again only when woken.
+pub struct Poller {
+  slot: u32,
+  generation: u32,
+  ready: Box<dyn Fn() -> bool>,
+}
+
+impl std::fmt::Debug for Poller {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Poller").field("slot", &self.slot).finish()
+  }
+}
+
 /// The mutable state behind the borrow.
 pub struct ShardInner {
   arena: Slab<TaskSlot>,
@@ -172,6 +190,7 @@ pub struct ShardInner {
   shutting_down: bool,
   fired: Vec<u64>,
   completions: Vec<Completion>,
+  pollers: Vec<Poller>,
 }
 
 impl ShardInner {
@@ -248,6 +267,7 @@ impl ShardContext {
         config,
         counters: Counters::default(),
         shutting_down: false,
+        pollers: Vec::new(),
       }),
     })))
   }
@@ -503,7 +523,9 @@ impl ShardContext {
     loop {
       if self.has_inbound()
         || self
-          .with_inner(|inner| inner.driver.has_pending())
+          .with_inner(|inner| {
+            inner.driver.has_pending() || inner.pollers.iter().any(|p| (p.ready)())
+          })
           .unwrap_or(false)
       {
         self.with_inner(|inner| inner.counters.spin_hits += 1);
@@ -572,6 +594,7 @@ impl ShardContext {
         let mut work = self.drain_control(inner);
         work |= self.drain_inbound(inner);
         work |= self.expire_timers(inner);
+        work |= self.wake_ready_pollers(inner);
         (work, inner.config.batch)
       })
       .unwrap_or((false, 1));
@@ -701,6 +724,55 @@ impl ShardContext {
         any = true;
         inner.counters.wakes_pair += 1;
         self.handle_wake(inner, Encoded::from_word(word));
+      }
+    }
+    any
+  }
+
+  /// Registers `task` as a poller with `ready`; the loop wakes it whenever `ready` says so.
+  /// Refused when the task is not live on this shard.
+  pub fn register_poller(&self, task: TaskId, ready: Box<dyn Fn() -> bool>) -> Result<(), RtError> {
+    let slot = task.0.slot();
+    let generation = task.0.generation();
+    self
+      .with_inner(|inner| {
+        if !inner
+          .arena
+          .generation_at(slot)
+          .is_some_and(|g| g & GENERATION_MASK == generation)
+        {
+          return Err(RtError::StaleTask { slot, generation });
+        }
+        inner.pollers.push(Poller {
+          slot,
+          generation,
+          ready,
+        });
+        Ok(())
+      })
+      .unwrap_or(Err(RtError::NotOnShardThread))
+  }
+
+  /// Forgets a poller.
+  pub fn unregister_poller(&self, task: TaskId) {
+    let slot = task.0.slot();
+    self.with_inner(|inner| inner.pollers.retain(|p| p.slot != slot));
+  }
+
+  /// Wakes every poller whose ring is ready; a poller whose task ended is dropped.
+  fn wake_ready_pollers(&self, inner: &mut ShardInner) -> bool {
+    let mut any = false;
+    inner.pollers.retain(|p| {
+      inner
+        .arena
+        .generation_at(p.slot)
+        .is_some_and(|g| g & GENERATION_MASK == p.generation)
+    });
+    for p in &inner.pollers {
+      if (p.ready)() {
+        any = true;
+        inner.counters.poller_wakes += 1;
+        self.local.push(p.slot);
       }
     }
     any

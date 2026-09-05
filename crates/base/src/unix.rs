@@ -51,14 +51,20 @@ fn fingerprint(st: &Stat) -> Fingerprint {
     size: u64::try_from(st.st_size).unwrap_or(0),
     mtime_ns: stamp_ns(widen(st.st_mtime), widen(st.st_mtime_nsec)),
     ctime_ns: stamp_ns(widen(st.st_ctime), widen(st.st_ctime_nsec)),
-    mode: u32::from(st.st_mode),
+    mode: mode_word(st.st_mode),
   }
 }
 
-/// A `stat` time field as `i64`, whatever width the platform gives it (`c_long` is 32 bits on
-/// i686).
-fn widen<T: Into<i64>>(x: T) -> i64 {
-  x.into()
+/// A `stat` mode as `u32`, whatever width the platform gives it (`u16` on macOS).
+fn mode_word<T: Into<u32>>(mode: T) -> u32 {
+  mode.into()
+}
+
+/// A `stat` time field as `i64`, whatever width or sign the platform gives it (`c_long` is 32
+/// bits on i686; rustix's raw Linux backend carries the nanosecond fields unsigned); a value
+/// past `i64` saturates.
+fn widen<T: TryInto<i64>>(x: T) -> i64 {
+  x.try_into().unwrap_or(i64::MAX)
 }
 
 /// Seconds and nanoseconds as one nanosecond count, saturating at the type's edges (year 2262).
@@ -284,7 +290,7 @@ fn fs_kind(fs: &rustix::fs::StatFs) -> FsKind {
   const NTFS: i64 = 0x5346_544e;
   /// Format: the magic for HFS+.
   const HFSPLUS: i64 = 0x482b;
-  match i64::from(fs.f_type) {
+  match widen(fs.f_type) {
     EXT4 | XFS | BTRFS | TMPFS => FsKind::Nanosecond,
     NTFS => FsKind::HundredNanoseconds,
     HFSPLUS => FsKind::Second,
@@ -381,16 +387,11 @@ mod watch {
       let mut buf = [MaybeUninit::<u8>::uninit(); BUFFER_BYTES];
       let mut reader = Reader::new(inotify, &mut buf);
       let mut out = Vec::new();
-      loop {
-        match reader.next() {
-          Ok(event) => {
-            if event.events().contains(ReadFlags::QUEUE_OVERFLOW) {
-              out.push(Hint::Overflow);
-            } else if let Some(dir) = self.by_wd.get(&event.wd()) {
-              out.push(Hint::Changed(*dir));
-            }
-          }
-          Err(_) => break,
+      while let Ok(event) = reader.next() {
+        if event.events().contains(ReadFlags::QUEUE_OVERFLOW) {
+          out.push(Hint::Overflow);
+        } else if let Some(dir) = self.by_wd.get(&event.wd()) {
+          out.push(Hint::Changed(*dir));
         }
       }
       out.dedup();

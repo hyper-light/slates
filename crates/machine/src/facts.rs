@@ -135,6 +135,13 @@ pub(crate) use platform::sysctl_u64;
 
 impl Facts {
   /// Queries every fact from the OS.
+  /// Memory available to a new allocation right now, as the OS estimates it (one cheap query;
+  /// the pressure source of dynamic quotas asks this before each growth, §4.2).
+  pub fn memory_available_now() -> Option<u64> {
+    platform::available_bytes()
+  }
+
+  /// Every fact, queried now (the boot profile's input).
   pub fn query() -> Facts {
     let mut notes = Vec::new();
     let page = platform::page(&mut notes);
@@ -370,7 +377,7 @@ mod platform {
     fn mach_host_self() -> libc::mach_port_t;
   }
 
-  fn available_bytes() -> Option<u64> {
+  pub(super) fn available_bytes() -> Option<u64> {
     let page = sysctl_u64(c"hw.pagesize")?;
     // SAFETY: an all-zero libc::vm_statistics64 is a valid, if empty, value for the call below to fill.
     let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
@@ -657,19 +664,23 @@ mod platform {
       u64::from(info.totalram).saturating_mul(unit),
       u64::from(info.freeram).saturating_mul(unit),
     );
-    let available = read("/proc/meminfo")
-      .and_then(|text| {
-        text
-          .lines()
-          .find_map(|l| l.strip_prefix("MemAvailable:"))
-          .and_then(parse_size)
-      })
-      .unwrap_or(free);
+    let available = available_bytes().unwrap_or(free);
     MemoryFacts {
       total,
       available,
       address_bits: usize::BITS,
     }
+  }
+
+  /// Memory available to a new allocation without reclaim, as the kernel estimates it now
+  /// (`MemAvailable` of `/proc/meminfo`).
+  pub(super) fn available_bytes() -> Option<u64> {
+    read("/proc/meminfo").and_then(|text| {
+      text
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(parse_size)
+    })
   }
 
   pub(super) fn power(notes: &mut Vec<String>) -> PowerState {
@@ -733,6 +744,12 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
+  /// The live "available" probe arrives with the Windows bridge (Phase 4); the facts' value
+  /// stands until then.
+  pub(super) fn available_bytes() -> Option<u64> {
+    None
+  }
+
   use super::{
     CACHE_LINE_FALLBACK, CoreClass, CoreFacts, MemoryFacts, PageFacts, PowerState, parallelism,
   };

@@ -383,19 +383,34 @@ mod platform {
   use super::Handoff;
   use crate::error::MemError;
 
+  /// The section and its view. The view is kept as its exposed address, not a pointer, so
+  /// the object is `Send` (a mapping belongs to the process, not a thread) without an unsafe
+  /// impl; the pointer is recovered with the provenance the exposure recorded.
   pub(super) struct Inner {
-    handle: HANDLE,
-    view: *mut c_void,
+    handle: usize,
+    view: usize,
     len: usize,
     name: String,
+  }
+
+  impl Inner {
+    fn view_ptr(&self) -> *mut c_void {
+      std::ptr::with_exposed_provenance_mut(self.view)
+    }
+
+    fn handle(&self) -> HANDLE {
+      std::ptr::with_exposed_provenance_mut(self.handle)
+    }
   }
 
   impl Drop for Inner {
     fn drop(&mut self) {
       // SAFETY: the view and handle were created or opened by this module and are ours.
       unsafe {
-        UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.view });
-        CloseHandle(self.handle);
+        UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+          Value: self.view_ptr(),
+        });
+        CloseHandle(self.handle());
       }
     }
   }
@@ -454,8 +469,8 @@ mod platform {
     }
     let view = view(handle, len)?;
     Ok(Inner {
-      handle,
-      view,
+      handle: handle.expose_provenance(),
+      view: view.expose_provenance(),
       len,
       name: name.to_owned(),
     })
@@ -476,8 +491,8 @@ mod platform {
     }
     let view = view(handle, len)?;
     Ok(Inner {
-      handle,
-      view,
+      handle: handle.expose_provenance(),
+      view: view.expose_provenance(),
       len,
       name: name.clone(),
     })
@@ -486,18 +501,18 @@ mod platform {
   impl Inner {
     pub(super) fn bytes(&self) -> &[u8] {
       // SAFETY: the view is `len` readable bytes for as long as `self` lives.
-      unsafe { std::slice::from_raw_parts(self.view.cast::<u8>(), self.len) }
+      unsafe { std::slice::from_raw_parts(self.view_ptr().cast::<u8>(), self.len) }
     }
 
     pub(super) fn bytes_mut(&mut self) -> &mut [u8] {
       // SAFETY: the view is `len` writable bytes for as long as `self` lives, and `&mut self`
       // is the only borrow of them in this process.
-      unsafe { std::slice::from_raw_parts_mut(self.view.cast::<u8>(), self.len) }
+      unsafe { std::slice::from_raw_parts_mut(self.view_ptr().cast::<u8>(), self.len) }
     }
 
     pub(super) fn lock(&mut self) -> Result<(), MemError> {
       // SAFETY: the view is ours and `len` bytes long.
-      let ok = unsafe { VirtualLock(self.view, self.len) };
+      let ok = unsafe { VirtualLock(self.view_ptr(), self.len) };
       if ok == 0 {
         return Err(os("VirtualLock"));
       }

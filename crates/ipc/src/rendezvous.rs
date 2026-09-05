@@ -33,6 +33,24 @@ pub fn instance_from_env() -> String {
   std::env::var(ENV_ENDPOINT).unwrap_or_else(|_| DEFAULT_INSTANCE.to_owned())
 }
 
+/// What the daemon prepares for a client: its region on its shard and, on Linux, the shard's
+/// kick descriptor the client writes to wake a parked shard (macOS and Windows ring the
+/// daemon-wide doorbell word of the bootstrap object instead).
+pub struct Prepared {
+  /// The region.
+  pub region: ClientRegion,
+  /// The shard's kick descriptor (Linux: an eventfd), duplicated for the client.
+  pub kick_fd: Option<i32>,
+}
+
+impl std::fmt::Debug for Prepared {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Prepared")
+      .field("region", &self.region)
+      .finish()
+  }
+}
+
 /// A client the daemon accepted: its id, its uid, and the region the daemon keeps.
 pub struct Accepted {
   /// The client id the daemon assigned.
@@ -86,7 +104,7 @@ impl Listener {
   /// completed. A refused peer is counted and skipped.
   pub fn accept_pending(
     &mut self,
-    make_region: &mut dyn FnMut(u32) -> Result<ClientRegion, IpcError>,
+    make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
   ) -> Result<Vec<Accepted>, IpcError> {
     let mut out = Vec::new();
     loop {
@@ -108,13 +126,87 @@ impl Listener {
   pub fn refused(&self) -> u64 {
     self.refused
   }
+
+  /// The daemon-wide doorbell word clients ring when a shard is parked (macOS, Windows: the
+  /// bootstrap object's word the doorbell thread waits on); none on Linux, where a client
+  /// writes the shard's kick descriptor.
+  pub fn doorbell(&self) -> Option<&std::sync::atomic::AtomicU32> {
+    self.inner.doorbell()
+  }
+
+  /// A second mapping of the bootstrap object and the doorbell's offset, for the doorbell
+  /// thread to wait on (macOS, Windows); none on Linux.
+  pub fn doorbell_waiter(&self) -> Result<Option<(slates_mem::SharedObject, usize)>, IpcError> {
+    self.inner.doorbell_waiter()
+  }
+
+  /// The listening socket's descriptor (Linux), for the doorbell thread's readiness wait.
+  pub fn raw_fd(&self) -> Option<i32> {
+    self.inner.raw_fd()
+  }
+}
+
+/// What a client rings to wake a parked shard.
+pub enum Doorbell {
+  /// Write eight bytes to the shard's kick eventfd (Linux).
+  #[cfg(target_os = "linux")]
+  Eventfd(std::os::fd::OwnedFd),
+  /// Bump and wake the daemon-wide word in the bootstrap object (macOS, Windows).
+  Word {
+    /// The bootstrap object.
+    object: slates_mem::SharedObject,
+    /// The word's offset.
+    offset: usize,
+  },
+}
+
+impl std::fmt::Debug for Doorbell {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str("Doorbell")
+  }
+}
+
+impl Doorbell {
+  /// Rings.
+  pub fn ring(&self) -> Result<(), IpcError> {
+    match self {
+      #[cfg(target_os = "linux")]
+      Doorbell::Eventfd(fd) => rustix::io::write(fd, &1u64.to_ne_bytes())
+        .map(|_| ())
+        .map_err(|e| IpcError::OsRefused {
+          call: "eventfd write",
+          code: Some(e.raw_os_error()),
+        }),
+      Doorbell::Word { object, offset } => {
+        let word = object.atomic_u32(*offset)?;
+        word.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        crate::wake::wake_one(word)
+      }
+    }
+  }
 }
 
 /// The client's side: connects to `instance` and returns its region.
-pub fn connect(
-  instance: &str,
-) -> Result<(ClientRegion, Option<platform::ClientControl>), IpcError> {
+pub fn connect(instance: &str) -> Result<Connected, IpcError> {
   platform::connect(instance)
+}
+
+/// What a client holds after the rendezvous.
+pub struct Connected {
+  /// The region.
+  pub region: ClientRegion,
+  /// The doorbell.
+  pub doorbell: Doorbell,
+  /// The control channel, where the platform has one.
+  pub control: Option<platform::ClientControl>,
+}
+
+impl std::fmt::Debug for Connected {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Connected")
+      .field("region", &self.region)
+      .finish()
+  }
 }
 
 /// The rendezvous name for an instance, per user.
@@ -139,7 +231,7 @@ pub mod platform {
   };
   use slates_mem::Handoff;
 
-  use super::{Accepted, rendezvous_name};
+  use super::{Accepted, Connected, Doorbell, Prepared, rendezvous_name};
   use crate::error::IpcError;
   use crate::region::ClientRegion;
 
@@ -149,8 +241,8 @@ pub mod platform {
   const HANDOFF_AT_CLIENT: usize = 0;
   /// Format: the region length's offset in the handoff message.
   const HANDOFF_AT_LEN: usize = 4;
-  /// Format: descriptors in the handoff: the region and the completion eventfd.
-  const HANDOFF_FDS: usize = 2;
+  /// Format: descriptors in the handoff: the region, the completion eventfd, the shard's kick.
+  const HANDOFF_FDS: usize = 3;
   /// Shape: the listen backlog (connections pending accept); the control shard drains them
   /// every loop, so the backlog only covers one loop of arrivals.
   const BACKLOG: i32 = 64;
@@ -207,10 +299,25 @@ pub mod platform {
       })
     }
 
+    pub(super) fn doorbell(&self) -> Option<&std::sync::atomic::AtomicU32> {
+      None
+    }
+
+    pub(super) fn doorbell_waiter(
+      &self,
+    ) -> Result<Option<(slates_mem::SharedObject, usize)>, IpcError> {
+      Ok(None)
+    }
+
+    pub(super) fn raw_fd(&self) -> Option<i32> {
+      use std::os::fd::AsRawFd;
+      Some(self.socket.as_raw_fd())
+    }
+
     pub(super) fn accept_one(
       &mut self,
       client_id: u32,
-      make_region: &mut dyn FnMut(u32) -> Result<ClientRegion, IpcError>,
+      make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
     ) -> Result<Option<Accepted>, IpcError> {
       let peer = match rustix::net::accept_with(&self.socket, SocketFlags::CLOEXEC) {
         Ok(fd) => fd,
@@ -222,12 +329,22 @@ pub mod platform {
       if uid != self.uid {
         return Err(IpcError::PeerRefused { uid });
       }
-      let region = make_region(client_id)?;
+      let Prepared { region, kick_fd } = make_region(client_id)?;
       let (handoff, len) = region.handoff()?;
       let Handoff::Descriptor(raw) = handoff else {
         return Err(IpcError::Layout {
           reason: "a Linux region hands off a descriptor",
         });
+      };
+      let kick = match kick_fd {
+        Some(fd) => rustix::io::dup(
+          // SAFETY: the number names the shard's kick eventfd, a descriptor the runtime
+          // leaked for the process; borrowing it for the duplicate is sound.
+          unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
+        )
+        .map_err(|e| refused("dup", e))?,
+        None => rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
+          .map_err(|e| refused("eventfd", e))?,
       };
       // SAFETY: the number is the duplicate `handoff` created for a child to inherit; this
       // process owns it and closes it after the send.
@@ -240,7 +357,7 @@ pub mod platform {
       let mut body = [0u8; HANDOFF_BYTES];
       body[HANDOFF_AT_CLIENT..HANDOFF_AT_LEN].copy_from_slice(&client_id.to_le_bytes());
       body[HANDOFF_AT_LEN..].copy_from_slice(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
-      let fds = [region_fd.as_fd(), completion.as_fd()];
+      let fds = [region_fd.as_fd(), completion.as_fd(), kick.as_fd()];
       let mut space =
         [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(HANDOFF_FDS))];
       let mut control = SendAncillaryBuffer::new(&mut space);
@@ -264,7 +381,7 @@ pub mod platform {
     }
   }
 
-  pub(super) fn connect(instance: &str) -> Result<(ClientRegion, Option<ClientControl>), IpcError> {
+  pub(super) fn connect(instance: &str) -> Result<Connected, IpcError> {
     let socket = rustix::net::socket_with(
       AddressFamily::UNIX,
       SocketType::STREAM,
@@ -304,6 +421,9 @@ pub mod platform {
         reason: "the handoff carried the wrong number of descriptors",
       });
     }
+    let kick = fds.pop().ok_or(IpcError::Layout {
+      reason: "no kick fd",
+    })?;
     let completion = fds.pop().ok_or(IpcError::Layout {
       reason: "no completion fd",
     })?;
@@ -315,7 +435,11 @@ pub mod platform {
     let len = usize::try_from(u64::from_le_bytes(len_word)).unwrap_or(0);
     let raw = std::os::fd::IntoRawFd::into_raw_fd(region_fd);
     let region = ClientRegion::open(&Handoff::Descriptor(raw), len)?;
-    Ok((region, Some(ClientControl { socket, completion })))
+    Ok(Connected {
+      region,
+      doorbell: Doorbell::Eventfd(kick),
+      control: Some(ClientControl { socket, completion }),
+    })
   }
 }
 
@@ -327,15 +451,18 @@ pub mod platform {
 
   use slates_mem::{Handoff, SharedObject};
 
-  use super::{Accepted, rendezvous_name};
+  use super::{Accepted, Connected, Doorbell, Prepared, rendezvous_name};
   use crate::error::IpcError;
   use crate::region::ClientRegion;
   use crate::wake;
 
   /// Format: the bootstrap object's magic, `SLBT` in little-endian ASCII.
   const MAGIC: u32 = 0x5442_4C53;
-  /// Format: the bootstrap header: magic (4), slots (4), padding to a cache line.
+  /// Format: the bootstrap header: magic (4), slots (4), the daemon-wide doorbell word (4),
+  /// padding to a cache line.
   const HEADER_BYTES: usize = 64;
+  /// Format: the doorbell word's offset in the header.
+  pub const AT_DOORBELL: usize = 8;
   /// Shape: claim slots in the bootstrap object: clients connecting inside one control-shard
   /// loop; the loop drains them, so the table only covers one loop of arrivals.
   const SLOTS: usize = 64;
@@ -403,17 +530,31 @@ pub mod platform {
       Ok(Listener { object })
     }
 
+    pub(super) fn doorbell(&self) -> Option<&AtomicU32> {
+      self.object.atomic_u32(AT_DOORBELL).ok()
+    }
+
+    pub(super) fn doorbell_waiter(&self) -> Result<Option<(SharedObject, usize)>, IpcError> {
+      let handoff = self.object.handoff()?;
+      let object = SharedObject::open(&handoff, self.object.len())?;
+      Ok(Some((object, AT_DOORBELL)))
+    }
+
+    pub(super) fn raw_fd(&self) -> Option<i32> {
+      None
+    }
+
     pub(super) fn accept_one(
       &mut self,
       client_id: u32,
-      make_region: &mut dyn FnMut(u32) -> Result<ClientRegion, IpcError>,
+      make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
     ) -> Result<Option<Accepted>, IpcError> {
       for i in 0..SLOTS {
         let word = state(&self.object, i)?;
         match word.load(Ordering::Acquire) {
           DONE => word.store(FREE, Ordering::Release),
           CLAIMED => {
-            let region = make_region(client_id)?;
+            let Prepared { region, .. } = make_region(client_id)?;
             let (handoff, len) = region.handoff()?;
             let Handoff::Name(name) = handoff else {
               return Err(IpcError::Layout {
@@ -486,7 +627,7 @@ pub mod platform {
     std::process::id()
   }
 
-  pub(super) fn connect(instance: &str) -> Result<(ClientRegion, Option<ClientControl>), IpcError> {
+  pub(super) fn connect(instance: &str) -> Result<Connected, IpcError> {
     let handoff =
       SharedObject::handoff_for_name(&rendezvous_name(instance)).ok_or(IpcError::Unsupported {
         feature: "rendezvous by name",
@@ -529,6 +670,11 @@ pub mod platform {
       let mut object = object;
       object.bytes_mut()[at + AT_PID..at + AT_PID + 4]
         .copy_from_slice(&current_pid().to_le_bytes());
+      // Ring the daemon-wide doorbell so a parked control shard sees the claim.
+      if let Ok(bell) = object.atomic_u32(AT_DOORBELL) {
+        bell.fetch_add(1, Ordering::AcqRel);
+        let _ = wake::wake_one(bell);
+      }
       let word = state(&object, index)?;
       // Wait for READY (spin then wait on the word).
       let started = std::time::Instant::now();
@@ -560,7 +706,14 @@ pub mod platform {
       };
       let region = ClientRegion::open(&Handoff::Name(name), len)?;
       state(&object, index)?.store(DONE, Ordering::Release);
-      Ok((region, Some(ClientControl)))
+      Ok(Connected {
+        region,
+        doorbell: Doorbell::Word {
+          object,
+          offset: AT_DOORBELL,
+        },
+        control: Some(ClientControl),
+      })
     }
   }
 }
@@ -569,7 +722,7 @@ pub mod platform {
 pub mod platform {
   //! Other platforms: no rendezvous yet.
 
-  use super::Accepted;
+  use super::{Accepted, Connected, Prepared};
   use crate::error::IpcError;
   use crate::region::ClientRegion;
 
@@ -587,16 +740,31 @@ pub mod platform {
       })
     }
 
+    pub(super) fn doorbell(&self) -> Option<&std::sync::atomic::AtomicU32> {
+      None
+    }
+
+    pub(super) fn doorbell_waiter(
+      &self,
+    ) -> Result<Option<(slates_mem::SharedObject, usize)>, IpcError> {
+      Ok(None)
+    }
+
+    pub(super) fn raw_fd(&self) -> Option<i32> {
+      None
+    }
+
     pub(super) fn accept_one(
       &mut self,
       _client_id: u32,
-      _make_region: &mut dyn FnMut(u32) -> Result<ClientRegion, IpcError>,
+      _make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
     ) -> Result<Option<Accepted>, IpcError> {
+      let _ = ClientRegion::open;
       Ok(None)
     }
   }
 
-  pub(super) fn connect(instance: &str) -> Result<(ClientRegion, Option<ClientControl>), IpcError> {
+  pub(super) fn connect(instance: &str) -> Result<Connected, IpcError> {
     Err(IpcError::DaemonUnavailable {
       endpoint: instance.to_owned(),
     })
