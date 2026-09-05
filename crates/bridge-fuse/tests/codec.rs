@@ -222,3 +222,22 @@ fn init_handles_a_version_mismatch_and_a_short_body() {
     Err(FuseError::ShortBody { .. })
   ));
 }
+
+/// FUSE_WRITEBACK_CACHE must use the Linux kernel ABI bit `1 << 16` (`<linux/fuse.h>`), not
+/// `1 << 8` (which is FUSE_SPLICE_MOVE). Driven by an independent kernel vector: a kernel that
+/// offers the real writeback bit must have it negotiated. With the wrong value the intersection
+/// dropped it and writeback never turned on (source audit BUG-6).
+#[test]
+fn writeback_cache_uses_the_kernel_abi_bit() {
+  const KERNEL_WRITEBACK_CACHE: u64 = 1 << 16; // FUSE_WRITEBACK_CACHE in <linux/fuse.h>
+  assert_eq!(
+    flags::WRITEBACK_CACHE,
+    KERNEL_WRITEBACK_CACHE,
+    "the advertised bit must match the kernel ABI"
+  );
+  let negotiated = negotiate(&init_body(7, KERNEL_WRITEBACK_CACHE)).unwrap();
+  assert!(
+    negotiated.flags & KERNEL_WRITEBACK_CACHE != 0,
+    "a kernel offering the real writeback bit negotiates it"
+  );
+}

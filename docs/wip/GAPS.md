@@ -814,7 +814,10 @@ unserved opcode is a typed miss the daemon answers `ENOSYS`), encodes the daemon
 `fuse_write_out`, and a bounded `readdir` buffer), and computes the `FUSE_INIT` negotiation
 (`init.rs`: the intersection of the flags slates wants — writeback cache, parallel dirops,
 readdirplus, explicit data invalidation, big writes — and the kernel's, the minor version
-bounded to slates' 7.31 floor, and the sizes it will use). Every field is read and written in
+bounded to slates' 7.31 floor, and the sizes it will use). The writeback-cache flag's advertised
+bit was corrected to the Linux ABI value `1 << 16` (`<linux/fuse.h>`); it had been `1 << 8`
+(`FUSE_SPLICE_MOVE`), so writeback never negotiated — the source audit's BUG-6, fixed with a
+kernel-vector test. Every field is read and written in
 order through a bounds-checked sequential reader/writer (`wire.rs`), so no byte offset is a
 literal and a truncated or oversized message is a typed refusal, never a panic or an
 out-of-bounds read; the crate holds no `unsafe`.
