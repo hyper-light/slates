@@ -33,6 +33,7 @@ pub mod prefault;
 pub mod region;
 pub mod ring;
 pub mod segmented;
+pub mod shared;
 pub mod slab;
 
 pub use arena::{ChunkArena, Extent};
@@ -42,4 +43,5 @@ pub use mpsc::MpscRing;
 pub use region::Region;
 pub use ring::SpscRing;
 pub use segmented::Segmented;
+pub use shared::{Handoff, SharedObject};
 pub use slab::Slab;

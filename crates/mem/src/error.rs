@@ -60,6 +60,20 @@ pub enum MemError {
     /// The capacity given.
     capacity: usize,
   },
+  /// The OS refused a call on a shared memory object; the call is named.
+  OsRefused {
+    /// The call.
+    call: &'static str,
+    /// The OS error code, when one exists.
+    code: Option<i32>,
+  },
+  /// An offset into a shared object that is misaligned or past its end.
+  OutOfRange {
+    /// The offset asked for.
+    offset: usize,
+    /// The object's length.
+    len: usize,
+  },
 }
 
 impl fmt::Display for MemError {
@@ -102,6 +116,13 @@ impl fmt::Display for MemError {
       }
       Self::TooLarge { len, max } => write!(f, "{len} bytes exceeds the largest extent of {max}"),
       Self::BadCapacity { capacity } => write!(f, "ring capacity {capacity} is not a power of two"),
+      Self::OsRefused { call, code } => write!(f, "{call} refused (code {code:?})"),
+      Self::OutOfRange { offset, len } => {
+        write!(
+          f,
+          "offset {offset} is misaligned or past the {len}-byte object"
+        )
+      }
     }
   }
 }

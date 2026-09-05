@@ -396,6 +396,28 @@ bytes, groups, the 4 KiB block) carry their measurements. The example targets of
 benched crates share the name `bench`; cargo warns of the output collision and may make it an
 error, so a rename to `<crate>-bench` is owed before the Phase 2 crates add theirs.
 
+## 8d. Phase 2 record (2026-09-05)
+
+Task 1 (the anchor) landed 2026-09-05: `slates_mem::SharedObject` (`crates/mem/src/shared.rs`),
+the shared memory object of §4.7 created without a filesystem entry (`memfd_create`, `shm_open`
+under the 31-character limit, a `Local\` section), handed to another process by an inherited
+descriptor or a name, mapped whole, with atomic views of the words two processes touch; and
+`slates-anchor` (`crates/anchor`): the segment layout (a header with the magic, version,
+machine identity, generation and the persisted geometry; a supervision block of atomic words;
+the profile, the per-partition log rings, two snapshot slots per partition, the audit ring and
+the landing slots, every region page-aligned and every size a derivation the daemon passes in),
+create and attach with the seqlock rule (a torn header or payload is refused, a foreign
+identity is refused with both hashes, a wrong length is refused), publish and read of payloads,
+and the supervisor (start with the handoff in the child's environment, non-blocking `step`,
+restart on exit, a restart bound derived from the recovery budget and the measured daemon start
+p99, the crash loop recorded in the segment as the health plane's `daemon.alive` input).
+Gated: `crates/anchor/tests/anchor.rs` (create, attach through the handoff, the payloads, the
+refusals; a real child process, the test binary re-invoked, attaches from its environment,
+beats, exits, is restarted three times and refused the fourth, with every step visible in the
+segment). Owed from task 1: the profile is published by the daemon's boot (task 2 wires
+`MachineProfile` in); `slates anchor` as a CLI command arrives with task 5; held descriptors
+(the FUSE fd, the NFS socket) with Phases 3 and 4.
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3

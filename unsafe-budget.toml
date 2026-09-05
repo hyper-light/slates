@@ -9,7 +9,11 @@
 #   safe wrapper exists (7 sites, one helper each); the macOS thread-affinity hint (1); the
 #   file-backed map of the profile segment (1); the Win32 facts, probes and section (the rest,
 #   compiled only for Windows).
-# slates-mem (4): the Windows working-set raise and VirtualLock/VirtualUnlock (memmap2 covers Unix).
+# slates-mem (16): the Windows working-set raise and VirtualLock/VirtualUnlock (memmap2 covers
+#   Unix) (4); the shared memory object of §4.7 (`shared.rs`, added 2026-09-05 for Phase 2):
+#   the file-backed map of a memory object (1), the descriptor a child inherits (1), the two
+#   atomic views of mapped words (2), and the Windows section (create, open, view, drop, the two
+#   byte views and the lock: 8).
 # slates-rt (16): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
 #   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
 #   the IOCP calls are Win32 (6).
@@ -19,16 +23,18 @@
 #   registration and one drain of the macOS/BSD directory watcher.
 # slates-vfs (0): the volume core is safe Rust over the arenas and slabs of slates-mem; the block
 #   layout is read and written through byte slices, never a cast.
+# slates-anchor (0): the segment is byte slices and the atomic views of slates-mem.
 # slates-land (3): the macOS libc calls rustix does not wrap, each on a descriptor the writer
 #   owns: fcntl(F_BARRIERFSYNC) as the data barrier, fcntl(F_FULLFSYNC) as the media barrier,
 #   renameatx_np(RENAME_SWAP) as the exchange.
 
 [budget]
 slates-machine = 43
-slates-mem = 4
+slates-mem = 16
 slates-rt = 16
 slates-base = 2
 slates-vfs = 0
 slates-land = 3
+slates-anchor = 0
 slates-wire = 4
 slates-wire-derive = 0

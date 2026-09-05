@@ -1,0 +1,17 @@
+[package]
+name = "slates-anchor"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The anchor process's library: the shared segment (profile, op logs, catalog snapshots, audit log, landing manifests), attach, and supervision of the daemon (design §2.5, §2.6, §4.8; Phase 2 task 1)."
+
+[dependencies]
+slates-machine = { workspace = true }
+slates-mem = { workspace = true }
+slates-wire = { workspace = true }
+
+[lints]
+workspace = true
