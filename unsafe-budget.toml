@@ -38,6 +38,7 @@
 #   process (`peer.rs`, added 2026-09-05 with the dead-client reclaim): open, wait with a zero
 #   timeout, close (3), compiled only for Windows.
 # slates-db (0): records, indexes and the log are safe Rust over the segment's byte slices.
+# slates-merge (0): the verdict is a pure sweep over ranges and a memcmp; safe Rust throughout.
 # slates-client (0): the rings and the rendezvous are slates-ipc's; the client is safe Rust.
 # slates-cli (4): the stop flag's handlers (`signal.rs`): `signal(2)` for SIGINT and SIGTERM on
 #   Unix (1), and on Windows the console control handler, an `unsafe extern` function by
@@ -66,4 +67,5 @@ slates-client = 0
 slates-cli = 4
 slates-wire = 4
 slates-bridge-fuse = 0
+slates-merge = 0
 slates-wire-derive = 0

@@ -932,6 +932,35 @@ as a whole token. The end-to-end CLI flow test (`crates/cli/tests/cli.rs`) is ga
 spin, and a busy parallel `cargo test --workspace` starves them; on its own (the CI step passes
 `--test-threads=1`) it is reliable.
 
+## 8f. Phase 6 groundwork (2026-09-05)
+
+The merge engine's deterministic verdict — the pure core of §4.16 (D-27) — landed 2026-09-05 as
+`slates-merge` (`crates/merge`), ahead of the rest of Phase 6, because it is a self-contained
+pure function that needs none of the fleet or the green-volume integration to be correct and
+directly confirmable. `range.rs` is the byte range and the per-path `RangeSet` (sorted,
+non-overlapping, with the half-open overlap rule that an insert at the very edge of a range does
+not conflict). `verdict.rs` is the two passes: `path_verdict` sweeps the increment's ranges
+against the intervening deltas' effect ranges on one path — disjoint ranges `Accept`, an
+identical span becomes a candidate for pass two, an insert anchored inside a change or two
+inserts at one point are `SamePositionDiffering`, any other overlap or containment is `Overlap`;
+a structural class the sweep cannot see (rename/create/type/meta/delete-vs-modify) is passed in
+and returned directly. `compare_bytes` is pass two (a memcmp: equal bytes `AcceptIdentical`,
+else a conflict). `fast_path` is the whole-increment shortcut: every touched path last changed
+at or before the base means `Accept` with no range work, and it never decides a conflict. The
+sweep is a linear merge of two sorted lists; it does no I/O, reads no clock, draws no randomness,
+and its hot comparison allocates nothing (a lint and a no-alloc test to pin that are owed).
+
+Gated (`crates/merge/tests/verdict.rs`, 9 tests, every host — the verdict is pure; the hecate
+M-matrix as range cases): disjoint accepts, no-intervening-change accepts, overlap and
+containment conflict, an identical span becomes a candidate that pass two resolves to
+identical-or-conflict, an insert inside a change conflicts while one at the edge accepts, two
+inserts at one point are resolved by pass two, every structural class is returned directly, and
+the fast path accepts an untouched basis. Owed (the rest of Phase 6): declared operations and
+the deriver (compose the journal into a net op set, never a diff), the canonical deltas and
+position mapping through (base, head] with checkpoints, the splice by extent surgery, the green
+chain and the fenced ledger register, and holder recomputation in a fleet; these build on the
+green-volume data model (§4.5's journal is in place; the version chain is not yet).
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3

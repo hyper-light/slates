@@ -781,6 +781,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-merge"
+version = "0.1.0"
+
+[[package]]
 name = "slates-rt"
 version = "0.1.0"
 dependencies = [
