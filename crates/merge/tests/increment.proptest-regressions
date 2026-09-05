@@ -5,3 +5,8 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 901a1a0807276c056480d2ca356a6e44c500085777b27c29f1eb35f8b82b5dea # shrinks to base_lens = [0, 0, 0], raws = [[], [], [Raw { kind: 36, a: 0, b: 0 }]]
+cc 3d3d3de9352ea4dbe1623f4445a28ff6ccaba5b765c2c5d9f19ac2d530d2c20f # shrinks to base_present = [false, false, true], base_lens = [0, 0, 0], raw = [Raw { path: 2, kind: 19, a: 0, b: 0 }, Raw { path: 2, kind: 0, a: 0, b: 0 }, Raw { path: 2, kind: 19, a: 0, b: 0 }, Raw { path: 2, kind: 0, a: 0, b: 0 }]
+cc f25159209364fc383904df0e4f507de72470a5a730bf36c439d0ae6f3531e32d # shrinks to base_present = [false, false, true], base_lens = [0, 0, 2], raw = [Raw { path: 2, kind: 204, a: 0, b: 34 }, Raw { path: 2, kind: 67, a: 32, b: 2 }]
+cc 9e4ae5a80c3c74467688f0c0f53aa3ca2332bd054506ad18363362e6c064929d # shrinks to base_present = [false, true, false], base_lens = [0, 0, 0], raw = [Raw { path: 1, kind: 20, a: 21, b: 0 }, Raw { path: 1, kind: 0, a: 0, b: 0 }, Raw { path: 0, kind: 222, a: 0, b: 0 }]
+cc 2c156d092edff7cc71ffe803bbe17e25aabc234e23b5e907627ddaf2b20d5c83 # shrinks to base_present = [true, true, false], base_lens = [0, 0, 0], raw = [Raw { path: 1, kind: 146, a: 44, b: 0 }, Raw { path: 0, kind: 55, a: 8, b: 0 }]
+cc 9b6d9d14b0f8e5ae6855e99edfff4097a3219220c1c7a91e744e16ba162dbd62 # shrinks to base_present = [false, true, false], base_lens = [0, 0, 0], raw = [Raw { path: 1, kind: 208, a: 0, b: 0 }, Raw { path: 1, kind: 0, a: 0, b: 0 }]

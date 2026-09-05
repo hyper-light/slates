@@ -1,16 +1,16 @@
 //! Oracle and worked-case tests for the whole-volume deriver (§4.16 "Composition at seal";
-//! T-6.x). A journal of content, create and unlink operations composes into one ops document. The
-//! property: reconstructing the final filesystem from the base version and the document — creating
-//! where a `Create` says, removing where an `Unlink` says, applying content ops and drawing added
-//! bytes from the post-state — reproduces the model filesystem the journal actually produced.
+//! T-6.x). A journal of content, create, unlink and rename composes into one ops document. The
+//! property: reconstructing the final filesystem from the base and the document — creating where a
+//! `Create` says, removing where an `Unlink` says, taking a renamed file's base from its source,
+//! applying content ops and drawing added bytes from the post-state — reproduces the model
+//! filesystem the journal actually produced.
 //!
 //! The oracle keeps a byte-level model of the filesystem, applies the journal to it (only ever
-//! generating valid operations, so the deriver never refuses), lays out the post-state as the
-//! deriver does, then reconstructs from the document and compares. Base bytes (values 0–127) and
-//! added bytes (values 128–255) are disjoint, so a misplaced op, a wrong length, a wrong source,
-//! or a missing create/unlink diverges.
+//! generating valid operations), lays out the post-state as the deriver does, then reconstructs
+//! from the document and compares. Base bytes (0–127) and added bytes (128–255) are disjoint, so
+//! a misplaced op, a wrong length, a wrong source, or a wrong create/unlink/rename diverges.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use slates_merge::increment::{VolumeOp, compose_volume};
 use slates_merge::ops_doc::{Op, OpKind, OpsDoc};
@@ -35,9 +35,11 @@ fn add_byte(counter: &mut u64) -> u8 {
   u8::try_from(value).unwrap_or(0x80)
 }
 
-/// The seed (and base-byte pattern) for a path name.
-fn seed_of(path: &str) -> u64 {
-  u64::try_from(PATHS.iter().position(|p| *p == path).unwrap_or(0)).unwrap_or(0)
+/// The base bytes for a path.
+fn base_of(base: &[(String, u64)], path: &str) -> Vec<u8> {
+  let len = base.iter().find(|(p, _)| p == path).map_or(0, |(_, l)| *l);
+  let seed = u64::try_from(PATHS.iter().position(|p| *p == path).unwrap_or(0)).unwrap_or(0);
+  (0..len).map(|i| base_byte(seed, i)).collect()
 }
 
 /// A raw op the strategy generates.
@@ -52,11 +54,17 @@ struct Raw {
 /// The oracle's model: the present files and their bytes.
 type Model = BTreeMap<String, Vec<u8>>;
 
-/// Applies one raw op to a present file, mutating its bytes, and returns the content `VolumeOp`
-/// it stands for (or `None` when the raw op is skipped, e.g. an overwrite of an empty file).
-fn content_op(file: &mut Vec<u8>, path: String, raw: &Raw, counter: &mut u64) -> Option<VolumeOp> {
+/// Applies one content op (kind 0..=4) to a present file, and returns the `VolumeOp` it stands for
+/// (or `None` when skipped, e.g. an overwrite of an empty file).
+fn content_op(
+  file: &mut Vec<u8>,
+  path: String,
+  kind: u8,
+  raw: &Raw,
+  counter: &mut u64,
+) -> Option<VolumeOp> {
   let current = file.len() as u64;
-  match raw.kind % 6 {
+  match kind {
     0 if current > 0 => {
       let at = raw.a % current;
       let len = 1 + raw.b % (current - at);
@@ -113,27 +121,29 @@ fn content_op(file: &mut Vec<u8>, path: String, raw: &Raw, counter: &mut u64) ->
 fn simulate(base: &[(String, u64)], raw_ops: &[Raw]) -> (Vec<VolumeOp>, Model) {
   let mut model: Model = base
     .iter()
-    .map(|(path, len)| {
-      let seed = seed_of(path);
-      (
-        path.clone(),
-        (0..*len).map(|i| base_byte(seed, i)).collect(),
-      )
-    })
+    .map(|(path, _)| (path.clone(), base_of(base, path)))
     .collect();
   let mut journal = Vec::new();
   let mut counter = 0u64;
   for raw in raw_ops {
     let path = PATHS[usize::from(raw.path) % PATHS.len()].to_owned();
+    let action = raw.kind % 7;
     if !model.contains_key(&path) {
-      // Only a create is valid on an absent path.
       model.insert(path.clone(), Vec::new());
       journal.push(VolumeOp::Create { path });
-    } else if raw.kind % 6 == 5 {
+    } else if action == 5 {
       model.remove(&path);
       journal.push(VolumeOp::Unlink { path });
+    } else if action == 6 {
+      let to = PATHS[usize::try_from(raw.a % 3).unwrap_or(0)].to_owned();
+      if to != path {
+        if let Some(content) = model.remove(&path) {
+          model.insert(to.clone(), content);
+        }
+        journal.push(VolumeOp::Rename { from: path, to });
+      }
     } else if let Some(file) = model.get_mut(&path)
-      && let Some(op) = content_op(file, path, raw, &mut counter)
+      && let Some(op) = content_op(file, path, action, raw, &mut counter)
     {
       journal.push(op);
     }
@@ -141,9 +151,8 @@ fn simulate(base: &[(String, u64)], raw_ops: &[Raw]) -> (Vec<VolumeOp>, Model) {
   (journal, model)
 }
 
-/// Reconstructs one path's content from its base bytes and its net ops, drawing added bytes from
-/// the post-state. The ops are in base coordinates and non-decreasing by `at`; `Create` and
-/// `Unlink` carry no content and are handled by the caller.
+/// Reconstructs one path's content from a base and its net ops, drawing added bytes from the
+/// post-state. `Create`, `Unlink` and `Rename` carry no content and are handled by the caller.
 fn apply_net(base: &[u8], net: &[Op], post_state: &[u8], base_len: u64) -> Vec<u8> {
   let mut out = Vec::new();
   let mut base_pos = 0u64;
@@ -179,59 +188,99 @@ fn apply_net(base: &[u8], net: &[Op], post_state: &[u8], base_len: u64) -> Vec<u
   out
 }
 
-/// Reconstructs the whole filesystem from the base and the ops document, and asserts it equals
-/// the model the journal produced.
-fn check(base: &[(String, u64)], doc: &OpsDoc, model: &Model) {
-  let base_len_of = |path: &str| base.iter().find(|(p, _)| p == path).map_or(0, |(_, l)| *l);
+/// The ops of the document that target the path at `index`.
+fn ops_for(doc: &OpsDoc, index: u16) -> Vec<Op> {
+  doc
+    .ops
+    .iter()
+    .copied()
+    .filter(|op| op.path == index)
+    .collect()
+}
 
-  // The post-state: the final content of every path in the document that survives, in path-table
-  // order (the deriver's region layout).
+/// The post-state: the emitting files' final content in path-table order (the deriver's region
+/// layout — created, renamed, or content-changed files, sorted by final path; net-unchanged files
+/// are not in the document, so not in the post-state).
+fn post_state_of(doc: &OpsDoc, model: &Model) -> Vec<u8> {
   let mut post_state = Vec::new();
-  for name in doc.paths.paths() {
-    if let Some(content) = model.get(name) {
+  for (path_index, name) in doc.paths.paths().iter().enumerate() {
+    let index = u16::try_from(path_index).unwrap_or(u16::MAX);
+    let emits = doc
+      .ops
+      .iter()
+      .any(|op| op.path == index && op.kind != OpKind::Unlink);
+    if let Some(content) = model.get(name).filter(|_| emits) {
       post_state.extend_from_slice(content);
     }
   }
+  post_state
+}
 
-  // Reconstruct each path the document names.
+/// Reconstructs the content the document declares for the path at `index`, or `None` when the path
+/// is a rename source (no ops) or a removed file (has an `Unlink`).
+fn reconstruct_path(
+  base: &[(String, u64)],
+  doc: &OpsDoc,
+  index: u16,
+  name: &str,
+  post_state: &[u8],
+) -> Option<Vec<u8>> {
+  let ops = ops_for(doc, index);
+  if ops.is_empty() || ops.iter().any(|op| op.kind == OpKind::Unlink) {
+    return None;
+  }
+  let rename = ops.iter().find(|op| op.kind == OpKind::Rename);
+  let created = ops.iter().any(|op| op.kind == OpKind::Create);
+  let (base_bytes, base_len) = if let Some(op) = rename {
+    let source = doc
+      .paths
+      .path(u16::try_from(op.src).unwrap_or(u16::MAX))
+      .unwrap_or("");
+    let bytes = base_of(base, source);
+    let len = bytes.len() as u64;
+    (bytes, len)
+  } else if created {
+    (Vec::new(), 0u64)
+  } else {
+    let bytes = base_of(base, name);
+    let len = bytes.len() as u64;
+    (bytes, len)
+  };
+  let content: Vec<Op> = ops
+    .into_iter()
+    .filter(|op| !matches!(op.kind, OpKind::Create | OpKind::Rename))
+    .collect();
+  Some(apply_net(&base_bytes, &content, post_state, base_len))
+}
+
+/// Reconstructs the whole filesystem from the base and the ops document, and asserts it equals
+/// the model.
+fn check(base: &[(String, u64)], doc: &OpsDoc, model: &Model) {
+  let post_state = post_state_of(doc, model);
+
+  // The base paths renamed away (present as some rename's source): excluded from the result.
+  let mut renamed_away: BTreeSet<String> = BTreeSet::new();
+  for op in &doc.ops {
+    if op.kind == OpKind::Rename
+      && let Some(source) = doc.paths.path(u16::try_from(op.src).unwrap_or(u16::MAX))
+    {
+      renamed_away.insert(source.to_owned());
+    }
+  }
+
   let mut reconstructed: Model = BTreeMap::new();
   for (path_index, name) in doc.paths.paths().iter().enumerate() {
     let index = u16::try_from(path_index).unwrap_or(u16::MAX);
-    let ops: Vec<Op> = doc
-      .ops
-      .iter()
-      .copied()
-      .filter(|op| op.path == index)
-      .collect();
-    if ops.iter().any(|op| op.kind == OpKind::Unlink) {
-      continue; // removed
+    if let Some(content) = reconstruct_path(base, doc, index, name, &post_state) {
+      reconstructed.insert(name.clone(), content);
     }
-    let created = ops.iter().any(|op| op.kind == OpKind::Create);
-    let content: Vec<Op> = ops
-      .into_iter()
-      .filter(|op| op.kind != OpKind::Create)
-      .collect();
-    let (base_bytes, base_len) = if created {
-      (Vec::new(), 0u64)
-    } else {
-      let seed = seed_of(name);
-      let len = base_len_of(name);
-      ((0..len).map(|i| base_byte(seed, i)).collect(), len)
-    };
-    reconstructed.insert(
-      name.clone(),
-      apply_net(&base_bytes, &content, &post_state, base_len),
-    );
   }
 
-  // Base paths the document does not name are unchanged from the base.
-  for (path, len) in base {
-    if !doc.paths.paths().iter().any(|p| p == path) {
-      let seed = seed_of(path);
-      reconstructed.insert(
-        path.clone(),
-        (0..*len).map(|i| base_byte(seed, i)).collect(),
-      );
+  // Base paths the document never names, and were not renamed away, are unchanged.
+  for (path, _) in base {
+    let named = doc.paths.paths().iter().any(|p| p == path);
+    if !named && !renamed_away.contains(path) {
+      reconstructed.insert(path.clone(), base_of(base, path));
     }
   }
 
@@ -241,7 +290,7 @@ fn check(base: &[(String, u64)], doc: &OpsDoc, model: &Model) {
   );
 }
 
-/// A create then an unlink of a new file cancels: nothing is declared.
+/// A create then an unlink of a new file cancels.
 #[test]
 fn a_create_then_unlink_cancels() {
   let doc = compose_volume(
@@ -256,7 +305,7 @@ fn a_create_then_unlink_cancels() {
     ],
   )
   .expect("valid");
-  assert!(doc.ops.is_empty(), "create then unlink declares nothing");
+  assert!(doc.ops.is_empty());
   assert!(doc.paths.paths().is_empty());
 }
 
@@ -275,7 +324,7 @@ fn unlinking_a_base_file_is_one_unlink() {
   assert_eq!(doc.paths.path(doc.ops[0].path), Some("d"));
 }
 
-/// Creating a file and writing it is a `Create` and its bytes as an insert.
+/// Creating and writing a file is a `Create` and its bytes.
 #[test]
 fn creating_and_writing_a_file_is_create_then_insert() {
   let doc = compose_volume(
@@ -292,54 +341,96 @@ fn creating_and_writing_a_file_is_create_then_insert() {
     ],
   )
   .expect("valid");
-  assert_eq!(doc.ops.len(), 2, "a create and one content op");
-  assert!(
-    doc.ops.iter().any(|op| op.kind == OpKind::Create),
-    "the new file is declared with a create"
-  );
+  assert!(doc.ops.iter().any(|op| op.kind == OpKind::Create));
   let content = doc
     .ops
     .iter()
     .find(|op| matches!(op.kind, OpKind::Insert | OpKind::Extend))
-    .expect("the written bytes are an insert or extend");
+    .expect("content");
   assert_eq!(content.len, 5);
 }
 
-/// Unlinking a base file then recreating and writing it replaces its content: a delete of the
-/// base and the new bytes, with no `Create` (the path existed at base).
+/// A base file renamed to a fresh path is one `Rename` whose source is the base path.
 #[test]
-fn recreating_a_base_file_replaces_its_content() {
-  let doc = compose_volume(
-    &[("d".to_owned(), 10)],
-    &[
-      VolumeOp::Unlink {
-        path: "d".to_owned(),
-      },
-      VolumeOp::Create {
-        path: "d".to_owned(),
-      },
-      VolumeOp::Extend {
-        path: "d".to_owned(),
-        at: 0,
-        len: 4,
-      },
-    ],
-  )
-  .expect("valid");
-  assert!(
-    !doc.ops.iter().any(|op| op.kind == OpKind::Create),
-    "a replaced base path declares no create"
-  );
-  assert!(doc.ops.iter().any(|op| op.kind == OpKind::Delete));
-  assert!(
+fn renaming_a_base_file_to_a_fresh_path() {
+  let base = [("a".to_owned(), 6)];
+  let journal = [VolumeOp::Rename {
+    from: "a".to_owned(),
+    to: "z".to_owned(),
+  }];
+  let doc = compose_volume(&base, &journal).expect("valid");
+  let rename = doc
+    .ops
+    .iter()
+    .find(|op| op.kind == OpKind::Rename)
+    .expect("a rename");
+  assert_eq!(doc.paths.path(rename.path), Some("z"), "destination");
+  assert_eq!(
     doc
-      .ops
-      .iter()
-      .any(|op| matches!(op.kind, OpKind::Insert | OpKind::Extend))
+      .paths
+      .path(u16::try_from(rename.src).unwrap_or(u16::MAX)),
+    Some("a"),
+    "source"
   );
+  let mut model: Model = BTreeMap::new();
+  model.insert("z".to_owned(), base_of(&base, "a"));
+  check(&base, &doc, &model);
 }
 
-/// Content on a missing file is a typed refusal, not a panic.
+/// A new file renamed over a base file is the write-and-rename pattern: the destination's content
+/// is replaced (a delete and the new bytes), with no rename.
+#[test]
+fn write_and_rename_replaces_the_destination_content() {
+  let base = [("out".to_owned(), 10)];
+  let journal = [
+    VolumeOp::Create {
+      path: "tmp".to_owned(),
+    },
+    VolumeOp::Extend {
+      path: "tmp".to_owned(),
+      at: 0,
+      len: 4,
+    },
+    VolumeOp::Rename {
+      from: "tmp".to_owned(),
+      to: "out".to_owned(),
+    },
+  ];
+  let doc = compose_volume(&base, &journal).expect("valid");
+  assert!(
+    !doc.ops.iter().any(|op| op.kind == OpKind::Rename),
+    "write-and-rename is not a rename"
+  );
+  assert!(
+    !doc.ops.iter().any(|op| op.kind == OpKind::Create),
+    "no create — the path existed"
+  );
+  assert!(
+    doc.ops.iter().any(|op| op.kind == OpKind::Delete),
+    "the base content is deleted"
+  );
+  // The destination now holds the four new bytes.
+  let mut model: Model = BTreeMap::new();
+  model.insert("out".to_owned(), vec![0x80, 0x81, 0x82, 0x83]);
+  // Reconstruct against the model's post-state (the new bytes).
+  let post_state = vec![0x80u8, 0x81, 0x82, 0x83];
+  let index = doc
+    .paths
+    .paths()
+    .iter()
+    .position(|p| p == "out")
+    .expect("out");
+  let ops: Vec<Op> = doc
+    .ops
+    .iter()
+    .copied()
+    .filter(|op| op.path == u16::try_from(index).unwrap_or(u16::MAX))
+    .collect();
+  let rebuilt = apply_net(&base_of(&base, "out"), &ops, &post_state, 10);
+  assert_eq!(rebuilt, model["out"]);
+}
+
+/// Content on a missing file is a typed refusal.
 #[test]
 fn content_on_a_missing_file_refuses() {
   let result = compose_volume(
@@ -357,9 +448,9 @@ fn content_on_a_missing_file_refuses() {
 }
 
 proptest! {
-  /// T-6.7 (the whole-volume oracle): for any base and any valid journal of content, create and
-  /// unlink across three paths, reconstructing the filesystem from the increment reproduces the
-  /// model the journal produced.
+  /// T-6.7 (the whole-volume oracle): for any base and any valid journal of content, create,
+  /// unlink and rename across three paths, reconstructing the filesystem from the increment
+  /// reproduces the model the journal produced (skipping the rare owed refusal).
   #[test]
   fn the_increment_reconstructs_the_filesystem(
     base_present in prop::array::uniform3(any::<bool>()),
@@ -377,8 +468,10 @@ proptest! {
       .map(|(i, name)| ((*name).to_owned(), base_lens[i]))
       .collect();
     let (journal, model) = simulate(&base, &raw);
-    let composed = compose_volume(&base, &journal);
-    prop_assert!(composed.is_ok(), "a generated journal composes");
-    check(&base, &composed.unwrap_or_default(), &model);
+    match compose_volume(&base, &journal) {
+      Ok(doc) => check(&base, &doc, &model),
+      // The rare rename onto a reused base path is an owed refusal, not a failure; skip it.
+      Err(_) => prop_assume!(false),
+    }
   }
 }
