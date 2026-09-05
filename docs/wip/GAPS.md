@@ -888,6 +888,15 @@ CI Linux lane. Owed: the new mount API (`fsopen`/`fsconfig`/`fsmount`/`move_moun
 daemon has `CAP_SYS_ADMIN` in its user namespace, and the anchor holding the fd across a
 restart (§2.6 step 4).
 
+The invalidation notifications landed 2026-09-05 (Phase 3, §4.6 "Cache posture"): `notify.rs`
+encodes the unsolicited messages the daemon writes to `/dev/fuse` to drop kernel cache on a
+mutation — `inval_inode` (an inode's attributes and a data range), `inval_entry` (a cached
+name → node mapping) and `delete` (an entry removed). They are pure encoders (the header with a
+zero unique and the notification code in `error`, then the body), tested on every host with
+golden byte checks (4 tests). The driver writes them before it acknowledges a mutating request,
+so a second process never reads stale attributes after the mutating call returns (AC-3.3); wiring
+them into the mutating dispatch paths is the driver's, with the transport.
+
 ## 9. Blocking order toward first light
 
 Phase 0 (foundations) → Phase 1 (volume core) → Phase 2 (server, database, IPC) → Phase 3
