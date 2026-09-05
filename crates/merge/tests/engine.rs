@@ -20,10 +20,9 @@ fn op(kind: OpKind, at: u64, len: u64, src: u64) -> Op {
   }
 }
 
-/// A change that creates a file with `bytes` (from an empty base).
+/// A change that creates a file with `bytes`.
 fn create(bytes: &[u8]) -> PathChange {
-  PathChange {
-    ops: vec![op(OpKind::Insert, 0, bytes.len() as u64, 0)],
+  PathChange::Create {
     post_state: bytes.to_vec(),
   }
 }
@@ -32,7 +31,7 @@ fn create(bytes: &[u8]) -> PathChange {
 fn overwrite(base: &[u8], at: usize, new: &[u8]) -> PathChange {
   let mut post_state = base.to_vec();
   post_state[at..at + new.len()].copy_from_slice(new);
-  PathChange {
+  PathChange::Modify {
     ops: vec![op(
       OpKind::Overwrite,
       at as u64,
@@ -47,7 +46,7 @@ fn overwrite(base: &[u8], at: usize, new: &[u8]) -> PathChange {
 fn insert(base: &[u8], at: usize, new: &[u8]) -> PathChange {
   let mut post_state = base.to_vec();
   post_state.splice(at..at, new.iter().copied());
-  PathChange {
+  PathChange::Modify {
     ops: vec![op(OpKind::Insert, at as u64, new.len() as u64, at as u64)],
     post_state,
   }
@@ -198,4 +197,103 @@ fn rebase_after_a_conflict_accepts() {
   ));
   assert_eq!(rebased, Outcome::Accepted { version: 3 });
   assert_eq!(&green.content("f").expect("present")[5..9], b"BBBB");
+}
+
+/// A `remove` change.
+fn remove() -> PathChange {
+  PathChange::Remove
+}
+
+/// Two agents creating the same path with different bytes: the second conflicts (create/create).
+#[test]
+fn create_create_conflicts() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "seed", create(b"x")));
+  let a = green.submit(&increment(2, 1, "new", create(b"from A")));
+  assert_eq!(a, Outcome::Accepted { version: 2 });
+  let b = green.submit(&increment(3, 1, "new", create(b"from B")));
+  match b {
+    Outcome::Conflict { windows } => assert_eq!(
+      windows[0].class,
+      slates_merge::verdict::MergeConflictClass::CreateCreate
+    ),
+    other => panic!("expected create/create conflict, got {other:?}"),
+  }
+}
+
+/// Two agents creating the same path with identical bytes: the second accepts (no-op).
+#[test]
+fn identical_create_accepts() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "seed", create(b"x")));
+  green.submit(&increment(2, 1, "new", create(b"same")));
+  let b = green.submit(&increment(3, 1, "new", create(b"same")));
+  assert_eq!(b, Outcome::Accepted { version: 3 });
+  assert_eq!(green.content("new"), Some(b"same".as_slice()));
+}
+
+/// One agent removes a file while another modifies it: delete/modify conflict.
+#[test]
+fn delete_versus_modify_conflicts() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "f", create(b"hello world")));
+  // Agent A removes f at version 2.
+  let a = green.submit(&increment(2, 1, "f", remove()));
+  assert_eq!(a, Outcome::Accepted { version: 2 });
+  assert_eq!(green.content("f"), None, "f is gone");
+  // Agent B (based on 1) modifies f — but f was deleted.
+  let b = green.submit(&increment(
+    3,
+    1,
+    "f",
+    overwrite(b"hello world", 0, b"HELLO"),
+  ));
+  match b {
+    Outcome::Conflict { windows } => assert_eq!(
+      windows[0].class,
+      slates_merge::verdict::MergeConflictClass::DeleteModify
+    ),
+    other => panic!("expected delete/modify conflict, got {other:?}"),
+  }
+}
+
+/// Removing a file unchanged since the base accepts.
+#[test]
+fn a_remove_accepts() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "f", create(b"bye")));
+  let outcome = green.submit(&increment(2, 1, "f", remove()));
+  assert_eq!(outcome, Outcome::Accepted { version: 2 });
+  assert_eq!(green.content("f"), None);
+}
+
+/// Removing an already-removed file is a no-op accept (both agents deleted it).
+#[test]
+fn removing_an_already_removed_file_is_a_no_op() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "f", create(b"bye")));
+  green.submit(&increment(2, 1, "f", remove()));
+  let again = green.submit(&increment(3, 1, "f", remove()));
+  assert_eq!(again, Outcome::Accepted { version: 3 });
+  assert_eq!(green.content("f"), None);
+}
+
+/// An agent removes a file another modified since the base: delete/modify conflict.
+#[test]
+fn remove_of_a_modified_file_conflicts() {
+  let mut green = Green::new();
+  green.submit(&increment(1, 0, "f", create(b"hello world")));
+  // Agent A modifies f at version 2.
+  green.submit(&increment(
+    2,
+    1,
+    "f",
+    overwrite(b"hello world", 0, b"HELLO"),
+  ));
+  // Agent B (based on 1) removes f — but f was modified intervening.
+  let b = green.submit(&increment(3, 1, "f", remove()));
+  assert!(
+    matches!(b, Outcome::Conflict { .. }),
+    "removing a modified file conflicts"
+  );
 }

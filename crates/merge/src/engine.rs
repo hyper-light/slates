@@ -3,39 +3,56 @@
 //! increment of declared operations against a base version; the engine maps the increment's ranges
 //! forward through everything committed since that base, decides the pure verdict, splices the
 //! accepted edits into a new version, and commits it. Conflicts are returned as byte-exact windows
-//! the agent rebases against; the merge task never stalls on a conflict.
+//! (each with its conflict class) that the agent rebases against; the merge task never stalls.
 //!
 //! This is the laptop-degenerate engine (R8): one green, one merge task, an in-memory version
 //! chain and a `seen` set for idempotent retries. The same pipeline runs in a fleet, where the
 //! commit is a fenced ledger-register entry to the green's candidate holders (§4.8) and holders
 //! recompute the verdict before serving — those are the engine's remaining pieces (owed). This
-//! module is pure: it composes [`crate::map`] (position mapping), [`crate::verdict`] (the identity
-//! check) and a byte splice; no I/O, no clock, no randomness.
+//! module is pure: it composes [`crate::map`] (position mapping) and a byte splice; no I/O, no
+//! clock, no randomness.
 //!
-//! Scope: content merges (files' bytes). The verdict here is per file: an increment whose edited
-//! ranges are disjoint from every intervening change is accepted and its edits re-applied at the
-//! shifted positions; an increment whose ranges meet an intervening change is a conflict unless the
-//! agent produced exactly the green's current bytes for that file (both made the same edit, which
-//! accepts). Per-range identity within a mixed file, and the namespace merge (create, rename and
-//! the rest through the pipeline), are owed.
+//! The verdict per path:
+//! - **Modify** a file: if an intervening change deleted it, that is a delete/modify conflict; else
+//!   each edited range is mapped forward — a range disjoint from every intervening change is
+//!   accepted and re-applied at the shifted position, a range that meets one is a conflict unless
+//!   the agent produced exactly the green's current bytes for that file (both made the same edit).
+//! - **Create** a file: a conflict if an intervening change already created it with different bytes
+//!   (create/create), accepted if the bytes match, else created.
+//! - **Remove** a file: accepted (or a no-op if already gone); a delete/modify conflict if an
+//!   intervening change modified it since the base.
+//!
+//! Per-range identity within a mixed file is owed. So is the whole namespace merge for directories,
+//! renames and links through this pipeline; the deriver composes those, and wiring their tree-level
+//! verdict here is the engine's next step.
 
 use std::collections::BTreeMap;
 
 use crate::ops_doc::{Op, OpKind};
 use crate::range::Range;
+use crate::verdict::MergeConflictClass;
 
-/// One file's change in an increment: its net content ops (base coordinates, `src` into
-/// `post_state`) and the file's final bytes (the sealed post-state for this path).
+/// What an increment does to one file.
 #[derive(Clone, Debug)]
-pub struct PathChange {
-  /// The net content ops, in the increment's base coordinates.
-  pub ops: Vec<Op>,
-  /// The file's final bytes.
-  pub post_state: Vec<u8>,
+pub enum PathChange {
+  /// Edit an existing file: net content ops (base coordinates, `src` into `post_state`) and the
+  /// file's final bytes.
+  Modify {
+    /// The net content ops.
+    ops: Vec<Op>,
+    /// The file's final bytes.
+    post_state: Vec<u8>,
+  },
+  /// Create a new file with these bytes.
+  Create {
+    /// The new file's bytes.
+    post_state: Vec<u8>,
+  },
+  /// Remove the file.
+  Remove,
 }
 
-/// An increment submitted against a base version: an identity (for idempotent retries), the base
-/// version it was cloned from, and the per-path changes.
+/// An increment submitted against a base version.
 #[derive(Clone, Debug)]
 pub struct Increment {
   /// The increment's identity (`blake3` of its declared work).
@@ -46,14 +63,16 @@ pub struct Increment {
   pub changes: BTreeMap<String, PathChange>,
 }
 
-/// A byte-exact conflict window: the file and the range (in the increment's base coordinates) that
-/// met an intervening change.
+/// A conflict window: the file, the range (base coordinates) that met an intervening change, and
+/// the class of the conflict.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConflictWindow {
   /// The file.
   pub path: String,
-  /// The conflicting range.
+  /// The conflicting range (a zero-length anchor for a whole-file namespace conflict).
   pub range: Range,
+  /// The class of the conflict.
+  pub class: MergeConflictClass,
 }
 
 /// The result of a submit.
@@ -71,9 +90,7 @@ pub enum Outcome {
   },
 }
 
-/// A green volume's merge state: the head content per file, the committed deltas (per version, the
-/// ops that produced it, per path, for position mapping), the last version each path changed at
-/// (the fast-path index), the `seen` set for idempotent retries, and the head version.
+/// A green volume's merge state.
 #[derive(Debug, Default)]
 pub struct Green {
   content: BTreeMap<String, Vec<u8>>,
@@ -83,8 +100,7 @@ pub struct Green {
   fast_path_hits: u64,
 }
 
-/// The base range an op touches, for overlap testing: the covered span for an overwrite, delete or
-/// truncate; a zero-length anchor for an insert or extend.
+/// The base range an op touches, for overlap testing.
 fn touched_range(op: &Op) -> Range {
   match op.kind {
     OpKind::Overwrite | OpKind::Delete | OpKind::Truncate => Range::new(op.at, op.len),
@@ -92,8 +108,7 @@ fn touched_range(op: &Op) -> Range {
   }
 }
 
-/// Applies content ops (in the given base coordinates, non-decreasing by `at`) to `base`, drawing
-/// added bytes from `post_state` — the byte form of the splice, used to build the merged file.
+/// Applies content ops to `base`, drawing added bytes from `post_state` — the byte splice.
 fn apply(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
   let base_len = base.len() as u64;
   let mut out = Vec::new();
@@ -131,6 +146,16 @@ fn push_slice(out: &mut Vec<u8>, from: &[u8], src: u64, len: u64) {
   out.extend_from_slice(&from[start..end]);
 }
 
+/// What merging one path produced.
+enum PathMerge {
+  /// Set the file to these bytes, recording these ops (head coordinates) as its delta.
+  Set(Vec<u8>, Vec<Op>),
+  /// Remove the file.
+  Remove,
+  /// No net change to the file.
+  Unchanged,
+}
+
 impl Green {
   /// An empty green volume at version 0.
   pub fn new() -> Green {
@@ -147,14 +172,12 @@ impl Green {
     self.content.get(path).map(Vec::as_slice)
   }
 
-  /// The number of paths merged through the fast path (no intervening change since the base). A
-  /// test asserts this moves, so a silently-dead fast path cannot pass (the non-vacuity counter).
+  /// The number of paths merged through the fast path (the non-vacuity counter).
   pub fn fast_path_hits(&self) -> u64 {
     self.fast_path_hits
   }
 
-  /// The ops each intervening delta in `(base, head]` applied to `path`, as the slice-of-slices the
-  /// position mapper takes.
+  /// The ops each intervening delta in `(base, head]` applied to `path`.
   fn intervening(&self, path: &str, base: u64) -> Vec<&[Op]> {
     let base = usize::try_from(base).unwrap_or(usize::MAX);
     self.deltas[base.min(self.deltas.len())..]
@@ -163,14 +186,27 @@ impl Green {
       .collect()
   }
 
-  /// Merges one file's change onto the head, returning either the merged bytes and the ops to
-  /// record (in head coordinates), or the first conflicting window.
-  fn merge_path(
+  /// A whole-file namespace conflict window at a path.
+  fn window(path: &str, class: MergeConflictClass) -> ConflictWindow {
+    ConflictWindow {
+      path: path.to_owned(),
+      range: Range::new(0, 0),
+      class,
+    }
+  }
+
+  /// Merges an edit to an existing file (the content path).
+  fn merge_modify(
     &mut self,
     path: &str,
     base: u64,
-    change: &PathChange,
-  ) -> Result<(Vec<u8>, Vec<Op>), ConflictWindow> {
+    ops: &[Op],
+    post_state: &[u8],
+  ) -> Result<PathMerge, ConflictWindow> {
+    if !self.content.contains_key(path) {
+      // The agent edited a file an intervening change deleted.
+      return Err(Green::window(path, MergeConflictClass::DeleteModify));
+    }
     let base_changed = self.last_changed.get(path).copied().unwrap_or(0);
     let unchanged = base_changed <= base;
     if unchanged {
@@ -181,8 +217,8 @@ impl Green {
     } else {
       self.intervening(path, base)
     };
-    let mut mapped = Vec::with_capacity(change.ops.len());
-    for op in &change.ops {
+    let mut mapped = Vec::with_capacity(ops.len());
+    for op in ops {
       match crate::map::map_range(&intervening, touched_range(op)) {
         crate::map::Mapped::Shifted(shifted) => {
           let mut moved = *op;
@@ -190,27 +226,72 @@ impl Green {
           mapped.push(moved);
         }
         crate::map::Mapped::Overlaps => {
-          // Pass two: if the agent produced exactly the green's current bytes for this file, both
-          // made the same edit — accept it as identical; otherwise it is a conflict.
           let current = self
             .content
             .get(path)
             .map(Vec::as_slice)
             .unwrap_or_default();
-          if change.post_state == current {
-            return Ok((current.to_vec(), Vec::new()));
+          if post_state == current {
+            return Ok(PathMerge::Unchanged);
           }
           return Err(ConflictWindow {
             path: path.to_owned(),
             range: touched_range(op),
+            class: MergeConflictClass::Overlap,
           });
         }
       }
     }
     let empty = Vec::new();
     let current = self.content.get(path).unwrap_or(&empty);
-    let merged = apply(current, &mapped, &change.post_state);
-    Ok((merged, mapped))
+    Ok(PathMerge::Set(apply(current, &mapped, post_state), mapped))
+  }
+
+  /// Merges a create.
+  fn merge_create(&self, path: &str, post_state: &[u8]) -> Result<PathMerge, ConflictWindow> {
+    match self.content.get(path) {
+      // Already created by an intervening increment: identical bytes accept, else conflict.
+      Some(current) if current.as_slice() == post_state => Ok(PathMerge::Unchanged),
+      Some(_) => Err(Green::window(path, MergeConflictClass::CreateCreate)),
+      None => {
+        let ops = vec![Op {
+          kind: OpKind::Insert,
+          flags: 0,
+          path: 0,
+          at: 0,
+          len: post_state.len() as u64,
+          src: 0,
+        }];
+        Ok(PathMerge::Set(post_state.to_vec(), ops))
+      }
+    }
+  }
+
+  /// Merges a remove.
+  fn merge_remove(&self, path: &str, base: u64) -> Result<PathMerge, ConflictWindow> {
+    if !self.content.contains_key(path) {
+      return Ok(PathMerge::Unchanged); // already gone
+    }
+    let base_changed = self.last_changed.get(path).copied().unwrap_or(0);
+    if base_changed > base {
+      // The agent removed a file an intervening change modified.
+      return Err(Green::window(path, MergeConflictClass::DeleteModify));
+    }
+    Ok(PathMerge::Remove)
+  }
+
+  /// Merges one file's change.
+  fn merge_path(
+    &mut self,
+    path: &str,
+    base: u64,
+    change: &PathChange,
+  ) -> Result<PathMerge, ConflictWindow> {
+    match change {
+      PathChange::Modify { ops, post_state } => self.merge_modify(path, base, ops, post_state),
+      PathChange::Create { post_state } => self.merge_create(path, post_state),
+      PathChange::Remove => self.merge_remove(path, base),
+    }
   }
 
   /// Submits an increment: idempotent by identity, merges every changed file, and commits a new
@@ -219,17 +300,16 @@ impl Green {
     if let Some(outcome) = self.seen.get(&increment.id) {
       return outcome.clone();
     }
-    let mut merged_content: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    let mut delta: BTreeMap<String, Vec<Op>> = BTreeMap::new();
+    let mut sets: BTreeMap<String, (Vec<u8>, Vec<Op>)> = BTreeMap::new();
+    let mut removes: Vec<String> = Vec::new();
     let mut windows = Vec::new();
     for (path, change) in &increment.changes {
       match self.merge_path(path, increment.base, change) {
-        Ok((content, ops)) => {
-          merged_content.insert(path.clone(), content);
-          if !ops.is_empty() {
-            delta.insert(path.clone(), ops);
-          }
+        Ok(PathMerge::Set(content, ops)) => {
+          sets.insert(path.clone(), (content, ops));
         }
+        Ok(PathMerge::Remove) => removes.push(path.clone()),
+        Ok(PathMerge::Unchanged) => {}
         Err(window) => windows.push(window),
       }
     }
@@ -239,8 +319,14 @@ impl Green {
       return outcome;
     }
     let version = self.head() + 1;
-    for (path, content) in merged_content {
+    let mut delta: BTreeMap<String, Vec<Op>> = BTreeMap::new();
+    for (path, (content, ops)) in sets {
       self.content.insert(path.clone(), content);
+      self.last_changed.insert(path.clone(), version);
+      delta.insert(path, ops);
+    }
+    for path in removes {
+      self.content.remove(&path);
       self.last_changed.insert(path, version);
     }
     self.deltas.push(delta);
