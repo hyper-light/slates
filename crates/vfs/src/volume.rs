@@ -1823,6 +1823,18 @@ impl Volume {
     self.destroy_queue.len()
   }
 
+  /// Frees a freshly-created volume that never entered service — a create or clone that failed after
+  /// the volume object existed but before it was published. Its owned slab slots (a scratch volume's
+  /// root inode, trie and dir) return to the store; a clone shares its origin's versions, so it frees
+  /// only what it made — nothing, for a fresh clone. Runs the destroy to completion in one call: a
+  /// never-served volume's tree is tiny, well within one slice, so this does not need the cooperative
+  /// budget the served-volume destroy path uses.
+  pub fn discard_partial(mut self, store: &mut Store) -> Result<(), VfsError> {
+    self.destroy(store)?;
+    while !matches!(self.destroy_step(store, u64::MAX)?, DestroyProgress::Done) {}
+    Ok(())
+  }
+
   // ------------------------------------------------------------------ paths (tests, journal)
 
   /// Resolves a `/`-separated path from the root.

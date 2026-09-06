@@ -1141,7 +1141,23 @@ fn create(
     .db
     .mutate(&mut state.segment, &Op::VolumeCreated { record }, now)
   {
+    let _ = volume.discard_partial(&mut state.store);
     return give_back(state, reservation, version_credit, refusal_of_db(&e));
+  }
+  // The volume registry must have room before the volume moves into a slot: a full registry's
+  // `insert` consumes and drops the slot, which would leak the fresh volume's slab slots. Check
+  // first, discarding the volume if there is none.
+  if !state.volumes.has_room() {
+    let full = state.volumes.max_slots();
+    let _ = volume.discard_partial(&mut state.store);
+    return give_back(
+      state,
+      reservation,
+      version_credit,
+      Refusal::BadRequest {
+        reason: format!("volume registry full at {full}"),
+      },
+    );
   }
   let slot = VolumeSlot {
     id,
@@ -1157,8 +1173,7 @@ fn create(
         id: to_wire_volume(id),
       }
     }
-    // The slot did not land: give both credits back to their budgets (they are `Copy`, so the vars
-    // still hold them after the slot took its copies), never leaking the reservation on this path.
+    // Unreachable given the room check above; the slot was consumed, so only the credits return.
     Err(e) => give_back(
       state,
       reservation,
@@ -1386,8 +1401,23 @@ fn clone(
   ];
   for op in &ops {
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
+      let _ = volume_core.discard_partial(&mut state.store);
       return give_back(state, reservation, version_credit, refusal_of_db(&e));
     }
+  }
+  // As in create: ensure the registry has room before moving the clone into a slot, discarding it
+  // (which frees only what the clone made — nothing, since it shares its origin's versions) otherwise.
+  if !state.volumes.has_room() {
+    let full = state.volumes.max_slots();
+    let _ = volume_core.discard_partial(&mut state.store);
+    return give_back(
+      state,
+      reservation,
+      version_credit,
+      Refusal::BadRequest {
+        reason: format!("volume registry full at {full}"),
+      },
+    );
   }
   let slot = VolumeSlot {
     id,

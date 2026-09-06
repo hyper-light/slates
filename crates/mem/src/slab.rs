@@ -64,6 +64,12 @@ impl<T> Slab<T> {
     self.len == 0
   }
 
+  /// Whether an insert would succeed — the occupied count is below the bound. Lets a caller that
+  /// must not lose its value on a full slab check first, since `insert` consumes the value.
+  pub const fn has_room(&self) -> bool {
+    self.len < self.max_slots
+  }
+
   /// Slots created so far (occupied or vacant).
   pub const fn slots(&self) -> usize {
     self.slots.len()
