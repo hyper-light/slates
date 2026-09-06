@@ -459,3 +459,93 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
   landing_refusal_scenario();
   bulk_and_overlay_scenario();
 }
+
+/// Shape: a version slab large enough to physically hold several volumes' inode and trie nodes, yet
+/// small enough that one big-quota volume's inode allowance reserves all of it above the copy-up
+/// headroom. So the second volume is refused by the §4.2 *reservation* while physical slots plainly
+/// remain — the honesty the reservation adds over the bare per-volume cap (a raw `SlabFull` would
+/// only fire once the slab were physically exhausted, which it is not here).
+const SMALL_VERSION_SLAB: usize = 128;
+
+/// A test daemon whose inode-version slab is `max_inodes` slots, on a single shard so every volume
+/// shares the one version budget (with two shards, volumes route to separate budgets and never
+/// contend). Otherwise the derived config the other scenarios use.
+fn capped_daemon(name: &str, max_inodes: usize) -> (Daemon, String) {
+  let profile = profile();
+  let instance = format!("srv-{name}-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance).with_shards(1);
+  config.store.max_inodes = max_inodes;
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-{name}"),
+    },
+  )
+  .unwrap();
+  (daemon, instance)
+}
+
+/// The §4.2 inode-dimension *reservation*, through the real create and destroy verbs (no mount): a
+/// volume's inode allowance is reserved against the shard's version slab at create, so a second
+/// volume whose allowance the slab cannot also back is refused (`BudgetExceeded`) even though byte
+/// space plainly remains — the disjoint reservation the bare per-volume cap does not give — and the
+/// slab returns on destroy so a later volume is admitted again. Non-vacuous: the byte budget is far
+/// larger than these small quotas, so only the version reservation can refuse the second volume;
+/// without it, both would be created.
+fn version_reservation_scenario() {
+  let (daemon, instance) = capped_daemon("versions", SMALL_VERSION_SLAB);
+  let mut client = Client::connect(&instance);
+  let sized = |name: &str| RequestBody::Create {
+    name: name.to_owned(),
+    size: SizeClass::Bounded { limit: 1 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  };
+  // The first volume's inode allowance fills the version slab (less the one-slot copy-up headroom).
+  let ReplyBody::Created { id: first } = client.call(&sized("first")) else {
+    panic!("first create");
+  };
+  // The second cannot be backed by the slab, so admission refuses it — not for want of bytes.
+  assert!(
+    matches!(
+      client.call(&sized("second")),
+      ReplyBody::Refused {
+        refusal: Refusal::BudgetExceeded { .. }
+      }
+    ),
+    "the version slab cannot back a second inode allowance"
+  );
+  // Destroy the first; its reserved slots return to the slab as the destroy completes in slices.
+  assert!(matches!(
+    client.call(&RequestBody::Destroy { volume: first }),
+    ReplyBody::Destroyed
+  ));
+  let started = Instant::now();
+  loop {
+    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+      panic!("list");
+    };
+    if volumes.is_empty() {
+      break;
+    }
+    assert!(
+      started.elapsed() < CREDIT_WAIT,
+      "destroy completes in slices: {volumes:?}"
+    );
+  }
+  // With the slab returned, a fresh volume is admitted again — the reservation is released on teardown.
+  assert!(
+    matches!(client.call(&sized("third")), ReplyBody::Created { .. }),
+    "the slab freed by destroy backs a new volume's allowance"
+  );
+  daemon.stop();
+}
+
+/// AC-2: §4.2 inode-dimension reservation — the disjoint version-slab reservation and its release on
+/// teardown, driven through the real create and destroy verbs.
+#[test]
+fn the_inode_allowance_is_reserved_against_the_version_slab_and_released_on_teardown() {
+  version_reservation_scenario();
+}

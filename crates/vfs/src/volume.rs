@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use slates_machine::{Derived, derived};
 use slates_mem::arena::ChunkArena;
-use slates_mem::budget::ShardBudget;
+use slates_mem::budget::{ShardBudget, VersionBudget};
 use slates_mem::{Handle, Slab};
 
 use crate::clock::Clock;
@@ -48,6 +48,15 @@ const DESTROY_CLOCK_EVERY_UNITS: usize = 16;
 /// smaller is the volume's bound so a landing never produces a file the target refuses.
 pub const LINK_MAX: u32 = 32_767;
 
+/// Derived: the inode-version budget's operation headroom (§4.2) — the transient version a copy-up
+/// holds. `Volume::make_current_inode` inserts the new inode version and retires the old within one
+/// synchronous, exclusively-borrowed shard call (no `await` between the insert and the retire), so
+/// at most one such transient exists at a time regardless of the client count. The headroom is
+/// therefore the structural constant one, not a write-rate measurement. If that copy-up ever
+/// interleaves (an `await` between the insert and the retire), this derivation and its value change.
+/// Anchor: the copy-up's atomicity on the single-threaded shard.
+const COPY_UP_VERSION_HEADROOM: u64 = 1;
+
 /// The shard's store: slabs and the chunk arena every volume on the shard allocates from.
 pub struct Store {
   /// Directory nodes.
@@ -69,6 +78,12 @@ pub struct Store {
   /// operation headroom and no two volumes get the same bytes. It lives here, with the store's arena
   /// it accounts, so the write path reaches it without a lock (the shard is single-threaded).
   pub budget: ShardBudget,
+  /// The shard's inode-version budget (§4.2 resource vector, inode dimension): the counted parallel
+  /// of `budget`, over the inode-version slab (`max_inodes`). A create reserves its whole logical
+  /// inode allowance here, so the sum of advertised allowances is backed by the slab rather than
+  /// merely capped — no volume's advertised allowance can be un-backed capacity another volume also
+  /// holds. It lives beside the slab it accounts, reached without a lock.
+  pub versions: VersionBudget,
 }
 
 impl std::fmt::Debug for Store {
@@ -125,6 +140,10 @@ impl Store {
       dir_cutover: config.dir_cutover.max(1),
       inline_bytes: inline_bytes(config.cache_line).get(),
       budget: ShardBudget::new(capacity, headroom),
+      versions: VersionBudget::new(
+        u64::try_from(config.max_inodes).unwrap_or(u64::MAX),
+        COPY_UP_VERSION_HEADROOM,
+      ),
     }
   }
 }

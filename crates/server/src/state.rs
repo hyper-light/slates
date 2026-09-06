@@ -55,6 +55,9 @@ pub struct VolumeSlot {
   pub host: Option<OsHost>,
   /// The reservation, for a bounded volume.
   pub reservation: Option<slates_mem::budget::Reservation>,
+  /// The inode-version reservation (§4.2 inode dimension): the volume's logical inode allowance
+  /// reserved against the shard's version slab, returned on teardown so the slab is never over-offered.
+  pub version_credit: Option<slates_mem::budget::VersionCredit>,
 }
 
 impl std::fmt::Debug for VolumeSlot {

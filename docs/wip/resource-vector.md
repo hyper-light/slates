@@ -19,11 +19,25 @@
 > debiting it — so two dynamic volumes cannot spend the same capacity, a dynamic volume cannot consume
 > a bounded volume's entitlement, and the hold is accounted through teardown and recovery. This is
 > proven through the real write path, no mount, in `crates/bridge-core/tests/admission.rs` (the five
-> histories). What remains: the retention dimension, and the step from a per-volume cap to disjoint
-> per-volume *reservation* for the **inode** dimension — which §4 shows waits on a *measured*
-> `operation_headroom` (the peak of transient CoW versions, which has no structural anchor the byte
-> headroom has). That measurement needs the version slab driven under write load; the honest inode cap
-> stands until it exists. Mounted POSIX and guest conformance are separately pending host environments.
+> histories). The **inode dimension's reservation is now landed too**: a volume's logical inode
+> allowance is reserved against a per-shard `VersionBudget` over the version slab (`store.max_inodes`,
+> crates/mem/src/budget.rs) at create — bounded and dynamic alike, on both the scratch-create and
+> clone-create paths and re-acquired on recovery — and released on destroy, so the *sum* of advertised
+> allowances is physically backed by the slab, not merely capped against `SlabFull`. An earlier
+> version of this note deferred it as waiting on a *measured* `operation_headroom` (the peak of
+> transient CoW versions under write load); **that was wrong.** The design defines `operation_headroom`
+> as "bounded temporary coexistence during copy-up" with "measured *or structural* anchors" (§4.2,
+> SLATES_DESIGN.md:809–816), and the code confirms the structural reading: `Volume::make_current_inode`
+> inserts the new version and retires the old within one synchronous, exclusively-borrowed shard call
+> (no `await` between), and `retire` frees the old at once or keeps it on a snapshot deadlist — the
+> **retention** dimension, now bounded — so at most one transient version coexists per copy-up. The
+> headroom is therefore the structural constant one, not a write-rate measurement. Proven through the
+> real create and destroy verbs, no mount, in `crates/server/tests/daemon.rs` (a second volume refused
+> while physical slots plainly remain; non-vacuous — without the reservation both are created). What
+> remains for the inode dimension: charging *retention* into the same `VersionBudget` (so retained
+> versions and logical allowances share the slab disjointly), and re-deriving the allowance on resize
+> (which today changes the byte quota but not the inode allowance — a pre-existing gap). Mounted POSIX
+> and guest conformance are separately pending host environments.
 
 ## 1. The requirement
 
@@ -156,43 +170,53 @@ double-spend; a refused growth leaves credits consistent with what is retained; 
 its allowance after competing growth is refused) — non-vacuously (the old private ceiling fails four of
 the five).
 
-The **inode** dimension's reservation is a separate story, below: it turns on a headroom that must be
-measured, not derived, so it stays a cap for now.
+The **inode** dimension's reservation is now landed too, on a *structural* headroom (below).
 
-**Where the current state already is safe.** Both inode enforcement points are typed refusals, so
-today's cap never corrupts or panics — it can only be *over-optimistic* about availability, never
-unsafe. `Volume::next_no` refuses a logical inode past the per-volume allowance (`NoSpace`), and the
-inode-version slab is a hard `Slab` that refuses past `store.max_inodes` (`SlabFull`). The gap the
-reservation closes is honesty, not safety: the *sum* of per-volume logical allowances can exceed the
-shard's version slab, so an advertised allowance need not be physically backed.
+**Where the current state was already safe, and is now backed.** Both inode enforcement points are
+typed refusals, so the cap never corrupts or panics — it could only be *over-optimistic* about
+availability. `Volume::next_no` refuses a logical inode past the per-volume allowance (`NoSpace`), and
+the inode-version slab is a hard `Slab` that refuses past `store.max_inodes` (`SlabFull`). The gap the
+reservation closes is honesty, not safety: the *sum* of per-volume logical allowances could exceed the
+shard's version slab, so an advertised allowance need not have been physically backed. The reservation
+below closes that gap — the sum of advertised allowances can no longer exceed the backed slab.
 
-**Why the reservation is not a clean isolated slice — the version/logical gap and its measured
-headroom.** `store.max_inodes` bounds inode *versions*, not logical inodes, and
-`Volume::make_current_inode` (crates/vfs/src/volume.rs) inserts a **new** slab slot whenever it
-mutates an inode whose `born` epoch is earlier than the head's (a snapshot or a prior epoch pinned
-the old version), retiring the old slot for reclaim at the next epoch boundary. So the version slab
-holds, at any instant, the logical inodes **plus** the snapshot-retained versions **plus** the
-transient in-epoch versions that are retired but not yet reclaimed. A correct reservation must
-therefore carry an `operation_headroom` for those transient versions (the §4.2 invariant's
-`operation_headroom` term) — as the byte budget now keeps a *derived* operation headroom free
-(`ShardBudget`, `2 × chunk_bytes × clients_per_shard`; §4 above). But the inode equivalent has no such
-structural anchor: it is the peak of concurrent retired-but-unreclaimed versions, which depends on the
-write rate against
-the epoch/reclaim cadence — a quantity that can only be measured with the data-plane write path
-driving the slab under load. Reserving the logical allowance as version-slots **without** that
-headroom would be a *false* guarantee: a volume within its logical allowance could still exhaust the
-version slab through in-epoch CoW churn before a reclaim pass runs. Under R3 a headroom number cannot
-be invented, and under R4/R5 a reservation must not advertise a guarantee it does not hold, so this
-step waits on the peak-version-burst measurement: the version slab driven under write load — which
-`VolumeBridge::write` can now do, no mount, exactly as the byte admission tests drive growth — to
-establish the transient-version headroom before reserving version credits. It is a separate, unbuilt
-piece; it is *not* the byte dimension's growth admission, which is done (§4 above).
+**Why the headroom is structural, not measured — correcting an earlier mistake.** An earlier version
+of this section claimed the inode reservation waited on a *measured* `operation_headroom` — "the peak
+of concurrent retired-but-unreclaimed versions, which depends on the write rate against the
+epoch/reclaim cadence." That was wrong, on two counts the code settles. First, `retire`
+(crates/vfs/src/volume.rs) resolves a copy-up's old version *immediately*: it is either kept on a
+snapshot deadlist (the **retention** dimension, now bounded by `retention_allowance`) or freed at once
+by `release_dead` — there is no third "retired-but-unreclaimed" pool that accumulates with write rate;
+the trie's own retired nodes are drained in the same `table_set`/`table_remove` call. Second,
+`Volume::make_current_inode` inserts the new version and retires the old within one *synchronous,
+exclusively-borrowed* shard call — there is no `await` between the insert and the retire, and the
+single-threaded shard runs no other operation meanwhile — so at most **one** transient inode version
+coexists at a time, regardless of the client count. The `operation_headroom` is therefore the
+structural constant one (`COPY_UP_VERSION_HEADROOM`, crates/vfs/src/volume.rs), exactly the design's
+"bounded temporary coexistence during copy-up" with "measured *or structural* anchors" — no
+measurement, no invented number. The write-dependent accumulation the earlier note feared is real, but
+it *is* the retention dimension, charged separately, not a transient headroom.
 
-**What the reservation's own observable proof would be (once the headroom exists).** A create
-refusal, not only `statfs`: fill a shard's inode-version reserve with prior volumes, then a further
-create refuses with a resource-vector refusal even though byte budget remains. `statfs` reporting
-backed inode availability (`allowance − live`, and the reserve's remaining credits) is the second
-surface and is owed with the data-plane `statfs` work (BUG-9, GAP-A9-3). BUG-3 (dynamic growth
-consuming only unpromised capacity) is **fixed** for the byte dimension — `BudgetGrowth` debits the one
-budget on each increment, gated by `crates/bridge-core/tests/admission.rs`; the inode version-credit
-reservation is the remaining, separate piece.
+**The reservation, as built.** A per-shard `VersionBudget` (crates/mem/src/budget.rs) — the counted
+parallel of `ShardBudget`, sharing its `Ledger` arithmetic — is over the version slab
+(`store.max_inodes`) less the one-slot copy-up headroom. At create, the server reserves the volume's
+whole logical inode allowance against it (`state.store.versions.reserve(inode_allowance(...))`,
+crates/server/src/verbs.rs), on both the scratch-create and clone-create paths, refused whole (giving
+back the byte reservation) if the slab cannot back it; the allowance is capped at `max_inodes −
+headroom` so the largest derivable allowance is still reservable. The credit rides in the volume's
+server slot and is released on destroy and given back on every create-failure path (including the
+slot-insert failure, which previously leaked the byte reservation — a sibling bug fixed here), and
+re-acquired from the rebuilt budget on recovery. A clone now also carries an inode cap (it previously
+had none), set to that same allowance, so its reservation actually bounds it.
+
+**Its observable proof (now exercised).** A create refusal, not only `statfs`: `crates/server/tests/
+daemon.rs` fills a small shard's version slab with one big-quota volume, then a second create is
+refused (`BudgetExceeded`) *while physical slots plainly remain* — the disjoint reservation the bare
+cap does not give — and a third is admitted once destroy returns the first's slots. It is non-vacuous:
+neutered to `reserve(0)`, the test fails (the second volume is created). `statfs` reporting backed
+inode availability at the *shard* level (the reserve's remaining credits, beside the per-volume
+`allowance − live` it already reports) is a second surface, owed with a status-wire field. What
+remains for the inode dimension: charging *retention* into the same `VersionBudget` so retained
+versions and logical allowances share the slab disjointly, and re-deriving the allowance (and adjusting
+its reservation) on resize. BUG-3 (dynamic growth consuming only unpromised capacity) stays **fixed**
+for the byte dimension.
