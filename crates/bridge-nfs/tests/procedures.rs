@@ -12,9 +12,9 @@ use slates_bridge_nfs::mount::MountReply;
 use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
 use slates_bridge_nfs::procedures::{
   Export, NFSPROC3_ACCESS, NFSPROC3_CREATE, NFSPROC3_FSINFO, NFSPROC3_FSSTAT, NFSPROC3_GETATTR,
-  NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ, NFSPROC3_READDIR, NFSPROC3_READDIRPLUS,
-  NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR,
-  NFSPROC3_SYMLINK, NFSPROC3_WRITE,
+  NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ, NFSPROC3_READDIR,
+  NFSPROC3_READDIRPLUS, NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR,
+  NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE,
 };
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_db::catalog::{Principal, VolumeId};
@@ -1543,4 +1543,81 @@ fn readdirplus_lists_entries_with_attributes_and_handles() {
     Ftype3::Dir,
     "the '.' entry names the directory"
   );
+}
+
+/// Every served NFS procedure refuses hostile or truncated input with a typed status and never
+/// panics or over-allocates (Part 4: hostile-input tests on every parser of external bytes).
+/// `serve_nfs` is the network entry point — a panic or an unbounded allocation there is a denial
+/// of service — so each procedure is driven with an empty buffer, a garbage prefix, and a buffer
+/// whose leading opaque length is `u32::MAX` (which the XDR reader must refuse before allocating).
+#[test]
+fn every_procedure_refuses_hostile_input_without_panicking() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+
+  // Every procedure that decodes arguments (NULL takes none and is excluded — it has no parser).
+  let procedures = [
+    NFSPROC3_GETATTR,
+    NFSPROC3_SETATTR,
+    NFSPROC3_LOOKUP,
+    NFSPROC3_ACCESS,
+    NFSPROC3_READLINK,
+    NFSPROC3_READ,
+    NFSPROC3_WRITE,
+    NFSPROC3_CREATE,
+    NFSPROC3_MKDIR,
+    NFSPROC3_SYMLINK,
+    NFSPROC3_REMOVE,
+    NFSPROC3_RMDIR,
+    NFSPROC3_RENAME,
+    NFSPROC3_READDIR,
+    NFSPROC3_READDIRPLUS,
+    NFSPROC3_FSSTAT,
+    NFSPROC3_FSINFO,
+  ];
+
+  // A buffer whose first field claims a u32::MAX-byte opaque (the file handle): the reader must
+  // refuse it (length past the handle cap and past the buffer) before allocating.
+  let hostile_length = {
+    let mut w = XdrWriter::new();
+    w.u32(u32::MAX);
+    w.into_bytes()
+  };
+  let hostile_inputs: [&[u8]; 4] = [
+    &[],                       // empty
+    &[0xff, 0x13, 0x37],       // a garbage prefix, too short for even a length word
+    &[0x00, 0x00, 0x00, 0x40], // a well-formed length (64) with no bytes following
+    &hostile_length,           // a u32::MAX opaque length
+  ];
+
+  for &procedure in &procedures {
+    for input in &hostile_inputs {
+      // Reaching past this call at all proves no panic. A produced reply must be a typed refusal:
+      // its leading status word decodes and is never NFS3_OK, since the arguments never parsed.
+      let reply = export.serve_nfs(procedure, &mut XdrReader::new(input));
+      if let Some(bytes) = reply {
+        assert!(
+          !bytes.is_empty(),
+          "procedure {procedure} produced an empty reply for hostile input"
+        );
+        let status = XdrReader::new(&bytes).u32().unwrap();
+        assert_ne!(
+          status,
+          Nfsstat3::Ok.wire(),
+          "procedure {procedure} accepted hostile input as OK"
+        );
+      }
+    }
+  }
 }
