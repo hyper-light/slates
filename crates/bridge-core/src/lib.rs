@@ -231,4 +231,8 @@ pub trait Bridge {
   /// to resolve a "set to now" time — NFS `SET_TO_SERVER_TIME`, FUSE `UTIME_NOW` — into the explicit
   /// value `setattr` takes; the NOW resolution the design places at the transport (AC-3.10).
   fn now(&mut self) -> i64;
+  /// A token that changes whenever `object` is mutated — its monotonic change version (§4.5). A
+  /// transport that must detect a change between two calls uses it: the NFS `READDIR` cookieverf is
+  /// this token, so a continuation against a directory mutated since the listing began is refused.
+  fn change_token(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError>;
 }

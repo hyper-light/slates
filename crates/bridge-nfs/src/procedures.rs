@@ -146,10 +146,6 @@ const READDIR_ENTRY_FIXED: usize = 4 + size_of::<u64>() + size_of::<u64>();
 /// `post_op_attr` (its bool plus a `fattr3`), the `cookieverf` (8), and the trailing end-of-list
 /// and `eof` bools (8) — reserved from the client's `count` so the reply stays within it.
 const READDIR_REPLY_OVERHEAD: usize = 4 + 4 + FATTR3_BYTES + size_of::<u64>() + 4 + 4;
-/// Format: the READDIR `cookieverf` this server returns — eight zero bytes, "no verifier". A
-/// directory-change verifier (so a client detects a directory mutated mid-listing) is owed; slates
-/// invalidates caches on every mutation (§4.6 cache posture), so a stale listing is not served.
-const COOKIE_VERF_NONE: [u8; size_of::<u64>()] = [0u8; size_of::<u64>()];
 /// Format: the fixed XDR bytes a READDIRPLUS `entryplus3` adds over a READDIR `entry3` besides the
 /// variable handle — a present `name_attributes` (its bool plus a `fattr3`) and the `name_handle`
 /// present bool — for budgeting a reply against the client's `maxcount`.
@@ -1014,10 +1010,10 @@ impl<'b> Export<'b> {
   fn encode_readdir(&mut self, args: &mut XdrReader<'_>, plus: bool) -> Vec<u8> {
     let mut writer = XdrWriter::new();
     match self.readdir_result(args, plus) {
-      Ok((dir_attr, entries, eof)) => {
+      Ok((dir_attr, entries, eof, verf)) => {
         Nfsstat3::Ok.encode(&mut writer);
         PostOpAttr(Some(dir_attr)).encode(&mut writer);
-        writer.fixed(&COOKIE_VERF_NONE);
+        writer.fixed(&verf);
         for entry in entries {
           writer.bool(true); // an entry follows
           writer.u64(entry.fileid);
@@ -1049,12 +1045,16 @@ impl<'b> Export<'b> {
     &mut self,
     args: &mut XdrReader<'_>,
     plus: bool,
-  ) -> Result<(Fattr3, Vec<ReaddirEntry>, bool), Nfsstat3> {
-    // READDIR3args: dir handle, cookie, cookieverf (ignored), count. READDIRPLUS3args replaces the
-    // trailing count with dircount (advisory, ignored) then maxcount (the reply budget).
+  ) -> Result<(Fattr3, Vec<ReaddirEntry>, bool, [u8; size_of::<u64>()]), Nfsstat3> {
+    // READDIR3args: dir handle, cookie, cookieverf, count. READDIRPLUS3args replaces the trailing
+    // count with dircount (advisory, ignored) then maxcount (the reply budget).
     let dir_fh = Nfsfh3::decode(args).map_err(|_| Nfsstat3::Badhandle)?;
     let cookie = args.u64().map_err(|_| Nfsstat3::Inval)?;
-    args.fixed(size_of::<u64>()).map_err(|_| Nfsstat3::Inval)?; // cookieverf, ignored (owed)
+    let cookieverf: [u8; size_of::<u64>()] = args
+      .fixed(size_of::<u64>())
+      .map_err(|_| Nfsstat3::Inval)?
+      .try_into()
+      .unwrap_or_default();
     let budget = if plus {
       let _dircount = args.u32().map_err(|_| Nfsstat3::Inval)?;
       usize::try_from(args.u32().map_err(|_| Nfsstat3::Inval)?).unwrap_or(0)
@@ -1066,6 +1066,18 @@ impl<'b> Export<'b> {
     let dir_attr = self.fattr3(&dir_node);
     let cx = self.op_context().map_err(|e| nfsstat_of(&e))?;
     let dir_object = ObjectId::new(identity.inode, identity.generation);
+    // The cookieverf is the directory's monotonic change version (§4.5): a continuation (cookie
+    // != 0) whose verf no longer matches means the directory changed since the listing began, so
+    // the client must restart from the beginning (RFC 1813 §3.3.16). The version is collision-free,
+    // unlike a change-time verf: a mutation always advances it, so a change is never missed.
+    let verf = self
+      .bridge
+      .change_token(dir_object, &cx)
+      .map_err(|e| nfsstat_of(&e))?
+      .to_be_bytes();
+    if cookie != 0 && cookieverf != verf {
+      return Err(Nfsstat3::BadCookie);
+    }
     // The cookie is the number of entries already returned; the shared readdir skips that many.
     let rows = self
       .bridge
@@ -1114,7 +1126,7 @@ impl<'b> Export<'b> {
         handle,
       });
     }
-    Ok((dir_attr, entries, eof))
+    Ok((dir_attr, entries, eof, verf))
   }
 
   /// The shared tail of CREATE, MKDIR and SYMLINK: apply the `sattr3` fields the creation did not

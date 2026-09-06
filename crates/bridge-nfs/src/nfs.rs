@@ -47,6 +47,9 @@ pub enum Nfsstat3 {
   /// Format: NFS3ERR_NOT_SYNC — a SETATTR guard's ctime did not match the object's, so the
   /// caller's cached state is out of date and the update is refused (RFC 1813 §3.3.2).
   NotSync = 10002,
+  /// Format: NFS3ERR_BAD_COOKIE — a READDIR/READDIRPLUS continuation whose cookieverf no longer
+  /// matches the directory's, so the directory changed since the listing began (RFC 1813 §3.3.16).
+  BadCookie = 10003,
   /// Format: NFS3ERR_NOTSUPP — the operation is not supported.
   Notsupp = 10004,
   /// Format: NFS3ERR_TOOSMALL — a READDIR/READDIRPLUS `count` too small to hold even one entry.

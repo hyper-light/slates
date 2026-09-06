@@ -230,6 +230,9 @@ impl Bridge for Mock {
   fn now(&mut self) -> i64 {
     0
   }
+  fn change_token(&mut self, _object: ObjectId, _cx: &OpContext) -> Result<u64, VfsError> {
+    Ok(0)
+  }
 }
 
 /// A read-write current-view context, built through the attachment registry the way the daemon

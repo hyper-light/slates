@@ -474,6 +474,14 @@ impl Volume {
     Ok(node.parent.unwrap_or(dir_no))
   }
 
+  /// The mutation version of inode `no`: a per-inode counter the journal records that increases on
+  /// every change to the object (`touch_dir` bumps a directory's on every entry insert or remove).
+  /// A transport that must detect a change between two calls — an NFS `READDIR` continuation whose
+  /// cookieverf must still match — reads it; it is monotonic and collision-free, unlike a clock.
+  pub fn change_version(&self, store: &Store, no: InodeNo) -> Result<u64, VfsError> {
+    Ok(self.inode(store, no)?.version)
+  }
+
   /// Creates a file named `name` in the directory named by inode number `dir_no`.
   pub fn create_file_no(
     &mut self,

@@ -1278,12 +1278,13 @@ fn a_readlink_returns_the_target_and_refuses_a_non_symlink() {
   );
 }
 
-/// Parses a READDIR reply into (names, last cookie, eof), for the listing tests.
-fn parse_readdir(reply: &[u8]) -> (Vec<String>, u64, bool) {
+/// Parses a READDIR reply into (names, last cookie, cookieverf, eof), for the listing tests. The
+/// cookieverf is carried so a continuation echoes it, the way a real client does.
+fn parse_readdir(reply: &[u8]) -> (Vec<String>, u64, [u8; 8], bool) {
   let mut r = XdrReader::new(reply);
   assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "READDIR succeeded");
   PostOpAttr::decode(&mut r).unwrap(); // dir attributes
-  let _verf = r.fixed(8).unwrap(); // cookieverf
+  let verf: [u8; 8] = r.fixed(8).unwrap().try_into().unwrap();
   let mut names = Vec::new();
   let mut last_cookie = 0;
   while r.bool().unwrap() {
@@ -1294,7 +1295,7 @@ fn parse_readdir(reply: &[u8]) -> (Vec<String>, u64, bool) {
     last_cookie = cookie;
   }
   let eof = r.bool().unwrap();
-  (names, last_cookie, eof)
+  (names, last_cookie, verf, eof)
 }
 
 /// READDIR lists a directory's entries and paginates: a generous count returns them all with eof,
@@ -1323,19 +1324,20 @@ fn readdir_lists_entries_and_paginates() {
   .unwrap();
   let root_fh = root_handle(&mut export);
 
-  // A generous count returns all three names with eof.
-  let readdir = |export: &mut Export<'_>, cookie: u64, count: u32| -> Vec<u8> {
+  // A READDIR echoing the cookieverf the previous reply gave, the way a client continues a listing.
+  let readdir = |export: &mut Export<'_>, cookie: u64, verf: [u8; 8], count: u32| -> Vec<u8> {
     let mut args = XdrWriter::new();
     root_fh.encode(&mut args);
     args.u64(cookie);
-    args.fixed(&[0u8; 8]); // cookieverf
+    args.fixed(&verf); // cookieverf
     args.u32(count);
     export
       .serve_nfs(NFSPROC3_READDIR, &mut XdrReader::new(args.as_slice()))
       .unwrap()
   };
 
-  let (mut names, _c, eof) = parse_readdir(&readdir(&mut export, 0, 8192));
+  // A generous count returns all entries with eof. The first call's verf is ignored (cookie 0).
+  let (mut names, _c, verf, eof) = parse_readdir(&readdir(&mut export, 0, [0u8; 8], 8192));
   names.sort();
   assert_eq!(
     names,
@@ -1344,14 +1346,15 @@ fn readdir_lists_entries_and_paginates() {
   );
   assert!(eof, "the whole directory fit, so eof is set");
 
-  // A small count paginates: a partial list without eof, then the rest from the resume cookie.
-  let (first, cookie, eof1) = parse_readdir(&readdir(&mut export, 0, 170));
+  // A small count paginates: a partial list without eof, then the rest resumed from the cookie and
+  // the cookieverf the first reply returned.
+  let (first, cookie, verf, eof1) = parse_readdir(&readdir(&mut export, 0, verf, 170));
   assert!(!eof1, "a partial listing is not at eof");
   assert!(
     !first.is_empty() && first.len() < 5,
     "a partial listing has some but not all entries"
   );
-  let (rest, _c2, eof2) = parse_readdir(&readdir(&mut export, cookie, 8192));
+  let (rest, _c2, _v2, eof2) = parse_readdir(&readdir(&mut export, cookie, verf, 8192));
   assert!(eof2, "the resumed listing reaches eof");
   let mut all: Vec<String> = first.into_iter().chain(rest).collect();
   all.sort();
@@ -1362,11 +1365,90 @@ fn readdir_lists_entries_and_paginates() {
   );
 
   // A count too small for even one entry is TOOSMALL.
-  let tiny = readdir(&mut export, 0, 8);
+  let tiny = readdir(&mut export, 0, [0u8; 8], 8);
   assert_eq!(
     XdrReader::new(&tiny).u32().unwrap(),
     Nfsstat3::Toosmall.wire(),
     "a count too small for one entry is TOOSMALL"
+  );
+}
+
+/// A READDIR continuation whose cookieverf no longer matches the directory's — because the
+/// directory changed since the listing began — is refused NFS3ERR_BAD_COOKIE, so a client never
+/// resumes a listing against a mutated directory and silently skips or repeats entries.
+#[test]
+fn a_readdir_continuation_after_the_directory_changes_is_bad_cookie() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  for name in ["a", "b", "c"] {
+    bridge.create(oid(root_ino), &cx, name, 0o644, 0).unwrap();
+  }
+
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = root_handle(&mut export);
+
+  let readdir = |export: &mut Export<'_>, cookie: u64, verf: [u8; 8], count: u32| -> Vec<u8> {
+    let mut args = XdrWriter::new();
+    root_fh.encode(&mut args);
+    args.u64(cookie);
+    args.fixed(&verf);
+    args.u32(count);
+    export
+      .serve_nfs(NFSPROC3_READDIR, &mut XdrReader::new(args.as_slice()))
+      .unwrap()
+  };
+
+  // A first partial listing yields a resume cookie and the directory's cookieverf.
+  let (first, cookie, verf, eof) = parse_readdir(&readdir(&mut export, 0, [0u8; 8], 170));
+  assert!(!eof, "a partial listing is not at eof");
+  assert!(!first.is_empty(), "the first page has entries");
+
+  // While the directory is unchanged, the echoed verf resumes the listing.
+  let ok = readdir(&mut export, cookie, verf, 8192);
+  assert_eq!(
+    XdrReader::new(&ok).u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "an unchanged directory resumes with the echoed verf"
+  );
+
+  // Change the directory through the export (a CREATE advances its change time), then resume with
+  // the now-stale verf: the continuation is refused BAD_COOKIE.
+  let mut ca = XdrWriter::new();
+  root_fh.encode(&mut ca);
+  ca.opaque("d".as_bytes());
+  ca.u32(1); // createmode GUARDED
+  ca.bool(false); // no sattr fields
+  ca.bool(false);
+  ca.bool(false);
+  ca.bool(false);
+  ca.u32(0);
+  ca.u32(0);
+  let creply = export
+    .serve_nfs(NFSPROC3_CREATE, &mut XdrReader::new(ca.as_slice()))
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&creply).u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "the CREATE changing the directory succeeds"
+  );
+
+  let stale = readdir(&mut export, cookie, verf, 8192);
+  assert_eq!(
+    XdrReader::new(&stale).u32().unwrap(),
+    Nfsstat3::BadCookie.wire(),
+    "a continuation against the changed directory is BAD_COOKIE"
   );
 }
 

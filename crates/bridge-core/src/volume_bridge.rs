@@ -556,6 +556,13 @@ impl Bridge for VolumeBridge<'_> {
     self.volume.wall_ns()
   }
 
+  fn change_token(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError> {
+    self.authorize_read(cx)?;
+    self
+      .volume
+      .change_version(self.store, slates_vfs::ids::InodeNo(object.inode))
+  }
+
   fn statfs(&mut self, _object: ObjectId, cx: &OpContext) -> Result<FsStat, VfsError> {
     self.authorize_read(cx)?;
     let accounting = self.volume.accounting();
