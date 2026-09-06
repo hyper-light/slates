@@ -706,6 +706,7 @@ impl Volume {
     let root_no = InodeNo(image.root_no);
     let seed = VolumeSeed {
       prefix: image.prefix,
+      root_no,
       policy,
       epoch,
       next_counter: image.next_counter,

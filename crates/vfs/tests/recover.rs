@@ -272,6 +272,64 @@ fn prefixed_volume(store: &mut slates_vfs::volume::Store, prefix: u16) -> Volume
   .unwrap()
 }
 
+/// AC (§4.8, A-9): a clone (a volume whose origin is another's snapshot) recovers its content —
+/// both the bytes it inherited from the origin snapshot and the bytes it wrote after diverging. It
+/// rebuilds as an independent volume (the O(1) sharing with the origin is a §4.2 efficiency
+/// refinement, not a content property), and its origin epoch is restored.
+#[test]
+fn a_clone_recovers_inherited_and_diverged_content() {
+  let mut src = store();
+  let mut origin = prefixed_volume(&mut src, 7);
+  let root = origin.root_inode(&src).unwrap();
+  let inherited = origin
+    .create_file_no(&mut src, root, "shared", 0o644)
+    .unwrap();
+  origin
+    .write(&mut src, inherited, 0, b"from the origin")
+    .unwrap();
+  let snap = origin.snapshot(&mut src).unwrap();
+
+  // A clone of that snapshot into a new volume (prefix 8); it inherits the origin's root and tree.
+  let mut clone = Volume::clone_of(
+    &src,
+    &mut origin,
+    snap,
+    VolumeConfig {
+      prefix: 8,
+      names: NameEquivalence::Fold,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 16,
+      clock: Box::new(StepClock::new(0, 1)),
+    },
+  )
+  .unwrap();
+  let clone_root = clone.root_inode(&src).unwrap();
+  let own = clone
+    .create_file_no(&mut src, clone_root, "clone-only", 0o644)
+    .unwrap();
+  clone.write(&mut src, own, 0, b"from the clone").unwrap();
+
+  let image = clone.to_image(&src).unwrap();
+  assert!(
+    image.origin_epoch.is_some(),
+    "a clone records its origin epoch"
+  );
+
+  let mut fresh = store();
+  let recovered =
+    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  assert_eq!(
+    recovered.to_image(&fresh).unwrap(),
+    image,
+    "the clone rebuilds faithfully"
+  );
+  let mut buf = vec![0u8; 32];
+  let n = recovered.read(&fresh, inherited, 0, &mut buf).unwrap();
+  assert_eq!(&buf[..n], b"from the origin", "inherited content recovered");
+  let n = recovered.read(&fresh, own, 0, &mut buf).unwrap();
+  assert_eq!(&buf[..n], b"from the clone", "diverged content recovered");
+}
+
 /// AC (§4.8, A-9): a whole shard of volumes — one content object holds them all — survives a handoff.
 /// Two volumes with distinct prefixes are imaged together into one shard image, published into a
 /// content object, and after the "restart" every volume is recovered by key and rebuilds faithfully.

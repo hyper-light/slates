@@ -228,6 +228,10 @@ pub enum DestroyProgress {
 pub(crate) struct VolumeSeed {
   /// The inode-number prefix.
   pub(crate) prefix: u16,
+  /// The root directory's inode number. Usually `compose(prefix, 1)`, but a clone inherits its
+  /// origin's root, so it carries the origin's prefix — recovery must use the image's number, not
+  /// recompute it from this volume's prefix.
+  pub(crate) root_no: InodeNo,
   /// The name-equivalence policy.
   pub(crate) policy: NameEquivalence,
   /// The head epoch.
@@ -354,7 +358,7 @@ impl Volume {
     journal_bytes: usize,
   ) -> Result<Volume, VfsError> {
     let epoch = seed.epoch;
-    let root_no = InodeNo::compose(seed.prefix, 1);
+    let root_no = seed.root_no;
     let root_inode = Inode::new(root_no, epoch, Kind::Dir, ROOT_MODE, Body::None);
     let root_handle = store.inodes.insert(root_inode)?;
     let inode_root = trie::new_root(&mut store.tries, epoch)?;
