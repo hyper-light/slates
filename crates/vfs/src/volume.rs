@@ -363,6 +363,15 @@ impl Volume {
     }
   }
 
+  /// The volume's total capacity in bytes: its quota ceiling — a bounded quota's `limit`, a dynamic
+  /// quota's `max`. A transport reports this as the filesystem's total size in `statfs`/`FSSTAT`,
+  /// against which `accounting().referenced_bytes` is the used amount; the two are the same pair the
+  /// quota admits writes against, so the reported free space is the real remaining quota, not an
+  /// invented figure.
+  pub fn capacity_bytes(&self) -> u64 {
+    self.quota.limit()
+  }
+
   /// The newest epoch whose objects the head shares with a snapshot or its clone origin.
   fn shared_epoch(&self) -> Option<Epoch> {
     match (self.last_snapshot_epoch(), self.origin_epoch) {

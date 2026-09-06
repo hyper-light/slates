@@ -580,15 +580,21 @@ impl Bridge for VolumeBridge<'_> {
   fn statfs(&mut self, _object: ObjectId, cx: &OpContext) -> Result<FsStat, VfsError> {
     self.authorize_read(cx)?;
     let accounting = self.volume.accounting();
-    // Blocks are the volume's referenced bytes over the block size; the volume core does not
-    // expose a hard cap here (a dynamic volume grows), so free is reported generously and the
-    // quota is enforced on write, not by statfs. A transport uses this only for `df`.
+    // Truthful space (audit BUG-9): the total is the volume's real quota ceiling, the used is its
+    // referenced bytes, and the free is the remaining quota — not an invented multiple of the used
+    // amount, which the previous `blocks = 2 * used` / `free = used` reported. The total and used
+    // are the same pair the quota admits writes against, so `df` shows the real capacity a write
+    // will be refused past (a dynamic volume's total is its `max`; the file counts are reported as
+    // "not enforced" because the volume allocates inodes up to the store cap, an exact free-inode
+    // count owed with the store accessor).
     let block = u64::from(BLOCK_SIZE);
-    let used = accounting.referenced_bytes.div_ceil(block);
+    let total_blocks = self.volume.capacity_bytes().div_ceil(block);
+    let used_blocks = accounting.referenced_bytes.div_ceil(block);
+    let free_blocks = total_blocks.saturating_sub(used_blocks);
     Ok(FsStat {
-      blocks: used.saturating_mul(2).max(1),
-      bfree: used,
-      bavail: used,
+      blocks: total_blocks,
+      bfree: free_blocks,
+      bavail: free_blocks,
       files: 0,
       ffree: 0,
       bsize: BLOCK_SIZE,

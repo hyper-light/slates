@@ -491,3 +491,57 @@ fn a_teardown_sweep_releases_one_attachments_references_through_the_bridge() {
   // A second sweep of a drained attachment releases nothing (idempotent).
   bridge.sweep_attachment(&a).unwrap();
 }
+
+/// statfs reports the volume's real capacity and free space, not an invented multiple of the used
+/// amount (audit BUG-9): the total is the quota ceiling, the used reflects the written bytes, and
+/// the free is the remaining quota. The previous `blocks = 2 * used` / `free = used` would fail
+/// this — its total tracked usage instead of the fixed 1 GiB capacity.
+#[test]
+fn statfs_reports_the_real_capacity_not_an_invented_figure() {
+  const QUOTA_BYTES: u64 = 1 << 30; // the test volume()'s Quota::Bounded limit
+  const BLOCK: u64 = 4096;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let root = bridge.root(&cx).unwrap();
+
+  // An empty volume: the total is the real quota, and (nearly) all of it is free.
+  let empty = bridge.statfs(oid(root), &cx).unwrap();
+  assert_eq!(
+    u64::from(empty.bsize),
+    BLOCK,
+    "the block size is the volume's page unit"
+  );
+  assert_eq!(
+    empty.blocks,
+    QUOTA_BYTES / BLOCK,
+    "the total is the real quota ceiling, not a multiple of the used amount"
+  );
+  assert!(
+    empty.bfree > (QUOTA_BYTES / BLOCK) - 16,
+    "an empty volume reports nearly all of its quota free, got {}",
+    empty.bfree
+  );
+
+  // After writing, used rises and free falls by the same amount — both against the fixed total.
+  let (attr, _fh) = bridge.create(oid(root), &cx, "f", 0o644, 0).unwrap();
+  let payload = vec![0u8; 200 * 1024]; // 200 KiB, several blocks
+  bridge.write(oid(attr.ino), &cx, 0, &payload).unwrap();
+  let after = bridge.statfs(oid(root), &cx).unwrap();
+  assert_eq!(
+    after.blocks, empty.blocks,
+    "the total capacity does not change with usage"
+  );
+  assert!(
+    after.bfree < empty.bfree,
+    "free space fell after the write ({} -> {})",
+    empty.bfree,
+    after.bfree
+  );
+  // The drop in free blocks reflects the written bytes (at least the payload's worth).
+  assert!(
+    empty.bfree - after.bfree >= (200 * 1024) / BLOCK,
+    "free fell by at least the written blocks"
+  );
+}
