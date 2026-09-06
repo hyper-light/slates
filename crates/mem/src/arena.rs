@@ -84,6 +84,14 @@ impl ChunkArena {
     self.slots.iter().map(|s| s.buddy.free_bytes()).sum()
   }
 
+  /// The usable (buddy-allocatable) capacity across regions: the bytes that can actually be
+  /// handed out, which is each region's largest power-of-two number of granules — not its mapping
+  /// length. Admission must reserve against this, never the mapping, or it over-promises quota the
+  /// arena cannot physically back (§4.2, BUG-2). Constant for the life of the arena's regions.
+  pub fn capacity(&self) -> usize {
+    self.slots.iter().map(|s| s.buddy.region_bytes()).sum()
+  }
+
   /// Locked bytes across regions.
   pub fn locked_bytes(&self) -> usize {
     self

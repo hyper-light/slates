@@ -273,6 +273,10 @@ fn init_shard(
     config.page,
     config.huge_pages,
   )?)?;
+  // The budget is over what the arena can actually hand out (its buddy-allocatable capacity), not
+  // the region's mapping length, so admission never promises quota the arena cannot back (§4.2,
+  // BUG-2). The two differ whenever the mapping is not a power-of-two number of granules.
+  let arena_capacity = u64::try_from(arena.capacity()).unwrap_or(u64::MAX);
   let store = Store::new(
     &StoreConfig {
       page: config.page,
@@ -326,7 +330,7 @@ fn init_shard(
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),
     by_id: std::collections::BTreeMap::new(),
     clients: Slab::new(config.caps.segment_slots, config.clients_per_shard),
-    budget: ShardBudget::new(config.reserve_per_shard, peak_burst.get()),
+    budget: ShardBudget::new(arena_capacity, peak_burst.get()),
     next_prefix: partition
       .saturating_mul(u16::try_from(config.caps.segment_slots).unwrap_or(u16::MAX))
       .max(1),
