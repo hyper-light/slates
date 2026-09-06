@@ -31,11 +31,11 @@ use slates_wire::crc32c::crc32c;
 use crate::clock::Clock;
 use crate::dir::{Child, DirNode};
 use crate::error::VfsError;
-use crate::ids::{Epoch, InodeNo};
+use crate::ids::{Epoch, InodeNo, SnapshotId};
 use crate::inode::{Attrs, Body, Home, Inode, Kind};
 use crate::names::NameEquivalence;
 use crate::quota::Quota;
-use crate::trie;
+use crate::trie::{self, TrieNode};
 use crate::volume::{Store, Volume, VolumeSeed};
 
 /// Format: a volume image's magic (`"SLR1"` little-endian), so an all-zero or foreign content
@@ -182,8 +182,44 @@ pub struct InodeImage {
   pub body: BodyImage,
 }
 
+/// A snapshot's slot and generation in the image — the same pair a [`crate::ids::SnapshotId`]
+/// carries, so a snapshot id a client holds still resolves after recovery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+pub struct SnapshotRef {
+  /// The snapshot slab slot.
+  pub index: u32,
+  /// The slot's generation when the snapshot was taken.
+  pub generation: u32,
+}
+
+/// One copy-on-write snapshot in the image (§4.8): its identity and accounting, its links to the
+/// neighbouring snapshots, and the tree frozen at it — every inode reachable from the snapshot's
+/// own inode table, with its content *as the snapshot holds it* (read through the snapshot, not the
+/// head). Captured independently of the head; the rebuild re-establishes it (its sharing with the
+/// head is a §4.2 efficiency refinement, not a correctness property of the content).
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct SnapshotImage {
+  /// The snapshot's id.
+  pub id: SnapshotRef,
+  /// The epoch the snapshot froze.
+  pub epoch: u64,
+  /// `referenced_bytes` at the snapshot (restored so accounting survives, §4.2/D-13).
+  pub referenced_bytes: u64,
+  /// The op-log head sequence at the snapshot (the deriver reads records after it).
+  pub seq: u64,
+  /// Clones that pin this snapshot as their origin.
+  pub clone_refs: u32,
+  /// The previous snapshot, if any.
+  pub previous: Option<SnapshotRef>,
+  /// The next snapshot, if any.
+  pub next: Option<SnapshotRef>,
+  /// Every inode reachable at the snapshot, in number order.
+  pub inodes: Vec<InodeImage>,
+}
+
 /// A whole volume's recoverable state (§4.8, A-9). The inodes are in number order (the order the
-/// inode table yields them), so two images of equal state are byte-identical (a determinism gate).
+/// inode table yields them) and snapshots are in id order, so two images of equal state are
+/// byte-identical (a determinism gate).
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub struct VolumeImage {
   /// The format magic; checked before anything else on decode.
@@ -204,8 +240,12 @@ pub struct VolumeImage {
   pub quota: QuotaImage,
   /// The root directory's inode number.
   pub root_no: u64,
-  /// Every inode, in number order.
+  /// The volume's most recent snapshot, if any.
+  pub last_snapshot: Option<SnapshotRef>,
+  /// Every inode of the head, in number order.
   pub inodes: Vec<InodeImage>,
+  /// Every copy-on-write snapshot, in id order.
+  pub snapshots: Vec<SnapshotImage>,
 }
 
 /// One volume's image under the routing key its owner (the server) files it by — the volume id's
@@ -404,13 +444,8 @@ impl Volume {
   /// does not yet capture (a base-backed entry or a whiteout over one), so a base-backed volume is
   /// never imaged as if it were only its overlay (the base-plane recovery gate).
   pub fn to_image(&self, store: &Store) -> Result<VolumeImage, VfsError> {
-    let mut handles = Vec::new();
-    trie::walk(&store.tries, self.inode_root, &mut handles);
-    let mut inodes = Vec::with_capacity(handles.len());
-    for handle in handles {
-      let inode = store.inodes.get(handle)?;
-      inodes.push(self.image_of_inode(store, inode)?);
-    }
+    let inodes = self.capture_tree(store, self.inode_root, None)?;
+    let snapshots = self.capture_snapshots(store)?;
     let root_no = store
       .dirs
       .get(self.root)
@@ -426,12 +461,63 @@ impl Volume {
       origin_epoch: self.origin_epoch.map(|e| e.0),
       quota: quota_image(&self.quota),
       root_no: root_no.0,
+      last_snapshot: self.last_snapshot.map(snap_ref),
       inodes,
+      snapshots,
     })
   }
 
-  /// The image of one inode, capturing its body faithfully or refusing an un-captured kind.
-  fn image_of_inode(&self, store: &Store, inode: &Inode) -> Result<InodeImage, VfsError> {
+  /// Captures every inode reachable from `inode_root`, in number order. File content is read through
+  /// `snapshot` when set (the snapshot's own bytes) or the head when `None` — the version at that
+  /// root, not the head's, which is what makes a snapshot's frozen content captured faithfully.
+  fn capture_tree(
+    &self,
+    store: &Store,
+    inode_root: Handle<TrieNode>,
+    snapshot: Option<SnapshotId>,
+  ) -> Result<Vec<InodeImage>, VfsError> {
+    let mut handles = Vec::new();
+    trie::walk(&store.tries, inode_root, &mut handles);
+    let mut inodes = Vec::with_capacity(handles.len());
+    for handle in handles {
+      let inode = store.inodes.get(handle)?;
+      inodes.push(self.image_of_inode(store, inode, snapshot)?);
+    }
+    Ok(inodes)
+  }
+
+  /// Captures every copy-on-write snapshot, in id order, with the tree frozen at each (§4.8).
+  fn capture_snapshots(&self, store: &Store) -> Result<Vec<SnapshotImage>, VfsError> {
+    let mut out = Vec::with_capacity(self.snapshots.iter().count());
+    for (handle, snap) in self.snapshots.iter() {
+      let id = SnapshotId {
+        index: handle.index(),
+        generation: handle.generation(),
+      };
+      let inodes = self.capture_tree(store, snap.inode_root, Some(id))?;
+      out.push(SnapshotImage {
+        id: snap_ref(id),
+        epoch: snap.epoch.0,
+        referenced_bytes: snap.referenced_bytes,
+        seq: snap.seq,
+        clone_refs: snap.clone_refs,
+        previous: snap.previous.map(snap_ref),
+        next: snap.next.map(snap_ref),
+        inodes,
+      });
+    }
+    out.sort_by_key(|s| (s.id.index, s.id.generation));
+    Ok(out)
+  }
+
+  /// The image of one inode, capturing its body faithfully or refusing an un-captured kind. File
+  /// content is read through `snapshot` when set (see [`Volume::capture_tree`]).
+  fn image_of_inode(
+    &self,
+    store: &Store,
+    inode: &Inode,
+    snapshot: Option<SnapshotId>,
+  ) -> Result<InodeImage, VfsError> {
     if matches!(inode.body, Body::Base(_)) {
       return Err(VfsError::RecoveryIncomplete);
     }
@@ -445,7 +531,7 @@ impl Volume {
         },
         _ => return Err(VfsError::RecoveryIncomplete),
       },
-      Kind::File => self.file_body(store, inode)?,
+      Kind::File => self.file_body(store, inode, snapshot)?,
     };
     Ok(InodeImage {
       no: inode.no.0,
@@ -505,9 +591,15 @@ impl Volume {
     Ok(entries)
   }
 
-  /// A file inode's bytes, read through the volume's own read path so inline, sealed and open
-  /// bodies are all captured the same. An empty file (no content yet) images as `Empty`.
-  fn file_body(&self, store: &Store, inode: &Inode) -> Result<BodyImage, VfsError> {
+  /// A file inode's bytes, read through the volume's own read path so inline, sealed and open bodies
+  /// are all captured the same, from `snapshot` when set (its frozen bytes) or the head. An empty
+  /// file (no content yet) images as `Empty`.
+  fn file_body(
+    &self,
+    store: &Store,
+    inode: &Inode,
+    snapshot: Option<SnapshotId>,
+  ) -> Result<BodyImage, VfsError> {
     let size = usize::try_from(inode.attrs.size).map_err(|_| VfsError::FileTooLarge)?;
     if size == 0 {
       return Ok(BodyImage::Empty);
@@ -516,7 +608,10 @@ impl Volume {
     let mut read = 0;
     while read < size {
       let at = u64::try_from(read).map_err(|_| VfsError::FileTooLarge)?;
-      let got = self.read(store, inode.no, at, &mut bytes[read..])?;
+      let got = match snapshot {
+        Some(id) => self.read_in(store, id, inode.no, at, &mut bytes[read..])?,
+        None => self.read(store, inode.no, at, &mut bytes[read..])?,
+      };
       if got == 0 {
         break;
       }
@@ -524,6 +619,14 @@ impl Volume {
     }
     bytes.truncate(read);
     Ok(BodyImage::File { bytes })
+  }
+}
+
+/// The image reference for a snapshot id.
+const fn snap_ref(id: SnapshotId) -> SnapshotRef {
+  SnapshotRef {
+    index: id.index,
+    generation: id.generation,
   }
 }
 

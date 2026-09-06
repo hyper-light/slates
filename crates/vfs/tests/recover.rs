@@ -371,6 +371,44 @@ fn the_content_frame_signals_empty_and_refuses_a_torn_write() {
   );
 }
 
+/// AC (§4.8, A-9): a copy-on-write snapshot is captured with the tree frozen at it — a file
+/// modified after the snapshot reads its new bytes in the head image and its old bytes in the
+/// snapshot image, so the snapshot's content is captured through the snapshot, not the head.
+#[test]
+fn to_image_captures_a_snapshots_frozen_content() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, f, 0, b"before").unwrap();
+  let _snap = vol.snapshot(&mut store).unwrap();
+  vol.write(&mut store, f, 0, b"after-the-snapshot").unwrap();
+
+  let image = vol.to_image(&store).unwrap();
+  assert_eq!(image.snapshots.len(), 1, "the snapshot is captured");
+
+  let head = image.inodes.iter().find(|i| i.no == f.0).unwrap();
+  assert_eq!(
+    head.body,
+    BodyImage::File {
+      bytes: b"after-the-snapshot".to_vec()
+    },
+    "the head image holds the post-snapshot content"
+  );
+  let frozen = image.snapshots[0]
+    .inodes
+    .iter()
+    .find(|i| i.no == f.0)
+    .unwrap();
+  assert_eq!(
+    frozen.body,
+    BodyImage::File {
+      bytes: b"before".to_vec()
+    },
+    "the snapshot image holds the content frozen at the snapshot"
+  );
+}
+
 /// AC (§4.8): an image round-trips through its content bytes unchanged — the exact state a
 /// restarted daemon would read back equals what the running one published.
 #[test]
