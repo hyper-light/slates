@@ -552,6 +552,57 @@ fn a_dynamic_volume_recovers_with_its_quota_and_growth() {
   assert_eq!(n, 128 * 1024, "the grown content reads back after recovery");
 }
 
+/// AC (§4.8): a referenced-but-unlinked orphan's content survives recovery — its acknowledged bytes
+/// are not lost. A file is opened (referenced), then unlinked while open (POSIX unlink-while-open):
+/// its name is gone but its inode stays allocated in the table, so the image (which captures every
+/// inode the table reaches, by number) captures it, and recovery rebuilds it. The recovered volume
+/// serves its bytes by the same inode number a handoff-reacquired handle would use.
+#[test]
+fn an_unlinked_but_open_orphan_recovers_its_content() {
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let f = vol.create_file_no(&mut src, root, "f", 0o644).unwrap();
+  vol.write(&mut src, f, 0, b"orphan-bytes").unwrap();
+  vol.reference(&src, f).unwrap(); // a transport holds it open
+  vol.unlink_no(&mut src, root, "f").unwrap(); // unlink while open → orphan
+  assert!(
+    vol.lookup_no(&src, root, "f").is_err(),
+    "the orphan has no name in the tree"
+  );
+  let mut buf = vec![0u8; 16];
+  let n = vol.read(&src, f, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..n],
+    b"orphan-bytes",
+    "the orphan is still readable by number while open"
+  );
+
+  let image = vol.to_image(&src).unwrap();
+  assert!(
+    image.inodes.iter().any(|i| i.no == f.0),
+    "the orphan inode is captured in the image (the walk covers the inode table, not just the tree)"
+  );
+  let mut fresh = store();
+  let mut recovered =
+    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  let n = recovered.read(&fresh, f, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..n],
+    b"orphan-bytes",
+    "the orphan's acknowledged content survives recovery (§4.8), not lost with its name"
+  );
+  // The orphan *tracking* is restored too, not just the bytes: a handle reacquired through the anchor
+  // handoff (a reference) and then closed (unreference) reclaims the orphan, rather than leaking it.
+  // Without restoring the orphan set this last close would not reclaim, so the assertion is non-vacuous.
+  recovered.reference(&fresh, f).unwrap();
+  recovered.unreference(&mut fresh, f).unwrap();
+  assert!(
+    recovered.read(&fresh, f, 0, &mut buf).is_err(),
+    "the recovered orphan is reclaimed when its reacquired handle closes, not leaked"
+  );
+}
+
 /// AC (§4.8): publication into the content object is an atomic double-buffered commit — an
 /// interrupted, torn or too-large publish preserves the last committed image and never presents a
 /// torn slot as a success. A fresh object holds nothing; a publish commits; a publish torn mid-write

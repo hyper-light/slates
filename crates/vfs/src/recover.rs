@@ -17,10 +17,12 @@
 //! What this slice captures and what it does not: it captures a scratch volume in full (the case
 //! §4.8 step two asks for — "create a scratch volume, write bytes, kill the daemon, restart, read
 //! the same bytes"). It refuses, rather than silently drops, a base-backed body or a whiteout (the
-//! base-plane recovery gate: "reopening a path alone cannot substitute another base"); CoW
-//! snapshots, referenced-but-unlinked orphans and the live pressure source of a dynamic quota are
-//! not yet in the image and are recorded as their own gates. The rebuild half (`from_image`) and
-//! the daemon/content-object wiring follow in their own slices.
+//! base-plane recovery gate: "reopening a path alone cannot substitute another base"). CoW
+//! snapshots, a dynamic quota's counters and referenced-but-unlinked orphans are all captured now:
+//! the inode walk covers the whole table, so an orphan's content is captured with every other
+//! inode's, and its orphan tracking travels in `orphans`, so a recovered orphan is reclaimed when
+//! its handle, reacquired through the anchor handoff, finally closes — not leaked. What remains for
+//! orphans is that handle handoff itself (restoring the open references), a separate §4.8 gate.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::mem::Discriminant;
@@ -283,6 +285,11 @@ pub struct VolumeImage {
   pub inodes: Vec<InodeImage>,
   /// Every copy-on-write snapshot, in id order.
   pub snapshots: Vec<SnapshotImage>,
+  /// Inode numbers that have left the namespace (`nlink == 0`) but are still held open — orphans
+  /// (POSIX unlink-while-open). Their inodes are captured with every other (the walk covers the whole
+  /// table), so their content already survives; this restores the *tracking* so a recovered orphan is
+  /// reclaimed when its handle, reacquired through the anchor handoff, finally closes — not leaked.
+  pub orphans: Vec<u64>,
 }
 
 /// One volume's image under the routing key its owner (the server) files it by — the volume id's
@@ -576,6 +583,7 @@ impl Volume {
       last_snapshot: self.last_snapshot.map(snap_ref),
       inodes,
       snapshots,
+      orphans: self.orphans.iter().map(|no| no.0).collect(),
     })
   }
 
@@ -875,12 +883,15 @@ impl Volume {
   /// entries are rebuilt, and file bytes are re-established through the volume's own write path, so
   /// the arena, the chunk store and the quota accounting end in the same state a live volume would
   /// hold. `clock` and `journal_bytes` are re-supplied, as they are on any construction; a dynamic
-  /// quota is refused for now (its live pressure source is not in the image).
+  /// quota is restored too (its source is the stateless [`BudgetGrowth`], so only its counters need
+  /// travel), and its granted growth is re-acquired from the rebuilt budget by the caller.
   ///
   /// The rebuild runs entirely at the image's head epoch, so nothing copies-on-write while it is
-  /// built; each inode's true birth epoch and version are restored at the end. It does not yet
-  /// rebuild CoW snapshots, clone lineage, referenced-but-unlinked orphans or a base plane — those
-  /// are their own gates — so it is exact for the scratch volume §4.8 step two asks for.
+  /// built; each inode's true birth epoch and version are restored at the end. CoW snapshots (with
+  /// their ids, deadlists and cross-snapshot sharing), clone lineage and referenced-but-unlinked
+  /// orphans (content and tracking) are all rebuilt; a base plane is refused rather than dropped (its
+  /// own gate). What an orphan still awaits is the anchor handle handoff that restores its open
+  /// references.
   pub fn from_image(
     store: &mut Store,
     image: &VolumeImage,
@@ -944,6 +955,9 @@ impl Volume {
     vol.bytes = head_bytes;
     vol.live_entries = head_entries;
     vol.last_snapshot = image.last_snapshot.map(to_snapshot_id);
+    // Restore the orphan tracking (§4.8): the inodes are already rebuilt with the rest, and marking
+    // them orphans again means a reacquired handle's last close reclaims them rather than leaking.
+    vol.orphans = image.orphans.iter().map(|no| InodeNo(*no)).collect();
     Ok(vol)
   }
 

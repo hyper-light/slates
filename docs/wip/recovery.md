@@ -235,11 +235,19 @@ volume.
   docs/bugs/2026-09-06-clone-recovery-root-number.md) and restoring the origin epoch. Owed: the O(1)
   *sharing* between a recovered clone and its origin (a §4.2 efficiency refinement, not content), and
   a process-level clone-across-restart test through the daemon.
-- **Other fidelity extensions.** Referenced-but-unlinked orphans (§4.6 lifetime across a restart —
-  though a restart drops the open handles that pinned them, so they are correctly not recovered);
-  base-backed volumes (a live base restored only through retained handles or validated source
-  identity — "reopening a path alone cannot substitute another base"); the live pressure source of a
-  dynamic quota (re-supplied on recovery like the clock).
+- **Referenced-but-unlinked orphans.** *(Content and tracking landed.)* The inode walk covers the
+  whole table, so an orphan's content is captured with every other inode's, and its orphan tracking
+  travels in the image's `orphans` list, so a recovered orphan is reclaimed when its handle finally
+  closes rather than leaked — not dropped from the image (`crates/vfs/tests/recover.rs`,
+  `an_unlinked_but_open_orphan_recovers_its_content`, non-vacuous: without restoring the orphan set
+  the recovered orphan leaks). What remains is the anchor **handle handoff** that restores the open
+  references a restart drops (§4.8: "live directory handles require an anchor handoff or validated
+  reacquisition"); until it exists, a recovered orphan is tracked and its bytes are held, ready for
+  the reacquired handle.
+- **Other fidelity extensions.** Base-backed volumes (a live base restored only through retained
+  handles or validated source identity — "reopening a path alone cannot substitute another base");
+  the live pressure source of a dynamic quota is re-supplied on recovery like the clock (its counters
+  and granted growth do travel, and the growth is re-acquired from the rebuilt budget).
 - **§4.2 reservation accounting.** BUG-2 (admit against usable arena capacity), BUG-1 (a strict
   volume locks its RAM or refuses) and **BUG-3 (dynamic growth consults the live shard budget, not
   machine RAM)** are landed. The budget now lives in the `Store`, so the write path reaches it without
