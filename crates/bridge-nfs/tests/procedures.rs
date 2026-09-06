@@ -232,3 +232,70 @@ fn the_post_mount_queries_answer_over_the_root() {
   PostOpAttr::decode(&mut r).unwrap();
   assert!(r.u64().unwrap() > 0, "the volume reports total space");
 }
+
+/// ACCESS reflects the object's permissions, not the request: a read-only file grants READ but
+/// refuses MODIFY (audit correction — it must not echo the requested bits).
+#[test]
+fn access_reflects_the_mode_not_the_request() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
+  let root_ino = bridge.root().unwrap();
+  bridge.create(root_ino, "ro", 0o444, 0).unwrap();
+  let mut export = Export::new(&mut bridge, VolumeId { bytes: [0x11; 16] });
+  let root_fh = match export.mnt("/") {
+    MountReply::Ok { handle, .. } => handle,
+    MountReply::Err(status) => panic!("MNT failed: {status:?}"),
+  };
+
+  let mut la = XdrWriter::new();
+  root_fh.encode(&mut la);
+  la.opaque("ro".as_bytes());
+  let lreply = export.lookup(&mut XdrReader::new(la.as_slice()));
+  let mut lr = XdrReader::new(&lreply);
+  assert_eq!(lr.u32().unwrap(), Nfsstat3::Ok.wire());
+  let file_fh = Nfsfh3::decode(&mut lr).unwrap();
+
+  // Request READ | MODIFY; a 0o444 file grants only READ.
+  let mut aa = XdrWriter::new();
+  file_fh.encode(&mut aa);
+  aa.u32(0x1 | 0x4);
+  let areply = export
+    .serve_nfs(NFSPROC3_ACCESS, &mut XdrReader::new(aa.as_slice()))
+    .unwrap();
+  let mut ar = XdrReader::new(&areply);
+  assert_eq!(ar.u32().unwrap(), Nfsstat3::Ok.wire());
+  PostOpAttr::decode(&mut ar).unwrap();
+  assert_eq!(
+    ar.u32().unwrap(),
+    0x1,
+    "a read-only file grants READ but not MODIFY"
+  );
+}
+
+/// A handle whose generation no longer matches the object's is refused stale — the encoded
+/// generation is validated, not discarded (audit correction).
+#[test]
+fn a_stale_generation_handle_is_refused() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
+  let root_ino = bridge.root().unwrap();
+  let mut export = Export::new(&mut bridge, VolumeId { bytes: [0x11; 16] });
+
+  // A handle to a live inode but carrying a generation the object does not have.
+  let stale = slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: root_ino,
+    generation: 1,
+  }
+  .to_fh();
+  let mut args = XdrWriter::new();
+  stale.encode(&mut args);
+  let reply = export.getattr(&mut XdrReader::new(args.as_slice()));
+  assert_eq!(
+    XdrReader::new(&reply).u32().unwrap(),
+    Nfsstat3::Stale.wire(),
+    "a handle whose generation no longer matches is stale"
+  );
+}

@@ -57,6 +57,24 @@ const FSF3_SYMLINK: u32 = 0x2;
 const FSF3_HOMOGENEOUS: u32 = 0x8;
 /// Format: FSF3_CANSETTIME, the server can set times through SETATTR.
 const FSF3_CANSETTIME: u32 = 0x10;
+/// Format: ACCESS3_READ, read file data or list a directory.
+const ACCESS3_READ: u32 = 0x1;
+/// Format: ACCESS3_LOOKUP, look a name up in a directory.
+const ACCESS3_LOOKUP: u32 = 0x2;
+/// Format: ACCESS3_MODIFY, change existing file data.
+const ACCESS3_MODIFY: u32 = 0x4;
+/// Format: ACCESS3_EXTEND, add to a file or directory.
+const ACCESS3_EXTEND: u32 = 0x8;
+/// Format: ACCESS3_DELETE, remove a directory entry.
+const ACCESS3_DELETE: u32 = 0x10;
+/// Format: ACCESS3_EXECUTE, execute a file or search a directory.
+const ACCESS3_EXECUTE: u32 = 0x20;
+/// Format: the owner read permission bit.
+const OWNER_READ: u32 = 0o400;
+/// Format: the owner write permission bit.
+const OWNER_WRITE: u32 = 0o200;
+/// Format: the owner execute permission bit.
+const OWNER_EXECUTE: u32 = 0o100;
 
 /// An NFSv3 export of one volume over the shared operation layer. Handles it mints and accepts name
 /// objects of `volume`; a handle for another volume is refused stale.
@@ -88,9 +106,10 @@ impl<'b> Export<'b> {
     .to_fh()
   }
 
-  /// The inode a file handle names, or a status refusal: a malformed handle is `Badhandle`, an
-  /// incompatible-version or foreign-volume handle is `Stale`.
-  fn inode_of(&self, fh: &Nfsfh3) -> Result<u64, Nfsstat3> {
+  /// The identity a file handle names — its inode *and* generation — or a status refusal: a
+  /// malformed handle is `Badhandle`, an incompatible-version or foreign-volume handle is `Stale`.
+  /// The generation is carried, never discarded, so a reused inode is caught by [`Export::attrs_of`].
+  fn resolve_handle(&self, fh: &Nfsfh3) -> Result<FileHandle, Nfsstat3> {
     let decoded = FileHandle::from_fh(fh).map_err(|e| match e {
       FileHandleError::Malformed => Nfsstat3::Badhandle,
       FileHandleError::UnknownVersion => Nfsstat3::Stale,
@@ -98,7 +117,22 @@ impl<'b> Export<'b> {
     if decoded.volume != self.volume {
       return Err(Nfsstat3::Stale);
     }
-    Ok(decoded.inode)
+    Ok(decoded)
+  }
+
+  /// The attributes of the object a resolved handle names, refusing a handle whose generation no
+  /// longer matches the object's — a stale handle to a reused inode is `Stale`, never answered from
+  /// whatever now holds the number. (Generation tracking in the volume core is owed, §4.6 `(no,
+  /// gen)`; until then every live generation is zero and the check is exact but trivial.)
+  fn attrs_of(&mut self, identity: &FileHandle) -> Result<NodeAttr, Nfsstat3> {
+    let node = self
+      .bridge
+      .getattr(identity.inode)
+      .map_err(|e| nfsstat_of(&e))?;
+    if node.generation != identity.generation {
+      return Err(Nfsstat3::Stale);
+    }
+    Ok(node)
   }
 
   /// The `fattr3` for a neutral attribute set of this export.
@@ -166,8 +200,8 @@ impl<'b> Export<'b> {
   /// The `fattr3` of the object a leading file handle in `args` names.
   fn object_attr(&mut self, args: &mut XdrReader<'_>) -> Result<Fattr3, Nfsstat3> {
     let handle = Nfsfh3::decode(args).map_err(|_| Nfsstat3::Badhandle)?;
-    let inode = self.inode_of(&handle)?;
-    let node = self.bridge.getattr(inode).map_err(|e| nfsstat_of(&e))?;
+    let identity = self.resolve_handle(&handle)?;
+    let node = self.attrs_of(&identity)?;
     Ok(self.fattr3(&node))
   }
 
@@ -199,14 +233,18 @@ impl<'b> Export<'b> {
     let name = args
       .string(NFS_MAXNAMELEN)
       .map_err(|_| (Nfsstat3::Inval, None))?;
-    let dir_inode = self
-      .inode_of(&dir_handle)
+    let dir_identity = self
+      .resolve_handle(&dir_handle)
       .map_err(|status| (status, None))?;
-    // The directory's post-operation attributes are best-effort context, present when readable.
-    let dir_attr = self.bridge.getattr(dir_inode).ok().map(|n| self.fattr3(&n));
+    // Validate the directory handle (existence and generation) before the lookup; its attributes
+    // are the reply's directory context.
+    let dir_node = self
+      .attrs_of(&dir_identity)
+      .map_err(|status| (status, None))?;
+    let dir_attr = Some(self.fattr3(&dir_node));
     let child = self
       .bridge
-      .lookup(dir_inode, name)
+      .lookup(dir_identity.inode, name)
       .map_err(|e| (nfsstat_of(&e), dir_attr))?;
     let handle = self.handle_for(child.ino, child.generation);
     let object = self.fattr3(&child);
@@ -236,9 +274,9 @@ impl<'b> Export<'b> {
   fn access_result(&mut self, args: &mut XdrReader<'_>) -> Result<(Fattr3, u32), Nfsstat3> {
     let handle = Nfsfh3::decode(args).map_err(|_| Nfsstat3::Badhandle)?;
     let requested = args.u32().map_err(|_| Nfsstat3::Inval)?;
-    let inode = self.inode_of(&handle)?;
-    let node = self.bridge.getattr(inode).map_err(|e| nfsstat_of(&e))?;
-    Ok((self.fattr3(&node), requested))
+    let identity = self.resolve_handle(&handle)?;
+    let node = self.attrs_of(&identity)?;
+    Ok((self.fattr3(&node), granted_access(node.mode, requested)))
   }
 
   /// NFSPROC3_FSSTAT: the volume's dynamic statistics — space and file counts — from the shared
@@ -268,9 +306,12 @@ impl<'b> Export<'b> {
 
   fn fsstat_result(&mut self, args: &mut XdrReader<'_>) -> Result<(Fattr3, FsStat), Nfsstat3> {
     let handle = Nfsfh3::decode(args).map_err(|_| Nfsstat3::Badhandle)?;
-    let inode = self.inode_of(&handle)?;
-    let node = self.bridge.getattr(inode).map_err(|e| nfsstat_of(&e))?;
-    let stat = self.bridge.statfs(inode).map_err(|e| nfsstat_of(&e))?;
+    let identity = self.resolve_handle(&handle)?;
+    let node = self.attrs_of(&identity)?;
+    let stat = self
+      .bridge
+      .statfs(identity.inode)
+      .map_err(|e| nfsstat_of(&e))?;
     Ok((self.fattr3(&node), stat))
   }
 
@@ -305,6 +346,25 @@ impl<'b> Export<'b> {
     }
     writer.into_bytes()
   }
+}
+
+/// The access bits granted for a `mode`, intersected with the `requested` bits. slates checks the
+/// object's permissions instead of granting whatever is asked (audit-flagged); the per-principal
+/// check — a caller other than the owner, the `AUTH_SYS` credentials, the §4.13 rights model — is
+/// owed, so this reads the owner's permission bits, the common case since a slates volume is the
+/// provisioning agent's own.
+fn granted_access(mode: u32, requested: u32) -> u32 {
+  let mut granted = 0;
+  if mode & OWNER_READ != 0 {
+    granted |= ACCESS3_READ;
+  }
+  if mode & OWNER_EXECUTE != 0 {
+    granted |= ACCESS3_LOOKUP | ACCESS3_EXECUTE;
+  }
+  if mode & OWNER_WRITE != 0 {
+    granted |= ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE;
+  }
+  granted & requested
 }
 
 /// The NFSv3 file type for a volume entry kind.
