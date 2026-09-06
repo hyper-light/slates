@@ -185,7 +185,13 @@ volume.
   the head's rebuilt inode for each shared number (the head is rebuilt first) and takes the kind
   from the head so the directory entries resolve; its deadlist (`tree_deadlist_excluding`) lists the
   snapshot's own objects minus the shared ones, so dropping it reclaims its private tree without
-  freeing the head's inodes. Directory nodes and diverged inodes stay private. Five gates hold
+  freeing the head's inodes. Directory nodes and diverged inodes stay private — one consequence,
+  measured by `Volume::retained_versions` and its test in `crates/vfs/tests/recover.rs`, is that a
+  recovered snapshotted volume can *retain more* inode versions than the live one did (the live
+  volume shares an unchanged directory's node with the head by CoW; the rebuild gives each snapshot
+  its own), so its version-slab footprint is an upper bound, never a loss; **directory** CoW-sharing
+  is the owed refinement that would close the gap, the parallel of the file/symlink sharing here.
+  Five gates hold
   together (`crates/vfs/tests/recover.rs`): the round-trip oracle (content faithful through the
   delta), the image is a delta not a second copy (the unchanged file is in `shared` and absent from
   the snapshot's `inodes`; the diverged file is captured in full), a drop frees the snapshot's own

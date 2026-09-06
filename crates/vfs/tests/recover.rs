@@ -553,6 +553,49 @@ fn a_dynamic_volume_recovers_with_its_quota_and_growth() {
   assert_eq!(n, 128 * 1024, "the grown content reads back after recovery");
 }
 
+/// AC (§4.2 retention): `retained_versions` counts the inode versions a volume's snapshots pin after
+/// the head diverges — the version-slab pressure snapshots add beyond the live inodes. Computed from
+/// the deadlists, it is zero for a fresh snapshot (which shares the head), rises by one for each file
+/// that diverges from the snapshot (an unchanged file pins none), and returns to zero when the
+/// snapshot is destroyed and its pinned versions are released. This is the accounting the §4.2
+/// retention charge (docs/wip/resource-vector.md §3) will bound; the count itself is verified here.
+#[test]
+fn retained_versions_counts_the_snapshot_pinned_inode_versions() {
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let a = vol.create_file_no(&mut src, root, "a", 0o644).unwrap();
+  let b = vol.create_file_no(&mut src, root, "b", 0o644).unwrap();
+  let c = vol.create_file_no(&mut src, root, "c", 0o644).unwrap();
+  vol.write(&mut src, a, 0, b"a1").unwrap();
+  vol.write(&mut src, b, 0, b"b1").unwrap();
+  vol.write(&mut src, c, 0, b"c1").unwrap();
+  let snap = vol.snapshot(&mut src).unwrap();
+  assert_eq!(
+    vol.retained_versions(),
+    0,
+    "a fresh snapshot pins nothing — it shares the head's inodes"
+  );
+  vol.write(&mut src, a, 0, b"a2").unwrap();
+  assert_eq!(
+    vol.retained_versions(),
+    1,
+    "diverging a pins its frozen version"
+  );
+  vol.write(&mut src, b, 0, b"b2").unwrap();
+  assert_eq!(
+    vol.retained_versions(),
+    2,
+    "diverging b pins another; c (unchanged) pins none"
+  );
+  vol.destroy_snapshot(&mut src, snap).unwrap();
+  assert_eq!(
+    vol.retained_versions(),
+    0,
+    "destroying the snapshot releases every version it pinned"
+  );
+}
+
 /// AC (§4.8): a referenced-but-unlinked orphan's content survives recovery — its acknowledged bytes
 /// are not lost. A file is opened (referenced), then unlinked while open (POSIX unlink-while-open):
 /// its name is gone but its inode stays allocated in the table, so the image (which captures every

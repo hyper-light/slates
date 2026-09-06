@@ -1873,6 +1873,26 @@ impl Volume {
     (self.live_entries, self.entry_allowance)
   }
 
+  /// The count of retained inode versions (§4.2 retention): inode versions the head has diverged
+  /// from that its snapshots still pin, held on their deadlists. This is the version-slab pressure a
+  /// volume's snapshots add beyond its live (logical) inodes. Computed from the deadlists — the
+  /// source of truth — so it cannot drift from a maintained counter.
+  pub fn retained_versions(&self) -> u64 {
+    let count: usize = self
+      .snapshots
+      .iter()
+      .map(|(_, snap)| {
+        snap
+          .deadlist
+          .items()
+          .iter()
+          .filter(|dead| matches!(dead, Dead::Inode(_, _)))
+          .count()
+      })
+      .sum();
+    u64::try_from(count).unwrap_or(u64::MAX)
+  }
+
   /// Sets the volume's namespace (entry) allowance (§4.2), refusing `NoSpace` if it is below the
   /// entries the volume already holds, so an allowance is never set below current use.
   pub fn set_entry_allowance(&mut self, allowance: u64) -> Result<(), VfsError> {
