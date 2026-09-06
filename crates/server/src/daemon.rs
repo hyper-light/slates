@@ -299,8 +299,10 @@ fn init_shard(
     );
   }
   if rebuilt != verbs::Rebuilt::default() {
+    // Say what recovery did, not more: identities were rebuilt (content is recreated empty until it
+    // is anchor-backed, BUG-11), and the content-less local snapshots and attachments were dropped.
     eprintln!(
-      "slates-server: shard {shard}: recovered {} volumes ({} skipped), reconciled {} local snapshots and {} attachments",
+      "slates-server: shard {shard}: rebuilt {} volume identities (content empty; {} skipped), dropped {} local snapshots and {} attachments",
       rebuilt.volumes, rebuilt.skipped, rebuilt.snapshots_dropped, rebuilt.attachments_dropped
     );
   }

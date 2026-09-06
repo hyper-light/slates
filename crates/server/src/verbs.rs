@@ -2014,6 +2014,15 @@ pub struct Rebuilt {
 /// process's memory held is reconciled in the log so the catalog stays true: snapshots
 /// placed nowhere but locally are destroyed and the head reset, attachments removed.
 /// Leases keep their terms (the wheel was rebuilt by recovery) and expire on their own.
+/// Rebuilds the shard's volumes from the recovered catalog after a restart. This restores each
+/// volume's **identity and policy** (name, size, name-equivalence) from the anchor-persisted
+/// records — *not* its content: a rebuilt volume's scratch bytes are recreated **empty** and its
+/// unplaced local snapshots are dropped ([`reconcile_lost`]), because volume content (the CoW
+/// dirtree, the arena, the inode table) is not yet anchor-backed. Restoring content across a
+/// restart is BUG-11 / GAP-A9-6 (§4.8, D-18): the owed re-architecture that persists content roots,
+/// bytes and witnesses in anchor-owned RAM with an atomic recovery boundary. The counts this
+/// returns name the loss honestly (`snapshots_dropped`, `attachments_dropped`), never dress it as
+/// content survival.
 pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   let records: Vec<VolumeRecord> = state
     .db
@@ -2044,6 +2053,11 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
 }
 
 /// One recovered volume's live tree, reservation and slot.
+/// Recreates one volume from its catalog record: a fresh, **empty** scratch volume with the
+/// record's identity, size policy and name-equivalence. It does not restore content — the bytes an
+/// agent had written before the restart are gone until content is anchor-backed (BUG-11 /
+/// GAP-A9-6). An overlay volume's base is still on disk, so its untouched base entries are served
+/// again; only the in-memory overlay (the diverged, copied-up state) is lost.
 fn rebuild_volume(state: &mut ShardState, record: &VolumeRecord) -> Result<(), String> {
   let size = wire_size(record.policy.size);
   let names = match record.policy.names {
@@ -2087,6 +2101,11 @@ fn rebuild_volume(state: &mut ShardState, record: &VolumeRecord) -> Result<(), S
 
 /// Reconciles what the old process's memory alone held: local-only snapshots (and the head
 /// they may have been) and attachments; each a recorded operation, so replay agrees.
+/// Drops the state a rebuilt volume cannot honor: its **local** (unplaced) snapshots and its
+/// attachments, whose in-memory content did not survive the restart. Returns the (snapshots,
+/// attachments) dropped, so the caller reports the loss rather than implying it was recovered. A
+/// placed snapshot (one durably held elsewhere) is not dropped here; only local, content-less
+/// snapshots are. This is the honest reconciliation until content is anchor-backed (BUG-11).
 fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usize) {
   let now = state.clock.monotonic_ns();
   let lost: Vec<DbSnapshotId> = state
