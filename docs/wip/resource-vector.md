@@ -98,9 +98,27 @@ remains"), and accepts again after an unlink frees one — proving the live coun
   bounded `Slab` that refuses `SlabFull` (BUG-4). Charging those handles against §4.2 admission (so
   they count toward the reservation below) is the owed refinement.
 - **In-flight**: bounded by the ring/credit admission (§4.7), not a per-volume vfs dimension.
-- **Retention** (snapshot-retained inodes and bytes): interacts with recovery — a recovered
-  snapshot's retained content is a separate charge from the head (§4.2 "a new retained snapshot may
-  require a separate retention charge"); it pairs with snapshot recovery (docs/wip/recovery.md).
+- **Retention** (snapshot-retained inode versions): the version slab (`store.max_inodes`) is shared,
+  and a volume's snapshots retain old inode versions as the head diverges (on the snapshots'
+  deadlists), which the per-volume inode allowance — a *logical* count via `next_no` — does not bound.
+  So one volume's snapshots can consume the shared slab and starve others (safe, since `SlabFull` is a
+  typed refusal, but unfair). The design as a per-volume cap, matching the inode/namespace caps:
+  - *Charge point (single, central):* `Volume::retire` (crates/vfs/src/volume.rs) is where a retired
+    inode version is either pushed to the newest snapshot's deadlist (retained) or freed immediately;
+    a `Dead::Inode` taking the deadlist branch increments a `retained_versions` counter.
+  - *Release points:* `destroy_snapshot` and `destroy` free deadlist items through `release_dead`;
+    a `Dead::Inode` freed there decrements the counter. Migration between deadlists (also in
+    `destroy_snapshot`) is net-zero. `retire`'s immediate-free branch is never counted.
+  - *Enforcement:* `make_current_inode`, before it copies an inode whose old version a snapshot pins
+    (`born <= last_snapshot_epoch`), refuses with `NoSpace` if `retained_versions` is at a derived
+    retention allowance — so a write that would over-retain is refused, as §4.2 asks ("a new retained
+    snapshot ... cannot use up a writer's promised future space").
+  - *Why it is not yet built:* the counter spans `retire`, `destroy_snapshot` and `destroy`, and the
+    model oracle (crates/vfs/tests/model.rs) does not track retention, so a decrement missed on one
+    path would not be caught by the oracle. The safe build adds the retention rule to the model first,
+    then the counter and the refusal, so drift is a test failure, not a silent leak or false refusal.
+    The full step is the *disjoint reservation*: charge retention (and reserve the logical allowance)
+    from a shared version budget over `max_inodes`, the exact parallel of the byte `ShardBudget`.
 
 So the applicable per-volume **caps** are in place (content=quota, inode, namespace); the remaining
 §4.2 work is the step from cap to **reservation** below, plus retention and the handle charge.
