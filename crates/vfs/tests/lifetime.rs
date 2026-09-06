@@ -150,3 +150,33 @@ fn a_reference_to_an_absent_inode_is_refused() {
     "cannot reference an inode that does not exist"
   );
 }
+
+/// Reclamation frees the inode's content bytes for reuse; while the inode is orphaned (unlinked
+/// but open) its bytes remain charged, since the content is still alive in RAM (Ada review point
+/// 6: reusable capacity after reclamation).
+#[test]
+fn reclamation_frees_capacity_for_reuse() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let file = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, file, 0, &[7u8; 4096]).unwrap();
+  let used_before = vol.accounting().referenced_bytes;
+  assert!(used_before >= 4096, "the write is accounted");
+
+  vol.reference(&store, file).unwrap();
+  vol.unlink_no(&mut store, root, "f").unwrap();
+  // While the inode is orphaned its content is alive, so its bytes are still charged.
+  assert_eq!(
+    vol.accounting().referenced_bytes,
+    used_before,
+    "an unlinked-but-open file still occupies its capacity"
+  );
+
+  // The last reference reclaims the content, freeing the capacity.
+  vol.unreference(&mut store, file).unwrap();
+  assert!(
+    vol.accounting().referenced_bytes < used_before,
+    "reclamation frees the capacity for reuse"
+  );
+}
