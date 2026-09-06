@@ -169,6 +169,14 @@ pub struct Volume {
   /// unlinked while open keeps serving until the last reference drops. Bounded by referenced
   /// inodes; empty for a volume no one holds open.
   pub(crate) references: BTreeMap<InodeNo, u32>,
+  /// Per-attachment attribution of [`Volume::references`]: for each attachment (an opaque owner id
+  /// the transport supplies), the references it holds per inode. The invariant is that the global
+  /// count above equals the sum of these per-attachment counts, so a teardown sweep of one
+  /// attachment ([`Volume::sweep_attachment`]) drops only its own share and never reclaims an inode
+  /// another attachment still holds (§3 of the inode-addressed-io design, "releasable per
+  /// attachment"). Bounded by (attachments × referenced inodes); empty for a volume no one holds
+  /// open.
+  pub(crate) attachment_refs: BTreeMap<u64, BTreeMap<InodeNo, u32>>,
   /// Inodes that have left the namespace (`nlink == 0`) while still referenced, awaiting
   /// reclamation at their last `unreference`. Bounded by open-unlinked files.
   pub(crate) orphans: BTreeSet<InodeNo>,
@@ -257,6 +265,7 @@ impl Volume {
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
+      attachment_refs: BTreeMap::new(),
       orphans: BTreeSet::new(),
     })
   }
@@ -309,6 +318,7 @@ impl Volume {
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
+      attachment_refs: BTreeMap::new(),
       orphans: BTreeSet::new(),
     })
   }
@@ -2133,6 +2143,96 @@ impl Volume {
       self.orphans.remove(&no);
     }
     Ok(())
+  }
+
+  /// Takes one reference on inode `no` attributed to `attachment` (an opaque owner id the transport
+  /// supplies): bumps the global count exactly like [`Volume::reference`] and records the same
+  /// reference in the attachment's per-owner ledger, so the invariant "global count == sum of
+  /// per-attachment counts" holds. A teardown sweep then releases exactly this owner's share
+  /// ([`Volume::sweep_attachment`]). Checked arithmetic; a validated inode; the ledger cannot grow
+  /// past (attachments × inode-table cap).
+  pub fn reference_for(
+    &mut self,
+    store: &Store,
+    no: InodeNo,
+    attachment: u64,
+  ) -> Result<(), VfsError> {
+    // The global reference validates the inode exists and checks its own arithmetic (refusing at
+    // the `u32` ceiling); take it first, so a refusal leaves the ledger untouched.
+    self.reference(store, no)?;
+    let owned = self
+      .attachment_refs
+      .entry(attachment)
+      .or_default()
+      .entry(no)
+      .or_insert(0);
+    // This attachment's count is at most the global count, which `reference` just refused to
+    // overflow, so the increment cannot overflow; saturate defensively rather than carry an
+    // unreachable error path (the invariant "global == sum of per-attachment" is preserved).
+    *owned = owned.saturating_add(1);
+    Ok(())
+  }
+
+  /// Drops up to `n` of `attachment`'s references to inode `no`: removes exactly the owner's share
+  /// (never more, so another attachment's references are untouched) from both the ledger and the
+  /// global count, running the deferred reclamation at the last global reference. The FUSE
+  /// `FORGET(inode, n)` routes here so the swept set stays accurate.
+  pub fn forget_for(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    attachment: u64,
+    n: u64,
+  ) -> Result<(), VfsError> {
+    // How many this attachment actually holds bounds how many it may forget, so it can never drop
+    // another owner's references from the shared global count.
+    let owned = self
+      .attachment_refs
+      .get(&attachment)
+      .and_then(|inodes| inodes.get(&no))
+      .copied()
+      .unwrap_or(0);
+    let drop = u32::try_from(n).unwrap_or(u32::MAX).min(owned);
+    if drop == 0 {
+      return Ok(());
+    }
+    self.debit_attachment(attachment, no, drop);
+    self.unreference_n(store, no, u64::from(drop))
+  }
+
+  /// Sweeps every reference `attachment` holds in one bounded batch at its teardown (an unmount or a
+  /// lost connection): releases exactly this owner's share of each inode it referenced, reclaiming
+  /// any that reach zero references and no links, and removes the owner's ledger. A whole
+  /// attachment's references are released here without a per-inode `FORGET`, which FUSE does not
+  /// guarantee at unmount (§3). The batch is bounded by the owner's referenced inodes; the
+  /// cooperative slicing of a very large sweep is owed (like the other bounded-work sites).
+  pub fn sweep_attachment(&mut self, store: &mut Store, attachment: u64) -> Result<(), VfsError> {
+    let Some(owned) = self.attachment_refs.remove(&attachment) else {
+      return Ok(());
+    };
+    for (no, count) in owned {
+      // Drop exactly this owner's count from the global; other owners' references keep the inode
+      // alive if they hold it. A reclamation failure is retained by the orphan record, as in
+      // `unreference_n`.
+      self.unreference_n(store, no, u64::from(count))?;
+    }
+    Ok(())
+  }
+
+  /// Debits `drop` from `attachment`'s ledger entry for inode `no`, removing the entry at zero and
+  /// the owner's map when it empties, so the ledger holds only live attributions.
+  fn debit_attachment(&mut self, attachment: u64, no: InodeNo, drop: u32) {
+    if let Some(inodes) = self.attachment_refs.get_mut(&attachment) {
+      if let Some(count) = inodes.get_mut(&no) {
+        *count = count.saturating_sub(drop);
+        if *count == 0 {
+          inodes.remove(&no);
+        }
+      }
+      if inodes.is_empty() {
+        self.attachment_refs.remove(&attachment);
+      }
+    }
   }
 
   pub(crate) fn release_dir_node(

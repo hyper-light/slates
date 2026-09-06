@@ -180,3 +180,92 @@ fn reclamation_frees_capacity_for_reuse() {
     "reclamation frees the capacity for reuse"
   );
 }
+
+/// A teardown sweep releases exactly the references one attachment holds and reclaims the inodes
+/// that reach zero references and no links — a whole attachment's references dropped in one batch,
+/// without a per-inode forget (FUSE does not guarantee one at unmount, §3).
+#[test]
+fn a_sweep_releases_an_attachments_references_and_reclaims() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, f, 0, b"data").unwrap();
+
+  // Attachment 7 references the file, then it is unlinked (deferred — the reference holds it).
+  vol.reference_for(&store, f, 7).unwrap();
+  vol.unlink_no(&mut store, root, "f").unwrap();
+  assert!(vol.stat(&store, f).is_ok(), "held open across unlink");
+
+  // Tearing down attachment 7 sweeps its reference; the unlinked inode is reclaimed.
+  vol.sweep_attachment(&mut store, 7).unwrap();
+  assert!(
+    vol.stat(&store, f).is_err(),
+    "reclaimed at the attachment teardown sweep"
+  );
+  // Sweeping an attachment that holds nothing is a no-op.
+  vol.sweep_attachment(&mut store, 7).unwrap();
+}
+
+/// The corruption guard: two attachments reference the same inode; sweeping one must NOT reclaim it
+/// while the other still holds it. Per-attachment accounting (global == sum of per-attachment
+/// counts) makes a sweep drop only its own share. A naive per-inode sweep would reclaim a live
+/// object another attachment is still serving — data loss for that holder.
+#[test]
+fn a_sweep_does_not_reclaim_an_inode_another_attachment_holds() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol
+    .create_file_no(&mut store, root, "shared", 0o644)
+    .unwrap();
+  vol.write(&mut store, f, 0, b"shared").unwrap();
+
+  // Two attachments (e.g. two mounts of the volume) both reference the same inode.
+  vol.reference_for(&store, f, 100).unwrap();
+  vol.reference_for(&store, f, 200).unwrap();
+  vol.unlink_no(&mut store, root, "shared").unwrap();
+
+  // Attachment 100 tears down: its share is released, but 200 still holds the inode alive.
+  vol.sweep_attachment(&mut store, 100).unwrap();
+  let mut buf = [0u8; 6];
+  let read = vol.read(&store, f, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..read],
+    b"shared",
+    "the inode survives one attachment's teardown — attachment 200 still holds it"
+  );
+
+  // Attachment 200 tears down: now no reference remains, so it is reclaimed.
+  vol.sweep_attachment(&mut store, 200).unwrap();
+  assert!(
+    vol.read(&store, f, 0, &mut buf).is_err(),
+    "reclaimed at the last attachment's teardown"
+  );
+}
+
+/// `forget_for` drops only the forgetting attachment's share: a FORGET from one attachment (even one
+/// asking to drop more than it holds) leaves another attachment's references — and the object —
+/// intact, until that attachment forgets too.
+#[test]
+fn a_forget_drops_only_the_owners_share() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+
+  vol.reference_for(&store, f, 1).unwrap();
+  vol.reference_for(&store, f, 2).unwrap();
+  vol.unlink_no(&mut store, root, "f").unwrap();
+
+  // Attachment 1 forgets more than it holds — capped at its own one reference; 2's remains.
+  vol.forget_for(&mut store, f, 1, 99).unwrap();
+  assert!(vol.stat(&store, f).is_ok(), "attachment 2 still holds it");
+
+  // Attachment 2 forgets its reference — now reclaimed.
+  vol.forget_for(&mut store, f, 2, 1).unwrap();
+  assert!(
+    vol.stat(&store, f).is_err(),
+    "reclaimed once both attachments forgot"
+  );
+}
