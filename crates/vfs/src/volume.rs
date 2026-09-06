@@ -8,6 +8,8 @@
 //! journal record. A refusal leaves nothing changed (T-1.1, T-1.9). The executable model in the
 //! tests is the specification this file must equal on every generated history.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use slates_machine::{Derived, derived};
 use slates_mem::arena::ChunkArena;
 use slates_mem::{Handle, Slab};
@@ -162,6 +164,14 @@ pub struct Volume {
   pub(crate) journal: OpLog,
   pub(crate) state: VolumeState,
   pub(crate) destroy_queue: Vec<Dead>,
+  /// Open and lookup references per inode number (§4.6 lifetime; the inode-addressed-io design):
+  /// an inode's content and table entry survive `unlink` while any reference is held, so a file
+  /// unlinked while open keeps serving until the last reference drops. Bounded by referenced
+  /// inodes; empty for a volume no one holds open.
+  pub(crate) references: BTreeMap<InodeNo, u32>,
+  /// Inodes that have left the namespace (`nlink == 0`) while still referenced, awaiting
+  /// reclamation at their last `unreference`. Bounded by open-unlinked files.
+  pub(crate) orphans: BTreeSet<InodeNo>,
 }
 
 impl std::fmt::Debug for Volume {
@@ -246,6 +256,8 @@ impl Volume {
       journal: OpLog::new(config.journal_bytes),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
+      references: BTreeMap::new(),
+      orphans: BTreeSet::new(),
     })
   }
 
@@ -296,6 +308,8 @@ impl Volume {
       journal: OpLog::new(config.journal_bytes),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
+      references: BTreeMap::new(),
+      orphans: BTreeSet::new(),
     })
   }
 
@@ -2017,6 +2031,21 @@ impl Volume {
     if nlink > 0 {
       return Ok(());
     }
+    // At zero links the inode has left the namespace. If a transport still holds it open (a
+    // reference), keep its content and table entry alive as an orphan and reclaim at the last
+    // `unreference` (POSIX unlink-while-open); otherwise reclaim now.
+    if self.references.get(&no).is_some_and(|count| *count > 0) {
+      self.orphans.insert(no);
+      Ok(())
+    } else {
+      self.reclaim_inode(store, no)
+    }
+  }
+
+  /// Reclaims an inode that has no links and no references: its content leaves the head's
+  /// accounting, its number is freed and its version retired.
+  fn reclaim_inode(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+    let handle = self.make_current_inode(store, no)?;
     let born = store.inodes.get(handle)?.born;
     self.release_body(store, handle)?;
     self.table_remove(store, no)?;
@@ -2024,6 +2053,33 @@ impl Volume {
     // The base plane's descriptor, if one was held, is closed by the owner of the host at its
     // next `process_hints`; the tables forget the inode now.
     let _ = self.base_forget(no);
+    Ok(())
+  }
+
+  /// Takes a reference on inode `no` — an open handle, or a transport lookup the kernel holds
+  /// until it forgets the inode. The inode's content survives a later `unlink` until every
+  /// reference is dropped (POSIX unlink-while-open; §4.6, the inode-addressed-io design).
+  pub fn reference(&mut self, no: InodeNo) {
+    *self.references.entry(no).or_insert(0) += 1;
+  }
+
+  /// Drops a reference on inode `no`. If it was the last reference and the inode has already left
+  /// the namespace (an orphan), its content is reclaimed now, at this terminal step.
+  pub fn unreference(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+    let remaining = match self.references.get_mut(&no) {
+      Some(count) => {
+        *count = count.saturating_sub(1);
+        let remaining = *count;
+        if remaining == 0 {
+          self.references.remove(&no);
+        }
+        remaining
+      }
+      None => 0,
+    };
+    if remaining == 0 && self.orphans.remove(&no) {
+      self.reclaim_inode(store, no)?;
+    }
     Ok(())
   }
 

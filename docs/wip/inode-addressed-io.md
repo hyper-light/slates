@@ -180,10 +180,14 @@ export a counter a test asserts moved.
 
 ## 9. Implementation plan (piecewise, each gated)
 
-1. **Volume core reference count and deferred reclamation.** Add `references` to the inode; split
-   `drop_link` into *unlink* (namespace removal + orphan-set insert when referenced) and *reclaim*
-   (the deferred body release on last reference). `reference`/`unreference` verbs. Tests 1, 2, 5
-   in RAM. Failing test first (open→unlink→read loses content today).
+1. **Volume core reference count and deferred reclamation.** *(Landed 2026-09-05.)* A per-volume
+   `references: BTreeMap<InodeNo, u32>` and `orphans: BTreeSet<InodeNo>`; `Volume::reference` /
+   `Volume::unreference`; `drop_link` splits into *defer-when-referenced* (orphan-set insert, keep
+   addressable) and `reclaim_inode` (the deferred body release, run at the last `unreference`).
+   Gated `crates/vfs/tests/lifetime.rs` (3 tests): open→unlink→read survives then reclaims;
+   rename-over an open file preserves it; several references reclaim only at the last. Failing test
+   first proved the gap. Owed within this step: the orphan set's survival across a daemon restart
+   (§4.8 recovery).
 2. **Per-inode generation.** Track and bump the generation on inode-number reuse; `getattr`
    reports the real generation. Test 3.
 3. **The `OpContext` and the neutral `Bridge` signature.** Introduce `ObjectId`/`OpContext`;
