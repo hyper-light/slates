@@ -73,6 +73,16 @@ fn core_snapshot(id: SnapshotId) -> slates_vfs::ids::SnapshotId {
   }
 }
 
+/// Releases a clone's pin on its origin snapshot (§4.5): the shard owns both volumes, so when a
+/// clone's destroy completes — or a partial clone is abandoned before it is published — the origin
+/// snapshot's clone count is decremented so the origin can reclaim that snapshot. Best-effort: the
+/// origin may already be gone, or the snapshot never pinned.
+fn unpin_origin(state: &mut ShardState, origin: Handle<VolumeSlot>, snapshot: SnapshotId) {
+  if let Ok(slot) = state.volumes.get_mut(origin) {
+    let _ = slot.volume.unpin(core_snapshot(snapshot));
+  }
+}
+
 /// A fresh volume id: the shard in the high bytes (the creator host's place in Phase 8), the
 /// clock and a counter below, so ids never repeat on this host.
 fn fresh_volume_id(state: &mut ShardState) -> DbVolumeId {
@@ -170,6 +180,7 @@ pub fn owner_of_attachment(id: u64) -> u16 {
 fn volume_of(body: &RequestBody) -> Option<VolumeId> {
   match body {
     RequestBody::Snapshot { volume }
+    | RequestBody::DestroySnapshot { volume, .. }
     | RequestBody::Clone { volume, .. }
     | RequestBody::Attach { volume, .. }
     | RequestBody::Resize { volume, .. }
@@ -778,6 +789,7 @@ fn mutates_shard_image(body: &RequestBody) -> bool {
       | RequestBody::Resize { .. }
       | RequestBody::Destroy { .. }
       | RequestBody::Snapshot { .. }
+      | RequestBody::DestroySnapshot { .. }
   )
 }
 
@@ -820,6 +832,9 @@ fn dispatch_inner(
       base.as_deref(),
     ),
     RequestBody::Snapshot { volume } => snapshot(state, principal, volume),
+    RequestBody::DestroySnapshot { volume, snapshot } => {
+      destroy_snapshot_verb(state, principal, volume, snapshot)
+    }
     RequestBody::Clone {
       volume,
       snapshot,
@@ -1299,6 +1314,44 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
   ReplyBody::Snapshotted { id }
 }
 
+fn destroy_snapshot_verb(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  snapshot: SnapshotId,
+) -> ReplyBody {
+  let (handle, record) = match find(state, volume) {
+    Ok(x) => x,
+    Err(r) => return *r,
+  };
+  if !rights_of(&record, principal).write {
+    return forbidden("destroy_snapshot");
+  }
+  // Remove it from the volume core first: this refuses `Pinned` if a clone still references it and
+  // returns the snapshot's retained inode versions to the shard's version budget (§4.2). Only then
+  // record the removal, so a refused destroy leaves the catalog untouched.
+  match state.volumes.get_mut(handle) {
+    Ok(slot) => {
+      if let Err(e) = slot
+        .volume
+        .destroy_snapshot(&mut state.store, core_snapshot(snapshot))
+      {
+        return refused(refusal_of_vfs(&e));
+      }
+    }
+    Err(_) => return refused(Refusal::NotFound),
+  }
+  let now = state.clock.monotonic_ns();
+  let op = Op::SnapshotDestroyed {
+    volume: record.id,
+    id: to_db_snapshot(snapshot),
+  };
+  if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
+    return refused(refusal_of_db(&e));
+  }
+  ReplyBody::SnapshotDestroyed
+}
+
 fn clone(
   state: &mut ShardState,
   principal: &Principal,
@@ -1415,14 +1468,17 @@ fn clone(
   ];
   for op in &ops {
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
+      unpin_origin(state, handle, snapshot);
       let _ = volume_core.discard_partial(&mut state.store);
       return give_back(state, reservation, version_credit, refusal_of_db(&e));
     }
   }
   // As in create: ensure the registry has room before moving the clone into a slot, discarding it
   // (which frees only what the clone made — nothing, since it shares its origin's versions) otherwise.
+  // A partial clone also releases the pin `clone_of` put on the origin snapshot.
   if !state.volumes.has_room() {
     let full = state.volumes.max_slots();
+    unpin_origin(state, handle, snapshot);
     let _ = volume_core.discard_partial(&mut state.store);
     return give_back(
       state,
@@ -1774,10 +1830,29 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       Err(_) => true,
     };
     if done {
+      // If this volume is a clone, capture its pin on the origin snapshot before the record goes, so
+      // the pin can be released once its destroy completes (§4.5): the origin can then reclaim that
+      // snapshot. Best-effort — the origin may be gone or on another shard.
+      let origin_pin = state
+        .db
+        .partition()
+        .lineage(id)
+        .map(|e| (e.origin_volume, e.origin_snapshot));
       let now = state.clock.monotonic_ns();
       let _ = state
         .db
         .mutate(&mut state.segment, &Op::VolumeDestroyed { id }, now);
+      if let Some((origin_volume, origin_snapshot)) = origin_pin
+        && let Some(origin_handle) = state.by_id.get(&origin_volume).copied()
+      {
+        unpin_origin(
+          state,
+          origin_handle,
+          SnapshotId {
+            value: origin_snapshot.value,
+          },
+        );
+      }
       if let Ok(slot) = state.volumes.remove(handle) {
         if let Some(r) = slot.reservation {
           state.store.budget.release(r);

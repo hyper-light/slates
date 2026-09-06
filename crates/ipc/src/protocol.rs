@@ -108,6 +108,14 @@ pub enum RequestBody {
     /// The volume.
     volume: VolumeId,
   },
+  /// Destroy a snapshot: its retained inode versions return to the shard's version budget; refused
+  /// if a clone still pins it.
+  DestroySnapshot {
+    /// The volume.
+    volume: VolumeId,
+    /// The snapshot.
+    snapshot: SnapshotId,
+  },
   /// Clone a snapshot into a new volume.
   Clone {
     /// The volume.
@@ -527,6 +535,8 @@ pub enum ReplyBody {
     /// The id.
     id: SnapshotId,
   },
+  /// A snapshot was destroyed.
+  SnapshotDestroyed,
   /// Cloned.
   Cloned {
     /// The clone's id.

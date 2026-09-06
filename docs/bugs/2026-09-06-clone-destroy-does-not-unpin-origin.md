@@ -1,6 +1,8 @@
 # Clone destroy does not release its origin snapshot's clone pin
 
-Status: **reported, not yet fixed** (found while wiring the partial-volume discard). Date: 2026-09-06.
+Status: **fixed** — the server now releases the origin's pin when a clone's destroy completes (and
+when a partial clone is abandoned). Wired together with the `DestroySnapshot` verb that makes it
+observable. Date: 2026-09-06.
 
 ## Description
 
@@ -26,10 +28,12 @@ its own, and it is bounded by the number of clones ever made from that snapshot.
 independent of the create-failure discard work; the partial-clone-failure path leaves the same residue
 as a normal clone destroy, so the discard work does not make it worse.
 
-## Fix (proposed)
+## Fix (applied)
 
-In the destroy verb, when the volume being destroyed has a lineage edge, call
-`origin.unpin(origin_snapshot)` on the origin's slot once the clone's destroy completes (guarding for
-an already-destroyed origin). Drive it from a test: clone a snapshot, destroy the clone, then the
-origin can `destroy_snapshot` that snapshot (it refuses `Pinned` without the fix). The same call closes
-the partial-clone-failure residue.
+`unpin_origin` (crates/server/src/verbs.rs) looks up the clone's lineage edge and calls
+`Volume::unpin(origin_snapshot)` on the origin's slot when the clone's destroy completes in
+`step_destroys`, and on the partial-clone-abandon paths in `clone`. A `DestroySnapshot` wire verb was
+added (the catalog already had `Op::SnapshotDestroyed`) so the effect is observable: gated in
+`crates/server/tests/daemon.rs`, a snapshot a clone was made from is refused destruction while the
+clone lives and can be destroyed once the clone's destroy completes. Non-vacuous — neutering
+`unpin_origin` leaves the snapshot pinned and the final destroy refused.

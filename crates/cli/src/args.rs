@@ -18,6 +18,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   volume list
   volume stat ID
   volume snapshot ID
+  volume destroy-snapshot ID SNAPSHOT
   volume clone ID SNAPSHOT NAME
   volume resize ID (--bounded SIZE | --dynamic MAX)
   volume destroy ID
@@ -130,6 +131,13 @@ pub(crate) enum Verb {
   Snapshot {
     /// The volume.
     volume: slates_client::VolumeId,
+  },
+  /// Destroy a snapshot.
+  DestroySnapshot {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The snapshot.
+    snapshot: slates_client::SnapshotId,
   },
   /// Await a durability scope (`volume placed`).
   Placed {
@@ -673,6 +681,17 @@ fn parse_volume(taken: &Taken, words: &[&str]) -> Result<Command, ParseError> {
         },
       ))
     }
+    ["destroy-snapshot", id, snap] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        taken,
+        Verb::DestroySnapshot {
+          volume: volume(id)?,
+          snapshot: snapshot(snap)?,
+        },
+      ))
+    }
+    ["destroy-snapshot", ..] => Err(ParseError::Missing("ID SNAPSHOT")),
     ["clone", id, snap, name] => {
       taken.only(&NONE)?;
       Ok(client(

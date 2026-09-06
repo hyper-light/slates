@@ -663,3 +663,76 @@ fn version_stats_scenario() {
 fn the_daemon_status_reports_the_shards_version_slab_reservation() {
   version_stats_scenario();
 }
+
+/// Destroying a snapshot over the wire, and the clone pin around it (§4.5/§4.2): a snapshot a clone
+/// was made from cannot be destroyed while the clone lives, and can once the clone's destroy
+/// completes — proof the server releases the origin's pin (`unpin`) when a clone is torn down.
+fn snapshot_destroy_scenario() {
+  let (daemon, instance) = daemon("snap-destroy");
+  let mut client = Client::connect(&instance);
+  let create = |n: &str| RequestBody::Create {
+    name: n.to_owned(),
+    size: SizeClass::Bounded { limit: 1 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  };
+  let ReplyBody::Created { id } = client.call(&create("origin")) else {
+    panic!("create");
+  };
+  let ReplyBody::Snapshotted { id: snap } = client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("snapshot");
+  };
+  let ReplyBody::Cloned { id: clone } = client.call(&RequestBody::Clone {
+    volume: id,
+    snapshot: snap,
+    name: "clone".into(),
+  }) else {
+    panic!("clone");
+  };
+  // The clone pins the snapshot it was made from: destroying that snapshot is refused.
+  assert!(
+    matches!(
+      client.call(&RequestBody::DestroySnapshot {
+        volume: id,
+        snapshot: snap
+      }),
+      ReplyBody::Refused { .. }
+    ),
+    "a live clone pins the snapshot"
+  );
+  // Destroy the clone and wait for its destroy to complete; that releases the pin.
+  assert!(matches!(
+    client.call(&RequestBody::Destroy { volume: clone }),
+    ReplyBody::Destroyed
+  ));
+  let started = Instant::now();
+  loop {
+    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+      panic!("list");
+    };
+    if volumes.iter().all(|v| v.name != "clone") {
+      break;
+    }
+    assert!(started.elapsed() < CREDIT_WAIT, "clone destroy completes");
+  }
+  // With the pin released, the snapshot can now be destroyed.
+  assert!(
+    matches!(
+      client.call(&RequestBody::DestroySnapshot {
+        volume: id,
+        snapshot: snap
+      }),
+      ReplyBody::SnapshotDestroyed
+    ),
+    "the pin released by the clone's destroy, the snapshot is destroyed"
+  );
+  daemon.stop();
+}
+
+/// §4.5/§4.2: the destroy-snapshot verb and the clone pin (unpin on clone teardown).
+#[test]
+fn a_snapshot_is_destroyed_over_the_wire_and_a_clone_pins_it_until_torn_down() {
+  snapshot_destroy_scenario();
+}

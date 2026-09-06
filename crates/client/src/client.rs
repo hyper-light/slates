@@ -378,6 +378,20 @@ impl Client {
     }
   }
 
+  /// Destroys a snapshot, returning its retained versions to the shard; refused while a clone pins it.
+  pub fn destroy_snapshot(
+    &mut self,
+    volume: VolumeId,
+    snapshot: SnapshotId,
+  ) -> Result<(), ClientError> {
+    match self.call(&RequestBody::DestroySnapshot { volume, snapshot })? {
+      ReplyBody::SnapshotDestroyed => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "destroy_snapshot",
+      }),
+    }
+  }
+
   /// Clones a snapshot into a new volume; the clone's id.
   pub fn clone_snapshot(
     &mut self,

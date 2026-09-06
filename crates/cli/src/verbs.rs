@@ -71,6 +71,10 @@ fn serve(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
     Verb::Snapshot { volume } => {
       println!("snapshot: {}", client.snapshot(*volume)?.value);
     }
+    Verb::DestroySnapshot { volume, snapshot } => {
+      client.destroy_snapshot(*volume, *snapshot)?;
+      println!("snapshot destroyed");
+    }
     Verb::Placed {
       volume,
       snapshot,
