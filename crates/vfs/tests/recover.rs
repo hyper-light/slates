@@ -15,7 +15,7 @@ use slates_vfs::VfsError;
 use slates_vfs::clock::StepClock;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::names::NameEquivalence;
-use slates_vfs::quota::Quota;
+use slates_vfs::quota::{BudgetGrowth, Quota};
 use slates_vfs::recover::{
   BodyImage, InodeImage, KeyedImage, KindImage, PolicyImage, ShardImage, SharedSource, VolumeImage,
 };
@@ -501,6 +501,55 @@ fn an_interrupted_shard_publish_preserves_the_last_committed_shard() {
     Some(&one),
     "a torn shard publish preserves the last committed shard image at the production seam"
   );
+}
+
+/// AC (§4.8): a dynamic volume recovers — its `Dynamic` quota (max, granted, denied) and the growth
+/// it took are restored, not refused. The growth source is the stateless `BudgetGrowth`, so only the
+/// counters travel in the image; the volume round-trips and holds the same granted growth, and its
+/// grown content reads back. (Before dynamic growth was admitted through the budget, a dynamic quota
+/// could not be serialized and recovery refused it with `RecoveryIncomplete`.)
+#[test]
+fn a_dynamic_volume_recovers_with_its_quota_and_growth() {
+  let mut src = store();
+  let mut vol = Volume::create(
+    &mut src,
+    VolumeConfig {
+      prefix: 7,
+      names: NameEquivalence::Fold,
+      quota: Quota::Dynamic {
+        max: 1 << 40,
+        source: Box::new(BudgetGrowth),
+        granted: 0,
+        denied: 0,
+      },
+      journal_bytes: 1 << 20,
+      clock: Box::new(StepClock::new(0, 1)),
+    },
+  )
+  .unwrap();
+  let root = vol.root_inode(&src).unwrap();
+  let f = vol.create_file_no(&mut src, root, "f", 0o644).unwrap();
+  vol.write(&mut src, f, 0, &vec![7u8; 128 * 1024]).unwrap(); // grows the dynamic quota from the budget
+  let grown = vol.budget_hold();
+  assert!(grown > 0, "the dynamic volume took growth from the budget");
+
+  let image = vol.to_image(&src).unwrap();
+  let mut fresh = store();
+  let recovered =
+    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  assert_eq!(
+    recovered.to_image(&fresh).unwrap(),
+    image,
+    "the dynamic volume round-trips: max, granted and denied are preserved"
+  );
+  assert_eq!(
+    recovered.budget_hold(),
+    grown,
+    "the granted growth is restored, not lost"
+  );
+  let mut buf = vec![0u8; 128 * 1024];
+  let n = recovered.read(&fresh, f, 0, &mut buf).unwrap();
+  assert_eq!(n, 128 * 1024, "the grown content reads back after recovery");
 }
 
 /// AC (§4.8): publication into the content object is an atomic double-buffered commit — an
