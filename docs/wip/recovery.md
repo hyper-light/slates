@@ -157,16 +157,24 @@ volume.
   still resolves, and metadata (referenced_bytes, seq, links, head pointer) is restored. The daemon
   publishes after `Snapshot` and keeps recovered snapshots in `reconcile_lost`, so a snapshot
   **survives a real daemon restart** (the client restart test asserts survival, not reconciliation).
-  A recovered snapshot **shares** each file or symlink it holds unchanged (an identical image) with
-  the head's inode rather than rebuilding a private copy (§4.2 efficiency), and its deadlist
-  (`tree_deadlist_excluding`) lists its own objects minus those shared — so dropping it reclaims its
-  private tree without freeing the head's shared inodes. Three gates hold together: the round-trip
-  oracle (content faithful), a drop frees the snapshot's own inodes, a drop leaves the head's shared
-  content readable (the double-free guard), and — non-vacuously — a recovered snapshot with an
-  unchanged file holds five inodes, not the six an independent rebuild would (sharing actually
-  occurs). Directory nodes and changed inodes stay private; capture-side dedup (a compact image for
-  a heavily-snapshotted volume) is the remaining efficiency step, bounded meanwhile by the image
-  overflow being a typed refusal.
+  CoW sharing spans **both halves**, capture and rebuild. **Capture** writes a *delta*: a file or
+  symlink whose handle is the head's very handle (CoW-shared, i.e. nothing rewrote it after the
+  snapshot froze) contributes only its number to the snapshot's `shared` list and is omitted from
+  its `inodes`, so its bytes live once in the whole image — the difference between an image that
+  fits its content-object slice and a `RecoveryIncomplete` for a heavily-snapshotted volume. A file
+  that diverged is captured in full. **Rebuild** reads that delta: it points the snapshot's table at
+  the head's rebuilt inode for each shared number (the head is rebuilt first) and takes the kind
+  from the head so the directory entries resolve; its deadlist (`tree_deadlist_excluding`) lists the
+  snapshot's own objects minus the shared ones, so dropping it reclaims its private tree without
+  freeing the head's inodes. Directory nodes and diverged inodes stay private. Five gates hold
+  together (`crates/vfs/tests/recover.rs`): the round-trip oracle (content faithful through the
+  delta), the image is a delta not a second copy (the unchanged file is in `shared` and absent from
+  the snapshot's `inodes`; the diverged file is captured in full), a drop frees the snapshot's own
+  inodes, a drop leaves the head's shared content readable (the double-free guard), and — non-vacuously,
+  verified by disabling sharing at capture — a recovered snapshot with an unchanged file holds five
+  inodes not six and both delta assertions fail without it. The remaining efficiency step is
+  *cross-snapshot* dedup (a file unchanged across a chain is still captured once per snapshot that
+  first froze a distinct version); it is bounded meanwhile by image overflow being a typed refusal.
 - **Clone recovery.** *(Content landed.)* A clone's image captures its whole tree (the bytes it
   inherited from the origin snapshot and the bytes it wrote after diverging), and `from_image`
   rebuilds it faithfully, keeping the inherited root inode number (fixed in

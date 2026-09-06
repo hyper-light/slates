@@ -214,8 +214,15 @@ pub struct SnapshotImage {
   pub previous: Option<SnapshotRef>,
   /// The next snapshot, if any.
   pub next: Option<SnapshotRef>,
-  /// Every inode reachable at the snapshot, in number order.
+  /// The inodes private to the snapshot — its directories, and the files or symlinks that diverged
+  /// from the head — in number order. Files and symlinks it shares unchanged with the head are *not*
+  /// here; their numbers are in `shared` and their bytes live once, in the head's image.
   pub inodes: Vec<InodeImage>,
+  /// Numbers of files or symlinks the snapshot shares unchanged with the head (CoW handle identity
+  /// at capture time). The rebuild points the snapshot's table at the head's rebuilt inode for each,
+  /// so a heavily-snapshotted volume's image holds each unchanged file once, not once per snapshot —
+  /// the difference between an image that fits its content-object slice and a `RecoveryIncomplete`.
+  pub shared: Vec<u64>,
 }
 
 /// A whole volume's recoverable state (§4.8, A-9). The inodes are in number order (the order the
@@ -488,6 +495,35 @@ impl Volume {
   }
 
   /// Captures every copy-on-write snapshot, in id order, with the tree frozen at each (§4.8).
+  /// Capture a snapshot's tree as a delta against the head: a file or symlink whose handle *is* the
+  /// head's very handle (CoW-shared, established when nothing rewrote it after the snapshot froze)
+  /// contributes only its number to `shared`; everything else — the snapshot's directories and the
+  /// files or symlinks that diverged — is captured in full. `self.inode_root` is the head.
+  fn capture_snapshot_tree(
+    &self,
+    store: &Store,
+    snap_inode_root: Handle<TrieNode>,
+    id: SnapshotId,
+  ) -> Result<(Vec<InodeImage>, Vec<u64>), VfsError> {
+    let mut handles = Vec::new();
+    trie::walk(&store.tries, snap_inode_root, &mut handles);
+    let mut inodes = Vec::with_capacity(handles.len());
+    let mut shared = Vec::new();
+    for handle in handles {
+      let inode = store.inodes.get(handle)?;
+      let no = inode.no;
+      if matches!(inode.kind, Kind::File | Kind::Symlink)
+        && trie::get(&store.tries, self.inode_root, no) == Some(handle)
+      {
+        shared.push(no.0);
+        continue;
+      }
+      inodes.push(self.image_of_inode(store, inode, Some(id))?);
+    }
+    shared.sort_unstable();
+    Ok((inodes, shared))
+  }
+
   fn capture_snapshots(&self, store: &Store) -> Result<Vec<SnapshotImage>, VfsError> {
     let mut out = Vec::with_capacity(self.snapshots.iter().count());
     for (handle, snap) in self.snapshots.iter() {
@@ -495,7 +531,7 @@ impl Volume {
         index: handle.index(),
         generation: handle.generation(),
       };
-      let inodes = self.capture_tree(store, snap.inode_root, Some(id))?;
+      let (inodes, shared) = self.capture_snapshot_tree(store, snap.inode_root, id)?;
       out.push(SnapshotImage {
         id: snap_ref(id),
         epoch: snap.epoch.0,
@@ -505,6 +541,7 @@ impl Volume {
         previous: snap.previous.map(snap_ref),
         next: snap.next.map(snap_ref),
         inodes,
+        shared,
       });
     }
     out.sort_by_key(|s| (s.id.index, s.id.generation));
@@ -758,8 +795,8 @@ impl Volume {
     dirs.insert(root_no.0, self.root);
     self.place_inodes(store, inodes, root_no, epoch, &mut dirs)?;
     self.rebuild_entries(store, inodes, &kinds, &dirs)?;
-    self.fill_content(store, inodes, &BTreeSet::new())?;
-    self.restore_identities(store, inodes, &BTreeSet::new())?;
+    self.fill_content(store, inodes)?;
+    self.restore_identities(store, inodes)?;
     Ok(())
   }
 
@@ -832,22 +869,24 @@ impl Volume {
     head_inode_root: Handle<TrieNode>,
     head_images: &BTreeMap<u64, &InodeImage>,
   ) -> Result<BTreeSet<u64>, VfsError> {
-    let kinds: BTreeMap<u64, KindImage> = snap.inodes.iter().map(|i| (i.no, i.kind)).collect();
+    // `snap.shared` names the files and symlinks the snapshot shares unchanged with the head; their
+    // bytes were captured once, in the head's image. Point the snapshot's table at the head's rebuilt
+    // inode for each — the head is rebuilt before any snapshot — and take its kind from the head so
+    // the directory entries that reference it resolve.
+    let shared: BTreeSet<u64> = snap.shared.iter().copied().collect();
+    let mut kinds: BTreeMap<u64, KindImage> = snap.inodes.iter().map(|i| (i.no, i.kind)).collect();
+    for no in &snap.shared {
+      let head_image = head_images.get(no).ok_or(VfsError::RecoveryIncomplete)?;
+      kinds.insert(*no, head_image.kind);
+      let head_handle = trie::get(&store.tries, head_inode_root, InodeNo(*no))
+        .ok_or(VfsError::RecoveryIncomplete)?;
+      self.table_set(store, InodeNo(*no), head_handle)?;
+    }
     let mut dirs: BTreeMap<u64, Handle<DirNode>> = BTreeMap::new();
     dirs.insert(root_no.0, self.root);
-    let mut shared: BTreeSet<u64> = BTreeSet::new();
     for image_inode in &snap.inodes {
       let no = InodeNo(image_inode.no);
       if no == root_no {
-        continue;
-      }
-      // A file or symlink identical to the head's version shares the head's inode handle.
-      if matches!(image_inode.kind, KindImage::File | KindImage::Symlink)
-        && head_images.get(&image_inode.no) == Some(&image_inode)
-        && let Some(head_handle) = trie::get(&store.tries, head_inode_root, no)
-      {
-        self.table_set(store, no, head_handle)?;
-        shared.insert(image_inode.no);
         continue;
       }
       let body = body_for(store, image_inode, no, epoch, &mut dirs)?;
@@ -856,8 +895,8 @@ impl Volume {
       self.table_set(store, no, handle)?;
     }
     self.rebuild_entries(store, &snap.inodes, &kinds, &dirs)?;
-    self.fill_content(store, &snap.inodes, &shared)?;
-    self.restore_identities(store, &snap.inodes, &shared)?;
+    self.fill_content(store, &snap.inodes)?;
+    self.restore_identities(store, &snap.inodes)?;
     Ok(shared)
   }
 
@@ -914,16 +953,8 @@ impl Volume {
   /// quota accounting end where a live write would leave them.
   /// Fills each non-empty file's content through the write path, skipping inodes in `shared` (a
   /// snapshot's files shared with the head already hold the head's content).
-  fn fill_content(
-    &mut self,
-    store: &mut Store,
-    inodes: &[InodeImage],
-    shared: &BTreeSet<u64>,
-  ) -> Result<(), VfsError> {
+  fn fill_content(&mut self, store: &mut Store, inodes: &[InodeImage]) -> Result<(), VfsError> {
     for image_inode in inodes {
-      if shared.contains(&image_inode.no) {
-        continue;
-      }
       if let BodyImage::File { bytes } = &image_inode.body
         && !bytes.is_empty()
       {
@@ -942,12 +973,8 @@ impl Volume {
     &mut self,
     store: &mut Store,
     inodes: &[InodeImage],
-    shared: &BTreeSet<u64>,
   ) -> Result<(), VfsError> {
     for image_inode in inodes {
-      if shared.contains(&image_inode.no) {
-        continue;
-      }
       let no = InodeNo(image_inode.no);
       let handle =
         trie::get(&store.tries, self.inode_root, no).ok_or(VfsError::RecoveryIncomplete)?;

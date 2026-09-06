@@ -682,6 +682,42 @@ fn a_recovered_snapshot_shares_unchanged_inodes_with_the_head() {
   );
 }
 
+/// AC (§4.2/§4.8): the captured image is a delta, not a full second copy. A file a snapshot shares
+/// unchanged with the head is named in the snapshot's `shared` list and omitted from its `inodes`,
+/// so the bytes live once in the image; a file that diverged is captured in full. This is what keeps
+/// a heavily-snapshotted volume's image inside its content-object slice rather than K copies of it.
+#[test]
+fn a_snapshot_image_holds_a_delta_not_a_second_copy_of_the_head() {
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let unchanged = vol.create_file_no(&mut src, root, "a", 0o644).unwrap();
+  vol.write(&mut src, unchanged, 0, b"stable").unwrap();
+  let diverged = vol.create_file_no(&mut src, root, "b", 0o644).unwrap();
+  vol.write(&mut src, diverged, 0, b"v1").unwrap();
+  let _snap = vol.snapshot(&mut src).unwrap();
+  vol.write(&mut src, diverged, 0, b"v2-longer").unwrap(); // b diverges; a stays shared
+
+  let image = vol.to_image(&src).unwrap();
+  let snap = &image.snapshots[0];
+  assert!(
+    snap.shared.contains(&unchanged.0),
+    "the unchanged file is recorded as shared with the head"
+  );
+  assert!(
+    snap.inodes.iter().all(|i| i.no != unchanged.0),
+    "the unchanged file's bytes are not copied into the snapshot image"
+  );
+  assert!(
+    !snap.shared.contains(&diverged.0),
+    "the diverged file is not shared"
+  );
+  assert!(
+    snap.inodes.iter().any(|i| i.no == diverged.0),
+    "the diverged file is captured in full in the snapshot image"
+  );
+}
+
 /// AC (§4.8): an image round-trips through its content bytes unchanged — the exact state a
 /// restarted daemon would read back equals what the running one published.
 #[test]
