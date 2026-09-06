@@ -60,6 +60,7 @@ fn store() -> Store {
       dir_cutover: 16,
     },
     arena,
+    0,
   )
 }
 

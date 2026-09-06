@@ -50,6 +50,7 @@ pub(crate) fn store() -> Store {
       dir_cutover: 4,
     },
     arena,
+    0,
   )
 }
 

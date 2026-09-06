@@ -81,6 +81,7 @@ fn store() -> Result<Store, Box<dyn std::error::Error>> {
       dir_cutover: 2,
     },
     arena,
+    0,
   ))
 }
 
