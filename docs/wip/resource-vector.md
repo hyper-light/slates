@@ -33,11 +33,12 @@
 > **retention** dimension, now bounded — so at most one transient version coexists per copy-up. The
 > headroom is therefore the structural constant one, not a write-rate measurement. Proven through the
 > real create and destroy verbs, no mount, in `crates/server/tests/daemon.rs` (a second volume refused
-> while physical slots plainly remain; non-vacuous — without the reservation both are created). What
-> remains for the inode dimension: charging *retention* into the same `VersionBudget` (so retained
-> versions and logical allowances share the slab disjointly), and re-deriving the allowance on resize
-> (which today changes the byte quota but not the inode allowance — a pre-existing gap). Mounted POSIX
-> and guest conformance are separately pending host environments.
+> while physical slots plainly remain; non-vacuous — without the reservation both are created). Resize
+> now moves the inode allowance with the policy too: it re-derives the allowance and grows or shrinks
+> the version reservation the same grow-first/shrink-after way as the byte reserve (a resize-down
+> returns slots that back another volume). What remains for the inode dimension: charging *retention*
+> into the same `VersionBudget` (so retained versions and logical allowances share the slab disjointly).
+> Mounted POSIX and guest conformance are separately pending host environments.
 
 ## 1. The requirement
 
@@ -222,8 +223,11 @@ non-vacuous two ways: neutered to `reserve(0)`, the reservation test creates the
 fails; and run against the pre-reorder ordering (reservation after `Volume::create`), the leak probes
 turn into `SlabFull` by the fourth attempt as leaked partial volumes fill the trie slab. `statfs` reporting backed
 inode availability at the *shard* level (the reserve's remaining credits, beside the per-volume
-`allowance − live` it already reports) is a second surface, owed with a status-wire field. What
-remains for the inode dimension: charging *retention* into the same `VersionBudget` so retained
-versions and logical allowances share the slab disjointly, and re-deriving the allowance (and adjusting
-its reservation) on resize. BUG-3 (dynamic growth consuming only unpromised capacity) stays **fixed**
-for the byte dimension.
+`allowance − live` it already reports) is a second surface, owed with a status-wire field. Resize
+re-derives the allowance and grows/shrinks its version reservation (grow-first, shrink-after, with a
+resize-up refused whole before anything changes if the slab cannot back it; gated in
+`crates/server/tests/daemon.rs`, non-vacuous — the pre-resize code leaves the resized volume's old
+reservation standing and the second volume refused). What remains for the inode dimension: charging
+*retention* into the same `VersionBudget` so retained versions and logical allowances share the slab
+disjointly. BUG-3 (dynamic growth consuming only unpromised capacity) stays **fixed** for the byte
+dimension.

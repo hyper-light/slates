@@ -1529,6 +1529,44 @@ fn detach(state: &mut ShardState, principal: &Principal, attachment: u64) -> Rep
   ReplyBody::Detached
 }
 
+/// Grows a volume's version reservation for a resize by `new − old` slots, whole or not at all (a
+/// resize-up the version slab cannot back is refused before anything else changes). Returns the
+/// growth credit — held so a later resize step can roll it back — or the refusal reply. A resize
+/// that does not grow the allowance returns `Ok(None)`; the shrink is applied later by
+/// [`settle_version_reservation`], after the core accepts the new limit.
+fn grow_version_reservation(
+  versions: &mut slates_mem::budget::VersionBudget,
+  old: u64,
+  new: u64,
+) -> Result<Option<slates_mem::budget::VersionCredit>, Refusal> {
+  if new <= old {
+    return Ok(None);
+  }
+  match versions.reserve(new - old) {
+    Ok(c) => Ok(Some(c)),
+    Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
+      Err(Refusal::BudgetExceeded { available })
+    }
+    Err(e) => Err(Refusal::BadRequest {
+      reason: e.to_string(),
+    }),
+  }
+}
+
+/// Settles a volume's version reservation to `new` slots once a resize is accepted: the growth was
+/// already taken by [`grow_version_reservation`], so only a shrink acts here, returning `old − new`
+/// slots to the slab. Returns the credit the volume's slot now holds.
+fn settle_version_reservation(
+  versions: &mut slates_mem::budget::VersionBudget,
+  old: u64,
+  new: u64,
+) -> slates_mem::budget::VersionCredit {
+  if new < old {
+    versions.release(slates_mem::budget::VersionCredit { slots: old - new });
+  }
+  slates_mem::budget::VersionCredit { slots: new }
+}
+
 fn resize(
   state: &mut ShardState,
   principal: &Principal,
@@ -1545,20 +1583,40 @@ fn resize(
   let limit = match size {
     SizeClass::Bounded { limit } | SizeClass::Dynamic { max: limit } => limit,
   };
+  // The inode allowance moves with the policy too (§4.2: allowances are derived from the requested
+  // policy, and the policy — the quota — is what resize changes). Re-derive it and grow its version
+  // reservation *first*, so a resize-up the version slab cannot back is refused whole before anything
+  // changes. Derived before the slot is borrowed (it reads the store's version budget). Never below
+  // the volume's live count, so a resize-down cannot strand inodes the volume already holds.
+  let derived_inode_allowance = inode_allowance(state, size);
   let Ok(slot) = state.volumes.get_mut(handle) else {
     return refused(Refusal::NotFound);
   };
-  // A bounded volume's reservation moves with the limit: grow first (refused whole if the
-  // reserve cannot cover it), shrink after the core accepted the new limit.
+  let new_allowance = derived_inode_allowance.max(slot.volume.inode_usage().0);
+  let old_version = slot.version_credit.map_or(0, |c| c.slots);
+  let version_grown =
+    match grow_version_reservation(&mut state.store.versions, old_version, new_allowance) {
+      Ok(v) => v,
+      Err(refusal) => return refused(refusal),
+    };
+  // A bounded volume's byte reservation moves with the limit: grow first (refused whole if the
+  // reserve cannot cover it), shrink after the core accepted the new limit. A failure here rolls
+  // back the version growth taken above, so a refused resize changes neither budget.
   let old = slot.reservation;
   let grow = old.map_or(0, |r| limit.saturating_sub(r.bytes));
   let grown = if grow > 0 {
     match state.store.budget.reserve(grow) {
       Ok(r) => Some(r),
       Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
+        if let Some(v) = version_grown {
+          state.store.versions.release(v);
+        }
         return refused(Refusal::BudgetExceeded { available });
       }
       Err(e) => {
+        if let Some(v) = version_grown {
+          state.store.versions.release(v);
+        }
         return refused(Refusal::BadRequest {
           reason: e.to_string(),
         });
@@ -1571,8 +1629,20 @@ fn resize(
     if let Some(g) = grown {
       state.store.budget.release(g);
     }
+    if let Some(v) = version_grown {
+      state.store.versions.release(v);
+    }
     return refused(refusal_of_vfs(&e));
   }
+  // The core accepted the new limit: apply the new inode cap and settle the version reservation to
+  // the new allowance (the growth is already taken above; a shrink returns the difference now), then
+  // settle the byte reservation the same way.
+  let _ = slot.volume.set_inode_allowance(new_allowance);
+  slot.version_credit = Some(settle_version_reservation(
+    &mut state.store.versions,
+    old_version,
+    new_allowance,
+  ));
   if let Some(old) = old {
     let combined = old.bytes.saturating_add(grown.map_or(0, |g| g.bytes));
     state

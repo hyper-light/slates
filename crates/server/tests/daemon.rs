@@ -561,3 +561,56 @@ fn version_reservation_scenario() {
 fn the_inode_allowance_is_reserved_against_the_version_slab_and_released_on_teardown() {
   version_reservation_scenario();
 }
+
+/// The inode reservation moves with the policy on resize (§4.2): a volume whose allowance fills the
+/// version slab, resized down, returns slots so another volume is admitted — proof the reservation
+/// tracks the resized allowance, not the create-time one. Non-vacuous: without the re-derivation the
+/// resized volume keeps its old (larger) reservation and the second volume stays refused.
+fn version_reservation_moves_on_resize_scenario() {
+  let (daemon, instance) = capped_daemon("resize-versions", SMALL_VERSION_SLAB);
+  let mut client = Client::connect(&instance);
+  let sized = |name: &str, limit: u64| RequestBody::Create {
+    name: name.to_owned(),
+    size: SizeClass::Bounded { limit },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  };
+  // A big-quota volume's allowance fills the version slab.
+  let ReplyBody::Created { id: filler } = client.call(&sized("filler", 1 << 20)) else {
+    panic!("filler create");
+  };
+  // A second volume, however small, cannot be backed while the filler holds the whole slab.
+  assert!(
+    matches!(
+      client.call(&sized("tenant", 1)),
+      ReplyBody::Refused {
+        refusal: Refusal::BudgetExceeded { .. }
+      }
+    ),
+    "the version slab is full while the filler holds its whole allowance"
+  );
+  // Resize the filler down to a tiny quota: its inode allowance shrinks and returns slots.
+  assert!(
+    matches!(
+      client.call(&RequestBody::Resize {
+        volume: filler,
+        size: SizeClass::Bounded { limit: 1 }
+      }),
+      ReplyBody::Resized
+    ),
+    "resize-down accepted"
+  );
+  // The returned slots back the small volume now — proof the reservation moved with the resize.
+  assert!(
+    matches!(client.call(&sized("tenant", 1)), ReplyBody::Created { .. }),
+    "the slots freed by the resize-down back a new volume"
+  );
+  daemon.stop();
+}
+
+/// AC-2: §4.2 inode reservation tracks a resized allowance — a resize-down returns version slots.
+#[test]
+fn the_inode_reservation_moves_with_the_allowance_on_resize() {
+  version_reservation_moves_on_resize_scenario();
+}
