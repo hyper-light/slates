@@ -251,13 +251,15 @@ attachment-teardown sweep each export a counter a test asserts moved.
    rendezvous-established principal (the server↔bridge seam, with the real Linux mount); wiring
    `open`/`release`/`lookup`/`forget` to per-attachment reference ownership with the teardown
    sweep; §8.5 (cleanup), §8.6 (lifecycle).
-4. **The NFS read/write/setattr/namespace procedures over the new interface.** *(READ and WRITE
-   landed 2026-09-05.)* Stateless: handle → `ObjectId`, the export identity → `OpContext`. `READ`
-   returns the bytes with the count and eof; `WRITE` lands `FILE_SYNC` in the anchor and returns
-   `wcc_data` + the volume-derived write verifier, its data length capped at the offered transfer
-   size; a write through a read-only export is refused by the seam (`NFS3ERR_PERM`). *Owed:*
-   `SETATTR`, `CREATE`/`MKDIR`/`REMOVE`/`RENAME`/`SYMLINK`/`READDIR(PLUS)`, and the request-lifetime
-   pins for the async driver.
+4. **The NFS read/write/setattr/namespace procedures over the new interface.** *(READ, WRITE,
+   REMOVE, RMDIR and RENAME landed 2026-09-05.)* Stateless: handle → `ObjectId`, the export
+   identity → `OpContext`. `READ` returns the bytes with the count and eof; `WRITE` lands
+   `FILE_SYNC` in the anchor and returns `wcc_data` + the volume-derived write verifier, its data
+   length capped at the offered transfer size; a write through a read-only export is refused by the
+   seam (`NFS3ERR_PERM`). `REMOVE`/`RMDIR`/`RENAME` decode `diropargs3` to a parent `ObjectId`, call
+   `unlink`/`rmdir`/`rename` through the seam, and reply the directories' `wcc_data`. *Owed:*
+   `SETATTR` and the entry-creating procedures (`CREATE`/`MKDIR`/`SYMLINK`), which need the `sattr3`
+   set-attribute union; `READDIR(PLUS)`; and the request-lifetime pins for the async driver.
 5. **Access enforcement through `subject`** once §4.13 threads the enrolled consumer; `AUTH_SYS`
    remains an advisory mapping, not authentication.
 
