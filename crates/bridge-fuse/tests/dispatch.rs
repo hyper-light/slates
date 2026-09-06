@@ -404,3 +404,23 @@ fn readdir_init_forget_and_unserved_dispatch() {
   let n = dispatch(&message(4096, 1, 1, &[]), &mut m, &mut out);
   assert_eq!(reply_error(&out, n), -ENOSYS);
 }
+
+/// FSYNC and FSYNCDIR are dispatched (they were answered ENOSYS before — audit BUG-7): the data is
+/// already in the anchor, so each is a success no-op with an empty reply, not an unimplemented op.
+#[test]
+fn fsync_and_fsyncdir_are_served_as_success() {
+  let mut m = mock();
+  let mut out = [0u8; 256];
+  // fuse_fsync_in: fh (8), fsync_flags (4). The file is inode 2.
+  let mut body = [0u8; 12];
+  body[0..8].copy_from_slice(&7u64.to_le_bytes());
+  for opcode in [Opcode::FSync, Opcode::FSyncDir] {
+    let n = dispatch(&message(opcode.to_wire(), 1, 2, &body), &mut m, &mut out);
+    assert_eq!(
+      u32::from_le_bytes(out[4..8].try_into().unwrap()),
+      0,
+      "{opcode:?} succeeds (not ENOSYS)"
+    );
+    assert_eq!(n, OUT_HEADER_LEN, "an empty success reply");
+  }
+}

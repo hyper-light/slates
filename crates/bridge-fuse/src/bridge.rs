@@ -94,7 +94,10 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     Opcode::ReadDir => serve_readdir(bridge, &request, cx, out),
     Opcode::Create => serve_create(bridge, &request, cx, out),
     Opcode::Release | Opcode::ReleaseDir => serve_release(bridge, &request, cx, out),
-    Opcode::Flush => serve_flush(bridge, &request, cx, out),
+    // FSYNC/FSYNCDIR are flush-equivalent for slates: the data is already in the anchor segment,
+    // which is the source of truth (R1), so there is nothing to force to a lower tier — a success
+    // no-op, the same as FLUSH. They carry `fh` first, exactly as FLUSH does (audit BUG-7).
+    Opcode::Flush | Opcode::FSync | Opcode::FSyncDir => serve_flush(bridge, &request, cx, out),
     Opcode::Forget => serve_forget(bridge, &request, cx),
     Opcode::MkDir => serve_mkdir(bridge, &request, cx, out),
     Opcode::Unlink => serve_unlink(bridge, &request, cx, false, out),
