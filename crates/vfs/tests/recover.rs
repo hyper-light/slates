@@ -655,6 +655,33 @@ fn dropping_a_recovered_snapshot_leaves_the_head_readable() {
   );
 }
 
+/// AC (§4.2/§4.8): a recovered snapshot shares an unchanged file's inode with the head rather than
+/// rebuilding a private copy, so the store holds it once. Head = root, a, b (3 inodes); the snapshot
+/// adds its own root and its own older `b` (2), and shares `a` with the head — so five inodes, not
+/// six. With sharing disabled this would be six, which makes the test non-vacuous.
+#[test]
+fn a_recovered_snapshot_shares_unchanged_inodes_with_the_head() {
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let a = vol.create_file_no(&mut src, root, "a", 0o644).unwrap();
+  vol.write(&mut src, a, 0, b"stable").unwrap();
+  let b = vol.create_file_no(&mut src, root, "b", 0o644).unwrap();
+  vol.write(&mut src, b, 0, b"v1").unwrap();
+  let _snap = vol.snapshot(&mut src).unwrap();
+  vol.write(&mut src, b, 0, b"v2-longer").unwrap(); // b differs; a is unchanged
+
+  let image = vol.to_image(&src).unwrap();
+  let mut fresh = store();
+  let _recovered =
+    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  assert_eq!(
+    fresh.inodes.len(),
+    5,
+    "the snapshot shares the unchanged file's inode with the head (six without sharing)"
+  );
+}
+
 /// AC (§4.8): an image round-trips through its content bytes unchanged — the exact state a
 /// restarted daemon would read back equals what the running one published.
 #[test]

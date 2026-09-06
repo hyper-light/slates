@@ -2945,10 +2945,11 @@ pub(crate) fn clip_extents(
 /// the deadlist, so a recovered snapshot needs one or it leaks its tree on drop. Chunks are freed
 /// with their inode versions (as [`Volume::destroy`]'s own walk relies on), so only nodes and inode
 /// versions are listed.
-pub(crate) fn tree_deadlist(
+pub(crate) fn tree_deadlist_excluding(
   store: &Store,
   dir_root: Handle<DirNode>,
   inode_root: Handle<TrieNode>,
+  shared: &std::collections::BTreeSet<u64>,
 ) -> Deadlist {
   let mut list = Deadlist::default();
   let mut dirs = Vec::new();
@@ -2966,6 +2967,11 @@ pub(crate) fn tree_deadlist(
   trie::walk_since(&store.tries, inode_root, None, &mut inodes);
   for handle in inodes {
     if let Ok(inode) = store.inodes.get(handle) {
+      // An inode shared with the head (a snapshot's unchanged file) is the head's to free, not this
+      // snapshot's — excluding it is what keeps a snapshot drop from corrupting the head (§4.8).
+      if shared.contains(&inode.no.0) {
+        continue;
+      }
       list.push(Dead::Inode(handle, inode.born));
     }
   }
