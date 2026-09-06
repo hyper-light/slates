@@ -754,12 +754,13 @@ fn a_snapshot_image_holds_a_delta_not_a_second_copy_of_the_head() {
 }
 
 /// AC (§4.2/§4.8): a version frozen identically in two snapshots but diverged from the head — edit a
-/// file after a run of snapshots — is captured once, not once per snapshot. The later snapshot names
-/// the earlier as its source; the image omits the second copy; recovery rebuilds an independent copy
-/// so both snapshots serve the version through their own ids, and dropping one leaves the other
-/// readable (the copies are independent — no cross-snapshot double-free).
+/// file after a run of snapshots — is captured once, not once per snapshot, and recovered as one
+/// shared inode, not one per snapshot (the live volume shares it by CoW, so a faithful recovery must
+/// too). The later snapshot names the earlier as its source; the image omits the second copy; both
+/// snapshots serve the version through their own ids; the store holds it once; and dropping the older
+/// leaves the newer readable, because the shared inode sits on the newest snapshot's deadlist.
 #[test]
-fn a_version_shared_across_snapshots_is_captured_once_and_recovers_independently() {
+fn a_version_shared_across_snapshots_is_captured_once_and_recovers_shared() {
   let mut src = store();
   let mut vol = volume(&mut src, 1 << 30);
   let root = vol.root_inode(&src).unwrap();
@@ -803,6 +804,12 @@ fn a_version_shared_across_snapshots_is_captured_once_and_recovers_independently
     image,
     "the deduplicated image round-trips: the rebuilt store re-captures to the same image"
   );
+  assert_eq!(
+    fresh.inodes.len(),
+    5,
+    "the shared version is one inode across both snapshots (head root, head f, root a, shared f, \
+     root b); an independent copy per snapshot would be six"
+  );
   let mut buf = vec![0u8; 16];
   let n = recovered.read_in(&fresh, snap_a, f, 0, &mut buf).unwrap();
   assert_eq!(
@@ -817,7 +824,8 @@ fn a_version_shared_across_snapshots_is_captured_once_and_recovers_independently
     "snapshot b serves the same version"
   );
 
-  // The copies are independent: dropping a leaves b readable, then dropping b is clean.
+  // The shared inode is on the newest snapshot's deadlist, so dropping the older snapshot does not
+  // free it; the newer still reads it. Then dropping the newer is clean.
   recovered.destroy_snapshot(&mut fresh, snap_a).unwrap();
   let n = recovered.read_in(&fresh, snap_b, f, 0, &mut buf).unwrap();
   assert_eq!(
@@ -826,6 +834,83 @@ fn a_version_shared_across_snapshots_is_captured_once_and_recovers_independently
     "dropping snapshot a does not free snapshot b's copy of the shared version"
   );
   recovered.destroy_snapshot(&mut fresh, snap_b).unwrap();
+}
+
+/// AC (§4.8): a version shared across a chain of snapshots recovers as one inode and survives being
+/// dropped newest-first with an intervening allocation that reuses freed slots — the adversarial case
+/// for the global newest-referencer-first deadlist reconstruction. If the shared inode were on more
+/// than one snapshot's deadlist, dropping the newest would free it early (or, worse, a later drop
+/// would free a slot a fresh file has since reused). The reconstruction puts it on exactly the newest
+/// snapshot, and `destroy_snapshot` migrates it toward the oldest, so it is freed once, when its last
+/// referencer goes, and never leaks.
+#[test]
+fn a_shared_version_survives_newest_first_drops_with_slot_reuse() {
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let f = vol.create_file_no(&mut src, root, "f", 0o644).unwrap();
+  vol.write(&mut src, f, 0, b"frozen").unwrap();
+  let s1 = vol.snapshot(&mut src).unwrap();
+  let s2 = vol.snapshot(&mut src).unwrap();
+  let s3 = vol.snapshot(&mut src).unwrap(); // f unchanged across all three
+  vol.write(&mut src, f, 0, b"head-edit").unwrap(); // f diverges; all three share the frozen version
+
+  let image = vol.to_image(&src).unwrap();
+  let mut fresh = store();
+  let mut rec =
+    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  assert_eq!(
+    fresh.inodes.len(),
+    6,
+    "one shared version, not one per snapshot: head root, head f, three snapshot roots, one shared f"
+  );
+
+  let mut buf = vec![0u8; 16];
+  let reads = |rec: &Volume, fresh: &_, snap, buf: &mut [u8]| {
+    let n = rec.read_in(fresh, snap, f, 0, buf).unwrap();
+    buf[..n].to_vec()
+  };
+
+  // Drop the newest, then allocate a fresh file that reuses the just-freed slots. If the shared
+  // inode had been freed by this drop (or double-listed), the new file would land on its slot and
+  // the later drops would corrupt it.
+  rec.destroy_snapshot(&mut fresh, s3).unwrap();
+  let g = rec.create_file_no(&mut fresh, root, "g", 0o644).unwrap();
+  rec.write(&mut fresh, g, 0, b"g-bytes").unwrap();
+  assert_eq!(
+    reads(&rec, &fresh, s1, &mut buf),
+    b"frozen",
+    "s1 after s3 drop"
+  );
+  assert_eq!(
+    reads(&rec, &fresh, s2, &mut buf),
+    b"frozen",
+    "s2 after s3 drop"
+  );
+
+  rec.destroy_snapshot(&mut fresh, s2).unwrap();
+  assert_eq!(
+    reads(&rec, &fresh, s1, &mut buf),
+    b"frozen",
+    "s1 after s2 drop"
+  );
+
+  rec.destroy_snapshot(&mut fresh, s1).unwrap();
+  // The head and the reused-slot file are intact — no drop freed a slot they hold.
+  let n = rec.read(&fresh, f, 0, &mut buf).unwrap();
+  assert_eq!(&buf[..n], b"head-edit", "the head's version is untouched");
+  let n = rec.read(&fresh, g, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..n],
+    b"g-bytes",
+    "the file that reused a freed slot is untouched"
+  );
+  // No leak: with every snapshot gone, only the head's reachable inodes remain (root, f, g).
+  assert_eq!(
+    fresh.inodes.len(),
+    3,
+    "the shared version was freed exactly once, when its last referencer was destroyed"
+  );
 }
 
 /// AC (§4.8): an image round-trips through its content bytes unchanged — the exact state a

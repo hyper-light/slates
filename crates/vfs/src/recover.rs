@@ -22,7 +22,8 @@
 //! not yet in the image and are recorded as their own gates. The rebuild half (`from_image`) and
 //! the daemon/content-object wiring follow in their own slices.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::mem::Discriminant;
 
 use slates_mem::Handle;
 use slates_wire::Wire;
@@ -35,7 +36,7 @@ use crate::ids::{Epoch, InodeNo, SnapshotId};
 use crate::inode::{Attrs, Body, Home, Inode, Kind};
 use crate::names::NameEquivalence;
 use crate::quota::Quota;
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Dead, Deadlist, Snapshot};
 use crate::trie::{self, TrieNode};
 use crate::volume::{Store, Volume, VolumeSeed};
 
@@ -828,29 +829,30 @@ impl Volume {
     // unchanged with the head instead of rebuilding a private copy (§4.2 CoW-sharing efficiency).
     let head_inode_root = vol.inode_root;
     let head_images: BTreeMap<u64, &InodeImage> = image.inodes.iter().map(|i| (i.no, i)).collect();
-    let head = HeadRefs {
-      inode_root: head_inode_root,
-      images: &head_images,
-    };
-
     // Each snapshot's own full inodes, keyed by (its id, number), so a later snapshot that
-    // deduplicated a byte-identical version against it can rebuild an independent copy from the
-    // canonical entry (§4.2 cross-snapshot dedup). Keyed by the id pair since `SnapshotRef` is not
-    // ordered.
+    // deduplicated a byte-identical version against it can share that snapshot's rebuilt inode
+    // (§4.2 cross-snapshot dedup). Keyed by the id pair since `SnapshotRef` is not ordered.
     let mut canonical_inode: BTreeMap<((u32, u32), u64), &InodeImage> = BTreeMap::new();
     for snap in &image.snapshots {
       for inode in &snap.inodes {
         canonical_inode.insert(((snap.id.index, snap.id.generation), inode.no), inode);
       }
     }
+    let refs = SharingRefs {
+      head_inode_root,
+      head_images: &head_images,
+      canonical_inode: &canonical_inode,
+    };
 
     // Each snapshot, into its own roots, in id order so a fresh slab reproduces its id and a
-    // cross-snapshot reference always resolves to an already-rebuilt canonical.
+    // cross-snapshot reference always resolves to an already-rebuilt canonical. Deadlists are left
+    // empty here and filled by one global pass below, once every tree (and its sharing) exists.
     let mut snapshots: Vec<&SnapshotImage> = image.snapshots.iter().collect();
     snapshots.sort_by_key(|s| (s.id.index, s.id.generation));
-    for snap in snapshots {
-      vol.rebuild_snapshot(store, snap, root_no, &head, &canonical_inode)?;
+    for snap in &snapshots {
+      vol.rebuild_snapshot(store, snap, root_no, &refs)?;
     }
+    vol.rebuild_deadlists(store, &snapshots)?;
     vol.bytes = head_bytes;
     vol.live_entries = head_entries;
     vol.last_snapshot = image.last_snapshot.map(to_snapshot_id);
@@ -888,30 +890,8 @@ impl Volume {
     store: &mut Store,
     snap: &SnapshotImage,
     root_no: InodeNo,
-    head: &HeadRefs,
-    canonical_inode: &BTreeMap<((u32, u32), u64), &InodeImage>,
+    refs: &SharingRefs,
   ) -> Result<(), VfsError> {
-    // Expand the snapshot's deduplicated references back to a full inode list: its own full inodes,
-    // plus an independent copy of every version it deduplicated against an *earlier snapshot* (from
-    // that snapshot's canonical entry). A version it shares with the *head* stays a reference in
-    // `head_shared` — the rebuild points at the head's inode. So the recovered store is exactly what
-    // a full (non-deduplicated) image would have rebuilt: independent copies, correct deadlists.
-    let mut effective: Vec<InodeImage> = snap.inodes.clone();
-    let mut head_shared: BTreeSet<u64> = BTreeSet::new();
-    for entry in &snap.shared {
-      match entry.source {
-        SharedSource::Head => {
-          head_shared.insert(entry.number);
-        }
-        SharedSource::Snapshot { at: src } => {
-          let canonical = canonical_inode
-            .get(&((src.index, src.generation), entry.number))
-            .ok_or(VfsError::RecoveryIncomplete)?;
-          effective.push((*canonical).clone());
-        }
-      }
-    }
-
     let saved = (self.epoch, self.root, self.inode_root);
     let saved_quota = std::mem::replace(&mut self.quota, Quota::Bounded { limit: u64::MAX });
     let epoch = Epoch(snap.epoch);
@@ -925,7 +905,7 @@ impl Volume {
     store.inodes.get_mut(root_handle)?.body = Body::Directory(root_dir);
     self.root = root_dir;
 
-    let outcome = self.rebuild_snapshot_tree(store, &effective, &head_shared, root_no, epoch, head);
+    let outcome = self.rebuild_snapshot_tree(store, snap, root_no, epoch, refs);
 
     let (root, inode_root) = (self.root, self.inode_root);
     self.quota = saved_quota;
@@ -934,15 +914,12 @@ impl Volume {
     self.inode_root = saved.2;
     outcome?;
 
-    // `destroy_snapshot` reclaims only from the deadlist, so give it the snapshot's own objects —
-    // but exclude inodes shared with the head, since freeing those on drop would corrupt the head
-    // (the double-free guard test proves this holds). Cross-snapshot copies are independent, so they
-    // belong to this snapshot's deadlist exactly as any diverged inode does.
-    let deadlist = crate::volume::tree_deadlist_excluding(store, root, inode_root, &head_shared);
     // Place the snapshot at the exact slot and generation it had before the crash: a `SnapshotId`
     // *is* its slab handle (§4.8), so a client that still holds the id must find the same snapshot
     // after recovery. `from_image` replays snapshots in ascending index order, so `insert_at`'s
-    // append-extending contract holds and a destroyed snapshot's slot becomes a reusable gap.
+    // append-extending contract holds and a destroyed snapshot's slot becomes a reusable gap. The
+    // deadlist is filled by the global pass (`rebuild_deadlists`), once every tree exists, because a
+    // shared inode belongs to exactly one snapshot's deadlist and that cannot be decided per-tree.
     self.snapshots.insert_at(
       snap.id.index,
       snap.id.generation,
@@ -950,7 +927,7 @@ impl Volume {
         epoch,
         root,
         inode_root,
-        deadlist,
+        deadlist: Deadlist::default(),
         clone_refs: snap.clone_refs,
         previous: snap.previous.map(to_snapshot_id),
         next: snap.next.map(to_snapshot_id),
@@ -962,6 +939,48 @@ impl Volume {
     Ok(())
   }
 
+  /// Reconstruct every recovered snapshot's deadlist in one global pass, newest first (§4.8). A
+  /// snapshot's deadlist is the objects it reaches that the head no longer holds; a version shared
+  /// across snapshots (CoW) must sit on exactly *one* snapshot's deadlist — the newest that holds it
+  /// — so that `destroy_snapshot`'s migration frees it only when its oldest referencer is destroyed.
+  /// Processing newest first and skipping anything an already-processed (newer) snapshot claimed puts
+  /// each object where the live volume kept it, so a drop in any order neither leaks nor double-frees.
+  fn rebuild_deadlists(
+    &mut self,
+    store: &mut Store,
+    snapshots: &[&SnapshotImage],
+  ) -> Result<(), VfsError> {
+    let mut order: Vec<&SnapshotImage> = snapshots.to_vec();
+    order.sort_by_key(|s| std::cmp::Reverse(s.epoch));
+    let mut claimed: HashSet<(Discriminant<Dead>, u32, u32)> = HashSet::new();
+    for snap in order {
+      // Objects the head still holds are the head's, not this snapshot's; everything else the
+      // snapshot reaches is a candidate, then filtered to what no newer snapshot already claimed.
+      let head_shared: BTreeSet<u64> = snap
+        .shared
+        .iter()
+        .filter_map(|s| match s.source {
+          SharedSource::Head => Some(s.number),
+          SharedSource::Snapshot { .. } => None,
+        })
+        .collect();
+      let handle = snapshot_slab_handle(snap.id);
+      let (root, inode_root) = {
+        let s = self.snapshots.get(handle)?;
+        (s.root, s.inode_root)
+      };
+      let full = crate::volume::tree_deadlist_excluding(store, root, inode_root, &head_shared);
+      let mut deadlist = Deadlist::default();
+      for dead in full.items() {
+        if claimed.insert(dead_key(dead)) {
+          deadlist.push(*dead);
+        }
+      }
+      self.snapshots.get_mut(handle)?.deadlist = deadlist;
+    }
+    Ok(())
+  }
+
   /// Rebuilds a snapshot's tree into the volume's current (snapshot) roots, sharing with the head
   /// every file or symlink the snapshot holds unchanged (an identical image) instead of rebuilding a
   /// private copy — the §4.2 CoW-sharing efficiency. Returns the inode numbers shared with the head,
@@ -969,28 +988,44 @@ impl Volume {
   fn rebuild_snapshot_tree(
     &mut self,
     store: &mut Store,
-    effective: &[InodeImage],
-    head_shared: &BTreeSet<u64>,
+    snap: &SnapshotImage,
     root_no: InodeNo,
     epoch: Epoch,
-    head: &HeadRefs,
+    refs: &SharingRefs,
   ) -> Result<(), VfsError> {
-    // `head_shared` names the files and symlinks the snapshot shares unchanged with the head; their
-    // bytes live once, in the head's image. Point the snapshot's table at the head's rebuilt inode
-    // for each — the head is rebuilt before any snapshot — and take its kind from the head so the
-    // directory entries that reference it resolve. `effective` is the snapshot's full inode list
-    // (its own, plus cross-snapshot copies already expanded), so everything else rebuilds here.
-    let mut kinds: BTreeMap<u64, KindImage> = effective.iter().map(|i| (i.no, i.kind)).collect();
-    for no in head_shared {
-      let head_image = head.images.get(no).ok_or(VfsError::RecoveryIncomplete)?;
-      kinds.insert(*no, head_image.kind);
-      let head_handle = trie::get(&store.tries, head.inode_root, InodeNo(*no))
-        .ok_or(VfsError::RecoveryIncomplete)?;
-      self.table_set(store, InodeNo(*no), head_handle)?;
+    // `snap.shared` names the files and symlinks the snapshot does not carry itself because an
+    // identical version is already in the rebuilt store: the head still holds it (share the head's
+    // inode) or an earlier snapshot captured it (share that snapshot's inode — the earlier snapshot
+    // has a lower id and is already rebuilt). Sharing, not copying, is what makes the recovered store
+    // match the live volume's CoW memory. The kind comes from the source so entries resolve; the
+    // snapshot's own inodes (`snap.inodes`) rebuild below.
+    let mut kinds: BTreeMap<u64, KindImage> = snap.inodes.iter().map(|i| (i.no, i.kind)).collect();
+    for entry in &snap.shared {
+      let no = InodeNo(entry.number);
+      let (source_root, kind) = match entry.source {
+        SharedSource::Head => {
+          let image = refs
+            .head_images
+            .get(&entry.number)
+            .ok_or(VfsError::RecoveryIncomplete)?;
+          (refs.head_inode_root, image.kind)
+        }
+        SharedSource::Snapshot { at } => {
+          let image = refs
+            .canonical_inode
+            .get(&((at.index, at.generation), entry.number))
+            .ok_or(VfsError::RecoveryIncomplete)?;
+          let source_root = self.snapshots.get(snapshot_slab_handle(at))?.inode_root;
+          (source_root, image.kind)
+        }
+      };
+      kinds.insert(entry.number, kind);
+      let handle = trie::get(&store.tries, source_root, no).ok_or(VfsError::RecoveryIncomplete)?;
+      self.table_set(store, no, handle)?;
     }
     let mut dirs: BTreeMap<u64, Handle<DirNode>> = BTreeMap::new();
     dirs.insert(root_no.0, self.root);
-    for image_inode in effective {
+    for image_inode in &snap.inodes {
       let no = InodeNo(image_inode.no);
       if no == root_no {
         continue;
@@ -1000,9 +1035,9 @@ impl Volume {
       let handle = store.inodes.insert(inode)?;
       self.table_set(store, no, handle)?;
     }
-    self.rebuild_entries(store, effective, &kinds, &dirs)?;
-    self.fill_content(store, effective)?;
-    self.restore_identities(store, effective)?;
+    self.rebuild_entries(store, &snap.inodes, &kinds, &dirs)?;
+    self.fill_content(store, &snap.inodes)?;
+    self.restore_identities(store, &snap.inodes)?;
     Ok(())
   }
 
@@ -1101,11 +1136,37 @@ impl Volume {
 
 /// The body to place an inode with in pass one: a fresh directory node (recorded in `dirs`), a
 /// symlink's target, or an empty file body the write pass fills.
-/// The head's rebuilt inode table and each inode's image, so a snapshot rebuild can share an inode
-/// it holds unchanged with the head (§4.2 CoW-sharing) and take a shared inode's kind from the head.
-struct HeadRefs<'a> {
-  inode_root: Handle<TrieNode>,
-  images: &'a BTreeMap<u64, &'a InodeImage>,
+/// What a snapshot rebuild needs to share an inode instead of rebuilding it (§4.2/§4.8 CoW-sharing):
+/// the head's rebuilt inode table and images (for a version the head still holds), and every
+/// snapshot's own images keyed by (id, number) so a version an earlier snapshot captured in full can
+/// be shared from that snapshot's rebuilt inode. Sharing — not copying — is what makes the recovered
+/// store use the same RAM the live, pre-crash volume did (the live volume shares CoW inodes across
+/// snapshots), so recovery reconstructs the volume as it was, not a bloated copy of it.
+struct SharingRefs<'a> {
+  head_inode_root: Handle<TrieNode>,
+  head_images: &'a BTreeMap<u64, &'a InodeImage>,
+  canonical_inode: &'a BTreeMap<((u32, u32), u64), &'a InodeImage>,
+}
+
+/// The slab handle a `SnapshotRef` names (its slot and generation) — a snapshot id *is* its slab
+/// handle (§4.8), so this resolves a reference to the rebuilt snapshot's record.
+fn snapshot_slab_handle(r: SnapshotRef) -> Handle<Snapshot> {
+  Handle::from_raw(r.index, r.generation)
+}
+
+/// A stable key for a dead object — its variant and slab handle — so the global deadlist pass (§4.8)
+/// claims each object for exactly one snapshot's deadlist. The variant discriminant separates the
+/// five slabs (a `Dir` handle and an `Inode` handle can share an index); the born epoch is not part
+/// of the key, since a slab handle at its generation already identifies one object uniquely.
+fn dead_key(dead: &Dead) -> (Discriminant<Dead>, u32, u32) {
+  let (index, generation) = match dead {
+    Dead::Dir(h, _) => (h.index(), h.generation()),
+    Dead::DirBlock(h, _) => (h.index(), h.generation()),
+    Dead::Inode(h, _) => (h.index(), h.generation()),
+    Dead::Trie(h, _) => (h.index(), h.generation()),
+    Dead::Chunk(h, _) => (h.index(), h.generation()),
+  };
+  (std::mem::discriminant(dead), index, generation)
 }
 
 /// A crc of a body's bytes, used only to bucket the cross-snapshot content dedup lookup (§4.2). The

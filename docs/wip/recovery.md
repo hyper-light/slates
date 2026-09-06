@@ -177,39 +177,42 @@ volume.
   verified by disabling sharing at capture — a recovered snapshot with an unchanged file holds five
   inodes not six and both delta assertions fail without it.
 
-  **Cross-snapshot dedup — the image half — is landed.** A version that diverged from the head but
-  is frozen identically in two or more snapshots (edit a long-stable file after a run of snapshots)
-  used to be captured once per snapshot; now `capture_snapshots` carries a `(number, body crc) →
-  canonical` map across snapshots (the crc buckets the lookup; exact bytes decide the match, so a crc
-  collision costs a comparison, never a wrong dedup that would corrupt content), and a later snapshot
-  that holds a byte-identical version records a `SharedInode { number, source: Snapshot { at } }`
-  instead of a second copy — so the whole image holds each distinct version once. This is the
-  recoverability win: a repeatedly-snapshotted, then-edited volume's image fits its content-object
-  slice instead of overflowing to `RecoveryIncomplete`.
+  **Cross-snapshot dedup is landed — both the image and the store.** A version that diverged from the
+  head but is frozen identically in two or more snapshots (edit a long-stable file after a run of
+  snapshots) used to be captured once per snapshot *and* rebuilt once per snapshot; now it is one
+  entry in the image and one inode in the store — the same as the live, pre-crash volume, which
+  shares it by CoW.
 
-  The **rebuild expands** each cross-snapshot reference back to an *independent copy* from the
-  canonical entry (`rebuild_snapshot` builds the snapshot's effective inode list from its own inodes
-  plus those copies), so the recovered store is byte-identical to what a full, non-deduplicated image
-  would have rebuilt — the deadlists stay per-snapshot (`tree_deadlist_excluding`, head-shared
-  excluded), the copies are distinct inodes with distinct deadlist entries, and dropping one snapshot
-  never touches another's. This keeps the delicate part — the deadlist — untouched, and the
-  byte-identical round-trip oracle guards it: because capture dedups by *content*, the rebuilt
-  independent copies re-capture to the same deduplicated image, so `to_image(from_image) == image`
-  still holds (asserted in the cross-snapshot test). Gated in `crates/vfs/tests/recover.rs`
-  (`a_version_shared_across_snapshots_is_captured_once_and_recovers_independently`): the earlier
-  snapshot is the canonical, the later omits the copy and names the earlier as its source, the image
-  round-trips, both snapshots serve the version through their own ids, and dropping one leaves the
-  other readable — non-vacuously (disabling the content match makes the later snapshot carry a full
-  copy and the assertions fail).
+  *Image:* `capture_snapshots` carries a `(number, body crc) → canonical` map across snapshots (the
+  crc buckets the lookup; exact bytes decide the match, so a crc collision costs a comparison, never a
+  wrong dedup that would corrupt content), and a later snapshot that holds a byte-identical version
+  records a `SharedInode { number, source: Snapshot { at } }` instead of a second copy — so the image
+  holds each distinct version once and fits its content-object slice instead of overflowing to
+  `RecoveryIncomplete`.
 
-  What remains is the *store* half: the rebuild still holds one inode per snapshot for a shared
-  version (the image is compact, the store is not). Store-sharing it (one inode across snapshots, as
-  head-sharing does within the head) needs a *global, newest-referencer-first* deadlist
-  reconstruction to match the live migration invariant — a shared inode must land on exactly one
-  snapshot's deadlist (the newest live referencer, since `destroy_snapshot` migrates it to the
-  previous while `dead.born() <= prev_epoch` and frees it only when the oldest referencer goes), or a
-  drop double-frees it. That is the one careful subsystem left here; the image half above already
-  buys the recoverability, and the store copies are correct meanwhile.
+  *Store:* `rebuild_snapshot_tree` **shares** rather than copies — a `Snapshot { at }` reference
+  points the snapshot's table at the canonical snapshot's rebuilt inode (that snapshot has a lower id
+  and is already rebuilt), a `Head` reference at the head's, so the recovered store uses the RAM the
+  live volume did. Because a shared inode may not sit on two deadlists (a drop would double-free it),
+  the deadlists are not built per-tree; `rebuild_deadlists` runs one global pass **newest-first**,
+  each snapshot claiming the objects it reaches that the head no longer holds and that no newer
+  snapshot already claimed — so each shared object lands on exactly the newest snapshot that holds it,
+  which is where the live volume kept it, and `destroy_snapshot`'s existing migration (to the previous
+  while `dead.born() <= prev_epoch`, freed only when the oldest referencer goes) does the rest. The
+  byte-identical round-trip oracle still guards it, since content-based capture re-derives the same
+  image whether the store shares or copies.
+
+  Gated in `crates/vfs/tests/recover.rs`:
+  `a_version_shared_across_snapshots_is_captured_once_and_recovers_shared` (the earlier snapshot is
+  the canonical, the later omits the copy and names it as source, the image round-trips, the store
+  holds the version as **one** inode not one per snapshot, both snapshots serve it through their own
+  ids, and dropping the older leaves the newer readable), and the adversarial
+  `a_shared_version_survives_newest_first_drops_with_slot_reuse` (three snapshots share a version;
+  dropping newest-first with a fresh file allocated in between — reusing freed slots — never frees the
+  shared inode early or double-frees a reused slot, and the store returns to exactly the head's
+  inodes, so no leak). Non-vacuous: disabling the content match makes a full copy and fails the counts;
+  disabling the newest-first `claimed` filter puts the shared inode on two deadlists and the first
+  drop frees it early, failing with a `StaleHandle` use-after-free.
 - **Clone recovery.** *(Content landed.)* A clone's image captures its whole tree (the bytes it
   inherited from the origin snapshot and the bytes it wrote after diverging), and `from_image`
   rebuilds it faithfully, keeping the inherited root inode number (fixed in
