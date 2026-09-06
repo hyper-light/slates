@@ -37,6 +37,10 @@ pub const NFSPROC3_NULL: u32 = 0;
 pub const NFSPROC3_GETATTR: u32 = 1;
 /// Format: NFSPROC3_SETATTR — set some of an object's attributes.
 pub const NFSPROC3_SETATTR: u32 = 2;
+/// Format: NFSPROC3_CREATE — create a regular file.
+pub const NFSPROC3_CREATE: u32 = 8;
+/// Format: NFSPROC3_MKDIR — create a directory.
+pub const NFSPROC3_MKDIR: u32 = 9;
 /// Format: NFSPROC3_LOOKUP — resolve a name in a directory to a handle.
 pub const NFSPROC3_LOOKUP: u32 = 3;
 /// Format: NFSPROC3_ACCESS — which operations the caller may perform on an object.
@@ -105,6 +109,19 @@ const TIME_SET_TO_SERVER: u32 = 1;
 const TIME_SET_TO_CLIENT: u32 = 2;
 /// Format: nanoseconds per second, for converting an `nfstime3` to the volume core's `i64` nanos.
 const NS_PER_SEC: i64 = 1_000_000_000;
+/// Format: `createmode3` UNCHECKED (RFC 1813 §3.3.8): create the file, or succeed on an existing
+/// one (an `open` with `O_CREAT` and no `O_EXCL`).
+const CREATE_UNCHECKED: u32 = 0;
+/// Format: `createmode3` GUARDED: create the file, or fail `NFS3ERR_EXIST` if the name exists.
+const CREATE_GUARDED: u32 = 1;
+/// Format: `createmode3` EXCLUSIVE: an idempotent create keyed by an 8-byte verifier. slates keeps
+/// no create-verifier table yet, so it is refused `NFS3ERR_NOTSUPP` (owed); a client retries GUARDED.
+const CREATE_EXCLUSIVE: u32 = 2;
+/// Format: the mode a CREATE falls back to when the client's `sattr3` omits one — a regular file,
+/// `rw-r--r--`. A client sets the mode in practice, so this is only a defensive default.
+const DEFAULT_FILE_MODE: u32 = 0o644;
+/// Format: the mode a MKDIR falls back to when the client's `sattr3` omits one — `rwxr-xr-x`.
+const DEFAULT_DIR_MODE: u32 = 0o755;
 
 /// An NFSv3 export of one volume over the shared operation layer. Handles it mints and accepts name
 /// objects of `volume`; a handle for another volume is refused stale. The export edge admits one
@@ -243,6 +260,8 @@ impl<'b> Export<'b> {
       NFSPROC3_GETATTR => Some(self.getattr(args)),
       NFSPROC3_SETATTR => Some(self.setattr(args)),
       NFSPROC3_LOOKUP => Some(self.lookup(args)),
+      NFSPROC3_CREATE => Some(self.create(args)),
+      NFSPROC3_MKDIR => Some(self.mkdir(args)),
       NFSPROC3_ACCESS => Some(self.access(args)),
       NFSPROC3_READ => Some(self.read(args)),
       NFSPROC3_WRITE => Some(self.write(args)),
@@ -693,6 +712,166 @@ impl<'b> Export<'b> {
     })
   }
 
+  /// NFSPROC3_CREATE: create a regular file in a directory over the shared interface under the
+  /// export's context, then reply the new file's handle and attributes and the directory's wcc. The
+  /// `createhow3` mode selects the semantics: GUARDED fails `NFS3ERR_EXIST` on an existing name,
+  /// UNCHECKED succeeds by opening it, EXCLUSIVE is refused `NFS3ERR_NOTSUPP` (owed). The `sattr3`
+  /// initial attributes are applied — the mode at creation, the rest through the seam's `setattr`.
+  pub fn create(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let (status, made, dir_post) = self.do_create(args);
+    let mut writer = XdrWriter::new();
+    encode_create_reply(&mut writer, status, made, dir_post);
+    writer.into_bytes()
+  }
+
+  fn do_create(
+    &mut self,
+    args: &mut XdrReader<'_>,
+  ) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Option<Fattr3>) {
+    // CREATE3args: where (diropargs3: dir handle then name), then how (createhow3).
+    let dir_fh = match Nfsfh3::decode(args) {
+      Ok(fh) => fh,
+      Err(_) => return (Nfsstat3::Badhandle, None, None),
+    };
+    let name = match args.string(NFS_MAXNAMELEN) {
+      Ok(n) => n.to_owned(),
+      Err(_) => return (Nfsstat3::Inval, None, None),
+    };
+    let mode_kind = match args.u32() {
+      Ok(m) => m,
+      Err(_) => return (Nfsstat3::Inval, None, None),
+    };
+    let changes = match mode_kind {
+      CREATE_UNCHECKED | CREATE_GUARDED => match self.decode_sattr3(args) {
+        Ok(c) => c,
+        Err(status) => return (status, None, None),
+      },
+      // EXCLUSIVE's createverf3 is an 8-byte verifier slates does not yet persist to make the
+      // create idempotent; refuse it typed rather than silently degrade to a plain create.
+      CREATE_EXCLUSIVE => return (Nfsstat3::Notsupp, None, None),
+      _ => return (Nfsstat3::Inval, None, None),
+    };
+    let dir_identity = match self.resolve_handle(&dir_fh) {
+      Ok(id) => id,
+      Err(status) => return (status, None, None),
+    };
+    let cx = match self.op_context() {
+      Ok(cx) => cx,
+      Err(e) => return (nfsstat_of(&e), None, None),
+    };
+    let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
+    let mode = changes.mode.unwrap_or(DEFAULT_FILE_MODE);
+    let object = match self.bridge.create(parent, &cx, &name, mode, 0) {
+      Ok((node, fh)) => {
+        // NFS keeps no open state; drop the open reference the create took (the client's handle is
+        // identity-based, not this open handle). The lookup reference persists until the teardown
+        // sweep (owed), since NFSv3 has no FORGET.
+        let object = ObjectId::new(node.ino, node.generation);
+        let _ = self.bridge.release(object, &cx, fh);
+        object
+      }
+      Err(VfsError::AlreadyExists) if mode_kind == CREATE_UNCHECKED => {
+        // UNCHECKED succeeds on an existing name by opening it.
+        match self.bridge.lookup(parent, &cx, &name) {
+          Ok(node) => ObjectId::new(node.ino, node.generation),
+          Err(e) => {
+            let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
+            return (nfsstat_of(&e), None, dir_post);
+          }
+        }
+      }
+      Err(e) => {
+        let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
+        return (nfsstat_of(&e), None, dir_post);
+      }
+    };
+    let post_changes = SetAttr {
+      mode: None,
+      ..changes
+    };
+    self.finish_create(object, &dir_identity, &cx, post_changes)
+  }
+
+  /// NFSPROC3_MKDIR: create a directory in a parent over the shared interface under the export's
+  /// context, then reply the new directory's handle and attributes and the parent's wcc.
+  pub fn mkdir(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let (status, made, dir_post) = self.do_mkdir(args);
+    let mut writer = XdrWriter::new();
+    encode_create_reply(&mut writer, status, made, dir_post);
+    writer.into_bytes()
+  }
+
+  fn do_mkdir(
+    &mut self,
+    args: &mut XdrReader<'_>,
+  ) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Option<Fattr3>) {
+    // MKDIR3args: where (diropargs3), then the attributes (sattr3).
+    let dir_fh = match Nfsfh3::decode(args) {
+      Ok(fh) => fh,
+      Err(_) => return (Nfsstat3::Badhandle, None, None),
+    };
+    let name = match args.string(NFS_MAXNAMELEN) {
+      Ok(n) => n.to_owned(),
+      Err(_) => return (Nfsstat3::Inval, None, None),
+    };
+    let changes = match self.decode_sattr3(args) {
+      Ok(c) => c,
+      Err(status) => return (status, None, None),
+    };
+    let dir_identity = match self.resolve_handle(&dir_fh) {
+      Ok(id) => id,
+      Err(status) => return (status, None, None),
+    };
+    let cx = match self.op_context() {
+      Ok(cx) => cx,
+      Err(e) => return (nfsstat_of(&e), None, None),
+    };
+    let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
+    let mode = changes.mode.unwrap_or(DEFAULT_DIR_MODE);
+    let object = match self.bridge.mkdir(parent, &cx, &name, mode) {
+      Ok(node) => ObjectId::new(node.ino, node.generation),
+      Err(e) => {
+        let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
+        return (nfsstat_of(&e), None, dir_post);
+      }
+    };
+    // A directory has no size to set; apply the remaining fields (uid/gid/times).
+    let post_changes = SetAttr {
+      mode: None,
+      size: None,
+      ..changes
+    };
+    self.finish_create(object, &dir_identity, &cx, post_changes)
+  }
+
+  /// The shared tail of CREATE and MKDIR: apply the `sattr3` fields the creation did not set (the
+  /// mode is set at creation), fetch the object's final attributes, mint its handle, and gather the
+  /// parent directory's post-op attributes for the wcc.
+  fn finish_create(
+    &mut self,
+    object: ObjectId,
+    dir_identity: &FileHandle,
+    cx: &OpContext,
+    post_changes: SetAttr,
+  ) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Option<Fattr3>) {
+    if post_changes != SetAttr::default()
+      && let Err(e) = self.bridge.setattr(object, cx, post_changes)
+    {
+      let dir_post = self.attrs_of(dir_identity).ok().map(|n| self.fattr3(&n));
+      return (nfsstat_of(&e), None, dir_post);
+    }
+    let attr = match self.bridge.getattr(object, cx) {
+      Ok(node) => self.fattr3(&node),
+      Err(e) => {
+        let dir_post = self.attrs_of(dir_identity).ok().map(|n| self.fattr3(&n));
+        return (nfsstat_of(&e), None, dir_post);
+      }
+    };
+    let handle = self.handle_for(object.inode, object.generation);
+    let dir_post = self.attrs_of(dir_identity).ok().map(|n| self.fattr3(&n));
+    (Nfsstat3::Ok, Some((handle, attr)), dir_post)
+  }
+
   /// NFSPROC3_FSSTAT: the volume's dynamic statistics — space and file counts — from the shared
   /// seam's `statfs`, in the bytes and counts NFS reports.
   pub fn fsstat(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
@@ -790,6 +969,24 @@ fn granted_access(mode: u32, requested: u32) -> u32 {
 fn encode_wcc(writer: &mut XdrWriter, post: Option<Fattr3>) {
   writer.bool(false);
   PostOpAttr(post).encode(writer);
+}
+
+/// Encodes a CREATE/MKDIR/SYMLINK reply (they share the shape, RFC 1813 §3.3.8-10): on success the
+/// new object's `post_op_fh3` and `post_op_attr` then the parent's `wcc_data`; on failure just the
+/// parent's `wcc_data`.
+fn encode_create_reply(
+  writer: &mut XdrWriter,
+  status: Nfsstat3,
+  made: Option<(Nfsfh3, Fattr3)>,
+  dir_post: Option<Fattr3>,
+) {
+  status.encode(writer);
+  if let Some((handle, attr)) = made {
+    writer.bool(true); // post_op_fh3: a handle follows
+    handle.encode(writer);
+    PostOpAttr(Some(attr)).encode(writer);
+  }
+  encode_wcc(writer, dir_post);
 }
 
 /// Decodes an `sattr3` optional `u32` (`set_mode3`/`set_uid3`/`set_gid3`): a bool, then the value

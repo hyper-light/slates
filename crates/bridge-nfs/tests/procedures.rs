@@ -11,9 +11,9 @@ use slates_bridge_core::{Attachments, Bridge, ObjectId, OpContext, Rights, View,
 use slates_bridge_nfs::mount::MountReply;
 use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
 use slates_bridge_nfs::procedures::{
-  Export, NFSPROC3_ACCESS, NFSPROC3_FSINFO, NFSPROC3_FSSTAT, NFSPROC3_GETATTR, NFSPROC3_NULL,
-  NFSPROC3_READ, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR,
-  NFSPROC3_WRITE,
+  Export, NFSPROC3_ACCESS, NFSPROC3_CREATE, NFSPROC3_FSINFO, NFSPROC3_FSSTAT, NFSPROC3_GETATTR,
+  NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR,
+  NFSPROC3_SETATTR, NFSPROC3_WRITE,
 };
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_db::catalog::{Principal, VolumeId};
@@ -975,5 +975,185 @@ fn a_setattr_guard_mismatch_is_not_sync() {
     Fattr3::decode(&mut gr).unwrap().mode,
     0o644,
     "the refused SETATTR applied nothing"
+  );
+}
+
+/// A helper: build an export over a fresh volume and return the pieces the create/mkdir tests need
+/// — the bridge is created inside so borrows stay simple; the export's root handle comes from MNT.
+fn root_handle(export: &mut Export<'_>) -> Nfsfh3 {
+  match export.mnt("/") {
+    MountReply::Ok { handle, .. } => handle,
+    MountReply::Err(status) => panic!("MNT failed: {status:?}"),
+  }
+}
+
+/// CREATE over the export makes a regular file: the reply carries the new file's handle and
+/// attributes (the requested mode, a regular file), and a following LOOKUP resolves the name.
+#[test]
+fn a_create_over_the_export_makes_a_file() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = root_handle(&mut export);
+
+  // CREATE "new" GUARDED with mode 0o600.
+  let mut args = XdrWriter::new();
+  root_fh.encode(&mut args);
+  args.opaque("new".as_bytes());
+  args.u32(1); // createmode GUARDED
+  args.bool(true); // sattr3 mode set
+  args.u32(0o600);
+  args.bool(false); // uid
+  args.bool(false); // gid
+  args.bool(false); // size
+  args.u32(0); // atime DONT_CHANGE
+  args.u32(0); // mtime DONT_CHANGE
+  let reply = export
+    .serve_nfs(NFSPROC3_CREATE, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "CREATE succeeded");
+  assert!(r.bool().unwrap(), "a file handle follows");
+  let _fh = Nfsfh3::decode(&mut r).unwrap();
+  let attr = PostOpAttr::decode(&mut r).unwrap().0.expect("object attrs");
+  assert_eq!(attr.kind, Ftype3::Reg, "a regular file");
+  assert_eq!(attr.mode, 0o600, "the requested mode");
+
+  // LOOKUP resolves the new name.
+  let mut la = XdrWriter::new();
+  root_fh.encode(&mut la);
+  la.opaque("new".as_bytes());
+  let lreply = export.lookup(&mut XdrReader::new(la.as_slice()));
+  assert_eq!(
+    XdrReader::new(&lreply).u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "the created name resolves"
+  );
+}
+
+/// A GUARDED CREATE onto an existing name is NFS3ERR_EXIST; an UNCHECKED CREATE onto an existing
+/// name succeeds (opening it), so a client's `open(O_CREAT)` without `O_EXCL` is idempotent.
+#[test]
+fn guarded_and_unchecked_create_differ_on_an_existing_name() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  bridge.create(oid(root_ino), &cx, "dup", 0o644, 0).unwrap();
+
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = root_handle(&mut export);
+
+  // GUARDED onto "dup" (exists) -> EXIST.
+  let mut ga = XdrWriter::new();
+  root_fh.encode(&mut ga);
+  ga.opaque("dup".as_bytes());
+  ga.u32(1); // GUARDED
+  ga.bool(true);
+  ga.u32(0o644);
+  ga.bool(false);
+  ga.bool(false);
+  ga.bool(false);
+  ga.u32(0);
+  ga.u32(0);
+  let greply = export
+    .serve_nfs(NFSPROC3_CREATE, &mut XdrReader::new(ga.as_slice()))
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&greply).u32().unwrap(),
+    Nfsstat3::Exist.wire(),
+    "GUARDED onto an existing name is EXIST"
+  );
+
+  // UNCHECKED onto "dup" (exists) -> OK.
+  let mut ua = XdrWriter::new();
+  root_fh.encode(&mut ua);
+  ua.opaque("dup".as_bytes());
+  ua.u32(0); // UNCHECKED
+  ua.bool(false); // mode unset
+  ua.bool(false);
+  ua.bool(false);
+  ua.bool(false);
+  ua.u32(0);
+  ua.u32(0);
+  let ureply = export
+    .serve_nfs(NFSPROC3_CREATE, &mut XdrReader::new(ua.as_slice()))
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&ureply).u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "UNCHECKED onto an existing name succeeds"
+  );
+}
+
+/// MKDIR over the export makes a directory: the reply carries its handle and attributes (a
+/// directory, the requested mode), and a following LOOKUP resolves the name.
+#[test]
+fn a_mkdir_over_the_export_makes_a_directory() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = root_handle(&mut export);
+
+  // MKDIR "d" with mode 0o750.
+  let mut args = XdrWriter::new();
+  root_fh.encode(&mut args);
+  args.opaque("d".as_bytes());
+  args.bool(true); // sattr3 mode set
+  args.u32(0o750);
+  args.bool(false); // uid
+  args.bool(false); // gid
+  args.bool(false); // size
+  args.u32(0); // atime DONT_CHANGE
+  args.u32(0); // mtime DONT_CHANGE
+  let reply = export
+    .serve_nfs(NFSPROC3_MKDIR, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "MKDIR succeeded");
+  assert!(r.bool().unwrap(), "a handle follows");
+  let _fh = Nfsfh3::decode(&mut r).unwrap();
+  let attr = PostOpAttr::decode(&mut r).unwrap().0.expect("object attrs");
+  assert_eq!(attr.kind, Ftype3::Dir, "a directory");
+  assert_eq!(attr.mode, 0o750, "the requested mode");
+
+  let mut la = XdrWriter::new();
+  root_fh.encode(&mut la);
+  la.opaque("d".as_bytes());
+  let lreply = export.lookup(&mut XdrReader::new(la.as_slice()));
+  assert_eq!(
+    XdrReader::new(&lreply).u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "the created directory resolves"
   );
 }
