@@ -579,6 +579,38 @@ fn a_volume_with_a_snapshot_rebuilds_faithfully() {
   );
 }
 
+/// AC (§4.8): a snapshot id survives recovery even when it is not the first slot — the `SnapshotRef`
+/// guarantee that "a snapshot id a client holds still resolves after recovery" must hold for a
+/// volume with more than one snapshot and for the survivors of a destroy, not only the trivial
+/// single-snapshot case. Two snapshots are taken, the first destroyed, and the survivor (whose id is
+/// slot one, not slot zero) must still serve its frozen content through the very id the client holds.
+#[test]
+fn a_recovered_snapshot_id_survives_when_it_is_not_the_first_slot() {
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let f = vol.create_file_no(&mut src, root, "f", 0o644).unwrap();
+  vol.write(&mut src, f, 0, b"first").unwrap();
+  let snap_a = vol.snapshot(&mut src).unwrap();
+  vol.write(&mut src, f, 0, b"second").unwrap();
+  let snap_b = vol.snapshot(&mut src).unwrap();
+  vol.write(&mut src, f, 0, b"head").unwrap();
+  vol.destroy_snapshot(&mut src, snap_a).unwrap(); // frees slot zero; snap_b keeps slot one
+
+  let image = vol.to_image(&src).unwrap();
+  let mut fresh = store();
+  let recovered =
+    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+
+  let mut buf = vec![0u8; 16];
+  let n = recovered.read_in(&fresh, snap_b, f, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..n],
+    b"second",
+    "the surviving snapshot serves its frozen content through the id the client still holds"
+  );
+}
+
 /// AC (§4.8): dropping a recovered snapshot reclaims its tree. `destroy_snapshot` reclaims only from
 /// the snapshot's deadlist, and a recovered snapshot's tree is independent, so recovery must give it
 /// a deadlist of its whole tree — otherwise the snapshot's chunks leak on drop. With a chunked file

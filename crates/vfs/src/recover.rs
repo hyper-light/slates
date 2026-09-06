@@ -841,18 +841,26 @@ impl Volume {
     // but exclude inodes shared with the head, since freeing those on drop would corrupt the head
     // (the double-free guard test proves this holds).
     let deadlist = crate::volume::tree_deadlist_excluding(store, root, inode_root, &shared);
-    self.snapshots.insert(Snapshot {
-      epoch,
-      root,
-      inode_root,
-      deadlist,
-      clone_refs: snap.clone_refs,
-      previous: snap.previous.map(to_snapshot_id),
-      next: snap.next.map(to_snapshot_id),
-      referenced_bytes: snap.referenced_bytes,
-      seq: snap.seq,
-      identity: None,
-    })?;
+    // Place the snapshot at the exact slot and generation it had before the crash: a `SnapshotId`
+    // *is* its slab handle (§4.8), so a client that still holds the id must find the same snapshot
+    // after recovery. `from_image` replays snapshots in ascending index order, so `insert_at`'s
+    // append-extending contract holds and a destroyed snapshot's slot becomes a reusable gap.
+    self.snapshots.insert_at(
+      snap.id.index,
+      snap.id.generation,
+      Snapshot {
+        epoch,
+        root,
+        inode_root,
+        deadlist,
+        clone_refs: snap.clone_refs,
+        previous: snap.previous.map(to_snapshot_id),
+        next: snap.next.map(to_snapshot_id),
+        referenced_bytes: snap.referenced_bytes,
+        seq: snap.seq,
+        identity: None,
+      },
+    )?;
     Ok(())
   }
 

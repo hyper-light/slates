@@ -108,6 +108,53 @@ impl<T> Slab<T> {
     Ok(Handle::new(index, 0))
   }
 
+  /// Places `value` at exactly `index` with `generation` and returns the handle `(index,
+  /// generation)`. For rebuilding a slab from a durable image where the handle *is* the identity —
+  /// a snapshot id is its slot and generation (§4.8), so a client's id must resolve to the same
+  /// slot after recovery: the caller replays the live entries in ascending index order into a fresh
+  /// slab and each lands at the exact slot a client still holds, gaps (destroyed entries) becoming
+  /// reusable vacant slots on the free list. The contract is append-extending — `index` must be at
+  /// or beyond the slots created so far — so no free-list surgery is needed; a lower index (a
+  /// duplicate or out-of-order entry, only possible from a corrupt image) is refused with
+  /// `OutOfRange`, and an index at or past the bound with `SlabFull`.
+  pub fn insert_at(
+    &mut self,
+    index: u32,
+    generation: u32,
+    value: T,
+  ) -> Result<Handle<T>, MemError> {
+    let target = usize::try_from(index).unwrap_or(usize::MAX);
+    if target >= self.max_slots {
+      return Err(MemError::SlabFull {
+        capacity: self.max_slots,
+      });
+    }
+    if target < self.slots.len() {
+      return Err(MemError::OutOfRange {
+        offset: target,
+        len: self.slots.len(),
+      });
+    }
+    // Fill the gap [slots.len(), index) with vacant slots threaded into the free list, so a
+    // destroyed entry's slot is reused by a later insert exactly as a fresh slab would reuse it.
+    while self.slots.len() < target {
+      let at = self.slots.push(Slot {
+        generation: 0,
+        body: Body::Vacant {
+          next_free: self.free_head,
+        },
+      });
+      self.free_head = Some(u32::try_from(at).unwrap_or(u32::MAX));
+    }
+    // The gap is filled, so this push lands at exactly `target`.
+    self.slots.push(Slot {
+      generation,
+      body: Body::Occupied(value),
+    });
+    self.len += 1;
+    Ok(Handle::new(index, generation))
+  }
+
   /// The value behind a live handle.
   pub fn get(&self, handle: Handle<T>) -> Result<&T, MemError> {
     match self
@@ -285,6 +332,56 @@ mod tests {
     }
     assert_eq!(slab.slots(), 256, "slots were reused, not grown");
     assert!(handles.iter().all(|h| !slab.contains(*h)));
+  }
+
+  #[test]
+  fn insert_at_rebuilds_exact_slots_and_leaves_the_gaps_reusable() {
+    // A slab rebuilt from a durable image (§4.8): live entries were at slots 1 and 3 (0 and 2 were
+    // destroyed). Replaying them in ascending order into a fresh slab must land them at exactly
+    // those handles — the identity a client still holds — and make the gaps reusable.
+    let mut slab: Slab<u64> = Slab::new(16, 256);
+    let h1 = slab.insert_at(1, 0, 111).unwrap();
+    let h3 = slab.insert_at(3, 2, 333).unwrap();
+    assert_eq!((h1.index(), h1.generation()), (1, 0));
+    assert_eq!((h3.index(), h3.generation()), (3, 2));
+    assert_eq!(*slab.get(h1).unwrap(), 111);
+    assert_eq!(
+      *slab.get(h3).unwrap(),
+      333,
+      "generation two was placed exactly"
+    );
+    assert_eq!(slab.len(), 2, "only the two live entries are occupied");
+    // The gap slots 0 and 2 are on the free list, so the next inserts reuse them, not a fourth slot.
+    let g_a = slab.insert(900).unwrap();
+    let g_b = slab.insert(901).unwrap();
+    let reused: HashSet<u32> = [g_a.index(), g_b.index()].into_iter().collect();
+    assert_eq!(
+      reused,
+      HashSet::from([0, 2]),
+      "the destroyed slots were reused"
+    );
+    assert_eq!(
+      slab.slots(),
+      4,
+      "no slot beyond the rebuilt extent was grown"
+    );
+  }
+
+  #[test]
+  fn insert_at_refuses_a_colliding_or_out_of_bound_index() {
+    let mut slab: Slab<u64> = Slab::new(16, 256);
+    slab.insert_at(1, 0, 111).unwrap();
+    slab.insert_at(3, 2, 333).unwrap();
+    // A lower (out-of-order or duplicate) index — only a corrupt image — is refused, not overwritten.
+    assert!(matches!(
+      slab.insert_at(1, 5, 7),
+      Err(MemError::OutOfRange { .. })
+    ));
+    // The bound still holds.
+    assert!(matches!(
+      slab.insert_at(256, 0, 7),
+      Err(MemError::SlabFull { capacity: 256 })
+    ));
   }
 
   #[test]
