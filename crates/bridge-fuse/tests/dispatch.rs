@@ -469,3 +469,32 @@ fn link_dispatches_and_returns_the_target_entry() {
     "LINK takes a lookup reference on the entry"
   );
 }
+
+/// READDIRPLUS is dispatched (it was ENOSYS before — audit BUG-7): each entry carries its
+/// attributes (a fuse_entry_out, so the kernel needs no follow-up LOOKUP) and takes a lookup
+/// reference, so the reply is larger than a plain readdir and the entry is referenced.
+#[test]
+fn readdirplus_dispatches_with_entry_attributes_and_references() {
+  let mut m = mock();
+  let mut out = [0u8; 1024];
+  let mut rd = vec![0u8; 24];
+  rd[16..20].copy_from_slice(&512u32.to_le_bytes()); // size
+  let n = dispatch(
+    &message(Opcode::ReadDirPlus.to_wire(), 1, 1, &rd),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(
+    u32::from_le_bytes(out[4..8].try_into().unwrap()),
+    0,
+    "READDIRPLUS succeeded (not ENOSYS)"
+  );
+  assert!(
+    n >= OUT_HEADER_LEN + EntryOut::LEN,
+    "the reply carries the entry's attributes (a fuse_entry_out), got {n} bytes"
+  );
+  assert_eq!(
+    m.referenced, 1,
+    "READDIRPLUS takes a lookup reference on each returned entry"
+  );
+}

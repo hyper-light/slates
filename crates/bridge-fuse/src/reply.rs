@@ -290,6 +290,28 @@ impl DirBuffer {
     true
   }
 
+  /// Adds a READDIRPLUS entry: the child's `fuse_entry_out` (its attributes and node id, so the
+  /// kernel caches the inode without a follow-up LOOKUP) followed by the same `fuse_dirent` as
+  /// [`DirBuffer::push`]. Returns false when it would exceed the request's size. The dirent's inode
+  /// is the entry's node id, so both halves name the same object.
+  pub fn push_plus(&mut self, entry: &EntryOut, offset: u64, kind: u32, name: &str) -> bool {
+    let dirent = (Self::DIRENT_HEAD + name.len()).next_multiple_of(Self::ALIGN);
+    let total = EntryOut::LEN.saturating_add(dirent);
+    if self.bytes.len().saturating_add(total) > self.max {
+      return false;
+    }
+    self.bytes.extend_from_slice(&entry.to_bytes());
+    let mut w = Writer::new();
+    w.u64(entry.nodeid);
+    w.u64(offset);
+    w.u32(u32::try_from(name.len()).unwrap_or(u32::MAX));
+    w.u32(kind);
+    w.bytes(name.as_bytes());
+    w.pad(dirent - Self::DIRENT_HEAD - name.len());
+    self.bytes.extend_from_slice(w.as_bytes());
+    true
+  }
+
   /// The accumulated entries.
   pub fn as_bytes(&self) -> &[u8] {
     &self.bytes

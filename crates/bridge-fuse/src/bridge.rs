@@ -92,6 +92,7 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     Opcode::Read => serve_read(bridge, &request, cx, out),
     Opcode::Write => serve_write(bridge, &request, cx, out),
     Opcode::ReadDir => serve_readdir(bridge, &request, cx, out),
+    Opcode::ReadDirPlus => serve_readdirplus(bridge, &request, cx, out),
     Opcode::Create => serve_create(bridge, &request, cx, out),
     Opcode::Release | Opcode::ReleaseDir => serve_release(bridge, &request, cx, out),
     // FSYNC/FSYNCDIR are flush-equivalent for slates: the data is already in the anchor segment,
@@ -404,6 +405,53 @@ fn serve_readdir(
     }
     Err(e) => reply_err(req.header.unique, e, out),
   }
+}
+
+fn serve_readdirplus(
+  bridge: &mut dyn Bridge,
+  req: &Request<'_>,
+  cx: &OpContext,
+  out: &mut [u8],
+) -> usize {
+  let Ok(r) = ReadIn::parse(Opcode::ReadDirPlus.to_wire(), req.body) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  let object = match resolve(bridge, cx, req.header.nodeid) {
+    Ok(object) => object,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
+  let entries = match bridge.readdir(object, cx, r.fh, r.offset) {
+    Ok(entries) => entries,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
+  let mut dir = DirBuffer::new(usize::try_from(r.size).unwrap_or(0));
+  for (index, entry) in entries.iter().enumerate() {
+    let cookie = r.offset.saturating_add(index as u64).saturating_add(1);
+    let child = ObjectId::new(entry.ino, 0);
+    // Each entry carries its attributes so the kernel needs no follow-up LOOKUP. Attributes are
+    // best-effort; an entry whose attributes cannot be fetched is skipped rather than failing the
+    // whole listing.
+    let Ok(node) = bridge.getattr(child, cx) else {
+      continue;
+    };
+    // READDIRPLUS takes a lookup reference on each child it returns (like LOOKUP), except the
+    // synthetic "." and ".." which the kernel handles specially and never forgets. If the entry
+    // does not fit, undo the reference and stop.
+    let synthetic = entry.name == "." || entry.name == "..";
+    if !synthetic && bridge.reference(child, cx).is_err() {
+      break;
+    }
+    if !dir.push_plus(&entry_out(&node), cookie, dtype(entry.kind), &entry.name) {
+      if !synthetic {
+        bridge.forget(child, cx, 1);
+      }
+      break;
+    }
+  }
+  write_or_drop(
+    ReplyHeader::write_ok(req.header.unique, dir.as_bytes(), out),
+    out,
+  )
 }
 
 fn serve_create(
