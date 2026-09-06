@@ -14,11 +14,43 @@
 use memmap2::MmapMut;
 
 use crate::error::MemError;
+use crate::shared::SharedObject;
+
+/// What backs a region's bytes: a private anonymous mapping (the default, process-local, gone at
+/// exit), or a shared memory object (§4.7, `SharedObject`) that survives the process and is
+/// re-attached by a restarted daemon through its handoff. The arena addresses bytes the same way
+/// over either; only the survival and ownership differ, which is what backing content in the anchor
+/// (§4.8 recovery) needs. Both expose their bytes through safe accessors, so this adds no unsafe.
+#[derive(Debug)]
+enum Backing {
+  /// A private anonymous mapping, faulted in by the pre-fault scheduler; lost when the process
+  /// exits.
+  Anon(MmapMut),
+  /// A shared memory object the region owns; its bytes outlive the process and a restarted daemon
+  /// maps the same object, so content placed here recovers (§4.8).
+  Shared(SharedObject),
+}
+
+impl Backing {
+  fn bytes(&self) -> &[u8] {
+    match self {
+      Backing::Anon(map) => map,
+      Backing::Shared(object) => object.bytes(),
+    }
+  }
+
+  fn bytes_mut(&mut self) -> &mut [u8] {
+    match self {
+      Backing::Anon(map) => map,
+      Backing::Shared(object) => object.bytes_mut(),
+    }
+  }
+}
 
 /// A mapped region.
 #[derive(Debug)]
 pub struct Region {
-  map: MmapMut,
+  backing: Backing,
   page: usize,
   locked: bool,
   huge: bool,
@@ -37,12 +69,28 @@ impl Region {
     })?;
     let huge = huge && advise_huge(&map);
     Ok(Region {
-      map,
+      backing: Backing::Anon(map),
       page,
       locked: false,
       huge,
       numa_node: 0,
     })
+  }
+
+  /// A region backed by a shared memory object it takes ownership of (§4.7, §4.8): the bytes live
+  /// in the object, so they survive the process and a restarted daemon re-maps the same object to
+  /// recover them. Used to back the store's content arena in anchor-owned RAM rather than a private
+  /// mapping, so an agent's writes survive a daemon crash (BUG-11). The object's length (rounded to
+  /// whole `page`s) is the region's length; `huge` is not asked of a shared object here.
+  pub fn shared(object: SharedObject, page: usize) -> Region {
+    let page = page.max(1);
+    Region {
+      backing: Backing::Shared(object),
+      page,
+      locked: false,
+      huge: false,
+      numa_node: 0,
+    }
   }
 
   /// Maps a region with the page facts and the huge-page decision taken from the profile.
@@ -56,17 +104,17 @@ impl Region {
 
   /// The base address.
   pub fn base(&self) -> *const u8 {
-    self.map.as_ptr()
+    self.backing.bytes().as_ptr()
   }
 
   /// Length in bytes.
   pub fn len(&self) -> usize {
-    self.map.len()
+    self.backing.bytes().len()
   }
 
   /// Whether the region is empty (never, for a mapped region).
   pub fn is_empty(&self) -> bool {
-    self.map.is_empty()
+    self.backing.bytes().is_empty()
   }
 
   /// The page size the region was mapped with.
@@ -100,7 +148,12 @@ impl Region {
     if self.locked {
       return Ok(());
     }
-    os::lock(&mut self.map)?;
+    match &mut self.backing {
+      Backing::Anon(map) => os::lock(map)?,
+      // The shared object locks its whole mapping into RAM (the same `mlock`/`VirtualLock` D-12
+      // cites); a restarted daemon re-locks it after re-mapping.
+      Backing::Shared(object) => object.lock()?,
+    }
     self.locked = true;
     Ok(())
   }
@@ -108,7 +161,12 @@ impl Region {
   /// Unlocks the region.
   pub fn unlock(&mut self) {
     if self.locked {
-      os::unlock(&mut self.map);
+      match &mut self.backing {
+        Backing::Anon(map) => os::unlock(map),
+        // A shared object holds its lock until it is dropped; there is no partial unlock verb, and
+        // a region that owns one is unlocked exactly when it (and the object) drop.
+        Backing::Shared(_) => {}
+      }
       self.locked = false;
     }
   }
@@ -118,28 +176,30 @@ impl Region {
   pub fn touch_pages(&mut self, from_page: usize, to_page: usize) {
     let pages = self.pages();
     let to = to_page.min(pages);
+    let page = self.page;
+    let bytes = self.backing.bytes_mut();
     let mut p = from_page;
     while p < to {
-      let at = p * self.page;
-      self.map[at] = 0;
-      std::hint::black_box(&self.map[at]);
+      let at = p * page;
+      bytes[at] = 0;
+      std::hint::black_box(&bytes[at]);
       p += 1;
     }
   }
 
   /// Pages in the region.
   pub fn pages(&self) -> usize {
-    self.map.len() / self.page
+    self.backing.bytes().len() / self.page
   }
 
   /// The bytes.
   pub fn bytes(&self) -> &[u8] {
-    &self.map
+    self.backing.bytes()
   }
 
   /// The bytes, mutably.
   pub fn bytes_mut(&mut self) -> &mut [u8] {
-    &mut self.map
+    self.backing.bytes_mut()
   }
 }
 
