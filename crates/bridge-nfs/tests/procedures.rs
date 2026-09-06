@@ -12,7 +12,7 @@ use slates_bridge_nfs::mount::MountReply;
 use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
 use slates_bridge_nfs::procedures::{
   Export, NFSPROC3_ACCESS, NFSPROC3_FSINFO, NFSPROC3_FSSTAT, NFSPROC3_GETATTR, NFSPROC3_NULL,
-  NFSPROC3_READ, NFSPROC3_WRITE,
+  NFSPROC3_READ, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_WRITE,
 };
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_db::catalog::{Principal, VolumeId};
@@ -612,5 +612,185 @@ fn a_write_through_a_read_only_export_is_refused() {
     XdrReader::new(&rreply).u32().unwrap(),
     Nfsstat3::Ok.wire(),
     "but a read-only export can READ"
+  );
+}
+
+/// REMOVE over the export unlinks the name from its directory: afterwards a LOOKUP of the name is
+/// NFS3ERR_NOENT, and the reply carries the directory's post-op attributes (wcc_data).
+#[test]
+fn a_remove_over_the_export_unlinks_the_name() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  bridge
+    .create(oid(root_ino), &cx, "doomed", 0o644, 0)
+    .unwrap();
+
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = match export.mnt("/") {
+    MountReply::Ok { handle, .. } => handle,
+    MountReply::Err(status) => panic!("MNT failed: {status:?}"),
+  };
+
+  // REMOVE "doomed" from the root.
+  let mut args = XdrWriter::new();
+  root_fh.encode(&mut args);
+  args.opaque("doomed".as_bytes());
+  let reply = export
+    .serve_nfs(NFSPROC3_REMOVE, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut rr = XdrReader::new(&reply);
+  assert_eq!(rr.u32().unwrap(), Nfsstat3::Ok.wire(), "REMOVE succeeded");
+  assert!(!rr.bool().unwrap(), "wcc: no pre-op attributes");
+  PostOpAttr::decode(&mut rr)
+    .unwrap()
+    .0
+    .expect("dir post attrs");
+
+  // LOOKUP of the removed name now misses.
+  let mut la = XdrWriter::new();
+  root_fh.encode(&mut la);
+  la.opaque("doomed".as_bytes());
+  let lreply = export.lookup(&mut XdrReader::new(la.as_slice()));
+  assert_eq!(
+    XdrReader::new(&lreply).u32().unwrap(),
+    Nfsstat3::Noent.wire(),
+    "the removed name is gone"
+  );
+}
+
+/// RMDIR over the export removes an empty directory; its name then misses.
+#[test]
+fn a_rmdir_over_the_export_removes_the_directory() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  bridge.mkdir(oid(root_ino), &cx, "sub", 0o755).unwrap();
+
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = match export.mnt("/") {
+    MountReply::Ok { handle, .. } => handle,
+    MountReply::Err(status) => panic!("MNT failed: {status:?}"),
+  };
+
+  let mut args = XdrWriter::new();
+  root_fh.encode(&mut args);
+  args.opaque("sub".as_bytes());
+  let reply = export
+    .serve_nfs(NFSPROC3_RMDIR, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&reply).u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "RMDIR of an empty directory succeeds"
+  );
+
+  let mut la = XdrWriter::new();
+  root_fh.encode(&mut la);
+  la.opaque("sub".as_bytes());
+  let lreply = export.lookup(&mut XdrReader::new(la.as_slice()));
+  assert_eq!(
+    XdrReader::new(&lreply).u32().unwrap(),
+    Nfsstat3::Noent.wire(),
+    "the directory is gone"
+  );
+}
+
+/// RENAME over the export moves an entry: the old name misses and the new name resolves to the same
+/// object (same fileid).
+#[test]
+fn a_rename_over_the_export_moves_the_entry() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (created, _fh) = bridge
+    .create(oid(root_ino), &cx, "before", 0o644, 0)
+    .unwrap();
+  let file_ino = created.ino;
+
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = match export.mnt("/") {
+    MountReply::Ok { handle, .. } => handle,
+    MountReply::Err(status) => panic!("MNT failed: {status:?}"),
+  };
+
+  // RENAME "before" -> "after", both under the root.
+  let mut args = XdrWriter::new();
+  root_fh.encode(&mut args);
+  args.opaque("before".as_bytes());
+  root_fh.encode(&mut args);
+  args.opaque("after".as_bytes());
+  let reply = export
+    .serve_nfs(NFSPROC3_RENAME, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&reply).u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "RENAME succeeded"
+  );
+
+  // The old name misses.
+  let mut la = XdrWriter::new();
+  root_fh.encode(&mut la);
+  la.opaque("before".as_bytes());
+  let lold = export.lookup(&mut XdrReader::new(la.as_slice()));
+  assert_eq!(
+    XdrReader::new(&lold).u32().unwrap(),
+    Nfsstat3::Noent.wire(),
+    "the old name is gone"
+  );
+
+  // The new name resolves to the same object.
+  let mut na = XdrWriter::new();
+  root_fh.encode(&mut na);
+  na.opaque("after".as_bytes());
+  let lnew = export.lookup(&mut XdrReader::new(na.as_slice()));
+  let mut nr = XdrReader::new(&lnew);
+  assert_eq!(
+    nr.u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "the new name resolves"
+  );
+  let _fh = Nfsfh3::decode(&mut nr).unwrap();
+  let attr = PostOpAttr::decode(&mut nr)
+    .unwrap()
+    .0
+    .expect("object attrs");
+  assert_eq!(
+    attr.fileid, file_ino,
+    "the same object moved to the new name"
   );
 }

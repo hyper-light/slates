@@ -15,7 +15,8 @@
 //! inode-addressed interface. The remaining namespace and directory procedures are owed.
 
 use slates_bridge_core::{
-  AttachmentId, Attachments, Bridge, FsStat, NodeAttr, ObjectId, OpContext, Rights, View,
+  AttachmentId, Attachments, Bridge, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, Rights,
+  View,
 };
 use slates_db::catalog::{Principal, VolumeId};
 use slates_vfs::error::VfsError;
@@ -42,6 +43,12 @@ pub const NFSPROC3_ACCESS: u32 = 4;
 pub const NFSPROC3_READ: u32 = 6;
 /// Format: NFSPROC3_WRITE — write data to a file.
 pub const NFSPROC3_WRITE: u32 = 7;
+/// Format: NFSPROC3_REMOVE — remove a file (a directory entry) from a directory.
+pub const NFSPROC3_REMOVE: u32 = 12;
+/// Format: NFSPROC3_RMDIR — remove a directory from its parent.
+pub const NFSPROC3_RMDIR: u32 = 13;
+/// Format: NFSPROC3_RENAME — rename an entry from one directory to another.
+pub const NFSPROC3_RENAME: u32 = 14;
 /// Format: NFSPROC3_FSSTAT — dynamic filesystem statistics (space and file counts).
 pub const NFSPROC3_FSSTAT: u32 = 18;
 /// Format: NFSPROC3_FSINFO — static filesystem limits and capabilities.
@@ -228,6 +235,9 @@ impl<'b> Export<'b> {
       NFSPROC3_ACCESS => Some(self.access(args)),
       NFSPROC3_READ => Some(self.read(args)),
       NFSPROC3_WRITE => Some(self.write(args)),
+      NFSPROC3_REMOVE => Some(self.remove(args, false)),
+      NFSPROC3_RMDIR => Some(self.remove(args, true)),
+      NFSPROC3_RENAME => Some(self.rename(args)),
       NFSPROC3_FSSTAT => Some(self.fsstat(args)),
       NFSPROC3_FSINFO => Some(self.fsinfo(args)),
       _ => None,
@@ -444,6 +454,123 @@ impl<'b> Export<'b> {
   /// `FILE_SYNC`, no client resend depends on this today.
   fn write_verifier(&self) -> [u8; size_of::<u64>()] {
     self.fsid().to_be_bytes()
+  }
+
+  /// NFSPROC3_REMOVE / NFSPROC3_RMDIR: remove a name from a directory over the shared interface
+  /// under the export's context (`is_dir` selects `rmdir` for a directory, `unlink` otherwise). The
+  /// reply is the directory's `wcc_data` — its post-operation attributes, so the client refreshes
+  /// its cached link count without a follow-up GETATTR.
+  pub fn remove(&mut self, args: &mut XdrReader<'_>, is_dir: bool) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    match self.remove_result(args, is_dir) {
+      Ok(dir_post) => {
+        Nfsstat3::Ok.encode(&mut writer);
+        encode_wcc(&mut writer, Some(dir_post));
+      }
+      Err((status, dir_post)) => {
+        status.encode(&mut writer);
+        encode_wcc(&mut writer, dir_post);
+      }
+    }
+    writer.into_bytes()
+  }
+
+  fn remove_result(
+    &mut self,
+    args: &mut XdrReader<'_>,
+    is_dir: bool,
+  ) -> Result<Fattr3, (Nfsstat3, Option<Fattr3>)> {
+    // `diropargs3`: the directory handle then the name.
+    let dir_handle = Nfsfh3::decode(args).map_err(|_| (Nfsstat3::Badhandle, None))?;
+    let name = args
+      .string(NFS_MAXNAMELEN)
+      .map_err(|_| (Nfsstat3::Inval, None))?
+      .to_owned();
+    let dir_identity = self
+      .resolve_handle(&dir_handle)
+      .map_err(|status| (status, None))?;
+    let cx = self.op_context().map_err(|e| (nfsstat_of(&e), None))?;
+    let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
+    let outcome = if is_dir {
+      self.bridge.rmdir(parent, &cx, &name)
+    } else {
+      self.bridge.unlink(parent, &cx, &name)
+    };
+    // The directory's post-op attributes (its new link count) go in the wcc whether the remove
+    // succeeded or failed.
+    let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
+    match outcome {
+      Ok(()) => dir_post.ok_or((Nfsstat3::ServerFault, None)),
+      Err(e) => Err((nfsstat_of(&e), dir_post)),
+    }
+  }
+
+  /// NFSPROC3_RENAME: move an entry from one directory to another over the shared interface under
+  /// the export's context. NFSv3 RENAME carries no `renameat2` flags — it replaces an existing
+  /// destination — so the neutral call uses the default flags. The reply is the source and
+  /// destination directories' `wcc_data`.
+  pub fn rename(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let (status, from_post, to_post) = self.do_rename(args);
+    let mut writer = XdrWriter::new();
+    status.encode(&mut writer);
+    encode_wcc(&mut writer, from_post); // fromdir_wcc
+    encode_wcc(&mut writer, to_post); // todir_wcc
+    writer.into_bytes()
+  }
+
+  /// Decodes the two `diropargs3` and performs the rename, returning the reply status and both
+  /// directories' post-op attributes for the `wcc_data`. The attributes are carried on the failure
+  /// path too (RFC 1813 answers RENAME with both dirs' wcc regardless), `None` only when a
+  /// directory handle itself does not resolve. A tuple, not a `Result`, so the two-attribute
+  /// payload is never a large `Err` variant.
+  fn do_rename(&mut self, args: &mut XdrReader<'_>) -> (Nfsstat3, Option<Fattr3>, Option<Fattr3>) {
+    // Two `diropargs3`: the source directory and name, then the destination directory and name.
+    // The names are owned because a second handle is decoded from `args` between them.
+    let from_dir_fh = match Nfsfh3::decode(args) {
+      Ok(fh) => fh,
+      Err(_) => return (Nfsstat3::Badhandle, None, None),
+    };
+    let from_name = match args.string(NFS_MAXNAMELEN) {
+      Ok(name) => name.to_owned(),
+      Err(_) => return (Nfsstat3::Inval, None, None),
+    };
+    let to_dir_fh = match Nfsfh3::decode(args) {
+      Ok(fh) => fh,
+      Err(_) => return (Nfsstat3::Badhandle, None, None),
+    };
+    let to_name = match args.string(NFS_MAXNAMELEN) {
+      Ok(name) => name.to_owned(),
+      Err(_) => return (Nfsstat3::Inval, None, None),
+    };
+    let from_identity = match self.resolve_handle(&from_dir_fh) {
+      Ok(id) => id,
+      Err(status) => return (status, None, None),
+    };
+    let to_identity = match self.resolve_handle(&to_dir_fh) {
+      Ok(id) => id,
+      Err(status) => return (status, None, None),
+    };
+    let cx = match self.op_context() {
+      Ok(cx) => cx,
+      Err(e) => return (nfsstat_of(&e), None, None),
+    };
+    let from_parent = ObjectId::new(from_identity.inode, from_identity.generation);
+    let to_parent = ObjectId::new(to_identity.inode, to_identity.generation);
+    let outcome = self.bridge.rename(
+      from_parent,
+      to_parent,
+      &cx,
+      &from_name,
+      &to_name,
+      RenameFlags::default(),
+    );
+    let from_post = self.attrs_of(&from_identity).ok().map(|n| self.fattr3(&n));
+    let to_post = self.attrs_of(&to_identity).ok().map(|n| self.fattr3(&n));
+    let status = match outcome {
+      Ok(()) => Nfsstat3::Ok,
+      Err(e) => nfsstat_of(&e),
+    };
+    (status, from_post, to_post)
   }
 
   /// NFSPROC3_FSSTAT: the volume's dynamic statistics — space and file counts — from the shared
