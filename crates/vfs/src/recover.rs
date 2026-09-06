@@ -208,13 +208,13 @@ pub struct VolumeImage {
   pub inodes: Vec<InodeImage>,
 }
 
-/// One volume's image under the opaque routing key its owner (the server) files it by. The key is
-/// a `u64` this crate does not interpret — the server maps its volume id onto it — so a whole shard
-/// of volumes recovers without vfs knowing what a volume id is.
+/// One volume's image under the routing key its owner (the server) files it by — the volume id's
+/// sixteen bytes, which this crate does not interpret, so a whole shard of volumes recovers without
+/// vfs knowing what a volume id is beyond its width.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub struct KeyedImage {
-  /// The owner's routing key for the volume.
-  pub key: u64,
+  /// The owner's routing key for the volume (a volume id's bytes).
+  pub key: [u8; 16],
   /// The volume's image.
   pub image: VolumeImage,
 }

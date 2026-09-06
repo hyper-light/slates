@@ -250,6 +250,13 @@ fn a_volume_survives_a_content_object_handoff() {
   );
 }
 
+/// A sixteen-byte routing key with a distinguishing final byte (a stand-in volume id).
+fn key_bytes(n: u8) -> [u8; 16] {
+  let mut key = [0u8; 16];
+  key[15] = n;
+  key
+}
+
 /// A scratch volume with the given inode-number prefix, for a multi-volume shard.
 fn prefixed_volume(store: &mut slates_vfs::volume::Store, prefix: u16) -> Volume {
   Volume::create(
@@ -285,11 +292,11 @@ fn a_whole_shard_of_volumes_survives_a_content_object_handoff() {
   // The running daemon publishes the whole shard into its one content object.
   let shard = ShardImage::new(vec![
     KeyedImage {
-      key: 7,
+      key: key_bytes(7),
       image: a.to_image(&original).unwrap(),
     },
     KeyedImage {
-      key: 8,
+      key: key_bytes(8),
       image: b.to_image(&original).unwrap(),
     },
   ]);
@@ -303,8 +310,12 @@ fn a_whole_shard_of_volumes_survives_a_content_object_handoff() {
   let recovered = ShardImage::read_from(reattached.bytes())
     .unwrap()
     .expect("the shard image is present after the handoff");
-  let keys: Vec<u64> = recovered.volumes.iter().map(|v| v.key).collect();
-  assert_eq!(keys, vec![7, 8], "both volumes recovered, in key order");
+  let keys: Vec<[u8; 16]> = recovered.volumes.iter().map(|v| v.key).collect();
+  assert_eq!(
+    keys,
+    vec![key_bytes(7), key_bytes(8)],
+    "both volumes recovered, in key order"
+  );
 
   let mut fresh = store();
   for keyed in &recovered.volumes {
@@ -318,7 +329,7 @@ fn a_whole_shard_of_volumes_survives_a_content_object_handoff() {
     assert_eq!(
       vol.to_image(&fresh).unwrap(),
       keyed.image,
-      "volume with key {} rebuilds faithfully",
+      "volume with key {:?} rebuilds faithfully",
       keyed.key
     );
   }
