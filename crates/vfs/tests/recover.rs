@@ -17,7 +17,8 @@ use slates_vfs::ids::InodeNo;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::{BudgetGrowth, Quota};
 use slates_vfs::recover::{
-  BodyImage, InodeImage, KeyedImage, KindImage, PolicyImage, ShardImage, SharedSource, VolumeImage,
+  BodyImage, EntryImage, InodeImage, KeyedImage, KindImage, PolicyImage, ShardImage, SharedSource,
+  VolumeImage,
 };
 use slates_vfs::volume::{Volume, VolumeConfig};
 
@@ -1150,4 +1151,78 @@ fn a_corrupt_or_foreign_image_is_refused_not_read_as_empty() {
   let mut trailing = good.clone();
   trailing.push(0);
   assert!(refused(&trailing), "trailing bytes after a whole image");
+}
+
+/// A hostile-input gate on the *framed, double-buffered* production path (`read_from`, what
+/// `recover_images` calls on a possibly-corrupt anchor content object): a huge frame length must not
+/// allocate (the length is checked against the buffer before any decode — no OOM), bit-flipped or
+/// payload-corrupt content commits nothing (the CRC catches it), and none of it panics or is read as
+/// a garbage success. This is the entry a corrupt anchor object actually reaches on a restart.
+#[test]
+fn a_hostile_framed_content_object_never_allocates_or_panics() {
+  let image = image_with(b"payload-bytes");
+  let mut buf = vec![0u8; CONTENT_LEN];
+  image.write_to(&mut buf).unwrap();
+  assert!(
+    VolumeImage::read_from(&buf).unwrap().is_some(),
+    "the well-formed framed object reads back"
+  );
+
+  // A frame length of u32::MAX in the committed slot's header: `unframe` checks the length against
+  // the slot before decoding, so it refuses without allocating gigabytes. With the other slot empty,
+  // recovery reads None — never a hang or an out-of-memory abort.
+  let mut huge = buf.clone();
+  huge[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+  assert!(
+    !matches!(VolumeImage::read_from(&huge), Ok(Some(_))),
+    "a u32::MAX frame length refuses without allocating, never a garbage success"
+  );
+
+  // Every byte flipped: every slot's CRC fails, so nothing is committed — never a garbage decode.
+  let mut flipped = buf.clone();
+  for b in flipped.iter_mut() {
+    *b ^= 0xA5;
+  }
+  assert!(
+    !matches!(VolumeImage::read_from(&flipped), Ok(Some(_))),
+    "bit-flipped content commits nothing"
+  );
+
+  // A single byte flipped inside the committed slot's payload: the CRC catches it and, with no other
+  // valid slot, recovery reads None (the caller then refuses) rather than a torn image.
+  let mut torn = buf.clone();
+  torn[16] ^= 0xFF;
+  assert!(
+    !matches!(VolumeImage::read_from(&torn), Ok(Some(_))),
+    "a payload byte corrupted under a valid length is caught by the CRC"
+  );
+}
+
+/// A hostile-input gate on the *rebuild* (`from_image`): an image that decodes as well-formed `Wire`
+/// but is semantically malformed — a directory entry naming an inode that is not in the image — is
+/// refused with a typed [`VfsError::RecoveryIncomplete`], never a panic and never a half-built volume
+/// (referential integrity is checked as the tree is rebuilt, so a crafted image cannot corrupt).
+#[test]
+fn a_semantically_malformed_image_is_refused_by_the_rebuild() {
+  let mut image = image_with(b"x");
+  let root_no = image.root_no;
+  // Craft a dangling reference: the root directory gains an entry naming an inode that does not exist.
+  for inode in &mut image.inodes {
+    if inode.no == root_no
+      && let BodyImage::Directory { entries } = &mut inode.body
+    {
+      entries.push(EntryImage {
+        name: "dangling".to_string(),
+        child: 999_999,
+      });
+    }
+  }
+  let mut fresh = store();
+  assert!(
+    matches!(
+      Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16),
+      Err(VfsError::RecoveryIncomplete)
+    ),
+    "a dangling directory reference is refused by the rebuild, not panicked or half-built"
+  );
 }
