@@ -614,3 +614,52 @@ fn version_reservation_moves_on_resize_scenario() {
 fn the_inode_reservation_moves_with_the_allowance_on_resize() {
   version_reservation_moves_on_resize_scenario();
 }
+
+/// The shard's version-slab reservation is observable in the daemon status (§4.2 "statfs includes
+/// backed inode availability", at the shard level): the reported slab capacity is the configured
+/// one, and committed version slots move as a volume's inode allowance is reserved.
+fn version_stats_scenario() {
+  let (daemon, instance) = capped_daemon("version-stats", SMALL_VERSION_SLAB);
+  let mut client = Client::connect(&instance);
+  let stats = |client: &mut Client| -> (u64, u64) {
+    let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+      panic!("daemon status");
+    };
+    let slots = report
+      .shards
+      .iter()
+      .map(|s| s.version_slots)
+      .max()
+      .unwrap_or(0);
+    let committed = report.shards.iter().map(|s| s.committed_versions).sum();
+    (slots, committed)
+  };
+  let (slots, before) = stats(&mut client);
+  assert_eq!(
+    slots,
+    u64::try_from(SMALL_VERSION_SLAB).unwrap(),
+    "the reported version slab is the configured capacity"
+  );
+  assert_eq!(before, 0, "no volumes yet, nothing committed to the slab");
+  let ReplyBody::Created { .. } = client.call(&RequestBody::Create {
+    name: "vol".into(),
+    size: SizeClass::Bounded { limit: 1 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("create");
+  };
+  let (_, after) = stats(&mut client);
+  assert!(
+    after > before,
+    "a volume's inode allowance is committed against the version slab: {after}"
+  );
+  daemon.stop();
+}
+
+/// AC-2: §4.2 shard-level version-slab availability is surfaced in the daemon status.
+#[test]
+fn the_daemon_status_reports_the_shards_version_slab_reservation() {
+  version_stats_scenario();
+}

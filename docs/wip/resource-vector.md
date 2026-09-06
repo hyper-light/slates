@@ -221,9 +221,11 @@ each refused (`BudgetExceeded`) *while physical slots plainly remain* — the di
 bare cap does not give — and one more is admitted once destroy returns the first's slots. It is
 non-vacuous two ways: neutered to `reserve(0)`, the reservation test creates the second volume and
 fails; and run against the pre-reorder ordering (reservation after `Volume::create`), the leak probes
-turn into `SlabFull` by the fourth attempt as leaked partial volumes fill the trie slab. `statfs` reporting backed
-inode availability at the *shard* level (the reserve's remaining credits, beside the per-volume
-`allowance − live` it already reports) is a second surface, owed with a status-wire field. Resize
+turn into `SlabFull` by the fourth attempt as leaked partial volumes fill the trie slab. Shard-level
+availability is now a second surface too: the daemon status carries the version slab's capacity and
+committed slots (`ShardReport::version_slots`/`committed_versions`, beside the byte reserve it already
+reports, and the per-volume `allowance − live` the mounted `statfs` reports), gated in
+`crates/server/tests/daemon.rs` (committed slots move as a volume's allowance is reserved). Resize
 re-derives the allowance and grows/shrinks its version reservation (grow-first, shrink-after, with a
 resize-up refused whole before anything changes if the slab cannot back it; gated in
 `crates/server/tests/daemon.rs`, non-vacuous — the pre-resize code leaves the resized volume's old

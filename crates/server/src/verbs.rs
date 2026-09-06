@@ -686,6 +686,8 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     torn_tail: state.recovered.torn,
     reserve_bytes: state.store.budget.capacity(),
     committed_bytes: state.store.budget.committed(),
+    version_slots: state.store.versions.capacity(),
+    committed_versions: state.store.versions.committed(),
     signals,
   }
 }

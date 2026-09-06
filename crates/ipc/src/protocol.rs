@@ -264,6 +264,10 @@ pub struct ShardReport {
   pub reserve_bytes: u64,
   /// Bytes committed to bounded volumes.
   pub committed_bytes: u64,
+  /// The shard's inode-version slab capacity (§4.2 inode dimension).
+  pub version_slots: u64,
+  /// Version slots committed to volumes' reserved inode allowances.
+  pub committed_versions: u64,
   /// The health signals.
   pub signals: Vec<Signal>,
 }
