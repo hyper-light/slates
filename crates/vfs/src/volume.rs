@@ -2078,7 +2078,14 @@ impl Volume {
       None => 0,
     };
     if remaining == 0 && self.orphans.remove(&no) {
-      self.reclaim_inode(store, no)?;
+      // Reclaim only if the inode is still unlinked. A re-link — a future `LINK` /
+      // `linkat(AT_EMPTY_PATH)` on the still-open inode — revives it with a name, and it must not
+      // be reclaimed then. No operation can re-link a nameless orphan today, so this guards that
+      // owed operation rather than fixing a reachable bug.
+      let nlink = self.inode(store, no).map(|i| i.attrs.nlink).unwrap_or(0);
+      if nlink == 0 {
+        self.reclaim_inode(store, no)?;
+      }
     }
     Ok(())
   }
