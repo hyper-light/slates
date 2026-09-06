@@ -1,7 +1,8 @@
 //! The client's tests (Phase 2 task 5; §4.4, §4.7, §4.9, AC-2.3's idempotency half): the
 //! typed verbs over an in-process daemon, and a session that outlives a daemon restart: the
 //! same client reconnects under its id and its retry meets the completion record; the
-//! volume is rebuilt from the recovered catalog; a second client cannot take a live session.
+//! volume and its snapshot are recovered from anchor-owned RAM; a second client cannot take a
+//! live session.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -196,21 +197,25 @@ fn the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed() {
 }
 
 /// After the restart: the client's next call reconnects under its id and is served by the
-/// restarted daemon, which rebuilt the volume; the local-only snapshot was reconciled away.
+/// restarted daemon, which rebuilt the volume and recovered its snapshot from anchor-owned RAM.
 fn assert_served_after_restart(
   client: &mut Client,
   kept: slates_client::VolumeId,
   session: slates_client::Session,
+  snapshot: slates_client::SnapshotId,
 ) {
   let report = client.status(kept).unwrap();
   assert_eq!(report.name, "kept");
   assert_eq!(client.reconnects(), 1, "one reconnect, under the old id");
   assert_eq!(client.client_id(), session.client_id);
   assert_eq!(
-    report.snapshots, 0,
-    "a snapshot held only in the old process's memory is reconciled out of the catalog"
+    report.snapshots, 1,
+    "the snapshot's content was recovered from anchor-owned RAM (§4.8), not reconciled away"
   );
-  assert_eq!(report.head.value, 0, "and the head is reset");
+  assert_eq!(
+    report.head.value, snapshot.value,
+    "and the head still points at the recovered snapshot"
+  );
 }
 
 /// Exactly-once across the restart: the retry answers from the replayed completion record.
@@ -241,9 +246,9 @@ fn assert_retry_meets_record(
 
 /// A session outlives a daemon restart over the same segment (the test plays the anchor):
 /// the client's next call finds the daemon gone, reconnects under its id and is served by
-/// the restarted daemon, which rebuilt the volume from the recovered catalog; its retry of
-/// the create it made before meets the completion record (the same id, no second volume);
-/// a local-only snapshot is reconciled away; a second client cannot take the live session.
+/// the restarted daemon, which recovered the volume and its snapshot from anchor-owned RAM; its
+/// retry of the create it made before meets the completion record (the same id, no second
+/// volume); a second client cannot take the live session.
 #[test]
 fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record() {
   let profile = profile();
@@ -275,12 +280,12 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
   let mut client = connect(&instance);
   let kept = client.create(&scratch("kept")).unwrap();
   let create_id = client.last_request();
-  let _snapshot = client.snapshot(kept).unwrap();
+  let snapshot = client.snapshot(kept).unwrap();
   assert_eq!(client.status(kept).unwrap().snapshots, 1);
   let session = client.session();
   first.stop();
   let second = Daemon::start(&profile, config, source()).unwrap();
-  assert_served_after_restart(&mut client, kept, session);
+  assert_served_after_restart(&mut client, kept, session, snapshot);
   assert_retry_meets_record(&mut client, kept, create_id);
   // New work continues under the session's sequence.
   let more = client.create(&scratch("more")).unwrap();

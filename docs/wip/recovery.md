@@ -152,12 +152,24 @@ volume.
 - **Crash-during-publish (double buffering).** The single-slot frame detects a torn write but does
   not keep the prior good image across one; the database's two-slot, sequence-numbered publish
   (`replay.rs`) is the pattern to adopt so a crash mid-publish recovers the last complete image.
-- **Fidelity extensions.** CoW snapshots and clone lineage; referenced-but-unlinked orphans
-  (§4.6 lifetime across a restart); base-backed volumes (a live base restored only through retained
-  handles or validated source identity — "reopening a path alone cannot substitute another base");
-  the live pressure source of a dynamic quota (re-supplied on recovery like the clock).
-- **§4.2 reservation accounting.** The admission invariant against physically-backed capacity, the
-  resource vector, and its typed refusals (tracked as BUG-1/2/3 in the ledger).
+- **Snapshot recovery.** *(Landed.)* `to_image`/`from_image` capture and rebuild every CoW snapshot
+  with the tree frozen at it; ids (slot + generation) are reproduced so a `SnapshotId` a client held
+  still resolves, and metadata (referenced_bytes, seq, links, head pointer) is restored. The daemon
+  publishes after `Snapshot` and keeps recovered snapshots in `reconcile_lost`, so a snapshot
+  **survives a real daemon restart** (the client restart test asserts survival, not reconciliation).
+  Gates: a recovered snapshot's tree is independent of the head's (CoW *sharing* is a §4.2 efficiency
+  refinement) and its deadlist is empty (reclaiming its unique bytes on drop is owed) — neither a
+  content-correctness issue.
+- **Other fidelity extensions.** Clone lineage (a clone pins an origin snapshot); referenced-but-
+  unlinked orphans (§4.6 lifetime across a restart); base-backed volumes (a live base restored only
+  through retained handles or validated source identity — "reopening a path alone cannot substitute
+  another base"); the live pressure source of a dynamic quota (re-supplied on recovery like the
+  clock).
+- **§4.2 reservation accounting.** BUG-2 (admit against usable arena capacity) and BUG-1 (a strict
+  volume locks its RAM or refuses) are landed. Still owed: BUG-3 (dynamic growth must consult the
+  live shard budget, not machine RAM — needs the vfs↔server write-path coupling, Phase-4-exercised),
+  the resource vector (per-volume inode/namespace/xattr allowances), and the non-doubling in-place
+  size (`Region::shared` backing the arena rather than copying content into the image).
 - **NFS durability gate.** `WRITE` currently returns `FILE_SYNC` (`crates/bridge-nfs`); once the
   image is published durably this becomes truthful for daemon-crash survival, but anchor RAM alone
   does not satisfy NFS's power-failure stable-storage contract (RFC 1813 §§3.3.7, 4.8) — recorded

@@ -794,6 +794,7 @@ fn mutates_shard_image(body: &RequestBody) -> bool {
       | RequestBody::Clone { .. }
       | RequestBody::Resize { .. }
       | RequestBody::Destroy { .. }
+      | RequestBody::Snapshot { .. }
   )
 }
 
@@ -2269,15 +2270,44 @@ fn build_recovered_volume(
 /// attachments) dropped, so the caller reports the loss rather than implying it was recovered. A
 /// placed snapshot (one durably held elsewhere) is not dropped here; only local, content-less
 /// snapshots are. This is the honest reconciliation until content is anchor-backed (BUG-11).
+/// Whether the volume's recovery image rebuilt this snapshot into the vfs volume (§4.8), so it is
+/// kept rather than reconciled out of the catalog. The db snapshot id packs the vfs snapshot's slot
+/// and generation as `(index << 32) | generation`.
+fn recovered_snapshot(
+  state: &ShardState,
+  handle: Option<Handle<VolumeSlot>>,
+  id: DbSnapshotId,
+) -> bool {
+  let Some(handle) = handle else {
+    return false;
+  };
+  let Ok(slot) = state.volumes.get(handle) else {
+    return false;
+  };
+  let vfs_id = slates_vfs::ids::SnapshotId {
+    index: u32::try_from(id.value >> u32::BITS).unwrap_or(u32::MAX),
+    generation: u32::try_from(id.value & u64::from(u32::MAX)).unwrap_or(u32::MAX),
+  };
+  slot.volume.snapshot_info(vfs_id).is_ok()
+}
+
 fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usize) {
   let now = state.clock.monotonic_ns();
-  let lost: Vec<DbSnapshotId> = state
+  // Local-only snapshots that the volume's recovery image did not bring back are genuinely lost and
+  // reconciled out of the catalog; one the image *did* rebuild (§4.8) is kept, so its content and
+  // the head that points at it survive the restart.
+  let candidates: Vec<DbSnapshotId> = state
     .db
     .partition()
     .snapshots_of(record.id)
     .iter()
     .filter(|s| matches!(s.placed, PlacementState::Local))
     .map(|s| s.id)
+    .collect();
+  let handle = state.by_id.get(&record.id).copied();
+  let lost: Vec<DbSnapshotId> = candidates
+    .into_iter()
+    .filter(|id| !recovered_snapshot(state, handle, *id))
     .collect();
   let mut snapshots = 0;
   for id in &lost {
