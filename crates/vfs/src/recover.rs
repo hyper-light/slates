@@ -35,6 +35,7 @@ use crate::ids::{Epoch, InodeNo, SnapshotId};
 use crate::inode::{Attrs, Body, Home, Inode, Kind};
 use crate::names::NameEquivalence;
 use crate::quota::Quota;
+use crate::snapshot::{Deadlist, Snapshot};
 use crate::trie::{self, TrieNode};
 use crate::volume::{Store, Volume, VolumeSeed};
 
@@ -630,6 +631,14 @@ const fn snap_ref(id: SnapshotId) -> SnapshotRef {
   }
 }
 
+/// The snapshot id an image reference names.
+const fn to_snapshot_id(r: SnapshotRef) -> SnapshotId {
+  SnapshotId {
+    index: r.index,
+    generation: r.generation,
+  }
+}
+
 /// The kind an image kind names.
 const fn kind_from_image(kind: KindImage) -> Kind {
   match kind {
@@ -705,15 +714,90 @@ impl Volume {
     };
     let mut vol = Volume::recovery_shell(store, seed, clock, journal_bytes)?;
 
-    let kinds: BTreeMap<u64, KindImage> = image.inodes.iter().map(|i| (i.no, i.kind)).collect();
-    let mut dirs: BTreeMap<u64, Handle<DirNode>> = BTreeMap::new();
-    dirs.insert(root_no.0, vol.root);
+    // The head, into the shell's roots.
+    vol.rebuild_passes(store, &image.inodes, root_no, epoch)?;
+    // The head's accounting is head-reachable content only; keep it aside so the snapshot rebuilds
+    // (which write through the same counters) do not perturb it.
+    let head_bytes = vol.bytes.clone();
 
-    vol.place_inodes(store, image, root_no, epoch, &mut dirs)?;
-    vol.rebuild_entries(store, image, &kinds, &dirs)?;
-    vol.fill_content(store, image)?;
-    vol.restore_identities(store, image)?;
+    // Each snapshot, into its own roots, in id order so a fresh slab reproduces its id.
+    let mut snapshots: Vec<&SnapshotImage> = image.snapshots.iter().collect();
+    snapshots.sort_by_key(|s| (s.id.index, s.id.generation));
+    for snap in snapshots {
+      vol.rebuild_snapshot(store, snap, root_no)?;
+    }
+    vol.bytes = head_bytes;
+    vol.last_snapshot = image.last_snapshot.map(to_snapshot_id);
     Ok(vol)
+  }
+
+  /// Runs the rebuild passes for one tree (the head or a snapshot) against the volume's current
+  /// roots and epoch: place every inode at its number, rebuild directory entries, fill file content
+  /// through the write path, then restore each inode's true identity.
+  fn rebuild_passes(
+    &mut self,
+    store: &mut Store,
+    inodes: &[InodeImage],
+    root_no: InodeNo,
+    epoch: Epoch,
+  ) -> Result<(), VfsError> {
+    let kinds: BTreeMap<u64, KindImage> = inodes.iter().map(|i| (i.no, i.kind)).collect();
+    let mut dirs: BTreeMap<u64, Handle<DirNode>> = BTreeMap::new();
+    dirs.insert(root_no.0, self.root);
+    self.place_inodes(store, inodes, root_no, epoch, &mut dirs)?;
+    self.rebuild_entries(store, inodes, &kinds, &dirs)?;
+    self.fill_content(store, inodes)?;
+    self.restore_identities(store, inodes)?;
+    Ok(())
+  }
+
+  /// Rebuilds one copy-on-write snapshot into its own roots at its epoch, then registers it (§4.8).
+  /// The volume's head roots and epoch are saved and restored around the rebuild, and its quota is
+  /// lifted for it, because a snapshot's retained content is written through the same path as the
+  /// head's but must not be charged against the head's quota (it is not head-reachable). The
+  /// snapshot's tree is independent of the head's (its sharing is a §4.2 efficiency refinement) and
+  /// its deadlist is empty (reclaiming a recovered snapshot's unique bytes on drop is owed).
+  fn rebuild_snapshot(
+    &mut self,
+    store: &mut Store,
+    snap: &SnapshotImage,
+    root_no: InodeNo,
+  ) -> Result<(), VfsError> {
+    let saved = (self.epoch, self.root, self.inode_root);
+    let saved_quota = std::mem::replace(&mut self.quota, Quota::Bounded { limit: u64::MAX });
+    let epoch = Epoch(snap.epoch);
+    self.epoch = epoch;
+    self.inode_root = trie::new_root(&mut store.tries, epoch)?;
+    let root_handle = store
+      .inodes
+      .insert(Inode::new(root_no, epoch, Kind::Dir, 0, Body::None))?;
+    self.table_set(store, root_no, root_handle)?;
+    let root_dir = store.dirs.insert(DirNode::new(epoch, None, root_no, ""))?;
+    store.inodes.get_mut(root_handle)?.body = Body::Directory(root_dir);
+    self.root = root_dir;
+
+    let outcome = self.rebuild_passes(store, &snap.inodes, root_no, epoch);
+
+    let (root, inode_root) = (self.root, self.inode_root);
+    self.quota = saved_quota;
+    self.epoch = saved.0;
+    self.root = saved.1;
+    self.inode_root = saved.2;
+    outcome?;
+
+    self.snapshots.insert(Snapshot {
+      epoch,
+      root,
+      inode_root,
+      deadlist: Deadlist::default(),
+      clone_refs: snap.clone_refs,
+      previous: snap.previous.map(to_snapshot_id),
+      next: snap.next.map(to_snapshot_id),
+      referenced_bytes: snap.referenced_bytes,
+      seq: snap.seq,
+      identity: None,
+    })?;
+    Ok(())
   }
 
   /// Pass one: place every non-root inode at its own number, born at the head epoch, with a fresh
@@ -722,12 +806,12 @@ impl Volume {
   fn place_inodes(
     &mut self,
     store: &mut Store,
-    image: &VolumeImage,
+    inodes: &[InodeImage],
     root_no: InodeNo,
     epoch: Epoch,
     dirs: &mut BTreeMap<u64, Handle<DirNode>>,
   ) -> Result<(), VfsError> {
-    for image_inode in &image.inodes {
+    for image_inode in inodes {
       let no = InodeNo(image_inode.no);
       if no == root_no {
         continue;
@@ -745,11 +829,11 @@ impl Volume {
   fn rebuild_entries(
     &mut self,
     store: &mut Store,
-    image: &VolumeImage,
+    inodes: &[InodeImage],
     kinds: &BTreeMap<u64, KindImage>,
     dirs: &BTreeMap<u64, Handle<DirNode>>,
   ) -> Result<(), VfsError> {
-    for image_inode in &image.inodes {
+    for image_inode in inodes {
       let BodyImage::Directory { entries } = &image_inode.body else {
         continue;
       };
@@ -767,8 +851,8 @@ impl Volume {
 
   /// Pass three: fill every non-empty file's content through the write path, so the chunk store and
   /// quota accounting end where a live write would leave them.
-  fn fill_content(&mut self, store: &mut Store, image: &VolumeImage) -> Result<(), VfsError> {
-    for image_inode in &image.inodes {
+  fn fill_content(&mut self, store: &mut Store, inodes: &[InodeImage]) -> Result<(), VfsError> {
+    for image_inode in inodes {
       if let BodyImage::File { bytes } = &image_inode.body
         && !bytes.is_empty()
       {
@@ -781,8 +865,12 @@ impl Volume {
   /// Pass four: restore each inode's true identity — generation, birth epoch, version, multi-link
   /// flag, home and exact attributes — over the placeholders the earlier passes left (the write
   /// path stamped fresh times and sizes; here they become the image's).
-  fn restore_identities(&mut self, store: &mut Store, image: &VolumeImage) -> Result<(), VfsError> {
-    for image_inode in &image.inodes {
+  fn restore_identities(
+    &mut self,
+    store: &mut Store,
+    inodes: &[InodeImage],
+  ) -> Result<(), VfsError> {
+    for image_inode in inodes {
       let no = InodeNo(image_inode.no);
       let handle =
         trie::get(&store.tries, self.inode_root, no).ok_or(VfsError::RecoveryIncomplete)?;

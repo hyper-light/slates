@@ -409,6 +409,53 @@ fn to_image_captures_a_snapshots_frozen_content() {
   );
 }
 
+/// AC (§4.8, A-9): a volume with a copy-on-write snapshot rebuilds faithfully — the rebuilt
+/// volume re-images byte-identically (head and snapshot content, snapshot ids and metadata all
+/// came back), the head serves its post-snapshot content by inode number, and the snapshot serves
+/// its frozen content through the same snapshot id the original issued (so the id survived).
+#[test]
+fn a_volume_with_a_snapshot_rebuilds_faithfully() {
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let f = vol.create_file_no(&mut src, root, "f", 0o644).unwrap();
+  vol.write(&mut src, f, 0, b"v1").unwrap();
+  let snap = vol.snapshot(&mut src).unwrap();
+  vol.write(&mut src, f, 0, b"v2-modified").unwrap();
+  vol.create_file_no(&mut src, root, "g", 0o644).unwrap();
+
+  let original = vol.to_image(&src).unwrap();
+
+  let mut fresh = store();
+  let recovered = Volume::from_image(
+    &mut fresh,
+    &original,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+  )
+  .unwrap();
+
+  assert_eq!(
+    recovered.to_image(&fresh).unwrap(),
+    original,
+    "the volume with a snapshot re-images identically after rebuild"
+  );
+
+  let mut buf = vec![0u8; 16];
+  let n = recovered.read(&fresh, f, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..n],
+    b"v2-modified",
+    "the head serves its post-snapshot content"
+  );
+  let n = recovered.read_in(&fresh, snap, f, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..n],
+    b"v1",
+    "the recovered snapshot serves its frozen content through the original snapshot id"
+  );
+}
+
 /// AC (§4.8): an image round-trips through its content bytes unchanged — the exact state a
 /// restarted daemon would read back equals what the running one published.
 #[test]
