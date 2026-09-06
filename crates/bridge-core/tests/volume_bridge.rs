@@ -47,6 +47,36 @@ fn rw_cx() -> OpContext {
   )
 }
 
+/// Two read-write current-view contexts for two distinct attachments of the same volume, minted
+/// from one registry so they hold different attachment keys (two mounts of one volume).
+fn two_rw_contexts() -> (OpContext, OpContext) {
+  let mut attachments = Attachments::new();
+  let rights = Rights {
+    read: true,
+    write: true,
+  };
+  let a = attachments
+    .attach(
+      VolumeId { bytes: [0; 16] },
+      View::Current,
+      Principal::Uid { uid: 0 },
+      rights,
+    )
+    .unwrap();
+  let b = attachments
+    .attach(
+      VolumeId { bytes: [0; 16] },
+      View::Current,
+      Principal::Uid { uid: 0 },
+      rights,
+    )
+    .unwrap();
+  (
+    attachments.context(a).unwrap(),
+    attachments.context(b).unwrap(),
+  )
+}
+
 /// The object at inode `ino` (generation zero — the volume core does not yet track generations, so
 /// every live object's generation is zero and identity is the never-reused inode number, D-4).
 fn oid(ino: u64) -> ObjectId {
@@ -424,4 +454,40 @@ fn readdir_synthesizes_dot_and_dotdot() {
   let root_entries = bridge.readdir(oid(root), &cx, 0, 0).unwrap();
   let root_dotdot = root_entries.iter().find(|e| e.name == "..").unwrap();
   assert_eq!(root_dotdot.ino, root, "the root's '..' is the root itself");
+}
+
+/// The teardown sweep through the bridge (the FUSE unmount path — no per-inode FORGET): files a
+/// mount holds open or referenced are released when its attachment is swept, and an
+/// unlinked-but-referenced inode is reclaimed. A second attachment's references are untouched, so
+/// the sweep never reclaims an object another mount is serving.
+#[test]
+fn a_teardown_sweep_releases_one_attachments_references_through_the_bridge() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let (a, b) = two_rw_contexts();
+  let root = bridge.root(&a).unwrap();
+
+  // Attachment `a` creates the file (an open reference attributed to `a`); attachment `b` also
+  // references it (a lookup reference attributed to `b`).
+  let (attr, _fh) = bridge.create(oid(root), &a, "f", 0o644, 0).unwrap();
+  let ino = attr.ino;
+  bridge.reference(oid(ino), &b).unwrap();
+  bridge.unlink(oid(root), &a, "f").unwrap();
+
+  // Tear down attachment `a`: its open reference is swept, but `b` still holds the inode alive.
+  bridge.sweep_attachment(&a).unwrap();
+  assert!(
+    bridge.getattr(oid(ino), &b).is_ok(),
+    "attachment b still holds the inode after a's teardown"
+  );
+
+  // Tear down attachment `b`: no reference remains, so the unlinked inode is reclaimed.
+  bridge.sweep_attachment(&b).unwrap();
+  assert!(
+    bridge.getattr(oid(ino), &a).is_err(),
+    "reclaimed once the last attachment tears down"
+  );
+  // A second sweep of a drained attachment releases nothing (idempotent).
+  bridge.sweep_attachment(&a).unwrap();
 }

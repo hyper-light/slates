@@ -242,4 +242,9 @@ pub trait Bridge {
   /// transport that must detect a change between two calls uses it: the NFS `READDIR` cookieverf is
   /// this token, so a continuation against a directory mutated since the listing began is refused.
   fn change_token(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError>;
+  /// Releases every reference the attachment named by `cx` holds, in one bounded batch, reclaiming
+  /// the inodes that reach zero references and no links (§3 the teardown sweep). The transport edge
+  /// calls this once when an attachment ends — a FUSE unmount, a lost connection — since FUSE does
+  /// not guarantee a `FORGET` per outstanding reference. Idempotent.
+  fn sweep_attachment(&mut self, cx: &OpContext) -> Result<(), VfsError>;
 }

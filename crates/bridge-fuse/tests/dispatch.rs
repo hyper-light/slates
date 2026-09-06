@@ -22,6 +22,7 @@ struct Mock {
   content: Vec<u8>,
   forgotten: u64,
   referenced: u64,
+  swept: u64,
 }
 
 /// Format: the file mode of a regular file, and of a directory.
@@ -238,6 +239,10 @@ impl Bridge for Mock {
   fn change_token(&mut self, _object: ObjectId, _cx: &OpContext) -> Result<u64, VfsError> {
     Ok(0)
   }
+  fn sweep_attachment(&mut self, _cx: &OpContext) -> Result<(), VfsError> {
+    self.swept = self.swept.saturating_add(1);
+    Ok(())
+  }
 }
 
 /// A read-write current-view context, built through the attachment registry the way the daemon
@@ -284,6 +289,7 @@ fn mock() -> Mock {
     content: b"hello world".to_vec(),
     forgotten: 0,
     referenced: 0,
+    swept: 0,
   }
 }
 

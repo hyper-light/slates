@@ -91,6 +91,17 @@ struct Attachment {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttachmentId(Handle<Attachment>);
 
+impl AttachmentId {
+  /// A stable per-process key for this attachment: its slab index and generation packed into one
+  /// word. The volume core attributes references to an attachment by this opaque `u64`
+  /// ([`crate::VfsError`]-free), so a teardown sweep releases exactly this attachment's references.
+  /// It is process-local, not the durable §4.8 attachment id; reconciling the two is owed with the
+  /// server wiring.
+  pub fn key(self) -> u64 {
+    (u64::from(self.0.index()) << u32::BITS) | u64::from(self.0.generation())
+  }
+}
+
 /// The authenticated attachment/view context a request carries, constructed by the owner from a
 /// validated [`Attachment`] — never caller-declared. Read/write consult it for the view and the
 /// granted access; the transport edges carry it per request.
