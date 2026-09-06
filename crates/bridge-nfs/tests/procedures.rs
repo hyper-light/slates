@@ -12,8 +12,8 @@ use slates_bridge_nfs::mount::MountReply;
 use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
 use slates_bridge_nfs::procedures::{
   Export, NFSPROC3_ACCESS, NFSPROC3_CREATE, NFSPROC3_FSINFO, NFSPROC3_FSSTAT, NFSPROC3_GETATTR,
-  NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR,
-  NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE,
+  NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ, NFSPROC3_READLINK, NFSPROC3_REMOVE,
+  NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE,
 };
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_db::catalog::{Principal, VolumeId};
@@ -1212,5 +1212,67 @@ fn a_symlink_over_the_export_makes_a_link() {
     XdrReader::new(&lreply).u32().unwrap(),
     Nfsstat3::Ok.wire(),
     "the created link resolves"
+  );
+}
+
+/// READLINK returns a symlink's target over the export, and a READLINK of a non-symlink is
+/// NFS3ERR_INVAL — the target round-trips and a directory is refused, never mis-read.
+#[test]
+fn a_readlink_returns_the_target_and_refuses_a_non_symlink() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let made = bridge
+    .symlink(oid(root_ino), &cx, "ln", "the/target/path")
+    .unwrap();
+  let link_ino = made.ino;
+
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+
+  // READLINK the symlink: the target round-trips.
+  let link_fh = slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: link_ino,
+    generation: 0,
+  }
+  .to_fh();
+  let mut args = XdrWriter::new();
+  link_fh.encode(&mut args);
+  let reply = export
+    .serve_nfs(NFSPROC3_READLINK, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "READLINK succeeded");
+  PostOpAttr::decode(&mut r).unwrap();
+  let target = r.opaque(4096).unwrap();
+  assert_eq!(target, b"the/target/path", "the symlink target round-trips");
+
+  // READLINK a directory (the root) is INVAL.
+  let root_fh = slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: root_ino,
+    generation: 0,
+  }
+  .to_fh();
+  let mut da = XdrWriter::new();
+  root_fh.encode(&mut da);
+  let dreply = export
+    .serve_nfs(NFSPROC3_READLINK, &mut XdrReader::new(da.as_slice()))
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&dreply).u32().unwrap(),
+    Nfsstat3::Inval.wire(),
+    "READLINK of a non-symlink is INVAL"
   );
 }

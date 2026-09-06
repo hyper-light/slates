@@ -9,10 +9,11 @@
 //! the objects they return — no server-side open table. Every call rides the export's authenticated
 //! [`OpContext`], built from the attachment the export edge admits at mount time for the enrolled
 //! subject (§4.13): the seam checks the volume, rights and view, so a read against a read-only
-//! export or a foreign volume is refused before any effect, exactly as at the FUSE edge. This slice
-//! serves the metadata path a client walks first — MOUNT `MNT`, `NULL`, `GETATTR`, `LOOKUP`,
-//! `ACCESS`, `FSSTAT`, `FSINFO` — and the file I/O path, `READ` and `WRITE`, over the shared
-//! inode-addressed interface. The remaining namespace and directory procedures are owed.
+//! export or a foreign volume is refused before any effect, exactly as at the FUSE edge. The
+//! served set is the metadata path (MOUNT `MNT`, `NULL`, `GETATTR`, `SETATTR`, `LOOKUP`, `ACCESS`,
+//! `FSSTAT`, `FSINFO`), the file I/O path (`READ`, `WRITE`), and the namespace (`CREATE`, `MKDIR`,
+//! `SYMLINK`, `READLINK`, `REMOVE`, `RMDIR`, `RENAME`) — all over the shared inode-addressed
+//! interface. The directory-listing procedures (`READDIR`, `READDIRPLUS`) are owed.
 
 use slates_bridge_core::{
   AttachmentId, Attachments, Bridge, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, Rights,
@@ -47,6 +48,8 @@ pub const NFSPROC3_SYMLINK: u32 = 10;
 pub const NFSPROC3_LOOKUP: u32 = 3;
 /// Format: NFSPROC3_ACCESS — which operations the caller may perform on an object.
 pub const NFSPROC3_ACCESS: u32 = 4;
+/// Format: NFSPROC3_READLINK — read the target path of a symbolic link.
+pub const NFSPROC3_READLINK: u32 = 5;
 /// Format: NFSPROC3_READ — read data from a file.
 pub const NFSPROC3_READ: u32 = 6;
 /// Format: NFSPROC3_WRITE — write data to a file.
@@ -266,6 +269,7 @@ impl<'b> Export<'b> {
       NFSPROC3_GETATTR => Some(self.getattr(args)),
       NFSPROC3_SETATTR => Some(self.setattr(args)),
       NFSPROC3_LOOKUP => Some(self.lookup(args)),
+      NFSPROC3_READLINK => Some(self.readlink(args)),
       NFSPROC3_CREATE => Some(self.create(args)),
       NFSPROC3_MKDIR => Some(self.mkdir(args)),
       NFSPROC3_SYMLINK => Some(self.symlink(args)),
@@ -906,6 +910,50 @@ impl<'b> Export<'b> {
       ..changes
     };
     self.finish_create(object, &dir_identity, &cx, post_changes)
+  }
+
+  /// NFSPROC3_READLINK: read the target path of a symbolic link a handle names, over the shared
+  /// interface under the export's context. The reply carries the link's attributes and its target;
+  /// a handle that does not name a symlink is `NFS3ERR_INVAL`.
+  pub fn readlink(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    match self.readlink_result(args) {
+      Ok((attr, target)) => {
+        Nfsstat3::Ok.encode(&mut writer);
+        PostOpAttr(Some(attr)).encode(&mut writer);
+        writer.opaque(target.as_bytes());
+      }
+      Err((status, attr)) => {
+        status.encode(&mut writer);
+        PostOpAttr(attr).encode(&mut writer);
+      }
+    }
+    writer.into_bytes()
+  }
+
+  fn readlink_result(
+    &mut self,
+    args: &mut XdrReader<'_>,
+  ) -> Result<(Fattr3, String), (Nfsstat3, Option<Fattr3>)> {
+    let handle = Nfsfh3::decode(args).map_err(|_| (Nfsstat3::Badhandle, None))?;
+    let identity = self
+      .resolve_handle(&handle)
+      .map_err(|status| (status, None))?;
+    let node = self.attrs_of(&identity).map_err(|status| (status, None))?;
+    let attr = self.fattr3(&node);
+    // READLINK is meaningful only on a symbolic link (RFC 1813 §3.3.5).
+    if node.kind != Kind::Symlink {
+      return Err((Nfsstat3::Inval, Some(attr)));
+    }
+    let cx = self
+      .op_context()
+      .map_err(|e| (nfsstat_of(&e), Some(attr)))?;
+    let object = ObjectId::new(identity.inode, identity.generation);
+    let target = self
+      .bridge
+      .readlink(object, &cx)
+      .map_err(|e| (nfsstat_of(&e), Some(attr)))?;
+    Ok((attr, target))
   }
 
   /// The shared tail of CREATE, MKDIR and SYMLINK: apply the `sattr3` fields the creation did not
