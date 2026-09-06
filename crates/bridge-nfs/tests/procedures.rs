@@ -329,3 +329,40 @@ fn a_handle_to_a_reclaimed_inode_is_stale() {
     "a handle to a reclaimed inode is stale, not noent"
   );
 }
+
+/// Object identity survives copy-on-write: a handle taken before a write still names the same
+/// object after it (same fileid), with the updated size — the handle generation is stable across
+/// CoW, not the slab-slot generation (Ada review point 5).
+#[test]
+fn a_handle_survives_copy_on_write_of_its_object() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
+  let root_ino = bridge.root().unwrap();
+  let (created, fh) = bridge.create(root_ino, "f", 0o644, 0).unwrap();
+  let file_ino = created.ino;
+
+  // Take a handle, then write through the file (a copy-on-write of the inode version).
+  let handle = slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: file_ino,
+    generation: 0,
+  }
+  .to_fh();
+  bridge.write(file_ino, fh, 0, b"hello world").unwrap();
+
+  let mut export = Export::new(&mut bridge, VolumeId { bytes: [0x11; 16] });
+  let mut args = XdrWriter::new();
+  handle.encode(&mut args);
+  let reply = export
+    .serve_nfs(NFSPROC3_GETATTR, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire());
+  let attr = Fattr3::decode(&mut r).unwrap();
+  assert_eq!(
+    attr.fileid, file_ino,
+    "the handle names the same object after CoW"
+  );
+  assert_eq!(attr.size, 11, "with the written bytes");
+}
