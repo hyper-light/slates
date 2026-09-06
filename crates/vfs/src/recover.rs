@@ -35,7 +35,7 @@ use crate::ids::{Epoch, InodeNo, SnapshotId};
 use crate::inode::{Attrs, Body, Home, Inode, Kind};
 use crate::names::NameEquivalence;
 use crate::quota::Quota;
-use crate::snapshot::{Deadlist, Snapshot};
+use crate::snapshot::Snapshot;
 use crate::trie::{self, TrieNode};
 use crate::volume::{Store, Volume, VolumeSeed};
 
@@ -788,11 +788,14 @@ impl Volume {
     self.inode_root = saved.2;
     outcome?;
 
+    // A recovered snapshot's tree is independent, and `destroy_snapshot` reclaims only from the
+    // deadlist, so give it a deadlist of its whole tree — otherwise it leaks its tree on drop (§4.8).
+    let deadlist = crate::volume::tree_deadlist(store, root, inode_root);
     self.snapshots.insert(Snapshot {
       epoch,
       root,
       inode_root,
-      deadlist: Deadlist::default(),
+      deadlist,
       clone_refs: snap.clone_refs,
       previous: snap.previous.map(to_snapshot_id),
       next: snap.next.map(to_snapshot_id),

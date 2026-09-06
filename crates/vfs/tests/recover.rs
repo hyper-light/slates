@@ -547,6 +547,38 @@ fn a_volume_with_a_snapshot_rebuilds_faithfully() {
   );
 }
 
+/// AC (§4.8): dropping a recovered snapshot reclaims its tree. `destroy_snapshot` reclaims only from
+/// the snapshot's deadlist, and a recovered snapshot's tree is independent, so recovery must give it
+/// a deadlist of its whole tree — otherwise the snapshot's chunks leak on drop. With a chunked file
+/// snapshotted then overwritten, the recovered snapshot holds its own copy of the old chunks, and
+/// dropping it frees them (an empty deadlist, the bug, would free nothing).
+#[test]
+fn dropping_a_recovered_snapshot_frees_its_tree() {
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let f = vol.create_file_no(&mut src, root, "f", 0o644).unwrap();
+  vol
+    .write(&mut src, f, 0, b"content the snapshot keeps")
+    .unwrap();
+  let snap = vol.snapshot(&mut src).unwrap();
+
+  let image = vol.to_image(&src).unwrap();
+  let mut fresh = store();
+  let mut recovered =
+    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+
+  // The recovered snapshot is an independent tree (its own root and file inode), so dropping it must
+  // free those inode slab slots. An empty deadlist (the bug) would free nothing.
+  let before = fresh.inodes.len();
+  recovered.destroy_snapshot(&mut fresh, snap).unwrap();
+  let after = fresh.inodes.len();
+  assert!(
+    after < before,
+    "dropping the recovered snapshot freed its inodes ({before} -> {after})"
+  );
+}
+
 /// AC (§4.8): an image round-trips through its content bytes unchanged — the exact state a
 /// restarted daemon would read back equals what the running one published.
 #[test]

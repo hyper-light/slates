@@ -157,9 +157,12 @@ volume.
   still resolves, and metadata (referenced_bytes, seq, links, head pointer) is restored. The daemon
   publishes after `Snapshot` and keeps recovered snapshots in `reconcile_lost`, so a snapshot
   **survives a real daemon restart** (the client restart test asserts survival, not reconciliation).
-  Gates: a recovered snapshot's tree is independent of the head's (CoW *sharing* is a §4.2 efficiency
-  refinement) and its deadlist is empty (reclaiming its unique bytes on drop is owed) — neither a
-  content-correctness issue.
+  A recovered snapshot's tree is independent of the head's (CoW *sharing* is a §4.2 efficiency
+  refinement), and its deadlist is reconstructed from that tree (`tree_deadlist`), so dropping a
+  recovered snapshot reclaims it — `destroy_snapshot` reclaims only from the deadlist, so an empty
+  one would leak the whole tree (fixed and gated non-vacuously: dropping a recovered snapshot frees
+  its inodes; an empty deadlist frees nothing). CoW sharing between the head and recovered snapshots
+  is the one owed refinement.
 - **Clone recovery.** *(Content landed.)* A clone's image captures its whole tree (the bytes it
   inherited from the origin snapshot and the bytes it wrote after diverging), and `from_image`
   rebuilds it faithfully, keeping the inherited root inode number (fixed in

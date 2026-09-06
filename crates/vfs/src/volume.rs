@@ -2900,6 +2900,46 @@ pub(crate) fn clip_extents(
 /// Every directory node reachable from `root` and born after `since`; a node born at or before
 /// `since` is shared with the clone's origin and its subtree with it (a child's copy forces the
 /// parent's), so the walk visits only the volume's own nodes (§4.5, the clone destroy example).
+/// Every object a tree rooted at `dir_root`/`inode_root` reaches, as a deadlist (§4.8 recovery). A
+/// recovered snapshot's tree is independent (distinct handles from the head and other snapshots), so
+/// this is exactly what dropping the snapshot must reclaim — `destroy_snapshot` reclaims only from
+/// the deadlist, so a recovered snapshot needs one or it leaks its tree on drop. Chunks are freed
+/// with their inode versions (as [`Volume::destroy`]'s own walk relies on), so only nodes and inode
+/// versions are listed.
+pub(crate) fn tree_deadlist(
+  store: &Store,
+  dir_root: Handle<DirNode>,
+  inode_root: Handle<TrieNode>,
+) -> Deadlist {
+  let mut list = Deadlist::default();
+  let mut dirs = Vec::new();
+  let mut blocks = Vec::new();
+  collect_dirs(store, dir_root, None, &mut dirs, &mut blocks);
+  for d in &dirs {
+    if let Ok(node) = store.dirs.get(*d) {
+      list.push(Dead::Dir(*d, node.born));
+    }
+  }
+  for (block, born) in blocks {
+    list.push(Dead::DirBlock(block, born));
+  }
+  let mut inodes = Vec::new();
+  trie::walk_since(&store.tries, inode_root, None, &mut inodes);
+  for handle in inodes {
+    if let Ok(inode) = store.inodes.get(handle) {
+      list.push(Dead::Inode(handle, inode.born));
+    }
+  }
+  let mut tries = Vec::new();
+  trie::nodes_under_since(&store.tries, inode_root, None, &mut tries);
+  for handle in tries {
+    if let Ok(node) = store.tries.get(handle) {
+      list.push(Dead::Trie(handle, node.born));
+    }
+  }
+  list
+}
+
 fn collect_dirs(
   store: &Store,
   root: Handle<DirNode>,
