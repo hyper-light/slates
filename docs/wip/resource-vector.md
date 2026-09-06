@@ -147,8 +147,15 @@ remains"), and accepts again after an unlink frees one — proving the live coun
 
 So the applicable per-volume **caps** are in place (content=quota, inode, namespace, retention), and
 the inode dimension is now a full **reservation**: logical allowances reserved disjointly and retention
-charged from unpromised capacity. The remaining §4.2 refinements are the *byte* dimension's per-shard
-credit distribution (§4 below) and the handle charge.
+charged from unpromised capacity. The *byte* dimension's per-shard credit distribution is already
+disjoint by construction: each shard maps its own `Region` of `reserve_per_shard =
+lock_capacity / shards / classes` (crates/server/src/daemon.rs, `region_bytes`), so the shard budgets
+sum to at most the machine's lock capacity and no two shards are handed the same bytes — the "control
+owner distributes disjoint credits to shards" rule realized by disjoint arenas rather than a runtime
+hand-out. The only remaining §4.2 refinement is the **handle charge** — charging open handles (already
+bounded by the bridge's attachment `Slab`, BUG-4) against admission so they count toward the reservation;
+it is a fairness refinement over an already-safe bound, and it is cross-layer (the handles live in the
+bridge, the budget in the store), so it is left as a deliberate follow-up.
 
 ## 4. Full admission (beyond a cap)
 
