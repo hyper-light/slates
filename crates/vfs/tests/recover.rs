@@ -17,7 +17,7 @@ use slates_vfs::ids::InodeNo;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::Quota;
 use slates_vfs::recover::{
-  BodyImage, InodeImage, KeyedImage, KindImage, PolicyImage, ShardImage, VolumeImage,
+  BodyImage, InodeImage, KeyedImage, KindImage, PolicyImage, ShardImage, SharedSource, VolumeImage,
 };
 use slates_vfs::volume::{Volume, VolumeConfig};
 
@@ -733,7 +733,10 @@ fn a_snapshot_image_holds_a_delta_not_a_second_copy_of_the_head() {
   let image = vol.to_image(&src).unwrap();
   let snap = &image.snapshots[0];
   assert!(
-    snap.shared.contains(&unchanged.0),
+    snap
+      .shared
+      .iter()
+      .any(|s| s.number == unchanged.0 && s.source == SharedSource::Head),
     "the unchanged file is recorded as shared with the head"
   );
   assert!(
@@ -741,13 +744,88 @@ fn a_snapshot_image_holds_a_delta_not_a_second_copy_of_the_head() {
     "the unchanged file's bytes are not copied into the snapshot image"
   );
   assert!(
-    !snap.shared.contains(&diverged.0),
+    snap.shared.iter().all(|s| s.number != diverged.0),
     "the diverged file is not shared"
   );
   assert!(
     snap.inodes.iter().any(|i| i.no == diverged.0),
     "the diverged file is captured in full in the snapshot image"
   );
+}
+
+/// AC (§4.2/§4.8): a version frozen identically in two snapshots but diverged from the head — edit a
+/// file after a run of snapshots — is captured once, not once per snapshot. The later snapshot names
+/// the earlier as its source; the image omits the second copy; recovery rebuilds an independent copy
+/// so both snapshots serve the version through their own ids, and dropping one leaves the other
+/// readable (the copies are independent — no cross-snapshot double-free).
+#[test]
+fn a_version_shared_across_snapshots_is_captured_once_and_recovers_independently() {
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let f = vol.create_file_no(&mut src, root, "f", 0o644).unwrap();
+  vol.write(&mut src, f, 0, b"stable-value").unwrap();
+  let snap_a = vol.snapshot(&mut src).unwrap();
+  let snap_b = vol.snapshot(&mut src).unwrap(); // f unchanged between a and b
+  vol.write(&mut src, f, 0, b"edited-in-head").unwrap(); // f diverges from both snapshots
+
+  let image = vol.to_image(&src).unwrap();
+  let a = image
+    .snapshots
+    .iter()
+    .find(|s| s.id.index == snap_a.index)
+    .unwrap();
+  let b = image
+    .snapshots
+    .iter()
+    .find(|s| s.id.index == snap_b.index)
+    .unwrap();
+  assert!(
+    a.inodes.iter().any(|i| i.no == f.0),
+    "the earlier snapshot is the canonical holder of the shared version"
+  );
+  assert!(
+    b.inodes.iter().all(|i| i.no != f.0),
+    "the later snapshot does not carry a second copy of the shared version"
+  );
+  assert!(
+    b.shared.iter().any(|s| s.number == f.0
+      && matches!(s.source, SharedSource::Snapshot { at }
+        if at.index == snap_a.index && at.generation == snap_a.generation)),
+    "the later snapshot names the earlier as the source of the shared version"
+  );
+
+  let mut fresh = store();
+  let mut recovered =
+    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  assert_eq!(
+    recovered.to_image(&fresh).unwrap(),
+    image,
+    "the deduplicated image round-trips: the rebuilt store re-captures to the same image"
+  );
+  let mut buf = vec![0u8; 16];
+  let n = recovered.read_in(&fresh, snap_a, f, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..n],
+    b"stable-value",
+    "snapshot a serves the shared version"
+  );
+  let n = recovered.read_in(&fresh, snap_b, f, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..n],
+    b"stable-value",
+    "snapshot b serves the same version"
+  );
+
+  // The copies are independent: dropping a leaves b readable, then dropping b is clean.
+  recovered.destroy_snapshot(&mut fresh, snap_a).unwrap();
+  let n = recovered.read_in(&fresh, snap_b, f, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..n],
+    b"stable-value",
+    "dropping snapshot a does not free snapshot b's copy of the shared version"
+  );
+  recovered.destroy_snapshot(&mut fresh, snap_b).unwrap();
 }
 
 /// AC (§4.8): an image round-trips through its content bytes unchanged — the exact state a

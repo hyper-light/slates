@@ -193,6 +193,32 @@ pub struct SnapshotRef {
   pub generation: u32,
 }
 
+/// Where a snapshot's deduplicated file or symlink lives in the image (§4.2/§4.8): the head (a CoW
+/// handle it shares with the head; the rebuild shares the head's inode) or an earlier snapshot (a
+/// version byte-identical to one an earlier snapshot already captured; the rebuild reconstructs an
+/// independent copy from that snapshot's entry, so the recovered store is exactly what a full image
+/// would have rebuilt — only the image is smaller).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+pub enum SharedSource {
+  /// The version the head still holds, shared by CoW handle identity.
+  Head,
+  /// A byte-identical version an earlier snapshot captured in full.
+  Snapshot {
+    /// The snapshot that holds the canonical copy.
+    at: SnapshotRef,
+  },
+}
+
+/// A file or symlink a snapshot does not carry in its own `inodes` because an identical version is
+/// already in the image: its inode number and where the canonical copy is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+pub struct SharedInode {
+  /// The inode number in this snapshot.
+  pub number: u64,
+  /// Where the identical version already lives.
+  pub source: SharedSource,
+}
+
 /// One copy-on-write snapshot in the image (§4.8): its identity and accounting, its links to the
 /// neighbouring snapshots, and the tree frozen at it — every inode reachable from the snapshot's
 /// own inode table, with its content *as the snapshot holds it* (read through the snapshot, not the
@@ -214,15 +240,17 @@ pub struct SnapshotImage {
   pub previous: Option<SnapshotRef>,
   /// The next snapshot, if any.
   pub next: Option<SnapshotRef>,
-  /// The inodes private to the snapshot — its directories, and the files or symlinks that diverged
-  /// from the head — in number order. Files and symlinks it shares unchanged with the head are *not*
-  /// here; their numbers are in `shared` and their bytes live once, in the head's image.
+  /// The inodes the snapshot carries in full — its directories, and the files or symlinks whose
+  /// bytes are not already elsewhere in the image — in number order. A file or symlink that is
+  /// identical to the head's version, or to one an earlier snapshot already captured, is *not* here;
+  /// it is named in `shared`, so its bytes live once across the whole image.
   pub inodes: Vec<InodeImage>,
-  /// Numbers of files or symlinks the snapshot shares unchanged with the head (CoW handle identity
-  /// at capture time). The rebuild points the snapshot's table at the head's rebuilt inode for each,
-  /// so a heavily-snapshotted volume's image holds each unchanged file once, not once per snapshot —
-  /// the difference between an image that fits its content-object slice and a `RecoveryIncomplete`.
-  pub shared: Vec<u64>,
+  /// The files and symlinks the snapshot deduplicates against the head or an earlier snapshot
+  /// (§4.2/§4.8): each names its inode number and where the identical version lives, so a
+  /// heavily-snapshotted volume — the same file frozen in many snapshots, or edited after a run of
+  /// snapshots — holds each distinct version once, the difference between an image that fits its
+  /// content-object slice and a `RecoveryIncomplete`. Sorted by number for a deterministic image.
+  pub shared: Vec<SharedInode>,
 }
 
 /// A whole volume's recoverable state (§4.8, A-9). The inodes are in number order (the order the
@@ -504,7 +532,8 @@ impl Volume {
     store: &Store,
     snap_inode_root: Handle<TrieNode>,
     id: SnapshotId,
-  ) -> Result<(Vec<InodeImage>, Vec<u64>), VfsError> {
+    canonical: &mut BTreeMap<(u64, u32), Vec<(SnapshotRef, BodyImage)>>,
+  ) -> Result<(Vec<InodeImage>, Vec<SharedInode>), VfsError> {
     let mut handles = Vec::new();
     trie::walk(&store.tries, snap_inode_root, &mut handles);
     let mut inodes = Vec::with_capacity(handles.len());
@@ -512,26 +541,58 @@ impl Volume {
     for handle in handles {
       let inode = store.inodes.get(handle)?;
       let no = inode.no;
-      if matches!(inode.kind, Kind::File | Kind::Symlink)
-        && trie::get(&store.tries, self.inode_root, no) == Some(handle)
-      {
-        shared.push(no.0);
+      if !matches!(inode.kind, Kind::File | Kind::Symlink) {
+        // Directories are always carried in full; their entries are small and their structure is
+        // this snapshot's own.
+        inodes.push(self.image_of_inode(store, inode, Some(id))?);
         continue;
       }
-      inodes.push(self.image_of_inode(store, inode, Some(id))?);
+      // A file or symlink whose handle is the head's very handle is CoW-shared with the head; the
+      // rebuild shares the head's inode (O(1), no content to compare).
+      if trie::get(&store.tries, self.inode_root, no) == Some(handle) {
+        shared.push(SharedInode {
+          number: no.0,
+          source: SharedSource::Head,
+        });
+        continue;
+      }
+      // A version that diverged from the head: dedup it against earlier snapshots by content. The
+      // crc buckets the lookup; the body decides the match.
+      let image = self.image_of_inode(store, inode, Some(id))?;
+      let crc = body_crc(&image.body);
+      let bucket = canonical.entry((no.0, crc)).or_default();
+      if let Some((src, _)) = bucket.iter().find(|(_, body)| *body == image.body) {
+        shared.push(SharedInode {
+          number: no.0,
+          source: SharedSource::Snapshot { at: *src },
+        });
+        continue;
+      }
+      // This snapshot is the canonical holder of this version; record it for later snapshots.
+      bucket.push((snap_ref(id), image.body.clone()));
+      inodes.push(image);
     }
-    shared.sort_unstable();
+    shared.sort_by_key(|s| s.number);
     Ok((inodes, shared))
   }
 
   fn capture_snapshots(&self, store: &Store) -> Result<Vec<SnapshotImage>, VfsError> {
+    // Cross-snapshot content dedup: a file or symlink version captured in full by one snapshot is
+    // referenced, not re-captured, by a later snapshot that holds the byte-identical version. The
+    // map is (number, body crc) → the snapshots that captured that version in full, with the body
+    // kept to verify against a crc collision (a wrong match would corrupt content, so bytes decide,
+    // not the checksum). `self.snapshots.iter()` yields ascending slot order, which is ascending id
+    // order, and `from_image` rebuilds in the same order, so a reference always points to an
+    // already-captured, earlier-rebuilt canonical.
+    let mut canonical: BTreeMap<(u64, u32), Vec<(SnapshotRef, BodyImage)>> = BTreeMap::new();
     let mut out = Vec::with_capacity(self.snapshots.iter().count());
     for (handle, snap) in self.snapshots.iter() {
       let id = SnapshotId {
         index: handle.index(),
         generation: handle.generation(),
       };
-      let (inodes, shared) = self.capture_snapshot_tree(store, snap.inode_root, id)?;
+      let (inodes, shared) =
+        self.capture_snapshot_tree(store, snap.inode_root, id, &mut canonical)?;
       out.push(SnapshotImage {
         id: snap_ref(id),
         epoch: snap.epoch.0,
@@ -767,12 +828,28 @@ impl Volume {
     // unchanged with the head instead of rebuilding a private copy (§4.2 CoW-sharing efficiency).
     let head_inode_root = vol.inode_root;
     let head_images: BTreeMap<u64, &InodeImage> = image.inodes.iter().map(|i| (i.no, i)).collect();
+    let head = HeadRefs {
+      inode_root: head_inode_root,
+      images: &head_images,
+    };
 
-    // Each snapshot, into its own roots, in id order so a fresh slab reproduces its id.
+    // Each snapshot's own full inodes, keyed by (its id, number), so a later snapshot that
+    // deduplicated a byte-identical version against it can rebuild an independent copy from the
+    // canonical entry (§4.2 cross-snapshot dedup). Keyed by the id pair since `SnapshotRef` is not
+    // ordered.
+    let mut canonical_inode: BTreeMap<((u32, u32), u64), &InodeImage> = BTreeMap::new();
+    for snap in &image.snapshots {
+      for inode in &snap.inodes {
+        canonical_inode.insert(((snap.id.index, snap.id.generation), inode.no), inode);
+      }
+    }
+
+    // Each snapshot, into its own roots, in id order so a fresh slab reproduces its id and a
+    // cross-snapshot reference always resolves to an already-rebuilt canonical.
     let mut snapshots: Vec<&SnapshotImage> = image.snapshots.iter().collect();
     snapshots.sort_by_key(|s| (s.id.index, s.id.generation));
     for snap in snapshots {
-      vol.rebuild_snapshot(store, snap, root_no, head_inode_root, &head_images)?;
+      vol.rebuild_snapshot(store, snap, root_no, &head, &canonical_inode)?;
     }
     vol.bytes = head_bytes;
     vol.live_entries = head_entries;
@@ -811,9 +888,30 @@ impl Volume {
     store: &mut Store,
     snap: &SnapshotImage,
     root_no: InodeNo,
-    head_inode_root: Handle<TrieNode>,
-    head_images: &BTreeMap<u64, &InodeImage>,
+    head: &HeadRefs,
+    canonical_inode: &BTreeMap<((u32, u32), u64), &InodeImage>,
   ) -> Result<(), VfsError> {
+    // Expand the snapshot's deduplicated references back to a full inode list: its own full inodes,
+    // plus an independent copy of every version it deduplicated against an *earlier snapshot* (from
+    // that snapshot's canonical entry). A version it shares with the *head* stays a reference in
+    // `head_shared` — the rebuild points at the head's inode. So the recovered store is exactly what
+    // a full (non-deduplicated) image would have rebuilt: independent copies, correct deadlists.
+    let mut effective: Vec<InodeImage> = snap.inodes.clone();
+    let mut head_shared: BTreeSet<u64> = BTreeSet::new();
+    for entry in &snap.shared {
+      match entry.source {
+        SharedSource::Head => {
+          head_shared.insert(entry.number);
+        }
+        SharedSource::Snapshot { at: src } => {
+          let canonical = canonical_inode
+            .get(&((src.index, src.generation), entry.number))
+            .ok_or(VfsError::RecoveryIncomplete)?;
+          effective.push((*canonical).clone());
+        }
+      }
+    }
+
     let saved = (self.epoch, self.root, self.inode_root);
     let saved_quota = std::mem::replace(&mut self.quota, Quota::Bounded { limit: u64::MAX });
     let epoch = Epoch(snap.epoch);
@@ -827,20 +925,20 @@ impl Volume {
     store.inodes.get_mut(root_handle)?.body = Body::Directory(root_dir);
     self.root = root_dir;
 
-    let outcome =
-      self.rebuild_snapshot_tree(store, snap, root_no, epoch, head_inode_root, head_images);
+    let outcome = self.rebuild_snapshot_tree(store, &effective, &head_shared, root_no, epoch, head);
 
     let (root, inode_root) = (self.root, self.inode_root);
     self.quota = saved_quota;
     self.epoch = saved.0;
     self.root = saved.1;
     self.inode_root = saved.2;
-    let shared = outcome?;
+    outcome?;
 
     // `destroy_snapshot` reclaims only from the deadlist, so give it the snapshot's own objects —
     // but exclude inodes shared with the head, since freeing those on drop would corrupt the head
-    // (the double-free guard test proves this holds).
-    let deadlist = crate::volume::tree_deadlist_excluding(store, root, inode_root, &shared);
+    // (the double-free guard test proves this holds). Cross-snapshot copies are independent, so they
+    // belong to this snapshot's deadlist exactly as any diverged inode does.
+    let deadlist = crate::volume::tree_deadlist_excluding(store, root, inode_root, &head_shared);
     // Place the snapshot at the exact slot and generation it had before the crash: a `SnapshotId`
     // *is* its slab handle (§4.8), so a client that still holds the id must find the same snapshot
     // after recovery. `from_image` replays snapshots in ascending index order, so `insert_at`'s
@@ -871,28 +969,28 @@ impl Volume {
   fn rebuild_snapshot_tree(
     &mut self,
     store: &mut Store,
-    snap: &SnapshotImage,
+    effective: &[InodeImage],
+    head_shared: &BTreeSet<u64>,
     root_no: InodeNo,
     epoch: Epoch,
-    head_inode_root: Handle<TrieNode>,
-    head_images: &BTreeMap<u64, &InodeImage>,
-  ) -> Result<BTreeSet<u64>, VfsError> {
-    // `snap.shared` names the files and symlinks the snapshot shares unchanged with the head; their
-    // bytes were captured once, in the head's image. Point the snapshot's table at the head's rebuilt
-    // inode for each — the head is rebuilt before any snapshot — and take its kind from the head so
-    // the directory entries that reference it resolve.
-    let shared: BTreeSet<u64> = snap.shared.iter().copied().collect();
-    let mut kinds: BTreeMap<u64, KindImage> = snap.inodes.iter().map(|i| (i.no, i.kind)).collect();
-    for no in &snap.shared {
-      let head_image = head_images.get(no).ok_or(VfsError::RecoveryIncomplete)?;
+    head: &HeadRefs,
+  ) -> Result<(), VfsError> {
+    // `head_shared` names the files and symlinks the snapshot shares unchanged with the head; their
+    // bytes live once, in the head's image. Point the snapshot's table at the head's rebuilt inode
+    // for each — the head is rebuilt before any snapshot — and take its kind from the head so the
+    // directory entries that reference it resolve. `effective` is the snapshot's full inode list
+    // (its own, plus cross-snapshot copies already expanded), so everything else rebuilds here.
+    let mut kinds: BTreeMap<u64, KindImage> = effective.iter().map(|i| (i.no, i.kind)).collect();
+    for no in head_shared {
+      let head_image = head.images.get(no).ok_or(VfsError::RecoveryIncomplete)?;
       kinds.insert(*no, head_image.kind);
-      let head_handle = trie::get(&store.tries, head_inode_root, InodeNo(*no))
+      let head_handle = trie::get(&store.tries, head.inode_root, InodeNo(*no))
         .ok_or(VfsError::RecoveryIncomplete)?;
       self.table_set(store, InodeNo(*no), head_handle)?;
     }
     let mut dirs: BTreeMap<u64, Handle<DirNode>> = BTreeMap::new();
     dirs.insert(root_no.0, self.root);
-    for image_inode in &snap.inodes {
+    for image_inode in effective {
       let no = InodeNo(image_inode.no);
       if no == root_no {
         continue;
@@ -902,10 +1000,10 @@ impl Volume {
       let handle = store.inodes.insert(inode)?;
       self.table_set(store, no, handle)?;
     }
-    self.rebuild_entries(store, &snap.inodes, &kinds, &dirs)?;
-    self.fill_content(store, &snap.inodes)?;
-    self.restore_identities(store, &snap.inodes)?;
-    Ok(shared)
+    self.rebuild_entries(store, effective, &kinds, &dirs)?;
+    self.fill_content(store, effective)?;
+    self.restore_identities(store, effective)?;
+    Ok(())
   }
 
   /// Pass one: place every non-root inode at its own number, born at the head epoch, with a fresh
@@ -1003,6 +1101,26 @@ impl Volume {
 
 /// The body to place an inode with in pass one: a fresh directory node (recorded in `dirs`), a
 /// symlink's target, or an empty file body the write pass fills.
+/// The head's rebuilt inode table and each inode's image, so a snapshot rebuild can share an inode
+/// it holds unchanged with the head (§4.2 CoW-sharing) and take a shared inode's kind from the head.
+struct HeadRefs<'a> {
+  inode_root: Handle<TrieNode>,
+  images: &'a BTreeMap<u64, &'a InodeImage>,
+}
+
+/// A crc of a body's bytes, used only to bucket the cross-snapshot content dedup lookup (§4.2). The
+/// match is then decided by exact byte equality, so a crc collision costs one comparison, never a
+/// wrong dedup (which would corrupt content). Directories do not reach here (only files and symlinks
+/// are deduped); the arm exists to keep the match exhaustive.
+fn body_crc(body: &BodyImage) -> u32 {
+  match body {
+    BodyImage::File { bytes } => crc32c(bytes),
+    BodyImage::Symlink { target } => crc32c(target.as_bytes()),
+    BodyImage::Empty => crc32c(&[]),
+    BodyImage::Directory { .. } => 0,
+  }
+}
+
 fn body_for(
   store: &mut Store,
   image_inode: &InodeImage,

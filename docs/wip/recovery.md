@@ -177,31 +177,39 @@ volume.
   verified by disabling sharing at capture — a recovered snapshot with an unchanged file holds five
   inodes not six and both delta assertions fail without it.
 
-  The remaining efficiency step is *cross-snapshot* dedup: a version that diverged from the head but
-  is frozen identically in two or more snapshots (edit a long-stable file, having snapshotted it
-  repeatedly) is captured once per snapshot today, and rebuilt as an independent copy per snapshot.
-  This is *not* data-plane-gated — it is pure recovery code — but it is not a quick win either,
-  because it turns on the deadlist. The live deadlist is not a snapshot's whole tree: a snapshot
-  begins with an empty deadlist (`Volume::snapshot`) and gains an object only when the head diverges
-  from it, onto the *newest* snapshot; `destroy_snapshot` then migrates each object to the previous
-  snapshot if `dead.born() <= prev_epoch` (an older snapshot still holds it) and frees it only when
-  no older snapshot does — so an object is freed exactly when its last (oldest) referencing snapshot
-  is destroyed. The present rebuild reconstructs each deadlist independently with
-  `tree_deadlist_excluding`; that is correct *because snapshots are rebuilt as independent copies*,
-  so a version shared across snapshots becomes distinct inodes with distinct deadlist entries — no
-  leak, no double-free. Two correct ways forward, each a careful subsystem, not a line:
-  - **Store-sharing** the version across snapshots (one inode, as head-sharing does) requires
-    reconstructing deadlists *globally, newest-referencer-first* to match that migration invariant —
-    the shared inode must land on exactly one snapshot's deadlist (the newest live referencer), or a
-    drop double-frees it.
-  - **Image-only** dedup (share in the image, rebuild an independent copy) keeps the deadlists as
-    they are but breaks the byte-identical round-trip oracle unless capture dedups by *content*
-    rather than by handle — and content-dedup conflicts with the handle-identity that head-sharing
-    needs (store-sharing is sound only for a truly identical object, not a coincidentally-equal one).
+  **Cross-snapshot dedup — the image half — is landed.** A version that diverged from the head but
+  is frozen identically in two or more snapshots (edit a long-stable file after a run of snapshots)
+  used to be captured once per snapshot; now `capture_snapshots` carries a `(number, body crc) →
+  canonical` map across snapshots (the crc buckets the lookup; exact bytes decide the match, so a crc
+  collision costs a comparison, never a wrong dedup that would corrupt content), and a later snapshot
+  that holds a byte-identical version records a `SharedInode { number, source: Snapshot { at } }`
+  instead of a second copy — so the whole image holds each distinct version once. This is the
+  recoverability win: a repeatedly-snapshotted, then-edited volume's image fits its content-object
+  slice instead of overflowing to `RecoveryIncomplete`.
 
-  Until one is built, the case is bounded by image overflow being a typed refusal and by the store
-  copies being correct; the win it buys is a smaller image for a repeatedly-snapshotted, then-edited
-  file (recoverability) and a smaller store (efficiency).
+  The **rebuild expands** each cross-snapshot reference back to an *independent copy* from the
+  canonical entry (`rebuild_snapshot` builds the snapshot's effective inode list from its own inodes
+  plus those copies), so the recovered store is byte-identical to what a full, non-deduplicated image
+  would have rebuilt — the deadlists stay per-snapshot (`tree_deadlist_excluding`, head-shared
+  excluded), the copies are distinct inodes with distinct deadlist entries, and dropping one snapshot
+  never touches another's. This keeps the delicate part — the deadlist — untouched, and the
+  byte-identical round-trip oracle guards it: because capture dedups by *content*, the rebuilt
+  independent copies re-capture to the same deduplicated image, so `to_image(from_image) == image`
+  still holds (asserted in the cross-snapshot test). Gated in `crates/vfs/tests/recover.rs`
+  (`a_version_shared_across_snapshots_is_captured_once_and_recovers_independently`): the earlier
+  snapshot is the canonical, the later omits the copy and names the earlier as its source, the image
+  round-trips, both snapshots serve the version through their own ids, and dropping one leaves the
+  other readable — non-vacuously (disabling the content match makes the later snapshot carry a full
+  copy and the assertions fail).
+
+  What remains is the *store* half: the rebuild still holds one inode per snapshot for a shared
+  version (the image is compact, the store is not). Store-sharing it (one inode across snapshots, as
+  head-sharing does within the head) needs a *global, newest-referencer-first* deadlist
+  reconstruction to match the live migration invariant — a shared inode must land on exactly one
+  snapshot's deadlist (the newest live referencer, since `destroy_snapshot` migrates it to the
+  previous while `dead.born() <= prev_epoch` and frees it only when the oldest referencer goes), or a
+  drop double-frees it. That is the one careful subsystem left here; the image half above already
+  buys the recoverability, and the store copies are correct meanwhile.
 - **Clone recovery.** *(Content landed.)* A clone's image captures its whole tree (the bytes it
   inherited from the origin snapshot and the bytes it wrote after diverging), and `from_image`
   rebuilds it faithfully, keeping the inherited root inode number (fixed in
