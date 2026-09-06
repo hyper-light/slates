@@ -9,9 +9,13 @@
 > server derives the allowance from the volume's quota (`min(quota / size_of::<Inode>,
 > store.max_inodes)`) rather than the tight fair-share first tried, and the vfs test fixtures leave
 > it unbounded so the determinism oracle is untouched. §4.2 and GAP-A9-1 are the authority; BUG-1
-> (locked store) and BUG-2 (usable capacity) are also fixed. What remains: the namespace/xattr/handle
-> dimensions, the retention dimension, and the step from a per-volume cap to disjoint per-volume
-> reservation (with BUG-3's data-plane dependency).
+> (locked store) and BUG-2 (usable capacity) are also fixed. Xattr is not applicable (unimplemented)
+> and open handles are bounded at the bridge's `Slab` (BUG-4), so the applicable per-volume caps are
+> all in place and *safe* (typed refusals at both the logical allowance and the version slab). What
+> remains: the retention dimension, and the step from a per-volume cap to disjoint per-volume
+> *reservation* — which §4 shows is data-plane-gated for its `operation_headroom` (the measured peak
+> of transient CoW versions), exactly as BUG-3 is gated for its growth source. Reserving without that
+> headroom would be a false guarantee, so the honest cap stands until the measurement exists.
 
 ## 1. The requirement
 
@@ -99,5 +103,38 @@ The above is a per-volume *cap*. The complete §4.2 rule *reserves* each dimensi
 physically-backed capacity before publishing (disjoint per-shard credits, protected through resize,
 pressure and recovery). That builds on the cap: once each dimension is counted and bounded, admission
 reserves the vector rather than only capping it, and `ShardBudget` grows a per-dimension reserve
-alongside its byte reserve. BUG-3 (dynamic growth consuming only unpromised capacity) is part of this
-and is additionally gated on the data-plane write path (docs/wip/recovery.md).
+alongside its byte reserve.
+
+**Where the current state already is safe.** Both inode enforcement points are typed refusals, so
+today's cap never corrupts or panics — it can only be *over-optimistic* about availability, never
+unsafe. `Volume::next_no` refuses a logical inode past the per-volume allowance (`NoSpace`), and the
+inode-version slab is a hard `Slab` that refuses past `store.max_inodes` (`SlabFull`). The gap the
+reservation closes is honesty, not safety: the *sum* of per-volume logical allowances can exceed the
+shard's version slab, so an advertised allowance need not be physically backed.
+
+**Why the reservation is not a clean isolated slice — the version/logical gap and its measured
+headroom.** `store.max_inodes` bounds inode *versions*, not logical inodes, and
+`Volume::make_current_inode` (crates/vfs/src/volume.rs) inserts a **new** slab slot whenever it
+mutates an inode whose `born` epoch is earlier than the head's (a snapshot or a prior epoch pinned
+the old version), retiring the old slot for reclaim at the next epoch boundary. So the version slab
+holds, at any instant, the logical inodes **plus** the snapshot-retained versions **plus** the
+transient in-epoch versions that are retired but not yet reclaimed. A correct reservation must
+therefore carry an `operation_headroom` for those transient versions (the §4.2 invariant's
+`operation_headroom` term) — exactly as the byte budget keeps a free floor from the *measured* peak
+burst (`ShardBudget::floor`, "measured peak burst across volumes"). The inode equivalent is the
+measured peak of concurrent retired-but-unreclaimed versions, which depends on the write rate against
+the epoch/reclaim cadence — a quantity that can only be measured with the data-plane write path
+driving the slab under load. Reserving the logical allowance as version-slots **without** that
+headroom would be a *false* guarantee: a volume within its logical allowance could still exhaust the
+version slab through in-epoch CoW churn before a reclaim pass runs. Under R3 a headroom number cannot
+be invented, and under R4/R5 a reservation must not advertise a guarantee it does not hold, so this
+step waits on the peak-version-burst measurement — it is data-plane-gated for its headroom exactly as
+BUG-3 is gated for its growth source.
+
+**What the reservation's own observable proof would be (once the headroom exists).** A create
+refusal, not only `statfs`: fill a shard's inode-version reserve with prior volumes, then a further
+create refuses with a resource-vector refusal even though byte budget remains. `statfs` reporting
+backed inode availability (`allowance − live`, and the reserve's remaining credits) is the second
+surface and is owed with the data-plane `statfs` work (BUG-9, GAP-A9-3). BUG-3 (dynamic growth
+consuming only unpromised capacity) is part of this same reservation and is likewise gated on the
+data-plane write path (docs/wip/recovery.md).
