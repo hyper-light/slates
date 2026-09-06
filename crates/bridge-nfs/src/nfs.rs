@@ -49,6 +49,8 @@ pub enum Nfsstat3 {
   NotSync = 10002,
   /// Format: NFS3ERR_NOTSUPP — the operation is not supported.
   Notsupp = 10004,
+  /// Format: NFS3ERR_TOOSMALL — a READDIR/READDIRPLUS `count` too small to hold even one entry.
+  Toosmall = 10005,
   /// Format: NFS3ERR_SERVERFAULT — an error not covered by the protocol.
   ServerFault = 10006,
 }

@@ -60,6 +60,8 @@ pub const NFSPROC3_REMOVE: u32 = 12;
 pub const NFSPROC3_RMDIR: u32 = 13;
 /// Format: NFSPROC3_RENAME — rename an entry from one directory to another.
 pub const NFSPROC3_RENAME: u32 = 14;
+/// Format: NFSPROC3_READDIR — list a directory's entries (names and ids).
+pub const NFSPROC3_READDIR: u32 = 16;
 /// Format: NFSPROC3_FSSTAT — dynamic filesystem statistics (space and file counts).
 pub const NFSPROC3_FSSTAT: u32 = 18;
 /// Format: NFSPROC3_FSINFO — static filesystem limits and capabilities.
@@ -131,6 +133,30 @@ const CREATE_EXCLUSIVE: u32 = 2;
 const DEFAULT_FILE_MODE: u32 = 0o644;
 /// Format: the mode a MKDIR falls back to when the client's `sattr3` omits one — `rwxr-xr-x`.
 const DEFAULT_DIR_MODE: u32 = 0o755;
+/// Format: the fixed XDR wire size of a `fattr3` (RFC 1813 §2.3.5): five `u32` (type, mode, nlink,
+/// uid, gid) = 20, two `size3` (size, used) = 16, one `specdata3` (rdev) = 8, `fsid` + `fileid` = 16,
+/// three `nfstime3` (atime, mtime, ctime) = 24 — 84 bytes. Used to budget a READDIR reply.
+const FATTR3_BYTES: usize = 84;
+/// Format: the fixed XDR bytes of a READDIR `entry3` besides its name — the value-follows bool (4),
+/// the `fileid` (8) and the `cookie` (8) — for budgeting a reply against the client's `count`.
+const READDIR_ENTRY_FIXED: usize = 4 + size_of::<u64>() + size_of::<u64>();
+/// Format: the fixed XDR bytes of a READDIR reply besides its entries — the status (4), a present
+/// `post_op_attr` (its bool plus a `fattr3`), the `cookieverf` (8), and the trailing end-of-list
+/// and `eof` bools (8) — reserved from the client's `count` so the reply stays within it.
+const READDIR_REPLY_OVERHEAD: usize = 4 + 4 + FATTR3_BYTES + size_of::<u64>() + 4 + 4;
+/// Format: the READDIR `cookieverf` this server returns — eight zero bytes, "no verifier". A
+/// directory-change verifier (so a client detects a directory mutated mid-listing) is owed; slates
+/// invalidates caches on every mutation (§4.6 cache posture), so a stale listing is not served.
+const COOKIE_VERF_NONE: [u8; size_of::<u64>()] = [0u8; size_of::<u64>()];
+
+/// One entry of a READDIR reply, gathered before encoding so the reply can be budgeted against the
+/// client's `count`: the child's inode number (the `fileid`), its name, and the resume `cookie` the
+/// next READDIR passes to continue after it.
+struct ReaddirEntry {
+  fileid: u64,
+  name: String,
+  cookie: u64,
+}
 
 /// An NFSv3 export of one volume over the shared operation layer. Handles it mints and accepts name
 /// objects of `volume`; a handle for another volume is refused stale. The export edge admits one
@@ -279,6 +305,7 @@ impl<'b> Export<'b> {
       NFSPROC3_REMOVE => Some(self.remove(args, false)),
       NFSPROC3_RMDIR => Some(self.remove(args, true)),
       NFSPROC3_RENAME => Some(self.rename(args)),
+      NFSPROC3_READDIR => Some(self.readdir(args)),
       NFSPROC3_FSSTAT => Some(self.fsstat(args)),
       NFSPROC3_FSINFO => Some(self.fsinfo(args)),
       _ => None,
@@ -956,6 +983,81 @@ impl<'b> Export<'b> {
     Ok((attr, target))
   }
 
+  /// NFSPROC3_READDIR: list a directory's entries over the shared interface under the export's
+  /// context. The reply carries the directory's attributes, a cookieverf, and as many entries as
+  /// fit the client's `count` — each with a resume cookie — then the end-of-directory flag. A
+  /// `count` too small for even one entry is `NFS3ERR_TOOSMALL`. Synthetic `.` and `..` entries are
+  /// not emitted (the shared `readdir` returns children only, the same as the FUSE edge; owed).
+  pub fn readdir(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    match self.readdir_result(args) {
+      Ok((dir_attr, entries, eof)) => {
+        Nfsstat3::Ok.encode(&mut writer);
+        PostOpAttr(Some(dir_attr)).encode(&mut writer);
+        writer.fixed(&COOKIE_VERF_NONE);
+        for entry in &entries {
+          writer.bool(true); // an entry follows
+          writer.u64(entry.fileid);
+          writer.opaque(entry.name.as_bytes());
+          writer.u64(entry.cookie);
+        }
+        writer.bool(false); // no more entries
+        writer.bool(eof);
+      }
+      Err(status) => {
+        status.encode(&mut writer);
+        PostOpAttr(None).encode(&mut writer);
+      }
+    }
+    writer.into_bytes()
+  }
+
+  fn readdir_result(
+    &mut self,
+    args: &mut XdrReader<'_>,
+  ) -> Result<(Fattr3, Vec<ReaddirEntry>, bool), Nfsstat3> {
+    // READDIR3args: dir handle, cookie, cookieverf (ignored), count.
+    let dir_fh = Nfsfh3::decode(args).map_err(|_| Nfsstat3::Badhandle)?;
+    let cookie = args.u64().map_err(|_| Nfsstat3::Inval)?;
+    args.fixed(size_of::<u64>()).map_err(|_| Nfsstat3::Inval)?; // cookieverf, ignored (owed)
+    let count = args.u32().map_err(|_| Nfsstat3::Inval)?;
+    let identity = self.resolve_handle(&dir_fh)?;
+    let dir_node = self.attrs_of(&identity)?;
+    let dir_attr = self.fattr3(&dir_node);
+    let cx = self.op_context().map_err(|e| nfsstat_of(&e))?;
+    let dir_object = ObjectId::new(identity.inode, identity.generation);
+    // The cookie is the number of entries already returned; the shared readdir skips that many.
+    let rows = self
+      .bridge
+      .readdir(dir_object, &cx, 0, cookie)
+      .map_err(|e| nfsstat_of(&e))?;
+    let budget = usize::try_from(count).unwrap_or(0);
+    let mut used = READDIR_REPLY_OVERHEAD;
+    let mut entries = Vec::new();
+    let mut eof = true;
+    for (index, row) in rows.into_iter().enumerate() {
+      let entry_bytes = READDIR_ENTRY_FIXED + xdr_str_len(&row.name);
+      if used.saturating_add(entry_bytes) > budget {
+        if entries.is_empty() {
+          // Not even one entry fits the client's count (RFC 1813 §3.3.16).
+          return Err(Nfsstat3::Toosmall);
+        }
+        eof = false; // more entries remain for the next READDIR
+        break;
+      }
+      used = used.saturating_add(entry_bytes);
+      let entry_cookie = cookie
+        .saturating_add(u64::try_from(index).unwrap_or(u64::MAX))
+        .saturating_add(1);
+      entries.push(ReaddirEntry {
+        fileid: row.ino,
+        name: row.name,
+        cookie: entry_cookie,
+      });
+    }
+    Ok((dir_attr, entries, eof))
+  }
+
   /// The shared tail of CREATE, MKDIR and SYMLINK: apply the `sattr3` fields the creation did not
   /// set (the mode is set at creation), fetch the object's final attributes, mint its handle, and
   /// gather the parent directory's post-op attributes for the wcc.
@@ -1099,6 +1201,14 @@ fn encode_create_reply(
     PostOpAttr(Some(attr)).encode(writer);
   }
   encode_wcc(writer, dir_post);
+}
+
+/// The XDR-encoded byte length of a variable-length string or opaque: a `u32` length prefix plus
+/// the bytes padded up to XDR's 4-byte (one `u32`) boundary. Used to budget a READDIR reply's
+/// entries.
+fn xdr_str_len(s: &str) -> usize {
+  const UNIT: usize = size_of::<u32>();
+  UNIT + s.len().div_ceil(UNIT) * UNIT
 }
 
 /// Decodes an `sattr3` optional `u32` (`set_mode3`/`set_uid3`/`set_gid3`): a bool, then the value

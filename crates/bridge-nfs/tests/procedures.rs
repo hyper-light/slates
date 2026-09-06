@@ -12,8 +12,9 @@ use slates_bridge_nfs::mount::MountReply;
 use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
 use slates_bridge_nfs::procedures::{
   Export, NFSPROC3_ACCESS, NFSPROC3_CREATE, NFSPROC3_FSINFO, NFSPROC3_FSSTAT, NFSPROC3_GETATTR,
-  NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ, NFSPROC3_READLINK, NFSPROC3_REMOVE,
-  NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE,
+  NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ, NFSPROC3_READDIR, NFSPROC3_READLINK,
+  NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK,
+  NFSPROC3_WRITE,
 };
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_db::catalog::{Principal, VolumeId};
@@ -1274,5 +1275,97 @@ fn a_readlink_returns_the_target_and_refuses_a_non_symlink() {
     XdrReader::new(&dreply).u32().unwrap(),
     Nfsstat3::Inval.wire(),
     "READLINK of a non-symlink is INVAL"
+  );
+}
+
+/// Parses a READDIR reply into (names, last cookie, eof), for the listing tests.
+fn parse_readdir(reply: &[u8]) -> (Vec<String>, u64, bool) {
+  let mut r = XdrReader::new(reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "READDIR succeeded");
+  PostOpAttr::decode(&mut r).unwrap(); // dir attributes
+  let _verf = r.fixed(8).unwrap(); // cookieverf
+  let mut names = Vec::new();
+  let mut last_cookie = 0;
+  while r.bool().unwrap() {
+    let _fileid = r.u64().unwrap();
+    let name = r.string(255).unwrap().to_owned();
+    let cookie = r.u64().unwrap();
+    names.push(name);
+    last_cookie = cookie;
+  }
+  let eof = r.bool().unwrap();
+  (names, last_cookie, eof)
+}
+
+/// READDIR lists a directory's entries and paginates: a generous count returns them all with eof,
+/// a small count returns a partial list with a resume cookie, and resuming from it returns the rest;
+/// a count too small for even one entry is NFS3ERR_TOOSMALL.
+#[test]
+fn readdir_lists_entries_and_paginates() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  for name in ["a", "b", "c"] {
+    bridge.create(oid(root_ino), &cx, name, 0o644, 0).unwrap();
+  }
+
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = root_handle(&mut export);
+
+  // A generous count returns all three names with eof.
+  let readdir = |export: &mut Export<'_>, cookie: u64, count: u32| -> Vec<u8> {
+    let mut args = XdrWriter::new();
+    root_fh.encode(&mut args);
+    args.u64(cookie);
+    args.fixed(&[0u8; 8]); // cookieverf
+    args.u32(count);
+    export
+      .serve_nfs(NFSPROC3_READDIR, &mut XdrReader::new(args.as_slice()))
+      .unwrap()
+  };
+
+  let (mut names, _c, eof) = parse_readdir(&readdir(&mut export, 0, 8192));
+  names.sort();
+  assert_eq!(
+    names,
+    vec!["a", "b", "c"],
+    "all entries with a generous count"
+  );
+  assert!(eof, "the whole directory fit, so eof is set");
+
+  // A small count paginates: a partial list without eof, then the rest from the resume cookie.
+  let (first, cookie, eof1) = parse_readdir(&readdir(&mut export, 0, 170));
+  assert!(!eof1, "a partial listing is not at eof");
+  assert!(
+    !first.is_empty() && first.len() < 3,
+    "a partial listing has some but not all entries"
+  );
+  let (rest, _c2, eof2) = parse_readdir(&readdir(&mut export, cookie, 8192));
+  assert!(eof2, "the resumed listing reaches eof");
+  let mut all: Vec<String> = first.into_iter().chain(rest).collect();
+  all.sort();
+  assert_eq!(
+    all,
+    vec!["a", "b", "c"],
+    "pagination returns every entry once"
+  );
+
+  // A count too small for even one entry is TOOSMALL.
+  let tiny = readdir(&mut export, 0, 8);
+  assert_eq!(
+    XdrReader::new(&tiny).u32().unwrap(),
+    Nfsstat3::Toosmall.wire(),
+    "a count too small for one entry is TOOSMALL"
   );
 }
