@@ -1044,44 +1044,12 @@ fn create(
     },
     SizeClass::Dynamic { .. } => None,
   };
-  // A strict volume backs its content in locked RAM (§4.2, BUG-1): lock the shard's arena so its
-  // content never swaps, refusing (as BudgetExceeded, the §4.2 lock-capacity refusal) if the OS
-  // will not — a strict guarantee never silently becomes swappable service. Whole-arena locking is
-  // a coarse first cut; locking only a strict volume's own chunks is the refinement (GAP-A9-1).
-  if require_locked && let Err(e) = state.store.content.arena_mut().lock() {
-    let available = match e {
-      slates_mem::MemError::LockRefused { locked, .. } => u64::try_from(locked).unwrap_or(u64::MAX),
-      _ => 0,
-    };
-    return give_back(
-      state,
-      reservation,
-      None,
-      Refusal::BudgetExceeded { available },
-    );
-  }
-  let quota = quota_for(size);
-  let config = volume_config(state, names, quota);
-  let (mut volume, host) = match base {
-    None => match Volume::create(&mut state.store, config) {
-      Ok(v) => (v, None),
-      Err(e) => return give_back(state, reservation, None, refusal_of_vfs(&e)),
-    },
-    Some(path) => match open_base(state, path, config) {
-      Ok(pair) => pair,
-      Err(reply) => return give_back(state, reservation, None, reply_refusal(*reply)),
-    },
-  };
-  // Admit the volume's inode dimension (§4.2 resource vector): its fair share of the shard's inode
-  // capacity, so no volume exhausts the inode slab with empty files.
-  if let Err(e) = admit_dimensions(state, &mut volume, size) {
-    return give_back(state, reservation, None, refusal_of_vfs(&e));
-  }
-  // Reserve that inode allowance against the shard's version slab (§4.2 inode dimension), so the
-  // advertised allowance is backed by real slab capacity, not merely capped — two volumes cannot
-  // each be promised the same slots, and a bounded volume's allowance stays available after another
-  // is admitted. Refused whole if the slab cannot back it, giving back the byte reservation. Bounded
-  // and dynamic both reserve their whole logical allowance: the sacred claim that backs divergence.
+  // Reserve the inode allowance against the shard's version slab *before* creating the volume (§4.2:
+  // "admission reserves all required credits or none before publishing"). So the advertised allowance
+  // is backed by real slab capacity — two volumes cannot each be promised the same slots — and a
+  // refusal here allocates nothing to leak (no root inode, trie or dir), giving back only the byte
+  // reservation. Bounded and dynamic both reserve their whole logical allowance: the sacred claim
+  // that backs divergence.
   let version_credit = match state.store.versions.reserve(inode_allowance(state, size)) {
     Ok(c) => Some(c),
     Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
@@ -1103,6 +1071,39 @@ fn create(
       );
     }
   };
+  // A strict volume backs its content in locked RAM (§4.2, BUG-1): lock the shard's arena so its
+  // content never swaps, refusing (as BudgetExceeded, the §4.2 lock-capacity refusal) if the OS
+  // will not — a strict guarantee never silently becomes swappable service. Whole-arena locking is
+  // a coarse first cut; locking only a strict volume's own chunks is the refinement (GAP-A9-1).
+  if require_locked && let Err(e) = state.store.content.arena_mut().lock() {
+    let available = match e {
+      slates_mem::MemError::LockRefused { locked, .. } => u64::try_from(locked).unwrap_or(u64::MAX),
+      _ => 0,
+    };
+    return give_back(
+      state,
+      reservation,
+      version_credit,
+      Refusal::BudgetExceeded { available },
+    );
+  }
+  let quota = quota_for(size);
+  let config = volume_config(state, names, quota);
+  let (mut volume, host) = match base {
+    None => match Volume::create(&mut state.store, config) {
+      Ok(v) => (v, None),
+      Err(e) => return give_back(state, reservation, version_credit, refusal_of_vfs(&e)),
+    },
+    Some(path) => match open_base(state, path, config) {
+      Ok(pair) => pair,
+      Err(reply) => return give_back(state, reservation, version_credit, reply_refusal(*reply)),
+    },
+  };
+  // Admit the volume's inode dimension (§4.2 resource vector): set the per-volume cap that
+  // `next_no` enforces, to the same allowance already reserved against the version slab above.
+  if let Err(e) = admit_dimensions(state, &mut volume, size) {
+    return give_back(state, reservation, version_credit, refusal_of_vfs(&e));
+  }
   let id = fresh_volume_id(state);
   let record = VolumeRecord {
     id,
@@ -1308,32 +1309,17 @@ fn clone(
     },
     SizeClass::Dynamic { .. } => None,
   };
-  let names = match record.policy.names {
-    DbNamePolicy::Exact => NamePolicy::Exact,
-    DbNamePolicy::Fold => NamePolicy::Fold,
-  };
-  let quota = quota_for(size);
-  let config = volume_config(state, names, quota);
-  let cloned = match state.volumes.get_mut(handle) {
-    Ok(slot) => Volume::clone_of(
-      &state.store,
-      &mut slot.volume,
-      core_snapshot(snapshot),
-      config,
-    ),
+  // Reserve the clone's inode allowance against the version slab *before* cloning (§4.2: reserve all
+  // credits or none before publishing), so a refusal allocates nothing and does not leave the
+  // origin's `clone_refs` bumped. A clone shares its origin's versions until it diverges, so it
+  // reserves the whole allowance — a create's fair share, but never below the count it inherits from
+  // the origin (equal to the origin's live count at clone time) — as the sacred claim that backs full
+  // divergence of the inherited inodes. If the slab cannot back it, the clone is refused.
+  let inherited = match state.volumes.get(handle) {
+    Ok(slot) => slot.volume.inode_usage().0,
     Err(_) => return give_back(state, reservation, None, Refusal::NotFound),
   };
-  let mut volume_core = match cloned {
-    Ok(v) => v,
-    Err(e) => return give_back(state, reservation, None, refusal_of_vfs(&e)),
-  };
-  // The clone carries an inode dimension too (§4.2): cap it at the same fair share a create gets,
-  // but never below the inodes it inherited from its origin, then reserve that whole allowance
-  // against the version slab. A clone shares its origin's versions until it diverges, so this
-  // reservation is the sacred claim that backs full divergence of the inherited inodes; if the slab
-  // cannot back it, the clone is refused rather than silently over-committing the slab.
-  let clone_allowance = inode_allowance(state, size).max(volume_core.inode_usage().0);
-  let _ = volume_core.set_inode_allowance(clone_allowance);
+  let clone_allowance = inode_allowance(state, size).max(inherited);
   let version_credit = match state.store.versions.reserve(clone_allowance) {
     Ok(c) => Some(c),
     Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
@@ -1355,6 +1341,28 @@ fn clone(
       );
     }
   };
+  let names = match record.policy.names {
+    DbNamePolicy::Exact => NamePolicy::Exact,
+    DbNamePolicy::Fold => NamePolicy::Fold,
+  };
+  let quota = quota_for(size);
+  let config = volume_config(state, names, quota);
+  let cloned = match state.volumes.get_mut(handle) {
+    Ok(slot) => Volume::clone_of(
+      &state.store,
+      &mut slot.volume,
+      core_snapshot(snapshot),
+      config,
+    ),
+    Err(_) => return give_back(state, reservation, version_credit, Refusal::NotFound),
+  };
+  let mut volume_core = match cloned {
+    Ok(v) => v,
+    Err(e) => return give_back(state, reservation, version_credit, refusal_of_vfs(&e)),
+  };
+  // Cap the clone's inode dimension at the same allowance already reserved above, so its per-volume
+  // cap (`next_no`) and its version-slab reservation agree. A clone previously carried no inode cap.
+  let _ = volume_core.set_inode_allowance(clone_allowance);
   let id = fresh_volume_id(state);
   let now = state.clock.monotonic_ns();
   let mut new_record = record.clone();

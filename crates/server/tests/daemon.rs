@@ -462,10 +462,15 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
 
 /// Shape: a version slab large enough to physically hold several volumes' inode and trie nodes, yet
 /// small enough that one big-quota volume's inode allowance reserves all of it above the copy-up
-/// headroom. So the second volume is refused by the §4.2 *reservation* while physical slots plainly
+/// headroom. So a further volume is refused by the §4.2 *reservation* while physical slots plainly
 /// remain — the honesty the reservation adds over the bare per-volume cap (a raw `SlabFull` would
 /// only fire once the slab were physically exhausted, which it is not here).
-const SMALL_VERSION_SLAB: usize = 128;
+const SMALL_VERSION_SLAB: usize = 64;
+/// Shape: refused-create attempts against a full version budget — enough that, were a partial volume
+/// allocated and leaked on each refusal (the pre-reorder bug), the trie slab would physically fill
+/// (a volume needs several trie nodes; 64 slots hold only a handful) and later refusals would turn
+/// into `SlabFull`. With the reservation checked before any allocation, all stay `BudgetExceeded`.
+const LEAK_PROBES: usize = 24;
 
 /// A test daemon whose inode-version slab is `max_inodes` slots, on a single shard so every volume
 /// shares the one version budget (with two shards, volumes route to separate budgets and never
@@ -507,16 +512,23 @@ fn version_reservation_scenario() {
   let ReplyBody::Created { id: first } = client.call(&sized("first")) else {
     panic!("first create");
   };
-  // The second cannot be backed by the slab, so admission refuses it — not for want of bytes.
-  assert!(
-    matches!(
-      client.call(&sized("second")),
+  // Many further creates cannot be backed by the slab, so admission refuses each — not for want of
+  // bytes. Every one must refuse at the *reservation* (`BudgetExceeded`), never with `SlabFull`:
+  // that is the leak proof. The reservation is taken before `Volume::create`, so a refusal allocates
+  // no root inode, trie or dir. Were a partial volume leaked on each refusal instead, these probes
+  // would physically exhaust the trie slab within a handful of attempts and later refusals would
+  // become `SlabFull` (a `BadRequest`) — which this asserts never happens.
+  for probe in 0..LEAK_PROBES {
+    let name = format!("probe-{probe}");
+    match client.call(&sized(&name)) {
       ReplyBody::Refused {
-        refusal: Refusal::BudgetExceeded { .. }
+        refusal: Refusal::BudgetExceeded { .. },
+      } => {}
+      other => {
+        panic!("probe {probe} must refuse at the reservation, not leak into SlabFull: {other:?}")
       }
-    ),
-    "the version slab cannot back a second inode allowance"
-  );
+    }
+  }
   // Destroy the first; its reserved slots return to the slab as the destroy completes in slices.
   assert!(matches!(
     client.call(&RequestBody::Destroy { volume: first }),

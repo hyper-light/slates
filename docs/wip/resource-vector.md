@@ -201,19 +201,26 @@ it *is* the retention dimension, charged separately, not a transient headroom.
 parallel of `ShardBudget`, sharing its `Ledger` arithmetic — is over the version slab
 (`store.max_inodes`) less the one-slot copy-up headroom. At create, the server reserves the volume's
 whole logical inode allowance against it (`state.store.versions.reserve(inode_allowance(...))`,
-crates/server/src/verbs.rs), on both the scratch-create and clone-create paths, refused whole (giving
-back the byte reservation) if the slab cannot back it; the allowance is capped at `max_inodes −
-headroom` so the largest derivable allowance is still reservable. The credit rides in the volume's
-server slot and is released on destroy and given back on every create-failure path (including the
-slot-insert failure, which previously leaked the byte reservation — a sibling bug fixed here), and
-re-acquired from the rebuilt budget on recovery. A clone now also carries an inode cap (it previously
-had none), set to that same allowance, so its reservation actually bounds it.
+crates/server/src/verbs.rs) *before* `Volume::create` (and before `clone_of`) — the design's "reserve
+all required credits or none before publishing" — so a refusal allocates no root inode, trie or dir to
+leak, and a clone refusal does not leave the origin's `clone_refs` bumped. Refused whole (giving back
+the byte reservation) if the slab cannot back it; the allowance is capped at `max_inodes − headroom`
+so the largest derivable allowance is still reservable. The credit rides in the volume's server slot
+and is released on destroy, given back on every later failure path (including the slot-insert failure,
+which previously leaked the byte reservation — a sibling bug fixed here), and re-acquired from the
+rebuilt budget on recovery. A clone now also carries an inode cap (it previously had none), set to that
+same allowance, so its reservation actually bounds it. (A partial volume dropped on the *db-mutate* or
+*slot-insert* failure — the paths still after allocation — leaks its slab slots; that is the residue
+tracked in docs/bugs/2026-09-06-partial-volume-slab-leak-on-create-failure.md, now that the common
+reservation-refused path no longer allocates.)
 
 **Its observable proof (now exercised).** A create refusal, not only `statfs`: `crates/server/tests/
-daemon.rs` fills a small shard's version slab with one big-quota volume, then a second create is
-refused (`BudgetExceeded`) *while physical slots plainly remain* — the disjoint reservation the bare
-cap does not give — and a third is admitted once destroy returns the first's slots. It is non-vacuous:
-neutered to `reserve(0)`, the test fails (the second volume is created). `statfs` reporting backed
+daemon.rs` fills a small shard's version slab with one big-quota volume, then 24 further creates are
+each refused (`BudgetExceeded`) *while physical slots plainly remain* — the disjoint reservation the
+bare cap does not give — and one more is admitted once destroy returns the first's slots. It is
+non-vacuous two ways: neutered to `reserve(0)`, the reservation test creates the second volume and
+fails; and run against the pre-reorder ordering (reservation after `Volume::create`), the leak probes
+turn into `SlabFull` by the fourth attempt as leaked partial volumes fill the trie slab. `statfs` reporting backed
 inode availability at the *shard* level (the reserve's remaining credits, beside the per-volume
 `allowance − live` it already reports) is a second surface, owed with a status-wire field. What
 remains for the inode dimension: charging *retention* into the same `VersionBudget` so retained
