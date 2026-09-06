@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 
 use slates_mem::Handle;
 use slates_wire::Wire;
+use slates_wire::crc32c::crc32c;
 
 use crate::clock::Clock;
 use crate::dir::{Child, DirNode};
@@ -220,7 +221,63 @@ impl VolumeImage {
   pub fn to_content(&self) -> Vec<u8> {
     self.to_bytes()
   }
+
+  /// Publishes this image into a content-object buffer (§4.8): a header of the byte length and a
+  /// CRC-32C of the image, then the image bytes. The header is what a restarted daemon reads to
+  /// find and validate the image; the CRC turns a write torn by a crash into a typed refusal rather
+  /// than a garbage decode. Refuses [`VfsError::NoSpace`] if the buffer cannot hold the frame.
+  pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, VfsError> {
+    let bytes = self.to_content();
+    let total = FRAME_HEADER
+      .checked_add(bytes.len())
+      .ok_or(VfsError::FileTooLarge)?;
+    if buf.len() < total {
+      return Err(VfsError::NoSpace);
+    }
+    let len = u32::try_from(bytes.len()).map_err(|_| VfsError::FileTooLarge)?;
+    let crc = crc32c(&bytes);
+    buf[..LEN_WIDTH].copy_from_slice(&len.to_le_bytes());
+    buf[LEN_WIDTH..FRAME_HEADER].copy_from_slice(&crc.to_le_bytes());
+    buf[FRAME_HEADER..total].copy_from_slice(&bytes);
+    Ok(total)
+  }
+
+  /// Reads an image a running daemon wrote with [`VolumeImage::write_to`] back from a content-object
+  /// buffer (§4.8). `Ok(None)` means the slot is empty — a fresh content object with nothing yet to
+  /// recover, so the caller starts a new volume rather than failing. A present-but-unreadable frame
+  /// (a length past the buffer, a CRC mismatch from a torn write, a malformed image) is
+  /// [`VfsError::RecoveryIncomplete`] — never an empty success (§4.8).
+  pub fn read_from(buf: &[u8]) -> Result<Option<VolumeImage>, VfsError> {
+    if buf.len() < FRAME_HEADER {
+      return Ok(None);
+    }
+    let mut len_bytes = [0u8; LEN_WIDTH];
+    len_bytes.copy_from_slice(&buf[..LEN_WIDTH]);
+    let len = usize::try_from(u32::from_le_bytes(len_bytes)).unwrap_or(usize::MAX);
+    if len == 0 {
+      return Ok(None);
+    }
+    let mut crc_bytes = [0u8; LEN_WIDTH];
+    crc_bytes.copy_from_slice(&buf[LEN_WIDTH..FRAME_HEADER]);
+    let want_crc = u32::from_le_bytes(crc_bytes);
+    let end = FRAME_HEADER
+      .checked_add(len)
+      .ok_or(VfsError::RecoveryIncomplete)?;
+    if buf.len() < end {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    let image_bytes = &buf[FRAME_HEADER..end];
+    if crc32c(image_bytes) != want_crc {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    VolumeImage::from_content(image_bytes).map(Some)
+  }
 }
+
+/// Format: the width of the frame's length and CRC fields.
+const LEN_WIDTH: usize = size_of::<u32>();
+/// Format: the frame header — a little-endian byte length then a CRC-32C of the image bytes.
+const FRAME_HEADER: usize = 2 * LEN_WIDTH;
 
 /// The image of `kind`.
 const fn kind_image(kind: Kind) -> KindImage {

@@ -102,13 +102,27 @@ volume.
    the multi-chunk file through the inode number handed out before the "restart" — the
    write→[image]→[drop]→[rebuild]→read proof at the library level. Non-vacuity of the oracle was
    checked by injecting a dropped-attribute-restore bug and confirming the round trip then fails.
+5. **Content-object framing and handoff survival.** *(Landed, `crates/vfs/src/recover.rs`
+   `write_to`/`read_from`.)* An image is published into a content-object buffer behind a small frame
+   — a little-endian byte length and a CRC-32C of the image bytes — so a restarted daemon finds it,
+   an empty (fresh) object reads as `None` (nothing to recover, start a new volume rather than fail),
+   and a write torn by a crash is caught by the CRC and refused with `RecoveryIncomplete` rather than
+   decoded to garbage (§4.8: never an empty success). Gated `crates/vfs/tests/recover.rs`: a volume
+   survives a real `SharedObject` **handoff** — the memory-level shape of a daemon restart with the
+   anchor surviving (slice 1's property) — its bytes read back through their original inode number
+   after the writer's mapping is dropped, and the frame signals empty, reads back, refuses a torn
+   write and refuses too small a buffer. This is Ada's step-two proof at the library level, through
+   the actual restart-surviving primitive; only the server/client process lifecycle is left to wire.
 
 ## 4. Owed, as individual gates
 
 - **Daemon/content-object wiring.** The create path sizes and creates the content object
-  (`AnchorSegment::with_content`); a barrier publishes the image into it; `init_shard` reads it back
-  and rebuilds via `from_image`. Then the process-level proof: write bytes through the client, kill
-  the daemon while the anchor survives, restart, read the same bytes.
+  (`AnchorSegment::with_content`, landed); a barrier calls `VolumeImage::write_to` into it;
+  `init_shard` calls `read_from` and rebuilds via `from_image`. Then the process-level proof: write
+  bytes through the client, kill the daemon while the anchor survives, restart, read the same bytes.
+- **Crash-during-publish (double buffering).** The single-slot frame detects a torn write but does
+  not keep the prior good image across one; the database's two-slot, sequence-numbered publish
+  (`replay.rs`) is the pattern to adopt so a crash mid-publish recovers the last complete image.
 - **Fidelity extensions.** CoW snapshots and clone lineage; referenced-but-unlinked orphans
   (§4.6 lifetime across a restart); base-backed volumes (a live base restored only through retained
   handles or validated source identity — "reopening a path alone cannot substitute another base");

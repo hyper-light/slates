@@ -10,11 +10,21 @@
 mod common;
 
 use common::{store, volume};
+use slates_mem::SharedObject;
 use slates_vfs::VfsError;
 use slates_vfs::clock::StepClock;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::recover::{BodyImage, InodeImage, KindImage, PolicyImage, VolumeImage};
 use slates_vfs::volume::Volume;
+
+/// Shape: a content object comfortably larger than the built fixture's image (a 256 KiB file plus
+/// its metadata), so the frame fits with room to spare.
+const CONTENT_LEN: usize = 4 * 1024 * 1024;
+
+/// A per-process content-object name within macOS's 31-character `shm_open` limit.
+fn object_name(tag: &str) -> String {
+  format!("slates-rec-{tag}-{}", std::process::id())
+}
 
 /// A deterministic, varied byte at index `i`, spread so a file crosses several chunks with no
 /// repeat short enough to hide a mis-ordered chunk on recovery.
@@ -193,6 +203,82 @@ fn a_volume_rebuilt_from_its_image_is_faithful() {
   assert_eq!(
     got, b.big_bytes,
     "the file reads back through its original inode number"
+  );
+}
+
+/// AC (§4.8, A-9): a volume survives a content-object handoff — the memory-level shape of a daemon
+/// restart with the anchor surviving. The running daemon publishes the image into a shared content
+/// object; the restarted daemon re-opens the same object from its handoff and rebuilds; the writer's
+/// mapping then goes away (the crashed process exits). Bytes written before the "restart" read back
+/// after it, and the rebuilt volume is fully faithful. This is Ada's step-two proof at the library
+/// level, through the actual restart-surviving primitive.
+#[test]
+fn a_volume_survives_a_content_object_handoff() {
+  let b = built();
+
+  // The running daemon publishes the image into the anchor content object.
+  let mut object = SharedObject::create(&object_name("h"), CONTENT_LEN).unwrap();
+  let handoff = object.handoff().unwrap();
+  b.image.write_to(object.bytes_mut()).unwrap();
+
+  // The restarted daemon re-opens the same object; the writer's mapping then goes away.
+  let reattached = SharedObject::open(&handoff, CONTENT_LEN).unwrap();
+  drop(object);
+  let image = VolumeImage::read_from(reattached.bytes())
+    .unwrap()
+    .expect("the published image is present after the handoff");
+
+  // Rebuild and read the bytes written before the "restart" through their original inode number.
+  let mut fresh = store();
+  let vol =
+    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  let mut got = vec![0u8; b.big_bytes.len()];
+  let n = vol.read(&fresh, b.big, 0, &mut got).unwrap();
+  got.truncate(n);
+  assert_eq!(
+    got, b.big_bytes,
+    "bytes written before the content-object handoff read back after it"
+  );
+  assert_eq!(
+    vol.to_image(&fresh).unwrap(),
+    image,
+    "the rebuilt volume is fully faithful"
+  );
+}
+
+/// A robustness gate on the content frame: an empty (fresh) object reads as "nothing to recover"
+/// (`None`, so the caller starts a new volume), a published image reads back, a write torn by a
+/// crash is caught by the CRC and refused rather than decoded, and a buffer too small to hold the
+/// frame refuses the publish.
+#[test]
+fn the_content_frame_signals_empty_and_refuses_a_torn_write() {
+  let b = built();
+  let mut buf = vec![0u8; CONTENT_LEN];
+
+  assert!(
+    VolumeImage::read_from(&buf).unwrap().is_none(),
+    "a fresh content object holds no image"
+  );
+
+  let total = b.image.write_to(&mut buf).unwrap();
+  assert!(
+    VolumeImage::read_from(&buf).unwrap().is_some(),
+    "a published image reads back"
+  );
+
+  buf[total - 1] ^= 0xFF;
+  assert!(
+    matches!(
+      VolumeImage::read_from(&buf),
+      Err(VfsError::RecoveryIncomplete)
+    ),
+    "a torn write is refused, not decoded"
+  );
+
+  let mut tiny = vec![0u8; 4];
+  assert!(
+    matches!(b.image.write_to(&mut tiny), Err(VfsError::NoSpace)),
+    "a buffer too small refuses the publish"
   );
 }
 
