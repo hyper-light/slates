@@ -1036,6 +1036,14 @@ impl Volume {
     Ok(())
   }
 
+  /// The volume's current wall-clock time, in nanoseconds since the Unix epoch. A transport uses it
+  /// to resolve a "set to now" request (NFS `SET_TO_SERVER_TIME`, FUSE `UTIME_NOW`) into the
+  /// explicit value [`Volume::set_times`] takes — the NOW resolution the design places at the
+  /// transport (AC-3.10).
+  pub fn wall_ns(&mut self) -> i64 {
+    self.clock.wall_ns()
+  }
+
   /// Sets the access and modification times (a `utimens`), so a bridge honors a `setattr` of times
   /// instead of ignoring it (§4.6). Times are nanoseconds since the Unix epoch. Copy-on-write; the
   /// change time advances. `UTIME_NOW`/`UTIME_OMIT` resolution belongs to the transport that

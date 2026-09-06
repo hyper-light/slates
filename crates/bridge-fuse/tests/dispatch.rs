@@ -227,6 +227,9 @@ impl Bridge for Mock {
   fn statfs(&mut self, _object: ObjectId, _cx: &OpContext) -> Result<FsStat, VfsError> {
     Err(VfsError::Invalid)
   }
+  fn now(&mut self) -> i64 {
+    0
+  }
 }
 
 /// A read-write current-view context, built through the attachment registry the way the daemon

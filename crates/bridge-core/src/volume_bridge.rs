@@ -529,6 +529,10 @@ impl Bridge for VolumeBridge<'_> {
     self.attr_of(ino)
   }
 
+  fn now(&mut self) -> i64 {
+    self.volume.wall_ns()
+  }
+
   fn statfs(&mut self, _object: ObjectId, cx: &OpContext) -> Result<FsStat, VfsError> {
     self.authorize_read(cx)?;
     let accounting = self.volume.accounting();

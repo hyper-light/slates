@@ -227,4 +227,8 @@ pub trait Bridge {
   ) -> Result<NodeAttr, VfsError>;
   /// Filesystem statistics for the volume `object` lives in, under `cx`.
   fn statfs(&mut self, object: ObjectId, cx: &OpContext) -> Result<FsStat, VfsError>;
+  /// The volume's current wall-clock time (nanoseconds since the Unix epoch). A transport uses it
+  /// to resolve a "set to now" time — NFS `SET_TO_SERVER_TIME`, FUSE `UTIME_NOW` — into the explicit
+  /// value `setattr` takes; the NOW resolution the design places at the transport (AC-3.10).
+  fn now(&mut self) -> i64;
 }

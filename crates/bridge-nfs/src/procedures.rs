@@ -16,7 +16,7 @@
 
 use slates_bridge_core::{
   AttachmentId, Attachments, Bridge, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, Rights,
-  View,
+  SetAttr, View,
 };
 use slates_db::catalog::{Principal, VolumeId};
 use slates_vfs::error::VfsError;
@@ -35,6 +35,8 @@ pub const NFS_VERSION: u32 = 3;
 pub const NFSPROC3_NULL: u32 = 0;
 /// Format: NFSPROC3_GETATTR — the attributes of the object a handle names.
 pub const NFSPROC3_GETATTR: u32 = 1;
+/// Format: NFSPROC3_SETATTR — set some of an object's attributes.
+pub const NFSPROC3_SETATTR: u32 = 2;
 /// Format: NFSPROC3_LOOKUP — resolve a name in a directory to a handle.
 pub const NFSPROC3_LOOKUP: u32 = 3;
 /// Format: NFSPROC3_ACCESS — which operations the caller may perform on an object.
@@ -95,6 +97,14 @@ const OWNER_EXECUTE: u32 = 0o100;
 /// to stable storage before the reply. slates lands every write in the anchor segment synchronously
 /// (there is no write-back buffer), so a WRITE is always `FILE_SYNC` and a later COMMIT is a no-op.
 const FILE_SYNC: u32 = 2;
+/// Format: `time_how` DONT_CHANGE (RFC 1813 §3.3.2): leave the time field unchanged.
+const TIME_DONT_CHANGE: u32 = 0;
+/// Format: `time_how` SET_TO_SERVER_TIME: set the time to the server's current wall clock.
+const TIME_SET_TO_SERVER: u32 = 1;
+/// Format: `time_how` SET_TO_CLIENT_TIME: set the time to the client-supplied `nfstime3`.
+const TIME_SET_TO_CLIENT: u32 = 2;
+/// Format: nanoseconds per second, for converting an `nfstime3` to the volume core's `i64` nanos.
+const NS_PER_SEC: i64 = 1_000_000_000;
 
 /// An NFSv3 export of one volume over the shared operation layer. Handles it mints and accepts name
 /// objects of `volume`; a handle for another volume is refused stale. The export edge admits one
@@ -231,6 +241,7 @@ impl<'b> Export<'b> {
     match procedure {
       NFSPROC3_NULL => Some(Vec::new()),
       NFSPROC3_GETATTR => Some(self.getattr(args)),
+      NFSPROC3_SETATTR => Some(self.setattr(args)),
       NFSPROC3_LOOKUP => Some(self.lookup(args)),
       NFSPROC3_ACCESS => Some(self.access(args)),
       NFSPROC3_READ => Some(self.read(args)),
@@ -573,6 +584,115 @@ impl<'b> Export<'b> {
     (status, from_post, to_post)
   }
 
+  /// NFSPROC3_SETATTR: set some of an object's attributes over the shared interface under the
+  /// export's context. The `sattr3` union chooses which fields to set (§4.6; the seam applies each
+  /// requested field and never acknowledges one it ignored, BUG-8); a `SET_TO_SERVER_TIME` time is
+  /// resolved to the volume's wall clock here (AC-3.10). An optional guard (`sattr_guard3`) makes
+  /// the update conditional on the object's `ctime` — a compare-and-set the client uses to avoid a
+  /// lost update — refused `NFS3ERR_NOT_SYNC` when the guard does not match.
+  pub fn setattr(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let (status, post) = self.do_setattr(args);
+    let mut writer = XdrWriter::new();
+    status.encode(&mut writer);
+    encode_wcc(&mut writer, post);
+    writer.into_bytes()
+  }
+
+  fn do_setattr(&mut self, args: &mut XdrReader<'_>) -> (Nfsstat3, Option<Fattr3>) {
+    // SETATTR3args: the object handle, the new attributes (sattr3), then the guard (sattr_guard3).
+    let handle = match Nfsfh3::decode(args) {
+      Ok(fh) => fh,
+      Err(_) => return (Nfsstat3::Badhandle, None),
+    };
+    let changes = match self.decode_sattr3(args) {
+      Ok(changes) => changes,
+      Err(status) => return (status, None),
+    };
+    // sattr_guard3: a bool, then (if set) the ctime the object must currently have.
+    let guarded = match args.bool() {
+      Ok(b) => b,
+      Err(_) => return (Nfsstat3::Inval, None),
+    };
+    let guard_ctime = if guarded {
+      match Nfstime3::decode(args) {
+        Ok(t) => Some(nfstime_to_ns(&t)),
+        Err(_) => return (Nfsstat3::Inval, None),
+      }
+    } else {
+      None
+    };
+    let identity = match self.resolve_handle(&handle) {
+      Ok(id) => id,
+      Err(status) => return (status, None),
+    };
+    let node = match self.attrs_of(&identity) {
+      Ok(node) => node,
+      Err(status) => return (status, None),
+    };
+    // The guard is a compare-and-set on the object's change time (a stale cache is refused).
+    if let Some(guard) = guard_ctime
+      && guard != node.ctime
+    {
+      return (Nfsstat3::NotSync, Some(self.fattr3(&node)));
+    }
+    let cx = match self.op_context() {
+      Ok(cx) => cx,
+      Err(e) => return (nfsstat_of(&e), Some(self.fattr3(&node))),
+    };
+    let object = ObjectId::new(identity.inode, identity.generation);
+    match self.bridge.setattr(object, &cx, changes) {
+      Ok(updated) => (Nfsstat3::Ok, Some(self.fattr3(&updated))),
+      Err(e) => {
+        let post = self.attrs_of(&identity).ok().map(|n| self.fattr3(&n));
+        (nfsstat_of(&e), post)
+      }
+    }
+  }
+
+  /// Decodes an `sattr3` (RFC 1813 §3.3.2) into the neutral [`SetAttr`]: each optional field becomes
+  /// `Some` only when the caller asks to set it, and a `SET_TO_SERVER_TIME` time is resolved to the
+  /// volume's wall clock now (AC-3.10), so the seam receives explicit values and never has to guess.
+  fn decode_sattr3(&mut self, args: &mut XdrReader<'_>) -> Result<SetAttr, Nfsstat3> {
+    let mode = decode_optional_u32(args)?;
+    let uid = decode_optional_u32(args)?;
+    let gid = decode_optional_u32(args)?;
+    let size = if args.bool().map_err(|_| Nfsstat3::Inval)? {
+      Some(args.u64().map_err(|_| Nfsstat3::Inval)?)
+    } else {
+      None
+    };
+    let atime_how = args.u32().map_err(|_| Nfsstat3::Inval)?;
+    let atime_client = if atime_how == TIME_SET_TO_CLIENT {
+      Some(nfstime_to_ns(
+        &Nfstime3::decode(args).map_err(|_| Nfsstat3::Inval)?,
+      ))
+    } else {
+      None
+    };
+    let mtime_how = args.u32().map_err(|_| Nfsstat3::Inval)?;
+    let mtime_client = if mtime_how == TIME_SET_TO_CLIENT {
+      Some(nfstime_to_ns(
+        &Nfstime3::decode(args).map_err(|_| Nfsstat3::Inval)?,
+      ))
+    } else {
+      None
+    };
+    // Resolve any SET_TO_SERVER_TIME to the wall clock once (AC-3.10).
+    let server_now = if atime_how == TIME_SET_TO_SERVER || mtime_how == TIME_SET_TO_SERVER {
+      Some(self.bridge.now())
+    } else {
+      None
+    };
+    Ok(SetAttr {
+      size,
+      mode,
+      uid,
+      gid,
+      atime: resolve_set_time(atime_how, atime_client, server_now)?,
+      mtime: resolve_set_time(mtime_how, mtime_client, server_now)?,
+    })
+  }
+
   /// NFSPROC3_FSSTAT: the volume's dynamic statistics — space and file counts — from the shared
   /// seam's `statfs`, in the bytes and counts NFS reports.
   pub fn fsstat(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
@@ -672,6 +792,41 @@ fn encode_wcc(writer: &mut XdrWriter, post: Option<Fattr3>) {
   PostOpAttr(post).encode(writer);
 }
 
+/// Decodes an `sattr3` optional `u32` (`set_mode3`/`set_uid3`/`set_gid3`): a bool, then the value
+/// when it is set, `None` otherwise.
+fn decode_optional_u32(args: &mut XdrReader<'_>) -> Result<Option<u32>, Nfsstat3> {
+  if args.bool().map_err(|_| Nfsstat3::Inval)? {
+    Ok(Some(args.u32().map_err(|_| Nfsstat3::Inval)?))
+  } else {
+    Ok(None)
+  }
+}
+
+/// Resolves an `sattr3` time field to the neutral optional nanosecond value the seam takes:
+/// `DONT_CHANGE` is `None`, `SET_TO_CLIENT_TIME` is the client's value, `SET_TO_SERVER_TIME` is the
+/// resolved wall-clock `now`. An unknown `time_how` is a typed refusal. The `client` and
+/// `server_now` inputs are `Some` exactly when the matching `how` was decoded, so the mapping is
+/// total.
+fn resolve_set_time(
+  how: u32,
+  client: Option<i64>,
+  server_now: Option<i64>,
+) -> Result<Option<i64>, Nfsstat3> {
+  match how {
+    TIME_DONT_CHANGE => Ok(None),
+    TIME_SET_TO_CLIENT => Ok(client),
+    TIME_SET_TO_SERVER => Ok(server_now),
+    _ => Err(Nfsstat3::Inval),
+  }
+}
+
+/// An `nfstime3` (seconds and nanoseconds) as the volume core's `i64` nanoseconds since the epoch.
+fn nfstime_to_ns(t: &Nfstime3) -> i64 {
+  i64::from(t.seconds)
+    .saturating_mul(NS_PER_SEC)
+    .saturating_add(i64::from(t.nseconds))
+}
+
 /// The NFSv3 file type for a volume entry kind.
 fn ftype3_of(kind: Kind) -> Ftype3 {
   match kind {
@@ -684,8 +839,6 @@ fn ftype3_of(kind: Kind) -> Ftype3 {
 /// An `nfstime3` from a nanosecond time, clamping a negative value to the epoch (the wire takes
 /// unsigned seconds).
 fn nfstime_of(ns: i64) -> Nfstime3 {
-  /// Format: nanoseconds per second.
-  const NS_PER_SEC: i64 = 1_000_000_000;
   let ns = ns.max(0);
   Nfstime3 {
     seconds: u32::try_from(ns / NS_PER_SEC).unwrap_or(u32::MAX),

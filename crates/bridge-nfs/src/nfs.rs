@@ -44,6 +44,9 @@ pub enum Nfsstat3 {
   Stale = 70,
   /// Format: NFS3ERR_BADHANDLE — an illegal file handle.
   Badhandle = 10001,
+  /// Format: NFS3ERR_NOT_SYNC — a SETATTR guard's ctime did not match the object's, so the
+  /// caller's cached state is out of date and the update is refused (RFC 1813 §3.3.2).
+  NotSync = 10002,
   /// Format: NFS3ERR_NOTSUPP — the operation is not supported.
   Notsupp = 10004,
   /// Format: NFS3ERR_SERVERFAULT — an error not covered by the protocol.

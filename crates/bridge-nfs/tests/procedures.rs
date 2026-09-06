@@ -12,7 +12,8 @@ use slates_bridge_nfs::mount::MountReply;
 use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
 use slates_bridge_nfs::procedures::{
   Export, NFSPROC3_ACCESS, NFSPROC3_FSINFO, NFSPROC3_FSSTAT, NFSPROC3_GETATTR, NFSPROC3_NULL,
-  NFSPROC3_READ, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_WRITE,
+  NFSPROC3_READ, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR,
+  NFSPROC3_WRITE,
 };
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_db::catalog::{Principal, VolumeId};
@@ -792,5 +793,187 @@ fn a_rename_over_the_export_moves_the_entry() {
   assert_eq!(
     attr.fileid, file_ino,
     "the same object moved to the new name"
+  );
+}
+
+/// SETATTR over the export changes the mode (a chmod), and a following GETATTR shows it stuck; the
+/// reply's wcc carries the new attributes.
+#[test]
+fn a_setattr_over_the_export_chmods() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (created, _fh) = bridge.create(oid(root_ino), &cx, "cfg", 0o644, 0).unwrap();
+  let file_ino = created.ino;
+
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let file_fh = slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: file_ino,
+    generation: 0,
+  }
+  .to_fh();
+
+  // SETATTR: set only the mode to 0o600.
+  let mut args = XdrWriter::new();
+  file_fh.encode(&mut args);
+  args.bool(true); // mode set
+  args.u32(0o600);
+  args.bool(false); // uid unset
+  args.bool(false); // gid unset
+  args.bool(false); // size unset
+  args.u32(0); // atime DONT_CHANGE
+  args.u32(0); // mtime DONT_CHANGE
+  args.bool(false); // guard unset
+  let reply = export
+    .serve_nfs(NFSPROC3_SETATTR, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "SETATTR succeeded");
+  assert!(!r.bool().unwrap(), "wcc: no pre-op attributes");
+  let post = PostOpAttr::decode(&mut r).unwrap().0.expect("post attrs");
+  assert_eq!(post.mode, 0o600, "the wcc reports the new mode");
+
+  // GETATTR confirms it stuck.
+  let mut ga = XdrWriter::new();
+  file_fh.encode(&mut ga);
+  let greply = export
+    .serve_nfs(NFSPROC3_GETATTR, &mut XdrReader::new(ga.as_slice()))
+    .unwrap();
+  let mut gr = XdrReader::new(&greply);
+  assert_eq!(gr.u32().unwrap(), Nfsstat3::Ok.wire());
+  assert_eq!(Fattr3::decode(&mut gr).unwrap().mode, 0o600);
+}
+
+/// SETATTR resolves both time modes: SET_TO_CLIENT_TIME keeps the client's explicit value,
+/// SET_TO_SERVER_TIME is resolved to the volume's wall clock at the seam (AC-3.10).
+#[test]
+fn a_setattr_sets_client_and_server_times() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (created, _fh) = bridge.create(oid(root_ino), &cx, "t", 0o644, 0).unwrap();
+  let file_ino = created.ino;
+
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let file_fh = slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: file_ino,
+    generation: 0,
+  }
+  .to_fh();
+
+  // SETATTR: atime = client 123.000000456, mtime = server time.
+  let mut args = XdrWriter::new();
+  file_fh.encode(&mut args);
+  args.bool(false); // mode
+  args.bool(false); // uid
+  args.bool(false); // gid
+  args.bool(false); // size
+  args.u32(2); // atime SET_TO_CLIENT_TIME
+  args.u32(123); // atime seconds
+  args.u32(456); // atime nseconds
+  args.u32(1); // mtime SET_TO_SERVER_TIME
+  args.bool(false); // guard
+  let reply = export
+    .serve_nfs(NFSPROC3_SETATTR, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "SETATTR succeeded");
+  assert!(!r.bool().unwrap());
+  let post = PostOpAttr::decode(&mut r).unwrap().0.expect("post attrs");
+  assert_eq!(post.atime.seconds, 123, "atime is the client's value");
+  assert_eq!(post.atime.nseconds, 456);
+  assert!(
+    post.mtime.seconds > 0,
+    "mtime is resolved to the server's wall clock, not zero"
+  );
+}
+
+/// A SETATTR whose guard ctime does not match the object's is refused NFS3ERR_NOT_SYNC and applies
+/// nothing — the compare-and-set protects against a lost update on stale client state.
+#[test]
+fn a_setattr_guard_mismatch_is_not_sync() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (created, _fh) = bridge.create(oid(root_ino), &cx, "g", 0o644, 0).unwrap();
+  let file_ino = created.ino;
+
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let file_fh = slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: file_ino,
+    generation: 0,
+  }
+  .to_fh();
+
+  // SETATTR mode 0o600 with a guard ctime of 1ns, which cannot match the real create ctime.
+  let mut args = XdrWriter::new();
+  file_fh.encode(&mut args);
+  args.bool(true); // mode set
+  args.u32(0o600);
+  args.bool(false); // uid
+  args.bool(false); // gid
+  args.bool(false); // size
+  args.u32(0); // atime DONT_CHANGE
+  args.u32(0); // mtime DONT_CHANGE
+  args.bool(true); // guard set
+  args.u32(0); // guard ctime seconds
+  args.u32(1); // guard ctime nseconds (1ns since the epoch — cannot match)
+  let reply = export
+    .serve_nfs(NFSPROC3_SETATTR, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&reply).u32().unwrap(),
+    Nfsstat3::NotSync.wire(),
+    "a guard mismatch is NOT_SYNC"
+  );
+
+  // The mode did not change.
+  let mut ga = XdrWriter::new();
+  file_fh.encode(&mut ga);
+  let greply = export
+    .serve_nfs(NFSPROC3_GETATTR, &mut XdrReader::new(ga.as_slice()))
+    .unwrap();
+  let mut gr = XdrReader::new(&greply);
+  assert_eq!(gr.u32().unwrap(), Nfsstat3::Ok.wire());
+  assert_eq!(
+    Fattr3::decode(&mut gr).unwrap().mode,
+    0o644,
+    "the refused SETATTR applied nothing"
   );
 }
