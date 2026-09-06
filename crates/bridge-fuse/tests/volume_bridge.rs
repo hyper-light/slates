@@ -5,10 +5,34 @@
 // Test harness code: an unwrap here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use slates_bridge_core::{Attachments, OpContext, Rights, View};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
-use slates_bridge_fuse::bridge::dispatch;
 use slates_bridge_fuse::reply::EntryOut;
 use slates_bridge_fuse::volume_bridge::VolumeBridge;
+use slates_db::catalog::{Principal, VolumeId};
+
+/// A read-write current-view context, minted through the attachment registry (the only way to
+/// build an `OpContext`), so the dispatch call sites below stay unchanged.
+fn test_cx() -> OpContext {
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VolumeId { bytes: [0; 16] },
+      View::Current,
+      Principal::Uid { uid: 0 },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  attachments.context(id).unwrap()
+}
+
+/// Drives the crate's dispatch with a real read-write context.
+fn dispatch(message: &[u8], bridge: &mut VolumeBridge<'_>, out: &mut [u8]) -> usize {
+  slates_bridge_fuse::bridge::dispatch(message, bridge, &test_cx(), out)
+}
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
 use slates_vfs::clock::HostClock;
@@ -196,9 +220,11 @@ fn a_fuse_round_trip_drives_the_volume_core() {
   );
 }
 
-/// A lookup of a name that does not exist is ENOENT; a read on a stale handle is EINVAL.
+/// A lookup of a name that does not exist is ENOENT; a read of an inode the volume does not have
+/// is ENOENT — reads are addressed by inode now, not an open handle, so a handle value is never
+/// consulted for the read.
 #[test]
-fn missing_names_and_stale_handles_are_typed_errnos() {
+fn missing_names_and_absent_inodes_are_typed_errnos() {
   let mut store = store();
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(&mut vol, &mut store);
@@ -216,8 +242,7 @@ fn missing_names_and_stale_handles_are_typed_errnos() {
   );
 
   let mut r = vec![0u8; 24];
-  r[0..8].copy_from_slice(&999u64.to_le_bytes()); // a handle never opened
-  r[16..20].copy_from_slice(&16u32.to_le_bytes());
+  r[16..20].copy_from_slice(&16u32.to_le_bytes()); // size; the handle word is unused for a read
   dispatch(
     &message(Opcode::Read.to_wire(), 2, 2, &r),
     &mut bridge,
@@ -225,8 +250,8 @@ fn missing_names_and_stale_handles_are_typed_errnos() {
   );
   assert_eq!(
     i32::from_le_bytes(out[4..8].try_into().unwrap()),
-    -22,
-    "EINVAL"
+    -2,
+    "ENOENT: the volume has no such inode"
   );
 }
 

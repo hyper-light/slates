@@ -22,6 +22,7 @@ use crate::abi::IN_HEADER_LEN;
 use crate::bridge::Bridge;
 use crate::dispatch;
 use crate::error::FuseError;
+use slates_bridge_core::{AttachmentId, Attachments};
 
 /// Format: the device the kernel's FUSE client and the daemon exchange messages over.
 const FUSE_DEVICE: &str = "/dev/fuse";
@@ -137,6 +138,8 @@ impl FuseChannel {
 pub fn serve_blocking(
   channel: &mut FuseChannel,
   bridge: &mut dyn Bridge,
+  attachments: &Attachments,
+  attachment: AttachmentId,
 ) -> Result<(), ChannelError> {
   let mut reply = vec![0u8; BUFFER_BYTES];
   loop {
@@ -153,9 +156,16 @@ pub fn serve_blocking(
     // `dispatch` needs a mutable reply buffer separate from the request buffer the channel
     // owns; borrow-split by moving the request into a local copy for the call is avoided by
     // dispatching from the channel's buffer into `reply`.
+    // Build the authenticated context from the mount's attachment before each effect, so a
+    // revoked or epoch-fenced attachment stops the mount rather than serving a request under
+    // stale authority (§4.8; per-request revalidation, the "checked before effects" rule). The
+    // registry's concurrent-revoke ownership is the async driver's design (owed).
+    let Ok(cx) = attachments.context(attachment) else {
+      return Ok(());
+    };
     let n = {
       let request = channel.take_request();
-      dispatch(&request, bridge, &mut reply)
+      dispatch(&request, bridge, &cx, &mut reply)
     };
     if n > 0 {
       channel.write_reply(&reply[..n])?;

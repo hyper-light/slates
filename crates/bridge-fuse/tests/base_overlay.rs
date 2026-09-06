@@ -10,10 +10,34 @@
 use std::path::Path;
 
 use slates_base::OsHost;
+use slates_bridge_core::{Attachments, OpContext, Rights, View};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
-use slates_bridge_fuse::bridge::dispatch;
 use slates_bridge_fuse::reply::EntryOut;
 use slates_bridge_fuse::volume_bridge::VolumeBridge;
+use slates_db::catalog::{Principal, VolumeId};
+
+/// A read-write current-view context, minted through the attachment registry (the only way to
+/// build an `OpContext`), so the dispatch call sites below stay unchanged.
+fn test_cx() -> OpContext {
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VolumeId { bytes: [0; 16] },
+      View::Current,
+      Principal::Uid { uid: 0 },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  attachments.context(id).unwrap()
+}
+
+/// Drives the crate's dispatch with a real read-write context.
+fn dispatch(message: &[u8], bridge: &mut VolumeBridge<'_>, out: &mut [u8]) -> usize {
+  slates_bridge_fuse::bridge::dispatch(message, bridge, &test_cx(), out)
+}
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
 use slates_vfs::base::BaseConfig;

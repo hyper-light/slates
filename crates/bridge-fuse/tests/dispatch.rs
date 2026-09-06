@@ -7,10 +7,13 @@
 // Test harness code: an unwrap here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use slates_bridge_core::{FsStat, NodeAttr, RenameFlags, SetAttr};
+use slates_bridge_core::{
+  Attachments, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, Rights, SetAttr, View,
+};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
-use slates_bridge_fuse::bridge::{Bridge, DirEntry, ENOSYS, dispatch};
+use slates_bridge_fuse::bridge::{Bridge, DirEntry, ENOSYS};
 use slates_bridge_fuse::reply::EntryOut;
+use slates_db::catalog::{Principal, VolumeId};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
@@ -83,8 +86,8 @@ impl Bridge for Mock {
   }
   fn read(
     &mut self,
-    _ino: u64,
-    _fh: u64,
+    _object: ObjectId,
+    _cx: &OpContext,
     offset: u64,
     size: u32,
     out: &mut Vec<u8>,
@@ -98,7 +101,13 @@ impl Bridge for Mock {
     out.extend_from_slice(&self.content[start..end]);
     Ok(())
   }
-  fn write(&mut self, _ino: u64, _fh: u64, offset: u64, data: &[u8]) -> Result<u32, VfsError> {
+  fn write(
+    &mut self,
+    _object: ObjectId,
+    _cx: &OpContext,
+    offset: u64,
+    data: &[u8],
+  ) -> Result<u32, VfsError> {
     let at = usize::try_from(offset).unwrap_or(0);
     if self.content.len() < at + data.len() {
       self.content.resize(at + data.len(), 0);
@@ -188,6 +197,29 @@ impl Bridge for Mock {
   fn statfs(&mut self, _ino: u64) -> Result<FsStat, VfsError> {
     Err(VfsError::Invalid)
   }
+}
+
+/// A read-write current-view context, built through the attachment registry the way the daemon
+/// would (the registry mints the only `OpContext`; a test cannot fabricate one).
+fn test_cx() -> OpContext {
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VolumeId { bytes: [0; 16] },
+      View::Current,
+      Principal::Uid { uid: 0 },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  attachments.context(id).unwrap()
+}
+
+/// Drives the crate's dispatch with a real read-write context, so the call sites stay unchanged.
+fn dispatch(message: &[u8], bridge: &mut dyn Bridge, out: &mut [u8]) -> usize {
+  slates_bridge_fuse::bridge::dispatch(message, bridge, &test_cx(), out)
 }
 
 fn message(opcode: u32, unique: u64, nodeid: u64, body: &[u8]) -> Vec<u8> {

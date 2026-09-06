@@ -7,7 +7,10 @@
 // Test harness code: an unwrap here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use slates_bridge_core::{Bridge, RenameFlags, SetAttr, VolumeBridge};
+use slates_bridge_core::{
+  Attachments, Bridge, ObjectId, OpContext, RenameFlags, Rights, SetAttr, View, VolumeBridge,
+};
+use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
 use slates_vfs::clock::HostClock;
@@ -18,6 +21,31 @@ use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
 /// Shape: the page and a small arena for the test volume.
 const PAGE: usize = 4096;
 const REGION_PAGES: usize = 4096;
+
+/// A context minted through the attachment registry (the only way to build one).
+fn context(view: View, rights: Rights) -> OpContext {
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VolumeId { bytes: [0; 16] },
+      view,
+      Principal::Uid { uid: 0 },
+      rights,
+    )
+    .unwrap();
+  attachments.context(id).unwrap()
+}
+
+/// A read-write current-view context.
+fn rw_cx() -> OpContext {
+  context(
+    View::Current,
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+}
 
 fn store() -> Store {
   let mut arena = ChunkArena::new(PAGE);
@@ -169,17 +197,19 @@ fn open_handles_are_reused_so_memory_stays_bounded() {
   let ino = attr.ino;
   bridge.release(ino, create_fh).unwrap();
 
+  let obj = ObjectId {
+    inode: ino,
+    generation: 0,
+  };
+  let cx = rw_cx();
   let fh1 = bridge.open(ino, 0).unwrap();
   bridge.release(ino, fh1).unwrap();
   let fh2 = bridge.open(ino, 0).unwrap();
   let mut out = Vec::new();
+  // A read is addressed by inode now, not the handle; the handle table only holds per-open state.
   assert!(
-    bridge.read(ino, fh1, 0, 16, &mut out).is_err(),
-    "a released handle is stale, never a wrong inode"
-  );
-  assert!(
-    bridge.read(ino, fh2, 0, 16, &mut out).is_ok(),
-    "the reused handle works"
+    bridge.read(obj, &cx, 0, 16, &mut out).is_ok(),
+    "a read is addressed by inode"
   );
   bridge.release(ino, fh2).unwrap();
 
@@ -193,5 +223,62 @@ fn open_handles_are_reused_so_memory_stays_bounded() {
     before,
     format!("{bridge:?}"),
     "open/release cycles reuse slots and leak no handles"
+  );
+}
+
+/// A write under a read-only attachment is refused before any effect, though a read is allowed
+/// (Ada review: authorization of an actual write, not only ACCESS reporting).
+#[test]
+fn a_write_is_refused_on_a_read_only_attachment() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
+  let root = bridge.root().unwrap();
+  let (attr, _fh) = bridge.create(root, "f", 0o644, 0).unwrap();
+  let obj = ObjectId {
+    inode: attr.ino,
+    generation: 0,
+  };
+  let read_only = context(
+    View::Current,
+    Rights {
+      read: true,
+      write: false,
+    },
+  );
+  assert!(
+    bridge.write(obj, &read_only, 0, b"x").is_err(),
+    "a read-only attachment cannot write"
+  );
+  let mut out = Vec::new();
+  assert!(
+    bridge.read(obj, &read_only, 0, 16, &mut out).is_ok(),
+    "but it can read"
+  );
+}
+
+/// A write against a pinned immutable view is refused (a green-volume or snapshot attachment is
+/// read-only, §4.16).
+#[test]
+fn a_write_is_refused_on_a_pinned_view() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
+  let root = bridge.root().unwrap();
+  let (attr, _fh) = bridge.create(root, "f", 0o644, 0).unwrap();
+  let obj = ObjectId {
+    inode: attr.ino,
+    generation: 0,
+  };
+  let pinned = context(
+    View::Version(1),
+    Rights {
+      read: true,
+      write: true,
+    },
+  );
+  assert!(
+    bridge.write(obj, &pinned, 0, b"x").is_err(),
+    "a pinned view cannot write"
   );
 }

@@ -19,6 +19,7 @@ slates-base = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
+slates-db = { workspace = true }
 slates-vfs = { workspace = true }
 
 [lints]

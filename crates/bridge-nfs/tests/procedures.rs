@@ -7,20 +7,37 @@
 // Test harness code: an unwrap here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use slates_bridge_core::{Bridge, VolumeBridge};
+use slates_bridge_core::{Attachments, Bridge, ObjectId, OpContext, Rights, View, VolumeBridge};
 use slates_bridge_nfs::mount::MountReply;
 use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
 use slates_bridge_nfs::procedures::{
   Export, NFSPROC3_ACCESS, NFSPROC3_FSINFO, NFSPROC3_FSSTAT, NFSPROC3_GETATTR, NFSPROC3_NULL,
 };
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
-use slates_db::catalog::VolumeId;
+use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
 use slates_vfs::clock::HostClock;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::Quota;
 use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
+
+/// A read-write context minted through the attachment registry.
+fn write_cx() -> OpContext {
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VolumeId { bytes: [0x11; 16] },
+      View::Current,
+      Principal::Uid { uid: 0 },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  attachments.context(id).unwrap()
+}
 
 const PAGE: usize = 4096;
 const REGION_PAGES: usize = 4096;
@@ -339,7 +356,7 @@ fn a_handle_survives_copy_on_write_of_its_object() {
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(&mut vol, &mut store);
   let root_ino = bridge.root().unwrap();
-  let (created, fh) = bridge.create(root_ino, "f", 0o644, 0).unwrap();
+  let (created, _fh) = bridge.create(root_ino, "f", 0o644, 0).unwrap();
   let file_ino = created.ino;
 
   // Take a handle, then write through the file (a copy-on-write of the inode version).
@@ -349,7 +366,17 @@ fn a_handle_survives_copy_on_write_of_its_object() {
     generation: 0,
   }
   .to_fh();
-  bridge.write(file_ino, fh, 0, b"hello world").unwrap();
+  bridge
+    .write(
+      ObjectId {
+        inode: file_ino,
+        generation: 0,
+      },
+      &write_cx(),
+      0,
+      b"hello world",
+    )
+    .unwrap();
 
   let mut export = Export::new(&mut bridge, VolumeId { bytes: [0x11; 16] });
   let mut args = XdrWriter::new();

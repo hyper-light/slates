@@ -16,7 +16,7 @@ use crate::reply::{Attr, AttrOut, DirBuffer, EntryOut, OpenOut, ReplyHeader, Sta
 use crate::request::{ReadIn, RenameIn, Request, SetAttrIn, WriteIn, parse_name};
 
 pub use slates_bridge_core::{Bridge, DirEntry};
-use slates_bridge_core::{FsStat, NodeAttr, RenameFlags, SetAttr};
+use slates_bridge_core::{FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
@@ -68,7 +68,7 @@ const BLKSIZE: u32 = 4096;
 /// written. A parse failure replies `EIO`; an unserved opcode replies `ENOSYS`; a refusal
 /// replies its mapped errno. `INIT` is answered here (it negotiates, it is not a Bridge method).
 /// The transport calls this for every message and writes `out[..n]` back to the kernel.
-pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, out: &mut [u8]) -> usize {
+pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &mut [u8]) -> usize {
   let request = match Request::parse(message) {
     Ok(r) => r,
     // A message the codec cannot parse: reply EIO with the unique the header would carry when
@@ -89,8 +89,8 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, out: &mut [u8]) -> usiz
     Opcode::GetAttr => serve_getattr(bridge, &request, out),
     Opcode::Open => serve_open(bridge, &request, Opcode::Open, out),
     Opcode::OpenDir => serve_open(bridge, &request, Opcode::OpenDir, out),
-    Opcode::Read => serve_read(bridge, &request, out),
-    Opcode::Write => serve_write(bridge, &request, out),
+    Opcode::Read => serve_read(bridge, &request, cx, out),
+    Opcode::Write => serve_write(bridge, &request, cx, out),
     Opcode::ReadDir => serve_readdir(bridge, &request, out),
     Opcode::Create => serve_create(bridge, &request, out),
     Opcode::Release | Opcode::ReleaseDir => serve_release(bridge, &request, out),
@@ -300,25 +300,40 @@ fn serve_open(bridge: &mut dyn Bridge, req: &Request<'_>, opcode: Opcode, out: &
   )
 }
 
-fn serve_read(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
+fn serve_read(bridge: &mut dyn Bridge, req: &Request<'_>, cx: &OpContext, out: &mut [u8]) -> usize {
   let Ok(r) = ReadIn::parse(Opcode::Read.to_wire(), req.body) else {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   };
+  // A read is never on the root, so the node id is the file's inode; the FUSE node id carries no
+  // generation (generation-tracked node-id reuse is owed), so it is zero.
+  let object = ObjectId {
+    inode: req.header.nodeid,
+    generation: 0,
+  };
   let mut data = Vec::new();
-  match bridge.read(req.header.nodeid, r.fh, r.offset, r.size, &mut data) {
+  match bridge.read(object, cx, r.offset, r.size, &mut data) {
     Ok(()) => write_or_drop(ReplyHeader::write_ok(req.header.unique, &data, out), out),
     Err(e) => reply_err(req.header.unique, e, out),
   }
 }
 
-fn serve_write(bridge: &mut dyn Bridge, req: &Request<'_>, out: &mut [u8]) -> usize {
+fn serve_write(
+  bridge: &mut dyn Bridge,
+  req: &Request<'_>,
+  cx: &OpContext,
+  out: &mut [u8],
+) -> usize {
   let Ok(w) = WriteIn::parse(Opcode::Write.to_wire(), req.body) else {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  let object = ObjectId {
+    inode: req.header.nodeid,
+    generation: 0,
   };
   reply(
     req.header.unique,
     bridge
-      .write(req.header.nodeid, w.fh, w.offset, w.data)
+      .write(object, cx, w.offset, w.data)
       .map(|size| WriteOut { size }),
     |o| o.to_bytes(),
     out,

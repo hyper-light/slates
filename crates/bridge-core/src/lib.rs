@@ -134,17 +134,26 @@ pub trait Bridge {
   fn getattr(&mut self, ino: u64) -> Result<NodeAttr, VfsError>;
   /// Open `ino`; the file handle.
   fn open(&mut self, ino: u64, flags: u32) -> Result<u64, VfsError>;
-  /// Read `size` bytes at `offset` from handle `fh` of `ino` into `out`.
+  /// Read `size` bytes at `offset` from `object` into `out`, under the authenticated `cx`. The
+  /// object is addressed by identity (§4.6), not an open handle; `cx` carries the view and the
+  /// granted access, and a read the context does not authorize is refused.
   fn read(
     &mut self,
-    ino: u64,
-    fh: u64,
+    object: ObjectId,
+    cx: &OpContext,
     offset: u64,
     size: u32,
     out: &mut Vec<u8>,
   ) -> Result<(), VfsError>;
-  /// Write `data` at `offset` to handle `fh` of `ino`; the bytes written.
-  fn write(&mut self, ino: u64, fh: u64, offset: u64, data: &[u8]) -> Result<u32, VfsError>;
+  /// Write `data` at `offset` to `object` under the authenticated `cx`; the bytes written. A write
+  /// against a read-only attachment or a pinned view is refused before any effect.
+  fn write(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    offset: u64,
+    data: &[u8],
+  ) -> Result<u32, VfsError>;
   /// Open directory `ino`; the handle.
   fn opendir(&mut self, ino: u64) -> Result<u64, VfsError>;
   /// The entries of directory `ino` from `offset` (each entry's position is the resume cookie).

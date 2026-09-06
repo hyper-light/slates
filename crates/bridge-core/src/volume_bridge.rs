@@ -13,7 +13,7 @@ use slates_vfs::error::VfsError;
 use slates_vfs::inode::{Attrs, Kind};
 use slates_vfs::volume::{Store, Volume};
 
-use crate::{Bridge, DirEntry, FsStat, NodeAttr, RenameFlags, SetAttr};
+use crate::{Bridge, DirEntry, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr, View};
 
 /// Shape: the read cap, one arena chunk (256 KiB), matched to the INIT negotiation; here it
 /// bounds a single reply buffer.
@@ -86,17 +86,6 @@ impl<'v> VolumeBridge<'v> {
   /// generation.
   fn open_handle(&mut self, inode: u64) -> Result<u64, VfsError> {
     Ok(pack_handle(self.handles.insert(inode)?))
-  }
-
-  /// The inode a handle names. A word that names no open slot — never opened, or released and
-  /// the slot's generation moved on — is an invalid argument (`EINVAL` at the FUSE edge, the
-  /// tested behavior; the NFS edge maps the same miss to a stale-handle status).
-  fn handle_inode(&self, fh: u64) -> Result<u64, VfsError> {
-    self
-      .handles
-      .get(unpack_handle(fh))
-      .copied()
-      .map_err(|_| VfsError::Invalid)
   }
 
   /// The neutral attributes of inode `no`: its stat (through the host for an overlay's base
@@ -173,16 +162,18 @@ impl Bridge for VolumeBridge<'_> {
 
   fn read(
     &mut self,
-    _ino: u64,
-    fh: u64,
+    object: ObjectId,
+    cx: &OpContext,
     offset: u64,
     size: u32,
     out: &mut Vec<u8>,
   ) -> Result<(), VfsError> {
-    let no = self.handle_inode(fh)?;
+    if !cx.rights.read {
+      return Err(VfsError::NotPermitted);
+    }
     let want = usize::try_from(size).unwrap_or(0).min(self.max_read);
     let mut buf = vec![0u8; want];
-    let inode = slates_vfs::ids::InodeNo(no);
+    let inode = slates_vfs::ids::InodeNo(object.inode);
     let read = match self.host.as_mut() {
       Some(host) => self
         .volume
@@ -194,9 +185,22 @@ impl Bridge for VolumeBridge<'_> {
     Ok(())
   }
 
-  fn write(&mut self, _ino: u64, fh: u64, offset: u64, data: &[u8]) -> Result<u32, VfsError> {
-    let no = self.handle_inode(fh)?;
-    let inode = slates_vfs::ids::InodeNo(no);
+  fn write(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    offset: u64,
+    data: &[u8],
+  ) -> Result<u32, VfsError> {
+    // A write against a read-only attachment, or a pinned immutable view, is refused before any
+    // effect (§4.6 EROFS/EACCES; the precise errno per case is a taxonomy refinement).
+    if !cx.rights.write {
+      return Err(VfsError::NotPermitted);
+    }
+    if !matches!(cx.view, View::Current) {
+      return Err(VfsError::NotPermitted);
+    }
+    let inode = slates_vfs::ids::InodeNo(object.inode);
     // An overlay write copies the base up first (through the host); a scratch write does not.
     let written = match self.host.as_mut() {
       Some(host) => self
