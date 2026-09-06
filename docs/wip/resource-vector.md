@@ -77,13 +77,21 @@ remains"), and accepts again after an unlink frees one — proving the live coun
 
 ## 3. The other dimensions
 
-Namespace (entry count/bytes), xattr, open-handle and in-flight allowances follow the same shape: a
-per-volume counter at its single mutation site, a derived allowance, a typed refusal, and — where a
-determinism oracle exercises the path — the reference model updated in step. The **retention**
-dimension (snapshot-retained inodes and bytes) is the one that interacts with recovery: a recovered
-snapshot's retained content is a separate charge from the head (§4.2 "a new retained snapshot may
-require a separate retention charge"), and it pairs with the snapshot-deadlist reconstruction owed
-in docs/wip/recovery.md.
+- **Namespace** (directory entries): *landed*, the same shape — a live-entry count at
+  `dir_insert`/`dir_remove`, a `quota / size_of::<Child>()` allowance, a `NoSpace` refusal — bounding
+  hard-link fan-out the inode allowance cannot.
+- **Xattr**: **not applicable** — the volume core does not implement extended attributes, so there is
+  no resource to bound; a dimension would be added with the feature.
+- **Open handles**: **already bounded elsewhere** — the bridge's attachment/handle registry is a
+  bounded `Slab` that refuses `SlabFull` (BUG-4). Charging those handles against §4.2 admission (so
+  they count toward the reservation below) is the owed refinement.
+- **In-flight**: bounded by the ring/credit admission (§4.7), not a per-volume vfs dimension.
+- **Retention** (snapshot-retained inodes and bytes): interacts with recovery — a recovered
+  snapshot's retained content is a separate charge from the head (§4.2 "a new retained snapshot may
+  require a separate retention charge"); it pairs with snapshot recovery (docs/wip/recovery.md).
+
+So the applicable per-volume **caps** are in place (content=quota, inode, namespace); the remaining
+§4.2 work is the step from cap to **reservation** below, plus retention and the handle charge.
 
 ## 4. Full admission (beyond a cap)
 
