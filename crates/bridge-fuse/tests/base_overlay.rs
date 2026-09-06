@@ -264,3 +264,45 @@ fn a_base_write_copies_up_and_leaves_the_disk_untouched() {
   let still = std::fs::read(format!("{base}/lib.rs")).unwrap();
   assert_eq!(still, original, "the disk was never written (R1)");
 }
+
+/// A direct LOOKUP of an untouched base file — with no prior READDIR to hydrate the directory —
+/// finds it through the base plane (audit BUG-5). The previous lookup was not host-aware, so it
+/// found a base entry only after a listing had populated the dirtree; a tool that opens a file by
+/// path without listing its directory first would have gotten a spurious ENOENT.
+#[test]
+fn a_base_file_is_found_by_direct_lookup_without_a_prior_readdir() {
+  let base = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+  let (mut host, root) = OsHost::open_root(Path::new(base)).unwrap();
+  let facts = host.facts(root).unwrap();
+  let mut store = store();
+  let mut vol = Volume::create_overlay(
+    &mut store,
+    VolumeConfig {
+      prefix: 1,
+      names: NameEquivalence::Exact,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 16,
+      clock: Box::new(HostClock::default()),
+    },
+    BaseConfig {
+      root,
+      facts,
+      large_class_bytes: 1 << 20,
+    },
+  )
+  .unwrap();
+  let mut bridge = VolumeBridge::with_base(VolumeId { bytes: [0; 16] }, &mut vol, &mut store, host);
+  let mut out = vec![0u8; 1 << 20];
+
+  // No READDIR first — a tool opening a file by path looks it up directly.
+  let n = dispatch(
+    &message(Opcode::Lookup.to_wire(), 1, 1, &name_body("lib.rs")),
+    &mut bridge,
+    &mut out,
+  );
+  assert!(
+    ok(&out),
+    "a base file is found by direct lookup, without listing its directory first"
+  );
+  assert!(n >= OUT_HEADER_LEN + EntryOut::LEN);
+}

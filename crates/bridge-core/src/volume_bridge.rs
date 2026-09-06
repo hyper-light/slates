@@ -213,10 +213,16 @@ impl Bridge for VolumeBridge<'_> {
 
   fn lookup(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<NodeAttr, VfsError> {
     self.authorize_read(cx)?;
-    let located =
-      self
-        .volume
-        .lookup_no(self.store, slates_vfs::ids::InodeNo(parent.inode), name)?;
+    let dir = slates_vfs::ids::InodeNo(parent.inode);
+    // Host-aware for an overlay volume (audit BUG-5): a base entry not yet hydrated into the
+    // dirtree is found through the base plane's own lookup (which consults its change-time listing
+    // cache), so a direct LOOKUP of an untouched base file works without a prior READDIR. The plain
+    // path had found a base entry only after a listing had populated the dirtree. This mirrors how
+    // `attr_of`/`readdir`/`read` already consult the host; a scratch volume uses the plain lookup.
+    let located = match self.host.as_mut() {
+      Some(host) => self.volume.with_host(host).lookup_no(self.store, dir, name),
+      None => self.volume.lookup_no(self.store, dir, name),
+    }?;
     let attr = self.attr_of(located.inode.0)?;
     // No implicit reference: a transport that owns lookup references (FUSE) takes one explicitly
     // through `reference`; NFS takes none (§3). Fixes the NFS lookup-reference leak.
