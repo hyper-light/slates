@@ -1136,6 +1136,23 @@ fn create(
     access: Vec::new(),
     created_ns: state.clock.monotonic_ns(),
   };
+  publish_created_volume(state, id, volume, host, reservation, version_credit, record)
+}
+
+/// Records a freshly-created volume and moves it into the shard's registry, or gives its credits back
+/// and discards the volume (returning its slab slots) if the record cannot be written or the registry
+/// has no room. The registry room is checked before the insert, since a full registry's `insert`
+/// consumes and drops the slot.
+#[allow(clippy::too_many_arguments)]
+fn publish_created_volume(
+  state: &mut ShardState,
+  id: slates_db::catalog::VolumeId,
+  volume: Volume,
+  host: Option<OsHost>,
+  reservation: Option<slates_mem::budget::Reservation>,
+  version_credit: Option<slates_mem::budget::VersionCredit>,
+  record: VolumeRecord,
+) -> ReplyBody {
   let now = state.clock.monotonic_ns();
   if let Err(e) = state
     .db
@@ -1144,9 +1161,6 @@ fn create(
     let _ = volume.discard_partial(&mut state.store);
     return give_back(state, reservation, version_credit, refusal_of_db(&e));
   }
-  // The volume registry must have room before the volume moves into a slot: a full registry's
-  // `insert` consumes and drops the slot, which would leak the fresh volume's slab slots. Check
-  // first, discarding the volume if there is none.
   if !state.volumes.has_room() {
     let full = state.volumes.max_slots();
     let _ = volume.discard_partial(&mut state.store);
@@ -2447,6 +2461,56 @@ pub fn publish_shard(state: &mut ShardState) {
 /// one is present (its content, tree and prefix restored, §4.8); with a content object but no image
 /// the volume's content was lost, which refuses (`RecoveryIncomplete`) rather than presenting empty;
 /// without any content object (a degraded build) it is recreated empty as before (BUG-11).
+/// Returns a recovered volume's byte reservation and re-grown dynamic hold to the shard budget, for
+/// a recovery that must be refused after they were taken.
+fn release_recovered_bytes(
+  store: &mut slates_vfs::volume::Store,
+  reservation: Option<slates_mem::budget::Reservation>,
+  held: u64,
+) {
+  if let Some(r) = reservation {
+    store.budget.release(r);
+  }
+  if held > 0 {
+    store
+      .budget
+      .release(slates_mem::budget::Reservation { bytes: held });
+  }
+}
+
+/// Re-acquires a recovered volume's version-slab credits (§4.2 accounting through recovery): its
+/// logical inode allowance and its retained-version charge, both admitted before the restart. If the
+/// slab shrank below what the recovered state needs, recovery cannot represent it and fails, returning
+/// the byte reservation and re-grown hold so a refused recovery leaks neither.
+fn recover_version_reservations(
+  store: &mut slates_vfs::volume::Store,
+  volume: &Volume,
+  allowance: u64,
+  reservation: Option<slates_mem::budget::Reservation>,
+  held: u64,
+) -> Result<Option<slates_mem::budget::VersionCredit>, String> {
+  let version_credit = match store.versions.reserve(allowance) {
+    Ok(c) => Some(c),
+    Err(e) => {
+      release_recovered_bytes(store, reservation, held);
+      return Err(format!(
+        "recovered inode allowance exceeds the version slab: {e}"
+      ));
+    }
+  };
+  let retained = volume.retained_versions();
+  if store.versions.charge_retention(retained).is_err() {
+    if let Some(c) = version_credit {
+      store.versions.release(c);
+    }
+    release_recovered_bytes(store, reservation, held);
+    return Err(format!(
+      "recovered retained versions ({retained}) exceed the version slab"
+    ));
+  }
+  Ok(version_credit)
+}
+
 fn rebuild_volume(
   state: &mut ShardState,
   record: &VolumeRecord,
@@ -2490,26 +2554,10 @@ fn rebuild_volume(
   let _ = volume.set_inode_allowance(allowance);
   let entries = entry_allowance(size).max(volume.entry_usage().0);
   let _ = volume.set_entry_allowance(entries);
-  // Re-acquire the version reservation (§4.2 accounting through recovery): the inode allowance was
-  // admitted before the restart, so it fits unless the version slab shrank. On failure give back
-  // both the byte reservation and the re-grown dynamic hold, so a refused recovery leaks neither.
-  let version_credit = match state.store.versions.reserve(allowance) {
-    Ok(c) => Some(c),
-    Err(e) => {
-      if let Some(r) = reservation {
-        state.store.budget.release(r);
-      }
-      if held > 0 {
-        state
-          .store
-          .budget
-          .release(slates_mem::budget::Reservation { bytes: held });
-      }
-      return Err(format!(
-        "recovered inode allowance exceeds the version slab: {e}"
-      ));
-    }
-  };
+  // Re-acquire the version reservation and re-establish the retained-version charge (§4.2 accounting
+  // through recovery), giving back the byte reservation and re-grown hold if the slab shrank.
+  let version_credit =
+    recover_version_reservations(&mut state.store, &volume, allowance, reservation, held)?;
   let slot = VolumeSlot {
     id: record.id,
     volume,

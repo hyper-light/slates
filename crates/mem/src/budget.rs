@@ -211,6 +211,22 @@ impl VersionBudget {
   pub fn release(&mut self, credit: VersionCredit) {
     self.ledger.give(credit.slots);
   }
+
+  /// Charges `slots` of snapshot-retained inode versions against the *unpromised* capacity — the
+  /// slab less what is reserved for volumes' logical allowances and the copy-up headroom (§4.2: "a
+  /// new retained snapshot ... cannot use up a writer's promised future space"). Refused whole if no
+  /// unpromised capacity remains, so a snapshot-and-diverge draws only from genuinely free slots and
+  /// a bounded writer's reservation is never spent on another volume's retention. Unlike a
+  /// reservation this is a running charge, not a held credit — the caller credits it back symmetrically
+  /// as retained versions are freed.
+  pub fn charge_retention(&mut self, slots: u64) -> Result<(), MemError> {
+    self.ledger.take(slots).map(drop)
+  }
+
+  /// Returns `slots` of retained-version charge to the slab as retained versions are freed.
+  pub fn credit_retention(&mut self, slots: u64) {
+    self.ledger.give(slots);
+  }
 }
 
 /// The dynamic-growth increment: at the measured p99 allocation rate (the p99 is the safety

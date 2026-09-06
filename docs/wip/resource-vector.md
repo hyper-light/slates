@@ -36,9 +36,14 @@
 > while physical slots plainly remain; non-vacuous — without the reservation both are created). Resize
 > now moves the inode allowance with the policy too: it re-derives the allowance and grows or shrinks
 > the version reservation the same grow-first/shrink-after way as the byte reserve (a resize-down
-> returns slots that back another volume). What remains for the inode dimension: charging *retention*
-> into the same `VersionBudget` (so retained versions and logical allowances share the slab disjointly).
-> Mounted POSIX and guest conformance are separately pending host environments.
+> returns slots that back another volume). And retention now shares the same `VersionBudget`: a
+> snapshot-retained inode version is charged one slot from *unpromised* capacity (the slab less the
+> logical reservations and the copy-up headroom) at the diverging copy-up, refused if none remains — so
+> a snapshot-and-diverge can never spend a bounded writer's reserved slab — and credited back
+> symmetrically as versions are freed, through `destroy_snapshot`, whole-volume destroy and recovery.
+> The charge/credit balance is proven against the drift-free retained count. So the inode dimension is
+> complete: logical allowances reserved, retention charged, both surfaced in `statfs`, all through the
+> real verbs, no mount. Mounted POSIX and guest conformance are separately pending host environments.
 
 ## 1. The requirement
 
@@ -127,16 +132,23 @@ remains"), and accepts again after an unlink frees one — proving the live coun
   `the_retention_allowance_refuses_a_diverging_write_past_the_bound`, the refusal leaving the write
   with no partial effect). The allowance is unbounded (`u64::MAX`) by default, so nothing is affected
   until an owner sets it.
-  - *What remains — the server policy:* the daemon does not yet *set* a retention allowance (like it
-    sets the inode/namespace ones), so production leaves it unbounded. The derivation needs care: too
-    tight a bound would refuse a legitimate snapshot-and-diverge workflow, so it wants a reasoned or
-    measured share of the version slab, not a guessed number. The fuller step is the *disjoint
-    reservation*: charge retention (and reserve the logical allowance) from a shared version budget
-    over `max_inodes`, the exact parallel of the byte `ShardBudget`.
+  - *Retention now charges the shared version budget.* `Volume::make_current_inode` charges one slot
+    against `store.versions` (`charge_retention`) when a copy-up retains a version — drawing only from
+    *unpromised* capacity (`admittable`: the slab less the logical reservations and the copy-up
+    headroom), refused (`NoSpace`) if none remains, so retention "cannot use up a writer's promised
+    future space" (§4.2). It is credited back symmetrically as versions are freed — measured as the
+    drop in the drift-free `retained_versions` across `destroy_snapshot` and whole-volume `destroy`
+    (so migration between snapshots, which keeps a version retained, is neutral), and re-established on
+    recovery. The charge/credit balance — `committed == retained_versions` with no logical reservation
+    present — is the oracle in `crates/vfs/tests/retention.rs`. Because the shard budget now bounds
+    total retention against the promised space, the *per-volume* `retention_allowance` need not be set
+    in production: it stays unbounded (a pure fairness cap whose derivation carries the false-refusal
+    risk noted above), while the shard budget provides the load-bearing protection.
 
-So the applicable per-volume **caps** are in place (content=quota, inode, namespace, retention); the
-remaining §4.2 work is the step from cap to **reservation** below, plus wiring the server to set the
-retention allowance and the handle charge.
+So the applicable per-volume **caps** are in place (content=quota, inode, namespace, retention), and
+the inode dimension is now a full **reservation**: logical allowances reserved disjointly and retention
+charged from unpromised capacity. The remaining §4.2 refinements are the *byte* dimension's per-shard
+credit distribution (§4 below) and the handle charge.
 
 ## 4. Full admission (beyond a cap)
 
@@ -229,7 +241,9 @@ reports, and the per-volume `allowance − live` the mounted `statfs` reports), 
 re-derives the allowance and grows/shrinks its version reservation (grow-first, shrink-after, with a
 resize-up refused whole before anything changes if the slab cannot back it; gated in
 `crates/server/tests/daemon.rs`, non-vacuous — the pre-resize code leaves the resized volume's old
-reservation standing and the second volume refused). What remains for the inode dimension: charging
-*retention* into the same `VersionBudget` so retained versions and logical allowances share the slab
-disjointly. BUG-3 (dynamic growth consuming only unpromised capacity) stays **fixed** for the byte
-dimension.
+reservation standing and the second volume refused). Retention shares the same `VersionBudget` now:
+`charge_retention`/`credit_retention` charge a retained version against unpromised capacity and return
+it as versions are freed, so retained versions and logical allowances share the slab disjointly with
+neither able to spend the other's — the charge/credit balance gated by the retained-count oracle in
+`crates/vfs/tests/retention.rs`. So the inode dimension is a complete reservation. BUG-3 (dynamic
+growth consuming only unpromised capacity) stays **fixed** for the byte dimension.

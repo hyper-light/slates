@@ -1682,6 +1682,10 @@ impl Volume {
     let next = snap.next;
     let prev_epoch =
       previous.and_then(|p| self.snapshots.get(snapshot_handle(p)).ok().map(|s| s.epoch));
+    // The retained versions this destroy frees (not the ones it migrates to the previous snapshot)
+    // return their charge to the shard's version budget (§4.2). Measured as the drop in the drift-free
+    // retained count across the operation, so migration (which keeps a version retained) is neutral.
+    let retained_before = self.retained_versions();
     let removed = self
       .snapshots
       .remove(handle)
@@ -1717,6 +1721,9 @@ impl Volume {
         },
       }
     }
+    store
+      .versions
+      .credit_retention(retained_before.saturating_sub(self.retained_versions()));
     Ok(())
   }
 
@@ -1727,6 +1734,10 @@ impl Volume {
       return Err(VfsError::Destroying);
     }
     self.state = VolumeState::Destroying;
+    // The whole volume's retained versions return their charge to the shard's version budget (§4.2):
+    // the budget accounting is settled here, at destroy, while `destroy_step` frees the slots in
+    // slices afterward. Idempotent against a re-entered destroy — the count is zero the second time.
+    store.versions.credit_retention(self.retained_versions());
     let mut queue = Vec::new();
     let snapshots: Vec<SnapshotId> = self
       .snapshots
@@ -2079,6 +2090,17 @@ impl Volume {
       && self.retained_versions() >= self.retention_allowance
     {
       return Err(VfsError::NoSpace);
+    }
+    // A retained version also draws a slot from the shard's version budget — from capacity not
+    // promised to any volume's logical allowance or the copy-up headroom (§4.2: "a new retained
+    // snapshot ... cannot use up a writer's promised future space"). Refused before the copy-up if no
+    // unpromised capacity remains, so a snapshot-and-diverge never spends a bounded writer's reserved
+    // slab. Credited back symmetrically as retained versions are freed in `destroy_snapshot`/`destroy`.
+    if self.last_snapshot_epoch().is_some_and(|snap| born <= snap) {
+      store
+        .versions
+        .charge_retention(1)
+        .map_err(|_| VfsError::NoSpace)?;
     }
     let _ = kind;
     let mut copy = store.inodes.get(handle)?.clone();
