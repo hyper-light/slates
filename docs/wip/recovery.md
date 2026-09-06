@@ -149,6 +149,14 @@ volume.
   survival itself is already proven at the library level (through a real `SharedObject` handoff); what
   the mount adds is the last process hop. Until then the control path proves catalog, roots and prefix
   recovery across a real restart.
+- **Host-environment acceptance — explicitly pending.** Three acceptance gates wait on environments
+  this machine does not provide, and are held pending by decision, not overlooked: **mounted POSIX
+  behavior** (a real FUSE/FSKit/NFS mount driving pjdfstest/fsx/fsstress against a volume as a normal
+  path), **kernel-cache coherence** (an outsider edit and an in-VFS edit staying consistent through
+  the kernel's page/attr caches, which live in the OS client and cannot be exercised without the
+  mount), and **guest-device acceptance** (a Linux guest consuming a volume over virtio-fs). Each
+  needs host capabilities or a VM; none is a code gap here, and none is simulated as if passing — they
+  are named so the recovery and admission work above is not mistaken for POSIX/guest conformance.
 - **§4.2 admission accounting and content-object sizing.** The object is sized at a derived
   `partitions × PUBLISH_SLOTS × reserve_per_shard` — the doubling is intentional, the price of atomic
   double-buffered publication (the committed image plus the one being written). The fuller §4.2
