@@ -5,12 +5,16 @@
 > (authority, open-file semantics, reference ownership, the sillyname guarantee, the generation
 > tests). Step 1 — the volume-core reference count and deferred reclamation (§9), with the
 > hardening of Ada's point 3 — has landed (`docs/bugs/2026-09-05-drop-link-open-reference.md`), and
-> so has step 3's foundation: the local attachment authority (real generation-checked records,
-> epoch fencing, revocation — no placeholders or unconditional validators) and inode-addressed
-> `read`/`write` under the authenticated `OpContext` with enforced rights and view (`098432e`,
-> `2bf6c46`). The rest of the trait, the transport edges' attachment creation, and the reference
-> wiring are next. On completion this becomes amendment A-10 applied to §4.5 (inode lifetime), §4.6
-> (the Bridge trait) and §4.13 (authority).
+> so has step 3: the local attachment authority (real generation-checked records, epoch fencing,
+> revocation — no placeholders or unconditional validators), the **whole** `Bridge` trait moved
+> onto `(ObjectId, &OpContext)` with rights/view/volume enforced at the seam once for every
+> transport, and both transport edges carrying the context (FUSE `dispatch`/`serve_blocking`, the
+> NFS `Export` admitting its attachment at mount time). Step 4 has begun: NFS `READ`/`WRITE` run
+> over the interface, a read-only export's write refused by the seam (`098432e`, `2bf6c46`,
+> `7c4480a`). The daemon wiring of the FUSE mount's attachment, per-attachment reference ownership
+> with the teardown sweep, and the remaining NFS namespace/setattr procedures are next. On
+> completion this becomes amendment A-10 applied to §4.5 (inode lifetime), §4.6 (the Bridge trait)
+> and §4.13 (authority).
 
 ## 1. The decision and why
 
@@ -230,22 +234,30 @@ attachment-teardown sweep each export a counter a test asserts moved.
 2. **Identity across incarnations.** Confirm identity survives CoW (a stable handle generation, not
    the slab-slot field); preserve inode identities and the allocator high-water mark on recovery; a
    restored-as-new volume gets a distinct volume identity. Tests of §8.3. *(No inode-number reuse.)*
-3. **The authority machinery and the `OpContext` interface.** *(Authority + read/write landed
-   2026-09-05.)* The local attachment authority (`bridge-core/src/authority.rs`): an owned,
-   generation-checked `Attachment` record binding volume/view/subject/rights/epoch; an
-   `Attachments` registry that admits under the current owner epoch, revokes, drains, fences on
-   `take_over`, and builds an `OpContext` only from a validated record — refusing an unknown,
-   revoked or epoch-fenced attachment. `read`/`write` moved onto `(ObjectId, &OpContext)`:
-   `VolumeBridge` addresses by inode and enforces rights (a read the context does not grant, a
-   write on a read-only attachment) and view (a write on a pinned view) before any effect; the
-   handle table is now open-state only. FUSE `dispatch` carries the context, `serve_blocking`
-   rebuilds it from the mount's attachment before each effect. §8.4 (write authorization) landed.
-   *Owed:* the rest of the trait (getattr/lookup/... onto `ObjectId`+`OpContext`); the transport
-   edges creating attachments at attach time from the enrolled subject; wiring
-   `open`/`release`/`lookup`/`forget` to the volume reference count with the teardown sweep; §8.5
-   (cleanup), §8.6 (lifecycle).
-4. **The NFS read/write/setattr/namespace procedures over the new interface.** Stateless: handle →
-   `ObjectId`, the export/request identity → `OpContext`, request-lifetime pins for async ops.
+3. **The authority machinery and the `OpContext` interface.** *(Authority, the whole trait onto
+   `(ObjectId, &OpContext)`, and both transport edges landed 2026-09-05.)* The local attachment
+   authority (`bridge-core/src/authority.rs`): an owned, generation-checked `Attachment` record
+   binding volume/view/subject/rights/epoch; an `Attachments` registry that admits under the
+   current owner epoch, revokes, drains, fences on `take_over`, and builds an `OpContext` only from
+   a validated record — refusing an unknown, revoked or epoch-fenced attachment. **Every** `Bridge`
+   method now names its object by `ObjectId` and rides an `&OpContext`; `VolumeBridge` holds its
+   volume id and enforces authority at the seam once for every transport (`authorize_read`,
+   `authorize_write`, `authorize_volume`): a context binding another volume, a read without read
+   rights, a write without write rights or off the current head, is refused before any effect; the
+   handle table is now open-state only. FUSE `dispatch` threads the context through every op and
+   `serve_blocking` rebuilds it from the mount's attachment before each effect; the NFS `Export`
+   admits its attachment at mount time for the enrolled subject. §8.4 (write authorization) landed
+   at both edges. *Owed:* the daemon wiring that creates the FUSE mount's attachment from the
+   rendezvous-established principal (the server↔bridge seam, with the real Linux mount); wiring
+   `open`/`release`/`lookup`/`forget` to per-attachment reference ownership with the teardown
+   sweep; §8.5 (cleanup), §8.6 (lifecycle).
+4. **The NFS read/write/setattr/namespace procedures over the new interface.** *(READ and WRITE
+   landed 2026-09-05.)* Stateless: handle → `ObjectId`, the export identity → `OpContext`. `READ`
+   returns the bytes with the count and eof; `WRITE` lands `FILE_SYNC` in the anchor and returns
+   `wcc_data` + the volume-derived write verifier, its data length capped at the offered transfer
+   size; a write through a read-only export is refused by the seam (`NFS3ERR_PERM`). *Owed:*
+   `SETATTR`, `CREATE`/`MKDIR`/`REMOVE`/`RENAME`/`SYMLINK`/`READDIR(PLUS)`, and the request-lifetime
+   pins for the async driver.
 5. **Access enforcement through `subject`** once §4.13 threads the enrolled consumer; `AUTH_SYS`
    remains an advisory mapping, not authentication.
 
