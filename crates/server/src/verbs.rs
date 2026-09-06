@@ -29,7 +29,7 @@ use slates_vfs::base::BaseConfig;
 use slates_vfs::clock::{Clock, HostClock};
 use slates_vfs::host::HostFs;
 use slates_vfs::names::NameEquivalence;
-use slates_vfs::quota::{Ceiling, Quota};
+use slates_vfs::quota::{BudgetGrowth, Quota};
 use slates_vfs::recover::{KeyedImage, ShardImage, VolumeImage};
 use slates_vfs::volume::{DestroyProgress, Volume, VolumeConfig};
 use slates_wire::Wire;
@@ -684,8 +684,8 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,
     torn_tail: state.recovered.torn,
-    reserve_bytes: state.budget.capacity(),
-    committed_bytes: state.budget.committed(),
+    reserve_bytes: state.store.budget.capacity(),
+    committed_bytes: state.store.budget.committed(),
     signals,
   }
 }
@@ -972,21 +972,17 @@ fn volume_config(state: &mut ShardState, names: NamePolicy, quota: Quota) -> Vol
   }
 }
 
-fn quota_for(state: &ShardState, size: SizeClass) -> Quota {
+fn quota_for(size: SizeClass) -> Quota {
   match size {
     SizeClass::Bounded { limit } => Quota::Bounded { limit },
     SizeClass::Dynamic { max } => Quota::Dynamic {
       max,
-      // Dynamic growth is admitted against the shard budget — the one capacity owner — never against
-      // raw host memory (§4.2: "raw free RAM and virtual address space do not qualify"). The ceiling
-      // is the capacity not already promised to a bounded volume and above the operation headroom at
-      // creation, clamped to the requested maximum. Re-checking the live budget on each growth as
-      // later volumes are admitted (so a dynamic volume never eats space promised after it) is owed
-      // with the data-plane write path (BUG-3), which is the only place a dynamic volume grows.
-      source: Box::new(Ceiling {
-        granted: 0,
-        limit: max.min(state.budget.admittable()),
-      }),
+      // Dynamic growth is admitted against, and debited from, the shard budget — the one capacity
+      // owner — on each increment as the write path takes it (§4.2), never against raw host memory
+      // ("raw free RAM ... do not qualify") and never from a private per-volume ceiling. So two
+      // dynamic volumes cannot receive the same capacity, and a growth reduces what bounded volumes
+      // are later offered. The `max` is the volume's own ceiling; the budget is the shard's.
+      source: Box::new(BudgetGrowth),
       granted: 0,
       denied: 0,
     },
@@ -1027,7 +1023,7 @@ fn create(
     return refused(Refusal::AlreadyExists { existing });
   }
   let reservation = match size {
-    SizeClass::Bounded { limit } => match state.budget.reserve(limit) {
+    SizeClass::Bounded { limit } => match state.store.budget.reserve(limit) {
       Ok(r) => Some(r),
       Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
         return refused(Refusal::BudgetExceeded { available });
@@ -1051,7 +1047,7 @@ fn create(
     };
     return give_back(state, reservation, Refusal::BudgetExceeded { available });
   }
-  let quota = quota_for(state, size);
+  let quota = quota_for(size);
   let config = volume_config(state, names, quota);
   let (mut volume, host) = match base {
     None => match Volume::create(&mut state.store, config) {
@@ -1139,7 +1135,7 @@ fn give_back(
   refusal: Refusal,
 ) -> ReplyBody {
   if let Some(r) = reservation {
-    state.budget.release(r);
+    state.store.budget.release(r);
   }
   refused(refusal)
 }
@@ -1248,7 +1244,7 @@ fn clone(
     DbSizeClass::Dynamic { max } => SizeClass::Dynamic { max },
   };
   let reservation = match size {
-    SizeClass::Bounded { limit } => match state.budget.reserve(limit) {
+    SizeClass::Bounded { limit } => match state.store.budget.reserve(limit) {
       Ok(r) => Some(r),
       Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
         return refused(Refusal::BudgetExceeded { available });
@@ -1265,7 +1261,7 @@ fn clone(
     DbNamePolicy::Exact => NamePolicy::Exact,
     DbNamePolicy::Fold => NamePolicy::Fold,
   };
-  let quota = quota_for(state, size);
+  let quota = quota_for(size);
   let config = volume_config(state, names, quota);
   let cloned = match state.volumes.get_mut(handle) {
     Ok(slot) => Volume::clone_of(
@@ -1463,7 +1459,7 @@ fn resize(
   let old = slot.reservation;
   let grow = old.map_or(0, |r| limit.saturating_sub(r.bytes));
   let grown = if grow > 0 {
-    match state.budget.reserve(grow) {
+    match state.store.budget.reserve(grow) {
       Ok(r) => Some(r),
       Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
         return refused(Refusal::BudgetExceeded { available });
@@ -1479,16 +1475,17 @@ fn resize(
   };
   if let Err(e) = slot.volume.resize(limit) {
     if let Some(g) = grown {
-      state.budget.release(g);
+      state.store.budget.release(g);
     }
     return refused(refusal_of_vfs(&e));
   }
   if let Some(old) = old {
     let combined = old.bytes.saturating_add(grown.map_or(0, |g| g.bytes));
     state
+      .store
       .budget
       .release(slates_mem::budget::Reservation { bytes: combined });
-    match state.budget.reserve(limit) {
+    match state.store.budget.reserve(limit) {
       Ok(r) => slot.reservation = Some(r),
       Err(_) => slot.reservation = None,
     }
@@ -1571,10 +1568,19 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       let _ = state
         .db
         .mutate(&mut state.segment, &Op::VolumeDestroyed { id }, now);
-      if let Ok(slot) = state.volumes.remove(handle)
-        && let Some(r) = slot.reservation
-      {
-        state.budget.release(r);
+      if let Ok(slot) = state.volumes.remove(handle) {
+        if let Some(r) = slot.reservation {
+          state.store.budget.release(r);
+        }
+        // A dynamic volume's growth was acquired from the shard budget as it wrote; give it back on
+        // teardown so the capacity returns to the one owner (§4.2 accounting through teardown).
+        let held = slot.volume.budget_hold();
+        if held > 0 {
+          state
+            .store
+            .budget
+            .release(slates_mem::budget::Reservation { bytes: held });
+        }
       }
       state.by_id.remove(&id);
     }
@@ -2242,7 +2248,13 @@ fn rebuild_volume(
 ) -> Result<u16, String> {
   let size = wire_size(record.policy.size);
   let reservation = match size {
-    SizeClass::Bounded { limit } => Some(state.budget.reserve(limit).map_err(|e| e.to_string())?),
+    SizeClass::Bounded { limit } => Some(
+      state
+        .store
+        .budget
+        .reserve(limit)
+        .map_err(|e| e.to_string())?,
+    ),
     SizeClass::Dynamic { .. } => None,
   };
   let built = build_recovered_volume(state, record, image, size);
@@ -2250,11 +2262,22 @@ fn rebuild_volume(
     Ok(triple) => triple,
     Err(reason) => {
       if let Some(r) = reservation {
-        state.budget.release(r);
+        state.store.budget.release(r);
       }
       return Err(reason);
     }
   };
+  // A recovered dynamic volume's growth was committed to the shard budget before the crash; re-acquire
+  // it now so the budget reflects it and later admissions account for it (§4.2 accounting through
+  // recovery). It was admitted before the restart, so it fits unless the capacity itself shrank; on
+  // teardown it is released through `budget_hold`, the same as a running volume's.
+  let held = volume.budget_hold();
+  if held > 0 && state.store.budget.grow(held).is_err() {
+    if let Some(r) = reservation {
+      state.store.budget.release(r);
+    }
+    return Err("recovered dynamic growth exceeds the shard budget".to_string());
+  }
   // Re-admit the inode dimension (§4.2): the fair share, but never below what the recovered volume
   // already holds — recovery does not refuse inodes that were admitted before the restart.
   let allowance = inode_allowance(state, size).max(volume.inode_usage().0);
@@ -2287,7 +2310,7 @@ fn build_recovered_volume(
   };
   match (&record.base, image) {
     (BaseRecord::Scratch, Some(image)) => {
-      let quota = quota_for(state, size);
+      let quota = quota_for(size);
       let journal = journal_bytes_for(state, &quota);
       let volume = Volume::from_image(&mut state.store, image, Box::new(HostClock::new()), journal)
         .map_err(|e| e.to_string())?;
@@ -2297,14 +2320,14 @@ fn build_recovered_volume(
       Err("RecoveryIncomplete: no content image for the volume".to_owned())
     }
     (BaseRecord::Scratch, None) => {
-      let config = volume_config(state, names, quota_for(state, size));
+      let config = volume_config(state, names, quota_for(size));
       let prefix = config.prefix;
       Volume::create(&mut state.store, config)
         .map(|v| (v, None, prefix))
         .map_err(|e| e.to_string())
     }
     (BaseRecord::Path { path }, _) => {
-      let config = volume_config(state, names, quota_for(state, size));
+      let config = volume_config(state, names, quota_for(size));
       let prefix = config.prefix;
       open_base(state, path, config)
         .map(|(v, h)| (v, h, prefix))

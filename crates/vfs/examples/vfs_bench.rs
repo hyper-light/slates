@@ -175,6 +175,7 @@ fn store_for(objects: usize, cutover: usize) -> Result<Store, Box<dyn Error>> {
       dir_cutover: cutover,
     },
     arena,
+    0,
   ))
 }
 

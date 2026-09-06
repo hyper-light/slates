@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use slates_machine::{Derived, derived};
 use slates_mem::arena::ChunkArena;
+use slates_mem::budget::ShardBudget;
 use slates_mem::{Handle, Slab};
 
 use crate::clock::Clock;
@@ -63,6 +64,11 @@ pub struct Store {
   pub dir_cutover: usize,
   /// The inline-content threshold.
   pub inline_bytes: usize,
+  /// The shard's byte budget (§4.2): the one capacity owner. A bounded volume's reservation and a
+  /// dynamic volume's growth both go through it, so growth takes only unpromised capacity above the
+  /// operation headroom and no two volumes get the same bytes. It lives here, with the store's arena
+  /// it accounts, so the write path reaches it without a lock (the shard is single-threaded).
+  pub budget: ShardBudget,
 }
 
 impl std::fmt::Debug for Store {
@@ -96,8 +102,11 @@ pub struct StoreConfig {
 
 impl Store {
   /// A store over `arena`.
-  pub fn new(config: &StoreConfig, arena: ChunkArena) -> Self {
+  pub fn new(config: &StoreConfig, arena: ChunkArena, headroom: u64) -> Self {
     let segment = (config.page / std::mem::size_of::<DirNode>()).max(1);
+    // The budget is over what the arena can actually hand out (its buddy-allocatable capacity), not
+    // the mapping length, so admission never promises quota the arena cannot back (§4.2, BUG-2).
+    let capacity = u64::try_from(arena.capacity()).unwrap_or(u64::MAX);
     Self {
       dirs: Slab::new(segment, config.max_dirs),
       blocks: Slab::new(
@@ -115,6 +124,7 @@ impl Store {
       content: ChunkStore::new(arena, config.page, config.max_chunks),
       dir_cutover: config.dir_cutover.max(1),
       inline_bytes: inline_bytes(config.cache_line).get(),
+      budget: ShardBudget::new(capacity, headroom),
     }
   }
 }
@@ -453,6 +463,12 @@ impl Volume {
   /// Growth requests the quota's pressure source refused (pressure events, T-1.5).
   pub fn growth_denials(&self) -> u64 {
     self.quota.denials()
+  }
+
+  /// Bytes this volume holds against the shard budget through its dynamic growth (§4.2): the granted
+  /// growth to give back on teardown (zero for a bounded volume, whose reservation the server holds).
+  pub const fn budget_hold(&self) -> u64 {
+    self.quota.budget_hold()
   }
 
   /// The exact counters (D-13): `referenced_bytes` is every content byte the head reaches;
@@ -1105,7 +1121,10 @@ impl Volume {
     }
     let old_size = self.inode(store, no)?.attrs.size;
     let charge = self.write_charge(store, no, off, end)?;
-    if !self.quota.admit(self.bytes.total(), charge) {
+    if !self
+      .quota
+      .admit(self.bytes.total(), charge, &mut store.budget)
+    {
       return Err(VfsError::NoSpace);
     }
     let handle = self.make_current_inode(store, no)?;
@@ -1507,7 +1526,10 @@ impl Volume {
       .and_then(|e| e.checked_add(u64::try_from(tail.len()).unwrap_or(u64::MAX)))
       .ok_or(VfsError::FileTooLarge)?;
     let charge = self.write_charge(store, no, at, end)?;
-    if !self.quota.admit(self.bytes.total(), charge) {
+    if !self
+      .quota
+      .admit(self.bytes.total(), charge, &mut store.budget)
+    {
       return Err(VfsError::NoSpace);
     }
     let handle = self.make_current_inode(store, no)?;

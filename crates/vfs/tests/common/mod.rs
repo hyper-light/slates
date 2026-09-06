@@ -42,6 +42,7 @@ pub(crate) fn store_with(max_dirs: usize, dir_cutover: usize) -> Store {
       dir_cutover,
     },
     arena,
+    0, // no operation headroom in the fixtures, so a volume's quota is the whole region
   )
 }
 

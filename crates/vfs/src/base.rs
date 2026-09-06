@@ -1344,7 +1344,11 @@ impl Overlay<'_> {
       self.plane()?.descriptors.remove(&no);
       let handle = self.vol.make_current_inode(store, no)?;
       let charge = self.vol.write_charge(store, no, 0, fp.size)?;
-      if !self.vol.quota.admit(self.vol.bytes.total(), charge) {
+      if !self
+        .vol
+        .quota
+        .admit(self.vol.bytes.total(), charge, &mut store.budget)
+      {
         return Err(VfsError::NoSpace);
       }
       let before = crate::volume::content_by_epoch(store, handle);
@@ -1428,7 +1432,11 @@ impl Overlay<'_> {
       }
       bytes.truncate(done);
       let charge = u64::try_from(bytes.len()).unwrap_or(0);
-      if !self.vol.quota.admit(self.vol.bytes.total(), charge) {
+      if !self
+        .vol
+        .quota
+        .admit(self.vol.bytes.total(), charge, &mut store.budget)
+      {
         return Err(VfsError::NoSpace);
       }
       let handle = self.vol.make_current_inode(store, no)?;

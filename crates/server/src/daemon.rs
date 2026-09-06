@@ -11,7 +11,6 @@ use slates_ipc::{ClientRegion, Listener, Prepared};
 use slates_machine::facts::Identity;
 use slates_machine::{MachineProfile, derived};
 use slates_mem::arena::ChunkArena;
-use slates_mem::budget::ShardBudget;
 use slates_mem::region::Region;
 use slates_mem::{Handoff, Slab};
 use slates_rt::control::Control;
@@ -283,22 +282,6 @@ fn init_shard(
     config.page,
     config.huge_pages,
   )?)?;
-  // The budget is over what the arena can actually hand out (its buddy-allocatable capacity), not
-  // the region's mapping length, so admission never promises quota the arena cannot back (§4.2,
-  // BUG-2). The two differ whenever the mapping is not a power-of-two number of granules.
-  let arena_capacity = u64::try_from(arena.capacity()).unwrap_or(u64::MAX);
-  let store = Store::new(
-    &StoreConfig {
-      page: config.page,
-      cache_line: config.cache_line,
-      max_dirs: config.store.max_dirs,
-      max_inodes: config.store.max_inodes,
-      max_chunks: config.store.max_chunks,
-      max_dir_blocks: config.store.max_dir_blocks,
-      dir_cutover: config.store.dir_cutover,
-    },
-    arena,
-  );
   // The operation headroom (§4.2): the bounded temporary coexistence of in-flight operations, kept
   // free of every admission (reservation and dynamic growth alike). A write into a sealed chunk
   // copies it into a new open extent — copy-on-write at chunk granularity — so the source chunk and
@@ -314,6 +297,23 @@ fn init_shard(
       .saturating_mul(concurrent_writers),
     "2 × chunk_bytes × clients_per_shard (a copy-up's source and destination chunk per concurrent writer)",
     ["vfs.chunk_bytes", "clients_per_shard"]
+  );
+  // The store owns the shard budget (§4.2): it is over what the arena can actually hand out (its
+  // buddy-allocatable capacity), not the region's mapping length, so admission never promises quota
+  // the arena cannot back (BUG-2), and it keeps the derived operation headroom free of every
+  // admission. Living with the store, the write path reaches it without a lock.
+  let store = Store::new(
+    &StoreConfig {
+      page: config.page,
+      cache_line: config.cache_line,
+      max_dirs: config.store.max_dirs,
+      max_inodes: config.store.max_inodes,
+      max_chunks: config.store.max_chunks,
+      max_dir_blocks: config.store.max_dir_blocks,
+      dir_cutover: config.store.dir_cutover,
+    },
+    arena,
+    headroom.get(),
   );
   let shard = registry::current_shard().unwrap_or(partition);
   // The node's host id: the machine identity's hash, stable across restarts, distinct per
@@ -350,7 +350,6 @@ fn init_shard(
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),
     by_id: std::collections::BTreeMap::new(),
     clients: Slab::new(config.caps.segment_slots, config.clients_per_shard),
-    budget: ShardBudget::new(arena_capacity, headroom.get()),
     next_prefix: partition
       .saturating_mul(u16::try_from(config.caps.segment_slots).unwrap_or(u16::MAX))
       .max(1),

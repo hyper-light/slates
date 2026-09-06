@@ -240,11 +240,15 @@ volume.
   base-backed volumes (a live base restored only through retained handles or validated source
   identity — "reopening a path alone cannot substitute another base"); the live pressure source of a
   dynamic quota (re-supplied on recovery like the clock).
-- **§4.2 reservation accounting.** BUG-2 (admit against usable arena capacity) and BUG-1 (a strict
-  volume locks its RAM or refuses) are landed. Still owed: BUG-3 (dynamic growth must consult the
-  live shard budget, not machine RAM — needs the vfs↔server write-path coupling, Phase-4-exercised),
-  the resource vector (per-volume inode/namespace/xattr allowances), and the non-doubling in-place
-  size (`Region::shared` backing the arena rather than copying content into the image).
+- **§4.2 reservation accounting.** BUG-2 (admit against usable arena capacity), BUG-1 (a strict
+  volume locks its RAM or refuses) and **BUG-3 (dynamic growth consults the live shard budget, not
+  machine RAM)** are landed. The budget now lives in the `Store`, so the write path reaches it without
+  a lock; a dynamic volume's `BudgetGrowth` source check-and-acquires from that one budget on each
+  increment, accounted through teardown and recovery, gated through the real write path in
+  `crates/bridge-core/tests/admission.rs` (no mount). Still owed: the inode dimension's *version-credit
+  reservation* (a measured transient-version headroom, docs/wip/resource-vector.md §4), and the
+  non-doubling in-place size (`Region::shared` backing the arena rather than copying content into the
+  image).
 - **NFS durability gate.** `WRITE` currently returns `FILE_SYNC` (`crates/bridge-nfs`); once the
   image is published durably this becomes truthful for daemon-crash survival, but anchor RAM alone
   does not satisfy NFS's power-failure stable-storage contract (RFC 1813 §§3.3.7, 4.8) — recorded

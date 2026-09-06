@@ -35,7 +35,7 @@ use crate::error::VfsError;
 use crate::ids::{Epoch, InodeNo, SnapshotId};
 use crate::inode::{Attrs, Body, Home, Inode, Kind};
 use crate::names::NameEquivalence;
-use crate::quota::Quota;
+use crate::quota::{BudgetGrowth, Quota};
 use crate::snapshot::{Dead, Deadlist, Snapshot};
 use crate::trie::{self, TrieNode};
 use crate::volume::{Store, Volume, VolumeSeed};
@@ -833,10 +833,23 @@ const fn policy_from_image(policy: PolicyImage) -> NameEquivalence {
 /// The quota an image quota names. A dynamic quota is refused for now (its live pressure source is
 /// not in the image and must be re-supplied by a future recovery path); a bounded quota rebuilds
 /// exactly.
-const fn quota_from_image(quota: QuotaImage) -> Result<Quota, VfsError> {
+fn quota_from_image(quota: QuotaImage) -> Result<Quota, VfsError> {
   match quota {
     QuotaImage::Bounded { limit } => Ok(Quota::Bounded { limit }),
-    QuotaImage::Dynamic { .. } => Err(VfsError::RecoveryIncomplete),
+    // A dynamic quota's growth source is now the stateless [`BudgetGrowth`], so it need not be
+    // serialized — only the counters travel in the image. The recovered volume grows against the
+    // rebuilt shard budget exactly as it did before, and the server re-acquires its `granted` from
+    // the budget so the reservation is accounted through recovery (§4.2).
+    QuotaImage::Dynamic {
+      max,
+      granted,
+      denied,
+    } => Ok(Quota::Dynamic {
+      max,
+      source: Box::new(BudgetGrowth),
+      granted,
+      denied,
+    }),
   }
 }
 

@@ -13,7 +13,6 @@ use slates_ipc::DaemonEnd;
 use slates_ipc::protocol::ReplyBody;
 use slates_mem::SharedObject;
 use slates_mem::Slab;
-use slates_mem::budget::ShardBudget;
 use slates_vfs::volume::{Store, Volume};
 
 use crate::config::DaemonConfig;
@@ -99,8 +98,6 @@ pub struct ShardState {
   pub by_id: BTreeMap<VolumeId, slates_mem::Handle<VolumeSlot>>,
   /// The clients.
   pub clients: Slab<ClientSlot>,
-  /// The reserve.
-  pub budget: ShardBudget,
   /// The next inode prefix a volume takes (unique per volume on the host: the shard in the
   /// high bits and a counter below).
   pub next_prefix: u16,

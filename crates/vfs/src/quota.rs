@@ -1,16 +1,34 @@
 //! Quotas and accounting (D-13): a bounded volume reserves its quota and refuses the byte that
 //! would exceed it before anything is copied; a dynamic volume grows by increments the pressure
-//! source allows; `referenced_bytes` charges every chunk the head reaches in full and
-//! `unique_bytes` what the head alone holds since its last snapshot.
+//! source admits against the shard budget; `referenced_bytes` charges every chunk the head reaches
+//! in full and `unique_bytes` what the head alone holds since its last snapshot.
 
-/// Where a dynamic volume asks before growing: the daemon's pressure source in Phase 2, a fixed
-/// answer in tests.
+use slates_mem::budget::ShardBudget;
+
+/// Where a dynamic volume asks before growing (§4.2). Growth is a *check-and-acquire* against the
+/// shard budget — the one capacity owner — passed in by the write path: the daemon's source debits
+/// the live budget so no two volumes get the same capacity and growth reduces what bounded volumes
+/// are later offered; a test source answers from a fixed ceiling and leaves the budget untouched.
 pub trait PressureSource {
-  /// Whether `bytes` more may be taken now.
-  fn may_grow(&mut self, bytes: u64) -> bool;
+  /// Whether `bytes` more may be taken now, acquiring them from `budget` if so.
+  fn may_grow(&mut self, bytes: u64, budget: &mut ShardBudget) -> bool;
 }
 
-/// A source that always agrees up to a ceiling.
+/// The real source: a dynamic volume's growth admitted by, and debited from, the shard budget
+/// (§4.2). Each increment is a check-and-acquire against the one capacity owner, so growth takes only
+/// capacity neither committed to another volume nor reserved as the operation headroom, and no two
+/// volumes ever receive the same bytes. Stateless — the budget it debits is the shard's, passed in.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BudgetGrowth;
+
+impl PressureSource for BudgetGrowth {
+  fn may_grow(&mut self, bytes: u64, budget: &mut ShardBudget) -> bool {
+    budget.grow(bytes).is_ok()
+  }
+}
+
+/// A test source that agrees up to a fixed ceiling, independent of any shard budget — for volume-core
+/// tests that bound growth without a daemon. It ignores the budget, so it neither reads nor debits it.
 #[derive(Debug, Clone)]
 pub struct Ceiling {
   /// Bytes granted so far.
@@ -20,7 +38,7 @@ pub struct Ceiling {
 }
 
 impl PressureSource for Ceiling {
-  fn may_grow(&mut self, bytes: u64) -> bool {
+  fn may_grow(&mut self, bytes: u64, _budget: &mut ShardBudget) -> bool {
     match self.granted.checked_add(bytes) {
       Some(total) if total <= self.limit => {
         self.granted = total;
@@ -81,7 +99,7 @@ pub struct Accounting {
 
 impl Quota {
   /// Whether `referenced + more` fits; for a dynamic volume this may ask the source.
-  pub fn admit(&mut self, referenced: u64, more: u64) -> bool {
+  pub fn admit(&mut self, referenced: u64, more: u64, budget: &mut ShardBudget) -> bool {
     let Some(total) = referenced.checked_add(more) else {
       return false;
     };
@@ -100,7 +118,7 @@ impl Quota {
           return true;
         }
         let needed = total - *granted;
-        if source.may_grow(needed) {
+        if source.may_grow(needed, budget) {
           *granted = total;
           true
         } else {
@@ -108,6 +126,15 @@ impl Quota {
           false
         }
       }
+    }
+  }
+
+  /// Bytes this quota holds against the shard budget: a dynamic quota's granted growth (a bounded
+  /// quota's reservation is held by the server, so this is zero). Released to the budget on teardown.
+  pub const fn budget_hold(&self) -> u64 {
+    match self {
+      Self::Bounded { .. } => 0,
+      Self::Dynamic { granted, .. } => *granted,
     }
   }
 
@@ -147,9 +174,11 @@ mod tests {
 
   #[test]
   fn bounded_refuses_the_byte_past_its_limit_and_dynamic_asks_its_source() {
+    // A budget large enough not to bind here; the Ceiling source is the binding limit.
+    let mut budget = ShardBudget::new(1 << 40, 0);
     let mut b = Quota::Bounded { limit: 100 };
-    assert!(b.admit(90, 10));
-    assert!(!b.admit(90, 11));
+    assert!(b.admit(90, 10, &mut budget));
+    assert!(!b.admit(90, 11, &mut budget));
     let mut d = Quota::Dynamic {
       max: 1000,
       source: Box::new(Ceiling {
@@ -159,11 +188,44 @@ mod tests {
       granted: 0,
       denied: 0,
     };
-    assert!(d.admit(0, 100));
-    assert!(d.admit(100, 50));
-    assert!(!d.admit(150, 1), "the source's ceiling");
+    assert!(d.admit(0, 100, &mut budget));
+    assert!(d.admit(100, 50, &mut budget));
+    assert!(!d.admit(150, 1, &mut budget), "the source's ceiling");
     assert_eq!(d.denials(), 1, "one pressure event");
-    assert!(d.admit(100, 50), "within what was already granted");
-    assert!(!d.admit(999, 2), "the max");
+    assert!(
+      d.admit(100, 50, &mut budget),
+      "within what was already granted"
+    );
+    assert!(!d.admit(999, 2, &mut budget), "the max");
+  }
+
+  /// The real (budget-backed) source: growth is admitted by and debited from the shard budget, so
+  /// two dynamic quotas cannot spend the same capacity (§4.2).
+  #[test]
+  fn budget_backed_growth_debits_the_shared_budget_and_cannot_double_spend() {
+    let mut budget = ShardBudget::new(100, 0); // 100 bytes, no headroom
+    let mut a = Quota::Dynamic {
+      max: 1000,
+      source: Box::new(BudgetGrowth),
+      granted: 0,
+      denied: 0,
+    };
+    let mut b = Quota::Dynamic {
+      max: 1000,
+      source: Box::new(BudgetGrowth),
+      granted: 0,
+      denied: 0,
+    };
+    assert!(
+      a.admit(0, 60, &mut budget),
+      "A grows to 60 from the shared budget"
+    );
+    assert_eq!(budget.committed(), 60);
+    assert!(b.admit(0, 40, &mut budget), "B takes the remaining 40");
+    assert!(
+      !b.admit(40, 1, &mut budget),
+      "the budget is spent — B cannot take capacity A already holds"
+    );
+    assert_eq!(b.denials(), 1);
   }
 }

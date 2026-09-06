@@ -12,15 +12,18 @@
 > (locked store) and BUG-2 (usable capacity) are also fixed. Xattr is not applicable (unimplemented)
 > and open handles are bounded at the bridge's `Slab` (BUG-4), so the applicable per-volume caps are
 > all in place and *safe* (typed refusals at both the logical allowance and the version slab). The
-> **byte dimension's reservation is now complete** (§4): `ShardBudget` keeps a *derived* operation
-> headroom (`2 × chunk_bytes × clients_per_shard`) free of every admission, reservation and dynamic
-> growth alike, so a bounded volume's claim is sacred and growth takes only unpromised capacity —
-> through the one budget, never against raw host memory. What remains: the retention dimension, and
-> the step from a per-volume cap to disjoint per-volume *reservation* for the **inode** dimension —
-> which §4 shows is data-plane-gated for *its* `operation_headroom` (the measured peak of transient
-> CoW versions, which has no structural anchor the byte headroom has), exactly as the byte dimension's
-> live per-growth re-check is gated on the data-plane write path. The honest inode cap stands until
-> that measurement exists.
+> **byte dimension's reservation — including live dynamic-growth admission — is landed** (§4):
+> `ShardBudget` (now in the `Store`, reached by the write path without a lock) keeps a *derived*
+> operation headroom (`2 × chunk_bytes × clients_per_shard`) free of every admission, and a dynamic
+> volume's growth does a check-and-acquire against that one budget on each increment (`BudgetGrowth`),
+> debiting it — so two dynamic volumes cannot spend the same capacity, a dynamic volume cannot consume
+> a bounded volume's entitlement, and the hold is accounted through teardown and recovery. This is
+> proven through the real write path, no mount, in `crates/bridge-core/tests/admission.rs` (the five
+> histories). What remains: the retention dimension, and the step from a per-volume cap to disjoint
+> per-volume *reservation* for the **inode** dimension — which §4 shows waits on a *measured*
+> `operation_headroom` (the peak of transient CoW versions, which has no structural anchor the byte
+> headroom has). That measurement needs the version slab driven under write load; the honest inode cap
+> stands until it exists. Mounted POSIX and guest conformance are separately pending host environments.
 
 ## 1. The requirement
 
@@ -110,21 +113,30 @@ pressure and recovery). That builds on the cap: once each dimension is counted a
 reserves the vector rather than only capping it, and `ShardBudget` grows a per-dimension reserve
 alongside its byte reserve.
 
-**The byte dimension's reservation is landed, headroom and growth included.** `ShardBudget` is the
-one capacity owner for content bytes (crates/mem/src/budget.rs): it keeps an `operation_headroom` free
-of *every* admission, reservation and growth alike (`admittable = capacity − committed − headroom`),
-and the headroom is now **derived, not a placeholder** — `2 × chunk_bytes × clients_per_shard` (a
-copy-up's source and destination chunk per concurrent writer), from structural anchors, replacing the
-old `reserve_per_shard / clients` stand-in. Earlier only `grow` respected the floor while `reserve`
-did not, so a bounded volume could commit into the headroom; now both obey the one `admittable` rule,
-so a bounded reservation keeps it free and a dynamic growth takes only capacity neither committed to
-another volume nor reserved as headroom (a sacred claim is never eaten — gated in budget.rs by
-`dynamic_growth_cannot_eat_a_bounded_reservation_or_the_headroom`). Dynamic growth is admitted through
-this same budget: the daemon's dynamic-volume pressure source is now a budget-anchored ceiling, not
-the raw `memory_available_now()` the design forbids ("raw free RAM … do not qualify"). What remains
-for the byte dimension is the *live* per-growth re-check against the budget as later volumes are
-admitted — owed with the data-plane write path (BUG-3), the only place a dynamic volume actually
-grows; the control-path growth (`resize`) already reserves through the headroom-respecting budget.
+**The byte dimension's reservation is landed — live dynamic-growth admission included.**
+`ShardBudget` is the one capacity owner for content bytes (crates/mem/src/budget.rs), and it now lives
+in the `Store` so the write path reaches it without a lock (the shard is single-threaded). It keeps an
+`operation_headroom` free of *every* admission, reservation and growth alike
+(`admittable = capacity − committed − headroom`), and the headroom is **derived, not a placeholder** —
+`2 × chunk_bytes × clients_per_shard` (a copy-up's source and destination chunk per concurrent
+writer), from structural anchors, replacing the old `reserve_per_shard / clients` stand-in. Earlier
+only `grow` respected the floor while `reserve` did not; now both obey the one `admittable` rule.
+
+The growth path is the part that had bypassed ownership accounting, and it no longer does. A dynamic
+volume's source is `BudgetGrowth`, which on *each* increment does a **check-and-acquire together**
+against the live shard budget (`Quota::admit` → `source.may_grow(bytes, &mut store.budget)` →
+`budget.grow`), debiting it — not a private per-volume ceiling and never the raw `memory_available_now()`
+the design forbids. So two dynamic volumes cannot receive the same capacity, a dynamic volume cannot
+consume a bounded volume's entitlement, and a bounded volume's admission accounts for growth already
+taken. The acquired bytes are tracked as the quota's `granted` (`Volume::budget_hold`) and released to
+the budget on teardown, and re-acquired from the rebuilt budget on recovery (`rebuild_volume`) — so the
+reservation is accounted through allocation, failure, teardown and recovery. This is exercised through
+the real write path, no mount: `crates/bridge-core/tests/admission.rs` drives `VolumeBridge::write`
+with the server's quota construction and admission for all five histories (a dynamic volume cannot eat
+a bounded entitlement; a bounded admission accounts for prior growth; two dynamic volumes cannot
+double-spend; a refused growth leaves credits consistent with what is retained; a bounded volume keeps
+its allowance after competing growth is refused) — non-vacuously (the old private ceiling fails four of
+the five).
 
 The **inode** dimension's reservation is a separate story, below: it turns on a headroom that must be
 measured, not derived, so it stays a cap for now.
@@ -153,13 +165,16 @@ driving the slab under load. Reserving the logical allowance as version-slots **
 headroom would be a *false* guarantee: a volume within its logical allowance could still exhaust the
 version slab through in-epoch CoW churn before a reclaim pass runs. Under R3 a headroom number cannot
 be invented, and under R4/R5 a reservation must not advertise a guarantee it does not hold, so this
-step waits on the peak-version-burst measurement — it is data-plane-gated for its headroom exactly as
-BUG-3 is gated for its growth source.
+step waits on the peak-version-burst measurement: the version slab driven under write load — which
+`VolumeBridge::write` can now do, no mount, exactly as the byte admission tests drive growth — to
+establish the transient-version headroom before reserving version credits. It is a separate, unbuilt
+piece; it is *not* the byte dimension's growth admission, which is done (§4 above).
 
 **What the reservation's own observable proof would be (once the headroom exists).** A create
 refusal, not only `statfs`: fill a shard's inode-version reserve with prior volumes, then a further
 create refuses with a resource-vector refusal even though byte budget remains. `statfs` reporting
 backed inode availability (`allowance − live`, and the reserve's remaining credits) is the second
 surface and is owed with the data-plane `statfs` work (BUG-9, GAP-A9-3). BUG-3 (dynamic growth
-consuming only unpromised capacity) is part of this same reservation and is likewise gated on the
-data-plane write path (docs/wip/recovery.md).
+consuming only unpromised capacity) is **fixed** for the byte dimension — `BudgetGrowth` debits the one
+budget on each increment, gated by `crates/bridge-core/tests/admission.rs`; the inode version-credit
+reservation is the remaining, separate piece.
