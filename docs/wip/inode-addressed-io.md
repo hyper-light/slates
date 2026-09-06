@@ -4,9 +4,13 @@
 > inode-addressed I/O and deferred reclamation and gave the corrections now folded in below
 > (authority, open-file semantics, reference ownership, the sillyname guarantee, the generation
 > tests). Step 1 — the volume-core reference count and deferred reclamation (§9), with the
-> hardening of Ada's point 3 — has landed (`docs/bugs/2026-09-05-drop-link-open-reference.md`).
-> The interface change (steps 3–4) is next. On completion this becomes amendment A-10 applied to
-> §4.5 (inode lifetime), §4.6 (the Bridge trait) and §4.13 (authority).
+> hardening of Ada's point 3 — has landed (`docs/bugs/2026-09-05-drop-link-open-reference.md`), and
+> so has step 3's foundation: the local attachment authority (real generation-checked records,
+> epoch fencing, revocation — no placeholders or unconditional validators) and inode-addressed
+> `read`/`write` under the authenticated `OpContext` with enforced rights and view (`098432e`,
+> `2bf6c46`). The rest of the trait, the transport edges' attachment creation, and the reference
+> wiring are next. On completion this becomes amendment A-10 applied to §4.5 (inode lifetime), §4.6
+> (the Bridge trait) and §4.13 (authority).
 
 ## 1. The decision and why
 
