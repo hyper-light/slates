@@ -37,6 +37,7 @@ pub mod inode;
 pub mod journal;
 pub mod names;
 pub mod quota;
+pub mod recover;
 pub mod snapshot;
 pub mod trie;
 pub mod volume;

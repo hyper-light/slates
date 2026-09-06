@@ -43,6 +43,11 @@ pub enum VfsError {
   BaseDrift,
   /// A base-plane verb on a scratch volume, or a path the base does not hold.
   NotOverlay,
+  /// A resource a recovery needs is missing or unreadable: a truncated or corrupt volume image,
+  /// or a body this recovery slice does not yet capture (a base-backed entry). §4.8 (A-9)
+  /// requires this over an empty success — a partial recovery must refuse, never silently
+  /// present a smaller volume than was acknowledged.
+  RecoveryIncomplete,
   /// The volume is archived.
   Archived,
   /// The name-equivalence policy of the two volumes differs (clone into a policy is refused).
@@ -69,7 +74,7 @@ impl VfsError {
       Self::CrossVolumeMove => "EXDEV",
       Self::StaleHandle => "ESTALE",
       Self::Destroying | Self::Archived | Self::Pinned => "EBUSY",
-      Self::BaseUnavailable(_) | Self::BaseDrift => "EIO",
+      Self::BaseUnavailable(_) | Self::BaseDrift | Self::RecoveryIncomplete => "EIO",
       Self::NotOverlay => "ENODEV",
       Self::PolicyMismatch => "EINVAL",
       Self::Memory(_) => "ENOMEM",

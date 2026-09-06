@@ -860,6 +860,7 @@ dependencies = [
  "proptest",
  "slates-machine",
  "slates-mem",
+ "slates-wire",
  "unicode-normalization",
 ]
 
