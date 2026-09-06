@@ -131,6 +131,14 @@ grow past the inode table's cap) and uses checked arithmetic; `Volume::unreferen
 as above. Charging references against §4.2 admission and the per-attachment ownership records are
 owed with the interface change (steps 3–4).
 
+**Reference-taking is a per-transport action (landed).** The shared operation layer no longer
+references implicitly: `Bridge::reference` is an explicit verb the FUSE edge calls after a
+successful `LOOKUP`/`CREATE`/`MKDIR`/`SYMLINK`, and the NFS edge never calls (NFS adds no
+references, above). This closed a lookup-reference leak in the first NFS surface, where the shared
+`lookup`/`create`/`mkdir`/`symlink` referenced for every transport and NFS — having no `FORGET` —
+never dropped them (`docs/bugs/2026-09-05-nfs-lookup-reference-leak.md`). The per-attachment
+ownership *ledger* and the teardown sweep (below) remain owed.
+
 **NFS: no server reference, a narrowed guarantee.** NFS has no `open`/`FORGET`, so it adds no
 references. A single client's unlink-while-open is the *client's* `.nfsXXXX` sillyname (an ordinary
 rename then unlink the server already handles). This is **not** a complete cross-client
@@ -250,10 +258,12 @@ attachment-teardown sweep each export a counter a test asserts moved.
    handle table is now open-state only. FUSE `dispatch` threads the context through every op and
    `serve_blocking` rebuilds it from the mount's attachment before each effect; the NFS `Export`
    admits its attachment at mount time for the enrolled subject. §8.4 (write authorization) landed
-   at both edges. *Owed:* the daemon wiring that creates the FUSE mount's attachment from the
-   rendezvous-established principal (the server↔bridge seam, with the real Linux mount); wiring
-   `open`/`release`/`lookup`/`forget` to per-attachment reference ownership with the teardown
-   sweep; §8.5 (cleanup), §8.6 (lifecycle).
+   at both edges. Reference-taking is now an explicit per-transport action (`Bridge::reference`):
+   the FUSE edge references on `LOOKUP`/`CREATE`/`MKDIR`/`SYMLINK`, NFS references nowhere — closing
+   the lookup-reference leak the first NFS surface had. *Owed:* the daemon wiring that creates the
+   FUSE mount's attachment from the rendezvous-established principal (the server↔bridge seam, with
+   the real Linux mount); the per-attachment reference *ledger* and the teardown sweep (a FUSE
+   unmount discards a whole attachment's references at once); §8.5 (cleanup), §8.6 (lifecycle).
 4. **The NFS read/write/setattr/namespace procedures over the new interface.** *(The metadata,
    file-I/O, namespace and directory-listing procedures landed 2026-09-05.)* Stateless: handle
    → `ObjectId`, the export identity → `OpContext`. `READ` returns the bytes with the count and eof;

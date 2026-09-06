@@ -1,7 +1,8 @@
 # NFS lookup-reference leak: the shared bridge references for a transport that never forgets
 
 Date: 2026-09-05. Found by reading design §3 against the code after landing the NFS procedure
-surface. Not yet fixed — the fix mechanism is architectural and awaits Ada's scope confirmation.
+surface. **Fixed** the same day (the leak-closing half); the per-attachment teardown sweep and
+restart handoff remain owed (server/shard layer, below).
 
 ## Description
 
@@ -37,24 +38,33 @@ layer to perform unconditionally.
 - The open reference is **not** affected: NFS `CREATE` already drops the open reference immediately
   (`do_create` calls `bridge.release`), so only the *lookup* reference leaks.
 
-## Proposed fix (awaiting scope confirmation)
+## Fix (landed)
 
-Move lookup-reference-taking out of the shared bridge and make it an explicit action the FUSE edge
-invokes, per §3 ("FUSE takes one per LOOKUP/CREATE/MKDIR/readdirplus entry"):
+Reference-taking moved out of the shared bridge to an explicit action the FUSE edge invokes, per §3
+("FUSE takes one per LOOKUP/CREATE/MKDIR/readdirplus entry"):
 
-1. Add `Bridge::reference(object, cx)` (the inverse of the existing `forget`); remove the four
-   `reference_lookup` calls from the shared `lookup`/`create`/`mkdir`/`symlink`.
-2. The FUSE `dispatch` calls `bridge.reference` after a successful entry-returning op; NFS does not.
-3. Update the mock (`bridge-fuse/tests/dispatch.rs`) and the reference tests
-   (`bridge-core/tests/volume_bridge.rs`, `bridge-nfs/tests/procedures.rs`) — the bridge-core
-   lifetime test then simulates the FUSE edge by calling `bridge.reference` explicitly.
+1. Added `Bridge::reference(object, cx)` (the inverse of `forget`); removed the four
+   `reference_lookup` calls from the shared `lookup`/`create`/`mkdir`/`symlink`
+   (`crates/bridge-core`). `create` now takes only an open reference.
+2. The FUSE `dispatch` calls `bridge.reference` after a successful `LOOKUP`/`CREATE`/`MKDIR`/
+   `SYMLINK`; a reference failure fails the reply so the kernel never gets an unreferenced node id.
+   NFS calls it nowhere, so the NFS path takes no references (§3).
+3. Tests: the FUSE dispatch LOOKUP test asserts the mock's `referenced` counter moved (one on a
+   hit, none on a miss) — the non-vacuity proof the edge references. Three bridge-core lifetime
+   tests: an open file survives unlink via the open reference (reclaimed at release); the FUSE
+   model (an explicit `reference` pins across release until `forget`); and the NFS model / this
+   fix — a transport that takes no reference does not pin past release, so an unlink reclaims at
+   once. That last test would have failed before the fix (the implicit reference kept the inode
+   alive), so it discriminates the fix.
 
-This fixes the leak and needs no per-attachment ledger. **Separately owed** (design §3, §4.8, not
-this fix): the per-attachment reference *ledger* and the **teardown sweep** (a FUSE unmount discards
-a whole attachment's outstanding lookup references in one bounded batch, since FUSE does not
-guarantee a `FORGET` per reference), and the restart handoff of an orphan with a live holder. That
-work belongs at the server/shard layer (§4.1: the shard owns both the volume and the attachments),
-not in the per-request `bridge-core` seam, so it is a larger piece than this leak fix.
+Verified: 140 tests pass across the four bridge/vfs crates; fmt, clippy, xtask, cross clean.
+
+**Separately owed** (design §3, §4.8, not this fix): the per-attachment reference *ledger* and the
+**teardown sweep** (a FUSE unmount discards a whole attachment's outstanding lookup references in
+one bounded batch, since FUSE does not guarantee a `FORGET` per reference), and the restart handoff
+of an orphan with a live holder. That work belongs at the server/shard layer (§4.1: the shard owns
+both the volume and the attachments), not in the per-request `bridge-core` seam, so it is a larger
+piece than this leak fix.
 
 ## Sibling check
 

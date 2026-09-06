@@ -180,6 +180,13 @@ pub trait Bridge {
   ) -> Result<(NodeAttr, u64), VfsError>;
   /// Release handle `fh` of `object`, under `cx`.
   fn release(&mut self, object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError>;
+  /// Takes one lookup reference on `object`, under `cx`: the transport is handed an object it may
+  /// address later, so it pins the object's lifetime until it forgets it. This is a per-transport
+  /// action — **FUSE** takes one per `LOOKUP`/`CREATE`/`MKDIR`/readdirplus entry and drops them on
+  /// `FORGET`; **NFS adds no references** (it has no `FORGET`, §3 of the inode-addressed-io design),
+  /// so the NFS edge never calls this. The shared operations therefore do not reference implicitly;
+  /// the transport that owns references calls this explicitly.
+  fn reference(&mut self, object: ObjectId, cx: &OpContext) -> Result<(), VfsError>;
   /// The transport drops `nlookup` references to `object`, under `cx` (its attachment's volume).
   fn forget(&mut self, object: ObjectId, cx: &OpContext, nlookup: u64);
   /// Flush handle `fh` of `object` under `cx` (no disk write; success once the data is in the

@@ -161,15 +161,6 @@ impl<'v> VolumeBridge<'v> {
     }
   }
 
-  /// Takes a lookup reference on inode `no`: the transport holds the entry until it forgets it, so
-  /// every entry-returning operation (lookup, create, mkdir, symlink) takes one and forget drops
-  /// it. An inode a transport still names keeps its content across an unlink.
-  fn reference_lookup(&mut self, no: u64) -> Result<(), VfsError> {
-    self
-      .volume
-      .reference(self.store, slates_vfs::ids::InodeNo(no))
-  }
-
   /// The neutral attributes of inode `no`: its stat (through the host for an overlay's base
   /// entry) and its kind (structural, always in the store).
   fn attr_of(&mut self, no: u64) -> Result<NodeAttr, VfsError> {
@@ -227,7 +218,8 @@ impl Bridge for VolumeBridge<'_> {
         .volume
         .lookup_no(self.store, slates_vfs::ids::InodeNo(parent.inode), name)?;
     let attr = self.attr_of(located.inode.0)?;
-    self.reference_lookup(located.inode.0)?;
+    // No implicit reference: a transport that owns lookup references (FUSE) takes one explicitly
+    // through `reference`; NFS takes none (§3). Fixes the NFS lookup-reference leak.
     Ok(attr)
   }
 
@@ -373,18 +365,10 @@ impl Bridge for VolumeBridge<'_> {
     )?;
     let attrs = self.volume.stat(self.store, no)?;
     let entry = node_attr(no.0, Kind::File, &attrs);
-    // A create takes both a lookup reference (survives release) and an open reference (dropped by
-    // release); take the lookup first, and undo it if the open cannot be allocated.
-    self.reference_lookup(no.0)?;
-    let fh = match self.open_handle(no.0) {
-      Ok(fh) => fh,
-      Err(e) => {
-        let _ = self
-          .volume
-          .unreference(self.store, slates_vfs::ids::InodeNo(no.0));
-        return Err(e);
-      }
-    };
+    // A create takes only an open reference (dropped by release); it does not implicitly take a
+    // lookup reference — a transport that owns lookup references (FUSE) takes one through
+    // `reference`, NFS takes none (§3). `open_handle` references then allocates, undoing on failure.
+    let fh = self.open_handle(no.0)?;
     Ok((entry, fh))
   }
 
@@ -399,6 +383,16 @@ impl Bridge for VolumeBridge<'_> {
     }
     let _ = self.handles.remove(unpack_handle(fh));
     Ok(())
+  }
+
+  fn reference(&mut self, object: ObjectId, cx: &OpContext) -> Result<(), VfsError> {
+    self.authorize_read(cx)?;
+    // Takes one lookup reference on the object (the FUSE edge calls this; NFS does not, §3). An
+    // inode a transport still references keeps its content and table entry across an unlink until
+    // the last reference drops.
+    self
+      .volume
+      .reference(self.store, slates_vfs::ids::InodeNo(object.inode))
   }
 
   fn forget(&mut self, object: ObjectId, cx: &OpContext, nlookup: u64) {
@@ -436,7 +430,7 @@ impl Bridge for VolumeBridge<'_> {
     )?;
     let attrs = self.volume.stat(self.store, no)?;
     let attr = node_attr(no.0, Kind::Dir, &attrs);
-    self.reference_lookup(no.0)?;
+    // No implicit lookup reference (see `lookup`): FUSE takes one through `reference`, NFS none.
     Ok(attr)
   }
 
@@ -470,7 +464,7 @@ impl Bridge for VolumeBridge<'_> {
     )?;
     let attrs = self.volume.stat(self.store, no)?;
     let attr = node_attr(no.0, Kind::Symlink, &attrs);
-    self.reference_lookup(no.0)?;
+    // No implicit lookup reference (see `lookup`): FUSE takes one through `reference`, NFS none.
     Ok(attr)
   }
 

@@ -21,6 +21,7 @@ use slates_vfs::inode::Kind;
 struct Mock {
   content: Vec<u8>,
   forgotten: u64,
+  referenced: u64,
 }
 
 /// Format: the file mode of a regular file, and of a directory.
@@ -171,6 +172,10 @@ impl Bridge for Mock {
   fn release(&mut self, _object: ObjectId, _cx: &OpContext, _fh: u64) -> Result<(), VfsError> {
     Ok(())
   }
+  fn reference(&mut self, _object: ObjectId, _cx: &OpContext) -> Result<(), VfsError> {
+    self.referenced = self.referenced.saturating_add(1);
+    Ok(())
+  }
   fn forget(&mut self, _object: ObjectId, _cx: &OpContext, nlookup: u64) {
     self.forgotten = self.forgotten.saturating_add(nlookup);
   }
@@ -278,6 +283,7 @@ fn mock() -> Mock {
   Mock {
     content: b"hello world".to_vec(),
     forgotten: 0,
+    referenced: 0,
   }
 }
 
@@ -302,6 +308,12 @@ fn lookup_dispatches_and_a_miss_is_enoent() {
     "nodeid 2"
   );
   assert_eq!(n, OUT_HEADER_LEN + EntryOut::LEN);
+  // The FUSE edge takes exactly one lookup reference on the entry it returns (§3); the kernel's
+  // node id now pins the object until FORGET. (NFS, with no FORGET, takes none.)
+  assert_eq!(
+    m.referenced, 1,
+    "a successful FUSE LOOKUP takes one lookup reference"
+  );
 
   let n = dispatch(
     &message(Opcode::Lookup.to_wire(), 2, 1, b"missing\0"),
@@ -309,6 +321,7 @@ fn lookup_dispatches_and_a_miss_is_enoent() {
     &mut out,
   );
   assert_eq!(reply_error(&out, n), -ENOENT, "the negated errno");
+  assert_eq!(m.referenced, 1, "a LOOKUP miss takes no reference");
 }
 
 /// READ returns the requested slice; WRITE mutates the file and reports the count.

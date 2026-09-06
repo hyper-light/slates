@@ -182,6 +182,20 @@ fn fuse_attr(node: &NodeAttr) -> Attr {
   }
 }
 
+/// Takes the FUSE lookup reference on an entry the mount returns (LOOKUP/CREATE/MKDIR/SYMLINK): the
+/// kernel is handed a node id it may address until it forgets it, so the object is pinned now (§3
+/// of the inode-addressed-io design; NFS, which has no FORGET, takes no such reference and never
+/// calls this). Called after a successful entry-returning op; a reference failure fails the reply,
+/// because the kernel must never receive a node id the mount did not reference.
+fn referenced(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  node: NodeAttr,
+) -> Result<NodeAttr, VfsError> {
+  bridge.reference(ObjectId::new(node.ino, node.generation), cx)?;
+  Ok(node)
+}
+
 /// A FUSE `fuse_entry_out` from neutral attributes, cached forever (slates invalidates on every
 /// mutation, §4.6).
 fn entry_out(node: &NodeAttr) -> EntryOut {
@@ -263,12 +277,10 @@ fn serve_lookup(
     Ok(object) => object,
     Err(e) => return reply_err(req.header.unique, e, out),
   };
-  reply(
-    req.header.unique,
-    bridge.lookup(parent, cx, name),
-    |n| entry_out(n).to_bytes(),
-    out,
-  )
+  let result = bridge
+    .lookup(parent, cx, name)
+    .and_then(|n| referenced(bridge, cx, n));
+  reply(req.header.unique, result, |n| entry_out(n).to_bytes(), out)
 }
 
 fn serve_getattr(
@@ -416,6 +428,12 @@ fn serve_create(
   };
   match bridge.create(parent, cx, name, mode, flags) {
     Ok((node, fh)) => {
+      // Take the FUSE lookup reference on the created entry; if it fails, fail the reply (the
+      // kernel must not receive an unreferenced node id). The open reference the create already
+      // took is dropped by the matching release regardless.
+      if let Err(e) = bridge.reference(ObjectId::new(node.ino, node.generation), cx) {
+        return reply_err(req.header.unique, e, out);
+      }
       let mut body = entry_out(&node).to_bytes();
       body.extend_from_slice(&OpenOut { fh, open_flags: 0 }.to_bytes());
       write_or_drop(ReplyHeader::write_ok(req.header.unique, &body, out), out)
@@ -496,12 +514,10 @@ fn serve_mkdir(
     Ok(object) => object,
     Err(e) => return reply_err(req.header.unique, e, out),
   };
-  reply(
-    req.header.unique,
-    bridge.mkdir(parent, cx, name, mode),
-    |n| entry_out(n).to_bytes(),
-    out,
-  )
+  let result = bridge
+    .mkdir(parent, cx, name, mode)
+    .and_then(|n| referenced(bridge, cx, n));
+  reply(req.header.unique, result, |n| entry_out(n).to_bytes(), out)
 }
 
 fn serve_unlink(
@@ -544,12 +560,10 @@ fn serve_symlink(
     Ok(object) => object,
     Err(e) => return reply_err(req.header.unique, e, out),
   };
-  reply(
-    req.header.unique,
-    bridge.symlink(parent, cx, name, target),
-    |n| entry_out(n).to_bytes(),
-    out,
-  )
+  let result = bridge
+    .symlink(parent, cx, name, target)
+    .and_then(|n| referenced(bridge, cx, n));
+  reply(req.header.unique, result, |n| entry_out(n).to_bytes(), out)
 }
 
 fn serve_readlink(

@@ -299,9 +299,10 @@ fn a_write_is_refused_on_a_pinned_view() {
   );
 }
 
-/// Unlink-while-open works end to end through the bridge: a created (and thus referenced) file
-/// survives an unlink and still serves reads, and is reclaimed only once its open handle is
-/// released and its lookup reference forgotten (Ada review: bridge lifecycle wiring).
+/// Unlink-while-open works end to end through the bridge via the OPEN reference (the handle a
+/// create holds): a created file survives an unlink and still serves reads, and is reclaimed once
+/// its open handle is released. The open reference is transport-neutral — both FUSE and NFS hold an
+/// open handle across a create — so this needs no lookup reference.
 #[test]
 fn an_open_file_survives_unlink_through_the_bridge() {
   let mut store = store();
@@ -309,7 +310,7 @@ fn an_open_file_survives_unlink_through_the_bridge() {
   let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
   let cx = rw_cx();
   let root = bridge.root(&cx).unwrap();
-  // create takes a lookup reference and an open reference (the handle).
+  // create takes an open reference (the handle); it takes no lookup reference (§3).
   let (attr, fh) = bridge.create(oid(root), &cx, "f", 0o644, 0).unwrap();
   let ino = attr.ino;
   let obj = oid(ino);
@@ -324,15 +325,74 @@ fn an_open_file_survives_unlink_through_the_bridge() {
   bridge.read(obj, &cx, 0, 16, &mut out).unwrap();
   assert_eq!(
     &out, b"hello",
-    "the open file keeps its content after unlink"
+    "the open file keeps its content after unlink (the open reference pins it)"
   );
 
-  // Release the open handle and forget the lookup reference — now the inode is reclaimed.
+  // Releasing the open handle drops the last reference, so the unlinked inode is reclaimed.
   bridge.release(oid(ino), &cx, fh).unwrap();
+  assert!(
+    bridge.getattr(oid(ino), &cx).is_err(),
+    "reclaimed once the open reference is released"
+  );
+  // A FORGET of an inode no reference was held on (or one already reclaimed) is a safe no-op.
+  bridge.forget(oid(ino), &cx, 1);
+  assert!(bridge.getattr(oid(ino), &cx).is_err(), "still gone");
+}
+
+/// The FUSE model: a lookup reference the edge takes explicitly (`bridge.reference`) pins an object
+/// across the release of its open handle, until `forget` drops it — this is why the kernel's node
+/// id stays valid after a file is closed. The reference is taken by the transport, not implicitly by
+/// the shared operation (§3).
+#[test]
+fn a_lookup_reference_pins_across_release_until_forget() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let root = bridge.root(&cx).unwrap();
+  let (attr, fh) = bridge.create(oid(root), &cx, "f", 0o644, 0).unwrap();
+  let ino = attr.ino;
+  // The edge takes a lookup reference (what FUSE does after CREATE/LOOKUP).
+  bridge.reference(oid(ino), &cx).unwrap();
+  // Releasing the open handle leaves the lookup reference holding the object.
+  bridge.release(oid(ino), &cx, fh).unwrap();
+  bridge.unlink(oid(root), &cx, "f").unwrap();
+  assert!(
+    bridge.getattr(oid(ino), &cx).is_ok(),
+    "the lookup reference keeps the unlinked inode alive after release"
+  );
+  // FORGET drops the lookup reference; now nlink == 0 and references == 0, so it is reclaimed.
   bridge.forget(oid(ino), &cx, 1);
   assert!(
     bridge.getattr(oid(ino), &cx).is_err(),
-    "reclaimed once the last reference is dropped"
+    "reclaimed once the lookup reference is forgotten"
+  );
+}
+
+/// The NFS model, and the fix for the lookup-reference leak (docs/bugs/2026-09-05-...): a transport
+/// that takes NO lookup reference does not pin an object past its open handle. After the handle is
+/// released, an unlink reclaims immediately — nothing lingers. Before the fix the shared
+/// lookup/create referenced implicitly, so this inode would stay alive forever with no way to
+/// forget it (NFS has no FORGET); this test would then have failed at the final assertion.
+#[test]
+fn a_transport_without_a_reference_does_not_pin_after_release() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let root = bridge.root(&cx).unwrap();
+  // Create then release, taking no lookup reference (the NFS path resolves objects but references
+  // none). The open reference the create took is the only one, and release drops it.
+  let (attr, fh) = bridge.create(oid(root), &cx, "f", 0o644, 0).unwrap();
+  let ino = attr.ino;
+  bridge.release(oid(ino), &cx, fh).unwrap();
+  // A later lookup (as NFS does per request) also takes no reference.
+  bridge.lookup(oid(root), &cx, "f").unwrap();
+  // Unlink: nlink == 0 and references == 0, so the inode is reclaimed at once — not leaked.
+  bridge.unlink(oid(root), &cx, "f").unwrap();
+  assert!(
+    bridge.getattr(oid(ino), &cx).is_err(),
+    "an unreferenced inode is reclaimed on unlink, not pinned forever"
   );
 }
 
