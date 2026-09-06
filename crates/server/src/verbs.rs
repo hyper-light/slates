@@ -943,6 +943,38 @@ fn inode_allowance(state: &ShardState, size: SizeClass) -> u64 {
   .get()
 }
 
+/// A volume's namespace (entry) allowance (§4.2 resource vector): the entries whose minimum
+/// footprint (a child pointer) fits in the volume's reserved byte quota. Bounds hard-link fan-out
+/// and name churn that the inode allowance does not; the directory-block slab is the ultimate cap.
+/// Admits a fresh volume's resource-vector dimensions (§4.2): its inode and namespace allowances,
+/// derived from the requested policy. A fresh volume is under both, so this refuses only on a
+/// pathological policy; the caller gives back the byte reservation on failure.
+fn admit_dimensions(
+  state: &ShardState,
+  volume: &mut Volume,
+  size: SizeClass,
+) -> Result<(), slates_vfs::VfsError> {
+  volume.set_inode_allowance(inode_allowance(state, size))?;
+  volume.set_entry_allowance(entry_allowance(size))?;
+  Ok(())
+}
+
+fn entry_allowance(size: SizeClass) -> u64 {
+  let limit = match size {
+    SizeClass::Bounded { limit } => limit,
+    SizeClass::Dynamic { max } => max,
+  };
+  let entry_bytes = u64::try_from(size_of::<slates_vfs::dir::Child>())
+    .unwrap_or(1)
+    .max(1);
+  derived!(
+    (limit / entry_bytes).max(1),
+    "quota / size_of::<Child>() (minimum entry footprint)",
+    ["quota"]
+  )
+  .get()
+}
+
 fn volume_config(state: &mut ShardState, names: NamePolicy, quota: Quota) -> VolumeConfig {
   let prefix = state.next_prefix;
   state.next_prefix = state.next_prefix.wrapping_add(1).max(1);
@@ -1045,7 +1077,7 @@ fn create(
   };
   // Admit the volume's inode dimension (§4.2 resource vector): its fair share of the shard's inode
   // capacity, so no volume exhausts the inode slab with empty files.
-  if let Err(e) = volume.set_inode_allowance(inode_allowance(state, size)) {
+  if let Err(e) = admit_dimensions(state, &mut volume, size) {
     return give_back(state, reservation, refusal_of_vfs(&e));
   }
   let id = fresh_volume_id(state);
@@ -2239,6 +2271,8 @@ fn rebuild_volume(
   // already holds — recovery does not refuse inodes that were admitted before the restart.
   let allowance = inode_allowance(state, size).max(volume.inode_usage().0);
   let _ = volume.set_inode_allowance(allowance);
+  let entries = entry_allowance(size).max(volume.entry_usage().0);
+  let _ = volume.set_entry_allowance(entries);
   let slot = VolumeSlot {
     id: record.id,
     volume,

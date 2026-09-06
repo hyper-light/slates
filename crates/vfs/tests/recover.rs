@@ -283,6 +283,38 @@ fn the_inode_allowance_bounds_empty_files_and_frees_on_unlink() {
     .expect("a create succeeds again after the unlink freed a credit");
 }
 
+/// AC (§4.2 namespace dimension): the entry allowance bounds a volume's live directory entries —
+/// including hard links, which add a name without an inode, so neither the byte quota nor the inode
+/// allowance bounds them — and an unlink returns the credit.
+#[test]
+fn the_entry_allowance_bounds_hard_links_and_frees_on_unlink() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  vol.set_entry_allowance(3).unwrap(); // the root starts empty; three names allowed
+  let f = vol.create_file_no(&mut store, root, "a", 0o644).unwrap();
+  vol.link_no(&mut store, root, "b", f).unwrap(); // a hard link: same inode, a new entry
+  vol.link_no(&mut store, root, "c", f).unwrap();
+  assert_eq!(vol.entry_usage(), (3, 3), "at the entry allowance");
+  assert!(
+    matches!(
+      vol.link_no(&mut store, root, "d", f),
+      Err(VfsError::NoSpace)
+    ),
+    "a fourth name is refused though it is one inode and byte space remains"
+  );
+
+  vol.unlink_no(&mut store, root, "a").unwrap();
+  assert_eq!(
+    vol.entry_usage(),
+    (2, 3),
+    "the unlink returned an entry credit"
+  );
+  vol
+    .link_no(&mut store, root, "d", f)
+    .expect("a link succeeds again after the unlink freed a credit");
+}
+
 /// A sixteen-byte routing key with a distinguishing final byte (a stand-in volume id).
 fn key_bytes(n: u8) -> [u8; 16] {
   let mut key = [0u8; 16];

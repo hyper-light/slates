@@ -188,6 +188,13 @@ pub struct Volume {
   /// admitting owner (the server derives it from the shard's inode capacity); a volume built without
   /// a set allowance is unbounded (`u64::MAX`), so tests and non-admitting callers are unaffected.
   pub(crate) inode_allowance: u64,
+  /// Live directory entries the head reaches (§4.2 resource vector, the namespace dimension):
+  /// incremented on `dir_insert`, decremented on `dir_remove`. Bounds hard-link fan-out and name
+  /// churn, which neither the byte quota nor the inode allowance bounds (one inode, many names).
+  pub(crate) live_entries: u64,
+  /// The most live entries this volume may hold before an insert refuses `NoSpace` (§4.2); unbounded
+  /// (`u64::MAX`) until the admitting owner sets it.
+  pub(crate) entry_allowance: u64,
 }
 
 impl std::fmt::Debug for Volume {
@@ -299,6 +306,8 @@ impl Volume {
       orphans: BTreeSet::new(),
       live_inodes: 1,
       inode_allowance: u64::MAX,
+      live_entries: 0,
+      entry_allowance: u64::MAX,
     })
   }
 
@@ -354,6 +363,8 @@ impl Volume {
       orphans: BTreeSet::new(),
       live_inodes: origin.live_inodes,
       inode_allowance: u64::MAX,
+      live_entries: origin.live_entries,
+      entry_allowance: u64::MAX,
     })
   }
 
@@ -410,6 +421,8 @@ impl Volume {
       orphans: BTreeSet::new(),
       live_inodes: 1,
       inode_allowance: u64::MAX,
+      live_entries: 0,
+      entry_allowance: u64::MAX,
     })
   }
 
@@ -1833,6 +1846,21 @@ impl Volume {
     (self.live_inodes, self.inode_allowance)
   }
 
+  /// The volume's live-entry count and its allowance (§4.2 namespace dimension).
+  pub const fn entry_usage(&self) -> (u64, u64) {
+    (self.live_entries, self.entry_allowance)
+  }
+
+  /// Sets the volume's namespace (entry) allowance (§4.2), refusing `NoSpace` if it is below the
+  /// entries the volume already holds, so an allowance is never set below current use.
+  pub fn set_entry_allowance(&mut self, allowance: u64) -> Result<(), VfsError> {
+    if allowance < self.live_entries {
+      return Err(VfsError::NoSpace);
+    }
+    self.entry_allowance = allowance;
+    Ok(())
+  }
+
   /// Sets the volume's inode allowance (§4.2): the admitting owner derives it from the shard's inode
   /// capacity and applies it after construction or recovery. Refuses `NoSpace` if the volume already
   /// holds more live inodes than the new allowance, so an allowance is never set below current use.
@@ -2065,6 +2093,11 @@ impl Volume {
     name: &str,
     child: Child,
   ) -> Result<(), VfsError> {
+    // Admit the namespace dimension (§4.2): a whiteout replaced or a fresh name both add one live
+    // entry, so charge one against the allowance before either.
+    if self.live_entries >= self.entry_allowance {
+      return Err(VfsError::NoSpace);
+    }
     let cutover = store.dir_cutover;
     let epoch = self.epoch;
     let policy = self.policy;
@@ -2086,7 +2119,9 @@ impl Volume {
         cutover,
       )?;
     }
-    self.retire_blocks(store, retired)
+    self.retire_blocks(store, retired)?;
+    self.live_entries += 1;
+    Ok(())
   }
 
   /// Journals a whiteout when the removal of `name` left one (a base name, §4.5).
@@ -2160,7 +2195,11 @@ impl Volume {
       child
     };
     self.retire_blocks(store, retired)?;
-    removed.ok_or(VfsError::NotFound)
+    let child = removed.ok_or(VfsError::NotFound)?;
+    // A real entry left the namespace: return its credit (§4.2). A base name becomes a whiteout,
+    // which is not a live entry, so it is a decrement too.
+    self.live_entries = self.live_entries.saturating_sub(1);
+    Ok(child)
   }
 
   pub(crate) fn touch_dir(

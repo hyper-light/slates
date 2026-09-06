@@ -719,6 +719,9 @@ impl Volume {
     // live-inode count (§4.2) to the recovered head's inode count directly.
     vol.rebuild_passes(store, &image.inodes, root_no, epoch)?;
     vol.live_inodes = u64::try_from(image.inodes.len()).unwrap_or(u64::MAX);
+    // The head's live-entry count (built by rebuild_entries); snapshot rebuilds below run through the
+    // same dir_insert and perturb it, so keep it and restore after (§4.2 namespace, head-reachable).
+    let head_entries = vol.live_entries;
     // The head's accounting is head-reachable content only; keep it aside so the snapshot rebuilds
     // (which write through the same counters) do not perturb it.
     let head_bytes = vol.bytes.clone();
@@ -730,6 +733,7 @@ impl Volume {
       vol.rebuild_snapshot(store, snap, root_no)?;
     }
     vol.bytes = head_bytes;
+    vol.live_entries = head_entries;
     vol.last_snapshot = image.last_snapshot.map(to_snapshot_id);
     Ok(vol)
   }

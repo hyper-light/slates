@@ -1,7 +1,11 @@
 # §4.2 resource vector — design for the inode dimension (and the rest)
 
-> Status: the **inode dimension is landed**; the other dimensions and full reservation are designed
-> below. The volume enforces a per-volume inode allowance with correct live-count accounting; the
+> Status: the **inode and namespace dimensions are landed**; the remaining dimensions (xattr,
+> handle) and full reservation are designed below. The namespace dimension bounds live directory
+> entries (`Volume::dir_insert`/`dir_remove` maintain the count, `next_no`'s sibling), so hard-link
+> fan-out — one inode, many names — is bounded where the byte quota and inode allowance are not; the
+> server derives it as `quota / size_of::<Child>()`. Fixtures leave it unbounded, so the oracle is
+> untouched. The volume enforces a per-volume inode allowance with correct live-count accounting; the
 > server derives the allowance from the volume's quota (`min(quota / size_of::<Inode>,
 > store.max_inodes)`) rather than the tight fair-share first tried, and the vfs test fixtures leave
 > it unbounded so the determinism oracle is untouched. §4.2 and GAP-A9-1 are the authority; BUG-1
