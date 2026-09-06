@@ -62,6 +62,8 @@ pub const NFSPROC3_RMDIR: u32 = 13;
 pub const NFSPROC3_RENAME: u32 = 14;
 /// Format: NFSPROC3_READDIR — list a directory's entries (names and ids).
 pub const NFSPROC3_READDIR: u32 = 16;
+/// Format: NFSPROC3_READDIRPLUS — list a directory's entries with each one's attributes and handle.
+pub const NFSPROC3_READDIRPLUS: u32 = 17;
 /// Format: NFSPROC3_FSSTAT — dynamic filesystem statistics (space and file counts).
 pub const NFSPROC3_FSSTAT: u32 = 18;
 /// Format: NFSPROC3_FSINFO — static filesystem limits and capabilities.
@@ -148,14 +150,22 @@ const READDIR_REPLY_OVERHEAD: usize = 4 + 4 + FATTR3_BYTES + size_of::<u64>() + 
 /// directory-change verifier (so a client detects a directory mutated mid-listing) is owed; slates
 /// invalidates caches on every mutation (§4.6 cache posture), so a stale listing is not served.
 const COOKIE_VERF_NONE: [u8; size_of::<u64>()] = [0u8; size_of::<u64>()];
+/// Format: the fixed XDR bytes a READDIRPLUS `entryplus3` adds over a READDIR `entry3` besides the
+/// variable handle — a present `name_attributes` (its bool plus a `fattr3`) and the `name_handle`
+/// present bool — for budgeting a reply against the client's `maxcount`.
+const PLUS_ENTRY_FIXED: usize = 4 + FATTR3_BYTES + 4;
 
-/// One entry of a READDIR reply, gathered before encoding so the reply can be budgeted against the
-/// client's `count`: the child's inode number (the `fileid`), its name, and the resume `cookie` the
-/// next READDIR passes to continue after it.
+/// One entry of a READDIR or READDIRPLUS reply, gathered before encoding so the reply can be
+/// budgeted against the client's `count`/`maxcount`: the child's inode number (the `fileid`), its
+/// name, and the resume `cookie` the next call passes to continue after it. For a READDIRPLUS
+/// listing, `attr` and `handle` carry the child's attributes and file handle (the handle is always
+/// derivable; the attributes are best-effort); both are `None` for a plain READDIR.
 struct ReaddirEntry {
   fileid: u64,
   name: String,
   cookie: u64,
+  attr: Option<Fattr3>,
+  handle: Option<Nfsfh3>,
 }
 
 /// An NFSv3 export of one volume over the shared operation layer. Handles it mints and accepts name
@@ -306,6 +316,7 @@ impl<'b> Export<'b> {
       NFSPROC3_RMDIR => Some(self.remove(args, true)),
       NFSPROC3_RENAME => Some(self.rename(args)),
       NFSPROC3_READDIR => Some(self.readdir(args)),
+      NFSPROC3_READDIRPLUS => Some(self.readdirplus(args)),
       NFSPROC3_FSSTAT => Some(self.fsstat(args)),
       NFSPROC3_FSINFO => Some(self.fsinfo(args)),
       _ => None,
@@ -989,17 +1000,39 @@ impl<'b> Export<'b> {
   /// `count` too small for even one entry is `NFS3ERR_TOOSMALL`. Synthetic `.` and `..` entries are
   /// not emitted (the shared `readdir` returns children only, the same as the FUSE edge; owed).
   pub fn readdir(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    self.encode_readdir(args, false)
+  }
+
+  /// NFSPROC3_READDIRPLUS: like READDIR, but each entry also carries the child's attributes and file
+  /// handle, so a client that lists a directory needs no follow-up GETATTR/LOOKUP per entry. The
+  /// reply is budgeted against `maxcount` (`dircount` is advisory and ignored). The handle is always
+  /// derivable from the identity; the attributes are best-effort (`post_op_attr` absent on a miss).
+  pub fn readdirplus(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    self.encode_readdir(args, true)
+  }
+
+  fn encode_readdir(&mut self, args: &mut XdrReader<'_>, plus: bool) -> Vec<u8> {
     let mut writer = XdrWriter::new();
-    match self.readdir_result(args) {
+    match self.readdir_result(args, plus) {
       Ok((dir_attr, entries, eof)) => {
         Nfsstat3::Ok.encode(&mut writer);
         PostOpAttr(Some(dir_attr)).encode(&mut writer);
         writer.fixed(&COOKIE_VERF_NONE);
-        for entry in &entries {
+        for entry in entries {
           writer.bool(true); // an entry follows
           writer.u64(entry.fileid);
           writer.opaque(entry.name.as_bytes());
           writer.u64(entry.cookie);
+          if plus {
+            PostOpAttr(entry.attr).encode(&mut writer); // name_attributes
+            match entry.handle {
+              Some(handle) => {
+                writer.bool(true); // name_handle follows
+                handle.encode(&mut writer);
+              }
+              None => writer.bool(false),
+            }
+          }
         }
         writer.bool(false); // no more entries
         writer.bool(eof);
@@ -1015,12 +1048,19 @@ impl<'b> Export<'b> {
   fn readdir_result(
     &mut self,
     args: &mut XdrReader<'_>,
+    plus: bool,
   ) -> Result<(Fattr3, Vec<ReaddirEntry>, bool), Nfsstat3> {
-    // READDIR3args: dir handle, cookie, cookieverf (ignored), count.
+    // READDIR3args: dir handle, cookie, cookieverf (ignored), count. READDIRPLUS3args replaces the
+    // trailing count with dircount (advisory, ignored) then maxcount (the reply budget).
     let dir_fh = Nfsfh3::decode(args).map_err(|_| Nfsstat3::Badhandle)?;
     let cookie = args.u64().map_err(|_| Nfsstat3::Inval)?;
     args.fixed(size_of::<u64>()).map_err(|_| Nfsstat3::Inval)?; // cookieverf, ignored (owed)
-    let count = args.u32().map_err(|_| Nfsstat3::Inval)?;
+    let budget = if plus {
+      let _dircount = args.u32().map_err(|_| Nfsstat3::Inval)?;
+      usize::try_from(args.u32().map_err(|_| Nfsstat3::Inval)?).unwrap_or(0)
+    } else {
+      usize::try_from(args.u32().map_err(|_| Nfsstat3::Inval)?).unwrap_or(0)
+    };
     let identity = self.resolve_handle(&dir_fh)?;
     let dir_node = self.attrs_of(&identity)?;
     let dir_attr = self.fattr3(&dir_node);
@@ -1031,18 +1071,35 @@ impl<'b> Export<'b> {
       .bridge
       .readdir(dir_object, &cx, 0, cookie)
       .map_err(|e| nfsstat_of(&e))?;
-    let budget = usize::try_from(count).unwrap_or(0);
     let mut used = READDIR_REPLY_OVERHEAD;
     let mut entries = Vec::new();
     let mut eof = true;
     for (index, row) in rows.into_iter().enumerate() {
-      let entry_bytes = READDIR_ENTRY_FIXED + xdr_str_len(&row.name);
+      // For a plus listing, gather the child's attributes (best-effort) and handle (always
+      // derivable) before budgeting, since the handle's encoded length varies with the fh.
+      let (attr, handle) = if plus {
+        let child = ObjectId::new(row.ino, 0);
+        let attr = self
+          .bridge
+          .getattr(child, &cx)
+          .ok()
+          .map(|n| self.fattr3(&n));
+        (attr, Some(self.handle_for(row.ino, 0)))
+      } else {
+        (None, None)
+      };
+      let mut entry_bytes = READDIR_ENTRY_FIXED + xdr_str_len(&row.name);
+      if plus {
+        entry_bytes = entry_bytes
+          .saturating_add(PLUS_ENTRY_FIXED)
+          .saturating_add(handle.as_ref().map_or(0, |h| xdr_len(h.0.len())));
+      }
       if used.saturating_add(entry_bytes) > budget {
         if entries.is_empty() {
-          // Not even one entry fits the client's count (RFC 1813 §3.3.16).
+          // Not even one entry fits the client's count (RFC 1813 §3.3.16-17).
           return Err(Nfsstat3::Toosmall);
         }
-        eof = false; // more entries remain for the next READDIR
+        eof = false; // more entries remain for the next call
         break;
       }
       used = used.saturating_add(entry_bytes);
@@ -1053,6 +1110,8 @@ impl<'b> Export<'b> {
         fileid: row.ino,
         name: row.name,
         cookie: entry_cookie,
+        attr,
+        handle,
       });
     }
     Ok((dir_attr, entries, eof))
@@ -1203,12 +1262,16 @@ fn encode_create_reply(
   encode_wcc(writer, dir_post);
 }
 
-/// The XDR-encoded byte length of a variable-length string or opaque: a `u32` length prefix plus
-/// the bytes padded up to XDR's 4-byte (one `u32`) boundary. Used to budget a READDIR reply's
-/// entries.
-fn xdr_str_len(s: &str) -> usize {
+/// The XDR-encoded byte length of a variable-length field of `len` bytes: a `u32` length prefix plus
+/// the bytes padded up to XDR's 4-byte (one `u32`) boundary. Used to budget a READDIR reply.
+fn xdr_len(len: usize) -> usize {
   const UNIT: usize = size_of::<u32>();
-  UNIT + s.len().div_ceil(UNIT) * UNIT
+  UNIT + len.div_ceil(UNIT) * UNIT
+}
+
+/// The XDR-encoded byte length of a variable-length string or opaque.
+fn xdr_str_len(s: &str) -> usize {
+  xdr_len(s.len())
 }
 
 /// Decodes an `sattr3` optional `u32` (`set_mode3`/`set_uid3`/`set_gid3`): a bool, then the value

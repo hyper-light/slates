@@ -12,9 +12,9 @@ use slates_bridge_nfs::mount::MountReply;
 use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
 use slates_bridge_nfs::procedures::{
   Export, NFSPROC3_ACCESS, NFSPROC3_CREATE, NFSPROC3_FSINFO, NFSPROC3_FSSTAT, NFSPROC3_GETATTR,
-  NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ, NFSPROC3_READDIR, NFSPROC3_READLINK,
-  NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK,
-  NFSPROC3_WRITE,
+  NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ, NFSPROC3_READDIR, NFSPROC3_READDIRPLUS,
+  NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR,
+  NFSPROC3_SYMLINK, NFSPROC3_WRITE,
 };
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_db::catalog::{Principal, VolumeId};
@@ -1368,4 +1368,91 @@ fn readdir_lists_entries_and_paginates() {
     Nfsstat3::Toosmall.wire(),
     "a count too small for one entry is TOOSMALL"
   );
+}
+
+/// Parses a READDIRPLUS reply into (names, handles), asserting each entry carries regular-file
+/// attributes (kind and mode) and a handle.
+fn parse_readdirplus(reply: &[u8]) -> (Vec<String>, Vec<Nfsfh3>) {
+  let mut r = XdrReader::new(reply);
+  assert_eq!(
+    r.u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "READDIRPLUS succeeded"
+  );
+  PostOpAttr::decode(&mut r).unwrap(); // directory attributes
+  r.fixed(8).unwrap(); // cookieverf
+  let mut names = Vec::new();
+  let mut handles = Vec::new();
+  while r.bool().unwrap() {
+    let _fileid = r.u64().unwrap();
+    names.push(r.string(255).unwrap().to_owned());
+    let _cookie = r.u64().unwrap();
+    let attr = PostOpAttr::decode(&mut r)
+      .unwrap()
+      .0
+      .expect("each entry carries its attributes");
+    assert_eq!(attr.kind, Ftype3::Reg, "a regular file's attributes");
+    assert_eq!(attr.mode, 0o644);
+    assert!(r.bool().unwrap(), "each entry carries a handle");
+    handles.push(Nfsfh3::decode(&mut r).unwrap());
+  }
+  assert!(r.bool().unwrap(), "the whole directory fit, so eof is set");
+  (names, handles)
+}
+
+/// READDIRPLUS lists a directory with each entry's attributes and file handle, so a client needs
+/// no follow-up GETATTR/LOOKUP per entry: every entry carries its attributes and a handle, and a
+/// listed handle resolves to the same object.
+#[test]
+fn readdirplus_lists_entries_with_attributes_and_handles() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  for name in ["a", "b", "c"] {
+    bridge.create(oid(root_ino), &cx, name, 0o644, 0).unwrap();
+  }
+
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = root_handle(&mut export);
+
+  // READDIRPLUS args: dir handle, cookie, cookieverf, dircount, maxcount.
+  let mut args = XdrWriter::new();
+  root_fh.encode(&mut args);
+  args.u64(0);
+  args.fixed(&[0u8; 8]);
+  args.u32(8192); // dircount (advisory)
+  args.u32(8192); // maxcount
+  let reply = export
+    .serve_nfs(NFSPROC3_READDIRPLUS, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+
+  let (mut names, handles) = parse_readdirplus(&reply);
+  names.sort();
+  assert_eq!(names, vec!["a", "b", "c"], "every entry is listed");
+  assert_eq!(handles.len(), 3, "every entry carries a handle");
+
+  // A listed handle resolves to the same object.
+  let mut ga = XdrWriter::new();
+  handles[0].encode(&mut ga);
+  let greply = export
+    .serve_nfs(NFSPROC3_GETATTR, &mut XdrReader::new(ga.as_slice()))
+    .unwrap();
+  let mut gr = XdrReader::new(&greply);
+  assert_eq!(
+    gr.u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "a listed handle resolves"
+  );
+  assert_eq!(Fattr3::decode(&mut gr).unwrap().kind, Ftype3::Reg);
 }
