@@ -921,6 +921,28 @@ fn journal_bytes_for(state: &ShardState, quota: &Quota) -> usize {
   .get()
 }
 
+/// A volume's inode allowance (§4.2 resource vector): the inodes whose metadata fits in the volume's
+/// reserved byte footprint (its quota over an inode's size), clamped to the shard's inode slab. It
+/// scales with the policy the caller asked for — a larger quota admits more inodes — and no single
+/// volume exhausts the slab. A fixed disjoint per-volume reservation is the fuller §4.2 refinement
+/// (docs/wip/resource-vector.md).
+fn inode_allowance(state: &ShardState, size: SizeClass) -> u64 {
+  let limit = match size {
+    SizeClass::Bounded { limit } => limit,
+    SizeClass::Dynamic { max } => max,
+  };
+  let inode_bytes = u64::try_from(size_of::<slates_vfs::inode::Inode>())
+    .unwrap_or(1)
+    .max(1);
+  let cap = u64::try_from(state.config.store.max_inodes).unwrap_or(u64::MAX);
+  derived!(
+    (limit / inode_bytes).min(cap).max(1),
+    "min(quota / size_of::<Inode>, store.max_inodes), at least one",
+    ["quota", "store.max_inodes"]
+  )
+  .get()
+}
+
 fn volume_config(state: &mut ShardState, names: NamePolicy, quota: Quota) -> VolumeConfig {
   let prefix = state.next_prefix;
   state.next_prefix = state.next_prefix.wrapping_add(1).max(1);
@@ -1011,7 +1033,7 @@ fn create(
   }
   let quota = quota_for(state, size);
   let config = volume_config(state, names, quota);
-  let (volume, host) = match base {
+  let (mut volume, host) = match base {
     None => match Volume::create(&mut state.store, config) {
       Ok(v) => (v, None),
       Err(e) => return give_back(state, reservation, refusal_of_vfs(&e)),
@@ -1021,6 +1043,11 @@ fn create(
       Err(reply) => return give_back(state, reservation, reply_refusal(*reply)),
     },
   };
+  // Admit the volume's inode dimension (§4.2 resource vector): its fair share of the shard's inode
+  // capacity, so no volume exhausts the inode slab with empty files.
+  if let Err(e) = volume.set_inode_allowance(inode_allowance(state, size)) {
+    return give_back(state, reservation, refusal_of_vfs(&e));
+  }
   let id = fresh_volume_id(state);
   let record = VolumeRecord {
     id,
@@ -2199,7 +2226,7 @@ fn rebuild_volume(
     SizeClass::Dynamic { .. } => None,
   };
   let built = build_recovered_volume(state, record, image, size);
-  let (volume, host, prefix) = match built {
+  let (mut volume, host, prefix) = match built {
     Ok(triple) => triple,
     Err(reason) => {
       if let Some(r) = reservation {
@@ -2208,6 +2235,10 @@ fn rebuild_volume(
       return Err(reason);
     }
   };
+  // Re-admit the inode dimension (§4.2): the fair share, but never below what the recovered volume
+  // already holds — recovery does not refuse inodes that were admitted before the restart.
+  let allowance = inode_allowance(state, size).max(volume.inode_usage().0);
+  let _ = volume.set_inode_allowance(allowance);
   let slot = VolumeSlot {
     id: record.id,
     volume,

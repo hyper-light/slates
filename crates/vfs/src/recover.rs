@@ -715,8 +715,10 @@ impl Volume {
     };
     let mut vol = Volume::recovery_shell(store, seed, clock, journal_bytes)?;
 
-    // The head, into the shell's roots.
+    // The head, into the shell's roots. Recovery places inodes by number (not `next_no`), so set the
+    // live-inode count (§4.2) to the recovered head's inode count directly.
     vol.rebuild_passes(store, &image.inodes, root_no, epoch)?;
+    vol.live_inodes = u64::try_from(image.inodes.len()).unwrap_or(u64::MAX);
     // The head's accounting is head-reachable content only; keep it aside so the snapshot rebuilds
     // (which write through the same counters) do not perturb it.
     let head_bytes = vol.bytes.clone();

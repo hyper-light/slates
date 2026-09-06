@@ -250,6 +250,39 @@ fn a_volume_survives_a_content_object_handoff() {
   );
 }
 
+/// AC (§4.2 resource vector): the inode allowance bounds a volume's live inodes independently of its
+/// byte quota — empty files are refused with `NoSpace` at the allowance even though byte space
+/// remains — and an unlink returns the credit so a create succeeds again.
+#[test]
+fn the_inode_allowance_bounds_empty_files_and_frees_on_unlink() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30); // a huge byte quota
+  vol.set_inode_allowance(3).unwrap(); // but only three live inodes: the root and two more
+  let root = vol.root_inode(&store).unwrap();
+  assert_eq!(vol.inode_usage(), (1, 3), "the root is the one live inode");
+
+  vol.create_file_no(&mut store, root, "a", 0o644).unwrap();
+  vol.create_file_no(&mut store, root, "b", 0o644).unwrap();
+  assert_eq!(vol.inode_usage(), (3, 3), "at the allowance");
+  assert!(
+    matches!(
+      vol.create_file_no(&mut store, root, "c", 0o644),
+      Err(VfsError::NoSpace)
+    ),
+    "an empty file beyond the inode allowance is refused, though byte space remains"
+  );
+
+  vol.unlink_no(&mut store, root, "a").unwrap();
+  assert_eq!(
+    vol.inode_usage(),
+    (2, 3),
+    "the unlink returned an inode credit"
+  );
+  vol
+    .create_file_no(&mut store, root, "c", 0o644)
+    .expect("a create succeeds again after the unlink freed a credit");
+}
+
 /// A sixteen-byte routing key with a distinguishing final byte (a stand-in volume id).
 fn key_bytes(n: u8) -> [u8; 16] {
   let mut key = [0u8; 16];

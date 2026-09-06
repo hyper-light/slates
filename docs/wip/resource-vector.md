@@ -1,9 +1,13 @@
 # §4.2 resource vector — design for the inode dimension (and the rest)
 
-> Status: designed, not yet implemented. This captures the analysis behind the §4.2 "Resource
-> dimensions" requirement so the change lands in one coordinated pass without putting the volume's
-> determinism oracle at risk. §4.2 (docs/wip/SLATES_DESIGN.md) and GAP-A9-1 are the authority;
-> BUG-1 (locked store) and BUG-2 (usable capacity) are already fixed.
+> Status: the **inode dimension is landed**; the other dimensions and full reservation are designed
+> below. The volume enforces a per-volume inode allowance with correct live-count accounting; the
+> server derives the allowance from the volume's quota (`min(quota / size_of::<Inode>,
+> store.max_inodes)`) rather than the tight fair-share first tried, and the vfs test fixtures leave
+> it unbounded so the determinism oracle is untouched. §4.2 and GAP-A9-1 are the authority; BUG-1
+> (locked store) and BUG-2 (usable capacity) are also fixed. What remains: the namespace/xattr/handle
+> dimensions, the retention dimension, and the step from a per-volume cap to disjoint per-volume
+> reservation (with BUG-3's data-plane dependency).
 
 ## 1. The requirement
 

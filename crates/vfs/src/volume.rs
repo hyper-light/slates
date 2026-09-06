@@ -180,6 +180,14 @@ pub struct Volume {
   /// Inodes that have left the namespace (`nlink == 0`) while still referenced, awaiting
   /// reclamation at their last `unreference`. Bounded by open-unlinked files.
   pub(crate) orphans: BTreeSet<InodeNo>,
+  /// Live logical inodes the head reaches (§4.2 resource vector, the inode dimension): incremented
+  /// as a number is issued, decremented as one is reclaimed. Bounds "arbitrarily many empty files",
+  /// which the byte quota cannot.
+  pub(crate) live_inodes: u64,
+  /// The most live inodes this volume may hold before a create refuses `NoSpace` (§4.2). Set by the
+  /// admitting owner (the server derives it from the shard's inode capacity); a volume built without
+  /// a set allowance is unbounded (`u64::MAX`), so tests and non-admitting callers are unaffected.
+  pub(crate) inode_allowance: u64,
 }
 
 impl std::fmt::Debug for Volume {
@@ -289,6 +297,8 @@ impl Volume {
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
       orphans: BTreeSet::new(),
+      live_inodes: 1,
+      inode_allowance: u64::MAX,
     })
   }
 
@@ -342,6 +352,8 @@ impl Volume {
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
       orphans: BTreeSet::new(),
+      live_inodes: origin.live_inodes,
+      inode_allowance: u64::MAX,
     })
   }
 
@@ -396,6 +408,8 @@ impl Volume {
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
       orphans: BTreeSet::new(),
+      live_inodes: 1,
+      inode_allowance: u64::MAX,
     })
   }
 
@@ -762,7 +776,7 @@ impl Volume {
     {
       return Err(VfsError::AlreadyExists);
     }
-    let no = self.next_no();
+    let no = self.next_no()?;
     let now = self.clock.wall_ns();
     let mut inode = Inode::new(no, self.epoch, Kind::File, mode, Body::Inline(Vec::new()));
     inode.home = Some(Home {
@@ -798,7 +812,7 @@ impl Volume {
     {
       return Err(VfsError::AlreadyExists);
     }
-    let no = self.next_no();
+    let no = self.next_no()?;
     let now = self.clock.wall_ns();
     let parent_no = store.dirs.get(dir)?.inode;
     let child = store
@@ -836,7 +850,7 @@ impl Volume {
     {
       return Err(VfsError::AlreadyExists);
     }
-    let no = self.next_no();
+    let no = self.next_no()?;
     let now = self.clock.wall_ns();
     let mut inode = Inode::new(
       no,
@@ -1800,10 +1814,34 @@ impl Volume {
     }
   }
 
-  pub(crate) fn next_no(&mut self) -> InodeNo {
+  /// Issues the next inode number, charging it against the volume's inode allowance (§4.2 resource
+  /// vector). Refuses `NoSpace` when the volume already holds its allowance of live inodes, so no
+  /// number of empty files can exhaust the shard's inode capacity. The single number-issuing site,
+  /// so the live count and the bound are maintained in one place.
+  pub(crate) fn next_no(&mut self) -> Result<InodeNo, VfsError> {
+    if self.live_inodes >= self.inode_allowance {
+      return Err(VfsError::NoSpace);
+    }
     let no = InodeNo::compose(self.prefix, self.next_counter);
     self.next_counter += 1;
-    no
+    self.live_inodes += 1;
+    Ok(no)
+  }
+
+  /// The volume's live-inode count and its allowance (§4.2), for `statfs` and admission.
+  pub const fn inode_usage(&self) -> (u64, u64) {
+    (self.live_inodes, self.inode_allowance)
+  }
+
+  /// Sets the volume's inode allowance (§4.2): the admitting owner derives it from the shard's inode
+  /// capacity and applies it after construction or recovery. Refuses `NoSpace` if the volume already
+  /// holds more live inodes than the new allowance, so an allowance is never set below current use.
+  pub fn set_inode_allowance(&mut self, allowance: u64) -> Result<(), VfsError> {
+    if allowance < self.live_inodes {
+      return Err(VfsError::NoSpace);
+    }
+    self.inode_allowance = allowance;
+    Ok(())
   }
 
   pub(crate) fn inode<'s>(&self, store: &'s Store, no: InodeNo) -> Result<&'s Inode, VfsError> {
@@ -2184,6 +2222,9 @@ impl Volume {
     self.release_body(store, handle)?;
     self.table_remove(store, no)?;
     self.retire(store, Dead::Inode(handle, born))?;
+    // The number leaves the head: return its credit to the inode allowance (§4.2). The single
+    // permanent-free site, matching `next_no`'s single charge.
+    self.live_inodes = self.live_inodes.saturating_sub(1);
     // The base plane's descriptor, if one was held, is closed by the owner of the host at its
     // next `process_hints`; the tables forget the inode now.
     let _ = self.base_forget(no);

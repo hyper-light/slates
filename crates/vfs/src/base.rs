@@ -693,7 +693,7 @@ impl Overlay<'_> {
   ) -> Result<Located, VfsError> {
     let dir = self.vol.make_current_dir(store, dir)?;
     let parent_no = store.dirs.get(dir)?.inode;
-    let no = self.vol.next_no();
+    let no = self.vol.next_no()?;
     let fp = entry.fingerprint;
     let epoch = self.vol.epoch;
     let child = match entry.kind {
