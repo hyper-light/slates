@@ -205,6 +205,11 @@ pub struct Volume {
   /// The most live entries this volume may hold before an insert refuses `NoSpace` (§4.2); unbounded
   /// (`u64::MAX`) until the admitting owner sets it.
   pub(crate) entry_allowance: u64,
+  /// The most inode versions this volume's snapshots may pin (§4.2 retention) before a diverging
+  /// write refuses `NoSpace`. Bounds one volume's snapshots from consuming the shared version slab
+  /// and starving others; unbounded (`u64::MAX`) until the admitting owner sets it, so tests and
+  /// non-admitting callers are unaffected. Checked against the drift-free [`Volume::retained_versions`].
+  pub(crate) retention_allowance: u64,
 }
 
 impl std::fmt::Debug for Volume {
@@ -318,6 +323,7 @@ impl Volume {
       inode_allowance: u64::MAX,
       live_entries: 0,
       entry_allowance: u64::MAX,
+      retention_allowance: u64::MAX,
     })
   }
 
@@ -375,6 +381,7 @@ impl Volume {
       inode_allowance: u64::MAX,
       live_entries: origin.live_entries,
       entry_allowance: u64::MAX,
+      retention_allowance: u64::MAX,
     })
   }
 
@@ -433,6 +440,7 @@ impl Volume {
       inode_allowance: u64::MAX,
       live_entries: 0,
       entry_allowance: u64::MAX,
+      retention_allowance: u64::MAX,
     })
   }
 
@@ -1903,6 +1911,17 @@ impl Volume {
     Ok(())
   }
 
+  /// Sets the retention allowance (§4.2): the most inode versions this volume's snapshots may pin.
+  /// Refuses if the volume already pins more (recovery does not retroactively refuse what was
+  /// admitted before the restart); the admitting owner sets it from the shard's version capacity.
+  pub fn set_retention_allowance(&mut self, allowance: u64) -> Result<(), VfsError> {
+    if allowance < self.retained_versions() {
+      return Err(VfsError::NoSpace);
+    }
+    self.retention_allowance = allowance;
+    Ok(())
+  }
+
   /// Sets the volume's inode allowance (§4.2): the admitting owner derives it from the shard's inode
   /// capacity and applies it after construction or recovery. Refuses `NoSpace` if the volume already
   /// holds more live inodes than the new allowance, so an allowance is never set below current use.
@@ -2017,6 +2036,18 @@ impl Volume {
     };
     if born == self.epoch {
       return Ok(handle);
+    }
+    // This copy-up retires the old version; if a snapshot pins it (its birth is at or before the last
+    // snapshot's epoch — the same rule `retire` uses to keep it), it is retained on that snapshot's
+    // deadlist. Charge it against the retention allowance (§4.2): refuse before the copy-up if the
+    // volume is already at its allowance, so one volume's snapshots cannot over-retain and starve the
+    // shared version slab. Unbounded by default (`u64::MAX`), so this never fires until an owner sets
+    // it; the count is the drift-free `retained_versions`.
+    if self.retention_allowance != u64::MAX
+      && self.last_snapshot_epoch().is_some_and(|snap| born <= snap)
+      && self.retained_versions() >= self.retention_allowance
+    {
+      return Err(VfsError::NoSpace);
     }
     let _ = kind;
     let mut copy = store.inodes.get(handle)?.clone();

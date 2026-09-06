@@ -98,30 +98,30 @@ remains"), and accepts again after an unlink frees one — proving the live coun
   bounded `Slab` that refuses `SlabFull` (BUG-4). Charging those handles against §4.2 admission (so
   they count toward the reservation below) is the owed refinement.
 - **In-flight**: bounded by the ring/credit admission (§4.7), not a per-volume vfs dimension.
-- **Retention** (snapshot-retained inode versions): the version slab (`store.max_inodes`) is shared,
-  and a volume's snapshots retain old inode versions as the head diverges (on the snapshots'
-  deadlists), which the per-volume inode allowance — a *logical* count via `next_no` — does not bound.
-  So one volume's snapshots can consume the shared slab and starve others (safe, since `SlabFull` is a
-  typed refusal, but unfair). The design as a per-volume cap, matching the inode/namespace caps:
-  - *Charge point (single, central):* `Volume::retire` (crates/vfs/src/volume.rs) is where a retired
-    inode version is either pushed to the newest snapshot's deadlist (retained) or freed immediately;
-    a `Dead::Inode` taking the deadlist branch increments a `retained_versions` counter.
-  - *Release points:* `destroy_snapshot` and `destroy` free deadlist items through `release_dead`;
-    a `Dead::Inode` freed there decrements the counter. Migration between deadlists (also in
-    `destroy_snapshot`) is net-zero. `retire`'s immediate-free branch is never counted.
-  - *Enforcement:* `make_current_inode`, before it copies an inode whose old version a snapshot pins
-    (`born <= last_snapshot_epoch`), refuses with `NoSpace` if `retained_versions` is at a derived
-    retention allowance — so a write that would over-retain is refused, as §4.2 asks ("a new retained
-    snapshot ... cannot use up a writer's promised future space").
-  - *Why it is not yet built:* the counter spans `retire`, `destroy_snapshot` and `destroy`, and the
-    model oracle (crates/vfs/tests/model.rs) does not track retention, so a decrement missed on one
-    path would not be caught by the oracle. The safe build adds the retention rule to the model first,
-    then the counter and the refusal, so drift is a test failure, not a silent leak or false refusal.
-    The full step is the *disjoint reservation*: charge retention (and reserve the logical allowance)
-    from a shared version budget over `max_inodes`, the exact parallel of the byte `ShardBudget`.
+- **Retention** (snapshot-retained inode versions): *the mechanism is landed.* The version slab
+  (`store.max_inodes`) is shared, and a volume's snapshots retain old inode versions as the head
+  diverges (on the snapshots' deadlists), which the per-volume inode allowance — a *logical* count via
+  `next_no` — does not bound, so one volume's snapshots could consume the slab and starve others (safe
+  via `SlabFull`, but unfair). Now `Volume::retained_versions` (crates/vfs/src/volume.rs) computes the
+  count from the deadlists — the source of truth, so it cannot drift from a maintained counter, and
+  the "why not built" worry (a decrement missed across `retire`/`destroy_snapshot`/`destroy`) does not
+  arise — and `make_current_inode` refuses a diverging copy-up with `NoSpace` when a snapshot would
+  pin a version past the volume's `retention_allowance` (as §4.2 asks: "a new retained snapshot ...
+  cannot use up a writer's promised future space"). Gated in crates/vfs/tests/recover.rs
+  (`retained_versions_counts_the_snapshot_pinned_inode_versions` and
+  `the_retention_allowance_refuses_a_diverging_write_past_the_bound`, the refusal leaving the write
+  with no partial effect). The allowance is unbounded (`u64::MAX`) by default, so nothing is affected
+  until an owner sets it.
+  - *What remains — the server policy:* the daemon does not yet *set* a retention allowance (like it
+    sets the inode/namespace ones), so production leaves it unbounded. The derivation needs care: too
+    tight a bound would refuse a legitimate snapshot-and-diverge workflow, so it wants a reasoned or
+    measured share of the version slab, not a guessed number. The fuller step is the *disjoint
+    reservation*: charge retention (and reserve the logical allowance) from a shared version budget
+    over `max_inodes`, the exact parallel of the byte `ShardBudget`.
 
-So the applicable per-volume **caps** are in place (content=quota, inode, namespace); the remaining
-§4.2 work is the step from cap to **reservation** below, plus retention and the handle charge.
+So the applicable per-volume **caps** are in place (content=quota, inode, namespace, retention); the
+remaining §4.2 work is the step from cap to **reservation** below, plus wiring the server to set the
+retention allowance and the handle charge.
 
 ## 4. Full admission (beyond a cap)
 

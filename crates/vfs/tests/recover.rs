@@ -596,6 +596,54 @@ fn retained_versions_counts_the_snapshot_pinned_inode_versions() {
   );
 }
 
+/// AC (§4.2 retention charge): a diverging write that would pin an inode version past the retention
+/// allowance is refused with `NoSpace` before the copy-up — so one volume's snapshots cannot consume
+/// the shared version slab past their bound — and the refused write changes nothing. Below the
+/// allowance a diverging write succeeds; destroying the snapshot releases the pinned versions. The
+/// allowance is unbounded by default, so only a volume an owner has bounded is affected.
+#[test]
+fn the_retention_allowance_refuses_a_diverging_write_past_the_bound() {
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  vol.set_retention_allowance(1).unwrap(); // at most one pinned version
+  let root = vol.root_inode(&src).unwrap();
+  let a = vol.create_file_no(&mut src, root, "a", 0o644).unwrap();
+  let b = vol.create_file_no(&mut src, root, "b", 0o644).unwrap();
+  vol.write(&mut src, a, 0, b"a1").unwrap();
+  vol.write(&mut src, b, 0, b"b1").unwrap();
+  let snap = vol.snapshot(&mut src).unwrap();
+
+  // Diverging `a` pins one version — at the allowance.
+  vol.write(&mut src, a, 0, b"a2").unwrap();
+  assert_eq!(vol.retained_versions(), 1, "a's frozen version is pinned");
+
+  // Diverging `b` would pin a second — refused, and nothing changes.
+  assert!(
+    matches!(vol.write(&mut src, b, 0, b"b2"), Err(VfsError::NoSpace)),
+    "a diverging write past the retention allowance is refused"
+  );
+  assert_eq!(
+    vol.retained_versions(),
+    1,
+    "the refused write pinned nothing"
+  );
+  let mut buf = vec![0u8; 8];
+  let n = vol.read(&src, b, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..n],
+    b"b1",
+    "the refused write left b unchanged — no partial copy-up"
+  );
+
+  // Destroying the snapshot releases the pinned version.
+  vol.destroy_snapshot(&mut src, snap).unwrap();
+  assert_eq!(
+    vol.retained_versions(),
+    0,
+    "destroying the snapshot releases its pinned version"
+  );
+}
+
 /// AC (§4.8): a referenced-but-unlinked orphan's content survives recovery — its acknowledged bytes
 /// are not lost. A file is opened (referenced), then unlinked while open (POSIX unlink-while-open):
 /// its name is gone but its inode stays allocated in the table, so the image (which captures every
