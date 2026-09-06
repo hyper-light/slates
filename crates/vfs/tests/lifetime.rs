@@ -7,6 +7,7 @@
 mod common;
 
 use common::{store, volume};
+use slates_vfs::ids::InodeNo;
 
 /// An inode unlinked while a reference is held keeps its content until the last reference drops,
 /// then is reclaimed. Without the deferral this fails: `drop_link` releases the content at
@@ -20,7 +21,7 @@ fn an_unlinked_referenced_inode_survives_until_the_last_reference() {
   vol.write(&mut store, file, 0, b"hello").unwrap();
 
   // A transport holds the file open.
-  vol.reference(file);
+  vol.reference(&store, file).unwrap();
   // It is unlinked from the namespace.
   vol.unlink_no(&mut store, root, "f").unwrap();
   assert!(
@@ -58,7 +59,7 @@ fn rename_over_an_open_file_preserves_it() {
   vol.write(&mut store, b, 0, b"bbb").unwrap();
 
   // Hold b open, then rename a over b, so b's inode leaves the namespace.
-  vol.reference(b);
+  vol.reference(&store, b).unwrap();
   vol.rename_no(&mut store, root, "a", root, "b").unwrap();
 
   // b's replaced inode still serves its own content.
@@ -93,8 +94,8 @@ fn content_reclaims_only_at_the_last_of_several_references() {
   let file = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
   vol.write(&mut store, file, 0, b"data").unwrap();
 
-  vol.reference(file);
-  vol.reference(file);
+  vol.reference(&store, file).unwrap();
+  vol.reference(&store, file).unwrap();
   vol.unlink_no(&mut store, root, "f").unwrap();
 
   let mut buf = [0u8; 4];
@@ -108,5 +109,44 @@ fn content_reclaims_only_at_the_last_of_several_references() {
   assert!(
     vol.read(&store, file, 0, &mut buf).is_err(),
     "reclaimed at the last reference"
+  );
+}
+
+/// Writes reach an unlinked-but-open file, not just reads (POSIX unlink-while-open covers both).
+#[test]
+fn writes_reach_an_unlinked_open_file() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let file = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, file, 0, b"hello").unwrap();
+  vol.reference(&store, file).unwrap();
+  vol.unlink_no(&mut store, root, "f").unwrap();
+
+  vol.write(&mut store, file, 5, b" world").unwrap();
+  let mut buf = [0u8; 11];
+  let read = vol.read(&store, file, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..read],
+    b"hello world",
+    "a write reaches an unlinked open file"
+  );
+
+  vol.unreference(&mut store, file).unwrap();
+  assert!(
+    vol.read(&store, file, 0, &mut buf).is_err(),
+    "reclaimed after the last reference"
+  );
+}
+
+/// A reference to an inode number no inode holds is refused, so the reference map cannot grow past
+/// the inode table's cap (hardening: references are validated, not arbitrary).
+#[test]
+fn a_reference_to_an_absent_inode_is_refused() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  assert!(
+    vol.reference(&store, InodeNo(999_999)).is_err(),
+    "cannot reference an inode that does not exist"
   );
 }

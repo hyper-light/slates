@@ -2057,10 +2057,18 @@ impl Volume {
   }
 
   /// Takes a reference on inode `no` — an open handle, or a transport lookup the kernel holds
-  /// until it forgets the inode. The inode's content survives a later `unlink` until every
-  /// reference is dropped (POSIX unlink-while-open; §4.6, the inode-addressed-io design).
-  pub fn reference(&mut self, no: InodeNo) {
-    *self.references.entry(no).or_insert(0) += 1;
+  /// until it forgets the inode. The inode must exist (a reference to an absent number is refused,
+  /// so the reference map cannot grow past the inode table's own cap), and the count is checked (a
+  /// reference count that would overflow is refused, not wrapped). The inode's content survives a
+  /// later `unlink` until every reference is dropped (POSIX unlink-while-open; §4.6, the
+  /// inode-addressed-io design). Charging the reference against the §4.2 admission budget, and
+  /// recording which attachment owns it (for disconnect and restart cleanup), are owed with the
+  /// interface change.
+  pub fn reference(&mut self, store: &Store, no: InodeNo) -> Result<(), VfsError> {
+    self.inode(store, no)?;
+    let count = self.references.entry(no).or_insert(0);
+    *count = count.checked_add(1).ok_or(VfsError::TooManyLinks)?;
+    Ok(())
   }
 
   /// Drops a reference on inode `no`. If it was the last reference and the inode has already left
@@ -2077,15 +2085,18 @@ impl Volume {
       }
       None => 0,
     };
-    if remaining == 0 && self.orphans.remove(&no) {
+    if remaining == 0 && self.orphans.contains(&no) {
       // Reclaim only if the inode is still unlinked. A re-link — a future `LINK` /
       // `linkat(AT_EMPTY_PATH)` on the still-open inode — revives it with a name, and it must not
       // be reclaimed then. No operation can re-link a nameless orphan today, so this guards that
       // owed operation rather than fixing a reachable bug.
       let nlink = self.inode(store, no).map(|i| i.attrs.nlink).unwrap_or(0);
       if nlink == 0 {
+        // Reclaim before dropping the orphan record, so a failed reclamation retains the cleanup
+        // obligation (the orphan is retried) rather than leaking the inode.
         self.reclaim_inode(store, no)?;
       }
+      self.orphans.remove(&no);
     }
     Ok(())
   }
