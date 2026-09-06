@@ -315,20 +315,43 @@ impl Bridge for VolumeBridge<'_> {
   ) -> Result<Vec<DirEntry>, VfsError> {
     self.authorize_read(cx)?;
     let dir_no = slates_vfs::ids::InodeNo(object.inode);
+    // The parent for `..`; the root has none, so `..` is the root itself (POSIX). Resolved before
+    // the listing (a separate read); a directory whose parent cannot be resolved falls back to
+    // itself rather than failing the whole listing.
+    let parent = self
+      .volume
+      .parent_no(self.store, dir_no)
+      .unwrap_or(dir_no)
+      .0;
     let rows = match self.host.as_mut() {
       Some(host) => self.volume.with_host(host).readdir_no(self.store, dir_no),
       None => self.volume.readdir_no(self.store, dir_no),
     }?;
+    // POSIX `readdir` lists "." (the directory) and ".." (its parent) before the children; the
+    // volume core returns children only, so the shared bridge synthesizes them here — one code
+    // path, so the FUSE mount and the NFS export list them identically (R8). The cookie/offset is
+    // over the full list, so ".".and "..".are positions 0 and 1 and a resume skips them.
+    let dot = DirEntry {
+      ino: object.inode,
+      kind: Kind::Dir,
+      name: ".".to_owned(),
+    };
+    let dotdot = DirEntry {
+      ino: parent,
+      kind: Kind::Dir,
+      name: "..".to_owned(),
+    };
+    let children = rows.into_iter().map(|row| DirEntry {
+      ino: row.inode.0,
+      kind: row.kind,
+      name: row.name.to_owned(),
+    });
     let start = usize::try_from(offset).unwrap_or(0);
     Ok(
-      rows
+      [dot, dotdot]
         .into_iter()
+        .chain(children)
         .skip(start)
-        .map(|row| DirEntry {
-          ino: row.inode.0,
-          kind: row.kind,
-          name: row.name.to_owned(),
-        })
         .collect(),
     )
   }

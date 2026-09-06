@@ -1339,8 +1339,8 @@ fn readdir_lists_entries_and_paginates() {
   names.sort();
   assert_eq!(
     names,
-    vec!["a", "b", "c"],
-    "all entries with a generous count"
+    vec![".", "..", "a", "b", "c"],
+    "all entries (with the synthesized . and ..) with a generous count"
   );
   assert!(eof, "the whole directory fit, so eof is set");
 
@@ -1348,7 +1348,7 @@ fn readdir_lists_entries_and_paginates() {
   let (first, cookie, eof1) = parse_readdir(&readdir(&mut export, 0, 170));
   assert!(!eof1, "a partial listing is not at eof");
   assert!(
-    !first.is_empty() && first.len() < 3,
+    !first.is_empty() && first.len() < 5,
     "a partial listing has some but not all entries"
   );
   let (rest, _c2, eof2) = parse_readdir(&readdir(&mut export, cookie, 8192));
@@ -1357,7 +1357,7 @@ fn readdir_lists_entries_and_paginates() {
   all.sort();
   assert_eq!(
     all,
-    vec!["a", "b", "c"],
+    vec![".", "..", "a", "b", "c"],
     "pagination returns every entry once"
   );
 
@@ -1370,8 +1370,8 @@ fn readdir_lists_entries_and_paginates() {
   );
 }
 
-/// Parses a READDIRPLUS reply into (names, handles), asserting each entry carries regular-file
-/// attributes (kind and mode) and a handle.
+/// Parses a READDIRPLUS reply into (names, handles), asserting each entry carries its attributes
+/// (`post_op_attr` present) and a handle — the plus data that saves the client a per-entry lookup.
 fn parse_readdirplus(reply: &[u8]) -> (Vec<String>, Vec<Nfsfh3>) {
   let mut r = XdrReader::new(reply);
   assert_eq!(
@@ -1387,12 +1387,10 @@ fn parse_readdirplus(reply: &[u8]) -> (Vec<String>, Vec<Nfsfh3>) {
     let _fileid = r.u64().unwrap();
     names.push(r.string(255).unwrap().to_owned());
     let _cookie = r.u64().unwrap();
-    let attr = PostOpAttr::decode(&mut r)
+    PostOpAttr::decode(&mut r)
       .unwrap()
       .0
       .expect("each entry carries its attributes");
-    assert_eq!(attr.kind, Ftype3::Reg, "a regular file's attributes");
-    assert_eq!(attr.mode, 0o644);
     assert!(r.bool().unwrap(), "each entry carries a handle");
     handles.push(Nfsfh3::decode(&mut r).unwrap());
   }
@@ -1439,10 +1437,14 @@ fn readdirplus_lists_entries_with_attributes_and_handles() {
 
   let (mut names, handles) = parse_readdirplus(&reply);
   names.sort();
-  assert_eq!(names, vec!["a", "b", "c"], "every entry is listed");
-  assert_eq!(handles.len(), 3, "every entry carries a handle");
+  assert_eq!(
+    names,
+    vec![".", "..", "a", "b", "c"],
+    "every entry (with . and ..) is listed"
+  );
+  assert_eq!(handles.len(), 5, "every entry carries a handle");
 
-  // A listed handle resolves to the same object.
+  // The first entry's handle is "." — it resolves to the directory itself.
   let mut ga = XdrWriter::new();
   handles[0].encode(&mut ga);
   let greply = export
@@ -1454,5 +1456,9 @@ fn readdirplus_lists_entries_with_attributes_and_handles() {
     Nfsstat3::Ok.wire(),
     "a listed handle resolves"
   );
-  assert_eq!(Fattr3::decode(&mut gr).unwrap().kind, Ftype3::Reg);
+  assert_eq!(
+    Fattr3::decode(&mut gr).unwrap().kind,
+    Ftype3::Dir,
+    "the '.' entry names the directory"
+  );
 }

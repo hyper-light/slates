@@ -465,6 +465,15 @@ impl Volume {
     self.readdir(store, dir)
   }
 
+  /// The inode number a directory's `..` entry names: its parent, or the directory's own number for
+  /// the root (which has no parent). A transport synthesizes the `.` and `..` entries POSIX
+  /// `readdir` includes; the volume core's `readdir` returns children only.
+  pub fn parent_no(&self, store: &Store, dir_no: InodeNo) -> Result<InodeNo, VfsError> {
+    let dir = self.current_dir(store, dir_no)?;
+    let node = store.dirs.get(dir).map_err(|_| VfsError::StaleHandle)?;
+    Ok(node.parent.unwrap_or(dir_no))
+  }
+
   /// Creates a file named `name` in the directory named by inode number `dir_no`.
   pub fn create_file_no(
     &mut self,

@@ -335,3 +335,33 @@ fn an_open_file_survives_unlink_through_the_bridge() {
     "reclaimed once the last reference is dropped"
   );
 }
+
+/// The shared readdir synthesizes "." (the directory) and ".." (its parent) before the children,
+/// so every transport lists them identically (R8, one code path): a subdirectory's readdir names
+/// itself as ".", the root as "..", then its own entries; the root's ".." is the root itself.
+#[test]
+fn readdir_synthesizes_dot_and_dotdot() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let root = bridge.root(&cx).unwrap();
+  let sub = bridge.mkdir(oid(root), &cx, "sub", 0o755).unwrap();
+  bridge.create(oid(sub.ino), &cx, "f", 0o644, 0).unwrap();
+
+  let entries = bridge.readdir(oid(sub.ino), &cx, 0, 0).unwrap();
+  let by_name: std::collections::BTreeMap<&str, u64> =
+    entries.iter().map(|e| (e.name.as_str(), e.ino)).collect();
+  assert_eq!(
+    by_name.get("."),
+    Some(&sub.ino),
+    "'.' names the directory itself"
+  );
+  assert_eq!(by_name.get(".."), Some(&root), "'..' names the parent");
+  assert!(by_name.contains_key("f"), "the children follow . and ..");
+
+  // The root has no parent, so its ".." is the root itself (POSIX).
+  let root_entries = bridge.readdir(oid(root), &cx, 0, 0).unwrap();
+  let root_dotdot = root_entries.iter().find(|e| e.name == "..").unwrap();
+  assert_eq!(root_dotdot.ino, root, "the root's '..' is the root itself");
+}
