@@ -286,3 +286,52 @@ fn assert_crash_loop_recorded(supervisor: &Supervisor) {
   assert!(!alive);
   assert_eq!(age, 95);
 }
+
+/// The anchor's content object — the RAM that backs a shard's volume storage (§4.8) — is held by
+/// the process that created it (the supervisor) and handed off in the environment, so content
+/// written through one mapping is still there when a restarted daemon re-opens it after the first
+/// mapping is gone. This is the memory-level guarantee that an agent's writes survive a daemon
+/// crash (BUG-11), the piece a private mapping (the store's old Region::map) could not provide.
+#[test]
+fn the_content_object_survives_a_daemon_restart_through_the_handoff() {
+  let name = format!("slates-anc-{}", std::process::id());
+  let content_name = format!("slates-anc-c-{}", std::process::id());
+  let content_bytes = 64 * 4096;
+
+  // The supervisor creates the anchor with a content object and holds it for the daemon's life.
+  let segment = AnchorSegment::create(&name, &identity(), geometry())
+    .unwrap()
+    .with_content(&content_name, content_bytes)
+    .unwrap();
+  let env = segment.handoff_env().unwrap();
+
+  // The running daemon opens the content object and writes an agent's bytes into it.
+  let mut daemon = AnchorSegment::open_content(&env).unwrap().unwrap();
+  let offset = 8 * 4096;
+  let written = b"agent content written before the crash";
+  daemon.bytes_mut()[offset..offset + written.len()].copy_from_slice(written);
+
+  // The daemon crashes: its mapping is gone. The supervisor still holds the object alive.
+  drop(daemon);
+
+  // The restarted daemon re-opens the content object from the same handoff; the bytes survive.
+  let restarted = AnchorSegment::open_content(&env).unwrap().unwrap();
+  assert_eq!(
+    &restarted.bytes()[offset..offset + written.len()],
+    written,
+    "content in the anchor's content object survives a daemon restart"
+  );
+
+  // A handoff env with no content object opens nothing (a build without anchor-backed storage).
+  let plain = AnchorSegment::create(
+    &format!("slates-anp-{}", std::process::id()),
+    &identity(),
+    geometry(),
+  )
+  .unwrap()
+  .handoff_env()
+  .unwrap();
+  assert!(AnchorSegment::open_content(&plain).is_none());
+
+  let _ = segment; // the supervisor keeps the content object alive across the restart
+}

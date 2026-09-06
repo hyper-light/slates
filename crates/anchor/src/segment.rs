@@ -20,11 +20,23 @@ pub const RING_WORDS: usize = 4;
 pub const ENV_HANDOFF: &str = "SLATES_ANCHOR";
 /// Format: the environment variable carrying the segment's length.
 pub const ENV_LEN: &str = "SLATES_ANCHOR_LEN";
+/// Format: the environment variable carrying the handoff to the content object — the anchor-owned
+/// RAM that backs a shard's volume storage (§4.8), so an agent's writes survive a daemon restart
+/// (the store's arena maps this object rather than a private mapping). A descriptor on Linux, a
+/// name elsewhere, exactly like [`ENV_HANDOFF`].
+pub const ENV_CONTENT: &str = "SLATES_ANCHOR_CONTENT";
+/// Format: the environment variable carrying the content object's length.
+pub const ENV_CONTENT_LEN: &str = "SLATES_ANCHOR_CONTENT_LEN";
 
 /// The mapped anchor segment.
 pub struct AnchorSegment {
   object: SharedObject,
   geometry: Geometry,
+  /// The content object the supervisor creates and holds so a shard's volume storage lives in
+  /// anchor-owned RAM (§4.8): `Some` on the process that created it (the supervisor keeps it alive
+  /// across daemon restarts), `None` on a process that only attached the metadata object — that
+  /// process opens the content object from the handoff env ([`AnchorSegment::open_content`]).
+  content: Option<SharedObject>,
 }
 
 impl std::fmt::Debug for AnchorSegment {
@@ -138,9 +150,45 @@ impl AnchorSegment {
     put(bytes, AT_TOTAL, &geometry.total_bytes().to_le_bytes());
     put(bytes, AT_GEOMETRY, &geometry.encode());
     put(bytes, AT_GENERATION, &2u64.to_le_bytes());
-    let segment = AnchorSegment { object, geometry };
+    let segment = AnchorSegment {
+      object,
+      geometry,
+      content: None,
+    };
     segment.init_rings();
     Ok(segment)
+  }
+
+  /// Adds the content object that backs a shard's volume storage in anchor-owned RAM (§4.8): a
+  /// shared memory object of `content_bytes` named `content_name`. The process that creates it (the
+  /// supervisor) holds it, so it — and an agent's writes in it — survive a daemon restart; a
+  /// restarted daemon opens it from [`AnchorSegment::handoff_env`] through
+  /// [`AnchorSegment::open_content`] and maps it as its store's content arena. This is the fix for
+  /// a restart recreating scratch content empty (BUG-11): the bytes no longer live in a private
+  /// mapping the exiting process takes with it.
+  pub fn with_content(
+    mut self,
+    content_name: &str,
+    content_bytes: usize,
+  ) -> Result<AnchorSegment, AnchorError> {
+    self.content = Some(SharedObject::create(content_name, content_bytes.max(1))?);
+    Ok(self)
+  }
+
+  /// Opens the content object the anchor handed off, read from the daemon's `env`, or `None` when
+  /// none was provided (a build or config without anchor-backed storage). The parse mirrors the
+  /// metadata handoff: a descriptor on Linux, a name elsewhere.
+  pub fn open_content(env: &[(String, String)]) -> Option<Result<SharedObject, AnchorError>> {
+    let raw = env.iter().find(|(k, _)| k == ENV_CONTENT).map(|(_, v)| v)?;
+    let len: usize = env
+      .iter()
+      .find(|(k, _)| k == ENV_CONTENT_LEN)
+      .and_then(|(_, v)| v.parse().ok())?;
+    let handoff = match raw.parse::<i32>() {
+      Ok(fd) if cfg!(target_os = "linux") => Handoff::Descriptor(fd),
+      _ => Handoff::Name(raw.clone()),
+    };
+    Some(SharedObject::open(&handoff, len).map_err(AnchorError::from))
   }
 
   /// Attaches to a segment another process created, from its handoff and length, checking
@@ -189,7 +237,11 @@ impl AnchorSegment {
         reason: "the mapped length is not the geometry's",
       });
     }
-    Ok(AnchorSegment { object, geometry })
+    Ok(AnchorSegment {
+      object,
+      geometry,
+      content: None,
+    })
   }
 
   /// Attaches from the environment the anchor gave the daemon.
@@ -221,10 +273,21 @@ impl AnchorSegment {
       Handoff::Descriptor(fd) => fd.to_string(),
       Handoff::Name(name) => name,
     };
-    Ok(vec![
+    let mut env = vec![
       (ENV_HANDOFF.to_owned(), handoff),
       (ENV_LEN.to_owned(), self.object.len().to_string()),
-    ])
+    ];
+    // Hand off the content object too, so a restarted daemon re-maps the same anchor-owned RAM and
+    // its volume content is still there (§4.8). Absent when this anchor has no content object.
+    if let Some(content) = &self.content {
+      let content_handoff = match content.handoff()? {
+        Handoff::Descriptor(fd) => fd.to_string(),
+        Handoff::Name(name) => name,
+      };
+      env.push((ENV_CONTENT.to_owned(), content_handoff));
+      env.push((ENV_CONTENT_LEN.to_owned(), content.len().to_string()));
+    }
+    Ok(env)
   }
 
   /// The geometry.
