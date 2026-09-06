@@ -208,6 +208,19 @@ impl Bridge for Mock {
   ) -> Result<NodeAttr, VfsError> {
     Err(VfsError::Invalid)
   }
+  fn link(
+    &mut self,
+    target: ObjectId,
+    _new_parent: ObjectId,
+    _cx: &OpContext,
+    _new_name: &str,
+  ) -> Result<NodeAttr, VfsError> {
+    if target.inode == 2 {
+      Ok(self.file_attr())
+    } else {
+      Err(VfsError::NotFound)
+    }
+  }
   fn readlink(&mut self, _object: ObjectId, _cx: &OpContext) -> Result<String, VfsError> {
     Err(VfsError::Invalid)
   }
@@ -423,4 +436,36 @@ fn fsync_and_fsyncdir_are_served_as_success() {
     );
     assert_eq!(n, OUT_HEADER_LEN, "an empty success reply");
   }
+}
+
+/// LINK is dispatched (it was ENOSYS before — audit BUG-7): it links an existing inode under a new
+/// name and returns that entry, taking a lookup reference on it as LOOKUP/CREATE do.
+#[test]
+fn link_dispatches_and_returns_the_target_entry() {
+  let mut m = mock();
+  let mut out = [0u8; 512];
+  // fuse_link_in: oldnodeid (8) = inode 2, then the new name in the request's directory (root).
+  let mut body = Vec::new();
+  body.extend_from_slice(&2u64.to_le_bytes());
+  body.extend_from_slice(b"hardlink\0");
+  let n = dispatch(
+    &message(Opcode::Link.to_wire(), 1, 1, &body),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(
+    u32::from_le_bytes(out[4..8].try_into().unwrap()),
+    0,
+    "LINK succeeded (not ENOSYS)"
+  );
+  assert_eq!(
+    u64::from_le_bytes(out[16..24].try_into().unwrap()),
+    2,
+    "the new name resolves to the target inode 2"
+  );
+  assert_eq!(n, OUT_HEADER_LEN + EntryOut::LEN);
+  assert_eq!(
+    m.referenced, 1,
+    "LINK takes a lookup reference on the entry"
+  );
 }

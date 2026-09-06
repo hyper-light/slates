@@ -488,6 +488,25 @@ impl Bridge for VolumeBridge<'_> {
     Ok(attr)
   }
 
+  fn link(
+    &mut self,
+    target: ObjectId,
+    new_parent: ObjectId,
+    cx: &OpContext,
+    new_name: &str,
+  ) -> Result<NodeAttr, VfsError> {
+    self.authorize_write(cx)?;
+    self.volume.link_no(
+      self.store,
+      slates_vfs::ids::InodeNo(new_parent.inode),
+      new_name,
+      slates_vfs::ids::InodeNo(target.inode),
+    )?;
+    // Return the target's attributes, now with the incremented link count (a FUSE LINK reply is an
+    // entry_out for the new name, which resolves to the same inode).
+    self.attr_of(target.inode)
+  }
+
   fn readlink(&mut self, object: ObjectId, cx: &OpContext) -> Result<String, VfsError> {
     self.authorize_read(cx)?;
     self

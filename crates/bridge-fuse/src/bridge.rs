@@ -103,6 +103,7 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     Opcode::Unlink => serve_unlink(bridge, &request, cx, false, out),
     Opcode::RmDir => serve_unlink(bridge, &request, cx, true, out),
     Opcode::SymLink => serve_symlink(bridge, &request, cx, out),
+    Opcode::Link => serve_link(bridge, &request, cx, out),
     Opcode::ReadLink => serve_readlink(bridge, &request, cx, out),
     Opcode::Rename => serve_rename(bridge, &request, cx, false, out),
     Opcode::Rename2 => serve_rename(bridge, &request, cx, true, out),
@@ -565,6 +566,31 @@ fn serve_symlink(
   };
   let result = bridge
     .symlink(parent, cx, name, target)
+    .and_then(|n| referenced(bridge, cx, n));
+  reply(req.header.unique, result, |n| entry_out(n).to_bytes(), out)
+}
+
+fn serve_link(bridge: &mut dyn Bridge, req: &Request<'_>, cx: &OpContext, out: &mut [u8]) -> usize {
+  // fuse_link_in: oldnodeid (8) — the existing inode to link — then the new name in this request's
+  // directory (the header node id).
+  const HEAD: usize = size_of::<u64>();
+  if req.body.len() < HEAD {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  }
+  let oldnodeid = u64::from_le_bytes(req.body[..HEAD].try_into().unwrap_or_default());
+  let Ok(name) = parse_name(&req.body[HEAD..]) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  let new_parent = match resolve(bridge, cx, req.header.nodeid) {
+    Ok(object) => object,
+    Err(e) => return reply_err(req.header.unique, e, out),
+  };
+  // The target is an existing inode, never the root; the FUSE node id carries no generation.
+  let target = ObjectId::new(oldnodeid, 0);
+  // LINK returns an entry (the new name resolving to the target), so the kernel takes a lookup
+  // reference on it — reference it as for LOOKUP/CREATE.
+  let result = bridge
+    .link(target, new_parent, cx, name)
     .and_then(|n| referenced(bridge, cx, n));
   reply(req.header.unique, result, |n| entry_out(n).to_bytes(), out)
 }

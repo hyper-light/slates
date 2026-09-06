@@ -545,6 +545,20 @@ impl Volume {
     self.symlink(store, dir, name, target)
   }
 
+  /// Creates a hard link named `name` in the directory named by inode number `dir_no`, pointing at
+  /// the existing inode `target` (`EPERM` for a directory, `EEXIST` for a taken name). The by-inode
+  /// wrapper the bridge uses, mirroring [`Volume::symlink_no`].
+  pub fn link_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    target: InodeNo,
+  ) -> Result<(), VfsError> {
+    let dir = self.current_dir(store, dir_no)?;
+    self.link(store, dir, name, target)
+  }
+
   /// Unlinks `name` from the directory named by inode number `dir_no`.
   pub fn unlink_no(
     &mut self,

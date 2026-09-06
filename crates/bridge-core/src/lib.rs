@@ -212,6 +212,15 @@ pub trait Bridge {
     name: &str,
     target: &str,
   ) -> Result<NodeAttr, VfsError>;
+  /// Create a hard link `new_name` in `new_parent` pointing at the existing `target`, under `cx`;
+  /// the target's attributes (with the incremented link count). A directory target is refused.
+  fn link(
+    &mut self,
+    target: ObjectId,
+    new_parent: ObjectId,
+    cx: &OpContext,
+    new_name: &str,
+  ) -> Result<NodeAttr, VfsError>;
   /// The target of symlink `object` under `cx`.
   fn readlink(&mut self, object: ObjectId, cx: &OpContext) -> Result<String, VfsError>;
   /// Rename `old_name` under `old_parent` to `new_name` under `new_parent`, under `cx`, honoring

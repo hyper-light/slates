@@ -545,3 +545,29 @@ fn statfs_reports_the_real_capacity_not_an_invented_figure() {
     "free fell by at least the written blocks"
   );
 }
+
+/// A hard link creates a second name for one inode: both names resolve to it and its link count
+/// rises; a directory cannot be hard-linked (audit BUG-7, the volume core's link over the seam).
+#[test]
+fn link_creates_a_second_name_for_the_same_inode() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let root = bridge.root(&cx).unwrap();
+  let (attr, _fh) = bridge.create(oid(root), &cx, "original", 0o644, 0).unwrap();
+  let ino = attr.ino;
+
+  let linked = bridge.link(oid(ino), oid(root), &cx, "alias").unwrap();
+  assert_eq!(linked.ino, ino, "the link resolves to the same inode");
+  assert_eq!(linked.nlink, 2, "the link count is now two");
+  assert_eq!(bridge.lookup(oid(root), &cx, "original").unwrap().ino, ino);
+  assert_eq!(bridge.lookup(oid(root), &cx, "alias").unwrap().ino, ino);
+
+  // A directory cannot be hard-linked.
+  let sub = bridge.mkdir(oid(root), &cx, "d", 0o755).unwrap();
+  assert!(
+    bridge.link(oid(sub.ino), oid(root), &cx, "dlink").is_err(),
+    "a directory cannot be hard-linked"
+  );
+}
