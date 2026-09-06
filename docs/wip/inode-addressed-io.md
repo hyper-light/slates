@@ -9,12 +9,15 @@
 > revocation — no placeholders or unconditional validators), the **whole** `Bridge` trait moved
 > onto `(ObjectId, &OpContext)` with rights/view/volume enforced at the seam once for every
 > transport, and both transport edges carrying the context (FUSE `dispatch`/`serve_blocking`, the
-> NFS `Export` admitting its attachment at mount time). Step 4 has begun: NFS `READ`/`WRITE` run
-> over the interface, a read-only export's write refused by the seam (`098432e`, `2bf6c46`,
-> `7c4480a`). The daemon wiring of the FUSE mount's attachment, per-attachment reference ownership
-> with the teardown sweep, and the remaining NFS namespace/setattr procedures are next. On
-> completion this becomes amendment A-10 applied to §4.5 (inode lifetime), §4.6 (the Bridge trait)
-> and §4.13 (authority).
+> NFS `Export` admitting its attachment at mount time). Step 4 is nearly complete: the NFS
+> metadata, file-I/O and namespace procedures all run over the interface — `GETATTR`/`SETATTR`,
+> `LOOKUP`/`ACCESS`, `READ`/`WRITE`, `CREATE`/`MKDIR`/`SYMLINK`/`READLINK`,
+> `REMOVE`/`RMDIR`/`RENAME`, `READDIR`, `FSSTAT`/`FSINFO` — each seam-enforced against the export's
+> rights, view and volume (`7c4480a` … `adee050`); only `READDIRPLUS` is left. The daemon wiring of
+> the FUSE mount's attachment, per-attachment reference ownership with the teardown sweep, synthetic
+> `.`/`..`, and the orphan's survival across a daemon restart are the remaining work. On completion
+> this becomes amendment A-10 applied to §4.5 (inode lifetime), §4.6 (the Bridge trait) and §4.13
+> (authority).
 
 ## 1. The decision and why
 
@@ -251,15 +254,21 @@ attachment-teardown sweep each export a counter a test asserts moved.
    rendezvous-established principal (the server↔bridge seam, with the real Linux mount); wiring
    `open`/`release`/`lookup`/`forget` to per-attachment reference ownership with the teardown
    sweep; §8.5 (cleanup), §8.6 (lifecycle).
-4. **The NFS read/write/setattr/namespace procedures over the new interface.** *(READ, WRITE,
-   REMOVE, RMDIR and RENAME landed 2026-09-05.)* Stateless: handle → `ObjectId`, the export
-   identity → `OpContext`. `READ` returns the bytes with the count and eof; `WRITE` lands
-   `FILE_SYNC` in the anchor and returns `wcc_data` + the volume-derived write verifier, its data
-   length capped at the offered transfer size; a write through a read-only export is refused by the
-   seam (`NFS3ERR_PERM`). `REMOVE`/`RMDIR`/`RENAME` decode `diropargs3` to a parent `ObjectId`, call
-   `unlink`/`rmdir`/`rename` through the seam, and reply the directories' `wcc_data`. *Owed:*
-   `SETATTR` and the entry-creating procedures (`CREATE`/`MKDIR`/`SYMLINK`), which need the `sattr3`
-   set-attribute union; `READDIR(PLUS)`; and the request-lifetime pins for the async driver.
+4. **The NFS read/write/setattr/namespace procedures over the new interface.** *(The metadata,
+   file-I/O and namespace paths landed 2026-09-05; only `READDIRPLUS` is left.)* Stateless: handle
+   → `ObjectId`, the export identity → `OpContext`. `READ` returns the bytes with the count and eof;
+   `WRITE` lands `FILE_SYNC` in the anchor and returns `wcc_data` + the volume-derived write
+   verifier, its data length capped at the offered transfer size. `SETATTR` decodes the `sattr3`
+   set-attribute union (resolving `SET_TO_SERVER_TIME` to the volume wall clock through
+   `Bridge::now`, AC-3.10) and honors an `sattr_guard3` ctime compare-and-set (`NFS3ERR_NOT_SYNC`).
+   `CREATE`/`MKDIR`/`SYMLINK` create through the seam (CREATE honoring `createhow3`: GUARDED,
+   UNCHECKED, and EXCLUSIVE refused `NOTSUPP`) and reply the object's handle/attributes + parent
+   `wcc`. `READLINK` returns a symlink target (a non-symlink is `INVAL`). `REMOVE`/`RMDIR`/`RENAME`
+   decode `diropargs3` to a parent `ObjectId` and reply the directories' `wcc_data`. `READDIR`
+   paginates by cookie, budgets its reply against the client's `count`, and answers `TOOSMALL`. A
+   write/create through a read-only or foreign-volume export is refused at the seam. *Owed:*
+   `READDIRPLUS`; synthetic `.`/`..` entries (a shared bridge concern, the FUSE edge omits them
+   too); a directory-change `cookieverf`; and the request-lifetime pins for the async driver.
 5. **Access enforcement through `subject`** once §4.13 threads the enrolled consumer; `AUTH_SYS`
    remains an advisory mapping, not authentication.
 
