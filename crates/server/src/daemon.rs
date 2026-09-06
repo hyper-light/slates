@@ -80,6 +80,10 @@ pub static INIT_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub static HANDOFF_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Volumes the recovered catalog holds that a shard could not rebuild (a health signal).
 pub static RECOVERY_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Volumes skipped from a shard publish because they could not be imaged (an overlay with base-backed
+/// inodes, whose base recovery is its own gate); the rest of the shard still publishes (a health
+/// signal, §4.8).
+pub static PUBLISH_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Connects refused at the daemon's derived client bound (a health signal, AC-2.6).
 pub static CLIENTS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Clients found dead and reclaimed (a health signal; T-2.3).

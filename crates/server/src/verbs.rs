@@ -2209,12 +2209,17 @@ pub fn publish_shard(state: &mut ShardState) {
         key: slot.id.bytes,
         image,
       }),
+      // A volume the image cannot yet hold (an overlay with base-backed inodes, whose base recovery
+      // is its own gate) is *skipped*, not a barrier — publishing the rest of the shard, so one such
+      // volume never blocks every other volume's recovery. The skipped volume recovers by its own
+      // path (an overlay reopens its base); a scratch volume that could not be imaged refuses on
+      // recovery rather than presenting empty, which is contained to that volume.
       Err(e) => {
+        crate::daemon::PUBLISH_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         eprintln!(
-          "slates-server: partition {}: a volume was not imaged: {e}",
+          "slates-server: partition {}: a volume was not imaged, skipped: {e}",
           state.partition
         );
-        return;
       }
     }
   }

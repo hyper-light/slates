@@ -82,6 +82,48 @@ fn populate(host: &mut SimHost, dirs: usize, files: usize) {
   }
 }
 
+/// AC (§4.8): an overlay whose base has been touched holds a base-backed inode, which the recovery
+/// image cannot yet capture (base recovery is its own gate), so `to_image` refuses it with
+/// `RecoveryIncomplete` — while a scratch volume in the same store images fine. This is the failure a
+/// shard publish now *skips* rather than treats as a barrier (crates/server/src/verbs.rs
+/// `publish_shard`), so one overlay never blocks every other volume's recovery.
+#[test]
+fn an_overlay_with_a_base_inode_refuses_to_image_but_a_scratch_still_images() {
+  let mut host = SimHost::new();
+  host.replace_file("/f", b"base content");
+  let mut store = store();
+
+  // A scratch volume in the same store images cleanly.
+  let mut scratch = Volume::create(
+    &mut store,
+    VolumeConfig {
+      prefix: 8,
+      names: NameEquivalence::Exact,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 20,
+      clock: Box::new(StepClock::new(0, 1)),
+    },
+  )
+  .unwrap();
+  let root = scratch.root_inode(&store).unwrap();
+  let s = scratch
+    .create_file_no(&mut store, root, "s", 0o644)
+    .unwrap();
+  scratch.write(&mut store, s, 0, b"scratch bytes").unwrap();
+  assert!(
+    scratch.to_image(&store).is_ok(),
+    "a scratch volume images cleanly"
+  );
+
+  // An overlay whose base file has been read holds a base-backed inode, which cannot yet be imaged.
+  let mut ov = overlay(&mut host, &mut store);
+  let _ = read_all(&mut ov, &mut host, &mut store, "/f").unwrap();
+  assert!(
+    matches!(ov.to_image(&store), Err(VfsError::RecoveryIncomplete)),
+    "an overlay with a base-backed inode refuses to_image (base recovery is its own gate)"
+  );
+}
+
 /// AC-1.9: create over a base directory costs one directory open regardless of tree size, and
 /// memory after create is independent of the tree.
 #[test]
