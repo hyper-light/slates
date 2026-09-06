@@ -160,11 +160,17 @@ volume.
   Gates: a recovered snapshot's tree is independent of the head's (CoW *sharing* is a §4.2 efficiency
   refinement) and its deadlist is empty (reclaiming its unique bytes on drop is owed) — neither a
   content-correctness issue.
-- **Other fidelity extensions.** Clone lineage (a clone pins an origin snapshot); referenced-but-
-  unlinked orphans (§4.6 lifetime across a restart); base-backed volumes (a live base restored only
-  through retained handles or validated source identity — "reopening a path alone cannot substitute
-  another base"); the live pressure source of a dynamic quota (re-supplied on recovery like the
-  clock).
+- **Clone recovery.** *(Content landed.)* A clone's image captures its whole tree (the bytes it
+  inherited from the origin snapshot and the bytes it wrote after diverging), and `from_image`
+  rebuilds it faithfully, keeping the inherited root inode number (fixed in
+  docs/bugs/2026-09-06-clone-recovery-root-number.md) and restoring the origin epoch. Owed: the O(1)
+  *sharing* between a recovered clone and its origin (a §4.2 efficiency refinement, not content), and
+  a process-level clone-across-restart test through the daemon.
+- **Other fidelity extensions.** Referenced-but-unlinked orphans (§4.6 lifetime across a restart —
+  though a restart drops the open handles that pinned them, so they are correctly not recovered);
+  base-backed volumes (a live base restored only through retained handles or validated source
+  identity — "reopening a path alone cannot substitute another base"); the live pressure source of a
+  dynamic quota (re-supplied on recovery like the clock).
 - **§4.2 reservation accounting.** BUG-2 (admit against usable arena capacity) and BUG-1 (a strict
   volume locks its RAM or refuses) are landed. Still owed: BUG-3 (dynamic growth must consult the
   live shard budget, not machine RAM — needs the vfs↔server write-path coupling, Phase-4-exercised),
