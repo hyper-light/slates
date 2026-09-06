@@ -11,11 +11,16 @@
 > it unbounded so the determinism oracle is untouched. §4.2 and GAP-A9-1 are the authority; BUG-1
 > (locked store) and BUG-2 (usable capacity) are also fixed. Xattr is not applicable (unimplemented)
 > and open handles are bounded at the bridge's `Slab` (BUG-4), so the applicable per-volume caps are
-> all in place and *safe* (typed refusals at both the logical allowance and the version slab). What
-> remains: the retention dimension, and the step from a per-volume cap to disjoint per-volume
-> *reservation* — which §4 shows is data-plane-gated for its `operation_headroom` (the measured peak
-> of transient CoW versions), exactly as BUG-3 is gated for its growth source. Reserving without that
-> headroom would be a false guarantee, so the honest cap stands until the measurement exists.
+> all in place and *safe* (typed refusals at both the logical allowance and the version slab). The
+> **byte dimension's reservation is now complete** (§4): `ShardBudget` keeps a *derived* operation
+> headroom (`2 × chunk_bytes × clients_per_shard`) free of every admission, reservation and dynamic
+> growth alike, so a bounded volume's claim is sacred and growth takes only unpromised capacity —
+> through the one budget, never against raw host memory. What remains: the retention dimension, and
+> the step from a per-volume cap to disjoint per-volume *reservation* for the **inode** dimension —
+> which §4 shows is data-plane-gated for *its* `operation_headroom` (the measured peak of transient
+> CoW versions, which has no structural anchor the byte headroom has), exactly as the byte dimension's
+> live per-growth re-check is gated on the data-plane write path. The honest inode cap stands until
+> that measurement exists.
 
 ## 1. The requirement
 
@@ -105,6 +110,25 @@ pressure and recovery). That builds on the cap: once each dimension is counted a
 reserves the vector rather than only capping it, and `ShardBudget` grows a per-dimension reserve
 alongside its byte reserve.
 
+**The byte dimension's reservation is landed, headroom and growth included.** `ShardBudget` is the
+one capacity owner for content bytes (crates/mem/src/budget.rs): it keeps an `operation_headroom` free
+of *every* admission, reservation and growth alike (`admittable = capacity − committed − headroom`),
+and the headroom is now **derived, not a placeholder** — `2 × chunk_bytes × clients_per_shard` (a
+copy-up's source and destination chunk per concurrent writer), from structural anchors, replacing the
+old `reserve_per_shard / clients` stand-in. Earlier only `grow` respected the floor while `reserve`
+did not, so a bounded volume could commit into the headroom; now both obey the one `admittable` rule,
+so a bounded reservation keeps it free and a dynamic growth takes only capacity neither committed to
+another volume nor reserved as headroom (a sacred claim is never eaten — gated in budget.rs by
+`dynamic_growth_cannot_eat_a_bounded_reservation_or_the_headroom`). Dynamic growth is admitted through
+this same budget: the daemon's dynamic-volume pressure source is now a budget-anchored ceiling, not
+the raw `memory_available_now()` the design forbids ("raw free RAM … do not qualify"). What remains
+for the byte dimension is the *live* per-growth re-check against the budget as later volumes are
+admitted — owed with the data-plane write path (BUG-3), the only place a dynamic volume actually
+grows; the control-path growth (`resize`) already reserves through the headroom-respecting budget.
+
+The **inode** dimension's reservation is a separate story, below: it turns on a headroom that must be
+measured, not derived, so it stays a cap for now.
+
 **Where the current state already is safe.** Both inode enforcement points are typed refusals, so
 today's cap never corrupts or panics — it can only be *over-optimistic* about availability, never
 unsafe. `Volume::next_no` refuses a logical inode past the per-volume allowance (`NoSpace`), and the
@@ -120,9 +144,10 @@ the old version), retiring the old slot for reclaim at the next epoch boundary. 
 holds, at any instant, the logical inodes **plus** the snapshot-retained versions **plus** the
 transient in-epoch versions that are retired but not yet reclaimed. A correct reservation must
 therefore carry an `operation_headroom` for those transient versions (the §4.2 invariant's
-`operation_headroom` term) — exactly as the byte budget keeps a free floor from the *measured* peak
-burst (`ShardBudget::floor`, "measured peak burst across volumes"). The inode equivalent is the
-measured peak of concurrent retired-but-unreclaimed versions, which depends on the write rate against
+`operation_headroom` term) — as the byte budget now keeps a *derived* operation headroom free
+(`ShardBudget`, `2 × chunk_bytes × clients_per_shard`; §4 above). But the inode equivalent has no such
+structural anchor: it is the peak of concurrent retired-but-unreclaimed versions, which depends on the
+write rate against
 the epoch/reclaim cadence — a quantity that can only be measured with the data-plane write path
 driving the slab under load. Reserving the logical allowance as version-slots **without** that
 headroom would be a *false* guarantee: a volume within its logical allowance could still exhaust the

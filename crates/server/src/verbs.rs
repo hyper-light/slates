@@ -29,7 +29,7 @@ use slates_vfs::base::BaseConfig;
 use slates_vfs::clock::{Clock, HostClock};
 use slates_vfs::host::HostFs;
 use slates_vfs::names::NameEquivalence;
-use slates_vfs::quota::{PressureSource, Quota};
+use slates_vfs::quota::{Ceiling, Quota};
 use slates_vfs::recover::{KeyedImage, ShardImage, VolumeImage};
 use slates_vfs::volume::{DestroyProgress, Volume, VolumeConfig};
 use slates_wire::Wire;
@@ -46,22 +46,6 @@ const PERMILLE: u64 = 1000;
 /// Shape: the destroy slice's budget as a share of the shard's step budget, parts per
 /// thousand: half, so a destroy never takes the whole step from the clients.
 const DESTROY_SLICE_PERMILLE: u64 = 500;
-
-/// The host's live memory as a dynamic quota's pressure source (§4.2: growth only while the
-/// projected free memory after it stays above the reserve).
-struct HostPressure {
-  /// Derived: the free floor, the shard's measured peak burst (the budget's floor).
-  floor: u64,
-}
-
-impl PressureSource for HostPressure {
-  fn may_grow(&mut self, bytes: u64) -> bool {
-    match slates_machine::facts::Facts::memory_available_now() {
-      Some(available) => available.saturating_sub(bytes) > self.floor,
-      None => false,
-    }
-  }
-}
 
 pub(crate) fn to_db_volume(id: VolumeId) -> DbVolumeId {
   DbVolumeId { bytes: id.bytes }
@@ -700,10 +684,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,
     torn_tail: state.recovered.torn,
-    reserve_bytes: state
-      .budget
-      .available()
-      .saturating_add(state.budget.committed()),
+    reserve_bytes: state.budget.capacity(),
     committed_bytes: state.budget.committed(),
     signals,
   }
@@ -996,8 +977,15 @@ fn quota_for(state: &ShardState, size: SizeClass) -> Quota {
     SizeClass::Bounded { limit } => Quota::Bounded { limit },
     SizeClass::Dynamic { max } => Quota::Dynamic {
       max,
-      source: Box::new(HostPressure {
-        floor: state.budget.floor().get(),
+      // Dynamic growth is admitted against the shard budget — the one capacity owner — never against
+      // raw host memory (§4.2: "raw free RAM and virtual address space do not qualify"). The ceiling
+      // is the capacity not already promised to a bounded volume and above the operation headroom at
+      // creation, clamped to the requested maximum. Re-checking the live budget on each growth as
+      // later volumes are admitted (so a dynamic volume never eats space promised after it) is owed
+      // with the data-plane write path (BUG-3), which is the only place a dynamic volume grows.
+      source: Box::new(Ceiling {
+        granted: 0,
+        limit: max.min(state.budget.admittable()),
       }),
       granted: 0,
       denied: 0,

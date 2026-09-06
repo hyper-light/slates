@@ -2,22 +2,31 @@
 //! refuse whole, and the dynamic-growth formulas of §4.2 with each result as a `Derived` value.
 //!
 //! Bounded: a reservation moves bytes from the reserve to the volume's accounting in one step;
-//! if the reserve cannot cover it the request is refused with `BudgetExceeded { available }` and
-//! nothing changes (never a partial volume). Dynamic: an increment is sized so that at the
-//! measured allocation rate it outlasts the measured time to prepare the next one (map,
-//! pre-fault, lock), and growth is granted only while projected free memory after the grant stays
-//! above the reserve derived from the measured peak burst.
+//! if the reserve cannot cover it — keeping the operation headroom free — the request is refused
+//! with `BudgetExceeded { available }` and nothing changes (never a partial volume). Dynamic: an
+//! increment is sized so that at the measured allocation rate it outlasts the measured time to
+//! prepare the next one (map, pre-fault, lock), and growth is admitted through this same budget,
+//! taking only capacity that is neither committed to another volume nor the operation headroom —
+//! so a dynamic volume never eats a bounded volume's sacred claim or the room in-flight operations
+//! need to coexist (§4.2).
 
 use slates_machine::{Derived, derived};
 
 use crate::error::MemError;
 
-/// A shard's byte reserve and its accounting.
+/// A shard's byte reserve and its accounting (§4.2 atomic admission). The `reserve` is the effective
+/// capacity — the usable, prepared arena; `committed` is the entitlement handed to volumes; and
+/// `headroom` is the operation headroom kept free for the bounded temporary coexistence of in-flight
+/// operations (a copy-up holds a source chunk and its new extent at once). Every admission — a
+/// bounded reservation or a dynamic growth alike — leaves the headroom free and takes only from
+/// capacity not already committed, so growth consumes only unpromised space and a burst never meets
+/// exhaustion. This is the one capacity owner: control-path reservations and dynamic growth both go
+/// through it, with no second, looser test against raw free memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardBudget {
   reserve: u64,
   committed: u64,
-  peak_burst: u64,
+  headroom: u64,
 }
 
 /// A reservation of bytes for one bounded volume.
@@ -28,38 +37,45 @@ pub struct Reservation {
 }
 
 impl ShardBudget {
-  /// A budget over `reserve` pre-faulted, locked bytes, with `peak_burst` the measured peak
-  /// burst across volumes that the free floor is derived from.
-  pub const fn new(reserve: u64, peak_burst: u64) -> Self {
+  /// A budget over `reserve` pre-faulted, locked bytes (the effective capacity), keeping `headroom`
+  /// bytes free for in-flight operation coexistence (§4.2). The caller derives `headroom` from
+  /// structural anchors (concurrent copy-ups × the copy-up window); the budget only enforces it.
+  pub const fn new(reserve: u64, headroom: u64) -> Self {
     Self {
       reserve,
       committed: 0,
-      peak_burst,
+      headroom,
     }
   }
 
-  /// Bytes available to a new reservation.
-  pub const fn available(&self) -> u64 {
-    self.reserve.saturating_sub(self.committed)
+  /// The effective capacity — the usable, prepared arena the budget is over.
+  pub const fn capacity(&self) -> u64 {
+    self.reserve
   }
 
-  /// Bytes committed to volumes.
+  /// Bytes committed to volumes (their entitlement).
   pub const fn committed(&self) -> u64 {
     self.committed
   }
 
-  /// The free floor: the measured peak burst, kept free so a burst never meets exhaustion.
-  pub fn floor(&self) -> Derived<u64> {
-    derived!(
-      self.peak_burst,
-      "measured peak burst across volumes",
-      ["mem.peak_burst"]
-    )
+  /// The operation headroom kept free of every admission (§4.2).
+  pub const fn headroom(&self) -> u64 {
+    self.headroom
   }
 
-  /// Reserves `bytes` for a bounded volume, whole or not at all.
+  /// Bytes an admission — a reservation or a growth — may still take: the effective capacity, less
+  /// what is committed, less the operation headroom every admission leaves free. So both a bounded
+  /// reservation and a dynamic growth take only unpromised capacity and never eat the headroom.
+  pub const fn admittable(&self) -> u64 {
+    self
+      .reserve
+      .saturating_sub(self.committed)
+      .saturating_sub(self.headroom)
+  }
+
+  /// Reserves `bytes` for a bounded volume, whole or not at all, keeping the operation headroom free.
   pub fn reserve(&mut self, bytes: u64) -> Result<Reservation, MemError> {
-    let available = self.available();
+    let available = self.admittable();
     if bytes > available {
       return Err(MemError::BudgetExceeded {
         requested: bytes,
@@ -75,18 +91,20 @@ impl ShardBudget {
     self.committed = self.committed.saturating_sub(reservation.bytes);
   }
 
-  /// Whether a dynamic volume may grow by `increment` now: only while the projected free bytes
-  /// after the grant stay above the floor.
-  pub fn may_grow(&self, increment: u64) -> bool {
-    self.available().saturating_sub(increment) >= self.floor().get()
+  /// Whether a dynamic volume may grow by `increment` now: only from capacity that is neither
+  /// committed to another volume nor the operation headroom — the same rule a reservation obeys, so
+  /// growth is sacred-claim-safe by construction and never needs a separate free-memory test.
+  pub const fn may_grow(&self, increment: u64) -> bool {
+    increment <= self.admittable()
   }
 
-  /// Grows a dynamic volume by `increment` under the floor rule.
+  /// Grows a dynamic volume by `increment`, consuming only unpromised capacity above the headroom.
   pub fn grow(&mut self, increment: u64) -> Result<Reservation, MemError> {
-    if !self.may_grow(increment) {
+    let available = self.admittable();
+    if increment > available {
       return Err(MemError::BudgetExceeded {
         requested: increment,
-        available: self.available().saturating_sub(self.floor().get()),
+        available,
       });
     }
     self.committed += increment;
@@ -136,18 +154,28 @@ mod tests {
   use super::*;
 
   #[test]
-  fn a_bounded_reservation_commits_whole_or_refuses_with_what_is_available() {
-    let mut b = ShardBudget::new(6 << 30, 1 << 20);
+  fn a_bounded_reservation_commits_whole_and_keeps_the_operation_headroom_free() {
+    let mut b = ShardBudget::new(6 << 30, 1 << 30); // 6 GiB capacity, 1 GiB operation headroom
+    assert_eq!(
+      b.admittable(),
+      5 << 30,
+      "only capacity above the headroom is admittable"
+    );
     let r = b.reserve(4 << 30).unwrap();
     assert_eq!(r.bytes, 4 << 30);
-    assert_eq!(b.available(), 2 << 30);
-    match b.reserve(3 << 30) {
+    assert_eq!(
+      b.admittable(),
+      1 << 30,
+      "4 GiB committed, the 1 GiB headroom still kept free"
+    );
+    // A reservation that would dip into the headroom refuses, whole, offering only the space above it.
+    match b.reserve(2 << 30) {
       Err(MemError::BudgetExceeded {
         requested,
         available,
       }) => {
-        assert_eq!(requested, 3 << 30);
-        assert_eq!(available, 2 << 30);
+        assert_eq!(requested, 2 << 30);
+        assert_eq!(available, 1 << 30);
       }
       other => panic!("{other:?}"),
     }
@@ -157,20 +185,42 @@ mod tests {
       "a refused reservation changes nothing"
     );
     b.release(r);
-    assert_eq!(b.available(), 6 << 30);
+    assert_eq!(b.admittable(), 5 << 30);
   }
 
   #[test]
-  fn dynamic_growth_stops_at_the_floor_derived_from_the_peak_burst() {
+  fn dynamic_growth_takes_only_unpromised_capacity_above_the_headroom() {
     let mut b = ShardBudget::new(100, 30);
-    assert_eq!(b.floor().get(), 30);
+    assert_eq!(b.headroom(), 30);
+    assert_eq!(b.admittable(), 70, "capacity above the operation headroom");
     assert!(b.may_grow(70));
-    assert!(!b.may_grow(71));
+    assert!(!b.may_grow(71), "growth may not dip into the headroom");
     b.grow(70).unwrap();
     assert!(matches!(
       b.grow(1),
       Err(MemError::BudgetExceeded { available: 0, .. })
     ));
+  }
+
+  /// The one capacity owner: a dynamic volume's growth cannot eat a bounded volume's reservation
+  /// (a sacred claim) or the operation headroom — the same admittable rule bounds both, so growth
+  /// takes only genuinely unpromised capacity (§4.2).
+  #[test]
+  fn dynamic_growth_cannot_eat_a_bounded_reservation_or_the_headroom() {
+    let mut b = ShardBudget::new(100, 20);
+    b.reserve(50).unwrap(); // a bounded volume's sacred 50
+    assert_eq!(
+      b.admittable(),
+      30,
+      "100 capacity − 50 committed − 20 headroom"
+    );
+    assert!(b.may_grow(30));
+    assert!(
+      !b.may_grow(31),
+      "growth cannot dip into the bounded reservation or the headroom"
+    );
+    b.grow(30).unwrap();
+    assert!(matches!(b.grow(1), Err(MemError::BudgetExceeded { .. })));
   }
 
   #[test]

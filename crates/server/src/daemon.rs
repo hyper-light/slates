@@ -299,11 +299,21 @@ fn init_shard(
     },
     arena,
   );
-  let peak_burst = derived!(
-    config.reserve_per_shard
-      / u64::from(u32::try_from(config.clients_per_shard).unwrap_or(1).max(1)),
-    "reserve_per_shard / clients_per_shard until the burst is measured (§4.2)",
-    ["reserve_per_shard", "clients_per_shard"]
+  // The operation headroom (§4.2): the bounded temporary coexistence of in-flight operations, kept
+  // free of every admission (reservation and dynamic growth alike). A write into a sealed chunk
+  // copies it into a new open extent — copy-on-write at chunk granularity — so the source chunk and
+  // its destination coexist (two chunk windows) until the seal, and at most one such copy-up is in
+  // flight per client the shard serves. This is structural — the chunk window times the client count
+  // — not the measured burst the earlier placeholder stood in for.
+  let chunk_window =
+    u64::try_from(slates_vfs::content::chunk_bytes(config.page).get()).unwrap_or(u64::MAX);
+  let concurrent_writers = u64::try_from(config.clients_per_shard).unwrap_or(1).max(1);
+  let headroom = derived!(
+    chunk_window
+      .saturating_mul(2)
+      .saturating_mul(concurrent_writers),
+    "2 × chunk_bytes × clients_per_shard (a copy-up's source and destination chunk per concurrent writer)",
+    ["vfs.chunk_bytes", "clients_per_shard"]
   );
   let shard = registry::current_shard().unwrap_or(partition);
   // The node's host id: the machine identity's hash, stable across restarts, distinct per
@@ -340,7 +350,7 @@ fn init_shard(
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),
     by_id: std::collections::BTreeMap::new(),
     clients: Slab::new(config.caps.segment_slots, config.clients_per_shard),
-    budget: ShardBudget::new(arena_capacity, peak_burst.get()),
+    budget: ShardBudget::new(arena_capacity, headroom.get()),
     next_prefix: partition
       .saturating_mul(u16::try_from(config.caps.segment_slots).unwrap_or(u16::MAX))
       .max(1),
