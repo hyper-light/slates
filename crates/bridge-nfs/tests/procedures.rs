@@ -13,7 +13,7 @@ use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
 use slates_bridge_nfs::procedures::{
   Export, NFSPROC3_ACCESS, NFSPROC3_CREATE, NFSPROC3_FSINFO, NFSPROC3_FSSTAT, NFSPROC3_GETATTR,
   NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR,
-  NFSPROC3_SETATTR, NFSPROC3_WRITE,
+  NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE,
 };
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_db::catalog::{Principal, VolumeId};
@@ -1155,5 +1155,62 @@ fn a_mkdir_over_the_export_makes_a_directory() {
     XdrReader::new(&lreply).u32().unwrap(),
     Nfsstat3::Ok.wire(),
     "the created directory resolves"
+  );
+}
+
+/// SYMLINK over the export makes a symbolic link: the reply carries the link's handle and
+/// attributes (a symlink whose size is the target length), and a following LOOKUP resolves it.
+#[test]
+fn a_symlink_over_the_export_makes_a_link() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = root_handle(&mut export);
+
+  let target = "to/the/target";
+  let mut args = XdrWriter::new();
+  root_fh.encode(&mut args);
+  args.opaque("link".as_bytes()); // name
+  // sattr3: nothing set (a symlink's mode is fixed), times DONT_CHANGE.
+  args.bool(false); // mode
+  args.bool(false); // uid
+  args.bool(false); // gid
+  args.bool(false); // size
+  args.u32(0); // atime
+  args.u32(0); // mtime
+  args.opaque(target.as_bytes()); // symlink_data (nfspath3)
+  let reply = export
+    .serve_nfs(NFSPROC3_SYMLINK, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "SYMLINK succeeded");
+  assert!(r.bool().unwrap(), "a handle follows");
+  let _fh = Nfsfh3::decode(&mut r).unwrap();
+  let attr = PostOpAttr::decode(&mut r).unwrap().0.expect("object attrs");
+  assert_eq!(attr.kind, Ftype3::Lnk, "a symbolic link");
+  assert_eq!(
+    attr.size,
+    u64::try_from(target.len()).unwrap(),
+    "the size is the target length"
+  );
+
+  let mut la = XdrWriter::new();
+  root_fh.encode(&mut la);
+  la.opaque("link".as_bytes());
+  let lreply = export.lookup(&mut XdrReader::new(la.as_slice()));
+  assert_eq!(
+    XdrReader::new(&lreply).u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "the created link resolves"
   );
 }

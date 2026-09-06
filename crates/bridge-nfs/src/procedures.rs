@@ -41,6 +41,8 @@ pub const NFSPROC3_SETATTR: u32 = 2;
 pub const NFSPROC3_CREATE: u32 = 8;
 /// Format: NFSPROC3_MKDIR — create a directory.
 pub const NFSPROC3_MKDIR: u32 = 9;
+/// Format: NFSPROC3_SYMLINK — create a symbolic link.
+pub const NFSPROC3_SYMLINK: u32 = 10;
 /// Format: NFSPROC3_LOOKUP — resolve a name in a directory to a handle.
 pub const NFSPROC3_LOOKUP: u32 = 3;
 /// Format: NFSPROC3_ACCESS — which operations the caller may perform on an object.
@@ -62,6 +64,10 @@ pub const NFSPROC3_FSINFO: u32 = 19;
 /// Format: the maximum bytes in a filename slates resolves (§4.5's name cap), refused before
 /// allocating.
 pub const NFS_MAXNAMELEN: usize = 255;
+/// Format: the maximum bytes in a symlink target the server accepts — POSIX `PATH_MAX` (4096). RFC
+/// 1813 leaves `nfspath3` unbounded, so the server caps it and refuses a longer target before
+/// allocating; the volume core does not yet enforce its own symlink-target cap (owed).
+const NFS_MAXPATHLEN: usize = 4096;
 /// Format: the `AUTH_SYS` authentication flavor (RFC 5531).
 const AUTH_SYS: u32 = 1;
 /// Format: the `AUTH_NONE` authentication flavor (RFC 5531).
@@ -262,6 +268,7 @@ impl<'b> Export<'b> {
       NFSPROC3_LOOKUP => Some(self.lookup(args)),
       NFSPROC3_CREATE => Some(self.create(args)),
       NFSPROC3_MKDIR => Some(self.mkdir(args)),
+      NFSPROC3_SYMLINK => Some(self.symlink(args)),
       NFSPROC3_ACCESS => Some(self.access(args)),
       NFSPROC3_READ => Some(self.read(args)),
       NFSPROC3_WRITE => Some(self.write(args)),
@@ -844,9 +851,66 @@ impl<'b> Export<'b> {
     self.finish_create(object, &dir_identity, &cx, post_changes)
   }
 
-  /// The shared tail of CREATE and MKDIR: apply the `sattr3` fields the creation did not set (the
-  /// mode is set at creation), fetch the object's final attributes, mint its handle, and gather the
-  /// parent directory's post-op attributes for the wcc.
+  /// NFSPROC3_SYMLINK: create a symbolic link in a directory over the shared interface under the
+  /// export's context, then reply the new link's handle and attributes and the parent's wcc. A
+  /// symlink's mode is fixed at creation, so only the `sattr3` ownership and times are applied.
+  pub fn symlink(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let (status, made, dir_post) = self.do_symlink(args);
+    let mut writer = XdrWriter::new();
+    encode_create_reply(&mut writer, status, made, dir_post);
+    writer.into_bytes()
+  }
+
+  fn do_symlink(
+    &mut self,
+    args: &mut XdrReader<'_>,
+  ) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Option<Fattr3>) {
+    // SYMLINK3args: where (diropargs3), then symlinkdata3 (the sattr3 attributes, then the target
+    // path). The target is capped before allocating.
+    let dir_fh = match Nfsfh3::decode(args) {
+      Ok(fh) => fh,
+      Err(_) => return (Nfsstat3::Badhandle, None, None),
+    };
+    let name = match args.string(NFS_MAXNAMELEN) {
+      Ok(n) => n.to_owned(),
+      Err(_) => return (Nfsstat3::Inval, None, None),
+    };
+    let changes = match self.decode_sattr3(args) {
+      Ok(c) => c,
+      Err(status) => return (status, None, None),
+    };
+    let target = match args.string(NFS_MAXPATHLEN) {
+      Ok(t) => t.to_owned(),
+      Err(_) => return (Nfsstat3::Inval, None, None),
+    };
+    let dir_identity = match self.resolve_handle(&dir_fh) {
+      Ok(id) => id,
+      Err(status) => return (status, None, None),
+    };
+    let cx = match self.op_context() {
+      Ok(cx) => cx,
+      Err(e) => return (nfsstat_of(&e), None, None),
+    };
+    let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
+    let object = match self.bridge.symlink(parent, &cx, &name, &target) {
+      Ok(node) => ObjectId::new(node.ino, node.generation),
+      Err(e) => {
+        let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
+        return (nfsstat_of(&e), None, dir_post);
+      }
+    };
+    // A symlink's mode is fixed and it has no size to set; apply the ownership and times.
+    let post_changes = SetAttr {
+      mode: None,
+      size: None,
+      ..changes
+    };
+    self.finish_create(object, &dir_identity, &cx, post_changes)
+  }
+
+  /// The shared tail of CREATE, MKDIR and SYMLINK: apply the `sattr3` fields the creation did not
+  /// set (the mode is set at creation), fetch the object's final attributes, mint its handle, and
+  /// gather the parent directory's post-op attributes for the wcc.
   fn finish_create(
     &mut self,
     object: ObjectId,
