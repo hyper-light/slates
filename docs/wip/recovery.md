@@ -113,13 +113,26 @@ volume.
    after the writer's mapping is dropped, and the frame signals empty, reads back, refuses a torn
    write and refuses too small a buffer. This is Ada's step-two proof at the library level, through
    the actual restart-surviving primitive; only the server/client process lifecycle is left to wire.
+6. **Whole-shard image.** *(Landed, `crates/vfs/src/recover.rs` `ShardImage`/`KeyedImage`.)* A shard
+   holds many volumes in one store and has one content object, so it publishes them all together: a
+   `ShardImage` is the volumes in key order, each a `KeyedImage` pairing the volume's image with an
+   opaque `u64` routing key its owner (the server) files it by — vfs does not interpret the key, so
+   the format is layering-clean. Same framing (`write_to`/`read_from`, shared with `VolumeImage` via
+   `frame`/`unframe`) and a distinct magic so a shard image is never decoded as a single volume.
+   Gated: two volumes with distinct prefixes survive a content-object handoff together, recovered by
+   key and each rebuilt faithfully. This is the format the daemon wiring needs, so that wiring is one
+   correct integration rather than a single-volume version later replaced.
 
 ## 4. Owed, as individual gates
 
 - **Daemon/content-object wiring.** The create path sizes and creates the content object
-  (`AnchorSegment::with_content`, landed); a barrier calls `VolumeImage::write_to` into it;
-  `init_shard` calls `read_from` and rebuilds via `from_image`. Then the process-level proof: write
+  (`AnchorSegment::with_content`, landed); a barrier images the shard's volumes and calls
+  `ShardImage::write_to` into the content object; `init_shard` calls `ShardImage::read_from` and
+  rebuilds each volume via `from_image`, keyed by volume id. Then the process-level proof: write
   bytes through the client, kill the daemon while the anchor survives, restart, read the same bytes.
+  The whole recovery format (capture, rebuild, per-shard framing) is now in place and gated; this
+  slice is server plumbing plus a two-daemon process test on the anchor-handoff harness
+  (`crates/client/tests/client.rs` is the model).
 - **Crash-during-publish (double buffering).** The single-slot frame detects a torn write but does
   not keep the prior good image across one; the database's two-slot, sequence-numbered publish
   (`replay.rs`) is the pattern to adopt so a crash mid-publish recovers the last complete image.

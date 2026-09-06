@@ -38,9 +38,12 @@ use crate::quota::Quota;
 use crate::trie;
 use crate::volume::{Store, Volume, VolumeSeed};
 
-/// Format: the image's magic (`"SLR1"` little-endian), so an all-zero or foreign content object
-/// decodes to a mismatch and is refused rather than read as a valid empty volume.
+/// Format: a volume image's magic (`"SLR1"` little-endian), so an all-zero or foreign content
+/// object decodes to a mismatch and is refused rather than read as a valid empty volume.
 const IMAGE_MAGIC: u32 = u32::from_le_bytes(*b"SLR1");
+/// Format: a shard image's magic (`"SLS1"` little-endian), distinct from a single volume's so one
+/// is never decoded as the other.
+const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// Format: the image layout version, bumped with any change to the types below.
 const IMAGE_VERSION: u16 = 1;
 
@@ -205,6 +208,72 @@ pub struct VolumeImage {
   pub inodes: Vec<InodeImage>,
 }
 
+/// One volume's image under the opaque routing key its owner (the server) files it by. The key is
+/// a `u64` this crate does not interpret — the server maps its volume id onto it — so a whole shard
+/// of volumes recovers without vfs knowing what a volume id is.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct KeyedImage {
+  /// The owner's routing key for the volume.
+  pub key: u64,
+  /// The volume's image.
+  pub image: VolumeImage,
+}
+
+/// Every volume a shard holds, imaged together (§4.8): one shard has one content object, and it
+/// publishes all of its volumes into it, so a restarted shard recovers them all from anchor-owned
+/// RAM in one read. Volumes are in key order, so the shard image is deterministic.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct ShardImage {
+  /// The format magic; checked before anything else on decode.
+  pub magic: u32,
+  /// The format version.
+  pub version: u16,
+  /// The volumes, in key order.
+  pub volumes: Vec<KeyedImage>,
+}
+
+impl ShardImage {
+  /// A shard image of the given volumes, in key order.
+  pub fn new(mut volumes: Vec<KeyedImage>) -> ShardImage {
+    volumes.sort_by_key(|v| v.key);
+    ShardImage {
+      magic: SHARD_MAGIC,
+      version: IMAGE_VERSION,
+      volumes,
+    }
+  }
+
+  /// Decodes a shard image from content-object bytes, refusing a foreign magic, an unknown version
+  /// or any malformed field with [`VfsError::RecoveryIncomplete`].
+  pub fn from_content(bytes: &[u8]) -> Result<ShardImage, VfsError> {
+    let shard = ShardImage::from_bytes(bytes).map_err(|_| VfsError::RecoveryIncomplete)?;
+    if shard.magic != SHARD_MAGIC || shard.version != IMAGE_VERSION {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    Ok(shard)
+  }
+
+  /// The canonical content-object bytes of this shard image.
+  pub fn to_content(&self) -> Vec<u8> {
+    self.to_bytes()
+  }
+
+  /// Publishes this shard image into a content-object buffer (§4.8), framed by [`frame`]. Refuses
+  /// [`VfsError::NoSpace`] if the buffer cannot hold the frame.
+  pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, VfsError> {
+    frame(&self.to_content(), buf)
+  }
+
+  /// Reads a shard image back from a content-object buffer (§4.8): `Ok(None)` for a fresh (empty)
+  /// object with nothing to recover, `Err(RecoveryIncomplete)` for a torn or malformed frame.
+  pub fn read_from(buf: &[u8]) -> Result<Option<ShardImage>, VfsError> {
+    match unframe(buf)? {
+      None => Ok(None),
+      Some(bytes) => ShardImage::from_content(bytes).map(Some),
+    }
+  }
+}
+
 impl VolumeImage {
   /// Decodes an image from content-object bytes, refusing a foreign magic, an unknown version,
   /// trailing bytes or any malformed field with [`VfsError::RecoveryIncomplete`] (§4.8: missing or
@@ -222,24 +291,10 @@ impl VolumeImage {
     self.to_bytes()
   }
 
-  /// Publishes this image into a content-object buffer (§4.8): a header of the byte length and a
-  /// CRC-32C of the image, then the image bytes. The header is what a restarted daemon reads to
-  /// find and validate the image; the CRC turns a write torn by a crash into a typed refusal rather
-  /// than a garbage decode. Refuses [`VfsError::NoSpace`] if the buffer cannot hold the frame.
+  /// Publishes this image into a content-object buffer (§4.8), framed by [`frame`]. Refuses
+  /// [`VfsError::NoSpace`] if the buffer cannot hold the frame.
   pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, VfsError> {
-    let bytes = self.to_content();
-    let total = FRAME_HEADER
-      .checked_add(bytes.len())
-      .ok_or(VfsError::FileTooLarge)?;
-    if buf.len() < total {
-      return Err(VfsError::NoSpace);
-    }
-    let len = u32::try_from(bytes.len()).map_err(|_| VfsError::FileTooLarge)?;
-    let crc = crc32c(&bytes);
-    buf[..LEN_WIDTH].copy_from_slice(&len.to_le_bytes());
-    buf[LEN_WIDTH..FRAME_HEADER].copy_from_slice(&crc.to_le_bytes());
-    buf[FRAME_HEADER..total].copy_from_slice(&bytes);
-    Ok(total)
+    frame(&self.to_content(), buf)
   }
 
   /// Reads an image a running daemon wrote with [`VolumeImage::write_to`] back from a content-object
@@ -248,36 +303,64 @@ impl VolumeImage {
   /// (a length past the buffer, a CRC mismatch from a torn write, a malformed image) is
   /// [`VfsError::RecoveryIncomplete`] — never an empty success (§4.8).
   pub fn read_from(buf: &[u8]) -> Result<Option<VolumeImage>, VfsError> {
-    if buf.len() < FRAME_HEADER {
-      return Ok(None);
+    match unframe(buf)? {
+      None => Ok(None),
+      Some(bytes) => VolumeImage::from_content(bytes).map(Some),
     }
-    let mut len_bytes = [0u8; LEN_WIDTH];
-    len_bytes.copy_from_slice(&buf[..LEN_WIDTH]);
-    let len = usize::try_from(u32::from_le_bytes(len_bytes)).unwrap_or(usize::MAX);
-    if len == 0 {
-      return Ok(None);
-    }
-    let mut crc_bytes = [0u8; LEN_WIDTH];
-    crc_bytes.copy_from_slice(&buf[LEN_WIDTH..FRAME_HEADER]);
-    let want_crc = u32::from_le_bytes(crc_bytes);
-    let end = FRAME_HEADER
-      .checked_add(len)
-      .ok_or(VfsError::RecoveryIncomplete)?;
-    if buf.len() < end {
-      return Err(VfsError::RecoveryIncomplete);
-    }
-    let image_bytes = &buf[FRAME_HEADER..end];
-    if crc32c(image_bytes) != want_crc {
-      return Err(VfsError::RecoveryIncomplete);
-    }
-    VolumeImage::from_content(image_bytes).map(Some)
   }
 }
 
 /// Format: the width of the frame's length and CRC fields.
 const LEN_WIDTH: usize = size_of::<u32>();
-/// Format: the frame header — a little-endian byte length then a CRC-32C of the image bytes.
+/// Format: the frame header — a little-endian byte length then a CRC-32C of the payload bytes.
 const FRAME_HEADER: usize = 2 * LEN_WIDTH;
+
+/// Frames Wire `payload` into a content-object buffer: a little-endian byte length and a CRC-32C of
+/// the payload, then the payload. The header is what a restarted daemon reads to find and validate
+/// what was published; the CRC turns a write torn by a crash into a typed refusal rather than a
+/// garbage decode. Refuses [`VfsError::NoSpace`] if the buffer cannot hold the frame.
+fn frame(payload: &[u8], buf: &mut [u8]) -> Result<usize, VfsError> {
+  let total = FRAME_HEADER
+    .checked_add(payload.len())
+    .ok_or(VfsError::FileTooLarge)?;
+  if buf.len() < total {
+    return Err(VfsError::NoSpace);
+  }
+  let len = u32::try_from(payload.len()).map_err(|_| VfsError::FileTooLarge)?;
+  buf[..LEN_WIDTH].copy_from_slice(&len.to_le_bytes());
+  buf[LEN_WIDTH..FRAME_HEADER].copy_from_slice(&crc32c(payload).to_le_bytes());
+  buf[FRAME_HEADER..total].copy_from_slice(payload);
+  Ok(total)
+}
+
+/// The framed payload in a content-object buffer: `None` if the slot is empty (a fresh object),
+/// `Err(RecoveryIncomplete)` if the frame is present but unreadable (a length past the buffer or a
+/// CRC mismatch from a torn write), else the validated payload bytes for a decoder.
+fn unframe(buf: &[u8]) -> Result<Option<&[u8]>, VfsError> {
+  if buf.len() < FRAME_HEADER {
+    return Ok(None);
+  }
+  let mut len_bytes = [0u8; LEN_WIDTH];
+  len_bytes.copy_from_slice(&buf[..LEN_WIDTH]);
+  let len = usize::try_from(u32::from_le_bytes(len_bytes)).unwrap_or(usize::MAX);
+  if len == 0 {
+    return Ok(None);
+  }
+  let mut crc_bytes = [0u8; LEN_WIDTH];
+  crc_bytes.copy_from_slice(&buf[LEN_WIDTH..FRAME_HEADER]);
+  let want_crc = u32::from_le_bytes(crc_bytes);
+  let end = FRAME_HEADER
+    .checked_add(len)
+    .ok_or(VfsError::RecoveryIncomplete)?;
+  if buf.len() < end {
+    return Err(VfsError::RecoveryIncomplete);
+  }
+  let payload = &buf[FRAME_HEADER..end];
+  if crc32c(payload) != want_crc {
+    return Err(VfsError::RecoveryIncomplete);
+  }
+  Ok(Some(payload))
+}
 
 /// The image of `kind`.
 const fn kind_image(kind: Kind) -> KindImage {

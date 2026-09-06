@@ -14,8 +14,12 @@ use slates_mem::SharedObject;
 use slates_vfs::VfsError;
 use slates_vfs::clock::StepClock;
 use slates_vfs::ids::InodeNo;
-use slates_vfs::recover::{BodyImage, InodeImage, KindImage, PolicyImage, VolumeImage};
-use slates_vfs::volume::Volume;
+use slates_vfs::names::NameEquivalence;
+use slates_vfs::quota::Quota;
+use slates_vfs::recover::{
+  BodyImage, InodeImage, KeyedImage, KindImage, PolicyImage, ShardImage, VolumeImage,
+};
+use slates_vfs::volume::{Volume, VolumeConfig};
 
 /// Shape: a content object comfortably larger than the built fixture's image (a 256 KiB file plus
 /// its metadata), so the frame fits with room to spare.
@@ -244,6 +248,80 @@ fn a_volume_survives_a_content_object_handoff() {
     image,
     "the rebuilt volume is fully faithful"
   );
+}
+
+/// A scratch volume with the given inode-number prefix, for a multi-volume shard.
+fn prefixed_volume(store: &mut slates_vfs::volume::Store, prefix: u16) -> Volume {
+  Volume::create(
+    store,
+    VolumeConfig {
+      prefix,
+      names: NameEquivalence::Fold,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 16,
+      clock: Box::new(StepClock::new(0, 1)),
+    },
+  )
+  .unwrap()
+}
+
+/// AC (§4.8, A-9): a whole shard of volumes — one content object holds them all — survives a handoff.
+/// Two volumes with distinct prefixes are imaged together into one shard image, published into a
+/// content object, and after the "restart" every volume is recovered by key and rebuilds faithfully.
+#[test]
+fn a_whole_shard_of_volumes_survives_a_content_object_handoff() {
+  let mut original = store();
+  let mut a = prefixed_volume(&mut original, 7);
+  let a_root = a.root_inode(&original).unwrap();
+  let a_file = a.create_file_no(&mut original, a_root, "a", 0o644).unwrap();
+  a.write(&mut original, a_file, 0, b"volume a bytes")
+    .unwrap();
+  let mut b = prefixed_volume(&mut original, 8);
+  let b_root = b.root_inode(&original).unwrap();
+  let b_file = b.create_file_no(&mut original, b_root, "b", 0o644).unwrap();
+  b.write(&mut original, b_file, 0, b"volume b bytes")
+    .unwrap();
+
+  // The running daemon publishes the whole shard into its one content object.
+  let shard = ShardImage::new(vec![
+    KeyedImage {
+      key: 7,
+      image: a.to_image(&original).unwrap(),
+    },
+    KeyedImage {
+      key: 8,
+      image: b.to_image(&original).unwrap(),
+    },
+  ]);
+  let mut object = SharedObject::create(&object_name("s"), CONTENT_LEN).unwrap();
+  let handoff = object.handoff().unwrap();
+  shard.write_to(object.bytes_mut()).unwrap();
+
+  // The restarted daemon re-opens the object and recovers every volume into a fresh store.
+  let reattached = SharedObject::open(&handoff, CONTENT_LEN).unwrap();
+  drop(object);
+  let recovered = ShardImage::read_from(reattached.bytes())
+    .unwrap()
+    .expect("the shard image is present after the handoff");
+  let keys: Vec<u64> = recovered.volumes.iter().map(|v| v.key).collect();
+  assert_eq!(keys, vec![7, 8], "both volumes recovered, in key order");
+
+  let mut fresh = store();
+  for keyed in &recovered.volumes {
+    let vol = Volume::from_image(
+      &mut fresh,
+      &keyed.image,
+      Box::new(StepClock::new(0, 1)),
+      1 << 16,
+    )
+    .unwrap();
+    assert_eq!(
+      vol.to_image(&fresh).unwrap(),
+      keyed.image,
+      "volume with key {} rebuilds faithfully",
+      keyed.key
+    );
+  }
 }
 
 /// A robustness gate on the content frame: an empty (fresh) object reads as "nothing to recover"
