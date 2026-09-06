@@ -299,3 +299,33 @@ fn a_stale_generation_handle_is_refused() {
     "a handle whose generation no longer matches is stale"
   );
 }
+
+/// A handle to an inode the volume has reclaimed is refused stale (not NOENT): inode numbers are
+/// never reused, so a gone number is a gone object.
+#[test]
+fn a_handle_to_a_reclaimed_inode_is_stale() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
+  let root_ino = bridge.root().unwrap();
+  let (attr, _fh) = bridge.create(root_ino, "gone", 0o644, 0).unwrap();
+  let gone_ino = attr.ino;
+  // No volume reference is held, so removing the name reclaims the inode and frees its number.
+  bridge.unlink(root_ino, "gone").unwrap();
+
+  let mut export = Export::new(&mut bridge, VolumeId { bytes: [0x11; 16] });
+  let handle = slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: gone_ino,
+    generation: 0,
+  }
+  .to_fh();
+  let mut args = XdrWriter::new();
+  handle.encode(&mut args);
+  let reply = export.getattr(&mut XdrReader::new(args.as_slice()));
+  assert_eq!(
+    XdrReader::new(&reply).u32().unwrap(),
+    Nfsstat3::Stale.wire(),
+    "a handle to a reclaimed inode is stale, not noent"
+  );
+}

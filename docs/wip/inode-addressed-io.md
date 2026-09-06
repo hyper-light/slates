@@ -2,8 +2,10 @@
 
 > **Status: proposed, pending Ada's acceptance (2026-09-05).** This note is the "precise
 > shared-interface/lifetime design" Ada asked for before replacing the handle-dependent I/O
-> interface. Nothing here is implemented yet. On acceptance it becomes amendment A-10, applied to
-> §4.5 (inode lifetime) and §4.6 (the Bridge trait), and the implementation follows the plan in
+> interface. Only its foundational step 1 (the volume-core reference count and deferred
+> reclamation) is implemented; the interface change (steps 3–4) is not. On acceptance it becomes
+> amendment A-10, applied to §4.5 (inode lifetime) and §4.6 (the Bridge trait), and the
+> implementation follows the plan in
 > §9 below, each piece gated and each of the §8 tests passing first.
 
 ## 1. The decision and why
@@ -140,13 +142,21 @@ because NFS never says forget").
 
 ## 6. Generation and staleness
 
-`ObjectId` carries the generation so a reused inode number is a distinct object: a handle minted
-under generation *g* is refused (`ESTALE`/`NFS3ERR_STALE`) once the inode has been reclaimed and its
-number reissued under *g+1*. This is what the NFS handle already encodes and what the corrected
-`attrs_of` already checks. It requires the volume core to **track a per-inode generation and bump it
-on inode-number reuse** — owed today (every live generation is 0, so the check is exact but
-trivial). NFS reclamation of an unreferenced inode is bounded by a GC timeout plus the generation
-bump, so a client that never `FORGET`s cannot pin an inode forever.
+`ObjectId` carries a generation so the tuple can distinguish a reused inode *number* — but slates
+**never reuses inode numbers** (D-4, "inode numbers on demand and never reused"). So in a single
+volume the primary staleness mechanism is simpler and stronger: a handle names a number, and once
+that number's inode is reclaimed (§3) it is never reissued, so a `getattr` on it fails and the
+handle is refused **stale** (a gone number is a gone object). The corrected NFS `attrs_of` maps
+exactly that — `VfsError::NotFound` on a handle's inode becomes `NFS3ERR_STALE`, not `NFS3ERR_NOENT`
+(which is for a *name* lookup, §4.4 of the audit).
+
+The generation therefore stays a stable value (0) for an object's lifetime; note that the inode's
+existing `generation` field is the *slab-slot* generation and changes on copy-on-write, so it must
+**not** be propagated to the handle (that would make a handle stale after any write). The tuple's
+generation is reserved for the cross-incarnation / fleet cases where a number space could be
+re-minted (a restarted owner, a clone-from-archive); those bump it and are owed with §4.8. NFS
+reclamation of an unreferenced inode is time-bounded (a GC timeout), the design's "inode GC because
+NFS never says forget".
 
 ## 7. Per-transport mapping
 

@@ -125,10 +125,14 @@ impl<'b> Export<'b> {
   /// whatever now holds the number. (Generation tracking in the volume core is owed, §4.6 `(no,
   /// gen)`; until then every live generation is zero and the check is exact but trivial.)
   fn attrs_of(&mut self, identity: &FileHandle) -> Result<NodeAttr, Nfsstat3> {
-    let node = self
-      .bridge
-      .getattr(identity.inode)
-      .map_err(|e| nfsstat_of(&e))?;
+    let node = match self.bridge.getattr(identity.inode) {
+      Ok(node) => node,
+      // A handle to an inode the volume no longer has is *stale*, not "no such entry": inode
+      // numbers are never reused (D-4), so a gone number means the object the handle named is
+      // gone, which is exactly `NFS3ERR_STALE`.
+      Err(VfsError::NotFound) => return Err(Nfsstat3::Stale),
+      Err(e) => return Err(nfsstat_of(&e)),
+    };
     if node.generation != identity.generation {
       return Err(Nfsstat3::Stale);
     }
