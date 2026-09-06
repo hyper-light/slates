@@ -685,11 +685,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-bridge-core"
+version = "0.1.0"
+dependencies = [
+ "slates-base",
+ "slates-db",
+ "slates-mem",
+ "slates-vfs",
+]
+
+[[package]]
 name = "slates-bridge-fuse"
 version = "0.1.0"
 dependencies = [
  "rustix",
  "slates-base",
+ "slates-bridge-core",
+ "slates-db",
  "slates-machine",
  "slates-mem",
  "slates-vfs",
@@ -698,6 +710,12 @@ dependencies = [
 [[package]]
 name = "slates-bridge-nfs"
 version = "0.1.0"
+dependencies = [
+ "slates-bridge-core",
+ "slates-db",
+ "slates-mem",
+ "slates-vfs",
+]
 
 [[package]]
 name = "slates-cli"

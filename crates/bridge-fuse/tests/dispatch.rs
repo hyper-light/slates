@@ -48,18 +48,23 @@ impl Mock {
 }
 
 impl Bridge for Mock {
-  fn root(&mut self) -> Result<u64, VfsError> {
+  fn root(&mut self, _cx: &OpContext) -> Result<u64, VfsError> {
     Ok(1)
   }
-  fn lookup(&mut self, parent: u64, name: &str) -> Result<NodeAttr, VfsError> {
-    if parent == 1 && name == "hello" {
+  fn lookup(
+    &mut self,
+    parent: ObjectId,
+    _cx: &OpContext,
+    name: &str,
+  ) -> Result<NodeAttr, VfsError> {
+    if parent.inode == 1 && name == "hello" {
       Ok(self.file_attr())
     } else {
       Err(VfsError::NotFound)
     }
   }
-  fn getattr(&mut self, ino: u64) -> Result<NodeAttr, VfsError> {
-    match ino {
+  fn getattr(&mut self, object: ObjectId, _cx: &OpContext) -> Result<NodeAttr, VfsError> {
+    match object.inode {
       1 => Ok(NodeAttr {
         ino: 1,
         generation: 0,
@@ -77,8 +82,8 @@ impl Bridge for Mock {
       _ => Err(VfsError::NotFound),
     }
   }
-  fn open(&mut self, ino: u64, _flags: u32) -> Result<u64, VfsError> {
-    if ino == 2 {
+  fn open(&mut self, object: ObjectId, _cx: &OpContext, _flags: u32) -> Result<u64, VfsError> {
+    if object.inode == 2 {
       Ok(7)
     } else {
       Err(VfsError::NotFound)
@@ -115,14 +120,20 @@ impl Bridge for Mock {
     self.content[at..at + data.len()].copy_from_slice(data);
     Ok(u32::try_from(data.len()).unwrap_or(u32::MAX))
   }
-  fn opendir(&mut self, ino: u64) -> Result<u64, VfsError> {
-    if ino == 1 {
+  fn opendir(&mut self, object: ObjectId, _cx: &OpContext) -> Result<u64, VfsError> {
+    if object.inode == 1 {
       Ok(9)
     } else {
       Err(VfsError::NotFound)
     }
   }
-  fn readdir(&mut self, _ino: u64, _fh: u64, offset: u64) -> Result<Vec<DirEntry>, VfsError> {
+  fn readdir(
+    &mut self,
+    _object: ObjectId,
+    _cx: &OpContext,
+    _fh: u64,
+    offset: u64,
+  ) -> Result<Vec<DirEntry>, VfsError> {
     if offset > 0 {
       return Ok(Vec::new());
     }
@@ -134,7 +145,8 @@ impl Bridge for Mock {
   }
   fn create(
     &mut self,
-    _parent: u64,
+    _parent: ObjectId,
+    _cx: &OpContext,
     _name: &str,
     _mode: u32,
     _flags: u32,
@@ -156,45 +168,63 @@ impl Bridge for Mock {
       8,
     ))
   }
-  fn release(&mut self, _ino: u64, _fh: u64) -> Result<(), VfsError> {
+  fn release(&mut self, _object: ObjectId, _cx: &OpContext, _fh: u64) -> Result<(), VfsError> {
     Ok(())
   }
-  fn forget(&mut self, _ino: u64, nlookup: u64) {
+  fn forget(&mut self, _object: ObjectId, _cx: &OpContext, nlookup: u64) {
     self.forgotten = self.forgotten.saturating_add(nlookup);
   }
-  fn flush(&mut self, _ino: u64, _fh: u64) -> Result<(), VfsError> {
+  fn flush(&mut self, _object: ObjectId, _cx: &OpContext, _fh: u64) -> Result<(), VfsError> {
     Ok(())
   }
   // The operations below are not exercised by these dispatch tests; the mock refuses them.
-  fn mkdir(&mut self, _parent: u64, _name: &str, _mode: u32) -> Result<NodeAttr, VfsError> {
+  fn mkdir(
+    &mut self,
+    _parent: ObjectId,
+    _cx: &OpContext,
+    _name: &str,
+    _mode: u32,
+  ) -> Result<NodeAttr, VfsError> {
     Err(VfsError::Invalid)
   }
-  fn unlink(&mut self, _parent: u64, _name: &str) -> Result<(), VfsError> {
+  fn unlink(&mut self, _parent: ObjectId, _cx: &OpContext, _name: &str) -> Result<(), VfsError> {
     Err(VfsError::Invalid)
   }
-  fn rmdir(&mut self, _parent: u64, _name: &str) -> Result<(), VfsError> {
+  fn rmdir(&mut self, _parent: ObjectId, _cx: &OpContext, _name: &str) -> Result<(), VfsError> {
     Err(VfsError::Invalid)
   }
-  fn symlink(&mut self, _parent: u64, _name: &str, _target: &str) -> Result<NodeAttr, VfsError> {
+  fn symlink(
+    &mut self,
+    _parent: ObjectId,
+    _cx: &OpContext,
+    _name: &str,
+    _target: &str,
+  ) -> Result<NodeAttr, VfsError> {
     Err(VfsError::Invalid)
   }
-  fn readlink(&mut self, _ino: u64) -> Result<String, VfsError> {
+  fn readlink(&mut self, _object: ObjectId, _cx: &OpContext) -> Result<String, VfsError> {
     Err(VfsError::Invalid)
   }
   fn rename(
     &mut self,
-    _op: u64,
+    _op: ObjectId,
+    _np: ObjectId,
+    _cx: &OpContext,
     _on: &str,
-    _np: u64,
     _nn: &str,
     _flags: RenameFlags,
   ) -> Result<(), VfsError> {
     Err(VfsError::Invalid)
   }
-  fn setattr(&mut self, _ino: u64, _changes: SetAttr) -> Result<NodeAttr, VfsError> {
+  fn setattr(
+    &mut self,
+    _object: ObjectId,
+    _cx: &OpContext,
+    _changes: SetAttr,
+  ) -> Result<NodeAttr, VfsError> {
     Err(VfsError::Invalid)
   }
-  fn statfs(&mut self, _ino: u64) -> Result<FsStat, VfsError> {
+  fn statfs(&mut self, _object: ObjectId, _cx: &OpContext) -> Result<FsStat, VfsError> {
     Err(VfsError::Invalid)
   }
 }

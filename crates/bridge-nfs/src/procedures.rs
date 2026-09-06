@@ -5,14 +5,19 @@
 //! their abstract states (§4.6 "the fallback is also the differential oracle").
 //!
 //! An NFSv3 file handle names its object by identity ([`crate::handle`]), so these procedures are
-//! stateless: they decode a handle to an inode, act, and mint handles for the objects they return —
-//! no server-side open table. This slice serves the metadata path a client walks first: MOUNT
-//! `MNT` (the export's root handle), `NULL`, `GETATTR` and `LOOKUP`. `READ` and `WRITE`, which the
-//! design keys by inode but the current `Bridge` keys by an open handle, are the next slice (owed);
-//! so are the remaining namespace and directory procedures.
+//! stateless in the NFS sense: they decode a handle to an [`ObjectId`], act, and mint handles for
+//! the objects they return — no server-side open table. Every call rides the export's authenticated
+//! [`OpContext`], built from the attachment the export edge admits at mount time for the enrolled
+//! subject (§4.13): the seam checks the volume, rights and view, so a read against a read-only
+//! export or a foreign volume is refused before any effect, exactly as at the FUSE edge. This slice
+//! serves the metadata path a client walks first — MOUNT `MNT`, `NULL`, `GETATTR`, `LOOKUP`,
+//! `ACCESS`, `FSSTAT`, `FSINFO` — and the file I/O path, `READ` and `WRITE`, over the shared
+//! inode-addressed interface. The remaining namespace and directory procedures are owed.
 
-use slates_bridge_core::{Bridge, FsStat, NodeAttr};
-use slates_db::catalog::VolumeId;
+use slates_bridge_core::{
+  AttachmentId, Attachments, Bridge, FsStat, NodeAttr, ObjectId, OpContext, Rights, View,
+};
+use slates_db::catalog::{Principal, VolumeId};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
@@ -33,6 +38,10 @@ pub const NFSPROC3_GETATTR: u32 = 1;
 pub const NFSPROC3_LOOKUP: u32 = 3;
 /// Format: NFSPROC3_ACCESS — which operations the caller may perform on an object.
 pub const NFSPROC3_ACCESS: u32 = 4;
+/// Format: NFSPROC3_READ — read data from a file.
+pub const NFSPROC3_READ: u32 = 6;
+/// Format: NFSPROC3_WRITE — write data to a file.
+pub const NFSPROC3_WRITE: u32 = 7;
 /// Format: NFSPROC3_FSSTAT — dynamic filesystem statistics (space and file counts).
 pub const NFSPROC3_FSSTAT: u32 = 18;
 /// Format: NFSPROC3_FSINFO — static filesystem limits and capabilities.
@@ -75,18 +84,52 @@ const OWNER_READ: u32 = 0o400;
 const OWNER_WRITE: u32 = 0o200;
 /// Format: the owner execute permission bit.
 const OWNER_EXECUTE: u32 = 0o100;
+/// Format: `FILE_SYNC` (`stable_how` = 2, RFC 1813 §3.3.7): the data and its metadata are committed
+/// to stable storage before the reply. slates lands every write in the anchor segment synchronously
+/// (there is no write-back buffer), so a WRITE is always `FILE_SYNC` and a later COMMIT is a no-op.
+const FILE_SYNC: u32 = 2;
 
 /// An NFSv3 export of one volume over the shared operation layer. Handles it mints and accepts name
-/// objects of `volume`; a handle for another volume is refused stale.
+/// objects of `volume`; a handle for another volume is refused stale. The export edge admits one
+/// attachment at mount time for the enrolled subject (§4.13), and every procedure rides the
+/// [`OpContext`] built from it, so the seam enforces the export's rights and view.
 pub struct Export<'b> {
   bridge: &'b mut dyn Bridge,
   volume: VolumeId,
+  /// The owner-side attachment registry for this export. A real daemon shares one registry across
+  /// its exports; a single export holds its own, admitted at construction.
+  attachments: Attachments,
+  /// The attachment this export admitted for its mount. Every procedure builds its context from it.
+  attachment: AttachmentId,
 }
 
 impl<'b> Export<'b> {
-  /// An export of the volume `bridge` serves, identified by `volume` for the file handles.
-  pub fn new(bridge: &'b mut dyn Bridge, volume: VolumeId) -> Export<'b> {
-    Export { bridge, volume }
+  /// An export of the volume `bridge` serves, identified by `volume` for the file handles, admitted
+  /// for the enrolled `subject` with `rights` on the volume's current head. Building the attachment
+  /// is the NFS analogue of the FUSE mount edge: the credentials are established once, at mount, and
+  /// the seam checks every later request against the resulting context. Refuses (`NotPermitted` at
+  /// the registry bound) if the attachment cannot be admitted.
+  pub fn new(
+    bridge: &'b mut dyn Bridge,
+    volume: VolumeId,
+    subject: Principal,
+    rights: Rights,
+  ) -> Result<Export<'b>, VfsError> {
+    let mut attachments = Attachments::new();
+    let attachment = attachments.attach(volume, View::Current, subject, rights)?;
+    Ok(Export {
+      bridge,
+      volume,
+      attachments,
+      attachment,
+    })
+  }
+
+  /// The authenticated context for a request, built from the export's attachment. Refuses when the
+  /// attachment is revoked or fenced (a superseded owner epoch) — the export edge's "authority can
+  /// no longer be established" case, which the caller maps to a `STALE`/`ACCES` NFS status.
+  fn op_context(&self) -> Result<OpContext, VfsError> {
+    self.attachments.context(self.attachment)
   }
 
   /// The filesystem id the export reports: the leading 64 bits of the volume id, stable per volume.
@@ -125,7 +168,9 @@ impl<'b> Export<'b> {
   /// whatever now holds the number. (Generation tracking in the volume core is owed, §4.6 `(no,
   /// gen)`; until then every live generation is zero and the check is exact but trivial.)
   fn attrs_of(&mut self, identity: &FileHandle) -> Result<NodeAttr, Nfsstat3> {
-    let node = match self.bridge.getattr(identity.inode) {
+    let cx = self.op_context().map_err(|e| nfsstat_of(&e))?;
+    let object = ObjectId::new(identity.inode, identity.generation);
+    let node = match self.bridge.getattr(object, &cx) {
       Ok(node) => node,
       // A handle to an inode the volume no longer has is *stale*, not "no such entry": inode
       // numbers are never reused (D-4), so a gone number means the object the handle named is
@@ -161,7 +206,10 @@ impl<'b> Export<'b> {
   /// MOUNT `MNT`: resolve an export path to its root file handle. A single-volume export answers
   /// any path with its own root; the path-to-volume resolution of a multi-volume export is owed.
   pub fn mnt(&mut self, _path: &str) -> MountReply {
-    match self.bridge.root() {
+    let Ok(cx) = self.op_context() else {
+      return MountReply::Err(Mountstat3::ServerFault);
+    };
+    match self.bridge.root(&cx) {
       Ok(root) => MountReply::Ok {
         handle: self.handle_for(root, 0),
         auth_flavors: vec![AUTH_SYS, AUTH_NONE],
@@ -178,6 +226,8 @@ impl<'b> Export<'b> {
       NFSPROC3_GETATTR => Some(self.getattr(args)),
       NFSPROC3_LOOKUP => Some(self.lookup(args)),
       NFSPROC3_ACCESS => Some(self.access(args)),
+      NFSPROC3_READ => Some(self.read(args)),
+      NFSPROC3_WRITE => Some(self.write(args)),
       NFSPROC3_FSSTAT => Some(self.fsstat(args)),
       NFSPROC3_FSINFO => Some(self.fsinfo(args)),
       _ => None,
@@ -246,9 +296,11 @@ impl<'b> Export<'b> {
       .attrs_of(&dir_identity)
       .map_err(|status| (status, None))?;
     let dir_attr = Some(self.fattr3(&dir_node));
+    let cx = self.op_context().map_err(|e| (nfsstat_of(&e), dir_attr))?;
+    let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
     let child = self
       .bridge
-      .lookup(dir_identity.inode, name)
+      .lookup(parent, &cx, name)
       .map_err(|e| (nfsstat_of(&e), dir_attr))?;
     let handle = self.handle_for(child.ino, child.generation);
     let object = self.fattr3(&child);
@@ -283,6 +335,117 @@ impl<'b> Export<'b> {
     Ok((self.fattr3(&node), granted_access(node.mode, requested)))
   }
 
+  /// NFSPROC3_READ: read up to `count` bytes at `offset` from the file a handle names, over the
+  /// shared inode-addressed interface under the export's context. The reply carries the file's
+  /// post-read attributes, the byte count, the end-of-file flag, and the data.
+  pub fn read(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    match self.read_result(args) {
+      Ok((post, count, eof, data)) => {
+        Nfsstat3::Ok.encode(&mut writer);
+        PostOpAttr(Some(post)).encode(&mut writer);
+        writer.u32(count);
+        writer.bool(eof);
+        writer.opaque(&data);
+      }
+      Err((status, post)) => {
+        status.encode(&mut writer);
+        PostOpAttr(post).encode(&mut writer);
+      }
+    }
+    writer.into_bytes()
+  }
+
+  #[allow(clippy::type_complexity)]
+  fn read_result(
+    &mut self,
+    args: &mut XdrReader<'_>,
+  ) -> Result<(Fattr3, u32, bool, Vec<u8>), (Nfsstat3, Option<Fattr3>)> {
+    // READ3args: the file handle, the offset, the byte count.
+    let handle = Nfsfh3::decode(args).map_err(|_| (Nfsstat3::Badhandle, None))?;
+    let offset = args.u64().map_err(|_| (Nfsstat3::Inval, None))?;
+    let count = args.u32().map_err(|_| (Nfsstat3::Inval, None))?;
+    let identity = self.resolve_handle(&handle).map_err(|s| (s, None))?;
+    // The post-op attributes double as the object's validation (existence and generation) and carry
+    // the size the end-of-file flag is computed against.
+    let node = self.attrs_of(&identity).map_err(|s| (s, None))?;
+    let post = self.fattr3(&node);
+    let cx = self
+      .op_context()
+      .map_err(|e| (nfsstat_of(&e), Some(post)))?;
+    let object = ObjectId::new(identity.inode, identity.generation);
+    let want = count.min(MAX_TRANSFER);
+    let mut data = Vec::new();
+    self
+      .bridge
+      .read(object, &cx, offset, want, &mut data)
+      .map_err(|e| (nfsstat_of(&e), Some(post)))?;
+    let end = offset.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+    let eof = end >= node.size;
+    let read = u32::try_from(data.len()).unwrap_or(u32::MAX);
+    Ok((post, read, eof, data))
+  }
+
+  /// NFSPROC3_WRITE: write the request's data at `offset` to the file a handle names, over the
+  /// shared interface under the export's context. slates lands every write in the anchor
+  /// synchronously, so the reply is always `FILE_SYNC`; a write against a read-only export or a
+  /// pinned view is refused by the seam before any effect.
+  pub fn write(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    match self.write_result(args) {
+      Ok((post, count)) => {
+        Nfsstat3::Ok.encode(&mut writer);
+        encode_wcc(&mut writer, Some(post));
+        writer.u32(count);
+        writer.u32(FILE_SYNC);
+        writer.fixed(&self.write_verifier());
+      }
+      Err((status, post)) => {
+        status.encode(&mut writer);
+        encode_wcc(&mut writer, post);
+      }
+    }
+    writer.into_bytes()
+  }
+
+  fn write_result(
+    &mut self,
+    args: &mut XdrReader<'_>,
+  ) -> Result<(Fattr3, u32), (Nfsstat3, Option<Fattr3>)> {
+    // WRITE3args: the file handle, the offset, the byte count, the requested stability, the data.
+    // The count and stability are advisory here — the data length is authoritative and slates
+    // always commits FILE_SYNC — but they are decoded so a malformed request is a typed refusal,
+    // and the data length is capped at the offered transfer size so a hostile length is refused
+    // before allocating.
+    let handle = Nfsfh3::decode(args).map_err(|_| (Nfsstat3::Badhandle, None))?;
+    let offset = args.u64().map_err(|_| (Nfsstat3::Inval, None))?;
+    let _count = args.u32().map_err(|_| (Nfsstat3::Inval, None))?;
+    let _stable = args.u32().map_err(|_| (Nfsstat3::Inval, None))?;
+    let data = args
+      .opaque(usize::try_from(MAX_TRANSFER).unwrap_or(0))
+      .map_err(|_| (Nfsstat3::Inval, None))?
+      .to_vec();
+    let identity = self.resolve_handle(&handle).map_err(|s| (s, None))?;
+    let cx = self.op_context().map_err(|e| (nfsstat_of(&e), None))?;
+    let object = ObjectId::new(identity.inode, identity.generation);
+    let written = self
+      .bridge
+      .write(object, &cx, offset, &data)
+      .map_err(|e| (nfsstat_of(&e), None))?;
+    // The post-op attributes reflect the file after the write (the wcc's post half).
+    let node = self.attrs_of(&identity).map_err(|s| (s, None))?;
+    Ok((self.fattr3(&node), written))
+  }
+
+  /// The write verifier the export returns (RFC 1813 `writeverf3`): eight bytes a client compares
+  /// across a server restart to decide whether to resend unstable writes. slates derives it from
+  /// the volume id, stable for the life of the volume; a boot-id-based verifier that also changes
+  /// on a daemon restart is owed with the §4.8 recovery wiring. Since every slates write is already
+  /// `FILE_SYNC`, no client resend depends on this today.
+  fn write_verifier(&self) -> [u8; size_of::<u64>()] {
+    self.fsid().to_be_bytes()
+  }
+
   /// NFSPROC3_FSSTAT: the volume's dynamic statistics — space and file counts — from the shared
   /// seam's `statfs`, in the bytes and counts NFS reports.
   pub fn fsstat(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
@@ -312,9 +475,11 @@ impl<'b> Export<'b> {
     let handle = Nfsfh3::decode(args).map_err(|_| Nfsstat3::Badhandle)?;
     let identity = self.resolve_handle(&handle)?;
     let node = self.attrs_of(&identity)?;
+    let cx = self.op_context().map_err(|e| nfsstat_of(&e))?;
+    let object = ObjectId::new(identity.inode, identity.generation);
     let stat = self
       .bridge
-      .statfs(identity.inode)
+      .statfs(object, &cx)
       .map_err(|e| nfsstat_of(&e))?;
     Ok((self.fattr3(&node), stat))
   }
@@ -369,6 +534,15 @@ fn granted_access(mode: u32, requested: u32) -> u32 {
     granted |= ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE;
   }
   granted & requested
+}
+
+/// Encodes an NFSv3 `wcc_data`: the pre-operation attributes (slates keeps none, so absent) then
+/// the post-operation attributes. A mutating reply (WRITE) carries it so the client updates its
+/// cache without a follow-up GETATTR; the absent pre-op half means the client cannot detect a
+/// racing outside change, which slates has none of on a head it owns (§4.6 cache posture).
+fn encode_wcc(writer: &mut XdrWriter, post: Option<Fattr3>) {
+  writer.bool(false);
+  PostOpAttr(post).encode(writer);
 }
 
 /// The NFSv3 file type for a volume entry kind.

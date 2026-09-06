@@ -37,6 +37,15 @@ pub struct ObjectId {
   pub generation: u64,
 }
 
+impl ObjectId {
+  /// The object named by inode number `inode` at generation `generation`. A transport that does
+  /// not track generations (FUSE addresses by node id) passes zero, the live generation until
+  /// generation-tracked reuse lands (§4.6 `(no, gen)`); NFS carries the handle's encoded value.
+  pub fn new(inode: u64, generation: u64) -> ObjectId {
+    ObjectId { inode, generation }
+  }
+}
+
 /// Which state a request sees: the volume's current head, or a pinned immutable version (§4.16 an
 /// `advance` re-pins). A write against a pinned view is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

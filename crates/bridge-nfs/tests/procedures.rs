@@ -12,6 +12,7 @@ use slates_bridge_nfs::mount::MountReply;
 use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
 use slates_bridge_nfs::procedures::{
   Export, NFSPROC3_ACCESS, NFSPROC3_FSINFO, NFSPROC3_FSSTAT, NFSPROC3_GETATTR, NFSPROC3_NULL,
+  NFSPROC3_READ, NFSPROC3_WRITE,
 };
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_db::catalog::{Principal, VolumeId};
@@ -37,6 +38,11 @@ fn write_cx() -> OpContext {
     )
     .unwrap();
   attachments.context(id).unwrap()
+}
+
+/// The object at inode `ino` (generation zero - the volume core does not track generations yet).
+fn oid(ino: u64) -> ObjectId {
+  ObjectId::new(ino, 0)
 }
 
 const PAGE: usize = 4096;
@@ -81,11 +87,23 @@ fn volume(store: &mut Store) -> Volume {
 fn mount_lookup_and_getattr_walk_the_export() {
   let mut store = store();
   let mut vol = volume(&mut store);
-  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
-  let root_ino = bridge.root().unwrap();
-  bridge.create(root_ino, "hello", 0o644, 0).unwrap();
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  bridge
+    .create(oid(root_ino), &cx, "hello", 0o644, 0)
+    .unwrap();
 
-  let mut export = Export::new(&mut bridge, VolumeId { bytes: [0x11; 16] });
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
 
   // NULL is an empty result.
   assert!(
@@ -131,8 +149,17 @@ fn mount_lookup_and_getattr_walk_the_export() {
 fn a_foreign_or_malformed_handle_is_refused() {
   let mut store = store();
   let mut vol = volume(&mut store);
-  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
-  let mut export = Export::new(&mut bridge, VolumeId { bytes: [0x11; 16] });
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
 
   // A well-formed handle naming a different volume.
   let foreign = slates_bridge_nfs::FileHandle {
@@ -166,9 +193,19 @@ fn a_foreign_or_malformed_handle_is_refused() {
 fn a_missing_name_is_noent() {
   let mut store = store();
   let mut vol = volume(&mut store);
-  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
-  let root_ino = bridge.root().unwrap();
-  let mut export = Export::new(&mut bridge, VolumeId { bytes: [0x11; 16] });
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
   let root_fh = slates_bridge_nfs::FileHandle {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: root_ino,
@@ -193,8 +230,17 @@ fn a_missing_name_is_noent() {
 fn the_post_mount_queries_answer_over_the_root() {
   let mut store = store();
   let mut vol = volume(&mut store);
-  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
-  let mut export = Export::new(&mut bridge, VolumeId { bytes: [0x11; 16] });
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
   let root_fh = match export.mnt("/") {
     MountReply::Ok { handle, .. } => handle,
     MountReply::Err(status) => panic!("MNT failed: {status:?}"),
@@ -256,10 +302,20 @@ fn the_post_mount_queries_answer_over_the_root() {
 fn access_reflects_the_mode_not_the_request() {
   let mut store = store();
   let mut vol = volume(&mut store);
-  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
-  let root_ino = bridge.root().unwrap();
-  bridge.create(root_ino, "ro", 0o444, 0).unwrap();
-  let mut export = Export::new(&mut bridge, VolumeId { bytes: [0x11; 16] });
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  bridge.create(oid(root_ino), &cx, "ro", 0o444, 0).unwrap();
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
   let root_fh = match export.mnt("/") {
     MountReply::Ok { handle, .. } => handle,
     MountReply::Err(status) => panic!("MNT failed: {status:?}"),
@@ -296,9 +352,19 @@ fn access_reflects_the_mode_not_the_request() {
 fn a_stale_generation_handle_is_refused() {
   let mut store = store();
   let mut vol = volume(&mut store);
-  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
-  let root_ino = bridge.root().unwrap();
-  let mut export = Export::new(&mut bridge, VolumeId { bytes: [0x11; 16] });
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
 
   // A handle to a live inode but carrying a generation the object does not have.
   let stale = slates_bridge_nfs::FileHandle {
@@ -323,17 +389,27 @@ fn a_stale_generation_handle_is_refused() {
 fn a_handle_to_a_reclaimed_inode_is_stale() {
   let mut store = store();
   let mut vol = volume(&mut store);
-  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
-  let root_ino = bridge.root().unwrap();
-  let (attr, fh) = bridge.create(root_ino, "gone", 0o644, 0).unwrap();
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (attr, fh) = bridge.create(oid(root_ino), &cx, "gone", 0o644, 0).unwrap();
   let gone_ino = attr.ino;
-  bridge.unlink(root_ino, "gone").unwrap();
+  bridge.unlink(oid(root_ino), &cx, "gone").unwrap();
   // Drop the references the create took — the open handle and the kernel's lookup — so the
   // unlinked inode is reclaimed and its number freed (an open/looked-up inode survives unlink).
-  bridge.release(gone_ino, fh).unwrap();
-  bridge.forget(gone_ino, 1);
+  bridge.release(oid(gone_ino), &cx, fh).unwrap();
+  bridge.forget(oid(gone_ino), &cx, 1);
 
-  let mut export = Export::new(&mut bridge, VolumeId { bytes: [0x11; 16] });
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
   let handle = slates_bridge_nfs::FileHandle {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: gone_ino,
@@ -357,9 +433,10 @@ fn a_handle_to_a_reclaimed_inode_is_stale() {
 fn a_handle_survives_copy_on_write_of_its_object() {
   let mut store = store();
   let mut vol = volume(&mut store);
-  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
-  let root_ino = bridge.root().unwrap();
-  let (created, _fh) = bridge.create(root_ino, "f", 0o644, 0).unwrap();
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (created, _fh) = bridge.create(oid(root_ino), &cx, "f", 0o644, 0).unwrap();
   let file_ino = created.ino;
 
   // Take a handle, then write through the file (a copy-on-write of the inode version).
@@ -381,7 +458,16 @@ fn a_handle_survives_copy_on_write_of_its_object() {
     )
     .unwrap();
 
-  let mut export = Export::new(&mut bridge, VolumeId { bytes: [0x11; 16] });
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
   let mut args = XdrWriter::new();
   handle.encode(&mut args);
   let reply = export
@@ -395,4 +481,136 @@ fn a_handle_survives_copy_on_write_of_its_object() {
     "the handle names the same object after CoW"
   );
   assert_eq!(attr.size, 11, "with the written bytes");
+}
+
+/// A WRITE then a READ over the export round-trips file content through the shared inode-addressed
+/// interface: the bytes NFSPROC3_WRITE stores come back from NFSPROC3_READ, the WRITE reports the
+/// post-write size and FILE_SYNC, and the READ reports the byte count and the end-of-file flag.
+#[test]
+fn a_write_then_read_round_trips_over_the_export() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (created, _fh) = bridge.create(oid(root_ino), &cx, "data", 0o644, 0).unwrap();
+  let file_ino = created.ino;
+
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let file_fh = slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: file_ino,
+    generation: 0,
+  }
+  .to_fh();
+
+  // WRITE the payload at offset 0.
+  let payload: &[u8] = b"slates";
+  let count = u32::try_from(payload.len()).unwrap();
+  let mut wargs = XdrWriter::new();
+  file_fh.encode(&mut wargs);
+  wargs.u64(0); // offset
+  wargs.u32(count); // count (advisory; the data length is authoritative)
+  wargs.u32(2); // stable = FILE_SYNC (advisory)
+  wargs.opaque(payload);
+  let wreply = export
+    .serve_nfs(NFSPROC3_WRITE, &mut XdrReader::new(wargs.as_slice()))
+    .unwrap();
+  let mut wr = XdrReader::new(&wreply);
+  assert_eq!(wr.u32().unwrap(), Nfsstat3::Ok.wire(), "WRITE succeeded");
+  // wcc_data: pre_op_attr absent, then post_op_attr present with the new size.
+  assert!(!wr.bool().unwrap(), "no pre-op attributes");
+  let post = PostOpAttr::decode(&mut wr).unwrap().0.expect("post attrs");
+  assert_eq!(
+    post.size,
+    u64::from(count),
+    "the file grew to the written size"
+  );
+  assert_eq!(wr.u32().unwrap(), count, "WRITE reports the byte count");
+  assert_eq!(wr.u32().unwrap(), 2, "slates commits FILE_SYNC");
+
+  // READ the whole file back (asking for more than it holds).
+  let mut rargs = XdrWriter::new();
+  file_fh.encode(&mut rargs);
+  rargs.u64(0); // offset
+  rargs.u32(64); // count larger than the file
+  let rreply = export
+    .serve_nfs(NFSPROC3_READ, &mut XdrReader::new(rargs.as_slice()))
+    .unwrap();
+  let mut rr = XdrReader::new(&rreply);
+  assert_eq!(rr.u32().unwrap(), Nfsstat3::Ok.wire(), "READ succeeded");
+  PostOpAttr::decode(&mut rr).unwrap();
+  assert_eq!(rr.u32().unwrap(), count, "READ returns the byte count");
+  assert!(rr.bool().unwrap(), "the read reached end of file");
+  let data = rr.opaque(64).unwrap();
+  assert_eq!(data, payload, "the bytes round-trip");
+}
+
+/// A WRITE through a read-only export is refused by the seam before any effect — authorization at
+/// the NFS edge, not only ACCESS reporting — while a READ through the same export is allowed.
+#[test]
+fn a_write_through_a_read_only_export_is_refused() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (created, _fh) = bridge.create(oid(root_ino), &cx, "ro", 0o644, 0).unwrap();
+  let file_ino = created.ino;
+
+  // A read-only export: its attachment carries read but not write.
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: false,
+    },
+  )
+  .unwrap();
+  let file_fh = slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: file_ino,
+    generation: 0,
+  }
+  .to_fh();
+
+  let mut wargs = XdrWriter::new();
+  file_fh.encode(&mut wargs);
+  wargs.u64(0);
+  wargs.u32(1);
+  wargs.u32(2);
+  wargs.opaque(b"x");
+  let wreply = export
+    .serve_nfs(NFSPROC3_WRITE, &mut XdrReader::new(wargs.as_slice()))
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&wreply).u32().unwrap(),
+    Nfsstat3::Perm.wire(),
+    "a read-only export refuses WRITE before any effect"
+  );
+
+  // A READ through the same export is allowed.
+  let mut rargs = XdrWriter::new();
+  file_fh.encode(&mut rargs);
+  rargs.u64(0);
+  rargs.u32(16);
+  let rreply = export
+    .serve_nfs(NFSPROC3_READ, &mut XdrReader::new(rargs.as_slice()))
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&rreply).u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "but a read-only export can READ"
+  );
 }

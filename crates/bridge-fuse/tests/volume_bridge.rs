@@ -187,7 +187,7 @@ fn getattr_size(bridge: &mut VolumeBridge<'_>, file: u64, out: &mut [u8]) -> u64
 fn a_fuse_round_trip_drives_the_volume_core() {
   let mut store = store();
   let mut vol = volume(&mut store);
-  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
   let mut out = vec![0u8; 1 << 16];
   let data = b"fn main() {}";
 
@@ -227,7 +227,7 @@ fn a_fuse_round_trip_drives_the_volume_core() {
 fn missing_names_and_absent_inodes_are_typed_errnos() {
   let mut store = store();
   let mut vol = volume(&mut store);
-  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
   let mut out = vec![0u8; 4096];
   let n = dispatch(
     &message(Opcode::Lookup.to_wire(), 1, 1, &name_body("nope")),
@@ -285,7 +285,7 @@ fn setattr_size_body(size: u64) -> Vec<u8> {
 fn mkdir_unlink_and_rmdir_dispatch_to_the_volume() {
   let mut store = store();
   let mut vol = volume(&mut store);
-  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
   let mut out = vec![0u8; 1 << 16];
 
   dispatch(
@@ -341,7 +341,7 @@ fn mkdir_unlink_and_rmdir_dispatch_to_the_volume() {
 fn rename_setattr_and_statfs_dispatch_to_the_volume() {
   let mut store = store();
   let mut vol = volume(&mut store);
-  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
   let mut out = vec![0u8; 1 << 16];
 
   let (file, fh) = create(&mut bridge, &mut out);

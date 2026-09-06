@@ -121,19 +121,23 @@ pub struct FsStat {
   pub frsize: u32,
 }
 
-/// The one VFS operation layer (§4.6). A transport calls these by real inode number; a refusal is
-/// the volume core's typed [`VfsError`], which the transport maps to its own wire error. Only the
-/// operations the transports dispatch are here; the set grows with the drivers.
+/// The one VFS operation layer (§4.6). Every request identifies its object by [`ObjectId`] (a
+/// real inode number and a generation, §4.6 `(no, gen)`) and rides an authenticated [`OpContext`]
+/// built by the owner from a validated attachment: the seam checks the context's volume, granted
+/// rights and view before any effect, so authority is enforced once, for every transport, at the
+/// seam — not re-invented at each edge. A refusal is the volume core's typed [`VfsError`], which
+/// the transport maps to its own wire error. Only the operations the transports dispatch are here;
+/// the set grows with the drivers.
 pub trait Bridge {
-  /// The root directory's inode number. FUSE resolves node id 1 to it; NFS mints the export's
-  /// root file handle from it.
-  fn root(&mut self) -> Result<u64, VfsError>;
-  /// Look `name` up in directory `parent`; the child's attributes.
-  fn lookup(&mut self, parent: u64, name: &str) -> Result<NodeAttr, VfsError>;
-  /// The attributes of `ino`.
-  fn getattr(&mut self, ino: u64) -> Result<NodeAttr, VfsError>;
-  /// Open `ino`; the file handle.
-  fn open(&mut self, ino: u64, flags: u32) -> Result<u64, VfsError>;
+  /// The root directory's inode number, under `cx` (the attachment's volume must be this bridge's).
+  /// FUSE resolves node id 1 to it; NFS mints the export's root file handle from it.
+  fn root(&mut self, cx: &OpContext) -> Result<u64, VfsError>;
+  /// Look `name` up in directory `parent` under `cx`; the child's attributes.
+  fn lookup(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<NodeAttr, VfsError>;
+  /// The attributes of `object` under `cx`.
+  fn getattr(&mut self, object: ObjectId, cx: &OpContext) -> Result<NodeAttr, VfsError>;
+  /// Open `object` under `cx`; the file handle.
+  fn open(&mut self, object: ObjectId, cx: &OpContext, flags: u32) -> Result<u64, VfsError>;
   /// Read `size` bytes at `offset` from `object` into `out`, under the authenticated `cx`. The
   /// object is addressed by identity (§4.6), not an open handle; `cx` carries the view and the
   /// granted access, and a read the context does not authorize is refused.
@@ -154,46 +158,73 @@ pub trait Bridge {
     offset: u64,
     data: &[u8],
   ) -> Result<u32, VfsError>;
-  /// Open directory `ino`; the handle.
-  fn opendir(&mut self, ino: u64) -> Result<u64, VfsError>;
-  /// The entries of directory `ino` from `offset` (each entry's position is the resume cookie).
-  fn readdir(&mut self, ino: u64, fh: u64, offset: u64) -> Result<Vec<DirEntry>, VfsError>;
-  /// Create `name` in `parent` and open it; the attributes and the handle.
+  /// Open directory `object` under `cx`; the handle.
+  fn opendir(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError>;
+  /// The entries of directory `object` from `offset` under `cx` (each entry's position is the
+  /// resume cookie).
+  fn readdir(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    fh: u64,
+    offset: u64,
+  ) -> Result<Vec<DirEntry>, VfsError>;
+  /// Create `name` in `parent` and open it, under `cx`; the attributes and the handle.
   fn create(
     &mut self,
-    parent: u64,
+    parent: ObjectId,
+    cx: &OpContext,
     name: &str,
     mode: u32,
     flags: u32,
   ) -> Result<(NodeAttr, u64), VfsError>;
-  /// Release handle `fh` of `ino`.
-  fn release(&mut self, ino: u64, fh: u64) -> Result<(), VfsError>;
-  /// The transport drops `nlookup` references to `ino`.
-  fn forget(&mut self, ino: u64, nlookup: u64);
-  /// Flush handle `fh` of `ino` (no disk write; success once the data is in the anchor).
-  fn flush(&mut self, ino: u64, fh: u64) -> Result<(), VfsError>;
-  /// Create directory `name` in `parent`; the attributes.
-  fn mkdir(&mut self, parent: u64, name: &str, mode: u32) -> Result<NodeAttr, VfsError>;
-  /// Remove `name` from `parent`.
-  fn unlink(&mut self, parent: u64, name: &str) -> Result<(), VfsError>;
-  /// Remove directory `name` from `parent`.
-  fn rmdir(&mut self, parent: u64, name: &str) -> Result<(), VfsError>;
-  /// Create a symlink `name` in `parent` pointing at `target`; the attributes.
-  fn symlink(&mut self, parent: u64, name: &str, target: &str) -> Result<NodeAttr, VfsError>;
-  /// The target of symlink `ino`.
-  fn readlink(&mut self, ino: u64) -> Result<String, VfsError>;
-  /// Rename `old_name` under `old_parent` to `new_name` under `new_parent`, honoring or refusing
-  /// the `renameat2` `flags` (never silently dropping them).
+  /// Release handle `fh` of `object`, under `cx`.
+  fn release(&mut self, object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError>;
+  /// The transport drops `nlookup` references to `object`, under `cx` (its attachment's volume).
+  fn forget(&mut self, object: ObjectId, cx: &OpContext, nlookup: u64);
+  /// Flush handle `fh` of `object` under `cx` (no disk write; success once the data is in the
+  /// anchor).
+  fn flush(&mut self, object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError>;
+  /// Create directory `name` in `parent` under `cx`; the attributes.
+  fn mkdir(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    name: &str,
+    mode: u32,
+  ) -> Result<NodeAttr, VfsError>;
+  /// Remove `name` from `parent` under `cx`.
+  fn unlink(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<(), VfsError>;
+  /// Remove directory `name` from `parent` under `cx`.
+  fn rmdir(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<(), VfsError>;
+  /// Create a symlink `name` in `parent` pointing at `target`, under `cx`; the attributes.
+  fn symlink(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    name: &str,
+    target: &str,
+  ) -> Result<NodeAttr, VfsError>;
+  /// The target of symlink `object` under `cx`.
+  fn readlink(&mut self, object: ObjectId, cx: &OpContext) -> Result<String, VfsError>;
+  /// Rename `old_name` under `old_parent` to `new_name` under `new_parent`, under `cx`, honoring
+  /// or refusing the `renameat2` `flags` (never silently dropping them).
   fn rename(
     &mut self,
-    old_parent: u64,
+    old_parent: ObjectId,
+    new_parent: ObjectId,
+    cx: &OpContext,
     old_name: &str,
-    new_parent: u64,
     new_name: &str,
     flags: RenameFlags,
   ) -> Result<(), VfsError>;
-  /// Apply `changes` to `ino`; the new attributes.
-  fn setattr(&mut self, ino: u64, changes: SetAttr) -> Result<NodeAttr, VfsError>;
-  /// Filesystem statistics for the volume `ino` lives in.
-  fn statfs(&mut self, ino: u64) -> Result<FsStat, VfsError>;
+  /// Apply `changes` to `object` under `cx`; the new attributes.
+  fn setattr(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    changes: SetAttr,
+  ) -> Result<NodeAttr, VfsError>;
+  /// Filesystem statistics for the volume `object` lives in, under `cx`.
+  fn statfs(&mut self, object: ObjectId, cx: &OpContext) -> Result<FsStat, VfsError>;
 }

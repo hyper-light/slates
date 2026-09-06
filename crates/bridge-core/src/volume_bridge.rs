@@ -8,6 +8,7 @@
 //! every transport shares the semantics it proves.
 
 use slates_base::OsHost;
+use slates_db::catalog::VolumeId;
 use slates_mem::{Handle, Slab};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::{Attrs, Kind};
@@ -34,6 +35,10 @@ const HANDLE_SEGMENT: usize = 256;
 
 /// The `Bridge` over one volume.
 pub struct VolumeBridge<'v> {
+  /// The id of the volume this bridge serves. A request's [`OpContext`] names the volume its
+  /// attachment binds; the seam refuses one that does not match this, so an attachment for another
+  /// volume can never act here (the [`OpContext`] volume invariant).
+  volume_id: VolumeId,
   volume: &'v mut Volume,
   store: &'v mut Store,
   /// The read-only host of the base directory, for an overlay volume; `None` for a scratch
@@ -58,9 +63,14 @@ impl std::fmt::Debug for VolumeBridge<'_> {
 }
 
 impl<'v> VolumeBridge<'v> {
-  /// A bridge over `volume` and its `store`.
-  pub fn new(volume: &'v mut Volume, store: &'v mut Store) -> VolumeBridge<'v> {
+  /// A bridge over the volume `volume_id` names, backed by `volume` and its `store`.
+  pub fn new(
+    volume_id: VolumeId,
+    volume: &'v mut Volume,
+    store: &'v mut Store,
+  ) -> VolumeBridge<'v> {
     VolumeBridge {
+      volume_id,
       volume,
       store,
       host: None,
@@ -69,16 +79,65 @@ impl<'v> VolumeBridge<'v> {
     }
   }
 
-  /// A bridge over an overlay `volume` whose base is served through `host` (§4.5, §4.6 "Base
-  /// files"): untouched base entries are looked up, listed, stat-ed and read from the disk.
-  pub fn with_base(volume: &'v mut Volume, store: &'v mut Store, host: OsHost) -> VolumeBridge<'v> {
+  /// A bridge over an overlay `volume` (the volume `volume_id` names) whose base is served through
+  /// `host` (§4.5, §4.6 "Base files"): untouched base entries are looked up, listed, stat-ed and
+  /// read from the disk.
+  pub fn with_base(
+    volume_id: VolumeId,
+    volume: &'v mut Volume,
+    store: &'v mut Store,
+    host: OsHost,
+  ) -> VolumeBridge<'v> {
     VolumeBridge {
+      volume_id,
       volume,
       store,
       host: Some(host),
       handles: Slab::new(HANDLE_SEGMENT, MAX_OPEN_HANDLES),
       max_read: MAX_READ,
     }
+  }
+
+  /// Refuses unless `cx` authorizes a read on this bridge's volume: its attachment must bind this
+  /// volume and carry read rights. The attachment's liveness and epoch were already checked when
+  /// the owner built the context ([`crate::Attachments::context`]); this is the object-side half —
+  /// the volume the context binds must be the one this bridge serves, and the operation must be
+  /// within the granted rights.
+  fn authorize_read(&self, cx: &OpContext) -> Result<(), VfsError> {
+    if cx.volume != self.volume_id {
+      return Err(VfsError::NotPermitted);
+    }
+    if !cx.rights.read {
+      return Err(VfsError::NotPermitted);
+    }
+    Ok(())
+  }
+
+  /// Refuses unless `cx` authorizes a write on this bridge's volume: its attachment must bind this
+  /// volume, carry write rights, and view the current head. A write against a read-only attachment
+  /// or a pinned immutable view is refused before any effect (§4.6 EROFS/EACCES).
+  fn authorize_write(&self, cx: &OpContext) -> Result<(), VfsError> {
+    if cx.volume != self.volume_id {
+      return Err(VfsError::NotPermitted);
+    }
+    if !cx.rights.write {
+      return Err(VfsError::NotPermitted);
+    }
+    if !matches!(cx.view, View::Current) {
+      return Err(VfsError::NotPermitted);
+    }
+    Ok(())
+  }
+
+  /// Refuses unless `cx`'s attachment binds this bridge's volume. The lifecycle operations
+  /// (release, forget, flush) need no particular right — dropping a handle or a lookup reference is
+  /// always the holder's to do — but they must still name this volume, so a context for another
+  /// volume can never touch its handle table or references.
+  fn authorize_volume(&self, cx: &OpContext) -> Result<(), VfsError> {
+    if cx.volume != self.volume_id {
+      return Err(VfsError::NotPermitted);
+    }
+    Ok(())
   }
 
   /// Assigns a handle naming `inode`, or a typed refusal (`MemError::SlabFull`) once the bridge
@@ -156,33 +215,38 @@ fn unpack_handle(word: u64) -> Handle<u64> {
 }
 
 impl Bridge for VolumeBridge<'_> {
-  fn root(&mut self) -> Result<u64, VfsError> {
+  fn root(&mut self, cx: &OpContext) -> Result<u64, VfsError> {
+    self.authorize_read(cx)?;
     self.volume.root_inode(self.store).map(|no| no.0)
   }
 
-  fn lookup(&mut self, parent: u64, name: &str) -> Result<NodeAttr, VfsError> {
-    let located = self
-      .volume
-      .lookup_no(self.store, slates_vfs::ids::InodeNo(parent), name)?;
+  fn lookup(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<NodeAttr, VfsError> {
+    self.authorize_read(cx)?;
+    let located =
+      self
+        .volume
+        .lookup_no(self.store, slates_vfs::ids::InodeNo(parent.inode), name)?;
     let attr = self.attr_of(located.inode.0)?;
     self.reference_lookup(located.inode.0)?;
     Ok(attr)
   }
 
-  fn getattr(&mut self, ino: u64) -> Result<NodeAttr, VfsError> {
-    self.attr_of(ino)
+  fn getattr(&mut self, object: ObjectId, cx: &OpContext) -> Result<NodeAttr, VfsError> {
+    self.authorize_read(cx)?;
+    self.attr_of(object.inode)
   }
 
-  fn open(&mut self, ino: u64, _flags: u32) -> Result<u64, VfsError> {
+  fn open(&mut self, object: ObjectId, cx: &OpContext, _flags: u32) -> Result<u64, VfsError> {
+    self.authorize_read(cx)?;
     // A directory is opened through opendir; open refuses it.
     if self
       .volume
-      .kind(self.store, slates_vfs::ids::InodeNo(ino))?
+      .kind(self.store, slates_vfs::ids::InodeNo(object.inode))?
       == Kind::Dir
     {
       return Err(VfsError::IsDirectory);
     }
-    self.open_handle(ino)
+    self.open_handle(object.inode)
   }
 
   fn read(
@@ -193,9 +257,7 @@ impl Bridge for VolumeBridge<'_> {
     size: u32,
     out: &mut Vec<u8>,
   ) -> Result<(), VfsError> {
-    if !cx.rights.read {
-      return Err(VfsError::NotPermitted);
-    }
+    self.authorize_read(cx)?;
     let want = usize::try_from(size).unwrap_or(0).min(self.max_read);
     let mut buf = vec![0u8; want];
     let inode = slates_vfs::ids::InodeNo(object.inode);
@@ -219,12 +281,7 @@ impl Bridge for VolumeBridge<'_> {
   ) -> Result<u32, VfsError> {
     // A write against a read-only attachment, or a pinned immutable view, is refused before any
     // effect (§4.6 EROFS/EACCES; the precise errno per case is a taxonomy refinement).
-    if !cx.rights.write {
-      return Err(VfsError::NotPermitted);
-    }
-    if !matches!(cx.view, View::Current) {
-      return Err(VfsError::NotPermitted);
-    }
+    self.authorize_write(cx)?;
     let inode = slates_vfs::ids::InodeNo(object.inode);
     // An overlay write copies the base up first (through the host); a scratch write does not.
     let written = match self.host.as_mut() {
@@ -237,19 +294,27 @@ impl Bridge for VolumeBridge<'_> {
     u32::try_from(written).map_err(|_| VfsError::FileTooLarge)
   }
 
-  fn opendir(&mut self, ino: u64) -> Result<u64, VfsError> {
+  fn opendir(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError> {
+    self.authorize_read(cx)?;
     if self
       .volume
-      .kind(self.store, slates_vfs::ids::InodeNo(ino))?
+      .kind(self.store, slates_vfs::ids::InodeNo(object.inode))?
       != Kind::Dir
     {
       return Err(VfsError::NotDirectory);
     }
-    self.open_handle(ino)
+    self.open_handle(object.inode)
   }
 
-  fn readdir(&mut self, ino: u64, _fh: u64, offset: u64) -> Result<Vec<DirEntry>, VfsError> {
-    let dir_no = slates_vfs::ids::InodeNo(ino);
+  fn readdir(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    _fh: u64,
+    offset: u64,
+  ) -> Result<Vec<DirEntry>, VfsError> {
+    self.authorize_read(cx)?;
+    let dir_no = slates_vfs::ids::InodeNo(object.inode);
     let rows = match self.host.as_mut() {
       Some(host) => self.volume.with_host(host).readdir_no(self.store, dir_no),
       None => self.volume.readdir_no(self.store, dir_no),
@@ -270,15 +335,19 @@ impl Bridge for VolumeBridge<'_> {
 
   fn create(
     &mut self,
-    parent: u64,
+    parent: ObjectId,
+    cx: &OpContext,
     name: &str,
     mode: u32,
     _flags: u32,
   ) -> Result<(NodeAttr, u64), VfsError> {
-    let no =
-      self
-        .volume
-        .create_file_no(self.store, slates_vfs::ids::InodeNo(parent), name, mode)?;
+    self.authorize_write(cx)?;
+    let no = self.volume.create_file_no(
+      self.store,
+      slates_vfs::ids::InodeNo(parent.inode),
+      name,
+      mode,
+    )?;
     let attrs = self.volume.stat(self.store, no)?;
     let entry = node_attr(no.0, Kind::File, &attrs);
     // A create takes both a lookup reference (survives release) and an open reference (dropped by
@@ -296,7 +365,8 @@ impl Bridge for VolumeBridge<'_> {
     Ok((entry, fh))
   }
 
-  fn release(&mut self, _ino: u64, fh: u64) -> Result<(), VfsError> {
+  fn release(&mut self, _object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError> {
+    self.authorize_volume(cx)?;
     // Drop the open reference the handle held, then free the slot for reuse. An unknown or
     // already-freed handle is a no-op (the kernel may release one the bridge already dropped).
     if let Ok(inode) = self.handles.get(unpack_handle(fh)).copied() {
@@ -308,73 +378,104 @@ impl Bridge for VolumeBridge<'_> {
     Ok(())
   }
 
-  fn forget(&mut self, ino: u64, nlookup: u64) {
-    // Drop the lookup references the transport held; at the last reference an already-unlinked
-    // inode is reclaimed (§4.6 the reference model). A bulk forget is one bounded step.
+  fn forget(&mut self, object: ObjectId, cx: &OpContext, nlookup: u64) {
+    // A forget for another volume's context touches nothing here (it cannot signal an error, so it
+    // is a safe no-op). Drop the lookup references the transport held; at the last reference an
+    // already-unlinked inode is reclaimed (§4.6 the reference model). A bulk forget is one bounded
+    // step.
+    if cx.volume != self.volume_id {
+      return;
+    }
     let _ = self
       .volume
-      .unreference_n(self.store, slates_vfs::ids::InodeNo(ino), nlookup);
+      .unreference_n(self.store, slates_vfs::ids::InodeNo(object.inode), nlookup);
   }
 
-  fn flush(&mut self, _ino: u64, _fh: u64) -> Result<(), VfsError> {
+  fn flush(&mut self, _object: ObjectId, cx: &OpContext, _fh: u64) -> Result<(), VfsError> {
+    self.authorize_read(cx)?;
     // No disk write: the data is already in the anchor segment (§4.6). Success.
     Ok(())
   }
 
-  fn mkdir(&mut self, parent: u64, name: &str, mode: u32) -> Result<NodeAttr, VfsError> {
-    let no = self
-      .volume
-      .mkdir_no(self.store, slates_vfs::ids::InodeNo(parent), name, mode)?;
+  fn mkdir(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    name: &str,
+    mode: u32,
+  ) -> Result<NodeAttr, VfsError> {
+    self.authorize_write(cx)?;
+    let no = self.volume.mkdir_no(
+      self.store,
+      slates_vfs::ids::InodeNo(parent.inode),
+      name,
+      mode,
+    )?;
     let attrs = self.volume.stat(self.store, no)?;
     let attr = node_attr(no.0, Kind::Dir, &attrs);
     self.reference_lookup(no.0)?;
     Ok(attr)
   }
 
-  fn unlink(&mut self, parent: u64, name: &str) -> Result<(), VfsError> {
+  fn unlink(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<(), VfsError> {
+    self.authorize_write(cx)?;
     self
       .volume
-      .unlink_no(self.store, slates_vfs::ids::InodeNo(parent), name)
+      .unlink_no(self.store, slates_vfs::ids::InodeNo(parent.inode), name)
   }
 
-  fn rmdir(&mut self, parent: u64, name: &str) -> Result<(), VfsError> {
+  fn rmdir(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<(), VfsError> {
+    self.authorize_write(cx)?;
     self
       .volume
-      .rmdir_no(self.store, slates_vfs::ids::InodeNo(parent), name)
+      .rmdir_no(self.store, slates_vfs::ids::InodeNo(parent.inode), name)
   }
 
-  fn symlink(&mut self, parent: u64, name: &str, target: &str) -> Result<NodeAttr, VfsError> {
-    let no = self
-      .volume
-      .symlink_no(self.store, slates_vfs::ids::InodeNo(parent), name, target)?;
+  fn symlink(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    name: &str,
+    target: &str,
+  ) -> Result<NodeAttr, VfsError> {
+    self.authorize_write(cx)?;
+    let no = self.volume.symlink_no(
+      self.store,
+      slates_vfs::ids::InodeNo(parent.inode),
+      name,
+      target,
+    )?;
     let attrs = self.volume.stat(self.store, no)?;
     let attr = node_attr(no.0, Kind::Symlink, &attrs);
     self.reference_lookup(no.0)?;
     Ok(attr)
   }
 
-  fn readlink(&mut self, ino: u64) -> Result<String, VfsError> {
+  fn readlink(&mut self, object: ObjectId, cx: &OpContext) -> Result<String, VfsError> {
+    self.authorize_read(cx)?;
     self
       .volume
-      .readlink(self.store, slates_vfs::ids::InodeNo(ino))
+      .readlink(self.store, slates_vfs::ids::InodeNo(object.inode))
       .map(|t| t.into_string())
   }
 
   fn rename(
     &mut self,
-    old_parent: u64,
+    old_parent: ObjectId,
+    new_parent: ObjectId,
+    cx: &OpContext,
     old_name: &str,
-    new_parent: u64,
     new_name: &str,
     flags: RenameFlags,
   ) -> Result<(), VfsError> {
+    self.authorize_write(cx)?;
     // EXCHANGE (atomically swap two existing entries) is not yet expressible over the volume
     // core; it is refused, never silently downgraded to a plain rename (audit BUG-10). `EINVAL`
     // is the errno `renameat2` itself returns where a flag is unsupported (D-26).
     if flags.exchange {
       return Err(VfsError::Invalid);
     }
-    let to_dir = slates_vfs::ids::InodeNo(new_parent);
+    let to_dir = slates_vfs::ids::InodeNo(new_parent.inode);
     // NOREPLACE must fail if the destination exists rather than replacing it. The owning shard
     // runs one operation at a time, so this check and the rename are atomic against other work.
     if flags.no_replace && self.volume.lookup_no(self.store, to_dir, new_name).is_ok() {
@@ -382,14 +483,21 @@ impl Bridge for VolumeBridge<'_> {
     }
     self.volume.rename_no(
       self.store,
-      slates_vfs::ids::InodeNo(old_parent),
+      slates_vfs::ids::InodeNo(old_parent.inode),
       old_name,
       to_dir,
       new_name,
     )
   }
 
-  fn setattr(&mut self, ino: u64, changes: SetAttr) -> Result<NodeAttr, VfsError> {
+  fn setattr(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    changes: SetAttr,
+  ) -> Result<NodeAttr, VfsError> {
+    self.authorize_write(cx)?;
+    let ino = object.inode;
     let inode = slates_vfs::ids::InodeNo(ino);
     if let Some(size) = changes.size {
       self.volume.truncate(self.store, inode, size)?;
@@ -421,7 +529,8 @@ impl Bridge for VolumeBridge<'_> {
     self.attr_of(ino)
   }
 
-  fn statfs(&mut self, _ino: u64) -> Result<FsStat, VfsError> {
+  fn statfs(&mut self, _object: ObjectId, cx: &OpContext) -> Result<FsStat, VfsError> {
+    self.authorize_read(cx)?;
     let accounting = self.volume.accounting();
     // Blocks are the volume's referenced bytes over the block size; the volume core does not
     // expose a hard cap here (a dynamic volume grows), so free is reported generously and the
