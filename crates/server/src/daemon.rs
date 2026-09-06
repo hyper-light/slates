@@ -49,6 +49,9 @@ pub enum SegmentSource {
     handoff: Handoff,
     /// The mapped length.
     len: usize,
+    /// The content object's handoff and length, if the anchor made one, so its shard content
+    /// survives the restart (§4.8). `None` recreates content empty on rebuild as before (BUG-11).
+    content: Option<(Handoff, usize)>,
   },
 }
 
@@ -92,9 +95,25 @@ impl Daemon {
   ) -> Result<Daemon, ServerError> {
     let identity = profile.facts.identity.clone();
     let mut segment = match source {
-      SegmentSource::Create { name } => AnchorSegment::create(&name, &identity, config.geometry)?,
+      SegmentSource::Create { name } => {
+        let content_name = content_name_of(&name);
+        AnchorSegment::create(&name, &identity, config.geometry)?
+          .with_content(&content_name, content_bytes(&config))?
+      }
       SegmentSource::FromEnv => AnchorSegment::attach_from_env(&identity)?,
-      SegmentSource::Handoff { handoff, len } => AnchorSegment::attach(&handoff, len, &identity)?,
+      SegmentSource::Handoff {
+        handoff,
+        len,
+        content,
+      } => {
+        let mut segment = AnchorSegment::attach(&handoff, len, &identity)?;
+        if let Some((content_handoff, content_len)) = content {
+          let object = slates_mem::SharedObject::open(&content_handoff, content_len)
+            .map_err(slates_anchor::AnchorError::from)?;
+          segment.adopt_content(object);
+        }
+        segment
+      }
     };
     if let Ok(json) = profile.to_json() {
       segment.publish(RegionKind::Profile, json.as_bytes())?;
@@ -197,6 +216,24 @@ fn host_id_of(identity: &Identity) -> u64 {
   ])
 }
 
+/// The content object's name for a segment named `seg_name`: the segment name with its `seg`
+/// marker replaced by `con`, so it stays the same length (within the platform's shared-object name
+/// limit the segment already meets) and is distinct from the segment's own name.
+fn content_name_of(seg_name: &str) -> String {
+  match seg_name.strip_prefix("slates-seg-") {
+    Some(rest) => format!("slates-con-{rest}"),
+    None => format!("{seg_name}-c"),
+  }
+}
+
+/// The content object's total size: one shard's reserve times the partitions, so each shard owns a
+/// reserve-sized slice for its recovery image (§4.8). The object is lazily backed, so the unused
+/// tail costs address space, not RAM, until an image is published into it.
+fn content_bytes(config: &DaemonConfig) -> usize {
+  let per_shard = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX);
+  per_shard.saturating_mul(usize::from(config.geometry.partitions.max(1)))
+}
+
 fn handoff_of(env: &[(String, String)]) -> Result<(Handoff, usize), ServerError> {
   let handoff = env
     .iter()
@@ -260,11 +297,28 @@ fn init_shard(
   // thing when Phase 8 adds peers. One host, `f = 0`, on a laptop.
   let host = slates_db::HostId(host_id_of(identity));
   let config_register = slates_db::Configuration::solo(host);
+  // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
+  // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
+  let content = match AnchorSegment::open_content(env) {
+    Some(result) => Some(result?),
+    None => None,
+  };
+  let content_range = match &content {
+    Some(object) => {
+      let partitions = config_shards.len().max(1);
+      let per_shard = object.len() / partitions;
+      let start = usize::from(partition).saturating_mul(per_shard);
+      (start, start.saturating_add(per_shard))
+    }
+    None => (0, 0),
+  };
   let mut state = ShardState {
     shard,
     partition,
     config: config.clone(),
     segment,
+    content,
+    content_range,
     db,
     config_register,
     landing: crate::landing::LandingState::default(),

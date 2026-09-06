@@ -39,12 +39,17 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   if let Some(shards) = options.shards {
     config = config.with_shards(shards);
   }
-  let mut segment = AnchorSegment::create(
-    &segment_name(&options.instance),
-    &profile.facts.identity,
-    config.geometry,
-  )
-  .map_err(|e| failed("segment", e))?;
+  // The anchor-owned content object that holds each shard's recovery image (§4.8): one shard's
+  // reserve times the partitions, lazily backed so its unused tail costs no RAM. The anchor holds
+  // it across daemon restarts and hands it off, so an agent's writes survive a restart (BUG-11).
+  let seg_name = segment_name(&options.instance);
+  let content_name = seg_name.replacen("slates-seg-", "slates-con-", 1);
+  let content_bytes = usize::try_from(config.reserve_per_shard)
+    .unwrap_or(usize::MAX)
+    .saturating_mul(usize::from(config.geometry.partitions.max(1)));
+  let mut segment = AnchorSegment::create(&seg_name, &profile.facts.identity, config.geometry)
+    .and_then(|s| s.with_content(&content_name, content_bytes))
+    .map_err(|e| failed("segment", e))?;
   let json = profile.to_json().map_err(|e| failed("profile", e))?;
   segment
     .publish(RegionKind::Profile, json.as_bytes())

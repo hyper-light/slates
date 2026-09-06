@@ -1,12 +1,13 @@
 # Anchor-owned volume storage and recovery (§4.2, §4.8): milestone design
 
-> Status: in progress. The memory foundation (a region and an anchor content object that survive a
-> daemon restart), the volume recovery **image** capture, and the faithful **rebuild** from it are
-> landed and gated — a scratch volume now survives an image → drop → rebuild round trip byte-for-byte
-> at the library level. The daemon/content-object wiring and the process-level
-> write→kill→restart→read proof are owed. This doc is the assistant-owned record of the milestone;
-> the numbered requirements live in `SLATES_DESIGN.md` §4.2 and §4.8 (A-9), and the gap ledger is
-> `GAPS.md`.
+> Status: in progress. The recovery **mechanism** is complete and gated end to end: capture, faithful
+> rebuild, per-shard framing, and — landed now — the **daemon wiring**, so a volume is recovered from
+> its image in anchor-owned RAM across a real daemon restart (the client restart test). What remains
+> is the **data-plane content barrier** and the process-level content-bytes proof, which are blocked
+> on a mount (FUSE/NFS need host capabilities — Ada's step-4 gate; the control client has no file
+> I/O), and the fuller **§4.2 admission accounting** (content-object sizing is a first, derived cut).
+> This doc is the assistant-owned record; the numbered requirements live in `SLATES_DESIGN.md` §4.2
+> and §4.8 (A-9), and the gap ledger is `GAPS.md`.
 
 ## 1. The requirement (settled, not a choice)
 
@@ -122,17 +123,32 @@ volume.
    Gated: two volumes with distinct prefixes survive a content-object handoff together, recovered by
    key and each rebuilt faithfully. This is the format the daemon wiring needs, so that wiring is one
    correct integration rather than a single-volume version later replaced.
+7. **Daemon/content-object wiring.** *(Landed, `crates/server`, `crates/anchor`, `crates/cli`.)* The
+   anchor creates one content object sized `partitions × reserve_per_shard` (lazily backed, so the
+   unused tail costs address space, not RAM) and hands it off with the segment; `SegmentSource`
+   carries the content handoff so a daemon that attaches by handoff (the restart test) adopts it too.
+   `init_shard` opens the object and takes this shard's slice (`ShardState.content`/`content_range`).
+   A control mutation that changes the volume set or roots (create, clone, resize, destroy) republishes
+   the shard's `ShardImage` into its slice (`publish_shard`); `rebuild_recovered` reads it back and
+   rebuilds each recovered volume through `from_image` (its prefix, tree and content restored — fixing
+   BUG-11's empty recreate and prefix reassignment), refusing `RecoveryIncomplete` for a db volume with
+   no image rather than presenting it empty. Gated by the existing client restart test, now threading
+   the content object: the volume is recovered from its image across a real daemon restart.
 
 ## 4. Owed, as individual gates
 
-- **Daemon/content-object wiring.** The create path sizes and creates the content object
-  (`AnchorSegment::with_content`, landed); a barrier images the shard's volumes and calls
-  `ShardImage::write_to` into the content object; `init_shard` calls `ShardImage::read_from` and
-  rebuilds each volume via `from_image`, keyed by volume id. Then the process-level proof: write
-  bytes through the client, kill the daemon while the anchor survives, restart, read the same bytes.
-  The whole recovery format (capture, rebuild, per-shard framing) is now in place and gated; this
-  slice is server plumbing plus a two-daemon process test on the anchor-handoff harness
-  (`crates/client/tests/client.rs` is the model).
+- **Data-plane content barrier and the process content-bytes proof.** File content is written through
+  the bridge (FUSE/NFS), not the control client, so a barrier there must `publish_shard` after a
+  content write, and the end-to-end "write bytes → kill → restart → read the same bytes through the
+  client" proof needs a mount — which needs host capabilities (Ada's step-4 gate). The content-bytes
+  survival itself is already proven at the library level (through a real `SharedObject` handoff); what
+  the mount adds is the last process hop. Until then the control path proves catalog, roots and prefix
+  recovery across a real restart.
+- **§4.2 admission accounting and content-object sizing.** The object is sized at a derived
+  `partitions × reserve_per_shard`; the fuller §4.2 admission invariant (physically-backed
+  entitlement, the resource vector, typed refusals) and a tighter, non-doubling size (content resident
+  once via `Region::shared` rather than copied into the image) are owed (BUG-1/2/3 and the in-place
+  refinement).
 - **Crash-during-publish (double buffering).** The single-slot frame detects a torn write but does
   not keep the prior good image across one; the database's two-slot, sequence-numbered publish
   (`replay.rs`) is the pattern to adopt so a crash mid-publish recovers the last complete image.

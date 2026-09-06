@@ -305,6 +305,27 @@ impl AnchorSegment {
     self.object.is_empty()
   }
 
+  /// The content object's handoff and length, for a caller (a test playing the anchor, or a
+  /// supervisor) that must hand it to a restarted daemon alongside the segment's; `None` when there
+  /// is no content object.
+  pub fn content_handoff(&self) -> Result<Option<(Handoff, usize)>, AnchorError> {
+    match &self.content {
+      Some(object) => Ok(Some((object.handoff()?, object.len()))),
+      None => Ok(None),
+    }
+  }
+
+  /// Adopts a content object a daemon opened from its handoff after attaching the segment, so the
+  /// segment carries it into [`AnchorSegment::handoff_env`] for the daemon's shard children (§4.8).
+  pub fn adopt_content(&mut self, object: SharedObject) {
+    self.content = Some(object);
+  }
+
+  /// The content object, if any (a shard reads and publishes its recovery image through it).
+  pub fn content(&self) -> Option<&SharedObject> {
+    self.content.as_ref()
+  }
+
   /// Locks the segment into RAM.
   pub fn lock(&mut self) -> Result<(), AnchorError> {
     Ok(self.object.lock()?)

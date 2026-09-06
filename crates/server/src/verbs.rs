@@ -30,6 +30,7 @@ use slates_vfs::clock::{Clock, HostClock};
 use slates_vfs::host::HostFs;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::{PressureSource, Quota};
+use slates_vfs::recover::{KeyedImage, ShardImage, VolumeImage};
 use slates_vfs::volume::{DestroyProgress, Volume, VolumeConfig};
 use slates_wire::Wire;
 use slates_wire::request::{RequestId, Seen};
@@ -783,7 +784,36 @@ fn refusal_name(r: &Refusal) -> &'static str {
   }
 }
 
+/// Whether a verb changes the set of volumes or a volume's roots, so the shard must republish its
+/// recovery image (§4.8). Data-plane content writes go through the bridge, not here, and carry their
+/// own barrier (owed with the mount path, docs/wip/recovery.md).
+fn mutates_shard_image(body: &RequestBody) -> bool {
+  matches!(
+    body,
+    RequestBody::Create { .. }
+      | RequestBody::Clone { .. }
+      | RequestBody::Resize { .. }
+      | RequestBody::Destroy { .. }
+  )
+}
+
 fn dispatch(
+  state: &mut ShardState,
+  client_id: u32,
+  principal: &Principal,
+  body: RequestBody,
+) -> ReplyBody {
+  let republish = mutates_shard_image(&body);
+  let reply = dispatch_inner(state, client_id, principal, body);
+  // Publish the shard's recovery image after a successful volume-set or roots change, so a restart
+  // recovers it from anchor-owned RAM (§4.8). A refusal changed nothing, so it needs no publish.
+  if republish && !matches!(reply, ReplyBody::Refused { .. }) {
+    publish_shard(state);
+  }
+  reply
+}
+
+fn dispatch_inner(
   state: &mut ShardState,
   client_id: u32,
   principal: &Principal,
@@ -876,16 +906,24 @@ pub(crate) fn find(
   Ok((handle, record))
 }
 
-fn volume_config(state: &mut ShardState, names: NamePolicy, quota: Quota) -> VolumeConfig {
-  let prefix = state.next_prefix;
-  state.next_prefix = state.next_prefix.wrapping_add(1).max(1);
-  let journal_bytes = derived!(
+/// The journal retention budget for a volume of the given quota: a per-mille share of the quota,
+/// at least one page (§4.16 journal). Shared by fresh creation and recovery so a rebuilt volume's
+/// journal is sized as its original was.
+fn journal_bytes_for(state: &ShardState, quota: &Quota) -> usize {
+  derived!(
     usize::try_from(quota.limit().saturating_mul(JOURNAL_SHARE_PERMILLE) / PERMILLE)
       .unwrap_or(usize::MAX)
       .max(usize::try_from(state.config.geometry.page).unwrap_or(1)),
     "quota × JOURNAL_SHARE_PERMILLE / 1000, at least one page",
     ["quota", "GAPS §5 journal share"]
-  );
+  )
+  .get()
+}
+
+fn volume_config(state: &mut ShardState, names: NamePolicy, quota: Quota) -> VolumeConfig {
+  let prefix = state.next_prefix;
+  state.next_prefix = state.next_prefix.wrapping_add(1).max(1);
+  let journal_bytes = journal_bytes_for(state, &quota);
   VolumeConfig {
     prefix,
     names: match names {
@@ -893,7 +931,7 @@ fn volume_config(state: &mut ShardState, names: NamePolicy, quota: Quota) -> Vol
       NamePolicy::Fold => NameEquivalence::Fold,
     },
     quota,
-    journal_bytes: journal_bytes.get(),
+    journal_bytes,
     clock: Box::new(HostClock::new()),
   }
 }
@@ -2032,10 +2070,17 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
     .filter(|v| !matches!(v.state, VolumeState::Destroying | VolumeState::Destroyed))
     .cloned()
     .collect();
+  // The shard's recovery images from anchor-owned RAM (§4.8), by volume id. Empty when there is no
+  // content object (a degraded build), or a fresh one with nothing published yet.
+  let images = recover_images(state);
   let mut rebuilt = Rebuilt::default();
+  let mut max_prefix = state.next_prefix;
   for record in &records {
-    match rebuild_volume(state, record) {
-      Ok(()) => rebuilt.volumes += 1,
+    match rebuild_volume(state, record, images.get(&record.id.bytes)) {
+      Ok(prefix) => {
+        rebuilt.volumes += 1;
+        max_prefix = max_prefix.max(prefix.wrapping_add(1).max(1));
+      }
       Err(reason) => {
         rebuilt.skipped += 1;
         eprintln!(
@@ -2049,7 +2094,75 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
     rebuilt.snapshots_dropped += snapshots;
     rebuilt.attachments_dropped += attachments;
   }
+  // Hand out prefixes past every recovered one, so a new volume never collides with a recovered
+  // volume's inode numbers (the prefixes came from the images, not from `next_prefix`).
+  state.next_prefix = max_prefix;
   rebuilt
+}
+
+/// The shard's recovery images from its slice of the anchor content object (§4.8), by volume id.
+/// A torn or malformed image logs and yields nothing for that shard (each volume then refuses as
+/// unrecoverable rather than presenting empty), matching §4.8's "never an empty success".
+fn recover_images(state: &ShardState) -> std::collections::BTreeMap<[u8; 16], VolumeImage> {
+  let (start, end) = state.content_range;
+  let Some(object) = &state.content else {
+    return std::collections::BTreeMap::new();
+  };
+  if end <= start || end > object.len() {
+    return std::collections::BTreeMap::new();
+  }
+  match ShardImage::read_from(&object.bytes()[start..end]) {
+    Ok(Some(shard)) => shard
+      .volumes
+      .into_iter()
+      .map(|keyed| (keyed.key, keyed.image))
+      .collect(),
+    Ok(None) => std::collections::BTreeMap::new(),
+    Err(e) => {
+      eprintln!(
+        "slates-server: partition {}: shard image unreadable: {e}",
+        state.partition
+      );
+      std::collections::BTreeMap::new()
+    }
+  }
+}
+
+/// Publishes the shard's volumes as one recovery image into its slice of the anchor content object
+/// (§4.8), so a restart recovers their content from anchor-owned RAM. A no-op without a content
+/// object. Efficiency gate: it re-images every volume on each call; an incremental or
+/// barrier-batched publish is owed (docs/wip/recovery.md).
+pub fn publish_shard(state: &mut ShardState) {
+  let (start, end) = state.content_range;
+  if state.content.is_none() || end <= start {
+    return;
+  }
+  let mut keyed = Vec::new();
+  for (_, slot) in state.volumes.iter() {
+    match slot.volume.to_image(&state.store) {
+      Ok(image) => keyed.push(KeyedImage {
+        key: slot.id.bytes,
+        image,
+      }),
+      Err(e) => {
+        eprintln!(
+          "slates-server: partition {}: a volume was not imaged: {e}",
+          state.partition
+        );
+        return;
+      }
+    }
+  }
+  let shard = ShardImage::new(keyed);
+  if let Some(object) = state.content.as_mut()
+    && let Some(slice) = object.bytes_mut().get_mut(start..end)
+    && let Err(e) = shard.write_to(slice)
+  {
+    eprintln!(
+      "slates-server: partition {}: shard image not published: {e}",
+      state.partition
+    );
+  }
 }
 
 /// One recovered volume's live tree, reservation and slot.
@@ -2058,29 +2171,24 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
 /// agent had written before the restart are gone until content is anchor-backed (BUG-11 /
 /// GAP-A9-6). An overlay volume's base is still on disk, so its untouched base entries are served
 /// again; only the in-memory overlay (the diverged, copied-up state) is lost.
-fn rebuild_volume(state: &mut ShardState, record: &VolumeRecord) -> Result<(), String> {
+/// Rebuilds one recovered volume into the shard's store, returning its inode-number prefix (so the
+/// caller advances `next_prefix` past it). A scratch volume is rebuilt from its recovery image when
+/// one is present (its content, tree and prefix restored, §4.8); with a content object but no image
+/// the volume's content was lost, which refuses (`RecoveryIncomplete`) rather than presenting empty;
+/// without any content object (a degraded build) it is recreated empty as before (BUG-11).
+fn rebuild_volume(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  image: Option<&VolumeImage>,
+) -> Result<u16, String> {
   let size = wire_size(record.policy.size);
-  let names = match record.policy.names {
-    DbNamePolicy::Exact => NamePolicy::Exact,
-    DbNamePolicy::Fold => NamePolicy::Fold,
-  };
   let reservation = match size {
     SizeClass::Bounded { limit } => Some(state.budget.reserve(limit).map_err(|e| e.to_string())?),
     SizeClass::Dynamic { .. } => None,
   };
-  let quota = quota_for(state, size);
-  let config = volume_config(state, names, quota);
-  let built = match &record.base {
-    BaseRecord::Scratch => Volume::create(&mut state.store, config)
-      .map(|v| (v, None))
-      .map_err(|e| e.to_string()),
-    BaseRecord::Path { path } => open_base(state, path, config).map_err(|reply| match *reply {
-      ReplyBody::Refused { refusal } => refusal_name(&refusal).to_owned(),
-      _ => "refused".to_owned(),
-    }),
-  };
-  let (volume, host) = match built {
-    Ok(pair) => pair,
+  let built = build_recovered_volume(state, record, image, size);
+  let (volume, host, prefix) = match built {
+    Ok(triple) => triple,
     Err(reason) => {
       if let Some(r) = reservation {
         state.budget.release(r);
@@ -2096,7 +2204,51 @@ fn rebuild_volume(state: &mut ShardState, record: &VolumeRecord) -> Result<(), S
   };
   let handle = state.volumes.insert(slot).map_err(|e| e.to_string())?;
   state.by_id.insert(record.id, handle);
-  Ok(())
+  Ok(prefix)
+}
+
+/// Builds the recovered volume and reports its inode-number prefix. See [`rebuild_volume`] for the
+/// scratch-volume cases; a base-backed volume re-opens its base (its content is on the base, not in
+/// the image; base recovery through retained handles is its own gate, §4.8).
+fn build_recovered_volume(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  image: Option<&VolumeImage>,
+  size: SizeClass,
+) -> Result<(Volume, Option<OsHost>, u16), String> {
+  let names = match record.policy.names {
+    DbNamePolicy::Exact => NamePolicy::Exact,
+    DbNamePolicy::Fold => NamePolicy::Fold,
+  };
+  match (&record.base, image) {
+    (BaseRecord::Scratch, Some(image)) => {
+      let quota = quota_for(state, size);
+      let journal = journal_bytes_for(state, &quota);
+      let volume = Volume::from_image(&mut state.store, image, Box::new(HostClock::new()), journal)
+        .map_err(|e| e.to_string())?;
+      Ok((volume, None, image.prefix))
+    }
+    (BaseRecord::Scratch, None) if state.content.is_some() => {
+      Err("RecoveryIncomplete: no content image for the volume".to_owned())
+    }
+    (BaseRecord::Scratch, None) => {
+      let config = volume_config(state, names, quota_for(state, size));
+      let prefix = config.prefix;
+      Volume::create(&mut state.store, config)
+        .map(|v| (v, None, prefix))
+        .map_err(|e| e.to_string())
+    }
+    (BaseRecord::Path { path }, _) => {
+      let config = volume_config(state, names, quota_for(state, size));
+      let prefix = config.prefix;
+      open_base(state, path, config)
+        .map(|(v, h)| (v, h, prefix))
+        .map_err(|reply| match *reply {
+          ReplyBody::Refused { refusal } => refusal_name(&refusal).to_owned(),
+          _ => "refused".to_owned(),
+        })
+    }
+  }
 }
 
 /// Reconciles what the old process's memory alone held: local-only snapshots (and the head

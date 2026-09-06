@@ -11,6 +11,7 @@ use slates_db::Db;
 use slates_db::catalog::{Principal, VolumeId};
 use slates_ipc::DaemonEnd;
 use slates_ipc::protocol::ReplyBody;
+use slates_mem::SharedObject;
 use slates_mem::Slab;
 use slates_mem::budget::ShardBudget;
 use slates_vfs::volume::{Store, Volume};
@@ -74,6 +75,14 @@ pub struct ShardState {
   pub config: DaemonConfig,
   /// The segment (this shard's mapping).
   pub segment: AnchorSegment,
+  /// The anchor-owned content object that holds this shard's recovery image (§4.8), and the byte
+  /// range within it this shard owns (shards share one object, partitioned by index). `None` when
+  /// the anchor provides no content object (a build or config without anchor-backed recovery); then
+  /// a restart recreates content empty as before (BUG-11).
+  pub content: Option<SharedObject>,
+  /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
+  /// from; `0..0` when there is no content object.
+  pub content_range: (usize, usize),
   /// The partition.
   pub db: Db,
   /// The register configuration (§4.8): the owner host, its epoch, its neighbourhood and
