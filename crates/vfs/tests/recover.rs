@@ -611,6 +611,50 @@ fn dropping_a_recovered_snapshot_frees_its_tree() {
   );
 }
 
+/// AC (§4.8): dropping a recovered snapshot never frees content the head still reaches. With a file
+/// unchanged since the snapshot (so head and snapshot hold identical content) and another changed
+/// after it, dropping the snapshot must leave both head files readable — the double-free guard for
+/// any head↔snapshot sharing the rebuild introduces.
+#[test]
+fn dropping_a_recovered_snapshot_leaves_the_head_readable() {
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let unchanged = vol
+    .create_file_no(&mut src, root, "unchanged", 0o644)
+    .unwrap();
+  vol
+    .write(&mut src, unchanged, 0, b"identical in head and snapshot")
+    .unwrap();
+  let changed = vol
+    .create_file_no(&mut src, root, "changed", 0o644)
+    .unwrap();
+  vol.write(&mut src, changed, 0, b"v1").unwrap();
+  let snap = vol.snapshot(&mut src).unwrap();
+  vol.write(&mut src, changed, 0, b"version-two").unwrap(); // longer, so it fully overwrites
+
+  let image = vol.to_image(&src).unwrap();
+  let mut fresh = store();
+  let mut recovered =
+    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+
+  recovered.destroy_snapshot(&mut fresh, snap).unwrap();
+
+  let mut buf = vec![0u8; 40];
+  let n = recovered.read(&fresh, unchanged, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..n],
+    b"identical in head and snapshot",
+    "the head's unchanged file survives the snapshot drop"
+  );
+  let n = recovered.read(&fresh, changed, 0, &mut buf).unwrap();
+  assert_eq!(
+    &buf[..n],
+    b"version-two",
+    "the head's changed file survives"
+  );
+}
+
 /// AC (§4.8): an image round-trips through its content bytes unchanged — the exact state a
 /// restarted daemon would read back equals what the running one published.
 #[test]
