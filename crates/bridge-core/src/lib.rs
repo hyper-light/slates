@@ -15,8 +15,10 @@
 //! which each transport maps to its wire error (a Linux errno, an `nfsstat3`); the neutral layer
 //! never invents an errno, so no transport inherits another's numbering.
 
+pub mod authority;
 pub mod volume_bridge;
 
+pub use authority::{AttachmentId, Attachments, ObjectId, OpContext, Rights, View};
 pub use volume_bridge::VolumeBridge;
 
 use slates_vfs::error::VfsError;
