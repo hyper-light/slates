@@ -609,19 +609,24 @@ impl Bridge for VolumeBridge<'_> {
     // referenced bytes, and the free is the remaining quota — not an invented multiple of the used
     // amount, which the previous `blocks = 2 * used` / `free = used` reported. The total and used
     // are the same pair the quota admits writes against, so `df` shows the real capacity a write
-    // will be refused past (a dynamic volume's total is its `max`; the file counts are reported as
-    // "not enforced" because the volume allocates inodes up to the store cap, an exact free-inode
-    // count owed with the store accessor).
+    // will be refused past (a dynamic volume's total is its `max`).
     let block = u64::from(BLOCK_SIZE);
     let total_blocks = self.volume.capacity_bytes().div_ceil(block);
     let used_blocks = accounting.referenced_bytes.div_ceil(block);
     let free_blocks = total_blocks.saturating_sub(used_blocks);
+    // Backed inode availability (§4.2: "statfs includes backed inode availability"): the volume's
+    // inode allowance is the total, and the free count is the allowance less its live inodes — the
+    // same pair `next_no` admits creates against, so `df -i` shows the real inodes a create will be
+    // refused past, not zero. (A dynamic-quota-derived allowance can be `u64::MAX`, an honest "not
+    // bounded here"; the fixtures leave it unbounded for the determinism oracle.)
+    let (live_inodes, inode_allowance) = self.volume.inode_usage();
+    let free_inodes = inode_allowance.saturating_sub(live_inodes);
     Ok(FsStat {
       blocks: total_blocks,
       bfree: free_blocks,
       bavail: free_blocks,
-      files: 0,
-      ffree: 0,
+      files: inode_allowance,
+      ffree: free_inodes,
       bsize: BLOCK_SIZE,
       namelen: NAME_MAX,
       frsize: BLOCK_SIZE,

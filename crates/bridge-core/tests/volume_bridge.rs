@@ -547,6 +547,43 @@ fn statfs_reports_the_real_capacity_not_an_invented_figure() {
   );
 }
 
+/// statfs reports backed inode availability (§4.2: "statfs includes backed inode availability"), not
+/// zero: `files` is the volume's inode allowance and `ffree` is the allowance less its live inodes —
+/// the same pair `next_no` admits creates against — so a create rises `used` and falls `ffree`, and
+/// an unlink returns the credit. The previous `files = ffree = 0` would fail this.
+#[test]
+fn statfs_reports_backed_inode_availability() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  vol.set_inode_allowance(5).unwrap(); // the root and four more
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let root = bridge.root(&cx).unwrap();
+
+  let empty = bridge.statfs(oid(root), &cx).unwrap();
+  assert_eq!(empty.files, 5, "the total inodes is the volume's allowance");
+  assert_eq!(
+    empty.ffree, 4,
+    "four inodes free: the allowance less the one live root"
+  );
+
+  let (a, fh_a) = bridge.create(oid(root), &cx, "a", 0o644, 0).unwrap();
+  bridge.create(oid(root), &cx, "b", 0o644, 0).unwrap();
+  let two = bridge.statfs(oid(root), &cx).unwrap();
+  assert_eq!(two.files, 5, "the allowance does not change with usage");
+  assert_eq!(two.ffree, 2, "two creates took two inodes");
+
+  // Closing the handle and unlinking with no other reference reclaims the inode and returns its
+  // credit (an unlinked-but-open file would stay a live orphan, correctly, until its handle closes).
+  bridge.release(oid(a.ino), &cx, fh_a).unwrap();
+  bridge.unlink(oid(root), &cx, "a").unwrap();
+  let freed = bridge.statfs(oid(root), &cx).unwrap();
+  assert_eq!(
+    freed.ffree, 3,
+    "an unlink of a closed file returns the inode credit"
+  );
+}
+
 /// A hard link creates a second name for one inode: both names resolve to it and its link count
 /// rises; a directory cannot be hard-linked (audit BUG-7, the volume core's link over the seam).
 #[test]
