@@ -92,6 +92,18 @@ impl ChunkArena {
     self.slots.iter().map(|s| s.buddy.region_bytes()).sum()
   }
 
+  /// Locks every region into RAM (§4.2, BUG-1), so content a strict volume backs never swaps.
+  /// Idempotent: a region already locked stays locked. Returns [`MemError::LockRefused`] if the OS
+  /// refuses (a working-set or `RLIMIT_MEMLOCK` limit), so a strict guarantee that cannot be met
+  /// refuses rather than silently becoming swappable service. Regions locked before the refusal
+  /// stay locked; the caller unwinds by refusing the admission.
+  pub fn lock(&mut self) -> Result<(), MemError> {
+    for slot in &mut self.slots {
+      slot.region.lock()?;
+    }
+    Ok(())
+  }
+
   /// Locked bytes across regions.
   pub fn locked_bytes(&self) -> usize {
     self

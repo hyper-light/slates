@@ -997,6 +997,17 @@ fn create(
     },
     SizeClass::Dynamic { .. } => None,
   };
+  // A strict volume backs its content in locked RAM (§4.2, BUG-1): lock the shard's arena so its
+  // content never swaps, refusing (as BudgetExceeded, the §4.2 lock-capacity refusal) if the OS
+  // will not — a strict guarantee never silently becomes swappable service. Whole-arena locking is
+  // a coarse first cut; locking only a strict volume's own chunks is the refinement (GAP-A9-1).
+  if require_locked && let Err(e) = state.store.content.arena_mut().lock() {
+    let available = match e {
+      slates_mem::MemError::LockRefused { locked, .. } => u64::try_from(locked).unwrap_or(u64::MAX),
+      _ => 0,
+    };
+    return give_back(state, reservation, Refusal::BudgetExceeded { available });
+  }
   let quota = quota_for(state, size);
   let config = volume_config(state, names, quota);
   let (volume, host) = match base {

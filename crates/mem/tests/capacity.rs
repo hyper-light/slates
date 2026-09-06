@@ -66,3 +66,29 @@ fn a_budget_over_usable_capacity_never_over_promises_what_the_arena_can_back() {
   arena.free(extent).unwrap();
   budget.release(reservation);
 }
+
+/// §4.2 (BUG-1): locking an arena locks its regions into RAM, so a strict (`require_locked`) volume's
+/// content never swaps; if the OS refuses (a working-set or `RLIMIT_MEMLOCK` limit) the caller learns
+/// so and refuses admission rather than silently giving swappable service. mlock capacity is
+/// environment-dependent, so a refusal here is a loud skip, not a failure.
+#[test]
+fn locking_an_arena_locks_its_regions_or_refuses_loudly() {
+  let region = 4 * PAGE;
+  let mut arena = ChunkArena::new(PAGE);
+  arena
+    .add_region(Region::map(region, PAGE, false).unwrap())
+    .unwrap();
+  match arena.lock() {
+    Ok(()) => assert!(
+      arena.locked_bytes() >= region,
+      "a locked arena reports its regions locked ({} >= {region})",
+      arena.locked_bytes()
+    ),
+    Err(MemError::LockRefused { .. }) => {
+      eprintln!(
+        "skipped locking_an_arena_locks_its_regions: the environment refuses mlock (no memlock capacity)"
+      );
+    }
+    Err(e) => panic!("an unexpected error locking the arena: {e}"),
+  }
+}
