@@ -22,15 +22,20 @@
 //! not yet in the image and are recorded as their own gates. The rebuild half (`from_image`) and
 //! the daemon/content-object wiring follow in their own slices.
 
+use std::collections::BTreeMap;
+
+use slates_mem::Handle;
 use slates_wire::Wire;
 
-use crate::dir::Child;
+use crate::clock::Clock;
+use crate::dir::{Child, DirNode};
 use crate::error::VfsError;
-use crate::inode::{Body, Inode, Kind};
+use crate::ids::{Epoch, InodeNo};
+use crate::inode::{Attrs, Body, Home, Inode, Kind};
 use crate::names::NameEquivalence;
 use crate::quota::Quota;
 use crate::trie;
-use crate::volume::{Store, Volume};
+use crate::volume::{Store, Volume, VolumeSeed};
 
 /// Format: the image's magic (`"SLR1"` little-endian), so an all-zero or foreign content object
 /// decodes to a mismatch and is refused rather than read as a valid empty volume.
@@ -353,6 +358,10 @@ impl Volume {
         child: child.0,
       });
     }
+    // Canonical order: by name. Names are distinct within a directory under the volume's policy, so
+    // this total order is independent of the small/indexed representation the entries happened to be
+    // stored in, which makes the image deterministic and a rebuild's re-capture byte-identical.
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(entries)
   }
 
@@ -375,5 +384,225 @@ impl Volume {
     }
     bytes.truncate(read);
     Ok(BodyImage::File { bytes })
+  }
+}
+
+/// The kind an image kind names.
+const fn kind_from_image(kind: KindImage) -> Kind {
+  match kind {
+    KindImage::File => Kind::File,
+    KindImage::Dir => Kind::Dir,
+    KindImage::Symlink => Kind::Symlink,
+  }
+}
+
+/// The name policy an image policy names.
+const fn policy_from_image(policy: PolicyImage) -> NameEquivalence {
+  match policy {
+    PolicyImage::Exact => NameEquivalence::Exact,
+    PolicyImage::Fold => NameEquivalence::Fold,
+  }
+}
+
+/// The quota an image quota names. A dynamic quota is refused for now (its live pressure source is
+/// not in the image and must be re-supplied by a future recovery path); a bounded quota rebuilds
+/// exactly.
+const fn quota_from_image(quota: QuotaImage) -> Result<Quota, VfsError> {
+  match quota {
+    QuotaImage::Bounded { limit } => Ok(Quota::Bounded { limit }),
+    QuotaImage::Dynamic { .. } => Err(VfsError::RecoveryIncomplete),
+  }
+}
+
+/// The attributes an image's attributes name.
+const fn attrs_from_image(a: &AttrsImage) -> Attrs {
+  Attrs {
+    mode: a.mode,
+    uid: a.uid,
+    gid: a.gid,
+    nlink: a.nlink,
+    size: a.size,
+    atime: a.atime,
+    mtime: a.mtime,
+    ctime: a.ctime,
+    btime: a.btime,
+  }
+}
+
+impl Volume {
+  /// A volume rebuilt from a recovery image (§4.8, A-9), the other half of [`Volume::to_image`]. It
+  /// is faithful: every inode is placed at its own number with its identity, attributes, home and
+  /// body, so a client's file handle from before the restart still resolves; directories and their
+  /// entries are rebuilt, and file bytes are re-established through the volume's own write path, so
+  /// the arena, the chunk store and the quota accounting end in the same state a live volume would
+  /// hold. `clock` and `journal_bytes` are re-supplied, as they are on any construction; a dynamic
+  /// quota is refused for now (its live pressure source is not in the image).
+  ///
+  /// The rebuild runs entirely at the image's head epoch, so nothing copies-on-write while it is
+  /// built; each inode's true birth epoch and version are restored at the end. It does not yet
+  /// rebuild CoW snapshots, clone lineage, referenced-but-unlinked orphans or a base plane — those
+  /// are their own gates — so it is exact for the scratch volume §4.8 step two asks for.
+  pub fn from_image(
+    store: &mut Store,
+    image: &VolumeImage,
+    clock: Box<dyn Clock>,
+    journal_bytes: usize,
+  ) -> Result<Volume, VfsError> {
+    let policy = policy_from_image(image.policy);
+    let quota = quota_from_image(image.quota)?;
+    let epoch = Epoch(image.epoch);
+    let root_no = InodeNo(image.root_no);
+    let seed = VolumeSeed {
+      prefix: image.prefix,
+      policy,
+      epoch,
+      next_counter: image.next_counter,
+      origin_epoch: image.origin_epoch.map(Epoch),
+      quota,
+    };
+    let mut vol = Volume::recovery_shell(store, seed, clock, journal_bytes)?;
+
+    let kinds: BTreeMap<u64, KindImage> = image.inodes.iter().map(|i| (i.no, i.kind)).collect();
+    let mut dirs: BTreeMap<u64, Handle<DirNode>> = BTreeMap::new();
+    dirs.insert(root_no.0, vol.root);
+
+    vol.place_inodes(store, image, root_no, epoch, &mut dirs)?;
+    vol.rebuild_entries(store, image, &kinds, &dirs)?;
+    vol.fill_content(store, image)?;
+    vol.restore_identities(store, image)?;
+    Ok(vol)
+  }
+
+  /// Pass one: place every non-root inode at its own number, born at the head epoch, with a fresh
+  /// directory node (parent and name fixed up when the parent's entries are rebuilt), a symlink's
+  /// target, or an empty file body to be filled by the write path. The root already exists.
+  fn place_inodes(
+    &mut self,
+    store: &mut Store,
+    image: &VolumeImage,
+    root_no: InodeNo,
+    epoch: Epoch,
+    dirs: &mut BTreeMap<u64, Handle<DirNode>>,
+  ) -> Result<(), VfsError> {
+    for image_inode in &image.inodes {
+      let no = InodeNo(image_inode.no);
+      if no == root_no {
+        continue;
+      }
+      let body = body_for(store, image_inode, no, epoch, dirs)?;
+      let inode = Inode::new(no, epoch, kind_from_image(image_inode.kind), 0, body);
+      let handle = store.inodes.insert(inode)?;
+      self.table_set(store, no, handle)?;
+    }
+    Ok(())
+  }
+
+  /// Pass two: rebuild every directory's entries, naming each child with the right kind, and fix
+  /// each subdirectory node's parent and name from the entry that reaches it.
+  fn rebuild_entries(
+    &mut self,
+    store: &mut Store,
+    image: &VolumeImage,
+    kinds: &BTreeMap<u64, KindImage>,
+    dirs: &BTreeMap<u64, Handle<DirNode>>,
+  ) -> Result<(), VfsError> {
+    for image_inode in &image.inodes {
+      let BodyImage::Directory { entries } = &image_inode.body else {
+        continue;
+      };
+      let parent_no = InodeNo(image_inode.no);
+      let parent = *dirs
+        .get(&image_inode.no)
+        .ok_or(VfsError::RecoveryIncomplete)?;
+      for e in entries {
+        let child = child_for(store, e, parent_no, kinds, dirs)?;
+        self.dir_insert(store, parent, &e.name, child)?;
+      }
+    }
+    Ok(())
+  }
+
+  /// Pass three: fill every non-empty file's content through the write path, so the chunk store and
+  /// quota accounting end where a live write would leave them.
+  fn fill_content(&mut self, store: &mut Store, image: &VolumeImage) -> Result<(), VfsError> {
+    for image_inode in &image.inodes {
+      if let BodyImage::File { bytes } = &image_inode.body
+        && !bytes.is_empty()
+      {
+        self.write(store, InodeNo(image_inode.no), 0, bytes)?;
+      }
+    }
+    Ok(())
+  }
+
+  /// Pass four: restore each inode's true identity — generation, birth epoch, version, multi-link
+  /// flag, home and exact attributes — over the placeholders the earlier passes left (the write
+  /// path stamped fresh times and sizes; here they become the image's).
+  fn restore_identities(&mut self, store: &mut Store, image: &VolumeImage) -> Result<(), VfsError> {
+    for image_inode in &image.inodes {
+      let no = InodeNo(image_inode.no);
+      let handle =
+        trie::get(&store.tries, self.inode_root, no).ok_or(VfsError::RecoveryIncomplete)?;
+      let inode = store.inodes.get_mut(handle)?;
+      inode.generation = image_inode.generation;
+      inode.born = Epoch(image_inode.born);
+      inode.version = image_inode.version;
+      inode.multi = image_inode.multi;
+      inode.home = image_inode.home.map(|h| Home {
+        parent: InodeNo(h.parent),
+        hash: h.hash,
+      });
+      inode.attrs = attrs_from_image(&image_inode.attrs);
+    }
+    Ok(())
+  }
+}
+
+/// The body to place an inode with in pass one: a fresh directory node (recorded in `dirs`), a
+/// symlink's target, or an empty file body the write pass fills.
+fn body_for(
+  store: &mut Store,
+  image_inode: &InodeImage,
+  no: InodeNo,
+  epoch: Epoch,
+  dirs: &mut BTreeMap<u64, Handle<DirNode>>,
+) -> Result<Body, VfsError> {
+  match image_inode.kind {
+    KindImage::Dir => {
+      let node = store.dirs.insert(DirNode::new(epoch, None, no, ""))?;
+      dirs.insert(image_inode.no, node);
+      Ok(Body::Directory(node))
+    }
+    KindImage::Symlink => match &image_inode.body {
+      BodyImage::Symlink { target } => Ok(Body::Symlink(target.as_str().into())),
+      _ => Err(VfsError::RecoveryIncomplete),
+    },
+    KindImage::File => Ok(Body::Inline(Vec::new())),
+  }
+}
+
+/// The child an entry names, resolving a subdirectory to its node handle and fixing that node's
+/// parent and name from the reaching entry.
+fn child_for(
+  store: &mut Store,
+  entry: &EntryImage,
+  parent_no: InodeNo,
+  kinds: &BTreeMap<u64, KindImage>,
+  dirs: &BTreeMap<u64, Handle<DirNode>>,
+) -> Result<Child, VfsError> {
+  let child_no = InodeNo(entry.child);
+  match kinds
+    .get(&entry.child)
+    .ok_or(VfsError::RecoveryIncomplete)?
+  {
+    KindImage::File => Ok(Child::File(child_no)),
+    KindImage::Symlink => Ok(Child::Symlink(child_no)),
+    KindImage::Dir => {
+      let handle = *dirs.get(&entry.child).ok_or(VfsError::RecoveryIncomplete)?;
+      let node = store.dirs.get_mut(handle)?;
+      node.parent = Some(parent_no);
+      node.name = entry.name.as_str().into();
+      Ok(Child::Dir(handle))
+    }
   }
 }

@@ -11,8 +11,10 @@ mod common;
 
 use common::{store, volume};
 use slates_vfs::VfsError;
+use slates_vfs::clock::StepClock;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::recover::{BodyImage, InodeImage, KindImage, PolicyImage, VolumeImage};
+use slates_vfs::volume::Volume;
 
 /// A deterministic, varied byte at index `i`, spread so a file crosses several chunks with no
 /// repeat short enough to hide a mis-ordered chunk on recovery.
@@ -158,6 +160,39 @@ fn to_image_captures_a_symlink_target() {
     BodyImage::Symlink {
       target: "dir/big".to_string()
     }
+  );
+}
+
+/// AC (§4.8, A-9): a scratch volume rebuilt from its image is faithful. The rebuilt volume's own
+/// image is byte-identical to the original's — so inode numbers, the tree, every file's bytes, the
+/// attributes and the roots all came back — and a read by an inode number handed out before the
+/// "restart" returns the same bytes. This is the write→[image]→[drop]→[rebuild]→read proof at the
+/// volume level: dropping the store and rebuilding into a fresh one is the "kill and restart."
+#[test]
+fn a_volume_rebuilt_from_its_image_is_faithful() {
+  let b = built();
+  let original = b.image.to_content();
+
+  // "Restart": a fresh store, rebuild the volume from the published image bytes.
+  let mut fresh = store();
+  let image = VolumeImage::from_content(&original).unwrap();
+  let vol =
+    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+
+  // The rebuilt volume re-images byte-for-byte identically: nothing was lost or changed.
+  let rebuilt = vol.to_image(&fresh).unwrap().to_content();
+  assert_eq!(
+    rebuilt, original,
+    "the rebuilt volume re-images identically"
+  );
+
+  // The multi-chunk file reads back through its original inode number (which survived the rebuild).
+  let mut got = vec![0u8; b.big_bytes.len()];
+  let n = vol.read(&fresh, b.big, 0, &mut got).unwrap();
+  got.truncate(n);
+  assert_eq!(
+    got, b.big_bytes,
+    "the file reads back through its original inode number"
   );
 }
 

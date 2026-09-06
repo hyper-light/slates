@@ -1,10 +1,12 @@
 # Anchor-owned volume storage and recovery (§4.2, §4.8): milestone design
 
 > Status: in progress. The memory foundation (a region and an anchor content object that survive a
-> daemon restart) and the volume recovery **image** capture are landed and gated; the image rebuild,
-> the daemon/content-object wiring, and the process-level write→kill→restart→read proof are owed.
-> This doc is the assistant-owned record of the milestone; the numbered requirements live in
-> `SLATES_DESIGN.md` §4.2 and §4.8 (A-9), and the gap ledger is `GAPS.md`.
+> daemon restart), the volume recovery **image** capture, and the faithful **rebuild** from it are
+> landed and gated — a scratch volume now survives an image → drop → rebuild round trip byte-for-byte
+> at the library level. The daemon/content-object wiring and the process-level
+> write→kill→restart→read proof are owed. This doc is the assistant-owned record of the milestone;
+> the numbered requirements live in `SLATES_DESIGN.md` §4.2 and §4.8 (A-9), and the gap ledger is
+> `GAPS.md`.
 
 ## 1. The requirement (settled, not a choice)
 
@@ -86,14 +88,23 @@ volume.
    determinism gate (two images byte-identical), and a hostile-input gate (empty, all-zero,
    truncated, foreign-magic and trailing-garbage content all refuse without panicking). Refuses,
    rather than silently drops, a base-backed body or a whiteout (the base-plane recovery gate).
+   Directory entries are captured in a canonical (name-sorted) order, so the image is independent of
+   the small/indexed directory representation and a rebuild re-captures byte-identically.
+4. **Volume recovery image — rebuild.** *(Landed, `crates/vfs/src/recover.rs` `from_image`, with
+   `Volume::recovery_shell`/`VolumeSeed` in `volume.rs`.)* The store is rebuilt from a `VolumeImage`
+   faithfully: every inode is placed at its own number (`trie::set`) with its identity, attributes,
+   home and body; directory nodes are rebuilt with their parent and name fixed from the reaching
+   entry; file bytes are re-established through the volume's own `write` path, so the chunk store and
+   the quota/byte accounting end where a live write would leave them. The whole rebuild runs at the
+   image's head epoch so nothing copies-on-write while it is built; each inode's true birth epoch and
+   version are restored last. A dynamic quota is refused for now (its live pressure source is not in
+   the image). Gated by the oracle `to_image(from_image(img)) == img` (byte-identical) plus a read of
+   the multi-chunk file through the inode number handed out before the "restart" — the
+   write→[image]→[drop]→[rebuild]→read proof at the library level. Non-vacuity of the oracle was
+   checked by injecting a dropped-attribute-restore bug and confirming the round trip then fails.
 
 ## 4. Owed, as individual gates
 
-- **Image rebuild (`from_image`).** Reconstruct the store from a `VolumeImage` faithfully —
-  inodes at their exact numbers via `trie::set`, directories rebuilt from their entries, file bytes
-  re-established, roots restored — then a full recovery round-trip test (`to_image` → drop →
-  `from_image` → observably identical volume, inode numbers included). The capture half is in; this
-  is the next slice.
 - **Daemon/content-object wiring.** The create path sizes and creates the content object
   (`AnchorSegment::with_content`); a barrier publishes the image into it; `init_shard` reads it back
   and rebuilds via `from_image`. Then the process-level proof: write bytes through the client, kill

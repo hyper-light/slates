@@ -222,6 +222,24 @@ pub enum DestroyProgress {
   Done,
 }
 
+/// The scalars a recovered volume takes from its image (§4.8), distinct from the runtime bits (the
+/// clock and journal budget) supplied afresh at recovery. Grouped so [`Volume::recovery_shell`]
+/// takes few arguments.
+pub(crate) struct VolumeSeed {
+  /// The inode-number prefix.
+  pub(crate) prefix: u16,
+  /// The name-equivalence policy.
+  pub(crate) policy: NameEquivalence,
+  /// The head epoch.
+  pub(crate) epoch: Epoch,
+  /// The next inode counter to hand out.
+  pub(crate) next_counter: u64,
+  /// The origin epoch, for a recovered clone.
+  pub(crate) origin_epoch: Option<Epoch>,
+  /// The quota.
+  pub(crate) quota: Quota,
+}
+
 impl Volume {
   /// Creates an empty scratch volume with a root directory.
   pub fn create(store: &mut Store, mut config: VolumeConfig) -> Result<Volume, VfsError> {
@@ -315,6 +333,60 @@ impl Volume {
         .map(|b| b.for_clone(InodeNo::compose(config.prefix, 1))),
       bytes: ByEpoch::inherited(epoch, referenced),
       journal: OpLog::new(config.journal_bytes),
+      state: VolumeState::Live,
+      destroy_queue: Vec::new(),
+      references: BTreeMap::new(),
+      attachment_refs: BTreeMap::new(),
+      orphans: BTreeSet::new(),
+    })
+  }
+
+  /// An empty volume shell for recovery (§4.8): the root inode, its directory node and the inode
+  /// table exist at the seed's epoch, and the volume's scalars are set from a recovery image, but no
+  /// other inode is present yet. [`crate::recover`]'s `from_image` fills the rest, at the same epoch
+  /// so nothing copies-on-write during the rebuild. It differs from [`Volume::create`] only in
+  /// taking the epoch, inode counter, origin and quota from the image rather than starting fresh;
+  /// the root inode's attributes are placeholders the caller overwrites from the image.
+  pub(crate) fn recovery_shell(
+    store: &mut Store,
+    seed: VolumeSeed,
+    clock: Box<dyn Clock>,
+    journal_bytes: usize,
+  ) -> Result<Volume, VfsError> {
+    let epoch = seed.epoch;
+    let root_no = InodeNo::compose(seed.prefix, 1);
+    let root_inode = Inode::new(root_no, epoch, Kind::Dir, ROOT_MODE, Body::None);
+    let root_handle = store.inodes.insert(root_inode)?;
+    let inode_root = trie::new_root(&mut store.tries, epoch)?;
+    let mut dead = Deadlist::default();
+    let (inode_root, _) = trie::set(
+      &mut store.tries,
+      inode_root,
+      root_no,
+      root_handle,
+      epoch,
+      &mut dead,
+    )?;
+    let root = store.dirs.insert(DirNode::new(epoch, None, root_no, ""))?;
+    store.inodes.get_mut(root_handle)?.body = Body::Directory(root);
+    Ok(Volume {
+      prefix: seed.prefix,
+      policy: seed.policy,
+      clock,
+      epoch,
+      root,
+      inode_root,
+      next_counter: seed.next_counter,
+      snapshots: Slab::new(
+        crate::snapshot::initial_capacity(store.content.page()).get(),
+        SNAPSHOT_SLOT_CAP,
+      ),
+      last_snapshot: None,
+      origin_epoch: seed.origin_epoch,
+      quota: seed.quota,
+      base: None,
+      bytes: ByEpoch::default(),
+      journal: OpLog::new(journal_bytes),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
