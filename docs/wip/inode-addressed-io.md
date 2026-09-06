@@ -226,12 +226,20 @@ attachment-teardown sweep each export a counter a test asserts moved.
 2. **Identity across incarnations.** Confirm identity survives CoW (a stable handle generation, not
    the slab-slot field); preserve inode identities and the allocator high-water mark on recovery; a
    restored-as-new volume gets a distinct volume identity. Tests of §8.3. *(No inode-number reuse.)*
-3. **The `OpContext` and the neutral `Bridge` signature.** Introduce `ObjectId`/`OpContext` built
-   from trusted server state; move `read`/`write` (then the rest) onto them; `open`/`create` take a
-   reference and record the granted access and append intent; `release`/`forget`/unmount
-   unreference (with the bounded teardown sweep). `VolumeBridge` uses the inode directly. FUSE edge
-   wired (node id → `ObjectId`, mount attachment → `OpContext`). All existing FUSE tests stay
-   green; §8.4 (write authorization), §8.5 (cleanup), §8.6 (lifecycle) added.
+3. **The authority machinery and the `OpContext` interface.** *(Authority + read/write landed
+   2026-09-05.)* The local attachment authority (`bridge-core/src/authority.rs`): an owned,
+   generation-checked `Attachment` record binding volume/view/subject/rights/epoch; an
+   `Attachments` registry that admits under the current owner epoch, revokes, drains, fences on
+   `take_over`, and builds an `OpContext` only from a validated record — refusing an unknown,
+   revoked or epoch-fenced attachment. `read`/`write` moved onto `(ObjectId, &OpContext)`:
+   `VolumeBridge` addresses by inode and enforces rights (a read the context does not grant, a
+   write on a read-only attachment) and view (a write on a pinned view) before any effect; the
+   handle table is now open-state only. FUSE `dispatch` carries the context, `serve_blocking`
+   rebuilds it from the mount's attachment before each effect. §8.4 (write authorization) landed.
+   *Owed:* the rest of the trait (getattr/lookup/... onto `ObjectId`+`OpContext`); the transport
+   edges creating attachments at attach time from the enrolled subject; wiring
+   `open`/`release`/`lookup`/`forget` to the volume reference count with the teardown sweep; §8.5
+   (cleanup), §8.6 (lifecycle).
 4. **The NFS read/write/setattr/namespace procedures over the new interface.** Stateless: handle →
    `ObjectId`, the export/request identity → `OpContext`, request-lifetime pins for async ops.
 5. **Access enforcement through `subject`** once §4.13 threads the enrolled consumer; `AUTH_SYS`
