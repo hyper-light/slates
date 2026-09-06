@@ -85,7 +85,30 @@ impl<'v> VolumeBridge<'v> {
   /// already holds [`MAX_OPEN_HANDLES`] (audit BUG-4). The wire handle packs the slot and its
   /// generation.
   fn open_handle(&mut self, inode: u64) -> Result<u64, VfsError> {
-    Ok(pack_handle(self.handles.insert(inode)?))
+    // An open takes an open reference on the inode (dropped by release), so a file open across an
+    // unlink keeps its content until the last reference. Reference first; undo it if the slot
+    // cannot be allocated, so the count never leaks (the lifecycle rule).
+    self
+      .volume
+      .reference(self.store, slates_vfs::ids::InodeNo(inode))?;
+    match self.handles.insert(inode) {
+      Ok(handle) => Ok(pack_handle(handle)),
+      Err(e) => {
+        let _ = self
+          .volume
+          .unreference(self.store, slates_vfs::ids::InodeNo(inode));
+        Err(e.into())
+      }
+    }
+  }
+
+  /// Takes a lookup reference on inode `no`: the transport holds the entry until it forgets it, so
+  /// every entry-returning operation (lookup, create, mkdir, symlink) takes one and forget drops
+  /// it. An inode a transport still names keeps its content across an unlink.
+  fn reference_lookup(&mut self, no: u64) -> Result<(), VfsError> {
+    self
+      .volume
+      .reference(self.store, slates_vfs::ids::InodeNo(no))
   }
 
   /// The neutral attributes of inode `no`: its stat (through the host for an overlay's base
@@ -141,7 +164,9 @@ impl Bridge for VolumeBridge<'_> {
     let located = self
       .volume
       .lookup_no(self.store, slates_vfs::ids::InodeNo(parent), name)?;
-    self.attr_of(located.inode.0)
+    let attr = self.attr_of(located.inode.0)?;
+    self.reference_lookup(located.inode.0)?;
+    Ok(attr)
   }
 
   fn getattr(&mut self, ino: u64) -> Result<NodeAttr, VfsError> {
@@ -256,20 +281,39 @@ impl Bridge for VolumeBridge<'_> {
         .create_file_no(self.store, slates_vfs::ids::InodeNo(parent), name, mode)?;
     let attrs = self.volume.stat(self.store, no)?;
     let entry = node_attr(no.0, Kind::File, &attrs);
-    let fh = self.open_handle(no.0)?;
+    // A create takes both a lookup reference (survives release) and an open reference (dropped by
+    // release); take the lookup first, and undo it if the open cannot be allocated.
+    self.reference_lookup(no.0)?;
+    let fh = match self.open_handle(no.0) {
+      Ok(fh) => fh,
+      Err(e) => {
+        let _ = self
+          .volume
+          .unreference(self.store, slates_vfs::ids::InodeNo(no.0));
+        return Err(e);
+      }
+    };
     Ok((entry, fh))
   }
 
   fn release(&mut self, _ino: u64, fh: u64) -> Result<(), VfsError> {
-    // Removing the slot frees it for reuse and bumps its generation; an unknown or already-freed
-    // handle is a no-op, because the kernel may release a handle the bridge has already dropped.
+    // Drop the open reference the handle held, then free the slot for reuse. An unknown or
+    // already-freed handle is a no-op (the kernel may release one the bridge already dropped).
+    if let Ok(inode) = self.handles.get(unpack_handle(fh)).copied() {
+      let _ = self
+        .volume
+        .unreference(self.store, slates_vfs::ids::InodeNo(inode));
+    }
     let _ = self.handles.remove(unpack_handle(fh));
     Ok(())
   }
 
-  fn forget(&mut self, _ino: u64, _nlookup: u64) {
-    // Inode numbers are never reclaimed while the volume lives; a forget is a hint the transport
-    // dropped its cache. Generation-tracked reuse is owed (§4.6 `(no, gen)`).
+  fn forget(&mut self, ino: u64, nlookup: u64) {
+    // Drop the lookup references the transport held; at the last reference an already-unlinked
+    // inode is reclaimed (§4.6 the reference model). A bulk forget is one bounded step.
+    let _ = self
+      .volume
+      .unreference_n(self.store, slates_vfs::ids::InodeNo(ino), nlookup);
   }
 
   fn flush(&mut self, _ino: u64, _fh: u64) -> Result<(), VfsError> {
@@ -282,7 +326,9 @@ impl Bridge for VolumeBridge<'_> {
       .volume
       .mkdir_no(self.store, slates_vfs::ids::InodeNo(parent), name, mode)?;
     let attrs = self.volume.stat(self.store, no)?;
-    Ok(node_attr(no.0, Kind::Dir, &attrs))
+    let attr = node_attr(no.0, Kind::Dir, &attrs);
+    self.reference_lookup(no.0)?;
+    Ok(attr)
   }
 
   fn unlink(&mut self, parent: u64, name: &str) -> Result<(), VfsError> {
@@ -302,7 +348,9 @@ impl Bridge for VolumeBridge<'_> {
       .volume
       .symlink_no(self.store, slates_vfs::ids::InodeNo(parent), name, target)?;
     let attrs = self.volume.stat(self.store, no)?;
-    Ok(node_attr(no.0, Kind::Symlink, &attrs))
+    let attr = node_attr(no.0, Kind::Symlink, &attrs);
+    self.reference_lookup(no.0)?;
+    Ok(attr)
   }
 
   fn readlink(&mut self, ino: u64) -> Result<String, VfsError> {

@@ -325,10 +325,13 @@ fn a_handle_to_a_reclaimed_inode_is_stale() {
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(&mut vol, &mut store);
   let root_ino = bridge.root().unwrap();
-  let (attr, _fh) = bridge.create(root_ino, "gone", 0o644, 0).unwrap();
+  let (attr, fh) = bridge.create(root_ino, "gone", 0o644, 0).unwrap();
   let gone_ino = attr.ino;
-  // No volume reference is held, so removing the name reclaims the inode and frees its number.
   bridge.unlink(root_ino, "gone").unwrap();
+  // Drop the references the create took — the open handle and the kernel's lookup — so the
+  // unlinked inode is reclaimed and its number freed (an open/looked-up inode survives unlink).
+  bridge.release(gone_ino, fh).unwrap();
+  bridge.forget(gone_ino, 1);
 
   let mut export = Export::new(&mut bridge, VolumeId { bytes: [0x11; 16] });
   let handle = slates_bridge_nfs::FileHandle {

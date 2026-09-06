@@ -2071,12 +2071,21 @@ impl Volume {
     Ok(())
   }
 
-  /// Drops a reference on inode `no`. If it was the last reference and the inode has already left
+  /// Drops one reference on inode `no`. If it was the last reference and the inode has already left
   /// the namespace (an orphan), its content is reclaimed now, at this terminal step.
   pub fn unreference(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+    self.unreference_n(store, no, 1)
+  }
+
+  /// Drops up to `n` references on inode `no` in one bounded step — a transport's bulk forget, or
+  /// an attachment teardown that discards its references without a message per inode (FUSE's
+  /// unmount). Never drops below zero. Reclaims the inode if this brings the count to zero and it
+  /// is an orphan, at this terminal step.
+  pub fn unreference_n(&mut self, store: &mut Store, no: InodeNo, n: u64) -> Result<(), VfsError> {
     let remaining = match self.references.get_mut(&no) {
       Some(count) => {
-        *count = count.saturating_sub(1);
+        let drop = u32::try_from(n).unwrap_or(u32::MAX).min(*count);
+        *count -= drop;
         let remaining = *count;
         if remaining == 0 {
           self.references.remove(&no);

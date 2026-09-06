@@ -282,3 +282,40 @@ fn a_write_is_refused_on_a_pinned_view() {
     "a pinned view cannot write"
   );
 }
+
+/// Unlink-while-open works end to end through the bridge: a created (and thus referenced) file
+/// survives an unlink and still serves reads, and is reclaimed only once its open handle is
+/// released and its lookup reference forgotten (Ada review: bridge lifecycle wiring).
+#[test]
+fn an_open_file_survives_unlink_through_the_bridge() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(&mut vol, &mut store);
+  let root = bridge.root().unwrap();
+  let cx = rw_cx();
+  // create takes a lookup reference and an open reference (the handle).
+  let (attr, fh) = bridge.create(root, "f", 0o644, 0).unwrap();
+  let ino = attr.ino;
+  let obj = ObjectId {
+    inode: ino,
+    generation: 0,
+  };
+  bridge.write(obj, &cx, 0, b"hello").unwrap();
+
+  bridge.unlink(root, "f").unwrap();
+  assert!(bridge.lookup(root, "f").is_err(), "the name is unlinked");
+  let mut out = Vec::new();
+  bridge.read(obj, &cx, 0, 16, &mut out).unwrap();
+  assert_eq!(
+    &out, b"hello",
+    "the open file keeps its content after unlink"
+  );
+
+  // Release the open handle and forget the lookup reference — now the inode is reclaimed.
+  bridge.release(ino, fh).unwrap();
+  bridge.forget(ino, 1);
+  assert!(
+    bridge.getattr(ino).is_err(),
+    "reclaimed once the last reference is dropped"
+  );
+}
