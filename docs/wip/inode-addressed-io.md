@@ -136,8 +136,20 @@ references implicitly: `Bridge::reference` is an explicit verb the FUSE edge cal
 successful `LOOKUP`/`CREATE`/`MKDIR`/`SYMLINK`, and the NFS edge never calls (NFS adds no
 references, above). This closed a lookup-reference leak in the first NFS surface, where the shared
 `lookup`/`create`/`mkdir`/`symlink` referenced for every transport and NFS — having no `FORGET` —
-never dropped them (`docs/bugs/2026-09-05-nfs-lookup-reference-leak.md`). The per-attachment
-ownership *ledger* and the teardown sweep (below) remain owed.
+never dropped them (`docs/bugs/2026-09-05-nfs-lookup-reference-leak.md`).
+
+**Per-attachment ownership and the teardown sweep (landed, vfs + bridge halves).** Every reference
+is attributed to the attachment that took it: the volume core holds a per-attachment ledger keyed
+by an opaque owner id, whose invariant is that the global reference count equals the sum of the
+per-attachment counts (`Volume::reference_for`/`forget_for`). `Volume::sweep_attachment` releases
+exactly one attachment's share of each inode it held, in one bounded batch, reclaiming those that
+reach zero references and no links — so a FUSE unmount discards a whole mount's references with no
+per-inode `FORGET`, and a sweep can never reclaim an inode another attachment still holds (the
+multi-attachment guard is a test at both the vfs and bridge levels). The bridge's `open`/`reference`/
+`forget`/`release` route through this API keyed by `cx.attachment.key()`, and `Bridge::sweep_attachment`
+is the teardown verb. *Owed:* the transport edges calling the sweep at unmount/disconnect, and
+reconciling the process-local attachment key with the durable §4.8 attachment id (the server
+wiring).
 
 **NFS: no server reference, a narrowed guarantee.** NFS has no `open`/`FORGET`, so it adds no
 references. A single client's unlink-while-open is the *client's* `.nfsXXXX` sillyname (an ordinary
@@ -260,10 +272,13 @@ attachment-teardown sweep each export a counter a test asserts moved.
    admits its attachment at mount time for the enrolled subject. §8.4 (write authorization) landed
    at both edges. Reference-taking is now an explicit per-transport action (`Bridge::reference`):
    the FUSE edge references on `LOOKUP`/`CREATE`/`MKDIR`/`SYMLINK`, NFS references nowhere — closing
-   the lookup-reference leak the first NFS surface had. *Owed:* the daemon wiring that creates the
-   FUSE mount's attachment from the rendezvous-established principal (the server↔bridge seam, with
-   the real Linux mount); the per-attachment reference *ledger* and the teardown sweep (a FUSE
-   unmount discards a whole attachment's references at once); §8.5 (cleanup), §8.6 (lifecycle).
+   the lookup-reference leak the first NFS surface had. The per-attachment reference ledger and the
+   teardown sweep landed (vfs + bridge): references are attributed per attachment, and
+   `Bridge::sweep_attachment` releases a whole attachment's references at once, never reclaiming an
+   inode another attachment holds. *Owed:* the daemon wiring that creates the FUSE mount's
+   attachment from the rendezvous-established principal and calls the sweep at unmount/disconnect
+   (the server↔bridge seam, with the real Linux mount); reconciling the process-local attachment key
+   with the durable §4.8 attachment id; §8.5 (cleanup), §8.6 (lifecycle).
 4. **The NFS read/write/setattr/namespace procedures over the new interface.** *(The metadata,
    file-I/O, namespace and directory-listing procedures landed 2026-09-05.)* Stateless: handle
    → `ObjectId`, the export identity → `OpContext`. `READ` returns the bytes with the count and eof;
