@@ -147,7 +147,7 @@ pub fn mount(mount_point: &str, extra_options: &[&str]) -> Result<Mount, MountEr
   let comm = clear_cloexec(&theirs).map_err(|e| MountError::Recv {
     code: Some(e.raw_os_error()),
   })?;
-  let mut child = Command::new(FUSERMOUNT)
+  let child = Command::new(FUSERMOUNT)
     .arg("-o")
     .arg(&options)
     .arg(mount_point)
@@ -158,10 +158,12 @@ pub fn mount(mount_point: &str, extra_options: &[&str]) -> Result<Mount, MountEr
     })?;
   // The daemon holds only its own end now; the child holds `theirs`.
   drop(theirs);
+  // Own the helper so it is reaped on *every* exit, not only the success path (audit BUG-14):
+  // if `receive_device` fails below, an early `?` return drops this guard, which kills and reaps
+  // the helper rather than leaving it a zombie/orphan. The success path disarms it via `finish`.
+  let mut helper = HelperGuard(Some(child));
   let device = receive_device(&ours)?;
-  let status = child.wait().map_err(|e| MountError::Spawn {
-    code: e.raw_os_error(),
-  })?;
+  let status = helper.finish()?;
   if !status.success() {
     return Err(MountError::Helper {
       exit: status.code(),
@@ -171,6 +173,38 @@ pub fn mount(mount_point: &str, extra_options: &[&str]) -> Result<Mount, MountEr
     channel: FuseChannel::from_device(device),
     mount_point: mount_point.to_owned(),
   })
+}
+
+/// Owns the spawned `fusermount3` helper so it is always reaped (audit BUG-14, and Part 2 item 9:
+/// no spawned child without an owner that joins or cancels it). A successful mount calls
+/// [`HelperGuard::finish`] to wait for the helper's own exit and disarm the guard; any earlier
+/// failure drops the guard instead, and its [`Drop`] kills and waits the child so no zombie lingers.
+struct HelperGuard(Option<std::process::Child>);
+
+impl HelperGuard {
+  /// Waits for the helper's normal exit, taking the child so the guard's drop is then a no-op.
+  fn finish(&mut self) -> Result<std::process::ExitStatus, MountError> {
+    match self.0.take() {
+      Some(mut child) => child.wait().map_err(|e| MountError::Spawn {
+        code: e.raw_os_error(),
+      }),
+      // `finish` runs once, after a successful spawn, so the child is present; a missing one is a
+      // caller error, reported rather than panicked (the no-panic law).
+      None => Err(MountError::Spawn { code: None }),
+    }
+  }
+}
+
+impl Drop for HelperGuard {
+  fn drop(&mut self) {
+    if let Some(mut child) = self.0.take() {
+      // The mount did not complete: stop the helper and reap it so no orphan or zombie is left.
+      // Both may fail if it has already exited; the wait still reaps the zombie, and either error
+      // is nothing the caller can act on at drop.
+      let _ = child.kill();
+      let _ = child.wait();
+    }
+  }
 }
 
 /// Clears close-on-exec on a descriptor so the spawned helper inherits it, returning its raw
