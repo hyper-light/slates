@@ -36,6 +36,17 @@ fn pattern_byte(i: u32) -> u8 {
   i.wrapping_mul(2_654_435_761).to_le_bytes()[0]
 }
 
+/// A one-file volume's image, the file holding `content`. Two calls with different content give two
+/// distinct images, for the atomic-publication tests.
+fn image_with(content: &[u8]) -> VolumeImage {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, f, 0, content).unwrap();
+  vol.to_image(&store).unwrap()
+}
+
 /// The inode image with number `no`; the walk yields each inode once, so this is unique.
 fn inode(image: &VolumeImage, no: InodeNo) -> &InodeImage {
   let mut matches = image.inodes.iter().filter(|i| i.no == no.0);
@@ -458,39 +469,97 @@ fn a_whole_shard_of_volumes_survives_a_content_object_handoff() {
   }
 }
 
-/// A robustness gate on the content frame: an empty (fresh) object reads as "nothing to recover"
-/// (`None`, so the caller starts a new volume), a published image reads back, a write torn by a
-/// crash is caught by the CRC and refused rather than decoded, and a buffer too small to hold the
-/// frame refuses the publish.
+/// AC (§4.8): the production shard-publication seam is atomic. `ShardImage::write_to` and
+/// `read_from` are exactly what the daemon's `publish_shard`/`recover_images` call, so this drives
+/// them: a shard image commits, a second shard image's publish is torn mid-write, and recovery reads
+/// back the *first* — the last committed shard, not a torn or empty one. This is the memory-level
+/// shape of a daemon killed in the middle of publishing to anchor-owned RAM.
 #[test]
-fn the_content_frame_signals_empty_and_refuses_a_torn_write() {
-  let b = built();
+fn an_interrupted_shard_publish_preserves_the_last_committed_shard() {
+  let one = ShardImage::new(vec![KeyedImage {
+    key: key_bytes(7),
+    image: image_with(b"committed-shard"),
+  }]);
+  let two = ShardImage::new(vec![KeyedImage {
+    key: key_bytes(7),
+    image: image_with(b"in-flight-shard"),
+  }]);
+  let mut buf = vec![0u8; CONTENT_LEN];
+
+  one.write_to(&mut buf).unwrap();
+  assert_eq!(
+    ShardImage::read_from(&buf).unwrap().as_ref(),
+    Some(&one),
+    "the first shard image commits"
+  );
+
+  let slot_len = two.write_to(&mut buf).unwrap();
+  let half = buf.len() / 2;
+  buf[half + slot_len - 1] ^= 0xFF; // the second shard landed in the inactive slot; tear it
+  assert_eq!(
+    ShardImage::read_from(&buf).unwrap().as_ref(),
+    Some(&one),
+    "a torn shard publish preserves the last committed shard image at the production seam"
+  );
+}
+
+/// AC (§4.8): publication into the content object is an atomic double-buffered commit — an
+/// interrupted, torn or too-large publish preserves the last committed image and never presents a
+/// torn slot as a success. A fresh object holds nothing; a publish commits; a publish torn mid-write
+/// leaves the previous commit intact; a retry commits; a buffer too small to hold a slot refuses the
+/// publish without touching the committed slot; and an object with no valid commit reads as `None`
+/// (which the caller turns into `RecoveryIncomplete`), never a garbage success.
+#[test]
+fn an_interrupted_publish_preserves_the_last_committed_image() {
+  let first = image_with(b"first-committed-value");
+  let second = image_with(b"second-in-flight-value");
   let mut buf = vec![0u8; CONTENT_LEN];
 
   assert!(
     VolumeImage::read_from(&buf).unwrap().is_none(),
-    "a fresh content object holds no image"
+    "a fresh content object has no committed image"
   );
 
-  let total = b.image.write_to(&mut buf).unwrap();
-  assert!(
-    VolumeImage::read_from(&buf).unwrap().is_some(),
-    "a published image reads back"
+  VolumeImage::write_to(&first, &mut buf).unwrap();
+  assert_eq!(
+    VolumeImage::read_from(&buf).unwrap().as_ref(),
+    Some(&first),
+    "the first image is committed and reads back"
   );
 
-  buf[total - 1] ^= 0xFF;
-  assert!(
-    matches!(
-      VolumeImage::read_from(&buf),
-      Err(VfsError::RecoveryIncomplete)
-    ),
-    "a torn write is refused, not decoded"
+  // Publish the second image, then tear its slot: the write reached the content object but the
+  // process died before the frame was coherent (its CRC no longer matches). The commit is the CRC
+  // becoming valid, so a torn slot was never a commit.
+  let slot_len = VolumeImage::write_to(&second, &mut buf).unwrap();
+  let half = buf.len() / 2;
+  buf[half + slot_len - 1] ^= 0xFF; // the second image landed in the inactive (second) slot
+  assert_eq!(
+    VolumeImage::read_from(&buf).unwrap().as_ref(),
+    Some(&first),
+    "an interrupted publish preserves the last committed image, not a torn or empty one"
   );
 
-  let mut tiny = vec![0u8; 4];
+  // A retry after the interruption commits the second image cleanly.
+  VolumeImage::write_to(&second, &mut buf).unwrap();
+  assert_eq!(
+    VolumeImage::read_from(&buf).unwrap().as_ref(),
+    Some(&second),
+    "a retry after the interrupted publish commits"
+  );
+
+  // Both slots torn: no valid commit — `None`, which the caller refuses, never a false success.
+  for byte in buf.iter_mut() {
+    *byte ^= 0xFF;
+  }
   assert!(
-    matches!(b.image.write_to(&mut tiny), Err(VfsError::NoSpace)),
-    "a buffer too small refuses the publish"
+    VolumeImage::read_from(&buf).unwrap().is_none(),
+    "an object with no valid commit yields None (the caller then refuses), never garbage"
+  );
+
+  let mut tiny = vec![0u8; 8];
+  assert!(
+    matches!(first.write_to(&mut tiny), Err(VfsError::NoSpace)),
+    "a buffer too small for a slot refuses the publish"
   );
 }
 

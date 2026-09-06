@@ -226,12 +226,22 @@ fn content_name_of(seg_name: &str) -> String {
   }
 }
 
-/// The content object's total size: one shard's reserve times the partitions, so each shard owns a
-/// reserve-sized slice for its recovery image (§4.8). The object is lazily backed, so the unused
-/// tail costs address space, not RAM, until an image is published into it.
+/// Slots per shard in the content object: the recovery image is published as a double buffer (§4.8),
+/// so each shard's slice holds two reserve-sized slots — the last committed image and the one being
+/// published. An interrupted publish lands in the non-committed slot, so the committed one always
+/// survives. Two is the minimum for that guarantee (a single slot cannot survive a torn write of
+/// itself); more slots would only add unused space.
+const PUBLISH_SLOTS: usize = 2;
+
+/// The content object's total size: two reserve-sized slots per shard (a double buffer) times the
+/// partitions, so each shard owns space for its committed recovery image and the one it is writing
+/// (§4.8). The object is lazily backed, so the unused tail costs address space, not RAM, until an
+/// image is published into it.
 fn content_bytes(config: &DaemonConfig) -> usize {
   let per_shard = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX);
-  per_shard.saturating_mul(usize::from(config.geometry.partitions.max(1)))
+  per_shard
+    .saturating_mul(PUBLISH_SLOTS)
+    .saturating_mul(usize::from(config.geometry.partitions.max(1)))
 }
 
 fn handoff_of(env: &[(String, String)]) -> Result<(Handoff, usize), ServerError> {

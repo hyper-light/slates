@@ -103,17 +103,21 @@ volume.
    the multi-chunk file through the inode number handed out before the "restart" — the
    write→[image]→[drop]→[rebuild]→read proof at the library level. Non-vacuity of the oracle was
    checked by injecting a dropped-attribute-restore bug and confirming the round trip then fails.
-5. **Content-object framing and handoff survival.** *(Landed, `crates/vfs/src/recover.rs`
-   `write_to`/`read_from`.)* An image is published into a content-object buffer behind a small frame
-   — a little-endian byte length and a CRC-32C of the image bytes — so a restarted daemon finds it,
-   an empty (fresh) object reads as `None` (nothing to recover, start a new volume rather than fail),
-   and a write torn by a crash is caught by the CRC and refused with `RecoveryIncomplete` rather than
-   decoded to garbage (§4.8: never an empty success). Gated `crates/vfs/tests/recover.rs`: a volume
-   survives a real `SharedObject` **handoff** — the memory-level shape of a daemon restart with the
-   anchor surviving (slice 1's property) — its bytes read back through their original inode number
-   after the writer's mapping is dropped, and the frame signals empty, reads back, refuses a torn
-   write and refuses too small a buffer. This is Ada's step-two proof at the library level, through
-   the actual restart-surviving primitive; only the server/client process lifecycle is left to wire.
+5. **Atomic double-buffered publication and handoff survival.** *(Landed, `crates/vfs/src/recover.rs`
+   `write_to`/`read_from`, `publish_committed`/`recover_committed`.)* An image is published into a
+   content-object buffer as an **atomic double buffer**: the buffer is two slots, each a frame (a
+   little-endian byte length, a CRC-32C, then a generation-tagged payload `[u64 generation ++ image]`).
+   A publish writes the slot that does *not* hold the last committed image, and the commit *is* the
+   CRC becoming valid over the new payload — so a publish interrupted or torn by a crash leaves that
+   slot's CRC wrong (ignored on recovery) while the other slot, untouched, still carries the last
+   committed image. Recovery reads the CRC-valid slot with the higher generation; a fresh object reads
+   as `None` (nothing to recover, start a new volume rather than fail); a slot that is CRC-valid but
+   decodes wrong is `RecoveryIncomplete`, never a false success (§4.8). Gated
+   `crates/vfs/tests/recover.rs`: a volume survives a real `SharedObject` **handoff** (slice 1's
+   property), and `an_interrupted_publish_preserves_the_last_committed_image` proves the atomicity —
+   commit an image, tear the next publish's slot, and recovery reads back the *committed* image, not a
+   torn or empty one; a retry then commits; both slots torn read as `None` (the caller refuses); too
+   small a buffer refuses the publish without touching the committed slot.
 6. **Whole-shard image.** *(Landed, `crates/vfs/src/recover.rs` `ShardImage`/`KeyedImage`.)* A shard
    holds many volumes in one store and has one content object, so it publishes them all together: a
    `ShardImage` is the volumes in key order, each a `KeyedImage` pairing the volume's image with an
@@ -124,7 +128,8 @@ volume.
    key and each rebuilt faithfully. This is the format the daemon wiring needs, so that wiring is one
    correct integration rather than a single-volume version later replaced.
 7. **Daemon/content-object wiring.** *(Landed, `crates/server`, `crates/anchor`, `crates/cli`.)* The
-   anchor creates one content object sized `partitions × reserve_per_shard` (lazily backed, so the
+   anchor creates one content object sized `partitions × PUBLISH_SLOTS × reserve_per_shard`
+   (`PUBLISH_SLOTS = 2`, the double buffer's committed and in-flight slots; lazily backed, so the
    unused tail costs address space, not RAM) and hands it off with the segment; `SegmentSource`
    carries the content handoff so a daemon that attaches by handoff (the restart test) adopts it too.
    `init_shard` opens the object and takes this shard's slice (`ShardState.content`/`content_range`).
@@ -145,13 +150,16 @@ volume.
   the mount adds is the last process hop. Until then the control path proves catalog, roots and prefix
   recovery across a real restart.
 - **§4.2 admission accounting and content-object sizing.** The object is sized at a derived
-  `partitions × reserve_per_shard`; the fuller §4.2 admission invariant (physically-backed
-  entitlement, the resource vector, typed refusals) and a tighter, non-doubling size (content resident
-  once via `Region::shared` rather than copied into the image) are owed (BUG-1/2/3 and the in-place
-  refinement).
-- **Crash-during-publish (double buffering).** The single-slot frame detects a torn write but does
-  not keep the prior good image across one; the database's two-slot, sequence-numbered publish
-  (`replay.rs`) is the pattern to adopt so a crash mid-publish recovers the last complete image.
+  `partitions × PUBLISH_SLOTS × reserve_per_shard` — the doubling is intentional, the price of atomic
+  double-buffered publication (the committed image plus the one being written). The fuller §4.2
+  admission invariant (physically-backed entitlement, the resource vector, typed refusals) and a
+  refinement that avoids copying content into the image at all (content resident once via
+  `Region::shared`, the image carrying references) are owed (BUG-1/2/3 and the in-place refinement).
+- **Crash-during-publish (double buffering).** *(Landed, `crates/vfs/src/recover.rs`.)* Publication
+  is a two-slot, generation-tagged double buffer: a publish writes the non-committed slot and commits
+  by making its CRC valid, so a crash mid-publish leaves the last complete image in the other slot.
+  Gated by `an_interrupted_publish_preserves_the_last_committed_image` and, at the production
+  `ShardImage` seam the daemon publishes through, `an_interrupted_shard_publish_preserves_the_last_committed_shard`.
 - **Snapshot recovery.** *(Landed.)* `to_image`/`from_image` capture and rebuild every CoW snapshot
   with the tree frozen at it; ids (slot + generation) are reproduced so a `SnapshotId` a client held
   still resolves — including a snapshot that is *not* the first slot or the survivor of a destroy,

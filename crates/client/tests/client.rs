@@ -255,9 +255,12 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
   let instance = format!("cl-resume-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
   // The test plays the anchor: it holds the segment and its content object across both daemons, so
-  // anchor-owned volume storage survives the restart (§4.8). The content object is one shard's
-  // reserve times the partitions; it is lazily backed, so its unused tail costs no RAM.
+  // anchor-owned volume storage survives the restart (§4.8). The content object is two reserve-sized
+  // slots per shard (the recovery image is a double buffer — the committed image and the one being
+  // published — so a torn publish preserves the committed one) times the partitions; it is lazily
+  // backed, so its unused tail costs no RAM.
   let content_bytes = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX)
+    * 2
     * usize::from(config.geometry.partitions.max(1));
   let segment = AnchorSegment::create(
     "slates-seg-cl-resume",
