@@ -77,3 +77,54 @@ fn a_udp_datagram_is_received_through_the_driver() {
   }
   rt.shutdown();
 }
+
+/// The simulated UDP fabric delivers deterministically at N=1 (§4.10a "sim arm first"): a receiver
+/// awaits recv_from (registering fabric interest), a sender delivers, and the datagram arrives — the
+/// whole plane with no OS network, driven to idle. Uses `slates_rt::sim::SimRuntime`.
+#[test]
+fn a_simulated_udp_datagram_is_received() {
+  use slates_rt::sim::SimRuntime;
+
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+  let (port_tx, port_rx) = channel();
+  let (result_tx, result_rx) = channel();
+
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      // The receiver's bound port, told to the sender before awaiting.
+      let _ = port_tx.send(socket.local_addr().unwrap().port());
+      let mut buf = [0u8; 64];
+      let outcome = socket
+        .recv_from(&mut buf)
+        .await
+        .map(|(n, from)| (buf[..n].to_vec(), from));
+      let _ = result_tx.send(outcome);
+    })
+    .unwrap();
+
+  sim
+    .spawn_on(id, async move {
+      // The receiver runs first (spawn order) and sends its port before awaiting, so it is ready.
+      let port = loop {
+        if let Ok(p) = port_rx.try_recv() {
+          break p;
+        }
+        slates_rt::futures::sleep(1_000).await;
+      };
+      let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = sender.send_to(b"simping", SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    })
+    .unwrap();
+
+  sim.run_until_idle();
+
+  match result_rx.try_recv() {
+    Ok(Ok((bytes, from))) => {
+      assert_eq!(bytes, b"simping", "the simulated datagram arrived");
+      assert_ne!(from.port(), 0, "with the sender's fabric port");
+    }
+    other => panic!("the simulated recv did not complete: {other:?}"),
+  }
+}

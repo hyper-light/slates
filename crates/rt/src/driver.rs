@@ -119,6 +119,12 @@ pub trait Driver {
   /// Whether a `wait` would return a completion or a kick without blocking, as far as the driver
   /// can tell without a syscall (an idle loop skips the wait when this is false).
   fn has_pending(&self) -> bool;
+
+  /// Whether this is the simulation driver, so a `UdpSocket` uses the deterministic in-memory fabric
+  /// instead of a real socket (§4.10a). Only the simulation driver overrides this.
+  fn is_sim(&self) -> bool {
+    false
+  }
 }
 
 /// What builds a driver on the shard's thread: a closure the runtime prepared with the OS

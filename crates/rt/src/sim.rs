@@ -21,6 +21,98 @@ use crate::task::SpawnRequest;
 /// Format: the "no deadline requested" sentinel.
 const NO_DEADLINE: u64 = u64::MAX;
 
+use std::cell::RefCell;
+use std::collections::{BTreeMap, VecDeque};
+
+use slates_mem::Encoded;
+
+/// The simulated UDP fabric (§4.10a): a deterministic, in-memory datagram switch so the fleet plane
+/// is testable at N=1 without the OS network — the "sim arm first" the design's phasing calls for.
+/// It is a thread-local because the simulation runs on one thread (so no `Send`/`Sync`, no lock), and
+/// wakes a waiting receiver through the registry, the same path a real driver completion takes.
+#[derive(Debug, Default)]
+pub struct SimFabric {
+  next_port: u16,
+  mailboxes: BTreeMap<u16, VecDeque<(Vec<u8>, u16)>>,
+  interests: BTreeMap<u16, u64>,
+}
+
+impl SimFabric {
+  fn new() -> SimFabric {
+    SimFabric {
+      // Ports start at 1 so 0 stays the "unspecified" address, as in the OS.
+      next_port: 1,
+      mailboxes: BTreeMap::new(),
+      interests: BTreeMap::new(),
+    }
+  }
+
+  fn bind(&mut self) -> u16 {
+    let port = self.next_port;
+    self.next_port = self.next_port.saturating_add(1);
+    self.mailboxes.entry(port).or_default();
+    port
+  }
+
+  /// Delivers a datagram to `dest`; returns a waker word to wake if a receiver was waiting on it.
+  fn send(&mut self, dest: u16, bytes: &[u8], from: u16) -> Option<u64> {
+    self
+      .mailboxes
+      .entry(dest)
+      .or_default()
+      .push_back((bytes.to_vec(), from));
+    self.interests.remove(&dest)
+  }
+
+  fn recv(&mut self, port: u16) -> Option<(Vec<u8>, u16)> {
+    self.mailboxes.get_mut(&port)?.pop_front()
+  }
+
+  /// Records one-shot read interest; returns a waker word to wake now if a datagram already waits.
+  fn register(&mut self, port: u16, word: u64) -> Option<u64> {
+    if self.mailboxes.get(&port).is_some_and(|q| !q.is_empty()) {
+      return Some(word);
+    }
+    self.interests.insert(port, word);
+    None
+  }
+}
+
+thread_local! {
+  static SIM_FABRIC: RefCell<SimFabric> = RefCell::new(SimFabric::new());
+}
+
+/// Resets the thread's simulated UDP fabric (a fresh simulation starts with an empty network).
+pub(crate) fn sim_fabric_reset() {
+  SIM_FABRIC.with(|f| *f.borrow_mut() = SimFabric::new());
+}
+
+/// Binds a simulated UDP port on this thread's fabric.
+pub fn sim_udp_bind() -> u16 {
+  SIM_FABRIC.with(|f| f.borrow_mut().bind())
+}
+
+/// Sends a simulated datagram, waking a waiting receiver through the registry.
+pub fn sim_udp_send(dest: u16, bytes: &[u8], from: u16) {
+  let wake = SIM_FABRIC.with(|f| f.borrow_mut().send(dest, bytes, from));
+  if let Some(word) = wake {
+    crate::registry::wake(Encoded::from_word(word));
+  }
+}
+
+/// Receives one simulated datagram, or `None` when the mailbox is empty.
+pub fn sim_udp_recv(port: u16) -> Option<(Vec<u8>, u16)> {
+  SIM_FABRIC.with(|f| f.borrow_mut().recv(port))
+}
+
+/// Registers one-shot read interest, waking now (through the registry) if a datagram already waits.
+pub fn sim_udp_register(port: u16, word: u64) {
+  let wake = SIM_FABRIC.with(|f| f.borrow_mut().register(port, word));
+  if let Some(word) = wake {
+    crate::registry::wake(Encoded::from_word(word));
+  }
+}
+
 /// The state a simulated driver shares with its kick and the simulation clock.
 #[derive(Debug)]
 pub struct SimShared {
@@ -122,17 +214,23 @@ impl Driver for SimDriver {
     Ok(())
   }
 
-  fn register_readable(&mut self, _raw: i32, _user_data: u64) -> Result<(), RtError> {
-    // Owed (§4.10a): this completion-native driver does not carry socket readiness yet; a
-    // typed refusal, never a silent drop. The readiness-native drivers (kqueue, epoll) do.
-    Err(RtError::DriverRefused {
+  fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
+    // The simulated UDP fabric (§4.10a): the raw handle is a sim port; interest is recorded there and
+    // woken through the registry when a datagram arrives — the same wake path a real completion takes.
+    let port = u16::try_from(raw).map_err(|_| RtError::DriverRefused {
       call: "register_readable",
       code: None,
-    })
+    })?;
+    sim_udp_register(port, user_data);
+    Ok(())
   }
 
   fn has_pending(&self) -> bool {
     !self.nops.is_empty() || self.shared.kicked.load(Ordering::Acquire)
+  }
+
+  fn is_sim(&self) -> bool {
+    true
   }
 }
 
@@ -154,6 +252,8 @@ impl std::fmt::Debug for SimRuntime {
 impl SimRuntime {
   /// Builds `config.shards` simulated shards sharing one clock seeded by `seed`.
   pub fn new(config: &RuntimeConfig, seed: u64) -> Result<SimRuntime, RtError> {
+    // A fresh simulation starts with an empty UDP fabric on this thread.
+    sim_fabric_reset();
     let clock: &'static SimShared = Box::leak(Box::new(SimShared::new(seed)));
     let mut seeds = Vec::new();
     let mut shared = Vec::new();

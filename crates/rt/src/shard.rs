@@ -482,6 +482,13 @@ impl ShardContext {
       .ok_or(RtError::NotOnShardThread)?
   }
 
+  /// Whether this shard runs the simulation driver (so a `UdpSocket` uses the in-memory fabric).
+  pub fn driver_is_sim(&self) -> bool {
+    self
+      .with_inner(|inner| inner.driver.is_sim())
+      .unwrap_or(false)
+  }
+
   /// Disarms a timer.
   pub fn disarm_timer(&self, id: crate::timer::TimerId) -> Result<(), RtError> {
     self
