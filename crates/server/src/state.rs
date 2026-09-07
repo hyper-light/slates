@@ -13,6 +13,8 @@ use slates_ipc::DaemonEnd;
 use slates_ipc::protocol::ReplyBody;
 use slates_mem::SharedObject;
 use slates_mem::Slab;
+use slates_merge::engine::Green;
+use slates_merge::increment::VolumeOp;
 use slates_vfs::volume::{Store, Volume};
 
 use crate::config::DaemonConfig;
@@ -139,6 +141,24 @@ pub struct ShardState {
   /// Forwards refused by a full control channel, kept to retry (backpressure, never a drop);
   /// bounded by the clients' credit, refused typed beyond it.
   pub pending_forwards: std::collections::VecDeque<PendingForward>,
+  /// Green volumes' merge engines (§4.16): the in-memory chain and per-path state a green owns,
+  /// keyed by its id. A green is not a store-backed VFS tree; its merged content lives here.
+  pub greens: BTreeMap<VolumeId, Green>,
+  /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
+  /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.
+  pub works: BTreeMap<VolumeId, WorkState>,
+}
+
+/// A work volume's accumulated declared operations (§4.16), composed into an increment on submit.
+pub struct WorkState {
+  /// The green this work is over.
+  pub green: VolumeId,
+  /// The green version the work is based on.
+  pub base_version: u64,
+  /// The declared operations, in order.
+  pub journal: Vec<VolumeOp>,
+  /// The post-state bytes the content operations name by offset.
+  pub post: Vec<u8>,
 }
 
 /// A reply waiting to be written into a client's ring.

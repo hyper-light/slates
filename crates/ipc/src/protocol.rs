@@ -116,6 +116,18 @@ pub enum RequestBody {
     /// The snapshot.
     snapshot: SnapshotId,
   },
+  /// Create a green volume — a shared merge target many work volumes submit increments into (§4.16).
+  CreateGreen {
+    /// The name.
+    name: String,
+    /// Whether an increment must carry evidence to be accepted.
+    require_evidence: bool,
+  },
+  /// A green's version chain: its head version (and, later, the records from `from`).
+  Versions {
+    /// The green.
+    green: VolumeId,
+  },
   /// Clone a snapshot into a new volume.
   Clone {
     /// The volume.
@@ -537,6 +549,16 @@ pub enum ReplyBody {
   },
   /// A snapshot was destroyed.
   SnapshotDestroyed,
+  /// A green volume was created.
+  GreenCreated {
+    /// The id.
+    id: VolumeId,
+  },
+  /// A green's version chain state.
+  Versions {
+    /// The head version.
+    head: u64,
+  },
   /// Cloned.
   Cloned {
     /// The clone's id.

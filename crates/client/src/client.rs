@@ -392,6 +392,31 @@ impl Client {
     }
   }
 
+  /// Creates a green volume — a shared merge target (§4.16); its id.
+  pub fn create_green(
+    &mut self,
+    name: &str,
+    require_evidence: bool,
+  ) -> Result<VolumeId, ClientError> {
+    match self.call(&RequestBody::CreateGreen {
+      name: name.to_owned(),
+      require_evidence,
+    })? {
+      ReplyBody::GreenCreated { id } => Ok(id),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "create_green",
+      }),
+    }
+  }
+
+  /// A green's head version (§4.16 merge chain).
+  pub fn versions(&mut self, green: VolumeId) -> Result<u64, ClientError> {
+    match self.call(&RequestBody::Versions { green })? {
+      ReplyBody::Versions { head } => Ok(head),
+      _ => Err(ClientError::UnexpectedReply { verb: "versions" }),
+    }
+  }
+
   /// Clones a snapshot into a new volume; the clone's id.
   pub fn clone_snapshot(
     &mut self,

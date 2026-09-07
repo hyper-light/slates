@@ -370,6 +370,8 @@ fn init_shard(
     status_scatters: std::collections::BTreeMap::new(),
     last_work_ns: now,
     pending_forwards: std::collections::VecDeque::new(),
+    greens: std::collections::BTreeMap::new(),
+    works: std::collections::BTreeMap::new(),
     ack_scatters: std::collections::BTreeMap::new(),
   };
   let rebuilt = verbs::rebuild_recovered(&mut state);

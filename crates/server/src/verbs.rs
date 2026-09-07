@@ -181,6 +181,7 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
   match body {
     RequestBody::Snapshot { volume }
     | RequestBody::DestroySnapshot { volume, .. }
+    | RequestBody::Versions { green: volume }
     | RequestBody::Clone { volume, .. }
     | RequestBody::Attach { volume, .. }
     | RequestBody::Resize { volume, .. }
@@ -192,6 +193,7 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::AwaitPlaced { volume, .. }
     | RequestBody::Land { volume, .. } => Some(*volume),
     RequestBody::Create { .. }
+    | RequestBody::CreateGreen { .. }
     | RequestBody::Detach { .. }
     | RequestBody::List
     | RequestBody::DaemonStatus
@@ -785,6 +787,7 @@ fn mutates_shard_image(body: &RequestBody) -> bool {
   matches!(
     body,
     RequestBody::Create { .. }
+      | RequestBody::CreateGreen { .. }
       | RequestBody::Clone { .. }
       | RequestBody::Resize { .. }
       | RequestBody::Destroy { .. }
@@ -835,6 +838,11 @@ fn dispatch_inner(
     RequestBody::DestroySnapshot { volume, snapshot } => {
       destroy_snapshot_verb(state, principal, volume, snapshot)
     }
+    RequestBody::CreateGreen {
+      name,
+      require_evidence,
+    } => create_green(state, principal, &name, require_evidence),
+    RequestBody::Versions { green } => versions(state, principal, green),
     RequestBody::Clone {
       volume,
       snapshot,
@@ -1350,6 +1358,76 @@ fn destroy_snapshot_verb(
     return refused(refusal_of_db(&e));
   }
   ReplyBody::SnapshotDestroyed
+}
+
+/// Creates a green volume (§4.16): a shared merge target. It is not a store-backed VFS tree — its
+/// merged content lives in the in-memory merge engine kept in `state.greens`, keyed by the id — so it
+/// takes no byte or version reservation. The catalog records the `Green` role and its head version.
+fn create_green(
+  state: &mut ShardState,
+  principal: &Principal,
+  name: &str,
+  require_evidence: bool,
+) -> ReplyBody {
+  if let Some(existing) = state.db.partition().volume_by_name(name) {
+    return refused(Refusal::AlreadyExists {
+      existing: to_wire_volume(existing.id),
+    });
+  }
+  let id = fresh_volume_id(state);
+  let record = VolumeRecord {
+    id,
+    name: name.to_owned(),
+    owner_shard: state.partition,
+    policy: PolicyRecord {
+      size: db_size(SizeClass::Dynamic { max: 0 }),
+      names: DbNamePolicy::Exact,
+      require_locked: false,
+      role: Role::Green {
+        require_evidence,
+        head_version: 0,
+      },
+    },
+    base: BaseRecord::Scratch,
+    head: DbSnapshotId::default(),
+    epoch: 0,
+    referenced_bytes: 0,
+    unique_bytes: 0,
+    state: VolumeState::Live,
+    lease: None,
+    owner: principal.clone(),
+    access: Vec::new(),
+    created_ns: state.clock.monotonic_ns(),
+  };
+  let now = state.clock.monotonic_ns();
+  if let Err(e) = state
+    .db
+    .mutate(&mut state.segment, &Op::VolumeCreated { record }, now)
+  {
+    return refused(refusal_of_db(&e));
+  }
+  state.greens.insert(id, slates_merge::engine::Green::new());
+  ReplyBody::GreenCreated {
+    id: to_wire_volume(id),
+  }
+}
+
+/// A green's version chain (§4.16): its head version. The read side of the chain — `changed_since`
+/// and the per-version records follow. Answered by the green's owner shard, which holds the engine.
+fn versions(state: &ShardState, principal: &Principal, green: VolumeId) -> ReplyBody {
+  let id = to_db_volume(green);
+  let Some(record) = state.db.partition().volume(id) else {
+    return refused(Refusal::NotFound);
+  };
+  if !rights_of(record, principal).read {
+    return forbidden("versions");
+  }
+  let Some(engine) = state.greens.get(&id) else {
+    return refused(Refusal::NotFound);
+  };
+  ReplyBody::Versions {
+    head: engine.head(),
+  }
 }
 
 fn clone(

@@ -19,6 +19,7 @@ slates-anchor = { workspace = true }
 slates-db = { workspace = true }
 slates-ipc = { workspace = true }
 slates-land = { workspace = true }
+slates-merge = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }

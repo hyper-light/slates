@@ -463,6 +463,7 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
   version_reservation_moves_on_resize_scenario();
   version_stats_scenario();
   snapshot_destroy_scenario();
+  green_chain_scenario();
 }
 
 /// Shape: a version slab large enough to physically hold several volumes' inode and trie nodes, yet
@@ -714,5 +715,33 @@ fn snapshot_destroy_scenario() {
     ),
     "the pin released by the clone's destroy, the snapshot is destroyed"
   );
+  daemon.stop();
+}
+
+/// The merge chain's read side (§4.16 Phase 6 Task 1): a fresh green volume exists and reports
+/// version 0. The green's owner shard holds its merge engine; `versions` routes to it.
+fn green_chain_scenario() {
+  let (daemon, instance) = daemon("green");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::GreenCreated { id } = client.call(&RequestBody::CreateGreen {
+    name: "g".to_owned(),
+    require_evidence: false,
+  }) else {
+    panic!("create green");
+  };
+  // A duplicate name is refused, like any volume.
+  assert!(matches!(
+    client.call(&RequestBody::CreateGreen {
+      name: "g".to_owned(),
+      require_evidence: false,
+    }),
+    ReplyBody::Refused {
+      refusal: Refusal::AlreadyExists { .. }
+    }
+  ));
+  let ReplyBody::Versions { head } = client.call(&RequestBody::Versions { green: id }) else {
+    panic!("versions");
+  };
+  assert_eq!(head, 0, "a fresh green is at version 0");
   daemon.stop();
 }
