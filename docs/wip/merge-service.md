@@ -99,10 +99,13 @@ than clobbering it. Non-vacuous — a broken verdict would accept both.
   `rebase`/`versions`/`changed_since`, plus `slates.help`) and the volume lifecycle
   (`slates.volume.create`/`list`/`stat`/`snapshot`/`clone`/`resize`/`destroy` and `slates.status`)
   over the client SDK, run by `slates mcp` over stdio. No tool creates a grant (R10) — none is
-  offered. Gated in `crates/mcp/tests/mcp.rs` (one serial daemon: the handshake, the whole merge loop
-  with a concurrent conflict, the volume lifecycle, and typed JSON-RPC errors for a bad tool or id).
-  **Owed:** the rest of the §4.12 tool set (`slates.attach`/`fs`/`base`/`land`), Streamable HTTP,
-  resources and prompts, and the Python/TypeScript SDKs.
+  offered — `slates.land.materialize` plans a landing and returns `GrantRequired` (the manifest and the
+  `slates grant` command a human runs), never a grant. Gated in `crates/mcp/tests/mcp.rs` (one serial
+  daemon: the handshake, the whole merge loop with a concurrent conflict, the volume lifecycle, a
+  landing to an unopenable target surfacing the typed refusal, and typed JSON-RPC errors for a bad tool
+  or id). **Owed:** the remaining §4.12 tools (`slates.attach`/`fs`/`base`), the successful
+  plan-grant-execute landing path (the server's Linux lane), Streamable HTTP, resources and prompts,
+  and the Python/TypeScript SDKs.
 - **Access control on the merge verbs** is owed and consistent across all of them: `create_work`,
   `edit`, `declare`, `submit` and `rebase` do not yet consult the §4.13 rights the store-backed verbs
   do. The natural rule under the clone-owner model is read on the green for `create_work` (a clone),

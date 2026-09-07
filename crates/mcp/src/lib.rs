@@ -18,8 +18,8 @@
 
 use serde_json::{Value, json};
 use slates_client::{
-  Client, ClientError, CreateSpec, DaemonReport, NamePolicy, Rebased, SizeClass, SnapshotId,
-  StatusReport, Submitted, VolumeId, VolumeSummary,
+  Client, ClientError, CreateSpec, DaemonReport, Filter, Landing, LandingOutcome, LandingSummary,
+  NamePolicy, Rebased, SizeClass, SnapshotId, StatusReport, Submitted, VolumeId, VolumeSummary,
 };
 
 /// The MCP protocol version this server speaks (the dated revision it targets, §4.12).
@@ -107,6 +107,7 @@ impl McpServer {
       "slates.volume.clone" => self.clone_volume(&args),
       "slates.volume.resize" => self.resize_volume(&args),
       "slates.volume.destroy" => self.destroy_volume(&args),
+      "slates.land.materialize" => self.land_materialize(&args),
       "slates.status" => self.status(),
       other => {
         return Err(McpError {
@@ -248,6 +249,46 @@ impl McpServer {
   fn status(&mut self) -> Result<Value, McpError> {
     let report = self.client.daemon_status().map_err(refusal)?;
     Ok(daemon_json(&report))
+  }
+
+  /// Plans a landing onto a host directory (§4.15). MCP never passes a grant (R10), so the reply is
+  /// `GrantRequired` — the manifest and summary a human reviews, and the `slates grant` command that
+  /// authorizes it — or `Landed` when there is nothing diverged to write. The grant itself is a
+  /// human-only act on the CLI; this tool cannot make one.
+  fn land_materialize(&mut self, args: &Value) -> Result<Value, McpError> {
+    let volume = volume_arg(args, "volume")?;
+    let target = string_arg(args, "target")?;
+    let snapshot = args
+      .get("snapshot")
+      .and_then(Value::as_u64)
+      .map(|value| SnapshotId { value });
+    let filter = Filter {
+      include: string_list(args, "include"),
+      exclude: string_list(args, "exclude"),
+    };
+    match self
+      .client
+      .land(volume, snapshot, &target, filter, None)
+      .map_err(refusal)?
+    {
+      Landing::GrantRequired {
+        landing,
+        manifest,
+        summary,
+        conflicts,
+      } => Ok(json!({
+        "grant_required": true,
+        "landing": landing,
+        "manifest": hex32(&manifest),
+        "summary": landing_summary_json(&summary),
+        "conflicts": conflicts,
+        "grant_with": format!("slates grant {landing}"),
+      })),
+      Landing::Landed(outcome) => Ok(json!({
+        "grant_required": false,
+        "outcome": outcome_json(&outcome),
+      })),
+    }
   }
 }
 
@@ -396,6 +437,19 @@ fn tool_list() -> Vec<Value> {
       json!(["volume"]),
     ),
     tool(
+      "slates.land.materialize",
+      "Plan a landing of a volume's diverged entries onto a host directory. Returns the manifest and \
+       the `slates grant` command a human runs to authorize it — this tool never grants (R10).",
+      json!({
+        "volume": string,
+        "target": string,
+        "snapshot": integer,
+        "include": { "type": "array", "items": string },
+        "exclude": { "type": "array", "items": string },
+      }),
+      json!(["volume", "target"]),
+    ),
+    tool(
       "slates.status",
       "The daemon's status: generation, restarts, shard count.",
       json!({}),
@@ -483,6 +537,47 @@ fn status_json(r: &StatusReport) -> Value {
       "mirror_age_ns": r.placed.mirror_age_ns,
     },
   })
+}
+
+/// A landing's summary as JSON: entries per action, bytes to write, and entries the filter excluded.
+fn landing_summary_json(s: &LandingSummary) -> Value {
+  json!({
+    "by_action": s.by_action.iter().map(|a| json!({ "action": a.action, "count": a.count })).collect::<Vec<_>>(),
+    "bytes": s.bytes,
+    "filtered_out": s.filtered_out,
+  })
+}
+
+/// A finished landing's outcome as JSON.
+fn outcome_json(o: &LandingOutcome) -> Value {
+  json!({
+    "landing": o.landing,
+    "state": o.state,
+    "written": o.written,
+    "skipped": o.skipped,
+    "conflicts": o.conflicts,
+    "failed": o.failed,
+    "bytes_written": o.bytes_written,
+  })
+}
+
+/// A required-or-empty list-of-strings argument (e.g. a landing filter's includes).
+fn string_list(args: &Value, key: &str) -> Vec<String> {
+  args
+    .get(key)
+    .and_then(Value::as_array)
+    .map(|items| {
+      items
+        .iter()
+        .filter_map(|v| v.as_str().map(str::to_owned))
+        .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Format: a 32-byte hash as 64 lowercase hex characters.
+fn hex32(bytes: &[u8; 32]) -> String {
+  bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The daemon's status as JSON (the top-level counters and the shard count).

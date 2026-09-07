@@ -74,6 +74,7 @@ fn assert_protocol(server: &mut McpServer) {
     .collect();
   assert!(names.contains(&"slates.merge.submit".to_owned()));
   assert!(names.contains(&"slates.volume.create".to_owned()));
+  assert!(names.contains(&"slates.land.materialize".to_owned()));
   assert!(
     !names.iter().any(|n| n.contains("grant")),
     "no grant tool is offered: {names:?}"
@@ -200,6 +201,33 @@ fn assert_volume_lifecycle(server: &mut McpServer) {
   assert_eq!(status["shards"], 2);
 }
 
+/// A landing planned over MCP: to a target that cannot be opened, the tool surfaces the daemon's
+/// typed refusal as a JSON-RPC error (the full plan-grant-execute flow needs a real target and the
+/// control channel, exercised in the server's Linux landing lane). No grant is ever created (R10).
+fn assert_land(server: &mut McpServer) {
+  let volume = call(
+    server,
+    "slates.volume.create",
+    json!({ "name": "land-v", "bounded": 1 << 20 }),
+  )["volume"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  let reply = server
+    .handle(&json!({
+      "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+      "params": {
+        "name": "slates.land.materialize",
+        "arguments": { "volume": volume, "target": "/nonexistent/slates/mcp/target" },
+      },
+    }))
+    .unwrap();
+  assert_eq!(
+    reply["error"]["code"], -32000,
+    "an unopenable target is a typed refusal: {reply}"
+  );
+}
+
 /// Malformed calls are typed JSON-RPC errors, not panics: an unknown tool, a bad volume id, and an
 /// unknown method.
 fn assert_malformed(server: &mut McpServer) {
@@ -251,6 +279,7 @@ fn the_mcp_surface_serves_the_tools() {
   assert_protocol(&mut server);
   assert_merge_loop(&mut server);
   assert_volume_lifecycle(&mut server);
+  assert_land(&mut server);
   assert_malformed(&mut server);
 
   daemon.stop();
