@@ -1,7 +1,7 @@
 //! The client verbs: one connection, one request, the reply printed in a stable plain form.
 
 use slates_client::{
-  Client, ClientError, CreateSpec, DaemonReport, Deadlines, StatusReport, VolumeSummary,
+  Client, ClientError, CreateSpec, DaemonReport, Deadlines, StatusReport, Submitted, VolumeSummary,
 };
 use slates_db::replay::RECOVERY_BUDGET_NS;
 use slates_server::daemon::LIVENESS_BUDGET_NS;
@@ -29,6 +29,57 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
   let mut client = connect(&request.instance)?;
   let outcome = serve(&mut client, &request.verb);
   outcome.map_err(|e| failure_of(e, &request.instance))
+}
+
+/// The merge verbs (§4.16), split out to keep [`serve`] under the cognitive-complexity bound.
+fn serve_merge(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
+  match verb {
+    Verb::Green { name, evidence } => {
+      let id = client.create_green(name, *evidence)?;
+      println!("id: {}", volume_id_text(id));
+    }
+    Verb::Versions { green } => {
+      println!("head: {}", client.versions(*green)?);
+    }
+    Verb::ChangedSince { green, version } => {
+      for path in client.changed_since(*green, *version)? {
+        println!("{path}");
+      }
+    }
+    Verb::Work { green, name } => {
+      let (id, base) = client.create_work(*green, name)?;
+      println!("id: {}", volume_id_text(id));
+      println!("base: {base}");
+    }
+    Verb::Edit {
+      work,
+      path,
+      at,
+      delete_len,
+      bytes,
+    } => {
+      client.edit(*work, path, *at, *delete_len, bytes)?;
+      println!("edited");
+    }
+    Verb::Submit { work } => match client.submit(*work)? {
+      Submitted::Accepted(version) => println!("accepted: {version}"),
+      Submitted::Conflict(windows) => {
+        println!("conflict:");
+        for window in windows {
+          println!(
+            "  {} [{}..{}] class {}",
+            window.path,
+            window.at,
+            window.at + window.len,
+            window.class
+          );
+        }
+      }
+    },
+    // Only the merge verbs above reach here.
+    _ => {}
+  }
+  Ok(())
 }
 
 fn serve(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
@@ -75,6 +126,12 @@ fn serve(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
       client.destroy_snapshot(*volume, *snapshot)?;
       println!("snapshot destroyed");
     }
+    Verb::Green { .. }
+    | Verb::Versions { .. }
+    | Verb::ChangedSince { .. }
+    | Verb::Work { .. }
+    | Verb::Edit { .. }
+    | Verb::Submit { .. } => serve_merge(client, verb)?,
     Verb::Placed {
       volume,
       snapshot,

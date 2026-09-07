@@ -22,6 +22,12 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   volume clone ID SNAPSHOT NAME
   volume resize ID (--bounded SIZE | --dynamic MAX)
   volume destroy ID
+  green NAME                                        create a green merge target
+  versions GREEN                                   its head version
+  changed-since GREEN VERSION                       files changed since a version
+  work GREEN NAME                                  a work volume over a green
+  edit WORK PATH AT DELETE TEXT                     declare an edit (a splice)
+  submit WORK                                       submit a work's increment
   volume placed ID [--snapshot N] [--mirror]         await a durability scope
   attach ID [--read | --write] [--snapshot N]
   detach ATTACHMENT
@@ -138,6 +144,50 @@ pub(crate) enum Verb {
     volume: slates_client::VolumeId,
     /// The snapshot.
     snapshot: slates_client::SnapshotId,
+  },
+  /// Create a green volume (§4.16 merge).
+  Green {
+    /// The name.
+    name: String,
+    /// Whether an increment must carry evidence.
+    evidence: bool,
+  },
+  /// A green's head version.
+  Versions {
+    /// The green.
+    green: slates_client::VolumeId,
+  },
+  /// The files a green changed since a version.
+  ChangedSince {
+    /// The green.
+    green: slates_client::VolumeId,
+    /// The base version.
+    version: u64,
+  },
+  /// Create a work volume over a green.
+  Work {
+    /// The green.
+    green: slates_client::VolumeId,
+    /// The name.
+    name: String,
+  },
+  /// Declare an edit on a work volume (a splice; the inserted bytes are the text argument).
+  Edit {
+    /// The work volume.
+    work: slates_client::VolumeId,
+    /// The file.
+    path: String,
+    /// The offset.
+    at: u64,
+    /// Bytes removed at the offset.
+    delete_len: u64,
+    /// Bytes inserted.
+    bytes: Vec<u8>,
+  },
+  /// Submit a work volume's increment to its green.
+  Submit {
+    /// The work volume.
+    work: slates_client::VolumeId,
   },
   /// Await a durability scope (`volume placed`).
   Placed {
@@ -453,6 +503,13 @@ fn snapshot(text: &str) -> Result<slates_client::SnapshotId, ParseError> {
   })
 }
 
+fn number(text: &str) -> Result<u64, ParseError> {
+  text.parse().map_err(|_| ParseError::BadValue {
+    what: "a number",
+    reason: text.to_owned(),
+  })
+}
+
 fn paths(words: &[String]) -> Option<Vec<String>> {
   if words.is_empty() {
     None
@@ -618,6 +675,62 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
         .transpose()?
         .unwrap_or(0);
       Ok(client(&taken, Verb::Audit { since }))
+    }
+    ["green", name] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        &taken,
+        Verb::Green {
+          name: (*name).to_owned(),
+          evidence: false,
+        },
+      ))
+    }
+    ["versions", id] => {
+      taken.only(&NONE)?;
+      Ok(client(&taken, Verb::Versions { green: volume(id)? }))
+    }
+    ["changed-since", id, version] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        &taken,
+        Verb::ChangedSince {
+          green: volume(id)?,
+          version: number(version)?,
+        },
+      ))
+    }
+    ["work", green, name] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        &taken,
+        Verb::Work {
+          green: volume(green)?,
+          name: (*name).to_owned(),
+        },
+      ))
+    }
+    ["edit", work, path, at, delete, text] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        &taken,
+        Verb::Edit {
+          work: volume(work)?,
+          path: (*path).to_owned(),
+          at: number(at)?,
+          delete_len: number(delete)?,
+          bytes: (*text).as_bytes().to_vec(),
+        },
+      ))
+    }
+    ["submit", work] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        &taken,
+        Verb::Submit {
+          work: volume(work)?,
+        },
+      ))
     }
     [verb, rest @ ..]
       if matches!(
@@ -851,6 +964,56 @@ mod tests {
         shards: Some(2),
       }))
     );
+  }
+
+  /// The merge grammar (§4.16): green, work, edit, submit, versions and changed-since parse to
+  /// their verbs.
+  #[test]
+  fn the_grammar_parses_the_merge_verbs() {
+    let verb = |text: &str| -> Verb {
+      let Command::Client(request) = parse(&args(text)).unwrap() else {
+        panic!("client");
+      };
+      request.verb
+    };
+    let id = "00000000000000000000000000000001";
+    let vid = parse_volume_id(id).unwrap();
+    assert_eq!(
+      verb("green shared"),
+      Verb::Green {
+        name: "shared".into(),
+        evidence: false,
+      }
+    );
+    assert_eq!(
+      verb(&format!("versions {id}")),
+      Verb::Versions { green: vid }
+    );
+    assert_eq!(
+      verb(&format!("changed-since {id} 2")),
+      Verb::ChangedSince {
+        green: vid,
+        version: 2,
+      }
+    );
+    assert_eq!(
+      verb(&format!("work {id} w")),
+      Verb::Work {
+        green: vid,
+        name: "w".into(),
+      }
+    );
+    assert_eq!(
+      verb(&format!("edit {id} f 0 5 hello")),
+      Verb::Edit {
+        work: vid,
+        path: "f".into(),
+        at: 0,
+        delete_len: 5,
+        bytes: b"hello".to_vec(),
+      }
+    );
+    assert_eq!(verb(&format!("submit {id}")), Verb::Submit { work: vid });
   }
 
   /// The refusals: a size without a binary unit, an unknown flag, a missing size, an extra

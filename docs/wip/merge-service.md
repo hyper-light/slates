@@ -5,8 +5,7 @@
 > (Phase 6 tasks 1, 6, 7, 8). **Landed:** green volumes and the chain read side (`CreateGreen`,
 > `Versions`, `ChangedSince`); the submit flow (`CreateWork`, `Edit`, `Submit`) for a fresh *and* a
 > non-empty green (derived against the current base), accept and conflict, through the real verbs.
-> **Owed:** `rebase`/`advance`, the CLI verbs, xattr/symlink post-state, the base at an intervening
-> version, cross-shard submit, and chain persistence.
+> **Owed:** `rebase`/`advance`, xattr/symlink post-state, the base at an intervening version, cross-shard submit, chain persistence, and the non-Rust SDKs (the CLI verbs are wired).
 
 ## What is wired (server + ipc + client)
 
@@ -46,7 +45,7 @@ than clobbering it. Non-vacuous — a broken verdict would accept both.
 - **`rebase`, `advance`** (Phase 6 task 7): the corrective rebase mapping a work's pending operations
   to a newer version, and the attachment re-pin with targeted invalidations. (`changed_since` — the
   per-path last-changed index read — is done: `Green::changed_since` and the verb.)
-- **Surfaces (task 8):** the CLI verbs and the SDKs' typed methods beyond the Rust client.
+- **Surfaces (task 8):** the non-Rust SDKs (MCP, Python, TypeScript); the Rust client and the CLI verbs (green, versions, changed-since, work, edit, submit) are wired.
 - **Cross-shard submit and chain persistence:** a work whose green is on another shard forwards the
   increment to the green's owner; and the chain (`VersionRecord`s and `seen`) is recovered from the
   partition log after a restart (task 6's crash recovery). Single-node, same-shard only for now.
