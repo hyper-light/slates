@@ -33,10 +33,13 @@ than clobbering it. Non-vacuous — a broken verdict would accept both.
 
 ## What is owed
 
-- **The general base.** `submit` derives against `Base::default()` — correct only when the green is
-  empty at the work's base version. A work over a non-empty green needs the green's state reconstructed
-  at `base_version` (the engine keeps a content history; a `base_at(version)` accessor is owed) so
-  `compose_volume` sees the base files, dirs, modes, symlinks and xattrs.
+- **The base at an older version.** `submit` derives against the green's base: `Base::default()` at
+  version 0, and the green's current state (`Green::current_base`) when the work's base is the head —
+  and a new work is seeded with the green's content (`Green::files`) so an edit to a base file splices
+  it rather than looking like a create. What is owed is the base at an *intervening* version
+  (`0 < base < head`, a work that lagged behind another's submit): the content history supports it per
+  file, but the other dimensions keep only the current value, so that submit is refused for now rather
+  than composed against the wrong base.
 - **Post-state for non-content dimensions.** `assemble_post_state` handles content ops only; a
   `SetXattr`/`Symlink` increment needs its value bytes laid into the post-state at the op's `src`.
 - **`changed_since`, `rebase`, `advance`** (Phase 6 tasks 1 and 7): the per-path last-changed index

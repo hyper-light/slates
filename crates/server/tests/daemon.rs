@@ -465,6 +465,7 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
   snapshot_destroy_scenario();
   green_chain_scenario();
   merge_submit_scenario();
+  merge_modify_scenario();
 }
 
 /// Shape: a version slab large enough to physically hold several volumes' inode and trie nodes, yet
@@ -813,5 +814,66 @@ fn merge_submit_scenario() {
     conflicts.iter().any(|w| w.path == "f"),
     "B conflicts on the file A committed: {conflicts:?}"
   );
+  daemon.stop();
+}
+
+/// Submitting against a non-empty green (§4.16): a work modifies a file the green already holds
+/// (seeded from the green's content, derived against the green's current base), and it merges. Proof
+/// that submit works past the fresh-green case — the current-base path, not just an empty base.
+fn merge_modify_scenario() {
+  let (daemon, instance) = daemon("merge-mod");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "g2".to_owned(),
+    require_evidence: false,
+  }) else {
+    panic!("create green");
+  };
+  let edit = |client: &mut Client, work, at, delete_len, bytes: &[u8]| {
+    assert!(matches!(
+      client.call(&RequestBody::Edit {
+        work,
+        path: "f".to_owned(),
+        at,
+        delete_len,
+        bytes: bytes.to_vec(),
+      }),
+      ReplyBody::Edited
+    ));
+  };
+  // Seed the green with f = "hello".
+  let ReplyBody::WorkCreated { id: seed, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "seed".to_owned(),
+  }) else {
+    panic!("create work");
+  };
+  edit(&mut client, seed, 0, 0, b"hello");
+  assert!(matches!(
+    client.call(&RequestBody::Submit { work: seed }),
+    ReplyBody::Submitted {
+      version: Some(1),
+      ..
+    }
+  ));
+  // A new work, based on version 1, overwrites f's bytes — it merges against the current base.
+  let ReplyBody::WorkCreated { id: modw, base } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "mod".to_owned(),
+  }) else {
+    panic!("create work");
+  };
+  assert_eq!(base, 1, "the work is based on the green's head, version 1");
+  edit(&mut client, modw, 0, 5, b"world");
+  let ReplyBody::Submitted { version, conflicts } =
+    client.call(&RequestBody::Submit { work: modw })
+  else {
+    panic!("submit");
+  };
+  assert!(
+    conflicts.is_empty(),
+    "the lone modify merges: {conflicts:?}"
+  );
+  assert_eq!(version, Some(2), "the green advanced to version 2");
   daemon.stop();
 }

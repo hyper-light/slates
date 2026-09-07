@@ -1459,6 +1459,12 @@ fn create_work(
     return refused(Refusal::NotFound);
   };
   let base = engine.head();
+  // Seed the work with the green's current content, so an edit to a base file splices what the file
+  // holds rather than looking like a fresh create.
+  let seeded: std::collections::BTreeMap<String, Vec<u8>> = engine
+    .files()
+    .map(|(path, bytes)| (path.to_owned(), bytes.to_vec()))
+    .collect();
   if let Some(existing) = state.db.partition().volume_by_name(name) {
     return refused(Refusal::AlreadyExists {
       existing: to_wire_volume(existing.id),
@@ -1503,7 +1509,7 @@ fn create_work(
       green: green_id,
       base_version: base,
       journal: Vec::new(),
-      content: std::collections::BTreeMap::new(),
+      content: seeded,
     },
   );
   ReplyBody::WorkCreated {
@@ -1614,13 +1620,33 @@ fn assemble_post_state(
 /// the green's merge verdict — accepted with the new version, or the conflict windows to rebase.
 fn submit(state: &mut ShardState, work: VolumeId) -> ReplyBody {
   let work_id = to_db_volume(work);
+  let Some((green_id, base_version)) = state.works.get(&work_id).map(|w| (w.green, w.base_version))
+  else {
+    return refused(Refusal::NotFound);
+  };
+  // The base state the increment is derived against: the green as it was at the work's base version.
+  // Version 0 is the empty green; a submit at the current head derives against the green's current
+  // state. A work that lagged behind an intervening submit (0 < base < head) needs the green
+  // reconstructed at that older version — owed — so it is refused rather than composed wrongly.
+  let base = {
+    let Some(engine) = state.greens.get(&green_id) else {
+      return refused(Refusal::NotFound);
+    };
+    if base_version == 0 {
+      slates_merge::increment::Base::default()
+    } else if base_version == engine.head() {
+      engine.current_base()
+    } else {
+      return refused(Refusal::BadRequest {
+        reason: "submit against an intervening green version needs base reconstruction (owed)"
+          .to_owned(),
+      });
+    }
+  };
   let built = {
     let Some(w) = state.works.get(&work_id) else {
       return refused(Refusal::NotFound);
     };
-    // The base state the increment is derived against. The first version reserves the whole-green
-    // reconstruction at an older base; a submit at the current head derives against an empty base.
-    let base = slates_merge::increment::Base::default();
     let doc = match slates_merge::increment::compose_volume(&base, &w.journal) {
       Ok(doc) => doc,
       Err(e) => {
@@ -1634,17 +1660,14 @@ fn submit(state: &mut ShardState, work: VolumeId) -> ReplyBody {
     hasher.update(&doc.encode());
     hasher.update(&post_state);
     let id = *hasher.finalize().as_bytes();
-    (
-      w.green,
-      slates_merge::engine::Increment {
-        id,
-        base: w.base_version,
-        doc,
-        post_state,
-      },
-    )
+    slates_merge::engine::Increment {
+      id,
+      base: base_version,
+      doc,
+      post_state,
+    }
   };
-  let (green_id, inc) = built;
+  let inc = built;
   let Some(engine) = state.greens.get_mut(&green_id) else {
     return refused(Refusal::NotFound);
   };

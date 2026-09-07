@@ -224,9 +224,54 @@ impl Green {
     self.deltas.len() as u64
   }
 
+  /// The green's current state as a deriver [`Base`](crate::increment::Base) — every file with its
+  /// content length, and the directories, modes, symlinks, hard links and xattrs — so an increment
+  /// based on the head can be composed against what the green actually holds. (Reconstructing the
+  /// base at an *older* version, for a work that lagged behind an intervening submit, is owed: the
+  /// content history supports it per file, but the other dimensions keep only the current value.)
+  pub fn current_base(&self) -> crate::increment::Base {
+    crate::increment::Base {
+      files: self
+        .content
+        .iter()
+        .map(|(path, bytes)| (path.clone(), bytes.len() as u64))
+        .collect(),
+      dirs: self.dirs.iter().cloned().collect(),
+      modes: self
+        .modes
+        .iter()
+        .map(|(path, mode)| (path.clone(), *mode))
+        .collect(),
+      symlinks: self
+        .symlinks
+        .iter()
+        .map(|(path, target)| (path.clone(), target.clone()))
+        .collect(),
+      xattrs: self
+        .xattrs
+        .iter()
+        .map(|((path, name), value)| (path.clone(), name.clone(), value.clone()))
+        .collect(),
+      hardlinks: self
+        .hardlinks
+        .iter()
+        .map(|(path, target)| (path.clone(), target.clone()))
+        .collect(),
+    }
+  }
+
   /// A file's current bytes, or `None` when it is absent.
   pub fn content(&self, path: &str) -> Option<&[u8]> {
     self.content.get(path).map(Vec::as_slice)
+  }
+
+  /// Every file the green currently holds, with its bytes — so a new work volume can be seeded with
+  /// the base content it inherits and edits splice against it.
+  pub fn files(&self) -> impl Iterator<Item = (&str, &[u8])> {
+    self
+      .content
+      .iter()
+      .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
   }
 
   /// Whether a directory exists at the path.
