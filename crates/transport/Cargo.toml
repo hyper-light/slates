@@ -1,0 +1,14 @@
+[package]
+name = "slates-transport"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The fleet claims-plane transport (§4.10a, Phase 8): the two-plane UDP wire — this crate is the control-datagram codec so far (owned QUIC + crypto owed). Design: docs/wip/fleet-transport.md."
+
+[dependencies]
+
+[lints]
+workspace = true

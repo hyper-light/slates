@@ -77,6 +77,10 @@ slates-bridge-fuse = 0
 # slates-bridge-nfs (0): the XDR/RPC codec is bounds-checked byte slices; the socket uses safe std::net.
 slates-bridge-nfs = 0
 slates-merge = 0
+# slates-transport (0): the control-datagram codec is byte slices read and written in field order
+# through a bounded reader, never a cast; the owned QUIC dialect and the AEAD seal (later slices, §4.10a)
+# will carry their own budgeted sites (the rt UDP driver's unsafe lives in slates-rt).
+slates-transport = 0
 # slates-mcp (0): the JSON-RPC dispatch is safe Rust over serde_json and the client SDK.
 slates-mcp = 0
 slates-archive = 0

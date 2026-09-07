@@ -867,6 +867,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-transport"
+version = "0.1.0"
+
+[[package]]
 name = "slates-vfs"
 version = "0.1.0"
 dependencies = [
