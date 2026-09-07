@@ -116,6 +116,22 @@ impl Driver for EpollDriver {
     Ok(())
   }
 
+  fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
+    // SAFETY: `raw` is a live socket the caller (a UdpSocket) owns for the registration; the borrow
+    // is used only for this epoll_ctl call and not retained.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
+    // One-shot readable interest whose u64 data carries the waker word; the `wait` loop above turns
+    // the ready event into a completion keyed by that word.
+    epoll::add(
+      &self.epfd,
+      fd,
+      EventData::new_u64(user_data),
+      EventFlags::IN | EventFlags::ONESHOT,
+    )
+    .map_err(|e| refused("epoll_ctl(ADD readable)", e))?;
+    Ok(())
+  }
+
   fn has_pending(&self) -> bool {
     !self.nops.is_empty()
   }

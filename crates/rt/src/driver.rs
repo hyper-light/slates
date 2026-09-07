@@ -109,6 +109,13 @@ pub trait Driver {
   /// self-test; every real operation follows the same path).
   fn submit_nop(&mut self, user_data: u64) -> Result<(), RtError>;
 
+  /// Registers one-shot interest in `raw`'s readability (a UDP socket for the fleet transport,
+  /// §4.10a): when it next becomes readable, a completion carrying `user_data` arrives on a following
+  /// `wait` (re-registered after each read). `raw` is the OS handle (a `RawFd` on Unix). The
+  /// readiness-native drivers (kqueue, epoll) register it; the completion-native drivers (io_uring,
+  /// IOCP) do not carry it yet and refuse with a typed [`RtError`] (owed).
+  fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError>;
+
   /// Whether a `wait` would return a completion or a kick without blocking, as far as the driver
   /// can tell without a syscall (an idle loop skips the wait when this is false).
   fn has_pending(&self) -> bool;

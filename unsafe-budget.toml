@@ -14,9 +14,11 @@
 #   the file-backed map of a memory object (1), the descriptor a child inherits (1), the two
 #   atomic views of mapped words (2), and the Windows section (create, open, view, drop, the two
 #   byte views and the lock: 8).
-# slates-rt (16): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
+# slates-rt (18): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
 #   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
-#   the IOCP calls are Win32 (6).
+#   the IOCP calls are Win32 (6); the UDP readiness registration (§4.10a, added 2026-09-07): the
+#   kqueue read-filter `kevent` (unsafe by signature, one change record, 1) and the epoll
+#   `BorrowedFd::borrow_raw` of a live socket for one `epoll_ctl` (1).
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
 # slates-base (6): rustix marks kevent unsafe because the kernel fills the output list; one
@@ -59,7 +61,7 @@
 [budget]
 slates-machine = 43
 slates-mem = 16
-slates-rt = 16
+slates-rt = 18
 slates-base = 6
 slates-vfs = 0
 slates-land = 3

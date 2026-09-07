@@ -36,6 +36,7 @@ pub mod shard;
 pub mod sim;
 pub mod task;
 pub mod timer;
+pub mod udp;
 pub mod waker;
 
 #[cfg(target_os = "linux")]

@@ -473,6 +473,15 @@ impl ShardContext {
       .ok_or(RtError::NotOnShardThread)?
   }
 
+  /// Registers one-shot interest in a socket's readability with the shard's driver (§4.10a): when it
+  /// next becomes readable, the driver wakes the task whose `word` this is. The path a UDP recv future
+  /// takes; mirrors [`arm_timer`], but on the driver rather than the wheel.
+  pub fn register_readable(&self, raw: i32, word: u64) -> Result<(), RtError> {
+    self
+      .with_inner(|inner| inner.driver.register_readable(raw, word))
+      .ok_or(RtError::NotOnShardThread)?
+  }
+
   /// Disarms a timer.
   pub fn disarm_timer(&self, id: crate::timer::TimerId) -> Result<(), RtError> {
     self

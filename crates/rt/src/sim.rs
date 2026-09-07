@@ -122,6 +122,15 @@ impl Driver for SimDriver {
     Ok(())
   }
 
+  fn register_readable(&mut self, _raw: i32, _user_data: u64) -> Result<(), RtError> {
+    // Owed (§4.10a): this completion-native driver does not carry socket readiness yet; a
+    // typed refusal, never a silent drop. The readiness-native drivers (kqueue, epoll) do.
+    Err(RtError::DriverRefused {
+      call: "register_readable",
+      code: None,
+    })
+  }
+
   fn has_pending(&self) -> bool {
     !self.nops.is_empty() || self.shared.kicked.load(Ordering::Acquire)
   }

@@ -142,6 +142,21 @@ impl Driver for KqueueDriver {
     Ok(())
   }
 
+  fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
+    // A one-shot read filter whose udata carries the waker word; the `wait` loop above turns the
+    // ready event into a completion keyed by that word (the same path the kick's siblings take).
+    let event = Event::new(
+      EventFilter::Read(raw),
+      EventFlags::ADD | EventFlags::ONESHOT,
+      core::ptr::without_provenance_mut(usize::try_from(user_data).unwrap_or(usize::MAX)),
+    );
+    let mut none: Vec<Event> = Vec::new();
+    // SAFETY: one valid change record on the open queue; the empty output buffer receives nothing.
+    unsafe { kevent(self.kq, &[event], &mut none, None) }
+      .map_err(|e| refused("kevent(EVFILT_READ)", e))?;
+    Ok(())
+  }
+
   fn has_pending(&self) -> bool {
     !self.nops.is_empty()
   }
