@@ -466,6 +466,7 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
   green_chain_scenario();
   merge_submit_scenario();
   merge_modify_scenario();
+  merge_lagging_scenario();
 }
 
 /// Shape: a version slab large enough to physically hold several volumes' inode and trie nodes, yet
@@ -892,5 +893,75 @@ fn merge_modify_scenario() {
     "the lone modify merges: {conflicts:?}"
   );
   assert_eq!(version, Some(2), "the green advanced to version 2");
+  daemon.stop();
+}
+
+/// A work that lagged behind an intervening submit still merges when it touches other files (§4.16):
+/// base_at reconstructs the green at the work's older base version, and the verdict's basis skips the
+/// unchanged files. A lagging work on a disjoint file merges past the version it fell behind.
+fn merge_lagging_scenario() {
+  let (daemon, instance) = daemon("merge-lag");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "g3".to_owned(),
+    require_evidence: false,
+  }) else {
+    panic!("create green");
+  };
+  let create_file = |client: &mut Client, work, name: &str, bytes: &[u8]| {
+    assert!(matches!(
+      client.call(&RequestBody::Edit {
+        work,
+        path: name.to_owned(),
+        at: 0,
+        delete_len: 0,
+        bytes: bytes.to_vec(),
+      }),
+      ReplyBody::Edited
+    ));
+  };
+  let work = |client: &mut Client, name: &str| -> (slates_ipc::protocol::VolumeId, u64) {
+    let ReplyBody::WorkCreated { id, base } = client.call(&RequestBody::CreateWork {
+      green,
+      name: name.to_owned(),
+    }) else {
+      panic!("create work");
+    };
+    (id, base)
+  };
+  // Seed the green with "base" so later works are based on version 1, not 0.
+  let (seed, _) = work(&mut client, "seed");
+  create_file(&mut client, seed, "base", b"x");
+  assert!(matches!(
+    client.call(&RequestBody::Submit { work: seed }),
+    ReplyBody::Submitted {
+      version: Some(1),
+      ..
+    }
+  ));
+  // A and B both start at version 1.
+  let (a, base_a) = work(&mut client, "a");
+  let (b, base_b) = work(&mut client, "b");
+  assert_eq!((base_a, base_b), (1, 1), "both based on version 1");
+  create_file(&mut client, a, "a", b"a-content");
+  create_file(&mut client, b, "b", b"b-content");
+  // B submits first, advancing the green to version 2; A now lags at base 1.
+  assert!(matches!(
+    client.call(&RequestBody::Submit { work: b }),
+    ReplyBody::Submitted {
+      version: Some(2),
+      ..
+    }
+  ));
+  // A, based on version 1, touched a different file — it merges past version 2 as version 3.
+  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit { work: a })
+  else {
+    panic!("submit a");
+  };
+  assert!(
+    conflicts.is_empty(),
+    "a disjoint lagging work merges: {conflicts:?}"
+  );
+  assert_eq!(version, Some(3), "A merged past the version it fell behind");
   daemon.stop();
 }

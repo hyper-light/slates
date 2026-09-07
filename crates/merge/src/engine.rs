@@ -318,6 +318,58 @@ impl Green {
     self.fast_path_hits
   }
 
+  /// The green's state at an older `version` as a deriver [`Base`](crate::increment::Base), for a
+  /// work whose base lagged behind an intervening submit. Files come from the content history (exact,
+  /// renames and deletes included); directories and modes are replayed from the deltas up to the
+  /// version. Symlinks, hard links and xattrs at an older version are owed — reconstructed empty here,
+  /// which is exact for the file-and-directory workflows and conservative otherwise.
+  pub fn base_at(&self, version: u64) -> crate::increment::Base {
+    use crate::ops_doc::OpKind;
+    if version >= self.head() {
+      return self.current_base();
+    }
+    let upto = usize::try_from(version)
+      .unwrap_or(usize::MAX)
+      .min(self.deltas.len());
+    let files = self
+      .content_history
+      .keys()
+      .filter_map(|path| {
+        self
+          .content_at(path, version)
+          .map(|bytes| (path.clone(), bytes.len() as u64))
+      })
+      .collect();
+    let mut dirs = std::collections::BTreeSet::new();
+    let mut modes = std::collections::BTreeMap::new();
+    for delta in &self.deltas[..upto] {
+      for (path, ops) in delta {
+        for op in ops {
+          match op.kind {
+            OpKind::Mkdir => {
+              dirs.insert(path.clone());
+            }
+            OpKind::Rmdir => {
+              dirs.remove(path);
+            }
+            OpKind::SetMode => {
+              modes.insert(path.clone(), u32::try_from(op.len).unwrap_or(0));
+            }
+            _ => {}
+          }
+        }
+      }
+    }
+    crate::increment::Base {
+      files,
+      dirs: dirs.into_iter().collect(),
+      modes: modes.into_iter().collect(),
+      symlinks: Vec::new(),
+      xattrs: Vec::new(),
+      hardlinks: Vec::new(),
+    }
+  }
+
   /// A file's bytes at `version`, reconstructed from its history — the latest recorded value at or
   /// before `version`, or `None` when the file was absent then.
   fn content_at(&self, path: &str, version: u64) -> Option<Vec<u8>> {

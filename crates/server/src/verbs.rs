@@ -1649,24 +1649,14 @@ fn submit(state: &mut ShardState, work: VolumeId) -> ReplyBody {
   else {
     return refused(Refusal::NotFound);
   };
-  // The base state the increment is derived against: the green as it was at the work's base version.
-  // Version 0 is the empty green; a submit at the current head derives against the green's current
-  // state. A work that lagged behind an intervening submit (0 < base < head) needs the green
-  // reconstructed at that older version — owed — so it is refused rather than composed wrongly.
+  // The base state the increment is derived against: the green as it was at the work's base version
+  // (empty at 0, the current state at head, replayed from the deltas for an intervening version a
+  // lagging work is based on) — what the work was seeded with, so the composition is exact.
   let base = {
     let Some(engine) = state.greens.get(&green_id) else {
       return refused(Refusal::NotFound);
     };
-    if base_version == 0 {
-      slates_merge::increment::Base::default()
-    } else if base_version == engine.head() {
-      engine.current_base()
-    } else {
-      return refused(Refusal::BadRequest {
-        reason: "submit against an intervening green version needs base reconstruction (owed)"
-          .to_owned(),
-      });
-    }
+    engine.base_at(base_version)
   };
   let built = {
     let Some(w) = state.works.get(&work_id) else {
