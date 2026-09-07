@@ -837,6 +837,7 @@ dependencies = [
 name = "slates-server"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "rustix",
  "slates-anchor",
  "slates-base",

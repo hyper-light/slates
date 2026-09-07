@@ -128,6 +128,32 @@ pub enum RequestBody {
     /// The green.
     green: VolumeId,
   },
+  /// Create a work volume over a green (§4.16): an agent's private clone to declare operations on.
+  CreateWork {
+    /// The green to work over.
+    green: VolumeId,
+    /// The name.
+    name: String,
+  },
+  /// Declare an edit on a work volume (§4.16): at `path`, remove `delete_len` bytes at `at` and
+  /// insert `bytes` — a true splice, not a whole-file rewrite. A new path is created.
+  Edit {
+    /// The work volume.
+    work: VolumeId,
+    /// The file.
+    path: String,
+    /// The offset.
+    at: u64,
+    /// Bytes removed at `at`.
+    delete_len: u64,
+    /// Bytes inserted at `at`.
+    bytes: Vec<u8>,
+  },
+  /// Submit a work volume's declared operations to its green as an increment (§4.16).
+  Submit {
+    /// The work volume.
+    work: VolumeId,
+  },
   /// Clone a snapshot into a new volume.
   Clone {
     /// The volume.
@@ -324,6 +350,20 @@ pub struct VolumeSummary {
   pub unique_bytes: u64,
   /// Whether it is an overlay.
   pub overlay: bool,
+}
+
+/// A merge conflict window (§4.16): the file, the range in base coordinates that met an intervening
+/// change, and the class of the conflict (the `MergeConflictClass` discriminant).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct MergeWindow {
+  /// The file.
+  pub path: String,
+  /// The conflicting range's offset (base coordinates).
+  pub at: u64,
+  /// The conflicting range's length.
+  pub len: u64,
+  /// The conflict class, as its `MergeConflictClass` discriminant.
+  pub class: u8,
 }
 
 /// A volume's placement (§4.8, D-18): every reply carries it from the first version, so the
@@ -558,6 +598,22 @@ pub enum ReplyBody {
   Versions {
     /// The head version.
     head: u64,
+  },
+  /// A work volume was created over a green.
+  WorkCreated {
+    /// The id.
+    id: VolumeId,
+    /// The green version it is based on.
+    base: u64,
+  },
+  /// An edit was recorded on a work volume.
+  Edited,
+  /// A work volume's increment was submitted (§4.16).
+  Submitted {
+    /// The committed green version, when the increment was accepted; `None` on conflict.
+    version: Option<u64>,
+    /// The conflict windows to rebase against, when not accepted.
+    conflicts: Vec<MergeWindow>,
   },
   /// Cloned.
   Cloned {

@@ -23,6 +23,7 @@ use slates_ipc::slot::SlotKind;
 use slates_ipc::{IpcError, Request};
 use slates_machine::derived;
 use slates_mem::Handle;
+use slates_merge::increment::VolumeOp;
 use slates_rt::control::Control;
 use slates_rt::task::SpawnRequest;
 use slates_vfs::base::BaseConfig;
@@ -182,6 +183,9 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     RequestBody::Snapshot { volume }
     | RequestBody::DestroySnapshot { volume, .. }
     | RequestBody::Versions { green: volume }
+    | RequestBody::CreateWork { green: volume, .. }
+    | RequestBody::Edit { work: volume, .. }
+    | RequestBody::Submit { work: volume }
     | RequestBody::Clone { volume, .. }
     | RequestBody::Attach { volume, .. }
     | RequestBody::Resize { volume, .. }
@@ -788,6 +792,9 @@ fn mutates_shard_image(body: &RequestBody) -> bool {
     body,
     RequestBody::Create { .. }
       | RequestBody::CreateGreen { .. }
+      | RequestBody::CreateWork { .. }
+      | RequestBody::Edit { .. }
+      | RequestBody::Submit { .. }
       | RequestBody::Clone { .. }
       | RequestBody::Resize { .. }
       | RequestBody::Destroy { .. }
@@ -843,6 +850,15 @@ fn dispatch_inner(
       require_evidence,
     } => create_green(state, principal, &name, require_evidence),
     RequestBody::Versions { green } => versions(state, principal, green),
+    RequestBody::CreateWork { green, name } => create_work(state, principal, green, &name),
+    RequestBody::Edit {
+      work,
+      path,
+      at,
+      delete_len,
+      bytes,
+    } => edit(state, work, &path, at, delete_len, &bytes),
+    RequestBody::Submit { work } => submit(state, work),
     RequestBody::Clone {
       volume,
       snapshot,
@@ -1427,6 +1443,228 @@ fn versions(state: &ShardState, principal: &Principal, green: VolumeId) -> Reply
   };
   ReplyBody::Versions {
     head: engine.head(),
+  }
+}
+
+/// Creates a work volume over a green (§4.16): an agent's private place to declare operations,
+/// based on the green's current head. The green must be owned by this shard (it holds the engine).
+fn create_work(
+  state: &mut ShardState,
+  principal: &Principal,
+  green: VolumeId,
+  name: &str,
+) -> ReplyBody {
+  let green_id = to_db_volume(green);
+  let Some(engine) = state.greens.get(&green_id) else {
+    return refused(Refusal::NotFound);
+  };
+  let base = engine.head();
+  if let Some(existing) = state.db.partition().volume_by_name(name) {
+    return refused(Refusal::AlreadyExists {
+      existing: to_wire_volume(existing.id),
+    });
+  }
+  let id = fresh_volume_id(state);
+  let record = VolumeRecord {
+    id,
+    name: name.to_owned(),
+    owner_shard: state.partition,
+    policy: PolicyRecord {
+      size: db_size(SizeClass::Dynamic { max: 0 }),
+      names: DbNamePolicy::Exact,
+      require_locked: false,
+      role: Role::Work {
+        green: green_id,
+        base_version: base,
+        stream: false,
+      },
+    },
+    base: BaseRecord::Scratch,
+    head: DbSnapshotId::default(),
+    epoch: 0,
+    referenced_bytes: 0,
+    unique_bytes: 0,
+    state: VolumeState::Live,
+    lease: None,
+    owner: principal.clone(),
+    access: Vec::new(),
+    created_ns: state.clock.monotonic_ns(),
+  };
+  let now = state.clock.monotonic_ns();
+  if let Err(e) = state
+    .db
+    .mutate(&mut state.segment, &Op::VolumeCreated { record }, now)
+  {
+    return refused(refusal_of_db(&e));
+  }
+  state.works.insert(
+    id,
+    crate::state::WorkState {
+      green: green_id,
+      base_version: base,
+      journal: Vec::new(),
+      content: std::collections::BTreeMap::new(),
+    },
+  );
+  ReplyBody::WorkCreated {
+    id: to_wire_volume(id),
+    base,
+  }
+}
+
+/// Declares an edit on a work volume (§4.16): a splice at `path` — remove `delete_len` bytes at `at`,
+/// insert `bytes`. Maintains the work's content and appends the declared operations, composed into an
+/// increment on submit. A new path is created first.
+fn edit(
+  state: &mut ShardState,
+  work: VolumeId,
+  path: &str,
+  at: u64,
+  delete_len: u64,
+  bytes: &[u8],
+) -> ReplyBody {
+  let work_id = to_db_volume(work);
+  let Some(w) = state.works.get_mut(&work_id) else {
+    return refused(Refusal::NotFound);
+  };
+  let is_new = !w.content.contains_key(path);
+  let old_len = w.content.get(path).map_or(0, |c| c.len() as u64);
+  {
+    let content = w.content.entry(path.to_owned()).or_default();
+    let start = usize::try_from(at).unwrap_or(usize::MAX).min(content.len());
+    let del = usize::try_from(delete_len)
+      .unwrap_or(usize::MAX)
+      .min(content.len() - start);
+    content.splice(start..start + del, bytes.iter().copied());
+  }
+  if is_new {
+    w.journal.push(VolumeOp::Create {
+      path: path.to_owned(),
+    });
+  }
+  if delete_len > 0 {
+    w.journal.push(VolumeOp::Delete {
+      path: path.to_owned(),
+      at,
+      len: delete_len,
+    });
+  }
+  if !bytes.is_empty() {
+    let len = bytes.len() as u64;
+    w.journal.push(if at >= old_len {
+      VolumeOp::Extend {
+        path: path.to_owned(),
+        at,
+        len,
+      }
+    } else {
+      VolumeOp::Insert {
+        path: path.to_owned(),
+        at,
+        len,
+      }
+    });
+  }
+  ReplyBody::Edited
+}
+
+/// Assembles an increment's post-state from a work's content (§4.16): the seal lays each file's final
+/// content out by region, and each content op names a slice of it — so for every content op, the
+/// bytes at `[op.at, op.at + op.len)` of the file go to `[op.src, op.src + op.len)` of the post-state.
+fn assemble_post_state(
+  doc: &slates_merge::ops_doc::OpsDoc,
+  content: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Vec<u8> {
+  use slates_merge::ops_doc::OpKind;
+  let is_content =
+    |kind: OpKind| matches!(kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend);
+  let mut size = 0u64;
+  for op in &doc.ops {
+    if is_content(op.kind) && op.src != u64::MAX {
+      size = size.max(op.src.saturating_add(op.len));
+    }
+  }
+  let mut post = vec![0u8; usize::try_from(size).unwrap_or(0)];
+  for op in &doc.ops {
+    if !is_content(op.kind) || op.src == u64::MAX {
+      continue;
+    }
+    let Some(path) = doc.paths.path(op.path) else {
+      continue;
+    };
+    let Some(file) = content.get(path) else {
+      continue;
+    };
+    let (Ok(from), Ok(to), Ok(dst)) = (
+      usize::try_from(op.at),
+      usize::try_from(op.at.saturating_add(op.len)),
+      usize::try_from(op.src),
+    ) else {
+      continue;
+    };
+    if to <= file.len() {
+      post[dst..dst + (to - from)].copy_from_slice(&file[from..to]);
+    }
+  }
+  post
+}
+
+/// Submits a work volume's declared operations to its green as an increment (§4.16): compose the
+/// declared operations into the canonical document, seal the post-state, hash the identity, and run
+/// the green's merge verdict — accepted with the new version, or the conflict windows to rebase.
+fn submit(state: &mut ShardState, work: VolumeId) -> ReplyBody {
+  let work_id = to_db_volume(work);
+  let built = {
+    let Some(w) = state.works.get(&work_id) else {
+      return refused(Refusal::NotFound);
+    };
+    // The base state the increment is derived against. The first version reserves the whole-green
+    // reconstruction at an older base; a submit at the current head derives against an empty base.
+    let base = slates_merge::increment::Base::default();
+    let doc = match slates_merge::increment::compose_volume(&base, &w.journal) {
+      Ok(doc) => doc,
+      Err(e) => {
+        return refused(Refusal::BadRequest {
+          reason: format!("increment does not compose: {e:?}"),
+        });
+      }
+    };
+    let post_state = assemble_post_state(&doc, &w.content);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&doc.encode());
+    hasher.update(&post_state);
+    let id = *hasher.finalize().as_bytes();
+    (
+      w.green,
+      slates_merge::engine::Increment {
+        id,
+        base: w.base_version,
+        doc,
+        post_state,
+      },
+    )
+  };
+  let (green_id, inc) = built;
+  let Some(engine) = state.greens.get_mut(&green_id) else {
+    return refused(Refusal::NotFound);
+  };
+  match engine.submit(&inc) {
+    slates_merge::engine::Outcome::Accepted { version } => ReplyBody::Submitted {
+      version: Some(version),
+      conflicts: Vec::new(),
+    },
+    slates_merge::engine::Outcome::Conflict { windows } => ReplyBody::Submitted {
+      version: None,
+      conflicts: windows
+        .iter()
+        .map(|w| slates_ipc::protocol::MergeWindow {
+          path: w.path.clone(),
+          at: w.range.start,
+          len: w.range.len,
+          class: w.class as u8,
+        })
+        .collect(),
+    },
   }
 }
 

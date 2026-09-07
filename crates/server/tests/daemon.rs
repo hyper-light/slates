@@ -464,6 +464,7 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
   version_stats_scenario();
   snapshot_destroy_scenario();
   green_chain_scenario();
+  merge_submit_scenario();
 }
 
 /// Shape: a version slab large enough to physically hold several volumes' inode and trie nodes, yet
@@ -743,5 +744,74 @@ fn green_chain_scenario() {
     panic!("versions");
   };
   assert_eq!(head, 0, "a fresh green is at version 0");
+  daemon.stop();
+}
+
+/// The merge submit flow and the verdict (§4.16 Phase 6 Task 6): two agents create work volumes over
+/// a green, both based on version 0. The first's edit merges on the fast path (the chain advances to
+/// version 1); the second, still based on version 0, declared the same file the first just committed,
+/// so its submit conflicts with a window rather than silently overwriting. The whole flow runs
+/// through the real verbs on the green's owner shard. Non-vacuous: a broken verdict would accept both.
+fn merge_submit_scenario() {
+  let (daemon, instance) = daemon("merge");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+  }) else {
+    panic!("create green");
+  };
+  let mut work = |name: &str| -> slates_ipc::protocol::VolumeId {
+    let ReplyBody::WorkCreated { id, base } = client.call(&RequestBody::CreateWork {
+      green,
+      name: name.to_owned(),
+    }) else {
+      panic!("create work");
+    };
+    assert_eq!(base, 0, "a work over a fresh green is based on version 0");
+    id
+  };
+  let a = work("a");
+  let b = work("b");
+  let declare = |client: &mut Client, w, bytes: &[u8]| {
+    assert!(matches!(
+      client.call(&RequestBody::Edit {
+        work: w,
+        path: "f".to_owned(),
+        at: 0,
+        delete_len: 0,
+        bytes: bytes.to_vec(),
+      }),
+      ReplyBody::Edited
+    ));
+  };
+  declare(&mut client, a, b"hello");
+  declare(&mut client, b, b"world");
+
+  // A merges on the fast path; the chain advances.
+  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit { work: a })
+  else {
+    panic!("submit a");
+  };
+  assert!(
+    conflicts.is_empty(),
+    "no conflict for the first submit: {conflicts:?}"
+  );
+  assert_eq!(version, Some(1), "A is accepted as version 1");
+  let ReplyBody::Versions { head } = client.call(&RequestBody::Versions { green }) else {
+    panic!("versions");
+  };
+  assert_eq!(head, 1, "the green advanced to version 1");
+
+  // B, still based on version 0, touched the same file — it conflicts rather than clobbering A.
+  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit { work: b })
+  else {
+    panic!("submit b");
+  };
+  assert_eq!(version, None, "B is not accepted");
+  assert!(
+    conflicts.iter().any(|w| w.path == "f"),
+    "B conflicts on the file A committed: {conflicts:?}"
+  );
   daemon.stop();
 }

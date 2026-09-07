@@ -4,14 +4,24 @@ use std::time::Instant;
 
 use slates_ipc::protocol::{
   AuditEntry, DaemonReport, Direction, Filter, GrantSummary, Intent, LandingOutcome,
-  LandingSummary, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass, SnapshotId, StatusReport,
-  VolumeId, VolumeSummary, pack, unpack,
+  LandingSummary, MergeWindow, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass, SnapshotId,
+  StatusReport, VolumeId, VolumeSummary, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect_as};
 use slates_machine::{Derived, derived};
 use slates_wire::request::RequestId;
 
 use crate::error::ClientError;
+
+/// The result of a submit (§4.16): accepted at a new green version, or a conflict with the windows
+/// to rebase against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Submitted {
+  /// The increment merged; the green's new head version.
+  Accepted(u64),
+  /// The increment conflicts; the windows to rebase against.
+  Conflict(Vec<MergeWindow>),
+}
 
 /// The client's deadlines, every one a derivation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -414,6 +424,60 @@ impl Client {
     match self.call(&RequestBody::Versions { green })? {
       ReplyBody::Versions { head } => Ok(head),
       _ => Err(ClientError::UnexpectedReply { verb: "versions" }),
+    }
+  }
+
+  /// Creates a work volume over a green (§4.16); its id and the green version it is based on.
+  pub fn create_work(
+    &mut self,
+    green: VolumeId,
+    name: &str,
+  ) -> Result<(VolumeId, u64), ClientError> {
+    match self.call(&RequestBody::CreateWork {
+      green,
+      name: name.to_owned(),
+    })? {
+      ReplyBody::WorkCreated { id, base } => Ok((id, base)),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "create_work",
+      }),
+    }
+  }
+
+  /// Declares an edit on a work volume (§4.16): a splice at `path` — remove `delete_len` bytes at
+  /// `at`, insert `bytes`.
+  pub fn edit(
+    &mut self,
+    work: VolumeId,
+    path: &str,
+    at: u64,
+    delete_len: u64,
+    bytes: &[u8],
+  ) -> Result<(), ClientError> {
+    match self.call(&RequestBody::Edit {
+      work,
+      path: path.to_owned(),
+      at,
+      delete_len,
+      bytes: bytes.to_vec(),
+    })? {
+      ReplyBody::Edited => Ok(()),
+      _ => Err(ClientError::UnexpectedReply { verb: "edit" }),
+    }
+  }
+
+  /// Submits a work volume's declared operations to its green (§4.16): accepted at a new version, or
+  /// a conflict with windows to rebase.
+  pub fn submit(&mut self, work: VolumeId) -> Result<Submitted, ClientError> {
+    match self.call(&RequestBody::Submit { work })? {
+      ReplyBody::Submitted {
+        version: Some(v), ..
+      } => Ok(Submitted::Accepted(v)),
+      ReplyBody::Submitted {
+        version: None,
+        conflicts,
+      } => Ok(Submitted::Conflict(conflicts)),
+      _ => Err(ClientError::UnexpectedReply { verb: "submit" }),
     }
   }
 

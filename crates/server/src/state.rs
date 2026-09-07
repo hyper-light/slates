@@ -157,8 +157,9 @@ pub struct WorkState {
   pub base_version: u64,
   /// The declared operations, in order.
   pub journal: Vec<VolumeOp>,
-  /// The post-state bytes the content operations name by offset.
-  pub post: Vec<u8>,
+  /// The work's current content per file path — the post-state the increment's content ops name by
+  /// range (a mounted work would keep this in its VFS tree; here `edit` maintains it directly).
+  pub content: BTreeMap<String, Vec<u8>>,
 }
 
 /// A reply waiting to be written into a client's ring.

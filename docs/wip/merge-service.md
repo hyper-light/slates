@@ -1,0 +1,48 @@
+# §4.16 merge Green/Work service — wiring status
+
+> Status: the `slates-merge` engine (verdict, deriver, splice, chain, position map, ops document) is
+> built and tested at the crate level; this note tracks wiring it into the server, client and CLI
+> (Phase 6 tasks 1, 6, 7, 8). **Landed:** green volumes and the chain head (`CreateGreen`, `Versions`);
+> the submit flow (`CreateWork`, `Edit`, `Submit`) for a fresh green with content edits, accept and
+> conflict, through the real verbs. **Owed:** the general base, `changed_since`, `rebase`/`advance`,
+> the CLI verbs, xattr/symlink post-state, cross-shard submit, and chain persistence.
+
+## What is wired (server + ipc + client)
+
+- **Green volumes.** `CreateGreen { name, require_evidence }` records the `Green` role in the catalog
+  and creates the in-memory merge engine in `ShardState.greens`, keyed by the green's id. A green is
+  not a store-backed VFS tree — its merged content lives in the engine — so it takes no byte or
+  version reservation. `Versions { green }` reports the engine's head version, routed to the green's
+  owner shard.
+- **Work volumes.** `CreateWork { green, name }` records the `Work` role over the green (based on the
+  green's current head) and a `WorkState` in `ShardState.works` holding the declared operation journal
+  and the work's content per path.
+- **Edit.** `Edit { work, path, at, delete_len, bytes }` is a declared splice: it maintains the work's
+  content and appends the `VolumeOp`s (a new path is `Create`d first; a splice is a `Delete` and/or an
+  `Insert`/`Extend`).
+- **Submit.** `Submit { work }` composes the journal into the canonical ops document
+  (`compose_volume`), seals the post-state from the work's content (each content op names a slice of
+  its file's final content, placed at the op's `src`), hashes the increment identity (BLAKE3 of the
+  encoded document and the post-state), and runs the green's `Green::submit` verdict — replying with
+  the accepted version or the conflict windows.
+
+Gated in `crates/server/tests/daemon.rs` (folded into the one serial lifecycle test so its daemon does
+not contend): two works over a fresh green, both based on version 0, declare the same file; the first
+merges on the fast path (the chain advances to version 1), the second conflicts on that file rather
+than clobbering it. Non-vacuous — a broken verdict would accept both.
+
+## What is owed
+
+- **The general base.** `submit` derives against `Base::default()` — correct only when the green is
+  empty at the work's base version. A work over a non-empty green needs the green's state reconstructed
+  at `base_version` (the engine keeps a content history; a `base_at(version)` accessor is owed) so
+  `compose_volume` sees the base files, dirs, modes, symlinks and xattrs.
+- **Post-state for non-content dimensions.** `assemble_post_state` handles content ops only; a
+  `SetXattr`/`Symlink` increment needs its value bytes laid into the post-state at the op's `src`.
+- **`changed_since`, `rebase`, `advance`** (Phase 6 tasks 1 and 7): the per-path last-changed index
+  read, the corrective rebase mapping a work's pending operations to a newer version, and the
+  attachment re-pin with targeted invalidations.
+- **Surfaces (task 8):** the CLI verbs and the SDKs' typed methods beyond the Rust client.
+- **Cross-shard submit and chain persistence:** a work whose green is on another shard forwards the
+  increment to the green's owner; and the chain (`VersionRecord`s and `seen`) is recovered from the
+  partition log after a restart (task 6's crash recovery). Single-node, same-shard only for now.
