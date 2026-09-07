@@ -194,6 +194,10 @@ impl DaemonConfig {
         .max(1),
       timers: volumes.get(),
       tick_ns: runtime.timer_tick_ns,
+      // The green merge chains share the partition's metadata byte budget (§4.16): the same table
+      // bytes the records draw from, so a green's persisted chain is bounded by measured memory, not
+      // a magic count. Checkpointing to fold old chain entries (the design's optimization) is owed.
+      green_chain_bytes: usize::try_from(tables.get()).unwrap_or(usize::MAX),
     };
     // The store's tables: the metadata share of the reserve over each record's size, the
     // inodes and directories sharing it, chunks over the arena share.

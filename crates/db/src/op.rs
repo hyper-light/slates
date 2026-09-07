@@ -166,6 +166,16 @@ pub enum Op {
     /// The record.
     record: AuditRecord,
   },
+  /// A green volume's merge chain advanced by one accepted increment (§4.16 "the merge record is a
+  /// partition log append"; §4.8). The bytes are the merge crate's encoded increment; the database
+  /// stores them opaquely (it never parses a merge structure) and the server replays them on recovery
+  /// to rebuild the green. Appended at the end of the operation set for append-only evolution.
+  GreenAdvanced {
+    /// The green volume.
+    green: VolumeId,
+    /// The encoded increment (identity, base, ops document and post-state).
+    increment: Vec<u8>,
+  },
 }
 
 impl Op {
@@ -196,6 +206,7 @@ impl Op {
       Op::LandingRecorded { .. } => "landing_recorded",
       Op::LandingStateChanged { .. } => "landing_state_changed",
       Op::AuditAppended { .. } => "audit_appended",
+      Op::GreenAdvanced { .. } => "green_advanced",
     }
   }
 }

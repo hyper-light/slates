@@ -52,6 +52,7 @@ fn caps() -> PartitionCaps {
     segment_slots: 1 << 10,
     timers: 1 << 15,
     tick_ns: 1_000,
+    green_chain_bytes: 1 << 20,
   }
 }
 

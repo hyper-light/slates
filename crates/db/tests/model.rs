@@ -75,6 +75,7 @@ fn caps() -> PartitionCaps {
     segment_slots: 64,
     timers: 1 << 12,
     tick_ns: 1_000,
+    green_chain_bytes: 1 << 20,
   }
 }
 
@@ -143,6 +144,7 @@ enum Step {
   Landing(usize),
   LandingState(usize, u8),
   Audit(u8),
+  GreenAdvance(usize),
   Crash,
 }
 
@@ -169,6 +171,7 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..8usize).prop_map(Step::Landing),
     1 => (0..8usize, 0..10u8).prop_map(|(l, s)| Step::LandingState(l, s)),
     1 => (0..7u8).prop_map(Step::Audit),
+    2 => (0..8usize).prop_map(Step::GreenAdvance),
     1 => Just(Step::Crash),
   ]
 }
@@ -361,6 +364,21 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
       client: *c,
       up_to: *s,
     },
+    step @ (Step::Grant(..)
+    | Step::GrantState(..)
+    | Step::LandingLease(..)
+    | Step::Landing(..)
+    | Step::LandingState(..)
+    | Step::Audit(..)
+    | Step::GreenAdvance(..)) => return op_for_service(step, ids, now_ns),
+    Step::Crash => return None,
+  })
+}
+
+/// The service operations (grants, landings, audit, green chains), split from [`op_for`] to
+/// keep each dispatch under the cognitive-complexity bound. Called only for those steps.
+fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
+  Some(match step {
     Step::Grant(v) => {
       let id = ids.next_grant;
       ids.next_grant += 1;
@@ -430,7 +448,13 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
         },
       }
     }
-    Step::Crash => return None,
+    Step::GreenAdvance(v) => Op::GreenAdvanced {
+      green: vid(pick(&ids.live, *v)?),
+      // The bytes are opaque to the database; a small deterministic value keeps the chain well under
+      // its byte budget over a run so recovery, not the cap, is what the model exercises.
+      increment: (*v as u64).to_le_bytes().to_vec(),
+    },
+    _ => return None,
   })
 }
 

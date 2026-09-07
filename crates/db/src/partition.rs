@@ -43,6 +43,9 @@ pub struct PartitionCaps {
   pub timers: usize,
   /// The wheel's tick, nanoseconds.
   pub tick_ns: u64,
+  /// The bytes all green merge chains together may hold in the partition (§4.16); a new increment
+  /// past it is a typed capacity refusal (bounded growth until checkpointing folds old entries).
+  pub green_chain_bytes: usize,
 }
 
 /// One client's completion state, as the snapshot carries it.
@@ -54,6 +57,15 @@ pub struct ClientCompletions {
   pub acknowledged_up_to: Option<u32>,
   /// The retained completions.
   pub records: Vec<CompletionRecord>,
+}
+
+/// One green volume's merge chain as a snapshot carries it: the green and its increments in order.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct GreenChain {
+  /// The green volume.
+  pub green: VolumeId,
+  /// The encoded increments, in commit order.
+  pub increments: Vec<Vec<u8>>,
 }
 
 /// The whole partition state as one canonical value: what a snapshot slot holds.
@@ -79,6 +91,8 @@ pub struct PartitionSnapshot {
   pub landings: Vec<LandingRecord>,
   /// The audit records retained (the ring holds the rest).
   pub audit: Vec<AuditRecord>,
+  /// Each green volume's merge chain, by green order (§4.16; appended for append-only evolution).
+  pub green_chains: Vec<GreenChain>,
 }
 
 /// The partition.
@@ -100,6 +114,12 @@ pub struct Partition {
   landing_leases: Art<LandingLeaseRecord>,
   landings: BTreeMap<u64, LandingRecord>,
   audit: Vec<AuditRecord>,
+  /// Each green volume's merge chain (§4.16): its accepted increments, encoded, in commit order, so
+  /// recovery replays them to rebuild the green. Bounded by `green_chain_bytes` against the cap.
+  green_chains: BTreeMap<VolumeId, Vec<Vec<u8>>>,
+  /// The total bytes held across all green chains, so a new increment can be refused at the cap
+  /// before it is appended (bounded growth; checkpointing to fold old chain entries is owed).
+  green_chain_bytes: usize,
 }
 
 impl std::fmt::Debug for Partition {
@@ -141,12 +161,20 @@ impl Partition {
       landing_leases: Art::new(),
       landings: BTreeMap::new(),
       audit: Vec::new(),
+      green_chains: BTreeMap::new(),
+      green_chain_bytes: 0,
     }
   }
 
   /// The caps.
   pub fn caps(&self) -> PartitionCaps {
     self.caps
+  }
+
+  /// A green volume's merge chain (§4.16): its accepted increments, encoded, in commit order. Empty
+  /// for a green with no committed version and for any non-green volume.
+  pub fn green_chain(&self, green: VolumeId) -> &[Vec<u8>] {
+    self.green_chains.get(&green).map_or(&[], Vec::as_slice)
   }
 
   // ------------------------------------------------------------------ reads
@@ -368,6 +396,18 @@ impl Partition {
       }
       Op::LandingStateChanged { id, .. } => self.landing(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::AuditAppended { .. } => Ok(()),
+      Op::GreenAdvanced { green, increment } => {
+        self.volume(*green).ok_or(DbError::NotFound)?;
+        // Bounded growth (§4.16; CLAUDE.md): the chain grows per accepted version, so a new increment
+        // is refused once the partition's green chains would exceed their byte budget — the typed
+        // refusal at the bound, until checkpointing folds old chain entries (owed).
+        if self.green_chain_bytes.saturating_add(increment.len()) > self.caps.green_chain_bytes {
+          return Err(DbError::Capacity {
+            table: "green_chains",
+          });
+        }
+        Ok(())
+      }
     }
   }
 
@@ -529,6 +569,15 @@ impl Partition {
         self.audit.push(record.clone());
         Ok(())
       }
+      Op::GreenAdvanced { green, increment } => {
+        self.green_chain_bytes = self.green_chain_bytes.saturating_add(increment.len());
+        self
+          .green_chains
+          .entry(*green)
+          .or_default()
+          .push(increment.clone());
+        Ok(())
+      }
     }
   }
 
@@ -577,6 +626,12 @@ impl Partition {
       }
     }
     self.lineage.remove(&id.bytes);
+    // A destroyed green's merge chain is reclaimed with it (its increments can never be replayed for
+    // a volume that no longer exists), returning its bytes to the chain budget.
+    if let Some(chain) = self.green_chains.remove(&id) {
+      let bytes: usize = chain.iter().map(Vec::len).sum();
+      self.green_chain_bytes = self.green_chain_bytes.saturating_sub(bytes);
+    }
     Ok(())
   }
 
@@ -675,6 +730,14 @@ impl Partition {
       landing_leases: self.landing_leases.iter().map(|(_, l)| l.clone()).collect(),
       landings: self.landings.values().cloned().collect(),
       audit: self.audit.clone(),
+      green_chains: self
+        .green_chains
+        .iter()
+        .map(|(green, increments)| GreenChain {
+          green: *green,
+          increments: increments.clone(),
+        })
+        .collect(),
     }
   }
 
@@ -721,6 +784,11 @@ impl Partition {
       p.landings.insert(l.id, l.clone());
     }
     p.audit = snapshot.audit.clone();
+    for chain in &snapshot.green_chains {
+      let bytes: usize = chain.increments.iter().map(Vec::len).sum();
+      p.green_chain_bytes = p.green_chain_bytes.saturating_add(bytes);
+      p.green_chains.insert(chain.green, chain.increments.clone());
+    }
     Ok(p)
   }
 }
