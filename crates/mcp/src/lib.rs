@@ -3,9 +3,11 @@
 //! function from one JSON-RPC message to its reply — so it is driven directly in tests against a live
 //! daemon; the `slates mcp` command wraps it in the stdio transport (the I/O boundary the CLI owns).
 //!
-//! The surface here is the merge tools (§4.16): create a green, clone it into a work, declare edits,
-//! submit, rebase, and read the version chain — the whole loop an agent needs to merge into a shared
-//! volume. It grows toward the full §4.12 tool set (volume, attach, fs, base, status) in later slices.
+//! The surface covers the merge loop (§4.16: create a green, clone a work, edit, submit, rebase, read
+//! the chain), the volume lifecycle (create, list, stat, snapshot, clone, resize, destroy), attach and
+//! detach, the base operations (read_base, rewitness, pin), `slates.status`, and `slates.land`
+//! (materialize, which returns `GrantRequired`). Owed toward the full §4.12: `slates.fs` (the mount
+//! path), Streamable HTTP, resources and prompts.
 //!
 //! **No grant, ever (R10).** No tool here creates a landing grant; the grant is a human-only act on
 //! the CLI or a confirmation surface. The server has no grant verb to refuse — it simply does not
@@ -18,8 +20,9 @@
 
 use serde_json::{Value, json};
 use slates_client::{
-  Client, ClientError, CreateSpec, DaemonReport, Filter, Landing, LandingOutcome, LandingSummary,
-  NamePolicy, Rebased, SizeClass, SnapshotId, StatusReport, Submitted, VolumeId, VolumeSummary,
+  Attachment, Client, ClientError, CreateSpec, DaemonReport, Filter, Intent, Landing,
+  LandingOutcome, LandingSummary, NamePolicy, Rebased, SizeClass, SnapshotId, StatusReport,
+  Submitted, VolumeId, VolumeSummary,
 };
 
 /// The MCP protocol version this server speaks (the dated revision it targets, §4.12).
@@ -107,6 +110,11 @@ impl McpServer {
       "slates.volume.clone" => self.clone_volume(&args),
       "slates.volume.resize" => self.resize_volume(&args),
       "slates.volume.destroy" => self.destroy_volume(&args),
+      "slates.attach.attach" => self.attach(&args),
+      "slates.attach.detach" => self.detach(&args),
+      "slates.base.read_base" => self.read_base(&args),
+      "slates.base.rewitness" => self.rewitness(&args),
+      "slates.base.pin" => self.pin(&args),
       "slates.land.materialize" => self.land_materialize(&args),
       "slates.status" => self.status(),
       other => {
@@ -244,6 +252,58 @@ impl McpServer {
     let volume = volume_arg(args, "volume")?;
     self.client.destroy(volume).map_err(refusal)?;
     Ok(json!({ "destroyed": true }))
+  }
+
+  fn attach(&mut self, args: &Value) -> Result<Value, McpError> {
+    let volume = volume_arg(args, "volume")?;
+    let snapshot = args
+      .get("snapshot")
+      .and_then(Value::as_u64)
+      .map(|value| SnapshotId { value });
+    let intent = if args.get("write").and_then(Value::as_bool).unwrap_or(false) {
+      Intent::Write
+    } else {
+      Intent::Read
+    };
+    let attached = self
+      .client
+      .attach(volume, snapshot, intent)
+      .map_err(refusal)?;
+    Ok(attachment_json(&attached))
+  }
+
+  fn detach(&mut self, args: &Value) -> Result<Value, McpError> {
+    let attachment = u64_arg(args, "attachment")?;
+    self.client.detach(attachment).map_err(refusal)?;
+    Ok(json!({ "detached": true }))
+  }
+
+  fn read_base(&mut self, args: &Value) -> Result<Value, McpError> {
+    let volume = volume_arg(args, "volume")?;
+    let path = string_arg(args, "path")?;
+    let bytes = self.client.read_base(volume, &path).map_err(refusal)?;
+    // The exact byte length is reported; the text is a lossy UTF-8 rendering (a base64 field for
+    // binary bytes is owed), so an agent always knows the true size even when the text is lossy.
+    Ok(json!({
+      "path": path,
+      "len": bytes.len(),
+      "text": String::from_utf8_lossy(&bytes),
+    }))
+  }
+
+  fn rewitness(&mut self, args: &Value) -> Result<Value, McpError> {
+    let volume = volume_arg(args, "volume")?;
+    let paths = self
+      .client
+      .rewitness(volume, paths_opt(args))
+      .map_err(refusal)?;
+    Ok(json!({ "rewitnessed": paths }))
+  }
+
+  fn pin(&mut self, args: &Value) -> Result<Value, McpError> {
+    let volume = volume_arg(args, "volume")?;
+    let pinned = self.client.pin(volume, paths_opt(args)).map_err(refusal)?;
+    Ok(json!({ "pinned": pinned }))
   }
 
   fn status(&mut self) -> Result<Value, McpError> {
@@ -437,6 +497,36 @@ fn tool_list() -> Vec<Value> {
       json!(["volume"]),
     ),
     tool(
+      "slates.attach.attach",
+      "Attach to a volume for reading (or writing, taking its lease); the attachment id and lease.",
+      json!({ "volume": string, "snapshot": integer, "write": { "type": "boolean" } }),
+      json!(["volume"]),
+    ),
+    tool(
+      "slates.attach.detach",
+      "Detach an attachment, releasing its lease.",
+      json!({ "attachment": integer }),
+      json!(["attachment"]),
+    ),
+    tool(
+      "slates.base.read_base",
+      "Read a file's bytes from a volume's base (the text form and the exact length).",
+      json!({ "volume": string, "path": string }),
+      json!(["volume", "path"]),
+    ),
+    tool(
+      "slates.base.rewitness",
+      "Re-witness a volume's base entries (given `paths`, or all); the paths whose base drifted.",
+      json!({ "volume": string, "paths": { "type": "array", "items": string } }),
+      json!(["volume"]),
+    ),
+    tool(
+      "slates.base.pin",
+      "Pin a volume's base entries (given `paths`, or all) into memory; the count pinned.",
+      json!({ "volume": string, "paths": { "type": "array", "items": string } }),
+      json!(["volume"]),
+    ),
+    tool(
       "slates.land.materialize",
       "Plan a landing of a volume's diverged entries onto a host directory. Returns the manifest and \
        the `slates grant` command a human runs to authorize it — this tool never grants (R10).",
@@ -558,6 +648,27 @@ fn outcome_json(o: &LandingOutcome) -> Value {
     "conflicts": o.conflicts,
     "failed": o.failed,
     "bytes_written": o.bytes_written,
+  })
+}
+
+/// An attachment as JSON: its id (for detach), the lease epoch for a write attachment, and the path
+/// (none until a bridge exists).
+fn attachment_json(a: &Attachment) -> Value {
+  json!({
+    "attachment": a.attachment,
+    "lease_epoch": a.lease_epoch,
+    "path": a.path,
+  })
+}
+
+/// The optional `paths` list of a base operation: `Some` of the given paths, or `None` (all paths)
+/// when the argument is absent.
+fn paths_opt(args: &Value) -> Option<Vec<String>> {
+  args.get("paths").and_then(Value::as_array).map(|items| {
+    items
+      .iter()
+      .filter_map(|v| v.as_str().map(str::to_owned))
+      .collect()
   })
 }
 

@@ -100,10 +100,11 @@ than clobbering it. Non-vacuous — a broken verdict would accept both.
   (`slates.volume.create`/`list`/`stat`/`snapshot`/`clone`/`resize`/`destroy` and `slates.status`)
   over the client SDK, run by `slates mcp` over stdio. No tool creates a grant (R10) — none is
   offered — `slates.land.materialize` plans a landing and returns `GrantRequired` (the manifest and the
-  `slates grant` command a human runs), never a grant. Gated in `crates/mcp/tests/mcp.rs` (one serial
-  daemon: the handshake, the whole merge loop with a concurrent conflict, the volume lifecycle, a
-  landing to an unopenable target surfacing the typed refusal, and typed JSON-RPC errors for a bad tool
-  or id). **Owed:** the remaining §4.12 tools (`slates.attach`/`fs`/`base`), the successful
+  `slates grant` command a human runs), never a grant. Also wired: `slates.attach` (attach/detach),
+  `slates.base` (read_base/rewitness/pin). Gated in `crates/mcp/tests/mcp.rs` (one serial daemon: the
+  handshake, the whole merge loop with a concurrent conflict, the volume lifecycle, attach and the base
+  operations over an overlay, a landing to an unopenable target surfacing the typed refusal, and typed
+  JSON-RPC errors for a bad tool or id). **Owed:** `slates.fs` (the mount path), the successful
   plan-grant-execute landing path (the server's Linux lane), Streamable HTTP, resources and prompts,
   and the Python/TypeScript SDKs.
 - **Access control on the merge verbs** is owed and consistent across all of them: `create_work`,

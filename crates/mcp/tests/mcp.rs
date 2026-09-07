@@ -201,6 +201,37 @@ fn assert_volume_lifecycle(server: &mut McpServer) {
   assert_eq!(status["shards"], 2);
 }
 
+/// Attach and the base operations over MCP: over an overlay of a real, readable directory (so the
+/// base operations have a base), attach for reading and detach, then rewitness and pin the base.
+fn assert_attach_base(server: &mut McpServer) {
+  // An overlay over this crate's own directory (read only, R1): a small, always-present base, with a
+  // bounded size so pin has budget to lock its entries.
+  let volume = call(
+    server,
+    "slates.volume.create",
+    json!({ "name": "ab", "base": env!("CARGO_MANIFEST_DIR"), "bounded": 16u64 << 20 }),
+  )["volume"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+
+  let attached = call(server, "slates.attach.attach", json!({ "volume": volume }));
+  let attachment = attached["attachment"].as_u64().unwrap();
+  assert_eq!(
+    call(
+      server,
+      "slates.attach.detach",
+      json!({ "attachment": attachment })
+    ),
+    json!({ "detached": true })
+  );
+
+  assert!(
+    call(server, "slates.base.rewitness", json!({ "volume": volume }))["rewitnessed"].is_array()
+  );
+  assert!(call(server, "slates.base.pin", json!({ "volume": volume }))["pinned"].is_number());
+}
+
 /// A landing planned over MCP: to a target that cannot be opened, the tool surfaces the daemon's
 /// typed refusal as a JSON-RPC error (the full plan-grant-execute flow needs a real target and the
 /// control channel, exercised in the server's Linux landing lane). No grant is ever created (R10).
@@ -279,6 +310,7 @@ fn the_mcp_surface_serves_the_tools() {
   assert_protocol(&mut server);
   assert_merge_loop(&mut server);
   assert_volume_lifecycle(&mut server);
+  assert_attach_base(&mut server);
   assert_land(&mut server);
   assert_malformed(&mut server);
 
