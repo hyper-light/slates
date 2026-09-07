@@ -681,3 +681,31 @@ fn a_rebased_operation_still_merges_a_later_disjoint_head_move() {
     "the fine-grained rebased op merges the disjoint head move"
   );
 }
+
+/// An increment round-trips through encode/decode exactly (§4.8 chain persistence): the identity,
+/// base, ops document and post-state all survive, so a replayed chain rebuilds the same green.
+#[test]
+fn an_increment_round_trips_through_encode_and_decode() {
+  let inc = Build::new()
+    .create("f", b"hello")
+    .overwrite("f", 0, b"HELLO")
+    .setxattr("f", "user.k", b"v")
+    .at(7, 3);
+  let decoded = Increment::decode(&inc.encode()).expect("a valid increment decodes");
+  assert_eq!(decoded, inc, "decode(encode(increment)) == increment");
+}
+
+/// A truncated increment refuses by type rather than panicking (§4.8 — a torn chain entry).
+#[test]
+fn a_truncated_increment_refuses() {
+  let inc = Build::new().create("f", b"hello").at(1, 0);
+  let bytes = inc.encode();
+  assert!(
+    Increment::decode(&bytes[..bytes.len() - 1]).is_err(),
+    "a truncated increment does not decode"
+  );
+  assert!(
+    Increment::decode(&[]).is_err(),
+    "empty bytes do not decode to an increment"
+  );
+}

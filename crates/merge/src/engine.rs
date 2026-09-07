@@ -43,7 +43,7 @@ use crate::verdict::MergeConflictClass;
 
 /// An increment submitted against a base version: the deriver's ops document and the sealed
 /// post-state its content operations' `src` offsets index into.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Increment {
   /// The increment's identity (`blake3` of its declared work).
   pub id: [u8; 32],
@@ -53,6 +53,57 @@ pub struct Increment {
   pub doc: OpsDoc,
   /// The sealed post-state bytes; a content op adds `post_state[src .. src + len]`.
   pub post_state: Vec<u8>,
+}
+
+impl Increment {
+  /// Serializes the increment for the durable green chain (§4.16, §4.8): the identity, the base
+  /// version, then the ops document and the post-state, each length-delimited. The db stores these
+  /// bytes opaquely (it never parses a merge structure); the server encodes here on commit and
+  /// decodes on recovery. Little-endian and length-delimited so [`Increment::decode`] is exact.
+  pub fn encode(&self) -> Vec<u8> {
+    let doc = self.doc.encode();
+    let mut out = Vec::with_capacity(
+      self.id.len()
+        + size_of::<u64>()
+        + size_of::<u64>()
+        + doc.len()
+        + size_of::<u64>()
+        + self.post_state.len(),
+    );
+    out.extend_from_slice(&self.id);
+    out.extend_from_slice(&self.base.to_le_bytes());
+    out.extend_from_slice(&(doc.len() as u64).to_le_bytes());
+    out.extend_from_slice(&doc);
+    out.extend_from_slice(&(self.post_state.len() as u64).to_le_bytes());
+    out.extend_from_slice(&self.post_state);
+    out
+  }
+
+  /// Decodes an increment persisted by [`Increment::encode`] — the inverse used to replay a green's
+  /// chain on recovery. Every length is bounds-checked against the bytes that remain before it is
+  /// read (a torn db entry never allocates a wild length), and any malformation is a typed
+  /// [`DocDecodeError`], never a panic.
+  pub fn decode(bytes: &[u8]) -> Result<Increment, crate::ops_doc::DocDecodeError> {
+    use crate::ops_doc::{DocDecodeError, OpsDoc, Reader};
+    let mut reader = Reader::new(bytes);
+    let mut id = [0u8; 32];
+    let id_len = id.len();
+    id.copy_from_slice(reader.bytes(id_len)?);
+    let base = reader.u64()?;
+    let doc_len = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
+    let doc = OpsDoc::decode(reader.bytes(doc_len)?)?;
+    let post_len = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
+    let post_state = reader.bytes(post_len)?.to_vec();
+    if !reader.is_empty() {
+      return Err(DocDecodeError::TrailingBytes);
+    }
+    Ok(Increment {
+      id,
+      base,
+      doc,
+      post_state,
+    })
+  }
 }
 
 /// A conflict window: the file, the range (base coordinates) that met an intervening change, and

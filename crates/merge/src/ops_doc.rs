@@ -221,4 +221,163 @@ impl OpsDoc {
   pub fn identity(&self) -> [u8; 32] {
     *blake3::hash(&self.encode()).as_bytes()
   }
+
+  /// Decodes the canonical encoding produced by [`OpsDoc::encode`] — the inverse used to replay a
+  /// green's persisted chain on recovery (§4.16, §4.8). It reads OUR OWN persisted bytes, but a torn
+  /// or corrupted db entry could present anything, so every field is bounds-checked against the bytes
+  /// that remain before it is read, no count from the header is trusted for allocation, and any
+  /// mismatch is a typed [`DocDecodeError`] rather than a panic. The decode is exact: `decode(encode(d))`
+  /// equals `d` for every document, the round-trip gated by test.
+  pub fn decode(bytes: &[u8]) -> Result<OpsDoc, DocDecodeError> {
+    let mut reader = Reader::new(bytes);
+    if reader.u32()? != MAGIC {
+      return Err(DocDecodeError::BadMagic);
+    }
+    if reader.u32()? != VERSION {
+      return Err(DocDecodeError::BadVersion);
+    }
+    let path_count = reader.u32()? as usize;
+    let op_count = reader.u32()? as usize;
+    // A path is at least its 4-byte length prefix and an op is a fixed 28-byte record; if the header's
+    // counts cannot fit in the bytes that remain, the entry is corrupt — checked before any allocation
+    // so a wild count never reserves memory it cannot fill.
+    if path_count > reader.remaining() / PATH_MIN_BYTES {
+      return Err(DocDecodeError::Truncated);
+    }
+    let mut paths = PathTable::new();
+    for _ in 0..path_count {
+      let len = reader.u32()? as usize;
+      let raw = reader.bytes(len)?;
+      let path = std::str::from_utf8(raw).map_err(|_| DocDecodeError::BadPath)?;
+      paths.intern(path);
+    }
+    if op_count > reader.remaining() / OP_BYTES {
+      return Err(DocDecodeError::Truncated);
+    }
+    let mut ops = Vec::with_capacity(op_count);
+    for _ in 0..op_count {
+      let kind = OpKind::from_wire(reader.u8()?).ok_or(DocDecodeError::BadKind)?;
+      let flags = reader.u8()?;
+      let path = reader.u16()?;
+      let at = reader.u64()?;
+      let len = reader.u64()?;
+      let src = reader.u64()?;
+      ops.push(Op {
+        kind,
+        flags,
+        path,
+        at,
+        len,
+        src,
+      });
+    }
+    if !reader.is_empty() {
+      return Err(DocDecodeError::TrailingBytes);
+    }
+    Ok(OpsDoc { paths, ops })
+  }
+}
+
+/// The smallest a path entry can be in the encoding: its length prefix (a `u32`), for an empty path.
+const PATH_MIN_BYTES: usize = size_of::<u32>();
+/// A fixed operation record's size: kind + flags (`u8` each), path (`u16`), and `at`, `len`, `src`
+/// (`u64` each) — the fields of [`Op`] as they are written by [`OpsDoc::encode`].
+const OP_BYTES: usize = size_of::<u8>()
+  + size_of::<u8>()
+  + size_of::<u16>()
+  + size_of::<u64>()
+  + size_of::<u64>()
+  + size_of::<u64>();
+
+/// A refusal decoding an ops document (§4.16): the closed set of ways the canonical bytes can be
+/// malformed. Every one is a corrupt or truncated entry, never a panic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocDecodeError {
+  /// The bytes ended before a field could be read.
+  Truncated,
+  /// The magic number was not the ops-document magic.
+  BadMagic,
+  /// The version was not one this build decodes.
+  BadVersion,
+  /// An operation kind byte named no known kind.
+  BadKind,
+  /// A path was not valid UTF-8.
+  BadPath,
+  /// Bytes remained after the last operation.
+  TrailingBytes,
+}
+
+impl std::fmt::Display for DocDecodeError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let reason = match self {
+      DocDecodeError::Truncated => "the ops document ended early",
+      DocDecodeError::BadMagic => "the ops document magic is wrong",
+      DocDecodeError::BadVersion => "the ops document version is unknown",
+      DocDecodeError::BadKind => "an operation kind is unknown",
+      DocDecodeError::BadPath => "a path is not valid UTF-8",
+      DocDecodeError::TrailingBytes => "the ops document has trailing bytes",
+    };
+    f.write_str(reason)
+  }
+}
+
+impl std::error::Error for DocDecodeError {}
+
+/// A cursor over the canonical bytes: every read is bounds-checked against what remains, so a torn
+/// entry yields a typed [`DocDecodeError::Truncated`] rather than an out-of-bounds panic.
+pub(crate) struct Reader<'a> {
+  bytes: &'a [u8],
+  at: usize,
+}
+
+impl<'a> Reader<'a> {
+  pub(crate) fn new(bytes: &'a [u8]) -> Reader<'a> {
+    Reader { bytes, at: 0 }
+  }
+
+  /// The bytes not yet read.
+  pub(crate) fn remaining(&self) -> usize {
+    self.bytes.len().saturating_sub(self.at)
+  }
+
+  pub(crate) fn is_empty(&self) -> bool {
+    self.remaining() == 0
+  }
+
+  /// The next `len` bytes, advancing past them, or `Truncated` when fewer remain.
+  pub(crate) fn bytes(&mut self, len: usize) -> Result<&'a [u8], DocDecodeError> {
+    let end = self.at.checked_add(len).ok_or(DocDecodeError::Truncated)?;
+    let slice = self
+      .bytes
+      .get(self.at..end)
+      .ok_or(DocDecodeError::Truncated)?;
+    self.at = end;
+    Ok(slice)
+  }
+
+  pub(crate) fn u8(&mut self) -> Result<u8, DocDecodeError> {
+    let b = self.bytes(size_of::<u8>())?;
+    Ok(b[0])
+  }
+
+  pub(crate) fn u16(&mut self) -> Result<u16, DocDecodeError> {
+    let b = self.bytes(size_of::<u16>())?;
+    let mut word = [0u8; size_of::<u16>()];
+    word.copy_from_slice(b);
+    Ok(u16::from_le_bytes(word))
+  }
+
+  pub(crate) fn u32(&mut self) -> Result<u32, DocDecodeError> {
+    let b = self.bytes(size_of::<u32>())?;
+    let mut word = [0u8; size_of::<u32>()];
+    word.copy_from_slice(b);
+    Ok(u32::from_le_bytes(word))
+  }
+
+  pub(crate) fn u64(&mut self) -> Result<u64, DocDecodeError> {
+    let b = self.bytes(size_of::<u64>())?;
+    let mut word = [0u8; size_of::<u64>()];
+    word.copy_from_slice(b);
+    Ok(u64::from_le_bytes(word))
+  }
 }

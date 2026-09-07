@@ -117,3 +117,91 @@ fn the_ops_document_identity_matches_its_golden_vector() {
     "the ops document identity changed; regenerate the golden vector only for a deliberate format change"
   );
 }
+
+/// A document round-trips through encode/decode exactly: every kind, several paths, content and
+/// namespace and xattr operations (§4.16, §4.8 — the chain is replayed from these bytes on recovery).
+#[test]
+fn the_document_round_trips_through_encode_and_decode() {
+  let mut d = OpsDoc::new();
+  for &(path, name, kind, at, len, src) in &[
+    ("src/lib.rs", "", OpKind::Overwrite, 10u64, 4u64, 0u64),
+    ("src/lib.rs", "", OpKind::Insert, 20, 3, 4),
+    ("dir", "", OpKind::Mkdir, 0, 0, u64::MAX),
+    ("old", "", OpKind::Rename, 0, 0, 1),
+    ("f", "user.k", OpKind::SetXattr, 0, 2, 7),
+  ] {
+    let path_idx = d.paths.intern(path);
+    let extra = if name.is_empty() {
+      src
+    } else {
+      u64::from(d.paths.intern(name))
+    };
+    d.ops.push(Op {
+      kind,
+      flags: 0,
+      path: path_idx,
+      at,
+      len,
+      src: extra,
+    });
+  }
+  d.canonicalize();
+  let decoded = OpsDoc::decode(&d.encode()).expect("a valid document decodes");
+  assert_eq!(decoded, d, "decode(encode(d)) == d");
+}
+
+/// The empty document round-trips.
+#[test]
+fn the_empty_document_round_trips() {
+  let d = OpsDoc::new();
+  assert_eq!(OpsDoc::decode(&d.encode()).expect("empty decodes"), d);
+}
+
+/// Hostile inputs decode to a typed refusal, never a panic (§4.8 — a torn or corrupt db entry).
+#[test]
+fn hostile_documents_refuse_by_type() {
+  use slates_merge::ops_doc::DocDecodeError;
+  let good = doc(&[("a", OpKind::Insert, 0, 1), ("b", OpKind::Overwrite, 2, 3)]).encode();
+
+  // Empty and short inputs cannot even hold the magic.
+  assert_eq!(OpsDoc::decode(&[]), Err(DocDecodeError::Truncated));
+  assert_eq!(OpsDoc::decode(&[1, 2, 3]), Err(DocDecodeError::Truncated));
+
+  // A wrong magic and a wrong version are named.
+  let mut bad_magic = good.clone();
+  bad_magic[0] ^= 0xff;
+  assert_eq!(OpsDoc::decode(&bad_magic), Err(DocDecodeError::BadMagic));
+  let mut bad_version = good.clone();
+  bad_version[4] ^= 0xff;
+  assert_eq!(
+    OpsDoc::decode(&bad_version),
+    Err(DocDecodeError::BadVersion)
+  );
+
+  // A truncated tail (drop the last op's bytes) is truncated, not a panic.
+  assert_eq!(
+    OpsDoc::decode(&good[..good.len() - 5]),
+    Err(DocDecodeError::Truncated)
+  );
+
+  // Trailing bytes past the last op are rejected.
+  let mut trailing = good.clone();
+  trailing.push(0);
+  assert_eq!(
+    OpsDoc::decode(&trailing),
+    Err(DocDecodeError::TrailingBytes)
+  );
+
+  // A wild path count (u32::MAX at bytes 8..12) cannot fit the remaining bytes: truncated, no
+  // allocation of the claimed size.
+  let mut wild = good.clone();
+  wild[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+  assert_eq!(OpsDoc::decode(&wild), Err(DocDecodeError::Truncated));
+
+  // A corrupt op kind byte names no kind. The op records start after the header (16 bytes) and the
+  // two single-character paths (4 + 1 each); the first op's kind is the first byte there.
+  let mut bad_kind = good.clone();
+  let op_start = 16 + (4 + 1) + (4 + 1);
+  bad_kind[op_start] = 0xff;
+  assert_eq!(OpsDoc::decode(&bad_kind), Err(DocDecodeError::BadKind));
+}
