@@ -9,7 +9,9 @@
 use std::time::{Duration, Instant};
 
 use slates_anchor::AnchorSegment;
-use slates_client::{Client, ClientError, CreateSpec, Deadlines, Intent, NamePolicy, SizeClass};
+use slates_client::{
+  Client, ClientError, CreateSpec, Deadlines, Intent, NamePolicy, SizeClass, Submitted,
+};
 use slates_ipc::protocol::{Refusal, RequestBody};
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
@@ -298,6 +300,80 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
     Client::resume(&instance, session, deadlines()),
     Err(ClientError::SessionTaken { .. })
   ));
+  second.stop();
+  drop(segment);
+}
+
+/// Commits two versions on a green: create `f`, then modify it, so the chain has versions 1 and 2.
+fn seed_green_two_versions(client: &mut Client, green: slates_client::VolumeId) {
+  let (w0, _) = client.create_work(green, "w0").unwrap();
+  client.edit(w0, "f", 0, 0, b"hello").unwrap();
+  assert!(matches!(client.submit(w0).unwrap(), Submitted::Accepted(1)));
+  let (w1, _) = client.create_work(green, "w1").unwrap();
+  client.edit(w1, "f", 0, 5, b"world").unwrap();
+  assert!(matches!(client.submit(w1).unwrap(), Submitted::Accepted(2)));
+  assert_eq!(client.versions(green).unwrap(), 2);
+}
+
+/// After the restart the green's chain recovered: the head is 2, the last-changed index still names
+/// f after version 0, and a new increment continues from the recovered head (version 3, not 1).
+fn assert_green_recovered(client: &mut Client, green: slates_client::VolumeId) {
+  assert_eq!(
+    client.versions(green).unwrap(),
+    2,
+    "the green's chain survived the restart"
+  );
+  assert_eq!(
+    client.changed_since(green, 0).unwrap(),
+    vec!["f".to_owned()]
+  );
+  assert!(client.changed_since(green, 2).unwrap().is_empty());
+  let (w2, base) = client.create_work(green, "w2").unwrap();
+  assert_eq!(base, 2, "a new work is based on the recovered head");
+  client.edit(w2, "g", 0, 0, b"new").unwrap();
+  match client.submit(w2).unwrap() {
+    Submitted::Accepted(v) => assert_eq!(v, 3, "the recovered green advances to version 3"),
+    other => panic!("expected accept, got {other:?}"),
+  }
+}
+
+/// A green's version chain is durable (§4.16, §4.8): versions committed before a restart are
+/// recovered from the partition log, so the head returns, the last-changed index is intact, and a
+/// new increment continues the chain. Non-vacuous: without the persisted chain the recovered green
+/// would be empty (head 0) and the next submit would be version 1, not 3.
+#[test]
+fn a_green_chain_survives_a_daemon_restart() {
+  let profile = profile();
+  let instance = format!("cl-green-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let content_bytes = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX)
+    * 2
+    * usize::from(config.geometry.partitions.max(1));
+  let segment = AnchorSegment::create(
+    "slates-seg-cl-green",
+    &profile.facts.identity,
+    config.geometry,
+  )
+  .unwrap()
+  .with_content("slates-con-cl-green", content_bytes)
+  .unwrap();
+  let source = || {
+    let (handoff, len) = segment.handoff().unwrap();
+    let content = segment.content_handoff().unwrap();
+    SegmentSource::Handoff {
+      handoff,
+      len,
+      content,
+    }
+  };
+  let first = Daemon::start(&profile, config.clone(), source()).unwrap();
+  let mut client = connect(&instance);
+  let green = client.create_green("g", false).unwrap();
+  seed_green_two_versions(&mut client, green);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source()).unwrap();
+  assert_green_recovered(&mut client, green);
   second.stop();
   drop(segment);
 }

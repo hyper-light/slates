@@ -8,7 +8,9 @@
 > conflict; `Rebase`, the corrective path (map a work's pending operations onto the head without
 > committing, or return the windows); and `Declare`, the namespace and metadata operations beyond
 > content (unlink, rename, mkdir, rmdir, mode, symlink, hard link, xattr) — all through the real verbs.
-> **Owed:** `advance` (the attachment re-pin), cross-shard submit, chain persistence, and the non-Rust SDKs (the Rust CLI verbs are wired).
+> Chain persistence is landed: an accepted `Submit` appends a durable `GreenAdvanced` record and a
+> restart replays it, recovering the green's chain (single node).
+> **Owed:** `advance` (the attachment re-pin), the migration case of cross-shard submit (fleet, Phase 8), checkpointing to bound the chain, and the non-Rust SDKs (the Rust CLI verbs are wired).
 
 ## What is wired (server + ipc + client)
 
@@ -77,15 +79,20 @@ than clobbering it. Non-vacuous — a broken verdict would accept both.
   refuse `NotFound` were the work placed away from its green. The only cross-shard case is a green that
   **migrates** to another shard after the work was created (the work's id still names the old owner);
   that is the fleet ownership-takeover path (§4.8), owed with Phase 8, not a single-node gap.
-- **Chain persistence** (GAP-A9-14, Phase 6) is **owed and needs a design amendment before code.** The
-  green's version chain, its deltas and the `seen` set live only in the in-memory engine; a restart
-  loses them. On recovery a `Role::Green`/`Role::Work` record currently falls through the store-volume
-  path and is skipped as `RecoveryIncomplete` (the record survives, the volume refuses on use — no
-  empty-success, but no recovery either). The design's laptop-degenerate mechanism is "the merge record
-  is a partition log append" (§4.16), which means a **new durable `Op`** — a change to the durable
-  format that belongs in the audit-owned amendment log (§4.9), alongside exactly-once atomicity with
-  the completion record and a bound (checkpointing) on the stored chain. It is ready to build once the
-  amendment is decided.
+- **Chain persistence** (GAP-A9-14, Phase 6) is **landed** (single node): the design's laptop
+  mechanism — "the merge record is a partition log append" — is realized as `Op::GreenAdvanced { green,
+  increment }`, appended on each accepted `Submit` and replayed on recovery. `submit` records it
+  guard-then-apply: the chain's byte budget is checked *before* the verdict commits (so an accepted
+  increment is always recordable, never stranding the green ahead of its log behind the engine's `seen`
+  cache), then the increment is appended in the same durable transaction as the completion record.
+  Recovery rebuilds each green by replaying its chain into a fresh engine (`rebuild_green`); a work is
+  reset to a fresh clone of its green's recovered head (`rebuild_work`) since its declared edits were
+  scratch. The chain is bounded by a derived byte budget with a typed `Capacity` refusal; checkpointing
+  to fold old entries (the design's optimization, which lifts the cap) is owed — the same owed
+  optimization as the engine's `content_history`. Gated in `crates/db/tests/model.rs` (a `GreenAdvance`
+  step under the crash-recovery whole-state comparison) and `crates/client/tests/client.rs`
+  (`a_green_chain_survives_a_daemon_restart`: two versions committed, the daemon restarted over the same
+  segment, the head and last-changed index recovered, a new increment continuing to version 3).
 - **Surfaces (task 8):** the non-Rust SDKs (MCP, Python, TypeScript); the Rust client and the CLI
   verbs are wired.
 - **Access control on the merge verbs** is owed and consistent across all of them: `create_work`,

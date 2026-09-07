@@ -1782,14 +1782,37 @@ fn submit(state: &mut ShardState, work: VolumeId) -> ReplyBody {
     Ok(built) => built,
     Err(refusal) => return refused(refusal),
   };
-  let Some(engine) = state.greens.get_mut(&green_id) else {
-    return refused(Refusal::NotFound);
+  // The increment is recorded durably so a restart replays it (§4.8, §4.16). Guard-then-apply: the
+  // chain must be able to hold it *before* the verdict commits, so an accepted increment is always
+  // recorded — otherwise a full-chain refusal after an in-memory commit would strand the green ahead
+  // of its log, hidden by the engine's idempotent `seen` cache on retry. A full chain refuses every
+  // submit (it cannot advance regardless of the verdict).
+  let record = Op::GreenAdvanced {
+    green: green_id,
+    increment: inc.encode(),
   };
-  match engine.submit(&inc) {
-    slates_merge::engine::Outcome::Accepted { version } => ReplyBody::Submitted {
-      version: Some(version),
-      conflicts: Vec::new(),
-    },
+  let now = state.clock.monotonic_ns();
+  if let Err(e) = state.db.partition().check(&record, now) {
+    return refused(refusal_of_db(&e));
+  }
+  let outcome = {
+    let Some(engine) = state.greens.get_mut(&green_id) else {
+      return refused(Refusal::NotFound);
+    };
+    engine.submit(&inc)
+  };
+  match outcome {
+    slates_merge::engine::Outcome::Accepted { version } => {
+      // The pre-check passed and the shard is single-threaded, so this append fits the budget; a
+      // segment-full failure refuses like any other verb and a resubmit records the (idempotent) accept.
+      if let Err(e) = state.db.mutate(&mut state.segment, &record, now) {
+        return refused(refusal_of_db(&e));
+      }
+      ReplyBody::Submitted {
+        version: Some(version),
+        conflicts: Vec::new(),
+      }
+    }
     slates_merge::engine::Outcome::Conflict { windows } => ReplyBody::Submitted {
       version: None,
       conflicts: merge_windows(&windows),
@@ -2882,6 +2905,9 @@ pub struct Rebuilt {
   pub snapshots_dropped: usize,
   /// Attachments reconciled out of the catalog (their clients attach again).
   pub attachments_dropped: usize,
+  /// Merge volumes rebuilt (§4.16): greens with their persisted chain replayed, works reset to a
+  /// fresh clone of their green's head (their scratch edits did not survive).
+  pub merge_volumes: usize,
 }
 
 /// Rebuilds the recovered catalog's volumes into live state after a daemon start over a
@@ -2914,20 +2940,36 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   let images = recover_images(state);
   let mut rebuilt = Rebuilt::default();
   let mut max_prefix = state.next_prefix;
+  // Greens first, so a work can seed from a rebuilt green (§4.16): a green's merge chain is replayed
+  // into a fresh engine, restoring its content and versions.
   for record in &records {
-    match rebuild_volume(state, record, images.get(&record.id.bytes)) {
-      Ok(prefix) => {
-        rebuilt.volumes += 1;
-        max_prefix = max_prefix.max(prefix.wrapping_add(1).max(1));
+    if matches!(record.policy.role, Role::Green { .. }) {
+      rebuild_green(state, record);
+      rebuilt.merge_volumes += 1;
+    }
+  }
+  for record in &records {
+    match record.policy.role {
+      // Rebuilt in the pass above; here only its content-less attachments are reconciled out.
+      Role::Green { .. } => {}
+      Role::Work { green, .. } => {
+        rebuild_work(state, record, green);
+        rebuilt.merge_volumes += 1;
       }
-      Err(reason) => {
-        rebuilt.skipped += 1;
-        eprintln!(
-          "slates-server: partition {}: volume {} not rebuilt: {reason}",
-          state.partition, record.name
-        );
-        continue;
-      }
+      Role::Plain => match rebuild_volume(state, record, images.get(&record.id.bytes)) {
+        Ok(prefix) => {
+          rebuilt.volumes += 1;
+          max_prefix = max_prefix.max(prefix.wrapping_add(1).max(1));
+        }
+        Err(reason) => {
+          rebuilt.skipped += 1;
+          eprintln!(
+            "slates-server: partition {}: volume {} not rebuilt: {reason}",
+            state.partition, record.name
+          );
+          continue;
+        }
+      },
     }
     let (snapshots, attachments) = reconcile_lost(state, record);
     rebuilt.snapshots_dropped += snapshots;
@@ -2937,6 +2979,54 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   // volume's inode numbers (the prefixes came from the images, not from `next_prefix`).
   state.next_prefix = max_prefix;
   rebuilt
+}
+
+/// Rebuilds a recovered green volume (§4.16, §4.8): a fresh merge engine with its persisted chain
+/// replayed in order, so its content, versions, last-changed index and dedup set return exactly as
+/// before the restart. A corrupt chain entry stops the replay there — the green recovers to its last
+/// good version, logged, rather than presenting a wrong later state.
+fn rebuild_green(state: &mut ShardState, record: &VolumeRecord) {
+  let chain: Vec<Vec<u8>> = state.db.partition().green_chain(record.id).to_vec();
+  let mut green = slates_merge::engine::Green::new();
+  for (version, bytes) in chain.iter().enumerate() {
+    match slates_merge::engine::Increment::decode(bytes) {
+      Ok(inc) => {
+        let _ = green.submit(&inc);
+      }
+      Err(e) => {
+        eprintln!(
+          "slates-server: partition {}: green {} chain entry {version} is corrupt, replay stops: {e}",
+          state.partition, record.name
+        );
+        break;
+      }
+    }
+  }
+  state.greens.insert(record.id, green);
+}
+
+/// Rebuilds a recovered work volume as a fresh clone of its green's current head (§4.16): a work's
+/// declared edits are scratch and do not survive a restart (BUG-11 class), so the work is reset —
+/// seeded with the green's content and based on its head — never presenting lost edits as if kept.
+/// Skipped when its green is gone (the work has nothing to be over).
+fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId) {
+  let Some(engine) = state.greens.get(&green) else {
+    return;
+  };
+  let base_version = engine.head();
+  let content = engine
+    .files()
+    .map(|(path, bytes)| (path.to_owned(), bytes.to_vec()))
+    .collect();
+  state.works.insert(
+    record.id,
+    crate::state::WorkState {
+      green,
+      base_version,
+      journal: Vec::new(),
+      content,
+    },
+  );
 }
 
 /// The shard's recovery images from its slice of the anchor content object (§4.8), by volume id.

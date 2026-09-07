@@ -385,8 +385,12 @@ fn init_shard(
     // Say what recovery did, not more: identities were rebuilt (content is recreated empty until it
     // is anchor-backed, BUG-11), and the content-less local snapshots and attachments were dropped.
     eprintln!(
-      "slates-server: shard {shard}: rebuilt {} volume identities (content empty; {} skipped), dropped {} local snapshots and {} attachments",
-      rebuilt.volumes, rebuilt.skipped, rebuilt.snapshots_dropped, rebuilt.attachments_dropped
+      "slates-server: shard {shard}: rebuilt {} volume identities (content empty; {} skipped), {} merge volumes (green chains replayed, works reset), dropped {} local snapshots and {} attachments",
+      rebuilt.volumes,
+      rebuilt.skipped,
+      rebuilt.merge_volumes,
+      rebuilt.snapshots_dropped,
+      rebuilt.attachments_dropped
     );
   }
   state::install(state);
