@@ -32,5 +32,5 @@ pub use error::ClientError;
 pub use slates_ipc::protocol::{
   ActionCount, AuditEntry, DaemonReport, Filter, GrantScope, GrantSummary, Intent, LandingOutcome,
   LandingSummary, NamePolicy, PlacedState, Refusal, RefusalCount, Scope, ShardReport, Signal,
-  SizeClass, SnapshotId, StatusReport, VolumeId, VolumeSummary,
+  SizeClass, SnapshotId, StatusReport, VolumeId, VolumeSummary, WorkOp,
 };

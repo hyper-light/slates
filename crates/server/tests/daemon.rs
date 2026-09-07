@@ -468,6 +468,7 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
   merge_modify_scenario();
   merge_lagging_scenario();
   merge_rebase_scenario();
+  merge_declare_scenario();
 }
 
 /// Shape: a version slab large enough to physically hold several volumes' inode and trie nodes, yet
@@ -1106,5 +1107,134 @@ fn merge_rebase_scenario() {
 
   rebase_clean_part(&mut client, green);
   rebase_conflict_part(&mut client, green);
+  daemon.stop();
+}
+
+/// Declares a namespace or metadata operation on a work, asserting it is recorded.
+fn declare(
+  client: &mut Client,
+  work: slates_ipc::protocol::VolumeId,
+  op: slates_ipc::protocol::WorkOp,
+) {
+  assert!(matches!(
+    client.call(&RequestBody::Declare { work, op }),
+    ReplyBody::Declared
+  ));
+}
+
+/// A work declares directory, symlink and mode operations in one increment, all against a file the
+/// green already holds; they merge as one version (§4.16 — every dimension the deriver composes).
+fn declare_metadata_part(client: &mut Client, green: slates_ipc::protocol::VolumeId) {
+  use slates_ipc::protocol::WorkOp;
+  let meta = work_over(client, green, "meta");
+  declare(
+    client,
+    meta,
+    WorkOp::Mkdir {
+      path: "d".to_owned(),
+    },
+  );
+  declare(
+    client,
+    meta,
+    WorkOp::Symlink {
+      path: "l".to_owned(),
+      target: "f".to_owned(),
+    },
+  );
+  declare(
+    client,
+    meta,
+    WorkOp::SetMode {
+      path: "f".to_owned(),
+      mode: 0o644,
+    },
+  );
+  let ReplyBody::Submitted { version, conflicts } =
+    client.call(&RequestBody::Submit { work: meta })
+  else {
+    panic!("submit meta");
+  };
+  assert!(
+    conflicts.is_empty(),
+    "the directory, symlink and mode merge in one increment: {conflicts:?}"
+  );
+  assert_eq!(version, Some(2), "the metadata increment is version 2");
+}
+
+/// A work sets an extended attribute and it commits; a concurrent work setting a *different* value
+/// conflicts (§4.16 xattr merge, meta/meta). This is the non-vacuity for the post-state seal: the
+/// value round-trips through the post-state, so the green stores the real bytes and the verdict
+/// compares them — were the value left zero, both works would seal the same zeros, hash to the same
+/// increment identity, and the second would deduplicate to the first's accept instead of conflicting.
+/// (The identical-value *accept* path is the engine's `xattr_merges`; over the wire it is exactly
+/// this deduplication, so it is not re-asserted here.)
+fn declare_xattr_part(client: &mut Client, green: slates_ipc::protocol::VolumeId) {
+  use slates_ipc::protocol::WorkOp;
+  let set = |client: &mut Client, name: &str, value: &[u8]| -> slates_ipc::protocol::VolumeId {
+    let work = work_over(client, green, name);
+    declare(
+      client,
+      work,
+      WorkOp::SetXattr {
+        path: "f".to_owned(),
+        name: "user.k".to_owned(),
+        value: value.to_vec(),
+      },
+    );
+    work
+  };
+  // Both are created and declared while the head is 2, so each is based on 2 and the second meets the
+  // first's committed change rather than sitting past it.
+  let first = set(client, "xattr-a", b"AA");
+  let other = set(client, "xattr-c", b"BB");
+
+  // The first sets the attribute; it advances the green to version 3, storing "AA".
+  let ReplyBody::Submitted { version, .. } = client.call(&RequestBody::Submit { work: first })
+  else {
+    panic!("submit xattr-a");
+  };
+  assert_eq!(version, Some(3), "the first xattr set is version 3");
+
+  // The second, based on 2, sets a different value — it conflicts against the stored "AA".
+  let ReplyBody::Submitted { version, conflicts } =
+    client.call(&RequestBody::Submit { work: other })
+  else {
+    panic!("submit xattr-c");
+  };
+  assert_eq!(
+    version, None,
+    "a differing concurrent xattr does not accept"
+  );
+  assert!(
+    conflicts.iter().any(|w| w.path == "f"),
+    "the conflict names the file: {conflicts:?}"
+  );
+}
+
+/// The namespace and metadata declarations (§4.16) over the wire: a work declares directories,
+/// symlinks, modes and extended attributes — the dimensions beyond content — and they merge. The
+/// xattr sub-test is the non-vacuity for the post-state seal (an identical value must accept).
+fn merge_declare_scenario() {
+  let (daemon, instance) = daemon("merge-declare");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "g6".to_owned(),
+    require_evidence: false,
+  }) else {
+    panic!("create green");
+  };
+  // Seed a file the metadata operations attach to.
+  let seed = work_over(&mut client, green, "seed");
+  edit_f(&mut client, seed, 0, 0, b"hello");
+  assert!(matches!(
+    client.call(&RequestBody::Submit { work: seed }),
+    ReplyBody::Submitted {
+      version: Some(1),
+      ..
+    }
+  ));
+  declare_metadata_part(&mut client, green);
+  declare_xattr_part(&mut client, green);
   daemon.stop();
 }

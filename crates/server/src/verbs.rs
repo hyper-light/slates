@@ -17,7 +17,7 @@ use slates_db::catalog::{
 use slates_ipc::protocol::{
   DaemonReport, Direction, Intent, NamePolicy, PlacedState, Refusal, RefusalCount, ReplyBody,
   RequestBody, Scope, ShardReport, Signal, SizeClass, SnapshotId, StatusReport, VolumeId,
-  VolumeSummary, pack, unpack,
+  VolumeSummary, WorkOp, pack, unpack,
 };
 use slates_ipc::slot::SlotKind;
 use slates_ipc::{IpcError, Request};
@@ -186,6 +186,7 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::ChangedSince { green: volume, .. }
     | RequestBody::CreateWork { green: volume, .. }
     | RequestBody::Edit { work: volume, .. }
+    | RequestBody::Declare { work: volume, .. }
     | RequestBody::Submit { work: volume }
     | RequestBody::Rebase { work: volume }
     | RequestBody::Clone { volume, .. }
@@ -796,6 +797,7 @@ fn mutates_shard_image(body: &RequestBody) -> bool {
       | RequestBody::CreateGreen { .. }
       | RequestBody::CreateWork { .. }
       | RequestBody::Edit { .. }
+      | RequestBody::Declare { .. }
       | RequestBody::Submit { .. }
       | RequestBody::Rebase { .. }
       | RequestBody::Clone { .. }
@@ -862,6 +864,7 @@ fn dispatch_inner(
       delete_len,
       bytes,
     } => edit(state, work, &path, at, delete_len, &bytes),
+    RequestBody::Declare { work, op } => declare(state, work, op),
     RequestBody::Submit { work } => submit(state, work),
     RequestBody::Rebase { work } => rebase(state, work),
     RequestBody::Clone {
@@ -1602,42 +1605,111 @@ fn edit(
   ReplyBody::Edited
 }
 
-/// Assembles an increment's post-state from a work's content (§4.16): the seal lays each file's final
-/// content out by region, and each content op names a slice of it — so for every content op, the
-/// bytes at `[op.at, op.at + op.len)` of the file go to `[op.src, op.src + op.len)` of the post-state.
+/// Declares a namespace or metadata operation on a work volume (§4.16): appends the corresponding
+/// declared operation to the work's journal, the counterpart to [`edit`]'s content splice. An unlink
+/// or rename also keeps the work's content map consistent, so a later edit and the post-state seal
+/// see the right files; a symlink's target travels in the ops document's path table and an xattr's
+/// value in the journal, so neither needs a work-side store.
+fn declare(state: &mut ShardState, work: VolumeId, op: WorkOp) -> ReplyBody {
+  let work_id = to_db_volume(work);
+  let Some(w) = state.works.get_mut(&work_id) else {
+    return refused(Refusal::NotFound);
+  };
+  let volume_op = match op {
+    WorkOp::Unlink { path } => {
+      w.content.remove(&path);
+      VolumeOp::Unlink { path }
+    }
+    WorkOp::Rename { from, to } => {
+      if let Some(bytes) = w.content.remove(&from) {
+        w.content.insert(to.clone(), bytes);
+      }
+      VolumeOp::Rename { from, to }
+    }
+    WorkOp::Mkdir { path } => VolumeOp::Mkdir { path },
+    WorkOp::Rmdir { path } => VolumeOp::Rmdir { path },
+    WorkOp::SetMode { path, mode } => VolumeOp::SetMode { path, mode },
+    WorkOp::Symlink { path, target } => VolumeOp::Symlink { path, target },
+    WorkOp::Link { path, target } => VolumeOp::Link { path, target },
+    WorkOp::SetXattr { path, name, value } => VolumeOp::SetXattr { path, name, value },
+    WorkOp::RemoveXattr { path, name } => VolumeOp::RemoveXattr { path, name },
+  };
+  w.journal.push(volume_op);
+  ReplyBody::Declared
+}
+
+/// The composed value of the extended attribute `(path, name)` in a work's journal (§4.16): the last
+/// `SetXattr` for that key, which is the deriver's final value. `None` when the work set no such
+/// attribute (a stale op referencing one, so the region is left zero and the guard below skips it).
+fn declared_xattr<'a>(journal: &'a [VolumeOp], path: &str, name: &str) -> Option<&'a [u8]> {
+  journal.iter().rev().find_map(|op| match op {
+    VolumeOp::SetXattr {
+      path: p,
+      name: n,
+      value,
+    } if p == path && n == name => Some(value.as_slice()),
+    _ => None,
+  })
+}
+
+/// Assembles an increment's post-state from a work's content and journal (§4.16): the seal lays each
+/// file's final content out by region and then the extended-attribute values, and each content or
+/// `SetXattr` op names a slice of that region. A content op copies `[op.at, op.at + op.len)` of its
+/// file; a `SetXattr` op copies the attribute's whole value — both into `[op.src, op.src + op.len)`.
+/// The xattr value round-trips through the post-state, which is how the green stores it and how the
+/// identity check compares two agents' values, so it must be laid in, not left zero.
 fn assemble_post_state(
   doc: &slates_merge::ops_doc::OpsDoc,
   content: &std::collections::BTreeMap<String, Vec<u8>>,
+  journal: &[VolumeOp],
 ) -> Vec<u8> {
   use slates_merge::ops_doc::OpKind;
-  let is_content =
+  let is_file_content =
     |kind: OpKind| matches!(kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend);
   let mut size = 0u64;
   for op in &doc.ops {
-    if is_content(op.kind) && op.src != u64::MAX {
+    if op.src != u64::MAX && (is_file_content(op.kind) || op.kind == OpKind::SetXattr) {
       size = size.max(op.src.saturating_add(op.len));
     }
   }
   let mut post = vec![0u8; usize::try_from(size).unwrap_or(0)];
   for op in &doc.ops {
-    if !is_content(op.kind) || op.src == u64::MAX {
+    if op.src == u64::MAX {
       continue;
     }
     let Some(path) = doc.paths.path(op.path) else {
       continue;
     };
-    let Some(file) = content.get(path) else {
+    // The bytes this op contributes, and the offset into them: a file's slice, or an xattr's value.
+    let (source, source_at): (&[u8], u64) = if is_file_content(op.kind) {
+      let Some(file) = content.get(path) else {
+        continue;
+      };
+      (file.as_slice(), op.at)
+    } else if op.kind == OpKind::SetXattr {
+      let Ok(name_index) = u16::try_from(op.at) else {
+        continue;
+      };
+      let Some(name) = doc.paths.path(name_index) else {
+        continue;
+      };
+      let Some(value) = declared_xattr(journal, path, name) else {
+        continue;
+      };
+      (value, 0)
+    } else {
       continue;
     };
-    let (Ok(from), Ok(to), Ok(dst)) = (
-      usize::try_from(op.at),
-      usize::try_from(op.at.saturating_add(op.len)),
+    let (Ok(from), Ok(dst), Ok(len)) = (
+      usize::try_from(source_at),
       usize::try_from(op.src),
+      usize::try_from(op.len),
     ) else {
       continue;
     };
-    if to <= file.len() {
-      post[dst..dst + (to - from)].copy_from_slice(&file[from..to]);
+    let to = from.saturating_add(len);
+    if to <= source.len() && dst.saturating_add(len) <= post.len() {
+      post[dst..dst + len].copy_from_slice(&source[from..to]);
     }
   }
   post
@@ -1670,7 +1742,7 @@ fn build_increment(
       });
     }
   };
-  let post_state = assemble_post_state(&doc, &w.content);
+  let post_state = assemble_post_state(&doc, &w.content, &w.journal);
   let mut hasher = blake3::Hasher::new();
   hasher.update(&doc.encode());
   hasher.update(&post_state);

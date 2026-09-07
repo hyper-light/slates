@@ -5,7 +5,7 @@ use std::time::Instant;
 use slates_ipc::protocol::{
   AuditEntry, DaemonReport, Direction, Filter, GrantSummary, Intent, LandingOutcome,
   LandingSummary, MergeWindow, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass, SnapshotId,
-  StatusReport, VolumeId, VolumeSummary, pack, unpack,
+  StatusReport, VolumeId, VolumeSummary, WorkOp, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect_as};
 use slates_machine::{Derived, derived};
@@ -487,6 +487,15 @@ impl Client {
     })? {
       ReplyBody::Edited => Ok(()),
       _ => Err(ClientError::UnexpectedReply { verb: "edit" }),
+    }
+  }
+
+  /// Declares a namespace or metadata operation on a work volume (§4.16): the counterpart to `edit`'s
+  /// content splice — an unlink, rename, directory, mode, symlink, hard link or extended attribute.
+  pub fn declare(&mut self, work: VolumeId, op: WorkOp) -> Result<(), ClientError> {
+    match self.call(&RequestBody::Declare { work, op })? {
+      ReplyBody::Declared => Ok(()),
+      _ => Err(ClientError::UnexpectedReply { verb: "declare" }),
     }
   }
 

@@ -5,9 +5,10 @@
 > (Phase 6 tasks 1, 6, 7, 8). **Landed:** green volumes and the chain read side (`CreateGreen`,
 > `Versions`, `ChangedSince`); the submit flow (`CreateWork`, `Edit`, `Submit`) for a fresh *and* a
 > non-empty green (derived against the current base or a reconstructed intervening base), accept and
-> conflict; and `Rebase`, the corrective path (map a work's pending operations onto the head without
-> committing, or return the windows) — all through the real verbs.
-> **Owed:** `advance` (the attachment re-pin), xattr/symlink post-state, cross-shard submit, chain persistence, and the non-Rust SDKs (the CLI verbs are wired).
+> conflict; `Rebase`, the corrective path (map a work's pending operations onto the head without
+> committing, or return the windows); and `Declare`, the namespace and metadata operations beyond
+> content (unlink, rename, mkdir, rmdir, mode, symlink, hard link, xattr) — all through the real verbs.
+> **Owed:** `advance` (the attachment re-pin), cross-shard submit, chain persistence, and the non-Rust SDKs (the Rust CLI verbs are wired).
 
 ## What is wired (server + ipc + client)
 
@@ -22,6 +23,12 @@
 - **Edit.** `Edit { work, path, at, delete_len, bytes }` is a declared splice: it maintains the work's
   content and appends the `VolumeOp`s (a new path is `Create`d first; a splice is a `Delete` and/or an
   `Insert`/`Extend`).
+- **Declare.** `Declare { work, op }` records a namespace or metadata operation — the counterpart to
+  `Edit`'s content splice — for every dimension the deriver composes: `Unlink`, `Rename`, `Mkdir`,
+  `Rmdir`, `SetMode`, `Symlink`, `Link`, `SetXattr`, `RemoveXattr` (a mounted work would journal these
+  from its filesystem operations; without a mount, `Declare` records them directly). An unlink or
+  rename also keeps the work's content map consistent. A symlink's target rides in the ops document's
+  path table and an xattr's value in the journal, so neither needs a work-side store.
 - **Submit.** `Submit { work }` composes the journal into the canonical ops document
   (`compose_volume`), seals the post-state from the work's content (each content op names a slice of
   its file's final content, placed at the op's `src`), hashes the increment identity (BLAKE3 of the
@@ -42,8 +49,11 @@ than clobbering it. Non-vacuous — a broken verdict would accept both.
   work) is now reconstructed by `Green::base_at`: files exactly from the content history, directories
   and modes replayed from the deltas; symlinks, hard links and xattrs at an older version are still
   owed (reconstructed empty, exact for file-and-directory workflows).
-- **Post-state for non-content dimensions.** `assemble_post_state` handles content ops only; a
-  `SetXattr`/`Symlink` increment needs its value bytes laid into the post-state at the op's `src`.
+- **Post-state for non-content dimensions** is **landed**: `assemble_post_state` lays each
+  extended-attribute value into the post-state region the `SetXattr` op names (drawn from the journal's
+  composed value), so the value round-trips into the green and the verdict compares real bytes — a
+  differing concurrent set conflicts, gated in `merge_declare_scenario`. A symlink's target needs no
+  post-state (it rides in the ops document's path table), so `Symlink` was never a post-state gap.
 - **`rebase`** (Phase 6 task 7) is **landed**: `Rebase { work }` runs the same verdict `Submit` would
   (`Green::rebase`), commits nothing to the green, and — when every operation maps cleanly — moves the
   work onto the head, restating its base, its full content and its journal in head coordinates (the

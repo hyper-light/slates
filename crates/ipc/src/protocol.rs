@@ -161,6 +161,14 @@ pub enum RequestBody {
     /// The work volume.
     work: VolumeId,
   },
+  /// Declare a namespace or metadata operation on a work volume (§4.16): the counterpart to `Edit`'s
+  /// content splice, for links, directories, modes and extended attributes.
+  Declare {
+    /// The work volume.
+    work: VolumeId,
+    /// The operation.
+    op: WorkOp,
+  },
   /// Rebase a work volume onto its green's head, the only corrective path (§4.16): map its pending
   /// operations forward, moving the work's base without committing to the green.
   Rebase {
@@ -377,6 +385,73 @@ pub struct MergeWindow {
   pub len: u64,
   /// The conflict class, as its `MergeConflictClass` discriminant.
   pub class: u8,
+}
+
+/// A namespace or metadata operation a work volume declares (§4.16), the counterpart to the content
+/// splice `Edit` carries. A mounted work would journal these from its filesystem operations; without
+/// a mount, `Declare` records them directly so every dimension the merge engine composes — links,
+/// directories, modes and extended attributes — can be exercised. Content edits stay with `Edit`.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum WorkOp {
+  /// Remove the name at `path` (a file, symlink or hard link).
+  Unlink {
+    /// The path removed.
+    path: String,
+  },
+  /// Rename `from` to `to`.
+  Rename {
+    /// The source path.
+    from: String,
+    /// The destination path.
+    to: String,
+  },
+  /// Create an empty directory at `path`.
+  Mkdir {
+    /// The directory path.
+    path: String,
+  },
+  /// Remove the empty directory at `path`.
+  Rmdir {
+    /// The directory path.
+    path: String,
+  },
+  /// Set the mode of the file or directory at `path`.
+  SetMode {
+    /// The path.
+    path: String,
+    /// The new mode.
+    mode: u32,
+  },
+  /// Create or retarget a symbolic link at `path` pointing at `target`.
+  Symlink {
+    /// The link's path.
+    path: String,
+    /// The link's target.
+    target: String,
+  },
+  /// Create a hard link at `path` to the existing file `target`.
+  Link {
+    /// The new name.
+    path: String,
+    /// The existing file it links to.
+    target: String,
+  },
+  /// Set the extended attribute `name` on `path` to `value`.
+  SetXattr {
+    /// The path.
+    path: String,
+    /// The attribute name.
+    name: String,
+    /// The attribute value.
+    value: Vec<u8>,
+  },
+  /// Remove the extended attribute `name` from `path`.
+  RemoveXattr {
+    /// The path.
+    path: String,
+    /// The attribute name.
+    name: String,
+  },
 }
 
 /// A volume's placement (§4.8, D-18): every reply carries it from the first version, so the
@@ -626,6 +701,8 @@ pub enum ReplyBody {
   },
   /// An edit was recorded on a work volume.
   Edited,
+  /// A namespace or metadata operation was declared on a work volume.
+  Declared,
   /// A work volume's increment was submitted (§4.16).
   Submitted {
     /// The committed green version, when the increment was accepted; `None` on conflict.
