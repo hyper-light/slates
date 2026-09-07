@@ -64,7 +64,32 @@ than clobbering it. Non-vacuous — a broken verdict would accept both.
   unmoved then submits, and a conflicting one leaves it unmoved). **`advance`** — the green *attachment*
   re-pin with targeted invalidations — is still owed (it belongs with the mount/attachment path).
   (`changed_since` — the per-path last-changed index read — is done: `Green::changed_since` and the verb.)
-- **Surfaces (task 8):** the non-Rust SDKs (MCP, Python, TypeScript); the Rust client and the CLI verbs (green, versions, changed-since, work, edit, submit) are wired.
-- **Cross-shard submit and chain persistence:** a work whose green is on another shard forwards the
-  increment to the green's owner; and the chain (`VersionRecord`s and `seen`) is recovered from the
-  partition log after a restart (task 6's crash recovery). Single-node, same-shard only for now.
+- **`Declare`** (Phase 6) is **landed**: `Declare { work, op }` records the namespace and metadata
+  operations beyond content — unlink, rename, mkdir, rmdir, mode, symlink, hard link, xattr — into the
+  work's journal, wired through ipc, server and the client SDK (`Client::declare`). Gated in
+  `merge_declare_scenario`. (No CLI verbs for these: the CLI's merge surface is green/versions/
+  changed-since/work/edit/submit/rebase per §4.4; the per-dimension declarations are SDK/mount-level.)
+- **Cross-shard submit is structurally handled for stable ownership, not owed.** A work is always
+  born on its green's owner shard: `CreateWork { green }` routes by the green's id (`owner_of(green)`)
+  and `fresh_volume_id` stamps the running shard's prefix, so `owner_of(work) == owner_of(green)`, and
+  `Submit`/`Edit`/`Declare`/`Rebase` (routed by the work's id) always reach the shard that holds the
+  green. The existing merge scenarios prove this: they run on the two-shard test daemon and would
+  refuse `NotFound` were the work placed away from its green. The only cross-shard case is a green that
+  **migrates** to another shard after the work was created (the work's id still names the old owner);
+  that is the fleet ownership-takeover path (§4.8), owed with Phase 8, not a single-node gap.
+- **Chain persistence** (GAP-A9-14, Phase 6) is **owed and needs a design amendment before code.** The
+  green's version chain, its deltas and the `seen` set live only in the in-memory engine; a restart
+  loses them. On recovery a `Role::Green`/`Role::Work` record currently falls through the store-volume
+  path and is skipped as `RecoveryIncomplete` (the record survives, the volume refuses on use — no
+  empty-success, but no recovery either). The design's laptop-degenerate mechanism is "the merge record
+  is a partition log append" (§4.16), which means a **new durable `Op`** — a change to the durable
+  format that belongs in the audit-owned amendment log (§4.9), alongside exactly-once atomicity with
+  the completion record and a bound (checkpointing) on the stored chain. It is ready to build once the
+  amendment is decided.
+- **Surfaces (task 8):** the non-Rust SDKs (MCP, Python, TypeScript); the Rust client and the CLI
+  verbs are wired.
+- **Access control on the merge verbs** is owed and consistent across all of them: `create_work`,
+  `edit`, `declare`, `submit` and `rebase` do not yet consult the §4.13 rights the store-backed verbs
+  do. The natural rule under the clone-owner model is read on the green for `create_work` (a clone),
+  write on the caller-owned work for the rest. It is not yet non-vacuously testable here: the daemon
+  derives the principal from the connection's peer uid, so every test connection shares one principal.
