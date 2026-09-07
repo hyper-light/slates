@@ -93,8 +93,14 @@ than clobbering it. Non-vacuous — a broken verdict would accept both.
   step under the crash-recovery whole-state comparison) and `crates/client/tests/client.rs`
   (`a_green_chain_survives_a_daemon_restart`: two versions committed, the daemon restarted over the same
   segment, the head and last-changed index recovered, a new increment continuing to version 3).
-- **Surfaces (task 8):** the non-Rust SDKs (MCP, Python, TypeScript); the Rust client and the CLI
-  verbs are wired.
+- **Surfaces (task 8):** the Rust client and the CLI verbs are wired; the **MCP merge surface is
+  landed** — `crates/mcp` (`slates-mcp`) is a JSON-RPC 2.0 server (`initialize`, `tools/list`,
+  `tools/call`) exposing the merge tools (`slates.merge.create_green`/`create_work`/`edit`/`submit`/
+  `rebase`/`versions`/`changed_since`, plus `slates.help`) over the client SDK, run by `slates mcp`
+  over stdio. No tool creates a grant (R10) — none is offered. Gated in `crates/mcp/tests/mcp.rs` (the
+  whole merge loop over tool calls, a concurrent conflict, and typed JSON-RPC errors for a bad tool or
+  id). **Owed:** the rest of the §4.12 tool set (`slates.volume`/`attach`/`fs`/`base`/`status`/`land`),
+  Streamable HTTP, resources and prompts, and the Python/TypeScript SDKs.
 - **Access control on the merge verbs** is owed and consistent across all of them: `create_work`,
   `edit`, `declare`, `submit` and `rebase` do not yet consult the §4.13 rights the store-backed verbs
   do. The natural rule under the clone-owner model is read on the green for `create_work` (a clone),

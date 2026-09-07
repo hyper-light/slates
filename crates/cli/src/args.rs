@@ -13,6 +13,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   anchor   [--quick] [--shards N]                  run the anchor: own the segment, supervise the daemon
   daemon   [--quick] [--shards N]                  run the daemon (alone, or as the anchor's child)
   profile  [--quick] [--json]                      measure and print the machine profile
+  mcp [--instance NAME]                             serve the MCP tools over stdio
 
   volume create NAME (--bounded SIZE | --dynamic MAX) [--fold] [--locked] [--base DIR]
   volume list
@@ -313,6 +314,8 @@ pub(crate) enum Command {
   Daemon(ProcessOptions),
   /// The profile.
   Profile(ProfileOptions),
+  /// The MCP server over stdio (the instance to connect to).
+  Mcp(String),
   /// A client verb.
   Client(ClientRequest),
 }
@@ -571,6 +574,13 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
         json: taken.switch("--json"),
       }))
     }
+    ["mcp"] => {
+      taken.only(&Spec {
+        values: &["--instance"],
+        switches: &[],
+      })?;
+      Ok(Command::Mcp(taken.instance()))
+    }
     ["volume", rest @ ..] => parse_volume(&taken, rest),
     ["attach", id] => {
       taken.only(&Spec {
@@ -750,7 +760,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
     [verb, rest @ ..]
       if matches!(
         *verb,
-        "anchor" | "daemon" | "profile" | "attach" | "detach" | "status"
+        "anchor" | "daemon" | "profile" | "mcp" | "attach" | "detach" | "status"
       ) =>
     {
       Err(ParseError::Extra(
@@ -978,6 +988,10 @@ mod tests {
         quick: true,
         shards: Some(2),
       }))
+    );
+    assert_eq!(
+      parse(&args("mcp --instance m")),
+      Ok(Command::Mcp("m".into()))
     );
   }
 

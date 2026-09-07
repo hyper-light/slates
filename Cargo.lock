@@ -723,11 +723,13 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rustix",
+ "serde_json",
  "slates-anchor",
  "slates-client",
  "slates-db",
  "slates-ipc",
  "slates-machine",
+ "slates-mcp",
  "slates-server",
  "slates-vfs",
  "windows-sys",
@@ -797,6 +799,17 @@ dependencies = [
  "serde_json",
  "windows-sys",
  "zstd",
+]
+
+[[package]]
+name = "slates-mcp"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "slates-client",
+ "slates-ipc",
+ "slates-machine",
+ "slates-server",
 ]
 
 [[package]]

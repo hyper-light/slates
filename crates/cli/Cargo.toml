@@ -19,6 +19,8 @@ slates-db = { workspace = true }
 slates-ipc = { workspace = true }
 slates-server = { workspace = true }
 slates-client = { workspace = true }
+slates-mcp = { workspace = true }
+serde_json = { workspace = true }
 slates-vfs = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

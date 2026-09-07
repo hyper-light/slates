@@ -1,0 +1,21 @@
+[package]
+name = "slates-mcp"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The MCP surface (§4.12, Phase 6 task 8): the JSON-RPC tools a coding agent drives — the merge tools over the client SDK, no grant verb (R10)."
+
+[dependencies]
+slates-client = { workspace = true }
+slates-ipc = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+slates-server = { workspace = true }
+slates-machine = { workspace = true }
+
+[lints]
+workspace = true

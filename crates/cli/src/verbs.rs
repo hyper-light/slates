@@ -32,6 +32,42 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
   outcome.map_err(|e| failure_of(e, &request.instance))
 }
 
+/// Serves the MCP tools over stdio (§4.12): one JSON-RPC message per line in, its reply per line out,
+/// until end of input. The protocol and dispatch live in `slates-mcp`; this is only the transport —
+/// the I/O boundary the CLI owns. A line that is not valid JSON gets a JSON-RPC parse error, so a
+/// malformed message never stops the server.
+pub(crate) fn mcp(instance: &str) -> Result<(), Failure> {
+  use std::io::{BufRead, Write};
+  let client = connect(instance)?;
+  let mut server = slates_mcp::McpServer::new(client);
+  let stdin = std::io::stdin();
+  let mut input = stdin.lock();
+  let mut out = std::io::stdout().lock();
+  let mut line = String::new();
+  loop {
+    line.clear();
+    let read = input
+      .read_line(&mut line)
+      .map_err(|e| Failure::Failed(e.to_string()))?;
+    if read == 0 {
+      return Ok(()); // end of input
+    }
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+      continue;
+    }
+    let reply = match serde_json::from_str::<serde_json::Value>(trimmed) {
+      Ok(request) => server.handle(&request),
+      // Not valid JSON: the protocol crate builds the JSON-RPC parse-error reply.
+      Err(_) => Some(slates_mcp::parse_error_reply()),
+    };
+    if let Some(reply) = reply {
+      writeln!(out, "{reply}").map_err(|e| Failure::Failed(e.to_string()))?;
+      out.flush().map_err(|e| Failure::Failed(e.to_string()))?;
+    }
+  }
+}
+
 /// The merge verbs (§4.16), split out to keep [`serve`] under the cognitive-complexity bound.
 fn serve_merge(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
   match verb {
