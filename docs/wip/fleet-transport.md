@@ -99,3 +99,39 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
 MCP stays the tool-plane edge (HTTP/1.1 loopback, built). `slates-wire` (payload codec) and the RIFL
 completion records (D-15) are reused unchanged. The local ring IPC (§4.7, D-10) is untouched — it is
 the agent↔daemon path, not the mesh.
+
+## 7. Security (design draft, to ratify) — the pre-crypto artifact for slice 2
+
+Crypto is the one place the project's "cite tiered evidence, design before code" rule binds hardest,
+so this fixes the seal, the key schedule and the enforcement order before any AEAD lands. It adapts
+hecate `WIRE_SECURITY.md` to slates's D-15 (TLS 1.3, not Noise). **Ratify before slice 2 codes it.**
+
+- **Identity is the host's enrollment credential** (§4.13 principals, D-16 fencing). A node holds a
+  long-lived enrollment key pair; the region's configuration group (D-14) is the authority that admits
+  a node and stamps its **key epoch**. This is the identity both planes key from; no per-pod identity
+  (slates has volumes and shards, not pods).
+- **The session plane keys via TLS 1.3.** `slates-quic` runs the RFC 9001 TLS 1.3 handshake
+  (`rustls::quic`) authenticated by the enrollment credential; record protection is TLS 1.3's own
+  (AES-256-GCM or ChaCha20-Poly1305 as negotiated). No bespoke session crypto — this is the whole
+  reason D-15 chose TLS 1.3 over Noise. A term/epoch advance (D-16) drops the session, typed.
+- **The control plane seals each datagram with an AEAD** derived from the same identity. The key
+  schedule: `HKDF-Expand-Label` (RFC 5869; the TLS 1.3 labelled form, RFC 8446 §7.1) from a control
+  secret established at enrollment, one key **per (sender, key_epoch, direction)**. Cipher:
+  **AES-256-GCM** (the RustCrypto `aes-gcm` crate — a vetted implementation, never hand-rolled). Nonce:
+  **a 96-bit counter** = 64-bit per-(key,direction) message counter ‖ 32-bit channel id, **never
+  random**; the counter is persisted-enough that reuse across a restart is refused, and any reuse is a
+  **typed, counted refusal** (the no-panic law — no assertion path). The sealed region wraps exactly
+  the plaintext envelope + body the codec (slice 1) already lays out; the prologue's `sealed_len`
+  becomes `len(nonce) + len(ciphertext) + 16-byte tag`.
+- **Enforcement order at every acceptance point** (host parsers both planes), adapted from hecate
+  PROTOCOL.md §1.3: length caps → prologue parse → **key lookup (unknown sender ⇒ drop, zero crypto
+  spent)** → AEAD verify+decrypt (one bounded pass) → envelope parse (flags must-be-zero, version) →
+  **fencing check (epoch/term)** → replay window → decode. The HLC bounds the replay window's memory
+  (liveness only); **safety rests on the nonce counter + AEAD + fencing**, never the clock. Garbage
+  without a key dies at the tag, counted. Identical categorized counters on every path.
+- **Slice 2 (crypto) then builds, in order:** (a) the key-schedule types + HKDF derivation
+  (test vectors), (b) the AEAD seal/unseal over the codec's plaintext (round-trip, tamper ⇒ typed
+  refusal, nonce-reuse ⇒ typed refusal, golden vectors), (c) the enforcement-order parser with the
+  hostile-input suite. Key **distribution/enrollment** (the region group admitting a node, minting the
+  control secret) is its own slice tied to §4.13/§4.8 membership — the largest remaining piece, and
+  the one most needing your review, since it is where identity and authority live.
