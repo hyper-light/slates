@@ -458,6 +458,11 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
   grant_scenario();
   landing_refusal_scenario();
   bulk_and_overlay_scenario();
+  // §4.2/§4.5 version-slab reservation scenarios run here, one daemon at a time, for the same reason.
+  version_reservation_scenario();
+  version_reservation_moves_on_resize_scenario();
+  version_stats_scenario();
+  snapshot_destroy_scenario();
 }
 
 /// Shape: a version slab large enough to physically hold several volumes' inode and trie nodes, yet
@@ -555,13 +560,6 @@ fn version_reservation_scenario() {
   daemon.stop();
 }
 
-/// AC-2: §4.2 inode-dimension reservation — the disjoint version-slab reservation and its release on
-/// teardown, driven through the real create and destroy verbs.
-#[test]
-fn the_inode_allowance_is_reserved_against_the_version_slab_and_released_on_teardown() {
-  version_reservation_scenario();
-}
-
 /// The inode reservation moves with the policy on resize (§4.2): a volume whose allowance fills the
 /// version slab, resized down, returns slots so another volume is admitted — proof the reservation
 /// tracks the resized allowance, not the create-time one. Non-vacuous: without the re-derivation the
@@ -609,12 +607,6 @@ fn version_reservation_moves_on_resize_scenario() {
   daemon.stop();
 }
 
-/// AC-2: §4.2 inode reservation tracks a resized allowance — a resize-down returns version slots.
-#[test]
-fn the_inode_reservation_moves_with_the_allowance_on_resize() {
-  version_reservation_moves_on_resize_scenario();
-}
-
 /// The shard's version-slab reservation is observable in the daemon status (§4.2 "statfs includes
 /// backed inode availability", at the shard level): the reported slab capacity is the configured
 /// one, and committed version slots move as a volume's inode allowance is reserved.
@@ -656,12 +648,6 @@ fn version_stats_scenario() {
     "a volume's inode allowance is committed against the version slab: {after}"
   );
   daemon.stop();
-}
-
-/// AC-2: §4.2 shard-level version-slab availability is surfaced in the daemon status.
-#[test]
-fn the_daemon_status_reports_the_shards_version_slab_reservation() {
-  version_stats_scenario();
 }
 
 /// Destroying a snapshot over the wire, and the clone pin around it (§4.5/§4.2): a snapshot a clone
@@ -729,10 +715,4 @@ fn snapshot_destroy_scenario() {
     "the pin released by the clone's destroy, the snapshot is destroyed"
   );
   daemon.stop();
-}
-
-/// §4.5/§4.2: the destroy-snapshot verb and the clone pin (unpin on clone teardown).
-#[test]
-fn a_snapshot_is_destroyed_over_the_wire_and_a_clone_pins_it_until_torn_down() {
-  snapshot_destroy_scenario();
 }
