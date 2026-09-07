@@ -4,8 +4,10 @@
 > built and tested at the crate level; this note tracks wiring it into the server, client and CLI
 > (Phase 6 tasks 1, 6, 7, 8). **Landed:** green volumes and the chain read side (`CreateGreen`,
 > `Versions`, `ChangedSince`); the submit flow (`CreateWork`, `Edit`, `Submit`) for a fresh *and* a
-> non-empty green (derived against the current base), accept and conflict, through the real verbs.
-> **Owed:** `rebase`/`advance`, xattr/symlink post-state, the base at an intervening version, cross-shard submit, chain persistence, and the non-Rust SDKs (the CLI verbs are wired).
+> non-empty green (derived against the current base or a reconstructed intervening base), accept and
+> conflict; and `Rebase`, the corrective path (map a work's pending operations onto the head without
+> committing, or return the windows) — all through the real verbs.
+> **Owed:** `advance` (the attachment re-pin), xattr/symlink post-state, cross-shard submit, chain persistence, and the non-Rust SDKs (the CLI verbs are wired).
 
 ## What is wired (server + ipc + client)
 
@@ -42,9 +44,16 @@ than clobbering it. Non-vacuous — a broken verdict would accept both.
   owed (reconstructed empty, exact for file-and-directory workflows).
 - **Post-state for non-content dimensions.** `assemble_post_state` handles content ops only; a
   `SetXattr`/`Symlink` increment needs its value bytes laid into the post-state at the op's `src`.
-- **`rebase`, `advance`** (Phase 6 task 7): the corrective rebase mapping a work's pending operations
-  to a newer version, and the attachment re-pin with targeted invalidations. (`changed_since` — the
-  per-path last-changed index read — is done: `Green::changed_since` and the verb.)
+- **`rebase`** (Phase 6 task 7) is **landed**: `Rebase { work }` runs the same verdict `Submit` would
+  (`Green::rebase`), commits nothing to the green, and — when every operation maps cleanly — moves the
+  work onto the head, restating its base, its full content and its journal in head coordinates (the
+  journal stays fine-grained, so a later disjoint head move still merges rather than conflicting). A
+  conflict returns the windows and changes nothing. Wired through ipc, server, client and the CLI
+  (`slates rebase WORK`); gated in the engine tests (byte-exact base, content and journal; the
+  no-commit property) and the server umbrella (`merge_rebase_scenario`: a clean rebase leaves the head
+  unmoved then submits, and a conflicting one leaves it unmoved). **`advance`** — the green *attachment*
+  re-pin with targeted invalidations — is still owed (it belongs with the mount/attachment path).
+  (`changed_since` — the per-path last-changed index read — is done: `Green::changed_since` and the verb.)
 - **Surfaces (task 8):** the non-Rust SDKs (MCP, Python, TypeScript); the Rust client and the CLI verbs (green, versions, changed-since, work, edit, submit) are wired.
 - **Cross-shard submit and chain persistence:** a work whose green is on another shard forwards the
   increment to the green's owner; and the chain (`VersionRecord`s and `seen`) is recovered from the

@@ -82,6 +82,29 @@ pub enum Outcome {
   },
 }
 
+/// The result of a rebase (§4.16 "Rebase, the only corrective path"). The green is never changed by
+/// a rebase; only the work moves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Rebased {
+  /// The work's pending operations all mapped cleanly onto the head. The work's base becomes
+  /// `version`, its full content becomes `files` (the head's content with the work's mapped edits
+  /// re-applied), and its declared operations are restated in head coordinates as `journal` (so the
+  /// next submit composes against the new base with no further mapping).
+  Rebased {
+    /// The head the work is now based on.
+    version: u64,
+    /// The work's full content per path after the rebase (the head's files with the work's edits).
+    files: BTreeMap<String, Vec<u8>>,
+    /// The work's declared operations restated relative to the new base.
+    journal: Vec<crate::increment::VolumeOp>,
+  },
+  /// The pending operations conflict; the windows to resolve, nothing changed.
+  Conflict {
+    /// The conflicting windows.
+    windows: Vec<ConflictWindow>,
+  },
+}
+
 /// A per-path content history: for each path, the versions at which its bytes changed and the bytes
 /// then (`None` when removed), so any base version's content can be reconstructed for the identity
 /// check. The design's chain shares these copy-on-write; here they are full copies (owed).
@@ -226,9 +249,9 @@ impl Green {
 
   /// The green's current state as a deriver [`Base`](crate::increment::Base) — every file with its
   /// content length, and the directories, modes, symlinks, hard links and xattrs — so an increment
-  /// based on the head can be composed against what the green actually holds. (Reconstructing the
-  /// base at an *older* version, for a work that lagged behind an intervening submit, is owed: the
-  /// content history supports it per file, but the other dimensions keep only the current value.)
+  /// based on the head can be composed against what the green actually holds. (An *older* version's
+  /// base, for a work that lagged behind an intervening submit, is reconstructed by [`Green::base_at`];
+  /// symlinks, hard links and xattrs at an older version are still owed there.)
   pub fn current_base(&self) -> crate::increment::Base {
     crate::increment::Base {
       files: self
@@ -892,6 +915,102 @@ impl Green {
     self.seen.insert(inc.id, outcome.clone());
     outcome
   }
+
+  /// Rebases a work's increment onto the green's head (§4.16 "Rebase, the only corrective path"):
+  /// runs the same verdict `submit` would, but commits nothing to the green — instead, when every
+  /// operation maps cleanly, it returns the work's new base (the head), its full rebased content
+  /// (the head's files with the work's mapped edits re-applied), and its journal restated in head
+  /// coordinates, so the agent can keep editing on a fresh base and submit without further mapping.
+  /// A conflict returns the windows and changes nothing; the agent resolves each window and rebases
+  /// again. The green — content, deltas and counters — is left exactly as it was.
+  pub fn rebase(&mut self, inc: &Increment) -> Rebased {
+    let to = self.head();
+    let resolved = Green::resolve(inc);
+    // The verdict shares `submit`'s decision but must not perturb the green; the only field `decide`
+    // writes is the fast-path counter (through `merge_content`), which a rebase restores.
+    let fast_path_before = self.fast_path_hits;
+    let decision = self.decide(inc, &resolved);
+    self.fast_path_hits = fast_path_before;
+    match decision {
+      Err(windows) => Rebased::Conflict { windows },
+      Ok(effects) => self.rebased_from(effects, to),
+    }
+  }
+
+  /// Restates the accepted effects of a clean rebase as the work's new full content and journal: the
+  /// content starts from the head's files and takes each effect; the journal is the effects as
+  /// declared operations in head coordinates (a content op keeps its mapped range, a file new to the
+  /// head is created first). The green is not touched.
+  fn rebased_from(&self, effects: Vec<Effect>, to: u64) -> Rebased {
+    use crate::increment::VolumeOp;
+    let mut files = self.content.clone();
+    let mut journal: Vec<VolumeOp> = Vec::new();
+    for effect in effects {
+      match effect {
+        Effect::SetContent(path, bytes, ops) => {
+          if !self.content.contains_key(&path) {
+            journal.push(VolumeOp::Create { path: path.clone() });
+          }
+          for op in &ops {
+            if let Some(volume_op) = content_volume_op(&path, op) {
+              journal.push(volume_op);
+            }
+          }
+          files.insert(path, bytes);
+        }
+        Effect::RemoveContent(path) => {
+          journal.push(VolumeOp::Unlink { path: path.clone() });
+          files.remove(&path);
+        }
+        Effect::MakeDir(path) => journal.push(VolumeOp::Mkdir { path }),
+        Effect::RemoveDir(path) => journal.push(VolumeOp::Rmdir { path }),
+        Effect::Mode(path, mode) => journal.push(VolumeOp::SetMode { path, mode }),
+        Effect::Symlink(path, target) => journal.push(VolumeOp::Symlink { path, target }),
+        Effect::Hardlink(path, target) => journal.push(VolumeOp::Link { path, target }),
+        Effect::SetXattr(path, name, value) => {
+          journal.push(VolumeOp::SetXattr { path, name, value });
+        }
+        Effect::RemoveXattr(path, name) => journal.push(VolumeOp::RemoveXattr { path, name }),
+      }
+    }
+    Rebased::Rebased {
+      version: to,
+      files,
+      journal,
+    }
+  }
+}
+
+/// Restates a mapped content op as a declared operation (head coordinates; the post-state offset is
+/// re-derived when the rebased journal is next composed, so it is dropped here). Returns `None` for a
+/// non-content op kind.
+fn content_volume_op(path: &str, op: &Op) -> Option<crate::increment::VolumeOp> {
+  use crate::increment::VolumeOp;
+  let path = path.to_owned();
+  Some(match op.kind {
+    OpKind::Overwrite => VolumeOp::Overwrite {
+      path,
+      at: op.at,
+      len: op.len,
+    },
+    OpKind::Insert => VolumeOp::Insert {
+      path,
+      at: op.at,
+      len: op.len,
+    },
+    OpKind::Extend => VolumeOp::Extend {
+      path,
+      at: op.at,
+      len: op.len,
+    },
+    OpKind::Delete => VolumeOp::Delete {
+      path,
+      at: op.at,
+      len: op.len,
+    },
+    OpKind::Truncate => VolumeOp::Truncate { path, len: op.len },
+    _ => return None,
+  })
 }
 
 /// Files one per-dimension merge result into the accepted effects or the conflict windows.

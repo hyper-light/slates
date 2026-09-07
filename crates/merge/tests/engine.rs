@@ -7,7 +7,8 @@
 //! xattr) merge per path with their conflict classes, several dimensions merge on one path in one
 //! increment, a directory move merges as its child ops, and retries are idempotent by identity.
 
-use slates_merge::engine::{Green, Increment, Outcome};
+use slates_merge::engine::{Green, Increment, Outcome, Rebased};
+use slates_merge::increment::VolumeOp;
 use slates_merge::ops_doc::{Op, OpKind, OpsDoc};
 use slates_merge::verdict::MergeConflictClass;
 
@@ -571,4 +572,112 @@ fn a_directory_move_merges_as_child_ops() {
   assert!(!green.is_dir("dir1"));
   assert_eq!(green.content("dir2/f"), Some(b"content".as_slice()));
   assert_eq!(green.content("dir1/f"), None);
+}
+
+/// T-6.x §4.16 "Rebase, the only corrective path": a work whose pending operations map cleanly onto
+/// the head is rebased — its base becomes the head, its content becomes the head's files with the
+/// mapped edits re-applied, and its journal is restated in head coordinates — while the green itself
+/// is committed nothing. Here a work based on version 1 overwrites the tail of `f`; the head moved
+/// under it by inserting two bytes at the front, so the tail op maps two bytes forward.
+#[test]
+fn rebase_maps_a_clean_work_forward_and_commits_nothing() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("f", b"0123456789").at(1, 0));
+  green.submit(&Build::new().content(OpKind::Insert, "f", 0, b"AB").at(2, 1));
+  assert_eq!(green.head(), 2);
+
+  let rebased = green.rebase(&Build::new().overwrite("f", 8, b"YY").at(3, 1));
+
+  // The green did not move: a rebase commits nothing.
+  assert_eq!(green.head(), 2, "rebase commits nothing to the green");
+  assert_eq!(
+    green.content("f"),
+    Some(b"AB0123456789".as_slice()),
+    "the green's bytes are unchanged by a rebase"
+  );
+  let Rebased::Rebased {
+    version,
+    files,
+    journal,
+  } = rebased
+  else {
+    panic!("the clean work rebases");
+  };
+  assert_eq!(version, 2, "the work is now based on the head");
+  assert_eq!(
+    files.get("f").map(Vec::as_slice),
+    Some(b"AB01234567YY".as_slice()),
+    "the head's file with the tail overwrite mapped two bytes forward"
+  );
+  assert_eq!(
+    journal,
+    vec![VolumeOp::Overwrite {
+      path: "f".to_owned(),
+      at: 10,
+      len: 2,
+    }],
+    "the journal is restated at the head offset (10), not the base offset (8)"
+  );
+}
+
+/// A rebase whose operations still conflict returns the windows and changes nothing — the green is
+/// untouched and the agent resolves each window and rebases again (§4.16).
+#[test]
+fn rebase_returns_windows_and_changes_nothing_on_conflict() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("f", b"0123456789").at(1, 0));
+  green.submit(&Build::new().overwrite("f", 2, b"XXX").at(2, 1));
+  assert_eq!(green.head(), 2);
+
+  let rebased = green.rebase(&Build::new().overwrite("f", 3, b"YYY").at(3, 1));
+
+  assert!(
+    matches!(rebased, Rebased::Conflict { windows } if windows.iter().any(|w| w.path == "f")),
+    "the overlapping edit conflicts on rebase"
+  );
+  assert_eq!(green.head(), 2, "a conflicting rebase commits nothing");
+  assert_eq!(
+    green.content("f"),
+    Some(b"01XXX56789".as_slice()),
+    "the green's bytes are unchanged by a conflicting rebase"
+  );
+}
+
+/// The rebase restates the journal as fine-grained operations, not a whole-file rewrite: after a
+/// rebase, a further disjoint move of the head still merges the rebased operation rather than
+/// conflicting. Non-vacuity for the mapping — a whole-file restatement would overlap the front
+/// change and conflict.
+#[test]
+fn a_rebased_operation_still_merges_a_later_disjoint_head_move() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("f", b"0123456789").at(1, 0));
+  green.submit(&Build::new().content(OpKind::Insert, "f", 0, b"AB").at(2, 1));
+  let Rebased::Rebased {
+    version, journal, ..
+  } = green.rebase(&Build::new().overwrite("f", 8, b"YY").at(3, 1))
+  else {
+    panic!("clean rebase");
+  };
+  assert_eq!(version, 2);
+  assert_eq!(
+    journal,
+    vec![VolumeOp::Overwrite {
+      path: "f".to_owned(),
+      at: 10,
+      len: 2,
+    }],
+    "the rebased journal is the fine-grained tail op at the head offset"
+  );
+
+  // The head moves again, disjoint from the rebased op (the front, not the tail).
+  green.submit(&Build::new().overwrite("f", 0, b"CD").at(4, 2));
+  assert_eq!(green.head(), 3);
+
+  // Resubmitting the rebased op (base 2) merges past the disjoint front change.
+  let out = green.submit(&Build::new().overwrite("f", 10, b"YY").at(5, 2));
+  assert_eq!(
+    out,
+    Outcome::Accepted { version: 4 },
+    "the fine-grained rebased op merges the disjoint head move"
+  );
 }

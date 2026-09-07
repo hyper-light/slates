@@ -28,6 +28,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   work GREEN NAME                                  a work volume over a green
   edit WORK PATH AT DELETE TEXT                     declare an edit (a splice)
   submit WORK                                       submit a work's increment
+  rebase WORK                                       rebase a work onto its green's head
   volume placed ID [--snapshot N] [--mirror]         await a durability scope
   attach ID [--read | --write] [--snapshot N]
   detach ATTACHMENT
@@ -186,6 +187,11 @@ pub(crate) enum Verb {
   },
   /// Submit a work volume's increment to its green.
   Submit {
+    /// The work volume.
+    work: slates_client::VolumeId,
+  },
+  /// Rebase a work volume onto its green's head (the corrective path).
+  Rebase {
     /// The work volume.
     work: slates_client::VolumeId,
   },
@@ -732,6 +738,15 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
         },
       ))
     }
+    ["rebase", work] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        &taken,
+        Verb::Rebase {
+          work: volume(work)?,
+        },
+      ))
+    }
     [verb, rest @ ..]
       if matches!(
         *verb,
@@ -1014,6 +1029,7 @@ mod tests {
       }
     );
     assert_eq!(verb(&format!("submit {id}")), Verb::Submit { work: vid });
+    assert_eq!(verb(&format!("rebase {id}")), Verb::Rebase { work: vid });
   }
 
   /// The refusals: a size without a binary unit, an unknown flag, a missing size, an extra

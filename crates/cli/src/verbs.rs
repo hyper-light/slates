@@ -1,7 +1,8 @@
 //! The client verbs: one connection, one request, the reply printed in a stable plain form.
 
 use slates_client::{
-  Client, ClientError, CreateSpec, DaemonReport, Deadlines, StatusReport, Submitted, VolumeSummary,
+  Client, ClientError, CreateSpec, DaemonReport, Deadlines, Rebased, StatusReport, Submitted,
+  VolumeSummary,
 };
 use slates_db::replay::RECOVERY_BUDGET_NS;
 use slates_server::daemon::LIVENESS_BUDGET_NS;
@@ -63,23 +64,30 @@ fn serve_merge(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
     }
     Verb::Submit { work } => match client.submit(*work)? {
       Submitted::Accepted(version) => println!("accepted: {version}"),
-      Submitted::Conflict(windows) => {
-        println!("conflict:");
-        for window in windows {
-          println!(
-            "  {} [{}..{}] class {}",
-            window.path,
-            window.at,
-            window.at + window.len,
-            window.class
-          );
-        }
-      }
+      Submitted::Conflict(windows) => print_windows(&windows),
+    },
+    Verb::Rebase { work } => match client.rebase(*work)? {
+      Rebased::Rebased(version) => println!("rebased: {version}"),
+      Rebased::Conflict(windows) => print_windows(&windows),
     },
     // Only the merge verbs above reach here.
     _ => {}
   }
   Ok(())
+}
+
+/// Prints merge conflict windows, one per line: the path, the byte range, and the conflict class.
+fn print_windows(windows: &[slates_ipc::protocol::MergeWindow]) {
+  println!("conflict:");
+  for window in windows {
+    println!(
+      "  {} [{}..{}] class {}",
+      window.path,
+      window.at,
+      window.at + window.len,
+      window.class
+    );
+  }
 }
 
 fn serve(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
@@ -131,7 +139,8 @@ fn serve(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
     | Verb::ChangedSince { .. }
     | Verb::Work { .. }
     | Verb::Edit { .. }
-    | Verb::Submit { .. } => serve_merge(client, verb)?,
+    | Verb::Submit { .. }
+    | Verb::Rebase { .. } => serve_merge(client, verb)?,
     Verb::Placed {
       volume,
       snapshot,

@@ -467,6 +467,7 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
   merge_submit_scenario();
   merge_modify_scenario();
   merge_lagging_scenario();
+  merge_rebase_scenario();
 }
 
 /// Shape: a version slab large enough to physically hold several volumes' inode and trie nodes, yet
@@ -963,5 +964,147 @@ fn merge_lagging_scenario() {
     "a disjoint lagging work merges: {conflicts:?}"
   );
   assert_eq!(version, Some(3), "A merged past the version it fell behind");
+  daemon.stop();
+}
+
+/// Creates a work over `green`, returning its id.
+fn work_over(
+  client: &mut Client,
+  green: slates_ipc::protocol::VolumeId,
+  name: &str,
+) -> slates_ipc::protocol::VolumeId {
+  let ReplyBody::WorkCreated { id, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: name.to_owned(),
+  }) else {
+    panic!("create work");
+  };
+  id
+}
+
+/// Declares a splice on `work`'s file `f`.
+fn edit_f(
+  client: &mut Client,
+  work: slates_ipc::protocol::VolumeId,
+  at: u64,
+  del: u64,
+  bytes: &[u8],
+) {
+  assert!(matches!(
+    client.call(&RequestBody::Edit {
+      work,
+      path: "f".to_owned(),
+      at,
+      delete_len: del,
+      bytes: bytes.to_vec(),
+    }),
+    ReplyBody::Edited
+  ));
+}
+
+/// The green's head version.
+fn green_head(client: &mut Client, green: slates_ipc::protocol::VolumeId) -> u64 {
+  let ReplyBody::Versions { head } = client.call(&RequestBody::Versions { green }) else {
+    panic!("versions");
+  };
+  head
+}
+
+/// A clean rebase commits nothing to the green, then the moved work submits (§4.16). A tail edit
+/// based on version 1 rebases onto the head (2) — the head stays 2 — then submits as version 3.
+fn rebase_clean_part(client: &mut Client, green: slates_ipc::protocol::VolumeId) {
+  let tail = work_over(client, green, "tail");
+  edit_f(client, tail, 8, 2, b"YY");
+  let ReplyBody::Rebased { version, conflicts } = client.call(&RequestBody::Rebase { work: tail })
+  else {
+    panic!("rebase");
+  };
+  assert!(
+    conflicts.is_empty(),
+    "the clean tail edit rebases: {conflicts:?}"
+  );
+  assert_eq!(version, Some(2), "the work is rebased onto the head");
+  assert_eq!(green_head(client, green), 2, "a rebase commits nothing");
+
+  let ReplyBody::Submitted { version, conflicts } =
+    client.call(&RequestBody::Submit { work: tail })
+  else {
+    panic!("submit");
+  };
+  assert!(
+    conflicts.is_empty(),
+    "the rebased work submits: {conflicts:?}"
+  );
+  assert_eq!(version, Some(3), "the rebased work advances the green to 3");
+  assert_eq!(green_head(client, green), 3);
+}
+
+/// A rebase that conflicts returns the windows and commits nothing (§4.16). Two works based on 3
+/// overwrite the same region; one submits (4), the other's rebase conflicts and the head stays 4.
+fn rebase_conflict_part(client: &mut Client, green: slates_ipc::protocol::VolumeId) {
+  let winner = work_over(client, green, "winner");
+  let loser = work_over(client, green, "loser");
+  edit_f(client, winner, 0, 2, b"PP");
+  edit_f(client, loser, 0, 2, b"QQ");
+  assert!(matches!(
+    client.call(&RequestBody::Submit { work: winner }),
+    ReplyBody::Submitted {
+      version: Some(4),
+      ..
+    }
+  ));
+  let ReplyBody::Rebased { version, conflicts } = client.call(&RequestBody::Rebase { work: loser })
+  else {
+    panic!("rebase loser");
+  };
+  assert_eq!(version, None, "the overlapping work does not rebase");
+  assert!(
+    conflicts.iter().any(|w| w.path == "f"),
+    "the conflict names the file: {conflicts:?}"
+  );
+  assert_eq!(
+    green_head(client, green),
+    4,
+    "a conflicting rebase commits nothing"
+  );
+}
+
+/// Rebase, the corrective path (§4.16), over the wire: a work whose operations map cleanly onto the
+/// head is rebased — the green is committed nothing (its head does not move), the work is moved onto
+/// the head, and a following submit accepts. A work that conflicts on rebase gets the windows and,
+/// again, the green does not move. Non-vacuous: were rebase to commit, the head would jump; were it
+/// to move the work wrongly, the following submit would not reach the expected version.
+fn merge_rebase_scenario() {
+  let (daemon, instance) = daemon("merge-rebase");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "g5".to_owned(),
+    require_evidence: false,
+  }) else {
+    panic!("create green");
+  };
+
+  // Seed f, then move the head under a work by inserting at the front.
+  let seed = work_over(&mut client, green, "seed");
+  edit_f(&mut client, seed, 0, 0, b"0123456789");
+  assert!(matches!(
+    client.call(&RequestBody::Submit { work: seed }),
+    ReplyBody::Submitted {
+      version: Some(1),
+      ..
+    }
+  ));
+  let front = work_over(&mut client, green, "front");
+  edit_f(&mut client, front, 0, 0, b"AB");
+  assert!(matches!(
+    client.call(&RequestBody::Submit { work: front }),
+    ReplyBody::Submitted {
+      version: Some(2),
+      ..
+    }
+  ));
+
+  rebase_clean_part(&mut client, green);
+  rebase_conflict_part(&mut client, green);
   daemon.stop();
 }

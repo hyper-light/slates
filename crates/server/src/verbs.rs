@@ -187,6 +187,7 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::CreateWork { green: volume, .. }
     | RequestBody::Edit { work: volume, .. }
     | RequestBody::Submit { work: volume }
+    | RequestBody::Rebase { work: volume }
     | RequestBody::Clone { volume, .. }
     | RequestBody::Attach { volume, .. }
     | RequestBody::Resize { volume, .. }
@@ -796,6 +797,7 @@ fn mutates_shard_image(body: &RequestBody) -> bool {
       | RequestBody::CreateWork { .. }
       | RequestBody::Edit { .. }
       | RequestBody::Submit { .. }
+      | RequestBody::Rebase { .. }
       | RequestBody::Clone { .. }
       | RequestBody::Resize { .. }
       | RequestBody::Destroy { .. }
@@ -861,6 +863,7 @@ fn dispatch_inner(
       bytes,
     } => edit(state, work, &path, at, delete_len, &bytes),
     RequestBody::Submit { work } => submit(state, work),
+    RequestBody::Rebase { work } => rebase(state, work),
     RequestBody::Clone {
       volume,
       snapshot,
@@ -1640,49 +1643,73 @@ fn assemble_post_state(
   post
 }
 
-/// Submits a work volume's declared operations to its green as an increment (§4.16): compose the
-/// declared operations into the canonical document, seal the post-state, hash the identity, and run
-/// the green's merge verdict — accepted with the new version, or the conflict windows to rebase.
-fn submit(state: &mut ShardState, work: VolumeId) -> ReplyBody {
-  let work_id = to_db_volume(work);
-  let Some((green_id, base_version)) = state.works.get(&work_id).map(|w| (w.green, w.base_version))
-  else {
-    return refused(Refusal::NotFound);
+/// Composes a work volume's declared operations into an increment against its green's base version
+/// (§4.16), shared by [`submit`] and [`rebase`] so the two never derive an increment differently.
+/// The base is the green as it was at the work's base version — empty at 0, the current state at the
+/// head, replayed from the deltas for an intervening version a lagging work is based on — what the
+/// work was seeded with, so the composition is exact. Returns the green's id and the increment, or
+/// the refusal to reply with.
+fn build_increment(
+  state: &ShardState,
+  work_id: DbVolumeId,
+) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
+  let Some(w) = state.works.get(&work_id) else {
+    return Err(Refusal::NotFound);
   };
-  // The base state the increment is derived against: the green as it was at the work's base version
-  // (empty at 0, the current state at head, replayed from the deltas for an intervening version a
-  // lagging work is based on) — what the work was seeded with, so the composition is exact.
-  let base = {
-    let Some(engine) = state.greens.get(&green_id) else {
-      return refused(Refusal::NotFound);
-    };
-    engine.base_at(base_version)
+  let green_id = w.green;
+  let base_version = w.base_version;
+  let Some(engine) = state.greens.get(&green_id) else {
+    return Err(Refusal::NotFound);
   };
-  let built = {
-    let Some(w) = state.works.get(&work_id) else {
-      return refused(Refusal::NotFound);
-    };
-    let doc = match slates_merge::increment::compose_volume(&base, &w.journal) {
-      Ok(doc) => doc,
-      Err(e) => {
-        return refused(Refusal::BadRequest {
-          reason: format!("increment does not compose: {e:?}"),
-        });
-      }
-    };
-    let post_state = assemble_post_state(&doc, &w.content);
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&doc.encode());
-    hasher.update(&post_state);
-    let id = *hasher.finalize().as_bytes();
+  let base = engine.base_at(base_version);
+  let doc = match slates_merge::increment::compose_volume(&base, &w.journal) {
+    Ok(doc) => doc,
+    Err(e) => {
+      return Err(Refusal::BadRequest {
+        reason: format!("increment does not compose: {e:?}"),
+      });
+    }
+  };
+  let post_state = assemble_post_state(&doc, &w.content);
+  let mut hasher = blake3::Hasher::new();
+  hasher.update(&doc.encode());
+  hasher.update(&post_state);
+  let id = *hasher.finalize().as_bytes();
+  Ok((
+    green_id,
     slates_merge::engine::Increment {
       id,
       base: base_version,
       doc,
       post_state,
-    }
+    },
+  ))
+}
+
+/// The conflict windows of a merge outcome, as the wire's [`MergeWindow`](slates_ipc::protocol::MergeWindow)s.
+fn merge_windows(
+  windows: &[slates_merge::engine::ConflictWindow],
+) -> Vec<slates_ipc::protocol::MergeWindow> {
+  windows
+    .iter()
+    .map(|w| slates_ipc::protocol::MergeWindow {
+      path: w.path.clone(),
+      at: w.range.start,
+      len: w.range.len,
+      class: w.class as u8,
+    })
+    .collect()
+}
+
+/// Submits a work volume's declared operations to its green as an increment (§4.16): compose the
+/// declared operations into the canonical document, seal the post-state, hash the identity, and run
+/// the green's merge verdict — accepted with the new version, or the conflict windows to rebase.
+fn submit(state: &mut ShardState, work: VolumeId) -> ReplyBody {
+  let work_id = to_db_volume(work);
+  let (green_id, inc) = match build_increment(state, work_id) {
+    Ok(built) => built,
+    Err(refusal) => return refused(refusal),
   };
-  let inc = built;
   let Some(engine) = state.greens.get_mut(&green_id) else {
     return refused(Refusal::NotFound);
   };
@@ -1693,15 +1720,46 @@ fn submit(state: &mut ShardState, work: VolumeId) -> ReplyBody {
     },
     slates_merge::engine::Outcome::Conflict { windows } => ReplyBody::Submitted {
       version: None,
-      conflicts: windows
-        .iter()
-        .map(|w| slates_ipc::protocol::MergeWindow {
-          path: w.path.clone(),
-          at: w.range.start,
-          len: w.range.len,
-          class: w.class as u8,
-        })
-        .collect(),
+      conflicts: merge_windows(&windows),
+    },
+  }
+}
+
+/// Rebases a work volume onto its green's head (§4.16 "Rebase, the only corrective path"): compose the
+/// same increment `submit` would, run the verdict without committing to the green, and — when every
+/// operation maps cleanly — move the work onto the head, restating its base, its content and its
+/// journal in head coordinates so a later submit composes with no further mapping. A conflict returns
+/// the windows and changes nothing. The green is never changed by a rebase.
+fn rebase(state: &mut ShardState, work: VolumeId) -> ReplyBody {
+  let work_id = to_db_volume(work);
+  let (green_id, inc) = match build_increment(state, work_id) {
+    Ok(built) => built,
+    Err(refusal) => return refused(refusal),
+  };
+  let Some(engine) = state.greens.get_mut(&green_id) else {
+    return refused(Refusal::NotFound);
+  };
+  match engine.rebase(&inc) {
+    slates_merge::engine::Rebased::Rebased {
+      version,
+      files,
+      journal,
+    } => {
+      // The work moves onto the head; the green is untouched. `build_increment` proved the work
+      // exists, so this lookup finds it.
+      if let Some(w) = state.works.get_mut(&work_id) {
+        w.base_version = version;
+        w.content = files;
+        w.journal = journal;
+      }
+      ReplyBody::Rebased {
+        version: Some(version),
+        conflicts: Vec::new(),
+      }
+    }
+    slates_merge::engine::Rebased::Conflict { windows } => ReplyBody::Rebased {
+      version: None,
+      conflicts: merge_windows(&windows),
     },
   }
 }

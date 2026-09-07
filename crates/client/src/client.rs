@@ -23,6 +23,16 @@ pub enum Submitted {
   Conflict(Vec<MergeWindow>),
 }
 
+/// The result of a rebase (§4.16 "Rebase, the only corrective path"): the work moved onto the head
+/// version, or a conflict with the windows to resolve first. The green is unchanged either way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Rebased {
+  /// Every operation mapped cleanly; the head version the work is now based on.
+  Rebased(u64),
+  /// The pending operations conflict; the windows to resolve, then rebase again.
+  Conflict(Vec<MergeWindow>),
+}
+
 /// The client's deadlines, every one a derivation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Deadlines {
@@ -492,6 +502,22 @@ impl Client {
         conflicts,
       } => Ok(Submitted::Conflict(conflicts)),
       _ => Err(ClientError::UnexpectedReply { verb: "submit" }),
+    }
+  }
+
+  /// Rebases a work volume onto its green's head (§4.16): its pending operations are mapped forward,
+  /// moving the work's base without committing to the green — the head version it now sits on, or the
+  /// conflict windows to resolve first.
+  pub fn rebase(&mut self, work: VolumeId) -> Result<Rebased, ClientError> {
+    match self.call(&RequestBody::Rebase { work })? {
+      ReplyBody::Rebased {
+        version: Some(v), ..
+      } => Ok(Rebased::Rebased(v)),
+      ReplyBody::Rebased {
+        version: None,
+        conflicts,
+      } => Ok(Rebased::Conflict(conflicts)),
+      _ => Err(ClientError::UnexpectedReply { verb: "rebase" }),
     }
   }
 

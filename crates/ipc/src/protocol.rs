@@ -161,6 +161,12 @@ pub enum RequestBody {
     /// The work volume.
     work: VolumeId,
   },
+  /// Rebase a work volume onto its green's head, the only corrective path (§4.16): map its pending
+  /// operations forward, moving the work's base without committing to the green.
+  Rebase {
+    /// The work volume.
+    work: VolumeId,
+  },
   /// Clone a snapshot into a new volume.
   Clone {
     /// The volume.
@@ -625,6 +631,13 @@ pub enum ReplyBody {
     /// The committed green version, when the increment was accepted; `None` on conflict.
     version: Option<u64>,
     /// The conflict windows to rebase against, when not accepted.
+    conflicts: Vec<MergeWindow>,
+  },
+  /// A work volume was rebased onto its green's head (§4.16). The green is unchanged.
+  Rebased {
+    /// The head the work is now based on, when every operation mapped cleanly; `None` on conflict.
+    version: Option<u64>,
+    /// The conflict windows to resolve, when the rebase did not complete.
     conflicts: Vec<MergeWindow>,
   },
   /// Cloned.
