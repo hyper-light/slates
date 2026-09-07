@@ -1,6 +1,8 @@
-//! The MCP server's tests (§4.12, Phase 6 task 8): the merge loop driven entirely through MCP tool
-//! calls against a live in-process daemon — create a green, clone a work, edit, submit, read the
-//! chain, and see a concurrent conflict — asserting on the JSON-RPC results an agent would receive.
+//! The MCP server's tests (§4.12, Phase 6 task 8): the tools driven through MCP tool calls against a
+//! live in-process daemon — the protocol handshake, the whole merge loop (with a concurrent
+//! conflict), the volume lifecycle, and typed JSON-RPC errors — asserting on the results an agent
+//! would receive. The scenarios share one daemon in one serial test so their spinning shards do not
+//! contend (the daemon-per-test contention the client and server tests also avoid).
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -71,6 +73,7 @@ fn assert_protocol(server: &mut McpServer) {
     .map(|t| t["name"].as_str().unwrap().to_owned())
     .collect();
   assert!(names.contains(&"slates.merge.submit".to_owned()));
+  assert!(names.contains(&"slates.volume.create".to_owned()));
   assert!(
     !names.iter().any(|n| n.contains("grant")),
     "no grant tool is offered: {names:?}"
@@ -84,30 +87,10 @@ fn assert_protocol(server: &mut McpServer) {
   );
 }
 
-/// The whole merge loop over MCP: initialize, list the tools, create a green and a work, edit,
-/// submit, read the chain — then a second work conflicts on the same file rather than clobbering it.
-#[test]
-fn the_merge_loop_runs_over_mcp() {
-  let profile = profile();
-  let instance = format!("mcp-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(2);
-  let daemon = Daemon::start(
-    &profile,
-    config,
-    SegmentSource::Create {
-      name: "slates-seg-mcp".to_owned(),
-    },
-  )
-  .unwrap();
-  let mut server = McpServer::new(connect(&instance));
-  assert_protocol(&mut server);
-
-  // create_green, then two works both based on version 0 (before either submits), each editing f.
-  let green = call(
-    &mut server,
-    "slates.merge.create_green",
-    json!({ "name": "g" }),
-  )["green"]
+/// The merge loop over MCP: create a green and two works (both based on version 0), edit, submit,
+/// read the chain, and see the second work conflict on the same file rather than clobbering the first.
+fn assert_merge_loop(server: &mut McpServer) {
+  let green = call(server, "slates.merge.create_green", json!({ "name": "g" }))["green"]
     .as_str()
     .unwrap()
     .to_owned();
@@ -120,51 +103,35 @@ fn the_merge_loop_runs_over_mcp() {
     assert_eq!(work["base"], 0, "a work over a fresh green is based on 0");
     work["work"].as_str().unwrap().to_owned()
   };
-  let work_a = new_work(&mut server, "a");
-  let work_b = new_work(&mut server, "b");
+  let work_a = new_work(server, "a");
+  let work_b = new_work(server, "b");
   call(
-    &mut server,
+    server,
     "slates.merge.edit",
     json!({ "work": work_a, "path": "f", "at": 0, "text": "hello" }),
   );
   call(
-    &mut server,
+    server,
     "slates.merge.edit",
     json!({ "work": work_b, "path": "f", "at": 0, "text": "world" }),
   );
 
-  // A submits on the fast path; the chain advances to version 1.
-  let submitted = call(
-    &mut server,
-    "slates.merge.submit",
-    json!({ "work": work_a }),
-  );
+  let submitted = call(server, "slates.merge.submit", json!({ "work": work_a }));
   assert_eq!(submitted, json!({ "accepted": true, "version": 1 }));
-
-  // The chain reads back: head 1, and f changed after version 0.
   assert_eq!(
-    call(
-      &mut server,
-      "slates.merge.versions",
-      json!({ "green": green })
-    )["head"],
+    call(server, "slates.merge.versions", json!({ "green": green }))["head"],
     1
   );
   assert_eq!(
     call(
-      &mut server,
+      server,
       "slates.merge.changed_since",
       json!({ "green": green, "version": 0 }),
     )["paths"],
     json!(["f"])
   );
 
-  // B, still based on 0, touched the same file — it conflicts rather than clobbering A.
-  let conflict = call(
-    &mut server,
-    "slates.merge.submit",
-    json!({ "work": work_b }),
-  );
+  let conflict = call(server, "slates.merge.submit", json!({ "work": work_b }));
   assert_eq!(conflict["accepted"], false, "the second submit conflicts");
   assert!(
     conflict["conflicts"]
@@ -174,26 +141,68 @@ fn the_merge_loop_runs_over_mcp() {
       .any(|w| w["path"] == "f"),
     "the conflict names the file: {conflict}"
   );
-
-  daemon.stop();
 }
 
-/// A malformed call is a typed JSON-RPC error, not a panic: an unknown tool and a bad volume id.
-#[test]
-fn malformed_calls_return_typed_errors() {
-  let profile = profile();
-  let instance = format!("mcp-bad-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(2);
-  let daemon = Daemon::start(
-    &profile,
-    config,
-    SegmentSource::Create {
-      name: "slates-seg-mcp-bad".to_owned(),
-    },
-  )
-  .unwrap();
-  let mut server = McpServer::new(connect(&instance));
+/// The volume lifecycle over MCP: create, list, stat, snapshot, clone, resize, destroy, and status.
+fn assert_volume_lifecycle(server: &mut McpServer) {
+  let volume = call(
+    server,
+    "slates.volume.create",
+    json!({ "name": "v", "bounded": 1 << 20 }),
+  )["volume"]
+    .as_str()
+    .unwrap()
+    .to_owned();
 
+  let listed = call(server, "slates.volume.list", json!({}));
+  assert!(
+    listed["volumes"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|v| v["name"] == "v"),
+    "the volume is listed: {listed}"
+  );
+  assert_eq!(
+    call(server, "slates.volume.stat", json!({ "volume": volume }))["name"],
+    "v"
+  );
+
+  let snapshot = call(
+    server,
+    "slates.volume.snapshot",
+    json!({ "volume": volume }),
+  )["snapshot"]
+    .as_u64()
+    .unwrap();
+  let clone = call(
+    server,
+    "slates.volume.clone",
+    json!({ "volume": volume, "snapshot": snapshot, "name": "v-clone" }),
+  );
+  assert_ne!(clone["volume"], Value::Null);
+
+  assert_eq!(
+    call(
+      server,
+      "slates.volume.resize",
+      json!({ "volume": volume, "bounded": 2u64 << 20 }),
+    ),
+    json!({ "resized": true })
+  );
+  assert_eq!(
+    call(server, "slates.volume.destroy", json!({ "volume": volume })),
+    json!({ "destroyed": true })
+  );
+
+  let status = call(server, "slates.status", json!({}));
+  assert_eq!(status["pid"], std::process::id());
+  assert_eq!(status["shards"], 2);
+}
+
+/// Malformed calls are typed JSON-RPC errors, not panics: an unknown tool, a bad volume id, and an
+/// unknown method.
+fn assert_malformed(server: &mut McpServer) {
   let unknown = server
     .handle(&json!({
       "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -220,6 +229,29 @@ fn malformed_calls_return_typed_errors() {
     .handle(&json!({ "jsonrpc": "2.0", "id": 3, "method": "no/such" }))
     .unwrap();
   assert_eq!(unknown_method["error"]["code"], -32601);
+}
+
+/// The whole MCP surface over one daemon: the handshake, the merge loop, the volume lifecycle, and
+/// typed errors. One serial daemon so the scenarios' spinning shards do not contend.
+#[test]
+fn the_mcp_surface_serves_the_tools() {
+  let profile = profile();
+  let instance = format!("mcp-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance).with_shards(2);
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: "slates-seg-mcp".to_owned(),
+    },
+  )
+  .unwrap();
+  let mut server = McpServer::new(connect(&instance));
+
+  assert_protocol(&mut server);
+  assert_merge_loop(&mut server);
+  assert_volume_lifecycle(&mut server);
+  assert_malformed(&mut server);
 
   daemon.stop();
 }

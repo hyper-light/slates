@@ -17,7 +17,10 @@
 //! hex, opaque to the agent and echoed back on every result.
 
 use serde_json::{Value, json};
-use slates_client::{Client, ClientError, Rebased, Submitted, VolumeId};
+use slates_client::{
+  Client, ClientError, CreateSpec, DaemonReport, NamePolicy, Rebased, SizeClass, SnapshotId,
+  StatusReport, Submitted, VolumeId, VolumeSummary,
+};
 
 /// The MCP protocol version this server speaks (the dated revision it targets, §4.12).
 const PROTOCOL_VERSION: &str = "2026-07-28";
@@ -97,6 +100,14 @@ impl McpServer {
       "slates.merge.rebase" => self.rebase(&args),
       "slates.merge.versions" => self.versions(&args),
       "slates.merge.changed_since" => self.changed_since(&args),
+      "slates.volume.create" => self.create_volume(&args),
+      "slates.volume.list" => self.list_volumes(),
+      "slates.volume.stat" => self.stat_volume(&args),
+      "slates.volume.snapshot" => self.snapshot_volume(&args),
+      "slates.volume.clone" => self.clone_volume(&args),
+      "slates.volume.resize" => self.resize_volume(&args),
+      "slates.volume.destroy" => self.destroy_volume(&args),
+      "slates.status" => self.status(),
       other => {
         return Err(McpError {
           code: code::METHOD_NOT_FOUND,
@@ -171,6 +182,72 @@ impl McpServer {
     let version = u64_arg(args, "version")?;
     let paths = self.client.changed_since(green, version).map_err(refusal)?;
     Ok(json!({ "paths": paths }))
+  }
+
+  fn create_volume(&mut self, args: &Value) -> Result<Value, McpError> {
+    let spec = CreateSpec {
+      name: string_arg(args, "name")?,
+      size: size_arg(args),
+      names: if args.get("fold").and_then(Value::as_bool).unwrap_or(false) {
+        NamePolicy::Fold
+      } else {
+        NamePolicy::Exact
+      },
+      require_locked: false,
+      base: args.get("base").and_then(Value::as_str).map(str::to_owned),
+    };
+    let volume = self.client.create(&spec).map_err(refusal)?;
+    Ok(json!({ "volume": id_hex(volume) }))
+  }
+
+  fn list_volumes(&mut self) -> Result<Value, McpError> {
+    let volumes = self.client.list().map_err(refusal)?;
+    Ok(json!({ "volumes": volumes.iter().map(summary_json).collect::<Vec<_>>() }))
+  }
+
+  fn stat_volume(&mut self, args: &Value) -> Result<Value, McpError> {
+    let volume = volume_arg(args, "volume")?;
+    let report = self.client.status(volume).map_err(refusal)?;
+    Ok(status_json(&report))
+  }
+
+  fn snapshot_volume(&mut self, args: &Value) -> Result<Value, McpError> {
+    let volume = volume_arg(args, "volume")?;
+    let snapshot = self.client.snapshot(volume).map_err(refusal)?;
+    Ok(json!({ "snapshot": snapshot.value }))
+  }
+
+  fn clone_volume(&mut self, args: &Value) -> Result<Value, McpError> {
+    let volume = volume_arg(args, "volume")?;
+    let snapshot = SnapshotId {
+      value: u64_arg(args, "snapshot")?,
+    };
+    let name = string_arg(args, "name")?;
+    let clone = self
+      .client
+      .clone_snapshot(volume, snapshot, &name)
+      .map_err(refusal)?;
+    Ok(json!({ "volume": id_hex(clone) }))
+  }
+
+  fn resize_volume(&mut self, args: &Value) -> Result<Value, McpError> {
+    let volume = volume_arg(args, "volume")?;
+    self
+      .client
+      .resize(volume, size_arg(args))
+      .map_err(refusal)?;
+    Ok(json!({ "resized": true }))
+  }
+
+  fn destroy_volume(&mut self, args: &Value) -> Result<Value, McpError> {
+    let volume = volume_arg(args, "volume")?;
+    self.client.destroy(volume).map_err(refusal)?;
+    Ok(json!({ "destroyed": true }))
+  }
+
+  fn status(&mut self) -> Result<Value, McpError> {
+    let report = self.client.daemon_status().map_err(refusal)?;
+    Ok(daemon_json(&report))
   }
 }
 
@@ -276,6 +353,54 @@ fn tool_list() -> Vec<Value> {
       json!({ "green": string, "version": integer }),
       json!(["green", "version"]),
     ),
+    tool(
+      "slates.volume.create",
+      "Create a volume: `bounded` (a byte limit) or `dynamic` (a max), optional `base` host path.",
+      json!({ "name": string, "bounded": integer, "dynamic": integer, "fold": { "type": "boolean" }, "base": string }),
+      json!(["name"]),
+    ),
+    tool(
+      "slates.volume.list",
+      "Every volume, with its referenced and unique bytes.",
+      json!({}),
+      json!([]),
+    ),
+    tool(
+      "slates.volume.stat",
+      "A volume's status: bytes, lease, attachments, head, snapshots, drift, placement.",
+      json!({ "volume": string }),
+      json!(["volume"]),
+    ),
+    tool(
+      "slates.volume.snapshot",
+      "Take a snapshot of a volume; the snapshot id.",
+      json!({ "volume": string }),
+      json!(["volume"]),
+    ),
+    tool(
+      "slates.volume.clone",
+      "Clone a volume's snapshot into a new volume.",
+      json!({ "volume": string, "snapshot": integer, "name": string }),
+      json!(["volume", "snapshot", "name"]),
+    ),
+    tool(
+      "slates.volume.resize",
+      "Resize a volume: `bounded` (a byte limit) or `dynamic` (a max).",
+      json!({ "volume": string, "bounded": integer, "dynamic": integer }),
+      json!(["volume"]),
+    ),
+    tool(
+      "slates.volume.destroy",
+      "Destroy a volume (its clones survive).",
+      json!({ "volume": string }),
+      json!(["volume"]),
+    ),
+    tool(
+      "slates.status",
+      "The daemon's status: generation, restarts, shard count.",
+      json!({}),
+      json!([]),
+    ),
   ]
 }
 
@@ -314,6 +439,63 @@ fn windows_json(windows: &[slates_ipc::protocol::MergeWindow]) -> Value {
       .map(|w| json!({ "path": w.path, "at": w.at, "len": w.len, "class": w.class }))
       .collect(),
   )
+}
+
+/// The size class from a `bounded` byte limit or a `dynamic` max, defaulting to an unbounded dynamic
+/// volume when neither is given.
+fn size_arg(args: &Value) -> SizeClass {
+  if let Some(limit) = args.get("bounded").and_then(Value::as_u64) {
+    SizeClass::Bounded { limit }
+  } else if let Some(max) = args.get("dynamic").and_then(Value::as_u64) {
+    SizeClass::Dynamic { max }
+  } else {
+    SizeClass::Dynamic { max: 0 }
+  }
+}
+
+/// A volume summary as JSON.
+fn summary_json(v: &VolumeSummary) -> Value {
+  json!({
+    "id": id_hex(v.id),
+    "name": v.name,
+    "referenced_bytes": v.referenced_bytes,
+    "unique_bytes": v.unique_bytes,
+    "overlay": v.overlay,
+  })
+}
+
+/// A volume status report as JSON.
+fn status_json(r: &StatusReport) -> Value {
+  json!({
+    "id": id_hex(r.id),
+    "name": r.name,
+    "referenced_bytes": r.referenced_bytes,
+    "unique_bytes": r.unique_bytes,
+    "lease_epoch": r.lease_epoch,
+    "attachments": r.attachments,
+    "head": r.head.value,
+    "snapshots": r.snapshots,
+    "watcher": r.watcher,
+    "drifted": r.drifted,
+    "placed": {
+      "region": r.placed.region,
+      "host_epoch": r.placed.host_epoch,
+      "mirror_age_ns": r.placed.mirror_age_ns,
+    },
+  })
+}
+
+/// The daemon's status as JSON (the top-level counters and the shard count).
+fn daemon_json(r: &DaemonReport) -> Value {
+  json!({
+    "pid": r.pid,
+    "generation": r.generation,
+    "restarts": r.restarts,
+    "heartbeat_age_ns": r.heartbeat_age_ns,
+    "clients_reaped": r.clients_reaped,
+    "clients_refused": r.clients_refused,
+    "shards": r.shards.len(),
+  })
 }
 
 /// A required string argument, or an invalid-params error.

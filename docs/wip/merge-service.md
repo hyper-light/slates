@@ -96,11 +96,13 @@ than clobbering it. Non-vacuous — a broken verdict would accept both.
 - **Surfaces (task 8):** the Rust client and the CLI verbs are wired; the **MCP merge surface is
   landed** — `crates/mcp` (`slates-mcp`) is a JSON-RPC 2.0 server (`initialize`, `tools/list`,
   `tools/call`) exposing the merge tools (`slates.merge.create_green`/`create_work`/`edit`/`submit`/
-  `rebase`/`versions`/`changed_since`, plus `slates.help`) over the client SDK, run by `slates mcp`
-  over stdio. No tool creates a grant (R10) — none is offered. Gated in `crates/mcp/tests/mcp.rs` (the
-  whole merge loop over tool calls, a concurrent conflict, and typed JSON-RPC errors for a bad tool or
-  id). **Owed:** the rest of the §4.12 tool set (`slates.volume`/`attach`/`fs`/`base`/`status`/`land`),
-  Streamable HTTP, resources and prompts, and the Python/TypeScript SDKs.
+  `rebase`/`versions`/`changed_since`, plus `slates.help`) and the volume lifecycle
+  (`slates.volume.create`/`list`/`stat`/`snapshot`/`clone`/`resize`/`destroy` and `slates.status`)
+  over the client SDK, run by `slates mcp` over stdio. No tool creates a grant (R10) — none is
+  offered. Gated in `crates/mcp/tests/mcp.rs` (one serial daemon: the handshake, the whole merge loop
+  with a concurrent conflict, the volume lifecycle, and typed JSON-RPC errors for a bad tool or id).
+  **Owed:** the rest of the §4.12 tool set (`slates.attach`/`fs`/`base`/`land`), Streamable HTTP,
+  resources and prompts, and the Python/TypeScript SDKs.
 - **Access control on the merge verbs** is owed and consistent across all of them: `create_work`,
   `edit`, `declare`, `submit` and `rebase` do not yet consult the §4.13 rights the store-backed verbs
   do. The natural rule under the clone-owner model is read on the green for `create_work` (a clone),
