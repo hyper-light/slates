@@ -13,7 +13,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   anchor   [--quick] [--shards N]                  run the anchor: own the segment, supervise the daemon
   daemon   [--quick] [--shards N]                  run the daemon (alone, or as the anchor's child)
   profile  [--quick] [--json]                      measure and print the machine profile
-  mcp [--instance NAME]                             serve the MCP tools over stdio
+  mcp [--instance NAME] [--http PORT]               serve the MCP tools (stdio, or loopback HTTP)
 
   volume create NAME (--bounded SIZE | --dynamic MAX) [--fold] [--locked] [--base DIR]
   volume list
@@ -106,6 +106,15 @@ pub(crate) struct ProfileOptions {
   pub quick: bool,
   /// JSON instead of the derived constants.
   pub json: bool,
+}
+
+/// Options of `mcp`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct McpOptions {
+  /// The daemon instance to connect to.
+  pub instance: String,
+  /// A loopback port to serve Streamable HTTP on, instead of stdio.
+  pub http: Option<u16>,
 }
 
 /// A client verb.
@@ -314,8 +323,8 @@ pub(crate) enum Command {
   Daemon(ProcessOptions),
   /// The profile.
   Profile(ProfileOptions),
-  /// The MCP server over stdio (the instance to connect to).
-  Mcp(String),
+  /// The MCP server (stdio, or Streamable HTTP on a loopback port).
+  Mcp(McpOptions),
   /// A client verb.
   Client(ClientRequest),
 }
@@ -334,6 +343,7 @@ const VALUES: &[&str] = &[
   "--exclude",
   "--volume",
   "--at",
+  "--http",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
@@ -576,10 +586,22 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
     }
     ["mcp"] => {
       taken.only(&Spec {
-        values: &["--instance"],
+        values: &["--http"],
         switches: &[],
       })?;
-      Ok(Command::Mcp(taken.instance()))
+      let http = match taken.value("--http") {
+        Some(port) => Some(
+          u16::try_from(number(port)?).map_err(|_| ParseError::BadValue {
+            what: "a port",
+            reason: port.to_owned(),
+          })?,
+        ),
+        None => None,
+      };
+      Ok(Command::Mcp(McpOptions {
+        instance: taken.instance(),
+        http,
+      }))
     }
     ["volume", rest @ ..] => parse_volume(&taken, rest),
     ["attach", id] => {
@@ -991,7 +1013,17 @@ mod tests {
     );
     assert_eq!(
       parse(&args("mcp --instance m")),
-      Ok(Command::Mcp("m".into()))
+      Ok(Command::Mcp(McpOptions {
+        instance: "m".into(),
+        http: None,
+      }))
+    );
+    assert_eq!(
+      parse(&args("mcp --instance m --http 8787")),
+      Ok(Command::Mcp(McpOptions {
+        instance: "m".into(),
+        http: Some(8787),
+      }))
     );
   }
 

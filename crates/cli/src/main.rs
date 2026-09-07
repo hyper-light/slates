@@ -56,7 +56,7 @@ fn main() -> ExitCode {
     Command::Anchor(options) => anchor::run(&options),
     Command::Daemon(options) => daemon::run(&options),
     Command::Profile(options) => verbs::profile(&options),
-    Command::Mcp(instance) => verbs::mcp(&instance),
+    Command::Mcp(options) => verbs::mcp(&options),
     Command::Client(request) => verbs::run(&request),
     Command::Exec(request) => run_exec(&request),
   };

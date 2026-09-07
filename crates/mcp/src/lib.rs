@@ -25,6 +25,10 @@ use slates_client::{
   Submitted, VolumeId, VolumeSummary,
 };
 
+pub mod http;
+
+pub use http::serve;
+
 /// The MCP protocol version this server speaks (the dated revision it targets, §4.12).
 const PROTOCOL_VERSION: &str = "2026-07-28";
 /// The server's name, reported in `initialize`.

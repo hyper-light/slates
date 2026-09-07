@@ -313,6 +313,43 @@ fn the_mcp_surface_serves_the_tools() {
   assert_attach_base(&mut server);
   assert_land(&mut server);
   assert_malformed(&mut server);
+  assert_http_transport(&instance);
 
   daemon.stop();
+}
+
+/// The loopback Streamable HTTP transport end to end (§4.12): a real TCP POST of a JSON-RPC message
+/// gets its reply over HTTP/1.1. A second client drives the HTTP server (its own daemon connection),
+/// so this exercises the socket path, not just the in-memory parser.
+fn assert_http_transport(instance: &str) {
+  use std::io::{Read, Write};
+  use std::net::{Ipv4Addr, TcpListener, TcpStream};
+
+  let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let addr = listener.local_addr().unwrap();
+  let server = McpServer::new(connect(instance));
+  // The server serves connections until dropped; the test makes one request and closes it. The
+  // accept loop then blocks on the next accept, which the process reaps at test end.
+  std::thread::spawn(move || {
+    let _ = slates_mcp::serve(server, &listener);
+  });
+
+  let mut stream = TcpStream::connect(addr).unwrap();
+  let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+  let request = format!(
+    "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+    body.len(),
+    body,
+  );
+  stream.write_all(request.as_bytes()).unwrap();
+  let mut response = String::new();
+  stream.read_to_string(&mut response).unwrap();
+  assert!(
+    response.starts_with("HTTP/1.1 200 OK"),
+    "an HTTP POST gets a 200: {response}"
+  );
+  assert!(
+    response.contains("\"protocolVersion\":\"2026-07-28\""),
+    "the initialize result rides the HTTP body: {response}"
+  );
 }

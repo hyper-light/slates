@@ -32,14 +32,31 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
   outcome.map_err(|e| failure_of(e, &request.instance))
 }
 
-/// Serves the MCP tools over stdio (§4.12): one JSON-RPC message per line in, its reply per line out,
-/// until end of input. The protocol and dispatch live in `slates-mcp`; this is only the transport —
-/// the I/O boundary the CLI owns. A line that is not valid JSON gets a JSON-RPC parse error, so a
-/// malformed message never stops the server.
-pub(crate) fn mcp(instance: &str) -> Result<(), Failure> {
+/// Serves the MCP tools (§4.12): the merge/volume/attach/base/land tools mapped onto the client SDK,
+/// over stdio by default or loopback Streamable HTTP when a port is given. MCP is the tool-plane edge
+/// only — the fleet's claims plane is a separate owned protocol (hecate's two-plane UDP), never MCP.
+/// The protocol and dispatch live in `slates-mcp`; this is the transport the CLI owns.
+pub(crate) fn mcp(options: &crate::args::McpOptions) -> Result<(), Failure> {
+  let client = connect(&options.instance)?;
+  let server = slates_mcp::McpServer::new(client);
+  match options.http {
+    Some(port) => serve_mcp_http(server, port),
+    None => serve_mcp_stdio(server),
+  }
+}
+
+/// Serves MCP over a loopback Streamable HTTP port (§4.12): the local edge, HTTP/1.1 over loopback.
+fn serve_mcp_http(server: slates_mcp::McpServer, port: u16) -> Result<(), Failure> {
+  let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+    .map_err(|e| Failure::Failed(format!("mcp http bind: {e}")))?;
+  slates_mcp::serve(server, &listener).map_err(|e| Failure::Failed(format!("mcp http: {e}")))
+}
+
+/// Serves MCP over stdio: one JSON-RPC message per line in, its reply per line out, until end of
+/// input. A line that is not valid JSON gets a JSON-RPC parse error, so a malformed message never
+/// stops the server.
+fn serve_mcp_stdio(mut server: slates_mcp::McpServer) -> Result<(), Failure> {
   use std::io::{BufRead, Write};
-  let client = connect(instance)?;
-  let mut server = slates_mcp::McpServer::new(client);
   let stdin = std::io::stdin();
   let mut input = stdin.lock();
   let mut out = std::io::stdout().lock();

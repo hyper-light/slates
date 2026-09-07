@@ -279,6 +279,10 @@ mod structural {
       "slates-ipc",
       "the per-OS rendezvous, which creates no filesystem entry (§4.7)",
     ),
+    (
+      "slates-mcp",
+      "the loopback MCP Streamable HTTP transport (§4.12); authorized by Ada 2026-09-06",
+    ),
     ("slates-bridge-fuse", "the mount and its device file (§4.6)"),
     (
       "slates-bridge-nfs",
