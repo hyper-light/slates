@@ -128,6 +128,13 @@ pub enum RequestBody {
     /// The green.
     green: VolumeId,
   },
+  /// The files a green changed strictly after `version` (§4.16): what a lagging work reconciles.
+  ChangedSince {
+    /// The green.
+    green: VolumeId,
+    /// The base version to compare against.
+    version: u64,
+  },
   /// Create a work volume over a green (§4.16): an agent's private clone to declare operations on.
   CreateWork {
     /// The green to work over.
@@ -598,6 +605,11 @@ pub enum ReplyBody {
   Versions {
     /// The head version.
     head: u64,
+  },
+  /// The files changed since a version.
+  ChangedSince {
+    /// The changed file paths.
+    paths: Vec<String>,
   },
   /// A work volume was created over a green.
   WorkCreated {

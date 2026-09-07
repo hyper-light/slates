@@ -2,10 +2,11 @@
 
 > Status: the `slates-merge` engine (verdict, deriver, splice, chain, position map, ops document) is
 > built and tested at the crate level; this note tracks wiring it into the server, client and CLI
-> (Phase 6 tasks 1, 6, 7, 8). **Landed:** green volumes and the chain head (`CreateGreen`, `Versions`);
-> the submit flow (`CreateWork`, `Edit`, `Submit`) for a fresh green with content edits, accept and
-> conflict, through the real verbs. **Owed:** the general base, `changed_since`, `rebase`/`advance`,
-> the CLI verbs, xattr/symlink post-state, cross-shard submit, and chain persistence.
+> (Phase 6 tasks 1, 6, 7, 8). **Landed:** green volumes and the chain read side (`CreateGreen`,
+> `Versions`, `ChangedSince`); the submit flow (`CreateWork`, `Edit`, `Submit`) for a fresh *and* a
+> non-empty green (derived against the current base), accept and conflict, through the real verbs.
+> **Owed:** `rebase`/`advance`, the CLI verbs, xattr/symlink post-state, the base at an intervening
+> version, cross-shard submit, and chain persistence.
 
 ## What is wired (server + ipc + client)
 
@@ -42,9 +43,9 @@ than clobbering it. Non-vacuous — a broken verdict would accept both.
   than composed against the wrong base.
 - **Post-state for non-content dimensions.** `assemble_post_state` handles content ops only; a
   `SetXattr`/`Symlink` increment needs its value bytes laid into the post-state at the op's `src`.
-- **`changed_since`, `rebase`, `advance`** (Phase 6 tasks 1 and 7): the per-path last-changed index
-  read, the corrective rebase mapping a work's pending operations to a newer version, and the
-  attachment re-pin with targeted invalidations.
+- **`rebase`, `advance`** (Phase 6 task 7): the corrective rebase mapping a work's pending operations
+  to a newer version, and the attachment re-pin with targeted invalidations. (`changed_since` — the
+  per-path last-changed index read — is done: `Green::changed_since` and the verb.)
 - **Surfaces (task 8):** the CLI verbs and the SDKs' typed methods beyond the Rust client.
 - **Cross-shard submit and chain persistence:** a work whose green is on another shard forwards the
   increment to the green's owner; and the chain (`VersionRecord`s and `seen`) is recovered from the

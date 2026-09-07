@@ -302,6 +302,17 @@ impl Green {
       .map(Vec::as_slice)
   }
 
+  /// The files whose content changed strictly after `version` (§4.16 the last-changed index): what a
+  /// lagging work must reconcile, and what a rebase remaps against. Sorted by path.
+  pub fn changed_since(&self, version: u64) -> Vec<String> {
+    self
+      .last_changed
+      .iter()
+      .filter(|(_, changed)| **changed > version)
+      .map(|(path, _)| path.clone())
+      .collect()
+  }
+
   /// The number of paths merged through the content fast path (the non-vacuity counter).
   pub fn fast_path_hits(&self) -> u64 {
     self.fast_path_hits

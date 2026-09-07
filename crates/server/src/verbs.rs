@@ -183,6 +183,7 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     RequestBody::Snapshot { volume }
     | RequestBody::DestroySnapshot { volume, .. }
     | RequestBody::Versions { green: volume }
+    | RequestBody::ChangedSince { green: volume, .. }
     | RequestBody::CreateWork { green: volume, .. }
     | RequestBody::Edit { work: volume, .. }
     | RequestBody::Submit { work: volume }
@@ -850,6 +851,7 @@ fn dispatch_inner(
       require_evidence,
     } => create_green(state, principal, &name, require_evidence),
     RequestBody::Versions { green } => versions(state, principal, green),
+    RequestBody::ChangedSince { green, version } => changed_since(state, principal, green, version),
     RequestBody::CreateWork { green, name } => create_work(state, principal, green, &name),
     RequestBody::Edit {
       work,
@@ -1443,6 +1445,29 @@ fn versions(state: &ShardState, principal: &Principal, green: VolumeId) -> Reply
   };
   ReplyBody::Versions {
     head: engine.head(),
+  }
+}
+
+/// The files a green changed strictly after `version` (§4.16): the read a lagging work uses to know
+/// what green moved under it before it rebases.
+fn changed_since(
+  state: &ShardState,
+  principal: &Principal,
+  green: VolumeId,
+  version: u64,
+) -> ReplyBody {
+  let id = to_db_volume(green);
+  let Some(record) = state.db.partition().volume(id) else {
+    return refused(Refusal::NotFound);
+  };
+  if !rights_of(record, principal).read {
+    return forbidden("changed_since");
+  }
+  let Some(engine) = state.greens.get(&id) else {
+    return refused(Refusal::NotFound);
+  };
+  ReplyBody::ChangedSince {
+    paths: engine.changed_since(version),
   }
 }
 

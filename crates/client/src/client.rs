@@ -427,6 +427,20 @@ impl Client {
     }
   }
 
+  /// The files a green changed strictly after `version` (§4.16).
+  pub fn changed_since(
+    &mut self,
+    green: VolumeId,
+    version: u64,
+  ) -> Result<Vec<String>, ClientError> {
+    match self.call(&RequestBody::ChangedSince { green, version })? {
+      ReplyBody::ChangedSince { paths } => Ok(paths),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "changed_since",
+      }),
+    }
+  }
+
   /// Creates a work volume over a green (§4.16); its id and the green version it is based on.
   pub fn create_work(
     &mut self,

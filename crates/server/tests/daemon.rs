@@ -804,6 +804,23 @@ fn merge_submit_scenario() {
   };
   assert_eq!(head, 1, "the green advanced to version 1");
 
+  // The chain's read side: the file A committed changed after version 0, but not after version 1.
+  let ReplyBody::ChangedSince { paths } =
+    client.call(&RequestBody::ChangedSince { green, version: 0 })
+  else {
+    panic!("changed_since");
+  };
+  assert_eq!(paths, vec!["f".to_owned()], "f changed after version 0");
+  let ReplyBody::ChangedSince { paths } =
+    client.call(&RequestBody::ChangedSince { green, version: 1 })
+  else {
+    panic!("changed_since");
+  };
+  assert!(
+    paths.is_empty(),
+    "nothing changed after the head: {paths:?}"
+  );
+
   // B, still based on version 0, touched the same file — it conflicts rather than clobbering A.
   let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit { work: b })
   else {
