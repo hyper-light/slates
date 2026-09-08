@@ -1708,8 +1708,21 @@ version.
 **Membership.** SWIM with Lifeguard: direct probe → k indirect proxies → SUSPECT → DEAD;
 suspicion timeout `max − (max−min)·log(C+1)/log(K+1)` with the originator excluded; peer
 confirmation before suspicion; gossip with λ·ln(n+1) rebroadcasts under the measured per-path
-MTU; a bounded local-health multiplier; every parameter derived from measured RTT, loss, and
-convergence (`research/survey-hyperscale.md` §8.4 gives the formula per parameter).
+MTU; a bounded local-health multiplier; randomized probe order; and, from Vivaldi network
+coordinates each node learns from its own measured round-trip times and exchanges on the
+acknowledgement, a per-peer RTT prediction that selects the indirect-probe relays nearest the
+target, so a slow far peer is not mistaken for a failed near one. Every parameter derived from
+measured RTT, loss, and convergence (`research/survey-hyperscale.md` §8.4 gives the formula per
+parameter; the local-health multiplier is a small integer cap, 3×–4×, not the raw `(LHM+1)`,
+which over-dilates timers under sustained probe failure).
+
+**Slow versus stuck.** A long operation that waits on remote progress — a mirror catching up, a
+put filling its quorum — is told apart from a stalled one by a progress witness (a monotone,
+operation-defined measure and the time it last advanced): near its deadline, an operation still
+advancing is granted a bounded extension rather than declared failed, and only a stalled one, or
+one that has spent its extension budget, is left to the hard timeout. This is the per-operation
+analogue of the local-health multiplier (slow ≠ dead). The statistical change-point witnesses for
+noisy progress (`research/survey-hyperscale.md`, hyperscale's `health/progress_witness`) are owed.
 
 **Placement.** The group assigns every host a neighbourhood of S hosts across distinct failure
 domains from the declared tree, with S derived from the measured re-replication bandwidth
@@ -4344,3 +4357,13 @@ Applied in the same change to: Part 0 (glossary), Part 1.4, Part 2.1, 2.3, 2.6, 
   Appendix B/C; GAPS.md; README.md; docs/cli.md; docs/wip/README.md; EQUIVALENCE.md;
   research/hecate-contract-review.md and survey-hecate.md; current-contract notes in the
   affected research documents; docs/bugs/2026-09-05-system-contract-audit.md.
+
+### A-10 (accepted 2026-09-08) — Cluster plane built: SWIM/Lifeguard complete, the hecate Raft dialect, Vivaldi coordinates, progress-based extension
+Applied in the same change to: §4.8 (Membership, new "Slow versus stuck"), the `slates-cluster` crate, GAPS §1 (Registers/configuration status).
+- Authorization: Ada directed building the cluster-plane subsystems ("build all those portions… I set NO rules preventing you"), the register-commit milestone, and — after a study of hyperscale's SWIM — the three follow-ons (LHM derivation, Vivaldi coordinates, progress extension) with "do it". This change records mechanisms already implemented and gated in `slates-cluster`; the module docs carry the per-mechanism evidence.
+- SWIM/Lifeguard (§4.8 Membership), sans-io and oracle-tested at N=1, then live over the simulated UDP fabric: incarnation-based membership merge with self-refutation; direct probe; indirect probe (ping-request through k relays); infection-style gossip (λ·log(N) bound); the Lifeguard local-health multiplier (a small integer cap, `health+1` to a derived `health_max` of 2–3, deliberately gentler than the raw `(LHM+1)` which over-dilates timers — hyperscale's measured correction); the confirmation-count suspicion timeout `max−(max−min)·log(C+1)/log(K+1)` with the **originator excluded** (a lone suspicion rides the full window — the bug hyperscale's chaos tests exposed and this fixed), the logarithm in deterministic fixed point; and randomized probe order (a seeded xorshift, so the simulation replays).
+- The configuration group is the **hecate Raft dialect** (§4.8 mechanism 2), a pure sans-io core: leader election with the §5.4.1 election restriction; log replication with the consistency check, conflict truncation and the §5.4.2 commit-safety rule; PreVote (§9.6, anti-disruption); CheckQuorum (§6.2); ReadIndex (§6.4); and the joint-consensus overlapping-majority rule (§6). The `ConfigGroup` folds its committed log into the `Configuration` (reconcile from the SWIM view; takeover to the rendezvous-first survivor with an epoch bump). Owed: the log-integrated membership transition (config-change entries taking effect on append), snapshot/log compaction (the log is bounded only once this lands), and the bug-record conformance suite.
+- Vivaldi network coordinates (Dabek 2004): each node learns a coordinate from its own measured round-trip times and exchanges it on the acknowledgement, so a node predicts the RTT to any peer and picks indirect-probe relays nearest the target. Float, but per-node local state with no cross-host bit-identity requirement (the one operational float in the cluster plane; the Vivaldi constants carry their derivations).
+- Progress-based extension (§4.8 "Slow versus stuck"): a progress witness and a deadline extender let a slow-but-progressing remote-waiting operation earn a bounded extension rather than be declared failed. Built standalone; its consumer (mirror catch-up, a soft-deadline put) is owed — the local land/merge engines are cooperatively chunked and do not have the pattern.
+- Evidence: SWIM (Das/Gupta/Motivala DSN 2002), Lifeguard (Dadgar/Phillips/Currey DSN 2018), Raft (Ongaro/Ousterhout 2014), Vivaldi (Dabek et al. SIGCOMM 2004); `../hyperscale/hyperscale/distributed/swim` read directly (`local_health_multiplier.py`, `detection/suspicion_state.py`, `coordinates/coordinate_engine.py`, `detection/probe_scheduler.py`, `nodes/worker/extension_trigger.py`).
+- What it does not change: the rules R1–R10; the register protocol and its refusal taxonomy; the one-quorum-rule authority of A-6; the RAM-only and grant-gated-landing rules. Fleet consensus, real network/process deployment, and the SDK/mount frontier remain gated.
