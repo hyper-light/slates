@@ -18,6 +18,8 @@ sha2 = { workspace = true }
 # control-plane test (§4.10a); shipped transport code stays pure — this is only the test's substrate.
 slates-rt = { workspace = true }
 rustix = { workspace = true }
+# Generative hostile-input fuzzing of the wire parsers (the hostile-input rule; D-20).
+proptest = { workspace = true }
 
 [lints]
 workspace = true
