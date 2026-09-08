@@ -78,6 +78,10 @@ pub enum Frame {
   },
 }
 
+/// Format: RFC 9000 §19.1 — the PADDING frame is a single zero byte with no content; the decoder
+/// consumes it and moves on. slates uses it to pad a packet up to the length header protection needs
+/// to sample (RFC 9001 §5.4.2), so a small packet (an acknowledgement alone) is still protectable.
+const KIND_PADDING: u8 = 0;
 /// Format: the frame-kind tags on the wire.
 const KIND_STREAM: u8 = 1;
 /// Format: the acknowledgement frame kind.
@@ -144,6 +148,10 @@ pub fn decode_frames(bytes: &[u8]) -> Result<Vec<Frame>, SessionError> {
   let mut frames = Vec::new();
   while !reader.is_empty() {
     let kind = reader.u8().map_err(|_| SessionError::Truncated)?;
+    // PADDING (RFC 9000 §19.1): a lone zero byte, consumed with no frame produced.
+    if kind == KIND_PADDING {
+      continue;
+    }
     let frame = match kind {
       KIND_STREAM => {
         let stream_id = reader.u64().map_err(|_| SessionError::Truncated)?;
@@ -223,6 +231,19 @@ mod tests {
   #[test]
   fn an_empty_payload_decodes_to_no_frames() {
     assert_eq!(decode_frames(&[]), Ok(Vec::new()));
+  }
+
+  /// PADDING bytes (zeros) around a real frame are skipped, leaving the real frame intact — the
+  /// property header protection relies on to pad a small packet up to a sampleable length.
+  #[test]
+  fn padding_bytes_are_skipped() {
+    let real = Frame::MaxData { max: 5 };
+    let mut wire = vec![0u8, 0, 0]; // leading PADDING
+    wire.extend_from_slice(&encode_frames(std::slice::from_ref(&real)));
+    wire.extend_from_slice(&[0u8; 5]); // trailing PADDING
+    assert_eq!(decode_frames(&wire), Ok(vec![real]));
+    // Padding alone decodes to nothing.
+    assert_eq!(decode_frames(&[0u8; 16]), Ok(Vec::new()));
   }
 
   /// Hostile inputs are typed refusals, never panics (§4.10a hostile-input rule).

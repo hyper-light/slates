@@ -135,14 +135,18 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    testable at N=1); io_uring/IOCP register-readable are typed-owed.
 4. **`slates-quic`** — **built:** the frame codec (4a), ordered streams both sides (4b), the
    reliability core / ACK+loss recovery (4c), the flow-control credit law (4d), the
-   `rustls::quic` TLS 1.3 handshake with pinned-identity auth (4e), and the **live `Endpoint`** (4f,
+   `rustls::quic` TLS 1.3 handshake with pinned-identity auth (4e), the packet-number codec (4g,
+   `packet_number.rs`; RFC 9000 §17.1 + App. A, oracle-tested), and the **live `Endpoint`** (4f,
    `endpoint.rs`) that drives the handshake to the 1-RTT keys over the `rt` UDP socket, protects each
-   packet's frames with those keys (AAD = a plaintext packet-number header), and carries a stream end
-   to end — proven by the N=1 live-session integration test (`tests/session.rs`: two endpoints hand-
-   shake over the sim UDP fabric, the client sends a stream, the server reassembles it byte-for-byte).
+   packet to full RFC 9001 shape — an RFC 9000 short header (§17.3) carrying a truncated packet number,
+   payload AEAD with that header as associated data, and **header protection** (§5.4) masking the first
+   byte and packet-number field — and carries a stream end to end. Proven by the N=1 live-session
+   integration test (`tests/session.rs`: two endpoints handshake over the sim UDP fabric, the client
+   sends a stream, the server reassembles it byte-for-byte) and unit tests that header protection
+   genuinely masks the header (non-vacuity) and a tampered packet is refused.
    **Owed on the connection:** wiring the reliability (`conn.rs`) and flow-credit (`flow.rs`) frames
-   into the endpoint loop, header protection (the packet-number header is plaintext today), congestion
-   control, multi-range ACKs, multiplexing many streams, and loom on the state machine.
+   into the endpoint loop, congestion control, multi-range ACKs, connection IDs, multiplexing many
+   streams, and loom on the state machine.
    The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c);
    its fencing step and the `Keyring`'s population ride membership/enrollment.
 5. **Register/placement wiring** — owed: §4.8 head + merge-record registers and D-14 placement ride
@@ -203,9 +207,11 @@ hecate `WIRE_SECURITY.md` to slates's D-15 (TLS 1.3, not Noise). **Ratify before
 > Draft to ratify (2026-09-08): the framing decisions below are architecture-level (Ada's to
 > ratify). The **frame codec** is built as the pure foundation (`crates/transport/src/session.rs`),
 > as the control-datagram codec was; the ordered streams (4b), reliability/ACK/loss (4c), flow-credit
-> law (4d), `rustls::quic` TLS 1.3 handshake (4e), and the live `Endpoint` that wires the handshake,
-> packet protection, and a stream together over the UDP socket (4f, `endpoint.rs` + `tests/session.rs`)
-> are built; congestion, header protection, and multi-stream multiplexing remain.
+> law (4d), `rustls::quic` TLS 1.3 handshake (4e), the packet-number codec (4g, `packet_number.rs`),
+> and the live `Endpoint` that wires the handshake, full RFC 9001 packet protection (short header +
+> truncated packet number + payload AEAD + **header protection**), and a stream together over the UDP
+> socket (4f, `endpoint.rs` + `tests/session.rs`) are built; congestion control, connection IDs, and
+> multi-stream multiplexing remain.
 
 slates's session plane carries every **reliable** class (version chains, merge records, content
 transfer, cross-region). It is an owned RFC 9000/9002-shaped dialect — adapting hecate-quic's

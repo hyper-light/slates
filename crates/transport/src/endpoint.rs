@@ -4,24 +4,46 @@
 //! `handshake.rs`) and carries a stream over the wire. This is the session-plane analogue of the
 //! control plane's `plane.rs`.
 //!
-//! Scope of this slice (the smallest live session): the handshake over UDP, 1-RTT packet protection
-//! (a plaintext packet-number header as AAD + payload AEAD — **header protection is owed**, an
-//! obfuscation atop the AEAD), and one stream carried end to end. Reliability/ACK/loss (`conn.rs`)
-//! and flow-control credit updates (`flow.rs`) are built and unit-composed; wiring their frames into
-//! this loop, congestion, and multiplexing many streams are the remaining connection work. The
-//! `Arc` here is rustls's config (D-8 exception 2), confined to `crate::handshake`.
+//! Scope of this slice (the smallest live session): the handshake over UDP, full 1-RTT packet
+//! protection to RFC 9001 shape — an RFC 9000 short header (§17.3) carrying a truncated packet number
+//! (`crate::packet_number`), payload AEAD with that header as associated data, and **header protection**
+//! (§5.4) masking the first byte and the packet-number field — and one stream carried end to end.
+//! Reliability/ACK/loss (`conn.rs`) and flow-control credit updates (`flow.rs`) are built and
+//! unit-composed; wiring their frames into this loop, congestion, connection IDs, and multiplexing
+//! many streams are the remaining connection work. The `Arc` here is rustls's config (D-8 exception 2),
+//! confined to `crate::handshake`.
 
 use rustix::net::SocketAddrV4;
 use rustls::quic::{ClientConnection, KeyChange, Keys, ServerConnection};
 use slates_rt::udp::UdpSocket;
 
 use crate::handshake::{HandshakeError, Identity, client_connection, server_connection};
+use crate::packet_number::{MAX_PACKET_NUMBER_BYTES, decode_packet_number, encode_packet_number};
 use crate::session::{Frame, decode_frames, encode_frames};
 use crate::stream::{StreamAssembler, StreamSender};
 
-/// The packet-number header size (bytes): the plaintext short-header this slice uses as the AEAD's
-/// additional data. Header protection (obfuscating it) is owed.
-const HEADER_BYTES: usize = size_of::<u64>();
+/// Format: RFC 9000 §17.3 — bit 6 of a short-header first byte, always 1 ("fixed bit"); a packet with
+/// it clear is not a valid short header.
+const FIXED_BIT: u8 = 0x40;
+/// Format: RFC 9000 §17.3, §17.3.1 — bits 3-4 of a short-header first byte are reserved and MUST be 0
+/// once header protection is removed; a non-zero value there is a protocol error.
+const SHORT_HEADER_RESERVED_MASK: u8 = 0x18;
+/// Format: RFC 9000 §17.3 — bits 0-1 of a short-header first byte carry the packet-number length minus
+/// one, so a stored 0..=3 means a 1..=4 byte field.
+const PACKET_NUMBER_LENGTH_MASK: u8 = 0x03;
+/// Shape: this slice binds one UDP socket to one peer, so a packet needs no connection ID to tell
+/// connections apart; the destination connection ID is therefore zero-length. A non-zero ID (for
+/// connection migration, or several connections on one socket) is owed.
+const CONNECTION_ID_BYTES: usize = 0;
+/// The offset of the packet-number field: past the single first byte and the connection ID.
+/// Format: RFC 9000 §17.3 short-header layout.
+const PACKET_NUMBER_OFFSET: usize = 1 + CONNECTION_ID_BYTES;
+/// The offset at which header protection samples the ciphertext.
+/// Format: RFC 9001 §5.4.2 — the sample begins four bytes into the packet-number field (as if the
+/// number were the maximum four bytes), so both ends sample the same bytes whatever the field's real
+/// length. Derived from the packet-number offset and the maximum field width.
+const HEADER_PROTECTION_SAMPLE_OFFSET: usize =
+  PACKET_NUMBER_OFFSET + MAX_PACKET_NUMBER_BYTES as usize;
 
 /// The handshake turn ceiling: the most drain-send-receive turns `establish` takes before it refuses
 /// a stuck handshake with `NotReady`, so the loop is bounded (banned item 8 — no unbounded loop). It
@@ -41,8 +63,11 @@ pub enum EndpointError {
   Tls(rustls::Error),
   /// The UDP socket refused.
   Io(slates_rt::error::RtError),
-  /// A packet arrived before the handshake produced keys, or was too short to carry a header.
+  /// A packet arrived before the handshake produced keys, or was too short to sample for header
+  /// protection.
   NotReady,
+  /// A received short header was malformed once unprotected (fixed bit clear, or a reserved bit set).
+  Header,
   /// The frames inside a packet did not decode.
   Frames(crate::session::SessionError),
 }
@@ -86,13 +111,17 @@ impl Quic {
 }
 
 /// One end of a session: the UDP socket, the peer, the QUIC handshake state, the 1-RTT keys once
-/// established, and the outgoing packet-number counter.
+/// established, the outgoing packet-number counter, the largest number acknowledged by the peer (which
+/// sizes the truncated field the sender writes), and the largest number received (against which the
+/// receiver reconstructs a truncated number).
 pub struct Endpoint {
   socket: UdpSocket,
   peer: SocketAddrV4,
   quic: Quic,
   keys: Option<Keys>,
   tx_pn: u64,
+  tx_largest_acked: Option<u64>,
+  rx_largest: u64,
 }
 
 impl Endpoint {
@@ -111,6 +140,8 @@ impl Endpoint {
       quic: Quic::Client(client),
       keys: None,
       tx_pn: 0,
+      tx_largest_acked: None,
+      rx_largest: 0,
     })
   }
 
@@ -127,6 +158,8 @@ impl Endpoint {
       quic: Quic::Server(server),
       keys: None,
       tx_pn: 0,
+      tx_largest_acked: None,
+      rx_largest: 0,
     })
   }
 
@@ -171,38 +204,22 @@ impl Endpoint {
     }
   }
 
-  /// Protects `frames` into a packet: a plaintext packet-number header (the AAD) then the AEAD of the
-  /// frame bytes under the local 1-RTT key. Advances the packet number.
+  /// Protects `frames` into a packet under the local 1-RTT keys, advancing the packet number and
+  /// sizing the truncated number against what the peer has acknowledged.
   fn protect(&mut self, frames: &[Frame]) -> Result<Vec<u8>, EndpointError> {
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
     let pn = self.tx_pn;
     self.tx_pn = self.tx_pn.saturating_add(1);
-    let header = pn.to_le_bytes();
-    let mut payload = encode_frames(frames);
-    let tag = keys
-      .local
-      .packet
-      .encrypt_in_place(pn, &header, &mut payload)?;
-    let mut datagram = header.to_vec();
-    datagram.extend_from_slice(&payload);
-    datagram.extend_from_slice(tag.as_ref());
-    Ok(datagram)
+    protect_packet(keys, pn, self.tx_largest_acked, frames)
   }
 
-  /// Unprotects a received packet into its frames: reads the packet-number header, then AEAD-opens
-  /// the rest under the remote 1-RTT key.
-  fn unprotect(&self, datagram: &[u8]) -> Result<Vec<Frame>, EndpointError> {
+  /// Unprotects a received packet under the remote 1-RTT keys and records its number as the largest
+  /// received (so the next reconstruction has the right reference).
+  fn unprotect(&mut self, datagram: &[u8]) -> Result<Vec<Frame>, EndpointError> {
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
-    if datagram.len() < HEADER_BYTES {
-      return Err(EndpointError::NotReady);
-    }
-    let (header, rest) = datagram.split_at(HEADER_BYTES);
-    let mut pn_bytes = [0u8; HEADER_BYTES];
-    pn_bytes.copy_from_slice(header);
-    let pn = u64::from_le_bytes(pn_bytes);
-    let mut buf = rest.to_vec();
-    let plaintext = keys.remote.packet.decrypt_in_place(pn, header, &mut buf)?;
-    decode_frames(plaintext).map_err(EndpointError::Frames)
+    let (pn, frames) = unprotect_packet(keys, self.rx_largest, datagram)?;
+    self.rx_largest = self.rx_largest.max(pn);
+    Ok(frames)
   }
 
   /// Sends `data` as one stream (id `stream_id`), framed within a generous credit at a frame cap and
@@ -248,5 +265,219 @@ impl Endpoint {
       received.extend_from_slice(&assembler.read());
     }
     Ok(received)
+  }
+}
+
+/// Protects `frames` into a packet to RFC 9001 shape under `keys` (pure — no socket, no state). Builds
+/// a short header (fixed bit set, the packet-number length in its low bits) carrying `pn` truncated to
+/// the fewest bytes `largest_acked` allows, pads the frame bytes up to the length header protection
+/// needs to sample, AEAD-seals them under the local 1-RTT packet key with that header as associated
+/// data, then masks the first byte and the packet-number field with the local header-protection key.
+fn protect_packet(
+  keys: &Keys,
+  pn: u64,
+  largest_acked: Option<u64>,
+  frames: &[Frame],
+) -> Result<Vec<u8>, EndpointError> {
+  // The short header: fixed bit set, spin/reserved/key-phase zero, low bits = packet-number length.
+  let encoded = encode_packet_number(pn, largest_acked);
+  let pn_len = encoded.len();
+  let first_byte = FIXED_BIT | u8::try_from(pn_len - 1).unwrap_or(0);
+  let mut packet = Vec::with_capacity(PACKET_NUMBER_OFFSET + pn_len);
+  packet.push(first_byte);
+  packet.extend_from_slice(encoded.as_slice());
+  let header_len = packet.len();
+
+  // The frame bytes, padded (RFC 9000 §19.1 PADDING = zero bytes) so the packet is long enough that
+  // header protection can sample the ciphertext even without counting the tag.
+  let sample_len = keys.local.header.sample_len();
+  let mut payload = encode_frames(frames);
+  let min_payload = (HEADER_PROTECTION_SAMPLE_OFFSET + sample_len).saturating_sub(header_len);
+  if payload.len() < min_payload {
+    payload.resize(min_payload, 0);
+  }
+
+  // AEAD-seal the payload with the plaintext header as associated data, then assemble the packet.
+  let tag = keys
+    .local
+    .packet
+    .encrypt_in_place(pn, &packet, &mut payload)?;
+  packet.extend_from_slice(&payload);
+  packet.extend_from_slice(tag.as_ref());
+
+  // Apply header protection: sample the ciphertext, mask the first byte and packet-number field.
+  let (head, tail) = packet.split_at_mut(HEADER_PROTECTION_SAMPLE_OFFSET);
+  let sample = &tail[..sample_len];
+  let (first, number) = head.split_at_mut(PACKET_NUMBER_OFFSET);
+  keys
+    .local
+    .header
+    .encrypt_in_place(sample, &mut first[0], number)?;
+  Ok(packet)
+}
+
+/// Unprotects a received packet to RFC 9001 shape under `keys`, returning the reconstructed packet
+/// number and the frames (pure — no socket, no state). Removes header protection (sampling the still-
+/// encrypted ciphertext to unmask the first byte and packet-number field), validates the short header,
+/// reconstructs the full number against `rx_largest`, then AEAD-opens the payload under the remote
+/// 1-RTT key with the unmasked header as associated data.
+fn unprotect_packet(
+  keys: &Keys,
+  rx_largest: u64,
+  datagram: &[u8],
+) -> Result<(u64, Vec<Frame>), EndpointError> {
+  let sample_len = keys.remote.header.sample_len();
+  if datagram.len() < HEADER_PROTECTION_SAMPLE_OFFSET + sample_len {
+    return Err(EndpointError::NotReady);
+  }
+  let mut packet = datagram.to_vec();
+
+  // Remove header protection: the packet-number field is unknown length, so hand the masker the full
+  // maximum-width span; it unmasks the first byte, reads the length, and unmasks exactly that many.
+  let (head, tail) = packet.split_at_mut(HEADER_PROTECTION_SAMPLE_OFFSET);
+  let sample = &tail[..sample_len];
+  let (first, number) = head.split_at_mut(PACKET_NUMBER_OFFSET);
+  keys
+    .remote
+    .header
+    .decrypt_in_place(sample, &mut first[0], number)?;
+
+  // Validate the now-plaintext short header.
+  let first_byte = packet[0];
+  if first_byte & FIXED_BIT == 0 || first_byte & SHORT_HEADER_RESERVED_MASK != 0 {
+    return Err(EndpointError::Header);
+  }
+  let pn_len = usize::from((first_byte & PACKET_NUMBER_LENGTH_MASK) + 1);
+  let header_len = PACKET_NUMBER_OFFSET + pn_len;
+  let pn = decode_packet_number(rx_largest, &packet[PACKET_NUMBER_OFFSET..header_len]);
+
+  // AEAD-open the payload with the unmasked header as associated data.
+  let aad = packet[..header_len].to_vec();
+  let mut buf = packet[header_len..].to_vec();
+  let plaintext = keys.remote.packet.decrypt_in_place(pn, &aad, &mut buf)?;
+  let frames = decode_frames(plaintext).map_err(EndpointError::Frames)?;
+  Ok((pn, frames))
+}
+
+#[cfg(test)]
+mod tests {
+  // Test harness: an unwrap here is a failed test.
+  #![allow(clippy::unwrap_used)]
+
+  use rustls::pki_types::PrivateKeyDer;
+
+  use super::*;
+  use crate::handshake::{Identity, connect};
+
+  /// A fresh self-signed identity, minted with `ring` via `rcgen`.
+  fn self_signed(name: &str) -> Identity {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec![name.to_owned()])
+      .unwrap()
+      .self_signed(&key)
+      .unwrap();
+    Identity::from_der(
+      cert.der().clone(),
+      PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+    )
+  }
+
+  /// Drives an in-process handshake to the 1-RTT keys, returning `(client_keys, server_keys)` so the
+  /// packet-protection functions can be exercised without a socket. (The direction is: the client's
+  /// local packet key equals the server's remote packet key, so a client-protected packet opens with
+  /// the server's keys.)
+  fn handshake_keys() -> (Keys, Keys) {
+    let identity = self_signed("slates-node");
+    let (mut client, mut server) = connect(&identity, "slates-node").unwrap();
+    let mut client_keys = None;
+    let mut server_keys = None;
+    for _ in 0..HANDSHAKE_TURN_CEILING {
+      if !client.is_handshaking() && !server.is_handshaking() {
+        break;
+      }
+      let mut to_server = Vec::new();
+      if let Some(KeyChange::OneRtt { keys, .. }) = client.write_hs(&mut to_server) {
+        client_keys = Some(keys);
+      }
+      if !to_server.is_empty() {
+        server.read_hs(&to_server).unwrap();
+      }
+      let mut to_client = Vec::new();
+      if let Some(KeyChange::OneRtt { keys, .. }) = server.write_hs(&mut to_client) {
+        server_keys = Some(keys);
+      }
+      if !to_client.is_empty() {
+        client.read_hs(&to_client).unwrap();
+      }
+    }
+    (client_keys.unwrap(), server_keys.unwrap())
+  }
+
+  /// The plaintext short header a given packet number would have with no header protection, for the
+  /// non-vacuity comparison below.
+  fn plaintext_header(pn: u64) -> Vec<u8> {
+    let encoded = encode_packet_number(pn, None);
+    let mut header = vec![FIXED_BIT | u8::try_from(encoded.len() - 1).unwrap()];
+    header.extend_from_slice(encoded.as_slice());
+    header
+  }
+
+  /// AC (§4.10a §8): a packet protected under the local keys opens under the peer's remote keys,
+  /// recovering the number and frames — across several packet numbers, so the truncated-number path is
+  /// exercised — and header protection genuinely masks the header. The masking check is the
+  /// non-vacuity counter (CLAUDE.md §4): a silently dead header-protection path would leave every wire
+  /// header equal to its plaintext, which this asserts never happens across the whole run.
+  #[test]
+  fn header_protection_masks_and_the_packet_round_trips() {
+    let (client_keys, server_keys) = handshake_keys();
+    // A deliberately tiny frame so the packet must be padded up to the sampleable length.
+    let frames = vec![Frame::MaxData { max: 0x0102_0304 }];
+
+    let mut any_masked = false;
+    let mut rx_largest = 0u64;
+    for pn in 0..8u64 {
+      let wire = protect_packet(&client_keys, pn, None, &frames).unwrap();
+      let plain = plaintext_header(pn);
+      if wire[..plain.len()] != plain[..] {
+        any_masked = true;
+      }
+      let (got_pn, got_frames) = unprotect_packet(&server_keys, rx_largest, &wire).unwrap();
+      assert_eq!(got_pn, pn, "reconstructed packet number");
+      assert_eq!(got_frames, frames, "recovered frames");
+      rx_largest = rx_largest.max(got_pn);
+    }
+    assert!(
+      any_masked,
+      "header protection never changed any header — a dead masking path"
+    );
+  }
+
+  /// AC (§4.10a §8, hostile): a packet with a flipped payload byte fails to open (the AEAD tag catches
+  /// it), and a packet too short to sample is refused — never a panic, never a silent accept.
+  #[test]
+  fn a_tampered_or_short_packet_is_refused() {
+    let (client_keys, server_keys) = handshake_keys();
+    let frames = vec![Frame::Stream {
+      stream_id: 1,
+      offset: 0,
+      fin: true,
+      data: b"payload".to_vec(),
+    }];
+    let wire = protect_packet(&client_keys, 3, None, &frames).unwrap();
+
+    // Flip the last byte (inside the AEAD tag): opening must fail.
+    let mut tampered = wire.clone();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0x01;
+    assert!(
+      unprotect_packet(&server_keys, 0, &tampered).is_err(),
+      "a tampered packet must not open"
+    );
+
+    // A packet shorter than the header-protection sample is refused as not-ready, not a panic.
+    assert!(matches!(
+      unprotect_packet(&server_keys, 0, &wire[..4]),
+      Err(EndpointError::NotReady)
+    ));
   }
 }

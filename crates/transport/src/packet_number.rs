@@ -15,8 +15,9 @@
 
 /// The most bytes a packet number occupies on the wire.
 /// Format: RFC 9000 §17.1 — the packet number field is 1 to 4 bytes; its length is carried in the two
-/// low bits of the (header-protected) first header byte. A protocol constant, not a tunable.
-const MAX_PACKET_NUMBER_BYTES: u32 = 4;
+/// low bits of the (header-protected) first header byte. A protocol constant, not a tunable. Public so
+/// the header codec derives its header-protection sample offset from the same source (RFC 9001 §5.4.2).
+pub const MAX_PACKET_NUMBER_BYTES: u32 = 4;
 
 /// The QUIC packet-number space ceiling: numbers live in `[0, 2^62)`.
 /// Format: RFC 9000 §17.1 — "packet numbers ... an integer in the range 0 to 2^62-1". A protocol
