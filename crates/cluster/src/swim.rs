@@ -338,7 +338,8 @@ pub async fn serve_probe(
   endpoint
     .serve_once(|request| match SwimMessage::decode(&request) {
       Ok(message) => {
-        detector.apply_gossip(message.gossip());
+        // Fold in the sender's gossip, counting the sender as a confirmer of any suspicion it carries.
+        detector.apply_gossip_from(message.from(), message.gossip());
         let gossip = detector.gossip(gossip_fanout);
         SwimMessage::Ack {
           from: local,

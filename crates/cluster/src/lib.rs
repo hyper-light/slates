@@ -31,6 +31,7 @@
 
 pub mod config_group;
 pub mod detector;
+pub(crate) mod fixed;
 pub mod membership;
 pub mod raft;
 pub mod swim;

@@ -81,6 +81,8 @@ fn timing() -> DetectorTiming {
     suspicion_periods: 2,
     gossip_transmits: 3,
     health_max: 0,
+    suspicion_min: 2,
+    confirmations_expected: 1,
   }
 }
 

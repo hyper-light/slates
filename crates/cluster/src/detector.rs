@@ -12,11 +12,14 @@
 //! local-health multiplier** (a bounded score, raised when the node's own probes fail or it is falsely
 //! suspected and lowered when they succeed, that dilates the suspicion window — and, through
 //! [`health_multiplier`](Detector::health_multiplier), the caller's probe cadence — so a node that
-//! itself looks unhealthy is slower to declare others dead). Owed: the confirmation-count suspicion
-//! timeout `max − (max−min)·log(C+1)/log(K+1)` (the timeout shrinks as independent peers confirm a
-//! suspicion) and randomized (rather than round-robin) probe order.
+//! itself looks unhealthy is slower to declare others dead); and the **confirmation-count suspicion
+//! timeout** `max − (max−min)·log(C+1)/log(K+1)` (the window shrinks from the base toward its floor as
+//! `C` distinct peers independently suspect a member — corroboration declares a real failure sooner while
+//! a lone suspicion waits the full window; the logarithm is computed in deterministic fixed point,
+//! [`crate::fixed`]). The two window mechanisms compose: corroboration shortens it, local ill-health
+//! lengthens it. Owed: randomized (rather than round-robin) probe order.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use slates_db::register::HostId;
 
@@ -62,6 +65,14 @@ pub struct DetectorTiming {
   /// probe cadence) may be dilated when the local node itself looks unhealthy. Derived (bounded) so a
   /// degraded node backs off without stalling detection forever.
   pub health_max: u32,
+  /// The floor of the suspicion window: the fewest periods a member stays suspected even when its
+  /// failure is fully corroborated, from the confirmation-count timeout `max − (max−min)·log(C+1)/log(K+1)`
+  /// (§4.8). Set equal to `suspicion_periods` to switch the confirmation curve off. Derived from RTT.
+  pub suspicion_min: u32,
+  /// The number of independent suspicions (`K`) at which the suspicion window reaches its floor — the
+  /// count of confirming peers that makes a failure certain enough to declare sooner. Derived from the
+  /// indirect-probe fan-out.
+  pub confirmations_expected: u32,
 }
 
 /// The failure detector for one node: it owns the node's [`Membership`] view, a round-robin cursor
@@ -78,6 +89,7 @@ pub struct Detector {
   probing: Option<HostId>,
   acked: bool,
   suspicion: BTreeMap<HostId, u32>,
+  confirmations: BTreeMap<HostId, BTreeSet<HostId>>,
   gossip: BTreeMap<HostId, (MemberState, u32)>,
   health: u32,
   timing: DetectorTiming,
@@ -96,6 +108,7 @@ impl Detector {
       probing: None,
       acked: false,
       suspicion: BTreeMap::new(),
+      confirmations: BTreeMap::new(),
       gossip: BTreeMap::new(),
       health: 0,
       timing,
@@ -121,14 +134,25 @@ impl Detector {
     self.health = self.health.saturating_sub(1);
   }
 
-  /// The effective suspicion window this period: the base window dilated by the local-health multiplier
-  /// (§4.8; Lifeguard). At full health it is the base; when the node looks unhealthy it widens, so the
-  /// node does not mass-declare peers dead on its own degradation.
-  fn suspicion_window(&self) -> u32 {
-    self
-      .timing
-      .suspicion_periods
-      .saturating_mul(self.health_multiplier())
+  /// The effective suspicion window for a member with `confirmations` independent suspicions this period
+  /// (§4.8): the confirmation-count timeout `max − (max−min)·log(C+1)/log(K+1)` — shrinking from the base
+  /// window toward the floor as independent peers corroborate the failure — then dilated by the Lifeguard
+  /// local-health multiplier (a node that itself looks unhealthy waits longer before declaring a peer
+  /// dead). The two mechanisms compose: corroboration shortens the wait, local ill-health lengthens it.
+  fn suspicion_window(&self, confirmations: u64) -> u32 {
+    let corroborated = crate::fixed::suspicion_window(
+      confirmations,
+      self.timing.suspicion_periods,
+      self.timing.suspicion_min,
+      self.timing.confirmations_expected,
+    );
+    corroborated.saturating_mul(self.health_multiplier())
+  }
+
+  /// Records that `by` suspects `subject` — a distinct confirmer that shortens `subject`'s suspicion
+  /// window through the confirmation-count timeout. Only tracked while `subject` is actually suspected.
+  fn confirm(&mut self, subject: HostId, by: HostId) {
+    self.confirmations.entry(subject).or_default().insert(by);
   }
 
   /// Applies a membership update and enqueues the resulting change for gossip dissemination.
@@ -191,6 +215,22 @@ impl Detector {
     }
   }
 
+  /// Applies a received gossip batch that arrived **from** `sender`, folding each update into the view
+  /// and, for every `Suspect` it carries, recording `sender` as an independent confirmer of that
+  /// suspicion — so a failure many peers suspect is declared dead sooner (the confirmation-count timeout,
+  /// §4.8). A `sender` that holds and gossips a suspicion is corroborating it; the count is of distinct
+  /// senders, so re-hearing the same sender does not inflate it.
+  pub fn apply_gossip_from(&mut self, sender: HostId, updates: &[(HostId, MemberState)]) {
+    for &(subject, state) in updates {
+      self.apply(subject, state);
+      if state.liveness == Liveness::Suspect
+        && self.membership.state(subject).map(|s| s.liveness) == Some(Liveness::Suspect)
+      {
+        self.confirm(subject, sender);
+      }
+    }
+  }
+
   /// The membership view this detector maintains.
   pub fn membership(&self) -> &Membership {
     &self.membership
@@ -217,6 +257,7 @@ impl Detector {
       && state.liveness == Liveness::Alive
     {
       self.suspicion.remove(&member);
+      self.confirmations.remove(&member);
     }
     change
   }
@@ -245,6 +286,8 @@ impl Detector {
               incarnation: current.incarnation,
             },
           );
+          // We are the first confirmer of this suspicion.
+          self.confirm(target, self.local);
         }
       }
     }
@@ -304,16 +347,20 @@ impl Detector {
     }
   }
 
-  /// Ages each suspected member's counter by one period; a member suspected for the whole suspicion
-  /// window — the base window dilated by the current local-health multiplier — is declared dead (at the
-  /// incarnation it was suspected under), and counters for members no longer suspected (refuted or
-  /// already dead) are dropped.
+  /// Ages each suspected member's counter by one period; a member suspected for its whole suspicion
+  /// window — the confirmation-count timeout for how many independent peers suspect it, dilated by the
+  /// local-health multiplier — is declared dead (at the incarnation it was suspected under). Counters and
+  /// confirmations for members no longer suspected (refuted or already dead) are dropped.
   fn age_suspicions(&mut self) {
-    let window = self.suspicion_window();
     let suspects = self.membership.suspects();
     let suspect_ids: Vec<HostId> = suspects.iter().map(|(host, _)| *host).collect();
     self.suspicion.retain(|host, _| suspect_ids.contains(host));
+    self
+      .confirmations
+      .retain(|host, _| suspect_ids.contains(host));
     for (host, incarnation) in suspects {
+      let confirmations = self.confirmations.get(&host).map_or(0, BTreeSet::len);
+      let window = self.suspicion_window(u64::try_from(confirmations).unwrap_or(u64::MAX));
       let periods = self.suspicion.entry(host).or_insert(0);
       *periods = periods.saturating_add(1);
       if *periods >= window {
@@ -325,6 +372,7 @@ impl Detector {
           },
         );
         self.suspicion.remove(&host);
+        self.confirmations.remove(&host);
       }
     }
   }
@@ -359,14 +407,17 @@ mod tests {
   const B: HostId = HostId(3);
   const C: HostId = HostId(4);
 
-  /// Timing for the pure-SWIM tests: the given suspicion window and gossip transmits, with the
-  /// Lifeguard local-health multiplier disabled (`health_max = 0`, so the multiplier stays 1) — those
-  /// tests exercise probing, suspicion and gossip in isolation. The LHM tests set `health_max` directly.
+  /// Timing for the pure-SWIM tests: the given suspicion window and gossip transmits, with the Lifeguard
+  /// local-health multiplier disabled (`health_max = 0`) and the confirmation curve off (the floor equals
+  /// the ceiling), so those tests exercise probing, suspicion and gossip in isolation. The LHM tests set
+  /// `health_max` and the confirmation test sets `suspicion_min` directly.
   fn timing(suspicion_periods: u32, gossip_transmits: u32) -> DetectorTiming {
     DetectorTiming {
       suspicion_periods,
       gossip_transmits,
       health_max: 0,
+      suspicion_min: suspicion_periods,
+      confirmations_expected: 1,
     }
   }
 
@@ -537,6 +588,8 @@ mod tests {
         suspicion_periods: 10,
         gossip_transmits: 2,
         health_max: 3,
+        suspicion_min: 10,
+        confirmations_expected: 1,
       },
     );
     assert_eq!(
@@ -579,6 +632,8 @@ mod tests {
         suspicion_periods: 10,
         gossip_transmits: 2,
         health_max: 2,
+        suspicion_min: 10,
+        confirmations_expected: 1,
       },
     );
     detector.join(A);
@@ -608,6 +663,8 @@ mod tests {
         suspicion_periods: 1,
         gossip_transmits: 2,
         health_max: 3,
+        suspicion_min: 1,
+        confirmations_expected: 1,
       },
     );
     // Make the node unhealthy through self-refutations, so its window dilates past one period.
@@ -632,6 +689,52 @@ mod tests {
       detector.membership().state(A).map(|s| s.liveness),
       Some(Liveness::Suspect),
       "the dilated window keeps A in doubt past the base window rather than declaring it dead"
+    );
+  }
+
+  /// The confirmation-count timeout (§4.8): a suspicion many peers independently corroborate is declared
+  /// dead sooner than a lone one. With a base window of six and a floor of two reached at three
+  /// confirmations, a suspicion confirmed by two more peers dies at the floor, while the same suspicion
+  /// held alone is still merely suspected at that point.
+  #[test]
+  fn a_corroborated_suspicion_dies_sooner_than_a_lone_one() {
+    let timing = DetectorTiming {
+      suspicion_periods: 6,
+      gossip_transmits: 2,
+      health_max: 0,
+      suspicion_min: 2,
+      confirmations_expected: 3,
+    };
+
+    // Corroborated: two peers confirm the suspicion, shrinking the window to its floor of two.
+    let mut corroborated = Detector::new(LOCAL, timing);
+    corroborated.join(A);
+    corroborated.tick(); // probe A
+    corroborated.tick(); // A unanswered → suspected (one confirmer: self)
+    let incarnation = corroborated.membership().state(A).unwrap().incarnation;
+    let suspect = MemberState {
+      liveness: Liveness::Suspect,
+      incarnation,
+    };
+    corroborated.apply_gossip_from(B, &[(A, suspect)]);
+    corroborated.apply_gossip_from(C, &[(A, suspect)]);
+    corroborated.tick(); // window is now two; the second aged period declares A dead
+    assert_eq!(
+      corroborated.membership().state(A).map(|s| s.liveness),
+      Some(Liveness::Dead),
+      "a corroborated failure is declared dead at the floor"
+    );
+
+    // Lone: only this node suspects A, so the full window applies and A is still merely suspected.
+    let mut lone = Detector::new(LOCAL, timing);
+    lone.join(A);
+    lone.tick();
+    lone.tick(); // suspected
+    lone.tick(); // still within the full window of four
+    assert_eq!(
+      lone.membership().state(A).map(|s| s.liveness),
+      Some(Liveness::Suspect),
+      "a lone suspicion waits the full, unshrunk window"
     );
   }
 }
