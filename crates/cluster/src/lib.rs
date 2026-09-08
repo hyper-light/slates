@@ -20,6 +20,11 @@
 //! and a deadline reached after partial acceptance is reported as **uncertain** — it never claims the
 //! write did not happen, and the record's identity is unchanged so a retry is idempotent at the holders
 //! that already accepted (§4.8 "network receipt is not acceptance"; a retry preserves record identity).
+//!
+//! Membership ([`membership`]): the SWIM/Lifeguard failure-detection view that maintains which hosts
+//! are alive — the neighbourhood the configuration and placement draw from.
+
+pub mod membership;
 
 use std::sync::mpsc::{TryRecvError, channel};
 
