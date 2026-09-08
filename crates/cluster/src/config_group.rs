@@ -18,9 +18,15 @@
 //! the group reassigns the volume to the rendezvous-first survivor, bumps the host epoch, and advances
 //! the generation, so a resumed stale owner is fenced (by the advanced configuration generation in this
 //! single-generation model — `ConfigurationStale`/`ForeignGeneration`). Owed: driving the Raft live over
-//! timers and the transport (this slice drives it sans-io), joint consensus to change the voter set, the
-//! per-host epoch fence of the design's `FencedRegister` (A-9), and the new owner's phase-one recovery
-//! (reading the dead owner's highest records from the holders and adopting the head before serving).
+//! timers and the transport (this slice drives it sans-io) and joint consensus to change the voter set.
+//! The per-host epoch fence and the new owner's phase-one recovery are now **built** for the
+//! transport-driven register — `install_authority`/`prepare`/`promote_over_holders`
+//! ([`slates_db::register`]) and the live `promote_record`/`promote_under_configuration`
+//! ([`crate`]), oracle-tested for Continuity and StaleNeverCommits (single-value registers; the ledger's
+//! committed-prefix adoption over the transport is the generalization, proven in the `slates-db` ledger
+//! simulation and owed here). What remains at this seam is composing them into the takeover flow from
+//! the owner runtime: distributing the taken-over authority to the holders (the `install_authority`
+//! calls) and having the new owner run the promotion before it serves.
 
 use std::mem::size_of;
 
