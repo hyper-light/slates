@@ -6,10 +6,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 readme.workspace = true
-description = "The fleet claims-plane transport (§4.10a, Phase 8): the two-plane UDP wire — the control-datagram codec and its AES-256-GCM seal (key injected; HKDF schedule, enrollment and the owned QUIC session plane owed). Design: docs/wip/fleet-transport.md."
+description = "The fleet claims-plane transport (§4.10a, Phase 8): the two-plane UDP wire — the control-datagram codec, its AES-256-GCM seal, and the HKDF-Expand-Label key schedule (control secret injected; enrollment and the owned QUIC session plane owed). Design: docs/wip/fleet-transport.md."
 
 [dependencies]
 aes-gcm = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
 
 [lints]
 workspace = true

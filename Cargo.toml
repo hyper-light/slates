@@ -61,6 +61,11 @@ blake3 = "1"
 # AEAD; counter nonces mean no RNG, so `getrandom` is off and only the AES backend + `alloc` (the
 # Vec-returning `encrypt`/`decrypt`) are pulled. Vetted primitive — the project never hand-rolls AEAD.
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+# HKDF (RFC 5869) over SHA-256 for the control-plane key schedule (§4.10a §7): HKDF-Expand-Label
+# (RFC 8446 §7.1 labelled form) derives the seal's per-(sender, key_epoch, direction) keys from an
+# enrolled control secret. Vetted RustCrypto crates — key derivation is never hand-rolled.
+hkdf = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode", "frame"] }
 zstd = "0.13"
 # The io_uring syscall wrapper (tokio-rs/io-uring): thin, no reference counting in its core types;

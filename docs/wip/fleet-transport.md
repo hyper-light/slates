@@ -9,12 +9,15 @@
 > QUIC/UDP** — a numbered decision, Ada's to ratify.
 >
 > Built so far (`crates/transport`, `crates/rt`): slice 1 (the wire codec), slice 3 (the `rt` UDP
-> driver, real kqueue/epoll + the deterministic sim fabric), and slice 2(b) (the AES-256-GCM seal —
-> `seal.rs`: `Sealer`/`Opener`, counter nonces, replay/forgery/exhaustion refusals, a golden vector).
-> The seal takes an **injected** key (`from_key`), which is the ratification boundary: no key
-> *schedule* (HKDF over an enrolled secret), no enrollment, and no QUIC session plane has been coded —
-> those are the numbered pieces below that wait on your ratifying this section (the D-15→QUIC/UDP
-> substrate amendment, and the §7 security design that fixes the schedule and the enforcement order).
+> driver, real kqueue/epoll + the deterministic sim fabric), and slice 2 (the crypto): the
+> AES-256-GCM seal (`seal.rs`: `Sealer`/`Opener`, counter nonces, replay/forgery/exhaustion refusals,
+> a golden vector) **and** the HKDF-Expand-Label key schedule (`schedule.rs`: per-channel keys from a
+> control secret, RFC 5869 + RFC 8446 §7.1, RFC known-answer + golden + schedule→seal→open tests).
+> The schedule takes the control secret **injected**, and the seal takes the key **injected** — that
+> injection is the ratification boundary: **enrollment** (the source of the secret and the
+> acceptance-point key lookup, §4.13) and the **QUIC session plane** are not coded, and wait on your
+> ratifying this section (the D-15→QUIC/UDP substrate amendment). Ada authorized proceeding on the
+> crypto 2026-09-08 ("just … do it"); enrollment and QUIC remain the owed subsystems below.
 
 ## 1. Scope and the R8 spine
 
@@ -94,11 +97,14 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
 
 1. **Wire codec** — **built** (`crates/transport/src/lib.rs`): prologue + envelope header + body,
    golden + hostile tests, on every host.
-2. **Control-plane seal** — **the AEAD is built** (`crates/transport/src/seal.rs`): AES-256-GCM under
-   an injected key, the nonce-counter discipline, replay refusal, forgery refusal (the routing
-   prologue bound as AAD), counter-exhaustion refusal, and a golden vector. **Owed** (the ratification
-   boundary): the HKDF key *schedule* that fills the key, and the acceptance-point key lookup
-   (unknown sender ⇒ drop, zero crypto spent) that lives with enrollment.
+2. **Control-plane seal + key schedule** — **built** (`crates/transport/src/seal.rs`,
+   `schedule.rs`): AES-256-GCM under a key the **HKDF-Expand-Label schedule** (RFC 5869 + RFC 8446
+   §7.1, `hkdf`/`sha2`) derives per `(sender, key_epoch, direction)` from an injected control secret;
+   the nonce-counter discipline, replay/forgery/exhaustion refusals, a seal golden vector, the RFC
+   5869 known-answer vector, and a schedule→seal→open end-to-end test. **Owed:** the *source* of the
+   control secret (enrollment, §4.13) and the acceptance-point key lookup (unknown sender ⇒ drop,
+   zero crypto spent) that lives with it — the schedule takes the secret injected, exactly as the
+   seal takes the key injected.
 3. **`rt` UDP driver** — **built** (`crates/rt/src/udp.rs`, `driver.rs`, `sim.rs`): a UDP readiness
    source in kqueue and epoll, plus the deterministic sim fabric (the sim arm, so the whole plane is
    testable at N=1); io_uring/IOCP register-readable are typed-owed.
@@ -142,10 +148,12 @@ hecate `WIRE_SECURITY.md` to slates's D-15 (TLS 1.3, not Noise). **Ratify before
   **fencing check (epoch/term)** → replay window → decode. The HLC bounds the replay window's memory
   (liveness only); **safety rests on the nonce counter + AEAD + fencing**, never the clock. Garbage
   without a key dies at the tag, counted. Identical categorized counters on every path.
-- **Slice 2 (crypto) breakdown:** (a) the key-schedule types + HKDF derivation (test vectors) — **owed**;
-  (b) the AEAD seal/unseal over the codec's plaintext (round-trip, tamper ⇒ typed refusal, nonce-reuse
-  ⇒ typed refusal, golden vectors) — **built** (`seal.rs`, key injected); (c) the enforcement-order
-  parser with the hostile-input suite — **owed** (it needs the key lookup, so it rides enrollment).
+- **Slice 2 (crypto) breakdown:** (a) the key-schedule types + HKDF derivation (test vectors) —
+  **built** (`schedule.rs`: `KeySchedule::from_control_secret`/`seal_key`/`sealer`/`opener`, RFC 5869
+  known-answer + a golden + a schedule→seal→open test; control secret injected); (b) the AEAD
+  seal/unseal over the codec's plaintext (round-trip, tamper ⇒ typed refusal, nonce-reuse ⇒ typed
+  refusal, golden vectors) — **built** (`seal.rs`, key injected); (c) the enforcement-order parser
+  with the hostile-input suite — **owed** (it needs the key *lookup* by sender, so it rides enrollment).
   Key **distribution/enrollment** (the region group admitting a node, minting the control secret) is
   its own slice tied to §4.13/§4.8 membership — the largest remaining piece, and the one most needing
   your review, since it is where identity and authority live. **What (b) deliberately does not do**

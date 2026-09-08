@@ -25,6 +25,7 @@
 //! typed [`FrameError`]/[`seal::SealError`], never a panic — the same discipline as `slates-merge`'s
 //! ops-document decode and `slates-bridge-fuse`'s ABI codec. The codec is pure and tested on every host.
 
+pub mod schedule;
 pub mod seal;
 
 /// The protocol version this build speaks (the floor; negotiation to higher versions is owed with the
