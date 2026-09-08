@@ -30,7 +30,7 @@
 
 use std::mem::size_of;
 
-use slates_db::register::{Configuration, HostEpoch, HostId, rendezvous_first};
+use slates_db::register::{Configuration, HostEpoch, HostId, Quorum, rendezvous_first};
 
 use crate::membership::Membership;
 use crate::raft::RaftNode;
@@ -156,16 +156,31 @@ pub struct ConfigGroup {
 }
 
 impl ConfigGroup {
+  /// A single-owner configuration group at fault tolerance `quorum` — one Raft voter (this `owner`),
+  /// the configuration carrying `quorum` for the **volume neighbourhood** (the candidate holders the
+  /// register path draws from). The voter set stays solo here — it is distinct from the neighbourhood
+  /// the admit/retire commands grow (per this module's contract) — so the lone voter self-elects and
+  /// may propose at once. This is the fleet degenerate the owner runtime ([`crate::fleet::FleetNode`])
+  /// composes; [`solo`](ConfigGroup::solo) is this at `f = 0` (the laptop). `quorum`'s `f` comes from
+  /// the failure-domain tree at deployment (a measured input, §4.8), or from a test's chosen topology.
+  pub fn new(owner: HostId, quorum: Quorum) -> ConfigGroup {
+    let mut raft = RaftNode::new(owner, vec![owner]);
+    let _ = raft.start_election();
+    let mut configuration = Configuration::solo(owner);
+    // The neighbourhood quorum is the only thing that differs from the laptop configuration; the voter
+    // set, version, epoch and (empty) neighbourhood are the same, grown later by reconcile.
+    configuration.quorum = quorum;
+    ConfigGroup {
+      raft,
+      configuration,
+      applied: 0,
+    }
+  }
+
   /// The solo configuration group — one voter, `owner`, `f = 0`, version zero (the laptop degenerate).
   /// The lone voter elects itself leader at once, so it may immediately propose configuration changes.
   pub fn solo(owner: HostId) -> ConfigGroup {
-    let mut raft = RaftNode::new(owner, vec![owner]);
-    let _ = raft.start_election();
-    ConfigGroup {
-      raft,
-      configuration: Configuration::solo(owner),
-      applied: 0,
-    }
+    ConfigGroup::new(owner, Quorum { f: 0 })
   }
 
   /// The current configuration — read per request; a request carrying an older version is refused with
