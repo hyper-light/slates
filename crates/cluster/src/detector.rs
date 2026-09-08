@@ -199,8 +199,11 @@ impl Detector {
     corroborated.saturating_mul(self.health_multiplier())
   }
 
-  /// Records that `by` suspects `subject` — a distinct confirmer that shortens `subject`'s suspicion
-  /// window through the confirmation-count timeout. Only tracked while `subject` is actually suspected.
+  /// Records that `by` — a member *other* than this node's own originating probe — independently
+  /// suspects `subject`, a distinct confirmation that shortens `subject`'s window through the
+  /// confirmation-count timeout. The originator (this node, when its own probe started the suspicion) is
+  /// never recorded here: its evidence is the suspicion itself, so counting it would collapse a lone
+  /// suspicion to the floor. Only tracked while `subject` is actually suspected.
   fn confirm(&mut self, subject: HostId, by: HostId) {
     self.confirmations.entry(subject).or_default().insert(by);
   }
@@ -336,8 +339,10 @@ impl Detector {
               incarnation: current.incarnation,
             },
           );
-          // We are the first confirmer of this suspicion.
-          self.confirm(target, self.local);
+          // We are the ORIGINATOR of this suspicion, not a confirmer: our failed probe is the suspicion
+          // itself, so it does not shrink the window. Only *other* members' independent confirmations do
+          // (Lifeguard/memberlist; hyperscale's chaos tests showed self-counting collapses a lone
+          // suspicion straight to the floor and evicts a peer mid-partition). C therefore starts at zero.
         }
       }
     }
@@ -433,18 +438,8 @@ impl Detector {
   /// probe is one round, not the unbounded delay a fixed rotation can suffer. Members that died mid-round
   /// are skipped, and `None` is returned only when no alive peer remains.
   fn next_target(&mut self) -> Option<HostId> {
-    // At most one reshuffle: the current round, then a fresh one if it held no live member.
-    for _ in 0..2 {
-      if self.cursor >= self.order.len() {
-        self.order = self
-          .membership
-          .alive()
-          .into_iter()
-          .filter(|host| *host != self.local)
-          .collect();
-        self.shuffler.shuffle(&mut self.order);
-        self.cursor = 0;
-      }
+    loop {
+      // Advance through the current shuffled round, skipping any member that died mid-round.
       while self.cursor < self.order.len() {
         let candidate = self.order[self.cursor];
         self.cursor += 1;
@@ -452,8 +447,22 @@ impl Detector {
           return Some(candidate);
         }
       }
+      // The round is exhausted. Draw a fresh permutation from the current alive peers; if none remain,
+      // there is no target. The fresh set is drawn from alive members, so the next pass returns its
+      // first member — the loop makes at most one further pass, and terminates without a step count.
+      let mut fresh: Vec<HostId> = self
+        .membership
+        .alive()
+        .into_iter()
+        .filter(|host| *host != self.local)
+        .collect();
+      if fresh.is_empty() {
+        return None;
+      }
+      self.shuffler.shuffle(&mut fresh);
+      self.order = fresh;
+      self.cursor = 0;
     }
-    None
   }
 }
 
@@ -757,26 +766,28 @@ mod tests {
   /// held alone is still merely suspected at that point.
   #[test]
   fn a_corroborated_suspicion_dies_sooner_than_a_lone_one() {
+    // Base window six, floor two, reached at two *independent* confirmations (the originator's own probe
+    // does not count — Lifeguard/memberlist).
     let timing = DetectorTiming {
       suspicion_periods: 6,
       gossip_transmits: 2,
       health_max: 0,
       suspicion_min: 2,
-      confirmations_expected: 3,
+      confirmations_expected: 2,
     };
 
-    // Corroborated: two peers confirm the suspicion, shrinking the window to its floor of two.
+    // Corroborated: two *other* peers confirm the suspicion, shrinking the window to its floor of two.
     let mut corroborated = Detector::new(LOCAL, timing);
     corroborated.join(A);
     corroborated.tick(); // probe A
-    corroborated.tick(); // A unanswered → suspected (one confirmer: self)
+    corroborated.tick(); // A unanswered → suspected (originator only, C = 0)
     let incarnation = corroborated.membership().state(A).unwrap().incarnation;
     let suspect = MemberState {
       liveness: Liveness::Suspect,
       incarnation,
     };
-    corroborated.apply_gossip_from(B, &[(A, suspect)]);
-    corroborated.apply_gossip_from(C, &[(A, suspect)]);
+    corroborated.apply_gossip_from(B, &[(A, suspect)]); // C = 1
+    corroborated.apply_gossip_from(C, &[(A, suspect)]); // C = 2 → the floor
     corroborated.tick(); // window is now two; the second aged period declares A dead
     assert_eq!(
       corroborated.membership().state(A).map(|s| s.liveness),
@@ -784,12 +795,13 @@ mod tests {
       "a corroborated failure is declared dead at the floor"
     );
 
-    // Lone: only this node suspects A, so the full window applies and A is still merely suspected.
+    // Lone: only this node's own probe suspects A (C = 0), so the full window of six applies — a lone
+    // suspicion rides the honest maximum rather than collapsing to the floor (the eviction bug fixed).
     let mut lone = Detector::new(LOCAL, timing);
     lone.join(A);
     lone.tick();
-    lone.tick(); // suspected
-    lone.tick(); // still within the full window of four
+    lone.tick(); // suspected, C = 0
+    lone.tick(); // period 2 of 6 — nowhere near the window
     assert_eq!(
       lone.membership().state(A).map(|s| s.liveness),
       Some(Liveness::Suspect),
@@ -802,14 +814,17 @@ mod tests {
   /// another full permutation.
   #[test]
   fn every_peer_is_probed_once_per_round() {
-    let mut detector = Detector::new(LOCAL, timing(3, 2));
-    detector.join(A);
-    detector.join(B);
-    detector.join(C);
+    let peers = [A, B, C];
+    let mut detector = Detector::new(LOCAL, timing(4, 2));
+    for &peer in &peers {
+      detector.join(peer);
+    }
 
+    // One round is exactly as many probes as there are peers — the loop length is the peer count, not a
+    // literal.
     let round = |detector: &mut Detector| {
       let mut probed = Vec::new();
-      for _ in 0..3 {
+      for _ in 0..peers.len() {
         let ping = detector.tick().expect("a peer to probe");
         detector.on_ack(ping.to); // keep every peer alive so the round is not disturbed
         probed.push(ping.to);
@@ -818,14 +833,16 @@ mod tests {
       probed
     };
 
+    let mut expected = peers.to_vec();
+    expected.sort_by_key(|host| host.0);
     assert_eq!(
       round(&mut detector),
-      vec![A, B, C],
+      expected,
       "the first round probes every peer once"
     );
     assert_eq!(
       round(&mut detector),
-      vec![A, B, C],
+      expected,
       "the next round reshuffles and covers them again"
     );
   }
