@@ -311,6 +311,73 @@ fn unlinking_a_hardlink_removes_it() {
   assert_eq!(green.hardlink("h"), None, "unlink removes the hard link");
 }
 
+/// `base_at` reconstructs every dimension at an intervening version, not only file content
+/// (§4.16: a lagging work derives against the base it declared, so directories, modes, symlinks,
+/// hard links and xattrs at that version must be exact). Each dimension is changed after version 1,
+/// so a correct reconstruction must return version 1's value, never the head's.
+#[test]
+fn base_at_reconstructs_every_dimension_at_an_intervening_version() {
+  let mut green = Green::new();
+  // Version 1: the paths exist.
+  green.submit(&Build::new().create("f", b"hello").mkdir("d").at(1, 0));
+  // Version 2: metadata set on the existing file, a symlink and a hard link created.
+  green.submit(
+    &Build::new()
+      .setmode("f", 0o600)
+      .symlink("l", "target")
+      .link("h", "f")
+      .setxattr("f", "user.k", b"v")
+      .at(2, 1),
+  );
+  // Version 3 changes every dimension and removes the directory, so version 2's state cannot be
+  // read from the head — it must be reconstructed.
+  green.submit(
+    &Build::new()
+      .overwrite("f", 0, b"world")
+      .setmode("f", 0o644)
+      .symlink("l", "elsewhere")
+      .setxattr("f", "user.k", b"w")
+      .rmdir("d")
+      .at(3, 2),
+  );
+
+  let base = green.base_at(2);
+  let mode_of = |p: &str| base.modes.iter().find(|(q, _)| q == p).map(|(_, m)| *m);
+  let symlink_of = |p: &str| {
+    base
+      .symlinks
+      .iter()
+      .find(|(q, _)| q == p)
+      .map(|(_, t)| t.clone())
+  };
+  let hardlink_of = |p: &str| {
+    base
+      .hardlinks
+      .iter()
+      .find(|(q, _)| q == p)
+      .map(|(_, t)| t.clone())
+  };
+  let xattr_of = |p: &str, n: &str| {
+    base
+      .xattrs
+      .iter()
+      .find(|(q, m, _)| q == p && m == n)
+      .map(|(_, _, v)| v.clone())
+  };
+  let file_len = |p: &str| base.files.iter().find(|(q, _)| q == p).map(|(_, l)| *l);
+
+  assert_eq!(file_len("f"), Some(5), "f is 'hello' at v2");
+  assert!(base.dirs.contains(&"d".to_string()), "dir d exists at v2");
+  assert_eq!(mode_of("f"), Some(0o600), "f's mode at v2");
+  assert_eq!(symlink_of("l").as_deref(), Some("target"), "symlink at v2");
+  assert_eq!(hardlink_of("h").as_deref(), Some("f"), "hard link at v2");
+  assert_eq!(
+    xattr_of("f", "user.k").as_deref(),
+    Some(b"v".as_slice()),
+    "xattr at v2"
+  );
+}
+
 /// An insert before an accepted disjoint edit shifts the later one, and both apply.
 #[test]
 fn an_intervening_insert_shifts_a_later_edit() {

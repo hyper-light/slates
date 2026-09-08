@@ -161,9 +161,21 @@ pub enum Rebased {
 /// check. The design's chain shares these copy-on-write; here they are full copies (owed).
 type ContentHistory = BTreeMap<String, Vec<(u64, Option<Vec<u8>>)>>;
 
+/// A per-path value history for a namespace dimension: the value at each version the path changed,
+/// `None` marking a removal (mode, symlink target, hard-link target). Reconstructs a base version.
+type ValueHistory<T> = BTreeMap<String, Vec<(u64, Option<T>)>>;
+
+/// A per-`(path, name)` xattr value history: the value at each version it changed, `None` a removal.
+type XattrHistory = BTreeMap<(String, String), Vec<(u64, Option<Vec<u8>>)>>;
+
+/// A per-path directory-presence history: whether the directory existed at each version it changed.
+type DirHistory = BTreeMap<String, Vec<(u64, bool)>>;
+
 /// A green volume's merge state. Each dimension is a current value plus the version it last changed
-/// at (the base-comparison index); the content dimension also keeps a per-path byte history so a
-/// file's bytes at an arbitrary base version can be reconstructed for the identity check.
+/// at (the base-comparison index), and a per-path/key *history* of `(version, value)` entries so any
+/// base version can be reconstructed for a lagging work (the design's chain shares these histories
+/// copy-on-write; here they are full copies, the measured optimization owed). The content dimension's
+/// history holds the bytes; the namespace dimensions' histories hold presence or the value.
 #[derive(Debug, Default)]
 pub struct Green {
   content: BTreeMap<String, Vec<u8>>,
@@ -173,6 +185,11 @@ pub struct Green {
   symlinks: BTreeMap<String, String>,
   hardlinks: BTreeMap<String, String>,
   xattrs: BTreeMap<(String, String), Vec<u8>>,
+  dir_history: DirHistory,
+  mode_history: ValueHistory<u32>,
+  symlink_history: ValueHistory<String>,
+  hardlink_history: ValueHistory<String>,
+  xattr_history: XattrHistory,
   deltas: Vec<BTreeMap<String, Vec<Op>>>,
   last_changed: BTreeMap<String, u64>,
   mode_changed: BTreeMap<String, u64>,
@@ -181,6 +198,26 @@ pub struct Green {
   xattr_changed: BTreeMap<(String, String), u64>,
   seen: BTreeMap<[u8; 32], Outcome>,
   fast_path_hits: u64,
+}
+
+/// The value of a `(version, Option<value>)` history at `version`: the last entry recorded at or
+/// before it, cloned. `None` when nothing was recorded by then or the last entry was a removal.
+fn history_at<T: Clone>(history: &[(u64, Option<T>)], version: u64) -> Option<T> {
+  history
+    .iter()
+    .rev()
+    .find(|(recorded, _)| *recorded <= version)
+    .and_then(|(_, value)| value.clone())
+}
+
+/// Whether a `(version, present)` history has the entity present at `version`: the last entry at or
+/// before it says so (absent when nothing was recorded by then).
+fn present_at(history: &[(u64, bool)], version: u64) -> bool {
+  history
+    .iter()
+    .rev()
+    .find(|(recorded, _)| *recorded <= version)
+    .is_some_and(|(_, present)| *present)
 }
 
 /// The base range an op touches, for overlap testing.
@@ -408,13 +445,13 @@ impl Green {
   /// version. Symlinks, hard links and xattrs at an older version are owed — reconstructed empty here,
   /// which is exact for the file-and-directory workflows and conservative otherwise.
   pub fn base_at(&self, version: u64) -> crate::increment::Base {
-    use crate::ops_doc::OpKind;
     if version >= self.head() {
       return self.current_base();
     }
-    let upto = usize::try_from(version)
-      .unwrap_or(usize::MAX)
-      .min(self.deltas.len());
+    // Each dimension is reconstructed from its own `(version, value)` history: the last entry at or
+    // before `version` is that dimension's state then. Files come from the content history (a path
+    // absent or removed by then yields no entry); directories from a presence history; modes,
+    // symlinks, hard links and xattrs from a value history (a removal is a `None` entry).
     let files = self
       .content_history
       .keys()
@@ -424,33 +461,45 @@ impl Green {
           .map(|bytes| (path.clone(), bytes.len() as u64))
       })
       .collect();
-    let mut dirs = std::collections::BTreeSet::new();
-    let mut modes = std::collections::BTreeMap::new();
-    for delta in &self.deltas[..upto] {
-      for (path, ops) in delta {
-        for op in ops {
-          match op.kind {
-            OpKind::Mkdir => {
-              dirs.insert(path.clone());
-            }
-            OpKind::Rmdir => {
-              dirs.remove(path);
-            }
-            OpKind::SetMode => {
-              modes.insert(path.clone(), u32::try_from(op.len).unwrap_or(0));
-            }
-            _ => {}
-          }
-        }
-      }
-    }
+    let dirs = self
+      .dir_history
+      .iter()
+      .filter(|(_, history)| present_at(history, version))
+      .map(|(path, _)| path.clone())
+      .collect();
+    let modes = self
+      .mode_history
+      .iter()
+      .filter_map(|(path, history)| history_at(history, version).map(|mode| (path.clone(), mode)))
+      .collect();
+    let symlinks = self
+      .symlink_history
+      .iter()
+      .filter_map(|(path, history)| {
+        history_at(history, version).map(|target| (path.clone(), target))
+      })
+      .collect();
+    let hardlinks = self
+      .hardlink_history
+      .iter()
+      .filter_map(|(path, history)| {
+        history_at(history, version).map(|target| (path.clone(), target))
+      })
+      .collect();
+    let xattrs = self
+      .xattr_history
+      .iter()
+      .filter_map(|((path, name), history)| {
+        history_at(history, version).map(|value| (path.clone(), name.clone(), value))
+      })
+      .collect();
     crate::increment::Base {
       files,
-      dirs: dirs.into_iter().collect(),
-      modes: modes.into_iter().collect(),
-      symlinks: Vec::new(),
-      xattrs: Vec::new(),
-      hardlinks: Vec::new(),
+      dirs,
+      modes,
+      symlinks,
+      xattrs,
+      hardlinks,
     }
   }
 
@@ -978,40 +1027,85 @@ impl Green {
         Effect::SetContent(path, bytes, ops) => set_content.push((path, bytes, ops)),
         Effect::RemoveContent(path) => removed_content.push(path),
         Effect::MakeDir(path) => {
-          self.dirs.insert(path);
+          self.dirs.insert(path.clone());
+          self
+            .dir_history
+            .entry(path)
+            .or_default()
+            .push((version, true));
         }
         Effect::RemoveDir(path) => {
           self.dirs.remove(&path);
+          self
+            .dir_history
+            .entry(path)
+            .or_default()
+            .push((version, false));
         }
         Effect::Mode(path, mode) => {
           self.modes.insert(path.clone(), mode);
-          self.mode_changed.insert(path, version);
+          self.mode_changed.insert(path.clone(), version);
+          self
+            .mode_history
+            .entry(path)
+            .or_default()
+            .push((version, Some(mode)));
         }
         Effect::Symlink(path, target) => {
-          self.symlinks.insert(path.clone(), target);
-          self.symlink_changed.insert(path, version);
+          self.symlinks.insert(path.clone(), target.clone());
+          self.symlink_changed.insert(path.clone(), version);
+          self
+            .symlink_history
+            .entry(path)
+            .or_default()
+            .push((version, Some(target)));
         }
         Effect::RemoveSymlink(path) => {
           self.symlinks.remove(&path);
-          self.symlink_changed.insert(path, version);
+          self.symlink_changed.insert(path.clone(), version);
+          self
+            .symlink_history
+            .entry(path)
+            .or_default()
+            .push((version, None));
         }
         Effect::Hardlink(path, target) => {
-          self.hardlinks.insert(path.clone(), target);
-          self.hardlink_changed.insert(path, version);
+          self.hardlinks.insert(path.clone(), target.clone());
+          self.hardlink_changed.insert(path.clone(), version);
+          self
+            .hardlink_history
+            .entry(path)
+            .or_default()
+            .push((version, Some(target)));
         }
         Effect::RemoveHardlink(path) => {
           self.hardlinks.remove(&path);
-          self.hardlink_changed.insert(path, version);
+          self.hardlink_changed.insert(path.clone(), version);
+          self
+            .hardlink_history
+            .entry(path)
+            .or_default()
+            .push((version, None));
         }
         Effect::SetXattr(path, name, value) => {
           let key = (path, name);
-          self.xattrs.insert(key.clone(), value);
-          self.xattr_changed.insert(key, version);
+          self.xattrs.insert(key.clone(), value.clone());
+          self.xattr_changed.insert(key.clone(), version);
+          self
+            .xattr_history
+            .entry(key)
+            .or_default()
+            .push((version, Some(value)));
         }
         Effect::RemoveXattr(path, name) => {
           let key = (path, name);
           self.xattrs.remove(&key);
-          self.xattr_changed.insert(key, version);
+          self.xattr_changed.insert(key.clone(), version);
+          self
+            .xattr_history
+            .entry(key)
+            .or_default()
+            .push((version, None));
         }
       }
     }

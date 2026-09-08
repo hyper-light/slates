@@ -52,13 +52,18 @@ than clobbering it. Non-vacuous — a broken verdict would accept both.
   a serial block-wise reference the engine must equal over every generated history) alongside the
   worked case. **Owed:** a length-changing overlap (insert/delete/truncate) still uses the whole-file
   check (its per-range coordinate mapping under a conflicting neighbour is the remaining piece).
-- **The base at an older version.** `submit` derives against the green's base: `Base::default()` at
-  version 0, and the green's current state (`Green::current_base`) when the work's base is the head —
-  and a new work is seeded with the green's content (`Green::files`) so an edit to a base file splices
-  it rather than looking like a create. The base at an *intervening* version (`0 < base < head`, a lagging
-  work) is now reconstructed by `Green::base_at`: files exactly from the content history, directories
-  and modes replayed from the deltas; symlinks, hard links and xattrs at an older version are still
-  owed (reconstructed empty, exact for file-and-directory workflows).
+- **The base at an older version** is **landed for every dimension.** `submit` derives against the
+  green's base: `Base::default()` at version 0, and the green's current state (`Green::current_base`)
+  when the work's base is the head — and a new work is seeded with the green's content (`Green::files`)
+  so an edit to a base file splices it rather than looking like a create. The base at an *intervening*
+  version (`0 < base < head`, a lagging work) is reconstructed by `Green::base_at` from a per-dimension
+  `(version, value)` history the commit records for content, directories, modes, symlinks, hard links
+  and xattrs alike (the last entry at or before the version is that dimension's state then; a removal
+  is a `None`/absent entry). Gated by `base_at_reconstructs_every_dimension_at_an_intervening_version`,
+  which changes every dimension after the target version so the head cannot stand in for it. (Earlier,
+  only file content reconstructed; directories/modes replayed from the per-version delta, which holds
+  only content ops, so they came back empty — the histories replace that.) The histories are full
+  copies per change; the design's copy-on-write sharing is the measured optimization, owed.
 - **Post-state for non-content dimensions** is **landed**: `assemble_post_state` lays each
   extended-attribute value into the post-state region the `SetXattr` op names (drawn from the journal's
   composed value), so the value round-trips into the green and the verdict compares real bytes — a
