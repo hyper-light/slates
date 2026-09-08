@@ -125,10 +125,11 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
 3. **`rt` UDP driver** — **built** (`crates/rt/src/udp.rs`, `driver.rs`, `sim.rs`): a UDP readiness
    source in kqueue and epoll, plus the deterministic sim fabric (the sim arm, so the whole plane is
    testable at N=1); io_uring/IOCP register-readable are typed-owed.
-4. **`slates-quic`** — the **frame codec is built** (`session.rs`, slice 4a: `Stream`/`Ack`/`MaxData`/
-   `MaxStreamData`, round-trip + hostile-fuzzed, §8). Owed: the connection state machine (packet
-   numbers, ack/loss recovery, credit accounting), the `rustls::quic` TLS 1.3 handshake, and the UDP
-   wiring — with loom on the state machine and the N=1 differential harness.
+4. **`slates-quic`** — **built:** the frame codec (4a), ordered streams both sides (4b), the
+   reliability core / ACK+loss recovery (4c), the flow-control credit law (4d), and the
+   `rustls::quic` TLS 1.3 handshake with pinned-identity auth (4e). **Owed:** the `Connection` that
+   wires those + record protection onto the `rt` UDP driver (with loom on the state machine and the
+   N=1 differential harness), plus congestion control and multi-range ACKs.
    The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c);
    its fencing step and the `Keyring`'s population ride membership/enrollment.
 5. **Register/placement wiring** — owed: §4.8 head + merge-record registers and D-14 placement ride
@@ -232,8 +233,13 @@ delivery. An offer past the window is a typed refusal.
 (receive side: the top contiguous run), and ACK processing with loss detection (send side: free the
 acknowledged, declare a gap lost past the RFC 9002 reorder threshold, retransmit its frames), proven
 by a `reliable_delivery_survives_loss` test that drops a packet and shows the whole stream still
-arrives once each (the assembler dedups the retransmit). **Owed:** multi-range ACKs, timer-based
-tail-loss recovery, congestion control, the credit accounting that *sets* the window from the peer's
-`MaxStreamData`, the `rustls::quic` TLS 1.3 handshake, and the wiring onto the `rt` UDP driver (the
-control plane's `accept`/seal are the datagram-plane analogue already wired). CRYPTO frames are
-`rustls::quic`'s, not ours.
+arrives once each (the assembler dedups the retransmit). **Built (slice 4e):** the **TLS 1.3
+handshake over `rustls::quic`** (`handshake.rs`) — a node authenticates with its enrolled identity as
+a **pinned certificate** (no CA PKI), the client↔server handshake completing over the `quic`
+`read_hs`/`write_hs` interface and negotiating TLS 1.3, with a test that a **wrong pin is rejected**
+(authenticated, not permissive). `rustls` uses the `ring` provider (no cmake); its config `Arc` is
+D-8's sanctioned exception. **Owed:** multi-range ACKs, timer-based tail-loss recovery, congestion
+control, the credit accounting that *sets* the window from the peer's `MaxStreamData`, and the
+`Connection` that wires streams+reliability+flow+handshake+record-protection onto the `rt` UDP driver
+(the control plane's `accept`/seal are the datagram-plane analogue already wired). CRYPTO frames are
+`rustls::quic`'s, not ours; the handshake keys drive the record protection (owed with the wiring).

@@ -28,6 +28,7 @@
 pub mod accept;
 pub mod conn;
 pub mod flow;
+pub mod handshake;
 pub mod schedule;
 pub mod seal;
 pub mod session;
