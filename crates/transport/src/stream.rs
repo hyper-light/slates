@@ -12,6 +12,99 @@
 
 use std::collections::BTreeMap;
 
+use crate::session::Frame;
+
+/// The send side of one ordered stream (§4.10a §8): buffered application bytes framed into
+/// `Stream` frames **only within the flow-control credit** the peer grants (its `MaxStreamData`),
+/// never more than a frame cap per frame. This is where the **never-whole-object-in-credit**
+/// invariant is enforced on send: a 2 GB write with a small credit emits only credit-worth of
+/// frames, the rest waiting for more credit, so a bulk stream never claims the whole object's worth
+/// of buffer and never head-of-line-blocks a control frame. Retransmission (re-framing acked-then-
+/// lost ranges) and buffer trimming on ack are owed with the connection's loss recovery; this slice
+/// frames each byte once, which is exactly right over the lossless sim and the base for loss recovery.
+#[derive(Debug, Default)]
+pub struct StreamSender {
+  buffered: Vec<u8>,
+  send_offset: u64,
+  credit: u64,
+  finished: bool,
+  fin_framed: bool,
+}
+
+impl StreamSender {
+  /// A fresh sender with no credit (nothing sends until the peer grants some).
+  pub fn new() -> StreamSender {
+    StreamSender::default()
+  }
+
+  /// Buffers application bytes to send, in order.
+  pub fn write(&mut self, data: &[u8]) {
+    self.buffered.extend_from_slice(data);
+  }
+
+  /// Raises the send credit to the peer's absolute `MaxStreamData` ceiling (monotonic; a lower grant
+  /// is ignored, so a reordered credit frame never shrinks the window).
+  pub fn grant_credit(&mut self, max: u64) {
+    self.credit = self.credit.max(max);
+  }
+
+  /// Marks the stream finished; the frame that carries its last byte (or an empty frame at the end)
+  /// will set `fin`.
+  pub fn finish(&mut self) {
+    self.finished = true;
+  }
+
+  /// The next `Stream` frame to send on `stream_id`, at most `max_frame_len` bytes, bounded by the
+  /// credit — or `None` when nothing is sendable yet (no bytes within credit, and no `fin` to mark).
+  pub fn next_frame(&mut self, stream_id: u64, max_frame_len: usize) -> Option<Frame> {
+    let sendable_end = (self.buffered.len() as u64).min(self.credit);
+    if self.send_offset >= sendable_end {
+      // No data within credit. Emit the terminating empty fin frame once, when every buffered byte
+      // has been framed and the credit covers the final offset.
+      if self.finished
+        && !self.fin_framed
+        && self.send_offset == self.buffered.len() as u64
+        && self.send_offset <= self.credit
+      {
+        self.fin_framed = true;
+        return Some(Frame::Stream {
+          stream_id,
+          offset: self.send_offset,
+          fin: true,
+          data: Vec::new(),
+        });
+      }
+      return None;
+    }
+    let start = self.send_offset;
+    let want = (sendable_end - start).min(max_frame_len as u64);
+    let lo = usize::try_from(start)
+      .unwrap_or(usize::MAX)
+      .min(self.buffered.len());
+    let hi = lo
+      .saturating_add(usize::try_from(want).unwrap_or(0))
+      .min(self.buffered.len());
+    let data = self.buffered[lo..hi].to_vec();
+    self.send_offset = start + (hi - lo) as u64;
+    // The fin rides the frame that carries the final byte (when the credit reaches the end).
+    let fin = self.finished && self.send_offset == self.buffered.len() as u64;
+    if fin {
+      self.fin_framed = true;
+    }
+    Some(Frame::Stream {
+      stream_id,
+      offset: start,
+      fin,
+      data,
+    })
+  }
+
+  /// The absolute offset framed so far (bytes handed to `next_frame`).
+  pub fn send_offset(&self) -> u64 {
+    self.send_offset
+  }
+}
+
 /// A refusal offering a segment to a stream (§4.10a §8): the closed set. Never a panic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamError {
@@ -195,6 +288,73 @@ mod tests {
       s.offer(0, b"hello world", true),
       Err(StreamError::FinChanged { was: 5, now: 11 })
     );
+  }
+
+  /// A sender with no credit sends nothing; credit lets it send, bounded by that credit.
+  #[test]
+  fn credit_bounds_what_the_sender_emits() {
+    let mut sender = StreamSender::new();
+    sender.write(&[0u8; 100]);
+    assert!(
+      sender.next_frame(1, 4096).is_none(),
+      "no credit, nothing to send"
+    );
+    sender.grant_credit(30);
+    let mut sent = 0u64;
+    while let Some(Frame::Stream { data, .. }) = sender.next_frame(1, 4096) {
+      sent += data.len() as u64;
+    }
+    assert_eq!(
+      sent, 30,
+      "only the credit-worth is sent (never-whole-object)"
+    );
+    assert_eq!(sender.send_offset(), 30);
+    sender.grant_credit(100);
+    let mut more = 0u64;
+    while let Some(Frame::Stream { data, .. }) = sender.next_frame(1, 4096) {
+      more += data.len() as u64;
+    }
+    assert_eq!(more, 70, "the rest sends once credit is raised");
+  }
+
+  /// The frame cap bounds a single frame regardless of how much credit and data are available.
+  #[test]
+  fn the_frame_cap_bounds_a_frame() {
+    let mut sender = StreamSender::new();
+    sender.write(&[7u8; 100]);
+    sender.grant_credit(100);
+    let frame = sender.next_frame(1, 10).unwrap();
+    let Frame::Stream { data, offset, .. } = frame else {
+      panic!("expected a stream frame");
+    };
+    assert_eq!(offset, 0);
+    assert_eq!(data.len(), 10, "the frame cap bounds the frame");
+  }
+
+  /// The send framer and the receive assembler compose into reliable ordered delivery: bytes written
+  /// on one side, framed within credit at a small frame cap, reassemble to exactly those bytes, and
+  /// the stream completes on the fin.
+  #[test]
+  fn send_and_receive_round_trip() {
+    let content: Vec<u8> = (0..250u16)
+      .map(|i| u8::try_from(i % 251).unwrap_or(0))
+      .collect();
+    let mut sender = StreamSender::new();
+    sender.write(&content);
+    sender.grant_credit(content.len() as u64);
+    sender.finish();
+
+    let mut assembler = StreamAssembler::new(content.len() as u64);
+    let mut received = Vec::new();
+    while let Some(Frame::Stream {
+      offset, fin, data, ..
+    }) = sender.next_frame(1, 7)
+    {
+      assembler.offer(offset, &data, fin).unwrap();
+      received.extend_from_slice(&assembler.read());
+    }
+    assert_eq!(received, content, "send→receive reproduces the bytes");
+    assert!(assembler.is_complete(), "the fin completed the stream");
   }
 
   proptest! {

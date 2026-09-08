@@ -208,11 +208,14 @@ payload of a TLS-1.3-protected packet:
 - `MAX_STREAM_DATA { stream_id, max }` — a stream's absolute flow-control credit.
 
 **Built (slice 4a):** the frame codec — encode/decode of a packet payload's frame sequence, every
-length bounds-checked, hostile-fuzzed, never a panic. **Built (slice 4b):** ordered stream reassembly
-(`stream.rs`, `StreamAssembler`) — `Stream` frames at absolute offsets buffered under a bounded
-window and drained contiguously, in order, once each (idempotent under reorder/duplicate/overlap; an
-offer past the window is a typed refusal — the never-whole-object-in-credit invariant), with a
-proptest oracle that reassembles a split-and-shuffled-and-duplicated stream to the original.
+length bounds-checked, hostile-fuzzed, never a panic. **Built (slice 4b):** both sides of an ordered
+stream (`stream.rs`). Receive — `StreamAssembler`: `Stream` frames at absolute offsets buffered under
+a bounded window and drained contiguously, in order, once each (idempotent under reorder/duplicate/
+overlap), with a proptest oracle that reassembles a split-and-shuffled-and-duplicated stream to the
+original. Send — `StreamSender`: buffered bytes framed **only within the flow-control credit** the
+peer grants, at most a frame cap per frame (the never-whole-object-in-credit invariant enforced on
+send), and a `send_and_receive_round_trip` test proves the two sides compose into reliable ordered
+delivery. An offer past the window is a typed refusal.
 **Owed:** the connection state machine (packet numbers, ack/loss recovery, the credit accounting that
 *sets* the window from the peer's `MaxStreamData`), the `rustls::quic` handshake, and the wiring onto
 the `rt` UDP driver (the control plane's `accept`/seal are the datagram-plane analogue already
