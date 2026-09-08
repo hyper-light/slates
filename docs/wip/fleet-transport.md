@@ -178,8 +178,16 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    is refused `UnknownSender`; a wrong-secret datagram fails the seal). The **distribution** of the
    secret and the list — configuration-group admission, human-authorized (§4.13) — is the owed half,
    designed in `docs/wip/enrollment.md` (a draft to ratify).
-5. **Register/placement wiring** — owed: §4.8 head + merge-record registers and D-14 placement ride
-   the session plane; the N=1 ≡ simulated-fleet differential (AC-2.5 extended) is the gate.
+5. **Register/placement wiring** — the **request/reply RPC seam is built** (`endpoint.rs`
+   `request`/`serve_once`, slice 5a): a client sends a request reliably as a stream and receives the
+   peer's reply on the same stream id (the reply travels the other direction over one `Connection`),
+   proven live end to end (`tests/session.rs`: a 250-byte request, a transformed reply, exact). This is
+   the seam §4.8's "lookups route by id to the current owner" and the owner→holder record ship use.
+   **Owed:** wiring `crates/db/src/register.rs` onto it — the owner ships a head/merge-record register
+   to its `2f+1` candidate holders and commits at `f+1` acks (`Placement`/`Quorum`), holders fence by
+   host epoch (`Fence`) — and the N=1 ≡ simulated-fleet differential (AC-2.5 extended) as the gate.
+   Whether the holder's ack rides a session reply (built) or a control datagram is the to-ratify shape
+   (recommendation: the session reply, so one `Connection` and one flow/loss machine carry both).
 
 ## 6. What this does not change
 

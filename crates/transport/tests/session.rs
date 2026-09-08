@@ -125,3 +125,74 @@ fn a_stream_flows_over_a_live_session() {
     other => panic!("the live session did not deliver the stream: {other:?}"),
   }
 }
+
+/// A request/reply exchange completes over a live session: the client sends a request, the server
+/// transforms it and replies, the client receives exactly the reply — the RPC seam register/placement
+/// will ride (§4.8 lookups route to the owner). Do X, expect Y.
+#[test]
+fn a_request_gets_a_reply_over_a_live_session() {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+
+  let request: Vec<u8> = (0..250u16)
+    .map(|i| u8::try_from(i % 251).unwrap_or(0))
+    .collect();
+  // The reply the server computes: the request with every byte incremented — a transform, so a reply
+  // echoed by mistake or a crossed stream would show.
+  let expected_reply: Vec<u8> = request.iter().map(|b| b.wrapping_add(1)).collect();
+  let identity = self_signed(NAME);
+  let pinned = identity.certificate();
+
+  let (server_port_tx, server_port_rx) = channel();
+  let (client_port_tx, client_port_rx) = channel();
+  let (result_tx, result_rx) = channel();
+
+  // The server: handshake, serve one request, reply with the transform.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = server_port_tx.send(socket.local_addr().unwrap().port());
+      let client_port = recv_port(client_port_rx).await;
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, client_port);
+      let mut server = Endpoint::server(socket, peer, &identity).unwrap();
+      server.establish().await.unwrap();
+      server
+        .serve_once(FRAME_CAP, |req| {
+          req.iter().map(|b| b.wrapping_add(1)).collect()
+        })
+        .await
+        .unwrap();
+    })
+    .unwrap();
+
+  // The client: handshake, send the request, receive the reply.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = client_port_tx.send(socket.local_addr().unwrap().port());
+      let server_port = recv_port(server_port_rx).await;
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+      let outcome = async {
+        let mut client =
+          Endpoint::client(socket, peer, &pinned, NAME).map_err(|e| format!("{e:?}"))?;
+        client.establish().await.map_err(|e| format!("{e:?}"))?;
+        client
+          .request(STREAM_ID, &request, FRAME_CAP)
+          .await
+          .map_err(|e| format!("{e:?}"))
+      }
+      .await;
+      let _ = result_tx.send(outcome);
+    })
+    .unwrap();
+
+  sim.run_until_idle();
+
+  match result_rx.try_recv() {
+    Ok(Ok(reply)) => assert_eq!(
+      reply, expected_reply,
+      "the reply arrived over the live session"
+    ),
+    other => panic!("the request/reply did not complete: {other:?}"),
+  }
+}

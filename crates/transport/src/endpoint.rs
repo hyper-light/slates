@@ -273,6 +273,84 @@ impl Endpoint {
       }
     }
   }
+
+  /// The client side of a **request/reply** exchange over the session (§4.8 "lookups route by id to
+  /// the current owner"): sends `request` reliably as stream `stream_id`, then receives the peer's
+  /// reply on the same stream id (the reply travels the other direction), returning its bytes. One
+  /// [`Connection`] carries both — the request as this end's send stream, the reply as its receive
+  /// stream — so a lost frame either way is recovered. The reply's completion is the exchange's
+  /// completion; the final acknowledgement of the reply rides the flush before this returns, so the
+  /// peer's [`serve_once`] finishes too. (Records ride the session plane per §4.10a §8; this is the
+  /// RPC seam register/placement (slice 5) will use — a to-ratify integration shape.)
+  ///
+  /// [`serve_once`]: Endpoint::serve_once
+  pub async fn request(
+    &mut self,
+    stream_id: u64,
+    request: &[u8],
+    frame_cap: usize,
+  ) -> Result<Vec<u8>, EndpointError> {
+    let mut conn = Connection::new(initial_receive_window(frame_cap));
+    conn.open(stream_id, request);
+    let mut buf = [0u8; 2048];
+    let mut rx_largest = 0u64;
+    let mut reply = Vec::new();
+    loop {
+      self.flush(&mut conn, frame_cap)?;
+      reply.extend_from_slice(&conn.read_stream(stream_id));
+      if conn.recv_stream_complete(stream_id) {
+        return Ok(reply);
+      }
+      self
+        .receive_into(&mut conn, &mut rx_largest, &mut buf)
+        .await?;
+    }
+  }
+
+  /// The server side of one request/reply exchange: receives a request stream, passes its bytes to
+  /// `handler`, and sends the reply back on the same stream id, returning once the reply is
+  /// acknowledged. Drives one [`Connection`]: phase one receives and acknowledges the request until its
+  /// `fin`; phase two frames the reply and completes when the peer has acknowledged all of it.
+  pub async fn serve_once<H>(&mut self, frame_cap: usize, handler: H) -> Result<(), EndpointError>
+  where
+    H: FnOnce(Vec<u8>) -> Vec<u8>,
+  {
+    let mut conn = Connection::new(initial_receive_window(frame_cap));
+    let mut buf = [0u8; 2048];
+    let mut rx_largest = 0u64;
+
+    // Phase one: receive the request in full, acknowledging and *draining* as it arrives — draining is
+    // what slides the flow-control window forward, so a request larger than one window keeps flowing
+    // (without it the credit never grows past the initial window and the sender stalls). The request
+    // rides one stream, so its id is the one that arrives.
+    let mut request = Vec::new();
+    let request_id = loop {
+      self
+        .receive_into(&mut conn, &mut rx_largest, &mut buf)
+        .await?;
+      self.flush(&mut conn, frame_cap)?;
+      let ids = conn.recv_stream_ids();
+      for &id in &ids {
+        request.extend_from_slice(&conn.read_stream(id));
+      }
+      if let Some(id) = ids.into_iter().find(|&id| conn.recv_stream_complete(id)) {
+        break id;
+      }
+    };
+
+    // Phase two: send the reply on the same stream id until the peer has acknowledged it whole.
+    let reply = handler(request);
+    conn.open(request_id, &reply);
+    loop {
+      self.flush(&mut conn, frame_cap)?;
+      if conn.send_complete() {
+        return Ok(());
+      }
+      self
+        .receive_into(&mut conn, &mut rx_largest, &mut buf)
+        .await?;
+    }
+  }
 }
 
 /// Protects `frames` into a packet to RFC 9001 shape under `keys` (pure — no socket, no state). Builds
