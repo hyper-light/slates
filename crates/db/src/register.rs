@@ -83,6 +83,16 @@ pub enum RegisterError {
   },
   /// A shipped record's bytes were truncated or claimed a length past what arrived.
   MalformedRecord,
+  /// A record from a principal the holder's authority does not authorize for the object.
+  Unauthorized,
+  /// A record under a configuration generation other than the holder's current one.
+  ForeignGeneration {
+    /// The holder's current generation.
+    current: u64,
+  },
+  /// A different value offered at a ledger position that already holds one — a committed position is
+  /// never rewritten (§4.8, BUG-12).
+  ConflictingPosition,
 }
 
 /// What `await placed` waits for (§4.8 "Mirroring", D-18): the home region's commit, or the
@@ -125,17 +135,30 @@ impl Placement {
     }
   }
 
-  /// Whether the region commit holds (`f + 1` regional acknowledgements).
+  /// Whether the region commit holds (`f + 1` regional acknowledgements). Counts each **candidate**
+  /// once: a duplicate acknowledgement from one holder, or an acknowledgement bearing a host id that
+  /// is not a candidate for this object, cannot manufacture a quorum (a two-count `f = 1` commit must
+  /// be two *distinct* candidates). The vector length alone is not the count.
   pub fn placed(&self, quorum: Quorum) -> bool {
-    quorum.committed(self.acked.len())
+    quorum.committed(self.distinct_candidate_acks(&self.acked))
   }
 
-  /// Whether the mirror commit holds.
+  /// Whether the mirror commit holds — the same distinct-candidate counting as [`Placement::placed`].
   pub fn placed_mirror(&self, quorum: Quorum) -> bool {
     self
       .mirror_acked
       .as_ref()
-      .is_some_and(|m| quorum.committed(m.len()))
+      .is_some_and(|m| quorum.committed(self.distinct_candidate_acks(m)))
+  }
+
+  /// The number of distinct candidates in `acks`: dedups the host ids and drops any that are not a
+  /// candidate for this object, so only eligible, once-counted acknowledgements count toward a quorum.
+  fn distinct_candidate_acks(&self, acks: &[HostId]) -> usize {
+    acks
+      .iter()
+      .filter(|host| self.candidates.contains(host))
+      .collect::<std::collections::BTreeSet<&HostId>>()
+      .len()
   }
 }
 
@@ -220,33 +243,46 @@ impl Default for Fence {
   }
 }
 
-/// A register record on its way to the candidate holders (§4.8 "records are sent to all candidates"):
-/// the object it belongs to, the owner's host epoch (which a holder fences against, D-16), and the
-/// value bytes (the head, chain version, lease or catalog entry — opaque here). This is the canonical
-/// serialization that rides the session plane's RPC to each holder (`docs/wip/fleet-transport.md` §8);
-/// the format is the to-ratify recommendation (object, epoch, then a length-prefixed value).
+/// A register record on its way to the candidate holders (§4.8 "records are sent to all candidates").
+/// It names its ledger position and authority so acceptance is bound to *this specific write*: the
+/// authorized `owner`, the `object` and its `sequence` (the ledger position), the owner's host `epoch`
+/// (the ballot the holder fences against, D-16), the configuration `generation` it is written under,
+/// and the value bytes (a head, chain version, lease or catalog entry — opaque here). Its BLAKE3
+/// [`identity`](Record::identity) over all of those is what an acknowledgement binds to, so a reply for
+/// a different record — different value, position, epoch or generation — cannot be counted for this one
+/// (§4.8 "network receipt is not acceptance"). Rides the session plane's RPC (fleet-transport.md §8).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
+  /// The authorized owner writing this record; a holder refuses one from an unauthorized principal.
+  pub owner: HostId,
   /// The object (volume head, chain, lease, catalog entry) this record belongs to.
   pub object: u64,
-  /// The owner's host epoch; a holder refuses a record below the highest epoch it has seen (fencing).
+  /// The ledger position within the object (monotonic per owner; a committed position is never
+  /// rewritten with a different value).
+  pub sequence: u64,
+  /// The owner's host epoch — the ballot; a holder refuses one below the epoch it has promised.
   pub epoch: HostEpoch,
+  /// The configuration generation this write is under; a holder refuses a foreign generation.
+  pub generation: u64,
   /// The record's value bytes (opaque to the register protocol).
   pub value: Vec<u8>,
 }
 
-/// The fixed prefix of an encoded record: the object and epoch words plus the value's length.
-/// Format: §4.8 record layout — `object` (u64 LE), `epoch` (u64 LE), `value_len` (u32 LE), then the
-/// value bytes; a record is MTU-shippable, so the length is a `u32`.
-const RECORD_PREFIX_BYTES: usize = size_of::<u64>() + size_of::<u64>() + size_of::<u32>();
+/// The fixed prefix of an encoded record: the five header words then the value's length.
+/// Format: §4.8 record layout — `owner`, `object`, `sequence`, `epoch`, `generation` (each u64 LE),
+/// `value_len` (u32 LE), then the value bytes; a record is MTU-shippable, so the length is a `u32`.
+const RECORD_PREFIX_BYTES: usize = 5 * size_of::<u64>() + size_of::<u32>();
 
 impl Record {
-  /// The canonical bytes: object, epoch, value length, value — little-endian throughout, so two hosts
-  /// encode a record identically (a determinism the holder set relies on).
+  /// The canonical bytes: the five header words, the value length, the value — little-endian
+  /// throughout, so two hosts encode a record identically (the determinism its identity relies on).
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::with_capacity(RECORD_PREFIX_BYTES + self.value.len());
+    out.extend_from_slice(&self.owner.0.to_le_bytes());
     out.extend_from_slice(&self.object.to_le_bytes());
+    out.extend_from_slice(&self.sequence.to_le_bytes());
     out.extend_from_slice(&self.epoch.0.to_le_bytes());
+    out.extend_from_slice(&self.generation.to_le_bytes());
     let value_len = u32::try_from(self.value.len()).unwrap_or(u32::MAX);
     out.extend_from_slice(&value_len.to_le_bytes());
     out.extend_from_slice(&self.value);
@@ -260,53 +296,211 @@ impl Record {
     if bytes.len() < RECORD_PREFIX_BYTES {
       return Err(RegisterError::MalformedRecord);
     }
-    let (object_bytes, rest) = bytes.split_at(size_of::<u64>());
+    let word = |slice: &[u8]| u64::from_le_bytes(slice.try_into().unwrap_or([0; 8]));
+    let (owner_bytes, rest) = bytes.split_at(size_of::<u64>());
+    let (object_bytes, rest) = rest.split_at(size_of::<u64>());
+    let (sequence_bytes, rest) = rest.split_at(size_of::<u64>());
     let (epoch_bytes, rest) = rest.split_at(size_of::<u64>());
+    let (generation_bytes, rest) = rest.split_at(size_of::<u64>());
     let (len_bytes, value_bytes) = rest.split_at(size_of::<u32>());
-    let object = u64::from_le_bytes(object_bytes.try_into().unwrap_or([0; 8]));
-    let epoch = HostEpoch(u64::from_le_bytes(epoch_bytes.try_into().unwrap_or([0; 8])));
     let value_len = u32::from_le_bytes(len_bytes.try_into().unwrap_or([0; 4]));
     let value_len = usize::try_from(value_len).unwrap_or(usize::MAX);
     if value_bytes.len() != value_len {
       return Err(RegisterError::MalformedRecord);
     }
     Ok(Record {
-      object,
-      epoch,
+      owner: HostId(word(owner_bytes)),
+      object: word(object_bytes),
+      sequence: word(sequence_bytes),
+      epoch: HostEpoch(word(epoch_bytes)),
+      generation: word(generation_bytes),
       value: value_bytes.to_vec(),
+    })
+  }
+
+  /// The record's identity: the BLAKE3 of its canonical encoding, binding every field. An
+  /// acknowledgement carries this so a reply for any other record cannot be counted for this one.
+  pub fn identity(&self) -> [u8; 32] {
+    *blake3::hash(&self.encode()).as_bytes()
+  }
+}
+
+/// The validated authority a holder accepts records under (§4.8 "epoch allocation derives from
+/// configuration authority"): the current configuration `generation`, and the `owner` authorized to
+/// write in it. The cluster plane supplies this from the configuration group (owed distribution); a
+/// holder refuses a record whose generation or owner does not match, so there is no unauthenticated
+/// path. (One authorized owner per generation this slice; per-object authority is owed.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Authority {
+  /// The configuration generation this holder currently serves.
+  pub generation: u64,
+  /// The owner authorized to write registers in this generation.
+  pub owner: HostId,
+}
+
+/// A holder's acknowledgement of a *specific* record (§4.8 "the holder set, record and its placed
+/// status publish atomically"): the acknowledging holder, the ledger position, the generation, and the
+/// record's identity. The owner counts it only if it [`binds`](Ack::binds) to the record shipped, so a
+/// duplicate, foreign, stale or wrong-record reply cannot manufacture a quorum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ack {
+  /// The holder that accepted and stored the record.
+  pub holder: HostId,
+  /// The object the record belongs to.
+  pub object: u64,
+  /// The ledger position accepted.
+  pub sequence: u64,
+  /// The generation it was accepted under.
+  pub generation: u64,
+  /// The accepted record's identity.
+  pub identity: [u8; 32],
+}
+
+impl Ack {
+  /// Whether this acknowledgement is for `record` — the position, generation and identity all match.
+  pub fn binds(&self, record: &Record) -> bool {
+    self.object == record.object
+      && self.sequence == record.sequence
+      && self.generation == record.generation
+      && self.identity == record.identity()
+  }
+}
+
+/// The per-position acceptor a holder runs (§4.8 "distinguish a holder's promised epoch from its
+/// accepted `(epoch, value)`"): the holder's id and authority, the highest epoch it has promised (the
+/// fence), and the value it has accepted at each ledger position. Acceptance is synchronous and
+/// recoverable — the accepted value and the promise are recorded *before* an acknowledgement is
+/// returned, and a restart reconstructs an acceptor from them ([`Acceptor::recovered`]) — so an
+/// acknowledgement always reflects a stored record (network receipt is not acceptance). db owns this
+/// synchronous acceptance; the cluster plane wraps it in asynchronous dispatch.
+pub struct Acceptor {
+  id: HostId,
+  authority: Authority,
+  fence: Fence,
+  accepted: std::collections::BTreeMap<(u64, u64), (HostEpoch, Vec<u8>)>,
+}
+
+/// A holder's durable accepted positions, for recovery: `(object, sequence, epoch, value)` per entry.
+pub type AcceptedPositions = Vec<(u64, u64, HostEpoch, Vec<u8>)>;
+
+impl Acceptor {
+  /// A fresh acceptor for holder `id` serving under `authority`, having accepted nothing.
+  pub fn new(id: HostId, authority: Authority) -> Acceptor {
+    Acceptor {
+      id,
+      authority,
+      fence: Fence::new(),
+      accepted: std::collections::BTreeMap::new(),
+    }
+  }
+
+  /// An acceptor recovered after a restart from its persisted promise and accepted positions — the
+  /// state a real holder writes to anchor-owned RAM before acknowledging (§4.8 "persist effect and
+  /// completion as one recoverable publication"). Acknowledged records and the fence survive.
+  pub fn recovered(
+    id: HostId,
+    authority: Authority,
+    promised: HostEpoch,
+    accepted: AcceptedPositions,
+  ) -> Acceptor {
+    let mut fence = Fence::new();
+    let _ = fence.accept(promised);
+    let accepted = accepted
+      .into_iter()
+      .map(|(object, sequence, epoch, value)| ((object, sequence), (epoch, value)))
+      .collect();
+    Acceptor {
+      id,
+      authority,
+      fence,
+      accepted,
+    }
+  }
+
+  /// This acceptor's durable state (the promise and the accepted positions), for a restart to recover.
+  pub fn persisted(&self) -> (HostEpoch, AcceptedPositions) {
+    let accepted = self
+      .accepted
+      .iter()
+      .map(|(&(object, sequence), (epoch, value))| (object, sequence, *epoch, value.clone()))
+      .collect();
+    (self.fence.seen, accepted)
+  }
+
+  /// Accepts `record` under this holder's authority and fence, storing it before acknowledging, or
+  /// refusing with a typed reason. The order is authority (a foreign generation or unauthorized owner
+  /// refuses before touching the fence), then the fence (a stale epoch refuses), then the position (a
+  /// *different* value at a position already accepted is a conflict — a committed position is never
+  /// rewritten; the *same* value re-acknowledges idempotently). On acceptance the promise is raised and
+  /// the accepted `(epoch, value)` recorded — recording the new epoch even when the value is unchanged
+  /// (BUG-12) — before the [`Ack`] is returned.
+  pub fn accept(&mut self, record: &Record) -> Result<Ack, RegisterError> {
+    if record.generation != self.authority.generation {
+      return Err(RegisterError::ForeignGeneration {
+        current: self.authority.generation,
+      });
+    }
+    if record.owner != self.authority.owner {
+      return Err(RegisterError::Unauthorized);
+    }
+    self.fence.accept(record.epoch)?;
+    let position = (record.object, record.sequence);
+    if let Some((_, existing)) = self.accepted.get(&position)
+      && existing != &record.value
+    {
+      return Err(RegisterError::ConflictingPosition);
+    }
+    // Store the accepted value and the raised promise before acknowledging.
+    self
+      .accepted
+      .insert(position, (record.epoch, record.value.clone()));
+    Ok(Ack {
+      holder: self.id,
+      object: record.object,
+      sequence: record.sequence,
+      generation: record.generation,
+      identity: record.identity(),
     })
   }
 }
 
 /// A candidate holder of an object's records (§4.8 "2f+1 candidate holders, the owner among them"). A
 /// real holder is reached over the session plane's RPC; the owner's own hold is local. `deliver`
-/// applies the record — fencing it against the holder's highest-seen epoch — and returns the holder's
-/// id on acknowledgement, or a [`RegisterError`] (a fenced record does not acknowledge, so it is not
-/// counted toward the commit). This is the seam the transport plugs a remote holder into (slice 5c);
-/// the register protocol here stays sans-io.
+/// applies the record through the holder's [`Acceptor`] and returns a binding [`Ack`] on acceptance,
+/// or a typed refusal (a refused record does not acknowledge, so it is not counted). This is the seam
+/// the transport plugs a remote holder into (the cluster plane); the register protocol stays sans-io.
 pub trait Holder {
-  /// Delivers `record` to this holder, returning its host id if it acknowledges (held under an epoch
-  /// at least as high as any it has seen), or refusing.
-  fn deliver(&mut self, record: &Record) -> Result<HostId, RegisterError>;
+  /// Delivers `record` to this holder, returning its binding acknowledgement if it accepts
+  /// (authorized, under a promise-respecting epoch, no conflicting value at the position) or refusing.
+  fn deliver(&mut self, record: &Record) -> Result<Ack, RegisterError>;
 }
 
-/// Ships `record` to the `candidates`' `holders` (the owner's local hold among them, `holders[i]` the
-/// holder for `candidates[i]`) and returns the resulting [`Placement`] — the candidates and the subset
-/// that acknowledged. The write commits when the placement is `placed(quorum)` (`f + 1`
-/// acknowledgements, §4.8 "one quorum rule"); a holder that fences the record (a stale epoch) does not
-/// acknowledge and is not counted, so a resumed stale owner cannot gather a quorum. At `f = 0` there is
-/// one holder, the owner, and its local hold is the commit — the same code path, never a mode switch
-/// (R8). `candidates` and `holders` must be the same length (a candidate and the holder that reaches
-/// it); a surplus holder or candidate beyond the shorter is ignored.
+impl Holder for Acceptor {
+  fn deliver(&mut self, record: &Record) -> Result<Ack, RegisterError> {
+    self.accept(record)
+  }
+}
+
+/// Ships `record` to the `candidates`' `holders` (the owner's local hold among them) and returns the
+/// resulting [`Placement`] — the candidates and the distinct subset that acknowledged *this* record.
+/// The write commits when the placement is `placed(quorum)` (`f + 1` distinct candidate
+/// acknowledgements, §4.8 "one quorum rule"). An acknowledgement is counted only if it **binds** to the
+/// record shipped (position, generation and identity), comes from an actual candidate, and is not a
+/// duplicate — so a fenced, foreign, stale or wrong-record reply cannot pad the quorum. At `f = 0`
+/// there is one holder, the owner, and its local hold is the commit — the same code path (R8).
 pub fn commit_over_holders(
   candidates: &[HostId],
   record: &Record,
   holders: &mut [&mut dyn Holder],
 ) -> Placement {
-  let mut acked = Vec::new();
+  let mut acked: Vec<HostId> = Vec::new();
   for holder in holders.iter_mut() {
-    if let Ok(host) = holder.deliver(record) {
-      acked.push(host);
+    if let Ok(ack) = holder.deliver(record)
+      && ack.binds(record)
+      && candidates.contains(&ack.holder)
+      && !acked.contains(&ack.holder)
+    {
+      acked.push(ack.holder);
     }
   }
   Placement {
@@ -396,42 +590,39 @@ impl Configuration {
 mod tests {
   use super::*;
 
-  /// A simulated fleet holder that fences a record and acknowledges: the other leg of the N=1
-  /// differential, so `f = 1` runs the same protocol as `f = 0` locally. It is a [`Holder`] — the
-  /// same seam a real transport-backed holder plugs into (slice 5c) — so the differential exercises
-  /// `commit_over_holders`, not a parallel simulation.
-  struct SimHolder {
-    id: HostId,
-    fence: Fence,
-  }
-
-  impl SimHolder {
-    fn new(id: HostId) -> SimHolder {
-      SimHolder {
-        id,
-        fence: Fence::new(),
-      }
+  /// A record authorized under `config`, at `object`/`sequence` and host `epoch`, carrying `value`.
+  fn record_under(
+    config: &Configuration,
+    object: u64,
+    sequence: u64,
+    epoch: HostEpoch,
+    value: &[u8],
+  ) -> Record {
+    Record {
+      owner: config.owner,
+      object,
+      sequence,
+      epoch,
+      generation: config.version,
+      value: value.to_vec(),
     }
   }
 
-  impl Holder for SimHolder {
-    fn deliver(&mut self, record: &Record) -> Result<HostId, RegisterError> {
-      self.fence.accept(record.epoch)?;
-      Ok(self.id)
-    }
-  }
-
-  /// Runs a register write over `config`'s candidates through `commit_over_holders` with a simulated
-  /// holder per candidate, and returns the placement observed. The owner's holder is local; peers are
-  /// simulated — the same code at f=0 (one holder) and f=1 (three).
+  /// Runs a register write over `config`'s candidates through `commit_over_holders` with a real
+  /// [`Acceptor`] per candidate (the same seam a transport-backed holder plugs into), and returns the
+  /// placement observed. The owner's holder is local; peers are distinct logical holders — the same
+  /// code at f=0 (one holder) and f=1 (three).
   fn write(config: &Configuration, object: u64, epoch: HostEpoch) -> Placement {
     let candidates = candidates_for(config.owner, &config.neighbourhood, object, config.quorum);
-    let record = Record {
-      object,
-      epoch,
-      value: Vec::new(),
+    let authority = Authority {
+      generation: config.version,
+      owner: config.owner,
     };
-    let mut holders: Vec<SimHolder> = candidates.iter().map(|h| SimHolder::new(*h)).collect();
+    let record = record_under(config, object, 0, epoch, b"value");
+    let mut holders: Vec<Acceptor> = candidates
+      .iter()
+      .map(|h| Acceptor::new(*h, authority))
+      .collect();
     let mut refs: Vec<&mut dyn Holder> = holders.iter_mut().map(|h| h as &mut dyn Holder).collect();
     commit_over_holders(&candidates, &record, &mut refs)
   }
@@ -519,18 +710,23 @@ mod tests {
   #[test]
   fn a_record_round_trips_and_refuses_malformation() {
     let record = Record {
-      object: 0x0102_0304_0506_0708,
-      epoch: HostEpoch(0x1122_3344),
-      value: b"head@v7".to_vec(),
+      owner: HostId(1),
+      object: 2,
+      sequence: 3,
+      epoch: HostEpoch(4),
+      generation: 5,
+      value: b"v".to_vec(),
     };
     let bytes = record.encode();
     assert_eq!(Record::decode(&bytes), Ok(record.clone()), "round-trip");
 
-    // Golden: object (8 LE) + epoch (8 LE) + len (4 LE) + value.
-    let mut golden = vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01];
-    golden.extend_from_slice(&[0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0]);
-    golden.extend_from_slice(&[0x07, 0, 0, 0]);
-    golden.extend_from_slice(b"head@v7");
+    // Golden: owner, object, sequence, epoch, generation (each 8 LE), value_len (4 LE), value.
+    let mut golden = Vec::new();
+    for word in [1u64, 2, 3, 4, 5] {
+      golden.extend_from_slice(&word.to_le_bytes());
+    }
+    golden.extend_from_slice(&1u32.to_le_bytes());
+    golden.push(b'v');
     assert_eq!(bytes, golden, "the canonical encoding is stable");
 
     // Hostile: a truncated prefix, and a value length past what arrived.
@@ -546,25 +742,29 @@ mod tests {
   }
 
   /// A holder that fences the record (a stale epoch) does not acknowledge, so it is not counted toward
-  /// the commit: at f=1 with only the owner accepting and both peers fencing, the write is **not**
-  /// placed (one ack, commit needs two) — StaleNeverCommits, over the real ship-and-collect path.
+  /// the commit: at f=1 with only the owner accepting and both peers having promised a higher epoch,
+  /// the write is **not** placed (one ack, commit needs two) — StaleNeverCommits, over the real
+  /// ship-and-collect path.
   #[test]
   fn a_fencing_holder_is_not_counted_toward_the_commit() {
     let owner = HostId(1);
+    let generation = 0u64;
+    let authority = Authority { generation, owner };
     let quorum = Quorum { f: 1 };
     let candidates = vec![owner, HostId(2), HostId(3)];
     let record = Record {
+      owner,
       object: 9,
+      sequence: 0,
       epoch: HostEpoch(5),
+      generation,
       value: b"v".to_vec(),
     };
 
-    // The owner accepts; the two peers have already seen a higher epoch, so they fence this record.
-    let mut owner_holder = SimHolder::new(owner);
-    let mut peer_two = SimHolder::new(HostId(2));
-    let mut peer_three = SimHolder::new(HostId(3));
-    peer_two.fence.accept(HostEpoch(6)).unwrap();
-    peer_three.fence.accept(HostEpoch(6)).unwrap();
+    // The owner accepts; the two peers have already promised epoch 6, so they fence this epoch-5 record.
+    let mut owner_holder = Acceptor::new(owner, authority);
+    let mut peer_two = Acceptor::recovered(HostId(2), authority, HostEpoch(6), Vec::new());
+    let mut peer_three = Acceptor::recovered(HostId(3), authority, HostEpoch(6), Vec::new());
     let mut refs: Vec<&mut dyn Holder> = vec![&mut owner_holder, &mut peer_two, &mut peer_three];
 
     let placement = commit_over_holders(&candidates, &record, &mut refs);
@@ -572,6 +772,172 @@ mod tests {
     assert!(
       !placement.placed(quorum),
       "one acknowledgement does not commit at f=1; the fenced peers are not counted"
+    );
+  }
+
+  /// A holder returning whatever acknowledgement it is told to — a forged, foreign, duplicate or
+  /// wrong-record reply — so the counting rule can be tested against an adversary.
+  struct LyingHolder {
+    reply: Ack,
+  }
+  impl Holder for LyingHolder {
+    fn deliver(&mut self, _record: &Record) -> Result<Ack, RegisterError> {
+      Ok(self.reply)
+    }
+  }
+
+  /// AC (acceptance history 2): duplicate, foreign and wrong-record acknowledgements cannot manufacture
+  /// a quorum. At f=1 only the owner truly accepts; adversarial holders claim a duplicate of the owner,
+  /// a foreign id, and a reply bound to a different record — none is counted, so the write is not placed.
+  #[test]
+  fn forged_acks_cannot_manufacture_quorum() {
+    let owner = HostId(1);
+    let generation = 0u64;
+    let authority = Authority { generation, owner };
+    let quorum = Quorum { f: 1 };
+    let candidates = vec![owner, HostId(2), HostId(3)];
+    let record = Record {
+      owner,
+      object: 9,
+      sequence: 0,
+      epoch: HostEpoch(5),
+      generation,
+      value: b"v".to_vec(),
+    };
+    let good_ack = Ack {
+      holder: owner,
+      object: 9,
+      sequence: 0,
+      generation,
+      identity: record.identity(),
+    };
+
+    let mut owner_holder = Acceptor::new(owner, authority);
+    // A holder claiming the owner's id again (a duplicate), and one bound to a different record.
+    let mut duplicate = LyingHolder { reply: good_ack };
+    let mut wrong_record = LyingHolder {
+      reply: Ack {
+        holder: HostId(2),
+        identity: [0xff; 32],
+        ..good_ack
+      },
+    };
+    let mut refs: Vec<&mut dyn Holder> = vec![&mut owner_holder, &mut duplicate, &mut wrong_record];
+    let placement = commit_over_holders(&candidates, &record, &mut refs);
+    assert_eq!(
+      placement.acked,
+      vec![owner],
+      "only the owner's genuine ack counts"
+    );
+    assert!(
+      !placement.placed(quorum),
+      "a duplicate of the owner and a wrong-record reply cannot manufacture the second ack"
+    );
+
+    // A foreign id (not a candidate) is likewise uncounted.
+    let mut foreign = LyingHolder {
+      reply: Ack {
+        holder: HostId(99),
+        ..good_ack
+      },
+    };
+    let mut refs: Vec<&mut dyn Holder> = vec![&mut foreign];
+    let placement = commit_over_holders(&candidates, &record, &mut refs);
+    assert!(
+      placement.acked.is_empty(),
+      "a non-candidate id is not counted"
+    );
+  }
+
+  /// AC (§4.13/§4.8): a record from a principal the authority does not authorize, or under a foreign
+  /// generation, is refused — there is no unauthenticated acceptance.
+  #[test]
+  fn authority_refuses_wrong_owner_and_generation() {
+    let owner = HostId(1);
+    let authority = Authority {
+      generation: 7,
+      owner,
+    };
+    let mut acceptor = Acceptor::new(HostId(2), authority);
+
+    let foreign_owner = Record {
+      owner: HostId(42),
+      object: 1,
+      sequence: 0,
+      epoch: HostEpoch(1),
+      generation: 7,
+      value: b"x".to_vec(),
+    };
+    assert_eq!(
+      acceptor.accept(&foreign_owner),
+      Err(RegisterError::Unauthorized)
+    );
+
+    let foreign_generation = Record {
+      owner,
+      object: 1,
+      sequence: 0,
+      epoch: HostEpoch(1),
+      generation: 6,
+      value: b"x".to_vec(),
+    };
+    assert_eq!(
+      acceptor.accept(&foreign_generation),
+      Err(RegisterError::ForeignGeneration { current: 7 })
+    );
+  }
+
+  /// AC (acceptance history 5): a restarted holder preserves its acknowledged records and fence — a
+  /// re-delivery of the same record re-acknowledges idempotently, a *different* value at that committed
+  /// position is refused, and an epoch below the recovered promise is still fenced.
+  #[test]
+  fn a_restarted_holder_preserves_acceptance_and_refuses_conflict() {
+    let owner = HostId(1);
+    let authority = Authority {
+      generation: 0,
+      owner,
+    };
+    let mut acceptor = Acceptor::new(HostId(2), authority);
+    let record = Record {
+      owner,
+      object: 5,
+      sequence: 0,
+      epoch: HostEpoch(3),
+      generation: 0,
+      value: b"committed".to_vec(),
+    };
+    let first = acceptor.accept(&record).unwrap();
+
+    // Restart: recover a fresh acceptor from the persisted promise and accepted positions.
+    let (promised, accepted) = acceptor.persisted();
+    let mut recovered = Acceptor::recovered(HostId(2), authority, promised, accepted);
+
+    // The same record re-acknowledges identically (idempotent recovery of the same result).
+    assert_eq!(
+      recovered.accept(&record),
+      Ok(first),
+      "the acknowledged record survived the restart"
+    );
+
+    // A different value at the same position is refused — a committed position is never rewritten.
+    let conflicting = Record {
+      value: b"different".to_vec(),
+      ..record.clone()
+    };
+    assert_eq!(
+      recovered.accept(&conflicting),
+      Err(RegisterError::ConflictingPosition)
+    );
+
+    // The recovered promise still fences a lower epoch.
+    let stale = Record {
+      sequence: 1,
+      epoch: HostEpoch(2),
+      ..record.clone()
+    };
+    assert_eq!(
+      recovered.accept(&stale),
+      Err(RegisterError::StaleEpoch { current: 3 })
     );
   }
 

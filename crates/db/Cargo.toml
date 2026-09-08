@@ -14,6 +14,8 @@ slates-mem = { workspace = true }
 slates-anchor = { workspace = true }
 slates-wire = { workspace = true }
 slates-rt = { workspace = true }
+# Register-record identities (§4.8): the BLAKE3 that binds an acknowledgement to the exact record.
+blake3 = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
