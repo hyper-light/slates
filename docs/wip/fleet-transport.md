@@ -208,8 +208,12 @@ payload of a TLS-1.3-protected packet:
 - `MAX_STREAM_DATA { stream_id, max }` — a stream's absolute flow-control credit.
 
 **Built (slice 4a):** the frame codec — encode/decode of a packet payload's frame sequence, every
-length bounds-checked, hostile-fuzzed, never a panic. **Owed:** the connection state machine
-(streams, packet numbers, ack/loss recovery, the credit accounting that enforces the flow-control
-law), the `rustls::quic` handshake, and the wiring onto the `rt` UDP driver (the control plane's
-`accept`/seal are the datagram-plane analogue already wired). CRYPTO frames are `rustls::quic`'s, not
-ours.
+length bounds-checked, hostile-fuzzed, never a panic. **Built (slice 4b):** ordered stream reassembly
+(`stream.rs`, `StreamAssembler`) — `Stream` frames at absolute offsets buffered under a bounded
+window and drained contiguously, in order, once each (idempotent under reorder/duplicate/overlap; an
+offer past the window is a typed refusal — the never-whole-object-in-credit invariant), with a
+proptest oracle that reassembles a split-and-shuffled-and-duplicated stream to the original.
+**Owed:** the connection state machine (packet numbers, ack/loss recovery, the credit accounting that
+*sets* the window from the peer's `MaxStreamData`), the `rustls::quic` handshake, and the wiring onto
+the `rt` UDP driver (the control plane's `accept`/seal are the datagram-plane analogue already
+wired). CRYPTO frames are `rustls::quic`'s, not ours.
