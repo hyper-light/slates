@@ -33,6 +33,17 @@ pub struct Ack {
   pub to: HostId,
 }
 
+/// A ping-request: ask `relay` to ping `target` on our behalf and relay the acknowledgement back. SWIM
+/// sends these to a few peers when a direct ping goes unanswered, so a single lost packet — rather than
+/// a failed member — does not cause a false suspicion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PingReq {
+  /// The peer asked to probe on our behalf.
+  pub relay: HostId,
+  /// The member to probe indirectly.
+  pub target: HostId,
+}
+
 /// The failure detector for one node: it owns the node's [`Membership`] view, a round-robin cursor
 /// over the members it probes, the member being probed this period and whether it has acknowledged,
 /// and how many periods each suspected member has gone unrefuted. A member suspected for
@@ -133,6 +144,42 @@ impl Detector {
   /// Responds to a received ping from `from` with the acknowledgement to send back.
   pub fn on_ping(&self, from: HostId) -> Ack {
     Ack { to: from }
+  }
+
+  /// When a direct ping has gone unanswered this period, asks up to `fanout` other alive peers to ping
+  /// the current target on our behalf (SWIM's indirect probe). Returns the ping-requests to send;
+  /// empty if there is no current target or no eligible relay. The caller sends them, and relays any
+  /// acknowledgement back as an indirect ack ([`on_indirect_ack`](Detector::on_indirect_ack)).
+  pub fn request_indirect(&self, fanout: usize) -> Vec<PingReq> {
+    let Some(target) = self.probing else {
+      return Vec::new();
+    };
+    if self.acked {
+      return Vec::new();
+    }
+    self
+      .membership
+      .alive()
+      .into_iter()
+      .filter(|host| *host != self.local && *host != target)
+      .take(fanout)
+      .map(|relay| PingReq { relay, target })
+      .collect()
+  }
+
+  /// As a relay, responds to a ping-request for `target` with the ping to send it; the caller relays
+  /// the resulting acknowledgement back to the requester (that relay-back routing is the caller's).
+  pub fn on_ping_req(&self, target: HostId) -> Ping {
+    Ping { to: target }
+  }
+
+  /// Records an indirect acknowledgement that `target` is alive (a relay reached it): if `target` is
+  /// this period's probe, the probe succeeded, so the target will not be suspected — a lost direct
+  /// packet is not mistaken for a failure.
+  pub fn on_indirect_ack(&mut self, target: HostId) {
+    if self.probing == Some(target) {
+      self.acked = true;
+    }
   }
 
   /// Ages each suspected member's counter by one period; a member suspected for the whole suspicion
@@ -257,5 +304,34 @@ mod tests {
   fn a_ping_is_acknowledged() {
     let detector = Detector::new(LOCAL, 2);
     assert_eq!(detector.on_ping(A), Ack { to: A });
+  }
+
+  /// An indirect acknowledgement prevents a false suspicion: A's direct ping is lost, but a relay
+  /// reaches A and relays the ack, so the next period does not suspect A — a lost packet is not a
+  /// failure. The ping-request is aimed at another alive peer, not the target.
+  #[test]
+  fn an_indirect_ack_prevents_a_false_suspicion() {
+    let mut detector = Detector::new(LOCAL, 2);
+    detector.join(A);
+    detector.join(B);
+
+    // Probe A. Suppose its direct ack is lost (we do not call on_ack for A).
+    let ping = detector.tick().unwrap();
+    let target = ping.to;
+    // Ask the other alive peer to probe the target indirectly.
+    let requests = detector.request_indirect(1);
+    assert_eq!(requests.len(), 1, "one relay is asked");
+    assert_eq!(requests[0].target, target);
+    assert_ne!(requests[0].relay, target, "the relay is a different peer");
+    // The relay reaches the target and relays the acknowledgement.
+    detector.on_indirect_ack(target);
+
+    // The next period must not suspect the target — the indirect ack saved it.
+    detector.tick();
+    assert_eq!(
+      detector.membership().state(target).unwrap().liveness,
+      Liveness::Alive,
+      "an indirectly-acknowledged member is not suspected"
+    );
   }
 }
