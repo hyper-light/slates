@@ -30,6 +30,7 @@
 //! `f = 0` degenerate of the fleet consensus, which is owed).
 
 pub mod config_group;
+pub mod coordinates;
 pub mod detector;
 pub(crate) mod fixed;
 pub mod membership;
