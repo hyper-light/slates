@@ -324,10 +324,12 @@ fn a_joint_change_commits_only_with_both_configurations() {
 
   cluster.elect(A, &[A, B, c].into_iter().collect());
   assert!(cluster.at(A).is_leader());
+  // begin appends the joint C_old,new as index 1 (it takes effect on append); the command is index 2.
   assert!(
     cluster.at(A).begin_membership_change(vec![c, d, e]),
     "enter the joint configuration"
   );
+  assert!(cluster.at(A).in_joint_configuration());
   cluster.at(A).append_command(b"during-change".to_vec());
 
   // Replicate to B alone: a majority of the old {A,B,C} (with A), but no majority of the new {C,D,E}.
@@ -338,11 +340,12 @@ fn a_joint_change_commits_only_with_both_configurations() {
     "a majority of the old configuration alone does not commit during a joint change"
   );
 
-  // Replicate to C and D: now a majority of the new {C,D,E} too (and still of the old).
+  // Replicate to C and D: now a majority of the new {C,D,E} too (and still of the old), so both the
+  // configuration entry (index 1) and the command (index 2) commit.
   cluster.replicate(A, &[c, d].into_iter().collect());
   assert_eq!(
     cluster.at(A).commit_index(),
-    1,
-    "a majority of both configurations commits"
+    2,
+    "a majority of both configurations commits the joint entry and the command"
   );
 }

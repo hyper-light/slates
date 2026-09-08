@@ -31,12 +31,18 @@
 //! a partition and a membership change, checking Election Safety, Log Matching, Leader Completeness and
 //! State Machine Safety.
 //!
+//! And the **log-integrated membership change** (§6): [`begin`](RaftNode::begin_membership_change) and
+//! [`complete_membership_change`](RaftNode::complete_membership_change) append `C_old,new`/`C_new`
+//! configuration entries that take effect the moment they are appended (the effective configuration is
+//! derived from the log, so a truncated entry reverts it) and replicate like any entry; compaction folds
+//! a discarded configuration into the base, and install-snapshot carries it, so it is never lost. This
+//! completes the dialect's core.
+//!
 //! Degenerate on a laptop (`f = 0`): one voter, itself; a pre-vote and an election each reach a majority
 //! of one at once, an appended entry commits at once, and the lone voter is always its own quorum so it
-//! never steps down — the same code path as a fleet, never a mode switch (R8). Owed: wiring the
-//! membership change through the log — the `C_old,new`/`C_new` entries that take effect on append and
-//! revert on truncation, the transition mechanics on top of the majority rule built here (the direct
-//! `begin`/`complete_membership_change` are the stand-in the config group drives at `f = 0`).
+//! never steps down — the same code path as a fleet, never a mode switch (R8). Owed: driving the dialect
+//! live over the transport in a multi-node fleet (this core is sans-io and multi-node-tested by direct
+//! message passing), and the PreVote/CheckQuorum timer cadence, which is the caller's clock.
 //!
 //! Evidence: Ongaro & Ousterhout, *In Search of an Understandable Consensus Algorithm (Extended
 //! Version)*, 2014 (tier A); the safety argument for the election restriction is §5.4.
@@ -114,15 +120,49 @@ pub struct VoteReply {
   pub granted: bool,
 }
 
-/// One entry in the replicated log: the term the entry was created in (Raft's per-entry term, the basis
-/// of the log-matching property) and the opaque command it carries (for the configuration group, an
-/// encoded configuration change — the Raft core does not interpret it).
+/// A voter configuration (Raft §6): the base voter set and, during a membership change, the incoming
+/// set. A decision needs a majority of the base and — when `joint` is set — of the incoming set too.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoterConfig {
+  /// The base voter set.
+  pub voters: Vec<HostId>,
+  /// The incoming voter set while a joint membership change is in flight.
+  pub joint: Option<Vec<HostId>>,
+}
+
+/// One entry in the replicated log (Raft's per-entry term is the basis of the log-matching property).
+/// A normal entry carries an opaque `command` the state machine applies (for the configuration group, an
+/// encoded configuration change — the Raft core does not interpret it). A **configuration entry** instead
+/// carries a [`VoterConfig`] that changes the Raft voter set; it takes effect the moment it is appended
+/// (§6), so the Raft core reads it directly rather than through the state machine.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogEntry {
   /// The term in which the leader created this entry.
   pub term: u64,
-  /// The command to apply once the entry commits (opaque to the Raft core).
+  /// The command to apply once the entry commits (empty for a configuration entry).
   pub command: Vec<u8>,
+  /// The voter configuration this entry installs, when it is a configuration entry (Raft §6).
+  pub config: Option<VoterConfig>,
+}
+
+impl LogEntry {
+  /// A normal command entry.
+  pub fn command(term: u64, command: Vec<u8>) -> LogEntry {
+    LogEntry {
+      term,
+      command,
+      config: None,
+    }
+  }
+
+  /// A configuration entry installing `config` (Raft §6, take-effect-on-append).
+  pub fn configuration(term: u64, config: VoterConfig) -> LogEntry {
+    LogEntry {
+      term,
+      command: Vec::new(),
+      config: Some(config),
+    }
+  }
 }
 
 /// A leader's replication message (Raft `AppendEntries`): the leader's term, the log position it is
@@ -174,6 +214,9 @@ pub struct InstallSnapshot {
   pub last_included_index: u64,
   /// The term of that last included entry (checked against any entry the follower still holds there).
   pub last_included_term: u64,
+  /// The voter configuration in effect at the snapshot, so a follower that discards its log to install
+  /// the snapshot does not lose it (Raft §6 configurations live in the state, hence the snapshot).
+  pub config: VoterConfig,
   /// The state-machine state at the snapshot (opaque to the Raft core; the caller applies it).
   pub state: Vec<u8>,
 }
@@ -460,11 +503,28 @@ impl RaftNode {
   /// change is in flight (Raft §6). The leader sends votes and entries to all of them; a message's
   /// recipient is the connection, so duplicates in the union are harmless, but they are deduped here.
   pub fn all_voters(&self) -> Vec<HostId> {
-    let mut set: BTreeSet<HostId> = self.voters.iter().copied().collect();
-    if let Some(new) = &self.joint {
-      set.extend(new.iter().copied());
+    let config = self.effective_config();
+    let mut set: BTreeSet<HostId> = config.voters.into_iter().collect();
+    if let Some(new) = config.joint {
+      set.extend(new);
     }
     set.into_iter().collect()
+  }
+
+  /// The voter configuration in effect now: the most recent configuration entry in the log (a
+  /// configuration takes effect the moment it is appended, before it commits — Raft §6), or the base
+  /// configuration when the log holds none. A truncated configuration entry reverts the effective
+  /// configuration automatically, because it is derived from the log rather than stored.
+  fn effective_config(&self) -> VoterConfig {
+    for entry in self.log.iter().rev() {
+      if let Some(config) = &entry.config {
+        return config.clone();
+      }
+    }
+    VoterConfig {
+      voters: self.voters.clone(),
+      joint: self.joint.clone(),
+    }
   }
 
   /// Whether `granters` form a majority under the current configuration (the quorum intersection Raft's
@@ -473,12 +533,13 @@ impl RaftNode {
   fn is_majority(&self, granters: &BTreeSet<HostId>) -> bool {
     let carries =
       |set: &[HostId]| set.iter().filter(|voter| granters.contains(voter)).count() > set.len() / 2;
-    carries(&self.voters) && self.joint.as_ref().is_none_or(|new| carries(new))
+    let config = self.effective_config();
+    carries(&config.voters) && config.joint.as_ref().is_none_or(|new| carries(new))
   }
 
   /// Whether this node is in a joint configuration (a membership change is in flight).
   pub fn in_joint_configuration(&self) -> bool {
-    self.joint.is_some()
+    self.effective_config().joint.is_some()
   }
 
   /// Whether a candidate's last-log summary is at least as up-to-date as ours (Raft §5.4.1): a later
@@ -562,6 +623,17 @@ impl RaftNode {
     };
     let discard = usize::try_from(up_to - self.snapshot_index).unwrap_or(usize::MAX);
     let discard = discard.min(self.log.len());
+    // A configuration entry in the discarded prefix would take its voter set with it — fold the most
+    // recent one into the base configuration so the effective configuration is preserved. (A later
+    // configuration entry that survives the compaction still dominates it, being derived from the log.)
+    if let Some(config) = self.log[..discard]
+      .iter()
+      .rev()
+      .find_map(|entry| entry.config.clone())
+    {
+      self.voters = config.voters;
+      self.joint = config.joint;
+    }
     self.log.drain(0..discard);
     self.snapshot_index = up_to;
     self.snapshot_term = term;
@@ -585,6 +657,12 @@ impl RaftNode {
       leader: self.id,
       last_included_index: self.snapshot_index,
       last_included_term: self.snapshot_term,
+      // The configuration at the snapshot is the base — `compact` folded any discarded configuration
+      // entry into it, and no surviving log entry precedes the snapshot.
+      config: VoterConfig {
+        voters: self.voters.clone(),
+        joint: self.joint.clone(),
+      },
       state: self.snapshot_data.clone(),
     })
   }
@@ -621,6 +699,10 @@ impl RaftNode {
       self.snapshot_index = request.last_included_index;
       self.snapshot_term = request.last_included_term;
       self.snapshot_data = request.state;
+      // Adopt the configuration at the snapshot as the base, so the effective configuration is preserved
+      // now that the log entries that carried it are gone.
+      self.voters = request.config.voters;
+      self.joint = request.config.joint;
       self.commit_index = self.commit_index.max(request.last_included_index);
     }
     InstallSnapshotReply {
@@ -655,10 +737,7 @@ impl RaftNode {
     if self.role != Role::Leader {
       return false;
     }
-    self.log.push(LogEntry {
-      term: self.current_term,
-      command,
-    });
+    self.log.push(LogEntry::command(self.current_term, command));
     self.advance_leader_commit();
     true
   }
@@ -813,10 +892,20 @@ impl RaftNode {
   /// and revert on truncation — is the owed second half (§6, the safety subtlety that a config change
   /// takes effect on append, not on commit).
   pub fn begin_membership_change(&mut self, new_voters: Vec<HostId>) -> bool {
-    if self.role != Role::Leader || self.joint.is_some() {
+    let current = self.effective_config();
+    if self.role != Role::Leader || current.joint.is_some() {
       return false;
     }
-    self.joint = Some(new_voters);
+    // Append the joint configuration `C_old,new` as a log entry — it takes effect on append (§6), so the
+    // very next quorum check needs a majority of both sets. It replicates like any entry.
+    self.log.push(LogEntry::configuration(
+      self.current_term,
+      VoterConfig {
+        voters: current.voters,
+        joint: Some(new_voters),
+      },
+    ));
+    self.advance_leader_commit();
     true
   }
 
@@ -825,13 +914,23 @@ impl RaftNode {
   /// only once the joint configuration has itself committed (the caller's obligation until the change is
   /// log-driven). Returns whether it completed.
   pub fn complete_membership_change(&mut self) -> bool {
-    match self.joint.take() {
-      Some(new_voters) => {
-        self.voters = new_voters;
-        true
-      }
-      None => false,
+    let current = self.effective_config();
+    let Some(new_voters) = current.joint else {
+      return false;
+    };
+    if self.role != Role::Leader {
+      return false;
     }
+    // Append the final configuration `C_new` (§6): the change is done once this commits.
+    self.log.push(LogEntry::configuration(
+      self.current_term,
+      VoterConfig {
+        voters: new_voters,
+        joint: None,
+      },
+    ));
+    self.advance_leader_commit();
+    true
   }
 
   /// Truncates the log from the one-based `index` onward (removing that entry and every later one).
@@ -911,10 +1010,7 @@ mod tests {
     terms
       .iter()
       .enumerate()
-      .map(|(index, &term)| LogEntry {
-        term,
-        command: vec![u8::try_from(index).unwrap_or(u8::MAX)],
-      })
+      .map(|(index, &term)| LogEntry::command(term, vec![u8::try_from(index).unwrap_or(u8::MAX)]))
       .collect()
   }
 
@@ -1637,6 +1733,77 @@ mod tests {
       follower_c.last_log_index(),
       4,
       "C is caught up to the leader"
+    );
+  }
+
+  /// The log-integrated membership change (Raft §6): a configuration entry takes effect the moment it is
+  /// appended — the node is joint before the entry commits — and reverts when the entry is truncated,
+  /// because the effective configuration is derived from the log, not stored.
+  #[test]
+  fn a_configuration_takes_effect_on_append_and_reverts_on_truncation() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    assert!(!leader.in_joint_configuration());
+    leader.begin_membership_change(vec![C, D, E]);
+    assert!(
+      leader.in_joint_configuration(),
+      "the joint configuration takes effect on append, before it commits"
+    );
+
+    // A follower adopts the joint configuration when it receives the entry.
+    let mut follower = RaftNode::new(B, vec![A, B, C]);
+    let append = leader
+      .replicate_to(B)
+      .expect("append carrying the configuration entry");
+    follower.on_append_entries(append);
+    assert!(
+      follower.in_joint_configuration(),
+      "the follower adopts it on append"
+    );
+
+    // A conflicting entry at index 1 from a newer term truncates the configuration entry, reverting the
+    // configuration to the base.
+    let conflicting = AppendEntries {
+      term: follower.term() + 1,
+      leader: A,
+      prev_log_index: 0,
+      prev_log_term: 0,
+      entries: vec![LogEntry::command(follower.term() + 1, b"other".to_vec())],
+      leader_commit: 0,
+    };
+    let reply = follower.on_append_entries(conflicting);
+    assert!(reply.success);
+    assert!(
+      !follower.in_joint_configuration(),
+      "truncating the configuration entry reverts the configuration"
+    );
+  }
+
+  /// Compaction preserves the effective configuration: a configuration entry folded into the snapshot is
+  /// carried into the base, so the node stays in the joint configuration after its log is compacted.
+  #[test]
+  fn compaction_preserves_the_configuration() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    leader.begin_membership_change(vec![B, C, D]); // joint {A,B,C} ∪ {B,C,D} at index 1
+    assert!(leader.in_joint_configuration());
+
+    // Replicate the joint entry to B and C — a majority of both configurations — so it commits.
+    for id in [B, C] {
+      let mut follower = RaftNode::new(id, vec![A, B, C]);
+      let append = leader.replicate_to(id).expect("append");
+      let reply = follower.on_append_entries(append);
+      leader.on_append_reply(reply);
+    }
+    assert_eq!(
+      leader.commit_index(),
+      1,
+      "the joint configuration entry commits"
+    );
+
+    // Compact past it; the joint configuration survives in the base.
+    assert!(leader.compact(1, b"state".to_vec()));
+    assert!(
+      leader.in_joint_configuration(),
+      "the configuration folded into the snapshot is preserved"
     );
   }
 }
