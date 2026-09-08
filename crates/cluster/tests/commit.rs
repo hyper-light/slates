@@ -11,8 +11,12 @@ use std::sync::mpsc::{Receiver, channel};
 
 use rustix::net::{Ipv4Addr, SocketAddrV4};
 use rustls::pki_types::PrivateKeyDer;
-use slates_cluster::{ClusterError, CommitBudget, commit_record, serve_record};
-use slates_db::register::{Acceptor, Authority, HostEpoch, HostId, Placement, Quorum, Record};
+use slates_cluster::{
+  ClusterError, CommitBudget, commit_record, commit_under_configuration, serve_record,
+};
+use slates_db::register::{
+  Acceptor, Authority, Configuration, HostEpoch, HostId, Placement, Quorum, Record,
+};
 use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::SimRuntime;
 use slates_rt::udp::UdpSocket;
@@ -229,6 +233,50 @@ fn f0_commits_locally_with_no_dispatch() {
     "f=0 is placed at one: {placement:?}"
   );
   assert_eq!(placement.acked, vec![OWNER], "only the owner holds at f=0");
+}
+
+/// AC (§4.8): a commit driven **through the configuration interface** derives the quorum, candidates
+/// and owner from a validated `Configuration` — here the solo (`f = 0`) configuration, which places on
+/// the owner's local hold with no dispatch. The commit consumes one validated snapshot, not loose
+/// parameters (SWIM/the configuration group will publish it; owed).
+#[test]
+fn a_commit_under_a_solo_configuration_places_locally() {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+  let (tx, rx) = channel();
+  sim
+    .spawn_on(id, async move {
+      let configuration = Configuration::solo(OWNER);
+      let mut owner_acceptor = Acceptor::new(
+        OWNER,
+        Authority {
+          generation: configuration.version,
+          owner: configuration.owner,
+        },
+      );
+      let committed = commit_under_configuration(
+        &configuration,
+        &record(b"head@v1"),
+        &mut owner_acceptor,
+        Vec::new(),
+        CommitBudget {
+          deadline_ns: DEADLINE_NS,
+          poll_interval_ns: POLL_NS,
+        },
+      )
+      .await;
+      let placed = committed
+        .outcome
+        .map(|p| p.placed(configuration.quorum))
+        .unwrap_or(false);
+      let _ = tx.send(placed);
+    })
+    .unwrap();
+  sim.run_until_idle();
+  assert!(
+    rx.try_recv().unwrap(),
+    "a solo-configuration commit places on the local hold"
+  );
 }
 
 /// AC (acceptance history 1): with `f = 1` and both remote holders serving, the owner's local hold plus

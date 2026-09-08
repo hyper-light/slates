@@ -23,7 +23,9 @@
 
 use std::sync::mpsc::{TryRecvError, channel};
 
-use slates_db::register::{Acceptor, Ack, HostId, Placement, Quorum, Record};
+use slates_db::register::{
+  Acceptor, Ack, Configuration, HostId, Placement, Quorum, Record, candidates_for,
+};
 use slates_rt::error::RtError;
 use slates_rt::futures::{cancel, sleep, spawn_child};
 use slates_transport::endpoint::Endpoint;
@@ -272,6 +274,39 @@ pub async fn commit_record(
     Err(ClusterError::NotPlaced { placement })
   };
   Committed { outcome, reusable }
+}
+
+/// Commits `record` using a validated [`Configuration`] as the authority interface (§4.8 "epoch
+/// allocation derives from configuration authority") — the caller consumes one validated snapshot
+/// rather than loose parameters. The quorum, the candidate holders (rendezvous over the
+/// configuration's neighbourhood for the record's object), and the owner all come from it; the
+/// per-holder authority (generation = the configuration's version, and the owner) is what the
+/// `owner_acceptor` and each remote holder's acceptor already enforce, so a record inconsistent with
+/// the configuration fails acceptance and gathers no quorum. This is where SWIM/Lifeguard membership
+/// and the configuration group (owed) will publish the [`Configuration`] this reads.
+pub async fn commit_under_configuration(
+  configuration: &Configuration,
+  record: &Record,
+  owner_acceptor: &mut Acceptor,
+  remote_holders: Vec<(HostId, Endpoint)>,
+  budget: CommitBudget,
+) -> Committed {
+  let candidates = candidates_for(
+    configuration.owner,
+    &configuration.neighbourhood,
+    record.object,
+    configuration.quorum,
+  );
+  commit_record(
+    configuration.owner,
+    owner_acceptor,
+    &candidates,
+    record,
+    configuration.quorum,
+    remote_holders,
+    budget,
+  )
+  .await
 }
 
 /// The [`Committed`] returned when a dispatch task could not be spawned: the runtime error, the tasks
