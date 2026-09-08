@@ -419,6 +419,194 @@ impl Ack {
   }
 }
 
+/// The highest record a holder has accepted for one object (§4.8 "reports the highest record it holds
+/// for each object"): the ledger position, the epoch it was accepted under, and the value. A holder
+/// reports this in its [`Promise`] so the new owner can adopt the newest across a quorum. Ordered by
+/// position then epoch, so the *newest* record is the maximum — a later write has a higher `sequence`,
+/// and a re-commit of the same head under a newer epoch has a higher `epoch` at the same `sequence`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Accepted {
+  /// The ledger position (the head's `sequence`; a committed position is never rewritten differently).
+  pub sequence: u64,
+  /// The epoch this value was accepted under.
+  pub epoch: HostEpoch,
+  /// The accepted value bytes (opaque to the register protocol).
+  pub value: Vec<u8>,
+}
+
+impl Accepted {
+  /// Whether `self` is a newer record than `other`: a higher position, or the same position under a
+  /// higher epoch. The adoption order of phase one — the new owner keeps the newest reported record.
+  fn newer_than(&self, other: &Accepted) -> bool {
+    (self.sequence, self.epoch.0) > (other.sequence, other.epoch.0)
+  }
+}
+
+/// The new owner's phase-one message when it takes over an object (§4.8 "Promotion and takeover": "each
+/// new owner runs phase one in one batched round … every holder raises its fence for that host to the
+/// new epoch"). It names the object, the new owner running the promotion, the bumped `epoch` it will
+/// serve under, and the takeover configuration `generation`. A holder that has installed that
+/// generation raises its fence to `epoch` and reports its highest [`Accepted`] record for the object;
+/// a holder still under the old generation, or already fenced above `epoch` by a newer takeover,
+/// refuses. Rides the session plane's RPC (fleet-transport.md §8); the register protocol stays sans-io.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Prepare {
+  /// The new owner (the surviving candidate the configuration named) running phase one.
+  pub owner: HostId,
+  /// The object being taken over.
+  pub object: u64,
+  /// The new (bumped) epoch the new owner will serve under — the ballot the holder promises.
+  pub epoch: HostEpoch,
+  /// The configuration generation the takeover is under; a holder under a different one refuses.
+  pub generation: u64,
+}
+
+/// A prepare's fixed wire size.
+/// Format: four u64 header words — owner, object, epoch, generation, little-endian.
+const PREPARE_BYTES: usize = 4 * size_of::<u64>();
+
+impl Prepare {
+  /// The canonical bytes: owner, object, epoch, generation, each little-endian.
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PREPARE_BYTES);
+    out.extend_from_slice(&self.owner.0.to_le_bytes());
+    out.extend_from_slice(&self.object.to_le_bytes());
+    out.extend_from_slice(&self.epoch.0.to_le_bytes());
+    out.extend_from_slice(&self.generation.to_le_bytes());
+    out
+  }
+
+  /// Reconstructs a prepare from its bytes, or a typed [`RegisterError::MalformedRecord`] if they are
+  /// the wrong length (a message that crossed the network — hostile input).
+  pub fn decode(bytes: &[u8]) -> Result<Prepare, RegisterError> {
+    if bytes.len() != PREPARE_BYTES {
+      return Err(RegisterError::MalformedRecord);
+    }
+    let word = |slice: &[u8]| u64::from_le_bytes(slice.try_into().unwrap_or([0; 8]));
+    let (owner_bytes, rest) = bytes.split_at(size_of::<u64>());
+    let (object_bytes, rest) = rest.split_at(size_of::<u64>());
+    let (epoch_bytes, generation_bytes) = rest.split_at(size_of::<u64>());
+    Ok(Prepare {
+      owner: HostId(word(owner_bytes)),
+      object: word(object_bytes),
+      epoch: HostEpoch(word(epoch_bytes)),
+      generation: word(generation_bytes),
+    })
+  }
+}
+
+/// A holder's reply to a [`Prepare`] (§4.8 "reports the highest record it holds for each object"): the
+/// promising holder, the object, the epoch it promised (echoing the prepare so the reply binds to it),
+/// the generation, and the highest [`Accepted`] record it holds for the object — or `None` if it holds
+/// nothing. The new owner counts a promise toward its phase-one quorum only if it [`binds`](Promise::binds)
+/// to the prepare and comes from a distinct candidate, so a fenced, foreign or wrong-object reply
+/// cannot manufacture a promotion quorum (the same discipline `commit_over_holders` uses for records).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Promise {
+  /// The holder that raised its fence and reports its highest record.
+  pub holder: HostId,
+  /// The object the promise is for.
+  pub object: u64,
+  /// The epoch the holder promised (echoes the prepare's epoch).
+  pub epoch: HostEpoch,
+  /// The generation the holder is serving under.
+  pub generation: u64,
+  /// The holder's highest accepted record for the object, or `None` if it holds nothing for it.
+  pub highest: Option<Accepted>,
+}
+
+/// A promise's fixed prefix: holder, object, epoch, generation (each u64 LE), then a one-byte flag
+/// (whether a highest record follows); a present record adds its sequence and epoch (u64 LE), its
+/// value length (u32 LE) and the value bytes.
+/// Format: §4.8 promise layout; a record is MTU-shippable, so the value length is a `u32`.
+const PROMISE_PREFIX_BYTES: usize = 4 * size_of::<u64>() + 1;
+/// Format: the promise flag values — no highest record, or one follows.
+const PROMISE_NONE: u8 = 0;
+/// Format: a highest record follows the flag.
+const PROMISE_SOME: u8 = 1;
+
+impl Promise {
+  /// Whether this promise answers `prepare` — the object, epoch and generation all match, so a reply
+  /// for a different prepare (object, epoch or generation) cannot be counted for this one.
+  pub fn binds(&self, prepare: &Prepare) -> bool {
+    self.object == prepare.object
+      && self.epoch == prepare.epoch
+      && self.generation == prepare.generation
+  }
+
+  /// The canonical bytes: the header words, the highest-record flag, then the record if present.
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::with_capacity(PROMISE_PREFIX_BYTES);
+    out.extend_from_slice(&self.holder.0.to_le_bytes());
+    out.extend_from_slice(&self.object.to_le_bytes());
+    out.extend_from_slice(&self.epoch.0.to_le_bytes());
+    out.extend_from_slice(&self.generation.to_le_bytes());
+    match &self.highest {
+      None => out.push(PROMISE_NONE),
+      Some(accepted) => {
+        out.push(PROMISE_SOME);
+        out.extend_from_slice(&accepted.sequence.to_le_bytes());
+        out.extend_from_slice(&accepted.epoch.0.to_le_bytes());
+        let value_len = u32::try_from(accepted.value.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&value_len.to_le_bytes());
+        out.extend_from_slice(&accepted.value);
+      }
+    }
+    out
+  }
+
+  /// Reconstructs a promise from its bytes, checking every length against what remains before reading,
+  /// so a truncated or over-claiming promise is a typed [`RegisterError::MalformedRecord`], never a
+  /// panic or an over-read (the hostile-input rule; this parses bytes that crossed the network).
+  pub fn decode(bytes: &[u8]) -> Result<Promise, RegisterError> {
+    if bytes.len() < PROMISE_PREFIX_BYTES {
+      return Err(RegisterError::MalformedRecord);
+    }
+    let word = |slice: &[u8]| u64::from_le_bytes(slice.try_into().unwrap_or([0; 8]));
+    let (holder_bytes, rest) = bytes.split_at(size_of::<u64>());
+    let (object_bytes, rest) = rest.split_at(size_of::<u64>());
+    let (epoch_bytes, rest) = rest.split_at(size_of::<u64>());
+    let (generation_bytes, rest) = rest.split_at(size_of::<u64>());
+    let (&flag, rest) = rest.split_first().unwrap_or((&PROMISE_NONE, &[]));
+    let highest = match flag {
+      PROMISE_NONE => {
+        if !rest.is_empty() {
+          return Err(RegisterError::MalformedRecord);
+        }
+        None
+      }
+      PROMISE_SOME => {
+        // A present record needs its sequence and epoch (two u64) and a u32 value length.
+        let fixed = 2 * size_of::<u64>() + size_of::<u32>();
+        if rest.len() < fixed {
+          return Err(RegisterError::MalformedRecord);
+        }
+        let (sequence_bytes, rest) = rest.split_at(size_of::<u64>());
+        let (accepted_epoch_bytes, rest) = rest.split_at(size_of::<u64>());
+        let (len_bytes, value_bytes) = rest.split_at(size_of::<u32>());
+        let value_len = u32::from_le_bytes(len_bytes.try_into().unwrap_or([0; 4]));
+        let value_len = usize::try_from(value_len).unwrap_or(usize::MAX);
+        if value_bytes.len() != value_len {
+          return Err(RegisterError::MalformedRecord);
+        }
+        Some(Accepted {
+          sequence: word(sequence_bytes),
+          epoch: HostEpoch(word(accepted_epoch_bytes)),
+          value: value_bytes.to_vec(),
+        })
+      }
+      _ => return Err(RegisterError::MalformedRecord),
+    };
+    Ok(Promise {
+      holder: HostId(word(holder_bytes)),
+      object: word(object_bytes),
+      epoch: HostEpoch(word(epoch_bytes)),
+      generation: word(generation_bytes),
+      highest,
+    })
+  }
+}
+
 /// The per-position acceptor a holder runs (§4.8 "distinguish a holder's promised epoch from its
 /// accepted `(epoch, value)`"): the holder's id and authority, the highest epoch it has promised (the
 /// fence), and the value it has accepted at each ledger position. Acceptance is synchronous and
@@ -515,6 +703,68 @@ impl Acceptor {
       identity: record.identity(),
     })
   }
+
+  /// Installs a new configuration authority — the holder applying the configuration update the regional
+  /// group distributed on a takeover or reconfiguration (§4.8 "the configuration is written only through
+  /// the regional group, read by every node from its local copy"). A generation below the holder's
+  /// current one is a stale configuration and is refused ([`RegisterError::ForeignGeneration`]); the
+  /// current or a newer one is adopted, so the new owner becomes the sole authorized writer and the old
+  /// owner is fenced by generation (its records are now [`Unauthorized`](RegisterError::Unauthorized)).
+  /// The accepted records are kept — they are exactly the state phase one reads — only the authority
+  /// changes; the epoch fence is raised separately, by the [`prepare`](Acceptor::prepare) round.
+  pub fn install_authority(&mut self, authority: Authority) -> Result<(), RegisterError> {
+    if authority.generation < self.authority.generation {
+      return Err(RegisterError::ForeignGeneration {
+        current: self.authority.generation,
+      });
+    }
+    self.authority = authority;
+    Ok(())
+  }
+
+  /// Answers a new owner's phase-one [`Prepare`] (§4.8 "Promotion and takeover"): raises this holder's
+  /// fence for the object's host to the prepare's epoch and reports the highest record it holds for the
+  /// object, so the new owner can adopt the newest across a quorum before it serves. The checks mirror
+  /// [`accept`](Acceptor::accept): a prepare under a generation the holder has not installed is
+  /// [`ForeignGeneration`](RegisterError::ForeignGeneration); one from a principal the installed
+  /// authority does not name as owner is [`Unauthorized`](RegisterError::Unauthorized); an epoch below
+  /// the fence (a newer takeover already promised higher) is [`StaleEpoch`](RegisterError::StaleEpoch).
+  /// On success the fence is raised **before** the promise is returned, so a resumed stale owner writing
+  /// under the old epoch can no longer commit (`StaleNeverCommits`). The reported record is the highest
+  /// by position then epoch, which is at least as new as anything that ever committed under the old
+  /// epoch, because a phase-one quorum and every phase-two commit quorum are both `f + 1` of `2f + 1`
+  /// and so intersect.
+  pub fn prepare(&mut self, prepare: &Prepare) -> Result<Promise, RegisterError> {
+    if prepare.generation != self.authority.generation {
+      return Err(RegisterError::ForeignGeneration {
+        current: self.authority.generation,
+      });
+    }
+    if prepare.owner != self.authority.owner {
+      return Err(RegisterError::Unauthorized);
+    }
+    self.fence.accept(prepare.epoch)?;
+    let highest = self
+      .accepted
+      .iter()
+      .filter_map(|(position, stored)| {
+        let &(object, sequence) = position;
+        let (epoch, value) = stored;
+        (object == prepare.object).then(|| Accepted {
+          sequence,
+          epoch: *epoch,
+          value: value.clone(),
+        })
+      })
+      .reduce(|best, next| if next.newer_than(&best) { next } else { best });
+    Ok(Promise {
+      holder: self.id,
+      object: prepare.object,
+      epoch: prepare.epoch,
+      generation: self.authority.generation,
+      highest,
+    })
+  }
 }
 
 /// A candidate holder of an object's records (§4.8 "2f+1 candidate holders, the owner among them"). A
@@ -561,6 +811,96 @@ pub fn commit_over_holders(
     acked,
     mirror_acked: None,
   }
+}
+
+/// A candidate holder answering a new owner's phase-one [`Prepare`] (§4.8 "Promotion and takeover").
+/// The seam the transport plugs a remote holder into for the promotion round (the cluster plane); the
+/// owner's own hold is local. `promise` raises the holder's fence and reports its highest record, or
+/// refuses (a foreign generation, an unauthorized owner, a stale epoch) — a refusal is not a promise
+/// and is not counted toward the promotion quorum. Every [`Acceptor`] is a promoter.
+pub trait Promoter {
+  /// Answers `prepare`, returning this holder's [`Promise`] if it accepts the promotion (installed
+  /// generation, authorized new owner, epoch at or above its fence) or a typed refusal.
+  fn promise(&mut self, prepare: &Prepare) -> Result<Promise, RegisterError>;
+}
+
+impl Promoter for Acceptor {
+  fn promise(&mut self, prepare: &Prepare) -> Result<Promise, RegisterError> {
+    self.prepare(prepare)
+  }
+}
+
+/// The result of a phase-one promotion round (§4.8 "Promotion and takeover"): the distinct candidates
+/// that promised, and the newest record adopted across them. The promotion is safe to serve only when
+/// [`promised`](Promotion::promised) is a quorum (`f + 1` distinct candidates); [`adopted`](Promotion::adopted)
+/// is then at least as new as anything that ever committed under the old epoch. `adopted` is `None`
+/// when no promising holder held a record for the object — the object had no committed head to inherit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Promotion {
+  /// The distinct candidates that raised their fence and promised (counted once each).
+  pub promised: Vec<HostId>,
+  /// The newest record adopted across the promising quorum, or `None` if none held one.
+  pub adopted: Option<Accepted>,
+}
+
+impl Promotion {
+  /// Whether a quorum of distinct candidates promised, so the adoption is safe to serve under the new
+  /// epoch (`f + 1` promises intersect every prior `f + 1` commit, so `adopted` covers the committed
+  /// prefix). Below a quorum the new owner must retry against more holders before serving.
+  pub fn promoted(&self, quorum: Quorum) -> bool {
+    quorum.committed(self.promised.len())
+  }
+
+  /// The record the new owner re-commits to complete safe adoption (§4.8 "completes safe adoption under
+  /// the new epoch"): the adopted value at its position, re-stamped with the new owner, the prepare's
+  /// epoch and generation, so a phase-two [`commit_over_holders`] records the new epoch even though the
+  /// bytes are unchanged (BUG-12) and fences anything older. `None` when there was nothing to adopt.
+  pub fn adoption_record(&self, prepare: &Prepare) -> Option<Record> {
+    self.adopted.as_ref().map(|accepted| Record {
+      owner: prepare.owner,
+      object: prepare.object,
+      sequence: accepted.sequence,
+      epoch: prepare.epoch,
+      generation: prepare.generation,
+      value: accepted.value.clone(),
+    })
+  }
+}
+
+/// Runs a new owner's phase-one round: sends `prepare` to the `candidates`' `holders` (the owner's own
+/// hold among them) and returns the [`Promotion`] — the distinct candidates that promised and the
+/// newest record adopted across them (§4.8 "each new owner runs phase one in one batched round … adopts
+/// the newest reported record per object"). A promise is counted only if it **binds** to the prepare
+/// (object, epoch and generation), comes from an actual candidate, and is not a duplicate — so a fenced,
+/// foreign or wrong-object reply cannot manufacture a promotion quorum, the same discipline
+/// [`commit_over_holders`] applies to acknowledgements. At `f = 0` there is one holder, the owner, and
+/// its own highest record is the adoption — the same code path (R8).
+pub fn promote_over_holders(
+  candidates: &[HostId],
+  prepare: &Prepare,
+  holders: &mut [&mut dyn Promoter],
+) -> Promotion {
+  let mut promised: Vec<HostId> = Vec::new();
+  let mut adopted: Option<Accepted> = None;
+  for holder in holders.iter_mut() {
+    if let Ok(promise) = holder.promise(prepare)
+      && promise.binds(prepare)
+      && candidates.contains(&promise.holder)
+      && !promised.contains(&promise.holder)
+    {
+      promised.push(promise.holder);
+      if let Some(reported) = promise.highest {
+        let keep = match &adopted {
+          Some(best) => reported.newer_than(best),
+          None => true,
+        };
+        if keep {
+          adopted = Some(reported);
+        }
+      }
+    }
+  }
+  Promotion { promised, adopted }
 }
 
 /// The configuration oracle (§4.8 "Configuration, by consensus"): membership, the fault
@@ -1071,6 +1411,301 @@ mod tests {
     assert!(
       winners.len() > 1,
       "the successor spreads over more than one survivor"
+    );
+  }
+
+  /// The object a takeover test promotes. A committed head "v1" lives at sequence 0, epoch 1,
+  /// generation 0, under the original owner D on candidates {D, H2, H3} at f=1, held by the commit
+  /// quorum {D, H2}; H3 lags (it never received the head), so a promotion must recover the head from
+  /// the quorum, not assume every candidate has it.
+  const TAKEOVER_OBJECT: u64 = 9;
+
+  /// Builds the committed-head state a takeover inherits: the original owner D and the two candidate
+  /// holders, with the head "v1" committed to {D, H2} under epoch 1, generation 0. Returns
+  /// `(owner D, holder H2, holder H3)` and the candidate set.
+  fn committed_head() -> (Acceptor, Acceptor, Acceptor, Vec<HostId>) {
+    let d = HostId(1);
+    let h2 = HostId(2);
+    let h3 = HostId(3);
+    let authority = Authority {
+      generation: 0,
+      owner: d,
+    };
+    let candidates = vec![d, h2, h3];
+    let mut owner = Acceptor::new(d, authority);
+    let mut holder2 = Acceptor::new(h2, authority);
+    let holder3 = Acceptor::new(h3, authority);
+    let head = Record {
+      owner: d,
+      object: TAKEOVER_OBJECT,
+      sequence: 0,
+      epoch: HostEpoch(1),
+      generation: 0,
+      value: b"v1".to_vec(),
+    };
+    owner.accept(&head).expect("the owner accepts its own head");
+    holder2.accept(&head).expect("H2 accepts the head (the commit quorum)");
+    // H3 never received the head — a lagging candidate the promotion must tolerate.
+    (owner, holder2, holder3, candidates)
+  }
+
+  /// A [`Prepare`] and a [`Promise`] round-trip through their wire encoding unchanged (both a promise
+  /// carrying a highest record and one carrying none), and a truncated or mis-flagged message decodes
+  /// to a typed refusal, never a panic (hostile input crossing the network).
+  #[test]
+  fn prepare_and_promise_round_trip_and_refuse_hostile_bytes() {
+    let prepare = Prepare {
+      owner: HostId(7),
+      object: 0x1234,
+      epoch: HostEpoch(3),
+      generation: 2,
+    };
+    assert_eq!(
+      Prepare::decode(&prepare.encode()),
+      Ok(prepare),
+      "a prepare round-trips"
+    );
+    assert_eq!(
+      Prepare::decode(&[0u8; 3]),
+      Err(RegisterError::MalformedRecord),
+      "a wrong-length prepare is refused"
+    );
+
+    let with_record = Promise {
+      holder: HostId(2),
+      object: 0x1234,
+      epoch: HostEpoch(3),
+      generation: 2,
+      highest: Some(Accepted {
+        sequence: 5,
+        epoch: HostEpoch(2),
+        value: b"head".to_vec(),
+      }),
+    };
+    let without = Promise {
+      highest: None,
+      ..with_record.clone()
+    };
+    assert_eq!(
+      Promise::decode(&with_record.encode()),
+      Ok(with_record.clone()),
+      "a promise with a highest record round-trips"
+    );
+    assert_eq!(
+      Promise::decode(&without.encode()),
+      Ok(without),
+      "a promise with no record round-trips"
+    );
+
+    // A promise that flags a record present but carries none is refused, not read past its end.
+    let mut truncated = with_record.encode();
+    truncated.truncate(PROMISE_PREFIX_BYTES);
+    truncated
+      .last_mut()
+      .map(|flag| *flag = PROMISE_SOME)
+      .expect("a flag byte");
+    assert_eq!(
+      Promise::decode(&truncated),
+      Err(RegisterError::MalformedRecord),
+      "a present-flag with no record is refused"
+    );
+    // An unknown flag is refused.
+    let mut bad_flag = with_record.encode();
+    bad_flag[PROMISE_PREFIX_BYTES - 1] = 0xff;
+    assert_eq!(
+      Promise::decode(&bad_flag),
+      Err(RegisterError::MalformedRecord),
+      "an unknown flag is refused"
+    );
+  }
+
+  /// AC (§4.8 "Promotion and takeover", Continuity): a new owner running phase one over a quorum
+  /// adopts the head that committed under the old epoch — even from a quorum where one candidate lagged
+  /// — and re-commits it under the new epoch, so the head survives the takeover. Do a takeover of a
+  /// committed head; expect the head is adopted and holds under the new epoch.
+  #[test]
+  fn a_takeover_adopts_the_committed_head_under_the_new_epoch() {
+    let (mut owner, mut holder2, mut holder3, candidates) = committed_head();
+    let survivors: Vec<HostId> = candidates.iter().copied().filter(|h| *h != owner.id).collect();
+    let successor = rendezvous_first(&survivors, TAKEOVER_OBJECT).expect("a survivor takes over");
+    let new_authority = Authority {
+      generation: 1,
+      owner: successor,
+    };
+
+    // The configuration group distributed the new authority (generation 1, owner = the successor);
+    // the surviving holders install it, fencing the old owner by generation.
+    holder2.install_authority(new_authority).expect("H2 installs");
+    holder3.install_authority(new_authority).expect("H3 installs");
+
+    // The successor runs phase one at the bumped epoch 2 over the two survivors (the dead owner is
+    // unreachable), promising each and adopting the newest reported record.
+    let prepare = Prepare {
+      owner: successor,
+      object: TAKEOVER_OBJECT,
+      epoch: HostEpoch(2),
+      generation: 1,
+    };
+    let quorum = Quorum { f: 1 };
+    let promotion = {
+      let mut holders: Vec<&mut dyn Promoter> = vec![&mut holder2, &mut holder3];
+      promote_over_holders(&candidates, &prepare, &mut holders)
+    };
+    assert!(
+      promotion.promoted(quorum),
+      "two survivors promised — a quorum at f=1"
+    );
+    assert_eq!(
+      promotion.adopted,
+      Some(Accepted {
+        sequence: 0,
+        epoch: HostEpoch(1),
+        value: b"v1".to_vec(),
+      }),
+      "the committed head is adopted, recovered from the one survivor that held it"
+    );
+
+    // The successor completes safe adoption: it re-commits the adopted head under the new epoch.
+    let adoption = promotion
+      .adoption_record(&prepare)
+      .expect("there is a head to adopt");
+    let placement = {
+      let mut holders: Vec<&mut dyn Holder> = vec![&mut holder2, &mut holder3];
+      commit_over_holders(&candidates, &adoption, &mut holders)
+    };
+    assert!(
+      placement.placed(quorum),
+      "the re-committed head places under the new epoch"
+    );
+    // The head survived: both survivors now hold "v1" at the new epoch (H3, which lagged, caught up).
+    let (_, h2_state) = holder2.persisted();
+    let (_, h3_state) = holder3.persisted();
+    for state in [h2_state, h3_state] {
+      assert_eq!(
+        state,
+        vec![(TAKEOVER_OBJECT, 0u64, HostEpoch(2), b"v1".to_vec())],
+        "the head holds at the new epoch"
+      );
+    }
+    // Keep the original owner referenced (it is the dead host; unused after the takeover).
+    let _ = &mut owner;
+  }
+
+  /// AC (§4.8 "Promotion and takeover", StaleNeverCommits): after a takeover raised the holders' fence,
+  /// a resumed stale owner cannot commit — its records are refused and it reaches no quorum, and a write
+  /// under the current authority but an epoch below the fence is refused `StaleEpoch`. Take over a head,
+  /// then have the old owner resume and try to advance it; expect no placement.
+  #[test]
+  fn a_stale_owner_cannot_commit_after_a_takeover() {
+    let (owner, mut holder2, mut holder3, candidates) = committed_head();
+    let survivors: Vec<HostId> = candidates.iter().copied().filter(|h| *h != owner.id).collect();
+    let successor = rendezvous_first(&survivors, TAKEOVER_OBJECT).expect("a survivor takes over");
+    let new_authority = Authority {
+      generation: 1,
+      owner: successor,
+    };
+    holder2.install_authority(new_authority).expect("H2 installs");
+    holder3.install_authority(new_authority).expect("H3 installs");
+    let prepare = Prepare {
+      owner: successor,
+      object: TAKEOVER_OBJECT,
+      epoch: HostEpoch(2),
+      generation: 1,
+    };
+    {
+      let mut holders: Vec<&mut dyn Promoter> = vec![&mut holder2, &mut holder3];
+      promote_over_holders(&candidates, &prepare, &mut holders);
+    }
+
+    // The old owner D resumes, unaware it was taken over, and tries to advance the head at its old
+    // epoch and generation. Every holder that installed the new authority refuses (the generation
+    // moved on), so D reaches no quorum.
+    let stale = Record {
+      owner: owner.id,
+      object: TAKEOVER_OBJECT,
+      sequence: 1,
+      epoch: HostEpoch(1),
+      generation: 0,
+      value: b"v2-stale".to_vec(),
+    };
+    let placement = {
+      let mut holders: Vec<&mut dyn Holder> = vec![&mut holder2, &mut holder3];
+      commit_over_holders(&candidates, &stale, &mut holders)
+    };
+    assert!(
+      placement.acked.is_empty(),
+      "no holder accepts the stale owner's write"
+    );
+    assert!(!placement.placed(Quorum { f: 1 }), "the stale owner does not commit");
+
+    // Even a write under the *current* authority but an epoch below the fence is refused StaleEpoch —
+    // the fence itself, raised by the promotion, is what stops it.
+    let stale_epoch = Record {
+      owner: successor,
+      object: TAKEOVER_OBJECT,
+      sequence: 1,
+      epoch: HostEpoch(1),
+      generation: 1,
+      value: b"v2".to_vec(),
+    };
+    assert_eq!(
+      holder2.accept(&stale_epoch),
+      Err(RegisterError::StaleEpoch { current: 2 }),
+      "an epoch below the raised fence is refused"
+    );
+  }
+
+  /// AC (§4.8 phase one): a promotion below a quorum of promises does not promote (the new owner must
+  /// not serve on it), and a forged or non-candidate promise cannot manufacture the quorum. Prepare
+  /// over one real survivor plus a lying holder; expect no promotion.
+  #[test]
+  fn a_promotion_below_quorum_does_not_promote() {
+    let (_owner, mut holder2, _holder3, candidates) = committed_head();
+    let successor = HostId(2);
+    holder2
+      .install_authority(Authority {
+        generation: 1,
+        owner: successor,
+      })
+      .expect("install");
+    let prepare = Prepare {
+      owner: successor,
+      object: TAKEOVER_OBJECT,
+      epoch: HostEpoch(2),
+      generation: 1,
+    };
+
+    // A holder that returns a forged promise for a non-candidate id, to pad the count.
+    struct LyingPromoter {
+      reply: Promise,
+    }
+    impl Promoter for LyingPromoter {
+      fn promise(&mut self, _prepare: &Prepare) -> Result<Promise, RegisterError> {
+        Ok(self.reply.clone())
+      }
+    }
+    let mut liar = LyingPromoter {
+      reply: Promise {
+        holder: HostId(99),
+        object: TAKEOVER_OBJECT,
+        epoch: HostEpoch(2),
+        generation: 1,
+        highest: None,
+      },
+    };
+
+    let promotion = {
+      let mut holders: Vec<&mut dyn Promoter> = vec![&mut holder2, &mut liar];
+      promote_over_holders(&candidates, &prepare, &mut holders)
+    };
+    assert_eq!(
+      promotion.promised,
+      vec![successor],
+      "only the real candidate promised; the non-candidate forgery is not counted"
+    );
+    assert!(
+      !promotion.promoted(Quorum { f: 1 }),
+      "one promise is not a quorum at f=1 — the new owner must not serve yet"
     );
   }
 }
