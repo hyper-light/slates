@@ -12,10 +12,16 @@
 //! bumping the version so a request under the stale version is refused (`ConfigurationStale`). The same
 //! interface will carry a fleet proposal through consensus, changing no caller (R8).
 //!
-//! Owed with the consensus: host-epoch advance on takeover (per-host epochs, not just the owner's),
-//! the home/mirror moves, and the fenced replication of the configuration log across the voters.
+//! Built here: the neighbourhood reconcile (above) and **takeover** ([`ConfigGroup::take_over`]) — when
+//! SWIM declares the owner dead, the group reassigns the volume to the rendezvous-first survivor, bumps
+//! the host epoch, and advances the generation, so a resumed stale owner is fenced (by the advanced
+//! configuration generation in this single-generation model — `ConfigurationStale`/`ForeignGeneration`).
+//! Owed with the consensus: the per-host epoch fence of the design's `FencedRegister` (A-9), the new
+//! owner's phase-one recovery (reading the dead owner's highest records from the holders and adopting
+//! the head before serving), the home/mirror moves, and the fenced replication of the configuration log
+//! across the voters.
 
-use slates_db::register::{Configuration, HostId};
+use slates_db::register::{Configuration, HostEpoch, HostId, rendezvous_first};
 
 use crate::membership::Membership;
 
@@ -27,6 +33,21 @@ pub enum Reconfiguration {
   Admit(HostId),
   /// Retire a member from the neighbourhood (a death the membership view confirmed).
   Retire(HostId),
+}
+
+/// A refusal to take over a dead owner's volume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TakeoverError {
+  /// The host being taken over is not the volume's current owner — a non-owner death is a neighbourhood
+  /// [`Retire`](Reconfiguration::Retire), not a takeover.
+  NotOwner {
+    /// The current owner (the one a takeover would have to name).
+    owner: HostId,
+  },
+  /// No survivor remains in the neighbourhood to take the volume — every candidate is gone. The volume
+  /// is unrecoverable from this configuration (the correlated-loss case the neighbourhood bound makes
+  /// rare); the caller reports the loss rather than inventing an owner.
+  NoSurvivor,
 }
 
 /// The configuration group on one node: the current [`Configuration`] it serves. At `f = 0` it is the
@@ -112,6 +133,44 @@ impl ConfigGroup {
     }
     changed
   }
+
+  /// Takes over the volume from a dead owner (§4.8 "Promotion and takeover"): SWIM has declared the
+  /// current owner `dead`, so the group assigns the volume to the survivor of the neighbourhood that
+  /// rendezvous ranks first for `object`, **bumps the host epoch** (the successor serves under the new
+  /// epoch), drops the dead owner from the neighbourhood, and advances the version. Returns the new
+  /// configuration, or a [`TakeoverError`] if the named host is not the owner or no survivor remains.
+  ///
+  /// In this single-generation model a resumed stale owner is fenced by the advanced generation: it
+  /// still holds the old configuration, so its request is refused `ConfigurationStale`, and a record it
+  /// ships to a holder now serving the new generation is refused `ForeignGeneration`/`Unauthorized`. The
+  /// design's per-host epoch fence — every holder raising its fence *for the dead host* to the new epoch,
+  /// so the zombie is refused `StaleEpoch{new}` even under its own owner id — is the `FencedRegister`
+  /// per-host model (A-9), owed. The new owner also still owes the phase-one recovery (reading the dead
+  /// owner's highest records from the holders and adopting the head) before it serves. At `f > 0` the
+  /// takeover decision is agreed by the configuration consensus (owed); this is its local effect.
+  pub fn take_over(&mut self, dead: HostId, object: u64) -> Result<&Configuration, TakeoverError> {
+    if dead != self.configuration.owner {
+      return Err(TakeoverError::NotOwner {
+        owner: self.configuration.owner,
+      });
+    }
+    let survivors: Vec<HostId> = self
+      .configuration
+      .neighbourhood
+      .iter()
+      .copied()
+      .filter(|host| *host != dead)
+      .collect();
+    let successor = rendezvous_first(&survivors, object).ok_or(TakeoverError::NoSurvivor)?;
+
+    self.configuration.owner = successor;
+    // Bump the authority so the dead owner's in-flight records are fenced at the holders (the next
+    // epoch, never a tunable — a monotonic step like the version).
+    self.configuration.host_epoch = HostEpoch(self.configuration.host_epoch.0.saturating_add(1));
+    self.configuration.neighbourhood = survivors;
+    self.configuration.version = self.configuration.version.saturating_add(1);
+    Ok(&self.configuration)
+  }
 }
 
 #[cfg(test)]
@@ -122,6 +181,7 @@ mod tests {
   const OWNER: HostId = HostId(1);
   const A: HostId = HostId(2);
   const B: HostId = HostId(3);
+  const C: HostId = HostId(4);
 
   /// Admitting a member grows the neighbourhood and advances the version; a duplicate admit is a no-op.
   #[test]
@@ -205,5 +265,62 @@ mod tests {
     assert!(group.reconcile(&view), "a dead peer is retired");
     assert_eq!(group.configuration().neighbourhood, vec![OWNER, A]);
     assert!(group.configuration().version > after_admit);
+  }
+
+  /// Taking over a dead owner reassigns the volume to the rendezvous-first survivor of the
+  /// neighbourhood, bumps the host epoch, drops the dead owner, and advances the generation.
+  #[test]
+  fn take_over_reassigns_to_the_rendezvous_first_survivor_and_bumps_the_epoch() {
+    let mut group = ConfigGroup::solo(OWNER);
+    group.reconfigure(Reconfiguration::Admit(A));
+    group.reconfigure(Reconfiguration::Admit(B));
+    group.reconfigure(Reconfiguration::Admit(C));
+    assert_eq!(group.configuration().host_epoch, HostEpoch(1));
+    let before = group.configuration().version;
+
+    let object = 42;
+    let new = group
+      .take_over(OWNER, object)
+      .expect("a survivor takes over")
+      .clone();
+
+    let survivors = [A, B, C];
+    assert!(survivors.contains(&new.owner), "a survivor took over");
+    assert_eq!(
+      new.owner,
+      rendezvous_first(&survivors, object).unwrap(),
+      "the rendezvous-first survivor is chosen"
+    );
+    assert_eq!(new.host_epoch, HostEpoch(2), "the host epoch is bumped");
+    assert!(
+      !new.neighbourhood.contains(&OWNER),
+      "the dead owner left the neighbourhood"
+    );
+    assert!(new.version > before, "the generation advanced");
+  }
+
+  /// Taking over a host that is not the current owner is refused — a non-owner death is a neighbourhood
+  /// retire, not a takeover.
+  #[test]
+  fn take_over_of_a_non_owner_refuses() {
+    let mut group = ConfigGroup::solo(OWNER);
+    group.reconfigure(Reconfiguration::Admit(A));
+    assert_eq!(
+      group.take_over(A, 42),
+      Err(TakeoverError::NotOwner { owner: OWNER }),
+      "only the current owner is taken over"
+    );
+  }
+
+  /// Taking over when no survivor remains is refused — the volume is unrecoverable from this
+  /// configuration rather than assigned to a phantom owner.
+  #[test]
+  fn take_over_with_no_survivor_refuses() {
+    let mut group = ConfigGroup::solo(OWNER);
+    assert_eq!(
+      group.take_over(OWNER, 42),
+      Err(TakeoverError::NoSurvivor),
+      "a lone owner has no survivor to take over"
+    );
   }
 }

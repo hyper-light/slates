@@ -210,6 +210,20 @@ fn rendezvous_weight(host: u64, object: u64) -> u64 {
   hash
 }
 
+/// The host that rendezvous ranks first for `object` among `hosts` — the highest rendezvous weight,
+/// the lowest id breaking a tie (the same total order [`candidates_for`] uses for the candidates after
+/// the owner). `None` if `hosts` is empty. Takeover assigns a dead owner's object to this survivor of
+/// its neighbourhood (§4.8 "Promotion and takeover"; the worked example's "rendezvous ranks first
+/// among {B, C, D}").
+pub fn rendezvous_first(hosts: &[HostId], object: u64) -> Option<HostId> {
+  let mut ranked: Vec<(u64, HostId)> = hosts
+    .iter()
+    .map(|host| (rendezvous_weight(host.0, object), *host))
+    .collect();
+  ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+  ranked.first().map(|(_, host)| *host)
+}
+
 /// A holder's fence for one host: the highest epoch it has accepted a record under (§4.8
 /// "Promotion and takeover"). A record under a lower epoch is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1019,6 +1033,44 @@ mod tests {
     assert!(
       seconds.len() > 1,
       "objects spread over more than one second holder"
+    );
+  }
+
+  /// The rendezvous-first survivor is deterministic, empty-safe, spreads across the survivors, and
+  /// agrees with the ranking `candidates_for` uses — takeover picks the same host the placement would
+  /// rank first among the survivors.
+  #[test]
+  fn rendezvous_first_is_deterministic_spreads_and_matches_the_candidate_ranking() {
+    assert_eq!(
+      rendezvous_first(&[], 42),
+      None,
+      "an empty survivor set has no successor"
+    );
+
+    let owner = HostId(1);
+    let neigh = vec![owner, HostId(2), HostId(3), HostId(4), HostId(5)];
+    let survivors: Vec<HostId> = neigh.iter().copied().filter(|h| *h != owner).collect();
+    let quorum = Quorum { f: 2 };
+    let mut winners = std::collections::BTreeSet::new();
+    for object in 0..256u64 {
+      let first = rendezvous_first(&survivors, object).expect("a survivor");
+      assert_eq!(
+        rendezvous_first(&survivors, object),
+        Some(first),
+        "deterministic"
+      );
+      assert!(survivors.contains(&first), "the winner is a survivor");
+      // The owner's first *other* candidate for this object is exactly the rendezvous-first survivor.
+      assert_eq!(
+        candidates_for(owner, &neigh, object, quorum)[1],
+        first,
+        "agrees with the candidate ranking"
+      );
+      winners.insert(first);
+    }
+    assert!(
+      winners.len() > 1,
+      "the successor spreads over more than one survivor"
     );
   }
 }
