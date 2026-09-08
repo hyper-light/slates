@@ -30,6 +30,7 @@ pub mod conn;
 pub mod endpoint;
 pub mod flow;
 pub mod handshake;
+pub mod packet_number;
 pub mod schedule;
 pub mod seal;
 pub mod session;
