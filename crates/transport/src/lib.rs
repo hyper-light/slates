@@ -4,21 +4,30 @@
 //! edge). This is the daemon↔daemon mesh, where Meta-scale traffic lives; the laptop-degenerate is a
 //! local/loopback delivery, one code path (R8).
 //!
-//! **What this crate holds (Phase 8 slices 1 and 2): the control-datagram wire codec and its AEAD
-//! seal.** A control datagram is a fixed-layout little-endian cleartext prologue (the key-finding
-//! minimum — version, sender, key epoch, sealed length) wrapping a sealed region that carries the
-//! envelope (a fixed header — kind, class, flags, epoch, hybrid-logical clock, request id) and a
-//! canonical body. [`ControlDatagram::encode`]/[`ControlDatagram::decode`] are the plaintext codec (the
-//! wire shape, tested on every host); [`ControlDatagram::encode_sealed`]/[`ControlDatagram::decode_sealed`]
-//! (module [`seal`]) wrap exactly the sealed region in AES-256-GCM (D-15's TLS 1.3 cipher) under a
-//! [`seal::Sealer`]/[`seal::Opener`], the cleartext prologue bound in as authenticated data so the
-//! routing header cannot be swapped. Nonces are a per-direction counter (never random, so no RNG and
-//! deterministic tests); a repeated counter is refused on both ends.
+//! **The control plane.** A control datagram is a fixed-layout little-endian cleartext prologue (the
+//! key-finding minimum — version, sender, key epoch, sealed length) wrapping a sealed region that
+//! carries the envelope (kind, class, flags, epoch, hybrid-logical clock, request id) and a canonical
+//! body. [`ControlDatagram::encode`]/[`ControlDatagram::decode`] are the plaintext codec (the wire
+//! shape, tested on every host); [`ControlDatagram::encode_sealed`]/[`ControlDatagram::decode_sealed`]
+//! ([`seal`]) wrap exactly the sealed region in AES-256-GCM (D-15's TLS 1.3 cipher), the cleartext
+//! prologue bound in as authenticated data so the routing header cannot be swapped; nonces are a
+//! per-direction counter, never random. [`schedule`] derives a `Sealer`/`Opener`'s key from the
+//! **control secret** (HKDF-Expand-Label, RFC 5869 + RFC 8446 §7.1); [`accept`] runs the acceptance
+//! order (length → prologue → keyring lookup that drops an unknown sender before crypto → open);
+//! [`enrollment`] turns an admitted-membership record into this node's sealer and the keyring over its
+//! enrolled peers.
 //!
-//! **Owed** (later slices in the design's phasing): the key *schedule* — the HKDF derivation that fills
-//! a `Sealer`'s key from an enrolled host secret — and enrollment itself; the owned QUIC dialect over
-//! `rustls::quic` (TLS 1.3, slates D-15, not hecate's Noise); and the register/placement wiring. Here
-//! the key is injected (`from_key`), exactly as the codec takes bytes without owning the socket.
+//! **The session plane** — slates's owned QUIC dialect over `rustls::quic` (TLS 1.3, D-15, not hecate's
+//! Noise): [`handshake`] (pinned-identity TLS 1.3), [`packet_number`] (RFC 9000 §17.1 truncation),
+//! [`session`]/[`stream`]/[`conn`]/[`flow`] (frames, ordered streams, reliability, flow credit),
+//! [`connection`] (the sans-io driver — reliable, flow-controlled, multi-stream) and [`endpoint`] (the
+//! UDP edge that pumps it). A stream crosses the wire authenticated, encrypted, header-protected,
+//! reliable and flow-controlled.
+//!
+//! **Owed:** the register/placement wiring (slice 5, §4.8) that rides the session plane; enrollment's
+//! *distribution* half (configuration-group admission, `docs/wip/enrollment.md`); congestion control
+//! (its validation needs a real network); and the session plane's tuning (probe timeout, MTU, BDP
+//! window autotuning).
 //!
 //! This is a parser of external bytes, so every length is checked against the bytes that remain before
 //! it is read (a wild `sealed_len` never allocates), `flags` must be zero, and every malformation is a
@@ -29,6 +38,7 @@ pub mod accept;
 pub mod conn;
 pub mod connection;
 pub mod endpoint;
+pub mod enrollment;
 pub mod flow;
 pub mod handshake;
 pub mod packet_number;

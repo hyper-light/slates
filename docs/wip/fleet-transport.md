@@ -170,8 +170,14 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    **Owed on the connection:** a real probe timeout, congestion control (its validation needs a real
    network), connection-level `MaxData`, multi-range ACKs, connection IDs, several frames per packet (an
    MTU budget), and loom on the state machine.
-   The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c);
-   its fencing step and the `Keyring`'s population ride membership/enrollment.
+   The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c); its
+   fencing step rides membership. The **`Keyring`'s population is built** (`enrollment.rs`, slice 6):
+   `Enrollment::from_membership` turns an admitted-membership record (the shared control secret + the
+   enrolled member ids) into this node's control `Sealer` and a keyring of `Opener`s over its peers,
+   proven end to end against the control plane (an enrolled peer's datagram opens; an un-enrolled sender
+   is refused `UnknownSender`; a wrong-secret datagram fails the seal). The **distribution** of the
+   secret and the list — configuration-group admission, human-authorized (§4.13) — is the owed half,
+   designed in `docs/wip/enrollment.md` (a draft to ratify).
 5. **Register/placement wiring** — owed: §4.8 head + merge-record registers and D-14 placement ride
    the session plane; the N=1 ≡ simulated-fleet differential (AC-2.5 extended) is the gate.
 
