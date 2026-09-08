@@ -17,7 +17,6 @@ use slates_rt::sim::SimRuntime;
 use slates_rt::udp::UdpSocket;
 use slates_transport::endpoint::Endpoint;
 use slates_transport::handshake::Identity;
-use slates_transport::stream::StreamAssembler;
 
 const NAME: &str = "slates-node";
 const STREAM_ID: u64 = 1;
@@ -90,9 +89,8 @@ fn a_stream_flows_over_a_live_session() {
       let outcome = async {
         let mut server = Endpoint::server(socket, peer, &identity).map_err(|e| format!("{e:?}"))?;
         server.establish().await.map_err(|e| format!("{e:?}"))?;
-        let mut assembler = StreamAssembler::new(0);
         server
-          .recv_stream(&mut assembler)
+          .recv_stream(STREAM_ID, FRAME_CAP)
           .await
           .map_err(|e| format!("{e:?}"))
       }

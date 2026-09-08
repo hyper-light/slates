@@ -126,6 +126,12 @@ impl SentTracker {
     self.in_flight.len()
   }
 
+  /// The largest packet number the peer has acknowledged, or `None` before the first ACK — the value
+  /// that sizes the truncated packet number a sender writes (RFC 9000 §17.1 via `packet_number`).
+  pub fn largest_acked(&self) -> Option<u64> {
+    self.largest_acked
+  }
+
   /// Removes and returns the frames of the oldest in-flight packet, for a probe retransmission when the
   /// reorder threshold cannot detect a loss — a lost *last* packet has no later acknowledged packets to
   /// open a gap past it (RFC 9002 §6.2 handles this with a probe timeout; this is that recovery's

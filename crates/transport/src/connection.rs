@@ -178,6 +178,12 @@ impl Connection {
     self.retransmitted
   }
 
+  /// The largest packet number the peer has acknowledged (for sizing the truncated packet number the
+  /// wire carries); `None` before the first acknowledgement.
+  pub fn tx_largest_acked(&self) -> Option<u64> {
+    self.sent.largest_acked()
+  }
+
   /// Queues frames for retransmission, counting them.
   fn queue_retransmit(&mut self, frames: Vec<Frame>) {
     self.retransmitted = self.retransmitted.saturating_add(frames.len() as u64);

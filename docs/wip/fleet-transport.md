@@ -148,10 +148,15 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    *reliable, ordered, exactly-once* delivery over a lossy, reordering path — `poll_transmit` /
    `handle_incoming` with no socket or clock — recovering a mid-stream drop by the reorder threshold and
    a lost tail by a probe (RFC 9002 §6.2), proven by a proptest that any loss pattern still delivers the
-   exact stream, with a retransmit counter as the non-vacuity check.
-   **Owed on the connection:** pumping the sans-io `Connection` from the `Endpoint`'s async loop
-   (replacing the happy-path `send_stream`/`recv_stream`), deriving the send credit from received
-   `MaxStreamData` (flow enforcement), congestion control, multi-range ACKs, connection IDs, several
+   exact stream, with a retransmit counter as the non-vacuity check. The **`Endpoint` now pumps that
+   `Connection`** (4i): `send_stream`/`recv_stream` protect what it wants to send and feed it what
+   arrives, so the live session delivers a stream *reliably* with acknowledgements flowing (proven over
+   the lossless sim by `tests/session.rs`; the loss/probe paths are the oracle's, and driving the probe
+   from a real timeout is owed with the runtime timer). TLS session-resumption tickets are disabled on
+   the server (slates authenticates by enrolled identity, not TLS resumption; a post-handshake
+   `NewSessionTicket` would otherwise reach the 1-RTT packet reader as unparseable CRYPTO bytes).
+   **Owed on the connection:** deriving the send credit from received `MaxStreamData` (flow
+   enforcement), a real probe timeout, congestion control, multi-range ACKs, connection IDs, several
    frames per packet (an MTU budget), multiplexing many streams, and loom on the state machine.
    The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c);
    its fencing step and the `Keyring`'s population ride membership/enrollment.

@@ -74,13 +74,17 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 }
 
 /// A server config presenting `identity`, TLS 1.3 only, no client auth (peer auth is the pinned
-/// server identity; mutual enrolled-identity auth is owed).
+/// server identity; mutual enrolled-identity auth is owed). Session-resumption tickets are disabled:
+/// slates's owned dialect has no use for TLS-level resumption (identity comes from enrollment), and a
+/// post-handshake `NewSessionTicket` would arrive as CRYPTO bytes that the 1-RTT packet reader is not
+/// meant to parse.
 pub fn server_config(identity: &Identity) -> Result<ServerConfig, HandshakeError> {
-  ServerConfig::builder_with_provider(provider())
+  let mut config = ServerConfig::builder_with_provider(provider())
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_no_client_auth()
-    .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())
-    .map_err(HandshakeError::from)
+    .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())?;
+  config.send_tls13_tickets = 0;
+  Ok(config)
 }
 
 /// A client config that trusts exactly `pinned` (the peer's enrolled certificate) — TLS 1.3 only.

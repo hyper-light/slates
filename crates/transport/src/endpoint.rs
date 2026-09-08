@@ -1,26 +1,27 @@
-//! The session-plane connection endpoint (§4.10a §8, slice 4f) — the culmination that wires the
-//! layers into a *live* session over the runtime's UDP socket: it drives the `rustls::quic` handshake
-//! to the 1-RTT keys, then protects each packet's frames with those keys (the AEAD proven in
-//! `handshake.rs`) and carries a stream over the wire. This is the session-plane analogue of the
-//! control plane's `plane.rs`.
+//! The session-plane connection endpoint (§4.10a §8) — the I/O edge that carries a *live* session over
+//! the runtime's UDP socket: it drives the `rustls::quic` handshake to the 1-RTT keys, then pumps the
+//! sans-io [`Connection`] driver — protecting each packet it wants to send and feeding it each packet
+//! that arrives — so a stream is delivered **reliably** over the wire. This is the session-plane
+//! analogue of the control plane's `plane.rs`.
 //!
-//! Scope of this slice (the smallest live session): the handshake over UDP, full 1-RTT packet
-//! protection to RFC 9001 shape — an RFC 9000 short header (§17.3) carrying a truncated packet number
-//! (`crate::packet_number`), payload AEAD with that header as associated data, and **header protection**
-//! (§5.4) masking the first byte and the packet-number field — and one stream carried end to end.
-//! Reliability/ACK/loss (`conn.rs`) and flow-control credit updates (`flow.rs`) are built and
-//! unit-composed; wiring their frames into this loop, congestion, connection IDs, and multiplexing
-//! many streams are the remaining connection work. The `Arc` here is rustls's config (D-8 exception 2),
-//! confined to `crate::handshake`.
+//! What it does: the handshake over UDP; full 1-RTT packet protection to RFC 9001 shape (an RFC 9000
+//! short header (§17.3) carrying a truncated packet number from `crate::packet_number`, payload AEAD
+//! with that header as associated data, and **header protection** (§5.4) masking the first byte and the
+//! packet-number field); and reliable single-stream delivery driven by the [`Connection`] —
+//! acknowledgements flow, and a transfer is complete only when every packet is acknowledged. Over the
+//! lossless simulation fabric no retransmission is needed; the loss-recovery and probe paths are proven
+//! by the `connection` oracle, and driving the probe from a real timeout is owed with the runtime timer.
+//! Remaining connection work: flow-credit enforcement, congestion control, connection IDs, and
+//! multiplexing many streams. The `Arc` here is rustls's config (D-8 exception 2), in `crate::handshake`.
 
 use rustix::net::SocketAddrV4;
 use rustls::quic::{ClientConnection, KeyChange, Keys, ServerConnection};
 use slates_rt::udp::UdpSocket;
 
+use crate::connection::Connection;
 use crate::handshake::{HandshakeError, Identity, client_connection, server_connection};
 use crate::packet_number::{MAX_PACKET_NUMBER_BYTES, decode_packet_number, encode_packet_number};
 use crate::session::{Frame, decode_frames, encode_frames};
-use crate::stream::{StreamAssembler, StreamSender};
 
 /// Format: RFC 9000 §17.3 — bit 6 of a short-header first byte, always 1 ("fixed bit"); a packet with
 /// it clear is not a valid short header.
@@ -110,18 +111,14 @@ impl Quic {
   }
 }
 
-/// One end of a session: the UDP socket, the peer, the QUIC handshake state, the 1-RTT keys once
-/// established, the outgoing packet-number counter, the largest number acknowledged by the peer (which
-/// sizes the truncated field the sender writes), and the largest number received (against which the
-/// receiver reconstructs a truncated number).
+/// One end of a session: the UDP socket, the peer, the QUIC handshake state, and the 1-RTT keys once
+/// established. Per-stream packet-number and reliability state lives in the [`Connection`] a transfer
+/// drives, not here.
 pub struct Endpoint {
   socket: UdpSocket,
   peer: SocketAddrV4,
   quic: Quic,
   keys: Option<Keys>,
-  tx_pn: u64,
-  tx_largest_acked: Option<u64>,
-  rx_largest: u64,
 }
 
 impl Endpoint {
@@ -139,9 +136,6 @@ impl Endpoint {
       peer,
       quic: Quic::Client(client),
       keys: None,
-      tx_pn: 0,
-      tx_largest_acked: None,
-      rx_largest: 0,
     })
   }
 
@@ -157,9 +151,6 @@ impl Endpoint {
       peer,
       quic: Quic::Server(server),
       keys: None,
-      tx_pn: 0,
-      tx_largest_acked: None,
-      rx_largest: 0,
     })
   }
 
@@ -204,67 +195,83 @@ impl Endpoint {
     }
   }
 
-  /// Protects `frames` into a packet under the local 1-RTT keys, advancing the packet number and
-  /// sizing the truncated number against what the peer has acknowledged.
-  fn protect(&mut self, frames: &[Frame]) -> Result<Vec<u8>, EndpointError> {
+  /// Flushes every packet the connection currently wants to send: each `poll_transmit` gives a packet
+  /// number and its frames, which are protected under the local 1-RTT keys (the number sized against
+  /// what the peer has acknowledged) and sent over the socket.
+  fn flush(&self, conn: &mut Connection, frame_cap: usize) -> Result<(), EndpointError> {
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
-    let pn = self.tx_pn;
-    self.tx_pn = self.tx_pn.saturating_add(1);
-    protect_packet(keys, pn, self.tx_largest_acked, frames)
+    while let Some((pn, frames)) = conn.poll_transmit(frame_cap) {
+      let datagram = protect_packet(keys, pn, conn.tx_largest_acked(), &frames)?;
+      self.socket.send_to(&datagram, self.peer)?;
+    }
+    Ok(())
   }
 
-  /// Unprotects a received packet under the remote 1-RTT keys and records its number as the largest
-  /// received (so the next reconstruction has the right reference).
-  fn unprotect(&mut self, datagram: &[u8]) -> Result<Vec<Frame>, EndpointError> {
+  /// Receives one protected packet, reconstructs its number against `rx_largest` (advancing it), and
+  /// feeds it to the connection.
+  async fn receive_into(
+    &self,
+    conn: &mut Connection,
+    rx_largest: &mut u64,
+    buf: &mut [u8],
+  ) -> Result<(), EndpointError> {
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
-    let (pn, frames) = unprotect_packet(keys, self.rx_largest, datagram)?;
-    self.rx_largest = self.rx_largest.max(pn);
-    Ok(frames)
+    let (n, _from) = self.socket.recv_from(buf).await?;
+    let (pn, frames) = unprotect_packet(keys, *rx_largest, &buf[..n])?;
+    *rx_largest = (*rx_largest).max(pn);
+    conn.handle_incoming(pn, &frames);
+    Ok(())
   }
 
-  /// Sends `data` as one stream (id `stream_id`), framed within a generous credit at a frame cap and
-  /// each packet protected, over the socket. (Reliability/flow wiring is owed; over the lossless sim
-  /// this delivers directly.)
+  /// Sends `data` as stream `stream_id` **reliably**: drives a [`Connection`] that frames the data,
+  /// sends it, and — receiving the peer's acknowledgements — considers the transfer done only when
+  /// every packet has been acknowledged. Over the lossless simulation fabric no retransmission is
+  /// needed; the loss-recovery path (and its probe for a lost tail, which over a real network needs a
+  /// timeout the runtime's timer will drive) is exercised by the `connection` oracle.
   pub async fn send_stream(
     &mut self,
     stream_id: u64,
     data: &[u8],
     frame_cap: usize,
   ) -> Result<(), EndpointError> {
-    let mut sender = StreamSender::new();
-    sender.write(data);
-    sender.grant_credit(data.len() as u64);
-    sender.finish();
-    while let Some(frame) = sender.next_frame(stream_id, frame_cap) {
-      let datagram = self.protect(&[frame])?;
-      self.socket.send_to(&datagram, self.peer)?;
+    let mut conn = Connection::new(stream_id);
+    conn.send_all(data);
+    let mut buf = [0u8; 2048];
+    let mut rx_largest = 0u64;
+    loop {
+      self.flush(&mut conn, frame_cap)?;
+      if conn.send_complete() {
+        return Ok(());
+      }
+      self
+        .receive_into(&mut conn, &mut rx_largest, &mut buf)
+        .await?;
     }
-    Ok(())
   }
 
-  /// Receives protected packets and reassembles one stream into `assembler`, returning its bytes when
-  /// the stream's `fin` completes.
+  /// Receives stream `stream_id` **reliably**, acknowledging what arrives and returning its bytes once
+  /// the stream's `fin` completes. Drives a [`Connection`]: each received packet is acknowledged (the
+  /// acknowledgement flushed before the next receive) so the sender learns of delivery, and the final
+  /// acknowledgement is flushed after completion so the sender can finish.
   pub async fn recv_stream(
     &mut self,
-    assembler: &mut StreamAssembler,
+    stream_id: u64,
+    frame_cap: usize,
   ) -> Result<Vec<u8>, EndpointError> {
+    let mut conn = Connection::new(stream_id);
     let mut buf = [0u8; 2048];
+    let mut rx_largest = 0u64;
     let mut received = Vec::new();
-    while !assembler.is_complete() {
-      let (n, _from) = self.socket.recv_from(&mut buf).await?;
-      for frame in self.unprotect(&buf[..n])? {
-        if let Frame::Stream {
-          offset, fin, data, ..
-        } = frame
-        {
-          // The receive window tracks the credit; here it is generous (flow wiring owed).
-          assembler.grant_window(offset + data.len() as u64 + 1);
-          let _ = assembler.offer(offset, &data, fin);
-        }
+    loop {
+      self
+        .receive_into(&mut conn, &mut rx_largest, &mut buf)
+        .await?;
+      self.flush(&mut conn, frame_cap)?;
+      received.extend_from_slice(&conn.read());
+      if conn.recv_complete() {
+        return Ok(received);
       }
-      received.extend_from_slice(&assembler.read());
     }
-    Ok(received)
   }
 }
 
