@@ -18,6 +18,13 @@ pub fn shard_id() -> Option<ShardId> {
   registry::with_current(|ctx| ShardId(ctx.id))
 }
 
+/// The current shard's monotonic clock in nanoseconds, or zero if this thread runs no shard (a caller
+/// that reads it off a shard thread, such as timing a round trip, gets the driver's clock; the sim's
+/// clock in a simulation).
+pub fn now_ns() -> u64 {
+  registry::with_current(|ctx| ctx.now_ns()).unwrap_or(0)
+}
+
 /// The task being polled on this thread, if any.
 pub fn current_task() -> Option<TaskId> {
   registry::with_current(|ctx| ctx.current_task()).flatten()

@@ -15,6 +15,7 @@ use std::sync::mpsc::{Receiver, channel};
 use rustix::net::{Ipv4Addr, SocketAddrV4};
 use rustls::pki_types::PrivateKeyDer;
 use slates_cluster::CommitBudget;
+use slates_cluster::coordinates::NetworkCoordinate;
 use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::membership::{Liveness, MemberState};
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once, serve_probe};
@@ -99,6 +100,8 @@ struct ProbeResult {
   timed_out: bool,
   ack_gossip: Vec<(HostId, MemberState)>,
   target_after_resolution: Option<Liveness>,
+  rtt_ns: u64,
+  coordinate_moved: bool,
 }
 
 /// Runs one live probe round: the prober (`1`) probes the target (`2`) over a mutually-authenticated
@@ -173,6 +176,12 @@ fn run_probe(target_serves: bool) -> ProbeResult {
 
       let mut detector = Detector::new(PROBER, timing());
       detector.join(TARGET);
+      // Learn the target's coordinate (in a live fleet this rides the reply; here supplied out of band),
+      // so a measured round-trip can relax our own coordinate against it.
+      let mut target_coordinate = NetworkCoordinate::origin(8);
+      target_coordinate.vec[0] = 10.0;
+      target_coordinate.error = 0.05;
+      detector.learn_coordinate(TARGET, target_coordinate);
       // Tick to open the probe of the target (sets it as this period's probe target).
       let _ = detector.tick();
       let ping = SwimMessage::Ping {
@@ -181,14 +190,20 @@ fn run_probe(target_serves: bool) -> ProbeResult {
       };
       let (_endpoint, outcome) = probe_once(endpoint, &ping, budget()).await.unwrap();
 
-      let (timed_out, ack_gossip) = match outcome {
-        ProbeOutcome::Acked(gossip) => {
+      let (timed_out, ack_gossip, rtt_ns) = match outcome {
+        ProbeOutcome::Acked { gossip, rtt_ns } => {
           detector.on_ack(TARGET);
           detector.apply_gossip(&gossip);
-          (false, gossip)
+          // Fold the measured round-trip into our Vivaldi coordinate.
+          detector.observe_rtt(TARGET, rtt_ns as f64);
+          (false, gossip, rtt_ns)
         }
-        ProbeOutcome::TimedOut => (true, Vec::new()),
+        ProbeOutcome::TimedOut => (true, Vec::new(), 0),
       };
+      // Whether the measured RTT moved our coordinate off the origin.
+      let coordinate = detector.coordinate();
+      let coordinate_moved =
+        coordinate.vec.iter().any(|component| *component != 0.0) || coordinate.height != 0.0;
       // Resolve the probe: an acknowledged target stays alive, an unanswered one is suspected.
       let _ = detector.tick();
       let target_after_resolution = detector.membership().state(TARGET).map(|s| s.liveness);
@@ -197,6 +212,8 @@ fn run_probe(target_serves: bool) -> ProbeResult {
         timed_out,
         ack_gossip,
         target_after_resolution,
+        rtt_ns,
+        coordinate_moved,
       });
     })
     .unwrap();
@@ -226,6 +243,14 @@ fn a_live_probe_is_acknowledged_and_carries_gossip() {
       }
     )),
     "the acknowledgement carried the target's gossip to the prober"
+  );
+  assert!(
+    result.rtt_ns > 0,
+    "the probe measured a real round-trip time"
+  );
+  assert!(
+    result.coordinate_moved,
+    "feeding the measured RTT relaxed the node's Vivaldi coordinate off the origin"
   );
 }
 

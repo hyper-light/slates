@@ -16,7 +16,7 @@ use std::sync::mpsc::{TryRecvError, channel};
 
 use slates_db::register::HostId;
 use slates_rt::error::RtError;
-use slates_rt::futures::{cancel, sleep, spawn_child};
+use slates_rt::futures::{cancel, now_ns, sleep, spawn_child};
 use slates_transport::endpoint::{Endpoint, EndpointError};
 
 use crate::CommitBudget;
@@ -255,9 +255,16 @@ const PROBE_STREAM: u64 = 1;
 
 /// The outcome of one live probe over the transport.
 pub enum ProbeOutcome {
-  /// The target acknowledged within the deadline; its piggybacked gossip is returned for the caller to
-  /// fold into the view (`detector.on_ack` and `detector.apply_gossip`).
-  Acked(Vec<(HostId, MemberState)>),
+  /// The target acknowledged within the deadline. The piggybacked gossip is returned for the caller to
+  /// fold into the view (`detector.on_ack` and `detector.apply_gossip`), and the measured round-trip time
+  /// (`rtt_ns`) for it to feed the Vivaldi coordinate (`detector.observe_rtt`) so per-peer RTT prediction
+  /// learns from real samples.
+  Acked {
+    /// The membership updates the acknowledgement carried.
+    gossip: Vec<(HostId, MemberState)>,
+    /// The measured round-trip time of this probe, in nanoseconds (the shard clock).
+    rtt_ns: u64,
+  },
   /// The deadline elapsed with no acknowledgement — a probe failure (the target may be down, or a packet
   /// lost). The caller does not acknowledge; the detector's next tick suspects, and the indirect probe or
   /// a later period clears or confirms it.
@@ -286,6 +293,7 @@ pub async fn probe_once(
   budget: CommitBudget,
 ) -> Result<(Option<Endpoint>, ProbeOutcome), RtError> {
   let bytes = probe.encode();
+  let started_ns = now_ns();
   let (tx, rx) = channel::<ProbeReply>();
 
   let request_tx = tx.clone();
@@ -310,7 +318,10 @@ pub async fn probe_once(
         let _ = cancel(deadline_task);
         // A missing or non-ack reply is not an acknowledgement — treat it as a probe failure.
         let outcome = match SwimMessage::decode(&reply) {
-          Ok(message @ SwimMessage::Ack { .. }) => ProbeOutcome::Acked(message.gossip().to_vec()),
+          Ok(message @ SwimMessage::Ack { .. }) => ProbeOutcome::Acked {
+            gossip: message.gossip().to_vec(),
+            rtt_ns: now_ns().saturating_sub(started_ns),
+          },
           _ => ProbeOutcome::TimedOut,
         };
         return Ok((Some(*endpoint), outcome));
