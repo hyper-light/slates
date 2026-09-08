@@ -11,8 +11,11 @@
 use std::mem::size_of;
 
 use slates_db::register::HostId;
+use slates_transport::endpoint::{Endpoint, EndpointError};
 
-use crate::raft::{AppendEntries, AppendReply, LogEntry, RequestVote, VoteReply, VoterConfig};
+use crate::raft::{
+  AppendEntries, AppendReply, LogEntry, RaftNode, RequestVote, VoteReply, VoterConfig,
+};
 
 /// A Raft message on the wire.
 #[derive(Clone, Debug, PartialEq)]
@@ -302,6 +305,41 @@ fn expect_end(rest: &[u8]) -> Result<(), RaftWireError> {
   } else {
     Err(RaftWireError::LengthMismatch)
   }
+}
+
+/// Format: a Raft RPC rides one stream per peer connection; the server's `serve_once` accepts whichever
+/// stream arrives, so the exact id is a fixed label, not a tunable.
+const RAFT_STREAM: u64 = 1;
+
+/// Serves one incoming Raft request on `node` over `endpoint` (§4.8): a received vote request or append
+/// is run through the node's handler and the reply is sent back. A reply-typed or malformed request is
+/// answered with nothing (the requester counts it as no reply). The caller loops this to keep serving.
+pub async fn serve_raft_once(
+  endpoint: &mut Endpoint,
+  node: &mut RaftNode,
+) -> Result<(), EndpointError> {
+  endpoint
+    .serve_once(|request| match RaftMessage::decode(&request) {
+      Ok(RaftMessage::RequestVote(vote)) => {
+        RaftMessage::VoteReply(node.on_request_vote(vote)).encode()
+      }
+      Ok(RaftMessage::AppendEntries(append)) => {
+        RaftMessage::AppendReply(node.on_append_entries(append)).encode()
+      }
+      _ => Vec::new(),
+    })
+    .await
+}
+
+/// Sends one Raft `message` over `endpoint` and returns the decoded reply, or `None` if the reply is
+/// missing or malformed. The caller (a candidate or leader) feeds the reply back to its node
+/// (`on_vote_reply`/`on_append_reply`).
+pub async fn request_raft(
+  endpoint: &mut Endpoint,
+  message: &RaftMessage,
+) -> Result<Option<RaftMessage>, EndpointError> {
+  let reply = endpoint.request(RAFT_STREAM, &message.encode()).await?;
+  Ok(RaftMessage::decode(&reply).ok())
 }
 
 #[cfg(test)]
