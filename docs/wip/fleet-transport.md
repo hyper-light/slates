@@ -143,10 +143,16 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    byte and packet-number field — and carries a stream end to end. Proven by the N=1 live-session
    integration test (`tests/session.rs`: two endpoints handshake over the sim UDP fabric, the client
    sends a stream, the server reassembles it byte-for-byte) and unit tests that header protection
-   genuinely masks the header (non-vacuity) and a tampered packet is refused.
-   **Owed on the connection:** wiring the reliability (`conn.rs`) and flow-credit (`flow.rs`) frames
-   into the endpoint loop, congestion control, multi-range ACKs, connection IDs, multiplexing many
-   streams, and loom on the state machine.
+   genuinely masks the header (non-vacuity) and a tampered packet is refused. The **sans-io connection
+   driver** (4h, `connection.rs`) composes the stream, reliability and (soon) flow layers into
+   *reliable, ordered, exactly-once* delivery over a lossy, reordering path — `poll_transmit` /
+   `handle_incoming` with no socket or clock — recovering a mid-stream drop by the reorder threshold and
+   a lost tail by a probe (RFC 9002 §6.2), proven by a proptest that any loss pattern still delivers the
+   exact stream, with a retransmit counter as the non-vacuity check.
+   **Owed on the connection:** pumping the sans-io `Connection` from the `Endpoint`'s async loop
+   (replacing the happy-path `send_stream`/`recv_stream`), deriving the send credit from received
+   `MaxStreamData` (flow enforcement), congestion control, multi-range ACKs, connection IDs, several
+   frames per packet (an MTU budget), multiplexing many streams, and loom on the state machine.
    The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c);
    its fencing step and the `Keyring`'s population ride membership/enrollment.
 5. **Register/placement wiring** — owed: §4.8 head + merge-record registers and D-14 placement ride

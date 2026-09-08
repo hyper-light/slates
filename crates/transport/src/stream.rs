@@ -103,6 +103,13 @@ impl StreamSender {
   pub fn send_offset(&self) -> u64 {
     self.send_offset
   }
+
+  /// Whether every byte and the terminating `fin` have been framed — the send side has nothing left to
+  /// originate (retransmission of lost frames is tracked separately). False until `finish` is called
+  /// and the last frame emitted.
+  pub fn is_drained(&self) -> bool {
+    self.fin_framed
+  }
 }
 
 /// A refusal offering a segment to a stream (§4.10a §8): the closed set. Never a panic.

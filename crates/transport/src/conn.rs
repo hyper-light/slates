@@ -125,6 +125,22 @@ impl SentTracker {
   pub fn in_flight_count(&self) -> usize {
     self.in_flight.len()
   }
+
+  /// Removes and returns the frames of the oldest in-flight packet, for a probe retransmission when the
+  /// reorder threshold cannot detect a loss — a lost *last* packet has no later acknowledged packets to
+  /// open a gap past it (RFC 9002 §6.2 handles this with a probe timeout; this is that recovery's
+  /// mechanism, driven when the connection would otherwise stall with packets still in flight). Returns
+  /// empty when nothing is in flight.
+  pub fn probe_oldest(&mut self) -> Vec<Frame> {
+    let Some((&pn, _)) = self.in_flight.iter().next() else {
+      return Vec::new();
+    };
+    self
+      .in_flight
+      .remove(&pn)
+      .map(|flight| flight.frames)
+      .unwrap_or_default()
+  }
 }
 
 #[cfg(test)]
@@ -180,6 +196,22 @@ mod tests {
       0,
       "lost packets leave flight for retransmission"
     );
+  }
+
+  /// A probe removes the oldest in-flight packet's frames when no ACK-driven loss can be detected (a
+  /// lost tail), so the connection can retransmit and drain.
+  #[test]
+  fn a_probe_takes_the_oldest_in_flight_packet() {
+    let mut sent = SentTracker::new();
+    sent.on_sent(0, vec![Frame::MaxData { max: 7 }]);
+    sent.on_sent(1, vec![Frame::MaxData { max: 8 }]);
+    // No ACK ever arrives (a tail loss), so `take_lost` finds nothing.
+    assert!(sent.take_lost().is_empty());
+    // The probe frees the oldest (pn 0) for retransmission.
+    assert_eq!(sent.probe_oldest(), vec![Frame::MaxData { max: 7 }]);
+    assert_eq!(sent.in_flight_count(), 1, "only the oldest was taken");
+    assert_eq!(sent.probe_oldest(), vec![Frame::MaxData { max: 8 }]);
+    assert!(sent.probe_oldest().is_empty(), "nothing left to probe");
   }
 
   /// Builds one packet's frames: the lost frames to retransmit first, then up to two fresh ones.

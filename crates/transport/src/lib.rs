@@ -27,6 +27,7 @@
 
 pub mod accept;
 pub mod conn;
+pub mod connection;
 pub mod endpoint;
 pub mod flow;
 pub mod handshake;
