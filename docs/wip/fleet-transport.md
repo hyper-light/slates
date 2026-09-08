@@ -183,11 +183,15 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    peer's reply on the same stream id (the reply travels the other direction over one `Connection`),
    proven live end to end (`tests/session.rs`: a 250-byte request, a transformed reply, exact). This is
    the seam §4.8's "lookups route by id to the current owner" and the owner→holder record ship use.
-   **Owed:** wiring `crates/db/src/register.rs` onto it — the owner ships a head/merge-record register
-   to its `2f+1` candidate holders and commits at `f+1` acks (`Placement`/`Quorum`), holders fence by
-   host epoch (`Fence`) — and the N=1 ≡ simulated-fleet differential (AC-2.5 extended) as the gate.
-   Whether the holder's ack rides a session reply (built) or a control datagram is the to-ratify shape
-   (recommendation: the session reply, so one `Connection` and one flow/loss machine carry both).
+   The **register commit over the transport is built** in `slates-cluster` (the designated cluster-plane
+   crate, `SLATES_DESIGN.md:3619`): the owner holds locally + ships the record to its `2f+1` candidate
+   holders over the session, holders run the db [`Acceptor`] (authorize owner+generation, fence the
+   epoch, store before ack) and reply a binding [`Ack`], the owner commits at `f+1` distinct binding
+   acks or reports **uncertain** on a deadline. The ack rides a **session reply** (the ratified shape).
+   Live over the sim with mutual TLS (`crates/cluster/tests/commit.rs`): f=0≡f=1 placement, an
+   unavailable holder does not block an available quorum, insufficient acks never place.
+   **Owed on the cluster plane:** SWIM/Lifeguard membership, the configuration group, takeover, the
+   mirror, and connection reuse across commits (each commit currently re-establishes).
 
 ## 6. What this does not change
 
