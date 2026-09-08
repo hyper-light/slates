@@ -117,27 +117,41 @@ pub fn connect(
 }
 
 /// Builds the connections with the client pinning `client_pin` (which may differ from the server's
-/// real certificate — the wrong-pin test uses the difference). The two `Arc`s here are rustls's
-/// configs, required by `ClientConnection::new`/`ServerConnection::new`'s signatures (D-8 exc. 2).
+/// real certificate — the wrong-pin test uses the difference). For separate endpoints each side
+/// builds only its own connection ([`client_connection`]/[`server_connection`]); this pairs them for
+/// the in-process handshake test.
 pub fn connect_with(
   server: &Identity,
   client_pin: &CertificateDer<'static>,
   name: &str,
 ) -> Result<(ClientConnection, ServerConnection), HandshakeError> {
-  let client_cfg = client_config(client_pin.clone())?;
-  let server_cfg = server_config(server)?;
+  Ok((
+    client_connection(client_pin, name)?,
+    server_connection(server)?,
+  ))
+}
+
+/// The client half of the handshake: pins `pinned` (the peer's enrolled certificate) and targets the
+/// peer as `name`. Needs no private key — only the certificate it trusts.
+pub fn client_connection(
+  pinned: &CertificateDer<'static>,
+  name: &str,
+) -> Result<ClientConnection, HandshakeError> {
+  let cfg = client_config(pinned.clone())?;
   let server_name =
     ServerName::try_from(name.to_owned()).map_err(|e| HandshakeError::Setup(e.to_string()))?;
-  let client = ClientConnection::new(
-    // structural: allow — D-8 exception 2: rustls's connection constructors take `Arc` by signature.
-    Arc::new(client_cfg),
-    Version::V1,
-    server_name,
-    TRANSPORT_PARAMS.to_vec(),
-  )?;
-  // structural: allow — D-8 exception 2: rustls's connection constructors take `Arc` by signature.
-  let server = ServerConnection::new(Arc::new(server_cfg), Version::V1, TRANSPORT_PARAMS.to_vec())?;
-  Ok((client, server))
+  // structural: allow — D-8 exception 2: rustls's `ClientConnection::new` takes `Arc` by signature.
+  let cfg = Arc::new(cfg);
+  ClientConnection::new(cfg, Version::V1, server_name, TRANSPORT_PARAMS.to_vec())
+    .map_err(HandshakeError::from)
+}
+
+/// The server half of the handshake: presents `identity`'s certificate and private key.
+pub fn server_connection(identity: &Identity) -> Result<ServerConnection, HandshakeError> {
+  let cfg = server_config(identity)?;
+  // structural: allow — D-8 exception 2: rustls's `ServerConnection::new` takes `Arc` by signature.
+  ServerConnection::new(Arc::new(cfg), Version::V1, TRANSPORT_PARAMS.to_vec())
+    .map_err(HandshakeError::from)
 }
 
 #[cfg(test)]

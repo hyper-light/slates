@@ -25,6 +25,14 @@
 > on the simulation UDP fabric, no OS network. So slice 1 (codec) + slice 2 (seal, schedule, accept)
 > + slice 3 (UDP driver) are a working control plane; what is left is the session plane (QUIC) and
 > the identity that populates the keyring (enrollment).
+>
+> The **session plane is now proven end to end over UDP too** (`crates/transport/tests/session.rs`,
+> slice 4f): two `Endpoint`s complete the `rustls::quic` TLS 1.3 handshake over the UDP socket, then
+> the client sends a stream in packets protected by the 1-RTT keys and the server reassembles it byte-
+> for-byte — the whole session stack (handshake + packet protection + framing + stream reassembly)
+> live at N=1 on the sim fabric. The layers above it (reliability, flow-credit, congestion, header
+> protection, multi-stream) are built or owed as listed in slice 4; enrollment still populates neither
+> plane's identity.
 
 ## 1. Scope and the R8 spine
 
@@ -126,10 +134,15 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    source in kqueue and epoll, plus the deterministic sim fabric (the sim arm, so the whole plane is
    testable at N=1); io_uring/IOCP register-readable are typed-owed.
 4. **`slates-quic`** — **built:** the frame codec (4a), ordered streams both sides (4b), the
-   reliability core / ACK+loss recovery (4c), the flow-control credit law (4d), and the
-   `rustls::quic` TLS 1.3 handshake with pinned-identity auth (4e). **Owed:** the `Connection` that
-   wires those + record protection onto the `rt` UDP driver (with loom on the state machine and the
-   N=1 differential harness), plus congestion control and multi-range ACKs.
+   reliability core / ACK+loss recovery (4c), the flow-control credit law (4d), the
+   `rustls::quic` TLS 1.3 handshake with pinned-identity auth (4e), and the **live `Endpoint`** (4f,
+   `endpoint.rs`) that drives the handshake to the 1-RTT keys over the `rt` UDP socket, protects each
+   packet's frames with those keys (AAD = a plaintext packet-number header), and carries a stream end
+   to end — proven by the N=1 live-session integration test (`tests/session.rs`: two endpoints hand-
+   shake over the sim UDP fabric, the client sends a stream, the server reassembles it byte-for-byte).
+   **Owed on the connection:** wiring the reliability (`conn.rs`) and flow-credit (`flow.rs`) frames
+   into the endpoint loop, header protection (the packet-number header is plaintext today), congestion
+   control, multi-range ACKs, multiplexing many streams, and loom on the state machine.
    The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c);
    its fencing step and the `Keyring`'s population ride membership/enrollment.
 5. **Register/placement wiring** — owed: §4.8 head + merge-record registers and D-14 placement ride
@@ -189,8 +202,10 @@ hecate `WIRE_SECURITY.md` to slates's D-15 (TLS 1.3, not Noise). **Ratify before
 
 > Draft to ratify (2026-09-08): the framing decisions below are architecture-level (Ada's to
 > ratify). The **frame codec** is built as the pure foundation (`crates/transport/src/session.rs`),
-> as the control-datagram codec was; the connection state machine and the `rustls::quic` TLS 1.3
-> handshake are the later sub-slices.
+> as the control-datagram codec was; the ordered streams (4b), reliability/ACK/loss (4c), flow-credit
+> law (4d), `rustls::quic` TLS 1.3 handshake (4e), and the live `Endpoint` that wires the handshake,
+> packet protection, and a stream together over the UDP socket (4f, `endpoint.rs` + `tests/session.rs`)
+> are built; congestion, header protection, and multi-stream multiplexing remain.
 
 slates's session plane carries every **reliable** class (version chains, merge records, content
 transfer, cross-region). It is an owned RFC 9000/9002-shaped dialect — adapting hecate-quic's
