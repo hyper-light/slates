@@ -66,6 +66,16 @@ is only the key-finding minimum (the prologue below).
 (framing, loss recovery, streams, congestion) is **owned and sans-io** — driven by `rt`'s UDP
 readiness driver — so it pulls **no async runtime** (#2; not `quinn`/`s2n-quic`, which do).
 
+> Buildability confirmed (2026-09-08, probe then reverted): `rustls = { version = "0.23",
+> default-features = false, features = ["ring", "std"] }` **builds in this sandbox** — `ring` 0.17
+> ships prebuilt asm for `aarch64-apple-darwin`, so no `cmake`/C-toolchain step (the default
+> `aws-lc-rs` provider needs `cmake`, which is absent and banned to install, so **use the `ring`
+> provider**). So the handshake has no environment gate. When it is built: slates authenticates with
+> the **enrolled identity as a raw public key** (RFC 7250 — rustls 0.23 supports raw keys), *not* CA
+> PKI, and `ring` (pulled by rustls) also mints the test keys, so no `rcgen`. The handshake must be
+> test-driven (a client↔server handshake completing and producing matching QUIC keys), so it lands
+> as its own careful slice with rustls's `quic` + raw-key API to hand — not rushed blind.
+
 ## 4. Wire layout (the part the first codec slice builds)
 
 Fixed-layout little-endian headers; canonical `slates-wire` bodies with a schema hash (D-15). A
