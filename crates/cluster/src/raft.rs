@@ -9,11 +9,16 @@
 //! owns the election and heartbeat timers and ships the [`RequestVote`]/[`VoteReply`]/[`AppendEntries`]/
 //! [`AppendReply`] it returns.
 //!
-//! Degenerate on a laptop (`f = 0`): one voter, itself; an election reaches a majority of one at once
-//! and an appended entry commits at once — the same code path as a fleet, never a mode switch (R8). Owed
-//! (the rest of the dialect, each its own slice): PreVote and CheckQuorum, joint consensus for
-//! membership changes, ReadIndex for linearizable reads, snapshot/log compaction, and the bug-record
-//! conformance suite.
+//! Also built: **PreVote** (§9.6) — a would-be candidate first runs a non-binding pre-vote round at the
+//! term it *would* seek, without incrementing its own term; only on a majority of pre-votes does it start
+//! a real election. A peer refuses a pre-vote while it still believes a leader is alive, so a
+//! partitioned, term-inflated node cannot force a healthy leader to step down when it rejoins.
+//!
+//! Degenerate on a laptop (`f = 0`): one voter, itself; a pre-vote and an election each reach a majority
+//! of one at once and an appended entry commits at once — the same code path as a fleet, never a mode
+//! switch (R8). Owed (the rest of the dialect, each its own slice): CheckQuorum (a leader stepping down
+//! without a quorum), joint consensus for membership changes, ReadIndex for linearizable reads,
+//! snapshot/log compaction, and the bug-record conformance suite.
 //!
 //! Evidence: Ongaro & Ousterhout, *In Search of an Understandable Consensus Algorithm (Extended
 //! Version)*, 2014 (tier A); the safety argument for the election restriction is §5.4.
@@ -22,12 +27,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use slates_db::register::HostId;
 
-/// A node's role in its term (Raft §5.1). A follower defers to a leader; a candidate is seeking votes; a
-/// leader has a majority for its term.
+/// A node's role in its term (Raft §5.1, plus the PreVote pre-candidacy of §9.6). A follower defers to a
+/// leader; a pre-candidate is testing whether an election could win without yet inflating its term; a
+/// candidate is seeking votes; a leader has a majority for its term.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
-  /// Passive — grants votes and (once replication lands) accepts a leader's entries.
+  /// Passive — grants votes and accepts a leader's entries.
   Follower,
+  /// Running a pre-vote round (§9.6): gathering non-binding assurances that an election could win,
+  /// without incrementing its term, so a partitioned node cannot disrupt a healthy leader.
+  PreCandidate,
   /// Seeking votes for its term.
   Candidate,
   /// Won a majority for its term.
@@ -46,6 +55,33 @@ pub struct RequestVote {
   pub last_log_index: u64,
   /// The term of the candidate's last log entry (zero when its log is empty).
   pub last_log_term: u64,
+}
+
+/// A pre-vote request (Raft §9.6): asked at the term the candidate *would* seek (`current + 1`) without
+/// the candidate incrementing its own term. A peer answers whether it would grant a real vote — but its
+/// term is left untouched, so a partitioned high-term node cannot force the cluster's term upward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreVote {
+  /// The term the candidate would seek (its current term plus one).
+  pub term: u64,
+  /// The pre-candidate.
+  pub candidate: HostId,
+  /// The index of the candidate's last log entry.
+  pub last_log_index: u64,
+  /// The term of the candidate's last log entry.
+  pub last_log_term: u64,
+}
+
+/// A reply to a [`PreVote`]: the voter and whether it would grant a real vote. It carries no term
+/// authority — a pre-vote never changes any node's term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreVoteReply {
+  /// The voter replying.
+  pub voter: HostId,
+  /// The term the pre-vote was for (the candidate matches replies to its pre-election).
+  pub term: u64,
+  /// Whether the voter would grant a real vote.
+  pub granted: bool,
 }
 
 /// A reply to a [`RequestVote`]: the replying voter, its current term (so a candidate learns of a newer
@@ -117,6 +153,8 @@ pub struct RaftNode {
   voted_for: Option<HostId>,
   role: Role,
   votes: BTreeSet<HostId>,
+  pre_votes: BTreeSet<HostId>,
+  has_leader: bool,
   log: Vec<LogEntry>,
   commit_index: u64,
   next_index: BTreeMap<HostId, u64>,
@@ -133,6 +171,8 @@ impl RaftNode {
       voted_for: None,
       role: Role::Follower,
       votes: BTreeSet::new(),
+      pre_votes: BTreeSet::new(),
+      has_leader: false,
       log: Vec::new(),
       commit_index: 0,
       next_index: BTreeMap::new(),
@@ -157,6 +197,8 @@ impl RaftNode {
       voted_for,
       role: Role::Follower,
       votes: BTreeSet::new(),
+      pre_votes: BTreeSet::new(),
+      has_leader: false,
       log,
       commit_index: 0,
       next_index: BTreeMap::new(),
@@ -184,9 +226,74 @@ impl RaftNode {
     self.voted_for
   }
 
+  /// The caller's election timer fired with no leader contact: begin a **pre-election** (Raft §9.6).
+  /// The node becomes a pre-candidate and forgets its belief in a leader, but does **not** increment its
+  /// term; it returns the [`PreVote`] to send each other voter, asking whether a real election could
+  /// win. A single voter's pre-vote already carries a majority, so it proceeds straight to a real
+  /// election and leads (the `f = 0` degenerate, no messages). Preferring this over a direct
+  /// `start_election` is what keeps a partitioned, term-inflated node from disrupting a healthy leader.
+  pub fn on_election_timeout(&mut self) -> Vec<PreVote> {
+    self.has_leader = false;
+    self.role = Role::PreCandidate;
+    self.pre_votes = BTreeSet::from([self.id]);
+    if self.pre_votes.len() >= self.majority() {
+      self.start_election();
+      return Vec::new();
+    }
+    let request = PreVote {
+      term: self.current_term.saturating_add(1),
+      candidate: self.id,
+      last_log_index: self.last_log_index(),
+      last_log_term: self.last_log_term(),
+    };
+    self
+      .voters
+      .iter()
+      .copied()
+      .filter(|voter| *voter != self.id)
+      .map(|_| request)
+      .collect()
+  }
+
+  /// Answers a received [`PreVote`] (Raft §9.6) **without changing this node's term, vote or role** — a
+  /// pre-vote is non-binding. The node would grant a real vote only if it does not currently believe a
+  /// leader is alive (it has not heard from one since its own election timeout), it is not itself the
+  /// leader, the pre-vote's term is ahead of its own, and the candidate's log is at least as up-to-date.
+  /// Because the term is never touched, a partitioned node's inflated term cannot force a step-down here.
+  pub fn on_pre_vote(&self, request: PreVote) -> PreVoteReply {
+    let granted = !self.has_leader
+      && self.role != Role::Leader
+      && request.term > self.current_term
+      && self.candidate_log_is_current(request.last_log_index, request.last_log_term);
+    PreVoteReply {
+      voter: self.id,
+      term: request.term,
+      granted,
+    }
+  }
+
+  /// Handles a received [`PreVoteReply`]. While this node is a pre-candidate for this pre-term, a granted
+  /// reply is counted; once a majority would grant, the node starts the **real** election (incrementing
+  /// its term now, having confirmed it can win) and returns the [`RequestVote`] to send. Otherwise
+  /// `None`.
+  pub fn on_pre_vote_reply(&mut self, reply: PreVoteReply) -> Option<Vec<RequestVote>> {
+    if self.role != Role::PreCandidate
+      || reply.term != self.current_term.saturating_add(1)
+      || !reply.granted
+    {
+      return None;
+    }
+    self.pre_votes.insert(reply.voter);
+    if self.pre_votes.len() >= self.majority() {
+      return Some(self.start_election());
+    }
+    None
+  }
+
   /// The caller's election timer fired: begin an election (Raft §5.2). Advance to the next term, become
   /// a candidate, vote for self, and return the [`RequestVote`] to send each *other* voter. A single
   /// voter reaches its own majority here and becomes leader with no messages (the `f = 0` degenerate).
+  /// Prefer [`on_election_timeout`](RaftNode::on_election_timeout), which runs the pre-vote round first.
   pub fn start_election(&mut self) -> Vec<RequestVote> {
     self.current_term = self.current_term.saturating_add(1);
     self.role = Role::Candidate;
@@ -379,8 +486,10 @@ impl RaftNode {
     if request.term > self.current_term {
       self.step_down(request.term);
     }
-    // A current-term append means a leader exists for our term — defer to it (a candidate steps down).
+    // A current-term append means a leader exists for our term — defer to it (a candidate steps down)
+    // and note the contact, so we refuse pre-votes that would disrupt this leader (§9.6).
     self.role = Role::Follower;
+    self.has_leader = true;
 
     // Consistency check: our log must contain the previous entry with the leader's term.
     if request.prev_log_index > 0
@@ -786,6 +895,95 @@ mod tests {
       leader.commit_index(),
       2,
       "committing the current-term entry carries the earlier one"
+    );
+  }
+
+  /// A lone voter's pre-vote round carries at once and proceeds straight to a real election, so it leads
+  /// (the `f = 0` degenerate of PreVote).
+  #[test]
+  fn a_solo_node_pre_elects_and_leads() {
+    let mut node = RaftNode::new(A, vec![A]);
+    let pre_votes = node.on_election_timeout();
+    assert!(pre_votes.is_empty(), "a lone voter sends no pre-votes");
+    assert!(node.is_leader(), "and proceeds straight to leadership");
+    assert_eq!(node.term(), 1);
+  }
+
+  /// The anti-disruption property (Raft §9.6): a node that has heard from a leader refuses a pre-vote —
+  /// even one at a far higher term — and, crucially, its own term is left untouched, so a partitioned,
+  /// term-inflated node that rejoins cannot force the healthy leader to step down.
+  #[test]
+  fn a_partitioned_node_cannot_disrupt_a_node_with_a_leader() {
+    let mut node = RaftNode::new(B, vec![A, B, C]);
+    // B hears a heartbeat from leader A at term 1.
+    node.on_append_entries(AppendEntries {
+      term: 1,
+      leader: A,
+      prev_log_index: 0,
+      prev_log_term: 0,
+      entries: Vec::new(),
+      leader_commit: 0,
+    });
+    assert_eq!(node.term(), 1);
+
+    // A partitioned node with an inflated term asks for a pre-vote.
+    let reply = node.on_pre_vote(PreVote {
+      term: 10,
+      candidate: C,
+      last_log_index: 0,
+      last_log_term: 0,
+    });
+    assert!(
+      !reply.granted,
+      "a node with a live leader refuses the pre-vote"
+    );
+    assert_eq!(
+      node.term(),
+      1,
+      "and its term is not inflated by the pre-vote"
+    );
+  }
+
+  /// A pre-vote majority starts the real election: a pre-candidate that gathers a majority of pre-votes
+  /// increments its term and issues real vote requests.
+  #[test]
+  fn pre_votes_from_a_majority_start_a_real_election() {
+    let mut node = RaftNode::new(A, vec![A, B, C]);
+    let pre_votes = node.on_election_timeout();
+    assert_eq!(pre_votes.len(), 2, "a pre-vote to each other voter");
+    assert_eq!(node.role(), Role::PreCandidate);
+    assert_eq!(
+      node.term(),
+      0,
+      "the term is not inflated during the pre-vote round"
+    );
+
+    let requests = node.on_pre_vote_reply(PreVoteReply {
+      voter: B,
+      term: 1,
+      granted: true,
+    });
+    let requests = requests.expect("a pre-vote majority starts the real election");
+    assert_eq!(requests.len(), 2, "real vote requests are issued");
+    assert_eq!(node.role(), Role::Candidate);
+    assert_eq!(node.term(), 1, "now the term advances");
+  }
+
+  /// A candidate whose term is behind is refused a pre-vote even by a leaderless peer — its pre-vote term
+  /// does not exceed the peer's, so it could not win a real election either.
+  #[test]
+  fn a_behind_candidate_is_refused_a_pre_vote() {
+    // A leaderless peer at term 5.
+    let node = RaftNode::recovered(A, vec![A, B, C], 5, None, Vec::new());
+    let reply = node.on_pre_vote(PreVote {
+      term: 3,
+      candidate: B,
+      last_log_index: 0,
+      last_log_term: 0,
+    });
+    assert!(
+      !reply.granted,
+      "a pre-vote term not ahead of ours is refused"
     );
   }
 }
