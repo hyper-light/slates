@@ -37,6 +37,16 @@ impl Cluster {
     Cluster { nodes }
   }
 
+  /// A cluster of `node_ids` where the initial voter configuration is only `voters` (the others are
+  /// present as nodes that accept a leader's entries — the members a joint membership change will add).
+  fn with_voter_config(node_ids: &[HostId], voters: Vec<HostId>) -> Cluster {
+    let nodes = node_ids
+      .iter()
+      .map(|id| RaftNode::new(*id, voters.clone()))
+      .collect();
+    Cluster { nodes }
+  }
+
   /// The node with id `who`.
   fn at(&mut self, who: HostId) -> &mut RaftNode {
     self
@@ -296,5 +306,43 @@ fn a_rejoining_partitioned_node_does_not_disrupt_a_healthy_leader() {
     cluster.at(A).term(),
     leader_term,
     "and its term is unchanged"
+  );
+}
+
+/// Joint consensus (Raft §6) across nodes: during a membership change from `{A,B,C}` to `{C,D,E}`, a
+/// commit needs a majority of BOTH configurations. A majority of the old configuration alone does not
+/// commit; only when both hold the entry does it — so no two disjoint majorities can form across the
+/// change.
+#[test]
+fn a_joint_change_commits_only_with_both_configurations() {
+  let c = HostId(3);
+  let d = HostId(4);
+  let e = HostId(5);
+  // Five nodes exist; the initial voter configuration is only {A, B, C}. D and E are the members the
+  // change adds — present as nodes that accept the leader's entries.
+  let mut cluster = Cluster::with_voter_config(&[A, B, c, d, e], vec![A, B, c]);
+
+  cluster.elect(A, &[A, B, c].into_iter().collect());
+  assert!(cluster.at(A).is_leader());
+  assert!(
+    cluster.at(A).begin_membership_change(vec![c, d, e]),
+    "enter the joint configuration"
+  );
+  cluster.at(A).append_command(b"during-change".to_vec());
+
+  // Replicate to B alone: a majority of the old {A,B,C} (with A), but no majority of the new {C,D,E}.
+  cluster.replicate(A, &[B].into_iter().collect());
+  assert_eq!(
+    cluster.at(A).commit_index(),
+    0,
+    "a majority of the old configuration alone does not commit during a joint change"
+  );
+
+  // Replicate to C and D: now a majority of the new {C,D,E} too (and still of the old).
+  cluster.replicate(A, &[c, d].into_iter().collect());
+  assert_eq!(
+    cluster.at(A).commit_index(),
+    1,
+    "a majority of both configurations commits"
   );
 }
