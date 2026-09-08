@@ -216,7 +216,12 @@ original. Send — `StreamSender`: buffered bytes framed **only within the flow-
 peer grants, at most a frame cap per frame (the never-whole-object-in-credit invariant enforced on
 send), and a `send_and_receive_round_trip` test proves the two sides compose into reliable ordered
 delivery. An offer past the window is a typed refusal.
-**Owed:** the connection state machine (packet numbers, ack/loss recovery, the credit accounting that
-*sets* the window from the peer's `MaxStreamData`), the `rustls::quic` handshake, and the wiring onto
-the `rt` UDP driver (the control plane's `accept`/seal are the datagram-plane analogue already
-wired). CRYPTO frames are `rustls::quic`'s, not ours.
+**Built (slice 4c):** the reliability core (`conn.rs`) — packet-number assignment, ACK generation
+(receive side: the top contiguous run), and ACK processing with loss detection (send side: free the
+acknowledged, declare a gap lost past the RFC 9002 reorder threshold, retransmit its frames), proven
+by a `reliable_delivery_survives_loss` test that drops a packet and shows the whole stream still
+arrives once each (the assembler dedups the retransmit). **Owed:** multi-range ACKs, timer-based
+tail-loss recovery, congestion control, the credit accounting that *sets* the window from the peer's
+`MaxStreamData`, the `rustls::quic` TLS 1.3 handshake, and the wiring onto the `rt` UDP driver (the
+control plane's `accept`/seal are the datagram-plane analogue already wired). CRYPTO frames are
+`rustls::quic`'s, not ours.
