@@ -21,11 +21,19 @@
 //! of the members rather than a fixed rotation, so every member is probed once per round and the
 //! worst-case wait for a first probe is one round; the shuffle is a deterministic xorshift seeded from
 //! the node id, so the simulation stays reproducible. This completes the §4.8 membership mechanism set.
+//!
+//! Coordinate-aware indirect probing: the detector carries a Vivaldi coordinate engine ([`crate::coordinates`])
+//! fed by measured round-trip times ([`observe_rtt`](Detector::observe_rtt)) and the coordinates it learns
+//! for peers ([`learn_coordinate`](Detector::learn_coordinate)). When a direct probe is lost, the
+//! indirect-probe relays are chosen **nearest the target** in coordinate space rather than arbitrarily,
+//! so the retry goes through a proxy likeliest to reach the target and a slow far peer is not mistaken for
+//! a failed near one. With no coordinates learned it falls back to a deterministic id order.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_db::register::HostId;
 
+use crate::coordinates::{CoordinateEngine, NetworkCoordinate};
 use crate::membership::{Change, Liveness, MemberState, Membership};
 
 /// A ping to send to `to` — probe it this period.
@@ -104,6 +112,8 @@ pub struct Detector {
   gossip: BTreeMap<HostId, (MemberState, u32)>,
   health: u32,
   shuffler: RandomizedOrder,
+  coordinates: CoordinateEngine,
+  peer_coordinates: BTreeMap<HostId, NetworkCoordinate>,
   timing: DetectorTiming,
 }
 
@@ -169,8 +179,51 @@ impl Detector {
       gossip: BTreeMap::new(),
       health: 0,
       shuffler: RandomizedOrder::seeded(local),
+      coordinates: CoordinateEngine::new(),
+      peer_coordinates: BTreeMap::new(),
       timing,
     }
+  }
+
+  /// This node's own network coordinate, to gossip so peers can predict the round-trip time to it.
+  pub fn coordinate(&self) -> NetworkCoordinate {
+    self.coordinates.coordinate()
+  }
+
+  /// Learns `peer`'s network coordinate (from a probe reply or gossip), so this node can predict the
+  /// round-trip time to it and rank it among indirect-probe relays by proximity.
+  pub fn learn_coordinate(&mut self, peer: HostId, coordinate: NetworkCoordinate) {
+    if peer != self.local {
+      self.peer_coordinates.insert(peer, coordinate);
+    }
+  }
+
+  /// Folds a measured round-trip `rtt` to `peer` into this node's own coordinate (Vivaldi), when `peer`'s
+  /// coordinate is known — so the coordinate learns to predict RTTs from real samples. A sample to a peer
+  /// whose coordinate is not yet known is skipped (there is nothing to relax against).
+  pub fn observe_rtt(&mut self, peer: HostId, rtt: f64) {
+    if let Some(coordinate) = self.peer_coordinates.get(&peer) {
+      self.coordinates.update_with_rtt(coordinate, rtt);
+    }
+  }
+
+  /// The predicted round-trip time from this node to `peer`, when `peer`'s coordinate is known.
+  pub fn predicted_rtt(&self, peer: HostId) -> Option<f64> {
+    self
+      .peer_coordinates
+      .get(&peer)
+      .map(|coordinate| self.coordinates.predict(coordinate))
+  }
+
+  /// The predicted round-trip time between two peers whose coordinates this node has learned — the basis
+  /// for picking indirect-probe relays that sit near the target.
+  fn predicted_between(&self, from: HostId, to: HostId) -> Option<f64> {
+    let from_coordinate = self.peer_coordinates.get(&from)?;
+    let to_coordinate = self.peer_coordinates.get(&to)?;
+    Some(CoordinateEngine::estimate_rtt(
+      from_coordinate,
+      to_coordinate,
+    ))
   }
 
   /// The Lifeguard local-health multiplier, `health + 1` — how much the node's own timing is dilated
@@ -385,11 +438,28 @@ impl Detector {
     if self.acked {
       return Vec::new();
     }
-    self
+    let mut relays: Vec<HostId> = self
       .membership
       .alive()
       .into_iter()
       .filter(|host| *host != self.local && *host != target)
+      .collect();
+    // Prefer relays that sit nearest the target in coordinate space — they are the likeliest to reach it,
+    // so a lost direct packet is retried through a near proxy rather than an arbitrary one. A relay whose
+    // distance to the target is unknown sorts last, keeping a deterministic id-order fallback.
+    relays.sort_by(|a, b| {
+      match (
+        self.predicted_between(*a, target),
+        self.predicted_between(*b, target),
+      ) {
+        (Some(x), Some(y)) => x.total_cmp(&y).then(a.0.cmp(&b.0)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.0.cmp(&b.0),
+      }
+    });
+    relays
+      .into_iter()
       .take(fanout)
       .map(|relay| PingReq { relay, target })
       .collect()
@@ -853,5 +923,71 @@ mod tests {
       expected,
       "the next round reshuffles and covers them again"
     );
+  }
+
+  /// A peer at a known coordinate has a predicted RTT; feeding consistent RTT samples converges the
+  /// prediction toward them, and an unknown peer has no prediction.
+  #[test]
+  fn observing_rtts_lets_the_node_predict_a_peer() {
+    let mut detector = Detector::new(LOCAL, timing(3, 2));
+    detector.join(A);
+    let mut peer = NetworkCoordinate::origin(8);
+    peer.vec[0] = 30.0;
+    peer.error = 0.05;
+    detector.learn_coordinate(A, peer);
+
+    assert!(
+      detector.predicted_rtt(A).is_some(),
+      "a known peer has a prediction"
+    );
+    assert_eq!(detector.predicted_rtt(B), None, "an unknown peer has none");
+
+    for _ in 0..200 {
+      detector.observe_rtt(A, 35.0);
+    }
+    let predicted = detector.predicted_rtt(A).expect("A is known");
+    assert!(
+      (predicted - 35.0).abs() < 35.0 * 0.2,
+      "the prediction {predicted} converged near the measured RTT 35"
+    );
+  }
+
+  /// When a direct probe is lost, the indirect-probe relays are ordered nearest-first to the target in
+  /// coordinate space — a near proxy is likeliest to reach the target.
+  #[test]
+  fn indirect_probe_prefers_relays_near_the_target() {
+    let mut detector = Detector::new(LOCAL, timing(3, 2));
+    // Peers on a line at increasing positions; the coordinate distance is the position gap.
+    let positions = [(A, 0.0), (B, 1.0), (C, 2.0), (HostId(5), 10.0)];
+    for &(host, x) in &positions {
+      detector.join(host);
+      let mut coordinate = NetworkCoordinate::origin(8);
+      coordinate.vec[0] = x;
+      coordinate.error = 0.05;
+      detector.learn_coordinate(host, coordinate);
+    }
+    let position = |host: HostId| {
+      positions
+        .iter()
+        .find(|(candidate, _)| *candidate == host)
+        .map(|(_, x)| *x)
+        .expect("a known peer")
+    };
+
+    detector.tick(); // opens a probe of some target (its ack is then withheld)
+    let requests = detector.request_indirect(positions.len());
+    assert!(requests.len() >= 2, "several relays are available");
+
+    // The relays must be non-decreasing in distance to the target — nearest first.
+    let target = requests[0].target;
+    let mut previous = 0.0;
+    for request in &requests {
+      let distance = (position(request.relay) - position(target)).abs();
+      assert!(
+        distance + f64::EPSILON >= previous,
+        "relays are ordered nearest-first to the target"
+      );
+      previous = distance;
+    }
   }
 }
