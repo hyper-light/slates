@@ -81,6 +81,8 @@ pub enum RegisterError {
     /// The scope named.
     scope: DurabilityScope,
   },
+  /// A shipped record's bytes were truncated or claimed a length past what arrived.
+  MalformedRecord,
 }
 
 /// What `await placed` waits for (§4.8 "Mirroring", D-18): the home region's commit, or the
@@ -218,6 +220,102 @@ impl Default for Fence {
   }
 }
 
+/// A register record on its way to the candidate holders (§4.8 "records are sent to all candidates"):
+/// the object it belongs to, the owner's host epoch (which a holder fences against, D-16), and the
+/// value bytes (the head, chain version, lease or catalog entry — opaque here). This is the canonical
+/// serialization that rides the session plane's RPC to each holder (`docs/wip/fleet-transport.md` §8);
+/// the format is the to-ratify recommendation (object, epoch, then a length-prefixed value).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Record {
+  /// The object (volume head, chain, lease, catalog entry) this record belongs to.
+  pub object: u64,
+  /// The owner's host epoch; a holder refuses a record below the highest epoch it has seen (fencing).
+  pub epoch: HostEpoch,
+  /// The record's value bytes (opaque to the register protocol).
+  pub value: Vec<u8>,
+}
+
+/// The fixed prefix of an encoded record: the object and epoch words plus the value's length.
+/// Format: §4.8 record layout — `object` (u64 LE), `epoch` (u64 LE), `value_len` (u32 LE), then the
+/// value bytes; a record is MTU-shippable, so the length is a `u32`.
+const RECORD_PREFIX_BYTES: usize = size_of::<u64>() + size_of::<u64>() + size_of::<u32>();
+
+impl Record {
+  /// The canonical bytes: object, epoch, value length, value — little-endian throughout, so two hosts
+  /// encode a record identically (a determinism the holder set relies on).
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::with_capacity(RECORD_PREFIX_BYTES + self.value.len());
+    out.extend_from_slice(&self.object.to_le_bytes());
+    out.extend_from_slice(&self.epoch.0.to_le_bytes());
+    let value_len = u32::try_from(self.value.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&value_len.to_le_bytes());
+    out.extend_from_slice(&self.value);
+    out
+  }
+
+  /// Reconstructs a record from `bytes`, checking every length against what remains before reading, so
+  /// a truncated or over-claiming record is a typed [`RegisterError::MalformedRecord`], never a panic
+  /// or an over-read (the hostile-input rule; this parses bytes that crossed the network).
+  pub fn decode(bytes: &[u8]) -> Result<Record, RegisterError> {
+    if bytes.len() < RECORD_PREFIX_BYTES {
+      return Err(RegisterError::MalformedRecord);
+    }
+    let (object_bytes, rest) = bytes.split_at(size_of::<u64>());
+    let (epoch_bytes, rest) = rest.split_at(size_of::<u64>());
+    let (len_bytes, value_bytes) = rest.split_at(size_of::<u32>());
+    let object = u64::from_le_bytes(object_bytes.try_into().unwrap_or([0; 8]));
+    let epoch = HostEpoch(u64::from_le_bytes(epoch_bytes.try_into().unwrap_or([0; 8])));
+    let value_len = u32::from_le_bytes(len_bytes.try_into().unwrap_or([0; 4]));
+    let value_len = usize::try_from(value_len).unwrap_or(usize::MAX);
+    if value_bytes.len() != value_len {
+      return Err(RegisterError::MalformedRecord);
+    }
+    Ok(Record {
+      object,
+      epoch,
+      value: value_bytes.to_vec(),
+    })
+  }
+}
+
+/// A candidate holder of an object's records (§4.8 "2f+1 candidate holders, the owner among them"). A
+/// real holder is reached over the session plane's RPC; the owner's own hold is local. `deliver`
+/// applies the record — fencing it against the holder's highest-seen epoch — and returns the holder's
+/// id on acknowledgement, or a [`RegisterError`] (a fenced record does not acknowledge, so it is not
+/// counted toward the commit). This is the seam the transport plugs a remote holder into (slice 5c);
+/// the register protocol here stays sans-io.
+pub trait Holder {
+  /// Delivers `record` to this holder, returning its host id if it acknowledges (held under an epoch
+  /// at least as high as any it has seen), or refusing.
+  fn deliver(&mut self, record: &Record) -> Result<HostId, RegisterError>;
+}
+
+/// Ships `record` to the `candidates`' `holders` (the owner's local hold among them, `holders[i]` the
+/// holder for `candidates[i]`) and returns the resulting [`Placement`] — the candidates and the subset
+/// that acknowledged. The write commits when the placement is `placed(quorum)` (`f + 1`
+/// acknowledgements, §4.8 "one quorum rule"); a holder that fences the record (a stale epoch) does not
+/// acknowledge and is not counted, so a resumed stale owner cannot gather a quorum. At `f = 0` there is
+/// one holder, the owner, and its local hold is the commit — the same code path, never a mode switch
+/// (R8). `candidates` and `holders` must be the same length (a candidate and the holder that reaches
+/// it); a surplus holder or candidate beyond the shorter is ignored.
+pub fn commit_over_holders(
+  candidates: &[HostId],
+  record: &Record,
+  holders: &mut [&mut dyn Holder],
+) -> Placement {
+  let mut acked = Vec::new();
+  for holder in holders.iter_mut() {
+    if let Ok(host) = holder.deliver(record) {
+      acked.push(host);
+    }
+  }
+  Placement {
+    candidates: candidates.to_vec(),
+    acked,
+    mirror_acked: None,
+  }
+}
+
 /// The configuration oracle (§4.8 "Configuration, by consensus"): membership, the fault
 /// tolerance, and the version every request carries. On a laptop it is one self-acknowledging
 /// voter whose version never advances; in a fleet the regional group writes it and a request
@@ -298,44 +396,44 @@ impl Configuration {
 mod tests {
   use super::*;
 
-  /// A simulated fleet holder that accepts a record under a fence and acknowledges: the other
-  /// leg of the N=1 differential, so `f = 1` runs the same protocol as `f = 0` locally.
-  struct Holder {
+  /// A simulated fleet holder that fences a record and acknowledges: the other leg of the N=1
+  /// differential, so `f = 1` runs the same protocol as `f = 0` locally. It is a [`Holder`] — the
+  /// same seam a real transport-backed holder plugs into (slice 5c) — so the differential exercises
+  /// `commit_over_holders`, not a parallel simulation.
+  struct SimHolder {
     id: HostId,
     fence: Fence,
   }
 
-  impl Holder {
-    fn new(id: HostId) -> Holder {
-      Holder {
+  impl SimHolder {
+    fn new(id: HostId) -> SimHolder {
+      SimHolder {
         id,
         fence: Fence::new(),
       }
     }
+  }
 
-    /// Accepts a record under `epoch`, acknowledging with its id, or refusing a stale epoch.
-    fn offer(&mut self, epoch: HostEpoch) -> Result<HostId, RegisterError> {
-      self.fence.accept(epoch)?;
+  impl Holder for SimHolder {
+    fn deliver(&mut self, record: &Record) -> Result<HostId, RegisterError> {
+      self.fence.accept(record.epoch)?;
       Ok(self.id)
     }
   }
 
-  /// Runs a register write over `config`'s candidates with holder stubs that all accept, and
-  /// returns the placement observed. The owner acknowledges itself; peers are simulated.
+  /// Runs a register write over `config`'s candidates through `commit_over_holders` with a simulated
+  /// holder per candidate, and returns the placement observed. The owner's holder is local; peers are
+  /// simulated — the same code at f=0 (one holder) and f=1 (three).
   fn write(config: &Configuration, object: u64, epoch: HostEpoch) -> Placement {
     let candidates = candidates_for(config.owner, &config.neighbourhood, object, config.quorum);
-    let mut acked = Vec::new();
-    for host in &candidates {
-      let mut holder = Holder::new(*host);
-      if let Ok(id) = holder.offer(epoch) {
-        acked.push(id);
-      }
-    }
-    Placement {
-      candidates,
-      acked,
-      mirror_acked: None,
-    }
+    let record = Record {
+      object,
+      epoch,
+      value: Vec::new(),
+    };
+    let mut holders: Vec<SimHolder> = candidates.iter().map(|h| SimHolder::new(*h)).collect();
+    let mut refs: Vec<&mut dyn Holder> = holders.iter_mut().map(|h| h as &mut dyn Holder).collect();
+    commit_over_holders(&candidates, &record, &mut refs)
   }
 
   /// AC-2.5 (the register slice): the observable outcome of a write — placed or not, and the
@@ -413,6 +511,68 @@ mod tests {
       Err(RegisterError::ConfigurationStale { version: 7 })
     );
     assert!(advanced.check_version(7).is_ok());
+  }
+
+  /// A record round-trips through its canonical bytes, and a truncated or over-claiming one is a
+  /// typed `MalformedRecord` (hostile input; a record crosses the network). A golden vector pins the
+  /// encoding so a change is caught across versions.
+  #[test]
+  fn a_record_round_trips_and_refuses_malformation() {
+    let record = Record {
+      object: 0x0102_0304_0506_0708,
+      epoch: HostEpoch(0x1122_3344),
+      value: b"head@v7".to_vec(),
+    };
+    let bytes = record.encode();
+    assert_eq!(Record::decode(&bytes), Ok(record.clone()), "round-trip");
+
+    // Golden: object (8 LE) + epoch (8 LE) + len (4 LE) + value.
+    let mut golden = vec![0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01];
+    golden.extend_from_slice(&[0x44, 0x33, 0x22, 0x11, 0, 0, 0, 0]);
+    golden.extend_from_slice(&[0x07, 0, 0, 0]);
+    golden.extend_from_slice(b"head@v7");
+    assert_eq!(bytes, golden, "the canonical encoding is stable");
+
+    // Hostile: a truncated prefix, and a value length past what arrived.
+    assert_eq!(
+      Record::decode(&bytes[..4]),
+      Err(RegisterError::MalformedRecord)
+    );
+    assert_eq!(
+      Record::decode(&bytes[..bytes.len() - 1]),
+      Err(RegisterError::MalformedRecord),
+      "a value shorter than its declared length is refused"
+    );
+  }
+
+  /// A holder that fences the record (a stale epoch) does not acknowledge, so it is not counted toward
+  /// the commit: at f=1 with only the owner accepting and both peers fencing, the write is **not**
+  /// placed (one ack, commit needs two) — StaleNeverCommits, over the real ship-and-collect path.
+  #[test]
+  fn a_fencing_holder_is_not_counted_toward_the_commit() {
+    let owner = HostId(1);
+    let quorum = Quorum { f: 1 };
+    let candidates = vec![owner, HostId(2), HostId(3)];
+    let record = Record {
+      object: 9,
+      epoch: HostEpoch(5),
+      value: b"v".to_vec(),
+    };
+
+    // The owner accepts; the two peers have already seen a higher epoch, so they fence this record.
+    let mut owner_holder = SimHolder::new(owner);
+    let mut peer_two = SimHolder::new(HostId(2));
+    let mut peer_three = SimHolder::new(HostId(3));
+    peer_two.fence.accept(HostEpoch(6)).unwrap();
+    peer_three.fence.accept(HostEpoch(6)).unwrap();
+    let mut refs: Vec<&mut dyn Holder> = vec![&mut owner_holder, &mut peer_two, &mut peer_three];
+
+    let placement = commit_over_holders(&candidates, &record, &mut refs);
+    assert_eq!(placement.acked, vec![owner], "only the owner acknowledged");
+    assert!(
+      !placement.placed(quorum),
+      "one acknowledgement does not commit at f=1; the fenced peers are not counted"
+    );
   }
 
   /// `await placed(region)` is the local append at f=0; `await placed(mirror)` is refused
