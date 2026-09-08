@@ -286,6 +286,31 @@ fn a_disjoint_edit_plus_an_identical_overlap_accepts_per_range() {
   assert_eq!(green.content("f"), Some(b"ABCDWXYZ".as_slice()));
 }
 
+/// Unlinking a symlink removes it (§4.16: the unlink op applies to a symlink path, not only a
+/// regular file). A conflict-free removal from a version that still holds the symlink accepts.
+#[test]
+fn unlinking_a_symlink_removes_it() {
+  let mut green = Green::new();
+  green.submit(&Build::new().symlink("l", "target").at(1, 0));
+  assert_eq!(green.symlink("l"), Some("target"));
+  let outcome = green.submit(&Build::new().remove("l").at(2, 1));
+  assert_eq!(outcome, Outcome::Accepted { version: 2 });
+  assert_eq!(green.symlink("l"), None, "unlink removes the symlink");
+}
+
+/// Unlinking a hard link removes that name (§4.16; the shared file's fate is the volume's concern
+/// at apply time, not the merge's — the merge removes the namespace edge).
+#[test]
+fn unlinking_a_hardlink_removes_it() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("f", b"shared").at(1, 0));
+  green.submit(&Build::new().link("h", "f").at(2, 1));
+  assert_eq!(green.hardlink("h"), Some("f"));
+  let outcome = green.submit(&Build::new().remove("h").at(3, 2));
+  assert_eq!(outcome, Outcome::Accepted { version: 3 });
+  assert_eq!(green.hardlink("h"), None, "unlink removes the hard link");
+}
+
 /// An insert before an accepted disjoint edit shifts the later one, and both apply.
 #[test]
 fn an_intervening_insert_shifts_a_later_edit() {

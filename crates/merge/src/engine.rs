@@ -285,8 +285,12 @@ enum Effect {
   Mode(String, u32),
   /// Create or retarget a symlink.
   Symlink(String, String),
+  /// Remove a symlink (its path is unlinked).
+  RemoveSymlink(String),
   /// Create or retarget a hard link (a namespace edge to the target file).
   Hardlink(String, String),
+  /// Remove a hard link's name (the shared file's fate is the volume's concern at apply time).
+  RemoveHardlink(String),
   /// Set an xattr value.
   SetXattr(String, String, Vec<u8>),
   /// Remove an xattr.
@@ -592,14 +596,30 @@ impl Green {
   }
 
   /// Merges an unlink at `path`.
+  /// Merges an unlink of whatever the path names — a regular file, a symlink, or a hard link
+  /// (§4.16). Each is a delete/modify conflict if that dimension changed since the increment's base;
+  /// a path that names nothing is a no-op (idempotent removal). A directory is not unlinked (rmdir
+  /// removes directories); a path that is a directory falls through to the no-op.
   fn merge_unlink(&self, path: &str, base: u64) -> Result<Option<Effect>, ConflictWindow> {
-    if !self.content.contains_key(path) {
-      return Ok(None); // already gone (or never a file)
+    if self.content.contains_key(path) {
+      if self.last_changed.get(path).copied().unwrap_or(0) > base {
+        return Err(Green::window(path, MergeConflictClass::DeleteModify));
+      }
+      return Ok(Some(Effect::RemoveContent(path.to_owned())));
     }
-    if self.last_changed.get(path).copied().unwrap_or(0) > base {
-      return Err(Green::window(path, MergeConflictClass::DeleteModify));
+    if self.symlinks.contains_key(path) {
+      if self.symlink_changed.get(path).copied().unwrap_or(0) > base {
+        return Err(Green::window(path, MergeConflictClass::DeleteModify));
+      }
+      return Ok(Some(Effect::RemoveSymlink(path.to_owned())));
     }
-    Ok(Some(Effect::RemoveContent(path.to_owned())))
+    if self.hardlinks.contains_key(path) {
+      if self.hardlink_changed.get(path).copied().unwrap_or(0) > base {
+        return Err(Green::window(path, MergeConflictClass::DeleteModify));
+      }
+      return Ok(Some(Effect::RemoveHardlink(path.to_owned())));
+    }
+    Ok(None) // already gone (or never present)
   }
 
   /// Merges an edit to an existing file (the content path), by the two pure passes of §4.16 / D-27.
@@ -971,8 +991,16 @@ impl Green {
           self.symlinks.insert(path.clone(), target);
           self.symlink_changed.insert(path, version);
         }
+        Effect::RemoveSymlink(path) => {
+          self.symlinks.remove(&path);
+          self.symlink_changed.insert(path, version);
+        }
         Effect::Hardlink(path, target) => {
           self.hardlinks.insert(path.clone(), target);
+          self.hardlink_changed.insert(path, version);
+        }
+        Effect::RemoveHardlink(path) => {
+          self.hardlinks.remove(&path);
           self.hardlink_changed.insert(path, version);
         }
         Effect::SetXattr(path, name, value) => {
@@ -1078,6 +1106,9 @@ impl Green {
         Effect::RemoveDir(path) => journal.push(VolumeOp::Rmdir { path }),
         Effect::Mode(path, mode) => journal.push(VolumeOp::SetMode { path, mode }),
         Effect::Symlink(path, target) => journal.push(VolumeOp::Symlink { path, target }),
+        Effect::RemoveSymlink(path) | Effect::RemoveHardlink(path) => {
+          journal.push(VolumeOp::Unlink { path });
+        }
         Effect::Hardlink(path, target) => journal.push(VolumeOp::Link { path, target }),
         Effect::SetXattr(path, name, value) => {
           journal.push(VolumeOp::SetXattr { path, name, value });
