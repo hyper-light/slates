@@ -155,9 +155,16 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    from a real timeout is owed with the runtime timer). TLS session-resumption tickets are disabled on
    the server (slates authenticates by enrolled identity, not TLS resumption; a post-handshake
    `NewSessionTicket` would otherwise reach the 1-RTT packet reader as unparseable CRYPTO bytes).
-   **Owed on the connection:** deriving the send credit from received `MaxStreamData` (flow
-   enforcement), a real probe timeout, congestion control, multi-range ACKs, connection IDs, several
-   frames per packet (an MTU budget), multiplexing many streams, and loom on the state machine.
+   **Flow control is enforced** (4j): the `Connection` runs the `flow.rs` credit law — the receiver
+   advertises `MaxStreamData` a bounded window ahead of what it has read (piggybacked on every
+   acknowledgement, so a lost credit frame re-advertises), and the sender frames only within it. The
+   initial window is derived — `(REORDER_THRESHOLD + 1) × frame_cap`, the least in-flight budget that
+   keeps reorder-based loss detection working (BDP autotuning owed). The oracle now drives a stream
+   through a window far smaller than the object and asserts the **never-whole-object** invariant
+   (`send_offset ≤ read_offset + window`) holds under loss.
+   **Owed on the connection:** a real probe timeout, congestion control, connection-level `MaxData`,
+   multi-range ACKs, connection IDs, several frames per packet (an MTU budget), multiplexing many
+   streams, and loom on the state machine.
    The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c);
    its fencing step and the `Keyring`'s population ride membership/enrollment.
 5. **Register/placement wiring** — owed: §4.8 head + merge-record registers and D-14 placement ride

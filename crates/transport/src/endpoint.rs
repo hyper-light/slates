@@ -18,7 +18,7 @@ use rustix::net::SocketAddrV4;
 use rustls::quic::{ClientConnection, KeyChange, Keys, ServerConnection};
 use slates_rt::udp::UdpSocket;
 
-use crate::connection::Connection;
+use crate::connection::{Connection, initial_receive_window};
 use crate::handshake::{HandshakeError, Identity, client_connection, server_connection};
 use crate::packet_number::{MAX_PACKET_NUMBER_BYTES, decode_packet_number, encode_packet_number};
 use crate::session::{Frame, decode_frames, encode_frames};
@@ -234,7 +234,7 @@ impl Endpoint {
     data: &[u8],
     frame_cap: usize,
   ) -> Result<(), EndpointError> {
-    let mut conn = Connection::new(stream_id);
+    let mut conn = Connection::new(stream_id, initial_receive_window(frame_cap));
     conn.send_all(data);
     let mut buf = [0u8; 2048];
     let mut rx_largest = 0u64;
@@ -258,7 +258,7 @@ impl Endpoint {
     stream_id: u64,
     frame_cap: usize,
   ) -> Result<Vec<u8>, EndpointError> {
-    let mut conn = Connection::new(stream_id);
+    let mut conn = Connection::new(stream_id, initial_receive_window(frame_cap));
     let mut buf = [0u8; 2048];
     let mut rx_largest = 0u64;
     let mut received = Vec::new();

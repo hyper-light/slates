@@ -18,8 +18,9 @@ use crate::session::Frame;
 
 /// Format: RFC 9002 §6.1.1 `kPacketThreshold` — three packets of reordering are tolerated before a
 /// gap below the largest acknowledged packet declares the missing packets lost. A protocol constant,
-/// not a tunable.
-const REORDER_THRESHOLD: u64 = 3;
+/// not a tunable. Public so the flow-control window can be sized to keep this detection working (a
+/// window of at least this many packets past a loss lets the gap form).
+pub const REORDER_THRESHOLD: u64 = 3;
 
 /// Receive-side acknowledgement state: which packet numbers have arrived, and the ACK to send back.
 #[derive(Debug, Default)]

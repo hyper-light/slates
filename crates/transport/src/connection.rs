@@ -21,18 +21,30 @@
 
 use std::collections::VecDeque;
 
-use crate::conn::{AckGenerator, SentTracker};
+use crate::conn::{AckGenerator, REORDER_THRESHOLD, SentTracker};
+use crate::flow::FlowController;
 use crate::session::Frame;
 use crate::stream::{StreamAssembler, StreamSender};
 
-/// One end of a reliable stream connection: the send side (the stream source, the in-flight tracker,
-/// and a queue of frames awaiting retransmission), the receive side (the ordered assembler and the
-/// acknowledgement generator), and whether an acknowledgement is owed for an ack-eliciting packet just
-/// received. A non-vacuity counter records how many frames have actually been retransmitted.
+/// The initial receive-window credit, in bytes, for a frame cap of `max_frame_len`.
+/// Derived: `(REORDER_THRESHOLD + 1) × max_frame_len` — the least in-flight data that keeps
+/// reorder-based loss detection working. A loss is declared when `REORDER_THRESHOLD` later packets are
+/// acknowledged past a gap (RFC 9002 §6.1.1); a window that admits one lost packet plus that many past
+/// it lets the gap form. Anchored to `conn::REORDER_THRESHOLD` and the frame size. The BDP-autotuned
+/// growth above this floor (the design's `k × frame_cap` with `k` measured) is owed.
+pub fn initial_receive_window(max_frame_len: usize) -> u64 {
+  (REORDER_THRESHOLD + 1).saturating_mul(max_frame_len as u64)
+}
+
+/// One end of a reliable, flow-controlled stream connection: the send side (the stream source bounded
+/// by the credit the peer advertises, the in-flight tracker, and a retransmission queue), the receive
+/// side (the ordered assembler, the acknowledgement generator, and the flow-control accounting that
+/// advertises credit a bounded window ahead of what has been read), and whether an acknowledgement is
+/// owed. A non-vacuity counter records how many frames have actually been retransmitted.
 pub struct Connection {
-  /// The stream id this end sends on (single-stream this slice).
+  /// The stream id this end sends on, and — single-stream this slice — the one it receives on.
   send_stream_id: u64,
-  /// The send-side stream source.
+  /// The send-side stream source (frames only within the credit the peer has advertised).
   sender: StreamSender,
   /// In-flight packet tracking and loss detection.
   sent: SentTracker,
@@ -42,6 +54,10 @@ pub struct Connection {
   assembler: StreamAssembler,
   /// Which packet numbers have arrived, and the acknowledgement to send back.
   acks: AckGenerator,
+  /// The receive-side flow-control accounting: advertises credit a window ahead of what is read.
+  flow: FlowController,
+  /// The credit window kept ahead of the read cursor (bytes).
+  window_ahead: u64,
   /// Set when an ack-eliciting packet has arrived and its acknowledgement has not yet been sent.
   ack_owed: bool,
   /// How many frames this end has retransmitted (the non-vacuity counter for the loss-recovery path).
@@ -49,25 +65,29 @@ pub struct Connection {
 }
 
 impl Connection {
-  /// A fresh connection sending on `send_stream_id`.
-  pub fn new(send_stream_id: u64) -> Connection {
+  /// A fresh connection sending on `send_stream_id`, advertising `window_ahead` bytes of receive
+  /// credit ahead of the read cursor (see [`initial_receive_window`]).
+  pub fn new(send_stream_id: u64, window_ahead: u64) -> Connection {
     Connection {
       send_stream_id,
       sender: StreamSender::new(),
       sent: SentTracker::new(),
       retransmit: VecDeque::new(),
-      assembler: StreamAssembler::new(0),
+      assembler: StreamAssembler::new(window_ahead),
       acks: AckGenerator::new(),
+      flow: FlowController::new(window_ahead),
+      window_ahead,
       ack_owed: false,
       retransmitted: 0,
     }
   }
 
-  /// Queues `data` as the whole of this end's send stream and finishes it, granting the send side the
-  /// full credit (flow enforcement — deriving the credit from the peer's `MaxStreamData` — is owed).
+  /// Queues `data` as the whole of this end's send stream and finishes it. The send side starts with
+  /// the initial window of credit (both ends derive the same window, R8); more is granted only as the
+  /// peer's `MaxStreamData` arrives, so the sender never races more than a window ahead of the reader.
   pub fn send_all(&mut self, data: &[u8]) {
     self.sender.write(data);
-    self.sender.grant_credit(data.len() as u64);
+    self.sender.grant_credit(self.window_ahead);
     self.sender.finish();
   }
 
@@ -91,6 +111,10 @@ impl Connection {
       && let Some(ack) = self.acks.ack_frame()
     {
       frames.push(ack);
+      // Piggyback the current receive credit on every acknowledgement, so a lost credit frame is
+      // re-advertised with the next one (a `MaxStreamData` is not itself retransmitted). The value is
+      // absolute, so a duplicate or reordered one is idempotent (the sender ignores a lower grant).
+      frames.push(self.flow.stream_credit_frame(self.send_stream_id));
       self.ack_owed = false;
     }
     if frames.is_empty() {
@@ -120,19 +144,24 @@ impl Connection {
           offset, fin, data, ..
         } => {
           ack_eliciting = true;
-          // Admit the segment: raise the window to cover it (flow control owed), then offer. A
-          // duplicate or reordered segment is deduped by the assembler; a refusal here would only be a
-          // window we just widened enough to prevent, so it is safe to ignore.
+          // Admit the segment: the receive window is the flow-control ceiling, which the sender was
+          // never allowed to exceed, so grant the assembler that ceiling and offer. A duplicate or
+          // reordered segment is deduped; a refusal would mean the sender broke flow control, so it is
+          // safe (and correct) to drop.
           self
             .assembler
-            .grant_window(offset.saturating_add(data.len() as u64).saturating_add(1));
+            .grant_window(self.flow.stream_max(self.send_stream_id));
           let _ = self.assembler.offer(*offset, data, *fin);
         }
         Frame::Ack { largest, range } => {
           self.sent.on_ack(*largest, *range);
         }
-        // MaxData / MaxStreamData drive flow control (owed); PADDING is nothing.
-        Frame::MaxData { .. } | Frame::MaxStreamData { .. } => {}
+        // The peer's advertised send credit: raise this end's send ceiling to it (monotonic).
+        Frame::MaxStreamData { max, .. } => {
+          self.sender.grant_credit(*max);
+        }
+        // Connection-level credit (single-stream this slice) and PADDING: nothing to do yet.
+        Frame::MaxData { .. } => {}
       }
     }
     if ack_eliciting {
@@ -156,9 +185,26 @@ impl Connection {
     probed
   }
 
-  /// Drains the bytes that have become contiguous on the receive side (in order, each once).
+  /// Drains the bytes that have become contiguous on the receive side (in order, each once) and slides
+  /// the flow-control window forward by what was consumed, so the next acknowledgement advertises fresh
+  /// credit a window ahead of the new read cursor.
   pub fn read(&mut self) -> Vec<u8> {
-    self.assembler.read()
+    let bytes = self.assembler.read();
+    self
+      .flow
+      .on_stream_consumed(self.send_stream_id, self.assembler.read_offset());
+    bytes
+  }
+
+  /// The absolute offset the send side has framed so far — for asserting the never-whole-object
+  /// invariant (the sender stays within a window of the reader).
+  pub fn send_offset(&self) -> u64 {
+    self.sender.send_offset()
+  }
+
+  /// The absolute offset the receive side has delivered so far.
+  pub fn read_offset(&self) -> u64 {
+    self.assembler.read_offset()
   }
 
   /// Whether this end has originated its whole stream and every ack-eliciting packet has been
@@ -230,9 +276,12 @@ mod tests {
   /// each end's outgoing packets, delivering or dropping each per the channel, and probes when it would
   /// otherwise stall with packets still in flight (a lost tail).
   fn transfer(content: &[u8], mut channel: Channel) -> (Vec<u8>, u64) {
-    let mut sender = Connection::new(1);
+    // A window far smaller than the object, so the transfer must slide it many times — and the
+    // never-whole-object invariant is under real pressure.
+    let window = initial_receive_window(FRAME_CAP);
+    let mut sender = Connection::new(1, window);
     sender.send_all(content);
-    let mut receiver = Connection::new(1);
+    let mut receiver = Connection::new(1, window);
     let mut received = Vec::new();
 
     let mut guard = 0u64;
@@ -244,6 +293,13 @@ mod tests {
       // Sender -> receiver (stream data).
       while let Some((pn, frames)) = sender.poll_transmit(FRAME_CAP) {
         progress = true;
+        // Never-whole-object: the sender is never more than a window ahead of what the reader has
+        // delivered — the flow-control guarantee. Without it the sender would frame the whole object
+        // at once, which this bound would catch.
+        assert!(
+          sender.send_offset() <= receiver.read_offset() + window,
+          "the sender raced more than a window ahead of the reader"
+        );
         if !channel.drops() {
           receiver.handle_incoming(pn, &frames);
         }
