@@ -22,8 +22,10 @@
 //! that already accepted (§4.8 "network receipt is not acceptance"; a retry preserves record identity).
 //!
 //! Membership ([`membership`]): the SWIM/Lifeguard failure-detection view that maintains which hosts
-//! are alive — the neighbourhood the configuration and placement draw from.
+//! are alive — the neighbourhood the configuration and placement draw from — and the [`detector`]
+//! protocol-period machine that probes members and drives that view alive → suspect → dead.
 
+pub mod detector;
 pub mod membership;
 
 use std::sync::mpsc::{TryRecvError, channel};

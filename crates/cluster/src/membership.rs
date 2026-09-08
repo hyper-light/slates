@@ -164,6 +164,17 @@ impl Membership {
     self.members.get(&member).copied()
   }
 
+  /// The members currently suspected, with their incarnations — the set the failure detector ages
+  /// toward death (each still a member until confirmed dead or refuted).
+  pub fn suspects(&self) -> Vec<(HostId, u64)> {
+    self
+      .members
+      .iter()
+      .filter(|(_, state)| state.liveness == Liveness::Suspect)
+      .map(|(&host, state)| (host, state.incarnation))
+      .collect()
+  }
+
   /// The local node's current incarnation.
   pub fn local_incarnation(&self) -> u64 {
     self.local_incarnation
