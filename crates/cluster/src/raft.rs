@@ -14,14 +14,16 @@
 //! a real election. A peer refuses a pre-vote while it still believes a leader is alive, so a
 //! partitioned, term-inflated node cannot force a healthy leader to step down when it rejoins. And
 //! **CheckQuorum** (§6.2) — a leader that has not been in contact with a majority since its previous
-//! check steps down, so a leader cut off from the cluster stops acting as one (the safety a lease read
-//! rests on). PreVote and CheckQuorum together give the stability etcd's raft ships by default.
+//! check steps down, so a leader cut off from the cluster stops acting as one. And **ReadIndex** (§6.4) —
+//! the leader serves a linearizable read at its commit index without appending a log entry, safe only
+//! when it has committed in its current term and is confirmed in contact with a majority. PreVote and
+//! CheckQuorum together give the stability etcd's raft ships by default.
 //!
 //! Degenerate on a laptop (`f = 0`): one voter, itself; a pre-vote and an election each reach a majority
 //! of one at once, an appended entry commits at once, and the lone voter is always its own quorum so it
 //! never steps down — the same code path as a fleet, never a mode switch (R8). Owed (the rest of the
-//! dialect, each its own slice): joint consensus for membership changes, ReadIndex for linearizable
-//! reads, snapshot/log compaction, and the bug-record conformance suite.
+//! dialect, each its own slice): joint consensus for membership changes, snapshot/log compaction, and the
+//! bug-record conformance suite.
 //!
 //! Evidence: Ongaro & Ousterhout, *In Search of an Understandable Consensus Algorithm (Extended
 //! Version)*, 2014 (tier A); the safety argument for the election restriction is §5.4.
@@ -573,6 +575,30 @@ impl RaftNode {
     self.contacts.clear();
   }
 
+  /// The linearizable read index (Raft §6.4): the commit index a read-only query may be served at
+  /// *without appending a log entry*, or `None` when this node cannot safely serve a linearizable read.
+  /// It is safe only when this node is the leader, has committed an entry **in its current term** (so its
+  /// commit index reflects its own term, not one blindly inherited from a predecessor — a fresh leader
+  /// must first commit a no-op), and is in contact with a majority this window (so no newer leader has
+  /// superseded it). The caller waits until it has applied at least this index, then serves the read.
+  pub fn read_index(&self) -> Option<u64> {
+    if self.role != Role::Leader {
+      return None;
+    }
+    if self.entry_term(self.commit_index) != Some(self.current_term) {
+      return None;
+    }
+    let reachable = self
+      .voters
+      .iter()
+      .filter(|voter| **voter == self.id || self.contacts.contains(voter))
+      .count();
+    if reachable < self.majority() {
+      return None;
+    }
+    Some(self.commit_index)
+  }
+
   /// Truncates the log from the one-based `index` onward (removing that entry and every later one).
   fn truncate_from(&mut self, index: u64) {
     let keep = usize::try_from(index.saturating_sub(1)).unwrap_or(usize::MAX);
@@ -1073,6 +1099,69 @@ mod tests {
     assert!(
       leader.is_leader(),
       "a single voter is always its own quorum"
+    );
+  }
+
+  /// ReadIndex (Raft §6.4): a leader serves a read only after committing in its current term. A lone
+  /// leader has no read index until it commits an entry; then the read index is its commit index.
+  #[test]
+  fn a_leader_serves_a_read_index_after_committing_in_its_term() {
+    let mut leader = elected_leader(A, vec![A]);
+    assert_eq!(
+      leader.read_index(),
+      None,
+      "no read before a current-term commit"
+    );
+
+    leader.append_command(b"cfg-1".to_vec()); // commits at once (f = 0)
+    assert_eq!(
+      leader.read_index(),
+      Some(1),
+      "the read index is the current commit index"
+    );
+  }
+
+  /// A non-leader never provides a read index — only the leader may serve a linearizable read.
+  #[test]
+  fn a_non_leader_has_no_read_index() {
+    let follower = RaftNode::new(B, vec![A, B, C]);
+    assert_eq!(follower.read_index(), None);
+  }
+
+  /// The §6.4 safety: a leader that has only an inherited (earlier-term) commit index cannot serve a
+  /// linearizable read until it commits an entry in its own term — so it never serves a read at a commit
+  /// index it has not confirmed under its own leadership.
+  #[test]
+  fn a_leader_without_a_current_term_commit_has_no_read_index() {
+    // Elected at a fresh term over an old-term log; recovered resets the commit index to zero.
+    let mut leader = RaftNode::recovered(A, vec![A, B, C], 3, None, log_of(&[3]));
+    leader.start_election(); // term 4
+    leader.on_vote_reply(VoteReply {
+      voter: B,
+      term: leader.term(),
+      granted: true,
+    });
+    assert!(leader.is_leader());
+    assert_eq!(
+      leader.read_index(),
+      None,
+      "no read until a term-4 entry commits"
+    );
+
+    // Commit a current-term entry with a majority (a follower that already holds the term-3 prefix).
+    leader.append_command(b"cfg-4".to_vec());
+    let mut follower = RaftNode::recovered(B, vec![A, B, C], 4, None, log_of(&[3]));
+    let append = leader.replicate_to(B).expect("append");
+    let reply = follower.on_append_entries(append);
+    assert!(
+      reply.success,
+      "the follower with the matching prefix accepts the append"
+    );
+    leader.on_append_reply(reply);
+    assert_eq!(
+      leader.read_index(),
+      Some(2),
+      "a term-4 commit enables the read at index 2"
     );
   }
 }
