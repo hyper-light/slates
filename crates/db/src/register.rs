@@ -437,7 +437,9 @@ pub struct Accepted {
 impl Accepted {
   /// Whether `self` is a newer record than `other`: a higher position, or the same position under a
   /// higher epoch. The adoption order of phase one — the new owner keeps the newest reported record.
-  fn newer_than(&self, other: &Accepted) -> bool {
+  /// Public so the cluster plane's live promotion collector folds promises by the same order the
+  /// sans-io [`promote_over_holders`] does.
+  pub fn newer_than(&self, other: &Accepted) -> bool {
     (self.sequence, self.epoch.0) > (other.sequence, other.epoch.0)
   }
 }
@@ -1444,7 +1446,9 @@ mod tests {
       value: b"v1".to_vec(),
     };
     owner.accept(&head).expect("the owner accepts its own head");
-    holder2.accept(&head).expect("H2 accepts the head (the commit quorum)");
+    holder2
+      .accept(&head)
+      .expect("H2 accepts the head (the commit quorum)");
     // H3 never received the head — a lagging candidate the promotion must tolerate.
     (owner, holder2, holder3, candidates)
   }
@@ -1526,7 +1530,11 @@ mod tests {
   #[test]
   fn a_takeover_adopts_the_committed_head_under_the_new_epoch() {
     let (mut owner, mut holder2, mut holder3, candidates) = committed_head();
-    let survivors: Vec<HostId> = candidates.iter().copied().filter(|h| *h != owner.id).collect();
+    let survivors: Vec<HostId> = candidates
+      .iter()
+      .copied()
+      .filter(|h| *h != owner.id)
+      .collect();
     let successor = rendezvous_first(&survivors, TAKEOVER_OBJECT).expect("a survivor takes over");
     let new_authority = Authority {
       generation: 1,
@@ -1535,8 +1543,12 @@ mod tests {
 
     // The configuration group distributed the new authority (generation 1, owner = the successor);
     // the surviving holders install it, fencing the old owner by generation.
-    holder2.install_authority(new_authority).expect("H2 installs");
-    holder3.install_authority(new_authority).expect("H3 installs");
+    holder2
+      .install_authority(new_authority)
+      .expect("H2 installs");
+    holder3
+      .install_authority(new_authority)
+      .expect("H3 installs");
 
     // The successor runs phase one at the bumped epoch 2 over the two survivors (the dead owner is
     // unreachable), promising each and adopting the newest reported record.
@@ -1598,14 +1610,22 @@ mod tests {
   #[test]
   fn a_stale_owner_cannot_commit_after_a_takeover() {
     let (owner, mut holder2, mut holder3, candidates) = committed_head();
-    let survivors: Vec<HostId> = candidates.iter().copied().filter(|h| *h != owner.id).collect();
+    let survivors: Vec<HostId> = candidates
+      .iter()
+      .copied()
+      .filter(|h| *h != owner.id)
+      .collect();
     let successor = rendezvous_first(&survivors, TAKEOVER_OBJECT).expect("a survivor takes over");
     let new_authority = Authority {
       generation: 1,
       owner: successor,
     };
-    holder2.install_authority(new_authority).expect("H2 installs");
-    holder3.install_authority(new_authority).expect("H3 installs");
+    holder2
+      .install_authority(new_authority)
+      .expect("H2 installs");
+    holder3
+      .install_authority(new_authority)
+      .expect("H3 installs");
     let prepare = Prepare {
       owner: successor,
       object: TAKEOVER_OBJECT,
@@ -1636,7 +1656,10 @@ mod tests {
       placement.acked.is_empty(),
       "no holder accepts the stale owner's write"
     );
-    assert!(!placement.placed(Quorum { f: 1 }), "the stale owner does not commit");
+    assert!(
+      !placement.placed(Quorum { f: 1 }),
+      "the stale owner does not commit"
+    );
 
     // Even a write under the *current* authority but an epoch below the fence is refused StaleEpoch —
     // the fence itself, raised by the promotion, is what stops it.
