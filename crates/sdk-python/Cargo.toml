@@ -1,0 +1,23 @@
+[package]
+name = "slates-sdk-python"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+description = "The Python SDK (§2.3, D-19; Phase 5): a PyO3 extension over the typed `slates-client`, exposing the lifecycle verbs as methods and mapping typed refusals to Python exceptions. Async over the completion descriptor is owed; this is the synchronous base the design says async wraps."
+
+[lib]
+# The Python extension module is a cdylib; `slates_sdk` is the imported name.
+name = "slates"
+crate-type = ["cdylib"]
+
+[dependencies]
+slates-client = { workspace = true }
+slates-wire = { workspace = true }
+# The PyO3 binding (D-19: "PyO3 SDK with fd completion"). abi3-py39 so one wheel serves every
+# CPython >= 3.9; `extension-module` so the build does not link libpython (the interpreter provides it).
+pyo3 = { version = "0.22", features = ["abi3-py39", "extension-module"] }
+
+[lints]
+workspace = true

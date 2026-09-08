@@ -79,8 +79,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy per target
         run: |
+          # slates-sdk-python is a host-only PyO3 extension: its cdylib cross-links against the target's
+          # Python, which the cross-lint lanes do not have (maturin builds it per platform in the wheel
+          # job). Excluded here like xtask; the native lint above still covers it.
           for target in x86_64-unknown-linux-gnu x86_64-pc-windows-msvc aarch64-apple-darwin; do
-            cargo clippy --workspace --exclude xtask --lib --bins \
+            cargo clippy --workspace --exclude xtask --exclude slates-sdk-python --lib --bins \
               --no-default-features --features slates-machine/pure-hash --target "$target" -- -D warnings
           done
 

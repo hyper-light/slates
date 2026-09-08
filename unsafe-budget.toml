@@ -90,3 +90,6 @@ slates-wire-derive = 0
 # slates-cluster (0): the register-commit dispatch is safe Rust — spawned tasks, a channel, and the
 # db acceptance rules over the transport; no raw pointers.
 slates-cluster = 0
+# slates-sdk-python (0): the PyO3 bindings are safe Rust over the typed client; the FFI unsafety lives
+# in PyO3's macro-generated code, not this crate's own source (which has no `unsafe` block).
+slates-sdk-python = 0
