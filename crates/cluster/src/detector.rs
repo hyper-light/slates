@@ -65,8 +65,16 @@ pub struct DetectorTiming {
   /// bound. Derived from the measured convergence and fleet size.
   pub gossip_transmits: u32,
   /// The cap on the Lifeguard local-health multiplier: the most the suspicion window (and the caller's
-  /// probe cadence) may be dilated when the local node itself looks unhealthy. Derived (bounded) so a
-  /// degraded node backs off without stalling detection forever.
+  /// probe cadence) may be dilated when the local node itself looks unhealthy. The effective multiplier
+  /// is `health + 1` up to `health_max + 1`, so this is the cap minus one.
+  ///
+  /// Derived: keep it **small** — 2 or 3, a cap of 3×–4×. The raw Lifeguard formula `(LHM + 1)` at the
+  /// paper's saturation `S = 8` reaches 9×, which pushes suspicion timers and probe timeouts off the
+  /// cliff under sustained probe failure; hyperscale's SWIM measured this and softened its multiplier to
+  /// `1 + score × 0.25` (a 3× cap at S = 8). This integer form reaches the same modest cap by deriving a
+  /// small `health_max` instead of a fractional weight — determinism-clean, and matching the design's
+  /// "bounded local-health multiplier" (§4.8). Anchor: hyperscale `local_health_multiplier.py`
+  /// (`get_multiplier`), the Backpressure & Degradation table (NORMAL 1× … CRITICAL 3×).
   pub health_max: u32,
   /// The floor of the suspicion window: the fewest periods a member stays suspected even when its
   /// failure is fully corroborated, from the confirmation-count timeout `max − (max−min)·log(C+1)/log(K+1)`
