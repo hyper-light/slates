@@ -234,8 +234,8 @@ impl Endpoint {
     data: &[u8],
     frame_cap: usize,
   ) -> Result<(), EndpointError> {
-    let mut conn = Connection::new(stream_id, initial_receive_window(frame_cap));
-    conn.send_all(data);
+    let mut conn = Connection::new(initial_receive_window(frame_cap));
+    conn.open(stream_id, data);
     let mut buf = [0u8; 2048];
     let mut rx_largest = 0u64;
     loop {
@@ -258,7 +258,7 @@ impl Endpoint {
     stream_id: u64,
     frame_cap: usize,
   ) -> Result<Vec<u8>, EndpointError> {
-    let mut conn = Connection::new(stream_id, initial_receive_window(frame_cap));
+    let mut conn = Connection::new(initial_receive_window(frame_cap));
     let mut buf = [0u8; 2048];
     let mut rx_largest = 0u64;
     let mut received = Vec::new();
@@ -267,8 +267,8 @@ impl Endpoint {
         .receive_into(&mut conn, &mut rx_largest, &mut buf)
         .await?;
       self.flush(&mut conn, frame_cap)?;
-      received.extend_from_slice(&conn.read());
-      if conn.recv_complete() {
+      received.extend_from_slice(&conn.read_stream(stream_id));
+      if conn.recv_stream_complete(stream_id) {
         return Ok(received);
       }
     }

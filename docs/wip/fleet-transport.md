@@ -162,9 +162,14 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    keeps reorder-based loss detection working (BDP autotuning owed). The oracle now drives a stream
    through a window far smaller than the object and asserts the **never-whole-object** invariant
    (`send_offset ≤ read_offset + window`) holds under loss.
-   **Owed on the connection:** a real probe timeout, congestion control, connection-level `MaxData`,
-   multi-range ACKs, connection IDs, several frames per packet (an MTU budget), multiplexing many
-   streams, and loom on the state machine.
+   The connection **multiplexes many streams** (4k): several independent ordered byte streams share one
+   connection (one handshake, one packet-number space, one reliability/ack machine), each with its own
+   flow window, served round-robin so none starves; a received frame is demultiplexed to its stream's
+   reassembler. Proven by an oracle that drives several fingerprinted streams through any loss pattern
+   and reassembles each exactly, never confusing one for another.
+   **Owed on the connection:** a real probe timeout, congestion control (its validation needs a real
+   network), connection-level `MaxData`, multi-range ACKs, connection IDs, several frames per packet (an
+   MTU budget), and loom on the state machine.
    The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c);
    its fencing step and the `Keyring`'s population ride membership/enrollment.
 5. **Register/placement wiring** — owed: §4.8 head + merge-record registers and D-14 placement ride
