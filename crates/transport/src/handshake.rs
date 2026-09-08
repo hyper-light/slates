@@ -182,6 +182,63 @@ mod tests {
     Ok(())
   }
 
+  /// The riskiest, most-blind piece of the `Connection`, probed in isolation: the handshake's 1-RTT
+  /// packet keys actually protect and unprotect a payload. Drives the handshake capturing each side's
+  /// `OneRtt` keys, then encrypts a payload with the client's local packet key and decrypts it with
+  /// the server's remote packet key — the record protection the `Connection` will wrap frames in.
+  #[test]
+  fn the_handshake_yields_working_packet_keys() {
+    use rustls::quic::KeyChange;
+
+    let identity = self_signed("slates-node");
+    let (mut client, mut server) = connect(&identity, "slates-node").unwrap();
+    let mut client_keys = None;
+    let mut server_keys = None;
+    for _ in 0..16 {
+      if !client.is_handshaking() && !server.is_handshaking() {
+        break;
+      }
+      let mut to_server = Vec::new();
+      if let Some(KeyChange::OneRtt { keys, .. }) = client.write_hs(&mut to_server) {
+        client_keys = Some(keys);
+      }
+      if !to_server.is_empty() {
+        server.read_hs(&to_server).unwrap();
+      }
+      let mut to_client = Vec::new();
+      if let Some(KeyChange::OneRtt { keys, .. }) = server.write_hs(&mut to_client) {
+        server_keys = Some(keys);
+      }
+      if !to_client.is_empty() {
+        client.read_hs(&to_client).unwrap();
+      }
+    }
+
+    let client_keys = client_keys.expect("client derived 1-RTT keys");
+    let server_keys = server_keys.expect("server derived 1-RTT keys");
+
+    // Protect a payload with the client's local key; unprotect with the server's remote key.
+    let plaintext = b"session frames go here";
+    let header = [0x40u8, 0, 0, 0]; // a placeholder short-header (the AAD); real header owed.
+    let packet_number = 0u64;
+    let mut buf = plaintext.to_vec();
+    let tag = client_keys
+      .local
+      .packet
+      .encrypt_in_place(packet_number, &header, &mut buf)
+      .unwrap();
+    buf.extend_from_slice(tag.as_ref());
+    let opened = server_keys
+      .remote
+      .packet
+      .decrypt_in_place(packet_number, &header, &mut buf)
+      .unwrap();
+    assert_eq!(
+      opened, plaintext,
+      "the handshake keys protect and unprotect a packet"
+    );
+  }
+
   /// A client and server complete a TLS 1.3 handshake over `rustls::quic`, the client pinning the
   /// server's enrolled (self-signed) identity — the session plane's authenticated handshake.
   #[test]
