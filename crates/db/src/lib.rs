@@ -45,4 +45,7 @@ pub use op::Op;
 pub use partition::Partition;
 pub use reconfig::{Phase, Reconfiguration, RetireError};
 pub use register::{Configuration, DurabilityScope, Fence, HostEpoch, HostId, Placement, Quorum};
+// The fleet ship-and-collect types (`register::Record`, `register::Holder`,
+// `register::commit_over_holders`) are reached through the `register` module path — `Record` is not
+// re-exported at the crate root because the replay log has a `Record` of its own.
 pub use replay::{Db, Recovered, SnapshotPolicy};
