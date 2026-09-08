@@ -22,12 +22,18 @@
 //! decision needs a majority of *both* the old and new voter sets, so no two disjoint majorities can form
 //! across the change; every quorum check (election, commit, CheckQuorum, ReadIndex) honours it.
 //!
+//! And **snapshot/log compaction** (§7): [`compact`](RaftNode::compact) folds the committed prefix into
+//! a snapshot and discards it, so the log stays bounded; every index resolves through a snapshot offset
+//! that is a no-op until the first compaction. The multi-node **conformance suite** (`tests/raft.rs`)
+//! drives a cluster through election, replication, a partition and a membership change, checking Election
+//! Safety, Log Matching, Leader Completeness and State Machine Safety.
+//!
 //! Degenerate on a laptop (`f = 0`): one voter, itself; a pre-vote and an election each reach a majority
 //! of one at once, an appended entry commits at once, and the lone voter is always its own quorum so it
-//! never steps down — the same code path as a fleet, never a mode switch (R8). Owed (the rest of the
-//! dialect, each its own slice): wiring the membership change through the log (the `C_old,new`/`C_new`
-//! entries that take effect on append and revert on truncation — the transition mechanics on top of the
-//! majority rule built here), snapshot/log compaction, and the bug-record conformance suite.
+//! never steps down — the same code path as a fleet, never a mode switch (R8). Owed: wiring the
+//! membership change through the log (the `C_old,new`/`C_new` entries that take effect on append and
+//! revert on truncation — the transition mechanics on top of the majority rule built here) and the
+//! install-snapshot RPC that catches up a follower fallen below the leader's snapshot.
 //!
 //! Evidence: Ongaro & Ousterhout, *In Search of an Understandable Consensus Algorithm (Extended
 //! Version)*, 2014 (tier A); the safety argument for the election restriction is §5.4.
@@ -170,6 +176,8 @@ pub struct RaftNode {
   commit_index: u64,
   next_index: BTreeMap<HostId, u64>,
   match_index: BTreeMap<HostId, u64>,
+  snapshot_index: u64,
+  snapshot_term: u64,
 }
 
 impl RaftNode {
@@ -190,6 +198,8 @@ impl RaftNode {
       commit_index: 0,
       next_index: BTreeMap::new(),
       match_index: BTreeMap::new(),
+      snapshot_index: 0,
+      snapshot_term: 0,
     }
   }
 
@@ -218,6 +228,8 @@ impl RaftNode {
       commit_index: 0,
       next_index: BTreeMap::new(),
       match_index: BTreeMap::new(),
+      snapshot_index: 0,
+      snapshot_term: 0,
     }
   }
 
@@ -443,23 +455,45 @@ impl RaftNode {
       || (candidate_term == self.last_log_term() && candidate_index >= self.last_log_index())
   }
 
-  /// The index of the last log entry (zero for an empty log). Raft indexes entries from one.
+  /// The vector position of the one-based log `index`, or `None` when it is not in the in-memory log
+  /// (it is at or before the snapshot, or beyond the end). With no snapshot (`snapshot_index == 0`) this
+  /// is `index - 1` — the un-compacted layout.
+  fn position(&self, index: u64) -> Option<usize> {
+    if index <= self.snapshot_index {
+      return None;
+    }
+    usize::try_from(index - self.snapshot_index - 1).ok()
+  }
+
+  /// The index of the last log entry (the snapshot index for an empty log; zero when neither exists).
+  /// Raft indexes entries from one.
   pub fn last_log_index(&self) -> u64 {
-    u64::try_from(self.log.len()).unwrap_or(u64::MAX)
+    self
+      .snapshot_index
+      .saturating_add(u64::try_from(self.log.len()).unwrap_or(u64::MAX))
   }
 
-  /// The term of the last log entry (zero for an empty log).
+  /// The term of the last log entry (the snapshot term for an empty log; zero when neither exists).
   pub fn last_log_term(&self) -> u64 {
-    self.log.last().map_or(0, |entry| entry.term)
+    self
+      .log
+      .last()
+      .map_or(self.snapshot_term, |entry| entry.term)
   }
 
-  /// The term of the entry at the one-based `index`, or `None` if the log has no such entry (index zero,
-  /// the position before the log, is the empty-log sentinel and has no term here — the consistency check
-  /// treats it specially).
+  /// The term of the entry at the one-based `index`, or `None` if it is not individually known: index
+  /// zero (the empty-log sentinel), an index below the snapshot (folded into it), or beyond the log's
+  /// end. The snapshot's own index returns the snapshot term. The consistency check treats the sentinel
+  /// specially.
   fn entry_term(&self, index: u64) -> Option<u64> {
-    let one_based = usize::try_from(index).unwrap_or(usize::MAX);
-    let zero_based = one_based.checked_sub(1)?;
-    self.log.get(zero_based).map(|entry| entry.term)
+    if index == 0 {
+      return None;
+    }
+    if index == self.snapshot_index {
+      return Some(self.snapshot_term);
+    }
+    let position = self.position(index)?;
+    self.log.get(position).map(|entry| entry.term)
   }
 
   /// The highest index known committed (a majority holds it).
@@ -467,10 +501,38 @@ impl RaftNode {
     self.commit_index
   }
 
-  /// The committed log entries in order (the prefix the caller may apply).
+  /// The committed log entries not yet folded into the snapshot, in order (the entries the caller applies
+  /// after the snapshotted prefix). With no snapshot this is the whole committed prefix.
   pub fn committed_entries(&self) -> &[LogEntry] {
-    let committed = usize::try_from(self.commit_index).unwrap_or(usize::MAX);
-    &self.log[..committed.min(self.log.len())]
+    let committed_above_snapshot = self.commit_index.saturating_sub(self.snapshot_index);
+    let count = usize::try_from(committed_above_snapshot).unwrap_or(usize::MAX);
+    &self.log[..count.min(self.log.len())]
+  }
+
+  /// The index up to which the log has been compacted into a snapshot (zero when nothing is compacted).
+  pub fn snapshot_index(&self) -> u64 {
+    self.snapshot_index
+  }
+
+  /// Compacts the log by folding the committed prefix up to `up_to` into a snapshot and discarding those
+  /// entries, so the log stays bounded (§7). Only committed entries are compacted — `up_to` must be at or
+  /// below the commit index and beyond the current snapshot — and the snapshot term is recorded so the
+  /// consistency check at the boundary still holds. Returns whether it compacted. The caller must have
+  /// captured the state machine's state at `up_to` first; a follower far enough behind to need a
+  /// discarded entry is served an install-snapshot (owed).
+  pub fn compact(&mut self, up_to: u64) -> bool {
+    if up_to <= self.snapshot_index || up_to > self.commit_index {
+      return false;
+    }
+    let Some(term) = self.entry_term(up_to) else {
+      return false;
+    };
+    let discard = usize::try_from(up_to - self.snapshot_index).unwrap_or(usize::MAX);
+    let discard = discard.min(self.log.len());
+    self.log.drain(0..discard);
+    self.snapshot_index = up_to;
+    self.snapshot_term = term;
+    true
   }
 
   /// Appends `command` to the leader's own log at the current term and updates its self-match, so a
@@ -495,14 +557,22 @@ impl RaftNode {
     if self.role != Role::Leader {
       return None;
     }
-    let next = self.next_index.get(&follower).copied().unwrap_or(1).max(1);
+    // Never send from below the snapshot boundary (those entries are compacted away).
+    let next = self
+      .next_index
+      .get(&follower)
+      .copied()
+      .unwrap_or(1)
+      .max(self.snapshot_index.saturating_add(1))
+      .max(1);
     let prev_log_index = next.saturating_sub(1);
     let prev_log_term = if prev_log_index == 0 {
       0
     } else {
       self.entry_term(prev_log_index).unwrap_or(0)
     };
-    let from = usize::try_from(prev_log_index).unwrap_or(usize::MAX);
+    let from = usize::try_from(next.saturating_sub(self.snapshot_index).saturating_sub(1))
+      .unwrap_or(usize::MAX);
     let entries = self.log.get(from..).unwrap_or(&[]).to_vec();
     Some(AppendEntries {
       term: self.current_term,
@@ -655,7 +725,8 @@ impl RaftNode {
 
   /// Truncates the log from the one-based `index` onward (removing that entry and every later one).
   fn truncate_from(&mut self, index: u64) {
-    let keep = usize::try_from(index.saturating_sub(1)).unwrap_or(usize::MAX);
+    let keep = usize::try_from(index.saturating_sub(self.snapshot_index).saturating_sub(1))
+      .unwrap_or(usize::MAX);
     self.log.truncate(keep);
   }
 
@@ -1282,5 +1353,103 @@ mod tests {
     let mut follower = RaftNode::new(A, vec![A, B, C]);
     assert!(!follower.begin_membership_change(vec![C, D, E]));
     assert!(!follower.in_joint_configuration());
+  }
+
+  /// Compaction (Raft §7) folds the committed prefix into a snapshot and discards it, bounding the log,
+  /// while every index still resolves — the last index is unchanged and appends continue past the
+  /// snapshot. Compacting backward or beyond the commit index is refused.
+  #[test]
+  fn compaction_bounds_the_log_while_indices_stay_correct() {
+    // A lone leader commits every append at once, so five appends give a five-entry committed log.
+    let mut leader = elected_leader(A, vec![A]);
+    for value in 0..5u8 {
+      leader.append_command(vec![value]);
+    }
+    assert_eq!(leader.commit_index(), 5);
+    assert_eq!(leader.last_log_index(), 5);
+
+    // Compact up to index 3: the prefix is discarded, but the last index and the committed remainder are
+    // still correct.
+    assert!(leader.compact(3), "committed entries up to 3 compact");
+    assert_eq!(leader.snapshot_index(), 3);
+    assert_eq!(
+      leader.last_log_index(),
+      5,
+      "the last index is unchanged by compaction"
+    );
+    assert_eq!(
+      leader.committed_entries().len(),
+      2,
+      "only the entries above the snapshot (indices 4 and 5) remain to apply"
+    );
+
+    // Appends continue past the snapshot boundary and still commit.
+    leader.append_command(b"after-snapshot".to_vec());
+    assert_eq!(leader.last_log_index(), 6);
+    assert_eq!(
+      leader.commit_index(),
+      6,
+      "the entry after the snapshot commits"
+    );
+  }
+
+  /// Compaction is refused backward (at or below the current snapshot) and ahead of the commit index —
+  /// only the committed, not-yet-snapshotted prefix may be discarded.
+  #[test]
+  fn compaction_refuses_backward_or_uncommitted() {
+    let mut leader = elected_leader(A, vec![A]);
+    for value in 0..3u8 {
+      leader.append_command(vec![value]);
+    }
+    assert!(leader.compact(2), "committed entries up to 2 compact");
+    assert!(
+      !leader.compact(2),
+      "cannot compact at or below the current snapshot"
+    );
+    assert!(!leader.compact(1), "nor backward");
+    assert!(!leader.compact(100), "nor beyond the commit index");
+  }
+
+  /// After compaction the leader still replicates correctly to a follower: the append it builds anchors
+  /// at the snapshot boundary (using the snapshot term), and a follower that already holds that prefix
+  /// accepts the entries beyond it.
+  #[test]
+  fn replication_works_across_a_snapshot_boundary() {
+    // A three-node leader with a committed three-entry log (recovered so the log exists), elected fresh.
+    let mut leader = RaftNode::recovered(A, vec![A, B, C], 2, None, log_of(&[1, 1, 2]));
+    leader.start_election(); // term 3
+    leader.on_vote_reply(VoteReply {
+      voter: B,
+      term: leader.term(),
+      granted: true,
+    });
+    assert!(leader.is_leader());
+    leader.append_command(b"t3".to_vec()); // index 4, term 3
+
+    // Commit index 4 by replicating to a follower that holds the term-1/term-2 prefix.
+    let mut follower = RaftNode::recovered(B, vec![A, B, C], 3, None, log_of(&[1, 1, 2]));
+    let append = leader.replicate_to(B).expect("append");
+    let reply = follower.on_append_entries(append);
+    assert!(reply.success);
+    leader.on_append_reply(reply);
+    assert_eq!(leader.commit_index(), 4);
+
+    // Compact the leader up to index 2; its log now begins after the snapshot.
+    assert!(leader.compact(2));
+    assert_eq!(leader.snapshot_index(), 2);
+
+    // Append and replicate again: the follower (already caught up) accepts across the boundary.
+    leader.append_command(b"t3-more".to_vec()); // index 5
+    let append = leader.replicate_to(B).expect("append after compaction");
+    assert!(
+      append.prev_log_index >= leader.snapshot_index(),
+      "the append anchors at or after the snapshot"
+    );
+    let reply = follower.on_append_entries(append);
+    assert!(
+      reply.success,
+      "the caught-up follower accepts the post-compaction append"
+    );
+    assert_eq!(follower.last_log_index(), 5);
   }
 }
