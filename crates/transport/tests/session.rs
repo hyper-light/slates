@@ -87,10 +87,11 @@ fn a_stream_flows_over_a_live_session() {
       let client_port = recv_port(client_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, client_port);
       let outcome = async {
-        let mut server = Endpoint::server(socket, peer, &identity).map_err(|e| format!("{e:?}"))?;
+        let mut server =
+          Endpoint::server(socket, peer, &identity, FRAME_CAP).map_err(|e| format!("{e:?}"))?;
         server.establish().await.map_err(|e| format!("{e:?}"))?;
         server
-          .recv_stream(STREAM_ID, FRAME_CAP)
+          .recv_stream(STREAM_ID)
           .await
           .map_err(|e| format!("{e:?}"))
       }
@@ -106,12 +107,9 @@ fn a_stream_flows_over_a_live_session() {
       let _ = client_port_tx.send(socket.local_addr().unwrap().port());
       let server_port = recv_port(server_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
-      let mut client = Endpoint::client(socket, peer, &pinned, NAME).unwrap();
+      let mut client = Endpoint::client(socket, peer, &pinned, NAME, FRAME_CAP).unwrap();
       client.establish().await.unwrap();
-      client
-        .send_stream(STREAM_ID, &content, FRAME_CAP)
-        .await
-        .unwrap();
+      client.send_stream(STREAM_ID, &content).await.unwrap();
     })
     .unwrap();
 
@@ -154,12 +152,10 @@ fn a_request_gets_a_reply_over_a_live_session() {
       let _ = server_port_tx.send(socket.local_addr().unwrap().port());
       let client_port = recv_port(client_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, client_port);
-      let mut server = Endpoint::server(socket, peer, &identity).unwrap();
+      let mut server = Endpoint::server(socket, peer, &identity, FRAME_CAP).unwrap();
       server.establish().await.unwrap();
       server
-        .serve_once(FRAME_CAP, |req| {
-          req.iter().map(|b| b.wrapping_add(1)).collect()
-        })
+        .serve_once(|req| req.iter().map(|b| b.wrapping_add(1)).collect())
         .await
         .unwrap();
     })
@@ -174,10 +170,10 @@ fn a_request_gets_a_reply_over_a_live_session() {
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
       let outcome = async {
         let mut client =
-          Endpoint::client(socket, peer, &pinned, NAME).map_err(|e| format!("{e:?}"))?;
+          Endpoint::client(socket, peer, &pinned, NAME, FRAME_CAP).map_err(|e| format!("{e:?}"))?;
         client.establish().await.map_err(|e| format!("{e:?}"))?;
         client
-          .request(STREAM_ID, &request, FRAME_CAP)
+          .request(STREAM_ID, &request)
           .await
           .map_err(|e| format!("{e:?}"))
       }
@@ -194,5 +190,89 @@ fn a_request_gets_a_reply_over_a_live_session() {
       "the reply arrived over the live session"
     ),
     other => panic!("the request/reply did not complete: {other:?}"),
+  }
+}
+
+/// Repeated request/reply exchanges on one endpoint keep the connection's packet numbers strictly
+/// increasing — a number is never reused under the 1-RTT keys (RFC 9000 §12.3, RFC 9001 §5.3). Before
+/// the persistent-connection fix each RPC restarted the counter at zero, reusing packet numbers (and
+/// so AEAD nonces) under the fixed keys. Each exchange also returns its own reply correctly.
+#[test]
+fn repeated_exchanges_never_reuse_packet_numbers() {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+  const EXCHANGES: u64 = 4;
+
+  let identity = self_signed(NAME);
+  let pinned = identity.certificate();
+  let (server_port_tx, server_port_rx) = channel();
+  let (client_port_tx, client_port_rx) = channel();
+  let (result_tx, result_rx) = channel();
+
+  // The server: serve `EXCHANGES` requests in turn, each echoed with a byte-transform.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = server_port_tx.send(socket.local_addr().unwrap().port());
+      let client_port = recv_port(client_port_rx).await;
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, client_port);
+      let mut server = Endpoint::server(socket, peer, &identity, FRAME_CAP).unwrap();
+      server.establish().await.unwrap();
+      for _ in 0..EXCHANGES {
+        server
+          .serve_once(|req| req.iter().map(|b| b.wrapping_add(7)).collect())
+          .await
+          .unwrap();
+      }
+    })
+    .unwrap();
+
+  // The client: make `EXCHANGES` requests on one endpoint, recording the packet-number cursor before
+  // each; assert every reply is right and the cursor is strictly increasing (never reset, never reused).
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = client_port_tx.send(socket.local_addr().unwrap().port());
+      let server_port = recv_port(server_port_rx).await;
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+      let outcome = async {
+        let mut client =
+          Endpoint::client(socket, peer, &pinned, NAME, FRAME_CAP).map_err(|e| format!("{e:?}"))?;
+        client.establish().await.map_err(|e| format!("{e:?}"))?;
+        let mut cursors = vec![client.tx_packet_number()];
+        for exchange in 0..EXCHANGES {
+          let request: Vec<u8> = (0..40u8)
+            .map(|b| b.wrapping_add(u8::try_from(exchange).unwrap_or(0)))
+            .collect();
+          let reply = client
+            .request(exchange + 1, &request)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+          let expected: Vec<u8> = request.iter().map(|b| b.wrapping_add(7)).collect();
+          if reply != expected {
+            return Err(format!("exchange {exchange}: wrong reply"));
+          }
+          cursors.push(client.tx_packet_number());
+        }
+        // Strictly increasing: every exchange consumed fresh packet numbers.
+        for pair in cursors.windows(2) {
+          if pair[1] <= pair[0] {
+            return Err(format!(
+              "packet numbers not strictly increasing: {cursors:?}"
+            ));
+          }
+        }
+        Ok(())
+      }
+      .await;
+      let _ = result_tx.send(outcome);
+    })
+    .unwrap();
+
+  sim.run_until_idle();
+
+  match result_rx.try_recv() {
+    Ok(Ok(())) => {}
+    other => panic!("repeated exchanges did not keep packet numbers monotonic: {other:?}"),
   }
 }

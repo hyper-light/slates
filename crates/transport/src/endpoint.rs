@@ -111,24 +111,31 @@ impl Quic {
   }
 }
 
-/// One end of a session: the UDP socket, the peer, the QUIC handshake state, and the 1-RTT keys once
-/// established. Per-stream packet-number and reliability state lives in the [`Connection`] a transfer
-/// drives, not here.
+/// One end of a session: the UDP socket, the peer, the QUIC handshake state, the 1-RTT keys once
+/// established, and — the crucial part for correctness — **one long-lived [`Connection`]** carrying
+/// every exchange, so the packet-number space is continuous and a number is never reused under the
+/// 1-RTT keys (RFC 9000 §12.3, RFC 9001 §5.3). `rx_largest` is the persistent packet-number decode
+/// cursor; `frame_cap` sizes each frame and the receive window. Completed streams are forgotten after
+/// each exchange so a long-lived connection does not accumulate them without bound.
 pub struct Endpoint {
   socket: UdpSocket,
   peer: SocketAddrV4,
   quic: Quic,
   keys: Option<Keys>,
+  conn: Connection,
+  rx_largest: u64,
+  frame_cap: usize,
 }
 
 impl Endpoint {
   /// The client end, pinning the server's `pinned` certificate (the enrolled identity it trusts) and
-  /// talking to `peer` as `name`. Needs no private key.
+  /// talking to `peer` as `name`, framing at `frame_cap`.
   pub fn client(
     socket: UdpSocket,
     peer: SocketAddrV4,
     pinned: &rustls::pki_types::CertificateDer<'static>,
     name: &str,
+    frame_cap: usize,
   ) -> Result<Endpoint, EndpointError> {
     let client = client_connection(pinned, name).map_err(EndpointError::Handshake)?;
     Ok(Endpoint {
@@ -136,14 +143,18 @@ impl Endpoint {
       peer,
       quic: Quic::Client(client),
       keys: None,
+      conn: Connection::new(initial_receive_window(frame_cap)),
+      rx_largest: 0,
+      frame_cap,
     })
   }
 
-  /// The server end presenting `identity`, talking to `peer`.
+  /// The server end presenting `identity`, talking to `peer`, framing at `frame_cap`.
   pub fn server(
     socket: UdpSocket,
     peer: SocketAddrV4,
     identity: &Identity,
+    frame_cap: usize,
   ) -> Result<Endpoint, EndpointError> {
     let server = server_connection(identity).map_err(EndpointError::Handshake)?;
     Ok(Endpoint {
@@ -151,7 +162,16 @@ impl Endpoint {
       peer,
       quic: Quic::Server(server),
       keys: None,
+      conn: Connection::new(initial_receive_window(frame_cap)),
+      rx_largest: 0,
+      frame_cap,
     })
+  }
+
+  /// The next packet number the connection will assign — its packet-number cursor, monotonic across
+  /// every exchange this endpoint carries (a test asserts it never regresses: no reuse under the keys).
+  pub fn tx_packet_number(&self) -> u64 {
+    self.conn.tx_packet_number()
   }
 
   /// Drives the handshake to the 1-RTT keys, shuttling CRYPTO bytes over UDP. Each turn *drains* all
@@ -196,30 +216,26 @@ impl Endpoint {
   }
 
   /// Flushes every packet the connection currently wants to send: each `poll_transmit` gives a packet
-  /// number and its frames, which are protected under the local 1-RTT keys (the number sized against
-  /// what the peer has acknowledged) and sent over the socket.
-  fn flush(&self, conn: &mut Connection, frame_cap: usize) -> Result<(), EndpointError> {
+  /// number (from the connection's continuous packet-number space) and its frames, which are protected
+  /// under the local 1-RTT keys (the number sized against what the peer has acknowledged) and sent.
+  fn flush(&mut self) -> Result<(), EndpointError> {
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
-    while let Some((pn, frames)) = conn.poll_transmit(frame_cap) {
-      let datagram = protect_packet(keys, pn, conn.tx_largest_acked(), &frames)?;
+    while let Some((pn, frames)) = self.conn.poll_transmit(self.frame_cap) {
+      let datagram = protect_packet(keys, pn, self.conn.tx_largest_acked(), &frames)?;
       self.socket.send_to(&datagram, self.peer)?;
     }
     Ok(())
   }
 
-  /// Receives one protected packet, reconstructs its number against `rx_largest` (advancing it), and
-  /// feeds it to the connection.
-  async fn receive_into(
-    &self,
-    conn: &mut Connection,
-    rx_largest: &mut u64,
-    buf: &mut [u8],
-  ) -> Result<(), EndpointError> {
+  /// Receives one protected packet, reconstructs its number against the persistent decode cursor
+  /// (advancing it), and feeds it to the connection.
+  async fn receive_into(&mut self) -> Result<(), EndpointError> {
+    let mut buf = [0u8; 2048];
+    let (n, _from) = self.socket.recv_from(&mut buf).await?;
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
-    let (n, _from) = self.socket.recv_from(buf).await?;
-    let (pn, frames) = unprotect_packet(keys, *rx_largest, &buf[..n])?;
-    *rx_largest = (*rx_largest).max(pn);
-    conn.handle_incoming(pn, &frames);
+    let (pn, frames) = unprotect_packet(keys, self.rx_largest, &buf[..n])?;
+    self.rx_largest = self.rx_largest.max(pn);
+    self.conn.handle_incoming(pn, &frames);
     Ok(())
   }
 
@@ -228,24 +244,15 @@ impl Endpoint {
   /// every packet has been acknowledged. Over the lossless simulation fabric no retransmission is
   /// needed; the loss-recovery path (and its probe for a lost tail, which over a real network needs a
   /// timeout the runtime's timer will drive) is exercised by the `connection` oracle.
-  pub async fn send_stream(
-    &mut self,
-    stream_id: u64,
-    data: &[u8],
-    frame_cap: usize,
-  ) -> Result<(), EndpointError> {
-    let mut conn = Connection::new(initial_receive_window(frame_cap));
-    conn.open(stream_id, data);
-    let mut buf = [0u8; 2048];
-    let mut rx_largest = 0u64;
+  pub async fn send_stream(&mut self, stream_id: u64, data: &[u8]) -> Result<(), EndpointError> {
+    self.conn.open(stream_id, data);
     loop {
-      self.flush(&mut conn, frame_cap)?;
-      if conn.send_complete() {
+      self.flush()?;
+      if self.conn.send_complete() {
+        self.conn.forget_stream(stream_id);
         return Ok(());
       }
-      self
-        .receive_into(&mut conn, &mut rx_largest, &mut buf)
-        .await?;
+      self.receive_into().await?;
     }
   }
 
@@ -253,22 +260,14 @@ impl Endpoint {
   /// the stream's `fin` completes. Drives a [`Connection`]: each received packet is acknowledged (the
   /// acknowledgement flushed before the next receive) so the sender learns of delivery, and the final
   /// acknowledgement is flushed after completion so the sender can finish.
-  pub async fn recv_stream(
-    &mut self,
-    stream_id: u64,
-    frame_cap: usize,
-  ) -> Result<Vec<u8>, EndpointError> {
-    let mut conn = Connection::new(initial_receive_window(frame_cap));
-    let mut buf = [0u8; 2048];
-    let mut rx_largest = 0u64;
+  pub async fn recv_stream(&mut self, stream_id: u64) -> Result<Vec<u8>, EndpointError> {
     let mut received = Vec::new();
     loop {
-      self
-        .receive_into(&mut conn, &mut rx_largest, &mut buf)
-        .await?;
-      self.flush(&mut conn, frame_cap)?;
-      received.extend_from_slice(&conn.read_stream(stream_id));
-      if conn.recv_stream_complete(stream_id) {
+      self.receive_into().await?;
+      self.flush()?;
+      received.extend_from_slice(&self.conn.read_stream(stream_id));
+      if self.conn.recv_stream_complete(stream_id) {
+        self.conn.forget_stream(stream_id);
         return Ok(received);
       }
     }
@@ -288,22 +287,17 @@ impl Endpoint {
     &mut self,
     stream_id: u64,
     request: &[u8],
-    frame_cap: usize,
   ) -> Result<Vec<u8>, EndpointError> {
-    let mut conn = Connection::new(initial_receive_window(frame_cap));
-    conn.open(stream_id, request);
-    let mut buf = [0u8; 2048];
-    let mut rx_largest = 0u64;
+    self.conn.open(stream_id, request);
     let mut reply = Vec::new();
     loop {
-      self.flush(&mut conn, frame_cap)?;
-      reply.extend_from_slice(&conn.read_stream(stream_id));
-      if conn.recv_stream_complete(stream_id) {
+      self.flush()?;
+      reply.extend_from_slice(&self.conn.read_stream(stream_id));
+      if self.conn.recv_stream_complete(stream_id) {
+        self.conn.forget_stream(stream_id);
         return Ok(reply);
       }
-      self
-        .receive_into(&mut conn, &mut rx_largest, &mut buf)
-        .await?;
+      self.receive_into().await?;
     }
   }
 
@@ -311,44 +305,40 @@ impl Endpoint {
   /// `handler`, and sends the reply back on the same stream id, returning once the reply is
   /// acknowledged. Drives one [`Connection`]: phase one receives and acknowledges the request until its
   /// `fin`; phase two frames the reply and completes when the peer has acknowledged all of it.
-  pub async fn serve_once<H>(&mut self, frame_cap: usize, handler: H) -> Result<(), EndpointError>
+  pub async fn serve_once<H>(&mut self, handler: H) -> Result<(), EndpointError>
   where
     H: FnOnce(Vec<u8>) -> Vec<u8>,
   {
-    let mut conn = Connection::new(initial_receive_window(frame_cap));
-    let mut buf = [0u8; 2048];
-    let mut rx_largest = 0u64;
-
     // Phase one: receive the request in full, acknowledging and *draining* as it arrives — draining is
     // what slides the flow-control window forward, so a request larger than one window keeps flowing
     // (without it the credit never grows past the initial window and the sender stalls). The request
     // rides one stream, so its id is the one that arrives.
     let mut request = Vec::new();
     let request_id = loop {
-      self
-        .receive_into(&mut conn, &mut rx_largest, &mut buf)
-        .await?;
-      self.flush(&mut conn, frame_cap)?;
-      let ids = conn.recv_stream_ids();
+      self.receive_into().await?;
+      self.flush()?;
+      let ids = self.conn.recv_stream_ids();
       for &id in &ids {
-        request.extend_from_slice(&conn.read_stream(id));
+        request.extend_from_slice(&self.conn.read_stream(id));
       }
-      if let Some(id) = ids.into_iter().find(|&id| conn.recv_stream_complete(id)) {
+      if let Some(id) = ids
+        .into_iter()
+        .find(|&id| self.conn.recv_stream_complete(id))
+      {
         break id;
       }
     };
 
     // Phase two: send the reply on the same stream id until the peer has acknowledged it whole.
     let reply = handler(request);
-    conn.open(request_id, &reply);
+    self.conn.open(request_id, &reply);
     loop {
-      self.flush(&mut conn, frame_cap)?;
-      if conn.send_complete() {
+      self.flush()?;
+      if self.conn.send_complete() {
+        self.conn.forget_stream(request_id);
         return Ok(());
       }
-      self
-        .receive_into(&mut conn, &mut rx_largest, &mut buf)
-        .await?;
+      self.receive_into().await?;
     }
   }
 }

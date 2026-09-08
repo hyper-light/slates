@@ -261,6 +261,25 @@ impl Connection {
       && self.send_streams.values().all(StreamSender::is_drained)
   }
 
+  /// Forgets a completed stream's send and receive state, so a long-lived connection carrying many
+  /// exchanges does not accumulate finished streams without bound. The connection-wide packet-number
+  /// space, acknowledgement and flow state are untouched (only the per-stream buffers are released), so
+  /// packet numbers stay monotonic across exchanges — never reused, per RFC 9000 §12.3. (Compacting the
+  /// acknowledgement set of a very long-lived connection is a separate bound, owed.)
+  pub fn forget_stream(&mut self, stream_id: u64) {
+    self.send_streams.remove(&stream_id);
+    self.send_order.retain(|&id| id != stream_id);
+    self.send_cursor = 0;
+    self.recv_streams.remove(&stream_id);
+  }
+
+  /// The next packet number this connection will assign — its packet-number cursor. Monotonic across
+  /// every exchange the connection carries; a test asserts it never regresses (no reuse under the
+  /// 1-RTT keys, RFC 9001 §5.3).
+  pub fn tx_packet_number(&self) -> u64 {
+    self.sent.peek_next_pn()
+  }
+
   /// How many frames this end has retransmitted — the non-vacuity counter proving the loss-recovery
   /// path actually ran, so a test over a lossy channel cannot pass with a dead retransmit path.
   pub fn retransmitted(&self) -> u64 {

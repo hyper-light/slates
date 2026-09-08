@@ -80,6 +80,12 @@ impl SentTracker {
     pn
   }
 
+  /// The next packet number that will be assigned, without advancing it — the packet-number cursor,
+  /// so a caller can assert it stays monotonic across exchanges (no reuse under the keys).
+  pub fn peek_next_pn(&self) -> u64 {
+    self.next_pn
+  }
+
   /// Records that packet `pn` carried `frames` (kept for possible retransmission).
   pub fn on_sent(&mut self, pn: u64, frames: Vec<Frame>) {
     self.in_flight.insert(pn, InFlight { frames });
