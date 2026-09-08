@@ -15,7 +15,6 @@ use std::sync::mpsc::{Receiver, channel};
 use rustix::net::{Ipv4Addr, SocketAddrV4};
 use rustls::pki_types::PrivateKeyDer;
 use slates_cluster::CommitBudget;
-use slates_cluster::coordinates::NetworkCoordinate;
 use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::membership::{Liveness, MemberState};
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once, serve_probe};
@@ -176,12 +175,6 @@ fn run_probe(target_serves: bool) -> ProbeResult {
 
       let mut detector = Detector::new(PROBER, timing());
       detector.join(TARGET);
-      // Learn the target's coordinate (in a live fleet this rides the reply; here supplied out of band),
-      // so a measured round-trip can relax our own coordinate against it.
-      let mut target_coordinate = NetworkCoordinate::origin(8);
-      target_coordinate.vec[0] = 10.0;
-      target_coordinate.error = 0.05;
-      detector.learn_coordinate(TARGET, target_coordinate);
       // Tick to open the probe of the target (sets it as this period's probe target).
       let _ = detector.tick();
       let ping = SwimMessage::Ping {
@@ -191,10 +184,16 @@ fn run_probe(target_serves: bool) -> ProbeResult {
       let (_endpoint, outcome) = probe_once(endpoint, &ping, budget()).await.unwrap();
 
       let (timed_out, ack_gossip, rtt_ns) = match outcome {
-        ProbeOutcome::Acked { gossip, rtt_ns } => {
+        ProbeOutcome::Acked {
+          gossip,
+          rtt_ns,
+          coordinate,
+        } => {
           detector.on_ack(TARGET);
           detector.apply_gossip(&gossip);
-          // Fold the measured round-trip into our Vivaldi coordinate.
+          // Learn the target's coordinate from the acknowledgement, then fold the measured round-trip
+          // into our own Vivaldi coordinate against it.
+          detector.learn_coordinate(TARGET, coordinate);
           detector.observe_rtt(TARGET, rtt_ns as f64);
           (false, gossip, rtt_ns)
         }

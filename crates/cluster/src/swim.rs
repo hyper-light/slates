@@ -5,11 +5,16 @@
 //! dissemination shares the probe traffic). The live driver that sends these over authenticated
 //! sessions and feeds replies back into the detector is composed on top; this module is the pure codec.
 //!
+//! An acknowledgement also carries the sender's Vivaldi network coordinate ([`crate::coordinates`]), so
+//! a prober learns the coordinate of every peer it probes and can predict the round-trip time to it —
+//! the live half of coordinate-aware indirect probing.
+//!
 //! Every decode is a parser of external bytes, so it checks the length against the message's shape
-//! before allocating and rejects a truncated header, an unknown tag, an unknown liveness byte, or a
-//! gossip count that does not match the bytes that arrived — a hostile datagram is a typed
-//! [`SwimWireError`], never a panic or an over-allocation. The encoding is little-endian throughout so
-//! two hosts encode a message identically (the determinism the golden vectors pin).
+//! before allocating and rejects a truncated header, an unknown tag, an unknown liveness byte, a gossip
+//! count that does not match the bytes that arrived, or a coordinate declaring more dimensions than the
+//! decoder accepts — a hostile datagram is a typed [`SwimWireError`], never a panic or an
+//! over-allocation. The encoding is little-endian throughout (floats as their bit pattern) so two hosts
+//! encode a message identically.
 
 use std::mem::size_of;
 use std::sync::mpsc::{TryRecvError, channel};
@@ -20,12 +25,14 @@ use slates_rt::futures::{cancel, now_ns, sleep, spawn_child};
 use slates_transport::endpoint::{Endpoint, EndpointError};
 
 use crate::CommitBudget;
+use crate::coordinates::NetworkCoordinate;
 use crate::detector::Detector;
 use crate::membership::{Liveness, MemberState};
 
 /// A SWIM message on the wire: a probe, its acknowledgement, or an indirect-probe request, each naming
-/// the sender and carrying a piggybacked batch of membership updates to gossip.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// the sender and carrying a piggybacked batch of membership updates to gossip. (`Eq` is not derived
+/// because an acknowledgement carries the sender's Vivaldi coordinate, which holds floating point.)
+#[derive(Clone, Debug, PartialEq)]
 pub enum SwimMessage {
   /// A direct probe from `from`.
   Ping {
@@ -34,12 +41,15 @@ pub enum SwimMessage {
     /// The membership updates piggybacked on this probe.
     gossip: Vec<(HostId, MemberState)>,
   },
-  /// An acknowledgement from `from` (the reply to a [`SwimMessage::Ping`] or an indirect probe).
+  /// An acknowledgement from `from` (the reply to a [`SwimMessage::Ping`] or an indirect probe), carrying
+  /// the sender's network coordinate so the prober learns it (and can predict the RTT to it).
   Ack {
     /// The acknowledging node.
     from: HostId,
     /// The membership updates piggybacked on this acknowledgement.
     gossip: Vec<(HostId, MemberState)>,
+    /// The acknowledging node's Vivaldi coordinate.
+    coordinate: NetworkCoordinate,
   },
   /// A request from `from` to probe `target` on its behalf (the indirect probe).
   PingReq {
@@ -70,6 +80,9 @@ pub enum SwimWireError {
   /// The declared gossip-entry count does not match the number of bytes that followed — a truncated or
   /// over-long batch (the check that bounds allocation to what actually arrived).
   GossipLengthMismatch,
+  /// An acknowledgement's network coordinate was malformed: too many dimensions (a hostile
+  /// over-allocation), or a byte length that does not match the declared dimensions.
+  MalformedCoordinate,
 }
 
 /// Format: the message tag occupies one leading byte; these are its values.
@@ -106,6 +119,14 @@ impl SwimMessage {
     }
   }
 
+  /// The sender's network coordinate, when the message is an acknowledgement (which carries it).
+  pub fn coordinate(&self) -> Option<&NetworkCoordinate> {
+    match self {
+      SwimMessage::Ack { coordinate, .. } => Some(coordinate),
+      SwimMessage::Ping { .. } | SwimMessage::PingReq { .. } => None,
+    }
+  }
+
   /// The canonical little-endian bytes: the tag, the sender, the target (for a ping-request only), then
   /// the gossip batch (its u32 count and each entry). Two hosts encode a message identically.
   pub fn encode(&self) -> Vec<u8> {
@@ -116,10 +137,15 @@ impl SwimMessage {
         out.extend_from_slice(&from.0.to_le_bytes());
         encode_gossip(&mut out, gossip);
       }
-      SwimMessage::Ack { from, gossip } => {
+      SwimMessage::Ack {
+        from,
+        gossip,
+        coordinate,
+      } => {
         out.push(TAG_ACK);
         out.extend_from_slice(&from.0.to_le_bytes());
         encode_gossip(&mut out, gossip);
+        encode_coordinate(&mut out, coordinate);
       }
       SwimMessage::PingReq {
         from,
@@ -141,18 +167,29 @@ impl SwimMessage {
     match tag {
       TAG_PING => {
         let (from, rest) = take_host(rest)?;
-        let gossip = decode_gossip(rest)?;
+        let (gossip, leftover) = decode_gossip(rest)?;
+        if !leftover.is_empty() {
+          return Err(SwimWireError::GossipLengthMismatch);
+        }
         Ok(SwimMessage::Ping { from, gossip })
       }
       TAG_ACK => {
         let (from, rest) = take_host(rest)?;
-        let gossip = decode_gossip(rest)?;
-        Ok(SwimMessage::Ack { from, gossip })
+        let (gossip, leftover) = decode_gossip(rest)?;
+        let coordinate = decode_coordinate(leftover)?;
+        Ok(SwimMessage::Ack {
+          from,
+          gossip,
+          coordinate,
+        })
       }
       TAG_PING_REQ => {
         let (from, rest) = take_host(rest)?;
         let (target, rest) = take_host(rest)?;
-        let gossip = decode_gossip(rest)?;
+        let (gossip, leftover) = decode_gossip(rest)?;
+        if !leftover.is_empty() {
+          return Err(SwimWireError::GossipLengthMismatch);
+        }
         Ok(SwimMessage::PingReq {
           from,
           target,
@@ -189,25 +226,32 @@ fn take_host(bytes: &[u8]) -> Result<(HostId, &[u8]), SwimWireError> {
   Ok((HostId(u64::from_le_bytes(word)), rest))
 }
 
-/// Decodes a gossip batch from the remaining bytes: the u32 count, then exactly `count` entries. The
-/// count is checked against the bytes that actually arrived before anything is allocated, so a datagram
-/// claiming a huge count without the bytes to back it is refused rather than over-allocating.
-fn decode_gossip(bytes: &[u8]) -> Result<Vec<(HostId, MemberState)>, SwimWireError> {
+/// A decoded gossip batch and the bytes that follow it in the message (the coordinate, for an
+/// acknowledgement; empty otherwise).
+type GossipAndRest<'a> = (Vec<(HostId, MemberState)>, &'a [u8]);
+
+/// Decodes a gossip batch from the front of `bytes`: the u32 count, then exactly `count` entries,
+/// returning the batch **and the bytes that follow it** (empty for a ping/ping-request, the coordinate
+/// for an acknowledgement). The count is checked against the bytes that actually arrived before anything
+/// is allocated, so a datagram claiming a huge count without the bytes to back it is refused rather than
+/// over-allocating.
+fn decode_gossip(bytes: &[u8]) -> Result<GossipAndRest<'_>, SwimWireError> {
   if bytes.len() < GOSSIP_COUNT_BYTES {
     return Err(SwimWireError::Truncated);
   }
-  let (count_bytes, mut rest) = bytes.split_at(GOSSIP_COUNT_BYTES);
+  let (count_bytes, after_count) = bytes.split_at(GOSSIP_COUNT_BYTES);
   let mut count_word = [0u8; GOSSIP_COUNT_BYTES];
   count_word.copy_from_slice(count_bytes);
   let count = usize::try_from(u32::from_le_bytes(count_word)).unwrap_or(usize::MAX);
 
-  // The remaining bytes must be exactly the entries the count declares — no more, no less.
+  // At least the entries the count declares must have arrived (anything after is the next field).
   let wanted = count
     .checked_mul(GOSSIP_ENTRY_BYTES)
     .ok_or(SwimWireError::GossipLengthMismatch)?;
-  if rest.len() != wanted {
+  if after_count.len() < wanted {
     return Err(SwimWireError::GossipLengthMismatch);
   }
+  let (mut rest, leftover) = after_count.split_at(wanted);
 
   let mut gossip = Vec::with_capacity(count);
   for _ in 0..count {
@@ -227,7 +271,85 @@ fn decode_gossip(bytes: &[u8]) -> Result<Vec<(HostId, MemberState)>, SwimWireErr
     ));
     rest = tail;
   }
-  Ok(gossip)
+  Ok((gossip, leftover))
+}
+
+/// Format: one coordinate component (and the height, adjustment and error) is a little-endian `f64`
+/// stored as its bit pattern.
+const F64_BYTES: usize = size_of::<u64>();
+/// Format: the coordinate is a `u32` dimension count, that many `f64` vector components, then the
+/// height, adjustment and error `f64`s.
+const COORDINATE_SCALARS: usize = 3;
+/// Shape: the largest coordinate dimension a decoder will accept before allocating — a hostile datagram
+/// cannot force an unbounded vector. Far above any sensible Vivaldi dimension (the engine uses eight).
+const MAX_COORDINATE_DIMS: usize = 64;
+
+/// Appends a network coordinate: the u32 dimension count, each vector component, then height, adjustment
+/// and error — every scalar a little-endian `f64` bit pattern.
+fn encode_coordinate(out: &mut Vec<u8>, coordinate: &NetworkCoordinate) {
+  let dims = u32::try_from(coordinate.vec.len()).unwrap_or(u32::MAX);
+  out.extend_from_slice(&dims.to_le_bytes());
+  for component in coordinate
+    .vec
+    .iter()
+    .take(usize::try_from(dims).unwrap_or(usize::MAX))
+  {
+    out.extend_from_slice(&component.to_bits().to_le_bytes());
+  }
+  out.extend_from_slice(&coordinate.height.to_bits().to_le_bytes());
+  out.extend_from_slice(&coordinate.adjustment.to_bits().to_le_bytes());
+  out.extend_from_slice(&coordinate.error.to_bits().to_le_bytes());
+}
+
+/// Decodes a network coordinate from `bytes`, which must be exactly the coordinate — the dimension count
+/// is bounded before allocating, and the byte length must match the declared dimensions plus the three
+/// scalars.
+fn decode_coordinate(bytes: &[u8]) -> Result<NetworkCoordinate, SwimWireError> {
+  if bytes.len() < GOSSIP_COUNT_BYTES {
+    return Err(SwimWireError::Truncated);
+  }
+  let (dims_bytes, rest) = bytes.split_at(GOSSIP_COUNT_BYTES);
+  let mut dims_word = [0u8; GOSSIP_COUNT_BYTES];
+  dims_word.copy_from_slice(dims_bytes);
+  let dims = usize::try_from(u32::from_le_bytes(dims_word)).unwrap_or(usize::MAX);
+  if dims > MAX_COORDINATE_DIMS {
+    return Err(SwimWireError::MalformedCoordinate);
+  }
+  let wanted = dims
+    .checked_add(COORDINATE_SCALARS)
+    .and_then(|scalars| scalars.checked_mul(F64_BYTES))
+    .ok_or(SwimWireError::MalformedCoordinate)?;
+  if rest.len() != wanted {
+    return Err(SwimWireError::MalformedCoordinate);
+  }
+  let mut cursor = rest;
+  let mut vec = Vec::with_capacity(dims);
+  for _ in 0..dims {
+    let (component, tail) = take_f64(cursor).ok_or(SwimWireError::MalformedCoordinate)?;
+    vec.push(component);
+    cursor = tail;
+  }
+  let (height, cursor) = take_f64(cursor).ok_or(SwimWireError::MalformedCoordinate)?;
+  let (adjustment, cursor) = take_f64(cursor).ok_or(SwimWireError::MalformedCoordinate)?;
+  let (error, _) = take_f64(cursor).ok_or(SwimWireError::MalformedCoordinate)?;
+  Ok(NetworkCoordinate {
+    vec,
+    height,
+    adjustment,
+    error,
+  })
+}
+
+/// Reads a little-endian `f64` (its bit pattern) from the front of `bytes`, returning it and the
+/// remainder, or `None` if fewer than eight bytes remain.
+fn take_f64(bytes: &[u8]) -> Option<(f64, &[u8])> {
+  if bytes.len() < F64_BYTES {
+    return None;
+  }
+  let (head, rest) = bytes.split_at(F64_BYTES);
+  let mut word = [0u8; F64_BYTES];
+  word.copy_from_slice(head);
+  Some((f64::from_bits(u64::from_le_bytes(word)), rest))
 }
 
 /// The wire byte for a liveness.
@@ -264,6 +386,9 @@ pub enum ProbeOutcome {
     gossip: Vec<(HostId, MemberState)>,
     /// The measured round-trip time of this probe, in nanoseconds (the shard clock).
     rtt_ns: u64,
+    /// The target's network coordinate, carried on the acknowledgement, for the caller to learn
+    /// (`detector.learn_coordinate`) so it can predict the RTT to the target thereafter.
+    coordinate: NetworkCoordinate,
   },
   /// The deadline elapsed with no acknowledgement — a probe failure (the target may be down, or a packet
   /// lost). The caller does not acknowledge; the detector's next tick suspects, and the indirect probe or
@@ -318,9 +443,12 @@ pub async fn probe_once(
         let _ = cancel(deadline_task);
         // A missing or non-ack reply is not an acknowledgement — treat it as a probe failure.
         let outcome = match SwimMessage::decode(&reply) {
-          Ok(message @ SwimMessage::Ack { .. }) => ProbeOutcome::Acked {
-            gossip: message.gossip().to_vec(),
+          Ok(SwimMessage::Ack {
+            gossip, coordinate, ..
+          }) => ProbeOutcome::Acked {
+            gossip,
             rtt_ns: now_ns().saturating_sub(started_ns),
+            coordinate,
           },
           _ => ProbeOutcome::TimedOut,
         };
@@ -349,12 +477,17 @@ pub async fn serve_probe(
   endpoint
     .serve_once(|request| match SwimMessage::decode(&request) {
       Ok(message) => {
-        // Fold in the sender's gossip, counting the sender as a confirmer of any suspicion it carries.
+        // Fold in the sender's gossip, counting the sender as a confirmer of any suspicion it carries;
+        // learn its coordinate too, if it carried one.
         detector.apply_gossip_from(message.from(), message.gossip());
+        if let Some(coordinate) = message.coordinate() {
+          detector.learn_coordinate(message.from(), coordinate.clone());
+        }
         let gossip = detector.gossip(gossip_fanout);
         SwimMessage::Ack {
           from: local,
           gossip,
+          coordinate: detector.coordinate(),
         }
         .encode()
       }
@@ -389,6 +522,42 @@ mod tests {
     ]
   }
 
+  fn sample_coordinate() -> NetworkCoordinate {
+    NetworkCoordinate {
+      vec: vec![1.5, -2.0, 0.0],
+      height: 3.25,
+      adjustment: -0.5,
+      error: 0.75,
+    }
+  }
+
+  /// An acknowledgement's coordinate round-trips, and a coordinate declaring more dimensions than the
+  /// decoder accepts is refused before allocating.
+  #[test]
+  fn a_coordinate_round_trips_and_a_huge_one_is_refused() {
+    let ack = SwimMessage::Ack {
+      from: A,
+      gossip: sample_gossip(),
+      coordinate: sample_coordinate(),
+    };
+    assert_eq!(
+      SwimMessage::decode(&ack.encode()),
+      Ok(ack),
+      "the coordinate round-trips"
+    );
+
+    // An Ack whose coordinate claims a vast dimension count with no bytes to back it is refused.
+    let mut hostile = vec![TAG_ACK];
+    hostile.extend_from_slice(&7u64.to_le_bytes()); // from
+    hostile.extend_from_slice(&0u32.to_le_bytes()); // empty gossip
+    hostile.extend_from_slice(&u32::MAX.to_le_bytes()); // coordinate dims = huge
+    assert_eq!(
+      SwimMessage::decode(&hostile),
+      Err(SwimWireError::MalformedCoordinate),
+      "an over-large coordinate is refused before allocating"
+    );
+  }
+
   /// Every message kind round-trips through encode/decode unchanged, gossip included.
   #[test]
   fn every_message_round_trips() {
@@ -400,6 +569,7 @@ mod tests {
       SwimMessage::Ack {
         from: B,
         gossip: Vec::new(),
+        coordinate: sample_coordinate(),
       },
       SwimMessage::PingReq {
         from: A,
