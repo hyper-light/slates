@@ -219,6 +219,13 @@ impl StreamAssembler {
     out
   }
 
+  /// Raises the receive window to `max` (monotonic) — the receiver granting itself more buffer as it
+  /// advertises more flow-control credit to the peer (§4.10a §8). A lower value is ignored, so a
+  /// reordered credit decision never shrinks the window.
+  pub fn grant_window(&mut self, max: u64) {
+    self.window = self.window.max(max);
+  }
+
   /// The next byte offset the reader expects (bytes delivered so far).
   pub fn read_offset(&self) -> u64 {
     self.read_offset

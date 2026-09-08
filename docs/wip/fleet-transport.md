@@ -194,10 +194,12 @@ ordered streams and flow-control law — reconciled to slates:
 - **Ordered streams.** A stream per (session, subject); records carry an absolute `offset`;
   delivery is strictly ordered, no gaps (the ordered-log archetype). The green-chain subscription
   (§4.16) is a named subject.
-- **Flow control is the ratified credit law, in the transport.** Dual-level (stream and connection),
-  **absolute-offset** credits (idempotent under loss/reorder), windows `k × frame_cap` per class,
-  the **never-whole-object-in-credit** invariant permanent — so a 2 GB transfer never blocks a
-  control frame (the frame cap's reason to exist).
+- **Flow control is the ratified credit law, in the transport** (built, `flow.rs`, slice 4d).
+  Dual-level (stream and connection), **absolute-offset** credits (idempotent under loss/reorder) a
+  bounded window `window_ahead` beyond what the app has consumed; the **never-whole-object-in-credit**
+  invariant is proven by `a_stream_flows_through_a_bounded_window` — a 200-byte stream flows through a
+  40-byte window, the sender never racing more than a window ahead of the reader, every byte arriving.
+  `window_ahead` is derived (`k × frame_cap`, BDP-autotuned — owed), not a constant.
 
 **The frame set** (fixed-layout little-endian, slates's wire style, D-15 — not QUIC's varints), the
 payload of a TLS-1.3-protected packet:
