@@ -221,6 +221,11 @@ impl RaftNode {
     }
   }
 
+  /// This node's id.
+  pub fn id(&self) -> HostId {
+    self.id
+  }
+
   /// This node's role.
   pub fn role(&self) -> Role {
     self.role
