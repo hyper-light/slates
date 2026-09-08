@@ -2472,11 +2472,19 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > rotates correctly, and a directory is removable once the increment's own removals empty it).
 > The engine now consumes the whole ops document (`Increment { doc, post_state }`) rather than one
 > change per path, so directory rename (as the deriver's child ops), hard link (a namespace edge)
-> and xattr merge too, and several dimensions on one path in one increment merge together. The fully
-> general intra-increment coordination (a path both renamed away and recreated in one increment),
-> per-range identity, the checkpoint folding of the canonical deltas, and the green chain are the
-> rest of Phase 6; the fleet register, mirror and reconfiguration protocols are now simulated (§4.8 status,
-> GAPS §8h).
+> and xattr merge too, and several dimensions on one path in one increment merge together. The
+> engine's content verdict now decides identity **per range**, not per file (the design's pass-two
+> memcmp of the same-range span alone): an overlapping overwrite accepts as a no-op when the green
+> already holds exactly those bytes at that span, so a disjoint edit elsewhere in the file no longer
+> turns an identical overlap into a false conflict. A generative oracle proves it — a serial
+> block-wise reference the engine must equal over every generated history of length-preserving
+> block edits (coordinate-free, so the reference states the design's per-range rule directly), plus
+> the worked case (T-6.x, `crates/merge/tests/engine.rs`). Per-range identity for a length-changing
+> overlap (insert/delete/truncate) still falls back to the whole-file check (its coordinate mapping
+> under a conflicting neighbour is owed). The fully general intra-increment coordination (a path both
+> renamed away and recreated in one increment), that shifting-op per-range identity, the checkpoint
+> folding of the canonical deltas, and the copy-on-write green chain are the rest of Phase 6; the
+> fleet register, mirror and reconfiguration protocols are now simulated (§4.8 status, GAPS §8h).
 
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an

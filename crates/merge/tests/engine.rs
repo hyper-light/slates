@@ -7,6 +7,7 @@
 //! xattr) merge per path with their conflict classes, several dimensions merge on one path in one
 //! increment, a directory move merges as its child ops, and retries are idempotent by identity.
 
+use proptest::prelude::*;
 use slates_merge::engine::{Green, Increment, Outcome, Rebased};
 use slates_merge::increment::VolumeOp;
 use slates_merge::ops_doc::{Op, OpKind, OpsDoc};
@@ -253,6 +254,36 @@ fn an_identical_edit_accepts() {
     Outcome::Accepted { version: 3 },
     "identical edit accepts"
   );
+}
+
+/// Per-range identity, not whole-file (§4.16 "The verdict, two pure passes", D-27: "memcmp only
+/// for same-range candidates"). An increment makes a disjoint edit (a new one, elsewhere in the
+/// file) *and* an edit on a range an intervening change already made identically. The design's
+/// verdict decides each range on its own: the disjoint range accepts at its position, the same-span
+/// range is accept-identical by a memcmp of that span alone. The disjoint edit elsewhere must not
+/// turn the identical overlap into a conflict — which a whole-file compare would. T-6.x.
+#[test]
+fn a_disjoint_edit_plus_an_identical_overlap_accepts_per_range() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("f", b"01234567").at(1, 0));
+  // An intervening change overwrites the second half with "WXYZ" (green head = "0123WXYZ").
+  green.submit(&Build::new().overwrite("f", 4, b"WXYZ").at(2, 1));
+  // An agent based on v1 overwrites the first half (disjoint, new) and the second half with the
+  // *same* bytes the intervening change produced. Per range: accept the first, accept-identical the
+  // second; overall accept. A whole-file identity check conflicts here (the file differs by the new
+  // first half), which is the bug this pins.
+  let outcome = green.submit(
+    &Build::new()
+      .overwrite("f", 0, b"ABCD")
+      .overwrite("f", 4, b"WXYZ")
+      .at(3, 1),
+  );
+  assert_eq!(
+    outcome,
+    Outcome::Accepted { version: 3 },
+    "per-range: a disjoint edit plus an identical overlap accepts"
+  );
+  assert_eq!(green.content("f"), Some(b"ABCDWXYZ".as_slice()));
 }
 
 /// An insert before an accepted disjoint edit shifts the later one, and both apply.
@@ -708,4 +739,101 @@ fn a_truncated_increment_refuses() {
     Increment::decode(&[]).is_err(),
     "empty bytes do not decode to an increment"
   );
+}
+
+// ---------------------------------------------------------------------------
+// The content verdict's generative oracle (§4.16 "The verdict, two pure passes", D-27; D-20's
+// model-based tests). A serial, obviously-correct reference decides the merge block by block; the
+// engine must agree on every generated history. To keep the reference free of coordinate reasoning
+// (which would just re-implement the engine), every edit is a length-preserving overwrite of a
+// whole fixed-size block, so no position ever shifts: the verdict is then purely per-block identity,
+// which is exactly the design's per-range rule made trivial to state.
+
+/// The fixed block width; a whole block is overwritten at once (length-preserving, so no shifts).
+const BLOCK_LEN: usize = 4;
+/// How many blocks the file has.
+const BLOCKS: usize = 5;
+
+/// The base file: block `b` is four copies of `b`, so the blocks are distinct and an untouched
+/// block is recognisable in the merged result.
+fn base_file() -> Vec<u8> {
+  let mut file = Vec::with_capacity(BLOCKS * BLOCK_LEN);
+  for b in 0..BLOCKS {
+    file.extend(std::iter::repeat_n(u8::try_from(b).unwrap_or(0), BLOCK_LEN));
+  }
+  file
+}
+
+/// The bytes an edit with tag `t` writes into a block: four copies of `100 + t`, independent of
+/// which side wrote them — so the same tag on both sides is byte-identical (a convergent edit) and
+/// different tags differ. Tags are 1..=3; tag 0 means the side left the block untouched.
+fn edit_bytes(tag: u8) -> Vec<u8> {
+  vec![100 + tag; BLOCK_LEN]
+}
+
+/// Overwrites into one `Build`, one op per edited block (tag != 0), at the block's fixed offset.
+fn block_edits(edits: &[u8]) -> Build {
+  let mut build = Build::new();
+  for (b, &tag) in edits.iter().enumerate() {
+    if tag != 0 {
+      build.overwrite("f", (b * BLOCK_LEN) as u64, &edit_bytes(tag));
+    }
+  }
+  build
+}
+
+/// The reference merged file when the verdict accepts: per block, the agent's bytes if it edited the
+/// block, else the intervening (green) bytes if it did, else the base bytes. Because an accepted
+/// merge has no block both sides changed differently, this is well-defined.
+fn reference_merge(green: &[u8], agent: &[u8]) -> Vec<u8> {
+  let base = base_file();
+  let mut out = Vec::with_capacity(base.len());
+  for b in 0..BLOCKS {
+    let range = b * BLOCK_LEN..(b + 1) * BLOCK_LEN;
+    if agent[b] != 0 {
+      out.extend_from_slice(&edit_bytes(agent[b]));
+    } else if green[b] != 0 {
+      out.extend_from_slice(&edit_bytes(green[b]));
+    } else {
+      out.extend_from_slice(&base[range]);
+    }
+  }
+  out
+}
+
+proptest! {
+  // Each block independently: 0 = untouched, 1..=3 = overwritten with that tag. The agent must
+  // touch at least one block (an empty content increment is a different path).
+  #[test]
+  fn the_content_verdict_matches_the_block_oracle(
+    green in prop::collection::vec(0u8..=3, BLOCKS),
+    agent in prop::collection::vec(0u8..=3, BLOCKS),
+  ) {
+    prop_assume!(agent.iter().any(|&t| t != 0));
+
+    // The design's per-block rule: a conflict iff some block was changed by both sides to
+    // different bytes; otherwise every block accepts (disjoint) or accepts-identical (same tag).
+    let expect_conflict =
+      (0..BLOCKS).any(|b| green[b] != 0 && agent[b] != 0 && green[b] != agent[b]);
+
+    let mut volume = Green::new();
+    volume.submit(&Build::new().create("f", &base_file()).at(1, 0)); // version 1 = base
+    let any_green = green.iter().any(|&t| t != 0);
+    if any_green {
+      volume.submit(&block_edits(&green).at(2, 1)); // version 2 = the intervening changes
+    }
+    // The agent is based on version 1, behind the intervening changes when there were any.
+    let outcome = volume.submit(&block_edits(&agent).at(3, 1));
+
+    if expect_conflict {
+      prop_assert!(
+        matches!(outcome, Outcome::Conflict { .. }),
+        "a block changed differently by both sides must conflict; got {outcome:?}"
+      );
+    } else {
+      prop_assert_eq!(&outcome, &Outcome::Accepted { version: if any_green { 3 } else { 2 } });
+      let expected = reference_merge(&green, &agent);
+      prop_assert_eq!(volume.content("f").unwrap(), expected.as_slice());
+    }
+  }
 }

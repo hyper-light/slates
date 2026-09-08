@@ -230,11 +230,17 @@ fn apply(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
 
 /// Appends `len` bytes at `src` of `from` to `out`, clamped to `from`'s bounds.
 fn push_slice(out: &mut Vec<u8>, from: &[u8], src: u64, len: u64) {
+  out.extend_from_slice(span_bytes(from, src, len));
+}
+
+/// The `len` bytes at `src` of `from`, clamped to `from`'s bounds (an op's declared bytes in a
+/// post-state). Used by the per-range verdict's byte check and by [`apply`]'s splice.
+fn span_bytes(from: &[u8], src: u64, len: u64) -> &[u8] {
   let start = usize::try_from(src).unwrap_or(usize::MAX).min(from.len());
   let end = start
     .saturating_add(usize::try_from(len).unwrap_or(0))
     .min(from.len());
-  out.extend_from_slice(&from[start..end]);
+  &from[start..end]
 }
 
 /// The changes an increment declares, resolved from the ops document into per-dimension groups by
@@ -596,9 +602,16 @@ impl Green {
     Ok(Some(Effect::RemoveContent(path.to_owned())))
   }
 
-  /// Merges an edit to an existing file (the content path): each net op is mapped forward, disjoint
-  /// ops are accepted at the shifted position, and an op that meets an intervening change is a
-  /// conflict unless the agent produced exactly the green's current bytes for the file.
+  /// Merges an edit to an existing file (the content path), by the two pure passes of §4.16 / D-27.
+  /// Pass one maps each net op forward: an op no intervening change touched accepts at its shifted
+  /// position; an op that meets an intervening change is a same-range candidate. Pass two is a
+  /// memcmp **of that span alone** — the agent's declared bytes for the span against the green's
+  /// current bytes there — so an identical (convergent) edit accepts as a no-op while a genuine
+  /// divergence is a byte-exact conflict. The span-only check is the fix for the whole-file
+  /// identity check's bug: a disjoint edit elsewhere in the file no longer poisons an identical
+  /// overlap (T-6.x). A length-changing op (insert/delete/truncate) that overlaps is not yet decided
+  /// per range — its coordinate mapping under a conflicting neighbour is owed — so the whole-file
+  /// identity check still stands for the path in that case, exactly as before (never a regression).
   fn merge_content(
     &mut self,
     inc: &Increment,
@@ -621,7 +634,12 @@ impl Green {
     } else {
       self.intervening(path, inc.base)
     };
+    // Pass one: classify each op. Disjoint ops go to `mapped` (accept at the shifted position);
+    // overlapping overwrites become same-range candidates; a length-changing op that overlaps falls
+    // the path back to the whole-file identity check (owed).
     let mut mapped = Vec::with_capacity(ops.len());
+    let mut candidates: Vec<&Op> = Vec::new();
+    let mut shifting_overlap: Option<Range> = None;
     for op in ops {
       match crate::map::map_range(&intervening, touched_range(op)) {
         crate::map::Mapped::Shifted(shifted) => {
@@ -630,25 +648,68 @@ impl Green {
           mapped.push(moved);
         }
         crate::map::Mapped::Overlaps => {
-          // Both agents may have made the identical edit: accept when the agent's final bytes for
-          // the file equal the green's current bytes (base reconstructed from history).
-          let base_bytes = self.content_at(path, inc.base).unwrap_or_default();
-          let agent_final = apply(&base_bytes, ops, &inc.post_state);
-          let current = self
-            .content
-            .get(path)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-          if agent_final == current {
-            return Ok(None);
+          if op.kind == OpKind::Overwrite {
+            candidates.push(op);
+          } else {
+            shifting_overlap.get_or_insert(touched_range(op));
           }
-          return Err(ConflictWindow {
-            path: path.to_owned(),
-            range: touched_range(op),
-            class: MergeConflictClass::Overlap,
-          });
         }
       }
+    }
+
+    // A length-changing op overlapped: the whole-file identity check decides the path (owed: full
+    // per-range identity for shifting ops), so a currently-accepted convergent case never regresses.
+    if let Some(range) = shifting_overlap {
+      let base_bytes = self.content_at(path, inc.base).unwrap_or_default();
+      let agent_final = apply(&base_bytes, ops, &inc.post_state);
+      let current = self
+        .content
+        .get(path)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+      if agent_final == current {
+        return Ok(None);
+      }
+      return Err(ConflictWindow {
+        path: path.to_owned(),
+        range,
+        class: MergeConflictClass::Overlap,
+      });
+    }
+
+    // Pass two: each overlapping overwrite must reproduce, byte for byte, what the intervening
+    // change already placed at that span; a differing span is a byte-exact conflict. An identical
+    // span is a no-op (the green already holds those bytes), so it is not added to `mapped`.
+    for op in &candidates {
+      let span = touched_range(op);
+      let head_start = match crate::map::map_range(&intervening, Range::new(span.start, 0)) {
+        crate::map::Mapped::Shifted(head) => head.start,
+        // A zero-length point cannot overlap (the edge rule), so this arm is unreachable; take the
+        // base offset rather than panic.
+        crate::map::Mapped::Overlaps => span.start,
+      };
+      let agent_bytes = span_bytes(&inc.post_state, op.src, op.len);
+      let current = self
+        .content
+        .get(path)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+      let start = usize::try_from(head_start).unwrap_or(usize::MAX);
+      let end = start.saturating_add(agent_bytes.len());
+      let identical = end <= current.len() && &current[start..end] == agent_bytes;
+      if !identical {
+        return Err(ConflictWindow {
+          path: path.to_owned(),
+          range: span,
+          class: MergeConflictClass::Overlap,
+        });
+      }
+    }
+
+    // Every op accepted. When only identical overlaps remained (nothing disjoint to apply), the
+    // green already holds the result: accept with no new effect, as an identical edit always has.
+    if mapped.is_empty() {
+      return Ok(None);
     }
     let empty = Vec::new();
     let current = self.content.get(path).unwrap_or(&empty);

@@ -44,6 +44,14 @@ than clobbering it. Non-vacuous — a broken verdict would accept both.
 
 ## What is owed
 
+- **Per-range identity in the content verdict** (§4.16 pass two, D-27) is **landed for overwrites**:
+  the engine decides an overlapping overwrite by a memcmp of that span alone against the green's
+  current bytes there (`Green::merge_content`), so it accepts a convergent edit as a no-op and a
+  disjoint edit elsewhere in the file no longer forces a false conflict — the bug the old whole-file
+  identity check carried. A generative oracle guards it (`the_content_verdict_matches_the_block_oracle`,
+  a serial block-wise reference the engine must equal over every generated history) alongside the
+  worked case. **Owed:** a length-changing overlap (insert/delete/truncate) still uses the whole-file
+  check (its per-range coordinate mapping under a conflicting neighbour is the remaining piece).
 - **The base at an older version.** `submit` derives against the green's base: `Base::default()` at
   version 0, and the green's current state (`Green::current_base`) when the work's base is the head —
   and a new work is seeded with the green's content (`Green::files`) so an edit to a base file splices
