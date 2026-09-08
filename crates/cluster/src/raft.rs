@@ -22,18 +22,21 @@
 //! decision needs a majority of *both* the old and new voter sets, so no two disjoint majorities can form
 //! across the change; every quorum check (election, commit, CheckQuorum, ReadIndex) honours it.
 //!
-//! And **snapshot/log compaction** (§7): [`compact`](RaftNode::compact) folds the committed prefix into
-//! a snapshot and discards it, so the log stays bounded; every index resolves through a snapshot offset
-//! that is a no-op until the first compaction. The multi-node **conformance suite** (`tests/raft.rs`)
-//! drives a cluster through election, replication, a partition and a membership change, checking Election
-//! Safety, Log Matching, Leader Completeness and State Machine Safety.
+//! And **snapshot/log compaction with install-snapshot** (§7): [`compact`](RaftNode::compact) folds the
+//! committed prefix into a snapshot and discards it, so the log stays bounded (every index resolves
+//! through a snapshot offset that is a no-op until the first compaction); and a follower that has fallen
+//! below the leader's snapshot — which no append can reach — is caught up by
+//! [`install_snapshot_for`](RaftNode::install_snapshot_for)/[`on_install_snapshot`](RaftNode::on_install_snapshot).
+//! The multi-node **conformance suite** (`tests/raft.rs`) drives a cluster through election, replication,
+//! a partition and a membership change, checking Election Safety, Log Matching, Leader Completeness and
+//! State Machine Safety.
 //!
 //! Degenerate on a laptop (`f = 0`): one voter, itself; a pre-vote and an election each reach a majority
 //! of one at once, an appended entry commits at once, and the lone voter is always its own quorum so it
 //! never steps down — the same code path as a fleet, never a mode switch (R8). Owed: wiring the
-//! membership change through the log (the `C_old,new`/`C_new` entries that take effect on append and
-//! revert on truncation — the transition mechanics on top of the majority rule built here) and the
-//! install-snapshot RPC that catches up a follower fallen below the leader's snapshot.
+//! membership change through the log — the `C_old,new`/`C_new` entries that take effect on append and
+//! revert on truncation, the transition mechanics on top of the majority rule built here (the direct
+//! `begin`/`complete_membership_change` are the stand-in the config group drives at `f = 0`).
 //!
 //! Evidence: Ongaro & Ousterhout, *In Search of an Understandable Consensus Algorithm (Extended
 //! Version)*, 2014 (tier A); the safety argument for the election restriction is §5.4.
@@ -157,6 +160,33 @@ pub struct AppendReply {
   pub match_index: u64,
 }
 
+/// A leader's snapshot transfer (Raft `InstallSnapshot`, §7) — sent to a follower that has fallen below
+/// the leader's snapshot, so `AppendEntries` cannot reach it (the entries it needs were compacted away).
+/// It resets the follower's log to begin after the snapshot's last included entry and carries the
+/// state-machine state at that point.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallSnapshot {
+  /// The leader's term.
+  pub term: u64,
+  /// The leader sending the snapshot.
+  pub leader: HostId,
+  /// The index of the last entry the snapshot includes (the follower's log resets to just after it).
+  pub last_included_index: u64,
+  /// The term of that last included entry (checked against any entry the follower still holds there).
+  pub last_included_term: u64,
+  /// The state-machine state at the snapshot (opaque to the Raft core; the caller applies it).
+  pub state: Vec<u8>,
+}
+
+/// A follower's reply to [`InstallSnapshot`]: the follower and its current term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstallSnapshotReply {
+  /// The follower replying.
+  pub follower: HostId,
+  /// The follower's current term.
+  pub term: u64,
+}
+
 /// A Raft node's state: its identity, the voters it counts a majority against, the persistent term and
 /// vote (Raft's `currentTerm`/`votedFor`), its role, the votes gathered this election, the replicated
 /// `log` and how far it is committed, and — while leader — the per-follower `next_index`/`match_index`
@@ -178,6 +208,7 @@ pub struct RaftNode {
   match_index: BTreeMap<HostId, u64>,
   snapshot_index: u64,
   snapshot_term: u64,
+  snapshot_data: Vec<u8>,
 }
 
 impl RaftNode {
@@ -200,6 +231,7 @@ impl RaftNode {
       match_index: BTreeMap::new(),
       snapshot_index: 0,
       snapshot_term: 0,
+      snapshot_data: Vec::new(),
     }
   }
 
@@ -230,6 +262,7 @@ impl RaftNode {
       match_index: BTreeMap::new(),
       snapshot_index: 0,
       snapshot_term: 0,
+      snapshot_data: Vec::new(),
     }
   }
 
@@ -520,7 +553,7 @@ impl RaftNode {
   /// consistency check at the boundary still holds. Returns whether it compacted. The caller must have
   /// captured the state machine's state at `up_to` first; a follower far enough behind to need a
   /// discarded entry is served an install-snapshot (owed).
-  pub fn compact(&mut self, up_to: u64) -> bool {
+  pub fn compact(&mut self, up_to: u64, state: Vec<u8>) -> bool {
     if up_to <= self.snapshot_index || up_to > self.commit_index {
       return false;
     }
@@ -532,7 +565,87 @@ impl RaftNode {
     self.log.drain(0..discard);
     self.snapshot_index = up_to;
     self.snapshot_term = term;
+    self.snapshot_data = state;
     true
+  }
+
+  /// The [`InstallSnapshot`] to send `follower` when it has fallen below the leader's snapshot (the
+  /// entries it needs were compacted away), else `None`. The leader calls this when
+  /// [`replicate_to`](RaftNode::replicate_to) returns `None`.
+  pub fn install_snapshot_for(&self, follower: HostId) -> Option<InstallSnapshot> {
+    if self.role != Role::Leader || self.snapshot_index == 0 {
+      return None;
+    }
+    let next = self.next_index.get(&follower).copied().unwrap_or(1).max(1);
+    if next > self.snapshot_index {
+      return None; // an append can still reach it
+    }
+    Some(InstallSnapshot {
+      term: self.current_term,
+      leader: self.id,
+      last_included_index: self.snapshot_index,
+      last_included_term: self.snapshot_term,
+      state: self.snapshot_data.clone(),
+    })
+  }
+
+  /// Handles a received [`InstallSnapshot`] as a follower (Raft §7). A stale-term snapshot is rejected; a
+  /// current-or-newer one is installed: if the follower holds an entry at the snapshot's last included
+  /// index and term it keeps the following entries, otherwise it discards its whole log; then it adopts
+  /// the snapshot index, term and state and advances its commit index to at least the snapshot. The
+  /// caller applies the state to its state machine. Returns the reply.
+  pub fn on_install_snapshot(&mut self, request: InstallSnapshot) -> InstallSnapshotReply {
+    if request.term < self.current_term {
+      return InstallSnapshotReply {
+        follower: self.id,
+        term: self.current_term,
+      };
+    }
+    if request.term > self.current_term {
+      self.step_down(request.term);
+    }
+    self.role = Role::Follower;
+    self.has_leader = true;
+
+    if request.last_included_index > self.snapshot_index {
+      let keeps_suffix =
+        self.entry_term(request.last_included_index) == Some(request.last_included_term);
+      if keeps_suffix {
+        let discard = usize::try_from(request.last_included_index - self.snapshot_index)
+          .unwrap_or(usize::MAX)
+          .min(self.log.len());
+        self.log.drain(0..discard);
+      } else {
+        self.log.clear();
+      }
+      self.snapshot_index = request.last_included_index;
+      self.snapshot_term = request.last_included_term;
+      self.snapshot_data = request.state;
+      self.commit_index = self.commit_index.max(request.last_included_index);
+    }
+    InstallSnapshotReply {
+      follower: self.id,
+      term: self.current_term,
+    }
+  }
+
+  /// Handles a follower's [`InstallSnapshotReply`] as the leader: a newer term steps us down; otherwise
+  /// the follower now holds up to the snapshot, so its `match_index`/`next_index` advance past it and the
+  /// commit index may advance.
+  pub fn on_install_snapshot_reply(&mut self, reply: InstallSnapshotReply) {
+    if reply.term > self.current_term {
+      self.step_down(reply.term);
+      return;
+    }
+    if self.role != Role::Leader || reply.term != self.current_term {
+      return;
+    }
+    self.contacts.insert(reply.follower);
+    self.match_index.insert(reply.follower, self.snapshot_index);
+    self
+      .next_index
+      .insert(reply.follower, self.snapshot_index.saturating_add(1));
+    self.advance_leader_commit();
   }
 
   /// Appends `command` to the leader's own log at the current term and updates its self-match, so a
@@ -557,15 +670,13 @@ impl RaftNode {
     if self.role != Role::Leader {
       return None;
     }
-    // Never send from below the snapshot boundary (those entries are compacted away).
-    let next = self
-      .next_index
-      .get(&follower)
-      .copied()
-      .unwrap_or(1)
-      .max(self.snapshot_index.saturating_add(1))
-      .max(1);
+    let next = self.next_index.get(&follower).copied().unwrap_or(1).max(1);
     let prev_log_index = next.saturating_sub(1);
+    // The entry before the new ones has been compacted away — the follower needs an install-snapshot
+    // ([`install_snapshot_for`](RaftNode::install_snapshot_for)), not an append.
+    if prev_log_index < self.snapshot_index {
+      return None;
+    }
     let prev_log_term = if prev_log_index == 0 {
       0
     } else {
@@ -821,6 +932,19 @@ mod tests {
       }
     }
     node
+  }
+
+  /// Drives replication from `leader` to `follower` (id `who`), applying each reply, until an append can
+  /// no longer be built (the follower needs a snapshot). Returns whether it became stuck; bounded.
+  fn replicate_until_stuck(leader: &mut RaftNode, follower: &mut RaftNode, who: HostId) -> bool {
+    for _ in 0..8 {
+      let Some(append) = leader.replicate_to(who) else {
+        return true;
+      };
+      let reply = follower.on_append_entries(append);
+      leader.on_append_reply(reply);
+    }
+    false
   }
 
   /// A single-voter group elects itself: an election reaches the majority of one at once, so the node is
@@ -1370,7 +1494,10 @@ mod tests {
 
     // Compact up to index 3: the prefix is discarded, but the last index and the committed remainder are
     // still correct.
-    assert!(leader.compact(3), "committed entries up to 3 compact");
+    assert!(
+      leader.compact(3, Vec::new()),
+      "committed entries up to 3 compact"
+    );
     assert_eq!(leader.snapshot_index(), 3);
     assert_eq!(
       leader.last_log_index(),
@@ -1401,13 +1528,19 @@ mod tests {
     for value in 0..3u8 {
       leader.append_command(vec![value]);
     }
-    assert!(leader.compact(2), "committed entries up to 2 compact");
     assert!(
-      !leader.compact(2),
+      leader.compact(2, Vec::new()),
+      "committed entries up to 2 compact"
+    );
+    assert!(
+      !leader.compact(2, Vec::new()),
       "cannot compact at or below the current snapshot"
     );
-    assert!(!leader.compact(1), "nor backward");
-    assert!(!leader.compact(100), "nor beyond the commit index");
+    assert!(!leader.compact(1, Vec::new()), "nor backward");
+    assert!(
+      !leader.compact(100, Vec::new()),
+      "nor beyond the commit index"
+    );
   }
 
   /// After compaction the leader still replicates correctly to a follower: the append it builds anchors
@@ -1435,7 +1568,7 @@ mod tests {
     assert_eq!(leader.commit_index(), 4);
 
     // Compact the leader up to index 2; its log now begins after the snapshot.
-    assert!(leader.compact(2));
+    assert!(leader.compact(2, Vec::new()));
     assert_eq!(leader.snapshot_index(), 2);
 
     // Append and replicate again: the follower (already caught up) accepts across the boundary.
@@ -1451,5 +1584,59 @@ mod tests {
       "the caught-up follower accepts the post-compaction append"
     );
     assert_eq!(follower.last_log_index(), 5);
+  }
+
+  /// A follower fallen below the leader's snapshot is caught up by an install-snapshot (Raft §7):
+  /// replication first backs its next index down to the snapshot boundary and then cannot proceed (the
+  /// entries are compacted away), so the leader ships the snapshot; the follower installs it and then
+  /// accepts the entries beyond it.
+  #[test]
+  fn a_follower_below_the_snapshot_is_caught_up_by_install_snapshot() {
+    // A term-3 leader with a four-entry committed log, compacted up to index 3 with some snapshot state.
+    let mut leader = RaftNode::recovered(A, vec![A, B, C], 2, None, log_of(&[1, 1, 2]));
+    leader.start_election(); // term 3
+    leader.on_vote_reply(VoteReply {
+      voter: B,
+      term: leader.term(),
+      granted: true,
+    });
+    leader.append_command(b"t3".to_vec()); // index 4, term 3
+    let mut follower_b = RaftNode::recovered(B, vec![A, B, C], 3, None, log_of(&[1, 1, 2]));
+    let append = leader.replicate_to(B).expect("append");
+    let reply = follower_b.on_append_entries(append);
+    leader.on_append_reply(reply);
+    assert_eq!(leader.commit_index(), 4);
+    assert!(leader.compact(3, b"snapshot-state".to_vec()));
+
+    // A fresh, empty follower C is far below the snapshot. Replication backs its next index down until an
+    // append can no longer be built (the previous entry is compacted away).
+    let mut follower_c = RaftNode::new(C, vec![A, B, C]);
+    let needs_snapshot = replicate_until_stuck(&mut leader, &mut follower_c, C);
+    assert!(
+      needs_snapshot,
+      "replication cannot reach a follower below the snapshot"
+    );
+
+    // The leader ships the snapshot; the follower installs it and reports back.
+    let snapshot = leader.install_snapshot_for(C).expect("C needs a snapshot");
+    assert_eq!(snapshot.last_included_index, 3);
+    assert_eq!(snapshot.state, b"snapshot-state");
+    let reply = follower_c.on_install_snapshot(snapshot);
+    leader.on_install_snapshot_reply(reply);
+    assert_eq!(
+      follower_c.snapshot_index(),
+      3,
+      "the follower adopted the snapshot"
+    );
+
+    // Now a normal append carries the entries beyond the snapshot, and C is caught up.
+    let append = leader.replicate_to(C).expect("append after the snapshot");
+    let reply = follower_c.on_append_entries(append);
+    assert!(reply.success, "C accepts the post-snapshot entries");
+    assert_eq!(
+      follower_c.last_log_index(),
+      4,
+      "C is caught up to the leader"
+    );
   }
 }
