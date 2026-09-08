@@ -18,6 +18,13 @@
 > acceptance-point key lookup, §4.13) and the **QUIC session plane** are not coded, and wait on your
 > ratifying this section (the D-15→QUIC/UDP substrate amendment). Ada authorized proceeding on the
 > crypto 2026-09-08 ("just … do it"); enrollment and QUIC remain the owed subsystems below.
+>
+> The whole **control plane is proven end to end over UDP** (`crates/transport/tests/plane.rs`): a
+> node derives its keys, seals a datagram, and sends it over a `UdpSocket`; the peer receives the
+> bytes and runs the acceptance order, recovering the authentic datagram — deterministically at N=1
+> on the simulation UDP fabric, no OS network. So slice 1 (codec) + slice 2 (seal, schedule, accept)
+> + slice 3 (UDP driver) are a working control plane; what is left is the session plane (QUIC) and
+> the identity that populates the keyring (enrollment).
 
 ## 1. Scope and the R8 spine
 

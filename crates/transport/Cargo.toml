@@ -13,5 +13,11 @@ aes-gcm = { workspace = true }
 hkdf = { workspace = true }
 sha2 = { workspace = true }
 
+[dev-dependencies]
+# The runtime's async UDP socket (real driver + the deterministic sim fabric) drives the end-to-end
+# control-plane test (§4.10a); shipped transport code stays pure — this is only the test's substrate.
+slates-rt = { workspace = true }
+rustix = { workspace = true }
+
 [lints]
 workspace = true

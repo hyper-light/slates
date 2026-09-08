@@ -1041,7 +1041,9 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "hkdf",
+ "rustix",
  "sha2",
+ "slates-rt",
 ]
 
 [[package]]
