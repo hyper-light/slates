@@ -5,13 +5,13 @@
 //! over the control plane and feeds received messages back in.
 //!
 //! Evidence: SWIM (Das/Gupta/Motivala, DSN 2002) and Lifeguard (Dadgar/Phillips/Currey, DSN 2018),
-//! tier A. This slice is **direct probing**: each period the detector pings the next member in a
-//! round-robin over the alive peers; a member that does not acknowledge within its period is
-//! suspected, and a member that stays suspected for the suspicion window is declared dead. Owed: the
-//! **indirect probe** (ping-request through `k` peers, which distinguishes a failed member from a lost
-//! packet), gossip piggybacked on the ping/ack, and the Lifeguard local-health multiplier that widens
-//! the timeouts when the local node itself looks unhealthy. Round-robin (not random) selection is the
-//! deterministic interim; SWIM's randomized order with a per-round shuffle is owed with the tuning.
+//! tier A. Built: **direct probing** (each period pings the next member round-robin; an unanswered
+//! probe suspects, a suspicion held for the window kills); the **indirect probe** (a ping-request
+//! through `k` peers, so a lost packet is not a failure); and **infection-style gossip** (each
+//! membership change piggybacks on ping/ack a bounded number of times, spreading the view). Owed: the
+//! Lifeguard local-health multiplier that widens the timeouts when the local node itself looks
+//! unhealthy, and randomized (rather than round-robin) probe order — both tuning refinements with a
+//! measured input.
 
 use std::collections::BTreeMap;
 
@@ -57,14 +57,16 @@ pub struct Detector {
   acked: bool,
   suspicion: BTreeMap<HostId, u32>,
   suspicion_periods: u32,
+  gossip: BTreeMap<HostId, (MemberState, u32)>,
+  gossip_transmits: u32,
 }
 
 impl Detector {
-  /// A detector for `local`, declaring a member dead after it has been suspected for
-  /// `suspicion_periods` protocol periods (the caller derives this from the fleet size and period —
-  /// SWIM's suspicion timeout grows with `log(N)`; owed as a measured value, a parameter here so it is
-  /// never a hidden constant).
-  pub fn new(local: HostId, suspicion_periods: u32) -> Detector {
+  /// A detector for `local`. A member is declared dead after it has been suspected for
+  /// `suspicion_periods` protocol periods, and each membership change is disseminated by gossip
+  /// `gossip_transmits` times (SWIM's `λ·log(N)` infection bound). Both are the caller's to derive
+  /// from the fleet size — parameters here, never hidden constants.
+  pub fn new(local: HostId, suspicion_periods: u32, gossip_transmits: u32) -> Detector {
     Detector {
       membership: Membership::new(local),
       local,
@@ -74,6 +76,63 @@ impl Detector {
       acked: false,
       suspicion: BTreeMap::new(),
       suspicion_periods,
+      gossip: BTreeMap::new(),
+      gossip_transmits,
+    }
+  }
+
+  /// Applies a membership update and enqueues the resulting change for gossip dissemination.
+  fn record(&mut self, subject: HostId, update: MemberState) -> Option<Change> {
+    let change = self.membership.apply(subject, update);
+    match change {
+      Some(Change::Adopted { member, state }) => {
+        self.gossip.insert(member, (state, self.gossip_transmits));
+      }
+      Some(Change::Refuted { incarnation }) => {
+        // Gossip our refutation so the fleet learns we are alive at the new incarnation.
+        let state = MemberState {
+          liveness: Liveness::Alive,
+          incarnation,
+        };
+        self
+          .gossip
+          .insert(self.local, (state, self.gossip_transmits));
+      }
+      None => {}
+    }
+    change
+  }
+
+  /// The batch of membership updates to piggyback on an outgoing ping or acknowledgement: up to `max`,
+  /// the least-disseminated first, each with its remaining-transmit count decremented and dropped once
+  /// exhausted — so the buffer is bounded and each change spreads a fixed number of times (§4.8; SWIM
+  /// infection-style dissemination).
+  pub fn gossip(&mut self, max: usize) -> Vec<(HostId, MemberState)> {
+    let mut ranked: Vec<(HostId, MemberState, u32)> = self
+      .gossip
+      .iter()
+      .map(|(&subject, &(state, remaining))| (subject, state, remaining))
+      .collect();
+    // Most remaining transmits first — freshest changes propagate soonest.
+    ranked.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.0.cmp(&b.0.0)));
+    let mut batch = Vec::new();
+    for (subject, state, _) in ranked.into_iter().take(max) {
+      batch.push((subject, state));
+      if let Some((_, remaining)) = self.gossip.get_mut(&subject) {
+        *remaining -= 1;
+        if *remaining == 0 {
+          self.gossip.remove(&subject);
+        }
+      }
+    }
+    batch
+  }
+
+  /// Applies a received gossip batch, folding each update into the view (and re-enqueueing anything it
+  /// adopts so the change spreads onward — the infection continues).
+  pub fn apply_gossip(&mut self, updates: &[(HostId, MemberState)]) {
+    for &(subject, state) in updates {
+      self.apply(subject, state);
     }
   }
 
@@ -85,7 +144,7 @@ impl Detector {
   /// Learns a peer (alive at incarnation zero) — a join. The next round will probe it.
   pub fn join(&mut self, peer: HostId) {
     if peer != self.local {
-      self.membership.apply(
+      self.record(
         peer,
         MemberState {
           liveness: Liveness::Alive,
@@ -95,10 +154,10 @@ impl Detector {
     }
   }
 
-  /// Applies a gossiped membership update (from a ping/ack payload), returning the change — the seam
-  /// gossip dissemination (owed) will drive; a refutation here clears any local suspicion of that peer.
+  /// Applies a gossiped membership update (from a ping/ack payload), returning the change and enqueuing
+  /// it for onward gossip; an alive adoption clears any local suspicion of that peer.
   pub fn apply(&mut self, subject: HostId, update: MemberState) -> Option<Change> {
-    let change = self.membership.apply(subject, update);
+    let change = self.record(subject, update);
     if let Some(Change::Adopted { member, state }) = change
       && state.liveness == Liveness::Alive
     {
@@ -118,7 +177,7 @@ impl Detector {
       && let Some(current) = self.membership.state(target)
       && current.liveness == Liveness::Alive
     {
-      self.membership.apply(
+      self.record(
         target,
         MemberState {
           liveness: Liveness::Suspect,
@@ -193,7 +252,7 @@ impl Detector {
       let periods = self.suspicion.entry(host).or_insert(0);
       *periods = periods.saturating_add(1);
       if *periods >= self.suspicion_periods {
-        self.membership.apply(
+        self.record(
           host,
           MemberState {
             liveness: Liveness::Dead,
@@ -238,7 +297,7 @@ mod tests {
   /// suspected for the suspicion window — Alive → Suspect → Dead, driven by ticks.
   #[test]
   fn an_unresponsive_member_is_suspected_then_declared_dead() {
-    let mut detector = Detector::new(LOCAL, 2);
+    let mut detector = Detector::new(LOCAL, 2, 3);
     detector.join(A);
 
     // Period 1 probes A (the only peer); A never acknowledges.
@@ -272,7 +331,7 @@ mod tests {
   /// A member that acknowledges each probe stays alive — never suspected.
   #[test]
   fn a_responsive_member_stays_alive() {
-    let mut detector = Detector::new(LOCAL, 2);
+    let mut detector = Detector::new(LOCAL, 2, 3);
     detector.join(A);
     for _ in 0..5 {
       let ping = detector.tick().expect("a peer to probe");
@@ -288,7 +347,7 @@ mod tests {
   /// are probed.
   #[test]
   fn probing_rotates_across_peers() {
-    let mut detector = Detector::new(LOCAL, 3);
+    let mut detector = Detector::new(LOCAL, 3, 3);
     detector.join(A);
     detector.join(B);
     let first = detector.tick().unwrap().to;
@@ -302,7 +361,7 @@ mod tests {
   /// A ping is answered with an acknowledgement to the sender.
   #[test]
   fn a_ping_is_acknowledged() {
-    let detector = Detector::new(LOCAL, 2);
+    let detector = Detector::new(LOCAL, 2, 3);
     assert_eq!(detector.on_ping(A), Ack { to: A });
   }
 
@@ -311,7 +370,7 @@ mod tests {
   /// failure. The ping-request is aimed at another alive peer, not the target.
   #[test]
   fn an_indirect_ack_prevents_a_false_suspicion() {
-    let mut detector = Detector::new(LOCAL, 2);
+    let mut detector = Detector::new(LOCAL, 2, 3);
     detector.join(A);
     detector.join(B);
 
@@ -332,6 +391,52 @@ mod tests {
       detector.membership().state(target).unwrap().liveness,
       Liveness::Alive,
       "an indirectly-acknowledged member is not suspected"
+    );
+  }
+
+  /// A membership change is disseminated a bounded number of times, then dropped — the gossip buffer
+  /// does not grow without end (infection-style dissemination, bounded).
+  #[test]
+  fn a_change_is_gossiped_a_bounded_number_of_times() {
+    let mut detector = Detector::new(LOCAL, 2, 2); // two transmits per change
+    detector.join(A); // learning A is a change to disseminate
+
+    assert!(
+      detector.gossip(10).iter().any(|(host, _)| *host == A),
+      "the change is gossiped (transmit 1)"
+    );
+    assert!(
+      detector.gossip(10).iter().any(|(host, _)| *host == A),
+      "and again (transmit 2)"
+    );
+    assert!(
+      detector.gossip(10).iter().all(|(host, _)| *host != A),
+      "after its transmit budget the change is dropped — the buffer is bounded"
+    );
+  }
+
+  /// Gossip carries a change to another node: one node declares a peer dead, gossips it, and a second
+  /// node that applies the batch adopts the death — the view spreads.
+  #[test]
+  fn gossip_carries_a_change_to_another_node() {
+    let mut source = Detector::new(LOCAL, 2, 2);
+    source.join(A);
+    // The source declares A dead (adopts it), enqueuing the change for gossip.
+    source.apply(
+      A,
+      MemberState {
+        liveness: Liveness::Dead,
+        incarnation: 0,
+      },
+    );
+    let batch = source.gossip(10);
+
+    let mut other = Detector::new(B, 2, 2);
+    other.apply_gossip(&batch);
+    assert_eq!(
+      other.membership().state(A).map(|s| s.liveness),
+      Some(Liveness::Dead),
+      "the second node learns A is dead through gossip"
     );
   }
 }
