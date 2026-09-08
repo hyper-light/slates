@@ -12,13 +12,16 @@
 //! Also built: **PreVote** (§9.6) — a would-be candidate first runs a non-binding pre-vote round at the
 //! term it *would* seek, without incrementing its own term; only on a majority of pre-votes does it start
 //! a real election. A peer refuses a pre-vote while it still believes a leader is alive, so a
-//! partitioned, term-inflated node cannot force a healthy leader to step down when it rejoins.
+//! partitioned, term-inflated node cannot force a healthy leader to step down when it rejoins. And
+//! **CheckQuorum** (§6.2) — a leader that has not been in contact with a majority since its previous
+//! check steps down, so a leader cut off from the cluster stops acting as one (the safety a lease read
+//! rests on). PreVote and CheckQuorum together give the stability etcd's raft ships by default.
 //!
 //! Degenerate on a laptop (`f = 0`): one voter, itself; a pre-vote and an election each reach a majority
-//! of one at once and an appended entry commits at once — the same code path as a fleet, never a mode
-//! switch (R8). Owed (the rest of the dialect, each its own slice): CheckQuorum (a leader stepping down
-//! without a quorum), joint consensus for membership changes, ReadIndex for linearizable reads,
-//! snapshot/log compaction, and the bug-record conformance suite.
+//! of one at once, an appended entry commits at once, and the lone voter is always its own quorum so it
+//! never steps down — the same code path as a fleet, never a mode switch (R8). Owed (the rest of the
+//! dialect, each its own slice): joint consensus for membership changes, ReadIndex for linearizable
+//! reads, snapshot/log compaction, and the bug-record conformance suite.
 //!
 //! Evidence: Ongaro & Ousterhout, *In Search of an Understandable Consensus Algorithm (Extended
 //! Version)*, 2014 (tier A); the safety argument for the election restriction is §5.4.
@@ -155,6 +158,7 @@ pub struct RaftNode {
   votes: BTreeSet<HostId>,
   pre_votes: BTreeSet<HostId>,
   has_leader: bool,
+  contacts: BTreeSet<HostId>,
   log: Vec<LogEntry>,
   commit_index: u64,
   next_index: BTreeMap<HostId, u64>,
@@ -173,6 +177,7 @@ impl RaftNode {
       votes: BTreeSet::new(),
       pre_votes: BTreeSet::new(),
       has_leader: false,
+      contacts: BTreeSet::new(),
       log: Vec::new(),
       commit_index: 0,
       next_index: BTreeMap::new(),
@@ -199,6 +204,7 @@ impl RaftNode {
       votes: BTreeSet::new(),
       pre_votes: BTreeSet::new(),
       has_leader: false,
+      contacts: BTreeSet::new(),
       log,
       commit_index: 0,
       next_index: BTreeMap::new(),
@@ -379,6 +385,9 @@ impl RaftNode {
       return;
     }
     self.role = Role::Leader;
+    // Start the CheckQuorum window already in contact with the voters that just elected it, so the first
+    // check does not spuriously step a freshly-won leader down before its heartbeats have replied.
+    self.contacts = self.votes.clone();
     let next = self.last_log_index().saturating_add(1);
     self.next_index.clear();
     self.match_index.clear();
@@ -530,6 +539,8 @@ impl RaftNode {
     if self.role != Role::Leader || reply.term != self.current_term {
       return;
     }
+    // Any same-term reply proves the follower is reachable this CheckQuorum window.
+    self.contacts.insert(reply.follower);
     if reply.success {
       self.match_index.insert(reply.follower, reply.match_index);
       self
@@ -539,6 +550,27 @@ impl RaftNode {
     } else if let Some(next) = self.next_index.get_mut(&reply.follower) {
       *next = (*next).saturating_sub(1).max(1);
     }
+  }
+
+  /// The leader's CheckQuorum tick (Raft §6.2): if the leader has not been in contact with a majority of
+  /// voters since the previous check, it steps down to a follower — so a leader cut off from the cluster
+  /// stops acting as leader (it will not keep serving reads or block a fresh election on the majority
+  /// side). Then the contact window resets. A non-leader is unaffected, and a lone voter is always its
+  /// own majority, so it never steps down (the `f = 0` degenerate).
+  pub fn check_quorum(&mut self) {
+    if self.role != Role::Leader {
+      return;
+    }
+    let reachable = self
+      .voters
+      .iter()
+      .filter(|voter| **voter == self.id || self.contacts.contains(voter))
+      .count();
+    if reachable < self.majority() {
+      self.role = Role::Follower;
+      self.has_leader = false;
+    }
+    self.contacts.clear();
   }
 
   /// Truncates the log from the one-based `index` onward (removing that entry and every later one).
@@ -984,6 +1016,63 @@ mod tests {
     assert!(
       !reply.granted,
       "a pre-vote term not ahead of ours is refused"
+    );
+  }
+
+  /// CheckQuorum (Raft §6.2): a leader that goes a whole window without contact from a majority steps
+  /// down. The first check after election still counts the electing votes; a second, with no replies
+  /// since, finds only itself and relinquishes leadership.
+  #[test]
+  fn a_leader_without_a_quorum_steps_down() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    assert!(leader.is_leader());
+
+    leader.check_quorum(); // window one: still counts the electing majority
+    assert!(
+      leader.is_leader(),
+      "the freshly-won leader is not stepped down"
+    );
+
+    leader.check_quorum(); // window two: no contact since — steps down
+    assert_eq!(
+      leader.role(),
+      Role::Follower,
+      "a leader cut off from a majority steps down"
+    );
+  }
+
+  /// A leader that keeps hearing from a follower stays leader across checks — the contact refreshes the
+  /// window.
+  #[test]
+  fn a_leader_with_a_quorum_stays() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    leader.check_quorum(); // resets the window
+
+    // A follower replies within the new window, so the leader is in contact with a majority.
+    leader.on_append_reply(AppendReply {
+      follower: B,
+      term: leader.term(),
+      success: true,
+      match_index: 0,
+    });
+    leader.check_quorum();
+    assert!(
+      leader.is_leader(),
+      "a leader in contact with a majority stays"
+    );
+  }
+
+  /// A lone leader never steps down under CheckQuorum — it is always its own majority (the `f = 0`
+  /// degenerate).
+  #[test]
+  fn a_solo_leader_never_steps_down() {
+    let mut leader = elected_leader(A, vec![A]);
+    for _ in 0..3 {
+      leader.check_quorum();
+    }
+    assert!(
+      leader.is_leader(),
+      "a single voter is always its own quorum"
     );
   }
 }
