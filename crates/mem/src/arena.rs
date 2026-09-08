@@ -153,27 +153,6 @@ impl ChunkArena {
     }
   }
 
-  /// Marks a specific extent allocated — the recovery re-seed (§4.8 content recovery). A restarted
-  /// daemon rebuilds a fresh arena over the recovered content object, then reserves every extent the
-  /// recovered metadata references before serving, so a later `alloc` never hands out a range that
-  /// still holds a snapshot's bytes. The extent is one a prior `alloc` returned (aligned,
-  /// power-of-two); a misaligned or already-reserved extent is a typed refusal, not corruption.
-  pub fn reserve(&mut self, extent: Extent) -> Result<(), MemError> {
-    let slot = self
-      .slots
-      .get_mut(usize::from(extent.region))
-      .ok_or(MemError::TooLarge {
-        len: extent.len,
-        max: 0,
-      })?;
-    slot.buddy.reserve(Block {
-      offset: extent.offset,
-      len: extent.len,
-    })?;
-    self.allocated_bytes += extent.len;
-    Ok(())
-  }
-
   /// Frees an extent.
   pub fn free(&mut self, extent: Extent) -> Result<(), MemError> {
     let slot = self
