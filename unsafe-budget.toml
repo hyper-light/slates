@@ -87,3 +87,6 @@ slates-transport = 0
 slates-mcp = 0
 slates-archive = 0
 slates-wire-derive = 0
+# slates-cluster (0): the register-commit dispatch is safe Rust — spawned tasks, a channel, and the
+# db acceptance rules over the transport; no raw pointers.
+slates-cluster = 0

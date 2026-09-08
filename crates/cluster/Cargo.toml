@@ -1,0 +1,27 @@
+[package]
+name = "slates-cluster"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The cluster plane (§4.8, D-14): the asynchronous dispatch that ships register records to their candidate holders over the fleet transport and commits at a quorum — db owns synchronous acceptance, the transport carries authenticated messages, and this owns the dispatch, collection, deadlines and cancellation. First milestone: register commits within one validated configuration generation (SWIM membership, the configuration group, takeover and mirror are owed)."
+
+[dependencies]
+# db owns synchronous acceptance and the register protocol (Record, Acceptor, Placement, Quorum).
+slates-db = { workspace = true }
+# the transport carries the authenticated request/reply the records ride.
+slates-transport = { workspace = true }
+# the runtime: bounded-concurrency dispatch (spawn/cancel) and the commit deadline (sleep).
+slates-rt = { workspace = true }
+
+[dev-dependencies]
+# self-signed enrolled identities for the holder-and-owner sessions in the tests.
+rcgen = { workspace = true }
+rustls = { workspace = true }
+# the UDP address types (via rustix::net, as the transport uses) for binding sim sockets in tests.
+rustix = { workspace = true }
+
+[lints]
+workspace = true

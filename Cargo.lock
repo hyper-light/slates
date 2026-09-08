@@ -1007,6 +1007,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-cluster"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "rustix",
+ "rustls",
+ "slates-db",
+ "slates-rt",
+ "slates-transport",
+]
+
+[[package]]
 name = "slates-db"
 version = "0.1.0"
 dependencies = [

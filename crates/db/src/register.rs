@@ -356,6 +356,11 @@ pub struct Ack {
   pub identity: [u8; 32],
 }
 
+/// An acknowledgement's fixed wire size.
+/// Format: four u64 header words (holder, object, sequence, generation) then the 32-byte BLAKE3
+/// identity — 64 bytes.
+const ACK_BYTES: usize = 4 * size_of::<u64>() + 32;
+
 impl Ack {
   /// Whether this acknowledgement is for `record` — the position, generation and identity all match.
   pub fn binds(&self, record: &Record) -> bool {
@@ -363,6 +368,40 @@ impl Ack {
       && self.sequence == record.sequence
       && self.generation == record.generation
       && self.identity == record.identity()
+  }
+
+  /// The canonical bytes an acknowledgement rides back on: holder, object, sequence, generation (each
+  /// u64 LE), then the BLAKE3 identity.
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ACK_BYTES);
+    out.extend_from_slice(&self.holder.0.to_le_bytes());
+    out.extend_from_slice(&self.object.to_le_bytes());
+    out.extend_from_slice(&self.sequence.to_le_bytes());
+    out.extend_from_slice(&self.generation.to_le_bytes());
+    out.extend_from_slice(&self.identity);
+    out
+  }
+
+  /// Reconstructs an acknowledgement from its bytes, or a typed [`RegisterError::MalformedRecord`] if
+  /// they are the wrong length (a reply that crossed the network — hostile input).
+  pub fn decode(bytes: &[u8]) -> Result<Ack, RegisterError> {
+    if bytes.len() != ACK_BYTES {
+      return Err(RegisterError::MalformedRecord);
+    }
+    let word = |slice: &[u8]| u64::from_le_bytes(slice.try_into().unwrap_or([0; 8]));
+    let (holder_bytes, rest) = bytes.split_at(size_of::<u64>());
+    let (object_bytes, rest) = rest.split_at(size_of::<u64>());
+    let (sequence_bytes, rest) = rest.split_at(size_of::<u64>());
+    let (generation_bytes, identity_bytes) = rest.split_at(size_of::<u64>());
+    let mut identity = [0u8; 32];
+    identity.copy_from_slice(identity_bytes);
+    Ok(Ack {
+      holder: HostId(word(holder_bytes)),
+      object: word(object_bytes),
+      sequence: word(sequence_bytes),
+      generation: word(generation_bytes),
+      identity,
+    })
   }
 }
 
