@@ -1,0 +1,257 @@
+//! The session plane's frame codec (§4.10a §8; design: `docs/wip/fleet-transport.md`). The session
+//! plane is slates's owned RFC 9000/9002-shaped QUIC dialect, adapting hecate-quic's ordered streams
+//! and absolute-offset flow-control law but with a **TLS 1.3** handshake (`rustls::quic`, D-15, not
+//! hecate's Noise) and **no warden/pod frame classes** (slates has no pods, so a host touches
+//! payloads directly and the dialect needs only ordinary QUIC frames). This module is the pure
+//! foundation: the frames that ride inside a TLS-1.3-protected packet's payload, and their codec.
+//!
+//! The frames (fixed-layout little-endian, slates's wire style per D-15 — not QUIC's varints):
+//! - `Stream`  — ordered stream data at an **absolute** offset (idempotent under loss/reorder), with
+//!   a `fin` marking the stream's end (the ordered-log archetype).
+//! - `Ack`     — acknowledges packet numbers `[largest - range, largest]`.
+//! - `MaxData` / `MaxStreamData` — the connection's and a stream's **absolute** flow-control credit
+//!   (the ratified dual-level credit law; the accounting that enforces it is owed with the state
+//!   machine).
+//!
+//! Owed (later sub-slices): the connection state machine (packet numbers, ack/loss recovery, the
+//! credit accounting), the `rustls::quic` handshake, and the wiring onto `rt`'s UDP driver. This is a
+//! parser of external bytes, so every length is bounds-checked before it is read, an unknown frame
+//! kind and a set reserved flag are typed refusals, and no input panics.
+
+use crate::Reader;
+
+/// A refusal decoding a session-plane frame sequence: the closed set of malformations. Never a panic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionError {
+  /// The bytes ended before a frame field could be read.
+  Truncated,
+  /// A frame kind byte named no known frame.
+  UnknownFrame(u8),
+  /// A reserved flag bit was set on a `Stream` frame.
+  FlagsSet,
+}
+
+impl std::fmt::Display for SessionError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      SessionError::Truncated => f.write_str("the frame sequence ended early"),
+      SessionError::UnknownFrame(k) => write!(f, "unknown frame kind {k}"),
+      SessionError::FlagsSet => f.write_str("a reserved stream-frame flag bit was set"),
+    }
+  }
+}
+
+impl std::error::Error for SessionError {}
+
+/// One session-plane frame — the payload of a TLS-1.3-protected packet is a sequence of these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Frame {
+  /// Ordered stream data at an absolute offset; `fin` marks the stream's final byte.
+  Stream {
+    /// The stream this data belongs to (per (session, subject)).
+    stream_id: u64,
+    /// The absolute byte offset of `data` within the stream (idempotent under loss/reorder).
+    offset: u64,
+    /// Whether this frame carries the stream's final byte.
+    fin: bool,
+    /// The stream bytes at `offset`.
+    data: Vec<u8>,
+  },
+  /// Acknowledges the contiguous packet-number range `[largest - range, largest]`.
+  Ack {
+    /// The largest packet number acknowledged.
+    largest: u64,
+    /// How many packet numbers below `largest` are also acknowledged.
+    range: u64,
+  },
+  /// The connection's absolute flow-control credit (bytes the peer may send across all streams).
+  MaxData {
+    /// The absolute byte ceiling.
+    max: u64,
+  },
+  /// A stream's absolute flow-control credit.
+  MaxStreamData {
+    /// The stream.
+    stream_id: u64,
+    /// The absolute byte ceiling for that stream.
+    max: u64,
+  },
+}
+
+/// Format: the frame-kind tags on the wire.
+const KIND_STREAM: u8 = 1;
+/// Format: the acknowledgement frame kind.
+const KIND_ACK: u8 = 2;
+/// Format: the connection-credit frame kind.
+const KIND_MAX_DATA: u8 = 3;
+/// Format: the stream-credit frame kind.
+const KIND_MAX_STREAM_DATA: u8 = 4;
+
+/// Format: the `Stream` frame's `fin` flag bit; every other bit of the flags byte must be zero.
+const STREAM_FIN: u8 = 0b0000_0001;
+
+impl Frame {
+  /// Appends this frame's canonical bytes to `out`.
+  fn encode_into(&self, out: &mut Vec<u8>) {
+    match self {
+      Frame::Stream {
+        stream_id,
+        offset,
+        fin,
+        data,
+      } => {
+        out.push(KIND_STREAM);
+        out.extend_from_slice(&stream_id.to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+        out.push(if *fin { STREAM_FIN } else { 0 });
+        // A frame is frame-cap-bounded, so the length fits a u32; the builder refuses an oversize
+        // frame first, so a saturating cast is only reachable by a bug.
+        out.extend_from_slice(&u32::try_from(data.len()).unwrap_or(u32::MAX).to_le_bytes());
+        out.extend_from_slice(data);
+      }
+      Frame::Ack { largest, range } => {
+        out.push(KIND_ACK);
+        out.extend_from_slice(&largest.to_le_bytes());
+        out.extend_from_slice(&range.to_le_bytes());
+      }
+      Frame::MaxData { max } => {
+        out.push(KIND_MAX_DATA);
+        out.extend_from_slice(&max.to_le_bytes());
+      }
+      Frame::MaxStreamData { stream_id, max } => {
+        out.push(KIND_MAX_STREAM_DATA);
+        out.extend_from_slice(&stream_id.to_le_bytes());
+        out.extend_from_slice(&max.to_le_bytes());
+      }
+    }
+  }
+}
+
+/// Encodes a packet payload's frame sequence to bytes.
+pub fn encode_frames(frames: &[Frame]) -> Vec<u8> {
+  let mut out = Vec::new();
+  for frame in frames {
+    frame.encode_into(&mut out);
+  }
+  out
+}
+
+/// Decodes a packet payload's frame sequence. Every length is bounds-checked before it is read (a
+/// wild stream length never allocates past the input), an unknown kind and a set reserved flag are
+/// typed refusals, and any malformation is a typed [`SessionError`], never a panic.
+pub fn decode_frames(bytes: &[u8]) -> Result<Vec<Frame>, SessionError> {
+  let mut reader = Reader::new(bytes);
+  let mut frames = Vec::new();
+  while !reader.is_empty() {
+    let kind = reader.u8().map_err(|_| SessionError::Truncated)?;
+    let frame = match kind {
+      KIND_STREAM => {
+        let stream_id = reader.u64().map_err(|_| SessionError::Truncated)?;
+        let offset = reader.u64().map_err(|_| SessionError::Truncated)?;
+        let flags = reader.u8().map_err(|_| SessionError::Truncated)?;
+        if flags & !STREAM_FIN != 0 {
+          return Err(SessionError::FlagsSet);
+        }
+        let len = reader.u32().map_err(|_| SessionError::Truncated)? as usize;
+        let data = reader
+          .bytes(len)
+          .map_err(|_| SessionError::Truncated)?
+          .to_vec();
+        Frame::Stream {
+          stream_id,
+          offset,
+          fin: flags & STREAM_FIN != 0,
+          data,
+        }
+      }
+      KIND_ACK => Frame::Ack {
+        largest: reader.u64().map_err(|_| SessionError::Truncated)?,
+        range: reader.u64().map_err(|_| SessionError::Truncated)?,
+      },
+      KIND_MAX_DATA => Frame::MaxData {
+        max: reader.u64().map_err(|_| SessionError::Truncated)?,
+      },
+      KIND_MAX_STREAM_DATA => Frame::MaxStreamData {
+        stream_id: reader.u64().map_err(|_| SessionError::Truncated)?,
+        max: reader.u64().map_err(|_| SessionError::Truncated)?,
+      },
+      other => return Err(SessionError::UnknownFrame(other)),
+    };
+    frames.push(frame);
+  }
+  Ok(frames)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn sample() -> Vec<Frame> {
+    vec![
+      Frame::Stream {
+        stream_id: 0x0102_0304_0506_0708,
+        offset: 4096,
+        fin: false,
+        data: b"ordered stream bytes".to_vec(),
+      },
+      Frame::Ack {
+        largest: 42,
+        range: 7,
+      },
+      Frame::MaxData { max: 1 << 20 },
+      Frame::MaxStreamData {
+        stream_id: 9,
+        max: 1 << 16,
+      },
+      Frame::Stream {
+        stream_id: 9,
+        offset: 0,
+        fin: true,
+        data: Vec::new(),
+      },
+    ]
+  }
+
+  /// A mixed frame sequence round-trips through encode/decode exactly, order and `fin` preserved.
+  #[test]
+  fn a_frame_sequence_round_trips() {
+    let frames = sample();
+    assert_eq!(decode_frames(&encode_frames(&frames)), Ok(frames));
+  }
+
+  /// An empty payload decodes to no frames.
+  #[test]
+  fn an_empty_payload_decodes_to_no_frames() {
+    assert_eq!(decode_frames(&[]), Ok(Vec::new()));
+  }
+
+  /// Hostile inputs are typed refusals, never panics (§4.10a hostile-input rule).
+  #[test]
+  fn hostile_frames_refuse_by_type() {
+    let good = encode_frames(&sample());
+
+    // An unknown frame kind is named.
+    assert_eq!(
+      decode_frames(&[0xFF]),
+      Err(SessionError::UnknownFrame(0xFF))
+    );
+
+    // A truncated tail (drop the last bytes of the trailing stream data) is truncated, not a panic.
+    assert_eq!(
+      decode_frames(&good[..good.len() - 1]),
+      Err(SessionError::Truncated)
+    );
+
+    // A stream frame with a reserved flag bit set is refused. Its flags byte is at
+    // kind(1) + stream_id(8) + offset(8) = offset 17 of the first (Stream) frame.
+    let mut flagged = good.clone();
+    flagged[1 + size_of::<u64>() + size_of::<u64>()] = 0b0000_0010;
+    assert_eq!(decode_frames(&flagged), Err(SessionError::FlagsSet));
+
+    // A wild stream length (u32::MAX) cannot fit the remaining bytes.
+    let mut wild = good.clone();
+    let len_at = 1 + size_of::<u64>() + size_of::<u64>() + size_of::<u8>();
+    wild[len_at..len_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(decode_frames(&wild), Err(SessionError::Truncated));
+  }
+}

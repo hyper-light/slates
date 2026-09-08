@@ -28,6 +28,7 @@
 pub mod accept;
 pub mod schedule;
 pub mod seal;
+pub mod session;
 
 /// The protocol version this build speaks (the floor; negotiation to higher versions is owed with the
 /// session plane).

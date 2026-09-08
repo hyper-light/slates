@@ -115,8 +115,10 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
 3. **`rt` UDP driver** — **built** (`crates/rt/src/udp.rs`, `driver.rs`, `sim.rs`): a UDP readiness
    source in kqueue and epoll, plus the deterministic sim fabric (the sim arm, so the whole plane is
    testable at N=1); io_uring/IOCP register-readable are typed-owed.
-4. **`slates-quic`** — owed: the owned dialect over `rustls::quic` — handshake, streams, loss
-   recovery, congestion — with loom on the state machine and the N=1 differential harness.
+4. **`slates-quic`** — the **frame codec is built** (`session.rs`, slice 4a: `Stream`/`Ack`/`MaxData`/
+   `MaxStreamData`, round-trip + hostile-fuzzed, §8). Owed: the connection state machine (packet
+   numbers, ack/loss recovery, credit accounting), the `rustls::quic` TLS 1.3 handshake, and the UDP
+   wiring — with loom on the state machine and the N=1 differential harness.
    The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c);
    its fencing step and the `Keyring`'s population ride membership/enrollment.
 5. **Register/placement wiring** — owed: §4.8 head + merge-record registers and D-14 placement ride
@@ -171,3 +173,43 @@ hecate `WIRE_SECURITY.md` to slates's D-15 (TLS 1.3, not Noise). **Ratify before
   your review, since it is where identity and authority live. **What (b) deliberately does not do**
   without ratification: derive or persist a key, look one up by sender, or enforce fencing — it is the
   primitive, exactly as the codec is the wire shape without a socket.
+
+## 8. The session plane (slice 4) — the owned QUIC dialect, TLS 1.3 not Noise
+
+> Draft to ratify (2026-09-08): the framing decisions below are architecture-level (Ada's to
+> ratify). The **frame codec** is built as the pure foundation (`crates/transport/src/session.rs`),
+> as the control-datagram codec was; the connection state machine and the `rustls::quic` TLS 1.3
+> handshake are the later sub-slices.
+
+slates's session plane carries every **reliable** class (version chains, merge records, content
+transfer, cross-region). It is an owned RFC 9000/9002-shaped dialect — adapting hecate-quic's
+ordered streams and flow-control law — reconciled to slates:
+
+- **TLS 1.3, not Noise.** The handshake runs over `rustls::quic` (D-15; hecate uses Noise-IKpsk2,
+  which slates dropped). Connection identity is the host's enrollment identity; a term/epoch advance
+  kills the session with a typed reason (D-16 fencing).
+- **No warden/pod frame classes.** hecate's four classes exist because a pod's payload is sealed past
+  the host it never trusts; slates has no pods, so a host touches payloads directly and the dialect
+  needs only the ordinary QUIC frames. (This is the biggest simplification from hecate.)
+- **Ordered streams.** A stream per (session, subject); records carry an absolute `offset`;
+  delivery is strictly ordered, no gaps (the ordered-log archetype). The green-chain subscription
+  (§4.16) is a named subject.
+- **Flow control is the ratified credit law, in the transport.** Dual-level (stream and connection),
+  **absolute-offset** credits (idempotent under loss/reorder), windows `k × frame_cap` per class,
+  the **never-whole-object-in-credit** invariant permanent — so a 2 GB transfer never blocks a
+  control frame (the frame cap's reason to exist).
+
+**The frame set** (fixed-layout little-endian, slates's wire style, D-15 — not QUIC's varints), the
+payload of a TLS-1.3-protected packet:
+
+- `STREAM { stream_id, offset, fin, data }` — ordered stream data at an absolute offset.
+- `ACK { largest, range }` — acknowledges packet numbers `[largest - range, largest]`.
+- `MAX_DATA { max }` — the connection's absolute flow-control credit.
+- `MAX_STREAM_DATA { stream_id, max }` — a stream's absolute flow-control credit.
+
+**Built (slice 4a):** the frame codec — encode/decode of a packet payload's frame sequence, every
+length bounds-checked, hostile-fuzzed, never a panic. **Owed:** the connection state machine
+(streams, packet numbers, ack/loss recovery, the credit accounting that enforces the flow-control
+law), the `rustls::quic` handshake, and the wiring onto the `rt` UDP driver (the control plane's
+`accept`/seal are the datagram-plane analogue already wired). CRYPTO frames are `rustls::quic`'s, not
+ours.

@@ -92,6 +92,19 @@ proptest! {
     }
   }
 
+  /// The session-plane frame codec never panics on arbitrary bytes, and any frame sequence it
+  /// accepts re-encodes to itself (an accepted decode round-trips).
+  #[test]
+  fn session_decode_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..4096)) {
+    if let Ok(frames) = slates_transport::session::decode_frames(&bytes) {
+      prop_assert_eq!(
+        slates_transport::session::decode_frames(&slates_transport::session::encode_frames(&frames)),
+        Ok(frames),
+        "an accepted frame sequence must re-encode and decode to itself"
+      );
+    }
+  }
+
   /// Near-valid inputs — a real sealed datagram with one byte flipped at an arbitrary offset — never
   /// panic through the acceptance path; they are accepted (a flip the tag tolerates cannot exist for
   /// the authenticated region) or a typed refusal, never a crash. This exercises the deep paths a
