@@ -491,6 +491,22 @@ fn a_hardlink_over_an_intervening_symlink_conflicts() {
   );
 }
 
+/// An rmdir of a path that names a hard link is a type conflict, not a silent no-op (§4.16: the
+/// agent's view had a directory there; the green has a hard link). merge_rmdir already refused a
+/// file or symlink at the path; a hard link is the same kind of type mismatch.
+#[test]
+fn rmdir_of_a_hardlink_conflicts() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("f", b"x").at(1, 0));
+  green.submit(&Build::new().link("h", "f").at(2, 1));
+  let outcome = green.submit(&Build::new().rmdir("h").at(3, 2));
+  assert_eq!(
+    conflict_class(&outcome),
+    Some(MergeConflictClass::TypeChanged),
+    "rmdir of a hard link is a type conflict"
+  );
+}
+
 /// An insert before an accepted disjoint edit shifts the later one, and both apply.
 #[test]
 fn an_intervening_insert_shifts_a_later_edit() {

@@ -833,7 +833,10 @@ impl Green {
     path: &str,
     cleared: &BTreeSet<String>,
   ) -> Result<Option<Effect>, ConflictWindow> {
-    if self.content.contains_key(path) || self.symlinks.contains_key(path) {
+    if self.content.contains_key(path)
+      || self.symlinks.contains_key(path)
+      || self.hardlinks.contains_key(path)
+    {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     if !self.dirs.contains(path) {
