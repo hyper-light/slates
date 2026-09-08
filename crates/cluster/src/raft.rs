@@ -17,13 +17,17 @@
 //! check steps down, so a leader cut off from the cluster stops acting as one. And **ReadIndex** (§6.4) —
 //! the leader serves a linearizable read at its commit index without appending a log entry, safe only
 //! when it has committed in its current term and is confirmed in contact with a majority. PreVote and
-//! CheckQuorum together give the stability etcd's raft ships by default.
+//! CheckQuorum together give the stability etcd's raft ships by default. And the **joint-consensus
+//! majority rule** (§6) — during a membership change the node enters a joint configuration where every
+//! decision needs a majority of *both* the old and new voter sets, so no two disjoint majorities can form
+//! across the change; every quorum check (election, commit, CheckQuorum, ReadIndex) honours it.
 //!
 //! Degenerate on a laptop (`f = 0`): one voter, itself; a pre-vote and an election each reach a majority
 //! of one at once, an appended entry commits at once, and the lone voter is always its own quorum so it
 //! never steps down — the same code path as a fleet, never a mode switch (R8). Owed (the rest of the
-//! dialect, each its own slice): joint consensus for membership changes, snapshot/log compaction, and the
-//! bug-record conformance suite.
+//! dialect, each its own slice): wiring the membership change through the log (the `C_old,new`/`C_new`
+//! entries that take effect on append and revert on truncation — the transition mechanics on top of the
+//! majority rule built here), snapshot/log compaction, and the bug-record conformance suite.
 //!
 //! Evidence: Ongaro & Ousterhout, *In Search of an Understandable Consensus Algorithm (Extended
 //! Version)*, 2014 (tier A); the safety argument for the election restriction is §5.4.
@@ -154,6 +158,7 @@ pub struct AppendReply {
 pub struct RaftNode {
   id: HostId,
   voters: Vec<HostId>,
+  joint: Option<Vec<HostId>>,
   current_term: u64,
   voted_for: Option<HostId>,
   role: Role,
@@ -173,6 +178,7 @@ impl RaftNode {
     RaftNode {
       id,
       voters,
+      joint: None,
       current_term: 0,
       voted_for: None,
       role: Role::Follower,
@@ -200,6 +206,7 @@ impl RaftNode {
     RaftNode {
       id,
       voters,
+      joint: None,
       current_term,
       voted_for,
       role: Role::Follower,
@@ -244,7 +251,7 @@ impl RaftNode {
     self.has_leader = false;
     self.role = Role::PreCandidate;
     self.pre_votes = BTreeSet::from([self.id]);
-    if self.pre_votes.len() >= self.majority() {
+    if self.is_majority(&self.pre_votes) {
       self.start_election();
       return Vec::new();
     }
@@ -255,9 +262,8 @@ impl RaftNode {
       last_log_term: self.last_log_term(),
     };
     self
-      .voters
-      .iter()
-      .copied()
+      .all_voters()
+      .into_iter()
       .filter(|voter| *voter != self.id)
       .map(|_| request)
       .collect()
@@ -292,7 +298,7 @@ impl RaftNode {
       return None;
     }
     self.pre_votes.insert(reply.voter);
-    if self.pre_votes.len() >= self.majority() {
+    if self.is_majority(&self.pre_votes) {
       return Some(self.start_election());
     }
     None
@@ -316,9 +322,8 @@ impl RaftNode {
       last_log_term: self.last_log_term(),
     };
     self
-      .voters
-      .iter()
-      .copied()
+      .all_voters()
+      .into_iter()
       .filter(|voter| *voter != self.id)
       .map(|_| request)
       .collect()
@@ -383,7 +388,7 @@ impl RaftNode {
   /// replication progress for each follower — `next_index` at the end of the leader's log (Raft's
   /// optimistic guess) and `match_index` at nothing known replicated (§5.3).
   fn become_leader_if_majority(&mut self) {
-    if self.role != Role::Candidate || self.votes.len() < self.majority() {
+    if self.role != Role::Candidate || !self.is_majority(&self.votes) {
       return;
     }
     self.role = Role::Leader;
@@ -393,7 +398,7 @@ impl RaftNode {
     let next = self.last_log_index().saturating_add(1);
     self.next_index.clear();
     self.match_index.clear();
-    for peer in &self.voters {
+    for peer in &self.all_voters() {
       if *peer != self.id {
         self.next_index.insert(*peer, next);
         self.match_index.insert(*peer, 0);
@@ -401,10 +406,29 @@ impl RaftNode {
     }
   }
 
-  /// A majority of the voters: more than half, so any two majorities intersect (the quorum intersection
-  /// Raft's safety rests on).
-  fn majority(&self) -> usize {
-    self.voters.len() / 2 + 1
+  /// Every voter that participates now — the base set, plus the incoming set while a joint membership
+  /// change is in flight (Raft §6). The leader sends votes and entries to all of them; a message's
+  /// recipient is the connection, so duplicates in the union are harmless, but they are deduped here.
+  pub fn all_voters(&self) -> Vec<HostId> {
+    let mut set: BTreeSet<HostId> = self.voters.iter().copied().collect();
+    if let Some(new) = &self.joint {
+      set.extend(new.iter().copied());
+    }
+    set.into_iter().collect()
+  }
+
+  /// Whether `granters` form a majority under the current configuration (the quorum intersection Raft's
+  /// safety rests on): more than half of the base voters, **and** — while a joint change is in flight —
+  /// more than half of the incoming voters too, so no two disjoint majorities can form across the change.
+  fn is_majority(&self, granters: &BTreeSet<HostId>) -> bool {
+    let carries =
+      |set: &[HostId]| set.iter().filter(|voter| granters.contains(voter)).count() > set.len() / 2;
+    carries(&self.voters) && self.joint.as_ref().is_none_or(|new| carries(new))
+  }
+
+  /// Whether this node is in a joint configuration (a membership change is in flight).
+  pub fn in_joint_configuration(&self) -> bool {
+    self.joint.is_some()
   }
 
   /// Whether a candidate's last-log summary is at least as up-to-date as ours (Raft §5.4.1): a later
@@ -563,12 +587,9 @@ impl RaftNode {
     if self.role != Role::Leader {
       return;
     }
-    let reachable = self
-      .voters
-      .iter()
-      .filter(|voter| **voter == self.id || self.contacts.contains(voter))
-      .count();
-    if reachable < self.majority() {
+    let mut reachable = self.contacts.clone();
+    reachable.insert(self.id);
+    if !self.is_majority(&reachable) {
       self.role = Role::Follower;
       self.has_leader = false;
     }
@@ -588,15 +609,43 @@ impl RaftNode {
     if self.entry_term(self.commit_index) != Some(self.current_term) {
       return None;
     }
-    let reachable = self
-      .voters
-      .iter()
-      .filter(|voter| **voter == self.id || self.contacts.contains(voter))
-      .count();
-    if reachable < self.majority() {
+    let mut reachable = self.contacts.clone();
+    reachable.insert(self.id);
+    if !self.is_majority(&reachable) {
       return None;
     }
     Some(self.commit_index)
+  }
+
+  /// Begins a membership change to `new_voters` (Raft §6 joint consensus): the node enters a **joint
+  /// configuration** where every decision — election, commit, CheckQuorum — needs a majority of both the
+  /// old and the new voter sets, so no two disjoint majorities can form across the change. Only the
+  /// leader begins one, and not while another is in flight. Returns whether it started.
+  ///
+  /// This slice models the joint configuration and its overlapping-majority rule; wiring the transition
+  /// through the log — the `C_old,new` and `C_new` entries that take effect the moment they are appended,
+  /// and revert on truncation — is the owed second half (§6, the safety subtlety that a config change
+  /// takes effect on append, not on commit).
+  pub fn begin_membership_change(&mut self, new_voters: Vec<HostId>) -> bool {
+    if self.role != Role::Leader || self.joint.is_some() {
+      return false;
+    }
+    self.joint = Some(new_voters);
+    true
+  }
+
+  /// Completes a membership change: leaves the joint configuration, adopting the new voter set as the
+  /// sole configuration (Raft §6, the transition to `C_new`). Only valid while a change is in flight, and
+  /// only once the joint configuration has itself committed (the caller's obligation until the change is
+  /// log-driven). Returns whether it completed.
+  pub fn complete_membership_change(&mut self) -> bool {
+    match self.joint.take() {
+      Some(new_voters) => {
+        self.voters = new_voters;
+        true
+      }
+      None => false,
+    }
   }
 
   /// Truncates the log from the one-based `index` onward (removing that entry and every later one).
@@ -626,12 +675,12 @@ impl RaftNode {
     let mut candidate = self.last_log_index();
     while candidate > self.commit_index {
       if self.entry_term(candidate) == Some(self.current_term) {
-        let holders = self
-          .voters
-          .iter()
-          .filter(|voter| self.match_of(**voter) >= candidate)
-          .count();
-        if holders >= self.majority() {
+        let holders: BTreeSet<HostId> = self
+          .all_voters()
+          .into_iter()
+          .filter(|voter| self.match_of(*voter) >= candidate)
+          .collect();
+        if self.is_majority(&holders) {
           self.commit_index = candidate;
           return;
         }
@@ -1163,5 +1212,70 @@ mod tests {
       Some(2),
       "a term-4 commit enables the read at index 2"
     );
+  }
+
+  /// Joint consensus (Raft §6): during a membership change a commit needs a majority of BOTH the old and
+  /// the new voter sets. A majority of the old configuration alone does not commit; only when both
+  /// configurations hold the entry does it commit — so no two disjoint majorities can form across a
+  /// change.
+  #[test]
+  fn a_joint_change_needs_a_majority_of_both_configurations() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    assert!(
+      leader.begin_membership_change(vec![C, D, E]),
+      "the leader enters the joint configuration"
+    );
+    assert!(leader.in_joint_configuration());
+
+    leader.append_command(b"x".to_vec());
+    let term = leader.term();
+    let reply = |follower| AppendReply {
+      follower,
+      term,
+      success: true,
+      match_index: 1,
+    };
+
+    // B is a majority of the old set {A,B,C} together with A, but holds no majority of the new set.
+    leader.on_append_reply(reply(B));
+    assert_eq!(
+      leader.commit_index(),
+      0,
+      "a majority of the old configuration alone does not commit during a joint change"
+    );
+
+    // C and D bring a majority of the new set {C,D,E} too (with A and B, still a majority of the old).
+    leader.on_append_reply(reply(C));
+    leader.on_append_reply(reply(D));
+    assert_eq!(
+      leader.commit_index(),
+      1,
+      "a majority of both configurations commits"
+    );
+  }
+
+  /// Completing a change leaves the joint configuration for the new voter set alone, after which a
+  /// majority is measured against the new set only.
+  #[test]
+  fn completing_a_change_adopts_the_new_configuration() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    leader.begin_membership_change(vec![C, D, E]);
+    assert!(leader.in_joint_configuration());
+
+    assert!(leader.complete_membership_change(), "the change completes");
+    assert!(!leader.in_joint_configuration(), "no longer joint");
+    assert_eq!(
+      leader.all_voters(),
+      vec![C, D, E],
+      "the new configuration is the sole one"
+    );
+  }
+
+  /// Only a leader may begin a membership change — a follower cannot.
+  #[test]
+  fn only_a_leader_begins_a_change() {
+    let mut follower = RaftNode::new(A, vec![A, B, C]);
+    assert!(!follower.begin_membership_change(vec![C, D, E]));
+    assert!(!follower.in_joint_configuration());
   }
 }
