@@ -128,16 +128,17 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
-  /// The client end, pinning the server's `pinned` certificate (the enrolled identity it trusts) and
-  /// talking to `peer` as `name`, framing at `frame_cap`.
+  /// The client end: presents its own `identity` (mutual authentication — the peer authenticates this
+  /// caller), pins the server's `pinned` certificate, talks to `peer` as `name`, framing at `frame_cap`.
   pub fn client(
     socket: UdpSocket,
     peer: SocketAddrV4,
+    identity: &Identity,
     pinned: &rustls::pki_types::CertificateDer<'static>,
     name: &str,
     frame_cap: usize,
   ) -> Result<Endpoint, EndpointError> {
-    let client = client_connection(pinned, name).map_err(EndpointError::Handshake)?;
+    let client = client_connection(identity, pinned, name).map_err(EndpointError::Handshake)?;
     Ok(Endpoint {
       socket,
       peer,
@@ -149,14 +150,17 @@ impl Endpoint {
     })
   }
 
-  /// The server end presenting `identity`, talking to `peer`, framing at `frame_cap`.
+  /// The server end presenting `identity` and requiring a client certificate found among
+  /// `allowed_clients` (mutual authentication — it authenticates its caller), talking to `peer`,
+  /// framing at `frame_cap`.
   pub fn server(
     socket: UdpSocket,
     peer: SocketAddrV4,
     identity: &Identity,
+    allowed_clients: &[rustls::pki_types::CertificateDer<'static>],
     frame_cap: usize,
   ) -> Result<Endpoint, EndpointError> {
-    let server = server_connection(identity).map_err(EndpointError::Handshake)?;
+    let server = server_connection(identity, allowed_clients).map_err(EndpointError::Handshake)?;
     Ok(Endpoint {
       socket,
       peer,
@@ -463,7 +467,7 @@ mod tests {
   /// the server's keys.)
   fn handshake_keys() -> (Keys, Keys) {
     let identity = self_signed("slates-node");
-    let (mut client, mut server) = connect(&identity, "slates-node").unwrap();
+    let (mut client, mut server) = connect(&identity, &identity, "slates-node").unwrap();
     let mut client_keys = None;
     let mut server_keys = None;
     for _ in 0..HANDSHAKE_TURN_CEILING {

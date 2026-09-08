@@ -1,9 +1,10 @@
 //! The session-plane TLS 1.3 handshake over `rustls::quic` (§4.10a §3, §8, slice 4e). slates's
 //! owned QUIC dialect keeps TLS 1.3 for the handshake and record protection (D-15, not hecate's
 //! Noise): `rustls::quic` runs the RFC 9001 handshake in CRYPTO frames and hands back the packet-
-//! protection keys per encryption level. A node authenticates with its **enrolled identity** — here
-//! a self-signed certificate the peer pins (the test stands in for enrollment distributing it);
-//! there is no CA PKI. A term/epoch advance drops the session (fencing, D-16) — owed with membership.
+//! protection keys per encryption level. Authentication is **mutual**: each node presents its
+//! **enrolled identity** — a self-signed certificate the peer pins — and the server likewise pins the
+//! client's, so a holder authenticates its caller (server-cert pinning alone does not, §4.13). There is
+//! no CA PKI. A term/epoch advance drops the session (fencing, D-16) — owed with membership.
 //!
 //! This module holds the **one `Arc` in slates**: `rustls::quic::{Client,Server}Connection::new`
 //! take `Arc<ClientConfig>`/`Arc<ServerConfig>` by signature (D-8 exception 2 — a foreign API that
@@ -73,75 +74,93 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
   Arc::new(rustls::crypto::ring::default_provider())
 }
 
-/// A server config presenting `identity`, TLS 1.3 only, no client auth (peer auth is the pinned
-/// server identity; mutual enrolled-identity auth is owed). Session-resumption tickets are disabled:
-/// slates's owned dialect has no use for TLS-level resumption (identity comes from enrollment), and a
-/// post-handshake `NewSessionTicket` would arrive as CRYPTO bytes that the 1-RTT packet reader is not
-/// meant to parse.
-pub fn server_config(identity: &Identity) -> Result<ServerConfig, HandshakeError> {
+/// A server config presenting `identity`, TLS 1.3 only, that **requires and pins the client's**
+/// enrolled certificate (mutual authentication): the client must present a certificate the server
+/// finds among `allowed_clients`, so the holder authenticates its caller's identity — server-cert
+/// pinning alone does not (§4.13). Session-resumption tickets are disabled: slates's owned dialect has
+/// no use for TLS-level resumption, and a post-handshake `NewSessionTicket` would arrive as CRYPTO
+/// bytes the 1-RTT packet reader is not meant to parse.
+pub fn server_config(
+  identity: &Identity,
+  allowed_clients: &[CertificateDer<'static>],
+) -> Result<ServerConfig, HandshakeError> {
+  let mut roots = RootCertStore::empty();
+  for cert in allowed_clients {
+    roots
+      .add(cert.clone())
+      .map_err(|e| HandshakeError::Setup(e.to_string()))?;
+  }
+  // structural: allow — D-8 exception 2: rustls's verifier builder takes `Arc` by signature.
+  let roots = Arc::new(roots);
+  let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider())
+    .build()
+    .map_err(|e| HandshakeError::Setup(e.to_string()))?;
   let mut config = ServerConfig::builder_with_provider(provider())
     .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_no_client_auth()
+    .with_client_cert_verifier(verifier)
     .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())?;
   config.send_tls13_tickets = 0;
   Ok(config)
 }
 
-/// A client config that trusts exactly `pinned` (the peer's enrolled certificate) — TLS 1.3 only.
-pub fn client_config(pinned: CertificateDer<'static>) -> Result<ClientConfig, HandshakeError> {
+/// A client config that trusts exactly `pinned_server` (the peer's enrolled certificate) and
+/// **presents `client_identity`** as its own certificate for mutual authentication — TLS 1.3 only.
+pub fn client_config(
+  pinned_server: CertificateDer<'static>,
+  client_identity: &Identity,
+) -> Result<ClientConfig, HandshakeError> {
   let mut roots = RootCertStore::empty();
   roots
-    .add(pinned)
+    .add(pinned_server)
     .map_err(|e| HandshakeError::Setup(e.to_string()))?;
   ClientConfig::builder_with_provider(provider())
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_root_certificates(roots)
-    .with_no_client_auth()
-    .pipe(Ok)
+    .with_client_auth_cert(
+      vec![client_identity.cert.clone()],
+      client_identity.key.clone_key(),
+    )
+    .map_err(HandshakeError::from)
 }
-
-/// A tiny helper so the config builders read as a pipeline.
-trait Pipe: Sized {
-  fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
-    f(self)
-  }
-}
-impl<T> Pipe for T {}
 
 /// slates's QUIC transport parameters (opaque to rustls; the codec's own params are owed). A fixed
 /// non-empty value so both ends present some.
 const TRANSPORT_PARAMS: &[u8] = b"slates-quic-v1";
 
-/// Builds the client and server QUIC connections for `name`, the client pinning the server's cert.
+/// Builds the mutually-authenticated client and server QUIC connections for `name`: the `client`
+/// presents its identity and pins the `server`'s cert, and the `server` pins the `client`'s cert.
 pub fn connect(
   server: &Identity,
+  client: &Identity,
   name: &str,
 ) -> Result<(ClientConnection, ServerConnection), HandshakeError> {
-  connect_with(server, &server.certificate(), name)
+  connect_with(server, client, &client.certificate(), name)
 }
 
-/// Builds the connections with the client pinning `client_pin` (which may differ from the server's
-/// real certificate — the wrong-pin test uses the difference). For separate endpoints each side
-/// builds only its own connection ([`client_connection`]/[`server_connection`]); this pairs them for
-/// the in-process handshake test.
+/// Builds the connections with the server pinning `allowed_client` (which may differ from the client's
+/// real certificate — the wrong-pin test uses the difference). For separate endpoints each side builds
+/// only its own connection ([`client_connection`]/[`server_connection`]); this pairs them for the
+/// in-process handshake test.
 pub fn connect_with(
   server: &Identity,
-  client_pin: &CertificateDer<'static>,
+  client: &Identity,
+  allowed_client: &CertificateDer<'static>,
   name: &str,
 ) -> Result<(ClientConnection, ServerConnection), HandshakeError> {
   Ok((
-    client_connection(client_pin, name)?,
-    server_connection(server)?,
+    client_connection(client, &server.certificate(), name)?,
+    server_connection(server, std::slice::from_ref(allowed_client))?,
   ))
 }
 
-/// The client half of the handshake: pins `pinned` (the peer's enrolled certificate) and targets the
-/// peer as `name`. Needs no private key — only the certificate it trusts.
+/// The client half of the handshake: presents `client_identity`, pins `pinned_server` (the peer's
+/// enrolled certificate), and targets the peer as `name`.
 pub fn client_connection(
-  pinned: &CertificateDer<'static>,
+  client_identity: &Identity,
+  pinned_server: &CertificateDer<'static>,
   name: &str,
 ) -> Result<ClientConnection, HandshakeError> {
-  let cfg = client_config(pinned.clone())?;
+  let cfg = client_config(pinned_server.clone(), client_identity)?;
   let server_name =
     ServerName::try_from(name.to_owned()).map_err(|e| HandshakeError::Setup(e.to_string()))?;
   // structural: allow — D-8 exception 2: rustls's `ClientConnection::new` takes `Arc` by signature.
@@ -150,9 +169,13 @@ pub fn client_connection(
     .map_err(HandshakeError::from)
 }
 
-/// The server half of the handshake: presents `identity`'s certificate and private key.
-pub fn server_connection(identity: &Identity) -> Result<ServerConnection, HandshakeError> {
-  let cfg = server_config(identity)?;
+/// The server half of the handshake: presents `identity` and requires a client certificate found among
+/// `allowed_clients` (mutual authentication), so it knows which enrolled caller it is speaking to.
+pub fn server_connection(
+  identity: &Identity,
+  allowed_clients: &[CertificateDer<'static>],
+) -> Result<ServerConnection, HandshakeError> {
+  let cfg = server_config(identity, allowed_clients)?;
   // structural: allow — D-8 exception 2: rustls's `ServerConnection::new` takes `Arc` by signature.
   ServerConnection::new(Arc::new(cfg), Version::V1, TRANSPORT_PARAMS.to_vec())
     .map_err(HandshakeError::from)
@@ -209,7 +232,7 @@ mod tests {
     use rustls::quic::KeyChange;
 
     let identity = self_signed("slates-node");
-    let (mut client, mut server) = connect(&identity, "slates-node").unwrap();
+    let (mut client, mut server) = connect(&identity, &identity, "slates-node").unwrap();
     let mut client_keys = None;
     let mut server_keys = None;
     for _ in 0..16 {
@@ -262,7 +285,7 @@ mod tests {
   #[test]
   fn a_pinned_tls13_handshake_completes() {
     let identity = self_signed("slates-node");
-    let (mut client, mut server) = connect(&identity, "slates-node").unwrap();
+    let (mut client, mut server) = connect(&identity, &identity, "slates-node").unwrap();
     drive(&mut client, &mut server).unwrap();
     assert!(!client.is_handshaking(), "the client handshake completed");
     assert!(!server.is_handshaking(), "the server handshake completed");
@@ -280,8 +303,13 @@ mod tests {
     let server_identity = self_signed("slates-node");
     let other = self_signed("slates-node");
     // The client pins `other`'s cert but talks to the real server.
-    let (mut client, mut server) =
-      connect_with(&server_identity, &other.certificate(), "slates-node").unwrap();
+    let (mut client, mut server) = connect_with(
+      &server_identity,
+      &server_identity,
+      &other.certificate(),
+      "slates-node",
+    )
+    .unwrap();
     let outcome = drive(&mut client, &mut server);
     // Either the drive errors, or the client never completes — never a silent accept of a wrong pin.
     assert!(

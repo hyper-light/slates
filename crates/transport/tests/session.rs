@@ -71,8 +71,10 @@ fn a_stream_flows_over_a_live_session() {
   let content: Vec<u8> = (0..300u16)
     .map(|i| u8::try_from(i % 251).unwrap_or(0))
     .collect();
-  let identity = self_signed(NAME);
-  let pinned = identity.certificate();
+  let server_identity = self_signed(NAME);
+  let client_identity = self_signed(NAME);
+  let server_cert = server_identity.certificate();
+  let client_cert = client_identity.certificate();
 
   let (server_port_tx, server_port_rx) = channel();
   let (client_port_tx, client_port_rx) = channel();
@@ -87,8 +89,14 @@ fn a_stream_flows_over_a_live_session() {
       let client_port = recv_port(client_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, client_port);
       let outcome = async {
-        let mut server =
-          Endpoint::server(socket, peer, &identity, FRAME_CAP).map_err(|e| format!("{e:?}"))?;
+        let mut server = Endpoint::server(
+          socket,
+          peer,
+          &server_identity,
+          std::slice::from_ref(&client_cert),
+          FRAME_CAP,
+        )
+        .map_err(|e| format!("{e:?}"))?;
         server.establish().await.map_err(|e| format!("{e:?}"))?;
         server
           .recv_stream(STREAM_ID)
@@ -107,7 +115,15 @@ fn a_stream_flows_over_a_live_session() {
       let _ = client_port_tx.send(socket.local_addr().unwrap().port());
       let server_port = recv_port(server_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
-      let mut client = Endpoint::client(socket, peer, &pinned, NAME, FRAME_CAP).unwrap();
+      let mut client = Endpoint::client(
+        socket,
+        peer,
+        &client_identity,
+        &server_cert,
+        NAME,
+        FRAME_CAP,
+      )
+      .unwrap();
       client.establish().await.unwrap();
       client.send_stream(STREAM_ID, &content).await.unwrap();
     })
@@ -138,8 +154,10 @@ fn a_request_gets_a_reply_over_a_live_session() {
   // The reply the server computes: the request with every byte incremented — a transform, so a reply
   // echoed by mistake or a crossed stream would show.
   let expected_reply: Vec<u8> = request.iter().map(|b| b.wrapping_add(1)).collect();
-  let identity = self_signed(NAME);
-  let pinned = identity.certificate();
+  let server_identity = self_signed(NAME);
+  let client_identity = self_signed(NAME);
+  let server_cert = server_identity.certificate();
+  let client_cert = client_identity.certificate();
 
   let (server_port_tx, server_port_rx) = channel();
   let (client_port_tx, client_port_rx) = channel();
@@ -152,7 +170,14 @@ fn a_request_gets_a_reply_over_a_live_session() {
       let _ = server_port_tx.send(socket.local_addr().unwrap().port());
       let client_port = recv_port(client_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, client_port);
-      let mut server = Endpoint::server(socket, peer, &identity, FRAME_CAP).unwrap();
+      let mut server = Endpoint::server(
+        socket,
+        peer,
+        &server_identity,
+        std::slice::from_ref(&client_cert),
+        FRAME_CAP,
+      )
+      .unwrap();
       server.establish().await.unwrap();
       server
         .serve_once(|req| req.iter().map(|b| b.wrapping_add(1)).collect())
@@ -169,8 +194,15 @@ fn a_request_gets_a_reply_over_a_live_session() {
       let server_port = recv_port(server_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
       let outcome = async {
-        let mut client =
-          Endpoint::client(socket, peer, &pinned, NAME, FRAME_CAP).map_err(|e| format!("{e:?}"))?;
+        let mut client = Endpoint::client(
+          socket,
+          peer,
+          &client_identity,
+          &server_cert,
+          NAME,
+          FRAME_CAP,
+        )
+        .map_err(|e| format!("{e:?}"))?;
         client.establish().await.map_err(|e| format!("{e:?}"))?;
         client
           .request(STREAM_ID, &request)
@@ -203,8 +235,10 @@ fn repeated_exchanges_never_reuse_packet_numbers() {
   let id = sim.shard_ids()[0];
   const EXCHANGES: u64 = 4;
 
-  let identity = self_signed(NAME);
-  let pinned = identity.certificate();
+  let server_identity = self_signed(NAME);
+  let client_identity = self_signed(NAME);
+  let server_cert = server_identity.certificate();
+  let client_cert = client_identity.certificate();
   let (server_port_tx, server_port_rx) = channel();
   let (client_port_tx, client_port_rx) = channel();
   let (result_tx, result_rx) = channel();
@@ -216,7 +250,14 @@ fn repeated_exchanges_never_reuse_packet_numbers() {
       let _ = server_port_tx.send(socket.local_addr().unwrap().port());
       let client_port = recv_port(client_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, client_port);
-      let mut server = Endpoint::server(socket, peer, &identity, FRAME_CAP).unwrap();
+      let mut server = Endpoint::server(
+        socket,
+        peer,
+        &server_identity,
+        std::slice::from_ref(&client_cert),
+        FRAME_CAP,
+      )
+      .unwrap();
       server.establish().await.unwrap();
       for _ in 0..EXCHANGES {
         server
@@ -236,8 +277,15 @@ fn repeated_exchanges_never_reuse_packet_numbers() {
       let server_port = recv_port(server_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
       let outcome = async {
-        let mut client =
-          Endpoint::client(socket, peer, &pinned, NAME, FRAME_CAP).map_err(|e| format!("{e:?}"))?;
+        let mut client = Endpoint::client(
+          socket,
+          peer,
+          &client_identity,
+          &server_cert,
+          NAME,
+          FRAME_CAP,
+        )
+        .map_err(|e| format!("{e:?}"))?;
         client.establish().await.map_err(|e| format!("{e:?}"))?;
         let mut cursors = vec![client.tx_packet_number()];
         for exchange in 0..EXCHANGES {
