@@ -12,9 +12,15 @@
 //! two hosts encode a message identically (the determinism the golden vectors pin).
 
 use std::mem::size_of;
+use std::sync::mpsc::{TryRecvError, channel};
 
 use slates_db::register::HostId;
+use slates_rt::error::RtError;
+use slates_rt::futures::{cancel, sleep, spawn_child};
+use slates_transport::endpoint::{Endpoint, EndpointError};
 
+use crate::CommitBudget;
+use crate::detector::Detector;
 use crate::membership::{Liveness, MemberState};
 
 /// A SWIM message on the wire: a probe, its acknowledgement, or an indirect-probe request, each naming
@@ -241,6 +247,108 @@ fn liveness_from_byte(byte: u8) -> Result<Liveness, SwimWireError> {
     LIVENESS_DEAD => Ok(Liveness::Dead),
     other => Err(SwimWireError::UnknownLiveness { liveness: other }),
   }
+}
+
+/// Format: a SWIM probe rides one stream per peer connection; the target's `serve_once` accepts whichever
+/// stream arrives, so the exact id is a fixed label, not a tunable.
+const PROBE_STREAM: u64 = 1;
+
+/// The outcome of one live probe over the transport.
+pub enum ProbeOutcome {
+  /// The target acknowledged within the deadline; its piggybacked gossip is returned for the caller to
+  /// fold into the view (`detector.on_ack` and `detector.apply_gossip`).
+  Acked(Vec<(HostId, MemberState)>),
+  /// The deadline elapsed with no acknowledgement — a probe failure (the target may be down, or a packet
+  /// lost). The caller does not acknowledge; the detector's next tick suspects, and the indirect probe or
+  /// a later period clears or confirms it.
+  TimedOut,
+}
+
+/// What the probe's request task or the deadline task reports back.
+enum ProbeReply {
+  /// The target replied (bytes, empty if the request failed) and its endpoint, handed back for reuse.
+  Replied(Vec<u8>, Box<Endpoint>),
+  /// The deadline elapsed first.
+  Deadline,
+}
+
+/// Sends one SWIM `probe` over `endpoint` and awaits the acknowledgement within `budget.deadline_ns`,
+/// racing the request against a deadline task so a dead target cannot hang the prober (§4.8; the same
+/// bounded-wait discipline as the commit dispatch — a probe never blocks a protocol period forever). On
+/// an acknowledgement the endpoint is returned for reuse, so its packet-number space stays continuous
+/// across probe periods (RFC 9000 §12.3), and the target's piggybacked gossip is delivered; on the
+/// deadline the request task is cancelled and its endpoint dropped (a crashed peer's connection is
+/// worthless), so a caller that retries reconnects. The budget is the caller's to derive (owed — a
+/// measured RTT budget).
+pub async fn probe_once(
+  endpoint: Endpoint,
+  probe: &SwimMessage,
+  budget: CommitBudget,
+) -> Result<(Option<Endpoint>, ProbeOutcome), RtError> {
+  let bytes = probe.encode();
+  let (tx, rx) = channel::<ProbeReply>();
+
+  let request_tx = tx.clone();
+  let request = spawn_child(async move {
+    let mut endpoint = endpoint;
+    let reply = endpoint
+      .request(PROBE_STREAM, &bytes)
+      .await
+      .unwrap_or_default();
+    let _ = request_tx.send(ProbeReply::Replied(reply, Box::new(endpoint)));
+  })?;
+
+  let deadline = budget.deadline_ns;
+  let deadline_task = spawn_child(async move {
+    sleep(deadline).await;
+    let _ = tx.send(ProbeReply::Deadline);
+  })?;
+
+  loop {
+    match rx.try_recv() {
+      Ok(ProbeReply::Replied(reply, endpoint)) => {
+        let _ = cancel(deadline_task);
+        // A missing or non-ack reply is not an acknowledgement — treat it as a probe failure.
+        let outcome = match SwimMessage::decode(&reply) {
+          Ok(message @ SwimMessage::Ack { .. }) => ProbeOutcome::Acked(message.gossip().to_vec()),
+          _ => ProbeOutcome::TimedOut,
+        };
+        return Ok((Some(*endpoint), outcome));
+      }
+      Ok(ProbeReply::Deadline) => {
+        let _ = cancel(request);
+        return Ok((None, ProbeOutcome::TimedOut));
+      }
+      Err(TryRecvError::Empty) => sleep(budget.poll_interval_ns).await,
+      Err(TryRecvError::Disconnected) => return Ok((None, ProbeOutcome::TimedOut)),
+    }
+  }
+}
+
+/// Serves one SWIM probe on a node (§4.8): receives a peer's message over `endpoint`, folds its
+/// piggybacked gossip into `detector`, and replies with an acknowledgement carrying up to `gossip_fanout`
+/// of this node's own gossip — so a probe both proves this node alive and spreads the view. A malformed
+/// message is answered with no reply (the prober counts nothing). The caller loops this to keep serving.
+pub async fn serve_probe(
+  endpoint: &mut Endpoint,
+  detector: &mut Detector,
+  local: HostId,
+  gossip_fanout: usize,
+) -> Result<(), EndpointError> {
+  endpoint
+    .serve_once(|request| match SwimMessage::decode(&request) {
+      Ok(message) => {
+        detector.apply_gossip(message.gossip());
+        let gossip = detector.gossip(gossip_fanout);
+        SwimMessage::Ack {
+          from: local,
+          gossip,
+        }
+        .encode()
+      }
+      Err(_) => Vec::new(),
+    })
+    .await
 }
 
 #[cfg(test)]
