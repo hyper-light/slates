@@ -4,19 +4,28 @@
 //! edge). This is the daemon↔daemon mesh, where Meta-scale traffic lives; the laptop-degenerate is a
 //! local/loopback delivery, one code path (R8).
 //!
-//! **What this crate holds so far (Phase 8 slice 1): the control-datagram wire codec.** A control
-//! datagram is a fixed-layout little-endian cleartext prologue (the key-finding minimum — version,
-//! sender, key epoch, sealed length) wrapping a sealed region that carries the envelope (a fixed
-//! header — kind, class, flags, epoch, hybrid-logical clock, request id) and a canonical body. The
-//! AEAD seal (AES-256-GCM under host-identity keys), the `rt` UDP driver, the owned QUIC dialect over
-//! `rustls::quic` (TLS 1.3, slates D-15, not hecate's Noise), and the register/placement wiring are
-//! the later slices in the design's phasing — **owed**. Here the sealed region is the plaintext
-//! envelope + body; the crypto slice wraps exactly these bytes.
+//! **What this crate holds (Phase 8 slices 1 and 2): the control-datagram wire codec and its AEAD
+//! seal.** A control datagram is a fixed-layout little-endian cleartext prologue (the key-finding
+//! minimum — version, sender, key epoch, sealed length) wrapping a sealed region that carries the
+//! envelope (a fixed header — kind, class, flags, epoch, hybrid-logical clock, request id) and a
+//! canonical body. [`ControlDatagram::encode`]/[`ControlDatagram::decode`] are the plaintext codec (the
+//! wire shape, tested on every host); [`ControlDatagram::encode_sealed`]/[`ControlDatagram::decode_sealed`]
+//! (module [`seal`]) wrap exactly the sealed region in AES-256-GCM (D-15's TLS 1.3 cipher) under a
+//! [`seal::Sealer`]/[`seal::Opener`], the cleartext prologue bound in as authenticated data so the
+//! routing header cannot be swapped. Nonces are a per-direction counter (never random, so no RNG and
+//! deterministic tests); a repeated counter is refused on both ends.
+//!
+//! **Owed** (later slices in the design's phasing): the key *schedule* — the HKDF derivation that fills
+//! a `Sealer`'s key from an enrolled host secret — and enrollment itself; the owned QUIC dialect over
+//! `rustls::quic` (TLS 1.3, slates D-15, not hecate's Noise); and the register/placement wiring. Here
+//! the key is injected (`from_key`), exactly as the codec takes bytes without owning the socket.
 //!
 //! This is a parser of external bytes, so every length is checked against the bytes that remain before
 //! it is read (a wild `sealed_len` never allocates), `flags` must be zero, and every malformation is a
-//! typed [`FrameError`], never a panic — the same discipline as `slates-merge`'s ops-document decode
-//! and `slates-bridge-fuse`'s ABI codec. The codec is pure and tested on every host.
+//! typed [`FrameError`]/[`seal::SealError`], never a panic — the same discipline as `slates-merge`'s
+//! ops-document decode and `slates-bridge-fuse`'s ABI codec. The codec is pure and tested on every host.
+
+pub mod seal;
 
 /// The protocol version this build speaks (the floor; negotiation to higher versions is owed with the
 /// session plane).
@@ -82,12 +91,29 @@ impl std::fmt::Display for FrameError {
 impl std::error::Error for FrameError {}
 
 /// The sealed region's fixed header size: the [`Envelope`] fields laid out little-endian.
-const ENVELOPE_BYTES: usize = size_of::<u8>() // kind
+pub(crate) const ENVELOPE_BYTES: usize = size_of::<u8>() // kind
   + size_of::<u8>() // class
   + size_of::<u8>() // flags
   + size_of::<u64>() // epoch
   + size_of::<u64>() // hlc
   + size_of::<u64>(); // request_id
+
+/// The cleartext prologue's fixed size: version, sender, key epoch, sealed length. Both the plaintext
+/// and the sealed encodings begin with exactly these bytes; the seal path binds them as the AEAD's
+/// authenticated data so a tamperer cannot re-route a sealed datagram without breaking the tag.
+pub(crate) const PROLOGUE_BYTES: usize =
+  size_of::<u8>() + size_of::<u64>() + size_of::<u32>() + size_of::<u32>();
+
+/// Writes the cleartext prologue (version, sender, key epoch, sealed length) — shared by the plaintext
+/// and sealed encodings. `sealed_len` is the byte count of whatever follows (the plaintext region, or
+/// the sealed region: wire counter + ciphertext + tag). A control datagram is MTU-bounded, so the
+/// length fits a `u32`; a saturating cast can only be reached by a bug the send builder refuses first.
+pub(crate) fn write_prologue(out: &mut Vec<u8>, sender: u64, key_epoch: u32, sealed_len: usize) {
+  out.push(PROTOCOL_VERSION);
+  out.extend_from_slice(&sender.to_le_bytes());
+  out.extend_from_slice(&key_epoch.to_le_bytes());
+  out.extend_from_slice(&u32::try_from(sealed_len).unwrap_or(u32::MAX).to_le_bytes());
+}
 
 impl ControlDatagram {
   /// The canonical byte encoding: the cleartext prologue (version, sender, key epoch, sealed length)
@@ -95,16 +121,17 @@ impl ControlDatagram {
   /// slice will encrypt the sealed region in place, its length unchanged in the prologue.
   pub fn encode(&self) -> Vec<u8> {
     let sealed_len = ENVELOPE_BYTES + self.body.len();
-    let mut out = Vec::with_capacity(
-      size_of::<u8>() + size_of::<u64>() + size_of::<u32>() + size_of::<u32>() + sealed_len,
-    );
-    out.push(PROTOCOL_VERSION);
-    out.extend_from_slice(&self.sender.to_le_bytes());
-    out.extend_from_slice(&self.key_epoch.to_le_bytes());
-    // A control datagram is MTU-bounded, so the sealed length fits a u32; oversize is refused by the
-    // per-path-MTU send builder (owed), so a saturating cast here can only be reached by a bug.
-    out.extend_from_slice(&u32::try_from(sealed_len).unwrap_or(u32::MAX).to_le_bytes());
-    // The sealed region (plaintext until the crypto slice): the envelope header, then the body.
+    let mut out = Vec::with_capacity(PROLOGUE_BYTES + sealed_len);
+    write_prologue(&mut out, self.sender, self.key_epoch, sealed_len);
+    // The sealed region (plaintext on this codec; the seal path encrypts exactly these bytes).
+    self.write_sealed_region(&mut out);
+    out
+  }
+
+  /// Appends the sealed region's plaintext — the envelope header then the body — to `out`. This is the
+  /// exact byte range [`ControlDatagram::encode`] leaves in cleartext and that the seal path encrypts,
+  /// so the two encodings share one region layout (a divergence here would desync the crypto slice).
+  pub(crate) fn write_sealed_region(&self, out: &mut Vec<u8>) {
     out.push(self.envelope.kind);
     out.push(self.envelope.class);
     out.push(self.envelope.flags);
@@ -112,7 +139,37 @@ impl ControlDatagram {
     out.extend_from_slice(&self.envelope.hlc.to_le_bytes());
     out.extend_from_slice(&self.envelope.request_id.to_le_bytes());
     out.extend_from_slice(&self.body);
-    out
+  }
+
+  /// Parses a sealed region's plaintext (envelope header then body) — the inverse of
+  /// [`ControlDatagram::write_sealed_region`], shared by the plaintext [`ControlDatagram::decode`] and
+  /// the sealed path (which calls it on the decrypted bytes). `flags` must be zero.
+  pub(crate) fn parse_sealed_region(region: &[u8]) -> Result<(Envelope, Vec<u8>), FrameError> {
+    if region.len() < ENVELOPE_BYTES {
+      return Err(FrameError::Truncated);
+    }
+    let mut reader = Reader::new(region);
+    let kind = reader.u8()?;
+    let class = reader.u8()?;
+    let flags = reader.u8()?;
+    if flags != 0 {
+      return Err(FrameError::FlagsSet);
+    }
+    let epoch = reader.u64()?;
+    let hlc = reader.u64()?;
+    let request_id = reader.u64()?;
+    let body = reader.bytes(reader.remaining())?.to_vec();
+    Ok((
+      Envelope {
+        kind,
+        class,
+        flags,
+        epoch,
+        hlc,
+        request_id,
+      },
+      body,
+    ))
   }
 
   /// Decodes a control datagram from [`ControlDatagram::encode`]'s bytes. Bounds-checked against the
@@ -130,30 +187,15 @@ impl ControlDatagram {
     if sealed_len < ENVELOPE_BYTES || sealed_len > reader.remaining() {
       return Err(FrameError::Truncated);
     }
-    let kind = reader.u8()?;
-    let class = reader.u8()?;
-    let flags = reader.u8()?;
-    if flags != 0 {
-      return Err(FrameError::FlagsSet);
-    }
-    let epoch = reader.u64()?;
-    let hlc = reader.u64()?;
-    let request_id = reader.u64()?;
-    let body = reader.bytes(sealed_len - ENVELOPE_BYTES)?.to_vec();
+    let region = reader.bytes(sealed_len)?;
     if !reader.is_empty() {
       return Err(FrameError::TrailingBytes);
     }
+    let (envelope, body) = ControlDatagram::parse_sealed_region(region)?;
     Ok(ControlDatagram {
       sender,
       key_epoch,
-      envelope: Envelope {
-        kind,
-        class,
-        flags,
-        epoch,
-        hlc,
-        request_id,
-      },
+      envelope,
       body,
     })
   }
@@ -161,43 +203,44 @@ impl ControlDatagram {
 
 /// A cursor over the datagram bytes: every read is bounds-checked against what remains, so a torn
 /// datagram yields [`FrameError::Truncated`] rather than an out-of-bounds panic.
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
+  // Shared with the seal path (module `seal`), which reads the prologue and the wire counter.
   bytes: &'a [u8],
   at: usize,
 }
 
 impl<'a> Reader<'a> {
-  fn new(bytes: &'a [u8]) -> Reader<'a> {
+  pub(crate) fn new(bytes: &'a [u8]) -> Reader<'a> {
     Reader { bytes, at: 0 }
   }
 
-  fn remaining(&self) -> usize {
+  pub(crate) fn remaining(&self) -> usize {
     self.bytes.len().saturating_sub(self.at)
   }
 
-  fn is_empty(&self) -> bool {
+  pub(crate) fn is_empty(&self) -> bool {
     self.remaining() == 0
   }
 
-  fn bytes(&mut self, len: usize) -> Result<&'a [u8], FrameError> {
+  pub(crate) fn bytes(&mut self, len: usize) -> Result<&'a [u8], FrameError> {
     let end = self.at.checked_add(len).ok_or(FrameError::Truncated)?;
     let slice = self.bytes.get(self.at..end).ok_or(FrameError::Truncated)?;
     self.at = end;
     Ok(slice)
   }
 
-  fn u8(&mut self) -> Result<u8, FrameError> {
+  pub(crate) fn u8(&mut self) -> Result<u8, FrameError> {
     Ok(self.bytes(size_of::<u8>())?[0])
   }
 
-  fn u32(&mut self) -> Result<u32, FrameError> {
+  pub(crate) fn u32(&mut self) -> Result<u32, FrameError> {
     let b = self.bytes(size_of::<u32>())?;
     let mut word = [0u8; size_of::<u32>()];
     word.copy_from_slice(b);
     Ok(u32::from_le_bytes(word))
   }
 
-  fn u64(&mut self) -> Result<u64, FrameError> {
+  pub(crate) fn u64(&mut self) -> Result<u64, FrameError> {
     let b = self.bytes(size_of::<u64>())?;
     let mut word = [0u8; size_of::<u64>()];
     word.copy_from_slice(b);
