@@ -2482,13 +2482,15 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > the worked case (T-6.x, `crates/merge/tests/engine.rs`). Per-range identity for a length-changing
 > overlap (insert/delete/truncate) still falls back to the whole-file check (its coordinate mapping
 > under a conflicting neighbour is owed). An unlink now removes whatever the path names — a file, a
-> symlink or a hard link (it had removed only files) — and `base_at` reconstructs a lagging work's
-> base at an intervening version across *every* dimension (a per-dimension `(version, value)` history
-> the commit records; directories/modes/symlinks/hard-links/xattrs had come back empty). The fully
-> general intra-increment coordination (including create-then-chmod/xattr on one path in one
-> increment, which currently conflicts), that shifting-op per-range identity, the checkpoint folding
-> of the canonical deltas, and the copy-on-write green chain are the rest of Phase 6; the fleet
-> register, mirror and reconfiguration protocols are now simulated (§4.8 status, GAPS §8h).
+> symlink or a hard link (it had removed only files); `base_at` reconstructs a lagging work's base at
+> an intervening version across *every* dimension (a per-dimension `(version, value)` history the
+> commit records; directories/modes/symlinks/hard-links/xattrs had come back empty); and a path the
+> increment itself creates or makes now establishes it for that increment's metadata, so a file
+> created and chmod'd or xattr'd in one increment accepts (it had conflicted delete/modify against the
+> not-yet-committed path). The fully general intra-increment coordination (a path both renamed away
+> and recreated in one increment), that shifting-op per-range identity, the checkpoint folding of the
+> canonical deltas, and the copy-on-write green chain are the rest of Phase 6; the fleet register,
+> mirror and reconfiguration protocols are now simulated (§4.8 status, GAPS §8h).
 
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an

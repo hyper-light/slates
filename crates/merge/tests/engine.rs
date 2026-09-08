@@ -378,6 +378,46 @@ fn base_at_reconstructs_every_dimension_at_an_intervening_version() {
   );
 }
 
+/// A file created and chmod'd in one increment accepts, with the mode applied (§4.16: the
+/// increment's own create establishes the path for its metadata dimensions — the deriver composed
+/// them into one increment, so the engine must not conflict the mode against a not-yet-committed
+/// file). T-6.x.
+#[test]
+fn create_then_setmode_in_one_increment_accepts() {
+  let mut green = Green::new();
+  let outcome = green.submit(&Build::new().create("f", b"hi").setmode("f", 0o600).at(1, 0));
+  assert_eq!(outcome, Outcome::Accepted { version: 1 });
+  assert_eq!(green.content("f"), Some(b"hi".as_slice()));
+  assert_eq!(
+    green.mode("f"),
+    Some(0o600),
+    "the mode set at creation applies"
+  );
+}
+
+/// A file created and given an xattr in one increment accepts, with the xattr applied.
+#[test]
+fn create_then_setxattr_in_one_increment_accepts() {
+  let mut green = Green::new();
+  let outcome = green.submit(
+    &Build::new()
+      .create("f", b"hi")
+      .setxattr("f", "user.k", b"v")
+      .at(1, 0),
+  );
+  assert_eq!(outcome, Outcome::Accepted { version: 1 });
+  assert_eq!(green.xattr("f", "user.k"), Some(b"v".as_slice()));
+}
+
+/// A directory created and chmod'd in one increment accepts, with the mode applied.
+#[test]
+fn mkdir_then_setmode_in_one_increment_accepts() {
+  let mut green = Green::new();
+  let outcome = green.submit(&Build::new().mkdir("d").setmode("d", 0o700).at(1, 0));
+  assert_eq!(outcome, Outcome::Accepted { version: 1 });
+  assert_eq!(green.mode("d"), Some(0o700));
+}
+
 /// An insert before an accepted disjoint edit shifts the later one, and both apply.
 #[test]
 fn an_intervening_insert_shifts_a_later_edit() {

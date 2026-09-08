@@ -306,6 +306,14 @@ impl Resolved {
     cleared.extend(self.renames.values().cloned());
     cleared
   }
+
+  /// Whether this increment itself brings `path` into being — a file it creates or renames into, or a
+  /// directory it makes. The metadata dimensions (mode, xattr) consult this so a file created and
+  /// chmod'd (or xattr'd) in one increment is not a delete/modify conflict against the not-yet-
+  /// committed path: the deriver composed them into one increment, so they belong together.
+  fn establishes(&self, path: &str) -> bool {
+    self.creates.contains(path) || self.mkdirs.contains(path) || self.renames.contains_key(path)
+  }
 }
 
 /// One accepted per-path effect to apply at commit.
@@ -825,8 +833,9 @@ impl Green {
     path: &str,
     base: u64,
     mode: u32,
+    established: bool,
   ) -> Result<Option<Effect>, ConflictWindow> {
-    if !self.content.contains_key(path) && !self.dirs.contains(path) {
+    if !self.content.contains_key(path) && !self.dirs.contains(path) && !established {
       return Err(Green::window(path, MergeConflictClass::DeleteModify));
     }
     if self.mode_changed.get(path).copied().unwrap_or(0) > base {
@@ -883,8 +892,9 @@ impl Green {
     name: &str,
     base: u64,
     value: &[u8],
+    established: bool,
   ) -> Result<Option<Effect>, ConflictWindow> {
-    if !self.content.contains_key(path) && !self.dirs.contains(path) {
+    if !self.content.contains_key(path) && !self.dirs.contains(path) && !established {
       return Err(Green::window(path, MergeConflictClass::DeleteModify));
     }
     let key = (path.to_owned(), name.to_owned());
@@ -987,7 +997,11 @@ impl Green {
     windows: &mut Vec<ConflictWindow>,
   ) {
     for (path, mode) in &r.modes {
-      record(effects, windows, self.merge_setmode(path, inc.base, *mode));
+      record(
+        effects,
+        windows,
+        self.merge_setmode(path, inc.base, *mode, r.establishes(path)),
+      );
     }
     for (path, target) in &r.symlinks {
       record(effects, windows, self.merge_symlink(path, inc.base, target));
@@ -1003,7 +1017,7 @@ impl Green {
       record(
         effects,
         windows,
-        self.merge_set_xattr(path, name, inc.base, value),
+        self.merge_set_xattr(path, name, inc.base, value, r.establishes(path)),
       );
     }
     for (path, name) in &r.xattr_removes {
