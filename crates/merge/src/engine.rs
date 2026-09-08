@@ -873,7 +873,12 @@ impl Green {
     base: u64,
     target: &str,
   ) -> Result<Option<Effect>, ConflictWindow> {
-    if self.content.contains_key(path) || self.dirs.contains(path) {
+    // A file, directory or hard link already at this path is a different kind — a type conflict. An
+    // existing symlink is not: that is the retarget case decided just below.
+    if self.content.contains_key(path)
+      || self.dirs.contains(path)
+      || self.hardlinks.contains_key(path)
+    {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     if self.symlink_changed.get(path).copied().unwrap_or(0) > base {
@@ -892,7 +897,12 @@ impl Green {
     base: u64,
     target: &str,
   ) -> Result<Option<Effect>, ConflictWindow> {
-    if self.content.contains_key(path) || self.dirs.contains(path) {
+    // A file, directory or symlink already at this path is a different kind — a type conflict. An
+    // existing hard link is not: that is the retarget case decided just below.
+    if self.content.contains_key(path)
+      || self.dirs.contains(path)
+      || self.symlinks.contains_key(path)
+    {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     if self.hardlink_changed.get(path).copied().unwrap_or(0) > base {

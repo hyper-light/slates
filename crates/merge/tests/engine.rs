@@ -451,6 +451,46 @@ fn renaming_a_hardlink_moves_it() {
   );
 }
 
+/// A symlink created where an intervening change put a hard link is a type conflict, not a second
+/// entry at one path (§4.16: one kind per path). Without the cross-kind check the path would hold
+/// both a symlink and a hard link — a corrupt state.
+#[test]
+fn a_symlink_over_an_intervening_hardlink_conflicts() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("f", b"x").at(1, 0));
+  green.submit(&Build::new().link("p", "f").at(2, 1)); // an intervening hard link at p
+  let outcome = green.submit(&Build::new().symlink("p", "t").at(3, 1)); // agent (based on v1) symlinks p
+  assert_eq!(
+    conflict_class(&outcome),
+    Some(MergeConflictClass::TypeChanged),
+    "a symlink over an intervening hard link is a type conflict"
+  );
+  assert_eq!(
+    green.symlink("p"),
+    None,
+    "no symlink was created over the hard link"
+  );
+}
+
+/// A hard link created where an intervening change put a symlink is a type conflict (the mirror).
+#[test]
+fn a_hardlink_over_an_intervening_symlink_conflicts() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("f", b"x").at(1, 0));
+  green.submit(&Build::new().symlink("p", "t").at(2, 1)); // an intervening symlink at p
+  let outcome = green.submit(&Build::new().link("p", "f").at(3, 1)); // agent (based on v1) hard-links p
+  assert_eq!(
+    conflict_class(&outcome),
+    Some(MergeConflictClass::TypeChanged),
+    "a hard link over an intervening symlink is a type conflict"
+  );
+  assert_eq!(
+    green.hardlink("p"),
+    None,
+    "no hard link was created over the symlink"
+  );
+}
+
 /// An insert before an accepted disjoint edit shifts the later one, and both apply.
 #[test]
 fn an_intervening_insert_shifts_a_later_edit() {
