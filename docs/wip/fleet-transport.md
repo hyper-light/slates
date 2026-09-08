@@ -110,6 +110,8 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    testable at N=1); io_uring/IOCP register-readable are typed-owed.
 4. **`slates-quic`** — owed: the owned dialect over `rustls::quic` — handshake, streams, loss
    recovery, congestion — with loom on the state machine and the N=1 differential harness.
+   The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c);
+   its fencing step and the `Keyring`'s population ride membership/enrollment.
 5. **Register/placement wiring** — owed: §4.8 head + merge-record registers and D-14 placement ride
    the session plane; the N=1 ≡ simulated-fleet differential (AC-2.5 extended) is the gate.
 
@@ -152,8 +154,11 @@ hecate `WIRE_SECURITY.md` to slates's D-15 (TLS 1.3, not Noise). **Ratify before
   **built** (`schedule.rs`: `KeySchedule::from_control_secret`/`seal_key`/`sealer`/`opener`, RFC 5869
   known-answer + a golden + a schedule→seal→open test; control secret injected); (b) the AEAD
   seal/unseal over the codec's plaintext (round-trip, tamper ⇒ typed refusal, nonce-reuse ⇒ typed
-  refusal, golden vectors) — **built** (`seal.rs`, key injected); (c) the enforcement-order parser
-  with the hostile-input suite — **owed** (it needs the key *lookup* by sender, so it rides enrollment).
+  refusal, golden vectors) — **built** (`seal.rs`, key injected); (c) the enforcement-order parser —
+  **built** (`accept.rs`: length cap → prologue → **key lookup that drops an unknown sender before
+  any crypto** → AEAD verify/decrypt/replay, over an injected `Keyring` trait; a test proves an
+  unknown sender with a corrupt body is `UnknownSender`, not `BadSeal`). The **fencing** step
+  (epoch/term) is owed with membership; the `Keyring`'s *population* is owed with enrollment.
   Key **distribution/enrollment** (the region group admitting a node, minting the control secret) is
   its own slice tied to §4.13/§4.8 membership — the largest remaining piece, and the one most needing
   your review, since it is where identity and authority live. **What (b) deliberately does not do**

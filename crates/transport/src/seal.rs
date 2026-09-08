@@ -232,6 +232,19 @@ impl ControlDatagram {
     Ok(out)
   }
 
+  /// Reads only the cleartext routing prologue — the sending node and its key epoch — without
+  /// touching the sealed region or spending any crypto. The acceptance path uses this to find the
+  /// key *before* it verifies, so an unknown sender is dropped for free (§4.10a §7 enforcement order).
+  pub fn peek_routing(bytes: &[u8]) -> Result<(u64, u32), SealError> {
+    let mut reader = Reader::new(bytes);
+    if reader.u8().map_err(|_| SealError::Truncated)? != PROTOCOL_VERSION {
+      return Err(SealError::BadVersion);
+    }
+    let sender = reader.u64().map_err(|_| SealError::Truncated)?;
+    let key_epoch = reader.u32().map_err(|_| SealError::Truncated)?;
+    Ok((sender, key_epoch))
+  }
+
   /// Decodes and opens a datagram from [`ControlDatagram::encode_sealed`]'s bytes. Every length is
   /// bounds-checked before it is read (a wild `sealed_len` never allocates), the tag is verified with
   /// the routing prologue as AAD, and any malformation, forgery or replay is a typed [`SealError`].
