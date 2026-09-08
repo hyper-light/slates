@@ -16,7 +16,7 @@ use rustix::net::{Ipv4Addr, SocketAddrV4};
 use rustls::pki_types::PrivateKeyDer;
 use slates_cluster::fleet::FleetNode;
 use slates_cluster::{CommitBudget, serve_record};
-use slates_db::register::{Acceptor, Authority, HostId, Quorum, Record};
+use slates_db::register::{Acceptor, Authority, HostId, ObjectId, Quorum, Record};
 use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::SimRuntime;
 use slates_rt::udp::UdpSocket;
@@ -25,7 +25,7 @@ use slates_transport::handshake::Identity;
 
 const NAME: &str = "slates-node";
 const FRAME_CAP: usize = 16;
-const OBJECT: u64 = 7;
+const OBJECT: ObjectId = ObjectId::new(OWNER, 7);
 const OWNER: HostId = HostId(1);
 const A: HostId = HostId(2);
 const B: HostId = HostId(3);

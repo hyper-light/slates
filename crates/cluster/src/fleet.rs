@@ -189,7 +189,7 @@ impl FleetNode {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use slates_db::register::{Placement, Record, commit_over_holders};
+  use slates_db::register::{ObjectId, Placement, Record, commit_over_holders};
 
   const SELF: HostId = HostId(1);
   const A: HostId = HostId(2);
@@ -212,7 +212,7 @@ mod tests {
   /// A dedicated probe position the invariant helper writes, distinct from any object a test commits
   /// for real, so the probe never conflicts with a test's own head. A constant value at a constant
   /// position means a re-probe under the current generation is an idempotent re-accept, not a conflict.
-  const PROBE_OBJECT: u64 = u64::MAX;
+  const PROBE_OBJECT: ObjectId = ObjectId::new(SELF, u64::MAX);
 
   /// Whether the owner's acceptor authorizes a head written under `generation` at this node's current
   /// authority — driven by use: a record under the configuration's version is accepted, one under a
@@ -287,7 +287,7 @@ mod tests {
     // A head commits on the local hold — the owner is f+1 at f=0.
     let record = Record {
       owner: SELF,
-      object: 0,
+      object: ObjectId::new(SELF, 0),
       sequence: 0,
       epoch: node.configuration().host_epoch,
       generation: node.configuration().version,
@@ -382,7 +382,7 @@ mod tests {
   #[test]
   fn the_fleet_path_genuinely_grows_before_it_degenerates() {
     let fleet = FleetNode::new(SELF, Quorum { f: 1 }, &[A, B]);
-    let grown: Placement = fleet.configuration().place(0);
+    let grown: Placement = fleet.configuration().place(ObjectId::new(SELF, 0));
     assert_eq!(
       grown.candidates.len(),
       3,

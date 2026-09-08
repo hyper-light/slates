@@ -15,7 +15,7 @@ use slates_cluster::{
   ClusterError, CommitBudget, commit_record, commit_under_configuration, serve_record,
 };
 use slates_db::register::{
-  Acceptor, Authority, Configuration, HostEpoch, HostId, Placement, Quorum, Record,
+  Acceptor, Authority, Configuration, HostEpoch, HostId, ObjectId, Placement, Quorum, Record,
 };
 use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::SimRuntime;
@@ -26,7 +26,7 @@ use slates_transport::handshake::Identity;
 const NAME: &str = "slates-node";
 const FRAME_CAP: usize = 16;
 const GENERATION: u64 = 0;
-const OBJECT: u64 = 7;
+const OBJECT: ObjectId = ObjectId::new(OWNER, 7);
 const OWNER: HostId = HostId(1);
 // Test values; a production caller derives the deadline from a measured RTT budget (owed).
 const DEADLINE_NS: u64 = 20_000_000;

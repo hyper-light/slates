@@ -30,7 +30,7 @@
 
 use std::mem::size_of;
 
-use slates_db::register::{Configuration, HostEpoch, HostId, Quorum, rendezvous_first};
+use slates_db::register::{Configuration, HostEpoch, HostId, ObjectId, Quorum, rendezvous_first};
 
 use crate::membership::Membership;
 use crate::raft::RaftNode;
@@ -48,8 +48,8 @@ pub enum ConfigCommand {
   TakeOver {
     /// The dead owner being taken over.
     dead: HostId,
-    /// The volume object whose ownership moves.
-    object: u64,
+    /// The volume object whose ownership moves (its 128-bit id, whose high half named the dead owner).
+    object: ObjectId,
   },
 }
 
@@ -75,7 +75,7 @@ impl ConfigCommand {
       ConfigCommand::TakeOver { dead, object } => {
         out.push(COMMAND_TAKE_OVER);
         out.extend_from_slice(&dead.0.to_le_bytes());
-        out.extend_from_slice(&object.to_le_bytes());
+        out.extend_from_slice(&object.0);
       }
     }
     out
@@ -90,14 +90,11 @@ impl ConfigCommand {
       COMMAND_RETIRE => Some(ConfigCommand::Retire(take_host(rest)?.0)),
       COMMAND_TAKE_OVER => {
         let (dead, rest) = take_host(rest)?;
-        if rest.len() != size_of::<u64>() {
-          return None;
-        }
-        let mut word = [0u8; size_of::<u64>()];
-        word.copy_from_slice(rest);
+        // The object is exactly its 16 id bytes; a different length is a corrupt entry.
+        let bytes: [u8; size_of::<ObjectId>()] = rest.try_into().ok()?;
         Some(ConfigCommand::TakeOver {
           dead,
-          object: u64::from_le_bytes(word),
+          object: ObjectId(bytes),
         })
       }
       _ => None,
@@ -282,7 +279,7 @@ impl ConfigGroup {
   /// Applies a committed takeover: reassigns the volume to the rendezvous-first survivor, bumps the host
   /// epoch, and drops the dead owner. A no-op if `dead` is no longer the owner or no survivor remains
   /// (the caller validated both before proposing; this stays safe if the log order changed them).
-  fn apply_take_over(&mut self, dead: HostId, object: u64) -> bool {
+  fn apply_take_over(&mut self, dead: HostId, object: ObjectId) -> bool {
     if dead != self.configuration.owner {
       return false;
     }
@@ -342,7 +339,11 @@ impl ConfigGroup {
   /// per-host model (A-9), owed. The new owner also still owes the phase-one recovery (reading the dead
   /// owner's highest records from the holders and adopting the head) before it serves. At `f > 0` the
   /// takeover decision is agreed by the configuration consensus (owed); this is its local effect.
-  pub fn take_over(&mut self, dead: HostId, object: u64) -> Result<&Configuration, TakeoverError> {
+  pub fn take_over(
+    &mut self,
+    dead: HostId,
+    object: ObjectId,
+  ) -> Result<&Configuration, TakeoverError> {
     // Validate against the current configuration before proposing — a takeover of a non-owner or one
     // with no survivor is refused without a log entry.
     if dead != self.configuration.owner {
@@ -471,7 +472,7 @@ mod tests {
     assert_eq!(group.configuration().host_epoch, HostEpoch(1));
     let before = group.configuration().version;
 
-    let object = 42;
+    let object = ObjectId::new(OWNER, 42);
     let new = group
       .take_over(OWNER, object)
       .expect("a survivor takes over")
@@ -499,7 +500,7 @@ mod tests {
     let mut group = ConfigGroup::solo(OWNER);
     group.reconfigure(Reconfiguration::Admit(A));
     assert_eq!(
-      group.take_over(A, 42),
+      group.take_over(A, ObjectId::new(OWNER, 42)),
       Err(TakeoverError::NotOwner { owner: OWNER }),
       "only the current owner is taken over"
     );
@@ -511,7 +512,7 @@ mod tests {
   fn take_over_with_no_survivor_refuses() {
     let mut group = ConfigGroup::solo(OWNER);
     assert_eq!(
-      group.take_over(OWNER, 42),
+      group.take_over(OWNER, ObjectId::new(OWNER, 42)),
       Err(TakeoverError::NoSurvivor),
       "a lone owner has no survivor to take over"
     );
@@ -554,7 +555,7 @@ mod tests {
       ConfigCommand::Retire(B),
       ConfigCommand::TakeOver {
         dead: OWNER,
-        object: 0x1234,
+        object: ObjectId::new(OWNER, 0x1234),
       },
     ];
     for command in commands {

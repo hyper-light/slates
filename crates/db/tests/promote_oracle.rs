@@ -23,12 +23,12 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 use slates_db::register::{
-  Acceptor, Authority, Holder, HostEpoch, HostId, Prepare, Promoter, Quorum, Record,
+  Acceptor, Authority, Holder, HostEpoch, HostId, ObjectId, Prepare, Promoter, Quorum, Record,
   commit_over_holders, promote_over_holders, rendezvous_first,
 };
 
 /// The single object every history writes (one register).
-const OBJECT: u64 = 0;
+const OBJECT: ObjectId = ObjectId::new(HostId(1), 0);
 
 /// The fleet under test and its serial reference: one real [`Acceptor`] per candidate, plus the
 /// bookkeeping the oracle checks — the current owner/epoch/generation, the next sequence the owner

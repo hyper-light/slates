@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 
 use slates_db::ledger::{Cohort, Owner, Reach, TakeoverError};
-use slates_db::register::{HostId, Quorum};
+use slates_db::register::{HostId, ObjectId, Quorum};
 
 /// A payload identity from a single byte (its 32 repeated); distinct bytes give distinct records.
 fn id(byte: u8) -> [u8; 32] {
@@ -22,7 +22,12 @@ fn id(byte: u8) -> [u8; 32] {
 /// cohort rather than assuming them.
 fn fleet(f: u32) -> (Cohort, Owner) {
   let neighbourhood: Vec<HostId> = (1..=8u64).map(HostId).collect();
-  let cohort = Cohort::new(HostId(1), &neighbourhood, 42, Quorum { f });
+  let cohort = Cohort::new(
+    HostId(1),
+    &neighbourhood,
+    ObjectId::new(HostId(1), 42),
+    Quorum { f },
+  );
   let owner = Owner::bootstrap(&cohort);
   (cohort, owner)
 }

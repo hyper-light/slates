@@ -39,7 +39,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::register::{FIRST_EPOCH, Fence, HostEpoch, HostId, Quorum, candidates_for};
+use crate::register::{FIRST_EPOCH, Fence, HostEpoch, HostId, ObjectId, Quorum, candidates_for};
 
 /// One entry in a holder's log. Its position is its index in the log (dense, `0`-based); it carries
 /// the payload's identity (the `blake3` of a merge record's declared work, a head, a lease — the
@@ -106,7 +106,7 @@ impl Cohort {
   /// The cohort for `object`: the rendezvous candidates from the owner's neighbourhood (owner
   /// first, `2f + 1` total), each an empty holder at the first epoch. At `f = 0` this is the owner
   /// alone.
-  pub fn new(owner: HostId, neighbourhood: &[HostId], object: u64, quorum: Quorum) -> Cohort {
+  pub fn new(owner: HostId, neighbourhood: &[HostId], object: ObjectId, quorum: Quorum) -> Cohort {
     let candidates = candidates_for(owner, neighbourhood, object, quorum);
     let mut holders = BTreeMap::new();
     for candidate in &candidates {

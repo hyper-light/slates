@@ -43,8 +43,8 @@ pub mod swim;
 use std::sync::mpsc::{TryRecvError, channel};
 
 use slates_db::register::{
-  Accepted, Acceptor, Ack, Configuration, HostId, Placement, Prepare, Promise, Promotion, Quorum,
-  Record, candidates_for,
+  Accepted, Acceptor, Ack, Configuration, HostId, ObjectId, Placement, Prepare, Promise, Promotion,
+  Quorum, Record, candidates_for,
 };
 use slates_rt::error::RtError;
 use slates_rt::futures::{cancel, sleep, spawn_child};
@@ -580,7 +580,7 @@ fn promote_spawn_failed(tasks: &[slates_rt::TaskId], error: RtError) -> Promoted
 /// configuration group (owed) publishes the taken-over [`Configuration`] this reads.
 pub async fn promote_under_configuration(
   configuration: &Configuration,
-  object: u64,
+  object: ObjectId,
   owner_acceptor: &mut Acceptor,
   remote_holders: Vec<(HostId, Endpoint)>,
   budget: CommitBudget,

@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use slates_db::ledger::{Cohort, Owner, Reach};
 use slates_db::mirror::Mirror;
-use slates_db::register::{HostId, Quorum};
+use slates_db::register::{HostId, ObjectId, Quorum};
 
 /// A payload identity from a byte.
 fn id(byte: u8) -> [u8; 32] {
@@ -19,10 +19,20 @@ fn id(byte: u8) -> [u8; 32] {
 /// disjoint set of hosts (a separate failure domain).
 fn regions(f: u32) -> (Cohort, Owner, Mirror) {
   let home_neighbourhood: Vec<HostId> = (1..=8u64).map(HostId).collect();
-  let home = Cohort::new(HostId(1), &home_neighbourhood, 42, Quorum { f });
+  let home = Cohort::new(
+    HostId(1),
+    &home_neighbourhood,
+    ObjectId::new(HostId(1), 42),
+    Quorum { f },
+  );
   let owner = Owner::bootstrap(&home);
   let mirror_neighbourhood: Vec<HostId> = (101..=108u64).map(HostId).collect();
-  let mirror = Mirror::new(HostId(101), &mirror_neighbourhood, 42, Quorum { f });
+  let mirror = Mirror::new(
+    HostId(101),
+    &mirror_neighbourhood,
+    ObjectId::new(HostId(1), 42),
+    Quorum { f },
+  );
   (home, owner, mirror)
 }
 

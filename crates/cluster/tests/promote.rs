@@ -16,7 +16,7 @@ use rustix::net::{Ipv4Addr, SocketAddrV4};
 use rustls::pki_types::PrivateKeyDer;
 use slates_cluster::{CommitBudget, Promoted, promote_record, serve_promotion};
 use slates_db::register::{
-  Acceptor, Authority, HostEpoch, HostId, Prepare, Quorum, rendezvous_first,
+  Acceptor, Authority, HostEpoch, HostId, ObjectId, Prepare, Quorum, rendezvous_first,
 };
 use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::SimRuntime;
@@ -26,7 +26,7 @@ use slates_transport::handshake::Identity;
 
 const NAME: &str = "slates-node";
 const FRAME_CAP: usize = 16;
-const OBJECT: u64 = 7;
+const OBJECT: ObjectId = ObjectId::new(DEAD, 7);
 // The dead owner D and its two candidate holders (D, H2, H3 at f = 1); H2 held the committed head, H3
 // lagged. After D dies the survivors are {H2, H3}; the configuration named the rendezvous-first of them
 // the new owner.

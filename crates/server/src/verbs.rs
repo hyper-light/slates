@@ -14,6 +14,7 @@ use slates_db::catalog::{
   SizeClass as DbSizeClass, SnapshotId as DbSnapshotId, SnapshotRecord, VolumeId as DbVolumeId,
   VolumeRecord, VolumeState,
 };
+use slates_db::register::ObjectId;
 use slates_ipc::protocol::{
   DaemonReport, Direction, Intent, NamePolicy, PlacedState, Refusal, RefusalCount, ReplyBody,
   RequestBody, Scope, ShardReport, Signal, SizeClass, SnapshotId, StatusReport, VolumeId,
@@ -1328,7 +1329,7 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
         volume: record.id,
         epoch: record.epoch.saturating_add(1),
         identity: None,
-        placed: placement_of(state, to_db_snapshot(id)),
+        placed: placement_of(state, record.id),
         taken_ns: now,
       },
     },
@@ -2433,10 +2434,12 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
   }
 }
 
-/// The placement of a snapshot as the register configuration computes it: at `f = 0` the
-/// owner alone, committed on the local append (§4.8 "Laptop degenerate").
-fn placement_of(state: &ShardState, snapshot: DbSnapshotId) -> PlacementState {
-  let placement = state.config_register.place(snapshot.value);
+/// The placement of a volume's snapshot as the register configuration computes it: at `f = 0` the
+/// owner alone, committed on the local append (§4.8 "Laptop degenerate"). A snapshot places on its
+/// volume's candidate holders, so the placement object is the volume's 128-bit id (whose high half
+/// names the creator host), not the volume-unique snapshot id.
+fn placement_of(state: &ShardState, volume: DbVolumeId) -> PlacementState {
+  let placement = state.config_register.place(ObjectId(volume.bytes));
   if state.config_register.region_placed(&placement) {
     PlacementState::Placed {
       region: placement.acked.iter().map(|h| h.0).collect(),
@@ -2452,17 +2455,10 @@ fn placement_of(state: &ShardState, snapshot: DbSnapshotId) -> PlacementState {
 fn placed_state(state: &ShardState, volume: DbVolumeId, head: DbSnapshotId) -> PlacedState {
   let region = if head == DbSnapshotId::default() {
     // No snapshot yet: the catalog register itself is locally committed, so at `f = 0` the
-    // head is placed (nothing to replicate until a seal).
-    let object = u64::from_be_bytes([
-      volume.bytes[0],
-      volume.bytes[1],
-      volume.bytes[2],
-      volume.bytes[3],
-      volume.bytes[4],
-      volume.bytes[5],
-      volume.bytes[6],
-      volume.bytes[7],
-    ]);
+    // head is placed (nothing to replicate until a seal). The placement object is the volume's full
+    // 128-bit id (its high half names the creator host); the old code truncated it to that high half
+    // alone, so every volume of one creator collided to one placement object — fixed by ObjectId.
+    let object = ObjectId(volume.bytes);
     state
       .config_register
       .region_placed(&state.config_register.place(object))
@@ -2496,7 +2492,9 @@ fn await_placed(
     return forbidden("await_placed");
   }
   let target = snapshot.map_or(record.head, to_db_snapshot);
-  let placement = state.config_register.place(target.value);
+  // The snapshot places on its volume's candidate holders — the placement object is the volume id.
+  let _ = target;
+  let placement = state.config_register.place(ObjectId(volume.bytes));
   let db_scope = match scope {
     Scope::Region => DurabilityScope::Region,
     Scope::Mirror => DurabilityScope::Mirror,

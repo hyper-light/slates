@@ -21,6 +21,56 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HostId(pub u64);
 
+/// A register object's id — the identifier of any register the owner writes (a volume head, a chain
+/// version, a landing lease, a catalog entry): 128 bits whose **high 8 bytes name the creator host**
+/// and whose low 8 bytes are a unique per-creator suffix (§4.8 "Lookup"; the catalog's `VolumeId` is
+/// exactly this shape). It routes by identity — a lookup extracts the creator from the high half and
+/// reaches that owner, or its takeover successor, so no global catalog is needed (D-12, D-14). A bare
+/// `u64` object id was a shortcut: it cannot carry a full 64-bit host id *and* a unique suffix at once,
+/// which would force either a narrowed host space or a translation table — both of which the design
+/// forbids. The bytes are big-endian creator-then-suffix, so the id's natural order groups objects by
+/// creator, and rendezvous placement hashes all 16 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObjectId(pub [u8; 16]);
+
+impl ObjectId {
+  /// An object id from its `creator` host (the high 8 bytes) and a unique per-creator `local` suffix
+  /// (the low 8 bytes), each big-endian so the id sorts by creator then suffix. `const` so a fixed
+  /// object id can be a `const` (the takeover tests name one).
+  pub const fn new(creator: HostId, local: u64) -> ObjectId {
+    let c = creator.0.to_be_bytes();
+    let l = local.to_be_bytes();
+    ObjectId([
+      c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], l[0], l[1], l[2], l[3], l[4], l[5], l[6],
+      l[7],
+    ])
+  }
+
+  /// The creator host named in the high 8 bytes — the id's owner by construction and the routing key a
+  /// lookup extracts (§4.8 "a volume id carries its creator host").
+  pub fn creator(&self) -> HostId {
+    let mut word = [0u8; size_of::<u64>()];
+    word.copy_from_slice(&self.0[..size_of::<u64>()]);
+    HostId(u64::from_be_bytes(word))
+  }
+
+  /// The unique per-creator suffix in the low 8 bytes.
+  pub fn local(&self) -> u64 {
+    let mut word = [0u8; size_of::<u64>()];
+    word.copy_from_slice(&self.0[size_of::<u64>()..]);
+    u64::from_be_bytes(word)
+  }
+}
+
+/// The width of an encoded object id (16 bytes) — its place in every register wire layout.
+const OBJECT_BYTES: usize = size_of::<ObjectId>();
+
+/// Reads an object id from the front of a decode split; the caller has already checked the length, so
+/// a mismatch falls back to the zero id rather than panicking (the hostile-input rule).
+fn object_from(bytes: &[u8]) -> ObjectId {
+  ObjectId(bytes.try_into().unwrap_or([0u8; OBJECT_BYTES]))
+}
+
 /// The fault tolerance and the quorum it fixes: `2f + 1` candidates, a commit at `f + 1`
 /// (§4.8 "one quorum rule"). `f = 0` gives one candidate and a commit of one, the local
 /// append.
@@ -121,7 +171,12 @@ impl Placement {
   /// The placement of an object at the moment its owner holds it and nothing else has yet: at
   /// `f = 0` this already commits (the owner is `f + 1`); at `f > 0` it is `Local` until
   /// holders acknowledge.
-  pub fn local(owner: HostId, quorum: Quorum, neighbourhood: &[HostId], object: u64) -> Placement {
+  pub fn local(
+    owner: HostId,
+    quorum: Quorum,
+    neighbourhood: &[HostId],
+    object: ObjectId,
+  ) -> Placement {
     let candidates = candidates_for(owner, neighbourhood, object, quorum);
     let acked = if quorum.committed(1) {
       vec![owner]
@@ -169,7 +224,7 @@ impl Placement {
 pub fn candidates_for(
   owner: HostId,
   neighbourhood: &[HostId],
-  object: u64,
+  object: ObjectId,
   quorum: Quorum,
 ) -> Vec<HostId> {
   let mut chosen = vec![owner];
@@ -180,7 +235,7 @@ pub fn candidates_for(
   let mut ranked: Vec<(u64, HostId)> = neighbourhood
     .iter()
     .filter(|h| **h != owner)
-    .map(|h| (rendezvous_weight(h.0, object), *h))
+    .map(|h| (rendezvous_weight(h.0, &object), *h))
     .collect();
   // Highest weight first; the host id breaks a tie, so the order is total and stable.
   ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -197,16 +252,32 @@ pub fn candidates_for(
 /// pseudo-random per object and stable across hosts (FNV-1a over the two words; the placement
 /// research calls for a good mixer, and this is replaced by the measured one when placement is
 /// tuned in Phase 8).
-fn rendezvous_weight(host: u64, object: u64) -> u64 {
+fn rendezvous_weight(host: u64, object: &ObjectId) -> u64 {
   /// Format: the FNV-1a 64-bit offset basis (Fowler, Noll, Vo).
   const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
   /// Format: the FNV-1a 64-bit prime.
   const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
   let mut hash = FNV_OFFSET;
-  for byte in host.to_le_bytes().iter().chain(object.to_le_bytes().iter()) {
+  for byte in host.to_le_bytes().iter().chain(object.0.iter()) {
     hash ^= u64::from(*byte);
     hash = hash.wrapping_mul(FNV_PRIME);
   }
+  // Finalize with the MurmurHash3 64-bit avalanche (Appleby's `fmix64`), so a difference in the last
+  // byte fed — an object id whose creator half is constant and whose suffix differs by one low byte —
+  // still reorders the ranking. Without it, plain FNV-1a leaves the last byte with no post-mixing, and
+  // rendezvous collapses (every such object picks the same holder). The three shift/multiply steps are
+  // the published fmix64 constants.
+  /// Format: MurmurHash3 `fmix64` first multiplier (Austin Appleby, public domain).
+  const FMIX_A: u64 = 0xff51_afd7_ed55_8ccd;
+  /// Format: MurmurHash3 `fmix64` second multiplier (Austin Appleby, public domain).
+  const FMIX_B: u64 = 0xc4ce_b9fe_1a85_ec53;
+  /// Format: MurmurHash3 `fmix64` shift distance (Austin Appleby, public domain).
+  const FMIX_SHIFT: u32 = 33;
+  hash ^= hash >> FMIX_SHIFT;
+  hash = hash.wrapping_mul(FMIX_A);
+  hash ^= hash >> FMIX_SHIFT;
+  hash = hash.wrapping_mul(FMIX_B);
+  hash ^= hash >> FMIX_SHIFT;
   hash
 }
 
@@ -215,10 +286,10 @@ fn rendezvous_weight(host: u64, object: u64) -> u64 {
 /// the owner). `None` if `hosts` is empty. Takeover assigns a dead owner's object to this survivor of
 /// its neighbourhood (§4.8 "Promotion and takeover"; the worked example's "rendezvous ranks first
 /// among {B, C, D}").
-pub fn rendezvous_first(hosts: &[HostId], object: u64) -> Option<HostId> {
+pub fn rendezvous_first(hosts: &[HostId], object: ObjectId) -> Option<HostId> {
   let mut ranked: Vec<(u64, HostId)> = hosts
     .iter()
-    .map(|host| (rendezvous_weight(host.0, object), *host))
+    .map(|host| (rendezvous_weight(host.0, &object), *host))
     .collect();
   ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
   ranked.first().map(|(_, host)| *host)
@@ -270,7 +341,7 @@ pub struct Record {
   /// The authorized owner writing this record; a holder refuses one from an unauthorized principal.
   pub owner: HostId,
   /// The object (volume head, chain, lease, catalog entry) this record belongs to.
-  pub object: u64,
+  pub object: ObjectId,
   /// The ledger position within the object (monotonic per owner; a committed position is never
   /// rewritten with a different value).
   pub sequence: u64,
@@ -283,9 +354,10 @@ pub struct Record {
 }
 
 /// The fixed prefix of an encoded record: the five header words then the value's length.
-/// Format: §4.8 record layout — `owner`, `object`, `sequence`, `epoch`, `generation` (each u64 LE),
-/// `value_len` (u32 LE), then the value bytes; a record is MTU-shippable, so the length is a `u32`.
-const RECORD_PREFIX_BYTES: usize = 5 * size_of::<u64>() + size_of::<u32>();
+/// Format: §4.8 record layout — `owner` (u64 LE), `object` (16 bytes), `sequence`, `epoch`,
+/// `generation` (each u64 LE), `value_len` (u32 LE), then the value bytes; a record is MTU-shippable,
+/// so the length is a `u32`.
+const RECORD_PREFIX_BYTES: usize = 4 * size_of::<u64>() + OBJECT_BYTES + size_of::<u32>();
 
 impl Record {
   /// The canonical bytes: the five header words, the value length, the value — little-endian
@@ -293,7 +365,7 @@ impl Record {
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::with_capacity(RECORD_PREFIX_BYTES + self.value.len());
     out.extend_from_slice(&self.owner.0.to_le_bytes());
-    out.extend_from_slice(&self.object.to_le_bytes());
+    out.extend_from_slice(&self.object.0);
     out.extend_from_slice(&self.sequence.to_le_bytes());
     out.extend_from_slice(&self.epoch.0.to_le_bytes());
     out.extend_from_slice(&self.generation.to_le_bytes());
@@ -312,7 +384,7 @@ impl Record {
     }
     let word = |slice: &[u8]| u64::from_le_bytes(slice.try_into().unwrap_or([0; 8]));
     let (owner_bytes, rest) = bytes.split_at(size_of::<u64>());
-    let (object_bytes, rest) = rest.split_at(size_of::<u64>());
+    let (object_bytes, rest) = rest.split_at(OBJECT_BYTES);
     let (sequence_bytes, rest) = rest.split_at(size_of::<u64>());
     let (epoch_bytes, rest) = rest.split_at(size_of::<u64>());
     let (generation_bytes, rest) = rest.split_at(size_of::<u64>());
@@ -324,7 +396,7 @@ impl Record {
     }
     Ok(Record {
       owner: HostId(word(owner_bytes)),
-      object: word(object_bytes),
+      object: object_from(object_bytes),
       sequence: word(sequence_bytes),
       epoch: HostEpoch(word(epoch_bytes)),
       generation: word(generation_bytes),
@@ -361,7 +433,7 @@ pub struct Ack {
   /// The holder that accepted and stored the record.
   pub holder: HostId,
   /// The object the record belongs to.
-  pub object: u64,
+  pub object: ObjectId,
   /// The ledger position accepted.
   pub sequence: u64,
   /// The generation it was accepted under.
@@ -371,9 +443,9 @@ pub struct Ack {
 }
 
 /// An acknowledgement's fixed wire size.
-/// Format: four u64 header words (holder, object, sequence, generation) then the 32-byte BLAKE3
-/// identity — 64 bytes.
-const ACK_BYTES: usize = 4 * size_of::<u64>() + 32;
+/// Format: `holder` (u64 LE), `object` (16 bytes), `sequence`, `generation` (each u64 LE), then the
+/// 32-byte BLAKE3 identity.
+const ACK_BYTES: usize = 3 * size_of::<u64>() + OBJECT_BYTES + 32;
 
 impl Ack {
   /// Whether this acknowledgement is for `record` — the position, generation and identity all match.
@@ -389,7 +461,7 @@ impl Ack {
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::with_capacity(ACK_BYTES);
     out.extend_from_slice(&self.holder.0.to_le_bytes());
-    out.extend_from_slice(&self.object.to_le_bytes());
+    out.extend_from_slice(&self.object.0);
     out.extend_from_slice(&self.sequence.to_le_bytes());
     out.extend_from_slice(&self.generation.to_le_bytes());
     out.extend_from_slice(&self.identity);
@@ -404,14 +476,14 @@ impl Ack {
     }
     let word = |slice: &[u8]| u64::from_le_bytes(slice.try_into().unwrap_or([0; 8]));
     let (holder_bytes, rest) = bytes.split_at(size_of::<u64>());
-    let (object_bytes, rest) = rest.split_at(size_of::<u64>());
+    let (object_bytes, rest) = rest.split_at(OBJECT_BYTES);
     let (sequence_bytes, rest) = rest.split_at(size_of::<u64>());
     let (generation_bytes, identity_bytes) = rest.split_at(size_of::<u64>());
     let mut identity = [0u8; 32];
     identity.copy_from_slice(identity_bytes);
     Ok(Ack {
       holder: HostId(word(holder_bytes)),
-      object: word(object_bytes),
+      object: object_from(object_bytes),
       sequence: word(sequence_bytes),
       generation: word(generation_bytes),
       identity,
@@ -456,7 +528,7 @@ pub struct Prepare {
   /// The new owner (the surviving candidate the configuration named) running phase one.
   pub owner: HostId,
   /// The object being taken over.
-  pub object: u64,
+  pub object: ObjectId,
   /// The new (bumped) epoch the new owner will serve under — the ballot the holder promises.
   pub epoch: HostEpoch,
   /// The configuration generation the takeover is under; a holder under a different one refuses.
@@ -464,15 +536,15 @@ pub struct Prepare {
 }
 
 /// A prepare's fixed wire size.
-/// Format: four u64 header words — owner, object, epoch, generation, little-endian.
-const PREPARE_BYTES: usize = 4 * size_of::<u64>();
+/// Format: `owner` (u64 LE), `object` (16 bytes), `epoch`, `generation` (each u64 LE).
+const PREPARE_BYTES: usize = 3 * size_of::<u64>() + OBJECT_BYTES;
 
 impl Prepare {
   /// The canonical bytes: owner, object, epoch, generation, each little-endian.
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::with_capacity(PREPARE_BYTES);
     out.extend_from_slice(&self.owner.0.to_le_bytes());
-    out.extend_from_slice(&self.object.to_le_bytes());
+    out.extend_from_slice(&self.object.0);
     out.extend_from_slice(&self.epoch.0.to_le_bytes());
     out.extend_from_slice(&self.generation.to_le_bytes());
     out
@@ -486,11 +558,11 @@ impl Prepare {
     }
     let word = |slice: &[u8]| u64::from_le_bytes(slice.try_into().unwrap_or([0; 8]));
     let (owner_bytes, rest) = bytes.split_at(size_of::<u64>());
-    let (object_bytes, rest) = rest.split_at(size_of::<u64>());
+    let (object_bytes, rest) = rest.split_at(OBJECT_BYTES);
     let (epoch_bytes, generation_bytes) = rest.split_at(size_of::<u64>());
     Ok(Prepare {
       owner: HostId(word(owner_bytes)),
-      object: word(object_bytes),
+      object: object_from(object_bytes),
       epoch: HostEpoch(word(epoch_bytes)),
       generation: word(generation_bytes),
     })
@@ -508,7 +580,7 @@ pub struct Promise {
   /// The holder that raised its fence and reports its highest record.
   pub holder: HostId,
   /// The object the promise is for.
-  pub object: u64,
+  pub object: ObjectId,
   /// The epoch the holder promised (echoes the prepare's epoch).
   pub epoch: HostEpoch,
   /// The generation the holder is serving under.
@@ -517,11 +589,11 @@ pub struct Promise {
   pub highest: Option<Accepted>,
 }
 
-/// A promise's fixed prefix: holder, object, epoch, generation (each u64 LE), then a one-byte flag
-/// (whether a highest record follows); a present record adds its sequence and epoch (u64 LE), its
-/// value length (u32 LE) and the value bytes.
+/// A promise's fixed prefix: holder (u64 LE), object (16 bytes), epoch, generation (each u64 LE), then
+/// a one-byte flag (whether a highest record follows); a present record adds its sequence and epoch
+/// (u64 LE), its value length (u32 LE) and the value bytes.
 /// Format: §4.8 promise layout; a record is MTU-shippable, so the value length is a `u32`.
-const PROMISE_PREFIX_BYTES: usize = 4 * size_of::<u64>() + 1;
+const PROMISE_PREFIX_BYTES: usize = 3 * size_of::<u64>() + OBJECT_BYTES + 1;
 /// Format: the promise flag values — no highest record, or one follows.
 const PROMISE_NONE: u8 = 0;
 /// Format: a highest record follows the flag.
@@ -540,7 +612,7 @@ impl Promise {
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::with_capacity(PROMISE_PREFIX_BYTES);
     out.extend_from_slice(&self.holder.0.to_le_bytes());
-    out.extend_from_slice(&self.object.to_le_bytes());
+    out.extend_from_slice(&self.object.0);
     out.extend_from_slice(&self.epoch.0.to_le_bytes());
     out.extend_from_slice(&self.generation.to_le_bytes());
     match &self.highest {
@@ -566,7 +638,7 @@ impl Promise {
     }
     let word = |slice: &[u8]| u64::from_le_bytes(slice.try_into().unwrap_or([0; 8]));
     let (holder_bytes, rest) = bytes.split_at(size_of::<u64>());
-    let (object_bytes, rest) = rest.split_at(size_of::<u64>());
+    let (object_bytes, rest) = rest.split_at(OBJECT_BYTES);
     let (epoch_bytes, rest) = rest.split_at(size_of::<u64>());
     let (generation_bytes, rest) = rest.split_at(size_of::<u64>());
     let (&flag, rest) = rest.split_first().unwrap_or((&PROMISE_NONE, &[]));
@@ -601,7 +673,7 @@ impl Promise {
     };
     Ok(Promise {
       holder: HostId(word(holder_bytes)),
-      object: word(object_bytes),
+      object: object_from(object_bytes),
       epoch: HostEpoch(word(epoch_bytes)),
       generation: word(generation_bytes),
       highest,
@@ -620,11 +692,11 @@ pub struct Acceptor {
   id: HostId,
   authority: Authority,
   fence: Fence,
-  accepted: std::collections::BTreeMap<(u64, u64), (HostEpoch, Vec<u8>)>,
+  accepted: std::collections::BTreeMap<(ObjectId, u64), (HostEpoch, Vec<u8>)>,
 }
 
 /// A holder's durable accepted positions, for recovery: `(object, sequence, epoch, value)` per entry.
-pub type AcceptedPositions = Vec<(u64, u64, HostEpoch, Vec<u8>)>;
+pub type AcceptedPositions = Vec<(ObjectId, u64, HostEpoch, Vec<u8>)>;
 
 impl Acceptor {
   /// A fresh acceptor for holder `id` serving under `authority`, having accepted nothing.
@@ -952,7 +1024,7 @@ impl Configuration {
   }
 
   /// The placement an object takes when the owner first holds it (`Placement::local`).
-  pub fn place(&self, object: u64) -> Placement {
+  pub fn place(&self, object: ObjectId) -> Placement {
     Placement::local(self.owner, self.quorum, &self.neighbourhood, object)
   }
 
@@ -995,7 +1067,9 @@ mod tests {
   ) -> Record {
     Record {
       owner: config.owner,
-      object,
+      // The object id carries its creator (the owner) in its high half; the `object` argument is the
+      // per-creator suffix, so a test names an object by a small number as before.
+      object: ObjectId::new(config.owner, object),
       sequence,
       epoch,
       generation: config.version,
@@ -1008,7 +1082,13 @@ mod tests {
   /// placement observed. The owner's holder is local; peers are distinct logical holders — the same
   /// code at f=0 (one holder) and f=1 (three).
   fn write(config: &Configuration, object: u64, epoch: HostEpoch) -> Placement {
-    let candidates = candidates_for(config.owner, &config.neighbourhood, object, config.quorum);
+    let object_id = ObjectId::new(config.owner, object);
+    let candidates = candidates_for(
+      config.owner,
+      &config.neighbourhood,
+      object_id,
+      config.quorum,
+    );
     let authority = Authority {
       generation: config.version,
       owner: config.owner,
@@ -1106,7 +1186,7 @@ mod tests {
   fn a_record_round_trips_and_refuses_malformation() {
     let record = Record {
       owner: HostId(1),
-      object: 2,
+      object: ObjectId::new(HostId(1), 2),
       sequence: 3,
       epoch: HostEpoch(4),
       generation: 5,
@@ -1115,9 +1195,12 @@ mod tests {
     let bytes = record.encode();
     assert_eq!(Record::decode(&bytes), Ok(record.clone()), "round-trip");
 
-    // Golden: owner, object, sequence, epoch, generation (each 8 LE), value_len (4 LE), value.
+    // Golden: owner (8 LE), object (16: creator then suffix, big-endian), sequence, epoch,
+    // generation (each 8 LE), value_len (4 LE), value.
     let mut golden = Vec::new();
-    for word in [1u64, 2, 3, 4, 5] {
+    golden.extend_from_slice(&1u64.to_le_bytes());
+    golden.extend_from_slice(&ObjectId::new(HostId(1), 2).0);
+    for word in [3u64, 4, 5] {
       golden.extend_from_slice(&word.to_le_bytes());
     }
     golden.extend_from_slice(&1u32.to_le_bytes());
@@ -1149,7 +1232,7 @@ mod tests {
     let candidates = vec![owner, HostId(2), HostId(3)];
     let record = Record {
       owner,
-      object: 9,
+      object: ObjectId::new(HostId(1), 9),
       sequence: 0,
       epoch: HostEpoch(5),
       generation,
@@ -1193,7 +1276,7 @@ mod tests {
     let candidates = vec![owner, HostId(2), HostId(3)];
     let record = Record {
       owner,
-      object: 9,
+      object: ObjectId::new(HostId(1), 9),
       sequence: 0,
       epoch: HostEpoch(5),
       generation,
@@ -1201,7 +1284,7 @@ mod tests {
     };
     let good_ack = Ack {
       holder: owner,
-      object: 9,
+      object: ObjectId::new(HostId(1), 9),
       sequence: 0,
       generation,
       identity: record.identity(),
@@ -1257,7 +1340,7 @@ mod tests {
 
     let foreign_owner = Record {
       owner: HostId(42),
-      object: 1,
+      object: ObjectId::new(HostId(1), 1),
       sequence: 0,
       epoch: HostEpoch(1),
       generation: 7,
@@ -1270,7 +1353,7 @@ mod tests {
 
     let foreign_generation = Record {
       owner,
-      object: 1,
+      object: ObjectId::new(HostId(1), 1),
       sequence: 0,
       epoch: HostEpoch(1),
       generation: 6,
@@ -1295,7 +1378,7 @@ mod tests {
     let mut acceptor = Acceptor::new(HostId(2), authority);
     let record = Record {
       owner,
-      object: 5,
+      object: ObjectId::new(HostId(1), 5),
       sequence: 0,
       epoch: HostEpoch(3),
       generation: 0,
@@ -1341,7 +1424,7 @@ mod tests {
   #[test]
   fn await_placed_returns_for_the_region_and_refuses_the_absent_mirror() {
     let config = Configuration::solo(HostId(1));
-    let placement = config.place(42);
+    let placement = config.place(ObjectId::new(config.owner, 42));
     assert_eq!(
       config.await_placed(DurabilityScope::Region, &placement),
       Ok(true),
@@ -1364,7 +1447,8 @@ mod tests {
     let neigh = vec![owner, HostId(2), HostId(3), HostId(4), HostId(5)];
     let quorum = Quorum { f: 2 };
     let mut seconds = std::collections::BTreeSet::new();
-    for object in 0..256u64 {
+    for local in 0..256u64 {
+      let object = ObjectId::new(owner, local);
       let a = candidates_for(owner, &neigh, object, quorum);
       let b = candidates_for(owner, &neigh, object, quorum);
       assert_eq!(a, b, "deterministic");
@@ -1384,7 +1468,7 @@ mod tests {
   #[test]
   fn rendezvous_first_is_deterministic_spreads_and_matches_the_candidate_ranking() {
     assert_eq!(
-      rendezvous_first(&[], 42),
+      rendezvous_first(&[], ObjectId::new(HostId(1), 42)),
       None,
       "an empty survivor set has no successor"
     );
@@ -1394,7 +1478,8 @@ mod tests {
     let survivors: Vec<HostId> = neigh.iter().copied().filter(|h| *h != owner).collect();
     let quorum = Quorum { f: 2 };
     let mut winners = std::collections::BTreeSet::new();
-    for object in 0..256u64 {
+    for local in 0..256u64 {
+      let object = ObjectId::new(owner, local);
       let first = rendezvous_first(&survivors, object).expect("a survivor");
       assert_eq!(
         rendezvous_first(&survivors, object),
@@ -1420,7 +1505,7 @@ mod tests {
   /// generation 0, under the original owner D on candidates {D, H2, H3} at f=1, held by the commit
   /// quorum {D, H2}; H3 lags (it never received the head), so a promotion must recover the head from
   /// the quorum, not assume every candidate has it.
-  const TAKEOVER_OBJECT: u64 = 9;
+  const TAKEOVER_OBJECT: ObjectId = ObjectId::new(HostId(1), 9);
 
   /// Builds the committed-head state a takeover inherits: the original owner D and the two candidate
   /// holders, with the head "v1" committed to {D, H2} under epoch 1, generation 0. Returns
@@ -1460,7 +1545,7 @@ mod tests {
   fn prepare_and_promise_round_trip_and_refuse_hostile_bytes() {
     let prepare = Prepare {
       owner: HostId(7),
-      object: 0x1234,
+      object: ObjectId::new(HostId(1), 0x1234),
       epoch: HostEpoch(3),
       generation: 2,
     };
@@ -1477,7 +1562,7 @@ mod tests {
 
     let with_record = Promise {
       holder: HostId(2),
-      object: 0x1234,
+      object: ObjectId::new(HostId(1), 0x1234),
       epoch: HostEpoch(3),
       generation: 2,
       highest: Some(Accepted {
