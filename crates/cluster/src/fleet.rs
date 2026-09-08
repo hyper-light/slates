@@ -31,10 +31,12 @@
 //!
 //! Those are transport- and server-layer pieces; this authority core is confirmable on its own.
 
-use slates_db::register::{Acceptor, Authority, Configuration, HostId, Quorum};
+use slates_db::register::{Acceptor, Authority, Configuration, HostId, Quorum, Record};
+use slates_transport::endpoint::Endpoint;
 
 use crate::config_group::{ConfigGroup, Reconfiguration};
 use crate::membership::{Liveness, MemberState, Membership};
+use crate::{CommitBudget, Committed, commit_under_configuration};
 
 /// The owner runtime on one node: the SWIM view, the configuration authority, and the owner's own
 /// register acceptor, composed and kept in step. Built at a fault tolerance (`f = 0` is the laptop);
@@ -153,6 +155,34 @@ impl FleetNode {
       let _ = self.acceptor.install_authority(authority);
     }
     changed
+  }
+
+  /// Commits one of this node's own heads through the register path under the current authority — the
+  /// owner runtime's write operation (§4.8 "records are sent to all candidates; committed at `f + 1`").
+  /// The owner holds the record locally through its own acceptor; each `remote_holder` (a connected
+  /// [`Endpoint`] per remaining candidate) is shipped it concurrently, and the commit places at `f + 1`
+  /// distinct acknowledgements or reports uncertain at the deadline — the [`commit_under_configuration`]
+  /// dispatch, driven against *this* node's configuration and acceptor so authority and dispatch cannot
+  /// diverge. At `f = 0` the local hold is the commit, no dispatch, the same code path (R8).
+  ///
+  /// This borrows the configuration (`&self.group`) and the acceptor (`&mut self.acceptor`) — disjoint
+  /// fields — so no clone is needed on the write path; the configuration is read, not copied, per
+  /// commit. The caller supplies the connected candidate holders (the live probe/gossip loop that keeps
+  /// them connected is owed) and the derived budget.
+  pub async fn commit_head(
+    &mut self,
+    record: &Record,
+    remote_holders: Vec<(HostId, Endpoint)>,
+    budget: CommitBudget,
+  ) -> Committed {
+    commit_under_configuration(
+      self.group.configuration(),
+      record,
+      &mut self.acceptor,
+      remote_holders,
+      budget,
+    )
+    .await
   }
 }
 
