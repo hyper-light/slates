@@ -129,6 +129,62 @@ impl Buddy {
     })
   }
 
+  /// Marks a specific, currently-free block allocated — the recovery re-seed (§4.8 content
+  /// recovery). A restarted daemon rebuilds a fresh allocator over the recovered content object,
+  /// which believes the whole region is free; before it serves anything it reserves every extent
+  /// the recovered metadata still references, so it never hands out a range that still holds a
+  /// snapshot's bytes. `block` is an aligned power-of-two block as `alloc` returns (a recovered
+  /// extent is exactly that). Refuses (`bad_block`) a misaligned block, or one not wholly free
+  /// (already reserved, so a double-reserve of the same extent is a typed refusal, not corruption).
+  pub fn reserve(&mut self, block: Block) -> Result<(), MemError> {
+    let target = self.order_for(block.len)?;
+    let index = u32::try_from(block.offset / self.granule).map_err(|_| bad_block(block))?;
+    // The block must sit at a target-order boundary, as every `alloc`ed block does.
+    if index & ((1u32 << target) - 1) != 0 {
+      return Err(bad_block(block));
+    }
+    // Find the free block that contains `index`: for each order from the target up, the
+    // order-aligned base of a free block of exactly that order is the enclosing block.
+    let mut base = index;
+    let mut order = target;
+    let found = loop {
+      let head = self
+        .state
+        .get(usize::try_from(base).unwrap_or(usize::MAX))
+        .copied()
+        .unwrap_or(INSIDE);
+      if head & FREE_BIT != 0 && u32::from(head & ORDER_MASK) == order {
+        break true;
+      }
+      if order >= self.max_order {
+        break false;
+      }
+      order += 1;
+      base = index & !((1u32 << order) - 1);
+    };
+    if !found {
+      return Err(bad_block(block));
+    }
+    // Split the enclosing free block down to the target order at `index`, freeing the half that
+    // does not contain `index` at each step (the mirror of `alloc`'s split, aimed at `index`).
+    self.unlink(base, order);
+    while order > target {
+      order -= 1;
+      let upper = base + (1u32 << order);
+      if index >= upper {
+        self.mark(base, order, true);
+        self.link(base, order);
+        base = upper;
+      } else {
+        self.mark(upper, order, true);
+        self.link(upper, order);
+      }
+    }
+    self.mark(index, target, false);
+    self.free_bytes -= (1usize << target).saturating_mul(self.granule);
+    Ok(())
+  }
+
   /// Frees a block previously returned by `alloc`, coalescing with free buddies.
   pub fn free(&mut self, block: Block) -> Result<(), MemError> {
     let index = u32::try_from(block.offset / self.granule).map_err(|_| bad_block(block))?;
@@ -299,5 +355,117 @@ mod tests {
       b.region_bytes(),
       "the full region is one block again"
     );
+  }
+
+  /// reserve marks a specific block allocated, refuses a double-reserve and a misaligned block, and
+  /// a reserved block frees back cleanly (§4.8 recovery re-seed). Do X, expect Y.
+  #[test]
+  fn reserve_marks_a_block_allocated_and_refuses_bad_input() {
+    let mut b = Buddy::new(4096, 4); // 16 granules = 64 KiB
+    let target = Block {
+      offset: 8192,
+      len: 4096,
+    };
+    b.reserve(target).unwrap();
+    assert_eq!(b.free_bytes(), 65_536 - 4096);
+    // A double-reserve of the same extent is a typed refusal, never silent corruption.
+    assert!(b.reserve(target).is_err(), "double reserve is refused");
+    // Every later allocation stays clear of the reserved block.
+    let mut live = vec![target];
+    for _ in 0..10 {
+      if let Ok(block) = b.alloc(4096) {
+        for other in &live {
+          let disjoint =
+            block.offset + block.len <= other.offset || other.offset + other.len <= block.offset;
+          assert!(disjoint, "{block:?} overlaps reserved {other:?}");
+        }
+        live.push(block);
+      }
+    }
+    // A reserved block frees back and coalesces to the whole region.
+    let mut fresh = Buddy::new(4096, 4);
+    fresh.reserve(target).unwrap();
+    fresh.free(target).unwrap();
+    assert_eq!(
+      fresh.largest_free(),
+      65_536,
+      "free after reserve coalesces back"
+    );
+    // A misaligned block is refused (index 1 is not order-1 aligned).
+    let mut other = Buddy::new(4096, 4);
+    assert!(
+      other
+        .reserve(Block {
+          offset: 4096,
+          len: 8192,
+        })
+        .is_err(),
+      "a misaligned reserve is refused"
+    );
+  }
+
+  /// The recovery-equivalence oracle (§4.8): a fresh allocator re-seeded by reserving exactly the
+  /// live extents of a prior allocator matches it — same free bytes — and never hands out a live
+  /// extent afterward, so recovered content is never overwritten. Do X, expect Y over a random
+  /// history.
+  /// Whether two blocks occupy disjoint byte ranges.
+  fn blocks_disjoint(a: Block, b: Block) -> bool {
+    a.offset + a.len <= b.offset || b.offset + b.len <= a.offset
+  }
+
+  /// Takes a fresh allocator through a random alloc/free history and returns its live set.
+  fn random_live_set(
+    b: &mut Buddy,
+    rng: &mut Xorshift,
+    granule: usize,
+    steps: usize,
+  ) -> Vec<Block> {
+    let mut live: Vec<Block> = Vec::new();
+    for _ in 0..steps {
+      if live.is_empty() || rng.below(3) != 0 {
+        let len = (rng.below(20) + 1) * granule * (1 << rng.below(4));
+        if let Ok(block) = b.alloc(len) {
+          live.push(block);
+        }
+      } else {
+        let block = live.swap_remove(rng.below(live.len()));
+        b.free(block).unwrap();
+      }
+    }
+    live
+  }
+
+  #[test]
+  fn reserve_reconstructs_the_allocator_state_for_recovery() {
+    let granule = 256;
+    let max_order = 10; // 1024 granules
+    // A "pre-restart" allocator taken through a random alloc/free history to a live set.
+    let mut original = Buddy::new(granule, max_order);
+    let mut rng = Xorshift::new(Xorshift::SEED);
+    let live = random_live_set(&mut original, &mut rng, granule, 2_000);
+    // Recovery: a fresh allocator over the same region, re-seeded by reserving every live extent
+    // (in arbitrary order, as recovery replays them).
+    let mut recovered = Buddy::new(granule, max_order);
+    for block in &live {
+      recovered.reserve(*block).unwrap();
+    }
+    let used: usize = live.iter().map(|x| x.len).sum();
+    assert_eq!(
+      recovered.free_bytes(),
+      original.free_bytes(),
+      "the re-seeded allocator has the same free bytes as the original"
+    );
+    assert_eq!(recovered.free_bytes() + used, recovered.region_bytes());
+    // A post-recovery allocation is disjoint from every live extent.
+    for _ in 0..500 {
+      if let Ok(block) = recovered.alloc((rng.below(20) + 1) * granule) {
+        for other in &live {
+          assert!(
+            blocks_disjoint(block, *other),
+            "post-recovery {block:?} overlaps live content {other:?}"
+          );
+        }
+      }
+    }
   }
 }
