@@ -92,6 +92,26 @@ impl Cluster {
     }
   }
 
+  /// Runs a pre-election for `candidate` (Raft §9.6): it asks each reachable peer for a pre-vote and,
+  /// only if a majority would grant, starts a real election. Returns whether a real election started.
+  fn attempt_pre_election(&mut self, candidate: HostId, reachable: &BTreeSet<HostId>) -> bool {
+    let pre_votes = self.at(candidate).on_election_timeout();
+    let Some(pre_vote) = pre_votes.first().copied() else {
+      return self.at(candidate).is_leader(); // a lone voter goes straight to leading
+    };
+    let mut started_real = false;
+    for other in self.others(candidate) {
+      if !reachable.contains(&other) {
+        continue;
+      }
+      let reply = self.at(other).on_pre_vote(pre_vote);
+      if self.at(candidate).on_pre_vote_reply(reply).is_some() {
+        started_real = true;
+      }
+    }
+    started_real
+  }
+
   /// Election Safety: no two nodes are leaders of the same term.
   fn assert_at_most_one_leader_per_term(&self) {
     let mut terms = BTreeSet::new();
@@ -241,4 +261,40 @@ fn a_behind_candidate_cannot_win() {
     "a candidate behind on its log cannot gather a majority"
   );
   cluster.assert_at_most_one_leader_per_term();
+}
+
+/// PreVote anti-disruption (Raft §9.6): a partitioned node that rejoins cannot disturb a healthy leader.
+/// Its pre-votes are refused — by the leader itself and by a follower still hearing from the leader — so
+/// it never starts a real election, its term never inflates, and the leader is not forced to step down.
+#[test]
+fn a_rejoining_partitioned_node_does_not_disrupt_a_healthy_leader() {
+  let mut cluster = Cluster::new(3);
+  let c = HostId(3);
+
+  // A leads and heartbeats everyone, so B has heard from a current leader.
+  cluster.elect(A, &all(3));
+  cluster.replicate(A, &all(3));
+  assert!(cluster.at(A).is_leader());
+  let leader_term = cluster.at(A).term();
+
+  // C runs a pre-election on rejoin; the leader (A) and the follower with a live leader (B) both refuse.
+  let started_real = cluster.attempt_pre_election(c, &all(3));
+  assert!(
+    !started_real,
+    "the pre-vote is refused, so no real election starts"
+  );
+  assert_eq!(
+    cluster.at(c).term(),
+    leader_term,
+    "C's term does not inflate — the anti-disruption"
+  );
+  assert!(
+    cluster.at(A).is_leader(),
+    "the healthy leader is undisturbed"
+  );
+  assert_eq!(
+    cluster.at(A).term(),
+    leader_term,
+    "and its term is unchanged"
+  );
 }
