@@ -182,6 +182,7 @@ fn run_commit(serve: [bool; 2]) -> Result<Placement, String> {
         },
       )
       .await
+      .outcome
       .map_err(|e: ClusterError| e.to_string());
       let _ = result_tx.send(outcome);
     })
@@ -216,6 +217,7 @@ fn f0_commits_locally_with_no_dispatch() {
         },
       )
       .await
+      .outcome
       .map_err(|e: ClusterError| e.to_string());
       let _ = tx.send(outcome);
     })
@@ -269,4 +271,127 @@ fn insufficient_acknowledgements_do_not_place() {
     ),
     Ok(placement) => panic!("a sub-quorum commit must not place: {placement:?}"),
   }
+}
+
+/// AC (acceptance history 4): a retry of the same record **reuses the connection** — the second commit
+/// runs on the endpoint handed back by the first, so the connection's packet numbers advance across the
+/// retry (never restart), and the holder acknowledges the same record identity idempotently (§4.8 "a
+/// retry preserves record identity"). Both commits place. One owner, one serving holder, one connection.
+#[test]
+fn a_retry_reuses_the_connection_with_advancing_packet_numbers() {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+
+  let owner_identity = self_signed(NAME);
+  let owner_cert = owner_identity.certificate();
+  let holder_identity = self_signed(NAME);
+  let holder_cert = holder_identity.certificate();
+
+  let (owner_port_tx, owner_port_rx) = channel::<u16>();
+  let (holder_port_tx, holder_port_rx) = channel::<u16>();
+  let (result_tx, result_rx) = channel();
+
+  // The holder serves the same record twice, on one connection and one persistent acceptor.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = holder_port_tx.send(socket.local_addr().unwrap().port());
+      let owner_port = recv_port(owner_port_rx).await;
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, owner_port);
+      let mut endpoint = Endpoint::server(
+        socket,
+        peer,
+        &holder_identity,
+        std::slice::from_ref(&owner_cert),
+        FRAME_CAP,
+      )
+      .unwrap();
+      endpoint.establish().await.unwrap();
+      let mut acceptor = Acceptor::new(HostId(2), authority());
+      serve_record(&mut endpoint, &mut acceptor).await.unwrap();
+      serve_record(&mut endpoint, &mut acceptor).await.unwrap();
+    })
+    .unwrap();
+
+  // The owner commits the same record twice, reusing the endpoint the first commit hands back.
+  sim
+    .spawn_on(id, async move {
+      let outcome = async {
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let _ = owner_port_tx.send(socket.local_addr().unwrap().port());
+        let holder_port = recv_port(holder_port_rx).await;
+        let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, holder_port);
+        let mut endpoint =
+          Endpoint::client(socket, peer, &owner_identity, &holder_cert, NAME, FRAME_CAP)
+            .map_err(|e| format!("{e:?}"))?;
+        endpoint.establish().await.map_err(|e| format!("{e:?}"))?;
+
+        let mut owner_acceptor = Acceptor::new(OWNER, authority());
+        let candidates = [OWNER, HostId(2), HostId(3)];
+        let budget = CommitBudget {
+          deadline_ns: DEADLINE_NS,
+          poll_interval_ns: POLL_NS,
+        };
+        let rec = record(b"head@v1");
+
+        let first = commit_record(
+          OWNER,
+          &mut owner_acceptor,
+          &candidates,
+          &rec,
+          Quorum { f: 1 },
+          vec![(HostId(2), endpoint)],
+          budget,
+        )
+        .await;
+        let placed_1 = first
+          .outcome
+          .map_err(|e| e.to_string())?
+          .placed(Quorum { f: 1 });
+        let pn_after_1 = first
+          .reusable
+          .first()
+          .map(|(_, ep)| ep.tx_packet_number())
+          .ok_or("the holder connection was not returned for reuse")?;
+
+        // Retry the same record, reusing the connection.
+        let second = commit_record(
+          OWNER,
+          &mut owner_acceptor,
+          &candidates,
+          &rec,
+          Quorum { f: 1 },
+          first.reusable,
+          budget,
+        )
+        .await;
+        let placed_2 = second
+          .outcome
+          .map_err(|e| e.to_string())?
+          .placed(Quorum { f: 1 });
+        let pn_after_2 = second
+          .reusable
+          .first()
+          .map(|(_, ep)| ep.tx_packet_number())
+          .ok_or("the reused connection was not returned again")?;
+
+        Ok::<_, String>((placed_1, placed_2, pn_after_1, pn_after_2))
+      }
+      .await;
+      let _ = result_tx.send(outcome);
+    })
+    .unwrap();
+
+  sim.run_until_idle();
+  let (placed_1, placed_2, pn_1, pn_2) =
+    result_rx.try_recv().unwrap().expect("the retry completed");
+  assert!(placed_1, "the first commit placed");
+  assert!(
+    placed_2,
+    "the retry placed (the holder acknowledged the same record idempotently)"
+  );
+  assert!(
+    pn_2 > pn_1,
+    "the reused connection's packet numbers advanced across the retry ({pn_1} -> {pn_2}), never reset"
+  );
 }
