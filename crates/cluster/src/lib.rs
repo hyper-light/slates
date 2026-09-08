@@ -23,8 +23,13 @@
 //!
 //! Membership ([`membership`]): the SWIM/Lifeguard failure-detection view that maintains which hosts
 //! are alive — the neighbourhood the configuration and placement draw from — and the [`detector`]
-//! protocol-period machine that probes members and drives that view alive → suspect → dead.
+//! protocol-period machine that probes members and drives that view alive → suspect → dead. The
+//! configuration group ([`config_group`]) turns that view into the versioned
+//! [`Configuration`](slates_db::register::Configuration) each request carries: it reconciles the
+//! neighbourhood to the alive membership, advancing the version so a stale request is refused (the
+//! `f = 0` degenerate of the fleet consensus, which is owed).
 
+pub mod config_group;
 pub mod detector;
 pub mod membership;
 
