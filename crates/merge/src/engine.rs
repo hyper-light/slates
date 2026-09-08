@@ -622,18 +622,37 @@ impl Green {
     if from == dst {
       return Ok(());
     }
-    let Some(source) = self.content.get(from) else {
+    // The source must still name something — a file, a symlink or a hard link. A source an
+    // intervening change renamed away or removed is a rename/rename conflict (checked first, so a
+    // vanished source is named even when the destination is also occupied).
+    let source_is_file = self.content.contains_key(from);
+    let source_exists =
+      source_is_file || self.symlinks.contains_key(from) || self.hardlinks.contains_key(from);
+    if !source_exists {
       return Err(Green::window(dst, MergeConflictClass::RenameRename));
-    };
+    }
+    // The destination must be free: a non-file already there is a type change; a file the base did
+    // not still hold (changed since base) is a rename/rename. An unchanged base file at the
+    // destination is replaced (the design's rename-over-a-base-file case).
     if self.occupied_by_nonfile(dst) {
       return Err(Green::window(dst, MergeConflictClass::TypeChanged));
     }
     if self.last_changed.get(dst).copied().unwrap_or(0) > base {
       return Err(Green::window(dst, MergeConflictClass::RenameRename));
     }
-    let ops = vec![insert_whole(source.len() as u64)];
-    effects.push(Effect::SetContent(dst.to_owned(), source.clone(), ops));
-    effects.push(Effect::RemoveContent(from.to_owned()));
+    // Move whatever the source names, capturing its current value so an intervening change to the
+    // source follows the move, and removing the source name.
+    if let Some(source) = self.content.get(from) {
+      let ops = vec![insert_whole(source.len() as u64)];
+      effects.push(Effect::SetContent(dst.to_owned(), source.clone(), ops));
+      effects.push(Effect::RemoveContent(from.to_owned()));
+    } else if let Some(target) = self.symlinks.get(from) {
+      effects.push(Effect::Symlink(dst.to_owned(), target.clone()));
+      effects.push(Effect::RemoveSymlink(from.to_owned()));
+    } else if let Some(target) = self.hardlinks.get(from) {
+      effects.push(Effect::Hardlink(dst.to_owned(), target.clone()));
+      effects.push(Effect::RemoveHardlink(from.to_owned()));
+    }
     Ok(())
   }
 

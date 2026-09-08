@@ -2481,8 +2481,9 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > block edits (coordinate-free, so the reference states the design's per-range rule directly), plus
 > the worked case (T-6.x, `crates/merge/tests/engine.rs`). Per-range identity for a length-changing
 > overlap (insert/delete/truncate) still falls back to the whole-file check (its coordinate mapping
-> under a conflicting neighbour is owed). An unlink now removes whatever the path names — a file, a
-> symlink or a hard link (it had removed only files); `base_at` reconstructs a lagging work's base at
+> under a conflicting neighbour is owed). An unlink and a rename now act on whatever the path
+> names — a file, a symlink or a hard link (both had handled only files: unlink no-oped a symlink,
+> rename false-conflicted one); `base_at` reconstructs a lagging work's base at
 > an intervening version across *every* dimension (a per-dimension `(version, value)` history the
 > commit records; directories/modes/symlinks/hard-links/xattrs had come back empty); and a path the
 > increment itself creates or makes now establishes it for that increment's metadata, so a file

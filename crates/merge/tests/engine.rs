@@ -418,6 +418,39 @@ fn mkdir_then_setmode_in_one_increment_accepts() {
   assert_eq!(green.mode("d"), Some(0o700));
 }
 
+/// Renaming a symlink moves the link, not only a file (§4.16: rename applies to whatever the source
+/// names). The source name is gone and the target is unchanged at the destination.
+#[test]
+fn renaming_a_symlink_moves_it() {
+  let mut green = Green::new();
+  green.submit(&Build::new().symlink("l", "target").at(1, 0));
+  let outcome = green.submit(&Build::new().rename("l", "m").at(2, 1));
+  assert_eq!(outcome, Outcome::Accepted { version: 2 });
+  assert_eq!(green.symlink("l"), None, "the source name is gone");
+  assert_eq!(
+    green.symlink("m"),
+    Some("target"),
+    "the link moved to the destination"
+  );
+}
+
+/// Renaming a hard link moves that name (the shared file is untouched).
+#[test]
+fn renaming_a_hardlink_moves_it() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("f", b"shared").at(1, 0));
+  green.submit(&Build::new().link("h", "f").at(2, 1));
+  let outcome = green.submit(&Build::new().rename("h", "g").at(3, 2));
+  assert_eq!(outcome, Outcome::Accepted { version: 3 });
+  assert_eq!(green.hardlink("h"), None, "the source name is gone");
+  assert_eq!(green.hardlink("g"), Some("f"), "the hard link moved");
+  assert_eq!(
+    green.content("f"),
+    Some(b"shared".as_slice()),
+    "the shared file is untouched"
+  );
+}
+
 /// An insert before an accepted disjoint edit shifts the later one, and both apply.
 #[test]
 fn an_intervening_insert_shifts_a_later_edit() {
