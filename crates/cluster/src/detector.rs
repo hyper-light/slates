@@ -17,7 +17,10 @@
 //! `C` distinct peers independently suspect a member — corroboration declares a real failure sooner while
 //! a lone suspicion waits the full window; the logarithm is computed in deterministic fixed point,
 //! [`crate::fixed`]). The two window mechanisms compose: corroboration shortens it, local ill-health
-//! lengthens it. Owed: randomized (rather than round-robin) probe order.
+//! lengthens it. And **randomized probe order** (SWIM §4): each round probes a fresh shuffled permutation
+//! of the members rather than a fixed rotation, so every member is probed once per round and the
+//! worst-case wait for a first probe is one round; the shuffle is a deterministic xorshift seeded from
+//! the node id, so the simulation stays reproducible. This completes the §4.8 membership mechanism set.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -75,8 +78,8 @@ pub struct DetectorTiming {
   pub confirmations_expected: u32,
 }
 
-/// The failure detector for one node: it owns the node's [`Membership`] view, a round-robin cursor
-/// over the members it probes, the member being probed this period and whether it has acknowledged,
+/// The failure detector for one node: it owns the node's [`Membership`] view, a cursor over the current
+/// randomized probe permutation, the member being probed this period and whether it has acknowledged,
 /// how many periods each suspected member has gone unrefuted, and its Lifeguard **local health** — a
 /// bounded multiplier, raised when the node's own probes fail (or it is falsely suspected) and lowered
 /// when they succeed, that dilates the suspicion window so a node that itself looks unhealthy is slower
@@ -92,7 +95,53 @@ pub struct Detector {
   confirmations: BTreeMap<HostId, BTreeSet<HostId>>,
   gossip: BTreeMap<HostId, (MemberState, u32)>,
   health: u32,
+  shuffler: RandomizedOrder,
   timing: DetectorTiming,
+}
+
+/// A deterministic pseudo-random order over the members to probe (SWIM §4): each protocol period probes
+/// the next member of a shuffled permutation, and a fresh permutation is drawn each round, so every
+/// member is probed once per round and the worst-case time to first probe is one round — not the
+/// unbounded wait a fixed rotation can suffer. The generator is a deterministic xorshift seeded from the
+/// node id, so the simulation replays failure histories identically (the timing must be portable).
+struct RandomizedOrder {
+  state: u64,
+}
+
+/// Format: the golden-ratio odd constant (2^64 / φ), the standard seed mixer, so distinct node ids seed
+/// visibly different sequences.
+const SEED_MIXER: u64 = 0x9E37_79B9_7F4A_7C15;
+/// Format: Marsaglia's xorshift64 shift triple (`Xorshift RNGs`, 2003) — the three shifts of the
+/// full-period 64-bit generator.
+const XORSHIFT_TRIPLE: [u32; 3] = [13, 7, 17];
+
+impl RandomizedOrder {
+  /// A generator seeded from `local`, never zero (xorshift stays at zero forever from a zero seed).
+  fn seeded(local: HostId) -> RandomizedOrder {
+    RandomizedOrder {
+      state: (local.0 ^ SEED_MIXER) | 1,
+    }
+  }
+
+  /// The next pseudo-random word (xorshift64).
+  fn next(&mut self) -> u64 {
+    let mut x = self.state;
+    x ^= x << XORSHIFT_TRIPLE[0];
+    x ^= x >> XORSHIFT_TRIPLE[1];
+    x ^= x << XORSHIFT_TRIPLE[2];
+    self.state = x;
+    x
+  }
+
+  /// Shuffles `items` in place with a Fisher–Yates pass driven by the generator.
+  fn shuffle(&mut self, items: &mut [HostId]) {
+    let len = items.len();
+    for index in (1..len).rev() {
+      let span = u64::try_from(index).unwrap_or(0).saturating_add(1);
+      let pick = usize::try_from(self.next() % span).unwrap_or(0);
+      items.swap(index, pick);
+    }
+  }
 }
 
 impl Detector {
@@ -111,6 +160,7 @@ impl Detector {
       confirmations: BTreeMap::new(),
       gossip: BTreeMap::new(),
       health: 0,
+      shuffler: RandomizedOrder::seeded(local),
       timing,
     }
   }
@@ -377,24 +427,33 @@ impl Detector {
     }
   }
 
-  /// The next alive peer to probe, round-robin. Rebuilds the rotation from the current alive set (so a
-  /// newly dead member drops out and a new one joins in), skipping the local node.
+  /// The next alive peer to probe, in **randomized** order (SWIM §4). Each round is a fresh shuffled
+  /// permutation of the alive peers, advanced one per period; when the round is exhausted a new
+  /// permutation is drawn — so every member is probed once per round and the worst-case wait for a first
+  /// probe is one round, not the unbounded delay a fixed rotation can suffer. Members that died mid-round
+  /// are skipped, and `None` is returned only when no alive peer remains.
   fn next_target(&mut self) -> Option<HostId> {
-    self.order = self
-      .membership
-      .alive()
-      .into_iter()
-      .filter(|host| *host != self.local)
-      .collect();
-    if self.order.is_empty() {
-      return None;
+    // At most one reshuffle: the current round, then a fresh one if it held no live member.
+    for _ in 0..2 {
+      if self.cursor >= self.order.len() {
+        self.order = self
+          .membership
+          .alive()
+          .into_iter()
+          .filter(|host| *host != self.local)
+          .collect();
+        self.shuffler.shuffle(&mut self.order);
+        self.cursor = 0;
+      }
+      while self.cursor < self.order.len() {
+        let candidate = self.order[self.cursor];
+        self.cursor += 1;
+        if self.membership.state(candidate).map(|state| state.liveness) == Some(Liveness::Alive) {
+          return Some(candidate);
+        }
+      }
     }
-    if self.cursor >= self.order.len() {
-      self.cursor = 0;
-    }
-    let target = self.order[self.cursor];
-    self.cursor += 1;
-    Some(target)
+    None
   }
 }
 
@@ -735,6 +794,39 @@ mod tests {
       lone.membership().state(A).map(|s| s.liveness),
       Some(Liveness::Suspect),
       "a lone suspicion waits the full, unshrunk window"
+    );
+  }
+
+  /// Randomized probe order (SWIM §4) still probes every peer exactly once per round — the coverage
+  /// guarantee that bounds the worst-case time to a first probe — and the next round reshuffles into
+  /// another full permutation.
+  #[test]
+  fn every_peer_is_probed_once_per_round() {
+    let mut detector = Detector::new(LOCAL, timing(3, 2));
+    detector.join(A);
+    detector.join(B);
+    detector.join(C);
+
+    let round = |detector: &mut Detector| {
+      let mut probed = Vec::new();
+      for _ in 0..3 {
+        let ping = detector.tick().expect("a peer to probe");
+        detector.on_ack(ping.to); // keep every peer alive so the round is not disturbed
+        probed.push(ping.to);
+      }
+      probed.sort_by_key(|host| host.0);
+      probed
+    };
+
+    assert_eq!(
+      round(&mut detector),
+      vec![A, B, C],
+      "the first round probes every peer once"
+    );
+    assert_eq!(
+      round(&mut detector),
+      vec![A, B, C],
+      "the next round reshuffles and covers them again"
     );
   }
 }
