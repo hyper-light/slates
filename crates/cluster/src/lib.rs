@@ -32,6 +32,7 @@
 pub mod config_group;
 pub mod detector;
 pub mod membership;
+pub mod raft;
 pub mod swim;
 
 use std::sync::mpsc::{TryRecvError, channel};
