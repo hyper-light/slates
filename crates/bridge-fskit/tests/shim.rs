@@ -96,6 +96,35 @@ fn a_request_round_trips_through_its_bytes() {
       offset: 4096,
       data: b"payload".to_vec(),
     },
+    ShimRequest::OpenDir { object: oid(1) },
+    ShimRequest::ReadDir {
+      object: oid(1),
+      fh: 7,
+      offset: 3,
+    },
+    ShimRequest::Release {
+      object: oid(1),
+      fh: 7,
+    },
+    ShimRequest::Create {
+      parent: oid(1),
+      name: "f".to_owned(),
+      mode: 0o644,
+      flags: 2,
+    },
+    ShimRequest::Mkdir {
+      parent: oid(1),
+      name: "d".to_owned(),
+      mode: 0o755,
+    },
+    ShimRequest::Unlink {
+      parent: oid(1),
+      name: "f".to_owned(),
+    },
+    ShimRequest::Rmdir {
+      parent: oid(1),
+      name: "d".to_owned(),
+    },
   ];
   for request in requests {
     let bytes = request.encode();
@@ -245,6 +274,100 @@ fn serve_writes_through_the_bridge_and_reads_it_back() {
     &reply[5..5 + len],
     payload,
     "the read returned the written bytes"
+  );
+}
+
+/// `serve` drives the directory lifecycle: mkdir a subdirectory, create a file in it, open and read
+/// the directory to see the file, then unlink the file and rmdir the directory — the namespace and
+/// enumeration path over the seam, with no ring and no mount.
+#[test]
+fn serve_drives_the_directory_lifecycle() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root = bridge.root(&cx).unwrap();
+
+  // Mkdir a subdirectory and read its inode from the OK attribute reply.
+  let mkdir = ShimRequest::Mkdir {
+    parent: oid(root),
+    name: "sub".to_owned(),
+    mode: 0o755,
+  }
+  .encode();
+  let reply = serve(&mkdir, &mut bridge, &cx).unwrap();
+  assert_eq!(reply[0], STATUS_OK, "mkdir succeeded");
+  let mut dir_ino = [0u8; 8];
+  dir_ino.copy_from_slice(&reply[1..9]);
+  let dir = u64::from_le_bytes(dir_ino);
+
+  // Create a file inside it (the reply is an attribute then a handle).
+  let create = ShimRequest::Create {
+    parent: oid(dir),
+    name: "file".to_owned(),
+    mode: 0o644,
+    flags: 0,
+  }
+  .encode();
+  let reply = serve(&create, &mut bridge, &cx).unwrap();
+  assert_eq!(reply[0], STATUS_OK, "create succeeded");
+
+  // Open the directory, read it, and confirm the file's name is among the entries.
+  let opendir = ShimRequest::OpenDir { object: oid(dir) }.encode();
+  let reply = serve(&opendir, &mut bridge, &cx).unwrap();
+  assert_eq!(reply[0], STATUS_OK, "opendir succeeded");
+  let mut fh_bytes = [0u8; 8];
+  fh_bytes.copy_from_slice(&reply[1..9]);
+  let fh = u64::from_le_bytes(fh_bytes);
+
+  let readdir = ShimRequest::ReadDir {
+    object: oid(dir),
+    fh,
+    offset: 0,
+  }
+  .encode();
+  let reply = serve(&readdir, &mut bridge, &cx).unwrap();
+  assert_eq!(reply[0], STATUS_OK, "readdir succeeded");
+  // The reply is a u32 count then each entry (ino u64, kind u8, name len+bytes); scan for "file".
+  let mut count_bytes = [0u8; 4];
+  count_bytes.copy_from_slice(&reply[1..5]);
+  let count = u32::from_le_bytes(count_bytes);
+  let mut cursor = 5usize;
+  let mut names = Vec::new();
+  for _ in 0..count {
+    cursor += 8 + 1; // ino + kind
+    let mut nlen = [0u8; 4];
+    nlen.copy_from_slice(&reply[cursor..cursor + 4]);
+    let nlen = usize::try_from(u32::from_le_bytes(nlen)).unwrap();
+    cursor += 4;
+    names.push(String::from_utf8(reply[cursor..cursor + nlen].to_vec()).unwrap());
+    cursor += nlen;
+  }
+  assert!(
+    names.contains(&"file".to_owned()),
+    "the created file is enumerated: {names:?}"
+  );
+
+  // Unlink the file and rmdir the directory; both are OK unit replies.
+  let unlink = ShimRequest::Unlink {
+    parent: oid(dir),
+    name: "file".to_owned(),
+  }
+  .encode();
+  assert_eq!(
+    serve(&unlink, &mut bridge, &cx).unwrap(),
+    vec![STATUS_OK],
+    "unlink is an OK unit reply"
+  );
+  let rmdir = ShimRequest::Rmdir {
+    parent: oid(root),
+    name: "sub".to_owned(),
+  }
+  .encode();
+  assert_eq!(
+    serve(&rmdir, &mut bridge, &cx).unwrap(),
+    vec![STATUS_OK],
+    "rmdir is an OK unit reply"
   );
 }
 

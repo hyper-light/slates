@@ -13,12 +13,14 @@
 //! either the result or a [`ShimError`] tag; the Swift shim maps that tag to the `NSError`/POSIX errno
 //! FSKit returns, so no errno numbers live in this Rust codec.
 //!
-//! This first slice carries the identity-addressed read path — `lookup`, `getattr`, `read` — which need
-//! no open-handle state (the volume core addresses objects by identity, §4.6). The handle path
-//! (`opendir`/`readdir`/`open`/`release`), the write and namespace operations, the ring transport
-//! itself, and the Swift shim are the owed continuation.
+//! The codec now covers the read path (`lookup`, `getattr`, `read`), the write path (`write`), the
+//! directory enumeration path (`opendir`, `readdir`, `release`) and the core namespace operations
+//! (`create`, `mkdir`, `unlink`, `rmdir`) — enough to browse and modify a tree over the seam. The
+//! remaining operations (`open`/`flush`, `symlink`/`link`/`readlink`, `rename`, `reference`/`forget`),
+//! a golden reply test pinning the wire, the app-group ring transport, and the Swift `FSVolume` shim
+//! (with the `Slates.app` bundle, the FSKit entitlement, and the mount spike) are the owed continuation.
 
-use slates_bridge_core::{Bridge, NodeAttr, ObjectId, OpContext};
+use slates_bridge_core::{Bridge, DirEntry, NodeAttr, ObjectId, OpContext};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
@@ -30,6 +32,20 @@ const OP_GETATTR: u8 = 2;
 const OP_READ: u8 = 3;
 /// Format: see [`OP_LOOKUP`].
 const OP_WRITE: u8 = 4;
+/// Format: see [`OP_LOOKUP`].
+const OP_OPENDIR: u8 = 5;
+/// Format: see [`OP_LOOKUP`].
+const OP_READDIR: u8 = 6;
+/// Format: see [`OP_LOOKUP`].
+const OP_RELEASE: u8 = 7;
+/// Format: see [`OP_LOOKUP`].
+const OP_CREATE: u8 = 8;
+/// Format: see [`OP_LOOKUP`].
+const OP_MKDIR: u8 = 9;
+/// Format: see [`OP_LOOKUP`].
+const OP_UNLINK: u8 = 10;
+/// Format: see [`OP_LOOKUP`].
+const OP_RMDIR: u8 = 11;
 
 /// Format: the reply status byte — the result follows, or a [`ShimError`] tag does.
 const STATUS_OK: u8 = 0;
@@ -184,6 +200,61 @@ pub enum ShimRequest {
     /// The bytes to write (at most [`MAX_WRITE_BYTES`]).
     data: Vec<u8>,
   },
+  /// Open directory `object` for enumeration; the reply is a handle.
+  OpenDir {
+    /// The directory.
+    object: ObjectId,
+  },
+  /// Read the entries of directory `object` under handle `fh` from `offset` (the resume cookie).
+  ReadDir {
+    /// The directory.
+    object: ObjectId,
+    /// The handle a prior [`OpenDir`](ShimRequest::OpenDir) returned.
+    fh: u64,
+    /// The resume cookie (zero from the start).
+    offset: u64,
+  },
+  /// Release the directory handle `fh` on `object`.
+  Release {
+    /// The object.
+    object: ObjectId,
+    /// The handle to release.
+    fh: u64,
+  },
+  /// Create and open file `name` in `parent`; the reply is the new attributes and a handle.
+  Create {
+    /// The parent directory.
+    parent: ObjectId,
+    /// The new name (at most [`MAX_NAME_BYTES`]).
+    name: String,
+    /// The permission bits.
+    mode: u32,
+    /// The open flags.
+    flags: u32,
+  },
+  /// Create directory `name` in `parent`; the reply is the new attributes.
+  Mkdir {
+    /// The parent directory.
+    parent: ObjectId,
+    /// The new name (at most [`MAX_NAME_BYTES`]).
+    name: String,
+    /// The permission bits.
+    mode: u32,
+  },
+  /// Remove file `name` from `parent`.
+  Unlink {
+    /// The parent directory.
+    parent: ObjectId,
+    /// The name to remove (at most [`MAX_NAME_BYTES`]).
+    name: String,
+  },
+  /// Remove directory `name` from `parent`.
+  Rmdir {
+    /// The parent directory.
+    parent: ObjectId,
+    /// The name to remove (at most [`MAX_NAME_BYTES`]).
+    name: String,
+  },
 }
 
 impl ShimRequest {
@@ -221,6 +292,49 @@ impl ShimRequest {
         out.extend_from_slice(&offset.to_le_bytes());
         put_bytes(&mut out, data);
       }
+      ShimRequest::OpenDir { object } => {
+        out.push(OP_OPENDIR);
+        put_object(&mut out, *object);
+      }
+      ShimRequest::ReadDir { object, fh, offset } => {
+        out.push(OP_READDIR);
+        put_object(&mut out, *object);
+        out.extend_from_slice(&fh.to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+      }
+      ShimRequest::Release { object, fh } => {
+        out.push(OP_RELEASE);
+        put_object(&mut out, *object);
+        out.extend_from_slice(&fh.to_le_bytes());
+      }
+      ShimRequest::Create {
+        parent,
+        name,
+        mode,
+        flags,
+      } => {
+        out.push(OP_CREATE);
+        put_object(&mut out, *parent);
+        put_bytes(&mut out, name.as_bytes());
+        out.extend_from_slice(&mode.to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
+      }
+      ShimRequest::Mkdir { parent, name, mode } => {
+        out.push(OP_MKDIR);
+        put_object(&mut out, *parent);
+        put_bytes(&mut out, name.as_bytes());
+        out.extend_from_slice(&mode.to_le_bytes());
+      }
+      ShimRequest::Unlink { parent, name } => {
+        out.push(OP_UNLINK);
+        put_object(&mut out, *parent);
+        put_bytes(&mut out, name.as_bytes());
+      }
+      ShimRequest::Rmdir { parent, name } => {
+        out.push(OP_RMDIR);
+        put_object(&mut out, *parent);
+        put_bytes(&mut out, name.as_bytes());
+      }
     }
     out
   }
@@ -232,8 +346,7 @@ impl ShimRequest {
     let request = match tag {
       OP_LOOKUP => {
         let parent = take_object(&mut rest)?;
-        let name_bytes = take_bytes(&mut rest, MAX_NAME_BYTES)?;
-        let name = String::from_utf8(name_bytes.to_vec()).map_err(|_| ShimWireError::BadLength)?;
+        let name = take_name(&mut rest)?;
         ShimRequest::Lookup { parent, name }
       }
       OP_GETATTR => {
@@ -263,6 +376,49 @@ impl ShimRequest {
           data,
         }
       }
+      OP_OPENDIR => {
+        let object = take_object(&mut rest)?;
+        ShimRequest::OpenDir { object }
+      }
+      OP_READDIR => {
+        let object = take_object(&mut rest)?;
+        let fh = take_u64(&mut rest)?;
+        let offset = take_u64(&mut rest)?;
+        ShimRequest::ReadDir { object, fh, offset }
+      }
+      OP_RELEASE => {
+        let object = take_object(&mut rest)?;
+        let fh = take_u64(&mut rest)?;
+        ShimRequest::Release { object, fh }
+      }
+      OP_CREATE => {
+        let parent = take_object(&mut rest)?;
+        let name = take_name(&mut rest)?;
+        let mode = take_u32(&mut rest)?;
+        let flags = take_u32(&mut rest)?;
+        ShimRequest::Create {
+          parent,
+          name,
+          mode,
+          flags,
+        }
+      }
+      OP_MKDIR => {
+        let parent = take_object(&mut rest)?;
+        let name = take_name(&mut rest)?;
+        let mode = take_u32(&mut rest)?;
+        ShimRequest::Mkdir { parent, name, mode }
+      }
+      OP_UNLINK => {
+        let parent = take_object(&mut rest)?;
+        let name = take_name(&mut rest)?;
+        ShimRequest::Unlink { parent, name }
+      }
+      OP_RMDIR => {
+        let parent = take_object(&mut rest)?;
+        let name = take_name(&mut rest)?;
+        ShimRequest::Rmdir { parent, name }
+      }
       other => return Err(ShimWireError::UnknownOp { tag: other }),
     };
     if rest.is_empty() {
@@ -284,36 +440,58 @@ pub fn serve(
   cx: &OpContext,
 ) -> Result<Vec<u8>, ShimWireError> {
   let request = ShimRequest::decode(request_bytes)?;
+  // Each arm calls one bridge method and turns its `Result` into a reply through `reply`, which folds
+  // the Ok/Err branch so the dispatch reads as one line per operation (and stays under the cognitive
+  // budget as operations are added).
   let reply = match request {
-    ShimRequest::Lookup { parent, name } => match bridge.lookup(parent, cx, &name) {
-      Ok(attr) => ok_attr(&attr),
-      Err(error) => err_reply(&error),
-    },
-    ShimRequest::GetAttr { object } => match bridge.getattr(object, cx) {
-      Ok(attr) => ok_attr(&attr),
-      Err(error) => err_reply(&error),
-    },
+    ShimRequest::Lookup { parent, name } => {
+      reply(bridge.lookup(parent, cx, &name), |a| ok_attr(&a))
+    }
+    ShimRequest::GetAttr { object } => reply(bridge.getattr(object, cx), |a| ok_attr(&a)),
     ShimRequest::Read {
       object,
       offset,
       size,
     } => {
       let mut out = Vec::new();
-      match bridge.read(object, cx, offset, size, &mut out) {
-        Ok(()) => ok_bytes(&out),
-        Err(error) => err_reply(&error),
-      }
+      reply(bridge.read(object, cx, offset, size, &mut out), |()| {
+        ok_bytes(&out)
+      })
     }
     ShimRequest::Write {
       object,
       offset,
       data,
-    } => match bridge.write(object, cx, offset, &data) {
-      Ok(written) => ok_count(written),
-      Err(error) => err_reply(&error),
-    },
+    } => reply(bridge.write(object, cx, offset, &data), ok_count),
+    ShimRequest::OpenDir { object } => reply(bridge.opendir(object, cx), ok_fh),
+    ShimRequest::ReadDir { object, fh, offset } => {
+      reply(bridge.readdir(object, cx, fh, offset), |e| ok_entries(&e))
+    }
+    ShimRequest::Release { object, fh } => reply(bridge.release(object, cx, fh), |()| ok_unit()),
+    ShimRequest::Create {
+      parent,
+      name,
+      mode,
+      flags,
+    } => reply(bridge.create(parent, cx, &name, mode, flags), |(a, fh)| {
+      ok_attr_fh(&a, fh)
+    }),
+    ShimRequest::Mkdir { parent, name, mode } => {
+      reply(bridge.mkdir(parent, cx, &name, mode), |a| ok_attr(&a))
+    }
+    ShimRequest::Unlink { parent, name } => reply(bridge.unlink(parent, cx, &name), |()| ok_unit()),
+    ShimRequest::Rmdir { parent, name } => reply(bridge.rmdir(parent, cx, &name), |()| ok_unit()),
   };
   Ok(reply)
+}
+
+/// Folds a bridge result into a reply: the `ok` closure encodes the success payload, a refusal becomes
+/// the mapped [`ShimError`] reply. This keeps every `serve` arm a single expression.
+fn reply<T>(result: Result<T, VfsError>, ok: impl FnOnce(T) -> Vec<u8>) -> Vec<u8> {
+  match result {
+    Ok(value) => ok(value),
+    Err(error) => err_reply(&error),
+  }
 }
 
 /// An OK reply carrying an encoded attribute.
@@ -334,6 +512,40 @@ fn ok_bytes(bytes: &[u8]) -> Vec<u8> {
 fn ok_count(count: u32) -> Vec<u8> {
   let mut out = vec![STATUS_OK];
   out.extend_from_slice(&count.to_le_bytes());
+  out
+}
+
+/// An OK reply carrying a `u64` handle (an opened directory).
+fn ok_fh(fh: u64) -> Vec<u8> {
+  let mut out = vec![STATUS_OK];
+  out.extend_from_slice(&fh.to_le_bytes());
+  out
+}
+
+/// An OK reply with no payload (an operation whose only result is success).
+fn ok_unit() -> Vec<u8> {
+  vec![STATUS_OK]
+}
+
+/// An OK reply carrying an encoded attribute then a `u64` handle (a created-and-opened file).
+fn ok_attr_fh(attr: &NodeAttr, fh: u64) -> Vec<u8> {
+  let mut out = vec![STATUS_OK];
+  put_attr(&mut out, attr);
+  out.extend_from_slice(&fh.to_le_bytes());
+  out
+}
+
+/// An OK reply carrying directory entries: a `u32` count then each entry — its inode (`u64`), its kind
+/// tag, and its name (a length-prefixed byte field).
+fn ok_entries(entries: &[DirEntry]) -> Vec<u8> {
+  let mut out = vec![STATUS_OK];
+  let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+  out.extend_from_slice(&count.to_le_bytes());
+  for entry in entries {
+    out.extend_from_slice(&entry.ino.to_le_bytes());
+    out.push(kind_tag(entry.kind));
+    put_bytes(&mut out, entry.name.as_bytes());
+  }
   out
 }
 
@@ -402,6 +614,13 @@ fn take_u32(rest: &mut &[u8]) -> Result<u32, ShimWireError> {
   let mut word = [0u8; size_of::<u32>()];
   word.copy_from_slice(head);
   Ok(u32::from_le_bytes(word))
+}
+
+/// Reads a length-prefixed path component (at most [`MAX_NAME_BYTES`]) from the front of `rest`,
+/// refusing an over-long or non-UTF-8 name (hostile input) as a typed error.
+fn take_name(rest: &mut &[u8]) -> Result<String, ShimWireError> {
+  let bytes = take_bytes(rest, MAX_NAME_BYTES)?;
+  String::from_utf8(bytes.to_vec()).map_err(|_| ShimWireError::BadLength)
 }
 
 /// Reads a length-prefixed byte field (`u32` length then the bytes) from the front of `rest`, refusing
