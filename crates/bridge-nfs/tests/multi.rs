@@ -10,8 +10,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 
 use slates_bridge_core::{Attachments, Bridge, ObjectId, OpContext, Rights, View, VolumeBridge};
-use slates_bridge_nfs::procedures::Export;
-use slates_bridge_nfs::{MultiExport, serve_connection};
+use slates_bridge_nfs::{MultiExport, OwnedVolumeSet, serve_connection};
 use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
@@ -56,11 +55,11 @@ fn make_store() -> Store {
   )
 }
 
-fn make_volume(store: &mut Store) -> Volume {
+fn make_volume(store: &mut Store, prefix: u16) -> Volume {
   Volume::create(
     store,
     VolumeConfig {
-      prefix: 1,
+      prefix,
       names: NameEquivalence::Exact,
       quota: Quota::Bounded { limit: 1 << 30 },
       journal_bytes: 1 << 16,
@@ -191,21 +190,18 @@ fn spawn_two_volume_server() -> (u16, std::thread::JoinHandle<()>) {
   let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
   let port = listener.local_addr().unwrap().port();
   let server = std::thread::spawn(move || {
-    let mut store_a = make_store();
-    let mut vol_a = make_volume(&mut store_a);
-    populate(&mut store_a, &mut vol_a, VOL_A, "hello.txt", MSG_A);
-    let mut store_b = make_store();
-    let mut vol_b = make_volume(&mut store_b);
-    populate(&mut store_b, &mut vol_b, VOL_B, "world.txt", MSG_B);
+    // Both volumes share one store — the daemon's shape (one store per shard, many volumes) — so they
+    // take distinct inode prefixes (a volume's root is `compose(prefix, 1)`).
+    let mut store = make_store();
+    let mut vol_a = make_volume(&mut store, 1);
+    populate(&mut store, &mut vol_a, VOL_A, "hello.txt", MSG_A);
+    let mut vol_b = make_volume(&mut store, 2);
+    populate(&mut store, &mut vol_b, VOL_B, "world.txt", MSG_B);
 
-    let mut bridge_a = VolumeBridge::new(VOL_A, &mut vol_a, &mut store_a);
-    let mut bridge_b = VolumeBridge::new(VOL_B, &mut vol_b, &mut store_b);
-    let export_a = Export::new(&mut bridge_a, VOL_A, Principal::Uid { uid: 0 }, rights()).unwrap();
-    let export_b = Export::new(&mut bridge_b, VOL_B, Principal::Uid { uid: 0 }, rights()).unwrap();
-
-    let mut multi = MultiExport::new();
-    multi.mount("alpha", VOL_A, export_a);
-    multi.mount("beta", VOL_B, export_b);
+    let mut set = OwnedVolumeSet::new(store);
+    set.add("alpha", VOL_A, vol_a);
+    set.add("beta", VOL_B, vol_b);
+    let mut multi = MultiExport::new(set, Principal::Uid { uid: 0 }, rights());
     assert_eq!(multi.len(), 2);
 
     if let Ok((mut stream, _)) = listener.accept() {

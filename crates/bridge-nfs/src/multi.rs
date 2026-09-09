@@ -5,22 +5,30 @@
 //!
 //! * [`NfsService`] is what the serve loop and `dispatch` serve NFS/MOUNT over — a single-volume
 //!   [`Export`], or a [`MultiExport`] over several — so the transport is unchanged either way.
+//! * [`VolumeSet`] is where the volumes come from. The daemon holds many volumes sharing one store on a
+//!   shard ([`ShardState`](../../server) — one `store`, a slab of volumes), so a volume is served through
+//!   a *transient* bridge built for the request (the design's "marshal each operation into the bridge
+//!   queue of the owning shard", the shape `bridge-fskit`'s `MountSession` already takes); the set
+//!   resolves a volume id to that transient serve. The test's [`OwnedVolumeSet`] is the same shape — one
+//!   store, several volumes — so the shared-store path the daemon uses is exercised here.
 //! * Routing needs no table: every served NFSv3 procedure begins with a file handle, and the handle
 //!   already encodes `(volume, inode, gen)` ([`crate::handle`]), so the router reads the leading
-//!   handle's volume id and hands the *untouched* request to that volume's [`Export`], which re-decodes
-//!   and validates it. A handle for a volume this server does not hold is `NFS3ERR_STALE`.
-//! * The **synthetic root** is a read-only directory whose entries are the mounted volumes: `MNT /`
-//!   returns its handle, `READDIR`/`READDIRPLUS` list the volume names, `LOOKUP` a name returns that
-//!   volume's root handle (the same one a direct mount gives), and every mutation on it is refused
-//!   `NFS3ERR_ROFS` — a volume appears by a metadata operation, never a client `mkdir` (design line
-//!   129). So one `mount_nfs localhost:/` lets a client `ls` the volumes and `cd` into any of them.
+//!   handle's volume id and asks the set to serve it. A handle for a volume not in the set is
+//!   `NFS3ERR_STALE`.
+//! * The **synthetic root** is a read-only directory whose entries are the volumes: `MNT /` returns its
+//!   handle, `READDIR`/`READDIRPLUS` list the volume names, `LOOKUP` a name returns that volume's root
+//!   handle (the same a direct mount gives), and every mutation is `NFS3ERR_ROFS` — a volume appears by
+//!   a metadata operation, never a client `mkdir` (design line 129). So one `mount_nfs localhost:/` lets
+//!   a client `ls` the volumes and `cd` into any of them.
 //!
-//! What is owed: this serves volumes that are all reachable from one place (the daemon's per-host
-//! set on one shard, or a test's in-process set). Serving volumes that live on *different* shards
-//! needs the cross-shard bridge queue (§4.3, a future phase) to route a request to a volume's owning
-//! shard; the routing and the root here sit unchanged above whichever supplies the volumes.
+//! What is owed: this serves the volumes of one [`VolumeSet`] (the daemon's per-shard set, or a test's).
+//! Serving volumes that live on *different* shards needs the cross-shard bridge queue (§4.3, D-7
+//! "bridge queues pinned to the owner") to route a request to a volume's owning shard; the routing and
+//! the root here sit unchanged above whichever supplies the volumes.
 
-use slates_db::catalog::VolumeId;
+use slates_bridge_core::{Rights, VolumeBridge};
+use slates_db::catalog::{Principal, VolumeId};
+use slates_vfs::volume::{Store, Volume};
 
 use crate::handle::FileHandle;
 use crate::mount::{MountReply, Mountstat3};
@@ -78,9 +86,41 @@ const ONE_NANOSECOND: Nfstime3 = Nfstime3 {
   nseconds: 1,
 };
 
+/// The volumes an NFS service serves, resolved per request. The daemon's volumes share one store on a
+/// shard, so a volume is served through a *transient* bridge built for the request (the design's
+/// "marshal each operation into the bridge queue of the owning shard"); this trait is that seam — the
+/// daemon implements it over its `ShardState`, a test over an owned set — so the routing and the
+/// synthetic root above it are written once.
+pub trait VolumeSet {
+  /// The mounted volumes as `(mount name, id)`, in listing order — the root directory's entries.
+  fn entries(&self) -> Vec<(String, VolumeId)>;
+
+  /// Serves one NFSv3 procedure against `volume` (routing has already chosen it), building a transient
+  /// bridge over the shared store under `subject`/`rights`. `None` if the volume is not in the set (the
+  /// router then answers the handle `NFS3ERR_STALE`). `args` is positioned at the procedure arguments.
+  fn serve(
+    &mut self,
+    volume: VolumeId,
+    subject: Principal,
+    rights: Rights,
+    procedure: u32,
+    args: &mut XdrReader<'_>,
+  ) -> Option<Vec<u8>>;
+
+  /// The root file handle and attributes of `volume`, for the synthetic root's `LOOKUP` and
+  /// `READDIRPLUS` of the volume's name. `None` if the volume is not in the set or its root cannot be
+  /// established.
+  fn root_object(
+    &mut self,
+    volume: VolumeId,
+    subject: Principal,
+    rights: Rights,
+  ) -> Option<(Nfsfh3, Fattr3)>;
+}
+
 /// What the loopback server serves NFS and MOUNT over: a single-volume [`Export`], or a [`MultiExport`]
-/// that routes among several under one root. The serve loop and [`crate::server::serve_connection`]
-/// work against this trait, so one server serves one volume or many with no change to the transport.
+/// over a [`VolumeSet`]. The serve loop and [`crate::server::serve_connection`] work against this trait,
+/// so one server serves one volume or many with no change to the transport.
 pub trait NfsService {
   /// MOUNT `MNT`: resolve an export path to a root file handle, or a typed mount refusal.
   fn serve_mount(&mut self, path: &str) -> MountReply;
@@ -99,52 +139,43 @@ impl NfsService for Export<'_> {
   }
 }
 
-/// One volume mounted in a [`MultiExport`]: the name it appears under in the root (its chosen path,
-/// design §4.6 "Chosen path"), its id for routing, and the export that serves it.
-struct Mount<'b> {
-  name: String,
-  volume: VolumeId,
-  export: Export<'b>,
+/// An NFS service over a [`VolumeSet`] under one read-only root directory, routing each request to the
+/// volume its file handle names. The mount credentials (`subject`/`rights`) are established once and
+/// carried on every request the set serves — the export edge's role (§4.13).
+pub struct MultiExport<V: VolumeSet> {
+  set: V,
+  subject: Principal,
+  rights: Rights,
 }
 
-/// An NFS service over several volumes under one read-only root directory, routing each request to the
-/// volume its file handle names. The daemon holds one of these per host and serves it on the anchor's
-/// loopback listener (owed); here it is driven directly and by the loopback server in tests.
-#[derive(Default)]
-pub struct MultiExport<'b> {
-  mounts: Vec<Mount<'b>>,
-}
-
-impl<'b> MultiExport<'b> {
-  /// An empty service; add volumes with [`MultiExport::mount`].
-  pub fn new() -> MultiExport<'b> {
-    MultiExport { mounts: Vec::new() }
+impl<V: VolumeSet> MultiExport<V> {
+  /// A service over `set`, whose requests run under `subject` with `rights`.
+  pub fn new(set: V, subject: Principal, rights: Rights) -> MultiExport<V> {
+    MultiExport {
+      set,
+      subject,
+      rights,
+    }
   }
 
-  /// Adds `export` (of `volume`) under the mount `name`. The caller supplies the name — a volume's
-  /// chosen path — and is responsible for its uniqueness; a duplicate name is matched only for the
-  /// first mount holding it, and a duplicate volume routes to the first mount holding it.
-  pub fn mount(&mut self, name: impl Into<String>, volume: VolumeId, export: Export<'b>) {
-    self.mounts.push(Mount {
-      name: name.into(),
-      volume,
-      export,
-    });
-  }
-
-  /// The number of volumes mounted.
+  /// The number of volumes the set holds.
   pub fn len(&self) -> usize {
-    self.mounts.len()
+    self.set.entries().len()
   }
 
-  /// Whether no volume is mounted.
+  /// Whether the set holds no volume.
   pub fn is_empty(&self) -> bool {
-    self.mounts.is_empty()
+    self.set.entries().is_empty()
   }
 
-  /// The index of the mount whose volume matches `volume`, if any.
-  fn index_of(&self, volume: VolumeId) -> Option<usize> {
-    self.mounts.iter().position(|m| m.volume == volume)
+  /// The volume id mounted under `name`, if any.
+  fn volume_of(&self, name: &str) -> Option<VolumeId> {
+    self
+      .set
+      .entries()
+      .into_iter()
+      .find(|(mount, _)| mount == name)
+      .map(|(_, id)| id)
   }
 
   // ---------------------------------------------------------------- the synthetic root directory
@@ -155,7 +186,7 @@ impl<'b> MultiExport<'b> {
     Fattr3 {
       kind: Ftype3::Dir,
       mode: ROOT_MODE,
-      nlink: u32::try_from(self.mounts.len().saturating_add(2)).unwrap_or(u32::MAX),
+      nlink: u32::try_from(self.set.entries().len().saturating_add(2)).unwrap_or(u32::MAX),
       uid: 0,
       gid: 0,
       size: 0,
@@ -173,7 +204,9 @@ impl<'b> MultiExport<'b> {
   /// continuing a listing across such a change is told to restart (a per-add/remove monotone token is
   /// owed; the volume count catches the common add/remove).
   fn root_verf(&self) -> [u8; size_of::<u64>()] {
-    u64::try_from(self.mounts.len()).unwrap_or(0).to_be_bytes()
+    u64::try_from(self.set.entries().len())
+      .unwrap_or(0)
+      .to_be_bytes()
   }
 
   /// Serves a request whose handle names the synthetic root: the read-only directory operations a
@@ -230,11 +263,11 @@ impl<'b> MultiExport<'b> {
       Ok(name) => name.to_owned(),
       Err(_) => return lookup_failure(Nfsstat3::Inval, None),
     };
-    let object = self
-      .mounts
-      .iter_mut()
-      .find(|m| m.name == name)
-      .and_then(|mount| mount.export.root_object());
+    let object = self.volume_of(&name).and_then(|volume| {
+      self
+        .set
+        .root_object(volume, self.subject.clone(), self.rights)
+    });
     match object {
       Some((handle, attr)) => {
         let mut writer = XdrWriter::new();
@@ -265,19 +298,22 @@ impl<'b> MultiExport<'b> {
       usize::try_from(args.u32().unwrap_or(0)).unwrap_or(0)
     };
     let start = usize::try_from(cookie).unwrap_or(usize::MAX);
+    let entries = self.set.entries();
 
     let mut body = XdrWriter::new();
     let mut used = READDIR_OVERHEAD;
     let mut emitted = 0usize;
     let mut eof = true;
-    for index in start..self.mounts.len() {
+    for (index, (name, volume)) in entries.iter().enumerate().skip(start) {
       let fileid = ROOT_ENTRY_FILEID_BASE.saturating_add(u64::try_from(index).unwrap_or(0));
       let plus_object = if plus {
-        self.mounts[index].export.root_object()
+        self
+          .set
+          .root_object(*volume, self.subject.clone(), self.rights)
       } else {
         None
       };
-      let entry = encode_readdir_entry(&self.mounts[index].name, fileid, index, plus, plus_object);
+      let entry = encode_readdir_entry(name, fileid, index, plus, plus_object);
       if budget != 0 && used.saturating_add(entry.len()) > budget {
         eof = false;
         break;
@@ -287,7 +323,7 @@ impl<'b> MultiExport<'b> {
       emitted += 1;
     }
     // A budget too small for even one pending entry is `TOOSMALL`, per RFC 1813 §3.3.16.
-    if emitted == 0 && start < self.mounts.len() {
+    if emitted == 0 && start < entries.len() {
       return readdir_failure(Nfsstat3::Toosmall, dir_attr);
     }
 
@@ -341,7 +377,7 @@ impl<'b> MultiExport<'b> {
   }
 }
 
-impl NfsService for MultiExport<'_> {
+impl<V: VolumeSet> NfsService for MultiExport<V> {
   fn serve_mount(&mut self, path: &str) -> MountReply {
     let name = path.trim_matches('/');
     if name.is_empty() {
@@ -352,8 +388,15 @@ impl NfsService for MultiExport<'_> {
       };
     }
     // A client may also mount a specific volume's subtree directly by its name.
-    match self.mounts.iter_mut().find(|m| m.name == name) {
-      Some(mount) => mount.export.mnt(path),
+    match self.volume_of(name).and_then(|volume| {
+      self
+        .set
+        .root_object(volume, self.subject.clone(), self.rights)
+    }) {
+      Some((handle, _)) => MountReply::Ok {
+        handle,
+        auth_flavors: vec![AUTH_SYS, AUTH_NONE],
+      },
       None => MountReply::Err(Mountstat3::Noent),
     }
   }
@@ -365,19 +408,106 @@ impl NfsService for MultiExport<'_> {
     match peek_handle_volume(args) {
       // The synthetic root's own handle.
       Some(volume) if volume == ROOT_VOLUME => self.serve_root(procedure, args),
-      // A volume's handle routes to that volume's export.
-      Some(volume) => {
-        let index = self.index_of(volume).unwrap_or(0);
+      // A volume's handle routes to that volume's transient serve; an unknown volume is stale.
+      Some(volume) => Some(
         self
-          .mounts
-          .get_mut(index)?
-          .export
-          .serve_nfs(procedure, args)
-      }
-      // An unparseable handle routes to the first export, which answers `BADHANDLE` with the right
-      // reply shape; with no volumes there is nothing to answer with (`PROC_UNAVAIL`).
-      None => self.mounts.get_mut(0)?.export.serve_nfs(procedure, args),
+          .set
+          .serve(volume, self.subject.clone(), self.rights, procedure, args)
+          .unwrap_or_else(|| stale_for(procedure)),
+      ),
+      // An unparseable handle is a bad handle in the procedure's own reply shape.
+      None => Some(badhandle_for(procedure)),
     }
+  }
+}
+
+/// One volume of an [`OwnedVolumeSet`]: its mount name, id, the volume core object, and its overlay
+/// host if it has a base. The volumes share the set's one store, the daemon's shape.
+pub struct OwnedVolume {
+  /// The mount name the volume appears under in the root.
+  pub name: String,
+  /// The volume id (its routing key and file-handle stamp).
+  pub id: VolumeId,
+  /// The volume core object.
+  pub volume: Volume,
+}
+
+/// A [`VolumeSet`] that owns its store and volumes — the shape a shard holds (one store, several
+/// volumes), used by tests and examples to drive the shared-store serve the daemon uses. Each request
+/// builds a transient [`VolumeBridge`] over the store and the routed volume.
+pub struct OwnedVolumeSet {
+  store: Store,
+  volumes: Vec<OwnedVolume>,
+}
+
+impl OwnedVolumeSet {
+  /// A set over `store` with no volumes yet.
+  pub fn new(store: Store) -> OwnedVolumeSet {
+    OwnedVolumeSet {
+      store,
+      volumes: Vec::new(),
+    }
+  }
+
+  /// Adds `volume` (id `id`) under the mount `name`. All volumes share the set's store.
+  pub fn add(&mut self, name: impl Into<String>, id: VolumeId, volume: Volume) {
+    self.volumes.push(OwnedVolume {
+      name: name.into(),
+      id,
+      volume,
+    });
+  }
+
+  /// Builds a transient export for `volume` over the shared store and runs `f` with it; `None` if the
+  /// volume is not in the set or its attachment cannot be admitted.
+  fn with_export<R>(
+    &mut self,
+    volume: VolumeId,
+    subject: Principal,
+    rights: Rights,
+    f: impl FnOnce(&mut Export<'_>) -> R,
+  ) -> Option<R> {
+    let store = &mut self.store;
+    let slot = self.volumes.iter_mut().find(|v| v.id == volume)?;
+    let mut bridge = VolumeBridge::new(volume, &mut slot.volume, store);
+    let mut export = Export::new(&mut bridge, volume, subject, rights).ok()?;
+    Some(f(&mut export))
+  }
+}
+
+impl VolumeSet for OwnedVolumeSet {
+  fn entries(&self) -> Vec<(String, VolumeId)> {
+    self
+      .volumes
+      .iter()
+      .map(|v| (v.name.clone(), v.id))
+      .collect()
+  }
+
+  fn serve(
+    &mut self,
+    volume: VolumeId,
+    subject: Principal,
+    rights: Rights,
+    procedure: u32,
+    args: &mut XdrReader<'_>,
+  ) -> Option<Vec<u8>> {
+    self
+      .with_export(volume, subject, rights, |export| {
+        export.serve_nfs(procedure, args)
+      })
+      .flatten()
+  }
+
+  fn root_object(
+    &mut self,
+    volume: VolumeId,
+    subject: Principal,
+    rights: Rights,
+  ) -> Option<(Nfsfh3, Fattr3)> {
+    self
+      .with_export(volume, subject, rights, |export| export.root_object())
+      .flatten()
   }
 }
 
@@ -399,6 +529,49 @@ fn peek_handle_volume(args: &XdrReader<'_>) -> Option<VolumeId> {
   FileHandle::from_fh(&handle)
     .ok()
     .map(|decoded| decoded.volume)
+}
+
+/// A `NFS3ERR_STALE` reply for a handle whose volume this set does not hold, in the failing
+/// procedure's own reply shape. The inode is not here, so the object the handle named is gone (D-4:
+/// inode numbers are never reused), which is exactly stale.
+fn stale_for(procedure: u32) -> Vec<u8> {
+  status_only_or_wcc(procedure, Nfsstat3::Stale)
+}
+
+/// A `NFS3ERR_BADHANDLE` reply when the leading handle does not parse, in the procedure's reply shape.
+fn badhandle_for(procedure: u32) -> Vec<u8> {
+  status_only_or_wcc(procedure, Nfsstat3::Badhandle)
+}
+
+/// Encodes `status` in the failing procedure's reply shape (its optional attributes all absent), so a
+/// routing-level refusal keeps the stream framed exactly as the per-volume export's own refusals do.
+fn status_only_or_wcc(procedure: u32, status: Nfsstat3) -> Vec<u8> {
+  let mut writer = XdrWriter::new();
+  status.encode(&mut writer);
+  match procedure {
+    // A leading `post_op_attr` (absent): GETATTR has none; these answer status + one post_op_attr.
+    NFSPROC3_LOOKUP | NFSPROC3_ACCESS | NFSPROC3_READLINK | NFSPROC3_READ | NFSPROC3_READDIR
+    | NFSPROC3_READDIRPLUS | NFSPROC3_FSINFO | NFSPROC3_FSSTAT => {
+      PostOpAttr(None).encode(&mut writer);
+    }
+    // The create family: post_op_fh (absent), post_op_attr (absent), dir wcc (absent).
+    NFSPROC3_CREATE | NFSPROC3_MKDIR | NFSPROC3_SYMLINK => {
+      writer.bool(false);
+      writer.bool(false);
+      write_absent_wcc(&mut writer);
+    }
+    NFSPROC3_RENAME => {
+      write_absent_wcc(&mut writer);
+      write_absent_wcc(&mut writer);
+    }
+    // SETATTR, WRITE, REMOVE, RMDIR: one wcc_data.
+    NFSPROC3_SETATTR | NFSPROC3_WRITE | NFSPROC3_REMOVE | NFSPROC3_RMDIR => {
+      write_absent_wcc(&mut writer);
+    }
+    // GETATTR and anything else: the status alone.
+    _ => {}
+  }
+  writer.into_bytes()
 }
 
 /// Encodes one root-listing entry (a mounted volume) as a READDIR `entry3` or a READDIRPLUS
