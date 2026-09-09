@@ -54,11 +54,32 @@ jobs:
       - name: The slates CLI flow (anchor + daemon)
         run: SLATES_TEST_CLI=1 cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture
       # The FSKit shim's Swift wire codec must agree with the Rust codec byte for byte (it shares the
-      # golden vector). Compile and run its cross-check on the macOS runner, where swiftc lives; the
-      # FSVolume handler, the app-group ring, and the entitlement are the mount-spike half, not this.
+      # golden vector). Compile and run its cross-check on the macOS runner, where swiftc lives.
+      # ShimWire.swift is a pure library of the codec types; ShimWireMain.swift is the @main driver,
+      # kept separate so the FSVolume handler can compile against the library (see the next step).
       - name: FSKit Swift shim wire cross-check (macOS)
         if: runner.os == 'macOS'
-        run: swiftc crates/bridge-fskit/swift/ShimWire.swift -o "$RUNNER_TEMP/shimwire" && "$RUNNER_TEMP/shimwire"
+        run: |
+          swiftc crates/bridge-fskit/swift/ShimWire.swift crates/bridge-fskit/swift/ShimWireMain.swift \
+            -o "$RUNNER_TEMP/shimwire" && "$RUNNER_TEMP/shimwire"
+      # The FSKit FSVolume handler (SlatesVolume.swift) conforms to the real FSKit operation protocols;
+      # compiling it against FSKit.framework verifies that API integration — the vorpal "write it,
+      # compile-verify, gate the run" discipline. FSKit ships in the macOS 15.4+ SDK; on an older
+      # runner the step skips loudly and passes (it never fails for the pin being absent). The
+      # app-group ring transport and the live-mount run are the Phase 4 spike, marked SPIKE: in the
+      # source; setAttributes is refused pending an OP_SETATTR wire op (docs/wip/GAPS.md §4.6).
+      - name: FSKit FSVolume handler compiles against the real framework (macOS 15.4+)
+        if: runner.os == 'macOS'
+        run: |
+          if echo 'import FSKit' | swiftc -typecheck - 2>/dev/null; then
+            swiftc -parse-as-library -typecheck \
+              crates/bridge-fskit/swift/ShimWire.swift \
+              crates/bridge-fskit/swift/SlatesVolume.swift \
+              -framework FSKit
+            echo "FSKit handler: compiled against the real framework."
+          else
+            echo "SKIP (loud): FSKit is not in this runner's SDK (needs macOS 15.4+); handler compile skipped."
+          fi
       # T-1.17: the 10k-entry delta into a 10^6-entry tree against cp -r; informational on a
       # shared runner (no ratchet baseline), the numbers land in the job log.
       - name: Landing bench over tmpfs (Linux)

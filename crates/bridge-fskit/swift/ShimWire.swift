@@ -310,7 +310,3 @@ func run() -> Int {
 
   return failures
 }
-
-let failures = run()
-print(failures == 0 ? "ALL PASS" : "\(failures) FAILURES")
-exit(failures == 0 ? 0 : 1)
