@@ -29,12 +29,14 @@
 // Our code adds none. A ClientError cannot cross into Python as a Rust type, so it crosses as a
 // message string on `SlatesError` — the one place a typed error becomes text, and the reason is here.
 
+use std::collections::HashMap;
+
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use slates_client::{
   Client as RustClient, ClientError, CreateSpec, Deadlines, Filter, Landing, NamePolicy, Rebased,
-  SizeClass, SnapshotId, Submitted, VolumeId, WorkOp,
+  SizeClass, SnapshotId, StatusReport, Submitted, VolumeId, WorkOp,
 };
 
 /// Format: a volume id is 16 bytes on the wire — its high half names the creator host (§4.8 "Lookup").

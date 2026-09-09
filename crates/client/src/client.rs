@@ -187,6 +187,31 @@ fn resolved(body: ReplyBody) -> Result<ReplyBody, ClientError> {
   }
 }
 
+/// Extracts a created volume's id from its reply, or a typed mismatch — the async typed `create`
+/// verb's leg, sharing the sync `create`'s rule.
+fn extract_created(body: ReplyBody) -> Result<VolumeId, ClientError> {
+  match body {
+    ReplyBody::Created { id } => Ok(id),
+    _ => Err(ClientError::UnexpectedReply { verb: "create" }),
+  }
+}
+
+/// Extracts a snapshot's id from its reply, or a typed mismatch.
+fn extract_snapshotted(body: ReplyBody) -> Result<SnapshotId, ClientError> {
+  match body {
+    ReplyBody::Snapshotted { id } => Ok(id),
+    _ => Err(ClientError::UnexpectedReply { verb: "snapshot" }),
+  }
+}
+
+/// Extracts a status report from its reply, or a typed mismatch.
+fn extract_status(body: ReplyBody) -> Result<StatusReport, ClientError> {
+  match body {
+    ReplyBody::Status { report } => Ok(report),
+    _ => Err(ClientError::UnexpectedReply { verb: "status" }),
+  }
+}
+
 impl Client {
   /// Connects to `instance` as a new client.
   pub fn connect(instance: &str, deadlines: Deadlines) -> Result<Client, ClientError> {
@@ -361,13 +386,19 @@ impl Client {
   /// while looking are buffered by id for their own `poll_reply`; a refusal is returned typed. `None`
   /// until `id`'s reply is on the ring.
   pub fn poll_reply(&mut self, id: RequestId) -> Result<Option<ReplyBody>, ClientError> {
-    if let Some(pos) = self.pending.iter().position(|(word, _)| *word == id.word()) {
+    self.poll_reply_word(id.word())
+  }
+
+  /// [`Self::poll_reply`] by the request id's word — the form an async pump uses, which holds a
+  /// request's id as its `u64` word across the yield to its event loop.
+  pub fn poll_reply_word(&mut self, word: u64) -> Result<Option<ReplyBody>, ClientError> {
+    if let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) {
       let (_, body) = self.pending.remove(pos);
       return resolved(body).map(Some);
     }
     while let Some(reply) = self.end.try_take()? {
       let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
-      if reply.request == id.word() {
+      if reply.request == word {
         return resolved(body).map(Some);
       }
       self.buffer(reply.request, body);
@@ -453,6 +484,120 @@ impl Client {
   #[cfg(unix)]
   pub fn drain_completion(&self) {
     self.end.drain_completion();
+  }
+
+  /// Sends the periodic acknowledgement if it is due, without waiting for its reply — the async
+  /// caller drains and drops the `Acknowledged` reply as an id it never awaited. This keeps the
+  /// daemon's retained completion records bounded (§4.9) the way [`Self::call`] does inline on the
+  /// sync path, without a blocking round trip on the event loop. The acknowledged mark advances
+  /// optimistically; a lost ack only means the daemon holds a little more until the next one.
+  pub fn begin_ack_if_due(&mut self) -> Result<(), ClientError> {
+    if self.sequence.wrapping_sub(self.acknowledged) >= self.ack_every {
+      let up_to = self.sequence;
+      self.begin(&RequestBody::Acknowledge { up_to })?;
+      self.acknowledged = self.acknowledged.max(up_to);
+    }
+    Ok(())
+  }
+
+  /// The spin window the daemon published (nanoseconds): the async fast path spins this long taking
+  /// the reply before it arms and yields to its event loop.
+  pub fn published_spin_ns(&self) -> u64 {
+    u64::from(self.end.region().spin_ns())
+  }
+
+  // Typed async verbs (R6, D-19): a `begin` that sends and returns the id, a `spin` that takes the
+  // reply within the spin window (the fast path), and a `poll` that takes it by id word once the
+  // completion fd signals (the slow path) — each yielding the same typed value the sync verb returns,
+  // so a binding reuses its decode without touching the wire enums. Only the verbs the SDKs bind
+  // async today (create, snapshot, status); the rest follow the same three-line shape.
+
+  /// Begins a create, returning its request id (the async `create`'s send half).
+  pub fn create_begin(&mut self, spec: &CreateSpec) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::Create {
+      name: spec.name.clone(),
+      size: spec.size,
+      names: spec.names,
+      require_locked: spec.require_locked,
+      base: spec.base.clone(),
+    })
+  }
+
+  /// Takes a create's reply within `spin_ns` (the fast path); `None` if it has not come.
+  pub fn create_spin(
+    &mut self,
+    id: RequestId,
+    spin_ns: u64,
+  ) -> Result<Option<VolumeId>, ClientError> {
+    self.spin_as(id, spin_ns, extract_created)
+  }
+
+  /// Takes a create's reply by id word once the completion fd signals; `None` until it is on the ring.
+  pub fn create_poll(&mut self, word: u64) -> Result<Option<VolumeId>, ClientError> {
+    self.poll_as(word, extract_created)
+  }
+
+  /// Begins a snapshot, returning its request id.
+  pub fn snapshot_begin(&mut self, volume: VolumeId) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::Snapshot { volume })
+  }
+
+  /// Takes a snapshot's reply within `spin_ns`.
+  pub fn snapshot_spin(
+    &mut self,
+    id: RequestId,
+    spin_ns: u64,
+  ) -> Result<Option<SnapshotId>, ClientError> {
+    self.spin_as(id, spin_ns, extract_snapshotted)
+  }
+
+  /// Takes a snapshot's reply by id word once the completion fd signals.
+  pub fn snapshot_poll(&mut self, word: u64) -> Result<Option<SnapshotId>, ClientError> {
+    self.poll_as(word, extract_snapshotted)
+  }
+
+  /// Begins a status read, returning its request id.
+  pub fn status_begin(&mut self, volume: VolumeId) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::Status { volume })
+  }
+
+  /// Takes a status reply within `spin_ns`.
+  pub fn status_spin(
+    &mut self,
+    id: RequestId,
+    spin_ns: u64,
+  ) -> Result<Option<StatusReport>, ClientError> {
+    self.spin_as(id, spin_ns, extract_status)
+  }
+
+  /// Takes a status reply by id word once the completion fd signals.
+  pub fn status_poll(&mut self, word: u64) -> Result<Option<StatusReport>, ClientError> {
+    self.poll_as(word, extract_status)
+  }
+
+  /// Takes `id`'s reply within `spin_ns` and extracts its typed value (the fast path over a typed verb).
+  fn spin_as<T>(
+    &mut self,
+    id: RequestId,
+    spin_ns: u64,
+    extract: fn(ReplyBody) -> Result<T, ClientError>,
+  ) -> Result<Option<T>, ClientError> {
+    match self.spin_reply(id, spin_ns)? {
+      Some(body) => extract(body).map(Some),
+      None => Ok(None),
+    }
+  }
+
+  /// Takes the reply for `word` if present and extracts its typed value (the slow path over a typed verb).
+  fn poll_as<T>(
+    &mut self,
+    word: u64,
+    extract: fn(ReplyBody) -> Result<T, ClientError>,
+  ) -> Result<Option<T>, ClientError> {
+    match self.poll_reply_word(word)? {
+      Some(body) => extract(body).map(Some),
+      None => Ok(None),
+    }
   }
 
   /// Writes the request into the command ring, waiting on credit (the daemon drains the ring
