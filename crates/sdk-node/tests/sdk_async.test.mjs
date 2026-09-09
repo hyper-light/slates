@@ -140,6 +140,15 @@ test('async lifecycle over a live daemon', async (t) => {
     assert.equal(outcome.ok, true, 'the async submit landed cleanly');
     assert.deepEqual(outcome.conflicts, []);
     assert.equal(typeof outcome.version, 'number');
+
+    // await versions/changedSince → the green advanced past the work's base and lists the edit.
+    assert.ok((await client.versions(green)) > work.base, 'the green advanced past the work base');
+    const changed = await client.changedSince(green, work.base);
+    assert.ok(changed.some((p) => p.includes('notes.txt')), 'changedSince lists the edit');
+    // await rebase → a fresh work off the advanced head rebases cleanly.
+    const fresh = await client.createWork(green, 'w2-node-async');
+    const rebased = await client.rebase(fresh.id);
+    assert.equal(rebased.ok, true, 'a fresh async work rebases cleanly');
   } finally {
     // Kill the whole process group so the supervised daemon goes with the anchor at once.
     try {

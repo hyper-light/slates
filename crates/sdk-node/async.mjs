@@ -101,6 +101,24 @@ export class AsyncClient {
     return this._await(word, (w) => this._c.pollSubmit(w));
   }
 
+  async versions(green) {
+    const { word, fast } = this._c.beginSpinVersions(green);
+    if (fast != null) return fast;
+    return this._await(word, (w) => this._c.pollVersions(w));
+  }
+
+  async changedSince(green, version) {
+    const { word, fast } = this._c.beginSpinChangedSince(green, version);
+    if (fast != null) return fast;
+    return this._await(word, (w) => this._c.pollChangedSince(w));
+  }
+
+  async rebase(work) {
+    const { word, fast } = this._c.beginSpinRebase(work);
+    if (fast != null) return fast;
+    return this._await(word, (w) => this._c.pollRebase(w));
+  }
+
   // Registers the pending future, arms the completion signal, ensures the reader, and closes the race
   // with a reply that landed between the spin's end and the arm.
   _await(word, poll) {

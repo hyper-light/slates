@@ -280,6 +280,38 @@ fn extract_submitted(body: ReplyBody) -> Result<Submitted, ClientError> {
   }
 }
 
+/// Extracts a green's head version from its reply, or a typed mismatch.
+fn extract_versions(body: ReplyBody) -> Result<u64, ClientError> {
+  match body {
+    ReplyBody::Versions { head } => Ok(head),
+    _ => Err(ClientError::UnexpectedReply { verb: "versions" }),
+  }
+}
+
+/// Extracts the changed-paths list from its reply, or a typed mismatch.
+fn extract_changed(body: ReplyBody) -> Result<Vec<String>, ClientError> {
+  match body {
+    ReplyBody::ChangedSince { paths } => Ok(paths),
+    _ => Err(ClientError::UnexpectedReply {
+      verb: "changed_since",
+    }),
+  }
+}
+
+/// Extracts a rebase's outcome — rebased onto a version, or a conflict — or a typed mismatch.
+fn extract_rebased(body: ReplyBody) -> Result<Rebased, ClientError> {
+  match body {
+    ReplyBody::Rebased {
+      version: Some(v), ..
+    } => Ok(Rebased::Rebased(v)),
+    ReplyBody::Rebased {
+      version: None,
+      conflicts,
+    } => Ok(Rebased::Conflict(conflicts)),
+    _ => Err(ClientError::UnexpectedReply { verb: "rebase" }),
+  }
+}
+
 impl Client {
   /// Connects to `instance` as a new client.
   pub fn connect(instance: &str, deadlines: Deadlines) -> Result<Client, ClientError> {
@@ -804,6 +836,63 @@ impl Client {
   /// Takes a submit's outcome by id word once the completion fd signals.
   pub fn submit_poll(&mut self, word: u64) -> Result<Option<Submitted>, ClientError> {
     self.poll_as(word, extract_submitted)
+  }
+
+  /// Begins a versions query on a green, returning its request id.
+  pub fn versions_begin(&mut self, green: VolumeId) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::Versions { green })
+  }
+
+  /// Takes a versions reply within `spin_ns`.
+  pub fn versions_spin(&mut self, id: RequestId, spin_ns: u64) -> Result<Option<u64>, ClientError> {
+    self.spin_as(id, spin_ns, extract_versions)
+  }
+
+  /// Takes a versions reply by id word once the completion fd signals.
+  pub fn versions_poll(&mut self, word: u64) -> Result<Option<u64>, ClientError> {
+    self.poll_as(word, extract_versions)
+  }
+
+  /// Begins a changed-since query on a green, returning its request id.
+  pub fn changed_since_begin(
+    &mut self,
+    green: VolumeId,
+    version: u64,
+  ) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::ChangedSince { green, version })
+  }
+
+  /// Takes a changed-since reply within `spin_ns`.
+  pub fn changed_since_spin(
+    &mut self,
+    id: RequestId,
+    spin_ns: u64,
+  ) -> Result<Option<Vec<String>>, ClientError> {
+    self.spin_as(id, spin_ns, extract_changed)
+  }
+
+  /// Takes a changed-since reply by id word once the completion fd signals.
+  pub fn changed_since_poll(&mut self, word: u64) -> Result<Option<Vec<String>>, ClientError> {
+    self.poll_as(word, extract_changed)
+  }
+
+  /// Begins a rebase of a work volume, returning its request id.
+  pub fn rebase_begin(&mut self, work: VolumeId) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::Rebase { work })
+  }
+
+  /// Takes a rebase's outcome within `spin_ns`.
+  pub fn rebase_spin(
+    &mut self,
+    id: RequestId,
+    spin_ns: u64,
+  ) -> Result<Option<Rebased>, ClientError> {
+    self.spin_as(id, spin_ns, extract_rebased)
+  }
+
+  /// Takes a rebase's outcome by id word once the completion fd signals.
+  pub fn rebase_poll(&mut self, word: u64) -> Result<Option<Rebased>, ClientError> {
+    self.poll_as(word, extract_rebased)
   }
 
   /// Takes `id`'s reply within `spin_ns` and extracts its typed value (the fast path over a typed verb).

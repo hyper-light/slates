@@ -402,6 +402,21 @@ fn submit_outcome(outcome: Submitted) -> Result<MergeOutcome> {
   }
 }
 
+/// Builds a [`MergeOutcome`] from a rebase's typed outcome — the same shape as a submit (§4.16).
+/// Shared by the sync and async `rebase` verbs.
+fn rebase_outcome(outcome: Rebased) -> Result<MergeOutcome> {
+  match outcome {
+    Rebased::Rebased(version) => merge_outcome(Some(version), Vec::new()),
+    Rebased::Conflict(windows) => merge_outcome(
+      None,
+      windows
+        .into_iter()
+        .map(|window| (window.path, window.at, window.len, window.class))
+        .collect(),
+    ),
+  }
+}
+
 /// A create-work begin-and-spin result (see [`CreateBegin`]).
 #[napi(object)]
 pub struct WorkBegin {
@@ -411,13 +426,22 @@ pub struct WorkBegin {
   pub fast: Option<WorkVolume>,
 }
 
-/// A submit begin-and-spin result (see [`CreateBegin`]).
+/// A submit or rebase begin-and-spin result (see [`CreateBegin`]).
 #[napi(object)]
 pub struct SubmitBegin {
   /// The request id word.
   pub word: String,
   /// The merge outcome, present when the reply came within the spin window.
   pub fast: Option<MergeOutcome>,
+}
+
+/// A changed-since begin-and-spin result (see [`CreateBegin`]).
+#[napi(object)]
+pub struct ChangedBegin {
+  /// The request id word.
+  pub word: String,
+  /// The changed paths, present when the reply came within the spin window.
+  pub fast: Option<Vec<String>>,
 }
 
 #[napi]
@@ -873,6 +897,88 @@ impl Client {
     }
   }
 
+  /// Begins a versions query and spins; the word and the head version if it landed in the spin.
+  #[napi]
+  pub fn begin_spin_versions(&mut self, green: String) -> Result<SnapshotBegin> {
+    let green = parse_volume(&green)?;
+    let request = self.inner.versions_begin(green).map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let spin = self.inner.published_spin_ns();
+    let fast = match self.inner.versions_spin(request, spin).map_err(refusal)? {
+      Some(head) => Some(status_i64(head, "version")?),
+      None => None,
+    };
+    Ok(SnapshotBegin {
+      word: request.word().to_string(),
+      fast,
+    })
+  }
+
+  /// Takes a versions reply by its word once the completion fd signals.
+  #[napi]
+  pub fn poll_versions(&mut self, word: String) -> Result<Option<i64>> {
+    let word = parse_word(&word)?;
+    match self.inner.versions_poll(word).map_err(refusal)? {
+      Some(head) => Ok(Some(status_i64(head, "version")?)),
+      None => Ok(None),
+    }
+  }
+
+  /// Begins a changed-since query and spins; the word and the paths if they landed in the spin.
+  #[napi]
+  pub fn begin_spin_changed_since(&mut self, green: String, version: i64) -> Result<ChangedBegin> {
+    let green = parse_volume(&green)?;
+    let version = checked_u64(version, "version")?;
+    let request = self
+      .inner
+      .changed_since_begin(green, version)
+      .map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let spin = self.inner.published_spin_ns();
+    let fast = self
+      .inner
+      .changed_since_spin(request, spin)
+      .map_err(refusal)?;
+    Ok(ChangedBegin {
+      word: request.word().to_string(),
+      fast,
+    })
+  }
+
+  /// Takes a changed-since reply by its word once the completion fd signals.
+  #[napi]
+  pub fn poll_changed_since(&mut self, word: String) -> Result<Option<Vec<String>>> {
+    let word = parse_word(&word)?;
+    self.inner.changed_since_poll(word).map_err(refusal)
+  }
+
+  /// Begins a rebase and spins; the word and the merge outcome if it landed in the spin.
+  #[napi]
+  pub fn begin_spin_rebase(&mut self, work: String) -> Result<SubmitBegin> {
+    let work = parse_volume(&work)?;
+    let request = self.inner.rebase_begin(work).map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let spin = self.inner.published_spin_ns();
+    let fast = match self.inner.rebase_spin(request, spin).map_err(refusal)? {
+      Some(outcome) => Some(rebase_outcome(outcome)?),
+      None => None,
+    };
+    Ok(SubmitBegin {
+      word: request.word().to_string(),
+      fast,
+    })
+  }
+
+  /// Takes a rebase's outcome by its word once the completion fd signals.
+  #[napi]
+  pub fn poll_rebase(&mut self, word: String) -> Result<Option<MergeOutcome>> {
+    let word = parse_word(&word)?;
+    match self.inner.rebase_poll(word).map_err(refusal)? {
+      Some(outcome) => Ok(Some(rebase_outcome(outcome)?)),
+      None => Ok(None),
+    }
+  }
+
   /// Lists the daemon's volumes (§4.4) as an array of [`VolumeEntry`] objects — id (hex), name, byte
   /// accounting, and overlay flag, the plain shape `slates list` prints.
   #[napi]
@@ -1013,16 +1119,7 @@ impl Client {
   #[napi]
   pub fn rebase(&mut self, work: String) -> Result<MergeOutcome> {
     let work = parse_volume(&work)?;
-    match self.inner.rebase(work).map_err(refusal)? {
-      Rebased::Rebased(version) => merge_outcome(Some(version), Vec::new()),
-      Rebased::Conflict(windows) => merge_outcome(
-        None,
-        windows
-          .into_iter()
-          .map(|w| (w.path, w.at, w.len, w.class))
-          .collect(),
-      ),
-    }
+    rebase_outcome(self.inner.rebase(work).map_err(refusal)?)
   }
 
   /// How many times this client has reconnected across daemon restarts (an observability counter, so a

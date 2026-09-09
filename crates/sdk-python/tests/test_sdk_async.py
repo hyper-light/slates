@@ -145,6 +145,15 @@ class SlatesAsyncRoundTrip(unittest.TestCase):
             self.assertTrue(outcome["ok"], f"the async submit landed cleanly: {outcome}")
             self.assertEqual(outcome["conflicts"], [])
             self.assertIsInstance(outcome["version"], int)
+
+            # await versions/changed_since → the green advanced past the work's base and lists the edit.
+            self.assertGreater(await client.versions(green), work["base"])
+            changed = await client.changed_since(green, work["base"])
+            self.assertTrue(any("notes.txt" in path for path in changed), changed)
+            # await rebase → a fresh work off the advanced head rebases cleanly (nothing to conflict).
+            fresh = await client.create_work(green, "w2-async")
+            rebased = await client.rebase(fresh["id"])
+            self.assertTrue(rebased["ok"], f"a fresh async work rebases cleanly: {rebased}")
         finally:
             # Kill the whole process group so the supervised daemon goes with the anchor at once.
             try:

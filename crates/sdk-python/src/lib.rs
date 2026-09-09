@@ -246,6 +246,23 @@ fn submitted_to_py(py: Python<'_>, outcome: Submitted) -> PyResult<PyObject> {
   Ok(dict.into_any())
 }
 
+/// Builds a rebase-outcome dict from the typed outcome — the same `{ok, version, conflicts}` shape as
+/// a submit (§4.16). Shared by the sync and async `rebase` verbs.
+fn rebased_to_py(py: Python<'_>, outcome: Rebased) -> PyResult<PyObject> {
+  let dict = match outcome {
+    Rebased::Rebased(version) => merge_outcome_dict(py, Some(version), Vec::new())?,
+    Rebased::Conflict(windows) => merge_outcome_dict(
+      py,
+      None,
+      windows
+        .into_iter()
+        .map(|window| (window.path, window.at, window.len, window.class))
+        .collect(),
+    )?,
+  };
+  Ok(dict.into_any())
+}
+
 #[pyclass(unsendable)]
 struct Client {
   inner: RustClient,
@@ -457,19 +474,10 @@ impl Client {
   /// Rebases a work volume onto its green's head (§4.16), mapping its pending edits forward without
   /// committing to the green — the same outcome shape as [`Client::submit`]: `ok` with the head
   /// `version` it now sits on, or the `conflicts` to resolve first.
-  fn rebase(&mut self, py: Python<'_>, work: &str) -> PyResult<Py<PyDict>> {
+  fn rebase(&mut self, py: Python<'_>, work: &str) -> PyResult<Py<PyAny>> {
     let work = parse_volume(work)?;
-    match self.inner.rebase(work).map_err(refusal)? {
-      Rebased::Rebased(version) => merge_outcome_dict(py, Some(version), Vec::new()),
-      Rebased::Conflict(windows) => merge_outcome_dict(
-        py,
-        None,
-        windows
-          .into_iter()
-          .map(|w| (w.path, w.at, w.len, w.class))
-          .collect(),
-      ),
-    }
+    let outcome = self.inner.rebase(work).map_err(refusal)?;
+    rebased_to_py(py, outcome)
   }
 
   /// Removes the name at `path` on a work volume (§4.16) — a file, symlink or hard link.
@@ -611,6 +619,12 @@ enum Decode {
   Edited,
   /// A submit's outcome dict.
   Submitted,
+  /// A green's head version.
+  Versions,
+  /// A list of changed paths.
+  Changed,
+  /// A rebase's outcome dict.
+  Rebased,
 }
 
 /// A request in flight on the async client: the future its `await` suspends on, and how to decode its
@@ -927,6 +941,71 @@ impl AsyncClient {
     finish(&slf, word, fast, Decode::Submitted)
   }
 
+  /// A green's head version (§4.16) — the async form of [`Client.versions`].
+  fn versions<'py>(slf: Bound<'py, Self>, green: &str) -> PyResult<Bound<'py, PyAny>> {
+    let py = slf.py();
+    let green = parse_volume(green)?;
+    let (word, fast) = {
+      let mut this = slf.borrow_mut();
+      let request = this.inner.versions_begin(green).map_err(refusal)?;
+      this.inner.begin_ack_if_due().map_err(refusal)?;
+      let spin = this.inner.published_spin_ns();
+      let fast = this
+        .inner
+        .versions_spin(request, spin)
+        .map_err(refusal)?
+        .map(|head| head.into_py(py));
+      (request.word(), fast)
+    };
+    finish(&slf, word, fast, Decode::Versions)
+  }
+
+  /// The files a green changed strictly after `version` (§4.16) — the async form of
+  /// [`Client.changed_since`].
+  fn changed_since<'py>(
+    slf: Bound<'py, Self>,
+    green: &str,
+    version: u64,
+  ) -> PyResult<Bound<'py, PyAny>> {
+    let py = slf.py();
+    let green = parse_volume(green)?;
+    let (word, fast) = {
+      let mut this = slf.borrow_mut();
+      let request = this
+        .inner
+        .changed_since_begin(green, version)
+        .map_err(refusal)?;
+      this.inner.begin_ack_if_due().map_err(refusal)?;
+      let spin = this.inner.published_spin_ns();
+      let fast = this
+        .inner
+        .changed_since_spin(request, spin)
+        .map_err(refusal)?
+        .map(|paths| paths.into_py(py));
+      (request.word(), fast)
+    };
+    finish(&slf, word, fast, Decode::Changed)
+  }
+
+  /// Rebases a work volume onto its green's head (§4.16) as an outcome dict — the async form of
+  /// [`Client.rebase`].
+  fn rebase<'py>(slf: Bound<'py, Self>, work: &str) -> PyResult<Bound<'py, PyAny>> {
+    let py = slf.py();
+    let work = parse_volume(work)?;
+    let (word, fast) = {
+      let mut this = slf.borrow_mut();
+      let request = this.inner.rebase_begin(work).map_err(refusal)?;
+      this.inner.begin_ack_if_due().map_err(refusal)?;
+      let spin = this.inner.published_spin_ns();
+      let fast = match this.inner.rebase_spin(request, spin).map_err(refusal)? {
+        Some(outcome) => Some(rebased_to_py(py, outcome)?),
+        None => None,
+      };
+      (request.word(), fast)
+    };
+    finish(&slf, word, fast, Decode::Rebased)
+  }
+
   /// The event loop's reader callback: drain the completion fd and resolve every request whose reply
   /// has landed. Registered once with `add_reader`, removed when no request is in flight.
   fn _pump(slf: Bound<'_, Self>) -> PyResult<()> {
@@ -1127,6 +1206,18 @@ fn decode_pending(
       .map(|_done| py.None()),
     Decode::Submitted => match inner.submit_poll(word).map_err(refusal)? {
       Some(outcome) => Some(submitted_to_py(py, outcome)?),
+      None => None,
+    },
+    Decode::Versions => inner
+      .versions_poll(word)
+      .map_err(refusal)?
+      .map(|head| head.into_py(py)),
+    Decode::Changed => inner
+      .changed_since_poll(word)
+      .map_err(refusal)?
+      .map(|paths| paths.into_py(py)),
+    Decode::Rebased => match inner.rebase_poll(word).map_err(refusal)? {
+      Some(outcome) => Some(rebased_to_py(py, outcome)?),
       None => None,
     },
   })
