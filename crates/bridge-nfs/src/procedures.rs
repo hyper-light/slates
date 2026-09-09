@@ -1150,8 +1150,11 @@ impl<'b> Export<'b> {
   /// NFSPROC3_READDIR: list a directory's entries over the shared interface under the export's
   /// context. The reply carries the directory's attributes, a cookieverf, and as many entries as
   /// fit the client's `count` — each with a resume cookie — then the end-of-directory flag. A
-  /// `count` too small for even one entry is `NFS3ERR_TOOSMALL`. Synthetic `.` and `..` entries are
-  /// not emitted (the shared `readdir` returns children only, the same as the FUSE edge; owed).
+  /// `count` too small for even one entry is `NFS3ERR_TOOSMALL`. The `.` (the directory) and `..`
+  /// (its parent, the directory itself at the root, POSIX) entries lead the listing — the shared
+  /// `readdir` emits them as positions 0 and 1 (`VolumeBridge::readdir`), so this passes them
+  /// through like any child (proven by `tests/procedures.rs` `readdir_lists_entries_and_paginates`,
+  /// which sees `[".", "..", "a", "b", "c"]`).
   pub fn readdir(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
     self.encode_readdir(args, false)
   }
