@@ -492,6 +492,9 @@ pub struct StatusReport {
   pub snapshots: u32,
   /// The placement of the head (§4.8, D-18).
   pub placed: PlacedState,
+  /// The daemon's NFS loopback port (§4.6), so a client can mount the volume with `mount_nfs
+  /// localhost:PORT`; `None` when the daemon is not serving NFS (the listener could not bind).
+  pub nfs_port: Option<u16>,
 }
 
 /// An action name and how many entries take it.

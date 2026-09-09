@@ -28,6 +28,18 @@ fn connect(instance: &str) -> Result<Client, Failure> {
 /// Runs one client verb.
 pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
   let mut client = connect(&request.instance)?;
+  // `mount` reads the volume's name and the daemon's NFS port through the client, then runs `mount_nfs`
+  // to mount it over the loopback NFS bridge (§4.6) — no privilege, no kernel extension, no Apple
+  // entitlement. Its failure is a `Failure` (a mount refusal, not a client error), so it is handled
+  // here rather than in [`serve`].
+  if let Verb::Mount { volume, path } = &request.verb {
+    let report = client
+      .status(*volume)
+      .map_err(|e| failure_of(e, &request.instance))?;
+    let mounted = crate::mount::establish(&report, path)?;
+    println!("mounted: {mounted}");
+    return Ok(());
+  }
   let outcome = serve(&mut client, &request.verb);
   outcome.map_err(|e| failure_of(e, &request.instance))
 }
@@ -180,6 +192,9 @@ fn serve(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
         print!("{}", status_text(&report));
       }
     }
+    // `mount` runs `mount_nfs` (a CLI/OS operation whose failure is a `Failure`, not a `ClientError`),
+    // so [`run`] handles it before this dispatch; it never reaches here.
+    Verb::Mount { .. } => {}
     Verb::Snapshot { volume } => {
       println!("snapshot: {}", client.snapshot(*volume)?.value);
     }

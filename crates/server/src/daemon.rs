@@ -119,6 +119,10 @@ pub static PUBLISH_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 pub static CLIENTS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Clients found dead and reclaimed (a health signal; T-2.3).
 pub static CLIENTS_REAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The loopback port the NFS transport serves on (§4.6), 0 until the listener is bound. Published as
+/// a process-global word (like the health signals) so a verb handler on any shard can report it to a
+/// client — `slates mount` reads it to run `mount_nfs localhost:PORT`.
+pub static NFS_PORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl Daemon {
   /// Starts the daemon from a profile.
@@ -205,6 +209,8 @@ impl Daemon {
       Ok(nfs_listener) => {
         let port = nfs_listener.local_addr().ok().map(|addr| addr.port());
         if let Some(port) = port {
+          // Publish the port for a verb handler to report to a client (`slates mount`).
+          NFS_PORT.store(u32::from(port), Ordering::Release);
           runtime.spawn_on(control, async move {
             if let Ok(task) = futures::spawn(crate::nfs::serve(nfs_listener, port)) {
               let _ = futures::detach(task);

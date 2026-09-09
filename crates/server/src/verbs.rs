@@ -2435,6 +2435,10 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       watcher,
       snapshots: u32::try_from(slot.volume.snapshot_count()).unwrap_or(u32::MAX),
       placed: placed_state(state, record.id, record.head),
+      // The daemon's NFS port (§4.6), 0 until the listener binds; report it so a client can mount.
+      nfs_port: u16::try_from(crate::daemon::NFS_PORT.load(std::sync::atomic::Ordering::Acquire))
+        .ok()
+        .filter(|port| *port != 0),
     },
   }
 }

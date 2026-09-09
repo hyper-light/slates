@@ -144,6 +144,13 @@ pub(crate) enum Verb {
     /// Drifted entries only.
     drift: bool,
   },
+  /// Mount a volume at a path over the loopback NFS bridge (`mount ID PATH`).
+  Mount {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The mount point: an existing user-owned directory.
+    path: String,
+  },
   /// Snapshot.
   Snapshot {
     /// The volume.
@@ -653,6 +660,17 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
       taken.only(&NONE)?;
       Ok(client(&taken, Verb::DaemonStatus))
     }
+    ["mount", id, path] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        &taken,
+        Verb::Mount {
+          volume: volume(id)?,
+          path: (*path).to_owned(),
+        },
+      ))
+    }
+    ["mount", ..] => Err(ParseError::Missing("mount ID PATH")),
     ["base", rest @ ..] => parse_base(&taken, rest),
     ["land", id, target] => {
       taken.only(&Spec {

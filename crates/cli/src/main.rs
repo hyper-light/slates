@@ -24,6 +24,7 @@ mod daemon;
 #[cfg(target_os = "linux")]
 mod exec;
 mod format;
+mod mount;
 mod parent;
 mod signal;
 mod verbs;
