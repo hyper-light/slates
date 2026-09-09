@@ -737,6 +737,10 @@ fn daemon_status_text(report: &DaemonReport) -> String {
         shard.partition, signal.name, signal.value, signal.freshness_ns
       ));
     }
+    out.push_str(&format!(
+      "shard {} telemetry: spans_held={} spans_dropped={}\n",
+      shard.partition, shard.spans_held, shard.spans_dropped
+    ));
   }
   out
 }

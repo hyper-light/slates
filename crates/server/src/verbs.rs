@@ -35,6 +35,7 @@ use slates_vfs::quota::{BudgetGrowth, Quota};
 use slates_vfs::recover::{KeyedImage, ShardImage, VolumeImage};
 use slates_vfs::volume::{DestroyProgress, Volume, VolumeConfig};
 use slates_wire::Wire;
+use slates_wire::observe::{Chokepoint, Span, SpanContext, SpanId, TraceId};
 use slates_wire::request::{RequestId, Seen};
 
 use crate::error::{refusal_of_db, refusal_of_vfs};
@@ -298,13 +299,46 @@ fn run_recorded(
   principal: &Principal,
   body: RequestBody,
 ) -> ReplyBody {
+  // The `shard.op` chokepoint span (§4.14): one verb on its owner shard, no awaits inside, measured
+  // from before the verb runs to after its completion record commits. The label is content-free — a
+  // read (0) or a mutation (1), the `shard.op{verb}` dimension at the coarsest honest granularity (a
+  // finer per-verb code is a follow-up); it never carries a path, a name or bytes. Computed before
+  // `dispatch` moves `body`.
+  let start_ns = state.clock.monotonic_ns();
+  let label = u32::from(mutates_shard_image(&body));
   state.db.begin();
   let reply = dispatch(state, client_id, principal, body);
   let reply = record_completion(state, id, reply);
-  match state.db.commit(&mut state.segment) {
+  let reply = match state.db.commit(&mut state.segment) {
     Ok(_) => reply,
     Err(e) => refused(refusal_of_db(&e)),
-  }
+  };
+  let end_ns = state.clock.monotonic_ns();
+  emit_shard_op(state, id, label, start_ns, end_ns);
+  reply
+}
+
+/// Emits the `shard.op` chokepoint span (§4.14) into this shard's bounded telemetry sink: the request
+/// identity (real, for replay), a fresh per-shard span id, and — until cross-boundary trace propagation
+/// (from the bridge or client) is wired — a trace seeded from the request word so a request's spans
+/// still correlate. `caused_by` is none, no upstream causal event being threaded yet. Emission is a
+/// sink push: no await, no lock, so it never blocks the verb it measures; a full sink sheds the oldest
+/// span and counts it (§4.14 shed-first, loss explicit).
+fn emit_shard_op(state: &mut ShardState, id: RequestId, label: u32, start_ns: u64, end_ns: u64) {
+  let span = SpanId(state.next_span_id);
+  state.next_span_id = state.next_span_id.saturating_add(1);
+  state.telemetry.emit(Span {
+    point: Chokepoint::ShardOp,
+    label,
+    context: SpanContext {
+      request: id,
+      trace: TraceId(u128::from(id.word())),
+      span,
+      caused_by: None,
+    },
+    start_ns,
+    end_ns,
+  });
 }
 
 /// The owner's side of a forwarded verb: its own completion window first (a retry of a
@@ -711,6 +745,8 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     version_slots: state.store.versions.capacity(),
     committed_versions: state.store.versions.committed(),
     signals,
+    spans_held: u64::try_from(state.telemetry.len()).unwrap_or(u64::MAX),
+    spans_dropped: state.telemetry.dropped(),
   }
 }
 

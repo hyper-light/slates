@@ -462,6 +462,7 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
   version_reservation_scenario();
   version_reservation_moves_on_resize_scenario();
   version_stats_scenario();
+  telemetry_scenario();
   snapshot_destroy_scenario();
   green_chain_scenario();
   merge_submit_scenario();
@@ -652,6 +653,34 @@ fn version_stats_scenario() {
   assert!(
     after > before,
     "a volume's inode allowance is committed against the version slab: {after}"
+  );
+  daemon.stop();
+}
+
+/// The `shard.op` chokepoint span is emitted for real, not just registered (§4.14): running verbs
+/// leaves spans in the shards' bounded telemetry sinks, and the daemon status reports the held count.
+/// Do: read the held span count, run several verbs, read it again. Expect: it moved up — the live
+/// non-vacuity witness that the registered emitter actually emits (a dead emit path would keep it at
+/// zero while the registration gate still passed). The count is reported per shard and summed here.
+fn telemetry_scenario() {
+  let (daemon, instance) = daemon("telemetry");
+  let mut client = Client::connect(&instance);
+  let held = |client: &mut Client| -> u64 {
+    let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+      panic!("daemon status");
+    };
+    report.shards.iter().map(|s| s.spans_held).sum()
+  };
+  let before = held(&mut client);
+  for i in 0..8 {
+    let ReplyBody::Created { .. } = client.call(&scratch(&format!("tele-{i}"))) else {
+      panic!("create");
+    };
+  }
+  let after = held(&mut client);
+  assert!(
+    after > before,
+    "the shard.op emitter is live: verbs leave spans in the shards' telemetry sinks (before={before}, after={after})"
   );
   daemon.stop();
 }

@@ -384,6 +384,12 @@ pub struct ShardReport {
   pub committed_versions: u64,
   /// The health signals.
   pub signals: Vec<Signal>,
+  /// Chokepoint spans this shard currently holds in its bounded telemetry sink (§4.14): the most
+  /// recent, at most the sink's capacity — the shed-first ring keeps the newest.
+  pub spans_held: u64,
+  /// Chokepoint spans this shard has shed since boot because its bounded sink was full (§4.14
+  /// "bounded rings report dropped spans"): the explicit telemetry-loss signal, never a silent gap.
+  pub spans_dropped: u64,
 }
 
 /// The daemon's status.

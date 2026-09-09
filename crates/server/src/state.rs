@@ -152,6 +152,14 @@ pub struct ShardState {
   /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
   /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.
   pub works: BTreeMap<VolumeId, WorkState>,
+  /// This shard's bounded telemetry sink (§4.14): the chokepoint spans emitted on the shard, held
+  /// shed-first (the newest kept, the oldest dropped and counted). Per-shard and thread-local, so it
+  /// needs no lock (R2) — the design's "per-shard rings"; a control-shard aggregation is owed.
+  pub telemetry: slates_wire::observe::SpanSink,
+  /// The next span id this shard assigns (§4.14, the three-id law): a per-shard monotonic counter, so
+  /// every span this shard emits has a distinct id within the shard (and distinct across the daemon
+  /// with the partition in view). It never resets except by a restart.
+  pub next_span_id: u64,
 }
 
 /// A work volume's accumulated declared operations (§4.16), composed into an increment on submit.

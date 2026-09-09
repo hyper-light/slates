@@ -438,6 +438,10 @@ fn init_shard(
     }
     None => (0, 0),
   };
+  // The telemetry sink keeps the most recent spans up to one client ring's depth (§4.14): a shard
+  // processes at most a ring of in-flight requests, so a ring's depth of recent spans covers the
+  // current activity window; older spans are shed (and counted), telemetry being the shed-first class.
+  let telemetry_capacity = usize::try_from(config.region.slots).unwrap_or(1).max(1);
   let mut state = ShardState {
     shard,
     partition,
@@ -471,6 +475,8 @@ fn init_shard(
     greens: std::collections::BTreeMap::new(),
     works: std::collections::BTreeMap::new(),
     ack_scatters: std::collections::BTreeMap::new(),
+    telemetry: slates_wire::observe::SpanSink::with_capacity(telemetry_capacity),
+    next_span_id: 1,
   };
   let rebuilt = verbs::rebuild_recovered(&mut state);
   if rebuilt.skipped > 0 {
