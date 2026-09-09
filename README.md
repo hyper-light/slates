@@ -1,9 +1,9 @@
 <p align="center">
-  <a href="docs/assets/brand/slates-split-preview.png">
+  <a href="docs/assets/brand/slates-tablets-preview.png">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/slates-split-dark.svg">
-      <source media="(prefers-color-scheme: light)" srcset="docs/assets/brand/slates-split-light.svg">
-      <img src="docs/assets/brand/slates-split-light.svg" alt="Slates logo: an upright slate divided by a stepped open seam" width="90" height="90">
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/slates-tablets-dark.svg">
+      <source media="(prefers-color-scheme: light)" srcset="docs/assets/brand/slates-tablets-light.svg">
+      <img src="docs/assets/brand/slates-tablets-light.svg" alt="Slates logo: a working tablet lifted from its source, with a stepped cut in the upper slate" width="90" height="90">
     </picture>
   </a>
 </p>

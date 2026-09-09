@@ -1,40 +1,45 @@
 # slates logo
 
-Redrawn as native SVG on 2026-09-09. A single upright slate is divided into two
-complementary pieces by a stepped open seam. The pieces suggest workspaces that
-can diverge independently while retaining a common shape: the copy-on-write
-model described in the unified design's glossary and Part 1. The angular cuts
-and monochrome silhouette continue the sibling vorpal brand's visual style.
+Redrawn as native SVG on 2026-09-09. The mark keeps the floating tablets and
+stepped cut of the original concept. One working tablet lifts diagonally from
+its source, with a slightly different orientation. The pairing refers to the
+copy-on-write model in the unified design's glossary and Part 1: a workspace
+can diverge while its source stays intact.
 
 ## Files and construction
 
-- `slates-split.svg` is the editable vector master: two filled paths, 633 bytes.
-- `slates-split-light.svg` and `slates-split-dark.svg` use identical paths in
-  `#1f2328` and `#f0f6fc`. The README displays these SVGs directly.
-- `slates-split-transparent.png` is a 1080 × 1080 export of the master.
-- `slates-split-preview.png` shows both themes at 256, 90, and 28 pixels.
-  All three sizes were visually checked on 2026-09-09.
+- `slates-tablets.svg` is the editable monochrome vector master.
+- `slates-tablets-light.svg` and `slates-tablets-dark.svg` use the same geometry
+  in `#1f2328` and `#f0f6fc`. The README displays these SVGs directly.
+- `slates-tablets-transparent.png` is a 1080 × 1080 export of the master.
+- `slates-tablets-preview.png` shows both themes at 256, 90, and 28 pixels.
+  These sizes were visually checked on 2026-09-09.
 
-The SVG viewBox is 90 × 90, matching its README dimensions. Horizontal edges
-sit on whole-pixel coordinates at that size. The long edges move one unit left
-for every four units down, and the stepped seam is six units wide. The two
-outer corners have matching bevels. The background and seam are transparent.
-There are no embedded bitmaps, filters, fonts, scripts, or external resources.
+Each tablet is one filled outline that includes its thin front edge. The upper
+one is offset and turned relative to the source. A vector mask clears three
+design units around it, separating the tablets wherever they overlap. A second
+vector mask cuts the 5.5-unit stepped opening through the upper tablet. Both
+masks use black and white regardless of the artwork's theme color.
+
+The background and cutouts are transparent. The assets contain no embedded
+bitmaps, filters, fonts, scripts, or external resources. The 90 × 90 README
+presentation uses the vectors; the PNG is an optional export.
 
 Reproduce the transparent export from the repository root with:
 
 ```sh
 rsvg-convert --width 1080 --height 1080 \
-  --output docs/assets/brand/slates-split-transparent.png \
-  docs/assets/brand/slates-split.svg
+  --output docs/assets/brand/slates-tablets-transparent.png \
+  docs/assets/brand/slates-tablets.svg
 ```
 
-The root README uses relative paths and a `<picture>` element for the two
-color themes. Clicking the logo opens the preview.
+The root README selects the theme with a `<picture>` element and links to the
+preview. All paths are relative to the repository.
 
-## Previous concept
+## Earlier concepts
 
-The generated stack of planes remains in git history at `112b5ed`. Ada flagged
-its resemblance to Redis's old logo and its softness at README size. This
-revision replaces the stack with one upright form and replaces the raster
-wrappers with native vector paths.
+The generated three-plane stack remains in git history at `112b5ed`. Ada liked
+its tablets but flagged its resemblance to Redis's old logo and its softness
+at README size. The upright split-slate revision at `63356ec` removed too much
+of that character. This version restores the tablets as a source-and-copy pair
+and retains native vector rendering.
