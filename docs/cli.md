@@ -1,16 +1,19 @@
 # The `slates` command
 
-This guide describes the implemented command grammar at `a1059ed`, reviewed 2026-09-05.
-The [unified design](wip/SLATES_DESIGN.md) §4.12 describes the target interface; the
-[gap ledger](wip/GAPS.md) §8i tracks what is still missing.
+This guide describes the implemented command grammar (the A-9 review was 2026-09-05;
+`mount`/`unmount`, the merge verbs, `--json` on the read and query verbs, and `mcp` were
+added 2026-09-09). The [unified design](wip/SLATES_DESIGN.md) §4.12 describes the target
+interface; the [gap ledger](wip/GAPS.md) §8i tracks what is still missing.
 
 The current CLI is a development surface. `--locked` records intent without establishing
 locked backing, and bounded/dynamic claims do not yet provide the design's host-capacity
 guarantee. Daemon restart recovers metadata but can lose volume bytes and local snapshots.
 `attach` returns an attachment record without creating a mounted path. `exec` is Linux-only
 and currently expects an externally supplied `SLATES_ROOT` naming an established root mount.
-There is no implemented CLI/MCP virtio-fs or OCI attachment flow, MCP server or SDK package.
-These limitations are open correctness/integration work, not optional setup steps.
+There is no implemented CLI/MCP virtio-fs or OCI attachment flow; the MCP server (`slates mcp`)
+and the Python and Node SDKs are implemented (§4.12). On macOS a volume can be mounted for real
+over the loopback NFS bridge (`slates mount`) with no privilege, kernel extension or Apple
+entitlement. These limitations are open correctness/integration work, not optional setup steps.
 
 ## Running a daemon
 
@@ -33,24 +36,35 @@ The instance is `--instance`, else `SLATES_ENDPOINT`, else `default`.
 
 ```
 slates volume create NAME (--bounded SIZE | --dynamic MAX) [--fold] [--locked] [--base DIR]
-slates volume list
-slates volume stat ID
+slates volume list [--json]
+slates volume stat ID [--json]
 slates volume snapshot ID
 slates volume clone ID SNAPSHOT NAME
 slates volume resize ID (--bounded SIZE | --dynamic MAX)
 slates volume destroy ID
 slates volume placed ID [--snapshot N] [--mirror]
+slates green NAME
+slates versions GREEN [--json]
+slates changed-since GREEN VERSION [--json]
+slates work GREEN NAME
+slates edit WORK PATH AT DELETE TEXT
+slates submit WORK [--json]
+slates rebase WORK [--json]
+slates mount ID PATH
+slates unmount PATH
 slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N]
 slates grants
 slates audit [--since N]
 slates exec --volume V --at PATH -- CMD [ARG ...]
 slates attach ID [--read | --write] [--snapshot N]
 slates detach ATTACHMENT
-slates status ID [--drift]
+slates status [--json]
+slates status ID [--drift] [--json]
 slates base read ID PATH
 slates base rewitness ID [PATH ...]
 slates base pin ID [PATH ...]
 slates profile [--quick] [--json]
+slates mcp [--instance NAME] [--http PORT]
 ```
 
 Sizes take a binary unit (`512MiB`, `4GiB`; `B`, `KiB`, `MiB`, `GiB`, `TiB`) or plain bytes.
@@ -60,6 +74,13 @@ Output is plain and stable: one `key: value` per line (`create`, `stat`, `status
 `snapshot`, `clone`, `pin`), one record per line (`list`: id, name, `referenced=`, `unique=`,
 `overlay=`; `status --drift` and `rewitness`: one path per line), `ok` for the verbs that
 return nothing, and the raw bytes for `base read`.
+
+`--json` emits a machine-readable form of the read and query verbs — `status`, `status ID` /
+`volume stat`, `volume list`, `versions`, `changed-since`, `submit` and `rebase` — with the same
+fields as the text form and the same schema the MCP surface emits (one definition, two surfaces).
+`slates mount ID PATH` mounts the volume at an existing user-owned directory over the loopback
+NFS bridge; `slates unmount PATH` removes it. `slates mcp` serves the MCP tools over stdio, or
+loopback Streamable HTTP with `--http PORT`.
 
 Exit codes: 0 done; 1 the daemon refused (the refusal is named on stderr, e.g.
 `AlreadyExists`); 2 usage; 3 no daemon at the instance; 4 the command itself failed.
@@ -75,7 +96,8 @@ The following are requirements, not additional runnable commands:
 
 - One typed operation definition supplies CLI help, MCP schemas, SDK calls and refusals.
 - Scoped names as well as ids; consistent `--help`, structured `--json`, pagination and
-  actionable errors. Today `--json` above belongs only to `profile`.
+  actionable errors. `--json` now covers the read and query verbs (above) with the MCP schema;
+  pagination (cursors), scoped names and JSON on the remaining verbs are still open.
 - Discover the instance/root from enrolled context; report success only when the requested
   path or guest tag is ready, including consumer rights and supported attachment capabilities.
 - Distinguish a live overlay's retained base from a complete immutable capture. Cloning shares
