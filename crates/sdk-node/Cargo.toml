@@ -1,0 +1,25 @@
+[package]
+name = "slates-sdk-node"
+version = { workspace = true }
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+description = "The TypeScript/Node SDK (§2.3, D-19; Phase 5): a napi-rs addon over the typed `slates-client`, exposing the lifecycle verbs and mapping typed refusals to JS errors. Async over the completion descriptor (uv_poll) is owed; this is the synchronous base."
+
+[lib]
+# The Node addon is a cdylib; napi names the loadable `.node` from it.
+crate-type = ["cdylib"]
+
+[dependencies]
+slates-client = { workspace = true }
+# The napi-rs binding (D-19: "napi-rs SDK with uv_poll completion"). napi 2 + the derive macros;
+# pure Rust, so no C toolchain and no cross-compile C surface.
+napi = { version = "2", default-features = false, features = ["napi8"] }
+napi-derive = "2"
+
+[build-dependencies]
+napi-build = "2"
+
+[lints]
+workspace = true
