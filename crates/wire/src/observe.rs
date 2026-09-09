@@ -211,6 +211,13 @@ impl SpanSink {
     self.dropped
   }
 
+  /// Folds in `n` spans that were shed *before* reaching this sink — by a bounded collector a lower
+  /// crate recorded into (a large landing's per-entry spans), whose overflow the server carries here so
+  /// the total loss stays one honest number (§4.14 "bounded rings report dropped spans"), not two.
+  pub fn record_dropped(&mut self, n: u64) {
+    self.dropped = self.dropped.saturating_add(n);
+  }
+
   /// Takes the held spans, leaving the sink empty; the drop count is retained (loss is not forgotten
   /// by reading). For a consumer that drains the sink when it reports.
   pub fn drain(&mut self) -> Vec<Span> {

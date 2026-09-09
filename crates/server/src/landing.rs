@@ -33,12 +33,16 @@ use slates_land::engine::Audit;
 #[cfg(unix)]
 use slates_land::engine::{AuditKind, AuditRecord};
 #[cfg(unix)]
-use slates_land::engine::{LandingRefusal, LandingReport, LandingRequest, Unobserved, land};
+use slates_land::engine::{LandingRefusal, LandingReport, LandingRequest, Observer, land};
+#[cfg(unix)]
+use slates_vfs::host::LandFs;
+#[cfg(unix)]
+use slates_wire::observe::Chokepoint;
 #[cfg(unix)]
 use slates_land::grant::{GrantId, GrantRefusal};
 use slates_land::grant::{GrantScope as LandScope, Grants, Leases, Surface};
 #[cfg(unix)]
-use slates_land::manifest::{Filter, Manifest};
+use slates_land::manifest::{Filter, LandingEntry, Manifest};
 #[cfg(unix)]
 use slates_land::os::{OsLand, TargetRefusal};
 use slates_vfs::clock::Clock;
@@ -143,6 +147,59 @@ pub fn land_verb(
   }
 }
 
+/// A landing observer (§4.14) that records one `land.entry` timing per entry into a bounded buffer, so
+/// a large landing never grows it without bound (ban 8): at capacity it sheds the oldest timing and
+/// counts the loss. It records only `(start, end)` — the land engine stays wire-free; the server builds
+/// the spans and assigns the shard's ids when it drains the observer ([`drain_land_spans`]).
+#[cfg(unix)]
+struct SpanObserver {
+  entries: std::collections::VecDeque<(u64, u64)>,
+  capacity: usize,
+  dropped: u64,
+}
+
+#[cfg(unix)]
+impl SpanObserver {
+  fn with_capacity(capacity: usize) -> SpanObserver {
+    SpanObserver {
+      entries: std::collections::VecDeque::with_capacity(capacity),
+      capacity,
+      dropped: 0,
+    }
+  }
+}
+
+#[cfg(unix)]
+impl<H: LandFs> Observer<H> for SpanObserver {
+  fn before_write(&mut self, _host: &mut H, _entry: &LandingEntry) {}
+
+  fn after_entry(&mut self, start_ns: u64, end_ns: u64) {
+    if self.entries.len() == self.capacity {
+      // At the bound: shed the oldest timing (or this one, when the bound is zero) and count the loss.
+      if self.entries.pop_front().is_none() {
+        self.dropped = self.dropped.saturating_add(1);
+        return;
+      }
+      self.dropped = self.dropped.saturating_add(1);
+    }
+    self.entries.push_back((start_ns, end_ns));
+  }
+}
+
+/// Drains a landing's observed entry timings into the shard's telemetry sink as `land.entry` spans
+/// (§4.14), each stamped with the request the shard is serving and one of the shard's own span ids, and
+/// folds the observer's shed count into the sink's loss total. Called after `land` returns, so the sink
+/// is clear of the landing's borrows.
+#[cfg(unix)]
+fn drain_land_spans(state: &mut ShardState, observer: SpanObserver) {
+  let request = state.current_request;
+  let dropped = observer.dropped;
+  for (start_ns, end_ns) in observer.entries {
+    crate::verbs::emit_span(state, Chokepoint::LandEntry, 0, request, start_ns, end_ns);
+  }
+  state.telemetry.record_dropped(dropped);
+}
+
 /// The Unix landing: open the target through `OsLand` and run the engine.
 #[cfg(unix)]
 fn land_verb_unix(
@@ -191,6 +248,13 @@ fn land_verb_unix(
     Ok(s) => s,
     Err(_) => return refused(Refusal::NotFound),
   };
+  // Observe each entry to emit a `land.entry` span (§4.14), into a bounded buffer so a large landing
+  // does not grow it without bound (ban 8). It records only timings; the spans are built and drained
+  // into the shard's telemetry sink after the landing, once the borrows above are released.
+  let telemetry_capacity = usize::try_from(state.config.region.slots)
+    .unwrap_or(1)
+    .max(1);
+  let mut spans = SpanObserver::with_capacity(telemetry_capacity);
   let outcome = land(
     &mut os,
     &land_target,
@@ -200,8 +264,9 @@ fn land_verb_unix(
     &mut state.landing.leases,
     &mut state.landing.audit,
     &request,
-    &mut Unobserved,
+    &mut spans,
   );
+  drain_land_spans(state, spans);
   let ids = LandingIds {
     landing_id,
     volume: db_volume,

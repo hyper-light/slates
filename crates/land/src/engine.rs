@@ -413,6 +413,11 @@ pub struct LandingRequest {
 pub trait Observer<H: LandFs> {
   /// Called with the host before `entry` is written.
   fn before_write(&mut self, host: &mut H, entry: &LandingEntry);
+  /// Called after each entry is processed (whatever its verdict), with the entry's monotonic start and
+  /// end in the landing's clock (`now_ns` + elapsed). A telemetry observer records one `land.entry`
+  /// span per entry from it (§4.14); the default does nothing, so a caller that does not observe (the
+  /// oracle, the tests) is unaffected and stays wire-free.
+  fn after_entry(&mut self, _start_ns: u64, _end_ns: u64) {}
 }
 
 /// The observer that does nothing.
@@ -749,6 +754,8 @@ impl<H: LandFs> Landing<'_, H> {
         step_entries = 0;
         step_max_ns = 0;
       }
+      // The `land.entry` chokepoint span (§4.14) brackets one entry's processing, whatever its verdict.
+      let entry_start_ns = self.request.now_ns.saturating_add(elapsed_ns(started));
       let outcome = match report.verdict {
         Some(Verdict::Apply) => {
           if grant_ended(
@@ -782,6 +789,10 @@ impl<H: LandFs> Landing<'_, H> {
         },
         None => continue,
       };
+      observer.after_entry(
+        entry_start_ns,
+        self.request.now_ns.saturating_add(elapsed_ns(started)),
+      );
       audit.push(AuditRecord {
         seq: 0,
         at_ns: self.request.now_ns.saturating_add(elapsed_ns(started)),
