@@ -33,8 +33,8 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use slates_client::{
-  Client as RustClient, ClientError, CreateSpec, Deadlines, NamePolicy, Rebased, SizeClass,
-  Submitted, VolumeId, WorkOp,
+  Client as RustClient, ClientError, CreateSpec, Deadlines, Filter, Landing, NamePolicy, Rebased,
+  SizeClass, SnapshotId, Submitted, VolumeId, WorkOp,
 };
 
 /// Format: a volume id is 16 bytes on the wire — its high half names the creator host (§4.8 "Lookup").
@@ -111,6 +111,64 @@ fn merge_outcome_dict(
     conflicts.push(window.into());
   }
   dict.set_item("conflicts", conflicts)?;
+  Ok(dict.into())
+}
+
+/// Format: a 32-byte manifest hash rendered as lowercase hex (64 characters), two digits per byte —
+/// the plain value Python holds, with no digit arithmetic to get wrong.
+fn hex32(bytes: &[u8; 32]) -> String {
+  let mut out = String::with_capacity(bytes.len() * 2);
+  for byte in bytes {
+    out.push_str(&format!("{byte:02x}"));
+  }
+  out
+}
+
+/// A landing's result as a dict (§4.15): `grant_required` False with the finished `outcome` (its
+/// terminal `state` and counts), or True with the `landing` id, the `manifest` hash (hex), the
+/// `summary` (entries per action, bytes, filtered-out), the `conflicts` paths, and `grant_with` — the
+/// exact `slates grant` command a human runs. The SDK never issues the grant itself (R10): a landing
+/// without one comes back `grant_required` for a human to authorize on the CLI.
+fn landing_dict(py: Python<'_>, landing: Landing) -> PyResult<Py<PyDict>> {
+  let dict = PyDict::new_bound(py);
+  match landing {
+    Landing::Landed(outcome) => {
+      dict.set_item("grant_required", false)?;
+      let o = PyDict::new_bound(py);
+      o.set_item("landing", outcome.landing)?;
+      o.set_item("state", outcome.state)?;
+      o.set_item("written", outcome.written)?;
+      o.set_item("skipped", outcome.skipped)?;
+      o.set_item("conflicts", outcome.conflicts)?;
+      o.set_item("failed", outcome.failed)?;
+      o.set_item("bytes_written", outcome.bytes_written)?;
+      dict.set_item("outcome", o)?;
+    }
+    Landing::GrantRequired {
+      landing,
+      manifest,
+      summary,
+      conflicts,
+    } => {
+      dict.set_item("grant_required", true)?;
+      dict.set_item("landing", landing)?;
+      dict.set_item("manifest", hex32(&manifest))?;
+      let s = PyDict::new_bound(py);
+      let mut by_action: Vec<Py<PyDict>> = Vec::with_capacity(summary.by_action.len());
+      for action in summary.by_action {
+        let a = PyDict::new_bound(py);
+        a.set_item("action", action.action)?;
+        a.set_item("count", action.count)?;
+        by_action.push(a.into());
+      }
+      s.set_item("by_action", by_action)?;
+      s.set_item("bytes", summary.bytes)?;
+      s.set_item("filtered_out", summary.filtered_out)?;
+      dict.set_item("summary", s)?;
+      dict.set_item("conflicts", conflicts)?;
+      dict.set_item("grant_with", format!("slates grant {landing}"))?;
+    }
+  }
   Ok(dict.into())
 }
 
@@ -252,6 +310,38 @@ impl Client {
     let id = parse_volume(volume)?;
     self.inner.destroy(id).map_err(refusal)?;
     Ok(())
+  }
+
+  /// Plans, and with a grant executes, a landing of the volume's diverged entries onto the host
+  /// directory `target` (§4.15). Returns a dict ([`landing_dict`]): without a grant, `grant_required`
+  /// True with the manifest and the `slates grant` command a human runs; with one, `grant_required`
+  /// False with the finished `outcome`. `snapshot` lands a snapshot (else the head); `include`/`exclude`
+  /// are path filters; `grant` is a grant id a human already issued on the CLI (the SDK never issues one,
+  /// R10). This is the whole landing surface an agent has: it can plan and, once a human authorizes,
+  /// execute — but it cannot authorize.
+  #[pyo3(signature = (volume, target, snapshot=None, include=None, exclude=None, grant=None))]
+  fn land(
+    &mut self,
+    volume: &str,
+    target: &str,
+    snapshot: Option<u64>,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    grant: Option<u64>,
+  ) -> PyResult<Py<PyDict>> {
+    let id = parse_volume(volume)?;
+    let snap = snapshot.map(|value| SnapshotId { value });
+    let filter = Filter {
+      include: include.unwrap_or_default(),
+      exclude: exclude.unwrap_or_default(),
+    };
+    let landing = self
+      .inner
+      .land(id, snap, target, filter, grant)
+      .map_err(refusal)?;
+    // The GIL is already held (Python called this method); `with_gil` re-borrows it to build the dict,
+    // so `land` stays under the argument-count lint without taking an explicit `py` token.
+    Python::with_gil(|py| landing_dict(py, landing))
   }
 
   /// Creates a green volume — a shared merge target (§4.16) — returning its hex id. `require_evidence`

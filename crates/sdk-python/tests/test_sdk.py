@@ -22,6 +22,7 @@ BOUND_VERBS = {
     "list",
     "resize",
     "destroy",
+    "land",
     "create_green",
     "create_work",
     "versions",

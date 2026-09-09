@@ -33,8 +33,8 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use slates_client::{
-  Client as RustClient, ClientError, CreateSpec, Deadlines, NamePolicy, Rebased, SizeClass,
-  Submitted, VolumeId, WorkOp,
+  Client as RustClient, ClientError, CreateSpec, Deadlines, Filter, Landing, NamePolicy, Rebased,
+  SizeClass, SnapshotId, Submitted, VolumeId, WorkOp,
 };
 
 /// Format: a volume id is 16 bytes on the wire — its high half names the creator host (§4.8 "Lookup").
@@ -185,6 +185,108 @@ fn merge_outcome(
   })
 }
 
+/// One action's entry count in a landing plan (§4.15): the action name and how many entries take it.
+#[napi(object)]
+pub struct LandingAction {
+  pub action: String,
+  pub count: i64,
+}
+
+/// A landing plan's summary (§4.15): entries per action, bytes to write, and entries the filter left out.
+#[napi(object)]
+pub struct LandingSummaryJs {
+  pub by_action: Vec<LandingAction>,
+  pub bytes: i64,
+  pub filtered_out: i64,
+}
+
+/// A finished landing's outcome (§4.15): its id, terminal `state`, and the per-entry and byte counts.
+#[napi(object)]
+pub struct LandingOutcomeJs {
+  pub landing: i64,
+  pub state: String,
+  pub written: i64,
+  pub skipped: i64,
+  pub conflicts: i64,
+  pub failed: i64,
+  pub bytes_written: i64,
+}
+
+/// The result of `land` (§4.15): `grantRequired` false with the finished `outcome`, or true with the
+/// `landing` id, the `manifest` hash (hex), the `summary`, the `conflicts` paths, and `grantWith` — the
+/// `slates grant` command a human runs. The optional fields are set for exactly one of the two cases.
+#[napi(object)]
+pub struct LandingResult {
+  pub grant_required: bool,
+  pub outcome: Option<LandingOutcomeJs>,
+  pub landing: Option<i64>,
+  pub manifest: Option<String>,
+  pub summary: Option<LandingSummaryJs>,
+  pub conflicts: Option<Vec<String>>,
+  pub grant_with: Option<String>,
+}
+
+/// Format: a 32-byte manifest hash rendered as lowercase hex (64 characters), two digits per byte.
+fn hex32(bytes: &[u8; 32]) -> String {
+  let mut out = String::with_capacity(bytes.len() * 2);
+  for byte in bytes {
+    out.push_str(&format!("{byte:02x}"));
+  }
+  out
+}
+
+/// Builds the landing result object (§4.15), every `u64` range-checked to a JS-safe integer. A landing
+/// without a grant comes back `grantRequired` with the manifest and the `slates grant` command; with a
+/// grant, `grantRequired` false with the finished counts. The SDK never issues a grant (R10).
+fn landing_result(landing: Landing) -> Result<LandingResult> {
+  match landing {
+    Landing::Landed(o) => Ok(LandingResult {
+      grant_required: false,
+      outcome: Some(LandingOutcomeJs {
+        landing: status_i64(o.landing, "landing")?,
+        state: o.state,
+        written: status_i64(o.written, "written")?,
+        skipped: status_i64(o.skipped, "skipped")?,
+        conflicts: status_i64(o.conflicts, "conflicts")?,
+        failed: status_i64(o.failed, "failed")?,
+        bytes_written: status_i64(o.bytes_written, "bytesWritten")?,
+      }),
+      landing: None,
+      manifest: None,
+      summary: None,
+      conflicts: None,
+      grant_with: None,
+    }),
+    Landing::GrantRequired {
+      landing,
+      manifest,
+      summary,
+      conflicts,
+    } => {
+      let mut by_action = Vec::with_capacity(summary.by_action.len());
+      for action in summary.by_action {
+        by_action.push(LandingAction {
+          action: action.action,
+          count: status_i64(action.count, "count")?,
+        });
+      }
+      Ok(LandingResult {
+        grant_required: true,
+        outcome: None,
+        landing: Some(status_i64(landing, "landing")?),
+        manifest: Some(hex32(&manifest)),
+        summary: Some(LandingSummaryJs {
+          by_action,
+          bytes: status_i64(summary.bytes, "bytes")?,
+          filtered_out: status_i64(summary.filtered_out, "filteredOut")?,
+        }),
+        conflicts: Some(conflicts),
+        grant_with: Some(format!("slates grant {landing}")),
+      })
+    }
+  }
+}
+
 /// A connected slates client (§4.4, §4.9): the lifecycle verbs as methods. Constructed by
 /// [`Client::connect`]; used from the Node main thread the addon runs on.
 #[napi]
@@ -324,6 +426,44 @@ impl Client {
     let id = parse_volume(&volume)?;
     self.inner.destroy(id).map_err(refusal)?;
     Ok(())
+  }
+
+  /// Plans, and with a grant executes, a landing of the volume's diverged entries onto the host
+  /// directory `target` (§4.15). Returns the landing result ([`LandingResult`]): without a grant,
+  /// `grantRequired` with the manifest and the `slates grant` command a human runs; with one, the
+  /// finished `outcome`. `snapshot` lands a snapshot (else the head); `include`/`exclude` are path
+  /// filters; `grant` is a grant id a human already issued on the CLI. The SDK never issues a grant
+  /// itself (R10) — an agent can plan and, once a human authorizes, execute, but cannot authorize.
+  #[napi]
+  pub fn land(
+    &mut self,
+    volume: String,
+    target: String,
+    snapshot: Option<i64>,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    grant: Option<i64>,
+  ) -> Result<LandingResult> {
+    let id = parse_volume(&volume)?;
+    let snap = match snapshot {
+      Some(value) => Some(SnapshotId {
+        value: checked_u64(value, "snapshot")?,
+      }),
+      None => None,
+    };
+    let filter = Filter {
+      include: include.unwrap_or_default(),
+      exclude: exclude.unwrap_or_default(),
+    };
+    let grant = match grant {
+      Some(value) => Some(checked_u64(value, "grant")?),
+      None => None,
+    };
+    let landing = self
+      .inner
+      .land(id, snap, &target, filter, grant)
+      .map_err(refusal)?;
+    landing_result(landing)
   }
 
   /// Creates a green volume — a shared merge target (§4.16) — returning its hex id. `requireEvidence`
