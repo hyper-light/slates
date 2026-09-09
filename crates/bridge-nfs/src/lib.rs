@@ -23,6 +23,7 @@ pub mod nfs;
 pub mod portmap;
 pub mod procedures;
 pub mod rpc;
+pub mod server;
 pub mod xdr;
 
 pub use handle::{FileHandle, FileHandleError};
@@ -31,4 +32,5 @@ pub use nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3}
 pub use portmap::Mapping;
 pub use procedures::Export;
 pub use rpc::{AcceptStatus, RpcCall, RpcError, read_record, reply_bytes, write_record};
+pub use server::serve_connection;
 pub use xdr::{XdrError, XdrReader, XdrWriter};
