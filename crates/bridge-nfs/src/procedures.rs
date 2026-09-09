@@ -68,6 +68,10 @@ pub const NFSPROC3_READDIRPLUS: u32 = 17;
 pub const NFSPROC3_FSSTAT: u32 = 18;
 /// Format: NFSPROC3_FSINFO — static filesystem limits and capabilities.
 pub const NFSPROC3_FSINFO: u32 = 19;
+/// Format: NFSPROC3_COMMIT (RFC 1813 procedure 21) — flush a file's writes to stable storage. Every
+/// slates write already lands `FILE_SYNC`, so a commit is a no-op that confirms the file and returns
+/// the write verifier; a client `fsync` maps to it.
+pub const NFSPROC3_COMMIT: u32 = 21;
 /// Format: the maximum bytes in a filename slates resolves (§4.5's name cap), refused before
 /// allocating.
 pub const NFS_MAXNAMELEN: usize = 255;
@@ -331,6 +335,7 @@ impl<'b> Export<'b> {
       NFSPROC3_READDIRPLUS => Some(self.readdirplus(args)),
       NFSPROC3_FSSTAT => Some(self.fsstat(args)),
       NFSPROC3_FSINFO => Some(self.fsinfo(args)),
+      NFSPROC3_COMMIT => Some(self.commit(args)),
       _ => None,
     }
   }
@@ -545,6 +550,46 @@ impl<'b> Export<'b> {
   /// `FILE_SYNC`, no client resend depends on this today.
   fn write_verifier(&self) -> [u8; size_of::<u64>()] {
     self.fsid().to_be_bytes()
+  }
+
+  /// NFSPROC3_COMMIT: flush a file's writes to stable storage (RFC 1813 §3.3.21). Every slates write
+  /// already lands `FILE_SYNC` — synchronously durable in the anchor segment before its reply (see
+  /// `write`) — so a commit has nothing to flush: it resolves the handle, returns the file's current
+  /// `wcc_data` and the same `writeverf3` a write returns, and answers `NFS3_OK`. A client `fsync`
+  /// (which the kernel issues as COMMIT) therefore succeeds over the mount, as the git, sqlite and
+  /// editor workloads require. Without this a COMMIT is `PROC_UNAVAIL` and the client's `fsync` fails.
+  pub fn commit(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    match self.commit_result(args) {
+      Ok(post) => {
+        Nfsstat3::Ok.encode(&mut writer);
+        encode_wcc(&mut writer, Some(post));
+        writer.fixed(&self.write_verifier());
+      }
+      Err((status, post)) => {
+        status.encode(&mut writer);
+        encode_wcc(&mut writer, post);
+      }
+    }
+    writer.into_bytes()
+  }
+
+  fn commit_result(
+    &mut self,
+    args: &mut XdrReader<'_>,
+  ) -> Result<Fattr3, (Nfsstat3, Option<Fattr3>)> {
+    // COMMIT3args: the file handle, the offset, the byte count. Both range fields are advisory —
+    // slates commits every write FILE_SYNC, so the whole file is already stable regardless of the
+    // requested range — but they are decoded so a malformed request is a typed refusal.
+    let handle = Nfsfh3::decode(args).map_err(|_| (Nfsstat3::Badhandle, None))?;
+    let _offset = args.u64().map_err(|_| (Nfsstat3::Inval, None))?;
+    let _count = args.u32().map_err(|_| (Nfsstat3::Inval, None))?;
+    let identity = self
+      .resolve_handle(&handle)
+      .map_err(|status| (status, None))?;
+    // The commit changes nothing; the file's current attributes are the wcc's post half.
+    let node = self.attrs_of(&identity).map_err(|status| (status, None))?;
+    Ok(self.fattr3(&node))
   }
 
   /// NFSPROC3_REMOVE / NFSPROC3_RMDIR: remove a name from a directory over the shared interface

@@ -11,12 +11,13 @@ use slates_bridge_core::{Attachments, Bridge, ObjectId, OpContext, Rights, View,
 use slates_bridge_nfs::mount::MountReply;
 use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
 use slates_bridge_nfs::procedures::{
-  Export, NFSPROC3_ACCESS, NFSPROC3_CREATE, NFSPROC3_FSINFO, NFSPROC3_FSSTAT, NFSPROC3_GETATTR,
-  NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ, NFSPROC3_READDIR,
-  NFSPROC3_READDIRPLUS, NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR,
-  NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE,
+  Export, NFSPROC3_ACCESS, NFSPROC3_COMMIT, NFSPROC3_CREATE, NFSPROC3_FSINFO, NFSPROC3_FSSTAT,
+  NFSPROC3_GETATTR, NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ,
+  NFSPROC3_READDIR, NFSPROC3_READDIRPLUS, NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME,
+  NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE,
 };
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+use slates_bridge_nfs::{MultiExport, NfsService, OwnedVolumeSet};
 use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
@@ -556,6 +557,122 @@ fn a_write_then_read_round_trips_over_the_export() {
   assert!(rr.bool().unwrap(), "the read reached end of file");
   let data = rr.opaque(64).unwrap();
   assert_eq!(data, payload, "the bytes round-trip");
+}
+
+/// COMMIT over the export reports the file's writes stable and returns the same `writeverf3` a WRITE
+/// returns — a client's `fsync` (which the kernel issues as COMMIT) succeeds, since every slates
+/// write already lands FILE_SYNC. Without COMMIT the fsync would fail PROC_UNAVAIL. The matching
+/// verifier is what tells the client its writes survived, so it need not resend them.
+#[test]
+fn a_commit_over_the_export_reports_the_write_stable() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (created, _fh) = bridge
+    .create(oid(root_ino), &cx, "synced", 0o644, 0)
+    .unwrap();
+  let file_ino = created.ino;
+
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let file_fh = slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: file_ino,
+    generation: 0,
+  }
+  .to_fh();
+
+  // WRITE some bytes, capturing the verifier the write returns.
+  let payload: &[u8] = b"durable";
+  let mut wargs = XdrWriter::new();
+  file_fh.encode(&mut wargs);
+  wargs.u64(0); // offset
+  wargs.u32(u32::try_from(payload.len()).unwrap()); // count
+  wargs.u32(2); // stable = FILE_SYNC
+  wargs.opaque(payload);
+  let wreply = export
+    .serve_nfs(NFSPROC3_WRITE, &mut XdrReader::new(wargs.as_slice()))
+    .unwrap();
+  let mut wr = XdrReader::new(&wreply);
+  assert_eq!(wr.u32().unwrap(), Nfsstat3::Ok.wire(), "WRITE succeeded");
+  assert!(!wr.bool().unwrap()); // wcc: no pre-op attributes
+  PostOpAttr::decode(&mut wr).unwrap(); // post-op attributes
+  wr.u32().unwrap(); // count
+  wr.u32().unwrap(); // committed stability
+  let write_verf: [u8; 8] = wr.fixed(8).unwrap().try_into().unwrap();
+
+  // COMMIT the file (offset 0, count 0 = the whole file, RFC 1813 §3.3.21).
+  let mut cargs = XdrWriter::new();
+  file_fh.encode(&mut cargs);
+  cargs.u64(0); // offset
+  cargs.u32(0); // count (0 means to the end of the file)
+  let creply = export
+    .serve_nfs(NFSPROC3_COMMIT, &mut XdrReader::new(cargs.as_slice()))
+    .unwrap();
+  let mut cr = XdrReader::new(&creply);
+  assert_eq!(cr.u32().unwrap(), Nfsstat3::Ok.wire(), "COMMIT succeeded");
+  assert!(!cr.bool().unwrap(), "wcc: no pre-op attributes");
+  let post = PostOpAttr::decode(&mut cr)
+    .unwrap()
+    .0
+    .expect("file post attrs");
+  assert_eq!(
+    post.size,
+    u64::try_from(payload.len()).unwrap(),
+    "the committed file's size"
+  );
+  let commit_verf: [u8; 8] = cr.fixed(8).unwrap().try_into().unwrap();
+  assert_eq!(
+    commit_verf, write_verf,
+    "COMMIT returns the same writeverf3 as WRITE, so the client keeps its writes"
+  );
+}
+
+/// A COMMIT of the synthetic host root succeeds as a no-op: a client that `fsync`s the root mount
+/// (`mount /`) gets NFS3_OK, not PROC_UNAVAIL, and the reply carries the root's verifier.
+#[test]
+fn a_commit_of_the_host_root_is_a_no_op() {
+  let store = store();
+  let set = OwnedVolumeSet::new(store);
+  let mut multi = MultiExport::new(
+    set,
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  );
+  let root_fh = match multi.serve_mount("/") {
+    MountReply::Ok { handle, .. } => handle,
+    MountReply::Err(status) => panic!("MNT / failed: {status:?}"),
+  };
+
+  let mut cargs = XdrWriter::new();
+  root_fh.encode(&mut cargs);
+  cargs.u64(0); // offset
+  cargs.u32(0); // count
+  let creply = multi
+    .serve_procedure(NFSPROC3_COMMIT, &mut XdrReader::new(cargs.as_slice()))
+    .expect("COMMIT of the root is answered");
+  let mut cr = XdrReader::new(&creply);
+  assert_eq!(
+    cr.u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "COMMIT of the root is a successful no-op"
+  );
+  assert!(!cr.bool().unwrap(), "wcc: no pre-op attributes");
+  PostOpAttr::decode(&mut cr).unwrap(); // absent post-op attributes
+  cr.fixed(8).unwrap(); // the verifier
 }
 
 /// A WRITE through a read-only export is refused by the seam before any effect — authorization at

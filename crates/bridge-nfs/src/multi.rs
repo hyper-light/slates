@@ -34,8 +34,8 @@ use crate::handle::FileHandle;
 use crate::mount::{MountReply, Mountstat3};
 use crate::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3};
 use crate::procedures::{
-  Export, NFS_MAXNAMELEN, NFSPROC3_ACCESS, NFSPROC3_CREATE, NFSPROC3_FSINFO, NFSPROC3_FSSTAT,
-  NFSPROC3_GETATTR, NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ,
+  Export, NFS_MAXNAMELEN, NFSPROC3_ACCESS, NFSPROC3_COMMIT, NFSPROC3_CREATE, NFSPROC3_FSINFO,
+  NFSPROC3_FSSTAT, NFSPROC3_GETATTR, NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ,
   NFSPROC3_READDIR, NFSPROC3_READDIRPLUS, NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME,
   NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE,
 };
@@ -221,6 +221,8 @@ impl<V: VolumeSet> MultiExport<V> {
       NFSPROC3_READDIRPLUS => self.root_readdir(args, true),
       NFSPROC3_FSINFO => self.root_fsinfo(),
       NFSPROC3_FSSTAT => self.root_fsstat(),
+      // COMMIT of the synthetic root: it holds no unwritten data, so it is a successful no-op.
+      NFSPROC3_COMMIT => self.root_commit(),
       // A directory cannot be read as a file or a symlink.
       NFSPROC3_READ => post_attr_failure(Nfsstat3::Isdir, Some(self.root_fattr3())),
       NFSPROC3_READLINK => post_attr_failure(Nfsstat3::Inval, Some(self.root_fattr3())),
@@ -230,6 +232,16 @@ impl<V: VolumeSet> MultiExport<V> {
       _ => return None,
     };
     Some(reply)
+  }
+
+  /// COMMIT of the root: the synthetic root has no unwritten data — its listing is derived on demand
+  /// — so the commit succeeds with an absent `wcc_data` and the root's verifier (RFC 1813 §3.3.21).
+  fn root_commit(&self) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    Nfsstat3::Ok.encode(&mut writer);
+    write_absent_wcc(&mut writer);
+    writer.fixed(&self.root_verf());
+    writer.into_bytes()
   }
 
   /// GETATTR of the root: its directory attributes.
@@ -577,8 +589,9 @@ fn status_only_or_wcc(procedure: u32, status: Nfsstat3) -> Vec<u8> {
       write_absent_wcc(&mut writer);
       write_absent_wcc(&mut writer);
     }
-    // SETATTR, WRITE, REMOVE, RMDIR: one wcc_data.
-    NFSPROC3_SETATTR | NFSPROC3_WRITE | NFSPROC3_REMOVE | NFSPROC3_RMDIR => {
+    // SETATTR, WRITE, REMOVE, RMDIR, COMMIT: one wcc_data. (COMMIT's success adds a verifier, but a
+    // failure — a stale or bad handle at the routing edge — is the bare wcc_data, RFC 1813 §3.3.21.)
+    NFSPROC3_SETATTR | NFSPROC3_WRITE | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_COMMIT => {
       write_absent_wcc(&mut writer);
     }
     // GETATTR and anything else: the status alone.
