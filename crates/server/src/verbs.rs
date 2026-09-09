@@ -337,7 +337,8 @@ fn run_recorded(
 /// correlate. `caused_by` is none (no upstream causal event is threaded yet). Emission is a sink push:
 /// no await, no lock, so it never blocks the verb it measures; a full sink sheds the oldest span and
 /// counts it (§4.14 shed-first, loss explicit). `label` is the span's content-free dimension code.
-fn emit_span(
+/// `pub(crate)` so the NFS bridge path (`crate::nfs`) emits `bridge.request` through the same helper.
+pub(crate) fn emit_span(
   state: &mut ShardState,
   point: Chokepoint,
   label: u32,

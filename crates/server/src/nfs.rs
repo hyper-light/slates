@@ -66,9 +66,12 @@ use slates_rt::control::Control;
 use slates_rt::task::SpawnRequest;
 use slates_rt::tcp::{TcpListener, TcpStream};
 use slates_rt::{futures, registry};
+use slates_vfs::clock::Clock;
+use slates_wire::observe::Chokepoint;
+use slates_wire::request::RequestId;
 
 use crate::state::{self, ShardState};
-use crate::verbs::{owner_of, owner_of_name};
+use crate::verbs::{emit_span, owner_of, owner_of_name};
 
 /// Shape: bytes read from a connection per `read` when more of an RPC record is needed (see the
 /// blocking server in bridge-nfs for the reasoning): one large transfer fits, the assembler stitches
@@ -268,14 +271,33 @@ fn serve_local(
   args: &[u8],
   port: u16,
 ) -> (AcceptStatus, Vec<u8>) {
+  // The `bridge.request` chokepoint span (§4.14): one NFS bridge call from arrival to reply, served on
+  // this shard's volumes. The label is the NFS procedure — content-free (an operation code, never a
+  // path or bytes). A bridge call is not a RIFL-replayed client verb, so it carries no client request
+  // identity (the default); its span id and trace still connect it. The clock and sink are reached
+  // through `with_state`, taken at the call's edges — outside `serve_call`'s own per-operation borrows,
+  // so there is no re-entrant borrow.
+  let start_ns = state::with_state(|s| s.clock.monotonic_ns()).unwrap_or(0);
   let mut service = MultiExport::new(ShardVolumeSet, subject, mount_rights());
-  serve_call(
+  let result = serve_call(
     &mut service,
     program,
     procedure,
     &mut XdrReader::new(args),
     port,
-  )
+  );
+  let _ = state::with_state(|s| {
+    let end_ns = s.clock.monotonic_ns();
+    emit_span(
+      s,
+      Chokepoint::BridgeRequest,
+      procedure,
+      RequestId::default(),
+      start_ns,
+      end_ns,
+    );
+  });
+  result
 }
 
 /// Serves one call on the volume's `owner` shard over the bridge queue: spawns the serve on the owner
