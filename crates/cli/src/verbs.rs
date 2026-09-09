@@ -105,12 +105,64 @@ fn serve_mcp_stdio(mut server: slates_mcp::McpServer) -> Result<(), Failure> {
 }
 
 /// The merge verbs (§4.16), split out to keep [`serve`] under the cognitive-complexity bound.
+/// `green NAME`: the new green's id, as text or a JSON `{ "id" }` under `--json`.
+fn merge_green(
+  client: &mut Client,
+  name: &str,
+  evidence: bool,
+  json: bool,
+) -> Result<(), ClientError> {
+  let id = client.create_green(name, evidence)?;
+  if json {
+    println!("{}", serde_json::json!({ "id": volume_id_text(id) }));
+  } else {
+    println!("id: {}", volume_id_text(id));
+  }
+  Ok(())
+}
+
+/// `work GREEN NAME`: the work's id and the green base version, as text lines or a JSON object.
+fn merge_work(
+  client: &mut Client,
+  green: slates_client::VolumeId,
+  name: &str,
+  json: bool,
+) -> Result<(), ClientError> {
+  let (id, base) = client.create_work(green, name)?;
+  if json {
+    println!(
+      "{}",
+      serde_json::json!({ "id": volume_id_text(id), "base": base })
+    );
+  } else {
+    println!("id: {}", volume_id_text(id));
+    println!("base: {base}");
+  }
+  Ok(())
+}
+
+/// `edit WORK PATH AT DELETE TEXT`: acknowledged as text `edited` or a JSON `{ "edited": true }`.
+fn merge_edit(
+  client: &mut Client,
+  work: slates_client::VolumeId,
+  path: &str,
+  at: u64,
+  delete_len: u64,
+  bytes: &[u8],
+  json: bool,
+) -> Result<(), ClientError> {
+  client.edit(work, path, at, delete_len, bytes)?;
+  if json {
+    println!("{}", serde_json::json!({ "edited": true }));
+  } else {
+    println!("edited");
+  }
+  Ok(())
+}
+
 fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError> {
   match verb {
-    Verb::Green { name, evidence } => {
-      let id = client.create_green(name, *evidence)?;
-      println!("id: {}", volume_id_text(id));
-    }
+    Verb::Green { name, evidence } => merge_green(client, name, *evidence, json)?,
     Verb::Versions { green } => {
       let head = client.versions(*green)?;
       if json {
@@ -129,21 +181,14 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
         }
       }
     }
-    Verb::Work { green, name } => {
-      let (id, base) = client.create_work(*green, name)?;
-      println!("id: {}", volume_id_text(id));
-      println!("base: {base}");
-    }
+    Verb::Work { green, name } => merge_work(client, *green, name, json)?,
     Verb::Edit {
       work,
       path,
       at,
       delete_len,
       bytes,
-    } => {
-      client.edit(*work, path, *at, *delete_len, bytes)?;
-      println!("edited");
-    }
+    } => merge_edit(client, *work, path, *at, *delete_len, bytes, json)?,
     Verb::Submit { work } => {
       let outcome = client.submit(*work)?;
       if json {

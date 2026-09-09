@@ -439,6 +439,27 @@ fn json_merge_queries(instance: &str) {
   );
 }
 
+/// `green`/`work` under `--json` emit JSON objects (the merge create verbs; `edit` is the same form).
+fn json_merge_creates(instance: &str) {
+  let (code, out, err) = run(instance, &["green", "greenj", "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.trim().starts_with('{') && out.contains("\"id\":"),
+    "green json: {out}"
+  );
+  // Capture a green id from the text form, then exercise `work --json`.
+  let (code, out, _) = run(instance, &["green", "greenj2"]);
+  assert_eq!(code, 0);
+  let green = value_of(&out, "id");
+  let (code, out, err) = run(instance, &["work", &green, "wj", "--json"]);
+  assert_eq!(code, 0, "{err}");
+  let out = out.trim();
+  assert!(
+    out.starts_with('{') && out.contains("\"id\":") && out.contains("\"base\":"),
+    "work json: {out}"
+  );
+}
+
 /// A failing verb under `--json` emits a JSON error on stderr with a kind and message (GAP-A9-10
 /// "consistent JSON errors"), and the same exit code (1, refused) as the text form.
 fn json_error(instance: &str) {
@@ -475,6 +496,7 @@ fn the_read_verbs_emit_json_with_the_json_flag() {
   json_list_has(&instance, &id);
   json_daemon_status(&instance);
   json_merge_queries(&instance);
+  json_merge_creates(&instance);
   json_error(&instance);
   drop(anchor);
 }
