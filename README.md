@@ -18,6 +18,12 @@ changes live in memory. Agents merge their work into a shared volume through an 
 returns accept, identical, or the exact bytes that overlap, and nothing is written back to disk
 until a person grants it.
 
+The same daemon is built to run on one laptop and across a fleet the size of Meta's EdenFS
+deployment: sealed snapshots and merge records are copied into the memory of neighbouring
+machines, durability is a per-write choice, a volume on another host attaches by id, and the
+merge engine works the same way whether the agents share a laptop or a planet. A laptop is the
+one-node case of that design, not a separate mode.
+
 It is one binary and one daemon:
 
 ```console
@@ -42,9 +48,10 @@ unmounted: /private/var/folders/1s/.../T/slates-readme-9_w1qw5m
 paths are shortened.*
 
 Slates has no release yet. The daemon, the CLI, mounts on macOS, the merge engine on one
-machine, landing plans, the MCP server and the Python and Node SDKs work today. Linux and
+machine, landing plans, the MCP server and the async Python and Node SDKs work today. Linux and
 Windows mounts, the grant command that lets a landing write to disk, container and VM guests,
-and everything fleet-related are still being built. The [gap ledger](docs/wip/GAPS.md#8i-a-9-contract-correction-and-open-implementation-gaps-2026-09-05)
+and the fleet (whose protocol core and transport exist, but not yet the wiring between nodes)
+are still being built. The [gap ledger](docs/wip/GAPS.md#8i-a-9-contract-correction-and-open-implementation-gaps-2026-09-05)
 tracks each item.
 
 ## Install
@@ -174,6 +181,24 @@ submitting. `versions GREEN` and `changed-since GREEN VERSION` read the history.
 operations (mkdir, rename, unlink, chmod, symlinks, links, xattrs) are declared from the SDKs
 and MCP tools. Accepted submissions survive a daemon restart.
 
+What makes this work at scale is that a submission never carries bytes. An **increment** is a
+fixed-size description of the operations an agent declared since its base version, naming the
+sealed result by hash. The engine maps those ranges through the exact deltas accepted since
+that version (a position map that composes, so a work volume a thousand versions behind costs
+the same per operation as one that is current), and the verdict is a pure function of the
+increment and the chain. Because it is pure, any machine holding the chain can recompute it.
+
+In a fleet that is exactly what happens. A green volume has one owner, which runs its merge
+task. An agent on any host submits by routing the green's id to that owner; the work volume's
+sealed result is placed on its holders first, then the merge record goes out as the next entry
+of the green's replicated ledger, to all of its candidate holders, and commits when f+1 have
+it on hand and every hash the new version references is already placed. Each holder recomputes
+the verdict and the manifest before serving the version and refuses on a mismatch. If the owner
+dies, the holder that already has the ledger takes over and in-flight submissions retry by
+identity, so no accepted version is ever lost and no conflict is ever decided twice. A team of
+agents in three regions merging into one tree gets the same accept, identical or conflict answer
+they would get on one laptop, from the same code.
+
 ## Landing
 
 A landing writes a volume's changes into a directory on disk, and it is the only thing in
@@ -236,41 +261,73 @@ with its typed name. `slates.land.materialize` plans a landing and returns
 
 ## Language packages
 
-Both SDKs are thin bindings over the Rust client, so they speak to the daemon exactly as the
-CLI does. They are synchronous for now and not yet on PyPI or npm.
+Both SDKs are thin bindings over the Rust client, so an agent in Python or Node speaks to the
+daemon over the same rings the CLI uses. Both are async first: every verb is awaitable and is
+resolved by the daemon's completion descriptor on your own event loop (`asyncio` in Python,
+libuv in Node), with no extra runtime or thread underneath. A blocking `Client` with the same
+verbs is there for scripts. The packages are `slates` on PyPI and `@hyper-light/slates` on npm;
+neither is published yet, so for now build them from the checkout.
 
-**Python**, via [maturin](https://www.maturin.rs):
-
-```sh
-maturin build -m crates/sdk-python/Cargo.toml && pip install target/wheels/slates-*.whl
-```
+**Python** (`pip install slates`; from a checkout, `maturin build -m crates/sdk-python/Cargo.toml`
+then `pip install target/wheels/slates-*.whl`):
 
 ```python
+import asyncio
 import slates
 
-client = slates.Client.connect("default", 5_000_000, 10_000_000)   # deadlines in ns
-green = client.create_green("main")
-work = client.create_work(green, "feature")
-client.edit(work["id"], "/notes.txt", 0, 0, b"hello")
-outcome = client.submit(work["id"])
-if not outcome["ok"]:
-    for w in outcome["conflicts"]:
-        print("conflict at", w["path"], w["at"], w["len"])
+async def main():
+    client = slates.AsyncClient.connect("default", 5_000_000, 10_000_000)  # deadlines in ns
+
+    # provision a volume; every verb is one await, resolved on the asyncio loop
+    volume = await client.create("scratch", 8 * 1024 * 1024)
+    print(await client.status(volume))
+
+    # many agents' worth of volumes at once: each reply routes to its own await
+    ids = await asyncio.gather(*(client.create(f"agent-{n}", 8 * 1024 * 1024) for n in range(8)))
+
+    # the merge loop
+    green = await client.create_green("main")
+    work = await client.create_work(green, "feature")
+    await client.edit(work["id"], "/notes.txt", 0, 0, b"hello")
+    await client.mkdir(work["id"], "/dir")
+    outcome = await client.submit(work["id"])
+    if outcome["ok"]:
+        print("merged as version", outcome["version"])
+    else:
+        for w in outcome["conflicts"]:
+            print("conflict at", w["path"], w["at"], w["len"])
+        # fix the work volume, then: await client.rebase(work["id"]) and submit again
+
+asyncio.run(main())
 ```
 
-**Node**, via [napi-rs](https://napi.rs):
+**Node / TypeScript** (`npm install @hyper-light/slates`, Node 18 or later; a prebuilt addon
+per platform, types included):
 
-```sh
-cargo build -p slates-sdk-node && cp target/debug/libslates_sdk_node.dylib ./slates.node
+```ts
+import { AsyncClient } from '@hyper-light/slates';
+
+const client = AsyncClient.connect('default', 5_000_000, 10_000_000);
+
+const volume = await client.create('scratch', 8 * 1024 * 1024);
+console.log(await client.status(volume));
+
+const ids = await Promise.all([...Array(8)].map((_, n) => client.create(`agent-${n}`, 8 * 1024 * 1024)));
+
+const green = await client.createGreen('main');
+const work = await client.createWork(green, 'feature');
+await client.edit(work.id, '/notes.txt', 0, 0, Buffer.from('hello'));
+const outcome = await client.submit(work.id);
+if (!outcome.ok) {
+  for (const w of outcome.conflicts) console.log('conflict at', w.path, w.at, w.len);
+}
 ```
 
-```js
-const slates = require('./slates.node');
-const client = slates.Client.connect('default', 5_000_000, 10_000_000);
-const volume = client.create('scratch', 8 * 1024 * 1024);
-console.log(client.status(volume));
-client.destroy(volume);
-```
+Every verb in the CLI table below has an async method with the same name (camelCase in Node),
+including `land`, which plans a landing and returns `grant_required` like the CLI does. A
+refusal from the daemon is a typed `SlatesError` in Python and an `Error` in Node, and an
+integer that would not survive the trip into a JavaScript number is refused rather than
+rounded.
 
 → **[Python quickstart](crates/sdk-python/README.md)** · **[Node quickstart](crates/sdk-node/README.md)**
 
@@ -354,6 +411,61 @@ The design is one document, **[docs/wip/SLATES_DESIGN.md](docs/wip/SLATES_DESIGN
 every decision and the evidence behind it; the research it draws on is in
 [docs/wip/research/](docs/wip/research/).
 
+## From a laptop to a fleet
+
+Slates is designed for the scale of a monorepo served to thousands of hosts: base trees of a
+billion files, millions of loaded inodes per mount, agents attaching and merging across regions.
+The mechanism is the same one a laptop runs, with the neighbour count set to zero.
+
+- **Durability is replication into RAM, under an epoch.** Every sealed snapshot, head record
+  and merge record is sent to the owner's candidate holders, a fixed circle of machines in
+  different failure domains. It counts as placed when the fastest f+1 of 2f+1 have it; slow
+  holders are hedged around, never waited for. Every record carries the owner's host epoch, and
+  a holder refuses anything older than the highest it has seen, so a machine that paused and
+  woke up cannot overwrite its successor's work.
+- **Consensus decides who, never what.** A small regional group agrees on membership,
+  neighbourhoods, host epochs, takeovers and moved homes. It is touched on those events and
+  never on a write, so a write costs one round of puts to the holders and nothing else.
+- **Attach anywhere by id.** An agent on host B attaches a snapshot owned by host A: the id
+  routes to A, the manifest comes from any recorded holder, the namespace is served at once,
+  and file contents fault in lazily from holders, verified by hash and cached under B's own
+  budget. A clone of a remote snapshot is a local volume. The daemon learns which paths a build
+  touches first and prefetches them on the next attach.
+- **Ownership follows the writer.** A volume is owned where it was created because the local
+  ring is the latency floor. When another host keeps writing to it, ownership moves there by a
+  fenced handoff; load never moves ownership.
+- **Durability is a per-write choice.** `await placed(region)` waits for the owner's
+  neighbourhood; `await placed(mirror)` waits for the copy in another region. Every reply
+  carries `placed` and `mirror_age`, so an agent that needs a stronger promise asks for it on
+  that operation and everyone else keeps the fast path. Losing a region promotes its mirror.
+- **Overlays keep their base across hosts.** A clone of an overlay volume on another host
+  still resolves untouched files through the original directory's identity; it never turns into
+  a scratch volume seeded with the changed entries. Capturing a base makes a complete immutable
+  snapshot that remote clones share by hash.
+
+```console
+$ slates volume placed 00000000000006f0ec41000000000000
+placed: true
+mirror_age_ns: none
+
+$ slates volume placed 00000000000006f0ec41000000000000 --mirror
+slates: refused: Unsupported { feature: "mirror" }
+```
+
+On one machine the region is placed the moment the local append lands, and the mirror is
+refused because there is nobody to mirror to. The reply fields are the same ones a fleet
+fills in.
+
+Where this stands: the replication register runs at f=0 and at a simulated f=1 with a test
+that asserts identical outcomes; the takeover and reconfiguration protocols are modelled in
+TLA+ and were checked in 2026-09-04; the node-to-node transport (an encrypted UDP control
+plane and a QUIC session plane) runs end to end on a simulated network; the merge engine's
+fleet path is designed in §4.10 and §4.16. Membership, enrollment and the wiring between real
+nodes are Phase 8, and there is no fleet benchmark yet. The design is §4.8 and §4.10 of the
+[unified design](docs/wip/SLATES_DESIGN.md) and the [transport draft](docs/wip/fleet-transport.md);
+the reading behind it, from EdenFS and Piper to Vertical Paxos and copysets, is in
+[docs/wip/research/](docs/wip/research/).
+
 ## Documentation
 
 | Doc | What's in it |
@@ -363,6 +475,7 @@ every decision and the evidence behind it; the research it draws on is in
 | [Design](docs/wip/SLATES_DESIGN.md) | Rules, decisions, every subsystem, the build plan |
 | [Gap ledger](docs/wip/GAPS.md) | What is open and what closes it |
 | [Benchmarks](docs/wip/BENCHMARKS.md) | Every measurement with its command and machine |
+| [Fleet transport](docs/wip/fleet-transport.md) · [Merge service](docs/wip/merge-service.md) | The node-to-node planes; how the merge engine is wired |
 | [Equivalence policy](docs/wip/EQUIVALENCE.md) | Where a volume is allowed to differ from the host filesystem |
 
 ## Contributing / development
