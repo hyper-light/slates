@@ -34,7 +34,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use slates_client::{
   Client as RustClient, ClientError, CreateSpec, Deadlines, Filter, Landing, NamePolicy, Rebased,
-  SizeClass, SnapshotId, StatusReport, Submitted, VolumeId, WorkOp,
+  SizeClass, SnapshotId, StatusReport, Submitted, VolumeId, VolumeSummary, WorkOp,
 };
 
 /// Format: a volume id is 16 bytes on the wire — its high half names the creator host (§4.8 "Lookup").
@@ -346,6 +346,37 @@ pub struct StatusBegin {
   pub fast: Option<VolumeStatus>,
 }
 
+/// A list begin-and-spin result (see [`CreateBegin`]).
+#[napi(object)]
+pub struct ListBegin {
+  /// The request id word.
+  pub word: String,
+  /// The volume entries, present when the reply came within the spin window.
+  pub fast: Option<Vec<VolumeEntry>>,
+}
+
+/// A unit verb's begin-and-spin result (resize/destroy): `fast` is `true` when the verb completed
+/// within the spin window, distinguishing "done" from "not yet" (the JS side resolves to undefined).
+#[napi(object)]
+pub struct UnitBegin {
+  /// The request id word.
+  pub word: String,
+  /// `true` when the verb completed within the spin window.
+  pub fast: Option<bool>,
+}
+
+/// Builds a [`VolumeEntry`] from a summary — the fields `slates list` prints. Shared by the sync
+/// `list` verb and the async one, so both surfaces return the identical shape (§4.4).
+fn volume_entry(volume: VolumeSummary) -> Result<VolumeEntry> {
+  Ok(VolumeEntry {
+    id: volume_hex(&volume.id),
+    name: volume.name,
+    referenced_bytes: status_i64(volume.referenced_bytes, "referencedBytes")?,
+    unique_bytes: status_i64(volume.unique_bytes, "uniqueBytes")?,
+    overlay: volume.overlay,
+  })
+}
+
 #[napi]
 pub struct Client {
   inner: RustClient,
@@ -579,23 +610,101 @@ impl Client {
     )
   }
 
+  /// Begins a list and spins for its reply; the word and the entries if they landed in the spin.
+  #[napi]
+  pub fn begin_spin_list(&mut self) -> Result<ListBegin> {
+    let request = self.inner.list_begin().map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let spin = self.inner.published_spin_ns();
+    let fast = match self.inner.list_spin(request, spin).map_err(refusal)? {
+      Some(volumes) => Some(
+        volumes
+          .into_iter()
+          .map(volume_entry)
+          .collect::<Result<Vec<_>>>()?,
+      ),
+      None => None,
+    };
+    Ok(ListBegin {
+      word: request.word().to_string(),
+      fast,
+    })
+  }
+
+  /// Takes a list reply by its word once the completion fd signals.
+  #[napi]
+  pub fn poll_list(&mut self, word: String) -> Result<Option<Vec<VolumeEntry>>> {
+    let word = parse_word(&word)?;
+    match self.inner.list_poll(word).map_err(refusal)? {
+      Some(volumes) => Ok(Some(
+        volumes
+          .into_iter()
+          .map(volume_entry)
+          .collect::<Result<Vec<_>>>()?,
+      )),
+      None => Ok(None),
+    }
+  }
+
+  /// Begins a resize and spins for its reply; the word and `true` if it completed within the spin.
+  #[napi]
+  pub fn begin_spin_resize(
+    &mut self,
+    volume: String,
+    size_bytes: i64,
+    dynamic: Option<bool>,
+  ) -> Result<UnitBegin> {
+    let id = parse_volume(&volume)?;
+    let size_bytes = checked_u64(size_bytes, "sizeBytes")?;
+    let size = if dynamic.unwrap_or(false) {
+      SizeClass::Dynamic { max: size_bytes }
+    } else {
+      SizeClass::Bounded { limit: size_bytes }
+    };
+    let request = self.inner.resize_begin(id, size).map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let spin = self.inner.published_spin_ns();
+    let fast = self.inner.resize_spin(request, spin).map_err(refusal)?;
+    Ok(UnitBegin {
+      word: request.word().to_string(),
+      fast,
+    })
+  }
+
+  /// Takes a resize's reply by its word once the completion fd signals (`true` when done).
+  #[napi]
+  pub fn poll_resize(&mut self, word: String) -> Result<Option<bool>> {
+    let word = parse_word(&word)?;
+    self.inner.resize_poll(word).map_err(refusal)
+  }
+
+  /// Begins a destroy and spins for its reply; the word and `true` if it completed within the spin.
+  #[napi]
+  pub fn begin_spin_destroy(&mut self, volume: String) -> Result<UnitBegin> {
+    let id = parse_volume(&volume)?;
+    let request = self.inner.destroy_begin(id).map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let spin = self.inner.published_spin_ns();
+    let fast = self.inner.destroy_spin(request, spin).map_err(refusal)?;
+    Ok(UnitBegin {
+      word: request.word().to_string(),
+      fast,
+    })
+  }
+
+  /// Takes a destroy's reply by its word once the completion fd signals (`true` when done).
+  #[napi]
+  pub fn poll_destroy(&mut self, word: String) -> Result<Option<bool>> {
+    let word = parse_word(&word)?;
+    self.inner.destroy_poll(word).map_err(refusal)
+  }
+
   /// Lists the daemon's volumes (§4.4) as an array of [`VolumeEntry`] objects — id (hex), name, byte
   /// accounting, and overlay flag, the plain shape `slates list` prints.
   #[napi]
   pub fn list(&mut self) -> Result<Vec<VolumeEntry>> {
     let volumes = self.inner.list().map_err(refusal)?;
-    volumes
-      .into_iter()
-      .map(|volume| {
-        Ok(VolumeEntry {
-          id: volume_hex(&volume.id),
-          name: volume.name,
-          referenced_bytes: status_i64(volume.referenced_bytes, "referencedBytes")?,
-          unique_bytes: status_i64(volume.unique_bytes, "uniqueBytes")?,
-          overlay: volume.overlay,
-        })
-      })
-      .collect()
+    volumes.into_iter().map(volume_entry).collect()
   }
 
   /// Resizes the volume's quota (§4.4): `sizeBytes` is the new `Bounded` reserve, or the new maximum of a

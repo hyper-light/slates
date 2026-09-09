@@ -52,7 +52,9 @@ test('the addon exposes the async low-level primitives', (t) => {
   const methods = Object.getOwnPropertyNames(slates.Client.prototype);
   const expected = [
     'beginSpinCreate', 'pollCreate', 'beginSpinSnapshot', 'pollSnapshot',
-    'beginSpinStatus', 'pollStatus', 'completionFd', 'arm', 'disarm', 'takeReady',
+    'beginSpinStatus', 'pollStatus', 'beginSpinList', 'pollList',
+    'beginSpinResize', 'pollResize', 'beginSpinDestroy', 'pollDestroy',
+    'completionFd', 'arm', 'disarm', 'takeReady',
   ];
   for (const verb of expected) {
     assert.ok(methods.includes(verb), `Client.prototype has ${verb}`);
@@ -99,6 +101,21 @@ test('async lifecycle over a live daemon', async (t) => {
     assert.equal(status.snapshots, 1);
     assert.equal(status.placed, true);
     assert.equal(status.hostEpoch, 1);
+
+    // await list → the volume appears with its fields (a scratch volume is not an overlay).
+    const listed = await client.list();
+    const entry = listed.find((v) => v.id === volume);
+    assert.ok(entry, 'the created volume appears in the async list');
+    assert.equal(entry.name, 'node-async-roundtrip');
+    assert.equal(entry.overlay, false);
+
+    // await resize → a larger bound; a unit verb resolves to undefined.
+    assert.equal(await client.resize(volume, 2 * VOLUME_BYTES), undefined);
+
+    // await destroy → the volume is gone from a later list; resolves to undefined.
+    assert.equal(await client.destroy(volume), undefined);
+    const after = await client.list();
+    assert.ok(after.every((v) => v.id !== volume), 'the destroyed volume is gone from the list');
 
     // Concurrency: many creates awaited at once, each its own reply — the multiplexing an async client
     // relies on (one reader serves them all, replies matched to requests by id).

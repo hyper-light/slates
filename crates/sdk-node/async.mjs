@@ -54,6 +54,28 @@ export class AsyncClient {
     return this._await(word, (w) => this._c.pollStatus(w));
   }
 
+  async list() {
+    const { word, fast } = this._c.beginSpinList();
+    if (fast != null) return fast;
+    return this._await(word, (w) => this._c.pollList(w));
+  }
+
+  // Resize and destroy return nothing: their poll yields `true` (done) rather than a value, which the
+  // pump resolves the awaiting Promise with; the caller sees undefined.
+  async resize(volume, sizeBytes, dynamic) {
+    const { word, fast } = this._c.beginSpinResize(volume, sizeBytes, dynamic);
+    if (fast != null) return undefined;
+    await this._await(word, (w) => this._c.pollResize(w));
+    return undefined;
+  }
+
+  async destroy(volume) {
+    const { word, fast } = this._c.beginSpinDestroy(volume);
+    if (fast != null) return undefined;
+    await this._await(word, (w) => this._c.pollDestroy(w));
+    return undefined;
+  }
+
   // Registers the pending future, arms the completion signal, ensures the reader, and closes the race
   // with a reply that landed between the spin's end and the arm.
   _await(word, poll) {

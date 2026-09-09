@@ -212,6 +212,31 @@ fn extract_status(body: ReplyBody) -> Result<StatusReport, ClientError> {
   }
 }
 
+/// Extracts the volume list from its reply, or a typed mismatch.
+fn extract_listed(body: ReplyBody) -> Result<Vec<VolumeSummary>, ClientError> {
+  match body {
+    ReplyBody::Listed { volumes } => Ok(volumes),
+    _ => Err(ClientError::UnexpectedReply { verb: "list" }),
+  }
+}
+
+/// Confirms a resize's reply, or a typed mismatch. A unit verb yields `true` (not the `None` a poll
+/// returns when the reply has not come), so an async pump can tell "done" from "not yet".
+fn extract_resized(body: ReplyBody) -> Result<bool, ClientError> {
+  match body {
+    ReplyBody::Resized => Ok(true),
+    _ => Err(ClientError::UnexpectedReply { verb: "resize" }),
+  }
+}
+
+/// Confirms a destroy's reply, or a typed mismatch (yields `true`, as [`extract_resized`] does).
+fn extract_destroyed(body: ReplyBody) -> Result<bool, ClientError> {
+  match body {
+    ReplyBody::Destroyed => Ok(true),
+    _ => Err(ClientError::UnexpectedReply { verb: "destroy" }),
+  }
+}
+
 impl Client {
   /// Connects to `instance` as a new client.
   pub fn connect(instance: &str, deadlines: Deadlines) -> Result<Client, ClientError> {
@@ -584,6 +609,59 @@ impl Client {
   /// Takes a status reply by id word once the completion fd signals.
   pub fn status_poll(&mut self, word: u64) -> Result<Option<StatusReport>, ClientError> {
     self.poll_as(word, extract_status)
+  }
+
+  /// Begins a list, returning its request id.
+  pub fn list_begin(&mut self) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::List)
+  }
+
+  /// Takes a list reply within `spin_ns`.
+  pub fn list_spin(
+    &mut self,
+    id: RequestId,
+    spin_ns: u64,
+  ) -> Result<Option<Vec<VolumeSummary>>, ClientError> {
+    self.spin_as(id, spin_ns, extract_listed)
+  }
+
+  /// Takes a list reply by id word once the completion fd signals.
+  pub fn list_poll(&mut self, word: u64) -> Result<Option<Vec<VolumeSummary>>, ClientError> {
+    self.poll_as(word, extract_listed)
+  }
+
+  /// Begins a resize, returning its request id.
+  pub fn resize_begin(
+    &mut self,
+    volume: VolumeId,
+    size: SizeClass,
+  ) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::Resize { volume, size })
+  }
+
+  /// Takes a resize's reply within `spin_ns` (`true` when done).
+  pub fn resize_spin(&mut self, id: RequestId, spin_ns: u64) -> Result<Option<bool>, ClientError> {
+    self.spin_as(id, spin_ns, extract_resized)
+  }
+
+  /// Takes a resize's reply by id word once the completion fd signals.
+  pub fn resize_poll(&mut self, word: u64) -> Result<Option<bool>, ClientError> {
+    self.poll_as(word, extract_resized)
+  }
+
+  /// Begins a destroy, returning its request id.
+  pub fn destroy_begin(&mut self, volume: VolumeId) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::Destroy { volume })
+  }
+
+  /// Takes a destroy's reply within `spin_ns` (`true` when done).
+  pub fn destroy_spin(&mut self, id: RequestId, spin_ns: u64) -> Result<Option<bool>, ClientError> {
+    self.spin_as(id, spin_ns, extract_destroyed)
+  }
+
+  /// Takes a destroy's reply by id word once the completion fd signals.
+  pub fn destroy_poll(&mut self, word: u64) -> Result<Option<bool>, ClientError> {
+    self.poll_as(word, extract_destroyed)
   }
 
   /// Takes `id`'s reply within `spin_ns` and extracts its typed value (the fast path over a typed verb).

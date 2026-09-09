@@ -33,10 +33,10 @@ use std::collections::HashMap;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyList};
 use slates_client::{
   Client as RustClient, ClientError, CreateSpec, Deadlines, Filter, Landing, NamePolicy, Rebased,
-  SizeClass, SnapshotId, StatusReport, Submitted, VolumeId, WorkOp,
+  SizeClass, SnapshotId, StatusReport, Submitted, VolumeId, VolumeSummary, WorkOp,
 };
 
 /// Format: a volume id is 16 bytes on the wire — its high half names the creator host (§4.8 "Lookup").
@@ -197,6 +197,28 @@ fn status_dict(py: Python<'_>, report: StatusReport) -> PyResult<Py<PyDict>> {
   Ok(dict.into())
 }
 
+/// Builds a volume-list entry dict from a summary — the fields `slates list` prints. Shared by the
+/// sync `list` verb and the async one, so both surfaces render the identical shape (§4.4).
+fn summary_dict(py: Python<'_>, volume: VolumeSummary) -> PyResult<Py<PyDict>> {
+  let dict = PyDict::new_bound(py);
+  dict.set_item("id", volume_hex(&volume.id))?;
+  dict.set_item("name", volume.name)?;
+  dict.set_item("referenced_bytes", volume.referenced_bytes)?;
+  dict.set_item("unique_bytes", volume.unique_bytes)?;
+  dict.set_item("overlay", volume.overlay)?;
+  Ok(dict.into())
+}
+
+/// A Python list of entry dicts from the volume summaries — the async `list`'s value (the sync verb
+/// returns a `Vec<Py<PyDict>>`, which crosses as the same list shape).
+fn summaries_to_py(py: Python<'_>, volumes: Vec<VolumeSummary>) -> PyResult<PyObject> {
+  let list = PyList::empty_bound(py);
+  for volume in volumes {
+    list.append(summary_dict(py, volume)?)?;
+  }
+  Ok(list.into_any().unbind())
+}
+
 #[pyclass(unsendable)]
 struct Client {
   inner: RustClient,
@@ -284,17 +306,10 @@ impl Client {
   /// The plain shape `slates list` prints, one dict per volume.
   fn list(&mut self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
     let volumes = self.inner.list().map_err(refusal)?;
-    let mut out = Vec::with_capacity(volumes.len());
-    for volume in volumes {
-      let dict = PyDict::new_bound(py);
-      dict.set_item("id", volume_hex(&volume.id))?;
-      dict.set_item("name", volume.name)?;
-      dict.set_item("referenced_bytes", volume.referenced_bytes)?;
-      dict.set_item("unique_bytes", volume.unique_bytes)?;
-      dict.set_item("overlay", volume.overlay)?;
-      out.push(dict.into());
-    }
-    Ok(out)
+    volumes
+      .into_iter()
+      .map(|volume| summary_dict(py, volume))
+      .collect()
   }
 
   /// Resizes the volume's quota (§4.4): `size_bytes` is the new `Bounded` reserve, or the new maximum of
@@ -567,6 +582,12 @@ enum Decode {
   Snapshotted,
   /// A status dict.
   Status,
+  /// A list of volume-entry dicts.
+  Listed,
+  /// A resize's confirmation (resolves to `None`).
+  Resized,
+  /// A destroy's confirmation (resolves to `None`).
+  Destroyed,
 }
 
 /// A request in flight on the async client: the future its `await` suspends on, and how to decode its
@@ -712,6 +733,73 @@ impl AsyncClient {
       (request.word(), fast)
     };
     finish(&slf, word, fast, Decode::Status)
+  }
+
+  /// Lists the daemon's volumes as a list of dicts (§4.4) — the async form of [`Client.list`].
+  fn list<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+    let py = slf.py();
+    let (word, fast) = {
+      let mut this = slf.borrow_mut();
+      let request = this.inner.list_begin().map_err(refusal)?;
+      this.inner.begin_ack_if_due().map_err(refusal)?;
+      let spin = this.inner.published_spin_ns();
+      let fast = match this.inner.list_spin(request, spin).map_err(refusal)? {
+        Some(volumes) => Some(summaries_to_py(py, volumes)?),
+        None => None,
+      };
+      (request.word(), fast)
+    };
+    finish(&slf, word, fast, Decode::Listed)
+  }
+
+  /// Resizes the volume's quota (§4.4) — the async form of [`Client.resize`]; resolves to `None`.
+  #[pyo3(signature = (volume, size_bytes, dynamic=false))]
+  fn resize<'py>(
+    slf: Bound<'py, Self>,
+    volume: &str,
+    size_bytes: u64,
+    dynamic: bool,
+  ) -> PyResult<Bound<'py, PyAny>> {
+    let py = slf.py();
+    let id = parse_volume(volume)?;
+    let size = if dynamic {
+      SizeClass::Dynamic { max: size_bytes }
+    } else {
+      SizeClass::Bounded { limit: size_bytes }
+    };
+    let (word, fast) = {
+      let mut this = slf.borrow_mut();
+      let request = this.inner.resize_begin(id, size).map_err(refusal)?;
+      this.inner.begin_ack_if_due().map_err(refusal)?;
+      let spin = this.inner.published_spin_ns();
+      let fast = this
+        .inner
+        .resize_spin(request, spin)
+        .map_err(refusal)?
+        .map(|_done| py.None());
+      (request.word(), fast)
+    };
+    finish(&slf, word, fast, Decode::Resized)
+  }
+
+  /// Destroys the volume and reclaims its memory (§4.4) — the async form of [`Client.destroy`];
+  /// resolves to `None`.
+  fn destroy<'py>(slf: Bound<'py, Self>, volume: &str) -> PyResult<Bound<'py, PyAny>> {
+    let py = slf.py();
+    let id = parse_volume(volume)?;
+    let (word, fast) = {
+      let mut this = slf.borrow_mut();
+      let request = this.inner.destroy_begin(id).map_err(refusal)?;
+      this.inner.begin_ack_if_due().map_err(refusal)?;
+      let spin = this.inner.published_spin_ns();
+      let fast = this
+        .inner
+        .destroy_spin(request, spin)
+        .map_err(refusal)?
+        .map(|_done| py.None());
+      (request.word(), fast)
+    };
+    finish(&slf, word, fast, Decode::Destroyed)
   }
 
   /// The event loop's reader callback: drain the completion fd and resolve every request whose reply
@@ -888,6 +976,18 @@ fn decode_pending(
       Some(report) => Some(status_dict(py, report)?.into_any()),
       None => None,
     },
+    Decode::Listed => match inner.list_poll(word).map_err(refusal)? {
+      Some(volumes) => Some(summaries_to_py(py, volumes)?),
+      None => None,
+    },
+    Decode::Resized => inner
+      .resize_poll(word)
+      .map_err(refusal)?
+      .map(|_done| py.None()),
+    Decode::Destroyed => inner
+      .destroy_poll(word)
+      .map_err(refusal)?
+      .map(|_done| py.None()),
   })
 }
 

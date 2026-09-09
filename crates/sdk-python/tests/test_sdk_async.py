@@ -17,8 +17,8 @@ import unittest
 
 import slates
 
-# The async verbs this slice binds; the rest of the lifecycle follows the same shape.
-ASYNC_VERBS = {"connect", "create", "snapshot", "status", "client_id"}
+# The async verbs this slice binds; the merge and namespace verbs follow the same shape.
+ASYNC_VERBS = {"connect", "create", "snapshot", "status", "list", "resize", "destroy", "client_id"}
 # Test deadlines in nanoseconds; a production caller derives these from the machine's budgets.
 REPLY_NS = 5_000_000
 RECONNECT_NS = 10_000_000
@@ -105,6 +105,23 @@ class SlatesAsyncRoundTrip(unittest.TestCase):
             self.assertEqual(status["snapshots"], 1)
             self.assertTrue(status["placed"])
             self.assertEqual(status["host_epoch"], 1)
+
+            # await list → the volume appears with its fields (a scratch volume is not an overlay).
+            listed = await client.list()
+            entry = next((v for v in listed if v["id"] == volume), None)
+            self.assertIsNotNone(entry, "the created volume appears in the async list")
+            self.assertEqual(entry["name"], "async-roundtrip")
+            self.assertFalse(entry["overlay"])
+
+            # await resize → a larger bound; a unit verb resolves to None.
+            self.assertIsNone(await client.resize(volume, 2 * VOLUME_BYTES))
+
+            # await destroy → the volume is gone from a later list; resolves to None.
+            self.assertIsNone(await client.destroy(volume))
+            after = await client.list()
+            self.assertTrue(
+                all(v["id"] != volume for v in after), "the destroyed volume is gone from the list"
+            )
 
             # Concurrency: many creates awaited at once, each its own reply — the multiplexing an async
             # client relies on (one reader serves them all, replies matched to requests by id).
