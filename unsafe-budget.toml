@@ -99,3 +99,6 @@ slates-sdk-node = 0
 # slates-bridge-fskit (0): the FSKit shim wire codec is bounds-checked byte slices and dispatch onto
 # the Bridge trait — safe Rust, exactly like the NFS codec; the platform half (the Swift shim) is owed.
 slates-bridge-fskit = 0
+# slates-bridge-winfsp (0): the host-buildable half is the pure VfsError->NTSTATUS refusal taxonomy —
+# safe Rust; the winfsp-rs FFI and the FSP_FSCTL_TRANSACT marshalling are the Windows half, owed.
+slates-bridge-winfsp = 0

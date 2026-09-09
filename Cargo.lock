@@ -1177,6 +1177,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-bridge-winfsp"
+version = "0.1.0"
+dependencies = [
+ "slates-vfs",
+]
+
+[[package]]
 name = "slates-cli"
 version = "0.1.0"
 dependencies = [

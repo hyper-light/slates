@@ -1,0 +1,15 @@
+[package]
+name = "slates-bridge-winfsp"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The Windows WinFsp bridge (§4.6, D-2; Phase 4): the pieces buildable and confirmable on any host — the refusal taxonomy that maps the volume core's `VfsError` to the `NTSTATUS` WinFsp returns, mirroring the FUSE errno and NFS `nfsstat3` edges. The `FSP_FILE_SYSTEM_INTERFACE` FFI over `winfsp-rs` and the `FSP_FSCTL_TRANSACT` marshalling are winfsp's header-defined Windows half (they cross-lint on the native Windows runner), owed."
+
+[dependencies]
+slates-vfs = { workspace = true }
+
+[lints]
+workspace = true
