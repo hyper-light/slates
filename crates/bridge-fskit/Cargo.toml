@@ -1,0 +1,20 @@
+[package]
+name = "slates-bridge-fskit"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The macOS FSKit bridge (FSKit-first on macOS 26+, Amendment A-1/D-O9): the shim wire codec that the Swift FSVolume handler forwards its operations over (the app-group-shared ring), decoded and dispatched onto the one `Bridge` operation seam (§4.6, D-2; Phase 4). The Swift shim, the Slates.app bundle + FSKit entitlement, and the mount spike are the platform half; this is the pure, host-confirmable Rust half — built first, exactly as the NFS codec was."
+
+[dependencies]
+slates-bridge-core = { workspace = true }
+slates-vfs = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+slates-db = { workspace = true }
+slates-mem = { workspace = true }

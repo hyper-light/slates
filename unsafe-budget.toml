@@ -96,3 +96,6 @@ slates-sdk-python = 0
 # slates-sdk-node (0): the napi-rs bindings are safe Rust over the typed client; the FFI unsafety lives
 # in napi's macro-generated code, not this crate's own source (which has no `unsafe` block).
 slates-sdk-node = 0
+# slates-bridge-fskit (0): the FSKit shim wire codec is bounds-checked byte slices and dispatch onto
+# the Bridge trait — safe Rust, exactly like the NFS codec; the platform half (the Swift shim) is owed.
+slates-bridge-fskit = 0
