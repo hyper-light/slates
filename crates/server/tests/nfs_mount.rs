@@ -264,6 +264,51 @@ fn read(stream: &mut TcpStream, file_fh: &[u8], xid: u32) -> Vec<u8> {
   read_opaque(&reply, off).0
 }
 
+/// READDIRPLUS `dir_fh` and return the entry names (skipping each entry's fileid, cookie, optional
+/// attributes and optional handle).
+fn readdirplus(stream: &mut TcpStream, dir_fh: &[u8], xid: u32) -> Vec<String> {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  args.extend_from_slice(&0u64.to_be_bytes()); // cookie
+  args.extend_from_slice(&[0u8; 8]); // cookieverf
+  args.extend_from_slice(&512u32.to_be_bytes()); // dircount (advisory)
+  args.extend_from_slice(&8192u32.to_be_bytes()); // maxcount
+  let reply = call(stream, NFS_PROGRAM, 17, &args, xid);
+  assert_eq!(status(&reply), 0, "READDIRPLUS");
+  let mut off = 4;
+  let dir_follows = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+  off += 4;
+  if dir_follows == 1 {
+    off += 84; // dir post_op_attr
+  }
+  off += 8; // cookieverf
+  let mut names = Vec::new();
+  loop {
+    let follows = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+    off += 4;
+    if follows == 0 {
+      break;
+    }
+    off += 8; // fileid
+    let (name, next) = read_opaque(&reply, off);
+    off = next;
+    off += 8; // cookie
+    let name_attr = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+    off += 4;
+    if name_attr == 1 {
+      off += 84; // name_attributes
+    }
+    let name_handle = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+    off += 4;
+    if name_handle == 1 {
+      let (_handle, next) = read_opaque(&reply, off);
+      off = next;
+    }
+    names.push(String::from_utf8_lossy(&name).into_owned());
+  }
+  names
+}
+
 /// The daemon mounts a volume it provisioned, and a file written over NFS reads back over NFS.
 #[test]
 fn the_daemon_serves_a_provisioned_volume_over_nfs() {
@@ -368,6 +413,52 @@ fn a_client_mounts_the_host_root_and_reaches_a_remote_volume_by_id() {
   assert_eq!(
     got, payload,
     "mounted the host root and reached a volume on another shard by its id, over NFS"
+  );
+
+  drop(stream);
+  drop(client);
+  drop(daemon);
+}
+
+/// The host root's listing gathers volumes from every shard over the bridge queue: a client mounts `/`,
+/// lists it (READDIRPLUS), and sees a volume from the control shard AND a volume from another shard —
+/// the design's single mount point under which every volume on the host appears.
+#[test]
+fn the_host_root_listing_gathers_volumes_from_every_shard() {
+  let (daemon, instance) = two_shard_daemon("nfsrootlist");
+  let mut client = Client::connect(&instance);
+  let control_partition = 0;
+
+  // Provision volumes until there is one on the control shard and one on another shard.
+  let mut local = None;
+  let mut remote = None;
+  for attempt in 0..48 {
+    let ReplyBody::Created { id } = client.call(&scratch(&format!("lv-{attempt}"))) else {
+      continue;
+    };
+    if slates_server::verbs::owner_of(id) == control_partition {
+      local.get_or_insert(id);
+    } else {
+      remote.get_or_insert(id);
+    }
+    if local.is_some() && remote.is_some() {
+      break;
+    }
+  }
+  let local = local.expect("a volume on the control shard");
+  let remote = remote.expect("a volume on another shard");
+
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root_fh = mount(&mut stream, "/", 1);
+  let names = readdirplus(&mut stream, &root_fh, 2);
+  assert!(
+    names.contains(&hex(&local.bytes)),
+    "the host root lists the control-shard volume: {names:?}"
+  );
+  assert!(
+    names.contains(&hex(&remote.bytes)),
+    "the host root lists the other-shard volume (gathered over the bridge queue): {names:?}"
   );
 
   drop(stream);

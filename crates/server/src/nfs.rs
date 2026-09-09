@@ -34,7 +34,9 @@ use std::task::{Context, Poll, Waker};
 use slates_bridge_core::{Rights, VolumeBridge, new_handle_store};
 use slates_bridge_nfs::mount::{MOUNT_PROGRAM, MOUNTPROC3_MNT};
 use slates_bridge_nfs::nfs::{Fattr3, Nfsfh3};
-use slates_bridge_nfs::procedures::{Export, NFS_MAXNAMELEN, NFS_PROGRAM, NFSPROC3_LOOKUP};
+use slates_bridge_nfs::procedures::{
+  Export, NFS_MAXNAMELEN, NFS_PROGRAM, NFSPROC3_LOOKUP, NFSPROC3_READDIR, NFSPROC3_READDIRPLUS,
+};
 use slates_bridge_nfs::xdr::XdrReader;
 use slates_bridge_nfs::{
   AcceptStatus, MultiExport, RpcError, VolumeSet, parse_call, read_record, reply_bytes,
@@ -353,6 +355,193 @@ impl Future for BridgeCall {
   }
 }
 
+// ------------------------------------------------------- the host root's cross-shard listing
+
+/// A [`VolumeSet`] for serving the host root's *listing* across shards: its `entries` are the volumes
+/// of every shard, gathered over the bridge queue, so `READDIR`/`READDIRPLUS` of the root lists them
+/// all. Attributes and handles (`READDIRPLUS`) come from the local [`ShardVolumeSet`], so a volume on
+/// another shard lists by name with its attributes absent — a client fills them with a `LOOKUP`, which
+/// routes across shards (built). Only the listing needs this; every other root op is unchanged.
+struct GatheredVolumeSet {
+  entries: Vec<(String, VolumeId)>,
+}
+
+impl VolumeSet for GatheredVolumeSet {
+  fn entries(&self) -> Vec<(String, VolumeId)> {
+    self.entries.clone()
+  }
+
+  fn serve(
+    &mut self,
+    volume: VolumeId,
+    subject: Principal,
+    rights: Rights,
+    procedure: u32,
+    args: &mut XdrReader<'_>,
+  ) -> Option<Vec<u8>> {
+    ShardVolumeSet.serve(volume, subject, rights, procedure, args)
+  }
+
+  fn root_object(
+    &mut self,
+    volume: VolumeId,
+    subject: Principal,
+    rights: Rights,
+  ) -> Option<(Nfsfh3, Fattr3)> {
+    ShardVolumeSet.root_object(volume, subject, rights)
+  }
+}
+
+thread_local! {
+  /// Cross-shard entry gathers this shard is awaiting, by id; single this shard's thread touches it.
+  static PENDING_ENTRIES: RefCell<BTreeMap<u64, PendingEntries>> =
+    const { RefCell::new(BTreeMap::new()) };
+}
+
+/// A gather of one shard's volume entries, awaiting its answer.
+struct PendingEntries {
+  entries: Option<Vec<(String, VolumeId)>>,
+  waker: Option<Waker>,
+}
+
+/// Registers a pending entry gather and returns its id (shares the bridge-call id space).
+fn register_entries() -> u64 {
+  let id = NEXT_CALL.with(|next| {
+    let id = next.get();
+    next.set(id.wrapping_add(1));
+    id
+  });
+  PENDING_ENTRIES.with(|map| {
+    map.borrow_mut().insert(
+      id,
+      PendingEntries {
+        entries: None,
+        waker: None,
+      },
+    )
+  });
+  id
+}
+
+/// Forgets a pending gather whose shard could not be reached.
+fn cancel_entries(id: u64) {
+  PENDING_ENTRIES.with(|map| map.borrow_mut().remove(&id));
+}
+
+/// Hands a gather's entries to the awaiting task and wakes it (run on the origin shard).
+fn deliver_entries(id: u64, entries: Vec<(String, VolumeId)>) {
+  PENDING_ENTRIES.with(|map| {
+    if let Some(pending) = map.borrow_mut().get_mut(&id) {
+      pending.entries = Some(entries);
+      if let Some(waker) = pending.waker.take() {
+        waker.wake();
+      }
+    }
+  });
+}
+
+/// The future a task awaits for one shard's gathered entries; an empty answer if the shard is gone.
+struct EntriesCall {
+  id: u64,
+}
+
+impl Future for EntriesCall {
+  type Output = Vec<(String, VolumeId)>;
+
+  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    PENDING_ENTRIES.with(|map| {
+      let mut map = map.borrow_mut();
+      let ready = match map.get_mut(&self.id) {
+        Some(pending) => match pending.entries.take() {
+          Some(entries) => Some(entries),
+          None => {
+            pending.waker = Some(cx.waker().clone());
+            None
+          }
+        },
+        None => return Poll::Ready(Vec::new()),
+      };
+      match ready {
+        Some(entries) => {
+          map.remove(&self.id);
+          Poll::Ready(entries)
+        }
+        None => Poll::Pending,
+      }
+    })
+  }
+}
+
+/// Gathers the volume entries of one other `shard` over the bridge queue (the spawn/back-spawn the
+/// bridge calls use); an empty list if the shard is gone.
+async fn gather_from_shard(shard: u16, origin: u16) -> Vec<(String, VolumeId)> {
+  let id = register_entries();
+  let task = SpawnRequest::new(
+    Box::pin(async move {
+      let entries = ShardVolumeSet.entries();
+      let back = SpawnRequest::new(
+        Box::pin(async move {
+          deliver_entries(id, entries);
+        }),
+        None,
+      );
+      let _ = registry::send_control(origin, Control::Spawn(Box::new(back)));
+    }),
+    None,
+  );
+  if registry::send_control(shard, Control::Spawn(Box::new(task))).is_err() {
+    cancel_entries(id);
+    return Vec::new();
+  }
+  EntriesCall { id }.await
+}
+
+/// Gathers the volumes of every shard for the host root listing: this shard's directly, each other
+/// shard's over the bridge queue.
+async fn gather_all_entries() -> Vec<(String, VolumeId)> {
+  let (mine, shards) =
+    state::with_state(|s| (s.partition, s.shards.clone())).unwrap_or((0, Vec::new()));
+  let origin = registry::current_shard().unwrap_or(0);
+  let mut all = ShardVolumeSet.entries();
+  for (partition, shard) in shards.iter().enumerate() {
+    if partition == usize::from(mine) {
+      continue;
+    }
+    let mut remote = gather_from_shard(*shard, origin).await;
+    all.append(&mut remote);
+  }
+  all
+}
+
+/// Whether a call is a `READDIR`/`READDIRPLUS` of the synthetic host root (which must list every
+/// shard's volumes, not just this shard's).
+fn is_root_listing(program: u32, procedure: u32, args: &[u8]) -> bool {
+  program == NFS_PROGRAM
+    && (procedure == NFSPROC3_READDIR || procedure == NFSPROC3_READDIRPLUS)
+    && request_volume(&XdrReader::new(args)) == Some(root_volume())
+}
+
+/// Serves a host-root `READDIR`/`READDIRPLUS` over the gathered entries of every shard.
+fn serve_root_listing(
+  procedure: u32,
+  args: &[u8],
+  entries: Vec<(String, VolumeId)>,
+  port: u16,
+) -> (AcceptStatus, Vec<u8>) {
+  let mut service = MultiExport::new(
+    GatheredVolumeSet { entries },
+    Principal::Uid { uid: 0 },
+    mount_rights(),
+  );
+  serve_call(
+    &mut service,
+    NFS_PROGRAM,
+    procedure,
+    &mut XdrReader::new(args),
+    port,
+  )
+}
+
 // ------------------------------------------------------------------------------------ the serve loop
 
 /// Serves NFS/MOUNT/portmap over `listener` on the current shard until the daemon stops: each
@@ -369,6 +558,33 @@ pub async fn serve(listener: TcpListener, port: u16) {
 /// Serves one accepted connection: reads RPC records, routes each call local or remote, and writes the
 /// framed reply, until the client closes the connection. Owned request data is taken out before the
 /// serve so the read buffer is free to drain while a remote call awaits its owner.
+/// Produces the RPC reply payload for one parsed call, routing it locally, to a volume's owner shard
+/// over the bridge queue, or (a host-root listing) across every shard. A `program` of 0 is a garbage
+/// call whose reply carries xid 0.
+async fn reply_for(
+  this: u16,
+  xid: u32,
+  program: u32,
+  procedure: u32,
+  args: Vec<u8>,
+  port: u16,
+) -> Vec<u8> {
+  if program == 0 {
+    return reply_bytes(0, AcceptStatus::GarbageArgs, &[]);
+  }
+  if is_root_listing(program, procedure, &args) {
+    // The host root lists every shard's volumes, gathered over the bridge queue.
+    let entries = gather_all_entries().await;
+    let (status, results) = serve_root_listing(procedure, &args, entries, port);
+    return reply_bytes(xid, status, &results);
+  }
+  let (status, results) = match route(program, procedure, &args) {
+    Some(owner) => serve_remote(owner, this, program, procedure, args, port).await,
+    None => serve_local(program, procedure, &args, port),
+  };
+  reply_bytes(xid, status, &results)
+}
+
 async fn serve_one(stream: TcpStream, port: u16) {
   let this = registry::current_shard().unwrap_or(0);
   let mut buffer: Vec<u8> = Vec::new();
@@ -392,15 +608,7 @@ async fn serve_one(stream: TcpStream, port: u16) {
     };
     match parsed {
       Some((xid, program, procedure, args, consumed)) => {
-        let reply = if program == 0 {
-          reply_bytes(0, AcceptStatus::GarbageArgs, &[])
-        } else {
-          let (status, results) = match route(program, procedure, &args) {
-            Some(owner) => serve_remote(owner, this, program, procedure, args, port).await,
-            None => serve_local(program, procedure, &args, port),
-          };
-          reply_bytes(xid, status, &results)
-        };
+        let reply = reply_for(this, xid, program, procedure, args, port).await;
         if stream.write_all(&write_record(&reply)).await.is_err() {
           return;
         }
