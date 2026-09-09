@@ -1,10 +1,11 @@
 //! The Python SDK (§2.3, D-19; Phase 5): a PyO3 extension over the typed [`slates_client::Client`],
 //! so an agent drives slates from Python through the same rings and completion records the Rust client
 //! uses — never a parallel reimplementation (the design rejects that: "Lost: parallel pure-Python/TS
-//! compatibility implementations"). This is the **synchronous base** the design says the async form
-//! wraps (R6): every method here is one `Client` call; the async form over the completion descriptor
-//! (fd-readiness on Linux, the parked-reply wake elsewhere) is owed and will drive these same calls off
-//! the event loop.
+//! compatibility implementations"). Two client classes over the one daemon (R6, D-19): [`AsyncClient`]
+//! is the **async-primary** form — each verb an `async` method a real `asyncio` loop drives to
+//! completion by the completion fd's readiness (`loop.add_reader`), never blocking the loop, over the
+//! `slates-client` async core; [`Client`] is the **thin blocking facade**, each method one `Client`
+//! call. No external runtime — no `tokio`, no `pyo3-asyncio`.
 //!
 //! The binding is thin and honest: each verb maps one-to-one to a client method, a typed refusal
 //! becomes a [`SlatesError`] carrying the refusal's text (richer per-refusal exception subclasses are
@@ -219,6 +220,32 @@ fn summaries_to_py(py: Python<'_>, volumes: Vec<VolumeSummary>) -> PyResult<PyOb
   Ok(list.into_any().unbind())
 }
 
+/// Builds a work dict from its id and base version — the shape `create_work` returns. Shared by the
+/// sync and async verbs (§4.16).
+fn work_dict(py: Python<'_>, id: VolumeId, base: u64) -> PyResult<Py<PyDict>> {
+  let dict = PyDict::new_bound(py);
+  dict.set_item("id", volume_hex(&id))?;
+  dict.set_item("base", base)?;
+  Ok(dict.into())
+}
+
+/// Builds a submit-outcome dict from the typed outcome — `ok`, the new `version`, and any `conflicts`
+/// windows (§4.16). Shared by the sync and async `submit` verbs, so both render one shape.
+fn submitted_to_py(py: Python<'_>, outcome: Submitted) -> PyResult<PyObject> {
+  let dict = match outcome {
+    Submitted::Accepted(version) => merge_outcome_dict(py, Some(version), Vec::new())?,
+    Submitted::Conflict(windows) => merge_outcome_dict(
+      py,
+      None,
+      windows
+        .into_iter()
+        .map(|window| (window.path, window.at, window.len, window.class))
+        .collect(),
+    )?,
+  };
+  Ok(dict.into_any())
+}
+
 #[pyclass(unsendable)]
 struct Client {
   inner: RustClient,
@@ -383,10 +410,7 @@ impl Client {
   fn create_work(&mut self, py: Python<'_>, green: &str, name: &str) -> PyResult<Py<PyDict>> {
     let green = parse_volume(green)?;
     let (id, base) = self.inner.create_work(green, name).map_err(refusal)?;
-    let dict = PyDict::new_bound(py);
-    dict.set_item("id", volume_hex(&id))?;
-    dict.set_item("base", base)?;
-    Ok(dict.into())
+    work_dict(py, id, base)
   }
 
   /// A green's head version (§4.16 merge chain) — the number that advances with each accepted submit.
@@ -424,19 +448,10 @@ impl Client {
   /// Submits a work volume's declared edits to its green (§4.16), returning the merge outcome (see
   /// [`merge_outcome_dict`]): `ok` with the new green `version` when accepted, or `ok` false with the
   /// `conflicts` windows to rebase against when an intervening change met the same range.
-  fn submit(&mut self, py: Python<'_>, work: &str) -> PyResult<Py<PyDict>> {
+  fn submit(&mut self, py: Python<'_>, work: &str) -> PyResult<Py<PyAny>> {
     let work = parse_volume(work)?;
-    match self.inner.submit(work).map_err(refusal)? {
-      Submitted::Accepted(version) => merge_outcome_dict(py, Some(version), Vec::new()),
-      Submitted::Conflict(windows) => merge_outcome_dict(
-        py,
-        None,
-        windows
-          .into_iter()
-          .map(|w| (w.path, w.at, w.len, w.class))
-          .collect(),
-      ),
-    }
+    let outcome = self.inner.submit(work).map_err(refusal)?;
+    submitted_to_py(py, outcome)
   }
 
   /// Rebases a work volume onto its green's head (§4.16), mapping its pending edits forward without
@@ -588,6 +603,14 @@ enum Decode {
   Resized,
   /// A destroy's confirmation (resolves to `None`).
   Destroyed,
+  /// A created green's id, as hex.
+  GreenCreated,
+  /// A created work's `{id, base}` dict.
+  WorkCreated,
+  /// An edit's confirmation (resolves to `None`).
+  Edited,
+  /// A submit's outcome dict.
+  Submitted,
 }
 
 /// A request in flight on the async client: the future its `await` suspends on, and how to decode its
@@ -802,6 +825,108 @@ impl AsyncClient {
     finish(&slf, word, fast, Decode::Destroyed)
   }
 
+  /// Creates a green merge target (§4.16) — the async form of [`Client.create_green`].
+  #[pyo3(signature = (name, require_evidence=false))]
+  fn create_green<'py>(
+    slf: Bound<'py, Self>,
+    name: &str,
+    require_evidence: bool,
+  ) -> PyResult<Bound<'py, PyAny>> {
+    let py = slf.py();
+    let (word, fast) = {
+      let mut this = slf.borrow_mut();
+      let request = this
+        .inner
+        .create_green_begin(name, require_evidence)
+        .map_err(refusal)?;
+      this.inner.begin_ack_if_due().map_err(refusal)?;
+      let spin = this.inner.published_spin_ns();
+      let fast = this
+        .inner
+        .create_green_spin(request, spin)
+        .map_err(refusal)?
+        .map(|volume| volume_hex(&volume).into_py(py));
+      (request.word(), fast)
+    };
+    finish(&slf, word, fast, Decode::GreenCreated)
+  }
+
+  /// Creates a work volume over a green (§4.16) as a `{id, base}` dict — the async form of
+  /// [`Client.create_work`].
+  fn create_work<'py>(
+    slf: Bound<'py, Self>,
+    green: &str,
+    name: &str,
+  ) -> PyResult<Bound<'py, PyAny>> {
+    let py = slf.py();
+    let green = parse_volume(green)?;
+    let (word, fast) = {
+      let mut this = slf.borrow_mut();
+      let request = this.inner.create_work_begin(green, name).map_err(refusal)?;
+      this.inner.begin_ack_if_due().map_err(refusal)?;
+      let spin = this.inner.published_spin_ns();
+      let fast = match this
+        .inner
+        .create_work_spin(request, spin)
+        .map_err(refusal)?
+      {
+        Some((id, base)) => Some(work_dict(py, id, base)?.into_any()),
+        None => None,
+      };
+      (request.word(), fast)
+    };
+    finish(&slf, word, fast, Decode::WorkCreated)
+  }
+
+  /// Declares a content edit on a work volume (§4.16) — the async form of [`Client.edit`]; resolves
+  /// to `None`.
+  fn edit<'py>(
+    slf: Bound<'py, Self>,
+    work: &str,
+    path: &str,
+    at: u64,
+    delete_len: u64,
+    data: &[u8],
+  ) -> PyResult<Bound<'py, PyAny>> {
+    let py = slf.py();
+    let work = parse_volume(work)?;
+    let (word, fast) = {
+      let mut this = slf.borrow_mut();
+      let request = this
+        .inner
+        .edit_begin(work, path, at, delete_len, data)
+        .map_err(refusal)?;
+      this.inner.begin_ack_if_due().map_err(refusal)?;
+      let spin = this.inner.published_spin_ns();
+      let fast = this
+        .inner
+        .edit_spin(request, spin)
+        .map_err(refusal)?
+        .map(|_done| py.None());
+      (request.word(), fast)
+    };
+    finish(&slf, word, fast, Decode::Edited)
+  }
+
+  /// Submits a work volume's operations to its green (§4.16) as an outcome dict — the async form of
+  /// [`Client.submit`].
+  fn submit<'py>(slf: Bound<'py, Self>, work: &str) -> PyResult<Bound<'py, PyAny>> {
+    let py = slf.py();
+    let work = parse_volume(work)?;
+    let (word, fast) = {
+      let mut this = slf.borrow_mut();
+      let request = this.inner.submit_begin(work).map_err(refusal)?;
+      this.inner.begin_ack_if_due().map_err(refusal)?;
+      let spin = this.inner.published_spin_ns();
+      let fast = match this.inner.submit_spin(request, spin).map_err(refusal)? {
+        Some(outcome) => Some(submitted_to_py(py, outcome)?),
+        None => None,
+      };
+      (request.word(), fast)
+    };
+    finish(&slf, word, fast, Decode::Submitted)
+  }
+
   /// The event loop's reader callback: drain the completion fd and resolve every request whose reply
   /// has landed. Registered once with `add_reader`, removed when no request is in flight.
   fn _pump(slf: Bound<'_, Self>) -> PyResult<()> {
@@ -988,6 +1113,22 @@ fn decode_pending(
       .destroy_poll(word)
       .map_err(refusal)?
       .map(|_done| py.None()),
+    Decode::GreenCreated => inner
+      .create_green_poll(word)
+      .map_err(refusal)?
+      .map(|volume| volume_hex(&volume).into_py(py)),
+    Decode::WorkCreated => match inner.create_work_poll(word).map_err(refusal)? {
+      Some((id, base)) => Some(work_dict(py, id, base)?.into_any()),
+      None => None,
+    },
+    Decode::Edited => inner
+      .edit_poll(word)
+      .map_err(refusal)?
+      .map(|_done| py.None()),
+    Decode::Submitted => match inner.submit_poll(word).map_err(refusal)? {
+      Some(outcome) => Some(submitted_to_py(py, outcome)?),
+      None => None,
+    },
   })
 }
 

@@ -1,9 +1,11 @@
 //! The TypeScript/Node SDK (§2.3, D-19; Phase 5): a napi-rs addon over the typed
 //! [`slates_client::Client`], so a Node or TypeScript agent drives slates through the same rings and
 //! completion records the Rust client uses — never a parallel reimplementation (the design rejects
-//! that). This is the **synchronous base** the design says the async form wraps (R6): every method here
-//! is one `Client` call; the async form over the completion descriptor (napi's `uv_poll`) is owed and
-//! will drive these same calls off the event loop as Promises.
+//! that). Two client surfaces over the one daemon (R6, D-19): the **async-primary** `AsyncClient` (the
+//! `async.mjs` JS wrapper over this addon's low-level primitives) returns a Promise per verb resolved
+//! by the completion fd's readiness — the fd wrapped in a libuv-polled `net.Socket` (`uv_poll`), never
+//! blocking the loop, over the `slates-client` async core; the [`Client`] here is the **thin blocking
+//! facade**, each method one `Client` call. No external runtime — no `tokio`.
 //!
 //! The binding is thin and honest: each verb maps one-to-one to a client method, a typed refusal
 //! becomes a JS `Error` carrying the refusal's text (richer error classes are owed — the message
@@ -377,6 +379,47 @@ fn volume_entry(volume: VolumeSummary) -> Result<VolumeEntry> {
   })
 }
 
+/// Builds a [`WorkVolume`] from a create-work's id and base. Shared by the sync and async verbs (§4.16).
+fn work_volume(id: VolumeId, base: u64) -> Result<WorkVolume> {
+  Ok(WorkVolume {
+    id: volume_hex(&id),
+    base: status_i64(base, "base")?,
+  })
+}
+
+/// Builds a [`MergeOutcome`] from a submit's typed outcome. Shared by the sync and async `submit`
+/// verbs, so both render one shape (§4.16).
+fn submit_outcome(outcome: Submitted) -> Result<MergeOutcome> {
+  match outcome {
+    Submitted::Accepted(version) => merge_outcome(Some(version), Vec::new()),
+    Submitted::Conflict(windows) => merge_outcome(
+      None,
+      windows
+        .into_iter()
+        .map(|window| (window.path, window.at, window.len, window.class))
+        .collect(),
+    ),
+  }
+}
+
+/// A create-work begin-and-spin result (see [`CreateBegin`]).
+#[napi(object)]
+pub struct WorkBegin {
+  /// The request id word.
+  pub word: String,
+  /// The work volume, present when the reply came within the spin window.
+  pub fast: Option<WorkVolume>,
+}
+
+/// A submit begin-and-spin result (see [`CreateBegin`]).
+#[napi(object)]
+pub struct SubmitBegin {
+  /// The request id word.
+  pub word: String,
+  /// The merge outcome, present when the reply came within the spin window.
+  pub fast: Option<MergeOutcome>,
+}
+
 #[napi]
 pub struct Client {
   inner: RustClient,
@@ -699,6 +742,137 @@ impl Client {
     self.inner.destroy_poll(word).map_err(refusal)
   }
 
+  /// Begins a create-green and spins; the word and the hex id if it landed in the spin.
+  #[napi]
+  pub fn begin_spin_create_green(
+    &mut self,
+    name: String,
+    require_evidence: Option<bool>,
+  ) -> Result<CreateBegin> {
+    let request = self
+      .inner
+      .create_green_begin(&name, require_evidence.unwrap_or(false))
+      .map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let spin = self.inner.published_spin_ns();
+    let fast = self
+      .inner
+      .create_green_spin(request, spin)
+      .map_err(refusal)?
+      .map(|volume| volume_hex(&volume));
+    Ok(CreateBegin {
+      word: request.word().to_string(),
+      fast,
+    })
+  }
+
+  /// Takes a create-green's reply by its word once the completion fd signals.
+  #[napi]
+  pub fn poll_create_green(&mut self, word: String) -> Result<Option<String>> {
+    let word = parse_word(&word)?;
+    Ok(
+      self
+        .inner
+        .create_green_poll(word)
+        .map_err(refusal)?
+        .map(|volume| volume_hex(&volume)),
+    )
+  }
+
+  /// Begins a create-work and spins; the word and the work volume if it landed in the spin.
+  #[napi]
+  pub fn begin_spin_create_work(&mut self, green: String, name: String) -> Result<WorkBegin> {
+    let green = parse_volume(&green)?;
+    let request = self
+      .inner
+      .create_work_begin(green, &name)
+      .map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let spin = self.inner.published_spin_ns();
+    let fast = match self
+      .inner
+      .create_work_spin(request, spin)
+      .map_err(refusal)?
+    {
+      Some((id, base)) => Some(work_volume(id, base)?),
+      None => None,
+    };
+    Ok(WorkBegin {
+      word: request.word().to_string(),
+      fast,
+    })
+  }
+
+  /// Takes a create-work's reply by its word once the completion fd signals.
+  #[napi]
+  pub fn poll_create_work(&mut self, word: String) -> Result<Option<WorkVolume>> {
+    let word = parse_word(&word)?;
+    match self.inner.create_work_poll(word).map_err(refusal)? {
+      Some((id, base)) => Ok(Some(work_volume(id, base)?)),
+      None => Ok(None),
+    }
+  }
+
+  /// Begins an edit and spins; the word and `true` if it completed within the spin.
+  #[napi]
+  pub fn begin_spin_edit(
+    &mut self,
+    work: String,
+    path: String,
+    at: i64,
+    delete_len: i64,
+    data: Buffer,
+  ) -> Result<UnitBegin> {
+    let work = parse_volume(&work)?;
+    let at = checked_u64(at, "at")?;
+    let delete_len = checked_u64(delete_len, "deleteLen")?;
+    let request = self
+      .inner
+      .edit_begin(work, &path, at, delete_len, data.as_ref())
+      .map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let spin = self.inner.published_spin_ns();
+    let fast = self.inner.edit_spin(request, spin).map_err(refusal)?;
+    Ok(UnitBegin {
+      word: request.word().to_string(),
+      fast,
+    })
+  }
+
+  /// Takes an edit's reply by its word once the completion fd signals (`true` when done).
+  #[napi]
+  pub fn poll_edit(&mut self, word: String) -> Result<Option<bool>> {
+    let word = parse_word(&word)?;
+    self.inner.edit_poll(word).map_err(refusal)
+  }
+
+  /// Begins a submit and spins; the word and the merge outcome if it landed in the spin.
+  #[napi]
+  pub fn begin_spin_submit(&mut self, work: String) -> Result<SubmitBegin> {
+    let work = parse_volume(&work)?;
+    let request = self.inner.submit_begin(work).map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let spin = self.inner.published_spin_ns();
+    let fast = match self.inner.submit_spin(request, spin).map_err(refusal)? {
+      Some(outcome) => Some(submit_outcome(outcome)?),
+      None => None,
+    };
+    Ok(SubmitBegin {
+      word: request.word().to_string(),
+      fast,
+    })
+  }
+
+  /// Takes a submit's outcome by its word once the completion fd signals.
+  #[napi]
+  pub fn poll_submit(&mut self, word: String) -> Result<Option<MergeOutcome>> {
+    let word = parse_word(&word)?;
+    match self.inner.submit_poll(word).map_err(refusal)? {
+      Some(outcome) => Ok(Some(submit_outcome(outcome)?)),
+      None => Ok(None),
+    }
+  }
+
   /// Lists the daemon's volumes (§4.4) as an array of [`VolumeEntry`] objects — id (hex), name, byte
   /// accounting, and overlay flag, the plain shape `slates list` prints.
   #[napi]
@@ -786,10 +960,7 @@ impl Client {
   pub fn create_work(&mut self, green: String, name: String) -> Result<WorkVolume> {
     let green = parse_volume(&green)?;
     let (id, base) = self.inner.create_work(green, &name).map_err(refusal)?;
-    Ok(WorkVolume {
-      id: volume_hex(&id),
-      base: status_i64(base, "base")?,
-    })
+    work_volume(id, base)
   }
 
   /// A green's head version (§4.16) — the number that advances with each accepted submit.
@@ -834,16 +1005,7 @@ impl Client {
   #[napi]
   pub fn submit(&mut self, work: String) -> Result<MergeOutcome> {
     let work = parse_volume(&work)?;
-    match self.inner.submit(work).map_err(refusal)? {
-      Submitted::Accepted(version) => merge_outcome(Some(version), Vec::new()),
-      Submitted::Conflict(windows) => merge_outcome(
-        None,
-        windows
-          .into_iter()
-          .map(|w| (w.path, w.at, w.len, w.class))
-          .collect(),
-      ),
-    }
+    submit_outcome(self.inner.submit(work).map_err(refusal)?)
   }
 
   /// Rebases a work volume onto its green's head (§4.16), mapping its pending edits forward without

@@ -76,6 +76,31 @@ export class AsyncClient {
     return undefined;
   }
 
+  async createGreen(name, requireEvidence) {
+    const { word, fast } = this._c.beginSpinCreateGreen(name, requireEvidence);
+    if (fast != null) return fast;
+    return this._await(word, (w) => this._c.pollCreateGreen(w));
+  }
+
+  async createWork(green, name) {
+    const { word, fast } = this._c.beginSpinCreateWork(green, name);
+    if (fast != null) return fast;
+    return this._await(word, (w) => this._c.pollCreateWork(w));
+  }
+
+  async edit(work, path, at, deleteLen, data) {
+    const { word, fast } = this._c.beginSpinEdit(work, path, at, deleteLen, data);
+    if (fast != null) return undefined;
+    await this._await(word, (w) => this._c.pollEdit(w));
+    return undefined;
+  }
+
+  async submit(work) {
+    const { word, fast } = this._c.beginSpinSubmit(work);
+    if (fast != null) return fast;
+    return this._await(word, (w) => this._c.pollSubmit(w));
+  }
+
   // Registers the pending future, arms the completion signal, ensures the reader, and closes the race
   // with a reply that landed between the spin's end and the arm.
   _await(word, poll) {

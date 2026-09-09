@@ -131,6 +131,20 @@ class SlatesAsyncRoundTrip(unittest.TestCase):
             self.assertEqual(
                 len(set(ids)), CONCURRENCY, "each concurrent create got a distinct volume id"
             )
+
+            # Merge workflow (§4.16): a green, a work over it, a content edit, a clean submit — the
+            # async form of the sync suite's merge loop, awaited on the same loop.
+            green = await client.create_green("g-async")
+            self.assertEqual(len(green), 32)
+            work = await client.create_work(green, "w-async")
+            self.assertEqual(len(work["id"]), 32)
+            self.assertIsInstance(work["base"], int)
+            # edit resolves to None (a unit verb); it creates the file on write.
+            self.assertIsNone(await client.edit(work["id"], "/notes.txt", 0, 0, b"hello async merge"))
+            outcome = await client.submit(work["id"])
+            self.assertTrue(outcome["ok"], f"the async submit landed cleanly: {outcome}")
+            self.assertEqual(outcome["conflicts"], [])
+            self.assertIsInstance(outcome["version"], int)
         finally:
             # Kill the whole process group so the supervised daemon goes with the anchor at once.
             try:

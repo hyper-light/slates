@@ -237,6 +237,49 @@ fn extract_destroyed(body: ReplyBody) -> Result<bool, ClientError> {
   }
 }
 
+/// Extracts a created green's id from its reply, or a typed mismatch.
+fn extract_green_created(body: ReplyBody) -> Result<VolumeId, ClientError> {
+  match body {
+    ReplyBody::GreenCreated { id } => Ok(id),
+    _ => Err(ClientError::UnexpectedReply {
+      verb: "create_green",
+    }),
+  }
+}
+
+/// Extracts a created work's id and base version from its reply, or a typed mismatch.
+fn extract_work_created(body: ReplyBody) -> Result<(VolumeId, u64), ClientError> {
+  match body {
+    ReplyBody::WorkCreated { id, base } => Ok((id, base)),
+    _ => Err(ClientError::UnexpectedReply {
+      verb: "create_work",
+    }),
+  }
+}
+
+/// Confirms an edit's reply, or a typed mismatch (yields `true`, the unit-verb sentinel).
+fn extract_edited(body: ReplyBody) -> Result<bool, ClientError> {
+  match body {
+    ReplyBody::Edited => Ok(true),
+    _ => Err(ClientError::UnexpectedReply { verb: "edit" }),
+  }
+}
+
+/// Extracts a submit's outcome from its reply — accepted at a version, or a conflict with windows —
+/// or a typed mismatch. The same rule the sync [`Client::submit`] applies.
+fn extract_submitted(body: ReplyBody) -> Result<Submitted, ClientError> {
+  match body {
+    ReplyBody::Submitted {
+      version: Some(v), ..
+    } => Ok(Submitted::Accepted(v)),
+    ReplyBody::Submitted {
+      version: None,
+      conflicts,
+    } => Ok(Submitted::Conflict(conflicts)),
+    _ => Err(ClientError::UnexpectedReply { verb: "submit" }),
+  }
+}
+
 impl Client {
   /// Connects to `instance` as a new client.
   pub fn connect(instance: &str, deadlines: Deadlines) -> Result<Client, ClientError> {
@@ -662,6 +705,105 @@ impl Client {
   /// Takes a destroy's reply by id word once the completion fd signals.
   pub fn destroy_poll(&mut self, word: u64) -> Result<Option<bool>, ClientError> {
     self.poll_as(word, extract_destroyed)
+  }
+
+  /// Begins a create-green, returning its request id.
+  pub fn create_green_begin(
+    &mut self,
+    name: &str,
+    require_evidence: bool,
+  ) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::CreateGreen {
+      name: name.to_owned(),
+      require_evidence,
+    })
+  }
+
+  /// Takes a create-green's reply within `spin_ns`.
+  pub fn create_green_spin(
+    &mut self,
+    id: RequestId,
+    spin_ns: u64,
+  ) -> Result<Option<VolumeId>, ClientError> {
+    self.spin_as(id, spin_ns, extract_green_created)
+  }
+
+  /// Takes a create-green's reply by id word once the completion fd signals.
+  pub fn create_green_poll(&mut self, word: u64) -> Result<Option<VolumeId>, ClientError> {
+    self.poll_as(word, extract_green_created)
+  }
+
+  /// Begins a create-work over a green, returning its request id.
+  pub fn create_work_begin(
+    &mut self,
+    green: VolumeId,
+    name: &str,
+  ) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::CreateWork {
+      green,
+      name: name.to_owned(),
+    })
+  }
+
+  /// Takes a create-work's reply (id and base version) within `spin_ns`.
+  pub fn create_work_spin(
+    &mut self,
+    id: RequestId,
+    spin_ns: u64,
+  ) -> Result<Option<(VolumeId, u64)>, ClientError> {
+    self.spin_as(id, spin_ns, extract_work_created)
+  }
+
+  /// Takes a create-work's reply by id word once the completion fd signals.
+  pub fn create_work_poll(&mut self, word: u64) -> Result<Option<(VolumeId, u64)>, ClientError> {
+    self.poll_as(word, extract_work_created)
+  }
+
+  /// Begins an edit on a work volume, returning its request id.
+  pub fn edit_begin(
+    &mut self,
+    work: VolumeId,
+    path: &str,
+    at: u64,
+    delete_len: u64,
+    bytes: &[u8],
+  ) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::Edit {
+      work,
+      path: path.to_owned(),
+      at,
+      delete_len,
+      bytes: bytes.to_vec(),
+    })
+  }
+
+  /// Takes an edit's reply within `spin_ns` (`true` when done).
+  pub fn edit_spin(&mut self, id: RequestId, spin_ns: u64) -> Result<Option<bool>, ClientError> {
+    self.spin_as(id, spin_ns, extract_edited)
+  }
+
+  /// Takes an edit's reply by id word once the completion fd signals.
+  pub fn edit_poll(&mut self, word: u64) -> Result<Option<bool>, ClientError> {
+    self.poll_as(word, extract_edited)
+  }
+
+  /// Begins a submit of a work volume, returning its request id.
+  pub fn submit_begin(&mut self, work: VolumeId) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::Submit { work })
+  }
+
+  /// Takes a submit's outcome within `spin_ns`.
+  pub fn submit_spin(
+    &mut self,
+    id: RequestId,
+    spin_ns: u64,
+  ) -> Result<Option<Submitted>, ClientError> {
+    self.spin_as(id, spin_ns, extract_submitted)
+  }
+
+  /// Takes a submit's outcome by id word once the completion fd signals.
+  pub fn submit_poll(&mut self, word: u64) -> Result<Option<Submitted>, ClientError> {
+    self.poll_as(word, extract_submitted)
   }
 
   /// Takes `id`'s reply within `spin_ns` and extracts its typed value (the fast path over a typed verb).

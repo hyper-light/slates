@@ -123,6 +123,23 @@ test('async lifecycle over a live daemon', async (t) => {
     const ids = await Promise.all(names.map((name) => client.create(name, VOLUME_BYTES)));
     assert.equal(ids.length, CONCURRENCY);
     assert.equal(new Set(ids).size, CONCURRENCY, 'each concurrent create got a distinct volume id');
+
+    // Merge workflow (§4.16): a green, a work over it, a content edit, a clean submit — the async
+    // merge loop, awaited on the same loop.
+    const green = await client.createGreen('g-node-async');
+    assert.equal(green.length, 32);
+    const work = await client.createWork(green, 'w-node-async');
+    assert.equal(work.id.length, 32);
+    assert.equal(typeof work.base, 'number');
+    // edit resolves to undefined (a unit verb); it creates the file on write.
+    assert.equal(
+      await client.edit(work.id, '/notes.txt', 0, 0, Buffer.from('hello async merge')),
+      undefined,
+    );
+    const outcome = await client.submit(work.id);
+    assert.equal(outcome.ok, true, 'the async submit landed cleanly');
+    assert.deepEqual(outcome.conflicts, []);
+    assert.equal(typeof outcome.version, 'number');
   } finally {
     // Kill the whole process group so the supervised daemon goes with the anchor at once.
     try {
