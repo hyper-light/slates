@@ -62,6 +62,12 @@ pub struct ClientEnd {
   /// has no completion channel yet. The fd is read-drained and the reply taken with [`Self::try_take`].
   #[cfg(unix)]
   completion: Option<OwnedFd>,
+  /// The macOS completion bridge (a self-pipe fed by a thread parking on the wake word), started on
+  /// demand by [`Self::enable_async_completion`]; `None` for a sync client and until the first async
+  /// use. macOS passes no shared completion fd (Mach and named sockets are refused, D-10), so the
+  /// async SDK polls this bridge's pipe; Linux uses [`Self::completion`] (the rendezvous eventfd).
+  #[cfg(target_os = "macos")]
+  bridge: Option<crate::completion::CompletionBridge>,
 }
 
 impl std::fmt::Debug for ClientEnd {
@@ -87,6 +93,8 @@ impl ClientEnd {
       replies: 0,
       #[cfg(unix)]
       completion: None,
+      #[cfg(target_os = "macos")]
+      bridge: None,
     }
   }
 
@@ -124,6 +132,10 @@ impl ClientEnd {
   /// drains it ([`Self::drain_completion`]), then takes the reply with [`Self::try_take`].
   #[cfg(unix)]
   pub fn completion_fd(&self) -> Option<RawFd> {
+    #[cfg(target_os = "macos")]
+    if let Some(bridge) = &self.bridge {
+      return Some(bridge.completion_fd());
+    }
     self.completion.as_ref().map(AsRawFd::as_raw_fd)
   }
 
@@ -133,10 +145,59 @@ impl ClientEnd {
   /// no-op.
   #[cfg(unix)]
   pub fn drain_completion(&self) {
+    #[cfg(target_os = "macos")]
+    if let Some(bridge) = &self.bridge {
+      bridge.drain();
+      return;
+    }
     if let Some(fd) = &self.completion {
       let mut scratch = [0u8; 64];
       let _ = rustix::io::read(fd, &mut scratch);
     }
+  }
+
+  /// Enables the async completion channel and returns the descriptor an event loop polls
+  /// (`add_reader` / `uv_poll`, D-19). Idempotent — the same descriptor each call. On Linux this is
+  /// the eventfd the rendezvous passed (the daemon writes it directly); on macOS it starts the
+  /// completion bridge (a self-pipe fed by a thread parking on the wake word) on first use. The SDK
+  /// registers the descriptor once, arms the parked flag with [`Self::arm_async`] before it yields,
+  /// re-checks [`Self::try_take`] to close the race, and drains the fd with [`Self::drain_completion`]
+  /// when the loop reports it readable.
+  #[cfg(unix)]
+  pub fn enable_async_completion(&mut self) -> Result<RawFd, IpcError> {
+    #[cfg(target_os = "macos")]
+    {
+      if let Some(bridge) = &self.bridge {
+        return Ok(bridge.completion_fd());
+      }
+      let bridge = crate::completion::CompletionBridge::start(&self.region)?;
+      let fd = bridge.completion_fd();
+      self.bridge = Some(bridge);
+      Ok(fd)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+      self.completion_fd().ok_or(IpcError::Unsupported {
+        feature: "async completion fd (the rendezvous passed no completion descriptor)",
+      })
+    }
+  }
+
+  /// Arms the completion signal before the SDK yields to its event loop: the daemon wakes a parked
+  /// client on a reply, making the completion fd readable, and the macOS bridge nudges its pipe only
+  /// while armed. This is the same `parked` flag the sync [`Self::wait`] sets; the async path manages
+  /// it explicitly because it never calls `wait`. A caller re-checks [`Self::try_take`] right after
+  /// arming to close the race with a reply that landed during the spin.
+  pub fn arm_async(&self) -> Result<(), IpcError> {
+    self.region.client_parked()?.store(1, Ordering::Release);
+    Ok(())
+  }
+
+  /// Clears the arm ([`Self::arm_async`]) once a reply is taken, so a later fast-path reply costs the
+  /// daemon no wake and the bridge no pipe write.
+  pub fn disarm_async(&self) -> Result<(), IpcError> {
+    self.region.client_parked()?.store(0, Ordering::Release);
+    Ok(())
   }
 
   /// Whether the daemon this end was connected to is gone (dead or restarted); true for an
@@ -457,5 +518,70 @@ mod tests {
     let reply = client.try_take().unwrap().unwrap();
     assert_eq!(reply.request, 1);
     assert_eq!(reply.payload, b"ok");
+  }
+
+  /// Waits up to `timeout_ns` for `fd` to become readable without consuming it (a poll, not a read),
+  /// so a test asserts readiness and drains separately. `true` if readable within the budget.
+  #[cfg(target_os = "macos")]
+  fn poll_readable(fd: RawFd, timeout_ns: u64) -> bool {
+    use rustix::event::{PollFd, PollFlags, Timespec};
+    // SAFETY: `fd` is the client's live completion fd, borrowed for one poll within the test.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let mut fds = [PollFd::new(&borrowed, PollFlags::IN)];
+    let ts = Timespec {
+      tv_sec: i64::try_from(timeout_ns / 1_000_000_000).unwrap_or(0),
+      tv_nsec: i64::try_from(timeout_ns % 1_000_000_000).unwrap_or(0),
+    };
+    rustix::event::poll(&mut fds, Some(&ts)).is_ok_and(|n| n > 0)
+  }
+
+  /// The macOS completion bridge signals only an *armed* reply, so the async fast path stays free of
+  /// any event-loop wakeup, and it stops clean on drop (§4.7, D-19). Do: enable the bridge; reply to a
+  /// disarmed client (the fast path) and then to an armed one (the slow path). Expect: the fd stays
+  /// quiet for the disarmed reply, becomes readable for the armed one, both replies wait in the ring,
+  /// and dropping the client joins the bridge thread (the test returns rather than hanging).
+  #[cfg(target_os = "macos")]
+  #[test]
+  fn the_completion_bridge_signals_only_an_armed_reply_and_stops_clean() {
+    let region = ClientRegion::create("slates-endpoint-bridge", 7, 0, geometry()).unwrap();
+    let (handoff, len) = region.handoff().unwrap();
+    let client_region = ClientRegion::open(&handoff, len).unwrap();
+    let mut daemon = DaemonEnd::new(region);
+    let mut client = ClientEnd::new(client_region);
+    let fd = client.enable_async_completion().unwrap();
+
+    // Fast path: the client is not armed (parked == 0), so the daemon issues no wake and the bridge
+    // writes nothing — no event-loop wakeup for a reply the client would take during its spin.
+    client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
+    let request = daemon.try_take().unwrap().unwrap();
+    daemon
+      .reply(&Slot::inline(request.request, b"one").unwrap())
+      .unwrap();
+    assert!(
+      !poll_readable(fd, 100_000_000),
+      "a disarmed (fast-path) reply does not wake the event loop"
+    );
+    let reply = client.try_take().unwrap().unwrap();
+    assert_eq!(reply.payload, b"one");
+
+    // Slow path: the client arms before it would yield, so the daemon wakes the word and the bridge
+    // makes the pipe readable for the loop.
+    client.arm_async().unwrap();
+    client.send(&Slot::inline(2, b"hi").unwrap()).unwrap();
+    let request = daemon.try_take().unwrap().unwrap();
+    daemon
+      .reply(&Slot::inline(request.request, b"two").unwrap())
+      .unwrap();
+    assert!(
+      poll_readable(fd, 2_000_000_000),
+      "an armed (slow-path) reply makes the completion fd readable"
+    );
+    client.drain_completion();
+    client.disarm_async().unwrap();
+    let reply = client.try_take().unwrap().unwrap();
+    assert_eq!(reply.payload, b"two");
+
+    // Clean shutdown: dropping the client joins the bridge thread; returning proves no hang.
+    drop(client);
   }
 }

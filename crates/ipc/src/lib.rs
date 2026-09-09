@@ -19,6 +19,11 @@
 //! shared object), [`wake`] (the wake word per OS), [`rendezvous`] (per OS), [`endpoint`]
 //! (the daemon's and the client's ends), [`error`].
 
+/// The client-side completion bridge for platforms whose rendezvous passes no completion fd (macOS
+/// today; Windows owed): a thread that makes a client-local self-pipe readable when an armed reply
+/// lands, for an async SDK event loop (§4.7, D-19). Linux uses the rendezvous eventfd instead.
+#[cfg(target_os = "macos")]
+pub mod completion;
 pub mod endpoint;
 pub mod error;
 pub mod protocol;

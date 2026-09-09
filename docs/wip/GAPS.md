@@ -505,13 +505,26 @@ one owner per end, dup'd once at accept. `a_reply_to_a_parked_client_nudges_the_
 drives it over a socketpair on this macOS host: the fd is quiet before the reply, readable after,
 the reply waiting in the ring. The Linux rendezvous dups its `SCM_RIGHTS` eventfd into the daemon
 end and hands the client its own (`rendezvous.rs`: `Accepted::completion_dup`,
-`Connected::take_completion`); `daemon.rs` sets it on the daemon end at accept. Still owed from
-task 3: the **macOS and Windows rendezvous** delivery of a real completion fd (Phase 5's optional
-control socket — a Unix-domain socketpair on macOS, a socket on Windows — the platform
-`Control::completion_dup`/`ClientControl::into_completion` return `None` until then, so the fd is
-live only on Linux and in the unit test today); and, above it, the Python `asyncio`/Node
-`uv_poll` bindings that poll `completion_fd` behind thin sync facades (R6, D-19). The Rust client
-parks on the word and needs none. The Windows named Event per client (Phase
+`Connected::take_completion`); `daemon.rs` sets it on the daemon end at accept. The **macOS
+completion fd is now live too**, by a different mechanism the design forces there (D-10 forbids
+the Linux one on macOS — Mach messages and filesystem-named sockets are both refused, so no fd can
+cross the `shm` rendezvous): `completion.rs`'s `CompletionBridge` is a client-owned thread that
+parks on the very wake word the daemon already signals and, on an *armed* reply, writes a
+client-local self-pipe the async SDK polls (§4.7 "signal the completion fd (eventfd / pipe /
+socket)"). The daemon is unchanged (its macOS completion stays `None`) and the fast path is
+untouched: a disarmed reply — taken during the spin, the client never parked — wakes neither the
+word nor the pipe, so the async fast path adds no event-loop wakeup (§4.7 worked example). One
+thread per async client, owned by the `ClientEnd` and joined on drop (the `slates-server`
+`DoorbellThread` pattern; the stop flag a `Box::leak`'d `&'static AtomicBool`, no `Arc`, R2).
+`ClientEnd::{enable_async_completion, arm_async, disarm_async}` are the uniform seam over both
+mechanisms (Linux eventfd written by the daemon, macOS pipe written by the bridge);
+`the_completion_bridge_signals_only_an_armed_reply_and_stops_clean` drives it on this macOS host —
+the fd quiet for a disarmed reply, readable for an armed one, the thread joining clean on drop,
+and the Linux branch lints clean cross-target. Still owed: the **Windows** completion fd (its
+async loop needs a socket, D-10 "asyncio on Windows needs a socket"; a client-local loopback
+socketpair fed by the same bridge, build-and-lint only from this host); and, above both, the
+Python `asyncio`/Node `uv_poll` bindings that poll `completion_fd` behind thin sync facades (R6,
+D-19). The Rust client parks on the word and needs none. The Windows named Event per client (Phase
 4, with the section-and-Event rendezvous compile-checked now); the doorbell thread that turns a
 client's wake of a parked macOS shard into the driver's kick, and the heartbeat slot that
 tells the daemon a client died where no socket closes, both with the server's integration in
