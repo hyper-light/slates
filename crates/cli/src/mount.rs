@@ -17,11 +17,15 @@ use slates_client::StatusReport;
 
 use crate::Failure;
 
-/// Derived: the attribute-cache timeout (`actimeo`, whole seconds) the mount requests. slates's
-/// loopback GETATTR is sub-millisecond, so revalidation is cheap; a short cache keeps the view fresh —
-/// an overlay changes under merges and outside edits — while amortizing repeated stats over a burst of
-/// identical reads. One second is the finest `mount_nfs`'s whole-second `actimeo` expresses; sylk
-/// documents the same trade-off for its 100 ms FUSE attribute timeout (`core/purevfs`).
+/// Derived: the attribute-cache timeout (`actimeo`, whole seconds — `man mount_nfs`:
+/// `actimeo=⟨seconds⟩`) the mount requests. §4.6 owed this value "from the measured loopback RTT"; the
+/// RTT resolves it, and floors it. slates's loopback GETATTR RTT is sub-millisecond — roughly 10,000×
+/// finer than the whole-second `actimeo` knob — so an RTT-derived timeout rounds to the knob's minimum.
+/// The two competing goals both land on that minimum: `actimeo=0` (`noac`) sends every `getattr` to the
+/// server and defeats `rdirplus`'s attribute batching, while the macOS default (5–60 s, scaled by file
+/// age) is far too stale for an overlay that changes under merges and outside edits. So the mount asks
+/// for the finest nonzero cache the knob expresses, one second — the same freshness/amortization
+/// trade-off sylk documents for its 100 ms FUSE attribute timeout (`core/purevfs`).
 const ATTR_CACHE_SECONDS: u32 = 1;
 
 /// The loopback mount mechanism a host offers (§4.6), the analogue of sylk's FUSE-backend selection.
