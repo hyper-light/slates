@@ -46,15 +46,17 @@ $ slates unmount $MNT
 unmounted: /private/var/folders/1s/.../T/slates-readme-9_w1qw5m
 ```
 
-*The console output in this README was captured from a build at `dbd63f5` on macOS; temporary
-paths are shortened.*
+> [!NOTE]
+> The console output in this README was captured from a build at `dbd63f5` on macOS;
+> temporary paths are shortened.
 
-Slates has no release yet. The daemon, the CLI, mounts on macOS, the merge engine on one
-machine, landing plans, the MCP server and the async Python and Node SDKs work today. Linux and
-Windows mounts, the grant command that lets a landing write to disk, container and VM guests,
-and the fleet (whose protocol core and transport exist, but not yet the wiring between nodes)
-are still being built. The [gap ledger](docs/wip/GAPS.md#8i-a-9-contract-correction-and-open-implementation-gaps-2026-09-05)
-tracks each item.
+> [!IMPORTANT]
+> Slates has no release yet. The daemon, the CLI, mounts on macOS, the merge engine on one
+> machine, landing plans, the MCP server and the async Python and Node SDKs work today. Linux
+> and Windows mounts, the grant command that lets a landing write to disk, container and VM
+> guests, and the fleet (whose protocol core and transport exist, but not yet the wiring between
+> nodes) are still being built. The [gap ledger](docs/wip/GAPS.md#8i-a-9-contract-correction-and-open-implementation-gaps-2026-09-05)
+> tracks each item.
 
 ## Install
 
@@ -70,10 +72,11 @@ slates --help
 Release builds for macOS, Linux (glibc and musl) and Windows run in CI on every tag, but no
 binaries are attached yet.
 
-Mounting a volume works on macOS today, with no root, no kernel extension and no entitlement:
-slates serves NFS on a loopback socket and the built-in `mount_nfs` mounts it. On Linux the
-daemon and CLI run and the FUSE bridge is tested at the protocol level, but a volume cannot be
-mounted yet. On Windows the workspace builds and nothing mounts.
+> [!IMPORTANT]
+> Mounting a volume works on macOS today, with no root, no kernel extension and no
+> entitlement: slates serves NFS on a loopback socket and the built-in `mount_nfs` mounts it.
+> On Linux the daemon and CLI run and the FUSE bridge is tested at the protocol level, but a
+> volume cannot be mounted yet. On Windows the workspace builds and nothing mounts.
 
 ## Quickstart
 
@@ -123,10 +126,11 @@ $ slates base read <id> /Cargo.toml          # read a file straight from the bas
 $ slates status <id> --drift                 # base files that changed since you touched them
 ```
 
-A few commands exist but are not finished. `--locked` records the intent but
-does not pin memory yet, `attach` records an attachment without mounting anything, and
-`exec` (Linux) needs a root mount that the daemon does not establish on its own. The
-[CLI guide](docs/cli.md) lists each one.
+> [!WARNING]
+> A few commands exist but are not finished. `--locked` records the intent but does not pin
+> memory yet, `attach` records an attachment without mounting anything, and `exec` (Linux)
+> needs a root mount that the daemon does not establish on its own. The [CLI guide](docs/cli.md)
+> lists each one.
 
 ## Merging
 
@@ -225,9 +229,11 @@ runs is what you approved and nothing more. If you edited a file yourself after 
 changed it, that file is refused rather than overwritten. The target must be a real directory,
 not a path through a symlink.
 
-The `slates grant` command the plan asks for does not exist yet, so nothing has landed through
-the CLI so far. When it does, it will be the only place a grant can come from: an agent cannot
-grant itself disk access through MCP or an SDK, because those surfaces have no such verb.
+> [!WARNING]
+> The `slates grant` command the plan asks for does not exist yet, so nothing has landed
+> through the CLI so far. When it does, it will be the only place a grant can come from: an
+> agent cannot grant itself disk access through MCP or an SDK, because those surfaces have no
+> such verb.
 
 ## Use it with an AI agent (MCP)
 
@@ -256,7 +262,11 @@ command = "/usr/local/bin/slates"
 args = ["mcp"]
 ```
 
-Add `--instance NAME` if the daemon was started with one. The 23 tools cover volumes
+> [!TIP]
+> Use the binary's absolute path: MCP clients start servers with no working directory and
+> often no `PATH`. Add `--instance NAME` if the daemon was started with one.
+
+The 23 tools cover volumes
 (`slates.volume.*`), the merge loop (`slates.merge.*`), attachments, the base directory
 (`slates.base.*`), landings (`slates.land.materialize`), `slates.status` and `slates.help`.
 Results come back as `structuredContent`, and a refusal from the daemon is a JSON-RPC error
@@ -269,8 +279,11 @@ Both SDKs are thin bindings over the Rust client, so an agent in Python or Node 
 daemon over the same rings the CLI uses. Both are async first: every verb is awaitable and is
 resolved by the daemon's completion descriptor on your own event loop (`asyncio` in Python,
 libuv in Node), with no extra runtime or thread underneath. A blocking `Client` with the same
-verbs is there for scripts. The packages are `slates` on PyPI and `@hyper-light/slates` on npm;
-neither is published yet, so for now build them from the checkout.
+verbs is there for scripts.
+
+> [!NOTE]
+> The packages are `slates` on PyPI and `@hyper-light/slates` on npm. Neither is published
+> yet, so for now build them from the checkout as shown.
 
 **Python** (`pip install slates`; from a checkout, `maturin build -m crates/sdk-python/Cargo.toml`
 then `pip install target/wheels/slates-*.whl`):
@@ -368,9 +381,13 @@ Creating a volume, measured from a client process through the real rendezvous an
 | One client | 9 µs | **25 µs** | 31 µs |
 | Eight clients | | 34–45 µs | |
 
-The 50 µs p99 for one client is a CI gate. Inside a volume
-(`cargo run --release -p slates-vfs --example vfs_bench`, trees shaped like a `cargo build`
-output directory):
+The 50 µs p99 for one client is a CI gate. A snapshot costs the same at a million files as
+at a thousand, destroying a million-file volume runs in 8 µs slices between other requests,
+and the daemon recovers ten thousand volumes from a million log records in 96 ms after a
+restart.
+
+<details>
+<summary>Inside a volume (<code>cargo run --release -p slates-vfs --example vfs_bench</code>, trees shaped like a <code>cargo build</code> output directory)</summary>
 
 | Operation | 1,000 files | 1,000,000 files |
 |---|---:|---:|
@@ -382,9 +399,7 @@ output directory):
 | Memory per file | 697 B | 468 B |
 | Build the tree | 1 ms | 1.0 s |
 
-A snapshot costs the same at a million files as at a thousand, and destroying a million-file
-volume runs in 8 µs slices between other requests. The daemon recovers ten thousand volumes
-from a million log records in 96 ms after a restart.
+</details>
 
 ## How it works
 
@@ -455,11 +470,12 @@ slates: refused: Unsupported { feature: "mirror" }
 On your laptop the region is placed as soon as the local append lands, and the mirror is
 refused because there is nobody to mirror to. The fields are the ones a fleet fills in.
 
-What you can run today is the one-machine case of all of this. The replication core runs at
-f=0 and at a simulated f=1 with a test that asserts identical outcomes, the takeover and
-reconfiguration protocols were model-checked on 2026-09-04, and the node-to-node transport
-runs end to end on a simulated network. Joining real machines together is Phase 8, and there
-is no fleet benchmark yet. The design is §4.8 and §4.10 of the
+> [!NOTE]
+> What you can run today is the one-machine case of all of this. The replication core runs at
+> f=0 and at a simulated f=1 with a test that asserts identical outcomes, the takeover and
+> reconfiguration protocols were model-checked on 2026-09-04, and the node-to-node transport
+> runs end to end on a simulated network. Joining real machines together is Phase 8, and there
+> is no fleet benchmark yet. The design is §4.8 and §4.10 of the
 [unified design](docs/wip/SLATES_DESIGN.md) and the [transport draft](docs/wip/fleet-transport.md);
 the reading behind it, from EdenFS and Piper to Vertical Paxos and copysets, is in
 [docs/wip/research/](docs/wip/research/).
