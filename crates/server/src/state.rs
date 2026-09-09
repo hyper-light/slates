@@ -186,6 +186,11 @@ pub struct Deferred {
   pub reply: ReplyBody,
   /// Whether its completion record exists already (the owner partition recorded it).
   pub recorded: bool,
+  /// The monotonic time the request was read from the ring, for the `ring.request` span (§4.14),
+  /// emitted when this deferred reply is finally written. Zero means "unknown" — a reply that arrived
+  /// from another shard (a forward's `deliver`), whose `ring.request` span at the origin is owed and
+  /// so is not emitted here rather than emitted with a wrong duration.
+  pub read_ns: u64,
 }
 
 /// A forward waiting for room on the owner shard's control channel.
@@ -278,6 +283,10 @@ pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool
       request,
       reply,
       recorded,
+      // A cross-shard reply (a forward's return or a scatter's part): the origin's `ring.request`
+      // span start was not threaded across the shard boundary, so it is not emitted (owed), not
+      // emitted with a wrong duration.
+      read_ns: 0,
     });
     s.server_task
   })

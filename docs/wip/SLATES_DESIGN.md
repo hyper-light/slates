@@ -2190,15 +2190,19 @@ it uses content addressing. The RAM-only trust boundary and any allowed sharing 
 > is **wired into the daemon boot**: `Daemon::start` builds the roster via `registered_chokepoints()`
 > and refuses to serve — typed `ServerError::ChokepointsUnregistered { missing }`, fail-closed, before
 > any resource is acquired — until every chokepoint has registered its emitter, so a daemon never
-> serves with a silently missing span source. The **`shard.op` chokepoint now emits for real**: each
-> shard owns a bounded per-shard `SpanSink` (thread-local, no lock — R2; sized to one client ring's
-> depth), `run_recorded` emits a `shard.op` span around every verb (real request id, per-shard span id,
-> content-free read/mutation label, trace seeded from the request word until propagation is wired), and
-> the held/dropped counts ride `ShardReport` to `slates status`; a non-vacuity test shows the count move
-> as verbs run. Owed: the other eight chokepoints' emit sites, the cross-shard aggregation of the
-> per-shard sinks into the single control-shard sink (the `Control::Spawn` path the bridge queue uses),
-> real cross-boundary trace propagation, and typed absence markers plus `(value, freshness)` on the
-> daemon-level counters.
+> serves with a silently missing span source. **Three chokepoints now emit for real**: each shard owns
+> a bounded per-shard `SpanSink` (thread-local, no lock — R2; sized to one client ring's depth), and
+> emits `shard.op` (the whole verb) and `log.append` (the durable `Db::commit` within it) for every
+> verb in `run_recorded`, plus `ring.request` (ring read → reply written) for a synchronously-served
+> reply in `serve_client`/`retry_deferred` — each with the real request id, a per-shard span id, a
+> content-free label, and a trace seeded from the request word until propagation is wired. The
+> held/dropped counts ride `ShardReport` to `slates status`; a non-vacuity test shows the count move as
+> verbs run. Owed: the other six chokepoints' emit sites (`bridge.request`, `ship.record`,
+> `consensus.step`, `archive.chunk`, `land.entry`, `merge.verdict`); `ring.request` for a *forwarded*
+> reply (its origin span crosses the shard boundary, so `read_ns` 0 marks it as owed rather than timing
+> it wrongly); the cross-shard aggregation of the per-shard sinks into the single control-shard sink
+> (the `Control::Spawn` path the bridge queue uses); real cross-boundary trace propagation; and typed
+> absence markers plus `(value, freshness)` on the daemon-level counters.
 
 Chokepoint spans (bridge request, ring request, shard operation, log append, replication ship,
 consensus step, archive chunk) with the three-id law; spans emitted asynchronously through

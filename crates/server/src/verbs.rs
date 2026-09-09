@@ -299,36 +299,53 @@ fn run_recorded(
   principal: &Principal,
   body: RequestBody,
 ) -> ReplyBody {
-  // The `shard.op` chokepoint span (§4.14): one verb on its owner shard, no awaits inside, measured
-  // from before the verb runs to after its completion record commits. The label is content-free — a
-  // read (0) or a mutation (1), the `shard.op{verb}` dimension at the coarsest honest granularity (a
-  // finer per-verb code is a follow-up); it never carries a path, a name or bytes. Computed before
-  // `dispatch` moves `body`.
+  // Two chokepoint spans measure one verb (§4.14): `shard.op` over the whole verb (one verb on its
+  // owner shard, no awaits inside), and `log.append` over the durable `Db::commit` within it (one
+  // op-log record appended and published). The `shard.op` label is content-free — a read (0) or a
+  // mutation (1), the `{verb}` dimension at the coarsest honest granularity (a finer per-verb code is
+  // a follow-up); the `log.append` label is the partition. Neither carries a path, a name or bytes.
   let start_ns = state.clock.monotonic_ns();
-  let label = u32::from(mutates_shard_image(&body));
+  let label = u32::from(mutates_shard_image(&body)); // before `dispatch` moves `body`
   state.db.begin();
   let reply = dispatch(state, client_id, principal, body);
   let reply = record_completion(state, id, reply);
+  let append_start = state.clock.monotonic_ns();
   let reply = match state.db.commit(&mut state.segment) {
     Ok(_) => reply,
     Err(e) => refused(refusal_of_db(&e)),
   };
   let end_ns = state.clock.monotonic_ns();
-  emit_shard_op(state, id, label, start_ns, end_ns);
+  emit_span(state, Chokepoint::ShardOp, label, id, start_ns, end_ns);
+  let partition_label = u32::from(state.partition);
+  emit_span(
+    state,
+    Chokepoint::LogAppend,
+    partition_label,
+    id,
+    append_start,
+    end_ns,
+  );
   reply
 }
 
-/// Emits the `shard.op` chokepoint span (§4.14) into this shard's bounded telemetry sink: the request
-/// identity (real, for replay), a fresh per-shard span id, and — until cross-boundary trace propagation
-/// (from the bridge or client) is wired — a trace seeded from the request word so a request's spans
-/// still correlate. `caused_by` is none, no upstream causal event being threaded yet. Emission is a
-/// sink push: no await, no lock, so it never blocks the verb it measures; a full sink sheds the oldest
-/// span and counts it (§4.14 shed-first, loss explicit).
-fn emit_shard_op(state: &mut ShardState, id: RequestId, label: u32, start_ns: u64, end_ns: u64) {
+/// Emits one chokepoint span (§4.14) into this shard's bounded telemetry sink: the request identity
+/// (real, for replay), a fresh per-shard span id, and — until cross-boundary trace propagation (from
+/// the bridge or client) is wired — a trace seeded from the request word so a request's spans still
+/// correlate. `caused_by` is none (no upstream causal event is threaded yet). Emission is a sink push:
+/// no await, no lock, so it never blocks the verb it measures; a full sink sheds the oldest span and
+/// counts it (§4.14 shed-first, loss explicit). `label` is the span's content-free dimension code.
+fn emit_span(
+  state: &mut ShardState,
+  point: Chokepoint,
+  label: u32,
+  id: RequestId,
+  start_ns: u64,
+  end_ns: u64,
+) {
   let span = SpanId(state.next_span_id);
   state.next_span_id = state.next_span_id.saturating_add(1);
   state.telemetry.emit(Span {
-    point: Chokepoint::ShardOp,
+    point,
     label,
     context: SpanContext {
       request: id,
@@ -484,6 +501,7 @@ fn retry_forwards(state: &mut ShardState) -> bool {
           request: pending.request,
           reply: refused(Refusal::NotFound),
           recorded: false,
+          read_ns: 0, // a forward that never reached its owner; the origin's ring.request is owed
         });
         any = true;
       }
@@ -2802,6 +2820,7 @@ fn retry_deferred(state: &mut ShardState) -> bool {
       request,
       reply,
       recorded,
+      read_ns,
     } = entry;
     let id = RequestId::from_word(request);
     let reply = if recorded {
@@ -2814,12 +2833,28 @@ fn retry_deferred(state: &mut ShardState) -> bool {
     };
     if send_reply(state, client_index, request, &reply) {
       any = true;
+      // The `ring.request` span (§4.14) for a reply that was deferred (its ring was full) and is now
+      // written — but only when the read time is known (a local request). A cross-shard reply carries
+      // `read_ns` 0, whose origin-side span is owed, so it is skipped rather than timed wrongly.
+      if read_ns != 0 {
+        let written_ns = state.clock.monotonic_ns();
+        let label = u32::from(state.partition);
+        emit_span(
+          state,
+          Chokepoint::RingRequest,
+          label,
+          id,
+          read_ns,
+          written_ns,
+        );
+      }
     } else {
       state.deferred.push(Deferred {
         client_index,
         request,
         reply,
         recorded: true,
+        read_ns,
       });
     }
   }
@@ -2852,15 +2887,33 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     }
     match serve(state, handle, &request) {
       Served::Reply(reply) => {
-        if !send_reply(state, index, request.request, &reply) {
+        if send_reply(state, index, request.request, &reply) {
+          // Written synchronously: the `ring.request` span (§4.14) from the ring read to the reply
+          // written. `now` (this round's single clock read, §4.7) stands for the read time — a small,
+          // conservative over-estimate within one batch, not a per-request clock read on the hot path.
+          let written_ns = state.clock.monotonic_ns();
+          let label = u32::from(state.partition);
+          emit_span(
+            state,
+            Chokepoint::RingRequest,
+            label,
+            RequestId::from_word(request.request),
+            now,
+            written_ns,
+          );
+        } else {
+          // The ring was full: keep the read time so the span is complete when `retry_deferred` writes.
           state.deferred.push(Deferred {
             client_index: index,
             request: request.request,
             reply,
             recorded: true,
+            read_ns: now,
           });
         }
       }
+      // A forwarded request: its reply returns from the owner shard via `deliver` (read_ns 0), so its
+      // origin-side `ring.request` span is owed — not emitted here with a wrong duration.
       Served::Forwarded => {}
     }
   }

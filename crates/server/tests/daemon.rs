@@ -657,10 +657,11 @@ fn version_stats_scenario() {
   daemon.stop();
 }
 
-/// The `shard.op` chokepoint span is emitted for real, not just registered (§4.14): running verbs
-/// leaves spans in the shards' bounded telemetry sinks, and the daemon status reports the held count.
+/// The live chokepoint spans are emitted for real, not just registered (§4.14): running verbs leaves
+/// spans in the shards' bounded telemetry sinks — `shard.op` and `log.append` for every verb, plus
+/// `ring.request` for a synchronously-served reply — and the daemon status reports the held count.
 /// Do: read the held span count, run several verbs, read it again. Expect: it moved up — the live
-/// non-vacuity witness that the registered emitter actually emits (a dead emit path would keep it at
+/// non-vacuity witness that the registered emitters actually emit (a dead emit path would keep it at
 /// zero while the registration gate still passed). The count is reported per shard and summed here.
 fn telemetry_scenario() {
   let (daemon, instance) = daemon("telemetry");
