@@ -125,6 +125,33 @@ fn a_request_round_trips_through_its_bytes() {
       parent: oid(1),
       name: "d".to_owned(),
     },
+    ShimRequest::Open {
+      object: oid(9),
+      flags: 2,
+    },
+    ShimRequest::Flush {
+      object: oid(9),
+      fh: 5,
+    },
+    ShimRequest::Symlink {
+      parent: oid(1),
+      name: "link".to_owned(),
+      target: "/a/b/c".to_owned(),
+    },
+    ShimRequest::Readlink { object: oid(9) },
+    ShimRequest::Link {
+      target: oid(9),
+      new_parent: oid(1),
+      new_name: "alias".to_owned(),
+    },
+    ShimRequest::Rename {
+      old_parent: oid(1),
+      new_parent: oid(2),
+      old_name: "from".to_owned(),
+      new_name: "to".to_owned(),
+      no_replace: true,
+      exchange: false,
+    },
   ];
   for request in requests {
     let bytes = request.encode();
@@ -368,6 +395,75 @@ fn serve_drives_the_directory_lifecycle() {
     serve(&rmdir, &mut bridge, &cx).unwrap(),
     vec![STATUS_OK],
     "rmdir is an OK unit reply"
+  );
+}
+
+/// `serve` drives a symlink and reads its target back, and renames a file — the link and rename path
+/// over the seam.
+#[test]
+fn serve_drives_symlink_and_rename() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root = bridge.root(&cx).unwrap();
+
+  // Symlink "link" -> "/target/path"; readlink returns the same target.
+  let target = "/target/path";
+  let symlink = ShimRequest::Symlink {
+    parent: oid(root),
+    name: "link".to_owned(),
+    target: target.to_owned(),
+  }
+  .encode();
+  let reply = serve(&symlink, &mut bridge, &cx).unwrap();
+  assert_eq!(reply[0], STATUS_OK, "symlink succeeded");
+  // The reply is the new attribute; its inode is the first field.
+  let mut ino = [0u8; 8];
+  ino.copy_from_slice(&reply[1..9]);
+  let link_ino = u64::from_le_bytes(ino);
+
+  let readlink = ShimRequest::Readlink {
+    object: oid(link_ino),
+  }
+  .encode();
+  let reply = serve(&readlink, &mut bridge, &cx).unwrap();
+  assert_eq!(reply[0], STATUS_OK, "readlink succeeded");
+  let mut len = [0u8; 4];
+  len.copy_from_slice(&reply[1..5]);
+  let len = usize::try_from(u32::from_le_bytes(len)).unwrap();
+  assert_eq!(
+    &reply[5..5 + len],
+    target.as_bytes(),
+    "readlink returns the target"
+  );
+
+  // Create a file and rename it; the rename is an OK unit reply and the new name resolves.
+  let (attr, fh) = bridge.create(oid(root), &cx, "before", 0o644, 0).unwrap();
+  bridge.release(oid(attr.ino), &cx, fh).ok();
+  let rename = ShimRequest::Rename {
+    old_parent: oid(root),
+    new_parent: oid(root),
+    old_name: "before".to_owned(),
+    new_name: "after".to_owned(),
+    no_replace: false,
+    exchange: false,
+  }
+  .encode();
+  assert_eq!(
+    serve(&rename, &mut bridge, &cx).unwrap(),
+    vec![STATUS_OK],
+    "rename is an OK unit reply"
+  );
+  let lookup = ShimRequest::Lookup {
+    parent: oid(root),
+    name: "after".to_owned(),
+  }
+  .encode();
+  assert_eq!(
+    serve(&lookup, &mut bridge, &cx).unwrap()[0],
+    STATUS_OK,
+    "the renamed file resolves"
   );
 }
 

@@ -13,14 +13,16 @@
 //! either the result or a [`ShimError`] tag; the Swift shim maps that tag to the `NSError`/POSIX errno
 //! FSKit returns, so no errno numbers live in this Rust codec.
 //!
-//! The codec now covers the read path (`lookup`, `getattr`, `read`), the write path (`write`), the
-//! directory enumeration path (`opendir`, `readdir`, `release`) and the core namespace operations
-//! (`create`, `mkdir`, `unlink`, `rmdir`) — enough to browse and modify a tree over the seam. The
-//! remaining operations (`open`/`flush`, `symlink`/`link`/`readlink`, `rename`, `reference`/`forget`),
-//! a golden reply test pinning the wire, the app-group ring transport, and the Swift `FSVolume` shim
-//! (with the `Slates.app` bundle, the FSKit entitlement, and the mount spike) are the owed continuation.
+//! The codec now covers the **whole `Bridge` filesystem operation set**: the read path (`lookup`,
+//! `getattr`, `read`), the write path (`write`), files and handles (`open`, `flush`), directory
+//! enumeration (`opendir`, `readdir`, `release`), the namespace (`create`, `mkdir`, `unlink`, `rmdir`,
+//! `rename`), and links (`symlink`, `readlink`, `link`) — a tree can be browsed and modified end to end
+//! over the seam. The transport-lifetime operations (`reference`/`forget`, which manage per-transport
+//! lookup counts) are owed, as are a golden reply test pinning the wire, the app-group ring transport,
+//! and the Swift `FSVolume` shim (with the `Slates.app` bundle, the FSKit entitlement, and the mount
+//! spike).
 
-use slates_bridge_core::{Bridge, DirEntry, NodeAttr, ObjectId, OpContext};
+use slates_bridge_core::{Bridge, DirEntry, NodeAttr, ObjectId, OpContext, RenameFlags};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
@@ -46,11 +48,28 @@ const OP_MKDIR: u8 = 9;
 const OP_UNLINK: u8 = 10;
 /// Format: see [`OP_LOOKUP`].
 const OP_RMDIR: u8 = 11;
+/// Format: see [`OP_LOOKUP`].
+const OP_OPEN: u8 = 12;
+/// Format: see [`OP_LOOKUP`].
+const OP_FLUSH: u8 = 13;
+/// Format: see [`OP_LOOKUP`].
+const OP_SYMLINK: u8 = 14;
+/// Format: see [`OP_LOOKUP`].
+const OP_READLINK: u8 = 15;
+/// Format: see [`OP_LOOKUP`].
+const OP_LINK: u8 = 16;
+/// Format: see [`OP_LOOKUP`].
+const OP_RENAME: u8 = 17;
 
 /// Format: the reply status byte — the result follows, or a [`ShimError`] tag does.
 const STATUS_OK: u8 = 0;
 /// Format: see [`STATUS_OK`] — an error reply, whose one following byte is the [`ShimError`] tag.
 const STATUS_ERR: u8 = 1;
+
+/// Format: the rename flag bit that refuses replacing an existing destination (`RENAME_NOREPLACE`).
+const RENAME_NO_REPLACE: u8 = 1;
+/// Format: the rename flag bit that atomically exchanges the two names (`RENAME_EXCHANGE`).
+const RENAME_EXCHANGE: u8 = 1 << 1;
 
 /// Format: the `Kind` tag in an encoded attribute — a file, a directory, or a symlink.
 const KIND_FILE: u8 = 0;
@@ -72,6 +91,10 @@ const MAX_READ_BYTES: u32 = 1 << 20;
 /// Shape: the largest single write the shim may carry in one message — the same page-cluster bound as
 /// [`MAX_READ_BYTES`], checked before the data is read so a hostile length allocates nothing.
 const MAX_WRITE_BYTES: usize = 1 << 20;
+
+/// Shape: the largest symlink target (and returned link) the shim may carry — one page, comfortably
+/// above Apple's `PATH_MAX` of 1024; a longer one is refused before allocating.
+const MAX_TARGET_BYTES: usize = 4096;
 
 /// A malformed shim message — a request whose bytes are truncated, over-claiming, or unknown. Every one
 /// is typed; the codec never panics or over-reads on input that crossed the extension boundary.
@@ -255,6 +278,58 @@ pub enum ShimRequest {
     /// The name to remove (at most [`MAX_NAME_BYTES`]).
     name: String,
   },
+  /// Open file `object`; the reply is a handle.
+  Open {
+    /// The object.
+    object: ObjectId,
+    /// The open flags.
+    flags: u32,
+  },
+  /// Flush the handle `fh` on `object`.
+  Flush {
+    /// The object.
+    object: ObjectId,
+    /// The handle.
+    fh: u64,
+  },
+  /// Create symlink `name` in `parent` pointing at `target`; the reply is the new attributes.
+  Symlink {
+    /// The parent directory.
+    parent: ObjectId,
+    /// The link's name (at most [`MAX_NAME_BYTES`]).
+    name: String,
+    /// The link target (at most [`MAX_TARGET_BYTES`]).
+    target: String,
+  },
+  /// Read the target of symlink `object`; the reply is the target path.
+  Readlink {
+    /// The symlink.
+    object: ObjectId,
+  },
+  /// Hard-link `target` into `new_parent` as `new_name`; the reply is the attributes.
+  Link {
+    /// The object to link to.
+    target: ObjectId,
+    /// The directory the new name goes in.
+    new_parent: ObjectId,
+    /// The new name (at most [`MAX_NAME_BYTES`]).
+    new_name: String,
+  },
+  /// Rename `old_name` under `old_parent` to `new_name` under `new_parent`, honoring the flags.
+  Rename {
+    /// The source parent.
+    old_parent: ObjectId,
+    /// The destination parent.
+    new_parent: ObjectId,
+    /// The source name (at most [`MAX_NAME_BYTES`]).
+    old_name: String,
+    /// The destination name (at most [`MAX_NAME_BYTES`]).
+    new_name: String,
+    /// Whether to refuse replacing an existing destination.
+    no_replace: bool,
+    /// Whether to atomically exchange the two names.
+    exchange: bool,
+  },
 }
 
 impl ShimRequest {
@@ -334,6 +409,55 @@ impl ShimRequest {
         out.push(OP_RMDIR);
         put_object(&mut out, *parent);
         put_bytes(&mut out, name.as_bytes());
+      }
+      ShimRequest::Open { object, flags } => {
+        out.push(OP_OPEN);
+        put_object(&mut out, *object);
+        out.extend_from_slice(&flags.to_le_bytes());
+      }
+      ShimRequest::Flush { object, fh } => {
+        out.push(OP_FLUSH);
+        put_object(&mut out, *object);
+        out.extend_from_slice(&fh.to_le_bytes());
+      }
+      ShimRequest::Symlink {
+        parent,
+        name,
+        target,
+      } => {
+        out.push(OP_SYMLINK);
+        put_object(&mut out, *parent);
+        put_bytes(&mut out, name.as_bytes());
+        put_bytes(&mut out, target.as_bytes());
+      }
+      ShimRequest::Readlink { object } => {
+        out.push(OP_READLINK);
+        put_object(&mut out, *object);
+      }
+      ShimRequest::Link {
+        target,
+        new_parent,
+        new_name,
+      } => {
+        out.push(OP_LINK);
+        put_object(&mut out, *target);
+        put_object(&mut out, *new_parent);
+        put_bytes(&mut out, new_name.as_bytes());
+      }
+      ShimRequest::Rename {
+        old_parent,
+        new_parent,
+        old_name,
+        new_name,
+        no_replace,
+        exchange,
+      } => {
+        out.push(OP_RENAME);
+        put_object(&mut out, *old_parent);
+        put_object(&mut out, *new_parent);
+        put_bytes(&mut out, old_name.as_bytes());
+        put_bytes(&mut out, new_name.as_bytes());
+        out.push(rename_flags_byte(*no_replace, *exchange));
       }
     }
     out
@@ -419,6 +543,55 @@ impl ShimRequest {
         let name = take_name(&mut rest)?;
         ShimRequest::Rmdir { parent, name }
       }
+      OP_OPEN => {
+        let object = take_object(&mut rest)?;
+        let flags = take_u32(&mut rest)?;
+        ShimRequest::Open { object, flags }
+      }
+      OP_FLUSH => {
+        let object = take_object(&mut rest)?;
+        let fh = take_u64(&mut rest)?;
+        ShimRequest::Flush { object, fh }
+      }
+      OP_SYMLINK => {
+        let parent = take_object(&mut rest)?;
+        let name = take_name(&mut rest)?;
+        let target = take_string(&mut rest, MAX_TARGET_BYTES)?;
+        ShimRequest::Symlink {
+          parent,
+          name,
+          target,
+        }
+      }
+      OP_READLINK => {
+        let object = take_object(&mut rest)?;
+        ShimRequest::Readlink { object }
+      }
+      OP_LINK => {
+        let target = take_object(&mut rest)?;
+        let new_parent = take_object(&mut rest)?;
+        let new_name = take_name(&mut rest)?;
+        ShimRequest::Link {
+          target,
+          new_parent,
+          new_name,
+        }
+      }
+      OP_RENAME => {
+        let old_parent = take_object(&mut rest)?;
+        let new_parent = take_object(&mut rest)?;
+        let old_name = take_name(&mut rest)?;
+        let new_name = take_name(&mut rest)?;
+        let flags = take_flags(&mut rest)?;
+        ShimRequest::Rename {
+          old_parent,
+          new_parent,
+          old_name,
+          new_name,
+          no_replace: flags & RENAME_NO_REPLACE != 0,
+          exchange: flags & RENAME_EXCHANGE != 0,
+        }
+      }
       other => return Err(ShimWireError::UnknownOp { tag: other }),
     };
     if rest.is_empty() {
@@ -481,8 +654,50 @@ pub fn serve(
     }
     ShimRequest::Unlink { parent, name } => reply(bridge.unlink(parent, cx, &name), |()| ok_unit()),
     ShimRequest::Rmdir { parent, name } => reply(bridge.rmdir(parent, cx, &name), |()| ok_unit()),
+    other => serve_rest(other, bridge, cx),
   };
   Ok(reply)
+}
+
+/// The remaining operations, split from [`serve`]'s dispatch so neither match exceeds the cognitive
+/// budget as the operation set grows. `serve` hands every request it did not handle here; the final
+/// arm is unreachable by that construction (a defensive refusal, never a panic).
+fn serve_rest(request: ShimRequest, bridge: &mut dyn Bridge, cx: &OpContext) -> Vec<u8> {
+  match request {
+    ShimRequest::Open { object, flags } => reply(bridge.open(object, cx, flags), ok_fh),
+    ShimRequest::Flush { object, fh } => reply(bridge.flush(object, cx, fh), |()| ok_unit()),
+    ShimRequest::Symlink {
+      parent,
+      name,
+      target,
+    } => reply(bridge.symlink(parent, cx, &name, &target), |a| ok_attr(&a)),
+    ShimRequest::Readlink { object } => reply(bridge.readlink(object, cx), |s| ok_str(&s)),
+    ShimRequest::Link {
+      target,
+      new_parent,
+      new_name,
+    } => reply(bridge.link(target, new_parent, cx, &new_name), |a| {
+      ok_attr(&a)
+    }),
+    ShimRequest::Rename {
+      old_parent,
+      new_parent,
+      old_name,
+      new_name,
+      no_replace,
+      exchange,
+    } => {
+      let flags = RenameFlags {
+        no_replace,
+        exchange,
+      };
+      reply(
+        bridge.rename(old_parent, new_parent, cx, &old_name, &new_name, flags),
+        |()| ok_unit(),
+      )
+    }
+    _ => err_reply(&VfsError::Invalid),
+  }
 }
 
 /// Folds a bridge result into a reply: the `ok` closure encodes the success payload, a refusal becomes
@@ -519,6 +734,13 @@ fn ok_count(count: u32) -> Vec<u8> {
 fn ok_fh(fh: u64) -> Vec<u8> {
   let mut out = vec![STATUS_OK];
   out.extend_from_slice(&fh.to_le_bytes());
+  out
+}
+
+/// An OK reply carrying a string (a `u32` length then the bytes) — a symlink target.
+fn ok_str(text: &str) -> Vec<u8> {
+  let mut out = vec![STATUS_OK];
+  put_bytes(&mut out, text.as_bytes());
   out
 }
 
@@ -619,8 +841,28 @@ fn take_u32(rest: &mut &[u8]) -> Result<u32, ShimWireError> {
 /// Reads a length-prefixed path component (at most [`MAX_NAME_BYTES`]) from the front of `rest`,
 /// refusing an over-long or non-UTF-8 name (hostile input) as a typed error.
 fn take_name(rest: &mut &[u8]) -> Result<String, ShimWireError> {
-  let bytes = take_bytes(rest, MAX_NAME_BYTES)?;
+  take_string(rest, MAX_NAME_BYTES)
+}
+
+/// Reads a length-prefixed UTF-8 string (at most `cap` bytes) from the front of `rest`, refusing an
+/// over-long or non-UTF-8 value as a typed error — the symlink target and other path fields.
+fn take_string(rest: &mut &[u8], cap: usize) -> Result<String, ShimWireError> {
+  let bytes = take_bytes(rest, cap)?;
   String::from_utf8(bytes.to_vec()).map_err(|_| ShimWireError::BadLength)
+}
+
+/// Reads the one-byte rename flag field from the front of `rest`.
+fn take_flags(rest: &mut &[u8]) -> Result<u8, ShimWireError> {
+  let (&byte, tail) = rest.split_first().ok_or(ShimWireError::Truncated)?;
+  *rest = tail;
+  Ok(byte)
+}
+
+/// The one-byte rename flag field: the no-replace and exchange bits.
+fn rename_flags_byte(no_replace: bool, exchange: bool) -> u8 {
+  let no_replace = if no_replace { RENAME_NO_REPLACE } else { 0 };
+  let exchange = if exchange { RENAME_EXCHANGE } else { 0 };
+  no_replace | exchange
 }
 
 /// Reads a length-prefixed byte field (`u32` length then the bytes) from the front of `rest`, refusing
