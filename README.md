@@ -11,17 +11,17 @@
 <h1 align="center">slates</h1>
 <p align="center"><em>In-memory workspaces for coding agents.</em></p>
 
-Slates gives each agent its own copy-on-write filesystem in RAM. A volume takes microseconds
-to create, shows up as a normal path that git, cargo, npm and editors can use, and can sit on
-top of a directory on disk so that untouched files are read from disk and only the agent's
-changes live in memory. Agents merge their work into a shared volume through an engine that
-returns accept, identical, or the exact bytes that overlap, and nothing is written back to disk
-until a person grants it.
+Slates gives every agent you run its own copy of your codebase, in memory, in microseconds.
+The agent sees a normal directory that git, cargo, npm and its editor all work in. It reads
+your real files and its changes stay in RAM, so ten agents on one repository cannot step on
+each other or on you. When two of them change the same bytes, slates tells you exactly which
+bytes instead of guessing at a merge. And nothing touches your disk until you say so.
 
-Slates does more than isolate work on your laptop - thousands run agents on remote hosts and watch them work on the your codebase just like they were on your local computer. Agents can:
+Slates does more than isolate work on your laptop. Thousands run agents on remote hosts and
+watch them work on your codebase just like they were on your local computer. Agents can:
 
 - Open a snapshot another host just made, without waiting for a copy
-- Merge from any host gets the same answer
+- Merge from any host and get the same answer
 - Recover work from dead agents without losing anything
 
 All of this made possible from the same binary using the same configuration and same server.
@@ -130,11 +130,12 @@ does not pin memory yet, `attach` records an attachment without mounting anythin
 
 ## Merging
 
-Several agents can work on one tree. A **green** volume is a shared tree with a numbered
-history that only the merge engine writes to. Each agent takes a **work** volume from a
-version, makes its changes, and submits them. The engine replays the submission against
-everything accepted since that version and answers with a new version number, or with the
-exact byte ranges that collide. It never guesses at a merge and never lets the last writer win.
+Put ten agents on one codebase and you need their work to come back together without anyone
+quietly losing an edit. In slates you give them a shared **green** volume; each agent takes its
+own **work** volume from it, changes what it likes, and submits. You get one of three answers:
+it merged and here is the new version, it was already there, or these exact bytes collide with
+what someone else landed. Nobody's change is ever overwritten and slates never invents a merge
+for you.
 
 ```console
 $ slates green main
@@ -203,8 +204,9 @@ they would get on one laptop, from the same code.
 
 ## Landing
 
-A landing writes a volume's changes into a directory on disk, and it is the only thing in
-slates that writes to disk at all. `land` plans it first:
+When you want an agent's work on your real disk, you land it. That is the only way anything in
+slates ever writes to disk, and it happens in two steps so you can see what you are approving.
+`land` shows you the plan first:
 
 ```console
 $ slates land 000000000000419328db000000000000 /private/var/.../slates-land-6f4x83u4
@@ -218,14 +220,14 @@ $ slates audit
 0 1119908750 landing_planned grant=None landing=Some(1) outcome=None
 ```
 
-The plan lists every file the landing would touch and hashes the list. A grant is tied to that
-hash, so what runs is what was approved. When the landing runs, each file is checked against
-what the disk held when the volume changed it; a file that changed underneath is refused, not
-overwritten. The target must be a real directory, not a path through a symlink.
+You see every file the landing would touch, and your grant is tied to that exact list, so what
+runs is what you approved and nothing more. If you edited a file yourself after the agent
+changed it, that file is refused rather than overwritten. The target must be a real directory,
+not a path through a symlink.
 
 The `slates grant` command the plan asks for does not exist yet, so nothing has landed through
-the CLI so far. When it does exist it will be the one place a grant can be created; the MCP
-server and the SDKs have no such verb by design.
+the CLI so far. When it does, it will be the only place a grant can come from: an agent cannot
+grant itself disk access through MCP or an SDK, because those surfaces have no such verb.
 
 ## Use it with an AI agent (MCP)
 
@@ -394,20 +396,21 @@ client                                  daemon shard (one per core)
   read the reply                      ◀─ reply; wake the client only if it parked
 ```
 
-- **One shard per core, nothing shared.** Each shard owns its volumes, memory arenas and slice
-  of the metadata database. Shards pass messages over bounded rings; there are no locks on the
-  data path and no reference counting.
-- **Copy-on-write by epoch.** A snapshot marks the current epoch. Writing to an older node
-  copies that node; older snapshots keep theirs. Content is hashed only when sealed, never on
-  the write path.
-- **A supervisor that outlives the daemon.** The anchor holds the operation logs and volume
-  images in a shared-memory segment. A daemon crash is a restart with everything recovered
-  from that segment.
-- **Disk is read, never written.** Overlay volumes read their base through a read-only seam.
-  A compile-time lint denies file-writing calls everywhere except the landing crate, and a
-  structural test checks the dependency graph to prove it.
-- **One code path from laptop to fleet.** The replication protocol is written for f failures
-  and a laptop is f = 0 of the same code, tested against a simulated f = 1.
+- **Why it is fast.** Each CPU core runs one shard that owns its volumes outright, so a request
+  never waits on a lock. Your agent drops a request in a ring and usually has the answer before
+  it would have finished going to sleep.
+- **Why snapshots are free.** A snapshot is a number. Writing after it copies only the piece
+  being changed, and the old snapshot keeps the old piece. Hashing happens when something is
+  sealed, never while an agent is writing.
+- **Why a crash costs you nothing.** A small supervisor process holds every volume's state in a
+  shared-memory segment that the daemon does not own. If the daemon dies it is restarted and
+  picks everything back up from that segment.
+- **Why your disk is safe.** The code that reads your directory cannot write to it: the only
+  crate allowed to write a host path is the landing engine, and a compile-time check fails the
+  build if anything else links a file-writing call.
+- **Why a fleet is not a different product.** The replication code is written for f failures.
+  Your laptop runs it with f = 0, and the test suite runs the same code at a simulated f = 1
+  and checks that the answers match.
 
 The design is one document, **[docs/wip/SLATES_DESIGN.md](docs/wip/SLATES_DESIGN.md)**, with
 every decision and the evidence behind it; the research it draws on is in
@@ -415,34 +418,30 @@ every decision and the evidence behind it; the research it draws on is in
 
 ## From a laptop to a fleet
 
-This is the part of slates built for a monorepo the size of Meta's or Google's: a billion
-files in the base tree, millions of files open per mount, thousands of hosts, agents in more
-than one region. What that means when you run agents across machines:
+If you run agents on more than one machine, this is the part of slates for you. It is sized
+for a monorepo like Meta's or Google's: a billion files, millions open per mount, thousands of
+hosts, agents in several regions. On a fleet your agents can:
 
-- **Any agent can open any snapshot, right away.** A snapshot made on one host is usable from
-  another the moment it exists. The agent sees the whole tree at once and only the files it
-  reads are fetched, checked against their hash, and kept locally. A clone of it is a local
-  volume. After a few attaches the daemon knows which files a build touches first and has them
-  waiting.
-- **A dead machine does not lose finished work.** Every snapshot and merge record is copied
-  into the memory of a fixed handful of neighbouring machines in different failure domains,
-  and counts as placed once the fastest f+1 of them have it. If the owner dies, one of those
-  neighbours already has everything and takes over; an owner that was merely paused cannot
-  come back and overwrite its successor, because every record carries an epoch and holders
-  refuse older ones.
-- **You choose how safe each write needs to be.** Most writes take the fast path. When a
-  result matters, an agent asks for that one operation to be placed in the region, or mirrored
-  to another region, and waits only then. Every reply says whether it is placed and how far
-  behind the mirror is, so nothing has to be guessed. Losing a whole region promotes its mirror.
-- **Writes are never slowed by coordination.** A small group per region agrees only on who is
-  a member, who neighbours whom, and who takes over a dead host. It is never asked about a
-  write, so a write costs one round of copies to the neighbours and nothing more.
-- **Volumes live where they are used.** A volume is owned by the host that created it, because
-  that is the fastest place to write it. If another host keeps writing to it, it moves there;
-  load alone never moves it.
-- **An overlay stays on its directory.** Cloning an overlay volume onto another host does not
-  turn it into a copy of the changed files: untouched files still come from the original
-  directory, and once a base has been captured, every remote clone shares that capture by hash.
+- **Open any snapshot from any host, right away.** The agent sees the whole tree the moment
+  the snapshot exists; only the files it reads are fetched, and they are checked against their
+  hash on the way in. After a few runs slates knows which files a build touches first and has
+  them waiting.
+- **Lose a machine without losing work.** Everything an agent has snapshotted or merged is
+  already in the memory of a few neighbouring machines in different failure domains. When the
+  machine dies, a neighbour that has it all takes over. A machine that was only paused cannot
+  come back and undo its successor's work.
+- **Pick how safe each write needs to be.** Most writes take the fast path. When a result
+  matters, the agent asks for that one write to be placed in the region, or mirrored to another
+  region, and waits only for that. Every reply tells you whether it is placed and how far behind
+  the mirror is. Lose a whole region and the mirror takes over.
+- **Write without waiting on a cluster.** The only thing the cluster ever votes on is who is a
+  member and who takes over a dead host. A write is one round of copies to the neighbours and
+  nothing else.
+- **Have their volume follow them.** A volume lives on the host that created it. If an agent
+  on another host keeps writing to it, it moves there. Load alone never moves it.
+- **Clone an overlay across hosts and still see the real directory.** Untouched files keep
+  coming from the original directory; once you have captured a base, every remote clone shares
+  that capture by hash.
 
 ```console
 $ slates volume placed 00000000000006f0ec41000000000000
@@ -453,15 +452,14 @@ $ slates volume placed 00000000000006f0ec41000000000000 --mirror
 slates: refused: Unsupported { feature: "mirror" }
 ```
 
-On one machine the region is placed the moment the local append lands, and the mirror is
-refused because there is nobody to mirror to. The reply fields are the same ones a fleet
-fills in.
+On your laptop the region is placed as soon as the local append lands, and the mirror is
+refused because there is nobody to mirror to. The fields are the ones a fleet fills in.
 
-What you can use today is the one-machine case of all of this, with the same reply fields
-and verbs. The replication core runs at f=0 and at a simulated f=1 with a test that asserts
-identical outcomes, the takeover and reconfiguration protocols were model-checked on
-2026-09-04, and the node-to-node transport runs end to end on a simulated network. Joining
-real machines together is Phase 8, and there is no fleet benchmark yet. The design is §4.8 and §4.10 of the
+What you can run today is the one-machine case of all of this. The replication core runs at
+f=0 and at a simulated f=1 with a test that asserts identical outcomes, the takeover and
+reconfiguration protocols were model-checked on 2026-09-04, and the node-to-node transport
+runs end to end on a simulated network. Joining real machines together is Phase 8, and there
+is no fleet benchmark yet. The design is §4.8 and §4.10 of the
 [unified design](docs/wip/SLATES_DESIGN.md) and the [transport draft](docs/wip/fleet-transport.md);
 the reading behind it, from EdenFS and Piper to Vertical Paxos and copysets, is in
 [docs/wip/research/](docs/wip/research/).
