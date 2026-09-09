@@ -199,6 +199,16 @@ fn mount(stream: &mut TcpStream, path: &str, xid: u32) -> Vec<u8> {
   read_opaque(&reply, 4).0
 }
 
+/// NFS LOOKUP `name` in `dir_fh` → the child's file handle.
+fn lookup(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32) -> Vec<u8> {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name.as_bytes(), &mut args);
+  let reply = call(stream, NFS_PROGRAM, 3, &args, xid);
+  assert_eq!(status(&reply), 0, "LOOKUP {name}");
+  read_opaque(&reply, 4).0
+}
+
 /// NFS CREATE (UNCHECKED) `name` in `dir_fh` with mode 0644 → the new file's handle.
 fn create(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32) -> Vec<u8> {
   let mut args = Vec::new();
@@ -316,6 +326,48 @@ fn the_daemon_serves_a_volume_on_another_shard_over_nfs() {
   assert_eq!(
     got, payload,
     "a volume on another shard served over the cross-shard bridge queue, byte-for-byte"
+  );
+
+  drop(stream);
+  drop(client);
+  drop(daemon);
+}
+
+/// A client mounts the single host root `/` and reaches a volume on ANOTHER shard by `cd`-ing into it
+/// by id (a root `LOOKUP` routed across shards by the looked-up name): the design's single mount point
+/// under which every volume appears, reaching a remote volume, over NFS with no privilege.
+#[test]
+fn a_client_mounts_the_host_root_and_reaches_a_remote_volume_by_id() {
+  let (daemon, instance) = two_shard_daemon("nfsroothex");
+  let mut client = Client::connect(&instance);
+  let control_partition = 0;
+
+  let mut remote = None;
+  for attempt in 0..32 {
+    let ReplyBody::Created { id } = client.call(&scratch(&format!("rv-{attempt}"))) else {
+      continue;
+    };
+    if slates_server::verbs::owner_of(id) != control_partition {
+      remote = Some(id);
+      break;
+    }
+  }
+  let id = remote.expect("a volume provisioned on a non-control shard");
+
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let name = hex(&id.bytes);
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+  // Mount the host root, then LOOKUP the remote volume by its id — the root LOOKUP routes across shards.
+  let root_fh = mount(&mut stream, "/", 1);
+  let volume_root = lookup(&mut stream, &root_fh, &name, 2);
+  let file_fh = create(&mut stream, &volume_root, "byid.txt", 3);
+  let payload = b"reached a remote volume by cd-ing into it from the single host root\n";
+  write(&mut stream, &file_fh, payload, 4);
+  let got = read(&mut stream, &file_fh, 5);
+  assert_eq!(
+    got, payload,
+    "mounted the host root and reached a volume on another shard by its id, over NFS"
   );
 
   drop(stream);

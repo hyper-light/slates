@@ -34,7 +34,7 @@ use std::task::{Context, Poll, Waker};
 use slates_bridge_core::{Rights, VolumeBridge, new_handle_store};
 use slates_bridge_nfs::mount::{MOUNT_PROGRAM, MOUNTPROC3_MNT};
 use slates_bridge_nfs::nfs::{Fattr3, Nfsfh3};
-use slates_bridge_nfs::procedures::{Export, NFS_PROGRAM};
+use slates_bridge_nfs::procedures::{Export, NFS_MAXNAMELEN, NFS_PROGRAM, NFSPROC3_LOOKUP};
 use slates_bridge_nfs::xdr::XdrReader;
 use slates_bridge_nfs::{
   AcceptStatus, MultiExport, RpcError, VolumeSet, parse_call, read_record, reply_bytes,
@@ -170,11 +170,7 @@ fn parse_hex(name: &str) -> Option<VolumeId> {
 /// bad handle). A volume's `owner_of` is its owning *partition* (§4.8: ids route to owners); a request
 /// whose owner partition is not this shard's is routed to that partition's shard over the bridge queue.
 fn route(program: u32, procedure: u32, args: &[u8]) -> Option<u16> {
-  let volume = match program {
-    NFS_PROGRAM => request_volume(&XdrReader::new(args)),
-    MOUNT_PROGRAM if procedure == MOUNTPROC3_MNT => mount_path_volume(args),
-    _ => None,
-  }?;
+  let volume = target_volume(program, procedure, args)?;
   if volume == root_volume() {
     return None;
   }
@@ -189,6 +185,34 @@ fn route(program: u32, procedure: u32, args: &[u8]) -> Option<u16> {
     s.shards.get(usize::from(owner_partition)).copied()
   })
   .flatten()
+}
+
+/// The volume a call is *about*, for routing: the file handle's volume for most NFS procedures; the
+/// looked-up name's volume for a `LOOKUP` under the synthetic root (its name is a volume's id in hex,
+/// so `cd <id>` at the host root reaches a volume on any shard); the mount path's volume for `MNT`.
+fn target_volume(program: u32, procedure: u32, args: &[u8]) -> Option<VolumeId> {
+  match program {
+    NFS_PROGRAM if procedure == NFSPROC3_LOOKUP => {
+      let dir = request_volume(&XdrReader::new(args))?;
+      if dir == root_volume() {
+        root_lookup_target(args)
+      } else {
+        Some(dir)
+      }
+    }
+    NFS_PROGRAM => request_volume(&XdrReader::new(args)),
+    MOUNT_PROGRAM if procedure == MOUNTPROC3_MNT => mount_path_volume(args),
+    _ => None,
+  }
+}
+
+/// The volume a root `LOOKUP` names: the id its name encodes (in hex), or `None` for a name that is not
+/// an id (served locally, where it is a miss or a local volume).
+fn root_lookup_target(args: &[u8]) -> Option<VolumeId> {
+  let mut reader = XdrReader::new(args);
+  let _dir = Nfsfh3::decode(&mut reader).ok()?;
+  let name = reader.string(NFS_MAXNAMELEN).ok()?;
+  parse_hex(name)
 }
 
 /// The volume a MOUNT `MNT` path names (`/<id-hex>`), or `None` for the root (`/`) or a name that is
