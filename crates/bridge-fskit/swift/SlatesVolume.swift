@@ -13,10 +13,12 @@
 //   1. the ring transport — the handler is written against the `ShimChannel` seam; the real
 //      app-group shared-memory ring to the daemon is dropped in at the spike, where a live mount
 //      exercises the FSItem lifecycle end to end; and
-//   2. open-handle refcounting across multiple opens of one item (the single-open map here is a mount
-//      refinement). The root object id and the time unit are no longer guesses: activate() learns the
-//      real root via OP_ROOT (the daemon's root is compose(prefix, 1), not a constant), and the shim
-//      times are Unix nanoseconds, both verified against the daemon's own code.
+//   2. whether FSKit pairs openItem/closeItem one-to-one under mode coalescing — the one behavior only
+//      a mount reveals. The handler's own accounting is already correct for however many calls arrive
+//      (a per-inode handle stack, one daemon reference held and dropped per call). The earlier
+//      root-object and time-unit guesses are now verified against the daemon's code, not assumed:
+//      activate() learns the real root via OP_ROOT (the daemon's root is compose(prefix, 1)), and the
+//      shim times are Unix nanoseconds.
 //
 // The shim wire is 21 ops (LOOKUP..FORGET, then SETATTR and ROOT); `setAttributes` maps to OP_SETATTR
 // (chmod/chown/truncate/utimes, returning the new attributes), and `activate` maps to OP_ROOT to learn
@@ -175,10 +177,14 @@ final class SlatesVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpera
 {
   private let channel: ShimChannel
 
-  // SPIKE: FUSE-style open returns a file handle and release takes one, but FSKit's open/close are
-  // handle-less (they carry the item and the modes). The handler keeps the daemon's handle per
-  // inode so close can name it; single-open for now, refcounting is a spike refinement.
-  private var openHandles: [UInt64: UInt64] = [:]
+  // FSKit's open/close carry the item and modes, not a handle, but the daemon's open returns a
+  // distinct handle per open and takes one open-reference on the inode, which release drops (verified
+  // against VolumeBridge::open/release; the daemon ignores open flags). So the handler keeps a stack of
+  // the outstanding handles per inode — one pushed per openItem, one popped and released per closeItem
+  // — so multiple opens of one item each hold and drop their own reference rather than leaking one.
+  // (Whether FSKit pairs open/close one-to-one under mode coalescing is the one mount-observable nuance
+  // left; the daemon-side accounting is correct for however many calls arrive.)
+  private var openHandles: [UInt64: [UInt64]] = [:]
 
   init(volumeID: FSVolume.Identifier, volumeName: FSFileName, channel: ShimChannel) {
     self.channel = channel
@@ -513,7 +519,7 @@ final class SlatesVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpera
       switch try call(.open(object: node.object, flags: UInt32(modes.rawValue)),
         expecting: .handle) {
       case .handle(let fh):
-        openHandles[node.object.inode] = fh
+        openHandles[node.object.inode, default: []].append(fh)
         reply(nil)
       case .error(let tag): reply(posixError(tag))
       default: reply(ioError())
@@ -525,7 +531,16 @@ final class SlatesVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpera
     _ item: FSItem, modes: FSVolume.OpenModes, replyHandler reply: @escaping (Error?) -> Void
   ) {
     guard let node = item as? SlatesItem else { return reply(ioError()) }
-    guard let fh = openHandles.removeValue(forKey: node.object.inode) else { return reply(nil) }
+    // Pop one outstanding handle for this inode and release it; an unknown item is a no-op (the
+    // kernel may close one the handler never opened).
+    guard var handles = openHandles[node.object.inode], let fh = handles.popLast() else {
+      return reply(nil)
+    }
+    if handles.isEmpty {
+      openHandles.removeValue(forKey: node.object.inode)
+    } else {
+      openHandles[node.object.inode] = handles
+    }
     _ = try? call(.release(object: node.object, fh: fh), expecting: .unit)
     reply(nil)
   }
