@@ -54,7 +54,13 @@ test('the addon exposes the async low-level primitives', (t) => {
     'beginSpinCreate', 'pollCreate', 'beginSpinSnapshot', 'pollSnapshot',
     'beginSpinStatus', 'pollStatus', 'beginSpinList', 'pollList',
     'beginSpinResize', 'pollResize', 'beginSpinDestroy', 'pollDestroy',
-    'completionFd', 'arm', 'disarm', 'takeReady',
+    'beginSpinCreateGreen', 'pollCreateGreen', 'beginSpinCreateWork', 'pollCreateWork',
+    'beginSpinEdit', 'pollEdit', 'beginSpinSubmit', 'pollSubmit',
+    'beginSpinVersions', 'pollVersions', 'beginSpinChangedSince', 'pollChangedSince',
+    'beginSpinRebase', 'pollRebase', 'beginSpinUnlink', 'beginSpinRename', 'beginSpinMkdir',
+    'beginSpinRmdir', 'beginSpinChmod', 'beginSpinSymlink', 'beginSpinLink',
+    'beginSpinSetXattr', 'beginSpinRemoveXattr', 'pollDeclare',
+    'beginSpinLand', 'pollLand', 'completionFd', 'arm', 'disarm', 'takeReady',
   ];
   for (const verb of expected) {
     assert.ok(methods.includes(verb), `Client.prototype has ${verb}`);

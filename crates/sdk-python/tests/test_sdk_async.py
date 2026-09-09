@@ -22,6 +22,7 @@ ASYNC_VERBS = {
     "connect", "create", "snapshot", "status", "list", "resize", "destroy", "client_id",
     "create_green", "create_work", "edit", "submit", "versions", "changed_since", "rebase",
     "unlink", "rename", "mkdir", "rmdir", "chmod", "symlink", "link", "set_xattr", "remove_xattr",
+    "land",
 }
 # Test deadlines in nanoseconds; a production caller derives these from the machine's budgets.
 REPLY_NS = 5_000_000

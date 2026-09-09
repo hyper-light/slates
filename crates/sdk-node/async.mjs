@@ -157,6 +157,14 @@ export class AsyncClient {
     return this._declare(this._c.beginSpinRemoveXattr(work, path, name));
   }
 
+  // Executes a landing (§4.15): resolves to the finished outcome, or grant-required with the exact
+  // `slates grant` command a human runs. The SDK creates no grant itself (R10).
+  async land(volume, target, snapshot, include, exclude, grant) {
+    const { word, fast } = this._c.beginSpinLand(volume, target, snapshot, include, exclude, grant);
+    if (fast != null) return fast;
+    return this._await(word, (w) => this._c.pollLand(w));
+  }
+
   // A namespace declaration resolves to undefined; its poll yields `true` (done), which the pump
   // resolves the awaiting Promise with.
   async _declare({ word, fast }) {

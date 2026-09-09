@@ -627,6 +627,8 @@ enum Decode {
   Rebased,
   /// A namespace declaration's confirmation (resolves to `None`).
   Declared,
+  /// A landing's result dict.
+  Landed,
 }
 
 /// A request in flight on the async client: the future its `await` suspends on, and how to decode its
@@ -1158,6 +1160,43 @@ impl AsyncClient {
     )
   }
 
+  /// Executes a landing (§4.15) — the async form of [`Client.land`]. Resolves to a dict: the finished
+  /// `outcome`, or `grant_required` with the exact `slates grant` command a human runs. The SDK creates
+  /// no grant itself (R10) — a landing without a satisfying `grant` comes back for a human to authorize.
+  #[pyo3(signature = (volume, target, snapshot=None, include=None, exclude=None, grant=None))]
+  fn land<'py>(
+    slf: Bound<'py, Self>,
+    volume: &str,
+    target: &str,
+    snapshot: Option<u64>,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    grant: Option<u64>,
+  ) -> PyResult<Bound<'py, PyAny>> {
+    let py = slf.py();
+    let id = parse_volume(volume)?;
+    let snap = snapshot.map(|value| SnapshotId { value });
+    let filter = Filter {
+      include: include.unwrap_or_default(),
+      exclude: exclude.unwrap_or_default(),
+    };
+    let (word, fast) = {
+      let mut this = slf.borrow_mut();
+      let request = this
+        .inner
+        .land_begin(id, snap, target, filter, grant)
+        .map_err(refusal)?;
+      this.inner.begin_ack_if_due().map_err(refusal)?;
+      let spin = this.inner.published_spin_ns();
+      let fast = match this.inner.land_spin(request, spin).map_err(refusal)? {
+        Some(landing) => Some(landing_dict(py, landing)?.into_any()),
+        None => None,
+      };
+      (request.word(), fast)
+    };
+    finish(&slf, word, fast, Decode::Landed)
+  }
+
   /// The event loop's reader callback: drain the completion fd and resolve every request whose reply
   /// has landed. Registered once with `add_reader`, removed when no request is in flight.
   fn _pump(slf: Bound<'_, Self>) -> PyResult<()> {
@@ -1402,6 +1441,10 @@ fn decode_pending(
       .declare_poll(word)
       .map_err(refusal)?
       .map(|_done| py.None()),
+    Decode::Landed => match inner.land_poll(word).map_err(refusal)? {
+      Some(landing) => Some(landing_dict(py, landing)?.into_any()),
+      None => None,
+    },
   })
 }
 

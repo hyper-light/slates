@@ -320,6 +320,26 @@ fn extract_declared(body: ReplyBody) -> Result<bool, ClientError> {
   }
 }
 
+/// Extracts a landing's outcome from its reply — landed, or a grant required — or a typed mismatch.
+/// The same rule the sync [`Client::land`] applies.
+fn extract_landed(body: ReplyBody) -> Result<Landing, ClientError> {
+  match body {
+    ReplyBody::Landed { outcome } => Ok(Landing::Landed(outcome)),
+    ReplyBody::GrantRequired {
+      landing,
+      manifest,
+      summary,
+      conflicts,
+    } => Ok(Landing::GrantRequired {
+      landing,
+      manifest,
+      summary,
+      conflicts,
+    }),
+    _ => Err(ClientError::UnexpectedReply { verb: "land" }),
+  }
+}
+
 impl Client {
   /// Connects to `instance` as a new client.
   pub fn connect(instance: &str, deadlines: Deadlines) -> Result<Client, ClientError> {
@@ -917,6 +937,35 @@ impl Client {
   /// Takes a declaration's reply by id word once the completion fd signals.
   pub fn declare_poll(&mut self, word: u64) -> Result<Option<bool>, ClientError> {
     self.poll_as(word, extract_declared)
+  }
+
+  /// Begins a landing (§4.15), returning its request id. The SDK creates no grant itself (R10): a
+  /// landing without a satisfying `grant` comes back `GrantRequired` for a human to authorize.
+  pub fn land_begin(
+    &mut self,
+    volume: VolumeId,
+    snapshot: Option<SnapshotId>,
+    target: &str,
+    filter: Filter,
+    grant: Option<u64>,
+  ) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::Land {
+      volume,
+      snapshot,
+      target: target.to_owned(),
+      filter,
+      grant,
+    })
+  }
+
+  /// Takes a landing's outcome within `spin_ns`.
+  pub fn land_spin(&mut self, id: RequestId, spin_ns: u64) -> Result<Option<Landing>, ClientError> {
+    self.spin_as(id, spin_ns, extract_landed)
+  }
+
+  /// Takes a landing's outcome by id word once the completion fd signals.
+  pub fn land_poll(&mut self, word: u64) -> Result<Option<Landing>, ClientError> {
+    self.poll_as(word, extract_landed)
   }
 
   /// Takes `id`'s reply within `spin_ns` and extracts its typed value (the fast path over a typed verb).

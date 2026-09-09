@@ -444,6 +444,15 @@ pub struct ChangedBegin {
   pub fast: Option<Vec<String>>,
 }
 
+/// A landing begin-and-spin result (see [`CreateBegin`]).
+#[napi(object)]
+pub struct LandBegin {
+  /// The request id word.
+  pub word: String,
+  /// The landing result, present when the reply came within the spin window.
+  pub fast: Option<LandingResult>,
+}
+
 #[napi]
 pub struct Client {
   inner: RustClient,
@@ -1070,6 +1079,59 @@ impl Client {
   pub fn poll_declare(&mut self, word: String) -> Result<Option<bool>> {
     let word = parse_word(&word)?;
     self.inner.declare_poll(word).map_err(refusal)
+  }
+
+  /// Begins a landing (§4.15) and spins; the word and the result if it landed in the spin. The SDK
+  /// creates no grant itself (R10): a landing without a satisfying grant comes back grant-required.
+  #[napi]
+  pub fn begin_spin_land(
+    &mut self,
+    volume: String,
+    target: String,
+    snapshot: Option<i64>,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    grant: Option<i64>,
+  ) -> Result<LandBegin> {
+    let id = parse_volume(&volume)?;
+    let snap = match snapshot {
+      Some(value) => Some(SnapshotId {
+        value: checked_u64(value, "snapshot")?,
+      }),
+      None => None,
+    };
+    let filter = Filter {
+      include: include.unwrap_or_default(),
+      exclude: exclude.unwrap_or_default(),
+    };
+    let grant = match grant {
+      Some(value) => Some(checked_u64(value, "grant")?),
+      None => None,
+    };
+    let request = self
+      .inner
+      .land_begin(id, snap, &target, filter, grant)
+      .map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let spin = self.inner.published_spin_ns();
+    let fast = match self.inner.land_spin(request, spin).map_err(refusal)? {
+      Some(landing) => Some(landing_result(landing)?),
+      None => None,
+    };
+    Ok(LandBegin {
+      word: request.word().to_string(),
+      fast,
+    })
+  }
+
+  /// Takes a landing's result by its word once the completion fd signals.
+  #[napi]
+  pub fn poll_land(&mut self, word: String) -> Result<Option<LandingResult>> {
+    let word = parse_word(&word)?;
+    match self.inner.land_poll(word).map_err(refusal)? {
+      Some(landing) => Ok(Some(landing_result(landing)?)),
+      None => Ok(None),
+    }
   }
 
   /// Lists the daemon's volumes (§4.4) as an array of [`VolumeEntry`] objects — id (hex), name, byte
