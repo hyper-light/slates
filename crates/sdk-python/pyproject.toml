@@ -5,6 +5,7 @@ build-backend = "maturin"
 [project]
 name = "slates"
 description = "The slates Python SDK: a PyO3 extension over the typed Rust client (design §2.3, D-19)."
+readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Ada Lundhe" }]
