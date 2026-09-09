@@ -29,10 +29,14 @@ pub mod xdr;
 
 pub use handle::{FileHandle, FileHandleError};
 pub use mount::{MountReply, Mountstat3};
-pub use multi::{MultiExport, NfsService, OwnedVolume, OwnedVolumeSet, VolumeSet};
+pub use multi::{
+  MultiExport, NfsService, OwnedVolume, OwnedVolumeSet, VolumeSet, request_volume, root_volume,
+};
 pub use nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3};
 pub use portmap::Mapping;
 pub use procedures::Export;
-pub use rpc::{AcceptStatus, RpcCall, RpcError, read_record, reply_bytes, write_record};
-pub use server::{serve_connection, serve_connection_async};
+pub use rpc::{
+  AcceptStatus, RpcCall, RpcError, parse_call, read_record, reply_bytes, write_record,
+};
+pub use server::{serve_call, serve_connection, serve_connection_async};
 pub use xdr::{XdrError, XdrReader, XdrWriter};

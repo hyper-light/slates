@@ -30,8 +30,10 @@ const RECORD_READ_CHUNK: usize = 1 << 16;
 /// Dispatches one decoded RPC call onto `service`, returning the accept status and encoded results.
 /// The `service` serves one volume ([`Export`](crate::procedures::Export)) or many
 /// ([`MultiExport`](crate::multi::MultiExport)) behind the same trait. The `port` answers a portmap
-/// `GETPORT` (this server serves every program on one port).
-fn dispatch(
+/// `GETPORT` (this server serves every program on one port). Public so a multi-shard daemon can run it
+/// both on the accepting shard (for a local volume) and, over the cross-shard bridge queue, on the
+/// owning shard (for a remote one) — the same engine either place.
+pub fn serve_call(
   service: &mut dyn NfsService,
   program: u32,
   procedure: u32,
@@ -77,7 +79,7 @@ pub fn serve_connection<S: Read + Write>(stream: &mut S, service: &mut dyn NfsSe
         let reply = match parse_call(&body) {
           Ok((call, mut args)) => {
             let (status, results) =
-              dispatch(service, call.program, call.procedure, &mut args, port);
+              serve_call(service, call.program, call.procedure, &mut args, port);
             reply_bytes(call.xid, status, &results)
           }
           Err(_) => reply_bytes(0, AcceptStatus::GarbageArgs, &[]),
@@ -98,7 +100,7 @@ pub fn serve_connection<S: Read + Write>(stream: &mut S, service: &mut dyn NfsSe
 
 /// Serves NFS/MOUNT/portmap RPC over one connected runtime `stream` against `service`, until the client
 /// closes it — the async analogue of [`serve_connection`] for the production server, which multiplexes
-/// connections on slates's own runtime (§4.6). It shares the RPC engine ([`dispatch`]) and the record
+/// connections on slates's own runtime (§4.6). It shares the RPC engine ([`serve_call`]) and the record
 /// codec with the blocking form; only the transport differs. Reads and writes await the shard's driver
 /// through the runtime's [`TcpStream`], so a write to a stalled client (a soft-mounted NFS client that
 /// stopped reading, filling the send buffer) yields the shard rather than blocking it — the reason the
@@ -119,7 +121,7 @@ pub async fn serve_connection_async(
         let reply = match parse_call(&body) {
           Ok((call, mut args)) => {
             let (status, results) =
-              dispatch(service, call.program, call.procedure, &mut args, port);
+              serve_call(service, call.program, call.procedure, &mut args, port);
             reply_bytes(call.xid, status, &results)
           }
           Err(_) => reply_bytes(0, AcceptStatus::GarbageArgs, &[]),

@@ -112,6 +112,23 @@ fn single_shard_daemon(name: &str) -> (Daemon, String) {
   (daemon, instance)
 }
 
+fn two_shard_daemon(name: &str) -> (Daemon, String) {
+  let profile = profile();
+  let instance = format!("srv-{name}-{}", std::process::id());
+  // Two shards, so a volume can land on a shard other than the one the NFS listener is served on,
+  // exercising the cross-shard bridge queue.
+  let config = DaemonConfig::derive(&profile, &instance).with_shards(2);
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-{name}"),
+    },
+  )
+  .unwrap();
+  (daemon, instance)
+}
+
 fn scratch(name: &str) -> RequestBody {
   RequestBody::Create {
     name: name.to_owned(),
@@ -258,6 +275,47 @@ fn the_daemon_serves_a_provisioned_volume_over_nfs() {
   assert_eq!(
     got, payload,
     "read back over NFS the bytes written over NFS to the daemon's own volume"
+  );
+
+  drop(stream);
+  drop(client);
+  drop(daemon);
+}
+
+/// The daemon serves a volume that lives on a shard OTHER than the one the NFS listener is on, over the
+/// cross-shard bridge queue: the request is routed to the volume's owning shard, served there against
+/// that shard's real state, and the reply routed back — a write over NFS reads back over NFS.
+#[test]
+fn the_daemon_serves_a_volume_on_another_shard_over_nfs() {
+  let (daemon, instance) = two_shard_daemon("nfsxshard");
+  let mut client = Client::connect(&instance);
+  // The NFS listener is served on the control shard, whose partition is 0; a volume whose owner
+  // partition is not 0 lives on the other shard and is reached over the cross-shard bridge queue.
+  let control_partition = 0;
+
+  let mut remote = None;
+  for attempt in 0..32 {
+    let ReplyBody::Created { id } = client.call(&scratch(&format!("vol-{attempt}"))) else {
+      continue;
+    };
+    if slates_server::verbs::owner_of(id) != control_partition {
+      remote = Some(id);
+      break;
+    }
+  }
+  let id = remote.expect("a volume provisioned on a non-control shard");
+
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let name = hex(&id.bytes);
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root_fh = mount(&mut stream, &format!("/{name}"), 1);
+  let file_fh = create(&mut stream, &root_fh, "remote.txt", 2);
+  let payload = b"served from a volume on another shard, over the cross-shard bridge queue\n";
+  write(&mut stream, &file_fh, payload, 3);
+  let got = read(&mut stream, &file_fh, 4);
+  assert_eq!(
+    got, payload,
+    "a volume on another shard served over the cross-shard bridge queue, byte-for-byte"
   );
 
   drop(stream);

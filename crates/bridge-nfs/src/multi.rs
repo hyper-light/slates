@@ -531,6 +531,19 @@ fn peek_handle_volume(args: &XdrReader<'_>) -> Option<VolumeId> {
     .map(|decoded| decoded.volume)
 }
 
+/// The volume id a request's leading file handle names (every served NFSv3 procedure begins with one),
+/// for a router that decides which shard owns the request before serving it. `None` if no valid handle
+/// leads the request; the synthetic root's own handle yields [`root_volume`].
+pub fn request_volume(args: &XdrReader<'_>) -> Option<VolumeId> {
+  peek_handle_volume(args)
+}
+
+/// The reserved volume id of the synthetic root directory (all-zero). A handle carrying it names the
+/// root, not any volume, so a multi-shard router serves it locally rather than routing it to an owner.
+pub fn root_volume() -> VolumeId {
+  ROOT_VOLUME
+}
+
 /// A `NFS3ERR_STALE` reply for a handle whose volume this set does not hold, in the failing
 /// procedure's own reply shape. The inode is not here, so the object the handle named is gone (D-4:
 /// inode numbers are never reused), which is exactly stale.
