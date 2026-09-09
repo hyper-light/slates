@@ -194,6 +194,25 @@ private func testWriteReportsTheCount() {
   check(written == 5, "write reports the stored byte count")
 }
 
+// probeResource recognizes a slates:// URL resource and refuses anything else — the mount entry gate,
+// checked by the FSMatchResult it returns (notRecognized = 0). Constructs the real SlatesFileSystem and
+// real FSGenericURLResources against FSKit; no mount.
+private func testProbeRecognizesSlatesScheme() {
+  let fs = SlatesFileSystem()
+
+  var slatesResult: FSMatchResult?
+  fs.probeResource(
+    resource: FSGenericURLResource(url: URL(string: "slates://volume/a/attach/b")!)
+  ) { result, _ in slatesResult = result?.result }
+  check(slatesResult != .notRecognized, "a slates:// resource is recognized")
+
+  var foreignResult: FSMatchResult?
+  fs.probeResource(
+    resource: FSGenericURLResource(url: URL(string: "https://example.com")!)
+  ) { result, _ in foreignResult = result?.result }
+  check(foreignResult == .notRecognized, "a non-slates resource is refused")
+}
+
 @main
 struct HandlerTest {
   static func main() {
@@ -205,6 +224,7 @@ struct HandlerTest {
     testRemoveItemBranchesOnKind()
     testGetAttributesMapsTheReply()
     testWriteReportsTheCount()
+    testProbeRecognizesSlatesScheme()
     print(failures == 0 ? "ALL PASS" : "\(failures) FAILURES")
     exit(failures == 0 ? 0 : 1)
   }

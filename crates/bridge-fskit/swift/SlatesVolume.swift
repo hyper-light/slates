@@ -27,6 +27,10 @@
 import FSKit
 import Foundation
 
+// The URL scheme a slates volume resource carries — `slates://volume/<id>/attach/<id>` (§4.6),
+// declared under FSSupportedSchemes in the app bundle. The probe recognizes a resource by this scheme.
+private let slatesURLScheme = "slates"
+
 // MARK: - The transport seam to the daemon
 
 // A request is the encoded ShimWire bytes; the reply is the daemon's framed answer
@@ -555,8 +559,12 @@ final class SlatesFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
   func probeResource(
     resource: FSResource, replyHandler reply: @escaping (FSProbeResult?, Error?) -> Void
   ) {
-    // SPIKE: a real probe reads the resource's slates marker; here it is recognized unconditionally
-    // so the load path type-checks. The name and container id come from the daemon at the spike.
+    // A slates volume is a URL resource under the `slates` scheme. Recognize one by its scheme and
+    // refuse anything else. The container id and name come from the daemon once the ring is wired, so
+    // this reports usableButLimited (recognized, identity to follow), not the full recognized form.
+    guard let url = (resource as? FSGenericURLResource)?.url, url.scheme == slatesURLScheme else {
+      return reply(.notRecognized, nil)
+    }
     reply(.usableButLimited, nil)
   }
 
