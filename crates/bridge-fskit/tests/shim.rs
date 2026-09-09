@@ -5,13 +5,16 @@
 //! mount, no Swift: the Rust half of the FSKit bridge is confirmable on any host, exactly as the NFS
 //! wire codec was built and confirmed first.
 
+use slates_base::OsHost;
 use slates_bridge_core::{Attachments, Bridge, ObjectId, OpContext, Rights, View, VolumeBridge};
 use slates_bridge_fskit::mount::MountSession;
 use slates_bridge_fskit::{ShimRequest, ShimWireError, serve};
 use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
+use slates_vfs::base::BaseConfig;
 use slates_vfs::clock::HostClock;
+use slates_vfs::host::HostFs;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::Quota;
 use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
@@ -657,7 +660,7 @@ fn a_mount_session_persists_open_handles_across_requests() {
 
   // The volume's real root, learned over the seam (each call below is a fresh bridge).
   let root_reply = session
-    .serve(&mut store, &mut vol, &cx, &ShimRequest::Root.encode())
+    .serve(&mut store, &mut vol, None, &cx, &ShimRequest::Root.encode())
     .unwrap();
   assert_eq!(root_reply[0], STATUS_OK, "root");
   let root = u64_at(&root_reply, 1);
@@ -667,6 +670,7 @@ fn a_mount_session_persists_open_handles_across_requests() {
     .serve(
       &mut store,
       &mut vol,
+      None,
       &cx,
       &ShimRequest::Create {
         parent: oid(root),
@@ -688,6 +692,7 @@ fn a_mount_session_persists_open_handles_across_requests() {
     .serve(
       &mut store,
       &mut vol,
+      None,
       &cx,
       &ShimRequest::Write {
         object: oid(file),
@@ -704,6 +709,7 @@ fn a_mount_session_persists_open_handles_across_requests() {
     .serve(
       &mut store,
       &mut vol,
+      None,
       &cx,
       &ShimRequest::Open {
         object: oid(file),
@@ -720,6 +726,7 @@ fn a_mount_session_persists_open_handles_across_requests() {
     .serve(
       &mut store,
       &mut vol,
+      None,
       &cx,
       &ShimRequest::Unlink {
         parent: oid(root),
@@ -735,6 +742,7 @@ fn a_mount_session_persists_open_handles_across_requests() {
     .serve(
       &mut store,
       &mut vol,
+      None,
       &cx,
       &ShimRequest::Read {
         object: oid(file),
@@ -755,6 +763,7 @@ fn a_mount_session_persists_open_handles_across_requests() {
     .serve(
       &mut store,
       &mut vol,
+      None,
       &cx,
       &ShimRequest::Release {
         object: oid(file),
@@ -772,6 +781,7 @@ fn a_mount_session_persists_open_handles_across_requests() {
     .serve(
       &mut store,
       &mut vol,
+      None,
       &cx,
       &ShimRequest::Release {
         object: oid(file),
@@ -788,6 +798,7 @@ fn a_mount_session_persists_open_handles_across_requests() {
     .serve(
       &mut store,
       &mut vol,
+      None,
       &cx,
       &ShimRequest::Read {
         object: oid(file),
@@ -800,5 +811,77 @@ fn a_mount_session_persists_open_handles_across_requests() {
   assert_eq!(
     after_release[0], STATUS_ERR,
     "after release the content is reclaimed — the handle persisted and release dropped the reference"
+  );
+}
+
+/// A read-only overlay base directory for tests that need one without a RAM disk: the repo's `crates/`
+/// tree, opened read-only. `bridge-fskit` is one of its entries.
+fn crates_dir() -> std::path::PathBuf {
+  std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .parent()
+    .unwrap()
+    .to_path_buf()
+}
+
+/// A `MountSession` serves an overlay volume's base through the *borrowed* host: the daemon lends the
+/// shard's `OsHost` per request, and a base entry the empty overlay does not hold is found from the
+/// host. This exercises `VolumeBridge::attached`'s borrowed-host path (`HostRef::Borrowed`) — the
+/// overlay analogue of the borrowed handle map. Read-only, no RAM disk (the base is the repo's crates
+/// tree). §4.5, §4.6.
+#[test]
+fn a_mount_session_serves_an_overlay_base_through_the_borrowed_host() {
+  let mut store = store();
+  let (mut host, root_dir) = OsHost::open_root(&crates_dir()).unwrap();
+  let facts = host.facts(root_dir).unwrap();
+  let mut vol = Volume::create_overlay(
+    &mut store,
+    VolumeConfig {
+      prefix: 1,
+      names: NameEquivalence::Exact,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 16,
+      clock: Box::new(HostClock::default()),
+    },
+    BaseConfig {
+      root: root_dir,
+      facts,
+      large_class_bytes: 1 << 20,
+    },
+  )
+  .unwrap();
+  let mut session = MountSession::new(VolumeId { bytes: [0x11; 16] });
+  let cx = write_cx();
+
+  // The overlay's root, learned over the seam.
+  let root_reply = session
+    .serve(
+      &mut store,
+      &mut vol,
+      Some(&mut host),
+      &cx,
+      &ShimRequest::Root.encode(),
+    )
+    .unwrap();
+  assert_eq!(root_reply[0], STATUS_OK, "root");
+  let root = u64_at(&root_reply, 1);
+
+  // Look up a base entry the empty overlay does not hold — `bridge-fskit` is a real crates/ subdirectory,
+  // served from the base through the borrowed host lent to the transient bridge.
+  let lookup = session
+    .serve(
+      &mut store,
+      &mut vol,
+      Some(&mut host),
+      &cx,
+      &ShimRequest::Lookup {
+        parent: oid(root),
+        name: "bridge-fskit".to_owned(),
+      }
+      .encode(),
+    )
+    .unwrap();
+  assert_eq!(
+    lookup[0], STATUS_OK,
+    "a base directory is found through the borrowed host — the overlay serve path works"
   );
 }

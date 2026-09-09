@@ -13,6 +13,7 @@
 //! call rather than held — the borrow checker's price for not having a GC, and a small one.
 
 use crate::{ShimWireError, serve};
+use slates_base::OsHost;
 use slates_bridge_core::{OpContext, VolumeBridge, new_handle_store};
 use slates_db::catalog::VolumeId;
 use slates_mem::Slab;
@@ -43,10 +44,11 @@ impl MountSession {
     &mut self,
     store: &mut Store,
     volume: &mut Volume,
+    host: Option<&mut OsHost>,
     cx: &OpContext,
     request: &[u8],
   ) -> Result<Vec<u8>, ShimWireError> {
-    let mut bridge = VolumeBridge::attached(self.id, volume, store, &mut self.handles);
+    let mut bridge = VolumeBridge::attached(self.id, volume, store, &mut self.handles, host);
     serve(request, &mut bridge, cx)
   }
 }

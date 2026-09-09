@@ -1147,6 +1147,7 @@ dependencies = [
 name = "slates-bridge-fskit"
 version = "0.1.0"
 dependencies = [
+ "slates-base",
  "slates-bridge-core",
  "slates-db",
  "slates-mem",

@@ -42,8 +42,10 @@ pub struct VolumeBridge<'v> {
   volume: &'v mut Volume,
   store: &'v mut Store,
   /// The read-only host of the base directory, for an overlay volume; `None` for a scratch
-  /// volume. Base entries (§4.5) are looked up, listed, stat-ed and read through it.
-  host: Option<OsHost>,
+  /// volume. Base entries (§4.5) are looked up, listed, stat-ed and read through it. Owned when the
+  /// bridge lives for the mount (FUSE, NFS); borrowed when it is rebuilt per request (the daemon FSKit
+  /// path); see [`HostRef`].
+  host: HostRef<'v>,
   /// Open handles: a bounded generational slab whose value is the inode the handle names (files
   /// and dirs share one space; a transport never confuses them). A released handle's slot is
   /// reused and its generation bumped, so repeated open/close does not grow memory (audit BUG-4)
@@ -104,6 +106,26 @@ impl HandleStore<'_> {
   }
 }
 
+/// The overlay base host: owned by the bridge (FUSE and NFS hold one for the mount), borrowed from the
+/// caller (the daemon FSKit path, where the host lives in the shard's volume slot and the transient
+/// bridge borrows it per request), or `None` for a scratch volume. `OsHost` is not `Clone` and its reads
+/// take `&mut`, so a per-request bridge cannot own it — it borrows it, exactly as it borrows the store.
+enum HostRef<'h> {
+  None,
+  Owned(OsHost),
+  Borrowed(&'h mut OsHost),
+}
+
+impl HostRef<'_> {
+  fn as_mut(&mut self) -> Option<&mut OsHost> {
+    match self {
+      Self::None => None,
+      Self::Owned(host) => Some(host),
+      Self::Borrowed(host) => Some(host),
+    }
+  }
+}
+
 impl<'v> VolumeBridge<'v> {
   /// A bridge over the volume `volume_id` names, backed by `volume` and its `store`.
   pub fn new(
@@ -115,7 +137,7 @@ impl<'v> VolumeBridge<'v> {
       volume_id,
       volume,
       store,
-      host: None,
+      host: HostRef::None,
       handles: HandleStore::Owned(Slab::new(HANDLE_SEGMENT, MAX_OPEN_HANDLES)),
       max_read: MAX_READ,
     }
@@ -134,28 +156,32 @@ impl<'v> VolumeBridge<'v> {
       volume_id,
       volume,
       store,
-      host: Some(host),
+      host: HostRef::Owned(host),
       handles: HandleStore::Owned(Slab::new(HANDLE_SEGMENT, MAX_OPEN_HANDLES)),
       max_read: MAX_READ,
     }
   }
 
-  /// A bridge over a scratch `volume` whose open-handle map lives *outside* it, in `handles` the caller
-  /// keeps across requests. This is the daemon's FSKit serve path: the volume lives in the owning
-  /// shard's slab and the bridge is rebuilt per request, so it cannot own persistent handle state; the
-  /// mount session owns the slab and lends it here (see [`HandleStore`]). Scratch only for now — an
-  /// overlay's borrowed base is a follow-up.
+  /// A bridge whose open-handle map — and, for an overlay, whose base `host` — live *outside* it, lent
+  /// by the caller across requests. This is the daemon's FSKit serve path: the volume lives in the
+  /// owning shard's slab and the bridge is rebuilt per request, so it cannot own persistent handle
+  /// state or the base host; the mount session owns the slab, and the shard's volume slot owns the
+  /// host, both lent here (see [`HandleStore`], [`HostRef`]). Pass `host: None` for a scratch volume.
   pub fn attached(
     volume_id: VolumeId,
     volume: &'v mut Volume,
     store: &'v mut Store,
     handles: &'v mut Slab<u64>,
+    host: Option<&'v mut OsHost>,
   ) -> VolumeBridge<'v> {
     VolumeBridge {
       volume_id,
       volume,
       store,
-      host: None,
+      host: match host {
+        Some(host) => HostRef::Borrowed(host),
+        None => HostRef::None,
+      },
       handles: HandleStore::Borrowed(handles),
       max_read: MAX_READ,
     }

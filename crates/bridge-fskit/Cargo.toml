@@ -18,9 +18,11 @@ crate-type = ["lib", "cdylib"]
 slates-bridge-core = { workspace = true }
 slates-vfs = { workspace = true }
 # The daemon FSKit serve session (`src/mount.rs`) holds a `VolumeId` and an open-handle `Slab` across
-# requests, so db (the id) and mem (the slab) are regular deps; both are pure RAM crates.
+# requests, so db (the id) and mem (the slab) are regular deps; both are pure RAM crates. base names the
+# read-only overlay host `OsHost` the session lends the bridge for an overlay volume (read-only by lint).
 slates-db = { workspace = true }
 slates-mem = { workspace = true }
+slates-base = { workspace = true }
 
 [features]
 # The in-process transport harness (`src/ffi.rs`): a C ABI over `serve` plus the store/volume it runs
