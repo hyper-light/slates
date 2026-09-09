@@ -19,7 +19,7 @@ pub mod authority;
 pub mod volume_bridge;
 
 pub use authority::{AttachmentId, Attachments, ObjectId, OpContext, Rights, View};
-pub use volume_bridge::VolumeBridge;
+pub use volume_bridge::{VolumeBridge, new_handle_store};
 
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;

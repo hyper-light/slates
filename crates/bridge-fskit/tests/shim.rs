@@ -6,6 +6,7 @@
 //! wire codec was built and confirmed first.
 
 use slates_bridge_core::{Attachments, Bridge, ObjectId, OpContext, Rights, View, VolumeBridge};
+use slates_bridge_fskit::mount::MountSession;
 use slates_bridge_fskit::{ShimRequest, ShimWireError, serve};
 use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::arena::ChunkArena;
@@ -632,4 +633,172 @@ fn serve_maps_a_refusal_to_an_error_reply() {
   let reply = serve(&getattr, &mut bridge, &cx).unwrap();
   assert_eq!(reply[0], STATUS_ERR, "a missing object is an error reply");
   assert_eq!(reply[1], SHIM_NOT_FOUND, "the refusal is NotFound");
+}
+
+/// Reads a little-endian `u64` from a reply at `start` (an inode at byte 1 of an attribute reply, an
+/// `fh` at byte 1 of a handle reply — both follow the one `STATUS_OK` byte).
+fn u64_at(reply: &[u8], start: usize) -> u64 {
+  u64::from_le_bytes(reply[start..start + 8].try_into().unwrap())
+}
+
+/// A `MountSession` persists open handles across requests — the daemon serves each request with a fresh
+/// bridge over the shard's volume, so the open reference an `open` takes and the `fh` it returns must
+/// survive to the matching `release`, which is a *separate* request on a *fresh* bridge. Proven through
+/// POSIX unlink-while-open: an open file's inode stays alive after its name is removed and is freed only
+/// when release drops the handle. If the session did not persist the map, release would not find the
+/// handle, the reference would leak, and the inode would never free — so the final getattr failing is
+/// the proof. §4.6, §4.8.
+#[test]
+fn a_mount_session_persists_open_handles_across_requests() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut session = MountSession::new(VolumeId { bytes: [0x11; 16] });
+  let cx = write_cx();
+
+  // The volume's real root, learned over the seam (each call below is a fresh bridge).
+  let root_reply = session
+    .serve(&mut store, &mut vol, &cx, &ShimRequest::Root.encode())
+    .unwrap();
+  assert_eq!(root_reply[0], STATUS_OK, "root");
+  let root = u64_at(&root_reply, 1);
+
+  // Create "f" under the root and learn its inode (create's reply is an attribute-plus-handle).
+  let create_reply = session
+    .serve(
+      &mut store,
+      &mut vol,
+      &cx,
+      &ShimRequest::Create {
+        parent: oid(root),
+        name: "f".to_owned(),
+        mode: 0o644,
+        flags: 0,
+      }
+      .encode(),
+    )
+    .unwrap();
+  assert_eq!(create_reply[0], STATUS_OK, "create f");
+  let file = u64_at(&create_reply, 1);
+  // create is create-and-open: it also takes an open reference and returns a handle *after* the
+  // attributes (STATUS_OK, then a 65-byte attribute record, then the fh). Capture it to release later.
+  let create_fh = u64_at(&create_reply, 66);
+
+  // Give it content, so there is something to keep alive and then reclaim.
+  let write_reply = session
+    .serve(
+      &mut store,
+      &mut vol,
+      &cx,
+      &ShimRequest::Write {
+        object: oid(file),
+        offset: 0,
+        data: b"data".to_vec(),
+      }
+      .encode(),
+    )
+    .unwrap();
+  assert_eq!(write_reply[0], STATUS_OK, "write f");
+
+  // Open it — the open reference and the returned fh land in the session's persistent map.
+  let open_reply = session
+    .serve(
+      &mut store,
+      &mut vol,
+      &cx,
+      &ShimRequest::Open {
+        object: oid(file),
+        flags: 0,
+      }
+      .encode(),
+    )
+    .unwrap();
+  assert_eq!(open_reply[0], STATUS_OK, "open f");
+  let fh = u64_at(&open_reply, 1);
+
+  // Remove the name. The inode stays alive because it is open (POSIX unlink-while-open, §4.8).
+  let unlink_reply = session
+    .serve(
+      &mut store,
+      &mut vol,
+      &cx,
+      &ShimRequest::Unlink {
+        parent: oid(root),
+        name: "f".to_owned(),
+      }
+      .encode(),
+    )
+    .unwrap();
+  assert_eq!(unlink_reply[0], STATUS_OK, "unlink f");
+
+  // While still open, a read returns the content — the open reference keeps it alive (§4.8).
+  let while_open = session
+    .serve(
+      &mut store,
+      &mut vol,
+      &cx,
+      &ShimRequest::Read {
+        object: oid(file),
+        offset: 0,
+        size: 16,
+      }
+      .encode(),
+    )
+    .unwrap();
+  assert_eq!(
+    while_open[0], STATUS_OK,
+    "an unlinked but open file keeps its content"
+  );
+
+  // Release with the fh from the earlier open. This must find the handle in the persisted map (a fresh
+  // per-request bridge that lost it could not) and drop the last reference.
+  let release_reply = session
+    .serve(
+      &mut store,
+      &mut vol,
+      &cx,
+      &ShimRequest::Release {
+        object: oid(file),
+        fh,
+      }
+      .encode(),
+    )
+    .unwrap();
+  assert_eq!(release_reply[0], STATUS_OK, "release the open handle");
+
+  // Drop create's handle too — create is create-and-open, so this is the last reference. Its handle
+  // came from the create request, so releasing it here through yet another fresh bridge again requires
+  // the map to have persisted across requests.
+  let release_create = session
+    .serve(
+      &mut store,
+      &mut vol,
+      &cx,
+      &ShimRequest::Release {
+        object: oid(file),
+        fh: create_fh,
+      }
+      .encode(),
+    )
+    .unwrap();
+  assert_eq!(release_create[0], STATUS_OK, "release the create handle");
+
+  // Now a read fails: the name is gone and the last open reference is dropped, so the content is
+  // reclaimed — which means release found the handle in the persisted map and dropped the reference.
+  let after_release = session
+    .serve(
+      &mut store,
+      &mut vol,
+      &cx,
+      &ShimRequest::Read {
+        object: oid(file),
+        offset: 0,
+        size: 16,
+      }
+      .encode(),
+    )
+    .unwrap();
+  assert_eq!(
+    after_release[0], STATUS_ERR,
+    "after release the content is reclaimed — the handle persisted and release dropped the reference"
+  );
 }

@@ -9,7 +9,7 @@
 
 use slates_base::OsHost;
 use slates_db::catalog::VolumeId;
-use slates_mem::{Handle, Slab};
+use slates_mem::{Handle, MemError, Slab};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::{Attrs, Kind};
 use slates_vfs::volume::{Store, Volume};
@@ -48,8 +48,10 @@ pub struct VolumeBridge<'v> {
   /// and dirs share one space; a transport never confuses them). A released handle's slot is
   /// reused and its generation bumped, so repeated open/close does not grow memory (audit BUG-4)
   /// and a stale handle is a typed miss, never a wrong inode. The wire handle packs the slot index
-  /// and generation into one word.
-  handles: Slab<u64>,
+  /// and generation into one word. Owned when the bridge lives for the mount (FUSE, NFS); borrowed
+  /// from the caller when the bridge is rebuilt per request (the daemon FSKit path), so the map
+  /// survives across requests in the owning shard's mount session (see [`HandleStore`]).
+  handles: HandleStore<'v>,
   /// Shape: the size a read is capped at when a request asks for more than one arena chunk.
   max_read: usize,
 }
@@ -59,6 +61,46 @@ impl std::fmt::Debug for VolumeBridge<'_> {
     f.debug_struct("VolumeBridge")
       .field("open_handles", &self.handles.len())
       .finish()
+  }
+}
+
+/// The open-handle slab: owned by the bridge, or borrowed from the caller.
+///
+/// A bridge that lives for the whole mount (the FUSE and NFS servers hold one) owns its slab. A bridge
+/// rebuilt for each request owns nothing durable — the daemon's FSKit serve path is like this: the
+/// volume lives in the owning shard's slab and the bridge borrows it for one operation, so it cannot
+/// keep persistent handle state. There the mount session owns the slab and lends it here, so open
+/// handles survive across requests. The open *reference* each handle takes lives in the `Volume` (which
+/// persists regardless); only this `fh`→inode map needed a home outside the transient bridge.
+enum HandleStore<'h> {
+  Owned(Slab<u64>),
+  Borrowed(&'h mut Slab<u64>),
+}
+
+impl HandleStore<'_> {
+  fn insert(&mut self, inode: u64) -> Result<Handle<u64>, MemError> {
+    match self {
+      Self::Owned(slab) => slab.insert(inode),
+      Self::Borrowed(slab) => slab.insert(inode),
+    }
+  }
+  fn get(&self, handle: Handle<u64>) -> Result<&u64, MemError> {
+    match self {
+      Self::Owned(slab) => slab.get(handle),
+      Self::Borrowed(slab) => slab.get(handle),
+    }
+  }
+  fn remove(&mut self, handle: Handle<u64>) -> Result<u64, MemError> {
+    match self {
+      Self::Owned(slab) => slab.remove(handle),
+      Self::Borrowed(slab) => slab.remove(handle),
+    }
+  }
+  fn len(&self) -> usize {
+    match self {
+      Self::Owned(slab) => slab.len(),
+      Self::Borrowed(slab) => slab.len(),
+    }
   }
 }
 
@@ -74,7 +116,7 @@ impl<'v> VolumeBridge<'v> {
       volume,
       store,
       host: None,
-      handles: Slab::new(HANDLE_SEGMENT, MAX_OPEN_HANDLES),
+      handles: HandleStore::Owned(Slab::new(HANDLE_SEGMENT, MAX_OPEN_HANDLES)),
       max_read: MAX_READ,
     }
   }
@@ -93,7 +135,28 @@ impl<'v> VolumeBridge<'v> {
       volume,
       store,
       host: Some(host),
-      handles: Slab::new(HANDLE_SEGMENT, MAX_OPEN_HANDLES),
+      handles: HandleStore::Owned(Slab::new(HANDLE_SEGMENT, MAX_OPEN_HANDLES)),
+      max_read: MAX_READ,
+    }
+  }
+
+  /// A bridge over a scratch `volume` whose open-handle map lives *outside* it, in `handles` the caller
+  /// keeps across requests. This is the daemon's FSKit serve path: the volume lives in the owning
+  /// shard's slab and the bridge is rebuilt per request, so it cannot own persistent handle state; the
+  /// mount session owns the slab and lends it here (see [`HandleStore`]). Scratch only for now — an
+  /// overlay's borrowed base is a follow-up.
+  pub fn attached(
+    volume_id: VolumeId,
+    volume: &'v mut Volume,
+    store: &'v mut Store,
+    handles: &'v mut Slab<u64>,
+  ) -> VolumeBridge<'v> {
+    VolumeBridge {
+      volume_id,
+      volume,
+      store,
+      host: None,
+      handles: HandleStore::Borrowed(handles),
       max_read: MAX_READ,
     }
   }
@@ -194,6 +257,13 @@ fn node_attr(no: u64, kind: Kind, attrs: &Attrs) -> NodeAttr {
 
 /// Packs a slab handle into one wire word: the slot index in the high half, the generation in the
 /// low half. The inverse is [`unpack_handle`]; the slab's generation check refuses a stale word.
+/// An empty open-handle map sized for [`VolumeBridge::attached`]. A caller that owns the map across
+/// requests (the daemon FSKit serve path) creates it with this, so its capacity is exactly an owned
+/// bridge's — no duplicated bound.
+pub fn new_handle_store() -> Slab<u64> {
+  Slab::new(HANDLE_SEGMENT, MAX_OPEN_HANDLES)
+}
+
 fn pack_handle(handle: Handle<u64>) -> u64 {
   (u64::from(handle.index()) << u32::BITS) | u64::from(handle.generation())
 }

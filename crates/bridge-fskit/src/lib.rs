@@ -21,6 +21,10 @@
 //! (this crate is the message codec, not the ring), and the Swift `FSVolume` shim (with the
 //! `Slates.app` bundle, the FSKit entitlement, and the mount spike).
 
+// The daemon's per-mount serve session (§4.6): holds the open-handle map across requests and serves
+// shim requests against a shard's volume through a transient bridge.
+pub mod mount;
+
 // The in-process transport harness (a C ABI over `serve` for the Swift handler's end-to-end test),
 // built only under the `test-harness` feature; the shipped crate does not include it.
 #[cfg(feature = "test-harness")]
