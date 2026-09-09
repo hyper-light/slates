@@ -299,6 +299,53 @@ pub struct Signal {
   pub freshness_ns: u64,
 }
 
+/// The closed registry of shard health signals (§4.14, D-23; GAP-A9-12). Every signal a shard reports
+/// is a variant here, so the set cannot drift — a free-string name can be miscounted ("nine spans were
+/// called seven"); an enum cannot. The report is built by mapping [`HealthSignal::ALL`], so a variant
+/// added without a measurement is a compile error and a variant that is never emitted cannot exist.
+/// The wire keeps [`Signal`]'s string name (`name()`), so no consumer changes; this is the producer's
+/// closed vocabulary. Signals are content-free counts and ages only (D-23), never payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HealthSignal {
+  /// Volumes in this shard's catalog.
+  CatalogVolumes,
+  /// Nanoseconds the recovered log took to replay at boot (its freshness is the time since boot).
+  LogReplayNs,
+  /// Leases within the failover SLO of expiring.
+  LeaseExpiring,
+  /// The summed depth of the client command rings on this shard.
+  RingDepth,
+  /// Live clients on this shard.
+  ShardClients,
+  /// Operations deferred on this shard.
+  ShardDeferred,
+}
+
+impl HealthSignal {
+  /// The closed registry: every shard health signal, in the order the report emits them. A doc-truth
+  /// test pins this set and its names so a rename or an addition is caught, not silently miscounted.
+  pub const ALL: [HealthSignal; 6] = [
+    HealthSignal::CatalogVolumes,
+    HealthSignal::LogReplayNs,
+    HealthSignal::LeaseExpiring,
+    HealthSignal::RingDepth,
+    HealthSignal::ShardClients,
+    HealthSignal::ShardDeferred,
+  ];
+
+  /// The dotted name this signal reports under (the stable wire vocabulary a consumer keys on).
+  pub const fn name(self) -> &'static str {
+    match self {
+      HealthSignal::CatalogVolumes => "catalog.volumes",
+      HealthSignal::LogReplayNs => "log.replay_ns",
+      HealthSignal::LeaseExpiring => "lease.expiring",
+      HealthSignal::RingDepth => "ring.depth",
+      HealthSignal::ShardClients => "shard.clients",
+      HealthSignal::ShardDeferred => "shard.deferred",
+    }
+  }
+}
+
 /// A refusal kind's count.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct RefusalCount {
@@ -932,5 +979,47 @@ pub fn unpack<M: Wire>(
     SlotKind::Cancel | SlotKind::Heartbeat => Err(IpcError::BadSlot {
       reason: "not a message",
     }),
+  }
+}
+
+#[cfg(test)]
+mod health_signal_registry {
+  use super::HealthSignal;
+
+  /// The health-signal registry is closed (§4.14, GAP-A9-12): `ALL` emits the canonical set in order,
+  /// its names are unique and dotted, and the set is pinned here as the doc-truth — so an addition, a
+  /// rename or a duplicate is caught at the test, never miscounted through a free string (the "nine
+  /// spans were called seven" drift the gap names).
+  #[test]
+  fn the_registry_is_closed_and_its_names_are_unique() {
+    // The canonical set the shard report emits, pinned here; a change to the registry must update this
+    // list, which is the point — a silent drift becomes a failing assertion.
+    let expected = [
+      "catalog.volumes",
+      "log.replay_ns",
+      "lease.expiring",
+      "ring.depth",
+      "shard.clients",
+      "shard.deferred",
+    ];
+    let names: Vec<&str> = HealthSignal::ALL
+      .iter()
+      .map(|signal| signal.name())
+      .collect();
+    assert_eq!(
+      names.as_slice(),
+      expected,
+      "ALL emits the canonical registry in order"
+    );
+    let mut unique = names.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), names.len(), "signal names are unique");
+    for name in &names {
+      assert!(
+        !name.is_empty() && name.contains('.'),
+        "a dotted, non-empty name: {name}"
+      );
+    }
   }
 }

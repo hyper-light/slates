@@ -16,9 +16,9 @@ use slates_db::catalog::{
 };
 use slates_db::register::ObjectId;
 use slates_ipc::protocol::{
-  DaemonReport, Direction, Intent, NamePolicy, PlacedState, Refusal, RefusalCount, ReplyBody,
-  RequestBody, Scope, ShardReport, Signal, SizeClass, SnapshotId, StatusReport, VolumeId,
-  VolumeSummary, WorkOp, pack, unpack,
+  DaemonReport, Direction, HealthSignal, Intent, NamePolicy, PlacedState, Refusal, RefusalCount,
+  ReplyBody, RequestBody, Scope, ShardReport, Signal, SizeClass, SnapshotId, StatusReport,
+  VolumeId, VolumeSummary, WorkOp, pack, unpack,
 };
 use slates_ipc::slot::SlotKind;
 use slates_ipc::{IpcError, Request};
@@ -660,35 +660,36 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
         .is_some_and(|l| l.expires_ns.saturating_sub(now) <= term)
     })
     .count();
-  let signal = |name: &str, value: u64, freshness_ns: u64| Signal {
-    name: name.to_owned(),
-    value,
-    freshness_ns,
+  // Every value the registry can report, computed once. `measure` selects one by its `HealthSignal`,
+  // and the report is built by mapping `HealthSignal::ALL` — so the report IS the closed registry, not
+  // a hand-kept parallel list that could gain or lose a signal (GAP-A9-12). A new signal is a compile
+  // error until it is both measured here and listed in `ALL`.
+  let catalog_volumes = u64::try_from(state.by_id.len()).unwrap_or(u64::MAX);
+  let log_replay_ns = state.recovered.replay_ns;
+  let lease_expiring = u64::try_from(expiring).unwrap_or(u64::MAX);
+  let shard_clients = u64::try_from(state.clients.iter().count()).unwrap_or(u64::MAX);
+  let shard_deferred = u64::try_from(state.deferred.len()).unwrap_or(u64::MAX);
+  let measure = |signal: HealthSignal| -> (u64, u64) {
+    match signal {
+      HealthSignal::CatalogVolumes => (catalog_volumes, 0),
+      HealthSignal::LogReplayNs => (log_replay_ns, since_boot),
+      HealthSignal::LeaseExpiring => (lease_expiring, 0),
+      HealthSignal::RingDepth => (ring_depth, 0),
+      HealthSignal::ShardClients => (shard_clients, 0),
+      HealthSignal::ShardDeferred => (shard_deferred, 0),
+    }
   };
-  let signals = vec![
-    signal(
-      "catalog.volumes",
-      u64::try_from(state.by_id.len()).unwrap_or(u64::MAX),
-      0,
-    ),
-    signal("log.replay_ns", state.recovered.replay_ns, since_boot),
-    signal(
-      "lease.expiring",
-      u64::try_from(expiring).unwrap_or(u64::MAX),
-      0,
-    ),
-    signal("ring.depth", ring_depth, 0),
-    signal(
-      "shard.clients",
-      u64::try_from(state.clients.iter().count()).unwrap_or(u64::MAX),
-      0,
-    ),
-    signal(
-      "shard.deferred",
-      u64::try_from(state.deferred.len()).unwrap_or(u64::MAX),
-      0,
-    ),
-  ];
+  let signals = HealthSignal::ALL
+    .iter()
+    .map(|&signal| {
+      let (value, freshness_ns) = measure(signal);
+      Signal {
+        name: signal.name().to_owned(),
+        value,
+        freshness_ns,
+      }
+    })
+    .collect();
   ShardReport {
     partition: state.partition,
     clients: u32::try_from(state.clients.iter().count()).unwrap_or(u32::MAX),
