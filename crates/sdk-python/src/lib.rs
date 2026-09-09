@@ -31,6 +31,7 @@
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use slates_client::{
   Client as RustClient, ClientError, CreateSpec, Deadlines, NamePolicy, SizeClass, VolumeId,
 };
@@ -155,6 +156,34 @@ impl Client {
     let id = parse_volume(volume)?;
     let taken = self.inner.snapshot(id).map_err(refusal)?;
     Ok(taken.value)
+  }
+
+  /// Reads the volume's status (§4.4) as a dict of plain Python values — the same fields `slates status`
+  /// prints: its id and name, the byte accounting (`referenced_bytes`, `unique_bytes`), the held lease
+  /// epoch (`None` when unheld), live `attachments`, the `head` snapshot sequence, `snapshots` held, the
+  /// overlay `watcher` state, and the `drifted` overlay paths (the full list; the CLI shows only the
+  /// count). The placement (§4.8, D-18) is flattened: `placed` is whether the head is placed in the
+  /// region, `mirror_age_ns` the mirror's lag (`None` where no mirror exists), `host_epoch` the owner's
+  /// authority. `nfs_port` is the daemon's loopback port for `mount_nfs`, or `None` when it serves no NFS.
+  fn status(&mut self, py: Python<'_>, volume: &str) -> PyResult<Py<PyDict>> {
+    let id = parse_volume(volume)?;
+    let report = self.inner.status(id).map_err(refusal)?;
+    let dict = PyDict::new_bound(py);
+    dict.set_item("id", volume_hex(&report.id))?;
+    dict.set_item("name", report.name)?;
+    dict.set_item("referenced_bytes", report.referenced_bytes)?;
+    dict.set_item("unique_bytes", report.unique_bytes)?;
+    dict.set_item("lease_epoch", report.lease_epoch)?;
+    dict.set_item("attachments", report.attachments)?;
+    dict.set_item("head", report.head.value)?;
+    dict.set_item("snapshots", report.snapshots)?;
+    dict.set_item("watcher", report.watcher)?;
+    dict.set_item("drifted", report.drifted)?;
+    dict.set_item("nfs_port", report.nfs_port)?;
+    dict.set_item("placed", report.placed.region)?;
+    dict.set_item("mirror_age_ns", report.placed.mirror_age_ns)?;
+    dict.set_item("host_epoch", report.placed.host_epoch)?;
+    Ok(dict.into())
   }
 
   /// How many times this client has reconnected across daemon restarts (an observability counter, so a
