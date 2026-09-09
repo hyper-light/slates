@@ -13,11 +13,14 @@
 //   1. the ring transport — the handler is written against the `ShimChannel` seam; the real
 //      app-group shared-memory ring to the daemon is dropped in at the spike, where a live mount
 //      exercises the FSItem lifecycle end to end; and
-//   2. the semantic choices a mount confirms (the root object id, the time unit, open refcounting).
+//   2. open-handle refcounting across multiple opens of one item (the single-open map here is a mount
+//      refinement). The root object id and the time unit are no longer guesses: activate() learns the
+//      real root via OP_ROOT (the daemon's root is compose(prefix, 1), not a constant), and the shim
+//      times are Unix nanoseconds, both verified against the daemon's own code.
 //
-// The shim wire is 20 ops (LOOKUP..FORGET, then SETATTR); `setAttributes` maps to OP_SETATTR,
-// carrying only the fields FSKit marks valid (chmod/chown/truncate/utimes) and returning the new
-// attributes, exactly as the by-use test `serve_sets_attributes_through_the_bridge` exercises it.
+// The shim wire is 21 ops (LOOKUP..FORGET, then SETATTR and ROOT); `setAttributes` maps to OP_SETATTR
+// (chmod/chown/truncate/utimes, returning the new attributes), and `activate` maps to OP_ROOT to learn
+// the volume's real root object — both exercised by the `serve_*` by-use tests over a real bridge.
 
 import FSKit
 import Foundation
@@ -129,7 +132,8 @@ private func itemType(fromKind kind: UInt8) -> FSItem.ItemType {
   }
 }
 
-// SPIKE: the shim times are Unix nanoseconds; a mount confirms the unit against the daemon.
+// The shim times are Unix nanoseconds (verified: the daemon copies the volume's `wall_ns()` clock
+// straight into the attribute record); this splits one into a timespec for FSKit.
 private func timespec(fromUnixNanos nanos: Int64) -> timespec {
   let billion: Int64 = 1_000_000_000
   return timespec(tv_sec: Int(nanos / billion), tv_nsec: Int(nanos % billion))
@@ -181,10 +185,6 @@ final class SlatesVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpera
     super.init(volumeID: volumeID, volumeName: volumeName)
   }
 
-  // SPIKE: the mounted volume's root object. FUSE convention is inode 1; a mount confirms it
-  // against the id the daemon actually assigns the volume root.
-  private var rootObject: ObjectId { ObjectId(inode: 1, generation: 0) }
-
   // One round trip: encode, send, decode into the expected shape. A transport failure throws.
   private func call(_ request: ShimRequest, expecting shape: ReplyShape) throws -> ShimReply {
     let reply = try channel.roundTrip(encode(request))
@@ -229,7 +229,18 @@ final class SlatesVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpera
   }
 
   func activate(options: FSTaskOptions, replyHandler reply: @escaping (FSItem?, Error?) -> Void) {
-    reply(SlatesItem(object: rootObject, kind: 1), nil)
+    // Learn the real root object from the daemon (OP_ROOT) rather than assuming a fixed inode — the
+    // daemon's root is compose(prefix, 1), per-volume prefixed, not a constant.
+    do {
+      switch try call(.root, expecting: .attr) {
+      case .attr(let attr):
+        reply(
+          SlatesItem(
+            object: ObjectId(inode: attr.ino, generation: attr.generation), kind: attr.kind), nil)
+      case .error(let tag): reply(nil, posixError(tag))
+      default: reply(nil, ioError())
+      }
+    } catch { reply(nil, ioError()) }
   }
 
   func deactivate(options: FSDeactivateOptions, replyHandler reply: @escaping (Error?) -> Void) {

@@ -12,7 +12,7 @@ import Foundation
 // The operation tags — identical to the Rust `OP_*` constants (1…19).
 enum ShimOp: UInt8 {
   case lookup = 1, getattr, read, write, opendir, readdir, release, create, mkdir, unlink, rmdir,
-    open, flush, symlink, readlink, link, rename, reference, forget, setattr
+    open, flush, symlink, readlink, link, rename, reference, forget, setattr, root
 }
 
 // The reply status byte and the ShimError tags — identical to the Rust `STATUS_*`/`ShimError` wire.
@@ -63,6 +63,7 @@ enum ShimRequest: Equatable {
   case setattr(
     object: ObjectId, size: UInt64?, mode: UInt32?, uid: UInt32?, gid: UInt32?, atime: Int64?,
     mtime: Int64?)
+  case root
 }
 
 // A decoded reply — what the shim gets back to answer FSKit. Mirrors the Rust reply encodings.
@@ -180,6 +181,8 @@ func encode(_ request: ShimRequest) -> [UInt8] {
     if let value = gid { appendLE(value, &out) }
     if let value = atime { appendLE(UInt64(bitPattern: value), &out) }
     if let value = mtime { appendLE(UInt64(bitPattern: value), &out) }
+  case .root:
+    out.append(ShimOp.root.rawValue)
   }
   return out
 }
@@ -273,6 +276,7 @@ func decode(_ bytes: [UInt8]) throws -> ShimRequest {
     let mtime: Int64? = valid & SETATTR_MTIME != 0 ? try r.i64() : nil
     request = .setattr(
       object: object, size: size, mode: mode, uid: uid, gid: gid, atime: atime, mtime: mtime)
+  case .root: request = .root
   case .none: throw WireError(reason: "unknown op \(tag)")
   }
   guard r.done else { throw WireError(reason: "trailing bytes") }
@@ -339,6 +343,7 @@ func run() -> Int {
       mtime: -1),
     .setattr(object: p, size: nil, mode: 0o755, uid: nil, gid: nil, atime: nil, mtime: 123),
     .setattr(object: o, size: nil, mode: nil, uid: nil, gid: nil, atime: nil, mtime: nil),
+    .root,
   ]
   for request in requests {
     if let decoded = try? decode(encode(request)) {

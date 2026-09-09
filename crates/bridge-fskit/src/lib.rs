@@ -66,6 +66,10 @@ const OP_FORGET: u8 = 19;
 /// Format: see [`OP_LOOKUP`] — set attributes on an object (chmod/chown/truncate/utimes); the object
 /// is followed by the `SETATTR_*` field mask and the present values in field order.
 const OP_SETATTR: u8 = 20;
+/// Format: see [`OP_LOOKUP`] — return the volume's root object. Carries no fields; the reply is the
+/// root's attribute record, so the handler learns the real root object id (`compose(prefix, 1)`, not a
+/// constant) at activate time rather than assuming inode 1.
+const OP_ROOT: u8 = 21;
 
 /// Format: the `SetAttr` field-present bits — a little-endian `u32` mask that follows the object; a set
 /// bit means that field's value follows, in the order size, mode, uid, gid, atime, mtime. Mirrors the
@@ -382,6 +386,10 @@ pub enum ShimRequest {
     /// A new modification time (Unix nanoseconds), if set.
     mtime: Option<i64>,
   },
+  /// Return the volume's root object; the reply is the root's attributes. The handler calls this at
+  /// activate time instead of assuming a fixed root inode — the daemon's root is `compose(prefix, 1)`
+  /// (per-volume prefixed, and a clone inherits its origin's), never a constant.
+  Root,
 }
 
 impl ShimRequest {
@@ -540,6 +548,7 @@ impl ShimRequest {
           mtime: *mtime,
         },
       ),
+      ShimRequest::Root => out.push(OP_ROOT),
     }
     out
   }
@@ -683,6 +692,7 @@ impl ShimRequest {
         ShimRequest::Forget { object, nlookup }
       }
       OP_SETATTR => take_setattr(&mut rest)?,
+      OP_ROOT => ShimRequest::Root,
       other => return Err(ShimWireError::UnknownOp { tag: other }),
     };
     if rest.is_empty() {
@@ -745,9 +755,19 @@ pub fn serve(
     }
     ShimRequest::Unlink { parent, name } => reply(bridge.unlink(parent, cx, &name), |()| ok_unit()),
     ShimRequest::Rmdir { parent, name } => reply(bridge.rmdir(parent, cx, &name), |()| ok_unit()),
+    ShimRequest::Root => reply(root_attr(bridge, cx), |a| ok_attr(&a)),
     other => serve_rest(other, bridge, cx),
   };
   Ok(reply)
+}
+
+/// The root object's attributes: the daemon's root inode (`compose(prefix, 1)`, never a constant) with
+/// its attribute record. The handler calls [`OP_ROOT`] at activate time to learn the real root object
+/// id rather than assuming inode 1. The shim object generation is a stable 0 (inode numbers are never
+/// reused, D-4), so the root object is `(root inode, 0)`.
+fn root_attr(bridge: &mut dyn Bridge, cx: &OpContext) -> Result<NodeAttr, VfsError> {
+  let root = bridge.root(cx)?;
+  bridge.getattr(ObjectId::new(root, 0), cx)
 }
 
 /// The remaining operations, split from [`serve`]'s dispatch so neither match exceeds the cognitive

@@ -188,6 +188,7 @@ fn a_request_round_trips_through_its_bytes() {
       atime: None,
       mtime: None,
     },
+    ShimRequest::Root,
   ];
   for request in requests {
     let bytes = request.encode();
@@ -397,6 +398,34 @@ fn serve_sets_attributes_through_the_bridge() {
     2,
     "the truncate persisted in the volume"
   );
+}
+
+/// `serve` answers OP_ROOT with the volume's real root object — `compose(prefix, 1)`, NOT the inode 1
+/// a FUSE-style handler would assume. This is the root-inode correctness fix: the FSKit handler learns
+/// the true root at activate time instead of hardcoding a constant that is wrong for any prefixed
+/// volume. §4.6.
+#[test]
+fn serve_returns_the_real_root_object() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root = bridge.root(&cx).unwrap();
+  // The test volume's prefix is 1, so its root is compose(1, 1) — provably NOT inode 1, the constant
+  // the handler used to assume. A handler hardcoding 1 would address the wrong object on this volume.
+  assert_ne!(root, 1, "a prefixed volume's root is not inode 1");
+
+  let reply = serve(&ShimRequest::Root.encode(), &mut bridge, &cx).unwrap();
+  assert_eq!(reply[0], STATUS_OK, "root succeeded");
+  // The reply is the root's attributes: inode at bytes 1..9, kind at byte 17 (the NodeAttr layout).
+  let mut ino_bytes = [0u8; 8];
+  ino_bytes.copy_from_slice(&reply[1..9]);
+  assert_eq!(
+    u64::from_le_bytes(ino_bytes),
+    root,
+    "OP_ROOT returns the daemon's real root inode, not a constant"
+  );
+  assert_eq!(reply[17], 1, "the root is a directory (KIND_DIR)");
 }
 
 /// `serve` drives the directory lifecycle: mkdir a subdirectory, create a file in it, open and read
