@@ -56,6 +56,18 @@ fn checked_u64(value: i64, field: &str) -> Result<u64> {
     .map_err(|_| Error::from_reason(format!("{field} must be a non-negative integer")))
 }
 
+/// A `u64` count crossing to Node as an object field, range-checked to a JS-safe `i64` — a value that
+/// would not round-trip is a typed error, never a silent truncation (the SDK's integer rule).
+fn status_i64(value: u64, field: &str) -> Result<i64> {
+  i64::try_from(value)
+    .map_err(|_| Error::from_reason(format!("{field} is too large for a JS number")))
+}
+
+/// An optional `u64` status field: `null` in JS when absent, range-checked when present.
+fn status_opt_i64(value: Option<u64>, field: &str) -> Result<Option<i64>> {
+  value.map(|v| status_i64(v, field)).transpose()
+}
+
 /// Renders a volume id as lowercase hex — the plain value Node holds and passes back.
 fn volume_hex(id: &VolumeId) -> String {
   let mut out = String::with_capacity(VOLUME_ID_HEX);
@@ -83,6 +95,29 @@ fn parse_volume(hex: &str) -> Result<VolumeId> {
       .map_err(|_| Error::from_reason(format!("not a hex byte: {pair:?}")))?;
   }
   Ok(VolumeId { bytes })
+}
+
+/// A volume's status as a plain JS object (§4.4) — the fields `slates status` prints, with napi's
+/// camelCase keys (`referencedBytes`, `nfsPort`, `mirrorAgeNs`, `hostEpoch`, …). Ids cross as hex; every
+/// `u64` count is range-checked to a JS-safe integer before the object is built; the placement (§4.8,
+/// D-18) is flattened to `placed`/`mirrorAgeNs`/`hostEpoch`; `nfsPort` is the daemon's `mount_nfs` port
+/// or `null`; `drifted` is the full list of drifted overlay paths (the CLI shows only the count).
+#[napi(object)]
+pub struct VolumeStatus {
+  pub id: String,
+  pub name: String,
+  pub referenced_bytes: i64,
+  pub unique_bytes: i64,
+  pub lease_epoch: Option<i64>,
+  pub attachments: u32,
+  pub head: i64,
+  pub snapshots: u32,
+  pub watcher: String,
+  pub drifted: Vec<String>,
+  pub nfs_port: Option<u32>,
+  pub placed: bool,
+  pub mirror_age_ns: Option<i64>,
+  pub host_epoch: i64,
 }
 
 /// A connected slates client (§4.4, §4.9): the lifecycle verbs as methods. Constructed by
@@ -157,6 +192,30 @@ impl Client {
     let taken = self.inner.snapshot(id).map_err(refusal)?;
     i64::try_from(taken.value)
       .map_err(|_| Error::from_reason("the snapshot id is too large for a JS number"))
+  }
+
+  /// Reads the volume's status (§4.4) as a [`VolumeStatus`] object — its placement, byte accounting,
+  /// attachments, overlay drift and the daemon's NFS port, the same fields `slates status` prints.
+  #[napi]
+  pub fn status(&mut self, volume: String) -> Result<VolumeStatus> {
+    let id = parse_volume(&volume)?;
+    let report = self.inner.status(id).map_err(refusal)?;
+    Ok(VolumeStatus {
+      id: volume_hex(&report.id),
+      name: report.name,
+      referenced_bytes: status_i64(report.referenced_bytes, "referencedBytes")?,
+      unique_bytes: status_i64(report.unique_bytes, "uniqueBytes")?,
+      lease_epoch: status_opt_i64(report.lease_epoch, "leaseEpoch")?,
+      attachments: report.attachments,
+      head: status_i64(report.head.value, "head")?,
+      snapshots: report.snapshots,
+      watcher: report.watcher,
+      drifted: report.drifted,
+      nfs_port: report.nfs_port.map(u32::from),
+      placed: report.placed.region,
+      mirror_age_ns: status_opt_i64(report.placed.mirror_age_ns, "mirrorAgeNs")?,
+      host_epoch: status_i64(report.placed.host_epoch, "hostEpoch")?,
+    })
   }
 
   /// How many times this client has reconnected across daemon restarts (an observability counter, so a

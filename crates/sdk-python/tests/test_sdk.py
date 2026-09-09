@@ -6,6 +6,7 @@ SLATES_DAEMON, and otherwise skips loudly (never fails on a machine without the 
 env-gated discipline. Run: `maturin develop && python3 -m unittest discover crates/sdk-python/tests`."""
 
 import os
+import signal
 import subprocess
 import time
 import unittest
@@ -82,10 +83,14 @@ class SlatesSdkRoundTrip(unittest.TestCase):
         cli.rs AnchorProcess discipline, in Python)."""
         binary = _daemon_binary()
         instance = f"slates-sdk-{os.getpid()}"
+        # `start_new_session` makes the anchor its own process-group leader, so teardown can kill the
+        # whole group — the anchor and the daemon it supervises — at once, rather than leaving the daemon
+        # up until its own liveness timeout notices the anchor gone.
         anchor = subprocess.Popen(
             [binary, "--instance", instance, "anchor", "--quick", "--shards", "1"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            start_new_session=True,
         )
         try:
             client = _connect_when_ready(instance)
@@ -112,7 +117,11 @@ class SlatesSdkRoundTrip(unittest.TestCase):
             self.assertIn("nfs_port", status)
             self.assertEqual(status["drifted"], [])
         finally:
-            anchor.kill()
+            # Kill the whole process group so the supervised daemon goes with the anchor at once.
+            try:
+                os.killpg(os.getpgid(anchor.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             anchor.wait()
 
 
