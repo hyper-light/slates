@@ -36,22 +36,21 @@ in one of three ways:
 - Already there: someone made the same change
 - These exact bytes in this file collide with what someone else landed
 
-A collision comes back as byte ranges, not conflict markers, and nobody's change is ever
-overwritten. Because a submission is a description and not a pile of files, it is small, it
-can be replayed by any machine that holds the history, and it gets the same answer whether
-the agents share a laptop or are spread across regions. If the machine coordinating a merge
-dies, a neighbour that already holds the history takes over and any submission in flight is
-retried; no accepted version is lost and no conflict is decided twice.
+A collision comes back as byte ranges, not conflict markers. Nobody's change gets
+overwritten. A submission is a list of edits, so it is small and any machine that has the
+history can replay it. That is what lets agents in three regions merge into one tree and get
+the same answer they would get sharing a laptop. If the machine running a merge dies, a
+neighbour that already has the history picks it up and retries whatever was in flight.
+Nothing that was accepted is lost.
 
-**Sharding that keeps agents out of each other's way.** Every CPU core on the machine owns
-its own set of volumes outright. An agent's request goes straight to the core that owns its
-volume and is answered there, with no lock, no shared counter and no other core in the way,
-which is why creating a volume takes microseconds and why one busy agent cannot stall
-another. Across a fleet the same rule holds one level up: every volume has one owning host
-and a fixed handful of neighbours that hold copies of everything it has snapshotted or
-merged. A volume moves to the host whose agents keep writing to it. If its owner dies, a
-neighbour takes over; if its owner was only paused, it cannot come back and overwrite what
-its successor did. The cluster votes on who owns what, never on a write.
+**Sharding.** Each CPU core owns its own volumes. A request goes to the core that owns the
+volume and gets answered there. No locks, nothing shared between cores. That is why creating
+a volume takes microseconds and why a busy agent cannot slow down another one. A fleet works
+the same way, one host at a time: each volume has one owner and a few neighbours that keep
+copies of its snapshots and merges. If agents on another host keep writing to a volume, it
+moves there. If the owner dies, a neighbour takes over. If the owner was just paused, it
+cannot come back and clobber what the neighbour did. The only thing the cluster ever votes on
+is who owns what.
 
 Slates consists of a single binary and a single daemon:
 
