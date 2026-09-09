@@ -17,6 +17,7 @@
 //! pending verification against `ntstatus.h` on Windows.
 
 use slates_vfs::error::VfsError;
+use slates_vfs::inode::Kind;
 
 /// An `NTSTATUS` code — the 32-bit status WinFsp hands the kernel for a request (§4.6). Held as the raw
 /// `u32` the constants are written in; the Windows FFI casts it to the `NTSTATUS`/`LONG` (`i32`) the API
@@ -50,6 +51,41 @@ const STATUS_NOT_SAME_DEVICE: Ntstatus = Ntstatus(0xC000_00D4);
 const STATUS_DIRECTORY_NOT_EMPTY: Ntstatus = Ntstatus(0xC000_0101);
 /// Format: `STATUS_NOT_A_DIRECTORY` — a file was found where a directory was expected (`ENOTDIR`).
 const STATUS_NOT_A_DIRECTORY: Ntstatus = Ntstatus(0xC000_0103);
+
+/// Format: the offset from the Windows `FILETIME` epoch (1601-01-01) to the Unix epoch (1970-01-01),
+/// in 100-nanosecond intervals — 11 644 473 600 seconds × 10^7. A `FILETIME` is 100-ns ticks since 1601,
+/// so a Unix time converts by dividing to 100-ns ticks and adding this offset.
+const FILETIME_UNIX_EPOCH_OFFSET: u64 = 116_444_736_000_000_000;
+/// Format: the length of a `FILETIME` tick in nanoseconds (100 ns) — the unit a Unix nanosecond time is
+/// divided by before the epoch offset is added.
+const FILETIME_TICK_NS: u64 = 100;
+
+/// Format: `FILE_ATTRIBUTE_DIRECTORY` — the object is a directory.
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+/// Format: `FILE_ATTRIBUTE_NORMAL` — an ordinary file with no other attributes.
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+/// Format: `FILE_ATTRIBUTE_REPARSE_POINT` — the object is a reparse point; WinFsp represents a symlink
+/// as one.
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// Converts a Unix time in nanoseconds to a Windows `FILETIME` (100-ns ticks since 1601), the form
+/// WinFsp reports file times in. A negative time is clamped to the Unix epoch (WinFsp takes an unsigned
+/// tick count), exactly as the FUSE bridge clamps a negative time to zero.
+pub fn filetime_from_unix_ns(ns: i64) -> u64 {
+  let ns = u64::try_from(ns).unwrap_or(0);
+  ns / FILETIME_TICK_NS + FILETIME_UNIX_EPOCH_OFFSET
+}
+
+/// The Windows file-attribute bits for a node kind (§4.6) — a directory, an ordinary file, or a symlink
+/// (a reparse point, the form WinFsp represents links in). The FUSE bridge makes the same choice with
+/// the `DT_*` d_type; this is its Windows analogue.
+pub fn file_attributes(kind: Kind) -> u32 {
+  match kind {
+    Kind::Dir => FILE_ATTRIBUTE_DIRECTORY,
+    Kind::File => FILE_ATTRIBUTE_NORMAL,
+    Kind::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
+  }
+}
 
 /// The `NTSTATUS` WinFsp returns for a volume refusal (§4.6). The common, well-defined codes map
 /// precisely; the rare and slates-specific refusals (`TooManyLinks`, `FileTooLarge`, `Destroying`,
@@ -125,5 +161,35 @@ mod tests {
         "a refusal is an error class: {status:?}"
       );
     }
+  }
+
+  /// A Unix time converts to the Windows `FILETIME` the kernel expects: the Unix epoch is the offset
+  /// itself, one second later is ten million ticks past it, and a negative time clamps to the epoch.
+  #[test]
+  fn unix_time_converts_to_filetime() {
+    assert_eq!(
+      filetime_from_unix_ns(0),
+      FILETIME_UNIX_EPOCH_OFFSET,
+      "the Unix epoch is the offset"
+    );
+    assert_eq!(
+      filetime_from_unix_ns(1_000_000_000),
+      FILETIME_UNIX_EPOCH_OFFSET + 10_000_000,
+      "one second is ten million 100-ns ticks past the epoch"
+    );
+    assert_eq!(
+      filetime_from_unix_ns(-42),
+      FILETIME_UNIX_EPOCH_OFFSET,
+      "a negative time clamps to the epoch"
+    );
+  }
+
+  /// Each node kind maps to its Windows file-attribute bit — a directory, an ordinary file, and a
+  /// symlink (a reparse point).
+  #[test]
+  fn each_kind_maps_to_its_file_attribute() {
+    assert_eq!(file_attributes(Kind::Dir), FILE_ATTRIBUTE_DIRECTORY);
+    assert_eq!(file_attributes(Kind::File), FILE_ATTRIBUTE_NORMAL);
+    assert_eq!(file_attributes(Kind::Symlink), FILE_ATTRIBUTE_REPARSE_POINT);
   }
 }
