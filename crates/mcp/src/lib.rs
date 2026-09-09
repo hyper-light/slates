@@ -3,8 +3,9 @@
 //! function from one JSON-RPC message to its reply — so it is driven directly in tests against a live
 //! daemon; the `slates mcp` command wraps it in the stdio transport (the I/O boundary the CLI owns).
 //!
-//! The surface covers the merge loop (§4.16: create a green, clone a work, edit, submit, rebase, read
-//! the chain), the volume lifecycle (create, list, stat, snapshot, clone, resize, destroy), attach and
+//! The surface covers the merge loop (§4.16: create a green, clone a work, edit content, declare
+//! namespace operations, submit, rebase, read the chain), the volume lifecycle (create, list, stat,
+//! snapshot, clone, resize, destroy), attach and
 //! detach, the base operations (read_base, rewitness, pin), `slates.status`, and `slates.land`
 //! (materialize, which returns `GrantRequired`). Owed toward the full §4.12: `slates.fs` (the mount
 //! path), Streamable HTTP, resources and prompts.
@@ -22,7 +23,7 @@ use serde_json::{Value, json};
 use slates_client::{
   Attachment, Client, ClientError, CreateSpec, DaemonReport, Filter, Intent, Landing,
   LandingOutcome, LandingSummary, NamePolicy, Rebased, SizeClass, SnapshotId, StatusReport,
-  Submitted, VolumeId, VolumeSummary,
+  Submitted, VolumeId, VolumeSummary, WorkOp,
 };
 
 pub mod http;
@@ -103,6 +104,7 @@ impl McpServer {
       "slates.merge.create_green" => self.create_green(&args),
       "slates.merge.create_work" => self.create_work(&args),
       "slates.merge.edit" => self.edit(&args),
+      "slates.merge.declare" => self.declare(&args),
       "slates.merge.submit" => self.submit(&args),
       "slates.merge.rebase" => self.rebase(&args),
       "slates.merge.versions" => self.versions(&args),
@@ -162,6 +164,22 @@ impl McpServer {
       .edit(work, &path, at, delete_len, text.as_bytes())
       .map_err(refusal)?;
     Ok(json!({ "edited": true }))
+  }
+
+  /// Declares a namespace operation on a work volume (§4.16) — the counterpart to [`Self::edit`]'s
+  /// content splice. `op.kind` selects the operation; `work_op_from` reads its fields. A mounted work
+  /// journals the same operations from its filesystem calls.
+  fn declare(&mut self, args: &Value) -> Result<Value, McpError> {
+    let work = volume_arg(args, "work")?;
+    let op = args.get("op").ok_or_else(|| McpError {
+      code: code::INVALID_PARAMS,
+      message: "missing object argument: op".to_owned(),
+    })?;
+    self
+      .client
+      .declare(work, work_op_from(op)?)
+      .map_err(refusal)?;
+    Ok(json!({ "declared": true }))
   }
 
   fn submit(&mut self, args: &Value) -> Result<Value, McpError> {
@@ -435,6 +453,14 @@ fn tool_list() -> Vec<Value> {
       json!(["work", "path", "at"]),
     ),
     tool(
+      "slates.merge.declare",
+      "Declare a namespace op on a work (the counterpart to edit). `op.kind` is one of unlink{path}, \
+       rename{from,to}, mkdir{path}, rmdir{path}, set_mode{path,mode}, symlink{path,target}, \
+       link{path,target}, set_xattr{path,name,value}, remove_xattr{path,name}.",
+      json!({ "work": string, "op": { "type": "object", "properties": { "kind": string, "path": string, "from": string, "to": string, "target": string, "name": string, "value": string, "mode": integer }, "required": ["kind"] } }),
+      json!(["work", "op"]),
+    ),
+    tool(
       "slates.merge.submit",
       "Submit a work's increment to its green: accepted at a new version, or the conflict windows.",
       json!({ "work": string }),
@@ -587,6 +613,53 @@ fn windows_json(windows: &[slates_ipc::protocol::MergeWindow]) -> Value {
       .map(|w| json!({ "path": w.path, "at": w.at, "len": w.len, "class": w.class }))
       .collect(),
   )
+}
+
+/// Reads a `WorkOp` from an `op` object (§4.16): `kind` names the operation, the rest are its fields.
+/// The `WorkOp` enum stays inside the server — its wire form is this plain JSON object.
+fn work_op_from(op: &Value) -> Result<WorkOp, McpError> {
+  let kind = string_arg(op, "kind")?;
+  let path = |op: &Value| string_arg(op, "path");
+  let work_op = match kind.as_str() {
+    "unlink" => WorkOp::Unlink { path: path(op)? },
+    "rename" => WorkOp::Rename {
+      from: string_arg(op, "from")?,
+      to: string_arg(op, "to")?,
+    },
+    "mkdir" => WorkOp::Mkdir { path: path(op)? },
+    "rmdir" => WorkOp::Rmdir { path: path(op)? },
+    "set_mode" => WorkOp::SetMode {
+      path: path(op)?,
+      mode: u32::try_from(u64_arg(op, "mode")?).map_err(|_| McpError {
+        code: code::INVALID_PARAMS,
+        message: "mode is out of range".to_owned(),
+      })?,
+    },
+    "symlink" => WorkOp::Symlink {
+      path: path(op)?,
+      target: string_arg(op, "target")?,
+    },
+    "link" => WorkOp::Link {
+      path: path(op)?,
+      target: string_arg(op, "target")?,
+    },
+    "set_xattr" => WorkOp::SetXattr {
+      path: path(op)?,
+      name: string_arg(op, "name")?,
+      value: string_arg(op, "value")?.into_bytes(),
+    },
+    "remove_xattr" => WorkOp::RemoveXattr {
+      path: path(op)?,
+      name: string_arg(op, "name")?,
+    },
+    other => {
+      return Err(McpError {
+        code: code::INVALID_PARAMS,
+        message: format!("unknown work op kind: {other}"),
+      });
+    }
+  };
+  Ok(work_op)
 }
 
 /// The size class from a `bounded` byte limit or a `dynamic` max, defaulting to an unbounded dynamic

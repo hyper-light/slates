@@ -142,6 +142,50 @@ fn assert_merge_loop(server: &mut McpServer) {
       .any(|w| w["path"] == "f"),
     "the conflict names the file: {conflict}"
   );
+
+  assert_declare_namespace_ops(server, &green);
+}
+
+/// Namespace operations over MCP (`slates.merge.declare`): a work builds a directory tree with a
+/// rename, a mode change, a symlink, a hard link and an xattr, then submits cleanly — the counterpart
+/// to `edit`'s content splice. `edit` creates a file on write, so these have real targets.
+fn assert_declare_namespace_ops(server: &mut McpServer, green: &str) {
+  let work = call(
+    server,
+    "slates.merge.create_work",
+    json!({ "green": green, "name": "ns" }),
+  )["work"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  call(
+    server,
+    "slates.merge.edit",
+    json!({ "work": work, "path": "/keep.txt", "at": 0, "text": "keep" }),
+  );
+  for op in [
+    json!({ "kind": "mkdir", "path": "/d" }),
+    json!({ "kind": "rename", "from": "/keep.txt", "to": "/d/g.txt" }),
+    json!({ "kind": "set_mode", "path": "/d/g.txt", "mode": 384 }),
+    json!({ "kind": "symlink", "path": "/d/link", "target": "g.txt" }),
+    json!({ "kind": "link", "path": "/d/hard.txt", "target": "/d/g.txt" }),
+    json!({ "kind": "set_xattr", "path": "/d/g.txt", "name": "user.slates", "value": "1" }),
+  ] {
+    assert_eq!(
+      call(
+        server,
+        "slates.merge.declare",
+        json!({ "work": work, "op": op.clone() }),
+      ),
+      json!({ "declared": true }),
+      "declare {op}"
+    );
+  }
+  let submitted = call(server, "slates.merge.submit", json!({ "work": work }));
+  assert_eq!(
+    submitted["accepted"], true,
+    "the namespace ops submit cleanly: {submitted}"
+  );
 }
 
 /// The volume lifecycle over MCP: create, list, stat, snapshot, clone, resize, destroy, and status.
