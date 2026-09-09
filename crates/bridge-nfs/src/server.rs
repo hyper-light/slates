@@ -18,6 +18,14 @@ use crate::rpc::{AcceptStatus, RpcError, parse_call};
 use crate::xdr::{XdrReader, XdrWriter};
 use crate::{read_record, reply_bytes, write_record};
 
+use slates_rt::RtError;
+use slates_rt::tcp::TcpStream;
+
+/// Shape: bytes read from the stream per `read` when more of an RPC record is needed. A large NFS
+/// transfer fits in one read, and the record assembler stitches any split across reads, so this
+/// bounds the number of syscalls per record, never correctness.
+const RECORD_READ_CHUNK: usize = 1 << 16;
+
 /// Dispatches one decoded RPC call onto `export`, returning the accept status and encoded results. The
 /// `port` answers a portmap `GETPORT` (this server serves every program on one port).
 fn dispatch(
@@ -59,7 +67,7 @@ fn dispatch(
 /// risking a desynchronised stream.
 pub fn serve_connection<S: Read + Write>(stream: &mut S, export: &mut Export<'_>, port: u16) {
   let mut buffer: Vec<u8> = Vec::new();
-  let mut chunk = [0u8; 1 << 16];
+  let mut chunk = [0u8; RECORD_READ_CHUNK];
   loop {
     match read_record(&buffer) {
       Ok((body, consumed)) => {
@@ -80,6 +88,48 @@ pub fn serve_connection<S: Read + Write>(stream: &mut S, export: &mut Export<'_>
         Ok(n) => buffer.extend_from_slice(&chunk[..n]),
       },
       Err(_) => return,
+    }
+  }
+}
+
+/// Serves NFS/MOUNT/portmap RPC over one connected runtime `stream` against `export`, until the client
+/// closes it — the async analogue of [`serve_connection`] for the production server, which multiplexes
+/// connections on slates's own runtime (§4.6). It shares the RPC engine ([`dispatch`]) and the record
+/// codec with the blocking form; only the transport differs. Reads and writes await the shard's driver
+/// through the runtime's [`TcpStream`], so a write to a stalled client (a soft-mounted NFS client that
+/// stopped reading, filling the send buffer) yields the shard rather than blocking it — the reason the
+/// production server runs here and the blocking form stays the example-and-test driver of the same
+/// engine. Returns `Ok(())` when the stream reaches end of file; a malformed record ends the
+/// connection rather than risk a desynchronised stream; a transport error is returned for the caller
+/// to log and drop the connection.
+pub async fn serve_connection_async(
+  stream: &mut TcpStream,
+  export: &mut Export<'_>,
+  port: u16,
+) -> Result<(), RtError> {
+  let mut buffer: Vec<u8> = Vec::new();
+  let mut chunk = [0u8; RECORD_READ_CHUNK];
+  loop {
+    match read_record(&buffer) {
+      Ok((body, consumed)) => {
+        let reply = match parse_call(&body) {
+          Ok((call, mut args)) => {
+            let (status, results) = dispatch(export, call.program, call.procedure, &mut args, port);
+            reply_bytes(call.xid, status, &results)
+          }
+          Err(_) => reply_bytes(0, AcceptStatus::GarbageArgs, &[]),
+        };
+        stream.write_all(&write_record(&reply)).await?;
+        buffer.drain(..consumed);
+      }
+      Err(RpcError::Incomplete) => {
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+          return Ok(());
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+      }
+      Err(_) => return Ok(()),
     }
   }
 }

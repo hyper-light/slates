@@ -1174,6 +1174,7 @@ dependencies = [
  "slates-bridge-core",
  "slates-db",
  "slates-mem",
+ "slates-rt",
  "slates-vfs",
 ]
 

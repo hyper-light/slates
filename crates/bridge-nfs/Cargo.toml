@@ -11,6 +11,7 @@ description = "The macOS NFSv3 loopback bridge (the FSKit fallback and different
 [dependencies]
 slates-bridge-core = { workspace = true }
 slates-db = { workspace = true }
+slates-rt = { workspace = true }
 slates-vfs = { workspace = true }
 
 [dev-dependencies]

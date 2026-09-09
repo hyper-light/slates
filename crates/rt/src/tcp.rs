@@ -11,9 +11,13 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use rustix::net::{
-  AddressFamily, SocketAddr, SocketAddrV4, SocketFlags, SocketType, accept, bind, connect,
-  getsockname, listen, socket_with,
+  AddressFamily, SocketAddr, SocketFlags, SocketType, accept, bind, connect, getsockname, listen,
+  socket_with,
 };
+
+// The socket address types are `rustix::net`'s (the standard `core::net` types, re-exported); re-export
+// them here so a consumer of this API can name a bind address without depending on `rustix` directly.
+pub use rustix::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::driver::refused;
 use crate::error::RtError;

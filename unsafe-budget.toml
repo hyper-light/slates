@@ -78,7 +78,9 @@ slates-wire = 4
 # volume-core implementation; no syscalls, no unsafe.
 slates-bridge-core = 0
 slates-bridge-fuse = 0
-# slates-bridge-nfs (0): the XDR/RPC codec is bounds-checked byte slices; the socket uses safe std::net.
+# slates-bridge-nfs (0): the XDR/RPC codec is bounds-checked byte slices; the blocking demo socket uses
+# safe std::net, and the production async server (`serve_connection_async`) uses the runtime's safe
+# `TcpStream` (the socket unsafe lives in slates-rt) — no unsafe in this crate.
 slates-bridge-nfs = 0
 slates-merge = 0
 # slates-transport (0): the control-datagram codec is byte slices read and written in field order
