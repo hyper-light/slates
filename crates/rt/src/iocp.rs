@@ -161,4 +161,13 @@ impl Driver for IocpDriver {
       code: None,
     })
   }
+
+  fn register_writable(&mut self, _raw: i32, _user_data: u64) -> Result<(), RtError> {
+    // Owed (§4.6): this completion-native driver does not carry socket write-readiness yet; a
+    // typed refusal, never a silent drop. The readiness-native drivers (kqueue, epoll) do.
+    Err(RtError::DriverRefused {
+      call: "register_writable",
+      code: None,
+    })
+  }
 }

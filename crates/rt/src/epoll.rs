@@ -1,7 +1,8 @@
 //! The epoll driver (Linux fallback when io_uring is refused, as in containers whose seccomp
 //! profile blocks it): an eventfd for kicks registered on an epoll instance, `epoll_wait` with a
-//! timeout for the wait [B: epoll(7); B: eventfd(2)], through rustix's safe wrappers, so this
-//! module holds no unsafe code.
+//! timeout for the wait [B: epoll(7); B: eventfd(2)], through rustix's safe wrappers. The one unsafe
+//! idiom is borrowing a caller-owned socket fd by number for a single `epoll_ctl` readiness
+//! registration (a `UdpSocket` recv, a `TcpStream` read or write), each with a `// SAFETY:` note.
 
 use std::os::fd::OwnedFd;
 use std::time::Instant;
@@ -129,6 +130,23 @@ impl Driver for EpollDriver {
       EventFlags::IN | EventFlags::ONESHOT,
     )
     .map_err(|e| refused("epoll_ctl(ADD readable)", e))?;
+    Ok(())
+  }
+
+  fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
+    // SAFETY: `raw` is a live socket the caller (a TcpStream) owns for the registration; the borrow
+    // is used only for this epoll_ctl call and not retained.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
+    // One-shot writable interest whose u64 data carries the waker word; the `wait` loop turns the
+    // ready event into a completion keyed by that word (§4.6, TCP send backpressure to a stalled
+    // client).
+    epoll::add(
+      &self.epfd,
+      fd,
+      EventData::new_u64(user_data),
+      EventFlags::OUT | EventFlags::ONESHOT,
+    )
+    .map_err(|e| refused("epoll_ctl(ADD writable)", e))?;
     Ok(())
   }
 

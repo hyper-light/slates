@@ -157,6 +157,22 @@ impl Driver for KqueueDriver {
     Ok(())
   }
 
+  fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
+    // A one-shot write filter whose udata carries the waker word; the `wait` loop turns the ready
+    // event into a completion keyed by that word, exactly as the read filter does. The socket becomes
+    // writable when its send buffer has space again (§4.6, TCP send backpressure to a stalled client).
+    let event = Event::new(
+      EventFilter::Write(raw),
+      EventFlags::ADD | EventFlags::ONESHOT,
+      core::ptr::without_provenance_mut(usize::try_from(user_data).unwrap_or(usize::MAX)),
+    );
+    let mut none: Vec<Event> = Vec::new();
+    // SAFETY: one valid change record on the open queue; the empty output buffer receives nothing.
+    unsafe { kevent(self.kq, &[event], &mut none, None) }
+      .map_err(|e| refused("kevent(EVFILT_WRITE)", e))?;
+    Ok(())
+  }
+
   fn has_pending(&self) -> bool {
     !self.nops.is_empty()
   }

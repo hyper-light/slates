@@ -916,6 +916,21 @@ threads and are routed to the owning shard by handle. Simulation: a driver that 
 randomness, sockets, rings, and the bridge with seeded in-process simulations for the whole
 cluster.
 
+> Status (2026-09-09): the driver readiness seam carries both directions. `Driver::register_readable`
+> and `register_writable` register one-shot interest in a descriptor's readability or writability with
+> the shard's driver (kqueue `EVFILT_READ`/`EVFILT_WRITE`, epoll `EPOLLIN`/`EPOLLOUT`, each re-armed
+> after the edge is consumed); the completion-native drivers (io_uring, IOCP) refuse both as owed with
+> a typed `RtError`, and the simulation refuses writability (its in-memory fabric sends never block).
+> Over that seam the runtime exposes two async sockets that share one readiness future
+> (`crates/rt/src/readiness.rs`, so neither duplicates the register-and-yield dance): `udp::UdpSocket`
+> (§4.10a, the fleet plane — a real `rustix` socket or the simulated fabric) and `tcp::{TcpListener,
+> TcpStream}` (§4.6, the NFS loopback server — real only, since TCP is host-local and has no simulated
+> fabric). `TcpStream::write_all` awaits writability when the send buffer fills, so a write to a stalled
+> peer (a soft-mounted NFS client that stopped reading) yields the shard rather than blocking it. Proven
+> by use on the readiness-native driver: `crates/rt/tests/tcp.rs` runs an accept→read→write→read round
+> trip with both ends on the runtime's own sockets, `tests/udp.rs` the datagram path. The
+> completion-native socket path (io_uring, IOCP) stays owed.
+
 **Failure matrix.** Driver setup refused (seccomp): Masked (epoll). Task arena full: Refused
 (`TooManyTasks`, admission). A task exceeding the bounded-work rule (measured per-iteration budget
 exceeded N times): Degraded, counted, the offending operation is chunked by design (destroys,

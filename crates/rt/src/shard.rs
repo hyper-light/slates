@@ -482,6 +482,15 @@ impl ShardContext {
       .ok_or(RtError::NotOnShardThread)?
   }
 
+  /// Registers one-shot interest in a socket's writability with the shard's driver (§4.6): when it
+  /// next has send-buffer space, the driver wakes the task whose `word` this is. The path a TCP
+  /// `write_all` takes when the send buffer filled; mirrors [`ShardContext::register_readable`].
+  pub fn register_writable(&self, raw: i32, word: u64) -> Result<(), RtError> {
+    self
+      .with_inner(|inner| inner.driver.register_writable(raw, word))
+      .ok_or(RtError::NotOnShardThread)?
+  }
+
   /// Whether this shard runs the simulation driver (so a `UdpSocket` uses the in-memory fabric).
   pub fn driver_is_sim(&self) -> bool {
     self

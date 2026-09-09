@@ -225,6 +225,16 @@ impl Driver for SimDriver {
     Ok(())
   }
 
+  fn register_writable(&mut self, _raw: i32, _user_data: u64) -> Result<(), RtError> {
+    // The simulated fabric is UDP-only and its sends never block (an in-memory push), so there is no
+    // write-readiness to await under simulation; TCP is a host-local bridge (§4.6), not the fleet
+    // plane (§4.10a). A typed refusal keeps the seam honest rather than pretending readiness.
+    Err(RtError::DriverRefused {
+      call: "register_writable",
+      code: None,
+    })
+  }
+
   fn has_pending(&self) -> bool {
     !self.nops.is_empty() || self.shared.kicked.load(Ordering::Acquire)
   }

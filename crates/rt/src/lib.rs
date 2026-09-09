@@ -23,18 +23,21 @@
 //! costs nothing to clone, which is what `LocalWaker` would have saved (Phase 0 task 6).
 //!
 //! Modules: [`error`], [`control`], [`waker`], [`registry`], [`task`], [`queue`], [`timer`],
-//! [`driver`], [`sim`], [`shard`], [`runtime`], [`futures`], and the OS drivers.
+//! [`driver`], [`sim`], [`shard`], [`runtime`], [`futures`], the async sockets ([`udp`] and [`tcp`],
+//! over one shared readiness future), and the OS drivers.
 
 pub mod control;
 pub mod driver;
 pub mod error;
 pub mod futures;
 pub mod queue;
+mod readiness;
 pub mod registry;
 pub mod runtime;
 pub mod shard;
 pub mod sim;
 pub mod task;
+pub mod tcp;
 pub mod timer;
 pub mod udp;
 pub mod waker;

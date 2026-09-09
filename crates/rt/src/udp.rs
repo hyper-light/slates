@@ -11,10 +11,7 @@
 //! socket type, one code path, the driver deciding (R8). `recv_from` shares the same `Readable`
 //! future either way; only the receive and the raw handle differ.
 
-use std::future::Future;
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 // The address types come through `rustix::net` (the standard `core::net` types re-exported), so the
 // host-path wall's `std::net` guard is honoured while the socket calls stay in `rustix`.
@@ -24,7 +21,7 @@ use rustix::net::{
 };
 
 use crate::error::RtError;
-use crate::waker::word_of;
+use crate::readiness::readable;
 use crate::{driver::refused, registry};
 
 /// An async UDP socket: a real `rustix` socket, or a port on the simulation's in-memory fabric.
@@ -126,13 +123,7 @@ impl UdpSocket {
           };
         }
         Ok((n, _flags, None)) => return Ok((n, SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))),
-        Err(rustix::io::Errno::AGAIN) => {
-          Readable {
-            raw: fd.as_raw_fd(),
-            armed: false,
-          }
-          .await?;
-        }
+        Err(rustix::io::Errno::AGAIN) => readable(fd.as_raw_fd()).await?,
         Err(e) => return Err(refused("recvfrom", e)),
       }
     }
@@ -147,42 +138,7 @@ impl UdpSocket {
         buf[..n].copy_from_slice(&bytes[..n]);
         return Ok((n, SocketAddrV4::new(Ipv4Addr::LOCALHOST, from)));
       }
-      Readable {
-        raw: i32::from(port),
-        armed: false,
-      }
-      .await?;
-    }
-  }
-}
-
-/// Awaits the socket's readability once: it registers one-shot read interest with the shard's driver
-/// on the first poll and yields; the driver's completion (or the sim fabric's wake) re-queues this
-/// task, and the next poll returns ready so the caller retries the non-blocking receive.
-struct Readable {
-  raw: i32,
-  armed: bool,
-}
-
-impl Future for Readable {
-  type Output = Result<(), RtError>;
-
-  fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), RtError>> {
-    if self.armed {
-      // The driver woke us; let the caller retry the receive (a spurious wake just retries).
-      return Poll::Ready(Ok(()));
-    }
-    let Some(word) = word_of(cx.waker()) else {
-      // A foreign waker cannot be armed on the driver; degrade to a retry (the caller's loop copes).
-      return Poll::Ready(Ok(()));
-    };
-    match registry::with_current(|ctx| ctx.register_readable(self.raw, word.word())) {
-      Some(Ok(())) => {
-        self.armed = true;
-        Poll::Pending
-      }
-      Some(Err(e)) => Poll::Ready(Err(e)),
-      None => Poll::Ready(Err(RtError::NotOnShardThread)),
+      readable(i32::from(port)).await?;
     }
   }
 }

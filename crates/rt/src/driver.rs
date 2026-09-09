@@ -110,11 +110,21 @@ pub trait Driver {
   fn submit_nop(&mut self, user_data: u64) -> Result<(), RtError>;
 
   /// Registers one-shot interest in `raw`'s readability (a UDP socket for the fleet transport,
-  /// §4.10a): when it next becomes readable, a completion carrying `user_data` arrives on a following
-  /// `wait` (re-registered after each read). `raw` is the OS handle (a `RawFd` on Unix). The
-  /// readiness-native drivers (kqueue, epoll) register it; the completion-native drivers (io_uring,
-  /// IOCP) do not carry it yet and refuse with a typed [`RtError`] (owed).
+  /// §4.10a; a TCP listener or stream for the loopback bridge, §4.6): when it next becomes readable, a
+  /// completion carrying `user_data` arrives on a following `wait` (re-registered after each read).
+  /// `raw` is the OS handle (a `RawFd` on Unix). The readiness-native drivers (kqueue, epoll) register
+  /// it; the completion-native drivers (io_uring, IOCP) do not carry it yet and refuse with a typed
+  /// [`RtError`] (owed).
   fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError>;
+
+  /// Registers one-shot interest in `raw`'s writability (a TCP stream whose send buffer filled while
+  /// the loopback bridge wrote a reply, §4.6): when it next has send-buffer space, a completion
+  /// carrying `user_data` arrives on a following `wait` (re-registered after each blocked write), so a
+  /// write to a stalled peer yields the shard instead of blocking it. `raw` is the OS handle. The
+  /// readiness-native drivers (kqueue, epoll) register it; the completion-native drivers (io_uring,
+  /// IOCP) do not carry it yet, and the simulation's fabric sends never block, so those refuse with a
+  /// typed [`RtError`] (owed).
+  fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError>;
 
   /// Whether a `wait` would return a completion or a kick without blocking, as far as the driver
   /// can tell without a syscall (an idle loop skips the wait when this is false).
