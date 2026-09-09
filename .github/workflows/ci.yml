@@ -63,29 +63,23 @@ jobs:
       - name: Ratchet
         run: cargo xtask ratchet
 
-  # Every shipped crate must lint clean for every OS we build for, not only the runner's own:
-  # the Linux drivers, the Windows driver and the Win32 facts are checked from one machine. The
-  # C dependencies stay off here (no cross C toolchain); the profile says so in its notes.
-  cross-lint:
-    name: cross-target clippy (linux, windows, macos)
-    runs-on: ubuntu-latest
+  # The Windows cfg branches (the Win32 rendezvous, the IOCP driver, the Win32 machine facts, the
+  # WinFsp bridge) lint on a NATIVE Windows runner — each platform builds and lints on its own OS, so
+  # every dependency (including the C ones) builds with that OS's toolchain. Linux and macOS are already
+  # covered natively by the `gates` matrix; this job adds Windows, so all three platforms' cfg code is
+  # linted on native runners.
+  windows-lint:
+    name: native clippy (windows)
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
           components: clippy
-          targets: x86_64-pc-windows-msvc, aarch64-apple-darwin, x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy per target
-        run: |
-          # slates-sdk-python is a host-only PyO3 extension: its cdylib cross-links against the target's
-          # Python, which the cross-lint lanes do not have (maturin builds it per platform in the wheel
-          # job). Excluded here like xtask; the native lint above still covers it.
-          for target in x86_64-unknown-linux-gnu x86_64-pc-windows-msvc aarch64-apple-darwin; do
-            cargo clippy --workspace --exclude xtask --exclude slates-sdk-python --lib --bins \
-              --no-default-features --features slates-machine/pure-hash --target "$target" -- -D warnings
-          done
+      - name: Clippy (native Windows)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   # D-20: instruction-count gates. callgrind counts are deterministic for a given binary, so
   # they see the one-percent change the wall clock cannot. valgrind is non-Rust tooling, admitted
