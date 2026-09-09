@@ -12,7 +12,7 @@ use slates_bridge_nfs::mount::MountReply;
 use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
 use slates_bridge_nfs::procedures::{
   Export, NFSPROC3_ACCESS, NFSPROC3_COMMIT, NFSPROC3_CREATE, NFSPROC3_FSINFO, NFSPROC3_FSSTAT,
-  NFSPROC3_GETATTR, NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ,
+  NFSPROC3_GETATTR, NFSPROC3_LINK, NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ,
   NFSPROC3_READDIR, NFSPROC3_READDIRPLUS, NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME,
   NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE,
 };
@@ -1394,6 +1394,80 @@ fn a_readlink_returns_the_target_and_refuses_a_non_symlink() {
     Nfsstat3::Inval.wire(),
     "READLINK of a non-symlink is INVAL"
   );
+}
+
+/// LINK over the export creates a second name for an existing file — a hard link: after linking "a"
+/// as "b", both names LOOKUP to the same object (same fileid) and the file's link count is two, so a
+/// client's `ln a b` works over the mount instead of failing PROC_UNAVAIL.
+#[test]
+fn a_link_over_the_export_makes_a_second_name() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (created, _fh) = bridge.create(oid(root_ino), &cx, "a", 0o644, 0).unwrap();
+  let file_ino = created.ino;
+
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = root_handle(&mut export);
+  let file_fh = slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: file_ino,
+    generation: 0,
+  }
+  .to_fh();
+
+  // LINK3args: the existing file handle, then diropargs3 (the directory handle, the new name).
+  let mut args = XdrWriter::new();
+  file_fh.encode(&mut args);
+  root_fh.encode(&mut args);
+  args.opaque("b".as_bytes());
+  let reply = export
+    .serve_nfs(NFSPROC3_LINK, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "LINK succeeded");
+  let file_attr = PostOpAttr::decode(&mut r)
+    .unwrap()
+    .0
+    .expect("file post attrs");
+  assert_eq!(
+    file_attr.fileid, file_ino,
+    "the link names the linked-to object"
+  );
+  assert_eq!(
+    file_attr.nlink, 2,
+    "the link count is two after a hard link"
+  );
+
+  // Both names now resolve to the same object.
+  for name in ["a", "b"] {
+    let mut la = XdrWriter::new();
+    root_fh.encode(&mut la);
+    la.opaque(name.as_bytes());
+    let lreply = export.lookup(&mut XdrReader::new(la.as_slice()));
+    let mut lr = XdrReader::new(&lreply);
+    assert_eq!(lr.u32().unwrap(), Nfsstat3::Ok.wire(), "the name resolves");
+    let _fh = Nfsfh3::decode(&mut lr).unwrap();
+    let attr = PostOpAttr::decode(&mut lr)
+      .unwrap()
+      .0
+      .expect("object attrs");
+    assert_eq!(
+      attr.fileid, file_ino,
+      "both names name the same object (a hard link)"
+    );
+  }
 }
 
 /// Parses a READDIR reply into (names, last cookie, cookieverf, eof), for the listing tests. The

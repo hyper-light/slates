@@ -35,9 +35,9 @@ use crate::mount::{MountReply, Mountstat3};
 use crate::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3};
 use crate::procedures::{
   Export, NFS_MAXNAMELEN, NFSPROC3_ACCESS, NFSPROC3_COMMIT, NFSPROC3_CREATE, NFSPROC3_FSINFO,
-  NFSPROC3_FSSTAT, NFSPROC3_GETATTR, NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ,
-  NFSPROC3_READDIR, NFSPROC3_READDIRPLUS, NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME,
-  NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE,
+  NFSPROC3_FSSTAT, NFSPROC3_GETATTR, NFSPROC3_LINK, NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_NULL,
+  NFSPROC3_READ, NFSPROC3_READDIR, NFSPROC3_READDIRPLUS, NFSPROC3_READLINK, NFSPROC3_REMOVE,
+  NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE,
 };
 use crate::xdr::{XdrReader, XdrWriter};
 
@@ -228,7 +228,9 @@ impl<V: VolumeSet> MultiExport<V> {
       NFSPROC3_READLINK => post_attr_failure(Nfsstat3::Inval, Some(self.root_fattr3())),
       // Everything that would change the root is refused: a volume appears by a metadata operation.
       NFSPROC3_SETATTR | NFSPROC3_WRITE | NFSPROC3_CREATE | NFSPROC3_MKDIR | NFSPROC3_SYMLINK
-      | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_RENAME => root_readonly_refusal(procedure),
+      | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_RENAME | NFSPROC3_LINK => {
+        root_readonly_refusal(procedure)
+      }
       _ => return None,
     };
     Some(reply)
@@ -594,6 +596,11 @@ fn status_only_or_wcc(procedure: u32, status: Nfsstat3) -> Vec<u8> {
     NFSPROC3_SETATTR | NFSPROC3_WRITE | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_COMMIT => {
       write_absent_wcc(&mut writer);
     }
+    // LINK: the linked-to file's post_op_attr (absent), then the directory's wcc_data (absent).
+    NFSPROC3_LINK => {
+      PostOpAttr(None).encode(&mut writer);
+      write_absent_wcc(&mut writer);
+    }
     // GETATTR and anything else: the status alone.
     _ => {}
   }
@@ -655,8 +662,9 @@ fn post_attr_failure(status: Nfsstat3, attr: Option<Fattr3>) -> Vec<u8> {
 
 /// A read-only refusal (`NFS3ERR_ROFS`) for a mutation on the root, encoded in the failing procedure's
 /// own reply shape so the stream stays framed: the create family carries `post_op_fh` + object
-/// `post_op_attr` + directory `wcc_data`, RENAME carries two `wcc_data`, the rest one `wcc_data`. Every
-/// optional here is "absent" (a single `false`), which is a valid, minimal `wcc_data`/`post_op_*`.
+/// `post_op_attr` + directory `wcc_data`, RENAME carries two `wcc_data`, LINK carries the file's
+/// `post_op_attr` + one `wcc_data`, the rest one `wcc_data`. Every optional here is "absent" (a single
+/// `false`), which is a valid, minimal `wcc_data`/`post_op_*`.
 fn root_readonly_refusal(procedure: u32) -> Vec<u8> {
   let mut writer = XdrWriter::new();
   Nfsstat3::Rofs.encode(&mut writer);
@@ -669,6 +677,10 @@ fn root_readonly_refusal(procedure: u32) -> Vec<u8> {
     NFSPROC3_RENAME => {
       write_absent_wcc(&mut writer); // fromdir_wcc
       write_absent_wcc(&mut writer); // todir_wcc
+    }
+    NFSPROC3_LINK => {
+      PostOpAttr(None).encode(&mut writer); // file_attributes: none
+      write_absent_wcc(&mut writer); // linkdir_wcc
     }
     // SETATTR, WRITE, REMOVE, RMDIR: one wcc_data.
     _ => write_absent_wcc(&mut writer),

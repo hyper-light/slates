@@ -60,6 +60,9 @@ pub const NFSPROC3_REMOVE: u32 = 12;
 pub const NFSPROC3_RMDIR: u32 = 13;
 /// Format: NFSPROC3_RENAME — rename an entry from one directory to another.
 pub const NFSPROC3_RENAME: u32 = 14;
+/// Format: NFSPROC3_LINK (RFC 1813 procedure 15) — create a hard link, a second name in a directory
+/// for an existing non-directory object.
+pub const NFSPROC3_LINK: u32 = 15;
 /// Format: NFSPROC3_READDIR — list a directory's entries (names and ids).
 pub const NFSPROC3_READDIR: u32 = 16;
 /// Format: NFSPROC3_READDIRPLUS — list a directory's entries with each one's attributes and handle.
@@ -331,6 +334,7 @@ impl<'b> Export<'b> {
       NFSPROC3_REMOVE => Some(self.remove(args, false)),
       NFSPROC3_RMDIR => Some(self.remove(args, true)),
       NFSPROC3_RENAME => Some(self.rename(args)),
+      NFSPROC3_LINK => Some(self.link(args)),
       NFSPROC3_READDIR => Some(self.readdir(args)),
       NFSPROC3_READDIRPLUS => Some(self.readdirplus(args)),
       NFSPROC3_FSSTAT => Some(self.fsstat(args)),
@@ -1005,6 +1009,65 @@ impl<'b> Export<'b> {
       ..changes
     };
     self.finish_create(object, &dir_identity, &cx, post_changes)
+  }
+
+  /// NFSPROC3_LINK: create a hard link (RFC 1813 §3.3.15) — a second name `new_name` in a directory
+  /// for the existing non-directory object a handle names, over the shared interface under the
+  /// export's context. The reply carries the linked-to file's post-operation attributes (its
+  /// incremented link count) and the directory's `wcc_data`. A directory target is refused by the
+  /// volume core (mapped to its `nfsstat3`), as NFSv3 requires. Without this a client's `ln` (a hard
+  /// link) fails `PROC_UNAVAIL` even though the volume supports links.
+  pub fn link(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let (status, file_attr, dir_post) = self.do_link(args);
+    let mut writer = XdrWriter::new();
+    status.encode(&mut writer);
+    PostOpAttr(file_attr).encode(&mut writer); // file_attributes
+    encode_wcc(&mut writer, dir_post); // linkdir_wcc
+    writer.into_bytes()
+  }
+
+  fn do_link(&mut self, args: &mut XdrReader<'_>) -> (Nfsstat3, Option<Fattr3>, Option<Fattr3>) {
+    // LINK3args: the existing file handle, then diropargs3 (the target directory handle, the name).
+    let file_fh = match Nfsfh3::decode(args) {
+      Ok(fh) => fh,
+      Err(_) => return (Nfsstat3::Badhandle, None, None),
+    };
+    let dir_fh = match Nfsfh3::decode(args) {
+      Ok(fh) => fh,
+      Err(_) => return (Nfsstat3::Badhandle, None, None),
+    };
+    let name = match args.string(NFS_MAXNAMELEN) {
+      Ok(n) => n.to_owned(),
+      Err(_) => return (Nfsstat3::Inval, None, None),
+    };
+    let file_identity = match self.resolve_handle(&file_fh) {
+      Ok(id) => id,
+      Err(status) => return (status, None, None),
+    };
+    let dir_identity = match self.resolve_handle(&dir_fh) {
+      Ok(id) => id,
+      Err(status) => {
+        // The target file resolved; report its attributes even though the directory did not.
+        let file_attr = self.attrs_of(&file_identity).ok().map(|n| self.fattr3(&n));
+        return (status, file_attr, None);
+      }
+    };
+    let cx = match self.op_context() {
+      Ok(cx) => cx,
+      Err(e) => return (nfsstat_of(&e), None, None),
+    };
+    let target = ObjectId::new(file_identity.inode, file_identity.generation);
+    let new_parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
+    // The directory's post-op attributes (its unchanged link count) go in the wcc either way.
+    let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
+    match self.bridge.link(target, new_parent, &cx, &name) {
+      // The bridge returns the target's attributes with the incremented link count.
+      Ok(node) => (Nfsstat3::Ok, Some(self.fattr3(&node)), dir_post),
+      Err(e) => {
+        let file_attr = self.attrs_of(&file_identity).ok().map(|n| self.fattr3(&n));
+        (nfsstat_of(&e), file_attr, dir_post)
+      }
+    }
   }
 
   /// NFSPROC3_READLINK: read the target path of a symbolic link a handle names, over the shared
