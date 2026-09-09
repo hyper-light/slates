@@ -364,6 +364,75 @@ fn slates_mount_establishes_a_real_kernel_mount_and_unmount_removes_it() {
   drop(anchor);
 }
 
+/// `status ID --json`: one JSON object carrying the volume's real fields (the MCP `status_json` schema).
+fn json_status_of(instance: &str, id: &str) {
+  let (code, out, err) = run(instance, &["status", id, "--json"]);
+  assert_eq!(code, 0, "{err}");
+  let out = out.trim();
+  assert!(
+    out.starts_with('{') && out.ends_with('}'),
+    "a JSON object: {out}"
+  );
+  assert!(out.contains(&format!("\"id\":\"{id}\"")), "the id: {out}");
+  assert!(out.contains("\"name\":\"jsonvol\""), "the name: {out}");
+  assert!(out.contains("\"nfs_port\":"), "the nfs_port field: {out}");
+  assert!(out.contains("\"region\":true"), "placed on a laptop: {out}");
+}
+
+/// `volume list --json`: a JSON array carrying the volume.
+fn json_list_has(instance: &str, id: &str) {
+  let (code, out, err) = run(instance, &["volume", "list", "--json"]);
+  assert_eq!(code, 0, "{err}");
+  let out = out.trim();
+  assert!(
+    out.starts_with('[') && out.ends_with(']'),
+    "a JSON array: {out}"
+  );
+  assert!(
+    out.contains(&format!("\"id\":\"{id}\"")),
+    "the volume: {out}"
+  );
+}
+
+/// `status --json` (no volume): the daemon's status as one JSON object (the MCP `daemon_json` schema).
+fn json_daemon_status(instance: &str) {
+  let (code, out, err) = run(instance, &["status", "--json"]);
+  assert_eq!(code, 0, "{err}");
+  let out = out.trim();
+  assert!(
+    out.starts_with('{') && out.ends_with('}'),
+    "a JSON object: {out}"
+  );
+  assert!(out.contains("\"pid\":"), "the daemon pid: {out}");
+  assert!(out.contains("\"shards\":"), "the shard count: {out}");
+}
+
+/// `--json` makes the read verbs emit the MCP JSON schema (§4.12, GAP-A9-10 "consistent JSON" — the
+/// CLI and the MCP surface share one definition): `status ID --json` and `status --json` return one
+/// JSON object, `volume list --json` a JSON array, each carrying the volume's real fields. Gated like
+/// the anchor+daemon flow (it needs a daemon), skipping loudly without `SLATES_TEST_CLI`.
+#[test]
+fn the_read_verbs_emit_json_with_the_json_flag() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the --json flow: set SLATES_TEST_CLI=1 to run it (needs the machine to itself)"
+    );
+    return;
+  }
+  let instance = format!("cli-json-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "jsonvol", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  json_status_of(&instance, &id);
+  json_list_has(&instance, &id);
+  json_daemon_status(&instance);
+  drop(anchor);
+}
+
 /// `slates profile --quick` prints the derived constants; `slates` alone prints the usage.
 #[test]
 fn the_profile_and_the_usage_print() {

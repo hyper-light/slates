@@ -16,8 +16,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   mcp [--instance NAME] [--http PORT]               serve the MCP tools (stdio, or loopback HTTP)
 
   volume create NAME (--bounded SIZE | --dynamic MAX) [--fold] [--locked] [--base DIR]
-  volume list
-  volume stat ID
+  volume list [--json]
+  volume stat ID [--json]
   volume snapshot ID
   volume destroy-snapshot ID SNAPSHOT
   volume clone ID SNAPSHOT NAME
@@ -33,8 +33,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   volume placed ID [--snapshot N] [--mirror]         await a durability scope
   attach ID [--read | --write] [--snapshot N]
   detach ATTACHMENT
-  status                                           the daemon's status
-  status ID [--drift]
+  status [--json]                                  the daemon's status
+  status ID [--drift] [--json]
   base read ID PATH
   base rewitness ID [PATH ...]
   base pin ID [PATH ...]
@@ -48,7 +48,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
 pub(crate) const USAGE_NOTES: &str =
   "SIZE is bytes with a binary unit: 512MiB, 4GiB (B, KiB, MiB, GiB, TiB).
 The instance is --instance, else SLATES_ENDPOINT, else `default`.
-Exit codes: 0 done, 1 refused, 2 usage, 3 no daemon, 4 failed.";
+Exit codes: 0 done, 1 refused, 2 usage, 3 no daemon, 4 failed.
+--json emits machine-readable JSON for status, `volume stat` and `volume list` (the MCP schema).";
 
 /// A parse refusal.
 #[derive(Debug, PartialEq, Eq)]
@@ -311,6 +312,9 @@ pub(crate) struct ClientRequest {
   pub instance: String,
   /// The verb.
   pub verb: Verb,
+  /// Emit machine-readable JSON instead of the plain text form (the read verbs; §4.12 "consistent
+  /// JSON"). The `--json` switch, allowed on any client verb like `--instance`.
+  pub json: bool,
 }
 
 /// A `slates exec` request: the volume, the path to show it at, and the command to run.
@@ -421,7 +425,12 @@ impl Taken {
       .values
       .keys()
       .filter(|k| **k != "--instance" && !spec.values.contains(k))
-      .chain(self.switches.keys().filter(|k| !spec.switches.contains(k)))
+      .chain(
+        self
+          .switches
+          .keys()
+          .filter(|k| **k != "--json" && !spec.switches.contains(k)),
+      )
       .next();
     match stray {
       Some(flag) => Err(ParseError::UnknownFlag((*flag).to_owned())),
@@ -434,6 +443,11 @@ impl Taken {
       .value("--instance")
       .map(str::to_owned)
       .unwrap_or_else(slates_ipc::instance_from_env)
+  }
+
+  /// Whether `--json` was given: a global switch (like `--instance`) allowed on any client verb.
+  fn json(&self) -> bool {
+    self.switch("--json")
   }
 }
 
@@ -553,6 +567,7 @@ fn client(taken: &Taken, verb: Verb) -> Command {
   Command::Client(ClientRequest {
     instance: taken.instance(),
     verb,
+    json: taken.json(),
   })
 }
 

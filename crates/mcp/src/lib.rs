@@ -601,8 +601,9 @@ fn size_arg(args: &Value) -> SizeClass {
   }
 }
 
-/// A volume summary as JSON.
-fn summary_json(v: &VolumeSummary) -> Value {
+/// A volume summary as JSON. Public so the CLI's `--json` emits the same schema as the MCP surface
+/// (§4.12 schema parity — one definition, two surfaces).
+pub fn summary_json(v: &VolumeSummary) -> Value {
   json!({
     "id": id_hex(v.id),
     "name": v.name,
@@ -612,8 +613,9 @@ fn summary_json(v: &VolumeSummary) -> Value {
   })
 }
 
-/// A volume status report as JSON.
-fn status_json(r: &StatusReport) -> Value {
+/// A volume status report as JSON. Public so the CLI's `--json` emits the same schema as the MCP
+/// surface (§4.12 schema parity — one definition, two surfaces).
+pub fn status_json(r: &StatusReport) -> Value {
   json!({
     "id": id_hex(r.id),
     "name": r.name,
@@ -625,6 +627,7 @@ fn status_json(r: &StatusReport) -> Value {
     "snapshots": r.snapshots,
     "watcher": r.watcher,
     "drifted": r.drifted,
+    "nfs_port": r.nfs_port,
     "placed": {
       "region": r.placed.region,
       "host_epoch": r.placed.host_epoch,
@@ -695,8 +698,9 @@ fn hex32(bytes: &[u8; 32]) -> String {
   bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The daemon's status as JSON (the top-level counters and the shard count).
-fn daemon_json(r: &DaemonReport) -> Value {
+/// The daemon's status as JSON (the top-level counters and the shard count). Public so the CLI's
+/// `--json` emits the same schema as the MCP surface (§4.12 schema parity).
+pub fn daemon_json(r: &DaemonReport) -> Value {
   json!({
     "pid": r.pid,
     "generation": r.generation,

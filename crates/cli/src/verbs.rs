@@ -47,7 +47,7 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
     println!("mounted: {mounted}");
     return Ok(());
   }
-  let outcome = serve(&mut client, &request.verb);
+  let outcome = serve(&mut client, &request.verb, request.json);
   outcome.map_err(|e| failure_of(e, &request.instance))
 }
 
@@ -162,7 +162,53 @@ fn print_windows(windows: &[slates_ipc::protocol::MergeWindow]) {
   }
 }
 
-fn serve(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
+/// `volume list`: every volume, one per line, or a JSON array (the MCP `summary_json` schema).
+fn emit_list(client: &mut Client, json: bool) -> Result<(), ClientError> {
+  let volumes = client.list()?;
+  if json {
+    let array = serde_json::Value::Array(volumes.iter().map(slates_mcp::summary_json).collect());
+    println!("{array}");
+  } else {
+    for volume in &volumes {
+      println!("{}", summary_line(volume));
+    }
+  }
+  Ok(())
+}
+
+/// `status` (no volume): the daemon's status as text, or JSON (the MCP `daemon_json` schema).
+fn emit_daemon_status(client: &mut Client, json: bool) -> Result<(), ClientError> {
+  let report = client.daemon_status()?;
+  if json {
+    println!("{}", slates_mcp::daemon_json(&report));
+  } else {
+    print!("{}", daemon_status_text(&report));
+  }
+  Ok(())
+}
+
+/// `status ID` / `volume stat ID`: the report as text, its drifted paths (`--drift`), or the whole
+/// report as JSON (the MCP `status_json` schema; `--drift` narrows only the text form).
+fn emit_status(
+  client: &mut Client,
+  volume: slates_client::VolumeId,
+  drift: bool,
+  json: bool,
+) -> Result<(), ClientError> {
+  let report = client.status(volume)?;
+  if json {
+    println!("{}", slates_mcp::status_json(&report));
+  } else if drift {
+    for path in &report.drifted {
+      println!("{path}");
+    }
+  } else {
+    print!("{}", status_text(&report));
+  }
+  Ok(())
+}
+
+fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError> {
   match verb {
     Verb::Create {
       name,
@@ -181,24 +227,9 @@ fn serve(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
       println!("id: {}", volume_id_text(id));
       println!("path: (none until a bridge exists)");
     }
-    Verb::List => {
-      for volume in client.list()? {
-        println!("{}", summary_line(&volume));
-      }
-    }
-    Verb::DaemonStatus => {
-      print!("{}", daemon_status_text(&client.daemon_status()?));
-    }
-    Verb::Status { volume, drift } => {
-      let report = client.status(*volume)?;
-      if *drift {
-        for path in &report.drifted {
-          println!("{path}");
-        }
-      } else {
-        print!("{}", status_text(&report));
-      }
-    }
+    Verb::List => emit_list(client, json)?,
+    Verb::DaemonStatus => emit_daemon_status(client, json)?,
+    Verb::Status { volume, drift } => emit_status(client, *volume, *drift, json)?,
     // `mount`/`unmount` run `mount_nfs`/`umount` (CLI/OS operations whose failure is a `Failure`, not a
     // `ClientError`), so [`run`] handles them before this dispatch; they never reach here.
     Verb::Mount { .. } | Verb::Unmount { .. } => {}
