@@ -24,6 +24,7 @@ pub mod daemon;
 pub mod doorbell;
 pub mod error;
 pub mod landing;
+pub mod nfs;
 pub mod peer;
 pub mod state;
 pub mod verbs;

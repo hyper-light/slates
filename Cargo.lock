@@ -1354,6 +1354,8 @@ dependencies = [
  "rustix",
  "slates-anchor",
  "slates-base",
+ "slates-bridge-core",
+ "slates-bridge-nfs",
  "slates-db",
  "slates-ipc",
  "slates-land",

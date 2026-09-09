@@ -15,6 +15,7 @@ use slates_mem::region::Region;
 use slates_mem::{Handoff, Slab};
 use slates_rt::control::Control;
 use slates_rt::task::SpawnRequest;
+use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
 use slates_rt::{Runtime, ShardId, futures, registry};
 use slates_vfs::clock::HostClock;
 use slates_vfs::volume::{Store, StoreConfig};
@@ -61,6 +62,9 @@ pub struct Daemon {
   doorbell: Option<DoorbellThread>,
   config: DaemonConfig,
   shards: Vec<ShardId>,
+  /// The loopback port the NFS transport (§4.6) listens on, when it is serving; `None` if the
+  /// listener could not be bound. A client mounts `nfs://localhost:PORT`.
+  nfs_port: Option<u16>,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -74,6 +78,9 @@ impl std::fmt::Debug for Daemon {
 
 /// Set by the doorbell thread each time it kicks; the control task's poller reads it.
 static DOORBELL_RANG: AtomicBool = AtomicBool::new(false);
+/// Shape: pending NFS connections the kernel queues before the accept loop takes them. A mount opens a
+/// small, bounded number of connections; the OS clamps the backlog to the system maximum anyway.
+const NFS_BACKLOG: i32 = 16;
 /// Shards whose initialization refused (a health signal; the daemon serves the rest).
 pub static INIT_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Clients handed to a shard that had no state to take them (a health signal).
@@ -165,13 +172,38 @@ impl Daemon {
       )
       .await;
     })?;
+    // The NFS transport (§4.6): one loopback listener served on the control shard, reaching the
+    // volumes on that shard — every volume on a single-shard daemon (R8); the cross-shard bridge queue
+    // for volumes on other shards is owed. The listener binds here (a syscall, no shard needed) so the
+    // port is known before the serve task moves it onto the shard.
+    let nfs_port = match TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), NFS_BACKLOG) {
+      Ok(nfs_listener) => {
+        let port = nfs_listener.local_addr().ok().map(|addr| addr.port());
+        if let Some(port) = port {
+          runtime.spawn_on(control, async move {
+            if let Ok(task) = futures::spawn(crate::nfs::serve(nfs_listener, port)) {
+              let _ = futures::detach(task);
+            }
+          })?;
+        }
+        port
+      }
+      Err(_) => None,
+    };
     Ok(Daemon {
       runtime: Some(runtime),
       segment,
       doorbell: Some(doorbell),
       config,
       shards,
+      nfs_port,
     })
+  }
+
+  /// The loopback port the NFS transport (§4.6) is serving on, if the listener bound; a client mounts
+  /// `nfs://localhost:PORT` to reach this daemon's volumes (those on its accepting shard, R8).
+  pub fn nfs_port(&self) -> Option<u16> {
+    self.nfs_port
   }
 
   /// The configuration.

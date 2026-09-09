@@ -20,6 +20,8 @@ slates-db = { workspace = true }
 slates-ipc = { workspace = true }
 slates-land = { workspace = true }
 slates-merge = { workspace = true }
+slates-bridge-core = { workspace = true }
+slates-bridge-nfs = { workspace = true }
 blake3 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
