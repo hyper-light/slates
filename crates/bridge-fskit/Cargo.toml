@@ -8,9 +8,23 @@ rust-version.workspace = true
 readme.workspace = true
 description = "The macOS FSKit bridge (FSKit-first on macOS 26+, Amendment A-1/D-O9): the shim wire codec that the Swift FSVolume handler forwards its operations over (the app-group-shared ring), decoded and dispatched onto the one `Bridge` operation seam (§4.6, D-2; Phase 4). The Swift shim, the Slates.app bundle + FSKit entitlement, and the mount spike are the platform half; this is the pure, host-confirmable Rust half — built first, exactly as the NFS codec was."
 
+# The library is also built as a `cdylib` for the `test-harness` feature: the in-process transport
+# harness (`src/ffi.rs`) exposes a C ABI over `serve` that the Swift FSVolume handler links against to
+# drive the real `Bridge` in one process (§4.6, R5). Without the feature the cdylib carries no exports.
+[lib]
+crate-type = ["lib", "cdylib"]
+
 [dependencies]
 slates-bridge-core = { workspace = true }
 slates-vfs = { workspace = true }
+# Enabled only by `test-harness`, to build a scratch volume for the in-process FFI harness.
+slates-db = { workspace = true, optional = true }
+slates-mem = { workspace = true, optional = true }
+
+[features]
+# The in-process transport harness (`src/ffi.rs`): a C ABI over `serve` plus the store/volume it runs
+# against, for the Swift handler's end-to-end by-use test. Off in the shipped crate.
+test-harness = ["dep:slates-db", "dep:slates-mem"]
 
 [lints]
 workspace = true

@@ -96,9 +96,12 @@ slates-sdk-python = 0
 # slates-sdk-node (0): the napi-rs bindings are safe Rust over the typed client; the FFI unsafety lives
 # in napi's macro-generated code, not this crate's own source (which has no `unsafe` block).
 slates-sdk-node = 0
-# slates-bridge-fskit (0): the FSKit shim wire codec is bounds-checked byte slices and dispatch onto
-# the Bridge trait — safe Rust, exactly like the NFS codec; the platform half (the Swift shim) is owed.
-slates-bridge-fskit = 0
+# slates-bridge-fskit (9): the FSKit shim wire codec is safe Rust (bounds-checked byte slices onto the
+# Bridge trait, exactly like the NFS codec). The 9 sites are all in `src/ffi.rs`, the `test-harness`
+# in-process transport (§4.6): two `extern "C"` entries and the raw-pointer handling they need to hand
+# the Swift FSVolume handler a C ABI over `serve` — sanctioned FFI unsafe, each block with a SAFETY
+# note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
+slates-bridge-fskit = 9
 # slates-bridge-winfsp (0): the host-buildable half is the pure VfsError->NTSTATUS refusal taxonomy —
 # safe Rust; the winfsp-rs FFI and the FSP_FSCTL_TRANSACT marshalling are the Windows half, owed.
 slates-bridge-winfsp = 0

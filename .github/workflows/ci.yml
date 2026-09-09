@@ -83,6 +83,27 @@ jobs:
           else
             echo "SKIP (loud): FSKit is not in this runner's SDK (needs macOS 15.4+); handler tests skipped."
           fi
+      # The in-process transport (§4.6): the `test-harness` cdylib exposes a C ABI over `serve`, and
+      # InProcessTest.swift links it to drive the real handler through serve() over a real VolumeBridge
+      # on a real scratch volume — the whole handler↔codec↔bridge stack end to end in one process, no
+      # ring and no mount. This is the one link the Rust `serve` tests and the Swift mock tests each
+      # cover only half of. The production transport form (this in-process form vs forwarding over the
+      # app-group ring) and the live mount remain the spike's (docs/wip/GAPS.md §4.6).
+      - name: FSKit in-process transport end-to-end test (macOS 15.4+)
+        if: runner.os == 'macOS'
+        run: |
+          if echo 'import FSKit' | swiftc -typecheck - 2>/dev/null; then
+            cargo build -p slates-bridge-fskit --features test-harness
+            swiftc \
+              crates/bridge-fskit/swift/ShimWire.swift \
+              crates/bridge-fskit/swift/SlatesVolume.swift \
+              crates/bridge-fskit/swift/InProcessTest.swift \
+              -framework FSKit -L target/debug -lslates_bridge_fskit \
+              -o "$RUNNER_TEMP/inprocess"
+            DYLD_LIBRARY_PATH=target/debug "$RUNNER_TEMP/inprocess"
+          else
+            echo "SKIP (loud): FSKit is not in this runner's SDK (needs macOS 15.4+); in-process test skipped."
+          fi
       # T-1.17: the 10k-entry delta into a 10^6-entry tree against cp -r; informational on a
       # shared runner (no ratchet baseline), the numbers land in the job log.
       - name: Landing bench over tmpfs (Linux)

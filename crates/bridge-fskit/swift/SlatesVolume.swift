@@ -10,9 +10,12 @@
 // conforms to `FSUnaryFileSystemOperations` and the `FSVolume` operation protocols against the
 // real framework on this machine (macOS 26, FSKit availability macOS 15.4+). Two things are the
 // Phase 4 mount spike, gated deliberately and marked below with `SPIKE:`:
-//   1. the ring transport — the handler is written against the `ShimChannel` seam; the real
-//      app-group shared-memory ring to the daemon is dropped in at the spike, where a live mount
-//      exercises the FSItem lifecycle end to end; and
+//   1. the production transport to the daemon's real volumes — the handler is written against the
+//      `ShimChannel` seam. The in-process form of that seam already exists as a verification harness
+//      (the `test-harness` cdylib's C ABI over `serve`, driven by InProcessTest.swift over a real
+//      VolumeBridge), so the whole stack is proven end to end here; which form the shipped extension
+//      uses to reach the daemon's real volumes — this in-process form or forwarding over the app-group
+//      ring — is the spike's measured choice, and the app-group binding needs the signed bundle; and
 //   2. whether FSKit pairs openItem/closeItem one-to-one under mode coalescing — the one behavior only
 //      a mount reveals. The handler's own accounting is already correct for however many calls arrive
 //      (a per-inode handle stack, one daemon reference held and dropped per call). The earlier

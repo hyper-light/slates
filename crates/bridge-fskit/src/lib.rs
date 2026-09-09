@@ -21,6 +21,11 @@
 //! (this crate is the message codec, not the ring), and the Swift `FSVolume` shim (with the
 //! `Slates.app` bundle, the FSKit entitlement, and the mount spike).
 
+// The in-process transport harness (a C ABI over `serve` for the Swift handler's end-to-end test),
+// built only under the `test-harness` feature; the shipped crate does not include it.
+#[cfg(feature = "test-harness")]
+pub mod ffi;
+
 use slates_bridge_core::{Bridge, DirEntry, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
