@@ -30,10 +30,14 @@
 //! name routes to the name's owning partition ([`route_by_name`] over `owner_of_name` — the same
 //! partition the create routed to and the id encodes, so a name reaches its volume with no global
 //! index, D-14) where the owner shard resolves it against its own slots (`MultiExport` matches the
-//! name in `entries`). The root-listing gather fans out to the shards in parallel. Owed here (minor,
-//! situational refinements): the anchor-held listener for restart survival (the daemon binds it now;
-//! §4.6 line 509); and the attribute-cache timeout from the measured loopback GETATTR RTT. The §4.6
-//! differential oracle (line 1368) is *not* owed here: it
+//! name in `entries`). The root-listing gather fans out to the shards in parallel. The **listener
+//! survives a daemon restart** (§4.6): a supervising anchor holds it and hands its descriptor over in
+//! the environment, and the daemon adopts it (`crate::daemon`'s `nfs_listener` over
+//! `slates_rt::tcp::TcpListener::from_fd` and `slates_anchor::ENV_NFS_LISTENER`) rather than binding a
+//! fresh ephemeral one, so the loopback
+//! port is stable across restarts; a standalone daemon (tests) still binds its own. Owed here (one
+//! minor, situational refinement): the attribute-cache timeout from the measured loopback GETATTR RTT.
+//! The §4.6 differential oracle (line 1368) is *not* owed here: it
 //! mounts the same volume via FSKit *and* via NFS and compares the abstract states — two real
 //! kernel mounts — so it is gated on the FSKit mount, hence on the Apple Developer entitlement that
 //! item (1) needs and this sandbox cannot hold. A synthetic FUSE-dispatch-vs-NFS-dispatch stand-in

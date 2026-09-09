@@ -28,4 +28,4 @@ pub mod supervise;
 pub use error::AnchorError;
 pub use layout::{Geometry, RegionKind, RegionSpec};
 pub use segment::{AnchorSegment, Supervision};
-pub use supervise::{RestartPolicy, Step, Supervisor};
+pub use supervise::{ENV_NFS_LISTENER, RestartPolicy, Step, Supervisor};

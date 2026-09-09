@@ -16,5 +16,11 @@ slates-wire = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
+# The NFS-listener-inheritance test binds a listener and checks the supervised child inherited it
+# (Unix only; NFS is the macOS/Linux bridge).
+[target.'cfg(unix)'.dev-dependencies]
+slates-rt = { workspace = true }
+rustix = { workspace = true }
+
 [lints]
 workspace = true

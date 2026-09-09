@@ -3,8 +3,12 @@
 //! profile, start the doorbell thread, and run the control shard's rendezvous; stop in
 //! reverse, joining everything the daemon started.
 
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(unix)]
+use slates_anchor::ENV_NFS_LISTENER;
 use slates_anchor::{AnchorSegment, RegionKind};
 use slates_db::catalog::Principal;
 use slates_ipc::{ClientRegion, Listener, Prepared};
@@ -16,7 +20,7 @@ use slates_mem::{Handoff, Slab};
 use slates_rt::control::Control;
 use slates_rt::task::SpawnRequest;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
-use slates_rt::{Runtime, ShardId, futures, registry};
+use slates_rt::{RtError, Runtime, ShardId, futures, registry};
 use slates_vfs::clock::HostClock;
 use slates_vfs::volume::{Store, StoreConfig};
 
@@ -81,6 +85,26 @@ static DOORBELL_RANG: AtomicBool = AtomicBool::new(false);
 /// Shape: pending NFS connections the kernel queues before the accept loop takes them. A mount opens a
 /// small, bounded number of connections; the OS clamps the backlog to the system maximum anyway.
 const NFS_BACKLOG: i32 = 16;
+
+/// The NFS loopback listener to serve: on Unix, the one a supervising anchor holds and hands over in
+/// the environment ([`slates_anchor::ENV_NFS_LISTENER`]), so its port survives a daemon restart (§4.6)
+/// — adopted here; failing that (a standalone start, tests, or Windows, where NFS is not the bridge) a
+/// fresh ephemeral bind. Adopting the anchor's descriptor is the only path that keeps the port stable
+/// across restarts.
+fn nfs_listener() -> Result<TcpListener, RtError> {
+  #[cfg(unix)]
+  if let Some(raw) = std::env::var(ENV_NFS_LISTENER)
+    .ok()
+    .and_then(|value| value.parse::<RawFd>().ok())
+  {
+    // SAFETY: the anchor bound this listening socket and handed its descriptor to us across the spawn,
+    // inherited at this number; ownership is ours now (the anchor keeps its own copy), so wrapping it
+    // in an `OwnedFd` gives it a single owner that closes it on drop.
+    let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+    return TcpListener::from_fd(owned);
+  }
+  TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), NFS_BACKLOG)
+}
 /// Shards whose initialization refused (a health signal; the daemon serves the rest).
 pub static INIT_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Clients handed to a shard that had no state to take them (a health signal).
@@ -172,11 +196,12 @@ impl Daemon {
       )
       .await;
     })?;
-    // The NFS transport (§4.6): one loopback listener served on the control shard, reaching the
-    // volumes on that shard — every volume on a single-shard daemon (R8); the cross-shard bridge queue
-    // for volumes on other shards is owed. The listener binds here (a syscall, no shard needed) so the
-    // port is known before the serve task moves it onto the shard.
-    let nfs_port = match TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), NFS_BACKLOG) {
+    // The NFS transport (§4.6): one loopback listener served on the control shard. A supervising
+    // anchor holds the listener and hands its descriptor over in the environment, so its port survives
+    // a daemon restart (Unix); the daemon adopts that when present, or binds a fresh ephemeral one when
+    // it runs standalone (tests). Either way the port is known here, before the serve task moves the
+    // listener onto the shard, and the cross-shard bridge queue reaches volumes on other shards.
+    let nfs_port = match nfs_listener() {
       Ok(nfs_listener) => {
         let port = nfs_listener.local_addr().ok().map(|addr| addr.port());
         if let Some(port) = port {

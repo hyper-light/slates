@@ -29,6 +29,10 @@ const POLL_US: u64 = 500;
 const BEATS: u64 = 5;
 /// Shape: the child's exit code.
 const EXIT: i32 = 3;
+/// Format: the environment variable carrying the port the NFS-listener-inheritance child expects the
+/// descriptor it inherited to be bound to, and turning this binary into that child.
+#[cfg(unix)]
+const CHILD_NFS_PORT: &str = "SLATES_ANCHOR_TEST_NFS_PORT";
 
 fn identity() -> Identity {
   Identity {
@@ -184,6 +188,106 @@ fn supervised_child() {
     supervision.beat(n);
   }
   std::process::exit(exit);
+}
+
+/// The NFS-listener-inheritance child (§4.6): it verifies it inherited the anchor's held listener
+/// descriptor across the spawn — reads [`CHILD_NFS_PORT`] (its role signal) and `ENV_NFS_LISTENER`,
+/// and exits 0 if that descriptor is a bound listening socket at the expected port, 1 otherwise.
+/// Ignored like `supervised_child`, and run by the parent with `--ignored --exact`.
+#[cfg(unix)]
+#[test]
+#[ignore = "the NFS-listener-inheritance child; run by the parent with --ignored"]
+fn nfs_listener_child() {
+  let Ok(expected) = std::env::var(CHILD_NFS_PORT) else {
+    return;
+  };
+  let expected: u16 = expected.parse().unwrap();
+  let raw: i32 = std::env::var(slates_anchor::ENV_NFS_LISTENER)
+    .expect("the anchor handed the listener descriptor over")
+    .parse()
+    .unwrap();
+  // SAFETY: the descriptor was inherited from the anchor across the spawn and named to us in the
+  // environment; borrowing it for one getsockname does not take ownership (the process owns it).
+  let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
+  let port = match rustix::net::getsockname(borrowed) {
+    Ok(name) => match rustix::net::SocketAddr::try_from(name) {
+      Ok(rustix::net::SocketAddr::V4(v4)) => v4.port(),
+      _ => 0,
+    },
+    Err(_) => 0,
+  };
+  std::process::exit(i32::from(port != expected));
+}
+
+/// The daemon inherits the anchor's held NFS listener across the spawn: the parent (the anchor) binds a
+/// listener, holds it, and spawns the supervised child, which finds the same listening socket at the
+/// bound port on the inherited descriptor — the §4.6 mechanism that keeps the loopback port across a
+/// daemon restart. macOS hands the *segment* over by name (not a descriptor), so this is the first
+/// proof here that the descriptor hand-off across `Command` works — the daemon's adoption rests on it.
+#[cfg(unix)]
+#[test]
+fn the_supervised_child_inherits_the_held_nfs_listener() {
+  use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
+  /// Shape: one queued pending connection suffices; nothing connects in this test.
+  const BACKLOG: i32 = 1;
+  let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
+  let port = listener.local_addr().unwrap().port();
+  let fd = listener.into_fd();
+  // Make the descriptor inheritable so the spawned child receives it across the exec.
+  rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()).unwrap();
+
+  let segment = AnchorSegment::create("slates-anchor-test-nfs", &identity(), geometry()).unwrap();
+  let exe = std::env::current_exe()
+    .unwrap()
+    .to_string_lossy()
+    .into_owned();
+  let args = vec![
+    "--ignored".to_owned(),
+    "--exact".to_owned(),
+    "nfs_listener_child".to_owned(),
+    "--nocapture".to_owned(),
+  ];
+  // Shape: a window that holds this test's one start, restart allowed once.
+  let policy = RestartPolicy {
+    window_ns: 60_000_000_000,
+    max_restarts: 1,
+  };
+  let mut supervisor = Supervisor::new(segment, &exe, &args, policy);
+  supervisor.hold_nfs_listener(fd);
+  // SAFETY: the test is single-threaded at this point; the child reads it. The role is chosen by the
+  // child's args, so a parallel test's child ignores this variable.
+  unsafe {
+    std::env::set_var(CHILD_NFS_PORT, port.to_string());
+  }
+  let clock = Instant::now();
+  supervisor.start(now_ns(clock)).unwrap();
+  // Drive until the child exits; it exits 0 iff it inherited the listener at the expected port.
+  let deadline = Duration::from_millis(CHILD_WAIT_MS);
+  let mut outcome = None;
+  while clock.elapsed() < deadline {
+    match supervisor.step(now_ns(clock)).unwrap() {
+      Step::Running => {
+        // The test harness paces the poll; shipped code parks on its driver (D-9).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_micros(POLL_US));
+      }
+      Step::Restarted { exit_code, .. } | Step::CrashLoop { exit_code } => {
+        outcome = Some(exit_code);
+        break;
+      }
+      Step::Stopped => break,
+    }
+  }
+  supervisor.stop().ok();
+  // SAFETY: single-threaded cleanup.
+  unsafe {
+    std::env::remove_var(CHILD_NFS_PORT);
+  }
+  assert_eq!(
+    outcome,
+    Some(Some(0)),
+    "the supervised child inherited the anchor's held listener at the bound port"
+  );
 }
 
 /// Steps the supervisor until the crash loop (or the deadline): restarts inside the window,

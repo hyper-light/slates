@@ -27,6 +27,27 @@ fn observation_pause() -> Duration {
   Duration::from_nanos(HEARTBEAT_NS)
 }
 
+/// Binds the NFS loopback listener the anchor holds across daemon restarts (§4.6) and hands it to
+/// `supervisor`, which passes its descriptor to every daemon it spawns. A bind failure is non-fatal:
+/// the daemon then binds its own ephemeral listener (its port is not stable across a restart, but the
+/// mount still works). Unix only — NFS is the macOS/Linux bridge; Windows uses WinFsp.
+#[cfg(unix)]
+fn hold_nfs_listener(supervisor: &mut Supervisor) {
+  use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
+  /// Shape: pending NFS connections the kernel queues before the accept loop takes them (matched to
+  /// the daemon's own backlog); the OS clamps it to the system maximum anyway.
+  const NFS_BACKLOG: i32 = 16;
+  let Ok(listener) = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), NFS_BACKLOG)
+  else {
+    return;
+  };
+  let fd = listener.into_fd();
+  // Clear close-on-exec so the daemon inherits the descriptor across the spawn (the anchor keeps its
+  // own copy, so the socket outlives any one daemon).
+  let _ = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty());
+  supervisor.hold_nfs_listener(fd);
+}
+
 fn failed(what: &str, e: impl std::fmt::Display) -> Failure {
   Failure::Failed(format!("{what}: {e}"))
 }
@@ -74,6 +95,10 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   // before it ever beat is restarted once.
   let policy = RestartPolicy::derive(RECOVERY_BUDGET_NS, RECOVERY_BUDGET_NS);
   let mut supervisor = Supervisor::new(segment, &exe, &args, policy.get());
+  // Hold the NFS loopback listener in the anchor so its port survives a daemon restart (§4.6): bind
+  // it once and hand it to every daemon the supervisor spawns; the daemon adopts it.
+  #[cfg(unix)]
+  hold_nfs_listener(&mut supervisor);
   let mut clock = HostClock::new();
   let now = clock.monotonic_ns();
   supervisor.start(now).map_err(|e| failed("start", e))?;

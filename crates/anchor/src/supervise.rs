@@ -10,6 +10,8 @@
 //! control channel.
 
 use std::collections::VecDeque;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::process::{Child, Command};
 
 use slates_machine::{Derived, derived};
@@ -21,6 +23,13 @@ use crate::segment::AnchorSegment;
 /// daemon can watch its supervisor and leave with it (a daemon outliving a dead anchor would
 /// hold a segment nobody supervises).
 pub const ENV_ANCHOR_PID: &str = "SLATES_ANCHOR_PID";
+
+/// Format: the environment variable carrying the descriptor of the NFS loopback listener the anchor
+/// holds (§4.6, "One TCP loopback listener held by the anchor"), inherited by the daemon across the
+/// spawn so its loopback port is stable across a restart — a live mount survives it. Set only when the
+/// anchor holds a listener (a Unix concern: NFS is the macOS/Linux bridge, Windows uses WinFsp), and a
+/// daemon without it binds its own. The daemon adopts it through `slates_rt::tcp::TcpListener::from_fd`.
+pub const ENV_NFS_LISTENER: &str = "SLATES_ANCHOR_NFS";
 
 /// The restart policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +92,14 @@ pub struct Supervisor {
   /// that kills its processes when its last handle closes; Linux: the daemon asks for the
   /// parent-death signal itself; macOS: the daemon watches its parent's id).
   lifetime: lifetime::Tie,
+  /// The NFS loopback listener the anchor holds, if any (§4.6): a bound, listening socket whose
+  /// descriptor is handed to each daemon it spawns (via [`ENV_NFS_LISTENER`], inherited across the
+  /// spawn) so the loopback port survives a restart. The anchor owns it for its whole life, past any
+  /// one daemon; the descriptor must be inheritable (not close-on-exec) — the caller clears that
+  /// before [`Supervisor::hold_nfs_listener`]. Unix only: NFS is the macOS/Linux bridge (Windows uses
+  /// WinFsp), and the descriptor type is Unix's.
+  #[cfg(unix)]
+  nfs_listener: Option<OwnedFd>,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -112,7 +129,18 @@ impl Supervisor {
       restarts_at_ns: VecDeque::new(),
       crash_loop: false,
       lifetime: lifetime::Tie::new(),
+      #[cfg(unix)]
+      nfs_listener: None,
     }
+  }
+
+  /// Holds `fd` — a bound, listening loopback socket — as the NFS listener handed to every daemon this
+  /// supervisor spawns, so its port is stable across restarts (§4.6). The descriptor must be
+  /// inheritable (the caller clears close-on-exec, since it is passed to the daemon across the spawn);
+  /// the supervisor owns it for its life, past any one daemon.
+  #[cfg(unix)]
+  pub fn hold_nfs_listener(&mut self, fd: OwnedFd) {
+    self.nfs_listener = Some(fd);
   }
 
   /// Replaces the policy (the anchor re-derives it as daemon starts are measured).
@@ -137,6 +165,12 @@ impl Supervisor {
     }
     let mut env = self.segment.handoff_env()?;
     env.push((ENV_ANCHOR_PID.to_owned(), std::process::id().to_string()));
+    // Hand the held NFS listener's descriptor over: it is inheritable (not close-on-exec), so the
+    // spawned daemon inherits it at the same number and adopts it, keeping the loopback port (§4.6).
+    #[cfg(unix)]
+    if let Some(fd) = &self.nfs_listener {
+      env.push((ENV_NFS_LISTENER.to_owned(), fd.as_raw_fd().to_string()));
+    }
     let child = Command::new(&self.program)
       .args(&self.args)
       .envs(env)
