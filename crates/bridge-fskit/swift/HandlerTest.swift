@@ -131,6 +131,69 @@ private func testLookupNotFoundSurfacesError() {
   check(error != nil, "a NotFound lookup returns an error")
 }
 
+// createItem routes a directory to OP_MKDIR (op 9) and everything else to OP_CREATE (op 8) — the
+// type branch, checked by the op byte the daemon receives.
+private func testCreateItemBranchesOnType() {
+  let dir = SlatesItem(object: ObjectId(inode: 1, generation: 0), kind: 1)
+
+  let fileChannel = MockChannel(replies: [okAttr(ino: 2, kind: 0)])
+  let fileVolume = makeVolume(fileChannel)
+  fileVolume.createItem(
+    named: FSFileName(string: "f"), type: .file, inDirectory: dir,
+    attributes: FSItem.SetAttributesRequest()
+  ) { _, _, _ in }
+  check(opOf(fileChannel.requests[0]) == 8, "creating a file sends OP_CREATE")
+
+  let dirChannel = MockChannel(replies: [okAttr(ino: 3, kind: 1)])
+  let dirVolume = makeVolume(dirChannel)
+  dirVolume.createItem(
+    named: FSFileName(string: "d"), type: .directory, inDirectory: dir,
+    attributes: FSItem.SetAttributesRequest()
+  ) { _, _, _ in }
+  check(opOf(dirChannel.requests[0]) == 9, "creating a directory sends OP_MKDIR")
+}
+
+// removeItem routes a directory item to OP_RMDIR (op 11) and a file to OP_UNLINK (op 10) — the branch
+// on the item's own kind, so no extra round trip is needed to decide.
+private func testRemoveItemBranchesOnKind() {
+  let dir = SlatesItem(object: ObjectId(inode: 1, generation: 0), kind: 1)
+
+  let fileChannel = MockChannel(replies: [okUnit()])
+  let fileVolume = makeVolume(fileChannel)
+  let file = SlatesItem(object: ObjectId(inode: 2, generation: 0), kind: 0)
+  fileVolume.removeItem(file, named: FSFileName(string: "f"), fromDirectory: dir) { _ in }
+  check(opOf(fileChannel.requests[0]) == 10, "removing a file sends OP_UNLINK")
+
+  let dirChannel = MockChannel(replies: [okUnit()])
+  let dirVolume = makeVolume(dirChannel)
+  let subdir = SlatesItem(object: ObjectId(inode: 3, generation: 0), kind: 1)
+  dirVolume.removeItem(subdir, named: FSFileName(string: "d"), fromDirectory: dir) { _ in }
+  check(opOf(dirChannel.requests[0]) == 11, "removing a directory sends OP_RMDIR")
+}
+
+// getAttributes turns the daemon's attribute reply into an FSItem.Attributes with the same mode and
+// size — the read side of the metadata path.
+private func testGetAttributesMapsTheReply() {
+  let channel = MockChannel(replies: [okAttr(ino: 5, kind: 0, mode: 0o600, size: 100)])
+  let volume = makeVolume(channel)
+  let item = SlatesItem(object: ObjectId(inode: 5, generation: 0), kind: 0)
+  var attrs: FSItem.Attributes?
+  volume.getAttributes(FSItem.GetAttributesRequest(), of: item) { a, _ in attrs = a }
+  check((attrs?.mode ?? 0) & 0o777 == 0o600, "getAttributes carries the mode through")
+  check(attrs?.size == 100, "getAttributes carries the size through")
+}
+
+// write hands the daemon the bytes and reports the count it stored back to FSKit.
+private func testWriteReportsTheCount() {
+  let channel = MockChannel(replies: [{ var out: [UInt8] = [0]; le32(5, &out); return out }()])
+  let volume = makeVolume(channel)
+  let item = SlatesItem(object: ObjectId(inode: 5, generation: 0), kind: 0)
+  var written = -1
+  volume.write(contents: Data([1, 2, 3, 4, 5]), to: item, at: 0) { count, _ in written = count }
+  check(opOf(channel.requests[0]) == 4, "write sends OP_WRITE")
+  check(written == 5, "write reports the stored byte count")
+}
+
 @main
 struct HandlerTest {
   static func main() {
@@ -138,6 +201,10 @@ struct HandlerTest {
     testCloseWithoutOpenIsANoOp()
     testLookupBuildsTheItem()
     testLookupNotFoundSurfacesError()
+    testCreateItemBranchesOnType()
+    testRemoveItemBranchesOnKind()
+    testGetAttributesMapsTheReply()
+    testWriteReportsTheCount()
     print(failures == 0 ? "ALL PASS" : "\(failures) FAILURES")
     exit(failures == 0 ? 0 : 1)
   }
