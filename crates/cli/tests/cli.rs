@@ -230,6 +230,140 @@ fn the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_th
   kill_anchor_and_wait_for_the_daemon_to_leave(&instance, anchor);
 }
 
+/// A live kernel mount point for the duration of a test: force-unmounted and removed when dropped,
+/// so a failed assertion never leaves a mount or a temp directory behind (the `AnchorProcess`
+/// discipline, applied to the mount). Both teardown steps are best-effort — a still-mounted path or
+/// a leftover directory on a panicking test is worse than a swallowed `umount`/`rmdir` error.
+struct MountPoint {
+  path: String,
+}
+
+impl Drop for MountPoint {
+  fn drop(&mut self) {
+    let _ = Command::new("umount").arg(&self.path).output();
+    let _ = Command::new("rmdir").arg(&self.path).output();
+  }
+}
+
+/// A fresh, user-owned mount-point directory (`mktemp -d`), resolved to its real path so it matches
+/// what the kernel records in the mount table (`/var/folders/...` is a symlink to `/private/var/...`
+/// on macOS). `std::fs::canonicalize` is a read, not a write, so it is outside the R1 wall; the
+/// directory itself is made by `mktemp`, not `std::fs::create_dir`.
+fn fresh_mount_point() -> String {
+  let out = Command::new("mktemp").arg("-d").output().unwrap();
+  assert!(out.status.success(), "mktemp -d");
+  let raw = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+  std::fs::canonicalize(&raw)
+    .unwrap()
+    .to_string_lossy()
+    .into_owned()
+}
+
+/// Whether `mount_nfs` — the mechanism `slates mount` drives — is on this host. It is macOS and the
+/// BSDs; on Linux the loopback mount is a different tool, so the live-mount flow skips there.
+fn mount_nfs_available() -> bool {
+  Command::new("sh")
+    .args(["-c", "command -v mount_nfs"])
+    .output()
+    .map(|o| o.status.success())
+    .unwrap_or(false)
+}
+
+/// Whether the mount table lists a mount at `path`.
+fn is_mounted(path: &str) -> bool {
+  let out = Command::new("mount").output().unwrap();
+  String::from_utf8_lossy(&out.stdout)
+    .lines()
+    .any(|line| line.contains(path))
+}
+
+/// `slates mount ID DIR` reports the path and the kernel mount table lists a real NFS mount there.
+fn mount_and_check(instance: &str, id: &str, path: &str) {
+  let (code, out, err) = run(instance, &["mount", id, path]);
+  assert_eq!(code, 0, "slates mount failed: {err}");
+  assert_eq!(
+    value_of(&out, "mounted"),
+    path,
+    "the command reports the path it mounted"
+  );
+  assert!(is_mounted(path), "the kernel mount table lists the mount");
+}
+
+/// A file written through the mount reads back byte for byte — the bytes travel host write → NFS →
+/// the slates volume → NFS → host read. The write side avoids `std::fs` (R1) through the shell; the
+/// read side is a separate `cat` process, a fresh READ across the mount rather than a page-cache echo.
+fn roundtrip_a_file_through(path: &str) {
+  let payload = "written through a real slates kernel mount";
+  let file = format!("{path}/roundtrip.txt");
+  let wrote = Command::new("sh")
+    .arg("-c")
+    .arg(format!("printf '%s' '{payload}' > '{file}'"))
+    .output()
+    .unwrap();
+  assert!(
+    wrote.status.success(),
+    "write through the mount: {}",
+    String::from_utf8_lossy(&wrote.stderr)
+  );
+  let readback = Command::new("cat").arg(&file).output().unwrap();
+  assert_eq!(
+    String::from_utf8_lossy(&readback.stdout),
+    payload,
+    "the bytes written through the mount read back byte for byte"
+  );
+}
+
+/// `slates unmount DIR` removes the mount (a pure `umount`, no daemon needed).
+fn unmount_and_check(instance: &str, path: &str) {
+  let (code, _out, err) = run(instance, &["unmount", path]);
+  assert_eq!(code, 0, "slates unmount failed: {err}");
+  assert!(
+    !is_mounted(path),
+    "the kernel mount table no longer lists it"
+  );
+}
+
+/// `slates mount ID DIR` establishes a real kernel NFS mount of a provisioned volume with no
+/// privilege (§4.6, R10; `noresvport`), a file written through the mount reads back byte for byte,
+/// and `slates unmount DIR` removes it — the whole command flow through the real binary against a
+/// real anchor-supervised daemon (R5: drive the CLI, assert observable behaviour). Gated like the
+/// anchor+daemon flow above: it performs a real kernel mount (a system-state change), so it runs only
+/// under `SLATES_TEST_CLI=1` and skips loudly where `mount_nfs` is absent, keeping the default
+/// `cargo test` green and hermetic.
+#[test]
+fn slates_mount_establishes_a_real_kernel_mount_and_unmount_removes_it() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the live mount flow: set SLATES_TEST_CLI=1 to run it (it performs a real kernel        mount_nfs and needs the machine to itself)"
+    );
+    return;
+  }
+  if !mount_nfs_available() {
+    eprintln!("skipping the live mount flow: mount_nfs is not on this host (macOS/BSD only)");
+    return;
+  }
+  let instance = format!("cli-mnt-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "mounted", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+
+  // The guard tears the mount and the directory down even if a helper below panics.
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  mount_and_check(&instance, &id, &mount_point.path);
+  roundtrip_a_file_through(&mount_point.path);
+  unmount_and_check(&instance, &mount_point.path);
+
+  drop(mount_point);
+  drop(anchor);
+}
+
 /// `slates profile --quick` prints the derived constants; `slates` alone prints the usage.
 #[test]
 fn the_profile_and_the_usage_print() {
