@@ -186,6 +186,47 @@ impl Client {
     Ok(dict.into())
   }
 
+  /// Lists the daemon's volumes (§4.4) as a list of dicts — each with its `id` (hex), `name`, the byte
+  /// accounting (`referenced_bytes`, `unique_bytes`), and whether it is an `overlay` of a host directory.
+  /// The plain shape `slates list` prints, one dict per volume.
+  fn list(&mut self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+    let volumes = self.inner.list().map_err(refusal)?;
+    let mut out = Vec::with_capacity(volumes.len());
+    for volume in volumes {
+      let dict = PyDict::new_bound(py);
+      dict.set_item("id", volume_hex(&volume.id))?;
+      dict.set_item("name", volume.name)?;
+      dict.set_item("referenced_bytes", volume.referenced_bytes)?;
+      dict.set_item("unique_bytes", volume.unique_bytes)?;
+      dict.set_item("overlay", volume.overlay)?;
+      out.push(dict.into());
+    }
+    Ok(out)
+  }
+
+  /// Resizes the volume's quota (§4.4): `size_bytes` is the new `Bounded` reserve, or the new maximum of
+  /// a `Dynamic` volume when `dynamic` is set. A refusal (a shrink below what is referenced, a class the
+  /// volume does not hold) crosses as [`SlatesError`].
+  #[pyo3(signature = (volume, size_bytes, dynamic=false))]
+  fn resize(&mut self, volume: &str, size_bytes: u64, dynamic: bool) -> PyResult<()> {
+    let id = parse_volume(volume)?;
+    let size = if dynamic {
+      SizeClass::Dynamic { max: size_bytes }
+    } else {
+      SizeClass::Bounded { limit: size_bytes }
+    };
+    self.inner.resize(id, size).map_err(refusal)?;
+    Ok(())
+  }
+
+  /// Destroys the volume (§4.4): its RAM is reclaimed and its id retired. Idempotent verbs do not exist
+  /// here — destroying a missing volume is a typed [`SlatesError`], not a silent success.
+  fn destroy(&mut self, volume: &str) -> PyResult<()> {
+    let id = parse_volume(volume)?;
+    self.inner.destroy(id).map_err(refusal)?;
+    Ok(())
+  }
+
   /// How many times this client has reconnected across daemon restarts (an observability counter, so a
   /// test can assert a session survived a restart — §4.9).
   fn reconnects(&self) -> u64 {

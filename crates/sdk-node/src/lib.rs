@@ -120,6 +120,17 @@ pub struct VolumeStatus {
   pub host_epoch: i64,
 }
 
+/// A volume in a listing (§4.4) as a plain JS object — its id (hex), name, byte accounting, and whether
+/// it overlays a host directory. napi's camelCase keys; the u64 counts range-checked to JS-safe integers.
+#[napi(object)]
+pub struct VolumeEntry {
+  pub id: String,
+  pub name: String,
+  pub referenced_bytes: i64,
+  pub unique_bytes: i64,
+  pub overlay: bool,
+}
+
 /// A connected slates client (§4.4, §4.9): the lifecycle verbs as methods. Constructed by
 /// [`Client::connect`]; used from the Node main thread the addon runs on.
 #[napi]
@@ -216,6 +227,49 @@ impl Client {
       mirror_age_ns: status_opt_i64(report.placed.mirror_age_ns, "mirrorAgeNs")?,
       host_epoch: status_i64(report.placed.host_epoch, "hostEpoch")?,
     })
+  }
+
+  /// Lists the daemon's volumes (§4.4) as an array of [`VolumeEntry`] objects — id (hex), name, byte
+  /// accounting, and overlay flag, the plain shape `slates list` prints.
+  #[napi]
+  pub fn list(&mut self) -> Result<Vec<VolumeEntry>> {
+    let volumes = self.inner.list().map_err(refusal)?;
+    volumes
+      .into_iter()
+      .map(|volume| {
+        Ok(VolumeEntry {
+          id: volume_hex(&volume.id),
+          name: volume.name,
+          referenced_bytes: status_i64(volume.referenced_bytes, "referencedBytes")?,
+          unique_bytes: status_i64(volume.unique_bytes, "uniqueBytes")?,
+          overlay: volume.overlay,
+        })
+      })
+      .collect()
+  }
+
+  /// Resizes the volume's quota (§4.4): `sizeBytes` is the new `Bounded` reserve, or the new maximum of a
+  /// `Dynamic` volume when `dynamic` is set. A refusal crosses as a JS `Error`.
+  #[napi]
+  pub fn resize(&mut self, volume: String, size_bytes: i64, dynamic: Option<bool>) -> Result<()> {
+    let id = parse_volume(&volume)?;
+    let size_bytes = checked_u64(size_bytes, "sizeBytes")?;
+    let size = if dynamic.unwrap_or(false) {
+      SizeClass::Dynamic { max: size_bytes }
+    } else {
+      SizeClass::Bounded { limit: size_bytes }
+    };
+    self.inner.resize(id, size).map_err(refusal)?;
+    Ok(())
+  }
+
+  /// Destroys the volume (§4.4): its RAM is reclaimed and its id retired. Destroying a missing volume is
+  /// a typed JS `Error`, not a silent success.
+  #[napi]
+  pub fn destroy(&mut self, volume: String) -> Result<()> {
+    let id = parse_volume(&volume)?;
+    self.inner.destroy(id).map_err(refusal)?;
+    Ok(())
   }
 
   /// How many times this client has reconnected across daemon restarts (an observability counter, so a

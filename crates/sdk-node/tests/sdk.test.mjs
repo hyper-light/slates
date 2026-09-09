@@ -48,7 +48,7 @@ test('the addon loads and exposes the Client surface', (t) => {
   assert.equal(typeof slates.Client, 'function', 'Client class is exported');
   // The lifecycle verbs this slice binds; more (createGreen, edit, submit, land) are owed.
   const methods = Object.getOwnPropertyNames(slates.Client.prototype);
-  for (const verb of ['create', 'snapshot', 'status', 'clientId', 'reconnects']) {
+  for (const verb of ['create', 'snapshot', 'status', 'list', 'resize', 'destroy', 'clientId', 'reconnects']) {
     assert.ok(methods.includes(verb), `Client.prototype has ${verb}`);
   }
   assert.equal(typeof slates.Client.connect, 'function', 'Client.connect factory is exported');
@@ -116,6 +116,22 @@ test('lifecycle round trip over a live daemon', async (t) => {
     assert.ok(status.mirrorAgeNs == null, 'no mirror on a laptop');
     assert.ok('nfsPort' in status, 'the status carries the NFS port field');
     assert.deepEqual(status.drifted, []);
+
+    // list → the volume appears with its fields (a scratch volume is not an overlay).
+    const entry = client.list().find((v) => v.id === volume);
+    assert.ok(entry, 'the created volume appears in list');
+    assert.equal(entry.name, 'sdk-node-roundtrip');
+    assert.equal(entry.overlay, false);
+
+    // resize → a larger bound succeeds.
+    client.resize(volume, 2 * VOLUME_BYTES);
+
+    // destroy → the volume is gone from a later list.
+    client.destroy(volume);
+    assert.ok(
+      client.list().every((v) => v.id !== volume),
+      'the destroyed volume is gone from list',
+    );
   } finally {
     // Kill the whole process group (negative pid) so the supervised daemon goes with the anchor at once.
     try {

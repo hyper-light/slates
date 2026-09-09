@@ -14,7 +14,17 @@ import unittest
 import slates
 
 # The lifecycle verbs this slice binds; more (create_green, edit, submit, land) are owed.
-BOUND_VERBS = {"connect", "create", "snapshot", "status", "client_id", "reconnects"}
+BOUND_VERBS = {
+    "connect",
+    "create",
+    "snapshot",
+    "status",
+    "list",
+    "resize",
+    "destroy",
+    "client_id",
+    "reconnects",
+}
 # Test deadlines in nanoseconds; a production caller derives these from the machine's budgets.
 REPLY_NS = 5_000_000
 RECONNECT_NS = 10_000_000
@@ -116,6 +126,23 @@ class SlatesSdkRoundTrip(unittest.TestCase):
             self.assertIsNone(status["mirror_age_ns"])
             self.assertIn("nfs_port", status)
             self.assertEqual(status["drifted"], [])
+
+            # list → the volume appears with its fields (a scratch volume is not an overlay).
+            listed = client.list()
+            entry = next((v for v in listed if v["id"] == volume), None)
+            self.assertIsNotNone(entry, "the created volume appears in list")
+            self.assertEqual(entry["name"], "sdk-roundtrip")
+            self.assertFalse(entry["overlay"])
+
+            # resize → a larger bound succeeds.
+            client.resize(volume, 2 * VOLUME_BYTES)
+
+            # destroy → the volume is gone from a later list.
+            client.destroy(volume)
+            self.assertTrue(
+                all(v["id"] != volume for v in client.list()),
+                "the destroyed volume is gone from list",
+            )
         finally:
             # Kill the whole process group so the supervised daemon goes with the anchor at once.
             try:
