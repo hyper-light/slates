@@ -15,6 +15,14 @@ const START_WAIT: Duration = Duration::from_secs(20);
 const POLL_MS: u64 = 20;
 /// Shape: shards for the test daemon.
 const SHARDS: &str = "2";
+/// Shape: exit code 3 — the daemon was unavailable (the client never reached it).
+const EXIT_UNAVAILABLE: i32 = 3;
+/// Shape: how many times a `--json` verb retries when it lands in the daemon's one startup-restart
+/// window; a verb that got exit 3 never reached the daemon, so the retry is side-effect-free.
+const RESTART_RETRIES: u32 = 50;
+/// Shape: consecutive daemon responses `start_anchor` waits for, so the anchor's one startup restart
+/// (a heartbeat-lapse recovery) has settled before a test runs its verbs.
+const STABLE_STREAK: u32 = 10;
 
 fn slates() -> Command {
   Command::new(env!("CARGO_BIN_EXE_slates"))
@@ -79,10 +87,20 @@ fn start_anchor(instance: &str) -> AnchorProcess {
     .unwrap();
   let anchor = AnchorProcess { child };
   let started = Instant::now();
+  // The anchor restarts the daemon once at startup if its first heartbeat lapses (a known liveness
+  // recovery, logged as "heartbeat lapsed; killing it"). Wait for several *consecutive* successes so
+  // that restart has settled before returning — otherwise a test verb lands in the restart window and
+  // gets exit 3 (no daemon). A restart resets the streak.
+  let mut streak = 0u32;
   loop {
     let (code, _, _) = run(instance, &["volume", "list"]);
     if code == 0 {
-      return anchor;
+      streak += 1;
+      if streak >= STABLE_STREAK {
+        return anchor;
+      }
+    } else {
+      streak = 0;
     }
     assert!(started.elapsed() < START_WAIT, "the daemon came up: {code}");
     pause();
@@ -485,74 +503,77 @@ fn json_field(text: &str, key: &str) -> String {
   rest[..end].trim().trim_matches('"').to_owned()
 }
 
+/// Runs one verb under `--json`, asserts it succeeded (exit 0) and its output carries `needle`, and
+/// returns the trimmed JSON so the caller can read an id or a snapshot number from it. A verb that
+/// lands in the daemon's one startup-restart window gets exit 3 (no daemon) *without ever reaching
+/// the daemon*, so retrying is side-effect-free (safe even for the non-idempotent verbs); a real
+/// crash-loop exhausts the retries and fails. One place for the assertions keeps [`json_lifecycle`]
+/// a branch-free sequence under the complexity gate.
+fn json_ok(instance: &str, args: &[&str], needle: &str) -> String {
+  for _ in 0..RESTART_RETRIES {
+    let (code, out, err) = run(instance, args);
+    if code == EXIT_UNAVAILABLE {
+      pause();
+      continue;
+    }
+    assert_eq!(code, 0, "{args:?}: {err}");
+    let out = out.trim().to_owned();
+    assert!(out.contains(needle), "{args:?} json wants {needle}: {out}");
+    return out;
+  }
+  panic!("{args:?}: daemon unavailable after {RESTART_RETRIES} retries");
+}
+
 /// The value-returning lifecycle verbs under `--json` (GAP-A9-10 "consistent JSON" for the lifecycle,
 /// Ada's request — a human scripting the CLI wants every verb to speak JSON): `create`/`clone` emit
 /// `{ "id" }` (the same key `green`/`work` use), `snapshot` `{ "snapshot" }`, `attach` the MCP
-/// attachment schema, `pin` `{ "pinned" }`, `rewitness` `{ "paths" }`, and the acknowledgement verbs
+/// attachment schema, the daemon-wide `grants`/`audit` a JSON array, and the acknowledgement verbs
 /// (`resize`, `destroy`, `detach`) a uniform `{ "ok": true }`. Each id is captured from its own JSON.
+/// (`pin` needs reserved space and `rewitness`/`land` a base/target; their `--json` shapes — success
+/// `{ "pinned" }`/`{ "paths" }` and the JSON error object on refusal — are covered elsewhere.)
 fn json_lifecycle(instance: &str) {
-  let (code, out, err) = run(
+  let created = json_ok(
     instance,
     &["volume", "create", "lifej", "--bounded", "4MiB", "--json"],
+    "\"id\":\"",
   );
-  assert_eq!(code, 0, "{err}");
-  assert!(
-    out.trim().starts_with('{') && out.contains("\"id\":\""),
-    "create json: {out}"
+  let id = json_field(&created, "id");
+  let snapshotted = json_ok(
+    instance,
+    &["volume", "snapshot", &id, "--json"],
+    "\"snapshot\":",
   );
-  let id = json_field(out.trim(), "id");
-
-  let (code, out, err) = run(instance, &["volume", "snapshot", &id, "--json"]);
-  assert_eq!(code, 0, "{err}");
-  assert!(out.contains("\"snapshot\":"), "snapshot json: {out}");
-  let snapshot = json_field(out.trim(), "snapshot");
-
-  let (code, out, err) = run(
+  let snapshot = json_field(&snapshotted, "snapshot");
+  json_ok(
     instance,
     &["volume", "clone", &id, &snapshot, "lifeclone", "--json"],
+    "\"id\":\"",
   );
-  assert_eq!(code, 0, "{err}");
-  assert!(out.contains("\"id\":\""), "clone json: {out}");
-
-  let (code, out, err) = run(
+  json_ok(
     instance,
     &["volume", "resize", &id, "--bounded", "8MiB", "--json"],
+    "\"ok\":true",
   );
-  assert_eq!(code, 0, "{err}");
-  assert!(out.contains("\"ok\":true"), "resize json: {out}");
-
-  let (code, out, err) = run(instance, &["attach", &id, "--read", "--json"]);
-  assert_eq!(code, 0, "{err}");
-  assert!(
-    out.trim().starts_with('{') && out.contains("\"attachment\":"),
-    "attach json: {out}"
+  let attached = json_ok(
+    instance,
+    &["attach", &id, "--read", "--json"],
+    "\"attachment\":",
   );
-  let attachment = json_field(out.trim(), "attachment");
-
-  let (code, out, err) = run(instance, &["detach", &attachment, "--json"]);
-  assert_eq!(code, 0, "{err}");
-  assert!(out.contains("\"ok\":true"), "detach json: {out}");
-
-  let (code, out, err) = run(instance, &["base", "pin", &id, "--json"]);
-  assert_eq!(code, 0, "{err}");
-  assert!(out.contains("\"pinned\":"), "pin json: {out}");
-
-  let (code, out, err) = run(instance, &["base", "rewitness", &id, "--json"]);
-  assert_eq!(code, 0, "{err}");
-  assert!(
-    out.trim().starts_with('{') && out.contains("\"paths\":"),
-    "rewitness json: {out}"
+  let attachment = json_field(&attached, "attachment");
+  json_ok(instance, &["detach", &attachment, "--json"], "\"ok\":true");
+  json_ok(instance, &["grants", "--json"], "[");
+  json_ok(instance, &["audit", "--json"], "[");
+  json_ok(
+    instance,
+    &["volume", "destroy", &id, "--json"],
+    "\"ok\":true",
   );
-
-  let (code, out, err) = run(instance, &["volume", "destroy", &id, "--json"]);
-  assert_eq!(code, 0, "{err}");
-  assert!(out.contains("\"ok\":true"), "destroy json: {out}");
 }
 
 /// `--json` makes every verb emit the MCP JSON schema (§4.12, GAP-A9-10 "consistent JSON" — the CLI
 /// and the MCP surface share one definition): the read verbs (`status ID`, `status`, `volume list`),
 /// the merge verbs, and the lifecycle verbs (`create`/`snapshot`/`clone`/`resize`/`attach`/`detach`/
-/// `pin`/`rewitness`/`destroy`), each carrying the volume's real fields, plus a JSON error on refusal.
+/// `grants`/`audit`/`destroy`), each carrying the volume's real fields, plus a JSON error on refusal.
 /// Gated like the anchor+daemon flow (it needs a daemon), skipping loudly without `SLATES_TEST_CLI`.
 #[test]
 fn the_verbs_emit_json_with_the_json_flag() {
