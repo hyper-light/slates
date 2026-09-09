@@ -2204,12 +2204,17 @@ it uses content addressing. The RAM-only trust boundary and any allowed sharing 
 > per-verb `current_request` context deep in a verb, §4.7; a bridge call's is the default), a per-shard
 > span id, a content-free label, and a trace seeded from the request word until propagation is wired.
 > The held/dropped counts ride `ShardReport` to `slates status`; a non-vacuity test shows the count move
-> as verbs run. Owed: the other three chokepoints' emit sites (`ship.record`, `consensus.step`,
-> `archive.chunk`), each through the same cross-crate seam in its own crate; `ring.request` for a
-> *forwarded* reply (its origin span crosses the shard boundary, so `read_ns` 0 marks it owed rather
-> than timing it wrongly); the cross-shard aggregation of the per-shard sinks into the single
-> control-shard sink (the `Control::Spawn` path the bridge queue uses); real cross-boundary trace
-> propagation; and typed absence markers plus `(value, freshness)` on the daemon-level counters.
+> as verbs run. The six live chokepoints are **every one active in the single-node daemon path**. The
+> other three are gated not on the seam (which is built) but on their subsystems being live: a laptop
+> runs no replication (`ship.record`) or consensus (`consensus.step`) at f=0, and `slates-cluster` is
+> not a daemon dependency yet, so those land with fleet integration (§4.8); the archive is not wired
+> into the daemon and its codec is Phase 7, so `archive.chunk` lands with §4.10 — each then through the
+> same cross-crate seam. Instrumenting them before their subsystems run would be untestable code (R5).
+> Also owed: `ring.request` for a *forwarded* reply (its origin span crosses the shard boundary, so
+> `read_ns` 0 marks it owed rather than timing it wrongly); the cross-shard aggregation of the per-shard
+> sinks into the single control-shard sink (the `Control::Spawn` path the bridge queue uses); real
+> cross-boundary trace propagation; and typed absence markers plus `(value, freshness)` on the
+> daemon-level counters.
 
 Chokepoint spans (bridge request, ring request, shard operation, log append, replication ship,
 consensus step, archive chunk) with the three-id law; spans emitted asynchronously through
