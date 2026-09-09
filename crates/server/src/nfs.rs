@@ -24,10 +24,17 @@
 //! looked-up id), read/write. Each request runs as the mounting user ([`subject_of`] reads the uid from
 //! the `AUTH_SYS` credential, §4.13; `AUTH_NONE` falls back to root).
 //!
-//! The root-listing gather fans out to the shards in parallel. Owed (refinements): a friendly
-//! chosen-path mount name (§4.6 "Chosen path"; the id's hex is the name today); the anchor-held listener
-//! for restart survival (the daemon binds it now); the attribute-cache timeout from the loopback RTT;
-//! and the FUSE-differential oracle.
+//! The root-listing gather fans out to the shards in parallel. Owed here (minor, situational
+//! refinements): a friendly chosen-path mount name (§4.6 "Chosen path"; the id's hex is the name
+//! today, and it is also the cross-shard routing key, so a name field would thread through
+//! `ShardState`'s volume slot and the root `LOOKUP` route); the anchor-held listener for restart
+//! survival (the daemon binds it now; §4.6 line 509); and the attribute-cache timeout from the
+//! measured loopback GETATTR RTT. The §4.6 differential oracle (line 1368) is *not* owed here: it
+//! mounts the same volume via FSKit *and* via NFS and compares the abstract states — two real
+//! kernel mounts — so it is gated on the FSKit mount, hence on the Apple Developer entitlement that
+//! item (1) needs and this sandbox cannot hold. A synthetic FUSE-dispatch-vs-NFS-dispatch stand-in
+//! would not be it: both legs dispatch onto one `VolumeBridge`, so their agreement is tautological
+//! (R5: no vacuous oracle).
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
