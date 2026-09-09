@@ -53,6 +53,12 @@ jobs:
       # itself (a busy parallel suite starves the daemon), so it is its own step.
       - name: The slates CLI flow (anchor + daemon)
         run: SLATES_TEST_CLI=1 cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture
+      # The FSKit shim's Swift wire codec must agree with the Rust codec byte for byte (it shares the
+      # golden vector). Compile and run its cross-check on the macOS runner, where swiftc lives; the
+      # FSVolume handler, the app-group ring, and the entitlement are the mount-spike half, not this.
+      - name: FSKit Swift shim wire cross-check (macOS)
+        if: runner.os == 'macOS'
+        run: swiftc crates/bridge-fskit/swift/ShimWire.swift -o "$RUNNER_TEMP/shimwire" && "$RUNNER_TEMP/shimwire"
       # T-1.17: the 10k-entry delta into a 10^6-entry tree against cp -r; informational on a
       # shared runner (no ratchet baseline), the numbers land in the job log.
       - name: Landing bench over tmpfs (Linux)
