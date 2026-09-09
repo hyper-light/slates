@@ -34,7 +34,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use slates_client::{
   Client as RustClient, ClientError, CreateSpec, Deadlines, Filter, Landing, NamePolicy, Rebased,
-  SizeClass, SnapshotId, Submitted, VolumeId, WorkOp,
+  SizeClass, SnapshotId, StatusReport, Submitted, VolumeId, WorkOp,
 };
 
 /// Format: a volume id is 16 bytes on the wire — its high half names the creator host (§4.8 "Lookup").
@@ -289,6 +289,63 @@ fn landing_result(landing: Landing) -> Result<LandingResult> {
 
 /// A connected slates client (§4.4, §4.9): the lifecycle verbs as methods. Constructed by
 /// [`Client::connect`]; used from the Node main thread the addon runs on.
+/// Builds a [`VolumeStatus`] from a report — the same fields `slates status` prints. Shared by the
+/// sync `status` verb and the async one, so both surfaces return the identical shape (§4.4).
+fn volume_status(report: StatusReport) -> Result<VolumeStatus> {
+  Ok(VolumeStatus {
+    id: volume_hex(&report.id),
+    name: report.name,
+    referenced_bytes: status_i64(report.referenced_bytes, "referencedBytes")?,
+    unique_bytes: status_i64(report.unique_bytes, "uniqueBytes")?,
+    lease_epoch: status_opt_i64(report.lease_epoch, "leaseEpoch")?,
+    attachments: report.attachments,
+    head: status_i64(report.head.value, "head")?,
+    snapshots: report.snapshots,
+    watcher: report.watcher,
+    drifted: report.drifted,
+    nfs_port: report.nfs_port.map(u32::from),
+    placed: report.placed.region,
+    mirror_age_ns: status_opt_i64(report.placed.mirror_age_ns, "mirrorAgeNs")?,
+    host_epoch: status_i64(report.placed.host_epoch, "hostEpoch")?,
+  })
+}
+
+/// Parses a request-id word from its decimal string (the async client holds it as a string across the
+/// yield, since a `u64` word can exceed a JS-safe integer).
+fn parse_word(word: &str) -> Result<u64> {
+  word
+    .parse::<u64>()
+    .map_err(|_| Error::from_reason("a request id word is a decimal u64 string"))
+}
+
+/// The result of an async verb's begin-and-spin: the request id word to await on, and the decoded
+/// reply if it already landed within the spin window (the fast path, no event loop).
+#[napi(object)]
+pub struct CreateBegin {
+  /// The request id word, held by the async client to match the reply.
+  pub word: String,
+  /// The volume id hex, present when the reply came within the spin window.
+  pub fast: Option<String>,
+}
+
+/// A snapshot begin-and-spin result (see [`CreateBegin`]).
+#[napi(object)]
+pub struct SnapshotBegin {
+  /// The request id word.
+  pub word: String,
+  /// The snapshot sequence, present when the reply came within the spin window.
+  pub fast: Option<i64>,
+}
+
+/// A status begin-and-spin result (see [`CreateBegin`]).
+#[napi(object)]
+pub struct StatusBegin {
+  /// The request id word.
+  pub word: String,
+  /// The status, present when the reply came within the spin window.
+  pub fast: Option<VolumeStatus>,
+}
+
 #[napi]
 pub struct Client {
   inner: RustClient,
@@ -367,22 +424,159 @@ impl Client {
   pub fn status(&mut self, volume: String) -> Result<VolumeStatus> {
     let id = parse_volume(&volume)?;
     let report = self.inner.status(id).map_err(refusal)?;
-    Ok(VolumeStatus {
-      id: volume_hex(&report.id),
-      name: report.name,
-      referenced_bytes: status_i64(report.referenced_bytes, "referencedBytes")?,
-      unique_bytes: status_i64(report.unique_bytes, "uniqueBytes")?,
-      lease_epoch: status_opt_i64(report.lease_epoch, "leaseEpoch")?,
-      attachments: report.attachments,
-      head: status_i64(report.head.value, "head")?,
-      snapshots: report.snapshots,
-      watcher: report.watcher,
-      drifted: report.drifted,
-      nfs_port: report.nfs_port.map(u32::from),
-      placed: report.placed.region,
-      mirror_age_ns: status_opt_i64(report.placed.mirror_age_ns, "mirrorAgeNs")?,
-      host_epoch: status_i64(report.placed.host_epoch, "hostEpoch")?,
+    volume_status(report)
+  }
+
+  // The async surface's low-level primitives (R6, D-19): begin-and-spin returns the request id word
+  // and the reply if it landed within the spin (the fast path); poll takes it by word once the
+  // completion fd signals; completionFd / arm / disarm / takeReady drive the JS `AsyncClient`'s libuv
+  // `uv_poll` loop. The verbs bound async today (create, snapshot, status); the rest follow the shape.
+
+  /// Begins a create and spins for its reply within the daemon's window; the word to await and the id
+  /// if it already landed (the async fast path).
+  #[napi]
+  pub fn begin_spin_create(
+    &mut self,
+    name: String,
+    size_bytes: i64,
+    dynamic: Option<bool>,
+    fold: Option<bool>,
+    require_locked: Option<bool>,
+    base: Option<String>,
+  ) -> Result<CreateBegin> {
+    let size_bytes = checked_u64(size_bytes, "sizeBytes")?;
+    let size = if dynamic.unwrap_or(false) {
+      SizeClass::Dynamic { max: size_bytes }
+    } else {
+      SizeClass::Bounded { limit: size_bytes }
+    };
+    let names = if fold.unwrap_or(true) {
+      NamePolicy::Fold
+    } else {
+      NamePolicy::Exact
+    };
+    let spec = CreateSpec {
+      name,
+      size,
+      names,
+      require_locked: require_locked.unwrap_or(false),
+      base,
+    };
+    let id = self.inner.create_begin(&spec).map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let spin = self.inner.published_spin_ns();
+    let fast = self
+      .inner
+      .create_spin(id, spin)
+      .map_err(refusal)?
+      .map(|volume| volume_hex(&volume));
+    Ok(CreateBegin {
+      word: id.word().to_string(),
+      fast,
     })
+  }
+
+  /// Takes a create's reply by its word once the completion fd signals; `null` until it is on the ring.
+  #[napi]
+  pub fn poll_create(&mut self, word: String) -> Result<Option<String>> {
+    let word = parse_word(&word)?;
+    Ok(
+      self
+        .inner
+        .create_poll(word)
+        .map_err(refusal)?
+        .map(|volume| volume_hex(&volume)),
+    )
+  }
+
+  /// Begins a snapshot and spins for its reply; the word and the sequence if it landed in the spin.
+  #[napi]
+  pub fn begin_spin_snapshot(&mut self, volume: String) -> Result<SnapshotBegin> {
+    let id = parse_volume(&volume)?;
+    let request = self.inner.snapshot_begin(id).map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let spin = self.inner.published_spin_ns();
+    let fast = match self.inner.snapshot_spin(request, spin).map_err(refusal)? {
+      Some(snapshot) => Some(status_i64(snapshot.value, "snapshot")?),
+      None => None,
+    };
+    Ok(SnapshotBegin {
+      word: request.word().to_string(),
+      fast,
+    })
+  }
+
+  /// Takes a snapshot's reply by its word once the completion fd signals.
+  #[napi]
+  pub fn poll_snapshot(&mut self, word: String) -> Result<Option<i64>> {
+    let word = parse_word(&word)?;
+    match self.inner.snapshot_poll(word).map_err(refusal)? {
+      Some(snapshot) => Ok(Some(status_i64(snapshot.value, "snapshot")?)),
+      None => Ok(None),
+    }
+  }
+
+  /// Begins a status read and spins for its reply; the word and the status if it landed in the spin.
+  #[napi]
+  pub fn begin_spin_status(&mut self, volume: String) -> Result<StatusBegin> {
+    let id = parse_volume(&volume)?;
+    let request = self.inner.status_begin(id).map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let spin = self.inner.published_spin_ns();
+    let fast = match self.inner.status_spin(request, spin).map_err(refusal)? {
+      Some(report) => Some(volume_status(report)?),
+      None => None,
+    };
+    Ok(StatusBegin {
+      word: request.word().to_string(),
+      fast,
+    })
+  }
+
+  /// Takes a status reply by its word once the completion fd signals.
+  #[napi]
+  pub fn poll_status(&mut self, word: String) -> Result<Option<VolumeStatus>> {
+    let word = parse_word(&word)?;
+    match self.inner.status_poll(word).map_err(refusal)? {
+      Some(report) => Ok(Some(volume_status(report)?)),
+      None => Ok(None),
+    }
+  }
+
+  /// The completion fd an async event loop polls (`uv_poll`), starting the completion channel on first
+  /// call (§4.7, D-19). A **dup** the JS side owns: Node's `net.Socket` adopts and closes the fd it
+  /// wraps, so it must be given its own descriptor — closing it leaves the client's intact.
+  #[napi]
+  pub fn completion_fd(&mut self) -> Result<i32> {
+    self.inner.enable_async_completion_dup().map_err(refusal)
+  }
+
+  /// Arms the completion signal before the async client yields to its loop (the daemon wakes a parked
+  /// client on a reply).
+  #[napi]
+  pub fn arm(&mut self) -> Result<()> {
+    self.inner.arm_async().map_err(refusal)
+  }
+
+  /// Clears the arm once no request is in flight.
+  #[napi]
+  pub fn disarm(&mut self) -> Result<()> {
+    self.inner.disarm_async().map_err(refusal)
+  }
+
+  /// Drains every ready reply into the client's buffer and returns their words, so the async pump
+  /// resolves each waiting request in one pass.
+  #[napi]
+  pub fn take_ready(&mut self) -> Result<Vec<String>> {
+    Ok(
+      self
+        .inner
+        .take_ready()
+        .map_err(refusal)?
+        .into_iter()
+        .map(|word| word.to_string())
+        .collect(),
+    )
   }
 
   /// Lists the daemon's volumes (§4.4) as an array of [`VolumeEntry`] objects — id (hex), name, byte

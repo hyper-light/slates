@@ -95,6 +95,17 @@ impl CompletionBridge {
     self.read.as_raw_fd()
   }
 
+  /// A dup of the read end, owned by the caller — for an SDK whose event loop closes the descriptor
+  /// it polls (Node's `net.Socket` does; `asyncio` does not, so it polls [`Self::completion_fd`]). The
+  /// dup refers to the same pipe, so closing it leaves this bridge's read end intact. A safe dup: the
+  /// read end is an owned fd, not a raw one.
+  pub fn dup_fd(&self) -> Result<OwnedFd, IpcError> {
+    rustix::io::dup(&self.read).map_err(|error| IpcError::OsRefused {
+      call: "dup",
+      code: Some(error.raw_os_error()),
+    })
+  }
+
   /// Clears the pipe's readiness after the loop reports it readable: a non-blocking read that takes
   /// whatever nudges are buffered. The read end is non-blocking, so an empty pipe is a no-op.
   pub fn drain(&self) {

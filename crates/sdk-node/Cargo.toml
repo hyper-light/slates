@@ -5,7 +5,7 @@ authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
 rust-version = { workspace = true }
-description = "The TypeScript/Node SDK (§2.3, D-19; Phase 5): a napi-rs addon over the typed `slates-client`, exposing the lifecycle verbs and mapping typed refusals to JS errors. Async over the completion descriptor (uv_poll) is owed; this is the synchronous base."
+description = "The TypeScript/Node SDK (§2.3, D-19; Phase 5): a napi-rs addon over the typed `slates-client`, exposing the lifecycle verbs and mapping typed refusals to JS errors. Async-primary: the `AsyncClient` JS wrapper (`async.mjs`) resolves each verb's Promise by the completion fd's readiness (a libuv-polled `net.Socket`, uv_poll, no tokio); the sync `Client` on the addon is the thin blocking facade."
 
 [lib]
 # The Node addon is a cdylib; napi names the loadable `.node` from it.

@@ -468,6 +468,17 @@ impl Client {
     self.end.enable_async_completion().map_err(ClientError::Ipc)
   }
 
+  /// Like [`Self::enable_async_completion`] but returns a dup the caller owns and must close — for an
+  /// SDK whose event loop closes the descriptor it polls (Node's `net.Socket`), not one that only
+  /// polls it (Python `asyncio`). Closing the dup leaves the client's own fd intact.
+  #[cfg(unix)]
+  pub fn enable_async_completion_dup(&mut self) -> Result<RawFd, ClientError> {
+    self
+      .end
+      .enable_async_completion_dup()
+      .map_err(ClientError::Ipc)
+  }
+
   /// Arms the completion signal before the SDK yields to its event loop (the daemon wakes a parked
   /// client on a reply). A caller re-checks [`Self::poll_reply`] right after arming to close the race
   /// with a reply that landed during the spin.

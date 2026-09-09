@@ -1,0 +1,99 @@
+// The async surface of the slates Node SDK (§2.3, R6, D-19): AsyncClient wraps the addon's typed
+// low-level primitives and resolves each verb's Promise by the completion fd's readiness — the fd is
+// wrapped in a net.Socket, which libuv polls (uv_poll), so a landed reply fires 'data' and the
+// awaiting Promise resolves; the loop is never blocked. The sync `Client` on the addon is the thin
+// blocking facade; this is the primary async form. No tokio and no extra thread — the loop is Node's,
+// the readiness is the completion fd's.
+//
+// For the sandbox test the addon is passed in (loaded via SLATES_NODE_ADDON); a published package
+// would load its own addon. The completion socket is created lazily on the first slow path, kept for
+// the client's life, and unref'd so it never holds the process open on its own; it is not closed
+// mid-life, because the fd is owned by the Rust client (a double close would race its descriptor).
+
+import net from 'node:net';
+
+export class AsyncClient {
+  constructor(inner) {
+    this._c = inner;
+    this._pending = new Map(); // word(string) -> { resolve, reject, poll }
+    this._sock = null;
+  }
+
+  // Connects to `instance` as a new async client over the loaded `addon`. The rendezvous is a fast
+  // blocking handshake done once; every verb after it is async.
+  static connect(addon, instance, replyNs, reconnectNs) {
+    return new AsyncClient(addon.Client.connect(instance, replyNs, reconnectNs));
+  }
+
+  clientId() {
+    return this._c.clientId();
+  }
+
+  async create(name, sizeBytes, dynamic, fold, requireLocked, base) {
+    const { word, fast } = this._c.beginSpinCreate(
+      name,
+      sizeBytes,
+      dynamic,
+      fold,
+      requireLocked,
+      base,
+    );
+    if (fast != null) return fast;
+    return this._await(word, (w) => this._c.pollCreate(w));
+  }
+
+  async snapshot(volume) {
+    const { word, fast } = this._c.beginSpinSnapshot(volume);
+    if (fast != null) return fast;
+    return this._await(word, (w) => this._c.pollSnapshot(w));
+  }
+
+  async status(volume) {
+    const { word, fast } = this._c.beginSpinStatus(volume);
+    if (fast != null) return fast;
+    return this._await(word, (w) => this._c.pollStatus(w));
+  }
+
+  // Registers the pending future, arms the completion signal, ensures the reader, and closes the race
+  // with a reply that landed between the spin's end and the arm.
+  _await(word, poll) {
+    return new Promise((resolve, reject) => {
+      this._pending.set(word, { resolve, reject, poll });
+      this._c.arm();
+      this._ensureReader();
+      this._pump();
+    });
+  }
+
+  // Wraps the completion fd in a libuv-polled stream once; its readable 'data' (the fd become
+  // readable) drives the pump. unref so a live reader never holds the process open on its own.
+  _ensureReader() {
+    if (this._sock) return;
+    const fd = this._c.completionFd();
+    this._sock = new net.Socket({ fd, readable: true, writable: false });
+    this._sock.on('data', () => this._pump());
+    this._sock.on('error', () => {});
+    this._sock.unref();
+  }
+
+  // Drains every ready reply and resolves each waiting request by its word; disarms when none remain.
+  _pump() {
+    for (const word of this._c.takeReady()) {
+      const entry = this._pending.get(word);
+      if (!entry) continue;
+      let value;
+      try {
+        value = entry.poll(word);
+      } catch (err) {
+        this._pending.delete(word);
+        entry.reject(err);
+        continue;
+      }
+      if (value != null) {
+        this._pending.delete(word);
+        entry.resolve(value);
+      }
+    }
+    if (this._pending.size === 0) this._c.disarm();
+  }
+}

@@ -5,7 +5,7 @@
 //! protocol, so neither end touches a shared counter on the hot path.
 
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -180,6 +180,33 @@ impl ClientEnd {
       self.completion_fd().ok_or(IpcError::Unsupported {
         feature: "async completion fd (the rendezvous passed no completion descriptor)",
       })
+    }
+  }
+
+  /// Like [`Self::enable_async_completion`] but returns a **dup** the caller owns and must close — for
+  /// an SDK whose event loop closes the descriptor it polls (Node's `net.Socket` adopts and closes the
+  /// fd; `asyncio` only polls it, so it uses `enable_async_completion`). The dup and the client's own
+  /// fd refer to the same pipe/eventfd, so closing the dup leaves the client's intact — no double close.
+  #[cfg(unix)]
+  pub fn enable_async_completion_dup(&mut self) -> Result<RawFd, IpcError> {
+    // Ensure the channel exists (starts the macOS bridge; Linux already holds the eventfd).
+    self.enable_async_completion()?;
+    #[cfg(target_os = "macos")]
+    if let Some(bridge) = &self.bridge {
+      return Ok(bridge.dup_fd()?.into_raw_fd());
+    }
+    match &self.completion {
+      Some(fd) => Ok(
+        rustix::io::dup(fd)
+          .map_err(|error| IpcError::OsRefused {
+            call: "dup",
+            code: Some(error.raw_os_error()),
+          })?
+          .into_raw_fd(),
+      ),
+      None => Err(IpcError::Unsupported {
+        feature: "async completion fd (the rendezvous passed no completion descriptor)",
+      }),
     }
   }
 
