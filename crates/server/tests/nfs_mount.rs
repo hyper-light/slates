@@ -382,17 +382,40 @@ fn a_client_mounts_the_host_root_and_reaches_a_remote_volume_by_name() {
   let mut client = Client::connect(&instance);
   let control_partition = 0;
 
+  // Provision a volume on a NON-control shard, deterministically: a create routes by `owner_of_name`
+  // (verbs.rs), so we target only names whose owner is a non-control partition and create them until
+  // one lands — instead of the old fixed `0..32` probe over arbitrary names, which flaked under load
+  // (it silently `continue`d past a remote-owned create that came back non-`Created`, and could exhaust
+  // its 32 tries). This skips control-owned names outright and surfaces the actual reply if every
+  // remote-owned create is refused, so a real forwarding failure is a loud panic, not a silent give-up.
+  let partitions = daemon.shards().len();
   let mut remote = None;
-  for attempt in 0..32 {
-    let ReplyBody::Created { id } = client.call(&scratch(&format!("rv-{attempt}"))) else {
-      continue;
-    };
-    if slates_server::verbs::owner_of(id) != control_partition {
-      remote = Some(format!("rv-{attempt}")); // the remote volume's friendly name
-      break;
+  let mut last_reply = None;
+  for attempt in 0..256u32 {
+    let candidate = format!("rv-{attempt}");
+    if slates_server::verbs::owner_of_name(&candidate, partitions) == control_partition {
+      continue; // a control-owned name; not what this test needs
+    }
+    match client.call(&scratch(&candidate)) {
+      ReplyBody::Created { id } => {
+        assert_eq!(
+          slates_server::verbs::owner_of(id),
+          slates_server::verbs::owner_of_name(&candidate, partitions),
+          "a volume is created on its name's owner shard"
+        );
+        assert_ne!(
+          slates_server::verbs::owner_of(id),
+          control_partition,
+          "and that owner is a non-control shard"
+        );
+        remote = Some(candidate);
+        break;
+      }
+      other => last_reply = Some(format!("{other:?}")),
     }
   }
-  let name = remote.expect("a volume provisioned on a non-control shard");
+  let name = remote
+    .unwrap_or_else(|| panic!("no remote volume created (last non-Created reply: {last_reply:?})"));
 
   let port = daemon.nfs_port().expect("the daemon is serving NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
