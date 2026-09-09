@@ -712,7 +712,8 @@ pub fn status_json(r: &StatusReport) -> Value {
 }
 
 /// A landing's summary as JSON: entries per action, bytes to write, and entries the filter excluded.
-fn landing_summary_json(s: &LandingSummary) -> Value {
+/// Public so the CLI's `--json land` emits the same schema as the MCP surface (§4.12 schema parity).
+pub fn landing_summary_json(s: &LandingSummary) -> Value {
   json!({
     "by_action": s.by_action.iter().map(|a| json!({ "action": a.action, "count": a.count })).collect::<Vec<_>>(),
     "bytes": s.bytes,
@@ -720,8 +721,9 @@ fn landing_summary_json(s: &LandingSummary) -> Value {
   })
 }
 
-/// A finished landing's outcome as JSON.
-fn outcome_json(o: &LandingOutcome) -> Value {
+/// A finished landing's outcome as JSON. Public so the CLI's `--json land` emits the same schema as
+/// the MCP surface (§4.12 schema parity — one definition, two surfaces).
+pub fn outcome_json(o: &LandingOutcome) -> Value {
   json!({
     "landing": o.landing,
     "state": o.state,
@@ -734,8 +736,9 @@ fn outcome_json(o: &LandingOutcome) -> Value {
 }
 
 /// An attachment as JSON: its id (for detach), the lease epoch for a write attachment, and the path
-/// (none until a bridge exists).
-fn attachment_json(a: &Attachment) -> Value {
+/// (none until a bridge exists). Public so the CLI's `--json attach` emits the same schema as the MCP
+/// surface (§4.12 schema parity — one definition, two surfaces).
+pub fn attachment_json(a: &Attachment) -> Value {
   json!({
     "attachment": a.attachment,
     "lease_epoch": a.lease_epoch,

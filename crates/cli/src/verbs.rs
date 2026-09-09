@@ -1,8 +1,8 @@
 //! The client verbs: one connection, one request, the reply printed in a stable plain form.
 
 use slates_client::{
-  Client, ClientError, CreateSpec, DaemonReport, Deadlines, Rebased, StatusReport, Submitted,
-  VolumeSummary,
+  AuditEntry, Client, ClientError, CreateSpec, DaemonReport, Deadlines, GrantSummary, Intent,
+  Landing, Rebased, Scope, SnapshotId, StatusReport, Submitted, VolumeId, VolumeSummary,
 };
 use slates_db::replay::RECOVERY_BUDGET_NS;
 use slates_server::daemon::LIVENESS_BUDGET_NS;
@@ -298,6 +298,242 @@ fn emit_status(
   Ok(())
 }
 
+/// `volume create`: the new volume's id, as text (the id and its bridge path) or a JSON `{ "id" }`.
+/// The id key matches `green`/`work`/`clone`, so a script reads `.id` from every creating verb.
+fn emit_create(client: &mut Client, spec: &CreateSpec, json: bool) -> Result<(), ClientError> {
+  let id = client.create(spec)?;
+  if json {
+    println!("{}", serde_json::json!({ "id": volume_id_text(id) }));
+  } else {
+    println!("id: {}", volume_id_text(id));
+    println!("path: (none until a bridge exists)");
+  }
+  Ok(())
+}
+
+/// `volume snapshot`: the snapshot's sequence number, as text or a JSON `{ "snapshot" }` (the MCP
+/// `slates.volume.snapshot` schema).
+fn emit_snapshot(client: &mut Client, volume: VolumeId, json: bool) -> Result<(), ClientError> {
+  let snapshot = client.snapshot(volume)?;
+  if json {
+    println!("{}", serde_json::json!({ "snapshot": snapshot.value }));
+  } else {
+    println!("snapshot: {}", snapshot.value);
+  }
+  Ok(())
+}
+
+/// `volume clone`: the clone's id, as text or a JSON `{ "id" }` (the id key `create`/`green`/`work`
+/// all use, so a script reads `.id` from every creating verb).
+fn emit_clone(
+  client: &mut Client,
+  volume: VolumeId,
+  snapshot: SnapshotId,
+  name: &str,
+  json: bool,
+) -> Result<(), ClientError> {
+  let id = client.clone_snapshot(volume, snapshot, name)?;
+  if json {
+    println!("{}", serde_json::json!({ "id": volume_id_text(id) }));
+  } else {
+    println!("id: {}", volume_id_text(id));
+  }
+  Ok(())
+}
+
+/// `volume placed`: whether the scope is durable and the mirror's age, as two text lines or a JSON
+/// `{ "placed", "mirror_age_ns" }` (a null `mirror_age_ns` when there is no mirror).
+fn emit_placed(
+  client: &mut Client,
+  volume: VolumeId,
+  snapshot: Option<SnapshotId>,
+  scope: Scope,
+  json: bool,
+) -> Result<(), ClientError> {
+  let (placed, mirror_age_ns) = client.await_placed(volume, snapshot, scope)?;
+  if json {
+    println!(
+      "{}",
+      serde_json::json!({ "placed": placed, "mirror_age_ns": mirror_age_ns })
+    );
+  } else {
+    println!("placed: {placed}");
+    println!("mirror_age_ns: {}", option_text(mirror_age_ns));
+  }
+  Ok(())
+}
+
+/// `attach`: the attachment id, lease epoch and path, as text lines or JSON (the MCP
+/// `slates_mcp::attachment_json` schema — one definition for both surfaces, §4.12 parity).
+fn emit_attach(
+  client: &mut Client,
+  volume: VolumeId,
+  snapshot: Option<SnapshotId>,
+  intent: Intent,
+  json: bool,
+) -> Result<(), ClientError> {
+  let attached = client.attach(volume, snapshot, intent)?;
+  if json {
+    println!("{}", slates_mcp::attachment_json(&attached));
+  } else {
+    println!("attachment: {}", attached.attachment);
+    println!("lease_epoch: {}", option_text(attached.lease_epoch));
+    println!(
+      "path: {}",
+      attached
+        .path
+        .unwrap_or_else(|| "(none until a bridge exists)".to_owned())
+    );
+  }
+  Ok(())
+}
+
+/// `base rewitness`: the paths whose base drifted, one per text line or a JSON `{ "paths" }` (the key
+/// `changed-since` uses, so a script reads `.paths` from both).
+fn emit_rewitness(
+  client: &mut Client,
+  volume: VolumeId,
+  paths: Option<Vec<String>>,
+  json: bool,
+) -> Result<(), ClientError> {
+  let rewitnessed = client.rewitness(volume, paths)?;
+  if json {
+    println!("{}", serde_json::json!({ "paths": rewitnessed }));
+  } else {
+    for path in rewitnessed {
+      println!("{path}");
+    }
+  }
+  Ok(())
+}
+
+/// `base pin`: the count of base entries pinned, as text or a JSON `{ "pinned" }` (the MCP
+/// `slates.base.pin` schema).
+fn emit_pin(
+  client: &mut Client,
+  volume: VolumeId,
+  paths: Option<Vec<String>>,
+  json: bool,
+) -> Result<(), ClientError> {
+  let pinned = client.pin(volume, paths)?;
+  if json {
+    println!("{}", serde_json::json!({ "pinned": pinned }));
+  } else {
+    println!("pinned: {pinned}");
+  }
+  Ok(())
+}
+
+/// `grants`: every grant, one per text line or a JSON array of [`grant_json`] objects (the shape a
+/// script iterates, matching `volume list`'s array of objects).
+fn emit_grants(client: &mut Client, json: bool) -> Result<(), ClientError> {
+  let grants = client.grants()?;
+  if json {
+    let array = serde_json::Value::Array(grants.iter().map(grant_json).collect());
+    println!("{array}");
+  } else {
+    for grant in &grants {
+      println!(
+        "{} {} {} {:?} {}",
+        grant.id,
+        volume_id_text(grant.volume),
+        grant.target,
+        grant.scope,
+        grant.state
+      );
+    }
+  }
+  Ok(())
+}
+
+/// One grant as JSON: its id, volume, target, the manifest hash it binds, its scope and its state.
+fn grant_json(grant: &GrantSummary) -> serde_json::Value {
+  serde_json::json!({
+    "id": grant.id,
+    "volume": volume_id_text(grant.volume),
+    "target": grant.target,
+    "manifest": hex32(&grant.manifest),
+    "scope": format!("{:?}", grant.scope).to_lowercase(),
+    "state": grant.state,
+  })
+}
+
+/// `audit`: every record, one per text line or a JSON array of [`audit_json`] objects.
+fn emit_audit(client: &mut Client, since: u64, json: bool) -> Result<(), ClientError> {
+  let records = client.audit(since)?;
+  if json {
+    let array = serde_json::Value::Array(records.iter().map(audit_json).collect());
+    println!("{array}");
+  } else {
+    for record in &records {
+      println!(
+        "{} {} {} grant={:?} landing={:?} outcome={:?}",
+        record.seq, record.at_ns, record.kind, record.grant, record.landing, record.outcome
+      );
+    }
+  }
+  Ok(())
+}
+
+/// One audit record as JSON: its sequence, monotonic time, kind, the grant/landing/manifest it binds
+/// (null when unbound), and the terminal outcome (null until a landing finishes).
+fn audit_json(record: &AuditEntry) -> serde_json::Value {
+  serde_json::json!({
+    "seq": record.seq,
+    "at_ns": record.at_ns,
+    "kind": record.kind,
+    "grant": record.grant,
+    "landing": record.landing,
+    "manifest": record.manifest.as_ref().map(hex32),
+    "outcome": record.outcome,
+  })
+}
+
+/// A landing's result, as the text form ([`print_landing`]) or JSON (the MCP `slates.land.materialize`
+/// schema — `grant_required` false with the `outcome`, or true with the manifest, summary, conflicts,
+/// and the `slates grant` command a human runs).
+fn emit_landing(landing: Landing, json: bool) {
+  if json {
+    println!("{}", landing_json(&landing));
+  } else {
+    print_landing(landing);
+  }
+}
+
+/// A landing as JSON, reusing the MCP landing serializers so the two surfaces share one schema.
+fn landing_json(landing: &Landing) -> serde_json::Value {
+  match landing {
+    Landing::Landed(outcome) => serde_json::json!({
+      "grant_required": false,
+      "outcome": slates_mcp::outcome_json(outcome),
+    }),
+    Landing::GrantRequired {
+      landing,
+      manifest,
+      summary,
+      conflicts,
+    } => serde_json::json!({
+      "grant_required": true,
+      "landing": landing,
+      "manifest": hex32(manifest),
+      "summary": slates_mcp::landing_summary_json(summary),
+      "conflicts": conflicts,
+      "grant_with": format!("slates grant {landing}"),
+    }),
+  }
+}
+
+/// Acknowledges an outcome-only verb: a JSON `{ "ok": true }` under `--json`, else the text `message`.
+/// One shape for every verb whose success is a bare acknowledgement (resize, destroy, detach, destroy
+/// a snapshot), so a script tests `.ok` uniformly.
+fn emit_ok(message: &str, json: bool) {
+  if json {
+    println!("{}", serde_json::json!({ "ok": true }));
+  } else {
+    println!("{message}");
+  }
+}
+
 fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError> {
   match verb {
     Verb::Create {
@@ -307,15 +543,14 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       require_locked,
       base,
     } => {
-      let id = client.create(&CreateSpec {
+      let spec = CreateSpec {
         name: name.clone(),
         size: *size,
         names: *names,
         require_locked: *require_locked,
         base: base.clone(),
-      })?;
-      println!("id: {}", volume_id_text(id));
-      println!("path: (none until a bridge exists)");
+      };
+      emit_create(client, &spec, json)?;
     }
     Verb::List => emit_list(client, json)?,
     Verb::DaemonStatus => emit_daemon_status(client, json)?,
@@ -323,12 +558,10 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     // `mount`/`unmount` run `mount_nfs`/`umount` (CLI/OS operations whose failure is a `Failure`, not a
     // `ClientError`), so [`run`] handles them before this dispatch; they never reach here.
     Verb::Mount { .. } | Verb::Unmount { .. } => {}
-    Verb::Snapshot { volume } => {
-      println!("snapshot: {}", client.snapshot(*volume)?.value);
-    }
+    Verb::Snapshot { volume } => emit_snapshot(client, *volume, json)?,
     Verb::DestroySnapshot { volume, snapshot } => {
       client.destroy_snapshot(*volume, *snapshot)?;
-      println!("snapshot destroyed");
+      emit_ok("snapshot destroyed", json);
     }
     Verb::Green { .. }
     | Verb::Versions { .. }
@@ -341,89 +574,52 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       volume,
       snapshot,
       scope,
-    } => {
-      let (placed, mirror_age_ns) = client.await_placed(*volume, *snapshot, *scope)?;
-      println!("placed: {placed}");
-      println!("mirror_age_ns: {}", option_text(mirror_age_ns));
-    }
+    } => emit_placed(client, *volume, *snapshot, *scope, json)?,
     Verb::Clone {
       volume,
       snapshot,
       name,
-    } => {
-      let id = client.clone_snapshot(*volume, *snapshot, name)?;
-      println!("id: {}", volume_id_text(id));
-    }
+    } => emit_clone(client, *volume, *snapshot, name, json)?,
     Verb::Resize { volume, size } => {
       client.resize(*volume, *size)?;
-      println!("ok");
+      emit_ok("ok", json);
     }
     Verb::Destroy { volume } => {
       client.destroy(*volume)?;
-      println!("ok");
+      emit_ok("ok", json);
     }
     Verb::Attach {
       volume,
       snapshot,
       intent,
-    } => {
-      let attached = client.attach(*volume, *snapshot, *intent)?;
-      println!("attachment: {}", attached.attachment);
-      println!("lease_epoch: {}", option_text(attached.lease_epoch));
-      println!(
-        "path: {}",
-        attached
-          .path
-          .unwrap_or_else(|| "(none until a bridge exists)".to_owned())
-      );
-    }
+    } => emit_attach(client, *volume, *snapshot, *intent, json)?,
     Verb::Detach { attachment } => {
       client.detach(*attachment)?;
-      println!("ok");
+      emit_ok("ok", json);
     }
     Verb::ReadBase { volume, path } => {
       use std::io::Write;
       let bytes = client.read_base(*volume, path)?;
       let mut out = std::io::stdout().lock();
-      // A closed pipe is the reader's choice, not a failure of the verb.
+      // A closed pipe is the reader's choice, not a failure of the verb. `read-base` writes raw bytes
+      // (a file's content), so `--json` does not wrap them — a script redirects the stream to a file.
       let _ = out.write_all(&bytes);
       let _ = out.flush();
     }
-    Verb::Rewitness { volume, paths } => {
-      for path in client.rewitness(*volume, paths.clone())? {
-        println!("{path}");
-      }
-    }
-    Verb::Pin { volume, paths } => {
-      println!("pinned: {}", client.pin(*volume, paths.clone())?);
-    }
+    Verb::Rewitness { volume, paths } => emit_rewitness(client, *volume, paths.clone(), json)?,
+    Verb::Pin { volume, paths } => emit_pin(client, *volume, paths.clone(), json)?,
     Verb::Land {
       volume,
       snapshot,
       target,
       filter,
       grant,
-    } => print_landing(client.land(*volume, *snapshot, target, filter.clone(), *grant)?),
-    Verb::Grants => {
-      for grant in client.grants()? {
-        println!(
-          "{} {} {} {:?} {}",
-          grant.id,
-          volume_id_text(grant.volume),
-          grant.target,
-          grant.scope,
-          grant.state
-        );
-      }
-    }
-    Verb::Audit { since } => {
-      for record in client.audit(*since)? {
-        println!(
-          "{} {} {} grant={:?} landing={:?} outcome={:?}",
-          record.seq, record.at_ns, record.kind, record.grant, record.landing, record.outcome
-        );
-      }
-    }
+    } => emit_landing(
+      client.land(*volume, *snapshot, target, filter.clone(), *grant)?,
+      json,
+    ),
+    Verb::Grants => emit_grants(client, json)?,
+    Verb::Audit { since } => emit_audit(client, *since, json)?,
   }
   Ok(())
 }

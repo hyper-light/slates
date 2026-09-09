@@ -15,32 +15,32 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   profile  [--quick] [--json]                      measure and print the machine profile
   mcp [--instance NAME] [--http PORT]               serve the MCP tools (stdio, or loopback HTTP)
 
-  volume create NAME (--bounded SIZE | --dynamic MAX) [--fold] [--locked] [--base DIR]
+  volume create NAME (--bounded SIZE | --dynamic MAX) [--fold] [--locked] [--base DIR] [--json]
   volume list [--json]
   volume stat ID [--json]
-  volume snapshot ID
-  volume destroy-snapshot ID SNAPSHOT
-  volume clone ID SNAPSHOT NAME
-  volume resize ID (--bounded SIZE | --dynamic MAX)
-  volume destroy ID
-  green NAME                                        create a green merge target
-  versions GREEN                                   its head version
-  changed-since GREEN VERSION                       files changed since a version
-  work GREEN NAME                                  a work volume over a green
-  edit WORK PATH AT DELETE TEXT                     declare an edit (a splice)
-  submit WORK                                       submit a work's increment
-  rebase WORK                                       rebase a work onto its green's head
-  volume placed ID [--snapshot N] [--mirror]         await a durability scope
-  attach ID [--read | --write] [--snapshot N]
-  detach ATTACHMENT
+  volume snapshot ID [--json]
+  volume destroy-snapshot ID SNAPSHOT [--json]
+  volume clone ID SNAPSHOT NAME [--json]
+  volume resize ID (--bounded SIZE | --dynamic MAX) [--json]
+  volume destroy ID [--json]
+  green NAME [--json]                              create a green merge target
+  versions GREEN [--json]                          its head version
+  changed-since GREEN VERSION [--json]             files changed since a version
+  work GREEN NAME [--json]                         a work volume over a green
+  edit WORK PATH AT DELETE TEXT [--json]           declare an edit (a splice)
+  submit WORK [--json]                             submit a work's increment
+  rebase WORK [--json]                             rebase a work onto its green's head
+  volume placed ID [--snapshot N] [--mirror] [--json]   await a durability scope
+  attach ID [--read | --write] [--snapshot N] [--json]
+  detach ATTACHMENT [--json]
   status [--json]                                  the daemon's status
   status ID [--drift] [--json]
   base read ID PATH
-  base rewitness ID [PATH ...]
-  base pin ID [PATH ...]
-  land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N]
-  grants
-  audit [--since N]
+  base rewitness ID [PATH ...] [--json]
+  base pin ID [PATH ...] [--json]
+  land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
+  grants [--json]
+  audit [--since N] [--json]
   exec --volume V --at PATH -- CMD [ARG ...]        run CMD with the volume at PATH
 ";
 
@@ -49,7 +49,8 @@ pub(crate) const USAGE_NOTES: &str =
   "SIZE is bytes with a binary unit: 512MiB, 4GiB (B, KiB, MiB, GiB, TiB).
 The instance is --instance, else SLATES_ENDPOINT, else `default`.
 Exit codes: 0 done, 1 refused, 2 usage, 3 no daemon, 4 failed.
---json emits machine-readable JSON for status, `volume stat`, `volume list`, versions and changed-since.";
+--json emits machine-readable JSON on every client verb (the MCP schema), except `base read` which
+streams raw bytes. Ids come back as `{\"id\"}`, an outcome-only verb as `{\"ok\":true}`.";
 
 /// A parse refusal.
 #[derive(Debug, PartialEq, Eq)]

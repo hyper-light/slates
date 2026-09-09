@@ -1,7 +1,7 @@
 # The `slates` command
 
 This guide describes the implemented command grammar (the A-9 review was 2026-09-05;
-`mount`/`unmount`, the merge verbs, `--json` on the read and query verbs, and `mcp` were
+`mount`/`unmount`, the merge verbs, `--json` on every verb, and `mcp` were
 added 2026-09-09). The [unified design](wip/SLATES_DESIGN.md) §4.12 describes the target
 interface; the [gap ledger](wip/GAPS.md) §8i tracks what is still missing.
 
@@ -35,34 +35,35 @@ an anonymous shared segment alone does not establish locked residency or no swap
 The instance is `--instance`, else `SLATES_ENDPOINT`, else `default`.
 
 ```
-slates volume create NAME (--bounded SIZE | --dynamic MAX) [--fold] [--locked] [--base DIR]
+slates volume create NAME (--bounded SIZE | --dynamic MAX) [--fold] [--locked] [--base DIR] [--json]
 slates volume list [--json]
 slates volume stat ID [--json]
-slates volume snapshot ID
-slates volume clone ID SNAPSHOT NAME
-slates volume resize ID (--bounded SIZE | --dynamic MAX)
-slates volume destroy ID
-slates volume placed ID [--snapshot N] [--mirror]
-slates green NAME
+slates volume snapshot ID [--json]
+slates volume destroy-snapshot ID SNAPSHOT [--json]
+slates volume clone ID SNAPSHOT NAME [--json]
+slates volume resize ID (--bounded SIZE | --dynamic MAX) [--json]
+slates volume destroy ID [--json]
+slates volume placed ID [--snapshot N] [--mirror] [--json]
+slates green NAME [--json]
 slates versions GREEN [--json]
 slates changed-since GREEN VERSION [--json]
-slates work GREEN NAME
-slates edit WORK PATH AT DELETE TEXT
+slates work GREEN NAME [--json]
+slates edit WORK PATH AT DELETE TEXT [--json]
 slates submit WORK [--json]
 slates rebase WORK [--json]
 slates mount ID PATH
 slates unmount PATH
-slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N]
-slates grants
-slates audit [--since N]
+slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
+slates grants [--json]
+slates audit [--since N] [--json]
 slates exec --volume V --at PATH -- CMD [ARG ...]
-slates attach ID [--read | --write] [--snapshot N]
-slates detach ATTACHMENT
+slates attach ID [--read | --write] [--snapshot N] [--json]
+slates detach ATTACHMENT [--json]
 slates status [--json]
 slates status ID [--drift] [--json]
 slates base read ID PATH
-slates base rewitness ID [PATH ...]
-slates base pin ID [PATH ...]
+slates base rewitness ID [PATH ...] [--json]
+slates base pin ID [PATH ...] [--json]
 slates profile [--quick] [--json]
 slates mcp [--instance NAME] [--http PORT]
 ```
@@ -75,9 +76,14 @@ Output is plain and stable: one `key: value` per line (`create`, `stat`, `status
 `overlay=`; `status --drift` and `rewitness`: one path per line), `ok` for the verbs that
 return nothing, and the raw bytes for `base read`.
 
-`--json` emits a machine-readable form of the read and query verbs — `status`, `status ID` /
-`volume stat`, `volume list`, `versions`, `changed-since`, `submit` and `rebase` — with the same
-fields as the text form and the same schema the MCP surface emits (one definition, two surfaces).
+`--json` emits a machine-readable form of every verb — the read and query verbs (`status`,
+`status ID` / `volume stat`, `volume list`, `versions`, `changed-since`, `submit`, `rebase`), the
+volume-lifecycle verbs (`create`, `snapshot`, `clone`, `resize`, `destroy`, `destroy-snapshot`,
+`placed`, `attach`, `detach`, `pin`, `rewitness`, `grants`, `audit`, `land`), and the merge create
+verbs (`green`, `work`, `edit`) — with the same fields as the text form and the same schema the MCP
+surface emits (one definition, two surfaces). A creating verb returns `{"id": "<hex>"}` (the same
+key across `create`, `clone`, `green` and `work`); an outcome-only verb returns `{"ok": true}`. The
+one exception is `base read`, which streams a file's raw bytes with or without `--json`.
 `slates mount ID PATH` mounts the volume at an existing user-owned directory over the loopback
 NFS bridge; `slates unmount PATH` removes it. `slates mcp` serves the MCP tools over stdio, or
 loopback Streamable HTTP with `--http PORT`.
@@ -96,8 +102,8 @@ The following are requirements, not additional runnable commands:
 
 - One typed operation definition supplies CLI help, MCP schemas, SDK calls and refusals.
 - Scoped names as well as ids; consistent `--help`, structured `--json`, pagination and
-  actionable errors. `--json` now covers the read and query verbs (above) with the MCP schema;
-  pagination (cursors), scoped names and JSON on the remaining verbs are still open.
+  actionable errors. `--json` now covers every verb (above) with the MCP schema; pagination
+  (cursors) and scoped names are still open.
 - Discover the instance/root from enrolled context; report success only when the requested
   path or guest tag is ready, including consumer rights and supported attachment capabilities.
 - Distinguish a live overlay's retained base from a complete immutable capture. Cloning shares

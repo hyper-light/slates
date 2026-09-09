@@ -1,4 +1,14 @@
-# slates
+<p align="center">
+  <a href="docs/assets/brand/slates-planes-preview.png">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/brand/slates-planes-dark.svg">
+      <source media="(prefers-color-scheme: light)" srcset="docs/assets/brand/slates-planes-light.svg">
+      <img src="docs/assets/brand/slates-planes-light.svg" alt="Slates logo: angular workspaces floating above a shared base" width="90" height="90">
+    </picture>
+  </a>
+</p>
+
+<h1 align="center">slates</h1>
 
 **Copy-on-write workspaces for coding agents: provisioned in microseconds, kept in RAM, seen as a normal path, merged without guessing, and written to disk only when a human says so.**
 

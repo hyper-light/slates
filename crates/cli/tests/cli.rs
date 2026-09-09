@@ -472,12 +472,90 @@ fn json_error(instance: &str) {
   );
 }
 
-/// `--json` makes the read verbs emit the MCP JSON schema (§4.12, GAP-A9-10 "consistent JSON" — the
-/// CLI and the MCP surface share one definition): `status ID --json` and `status --json` return one
-/// JSON object, `volume list --json` a JSON array, each carrying the volume's real fields. Gated like
-/// the anchor+daemon flow (it needs a daemon), skipping loudly without `SLATES_TEST_CLI`.
+/// Reads one compact-JSON field's value (a number, or a quoted string with its quotes stripped), so
+/// the lifecycle flow can capture an id or a snapshot number the `--json` verbs print.
+fn json_field(text: &str, key: &str) -> String {
+  let needle = format!("\"{key}\":");
+  let start = text
+    .find(&needle)
+    .unwrap_or_else(|| panic!("no `{key}` in {text:?}"))
+    + needle.len();
+  let rest = &text[start..];
+  let end = rest.find([',', '}', ']']).unwrap_or(rest.len());
+  rest[..end].trim().trim_matches('"').to_owned()
+}
+
+/// The value-returning lifecycle verbs under `--json` (GAP-A9-10 "consistent JSON" for the lifecycle,
+/// Ada's request — a human scripting the CLI wants every verb to speak JSON): `create`/`clone` emit
+/// `{ "id" }` (the same key `green`/`work` use), `snapshot` `{ "snapshot" }`, `attach` the MCP
+/// attachment schema, `pin` `{ "pinned" }`, `rewitness` `{ "paths" }`, and the acknowledgement verbs
+/// (`resize`, `destroy`, `detach`) a uniform `{ "ok": true }`. Each id is captured from its own JSON.
+fn json_lifecycle(instance: &str) {
+  let (code, out, err) = run(
+    instance,
+    &["volume", "create", "lifej", "--bounded", "4MiB", "--json"],
+  );
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.trim().starts_with('{') && out.contains("\"id\":\""),
+    "create json: {out}"
+  );
+  let id = json_field(out.trim(), "id");
+
+  let (code, out, err) = run(instance, &["volume", "snapshot", &id, "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(out.contains("\"snapshot\":"), "snapshot json: {out}");
+  let snapshot = json_field(out.trim(), "snapshot");
+
+  let (code, out, err) = run(
+    instance,
+    &["volume", "clone", &id, &snapshot, "lifeclone", "--json"],
+  );
+  assert_eq!(code, 0, "{err}");
+  assert!(out.contains("\"id\":\""), "clone json: {out}");
+
+  let (code, out, err) = run(
+    instance,
+    &["volume", "resize", &id, "--bounded", "8MiB", "--json"],
+  );
+  assert_eq!(code, 0, "{err}");
+  assert!(out.contains("\"ok\":true"), "resize json: {out}");
+
+  let (code, out, err) = run(instance, &["attach", &id, "--read", "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.trim().starts_with('{') && out.contains("\"attachment\":"),
+    "attach json: {out}"
+  );
+  let attachment = json_field(out.trim(), "attachment");
+
+  let (code, out, err) = run(instance, &["detach", &attachment, "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(out.contains("\"ok\":true"), "detach json: {out}");
+
+  let (code, out, err) = run(instance, &["base", "pin", &id, "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(out.contains("\"pinned\":"), "pin json: {out}");
+
+  let (code, out, err) = run(instance, &["base", "rewitness", &id, "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.trim().starts_with('{') && out.contains("\"paths\":"),
+    "rewitness json: {out}"
+  );
+
+  let (code, out, err) = run(instance, &["volume", "destroy", &id, "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(out.contains("\"ok\":true"), "destroy json: {out}");
+}
+
+/// `--json` makes every verb emit the MCP JSON schema (§4.12, GAP-A9-10 "consistent JSON" — the CLI
+/// and the MCP surface share one definition): the read verbs (`status ID`, `status`, `volume list`),
+/// the merge verbs, and the lifecycle verbs (`create`/`snapshot`/`clone`/`resize`/`attach`/`detach`/
+/// `pin`/`rewitness`/`destroy`), each carrying the volume's real fields, plus a JSON error on refusal.
+/// Gated like the anchor+daemon flow (it needs a daemon), skipping loudly without `SLATES_TEST_CLI`.
 #[test]
-fn the_read_verbs_emit_json_with_the_json_flag() {
+fn the_verbs_emit_json_with_the_json_flag() {
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
     eprintln!(
       "skipping the --json flow: set SLATES_TEST_CLI=1 to run it (needs the machine to itself)"
@@ -497,6 +575,7 @@ fn the_read_verbs_emit_json_with_the_json_flag() {
   json_daemon_status(&instance);
   json_merge_queries(&instance);
   json_merge_creates(&instance);
+  json_lifecycle(&instance);
   json_error(&instance);
   drop(anchor);
 }
