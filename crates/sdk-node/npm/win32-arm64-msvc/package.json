@@ -1,0 +1,34 @@
+{
+  "name": "slates-win32-arm64-msvc",
+  "version": "0.1.0",
+  "cpu": [
+    "arm64"
+  ],
+  "main": "slates.win32-arm64-msvc.node",
+  "files": [
+    "slates.win32-arm64-msvc.node"
+  ],
+  "description": "The Node / TypeScript SDK for slates — a hermetic, RAM-only, copy-on-write VFS an agent provisions in under 50 µs. A napi-rs addon over the typed Rust client (sync Client) plus an async-primary AsyncClient resolved by the completion fd's readiness.",
+  "keywords": [
+    "slates",
+    "vfs",
+    "filesystem",
+    "copy-on-write",
+    "agent",
+    "sandbox",
+    "napi",
+    "async"
+  ],
+  "author": "Ada Lundhe",
+  "license": "MIT",
+  "engines": {
+    "node": ">= 18"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "os": [
+    "win32"
+  ]
+}

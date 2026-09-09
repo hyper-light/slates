@@ -10,28 +10,37 @@ not truncated).
 This is the **synchronous** base the design says the async form wraps (R6); the async form (over the
 completion descriptor, as Promises) is owed.
 
-## Build and load
+## Install
 
 ```
-cargo build -p slates-sdk-node          # target/debug/libslates_sdk_node.dylib (.so / .dll)
+npm install slates
 ```
 
-Load the built library as a Node addon (copy or rename it to a `*.node` path):
-
-```js
-const { createRequire } = require('node:module');
-const slates = createRequire(import.meta.url)('/path/to/slates.node');
-```
+`slates` ships a prebuilt native addon per platform (macOS, Linux, Windows), resolved for your
+`process.platform`/`arch` as an `optionalDependency` — no build toolchain is needed to install. From
+a source checkout instead: `cargo build -p slates-sdk-node`, then `npm run build` (napi) produces the
+platform `.node`.
 
 ## Connect
 
 ```js
-// replyNs / reconnectNs are nanosecond deadlines; a production caller derives them from the
-// machine's budgets. The instance is the daemon `slates anchor --instance <name>` published.
-const client = slates.Client.connect('default', 5_000_000, 10_000_000);
+import { Client, AsyncClient } from 'slates';
+
+// replyNs / reconnectNs are nanosecond deadlines a production caller derives from the machine's
+// budgets. The instance is the daemon `slates anchor --instance <name>` published.
+const client = Client.connect('default', 5_000_000, 10_000_000);
 ```
 
-Connecting where no daemon answers throws. Use the client from the Node main thread.
+`AsyncClient` is the **async-primary** form — the same verbs, each a Promise resolved on the event
+loop by the completion fd's readiness (never blocking it), with the sync `Client` as the thin facade:
+
+```js
+const async = AsyncClient.connect('default', 5_000_000, 10_000_000);
+const volume = await async.create('scratch', 8 * 1024 * 1024);
+const status = await async.status(volume);
+```
+
+Connecting where no daemon answers throws. Use a client from the thread that connected it.
 
 ## Volume lifecycle
 

@@ -11,6 +11,19 @@
 // mid-life, because the fd is owned by the Rust client (a double close would race its descriptor).
 
 import net from 'node:net';
+import { createRequire } from 'node:module';
+
+// The published package loads the napi addon from its generated loader; the sandbox tests pass a
+// freshly built addon explicitly (via SLATES_NODE_ADDON), so this is resolved lazily and only in the
+// package path — a test never triggers it.
+let _defaultAddon = null;
+function defaultAddon() {
+  if (!_defaultAddon) {
+    const require = createRequire(import.meta.url);
+    _defaultAddon = require('./index.js');
+  }
+  return _defaultAddon;
+}
 
 export class AsyncClient {
   constructor(inner) {
@@ -19,10 +32,15 @@ export class AsyncClient {
     this._sock = null;
   }
 
-  // Connects to `instance` as a new async client over the loaded `addon`. The rendezvous is a fast
-  // blocking handshake done once; every verb after it is async.
-  static connect(addon, instance, replyNs, reconnectNs) {
-    return new AsyncClient(addon.Client.connect(instance, replyNs, reconnectNs));
+  // Connects to a daemon as a new async client. In the published package: `connect(instance, replyNs,
+  // reconnectNs)` — the addon loads itself. In the sandbox tests: `connect(addon, instance, replyNs,
+  // reconnectNs)` — an explicit, freshly built addon. The rendezvous is a fast blocking handshake done
+  // once; every verb after it is async.
+  static connect(a, b, c, d) {
+    if (typeof a === 'string') {
+      return new AsyncClient(defaultAddon().Client.connect(a, b, c));
+    }
+    return new AsyncClient(a.Client.connect(b, c, d));
   }
 
   clientId() {

@@ -1,0 +1,78 @@
+{
+  "name": "slates",
+  "version": "0.1.0",
+  "description": "The Node / TypeScript SDK for slates — a hermetic, RAM-only, copy-on-write VFS an agent provisions in under 50 µs. A napi-rs addon over the typed Rust client (sync Client) plus an async-primary AsyncClient resolved by the completion fd's readiness.",
+  "author": "Ada Lundhe",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hyper-light/slates.git",
+    "directory": "crates/sdk-node"
+  },
+  "homepage": "https://github.com/hyper-light/slates#readme",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs",
+      "require": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "index.mjs",
+    "async.mjs",
+    "README.md"
+  ],
+  "keywords": [
+    "slates",
+    "vfs",
+    "filesystem",
+    "copy-on-write",
+    "agent",
+    "sandbox",
+    "napi",
+    "async"
+  ],
+  "napi": {
+    "binaryName": "slates",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-musl",
+      "x86_64-pc-windows-msvc",
+      "aarch64-pc-windows-msvc",
+      "i686-pc-windows-msvc"
+    ]
+  },
+  "optionalDependencies": {
+    "slates-darwin-arm64": "0.1.0",
+    "slates-darwin-x64": "0.1.0",
+    "slates-linux-x64-gnu": "0.1.0",
+    "slates-linux-arm64-gnu": "0.1.0",
+    "slates-linux-x64-musl": "0.1.0",
+    "slates-linux-arm64-musl": "0.1.0",
+    "slates-win32-x64-msvc": "0.1.0",
+    "slates-win32-arm64-msvc": "0.1.0",
+    "slates-win32-ia32-msvc": "0.1.0"
+  },
+  "engines": {
+    "node": ">= 18"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "scripts": {
+    "build": "napi build --manifest-path Cargo.toml --platform --release",
+    "build:debug": "napi build --manifest-path Cargo.toml --platform",
+    "artifacts": "napi artifacts",
+    "prepublishOnly": "napi prepublish -t npm --no-gh-release",
+    "test": "node --test tests/sdk.test.mjs tests/sdk_async.test.mjs"
+  }
+}

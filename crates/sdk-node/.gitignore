@@ -1,0 +1,2 @@
+# napi build artifacts (built per-platform in CI, not committed)
+*.node
