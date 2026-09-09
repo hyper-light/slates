@@ -49,7 +49,7 @@ pub(crate) const USAGE_NOTES: &str =
   "SIZE is bytes with a binary unit: 512MiB, 4GiB (B, KiB, MiB, GiB, TiB).
 The instance is --instance, else SLATES_ENDPOINT, else `default`.
 Exit codes: 0 done, 1 refused, 2 usage, 3 no daemon, 4 failed.
---json emits machine-readable JSON for status, `volume stat` and `volume list` (the MCP schema).";
+--json emits machine-readable JSON for status, `volume stat`, `volume list`, versions and changed-since.";
 
 /// A parse refusal.
 #[derive(Debug, PartialEq, Eq)]

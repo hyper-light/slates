@@ -407,6 +407,26 @@ fn json_daemon_status(instance: &str) {
   assert!(out.contains("\"shards\":"), "the shard count: {out}");
 }
 
+/// `versions GREEN --json` → a `{ "head": N }` object; `changed-since GREEN 0 --json` → a
+/// `{ "paths": [...] }` object (empty on a fresh green).
+fn json_merge_queries(instance: &str) {
+  let (code, out, err) = run(instance, &["green", "greenjson"]);
+  assert_eq!(code, 0, "{err}");
+  let green = value_of(&out, "id");
+  let (code, out, err) = run(instance, &["versions", &green, "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.trim().starts_with('{') && out.contains("\"head\":"),
+    "versions json: {out}"
+  );
+  let (code, out, err) = run(instance, &["changed-since", &green, "0", "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.trim().starts_with('{') && out.contains("\"paths\":"),
+    "changed-since json: {out}"
+  );
+}
+
 /// `--json` makes the read verbs emit the MCP JSON schema (§4.12, GAP-A9-10 "consistent JSON" — the
 /// CLI and the MCP surface share one definition): `status ID --json` and `status --json` return one
 /// JSON object, `volume list --json` a JSON array, each carrying the volume's real fields. Gated like
@@ -430,6 +450,7 @@ fn the_read_verbs_emit_json_with_the_json_flag() {
   json_status_of(&instance, &id);
   json_list_has(&instance, &id);
   json_daemon_status(&instance);
+  json_merge_queries(&instance);
   drop(anchor);
 }
 

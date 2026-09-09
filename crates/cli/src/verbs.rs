@@ -105,18 +105,28 @@ fn serve_mcp_stdio(mut server: slates_mcp::McpServer) -> Result<(), Failure> {
 }
 
 /// The merge verbs (§4.16), split out to keep [`serve`] under the cognitive-complexity bound.
-fn serve_merge(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
+fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError> {
   match verb {
     Verb::Green { name, evidence } => {
       let id = client.create_green(name, *evidence)?;
       println!("id: {}", volume_id_text(id));
     }
     Verb::Versions { green } => {
-      println!("head: {}", client.versions(*green)?);
+      let head = client.versions(*green)?;
+      if json {
+        println!("{}", serde_json::json!({ "head": head }));
+      } else {
+        println!("head: {head}");
+      }
     }
     Verb::ChangedSince { green, version } => {
-      for path in client.changed_since(*green, *version)? {
-        println!("{path}");
+      let paths = client.changed_since(*green, *version)?;
+      if json {
+        println!("{}", serde_json::json!({ "paths": paths }));
+      } else {
+        for path in paths {
+          println!("{path}");
+        }
       }
     }
     Verb::Work { green, name } => {
@@ -246,7 +256,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     | Verb::Work { .. }
     | Verb::Edit { .. }
     | Verb::Submit { .. }
-    | Verb::Rebase { .. } => serve_merge(client, verb)?,
+    | Verb::Rebase { .. } => serve_merge(client, verb, json)?,
     Verb::Placed {
       volume,
       snapshot,
