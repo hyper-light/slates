@@ -19,7 +19,7 @@
 //! class's latency bound contains a term from another class's queue.
 //!
 //! Modules: [`header`], [`codec`] (the `Wire` trait and the primitive encodings), [`schema`],
-//! [`crc32c`], [`frame`], [`credit`], [`request`], [`error`].
+//! [`crc32c`], [`frame`], [`credit`], [`request`], [`observe`] (§4.14 spans), [`error`].
 
 // The derive emits `::slates_wire::` paths; this alias makes them resolve inside the crate.
 extern crate self as slates_wire;
@@ -30,6 +30,7 @@ pub mod credit;
 pub mod error;
 pub mod frame;
 pub mod header;
+pub mod observe;
 pub mod request;
 pub mod schema;
 
@@ -37,5 +38,6 @@ pub use codec::Wire;
 pub use error::WireError;
 pub use frame::{FrameCaps, Framer};
 pub use header::{Class, Flags, Header};
+pub use observe::{CausedBy, Chokepoint, SpanContext, SpanId, TraceId};
 pub use request::RequestId;
 pub use slates_wire_derive::Wire;
