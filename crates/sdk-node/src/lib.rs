@@ -33,7 +33,8 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use slates_client::{
-  Client as RustClient, ClientError, CreateSpec, Deadlines, NamePolicy, SizeClass, VolumeId,
+  Client as RustClient, ClientError, CreateSpec, Deadlines, NamePolicy, Rebased, SizeClass,
+  Submitted, VolumeId,
 };
 
 /// Format: a volume id is 16 bytes on the wire — its high half names the creator host (§4.8 "Lookup").
@@ -129,6 +130,59 @@ pub struct VolumeEntry {
   pub referenced_bytes: i64,
   pub unique_bytes: i64,
   pub overlay: bool,
+}
+
+/// A work volume created over a green (§4.16): its id (hex) and the green base version its edits submit
+/// against. napi camelCase keys.
+#[napi(object)]
+pub struct WorkVolume {
+  pub id: String,
+  pub base: i64,
+}
+
+/// A merge conflict window (§4.16): the file and the base-coordinate range (`at`, `len`) that met an
+/// intervening change, with the conflict-class discriminant. napi camelCase keys.
+#[napi(object)]
+pub struct ConflictWindow {
+  pub path: String,
+  pub at: i64,
+  pub len: i64,
+  pub class: u32,
+}
+
+/// The outcome of a `submit` or `rebase` (§4.16): `ok` whether the increment landed cleanly, the green
+/// `version` produced (or null on conflict), and the `conflicts` windows to resolve.
+#[napi(object)]
+pub struct MergeOutcome {
+  pub ok: bool,
+  pub version: Option<i64>,
+  pub conflicts: Vec<ConflictWindow>,
+}
+
+/// Builds the uniform merge outcome for `submit`/`rebase`: `ok` is exactly "a version was produced";
+/// windows arrive as plain tuples so this needs no protocol type. Every u64 range-checked to a JS int.
+fn merge_outcome(
+  version: Option<u64>,
+  windows: Vec<(String, u64, u64, u8)>,
+) -> Result<MergeOutcome> {
+  let mut conflicts = Vec::with_capacity(windows.len());
+  for (path, at, len, class) in windows {
+    conflicts.push(ConflictWindow {
+      path,
+      at: status_i64(at, "at")?,
+      len: status_i64(len, "len")?,
+      class: u32::from(class),
+    });
+  }
+  let version = match version {
+    Some(value) => Some(status_i64(value, "version")?),
+    None => None,
+  };
+  Ok(MergeOutcome {
+    ok: version.is_some(),
+    version,
+    conflicts,
+  })
 }
 
 /// A connected slates client (§4.4, §4.9): the lifecycle verbs as methods. Constructed by
@@ -270,6 +324,100 @@ impl Client {
     let id = parse_volume(&volume)?;
     self.inner.destroy(id).map_err(refusal)?;
     Ok(())
+  }
+
+  /// Creates a green volume — a shared merge target (§4.16) — returning its hex id. `requireEvidence`
+  /// makes the green refuse an increment that carries no evidence of the base it was derived from.
+  #[napi]
+  pub fn create_green(&mut self, name: String, require_evidence: Option<bool>) -> Result<String> {
+    let id = self
+      .inner
+      .create_green(&name, require_evidence.unwrap_or(false))
+      .map_err(refusal)?;
+    Ok(volume_hex(&id))
+  }
+
+  /// Creates a work volume over a green (§4.16), returning its id (hex) and the green base version its
+  /// edits will be submitted against.
+  #[napi]
+  pub fn create_work(&mut self, green: String, name: String) -> Result<WorkVolume> {
+    let green = parse_volume(&green)?;
+    let (id, base) = self.inner.create_work(green, &name).map_err(refusal)?;
+    Ok(WorkVolume {
+      id: volume_hex(&id),
+      base: status_i64(base, "base")?,
+    })
+  }
+
+  /// A green's head version (§4.16) — the number that advances with each accepted submit.
+  #[napi]
+  pub fn versions(&mut self, green: String) -> Result<i64> {
+    let green = parse_volume(&green)?;
+    status_i64(self.inner.versions(green).map_err(refusal)?, "version")
+  }
+
+  /// The files a green changed strictly after `version` (§4.16).
+  #[napi]
+  pub fn changed_since(&mut self, green: String, version: i64) -> Result<Vec<String>> {
+    let green = parse_volume(&green)?;
+    let version = checked_u64(version, "version")?;
+    self.inner.changed_since(green, version).map_err(refusal)
+  }
+
+  /// Declares a content edit on a work volume (§4.16): a splice at `path` — remove `deleteLen` bytes at
+  /// offset `at`, then insert `data` (a Buffer). An insert is `deleteLen` zero; an overwrite is a delete
+  /// and an insert in one call.
+  #[napi]
+  pub fn edit(
+    &mut self,
+    work: String,
+    path: String,
+    at: i64,
+    delete_len: i64,
+    data: Buffer,
+  ) -> Result<()> {
+    let work = parse_volume(&work)?;
+    let at = checked_u64(at, "at")?;
+    let delete_len = checked_u64(delete_len, "deleteLen")?;
+    self
+      .inner
+      .edit(work, &path, at, delete_len, data.as_ref())
+      .map_err(refusal)?;
+    Ok(())
+  }
+
+  /// Submits a work volume's declared edits to its green (§4.16): the merge outcome — `ok` with the new
+  /// green `version` when accepted, or the `conflicts` windows to rebase against when it conflicts.
+  #[napi]
+  pub fn submit(&mut self, work: String) -> Result<MergeOutcome> {
+    let work = parse_volume(&work)?;
+    match self.inner.submit(work).map_err(refusal)? {
+      Submitted::Accepted(version) => merge_outcome(Some(version), Vec::new()),
+      Submitted::Conflict(windows) => merge_outcome(
+        None,
+        windows
+          .into_iter()
+          .map(|w| (w.path, w.at, w.len, w.class))
+          .collect(),
+      ),
+    }
+  }
+
+  /// Rebases a work volume onto its green's head (§4.16), mapping its pending edits forward without
+  /// committing to the green — the same outcome shape as [`Client::submit`].
+  #[napi]
+  pub fn rebase(&mut self, work: String) -> Result<MergeOutcome> {
+    let work = parse_volume(&work)?;
+    match self.inner.rebase(work).map_err(refusal)? {
+      Rebased::Rebased(version) => merge_outcome(Some(version), Vec::new()),
+      Rebased::Conflict(windows) => merge_outcome(
+        None,
+        windows
+          .into_iter()
+          .map(|w| (w.path, w.at, w.len, w.class))
+          .collect(),
+      ),
+    }
   }
 
   /// How many times this client has reconnected across daemon restarts (an observability counter, so a

@@ -13,7 +13,7 @@ import unittest
 
 import slates
 
-# The lifecycle verbs this slice binds; more (create_green, edit, submit, land) are owed.
+# The lifecycle and merge verbs this slice binds; `land` and the async form are owed.
 BOUND_VERBS = {
     "connect",
     "create",
@@ -22,6 +22,13 @@ BOUND_VERBS = {
     "list",
     "resize",
     "destroy",
+    "create_green",
+    "create_work",
+    "versions",
+    "changed_since",
+    "edit",
+    "submit",
+    "rebase",
     "client_id",
     "reconnects",
 }
@@ -143,6 +150,26 @@ class SlatesSdkRoundTrip(unittest.TestCase):
                 all(v["id"] != volume for v in client.list()),
                 "the destroyed volume is gone from list",
             )
+
+            # merge workflow (§4.16): a green, a work over it, a content edit, a clean submit.
+            green = client.create_green("g-roundtrip")
+            self.assertEqual(len(green), 32)
+            work = client.create_work(green, "w-roundtrip")
+            self.assertEqual(len(work["id"]), 32)
+            base = work["base"]
+            client.edit(work["id"], "/notes.txt", 0, 0, b"hello merge")
+            outcome = client.submit(work["id"])
+            self.assertTrue(outcome["ok"], f"the submit landed cleanly: {outcome}")
+            self.assertIsInstance(outcome["version"], int)
+            self.assertEqual(outcome["conflicts"], [])
+            # the green advanced past the work's base and lists the edited file.
+            self.assertGreater(client.versions(green), base)
+            changed = client.changed_since(green, base)
+            self.assertTrue(any("notes.txt" in path for path in changed), changed)
+            # a fresh work off the advanced head rebases cleanly (no pending edits, nothing to conflict).
+            fresh = client.create_work(green, "w2-roundtrip")
+            rebased = client.rebase(fresh["id"])
+            self.assertTrue(rebased["ok"], f"a fresh work rebases cleanly: {rebased}")
         finally:
             # Kill the whole process group so the supervised daemon goes with the anchor at once.
             try:

@@ -33,7 +33,8 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use slates_client::{
-  Client as RustClient, ClientError, CreateSpec, Deadlines, NamePolicy, SizeClass, VolumeId,
+  Client as RustClient, ClientError, CreateSpec, Deadlines, NamePolicy, Rebased, SizeClass,
+  Submitted, VolumeId,
 };
 
 /// Format: a volume id is 16 bytes on the wire — its high half names the creator host (§4.8 "Lookup").
@@ -85,6 +86,32 @@ fn parse_volume(hex: &str) -> PyResult<VolumeId> {
       .map_err(|_| SlatesError::new_err(format!("not a hex byte: {pair:?}")))?;
   }
   Ok(VolumeId { bytes })
+}
+
+/// Builds the uniform merge-outcome dict for `submit`/`rebase` (§4.16): `ok` — whether the increment
+/// landed cleanly (a new green version) rather than conflicting; `version` — the green version produced,
+/// or `None` on conflict; `conflicts` — the windows to resolve, each a dict of `path`, `at`, `len` (base
+/// coordinates) and `class` (the conflict-class discriminant). Windows arrive as plain tuples so this
+/// needs no protocol type — `ok` is exactly "a version was produced".
+fn merge_outcome_dict(
+  py: Python<'_>,
+  version: Option<u64>,
+  windows: Vec<(String, u64, u64, u8)>,
+) -> PyResult<Py<PyDict>> {
+  let dict = PyDict::new_bound(py);
+  dict.set_item("ok", version.is_some())?;
+  dict.set_item("version", version)?;
+  let mut conflicts: Vec<Py<PyDict>> = Vec::with_capacity(windows.len());
+  for (path, at, len, class) in windows {
+    let window = PyDict::new_bound(py);
+    window.set_item("path", path)?;
+    window.set_item("at", at)?;
+    window.set_item("len", len)?;
+    window.set_item("class", class)?;
+    conflicts.push(window.into());
+  }
+  dict.set_item("conflicts", conflicts)?;
+  Ok(dict.into())
 }
 
 /// A connected slates client (§4.4, §4.9): the lifecycle verbs as methods. Constructed by
@@ -225,6 +252,96 @@ impl Client {
     let id = parse_volume(volume)?;
     self.inner.destroy(id).map_err(refusal)?;
     Ok(())
+  }
+
+  /// Creates a green volume — a shared merge target (§4.16) — returning its hex id. `require_evidence`
+  /// makes the green refuse an increment that carries no evidence of the base it was derived from.
+  #[pyo3(signature = (name, require_evidence=false))]
+  fn create_green(&mut self, name: &str, require_evidence: bool) -> PyResult<String> {
+    let id = self
+      .inner
+      .create_green(name, require_evidence)
+      .map_err(refusal)?;
+    Ok(volume_hex(&id))
+  }
+
+  /// Creates a work volume over a green (§4.16), returning a dict of the work's `id` (hex) and the green
+  /// `base` version it is based on — the version its edits will be submitted against.
+  fn create_work(&mut self, py: Python<'_>, green: &str, name: &str) -> PyResult<Py<PyDict>> {
+    let green = parse_volume(green)?;
+    let (id, base) = self.inner.create_work(green, name).map_err(refusal)?;
+    let dict = PyDict::new_bound(py);
+    dict.set_item("id", volume_hex(&id))?;
+    dict.set_item("base", base)?;
+    Ok(dict.into())
+  }
+
+  /// A green's head version (§4.16 merge chain) — the number that advances with each accepted submit.
+  fn versions(&mut self, green: &str) -> PyResult<u64> {
+    let green = parse_volume(green)?;
+    self.inner.versions(green).map_err(refusal)
+  }
+
+  /// The files a green changed strictly after `version` (§4.16) — the paths a caller based at `version`
+  /// must reconcile before it can submit cleanly.
+  fn changed_since(&mut self, green: &str, version: u64) -> PyResult<Vec<String>> {
+    let green = parse_volume(green)?;
+    self.inner.changed_since(green, version).map_err(refusal)
+  }
+
+  /// Declares a content edit on a work volume (§4.16): a splice at `path` — remove `delete_len` bytes at
+  /// offset `at`, then insert `data`. The bytes cross from Python as `bytes`. An insert is `delete_len`
+  /// zero; an overwrite is a delete and an insert in one call.
+  fn edit(
+    &mut self,
+    work: &str,
+    path: &str,
+    at: u64,
+    delete_len: u64,
+    data: &[u8],
+  ) -> PyResult<()> {
+    let work = parse_volume(work)?;
+    self
+      .inner
+      .edit(work, path, at, delete_len, data)
+      .map_err(refusal)?;
+    Ok(())
+  }
+
+  /// Submits a work volume's declared edits to its green (§4.16), returning the merge outcome (see
+  /// [`merge_outcome_dict`]): `ok` with the new green `version` when accepted, or `ok` false with the
+  /// `conflicts` windows to rebase against when an intervening change met the same range.
+  fn submit(&mut self, py: Python<'_>, work: &str) -> PyResult<Py<PyDict>> {
+    let work = parse_volume(work)?;
+    match self.inner.submit(work).map_err(refusal)? {
+      Submitted::Accepted(version) => merge_outcome_dict(py, Some(version), Vec::new()),
+      Submitted::Conflict(windows) => merge_outcome_dict(
+        py,
+        None,
+        windows
+          .into_iter()
+          .map(|w| (w.path, w.at, w.len, w.class))
+          .collect(),
+      ),
+    }
+  }
+
+  /// Rebases a work volume onto its green's head (§4.16), mapping its pending edits forward without
+  /// committing to the green — the same outcome shape as [`Client::submit`]: `ok` with the head
+  /// `version` it now sits on, or the `conflicts` to resolve first.
+  fn rebase(&mut self, py: Python<'_>, work: &str) -> PyResult<Py<PyDict>> {
+    let work = parse_volume(work)?;
+    match self.inner.rebase(work).map_err(refusal)? {
+      Rebased::Rebased(version) => merge_outcome_dict(py, Some(version), Vec::new()),
+      Rebased::Conflict(windows) => merge_outcome_dict(
+        py,
+        None,
+        windows
+          .into_iter()
+          .map(|w| (w.path, w.at, w.len, w.class))
+          .collect(),
+      ),
+    }
   }
 
   /// How many times this client has reconnected across daemon restarts (an observability counter, so a

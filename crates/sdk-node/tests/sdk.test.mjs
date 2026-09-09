@@ -46,9 +46,14 @@ test('the addon loads and exposes the Client surface', (t) => {
   }
   const slates = require(addonPath);
   assert.equal(typeof slates.Client, 'function', 'Client class is exported');
-  // The lifecycle verbs this slice binds; more (createGreen, edit, submit, land) are owed.
+  // The lifecycle and merge verbs this slice binds; `land` and the async form are owed.
   const methods = Object.getOwnPropertyNames(slates.Client.prototype);
-  for (const verb of ['create', 'snapshot', 'status', 'list', 'resize', 'destroy', 'clientId', 'reconnects']) {
+  const expected = [
+    'create', 'snapshot', 'status', 'list', 'resize', 'destroy',
+    'createGreen', 'createWork', 'versions', 'changedSince', 'edit', 'submit', 'rebase',
+    'clientId', 'reconnects',
+  ];
+  for (const verb of expected) {
     assert.ok(methods.includes(verb), `Client.prototype has ${verb}`);
   }
   assert.equal(typeof slates.Client.connect, 'function', 'Client.connect factory is exported');
@@ -132,6 +137,26 @@ test('lifecycle round trip over a live daemon', async (t) => {
       client.list().every((v) => v.id !== volume),
       'the destroyed volume is gone from list',
     );
+
+    // merge workflow (§4.16): a green, a work over it, a content edit, a clean submit.
+    const green = client.createGreen('g-node-roundtrip');
+    assert.equal(green.length, 32);
+    const work = client.createWork(green, 'w-node-roundtrip');
+    assert.equal(work.id.length, 32);
+    const base = work.base;
+    client.edit(work.id, '/notes.txt', 0, 0, Buffer.from('hello merge'));
+    const outcome = client.submit(work.id);
+    assert.equal(outcome.ok, true, `the submit landed cleanly: ${JSON.stringify(outcome)}`);
+    assert.equal(typeof outcome.version, 'number');
+    assert.deepEqual(outcome.conflicts, []);
+    // the green advanced past the work's base and lists the edited file.
+    assert.ok(client.versions(green) > base);
+    const changed = client.changedSince(green, base);
+    assert.ok(changed.some((p) => p.includes('notes.txt')), JSON.stringify(changed));
+    // a fresh work off the advanced head rebases cleanly (no pending edits, nothing to conflict).
+    const fresh = client.createWork(green, 'w2-node-roundtrip');
+    const rebased = client.rebase(fresh.id);
+    assert.equal(rebased.ok, true, `a fresh work rebases cleanly: ${JSON.stringify(rebased)}`);
   } finally {
     // Kill the whole process group (negative pid) so the supervised daemon goes with the anchor at once.
     try {
