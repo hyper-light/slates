@@ -979,6 +979,99 @@ impl Client {
     }
   }
 
+  // The namespace operations' async begin-and-spin (§4.16): each builds one `WorkOp` and defers to the
+  // private `declare_begin_spin`; all share `poll_declare`. The `WorkOp` enum never crosses into JS.
+
+  /// Begins an unlink and spins; the word and `true` if it completed within the spin.
+  #[napi]
+  pub fn begin_spin_unlink(&mut self, work: String, path: String) -> Result<UnitBegin> {
+    self.declare_begin_spin(&work, WorkOp::Unlink { path })
+  }
+
+  /// Begins a rename and spins.
+  #[napi]
+  pub fn begin_spin_rename(&mut self, work: String, from: String, to: String) -> Result<UnitBegin> {
+    self.declare_begin_spin(&work, WorkOp::Rename { from, to })
+  }
+
+  /// Begins a mkdir and spins.
+  #[napi]
+  pub fn begin_spin_mkdir(&mut self, work: String, path: String) -> Result<UnitBegin> {
+    self.declare_begin_spin(&work, WorkOp::Mkdir { path })
+  }
+
+  /// Begins a rmdir and spins.
+  #[napi]
+  pub fn begin_spin_rmdir(&mut self, work: String, path: String) -> Result<UnitBegin> {
+    self.declare_begin_spin(&work, WorkOp::Rmdir { path })
+  }
+
+  /// Begins a chmod and spins.
+  #[napi]
+  pub fn begin_spin_chmod(&mut self, work: String, path: String, mode: u32) -> Result<UnitBegin> {
+    self.declare_begin_spin(&work, WorkOp::SetMode { path, mode })
+  }
+
+  /// Begins a symlink and spins.
+  #[napi]
+  pub fn begin_spin_symlink(
+    &mut self,
+    work: String,
+    path: String,
+    target: String,
+  ) -> Result<UnitBegin> {
+    self.declare_begin_spin(&work, WorkOp::Symlink { path, target })
+  }
+
+  /// Begins a hard link and spins.
+  #[napi]
+  pub fn begin_spin_link(
+    &mut self,
+    work: String,
+    path: String,
+    target: String,
+  ) -> Result<UnitBegin> {
+    self.declare_begin_spin(&work, WorkOp::Link { path, target })
+  }
+
+  /// Begins a set-xattr and spins.
+  #[napi]
+  pub fn begin_spin_set_xattr(
+    &mut self,
+    work: String,
+    path: String,
+    name: String,
+    value: Buffer,
+  ) -> Result<UnitBegin> {
+    self.declare_begin_spin(
+      &work,
+      WorkOp::SetXattr {
+        path,
+        name,
+        value: value.to_vec(),
+      },
+    )
+  }
+
+  /// Begins a remove-xattr and spins.
+  #[napi]
+  pub fn begin_spin_remove_xattr(
+    &mut self,
+    work: String,
+    path: String,
+    name: String,
+  ) -> Result<UnitBegin> {
+    self.declare_begin_spin(&work, WorkOp::RemoveXattr { path, name })
+  }
+
+  /// Takes a namespace declaration's reply by its word once the completion fd signals (`true` when
+  /// done); shared by every namespace op.
+  #[napi]
+  pub fn poll_declare(&mut self, word: String) -> Result<Option<bool>> {
+    let word = parse_word(&word)?;
+    self.inner.declare_poll(word).map_err(refusal)
+  }
+
   /// Lists the daemon's volumes (§4.4) as an array of [`VolumeEntry`] objects — id (hex), name, byte
   /// accounting, and overlay flag, the plain shape `slates list` prints.
   #[napi]
@@ -1206,5 +1299,19 @@ impl Client {
     let work = parse_volume(work)?;
     self.inner.declare(work, op).map_err(refusal)?;
     Ok(())
+  }
+
+  /// Begins one namespace declaration and spins — the async begin-and-spin body the namespace verbs
+  /// share (`true` when done in the spin). Not a `#[napi]` verb: `WorkOp` does not cross into JS.
+  fn declare_begin_spin(&mut self, work: &str, op: WorkOp) -> Result<UnitBegin> {
+    let work = parse_volume(work)?;
+    let request = self.inner.declare_begin(work, op).map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let spin = self.inner.published_spin_ns();
+    let fast = self.inner.declare_spin(request, spin).map_err(refusal)?;
+    Ok(UnitBegin {
+      word: request.word().to_string(),
+      fast,
+    })
   }
 }

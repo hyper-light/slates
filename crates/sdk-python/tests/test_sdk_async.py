@@ -17,8 +17,12 @@ import unittest
 
 import slates
 
-# The async verbs this slice binds; the merge and namespace verbs follow the same shape.
-ASYNC_VERBS = {"connect", "create", "snapshot", "status", "list", "resize", "destroy", "client_id"}
+# The async verbs bound: the volume lifecycle, the whole merge workflow, and the namespace operations.
+ASYNC_VERBS = {
+    "connect", "create", "snapshot", "status", "list", "resize", "destroy", "client_id",
+    "create_green", "create_work", "edit", "submit", "versions", "changed_since", "rebase",
+    "unlink", "rename", "mkdir", "rmdir", "chmod", "symlink", "link", "set_xattr", "remove_xattr",
+}
 # Test deadlines in nanoseconds; a production caller derives these from the machine's budgets.
 REPLY_NS = 5_000_000
 RECONNECT_NS = 10_000_000
@@ -154,6 +158,23 @@ class SlatesAsyncRoundTrip(unittest.TestCase):
             fresh = await client.create_work(green, "w2-async")
             rebased = await client.rebase(fresh["id"])
             self.assertTrue(rebased["ok"], f"a fresh async work rebases cleanly: {rebased}")
+
+            # namespace operations (§4.16): build a tree on a work volume with every op — each awaited
+            # and resolving to None — then submit; the async form of the sync suite's namespace loop.
+            ns_work = await client.create_work(green, "w-ns-async")
+            ns_id = ns_work["id"]
+            self.assertIsNone(await client.edit(ns_id, "/keep.txt", 0, 0, b"keep"))
+            self.assertIsNone(await client.edit(ns_id, "/gone.txt", 0, 0, b"gone"))
+            self.assertIsNone(await client.unlink(ns_id, "/gone.txt"))
+            self.assertIsNone(await client.mkdir(ns_id, "/d"))
+            self.assertIsNone(await client.rename(ns_id, "/keep.txt", "/d/keep.txt"))
+            self.assertIsNone(await client.chmod(ns_id, "/d/keep.txt", 0o600))
+            self.assertIsNone(await client.symlink(ns_id, "/d/link", "keep.txt"))
+            self.assertIsNone(await client.link(ns_id, "/d/hard.txt", "/d/keep.txt"))
+            self.assertIsNone(await client.set_xattr(ns_id, "/d/keep.txt", "user.slates", b"1"))
+            self.assertIsNone(await client.remove_xattr(ns_id, "/d/keep.txt", "user.slates"))
+            ns_outcome = await client.submit(ns_id)
+            self.assertTrue(ns_outcome["ok"], f"the async namespace ops submitted cleanly: {ns_outcome}")
         finally:
             # Kill the whole process group so the supervised daemon goes with the anchor at once.
             try:

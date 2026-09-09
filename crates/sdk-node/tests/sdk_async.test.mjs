@@ -149,6 +149,23 @@ test('async lifecycle over a live daemon', async (t) => {
     const fresh = await client.createWork(green, 'w2-node-async');
     const rebased = await client.rebase(fresh.id);
     assert.equal(rebased.ok, true, 'a fresh async work rebases cleanly');
+
+    // namespace operations (§4.16): build a tree on a work volume with every op — each awaited and
+    // resolving to undefined — then submit; the async form of the sync suite's namespace loop.
+    const nsWork = await client.createWork(green, 'w-ns-node-async');
+    const nsId = nsWork.id;
+    assert.equal(await client.edit(nsId, '/keep.txt', 0, 0, Buffer.from('keep')), undefined);
+    assert.equal(await client.edit(nsId, '/gone.txt', 0, 0, Buffer.from('gone')), undefined);
+    assert.equal(await client.unlink(nsId, '/gone.txt'), undefined);
+    assert.equal(await client.mkdir(nsId, '/d'), undefined);
+    assert.equal(await client.rename(nsId, '/keep.txt', '/d/keep.txt'), undefined);
+    assert.equal(await client.chmod(nsId, '/d/keep.txt', 0o600), undefined);
+    assert.equal(await client.symlink(nsId, '/d/link', 'keep.txt'), undefined);
+    assert.equal(await client.link(nsId, '/d/hard.txt', '/d/keep.txt'), undefined);
+    assert.equal(await client.setXattr(nsId, '/d/keep.txt', 'user.slates', Buffer.from('1')), undefined);
+    assert.equal(await client.removeXattr(nsId, '/d/keep.txt', 'user.slates'), undefined);
+    const nsOutcome = await client.submit(nsId);
+    assert.equal(nsOutcome.ok, true, 'the async namespace ops submitted cleanly');
   } finally {
     // Kill the whole process group so the supervised daemon goes with the anchor at once.
     try {

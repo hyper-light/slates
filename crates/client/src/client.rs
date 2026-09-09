@@ -312,6 +312,14 @@ fn extract_rebased(body: ReplyBody) -> Result<Rebased, ClientError> {
   }
 }
 
+/// Confirms a namespace declaration's reply, or a typed mismatch (yields `true`, the unit sentinel).
+fn extract_declared(body: ReplyBody) -> Result<bool, ClientError> {
+  match body {
+    ReplyBody::Declared => Ok(true),
+    _ => Err(ClientError::UnexpectedReply { verb: "declare" }),
+  }
+}
+
 impl Client {
   /// Connects to `instance` as a new client.
   pub fn connect(instance: &str, deadlines: Deadlines) -> Result<Client, ClientError> {
@@ -893,6 +901,22 @@ impl Client {
   /// Takes a rebase's outcome by id word once the completion fd signals.
   pub fn rebase_poll(&mut self, word: u64) -> Result<Option<Rebased>, ClientError> {
     self.poll_as(word, extract_rebased)
+  }
+
+  /// Begins a namespace declaration on a work volume, returning its request id. The `WorkOp` is the
+  /// same one the sync [`Self::declare`] takes; a binding builds it and never crosses it over FFI.
+  pub fn declare_begin(&mut self, work: VolumeId, op: WorkOp) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::Declare { work, op })
+  }
+
+  /// Takes a declaration's reply within `spin_ns` (`true` when done).
+  pub fn declare_spin(&mut self, id: RequestId, spin_ns: u64) -> Result<Option<bool>, ClientError> {
+    self.spin_as(id, spin_ns, extract_declared)
+  }
+
+  /// Takes a declaration's reply by id word once the completion fd signals.
+  pub fn declare_poll(&mut self, word: u64) -> Result<Option<bool>, ClientError> {
+    self.poll_as(word, extract_declared)
   }
 
   /// Takes `id`'s reply within `spin_ns` and extracts its typed value (the fast path over a typed verb).

@@ -625,6 +625,8 @@ enum Decode {
   Changed,
   /// A rebase's outcome dict.
   Rebased,
+  /// A namespace declaration's confirmation (resolves to `None`).
+  Declared,
 }
 
 /// A request in flight on the async client: the future its `await` suspends on, and how to decode its
@@ -1006,10 +1008,186 @@ impl AsyncClient {
     finish(&slf, word, fast, Decode::Rebased)
   }
 
+  // The namespace operations (§4.16) — the async form of [`Client`]'s, each declaring one `WorkOp` on
+  // a work volume and resolving to `None`. Each builds its op and defers to `declare_async`; the
+  // `WorkOp` enum stays inside the SDK, never crossing the FFI.
+
+  /// Removes the name at `path` on a work volume (§4.16).
+  fn unlink<'py>(slf: Bound<'py, Self>, work: &str, path: &str) -> PyResult<Bound<'py, PyAny>> {
+    let work = parse_volume(work)?;
+    Self::declare_async(
+      slf,
+      work,
+      WorkOp::Unlink {
+        path: path.to_owned(),
+      },
+    )
+  }
+
+  /// Renames `from` to `to` on a work volume (§4.16).
+  fn rename<'py>(
+    slf: Bound<'py, Self>,
+    work: &str,
+    from: &str,
+    to: &str,
+  ) -> PyResult<Bound<'py, PyAny>> {
+    let work = parse_volume(work)?;
+    Self::declare_async(
+      slf,
+      work,
+      WorkOp::Rename {
+        from: from.to_owned(),
+        to: to.to_owned(),
+      },
+    )
+  }
+
+  /// Creates an empty directory at `path` on a work volume (§4.16).
+  fn mkdir<'py>(slf: Bound<'py, Self>, work: &str, path: &str) -> PyResult<Bound<'py, PyAny>> {
+    let work = parse_volume(work)?;
+    Self::declare_async(
+      slf,
+      work,
+      WorkOp::Mkdir {
+        path: path.to_owned(),
+      },
+    )
+  }
+
+  /// Removes the empty directory at `path` on a work volume (§4.16).
+  fn rmdir<'py>(slf: Bound<'py, Self>, work: &str, path: &str) -> PyResult<Bound<'py, PyAny>> {
+    let work = parse_volume(work)?;
+    Self::declare_async(
+      slf,
+      work,
+      WorkOp::Rmdir {
+        path: path.to_owned(),
+      },
+    )
+  }
+
+  /// Sets the mode bits at `path` on a work volume (§4.16).
+  fn chmod<'py>(
+    slf: Bound<'py, Self>,
+    work: &str,
+    path: &str,
+    mode: u32,
+  ) -> PyResult<Bound<'py, PyAny>> {
+    let work = parse_volume(work)?;
+    Self::declare_async(
+      slf,
+      work,
+      WorkOp::SetMode {
+        path: path.to_owned(),
+        mode,
+      },
+    )
+  }
+
+  /// Creates a symbolic link at `path` pointing at `target` on a work volume (§4.16).
+  fn symlink<'py>(
+    slf: Bound<'py, Self>,
+    work: &str,
+    path: &str,
+    target: &str,
+  ) -> PyResult<Bound<'py, PyAny>> {
+    let work = parse_volume(work)?;
+    Self::declare_async(
+      slf,
+      work,
+      WorkOp::Symlink {
+        path: path.to_owned(),
+        target: target.to_owned(),
+      },
+    )
+  }
+
+  /// Creates a hard link at `path` to `target` on a work volume (§4.16).
+  fn link<'py>(
+    slf: Bound<'py, Self>,
+    work: &str,
+    path: &str,
+    target: &str,
+  ) -> PyResult<Bound<'py, PyAny>> {
+    let work = parse_volume(work)?;
+    Self::declare_async(
+      slf,
+      work,
+      WorkOp::Link {
+        path: path.to_owned(),
+        target: target.to_owned(),
+      },
+    )
+  }
+
+  /// Sets the extended attribute `name` to `value` at `path` on a work volume (§4.16).
+  fn set_xattr<'py>(
+    slf: Bound<'py, Self>,
+    work: &str,
+    path: &str,
+    name: &str,
+    value: &[u8],
+  ) -> PyResult<Bound<'py, PyAny>> {
+    let work = parse_volume(work)?;
+    Self::declare_async(
+      slf,
+      work,
+      WorkOp::SetXattr {
+        path: path.to_owned(),
+        name: name.to_owned(),
+        value: value.to_vec(),
+      },
+    )
+  }
+
+  /// Removes the extended attribute `name` at `path` on a work volume (§4.16).
+  fn remove_xattr<'py>(
+    slf: Bound<'py, Self>,
+    work: &str,
+    path: &str,
+    name: &str,
+  ) -> PyResult<Bound<'py, PyAny>> {
+    let work = parse_volume(work)?;
+    Self::declare_async(
+      slf,
+      work,
+      WorkOp::RemoveXattr {
+        path: path.to_owned(),
+        name: name.to_owned(),
+      },
+    )
+  }
+
   /// The event loop's reader callback: drain the completion fd and resolve every request whose reply
   /// has landed. Registered once with `add_reader`, removed when no request is in flight.
   fn _pump(slf: Bound<'_, Self>) -> PyResult<()> {
     pump(&slf)
+  }
+}
+
+impl AsyncClient {
+  /// Declares one `WorkOp` on a work volume and resolves to `None` — the async namespace verbs' shared
+  /// core. Not a `#[pymethods]` verb: `WorkOp` is a Rust enum that does not cross the FFI, so this stays
+  /// a private helper the ergonomic verbs above defer to (the sync `Client`'s `declare` shape).
+  fn declare_async<'py>(
+    slf: Bound<'py, Self>,
+    work: VolumeId,
+    op: WorkOp,
+  ) -> PyResult<Bound<'py, PyAny>> {
+    let py = slf.py();
+    let (word, fast) = {
+      let mut this = slf.borrow_mut();
+      let request = this.inner.declare_begin(work, op).map_err(refusal)?;
+      this.inner.begin_ack_if_due().map_err(refusal)?;
+      let spin = this.inner.published_spin_ns();
+      let fast = this
+        .inner
+        .declare_spin(request, spin)
+        .map_err(refusal)?
+        .map(|_done| py.None());
+      (request.word(), fast)
+    };
+    finish(&slf, word, fast, Decode::Declared)
   }
 }
 
@@ -1220,6 +1398,10 @@ fn decode_pending(
       Some(outcome) => Some(rebased_to_py(py, outcome)?),
       None => None,
     },
+    Decode::Declared => inner
+      .declare_poll(word)
+      .map_err(refusal)?
+      .map(|_done| py.None()),
   })
 }
 

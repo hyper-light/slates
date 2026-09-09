@@ -119,6 +119,52 @@ export class AsyncClient {
     return this._await(word, (w) => this._c.pollRebase(w));
   }
 
+  // The namespace operations (§4.16), each declaring one WorkOp on a work volume and resolving to
+  // undefined. Each defers to _declare, which shares one poll (the WorkOp is built in Rust).
+  async unlink(work, path) {
+    return this._declare(this._c.beginSpinUnlink(work, path));
+  }
+
+  async rename(work, from, to) {
+    return this._declare(this._c.beginSpinRename(work, from, to));
+  }
+
+  async mkdir(work, path) {
+    return this._declare(this._c.beginSpinMkdir(work, path));
+  }
+
+  async rmdir(work, path) {
+    return this._declare(this._c.beginSpinRmdir(work, path));
+  }
+
+  async chmod(work, path, mode) {
+    return this._declare(this._c.beginSpinChmod(work, path, mode));
+  }
+
+  async symlink(work, path, target) {
+    return this._declare(this._c.beginSpinSymlink(work, path, target));
+  }
+
+  async link(work, path, target) {
+    return this._declare(this._c.beginSpinLink(work, path, target));
+  }
+
+  async setXattr(work, path, name, value) {
+    return this._declare(this._c.beginSpinSetXattr(work, path, name, value));
+  }
+
+  async removeXattr(work, path, name) {
+    return this._declare(this._c.beginSpinRemoveXattr(work, path, name));
+  }
+
+  // A namespace declaration resolves to undefined; its poll yields `true` (done), which the pump
+  // resolves the awaiting Promise with.
+  async _declare({ word, fast }) {
+    if (fast != null) return undefined;
+    await this._await(word, (w) => this._c.pollDeclare(w));
+    return undefined;
+  }
+
   // Registers the pending future, arms the completion signal, ensures the reader, and closes the race
   // with a reply that landed between the spin's end and the arm.
   _await(word, poll) {
