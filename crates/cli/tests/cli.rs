@@ -425,6 +425,18 @@ fn json_merge_queries(instance: &str) {
     out.trim().starts_with('{') && out.contains("\"paths\":"),
     "changed-since json: {out}"
   );
+  // work → edit → submit --json: a clean submit is an `accepted` outcome with the new version.
+  let (code, out, err) = run(instance, &["work", &green, "workjson"]);
+  assert_eq!(code, 0, "{err}");
+  let work = value_of(&out, "id");
+  let (code, _out, err) = run(instance, &["edit", &work, "/f.txt", "0", "0", "hi"]);
+  assert_eq!(code, 0, "{err}");
+  let (code, out, err) = run(instance, &["submit", &work, "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.trim().starts_with('{') && out.contains("\"accepted\":true"),
+    "submit json accepted: {out}"
+  );
 }
 
 /// `--json` makes the read verbs emit the MCP JSON schema (§4.12, GAP-A9-10 "consistent JSON" — the

@@ -144,18 +144,53 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
       client.edit(*work, path, *at, *delete_len, bytes)?;
       println!("edited");
     }
-    Verb::Submit { work } => match client.submit(*work)? {
-      Submitted::Accepted(version) => println!("accepted: {version}"),
-      Submitted::Conflict(windows) => print_windows(&windows),
-    },
-    Verb::Rebase { work } => match client.rebase(*work)? {
-      Rebased::Rebased(version) => println!("rebased: {version}"),
-      Rebased::Conflict(windows) => print_windows(&windows),
-    },
+    Verb::Submit { work } => {
+      let outcome = client.submit(*work)?;
+      if json {
+        println!("{}", submit_json(&outcome));
+      } else {
+        match outcome {
+          Submitted::Accepted(version) => println!("accepted: {version}"),
+          Submitted::Conflict(windows) => print_windows(&windows),
+        }
+      }
+    }
+    Verb::Rebase { work } => {
+      let outcome = client.rebase(*work)?;
+      if json {
+        println!("{}", rebase_json(&outcome));
+      } else {
+        match outcome {
+          Rebased::Rebased(version) => println!("rebased: {version}"),
+          Rebased::Conflict(windows) => print_windows(&windows),
+        }
+      }
+    }
     // Only the merge verbs above reach here.
     _ => {}
   }
   Ok(())
+}
+
+/// A submit outcome as JSON (the MCP schema — `slates_mcp::windows_json` for the conflicts): `accepted`
+/// with the new green `version`, or the `conflicts` windows to rebase against.
+fn submit_json(outcome: &Submitted) -> serde_json::Value {
+  match outcome {
+    Submitted::Accepted(version) => serde_json::json!({ "accepted": true, "version": version }),
+    Submitted::Conflict(windows) => {
+      serde_json::json!({ "accepted": false, "conflicts": slates_mcp::windows_json(windows) })
+    }
+  }
+}
+
+/// A rebase outcome as JSON (the MCP schema): `rebased` with the head `version`, or the `conflicts`.
+fn rebase_json(outcome: &Rebased) -> serde_json::Value {
+  match outcome {
+    Rebased::Rebased(version) => serde_json::json!({ "rebased": true, "version": version }),
+    Rebased::Conflict(windows) => {
+      serde_json::json!({ "rebased": false, "conflicts": slates_mcp::windows_json(windows) })
+    }
+  }
 }
 
 /// Prints merge conflict windows, one per line: the path, the byte range, and the conflict class.

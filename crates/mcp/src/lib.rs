@@ -606,7 +606,9 @@ fn tool_result(structured: &Value) -> Value {
 }
 
 /// The conflict windows as JSON: the file, the byte range, and the conflict class.
-fn windows_json(windows: &[slates_ipc::protocol::MergeWindow]) -> Value {
+/// Merge conflict windows as JSON. Public so the CLI's `--json` submit/rebase emit the same schema as
+/// the MCP surface (§4.12 schema parity).
+pub fn windows_json(windows: &[slates_ipc::protocol::MergeWindow]) -> Value {
   Value::Array(
     windows
       .iter()
