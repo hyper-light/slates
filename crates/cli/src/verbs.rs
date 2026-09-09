@@ -700,6 +700,15 @@ fn status_text(report: &StatusReport) -> String {
   )
 }
 
+/// A health signal's value as text: the measured number, or `absent/<meaning>` when the signal has no
+/// value (§4.14 A-9) — never a bare `0` a reader could mistake for a measured zero.
+fn signal_value(signal: &slates_client::Signal) -> String {
+  match signal.value {
+    Some(value) => value.to_string(),
+    None => format!("absent/{:?}", signal.absence).to_lowercase(),
+  }
+}
+
 /// The daemon's status: the daemon's lines, then one block per shard.
 fn daemon_status_text(report: &DaemonReport) -> String {
   let mut out = format!(
@@ -734,7 +743,10 @@ fn daemon_status_text(report: &DaemonReport) -> String {
     for signal in &shard.signals {
       out.push_str(&format!(
         "shard {} {}: {} (age {} ns)\n",
-        shard.partition, signal.name, signal.value, signal.freshness_ns
+        shard.partition,
+        signal.name,
+        signal_value(signal),
+        signal.freshness_ns
       ));
     }
     out.push_str(&format!(
@@ -769,4 +781,32 @@ pub(crate) fn profile(options: &ProfileOptions) -> Result<(), Failure> {
   );
   println!("ring_entries: {}", derived.ring_entries.get());
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::signal_value;
+  use slates_client::{AbsenceIs, Signal};
+
+  /// A health signal renders its measured value, and a genuinely absent signal renders
+  /// `absent/<meaning>` — never a bare `0` a reader could mistake for a measured zero (§4.14 A-9).
+  /// Do: render a measured zero and an absent signal. Expect: `"0"` and `"absent/unknown"`, so a real
+  /// zero and an unknown value are distinguishable in the status a human reads.
+  #[test]
+  fn a_signal_distinguishes_a_measured_zero_from_an_absent_value() {
+    let measured_zero = Signal {
+      name: "catalog.volumes".to_owned(),
+      value: Some(0),
+      absence: AbsenceIs::Degraded,
+      freshness_ns: 0,
+    };
+    assert_eq!(signal_value(&measured_zero), "0");
+    let absent = Signal {
+      name: "mirror.age".to_owned(),
+      value: None,
+      absence: AbsenceIs::Unknown,
+      freshness_ns: 0,
+    };
+    assert_eq!(signal_value(&absent), "absent/unknown");
+  }
 }

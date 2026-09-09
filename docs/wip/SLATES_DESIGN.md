@@ -2213,8 +2213,12 @@ it uses content addressing. The RAM-only trust boundary and any allowed sharing 
 > Also owed: `ring.request` for a *forwarded* reply (its origin span crosses the shard boundary, so
 > `read_ns` 0 marks it owed rather than timing it wrongly); the cross-shard aggregation of the per-shard
 > sinks into the single control-shard sink (the `Control::Spawn` path the bridge queue uses); real
-> cross-boundary trace propagation; and typed absence markers plus `(value, freshness)` on the
-> daemon-level counters.
+> cross-boundary trace propagation; and `(value, freshness)` on the daemon-level counters.
+> **Typed absence on the shard health signals is done** (A-9): `Signal.value` is now `Option<u64>` with
+> an `AbsenceIs` (`Unknown`/`Degraded`, `HealthSignal::absence()`), so an absent sample is never a
+> silent healthy zero — a live `catalog.volumes: 0` reads as `0`, a genuinely absent signal (a future
+> mirror age at f = 0, a non-reporting shard) as `absent/<meaning>`; pinned by `every_signal_types_its_absence`
+> and a status-render unit test.
 
 Chokepoint spans (bridge request, ring request, shard operation, log append, replication ship,
 consensus step, archive chunk) with the three-id law; spans emitted asynchronously through

@@ -288,13 +288,30 @@ pub enum RequestBody {
   },
 }
 
-/// A health signal (§4.14): a value and how old it is.
+/// What a health signal's absence means (§4.14, A-9): a missing sample is never silently read as
+/// "healthy". A `None` value carries this so a consumer knows whether the gap is benign or a fault.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbsenceIs {
+  /// The value has simply not been measured yet (a fresh daemon's replay time before any replay);
+  /// its absence is not a fault, only "not known".
+  Unknown,
+  /// The value should be present; its absence means a producer that ought to be reporting is not,
+  /// which is itself a degradation, not a healthy zero.
+  Degraded,
+}
+
+/// A health signal (§4.14): a value, whether it is present, what its absence would mean, and how old
+/// it is. The value is optional so an absent sample is never conflated with a real numeric zero (A-9:
+/// "values may be absent and must remain distinguishable from numeric zero").
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct Signal {
   /// The name, dotted (`catalog.volumes`).
   pub name: String,
-  /// The value.
-  pub value: u64,
+  /// The value, or `None` when the signal is absent (not measured / not reporting) — never conflated
+  /// with a real zero (§4.14, A-9).
+  pub value: Option<u64>,
+  /// What a `None` value means for this signal, so absence is never read as "healthy" (§4.14, A-9).
+  pub absence: AbsenceIs,
   /// How old the value is, in nanoseconds (zero for one computed now).
   pub freshness_ns: u64,
 }
@@ -342,6 +359,21 @@ impl HealthSignal {
       HealthSignal::RingDepth => "ring.depth",
       HealthSignal::ShardClients => "shard.clients",
       HealthSignal::ShardDeferred => "shard.deferred",
+    }
+  }
+
+  /// What this signal's absence means (§4.14, A-9). `log.replay_ns` is `Unknown` until a replay
+  /// happens (a fresh daemon that replayed nothing has no replay time — distinct from a 0 ns replay).
+  /// The rest are always-computable counts on a live shard, so an absent one is a `Degraded` producer,
+  /// never a healthy zero.
+  pub const fn absence(self) -> AbsenceIs {
+    match self {
+      HealthSignal::LogReplayNs => AbsenceIs::Unknown,
+      HealthSignal::CatalogVolumes
+      | HealthSignal::LeaseExpiring
+      | HealthSignal::RingDepth
+      | HealthSignal::ShardClients
+      | HealthSignal::ShardDeferred => AbsenceIs::Degraded,
     }
   }
 }
@@ -990,7 +1022,7 @@ pub fn unpack<M: Wire>(
 
 #[cfg(test)]
 mod health_signal_registry {
-  use super::HealthSignal;
+  use super::{AbsenceIs, HealthSignal};
 
   /// The health-signal registry is closed (§4.14, GAP-A9-12): `ALL` emits the canonical set in order,
   /// its names are unique and dotted, and the set is pinned here as the doc-truth — so an addition, a
@@ -1025,6 +1057,27 @@ mod health_signal_registry {
       assert!(
         !name.is_empty() && name.contains('.'),
         "a dotted, non-empty name: {name}"
+      );
+    }
+  }
+
+  /// Every health signal types what its absence means (§4.14, A-9): a missing sample is never a silent
+  /// healthy zero. `log.replay_ns` is `Unknown` (a fresh daemon has no replay time yet, distinct from a
+  /// 0 ns replay); every other signal is an always-computable count whose absence would be a `Degraded`
+  /// producer. Pinned so a new signal must decide its absence meaning, not inherit a look-alike zero.
+  #[test]
+  fn every_signal_types_its_absence() {
+    for signal in HealthSignal::ALL {
+      let expected = if matches!(signal, HealthSignal::LogReplayNs) {
+        AbsenceIs::Unknown
+      } else {
+        AbsenceIs::Degraded
+      };
+      assert_eq!(
+        signal.absence(),
+        expected,
+        "{} types its absence",
+        signal.name()
       );
     }
   }

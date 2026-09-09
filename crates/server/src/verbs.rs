@@ -725,14 +725,19 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
   let lease_expiring = u64::try_from(expiring).unwrap_or(u64::MAX);
   let shard_clients = u64::try_from(state.clients.iter().count()).unwrap_or(u64::MAX);
   let shard_deferred = u64::try_from(state.deferred.len()).unwrap_or(u64::MAX);
-  let measure = |signal: HealthSignal| -> (u64, u64) {
+  // A signal's value is `Some` when measured (§4.14 A-9): the six shard signals are all computable on a
+  // live shard, so each is `Some` — a real zero (no volumes, no expiring leases) is a measured zero, not
+  // an absent one. The `None` case is reserved for a signal that genuinely cannot be measured in a state
+  // (a mirror age at f = 0, a signal from a shard that is not reporting); the type keeps that
+  // distinguishable from a numeric zero rather than conflated with it.
+  let measure = |signal: HealthSignal| -> (Option<u64>, u64) {
     match signal {
-      HealthSignal::CatalogVolumes => (catalog_volumes, 0),
-      HealthSignal::LogReplayNs => (log_replay_ns, since_boot),
-      HealthSignal::LeaseExpiring => (lease_expiring, 0),
-      HealthSignal::RingDepth => (ring_depth, 0),
-      HealthSignal::ShardClients => (shard_clients, 0),
-      HealthSignal::ShardDeferred => (shard_deferred, 0),
+      HealthSignal::CatalogVolumes => (Some(catalog_volumes), 0),
+      HealthSignal::LogReplayNs => (Some(log_replay_ns), since_boot),
+      HealthSignal::LeaseExpiring => (Some(lease_expiring), 0),
+      HealthSignal::RingDepth => (Some(ring_depth), 0),
+      HealthSignal::ShardClients => (Some(shard_clients), 0),
+      HealthSignal::ShardDeferred => (Some(shard_deferred), 0),
     }
   };
   let signals = HealthSignal::ALL
@@ -742,6 +747,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
       Signal {
         name: signal.name().to_owned(),
         value,
+        absence: signal.absence(),
         freshness_ns,
       }
     })
