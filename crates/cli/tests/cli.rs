@@ -439,6 +439,18 @@ fn json_merge_queries(instance: &str) {
   );
 }
 
+/// A failing verb under `--json` emits a JSON error on stderr with a kind and message (GAP-A9-10
+/// "consistent JSON errors"), and the same exit code (1, refused) as the text form.
+fn json_error(instance: &str) {
+  let (code, _out, err) = run(instance, &["status", &"0".repeat(32), "--json"]);
+  assert_eq!(code, 1, "a missing volume is refused: {err}");
+  let err = err.trim();
+  assert!(
+    err.starts_with('{') && err.contains("\"error\"") && err.contains("\"kind\":\"refused\""),
+    "a JSON error object on stderr: {err}"
+  );
+}
+
 /// `--json` makes the read verbs emit the MCP JSON schema (§4.12, GAP-A9-10 "consistent JSON" — the
 /// CLI and the MCP surface share one definition): `status ID --json` and `status --json` return one
 /// JSON object, `volume list --json` a JSON array, each carrying the volume's real fields. Gated like
@@ -463,6 +475,7 @@ fn the_read_verbs_emit_json_with_the_json_flag() {
   json_list_has(&instance, &id);
   json_daemon_status(&instance);
   json_merge_queries(&instance);
+  json_error(&instance);
   drop(anchor);
 }
 

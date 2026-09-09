@@ -53,6 +53,12 @@ fn main() -> ExitCode {
       return ExitCode::from(EXIT_USAGE);
     }
   };
+  // Whether a failure should be reported as JSON: the `--json` switch, for the verbs that carry it.
+  let json = match &command {
+    Command::Client(request) => request.json,
+    Command::Profile(options) => options.json,
+    _ => false,
+  };
   let outcome = match command {
     Command::Anchor(options) => anchor::run(&options),
     Command::Daemon(options) => daemon::run(&options),
@@ -63,19 +69,39 @@ fn main() -> ExitCode {
   };
   match outcome {
     Ok(()) => ExitCode::SUCCESS,
-    Err(Failure::Refused(text)) => {
-      eprintln!("slates: refused: {text}");
-      ExitCode::from(EXIT_REFUSED)
-    }
-    Err(Failure::Unavailable(instance)) => {
-      eprintln!("slates: no daemon at instance {instance} (is `slates anchor` running?)");
-      ExitCode::from(EXIT_UNAVAILABLE)
-    }
-    Err(Failure::Failed(text)) => {
-      eprintln!("slates: {text}");
-      ExitCode::from(EXIT_FAILED)
+    Err(failure) => report_failure(&failure, json),
+  }
+}
+
+/// Prints a failure and returns its exit code. Under `--json` it is a JSON object
+/// `{"error": {"kind", "message"}}` (so a harness parsing `--json` gets a structured failure, not
+/// prose on stderr — GAP-A9-10 "consistent JSON errors"); otherwise the plain `slates: …` text. The
+/// exit code — 1 refused, 3 no daemon, 4 failed — is the same either way, so a script can key on it.
+fn report_failure(failure: &Failure, json: bool) -> ExitCode {
+  let (code, kind) = match failure {
+    Failure::Refused(_) => (EXIT_REFUSED, "refused"),
+    Failure::Unavailable(_) => (EXIT_UNAVAILABLE, "unavailable"),
+    Failure::Failed(_) => (EXIT_FAILED, "failed"),
+  };
+  if json {
+    let message = match failure {
+      Failure::Refused(text) | Failure::Failed(text) => text.clone(),
+      Failure::Unavailable(instance) => format!("no daemon at instance {instance}"),
+    };
+    eprintln!(
+      "{}",
+      serde_json::json!({ "error": { "kind": kind, "message": message } })
+    );
+  } else {
+    match failure {
+      Failure::Refused(text) => eprintln!("slates: refused: {text}"),
+      Failure::Unavailable(instance) => {
+        eprintln!("slates: no daemon at instance {instance} (is `slates anchor` running?)");
+      }
+      Failure::Failed(text) => eprintln!("slates: {text}"),
     }
   }
+  ExitCode::from(code)
 }
 
 /// Runs the launcher on Linux; elsewhere the namespaces it needs do not exist.
