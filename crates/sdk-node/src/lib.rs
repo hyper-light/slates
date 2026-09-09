@@ -34,7 +34,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use slates_client::{
   Client as RustClient, ClientError, CreateSpec, Deadlines, NamePolicy, Rebased, SizeClass,
-  Submitted, VolumeId,
+  Submitted, VolumeId, WorkOp,
 };
 
 /// Format: a volume id is 16 bytes on the wire — its high half names the creator host (§4.8 "Lookup").
@@ -426,5 +426,83 @@ impl Client {
   pub fn reconnects(&self) -> Result<i64> {
     i64::try_from(self.inner.reconnects())
       .map_err(|_| Error::from_reason("the reconnect count is too large for a JS number"))
+  }
+
+  /// Removes the name at `path` on a work volume (§4.16) — a file, symlink or hard link.
+  #[napi]
+  pub fn unlink(&mut self, work: String, path: String) -> Result<()> {
+    self.declare(&work, WorkOp::Unlink { path })
+  }
+
+  /// Renames `from` to `to` on a work volume (§4.16).
+  #[napi]
+  pub fn rename(&mut self, work: String, from: String, to: String) -> Result<()> {
+    self.declare(&work, WorkOp::Rename { from, to })
+  }
+
+  /// Creates an empty directory at `path` on a work volume (§4.16).
+  #[napi]
+  pub fn mkdir(&mut self, work: String, path: String) -> Result<()> {
+    self.declare(&work, WorkOp::Mkdir { path })
+  }
+
+  /// Removes the empty directory at `path` on a work volume (§4.16).
+  #[napi]
+  pub fn rmdir(&mut self, work: String, path: String) -> Result<()> {
+    self.declare(&work, WorkOp::Rmdir { path })
+  }
+
+  /// Sets the mode of the file or directory at `path` on a work volume (§4.16).
+  #[napi]
+  pub fn chmod(&mut self, work: String, path: String, mode: u32) -> Result<()> {
+    self.declare(&work, WorkOp::SetMode { path, mode })
+  }
+
+  /// Creates or retargets a symbolic link at `path` pointing at `target` on a work volume (§4.16).
+  #[napi]
+  pub fn symlink(&mut self, work: String, path: String, target: String) -> Result<()> {
+    self.declare(&work, WorkOp::Symlink { path, target })
+  }
+
+  /// Creates a hard link at `path` to the existing file `target` on a work volume (§4.16).
+  #[napi]
+  pub fn link(&mut self, work: String, path: String, target: String) -> Result<()> {
+    self.declare(&work, WorkOp::Link { path, target })
+  }
+
+  /// Sets the extended attribute `name` on `path` to `value` (a Buffer) on a work volume (§4.16).
+  #[napi]
+  pub fn set_xattr(
+    &mut self,
+    work: String,
+    path: String,
+    name: String,
+    value: Buffer,
+  ) -> Result<()> {
+    self.declare(
+      &work,
+      WorkOp::SetXattr {
+        path,
+        name,
+        value: value.to_vec(),
+      },
+    )
+  }
+
+  /// Removes the extended attribute `name` from `path` on a work volume (§4.16).
+  #[napi]
+  pub fn remove_xattr(&mut self, work: String, path: String, name: String) -> Result<()> {
+    self.declare(&work, WorkOp::RemoveXattr { path, name })
+  }
+}
+
+impl Client {
+  /// Declares one namespace operation on a work volume (§4.16) — the shared body of the namespace verbs
+  /// (`unlink`/`rename`/`mkdir`/…). Not a `#[napi]` verb: `WorkOp` is a Rust enum that does not cross into
+  /// JS, so the SDK exposes the ergonomic verbs above rather than a raw `declare`.
+  fn declare(&mut self, work: &str, op: WorkOp) -> Result<()> {
+    let work = parse_volume(work)?;
+    self.inner.declare(work, op).map_err(refusal)?;
+    Ok(())
   }
 }

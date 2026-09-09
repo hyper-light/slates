@@ -29,6 +29,15 @@ BOUND_VERBS = {
     "edit",
     "submit",
     "rebase",
+    "unlink",
+    "rename",
+    "mkdir",
+    "rmdir",
+    "chmod",
+    "symlink",
+    "link",
+    "set_xattr",
+    "remove_xattr",
     "client_id",
     "reconnects",
 }
@@ -170,6 +179,26 @@ class SlatesSdkRoundTrip(unittest.TestCase):
             fresh = client.create_work(green, "w2-roundtrip")
             rebased = client.rebase(fresh["id"])
             self.assertTrue(rebased["ok"], f"a fresh work rebases cleanly: {rebased}")
+
+            # namespace operations (§4.16): build a directory tree with a rename, an unlink, a mode
+            # change, a symlink, a hard link and an xattr on a work volume, then submit — the counterpart
+            # to edit's content splice (edit creates a file on write, so these have real targets).
+            ns_work = client.create_work(green, "w-ns-roundtrip")
+            ns_base = ns_work["base"]
+            work_id = ns_work["id"]
+            client.edit(work_id, "/keep.txt", 0, 0, b"keep")
+            client.edit(work_id, "/gone.txt", 0, 0, b"gone")
+            client.unlink(work_id, "/gone.txt")
+            client.mkdir(work_id, "/d")
+            client.rename(work_id, "/keep.txt", "/d/keep.txt")
+            client.chmod(work_id, "/d/keep.txt", 0o600)
+            client.symlink(work_id, "/d/link", "keep.txt")
+            client.link(work_id, "/d/hard.txt", "/d/keep.txt")
+            client.set_xattr(work_id, "/d/keep.txt", "user.slates", b"1")
+            ns_outcome = client.submit(work_id)
+            self.assertTrue(ns_outcome["ok"], f"the namespace ops submitted cleanly: {ns_outcome}")
+            ns_changed = client.changed_since(green, ns_base)
+            self.assertTrue(any("keep.txt" in path for path in ns_changed), ns_changed)
         finally:
             # Kill the whole process group so the supervised daemon goes with the anchor at once.
             try:

@@ -34,7 +34,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use slates_client::{
   Client as RustClient, ClientError, CreateSpec, Deadlines, NamePolicy, Rebased, SizeClass,
-  Submitted, VolumeId,
+  Submitted, VolumeId, WorkOp,
 };
 
 /// Format: a volume id is 16 bytes on the wire — its high half names the creator host (§4.8 "Lookup").
@@ -344,10 +344,118 @@ impl Client {
     }
   }
 
+  /// Removes the name at `path` on a work volume (§4.16) — a file, symlink or hard link.
+  fn unlink(&mut self, work: &str, path: &str) -> PyResult<()> {
+    self.declare(
+      work,
+      WorkOp::Unlink {
+        path: path.to_owned(),
+      },
+    )
+  }
+
+  /// Renames `from` to `to` on a work volume (§4.16).
+  fn rename(&mut self, work: &str, from: &str, to: &str) -> PyResult<()> {
+    self.declare(
+      work,
+      WorkOp::Rename {
+        from: from.to_owned(),
+        to: to.to_owned(),
+      },
+    )
+  }
+
+  /// Creates an empty directory at `path` on a work volume (§4.16).
+  fn mkdir(&mut self, work: &str, path: &str) -> PyResult<()> {
+    self.declare(
+      work,
+      WorkOp::Mkdir {
+        path: path.to_owned(),
+      },
+    )
+  }
+
+  /// Removes the empty directory at `path` on a work volume (§4.16).
+  fn rmdir(&mut self, work: &str, path: &str) -> PyResult<()> {
+    self.declare(
+      work,
+      WorkOp::Rmdir {
+        path: path.to_owned(),
+      },
+    )
+  }
+
+  /// Sets the mode of the file or directory at `path` on a work volume (§4.16).
+  fn chmod(&mut self, work: &str, path: &str, mode: u32) -> PyResult<()> {
+    self.declare(
+      work,
+      WorkOp::SetMode {
+        path: path.to_owned(),
+        mode,
+      },
+    )
+  }
+
+  /// Creates or retargets a symbolic link at `path` pointing at `target` on a work volume (§4.16).
+  fn symlink(&mut self, work: &str, path: &str, target: &str) -> PyResult<()> {
+    self.declare(
+      work,
+      WorkOp::Symlink {
+        path: path.to_owned(),
+        target: target.to_owned(),
+      },
+    )
+  }
+
+  /// Creates a hard link at `path` to the existing file `target` on a work volume (§4.16).
+  fn link(&mut self, work: &str, path: &str, target: &str) -> PyResult<()> {
+    self.declare(
+      work,
+      WorkOp::Link {
+        path: path.to_owned(),
+        target: target.to_owned(),
+      },
+    )
+  }
+
+  /// Sets the extended attribute `name` on `path` to `value` (bytes) on a work volume (§4.16).
+  fn set_xattr(&mut self, work: &str, path: &str, name: &str, value: &[u8]) -> PyResult<()> {
+    self.declare(
+      work,
+      WorkOp::SetXattr {
+        path: path.to_owned(),
+        name: name.to_owned(),
+        value: value.to_vec(),
+      },
+    )
+  }
+
+  /// Removes the extended attribute `name` from `path` on a work volume (§4.16).
+  fn remove_xattr(&mut self, work: &str, path: &str, name: &str) -> PyResult<()> {
+    self.declare(
+      work,
+      WorkOp::RemoveXattr {
+        path: path.to_owned(),
+        name: name.to_owned(),
+      },
+    )
+  }
+
   /// How many times this client has reconnected across daemon restarts (an observability counter, so a
   /// test can assert a session survived a restart — §4.9).
   fn reconnects(&self) -> u64 {
     self.inner.reconnects()
+  }
+}
+
+impl Client {
+  /// Declares one namespace operation on a work volume (§4.16) — the shared body of the namespace verbs
+  /// (`unlink`/`rename`/`mkdir`/…). Private, not a `#[pymethods]` verb: `WorkOp` is a Rust enum that does
+  /// not cross into Python, so the SDK exposes the ergonomic verbs above rather than a raw `declare`.
+  fn declare(&mut self, work: &str, op: WorkOp) -> PyResult<()> {
+    let work = parse_volume(work)?;
+    self.inner.declare(work, op).map_err(refusal)?;
+    Ok(())
   }
 }
 

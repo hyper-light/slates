@@ -51,6 +51,7 @@ test('the addon loads and exposes the Client surface', (t) => {
   const expected = [
     'create', 'snapshot', 'status', 'list', 'resize', 'destroy',
     'createGreen', 'createWork', 'versions', 'changedSince', 'edit', 'submit', 'rebase',
+    'unlink', 'rename', 'mkdir', 'rmdir', 'chmod', 'symlink', 'link', 'setXattr', 'removeXattr',
     'clientId', 'reconnects',
   ];
   for (const verb of expected) {
@@ -157,6 +158,25 @@ test('lifecycle round trip over a live daemon', async (t) => {
     const fresh = client.createWork(green, 'w2-node-roundtrip');
     const rebased = client.rebase(fresh.id);
     assert.equal(rebased.ok, true, `a fresh work rebases cleanly: ${JSON.stringify(rebased)}`);
+
+    // namespace operations (§4.16): a directory tree with a rename, an unlink, a mode change, a
+    // symlink, a hard link and an xattr on a work volume, then submit — the counterpart to edit.
+    const nsWork = client.createWork(green, 'w-ns-node-roundtrip');
+    const nsBase = nsWork.base;
+    const w = nsWork.id;
+    client.edit(w, '/keep.txt', 0, 0, Buffer.from('keep'));
+    client.edit(w, '/gone.txt', 0, 0, Buffer.from('gone'));
+    client.unlink(w, '/gone.txt');
+    client.mkdir(w, '/d');
+    client.rename(w, '/keep.txt', '/d/keep.txt');
+    client.chmod(w, '/d/keep.txt', 0o600);
+    client.symlink(w, '/d/link', 'keep.txt');
+    client.link(w, '/d/hard.txt', '/d/keep.txt');
+    client.setXattr(w, '/d/keep.txt', 'user.slates', Buffer.from('1'));
+    const nsOutcome = client.submit(w);
+    assert.equal(nsOutcome.ok, true, `the namespace ops submitted cleanly: ${JSON.stringify(nsOutcome)}`);
+    const nsChanged = client.changedSince(green, nsBase);
+    assert.ok(nsChanged.some((p) => p.includes('keep.txt')), JSON.stringify(nsChanged));
   } finally {
     // Kill the whole process group (negative pid) so the supervised daemon goes with the anchor at once.
     try {
