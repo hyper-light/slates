@@ -26,6 +26,33 @@ watch them work on your codebase just like they were on your local computer. Age
 
 All of this made possible from the same binary using the same configuration and same server.
 
+**Merging that never guesses.** Your agents do not hand slates files to merge; they hand it
+what they did. Every change on a work volume is recorded as it happens: these bytes at this
+offset in this file, this rename, this new directory. When an agent submits, slates replays
+that record against everything the others have merged since the agent started, and answers
+in one of three ways:
+
+- Merged, and here is the new version
+- Already there: someone made the same change
+- These exact bytes in this file collide with what someone else landed
+
+A collision comes back as byte ranges, not conflict markers, and nobody's change is ever
+overwritten. Because a submission is a description and not a pile of files, it is small, it
+can be replayed by any machine that holds the history, and it gets the same answer whether
+the agents share a laptop or are spread across regions. If the machine coordinating a merge
+dies, a neighbour that already holds the history takes over and any submission in flight is
+retried; no accepted version is lost and no conflict is decided twice.
+
+**Sharding that keeps agents out of each other's way.** Every CPU core on the machine owns
+its own set of volumes outright. An agent's request goes straight to the core that owns its
+volume and is answered there, with no lock, no shared counter and no other core in the way,
+which is why creating a volume takes microseconds and why one busy agent cannot stall
+another. Across a fleet the same rule holds one level up: every volume has one owning host
+and a fixed handful of neighbours that hold copies of everything it has snapshotted or
+merged. A volume moves to the host whose agents keep writing to it. If its owner dies, a
+neighbour takes over; if its owner was only paused, it cannot come back and overwrite what
+its successor did. The cluster votes on who owns what, never on a write.
+
 Slates consists of a single binary and a single daemon:
 
 ```console
