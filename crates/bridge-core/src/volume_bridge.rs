@@ -8,7 +8,7 @@
 //! every transport shares the semantics it proves.
 
 use slates_base::OsHost;
-use slates_db::catalog::VolumeId;
+use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::{Handle, MemError, Slab};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::{Attrs, Kind};
@@ -261,6 +261,33 @@ impl<'v> VolumeBridge<'v> {
     let kind = self.volume.kind(self.store, inode)?;
     Ok(node_attr(no, kind, &attrs))
   }
+
+  /// Stamps a freshly created inode `new` with the owner a mount must show: its uid is the mounting
+  /// user — the request subject's uid — and its gid is inherited from its parent directory `parent`,
+  /// the BSD/macOS create rule (a new object takes the creating user and the parent's group). Without
+  /// this the object keeps the volume core's born default (uid 0), so a file an ordinary user made
+  /// listed as root (§4.13 "each request runs as the mounting user"; the root:wheel mount bug fixed in
+  /// docs/bugs/2026-09-09-root-wheel-mount.md). A subject that is not a Unix user (a Windows SID or a
+  /// certificate — never on the POSIX mount path) carries no uid, so the born owner stands and that
+  /// platform's own ownership model governs. The parent's group is read host-aware so an overlay's
+  /// base directory reports its real group.
+  fn stamp_created_owner(
+    &mut self,
+    new: slates_vfs::ids::InodeNo,
+    parent: slates_vfs::ids::InodeNo,
+    cx: &OpContext,
+  ) -> Result<(), VfsError> {
+    let uid = match &cx.subject {
+      Principal::Uid { uid } => *uid,
+      Principal::Sid { .. } | Principal::Certificate { .. } => return Ok(()),
+    };
+    let parent_group = match self.host.as_mut() {
+      Some(host) => self.volume.with_host(host).stat(self.store, parent),
+      None => self.volume.stat(self.store, parent),
+    }?
+    .gid;
+    self.volume.chown(self.store, new, uid, parent_group)
+  }
 }
 
 /// A neutral [`NodeAttr`] from the volume's attributes, kind and inode number. Generation is 0
@@ -459,12 +486,11 @@ impl Bridge for VolumeBridge<'_> {
     _flags: u32,
   ) -> Result<(NodeAttr, u64), VfsError> {
     self.authorize_write(cx)?;
-    let no = self.volume.create_file_no(
-      self.store,
-      slates_vfs::ids::InodeNo(parent.inode),
-      name,
-      mode,
-    )?;
+    let parent_no = slates_vfs::ids::InodeNo(parent.inode);
+    let no = self
+      .volume
+      .create_file_no(self.store, parent_no, name, mode)?;
+    self.stamp_created_owner(no, parent_no, cx)?;
     let attrs = self.volume.stat(self.store, no)?;
     let entry = node_attr(no.0, Kind::File, &attrs);
     // A create takes only an open reference (dropped by release); it does not implicitly take a
@@ -544,12 +570,9 @@ impl Bridge for VolumeBridge<'_> {
     mode: u32,
   ) -> Result<NodeAttr, VfsError> {
     self.authorize_write(cx)?;
-    let no = self.volume.mkdir_no(
-      self.store,
-      slates_vfs::ids::InodeNo(parent.inode),
-      name,
-      mode,
-    )?;
+    let parent_no = slates_vfs::ids::InodeNo(parent.inode);
+    let no = self.volume.mkdir_no(self.store, parent_no, name, mode)?;
+    self.stamp_created_owner(no, parent_no, cx)?;
     let attrs = self.volume.stat(self.store, no)?;
     let attr = node_attr(no.0, Kind::Dir, &attrs);
     // No implicit lookup reference (see `lookup`): FUSE takes one through `reference`, NFS none.
@@ -578,12 +601,11 @@ impl Bridge for VolumeBridge<'_> {
     target: &str,
   ) -> Result<NodeAttr, VfsError> {
     self.authorize_write(cx)?;
-    let no = self.volume.symlink_no(
-      self.store,
-      slates_vfs::ids::InodeNo(parent.inode),
-      name,
-      target,
-    )?;
+    let parent_no = slates_vfs::ids::InodeNo(parent.inode);
+    let no = self
+      .volume
+      .symlink_no(self.store, parent_no, name, target)?;
+    self.stamp_created_owner(no, parent_no, cx)?;
     let attrs = self.volume.stat(self.store, no)?;
     let attr = node_attr(no.0, Kind::Symlink, &attrs);
     // No implicit lookup reference (see `lookup`): FUSE takes one through `reference`, NFS none.

@@ -47,6 +47,24 @@ fn rw_cx() -> OpContext {
   )
 }
 
+/// A read-write current-view context whose enrolled subject is the Unix user `uid` — the mounting
+/// user a request runs as (§4.13), so an object it creates is owned by that user rather than root.
+fn rw_cx_as(uid: u32) -> OpContext {
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VolumeId { bytes: [0; 16] },
+      View::Current,
+      Principal::Uid { uid },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  attachments.context(id).unwrap()
+}
+
 /// Two read-write current-view contexts for two distinct attachments of the same volume, minted
 /// from one registry so they hold different attachment keys (two mounts of one volume).
 fn two_rw_contexts() -> (OpContext, OpContext) {
@@ -171,6 +189,56 @@ fn setattr_honors_ownership_and_times() {
   assert_eq!(
     after.mtime, 222,
     "a mode-only setattr leaves the mtime alone"
+  );
+}
+
+/// An object created through the bridge is owned by the mounting user — the request subject's uid —
+/// not root, and takes its parent directory's group (the BSD/macOS create rule a mount must present
+/// transparently). Before the fix a created inode kept the volume core's born default (uid 0, gid
+/// 0), so a file an ordinary user made through the mount listed as `root wheel` regardless of who
+/// made it (§4.13 "each request runs as the mounting user"; the root:wheel mount bug). This drives
+/// all three creating verbs — `create`, `mkdir`, `symlink` — since they shared the gap.
+#[test]
+fn a_created_object_is_owned_by_the_mounting_user_and_its_parent_group() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx_as(501);
+  let root = bridge.root(&cx).unwrap();
+
+  // A directory the user makes is owned by the user; give it a distinct group so a child proves the
+  // group is inherited from the parent (the subject carries no group of its own).
+  let dir = bridge.mkdir(oid(root), &cx, "d", 0o755).unwrap();
+  assert_eq!(
+    dir.uid, 501,
+    "a created directory is owned by the mounting user, not root"
+  );
+  bridge
+    .setattr(
+      oid(dir.ino),
+      &cx,
+      SetAttr {
+        gid: Some(20),
+        ..SetAttr::default()
+      },
+    )
+    .unwrap();
+
+  let (file, _fh) = bridge.create(oid(dir.ino), &cx, "f", 0o644, 0).unwrap();
+  assert_eq!(
+    file.uid, 501,
+    "a created file is owned by the mounting user, not root"
+  );
+  assert_eq!(
+    file.gid, 20,
+    "and takes its parent directory's group (BSD/macOS create semantics)"
+  );
+
+  let link = bridge.symlink(oid(dir.ino), &cx, "l", "f").unwrap();
+  assert_eq!(
+    (link.uid, link.gid),
+    (501, 20),
+    "a created symlink is owned by the user and grouped by its parent too"
   );
 }
 
