@@ -293,6 +293,22 @@ impl<'b> Export<'b> {
     }
   }
 
+  /// This export's volume root as a file handle and its attributes — what a multi-volume root
+  /// ([`crate::multi::MultiExport`]) answers `LOOKUP` and `READDIRPLUS` of this volume's name with, so
+  /// the handle and attributes a client gets by browsing into the volume match a direct mount of it.
+  /// `None` if the root cannot be established (a revoked or fenced attachment).
+  pub fn root_object(&mut self) -> Option<(Nfsfh3, Fattr3)> {
+    let cx = self.op_context().ok()?;
+    let root = self.bridge.root(&cx).ok()?;
+    let identity = FileHandle {
+      volume: self.volume,
+      inode: root,
+      generation: 0,
+    };
+    let node = self.attrs_of(&identity).ok()?;
+    Some((self.handle_for(root, 0), self.fattr3(&node)))
+  }
+
   /// Dispatches one NFSv3 procedure, returning the accepted reply's result bytes, or `None` for a
   /// procedure this slice does not serve (the caller answers `PROC_UNAVAIL`).
   pub fn serve_nfs(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Option<Vec<u8>> {

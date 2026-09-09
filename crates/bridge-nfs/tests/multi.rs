@@ -144,6 +144,35 @@ fn status(results: &[u8]) -> u32 {
   u32::from_be_bytes(results[0..4].try_into().unwrap())
 }
 
+/// LOOKUP `name` in the directory `dir_fh` names, asserting success and returning the child's handle.
+fn lookup(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32) -> Vec<u8> {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name.as_bytes(), &mut args);
+  let reply = call(stream, NFS_PROGRAM, 3, &args, xid);
+  assert_eq!(status(&reply), 0, "LOOKUP {name}");
+  read_opaque(&reply, 4).0
+}
+
+/// READ the file `file_fh` names from offset zero, asserting success and returning its data (past the
+/// reply's `post_op_attr`, count and eof).
+fn read_fh(stream: &mut TcpStream, file_fh: &[u8], xid: u32) -> Vec<u8> {
+  let mut args = Vec::new();
+  opaque(file_fh, &mut args);
+  args.extend_from_slice(&0u64.to_be_bytes());
+  args.extend_from_slice(&200u32.to_be_bytes());
+  let read = call(stream, NFS_PROGRAM, 6, &args, xid);
+  assert_eq!(status(&read), 0, "READ");
+  let mut off = 4;
+  let follows = u32::from_be_bytes(read[off..off + 4].try_into().unwrap());
+  off += 4;
+  if follows == 1 {
+    off += 84; // post_op_attr fattr3
+  }
+  off += 8; // count and eof
+  read_opaque(&read, off).0
+}
+
 /// Reads a file by mounting `export_name`, looking up `filename`, and reading it — the three RPCs a
 /// client makes, over one connection, so the same server serves both volumes in the test.
 fn read_file(stream: &mut TcpStream, export_name: &str, filename: &str, xid: u32) -> Vec<u8> {
@@ -152,39 +181,15 @@ fn read_file(stream: &mut TcpStream, export_name: &str, filename: &str, xid: u32
   let mnt = call(stream, MOUNT_PROGRAM, 1, &mnt_args, xid);
   assert_eq!(status(&mnt), 0, "MNT {export_name} succeeded");
   let (root_fh, _) = read_opaque(&mnt, 4);
-
-  let mut lookup_args = Vec::new();
-  opaque(&root_fh, &mut lookup_args);
-  opaque(filename.as_bytes(), &mut lookup_args);
-  let lookup = call(stream, NFS_PROGRAM, 3, &lookup_args, xid + 1);
-  assert_eq!(status(&lookup), 0, "LOOKUP {filename} in {export_name}");
-  let (file_fh, _) = read_opaque(&lookup, 4);
-
-  let mut read_args = Vec::new();
-  opaque(&file_fh, &mut read_args);
-  read_args.extend_from_slice(&0u64.to_be_bytes());
-  read_args.extend_from_slice(&200u32.to_be_bytes());
-  let read = call(stream, NFS_PROGRAM, 6, &read_args, xid + 2);
-  assert_eq!(status(&read), 0, "READ in {export_name}");
-  let mut off = 4;
-  let follows = u32::from_be_bytes(read[off..off + 4].try_into().unwrap());
-  off += 4;
-  if follows == 1 {
-    off += 84;
-  }
-  off += 8;
-  let (data, _) = read_opaque(&read, off);
-  data
+  let file_fh = lookup(stream, &root_fh, filename, xid + 1);
+  read_fh(stream, &file_fh, xid + 2)
 }
 
-/// One `MultiExport` serves two volumes over one connection; the client mounts each by name and reads
-/// its file, and the bytes match the volume each handle named — proof the request routed by the
-/// handle's volume id, not to one fixed export.
-#[test]
-fn one_server_routes_requests_to_the_volume_each_handle_names() {
+/// Binds a loopback listener and serves, on a thread, one connection to a `MultiExport` of two
+/// volumes (`alpha` with `hello.txt`, `beta` with `world.txt`). Returns the port and the thread.
+fn spawn_two_volume_server() -> (u16, std::thread::JoinHandle<()>) {
   let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
   let port = listener.local_addr().unwrap().port();
-
   let server = std::thread::spawn(move || {
     let mut store_a = make_store();
     let mut vol_a = make_volume(&mut store_a);
@@ -207,6 +212,53 @@ fn one_server_routes_requests_to_the_volume_each_handle_names() {
       serve_connection(&mut stream, &mut multi, port);
     }
   });
+  (port, server)
+}
+
+/// The entry names a READDIRPLUS reply lists (its status must be Ok), skipping each entry's fileid,
+/// cookie, attributes and handle — enough to prove the root lists the volumes.
+fn readdirplus_names(reply: &[u8]) -> Vec<String> {
+  assert_eq!(status(reply), 0, "READDIRPLUS Ok");
+  let mut off = 4;
+  let dir_follows = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+  off += 4;
+  if dir_follows == 1 {
+    off += 84; // dir post_op_attr
+  }
+  off += 8; // cookieverf
+  let mut names = Vec::new();
+  loop {
+    let value_follows = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+    off += 4;
+    if value_follows == 0 {
+      break;
+    }
+    off += 8; // fileid
+    let (name, next) = read_opaque(reply, off);
+    off = next;
+    off += 8; // cookie
+    let name_attr = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+    off += 4;
+    if name_attr == 1 {
+      off += 84; // name_attributes fattr3
+    }
+    let name_handle = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+    off += 4;
+    if name_handle == 1 {
+      let (_handle, next) = read_opaque(reply, off);
+      off = next;
+    }
+    names.push(String::from_utf8_lossy(&name).into_owned());
+  }
+  names
+}
+
+/// One `MultiExport` serves two volumes over one connection; the client mounts each by name and reads
+/// its file, and the bytes match the volume each handle named — proof the request routed by the
+/// handle's volume id, not to one fixed export.
+#[test]
+fn one_server_routes_requests_to_the_volume_each_handle_names() {
+  let (port, server) = spawn_two_volume_server();
 
   let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
   let from_alpha = read_file(&mut stream, "/alpha", "hello.txt", 1);
@@ -223,6 +275,64 @@ fn one_server_routes_requests_to_the_volume_each_handle_names() {
   assert_ne!(
     from_alpha, from_beta,
     "the two volumes served distinct content"
+  );
+
+  drop(stream);
+  server.join().unwrap();
+}
+
+/// A client mounts the single host root `/`, lists the volumes under it (READDIRPLUS), and descends
+/// into one to read a file — the design's "one mount point per host under which volumes appear as
+/// directories" (§4.6), end to end over a real socket: `mount /` → `ls` → `cd alpha` → `cat`.
+#[test]
+fn a_client_mounts_the_root_and_browses_the_volumes() {
+  let (port, server) = spawn_two_volume_server();
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+  // MNT "/" → the synthetic root directory handle.
+  let mut mnt_args = Vec::new();
+  opaque(b"/", &mut mnt_args);
+  let mnt = call(&mut stream, MOUNT_PROGRAM, 1, &mnt_args, 1);
+  assert_eq!(status(&mnt), 0, "MNT / succeeded");
+  let (root_fh, _) = read_opaque(&mnt, 4);
+
+  // GETATTR(root) → a directory (ftype3 Dir = 2, the first fattr3 field).
+  let mut getattr_args = Vec::new();
+  opaque(&root_fh, &mut getattr_args);
+  let getattr = call(&mut stream, NFS_PROGRAM, 1, &getattr_args, 2);
+  assert_eq!(status(&getattr), 0, "GETATTR root");
+  assert_eq!(
+    u32::from_be_bytes(getattr[4..8].try_into().unwrap()),
+    2,
+    "the root is a directory"
+  );
+
+  // READDIRPLUS(root) → the volumes appear as entries.
+  let mut readdir_args = Vec::new();
+  opaque(&root_fh, &mut readdir_args);
+  readdir_args.extend_from_slice(&0u64.to_be_bytes()); // cookie
+  readdir_args.extend_from_slice(&[0u8; 8]); // cookieverf
+  readdir_args.extend_from_slice(&512u32.to_be_bytes()); // dircount (advisory)
+  readdir_args.extend_from_slice(&8192u32.to_be_bytes()); // maxcount
+  let readdir = call(&mut stream, NFS_PROGRAM, 17, &readdir_args, 3);
+  let names = readdirplus_names(&readdir);
+  assert!(
+    names.iter().any(|n| n == "alpha"),
+    "root lists alpha: {names:?}"
+  );
+  assert!(
+    names.iter().any(|n| n == "beta"),
+    "root lists beta: {names:?}"
+  );
+
+  // Cross into alpha (LOOKUP under the root gives its own root handle), then look up and read its
+  // file — the LOOKUP inside alpha routes to the alpha volume by the handle it returned.
+  let alpha_root = lookup(&mut stream, &root_fh, "alpha", 4);
+  let file_fh = lookup(&mut stream, &alpha_root, "hello.txt", 5);
+  let data = read_fh(&mut stream, &file_fh, 6);
+  assert_eq!(
+    data, MSG_A,
+    "mounted /, listed the volumes, descended into alpha and read its file"
   );
 
   drop(stream);
