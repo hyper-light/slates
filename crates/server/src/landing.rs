@@ -35,10 +35,6 @@ use slates_land::engine::{AuditKind, AuditRecord};
 #[cfg(unix)]
 use slates_land::engine::{LandingRefusal, LandingReport, LandingRequest, Observer, land};
 #[cfg(unix)]
-use slates_vfs::host::LandFs;
-#[cfg(unix)]
-use slates_wire::observe::Chokepoint;
-#[cfg(unix)]
 use slates_land::grant::{GrantId, GrantRefusal};
 use slates_land::grant::{GrantScope as LandScope, Grants, Leases, Surface};
 #[cfg(unix)]
@@ -46,6 +42,10 @@ use slates_land::manifest::{Filter, LandingEntry, Manifest};
 #[cfg(unix)]
 use slates_land::os::{OsLand, TargetRefusal};
 use slates_vfs::clock::Clock;
+#[cfg(unix)]
+use slates_vfs::host::LandFs;
+#[cfg(unix)]
+use slates_wire::observe::Chokepoint;
 
 #[cfg(unix)]
 use crate::error::refusal_of_vfs;
@@ -167,15 +167,11 @@ impl SpanObserver {
       dropped: 0,
     }
   }
-}
 
-#[cfg(unix)]
-impl<H: LandFs> Observer<H> for SpanObserver {
-  fn before_write(&mut self, _host: &mut H, _entry: &LandingEntry) {}
-
-  fn after_entry(&mut self, start_ns: u64, end_ns: u64) {
+  /// Records one entry's `(start, end)` timing, bounded shed-first: at capacity the oldest timing is
+  /// shed and counted (or this one, when the bound is zero), so the buffer never grows past its bound.
+  fn record(&mut self, start_ns: u64, end_ns: u64) {
     if self.entries.len() == self.capacity {
-      // At the bound: shed the oldest timing (or this one, when the bound is zero) and count the loss.
       if self.entries.pop_front().is_none() {
         self.dropped = self.dropped.saturating_add(1);
         return;
@@ -183,6 +179,15 @@ impl<H: LandFs> Observer<H> for SpanObserver {
       self.dropped = self.dropped.saturating_add(1);
     }
     self.entries.push_back((start_ns, end_ns));
+  }
+}
+
+#[cfg(unix)]
+impl<H: LandFs> Observer<H> for SpanObserver {
+  fn before_write(&mut self, _host: &mut H, _entry: &LandingEntry) {}
+
+  fn after_entry(&mut self, start_ns: u64, end_ns: u64) {
+    self.record(start_ns, end_ns);
   }
 }
 
@@ -656,4 +661,29 @@ fn grant_state_name(state: DbGrantState) -> String {
     DbGrantState::Revoked => "revoked",
   }
   .to_owned()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+  use super::SpanObserver;
+
+  /// The landing span observer is bounded shed-first (§4.14): recording more entry timings than its
+  /// capacity keeps the most recent and counts the shed ones, so a large landing never grows the buffer
+  /// without bound. Do: record five timings into a capacity of three. Expect: three held (the most
+  /// recent, oldest first) and two counted as dropped — the loss the server folds into the sink's total.
+  #[test]
+  fn the_landing_observer_is_bounded_and_counts_shed_timings() {
+    let mut observer = SpanObserver::with_capacity(3);
+    for i in 0..5u64 {
+      observer.record(i, i + 1);
+    }
+    assert_eq!(observer.entries.len(), 3, "held at the bound");
+    assert_eq!(observer.dropped, 2, "the two oldest were shed and counted");
+    let held: Vec<u64> = observer.entries.iter().map(|(start, _)| *start).collect();
+    assert_eq!(
+      held,
+      vec![2, 3, 4],
+      "the three most recent survived, oldest first"
+    );
+  }
 }
