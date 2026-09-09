@@ -18,11 +18,11 @@ changes live in memory. Agents merge their work into a shared volume through an 
 returns accept, identical, or the exact bytes that overlap, and nothing is written back to disk
 until a person grants it.
 
-The same daemon is built to run on one laptop and across a fleet the size of Meta's EdenFS
-deployment: sealed snapshots and merge records are copied into the memory of neighbouring
-machines, durability is a per-write choice, a volume on another host attaches by id, and the
-merge engine works the same way whether the agents share a laptop or a planet. A laptop is the
-one-node case of that design, not a separate mode.
+It does not stop at one machine. Run agents on a hundred hosts and they still work on one tree:
+an agent can open a snapshot another host just made, without waiting for a copy; a merge from
+any host gets the same answer; and a host dying loses nothing that was already placed, because
+placed means "in the memory of other machines." You start on a laptop and add machines; there
+is no cluster mode to switch to.
 
 It is one binary and one daemon:
 
@@ -413,35 +413,34 @@ every decision and the evidence behind it; the research it draws on is in
 
 ## From a laptop to a fleet
 
-Slates is designed for the scale of a monorepo served to thousands of hosts: base trees of a
-billion files, millions of loaded inodes per mount, agents attaching and merging across regions.
-The mechanism is the same one a laptop runs, with the neighbour count set to zero.
+This is the part of slates built for a monorepo the size of Meta's or Google's: a billion
+files in the base tree, millions of files open per mount, thousands of hosts, agents in more
+than one region. What that means when you run agents across machines:
 
-- **Durability is replication into RAM, under an epoch.** Every sealed snapshot, head record
-  and merge record is sent to the owner's candidate holders, a fixed circle of machines in
-  different failure domains. It counts as placed when the fastest f+1 of 2f+1 have it; slow
-  holders are hedged around, never waited for. Every record carries the owner's host epoch, and
-  a holder refuses anything older than the highest it has seen, so a machine that paused and
-  woke up cannot overwrite its successor's work.
-- **Consensus decides who, never what.** A small regional group agrees on membership,
-  neighbourhoods, host epochs, takeovers and moved homes. It is touched on those events and
-  never on a write, so a write costs one round of puts to the holders and nothing else.
-- **Attach anywhere by id.** An agent on host B attaches a snapshot owned by host A: the id
-  routes to A, the manifest comes from any recorded holder, the namespace is served at once,
-  and file contents fault in lazily from holders, verified by hash and cached under B's own
-  budget. A clone of a remote snapshot is a local volume. The daemon learns which paths a build
-  touches first and prefetches them on the next attach.
-- **Ownership follows the writer.** A volume is owned where it was created because the local
-  ring is the latency floor. When another host keeps writing to it, ownership moves there by a
-  fenced handoff; load never moves ownership.
-- **Durability is a per-write choice.** `await placed(region)` waits for the owner's
-  neighbourhood; `await placed(mirror)` waits for the copy in another region. Every reply
-  carries `placed` and `mirror_age`, so an agent that needs a stronger promise asks for it on
-  that operation and everyone else keeps the fast path. Losing a region promotes its mirror.
-- **Overlays keep their base across hosts.** A clone of an overlay volume on another host
-  still resolves untouched files through the original directory's identity; it never turns into
-  a scratch volume seeded with the changed entries. Capturing a base makes a complete immutable
-  snapshot that remote clones share by hash.
+- **Any agent can open any snapshot, right away.** A snapshot made on one host is usable from
+  another the moment it exists. The agent sees the whole tree at once and only the files it
+  reads are fetched, checked against their hash, and kept locally. A clone of it is a local
+  volume. After a few attaches the daemon knows which files a build touches first and has them
+  waiting.
+- **A dead machine does not lose finished work.** Every snapshot and merge record is copied
+  into the memory of a fixed handful of neighbouring machines in different failure domains,
+  and counts as placed once the fastest f+1 of them have it. If the owner dies, one of those
+  neighbours already has everything and takes over; an owner that was merely paused cannot
+  come back and overwrite its successor, because every record carries an epoch and holders
+  refuse older ones.
+- **You choose how safe each write needs to be.** Most writes take the fast path. When a
+  result matters, an agent asks for that one operation to be placed in the region, or mirrored
+  to another region, and waits only then. Every reply says whether it is placed and how far
+  behind the mirror is, so nothing has to be guessed. Losing a whole region promotes its mirror.
+- **Writes are never slowed by coordination.** A small group per region agrees only on who is
+  a member, who neighbours whom, and who takes over a dead host. It is never asked about a
+  write, so a write costs one round of copies to the neighbours and nothing more.
+- **Volumes live where they are used.** A volume is owned by the host that created it, because
+  that is the fastest place to write it. If another host keeps writing to it, it moves there;
+  load alone never moves it.
+- **An overlay stays on its directory.** Cloning an overlay volume onto another host does not
+  turn it into a copy of the changed files: untouched files still come from the original
+  directory, and once a base has been captured, every remote clone shares that capture by hash.
 
 ```console
 $ slates volume placed 00000000000006f0ec41000000000000
@@ -456,12 +455,11 @@ On one machine the region is placed the moment the local append lands, and the m
 refused because there is nobody to mirror to. The reply fields are the same ones a fleet
 fills in.
 
-Where this stands: the replication register runs at f=0 and at a simulated f=1 with a test
-that asserts identical outcomes; the takeover and reconfiguration protocols are modelled in
-TLA+ and were checked in 2026-09-04; the node-to-node transport (an encrypted UDP control
-plane and a QUIC session plane) runs end to end on a simulated network; the merge engine's
-fleet path is designed in §4.10 and §4.16. Membership, enrollment and the wiring between real
-nodes are Phase 8, and there is no fleet benchmark yet. The design is §4.8 and §4.10 of the
+What you can use today is the one-machine case of all of this, with the same reply fields
+and verbs. The replication core runs at f=0 and at a simulated f=1 with a test that asserts
+identical outcomes, the takeover and reconfiguration protocols were model-checked on
+2026-09-04, and the node-to-node transport runs end to end on a simulated network. Joining
+real machines together is Phase 8, and there is no fleet benchmark yet. The design is §4.8 and §4.10 of the
 [unified design](docs/wip/SLATES_DESIGN.md) and the [transport draft](docs/wip/fleet-transport.md);
 the reading behind it, from EdenFS and Piper to Vertical Paxos and copysets, is in
 [docs/wip/research/](docs/wip/research/).
