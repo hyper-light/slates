@@ -242,6 +242,37 @@ fn a_created_object_is_owned_by_the_mounting_user_and_its_parent_group() {
   );
 }
 
+/// When the request's credential names a group (`OpContext::owner_gid`, an NFS `AUTH_SYS` gid), a
+/// created object takes *that* group, not its parent directory's — matching what a native NFS server
+/// stamps, so a file the mounting user makes lists as their own group rather than the volume root's
+/// `wheel`. This is the credential-group half of the root:wheel fix; the parent-inherited half is
+/// covered above (the `None` case).
+#[test]
+fn a_created_object_takes_the_request_group_when_the_credential_names_one() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  // The mounting user is uid 501 with group 20 (the credential's gid), the export edge overlaying the
+  // group onto the context (as the daemon's NFS path does per request).
+  let mut cx = rw_cx_as(501);
+  cx.owner_gid = Some(20);
+  let root = bridge.root(&cx).unwrap();
+
+  // The parent directory (the volume root) has group 0, but the credential names 20: the created file
+  // takes 20, proving the request's group wins over the parent's when the credential supplies it.
+  let (file, _fh) = bridge.create(oid(root), &cx, "f", 0o644, 0).unwrap();
+  assert_eq!(
+    (file.uid, file.gid),
+    (501, 20),
+    "a created file takes the mounting user's uid and their credential group, not the parent's"
+  );
+  // A directory and a symlink take it too.
+  let dir = bridge.mkdir(oid(root), &cx, "d", 0o755).unwrap();
+  let link = bridge.symlink(oid(root), &cx, "l", "f").unwrap();
+  assert_eq!((dir.uid, dir.gid), (501, 20));
+  assert_eq!((link.uid, link.gid), (501, 20));
+}
+
 /// `RENAME_NOREPLACE` fails onto an existing name and succeeds onto a free one — the flag is
 /// honored, not dropped and turned into an ordinary replacing rename (BUG-10).
 #[test]

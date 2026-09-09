@@ -36,7 +36,8 @@ pub use nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3}
 pub use portmap::Mapping;
 pub use procedures::Export;
 pub use rpc::{
-  AcceptStatus, RpcCall, RpcError, auth_sys_uid, parse_call, read_record, reply_bytes, write_record,
+  AcceptStatus, RpcCall, RpcError, auth_sys_creds, auth_sys_gid, auth_sys_uid, parse_call,
+  read_record, reply_bytes, write_record,
 };
 pub use server::{serve_call, serve_connection, serve_connection_async};
 pub use xdr::{XdrError, XdrReader, XdrWriter};

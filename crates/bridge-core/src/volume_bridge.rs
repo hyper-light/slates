@@ -263,14 +263,16 @@ impl<'v> VolumeBridge<'v> {
   }
 
   /// Stamps a freshly created inode `new` with the owner a mount must show: its uid is the mounting
-  /// user — the request subject's uid — and its gid is inherited from its parent directory `parent`,
-  /// the BSD/macOS create rule (a new object takes the creating user and the parent's group). Without
-  /// this the object keeps the volume core's born default (uid 0), so a file an ordinary user made
-  /// listed as root (§4.13 "each request runs as the mounting user"; the root:wheel mount bug fixed in
-  /// docs/bugs/2026-09-09-root-wheel-mount.md). A subject that is not a Unix user (a Windows SID or a
-  /// certificate — never on the POSIX mount path) carries no uid, so the born owner stands and that
-  /// platform's own ownership model governs. The parent's group is read host-aware so an overlay's
-  /// base directory reports its real group.
+  /// user — the request subject's uid — and its gid is the request's own group when its credential
+  /// named one (an NFS `AUTH_SYS` gid, carried on [`OpContext::owner_gid`]), matching what a native
+  /// NFS server stamps; otherwise it inherits the parent directory `parent`'s group, the BSD/macOS
+  /// create rule (a new object takes the creating user and the parent's group). Without this the
+  /// object keeps the volume core's born default (uid 0, gid 0), so a file an ordinary user made
+  /// listed as `root wheel` regardless of who made it (§4.13 "each request runs as the mounting user";
+  /// the root:wheel mount bug fixed in docs/bugs/2026-09-09-root-wheel-mount.md). A subject that is
+  /// not a Unix user (a Windows SID or a certificate — never on the POSIX mount path) carries no uid,
+  /// so the born owner stands and that platform's own ownership model governs. The parent's group is
+  /// read host-aware so an overlay's base directory reports its real group.
   fn stamp_created_owner(
     &mut self,
     new: slates_vfs::ids::InodeNo,
@@ -281,12 +283,17 @@ impl<'v> VolumeBridge<'v> {
       Principal::Uid { uid } => *uid,
       Principal::Sid { .. } | Principal::Certificate { .. } => return Ok(()),
     };
-    let parent_group = match self.host.as_mut() {
-      Some(host) => self.volume.with_host(host).stat(self.store, parent),
-      None => self.volume.stat(self.store, parent),
-    }?
-    .gid;
-    self.volume.chown(self.store, new, uid, parent_group)
+    let gid = match cx.owner_gid {
+      Some(gid) => gid,
+      None => {
+        match self.host.as_mut() {
+          Some(host) => self.volume.with_host(host).stat(self.store, parent),
+          None => self.volume.stat(self.store, parent),
+        }?
+        .gid
+      }
+    };
+    self.volume.chown(self.store, new, uid, gid)
   }
 }
 

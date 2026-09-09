@@ -194,6 +194,11 @@ pub struct Export<'b> {
   attachments: Attachments,
   /// The attachment this export admitted for its mount. Every procedure builds its context from it.
   attachment: AttachmentId,
+  /// The mounting user's group (an `AUTH_SYS` gid), overlaid onto every request's [`OpContext`] so a
+  /// created object takes it; `None` when the mount's credential named none (`AUTH_NONE`), and a
+  /// created object then inherits its parent's group. Set after construction ([`Self::set_owner_gid`])
+  /// so `new`'s many call sites stay unchanged — the group is not part of the authenticated identity.
+  owner_gid: Option<u32>,
 }
 
 impl<'b> Export<'b> {
@@ -201,7 +206,8 @@ impl<'b> Export<'b> {
   /// for the enrolled `subject` with `rights` on the volume's current head. Building the attachment
   /// is the NFS analogue of the FUSE mount edge: the credentials are established once, at mount, and
   /// the seam checks every later request against the resulting context. Refuses (`NotPermitted` at
-  /// the registry bound) if the attachment cannot be admitted.
+  /// the registry bound) if the attachment cannot be admitted. The mounting user's group is set
+  /// separately with [`Self::set_owner_gid`] (it defaults to none — a parent-inherited group).
   pub fn new(
     bridge: &'b mut dyn Bridge,
     volume: VolumeId,
@@ -215,14 +221,26 @@ impl<'b> Export<'b> {
       volume,
       attachments,
       attachment,
+      owner_gid: None,
     })
+  }
+
+  /// Sets the mounting user's group (from the call's `AUTH_SYS` credential), overlaid onto every
+  /// request's context so a created object takes it — the daemon's export path calls this per request
+  /// with the credential's gid; a mount with no such credential leaves it `None` (parent-inherited).
+  pub fn set_owner_gid(&mut self, gid: Option<u32>) {
+    self.owner_gid = gid;
   }
 
   /// The authenticated context for a request, built from the export's attachment. Refuses when the
   /// attachment is revoked or fenced (a superseded owner epoch) — the export edge's "authority can
   /// no longer be established" case, which the caller maps to a `STALE`/`ACCES` NFS status.
   fn op_context(&self) -> Result<OpContext, VfsError> {
-    self.attachments.context(self.attachment)
+    let mut context = self.attachments.context(self.attachment)?;
+    // Overlay the mount's group onto the authenticated context: the attachment registry carries only
+    // the authenticated identity (uid-only), and the group is file ownership the export edge supplies.
+    context.owner_gid = self.owner_gid;
+    Ok(context)
   }
 
   /// The filesystem id the export reports: the leading 64 bits of the volume id, stable per volume.

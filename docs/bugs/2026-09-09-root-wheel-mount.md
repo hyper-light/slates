@@ -1,9 +1,10 @@
 # A file created through the mount lists as root:wheel
 
-Status: **fixed** — a created object is now owned by the mounting user (the request subject's uid),
-with the group inherited from its parent directory (BSD/macOS create semantics). The remaining
-`wheel` group on a volume's top level is a separate, reported item (see *Residue* below). Date:
-2026-09-09.
+Status: **fixed** — a created object is now owned by the mounting user (the request subject's uid)
+*and* the mounting user's own group (the `AUTH_SYS` credential's gid, threaded per request), so a file
+made through the mount lists as e.g. `adalundhe staff`, exactly as a native NFS server stamps it —
+verified live. When a mount carries no credential group (`AUTH_NONE`), the group falls back to the
+parent directory's (BSD/macOS create semantics). Date: 2026-09-09.
 
 ## Description
 
@@ -65,32 +66,44 @@ FSKit/FUSE when they mount). `VolumeBridge` gains one helper, `stamp_created_own
 - **uid** ← the request subject's uid (`OpContext.subject`, a `Principal::Uid`). This is the mounting
   user the credential named. A non-uid subject (a Windows SID or a certificate — never on the POSIX
   mount path) carries no uid, so the born owner stands and that platform's own ownership model governs.
-- **gid** ← the *parent directory's* group, read with one `Volume::stat` of the parent. This is the
-  BSD/macOS local-filesystem create rule (a new file takes the creating user and the parent's group),
-  which the mount must present transparently; it is applied with the existing `Volume::chown` that
-  `setattr` already uses, so no new vfs surface is added.
+- **gid** ← the mounting user's own group when the request's credential named one — the `AUTH_SYS`
+  gid, carried on the new `OpContext.owner_gid` — matching what a native NFS server stamps; otherwise
+  (no credential group, `AUTH_NONE`) the *parent directory's* group, read with one `Volume::stat` of
+  the parent, the BSD/macOS local-filesystem create rule. Applied with the existing `Volume::chown`
+  that `setattr` already uses, so no new vfs surface is added.
 
 The vfs core stays identity-agnostic (it never learns about principals); the identity→ownership mapping
 lives in the bridge, where the authenticated context already is.
 
-## Residue (reported, not fixed here)
+### Threading the credential group (the second half, Ada's call 2026-09-09)
 
-With the parent-group rule, a top-level file still shows the group of the volume's *root* directory,
-which is created `gid 0` at provisioning (`Volume::create`) and shared across mounts — so top-level
-entries list as `<user> wheel` rather than `<user> staff`. The alarming half (`root`) is fixed; the
-`wheel` half is the volume root's own group, a distinct question:
+The group is deliberately *not* part of the §4.13 identity `Principal` (which is uid-only — a user is
+the same principal for authority regardless of their group). It rides beside the subject as a distinct
+"file ownership to stamp" value:
 
-- Option A — thread the `AUTH_SYS` credential's **gid** (macOS sends the real group, 20/staff) as a
-  per-request POSIX group and stamp it directly. This is what a conventional NFS server does and would
-  yield `<user> staff`, but the group is not part of the §4.13 identity model (`Principal` is uid-only)
-  and carrying it to the stamp point means widening `OpContext`/`Attachments::attach`/`Export::new` —
-  ~14 + ~40 call sites across every transport's tests. Disproportionate for this fix; a deliberate
-  design change.
-- Option B — stamp the volume root's owner to the provisioning user at create time, so the parent-group
-  rule then propagates a sensible group. Needs the creating principal's group at provisioning.
+- `bridge-nfs`'s `auth_sys_creds` reads both uid and gid from one `AUTH_SYS` credential (`auth_sys_uid`
+  and the new `auth_sys_gid` are thin projections of it).
+- The daemon's NFS path reads the group with `owner_gid_of` and carries it beside the subject as one
+  `Requester` (subject + group), which rides to a volume's owner shard exactly as the subject already
+  did — so a cross-shard request stamps the same group.
+- `bridge-core`'s `OpContext` gains `owner_gid: Option<u32>`; the `Export` overlays the mount's group
+  onto every request's context (`set_owner_gid`, set per request by the export edge), and
+  `stamp_created_owner` uses it when present. This kept `Attachments::attach` and the 40 `Export::new`
+  call sites untouched — the group is set on the `Export`, not the authenticated attachment.
 
-Both are larger than the reported defect and change behavior beyond it, so they are surfaced to Ada
-rather than taken here.
+Proven by use: `crates/bridge-core/tests/volume_bridge.rs`
+`a_created_object_takes_the_request_group_when_the_credential_names_one` (the created object takes the
+credential's group over its parent's), the parent-inherited half covered by the sibling test; and live
+on a real kernel mount — a file created through the mount now lists as `adalundhe staff` (was
+`root wheel`, then `adalundhe wheel` after the uid-only fix).
+
+### Remaining (minor, not the reported defect)
+
+The volume's *root* directory (`.` seen at the mountpoint) is still created `gid 0` / `uid 0` at
+provisioning (`Volume::create`) and shared across mounts, so it lists as `root wheel`. This is the
+mount root's own ownership, not a "file created through the mount" (the reported and fixed defect); a
+native NFS export root is often root-owned too. Stamping it to the provisioning user would need the
+creating principal's group carried into provisioning — a separate, larger change, left for later.
 
 ## Sibling sweep
 

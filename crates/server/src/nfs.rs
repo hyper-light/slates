@@ -58,8 +58,8 @@ use slates_bridge_nfs::procedures::{
 };
 use slates_bridge_nfs::xdr::XdrReader;
 use slates_bridge_nfs::{
-  AcceptStatus, MultiExport, RpcError, VolumeSet, auth_sys_uid, parse_call, read_record,
-  reply_bytes, request_volume, root_volume, serve_call, write_record,
+  AcceptStatus, MultiExport, RpcError, VolumeSet, auth_sys_gid, auth_sys_uid, parse_call,
+  read_record, reply_bytes, request_volume, root_volume, serve_call, write_record,
 };
 use slates_db::catalog::{Principal, VolumeId};
 use slates_rt::control::Control;
@@ -109,11 +109,12 @@ impl VolumeSet for ShardVolumeSet {
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
+    owner_gid: Option<u32>,
     procedure: u32,
     args: &mut XdrReader<'_>,
   ) -> Option<Vec<u8>> {
     state::with_state(|s| {
-      with_export(s, volume, subject, rights, |export| {
+      with_export(s, volume, subject, rights, owner_gid, |export| {
         export.serve_nfs(procedure, args)
       })
     })
@@ -126,10 +127,15 @@ impl VolumeSet for ShardVolumeSet {
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
+    owner_gid: Option<u32>,
   ) -> Option<(Nfsfh3, Fattr3)> {
-    state::with_state(|s| with_export(s, volume, subject, rights, |export| export.root_object()))
-      .flatten()
-      .flatten()
+    state::with_state(|s| {
+      with_export(s, volume, subject, rights, owner_gid, |export| {
+        export.root_object()
+      })
+    })
+    .flatten()
+    .flatten()
   }
 }
 
@@ -142,6 +148,7 @@ fn with_export<R>(
   volume: VolumeId,
   subject: Principal,
   rights: Rights,
+  owner_gid: Option<u32>,
   f: impl FnOnce(&mut Export<'_>) -> R,
 ) -> Option<R> {
   let handle = *s.by_id.get(&volume)?;
@@ -156,6 +163,7 @@ fn with_export<R>(
     slot.host.as_mut(),
   );
   let mut export = Export::new(&mut bridge, volume, subject, rights).ok()?;
+  export.set_owner_gid(owner_gid);
   Some(f(&mut export))
 }
 
@@ -175,6 +183,43 @@ fn subject_of(body: &[u8]) -> Principal {
   match auth_sys_uid(body) {
     Some(uid) => Principal::Uid { uid },
     None => Principal::Uid { uid: 0 },
+  }
+}
+
+/// The group a call's created objects take: the gid its `AUTH_SYS` credential names (the mounting
+/// user's primary group, set by the kernel on a loopback mount), or `None` when the call carries no
+/// such credential (`AUTH_NONE`) — a created object then inherits its parent directory's group. So a
+/// real `mount_nfs` stamps the mounting user's own group, not `wheel` (§4.13).
+fn owner_gid_of(body: &[u8]) -> Option<u32> {
+  auth_sys_gid(body)
+}
+
+/// The mounting user a request runs as: the authenticated `subject` (uid-only, §4.13) it authorizes
+/// as, and the `owner_gid` a created object takes (the `AUTH_SYS` group; `None` — parent-inherited —
+/// when the mount named none). Both are read from the one credential and ride together to a volume's
+/// owner shard, so they travel as one value rather than two parallel arguments through the routing.
+#[derive(Clone)]
+struct Requester {
+  subject: Principal,
+  owner_gid: Option<u32>,
+}
+
+impl Requester {
+  /// The mounting user a call runs as, from its `AUTH_SYS` credential (both uid and gid, §4.13).
+  fn of(body: &[u8]) -> Requester {
+    Requester {
+      subject: subject_of(body),
+      owner_gid: owner_gid_of(body),
+    }
+  }
+
+  /// The fallback requester for a call whose header would not parse (a garbage call): machine root,
+  /// parent-inherited group. Never authorizes anything a real credential would not.
+  fn root() -> Requester {
+    Requester {
+      subject: Principal::Uid { uid: 0 },
+      owner_gid: None,
+    }
   }
 }
 
@@ -263,9 +308,10 @@ fn root_mount_name(program: u32, procedure: u32, args: &[u8]) -> Option<String> 
   }
 }
 
-/// Serves one call locally, on this shard's volumes and synthetic root, under `subject`.
+/// Serves one call locally, on this shard's volumes and synthetic root, as `requester` (the mounting
+/// user's subject and the group its created objects take).
 fn serve_local(
-  subject: Principal,
+  requester: Requester,
   program: u32,
   procedure: u32,
   args: &[u8],
@@ -278,7 +324,12 @@ fn serve_local(
   // through `with_state`, taken at the call's edges — outside `serve_call`'s own per-operation borrows,
   // so there is no re-entrant borrow.
   let start_ns = state::with_state(|s| s.clock.monotonic_ns()).unwrap_or(0);
-  let mut service = MultiExport::new(ShardVolumeSet, subject, mount_rights());
+  let mut service = MultiExport::new(
+    ShardVolumeSet,
+    requester.subject,
+    mount_rights(),
+    requester.owner_gid,
+  );
   let result = serve_call(
     &mut service,
     program,
@@ -307,7 +358,7 @@ fn serve_local(
 async fn serve_remote(
   owner: u16,
   origin: u16,
-  subject: Principal,
+  requester: Requester,
   program: u32,
   procedure: u32,
   args: Vec<u8>,
@@ -316,7 +367,7 @@ async fn serve_remote(
   let call_id = register_pending();
   let owner_task = SpawnRequest::new(
     Box::pin(async move {
-      let outcome = serve_local(subject, program, procedure, &args, port);
+      let outcome = serve_local(requester, program, procedure, &args, port);
       let back = SpawnRequest::new(
         Box::pin(async move {
           deliver_reply(call_id, outcome);
@@ -442,10 +493,11 @@ impl VolumeSet for GatheredVolumeSet {
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
+    owner_gid: Option<u32>,
     procedure: u32,
     args: &mut XdrReader<'_>,
   ) -> Option<Vec<u8>> {
-    ShardVolumeSet.serve(volume, subject, rights, procedure, args)
+    ShardVolumeSet.serve(volume, subject, rights, owner_gid, procedure, args)
   }
 
   fn root_object(
@@ -453,8 +505,9 @@ impl VolumeSet for GatheredVolumeSet {
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
+    owner_gid: Option<u32>,
   ) -> Option<(Nfsfh3, Fattr3)> {
-    ShardVolumeSet.root_object(volume, subject, rights)
+    ShardVolumeSet.root_object(volume, subject, rights, owner_gid)
   }
 }
 
@@ -591,15 +644,21 @@ fn is_root_listing(program: u32, procedure: u32, args: &[u8]) -> bool {
     && request_volume(&XdrReader::new(args)) == Some(root_volume())
 }
 
-/// Serves a host-root `READDIR`/`READDIRPLUS` over the gathered entries of every shard, under `subject`.
+/// Serves a host-root `READDIR`/`READDIRPLUS` over the gathered entries of every shard, as `requester`
+/// (the listing is read-only, so the group only rides for uniformity — the root creates nothing).
 fn serve_root_listing(
-  subject: Principal,
+  requester: Requester,
   procedure: u32,
   args: &[u8],
   entries: Vec<(String, VolumeId)>,
   port: u16,
 ) -> (AcceptStatus, Vec<u8>) {
-  let mut service = MultiExport::new(GatheredVolumeSet { entries }, subject, mount_rights());
+  let mut service = MultiExport::new(
+    GatheredVolumeSet { entries },
+    requester.subject,
+    mount_rights(),
+    requester.owner_gid,
+  );
   serve_call(
     &mut service,
     NFS_PROGRAM,
@@ -623,12 +682,12 @@ pub async fn serve(listener: TcpListener, port: u16) {
 }
 
 /// Produces the RPC reply payload for one parsed call, routing it locally, to a volume's owner shard
-/// over the bridge queue, or (a host-root listing) across every shard, all under `subject` (the
+/// over the bridge queue, or (a host-root listing) across every shard, all as `requester` (the
 /// mounting user, §4.13). A `program` of 0 is a garbage call whose reply carries xid 0.
 async fn reply_for(
   this: u16,
   xid: u32,
-  subject: Principal,
+  requester: Requester,
   program: u32,
   procedure: u32,
   args: Vec<u8>,
@@ -640,12 +699,12 @@ async fn reply_for(
   if is_root_listing(program, procedure, &args) {
     // The host root lists every shard's volumes, gathered over the bridge queue.
     let entries = gather_all_entries().await;
-    let (status, results) = serve_root_listing(subject, procedure, &args, entries, port);
+    let (status, results) = serve_root_listing(requester, procedure, &args, entries, port);
     return reply_bytes(xid, status, &results);
   }
   let (status, results) = match route(program, procedure, &args) {
-    Some(owner) => serve_remote(owner, this, subject, program, procedure, args, port).await,
-    None => serve_local(subject, program, procedure, &args, port),
+    Some(owner) => serve_remote(owner, this, requester, program, procedure, args, port).await,
+    None => serve_local(requester, program, procedure, &args, port),
   };
   reply_bytes(xid, status, &results)
 }
@@ -659,26 +718,27 @@ async fn serve_one(stream: TcpStream, port: u16) {
   let mut buffer: Vec<u8> = Vec::new();
   let mut chunk = [0u8; RECORD_CHUNK];
   loop {
-    // (xid, subject, program, procedure, args, consumed); a program of 0 marks a garbage call (no real
-    // program is 0), whose xid is unknown so the reply carries 0.
-    let parsed: Option<(u32, Principal, u32, u32, Vec<u8>, usize)> = match read_record(&buffer) {
+    // (xid, requester, program, procedure, args, consumed); a program of 0 marks a garbage call (no
+    // real program is 0), whose xid is unknown so the reply carries 0. The requester is the mounting
+    // user (subject and group), read from the one `AUTH_SYS` credential.
+    let parsed: Option<(u32, Requester, u32, u32, Vec<u8>, usize)> = match read_record(&buffer) {
       Ok((body, consumed)) => match parse_call(&body) {
         Ok((call, args)) => Some((
           call.xid,
-          subject_of(&body),
+          Requester::of(&body),
           call.program,
           call.procedure,
           args.rest().to_vec(),
           consumed,
         )),
-        Err(_) => Some((0, Principal::Uid { uid: 0 }, 0, 0, Vec::new(), consumed)),
+        Err(_) => Some((0, Requester::root(), 0, 0, Vec::new(), consumed)),
       },
       Err(RpcError::Incomplete) => None,
       Err(_) => return,
     };
     match parsed {
-      Some((xid, subject, program, procedure, args, consumed)) => {
-        let reply = reply_for(this, xid, subject, program, procedure, args, port).await;
+      Some((xid, requester, program, procedure, args, consumed)) => {
+        let reply = reply_for(this, xid, requester, program, procedure, args, port).await;
         if stream.write_all(&write_record(&reply)).await.is_err() {
           return;
         }

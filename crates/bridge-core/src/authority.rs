@@ -119,6 +119,13 @@ pub struct OpContext {
   pub rights: Rights,
   /// The owner epoch the attachment was admitted under (checked against the current epoch).
   pub epoch: u64,
+  /// The POSIX group a created object takes, when the request's credential names one (an NFS
+  /// `AUTH_SYS` gid). `None` when it does not — for `AUTH_NONE`, and for transports with no such
+  /// credential (FUSE, FSKit) — and the object then inherits its parent directory's group (the
+  /// BSD/macOS create rule). This is deliberately *not* part of [`OpContext::subject`]: the subject
+  /// is the uid-only authenticated identity that authority is checked against (§4.13), while the
+  /// group is file ownership to stamp, carried beside it and never consulted for access.
+  pub owner_gid: Option<u32>,
 }
 
 /// The owner's attachment registry: it admits attachments under the current host epoch, validates
@@ -220,6 +227,9 @@ impl Attachments {
       subject: attachment.subject.clone(),
       rights: attachment.rights,
       epoch: attachment.epoch,
+      // Set by the transport edge that has a credential group (the NFS export overlays the mounting
+      // user's gid); the attachment registry itself carries no group.
+      owner_gid: None,
     })
   }
 }

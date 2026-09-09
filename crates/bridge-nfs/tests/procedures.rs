@@ -658,6 +658,7 @@ fn a_commit_of_the_host_root_is_a_no_op() {
       read: true,
       write: true,
     },
+    None,
   );
   let root_fh = match multi.serve_mount("/") {
     MountReply::Ok { handle, .. } => handle,

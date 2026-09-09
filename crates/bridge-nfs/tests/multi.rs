@@ -201,7 +201,7 @@ fn spawn_two_volume_server() -> (u16, std::thread::JoinHandle<()>) {
     let mut set = OwnedVolumeSet::new(store);
     set.add("alpha", VOL_A, vol_a);
     set.add("beta", VOL_B, vol_b);
-    let mut multi = MultiExport::new(set, Principal::Uid { uid: 0 }, rights());
+    let mut multi = MultiExport::new(set, Principal::Uid { uid: 0 }, rights(), None);
     assert_eq!(multi.len(), 2);
 
     if let Ok((mut stream, _)) = listener.accept() {

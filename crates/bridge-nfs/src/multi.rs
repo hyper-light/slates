@@ -97,25 +97,31 @@ pub trait VolumeSet {
   fn entries(&self) -> Vec<(String, VolumeId)>;
 
   /// Serves one NFSv3 procedure against `volume` (routing has already chosen it), building a transient
-  /// bridge over the shared store under `subject`/`rights`. `None` if the volume is not in the set (the
-  /// router then answers the handle `NFS3ERR_STALE`). `args` is positioned at the procedure arguments.
+  /// bridge over the shared store under `subject`/`rights`, with `owner_gid` the mounting user's group
+  /// (from the call's `AUTH_SYS` credential) that a created object takes — `None` when the mount named
+  /// none, and a created object inherits its parent's group. `None` (the return) if the volume is not
+  /// in the set (the router then answers the handle `NFS3ERR_STALE`). `args` is positioned at the
+  /// procedure arguments.
   fn serve(
     &mut self,
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
+    owner_gid: Option<u32>,
     procedure: u32,
     args: &mut XdrReader<'_>,
   ) -> Option<Vec<u8>>;
 
   /// The root file handle and attributes of `volume`, for the synthetic root's `LOOKUP` and
   /// `READDIRPLUS` of the volume's name. `None` if the volume is not in the set or its root cannot be
-  /// established.
+  /// established. Carries `subject`/`rights`/`owner_gid` as [`Self::serve`] does, though a root object
+  /// creates nothing, so the group only rides for uniformity.
   fn root_object(
     &mut self,
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
+    owner_gid: Option<u32>,
   ) -> Option<(Nfsfh3, Fattr3)>;
 }
 
@@ -147,15 +153,20 @@ pub struct MultiExport<V: VolumeSet> {
   set: V,
   subject: Principal,
   rights: Rights,
+  owner_gid: Option<u32>,
 }
 
 impl<V: VolumeSet> MultiExport<V> {
-  /// A service over `set`, whose requests run under `subject` with `rights`.
-  pub fn new(set: V, subject: Principal, rights: Rights) -> MultiExport<V> {
+  /// A service over `set`, whose requests run under `subject` with `rights`, and whose created objects
+  /// take `owner_gid` (the mounting user's `AUTH_SYS` group; `None` — parent-inherited — when the
+  /// mount named none). `subject` and `owner_gid` together are the mounting user's identity and group,
+  /// carried on every request the set serves.
+  pub fn new(set: V, subject: Principal, rights: Rights, owner_gid: Option<u32>) -> MultiExport<V> {
     MultiExport {
       set,
       subject,
       rights,
+      owner_gid,
     }
   }
 
@@ -300,7 +311,7 @@ impl<V: VolumeSet> MultiExport<V> {
     let object = self.volume_of(&name).and_then(|volume| {
       self
         .set
-        .root_object(volume, self.subject.clone(), self.rights)
+        .root_object(volume, self.subject.clone(), self.rights, self.owner_gid)
     });
     match object {
       Some((handle, attr)) => {
@@ -343,7 +354,7 @@ impl<V: VolumeSet> MultiExport<V> {
       let plus_object = if plus {
         self
           .set
-          .root_object(*volume, self.subject.clone(), self.rights)
+          .root_object(*volume, self.subject.clone(), self.rights, self.owner_gid)
       } else {
         None
       };
@@ -425,7 +436,7 @@ impl<V: VolumeSet> NfsService for MultiExport<V> {
     match self.volume_of(name).and_then(|volume| {
       self
         .set
-        .root_object(volume, self.subject.clone(), self.rights)
+        .root_object(volume, self.subject.clone(), self.rights, self.owner_gid)
     }) {
       Some((handle, _)) => MountReply::Ok {
         handle,
@@ -446,7 +457,14 @@ impl<V: VolumeSet> NfsService for MultiExport<V> {
       Some(volume) => Some(
         self
           .set
-          .serve(volume, self.subject.clone(), self.rights, procedure, args)
+          .serve(
+            volume,
+            self.subject.clone(),
+            self.rights,
+            self.owner_gid,
+            procedure,
+            args,
+          )
           .unwrap_or_else(|| stale_for(procedure)),
       ),
       // An unparseable handle is a bad handle in the procedure's own reply shape.
@@ -499,12 +517,14 @@ impl OwnedVolumeSet {
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
+    owner_gid: Option<u32>,
     f: impl FnOnce(&mut Export<'_>) -> R,
   ) -> Option<R> {
     let store = &mut self.store;
     let slot = self.volumes.iter_mut().find(|v| v.id == volume)?;
     let mut bridge = VolumeBridge::new(volume, &mut slot.volume, store);
     let mut export = Export::new(&mut bridge, volume, subject, rights).ok()?;
+    export.set_owner_gid(owner_gid);
     Some(f(&mut export))
   }
 }
@@ -523,11 +543,12 @@ impl VolumeSet for OwnedVolumeSet {
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
+    owner_gid: Option<u32>,
     procedure: u32,
     args: &mut XdrReader<'_>,
   ) -> Option<Vec<u8>> {
     self
-      .with_export(volume, subject, rights, |export| {
+      .with_export(volume, subject, rights, owner_gid, |export| {
         export.serve_nfs(procedure, args)
       })
       .flatten()
@@ -538,9 +559,12 @@ impl VolumeSet for OwnedVolumeSet {
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
+    owner_gid: Option<u32>,
   ) -> Option<(Nfsfh3, Fattr3)> {
     self
-      .with_export(volume, subject, rights, |export| export.root_object())
+      .with_export(volume, subject, rights, owner_gid, |export| {
+        export.root_object()
+      })
       .flatten()
   }
 }
