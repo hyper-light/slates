@@ -12,7 +12,7 @@ import Foundation
 // The operation tags — identical to the Rust `OP_*` constants (1…19).
 enum ShimOp: UInt8 {
   case lookup = 1, getattr, read, write, opendir, readdir, release, create, mkdir, unlink, rmdir,
-    open, flush, symlink, readlink, link, rename, reference, forget
+    open, flush, symlink, readlink, link, rename, reference, forget, setattr
 }
 
 // The reply status byte and the ShimError tags — identical to the Rust `STATUS_*`/`ShimError` wire.
@@ -21,6 +21,14 @@ let STATUS_ERR: UInt8 = 1
 // The rename flag bits (Rust `RENAME_NO_REPLACE`/`RENAME_EXCHANGE`).
 let RENAME_NO_REPLACE: UInt8 = 1
 let RENAME_EXCHANGE: UInt8 = 2
+// The SetAttr field-present bits (Rust `SETATTR_*`): which of the six optional fields a setattr
+// request carries, as a little-endian UInt32 mask after the object, values following in field order.
+let SETATTR_SIZE: UInt32 = 1 << 0
+let SETATTR_MODE: UInt32 = 1 << 1
+let SETATTR_UID: UInt32 = 1 << 2
+let SETATTR_GID: UInt32 = 1 << 3
+let SETATTR_ATIME: UInt32 = 1 << 4
+let SETATTR_MTIME: UInt32 = 1 << 5
 
 // An object id: an inode and a generation, each a little-endian UInt64 (16 bytes), matching Rust's
 // `put_object`.
@@ -52,6 +60,9 @@ enum ShimRequest: Equatable {
     exchange: Bool)
   case reference(object: ObjectId)
   case forget(object: ObjectId, nlookup: UInt64)
+  case setattr(
+    object: ObjectId, size: UInt64?, mode: UInt32?, uid: UInt32?, gid: UInt32?, atime: Int64?,
+    mtime: Int64?)
 }
 
 // A decoded reply — what the shim gets back to answer FSKit. Mirrors the Rust reply encodings.
@@ -153,6 +164,22 @@ func encode(_ request: ShimRequest) -> [UInt8] {
     out.append(ShimOp.reference.rawValue); appendObject(object, &out)
   case let .forget(object, nlookup):
     out.append(ShimOp.forget.rawValue); appendObject(object, &out); appendLE(nlookup, &out)
+  case let .setattr(object, size, mode, uid, gid, atime, mtime):
+    out.append(ShimOp.setattr.rawValue); appendObject(object, &out)
+    var valid: UInt32 = 0
+    if size != nil { valid |= SETATTR_SIZE }
+    if mode != nil { valid |= SETATTR_MODE }
+    if uid != nil { valid |= SETATTR_UID }
+    if gid != nil { valid |= SETATTR_GID }
+    if atime != nil { valid |= SETATTR_ATIME }
+    if mtime != nil { valid |= SETATTR_MTIME }
+    appendLE(valid, &out)
+    if let value = size { appendLE(value, &out) }
+    if let value = mode { appendLE(value, &out) }
+    if let value = uid { appendLE(value, &out) }
+    if let value = gid { appendLE(value, &out) }
+    if let value = atime { appendLE(UInt64(bitPattern: value), &out) }
+    if let value = mtime { appendLE(UInt64(bitPattern: value), &out) }
   }
   return out
 }
@@ -234,6 +261,18 @@ func decode(_ bytes: [UInt8]) throws -> ShimRequest {
       noReplace: flags & RENAME_NO_REPLACE != 0, exchange: flags & RENAME_EXCHANGE != 0)
   case .reference: request = .reference(object: try r.object())
   case .forget: request = .forget(object: try r.object(), nlookup: try r.u64())
+  case .setattr:
+    let object = try r.object()
+    let valid = try r.u32()
+    // Read each present field in the mask's fixed order; an absent field consumes no bytes.
+    let size: UInt64? = valid & SETATTR_SIZE != 0 ? try r.u64() : nil
+    let mode: UInt32? = valid & SETATTR_MODE != 0 ? try r.u32() : nil
+    let uid: UInt32? = valid & SETATTR_UID != 0 ? try r.u32() : nil
+    let gid: UInt32? = valid & SETATTR_GID != 0 ? try r.u32() : nil
+    let atime: Int64? = valid & SETATTR_ATIME != 0 ? try r.i64() : nil
+    let mtime: Int64? = valid & SETATTR_MTIME != 0 ? try r.i64() : nil
+    request = .setattr(
+      object: object, size: size, mode: mode, uid: uid, gid: gid, atime: atime, mtime: mtime)
   case .none: throw WireError(reason: "unknown op \(tag)")
   }
   guard r.done else { throw WireError(reason: "trailing bytes") }
@@ -295,6 +334,11 @@ func run() -> Int {
     .readlink(object: o), .link(target: o, newParent: p, newName: "alias"),
     .rename(oldParent: p, newParent: o, oldName: "a", newName: "b", noReplace: true, exchange: false),
     .reference(object: o), .forget(object: o, nlookup: 3),
+    .setattr(
+      object: o, size: 4096, mode: 0o600, uid: 501, gid: 20, atime: 1_700_000_000_000_000_000,
+      mtime: -1),
+    .setattr(object: p, size: nil, mode: 0o755, uid: nil, gid: nil, atime: nil, mtime: 123),
+    .setattr(object: o, size: nil, mode: nil, uid: nil, gid: nil, atime: nil, mtime: nil),
   ]
   for request in requests {
     if let decoded = try? decode(encode(request)) {

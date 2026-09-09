@@ -21,7 +21,7 @@
 //! (this crate is the message codec, not the ring), and the Swift `FSVolume` shim (with the
 //! `Slates.app` bundle, the FSKit entitlement, and the mount spike).
 
-use slates_bridge_core::{Bridge, DirEntry, NodeAttr, ObjectId, OpContext, RenameFlags};
+use slates_bridge_core::{Bridge, DirEntry, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
@@ -63,6 +63,24 @@ const OP_RENAME: u8 = 17;
 const OP_REFERENCE: u8 = 18;
 /// Format: see [`OP_LOOKUP`].
 const OP_FORGET: u8 = 19;
+/// Format: see [`OP_LOOKUP`] — set attributes on an object (chmod/chown/truncate/utimes); the object
+/// is followed by the `SETATTR_*` field mask and the present values in field order.
+const OP_SETATTR: u8 = 20;
+
+/// Format: the `SetAttr` field-present bits — a little-endian `u32` mask that follows the object; a set
+/// bit means that field's value follows, in the order size, mode, uid, gid, atime, mtime. Mirrors the
+/// Swift shifts and the `SetAttr` optionals in `bridge-core`. This bit: a new size (a truncate).
+const SETATTR_SIZE: u32 = 1 << 0;
+/// Format: see [`SETATTR_SIZE`] — new permission bits.
+const SETATTR_MODE: u32 = 1 << 1;
+/// Format: see [`SETATTR_SIZE`] — a new owner uid.
+const SETATTR_UID: u32 = 1 << 2;
+/// Format: see [`SETATTR_SIZE`] — a new owner gid.
+const SETATTR_GID: u32 = 1 << 3;
+/// Format: see [`SETATTR_SIZE`] — a new access time (Unix nanoseconds).
+const SETATTR_ATIME: u32 = 1 << 4;
+/// Format: see [`SETATTR_SIZE`] — a new modification time (Unix nanoseconds).
+const SETATTR_MTIME: u32 = 1 << 5;
 
 /// Format: the reply status byte — the result follows, or a [`ShimError`] tag does.
 const STATUS_OK: u8 = 0;
@@ -345,6 +363,25 @@ pub enum ShimRequest {
     /// How many references to drop.
     nlookup: u64,
   },
+  /// Set attributes on `object` (chmod/chown/truncate/utimes); only the `Some` fields change and the
+  /// reply is the object's new attributes. Mirrors `bridge-core`'s [`SetAttr`], which fills the unset
+  /// half of a uid/gid or atime/mtime pair from the current value so a partial set never clobbers.
+  SetAttr {
+    /// The object.
+    object: ObjectId,
+    /// A new size (a truncate), if set.
+    size: Option<u64>,
+    /// New permission bits, if set.
+    mode: Option<u32>,
+    /// A new owner uid, if set.
+    uid: Option<u32>,
+    /// A new owner gid, if set.
+    gid: Option<u32>,
+    /// A new access time (Unix nanoseconds), if set.
+    atime: Option<i64>,
+    /// A new modification time (Unix nanoseconds), if set.
+    mtime: Option<i64>,
+  },
 }
 
 impl ShimRequest {
@@ -483,6 +520,26 @@ impl ShimRequest {
         put_object(&mut out, *object);
         out.extend_from_slice(&nlookup.to_le_bytes());
       }
+      ShimRequest::SetAttr {
+        object,
+        size,
+        mode,
+        uid,
+        gid,
+        atime,
+        mtime,
+      } => put_setattr(
+        &mut out,
+        *object,
+        SetAttr {
+          size: *size,
+          mode: *mode,
+          uid: *uid,
+          gid: *gid,
+          atime: *atime,
+          mtime: *mtime,
+        },
+      ),
     }
     out
   }
@@ -625,6 +682,7 @@ impl ShimRequest {
         let nlookup = take_u64(&mut rest)?;
         ShimRequest::Forget { object, nlookup }
       }
+      OP_SETATTR => take_setattr(&mut rest)?,
       other => return Err(ShimWireError::UnknownOp { tag: other }),
     };
     if rest.is_empty() {
@@ -735,6 +793,25 @@ fn serve_rest(request: ShimRequest, bridge: &mut dyn Bridge, cx: &OpContext) -> 
       bridge.forget(object, cx, nlookup);
       ok_unit()
     }
+    ShimRequest::SetAttr {
+      object,
+      size,
+      mode,
+      uid,
+      gid,
+      atime,
+      mtime,
+    } => {
+      let changes = SetAttr {
+        size,
+        mode,
+        uid,
+        gid,
+        atime,
+        mtime,
+      };
+      reply(bridge.setattr(object, cx, changes), |a| ok_attr(&a))
+    }
     _ => err_reply(&VfsError::Invalid),
   }
 }
@@ -821,6 +898,45 @@ fn put_object(out: &mut Vec<u8>, object: ObjectId) {
   out.extend_from_slice(&object.generation.to_le_bytes());
 }
 
+/// The mask bit for an optional field: the bit if the field is present, zero otherwise. Folding the
+/// `SETATTR_*` mask through this keeps [`put_setattr`] branch-free where it builds the mask.
+fn mask_bit<T>(field: Option<T>, bit: u32) -> u32 {
+  if field.is_some() { bit } else { 0 }
+}
+
+/// Encodes the [`OP_SETATTR`] body onto `out`: the object, then the `SETATTR_*` field mask and the
+/// present values in field order. Split from [`ShimRequest::encode`] so that match stays under the
+/// cognitive-complexity budget.
+fn put_setattr(out: &mut Vec<u8>, object: ObjectId, changes: SetAttr) {
+  out.push(OP_SETATTR);
+  put_object(out, object);
+  let valid = mask_bit(changes.size, SETATTR_SIZE)
+    | mask_bit(changes.mode, SETATTR_MODE)
+    | mask_bit(changes.uid, SETATTR_UID)
+    | mask_bit(changes.gid, SETATTR_GID)
+    | mask_bit(changes.atime, SETATTR_ATIME)
+    | mask_bit(changes.mtime, SETATTR_MTIME);
+  out.extend_from_slice(&valid.to_le_bytes());
+  if let Some(value) = changes.size {
+    out.extend_from_slice(&value.to_le_bytes());
+  }
+  if let Some(value) = changes.mode {
+    out.extend_from_slice(&value.to_le_bytes());
+  }
+  if let Some(value) = changes.uid {
+    out.extend_from_slice(&value.to_le_bytes());
+  }
+  if let Some(value) = changes.gid {
+    out.extend_from_slice(&value.to_le_bytes());
+  }
+  if let Some(value) = changes.atime {
+    out.extend_from_slice(&value.to_le_bytes());
+  }
+  if let Some(value) = changes.mtime {
+    out.extend_from_slice(&value.to_le_bytes());
+  }
+}
+
 /// Appends a length-prefixed byte field: a `u32` length then the bytes.
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
   let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
@@ -866,6 +982,65 @@ fn take_u64(rest: &mut &[u8]) -> Result<u64, ShimWireError> {
   let mut word = [0u8; size_of::<u64>()];
   word.copy_from_slice(head);
   Ok(u64::from_le_bytes(word))
+}
+
+/// Reads a little-endian `i64` from the front of `rest`, advancing it, or `Truncated`. The bytes are a
+/// two's-complement bit pattern (a timestamp), so this decodes them directly rather than casting a
+/// `u64`, which would trip the wrap lint.
+fn take_i64(rest: &mut &[u8]) -> Result<i64, ShimWireError> {
+  let (head, tail) = split_at_checked(rest, size_of::<i64>())?;
+  *rest = tail;
+  let mut word = [0u8; size_of::<i64>()];
+  word.copy_from_slice(head);
+  Ok(i64::from_le_bytes(word))
+}
+
+/// Decodes the [`OP_SETATTR`] body: the object, then the `SETATTR_*` field mask and the present values
+/// in field order (size, mode, uid, gid, atime, mtime). Split from `ShimRequest::decode`'s match so
+/// that match stays under the cognitive-complexity budget. An absent field consumes no bytes; a
+/// truncated present one refuses through `take_*` before the bridge is touched.
+fn take_setattr(rest: &mut &[u8]) -> Result<ShimRequest, ShimWireError> {
+  let object = take_object(rest)?;
+  let valid = take_u32(rest)?;
+  let size = if valid & SETATTR_SIZE != 0 {
+    Some(take_u64(rest)?)
+  } else {
+    None
+  };
+  let mode = if valid & SETATTR_MODE != 0 {
+    Some(take_u32(rest)?)
+  } else {
+    None
+  };
+  let uid = if valid & SETATTR_UID != 0 {
+    Some(take_u32(rest)?)
+  } else {
+    None
+  };
+  let gid = if valid & SETATTR_GID != 0 {
+    Some(take_u32(rest)?)
+  } else {
+    None
+  };
+  let atime = if valid & SETATTR_ATIME != 0 {
+    Some(take_i64(rest)?)
+  } else {
+    None
+  };
+  let mtime = if valid & SETATTR_MTIME != 0 {
+    Some(take_i64(rest)?)
+  } else {
+    None
+  };
+  Ok(ShimRequest::SetAttr {
+    object,
+    size,
+    mode,
+    uid,
+    gid,
+    atime,
+    mtime,
+  })
 }
 
 /// Reads a little-endian `u32` from the front of `rest`, advancing it, or `Truncated`.

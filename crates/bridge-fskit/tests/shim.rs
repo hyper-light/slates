@@ -157,6 +157,37 @@ fn a_request_round_trips_through_its_bytes() {
       object: oid(9),
       nlookup: 3,
     },
+    // SetAttr with every field present: the mask carries all six bits and the values follow in order.
+    ShimRequest::SetAttr {
+      object: oid(42),
+      size: Some(4096),
+      mode: Some(0o600),
+      uid: Some(501),
+      gid: Some(20),
+      atime: Some(1_700_000_000_000_000_000),
+      mtime: Some(-1),
+    },
+    // A partial set: only the mode and the modification time, so the mask carries two bits and only
+    // those two values are on the wire; round-trip must preserve which fields were absent.
+    ShimRequest::SetAttr {
+      object: oid(7),
+      size: None,
+      mode: Some(0o755),
+      uid: None,
+      gid: None,
+      atime: None,
+      mtime: Some(123),
+    },
+    // The empty set: a zero mask and no values (a no-op setattr the shim still frames well).
+    ShimRequest::SetAttr {
+      object: oid(1),
+      size: None,
+      mode: None,
+      uid: None,
+      gid: None,
+      atime: None,
+      mtime: None,
+    },
   ];
   for request in requests {
     let bytes = request.encode();
@@ -306,6 +337,65 @@ fn serve_writes_through_the_bridge_and_reads_it_back() {
     &reply[5..5 + len],
     payload,
     "the read returned the written bytes"
+  );
+}
+
+/// `serve` drives a setattr through the bridge: a chmod and a truncate on a written file return an OK
+/// attribute reply carrying the new mode and the new (smaller) size, and a following getattr sees the
+/// same — the metadata path over the seam, with no ring and no mount. This is the op FSKit's
+/// `setAttributes` needs (chmod/chown/truncate/utimes); AC-3.10.
+#[test]
+fn serve_sets_attributes_through_the_bridge() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root = bridge.root(&cx).unwrap();
+  let (attr, fh) = bridge.create(oid(root), &cx, "doc", 0o644, 0).unwrap();
+  bridge.write(oid(attr.ino), &cx, 0, b"five!").unwrap();
+  bridge.release(oid(attr.ino), &cx, fh).ok();
+
+  // Change the mode to 0o600 and truncate the 5-byte file to 2 bytes in one setattr; the unset uid,
+  // gid and times are left untouched.
+  let set = ShimRequest::SetAttr {
+    object: oid(attr.ino),
+    size: Some(2),
+    mode: Some(0o600),
+    uid: None,
+    gid: None,
+    atime: None,
+    mtime: None,
+  }
+  .encode();
+  let reply = serve(&set, &mut bridge, &cx).unwrap();
+  assert_eq!(reply[0], STATUS_OK, "setattr succeeded");
+
+  // The reply is the new attributes: mode at bytes 18..22, size at bytes 34..42 (the NodeAttr wire
+  // layout the getattr golden pins).
+  let mut mode_bytes = [0u8; 4];
+  mode_bytes.copy_from_slice(&reply[18..22]);
+  assert_eq!(
+    u32::from_le_bytes(mode_bytes) & 0o777,
+    0o600,
+    "the mode changed"
+  );
+  let mut size_bytes = [0u8; 8];
+  size_bytes.copy_from_slice(&reply[34..42]);
+  assert_eq!(u64::from_le_bytes(size_bytes), 2, "the file was truncated");
+
+  // A following getattr sees the same, so the change is durable in the volume, not just the reply.
+  let getattr = ShimRequest::GetAttr {
+    object: oid(attr.ino),
+  }
+  .encode();
+  let reply = serve(&getattr, &mut bridge, &cx).unwrap();
+  assert_eq!(reply[0], STATUS_OK);
+  let mut size_again = [0u8; 8];
+  size_again.copy_from_slice(&reply[34..42]);
+  assert_eq!(
+    u64::from_le_bytes(size_again),
+    2,
+    "the truncate persisted in the volume"
   );
 }
 

@@ -15,9 +15,9 @@
 //      exercises the FSItem lifecycle end to end; and
 //   2. the semantic choices a mount confirms (the root object id, the time unit, open refcounting).
 //
-// One protocol gap is honest and tracked: the shim wire has 19 ops (LOOKUP..FORGET) and no
-// SETATTR, so `setAttributes` refuses with EPERM until an `OP_SETATTR` is added to both codecs,
-// the golden vector, the Rust bridge and this handler (owed; see docs/wip/GAPS.md §4.6).
+// The shim wire is 20 ops (LOOKUP..FORGET, then SETATTR); `setAttributes` maps to OP_SETATTR,
+// carrying only the fields FSKit marks valid (chmod/chown/truncate/utimes) and returning the new
+// attributes, exactly as the by-use test `serve_sets_attributes_through_the_bridge` exercises it.
 
 import FSKit
 import Foundation
@@ -135,6 +135,13 @@ private func timespec(fromUnixNanos nanos: Int64) -> timespec {
   return timespec(tv_sec: Int(nanos / billion), tv_nsec: Int(nanos % billion))
 }
 
+// The inverse of the above: a timespec (FSKit's time form) as Unix nanoseconds, the form the shim's
+// setattr carries.
+private func unixNanos(from time: timespec) -> Int64 {
+  let billion: Int64 = 1_000_000_000
+  return Int64(time.tv_sec) * billion + Int64(time.tv_nsec)
+}
+
 // Fills an `FSItem.Attributes` from the shim's `NodeAttr`. FSKit asks for a subset via the
 // `wantedAttributes` mask, but over-reporting is allowed, so the handler fills what it has.
 private func mappedAttributes(from attr: NodeAttr) -> FSItem.Attributes {
@@ -249,10 +256,24 @@ final class SlatesVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOpera
     _ newAttributes: FSItem.SetAttributesRequest, on item: FSItem,
     replyHandler reply: @escaping (FSItem.Attributes?, Error?) -> Void
   ) {
-    // Owed: the shim wire has no SETATTR op yet. Refuse rather than silently drop a chmod/chown/
-    // truncate/utimes. Closing this needs OP_SETATTR across both codecs, the golden vector, the
-    // Rust bridge and this method (docs/wip/GAPS.md §4.6).
-    reply(nil, NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM)))
+    guard let node = item as? SlatesItem else { return reply(nil, ioError()) }
+    // Only the fields FSKit marks valid become Some; the shim's setattr leaves the rest unchanged,
+    // filling the unset half of a uid/gid or atime/mtime pair from the current value (bridge-core).
+    let request = ShimRequest.setattr(
+      object: node.object,
+      size: newAttributes.isValid(.size) ? newAttributes.size : nil,
+      mode: newAttributes.isValid(.mode) ? newAttributes.mode : nil,
+      uid: newAttributes.isValid(.uid) ? newAttributes.uid : nil,
+      gid: newAttributes.isValid(.gid) ? newAttributes.gid : nil,
+      atime: newAttributes.isValid(.accessTime) ? unixNanos(from: newAttributes.accessTime) : nil,
+      mtime: newAttributes.isValid(.modifyTime) ? unixNanos(from: newAttributes.modifyTime) : nil)
+    do {
+      switch try call(request, expecting: .attr) {
+      case .attr(let attr): reply(mappedAttributes(from: attr), nil)
+      case .error(let tag): reply(nil, posixError(tag))
+      default: reply(nil, ioError())
+      }
+    } catch { reply(nil, ioError()) }
   }
 
   func lookupItem(
