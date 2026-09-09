@@ -477,6 +477,7 @@ fn init_shard(
     ack_scatters: std::collections::BTreeMap::new(),
     telemetry: slates_wire::observe::SpanSink::with_capacity(telemetry_capacity),
     next_span_id: 1,
+    current_request: slates_wire::request::RequestId::default(),
   };
   let rebuilt = verbs::rebuild_recovered(&mut state);
   if rebuilt.skipped > 0 {

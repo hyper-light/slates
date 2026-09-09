@@ -160,6 +160,11 @@ pub struct ShardState {
   /// every span this shard emits has a distinct id within the shard (and distinct across the daemon
   /// with the partition in view). It never resets except by a restart.
   pub next_span_id: u64,
+  /// The request the shard is serving right now (§4.14): set at the start of `run_recorded`, so a
+  /// fine-grained chokepoint deeper in a verb (a `merge.verdict`, a `land.entry`) can stamp its span
+  /// with the real request identity without threading it through every handler. The shard is
+  /// single-threaded and runs one verb at a time with no awaits inside (§4.7), so this is unambiguous.
+  pub current_request: slates_wire::request::RequestId,
 }
 
 /// A work volume's accumulated declared operations (§4.16), composed into an increment on submit.

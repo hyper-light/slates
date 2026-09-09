@@ -299,6 +299,9 @@ fn run_recorded(
   principal: &Principal,
   body: RequestBody,
 ) -> ReplyBody {
+  // The request the shard is serving, so a fine-grained chokepoint deeper in the verb (a `merge.verdict`)
+  // can stamp its span with the real identity without threading it through every handler.
+  state.current_request = id;
   // Two chokepoint spans measure one verb (§4.14): `shard.op` over the whole verb (one verb on its
   // owner shard, no awaits inside), and `log.append` over the durable `Db::commit` within it (one
   // op-log record appended and published). The `shard.op` label is content-free — a read (0) or a
@@ -1855,12 +1858,30 @@ fn submit(state: &mut ShardState, work: VolumeId) -> ReplyBody {
   if let Err(e) = state.db.partition().check(&record, now) {
     return refused(refusal_of_db(&e));
   }
+  let verdict_start = state.clock.monotonic_ns();
   let outcome = {
     let Some(engine) = state.greens.get_mut(&green_id) else {
       return refused(Refusal::NotFound);
     };
     engine.submit(&inc)
   };
+  // The `merge.verdict` chokepoint span (§4.14): one increment judged (accept, identical, or conflict).
+  // The label is content-free — accepted (1) or conflict (0); the request is the one the shard is
+  // serving (set in `run_recorded`). It never carries a path, a name or bytes.
+  let verdict_end = state.clock.monotonic_ns();
+  let accepted = u32::from(matches!(
+    &outcome,
+    slates_merge::engine::Outcome::Accepted { .. }
+  ));
+  let request = state.current_request;
+  emit_span(
+    state,
+    Chokepoint::MergeVerdict,
+    accepted,
+    request,
+    verdict_start,
+    verdict_end,
+  );
   match outcome {
     slates_merge::engine::Outcome::Accepted { version } => {
       // The pre-check passed and the shard is single-threaded, so this append fits the budget; a
