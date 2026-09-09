@@ -30,6 +30,13 @@ pub enum ServerError {
   Refused(Refusal),
   /// The daemon is not on a shard thread where it expected one.
   NotOnShard,
+  /// The observability gate is shut: some chokepoint spans have not registered their emitter, so the
+  /// health plane refuses to serve (§2.6, §4.14). Fail-closed — a daemon never serves with a silently
+  /// missing span source. Names the missing chokepoints so the operator sees which emitter is absent.
+  ChokepointsUnregistered {
+    /// The dotted names of the chokepoints that did not register (§4.14 roster order).
+    missing: Vec<&'static str>,
+  },
 }
 
 impl fmt::Display for ServerError {
@@ -43,6 +50,11 @@ impl fmt::Display for ServerError {
       Self::Memory(e) => write!(f, "memory: {e}"),
       Self::Refused(r) => write!(f, "refused: {r:?}"),
       Self::NotOnShard => f.write_str("not on a shard thread"),
+      Self::ChokepointsUnregistered { missing } => write!(
+        f,
+        "observability incomplete: chokepoint spans not registered: {}",
+        missing.join(", ")
+      ),
     }
   }
 }

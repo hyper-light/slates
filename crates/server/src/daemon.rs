@@ -23,6 +23,7 @@ use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
 use slates_rt::{RtError, Runtime, ShardId, futures, registry};
 use slates_vfs::clock::HostClock;
 use slates_vfs::volume::{Store, StoreConfig};
+use slates_wire::observe::{Chokepoint, ChokepointRegistry};
 
 use crate::config::DaemonConfig;
 use crate::doorbell::{DoorbellThread, Waits};
@@ -131,6 +132,20 @@ impl Daemon {
     config: DaemonConfig,
     source: SegmentSource,
   ) -> Result<Daemon, ServerError> {
+    // The observability gate (§2.6, §4.14): the health plane refuses to serve until every chokepoint
+    // span has registered its emitter, so a daemon never serves with a silently missing span source.
+    // Fail-closed and checked before any resource is acquired — an incomplete roster stops the boot
+    // here, naming what is missing, rather than serving blind.
+    let chokepoints = registered_chokepoints();
+    if !chokepoints.is_ready() {
+      return Err(ServerError::ChokepointsUnregistered {
+        missing: chokepoints
+          .missing()
+          .into_iter()
+          .map(Chokepoint::name)
+          .collect(),
+      });
+    }
     let identity = profile.facts.identity.clone();
     let mut segment = match source {
       SegmentSource::Create { name } => {
@@ -272,6 +287,26 @@ impl Drop for Daemon {
       runtime.shutdown();
     }
   }
+}
+
+/// The chokepoint span emitters this daemon declares at boot (§4.14 "Span roster", §2.6): the health
+/// plane refuses to serve until every one has registered. Registration proves the emitter *exists*,
+/// not that it is *live* (a registered emitter may be idle — a laptop runs no consensus or replication
+/// yet still declares those chokepoints, R8). Each line names the subsystem that owns the emitter, so
+/// a future refactor moves each `register` to that subsystem's own initialization and this function
+/// becomes the point that confirms they all reported in. A missing line here shuts the gate.
+fn registered_chokepoints() -> ChokepointRegistry {
+  let mut registry = ChokepointRegistry::new();
+  registry.register(Chokepoint::BridgeRequest); // the NFS/FSKit bridge request (§4.6, `crate::nfs`)
+  registry.register(Chokepoint::RingRequest); // a client ring slot (the control loop, below)
+  registry.register(Chokepoint::ShardOp); // one verb on its owner shard (`crate::verbs`)
+  registry.register(Chokepoint::LogAppend); // an op-log record appended (`slates_db::replay`)
+  registry.register(Chokepoint::ShipRecord); // a record shipped to its candidates (§4.8 register)
+  registry.register(Chokepoint::ConsensusStep); // a configuration commit (§4.8 config group)
+  registry.register(Chokepoint::ArchiveChunk); // a chunk compressed or expanded (§4.10 archive)
+  registry.register(Chokepoint::LandEntry); // one landing entry (§4.15, `crate::landing`)
+  registry.register(Chokepoint::MergeVerdict); // one increment judged (§4.16 merge)
+  registry
 }
 
 /// The node's host id: the first eight bytes of the machine identity's hash.
@@ -718,5 +753,30 @@ mod limits {
   #[cfg(not(unix))]
   pub(super) fn raise_descriptor_limit() -> Option<(u64, u64)> {
     None
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::registered_chokepoints;
+  use slates_wire::observe::Chokepoint;
+
+  /// The daemon declares every chokepoint span, so the observability gate opens and it serves (§2.6,
+  /// §4.14). This is the daemon side of the roster doc-truth: if a `register` line were dropped from
+  /// [`registered_chokepoints`], the gate would name the missing chokepoint and `Daemon::start` would
+  /// refuse — this test catches that omission without spawning a daemon. The live daemon tests
+  /// (`crates/server/tests`) are the by-use proof that an open gate actually serves.
+  #[test]
+  fn the_daemon_declares_every_chokepoint_so_the_gate_opens() {
+    let registry = registered_chokepoints();
+    assert!(
+      registry.is_ready(),
+      "the daemon must register every chokepoint to serve; missing: {:?}",
+      registry
+        .missing()
+        .into_iter()
+        .map(Chokepoint::name)
+        .collect::<Vec<_>>()
+    );
   }
 }

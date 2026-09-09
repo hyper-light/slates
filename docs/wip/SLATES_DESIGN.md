@@ -2180,6 +2180,21 @@ it uses content addressing. The RAM-only trust boundary and any allowed sharing 
 
 ### 4.14 Observability (D-23)
 
+> **Status (2026-09-09).** The chokepoint-span roster and the three distinct identity types are built
+> (`slates-wire::observe`: a closed `Chokepoint` enum of the nine spans, `SpanContext` = request +
+> trace + span + optional caused-by, each a separate type so a trace field never carries a
+> `RequestId`'s authority; doc-truth tested). The **emission foundation** now exists: a completed
+> `Span` (three-id context + a content-free bounded dimension code + monotonic start/end), a bounded
+> **shed-first `SpanSink`** (a ring that keeps the most recent spans and counts every shed one — no
+> unbounded growth, explicit loss), and the `ChokepointRegistry` gate. The **registration gate** (§2.6)
+> is **wired into the daemon boot**: `Daemon::start` builds the roster via `registered_chokepoints()`
+> and refuses to serve — typed `ServerError::ChokepointsUnregistered { missing }`, fail-closed, before
+> any resource is acquired — until every chokepoint has registered its emitter, so a daemon never
+> serves with a silently missing span source. Owed: the async span **delivery** through the shard's
+> telemetry ring into the control sink (in-process, by move — the `Control::Spawn` path the cross-shard
+> bridge queue already uses) and the per-chokepoint **emit sites**; typed absence markers and
+> `(value, freshness)` on the daemon-level counters.
+
 Chokepoint spans (bridge request, ring request, shard operation, log append, replication ship,
 consensus step, archive chunk) with the three-id law; spans emitted asynchronously through
 per-shard rings into the control shard's sink; health signals carry `(value, freshness)` and are
