@@ -19,6 +19,7 @@
 
 pub mod handle;
 pub mod mount;
+pub mod multi;
 pub mod nfs;
 pub mod portmap;
 pub mod procedures;
@@ -28,6 +29,7 @@ pub mod xdr;
 
 pub use handle::{FileHandle, FileHandleError};
 pub use mount::{MountReply, Mountstat3};
+pub use multi::{MultiExport, NfsService};
 pub use nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3};
 pub use portmap::Mapping;
 pub use procedures::Export;

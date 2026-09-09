@@ -113,6 +113,13 @@ impl<'a> XdrReader<'a> {
     self.pos
   }
 
+  /// The bytes not yet read, so a caller can peek a leading field through a fresh reader without
+  /// consuming this one (the multi-volume router reads the leading file handle to route, then hands
+  /// the untouched reader to the chosen volume's export).
+  pub fn rest(&self) -> &'a [u8] {
+    self.bytes.get(self.pos..).unwrap_or(&[])
+  }
+
   /// Takes `count` bytes, or refuses when the buffer is too short.
   fn take(&mut self, count: usize) -> Result<&'a [u8], XdrError> {
     let end = self.pos.checked_add(count).ok_or(XdrError::BadLength)?;

@@ -12,8 +12,9 @@ use std::io::{Read, Write};
 use crate::mount::{
   MOUNT_PROGRAM, MOUNTPROC3_MNT, MOUNTPROC3_NULL, MOUNTPROC3_UMNT, parse_mount_path,
 };
+use crate::multi::NfsService;
 use crate::portmap::{PMAPPROC_GETPORT, PMAPPROC_NULL, PORTMAP_PROGRAM, getport_reply};
-use crate::procedures::{Export, NFS_PROGRAM};
+use crate::procedures::NFS_PROGRAM;
 use crate::rpc::{AcceptStatus, RpcError, parse_call};
 use crate::xdr::{XdrReader, XdrWriter};
 use crate::{read_record, reply_bytes, write_record};
@@ -26,10 +27,12 @@ use slates_rt::tcp::TcpStream;
 /// bounds the number of syscalls per record, never correctness.
 const RECORD_READ_CHUNK: usize = 1 << 16;
 
-/// Dispatches one decoded RPC call onto `export`, returning the accept status and encoded results. The
-/// `port` answers a portmap `GETPORT` (this server serves every program on one port).
+/// Dispatches one decoded RPC call onto `service`, returning the accept status and encoded results.
+/// The `service` serves one volume ([`Export`](crate::procedures::Export)) or many
+/// ([`MultiExport`](crate::multi::MultiExport)) behind the same trait. The `port` answers a portmap
+/// `GETPORT` (this server serves every program on one port).
 fn dispatch(
-  export: &mut Export<'_>,
+  service: &mut dyn NfsService,
   program: u32,
   procedure: u32,
   args: &mut XdrReader<'_>,
@@ -45,7 +48,7 @@ fn dispatch(
       MOUNTPROC3_NULL => (AcceptStatus::Success, Vec::new()),
       MOUNTPROC3_MNT => {
         let path = parse_mount_path(args).unwrap_or("/").to_owned();
-        let reply = export.mnt(&path);
+        let reply = service.serve_mount(&path);
         let mut writer = XdrWriter::new();
         reply.encode(&mut writer);
         (AcceptStatus::Success, writer.as_slice().to_vec())
@@ -53,7 +56,7 @@ fn dispatch(
       MOUNTPROC3_UMNT => (AcceptStatus::Success, Vec::new()),
       _ => (AcceptStatus::ProcUnavail, Vec::new()),
     },
-    NFS_PROGRAM => match export.serve_nfs(procedure, args) {
+    NFS_PROGRAM => match service.serve_procedure(procedure, args) {
       Some(results) => (AcceptStatus::Success, results),
       None => (AcceptStatus::ProcUnavail, Vec::new()),
     },
@@ -61,11 +64,11 @@ fn dispatch(
   }
 }
 
-/// Serves NFS/MOUNT/portmap RPC over one connected `stream` against `export`, until the client closes
+/// Serves NFS/MOUNT/portmap RPC over one connected `stream` against `service`, until the client closes
 /// it. `port` is the port the server listens on (answered to a portmap `GETPORT`). Returns when the
 /// stream reaches end of file or a read/write fails; a malformed record ends the connection rather than
 /// risking a desynchronised stream.
-pub fn serve_connection<S: Read + Write>(stream: &mut S, export: &mut Export<'_>, port: u16) {
+pub fn serve_connection<S: Read + Write>(stream: &mut S, service: &mut dyn NfsService, port: u16) {
   let mut buffer: Vec<u8> = Vec::new();
   let mut chunk = [0u8; RECORD_READ_CHUNK];
   loop {
@@ -73,7 +76,8 @@ pub fn serve_connection<S: Read + Write>(stream: &mut S, export: &mut Export<'_>
       Ok((body, consumed)) => {
         let reply = match parse_call(&body) {
           Ok((call, mut args)) => {
-            let (status, results) = dispatch(export, call.program, call.procedure, &mut args, port);
+            let (status, results) =
+              dispatch(service, call.program, call.procedure, &mut args, port);
             reply_bytes(call.xid, status, &results)
           }
           Err(_) => reply_bytes(0, AcceptStatus::GarbageArgs, &[]),
@@ -92,7 +96,7 @@ pub fn serve_connection<S: Read + Write>(stream: &mut S, export: &mut Export<'_>
   }
 }
 
-/// Serves NFS/MOUNT/portmap RPC over one connected runtime `stream` against `export`, until the client
+/// Serves NFS/MOUNT/portmap RPC over one connected runtime `stream` against `service`, until the client
 /// closes it — the async analogue of [`serve_connection`] for the production server, which multiplexes
 /// connections on slates's own runtime (§4.6). It shares the RPC engine ([`dispatch`]) and the record
 /// codec with the blocking form; only the transport differs. Reads and writes await the shard's driver
@@ -104,7 +108,7 @@ pub fn serve_connection<S: Read + Write>(stream: &mut S, export: &mut Export<'_>
 /// to log and drop the connection.
 pub async fn serve_connection_async(
   stream: &mut TcpStream,
-  export: &mut Export<'_>,
+  service: &mut dyn NfsService,
   port: u16,
 ) -> Result<(), RtError> {
   let mut buffer: Vec<u8> = Vec::new();
@@ -114,7 +118,8 @@ pub async fn serve_connection_async(
       Ok((body, consumed)) => {
         let reply = match parse_call(&body) {
           Ok((call, mut args)) => {
-            let (status, results) = dispatch(export, call.program, call.procedure, &mut args, port);
+            let (status, results) =
+              dispatch(service, call.program, call.procedure, &mut args, port);
             reply_bytes(call.xid, status, &results)
           }
           Err(_) => reply_bytes(0, AcceptStatus::GarbageArgs, &[]),
