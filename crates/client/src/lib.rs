@@ -34,3 +34,6 @@ pub use slates_ipc::protocol::{
   LandingOutcome, LandingSummary, NamePolicy, PlacedState, Refusal, RefusalCount, Scope,
   ShardReport, Signal, SizeClass, SnapshotId, StatusReport, VolumeId, VolumeSummary, WorkOp,
 };
+/// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async
+/// caller holds it between the send and the reply the completion fd signals (§4.7, D-19).
+pub use slates_wire::request::RequestId;

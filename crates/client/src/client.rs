@@ -1,5 +1,7 @@
 //! The client: the rendezvous, one request in flight, exactly-once retries, typed verbs.
 
+#[cfg(unix)]
+use std::os::fd::RawFd;
 use std::time::Instant;
 
 use slates_ipc::protocol::{
@@ -129,6 +131,12 @@ pub struct Client {
   /// ring's slots, so the daemon retains at most one ring of records per client while the
   /// acknowledgement costs one request in that many.
   ack_every: u32,
+  /// Replies drained from the completion ring while looking for another request's reply, held by
+  /// their request-id word until their own [`Client::poll_reply`] takes them. The async path drains
+  /// the ring on a completion-fd signal and matches by id, so replies that arrive out of order (a
+  /// deferred verb) or unawaited (an acknowledgement) do not block another request's. Bounded — an
+  /// overflow drops the oldest, which can only be an unawaited reply, never one still in flight.
+  pending: Vec<(u64, ReplyBody)>,
 }
 
 fn ack_every_of(end: &ClientEnd) -> u32 {
@@ -170,6 +178,15 @@ fn elapsed_ns(since: Instant) -> u64 {
   u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// Maps a decoded reply body to a result: a refusal becomes the typed error, any other body passes
+/// through — the same rule [`Client::exchange`] applies to a synchronous reply.
+fn resolved(body: ReplyBody) -> Result<ReplyBody, ClientError> {
+  match body {
+    ReplyBody::Refused { refusal } => Err(ClientError::Refused(refusal)),
+    other => Ok(other),
+  }
+}
+
 impl Client {
   /// Connects to `instance` as a new client.
   pub fn connect(instance: &str, deadlines: Deadlines) -> Result<Client, ClientError> {
@@ -186,6 +203,7 @@ impl Client {
       reconnects: 0,
       acknowledged: 0,
       ack_every,
+      pending: Vec::new(),
     })
   }
 
@@ -213,6 +231,7 @@ impl Client {
       reconnects: 0,
       acknowledged: 0,
       ack_every,
+      pending: Vec::new(),
     })
   }
 
@@ -311,6 +330,129 @@ impl Client {
         Err(e) => return Err(ClientError::Ipc(e)),
       }
     }
+  }
+
+  // --- The async round trip (§4.7 "Wake strategy", R6, D-19) --------------------------------
+  //
+  // The sync `call` blocks on `end.wait` (spin then park). The async form splits that in two so a
+  // host event loop drives the wait: `begin` sends and returns the request id; the caller spins
+  // with `spin_reply` (the fast path, no event loop) and, if the reply has not landed, arms the
+  // completion signal, yields to its loop on the completion fd, and takes the reply with
+  // `poll_reply` when the fd signals. The SDK bindings own the yield on their own loop
+  // (`asyncio.add_reader`, `uv_poll`); this core provides the non-blocking primitives and matches
+  // replies to requests by id, so one reader can serve every request in flight.
+
+  /// Sends `body` under the next sequence and returns its request id, without waiting for the reply
+  /// — the async caller awaits it on the completion fd. Unlike [`Self::call`], this sends no periodic
+  /// acknowledgement inline (a blocking round trip has no place on the async path); an async caller
+  /// acknowledges by a sync [`Self::acknowledge`] between calls, or by `begin`-ing the ack body and
+  /// dropping its reply.
+  pub fn begin(&mut self, body: &RequestBody) -> Result<RequestId, ClientError> {
+    self.sequence = self.sequence.wrapping_add(1);
+    let id = RequestId {
+      client: self.client_id,
+      sequence: self.sequence,
+    };
+    self.send(id, body)?;
+    Ok(id)
+  }
+
+  /// Takes the reply to `id` if it has arrived, without blocking. Replies for other requests drained
+  /// while looking are buffered by id for their own `poll_reply`; a refusal is returned typed. `None`
+  /// until `id`'s reply is on the ring.
+  pub fn poll_reply(&mut self, id: RequestId) -> Result<Option<ReplyBody>, ClientError> {
+    if let Some(pos) = self.pending.iter().position(|(word, _)| *word == id.word()) {
+      let (_, body) = self.pending.remove(pos);
+      return resolved(body).map(Some);
+    }
+    while let Some(reply) = self.end.try_take()? {
+      let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
+      if reply.request == id.word() {
+        return resolved(body).map(Some);
+      }
+      self.buffer(reply.request, body);
+    }
+    Ok(None)
+  }
+
+  /// Spins for `spin_ns` taking `id`'s reply if it lands — the async fast path: most replies arrive
+  /// within the daemon's published spin window and never touch the event loop (§4.7 worked example).
+  /// `None` if the reply has not come by the window's end, so the caller yields to its loop.
+  pub fn spin_reply(
+    &mut self,
+    id: RequestId,
+    spin_ns: u64,
+  ) -> Result<Option<ReplyBody>, ClientError> {
+    let started = Instant::now();
+    loop {
+      if let Some(reply) = self.poll_reply(id)? {
+        return Ok(Some(reply));
+      }
+      if elapsed_ns(started) >= spin_ns {
+        return Ok(None);
+      }
+      std::hint::spin_loop();
+    }
+  }
+
+  /// Drains every reply now on the completion ring into the per-id buffer and returns the ids held,
+  /// so an async pump resolves each waiting request in one pass (an event loop allows one reader per
+  /// fd, so one reader serves every request in flight). Non-blocking.
+  pub fn take_ready(&mut self) -> Result<Vec<u64>, ClientError> {
+    while let Some(reply) = self.end.try_take()? {
+      let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
+      self.buffer(reply.request, body);
+    }
+    Ok(self.pending.iter().map(|(word, _)| *word).collect())
+  }
+
+  /// Buffers a reply drained for another request. Bounded (item 8): no more requests can be in flight
+  /// than the ring holds, so an awaited reply is always within one ring's worth; twice that as the cap
+  /// means an overflow drops only an unawaited reply (a periodic acknowledgement), never one still
+  /// awaited.
+  fn buffer(&mut self, id_word: u64, body: ReplyBody) {
+    self.pending.push((id_word, body));
+    let bound = self.reply_buffer_bound();
+    while self.pending.len() > bound {
+      self.pending.remove(0);
+    }
+  }
+
+  /// Derived: the reply buffer's bound, twice the command ring's slots (an awaited reply is always
+  /// within one ring of in-flight requests, so twice that never evicts one still awaited).
+  fn reply_buffer_bound(&self) -> usize {
+    derived!(
+      self.end.region().cmd().slots().saturating_mul(2).max(1),
+      "2 × region.slots",
+      ["region.slots"]
+    )
+    .get()
+  }
+
+  /// Enables the async completion channel and returns the descriptor an event loop polls
+  /// (`add_reader` / `uv_poll`, D-19): the SDK registers it, arms with [`Self::arm_async`] before it
+  /// yields, and drains it with [`Self::drain_completion`] when the loop reports it readable.
+  #[cfg(unix)]
+  pub fn enable_async_completion(&mut self) -> Result<RawFd, ClientError> {
+    self.end.enable_async_completion().map_err(ClientError::Ipc)
+  }
+
+  /// Arms the completion signal before the SDK yields to its event loop (the daemon wakes a parked
+  /// client on a reply). A caller re-checks [`Self::poll_reply`] right after arming to close the race
+  /// with a reply that landed during the spin.
+  pub fn arm_async(&mut self) -> Result<(), ClientError> {
+    self.end.arm_async().map_err(ClientError::Ipc)
+  }
+
+  /// Clears the arm once a reply is taken, so a later fast-path reply costs the daemon no wake.
+  pub fn disarm_async(&mut self) -> Result<(), ClientError> {
+    self.end.disarm_async().map_err(ClientError::Ipc)
+  }
+
+  /// Clears the completion fd's readiness after the loop reports it readable.
+  #[cfg(unix)]
+  pub fn drain_completion(&self) {
+    self.end.drain_completion();
   }
 
   /// Writes the request into the command ring, waiting on credit (the daemon drains the ring

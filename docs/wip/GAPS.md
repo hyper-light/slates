@@ -520,11 +520,25 @@ thread per async client, owned by the `ClientEnd` and joined on drop (the `slate
 mechanisms (Linux eventfd written by the daemon, macOS pipe written by the bridge);
 `the_completion_bridge_signals_only_an_armed_reply_and_stops_clean` drives it on this macOS host —
 the fd quiet for a disarmed reply, readable for an armed one, the thread joining clean on drop,
-and the Linux branch lints clean cross-target. Still owed: the **Windows** completion fd (its
+and the Linux branch lints clean cross-target. The **Rust async core the bindings drive is now
+built** (`slates-client`, splitting the sync round trip so a host event loop drives the wait):
+`Client::begin` sends without waiting and returns the request id; `spin_reply` is the fast path (a
+reply taken within the daemon's spin window, no event loop — §4.7's worked example); `poll_reply`
+takes a reply by id once the completion fd signals, buffering another request's reply so a reply
+that arrives out of order (a deferred verb) or unawaited (an acknowledgement) never blocks
+another's — the buffer bounded at twice the ring (item 8, no unbounded growth); `take_ready` drains
+every ready reply for a pump that serves every in-flight request through one reader (a loop allows
+one reader per fd); and `enable_async_completion` / `arm_async` / `disarm_async` /
+`drain_completion` are the completion-fd seam. Proven by use over an in-process daemon
+(`crates/client/tests/async_core.rs`): the create's reply taken by the spin fast path, the
+snapshot's by the completion fd (armed before the send, so the daemon signals the fd exactly as for
+a request parked on the loop), and two in-flight requests each routed to their own reply by id.
+Still owed: the **Windows** completion fd (its
 async loop needs a socket, D-10 "asyncio on Windows needs a socket"; a client-local loopback
 socketpair fed by the same bridge, build-and-lint only from this host); and, above both, the
-Python `asyncio`/Node `uv_poll` bindings that poll `completion_fd` behind thin sync facades (R6,
-D-19). The Rust client parks on the word and needs none. The Windows named Event per client (Phase
+Python `asyncio`/Node `uv_poll` bindings that call these primitives — `begin`, `spin_reply`,
+`poll_reply` — behind thin sync facades (R6, D-19). The Rust client parks on the word and needs
+none. The Windows named Event per client (Phase
 4, with the section-and-Event rendezvous compile-checked now); the doorbell thread that turns a
 client's wake of a parked macOS shard into the driver's kick, and the heartbeat slot that
 tells the daemon a client died where no socket closes, both with the server's integration in

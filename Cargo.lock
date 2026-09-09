@@ -1210,6 +1210,7 @@ dependencies = [
 name = "slates-client"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "slates-anchor",
  "slates-db",
  "slates-ipc",

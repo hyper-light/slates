@@ -16,6 +16,9 @@ slates-wire = { workspace = true }
 [dev-dependencies]
 slates-server = { workspace = true }
 slates-anchor = { workspace = true }
+# Test-only: the async-core test polls the completion fd for readiness (the fd an event loop would
+# poll), which needs `poll(2)`; rustix is the crate's syscall wrapper, a normal dep of `slates-ipc`.
+rustix = { workspace = true }
 slates-mem = { workspace = true }
 slates-db = { workspace = true }
 
