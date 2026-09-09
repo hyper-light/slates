@@ -152,6 +152,11 @@ fn a_request_round_trips_through_its_bytes() {
       no_replace: true,
       exchange: false,
     },
+    ShimRequest::Reference { object: oid(9) },
+    ShimRequest::Forget {
+      object: oid(9),
+      nlookup: 3,
+    },
   ];
   for request in requests {
     let bytes = request.encode();
@@ -464,6 +469,34 @@ fn serve_drives_symlink_and_rename() {
     serve(&lookup, &mut bridge, &cx).unwrap()[0],
     STATUS_OK,
     "the renamed file resolves"
+  );
+}
+
+/// A golden vector pins the wire so a change is caught across versions: the exact bytes of a GetAttr
+/// request and of a NotFound error reply.
+#[test]
+fn the_wire_is_pinned_by_a_golden_vector() {
+  // GetAttr: op tag 2, then the object — inode (u64 LE) then generation (u64 LE).
+  let request = ShimRequest::GetAttr { object: oid(7) }.encode();
+  let mut golden = vec![2u8];
+  golden.extend_from_slice(&7u64.to_le_bytes());
+  golden.extend_from_slice(&0u64.to_le_bytes());
+  assert_eq!(request, golden, "the GetAttr request wire is stable");
+
+  // A NotFound error reply is the status byte 1 (ERR) then the ShimError tag 0 (NotFound).
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let missing = ShimRequest::GetAttr {
+    object: oid(12_345),
+  }
+  .encode();
+  let reply = serve(&missing, &mut bridge, &cx).unwrap();
+  assert_eq!(
+    reply,
+    vec![STATUS_ERR, SHIM_NOT_FOUND],
+    "the NotFound error reply wire is stable"
   );
 }
 

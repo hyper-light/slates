@@ -13,14 +13,13 @@
 //! either the result or a [`ShimError`] tag; the Swift shim maps that tag to the `NSError`/POSIX errno
 //! FSKit returns, so no errno numbers live in this Rust codec.
 //!
-//! The codec now covers the **whole `Bridge` filesystem operation set**: the read path (`lookup`,
-//! `getattr`, `read`), the write path (`write`), files and handles (`open`, `flush`), directory
-//! enumeration (`opendir`, `readdir`, `release`), the namespace (`create`, `mkdir`, `unlink`, `rmdir`,
-//! `rename`), and links (`symlink`, `readlink`, `link`) — a tree can be browsed and modified end to end
-//! over the seam. The transport-lifetime operations (`reference`/`forget`, which manage per-transport
-//! lookup counts) are owed, as are a golden reply test pinning the wire, the app-group ring transport,
-//! and the Swift `FSVolume` shim (with the `Slates.app` bundle, the FSKit entitlement, and the mount
-//! spike).
+//! The codec covers the **whole `Bridge` operation set** — the read path (`lookup`, `getattr`, `read`),
+//! the write path (`write`), files and handles (`open`, `flush`), directory enumeration (`opendir`,
+//! `readdir`, `release`), the namespace (`create`, `mkdir`, `unlink`, `rmdir`, `rename`), links
+//! (`symlink`, `readlink`, `link`) and the transport-lifetime references (`reference`, `forget`) — with
+//! a golden vector pinning the wire. What is owed is the **platform half**: the app-group ring transport
+//! (this crate is the message codec, not the ring), and the Swift `FSVolume` shim (with the
+//! `Slates.app` bundle, the FSKit entitlement, and the mount spike).
 
 use slates_bridge_core::{Bridge, DirEntry, NodeAttr, ObjectId, OpContext, RenameFlags};
 use slates_vfs::error::VfsError;
@@ -60,6 +59,10 @@ const OP_READLINK: u8 = 15;
 const OP_LINK: u8 = 16;
 /// Format: see [`OP_LOOKUP`].
 const OP_RENAME: u8 = 17;
+/// Format: see [`OP_LOOKUP`].
+const OP_REFERENCE: u8 = 18;
+/// Format: see [`OP_LOOKUP`].
+const OP_FORGET: u8 = 19;
 
 /// Format: the reply status byte — the result follows, or a [`ShimError`] tag does.
 const STATUS_OK: u8 = 0;
@@ -330,6 +333,18 @@ pub enum ShimRequest {
     /// Whether to atomically exchange the two names.
     exchange: bool,
   },
+  /// Take one lookup reference on `object` (the shim is handed an object to address later).
+  Reference {
+    /// The object.
+    object: ObjectId,
+  },
+  /// Drop `nlookup` lookup references on `object` (the shim forgot it that many times).
+  Forget {
+    /// The object.
+    object: ObjectId,
+    /// How many references to drop.
+    nlookup: u64,
+  },
 }
 
 impl ShimRequest {
@@ -458,6 +473,15 @@ impl ShimRequest {
         put_bytes(&mut out, old_name.as_bytes());
         put_bytes(&mut out, new_name.as_bytes());
         out.push(rename_flags_byte(*no_replace, *exchange));
+      }
+      ShimRequest::Reference { object } => {
+        out.push(OP_REFERENCE);
+        put_object(&mut out, *object);
+      }
+      ShimRequest::Forget { object, nlookup } => {
+        out.push(OP_FORGET);
+        put_object(&mut out, *object);
+        out.extend_from_slice(&nlookup.to_le_bytes());
       }
     }
     out
@@ -592,6 +616,15 @@ impl ShimRequest {
           exchange: flags & RENAME_EXCHANGE != 0,
         }
       }
+      OP_REFERENCE => {
+        let object = take_object(&mut rest)?;
+        ShimRequest::Reference { object }
+      }
+      OP_FORGET => {
+        let object = take_object(&mut rest)?;
+        let nlookup = take_u64(&mut rest)?;
+        ShimRequest::Forget { object, nlookup }
+      }
       other => return Err(ShimWireError::UnknownOp { tag: other }),
     };
     if rest.is_empty() {
@@ -695,6 +728,12 @@ fn serve_rest(request: ShimRequest, bridge: &mut dyn Bridge, cx: &OpContext) -> 
         bridge.rename(old_parent, new_parent, cx, &old_name, &new_name, flags),
         |()| ok_unit(),
       )
+    }
+    ShimRequest::Reference { object } => reply(bridge.reference(object, cx), |()| ok_unit()),
+    ShimRequest::Forget { object, nlookup } => {
+      // `forget` is fire-and-forget (no result); the reply is a bare ack the shim may ignore.
+      bridge.forget(object, cx, nlookup);
+      ok_unit()
     }
     _ => err_reply(&VfsError::Invalid),
   }
