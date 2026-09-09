@@ -12,6 +12,9 @@ use std::time::Instant;
 use crate::error::IpcError;
 use crate::region::ClientRegion;
 use crate::slot::{Slot, SlotKind};
+// The word-based wake serves Linux/macOS; Windows waits on and signals the region's named Event
+// instead (`ClientRegion::wake_wait`/`wake_signal`), so this import is dead there.
+#[cfg(not(windows))]
 use crate::wake;
 
 /// Format: the eight bytes a completion signal writes (an eventfd counter increment on Linux; a byte
@@ -107,6 +110,9 @@ impl ClientEnd {
 
   /// The client's end over everything the rendezvous handed over: the region, the doorbell,
   /// the liveness check, and (where the platform has one) the completion fd an async SDK polls.
+  // `connected` is mutated only to take the completion fd, which is a Unix concern; on Windows it is
+  // read-only, so the `mut` is dead there.
+  #[cfg_attr(windows, allow(unused_mut))]
   pub fn connected(mut connected: crate::rendezvous::Connected) -> ClientEnd {
     #[cfg(unix)]
     let completion = connected.take_completion();
@@ -309,9 +315,12 @@ impl ClientEnd {
       if deadline_ns.is_some_and(|d| elapsed_ns(started) >= d) {
         return Err(IpcError::DeadlineExceeded);
       }
-      // Park: the flag first, the word's value, then the re-check that closes the race with
-      // a reply written between the last poll and the wait.
+      // Park: the flag first, the word's value (Linux/macOS), then the re-check that closes the race
+      // with a reply written between the last poll and the wait. On Linux/macOS the wait returns at
+      // once if the wake word moved past the value read here; on Windows the named auto-reset Event
+      // carries a signal made before the wait, so no separate value is needed.
       self.region.client_parked()?.store(1, Ordering::Release);
+      #[cfg(not(windows))]
       let expected = self.region.wake_word()?.load(Ordering::Acquire);
       if let Some(reply) = self.try_take()? {
         self.region.client_parked()?.store(0, Ordering::Release);
@@ -319,6 +328,9 @@ impl ClientEnd {
       }
       self.parks += 1;
       let remaining = deadline_ns.map(|d| d.saturating_sub(elapsed_ns(started)));
+      #[cfg(windows)]
+      let woken = self.region.wake_wait(remaining)?;
+      #[cfg(not(windows))]
       let woken = wake::wait(self.region.wake_word()?, expected, remaining)?;
       self.region.client_parked()?.store(0, Ordering::Release);
       if !woken && deadline_ns.is_some() {
@@ -419,6 +431,11 @@ impl DaemonEnd {
     let word = self.region.wake_word()?;
     word.fetch_add(1, Ordering::AcqRel);
     if self.region.client_parked()?.load(Ordering::Acquire) != 0 {
+      // Wake the parked client: the wake word on Linux/macOS (a spinning client never parked, so it
+      // pays no wake), the named auto-reset Event on Windows.
+      #[cfg(windows)]
+      self.region.wake_signal()?;
+      #[cfg(not(windows))]
       wake::wake_one(word)?;
       self.wakes += 1;
       // Nudge the completion fd too, so an async SDK event loop polling it (D-19) wakes alongside a

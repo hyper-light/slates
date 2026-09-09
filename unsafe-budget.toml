@@ -33,10 +33,14 @@
 #   job object that ends the daemon with the anchor (`supervise.rs`, added 2026-09-05 with the
 #   CLI of Phase 2 task 5): create, the zeroed limit record, set the kill-on-close limit, assign
 #   the child, and the two closes (6), compiled only for Windows.
-# slates-ipc (4): the macOS wait-on-address and wake-by-address calls libc exposes without a
+# slates-ipc (8): the macOS wait-on-address and wake-by-address calls libc exposes without a
 #   safe wrapper (`wake.rs`), each on a live word of a shared mapping (2); the Linux rendezvous
 #   adopting the region descriptor it duplicated for the handoff before sending it (1) and
-#   borrowing the shard's leaked kick descriptor to duplicate it for the client (1).
+#   borrowing the shard's leaked kick descriptor to duplicate it for the client (1); and the
+#   Windows named-Event wake (`wake.rs`, added 2026-09-09, compiled only for Windows): the four
+#   Win32 calls windows-sys exposes without a safe wrapper — `CreateEventW` to create-or-open the
+#   named auto-reset Event, `SetEvent` and `WaitForSingleObject` on the handle it owns, and
+#   `CloseHandle` on drop (4).
 # slates-server (5): the Linux doorbell thread borrowing the daemon's listening socket by
 #   number for one readiness poll (`doorbell.rs`); the Windows liveness probe of a client's
 #   process (`peer.rs`, added 2026-09-05 with the dead-client reclaim): open, wait with a zero
@@ -71,7 +75,7 @@ slates-vfs = 0
 slates-land = 3
 slates-anchor = 6
 slates-db = 0
-slates-ipc = 4
+slates-ipc = 8
 slates-server = 5
 slates-client = 0
 slates-cli = 4

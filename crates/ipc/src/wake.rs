@@ -6,8 +6,10 @@
 //! - macOS: `os_sync_wait_on_address` with `OS_SYNC_WAIT_ON_ADDRESS_SHARED` and the matching
 //!   `os_sync_wake_by_address_any` (macOS 14.4+); a spurious wake surfaces as `EINTR` and the
 //!   caller re-checks.
-//! - Windows: `WaitOnAddress` wakes only threads of the same process, so the cross-process
-//!   wake is a named auto-reset Event per client; arrives with the Windows rendezvous.
+//! - Windows: `WaitOnAddress` wakes only threads of the same process, so the cross-process wake is a
+//!   named auto-reset [`Event`] per client (below), derived from the region's object name so both ends
+//!   open the one Event; the endpoint waits on and signals it rather than the wake word. The word-based
+//!   [`wait`]/[`wake_one`] below stay `Unsupported` there — they are the Linux/macOS path.
 //!
 //! Every function takes the word by atomic reference and an `expected` value: the wait
 //! returns at once when the word no longer equals it, which is what closes the race between
@@ -159,5 +161,107 @@ mod platform {
     Err(IpcError::Unsupported {
       feature: "the cross-process wake word (a named Event per client on Windows)",
     })
+  }
+}
+
+/// The Windows cross-process wake: a named auto-reset [`Event`] per waiter. `WaitOnAddress` wakes only
+/// threads of the same process (D-10), so the word-based [`wait`]/[`wake_one`] above cannot cross a
+/// process boundary here; the endpoint waits on and signals this Event instead. Both processes
+/// `CreateEventW` the same `Local\`-prefixed name, so each holds a handle to the one Event with no
+/// handle passing.
+#[cfg(windows)]
+pub use win_event::Event;
+
+#[cfg(windows)]
+mod win_event {
+  use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+  use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+
+  use crate::error::IpcError;
+
+  /// Format: the no-timeout wait sentinel (`INFINITE`).
+  const INFINITE: u32 = u32::MAX;
+  /// Format: nanoseconds per millisecond — the Windows wait's unit is the millisecond, so a nanosecond
+  /// budget is rounded up (a shorter-than-a-millisecond wait rounds to one, never to zero-poll).
+  const NANOS_PER_MILLI: u64 = 1_000_000;
+
+  /// A named auto-reset Event — the cross-process wake on Windows. Auto-reset means a signal made
+  /// before the waiter parks is not lost: the Event stays signaled until one wait consumes it, which
+  /// closes the park race the wake word closes on Linux/macOS with its value re-check. The handle is
+  /// stored as its exposed address so the type is `Send` (a handle belongs to the process, not a
+  /// thread) without an unsafe impl — the `slates-mem` idiom.
+  pub struct Event {
+    handle: usize,
+  }
+
+  /// The `Local\`-prefixed, null-terminated wide name the kernel object namespace takes (per-session,
+  /// the `slates-mem` shared-object convention).
+  fn wide(name: &str) -> Vec<u16> {
+    format!("Local\\{name}")
+      .encode_utf16()
+      .chain(std::iter::once(0))
+      .collect()
+  }
+
+  fn os(call: &'static str) -> IpcError {
+    IpcError::OsRefused {
+      call,
+      code: std::io::Error::last_os_error().raw_os_error(),
+    }
+  }
+
+  impl Event {
+    /// Creates or opens the named auto-reset Event (default DACL — the `Local\` namespace is the
+    /// session's; manual-reset off; initial state non-signaled).
+    pub fn open(name: &str) -> Result<Event, IpcError> {
+      let name = wide(name);
+      // SAFETY: a null attributes pointer (the default per-session security), the two `BOOL`s `0`/`0`
+      // (auto-reset, initially non-signaled), and a valid null-terminated wide name.
+      let handle = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+      if handle.is_null() {
+        return Err(os("CreateEventW"));
+      }
+      Ok(Event {
+        handle: handle.expose_provenance(),
+      })
+    }
+
+    fn handle(&self) -> HANDLE {
+      std::ptr::with_exposed_provenance_mut(self.handle)
+    }
+
+    /// Signals the Event, waking one waiter (a signal with no waiter is remembered until the next wait).
+    pub fn signal(&self) -> Result<(), IpcError> {
+      // SAFETY: the handle is a live Event this struct owns.
+      if unsafe { SetEvent(self.handle()) } == 0 {
+        return Err(os("SetEvent"));
+      }
+      Ok(())
+    }
+
+    /// Waits up to `timeout_ns` (`None`: forever). `Ok(true)` when signaled, `Ok(false)` at the timeout.
+    pub fn wait(&self, timeout_ns: Option<u64>) -> Result<bool, IpcError> {
+      let ms = timeout_ns.map_or(INFINITE, |ns| {
+        u32::try_from(ns.div_ceil(NANOS_PER_MILLI)).unwrap_or(INFINITE - 1)
+      });
+      // SAFETY: the handle is a live Event this struct owns.
+      let rc = unsafe { WaitForSingleObject(self.handle(), ms) };
+      if rc == WAIT_OBJECT_0 {
+        Ok(true)
+      } else if rc == WAIT_TIMEOUT {
+        Ok(false)
+      } else {
+        Err(os("WaitForSingleObject"))
+      }
+    }
+  }
+
+  impl Drop for Event {
+    fn drop(&mut self) {
+      // SAFETY: the handle was created by this module and is ours.
+      unsafe {
+        CloseHandle(self.handle());
+      }
+    }
   }
 }

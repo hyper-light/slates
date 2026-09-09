@@ -100,6 +100,12 @@ pub struct ClientRegion {
   cmd: Ring,
   cpl: Ring,
   bulk: (usize, usize),
+  /// The Windows cross-process wake: a named auto-reset Event derived from the region's object name
+  /// (`{name}-wake`), so both ends open the same one with no handle passing. `WaitOnAddress` on the
+  /// wake word wakes only threads of this process (D-10), so the endpoint waits on and signals this
+  /// Event instead. Absent on Linux/macOS, where the futex / `os_sync` wake word crosses processes.
+  #[cfg(windows)]
+  wake_event: crate::wake::Event,
 }
 
 impl std::fmt::Debug for ClientRegion {
@@ -110,6 +116,21 @@ impl std::fmt::Debug for ClientRegion {
       .field("slots", &self.cmd.slots())
       .finish()
   }
+}
+
+/// The named auto-reset Event a region waits on and signals on Windows, derived from the region's
+/// object name so both ends open the one Event with no handle passing (`{name}-wake`).
+#[cfg(windows)]
+fn windows_wake_event(object: &SharedObject) -> Result<crate::wake::Event, IpcError> {
+  let base = match object.handoff()? {
+    Handoff::Name(name) => name,
+    Handoff::Descriptor(_) => {
+      return Err(IpcError::Layout {
+        reason: "a windows region hands off a name for its wake Event",
+      });
+    }
+  };
+  crate::wake::Event::open(&format!("{base}-wake"))
 }
 
 impl ClientRegion {
@@ -168,6 +189,8 @@ impl ClientRegion {
     for at in [AT_WAKE, AT_CLIENT_PARKED, AT_DAEMON_PARKED, AT_DOORBELL] {
       object.atomic_u32(at)?.store(0, Ordering::Release);
     }
+    #[cfg(windows)]
+    let wake_event = windows_wake_event(&object)?;
     Ok(ClientRegion {
       object,
       client_id,
@@ -176,6 +199,8 @@ impl ClientRegion {
       cmd,
       cpl,
       bulk,
+      #[cfg(windows)]
+      wake_event,
     })
   }
 
@@ -213,6 +238,8 @@ impl ClientRegion {
     let client_id = read_u32(bytes, AT_CLIENT);
     let shard = u16::from_le_bytes([bytes[AT_SHARD], bytes[AT_SHARD + 1]]);
     let spin_ns = read_u32(bytes, AT_SPIN);
+    #[cfg(windows)]
+    let wake_event = windows_wake_event(&object)?;
     Ok(ClientRegion {
       object,
       client_id,
@@ -221,6 +248,8 @@ impl ClientRegion {
       cmd: Ring::at(cmd_at, slots),
       cpl: Ring::at(cpl_at, slots),
       bulk: (bulk_at, bulk_len),
+      #[cfg(windows)]
+      wake_event,
     })
   }
 
@@ -267,6 +296,22 @@ impl ClientRegion {
   /// The object, mutably.
   pub fn object_mut(&mut self) -> &mut SharedObject {
     &mut self.object
+  }
+
+  /// Waits on the region's cross-process wake for up to `timeout_ns` (Windows: the named Event). The
+  /// caller has already published the parked flag and re-checked the reply, as on Linux/macOS, so a
+  /// signal made before this wait is not lost (the auto-reset Event stays signaled until consumed).
+  /// `true` when signaled, `false` at the timeout.
+  #[cfg(windows)]
+  pub fn wake_wait(&self, timeout_ns: Option<u64>) -> Result<bool, IpcError> {
+    self.wake_event.wait(timeout_ns)
+  }
+
+  /// Signals the region's cross-process wake (Windows: `SetEvent` on the named Event), waking a parked
+  /// client.
+  #[cfg(windows)]
+  pub fn wake_signal(&self) -> Result<(), IpcError> {
+    self.wake_event.signal()
   }
 
   /// The wake word.
