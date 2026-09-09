@@ -638,9 +638,17 @@ async fn control_loop(
         let principal = Principal::Uid { uid: a.uid };
         let client_id = a.client_id;
         state::with_handed(|h| h.insert(client_id));
+        // Dup the completion eventfd (Linux) for the daemon's end to nudge on a reply to a parked
+        // client, so an async SDK event loop wakes (D-19); the original stays in the slot's control for
+        // liveness. macOS/Windows have no completion fd yet.
+        #[cfg(unix)]
+        let completion = a.completion_dup();
         let control = a.control;
         let pid = a.pid;
-        let end = slates_ipc::DaemonEnd::new(a.region);
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut end = slates_ipc::DaemonEnd::new(a.region);
+        #[cfg(unix)]
+        end.set_completion(completion);
         let request = Box::new(SpawnRequest::new(
           Box::pin(async move {
             // The server task may be idle with its parked flags set on the clients it knew;

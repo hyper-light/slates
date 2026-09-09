@@ -74,6 +74,19 @@ impl std::fmt::Debug for Accepted {
   }
 }
 
+#[cfg(unix)]
+impl Accepted {
+  /// A dup of the completion fd the platform handed the daemon for this client (Linux's eventfd today;
+  /// macOS/Windows owed) — the original stays in the client slot for its liveness socket. The dup
+  /// shares the eventfd object, so the daemon's `DaemonEnd` nudging it wakes the client's poll (D-19).
+  pub fn completion_dup(&self) -> Option<std::os::fd::OwnedFd> {
+    self
+      .control
+      .as_ref()
+      .and_then(platform::Control::completion_dup)
+  }
+}
+
 /// What the daemon opens once: the listener (Linux) or the bootstrap object (macOS, Windows).
 pub struct Listener {
   inner: platform::Listener,
@@ -257,6 +270,18 @@ impl std::fmt::Debug for Connected {
   }
 }
 
+#[cfg(unix)]
+impl Connected {
+  /// Takes the completion fd the platform handed the client (Linux's eventfd today; macOS/Windows
+  /// owed), consuming the control channel. The client's `ClientEnd` polls it for an async SDK (D-19).
+  pub fn take_completion(&mut self) -> Option<std::os::fd::OwnedFd> {
+    self
+      .control
+      .take()
+      .and_then(platform::ClientControl::into_completion)
+  }
+}
+
 /// The rendezvous name for an instance, per user.
 fn rendezvous_name(instance: &str) -> String {
   let clean: String = instance
@@ -317,6 +342,22 @@ pub mod platform {
   pub struct ClientControl {
     /// The completion eventfd.
     pub completion: OwnedFd,
+  }
+
+  impl Control {
+    /// A dup of the completion eventfd, for the daemon's end to nudge — the original stays here for the
+    /// liveness socket's owner. Dup'ing shares the eventfd object, so a nudge on the dup increments the
+    /// counter the client's own dup reads.
+    pub fn completion_dup(&self) -> Option<OwnedFd> {
+      rustix::io::dup(&self.completion).ok()
+    }
+  }
+
+  impl ClientControl {
+    /// The completion eventfd an async SDK event loop polls for reply-readiness.
+    pub fn into_completion(self) -> Option<OwnedFd> {
+      Some(self.completion)
+    }
   }
 
   /// The client's liveness check: the control socket; its peer end closes with the daemon.
@@ -584,12 +625,30 @@ pub mod platform {
   /// dead daemon.
   const CLAIM_WAIT_NS: u64 = 1_000_000_000;
 
-  /// No control channel on these platforms in Phase 2 (the completion fd for SDK event loops
-  /// arrives with Phase 5's optional control socket).
+  /// No control channel on these platforms yet: the bootstrap-object rendezvous passes no descriptor,
+  /// so the completion fd an async SDK polls (D-19) arrives with the control socket owed here (a Unix
+  /// socketpair on macOS, a loopback socket on Windows). Until then `into_completion` yields `None` and
+  /// the SDK falls back to the sync path.
   pub struct Control;
 
-  /// No client control channel on these platforms in Phase 2.
+  /// No client control channel on these platforms yet (the completion fd is owed, as for `Control`).
   pub struct ClientControl;
+
+  #[cfg(unix)]
+  impl Control {
+    /// No completion fd on macOS yet (the control socket is owed); the daemon nudges nothing.
+    pub fn completion_dup(&self) -> Option<std::os::fd::OwnedFd> {
+      None
+    }
+  }
+
+  #[cfg(unix)]
+  impl ClientControl {
+    /// No completion fd on macOS yet (the control socket is owed); an async SDK falls back to polling.
+    pub fn into_completion(self) -> Option<std::os::fd::OwnedFd> {
+      None
+    }
+  }
 
   /// The client's liveness check: the start stamp it saw, compared to the one the bootstrap
   /// object holds now (none when no daemon holds the object).
@@ -887,6 +946,23 @@ pub mod platform {
   pub struct Control;
   /// No client control channel.
   pub struct ClientControl;
+
+  #[cfg(unix)]
+  impl Control {
+    /// No completion fd on this platform.
+    pub fn completion_dup(&self) -> Option<std::os::fd::OwnedFd> {
+      None
+    }
+  }
+
+  #[cfg(unix)]
+  impl ClientControl {
+    /// No completion fd on this platform.
+    pub fn into_completion(self) -> Option<std::os::fd::OwnedFd> {
+      None
+    }
+  }
+
   /// No liveness check: no daemon to connect to.
   pub struct Liveness;
 

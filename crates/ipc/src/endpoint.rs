@@ -4,6 +4,8 @@
 //! parked client. Each end owns its sequence cursors; the slots' sequence words carry the
 //! protocol, so neither end touches a shared counter on the hot path.
 
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -11,6 +13,12 @@ use crate::error::IpcError;
 use crate::region::ClientRegion;
 use crate::slot::{Slot, SlotKind};
 use crate::wake;
+
+/// Format: the eight bytes a completion signal writes (an eventfd counter increment on Linux; a byte
+/// stream elsewhere reads them as one nudge). The value is not read — the fd's readability is the
+/// signal — so any nonzero eight bytes serve; `1` matches the eventfd add-one convention.
+#[cfg(unix)]
+const COMPLETION_NUDGE: [u8; 8] = 1u64.to_ne_bytes();
 
 /// A request as the daemon end hands it to the server.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,6 +56,12 @@ pub struct ClientEnd {
   parks: u64,
   /// Replies taken.
   replies: u64,
+  /// The completion fd an async SDK event loop polls for reply-readiness (§4.7, D-19): the daemon
+  /// makes it readable when it writes a reply to a parked client, so an `asyncio`/`uv_poll` loop wakes
+  /// without spinning. `None` for the sync client (it parks on the wake word) and where the platform
+  /// has no completion channel yet. The fd is read-drained and the reply taken with [`Self::try_take`].
+  #[cfg(unix)]
+  completion: Option<OwnedFd>,
 }
 
 impl std::fmt::Debug for ClientEnd {
@@ -71,6 +85,8 @@ impl ClientEnd {
       next_reply: 0,
       parks: 0,
       replies: 0,
+      #[cfg(unix)]
+      completion: None,
     }
   }
 
@@ -81,13 +97,46 @@ impl ClientEnd {
     end
   }
 
-  /// The client's end over everything the rendezvous handed over: the region, the doorbell
-  /// and the liveness check.
-  pub fn connected(connected: crate::rendezvous::Connected) -> ClientEnd {
+  /// The client's end over everything the rendezvous handed over: the region, the doorbell,
+  /// the liveness check, and (where the platform has one) the completion fd an async SDK polls.
+  pub fn connected(mut connected: crate::rendezvous::Connected) -> ClientEnd {
+    #[cfg(unix)]
+    let completion = connected.take_completion();
     let mut end = ClientEnd::new(connected.region);
     end.doorbell = Some(connected.doorbell);
     end.liveness = Some(connected.liveness);
+    #[cfg(unix)]
+    {
+      end.completion = completion;
+    }
     end
+  }
+
+  /// Sets the completion fd (the rendezvous's, or a paired fd a test injects). The daemon's end makes
+  /// it readable on a reply to a parked client; an async SDK polls it.
+  #[cfg(unix)]
+  pub fn set_completion(&mut self, completion: OwnedFd) {
+    self.completion = Some(completion);
+  }
+
+  /// The completion fd for an async SDK event loop to poll (`asyncio.add_reader` / `uv_poll`, D-19),
+  /// or `None` for a sync client or a platform without one. The loop waits for it to become readable,
+  /// drains it ([`Self::drain_completion`]), then takes the reply with [`Self::try_take`].
+  #[cfg(unix)]
+  pub fn completion_fd(&self) -> Option<RawFd> {
+    self.completion.as_ref().map(AsRawFd::as_raw_fd)
+  }
+
+  /// Clears the completion fd's readiness bytes after the event loop reports it readable, so the next
+  /// wait blocks again rather than seeing a stale nudge. Best-effort — a non-blocking read that takes
+  /// the buffered bytes (an eventfd resets its counter; a socket drains its nudges); an empty fd is a
+  /// no-op.
+  #[cfg(unix)]
+  pub fn drain_completion(&self) {
+    if let Some(fd) = &self.completion {
+      let mut scratch = [0u8; 64];
+      let _ = rustix::io::read(fd, &mut scratch);
+    }
   }
 
   /// Whether the daemon this end was connected to is gone (dead or restarted); true for an
@@ -201,6 +250,11 @@ pub struct DaemonEnd {
   next_reply: u64,
   /// Wakes issued.
   wakes: u64,
+  /// The completion fd to make readable when a reply reaches a parked client, so an async SDK event
+  /// loop polling it wakes (§4.7, D-19). `None` where the platform has no completion channel. Signaled
+  /// only under the same parked check as the wake-word wake, so a spinning client costs no extra syscall.
+  #[cfg(unix)]
+  completion: Option<OwnedFd>,
 }
 
 impl std::fmt::Debug for DaemonEnd {
@@ -220,7 +274,16 @@ impl DaemonEnd {
       next_request: 0,
       next_reply: 0,
       wakes: 0,
+      #[cfg(unix)]
+      completion: None,
     }
+  }
+
+  /// Sets the completion fd the rendezvous handed the daemon for this client — the write end the daemon
+  /// nudges on a reply to a parked client. `None` clears it.
+  #[cfg(unix)]
+  pub fn set_completion(&mut self, completion: Option<OwnedFd>) {
+    self.completion = completion;
   }
 
   /// The region.
@@ -270,8 +333,24 @@ impl DaemonEnd {
     if self.region.client_parked()?.load(Ordering::Acquire) != 0 {
       wake::wake_one(word)?;
       self.wakes += 1;
+      // Nudge the completion fd too, so an async SDK event loop polling it (D-19) wakes alongside a
+      // futex-parked sync client. Both are under the same parked check, so a spinning client pays for
+      // neither.
+      #[cfg(unix)]
+      self.nudge_completion();
     }
     Ok(())
+  }
+
+  /// Makes the completion fd readable (a write of `COMPLETION_NUDGE`), best-effort. A short write, a
+  /// full pipe, or an absent fd is ignored: the fd's readability is the signal and the wake word has
+  /// already advanced, so a missed nudge only means the SDK falls back to its next poll of the ring,
+  /// never a lost reply.
+  #[cfg(unix)]
+  fn nudge_completion(&self) {
+    if let Some(fd) = &self.completion {
+      let _ = rustix::io::write(fd, &COMPLETION_NUDGE);
+    }
   }
 
   /// Marks the daemon's shard parked (true) or polling (false), so the client knows whether
@@ -292,4 +371,91 @@ impl DaemonEnd {
 
 fn elapsed_ns(since: Instant) -> u64 {
   u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+  use std::os::fd::{BorrowedFd, RawFd};
+  use std::sync::atomic::Ordering;
+
+  use rustix::net::{AddressFamily, SocketFlags, SocketType};
+
+  use super::{ClientEnd, DaemonEnd};
+  use crate::region::{ClientRegion, RegionGeometry};
+  use crate::slot::Slot;
+
+  fn geometry() -> RegionGeometry {
+    RegionGeometry {
+      slots: 8,
+      spin_ns: 200_000,
+      bulk_bytes: 4096,
+      page: 4096,
+    }
+  }
+
+  /// Reads whatever the non-blocking fd has right now (`0` when empty), so a test checks readability
+  /// without blocking or a poll dependency.
+  fn read_available(fd: RawFd) -> usize {
+    let mut buf = [0u8; 8];
+    // SAFETY: `fd` is the client end's live, non-blocking completion fd for the test's duration.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    rustix::io::read(borrowed, &mut buf).unwrap_or(0)
+  }
+
+  /// A parked client's completion fd becomes readable when the daemon replies (§4.7, D-19): the
+  /// fd-readiness an async SDK event loop polls instead of spinning. A socketpair stands in for the
+  /// platform completion channel (an eventfd on Linux), the same shape, testable on every unix. Do:
+  /// pair the ends, mark the client parked, send a request, reply. Expect: the completion fd is quiet
+  /// before, carries the nudge after, and the reply is waiting for `try_take`.
+  #[test]
+  fn a_reply_to_a_parked_client_nudges_the_completion_fd() {
+    let region = ClientRegion::create("slates-endpoint-completion", 7, 0, geometry()).unwrap();
+    let (handoff, len) = region.handoff().unwrap();
+    let client_region = ClientRegion::open(&handoff, len).unwrap();
+    let mut daemon = DaemonEnd::new(region);
+    let mut client = ClientEnd::new(client_region);
+
+    // macOS's socketpair takes no CLOEXEC/NONBLOCK creation flags (Linux-only), so pass none and set
+    // the client end non-blocking with an ioctl — the real completion fds are created non-blocking too,
+    // so the readability check never blocks.
+    let (daemon_fd, client_fd) = rustix::net::socketpair(
+      AddressFamily::UNIX,
+      SocketType::STREAM,
+      SocketFlags::empty(),
+      None,
+    )
+    .unwrap();
+    rustix::io::ioctl_fionbio(&client_fd, true).unwrap();
+    daemon.set_completion(Some(daemon_fd));
+    client.set_completion(client_fd);
+    let poll_fd = client.completion_fd().unwrap();
+
+    assert_eq!(
+      read_available(poll_fd),
+      0,
+      "the completion fd is quiet before any reply"
+    );
+
+    // Mark the client parked (the idle condition the daemon signals for), then run one round trip.
+    client
+      .region()
+      .client_parked()
+      .unwrap()
+      .store(1, Ordering::Release);
+    client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
+    let request = daemon.try_take().unwrap().unwrap();
+    daemon
+      .reply(&Slot::inline(request.request, b"ok").unwrap())
+      .unwrap();
+
+    // The daemon nudged the completion fd: an async event loop polling it would wake here.
+    assert!(
+      read_available(poll_fd) > 0,
+      "a reply to a parked client makes the completion fd readable"
+    );
+    // And the reply is in the ring for the SDK to take once its loop wakes.
+    let reply = client.try_take().unwrap().unwrap();
+    assert_eq!(reply.request, 1);
+    assert_eq!(reply.payload, b"ok");
+  }
 }

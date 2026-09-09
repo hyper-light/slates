@@ -496,8 +496,22 @@ Both branches lint clean for Linux and Windows from this machine (the Linux test
 CI lane). Baselines in BENCHMARKS.md (Phase 2 baseline: IPC): 278 ns per spinning round trip,
 1.05 µs per parked-and-woken round trip.
 
-Owed from task 3: the completion fd on macOS and Windows (Phase 5's optional control socket;
-the Rust client parks on the word and needs none); the Windows named Event per client (Phase
+The completion-fd mechanism is now built end to end and proven on macOS (`endpoint.rs`): the
+daemon end nudges a completion fd on a reply to a *parked* client, under the same parked check
+as the futex wake, so a spinning client pays for neither the wake nor the nudge; the client end
+carries an owned completion fd it exposes as `completion_fd` (a raw fd an async SDK loop polls)
+and `drain_completion` (a non-blocking read that clears its readiness), no `Arc` and no lock —
+one owner per end, dup'd once at accept. `a_reply_to_a_parked_client_nudges_the_completion_fd`
+drives it over a socketpair on this macOS host: the fd is quiet before the reply, readable after,
+the reply waiting in the ring. The Linux rendezvous dups its `SCM_RIGHTS` eventfd into the daemon
+end and hands the client its own (`rendezvous.rs`: `Accepted::completion_dup`,
+`Connected::take_completion`); `daemon.rs` sets it on the daemon end at accept. Still owed from
+task 3: the **macOS and Windows rendezvous** delivery of a real completion fd (Phase 5's optional
+control socket — a Unix-domain socketpair on macOS, a socket on Windows — the platform
+`Control::completion_dup`/`ClientControl::into_completion` return `None` until then, so the fd is
+live only on Linux and in the unit test today); and, above it, the Python `asyncio`/Node
+`uv_poll` bindings that poll `completion_fd` behind thin sync facades (R6, D-19). The Rust client
+parks on the word and needs none. The Windows named Event per client (Phase
 4, with the section-and-Event rendezvous compile-checked now); the doorbell thread that turns a
 client's wake of a parked macOS shard into the driver's kick, and the heartbeat slot that
 tells the daemon a client died where no socket closes, both with the server's integration in
