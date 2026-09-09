@@ -103,3 +103,76 @@ fn a_tcp_request_and_reply_travel_through_the_driver() {
   }
   rt.shutdown();
 }
+
+/// A listener bound, reduced to its bare descriptor, and re-adopted serves on the SAME port — the
+/// descriptor handoff a supervisor uses to keep the loopback port across a daemon restart (§4.6,
+/// "One TCP loopback listener held by the anchor"). Proven by accepting a connection on the adopted
+/// listener at the original port, so the port is stable across the hand-off, not re-assigned.
+#[test]
+fn a_listener_handed_over_by_descriptor_serves_on_the_same_port() {
+  let rt = Runtime::start(&config()).unwrap();
+  let id = rt.shard_ids()[0];
+
+  // Bind and note the port, then hand the listener over as a bare descriptor and re-adopt it — the
+  // supervisor-binds / daemon-adopts hand-off. The port must not change.
+  let bound = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
+  let port = bound.local_addr().unwrap().port();
+  assert_ne!(port, 0, "the OS assigned a port");
+  let listener = TcpListener::from_fd(bound.into_fd()).unwrap();
+  assert_eq!(
+    listener.local_addr().unwrap().port(),
+    port,
+    "the adopted listener keeps the original port"
+  );
+  let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+
+  rt.spawn_on(id, async move {
+    if let Ok(stream) = listener.accept().await {
+      let mut buf = [0u8; 64];
+      if let Ok(n) = stream.read(&mut buf).await {
+        let _ = stream.write_all(REPLY_PREFIX).await;
+        let _ = stream.write_all(&buf[..n]).await;
+      }
+    }
+  })
+  .unwrap();
+
+  let (tx, rx) = channel();
+  rt.spawn_on(id, async move {
+    let outcome: Result<Vec<u8>, slates_rt::RtError> = async {
+      let stream = TcpStream::connect(addr).await?;
+      stream.write_all(REQUEST).await?;
+      let want = REPLY_PREFIX.len() + REQUEST.len();
+      let mut got = Vec::new();
+      let mut buf = [0u8; 64];
+      while got.len() < want {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+          break;
+        }
+        got.extend_from_slice(&buf[..n]);
+      }
+      Ok(got)
+    }
+    .await;
+    let _ = tx.send(outcome);
+  })
+  .unwrap();
+
+  match rx.recv_timeout(Duration::from_secs(5)) {
+    Ok(Ok(bytes)) => {
+      let mut expected = REPLY_PREFIX.to_vec();
+      expected.extend_from_slice(REQUEST);
+      assert_eq!(
+        bytes, expected,
+        "the client round-tripped through the re-adopted listener"
+      );
+    }
+    Ok(Err(e)) => panic!("the round trip failed: {e:?}"),
+    Err(e) => {
+      let counters = rt.shutdown();
+      panic!("timed out ({e}); counters {counters:#?}");
+    }
+  }
+  rt.shutdown();
+}

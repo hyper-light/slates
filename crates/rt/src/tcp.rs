@@ -81,6 +81,24 @@ impl TcpListener {
     Ok(TcpListener { fd })
   }
 
+  /// Adopts an already-bound, listening socket from an existing descriptor — a listener a supervisor
+  /// bound and handed over across an exec so its port survives a daemon restart (§4.6, "One TCP
+  /// loopback listener held by the anchor"). The descriptor must name a bound, listening INET stream
+  /// socket; it is made non-blocking (the driver waits on it) and close-on-exec (the adopting process
+  /// does not re-inherit it), then owned here. `fd` is an `OwnedFd`, so the caller has already taken
+  /// ownership of the raw descriptor (its own `unsafe` at the inheritance boundary).
+  pub fn from_fd(fd: OwnedFd) -> Result<TcpListener, RtError> {
+    set_nonblocking_cloexec(&fd)?;
+    Ok(TcpListener { fd })
+  }
+
+  /// Gives up ownership of the underlying descriptor — the counterpart to [`TcpListener::from_fd`],
+  /// for a supervisor that binds the listener, then hands its descriptor to the daemon it spawns so
+  /// the port survives a restart (§4.6). The caller owns the returned descriptor and its lifetime.
+  pub fn into_fd(self) -> OwnedFd {
+    self.fd
+  }
+
   /// The local address the listener is bound to (the OS-assigned port on an ephemeral bind).
   pub fn local_addr(&self) -> Result<SocketAddrV4, RtError> {
     local_v4(&self.fd)
