@@ -151,6 +151,11 @@ pub(crate) enum Verb {
     /// The mount point: an existing user-owned directory.
     path: String,
   },
+  /// Unmount a loopback bridge mount at a path (`unmount PATH`).
+  Unmount {
+    /// The mount point.
+    path: String,
+  },
   /// Snapshot.
   Snapshot {
     /// The volume.
@@ -671,6 +676,16 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
       ))
     }
     ["mount", ..] => Err(ParseError::Missing("mount ID PATH")),
+    ["unmount", path] => {
+      taken.only(&NONE)?;
+      Ok(client(
+        &taken,
+        Verb::Unmount {
+          path: (*path).to_owned(),
+        },
+      ))
+    }
+    ["unmount"] => Err(ParseError::Missing("unmount PATH")),
     ["base", rest @ ..] => parse_base(&taken, rest),
     ["land", id, target] => {
       taken.only(&Spec {

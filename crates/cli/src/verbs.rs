@@ -27,6 +27,13 @@ fn connect(instance: &str) -> Result<Client, Failure> {
 
 /// Runs one client verb.
 pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
+  // `unmount` is a pure OS operation (`umount`); it needs no daemon, so it runs before connecting —
+  // a stale mount is unmountable even after its daemon has gone.
+  if let Verb::Unmount { path } = &request.verb {
+    crate::mount::unmount(path)?;
+    println!("unmounted: {path}");
+    return Ok(());
+  }
   let mut client = connect(&request.instance)?;
   // `mount` reads the volume's name and the daemon's NFS port through the client, then runs `mount_nfs`
   // to mount it over the loopback NFS bridge (§4.6) — no privilege, no kernel extension, no Apple
@@ -192,9 +199,9 @@ fn serve(client: &mut Client, verb: &Verb) -> Result<(), ClientError> {
         print!("{}", status_text(&report));
       }
     }
-    // `mount` runs `mount_nfs` (a CLI/OS operation whose failure is a `Failure`, not a `ClientError`),
-    // so [`run`] handles it before this dispatch; it never reaches here.
-    Verb::Mount { .. } => {}
+    // `mount`/`unmount` run `mount_nfs`/`umount` (CLI/OS operations whose failure is a `Failure`, not a
+    // `ClientError`), so [`run`] handles them before this dispatch; they never reach here.
+    Verb::Mount { .. } | Verb::Unmount { .. } => {}
     Verb::Snapshot { volume } => {
       println!("snapshot: {}", client.snapshot(*volume)?.value);
     }
