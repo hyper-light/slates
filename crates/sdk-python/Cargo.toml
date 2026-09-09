@@ -5,7 +5,7 @@ authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
 rust-version = { workspace = true }
-description = "The Python SDK (§2.3, D-19; Phase 5): a PyO3 extension over the typed `slates-client`, exposing the lifecycle verbs as methods and mapping typed refusals to Python exceptions. Async over the completion descriptor is owed; this is the synchronous base the design says async wraps."
+description = "The Python SDK (§2.3, D-19; Phase 5): a PyO3 extension over the typed `slates-client`, exposing the lifecycle verbs as methods and mapping typed refusals to Python exceptions. Async-primary: `AsyncClient` resolves each verb on a real asyncio loop by the completion fd's readiness (`loop.add_reader`, no tokio/pyo3-asyncio); the sync `Client` is the thin blocking facade."
 
 [lib]
 # The Python extension module is a cdylib; `slates_sdk` is the imported name.
