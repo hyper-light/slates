@@ -1201,6 +1201,9 @@ fn publish_created_volume(
   version_credit: Option<slates_mem::budget::VersionCredit>,
   record: VolumeRecord,
 ) -> ReplyBody {
+  // Capture the mount name before the record is moved into the log op below; the slot lists the
+  // volume under it in the host root (a client mounts `/<name>` or reaches it by `cd <name>`).
+  let name = record.name.clone();
   let now = state.clock.monotonic_ns();
   if let Err(e) = state
     .db
@@ -1223,6 +1226,7 @@ fn publish_created_volume(
   }
   let slot = VolumeSlot {
     id,
+    name,
     volume,
     host,
     reservation,
@@ -1999,6 +2003,7 @@ fn clone(
   }
   let slot = VolumeSlot {
     id,
+    name: name.to_owned(),
     volume: volume_core,
     host: None,
     reservation,
@@ -3207,6 +3212,7 @@ fn rebuild_volume(
     recover_version_reservations(&mut state.store, &volume, allowance, reservation, held)?;
   let slot = VolumeSlot {
     id: record.id,
+    name: record.name.clone(),
     volume,
     host,
     reservation,

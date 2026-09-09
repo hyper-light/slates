@@ -139,11 +139,6 @@ fn scratch(name: &str) -> RequestBody {
   }
 }
 
-/// The lowercase-hex mount name the daemon gives a volume (its id), matching `crate::nfs::hex`.
-fn hex(bytes: &[u8; 16]) -> String {
-  bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 // --- The NFS client over the daemon's loopback port. ---
 
 fn opaque(bytes: &[u8], out: &mut Vec<u8>) {
@@ -315,14 +310,14 @@ fn the_daemon_serves_a_provisioned_volume_over_nfs() {
   let (daemon, instance) = single_shard_daemon("nfsmount");
   let mut client = Client::connect(&instance);
 
-  let ReplyBody::Created { id } = client.call(&scratch("vol")) else {
+  let ReplyBody::Created { .. } = client.call(&scratch("vol")) else {
     panic!("the volume was not created");
   };
   let port = daemon.nfs_port().expect("the daemon is serving NFS");
-  let name = hex(&id.bytes);
 
   let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-  let root_fh = mount(&mut stream, &format!("/{name}"), 1);
+  // Mount the volume by its provisioned friendly name, not its id.
+  let root_fh = mount(&mut stream, "/vol", 1);
   let file_fh = create(&mut stream, &root_fh, "hello.txt", 2);
   let payload = b"written through the NFS mount into a daemon-provisioned volume\n";
   write(&mut stream, &file_fh, payload, 3);
@@ -354,15 +349,15 @@ fn the_daemon_serves_a_volume_on_another_shard_over_nfs() {
       continue;
     };
     if slates_server::verbs::owner_of(id) != control_partition {
-      remote = Some(id);
+      remote = Some(format!("vol-{attempt}")); // the remote volume's friendly name
       break;
     }
   }
-  let id = remote.expect("a volume provisioned on a non-control shard");
+  let name = remote.expect("a volume provisioned on a non-control shard");
 
   let port = daemon.nfs_port().expect("the daemon is serving NFS");
-  let name = hex(&id.bytes);
   let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  // Mount the remote volume by its friendly name; the MNT routes across shards by `owner_of_name`.
   let root_fh = mount(&mut stream, &format!("/{name}"), 1);
   let file_fh = create(&mut stream, &root_fh, "remote.txt", 2);
   let payload = b"served from a volume on another shard, over the cross-shard bridge queue\n";
@@ -379,11 +374,11 @@ fn the_daemon_serves_a_volume_on_another_shard_over_nfs() {
 }
 
 /// A client mounts the single host root `/` and reaches a volume on ANOTHER shard by `cd`-ing into it
-/// by id (a root `LOOKUP` routed across shards by the looked-up name): the design's single mount point
-/// under which every volume appears, reaching a remote volume, over NFS with no privilege.
+/// by its friendly name (a root `LOOKUP` routed across shards by `owner_of_name`): the design's single
+/// mount point under which every volume appears, reaching a remote volume, over NFS with no privilege.
 #[test]
-fn a_client_mounts_the_host_root_and_reaches_a_remote_volume_by_id() {
-  let (daemon, instance) = two_shard_daemon("nfsroothex");
+fn a_client_mounts_the_host_root_and_reaches_a_remote_volume_by_name() {
+  let (daemon, instance) = two_shard_daemon("nfsrootname");
   let mut client = Client::connect(&instance);
   let control_partition = 0;
 
@@ -393,26 +388,26 @@ fn a_client_mounts_the_host_root_and_reaches_a_remote_volume_by_id() {
       continue;
     };
     if slates_server::verbs::owner_of(id) != control_partition {
-      remote = Some(id);
+      remote = Some(format!("rv-{attempt}")); // the remote volume's friendly name
       break;
     }
   }
-  let id = remote.expect("a volume provisioned on a non-control shard");
+  let name = remote.expect("a volume provisioned on a non-control shard");
 
   let port = daemon.nfs_port().expect("the daemon is serving NFS");
-  let name = hex(&id.bytes);
   let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
 
-  // Mount the host root, then LOOKUP the remote volume by its id — the root LOOKUP routes across shards.
+  // Mount the host root, then LOOKUP the remote volume by its name — the root LOOKUP routes across
+  // shards by `owner_of_name`, and the owning shard resolves the name against its own volumes.
   let root_fh = mount(&mut stream, "/", 1);
   let volume_root = lookup(&mut stream, &root_fh, &name, 2);
-  let file_fh = create(&mut stream, &volume_root, "byid.txt", 3);
+  let file_fh = create(&mut stream, &volume_root, "byname.txt", 3);
   let payload = b"reached a remote volume by cd-ing into it from the single host root\n";
   write(&mut stream, &file_fh, payload, 4);
   let got = read(&mut stream, &file_fh, 5);
   assert_eq!(
     got, payload,
-    "mounted the host root and reached a volume on another shard by its id, over NFS"
+    "mounted the host root and reached a volume on another shard by its name, over NFS"
   );
 
   drop(stream);
@@ -437,9 +432,9 @@ fn the_host_root_listing_gathers_volumes_from_every_shard() {
       continue;
     };
     if slates_server::verbs::owner_of(id) == control_partition {
-      local.get_or_insert(id);
+      local.get_or_insert(format!("lv-{attempt}"));
     } else {
-      remote.get_or_insert(id);
+      remote.get_or_insert(format!("lv-{attempt}"));
     }
     if local.is_some() && remote.is_some() {
       break;
@@ -452,13 +447,14 @@ fn the_host_root_listing_gathers_volumes_from_every_shard() {
   let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
   let root_fh = mount(&mut stream, "/", 1);
   let names = readdirplus(&mut stream, &root_fh, 2);
+  // The host root lists each volume under its friendly (provisioned) name.
   assert!(
-    names.contains(&hex(&local.bytes)),
-    "the host root lists the control-shard volume: {names:?}"
+    names.contains(&local),
+    "the host root lists the control-shard volume by name: {names:?}"
   );
   assert!(
-    names.contains(&hex(&remote.bytes)),
-    "the host root lists the other-shard volume (gathered over the bridge queue): {names:?}"
+    names.contains(&remote),
+    "the host root lists the other-shard volume by name (gathered over the bridge queue): {names:?}"
   );
 
   drop(stream);

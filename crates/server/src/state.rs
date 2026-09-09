@@ -51,6 +51,11 @@ impl std::fmt::Debug for ClientSlot {
 pub struct VolumeSlot {
   /// The id.
   pub id: VolumeId,
+  /// The mount name the volume was provisioned under — the friendly name it appears under in the host
+  /// root, so a client mounts `/<name>` or reaches it by `cd <name>` (§4.6 "Chosen path"). Unique per
+  /// host: a name is created on the one partition `verbs::owner_of_name` routes it to, which is also
+  /// the partition the volume's id encodes, so a name routes to its volume with no global index (D-14).
+  pub name: String,
   /// The volume.
   pub volume: Volume,
   /// The read-only host of the base directory, for an overlay.

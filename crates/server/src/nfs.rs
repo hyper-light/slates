@@ -19,17 +19,21 @@
 //!   through a per-shard pending map. No new runtime primitive — the cross-shard spawn is the one the
 //!   daemon already uses; the pending map is thread-local, so it needs no lock.
 //!
-//! The whole browse spans shards: `mount /` (or a volume by id), `ls /` (a `READDIR` of the host root
-//! scatters an entry-gather to every shard and lists them all), `cd <id>` (a root `LOOKUP` routes by the
-//! looked-up id), read/write. Each request runs as the mounting user ([`subject_of`] reads the uid from
-//! the `AUTH_SYS` credential, §4.13; `AUTH_NONE` falls back to root).
+//! The whole browse spans shards: `mount /<name>` (or `/` for the host root), `ls /` (a `READDIR` of
+//! the host root scatters an entry-gather to every shard and lists every volume by its friendly name),
+//! `cd <name>` (a root `LOOKUP` routes across shards by `owner_of_name`), read/write. Each request runs
+//! as the mounting user ([`subject_of`] reads the uid from the `AUTH_SYS` credential, §4.13; `AUTH_NONE`
+//! falls back to root).
 //!
-//! The root-listing gather fans out to the shards in parallel. Owed here (minor, situational
-//! refinements): a friendly chosen-path mount name (§4.6 "Chosen path"; the id's hex is the name
-//! today, and it is also the cross-shard routing key, so a name field would thread through
-//! `ShardState`'s volume slot and the root `LOOKUP` route); the anchor-held listener for restart
-//! survival (the daemon binds it now; §4.6 line 509); and the attribute-cache timeout from the
-//! measured loopback GETATTR RTT. The §4.6 differential oracle (line 1368) is *not* owed here: it
+//! A volume appears under its **provisioned name** (§4.6 "Chosen path"): the slot carries the name
+//! ([`crate::state::VolumeSlot`]), [`ShardVolumeSet::entries`] lists it, and a root `LOOKUP`/`MNT` of a
+//! name routes to the name's owning partition ([`route_by_name`] over `owner_of_name` — the same
+//! partition the create routed to and the id encodes, so a name reaches its volume with no global
+//! index, D-14) where the owner shard resolves it against its own slots (`MultiExport` matches the
+//! name in `entries`). The root-listing gather fans out to the shards in parallel. Owed here (minor,
+//! situational refinements): the anchor-held listener for restart survival (the daemon binds it now;
+//! §4.6 line 509); and the attribute-cache timeout from the measured loopback GETATTR RTT. The §4.6
+//! differential oracle (line 1368) is *not* owed here: it
 //! mounts the same volume via FSKit *and* via NFS and compares the abstract states — two real
 //! kernel mounts — so it is gated on the FSKit mount, hence on the Apple Developer entitlement that
 //! item (1) needs and this sandbox cannot hold. A synthetic FUSE-dispatch-vs-NFS-dispatch stand-in
@@ -60,14 +64,12 @@ use slates_rt::tcp::{TcpListener, TcpStream};
 use slates_rt::{futures, registry};
 
 use crate::state::{self, ShardState};
-use crate::verbs::owner_of;
+use crate::verbs::{owner_of, owner_of_name};
 
 /// Shape: bytes read from a connection per `read` when more of an RPC record is needed (see the
 /// blocking server in bridge-nfs for the reasoning): one large transfer fits, the assembler stitches
 /// any split, so this bounds syscalls per record, not correctness.
 const RECORD_CHUNK: usize = 1 << 16;
-/// Format: the base of a hexadecimal digit, for parsing a volume id out of a mount path.
-const HEX_RADIX: u32 = 16;
 /// Format: the largest mount path the router reads before deciding a route (RFC 1813 `MNTPATHLEN`).
 const MNT_PATH_MAX: usize = 1024;
 
@@ -81,7 +83,18 @@ struct ShardVolumeSet;
 
 impl VolumeSet for ShardVolumeSet {
   fn entries(&self) -> Vec<(String, VolumeId)> {
-    state::with_state(|s| s.by_id.keys().map(|id| (hex(id), *id)).collect()).unwrap_or_default()
+    state::with_state(|s| {
+      // List each volume under its provisioned mount name (its slot's `name`), so `ls /` shows
+      // friendly names and `cd <name>`/`mount /<name>` resolve by matching it (`MultiExport`).
+      let mut out = Vec::with_capacity(s.by_id.len());
+      for (id, &handle) in &s.by_id {
+        if let Ok(slot) = s.volumes.get(handle) {
+          out.push((slot.name.clone(), *id));
+        }
+      }
+      out
+    })
+    .unwrap_or_default()
   }
 
   fn serve(
@@ -139,18 +152,6 @@ fn with_export<R>(
   Some(f(&mut export))
 }
 
-/// The mount name a volume appears under in the root listing: its id in hex. A friendly chosen-path
-/// name (§4.6 "Chosen path") is owed; the id is unique and stable, so `ls /` and `cd <id>` work today.
-fn hex(id: &VolumeId) -> String {
-  use std::fmt::Write as _;
-  let mut out = String::with_capacity(id.bytes.len().saturating_mul(2));
-  for byte in id.bytes {
-    // Two lowercase hex digits per byte; the write into a String cannot fail.
-    let _ = write!(out, "{byte:02x}");
-  }
-  out
-}
-
 /// The rights every NFS request runs under (§4.13): read-write, so a mount can read and write the
 /// volumes it reaches. Which *user* the request runs as comes from its credential ([`subject_of`]).
 fn mount_rights() -> Rights {
@@ -170,22 +171,6 @@ fn subject_of(body: &[u8]) -> Principal {
   }
 }
 
-/// The volume id encoded in a 32-hex-digit mount name, or `None` if the name is not one (the root, or
-/// a not-yet-supported friendly name).
-fn parse_hex(name: &str) -> Option<VolumeId> {
-  let bytes: Vec<u8> = (0..name.len())
-    .step_by(2)
-    .map(|index| {
-      name
-        .get(index..index + 2)
-        .and_then(|pair| u8::from_str_radix(pair, HEX_RADIX).ok())
-    })
-    .collect::<Option<Vec<u8>>>()?;
-  Some(VolumeId {
-    bytes: bytes.try_into().ok()?,
-  })
-}
-
 // ---------------------------------------------------------------- routing and the bridge queue
 
 /// The owner shard's runtime id a call must be routed to, or `None` to serve it on this shard (the
@@ -193,6 +178,13 @@ fn parse_hex(name: &str) -> Option<VolumeId> {
 /// bad handle). A volume's `owner_of` is its owning *partition* (§4.8: ids route to owners); a request
 /// whose owner partition is not this shard's is routed to that partition's shard over the bridge queue.
 fn route(program: u32, procedure: u32, args: &[u8]) -> Option<u16> {
+  // A root `LOOKUP` or a `MNT` names a volume by its friendly mount name, which — unlike the id — is
+  // not self-describing, so it routes by the name's owning partition (`owner_of_name`, the partition
+  // the create routed to and the volume's id encodes, so the two agree with no global index, D-14).
+  if let Some(name) = root_mount_name(program, procedure, args) {
+    return route_by_name(&name);
+  }
+  // Every other call names its volume by a file handle; route by the volume's owning partition.
   let volume = target_volume(program, procedure, args)?;
   if volume == root_volume() {
     return None;
@@ -210,39 +202,58 @@ fn route(program: u32, procedure: u32, args: &[u8]) -> Option<u16> {
   .flatten()
 }
 
-/// The volume a call is *about*, for routing: the file handle's volume for most NFS procedures; the
-/// looked-up name's volume for a `LOOKUP` under the synthetic root (its name is a volume's id in hex,
-/// so `cd <id>` at the host root reaches a volume on any shard); the mount path's volume for `MNT`.
-fn target_volume(program: u32, procedure: u32, args: &[u8]) -> Option<VolumeId> {
-  match program {
-    NFS_PROGRAM if procedure == NFSPROC3_LOOKUP => {
-      let dir = request_volume(&XdrReader::new(args))?;
-      if dir == root_volume() {
-        root_lookup_target(args)
-      } else {
-        Some(dir)
-      }
+/// The shard for the partition that owns `name` (`owner_of_name` over `state.shards.len()`, the same
+/// count the create used), or `None` when that partition is this shard's. A friendly-name root
+/// `LOOKUP`/`MNT` routes here to the shard holding the named volume, which resolves the name against
+/// its own slots (`MultiExport` matches it in `ShardVolumeSet::entries`).
+fn route_by_name(name: &str) -> Option<u16> {
+  state::with_state(|s| {
+    let owner_partition = owner_of_name(name, s.shards.len());
+    if owner_partition == s.partition {
+      return None;
     }
+    s.shards.get(usize::from(owner_partition)).copied()
+  })
+  .flatten()
+}
+
+/// The volume a handle-addressed call is *about*, for routing: the leading file handle's volume. A
+/// root `LOOKUP` (by name) and a `MNT` (by path) route by name through [`root_mount_name`] before
+/// this, so they do not reach here; every other NFS call names its volume by its file handle.
+fn target_volume(program: u32, _procedure: u32, args: &[u8]) -> Option<VolumeId> {
+  match program {
+    // A LOOKUP inside a volume routes to that volume; a LOOKUP under the synthetic root and a `MNT`
+    // route by name ([`root_mount_name`]) before this, so they never reach here as the root.
     NFS_PROGRAM => request_volume(&XdrReader::new(args)),
-    MOUNT_PROGRAM if procedure == MOUNTPROC3_MNT => mount_path_volume(args),
     _ => None,
   }
 }
 
-/// The volume a root `LOOKUP` names: the id its name encodes (in hex), or `None` for a name that is not
-/// an id (served locally, where it is a miss or a local volume).
-fn root_lookup_target(args: &[u8]) -> Option<VolumeId> {
-  let mut reader = XdrReader::new(args);
-  let _dir = Nfsfh3::decode(&mut reader).ok()?;
-  let name = reader.string(NFS_MAXNAMELEN).ok()?;
-  parse_hex(name)
-}
-
-/// The volume a MOUNT `MNT` path names (`/<id-hex>`), or `None` for the root (`/`) or a name that is
-/// not an id.
-fn mount_path_volume(args: &[u8]) -> Option<VolumeId> {
-  let path = XdrReader::new(args).string(MNT_PATH_MAX).ok()?;
-  parse_hex(path.trim_matches('/'))
+/// The friendly mount name a root `LOOKUP` (a name under the synthetic root) or a `MNT` names, to be
+/// routed by [`route_by_name`]. `None` for the host root itself (`MNT /`), a LOOKUP inside a volume
+/// (routed by its handle through [`target_volume`]), or any other call.
+fn root_mount_name(program: u32, procedure: u32, args: &[u8]) -> Option<String> {
+  match program {
+    NFS_PROGRAM if procedure == NFSPROC3_LOOKUP => {
+      // Only a LOOKUP whose directory is the synthetic root routes by name.
+      if request_volume(&XdrReader::new(args))? != root_volume() {
+        return None;
+      }
+      let mut reader = XdrReader::new(args);
+      let _dir = Nfsfh3::decode(&mut reader).ok()?;
+      Some(reader.string(NFS_MAXNAMELEN).ok()?.to_owned())
+    }
+    MOUNT_PROGRAM if procedure == MOUNTPROC3_MNT => {
+      let path = XdrReader::new(args).string(MNT_PATH_MAX).ok()?;
+      let name = path.trim_matches('/');
+      if name.is_empty() {
+        None
+      } else {
+        Some(name.to_owned())
+      }
+    }
+    _ => None,
+  }
 }
 
 /// Serves one call locally, on this shard's volumes and synthetic root, under `subject`.
