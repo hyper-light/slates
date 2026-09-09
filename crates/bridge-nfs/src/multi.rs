@@ -35,9 +35,10 @@ use crate::mount::{MountReply, Mountstat3};
 use crate::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3};
 use crate::procedures::{
   Export, NFS_MAXNAMELEN, NFSPROC3_ACCESS, NFSPROC3_COMMIT, NFSPROC3_CREATE, NFSPROC3_FSINFO,
-  NFSPROC3_FSSTAT, NFSPROC3_GETATTR, NFSPROC3_LINK, NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_NULL,
-  NFSPROC3_READ, NFSPROC3_READDIR, NFSPROC3_READDIRPLUS, NFSPROC3_READLINK, NFSPROC3_REMOVE,
-  NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE,
+  NFSPROC3_FSSTAT, NFSPROC3_GETATTR, NFSPROC3_LINK, NFSPROC3_LOOKUP, NFSPROC3_MKDIR,
+  NFSPROC3_MKNOD, NFSPROC3_NULL, NFSPROC3_READ, NFSPROC3_READDIR, NFSPROC3_READDIRPLUS,
+  NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR,
+  NFSPROC3_SYMLINK, NFSPROC3_WRITE,
 };
 use crate::xdr::{XdrReader, XdrWriter};
 
@@ -228,7 +229,7 @@ impl<V: VolumeSet> MultiExport<V> {
       NFSPROC3_READLINK => post_attr_failure(Nfsstat3::Inval, Some(self.root_fattr3())),
       // Everything that would change the root is refused: a volume appears by a metadata operation.
       NFSPROC3_SETATTR | NFSPROC3_WRITE | NFSPROC3_CREATE | NFSPROC3_MKDIR | NFSPROC3_SYMLINK
-      | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_RENAME | NFSPROC3_LINK => {
+      | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_RENAME | NFSPROC3_LINK | NFSPROC3_MKNOD => {
         root_readonly_refusal(procedure)
       }
       _ => return None,
@@ -593,7 +594,8 @@ fn status_only_or_wcc(procedure: u32, status: Nfsstat3) -> Vec<u8> {
     }
     // SETATTR, WRITE, REMOVE, RMDIR, COMMIT: one wcc_data. (COMMIT's success adds a verifier, but a
     // failure — a stale or bad handle at the routing edge — is the bare wcc_data, RFC 1813 §3.3.21.)
-    NFSPROC3_SETATTR | NFSPROC3_WRITE | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_COMMIT => {
+    NFSPROC3_SETATTR | NFSPROC3_WRITE | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_COMMIT
+    | NFSPROC3_MKNOD => {
       write_absent_wcc(&mut writer);
     }
     // LINK: the linked-to file's post_op_attr (absent), then the directory's wcc_data (absent).

@@ -12,9 +12,9 @@ use slates_bridge_nfs::mount::MountReply;
 use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
 use slates_bridge_nfs::procedures::{
   Export, NFSPROC3_ACCESS, NFSPROC3_COMMIT, NFSPROC3_CREATE, NFSPROC3_FSINFO, NFSPROC3_FSSTAT,
-  NFSPROC3_GETATTR, NFSPROC3_LINK, NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_NULL, NFSPROC3_READ,
-  NFSPROC3_READDIR, NFSPROC3_READDIRPLUS, NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME,
-  NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE,
+  NFSPROC3_GETATTR, NFSPROC3_LINK, NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_MKNOD, NFSPROC3_NULL,
+  NFSPROC3_READ, NFSPROC3_READDIR, NFSPROC3_READDIRPLUS, NFSPROC3_READLINK, NFSPROC3_REMOVE,
+  NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE,
 };
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_bridge_nfs::{MultiExport, NfsService, OwnedVolumeSet};
@@ -1468,6 +1468,52 @@ fn a_link_over_the_export_makes_a_second_name() {
       "both names name the same object (a hard link)"
     );
   }
+}
+
+/// MKNOD over the export is refused NFS3ERR_NOTSUPP — a typed refusal, not PROC_UNAVAIL (which a
+/// truly-unhandled procedure gives) — because a RAM copy-on-write filesystem does not create device,
+/// FIFO or socket nodes. The reply is framed as the directory's wcc_data, so the stream stays synced.
+#[test]
+fn a_mknod_over_the_export_is_notsupp() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = root_handle(&mut export);
+
+  // MKNOD3args: the directory (diropargs3), then mknoddata3 — here a block device with specdata.
+  let mut args = XdrWriter::new();
+  root_fh.encode(&mut args);
+  args.opaque("dev".as_bytes()); // name
+  args.u32(3); // ftype3 NF3BLK
+  args.bool(false); // sattr3 mode unset
+  args.bool(false); // uid
+  args.bool(false); // gid
+  args.bool(false); // size
+  args.u32(0); // atime DONT_CHANGE
+  args.u32(0); // mtime DONT_CHANGE
+  args.u32(1); // specdata3 major
+  args.u32(2); // specdata3 minor
+  let reply = export
+    .serve_nfs(NFSPROC3_MKNOD, &mut XdrReader::new(args.as_slice()))
+    .expect("MKNOD is answered, not PROC_UNAVAIL");
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(
+    r.u32().unwrap(),
+    Nfsstat3::Notsupp.wire(),
+    "MKNOD is a typed NOTSUPP refusal, not PROC_UNAVAIL"
+  );
+  assert!(!r.bool().unwrap(), "wcc: no pre-op attributes");
+  PostOpAttr::decode(&mut r).unwrap(); // the directory's post-op attributes
 }
 
 /// Parses a READDIR reply into (names, last cookie, cookieverf, eof), for the listing tests. The

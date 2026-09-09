@@ -44,6 +44,10 @@ pub const NFSPROC3_CREATE: u32 = 8;
 pub const NFSPROC3_MKDIR: u32 = 9;
 /// Format: NFSPROC3_SYMLINK — create a symbolic link.
 pub const NFSPROC3_SYMLINK: u32 = 10;
+/// Format: NFSPROC3_MKNOD (RFC 1813 procedure 11) — create a special device, FIFO or socket node.
+/// slates is a RAM copy-on-write filesystem for regular files, directories and links; it does not
+/// create special nodes, so this is refused `NFS3ERR_NOTSUPP` (a typed refusal, not `PROC_UNAVAIL`).
+pub const NFSPROC3_MKNOD: u32 = 11;
 /// Format: NFSPROC3_LOOKUP — resolve a name in a directory to a handle.
 pub const NFSPROC3_LOOKUP: u32 = 3;
 /// Format: NFSPROC3_ACCESS — which operations the caller may perform on an object.
@@ -328,6 +332,7 @@ impl<'b> Export<'b> {
       NFSPROC3_CREATE => Some(self.create(args)),
       NFSPROC3_MKDIR => Some(self.mkdir(args)),
       NFSPROC3_SYMLINK => Some(self.symlink(args)),
+      NFSPROC3_MKNOD => Some(self.mknod_unsupported(args)),
       NFSPROC3_ACCESS => Some(self.access(args)),
       NFSPROC3_READ => Some(self.read(args)),
       NFSPROC3_WRITE => Some(self.write(args)),
@@ -1068,6 +1073,26 @@ impl<'b> Export<'b> {
         (nfsstat_of(&e), file_attr, dir_post)
       }
     }
+  }
+
+  /// NFSPROC3_MKNOD: slates does not create special (device, FIFO or socket) nodes — it is a RAM
+  /// copy-on-write filesystem for regular files, directories, symbolic and hard links — so the
+  /// operation is refused `NFS3ERR_NOTSUPP` (the typed refusal per RFC 1813 §3.3.11, not the
+  /// `PROC_UNAVAIL` an unhandled procedure gives). The reply is the directory's `wcc_data`
+  /// (MKNOD3resfail); the leading handle is resolved for the directory's post-op attributes, and the
+  /// node type and attributes that follow it are not decoded — the refusal is unconditional.
+  pub fn mknod_unsupported(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    Nfsstat3::Notsupp.encode(&mut writer);
+    let dir_post = match Nfsfh3::decode(args) {
+      Ok(fh) => match self.resolve_handle(&fh) {
+        Ok(identity) => self.attrs_of(&identity).ok().map(|node| self.fattr3(&node)),
+        Err(_) => None,
+      },
+      Err(_) => None,
+    };
+    encode_wcc(&mut writer, dir_post);
+    writer.into_bytes()
   }
 
   /// NFSPROC3_READLINK: read the target path of a symbolic link a handle names, over the shared
