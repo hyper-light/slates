@@ -2,6 +2,8 @@
 
 #[cfg(unix)]
 use std::os::fd::RawFd;
+#[cfg(windows)]
+use std::os::windows::io::RawSocket;
 use std::time::Instant;
 
 use slates_ipc::protocol::{
@@ -607,6 +609,24 @@ impl Client {
       .map_err(ClientError::Ipc)
   }
 
+  /// The Windows analogue of [`Self::enable_async_completion`], returning the loopback `SOCKET` an
+  /// event loop polls (`uv_poll` / a Python selector, D-19): Windows passes no shared completion fd
+  /// (D-10), so this starts the completion bridge on first use and hands back its socket.
+  #[cfg(windows)]
+  pub fn enable_async_completion(&mut self) -> Result<RawSocket, ClientError> {
+    self.end.enable_async_completion().map_err(ClientError::Ipc)
+  }
+
+  /// The Windows analogue of [`Self::enable_async_completion_dup`]: a dup of the completion socket the
+  /// caller owns and closes (Node's `net.Socket` adopts and closes it), leaving the client's intact.
+  #[cfg(windows)]
+  pub fn enable_async_completion_dup(&mut self) -> Result<RawSocket, ClientError> {
+    self
+      .end
+      .enable_async_completion_dup()
+      .map_err(ClientError::Ipc)
+  }
+
   /// Arms the completion signal before the SDK yields to its event loop (the daemon wakes a parked
   /// client on a reply). A caller re-checks [`Self::poll_reply`] right after arming to close the race
   /// with a reply that landed during the spin.
@@ -621,6 +641,12 @@ impl Client {
 
   /// Clears the completion fd's readiness after the loop reports it readable.
   #[cfg(unix)]
+  pub fn drain_completion(&self) {
+    self.end.drain_completion();
+  }
+
+  /// Clears the completion socket's readiness after the loop reports it readable (Windows).
+  #[cfg(windows)]
   pub fn drain_completion(&self) {
     self.end.drain_completion();
   }

@@ -18,13 +18,15 @@ changes live in memory. Agents merge their work into a shared volume through an 
 returns accept, identical, or the exact bytes that overlap, and nothing is written back to disk
 until a person grants it.
 
-It does not stop at one machine. Run agents on a hundred hosts and they still work on one tree:
-an agent can open a snapshot another host just made, without waiting for a copy; a merge from
-any host gets the same answer; and a host dying loses nothing that was already placed, because
-placed means "in the memory of other machines." You start on a laptop and add machines; there
-is no cluster mode to switch to.
+Slates does more than isolate work on your laptop - thousands run agents on remote hosts and watch them work on the your codebase just like they were on your local computer. Agents can:
 
-It is one binary and one daemon:
+- Open a snapshot another host just made, without waiting for a copy
+- Merge from any host gets the same answer
+- Recover work from dead agents without losing anything
+
+All of this made possible from the same binary using the same configuration and same server.
+
+Slates consists of a single binary and a single daemon:
 
 ```console
 $ slates volume create scratch --bounded 512MiB

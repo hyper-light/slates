@@ -226,3 +226,88 @@ fn the_doorbell_rings_only_while_the_daemon_is_parked() {
   client.send(&Slot::inline(4, &[]).unwrap()).unwrap();
   assert_eq!(daemon.doorbell().unwrap(), 2);
 }
+
+/// Whether the loopback completion socket `sock` is readable within `timeout` — a `WSAPoll` for
+/// `POLLRDNORM`, the readiness a Windows async runtime (`uv_poll`, a Python selector) waits on. It
+/// borrows the socket by value (`WSAPoll` takes no ownership), so it neither closes nor races the
+/// bridge's own handle.
+#[cfg(windows)]
+fn readable_within(sock: std::os::windows::io::RawSocket, timeout: Duration) -> bool {
+  use windows_sys::Win32::Networking::WinSock::{POLLRDNORM, WSAPOLLFD, WSAPoll};
+  // `RawSocket` is a `u64`; a Windows `SOCKET` is pointer-width. The handle fits (a socket is within
+  // the pointer range on its own target), so the conversion is exact, not a truncating cast.
+  let mut fds = [WSAPOLLFD {
+    fd: usize::try_from(sock).unwrap(),
+    events: POLLRDNORM,
+    revents: 0,
+  }];
+  let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+  // SAFETY: `fds` is one well-formed pollfd naming the live completion socket; `WSAPoll` reads the
+  // array of length one and writes `revents`. It takes no ownership of the socket.
+  let n = unsafe { WSAPoll(fds.as_mut_ptr(), 1, ms) };
+  n > 0 && (fds[0].revents & POLLRDNORM) != 0
+}
+
+/// The async completion socket becomes readable when a reply lands for an armed (parked) client —
+/// the readiness a Windows async SDK's event loop waits on (`uv_poll` / a selector, D-19). Windows
+/// passes no shared completion fd (Mach and named sockets are refused, D-10), so the client-local
+/// bridge parks on the region's named auto-reset Event — the daemon signals *that* on a reply, not
+/// the process-local wake word — and nudges its loopback socket only while armed, so a fast-path
+/// reply (parked == 0) wakes no loop. This drives that whole path over a real region and a real
+/// reply; the socket goes from quiet to readable exactly at the armed reply.
+#[cfg(windows)]
+#[test]
+fn the_completion_socket_becomes_readable_on_an_armed_reply() {
+  let (mut daemon, mut client) = pair("slates-ipc-completion-armed");
+  let sock = client.enable_async_completion().unwrap();
+  // No reply yet: an event loop polling the socket would find nothing to wake on.
+  assert!(
+    !readable_within(sock, Duration::from_millis(50)),
+    "the completion socket is quiet until a reply lands"
+  );
+
+  // Arm before the reply (the SDK sets parked before it yields to its loop), then send a request.
+  client.arm_async().unwrap();
+  client.send(&Slot::inline(0, &[1, 2, 3]).unwrap()).unwrap();
+
+  // The daemon answers on its own thread: it reverses the payload and replies, which bumps the wake
+  // word and signals the Event because the client is parked.
+  let server = std::thread::spawn(move || {
+    loop {
+      if let Some(req) = daemon.try_take().unwrap() {
+        let mut reply = req.payload.clone();
+        reply.reverse();
+        daemon
+          .reply(&Slot::inline(req.request, &reply).unwrap())
+          .unwrap();
+        break daemon.wakes();
+      }
+      std::hint::spin_loop();
+    }
+  });
+
+  // The bridge wakes on the Event and nudges the socket: the loop's poll now fires.
+  assert!(
+    readable_within(sock, Duration::from_secs(2)),
+    "the completion socket became readable after the armed reply"
+  );
+  client.drain_completion();
+
+  // And the reply is on the ring to take, id-matched with its payload reversed.
+  let reply = loop {
+    if let Some(reply) = client.try_take().unwrap() {
+      break reply;
+    }
+    std::hint::spin_loop();
+  };
+  assert_eq!(reply.request, 0);
+  assert_eq!(reply.payload, vec![3, 2, 1]);
+  assert_eq!(reply.kind, SlotKind::Inline);
+  client.disarm_async().unwrap();
+
+  let wakes = server.join().unwrap();
+  assert_eq!(
+    wakes, 1,
+    "the daemon issued exactly one wake for the parked client"
+  );
+}

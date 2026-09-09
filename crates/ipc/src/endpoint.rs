@@ -6,6 +6,8 @@
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::RawSocket;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -71,6 +73,12 @@ pub struct ClientEnd {
   /// async SDK polls this bridge's pipe; Linux uses [`Self::completion`] (the rendezvous eventfd).
   #[cfg(target_os = "macos")]
   bridge: Option<crate::completion::CompletionBridge>,
+  /// The Windows completion bridge (a loopback socket fed by a thread parking on the region's named
+  /// Event), started on demand by [`Self::enable_async_completion`]; `None` for a sync client and
+  /// until the first async use. Windows passes no shared completion fd (Mach and named sockets are
+  /// refused, D-10), so the async SDK polls this bridge's socket, exactly as macOS polls its pipe.
+  #[cfg(windows)]
+  bridge: Option<crate::completion::CompletionBridge>,
 }
 
 impl std::fmt::Debug for ClientEnd {
@@ -97,6 +105,8 @@ impl ClientEnd {
       #[cfg(unix)]
       completion: None,
       #[cfg(target_os = "macos")]
+      bridge: None,
+      #[cfg(windows)]
       bridge: None,
     }
   }
@@ -212,6 +222,61 @@ impl ClientEnd {
       ),
       None => Err(IpcError::Unsupported {
         feature: "async completion fd (the rendezvous passed no completion descriptor)",
+      }),
+    }
+  }
+
+  /// The completion socket for an async SDK event loop to poll (`uv_poll` / a Python selector, D-19),
+  /// or `None` for a sync client or until [`Self::enable_async_completion`] starts the bridge. The
+  /// loop waits for it to become readable, drains it ([`Self::drain_completion`]), then takes the
+  /// reply with [`Self::try_take`]. The Windows analogue of [`Self::completion_fd`].
+  #[cfg(windows)]
+  pub fn completion_socket(&self) -> Option<RawSocket> {
+    self
+      .bridge
+      .as_ref()
+      .map(crate::completion::CompletionBridge::completion_socket)
+  }
+
+  /// Clears the completion socket's readiness after the event loop reports it readable, so the next
+  /// wait blocks again rather than seeing a stale nudge. Best-effort — a non-blocking read of the
+  /// buffered nudges; a no-op before the bridge starts or when the socket is already drained.
+  #[cfg(windows)]
+  pub fn drain_completion(&self) {
+    if let Some(bridge) = &self.bridge {
+      bridge.drain();
+    }
+  }
+
+  /// Enables the async completion channel and returns the socket an event loop polls (`uv_poll` / a
+  /// selector, D-19). Idempotent — the same socket each call. Windows passes no shared completion fd
+  /// (Mach and named sockets are refused, D-10), so this starts the completion bridge (a loopback
+  /// socket fed by a thread parking on the region's named Event) on first use, exactly as macOS
+  /// starts its self-pipe bridge. The SDK registers the socket once, arms the parked flag with
+  /// [`Self::arm_async`] before it yields, re-checks [`Self::try_take`] to close the race, and drains
+  /// the socket with [`Self::drain_completion`] when the loop reports it readable.
+  #[cfg(windows)]
+  pub fn enable_async_completion(&mut self) -> Result<RawSocket, IpcError> {
+    if let Some(bridge) = &self.bridge {
+      return Ok(bridge.completion_socket());
+    }
+    let bridge = crate::completion::CompletionBridge::start(&self.region)?;
+    let socket = bridge.completion_socket();
+    self.bridge = Some(bridge);
+    Ok(socket)
+  }
+
+  /// Like [`Self::enable_async_completion`] but returns a **dup** the caller owns and must close — for
+  /// an SDK whose event loop closes the socket it polls (Node's `net.Socket` adopts and closes it;
+  /// asyncio only polls it, so it uses `enable_async_completion`). The dup and the client's own socket
+  /// refer to the same loopback endpoint, so closing the dup leaves the client's intact.
+  #[cfg(windows)]
+  pub fn enable_async_completion_dup(&mut self) -> Result<RawSocket, IpcError> {
+    self.enable_async_completion()?;
+    match &self.bridge {
+      Some(bridge) => bridge.dup_socket(),
+      None => Err(IpcError::Unsupported {
+        feature: "async completion socket (the bridge did not start)",
       }),
     }
   }

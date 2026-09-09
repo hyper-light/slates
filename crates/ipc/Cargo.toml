@@ -20,5 +20,11 @@ libc = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
+# Test-only: the completion-bridge test polls the loopback socket for readiness with `WSAPoll`, which
+# needs the WinSock binding the lib itself does not use (the lib's socket is std's `TcpStream`). A
+# dev-dependency keeps it out of the lib build and off downstream crates.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
+
 [lints]
 workspace = true
