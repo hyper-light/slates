@@ -24,10 +24,10 @@
 //! looked-up id), read/write. Each request runs as the mounting user ([`subject_of`] reads the uid from
 //! the `AUTH_SYS` credential, §4.13; `AUTH_NONE` falls back to root).
 //!
-//! Owed (refinements): a friendly chosen-path mount name (§4.6 "Chosen path"; the id's hex is the name
-//! today); the anchor-held listener for restart survival (the daemon binds it now); the attribute-cache
-//! timeout from the loopback RTT; a concurrent (vs. sequential) root-listing gather; and the
-//! FUSE-differential oracle.
+//! The root-listing gather fans out to the shards in parallel. Owed (refinements): a friendly
+//! chosen-path mount name (§4.6 "Chosen path"; the id's hex is the name today); the anchor-held listener
+//! for restart survival (the daemon binds it now); the attribute-cache timeout from the loopback RTT;
+//! and the FUSE-differential oracle.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -494,9 +494,10 @@ impl Future for EntriesCall {
   }
 }
 
-/// Gathers the volume entries of one other `shard` over the bridge queue (the spawn/back-spawn the
-/// bridge calls use); an empty list if the shard is gone.
-async fn gather_from_shard(shard: u16, origin: u16) -> Vec<(String, VolumeId)> {
+/// Spawns a gather of one other `shard`'s volume entries over the bridge queue (the same spawn/back-spawn
+/// the bridge calls use), returning the pending call's id — or `None` if the shard is gone. It does not
+/// await, so a caller spawns every shard's gather before awaiting any and they run in parallel.
+fn spawn_gather(shard: u16, origin: u16) -> Option<u64> {
   let id = register_entries();
   let task = SpawnRequest::new(
     Box::pin(async move {
@@ -513,23 +514,26 @@ async fn gather_from_shard(shard: u16, origin: u16) -> Vec<(String, VolumeId)> {
   );
   if registry::send_control(shard, Control::Spawn(Box::new(task))).is_err() {
     cancel_entries(id);
-    return Vec::new();
+    return None;
   }
-  EntriesCall { id }.await
+  Some(id)
 }
 
-/// Gathers the volumes of every shard for the host root listing: this shard's directly, each other
-/// shard's over the bridge queue.
+/// Gathers the volumes of every shard for the host root listing: this shard's directly, and every other
+/// shard's over the bridge queue — fanned out first so the gathers run in parallel, then collected.
 async fn gather_all_entries() -> Vec<(String, VolumeId)> {
   let (mine, shards) =
     state::with_state(|s| (s.partition, s.shards.clone())).unwrap_or((0, Vec::new()));
   let origin = registry::current_shard().unwrap_or(0);
   let mut all = ShardVolumeSet.entries();
-  for (partition, shard) in shards.iter().enumerate() {
-    if partition == usize::from(mine) {
-      continue;
-    }
-    let mut remote = gather_from_shard(*shard, origin).await;
+  let calls: Vec<u64> = shards
+    .iter()
+    .enumerate()
+    .filter(|(partition, _)| *partition != usize::from(mine))
+    .filter_map(|(_, shard)| spawn_gather(*shard, origin))
+    .collect();
+  for id in calls {
+    let mut remote = EntriesCall { id }.await;
     all.append(&mut remote);
   }
   all
