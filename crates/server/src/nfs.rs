@@ -19,11 +19,15 @@
 //!   through a per-shard pending map. No new runtime primitive — the cross-shard spawn is the one the
 //!   daemon already uses; the pending map is thread-local, so it needs no lock.
 //!
-//! Owed: the synthetic root's *listing* still shows only the accepting shard's volumes (a cross-shard
-//! scatter for the full host root is owed; a mount of a specific volume by id works across shards
-//! now). Per-mount authentication (§4.13) is owed — every request runs as root read-write; a friendly
-//! chosen-path mount name (§4.6 "Chosen path") is owed — the id's hex is the name today; and the
-//! anchor-held listener for restart survival is owed — the daemon binds it now.
+//! The whole browse spans shards: `mount /` (or a volume by id), `ls /` (a `READDIR` of the host root
+//! scatters an entry-gather to every shard and lists them all), `cd <id>` (a root `LOOKUP` routes by the
+//! looked-up id), read/write. Each request runs as the mounting user ([`subject_of`] reads the uid from
+//! the `AUTH_SYS` credential, §4.13; `AUTH_NONE` falls back to root).
+//!
+//! Owed (refinements): a friendly chosen-path mount name (§4.6 "Chosen path"; the id's hex is the name
+//! today); the anchor-held listener for restart survival (the daemon binds it now); the attribute-cache
+//! timeout from the loopback RTT; a concurrent (vs. sequential) root-listing gather; and the
+//! FUSE-differential oracle.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -39,8 +43,8 @@ use slates_bridge_nfs::procedures::{
 };
 use slates_bridge_nfs::xdr::XdrReader;
 use slates_bridge_nfs::{
-  AcceptStatus, MultiExport, RpcError, VolumeSet, parse_call, read_record, reply_bytes,
-  request_volume, root_volume, serve_call, write_record,
+  AcceptStatus, MultiExport, RpcError, VolumeSet, auth_sys_uid, parse_call, read_record,
+  reply_bytes, request_volume, root_volume, serve_call, write_record,
 };
 use slates_db::catalog::{Principal, VolumeId};
 use slates_rt::control::Control;
@@ -140,12 +144,22 @@ fn hex(id: &VolumeId) -> String {
   out
 }
 
-/// The credentials every NFS request runs under until per-mount authentication lands (§4.13): the
-/// machine's root, read-write, so a mount can read and write the volumes it reaches.
+/// The rights every NFS request runs under (§4.13): read-write, so a mount can read and write the
+/// volumes it reaches. Which *user* the request runs as comes from its credential ([`subject_of`]).
 fn mount_rights() -> Rights {
   Rights {
     read: true,
     write: true,
+  }
+}
+
+/// The principal a call runs as: the uid its `AUTH_SYS` credential names (the mounting user, §4.13, set
+/// by the kernel on a loopback mount), or the machine root when the call carries no such credential
+/// (`AUTH_NONE`) — so a real `mount_nfs` runs as the mounting user, not always root.
+fn subject_of(body: &[u8]) -> Principal {
+  match auth_sys_uid(body) {
+    Some(uid) => Principal::Uid { uid },
+    None => Principal::Uid { uid: 0 },
   }
 }
 
@@ -224,9 +238,15 @@ fn mount_path_volume(args: &[u8]) -> Option<VolumeId> {
   parse_hex(path.trim_matches('/'))
 }
 
-/// Serves one call locally, on this shard's volumes and synthetic root.
-fn serve_local(program: u32, procedure: u32, args: &[u8], port: u16) -> (AcceptStatus, Vec<u8>) {
-  let mut service = MultiExport::new(ShardVolumeSet, Principal::Uid { uid: 0 }, mount_rights());
+/// Serves one call locally, on this shard's volumes and synthetic root, under `subject`.
+fn serve_local(
+  subject: Principal,
+  program: u32,
+  procedure: u32,
+  args: &[u8],
+  port: u16,
+) -> (AcceptStatus, Vec<u8>) {
+  let mut service = MultiExport::new(ShardVolumeSet, subject, mount_rights());
   serve_call(
     &mut service,
     program,
@@ -238,10 +258,12 @@ fn serve_local(program: u32, procedure: u32, args: &[u8], port: u16) -> (AcceptS
 
 /// Serves one call on the volume's `owner` shard over the bridge queue: spawns the serve on the owner
 /// (the same cross-shard spawn the client forward uses, §4.3), which spawns a task back on `origin`
-/// that hands the reply to this awaiting task. Returns a system error if the owner shard is gone.
+/// that hands the reply to this awaiting task. Returns a system error if the owner shard is gone. The
+/// mounting user's `subject` rides to the owner, so the request runs as the same user there (§4.13).
 async fn serve_remote(
   owner: u16,
   origin: u16,
+  subject: Principal,
   program: u32,
   procedure: u32,
   args: Vec<u8>,
@@ -250,7 +272,7 @@ async fn serve_remote(
   let call_id = register_pending();
   let owner_task = SpawnRequest::new(
     Box::pin(async move {
-      let outcome = serve_local(program, procedure, &args, port);
+      let outcome = serve_local(subject, program, procedure, &args, port);
       let back = SpawnRequest::new(
         Box::pin(async move {
           deliver_reply(call_id, outcome);
@@ -521,18 +543,15 @@ fn is_root_listing(program: u32, procedure: u32, args: &[u8]) -> bool {
     && request_volume(&XdrReader::new(args)) == Some(root_volume())
 }
 
-/// Serves a host-root `READDIR`/`READDIRPLUS` over the gathered entries of every shard.
+/// Serves a host-root `READDIR`/`READDIRPLUS` over the gathered entries of every shard, under `subject`.
 fn serve_root_listing(
+  subject: Principal,
   procedure: u32,
   args: &[u8],
   entries: Vec<(String, VolumeId)>,
   port: u16,
 ) -> (AcceptStatus, Vec<u8>) {
-  let mut service = MultiExport::new(
-    GatheredVolumeSet { entries },
-    Principal::Uid { uid: 0 },
-    mount_rights(),
-  );
+  let mut service = MultiExport::new(GatheredVolumeSet { entries }, subject, mount_rights());
   serve_call(
     &mut service,
     NFS_PROGRAM,
@@ -555,15 +574,13 @@ pub async fn serve(listener: TcpListener, port: u16) {
   }
 }
 
-/// Serves one accepted connection: reads RPC records, routes each call local or remote, and writes the
-/// framed reply, until the client closes the connection. Owned request data is taken out before the
-/// serve so the read buffer is free to drain while a remote call awaits its owner.
 /// Produces the RPC reply payload for one parsed call, routing it locally, to a volume's owner shard
-/// over the bridge queue, or (a host-root listing) across every shard. A `program` of 0 is a garbage
-/// call whose reply carries xid 0.
+/// over the bridge queue, or (a host-root listing) across every shard, all under `subject` (the
+/// mounting user, §4.13). A `program` of 0 is a garbage call whose reply carries xid 0.
 async fn reply_for(
   this: u16,
   xid: u32,
+  subject: Principal,
   program: u32,
   procedure: u32,
   args: Vec<u8>,
@@ -575,40 +592,45 @@ async fn reply_for(
   if is_root_listing(program, procedure, &args) {
     // The host root lists every shard's volumes, gathered over the bridge queue.
     let entries = gather_all_entries().await;
-    let (status, results) = serve_root_listing(procedure, &args, entries, port);
+    let (status, results) = serve_root_listing(subject, procedure, &args, entries, port);
     return reply_bytes(xid, status, &results);
   }
   let (status, results) = match route(program, procedure, &args) {
-    Some(owner) => serve_remote(owner, this, program, procedure, args, port).await,
-    None => serve_local(program, procedure, &args, port),
+    Some(owner) => serve_remote(owner, this, subject, program, procedure, args, port).await,
+    None => serve_local(subject, program, procedure, &args, port),
   };
   reply_bytes(xid, status, &results)
 }
 
+/// Serves one accepted connection: reads RPC records, routes each call, and writes the framed reply,
+/// until the client closes the connection. Owned request data (including the mounting user from the
+/// `AUTH_SYS` credential, §4.13) is taken out before the serve, so the read buffer is free to drain
+/// while a remote call awaits its owner.
 async fn serve_one(stream: TcpStream, port: u16) {
   let this = registry::current_shard().unwrap_or(0);
   let mut buffer: Vec<u8> = Vec::new();
   let mut chunk = [0u8; RECORD_CHUNK];
   loop {
-    // (xid, program, procedure, args, consumed); a program of 0 marks a garbage call (no real program
-    // is 0), whose xid is unknown so the reply carries 0.
-    let parsed: Option<(u32, u32, u32, Vec<u8>, usize)> = match read_record(&buffer) {
+    // (xid, subject, program, procedure, args, consumed); a program of 0 marks a garbage call (no real
+    // program is 0), whose xid is unknown so the reply carries 0.
+    let parsed: Option<(u32, Principal, u32, u32, Vec<u8>, usize)> = match read_record(&buffer) {
       Ok((body, consumed)) => match parse_call(&body) {
         Ok((call, args)) => Some((
           call.xid,
+          subject_of(&body),
           call.program,
           call.procedure,
           args.rest().to_vec(),
           consumed,
         )),
-        Err(_) => Some((0, 0, 0, Vec::new(), consumed)),
+        Err(_) => Some((0, Principal::Uid { uid: 0 }, 0, 0, Vec::new(), consumed)),
       },
       Err(RpcError::Incomplete) => None,
       Err(_) => return,
     };
     match parsed {
-      Some((xid, program, procedure, args, consumed)) => {
-        let reply = reply_for(this, xid, program, procedure, args, port).await;
+      Some((xid, subject, program, procedure, args, consumed)) => {
+        let reply = reply_for(this, xid, subject, program, procedure, args, port).await;
         if stream.write_all(&write_record(&reply)).await.is_err() {
           return;
         }

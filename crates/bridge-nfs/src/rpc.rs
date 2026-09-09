@@ -183,6 +183,35 @@ pub fn parse_call(body: &[u8]) -> Result<(RpcCall, XdrReader<'_>), RpcError> {
   ))
 }
 
+/// Format: the `AUTH_SYS` authentication flavor (RFC 5531): a credential carrying the caller's uid/gid.
+const AUTH_SYS: u32 = 1;
+
+/// The Unix user id an `AUTH_SYS` credential on a call names — the uid the client mounted as — or
+/// `None` for `AUTH_NONE` or a credential this cannot read. On a loopback mount the kernel fills it from
+/// the mounting process, so it is the mounting user's identity (§4.13), which a server may map to a
+/// principal rather than trusting every request as root. Re-reads the call header (cheap) to reach the
+/// credential `parse_call` skips.
+pub fn auth_sys_uid(body: &[u8]) -> Option<u32> {
+  let mut reader = XdrReader::new(body);
+  // The call header before the credential: xid, mtype, rpcvers, program, version, procedure.
+  let _xid = reader.u32().ok()?;
+  let _mtype = reader.u32().ok()?;
+  let _rpcvers = reader.u32().ok()?;
+  let _program = reader.u32().ok()?;
+  let _version = reader.u32().ok()?;
+  let _procedure = reader.u32().ok()?;
+  let flavor = reader.u32().ok()?;
+  let credential = reader.opaque(MAX_AUTH_BODY).ok()?;
+  if flavor != AUTH_SYS {
+    return None;
+  }
+  // authsys_parms (RFC 5531 Appendix A): stamp, machinename, uid, gid, gids.
+  let mut credential = XdrReader::new(credential);
+  let _stamp = credential.u32().ok()?;
+  let _machinename = credential.opaque(MAX_AUTH_BODY).ok()?;
+  credential.u32().ok()
+}
+
 /// Builds an accepted RPC reply message body (not record-marked): the xid, the accepted status, an
 /// `AUTH_NONE` verifier, the accept status, and — for success — the already-XDR-encoded `results`.
 pub fn reply_bytes(xid: u32, status: AcceptStatus, results: &[u8]) -> Vec<u8> {
