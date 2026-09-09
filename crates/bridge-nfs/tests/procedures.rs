@@ -13,8 +13,9 @@ use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
 use slates_bridge_nfs::procedures::{
   Export, NFSPROC3_ACCESS, NFSPROC3_COMMIT, NFSPROC3_CREATE, NFSPROC3_FSINFO, NFSPROC3_FSSTAT,
   NFSPROC3_GETATTR, NFSPROC3_LINK, NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_MKNOD, NFSPROC3_NULL,
-  NFSPROC3_READ, NFSPROC3_READDIR, NFSPROC3_READDIRPLUS, NFSPROC3_READLINK, NFSPROC3_REMOVE,
-  NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE,
+  NFSPROC3_PATHCONF, NFSPROC3_READ, NFSPROC3_READDIR, NFSPROC3_READDIRPLUS, NFSPROC3_READLINK,
+  NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK,
+  NFSPROC3_WRITE,
 };
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_bridge_nfs::{MultiExport, NfsService, OwnedVolumeSet};
@@ -72,11 +73,17 @@ fn store() -> Store {
 }
 
 fn volume(store: &mut Store) -> Volume {
+  volume_with_names(store, NameEquivalence::Exact)
+}
+
+/// A volume with the given name-equivalence policy — `Exact` is case-sensitive, `Fold` case-folding
+/// (APFS-style), the property PATHCONF reports.
+fn volume_with_names(store: &mut Store, names: NameEquivalence) -> Volume {
   Volume::create(
     store,
     VolumeConfig {
       prefix: 1,
-      names: NameEquivalence::Exact,
+      names,
       quota: Quota::Bounded { limit: 1 << 30 },
       journal_bytes: 1 << 16,
       clock: Box::new(HostClock::default()),
@@ -1514,6 +1521,90 @@ fn a_mknod_over_the_export_is_notsupp() {
   );
   assert!(!r.bool().unwrap(), "wcc: no pre-op attributes");
   PostOpAttr::decode(&mut r).unwrap(); // the directory's post-op attributes
+}
+
+/// PATHCONF over the export reports the volume's POSIX limits from its own policy: an exact-name
+/// volume is case-sensitive (`case_insensitive` false), the link maximum is the u32 counter's range,
+/// names are capped at NAME_MAX and refused rather than truncated (`no_trunc`), ownership changes are
+/// unrestricted (`chown_restricted` false), and case is preserved — so a client's `pathconf` gets
+/// real answers instead of PROC_UNAVAIL and conservative fallbacks.
+#[test]
+fn pathconf_reports_the_volume_limits() {
+  let mut store = store();
+  let mut vol = volume(&mut store); // NameEquivalence::Exact
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = root_handle(&mut export);
+
+  let mut args = XdrWriter::new();
+  root_fh.encode(&mut args);
+  let reply = export
+    .serve_nfs(NFSPROC3_PATHCONF, &mut XdrReader::new(args.as_slice()))
+    .expect("PATHCONF is answered, not PROC_UNAVAIL");
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "PATHCONF succeeded");
+  PostOpAttr::decode(&mut r).unwrap(); // the object's post-op attributes
+  assert_eq!(
+    r.u32().unwrap(),
+    u32::MAX,
+    "linkmax is the u32 counter's range"
+  );
+  assert_eq!(r.u32().unwrap(), 255, "name_max is NAME_MAX");
+  assert!(r.bool().unwrap(), "no_trunc: an over-long name is refused");
+  assert!(
+    !r.bool().unwrap(),
+    "chown is not restricted to the superuser"
+  );
+  assert!(!r.bool().unwrap(), "an exact-name volume is case-sensitive");
+  assert!(r.bool().unwrap(), "case is preserved");
+}
+
+/// PATHCONF reflects a case-folding volume: a `Fold`-policy volume reports `case_insensitive` true,
+/// so a client learns the volume's real case behaviour from its policy rather than assuming
+/// case-sensitivity — the value is the inverse of the volume's `NameEquivalence`, not a fixed guess.
+#[test]
+fn pathconf_reflects_a_case_folding_volume() {
+  let mut store = store();
+  let mut vol = volume_with_names(&mut store, NameEquivalence::Fold);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = root_handle(&mut export);
+
+  let mut args = XdrWriter::new();
+  root_fh.encode(&mut args);
+  let reply = export
+    .serve_nfs(NFSPROC3_PATHCONF, &mut XdrReader::new(args.as_slice()))
+    .expect("PATHCONF is answered");
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire());
+  PostOpAttr::decode(&mut r).unwrap();
+  r.u32().unwrap(); // linkmax
+  r.u32().unwrap(); // name_max
+  r.bool().unwrap(); // no_trunc
+  r.bool().unwrap(); // chown_restricted
+  assert!(
+    r.bool().unwrap(),
+    "a case-folding volume reports case_insensitive true"
+  );
+  assert!(r.bool().unwrap(), "case is still preserved");
 }
 
 /// Parses a READDIR reply into (names, last cookie, cookieverf, eof), for the listing tests. The

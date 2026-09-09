@@ -36,9 +36,9 @@ use crate::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdat
 use crate::procedures::{
   Export, NFS_MAXNAMELEN, NFSPROC3_ACCESS, NFSPROC3_COMMIT, NFSPROC3_CREATE, NFSPROC3_FSINFO,
   NFSPROC3_FSSTAT, NFSPROC3_GETATTR, NFSPROC3_LINK, NFSPROC3_LOOKUP, NFSPROC3_MKDIR,
-  NFSPROC3_MKNOD, NFSPROC3_NULL, NFSPROC3_READ, NFSPROC3_READDIR, NFSPROC3_READDIRPLUS,
-  NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR,
-  NFSPROC3_SYMLINK, NFSPROC3_WRITE,
+  NFSPROC3_MKNOD, NFSPROC3_NULL, NFSPROC3_PATHCONF, NFSPROC3_READ, NFSPROC3_READDIR,
+  NFSPROC3_READDIRPLUS, NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR,
+  NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE, PATHCONF_LINKMAX,
 };
 use crate::xdr::{XdrReader, XdrWriter};
 
@@ -224,6 +224,8 @@ impl<V: VolumeSet> MultiExport<V> {
       NFSPROC3_FSSTAT => self.root_fsstat(),
       // COMMIT of the synthetic root: it holds no unwritten data, so it is a successful no-op.
       NFSPROC3_COMMIT => self.root_commit(),
+      // PATHCONF of the synthetic root: its static POSIX limits.
+      NFSPROC3_PATHCONF => self.root_pathconf(),
       // A directory cannot be read as a file or a symlink.
       NFSPROC3_READ => post_attr_failure(Nfsstat3::Isdir, Some(self.root_fattr3())),
       NFSPROC3_READLINK => post_attr_failure(Nfsstat3::Inval, Some(self.root_fattr3())),
@@ -235,6 +237,23 @@ impl<V: VolumeSet> MultiExport<V> {
       _ => return None,
     };
     Some(reply)
+  }
+
+  /// PATHCONF of the root: the synthetic root's static POSIX limits, mirroring a volume's so a client
+  /// sees one uniform PATHCONF across the mount (RFC 1813 §3.3.20). The root is read-only and its names
+  /// are volume ids, so it is case-sensitive; names are not truncated, chown is unrestricted, and case
+  /// is preserved — the same shape a volume reports, with the shared [`PATHCONF_LINKMAX`].
+  fn root_pathconf(&self) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    Nfsstat3::Ok.encode(&mut writer);
+    PostOpAttr(Some(self.root_fattr3())).encode(&mut writer);
+    writer.u32(PATHCONF_LINKMAX); // linkmax
+    writer.u32(u32::try_from(NFS_MAXNAMELEN).unwrap_or(u32::MAX)); // name_max
+    writer.bool(true); // no_trunc
+    writer.bool(false); // chown_restricted
+    writer.bool(false); // case_insensitive: the root's names (volume ids) are case-sensitive
+    writer.bool(true); // case_preserving
+    writer.into_bytes()
   }
 
   /// COMMIT of the root: the synthetic root has no unwritten data — its listing is derived on demand
@@ -579,7 +598,7 @@ fn status_only_or_wcc(procedure: u32, status: Nfsstat3) -> Vec<u8> {
   match procedure {
     // A leading `post_op_attr` (absent): GETATTR has none; these answer status + one post_op_attr.
     NFSPROC3_LOOKUP | NFSPROC3_ACCESS | NFSPROC3_READLINK | NFSPROC3_READ | NFSPROC3_READDIR
-    | NFSPROC3_READDIRPLUS | NFSPROC3_FSINFO | NFSPROC3_FSSTAT => {
+    | NFSPROC3_READDIRPLUS | NFSPROC3_FSINFO | NFSPROC3_FSSTAT | NFSPROC3_PATHCONF => {
       PostOpAttr(None).encode(&mut writer);
     }
     // The create family: post_op_fh (absent), post_op_attr (absent), dir wcc (absent).

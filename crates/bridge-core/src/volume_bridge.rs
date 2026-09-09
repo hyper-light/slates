@@ -726,6 +726,9 @@ impl Bridge for VolumeBridge<'_> {
       bsize: BLOCK_SIZE,
       namelen: NAME_MAX,
       frsize: BLOCK_SIZE,
+      // The volume's own name-equivalence policy (§4.5), so a transport reports the volume's real
+      // case behaviour, not a fixed guess.
+      case_sensitive: self.volume.policy().case_sensitive(),
     })
   }
 }

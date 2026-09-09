@@ -79,6 +79,9 @@ pub const NFSPROC3_FSINFO: u32 = 19;
 /// slates write already lands `FILE_SYNC`, so a commit is a no-op that confirms the file and returns
 /// the write verifier; a client `fsync` maps to it.
 pub const NFSPROC3_COMMIT: u32 = 21;
+/// Format: NFSPROC3_PATHCONF (RFC 1813 procedure 20) — the POSIX pathconf limits of the filesystem an
+/// object lives in (name and link maxima, truncation, chown restriction, case behaviour).
+pub const NFSPROC3_PATHCONF: u32 = 20;
 /// Format: the maximum bytes in a filename slates resolves (§4.5's name cap), refused before
 /// allocating.
 pub const NFS_MAXNAMELEN: usize = 255;
@@ -103,6 +106,10 @@ const FSF3_SYMLINK: u32 = 0x2;
 const FSF3_HOMOGENEOUS: u32 = 0x8;
 /// Format: FSF3_CANSETTIME, the server can set times through SETATTR.
 const FSF3_CANSETTIME: u32 = 0x10;
+/// Derived: the maximum hard links PATHCONF reports (RFC 1813 `linkmax`). slates stores an object's
+/// link count as a `u32` and imposes no tighter cap, so the maximum is the counter's range, `u32::MAX`.
+/// Shared with the synthetic root's PATHCONF ([`crate::multi`]) so the mount reports one uniform value.
+pub const PATHCONF_LINKMAX: u32 = u32::MAX;
 /// Format: ACCESS3_READ, read file data or list a directory.
 const ACCESS3_READ: u32 = 0x1;
 /// Format: ACCESS3_LOOKUP, look a name up in a directory.
@@ -345,6 +352,7 @@ impl<'b> Export<'b> {
       NFSPROC3_FSSTAT => Some(self.fsstat(args)),
       NFSPROC3_FSINFO => Some(self.fsinfo(args)),
       NFSPROC3_COMMIT => Some(self.commit(args)),
+      NFSPROC3_PATHCONF => Some(self.pathconf(args)),
       _ => None,
     }
   }
@@ -1332,6 +1340,48 @@ impl<'b> Export<'b> {
   }
 
   fn fsstat_result(&mut self, args: &mut XdrReader<'_>) -> Result<(Fattr3, FsStat), Nfsstat3> {
+    let handle = Nfsfh3::decode(args).map_err(|_| Nfsstat3::Badhandle)?;
+    let identity = self.resolve_handle(&handle)?;
+    let node = self.attrs_of(&identity)?;
+    let cx = self.op_context().map_err(|e| nfsstat_of(&e))?;
+    let object = ObjectId::new(identity.inode, identity.generation);
+    let stat = self
+      .bridge
+      .statfs(object, &cx)
+      .map_err(|e| nfsstat_of(&e))?;
+    Ok((self.fattr3(&node), stat))
+  }
+
+  /// NFSPROC3_PATHCONF: the POSIX pathconf limits for the filesystem an object lives in (RFC 1813
+  /// §3.3.20), reported from the volume's own policy rather than a fixed guess. The maximum name
+  /// length and the case behaviour come from the volume through `statfs`; the link maximum is the
+  /// `u32` link counter's range ([`PATHCONF_LINKMAX`]); an over-long name is refused, never truncated
+  /// (`no_trunc` true); ownership changes are not restricted to the superuser (`chown_restricted`
+  /// false — a write-authorized caller may `chown`, `Volume::chown` imposing no privilege check); and
+  /// case is always preserved. Without this a client's `pathconf` is `PROC_UNAVAIL` and it falls back
+  /// to conservative defaults.
+  pub fn pathconf(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    match self.pathconf_result(args) {
+      Ok((attr, stat)) => {
+        Nfsstat3::Ok.encode(&mut writer);
+        PostOpAttr(Some(attr)).encode(&mut writer);
+        writer.u32(PATHCONF_LINKMAX); // linkmax
+        writer.u32(stat.namelen); // name_max
+        writer.bool(true); // no_trunc: an over-long name is refused, never truncated
+        writer.bool(false); // chown_restricted: any write-authorized caller may chown
+        writer.bool(!stat.case_sensitive); // case_insensitive: the inverse of the volume's policy
+        writer.bool(true); // case_preserving: the stored case is always kept
+      }
+      Err(status) => {
+        status.encode(&mut writer);
+        PostOpAttr(None).encode(&mut writer);
+      }
+    }
+    writer.into_bytes()
+  }
+
+  fn pathconf_result(&mut self, args: &mut XdrReader<'_>) -> Result<(Fattr3, FsStat), Nfsstat3> {
     let handle = Nfsfh3::decode(args).map_err(|_| Nfsstat3::Badhandle)?;
     let identity = self.resolve_handle(&handle)?;
     let node = self.attrs_of(&identity)?;

@@ -119,6 +119,11 @@ pub struct FsStat {
   pub namelen: u32,
   /// The fragment size in bytes.
   pub frsize: u32,
+  /// Whether the volume distinguishes names differing only in case (or normalization): true for an
+  /// exact-name volume (Linux/POSIX), false for a case-folding one (APFS's default). A transport that
+  /// reports case behaviour reads it here — NFS `PATHCONF`'s `case_insensitive`, and WinFsp/FSKit as
+  /// they mature — so the property lives once, in the neutral filesystem-info the volume already fills.
+  pub case_sensitive: bool,
 }
 
 /// The one VFS operation layer (§4.6). Every request identifies its object by [`ObjectId`] (a

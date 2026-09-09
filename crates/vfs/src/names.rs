@@ -58,6 +58,13 @@ impl Iterator for Folded<'_> {
 }
 
 impl NameEquivalence {
+  /// Whether the policy distinguishes names that differ only in case (or normalization). `Exact`
+  /// does — bytes must match — so it is case-sensitive; `Fold` treats such names as one, so it is
+  /// not. A transport reports this to a client (NFS `PATHCONF`'s `case_insensitive`, WinFsp, FSKit).
+  pub const fn case_sensitive(self) -> bool {
+    matches!(self, NameEquivalence::Exact)
+  }
+
   /// The folded characters of `name` under this policy (no allocation).
   pub fn folded(self, name: &str) -> Folded<'_> {
     match self {
