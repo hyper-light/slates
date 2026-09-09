@@ -91,6 +91,11 @@ fn a_request_round_trips_through_its_bytes() {
       offset: 4096,
       size: 512,
     },
+    ShimRequest::Write {
+      object: oid(42),
+      offset: 4096,
+      data: b"payload".to_vec(),
+    },
   ];
   for request in requests {
     let bytes = request.encode();
@@ -190,6 +195,55 @@ fn serve_drives_the_read_path_over_a_real_bridge() {
   assert_eq!(
     &reply[5..5 + len],
     b"world",
+    "the read returned the written bytes"
+  );
+}
+
+/// `serve` drives a write through the bridge and reports the count stored, and a following read over
+/// the seam returns exactly the written bytes — the write path round-trips end to end.
+#[test]
+fn serve_writes_through_the_bridge_and_reads_it_back() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root = bridge.root(&cx).unwrap();
+  let (attr, fh) = bridge.create(oid(root), &cx, "note", 0o644, 0).unwrap();
+  bridge.release(oid(attr.ino), &cx, fh).ok();
+
+  // Write through serve; the reply is OK and the u32 count equals the bytes sent.
+  let payload = b"fskit bytes";
+  let write = ShimRequest::Write {
+    object: oid(attr.ino),
+    offset: 0,
+    data: payload.to_vec(),
+  }
+  .encode();
+  let reply = serve(&write, &mut bridge, &cx).unwrap();
+  assert_eq!(reply[0], STATUS_OK, "write succeeded");
+  let mut count_bytes = [0u8; 4];
+  count_bytes.copy_from_slice(&reply[1..5]);
+  assert_eq!(
+    usize::try_from(u32::from_le_bytes(count_bytes)).unwrap(),
+    payload.len(),
+    "the whole payload was written"
+  );
+
+  // Read it back over the seam.
+  let read = ShimRequest::Read {
+    object: oid(attr.ino),
+    offset: 0,
+    size: 32,
+  }
+  .encode();
+  let reply = serve(&read, &mut bridge, &cx).unwrap();
+  assert_eq!(reply[0], STATUS_OK);
+  let mut len_bytes = [0u8; 4];
+  len_bytes.copy_from_slice(&reply[1..5]);
+  let len = usize::try_from(u32::from_le_bytes(len_bytes)).unwrap();
+  assert_eq!(
+    &reply[5..5 + len],
+    payload,
     "the read returned the written bytes"
   );
 }

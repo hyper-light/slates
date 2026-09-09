@@ -28,6 +28,8 @@ const OP_LOOKUP: u8 = 1;
 const OP_GETATTR: u8 = 2;
 /// Format: see [`OP_LOOKUP`].
 const OP_READ: u8 = 3;
+/// Format: see [`OP_LOOKUP`].
+const OP_WRITE: u8 = 4;
 
 /// Format: the reply status byte — the result follows, or a [`ShimError`] tag does.
 const STATUS_OK: u8 = 0;
@@ -50,6 +52,10 @@ const MAX_NAME_BYTES: usize = 255;
 /// mebibyte covers a page-cluster read with margin; the real cap is tuned against the ring frame in the
 /// spike (owed) and only ever lowered here.
 const MAX_READ_BYTES: u32 = 1 << 20;
+
+/// Shape: the largest single write the shim may carry in one message — the same page-cluster bound as
+/// [`MAX_READ_BYTES`], checked before the data is read so a hostile length allocates nothing.
+const MAX_WRITE_BYTES: usize = 1 << 20;
 
 /// A malformed shim message — a request whose bytes are truncated, over-claiming, or unknown. Every one
 /// is typed; the codec never panics or over-reads on input that crossed the extension boundary.
@@ -169,6 +175,15 @@ pub enum ShimRequest {
     /// The byte count (at most [`MAX_READ_BYTES`]).
     size: u32,
   },
+  /// Write `data` at `offset` to `object`.
+  Write {
+    /// The object.
+    object: ObjectId,
+    /// The byte offset.
+    offset: u64,
+    /// The bytes to write (at most [`MAX_WRITE_BYTES`]).
+    data: Vec<u8>,
+  },
 }
 
 impl ShimRequest {
@@ -195,6 +210,16 @@ impl ShimRequest {
         put_object(&mut out, *object);
         out.extend_from_slice(&offset.to_le_bytes());
         out.extend_from_slice(&size.to_le_bytes());
+      }
+      ShimRequest::Write {
+        object,
+        offset,
+        data,
+      } => {
+        out.push(OP_WRITE);
+        put_object(&mut out, *object);
+        out.extend_from_slice(&offset.to_le_bytes());
+        put_bytes(&mut out, data);
       }
     }
     out
@@ -226,6 +251,16 @@ impl ShimRequest {
           object,
           offset,
           size,
+        }
+      }
+      OP_WRITE => {
+        let object = take_object(&mut rest)?;
+        let offset = take_u64(&mut rest)?;
+        let data = take_bytes(&mut rest, MAX_WRITE_BYTES)?.to_vec();
+        ShimRequest::Write {
+          object,
+          offset,
+          data,
         }
       }
       other => return Err(ShimWireError::UnknownOp { tag: other }),
@@ -269,6 +304,14 @@ pub fn serve(
         Err(error) => err_reply(&error),
       }
     }
+    ShimRequest::Write {
+      object,
+      offset,
+      data,
+    } => match bridge.write(object, cx, offset, &data) {
+      Ok(written) => ok_count(written),
+      Err(error) => err_reply(&error),
+    },
   };
   Ok(reply)
 }
@@ -284,6 +327,13 @@ fn ok_attr(attr: &NodeAttr) -> Vec<u8> {
 fn ok_bytes(bytes: &[u8]) -> Vec<u8> {
   let mut out = vec![STATUS_OK];
   put_bytes(&mut out, bytes);
+  out
+}
+
+/// An OK reply carrying a `u32` count (the bytes a write stored).
+fn ok_count(count: u32) -> Vec<u8> {
+  let mut out = vec![STATUS_OK];
+  out.extend_from_slice(&count.to_le_bytes());
   out
 }
 
