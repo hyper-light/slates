@@ -17,10 +17,13 @@ use slates_machine::{MachineProfile, derived};
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
 use slates_mem::{Handoff, Slab};
+#[cfg(unix)]
+use slates_rt::RtError;
 use slates_rt::control::Control;
 use slates_rt::task::SpawnRequest;
+#[cfg(unix)]
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
-use slates_rt::{RtError, Runtime, ShardId, futures, registry};
+use slates_rt::{Runtime, ShardId, futures, registry};
 use slates_vfs::clock::HostClock;
 use slates_vfs::volume::{Store, StoreConfig};
 use slates_wire::observe::{Chokepoint, ChokepointRegistry};
@@ -84,16 +87,18 @@ impl std::fmt::Debug for Daemon {
 /// Set by the doorbell thread each time it kicks; the control task's poller reads it.
 static DOORBELL_RANG: AtomicBool = AtomicBool::new(false);
 /// Shape: pending NFS connections the kernel queues before the accept loop takes them. A mount opens a
-/// small, bounded number of connections; the OS clamps the backlog to the system maximum anyway.
+/// small, bounded number of connections; the OS clamps the backlog to the system maximum anyway. Unix
+/// only, with the NFS transport.
+#[cfg(unix)]
 const NFS_BACKLOG: i32 = 16;
 
-/// The NFS loopback listener to serve: on Unix, the one a supervising anchor holds and hands over in
-/// the environment ([`slates_anchor::ENV_NFS_LISTENER`]), so its port survives a daemon restart (§4.6)
-/// — adopted here; failing that (a standalone start, tests, or Windows, where NFS is not the bridge) a
-/// fresh ephemeral bind. Adopting the anchor's descriptor is the only path that keeps the port stable
-/// across restarts.
+/// The NFS loopback listener to serve: the one a supervising anchor holds and hands over in the
+/// environment ([`slates_anchor::ENV_NFS_LISTENER`]), so its port survives a daemon restart (§4.6) —
+/// adopted here; failing that (a standalone start or tests) a fresh ephemeral bind. Adopting the
+/// anchor's descriptor is the only path that keeps the port stable across restarts. Unix only: NFS is
+/// the macOS/Linux mount path (Windows mounts through WinFsp), and it rides the Unix-only rt TCP.
+#[cfg(unix)]
 fn nfs_listener() -> Result<TcpListener, RtError> {
-  #[cfg(unix)]
   if let Some(raw) = std::env::var(ENV_NFS_LISTENER)
     .ok()
     .and_then(|value| value.parse::<RawFd>().ok())
@@ -220,6 +225,7 @@ impl Daemon {
     // a daemon restart (Unix); the daemon adopts that when present, or binds a fresh ephemeral one when
     // it runs standalone (tests). Either way the port is known here, before the serve task moves the
     // listener onto the shard, and the cross-shard bridge queue reaches volumes on other shards.
+    #[cfg(unix)]
     let nfs_port = match nfs_listener() {
       Ok(nfs_listener) => {
         let port = nfs_listener.local_addr().ok().map(|addr| addr.port());
@@ -236,6 +242,10 @@ impl Daemon {
       }
       Err(_) => None,
     };
+    // No NFS transport on Windows: NFS is the macOS/Linux mount path (Windows mounts through WinFsp),
+    // so a Windows daemon serves IPC clients and lands, but publishes no mount port.
+    #[cfg(windows)]
+    let nfs_port: Option<u16> = None;
     Ok(Daemon {
       runtime: Some(runtime),
       segment,

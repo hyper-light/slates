@@ -21,11 +21,13 @@ slates-ipc = { workspace = true }
 slates-land = { workspace = true }
 slates-merge = { workspace = true }
 slates-bridge-core = { workspace = true }
-slates-bridge-nfs = { workspace = true }
 blake3 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
+# The NFS loopback mount server is the macOS/Linux mount path (Windows mounts through WinFsp), and it
+# rides `slates_rt::tcp`, which is Unix-only, so the daemon's NFS transport (`crate::nfs`) is too.
+slates-bridge-nfs = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
