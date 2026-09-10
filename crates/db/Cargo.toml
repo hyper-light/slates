@@ -8,6 +8,12 @@ rust-version.workspace = true
 readme.workspace = true
 description = "The metadata database: partitions with their indexes, the operation log in the anchor segment, completion records, leases, grants, landings, the audit log; replay and snapshots (design §4.8; Phase 2 task 2)."
 
+[features]
+# Forwards blake3's pure-Rust backend (through slates-machine) so a crate depending on the db can
+# cross-lint for a Windows target from a host with no MSVC assembler. Off by default; production uses
+# the SIMD C path.
+pure-hash = ["slates-machine/pure-hash"]
+
 [dependencies]
 slates-machine = { workspace = true }
 slates-mem = { workspace = true }

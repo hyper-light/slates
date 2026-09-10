@@ -6,10 +6,20 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 readme.workspace = true
-description = "The Windows WinFsp bridge (§4.6, D-2; Phase 4): the pieces buildable and confirmable on any host — the refusal taxonomy that maps the volume core's `VfsError` to the `NTSTATUS` WinFsp returns, mirroring the FUSE errno and NFS `nfsstat3` edges. The `FSP_FILE_SYSTEM_INTERFACE` FFI over `winfsp-rs` and the `FSP_FSCTL_TRANSACT` marshalling are winfsp's header-defined Windows half (they cross-lint on the native Windows runner), owed."
+description = "The Windows WinFsp bridge (§4.6, D-2; Phase 4): the refusal taxonomy that maps the volume core's `VfsError` to the `NTSTATUS` WinFsp returns (mirroring the FUSE errno and NFS `nfsstat3` edges), and the WinFsp host — the `FSP_FILE_SYSTEM_INTERFACE` vtable and `FspFileSystem*` FFI, hand-transcribed from winfsp's headers (like the AFD reactor from the WDK), dispatching each callback onto the shared `Bridge` over a single-owner volume thread. Cross-lints on the Windows target; the live mount runs on the native Windows runner."
 
 [dependencies]
 slates-vfs = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+slates-bridge-core = { workspace = true }
+slates-db = { workspace = true }
+slates-mem = { workspace = true }
+# A direct dep so a cross-lint for the Windows target from a host with no MSVC assembler can enable
+# blake3's pure-Rust backend with `--features slates-machine/pure-hash` (as ipc/client do); the CI
+# Windows build uses the default SIMD C path. The crate does not use slates-machine directly yet.
+slates-machine = { workspace = true }
+windows-sys = { workspace = true }
 
 [lints]
 workspace = true

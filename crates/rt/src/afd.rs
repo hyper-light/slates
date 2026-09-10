@@ -226,7 +226,8 @@ impl Afd {
       status: 0,
       information: 0,
     };
-    // FILE_SHARE_READ | FILE_SHARE_WRITE so the device is shareable across drivers.
+    /// Format: `FILE_SHARE_READ | FILE_SHARE_WRITE` (`0x1 | 0x2`) — the device is shareable across
+    /// drivers, so several runtimes can open `\Device\Afd` at once.
     const FILE_SHARE_READ_WRITE: u32 = 0x0000_0003;
     // SAFETY: `attributes` names a valid device and is live for the call; `handle`/`iosb` are writable;
     // the `name` buffer outlives the call. All other pointers are the documented nulls.

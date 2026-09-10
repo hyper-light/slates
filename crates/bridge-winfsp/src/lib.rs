@@ -1,29 +1,50 @@
-//! The Windows WinFsp bridge (§4.6, D-2; Phase 4) — the host-buildable pieces first.
+//! The Windows WinFsp bridge (§4.6, D-2; Phase 4).
 //!
-//! WinFsp is Windows' user-mode filesystem framework: a kernel FSD and a user DLL, where the user side
-//! blocks in `FSP_FSCTL_TRANSACT` to fetch IRPs and answers them through the `FSP_FILE_SYSTEM_INTERFACE`
-//! callbacks (roughly 25 of them). Unlike the FSKit bridge — whose shim wire is *ours* to define, so its
-//! whole codec is built and tested on any host — WinFsp's transact request/response layout is winfsp's
-//! own header-defined protocol (`fsctl.h`), so the marshalling and the `winfsp-rs` FFI are the Windows
-//! half, written against those headers and cross-linted on the native Windows runner (they cannot be
-//! faithfully modelled here without guessing the struct layout).
+//! WinFsp is Windows' user-mode filesystem framework: a kernel FSD and a user DLL where the user side
+//! answers requests through an `FSP_FILE_SYSTEM_INTERFACE` of callbacks and mounts at a drive letter.
+//! slates realizes it in two parts, both here:
 //!
-//! What *is* host-buildable — and is built and tested here — is the **refusal taxonomy**: the map from
-//! the volume core's [`VfsError`] to the `NTSTATUS` WinFsp returns to the kernel, the exact analogue of
-//! the FUSE bridge's `VfsError`→errno edge and the NFS bridge's `VfsError`→`nfsstat3` edge (§4.6 "the
-//! volume core's own `VfsError`, which each transport maps to its wire error"). The common, well-defined
-//! `NTSTATUS` codes are mapped precisely; the rare and slates-specific refusals fall to the generic
-//! `STATUS_UNSUCCESSFUL` rather than a guessed-at code — their precise `NTSTATUS` values are owed,
-//! pending verification against `ntstatus.h` on Windows.
+//! - The **refusal taxonomy** ([`ntstatus`]), host-buildable and tested on any host: the map from the
+//!   volume core's [`VfsError`] to the `NTSTATUS` WinFsp returns to the kernel, the exact analogue of
+//!   the FUSE bridge's `VfsError`→errno edge and the NFS bridge's `VfsError`→`nfsstat3` edge. The
+//!   common `NTSTATUS` codes are mapped precisely; a rare or slates-specific refusal falls to
+//!   `STATUS_UNSUCCESSFUL` rather than a guessed code.
+//!
+//! - The **mount host** (the `host` module, Windows-only): the `FSP_FILE_SYSTEM_INTERFACE` vtable and
+//!   the `FspFileSystem*` FFI, **hand-transcribed from winfsp's `winfsp.h`/`fsctl.h`** — the same
+//!   discipline the rt AFD reactor uses over the WDK — so it is a faithful model, not a guess (the
+//!   structs carry the header's own `static_assert` sizes), and it cross-lints on the Windows target
+//!   from any host. Each callback dispatches onto the shared `Bridge` (`slates-bridge-core`) over a
+//!   single owner thread that holds the `!Send` volume (D-7's "sharing is a move over a bounded
+//!   channel"; no `Mutex`, no `Arc`). The live mount — mount a drive letter, create/write/read/list/
+//!   delete through the Windows kernel, unmount — runs on the native Windows CI runner, the way the
+//!   FSKit handler's live mount runs on macOS.
 
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
+
+// The WinFsp host — the `FSP_FILE_SYSTEM_INTERFACE` FFI and the mount driver, hand-transcribed from
+// winfsp's headers and dispatching onto the shared `Bridge`. Windows-only (it links `winfsp-x64.dll`);
+// it cross-lints on the Windows target from any host, and the live mount runs on the Windows runner.
+#[cfg(windows)]
+mod ffi;
+#[cfg(windows)]
+pub mod host;
 
 /// An `NTSTATUS` code — the 32-bit status WinFsp hands the kernel for a request (§4.6). Held as the raw
 /// `u32` the constants are written in; the Windows FFI casts it to the `NTSTATUS`/`LONG` (`i32`) the API
 /// takes at the boundary, so no signed-hex casts live in this host-buildable core.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ntstatus(pub u32);
+
+#[cfg(windows)]
+impl Ntstatus {
+  /// The status as the signed `i32` WinFsp's ABI takes — a bit-preserving reinterpret (an `NTSTATUS`
+  /// failure code such as `0xC000_0001` is meant to read as a negative `i32`), never a lossy cast.
+  pub(crate) fn as_i32(self) -> i32 {
+    i32::from_ne_bytes(self.0.to_ne_bytes())
+  }
+}
 
 /// Format: `STATUS_SUCCESS` — the request succeeded (`0x0000_0000`).
 pub const STATUS_SUCCESS: Ntstatus = Ntstatus(0x0000_0000);
@@ -107,6 +128,32 @@ pub fn ntstatus(error: &VfsError) -> Ntstatus {
     VfsError::Pinned => STATUS_MEDIA_WRITE_PROTECTED,
     _ => STATUS_UNSUCCESSFUL,
   }
+}
+
+/// The generic-failure status as the FFI `i32`, for the host to return where no volume refusal applies
+/// (a broken owner channel, an unexpected reply). Windows-only, used by the mount host.
+#[cfg(windows)]
+pub(crate) fn status_unsuccessful() -> i32 {
+  STATUS_UNSUCCESSFUL.as_i32()
+}
+
+/// `STATUS_OBJECT_NAME_NOT_FOUND` as the FFI `i32` (a lookup of a name that does not exist).
+#[cfg(windows)]
+pub(crate) fn status_object_name_not_found() -> i32 {
+  STATUS_OBJECT_NAME_NOT_FOUND.as_i32()
+}
+
+/// `STATUS_INVALID_PARAMETER` as the FFI `i32` (a malformed path with no final component).
+#[cfg(windows)]
+pub(crate) fn status_invalid_parameter() -> i32 {
+  STATUS_INVALID_PARAMETER.as_i32()
+}
+
+/// Format: `STATUS_BUFFER_OVERFLOW` (`0x8000_0005`) as the FFI `i32` — the security-descriptor buffer
+/// WinFsp offered was smaller than the descriptor; the host reports the needed size and this status.
+#[cfg(windows)]
+pub(crate) fn status_buffer_overflow() -> i32 {
+  Ntstatus(0x8000_0005).as_i32()
 }
 
 #[cfg(test)]

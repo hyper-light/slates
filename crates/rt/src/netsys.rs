@@ -137,13 +137,15 @@ mod imp {
   /// matching cleanup (process-lifetime) means one success suffices. A `OnceLock` makes it
   /// exactly-once with no lock on the data path.
   fn ensure_started() -> Result<(), RtError> {
+    /// Format: the Winsock version to request in `WSAStartup` — 2.2, low byte major, high byte minor
+    /// (`MAKEWORD(2, 2)` = `0x0202`), the version every current Windows provides.
+    const WINSOCK_VERSION_2_2: u16 = 0x0202;
     static STARTED: OnceLock<bool> = OnceLock::new();
     let ok = *STARTED.get_or_init(|| {
       // SAFETY: an all-zero WSADATA is a valid, uninitialized out-param.
       let mut data: WSADATA = unsafe { std::mem::zeroed() };
       // SAFETY: `data` is a live, writable WSADATA; `WSAStartup` fills it and returns 0 on success.
-      // 0x0202 requests Winsock 2.2.
-      unsafe { WSAStartup(0x0202, &mut data) == 0 }
+      unsafe { WSAStartup(WINSOCK_VERSION_2_2, &mut data) == 0 }
     });
     if ok {
       Ok(())

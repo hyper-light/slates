@@ -124,6 +124,16 @@ slates-sdk-node = 0
 # the Swift FSVolume handler a C ABI over `serve` — sanctioned FFI unsafe, each block with a SAFETY
 # note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
 slates-bridge-fskit = 9
-# slates-bridge-winfsp (0): the host-buildable half is the pure VfsError->NTSTATUS refusal taxonomy —
-# safe Rust; the winfsp-rs FFI and the FSP_FSCTL_TRANSACT marshalling are the Windows half, owed.
-slates-bridge-winfsp = 0
+# slates-bridge-winfsp (86): the VfsError->NTSTATUS refusal taxonomy stays safe Rust (lib.rs, 0). The
+# WinFsp mount host is Windows-only FFI, hand-transcribed from winfsp's headers (like the rt AFD
+# reactor from the WDK) and compiled only for Windows, each block with a `// SAFETY:` line (clippy
+# `undocumented_unsafe_blocks` enforces it): `ffi.rs` (18) declares the `FspFileSystem*` exports and
+# the `FSP_FILE_SYSTEM_INTERFACE` callback signatures; `host.rs` (68) is the mount driver — the 16
+# `FSP_FILE_SYSTEM_INTERFACE` trampolines that read WinFsp's raw pointers (the file system's
+# `UserContext` handler, the opaque `FileContext` open-files, UTF-16 path strings, the read/write
+# buffers) under WinFsp's COARSE operation guard that serializes them, plus `FspFileSystemCreate`/
+# `SetMountPoint`/`StartDispatcher`/`AddDirInfo`, the leaked `Handler`/`OpenFile` boxes, and the
+# `ConvertStringSecurityDescriptor…`/`GetSecurityDescriptorLength`/`LocalFree` for the reference
+# descriptor. All are Win32/WinFsp FFI without a safe wrapper; there is no `unsafe impl Send`/`Sync`
+# (the volume is owned by one thread and shared only over channels, R2/D-7).
+slates-bridge-winfsp = 86

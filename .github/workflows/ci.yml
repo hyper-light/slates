@@ -129,14 +129,21 @@ jobs:
           toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      # WinFsp: the mount host links `winfsp-x64.dll`'s import library and the live mount test needs the
+      # kernel FSD installed. The MSI ships the SDK (inc/, lib/) under `C:\Program Files (x86)\WinFsp`.
+      - name: Install WinFsp
+        run: choco install winfsp -y --no-progress
       # `--workspace` cannot build here: the NFS-mount and FUSE/FSKit crates (bridge-nfs, cli,
       # bridge-fuse, bridge-fskit) are macOS/Linux-only — Windows mounts through WinFsp, and the fleet
       # transport is QUIC over UDP, not the NFS-over-TCP loopback. So clippy the crates that carry
       # Windows code: the shared memory and wake (mem, ipc), the runtime with its IOCP/AFD driver (rt),
       # the client, the **daemon** (`slates-server` — a RAM-only IPC daemon on Windows, its NFS mount
-      # transport gated off; provisioning, merge and landing all cross-platform), and the two SDK addons.
+      # transport gated off; provisioning, merge and landing all cross-platform), the **WinFsp mount
+      # host** (`slates-bridge-winfsp`), and the two SDK addons.
       - name: Clippy the Windows-buildable crates (native Windows)
-        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-client -p slates-server -p slates-sdk-node -p slates-sdk-python --all-targets -- -D warnings
+        env:
+          WINFSP_LIB: C:\Program Files (x86)\WinFsp\lib
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-client -p slates-server -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python --all-targets -- -D warnings
       # Run the tests whose Win32 cfg branches only a native Windows runner can exercise: the shared
       # memory (`CreateFileMappingW`); the cross-process wake (the named auto-reset Event — §4.7's
       # `WaitOnAddress`-is-process-local case, so the park/late-reply wake in `rings` goes through the
@@ -153,6 +160,16 @@ jobs:
           cargo test -p slates-ipc --test rings
           cargo test -p slates-ipc --test rendezvous
           cargo test -p slates-rt --test udp
+      # The live WinFsp mount (§4.6): mount a slates volume at a drive letter through the real kernel
+      # FSD, then create/write/read/list/delete a file through the Windows filesystem and unmount. This
+      # drives the whole `FSP_FILE_SYSTEM_INTERFACE` — the hand-transcribed FFI, the callback
+      # trampolines, the owner-thread volume — end to end, the Windows analogue of the macOS FSKit and
+      # `mount_nfs` live mounts. Gated by `WINFSP_TEST_MOUNT=1`; needs WinFsp (installed above).
+      - name: Live WinFsp mount (native Windows)
+        env:
+          WINFSP_LIB: C:\Program Files (x86)\WinFsp\lib
+          WINFSP_TEST_MOUNT: "1"
+        run: cargo test -p slates-bridge-winfsp --test mount -- --nocapture
 
   # D-20: instruction-count gates. callgrind counts are deterministic for a given binary, so
   # they see the one-percent change the wall clock cannot. valgrind is non-Rust tooling, admitted
