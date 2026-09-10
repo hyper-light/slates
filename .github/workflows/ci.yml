@@ -235,7 +235,28 @@ jobs:
           toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --workspace
+      # `--workspace` cannot build on Windows: the NFS-mount and FUSE/FSKit crates (bridge-nfs, cli,
+      # bridge-fuse, bridge-fskit) are macOS/Linux-only (Windows mounts through WinFsp, the fleet is
+      # QUIC-over-UDP not NFS-over-TCP). Clippy and test the Windows-buildable crates — the same set the
+      # `windows-lint` job covers, plus the WinFsp mount host, which needs WinFsp installed to link.
+      - name: Install WinFsp
+        run: |
+          choco install winfsp -y --no-progress
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Clippy the Windows-buildable crates
+        env:
+          WINFSP_LIB: C:\Program Files (x86)\WinFsp\lib
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-client -p slates-server -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python --all-targets -- -D warnings
+      # The Win32 paths a native runner can actually exercise (the daemon-spawning server/client tests
+      # are not run on Windows yet — the full daemon lifecycle there awaits the Win32 rendezvous end to
+      # end; the pieces are proven by `windows-lint`). WinFsp is installed above, so the live mount runs.
+      - name: Test the Win32 memory, wake, AFD, rendezvous, and WinFsp mount paths
+        env:
+          WINFSP_LIB: C:\Program Files (x86)\WinFsp\lib
+          WINFSP_TEST_MOUNT: "1"
+        run: |
+          cargo test -p slates-mem
+          cargo test -p slates-ipc --test rings
+          cargo test -p slates-ipc --test rendezvous
+          cargo test -p slates-rt --test udp
+          cargo test -p slates-bridge-winfsp --test mount -- --nocapture
