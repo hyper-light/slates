@@ -339,8 +339,13 @@ a **pinned certificate** (no CA PKI), the client↔server handshake completing o
 (authenticated, not permissive). `rustls` uses the `ring` provider (no cmake); its config `Arc` is
 D-8's sanctioned exception. The **`Connection`** that wires streams + reliability + multi-range ACKs +
 the dual-level (`MaxStreamData` + `MaxData`) credit law + congestion control is **built**
-(`connection.rs`), and `Endpoint` (`endpoint.rs`) protects its packets and drives the reliable
-request/reply exchange. **Owed:** timer-based tail-loss recovery, and wiring the `Endpoint` onto the
-`rt` UDP driver for the real over-the-wire path (the sans-io core is exercised by the in-process oracle
-today; the control plane's `accept`/seal are the datagram-plane analogue already wired). CRYPTO frames
-are `rustls::quic`'s, not ours; the handshake keys drive the record protection.
+(`connection.rs`), and **`Endpoint` (`endpoint.rs`) runs it over the real `rt` UDP driver** — it binds a
+`slates_rt::udp::UdpSocket`, protects/unprotects each packet, and drives the handshake and the reliable
+stream and request/reply exchanges over the wire. Proven **end-to-end over loopback UDP** by
+`crates/transport/tests/session.rs`: `a_stream_flows_over_a_live_session` (handshake + a stream
+reassembled exactly), `a_request_gets_a_reply_over_a_live_session`, and
+`repeated_exchanges_never_reuse_packet_numbers` (connection reuse, monotonic packet numbers). **Owed:**
+timer-based tail-loss recovery driven from an RTT-derived probe timeout (the probe *mechanism* exists;
+today the endpoint drives it heuristically when a send stalls, adequate over the lossless fabric but not
+an RTT timer), connection IDs, and several frames per packet (an MTU budget). CRYPTO frames are
+`rustls::quic`'s, not ours; the handshake keys drive the record protection.
