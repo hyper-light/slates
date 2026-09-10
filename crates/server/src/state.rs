@@ -99,8 +99,9 @@ pub struct ShardState {
   /// view, the configuration group, and the owner's register acceptor, composed by `slates-cluster`'s
   /// `FleetNode`. `FleetNode::solo` at `f = 0` (the laptop) — the same code path a fleet runs (R8), a
   /// membership event folding into the configuration through [`slates_cluster::FleetNode::observe`]. The
-  /// placement authority the verbs read is `fleet.configuration()`; the live probe/gossip loop that
-  /// drives `observe` and the cross-node commit are the next fleet pieces.
+  /// verbs read `fleet.configuration()` for the candidate placement of an object and `placed_heads` for
+  /// what the fleet has actually committed; the live probe/gossip loop that drives `observe` and the
+  /// cross-node commit run in `crate::fleet` on the control shard.
   pub fleet: slates_cluster::fleet::FleetNode,
   /// The landing runtime: grants, leases and the audit log (§4.15), mirrored to the
   /// database's durable records.
@@ -212,6 +213,14 @@ pub struct ShardState {
   /// window while every survivor brings its holds' authority into step). Empty on a laptop (no fleet loop
   /// runs) and whenever no takeover is outstanding.
   pub pending_takeovers: std::collections::BTreeSet<ObjectId>,
+  /// This node's client record sessions to its candidate holder peers (§4.8), keyed by peer host: each
+  /// per-peer link task ([`crate::fleet::establish_record_link`]) brings its session up on one socket and
+  /// installs it here as `Some`; the record-plane coordinator borrows a session for each dispatch — leaving
+  /// the entry `None` while it is out — and returns it after, straggler sessions being recovered later. An
+  /// absent entry means no session (never established, or lost — a borrow that ended without a return),
+  /// which the link task re-establishes; a retired peer's entry is removed with it. Empty on a laptop (no
+  /// fleet loop runs).
+  pub record_sessions: BTreeMap<slates_db::HostId, Option<slates_transport::endpoint::Endpoint>>,
 }
 
 /// A work volume's accumulated declared operations (§4.16), composed into an increment on submit.

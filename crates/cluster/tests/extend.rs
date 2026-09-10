@@ -57,26 +57,41 @@ const LOOKAHEAD_DEN: u64 = 4;
 /// The stall window — wider than the gap between the staggered acknowledgements, so a steadily filling
 /// quorum reads as progressing while a quorum with no new acknowledgement for this long reads as stalled.
 const STALL_WINDOW_NS: u64 = 20_000_000;
+/// When a third holder — the straggler — acknowledges: past the quorum the owner and two prompt holders
+/// form at [`FIRST_ACK_NS`], so the commit has already returned without it, and within the dispatch's full
+/// span (`BASE_DEADLINE_NS + MAX_EXTENSIONS × EXTENSION_NS`), so its task finishes by acknowledging rather
+/// than timing out.
+const STRAGGLER_ACK_NS: u64 = 25_000_000;
+/// How long the owner waits after a commit returns before recovering its stragglers' sessions: past
+/// [`STRAGGLER_ACK_NS`], so the recovery finds the straggler finished.
+const RECOVERY_WAIT_NS: u64 = 30_000_000;
 /// How long a stalled holder keeps its connection open before exiting — past the commit's stall-driven
 /// expiry, so the owner's request genuinely waits (and times out) rather than seeing the connection drop
 /// (which would be reported "not placed", a different path). Bounded so the simulation reaches idle.
 const KEEPALIVE_NS: u64 = 60_000_000;
 
-/// A holder's plan: whether it acknowledges the record, and at what delay after its handshake completes.
+/// A holder's plan: how many successive records it acknowledges (serving one commit each), and at what
+/// delay after its handshake completes it starts.
 #[derive(Clone, Copy)]
 struct HolderPlan {
-  /// Whether the holder serves (acknowledges) the record. A holder that does not serve keeps its
+  /// How many successive commits the holder serves (acknowledges). A holder that serves none keeps its
   /// connection open for [`KEEPALIVE_NS`] and then exits, so the owner's request to it genuinely waits.
-  serves: bool,
+  serves: u32,
   /// The delay after the handshake before the holder acts (serves, or simply stays alive).
   at_ns: u64,
 }
 
 /// The commit's outcome (its placement or the `ClusterError` string) and the sim time the dispatch took,
-/// so a test can assert the commit ran past its base deadline (the extension is observable) or expired.
+/// so a test can assert the commit ran past its base deadline (the extension is observable) or expired;
+/// the holders whose sessions came back at the return (`reusable`) and those recovered later from the
+/// stragglers (`recovered`, after [`RECOVERY_WAIT_NS`]); and, when the run re-commits, the second commit's
+/// placement over the returned **and recovered** sessions — the by-use proof a recovered session is live.
 struct Outcome {
   placement: Result<Placement, String>,
   elapsed_ns: u64,
+  reusable: Vec<HostId>,
+  recovered: Vec<HostId>,
+  recommitted: Option<Placement>,
 }
 
 fn config() -> RuntimeConfig {
@@ -123,31 +138,39 @@ fn authority() -> Authority {
   }
 }
 
-fn record(value: &[u8]) -> Record {
+fn record(sequence: u64, value: &[u8]) -> Record {
   Record {
     owner: OWNER,
     object: OBJECT,
-    sequence: 0,
+    sequence,
     epoch: HostEpoch(1),
     generation: GENERATION,
     value: value.to_vec(),
   }
 }
 
-/// Runs an `f = 2` commit — owner `1`, candidate holders `2` and `3` — over the sim fabric with `budget`
-/// and the given per-holder plans. Each serving holder acknowledges after its planned delay, so the
-/// owner's quorum fills over time. Returns the commit's [`Outcome`] (placement and elapsed sim time).
-fn run_commit(budget: CommitBudget, plans: [HolderPlan; 2]) -> Outcome {
+/// The host id of the holder at `index` among the plans: the owner is `1`, the holders `2`, `3`, ….
+fn holder_id(index: usize) -> HostId {
+  HostId(u64::try_from(index).unwrap_or(0) + 2)
+}
+
+/// Runs an `f = 2` commit — owner `1`, one candidate holder per plan (`2`, `3`, …) — over the sim fabric
+/// with `budget`. Each serving holder acknowledges after its planned delay, so the owner's quorum fills
+/// over time. After the commit returns, the owner waits [`RECOVERY_WAIT_NS`] and recovers the sessions of
+/// the holders that were still in flight (the stragglers); with a `recommit` quorum, it then commits a
+/// **second** record, under that quorum, over the returned and recovered sessions together, so a recovered
+/// session is proven live by use. Returns the commit's [`Outcome`].
+fn run_commit(budget: CommitBudget, plans: &[HolderPlan], recommit: Option<Quorum>) -> Outcome {
   let mut sim = SimRuntime::new(&config(), 1).unwrap();
   let id = sim.shard_ids()[0];
 
   let owner_identity = self_signed(NAME);
   let owner_cert = owner_identity.certificate();
-  let holder_identities = [self_signed(NAME), self_signed(NAME)];
-  let holder_certs = [
-    holder_identities[0].certificate(),
-    holder_identities[1].certificate(),
-  ];
+  let holder_identities: Vec<Identity> = plans.iter().map(|_| self_signed(NAME)).collect();
+  let holder_certs: Vec<_> = holder_identities
+    .iter()
+    .map(Identity::certificate)
+    .collect();
 
   // Port exchange, one pair of channels per holder: the owner sends the port of the socket it dials
   // from, and holder i sends the port it listens on.
@@ -155,7 +178,7 @@ fn run_commit(budget: CommitBudget, plans: [HolderPlan; 2]) -> Outcome {
   let mut owner_port_rx = Vec::new();
   let mut holder_port_tx = Vec::new();
   let mut holder_port_rx = Vec::new();
-  for _ in 0..2 {
+  for _ in plans {
     let (otx, orx) = channel::<u16>();
     let (htx, hrx) = channel::<u16>();
     owner_port_tx.push(otx);
@@ -165,16 +188,16 @@ fn run_commit(budget: CommitBudget, plans: [HolderPlan; 2]) -> Outcome {
   }
   let (result_tx, result_rx) = channel::<Outcome>();
 
-  // The holder tasks: each handshakes, waits its planned delay, then either serves the record
-  // (acknowledging) or simply stays alive to its keepalive and exits.
+  // The holder tasks: each handshakes, waits its planned delay, then serves its planned number of records
+  // (acknowledging each) or simply stays alive to its keepalive and exits.
   let holder_setup = holder_identities
     .into_iter()
     .zip(owner_port_rx)
     .zip(holder_port_tx)
-    .zip(plans);
+    .zip(plans.iter().copied());
   for (index, (((holder_identity, orx), htx), plan)) in holder_setup.enumerate() {
     let owner_cert = owner_cert.clone();
-    let holder_id = HostId(u64::try_from(index).unwrap_or(0) + 2);
+    let holder = holder_id(index);
     sim
       .spawn_on(id, async move {
         let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -191,8 +214,8 @@ fn run_commit(budget: CommitBudget, plans: [HolderPlan; 2]) -> Outcome {
         .unwrap();
         endpoint.establish().await.unwrap();
         slates_rt::futures::sleep(plan.at_ns).await;
-        if plan.serves {
-          let mut acceptor = Acceptor::new(holder_id, authority());
+        let mut acceptor = Acceptor::new(holder, authority());
+        for _ in 0..plan.serves {
           // Ignore the result: a holder that serves before the commit resolves acknowledges cleanly; a
           // holder whose owner has already given up serves into a closed connection, which simply fails.
           let _ = serve_record(&mut endpoint, &mut acceptor).await;
@@ -203,6 +226,9 @@ fn run_commit(budget: CommitBudget, plans: [HolderPlan; 2]) -> Outcome {
   }
 
   // The owner task: dial each holder, establish, then commit under `budget`, timing the dispatch.
+  let candidates: Vec<HostId> = std::iter::once(OWNER)
+    .chain((0..plans.len()).map(holder_id))
+    .collect();
   sim
     .spawn_on(id, async move {
       let dial = owner_port_tx
@@ -218,28 +244,53 @@ fn run_commit(budget: CommitBudget, plans: [HolderPlan; 2]) -> Outcome {
         let mut endpoint =
           Endpoint::client(socket, peer, &owner_identity, &holder_cert, NAME, FRAME_CAP).unwrap();
         endpoint.establish().await.unwrap();
-        remotes.push((HostId(u64::try_from(index).unwrap_or(0) + 2), endpoint));
+        remotes.push((holder_id(index), endpoint));
       }
 
       let mut owner_acceptor = Acceptor::new(OWNER, authority());
-      let candidates = [OWNER, HostId(2), HostId(3)];
       let started = slates_rt::futures::now_ns();
-      let placement = commit_record(
+      let committed = commit_record(
         OWNER,
         &mut owner_acceptor,
         &candidates,
-        &record(b"head@v1"),
+        &record(0, b"head@v1"),
         QUORUM,
         remotes,
         budget,
       )
-      .await
-      .outcome
-      .map_err(|e: ClusterError| e.to_string());
+      .await;
       let elapsed_ns = slates_rt::futures::now_ns().saturating_sub(started);
+      let placement = committed.outcome.map_err(|e: ClusterError| e.to_string());
+      let reusable: Vec<HostId> = committed.reusable.iter().map(|(host, _)| *host).collect();
+      let mut sessions = committed.reusable;
+      // Give the stragglers their bounded time to finish, then recover their sessions.
+      let mut stragglers = committed.stragglers;
+      slates_rt::futures::sleep(RECOVERY_WAIT_NS).await;
+      let (late, _) = stragglers.recover();
+      let recovered: Vec<HostId> = late.iter().map(|(host, _)| *host).collect();
+      sessions.extend(late);
+      let recommitted = if let Some(quorum) = recommit {
+        commit_record(
+          OWNER,
+          &mut owner_acceptor,
+          &candidates,
+          &record(1, b"head@v2"),
+          quorum,
+          sessions,
+          budget,
+        )
+        .await
+        .outcome
+        .ok()
+      } else {
+        None
+      };
       let _ = result_tx.send(Outcome {
         placement,
         elapsed_ns,
+        reusable,
+        recovered,
+        recommitted,
       });
     })
     .unwrap();
@@ -265,16 +316,17 @@ fn a_progressing_commit_is_extended_past_its_deadline_and_places() {
       MAX_EXTENSIONS,
       STALL_WINDOW_NS,
     ),
-    [
+    &[
       HolderPlan {
-        serves: true,
+        serves: 1,
         at_ns: FIRST_ACK_NS,
       },
       HolderPlan {
-        serves: true,
+        serves: 1,
         at_ns: SECOND_ACK_NS,
       },
     ],
+    None,
   );
   let placement = outcome
     .placement
@@ -308,16 +360,17 @@ fn a_stalled_commit_expires_and_is_reported_uncertain() {
       MAX_EXTENSIONS,
       STALL_WINDOW_NS,
     ),
-    [
+    &[
       HolderPlan {
-        serves: false,
+        serves: 0,
         at_ns: KEEPALIVE_NS,
       },
       HolderPlan {
-        serves: false,
+        serves: 0,
         at_ns: KEEPALIVE_NS,
       },
     ],
+    None,
   );
   match outcome.placement {
     Err(e) => assert!(
@@ -334,5 +387,78 @@ fn a_stalled_commit_expires_and_is_reported_uncertain() {
     "expired on the stall within the extension budget (base {BASE_DEADLINE_NS} ns ≤ elapsed {} ns < \
      full {full_budget_ns} ns)",
     outcome.elapsed_ns
+  );
+}
+
+/// AC (§4.8 "records are sent to all candidates; committed at `f + 1`", keep-session): a holder still in
+/// flight when the commit returns at an early quorum — a **straggler** — is not cancelled and does not lose
+/// its session: the owner recovers it later from the dispatch's `Stragglers` and reuses it. Three holders at
+/// `f = 2`: the owner and the two prompt holders form the quorum at [`FIRST_ACK_NS`], so the commit returns
+/// with those two sessions reusable and the third holder's still out; the straggler acknowledges at
+/// [`STRAGGLER_ACK_NS`] and its session is recovered. The recovered session is then proven **live by use**,
+/// deterministically: the two prompt holders served once and are gone, so a second record committed at
+/// `f = 1` over all three sessions can reach its second acknowledgement **only** through the recovered one
+/// — it placing with the straggler among its acknowledgers is possible on no other path. Before this, the
+/// dispatch cancelled the straggler and dropped its endpoint — a session the per-peer-socket mesh cannot
+/// re-establish — so every early quorum at `f > 1` cost a live holder its session for good.
+#[test]
+fn an_early_quorums_straggler_hands_its_session_back_and_it_is_reused() {
+  let outcome = run_commit(
+    CommitBudget::with_extension(
+      BASE_DEADLINE_NS,
+      POLL_NS,
+      LOOKAHEAD_NUM,
+      LOOKAHEAD_DEN,
+      EXTENSION_NS,
+      MAX_EXTENSIONS,
+      STALL_WINDOW_NS,
+    ),
+    &[
+      HolderPlan {
+        serves: 1,
+        at_ns: FIRST_ACK_NS,
+      },
+      HolderPlan {
+        serves: 1,
+        at_ns: FIRST_ACK_NS,
+      },
+      HolderPlan {
+        serves: 2,
+        at_ns: STRAGGLER_ACK_NS,
+      },
+    ],
+    Some(Quorum { f: 1 }),
+  );
+  let placement = outcome
+    .placement
+    .expect("the owner and the two prompt holders place the first commit");
+  assert!(
+    placement.placed(QUORUM),
+    "placed at the early quorum: {placement:?}"
+  );
+  let straggler = holder_id(2);
+  assert!(
+    !placement.acked.contains(&straggler),
+    "the straggler had not acknowledged when the commit returned: {placement:?}"
+  );
+  let mut reusable = outcome.reusable;
+  reusable.sort();
+  assert_eq!(
+    reusable,
+    vec![holder_id(0), holder_id(1)],
+    "the two prompt holders' sessions came back at the return"
+  );
+  assert_eq!(
+    outcome.recovered,
+    vec![straggler],
+    "the straggler's session was recovered from the stragglers rather than dropped"
+  );
+  let recommitted = outcome
+    .recommitted
+    .expect("the second commit places through the recovered session");
+  assert!(
+    recommitted.placed(Quorum { f: 1 }) && recommitted.acked.contains(&straggler),
+    "the recovered session is live: the straggler's acknowledgement over it is the only second one the \
+     commit could get — {recommitted:?}"
   );
 }

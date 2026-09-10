@@ -125,15 +125,16 @@ under the full suite's load, producing no drive attempts at all because the driv
 **Fix.** Each dispatched holder request now runs through `request_within` — a deadline-bounded
 request/reply that **hands the endpoint back whatever the outcome** (reply, refusal, or timeout), bounded by
 the collection loop's full progress-extended span (`CommitBudget::max_deadline_ns`). So a straggler that
-never replies still returns its session, and the caller (`ship_records`/`drive_takeover`) retries the
-timed-out commit or promotion **over the same warm session** instead of losing it. At `f = 1` — the daemon's
-shape — there is one remote holder and no early quorum without it, so its session is always recovered; at
-`f > 1` an early-quorum straggler cut off before its own deadline still loses its session (unavoidable
-without waiting for it, and unchanged from before). This is the probe fix's keep-session discipline applied
-to the record plane, and it is a correct robustness improvement — but it did **not** eliminate the takeover
-flake (nor did a companion session-establishment fix: making `ship_records` drive the handshake on one
-persistent socket, so the peer's pinned `accept` completes rather than a fresh-port re-dial being ignored).
-The flake persisted at ~8%, which is what forced the real root out (Defect 4).
+never replies still returns its session, and the caller (the record plane's coordinator,
+`run_record_plane`/`drive_takeover`) retries the timed-out commit or promotion **over the same warm
+session** instead of losing it. (As first landed this covered only the *timeout* path: an early-quorum
+straggler at `f > 1` was still cancelled and lost its session; the review addendum below closes that too —
+the dispatch now returns at quorum and hands the stragglers back for the caller to recover.) This is the probe
+fix's keep-session discipline applied to the record plane, and it is a correct robustness improvement — but it
+did **not** eliminate the takeover flake (nor did a companion session-establishment fix: making the record
+ship drive the handshake on one persistent socket, so the peer's pinned `accept` completes rather than a
+fresh-port re-dial being ignored). The flake persisted at ~8%, which is what forced the real root out
+(Defect 4).
 
 ## Defect 4 — a head is shipped only until quorum, not to every candidate (the actual takeover-flake root)
 
@@ -142,8 +143,9 @@ head before A dies." Under load ~8% of runs failed there, and the takeover itsel
 (a survivor that never received the head cannot promise, so the promotion cannot reach quorum after the
 death).
 
-**Root cause.** The owner ships a head to its candidate holders with one **per-peer** ship task each
-(`ship_records`, the per-peer-socket mesh). `unplaced_heads` gated on the object's **overall placement**:
+**Root cause.** The owner shipped a head to its candidate holders with one **per-peer** ship task each
+(the then `ship_records` tasks over the per-peer-socket mesh). `unplaced_heads` gated on the object's
+**overall placement**:
 once *any* ship task committed the head to `f + 1` distinct candidates (region-placed, durable), it inserted
 `placed_heads[object]`, and **every other ship task then skipped the object**. So a head reached only its
 first `f + 1` holders. At `f = 1`, three candidates {A, B, C}: A's ship-to-B commits (A + B = quorum) and
@@ -153,12 +155,12 @@ why it flaked rather than always failed. But the design is explicit — "records
 candidates; committed at `f + 1`" — because after a death the surviving candidates form the promotion quorum
 and each must hold the head.
 
-**Fix.** The gate is now **per holder**, not per object: `unplaced_heads` became
-`heads_for_peer(state, local, peer_host)`, which returns a head for the ship task only if `peer_host` is a
-candidate for it **and has not yet acknowledged it** (`placed_heads[object].acked` does not contain it). And
-the placement is **merged, not overwritten** on each commit — the union of the per-peer ship tasks' acked
-candidates is the true region placement — so a head is shipped to every candidate exactly until that
-candidate holds it, and no further. With this the three-node full suite ran 30/30 under load (was ~8%
+**Fix.** The gate is now **per holder**, not per object: `unplaced_heads` returns a head together with the
+candidates that have **not yet acknowledged it** (`placed_heads[object].acked`), and it is shipped only to
+those (while the ship tasks were per peer this was `heads_for_peer(state, local, peer_host)`; the coordinator
+that replaced them keeps the per-holder gate). And the placement is **merged, not overwritten** on each
+commit — the union of every round's acknowledging candidates is the true region placement — so a head is
+shipped to every candidate exactly until that candidate holds it, and no further. With this the three-node full suite ran 30/30 under load (was ~8%
 flaky). This was the actual scale-up cause; Defects 1–3's fixes are correct robustness that the fleet keeps.
 
 A test-harness change accompanied it: the fleet tests now `std::thread::yield_now()` between poll checks
@@ -187,31 +189,88 @@ when the fleet test binary was run as several concurrent OS processes** to manuf
 reproduce in the real suite: 60/60 sequential runs pass, and 25/25 full-suite serialized runs
 (`--test-threads=1`, one process) pass under heavy unrelated CPU load (8 spinners, then 24 oversubscribed on
 an 18-core box). The genuine fleet is sound; the multi-process failure is a **test-harness artifact** of the
-repro method, from two facts that only hold across separate processes:
+repro method. The mechanism was **not instrumented** (the failing run was not captured with port logging), so
+what follows is the analysis, not a confirmed trace: the harness's port allocation only holds across one
+process. `four_free_ports`/`free_ports` bind `:0` sockets **all at once** so the OS hands back ports distinct
+**within one process**, then drop them for the daemons to rebind — and a second concurrent process can be
+handed one of those released ports in that window. Two consequences follow, either of which produces the
+`a`/`b`-unmeshed, `c`-meshed shape observed: the other process's socket now **holds** the port, so this
+process's daemon fails to bind its per-peer serve socket — which the fleet loop then **silently skipped**
+(the swallowed error the review below fixed: it is now counted as a `fleet.bind` status refusal, tested by
+`a_peer_whose_serve_socket_cannot_be_bound_is_counted_not_silently_skipped`) — or the other process's node
+dials the port and `Endpoint::accept` pins that stray source, stranding the real dialer. (`unique()`, the
+harness's host-id counter, is also process-local, so two processes mint identical host ids — harmless on its
+own, since separate processes never exchange messages unless their ports collide as above.)
 
-1. *Ephemeral-port reuse across processes.* `four_free_ports`/`free_ports` bind `:0` sockets **all at once** so
-   the OS hands back ports distinct **within one process**, then drop them for the daemons to rebind. Two
-   concurrent processes can be handed the **same** released port, so process B's node dials an address that is
-   process A's per-peer serve socket. `Endpoint::accept` pins the first source it hears, so that stray
-   ClientHello pins A's accept to the wrong peer and A's real dialer can never complete that directed session —
-   exactly the `a`/`b`-unmeshed, `c`-meshed shape observed.
-2. *Host-id collision across processes.* `unique()` is a process-local `AtomicU64` starting at 0, so two
-   processes mint **identical** host ids (the harness comment assumes in-process thread parallelism, which is
-   how `cargo test` runs; the fleet tests also serialize on a process-global mutex, so only one runs at a time).
-
-Neither can occur in real operation (distinct machine addresses; one address space) or in the real suite (one
-process, fleet tests serialized, `unique()` genuinely monotonic). So this is **not** a fleet defect and needs
-no fleet fix. Left as-is deliberately: making the harness safe across processes would need the daemon to accept
-**pre-bound** sockets (holding the port through the rebind) plus a process salt in the host id — test-infra
-scope beyond this bug, recorded here so it is not re-chased as a fleet flake.
+None of this can occur in real operation (distinct machine addresses; one address space) or in the real suite
+(one process, fleet tests serialized on a process-global mutex, `unique()` genuinely monotonic). So this is
+**not** a fleet defect. Left as-is deliberately: making the harness safe across processes would need the daemon
+to accept **pre-bound** sockets (holding the port through the rebind) — test-infra scope beyond this bug,
+recorded here so it is not re-chased as a fleet flake; the bind-refusal count now makes the first mechanism
+directly observable should it recur.
 
 The investigation did, however, motivate a real robustness improvement kept here: `probe_peer` (the SWIM probe
 client) previously dialed with a **single** `establish()` attempt (`dial`) and **returned on failure** — so a
 peer that took longer than one handshake budget to come up (a genuinely slow scale-up join, not the sub-ms
 loopback case) would strand that probe task permanently, never probing or meshing the peer and never able to
 retire it either. It now brings the session up with `client_for` + `establish_session` — one handshake attempt
-per period **on the same socket**, retried until it completes — mirroring the record plane's `ship_records`
-(the two now share `establish_session`). The detector ticks only when a probe is actually sent, so an
-as-yet-unestablished session never ages the peer. `dial` is removed (fully replaced). This is scale-up
-robustness, symmetric with the record plane; it is not the fix for the harness-artifact formation failure
-above, which has no fleet-side cause.
+per period **on the same socket**, retried until it completes — mirroring the record plane's link tasks
+(`establish_record_link`; the two share `establish_session`). The detector ticks only when a probe is actually
+sent, so an as-yet-unestablished session never ages the peer. `dial` is removed (fully replaced). This is
+scale-up robustness, symmetric with the record plane; it is not the fix for the harness-artifact formation
+failure above, which has no fleet-side cause.
+
+## Review addendum (2026-09-10) — five defects found reviewing the record-plane coordinator
+
+A same-day review of the coordinator that replaced the per-peer ship tasks (`run_record_plane`, landed in
+`360582f` to drive the `f > 1` multi-holder takeover) found that its 5-node proof passed only because loopback
+replies land within one poll interval. Reading the dispatch code rather than trusting the green run turned up
+five defects — three introduced by the consolidation, two pre-existing and exposed by the sweep:
+
+1. **A late acknowledgement was discarded at `f > 1`.** `commit_record` counts only its own round's
+   acknowledgements (it seeds `acked` with the owner alone), and the coordinator recorded acknowledgements
+   only from an `Ok` round. Once a head was placed by an earlier round, the later round re-shipping to a
+   straggler was short of quorum on its own — `NotPlaced`/`Uncertain` — so the straggler's acknowledgement,
+   though received and durable on the straggler, was thrown away and the head re-shipped to it **forever**.
+   *Fix:* `record_acks` merges the acknowledging set from every outcome (`Ok`, `Uncertain`, `NotPlaced` all
+   carry the placement); the union of rounds is the true placement, since each acknowledgement is a distinct
+   holder's durable acceptance of the same record.
+2. **An early quorum dropped the stragglers' sessions.** The dispatch cancelled holders still in flight at
+   quorum, dropping their endpoints — sessions the per-peer-socket mesh cannot re-establish. The per-peer
+   design sidestepped it at `f = 1` (one remote holder, no early quorum without it); the coordinator dispatches
+   to several holders even at `f = 1`, so every commit with two remote candidates could cost one its session.
+   *Fix:* the dispatch no longer cancels; each straggler is bounded by the dispatch's full span and hands its
+   session back through the reply channel, returned to the caller as `Committed::stragglers` /
+   `Promoted::stragglers` / `LedgerPromoted::stragglers` (`Stragglers::recover`, non-blocking). The coordinator
+   settles them each period (`Dispatch::settle`). Regression:
+   `crates/cluster/tests/extend.rs` `an_early_quorums_straggler_hands_its_session_back_and_it_is_reused` — a
+   third holder acknowledging past the quorum has its session recovered and a second commit places **only**
+   through it (deterministic: the prompt holders served once and are gone).
+3. **One slow link stalled the whole record plane.** The coordinator drove every link's handshake itself, and
+   one attempt to a peer that never answers is bounded but long (the retransmit ceiling, ~16 s) — so a lost or
+   slow link blocked every other peer's commits and every takeover behind it, each period. *Fix:* per-peer link
+   tasks (`establish_record_link`) keep the sessions in `ShardState::record_sessions`; the coordinator only
+   borrows them (`take_sessions`/`return_sessions`), and a borrow that ends without a return is marked lost so
+   the link task re-establishes on a fresh socket. A retired peer's link task ends and drops its entry.
+4. **The verbs never read the recorded placement (pre-existing).** `status` and `await placed(region)`
+   recomputed `Configuration::place` — the owner alone — so at `f ≥ 1` a head was reported unplaced *forever*,
+   however many holders acknowledged; only the test-facing `Daemon::fleet_head_placed` read `placed_heads`.
+   The docs (this one included, as first written) claimed otherwise. *Fix:* `committed_placement` in
+   `verbs.rs` reads the recorded acknowledgements and falls back to the computed local placement (the `f = 0`
+   degenerate, one code path — R8). Proven by `a_provisioned_head_replicates_across_the_fleet`, which now also
+   asks the owner's `await placed(region)` verb and requires `placed: true`.
+5. **The owner's acceptor was frozen at the boot generation (pre-existing).** The record plane built its
+   owner acceptor once, under the boot-time configuration version, while `FleetNode` advances the version on
+   every join or retirement and `Acceptor::accept` refuses a record under another generation
+   (`ForeignGeneration`). After any membership change, a newly provisioned head failed the owner's **own**
+   local hold and could never place. *Fix:* the coordinator re-installs the configuration's authority on its
+   acceptor each period (`install_authority` accepts an equal-or-higher generation, as `FleetNode::observe`
+   does for the node's own acceptor). Proven by
+   `three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node`, which now provisions a volume on a
+   survivor **after** the retirement and requires it to place.
+
+Also from the sweep: the fleet loop **silently skipped** a peer whose serve sockets failed to bind or accept
+(`continue` with no record — a swallowed error, banned item 9); it now counts a `fleet.bind` / `fleet.accept`
+refusal in the shard's status refusal counts, tested by use. And the review corrected this document's own
+claims: the harness-artifact mechanism above is analysis, not an instrumented trace (it was first written as
+fact), and function names that had moved (`ship_records`, `heads_for_peer`) are updated.

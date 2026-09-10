@@ -21,7 +21,7 @@ use rustls::pki_types::PrivateKeyDer;
 use slates_db::HostId;
 use slates_db::register::{ObjectId, Quorum, rendezvous_first};
 use slates_ipc::protocol::{
-  Direction, NamePolicy, ReplyBody, RequestBody, SizeClass, pack, unpack,
+  Direction, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
@@ -460,12 +460,28 @@ fn three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node() {
   let dead = hosts[2];
   daemons.pop().expect("three daemons").stop();
   let all_retired = poll_survivors_retire(&daemons, dead);
+  // Scaling down must not strand new work: with C retired (the configuration version advanced), a volume
+  // provisioned on A now must still place — over B, the one remaining candidate — under the new generation.
+  // Before the owner's acceptor followed the version, A's own hold refused its record `ForeignGeneration`
+  // and nothing provisioned after a membership change ever placed; the head placing is the proof it does.
+  let pid = std::process::id();
+  let placed_after_retirement = all_retired && {
+    let mut client = Client::connect(&format!("fleet3-{}-{pid}", hosts[0].0));
+    match client.call(&scratch("after-retirement")) {
+      ReplyBody::Created { id } => poll_head_placed(&daemons[0], ObjectId(id.bytes)),
+      _ => false,
+    }
+  };
   for daemon in daemons {
     daemon.stop();
   }
   assert!(
     all_retired,
     "both survivors detected C's death over the transport and retired it"
+  );
+  assert!(
+    placed_after_retirement,
+    "a head provisioned on a survivor after the retirement places under the advanced generation"
   );
 }
 
@@ -635,12 +651,29 @@ fn a_provisioned_head_replicates_across_the_fleet() {
     }
     std::thread::yield_now();
   }
+  // The verbs read the same recorded placement (§4.8 D-18, `await placed(region)`): a client asking the
+  // owner for the region scope is told it is placed. Before the verbs consulted the recorded
+  // acknowledgements they recomputed the owner's local placement — the owner alone — so a fleet's head was
+  // reported unplaced forever, however many holders held it; `placed: true` here is the proof they now read
+  // what the fleet committed.
+  let placed_by_verb = matches!(
+    client.call(&RequestBody::AwaitPlaced {
+      volume: id,
+      snapshot: None,
+      scope: Scope::Region,
+    }),
+    ReplyBody::Placed { placed: true, .. }
+  );
 
   daemon_a.stop();
   daemon_b.stop();
   assert!(
     placed,
     "the provisioned head replicated to the peer holder and reached the f=1 quorum"
+  );
+  assert!(
+    placed_by_verb,
+    "the owner's `await placed(region)` verb reports the replicated head placed"
   );
 }
 
@@ -718,16 +751,9 @@ fn a_holder_durably_holds_the_owners_replicated_head() {
 }
 
 /// Polls until both survivor daemons durably hold `object`'s head (the owner shipped it to each candidate
-/// holder), or the hold deadline passes; returns whether they both did.
+/// holder), or the hold deadline passes; returns whether they both did — [`poll_all_hold`] over the pair.
 fn poll_both_hold(first: &Daemon, second: &Daemon, object: ObjectId) -> bool {
-  let deadline = Instant::now() + Duration::from_secs(20);
-  while Instant::now() < deadline {
-    if first.fleet_holder_head(object).is_some() && second.fleet_holder_head(object).is_some() {
-      return true;
-    }
-    std::thread::yield_now();
-  }
-  false
+  poll_all_hold(&[first, second], object)
 }
 
 /// Polls until `daemon` reports `object` region-placed — the takeover re-committed the adopted head under
@@ -936,5 +962,51 @@ fn five_daemons_take_over_a_dead_owners_head_over_a_multi_holder_quorum() {
     held.1,
     id.bytes.to_vec(),
     "the taken-over head's value survived the multi-holder promotion and re-commit"
+  );
+}
+
+/// AC (§4.14; banned item 9 — no swallowed error): a fleet peer whose serve socket this node cannot bind at
+/// boot is not silently skipped — the refusal is **counted** in the daemon's status (`fleet.bind`), so an
+/// operator can see why the mesh never formed to that peer. A's probe serve port is already held by another
+/// socket when A boots, so A cannot serve B's probes: A's status must report the refusal. Non-vacuous:
+/// without the count, the status showed nothing and the only symptom was a mesh that never formed.
+#[test]
+fn a_peer_whose_serve_socket_cannot_be_bound_is_counted_not_silently_skipped() {
+  let _serial = serialize_fleet_tests();
+  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  // Hold A's probe serve port before A boots, so A's bind of it fails (released when the test ends).
+  let _squatter = std::net::UdpSocket::bind(("127.0.0.1", pa_probe))
+    .expect("the port the allocator just released is free to hold");
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let pid = std::process::id();
+  let instance_a = format!("fleet-{}-{pid}", a.host.0);
+  let peer_of_a = Peer {
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let daemon_a = start(a, peer_of_a);
+
+  // The fleet loop counts the refusal on its first run on the control shard; poll the status for it,
+  // bounded, since that run and this client's request are queued on the same shard.
+  let mut client = Client::connect(&instance_a);
+  let deadline = Instant::now() + Duration::from_secs(5);
+  let mut counted = false;
+  while Instant::now() < deadline && !counted {
+    if let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) {
+      counted = report
+        .shards
+        .iter()
+        .flat_map(|shard| shard.refusals.iter())
+        .any(|refusal| refusal.kind == "fleet.bind" && refusal.count >= 1);
+    }
+    std::thread::yield_now();
+  }
+  daemon_a.stop();
+  assert!(
+    counted,
+    "the serve socket A could not bind is counted as a `fleet.bind` refusal in A's status"
   );
 }

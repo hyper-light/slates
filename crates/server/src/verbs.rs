@@ -2542,6 +2542,21 @@ fn placement_of(state: &ShardState, volume: DbVolumeId) -> PlacementState {
   }
 }
 
+/// The region placement of `object` as the fleet has **actually committed** it (§4.8 "the acknowledging
+/// set is recorded in the object's head record"): the acknowledging candidates the control-shard record
+/// plane recorded when it replicated the head to its holders (`ShardState::placed_heads`), or — before
+/// any holder has acknowledged, or on a laptop where no fleet loop runs — the owner's local placement the
+/// configuration computes (`Configuration::place`: the owner alone, which is placed at `f = 0` and not yet
+/// at `f > 0`). One code path serves both (R8): the laptop is the empty-map degenerate. Reading the
+/// computed placement alone reported a fleet's head *never* region-placed, however many holders held it.
+fn committed_placement(state: &ShardState, object: ObjectId) -> slates_db::register::Placement {
+  state
+    .placed_heads
+    .get(&object)
+    .cloned()
+    .unwrap_or_else(|| state.fleet.configuration().place(object))
+}
+
 /// A volume's head placement for a status reply (§4.8, D-18): whether the head is placed in
 /// the region, the mirror's lag (none at `f = 0`), and the owner's host epoch.
 fn placed_state(state: &ShardState, volume: DbVolumeId, head: DbSnapshotId) -> PlacedState {
@@ -2552,7 +2567,7 @@ fn placed_state(state: &ShardState, volume: DbVolumeId, head: DbSnapshotId) -> P
     // alone, so every volume of one creator collided to one placement object — fixed by ObjectId.
     let object = ObjectId(volume.bytes);
     let config = state.fleet.configuration();
-    config.region_placed(&config.place(object))
+    config.region_placed(&committed_placement(state, object))
   } else {
     match state.db.partition().snapshot(volume, head) {
       Some(record) => matches!(record.placed, PlacementState::Placed { .. }),
@@ -2585,7 +2600,7 @@ fn await_placed(
   let target = snapshot.map_or(record.head, to_db_snapshot);
   // The snapshot places on its volume's candidate holders — the placement object is the volume id.
   let _ = target;
-  let placement = state.fleet.configuration().place(ObjectId(volume.bytes));
+  let placement = committed_placement(state, ObjectId(volume.bytes));
   let db_scope = match scope {
     Scope::Region => DurabilityScope::Region,
     Scope::Mirror => DurabilityScope::Mirror,

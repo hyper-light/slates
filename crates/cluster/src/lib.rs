@@ -283,6 +283,53 @@ impl DispatchWait {
 /// report is always a holder's reply.
 struct Reply(HostId, Vec<u8>, Box<Endpoint>);
 
+/// The holder replies still in flight when a dispatch returned at quorum (or timed out): the receiving end
+/// of the dispatch's reply channel, kept open so each straggler task — bounded by the dispatch's full span
+/// ([`CommitBudget::max_deadline_ns`], the same bound the collection loop used) — hands its **session** back
+/// here when it finishes, instead of having it dropped by a cancellation. The caller recovers the sessions
+/// later ([`Stragglers::recover`]) and reuses them, so an early quorum costs no slow holder its session —
+/// which the per-peer-socket mesh cannot re-establish (`Endpoint::accept` pins one source). The straggler's
+/// reply itself is not folded (the dispatch already resolved without it); a commit re-ships to that holder
+/// next period over the recovered session, idempotently. Empty when nothing was dispatched.
+pub struct Stragglers {
+  replies: Option<std::sync::mpsc::Receiver<Reply>>,
+}
+
+impl Stragglers {
+  /// No stragglers: nothing was dispatched (a local quorum at `f = 0`, or a spawn failure that cancelled the
+  /// tasks already started).
+  fn none() -> Self {
+    Self { replies: None }
+  }
+
+  /// The stragglers of a dispatch whose reply channel is `replies` — every task still running sends there.
+  fn pending(replies: std::sync::mpsc::Receiver<Reply>) -> Self {
+    Self {
+      replies: Some(replies),
+    }
+  }
+
+  /// Recovers the sessions of the stragglers that have finished since the last call, and whether every
+  /// straggler is now accounted for (the channel has closed: no task still holds a session), after which
+  /// this is spent and can be dropped. Never blocks; a caller polls it each period.
+  pub fn recover(&mut self) -> (Vec<(HostId, Endpoint)>, bool) {
+    let mut recovered = Vec::new();
+    let Some(replies) = self.replies.as_ref() else {
+      return (recovered, true);
+    };
+    loop {
+      match replies.try_recv() {
+        Ok(Reply(host, _, endpoint)) => recovered.push((host, *endpoint)),
+        Err(TryRecvError::Empty) => return (recovered, false),
+        Err(TryRecvError::Disconnected) => {
+          self.replies = None;
+          return (recovered, true);
+        }
+      }
+    }
+  }
+}
+
 /// Runs one request/reply on `endpoint` (its `request`), racing it against `deadline_ns`, and returns the
 /// reply bytes (empty on a timeout or a transport error) **together with the endpoint, kept whatever the
 /// outcome**. This is what lets a dispatch task *always* hand its holder's session back to the collection
@@ -332,7 +379,7 @@ fn is_placed(candidates: &[HostId], acked: &[HostId], quorum: Quorum) -> bool {
 /// `acked`, keeps every replying holder's endpoint for reuse, and returns the reusable endpoints and
 /// whether the deadline was reached. Recovers the endpoints of tasks that finished after the loop.
 async fn collect_acks(
-  rx: std::sync::mpsc::Receiver<Reply>,
+  rx: &mut std::sync::mpsc::Receiver<Reply>,
   record: &Record,
   candidates: &[HostId],
   quorum: Quorum,
@@ -375,13 +422,15 @@ async fn collect_acks(
 
 /// A commit's outcome and the holder connections still open for the next commit — a holder that
 /// replied before the quorum or deadline hands its [`Endpoint`] back, so a retry reuses the same
-/// connection (continuous packet numbers) rather than re-establishing; a holder whose task was
-/// cancelled (too slow) is absent and is re-established on next use.
+/// connection (continuous packet numbers) rather than re-establishing; a holder still in flight at the
+/// return (a straggler past an early quorum) hands its session back later through `stragglers`.
 pub struct Committed {
   /// Whether the write placed (a [`Placement`]) or why not (a [`ClusterError`]).
   pub outcome: Result<Placement, ClusterError>,
   /// The holder connections still open, for reuse on the next commit.
   pub reusable: Vec<(HostId, Endpoint)>,
+  /// The holders still in flight at the return, whose sessions the caller recovers later.
+  pub stragglers: Stragglers,
 }
 
 /// Commits `record` across its `candidates` (§4.8 "records are sent to all candidates; committed at
@@ -395,7 +444,9 @@ pub struct Committed {
 /// on the deadline [`ClusterError::Uncertain`] (partial acceptance may have occurred); if every holder
 /// answered short of quorum [`ClusterError::NotPlaced`] — together with the holder connections that
 /// replied, handed back for reuse (so a retry reuses the same connection and its continuous
-/// packet-number space). Remaining tasks are cancelled. The budget is the caller's to derive (owed — a
+/// packet-number space). Holders still in flight at the return are **not** cancelled: each is bounded by
+/// the dispatch's full span and hands its session back through [`Committed::stragglers`] when it finishes,
+/// so an early quorum costs no slow holder its session. The budget is the caller's to derive (owed — a
 /// measured RTT budget); nothing here is a hidden constant.
 pub async fn commit_record(
   owner: HostId,
@@ -423,13 +474,14 @@ pub async fn commit_record(
     return Committed {
       outcome: Ok(build(&acked)),
       reusable: Vec::new(),
+      stragglers: Stragglers::none(),
     };
   }
 
   // Dispatch each remote holder in its own task, reporting to one channel; the collection loop below
   // bounds the wait itself (its progress-extension policy), so no deadline task is needed. Children of
-  // this task, so they are cancelled if this future is dropped (no orphans).
-  let (tx, rx) = channel::<Reply>();
+  // the calling task, so they end with it (no orphans), and each is bounded by the dispatch's span.
+  let (tx, mut rx) = channel::<Reply>();
   let record_bytes = record.encode();
   let deadline_ns = budget.max_deadline_ns();
   let mut tasks = Vec::new();
@@ -451,14 +503,13 @@ pub async fn commit_record(
   drop(tx); // so the channel disconnects once every task has ended
 
   let (reusable, timed_out) =
-    collect_acks(rx, record, candidates, quorum, budget, &mut acked).await;
+    collect_acks(&mut rx, record, candidates, quorum, budget, &mut acked).await;
 
-  // Cancel whatever is still running — a straggler cut off *before* its own deadline (an early quorum at
-  // f > 1) loses its session, which is unavoidable without waiting for it; but at f = 1 the single holder
-  // always reports (there is no early quorum without it), so its session is kept for a retry.
-  for task in &tasks {
-    let _ = cancel(*task);
-  }
+  // Whatever is still running is left to finish — a straggler cut off by a cancellation (an early quorum
+  // at f > 1, or a commit that timed out just before its reply) would lose its session, which the
+  // per-peer-socket mesh cannot re-establish. Each straggler is bounded by the dispatch's full span and
+  // hands its session back through the channel, which the caller drains from `stragglers`.
+  let stragglers = Stragglers::pending(rx);
 
   let placement = build(&acked);
   let outcome = if placement.placed(quorum) {
@@ -468,7 +519,11 @@ pub async fn commit_record(
   } else {
     Err(ClusterError::NotPlaced { placement })
   };
-  Committed { outcome, reusable }
+  Committed {
+    outcome,
+    reusable,
+    stragglers,
+  }
 }
 
 /// Commits `record` using a validated [`Configuration`] as the authority interface (§4.8 "epoch
@@ -513,6 +568,7 @@ fn spawn_failed(tasks: &[slates_rt::TaskId], error: RtError) -> Committed {
   Committed {
     outcome: Err(ClusterError::Runtime(error)),
     reusable: Vec::new(),
+    stragglers: Stragglers::none(),
   }
 }
 
@@ -565,6 +621,8 @@ pub struct Promoted {
   pub outcome: Result<Promotion, ClusterError>,
   /// The holder connections still open, for the adoption re-commit that follows.
   pub reusable: Vec<(HostId, Endpoint)>,
+  /// The holders still in flight at the return, whose sessions the caller recovers later.
+  pub stragglers: Stragglers,
 }
 
 /// Collects promises until a quorum promised or the deadline: records each distinct, binding promise
@@ -573,7 +631,7 @@ pub struct Promoted {
 /// reusable endpoints and whether the deadline was reached. Recovers the endpoints of tasks that
 /// finished after the loop.
 async fn collect_promises(
-  rx: std::sync::mpsc::Receiver<Reply>,
+  rx: &mut std::sync::mpsc::Receiver<Reply>,
   prepare: &Prepare,
   candidates: &[HostId],
   quorum: Quorum,
@@ -639,8 +697,9 @@ fn fold_adopted(adopted: &mut Option<Accepted>, reported: Option<Accepted>) {
 /// [`Promoted`]: on a quorum the [`Promotion`] (safe to
 /// serve — `f + 1` promises intersect every prior `f + 1` commit, so the adoption covers the committed
 /// prefix); on the deadline [`ClusterError::Uncertain`]; short of quorum [`ClusterError::NotPlaced`] —
-/// with the replying holders' connections handed back for the adoption re-commit. Remaining tasks are
-/// cancelled. The budget is the caller's to derive (owed — a measured RTT budget); nothing here is a
+/// with the replying holders' connections handed back for the adoption re-commit. Holders still in flight
+/// at the return are not cancelled but hand their sessions back through [`Promoted::stragglers`]. The
+/// budget is the caller's to derive (owed — a measured RTT budget); nothing here is a
 /// hidden constant.
 pub async fn promote_record(
   new_owner: HostId,
@@ -666,13 +725,14 @@ pub async fn promote_record(
     return Promoted {
       outcome: Ok(Promotion { promised, adopted }),
       reusable: Vec::new(),
+      stragglers: Stragglers::none(),
     };
   }
 
   // Dispatch each remote holder in its own task, reporting to one channel; the collection loop below
   // bounds the wait itself (its progress-extension policy), so no deadline task is needed. Children of
-  // this task, so they are cancelled if this future is dropped (no orphans).
-  let (tx, rx) = channel::<Reply>();
+  // the calling task, so they end with it (no orphans), and each is bounded by the dispatch's span.
+  let (tx, mut rx) = channel::<Reply>();
   let prepare_bytes = prepare.encode();
   let deadline_ns = budget.max_deadline_ns();
   let mut tasks = Vec::new();
@@ -693,7 +753,7 @@ pub async fn promote_record(
   drop(tx); // so the channel disconnects once every task has ended
 
   let (reusable, timed_out) = collect_promises(
-    rx,
+    &mut rx,
     prepare,
     candidates,
     quorum,
@@ -703,10 +763,9 @@ pub async fn promote_record(
   )
   .await;
 
-  // Cancel whatever is still running — a straggler's endpoint is dropped and that holder reconnects.
-  for task in &tasks {
-    let _ = cancel(*task);
-  }
+  // Whatever is still running is left to finish (bounded by the dispatch's span) and hands its session
+  // back through the channel — recovered by the caller from `stragglers`, never dropped.
+  let stragglers = Stragglers::pending(rx);
 
   let promotion = Promotion {
     promised: promised.clone(),
@@ -731,7 +790,11 @@ pub async fn promote_record(
       },
     })
   };
-  Promoted { outcome, reusable }
+  Promoted {
+    outcome,
+    reusable,
+    stragglers,
+  }
 }
 
 /// The [`Promoted`] returned when a dispatch task could not be spawned: the runtime error, the tasks
@@ -743,6 +806,7 @@ fn promote_spawn_failed(tasks: &[slates_rt::TaskId], error: RtError) -> Promoted
   Promoted {
     outcome: Err(ClusterError::Runtime(error)),
     reusable: Vec::new(),
+    stragglers: Stragglers::none(),
   }
 }
 
@@ -806,6 +870,8 @@ pub struct LedgerPromotion {
 pub struct LedgerPromoted {
   /// The promotion result: the adopted log and promising set, or why it did not confirm.
   pub outcome: Result<LedgerPromotion, ClusterError>,
+  /// The holders still in flight at the return, whose sessions the caller recovers later.
+  pub stragglers: Stragglers,
   /// The holder connections still open, for the adoption re-commit that follows.
   pub reusable: Vec<(HostId, Endpoint)>,
 }
@@ -835,7 +901,7 @@ pub async fn serve_ledger_promotion(
 /// whether the deadline was reached. The same progress-extension policy the commit and single-value
 /// promotion use bounds the wait.
 async fn collect_ledger_promises(
-  rx: std::sync::mpsc::Receiver<Reply>,
+  rx: &mut std::sync::mpsc::Receiver<Reply>,
   prepare: &Prepare,
   candidates: &[HostId],
   quorum: Quorum,
@@ -888,7 +954,8 @@ async fn collect_ledger_promises(
 /// old owner (Continuity), because a phase-one quorum and every prior `f + 1` commit quorum both intersect
 /// at `f + 1` of `2f + 1`. It returns a [`LedgerPromoted`]: on a quorum the adopted log (safe to re-commit
 /// and serve); on the deadline [`ClusterError::Uncertain`]; short of quorum [`ClusterError::NotPlaced`] —
-/// with the replying holders' connections for the adoption re-commit. Remaining tasks are cancelled. The
+/// with the replying holders' connections for the adoption re-commit. Holders still in flight at the return
+/// hand their sessions back through [`LedgerPromoted::stragglers`] rather than being cancelled. The
 /// budget is the caller's to derive (owed — a measured RTT budget); nothing here is a hidden constant.
 pub async fn promote_ledger_record(
   new_owner: HostId,
@@ -917,13 +984,14 @@ pub async fn promote_ledger_record(
         adopted: ledger::adopt(&logs),
       }),
       reusable: Vec::new(),
+      stragglers: Stragglers::none(),
     };
   }
 
   // Dispatch each remote holder in its own task, reporting to one channel; the collection loop bounds the
-  // wait itself (its progress-extension policy). Children of this task, so they are cancelled if this
-  // future is dropped (no orphans).
-  let (tx, rx) = channel::<Reply>();
+  // wait itself (its progress-extension policy). Children of the calling task, so they end with it (no
+  // orphans), each bounded by the dispatch's span.
+  let (tx, mut rx) = channel::<Reply>();
   let prepare_bytes = prepare.encode();
   let deadline_ns = budget.max_deadline_ns();
   let mut tasks = Vec::new();
@@ -944,7 +1012,7 @@ pub async fn promote_ledger_record(
   drop(tx); // so the channel disconnects once every task has ended
 
   let (reusable, timed_out) = collect_ledger_promises(
-    rx,
+    &mut rx,
     prepare,
     candidates,
     quorum,
@@ -954,10 +1022,9 @@ pub async fn promote_ledger_record(
   )
   .await;
 
-  // Cancel whatever is still running — a straggler's endpoint is dropped and that holder reconnects.
-  for task in &tasks {
-    let _ = cancel(*task);
-  }
+  // Whatever is still running is left to finish (bounded by the dispatch's span) and hands its session
+  // back through the channel — recovered by the caller from `stragglers`, never dropped.
+  let stragglers = Stragglers::pending(rx);
 
   let outcome = if quorum.committed(promised.len()) {
     Ok(LedgerPromotion {
@@ -981,7 +1048,11 @@ pub async fn promote_ledger_record(
       },
     })
   };
-  LedgerPromoted { outcome, reusable }
+  LedgerPromoted {
+    outcome,
+    reusable,
+    stragglers,
+  }
 }
 
 /// The [`LedgerPromoted`] returned when a dispatch task could not be spawned: the runtime error, the tasks
@@ -993,5 +1064,6 @@ fn ledger_promote_spawn_failed(tasks: &[slates_rt::TaskId], error: RtError) -> L
   LedgerPromoted {
     outcome: Err(ClusterError::Runtime(error)),
     reusable: Vec::new(),
+    stragglers: Stragglers::none(),
   }
 }
