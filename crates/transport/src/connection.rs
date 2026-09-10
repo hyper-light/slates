@@ -85,6 +85,11 @@ pub struct Connection {
   /// total stream data it will accept across all streams. Starts at the initial window (both ends derive
   /// the same one, R8) and rises monotonically as the peer reads and re-advertises.
   peer_max_data: u64,
+  /// ACK-of-ACK bookkeeping (RFC 9000 §13.2.4): for each ack-eliciting packet this end sent that also
+  /// carried an acknowledgement, the largest packet number that acknowledgement covered. When the peer
+  /// acknowledges such a packet, the entry is consumed to bound the receive-side ack set. Entries are
+  /// dropped on acknowledgement or loss, so the map stays within the in-flight ack-bearing packets.
+  sent_acks: BTreeMap<u64, u64>,
 }
 
 impl Connection {
@@ -112,6 +117,7 @@ impl Connection {
       // The peer's initial connection credit is the initial window it advertises before any read (its
       // `FlowController::connection_max` with nothing consumed); both ends derive the same one (R8).
       peer_max_data: window_ahead,
+      sent_acks: BTreeMap::new(),
     }
   }
 
@@ -167,20 +173,9 @@ impl Connection {
     if let Some(frame) = reliable.clone() {
       frames.push(frame);
     }
-    if self.ack_owed
-      && let Some(ack) = self.acks.ack_frame(Self::max_ack_ranges(max_frame_len))
-    {
-      frames.push(ack);
-      // Piggyback the connection-wide credit and each received stream's credit on the acknowledgement,
-      // so a lost credit frame is re-advertised with the next one (credit frames are not themselves
-      // retransmitted). Absolute values make a duplicate or reordered one idempotent (the peer ignores a
-      // lower grant).
-      frames.push(self.flow.connection_credit_frame());
-      for &stream_id in self.recv_streams.keys() {
-        frames.push(self.flow.stream_credit_frame(stream_id));
-      }
-      self.ack_owed = false;
-    }
+    // The largest packet number this packet's acknowledgement covers, if it carries one — recorded for
+    // ACK-of-ACK once the packet is known to be ack-eliciting (so the peer will acknowledge it back).
+    let ack_largest = self.push_acknowledgement(&mut frames, max_frame_len);
     if frames.is_empty() {
       return None;
     }
@@ -197,9 +192,38 @@ impl Connection {
       if fresh {
         self.connection_sent = self.connection_sent.saturating_add(bytes);
       }
+      // ACK-of-ACK: this packet is ack-eliciting (it carries a stream frame), so the peer will
+      // acknowledge it; if it also carries an acknowledgement of ours, remember what that covered, so
+      // that when the peer acks this packet we can stop tracking the packets it acknowledged.
+      if let Some(largest) = ack_largest {
+        self.sent_acks.insert(pn, largest);
+      }
       self.sent.on_sent(pn, vec![frame]);
     }
     Some((pn, frames))
+  }
+
+  /// If an acknowledgement is owed, appends it — followed by the connection-wide credit and each
+  /// received stream's credit, piggybacked so a lost credit frame re-advertises with the next
+  /// acknowledgement — to `frames`, clears the owed flag, and returns the largest packet number the
+  /// acknowledgement covered (for ACK-of-ACK bookkeeping). `None` when none is owed or generated.
+  fn push_acknowledgement(&mut self, frames: &mut Vec<Frame>, max_frame_len: usize) -> Option<u64> {
+    if !self.ack_owed {
+      return None;
+    }
+    let ack = self.acks.ack_frame(Self::max_ack_ranges(max_frame_len))?;
+    let largest = if let Frame::Ack { largest, .. } = ack {
+      Some(largest)
+    } else {
+      None
+    };
+    frames.push(ack);
+    frames.push(self.flow.connection_credit_frame());
+    for &stream_id in self.recv_streams.keys() {
+      frames.push(self.flow.stream_credit_frame(stream_id));
+    }
+    self.ack_owed = false;
+    largest
   }
 
   /// The next fresh stream frame to send, chosen round-robin across the send streams so none starves,
@@ -254,7 +278,15 @@ impl Connection {
           ranges,
         } => {
           let acked = self.sent.on_ack_frame(*largest, *range, ranges);
-          self.congestion.on_ack(acked);
+          self.congestion.on_ack(acked.bytes);
+          // ACK-of-ACK (RFC 9000 §13.2.4): for each of our packets the peer just acknowledged that had
+          // carried an acknowledgement of ours, the peer now has that acknowledgement — so we can stop
+          // tracking the packets it covered, bounding the receive-side ack set.
+          for pn in acked.pns {
+            if let Some(covered) = self.sent_acks.remove(&pn) {
+              self.acks.confirm(covered);
+            }
+          }
         }
         // The peer's advertised send credit for one stream: raise that stream's send ceiling (monotonic).
         Frame::MaxStreamData { stream_id, max } => {
@@ -281,6 +313,18 @@ impl Connection {
       self
         .congestion
         .on_loss(lost_bytes, highest_pn, largest_sent);
+    }
+    // Drop the ACK-of-ACK bookkeeping for lost packets: a lost packet is never acknowledged, so its
+    // entry would otherwise linger; its acknowledgement content is regenerated in the retransmission.
+    for pn in &lost.pns {
+      self.sent_acks.remove(pn);
+    }
+    // Bound the ACK-of-ACK map to the recent unacknowledged window: an entry at or below the peer's
+    // largest acknowledged that survived the confirm and loss passes is a probed or abandoned packet the
+    // peer will never acknowledge, so drop it. Later acknowledgements cover the same received packets, so
+    // no receive-set pruning is lost.
+    if let Some(largest_acked) = self.sent.largest_acked() {
+      self.sent_acks = self.sent_acks.split_off(&largest_acked);
     }
     self.queue_retransmit(lost.frames);
   }
@@ -333,6 +377,12 @@ impl Connection {
   /// The bytes currently in flight (sent, not yet acknowledged, freed, or declared lost).
   pub fn bytes_in_flight(&self) -> u64 {
     self.congestion.in_flight()
+  }
+
+  /// How many packet numbers the receive side still tracks for acknowledgement — the handle a test uses
+  /// to prove ACK-of-ACK keeps this set bounded on a long-lived or reused connection (Banned #8).
+  pub fn acks_tracked(&self) -> usize {
+    self.acks.tracked()
   }
 
   /// Whether receive stream `stream_id` is complete (all bytes through its `fin`). False if unknown.
@@ -664,6 +714,78 @@ mod tests {
     assert!(
       peak_in_flight >= window - FRAME_CAP as u64,
       "the connection window was never saturated ({peak_in_flight} < {window}), so the test proves nothing"
+    );
+  }
+
+  /// AC (§4.10a §8, RFC 9000 §13.2.4 ACK-of-ACK): on a connection reused across many exchanges the
+  /// receive-side acknowledgement set stays bounded — once the peer acknowledges one of our
+  /// acknowledgement-bearing packets, the packets it covered are dropped — rather than growing without
+  /// bound (Banned #8). Runs many bidirectional exchanges over one connection pair and asserts the
+  /// tracked set never grows past a small bound while every exchange still delivers exactly.
+  #[test]
+  fn ack_of_ack_bounds_the_receive_set_over_a_reused_connection() {
+    /// Shape: enough exchanges that an unpruned set (≈ exchanges × packets-each-way) would dwarf the
+    /// bound below; with pruning it stays near one exchange's worth.
+    const EXCHANGES: u64 = 50;
+    /// Shape: a few packets each way per exchange (fits one window, so no flow stall).
+    const BODY: usize = 24;
+
+    let window = initial_receive_window(FRAME_CAP);
+    let mut a = Connection::new(window);
+    let mut b = Connection::new(window);
+    let mut channel = Channel::new(Vec::new());
+    let mut peak_tracked = 0usize;
+
+    for i in 0..EXCHANGES {
+      let sid = i * 2 + 1; // a fresh stream id per exchange
+      a.open(sid, &stream_content(u8::try_from(i % 7).unwrap_or(0), BODY));
+      b.open(
+        sid,
+        &stream_content(u8::try_from(i % 5).unwrap_or(0).wrapping_add(100), BODY),
+      );
+      let mut guard = 0u64;
+      loop {
+        guard += 1;
+        assert!(guard < 100_000, "the exchange must make progress");
+        // One packet each way per step, draining the receiver before the reverse send. Interleaving one
+        // at a time is what makes each data packet also carry the pending acknowledgement (rather than a
+        // separate pure-ACK packet the peer never acknowledges), so ACK-of-ACK actually confirms — the
+        // realistic behaviour a fully-drained pump would hide.
+        let a_sent = a.poll_transmit(FRAME_CAP);
+        if let Some((pn, frames)) = &a_sent
+          && !channel.drops()
+        {
+          b.handle_incoming(*pn, frames);
+        }
+        let _ = b.read_stream(sid);
+        let b_sent = b.poll_transmit(FRAME_CAP);
+        if let Some((pn, frames)) = &b_sent
+          && !channel.drops()
+        {
+          a.handle_incoming(*pn, frames);
+        }
+        let _ = a.read_stream(sid);
+        peak_tracked = peak_tracked.max(a.acks_tracked()).max(b.acks_tracked());
+        let delivered = a.recv_stream_complete(sid) && b.recv_stream_complete(sid);
+        if delivered && a.send_complete() && b.send_complete() {
+          break;
+        }
+        if a_sent.is_none() && b_sent.is_none() {
+          a.probe();
+          b.probe();
+        }
+      }
+      a.forget_stream(sid);
+      b.forget_stream(sid);
+    }
+
+    // The bound (with non-vacuity): many exchanges ran — an unpruned set would be on the order of
+    // EXCHANGES × (BODY / FRAME_CAP) ≈ 150 — yet ACK-of-ACK held the tracked set within a couple of
+    // exchanges' worth. A generous ceiling well below the unpruned size proves the pruning is real.
+    assert!(peak_tracked > 0, "exchanges actually ran and were tracked");
+    assert!(
+      peak_tracked < 40,
+      "ACK-of-ACK kept the receive set bounded across {EXCHANGES} exchanges (peak {peak_tracked})"
     );
   }
 

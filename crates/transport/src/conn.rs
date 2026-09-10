@@ -9,9 +9,10 @@
 //! The ACK is multi-range (RFC 9000 §19.3): [`AckGenerator`] reports every contiguous run of received
 //! packet numbers — so a packet received below a gap is acknowledged rather than left to a spurious
 //! retransmission — up to a frame-size budget, and [`SentTracker::on_ack_frame`] frees every
-//! acknowledged run. The emitted ACK *frame* is bounded by that budget; safely bounding the received
-//! *set* is owed, because forgetting a received packet needs an ACK-of-ACK (RFC 9000 §13.2.4) this
-//! dialect does not yet carry (see [`AckGenerator`]).
+//! acknowledged run (returning the freed packet numbers, for ACK-of-ACK). The emitted ACK *frame* is
+//! bounded by that budget, and the received *set* is bounded by ACK-of-ACK ([`AckGenerator::confirm`],
+//! RFC 9000 §13.2.4): once the peer acknowledges one of our acknowledgement-bearing packets, the
+//! packets it covered are dropped, so the set stays within the recent unconfirmed window.
 //!
 //! Owed (the rest of the connection): timer-based tail-loss recovery (this detects loss only by the
 //! packet-reorder threshold, so a purely-tail drop needs the timer QUIC adds — the loop here keeps
@@ -32,12 +33,11 @@ pub const REORDER_THRESHOLD: u64 = 3;
 /// Receive-side acknowledgement state: which packet numbers have arrived, and the multi-range ACK to
 /// send back.
 ///
-/// The `received` set is not yet pruned: safely forgetting a received packet needs to know the peer
-/// has seen an acknowledgement covering it (an acknowledgement of one of our ACK-bearing packets — RFC
-/// 9000 §13.2.4's ACK-of-ACK), which this dialect does not yet carry. A fixed-window prune is *unsafe*
-/// — an aggregated ACK would stop covering older packets the sender still has in flight, and the sender
-/// would declare them lost — so bounding this set is owed together with connection-level `MaxData` and
-/// ACK-of-ACK. The emitted ACK *frame* is bounded regardless (see [`AckGenerator::ack_frame`]).
+/// The `received` set is bounded by ACK-of-ACK (RFC 9000 §13.2.4, [`AckGenerator::confirm`]): once the
+/// peer acknowledges one of our acknowledgement-bearing packets, it has that acknowledgement, so the
+/// packets it covered need never be acknowledged again and are dropped. So on a long-lived or reused
+/// connection the set stays within the recent unconfirmed window rather than growing without bound
+/// (Banned #8). The emitted ACK *frame* is separately bounded (see [`AckGenerator::ack_frame`]).
 #[derive(Debug, Default)]
 pub struct AckGenerator {
   received: BTreeSet<u64>,
@@ -52,6 +52,21 @@ impl AckGenerator {
   /// Records a received packet number.
   pub fn record(&mut self, pn: u64) {
     self.received.insert(pn);
+  }
+
+  /// Confirms the peer has received an acknowledgement of ours covering packets up to `largest` (RFC
+  /// 9000 §13.2.4): those packets need never be acknowledged again — the peer has freed them and will
+  /// not ask for them — so drop them, which is what bounds this set. A later duplicate of a dropped
+  /// packet is simply recorded and acknowledged again (idempotent), so dropping is always safe.
+  pub fn confirm(&mut self, largest: u64) {
+    // Keep everything strictly above `largest`; drop `<= largest`.
+    self.received = self.received.split_off(&largest.saturating_add(1));
+  }
+
+  /// How many packet numbers are still tracked for acknowledgement — the non-vacuity handle a test uses
+  /// to prove ACK-of-ACK actually bounds the set (it would grow without bound otherwise).
+  pub fn tracked(&self) -> usize {
+    self.received.len()
   }
 
   /// The multi-range ACK for the received packets (RFC 9000 §19.3), or `None` if none received: the
@@ -106,6 +121,17 @@ struct InFlight {
   frames: Vec<Frame>,
 }
 
+/// What processing an ACK freed: the stream-data bytes newly acknowledged (for the congestion
+/// controller) and the packet numbers removed from flight (for ACK-of-ACK, so the connection can
+/// confirm which of its own acknowledgement-bearing packets the peer has now received).
+#[derive(Debug, Default)]
+pub struct Acked {
+  /// The stream-data bytes newly acknowledged.
+  pub bytes: u64,
+  /// The packet numbers freed from flight by this acknowledgement.
+  pub pns: Vec<u64>,
+}
+
 /// What a loss-detection pass declared lost: the frames to retransmit, and the largest packet number
 /// among them (for the congestion controller's recovery-period guard, RFC 9002 §7.3.1). `highest_pn` is
 /// `None` when nothing was lost.
@@ -113,6 +139,9 @@ struct InFlight {
 pub struct Lost {
   /// The frames of the lost packets, to retransmit.
   pub frames: Vec<Frame>,
+  /// The packet numbers declared lost (for the connection to drop their ACK-of-ACK bookkeeping — a lost
+  /// packet is never acknowledged, so its entry would otherwise linger).
+  pub pns: Vec<u64>,
   /// The largest packet number that was declared lost, if any.
   pub highest_pn: Option<u64>,
 }
@@ -161,40 +190,43 @@ impl SentTracker {
 
   /// Processes an ACK for `[largest - range, largest]`: removes acknowledged packets from flight and
   /// advances the largest-acknowledged watermark. Returns the stream-data bytes newly acknowledged (for
-  /// the congestion controller to free from its in-flight count and grow the window by).
-  pub fn on_ack(&mut self, largest: u64, range: u64) -> u64 {
+  /// the congestion controller) and the packet numbers freed (for ACK-of-ACK — the connection looks up
+  /// which of its own acknowledgement-bearing packets these were).
+  pub fn on_ack(&mut self, largest: u64, range: u64) -> Acked {
     let low = largest.saturating_sub(range);
-    let acked: Vec<u64> = self
+    let pns: Vec<u64> = self
       .in_flight
       .range(low..=largest)
       .map(|(&pn, _)| pn)
       .collect();
     let mut bytes = 0u64;
-    for pn in acked {
+    for &pn in &pns {
       if let Some(flight) = self.in_flight.remove(&pn) {
         bytes = bytes.saturating_add(flight.frames.iter().map(tracked_bytes).sum());
       }
     }
     self.largest_acked = Some(self.largest_acked.map_or(largest, |l| l.max(largest)));
-    bytes
+    Acked { bytes, pns }
   }
 
   /// Processes a whole ACK frame: its first range `[largest - range, largest]`, then each additional
   /// range below it (RFC 9000 §19.3.1), freeing every acknowledged packet from flight. Returns the
-  /// total stream-data bytes newly acknowledged (for the congestion controller). Decoding each
-  /// additional range relative to the previous run's low: `high = prev_low - gap - 2`, `low =
-  /// high - len`. Saturating arithmetic means a malformed range from a hostile peer can only
-  /// under-acknowledge (a packet not in flight frees nothing), never panic or free the wrong packet.
-  pub fn on_ack_frame(&mut self, largest: u64, range: u64, ranges: &[AckRange]) -> u64 {
-    let mut bytes = self.on_ack(largest, range);
+  /// total stream-data bytes newly acknowledged (for the congestion controller) and every freed packet
+  /// number (for ACK-of-ACK). Decoding each additional range relative to the previous run's low:
+  /// `high = prev_low - gap - 2`, `low = high - len`. Saturating arithmetic means a malformed range
+  /// from a hostile peer can only under-acknowledge (a packet not in flight frees nothing), never panic.
+  pub fn on_ack_frame(&mut self, largest: u64, range: u64, ranges: &[AckRange]) -> Acked {
+    let mut acked = self.on_ack(largest, range);
     let mut prev_low = largest.saturating_sub(range);
     for r in ranges {
       let high = prev_low.saturating_sub(r.gap).saturating_sub(2);
       let low = high.saturating_sub(r.len);
-      bytes = bytes.saturating_add(self.on_ack(high, high.saturating_sub(low)));
+      let more = self.on_ack(high, high.saturating_sub(low));
+      acked.bytes = acked.bytes.saturating_add(more.bytes);
+      acked.pns.extend(more.pns);
       prev_low = low;
     }
-    bytes
+    acked
   }
 
   /// Removes and returns the frames of packets now declared lost — in flight and at least the
@@ -213,12 +245,16 @@ impl SentTracker {
       .collect();
     let highest_pn = lost.iter().copied().max();
     let mut frames = Vec::new();
-    for pn in lost {
+    for &pn in &lost {
       if let Some(flight) = self.in_flight.remove(&pn) {
         frames.extend(flight.frames);
       }
     }
-    Lost { frames, highest_pn }
+    Lost {
+      frames,
+      pns: lost,
+      highest_pn,
+    }
   }
 
   /// How many packets are unacknowledged and in flight.
@@ -350,11 +386,12 @@ mod tests {
     else {
       panic!("an ACK is owed");
     };
-    let bytes = sent.on_ack_frame(largest, range, &ranges);
+    let acked = sent.on_ack_frame(largest, range, &ranges);
     assert_eq!(
-      bytes, 5,
+      acked.bytes, 5,
       "five 1-byte stream packets acknowledged across the gap"
     );
+    assert_eq!(acked.pns.len(), 5, "five packet numbers freed (0,1,2,4,5)");
     assert_eq!(
       sent.in_flight_count(),
       1,

@@ -182,8 +182,12 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    gap as a §19.3.1 gap/length `AckRange` — so a packet received below a gap is acknowledged rather than
    left to a spurious retransmission, and `SentTracker::on_ack_frame` frees every acknowledged run. The
    emitted ACK *frame* is bounded to a derived per-frame range budget (older runs fall back to
-   retransmit-and-dedup); bounding the receiver's *set* of received packet numbers is owed with ACK-of-ACK
-   (RFC 9000 §13.2.4), which this dialect does not yet carry (a fixed-window prune is unsafe — an
+   retransmit-and-dedup), and the receiver's *set* of received packet numbers is bounded by **ACK-of-ACK**
+   (RFC 9000 §13.2.4, now built): each of our packets records the largest its acknowledgement covered, and
+   when the peer acknowledges that packet we drop the packets it covered, so on a reused connection the set
+   stays within the recent unconfirmed window (proven by an oracle running 50 bidirectional exchanges over
+   one connection pair and asserting the tracked set never grows past a couple of exchanges' worth — the
+   `AckGenerator::tracked` non-vacuity counter). A fixed-window prune would instead be unsafe (an
    aggregated ACK would stop covering packets the sender still has in flight).
    **Connection-level `MaxData` is now built** (`connection.rs` + `flow.rs`, RFC 9000 §19.9): the ratified
    dual-level credit law is complete — a fresh frame is now gated by *both* its stream's `MaxStreamData`
@@ -200,8 +204,8 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    the boundary otherwise), and `forget_stream` now **resets the per-stream credit watermark** (so a reused
    stream id starts fresh; the stale watermark had blocked the connection-credit ratchet on a reused
    connection).
-   **Owed on the connection:** a real probe timeout, ACK-of-ACK (to bound the received set), connection
-   IDs, several frames per packet (an MTU budget), and loom on the state machine.
+   **Owed on the connection:** a real probe timeout, connection IDs, several frames per packet (an MTU
+   budget), and loom on the state machine.
    The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c); its
    fencing step rides membership. The **`Keyring`'s population is built** (`enrollment.rs`, slice 6):
    `Enrollment::from_membership` turns an admitted-membership record (the shared control secret + the
@@ -336,8 +340,7 @@ a **pinned certificate** (no CA PKI), the client↔server handshake completing o
 D-8's sanctioned exception. The **`Connection`** that wires streams + reliability + multi-range ACKs +
 the dual-level (`MaxStreamData` + `MaxData`) credit law + congestion control is **built**
 (`connection.rs`), and `Endpoint` (`endpoint.rs`) protects its packets and drives the reliable
-request/reply exchange. **Owed:** timer-based tail-loss recovery, ACK-of-ACK (to bound the received
-set), and wiring the `Endpoint` onto the `rt` UDP driver for the real over-the-wire path (the sans-io
-core is exercised by the in-process oracle today; the control plane's `accept`/seal are the
-datagram-plane analogue already wired). CRYPTO frames are `rustls::quic`'s, not ours; the handshake keys
-drive the record protection.
+request/reply exchange. **Owed:** timer-based tail-loss recovery, and wiring the `Endpoint` onto the
+`rt` UDP driver for the real over-the-wire path (the sans-io core is exercised by the in-process oracle
+today; the control plane's `accept`/seal are the datagram-plane analogue already wired). CRYPTO frames
+are `rustls::quic`'s, not ours; the handshake keys drive the record protection.
