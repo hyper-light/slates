@@ -40,12 +40,24 @@
 //!
 //! Those are transport- and server-layer pieces; this authority core is confirmable on its own.
 
-use slates_db::register::{Acceptor, Authority, Configuration, HostId, Quorum, Record};
+use slates_db::register::{Acceptor, Authority, Configuration, HostId, ObjectId, Quorum, Record};
 use slates_transport::endpoint::Endpoint;
 
 use crate::config_group::{ConfigGroup, Reconfiguration};
 use crate::membership::{Liveness, MemberState, Membership};
+use crate::routing::{Reassignment, Routing};
 use crate::{CommitBudget, Committed, commit_under_configuration};
+
+/// What folding a membership event in produced (`FleetNode::observe`): whether the configuration
+/// changed, and the objects this node must now take over (a dead owner's objects that fell to it).
+#[derive(Debug, Default)]
+pub struct Observed {
+  /// Whether the configuration version advanced (a member joined or was retired).
+  pub config_changed: bool,
+  /// The objects the event handed this node — a dead owner's objects it backed that rendezvous now
+  /// ranks first to it. Each needs phase-one recovery of the dead owner's head, then serving.
+  pub takeovers: Vec<Reassignment>,
+}
 
 /// The owner runtime on one node: the SWIM view, the configuration authority, and the owner's own
 /// register acceptor, composed and kept in step. Built at a fault tolerance (`f = 0` is the laptop);
@@ -57,6 +69,7 @@ pub struct FleetNode {
   membership: Membership,
   group: ConfigGroup,
   acceptor: Acceptor,
+  routing: Routing,
 }
 
 impl FleetNode {
@@ -84,6 +97,7 @@ impl FleetNode {
       membership,
       group,
       acceptor,
+      routing: Routing::new(host),
     }
   }
 
@@ -112,6 +126,23 @@ impl FleetNode {
     &self.membership
   }
 
+  /// Records that this node holds `object`, owned by `owner` (its own object created here, or a peer's
+  /// it backs as a candidate) — so a later owner death drives its takeover (§4.8). The daemon calls this
+  /// as it provisions a volume (owner = this host) or accepts a backup of a peer's.
+  pub fn track_object(&mut self, object: ObjectId, owner: HostId) {
+    self.routing.track(object, owner);
+  }
+
+  /// Forgets `object` (destroyed, or no longer held here).
+  pub fn forget_object(&mut self, object: ObjectId) {
+    self.routing.forget(object);
+  }
+
+  /// The current owner of `object` as this node's routing sees it, or `None` if it holds no copy.
+  pub fn object_owner(&self, object: ObjectId) -> Option<HostId> {
+    self.routing.owner_of(object)
+  }
+
   /// The owner's own register acceptor — its local hold of the heads it owns. The async
   /// [`commit_record`](crate::commit_record) borrows this as the owner's candidate hold; it serves
   /// under the authority [`observe`](FleetNode::observe) keeps in step with the configuration.
@@ -133,17 +164,20 @@ impl FleetNode {
   /// neighbourhood to the new alive set (admitting a fresh member, retiring a dead one). When the
   /// configuration version advances, the owner's own acceptor adopts the new authority — so the owner
   /// writes its next records under the current version, which a holder that installed the new
-  /// configuration requires. Returns whether the configuration changed.
+  /// configuration requires. And when the update is a *death*, the routing view reassigns the dead
+  /// host's objects this node backs, so the ones that rendezvous now ranks first to this node are
+  /// returned as takeovers to drive. Returns both effects in an [`Observed`].
   ///
   /// At `f = 0` there are no peers to hear about, so `observe` is only ever a self-refutation (a no-op
-  /// for the neighbourhood) — the same code path, exercised trivially, that a fleet drives with real
-  /// peers. It never removes this host (the owner is never retired), so the runtime always has an owner.
-  pub fn observe(&mut self, subject: HostId, update: MemberState) -> bool {
+  /// for the neighbourhood, and this node backs no peer's object) — the same code path, exercised
+  /// trivially, that a fleet drives with real peers. It never removes this host (the owner is never
+  /// retired), so the runtime always has an owner.
+  pub fn observe(&mut self, subject: HostId, update: MemberState) -> Observed {
     if self.membership.apply(subject, update).is_none() {
-      return false;
+      return Observed::default();
     }
-    let changed = self.group.reconcile(&self.membership);
-    if changed {
+    let config_changed = self.group.reconcile(&self.membership);
+    if config_changed {
       // The version moved; keep the owner's acceptor authority in step (install_authority accepts an
       // equal-or-higher generation, so a monotonically advancing version is always adopted, keeping the
       // owner writing under the current generation). The owner is unchanged, so this never fences the
@@ -151,7 +185,20 @@ impl FleetNode {
       let authority = Self::authority(self.group.configuration());
       let _ = self.acceptor.install_authority(authority);
     }
-    changed
+    // A death reassigns the dead host's objects this node holds a copy of. The reconciled neighbourhood
+    // is exactly the survivors, so the routing view ranks each dead-owned object over them and hands
+    // this node the ones it wins (the rest go to other survivors, recorded but not returned).
+    let takeovers = if update.liveness == Liveness::Dead {
+      self
+        .routing
+        .take_over(subject, &self.group.configuration().neighbourhood)
+    } else {
+      Vec::new()
+    };
+    Observed {
+      config_changed,
+      takeovers,
+    }
   }
 
   /// Reconfigures the neighbourhood directly (an operator admit/retire, not a SWIM-driven change),
@@ -327,7 +374,7 @@ mod tests {
 
     // A joins: the neighbourhood grows, the version advances, the authority stays in step.
     assert!(
-      node.observe(A, alive(0)),
+      node.observe(A, alive(0)).config_changed,
       "a fresh member changes the config"
     );
     assert!(node.configuration().neighbourhood.contains(&A));
@@ -335,16 +382,22 @@ mod tests {
     assert_runtime_invariants(&mut node);
 
     // B joins likewise.
-    assert!(node.observe(B, alive(0)));
+    assert!(node.observe(B, alive(0)).config_changed);
     assert_runtime_invariants(&mut node);
     let with_both = node.configuration().version;
 
     // A stale re-assertion of A (lower/equal incarnation, already alive) changes nothing.
-    assert!(!node.observe(A, alive(0)), "a stale update is a no-op");
+    assert!(
+      !node.observe(A, alive(0)).config_changed,
+      "a stale update is a no-op"
+    );
     assert_eq!(node.configuration().version, with_both, "no version churn");
 
     // A dies: it is retired from the neighbourhood, the version advances, the authority stays in step.
-    assert!(node.observe(A, dead(1)), "a death changes the config");
+    assert!(
+      node.observe(A, dead(1)).config_changed,
+      "a death changes the config"
+    );
     assert!(
       !node.configuration().neighbourhood.contains(&A),
       "the dead member is retired"
@@ -396,6 +449,54 @@ mod tests {
       grown.candidates.len(),
       3,
       "at f=1 with two peers the object has three candidate holders — a real fleet topology"
+    );
+  }
+
+  /// AC (§4.8 takeover, driven by membership): when a peer this node backs dies, `observe` reassigns
+  /// the peer's objects and returns the ones that fall to this node — the same rendezvous computation
+  /// the routing view runs, folded in from the death event. Non-vacuous: this node takes some of the
+  /// dead peer's objects and the other survivor takes the rest.
+  #[test]
+  fn a_peer_death_hands_this_node_the_objects_that_fall_to_it() {
+    let mut node = FleetNode::new(SELF, Quorum { f: 1 }, &[A, B]);
+    // This node holds a copy of many of A's objects (it backs them as a candidate).
+    let a_objects: Vec<ObjectId> = (0..64u64).map(|i| ObjectId::new(A, i)).collect();
+    for &object in &a_objects {
+      node.track_object(object, A);
+    }
+
+    let observed = node.observe(A, dead(1));
+    assert!(
+      observed.config_changed,
+      "A's death retired it from the neighbourhood, advancing the config"
+    );
+    // Every returned takeover is one of A's objects, now owned by this node.
+    for reassignment in &observed.takeovers {
+      assert_eq!(reassignment.new_owner, SELF);
+      assert_eq!(node.object_owner(reassignment.object), Some(SELF));
+      assert!(a_objects.contains(&reassignment.object));
+    }
+    // Non-vacuity: this node took some but not all — the other survivor (B) took the rest.
+    assert!(
+      !observed.takeovers.is_empty(),
+      "this node took over some of A's objects"
+    );
+    assert!(
+      observed.takeovers.len() < a_objects.len(),
+      "the other survivor took the rest (a real split)"
+    );
+  }
+
+  /// The R8 degenerate of takeover: at `f = 0` (the laptop) this node backs no peer's object, so a
+  /// membership event yields no takeover — the same code path a fleet drives, exercised trivially.
+  #[test]
+  fn the_solo_runtime_takes_over_nothing() {
+    let mut node = FleetNode::solo(SELF);
+    node.track_object(ObjectId::new(SELF, 0), SELF);
+    let observed = node.observe(SELF, alive(1));
+    assert!(
+      observed.takeovers.is_empty(),
+      "the laptop takes over nothing (it backs no peer's object)"
     );
   }
 }
