@@ -93,10 +93,16 @@ impl Wheel {
     Ok(id)
   }
 
-  /// Disarms a timer; a stale id is refused.
+  /// Disarms a timer; a stale id is refused. The arena removal comes **first** so the id's generation is
+  /// validated before any list is touched: a stale id (its slot already fired and was reused by a *later*
+  /// timer) is refused here and never reaches the unlink — unlinking by bare index would otherwise splice
+  /// out whichever timer now occupies the slot, orphaning a live timer so it never fires (the SWIM probe's
+  /// deadline stranded exactly this way, hanging a survivor's death detection under a fleet's own load).
+  /// The removed entry carries its own recorded position, so the unlink needs no second read of it.
   pub fn cancel(&mut self, id: TimerId) -> Result<(), RtError> {
-    self.unlink(id.index())?;
     let removed = self.entries.remove(id)?;
+    let head = usize::from(removed.level) * SLOTS_PER_LEVEL + usize::from(removed.slot);
+    self.unlink_at(removed.next, removed.prev, head);
     self.armed -= 1;
     if self.earliest == Some(removed.deadline) {
       // The earliest may have been this one; the next query rescans.
@@ -224,16 +230,12 @@ impl Wheel {
     self.heads[head] = index;
   }
 
-  fn unlink(&mut self, index: u32) -> Result<(), RtError> {
-    let generation = self.generation_of(index);
-    let (next, prev, head) = {
-      let entry = self.entries.get(Handle::from_raw(index, generation))?;
-      (
-        entry.next,
-        entry.prev,
-        usize::from(entry.level) * SLOTS_PER_LEVEL + usize::from(entry.slot),
-      )
-    };
+  /// Splices an entry out of its doubly-linked slot list given the position it recorded — its `next`,
+  /// `prev`, and the `head` of its `(level, slot)`. The entry itself is already gone from the arena (the
+  /// caller removed it after validating its generation), so this only mends its former neighbours and the
+  /// head pointer. Its neighbours are the entry's own list-mates, so they are live at their current
+  /// generation.
+  fn unlink_at(&mut self, next: u32, prev: u32, head: usize) {
     if prev == NONE {
       self.heads[head] = next;
     } else if let Ok(p) = self
@@ -249,7 +251,6 @@ impl Wheel {
     {
       n.prev = prev;
     }
-    Ok(())
   }
 }
 
@@ -307,6 +308,42 @@ mod tests {
     assert_eq!(fired, vec![2]);
     assert!(wheel.cancel(b).is_err());
     assert_eq!(wheel.next_deadline_ns(), None);
+  }
+
+  /// A stale `cancel` — one whose slot has already fired and been reused by a *later* timer — must be
+  /// refused without disturbing the reused slot's live timer. Regression: `cancel` unlinked by bare index
+  /// (at the slot's current generation) *before* validating the id's generation, so a stale cancel spliced
+  /// the timer that had reused the slot out of its list — orphaning it in the arena, in no slot list, so
+  /// it never fired. That is the runtime hazard that hung a fleet survivor's SWIM probe of a dead node
+  /// (the probe's deadline timer, orphaned when a healthy probe's fired-timer slot was reused and its id
+  /// then cancelled late). Here A fires and frees its slot, B reuses it, the stale cancel of A is refused,
+  /// and B must still fire.
+  #[test]
+  fn a_stale_cancel_does_not_orphan_the_timer_that_reused_the_slot() {
+    let mut wheel = Wheel::new(10, 4, 0);
+    let a = wheel.insert(50, 1).unwrap();
+    let mut fired = Vec::new();
+    // Fire A, freeing its slot for reuse.
+    wheel.advance(60, &mut fired);
+    assert_eq!(fired, vec![1], "A fired, freeing its slot");
+    fired.clear();
+    // B reuses A's freed slot (same index, a new generation) — the reuse the bug needs.
+    let b = wheel.insert(100, 2).unwrap();
+    assert_eq!(a.index(), b.index(), "B reused A's slot");
+    // The now-stale cancel of A is refused and must NOT unlink B.
+    assert!(
+      wheel.cancel(a).is_err(),
+      "a stale cancel (fired-and-reused slot) is refused"
+    );
+    // B was not orphaned: it is still the earliest, and it still fires.
+    assert_eq!(wheel.next_deadline_ns(), Some(100));
+    wheel.advance(110, &mut fired);
+    assert_eq!(
+      fired,
+      vec![2],
+      "B still fires — the stale cancel did not orphan it"
+    );
+    let _ = b;
   }
 
   #[test]
