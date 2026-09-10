@@ -27,13 +27,16 @@
 //! group rather than a bare `Configuration` (R8: the same code the fleet runs, degenerate at N=1). Verb
 //! and daemon-lifecycle behaviour is unchanged at N=1.
 //!
+//! The per-object routing view (`crate::routing`) is composed in: [`track_object`](FleetNode::track_object)
+//! records what this node holds, and [`observe`](FleetNode::observe) folds a death into a takeover,
+//! returning the objects that fall to this node ([`Observed::takeovers`]). [`sync_membership`] bridges a
+//! detector's converged SWIM view into the runtime — the piece the live probe loop calls each round.
+//!
 //! Deliberately **not** here yet, and owed as the next pieces, each at a real boundary:
 //!
-//! - the object→owner routing registry — *which* of a dead host's objects this node holds — so
-//!   cross-node takeover can be driven per object (the `ConfigGroup`'s single-owner `Configuration`
-//!   models this node's authority over its own objects, not a per-object table);
-//! - the live probe/gossip loop that feeds [`observe`](FleetNode::observe) from the [`crate::detector`],
-//!   and the async register lifecycle (commit a head, on takeover run the promotion) driven from it;
+//! - the live probe/gossip *loop* itself — running the [`crate::detector`] over the transport on a timer,
+//!   calling [`sync_membership`] each round, and driving each returned takeover's phase-one recovery and
+//!   serve; and the async register lifecycle (commit a head on write) driven from it;
 //! - propagating a control-shard membership change to the worker shards' configurations (at N=1 there
 //!   are none, so each shard's solo `FleetNode` agrees; a fleet's control shard `observe`s and the new
 //!   configuration must reach the shards that place objects).
@@ -240,6 +243,46 @@ impl FleetNode {
     )
     .await
   }
+}
+
+/// Folds a SWIM `view` (a [`crate::detector::Detector`]'s converged membership) into `fleet` — the
+/// bridge the live probe/gossip loop calls after each round to carry the detector's view into the owner
+/// runtime (§4.8 "membership fed by SWIM"). A host the fleet's neighbourhood holds that the view now
+/// believes **dead** is folded in as a death (retiring it and handing this node the objects that fall to
+/// it); a host the view believes **alive** that the fleet does not yet hold has joined. A *suspect* is
+/// left untouched — it is still a member until a confirmed death, so only a death retires it. Returns
+/// the takeovers the deaths produced. Idempotent: a view already matching the fleet is a no-op, so the
+/// loop can call it every round.
+pub fn sync_membership(view: &Membership, fleet: &mut FleetNode) -> Vec<Reassignment> {
+  let mut takeovers = Vec::new();
+  // Deaths first: fold each confirmed-dead member the fleet still holds, which retires it and may hand
+  // this node its objects. The neighbourhood is cloned because `observe` mutates the fleet.
+  let neighbourhood: Vec<HostId> = fleet.configuration().neighbourhood.clone();
+  for host in neighbourhood {
+    if host == fleet.host() {
+      continue;
+    }
+    if let Some(state) = view.state(host)
+      && state.liveness == Liveness::Dead
+    {
+      takeovers.extend(fleet.observe(host, state).takeovers);
+    }
+  }
+  // Joins: a host the view believes alive that the fleet's neighbourhood does not yet hold.
+  let known: std::collections::BTreeSet<HostId> = fleet
+    .configuration()
+    .neighbourhood
+    .iter()
+    .copied()
+    .collect();
+  for host in view.alive() {
+    if !known.contains(&host)
+      && let Some(state) = view.state(host)
+    {
+      fleet.observe(host, state);
+    }
+  }
+  takeovers
 }
 
 #[cfg(test)]
@@ -497,6 +540,46 @@ mod tests {
     assert!(
       observed.takeovers.is_empty(),
       "the laptop takes over nothing (it backs no peer's object)"
+    );
+  }
+
+  /// AC (§4.8, the probe-loop bridge): `sync_membership` folds a detector's converged SWIM view into the
+  /// owner runtime — a member the view believes dead is retired and its backed objects taken over, a
+  /// member the view believes alive is admitted — the same effects `observe` gives, driven from the view.
+  /// It is idempotent, so the live loop can call it every round.
+  #[test]
+  fn sync_membership_folds_deaths_and_joins_from_the_view() {
+    let mut fleet = FleetNode::new(SELF, Quorum { f: 1 }, &[A]);
+    let a_objects: Vec<ObjectId> = (0..32u64).map(|i| ObjectId::new(A, i)).collect();
+    for &object in &a_objects {
+      fleet.track_object(object, A);
+    }
+    // The SWIM view: A has died (a later incarnation overrides its alive record), and B has joined.
+    let mut view = Membership::new(SELF);
+    view.apply(A, alive(0));
+    view.apply(A, dead(1));
+    view.apply(B, alive(0));
+
+    let takeovers = sync_membership(&view, &mut fleet);
+
+    assert!(
+      !fleet.configuration().neighbourhood.contains(&A),
+      "the dead member A is retired"
+    );
+    assert!(
+      fleet.configuration().neighbourhood.contains(&B),
+      "the alive member B is admitted"
+    );
+    assert!(!takeovers.is_empty(), "this node took over A's objects");
+    for reassignment in &takeovers {
+      assert_eq!(reassignment.new_owner, SELF);
+      assert_eq!(fleet.object_owner(reassignment.object), Some(SELF));
+    }
+
+    // Idempotent: syncing the same view again retires nothing and takes over nothing.
+    assert!(
+      sync_membership(&view, &mut fleet).is_empty(),
+      "a second sync of the same view is a no-op"
     );
   }
 }
