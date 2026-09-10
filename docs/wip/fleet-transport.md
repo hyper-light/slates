@@ -185,9 +185,23 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    retransmit-and-dedup); bounding the receiver's *set* of received packet numbers is owed with ACK-of-ACK
    (RFC 9000 §13.2.4), which this dialect does not yet carry (a fixed-window prune is unsafe — an
    aggregated ACK would stop covering packets the sender still has in flight).
-   **Owed on the connection:** a real probe timeout, connection-level `MaxData` (only per-stream
-   `MaxStreamData` is enforced), ACK-of-ACK (to bound the received set), connection IDs, several frames per
-   packet (an MTU budget), and loom on the state machine.
+   **Connection-level `MaxData` is now built** (`connection.rs` + `flow.rs`, RFC 9000 §19.9): the ratified
+   dual-level credit law is complete — a fresh frame is now gated by *both* its stream's `MaxStreamData`
+   and the connection-wide `MaxData` (the total fresh bytes across all streams), each advertised a window
+   ahead of what the peer has consumed. The receiver advertises `MaxData` alongside each `MaxStreamData`
+   (piggybacked on the acknowledgement), tracks the connection-consumed total as a running sum of every
+   stream's advance (so a forgotten stream never un-counts its bytes), and the sender raises its ceiling on
+   `MaxData` and caps a fresh frame to the remaining connection credit. Proven by an oracle where several
+   streams each within their per-stream window are together bounded by the connection window (a non-vacuity
+   check confirms the connection window is the binding constraint), all bytes still arriving. Two latent
+   bugs were fixed in the same change (both exposed by the cumulative connection tier, both real): the
+   endpoint exchange loops now **drain before flushing** (so an acknowledgement advertises credit
+   reflecting the just-read bytes, not a round-stale window — a transfer larger than one window stalled at
+   the boundary otherwise), and `forget_stream` now **resets the per-stream credit watermark** (so a reused
+   stream id starts fresh; the stale watermark had blocked the connection-credit ratchet on a reused
+   connection).
+   **Owed on the connection:** a real probe timeout, ACK-of-ACK (to bound the received set), connection
+   IDs, several frames per packet (an MTU budget), and loom on the state machine.
    The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c); its
    fencing step rides membership. The **`Keyring`'s population is built** (`enrollment.rs`, slice 6):
    `Enrollment::from_membership` turns an admitted-membership record (the shared control secret + the
@@ -319,8 +333,11 @@ handshake over `rustls::quic`** (`handshake.rs`) — a node authenticates with i
 a **pinned certificate** (no CA PKI), the client↔server handshake completing over the `quic`
 `read_hs`/`write_hs` interface and negotiating TLS 1.3, with a test that a **wrong pin is rejected**
 (authenticated, not permissive). `rustls` uses the `ring` provider (no cmake); its config `Arc` is
-D-8's sanctioned exception. **Owed:** timer-based tail-loss recovery, ACK-of-ACK (to bound the received
-set), connection-level `MaxData`, the credit accounting that *sets* the window from the peer's `MaxStreamData`, and the
-`Connection` that wires streams+reliability+flow+handshake+record-protection onto the `rt` UDP driver
-(the control plane's `accept`/seal are the datagram-plane analogue already wired). CRYPTO frames are
-`rustls::quic`'s, not ours; the handshake keys drive the record protection (owed with the wiring).
+D-8's sanctioned exception. The **`Connection`** that wires streams + reliability + multi-range ACKs +
+the dual-level (`MaxStreamData` + `MaxData`) credit law + congestion control is **built**
+(`connection.rs`), and `Endpoint` (`endpoint.rs`) protects its packets and drives the reliable
+request/reply exchange. **Owed:** timer-based tail-loss recovery, ACK-of-ACK (to bound the received
+set), and wiring the `Endpoint` onto the `rt` UDP driver for the real over-the-wire path (the sans-io
+core is exercised by the in-process oracle today; the control plane's `accept`/seal are the
+datagram-plane analogue already wired). CRYPTO frames are `rustls::quic`'s, not ours; the handshake keys
+drive the record protection.

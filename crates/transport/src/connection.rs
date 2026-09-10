@@ -22,10 +22,11 @@
 //!
 //! Congestion control is now enforced (RFC 9002 §7 NewReno, `crate::congestion`): fresh sends are gated
 //! on the window, which grows on acknowledgement and halves on loss; only the empirical *tuning* (the
-//! window's exact constants, CUBIC, pacing) awaits a real network. Owed: connection-level `MaxData`
-//! (only per-stream `MaxStreamData` is enforced), several ack-eliciting frames per packet (an MTU
-//! budget),
-//! and driving the tail-loss probe from a real timeout.
+//! window's exact constants, CUBIC, pacing) awaits a real network. Flow control is the ratified
+//! dual-level credit law (`crate::flow`): a fresh frame is bounded both by its stream's `MaxStreamData`
+//! and by the connection-wide `MaxData` (the total fresh bytes across all streams), each advertised a
+//! window ahead of what the peer has consumed. Owed: several ack-eliciting frames per packet (an MTU
+//! budget), and driving the tail-loss probe from a real timeout.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -77,6 +78,13 @@ pub struct Connection {
   /// The NewReno congestion controller: the sender's self-limit on in-flight data, grown on
   /// acknowledgement and reduced on loss. Gates fresh sends in [`Connection::poll_transmit`].
   congestion: Congestion,
+  /// Send side: total fresh stream bytes sent across all streams (never counting a retransmission),
+  /// the connection-wide counterpart to each stream's send offset. Held below `peer_max_data`.
+  connection_sent: u64,
+  /// Send side: the connection-wide flow-control ceiling the peer has advertised (`MaxData`) — the most
+  /// total stream data it will accept across all streams. Starts at the initial window (both ends derive
+  /// the same one, R8) and rises monotonically as the peer reads and re-advertises.
+  peer_max_data: u64,
 }
 
 impl Connection {
@@ -100,6 +108,10 @@ impl Connection {
       ack_owed: false,
       retransmitted: 0,
       congestion: Congestion::new(max_datagram),
+      connection_sent: 0,
+      // The peer's initial connection credit is the initial window it advertises before any read (its
+      // `FlowController::connection_max` with nothing consumed); both ends derive the same one (R8).
+      peer_max_data: window_ahead,
     }
   }
 
@@ -135,14 +147,20 @@ impl Connection {
   /// packet that carries an ack-eliciting frame is tracked for loss (RFC 9002 §2).
   pub fn poll_transmit(&mut self, max_frame_len: usize) -> Option<(u64, Vec<Frame>)> {
     // One ack-eliciting frame: a retransmission takes priority over fresh stream data. Fresh data is
-    // gated by the congestion window (a retransmission is recovery, not new load, so it is not gated);
-    // `can_send` still lets a lone frame go when nothing is in flight, so the connection never stalls.
-    let reliable = match self.retransmit.pop_front() {
-      Some(frame) => Some(frame),
-      None if self.congestion.can_send(max_frame_len as u64) => {
-        self.next_fresh_frame(max_frame_len)
+    // gated by two limits — the congestion window (a retransmission is recovery, not new load, so it is
+    // never gated) and the connection-wide flow-control credit the peer advertised (`peer_max_data`),
+    // which bounds the *total* fresh bytes across all streams (each stream is also bounded by its own
+    // `MaxStreamData`, inside `StreamSender`). `can_send` still lets a lone frame go when nothing is in
+    // flight, so congestion never stalls the connection; a fresh frame is capped to the remaining
+    // connection credit so `connection_sent` never crosses the ceiling.
+    let connection_credit = self.peer_max_data.saturating_sub(self.connection_sent);
+    let fresh_cap = max_frame_len.min(usize::try_from(connection_credit).unwrap_or(max_frame_len));
+    let (reliable, fresh) = match self.retransmit.pop_front() {
+      Some(frame) => (Some(frame), false),
+      None if self.congestion.can_send(max_frame_len as u64) && connection_credit > 0 => {
+        (self.next_fresh_frame(fresh_cap), true)
       }
-      None => None,
+      None => (None, false),
     };
 
     let mut frames = Vec::new();
@@ -153,9 +171,11 @@ impl Connection {
       && let Some(ack) = self.acks.ack_frame(Self::max_ack_ranges(max_frame_len))
     {
       frames.push(ack);
-      // Piggyback each received stream's current credit on the acknowledgement, so a lost credit frame
-      // is re-advertised with the next one (a `MaxStreamData` is not itself retransmitted). Absolute
-      // values make a duplicate or reordered one idempotent (the sender ignores a lower grant).
+      // Piggyback the connection-wide credit and each received stream's credit on the acknowledgement,
+      // so a lost credit frame is re-advertised with the next one (credit frames are not themselves
+      // retransmitted). Absolute values make a duplicate or reordered one idempotent (the peer ignores a
+      // lower grant).
+      frames.push(self.flow.connection_credit_frame());
       for &stream_id in self.recv_streams.keys() {
         frames.push(self.flow.stream_credit_frame(stream_id));
       }
@@ -168,9 +188,15 @@ impl Connection {
     let pn = self.sent.next_pn();
     // Track only the ack-eliciting frame for loss/retransmission; the acknowledgement and credit frames
     // are regenerated fresh each time, never retransmitted stale. Its stream bytes enter the congestion
-    // window's in-flight count (a retransmission re-adds bytes a loss or probe earlier freed).
+    // window's in-flight count (a retransmission re-adds bytes a loss or probe earlier freed); a *fresh*
+    // frame's bytes also advance the connection-wide sent total (a retransmission does not — those bytes
+    // were already counted against the connection window when first sent).
     if let Some(frame) = reliable {
-      self.congestion.on_sent(tracked_bytes(&frame));
+      let bytes = tracked_bytes(&frame);
+      self.congestion.on_sent(bytes);
+      if fresh {
+        self.connection_sent = self.connection_sent.saturating_add(bytes);
+      }
       self.sent.on_sent(pn, vec![frame]);
     }
     Some((pn, frames))
@@ -236,8 +262,11 @@ impl Connection {
             sender.grant_credit(*max);
           }
         }
-        // Connection-level credit (owed) and PADDING: nothing to do yet.
-        Frame::MaxData { .. } => {}
+        // The peer's advertised connection-wide send credit: raise the ceiling on total fresh bytes
+        // across all streams (monotonic — a duplicate or reordered lower grant is ignored).
+        Frame::MaxData { max } => {
+          self.peer_max_data = self.peer_max_data.max(*max);
+        }
       }
     }
     if ack_eliciting {
@@ -282,6 +311,10 @@ impl Connection {
     };
     let bytes = assembler.read();
     let read_offset = assembler.read_offset();
+    // Advance both flow-control tiers: this stream's cursor and (inside `on_stream_consumed`) the
+    // connection-wide consumed total, so the next acknowledgement advertises connection credit a window
+    // ahead of it — the dual-level credit law's connection tier. The connection total is a running sum,
+    // so a later `forget_stream` of this completed stream does not un-count its bytes.
     self.flow.on_stream_consumed(stream_id, read_offset);
     bytes
   }
@@ -328,6 +361,10 @@ impl Connection {
     self.send_order.retain(|&id| id != stream_id);
     self.send_cursor = 0;
     self.recv_streams.remove(&stream_id);
+    // Forget the per-stream flow-control watermark too, so reusing this id starts fresh; the
+    // connection-wide consumed total is kept (its bytes stay counted, so the peer's credit never
+    // regresses). Leaving a stale watermark would stall a reused stream (its offsets fall below it).
+    self.flow.forget_stream(stream_id);
   }
 
   /// The next packet number this connection will assign — its packet-number cursor. Monotonic across
@@ -521,6 +558,113 @@ mod tests {
       );
     }
     assert_eq!(retransmits, 0, "nothing retransmitted with no loss");
+  }
+
+  /// Pumps sender→receiver, asserting the connection-wide never-whole-object bound (`Σ send ≤ Σ read +
+  /// window`) on every transmission and tracking the largest total in flight seen. Returns whether
+  /// anything was sent.
+  fn pump_bounded(
+    sender: &mut Connection,
+    receiver: &mut Connection,
+    channel: &mut Channel,
+    streams: &[(u64, Vec<u8>)],
+    window: u64,
+    peak: &mut u64,
+  ) -> bool {
+    let mut sent = false;
+    while let Some((pn, frames)) = sender.poll_transmit(FRAME_CAP) {
+      sent = true;
+      let total_sent: u64 = streams.iter().map(|(id, _)| sender.send_offset(*id)).sum();
+      let total_read: u64 = streams
+        .iter()
+        .map(|(id, _)| receiver.read_offset(*id))
+        .sum();
+      *peak = (*peak).max(total_sent - total_read);
+      assert!(
+        total_sent <= total_read + window,
+        "the connection raced {total_sent} > {total_read} + {window} ahead across all streams"
+      );
+      if !channel.drops() {
+        receiver.handle_incoming(pn, &frames);
+      }
+    }
+    sent
+  }
+
+  /// AC (§4.10a §8, the connection tier of the dual-level credit law): the connection-wide flow-control
+  /// window bounds the *total* unread bytes across all streams — so several streams that each fit inside
+  /// their own per-stream window cannot together race the connection more than one window ahead of the
+  /// reader. Each stream here is smaller than the per-stream window, so per-stream credit never blocks;
+  /// only the connection `MaxData` can bound the sum. Every byte still arrives.
+  #[test]
+  fn the_connection_window_bounds_total_in_flight_across_streams() {
+    let window = initial_receive_window(FRAME_CAP);
+    // Three streams of 20 bytes each: 20 < the per-stream window, so no stream is blocked on its own
+    // credit; the 60-byte total is more than the connection window, so `MaxData` must throttle it.
+    let streams: Vec<(u64, Vec<u8>)> = vec![
+      (1, stream_content(1, 20)),
+      (3, stream_content(2, 20)),
+      (7, stream_content(3, 20)),
+    ];
+    assert!(
+      (streams.len() as u64) * 20 > window && 20 < window,
+      "the total exceeds the connection window while each stream fits its per-stream window"
+    );
+
+    let mut sender = Connection::new(window);
+    for (id, content) in &streams {
+      sender.open(*id, content);
+    }
+    let mut receiver = Connection::new(window);
+    let mut received: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let mut channel = Channel::new(Vec::new());
+    let mut peak_in_flight = 0u64;
+
+    let mut guard = 0u64;
+    loop {
+      guard += 1;
+      assert!(guard < 1_000_000, "the connection must make progress");
+      // Pump sender→receiver, checking the connection-wide never-whole-object bound on every send.
+      let sent = pump_bounded(
+        &mut sender,
+        &mut receiver,
+        &mut channel,
+        &streams,
+        window,
+        &mut peak_in_flight,
+      );
+      for id in receiver.recv_stream_ids() {
+        received
+          .entry(id)
+          .or_default()
+          .extend(receiver.read_stream(id));
+      }
+      let acked = pump(&mut receiver, &mut sender, &mut channel, None);
+      let all_recv = streams
+        .iter()
+        .all(|(id, _)| receiver.recv_stream_complete(*id));
+      if sender.send_complete() && all_recv {
+        break;
+      }
+      if !(sent || acked) && !sender.probe() {
+        break;
+      }
+    }
+
+    for (id, content) in &streams {
+      assert_eq!(
+        received.get(id),
+        Some(content),
+        "stream {id} arrived exactly"
+      );
+    }
+    // Non-vacuity: the connection window was actually the binding constraint — the in-flight total
+    // reached within a frame of it (had `MaxData` not throttled, all 60 bytes would have been in flight
+    // at once, far past the window).
+    assert!(
+      peak_in_flight >= window - FRAME_CAP as u64,
+      "the connection window was never saturated ({peak_in_flight} < {window}), so the test proves nothing"
+    );
   }
 
   /// AC (§4.10a §8): a lone data packet that is dropped — a tail loss the reorder threshold cannot

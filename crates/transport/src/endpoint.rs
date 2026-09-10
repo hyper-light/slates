@@ -268,8 +268,11 @@ impl Endpoint {
     let mut received = Vec::new();
     loop {
       self.receive_into().await?;
-      self.flush()?;
+      // Drain *before* flushing: reading slides the flow-control window forward, and the flush that
+      // follows advertises credit reflecting what was just read. Flushing first would advertise a
+      // round-stale window and stall a transfer larger than one window at the window boundary.
       received.extend_from_slice(&self.conn.read_stream(stream_id));
+      self.flush()?;
       if self.conn.recv_stream_complete(stream_id) {
         self.conn.forget_stream(stream_id);
         return Ok(received);
@@ -295,8 +298,11 @@ impl Endpoint {
     self.conn.open(stream_id, request);
     let mut reply = Vec::new();
     loop {
-      self.flush()?;
+      // Drain the reply, then flush: the flush sends the request (opened above, still credited) and the
+      // acknowledgement whose piggybacked credit reflects the reply bytes just read — so a reply larger
+      // than one window keeps flowing. Flushing before the drain would advertise a round-stale window.
       reply.extend_from_slice(&self.conn.read_stream(stream_id));
+      self.flush()?;
       if self.conn.recv_stream_complete(stream_id) {
         self.conn.forget_stream(stream_id);
         return Ok(reply);
@@ -320,11 +326,14 @@ impl Endpoint {
     let mut request = Vec::new();
     let request_id = loop {
       self.receive_into().await?;
-      self.flush()?;
       let ids = self.conn.recv_stream_ids();
       for &id in &ids {
         request.extend_from_slice(&self.conn.read_stream(id));
       }
+      // Flush *after* draining, so the acknowledgement advertises credit that reflects what was just
+      // read — draining slides the flow-control window, and advertising before it would lag a round and
+      // stall a request larger than one window at the window boundary (also carries the final ACK).
+      self.flush()?;
       if let Some(id) = ids
         .into_iter()
         .find(|&id| self.conn.recv_stream_complete(id))
