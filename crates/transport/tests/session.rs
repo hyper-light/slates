@@ -333,3 +333,88 @@ fn repeated_exchanges_never_reuse_packet_numbers() {
     other => panic!("repeated exchanges did not keep packet numbers monotonic: {other:?}"),
   }
 }
+
+/// A server built by `Endpoint::accept` learns its peer from the first datagram — it is **not** told the
+/// client's address in advance (only the client is told the server's published address, as a fleet node
+/// advertises its socket) — and still completes the handshake and replies. This is the accept-from-unknown
+/// a fleet node needs: a peer dials its advertised socket from an address chosen at dial time. Mutual TLS
+/// still gates the handshake (`allowed_clients`). Non-vacuous: the server never received the client's
+/// port, so if `accept` did not adopt the first datagram's source the reply would go to the placeholder
+/// (the server's own address) and never reach the client — the reply arriving is the proof it was learned.
+#[test]
+fn an_accepted_server_learns_its_peer_and_replies() {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+
+  let request: Vec<u8> = (0..300u16)
+    .map(|i| u8::try_from(i % 251).unwrap_or(0))
+    .collect();
+  // The reply the server computes: every byte + 9, a transform so a crossed or echoed reply would show.
+  let expected_reply: Vec<u8> = request.iter().map(|b| b.wrapping_add(9)).collect();
+  let server_identity = self_signed(NAME);
+  let client_identity = self_signed(NAME);
+  let server_cert = server_identity.certificate();
+  let client_cert = client_identity.certificate();
+
+  // Only the server's port is published; the client's address is never sent to the server — it learns it.
+  let (server_port_tx, server_port_rx) = channel();
+  let (result_tx, result_rx) = channel();
+
+  // The server: accept (no peer known in advance), handshake, serve one request.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = server_port_tx.send(socket.local_addr().unwrap().port());
+      let mut server = Endpoint::accept(
+        socket,
+        &server_identity,
+        std::slice::from_ref(&client_cert),
+        FRAME_CAP,
+      )
+      .unwrap();
+      server.establish().await.unwrap();
+      server
+        .serve_once(|req| req.iter().map(|b| b.wrapping_add(9)).collect())
+        .await
+        .unwrap();
+    })
+    .unwrap();
+
+  // The client: dial the server's published port from its own address, handshake, request.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let server_port = recv_port(server_port_rx).await;
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+      let outcome = async {
+        let mut client = Endpoint::client(
+          socket,
+          peer,
+          &client_identity,
+          &server_cert,
+          NAME,
+          FRAME_CAP,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        client.establish().await.map_err(|e| format!("{e:?}"))?;
+        let reply = client
+          .request(STREAM_ID, &request)
+          .await
+          .map_err(|e| format!("{e:?}"))?;
+        Ok::<_, String>(reply)
+      }
+      .await;
+      let _ = result_tx.send(outcome);
+    })
+    .unwrap();
+
+  sim.run_until_idle();
+
+  match result_rx.try_recv() {
+    Ok(Ok(reply)) => assert_eq!(
+      reply, expected_reply,
+      "the accepted server learned its peer from the first datagram and replied over that session"
+    ),
+    other => panic!("the accept-from-unknown exchange did not complete: {other:?}"),
+  }
+}

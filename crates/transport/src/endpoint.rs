@@ -138,6 +138,12 @@ pub struct Endpoint {
   /// The send time of each ack-eliciting packet still awaiting acknowledgement, keyed by packet number,
   /// for the RTT sample. Pruned as packets are acknowledged, so it stays within the in-flight window.
   send_times: BTreeMap<u64, Instant>,
+  /// Whether this endpoint learns its peer address from the first datagram it receives. A server created
+  /// by [`accept`](Endpoint::accept) does not know the client's address until the client dials it, so the
+  /// first `recv_from` in [`establish`](Endpoint::establish) adopts that source as the peer; a `client` or
+  /// `server` built with a known peer has this `false` and keeps its pinned peer. Mutual TLS still gates
+  /// who may complete the handshake (`allowed_clients`), so adopting the source is not a trust decision.
+  learn_peer: bool,
 }
 
 impl Endpoint {
@@ -162,6 +168,7 @@ impl Endpoint {
       frame_cap,
       rtt: RttEstimator::new(),
       send_times: BTreeMap::new(),
+      learn_peer: false,
     })
   }
 
@@ -186,6 +193,39 @@ impl Endpoint {
       frame_cap,
       rtt: RttEstimator::new(),
       send_times: BTreeMap::new(),
+      learn_peer: false,
+    })
+  }
+
+  /// A server end that **accepts a client without knowing its address in advance** — the counterpart of
+  /// [`server`](Endpoint::server) for a fleet node whose one advertised socket a peer dials from an
+  /// address chosen at dial time (§4.8; the fleet transport). It presents `identity` and requires a client
+  /// certificate among `allowed_clients` (mutual authentication — the same trust `server` enforces, so an
+  /// unauthorised dialer's handshake fails), and adopts the source of the first datagram it receives as
+  /// its peer (`learn_peer`). One accepted `socket` serves one peer; a node accepting *several* peers on
+  /// one socket needs the connection-ID demux the endpoint marks owed. The caller drives
+  /// [`establish`](Endpoint::establish) as usual; it learns the peer on the first receive.
+  pub fn accept(
+    socket: UdpSocket,
+    identity: &Identity,
+    allowed_clients: &[rustls::pki_types::CertificateDer<'static>],
+    frame_cap: usize,
+  ) -> Result<Endpoint, EndpointError> {
+    let server = server_connection(identity, allowed_clients).map_err(EndpointError::Handshake)?;
+    // A harmless placeholder until the first datagram's source is adopted: the socket's own address,
+    // which is never sent to (the first send follows the first receive, which sets the real peer).
+    let peer = socket.local_addr().map_err(EndpointError::Io)?;
+    Ok(Endpoint {
+      socket,
+      peer,
+      quic: Quic::Server(server),
+      keys: None,
+      conn: Connection::new(initial_receive_window(frame_cap)),
+      rx_largest: 0,
+      frame_cap,
+      rtt: RttEstimator::new(),
+      send_times: BTreeMap::new(),
+      learn_peer: true,
     })
   }
 
@@ -224,7 +264,14 @@ impl Endpoint {
       if !self.quic.is_handshaking() && self.keys.is_some() {
         return Ok(());
       }
-      let (n, _from) = self.socket.recv_from(&mut buf).await?;
+      let (n, from) = self.socket.recv_from(&mut buf).await?;
+      // A server built by `accept` adopts the source of the first datagram it hears as its peer, so its
+      // reply (drained and sent on the next turn) reaches the client that dialed it. Only the first
+      // receive sets it; thereafter the peer is pinned.
+      if self.learn_peer {
+        self.peer = from;
+        self.learn_peer = false;
+      }
       self.quic.read_hs(&buf[..n])?;
     }
     Err(EndpointError::NotReady)
