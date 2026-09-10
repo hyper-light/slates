@@ -6,15 +6,22 @@
 //! dedups the retransmit. A `reliable_delivery_survives_loss` test composes this with the stream
 //! send/receive sides over a lossy channel and shows every byte arrives.
 //!
-//! Owed (the rest of the connection): multi-range ACKs (this acks the top contiguous run — correct,
-//! just retransmits a received-but-below-a-gap packet, which dedups), timer-based tail-loss recovery
-//! (this detects loss only by the packet-reorder threshold, so a purely-tail drop needs the timer
-//! QUIC adds — the loop here keeps sending until in-flight drains), congestion control, and the
-//! packet header + `rustls::quic` record protection that wraps these frames on the wire.
+//! The ACK is multi-range (RFC 9000 §19.3): [`AckGenerator`] reports every contiguous run of received
+//! packet numbers — so a packet received below a gap is acknowledged rather than left to a spurious
+//! retransmission — up to a frame-size budget, and [`SentTracker::on_ack_frame`] frees every
+//! acknowledged run. The emitted ACK *frame* is bounded by that budget; safely bounding the received
+//! *set* is owed, because forgetting a received packet needs an ACK-of-ACK (RFC 9000 §13.2.4) this
+//! dialect does not yet carry (see [`AckGenerator`]).
+//!
+//! Owed (the rest of the connection): timer-based tail-loss recovery (this detects loss only by the
+//! packet-reorder threshold, so a purely-tail drop needs the timer QUIC adds — the loop here keeps
+//! sending until in-flight drains, and [`SentTracker::probe_oldest`] is that recovery's mechanism), and
+//! the packet header + `rustls::quic` record protection that wraps these frames on the wire.
+//! Congestion control is built ([`crate::congestion`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::session::Frame;
+use crate::session::{AckRange, Frame};
 
 /// Format: RFC 9002 §6.1.1 `kPacketThreshold` — three packets of reordering are tolerated before a
 /// gap below the largest acknowledged packet declares the missing packets lost. A protocol constant,
@@ -22,7 +29,15 @@ use crate::session::Frame;
 /// window of at least this many packets past a loss lets the gap form).
 pub const REORDER_THRESHOLD: u64 = 3;
 
-/// Receive-side acknowledgement state: which packet numbers have arrived, and the ACK to send back.
+/// Receive-side acknowledgement state: which packet numbers have arrived, and the multi-range ACK to
+/// send back.
+///
+/// The `received` set is not yet pruned: safely forgetting a received packet needs to know the peer
+/// has seen an acknowledgement covering it (an acknowledgement of one of our ACK-bearing packets — RFC
+/// 9000 §13.2.4's ACK-of-ACK), which this dialect does not yet carry. A fixed-window prune is *unsafe*
+/// — an aggregated ACK would stop covering older packets the sender still has in flight, and the sender
+/// would declare them lost — so bounding this set is owed together with connection-level `MaxData` and
+/// ACK-of-ACK. The emitted ACK *frame* is bounded regardless (see [`AckGenerator::ack_frame`]).
 #[derive(Debug, Default)]
 pub struct AckGenerator {
   received: BTreeSet<u64>,
@@ -39,16 +54,49 @@ impl AckGenerator {
     self.received.insert(pn);
   }
 
-  /// The ACK for the top contiguous run of received packet numbers, or `None` if none received.
-  /// Single-range (multi-range gaps are owed): correct — the sender retransmits a received-but-below-
-  /// a-gap packet, which the receiver dedups — just less efficient than acknowledging every range.
-  pub fn ack_frame(&self) -> Option<Frame> {
-    let largest = *self.received.iter().next_back()?;
-    let mut range = 0u64;
-    while range < largest && self.received.contains(&(largest - range - 1)) {
-      range += 1;
+  /// The multi-range ACK for the received packets (RFC 9000 §19.3), or `None` if none received: the
+  /// highest contiguous run as `(largest, range)`, then each further run below it as an [`AckRange`]
+  /// gap/length relative to the previous run (RFC 9000 §19.3.1), so a packet received below a gap is
+  /// acknowledged too — not left to a spurious retransmission. `max_ranges` bounds the additional
+  /// ranges so the frame fits its size budget; runs beyond it are simply not acknowledged here and the
+  /// sender retransmits them (the receiver dedups), which is the single-range fallback this replaces.
+  pub fn ack_frame(&self, max_ranges: usize) -> Option<Frame> {
+    if self.received.is_empty() {
+      return None;
     }
-    Some(Frame::Ack { largest, range })
+    // Collect contiguous runs as (high, low) inclusive, in descending order of packet number, stopping
+    // once the range budget is reached (the highest runs — the sender's most recent activity — first).
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for &pn in self.received.iter().rev() {
+      match runs.last_mut() {
+        Some((_, low)) if *low == pn + 1 => *low = pn, // contiguous: extend the current run downward
+        _ => {
+          if runs.len() > max_ranges {
+            break; // one first range plus `max_ranges` additional; older runs fall back to retransmit
+          }
+          runs.push((pn, pn)); // a gap: start a new run
+        }
+      }
+    }
+    let (largest, first_low) = runs[0];
+    let range = largest - first_low;
+    // Each further run below the first: the count of unacknowledged packets since the previous run's
+    // low, then this run's length, both minus one (RFC 9000 §19.3.1). Consecutive runs are separated
+    // by at least one unacknowledged packet, so `prev_low - high >= 2` and neither subtraction wraps.
+    let mut ranges = Vec::new();
+    let mut prev_low = first_low;
+    for &(high, low) in &runs[1..] {
+      ranges.push(AckRange {
+        gap: prev_low - high - 2,
+        len: high - low,
+      });
+      prev_low = low;
+    }
+    Some(Frame::Ack {
+      largest,
+      range,
+      ranges,
+    })
   }
 }
 
@@ -131,6 +179,24 @@ impl SentTracker {
     bytes
   }
 
+  /// Processes a whole ACK frame: its first range `[largest - range, largest]`, then each additional
+  /// range below it (RFC 9000 §19.3.1), freeing every acknowledged packet from flight. Returns the
+  /// total stream-data bytes newly acknowledged (for the congestion controller). Decoding each
+  /// additional range relative to the previous run's low: `high = prev_low - gap - 2`, `low =
+  /// high - len`. Saturating arithmetic means a malformed range from a hostile peer can only
+  /// under-acknowledge (a packet not in flight frees nothing), never panic or free the wrong packet.
+  pub fn on_ack_frame(&mut self, largest: u64, range: u64, ranges: &[AckRange]) -> u64 {
+    let mut bytes = self.on_ack(largest, range);
+    let mut prev_low = largest.saturating_sub(range);
+    for r in ranges {
+      let high = prev_low.saturating_sub(r.gap).saturating_sub(2);
+      let low = high.saturating_sub(r.len);
+      bytes = bytes.saturating_add(self.on_ack(high, high.saturating_sub(low)));
+      prev_low = low;
+    }
+    bytes
+  }
+
   /// Removes and returns the frames of packets now declared lost — in flight and at least the
   /// reorder threshold below the largest acknowledged packet (a gap that persisted past reordering) —
   /// with the largest lost packet number (for the congestion recovery-period guard). Retransmit the
@@ -188,28 +254,111 @@ mod tests {
   use super::*;
   use crate::stream::{StreamAssembler, StreamSender};
 
-  /// The ACK covers the top contiguous run and stops at a gap.
+  /// Shape: an additional-range budget larger than any gap these small tests create, so the ACK
+  /// reports every run (the cap itself is exercised by `the_ack_range_budget_bounds_the_frame`).
+  const AMPLE_RANGES: usize = 8;
+
+  /// The ACK reports *every* contiguous run of received packet numbers as multiple ranges (RFC 9000
+  /// §19.3), so a packet received below a gap is acknowledged, not only the top run.
   #[test]
-  fn the_ack_covers_the_top_contiguous_run() {
+  fn the_ack_reports_every_received_run() {
     let mut acks = AckGenerator::new();
     for pn in [0u64, 1, 2, 4, 5] {
       acks.record(pn);
     }
-    // Received {0,1,2,4,5}: the top run is [4,5] (a gap at 3), so largest 5, range 1.
+    // Received {0,1,2,4,5}: top run [4,5] → largest 5, range 1; then run [0,2] below the gap at 3 →
+    // one unacknowledged packet (3) so gap 0, three acknowledged (0,1,2) so len 2.
     assert_eq!(
-      acks.ack_frame(),
+      acks.ack_frame(AMPLE_RANGES),
       Some(Frame::Ack {
         largest: 5,
-        range: 1
+        range: 1,
+        ranges: vec![AckRange { gap: 0, len: 2 }],
       })
     );
-    acks.record(3); // filling the gap joins the runs: [0..=5].
+    acks.record(3); // filling the gap joins the runs: [0..=5], a single range.
     assert_eq!(
-      acks.ack_frame(),
+      acks.ack_frame(AMPLE_RANGES),
       Some(Frame::Ack {
         largest: 5,
-        range: 5
+        range: 5,
+        ranges: vec![],
       })
+    );
+  }
+
+  /// The additional-range budget bounds the ACK frame: with more gaps than the budget allows, only the
+  /// first range plus `max_ranges` further runs are reported (the highest, most-recent ones); older
+  /// runs are left for the sender to retransmit-and-dedup (the single-range fallback this generalizes).
+  #[test]
+  fn the_ack_range_budget_bounds_the_frame() {
+    let mut acks = AckGenerator::new();
+    // Received every even packet 0..=10: runs {10},{8},{6},{4},{2},{0} — six singleton runs.
+    for pn in [0u64, 2, 4, 6, 8, 10] {
+      acks.record(pn);
+    }
+    // A budget of 2 additional ranges reports the top run plus the next two below it: {10},{8},{6}.
+    let ack = acks.ack_frame(2).expect("an ACK is owed");
+    let Frame::Ack {
+      largest,
+      range,
+      ranges,
+    } = ack
+    else {
+      panic!("an ACK frame");
+    };
+    assert_eq!((largest, range), (10, 0), "top run is the singleton {{10}}");
+    assert_eq!(
+      ranges.len(),
+      2,
+      "only two additional ranges within the budget"
+    );
+    // Each further even singleton is one unacknowledged packet below the last (gap 0, len 0): {8},{6}.
+    assert_eq!(
+      ranges,
+      vec![AckRange { gap: 0, len: 0 }, AckRange { gap: 0, len: 0 }]
+    );
+  }
+
+  /// A multi-range ACK frees every acknowledged run from flight, across the gaps — not just the top
+  /// run (the round-trip of `AckGenerator::ack_frame` through `SentTracker::on_ack_frame`).
+  #[test]
+  fn a_multi_range_ack_frees_every_run() {
+    let mut sent = SentTracker::new();
+    for pn in 0..6 {
+      assert_eq!(sent.next_pn(), pn);
+      sent.on_sent(
+        pn,
+        vec![Frame::Stream {
+          stream_id: 1,
+          offset: pn,
+          fin: false,
+          data: vec![0u8],
+        }],
+      );
+    }
+    // Received {0,1,2,4,5} (packet 3 dropped): the generator's ACK acknowledges both runs.
+    let mut acks = AckGenerator::new();
+    for pn in [0u64, 1, 2, 4, 5] {
+      acks.record(pn);
+    }
+    let Some(Frame::Ack {
+      largest,
+      range,
+      ranges,
+    }) = acks.ack_frame(AMPLE_RANGES)
+    else {
+      panic!("an ACK is owed");
+    };
+    let bytes = sent.on_ack_frame(largest, range, &ranges);
+    assert_eq!(
+      bytes, 5,
+      "five 1-byte stream packets acknowledged across the gap"
+    );
+    assert_eq!(
+      sent.in_flight_count(),
+      1,
+      "only packet 3 (never received) stays in flight"
     );
   }
 
@@ -287,8 +436,13 @@ mod tests {
       }
     }
     received.extend_from_slice(&assembler.read());
-    if let Some(Frame::Ack { largest, range }) = acks.ack_frame() {
-      sent.on_ack(largest, range);
+    if let Some(Frame::Ack {
+      largest,
+      range,
+      ranges,
+    }) = acks.ack_frame(AMPLE_RANGES)
+    {
+      sent.on_ack_frame(largest, range, &ranges);
     }
   }
 

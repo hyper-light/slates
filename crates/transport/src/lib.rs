@@ -254,6 +254,13 @@ impl<'a> Reader<'a> {
     Ok(self.bytes(size_of::<u8>())?[0])
   }
 
+  pub(crate) fn u16(&mut self) -> Result<u16, FrameError> {
+    let b = self.bytes(size_of::<u16>())?;
+    let mut word = [0u8; size_of::<u16>()];
+    word.copy_from_slice(b);
+    Ok(u16::from_le_bytes(word))
+  }
+
   pub(crate) fn u32(&mut self) -> Result<u32, FrameError> {
     let b = self.bytes(size_of::<u32>())?;
     let mut word = [0u8; size_of::<u32>()];

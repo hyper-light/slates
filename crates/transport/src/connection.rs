@@ -83,6 +83,10 @@ impl Connection {
   /// A fresh connection with no streams yet, advertising `window_ahead` bytes of receive credit ahead
   /// of each stream's read cursor (see [`initial_receive_window`]).
   pub fn new(window_ahead: u64) -> Connection {
+    // The congestion window counts in max-datagram units. This dialect sends one frame per packet, so
+    // the max datagram is the connection's frame cap, which the receive window is `REORDER_THRESHOLD +
+    // 1` of (see `initial_receive_window`); recover it from `window_ahead` so `new` keeps one argument.
+    let max_datagram = window_ahead / (REORDER_THRESHOLD + 1);
     Connection {
       send_streams: BTreeMap::new(),
       send_order: Vec::new(),
@@ -95,11 +99,18 @@ impl Connection {
       window_ahead,
       ack_owed: false,
       retransmitted: 0,
-      // The congestion window counts in max-datagram units. This dialect sends one frame per packet, so
-      // the max datagram is the connection's frame cap, which the receive window is `REORDER_THRESHOLD +
-      // 1` of (see `initial_receive_window`); recover it from `window_ahead` so `new` keeps one argument.
-      congestion: Congestion::new(window_ahead / (REORDER_THRESHOLD + 1)),
+      congestion: Congestion::new(max_datagram),
     }
+  }
+
+  /// The most additional ACK ranges the acknowledgement frame may carry (RFC 9000 §19.3.1), derived so
+  /// the whole ACK fits one `max_frame_len`-byte frame: the frame cap, less the ACK header (kind byte,
+  /// largest, first range, range count), over the bytes each additional range costs (a gap and a
+  /// length). Beyond it, older received runs are retransmitted and deduped rather than acknowledged.
+  fn max_ack_ranges(max_frame_len: usize) -> usize {
+    let header = size_of::<u8>() + size_of::<u64>() + size_of::<u64>() + size_of::<u16>();
+    let per_range = size_of::<u64>() + size_of::<u64>();
+    max_frame_len.saturating_sub(header) / per_range.max(1)
   }
 
   /// Opens send stream `stream_id` carrying the whole of `data`, and finishes it. The send side starts
@@ -139,7 +150,7 @@ impl Connection {
       frames.push(frame);
     }
     if self.ack_owed
-      && let Some(ack) = self.acks.ack_frame()
+      && let Some(ack) = self.acks.ack_frame(Self::max_ack_ranges(max_frame_len))
     {
       frames.push(ack);
       // Piggyback each received stream's current credit on the acknowledgement, so a lost credit frame
@@ -211,8 +222,12 @@ impl Connection {
           assembler.grant_window(window);
           let _ = assembler.offer(*offset, data, *fin);
         }
-        Frame::Ack { largest, range } => {
-          let acked = self.sent.on_ack(*largest, *range);
+        Frame::Ack {
+          largest,
+          range,
+          ranges,
+        } => {
+          let acked = self.sent.on_ack_frame(*largest, *range, ranges);
           self.congestion.on_ack(acked);
         }
         // The peer's advertised send credit for one stream: raise that stream's send ceiling (monotonic).

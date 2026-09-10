@@ -43,6 +43,19 @@ impl std::fmt::Display for SessionError {
 
 impl std::error::Error for SessionError {}
 
+/// One additional ACK Range below an ACK frame's first range (RFC 9000 §19.3.1), encoded relative to
+/// the previous (higher) range. `gap` acknowledges nothing — it is the count of contiguous
+/// unacknowledged packets between this run and the previous one, minus one; `len` is the count of
+/// contiguous acknowledged packets in this run, minus one. So if the previous run's smallest
+/// acknowledged packet number is `s`, this run acknowledges `[s - gap - 2 - len, s - gap - 2]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AckRange {
+  /// The count of contiguous unacknowledged packets before this run, minus one ("Gap").
+  pub gap: u64,
+  /// The count of contiguous acknowledged packets in this run, minus one ("ACK Range Length").
+  pub len: u64,
+}
+
 /// One session-plane frame — the payload of a TLS-1.3-protected packet is a sequence of these.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Frame {
@@ -57,12 +70,17 @@ pub enum Frame {
     /// The stream bytes at `offset`.
     data: Vec<u8>,
   },
-  /// Acknowledges the contiguous packet-number range `[largest - range, largest]`.
+  /// Acknowledges received packets (RFC 9000 §19.3): the first (highest) run is
+  /// `[largest - range, largest]`, and each entry of `ranges` is a further run below it, encoded
+  /// relative to the previous one (RFC 9000 §19.3.1). Multi-range, so a packet received *below* a gap
+  /// is acknowledged too — not left for the sender to retransmit spuriously.
   Ack {
     /// The largest packet number acknowledged.
     largest: u64,
-    /// How many packet numbers below `largest` are also acknowledged.
+    /// How many packet numbers below `largest` are also acknowledged (the "First ACK Range").
     range: u64,
+    /// Further acknowledged runs below the first, each relative to the previous (RFC 9000 §19.3.1).
+    ranges: Vec<AckRange>,
   },
   /// The connection's absolute flow-control credit (bytes the peer may send across all streams).
   MaxData {
@@ -113,10 +131,23 @@ impl Frame {
         out.extend_from_slice(&u32::try_from(data.len()).unwrap_or(u32::MAX).to_le_bytes());
         out.extend_from_slice(data);
       }
-      Frame::Ack { largest, range } => {
+      Frame::Ack {
+        largest,
+        range,
+        ranges,
+      } => {
         out.push(KIND_ACK);
         out.extend_from_slice(&largest.to_le_bytes());
         out.extend_from_slice(&range.to_le_bytes());
+        // The additional-range count is a u16. The generator bounds the ranges to a frame-size budget
+        // (far below u16::MAX), so the wire cap is never the binding limit; `take` keeps the written
+        // count and body consistent even for a hand-built oversize frame.
+        let count = u16::try_from(ranges.len()).unwrap_or(u16::MAX);
+        out.extend_from_slice(&count.to_le_bytes());
+        for r in ranges.iter().take(usize::from(count)) {
+          out.extend_from_slice(&r.gap.to_le_bytes());
+          out.extend_from_slice(&r.len.to_le_bytes());
+        }
       }
       Frame::MaxData { max } => {
         out.push(KIND_MAX_DATA);
@@ -172,10 +203,25 @@ pub fn decode_frames(bytes: &[u8]) -> Result<Vec<Frame>, SessionError> {
           data,
         }
       }
-      KIND_ACK => Frame::Ack {
-        largest: reader.u64().map_err(|_| SessionError::Truncated)?,
-        range: reader.u64().map_err(|_| SessionError::Truncated)?,
-      },
+      KIND_ACK => {
+        let largest = reader.u64().map_err(|_| SessionError::Truncated)?;
+        let range = reader.u64().map_err(|_| SessionError::Truncated)?;
+        let count = reader.u16().map_err(|_| SessionError::Truncated)?;
+        // Read exactly `count` ranges. Each `u64` is bounds-checked against the remaining input and
+        // nothing is pre-sized to `count`, so a hostile count truncates within the packet rather than
+        // allocating past it (the parser-checks-length-before-reading discipline of this decoder).
+        let mut ranges = Vec::new();
+        for _ in 0..count {
+          let gap = reader.u64().map_err(|_| SessionError::Truncated)?;
+          let len = reader.u64().map_err(|_| SessionError::Truncated)?;
+          ranges.push(AckRange { gap, len });
+        }
+        Frame::Ack {
+          largest,
+          range,
+          ranges,
+        }
+      }
       KIND_MAX_DATA => Frame::MaxData {
         max: reader.u64().map_err(|_| SessionError::Truncated)?,
       },
@@ -205,6 +251,7 @@ mod tests {
       Frame::Ack {
         largest: 42,
         range: 7,
+        ranges: vec![AckRange { gap: 0, len: 2 }, AckRange { gap: 4, len: 0 }],
       },
       Frame::MaxData { max: 1 << 20 },
       Frame::MaxStreamData {
@@ -273,6 +320,30 @@ mod tests {
     let mut wild = good.clone();
     let len_at = 1 + size_of::<u64>() + size_of::<u64>() + size_of::<u8>();
     wild[len_at..len_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(decode_frames(&wild), Err(SessionError::Truncated));
+  }
+
+  /// A multi-range ACK round-trips exactly, and a hostile ACK that claims more ranges than its bytes
+  /// carry is a typed truncation, never an over-allocation or a panic (RFC 9000 §19.3.1).
+  #[test]
+  fn a_multi_range_ack_round_trips_and_a_wild_count_truncates() {
+    let ack = Frame::Ack {
+      largest: 1000,
+      range: 3,
+      ranges: vec![
+        AckRange { gap: 1, len: 4 },
+        AckRange { gap: 0, len: 0 },
+        AckRange { gap: 9, len: 2 },
+      ],
+    };
+    let wire = encode_frames(std::slice::from_ref(&ack));
+    assert_eq!(decode_frames(&wire), Ok(vec![ack]));
+
+    // Overwrite the u16 range count (at kind(1) + largest(8) + range(8)) with u16::MAX: the decoder
+    // must exhaust the input reading ranges and refuse, not allocate a huge vector.
+    let mut wild = wire.clone();
+    let count_at = 1 + size_of::<u64>() + size_of::<u64>();
+    wild[count_at..count_at + size_of::<u16>()].copy_from_slice(&u16::MAX.to_le_bytes());
     assert_eq!(decode_frames(&wild), Err(SessionError::Truncated));
   }
 }

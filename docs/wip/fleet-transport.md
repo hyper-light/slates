@@ -177,8 +177,17 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    to end — the window rises on acks and falls on a detected loss while the stream still arrives exactly.
    Only the empirical *tuning* is owed to the fleet's measurement work (the initial-window constant, CUBIC
    vs Reno, pacing, ECN, an RTT-derived probe timeout — all need a real network).
-   **Owed on the connection:** a real probe timeout, connection-level `MaxData`, multi-range ACKs,
-   connection IDs, several frames per packet (an MTU budget), and loom on the state machine.
+   **Multi-range ACKs are now built** (`conn.rs`, RFC 9000 §19.3): the receiver reports *every* contiguous
+   run of received packet numbers — the highest run as `(largest, first-range)`, each further run below a
+   gap as a §19.3.1 gap/length `AckRange` — so a packet received below a gap is acknowledged rather than
+   left to a spurious retransmission, and `SentTracker::on_ack_frame` frees every acknowledged run. The
+   emitted ACK *frame* is bounded to a derived per-frame range budget (older runs fall back to
+   retransmit-and-dedup); bounding the receiver's *set* of received packet numbers is owed with ACK-of-ACK
+   (RFC 9000 §13.2.4), which this dialect does not yet carry (a fixed-window prune is unsafe — an
+   aggregated ACK would stop covering packets the sender still has in flight).
+   **Owed on the connection:** a real probe timeout, connection-level `MaxData` (only per-stream
+   `MaxStreamData` is enforced), ACK-of-ACK (to bound the received set), connection IDs, several frames per
+   packet (an MTU budget), and loom on the state machine.
    The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c); its
    fencing step rides membership. The **`Keyring`'s population is built** (`enrollment.rs`, slice 6):
    `Enrollment::from_membership` turns an admitted-membership record (the shared control secret + the
@@ -301,16 +310,17 @@ peer grants, at most a frame cap per frame (the never-whole-object-in-credit inv
 send), and a `send_and_receive_round_trip` test proves the two sides compose into reliable ordered
 delivery. An offer past the window is a typed refusal.
 **Built (slice 4c):** the reliability core (`conn.rs`) — packet-number assignment, ACK generation
-(receive side: the top contiguous run), and ACK processing with loss detection (send side: free the
-acknowledged, declare a gap lost past the RFC 9002 reorder threshold, retransmit its frames), proven
+(receive side: every contiguous run, multi-range per RFC 9000 §19.3, up to a per-frame range budget),
+and ACK processing with loss detection (send side: free every acknowledged run, declare a gap lost past
+the RFC 9002 reorder threshold, retransmit its frames), proven
 by a `reliable_delivery_survives_loss` test that drops a packet and shows the whole stream still
 arrives once each (the assembler dedups the retransmit). **Built (slice 4e):** the **TLS 1.3
 handshake over `rustls::quic`** (`handshake.rs`) — a node authenticates with its enrolled identity as
 a **pinned certificate** (no CA PKI), the client↔server handshake completing over the `quic`
 `read_hs`/`write_hs` interface and negotiating TLS 1.3, with a test that a **wrong pin is rejected**
 (authenticated, not permissive). `rustls` uses the `ring` provider (no cmake); its config `Arc` is
-D-8's sanctioned exception. **Owed:** multi-range ACKs, timer-based tail-loss recovery, congestion
-control, the credit accounting that *sets* the window from the peer's `MaxStreamData`, and the
+D-8's sanctioned exception. **Owed:** timer-based tail-loss recovery, ACK-of-ACK (to bound the received
+set), connection-level `MaxData`, the credit accounting that *sets* the window from the peer's `MaxStreamData`, and the
 `Connection` that wires streams+reliability+flow+handshake+record-protection onto the `rt` UDP driver
 (the control plane's `accept`/seal are the datagram-plane analogue already wired). CRYPTO frames are
 `rustls::quic`'s, not ours; the handshake keys drive the record protection (owed with the wiring).
