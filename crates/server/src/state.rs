@@ -203,6 +203,15 @@ pub struct ShardState {
   /// carried the message. The acceptor's authority owner is the socket's TLS-authenticated peer, so a
   /// record whose owner field is not that peer is refused. Empty on a laptop (no fleet loop runs).
   pub holder_records: BTreeMap<ObjectId, Acceptor>,
+  /// The objects this node must **take over** — an owner died and rendezvous ranked this node first among
+  /// the survivors for the object (§4.8 "Promotion and takeover"), recorded here by the probe loop
+  /// ([`crate::fleet::probe_peer`] via `sync_peer`) for the record-ship task to drive: it promotes the
+  /// object's head over the surviving candidate holders (phase one, adopting the newest committed record),
+  /// re-commits the adopted head under the new epoch, and records the placement — then removes the object.
+  /// An object stays until its takeover places (the drive retries each period, self-healing across the
+  /// window while every survivor brings its holds' authority into step). Empty on a laptop (no fleet loop
+  /// runs) and whenever no takeover is outstanding.
+  pub pending_takeovers: std::collections::BTreeSet<ObjectId>,
 }
 
 /// A work volume's accumulated declared operations (§4.16), composed into an increment on submit.

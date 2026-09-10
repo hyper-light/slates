@@ -215,6 +215,19 @@ impl CommitBudget {
       self.max_extensions,
     )
   }
+
+  /// The longest the collection loop can wait under this budget — the base deadline plus every extension it
+  /// may grant. A dispatch task bounds its own wait ([`request_within`]) by this, so it hands its holder's
+  /// session back no later than the loop stops waiting for it, and a reply arriving during a granted
+  /// extension is still received rather than cut off at the base deadline. At the [`hard`](CommitBudget::hard)
+  /// degenerate (no extensions) this is exactly the base deadline.
+  fn max_deadline_ns(&self) -> u64 {
+    self.deadline_ns.saturating_add(
+      self
+        .extension_ns
+        .saturating_mul(u64::from(self.max_extensions)),
+    )
+  }
 }
 
 /// The dispatch collection loop's wait-and-decide step (§4.8 "late work"), shared by the commit
@@ -269,6 +282,41 @@ impl DispatchWait {
 /// longer a message: it is the collection loop's own progress-extension decision ([`DispatchWait`]), so a
 /// report is always a holder's reply.
 struct Reply(HostId, Vec<u8>, Box<Endpoint>);
+
+/// Runs one request/reply on `endpoint` (its `request`), racing it against `deadline_ns`, and returns the
+/// reply bytes (empty on a timeout or a transport error) **together with the endpoint, kept whatever the
+/// outcome**. This is what lets a dispatch task *always* hand its holder's session back to the collection
+/// loop — a straggler that never replies still returns its endpoint at the deadline rather than blocking
+/// until it is cancelled and its session dropped. A dropped session cannot be re-established in the
+/// per-peer-socket mesh (`Endpoint::accept` pins one source), so keeping it is what lets the caller retry a
+/// load-timed-out commit or promotion over the same warm session instead of stranding the object
+/// (`docs/bugs/2026-09-10-swim-stale-ack.md` records the same discipline for the SWIM probe). The deadline
+/// is the collection loop's own bound — its full progress-extended span
+/// ([`CommitBudget::max_deadline_ns`]) — so a reply that arrives while the loop is still extending is not
+/// cut off early.
+async fn request_within(
+  mut endpoint: Endpoint,
+  stream_id: u64,
+  request: &[u8],
+  deadline_ns: u64,
+) -> (Vec<u8>, Endpoint) {
+  let reply = {
+    let mut exchange = std::pin::pin!(endpoint.request(stream_id, request));
+    let mut timer = std::pin::pin!(sleep(deadline_ns));
+    std::future::poll_fn(|cx| {
+      // Prefer a delivered reply over the deadline when both are ready.
+      if let std::task::Poll::Ready(result) = std::future::Future::poll(exchange.as_mut(), cx) {
+        return std::task::Poll::Ready(result.ok());
+      }
+      if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
+        return std::task::Poll::Ready(None);
+      }
+      std::task::Poll::Pending
+    })
+    .await
+  };
+  (reply.unwrap_or_default(), endpoint)
+}
 
 /// Whether `acked` (distinct candidates) commits under `quorum` for `candidates`.
 fn is_placed(candidates: &[HostId], acked: &[HostId], quorum: Quorum) -> bool {
@@ -383,15 +431,16 @@ pub async fn commit_record(
   // this task, so they are cancelled if this future is dropped (no orphans).
   let (tx, rx) = channel::<Reply>();
   let record_bytes = record.encode();
+  let deadline_ns = budget.max_deadline_ns();
   let mut tasks = Vec::new();
-  for (host, mut endpoint) in remote_holders {
+  for (host, endpoint) in remote_holders {
     let tx = tx.clone();
     let bytes = record_bytes.clone();
     let spawned = spawn_child(async move {
-      let reply = endpoint
-        .request(RECORD_STREAM, &bytes)
-        .await
-        .unwrap_or_default();
+      // Bounded by the collection loop's full span, and hands the endpoint back whatever the outcome, so a
+      // straggler that never replies still returns its session rather than having it dropped when this task
+      // is cancelled — the caller can then retry a load-timed-out commit over the same warm session.
+      let (reply, endpoint) = request_within(endpoint, RECORD_STREAM, &bytes, deadline_ns).await;
       let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     match spawned {
@@ -404,7 +453,9 @@ pub async fn commit_record(
   let (reusable, timed_out) =
     collect_acks(rx, record, candidates, quorum, budget, &mut acked).await;
 
-  // Cancel whatever is still running — a straggler's endpoint is dropped and that holder reconnects.
+  // Cancel whatever is still running — a straggler cut off *before* its own deadline (an early quorum at
+  // f > 1) loses its session, which is unavoidable without waiting for it; but at f = 1 the single holder
+  // always reports (there is no early quorum without it), so its session is kept for a retry.
   for task in &tasks {
     let _ = cancel(*task);
   }
@@ -623,15 +674,15 @@ pub async fn promote_record(
   // this task, so they are cancelled if this future is dropped (no orphans).
   let (tx, rx) = channel::<Reply>();
   let prepare_bytes = prepare.encode();
+  let deadline_ns = budget.max_deadline_ns();
   let mut tasks = Vec::new();
-  for (host, mut endpoint) in remote_holders {
+  for (host, endpoint) in remote_holders {
     let tx = tx.clone();
     let bytes = prepare_bytes.clone();
     let spawned = spawn_child(async move {
-      let reply = endpoint
-        .request(PROMOTE_STREAM, &bytes)
-        .await
-        .unwrap_or_default();
+      // Bounded and endpoint-preserving (see `request_within`): a holder that does not promise in time still
+      // returns its session, so the new owner can retry the takeover over the same warm session.
+      let (reply, endpoint) = request_within(endpoint, PROMOTE_STREAM, &bytes, deadline_ns).await;
       let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     match spawned {
@@ -874,15 +925,15 @@ pub async fn promote_ledger_record(
   // future is dropped (no orphans).
   let (tx, rx) = channel::<Reply>();
   let prepare_bytes = prepare.encode();
+  let deadline_ns = budget.max_deadline_ns();
   let mut tasks = Vec::new();
-  for (host, mut endpoint) in remote_holders {
+  for (host, endpoint) in remote_holders {
     let tx = tx.clone();
     let bytes = prepare_bytes.clone();
     let spawned = spawn_child(async move {
-      let reply = endpoint
-        .request(LEDGER_PROMOTE_STREAM, &bytes)
-        .await
-        .unwrap_or_default();
+      // Bounded and endpoint-preserving (see `request_within`), so a holder's session survives a timeout.
+      let (reply, endpoint) =
+        request_within(endpoint, LEDGER_PROMOTE_STREAM, &bytes, deadline_ns).await;
       let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     match spawned {

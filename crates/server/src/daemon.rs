@@ -663,6 +663,7 @@ fn init_shard(
     placed_heads: std::collections::BTreeMap::new(),
     formed_probe_peers: std::collections::BTreeSet::new(),
     holder_records: std::collections::BTreeMap::new(),
+    pending_takeovers: std::collections::BTreeSet::new(),
   };
   let rebuilt = verbs::rebuild_recovered(&mut state);
   if rebuilt.skipped > 0 {

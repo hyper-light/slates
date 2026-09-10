@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use rustls::pki_types::PrivateKeyDer;
 use slates_db::HostId;
-use slates_db::register::{ObjectId, Quorum};
+use slates_db::register::{ObjectId, Quorum, rendezvous_first};
 use slates_ipc::protocol::{
   Direction, NamePolicy, ReplyBody, RequestBody, SizeClass, pack, unpack,
 };
@@ -58,9 +58,12 @@ const FORMATION_DEADLINE: Duration = Duration::from_secs(15);
 
 /// Each fleet test starts several daemons — every daemon is a shard thread plus its doorbell thread — so
 /// running the tests concurrently oversubscribes the machine and stretches the probe and commit timing
-/// enough to flake (the test threads themselves busy-spin, since the runtime's `sleep` is unavailable off a
-/// shard and `std::thread::sleep` is disallowed). This lock serialises the heavy fleet tests so each runs
-/// against a quiet machine — the test-harness exception to R2's no-`Mutex` rule (D-8 exception 3).
+/// enough to flake. The test threads wait by polling; since the runtime's `sleep` is unavailable off a shard
+/// and `std::thread::sleep` is disallowed, they `std::thread::yield_now()` between checks rather than
+/// `std::hint::spin_loop()` — yielding the core to the daemon shard threads they are waiting on, instead of
+/// pinning it and starving the very daemons whose progress the poll is waiting for. This lock serialises the
+/// heavy fleet tests so each runs against a quiet machine — the test-harness exception to R2's no-`Mutex`
+/// rule (D-8 exception 3).
 #[allow(clippy::disallowed_types)]
 static FLEET_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -224,11 +227,11 @@ fn a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it() {
   let daemon_b = start(b, peer_of_b);
 
   // Let the fleet form: the loops establish their sessions and exchange probes over the transport. The
-  // test thread is not a runtime task, so it waits by spinning on the clock (as the other daemon tests do
+  // test thread is not a runtime task, so it waits by yielding on the clock (as the other daemon tests do
   // — the runtime's `futures::sleep` is unavailable off a shard).
   let settle = Instant::now() + FORMATION_SETTLE;
   while Instant::now() < settle {
-    std::hint::spin_loop();
+    std::thread::yield_now();
   }
   assert!(
     daemon_a.fleet_members().contains(&host_b),
@@ -247,7 +250,7 @@ fn a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it() {
       retired = true;
       break;
     }
-    std::hint::spin_loop();
+    std::thread::yield_now();
   }
 
   daemon_a.stop();
@@ -379,7 +382,7 @@ fn three_daemons_form_a_full_mesh() {
   // the formation deadline.
   let deadline = Instant::now() + FORMATION_DEADLINE;
   while Instant::now() < deadline && !daemons.iter().all(Daemon::fleet_meshed) {
-    std::hint::spin_loop();
+    std::thread::yield_now();
   }
   let meshed: Vec<(&str, bool)> = names
     .iter()
@@ -463,7 +466,7 @@ fn assert_fleet_forms(daemons: &[Daemon], _hosts: &[HostId], names: &[&str]) {
     if daemons.iter().all(Daemon::fleet_meshed) {
       return;
     }
-    std::hint::spin_loop();
+    std::thread::yield_now();
   }
   // Past the deadline and still not meshed: assert with a message naming the first unmeshed node (its
   // seeded members view is shown to make the seeded-vs-formed distinction legible on a failure).
@@ -488,7 +491,7 @@ fn poll_survivors_retire(survivors: &[Daemon], dead: HostId) -> bool {
         *done = true;
       }
     }
-    std::hint::spin_loop();
+    std::thread::yield_now();
   }
   retired.iter().all(|&r| r)
 }
@@ -514,7 +517,7 @@ impl Client {
           };
         }
         Err(IpcError::DaemonUnavailable { .. }) if started.elapsed() < CREDIT_WAIT => {
-          std::hint::spin_loop();
+          std::thread::yield_now();
         }
         Err(e) => panic!("{e}"),
       }
@@ -540,7 +543,7 @@ impl Client {
     loop {
       match self.end.send(&slot) {
         Ok(()) => break,
-        Err(IpcError::RingFull) if started.elapsed() < CREDIT_WAIT => std::hint::spin_loop(),
+        Err(IpcError::RingFull) if started.elapsed() < CREDIT_WAIT => std::thread::yield_now(),
         Err(e) => panic!("{e}"),
       }
     }
@@ -593,7 +596,7 @@ fn a_provisioned_head_replicates_across_the_fleet() {
   // undisturbed by the client and the placement polling below (which run on the same control shard).
   let settle = Instant::now() + FORMATION_SETTLE;
   while Instant::now() < settle {
-    std::hint::spin_loop();
+    std::thread::yield_now();
   }
 
   // Provision a volume on A; its object is the volume id.
@@ -614,7 +617,7 @@ fn a_provisioned_head_replicates_across_the_fleet() {
       placed = true;
       break;
     }
-    std::hint::spin_loop();
+    std::thread::yield_now();
   }
 
   daemon_a.stop();
@@ -660,7 +663,7 @@ fn a_holder_durably_holds_the_owners_replicated_head() {
   // Let the fleet form before provisioning, as the replication test does.
   let settle = Instant::now() + FORMATION_SETTLE;
   while Instant::now() < settle {
-    std::hint::spin_loop();
+    std::thread::yield_now();
   }
 
   // Provision a volume on A; its object is the volume id, and its head's value is the id bytes.
@@ -681,7 +684,7 @@ fn a_holder_durably_holds_the_owners_replicated_head() {
       held = Some(record);
       break;
     }
-    std::hint::spin_loop();
+    std::thread::yield_now();
   }
 
   daemon_a.stop();
@@ -695,5 +698,118 @@ fn a_holder_durably_holds_the_owners_replicated_head() {
     held.1,
     id.bytes.to_vec(),
     "B holds the head's value (the volume id bytes)"
+  );
+}
+
+/// Polls until both survivor daemons durably hold `object`'s head (the owner shipped it to each candidate
+/// holder), or the hold deadline passes; returns whether they both did.
+fn poll_both_hold(first: &Daemon, second: &Daemon, object: ObjectId) -> bool {
+  let deadline = Instant::now() + Duration::from_secs(20);
+  while Instant::now() < deadline {
+    if first.fleet_holder_head(object).is_some() && second.fleet_holder_head(object).is_some() {
+      return true;
+    }
+    std::thread::yield_now();
+  }
+  false
+}
+
+/// Polls until `daemon` reports `object` region-placed — the takeover re-committed the adopted head under
+/// its ownership — or the takeover deadline passes; returns whether it did.
+fn poll_head_placed(daemon: &Daemon, object: ObjectId) -> bool {
+  let deadline = Instant::now() + Duration::from_secs(25);
+  while Instant::now() < deadline {
+    if daemon.fleet_head_placed(object) {
+      return true;
+    }
+    std::thread::yield_now();
+  }
+  false
+}
+
+/// AC (§4.8 "Promotion and takeover", boot step 6, N-node): three daemons form one `f = 1` fleet; a volume
+/// is provisioned on the node that then dies, and the **survivor rendezvous ranks first takes over its
+/// head** — it runs phase one over the surviving candidate holder, adopts the head that committed under the
+/// old owner, re-commits it under the new epoch, and serves it region-placed **under its own ownership**.
+/// This is the smallest real takeover: three nodes keep a quorum through one death at `f = 1` (2f + 1 = 3),
+/// and the successor plus the remaining holder are exactly the `f + 1 = 2` promises phase one needs, so the
+/// adopted head is at least as new as anything that ever committed (Continuity). Non-vacuous on two counts:
+/// the successor holds the head only as a candidate holder before the death (it is not the owner, so its
+/// `placed_heads` has no record for the object — `fleet_head_placed` is false), and the seeded membership
+/// would never reassign ownership; so the successor reporting the object **region-placed and owned by
+/// itself** after the death is a transition only the takeover drive can make over the transport.
+#[test]
+fn three_daemons_take_over_a_dead_owners_head() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  assert_eq!(
+    hosts
+      .iter()
+      .collect::<std::collections::BTreeSet<_>>()
+      .len(),
+    n,
+    "the three machine identities give three distinct host ids"
+  );
+
+  let pid = std::process::id();
+  // Node A (index 0) is the owner that will die; the client provisions the volume on it.
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let serve = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  // Provision a volume on A; its object is the volume id, and its head's value is the id bytes.
+  let mut client = Client::connect(&instance_a);
+  let ReplyBody::Created { id } = client.call(&scratch("taken-over")) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("the volume was not created");
+  };
+  let object = ObjectId(id.bytes);
+
+  // Wait until BOTH survivors hold A's head (A ships it to each) — so after A dies, the successor and the
+  // remaining holder both have the committed record phase-one recovery reads.
+  assert!(
+    poll_both_hold(&daemons[1], &daemons[2], object),
+    "both survivors hold A's head before A dies (the record replicated to each candidate holder)"
+  );
+
+  // A dies. The survivor rendezvous ranks first for the object takes it over.
+  let owner = daemons.remove(0);
+  owner.stop();
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
+  // Map the successor host back to its (now index-shifted) daemon: survivors are daemons[0]=hosts[1],
+  // daemons[1]=hosts[2].
+  let successor_index = if successor == hosts[1] { 0 } else { 1 };
+
+  // The successor drives phase one over the surviving holder, adopts the committed head, re-commits it under
+  // the new epoch, and reports it region-placed under its own ownership.
+  let served = poll_head_placed(&daemons[successor_index], object);
+  let held = daemons[successor_index].fleet_holder_head(object);
+
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    served,
+    "the successor took over the dead owner's head and served it region-placed under its ownership"
+  );
+  let held = held.expect("the successor still holds the taken-over head");
+  assert_eq!(
+    held.0, successor,
+    "the successor is now the object's owner (the takeover reassigned ownership)"
+  );
+  assert_eq!(
+    held.1,
+    id.bytes.to_vec(),
+    "the taken-over head's value survived the promotion and re-commit"
   );
 }

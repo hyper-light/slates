@@ -27,22 +27,34 @@
 //!   node's **durable per-object hold** in the shard state, so it backs the peer as a candidate holder and
 //!   the record survives for a takeover to read);
 //! - the **ship** task dials the peer's record address and replicates this node's unplaced volume heads to
-//!   it each period (the cross-node commit, §4.8 "committed at `f + 1`").
+//!   it each period (the cross-node commit, §4.8 "committed at `f + 1`"), and **drives any takeover** this
+//!   node owes over the same session (`drive_takeover`: promote the object's head over the surviving
+//!   candidate holder, adopt the newest committed record, re-commit it under the new epoch, serve it).
+//!
+//! **Takeover phase-one recovery** (§4.8 "Promotion and takeover"): when a peer dies, the probe loop records
+//! the objects `sync_peer` reassigns to this node ([`ShardState::pending_takeovers`]) and brings every held
+//! acceptor's authority into step with the routing view ([`reconcile_held_authority`] — the successor is
+//! installed, so a holder answers the new owner's prepare and accepts its re-commit); the ship task then
+//! promotes the object over the surviving candidate holder and re-commits the adopted head under the new
+//! epoch, recording the placement so the verbs read the head owned and region-placed. The serve loop answers
+//! a `Prepare` from the same durable hold ([`serve_held_promotion`]). This is the `f = 1` shape (one
+//! remaining candidate per object); the multi-holder `f > 1` promotion and the taken-over head's **content**
+//! serve (§4.10) are owed.
 //!
 //! The `FleetNode` lives in the shard state (the verbs read it for placement), so it is touched only
 //! through brief synchronous [`state::with_state`] — never held across an await. At `f = 0` (the laptop)
 //! there is no fleet transport and this loop does not run; the placement path still runs the same
-//! `FleetNode`, degenerate (R8). The records a survivor's phase-one recovery reads are now durable (the
-//! per-object holds above, tracked in the routing view); **driving** the takeover — installing the
-//! successor authority on the holders and running the promotion over them before serving the taken-over
-//! head under the new epoch — is owed; here the routing view records the reassignment `sync_peer` computes.
+//! `FleetNode`, degenerate (R8).
 
 use rustls::pki_types::CertificateDer;
 use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::fleet::sync_peer;
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once, serve_probe};
-use slates_cluster::{CommitBudget, commit_record};
-use slates_db::register::{Acceptor, Authority, HostId, ObjectId, Quorum, Record};
+use slates_cluster::{CommitBudget, commit_record, promote_record};
+use slates_db::register::{
+  Acceptor, Authority, FIRST_EPOCH, HostEpoch, HostId, ObjectId, Prepare, Quorum, Record,
+  candidates_for,
+};
 use slates_rt::futures;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 use slates_rt::udp::UdpSocket;
@@ -256,19 +268,21 @@ pub async fn run_membership(transport: FleetTransport) {
   }
 }
 
-/// Dials `address` and completes the handshake on one socket. The handshake retransmits its own flights
-/// ([`Endpoint::establish`]), so a single dial socket survives a peer that boots after this node first dials
-/// it — there is no re-dial from a fresh port, which would race the peer's `accept` (it pins the first source
-/// it hears, so a port change mid-handshake strands the session). `None` if the runtime refuses a socket or
-/// endpoint, or the handshake is abandoned (a peer that never answers within the retransmit ceiling).
-async fn dial(
+/// Binds a fresh socket and builds an **un-established** client endpoint for `address` — the handshake is
+/// driven separately ([`Endpoint::establish`]) so the caller can **retry it on this same socket** until the
+/// peer's `accept` completes, rather than re-dialing from a fresh port. Retrying on one socket is what lets
+/// a handshake finish under contention: `accept` pins the first source it hears, so its half-open state
+/// waits for *this* source's next flight; a fresh-port re-dial is a new source it ignores, stranding the
+/// session (the record-plane cause of the takeover flaking under load). `None` if the runtime refuses the
+/// socket or endpoint.
+fn client_for(
   identity: &Identity,
   name: &str,
   address: SocketAddrV4,
   certificate: &CertificateDer<'static>,
 ) -> Option<Endpoint> {
   let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).ok()?;
-  let mut client = Endpoint::client(
+  Endpoint::client(
     socket,
     address,
     identity,
@@ -276,10 +290,32 @@ async fn dial(
     name,
     FLEET_FRAME_CAP,
   )
-  .ok()?;
-  match client.establish().await {
-    Ok(()) => Some(client),
-    Err(_) => None,
+  .ok()
+}
+
+/// Advances a session toward established, one handshake attempt per call (the probe and ship loops call it
+/// each period): if a `session` is already up it is returned unchanged; otherwise the held un-established
+/// `client` is driven one `establish` step **on its same socket** (kept for a retry on failure, so the
+/// peer's pinned `accept` completes rather than a fresh-port re-dial being ignored — the establishment
+/// fragility that flaked both the probe mesh's formation and the record plane's takeover under load), and a
+/// client that was consumed but whose session was then lost is rebuilt. Returns the updated `(client, session)`.
+async fn establish_session(
+  client: Option<Endpoint>,
+  session: Option<Endpoint>,
+  identity: &Identity,
+  name: &str,
+  address: SocketAddrV4,
+  certificate: &CertificateDer<'static>,
+) -> (Option<Endpoint>, Option<Endpoint>) {
+  if session.is_some() {
+    return (client, session);
+  }
+  match client {
+    Some(mut endpoint) => match endpoint.establish().await {
+      Ok(()) => (None, Some(endpoint)),
+      Err(_) => (Some(endpoint), None),
+    },
+    None => (client_for(identity, name, address, certificate), None),
   }
 }
 
@@ -303,10 +339,13 @@ async fn serve_peer_probes(mut endpoint: Endpoint, local: HostId, neighbourhood:
 /// peers' loops — each probe task dials its own), then each protocol period probe the peer, fold the outcome,
 /// and fold this detector's converged view into the shard's `FleetNode` (§4.8). Each peer has its own probe
 /// task and its own detector; `sync_membership` folds each detector's view without disturbing the peers it
-/// does not track, so N detectors compose into one membership. While the session is alive a successful probe
-/// reuses it (continuous packet numbers); a timeout drops it and the loop keeps ticking so the suspicion ages
-/// to death (the peer is unreachable — the single session cannot be re-established), driving the takeover the
-/// moment the fleet retires it.
+/// does not track, so N detectors compose into one membership. The session is **reused whatever a probe's
+/// outcome** — an acknowledgement and a timeout both hand it back ([`probe_once`]) — so a single missed
+/// probe (a lost packet, scheduling jitter, a nonce-rejected stale reply) does not drop it: the next period
+/// re-probes, a still-live peer refutes the suspicion the ping carried, and only a peer silent across the
+/// suspicion window ages to death and is retired (driving the takeover). Dropping the session on one miss —
+/// which cannot be re-established, since `Endpoint::accept` pins one source — would retire a live peer on
+/// any transient glitch (`docs/bugs/2026-09-10-swim-stale-ack.md`).
 async fn probe_peer(
   identity: &'static Identity,
   name: String,
@@ -317,23 +356,40 @@ async fn probe_peer(
   neighbourhood: usize,
 ) {
   let budget = probe_budget();
-  let Some(endpoint) = dial(identity, &name, address, &certificate).await else {
-    return;
-  };
-  // The direct probe session to this peer has formed — record it, so the daemon can tell the real mesh
-  // is up (`fleet_meshed`) rather than trusting the membership's optimistically seeded alive set.
-  state::with_state(|s| s.formed_probe_peers.insert(peer_host));
   let timing = detector_timing(neighbourhood);
   let fanout = usize::try_from(timing.gossip_transmits).unwrap_or(1);
   let mut detector = Detector::new(local, timing);
   detector.join(peer_host);
-  let mut session: Option<Endpoint> = Some(endpoint);
+  // Bring the probe session up on one socket, retrying the handshake there each period until it completes —
+  // so a formation-race handshake that partially reached the peer's pinned `accept` finishes rather than
+  // stranding the session (which would leave this peer unprobed and the N·(N−1) mesh un-formed). Once up it
+  // is reused whatever a probe's outcome (see [`probe_once`]). The detector ticks only when a probe is
+  // actually sent, so an as-yet-unestablished session never resolves as a missed probe and falsely ages the
+  // peer.
+  let mut client: Option<Endpoint> = client_for(identity, &name, address, &certificate);
+  let mut session: Option<Endpoint> = None;
+  let mut recorded_mesh = false;
+  // A per-probe nonce the acknowledgement must echo: monotonic over this session, so every probe's nonce
+  // is higher than any earlier one on it, and a *stale* acknowledgement the transport redelivered (from an
+  // earlier probe, carrying a lower nonce) is rejected rather than counted as this probe's reply — the
+  // fix for a survivor accepting a dead peer's buffered acknowledgements (`docs/bugs/2026-09-10-swim-stale-ack.md`).
+  let mut probe_nonce: u64 = 0;
 
   loop {
-    detector.tick();
+    (client, session) =
+      establish_session(client, session, identity, &name, address, &certificate).await;
+    if session.is_some() && !recorded_mesh {
+      // The direct probe session to this peer has formed — record it, so the daemon can tell the real mesh
+      // is up (`fleet_meshed`) rather than trusting the membership's optimistically seeded alive set.
+      state::with_state(|s| s.formed_probe_peers.insert(peer_host));
+      recorded_mesh = true;
+    }
     if let Some(open) = session.take() {
+      detector.tick();
+      probe_nonce += 1;
       let ping = SwimMessage::Ping {
         from: local,
+        nonce: probe_nonce,
         gossip: detector.gossip(fanout),
       };
       match probe_once(open, &ping, budget).await {
@@ -352,9 +408,16 @@ async fn probe_peer(
           detector.learn_coordinate(peer_host, coordinate);
           session = returned;
         }
-        // A timeout (or a runtime refusal): the session is dropped; the loop keeps ticking to age the
-        // suspicion to death, since the single accepted session cannot be re-established.
-        Ok((_, ProbeOutcome::TimedOut)) | Err(_) => {}
+        // A timeout is a **transient miss**, not a verdict — a lost packet, a moment's scheduling jitter, or
+        // a nonce-rejected stale reply. The session is **kept and re-probed** next period: the ping carries
+        // this node's suspicion, a still-live peer refutes it (its acknowledgement's gossip clears the
+        // suspicion), and only a peer that stays silent across the detector's suspicion window ages to death.
+        // Dropping it on one miss would retire a live peer on any glitch (the formation flake). A runtime
+        // refusal (never expected from the inline probe) drops the session.
+        Ok((returned, ProbeOutcome::TimedOut)) => {
+          session = returned;
+        }
+        Err(_) => {}
       }
     }
 
@@ -365,16 +428,21 @@ async fn probe_peer(
     // retirement sticks the moment this detector ages it out.
     let retired = state::with_state(|s| {
       let takeovers = sync_peer(detector.membership(), &mut s.fleet, peer_host);
-      (
-        !takeovers.is_empty(),
-        !s.fleet.configuration().neighbourhood.contains(&peer_host),
-      )
+      // A death may hand this node objects to take over (it is the rendezvous-first survivor) and changes
+      // the routing owner of others it merely holds a copy of. Record the ones to drive, and bring every
+      // held acceptor's authority into step with the routing view — so this node can promote the objects it
+      // takes over and can answer *another* survivor's promotion of the rest (the configuration group's
+      // taken-over authority, applied locally with no coordination — every survivor computes the same
+      // rendezvous winner, §4.8 "Promotion and takeover").
+      for reassignment in &takeovers {
+        s.pending_takeovers.insert(reassignment.object);
+      }
+      reconcile_held_authority(s);
+      !s.fleet.configuration().neighbourhood.contains(&peer_host)
     });
-    if let Some((_took_over, gone)) = retired
-      && gone
-    {
-      // The peer is retired and its objects reassigned in the routing view; phase-one recovery and serving
-      // the taken-over head under the new epoch are owed. It is no longer part of the direct mesh.
+    if retired == Some(true) {
+      // The peer is retired and gone from the direct mesh. Its objects' phase-one recovery is now driven by
+      // the record-ship task (over the surviving candidate holders); this probe task for the dead peer ends.
       state::with_state(|s| s.formed_probe_peers.remove(&peer_host));
       return;
     }
@@ -382,29 +450,76 @@ async fn probe_peer(
   }
 }
 
-/// The record serve side (§4.8 "records are sent to all candidates"): complete the accepted session's
-/// handshake and loop accepting the peer's register record commits into a holder acceptor for the peer's
-/// objects — this node backs the peer as a candidate holder. The acceptor's authority names the peer as the
-/// owner under the configuration's generation, so a record from the peer is authorized and one from a stale
-/// writer is refused. A serve failure (the peer's connection dropped) ends the loop.
+/// The record serve side (§4.8 "records are sent to all candidates"; "Promotion and takeover"): complete
+/// the accepted session's handshake and loop answering the peer over this node's per-object holds — a
+/// **record** commit is accepted into the object's durable acceptor (this node backs the peer as a
+/// candidate holder), and a **prepare** (a new owner's phase-one message when it takes over an object) is
+/// answered from that same hold with a binding promise. Both are served here because the session plane
+/// carries both and `serve_once` hands the handler the raw request either way; the two never collide, a
+/// [`Prepare`] being a fixed 40 bytes and a [`Record`] always longer (its prefix alone exceeds that), so
+/// the length disambiguates. The acceptor authorizes the record's or prepare's owner and generation against
+/// the authority the takeover installed, fences the epoch, and refuses a stale writer. A serve failure (the
+/// peer's connection dropped when it died) ends the loop.
 async fn serve_peer_records(mut endpoint: Endpoint, local: HostId, peer_host: HostId) {
   if endpoint.establish().await.is_err() {
     return;
   }
-  // Serve the peer's record commits into this node's **durable** per-object holds in the shard state, so
-  // an accepted record survives past this task — the state a survivor's phase-one recovery reads on a
-  // takeover. The handler runs synchronously inside `serve_once` (a brief `with_state` borrow, no await
-  // held across it). A serve failure — the peer's connection dropped when it died — ends the loop.
+  // Serve the peer's commits and prepares against this node's **durable** per-object holds in the shard
+  // state, so an accepted record survives past this task — the state a survivor's phase-one recovery reads
+  // on a takeover — and a prepare is answered from it. The handler runs synchronously inside `serve_once` (a
+  // brief `with_state` borrow, no await held across it). A serve failure ends the loop.
   loop {
     let served = endpoint
-      .serve_once(|request| match Record::decode(&request) {
-        Ok(record) => state::with_state(|s| accept_held_record(s, local, peer_host, &record))
-          .unwrap_or_default(),
-        Err(_) => Vec::new(),
+      .serve_once(|request| {
+        if let Ok(prepare) = Prepare::decode(&request) {
+          state::with_state(|s| serve_held_promotion(s, &prepare)).unwrap_or_default()
+        } else if let Ok(record) = Record::decode(&request) {
+          state::with_state(|s| accept_held_record(s, local, peer_host, &record))
+            .unwrap_or_default()
+        } else {
+          Vec::new()
+        }
       })
       .await;
     if served.is_err() {
       return;
+    }
+  }
+}
+
+/// Answers a new owner's phase-one [`Prepare`] from this node's durable hold of the object (§4.8 "every
+/// holder raises its fence for that host to the new epoch and reports the highest record it holds"): runs
+/// the prepare through the object's acceptor — which authorizes the new owner and generation the takeover
+/// installed ([`reconcile_held_authority`]), raises the fence to the prepare's epoch, and reports the
+/// highest record this node holds for the object — and replies with the binding [`Promise`], or an empty
+/// reply if this node holds nothing for the object or the acceptor refuses (a foreign generation, an
+/// unauthorized owner, or an epoch below the fence), so the new owner counts nothing.
+fn serve_held_promotion(state: &mut ShardState, prepare: &Prepare) -> Vec<u8> {
+  match state.holder_records.get_mut(&prepare.object) {
+    Some(acceptor) => match acceptor.prepare(prepare) {
+      Ok(promise) => promise.encode(),
+      Err(_) => Vec::new(),
+    },
+    None => Vec::new(),
+  }
+}
+
+/// Brings every held acceptor's authority into step with the routing view (§4.8 "distributing the
+/// taken-over authority to the holders"): for each object this node holds a copy of, installs the object's
+/// current owner (as the routing view records it) under the configuration generation. On a takeover the
+/// routing owner moved to the survivor rendezvous ranks first, so this installs the successor as the
+/// authorized owner — the object's new owner can then commit through this hold and its prepare authorizes.
+/// Every survivor computes the same routing winner, so this needs no coordination. Idempotent: an install
+/// of the same owner under an equal-or-higher generation is accepted, a lower one refused (ignored), so the
+/// authority only advances.
+fn reconcile_held_authority(state: &mut ShardState) {
+  let generation = state.fleet.configuration().version;
+  let held: Vec<ObjectId> = state.holder_records.keys().copied().collect();
+  for object in held {
+    if let Some(owner) = state.fleet.object_owner(object)
+      && let Some(acceptor) = state.holder_records.get_mut(&object)
+    {
+      let _ = acceptor.install_authority(Authority { generation, owner });
     }
   }
 }
@@ -457,18 +572,32 @@ struct Head {
   quorum: Quorum,
 }
 
-/// The volume heads this node owns that are not yet region-placed (§4.8): for each volume on the shard whose
-/// object has no stored quorum placement, the record to commit (under the configuration's epoch and
-/// generation) and the candidates and quorum the configuration computes for it. Read under `with_state`.
-fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
+/// The volume heads this node owns that `peer_host` should still receive (§4.8 "records are sent to **all**
+/// candidates; committed at `f + 1`"): for each volume whose object has `peer_host` among its candidate
+/// holders and which `peer_host` has **not yet acknowledged**, the record to commit and the candidates and
+/// quorum the configuration computes for it. Read under `with_state`.
+///
+/// The gate is per-holder (`peer_host` has not acked), **not** the object's overall quorum: a head reaches
+/// `f + 1` acknowledgements (region-placed, durable) from *some* candidates, but every candidate must still
+/// receive it, because after a death the surviving candidates form the promotion quorum a takeover needs —
+/// each must hold the head. Gating on the quorum alone let the first ship task to place a head stop every
+/// other from shipping it, so a head reached only its first `f + 1` holders and a co-survivor never got it.
+fn heads_for_peer(state: &ShardState, local: HostId, peer_host: HostId) -> Vec<Head> {
   let config = state.fleet.configuration();
   let mut heads = Vec::new();
   for (_, slot) in state.volumes.iter() {
     let object = ObjectId(slot.id.bytes);
-    if state.placed_heads.contains_key(&object) {
-      continue;
-    }
     let placement = config.place(object);
+    if !placement.candidates.contains(&peer_host) {
+      continue; // `peer_host` is not a candidate holder for this object.
+    }
+    if state
+      .placed_heads
+      .get(&object)
+      .is_some_and(|placed| placed.acked.contains(&peer_host))
+    {
+      continue; // `peer_host` already holds this head.
+    }
     heads.push(Head {
       object,
       record: Record {
@@ -517,17 +646,30 @@ async fn ship_records(
     return;
   };
   let mut owner_acceptor = Acceptor::new(local, authority);
-  // Dial the peer's record session at boot, alongside the probe session, so the peer's serve side completes
-  // its handshake now rather than waiting idle for a first use seconds later (an idle accept socket does not
-  // wake promptly on a datagram that arrives long after its handshake — the same reuse stall the commit
-  // itself would hit). The session then stays open, reused across commits; a commit that loses it redials.
-  let mut session = dial(identity, &name, record_address, &certificate).await;
+  // Bring the peer's record session up on **one socket**, retrying its handshake there each period until it
+  // completes, so it is established during formation — well before an idle successor (a node with no volumes
+  // of its own) first uses it to drive a takeover. Retrying on the same socket is what finishes the
+  // handshake under contention: the peer's `accept` pins the first source it hears and waits for *that*
+  // source's next flight, so a fresh-port re-dial (a new source) is ignored and the session stranded — the
+  // record-plane cause of the takeover flaking under load. Once established the session stays live: the
+  // dispatch keeps it across a timeout (`request_within`), so a load-timed-out commit or promotion retries
+  // over the same warm session. A genuinely-lost session (a transport error, not a timeout) rebuilds a fresh
+  // client best-effort; a truly broken session's re-establishment is owed with the transport's connection
+  // management (the connection-ID demux / an accept that re-learns).
+  let mut client: Option<Endpoint> = client_for(identity, &name, record_address, &certificate);
+  let mut session: Option<Endpoint> = None;
   loop {
-    let work = state::with_state(|s| unplaced_heads(s, local)).unwrap_or_default();
-    // A session lost to a straggler timeout is redialed the next period there is a head to place.
-    if !work.is_empty() && session.is_none() {
-      session = dial(identity, &name, record_address, &certificate).await;
-    }
+    (client, session) = establish_session(
+      client,
+      session,
+      identity,
+      &name,
+      record_address,
+      &certificate,
+    )
+    .await;
+    let work = state::with_state(|s| heads_for_peer(s, local, peer_host)).unwrap_or_default();
+    let owed = state::with_state(|s| takeovers_for_peer(s, local, peer_host)).unwrap_or_default();
     for head in work {
       let Some(endpoint) = session.take() else {
         // No live session (dial failed, or a prior head this period lost it): leave the rest for a retry.
@@ -552,10 +694,168 @@ async fn ship_records(
         .map(|(_, endpoint)| endpoint);
       if let Ok(placement) = committed.outcome {
         state::with_state(|s| {
-          s.placed_heads.insert(head.object, placement);
+          // Merge this holder's acknowledgement into the object's placement rather than overwriting it: each
+          // per-peer ship task commits to one holder, so the union of their acked candidates is the real
+          // region placement. Overwriting would let a later ship (to another holder) forget an earlier one,
+          // so `heads_for_peer` would re-ship a head the peer already holds forever.
+          let entry = s
+            .placed_heads
+            .entry(head.object)
+            .or_insert_with(|| placement.clone());
+          for host in placement.acked {
+            if !entry.acked.contains(&host) {
+              entry.acked.push(host);
+            }
+          }
         });
       }
     }
+    // Drive each takeover this holder is a surviving candidate for: promote the object's head over this
+    // session and re-commit the adopted head under the new epoch (§4.8 "phase-one recovery"). A drive that
+    // does not place leaves the object pending, so the next period retries.
+    for object in owed {
+      let Some(endpoint) = session.take() else {
+        break;
+      };
+      session = drive_takeover(object, peer_host, local, endpoint, budget).await;
+    }
     futures::sleep(HEARTBEAT_NS).await;
   }
+}
+
+/// The pending takeovers this holder session should drive: the objects this node owes a takeover for
+/// ([`ShardState::pending_takeovers`]) whose surviving candidate set — computed the same way every node
+/// computes placement ([`candidates_for`] over the current neighbourhood) — contains both this node (the
+/// new owner) and `peer_host` (the remaining holder reached over this session). At `f = 1` a single death
+/// leaves one remaining candidate per object, so exactly one ship task drives each takeover; the
+/// multi-holder promotion an `f > 1` takeover needs (several holder sessions coordinated for one object) is
+/// the owed generalization. Read under `with_state`.
+fn takeovers_for_peer(state: &ShardState, local: HostId, peer_host: HostId) -> Vec<ObjectId> {
+  let config = state.fleet.configuration();
+  state
+    .pending_takeovers
+    .iter()
+    .copied()
+    .filter(|object| {
+      let candidates = candidates_for(local, &config.neighbourhood, *object, config.quorum);
+      candidates.contains(&peer_host) && candidates.contains(&local)
+    })
+    .collect()
+}
+
+/// Drives one object's takeover over this holder session (§4.8 "Promotion and takeover": phase one and safe
+/// adoption). This node is the survivor rendezvous ranked first for `object`, so it promotes the object's
+/// head over the surviving candidate holders — its own hold plus `peer_host` over `session` — and, on a
+/// quorum of promises, re-commits the adopted head under the new epoch, records the placement, and clears
+/// the pending takeover so the verbs read the head as owned and region-placed. The object's hold is removed
+/// from the shard state for the promotion and re-commit (nothing else touches a dead owner's object's hold
+/// here) and re-inserted after, now under this node's authority. Returns the holder session for reuse, or
+/// `None` if it was lost (the ship loop redials). Short of quorum, or on a lost session, the object stays
+/// pending and the next period retries — self-healing across the window while every survivor brings its
+/// holds' authority into step.
+async fn drive_takeover(
+  object: ObjectId,
+  peer_host: HostId,
+  local: HostId,
+  session: Endpoint,
+  budget: CommitBudget,
+) -> Option<Endpoint> {
+  // Read the takeover parameters and take exclusive hold of the object's acceptor. Nothing to drive if this
+  // node does not hold the object or is not a candidate for it.
+  let prepared = state::with_state(|s| {
+    let config = s.fleet.configuration();
+    let candidates = candidates_for(local, &config.neighbourhood, object, config.quorum);
+    if !candidates.contains(&peer_host) || !candidates.contains(&local) {
+      return None;
+    }
+    let quorum = config.quorum;
+    let generation = config.version;
+    let mut acceptor = s.holder_records.remove(&object)?;
+    // The new epoch: one above the highest this node holds for the object, so the promotion raises the
+    // holders' fence above the epoch the dead owner committed under (§4.8 "serves under the bumped epoch").
+    let epoch = HostEpoch(highest_held_epoch(&acceptor, object).0.saturating_add(1));
+    // Install this node as the object's owner under the current generation, so its own promise and the
+    // adoption re-commit are authorized (the configuration group's taken-over authority, applied locally).
+    let _ = acceptor.install_authority(Authority {
+      generation,
+      owner: local,
+    });
+    Some((acceptor, candidates, quorum, generation, epoch))
+  })
+  .flatten();
+  let Some((mut acceptor, candidates, quorum, generation, epoch)) = prepared else {
+    return Some(session);
+  };
+
+  let prepare = Prepare {
+    owner: local,
+    object,
+    epoch,
+    generation,
+  };
+  // Phase one: promise locally through this node's hold and over the peer holder; adopt the newest record.
+  let promoted = promote_record(
+    local,
+    &mut acceptor,
+    &candidates,
+    &prepare,
+    quorum,
+    vec![(peer_host, session)],
+    budget,
+  )
+  .await;
+  let mut session = reusable_of(promoted.reusable, peer_host);
+  // Safe adoption: re-commit the adopted head under the new epoch over the same holder, reaching the quorum.
+  let mut placed = None;
+  if let Ok(promotion) = promoted.outcome
+    && let Some(adoption) = promotion.adoption_record(&prepare)
+    && let Some(endpoint) = session.take()
+  {
+    let committed = commit_record(
+      local,
+      &mut acceptor,
+      &candidates,
+      &adoption,
+      quorum,
+      vec![(peer_host, endpoint)],
+      budget,
+    )
+    .await;
+    session = reusable_of(committed.reusable, peer_host);
+    if let Ok(placement) = committed.outcome
+      && placement.placed(quorum)
+    {
+      placed = Some(placement);
+    }
+  }
+  // Re-insert the hold (now under this node's authority) and, when the adoption placed, record the placement
+  // and clear the pending takeover so the head is served as owned; otherwise the object stays pending.
+  state::with_state(|s| {
+    s.holder_records.insert(object, acceptor);
+    if let Some(placement) = placed {
+      s.placed_heads.insert(object, placement);
+      s.pending_takeovers.remove(&object);
+    }
+  });
+  session
+}
+
+/// The endpoint for `host` among the reusable session connections a dispatch handed back, if it replied.
+fn reusable_of(reusable: Vec<(HostId, Endpoint)>, host: HostId) -> Option<Endpoint> {
+  reusable
+    .into_iter()
+    .find(|(held_host, _)| *held_host == host)
+    .map(|(_, endpoint)| endpoint)
+}
+
+/// The highest epoch this node holds for `object` in `acceptor`, or the first epoch if it holds nothing —
+/// the anchor the takeover's new epoch is bumped one above.
+fn highest_held_epoch(acceptor: &Acceptor, object: ObjectId) -> HostEpoch {
+  let (_, positions) = acceptor.persisted();
+  positions
+    .into_iter()
+    .filter(|(held, _, _, _)| *held == object)
+    .map(|(_, _, epoch, _)| epoch)
+    .max_by_key(|epoch| epoch.0)
+    .unwrap_or(FIRST_EPOCH)
 }

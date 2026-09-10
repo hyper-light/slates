@@ -17,11 +17,10 @@
 //! encode a message identically.
 
 use std::mem::size_of;
-use std::sync::mpsc::{TryRecvError, channel};
 
 use slates_db::register::HostId;
 use slates_rt::error::RtError;
-use slates_rt::futures::{cancel, now_ns, sleep, spawn_child};
+use slates_rt::futures::{now_ns, sleep};
 use slates_transport::endpoint::{Endpoint, EndpointError};
 
 use crate::CommitBudget;
@@ -38,6 +37,12 @@ pub enum SwimMessage {
   Ping {
     /// The probing node.
     from: HostId,
+    /// A per-probe token the acknowledgement must echo — the probe sequence number (memberlist's `SeqNo`;
+    /// SWIM §4). It correlates the acknowledgement to *this* ping: without it a stale acknowledgement (one
+    /// the peer sent to an earlier ping, before it died, that a real datagram socket buffered and the
+    /// reliable transport redelivered on the reused probe stream) would pass for a fresh reply and keep a
+    /// dead peer looking alive, so the survivor never retired it (`docs/bugs/2026-09-10-swim-stale-ack.md`).
+    nonce: u64,
     /// The membership updates piggybacked on this probe.
     gossip: Vec<(HostId, MemberState)>,
   },
@@ -46,6 +51,9 @@ pub enum SwimMessage {
   Ack {
     /// The acknowledging node.
     from: HostId,
+    /// Echoes the probing [`Ping`]'s `nonce`, so the prober counts this acknowledgement only for the probe
+    /// it is answering — never for an earlier one whose reply was redelivered.
+    nonce: u64,
     /// The membership updates piggybacked on this acknowledgement.
     gossip: Vec<(HostId, MemberState)>,
     /// The acknowledging node's Vivaldi coordinate.
@@ -127,23 +135,41 @@ impl SwimMessage {
     }
   }
 
+  /// The probe token: a [`Ping`](SwimMessage::Ping)'s nonce, or the value an [`Ack`](SwimMessage::Ack)
+  /// echoes back; `None` for a ping-request (which carries no probe token — its target's acknowledgement
+  /// is correlated by the relay's own ping). The prober compares its ping's nonce to the acknowledgement's
+  /// to reject a stale reply.
+  pub fn nonce(&self) -> Option<u64> {
+    match self {
+      SwimMessage::Ping { nonce, .. } | SwimMessage::Ack { nonce, .. } => Some(*nonce),
+      SwimMessage::PingReq { .. } => None,
+    }
+  }
+
   /// The canonical little-endian bytes: the tag, the sender, the target (for a ping-request only), then
   /// the gossip batch (its u32 count and each entry). Two hosts encode a message identically.
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::new();
     match self {
-      SwimMessage::Ping { from, gossip } => {
+      SwimMessage::Ping {
+        from,
+        nonce,
+        gossip,
+      } => {
         out.push(TAG_PING);
         out.extend_from_slice(&from.0.to_le_bytes());
+        out.extend_from_slice(&nonce.to_le_bytes());
         encode_gossip(&mut out, gossip);
       }
       SwimMessage::Ack {
         from,
+        nonce,
         gossip,
         coordinate,
       } => {
         out.push(TAG_ACK);
         out.extend_from_slice(&from.0.to_le_bytes());
+        out.extend_from_slice(&nonce.to_le_bytes());
         encode_gossip(&mut out, gossip);
         encode_coordinate(&mut out, coordinate);
       }
@@ -167,18 +193,25 @@ impl SwimMessage {
     match tag {
       TAG_PING => {
         let (from, rest) = take_host(rest)?;
+        let (nonce, rest) = take_word(rest)?;
         let (gossip, leftover) = decode_gossip(rest)?;
         if !leftover.is_empty() {
           return Err(SwimWireError::GossipLengthMismatch);
         }
-        Ok(SwimMessage::Ping { from, gossip })
+        Ok(SwimMessage::Ping {
+          from,
+          nonce,
+          gossip,
+        })
       }
       TAG_ACK => {
         let (from, rest) = take_host(rest)?;
+        let (nonce, rest) = take_word(rest)?;
         let (gossip, leftover) = decode_gossip(rest)?;
         let coordinate = decode_coordinate(leftover)?;
         Ok(SwimMessage::Ack {
           from,
+          nonce,
           gossip,
           coordinate,
         })
@@ -217,13 +250,20 @@ fn encode_gossip(out: &mut Vec<u8>, gossip: &[(HostId, MemberState)]) {
 
 /// Reads the u64 host id at the front of `bytes`, returning it and the remainder, or `Truncated`.
 fn take_host(bytes: &[u8]) -> Result<(HostId, &[u8]), SwimWireError> {
+  let (word, rest) = take_word(bytes)?;
+  Ok((HostId(word), rest))
+}
+
+/// Reads a little-endian u64 at the front of `bytes` (the probe nonce, and the raw word `take_host`
+/// wraps), returning it and the remainder, or `Truncated` if fewer than eight bytes remain.
+fn take_word(bytes: &[u8]) -> Result<(u64, &[u8]), SwimWireError> {
   if bytes.len() < size_of::<u64>() {
     return Err(SwimWireError::Truncated);
   }
   let (head, rest) = bytes.split_at(size_of::<u64>());
   let mut word = [0u8; size_of::<u64>()];
   word.copy_from_slice(head);
-  Ok((HostId(u64::from_le_bytes(word)), rest))
+  Ok((u64::from_le_bytes(word), rest))
 }
 
 /// A decoded gossip batch and the bytes that follow it in the message (the coordinate, for an
@@ -396,72 +436,75 @@ pub enum ProbeOutcome {
   TimedOut,
 }
 
-/// What the probe's request task or the deadline task reports back.
-enum ProbeReply {
-  /// The target replied (bytes, empty if the request failed) and its endpoint, handed back for reuse.
-  Replied(Vec<u8>, Box<Endpoint>),
-  /// The deadline elapsed first.
-  Deadline,
-}
-
-/// Sends one SWIM `probe` over `endpoint` and awaits the acknowledgement within `budget.deadline_ns`,
-/// racing the request against a deadline task so a dead target cannot hang the prober (§4.8; the same
-/// bounded-wait discipline as the commit dispatch — a probe never blocks a protocol period forever). On
-/// an acknowledgement the endpoint is returned for reuse, so its packet-number space stays continuous
-/// across probe periods (RFC 9000 §12.3), and the target's piggybacked gossip is delivered; on the
-/// deadline the request task is cancelled and its endpoint dropped (a crashed peer's connection is
-/// worthless), so a caller that retries reconnects. The budget is the caller's to derive (owed — a
-/// measured RTT budget).
+/// Sends one SWIM `probe` over `endpoint` and awaits an acknowledgement that **echoes the probe's nonce**
+/// within `budget.deadline_ns`, driving the request/reply inline and racing it against a deadline so a dead
+/// target cannot hang the prober (§4.8; the same bounded-wait discipline as the commit dispatch — a probe
+/// never blocks a protocol period forever). The **endpoint is returned for reuse whatever the outcome** —
+/// acknowledged *or* timed out — so its packet-number space stays continuous across probe periods
+/// (RFC 9000 §12.3) and, crucially, a single missed probe does not drop the session. The budget is the
+/// caller's to derive (owed — a measured RTT budget).
+///
+/// **Correctness (the nonce).** The reply counts only if it echoes this probe's nonce, so a *stale*
+/// acknowledgement — one the peer sent to an earlier probe before it died, that a real datagram socket
+/// buffered and the reliable transport redelivered on the reused probe stream — does not satisfy the probe;
+/// a dead peer times out rather than looking alive forever (`docs/bugs/2026-09-10-swim-stale-ack.md`).
+///
+/// **Robustness (keeping the session).** A timeout is a *transient miss*, not a verdict: a lost packet, a
+/// moment's scheduling jitter, or a nonce-rejected stale reply all produce one. Because a single accepted
+/// session cannot be re-established (`Endpoint::accept` pins one source), dropping it on one miss would
+/// retire a peer on any transient glitch — which is what made both survivors retire a *live* peer during
+/// formation. So the session is kept and the caller re-probes it: the ping carries this node's suspicion,
+/// the still-live peer refutes it (SWIM's incarnation refutation, [`crate::detector::Detector`]), and the
+/// acknowledgement's gossip clears the suspicion — while a genuinely dead peer, never refuting, still ages
+/// to death across the suspicion window. One missed probe never retires anyone; sustained silence does.
 pub async fn probe_once(
-  endpoint: Endpoint,
+  mut endpoint: Endpoint,
   probe: &SwimMessage,
   budget: CommitBudget,
 ) -> Result<(Option<Endpoint>, ProbeOutcome), RtError> {
   let bytes = probe.encode();
+  let expected = probe.nonce();
   let started_ns = now_ns();
-  let (tx, rx) = channel::<ProbeReply>();
 
-  let request_tx = tx.clone();
-  let request = spawn_child(async move {
-    let mut endpoint = endpoint;
-    let reply = endpoint
-      .request(PROBE_STREAM, &bytes)
-      .await
-      .unwrap_or_default();
-    let _ = request_tx.send(ProbeReply::Replied(reply, Box::new(endpoint)));
-  })?;
-
-  let deadline = budget.deadline_ns;
-  let deadline_task = spawn_child(async move {
-    sleep(deadline).await;
-    let _ = tx.send(ProbeReply::Deadline);
-  })?;
-
-  loop {
-    match rx.try_recv() {
-      Ok(ProbeReply::Replied(reply, endpoint)) => {
-        let _ = cancel(deadline_task);
-        // A missing or non-ack reply is not an acknowledgement — treat it as a probe failure.
-        let outcome = match SwimMessage::decode(&reply) {
-          Ok(SwimMessage::Ack {
-            gossip, coordinate, ..
-          }) => ProbeOutcome::Acked {
-            gossip,
-            rtt_ns: now_ns().saturating_sub(started_ns),
-            coordinate,
-          },
-          _ => ProbeOutcome::TimedOut,
-        };
-        return Ok((Some(*endpoint), outcome));
+  // Drive the request inline, racing it against the deadline. On the deadline the request future is dropped
+  // (releasing the borrow of `endpoint`) and the endpoint is still owned here, so it is returned for reuse —
+  // the reliable exchange is not self-bounded, so this deadline is the caller-owned bound it relies on.
+  let received = {
+    let mut request = std::pin::pin!(endpoint.request(PROBE_STREAM, &bytes));
+    let mut deadline = std::pin::pin!(sleep(budget.deadline_ns));
+    std::future::poll_fn(|cx| {
+      // Prefer a delivered reply over the deadline when both are ready, so a probe that just made it is not
+      // traded for a timeout.
+      if let std::task::Poll::Ready(result) = std::future::Future::poll(request.as_mut(), cx) {
+        return std::task::Poll::Ready(Some(result));
       }
-      Ok(ProbeReply::Deadline) => {
-        let _ = cancel(request);
-        return Ok((None, ProbeOutcome::TimedOut));
+      if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+        return std::task::Poll::Ready(None);
       }
-      Err(TryRecvError::Empty) => sleep(budget.poll_interval_ns).await,
-      Err(TryRecvError::Disconnected) => return Ok((None, ProbeOutcome::TimedOut)),
-    }
-  }
+      std::task::Poll::Pending
+    })
+    .await
+  };
+
+  // A reply counts only if it decodes as an acknowledgement echoing this probe's nonce; a request error, a
+  // wrong-nonce (stale) reply, or the deadline (`None`) is a probe failure — all keeping the endpoint.
+  let outcome = match received {
+    Some(Ok(reply)) => match SwimMessage::decode(&reply) {
+      Ok(SwimMessage::Ack {
+        nonce,
+        gossip,
+        coordinate,
+        ..
+      }) if Some(nonce) == expected => ProbeOutcome::Acked {
+        gossip,
+        rtt_ns: now_ns().saturating_sub(started_ns),
+        coordinate,
+      },
+      _ => ProbeOutcome::TimedOut,
+    },
+    Some(Err(_)) | None => ProbeOutcome::TimedOut,
+  };
+  Ok((Some(endpoint), outcome))
 }
 
 /// Serves one SWIM probe on a node (§4.8): receives a peer's message over `endpoint`, folds its
@@ -486,6 +529,9 @@ pub async fn serve_probe(
         let gossip = detector.gossip(gossip_fanout);
         SwimMessage::Ack {
           from: local,
+          // Echo the probe's nonce so the prober can tell this acknowledgement answers its current ping; a
+          // message that carried none (not a ping) echoes zero, which a real probe's non-zero nonce rejects.
+          nonce: message.nonce().unwrap_or(0),
           gossip,
           coordinate: detector.coordinate(),
         }
@@ -537,6 +583,7 @@ mod tests {
   fn a_coordinate_round_trips_and_a_huge_one_is_refused() {
     let ack = SwimMessage::Ack {
       from: A,
+      nonce: 42,
       gossip: sample_gossip(),
       coordinate: sample_coordinate(),
     };
@@ -549,6 +596,7 @@ mod tests {
     // An Ack whose coordinate claims a vast dimension count with no bytes to back it is refused.
     let mut hostile = vec![TAG_ACK];
     hostile.extend_from_slice(&7u64.to_le_bytes()); // from
+    hostile.extend_from_slice(&0u64.to_le_bytes()); // nonce
     hostile.extend_from_slice(&0u32.to_le_bytes()); // empty gossip
     hostile.extend_from_slice(&u32::MAX.to_le_bytes()); // coordinate dims = huge
     assert_eq!(
@@ -564,10 +612,12 @@ mod tests {
     let messages = [
       SwimMessage::Ping {
         from: A,
+        nonce: 1,
         gossip: sample_gossip(),
       },
       SwimMessage::Ack {
         from: B,
+        nonce: u64::MAX,
         gossip: Vec::new(),
         coordinate: sample_coordinate(),
       },
@@ -593,6 +643,7 @@ mod tests {
   fn ping_has_a_golden_encoding() {
     let message = SwimMessage::Ping {
       from: HostId(2),
+      nonce: 5,
       gossip: vec![(
         HostId(3),
         MemberState {
@@ -611,6 +662,14 @@ mod tests {
       0,
       0,
       0, // from = 2
+      5,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, // nonce = 5
       1,
       0,
       0,
@@ -645,9 +704,18 @@ mod tests {
       Err(SwimWireError::Truncated),
       "header cut"
     );
-    // Tag + full from, but the gossip count word is missing.
+    // Tag + full from, but the nonce word is missing.
     assert_eq!(
       SwimMessage::decode(&[TAG_PING, 0, 0, 0, 0, 0, 0, 0, 0]),
+      Err(SwimWireError::Truncated),
+      "nonce cut"
+    );
+    // Tag + full from + full nonce, but the gossip count word is missing.
+    let mut nonce_ok = vec![TAG_PING];
+    nonce_ok.extend_from_slice(&2u64.to_le_bytes()); // from
+    nonce_ok.extend_from_slice(&9u64.to_le_bytes()); // nonce
+    assert_eq!(
+      SwimMessage::decode(&nonce_ok),
       Err(SwimWireError::Truncated),
       "gossip count cut"
     );
@@ -663,6 +731,7 @@ mod tests {
     // A Ping with one gossip entry whose liveness byte is foreign (5).
     let bytes = [
       TAG_PING, 2, 0, 0, 0, 0, 0, 0, 0, // from
+      0, 0, 0, 0, 0, 0, 0, 0, // nonce
       1, 0, 0, 0, // count = 1
       3, 0, 0, 0, 0, 0, 0, 0, // subject
       5, // foreign liveness
@@ -681,6 +750,7 @@ mod tests {
     // Claim u32::MAX entries with no entry bytes at all.
     let mut bytes = vec![TAG_ACK];
     bytes.extend_from_slice(&7u64.to_le_bytes()); // from
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // nonce
     bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // count = huge
     assert_eq!(
       SwimMessage::decode(&bytes),
@@ -690,6 +760,7 @@ mod tests {
     // Claim one entry but supply only part of it.
     let mut short = vec![TAG_ACK];
     short.extend_from_slice(&7u64.to_le_bytes());
+    short.extend_from_slice(&0u64.to_le_bytes()); // nonce
     short.extend_from_slice(&1u32.to_le_bytes());
     short.extend_from_slice(&[9, 9, 9]); // a partial entry
     assert_eq!(

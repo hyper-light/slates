@@ -32,6 +32,11 @@ const TARGET: HostId = HostId(2);
 // A change the target already knows, seeded so its acknowledgement carries gossip the prober learns.
 const RUMOUR: HostId = HostId(6);
 const GOSSIP_FANOUT: usize = 8;
+// The nonce the prober stamps on its probe; the acknowledgement must echo it to count.
+const PROBE_NONCE: u64 = 0xABCD;
+// A different nonce a stale acknowledgement carries — the redelivered reply of an earlier probe, which the
+// prober must reject rather than count as its current probe's answer.
+const STALE_NONCE: u64 = 0x1111;
 // Test values; a production caller derives the deadline from a measured RTT budget (owed).
 const DEADLINE_NS: u64 = 20_000_000;
 const POLL_NS: u64 = 1_000;
@@ -100,12 +105,26 @@ struct ProbeResult {
   coordinate_moved: bool,
 }
 
+/// How the target behaves in a probe round.
+#[derive(Clone, Copy)]
+enum TargetMode {
+  /// Serves the probe normally, echoing the ping's nonce — a live acknowledgement.
+  Serves,
+  /// Handshakes then leaves without answering — a silent (dead) peer.
+  Silent,
+  /// Answers, but with an acknowledgement carrying a **stale** nonce that does not match the probe's — a
+  /// stand-in for the buffered/redelivered acknowledgement of an earlier probe, which the prober must not
+  /// count as this probe's answer.
+  StaleNonce,
+}
+
 /// Runs one live probe round: the prober (`1`) probes the target (`2`) over a mutually-authenticated
-/// session. When `target_serves`, the target serves the probe (seeding a rumour so its acknowledgement
-/// carries gossip); otherwise it handshakes and leaves without answering, so the probe must time out.
-/// The prober ticks once to set up the probe, probes, then ticks again to resolve it (an acknowledged
-/// probe keeps the target alive; an unanswered one suspects it).
-fn run_probe(target_serves: bool) -> ProbeResult {
+/// session. In [`TargetMode::Serves`] the target serves the probe (seeding a rumour so its acknowledgement
+/// carries gossip); in [`TargetMode::Silent`] it handshakes and leaves without answering, so the probe must
+/// time out; in [`TargetMode::StaleNonce`] it answers with a mismatched-nonce acknowledgement the prober
+/// must reject. The prober ticks once to set up the probe, probes, then ticks again to resolve it (an
+/// acknowledged probe keeps the target alive; an unanswered or rejected one suspects it).
+fn run_probe(mode: TargetMode) -> ProbeResult {
   let mut sim = SimRuntime::new(&config(), 1).unwrap();
   let id = sim.shard_ids()[0];
 
@@ -134,21 +153,47 @@ fn run_probe(target_serves: bool) -> ProbeResult {
       )
       .unwrap();
       endpoint.establish().await.unwrap();
-      if target_serves {
-        let mut detector = Detector::new(TARGET, timing());
-        // A rumour the target already holds, so its acknowledgement piggybacks gossip.
-        detector.apply(
-          RUMOUR,
-          MemberState {
-            liveness: Liveness::Suspect,
-            incarnation: 1,
-          },
-        );
-        serve_probe(&mut endpoint, &mut detector, TARGET, GOSSIP_FANOUT)
-          .await
-          .unwrap();
+      match mode {
+        TargetMode::Serves => {
+          let mut detector = Detector::new(TARGET, timing());
+          // A rumour the target already holds, so its acknowledgement piggybacks gossip.
+          detector.apply(
+            RUMOUR,
+            MemberState {
+              liveness: Liveness::Suspect,
+              incarnation: 1,
+            },
+          );
+          serve_probe(&mut endpoint, &mut detector, TARGET, GOSSIP_FANOUT)
+            .await
+            .unwrap();
+        }
+        TargetMode::StaleNonce => {
+          // Answer with a valid Ack but a nonce that does not match the prober's probe — a stale
+          // acknowledgement. Carry the rumour as gossip, so a *wrongly accepted* stale ack would leak it to
+          // the prober; the correct rejection delivers nothing.
+          let coordinate = Detector::new(TARGET, timing()).coordinate();
+          let _ = endpoint
+            .serve_once(move |_request| {
+              SwimMessage::Ack {
+                from: TARGET,
+                nonce: STALE_NONCE,
+                gossip: vec![(
+                  RUMOUR,
+                  MemberState {
+                    liveness: Liveness::Suspect,
+                    incarnation: 1,
+                  },
+                )],
+                coordinate,
+              }
+              .encode()
+            })
+            .await;
+        }
+        // An unserved target handshakes then leaves; the prober's probe must not block on it.
+        TargetMode::Silent => {}
       }
-      // An unserved target handshakes then leaves; the prober's probe must not block on it.
     })
     .unwrap();
 
@@ -176,6 +221,9 @@ fn run_probe(target_serves: bool) -> ProbeResult {
       let _ = detector.tick();
       let ping = SwimMessage::Ping {
         from: PROBER,
+        // The nonce the acknowledgement must echo for the probe to count as acked; the serve side echoes it,
+        // so a live probe succeeds, while a stale reply carrying another nonce ([`STALE_NONCE`]) does not.
+        nonce: PROBE_NONCE,
         gossip: detector.gossip(GOSSIP_FANOUT),
       };
       let (_endpoint, outcome) = probe_once(endpoint, &ping, budget()).await.unwrap();
@@ -223,7 +271,7 @@ fn run_probe(target_serves: bool) -> ProbeResult {
 /// real sessions.
 #[test]
 fn a_live_probe_is_acknowledged_and_carries_gossip() {
-  let result = run_probe(true);
+  let result = run_probe(TargetMode::Serves);
   assert!(!result.timed_out, "the target answered within the deadline");
   assert_eq!(
     result.target_after_resolution,
@@ -254,7 +302,7 @@ fn a_live_probe_is_acknowledged_and_carries_gossip() {
 /// prober), and the detector then suspects it — the failure path over real sessions.
 #[test]
 fn a_probe_to_a_silent_peer_times_out_and_is_suspected() {
-  let result = run_probe(false);
+  let result = run_probe(TargetMode::Silent);
   assert!(
     result.timed_out,
     "an unanswered probe times out at the deadline"
@@ -263,5 +311,38 @@ fn a_probe_to_a_silent_peer_times_out_and_is_suspected() {
     result.target_after_resolution,
     Some(Liveness::Suspect),
     "a timed-out probe drives the target to suspicion"
+  );
+}
+
+/// A probe answered with a **stale** acknowledgement — one whose nonce does not match the probe's — is
+/// treated as a failure, not as proof of life (§4.8; the SWIM probe sequence number). This is the direct
+/// regression for the survivor that never retired a dead peer: after the peer died, the reliable transport
+/// kept redelivering the peer's earlier acknowledgements (buffered on the reused probe stream, no
+/// packet-number dedup), and without the nonce those stale replies passed for fresh probes forever
+/// (`docs/bugs/2026-09-10-swim-stale-ack.md`). With it, the mismatched-nonce reply times out and the
+/// detector suspects the target, and none of the stale acknowledgement's gossip is folded (the reply's
+/// contents are discarded, not learned) — non-vacuous proof the acknowledgement was received and rejected,
+/// not merely absent.
+#[test]
+fn a_stale_nonce_acknowledgement_is_rejected_and_the_peer_is_suspected() {
+  let result = run_probe(TargetMode::StaleNonce);
+  assert!(
+    result.timed_out,
+    "a mismatched-nonce acknowledgement does not count as a fresh reply — the probe times out"
+  );
+  assert_eq!(
+    result.target_after_resolution,
+    Some(Liveness::Suspect),
+    "a stale-nonce reply drives the target to suspicion, exactly as silence does"
+  );
+  assert!(
+    !result.ack_gossip.contains(&(
+      RUMOUR,
+      MemberState {
+        liveness: Liveness::Suspect,
+        incarnation: 1,
+      }
+    )),
+    "the rejected acknowledgement's gossip was not folded into the prober — its contents were discarded"
   );
 }
