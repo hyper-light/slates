@@ -64,6 +64,17 @@ const HEADER_PROTECTION_SAMPLE_OFFSET: usize =
 /// above that to absorb a retransmitted, split, or coalesced flight.
 const HANDSHAKE_TURN_CEILING: usize = 16;
 
+/// The most times `establish` retransmits a handshake flight, while waiting for the peer's next flight,
+/// before it abandons the connection with `NotReady` — the bound on the handshake's wait (banned item 8: no
+/// unbounded wait). Each retransmit waits one probe timeout (RFC 9002 §6.2.2, two thirds of a second before
+/// the handshake yields an RTT sample), so this covers a peer that boots many seconds after this node first
+/// dials it — a fleet forms as its nodes come up one after another — while still terminating on a peer that
+/// never answers.
+/// Shape: it caps only the failure-and-formation path (a healthy handshake completes in its first few turns
+/// and never retransmits), so the exact value is not performance-tuned — only large enough that the wait,
+/// `MAX_HANDSHAKE_RETRANSMITS` × the initial probe timeout ≈ twenty seconds, spans a plausible boot skew.
+const MAX_HANDSHAKE_RETRANSMITS: u32 = 32;
+
 /// A refusal on the endpoint.
 #[derive(Debug)]
 pub enum EndpointError {
@@ -259,22 +270,62 @@ impl Endpoint {
   pub async fn establish(&mut self) -> Result<(), EndpointError> {
     let mut buf = [0u8; 2048];
     let mut sent_at: Option<Instant> = None;
+    let mut last_flight: Vec<u8> = Vec::new();
     for _ in 0..HANDSHAKE_TURN_CEILING {
       let out = self.drain_handshake();
       if !out.is_empty() {
         self.socket.send_to(&out, self.peer)?;
         sent_at = Some(Instant::now());
+        last_flight = out;
       }
       if !self.quic.is_handshaking() && self.keys.is_some() {
         return Ok(());
       }
-      let (n, from) = self.socket.recv_from(&mut buf).await?;
+      // Receive the peer's next flight, retransmitting our last flight each probe timeout so a dropped
+      // handshake packet — the common case being a peer not yet listening when we first sent — is recovered
+      // on the *same* connection (RFC 9002 §6.2: no handshake acknowledgement, arm the PTO and retransmit).
+      // This is what lets a client keep one dial socket across a peer's boot rather than re-dialing from a
+      // fresh port: a fresh-port re-dial would race the server's `accept`, which pins the first source it
+      // hears. The accept side, still to learn its peer, has no flight yet and no peer to send to, so it
+      // simply waits. Bounded by a retransmit ceiling (banned item 8: no unbounded wait).
+      let (n, from) = {
+        let mut retransmits = 0u32;
+        loop {
+          let received = {
+            let mut recv = std::pin::pin!(self.socket.recv_from(&mut buf));
+            let mut timer = std::pin::pin!(slates_rt::futures::sleep(self.probe_timeout()));
+            std::future::poll_fn(|cx| {
+              if let std::task::Poll::Ready(result) = std::future::Future::poll(recv.as_mut(), cx) {
+                return std::task::Poll::Ready(Some(result));
+              }
+              if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
+                return std::task::Poll::Ready(None);
+              }
+              std::task::Poll::Pending
+            })
+            .await
+          };
+          match received {
+            Some(result) => break result?,
+            None => {
+              retransmits += 1;
+              if retransmits > MAX_HANDSHAKE_RETRANSMITS {
+                return Err(EndpointError::NotReady);
+              }
+              if !self.learn_peer && !last_flight.is_empty() {
+                self.socket.send_to(&last_flight, self.peer)?;
+                sent_at = Some(Instant::now());
+              }
+            }
+          }
+        }
+      };
       // The handshake's own round trip seeds the RTT estimator (RFC 9002 §5.1: the handshake gives the
       // first sample): the time from this end's last flight to the peer's reply. Without it the probe
       // timeout the reliable exchanges arm against would stay at the conservative initial RTT (two thirds
       // of a second) until the first post-handshake acknowledgement — far too coarse for a loopback or
-      // LAN commit to recover a dropped packet within its budget. A coalesced or split flight makes this
-      // an approximation, which is all a seed needs to be.
+      // LAN commit to recover a dropped packet within its budget. A coalesced or split flight (or one that
+      // followed a retransmit) makes this an approximation, which is all a seed needs to be.
       if let Some(flight) = sent_at.take() {
         let sample = u64::try_from(Instant::now().saturating_duration_since(flight).as_nanos())
           .unwrap_or(u64::MAX);

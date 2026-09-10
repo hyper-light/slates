@@ -285,6 +285,33 @@ pub fn sync_membership(view: &Membership, fleet: &mut FleetNode) -> Vec<Reassign
   takeovers
 }
 
+/// Folds only `peer`'s liveness from `view` into `fleet` — the same alive-joins-it, dead-retires-it,
+/// suspect-leaves-it rule as [`sync_membership`], but for the one peer the caller names rather than the
+/// whole view. This is the fold a node running **one detector per peer** must use: a per-peer detector's
+/// gossip carries the *other* peers' states too (SWIM disseminates the whole view), so if each detector
+/// folded the whole view with `sync_membership`, one detector would re-join a peer another has just retired
+/// — the two would flap it until every detector independently converged. Scoping the fold to the detector's
+/// own peer removes that coupling: each peer is joined and retired by its own detector alone. Returns the
+/// takeovers a death produced (empty otherwise).
+pub fn sync_peer(view: &Membership, fleet: &mut FleetNode, peer: HostId) -> Vec<Reassignment> {
+  if peer == fleet.host() {
+    return Vec::new();
+  }
+  match view.state(peer) {
+    // Confirmed dead: retire it (and take over the objects that fall to this node).
+    Some(state) if state.liveness == Liveness::Dead => fleet.observe(peer, state).takeovers,
+    // Alive: fold it in so the membership holds it (idempotent once held; recovers it after a transient
+    // suspicion during formation).
+    Some(state) if state.liveness == Liveness::Alive => {
+      fleet.observe(peer, state);
+      Vec::new()
+    }
+    // Suspect or not yet seen: leave the fleet's current view untouched — a suspect is still a member until
+    // a confirmed death, exactly as `sync_membership` treats it.
+    _ => Vec::new(),
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -580,6 +607,59 @@ mod tests {
     assert!(
       sync_membership(&view, &mut fleet).is_empty(),
       "a second sync of the same view is a no-op"
+    );
+  }
+
+  /// `sync_peer` folds only the peer it names: retiring it on its death (taking over its objects) or
+  /// keeping it a member while alive — and never touching another peer, even one the view's gossip
+  /// carries. This is what lets a node run one detector per peer: a peer this node has retired must not be
+  /// re-joined from another peer's detector, or the two would flap it (the coupling `sync_membership`'s
+  /// whole-view fold has, which `sync_peer` is built to avoid).
+  #[test]
+  fn sync_peer_folds_only_the_peer_it_names() {
+    let mut fleet = FleetNode::new(SELF, Quorum { f: 1 }, &[A, B]);
+    let a_objects: Vec<ObjectId> = (0..8u64).map(|i| ObjectId::new(A, i)).collect();
+    for &object in &a_objects {
+      fleet.track_object(object, A);
+    }
+
+    // A's own detector has seen A die; its gossip still carries B alive (a per-peer detector disseminates
+    // the whole view). Folding it *scoped to A* retires A and hands this node A's objects — B is untouched.
+    let mut a_view = Membership::new(SELF);
+    a_view.apply(A, alive(0));
+    a_view.apply(A, dead(1));
+    a_view.apply(B, alive(0));
+    let takeovers = sync_peer(&a_view, &mut fleet, A);
+    assert!(
+      !fleet.configuration().neighbourhood.contains(&A),
+      "A is retired by its own detector"
+    );
+    assert!(
+      fleet.configuration().neighbourhood.contains(&B),
+      "B is untouched by A's fold"
+    );
+    assert!(!takeovers.is_empty(), "this node took over A's objects");
+
+    // B's detector still believes A alive (stale gossip about the peer this node just retired). Folding it
+    // *scoped to B* must NOT re-join A — the flap the per-peer detectors would suffer under a whole-view
+    // fold is exactly what this prevents.
+    let mut b_view = Membership::new(SELF);
+    b_view.apply(A, alive(0));
+    b_view.apply(B, alive(0));
+    let _ = sync_peer(&b_view, &mut fleet, B);
+    assert!(
+      !fleet.configuration().neighbourhood.contains(&A),
+      "A stays retired — B's detector never re-joins it"
+    );
+    assert!(
+      fleet.configuration().neighbourhood.contains(&B),
+      "B is still a member"
+    );
+
+    // Idempotent: a second fold of A's death is a no-op.
+    assert!(
+      sync_peer(&a_view, &mut fleet, A).is_empty(),
+      "a second sync of A's death takes over nothing"
     );
   }
 }

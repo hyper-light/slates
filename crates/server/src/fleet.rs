@@ -1,37 +1,45 @@
 //! The fleet membership loop the control shard runs (§4.8 "Membership"; §2.6 boot step 6). A fleet node
-//! probes its peers over the transport, serves their probes, and folds the converged SWIM view into its
-//! [`FleetNode`](slates_cluster::fleet::FleetNode) — retiring a dead peer and taking over the objects that
-//! rendezvous now ranks first to this node. Built for the **two-node** fleet — one peer per node — over
-//! [`Endpoint::accept`](slates_transport::endpoint::Endpoint::accept): a peer dials this node's advertised
-//! socket from an address chosen at dial time, and the node accepts it; each node *accepts* its one peer
-//! on its advertised socket and *dials* the peer's advertised socket from a separate socket, so the two
-//! sessions are cleanly one-directional (no bidirectional-request deadlock). Serving many peers on one
-//! socket needs the connection-ID demux the transport marks owed; that is the N-node generalization.
+//! probes each of its peers over the transport, serves their probes, replicates its volume heads to them,
+//! and folds the converged SWIM view into its [`FleetNode`](slates_cluster::fleet::FleetNode) — retiring a
+//! dead peer and taking over the objects that rendezvous now ranks first to this node.
 //!
-//! The loop runs as **two tasks** on the control shard, because [`serve_probe`] borrows its detector
-//! across the receive await while [`probe_once`] does not — so a single shared detector cannot drive both:
-//! - the **probe** task owns the failure [`Detector`], dials the peer, and each protocol period probes it,
-//!   folds the acknowledgement (or lets a timeout age the suspicion), then folds the detector's converged
-//!   view into the shard's `FleetNode` via [`sync_membership`] and records any takeover;
-//! - the **serve** task accepts the peer and answers its probes, so the peer sees this node alive; its own
-//!   detector builds the acknowledgement gossip.
+//! **Per-peer sessions over [`Endpoint::accept`]** (`slates_transport::endpoint::Endpoint::accept`): a peer
+//! dials this node from an address chosen at dial time, and the node accepts it. Because `accept` learns one
+//! peer from the first datagram on its socket, this node binds **one serve socket per peer per plane** and
+//! *dials* each peer's serve socket from a separate socket, so every session is cleanly one-directional (no
+//! bidirectional-request deadlock). A two-node fleet is the single-peer degenerate — one serve socket pair —
+//! and is proven live (`crates/server/tests/fleet.rs`). The loop is the general N-peer form (it iterates the
+//! transport's peers), but a fleet of N > 2 does not yet form its full mesh reliably: some of the N·(N−1)
+//! handshakes over `accept` intermittently fail to establish, which the robust connection management the
+//! transport marks owed (a fixed-port mesh, or an accept that re-learns across a dialer's flights) closes.
+//! Multiplexing several peers on *one* socket (an O(N) socket count rather than the mesh's O(N²)) is the
+//! connection-ID demux, also owed.
+//!
+//! **Tasks per peer on the control shard.** Each peer has its own probe task and serve tasks, because
+//! [`serve_probe`] borrows its detector across the receive await while [`probe_once`] does not — so a single
+//! shared detector cannot drive both, and each peer's detector is folded into the shared `FleetNode` by
+//! [`sync_peer`], which touches only the peer it tracks (its own deaths and joins), so N detectors compose:
+//! - the **probe** task owns a failure [`Detector`], dials the peer, and each protocol period probes it,
+//!   folds the acknowledgement (or lets a timeout age the suspicion), then folds the detector's view into
+//!   the shard's `FleetNode` and records any takeover;
+//! - the **serve** tasks accept the peer on this node's per-peer sockets and answer its probes (so the peer
+//!   sees this node alive) and its register record commits (so this node backs the peer as a holder);
+//! - the **ship** task dials the peer's record address and replicates this node's unplaced volume heads to
+//!   it each period (the cross-node commit, §4.8 "committed at `f + 1`").
 //!
 //! The `FleetNode` lives in the shard state (the verbs read it for placement), so it is touched only
 //! through brief synchronous [`state::with_state`] — never held across an await. At `f = 0` (the laptop)
 //! there is no fleet transport and this loop does not run; the placement path still runs the same
 //! `FleetNode`, degenerate (R8). Phase-one recovery of a taken-over object's head and serving it under the
-//! new epoch is owed; here the routing view records the reassignment `sync_membership` computes.
-
-use std::sync::mpsc::{TryRecvError, channel};
+//! new epoch is owed; here the routing view records the reassignment `sync_peer` computes.
 
 use rustls::pki_types::CertificateDer;
 use slates_cluster::detector::{Detector, DetectorTiming};
-use slates_cluster::fleet::sync_membership;
+use slates_cluster::fleet::sync_peer;
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once, serve_probe};
 use slates_cluster::{CommitBudget, commit_record, serve_record};
 use slates_db::register::{Acceptor, Authority, HostId, ObjectId, Quorum, Record};
-use slates_rt::error::RtError;
-use slates_rt::futures::{self, cancel, spawn_child};
+use slates_rt::futures;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 use slates_rt::udp::UdpSocket;
 use slates_transport::endpoint::Endpoint;
@@ -83,18 +91,28 @@ const LOCAL_HEALTH_CAP: u32 = 2;
 /// spinning. A finer value measured from the RTT is the owed refinement.
 const POLL_PER_PERIOD: u64 = 10;
 
-/// A fleet peer this node probes and is probed by (§4.8): its host id, its advertised (accept) address
-/// this node dials, and the operator-provisioned certificate the mutual-TLS session pins (§4.8 "TLS 1.3
-/// via rustls with certificates provisioned by the operator").
+/// A fleet peer this node probes and is probed by (§4.8): its host id, the two addresses this node dials to
+/// reach it, the two local addresses this node binds to *serve* it, and the operator-provisioned certificate
+/// the mutual-TLS session pins (§4.8 "TLS 1.3 via rustls with certificates provisioned by the operator").
+///
+/// The serve binds are **per peer**: [`Endpoint::accept`] learns one peer from the first datagram on its
+/// socket, so a node backing N peers needs one serve socket per peer per plane until the connection-ID demux
+/// that would multiplex several peers on one socket lands (owed, `endpoint.rs`). A two-node fleet is the
+/// single-peer degenerate — one peer, so one serve socket pair.
 pub struct FleetPeer {
   /// The peer's host id.
   pub host: HostId,
-  /// The peer's advertised probe address — where it accepts SWIM probes, and where this node dials it.
+  /// The peer's advertised probe address — where it accepts this node's SWIM probes, and where this node
+  /// dials it.
   pub address: SocketAddrV4,
-  /// The peer's advertised record address — where it accepts register record commits (a separate socket
-  /// from the probe one, because the SWIM and register wire formats are not distinguished by content on a
-  /// shared stream; the connection-ID demux that would multiplex them on one socket is owed).
+  /// The peer's advertised record address — where it accepts this node's register record commits (a separate
+  /// socket from the probe one, because the SWIM and register wire formats are not distinguished by content
+  /// on a shared stream; the connection-ID demux that would multiplex them on one socket is owed).
   pub record_address: SocketAddrV4,
+  /// This node's local probe-serve address for this peer — where it accepts *this peer's* SWIM probes.
+  pub probe_bind: SocketAddrV4,
+  /// This node's local record-serve address for this peer — where it accepts *this peer's* record commits.
+  pub record_bind: SocketAddrV4,
   /// The peer's operator-provisioned certificate, pinned for the mutual-TLS session.
   pub certificate: CertificateDer<'static>,
 }
@@ -103,17 +121,14 @@ pub struct FleetPeer {
 /// Clone-able [`DaemonConfig`](crate::config::DaemonConfig) because [`Identity`] is not `Clone` (it holds a
 /// private key): the membership *policy* (quorum + peers) lives in the config and builds the `FleetNode`;
 /// this *transport* material is handed to [`Daemon::start`](crate::Daemon) and moved to the control shard.
+/// Each peer carries its own serve binds (the per-peer socket mesh), so the node-level addresses live on the
+/// peers, not here.
 pub struct FleetTransport {
   /// This node's fleet TLS identity (operator-provisioned).
   pub identity: Identity,
   /// The TLS server name this node presents and its peers pin.
   pub name: String,
-  /// This node's advertised probe address — where it accepts peers' SWIM probes; bound on the control shard.
-  pub bind: SocketAddrV4,
-  /// This node's advertised record address — where it accepts peers' register record commits; bound on the
-  /// control shard, a separate socket from the probe one.
-  pub record_bind: SocketAddrV4,
-  /// The peers this node probes and is probed by.
+  /// The peers this node probes and is probed by, each with its own dial and serve addresses.
   pub peers: Vec<FleetPeer>,
 }
 
@@ -146,147 +161,121 @@ fn probe_budget() -> CommitBudget {
   CommitBudget::hard(HEARTBEAT_NS, (HEARTBEAT_NS / POLL_PER_PERIOD).max(1))
 }
 
-/// Runs the fleet membership loop for `transport` on the control shard (§4.8, boot step 6). It sets up the
-/// two sessions with the node's peer — accepting the peer on the advertised socket (the serve side) and
-/// dialing the peer's advertised address (the probe side) — and spawns the serve and probe tasks. Built
-/// for one peer (the two-node fleet); a further peer needs the connection-ID demux the transport marks
-/// owed. Detached tasks: they live as long as the shard and are cancelled by the runtime's shutdown.
+/// Runs the fleet membership loop for `transport` on the control shard (§4.8, boot step 6). For each peer it
+/// sets up the two sessions — accepting the peer on this node's per-peer serve sockets and dialing the peer's
+/// advertised addresses — and spawns the serve, probe and record-ship tasks. A two-node fleet is the
+/// single-peer degenerate; N peers use N serve socket pairs (one per peer, since [`Endpoint::accept`] pins
+/// one peer per socket) until the connection-ID demux that would multiplex peers on one socket lands (owed).
+/// Detached tasks: they live as long as the shard and are cancelled by the runtime's shutdown.
 pub async fn run_membership(transport: FleetTransport) {
   let FleetTransport {
     identity,
     name,
-    bind,
-    record_bind,
     peers,
   } = transport;
-  let Some(peer) = peers.into_iter().next() else {
-    // No peer — nothing to do (the placement path still runs the FleetNode, degenerate).
+  if peers.is_empty() {
+    // No peers — nothing to probe; the placement path still runs the `FleetNode`, degenerate (R8).
     return;
-  };
-  let neighbourhood = 2; // this node and its one peer (the two-node fleet).
+  }
+  // The identity is process-lifetime and shared by every peer's serve accepts and client dials — it is not
+  // `Clone` (it holds a private key), so it is leaked to `&'static` and each peer's tasks borrow the one
+  // copy. One leak per daemon boot.
+  let identity: &'static Identity = Box::leak(Box::new(identity));
+  let neighbourhood = peers.len().saturating_add(1); // this node and its peers.
   let local = state::with_state(|s| s.fleet.host()).unwrap_or(HostId(0));
   let budget = probe_budget();
 
-  // The two serve sides accept the peer on this node's two advertised sockets (bound here, on the control
-  // shard — a runtime context) and answer, one SWIM probes and one register record commits. Each is built
-  // with a borrow of the identity and moved to its task; the serve tasks must be up before the client dials
-  // below, so a peer's dial finds a listener (its initial packet is buffered on the bound socket meanwhile).
-  let (Ok(probe_accept), Ok(record_accept)) = (UdpSocket::bind(bind), UdpSocket::bind(record_bind)) else {
-    return;
-  };
-  let (Ok(probe_serve), Ok(record_serve)) = (
-    Endpoint::accept(
-      probe_accept,
-      &identity,
-      std::slice::from_ref(&peer.certificate),
-      FLEET_FRAME_CAP,
-    ),
-    Endpoint::accept(
-      record_accept,
-      &identity,
-      std::slice::from_ref(&peer.certificate),
-      FLEET_FRAME_CAP,
-    ),
-  ) else {
-    return;
-  };
-  if let Ok(task) = futures::spawn(serve_peer_probes(probe_serve, local, neighbourhood)) {
-    let _ = futures::detach(task);
-  }
-  if let Ok(task) = futures::spawn(serve_peer_records(record_serve, local, peer.host)) {
-    let _ = futures::detach(task);
-  }
-
-  // The probe client dials the peer's advertised probe address with the startup retry (the handshake is
-  // not retransmitted, so a lost initial packet — the peer not yet listening — is recovered by re-dialing).
-  // The identity is borrowed here for the probe dial and the two serve-side accepts above; it is then moved
-  // into the record ship loop, which dials the peer's record address at its own boot (see `ship_records`).
-  // Detached: cancelled by the runtime's shutdown.
-  let Some(probe_client) = dial(&identity, &name, peer.address, &peer.certificate, budget).await else {
-    return;
-  };
-  if let Ok(task) = futures::spawn(probe_peer(probe_client, peer.host, local, neighbourhood)) {
-    let _ = futures::detach(task);
-  }
-  if let Ok(task) = futures::spawn(ship_records(
-    identity,
-    name,
-    peer.record_address,
-    peer.certificate,
-    peer.host,
-    local,
-    budget,
-  )) {
-    let _ = futures::detach(task);
+  for peer in peers {
+    let FleetPeer {
+      host,
+      address,
+      record_address,
+      probe_bind,
+      record_bind,
+      certificate,
+    } = peer;
+    // The two serve sides accept this peer on this node's two per-peer sockets (bound here on the control
+    // shard) and answer, one SWIM probes and one register record commits. They come up before the clients
+    // dial, so a peer's dial finds a listener.
+    let (Ok(probe_accept), Ok(record_accept)) =
+      (UdpSocket::bind(probe_bind), UdpSocket::bind(record_bind))
+    else {
+      continue;
+    };
+    let (Ok(probe_serve), Ok(record_serve)) = (
+      Endpoint::accept(
+        probe_accept,
+        identity,
+        std::slice::from_ref(&certificate),
+        FLEET_FRAME_CAP,
+      ),
+      Endpoint::accept(
+        record_accept,
+        identity,
+        std::slice::from_ref(&certificate),
+        FLEET_FRAME_CAP,
+      ),
+    ) else {
+      continue;
+    };
+    if let Ok(task) = futures::spawn(serve_peer_probes(probe_serve, local, neighbourhood)) {
+      let _ = futures::detach(task);
+    }
+    if let Ok(task) = futures::spawn(serve_peer_records(record_serve, local, host)) {
+      let _ = futures::detach(task);
+    }
+    // The client sides each dial their own session — the probe task the peer's probe address, the record
+    // ship task the record address at its own boot — so a slow or not-yet-listening peer never blocks
+    // another peer's setup.
+    if let Ok(task) = futures::spawn(probe_peer(
+      identity,
+      name.clone(),
+      address,
+      certificate.clone(),
+      host,
+      local,
+      neighbourhood,
+    )) {
+      let _ = futures::detach(task);
+    }
+    if let Ok(task) = futures::spawn(ship_records(
+      identity,
+      name.clone(),
+      record_address,
+      certificate,
+      host,
+      local,
+      budget,
+    )) {
+      let _ = futures::detach(task);
+    }
   }
 }
 
-/// Dials `address` and completes the handshake, re-dialing from a fresh socket until the peer's accept side
-/// answers (the session-plane handshake is not retransmitted — owed — so a lost initial packet at startup
-/// stalls otherwise). `None` if the runtime refuses a socket or endpoint.
+/// Dials `address` and completes the handshake on one socket. The handshake retransmits its own flights
+/// ([`Endpoint::establish`]), so a single dial socket survives a peer that boots after this node first dials
+/// it — there is no re-dial from a fresh port, which would race the peer's `accept` (it pins the first source
+/// it hears, so a port change mid-handshake strands the session). `None` if the runtime refuses a socket or
+/// endpoint, or the handshake is abandoned (a peer that never answers within the retransmit ceiling).
 async fn dial(
   identity: &Identity,
   name: &str,
   address: SocketAddrV4,
   certificate: &CertificateDer<'static>,
-  budget: CommitBudget,
 ) -> Option<Endpoint> {
-  loop {
-    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).ok()?;
-    let client =
-      Endpoint::client(socket, address, identity, certificate, name, FLEET_FRAME_CAP).ok()?;
-    match establish_bounded(client, budget).await {
-      Ok(Some(established)) => return Some(established),
-      Ok(None) => continue,
-      Err(_) => return None,
-    }
-  }
-}
-
-/// What a bounded handshake reports.
-enum Established {
-  /// The handshake finished: the established endpoint (boxed — an endpoint is large, while the deadline
-  /// variant is empty), or `None` on a TLS/socket refusal.
-  Done(Option<Box<Endpoint>>),
-  /// The deadline elapsed first.
-  Deadline,
-}
-
-/// Completes `endpoint`'s handshake within `budget`'s deadline, racing it against a deadline the way
-/// [`probe_once`] races a probe: on the deadline the handshake task is cancelled (its endpoint dropped) and
-/// `None` is returned, so the caller re-dials. The session-plane handshake is not retransmitted (owed), so a
-/// lost initial packet — the peer not yet listening at startup — would otherwise stall the dialer forever.
-async fn establish_bounded(
-  mut endpoint: Endpoint,
-  budget: CommitBudget,
-) -> Result<Option<Endpoint>, RtError> {
-  let (tx, rx) = channel::<Established>();
-  let deadline_tx = tx.clone();
-  let handshake = spawn_child(async move {
-    let done = if endpoint.establish().await.is_ok() {
-      Some(Box::new(endpoint))
-    } else {
-      None
-    };
-    let _ = tx.send(Established::Done(done));
-  })?;
-  let deadline = spawn_child(async move {
-    futures::sleep(budget.deadline_ns).await;
-    let _ = deadline_tx.send(Established::Deadline);
-  })?;
-  loop {
-    match rx.try_recv() {
-      Ok(Established::Done(endpoint)) => {
-        let _ = cancel(deadline);
-        return Ok(endpoint.map(|boxed| *boxed));
-      }
-      Ok(Established::Deadline) => {
-        let _ = cancel(handshake);
-        return Ok(None);
-      }
-      Err(TryRecvError::Empty) => futures::sleep(budget.poll_interval_ns).await,
-      Err(TryRecvError::Disconnected) => return Ok(None),
-    }
+  let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).ok()?;
+  let mut client = Endpoint::client(
+    socket,
+    address,
+    identity,
+    certificate,
+    name,
+    FLEET_FRAME_CAP,
+  )
+  .ok()?;
+  match client.establish().await {
+    Ok(()) => Some(client),
+    Err(_) => None,
   }
 }
 
@@ -306,13 +295,27 @@ async fn serve_peer_probes(mut endpoint: Endpoint, local: HostId, neighbourhood:
   {}
 }
 
-/// The probe side (its session already established): each protocol period, probe the peer, fold the outcome,
-/// and fold the detector's converged view into the shard's `FleetNode` (§4.8). While the session is alive a
-/// successful probe reuses it (continuous packet numbers); a timeout drops it and the loop keeps ticking so
-/// the suspicion ages to death (the peer is unreachable — the single session cannot be re-established),
-/// driving the takeover the moment the fleet retires it.
-async fn probe_peer(endpoint: Endpoint, peer_host: HostId, local: HostId, neighbourhood: usize) {
+/// The probe side: dial the peer's probe address (so a slow or not-yet-listening peer never blocks the other
+/// peers' loops — each probe task dials its own), then each protocol period probe the peer, fold the outcome,
+/// and fold this detector's converged view into the shard's `FleetNode` (§4.8). Each peer has its own probe
+/// task and its own detector; `sync_membership` folds each detector's view without disturbing the peers it
+/// does not track, so N detectors compose into one membership. While the session is alive a successful probe
+/// reuses it (continuous packet numbers); a timeout drops it and the loop keeps ticking so the suspicion ages
+/// to death (the peer is unreachable — the single session cannot be re-established), driving the takeover the
+/// moment the fleet retires it.
+async fn probe_peer(
+  identity: &'static Identity,
+  name: String,
+  address: SocketAddrV4,
+  certificate: CertificateDer<'static>,
+  peer_host: HostId,
+  local: HostId,
+  neighbourhood: usize,
+) {
   let budget = probe_budget();
+  let Some(endpoint) = dial(identity, &name, address, &certificate).await else {
+    return;
+  };
   let timing = detector_timing(neighbourhood);
   let fanout = usize::try_from(timing.gossip_transmits).unwrap_or(1);
   let mut detector = Detector::new(local, timing);
@@ -348,9 +351,13 @@ async fn probe_peer(endpoint: Endpoint, peer_host: HostId, local: HostId, neighb
       }
     }
 
-    // Fold the converged view into the shard's FleetNode (brief, synchronous — never held across an await).
+    // Fold this peer's liveness into the shard's FleetNode (brief, synchronous — never held across an await).
+    // Peer-scoped ([`sync_peer`], not `sync_membership`): each peer has its own detector, and a detector's
+    // gossip carries other peers' states, so folding the whole view would let one peer's detector re-join a
+    // peer another has retired — they would flap it until every detector converged. Scoped to this peer, the
+    // retirement sticks the moment this detector ages it out.
     let retired = state::with_state(|s| {
-      let takeovers = sync_membership(detector.membership(), &mut s.fleet);
+      let takeovers = sync_peer(detector.membership(), &mut s.fleet, peer_host);
       (
         !takeovers.is_empty(),
         !s.fleet.configuration().neighbourhood.contains(&peer_host),
@@ -439,7 +446,7 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
 /// work — is owed; so a lost session is retried, but a peer that has torn its accept side down is reached
 /// only once it rebuilds.
 async fn ship_records(
-  identity: Identity,
+  identity: &'static Identity,
   name: String,
   record_address: SocketAddrV4,
   certificate: CertificateDer<'static>,
@@ -458,12 +465,12 @@ async fn ship_records(
   // its handshake now rather than waiting idle for a first use seconds later (an idle accept socket does not
   // wake promptly on a datagram that arrives long after its handshake — the same reuse stall the commit
   // itself would hit). The session then stays open, reused across commits; a commit that loses it redials.
-  let mut session = dial(&identity, &name, record_address, &certificate, budget).await;
+  let mut session = dial(identity, &name, record_address, &certificate).await;
   loop {
     let work = state::with_state(|s| unplaced_heads(s, local)).unwrap_or_default();
     // A session lost to a straggler timeout is redialed the next period there is a head to place.
     if !work.is_empty() && session.is_none() {
-      session = dial(&identity, &name, record_address, &certificate, budget).await;
+      session = dial(identity, &name, record_address, &certificate).await;
     }
     for head in work {
       let Some(endpoint) = session.take() else {

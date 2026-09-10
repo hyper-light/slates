@@ -322,7 +322,8 @@ impl Daemon {
   /// not yet placed, the daemon is stopping, or it is a laptop (no fleet loop runs). Runs a one-shot query
   /// on the control shard, bounded by the liveness budget.
   pub fn fleet_head_placed(&self, object: slates_db::register::ObjectId) -> bool {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied()) else {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
       return false;
     };
     let (tx, rx) = std::sync::mpsc::channel();
