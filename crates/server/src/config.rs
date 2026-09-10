@@ -3,6 +3,7 @@
 
 use slates_anchor::Geometry;
 use slates_db::partition::PartitionCaps;
+use slates_db::register::{HostId, Quorum};
 use slates_ipc::RegionGeometry;
 use slates_machine::{Derived, MachineProfile, derived};
 use slates_mem::budget::region_bytes;
@@ -75,6 +76,24 @@ pub struct StoreCaps {
   pub dir_cutover: usize,
 }
 
+/// The fleet membership this node is configured to join (§4.8, boot step 6): the fault-tolerance
+/// quorum and the peer hosts its neighbourhood is drawn from. `None` on the `DaemonConfig` is the
+/// laptop — `f = 0`, solo, one member (itself), the same code path a fleet runs (R8), the cluster plane
+/// degenerate. Placement, the configuration group and the owner's acceptor are built over this at boot
+/// (`init_shard`). The *transport* the live probe/gossip loop dials each peer over (its address and the
+/// operator-provisioned certificate, §4.8 "certificates provisioned by the operator") arrives with that
+/// loop; this is the membership the placement authority is built over, which a single-host daemon leaves
+/// `None`.
+#[derive(Clone, Debug)]
+pub struct FleetMembership {
+  /// The fault tolerance: a write commits at `f + 1` acknowledgements of `2f + 1` candidate holders
+  /// (§4.8). `f = 0` is the solo degenerate (one candidate, the owner) — the same as no fleet at all.
+  pub quorum: Quorum,
+  /// The peer hosts this node's neighbourhood is drawn from, believed alive at boot; SWIM refines the
+  /// live set from here. This host is always a member and is never listed among its own peers.
+  pub peers: Vec<HostId>,
+}
+
 /// The daemon's configuration.
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
@@ -105,6 +124,11 @@ pub struct DaemonConfig {
   pub instance: String,
   /// The operator's failover SLO, the lease term's ceiling (§4.4 "Derived constants", D-16).
   pub failover_slo_ns: u64,
+  /// The fleet this node joins (§4.8, boot step 6), or `None` for the laptop (`f = 0`, solo — the
+  /// degenerate of the same code path, R8). A single-host daemon leaves this `None` and every placement
+  /// is local; a fleet node names its quorum and peers, and the placement authority, configuration group
+  /// and owner acceptor are built over them at boot.
+  pub fleet: Option<FleetMembership>,
   /// Every derivation, for the boot log.
   pub derivations: Vec<String>,
 }
@@ -310,6 +334,9 @@ impl DaemonConfig {
       page: usize::try_from(page).unwrap_or(1).max(1),
       instance: instance.to_owned(),
       failover_slo_ns: FAILOVER_SLO_NS,
+      // The laptop default: no fleet, `f = 0`, solo. An operator deploying a fleet sets this (with
+      // `with_fleet`); the derivation from the machine profile is the same either way (R8).
+      fleet: None,
       derivations,
     }
   }
@@ -329,6 +356,14 @@ impl DaemonConfig {
     self.runtime.pin = false;
     self.runtime.cores = Vec::new();
     self.geometry.partitions = shards.max(1);
+    self
+  }
+
+  /// The same configuration joined to a fleet (§4.8, boot step 6): the placement authority, configuration
+  /// group and owner acceptor are built over `membership` (its quorum and peers) at boot, rather than the
+  /// solo degenerate. An operator sets this to deploy a fleet node; a laptop leaves it unset.
+  pub fn with_fleet(mut self, membership: FleetMembership) -> DaemonConfig {
+    self.fleet = Some(membership);
     self
   }
 }

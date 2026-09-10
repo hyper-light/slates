@@ -33,7 +33,7 @@ pub mod peer;
 pub mod state;
 pub mod verbs;
 
-pub use config::DaemonConfig;
+pub use config::{DaemonConfig, FleetMembership};
 pub use daemon::{Daemon, SegmentSource};
 
 pub use error::ServerError;

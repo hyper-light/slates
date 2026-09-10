@@ -433,11 +433,18 @@ fn init_shard(
   // thing when Phase 8 adds peers. One host, `f = 0`, on a laptop.
   let host = slates_db::HostId(host_id_of(identity));
   // The owner runtime this node takes part in a region as (§4.8, boot step 6): membership + the
-  // configuration group + the owner's acceptor, composed by `slates-cluster`. `solo` is the laptop
-  // `f = 0` degenerate — one member, itself the owner — the same code path a fleet runs (R8). The
-  // placement authority the verbs read is `fleet.configuration()`; the live probe/gossip loop that
-  // folds membership into it (and the cross-node commit) are the next fleet pieces.
-  let fleet = slates_cluster::fleet::FleetNode::solo(host);
+  // configuration group + the owner's acceptor, composed by `slates-cluster`. Built from the configured
+  // fleet membership (its quorum and peers) when the operator deploys a fleet, or the laptop `f = 0`
+  // degenerate — `solo`, one member, itself the owner — when there is none; `solo` is `new(host, f = 0,
+  // no peers)`, so it is the same code path a fleet runs (R8), not a branch in behaviour. The placement
+  // authority the verbs read is `fleet.configuration()`; the live probe/gossip loop that folds
+  // membership into it (and the cross-node commit) are the next fleet pieces.
+  let fleet = match &config.fleet {
+    Some(membership) => {
+      slates_cluster::fleet::FleetNode::new(host, membership.quorum, &membership.peers)
+    }
+    None => slates_cluster::fleet::FleetNode::solo(host),
+  };
   // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
   let content = match AnchorSegment::open_content(env) {
