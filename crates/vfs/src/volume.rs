@@ -2972,7 +2972,7 @@ fn materialized_windows(body: &Body, chunk: u64) -> std::collections::BTreeMap<u
   map
 }
 
-fn snapshot_handle(id: SnapshotId) -> Handle<Snapshot> {
+pub(crate) fn snapshot_handle(id: SnapshotId) -> Handle<Snapshot> {
   Handle::from_raw(id.index, id.generation)
 }
 

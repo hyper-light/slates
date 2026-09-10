@@ -10,10 +10,13 @@
 //! so its host id — the fleet member id — is distinct.
 //!
 //! Coverage here: two daemons detect a dead peer and retire it; a provisioned head replicates across a
-//! two-node fleet to the `f = 1` quorum; and **three** daemons form one fleet over the per-peer socket mesh
-//! and the two survivors each retire a dead node (the smallest fleet that keeps a quorum through a death at
-//! `f = 1`). Real multi-process deployment and the connection-ID demux (many peers on one socket) are
-//! further gates.
+//! two-node fleet to the `f = 1` quorum and a holder durably holds it; **three** daemons form one fleet over
+//! the per-peer socket mesh, the two survivors each retire a dead node, and the first-ranked survivor takes
+//! over the dead owner's head (**five** at `f = 2`, over a multi-holder promotion quorum); a sealed
+//! snapshot's **content** — written over the daemon's real NFS port — replicates to its holder by missing
+//! set and places (§4.10); and a takeover successor **serves** the dead owner's bytes back over its own NFS
+//! port. Real multi-process deployment and the connection-ID demux (many peers on one socket) are further
+//! gates.
 
 use std::time::{Duration, Instant};
 
@@ -21,15 +24,22 @@ use rustls::pki_types::PrivateKeyDer;
 use slates_db::HostId;
 use slates_db::register::{ObjectId, Quorum, rendezvous_first};
 use slates_ipc::protocol::{
-  Direction, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass, pack, unpack,
+  Direction, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass, SnapshotId, VolumeId, pack,
+  unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 use slates_server::daemon::host_id_of;
+use slates_server::head::HeadValue;
 use slates_server::{
   Daemon, DaemonConfig, FleetMembership, FleetPeer, FleetTransport, SegmentSource,
 };
+
+mod common;
+use std::net::TcpStream;
+
+use common::nfs::{create, lookup, mount, read, write};
 use slates_transport::handshake::Identity;
 use slates_wire::request::RequestId;
 
@@ -743,10 +753,14 @@ fn a_holder_durably_holds_the_owners_replicated_head() {
     held.0, host_a,
     "B records A as the owner of the held object"
   );
-  assert_eq!(
-    held.1,
-    id.bytes.to_vec(),
-    "B holds the head's value (the volume id bytes)"
+  let head = HeadValue::from_record_bytes(&held.1).expect("B holds a well-formed head value");
+  assert!(
+    head.manifest.is_none(),
+    "an unsealed volume's head names no content: {head:?}"
+  );
+  assert!(
+    matches!(head.size, slates_db::catalog::SizeClass::Bounded { limit } if limit == 1 << 20),
+    "B holds the head's catalog essentials (the size class the volume was created with): {head:?}"
   );
 }
 
@@ -849,9 +863,9 @@ fn three_daemons_take_over_a_dead_owners_head() {
     held.0, successor,
     "the successor is now the object's owner (the takeover reassigned ownership)"
   );
+  let head = HeadValue::from_record_bytes(&held.1).expect("a well-formed head value");
   assert_eq!(
-    held.1,
-    id.bytes.to_vec(),
+    head.name, "taken-over",
     "the taken-over head's value survived the promotion and re-commit"
   );
 }
@@ -958,10 +972,239 @@ fn five_daemons_take_over_a_dead_owners_head_over_a_multi_holder_quorum() {
     held.0, successor,
     "the successor is now the object's owner (the takeover reassigned ownership)"
   );
+  let head = HeadValue::from_record_bytes(&held.1).expect("a well-formed head value");
   assert_eq!(
-    held.1,
-    id.bytes.to_vec(),
+    head.name, "taken-over-5",
     "the taken-over head's value survived the multi-holder promotion and re-commit"
+  );
+}
+
+/// Shape: the bytes a fleet test writes into a volume over NFS and expects back — under the NFS
+/// client's 400-byte read, and distinctive.
+const CONTENT: &[u8] =
+  b"sealed on the owner, replicated to its candidate holders, served after its death\n";
+/// Shape: how long to wait for a sealed snapshot's content and head to place across the fleet — the
+/// archive walk, the offer/put rounds and the head commit, each a few protocol periods on loopback.
+const PLACEMENT_DEADLINE: Duration = Duration::from_secs(20);
+/// Shape: how long to wait for a takeover successor to materialize and serve the taken-over content —
+/// the takeover, a possible fetch from the recorded holder, and the restore.
+const SERVE_DEADLINE: Duration = Duration::from_secs(25);
+
+/// Writes [`CONTENT`] as `hello.txt` into the volume mounted at `/<name>` on `daemon`'s NFS port.
+fn write_hello_over_nfs(daemon: &Daemon, name: &str) {
+  let port = daemon.nfs_port().expect("the daemon serves NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
+  let root_fh = mount(&mut stream, &format!("/{name}"), 1);
+  let file_fh = create(&mut stream, &root_fh, "hello.txt", 2);
+  write(&mut stream, &file_fh, CONTENT, 3);
+}
+
+/// Reads `hello.txt` back from the volume mounted at `/<name>` on `daemon`'s NFS port.
+fn read_hello_over_nfs(daemon: &Daemon, name: &str) -> Vec<u8> {
+  let port = daemon.nfs_port().expect("the daemon serves NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
+  let root_fh = mount(&mut stream, &format!("/{name}"), 1);
+  let file_fh = lookup(&mut stream, &root_fh, "hello.txt", 2);
+  read(&mut stream, &file_fh, 3)
+}
+
+/// Provisions `name` on the owner (`daemons[0]`, reached at `instance`), writes [`CONTENT`] into it over
+/// NFS, seals it with a snapshot, and waits for the snapshot to place and for every other daemon to hold
+/// the head — the state a takeover test needs before the owner dies. Returns the volume id, or why the
+/// setup did not complete (the caller stops the daemons and fails).
+fn seal_hello_on_owner(instance: &str, daemons: &[Daemon], name: &str) -> Result<VolumeId, String> {
+  let mut client = Client::connect(instance);
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    return Err("the volume was not created".to_owned());
+  };
+  write_hello_over_nfs(&daemons[0], name);
+  let ReplyBody::Snapshotted { id: snapshot } = client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    return Err("the snapshot was not taken".to_owned());
+  };
+  let placed = poll_snapshot_placed(&mut client, id, snapshot);
+  let survivors: Vec<&Daemon> = daemons[1..].iter().collect();
+  let all_hold = poll_all_hold(&survivors, ObjectId(id.bytes));
+  if placed && all_hold {
+    Ok(id)
+  } else {
+    Err(format!(
+      "placed={placed}, every survivor holds the head={all_hold}"
+    ))
+  }
+}
+
+/// Polls `status` for `volume` at the daemon reached at `instance` until it answers with a report (the
+/// volume is served there) or the serve deadline passes; returns whether it did.
+fn poll_status_answers(instance: &str, volume: VolumeId) -> bool {
+  let mut client = Client::connect(instance);
+  let deadline = Instant::now() + SERVE_DEADLINE;
+  while Instant::now() < deadline {
+    if matches!(
+      client.call(&RequestBody::Status { volume }),
+      ReplyBody::Status { .. }
+    ) {
+      return true;
+    }
+    std::thread::yield_now();
+  }
+  false
+}
+
+/// Polls the owner's `await placed(snapshot, region)` verb until it answers placed, or the placement
+/// deadline passes; returns whether it did.
+fn poll_snapshot_placed(client: &mut Client, volume: VolumeId, snapshot: SnapshotId) -> bool {
+  let deadline = Instant::now() + PLACEMENT_DEADLINE;
+  while Instant::now() < deadline {
+    let reply = client.call(&RequestBody::AwaitPlaced {
+      volume,
+      snapshot: Some(snapshot),
+      scope: Scope::Region,
+    });
+    if matches!(reply, ReplyBody::Placed { placed: true, .. }) {
+      return true;
+    }
+    std::thread::yield_now();
+  }
+  false
+}
+
+/// AC (§4.10 "Content replication"; §4.8 mechanism 1 — "content to `f + 1` … the acknowledging set is
+/// written into the object's head record"; AC-8.2 "no head record names content that is not placed"): in
+/// a two-node `f = 1` fleet, a file written over NFS into a volume on A and sealed by a snapshot has its
+/// **content** replicated to the peer — A archives the snapshot in bounded slices, offers the archive, ships
+/// exactly the chunks B lacks, B verifies and holds them whole — and only then does the head naming it
+/// commit, so A's `await placed(snapshot, region)` answers placed and B holds the manifest. Non-vacuous: at
+/// `f = 1` a sealed snapshot is `Local` (its `await placed` false) until B acknowledges the content and the
+/// head places, and B holds nothing until the put reaches it and verifies.
+#[test]
+fn a_sealed_snapshots_content_replicates_to_the_holder_and_places() {
+  let _serial = serialize_fleet_tests();
+  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let pid = std::process::id();
+  let instance_a = format!("fleet-{}-{pid}", a.host.0);
+  let peer_of_a = Peer {
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start(a, peer_of_a);
+  let daemon_b = start(b, peer_of_b);
+  let settle = Instant::now() + FORMATION_SETTLE;
+  while Instant::now() < settle {
+    std::thread::yield_now();
+  }
+
+  let mut client = Client::connect(&instance_a);
+  let ReplyBody::Created { id } = client.call(&scratch("sealed")) else {
+    daemon_a.stop();
+    daemon_b.stop();
+    panic!("the volume was not created");
+  };
+  let object = ObjectId(id.bytes);
+  write_hello_over_nfs(&daemon_a, "sealed");
+  let ReplyBody::Snapshotted { id: snapshot } = client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    daemon_a.stop();
+    daemon_b.stop();
+    panic!("the snapshot was not taken");
+  };
+
+  let placed = poll_snapshot_placed(&mut client, id, snapshot);
+  let manifest = daemon_a.fleet_head_manifest(object);
+  let held = manifest.is_some_and(|manifest| daemon_b.fleet_holder_content(manifest));
+
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    placed,
+    "the sealed snapshot's content and head placed at the f=1 quorum: `await placed(snapshot, region)`"
+  );
+  assert!(
+    manifest.is_some(),
+    "the snapshot's manifest identity was recorded once its content placed"
+  );
+  assert!(
+    held,
+    "B holds the snapshot's content whole, by the manifest identity the head names"
+  );
+}
+
+/// AC (§4.8 "Promotion and takeover" — the successor "adopts the newest records, and serves"; §4.10
+/// clone-from-archive; R8 one code path): three daemons form an `f = 1` fleet; a file is written over NFS
+/// into a volume on A and sealed; its content places (A plus one content candidate) and its head reaches
+/// both survivors; A dies; the survivor rendezvous ranks first takes the head over **and serves the
+/// content** — it materializes the volume under its original id and mount name from the archive it holds,
+/// or fetches the archive by identity from the recorded content holder when it was not the content
+/// candidate — and a client mounting `/served` on the successor's NFS port reads the file back byte for
+/// byte. Non-vacuous: before the takeover the successor has no such volume (its `status` refuses
+/// `NotFound`), and only the content plane can put the bytes there.
+#[test]
+fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let serve = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  // Provision, write and seal on A; wait for the content and head to place and for both survivors to
+  // hold the head (the promotion quorum after A dies).
+  let sealed = seal_hello_on_owner(&instance_a, &daemons, "served");
+  let id = match sealed {
+    Ok(id) => id,
+    Err(why) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("setup: {why}");
+    }
+  };
+  let object = ObjectId(id.bytes);
+
+  // A dies. The first-ranked survivor takes over the head, then serves the content.
+  let owner = daemons.remove(0);
+  owner.stop();
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
+  let successor_index = if successor == hosts[1] { 0 } else { 1 };
+  let head_placed = poll_head_placed(&daemons[successor_index], object);
+
+  // The successor serves the volume once it materialized it: its `status` answers instead of refusing.
+  let served = poll_status_answers(&format!("fleet3-{}-{pid}", successor.0), id);
+  let got = if served {
+    Some(read_hello_over_nfs(&daemons[successor_index], "served"))
+  } else {
+    None
+  };
+
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(head_placed, "the successor took over the dead owner's head");
+  assert!(
+    served,
+    "the successor materialized the taken-over volume and serves it under its id"
+  );
+  assert_eq!(
+    got.as_deref(),
+    Some(CONTENT),
+    "the file written on the dead owner reads back byte for byte over the successor's NFS port"
   );
 }
 

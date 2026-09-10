@@ -33,6 +33,7 @@ slates-cli = { path = "crates/cli", version = "0.1.0" }
 slates-wire-derive = { path = "crates/wire-derive", version = "0.1.0" }
 slates-transport = { path = "crates/transport", version = "0.1.0" }
 slates-cluster = { path = "crates/cluster", version = "0.1.0" }
+slates-archive = { path = "crates/archive", version = "0.1.0" }
 
 # Third-party versions are pinned once here. Exact `=` pins only where an ABI contract is
 # version-specific, each with a comment saying why (Appendix B.1).

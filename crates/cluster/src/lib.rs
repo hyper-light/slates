@@ -32,6 +32,7 @@
 //! `f = 0` degenerate of the fleet consensus, which is owed).
 
 pub mod config_group;
+pub mod content;
 pub mod coordinates;
 pub mod detector;
 pub(crate) mod fixed;
@@ -59,7 +60,7 @@ use crate::progress::{DeadlineExtender, ExtensionOutcome, ProgressWitness};
 /// The stream a record request rides on a holder connection.
 /// Format: the register-ship RPC uses one stream per connection; the holder's `serve_once` accepts
 /// whichever stream arrives, so the exact id is a fixed label, not a tunable.
-const RECORD_STREAM: u64 = 1;
+pub const RECORD_STREAM: u64 = 1;
 
 /// A refusal committing a record across the cluster.
 #[derive(Debug)]
@@ -119,7 +120,7 @@ pub async fn serve_record(
   acceptor: &mut Acceptor,
 ) -> Result<(), slates_transport::endpoint::EndpointError> {
   endpoint
-    .serve_once(|request| match Record::decode(&request) {
+    .serve_once(|_, request| match Record::decode(&request) {
       Ok(record) => match acceptor.accept(&record) {
         Ok(ack) => ack.encode(),
         Err(_) => Vec::new(),
@@ -220,8 +221,9 @@ impl CommitBudget {
   /// may grant. A dispatch task bounds its own wait ([`request_within`]) by this, so it hands its holder's
   /// session back no later than the loop stops waiting for it, and a reply arriving during a granted
   /// extension is still received rather than cut off at the base deadline. At the [`hard`](CommitBudget::hard)
-  /// degenerate (no extensions) this is exactly the base deadline.
-  fn max_deadline_ns(&self) -> u64 {
+  /// degenerate (no extensions) this is exactly the base deadline. Public so a caller bounds a single
+  /// exchange it drives itself (a content fetch) by the same span its quorum dispatches use.
+  pub fn max_deadline_ns(&self) -> u64 {
     self.deadline_ns.saturating_add(
       self
         .extension_ns
@@ -375,16 +377,19 @@ fn is_placed(candidates: &[HostId], acked: &[HostId], quorum: Quorum) -> bool {
   .placed(quorum)
 }
 
-/// Collects replies until quorum or the deadline: records each distinct, binding acknowledgement into
-/// `acked`, keeps every replying holder's endpoint for reuse, and returns the reusable endpoints and
+/// Collects replies until quorum or the deadline: records into `acked` each reply from a distinct
+/// candidate that `binds` (the caller's check that the reply is *this* dispatch's acknowledgement from
+/// *that* holder — a record acknowledgement's identity binding, a content acknowledgement's manifest
+/// binding), keeps every replying holder's endpoint for reuse, and returns the reusable endpoints and
 /// whether the deadline was reached. Recovers the endpoints of tasks that finished after the loop.
-async fn collect_acks(
+/// Shared by every quorum dispatch (records, content) so the binding-and-quorum discipline is one.
+pub(crate) async fn collect_bound(
   rx: &mut std::sync::mpsc::Receiver<Reply>,
-  record: &Record,
   candidates: &[HostId],
   quorum: Quorum,
   budget: CommitBudget,
   acked: &mut Vec<HostId>,
+  binds: impl Fn(HostId, &[u8]) -> bool,
 ) -> (Vec<(HostId, Endpoint)>, bool) {
   let mut reusable: Vec<(HostId, Endpoint)> = Vec::new();
   let mut timed_out = false;
@@ -393,12 +398,7 @@ async fn collect_acks(
     match rx.try_recv() {
       Ok(Reply(host, reply, endpoint)) => {
         reusable.push((host, *endpoint));
-        if let Ok(ack) = Ack::decode(&reply)
-          && ack.holder == host
-          && ack.binds(record)
-          && candidates.contains(&host)
-          && !acked.contains(&host)
-        {
+        if candidates.contains(&host) && !acked.contains(&host) && binds(host, &reply) {
           acked.push(host);
         }
       }
@@ -502,8 +502,15 @@ pub async fn commit_record(
   }
   drop(tx); // so the channel disconnects once every task has ended
 
-  let (reusable, timed_out) =
-    collect_acks(&mut rx, record, candidates, quorum, budget, &mut acked).await;
+  let (reusable, timed_out) = collect_bound(
+    &mut rx,
+    candidates,
+    quorum,
+    budget,
+    &mut acked,
+    |host, reply| Ack::decode(reply).is_ok_and(|ack| ack.holder == host && ack.binds(record)),
+  )
+  .await;
 
   // Whatever is still running is left to finish — a straggler cut off by a cancellation (an early quorum
   // at f > 1, or a commit that timed out just before its reply) would lose its session, which the
@@ -588,7 +595,7 @@ fn spawn_failed(tasks: &[slates_rt::TaskId], error: RtError) -> Committed {
 /// The stream a phase-one prepare request rides on a holder connection — distinct from the commit
 /// stream so a holder can tell a promotion from a write.
 /// Format: the register-promote RPC uses its own stream id per connection; a fixed label, not a tunable.
-const PROMOTE_STREAM: u64 = 2;
+pub const PROMOTE_STREAM: u64 = 2;
 
 /// Serves one phase-one prepare on a holder: receives the [`Prepare`] over the transport, runs it
 /// through the holder's [`Acceptor`] (which checks the installed generation and owner, raises the fence
@@ -601,7 +608,7 @@ pub async fn serve_promotion(
   acceptor: &mut Acceptor,
 ) -> Result<(), slates_transport::endpoint::EndpointError> {
   endpoint
-    .serve_once(|request| match Prepare::decode(&request) {
+    .serve_once(|_, request| match Prepare::decode(&request) {
       Ok(prepare) => match acceptor.prepare(&prepare) {
         Ok(promise) => promise.encode(),
         Err(_) => Vec::new(),
@@ -885,7 +892,7 @@ pub async fn serve_ledger_promotion(
   acceptor: &mut LedgerAcceptor,
 ) -> Result<(), slates_transport::endpoint::EndpointError> {
   endpoint
-    .serve_once(|request| match Prepare::decode(&request) {
+    .serve_once(|_, request| match Prepare::decode(&request) {
       Ok(prepare) => match acceptor.prepare(&prepare) {
         Ok(promise) => promise.encode(),
         Err(_) => Vec::new(),

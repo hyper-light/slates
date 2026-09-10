@@ -42,9 +42,19 @@
 //! promotes the object over all surviving candidate holders and re-commits the adopted head under the new
 //! epoch, recording the placement so the verbs read the head owned and region-placed. The serve loop answers
 //! a `Prepare` from the same durable hold ([`serve_held_promotion`]). This is the general `f`-tolerant form
-//! (proven at `f = 1` over three nodes and `f = 2` over five, the promotion spanning a multi-holder quorum);
-//! serving the taken-over head's **content** (§4.10) — a holder has the head record, not the chunk bytes — is
-//! owed.
+//! (proven at `f = 1` over three nodes and `f = 2` over five, the promotion spanning a multi-holder quorum).
+//!
+//! **Content replication and serve** (§4.10 "Content replication"; §4.8 mechanism 1): each owned volume's
+//! newest snapshot is archived in bounded slices ([`advance_seals`], the vfs `SnapshotArchiver`), its
+//! archive put to the content candidates by missing set until `f + 1` hold it verified
+//! ([`put_seal_content`], the first round to `f + 1`, later rounds hedged to the rest), and only then the
+//! head naming the manifest and the acknowledging holders shipped ([`head_value_of`]) and the snapshot
+//! recorded placed durably ([`record_placed_seals`]). A holder serves the content exchanges from
+//! [`ShardState::held_content`] on the record session's content streams. After a takeover the successor
+//! serves the adopted head's content: it materializes the volume under its original id from the archive it
+//! holds, or fetches it by identity from a recorded holder ([`materialize_pending`]). Owed: content-defined
+//! chunking and the compress-or-not cost model (D-17), the hedge trigger from a measured p95, anti-entropy
+//! and the healer, and the per-shard record plane (the loop runs on the control shard's volumes).
 //!
 //! The `FleetNode` lives in the shard state (the verbs read it for placement), so it is touched only
 //! through brief synchronous [`state::with_state`] — never held across an await. At `f = 0` (the laptop)
@@ -52,10 +62,19 @@
 //! `FleetNode`, degenerate (R8).
 
 use rustls::pki_types::CertificateDer;
+use slates_archive::Archive;
+use slates_cluster::content::{fetch_content, is_content_stream, put_content};
 use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::fleet::sync_peer;
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once, serve_probe};
-use slates_cluster::{ClusterError, CommitBudget, Stragglers, commit_record, promote_record};
+use slates_cluster::{
+  ClusterError, CommitBudget, PROMOTE_STREAM, RECORD_STREAM, Stragglers, commit_record,
+  promote_record,
+};
+use slates_db::Op;
+use slates_db::catalog::{
+  PlacementState, SnapshotId as DbSnapshotId, VolumeId as DbVolumeId, VolumeRecord,
+};
 use slates_db::register::{
   Acceptor, Authority, FIRST_EPOCH, HostEpoch, HostId, ObjectId, Placement, Prepare, Quorum,
   Record, candidates_for,
@@ -65,9 +84,13 @@ use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 use slates_rt::udp::UdpSocket;
 use slates_transport::endpoint::Endpoint;
 use slates_transport::handshake::Identity;
+use slates_vfs::clock::Clock;
+use slates_vfs::export::{Progress, SnapshotArchiver};
 
 use crate::daemon::HEARTBEAT_NS;
+use crate::head::{HeadValue, PlacedHead, SealJob};
 use crate::state::{self, ShardState};
+use crate::verbs;
 
 /// Format: RFC 9000 §14.1 — the smallest maximum UDP payload every QUIC path is required to carry without
 /// path-MTU discovery (which the transport marks owed, `endpoint.rs`). Sizing a fleet datagram within it
@@ -482,17 +505,25 @@ async fn serve_peer_records(mut endpoint: Endpoint, local: HostId, peer_host: Ho
   // state, so an accepted record survives past this task — the state a survivor's phase-one recovery reads
   // on a takeover — and a prepare is answered from it. The handler runs synchronously inside `serve_once` (a
   // brief `with_state` borrow, no await held across it). A serve failure ends the loop.
+  // Each request kind rides its own stream id, so the dispatch is by kind: a record commit, a phase-one
+  // prepare, or a content exchange (an offer, a put, a fetch — §4.10) — never a guess from the bytes.
   loop {
     let served = endpoint
-      .serve_once(|request| {
-        if let Ok(prepare) = Prepare::decode(&request) {
-          state::with_state(|s| serve_held_promotion(s, &prepare)).unwrap_or_default()
-        } else if let Ok(record) = Record::decode(&request) {
-          state::with_state(|s| accept_held_record(s, local, peer_host, &record))
-            .unwrap_or_default()
-        } else {
-          Vec::new()
+      .serve_once(|stream, request| match stream {
+        RECORD_STREAM => Record::decode(&request)
+          .ok()
+          .and_then(|record| {
+            state::with_state(|s| accept_held_record(s, local, peer_host, &record))
+          })
+          .unwrap_or_default(),
+        PROMOTE_STREAM => Prepare::decode(&request)
+          .ok()
+          .and_then(|prepare| state::with_state(|s| serve_held_promotion(s, &prepare)))
+          .unwrap_or_default(),
+        stream if is_content_stream(stream) => {
+          state::with_state(|s| s.held_content.serve(local, &request)).unwrap_or_default()
         }
+        _ => Vec::new(),
       })
       .await;
     if served.is_err() {
@@ -589,9 +620,15 @@ struct Head {
 }
 
 /// The volume heads this node owns that some candidate has **not yet acknowledged** (§4.8 "records are sent
-/// to **all** candidates; committed at `f + 1`"): for each volume whose placement still has a remote
-/// candidate holder missing the head, the record to commit, the full candidate set, the candidates that
-/// already hold it, and the quorum the configuration computes. Read under `with_state`.
+/// to **all** candidates; committed at `f + 1`"): for each volume whose head at its current sequence still
+/// has a remote candidate holder missing it, the record to commit, the full candidate set, the candidates
+/// that already hold it, and the quorum the configuration computes. Read under `with_state`.
+///
+/// The head's sequence is the volume's epoch — 0 at creation (the epoch-one head, naming no content), and
+/// the snapshot's epoch once it is sealed — and its value ([`HeadValue`]) names the snapshot's content and
+/// the holders that acknowledged it. A sealed head is shipped only once its content is placed ("no head
+/// record names content that is not placed", AC-8.2), so until then the volume's head stays at what was
+/// last placed; [`head_value_of`] is that gate.
 ///
 /// The gate is per-holder (a candidate has not acked), **not** the object's overall quorum: a head reaches
 /// `f + 1` acknowledgements (region-placed, durable) from *some* candidates, but every candidate must still
@@ -603,12 +640,19 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
   let config = state.fleet.configuration();
   let mut heads = Vec::new();
   for (_, slot) in state.volumes.iter() {
+    let Some(record) = state.db.partition().volume(slot.id) else {
+      continue;
+    };
     let object = ObjectId(slot.id.bytes);
+    let Some((sequence, value)) = head_value_of(state, record, object, config.quorum) else {
+      continue; // The newest seal's content is not yet placed: the head waits for it.
+    };
     let placement = config.place(object);
     let acked = state
       .placed_heads
       .get(&object)
-      .map(|placed| placed.acked.clone())
+      .filter(|head| head.sequence == sequence)
+      .map(|head| head.placement.acked.clone())
       .unwrap_or_default();
     // Every remote candidate that has not acked still needs the head; when none remain the head is done.
     let outstanding = placement
@@ -623,10 +667,10 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
       record: Record {
         owner: local,
         object,
-        sequence: 0,
+        sequence,
         epoch: config.host_epoch,
         generation: config.version,
-        value: slot.id.bytes.to_vec(),
+        value: value.to_record_bytes(),
       },
       candidates: placement.candidates,
       acked,
@@ -634,6 +678,427 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
     });
   }
   heads
+}
+
+/// The head this node should be shipping for `record`'s volume — its sequence and value — or `None` while
+/// the volume's newest snapshot has content not yet placed. At epoch 0 it is the creation head (no content).
+/// For a sealed snapshot it names the manifest and the content holders: from the snapshot's durable record
+/// once the seal completed (`SnapshotIdentified` + `SnapshotPlaced`), else from the seal in progress once
+/// its content has placed, else nothing yet. The catalog essentials come from the volume record.
+fn head_value_of(
+  state: &ShardState,
+  record: &VolumeRecord,
+  object: ObjectId,
+  quorum: Quorum,
+) -> Option<(u64, HeadValue)> {
+  let value = |manifest: Option<[u8; 32]>, content_holders: Vec<u64>| HeadValue {
+    manifest,
+    content_holders,
+    name: record.name.clone(),
+    size: record.policy.size,
+    names: record.policy.names,
+    owner: record.owner.clone(),
+  };
+  if record.epoch == 0 {
+    return Some((0, value(None, Vec::new())));
+  }
+  if let Some(snapshot) = state.db.partition().snapshot(record.id, record.head)
+    && let PlacementState::Placed { region, .. } = &snapshot.placed
+    && let Some(identity) = snapshot.identity
+  {
+    return Some((record.epoch, value(Some(identity), region.clone())));
+  }
+  let seal = state.seals.get(&object)?;
+  if seal.snapshot != record.head || !seal.content.placed(quorum) {
+    return None;
+  }
+  let holders = seal.content.acked.iter().map(|host| host.0).collect();
+  Some((seal.sequence, value(seal.manifest, holders)))
+}
+
+/// A seal whose archive is complete and whose content is not yet placed: the put to run this period.
+struct ContentWork {
+  object: ObjectId,
+  snapshot: DbSnapshotId,
+  sequence: u64,
+  archive: Archive,
+  candidates: Vec<HostId>,
+  acked: Vec<HostId>,
+  quorum: Quorum,
+  round: u32,
+}
+
+/// The status refusal count under which the fleet loop records a snapshot it could not archive (a
+/// base-backed entry whose bytes are on disk, not in RAM; a torn read): the seal stays `Local`, reported.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const SEAL_REFUSED: &str = "fleet.seal";
+
+/// One period of this node's seals (§4.10 "auto-seal" → content replication; §4.3 bounded slices): for each
+/// owned volume whose newest snapshot is not yet placed, a seal job is started (or replaced, when a newer
+/// snapshot superseded the one being sealed), its archive walk is advanced one slice of `slice_bytes`, and —
+/// once the archive is complete and its content not yet placed — the content put to run this period is
+/// returned, its archive moved out for the dispatch and put back after ([`put_seal_content`]). A seal whose
+/// snapshot the database already records placed is dropped (a restart resumes nothing it need not).
+fn advance_seals(
+  state: &mut ShardState,
+  local: HostId,
+  slice_bytes: u64,
+  created_unix: u64,
+) -> Vec<ContentWork> {
+  let quorum = state.fleet.configuration().quorum;
+  let mut work = Vec::new();
+  let volumes: Vec<(DbVolumeId, slates_mem::Handle<crate::state::VolumeSlot>)> =
+    state.by_id.iter().map(|(id, h)| (*id, *h)).collect();
+  for (id, handle) in volumes {
+    let object = ObjectId(id.bytes);
+    let Some((head, sequence)) = sealable_head(state, id, object) else {
+      continue;
+    };
+    if !state.seals.contains_key(&object)
+      && !start_seal(state, local, object, handle, head, sequence, created_unix)
+    {
+      continue;
+    }
+    if !advance_seal(state, object, handle, slice_bytes) {
+      continue;
+    }
+    if let Some(item) = content_work(state, object, quorum) {
+      work.push(item);
+    }
+  }
+  work
+}
+
+/// The head snapshot of `id` that still needs sealing — its id and the head sequence — or `None` when the
+/// volume has no snapshot yet, or its head is already recorded placed (a finished seal is dropped). A seal in
+/// progress for an older snapshot is dropped too: the newer snapshot supersedes it.
+fn sealable_head(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  object: ObjectId,
+) -> Option<(DbSnapshotId, u64)> {
+  let record = state.db.partition().volume(id)?;
+  if record.epoch == 0 {
+    return None; // Nothing sealed yet: the creation head names no content.
+  }
+  let (head, sequence) = (record.head, record.epoch);
+  let placed = state
+    .db
+    .partition()
+    .snapshot(id, head)
+    .is_some_and(|snapshot| matches!(snapshot.placed, PlacementState::Placed { .. }));
+  if placed {
+    state.seals.remove(&object);
+    return None;
+  }
+  if state
+    .seals
+    .get(&object)
+    .is_some_and(|job| job.snapshot != head)
+  {
+    state.seals.remove(&object);
+  }
+  Some((head, sequence))
+}
+
+/// Starts the seal of `head` for `object`: the archive walk over the volume's snapshot, and the content
+/// placement with the owner already counted (it holds its own content) when it is a candidate. `false`,
+/// counted, if the snapshot cannot be walked.
+fn start_seal(
+  state: &mut ShardState,
+  local: HostId,
+  object: ObjectId,
+  handle: slates_mem::Handle<crate::state::VolumeSlot>,
+  head: DbSnapshotId,
+  sequence: u64,
+  created_unix: u64,
+) -> bool {
+  let Ok(slot) = state.volumes.get(handle) else {
+    return false;
+  };
+  let archiver = SnapshotArchiver::new(
+    &slot.volume,
+    &state.store,
+    verbs::core_snapshot(slates_ipc::protocol::SnapshotId { value: head.value }),
+    object.local(),
+    created_unix,
+  );
+  let Ok(archiver) = archiver else {
+    *state.refusals.entry(SEAL_REFUSED).or_insert(0) += 1;
+    return false;
+  };
+  let mut content = state.fleet.configuration().place(object);
+  content.acked = if content.candidates.contains(&local) {
+    vec![local]
+  } else {
+    Vec::new()
+  };
+  state.seals.insert(
+    object,
+    SealJob {
+      snapshot: head,
+      sequence,
+      archiver: Some(archiver),
+      archive: None,
+      manifest: None,
+      content,
+      rounds: 0,
+    },
+  );
+  true
+}
+
+/// Advances `object`'s seal one slice of `slice_bytes`; `true` once its archive is complete (this slice or
+/// an earlier one). A snapshot that cannot be archived whole (an overlay's base bytes are not in RAM) stays
+/// `Local`, counted so an operator sees why it never places (§4.4 coverage is never upgraded).
+fn advance_seal(
+  state: &mut ShardState,
+  object: ObjectId,
+  handle: slates_mem::Handle<crate::state::VolumeSlot>,
+  slice_bytes: u64,
+) -> bool {
+  let Some(job) = state.seals.get_mut(&object) else {
+    return false;
+  };
+  let Some(archiver) = job.archiver.as_mut() else {
+    return true;
+  };
+  let Ok(slot) = state.volumes.get(handle) else {
+    return false;
+  };
+  match archiver.advance(&slot.volume, &state.store, slice_bytes) {
+    Ok(Progress::More) => false,
+    Ok(Progress::Done(archive)) => {
+      job.manifest = Some(archive.manifest.identity());
+      job.archive = Some(archive);
+      job.archiver = None;
+      true
+    }
+    Err(_) => {
+      job.archiver = None;
+      *state.refusals.entry(SEAL_REFUSED).or_insert(0) += 1;
+      false
+    }
+  }
+}
+
+/// The content put `object`'s seal calls for this period — its archive moved out for the dispatch — or
+/// `None` once the content is placed (the head naming it then ships through `unplaced_heads`) or while
+/// the archive is out on a put.
+fn content_work(state: &mut ShardState, object: ObjectId, quorum: Quorum) -> Option<ContentWork> {
+  let job = state.seals.get_mut(&object)?;
+  if job.content.placed(quorum) {
+    return None;
+  }
+  let archive = job.archive.take()?;
+  Some(ContentWork {
+    object,
+    snapshot: job.snapshot,
+    sequence: job.sequence,
+    archive,
+    candidates: job.content.candidates.clone(),
+    acked: job.content.acked.clone(),
+    quorum,
+    round: job.rounds,
+  })
+}
+
+/// Runs one content round for a seal (§4.8 mechanism 1: "content is sent to `f + 1` candidates first,
+/// hedged to the remaining candidates after the measured p95 put latency"): the first round goes to the
+/// first `f` remote candidates in rendezvous order (the owner is the `f + 1`-th copy), every later round
+/// hedges to all remaining candidates — the round's own deadline is the hedge trigger until the p95 is
+/// measured (owed). The holders' sessions are borrowed for the put and returned; the acknowledging set is
+/// merged into the seal whatever the round's outcome (each acknowledgement is a distinct holder's verified,
+/// durable hold), and the archive is put back for the next round. Returns the dispatch to settle.
+async fn put_seal_content(
+  local: HostId,
+  work: ContentWork,
+  budget: CommitBudget,
+) -> Option<Dispatch> {
+  let hedge = usize::try_from(work.quorum.f).unwrap_or(0);
+  let remote: Vec<HostId> = work
+    .candidates
+    .iter()
+    .copied()
+    .filter(|host| *host != local && !work.acked.contains(host))
+    .collect();
+  let targets: Vec<HostId> = if work.round == 0 {
+    remote.into_iter().take(hedge).collect()
+  } else {
+    remote
+  };
+  let holders = take_sessions(|host| targets.contains(&host));
+  let (placement, dispatch) = if holders.is_empty() {
+    (None, None)
+  } else {
+    let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
+    let placed = put_content(
+      local,
+      &work.archive,
+      work.object,
+      work.sequence,
+      &work.candidates,
+      work.quorum,
+      holders,
+      budget,
+    )
+    .await;
+    let dispatch = Dispatch::new(taken, &placed.reusable, placed.stragglers);
+    return_sessions(placed.reusable);
+    let placement = match placed.outcome {
+      Ok(placement) => Some(placement),
+      Err(ClusterError::Uncertain { placement } | ClusterError::NotPlaced { placement }) => {
+        Some(placement)
+      }
+      Err(_) => None,
+    };
+    (placement, Some(dispatch))
+  };
+  state::with_state(|s| {
+    let Some(job) = s.seals.get_mut(&work.object) else {
+      return; // The seal was superseded meanwhile; its archive is dropped with it.
+    };
+    if job.snapshot != work.snapshot {
+      return;
+    }
+    job.archive = Some(work.archive);
+    if let Some(placement) = placement {
+      job.rounds = job.rounds.saturating_add(1);
+      for host in placement.acked {
+        if !job.content.acked.contains(&host) {
+          job.content.acked.push(host);
+        }
+      }
+    }
+  });
+  dispatch
+}
+
+/// Records durably each seal whose content **and** head have both placed (§4.10; AC-8.2 "no head record names
+/// content that is not placed"): the snapshot's manifest identity (`SnapshotIdentified`) and its region
+/// placement (`SnapshotPlaced`, the content holders), the facts `status` and `await placed(region)` answer
+/// from and a restart resumes from. The seal is then dropped — its archive with it; the volume holds the
+/// bytes, and its holders serve them by identity.
+fn record_placed_seals(state: &mut ShardState) {
+  let quorum = state.fleet.configuration().quorum;
+  let now = state.clock.monotonic_ns();
+  let done: Vec<(ObjectId, DbSnapshotId, [u8; 32], Vec<u64>)> = state
+    .seals
+    .iter()
+    .filter_map(|(object, job)| {
+      let identity = job.manifest?;
+      if !job.content.placed(quorum) {
+        return None;
+      }
+      let head = state.placed_heads.get(object)?;
+      if head.sequence != job.sequence || !head.placement.placed(quorum) {
+        return None;
+      }
+      let region = job.content.acked.iter().map(|host| host.0).collect();
+      Some((*object, job.snapshot, identity, region))
+    })
+    .collect();
+  for (object, snapshot, identity, region) in done {
+    let volume = DbVolumeId { bytes: object.0 };
+    let ops = [
+      Op::SnapshotIdentified {
+        volume,
+        id: snapshot,
+        identity,
+      },
+      Op::SnapshotPlaced {
+        volume,
+        id: snapshot,
+        placed: PlacementState::Placed {
+          region,
+          mirror: None,
+        },
+      },
+    ];
+    for op in &ops {
+      if state.db.mutate(&mut state.segment, op, now).is_err() {
+        break; // The snapshot is gone (destroyed meanwhile): nothing to record; the seal is dropped.
+      }
+    }
+    state.seals.remove(&object);
+  }
+}
+
+/// The status refusal count under which the fleet loop records a taken-over volume it could not
+/// materialize (an archive it could not hold, a name already taken locally, admission refused): the
+/// takeover's head is placed and served, but its content is not yet served, and the attempt repeats each
+/// period while the condition holds — counted so an operator sees it.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const MATERIALIZE_REFUSED: &str = "fleet.materialize";
+
+/// Serves the content of each taken-over object whose head this node adopted (§4.8 "adopts the newest
+/// records, and serves"; §4.10): if the manifest the head names is held whole (this node was a content
+/// candidate) the volume is materialized from it; otherwise the archive is fetched by identity from a
+/// recorded content holder over its live session (§4.10 "fetches … by identity from a recorded holder"),
+/// held once verified, and then materialized. An object whose content is not yet reachable stays pending
+/// and is retried next period.
+async fn materialize_pending(budget: CommitBudget) {
+  let pending: Vec<(ObjectId, HeadValue)> = state::with_state(|s| {
+    s.pending_materializations
+      .iter()
+      .map(|(object, head)| (*object, head.clone()))
+      .collect()
+  })
+  .unwrap_or_default();
+  for (object, head) in pending {
+    let Some(manifest) = head.manifest else {
+      // A head naming no content (the volume was never sealed): nothing to serve beyond the head.
+      state::with_state(|s| s.pending_materializations.remove(&object));
+      continue;
+    };
+    let held = state::with_state(|s| s.held_content.holds_manifest(&manifest)).unwrap_or(false);
+    if !held {
+      let holders = head.holders();
+      let mut sessions = take_sessions(|host| holders.contains(&host));
+      let Some((host, endpoint)) = sessions.pop() else {
+        return_sessions(sessions);
+        continue; // No recorded holder reachable this period.
+      };
+      return_sessions(sessions);
+      let (archive, endpoint) = fetch_content(endpoint, manifest, budget.max_deadline_ns()).await;
+      return_sessions(vec![(host, endpoint)]);
+      let Some(archive) = archive else {
+        continue;
+      };
+      let stored = state::with_state(|s| s.held_content.hold(archive).is_ok()).unwrap_or(false);
+      if !stored {
+        count_refusal(MATERIALIZE_REFUSED);
+        continue;
+      }
+    }
+    state::with_state(|s| materialize(s, object, &head));
+  }
+}
+
+/// Materializes one taken-over volume from the content this node holds for its head (see
+/// [`materialize_pending`]); on success the object is no longer pending, on a refusal it is counted and
+/// stays pending.
+fn materialize(state: &mut ShardState, object: ObjectId, head: &HeadValue) {
+  let Some(manifest) = head.manifest else {
+    return;
+  };
+  let Some(archive) = state.held_content.archive_of(&manifest) else {
+    return;
+  };
+  let sequence = state
+    .placed_heads
+    .get(&object)
+    .map_or(0, |placed| placed.sequence);
+  let region = head.content_holders.clone();
+  let id = DbVolumeId { bytes: object.0 };
+  match verbs::materialize_taken_over(state, id, head, sequence, region, &archive) {
+    Ok(()) => {
+      state.pending_materializations.remove(&object);
+    }
+    Err(_) => {
+      *state.refusals.entry(MATERIALIZE_REFUSED).or_insert(0) += 1;
+    }
+  }
 }
 
 /// The status refusal count under which the fleet loop records a peer whose serve sockets could not be
@@ -779,22 +1244,55 @@ async fn run_record_plane(local: HostId, budget: CommitBudget) {
     if let Some(authority) = owner_authority(local) {
       let _ = owner_acceptor.install_authority(authority);
     }
-    // Ship each unplaced head to all its candidate holders at once, committed at `f + 1`.
-    let work = state::with_state(|s| unplaced_heads(s, local)).unwrap_or_default();
-    for head in work {
-      if let Some(dispatch) = ship_head(&mut owner_acceptor, local, &head, budget).await {
-        in_flight.push(dispatch);
-      }
-    }
-    // Drive each owed takeover over all this object's surviving candidate holders (phase-one recovery). A
-    // drive that does not place leaves the object pending, so the next period retries.
-    let owed = state::with_state(|s| takeovers(s, local)).unwrap_or_default();
-    for object in owed {
-      in_flight.extend(drive_takeover(object, local, budget).await);
-    }
+    run_record_period(local, budget, &mut owner_acceptor, &mut in_flight).await;
     futures::sleep(HEARTBEAT_NS).await;
   }
 }
+
+/// One period of the record plane, in the order the design's placement rule requires: seals advance and
+/// their content is put (content places first), then the heads naming placed content ship, then the seals
+/// whose content and head both placed are recorded durably, then owed takeovers are driven and adopted
+/// heads' content served.
+async fn run_record_period(
+  local: HostId,
+  budget: CommitBudget,
+  owner_acceptor: &mut Acceptor,
+  in_flight: &mut Vec<Dispatch>,
+) {
+  // Advance this node's seals one bounded slice each and put the completed archives' content to their
+  // candidates (§4.10) — content places before the head that names it ships.
+  let seals = state::with_state(|s| {
+    let slice_bytes = s.config.archive_slice_bytes;
+    let created_unix = u64::try_from(s.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND;
+    advance_seals(s, local, slice_bytes, created_unix)
+  })
+  .unwrap_or_default();
+  for work in seals {
+    if let Some(dispatch) = put_seal_content(local, work, budget).await {
+      in_flight.push(dispatch);
+    }
+  }
+  // Ship each unplaced head to all its candidate holders at once, committed at `f + 1`.
+  let work = state::with_state(|s| unplaced_heads(s, local)).unwrap_or_default();
+  for head in work {
+    if let Some(dispatch) = ship_head(owner_acceptor, local, &head, budget).await {
+      in_flight.push(dispatch);
+    }
+  }
+  // Record durably each seal whose content and head have both placed.
+  state::with_state(record_placed_seals);
+  // Drive each owed takeover over all this object's surviving candidate holders (phase-one recovery). A
+  // drive that does not place leaves the object pending, so the next period retries.
+  let owed = state::with_state(|s| takeovers(s, local)).unwrap_or_default();
+  for object in owed {
+    in_flight.extend(drive_takeover(object, local, budget).await);
+  }
+  // Serve the content of each adopted head, from what this node holds or a recorded holder.
+  materialize_pending(budget).await;
+}
+
+/// Format: nanoseconds per second, for the archive header's creation time in Unix seconds.
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// Commits one head to the candidate holders that have not yet acknowledged it (those with a live session in
 /// the shard state), through the owner's own acceptor, at `f + 1`. The holders' sessions are borrowed for the
@@ -832,25 +1330,38 @@ async fn ship_head(
     Err(ClusterError::Uncertain { placement } | ClusterError::NotPlaced { placement }) => placement,
     Err(_) => return Some(dispatch), // A runtime refusal dispatched nothing; retry next period.
   };
-  record_acks(head.object, placement);
+  record_acks(head.object, head.record.sequence, placement);
   Some(dispatch)
 }
 
-/// Merges an acknowledging set into the object's recorded placement — never overwriting it: the union of
-/// every round's acknowledgements is the true region placement, since each holder's acceptance is durable on
-/// that holder and binds the same record, so `f + 1` distinct acknowledgements place the head whichever
-/// rounds carried them. `unplaced_heads` reads the merged set to ship only to the candidates still missing
-/// the head, and the verbs read it for `region_placed`.
-fn record_acks(object: ObjectId, placement: Placement) {
+/// Merges an acknowledging set into the object's recorded placement at `sequence` — never overwriting it
+/// within a sequence: the union of every round's acknowledgements is the true region placement, since each
+/// holder's acceptance is durable on that holder and binds the same record, so `f + 1` distinct
+/// acknowledgements place the head whichever rounds carried them. A newer sequence replaces an older one's
+/// placement (the head register's newest position is the head); an older round's acknowledgements are
+/// ignored. `unplaced_heads` reads the merged set to ship only to the candidates still missing the head,
+/// and the verbs read it for `region_placed`.
+fn record_acks(object: ObjectId, sequence: u64, placement: Placement) {
   state::with_state(|s| {
-    let entry = s.placed_heads.entry(object).or_insert_with(|| Placement {
-      candidates: placement.candidates.clone(),
-      acked: Vec::new(),
-      mirror_acked: None,
+    let entry = s.placed_heads.entry(object).or_insert_with(|| PlacedHead {
+      sequence,
+      placement: Placement {
+        candidates: placement.candidates.clone(),
+        acked: Vec::new(),
+        mirror_acked: None,
+      },
     });
+    if entry.sequence > sequence {
+      return; // A stale round for a superseded head.
+    }
+    if entry.sequence < sequence {
+      entry.sequence = sequence;
+      entry.placement.candidates = placement.candidates.clone();
+      entry.placement.acked.clear();
+    }
     for host in placement.acked {
-      if !entry.acked.contains(&host) {
-        entry.acked.push(host);
+      if !entry.placement.acked.contains(&host) {
+        entry.placement.acked.push(host);
       }
     }
   });
@@ -997,16 +1508,26 @@ async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -
     if let Ok(placement) = committed.outcome
       && placement.placed(quorum)
     {
-      placed = Some(placement);
+      placed = Some((adoption.sequence, adoption.value.clone(), placement));
     }
   }
   // Re-insert the hold (now under this node's authority) and, when the adoption placed, record the placement
-  // and clear the pending takeover so the head is served as owned; otherwise the object stays pending.
+  // and clear the pending takeover so the head is served as owned — and queue the head's content to be
+  // materialized and served (§4.10); otherwise the object stays pending.
   state::with_state(|s| {
     s.holder_records.insert(object, acceptor);
-    if let Some(placement) = placed {
-      s.placed_heads.insert(object, placement);
+    if let Some((sequence, value, placement)) = placed {
+      s.placed_heads.insert(
+        object,
+        PlacedHead {
+          sequence,
+          placement,
+        },
+      );
       s.pending_takeovers.remove(&object);
+      if let Some(head) = HeadValue::from_record_bytes(&value) {
+        s.pending_materializations.insert(object, head);
+      }
     }
   });
   dispatches

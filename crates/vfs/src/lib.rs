@@ -31,6 +31,7 @@ pub mod derive;
 pub mod dir;
 pub mod dirtree;
 pub mod error;
+pub mod export;
 pub mod host;
 pub mod ids;
 pub mod inode;

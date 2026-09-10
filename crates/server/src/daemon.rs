@@ -372,7 +372,7 @@ impl Daemon {
           let quorum = s.fleet.configuration().quorum;
           s.placed_heads
             .get(&object)
-            .is_some_and(|placement| placement.placed(quorum))
+            .is_some_and(|head| head.placement.placed(quorum))
         })
         .unwrap_or(false);
         let _ = tx.send(placed);
@@ -383,6 +383,60 @@ impl Daemon {
     }
     rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
       .unwrap_or(false)
+  }
+
+  /// Whether this node **holds whole**, as a content candidate, the snapshot content with `manifest`
+  /// identity (§4.10 "Content replication"): every chunk the manifest references, verified on arrival. A
+  /// test or an operator reads this to observe that a holder received an owner's sealed content over the
+  /// wire — the bytes a takeover successor materializes from. Non-vacuous: a holder holds nothing until the
+  /// owner's content put reaches it and verifies. Runs a one-shot query on the control shard, bounded by
+  /// the liveness budget; `false` if the daemon is stopping or the shard does not answer in time.
+  pub fn fleet_holder_content(&self, manifest: [u8; 32]) -> bool {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
+      return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        let held = state::with_state(|s| s.held_content.holds_manifest(&manifest)).unwrap_or(false);
+        let _ = tx.send(held);
+      })
+      .is_err()
+    {
+      return false;
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .unwrap_or(false)
+  }
+
+  /// The manifest identity of the head snapshot of the volume `object` names, once the content plane has
+  /// archived it (§4.10; recorded durably as `SnapshotIdentified`), or `None` before then, for a volume
+  /// with no snapshot, or for one this node does not own. Runs a one-shot query on the control shard,
+  /// bounded by the liveness budget.
+  pub fn fleet_head_manifest(&self, object: slates_db::register::ObjectId) -> Option<[u8; 32]> {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
+      return None;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        let identity = state::with_state(|s| {
+          let id = slates_db::catalog::VolumeId { bytes: object.0 };
+          let record = s.db.partition().volume(id)?;
+          s.db.partition().snapshot(id, record.head)?.identity
+        })
+        .flatten();
+        let _ = tx.send(identity);
+      })
+      .is_err()
+    {
+      return None;
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .ok()
+      .flatten()
   }
 
   /// The head this node **durably holds** for `object` as a candidate holder (§4.8 "records are sent to
@@ -665,6 +719,9 @@ fn init_shard(
     holder_records: std::collections::BTreeMap::new(),
     pending_takeovers: std::collections::BTreeSet::new(),
     record_sessions: std::collections::BTreeMap::new(),
+    held_content: slates_cluster::content::ContentHold::new(),
+    seals: std::collections::BTreeMap::new(),
+    pending_materializations: std::collections::BTreeMap::new(),
   };
   let rebuilt = verbs::rebuild_recovered(&mut state);
   if rebuilt.skipped > 0 {

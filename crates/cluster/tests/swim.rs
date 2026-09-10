@@ -174,7 +174,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
           // the prober; the correct rejection delivers nothing.
           let coordinate = Detector::new(TARGET, timing()).coordinate();
           let _ = endpoint
-            .serve_once(move |_request| {
+            .serve_once(move |_, _request| {
               SwimMessage::Ack {
                 from: TARGET,
                 nonce: STALE_NONCE,

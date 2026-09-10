@@ -9,7 +9,7 @@ use slates_anchor::AnchorSegment;
 use slates_base::OsHost;
 use slates_db::Db;
 use slates_db::catalog::{Principal, VolumeId};
-use slates_db::register::{Acceptor, ObjectId, Placement};
+use slates_db::register::{Acceptor, ObjectId};
 use slates_ipc::DaemonEnd;
 use slates_ipc::protocol::ReplyBody;
 use slates_mem::SharedObject;
@@ -176,7 +176,7 @@ pub struct ShardState {
   /// candidate holders and reached the quorum. The placement authority the verbs read (`region_placed`,
   /// `await_placed`) consults this — a head with a stored quorum placement is region-placed; without one it
   /// is the local append (`f = 0`, or not yet replicated). Empty on a laptop (no fleet loop runs).
-  pub placed_heads: BTreeMap<ObjectId, Placement>,
+  pub placed_heads: BTreeMap<ObjectId, crate::head::PlacedHead>,
   /// The fleet peers this node has established a live probe session with (§4.8): a peer is inserted the
   /// moment its probe session's handshake completes, so this is the set of peers the direct mesh has
   /// actually formed to — distinct from the membership's optimistically **seeded** alive set, which holds
@@ -221,6 +221,23 @@ pub struct ShardState {
   /// which the link task re-establishes; a retired peer's entry is removed with it. Empty on a laptop (no
   /// fleet loop runs).
   pub record_sessions: BTreeMap<slates_db::HostId, Option<slates_transport::endpoint::Endpoint>>,
+  /// What this node holds as a **content candidate** for other owners' snapshots (§4.10 "Content
+  /// replication"): the distinct chunks by identity and each manifest held whole, verified before
+  /// anything is stored — served on the record session's content stream by the fleet loop. It is what
+  /// a takeover successor materializes a taken-over volume from, and what a reader fetches by identity.
+  /// Empty on a laptop (no fleet loop runs).
+  pub held_content: slates_cluster::content::ContentHold,
+  /// The seals in progress for volumes this node owns (§4.10), by object: each walks the volume's newest
+  /// snapshot into its archive in bounded slices, puts the archive to the content candidates until
+  /// `f + 1` hold it, and is dropped once the head naming it places and the snapshot is recorded placed.
+  /// Empty on a laptop and whenever every owned snapshot is placed.
+  pub seals: BTreeMap<ObjectId, crate::head::SealJob>,
+  /// Taken-over objects whose head this node adopted and placed but whose **content** it has not yet
+  /// materialized into a served volume (§4.10 "Promotion and takeover" → serve): the adopted head
+  /// value, kept until the manifest's archive is held (already, as a content candidate, or fetched
+  /// from a recorded holder) and the volume is created under its original id. Empty once every
+  /// takeover serves.
+  pub pending_materializations: BTreeMap<ObjectId, crate::head::HeadValue>,
 }
 
 /// A work volume's accumulated declared operations (§4.16), composed into an increment on submit.

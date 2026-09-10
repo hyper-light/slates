@@ -749,13 +749,16 @@ impl Endpoint {
     }
   }
 
-  /// The server side of one request/reply exchange: receives a request stream, passes its bytes to
-  /// `handler`, and sends the reply back on the same stream id, returning once the reply is
-  /// acknowledged. Drives one [`Connection`]: phase one receives and acknowledges the request until its
-  /// `fin`; phase two frames the reply and completes when the peer has acknowledged all of it.
+  /// The server side of one request/reply exchange: receives a request stream, passes its stream id
+  /// and bytes to `handler`, and sends the reply back on the same stream id, returning once the reply
+  /// is acknowledged. The stream id is the request's **kind** on a session that carries several RPCs
+  /// (a record commit, a promotion, a content put each ride their own id), so a server dispatches on it
+  /// rather than guessing a message's kind from its bytes. Drives one [`Connection`]: phase one receives
+  /// and acknowledges the request until its `fin`; phase two frames the reply and completes when the
+  /// peer has acknowledged all of it.
   pub async fn serve_once<H>(&mut self, handler: H) -> Result<(), EndpointError>
   where
-    H: FnOnce(Vec<u8>) -> Vec<u8>,
+    H: FnOnce(u64, Vec<u8>) -> Vec<u8>,
   {
     // Phase one: receive the request in full, acknowledging and *draining* as it arrives — draining is
     // what slides the flow-control window forward, so a request larger than one window keeps flowing
@@ -783,7 +786,7 @@ impl Endpoint {
     // Phase two: send the reply on the same stream id until the peer has acknowledged it whole. This is an
     // active exchange (a reply is in flight awaiting acknowledgement), so it carries the stall bound — a
     // peer that stops acknowledging is abandoned rather than retransmitted into forever.
-    let reply = handler(request);
+    let reply = handler(request_id, request);
     self.conn.open(request_id, &reply);
     loop {
       self.flush()?;

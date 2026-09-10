@@ -35,6 +35,12 @@ const TABLE_SHARE_PERMILLE: u64 = 250;
 const CLIENT_SHARE_PERMILLE: u64 = 250;
 /// Format: parts per thousand.
 const PERMILLE: u64 = 1000;
+/// Shape: the archive walk's slice as a share of the shard's step budget, parts per thousand: half,
+/// so a seal in progress never takes the whole step from the clients (the share a cooperative destroy
+/// takes, `verbs::DESTROY_SLICE_PERMILLE`).
+const ARCHIVE_SLICE_PERMILLE: u64 = 500;
+/// Format: nanoseconds per second, to turn a bytes-per-second throughput into bytes per step.
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
 /// Shape: tasks a client may need across shards at once: its request forwarded to the owner
 /// and the reply carried back (a synchronous client has one request in flight; an
 /// asynchronous one is bounded by its ring's credit, which the ring's slots cap).
@@ -124,6 +130,10 @@ pub struct DaemonConfig {
   pub instance: String,
   /// The operator's failover SLO, the lease term's ceiling (§4.4 "Derived constants", D-16).
   pub failover_slo_ns: u64,
+  /// Derived: the bytes one archive-walk slice may hash — half the step budget at the machine's measured
+  /// BLAKE3 throughput — so a seal (§4.10) is archived in bounded slices (§4.3) that never take the whole
+  /// step from the clients.
+  pub archive_slice_bytes: u64,
   /// The fleet this node joins (§4.8, boot step 6), or `None` for the laptop (`f = 0`, solo — the
   /// degenerate of the same code path, R8). A single-host daemon leaves this `None` and every placement
   /// is local; a fleet node names its quorum and peers, and the placement authority, configuration group
@@ -204,6 +214,18 @@ impl DaemonConfig {
       ["table_bytes"]
     );
     derivations.push(note("snapshot_bytes_per_partition", &snapshot_bytes));
+    let archive_slice_bytes: Derived<u64> = derived!(
+      (profile
+        .hash
+        .blake3_bytes_per_second
+        .saturating_mul(runtime.step_budget_ns)
+        / NANOS_PER_SECOND)
+        .saturating_mul(ARCHIVE_SLICE_PERMILLE)
+        / PERMILLE,
+      "blake3_bytes_per_second × step_budget_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000",
+      ["hash.blake3_bytes_per_second", "rt.step_budget_ns"]
+    );
+    derivations.push(note("archive_slice_bytes", &archive_slice_bytes));
     let geometry = Geometry {
       partitions: runtime.shards.max(1),
       page,
@@ -334,6 +356,7 @@ impl DaemonConfig {
       page: usize::try_from(page).unwrap_or(1).max(1),
       instance: instance.to_owned(),
       failover_slo_ns: FAILOVER_SLO_NS,
+      archive_slice_bytes: archive_slice_bytes.get(),
       // The laptop default: no fleet, `f = 0`, solo. An operator deploying a fleet sets this (with
       // `with_fleet`); the derivation from the machine profile is the same either way (R8).
       fleet: None,

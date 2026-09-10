@@ -24,6 +24,7 @@ pub mod daemon;
 pub mod doorbell;
 pub mod error;
 pub mod fleet;
+pub mod head;
 pub mod landing;
 // The NFS mount transport is the macOS/Linux mount path (Windows mounts through WinFsp); it rides the
 // Unix-only `slates_rt::tcp`, so it is gated off Windows. A Windows daemon serves IPC clients and lands

@@ -336,7 +336,9 @@ impl Partition {
         }
         Ok(())
       }
-      Op::SnapshotPlaced { volume, id, .. } | Op::SnapshotDestroyed { volume, id } => self
+      Op::SnapshotPlaced { volume, id, .. }
+      | Op::SnapshotIdentified { volume, id, .. }
+      | Op::SnapshotDestroyed { volume, id } => self
         .snapshot(*volume, *id)
         .map(|_| ())
         .ok_or(DbError::NotFound),
@@ -483,6 +485,18 @@ impl Partition {
           .get(&snapshot_key(*volume, *id))
           .ok_or(DbError::NotFound)?;
         self.snapshots.get_mut(h)?.placed = placed.clone();
+        Ok(())
+      }
+      Op::SnapshotIdentified {
+        volume,
+        id,
+        identity,
+      } => {
+        let h = *self
+          .snapshot_index
+          .get(&snapshot_key(*volume, *id))
+          .ok_or(DbError::NotFound)?;
+        self.snapshots.get_mut(h)?.identity = Some(*identity);
         Ok(())
       }
       Op::SnapshotDestroyed { volume, id } => {

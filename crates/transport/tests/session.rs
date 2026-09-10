@@ -180,7 +180,7 @@ fn a_request_gets_a_reply_over_a_live_session() {
       .unwrap();
       server.establish().await.unwrap();
       server
-        .serve_once(|req| req.iter().map(|b| b.wrapping_add(1)).collect())
+        .serve_once(|_, req| req.iter().map(|b| b.wrapping_add(1)).collect())
         .await
         .unwrap();
     })
@@ -270,7 +270,7 @@ fn repeated_exchanges_never_reuse_packet_numbers() {
       server.establish().await.unwrap();
       for _ in 0..EXCHANGES {
         server
-          .serve_once(|req| req.iter().map(|b| b.wrapping_add(7)).collect())
+          .serve_once(|_, req| req.iter().map(|b| b.wrapping_add(7)).collect())
           .await
           .unwrap();
       }
@@ -374,7 +374,7 @@ fn an_accepted_server_learns_its_peer_and_replies() {
       .unwrap();
       server.establish().await.unwrap();
       server
-        .serve_once(|req| req.iter().map(|b| b.wrapping_add(9)).collect())
+        .serve_once(|_, req| req.iter().map(|b| b.wrapping_add(9)).collect())
         .await
         .unwrap();
     })

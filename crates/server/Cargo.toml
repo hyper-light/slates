@@ -18,6 +18,7 @@ slates-base = { workspace = true }
 slates-anchor = { workspace = true }
 slates-db = { workspace = true }
 slates-cluster = { workspace = true }
+slates-archive = { workspace = true }
 slates-transport = { workspace = true }
 slates-ipc = { workspace = true }
 slates-land = { workspace = true }

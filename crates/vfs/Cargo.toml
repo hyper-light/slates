@@ -13,6 +13,8 @@ blake3 = { workspace = true }
 slates-machine = { workspace = true }
 slates-mem = { workspace = true }
 slates-wire = { workspace = true }
+# The archive format a snapshot exports to (§4.10 replication, §4.11): pure bytes, no I/O.
+slates-archive = { workspace = true }
 unicode-normalization = { workspace = true }
 
 [dev-dependencies]

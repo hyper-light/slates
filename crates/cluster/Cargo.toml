@@ -15,6 +15,8 @@ slates-db = { workspace = true }
 slates-transport = { workspace = true }
 # the runtime: bounded-concurrency dispatch (spawn/cancel) and the commit deadline (sleep).
 slates-rt = { workspace = true }
+# the archive: the content plane's transfer unit and the holder's verified content store (§4.10).
+slates-archive = { workspace = true }
 
 [dev-dependencies]
 # self-signed enrolled identities for the holder-and-owner sessions in the tests.

@@ -69,7 +69,7 @@ fn wire_snapshot(id: slates_vfs::ids::SnapshotId) -> SnapshotId {
   }
 }
 
-fn core_snapshot(id: SnapshotId) -> slates_vfs::ids::SnapshotId {
+pub(crate) fn core_snapshot(id: SnapshotId) -> slates_vfs::ids::SnapshotId {
   slates_vfs::ids::SnapshotId {
     index: u32::try_from(id.value >> u32::BITS).unwrap_or(u32::MAX),
     generation: u32::try_from(id.value & u64::from(u32::MAX)).unwrap_or(u32::MAX),
@@ -2517,7 +2517,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       drifted,
       watcher,
       snapshots: u32::try_from(slot.volume.snapshot_count()).unwrap_or(u32::MAX),
-      placed: placed_state(state, record.id, record.head),
+      placed: placed_state(state, &record),
       // The daemon's NFS port (§4.6), 0 until the listener binds; report it so a client can mount.
       nfs_port: u16::try_from(crate::daemon::NFS_PORT.load(std::sync::atomic::Ordering::Acquire))
         .ok()
@@ -2542,35 +2542,44 @@ fn placement_of(state: &ShardState, volume: DbVolumeId) -> PlacementState {
   }
 }
 
-/// The region placement of `object` as the fleet has **actually committed** it (§4.8 "the acknowledging
-/// set is recorded in the object's head record"): the acknowledging candidates the control-shard record
-/// plane recorded when it replicated the head to its holders (`ShardState::placed_heads`), or — before
-/// any holder has acknowledged, or on a laptop where no fleet loop runs — the owner's local placement the
-/// configuration computes (`Configuration::place`: the owner alone, which is placed at `f = 0` and not yet
-/// at `f > 0`). One code path serves both (R8): the laptop is the empty-map degenerate. Reading the
-/// computed placement alone reported a fleet's head *never* region-placed, however many holders held it.
-fn committed_placement(state: &ShardState, object: ObjectId) -> slates_db::register::Placement {
+/// The region placement of `object`'s head at `sequence` as the fleet has **actually committed** it (§4.8
+/// "the acknowledging set is recorded in the object's head record"): the acknowledging candidates the
+/// control-shard record plane recorded when it replicated that head to its holders
+/// (`ShardState::placed_heads`), or — before any holder has acknowledged, for an older or newer sequence,
+/// or on a laptop where no fleet loop runs — the owner's local placement the configuration computes
+/// (`Configuration::place`: the owner alone, which is placed at `f = 0` and not yet at `f > 0`). One code
+/// path serves both (R8): the laptop is the empty-map degenerate. Reading the computed placement alone
+/// reported a fleet's head *never* region-placed, however many holders held it.
+fn committed_placement(
+  state: &ShardState,
+  object: ObjectId,
+  sequence: u64,
+) -> slates_db::register::Placement {
   state
     .placed_heads
     .get(&object)
-    .cloned()
+    .filter(|head| head.sequence == sequence)
+    .map(|head| head.placement.clone())
     .unwrap_or_else(|| state.fleet.configuration().place(object))
 }
 
 /// A volume's head placement for a status reply (§4.8, D-18): whether the head is placed in
-/// the region, the mirror's lag (none at `f = 0`), and the owner's host epoch.
-fn placed_state(state: &ShardState, volume: DbVolumeId, head: DbSnapshotId) -> PlacedState {
-  let region = if head == DbSnapshotId::default() {
+/// the region, the mirror's lag (none at `f = 0`), and the owner's host epoch. "No snapshot yet" is
+/// the volume's **epoch** being zero, never the head id being the default: the first snapshot a volume
+/// takes lands in slab slot 0 at generation 0, whose wire id is exactly the default — so a check on the id
+/// mistook every volume's first snapshot for none and reported the creation head's placement instead.
+fn placed_state(state: &ShardState, record: &VolumeRecord) -> PlacedState {
+  let region = if record.epoch == 0 {
     // No snapshot yet: the catalog register itself is locally committed, so at `f = 0` the
     // head is placed (nothing to replicate until a seal). The placement object is the volume's full
     // 128-bit id (its high half names the creator host); the old code truncated it to that high half
     // alone, so every volume of one creator collided to one placement object — fixed by ObjectId.
-    let object = ObjectId(volume.bytes);
+    let object = ObjectId(record.id.bytes);
     let config = state.fleet.configuration();
-    config.region_placed(&committed_placement(state, object))
+    config.region_placed(&committed_placement(state, object, CREATION_HEAD_SEQUENCE))
   } else {
-    match state.db.partition().snapshot(volume, head) {
-      Some(record) => matches!(record.placed, PlacementState::Placed { .. }),
+    match state.db.partition().snapshot(record.id, record.head) {
+      Some(snapshot) => matches!(snapshot.placed, PlacementState::Placed { .. }),
       None => false,
     }
   };
@@ -2597,29 +2606,283 @@ fn await_placed(
   if !rights_of(&record, principal).read {
     return forbidden("await_placed");
   }
-  let target = snapshot.map_or(record.head, to_db_snapshot);
   // The snapshot places on its volume's candidate holders — the placement object is the volume id.
-  let _ = target;
-  let placement = committed_placement(state, ObjectId(volume.bytes));
-  let db_scope = match scope {
-    Scope::Region => DurabilityScope::Region,
-    Scope::Mirror => DurabilityScope::Mirror,
+  let object = ObjectId(volume.bytes);
+  let config = state.fleet.configuration();
+  // The region: a snapshot is placed once the content plane recorded it so (§4.10 — its content held by
+  // `f + 1` candidates and the head naming it committed, the durable `SnapshotPlaced`); with no snapshot
+  // yet (the volume's epoch is zero — never "the head id is the default", which the first snapshot's id
+  // also is), the creation head's recorded acknowledgements (sequence 0). `await placed` reports which
+  // coverage was placed, never silently upgrading it (§4.4).
+  let target = match snapshot {
+    Some(snapshot) => Some(to_db_snapshot(snapshot)),
+    None if record.epoch == 0 => None,
+    None => Some(record.head),
   };
-  match state
-    .fleet
-    .configuration()
-    .await_placed(db_scope, &placement)
-  {
-    Ok(placed) => ReplyBody::Placed {
-      placed,
+  let region = match target {
+    None => config.region_placed(&committed_placement(state, object, CREATION_HEAD_SEQUENCE)),
+    Some(target) => match state.db.partition().snapshot(record.id, target) {
+      Some(snapshot) => matches!(snapshot.placed, PlacementState::Placed { .. }),
+      None => return refused(Refusal::NotFound),
+    },
+  };
+  match scope {
+    Scope::Region => ReplyBody::Placed {
+      placed: region,
       mirror_age_ns: None,
     },
-    Err(slates_db::register::RegisterError::Unsupported { .. }) => refused(Refusal::Unsupported {
-      feature: "mirror".to_owned(),
-    }),
-    Err(_) => refused(Refusal::NotFound),
+    Scope::Mirror => match config.await_placed(
+      DurabilityScope::Mirror,
+      &committed_placement(state, object, record.epoch),
+    ) {
+      Ok(placed) => ReplyBody::Placed {
+        placed,
+        mirror_age_ns: None,
+      },
+      Err(slates_db::register::RegisterError::Unsupported { .. }) => {
+        refused(Refusal::Unsupported {
+          feature: "mirror".to_owned(),
+        })
+      }
+      Err(_) => refused(Refusal::NotFound),
+    },
   }
 }
+
+/// Format: the head register's sequence at a volume's creation — the "epoch-one head record" that names
+/// no content yet (§4.4 create); each snapshot's placement then writes the next sequence.
+const CREATION_HEAD_SEQUENCE: u64 = 0;
+
+/// Materializes a taken-over volume on this node (§4.8 "Promotion and takeover": the new owner "adopts
+/// the newest records, and serves"; §4.10 clone-from-archive): from the adopted head's catalog essentials
+/// and the archive of the content it names, creates the volume **under its original id and name**, restores
+/// every directory, file (bytes, mode, times) and symlink from the archive, and seals the tree as the
+/// volume's head snapshot at the adopted `sequence` — with the manifest identity the head names and the
+/// content holders (`region`) the head recorded, so `status` and `await placed(region)` answer for it as
+/// they did on the dead owner. Idempotent: a volume already present under the id is served as it is. The
+/// admission (byte reservation, inode allowance) is the same a `create` makes, so a successor short of
+/// capacity refuses `BudgetExceeded` rather than over-committing; a mount name already taken locally is
+/// `AlreadyExists` (names are per host, §4.4); a malformed archive is a `BadRequest` naming the reader's
+/// refusal. Any refusal leaves nothing behind (the credits go back, the partial volume is discarded).
+pub(crate) fn materialize_taken_over(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  head: &crate::head::HeadValue,
+  sequence: u64,
+  region: Vec<u64>,
+  archive: &slates_archive::Archive,
+) -> Result<(), Box<ReplyBody>> {
+  if state.by_id.contains_key(&id) {
+    return Ok(());
+  }
+  if let Some(existing) = state.db.partition().volume_by_name(&head.name) {
+    return Err(Box::new(refused(Refusal::AlreadyExists {
+      existing: to_wire_volume(existing.id),
+    })));
+  }
+  let restored = slates_archive::restore(archive).map_err(|e| {
+    refused(Refusal::BadRequest {
+      reason: format!("taken-over content archive: {e}"),
+    })
+  })?;
+  let size = match head.size {
+    DbSizeClass::Bounded { limit } => SizeClass::Bounded { limit },
+    DbSizeClass::Dynamic { max } => SizeClass::Dynamic { max },
+  };
+  let reservation = match size {
+    SizeClass::Bounded { limit } => match state.store.budget.reserve(limit) {
+      Ok(r) => Some(r),
+      Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
+        return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
+      }
+      Err(e) => {
+        return Err(Box::new(refused(Refusal::BadRequest {
+          reason: e.to_string(),
+        })));
+      }
+    },
+    SizeClass::Dynamic { .. } => None,
+  };
+  let version_credit = match state.store.versions.reserve(inode_allowance(state, size)) {
+    Ok(c) => Some(c),
+    Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
+      return Err(Box::new(give_back(
+        state,
+        reservation,
+        None,
+        Refusal::BudgetExceeded { available },
+      )));
+    }
+    Err(e) => {
+      return Err(Box::new(give_back(
+        state,
+        reservation,
+        None,
+        Refusal::BadRequest {
+          reason: e.to_string(),
+        },
+      )));
+    }
+  };
+  let names = match head.names {
+    DbNamePolicy::Exact => NamePolicy::Exact,
+    DbNamePolicy::Fold => NamePolicy::Fold,
+  };
+  let config = volume_config(state, names, quota_for(size));
+  let mut volume = match Volume::create(&mut state.store, config) {
+    Ok(v) => v,
+    Err(e) => {
+      return Err(Box::new(give_back(
+        state,
+        reservation,
+        version_credit,
+        refusal_of_vfs(&e),
+      )));
+    }
+  };
+  if let Err(e) = admit_dimensions(state, &mut volume, size) {
+    let _ = volume.discard_partial(&mut state.store);
+    return Err(Box::new(give_back(
+      state,
+      reservation,
+      version_credit,
+      refusal_of_vfs(&e),
+    )));
+  }
+  if let Err(e) = populate_restored(&mut state.store, &mut volume, &restored) {
+    let _ = volume.discard_partial(&mut state.store);
+    return Err(Box::new(give_back(
+      state,
+      reservation,
+      version_credit,
+      refusal_of_vfs(&e),
+    )));
+  }
+  let now = state.clock.monotonic_ns();
+  let record = VolumeRecord {
+    id,
+    name: head.name.clone(),
+    owner_shard: state.partition,
+    policy: PolicyRecord {
+      size: head.size,
+      names: head.names,
+      require_locked: false,
+      role: Role::Plain,
+    },
+    base: BaseRecord::Scratch,
+    head: DbSnapshotId::default(),
+    // The seal below advances the epoch to the adopted sequence, so the head register continues from it.
+    epoch: sequence.saturating_sub(1),
+    referenced_bytes: 0,
+    unique_bytes: 0,
+    state: VolumeState::Live,
+    lease: None,
+    owner: head.owner.clone(),
+    access: Vec::new(),
+    created_ns: now,
+  };
+  let published =
+    publish_created_volume(state, id, volume, None, reservation, version_credit, record);
+  if !matches!(published, ReplyBody::Created { .. }) {
+    return Err(Box::new(published));
+  }
+  // Seal the restored tree as the taken-over head: the snapshot at the adopted sequence, carrying the
+  // manifest identity the head names and the placement the head recorded, so the successor answers for it.
+  let Some(&handle) = state.by_id.get(&id) else {
+    return Err(Box::new(refused(Refusal::NotFound)));
+  };
+  let taken = match state.volumes.get_mut(handle) {
+    Ok(slot) => slot.volume.snapshot(&mut state.store),
+    Err(_) => return Err(Box::new(refused(Refusal::NotFound))),
+  };
+  let snapshot = match taken {
+    Ok(snapshot) => wire_snapshot(snapshot),
+    Err(e) => return Err(Box::new(refused(refusal_of_vfs(&e)))),
+  };
+  let ops = [
+    Op::SnapshotTaken {
+      record: SnapshotRecord {
+        id: to_db_snapshot(snapshot),
+        volume: id,
+        epoch: sequence,
+        identity: head.manifest,
+        placed: PlacementState::Placed {
+          region,
+          mirror: None,
+        },
+        taken_ns: now,
+      },
+    },
+    Op::VolumeHeadAdvanced {
+      id,
+      head: to_db_snapshot(snapshot),
+      epoch: sequence,
+    },
+  ];
+  for op in &ops {
+    if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
+      return Err(Box::new(refused(refusal_of_db(&e))));
+    }
+  }
+  Ok(())
+}
+
+/// Recreates a restored archive's tree in a fresh volume: directories parents-first (the restore's paths
+/// sort so), then each file's bytes under its mode and times, a symlink (a file under the link type bits,
+/// its bytes the target) as a link. The archive's own metadata carries the permission bits and times; the
+/// inode numbers are this volume's (identity across renames is per volume, not carried).
+fn populate_restored(
+  store: &mut slates_vfs::volume::Store,
+  volume: &mut Volume,
+  restored: &slates_archive::Restored,
+) -> Result<(), slates_vfs::VfsError> {
+  use slates_vfs::export::{kind_of_mode, permissions_of_mode};
+  use slates_vfs::inode::Kind;
+  let mut directories: std::collections::BTreeMap<String, Handle<slates_vfs::dir::DirNode>> =
+    std::collections::BTreeMap::new();
+  directories.insert(String::new(), volume.root());
+  let parent_of = |directories: &std::collections::BTreeMap<_, _>, path: &str| {
+    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+    directories
+      .get(parent)
+      .copied()
+      .map(|handle| (handle, name.to_owned()))
+      .ok_or(slates_vfs::VfsError::NotFound)
+  };
+  for path in &restored.directories {
+    let (parent, name) = parent_of(&directories, path)?;
+    let mode = restored
+      .metadata
+      .get(path)
+      .map_or(DEFAULT_DIRECTORY_MODE, |meta| {
+        permissions_of_mode(meta.mode)
+      });
+    let handle = volume.mkdir(store, parent, &name, mode)?;
+    directories.insert(path.clone(), handle);
+  }
+  for (path, bytes) in &restored.files {
+    let (parent, name) = parent_of(&directories, path)?;
+    let meta = restored.metadata.get(path).copied().unwrap_or_default();
+    match kind_of_mode(meta.mode) {
+      Some(Kind::Symlink) => {
+        let target = String::from_utf8_lossy(bytes);
+        volume.symlink(store, parent, &name, &target)?;
+      }
+      _ => {
+        let no = volume.create_file(store, parent, &name, permissions_of_mode(meta.mode))?;
+        if !bytes.is_empty() {
+          volume.write(store, no, 0, bytes)?;
+        }
+        let mtime = i64::try_from(meta.mtime_ns).unwrap_or(i64::MAX);
+        volume.set_times(store, no, mtime, mtime)?;
+      }
+    }
+  }
+  Ok(())
+}
+
+/// Format: POSIX `0755`, the mode a restored directory takes when the archive carries none for it.
+const DEFAULT_DIRECTORY_MODE: u32 = 0o755;
 
 fn list(state: &mut ShardState, principal: &Principal) -> ReplyBody {
   let volumes = state

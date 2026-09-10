@@ -176,6 +176,18 @@ pub enum Op {
     /// The encoded increment (identity, base, ops document and post-state).
     increment: Vec<u8>,
   },
+  /// A snapshot's content identity was computed (§4.10, D-17): the BLAKE3 root of its archive's
+  /// manifest — the value the fleet's holders verify and a reader fetches the content by. A snapshot
+  /// is taken O(1) with no identity (`SnapshotTaken` records `None`); the identity is recorded once the
+  /// content plane has archived it. Appended at the end of the operation set for append-only evolution.
+  SnapshotIdentified {
+    /// The volume.
+    volume: VolumeId,
+    /// The snapshot.
+    id: SnapshotId,
+    /// The manifest identity.
+    identity: [u8; 32],
+  },
 }
 
 impl Op {
@@ -191,6 +203,7 @@ impl Op {
       Op::VolumeDestroyed { .. } => "volume_destroyed",
       Op::SnapshotTaken { .. } => "snapshot_taken",
       Op::SnapshotPlaced { .. } => "snapshot_placed",
+      Op::SnapshotIdentified { .. } => "snapshot_identified",
       Op::SnapshotDestroyed { .. } => "snapshot_destroyed",
       Op::LineageAdded { .. } => "lineage_added",
       Op::LeaseTaken { .. } => "lease_taken",

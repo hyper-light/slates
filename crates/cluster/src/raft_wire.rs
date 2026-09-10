@@ -319,7 +319,7 @@ pub async fn serve_raft_once(
   node: &mut RaftNode,
 ) -> Result<(), EndpointError> {
   endpoint
-    .serve_once(|request| match RaftMessage::decode(&request) {
+    .serve_once(|_, request| match RaftMessage::decode(&request) {
       Ok(RaftMessage::RequestVote(vote)) => {
         RaftMessage::VoteReply(node.on_request_vote(vote)).encode()
       }

@@ -518,7 +518,7 @@ pub async fn serve_probe(
   gossip_fanout: usize,
 ) -> Result<(), EndpointError> {
   endpoint
-    .serve_once(|request| match SwimMessage::decode(&request) {
+    .serve_once(|_, request| match SwimMessage::decode(&request) {
       Ok(message) => {
         // Fold in the sender's gossip, counting the sender as a confirmer of any suspicion it carries;
         // learn its coordinate too, if it carried one.
