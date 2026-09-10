@@ -530,10 +530,14 @@ startup).
 > measured. Step 4 (bridges) is Phase 3 and 4; step 6 is Phase 8 — its **authority core** now
 > exists (A-10): `slates-cluster`'s `FleetNode` composes membership, the configuration group and
 > the owner's register acceptor, with the `f = 0` laptop as the same code path (the N=1≡fleet
-> differential is a named test) and a head commit driven live over the transport; **owed** to
-> reach step 6 in the daemon are the object→owner routing registry, the live probe/gossip loop,
-> and wiring `FleetNode` into the control shard at boot. The health plane's refusal to serve
-> before every chokepoint registers arrives with task 6's signals.
+> differential is a named test) and a head commit driven live over the transport. Step 6 is now
+> **reached for a two-node fleet**: the object→owner routing registry, the detector→fleet bridge, the
+> live probe/gossip loop, and `FleetNode` wired into the control shard at boot all exist
+> (`crates/server/src/fleet.rs`, `Daemon::start_with_fleet`), proven by two in-process daemons that form
+> a fleet over real UDP and detect and retire a stopped peer (`crates/server/tests/fleet.rs`). **Owed**
+> to generalize it: the cross-node commit path at `f > 0`, the takeover's phase-one recovery, the N-node
+> connection-ID demux (many peers on one socket), and full multi-process deployment. The health plane's
+> refusal to serve before every chokepoint registers arrives with task 6's signals.
 > A-9 correction: rebuilding scratch volumes empty and dropping snapshots is acknowledged
 > content loss (BUG-11), not content recovery. Anchor-owned bytes/roots and validated base
 > identity handoff are required before the design's restart-survival promise can be offered.

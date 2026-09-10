@@ -1360,7 +1360,9 @@ name = "slates-server"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "rcgen",
  "rustix",
+ "rustls",
  "slates-anchor",
  "slates-base",
  "slates-bridge-core",
@@ -1373,6 +1375,7 @@ dependencies = [
  "slates-mem",
  "slates-merge",
  "slates-rt",
+ "slates-transport",
  "slates-vfs",
  "slates-wire",
  "windows-sys 0.60.2",

@@ -18,11 +18,13 @@ slates-base = { workspace = true }
 slates-anchor = { workspace = true }
 slates-db = { workspace = true }
 slates-cluster = { workspace = true }
+slates-transport = { workspace = true }
 slates-ipc = { workspace = true }
 slates-land = { workspace = true }
 slates-merge = { workspace = true }
 slates-bridge-core = { workspace = true }
 blake3 = { workspace = true }
+rustls = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
@@ -32,6 +34,10 @@ slates-bridge-nfs = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
+
+[dev-dependencies]
+# self-signed fleet identities for the two-daemon membership test (as the cluster tests mint them).
+rcgen = { workspace = true }
 
 [lints]
 workspace = true

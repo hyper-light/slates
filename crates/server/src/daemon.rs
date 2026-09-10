@@ -137,6 +137,22 @@ impl Daemon {
     config: DaemonConfig,
     source: SegmentSource,
   ) -> Result<Daemon, ServerError> {
+    Self::start_with_fleet(profile, config, source, None)
+  }
+
+  /// Like [`start`](Daemon::start) but **joins a fleet** (§4.8, boot step 6): `fleet_transport` — this
+  /// node's fleet TLS identity, its advertised accept socket, and its peers — drives the control shard's
+  /// membership loop, which probes the peers, serves their probes, and folds the converged view into the
+  /// `FleetNode` the verbs read for placement. `None` is the laptop: no loop runs, and the placement path
+  /// still runs the same `FleetNode`, degenerate (R8). The membership *policy* (quorum + peer hosts) comes
+  /// from [`DaemonConfig::fleet`](crate::config::DaemonConfig); this is the transport material, kept
+  /// separate because [`Identity`](slates_transport::handshake::Identity) is not `Clone`.
+  pub fn start_with_fleet(
+    profile: &MachineProfile,
+    config: DaemonConfig,
+    source: SegmentSource,
+    fleet_transport: Option<crate::fleet::FleetTransport>,
+  ) -> Result<Daemon, ServerError> {
     // The observability gate (§2.6, §4.14): the health plane refuses to serve until every chokepoint
     // span has registered its emitter, so a daemon never serves with a silently missing span source.
     // Fail-closed and checked before any resource is acquired — an incomplete roster stops the boot
@@ -220,6 +236,15 @@ impl Daemon {
       )
       .await;
     })?;
+    // In a fleet (§4.8, boot step 6): the control shard runs the membership loop over the fleet transport,
+    // probing its peers, serving their probes, and folding the converged view into the `FleetNode` the
+    // verbs read for placement. A laptop passes no transport and runs no loop (R8: the same placement path,
+    // degenerate). The loop's perpetual tasks are detached and cancelled by `runtime.shutdown()`.
+    if let Some(transport) = fleet_transport {
+      runtime.spawn_on(control, async move {
+        crate::fleet::run_membership(transport).await;
+      })?;
+    }
     // The NFS transport (§4.6): one loopback listener served on the control shard. A supervising
     // anchor holds the listener and hands its descriptor over in the environment, so its port survives
     // a daemon restart (Unix); the daemon adopts that when present, or binds a fresh ephemeral one when
@@ -265,6 +290,30 @@ impl Daemon {
   /// The configuration.
   pub fn config(&self) -> &DaemonConfig {
     &self.config
+  }
+
+  /// The hosts this daemon's fleet currently sees alive (§4.8) — this node and the peers its control-shard
+  /// membership loop has probed and found live — for a test or an operator to observe the membership the
+  /// verbs read for placement. It runs a one-shot query on the control shard and returns its answer; empty
+  /// if the daemon is stopping, is not on a shard, or the shard does not answer within the liveness budget
+  /// (the bound the daemon's own heartbeat already lives under). A laptop (no fleet) reports itself alone.
+  pub fn fleet_members(&self) -> Vec<slates_db::HostId> {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
+      return Vec::new();
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        let alive = state::with_state(|s| s.fleet.membership().alive()).unwrap_or_default();
+        let _ = tx.send(alive);
+      })
+      .is_err()
+    {
+      return Vec::new();
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .unwrap_or_default()
   }
 
   /// The shards.
@@ -319,8 +368,10 @@ fn registered_chokepoints() -> ChokepointRegistry {
   registry
 }
 
-/// The node's host id: the first eight bytes of the machine identity's hash.
-fn host_id_of(identity: &Identity) -> u64 {
+/// The node's host id: the first eight bytes of the machine identity's hash. Public so a fleet operator or
+/// a multi-node test computes a node's host id from its machine identity the same way the daemon does — the
+/// id a peer names in its fleet configuration (§4.8).
+pub fn host_id_of(identity: &Identity) -> u64 {
   let hash = identity.hash();
   u64::from_le_bytes([
     hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
