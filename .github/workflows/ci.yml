@@ -130,9 +130,13 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       # WinFsp: the mount host links `winfsp-x64.dll`'s import library and the live mount test needs the
-      # kernel FSD installed. The MSI ships the SDK (inc/, lib/) under `C:\Program Files (x86)\WinFsp`.
+      # kernel FSD installed. The MSI ships the SDK (inc/, lib/) under `C:\Program Files (x86)\WinFsp`
+      # and the DLL under `bin/`; put `bin/` on PATH so the test executable's loader finds the DLL at
+      # run time (linking uses the lib via WINFSP_LIB; running needs the DLL, else STATUS_DLL_NOT_FOUND).
       - name: Install WinFsp
-        run: choco install winfsp -y --no-progress
+        run: |
+          choco install winfsp -y --no-progress
+          "C:\Program Files (x86)\WinFsp\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       # `--workspace` cannot build here: the NFS-mount and FUSE/FSKit crates (bridge-nfs, cli,
       # bridge-fuse, bridge-fskit) are macOS/Linux-only — Windows mounts through WinFsp, and the fleet
       # transport is QUIC over UDP, not the NFS-over-TCP loopback. So clippy the crates that carry
