@@ -522,6 +522,25 @@ mod tests {
     sent_any
   }
 
+  /// Like [`pump`], but delivers each batch of packets `from` emits in *reverse* order — a deterministic
+  /// reordering of the datagram path (the design's "lossy, reordering" path). Out-of-order arrival
+  /// exercises the receiver's reassembly buffer, multi-range ACK formation across the gaps reorder
+  /// opens, and the loss detector: a packet far enough behind the largest acknowledged is declared lost
+  /// and retransmitted (RFC 9002 §6.1.1), and the assembler dedups it, so delivery is still exactly-once.
+  fn pump_reordering(from: &mut Connection, to: &mut Connection, channel: &mut Channel) -> bool {
+    let mut batch = Vec::new();
+    while let Some(packet) = from.poll_transmit(FRAME_CAP) {
+      batch.push(packet);
+    }
+    let sent_any = !batch.is_empty();
+    for (pn, frames) in batch.into_iter().rev() {
+      if !channel.drops() {
+        to.handle_incoming(pn, &frames);
+      }
+    }
+    sent_any
+  }
+
   /// Runs a transfer of `streams` (each `(stream_id, content)`) from a sender to a receiver over
   /// `channel`, returning what the receiver reassembled per stream and how many frames were
   /// retransmitted. Asserts the never-whole-object invariant on every transmission.
@@ -896,6 +915,56 @@ mod tests {
         .map(|(i, &len)| (u64::try_from(i * 2 + 1).unwrap_or(1), stream_content(u8::try_from(i).unwrap_or(0), len)))
         .collect();
       let (received, _) = transfer(&streams, Channel::new(drops));
+      for (id, content) in &streams {
+        prop_assert_eq!(received.get(id), Some(content));
+      }
+    }
+
+    /// The reordering oracle (R5, the design's "lossy, reordering datagram path"): for any streams, any
+    /// loss, AND out-of-order delivery, the receiver still reassembles each stream exactly. The forward
+    /// direction delivers each batch reversed, so packets arrive out of order — stressing the reassembly
+    /// buffer, multi-range ACK formation across the gaps reorder opens, and loss-detection-then-dedup
+    /// when reorder pushes a packet past the reorder threshold. Every byte still arrives, once.
+    #[test]
+    fn any_streams_survive_loss_and_reorder(
+      lens in prop::collection::vec(0usize..200, 1..4),
+      drops in prop::collection::vec(0u64..120, 0..20),
+    ) {
+      let streams: Vec<(u64, Vec<u8>)> = lens
+        .iter()
+        .enumerate()
+        .map(|(i, &len)| (u64::try_from(i * 2 + 1).unwrap_or(1), stream_content(u8::try_from(i).unwrap_or(0), len)))
+        .collect();
+      let window = initial_receive_window(FRAME_CAP);
+      let mut sender = Connection::new(window);
+      for (id, content) in &streams {
+        sender.open(*id, content);
+      }
+      let mut receiver = Connection::new(window);
+      let mut channel = Channel::new(drops);
+      let mut received: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+
+      let mut guard = 0u64;
+      loop {
+        guard += 1;
+        prop_assert!(guard < 1_000_000, "the connection must make progress");
+        // Forward data is reordered; the reverse (acknowledgement) direction stays in order.
+        let sent = pump_reordering(&mut sender, &mut receiver, &mut channel);
+        for id in receiver.recv_stream_ids() {
+          received.entry(id).or_default().extend(receiver.read_stream(id));
+        }
+        let acked = pump(&mut receiver, &mut sender, &mut channel, None);
+        let all_recv = streams
+          .iter()
+          .all(|(id, _)| receiver.recv_stream_complete(*id));
+        if sender.send_complete() && all_recv {
+          break;
+        }
+        if !(sent || acked) && !sender.probe() {
+          break;
+        }
+      }
+
       for (id, content) in &streams {
         prop_assert_eq!(received.get(id), Some(content));
       }
