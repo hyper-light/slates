@@ -190,7 +190,8 @@ jobs:
       - name: Benches
         run: cargo bench --workspace --bench callgrind
 
- on the unit tests of the crates that hold unsafe code. Miri ships only with the
+  # Miri (the memory-model interpreter) and loom (the concurrency-permutation checker) run
+  # on the unit tests of the crates that hold unsafe code. Miri ships only with the
   # nightly toolchain, which CI installs for this job alone; the pinned stable toolchain builds
   # everything else. loom runs under stable with `--cfg loom`.
   miri-and-loom:
@@ -207,13 +208,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      - name: Miri (memory and wire: leak check on)
+      - name: "Miri (memory and wire: leak check on)"
         run: cargo +nightly miri test -p slates-mem -p slates-wire --lib
       # The runtime leaks its shard contexts, rings and registry entries on purpose (they live
       # for the process; the leak is what makes every reference to them a plain `&'static`), so
       # Miri's leak check is off for it; every other check stays on. The OS-driver tests are
       # marked ignored under Miri, which cannot model kqueue or eventfd.
-      - name: Miri (runtime: simulation tests, intentional leaks ignored)
+      - name: "Miri (runtime: simulation tests, intentional leaks ignored)"
         run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib --test differential
 
   windows-nightly:
