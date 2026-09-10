@@ -123,16 +123,19 @@ impl DaemonConfig {
     let mut runtime =
       RuntimeConfig::from_profile(profile, admission.get(), admission.get(), LATENCY_BUDGET_NS);
     let shards = u64::from(runtime.shards.max(1));
-    // §4.2 D-12 "honest degradation": the default provisioning reserve is USABLE memory, not the OS
-    // lock LIMIT. A volume's arena is locked only when a client asks (`require_locked`, verbs.rs); by
-    // default it is a normal, usable — if unlocked — mapping (crate mem's lock sequence keeps unmapped
-    // regions "usable, unlocked, and counted"). Deriving the reserve from the mlock limit refused every
-    // volume where the OS grants little lockable RAM — the design's own failure case, "a locked-down CI
-    // container refuses mlock; lock capacity 0" (§4.2 boot order). Usable memory lets the daemon
-    // provision there (degraded: those pages may swap), while a `require_locked` volume still respects
-    // the lock capacity best-effort. On a machine that can lock freely the two are the same — the lock
-    // probe already records `memory.available` when `RLIMIT_MEMLOCK` is unlimited (`probes.rs`).
-    let reserve = region_bytes(profile.facts.memory.available, shards, MEMORY_CLASSES);
+    // §4.2 D-12 "honest degradation": the default provisioning reserve is the shard's share of the
+    // machine's total RAM, not the OS lock LIMIT. A volume's arena is locked only when a client asks
+    // (`require_locked`, verbs.rs); by default it is a normal, usable — if unlocked — mapping (crate
+    // mem's lock sequence keeps an unlocked region "usable, unlocked, and counted"). Deriving the
+    // reserve from the mlock limit refused every volume where the OS grants little lockable RAM — the
+    // design's own failure case, "a locked-down CI container refuses mlock; lock capacity 0" (§4.2 boot
+    // order); a `require_locked` volume still respects the lock capacity best-effort. The basis is
+    // **total** memory, not free/available: the reserve is a boot-time admission *ceiling* (the arena
+    // is a lazy anonymous mapping — it costs no physical RAM until a volume stores bytes, so a virtual
+    // ceiling over total is honest), and total is stable, whereas free memory is a fluctuating snapshot
+    // that would make the ceiling — and whether the daemon can provision at all — depend on whatever
+    // else the machine is doing at boot (racy under a busy host or a parallel test suite).
+    let reserve = region_bytes(profile.facts.memory.total, shards, MEMORY_CLASSES);
     derivations.push(note("reserve_per_shard", &reserve));
     let page = profile.facts.page.base;
     let tables: Derived<u64> = derived!(

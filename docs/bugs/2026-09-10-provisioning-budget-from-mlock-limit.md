@@ -53,17 +53,25 @@ not been running.
 
 ## Fix (applied)
 
-`crates/server/src/config.rs`: derive the default reserve from usable memory —
-`region_bytes(profile.facts.memory.available, shards, MEMORY_CLASSES)` — with a comment citing D-12 and
-the §4.2 failure case. `crates/mem/src/budget.rs`: `region_bytes`'s parameter and derivation note are
-generalized from "lock capacity" to "memory capacity" (the caller decides the basis). The lock limit is
-unchanged where it belongs: a `require_locked` volume still calls `arena.lock()`, which respects the mlock
-limit best-effort and refuses if it cannot lock. On a machine that can lock freely the two bases are the
-same — the lock probe already records `memory.available` when `RLIMIT_MEMLOCK` is unlimited.
+`crates/server/src/config.rs`: derive the default reserve from the shard's share of the machine's
+**total** RAM — `region_bytes(profile.facts.memory.total, shards, MEMORY_CLASSES)` — with a comment citing
+D-12 and the §4.2 failure case. `crates/mem/src/budget.rs`: `region_bytes`'s parameter and derivation note
+are generalized from "lock capacity" to "memory capacity" (the caller decides the basis). The lock limit
+is unchanged where it belongs: a `require_locked` volume still calls `arena.lock()`, which respects the
+mlock limit best-effort and refuses if it cannot lock.
 
-Verified by reproducing under `ulimit -l 64` before and after: the client, anchor and server-`nfs_mount`
-suites go from failing (`BudgetExceeded { available: 0 }`) to passing; the budget unit tests and normal
-(high-mlock) runs are unchanged; `cargo xtask check` (structural/literals/unsafe) clean.
+**Why total, not free/available.** The reserve is a boot-time admission *ceiling*, and the arena it sizes
+is a lazy anonymous mapping — it costs no physical RAM until a volume actually stores bytes — so a virtual
+ceiling over total memory is honest, and total is stable. Free/available memory is a fluctuating snapshot;
+deriving the ceiling from it made *whether the daemon can provision at all* depend on whatever else the
+host was doing at boot. That is exactly what the first cut of this fix (using `memory.available`) hit on
+CI: most daemon tests passed, but a test whose profile happened to be measured while the parallel test
+suite had consumed RAM saw `available` ≈ 0 and refused again. Total removes the race.
+
+Verified by reproducing under `ulimit -l 64` before and after, with the daemon-spawning suites
+(`slates-client`, `slates-anchor`, `slates-server`) run together for parallel memory pressure: all go from
+failing (`BudgetExceeded { available: 0 }`) to passing; the budget unit tests and normal (high-mlock) runs
+are unchanged; `cargo xtask check` (structural/literals/unsafe) clean.
 
 ## Sibling sweep
 
