@@ -693,6 +693,20 @@ pub mod platform {
 
   pub(super) struct Listener {
     object: SharedObject,
+    /// The named Event a claiming client waits on for its slot to reach READY, signaled here once the
+    /// claim is served. `WaitOnAddress` on the slot word is process-local on Windows (D-10), so it
+    /// cannot wake a client in another process; the Event does. Without it a client still connects — it
+    /// re-checks READY on each claim-timeout — but not at the parked-wake latency. macOS's `__ulock`
+    /// wake reaches across processes, so the Event is Windows-only.
+    #[cfg(windows)]
+    ready_event: crate::wake::Event,
+  }
+
+  /// The name of the per-instance rendezvous READY Event (Windows), derived from the bootstrap
+  /// object's name so the daemon and every client name the one Event with no handle passing.
+  #[cfg(windows)]
+  fn ready_event_name(instance: &str) -> String {
+    format!("{}-rvz", rendezvous_name(instance))
   }
 
   fn slot_at(index: usize) -> usize {
@@ -718,7 +732,11 @@ pub mod platform {
       for i in 0..SLOTS {
         state(&object, i)?.store(FREE, Ordering::Release);
       }
-      Ok(Listener { object })
+      Ok(Listener {
+        object,
+        #[cfg(windows)]
+        ready_event: crate::wake::Event::open(&ready_event_name(instance))?,
+      })
     }
 
     pub(super) fn doorbell(&self) -> Option<&AtomicU32> {
@@ -789,6 +807,11 @@ pub mod platform {
             let word = state(&self.object, i)?;
             word.store(READY, Ordering::Release);
             wake::wake_one(word)?;
+            // Cross-process wake for the waiting client on Windows (the word wake above is
+            // process-local there, D-10); the auto-reset Event holds a signal raised before the
+            // client waits, so a served-before-the-wait claim is not lost.
+            #[cfg(windows)]
+            let _ = self.ready_event.signal();
             return Ok(Some(Accepted {
               client_id,
               // The object's mode and per-user name are the authentication: whoever opened
@@ -886,7 +909,12 @@ pub mod platform {
         let _ = wake::wake_one(bell);
       }
       let word = state(&object, index)?;
-      // Wait for READY (spin then wait on the word).
+      // The Event the daemon signals when it marks this slot READY (Windows; the word wake is
+      // process-local there). Opened before the wait so a claim served in the gap is not missed —
+      // the auto-reset Event holds the signal until this first wait consumes it.
+      #[cfg(windows)]
+      let ready_event = crate::wake::Event::open(&ready_event_name(instance))?;
+      // Wait for READY (spin then wait on the word, or on the Event on Windows).
       let started = std::time::Instant::now();
       loop {
         let now = word.load(Ordering::Acquire);
@@ -900,7 +928,10 @@ pub mod platform {
             endpoint: instance.to_owned(),
           });
         }
+        #[cfg(not(windows))]
         let _ = wake::wait(word, now, Some(CLAIM_WAIT_NS - elapsed))?;
+        #[cfg(windows)]
+        let _ = ready_event.wait(Some(CLAIM_WAIT_NS - elapsed))?;
       }
       let (name, len) = {
         let bytes = object.bytes();
