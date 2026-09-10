@@ -20,13 +20,17 @@
 //! retransmitted whatever stream it belonged to. What each carries (the reliable record classes of
 //! §4.10a) is the caller's; here they are just byte streams.
 //!
-//! Owed: connection-level `MaxData` (only per-stream `MaxStreamData` is enforced), congestion control
-//! (whose validation needs a real network), several ack-eliciting frames per packet (an MTU budget),
+//! Congestion control is now enforced (RFC 9002 §7 NewReno, `crate::congestion`): fresh sends are gated
+//! on the window, which grows on acknowledgement and halves on loss; only the empirical *tuning* (the
+//! window's exact constants, CUBIC, pacing) awaits a real network. Owed: connection-level `MaxData`
+//! (only per-stream `MaxStreamData` is enforced), several ack-eliciting frames per packet (an MTU
+//! budget),
 //! and driving the tail-loss probe from a real timeout.
 
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::conn::{AckGenerator, REORDER_THRESHOLD, SentTracker};
+use crate::congestion::Congestion;
+use crate::conn::{AckGenerator, REORDER_THRESHOLD, SentTracker, tracked_bytes};
 use crate::flow::FlowController;
 use crate::session::Frame;
 use crate::stream::{StreamAssembler, StreamSender};
@@ -70,6 +74,9 @@ pub struct Connection {
   ack_owed: bool,
   /// How many frames this end has retransmitted (the non-vacuity counter for the loss-recovery path).
   retransmitted: u64,
+  /// The NewReno congestion controller: the sender's self-limit on in-flight data, grown on
+  /// acknowledgement and reduced on loss. Gates fresh sends in [`Connection::poll_transmit`].
+  congestion: Congestion,
 }
 
 impl Connection {
@@ -88,6 +95,10 @@ impl Connection {
       window_ahead,
       ack_owed: false,
       retransmitted: 0,
+      // The congestion window counts in max-datagram units. This dialect sends one frame per packet, so
+      // the max datagram is the connection's frame cap, which the receive window is `REORDER_THRESHOLD +
+      // 1` of (see `initial_receive_window`); recover it from `window_ahead` so `new` keeps one argument.
+      congestion: Congestion::new(window_ahead / (REORDER_THRESHOLD + 1)),
     }
   }
 
@@ -112,10 +123,15 @@ impl Connection {
   /// acknowledgement is owed, appends it followed by the current per-stream receive credit. Only a
   /// packet that carries an ack-eliciting frame is tracked for loss (RFC 9002 §2).
   pub fn poll_transmit(&mut self, max_frame_len: usize) -> Option<(u64, Vec<Frame>)> {
-    // One ack-eliciting frame: a retransmission takes priority over fresh stream data.
+    // One ack-eliciting frame: a retransmission takes priority over fresh stream data. Fresh data is
+    // gated by the congestion window (a retransmission is recovery, not new load, so it is not gated);
+    // `can_send` still lets a lone frame go when nothing is in flight, so the connection never stalls.
     let reliable = match self.retransmit.pop_front() {
       Some(frame) => Some(frame),
-      None => self.next_fresh_frame(max_frame_len),
+      None if self.congestion.can_send(max_frame_len as u64) => {
+        self.next_fresh_frame(max_frame_len)
+      }
+      None => None,
     };
 
     let mut frames = Vec::new();
@@ -140,8 +156,10 @@ impl Connection {
 
     let pn = self.sent.next_pn();
     // Track only the ack-eliciting frame for loss/retransmission; the acknowledgement and credit frames
-    // are regenerated fresh each time, never retransmitted stale.
+    // are regenerated fresh each time, never retransmitted stale. Its stream bytes enter the congestion
+    // window's in-flight count (a retransmission re-adds bytes a loss or probe earlier freed).
     if let Some(frame) = reliable {
+      self.congestion.on_sent(tracked_bytes(&frame));
       self.sent.on_sent(pn, vec![frame]);
     }
     Some((pn, frames))
@@ -194,7 +212,8 @@ impl Connection {
           let _ = assembler.offer(*offset, data, *fin);
         }
         Frame::Ack { largest, range } => {
-          self.sent.on_ack(*largest, *range);
+          let acked = self.sent.on_ack(*largest, *range);
+          self.congestion.on_ack(acked);
         }
         // The peer's advertised send credit for one stream: raise that stream's send ceiling (monotonic).
         Frame::MaxStreamData { stream_id, max } => {
@@ -211,7 +230,15 @@ impl Connection {
     }
     // A just-processed acknowledgement may have opened a gap past the reorder threshold.
     let lost = self.sent.take_lost();
-    self.queue_retransmit(lost);
+    if let Some(highest_pn) = lost.highest_pn {
+      let lost_bytes: u64 = lost.frames.iter().map(tracked_bytes).sum();
+      // The largest packet number sent so far bounds this congestion event's recovery period.
+      let largest_sent = self.sent.peek_next_pn().saturating_sub(1);
+      self
+        .congestion
+        .on_loss(lost_bytes, highest_pn, largest_sent);
+    }
+    self.queue_retransmit(lost.frames);
   }
 
   /// Retransmits the oldest in-flight packet when the connection has stalled with packets still in
@@ -223,6 +250,10 @@ impl Connection {
   pub fn probe(&mut self) -> bool {
     let frames = self.sent.probe_oldest();
     let probed = !frames.is_empty();
+    // The probed bytes leave the in-flight count (the retransmission re-adds them); a probe is not a
+    // congestion signal, so the window is unchanged.
+    let probed_bytes: u64 = frames.iter().map(tracked_bytes).sum();
+    self.congestion.on_probe_removed(probed_bytes);
     self.queue_retransmit(frames);
     probed
   }
@@ -243,6 +274,17 @@ impl Connection {
   /// The stream ids seen on the receive side so far (a frame has arrived for each).
   pub fn recv_stream_ids(&self) -> Vec<u64> {
     self.recv_streams.keys().copied().collect()
+  }
+
+  /// The sender's current congestion window in bytes — the most in-flight data it allows itself. Grows
+  /// on acknowledgement and reduces on loss; exposed so a test can witness that response.
+  pub fn congestion_window(&self) -> u64 {
+    self.congestion.window()
+  }
+
+  /// The bytes currently in flight (sent, not yet acknowledged, freed, or declared lost).
+  pub fn bytes_in_flight(&self) -> u64 {
+    self.congestion.in_flight()
   }
 
   /// Whether receive stream `stream_id` is complete (all bytes through its `fin`). False if unknown.
@@ -423,6 +465,22 @@ mod tests {
     (received, sender.retransmitted())
   }
 
+  /// Pumps every packet `from` wants to send into `to`, dropping the one whose packet number equals
+  /// `drop_pn` the first time it is seen (then clearing it, so exactly one packet is dropped). Returns
+  /// whether anything was sent. A small observing pump for the congestion test.
+  fn pump_dropping(from: &mut Connection, to: &mut Connection, drop_pn: &mut Option<u64>) -> bool {
+    let mut sent_any = false;
+    while let Some((pn, frames)) = from.poll_transmit(FRAME_CAP) {
+      sent_any = true;
+      if *drop_pn == Some(pn) {
+        *drop_pn = None;
+        continue;
+      }
+      to.handle_incoming(pn, &frames);
+    }
+    sent_any
+  }
+
   /// A stream of `len` bytes with a per-stream fingerprint, so a demultiplexing mix-up would show.
   fn stream_content(seed: u8, len: usize) -> Vec<u8> {
     (0..len)
@@ -485,6 +543,62 @@ mod tests {
       );
     }
     assert!(retransmits >= 1, "the loss-recovery path actually ran");
+  }
+
+  /// AC (§4.10a §8, RFC 9002 §7): congestion control is live end to end — acknowledgements grow the
+  /// sender's window (slow start), and a detected loss reduces it, while the reliability core still
+  /// delivers the whole stream. The window's rise (peak above the start) and its later fall (a strictly
+  /// smaller value after a growth) are the non-vacuity witnesses that the controller actually gates the
+  /// send, not a dead path.
+  #[test]
+  fn a_loss_reduces_the_congestion_window_while_delivery_still_completes() {
+    let window = initial_receive_window(FRAME_CAP);
+    // Many packets, so slow start ramps the window well above its start before the loss is detected.
+    let content = stream_content(1, 30 * FRAME_CAP);
+    let mut sender = Connection::new(window);
+    sender.open(1, &content);
+    let mut receiver = Connection::new(window);
+    let start_window = sender.congestion_window();
+
+    let mut received = Vec::new();
+    let mut peak = start_window;
+    let mut prev = start_window;
+    let mut saw_reduction = false;
+    // Drop mid-stream packet 3 once, so a later acknowledgement's gap declares it lost past the reorder
+    // threshold; `None` on the acknowledgement path (no drops back).
+    let mut drop_pn = Some(3u64);
+    let mut guard = 0u64;
+    loop {
+      guard += 1;
+      assert!(guard < 1_000_000, "the connection must make progress");
+      let sent_any = pump_dropping(&mut sender, &mut receiver, &mut drop_pn);
+      received.extend(receiver.read_stream(1));
+      let acked_any = pump_dropping(&mut receiver, &mut sender, &mut None);
+      let now = sender.congestion_window();
+      peak = peak.max(now);
+      saw_reduction |= now < prev;
+      prev = now;
+      if sender.send_complete() && receiver.recv_stream_complete(1) {
+        break;
+      }
+      if !sent_any && !acked_any && !sender.probe() {
+        break;
+      }
+    }
+
+    assert_eq!(
+      received, content,
+      "the stream arrived exactly despite the loss"
+    );
+    assert!(sender.retransmitted() >= 1, "the loss-recovery path ran");
+    assert!(
+      peak > start_window,
+      "acknowledgements grew the window (slow start)"
+    );
+    assert!(
+      saw_reduction,
+      "the detected loss reduced the congestion window"
+    );
   }
 
   proptest! {

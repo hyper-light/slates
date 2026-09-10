@@ -35,6 +35,7 @@
 //! ops-document decode and `slates-bridge-fuse`'s ABI codec. The codec is pure and tested on every host.
 
 pub mod accept;
+pub mod congestion;
 pub mod conn;
 pub mod connection;
 pub mod endpoint;

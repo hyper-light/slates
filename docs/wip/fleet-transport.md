@@ -167,9 +167,18 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    flow window, served round-robin so none starves; a received frame is demultiplexed to its stream's
    reassembler. Proven by an oracle that drives several fingerprinted streams through any loss pattern
    and reassembles each exactly, never confusing one for another.
-   **Owed on the connection:** a real probe timeout, congestion control (its validation needs a real
-   network), connection-level `MaxData`, multi-range ACKs, connection IDs, several frames per packet (an
-   MTU budget), and loom on the state machine.
+   **Congestion control is now built** (`congestion.rs`, RFC 9002 §7 NewReno): the sender counts bytes
+   in flight, grows the window on acknowledgement (slow start below the threshold, additive-increase
+   congestion avoidance above it) and reduces it once per loss event (multiplicative decrease, guarded by
+   a recovery period so a burst of losses in one round-trip reduces the window once), and `poll_transmit`
+   gates fresh sends on the window (retransmissions and acks are never gated; a lone frame still goes when
+   nothing is in flight, so the connection never stalls). Sans-io, so the control law is unit-tested by
+   injecting acknowledgements and losses and asserting the window; the connection oracle witnesses it end
+   to end — the window rises on acks and falls on a detected loss while the stream still arrives exactly.
+   Only the empirical *tuning* is owed to the fleet's measurement work (the initial-window constant, CUBIC
+   vs Reno, pacing, ECN, an RTT-derived probe timeout — all need a real network).
+   **Owed on the connection:** a real probe timeout, connection-level `MaxData`, multi-range ACKs,
+   connection IDs, several frames per packet (an MTU budget), and loom on the state machine.
    The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c); its
    fencing step rides membership. The **`Keyring`'s population is built** (`enrollment.rs`, slice 6):
    `Enrollment::from_membership` turns an admitted-membership record (the shared control secret + the
