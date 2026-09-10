@@ -10,11 +10,11 @@
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
-// The address types come through `rustix::net` (the standard types re-exported) to honour the
-// host-path wall's `std::net` guard.
-use rustix::net::{Ipv4Addr, SocketAddrV4};
+// The address types come from the runtime's own re-export (`core::net`'s, the same ones `rustix::net`
+// re-exports) so the test builds on every platform — including Windows, where a real datagram round
+// trip here exercises the IOCP driver's AFD readiness reactor (`crate::afd`).
 use slates_rt::runtime::{Runtime, RuntimeConfig};
-use slates_rt::udp::UdpSocket;
+use slates_rt::udp::{Ipv4Addr, SocketAddrV4, UdpSocket};
 
 fn config() -> RuntimeConfig {
   RuntimeConfig {

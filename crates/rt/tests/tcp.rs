@@ -6,6 +6,9 @@
 
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+// Async TCP is the NFS loopback mount server's alone (macOS/Linux); Windows mounts through WinFsp, so
+// the `tcp` module and this test are gated off it (the fleet transport is QUIC over UDP — see udp.rs).
+#![cfg(not(windows))]
 
 use std::sync::mpsc::channel;
 use std::time::Duration;

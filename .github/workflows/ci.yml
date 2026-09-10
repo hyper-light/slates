@@ -129,17 +129,25 @@ jobs:
           toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy (native Windows)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      # `--workspace` cannot build here: the NFS-mount and FUSE/FSKit crates (bridge-nfs, server, cli,
+      # bridge-fuse, bridge-fskit) are macOS/Linux-only — Windows mounts through WinFsp, and the fleet
+      # transport is QUIC over UDP, not the NFS-over-TCP loopback. So clippy the crates that carry
+      # Windows code: the shared memory and wake (mem, ipc), the runtime with its IOCP/AFD driver (rt),
+      # the client, and the two SDK addons.
+      - name: Clippy the Windows-buildable crates (native Windows)
+        run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-client -p slates-sdk-node -p slates-sdk-python --all-targets -- -D warnings
       # Run the tests whose Win32 cfg branches only a native Windows runner can exercise: the shared
-      # memory (`CreateFileMappingW`) and the cross-process wake (the named auto-reset Event — §4.7's
+      # memory (`CreateFileMappingW`); the cross-process wake (the named auto-reset Event — §4.7's
       # `WaitOnAddress`-is-process-local case, so the park/late-reply wake in `rings` goes through the
-      # Event here, not the wake word). These need no daemon or rendezvous, so they run standalone; the
-      # server/client/rendezvous paths await the full Win32 rendezvous (Phase 4) and are not run yet.
-      - name: Test the Win32 memory and wake paths (native Windows)
+      # Event here, not the wake word); and the IOCP driver's AFD socket readiness (`afd.rs`,
+      # `\Device\Afd`/`IOCTL_AFD_POLL`), exercised by a real loopback UDP round trip in rt's `udp` test —
+      # the fleet transport's datagram substrate. These need no daemon or rendezvous, so they run
+      # standalone; the full Win32 rendezvous (Phase 4) and the SDK's live daemon are not run yet.
+      - name: Test the Win32 memory, wake, and AFD readiness paths (native Windows)
         run: |
           cargo test -p slates-mem
           cargo test -p slates-ipc --test rings
+          cargo test -p slates-rt --test udp
 
   # D-20: instruction-count gates. callgrind counts are deterministic for a given binary, so
   # they see the one-percent change the wall clock cannot. valgrind is non-Rust tooling, admitted
