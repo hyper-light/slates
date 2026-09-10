@@ -39,7 +39,10 @@
 
 use std::collections::BTreeMap;
 
-use crate::register::{FIRST_EPOCH, Fence, HostEpoch, HostId, ObjectId, Quorum, candidates_for};
+use crate::register::{
+  Authority, FIRST_EPOCH, Fence, HostEpoch, HostId, ObjectId, Prepare, Quorum, RegisterError,
+  candidates_for,
+};
 
 /// One entry in a holder's log. Its position is its index in the log (dense, `0`-based); it carries
 /// the payload's identity (the `blake3` of a merge record's declared work, a head, a lease — the
@@ -367,7 +370,11 @@ impl Owner {
 /// has a record; the result is dense. A committed position's only identity is the committed one (no
 /// later owner proposes a different record at a committed position), so its highest-epoch record is
 /// the committed value.
-fn adopt(logs: &[Vec<Record>]) -> Vec<[u8; 32]> {
+///
+/// Public so the cluster plane's live ledger promotion adopts a quorum of [`LedgerPromise`] logs by the
+/// exact same rule the sans-io [`Owner::take_over`] does — the transport gathers the holders' logs over
+/// the wire, this folds them, and the two must agree (the sim is the oracle).
+pub fn adopt(logs: &[Vec<Record>]) -> Vec<[u8; 32]> {
   let max_len = logs.iter().map(Vec::len).max().unwrap_or(0);
   let mut adopted = Vec::with_capacity(max_len);
   for position in 0..max_len {
@@ -385,4 +392,209 @@ fn adopt(logs: &[Vec<Record>]) -> Vec<[u8; 32]> {
     }
   }
   adopted
+}
+
+/// A candidate holder's reply to a phase-one [`Prepare`] over the transport for a *ledger* register — the
+/// multi-entry counterpart of [`crate::register::Promise`], which reports a single highest record. It
+/// names the promising holder, the object, the epoch it promised (echoing the prepare so the reply binds
+/// to it), the generation, and its **whole log**: every position, each a [`Record`] carrying the epoch it
+/// was last accepted under, so the new owner adopts, per position, the record under the highest epoch
+/// across a phase-one quorum ([`adopt`]). A holder counts toward the quorum only if its promise
+/// [`binds`](LedgerPromise::binds) to the prepare and comes from a distinct candidate, so a fenced,
+/// foreign or wrong-object reply cannot manufacture a promotion quorum.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerPromise {
+  /// The holder that raised its fence and reports its log.
+  pub holder: HostId,
+  /// The object the promise is for.
+  pub object: ObjectId,
+  /// The epoch the holder promised (echoes the prepare's epoch).
+  pub epoch: HostEpoch,
+  /// The generation the holder is serving under.
+  pub generation: u64,
+  /// The holder's whole log, dense by position; each entry an identity and the epoch it is held under.
+  pub log: Vec<Record>,
+}
+
+/// A ledger promise's fixed prefix on the wire: holder (u64 LE), object (16 bytes), epoch and generation
+/// (each u64 LE), then the log length (u32 LE).
+/// Format: the §4.8 promotion reply generalised to a whole log; the length is a `u32` because the log
+/// ships in one MTU-bounded transport frame, whose cap bounds it — no separate constant is invented.
+const LEDGER_PROMISE_PREFIX_BYTES: usize = 3 * size_of::<u64>() + OBJECT_BYTES + size_of::<u32>();
+/// One log entry's wire size: its epoch (u64 LE) then its 32-byte identity.
+/// Format: the ledger [`Record`] is `{ epoch, identity }`, the identity a 32-byte blake3.
+const LEDGER_ENTRY_BYTES: usize = size_of::<u64>() + IDENTITY_BYTES;
+/// The object id's wire width (bytes).
+/// Format: [`ObjectId`] is a 128-bit id (D-14: the high half is the creator host).
+const OBJECT_BYTES: usize = 16;
+/// A payload identity's wire width (bytes).
+/// Format: a blake3 digest is 32 bytes.
+const IDENTITY_BYTES: usize = 32;
+
+impl LedgerPromise {
+  /// Whether this promise answers `prepare` — the object, epoch and generation all match, so a reply for
+  /// a different prepare cannot be counted for this one.
+  pub fn binds(&self, prepare: &Prepare) -> bool {
+    self.object == prepare.object
+      && self.epoch == prepare.epoch
+      && self.generation == prepare.generation
+  }
+
+  /// The canonical bytes: the header words, the log length, then each entry's epoch and identity.
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out =
+      Vec::with_capacity(LEDGER_PROMISE_PREFIX_BYTES + self.log.len() * LEDGER_ENTRY_BYTES);
+    out.extend_from_slice(&self.holder.0.to_le_bytes());
+    out.extend_from_slice(&self.object.0);
+    out.extend_from_slice(&self.epoch.0.to_le_bytes());
+    out.extend_from_slice(&self.generation.to_le_bytes());
+    let count = u32::try_from(self.log.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&count.to_le_bytes());
+    for record in &self.log {
+      out.extend_from_slice(&record.epoch.0.to_le_bytes());
+      out.extend_from_slice(&record.identity);
+    }
+    out
+  }
+
+  /// Reconstructs a promise from its bytes, or a typed [`RegisterError::MalformedRecord`] if they are the
+  /// wrong length — the declared log length must match the bytes present *exactly*, so a message that
+  /// crossed the network (hostile input) can neither over- nor under-run the buffer, and no length is
+  /// trusted before it is checked against the bytes actually there.
+  pub fn decode(bytes: &[u8]) -> Result<LedgerPromise, RegisterError> {
+    if bytes.len() < LEDGER_PROMISE_PREFIX_BYTES {
+      return Err(RegisterError::MalformedRecord);
+    }
+    let word = |slice: &[u8]| u64::from_le_bytes(slice.try_into().unwrap_or([0; 8]));
+    let (holder_bytes, rest) = bytes.split_at(size_of::<u64>());
+    let (object_bytes, rest) = rest.split_at(OBJECT_BYTES);
+    let (epoch_bytes, rest) = rest.split_at(size_of::<u64>());
+    let (generation_bytes, rest) = rest.split_at(size_of::<u64>());
+    let (count_bytes, mut entries) = rest.split_at(size_of::<u32>());
+    let count = u32::from_le_bytes(count_bytes.try_into().unwrap_or([0; 4])) as usize;
+    // The declared count must match the bytes present exactly — no partial or padded entry survives.
+    if entries.len() != count.saturating_mul(LEDGER_ENTRY_BYTES) {
+      return Err(RegisterError::MalformedRecord);
+    }
+    let mut log = Vec::with_capacity(count);
+    for _ in 0..count {
+      let (entry, next) = entries.split_at(LEDGER_ENTRY_BYTES);
+      entries = next;
+      let (entry_epoch, identity_bytes) = entry.split_at(size_of::<u64>());
+      let mut identity = [0u8; IDENTITY_BYTES];
+      identity.copy_from_slice(identity_bytes);
+      log.push(Record {
+        epoch: HostEpoch(word(entry_epoch)),
+        identity,
+      });
+    }
+    let mut object = [0u8; OBJECT_BYTES];
+    object.copy_from_slice(object_bytes);
+    Ok(LedgerPromise {
+      holder: HostId(word(holder_bytes)),
+      object: ObjectId(object),
+      epoch: HostEpoch(word(epoch_bytes)),
+      generation: word(generation_bytes),
+      log,
+    })
+  }
+}
+
+/// A candidate holder of one object's *ledger* register as a standalone node — the transport counterpart
+/// of the in-cohort [`Holder`], the multi-entry analogue of [`crate::register::Acceptor`]. It holds the
+/// object's log (dense by position) under a [`Fence`] (the highest epoch it has accepted a record under)
+/// and a configuration [`Authority`], and answers a new owner's phase-one [`Prepare`] with its whole log
+/// so the owner adopts the committed prefix. A takeover installs the new authority
+/// ([`install_authority`](LedgerAcceptor::install_authority)) before the prepare, mirroring the register
+/// plane's discipline; the serve routes a prepare to the acceptor for its object.
+pub struct LedgerAcceptor {
+  id: HostId,
+  object: ObjectId,
+  authority: Authority,
+  fence: Fence,
+  log: Vec<Record>,
+}
+
+impl LedgerAcceptor {
+  /// A fresh acceptor for holder `id` and `object` under `authority`, holding an empty log.
+  pub fn new(id: HostId, object: ObjectId, authority: Authority) -> LedgerAcceptor {
+    LedgerAcceptor {
+      id,
+      object,
+      authority,
+      fence: Fence::new(),
+      log: Vec::new(),
+    }
+  }
+
+  /// An acceptor recovered after a restart from its promised epoch and its `log` — the committed state a
+  /// real holder writes to anchor-owned RAM before acknowledging (§4.8 "persist effect and completion as
+  /// one recoverable publication"), mirroring [`crate::register::Acceptor::recovered`]. The fence is
+  /// raised to `promised` and the log restored, so phase one reads exactly what the holder held.
+  pub fn recovered(
+    id: HostId,
+    object: ObjectId,
+    authority: Authority,
+    promised: HostEpoch,
+    log: Vec<Record>,
+  ) -> LedgerAcceptor {
+    let mut fence = Fence::new();
+    let _ = fence.accept(promised);
+    LedgerAcceptor {
+      id,
+      object,
+      authority,
+      fence,
+      log,
+    }
+  }
+
+  /// The holder's current log.
+  pub fn log(&self) -> &[Record] {
+    &self.log
+  }
+
+  /// Installs a new configuration authority (the holder applying the configuration update the regional
+  /// group distributed on a takeover), mirroring [`crate::register::Acceptor::install_authority`]: a
+  /// generation below the current one is a stale configuration and is refused; the current or a newer one
+  /// is adopted, so the new owner becomes the sole authorised writer and the old owner is fenced by
+  /// generation. The log is kept — it is exactly the state phase one reads.
+  pub fn install_authority(&mut self, authority: Authority) -> Result<(), RegisterError> {
+    if authority.generation < self.authority.generation {
+      return Err(RegisterError::ForeignGeneration {
+        current: self.authority.generation,
+      });
+    }
+    self.authority = authority;
+    Ok(())
+  }
+
+  /// Answers a new owner's phase-one [`Prepare`]: gates on the installed authority (a prepare under a
+  /// generation the holder has not installed is [`ForeignGeneration`](RegisterError::ForeignGeneration);
+  /// one from a principal the installed authority does not name as owner is
+  /// [`Unauthorized`](RegisterError::Unauthorized)), then raises the fence to the prepare's epoch **before**
+  /// replying (so a resumed stale owner under the old epoch can no longer commit — `StaleNeverCommits`),
+  /// and reports the whole log so the new owner adopts, per position, the record under the highest epoch
+  /// across a phase-one quorum. The reported log is at least as new as anything that ever committed under
+  /// the old epoch, because a phase-one quorum and every phase-two commit quorum both intersect at
+  /// `f + 1` of `2f + 1`. The promise carries this acceptor's object, so a prepare misrouted to the wrong
+  /// object yields a promise that does not [`bind`](LedgerPromise::binds) and is not counted.
+  pub fn prepare(&mut self, prepare: &Prepare) -> Result<LedgerPromise, RegisterError> {
+    if prepare.generation != self.authority.generation {
+      return Err(RegisterError::ForeignGeneration {
+        current: self.authority.generation,
+      });
+    }
+    if prepare.owner != self.authority.owner {
+      return Err(RegisterError::Unauthorized);
+    }
+    self.fence.accept(prepare.epoch)?;
+    Ok(LedgerPromise {
+      holder: self.id,
+      object: self.object,
+      epoch: prepare.epoch,
+      generation: prepare.generation,
+      log: self.log.clone(),
+    })
+  }
 }

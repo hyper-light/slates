@@ -45,6 +45,7 @@ pub mod swim;
 
 use std::sync::mpsc::{TryRecvError, channel};
 
+use slates_db::ledger::{self, LedgerAcceptor, LedgerPromise};
 use slates_db::register::{
   Accepted, Acceptor, Ack, Configuration, HostId, ObjectId, Placement, Prepare, Promise, Promotion,
   Quorum, Record, candidates_for,
@@ -729,4 +730,217 @@ pub async fn promote_under_configuration(
     budget,
   )
   .await
+}
+
+/// The stream a *ledger* phase-one prepare rides on a holder connection — distinct from the single-value
+/// promotion's [`PROMOTE_STREAM`] so a holder serving both tells them apart.
+/// Format: one stream id per RPC kind on a connection; the holder's serve accepts whichever arrives.
+const LEDGER_PROMOTE_STREAM: u64 = 3;
+
+/// A confirmed ledger promotion: the holders that promised, and the log the new owner adopts — per
+/// position, the identity carried under the highest epoch across the phase-one quorum ([`ledger::adopt`]).
+/// The committed prefix of this log is every record that had committed under the old owner (Continuity),
+/// because the phase-one quorum intersects every prior `f + 1` commit quorum.
+pub struct LedgerPromotion {
+  /// The candidates that returned a binding promise (a phase-one quorum).
+  pub promised: Vec<HostId>,
+  /// The adopted log, dense by position — the committed prefix and any adopted uncommitted tail.
+  pub adopted: Vec<[u8; 32]>,
+}
+
+/// A ledger promotion's outcome and the holder connections still open for reuse — the multi-entry
+/// counterpart of [`Promoted`]. On a quorum of promises the [`LedgerPromotion`] (the adopted log and the
+/// promising set); on the deadline [`ClusterError::Uncertain`]; short of quorum [`ClusterError::NotPlaced`].
+/// The new owner completes the takeover by re-committing the adopted log and only then serving.
+pub struct LedgerPromoted {
+  /// The promotion result: the adopted log and promising set, or why it did not confirm.
+  pub outcome: Result<LedgerPromotion, ClusterError>,
+  /// The holder connections still open, for the adoption re-commit that follows.
+  pub reusable: Vec<(HostId, Endpoint)>,
+}
+
+/// The holder side of ledger phase one: serve one [`Prepare`], replying with this holder's whole log (a
+/// [`LedgerPromise`]) after raising its fence. A prepare the holder refuses (foreign generation,
+/// unauthorised owner, stale epoch) or that does not decode replies with empty bytes, which the new owner
+/// does not count toward its quorum. The `acceptor` is the holder's persistent ledger store for the object.
+pub async fn serve_ledger_promotion(
+  endpoint: &mut Endpoint,
+  acceptor: &mut LedgerAcceptor,
+) -> Result<(), slates_transport::endpoint::EndpointError> {
+  endpoint
+    .serve_once(|request| match Prepare::decode(&request) {
+      Ok(prepare) => match acceptor.prepare(&prepare) {
+        Ok(promise) => promise.encode(),
+        Err(_) => Vec::new(),
+      },
+      Err(_) => Vec::new(),
+    })
+    .await
+}
+
+/// Collects ledger promises until a phase-one quorum promised or the deadline: records each distinct,
+/// binding promise's holder into `promised` and its whole log into `logs` (the set the new owner adopts
+/// across), keeps every replying holder's endpoint for reuse, and returns the reusable endpoints and
+/// whether the deadline was reached. The same progress-extension policy the commit and single-value
+/// promotion use bounds the wait.
+async fn collect_ledger_promises(
+  rx: std::sync::mpsc::Receiver<Reply>,
+  prepare: &Prepare,
+  candidates: &[HostId],
+  quorum: Quorum,
+  budget: CommitBudget,
+  promised: &mut Vec<HostId>,
+  logs: &mut Vec<Vec<ledger::Record>>,
+) -> (Vec<(HostId, Endpoint)>, bool) {
+  let mut reusable: Vec<(HostId, Endpoint)> = Vec::new();
+  let mut timed_out = false;
+  let mut wait = DispatchWait::new(budget, now_ns());
+  while !quorum.committed(promised.len()) {
+    match rx.try_recv() {
+      Ok(Reply(host, reply, endpoint)) => {
+        reusable.push((host, *endpoint));
+        if let Ok(promise) = LedgerPromise::decode(&reply)
+          && promise.holder == host
+          && promise.binds(prepare)
+          && candidates.contains(&host)
+          && !promised.contains(&host)
+        {
+          promised.push(host);
+          logs.push(promise.log);
+        }
+      }
+      // Nothing to receive: park a poll interval and let the progress-extension policy decide whether a
+      // promotion at its deadline is still filling its quorum (keep waiting) or has stalled (time out).
+      Err(TryRecvError::Empty) => {
+        if !wait.keep_waiting(promised.len()).await {
+          timed_out = true;
+          break;
+        }
+      }
+      Err(TryRecvError::Disconnected) => break,
+    }
+  }
+  while let Ok(Reply(host, _, endpoint)) = rx.try_recv() {
+    reusable.push((host, *endpoint));
+  }
+  (reusable, timed_out)
+}
+
+/// Runs ledger phase one for `prepare` across its `candidates` (§4.8 "each new owner runs phase one in one
+/// batched round"), the multi-entry counterpart of [`promote_record`]. The new owner (`new_owner`)
+/// promises locally through `owner_acceptor` (it is a candidate — the surviving holder the takeover
+/// named); the `remote_holders` are each sent the prepare concurrently — one task per holder — and the
+/// loop collects distinct, binding promises, each a holder's whole log, until a quorum promised or the
+/// budget's deadline expires (the same §4.8 "late work" progress extension the commit uses). On a quorum
+/// it adopts, per position, the record under the highest epoch across the promising quorum
+/// ([`ledger::adopt`]); the adopted log's committed prefix is every record that had committed under the
+/// old owner (Continuity), because a phase-one quorum and every prior `f + 1` commit quorum both intersect
+/// at `f + 1` of `2f + 1`. It returns a [`LedgerPromoted`]: on a quorum the adopted log (safe to re-commit
+/// and serve); on the deadline [`ClusterError::Uncertain`]; short of quorum [`ClusterError::NotPlaced`] —
+/// with the replying holders' connections for the adoption re-commit. Remaining tasks are cancelled. The
+/// budget is the caller's to derive (owed — a measured RTT budget); nothing here is a hidden constant.
+pub async fn promote_ledger_record(
+  new_owner: HostId,
+  owner_acceptor: &mut LedgerAcceptor,
+  candidates: &[HostId],
+  prepare: &Prepare,
+  quorum: Quorum,
+  remote_holders: Vec<(HostId, Endpoint)>,
+  budget: CommitBudget,
+) -> LedgerPromoted {
+  let mut promised: Vec<HostId> = Vec::new();
+  let mut logs: Vec<Vec<ledger::Record>> = Vec::new();
+  // The new owner's own hold: it promises to itself, raising its fence and reporting its whole log.
+  if let Ok(local) = owner_acceptor.prepare(prepare)
+    && candidates.contains(&new_owner)
+  {
+    promised.push(new_owner);
+    logs.push(local.log);
+  }
+
+  // A local promise may already be a quorum (f = 0: one candidate, the new owner) — no dispatch needed.
+  if quorum.committed(promised.len()) {
+    return LedgerPromoted {
+      outcome: Ok(LedgerPromotion {
+        promised,
+        adopted: ledger::adopt(&logs),
+      }),
+      reusable: Vec::new(),
+    };
+  }
+
+  // Dispatch each remote holder in its own task, reporting to one channel; the collection loop bounds the
+  // wait itself (its progress-extension policy). Children of this task, so they are cancelled if this
+  // future is dropped (no orphans).
+  let (tx, rx) = channel::<Reply>();
+  let prepare_bytes = prepare.encode();
+  let mut tasks = Vec::new();
+  for (host, mut endpoint) in remote_holders {
+    let tx = tx.clone();
+    let bytes = prepare_bytes.clone();
+    let spawned = spawn_child(async move {
+      let reply = endpoint
+        .request(LEDGER_PROMOTE_STREAM, &bytes)
+        .await
+        .unwrap_or_default();
+      let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
+    });
+    match spawned {
+      Ok(task) => tasks.push(task),
+      Err(e) => return ledger_promote_spawn_failed(&tasks, e),
+    }
+  }
+  drop(tx); // so the channel disconnects once every task has ended
+
+  let (reusable, timed_out) = collect_ledger_promises(
+    rx,
+    prepare,
+    candidates,
+    quorum,
+    budget,
+    &mut promised,
+    &mut logs,
+  )
+  .await;
+
+  // Cancel whatever is still running — a straggler's endpoint is dropped and that holder reconnects.
+  for task in &tasks {
+    let _ = cancel(*task);
+  }
+
+  let outcome = if quorum.committed(promised.len()) {
+    Ok(LedgerPromotion {
+      promised,
+      adopted: ledger::adopt(&logs),
+    })
+  } else if timed_out {
+    Err(ClusterError::Uncertain {
+      placement: Placement {
+        candidates: candidates.to_vec(),
+        acked: promised,
+        mirror_acked: None,
+      },
+    })
+  } else {
+    Err(ClusterError::NotPlaced {
+      placement: Placement {
+        candidates: candidates.to_vec(),
+        acked: promised,
+        mirror_acked: None,
+      },
+    })
+  };
+  LedgerPromoted { outcome, reusable }
+}
+
+/// The [`LedgerPromoted`] returned when a dispatch task could not be spawned: the runtime error, the tasks
+/// already started cancelled, and no endpoints recoverable (they moved into the spawned futures).
+fn ledger_promote_spawn_failed(tasks: &[slates_rt::TaskId], error: RtError) -> LedgerPromoted {
+  for task in tasks {
+    let _ = cancel(*task);
+  }
+  LedgerPromoted {
+    outcome: Err(ClusterError::Runtime(error)),
+    reusable: Vec::new(),
+  }
 }

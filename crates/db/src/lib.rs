@@ -39,7 +39,9 @@ pub mod replay;
 
 pub use art::Art;
 pub use error::DbError;
-pub use ledger::{Cohort, Commit, Owner, Reach, Record, TakeoverError};
+pub use ledger::{
+  Cohort, Commit, LedgerAcceptor, LedgerPromise, Owner, Reach, Record, TakeoverError,
+};
 pub use mirror::Mirror;
 pub use op::Op;
 pub use partition::Partition;

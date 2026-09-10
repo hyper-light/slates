@@ -9,8 +9,10 @@
 
 use std::collections::BTreeSet;
 
-use slates_db::ledger::{Cohort, Owner, Reach, TakeoverError};
-use slates_db::register::{HostId, ObjectId, Quorum};
+use slates_db::ledger::{
+  Cohort, LedgerAcceptor, LedgerPromise, Owner, Reach, Record, TakeoverError,
+};
+use slates_db::register::{Authority, HostEpoch, HostId, ObjectId, Prepare, Quorum, RegisterError};
 
 /// A payload identity from a single byte (its 32 repeated); distinct bytes give distinct records.
 fn id(byte: u8) -> [u8; 32] {
@@ -340,4 +342,161 @@ fn a_committed_value_survives_adversarial_takeovers() {
     committed_after.starts_with(&committed_before),
     "a committed value was overwritten across takeovers: was {committed_before:?}, now {committed_after:?}"
   );
+}
+
+/// A log record accepted under `epoch` carrying identity byte `byte`.
+fn entry(epoch: u64, byte: u8) -> Record {
+  Record {
+    epoch: HostEpoch(epoch),
+    identity: id(byte),
+  }
+}
+
+/// A [`LedgerPromise`] with a multi-entry log round-trips through its wire form byte for byte (the codec
+/// the transport promotion ships is faithful).
+#[test]
+fn a_ledger_promise_round_trips_over_the_wire() {
+  let promise = LedgerPromise {
+    holder: HostId(7),
+    object: ObjectId::new(HostId(3), 11),
+    epoch: HostEpoch(4),
+    generation: 2,
+    log: vec![entry(1, b'a'), entry(3, b'b'), entry(4, b'c')],
+  };
+  let decoded = LedgerPromise::decode(&promise.encode()).expect("a well-formed promise decodes");
+  assert_eq!(
+    decoded, promise,
+    "the log and header survive the round trip"
+  );
+}
+
+/// An empty-log promise round-trips too (a holder that holds nothing for the object).
+#[test]
+fn an_empty_ledger_promise_round_trips() {
+  let promise = LedgerPromise {
+    holder: HostId(1),
+    object: ObjectId::new(HostId(1), 0),
+    epoch: HostEpoch(1),
+    generation: 0,
+    log: Vec::new(),
+  };
+  assert_eq!(
+    LedgerPromise::decode(&promise.encode()).expect("decodes"),
+    promise
+  );
+}
+
+/// Hostile input: bytes shorter than the fixed prefix are refused, never read past their end.
+#[test]
+fn a_truncated_ledger_promise_is_refused() {
+  assert!(matches!(
+    LedgerPromise::decode(&[]),
+    Err(RegisterError::MalformedRecord)
+  ));
+  assert!(matches!(
+    LedgerPromise::decode(&[0u8; 8]),
+    Err(RegisterError::MalformedRecord)
+  ));
+}
+
+/// Hostile input: a declared log length that does not match the bytes present — an entry short, or extra
+/// trailing bytes — is refused as malformed, so a message can neither over- nor under-run the buffer.
+#[test]
+fn a_ledger_promise_with_a_mismatched_log_length_is_refused() {
+  let promise = LedgerPromise {
+    holder: HostId(2),
+    object: ObjectId::new(HostId(2), 5),
+    epoch: HostEpoch(2),
+    generation: 1,
+    log: vec![entry(1, b'x'), entry(2, b'y')],
+  };
+  // One byte short: the last entry is now incomplete, so the declared count exceeds the bytes present.
+  let mut short = promise.encode();
+  short.pop();
+  assert!(
+    matches!(
+      LedgerPromise::decode(&short),
+      Err(RegisterError::MalformedRecord)
+    ),
+    "a truncated tail is refused"
+  );
+  // Trailing junk: the bytes now exceed what the declared count accounts for.
+  let mut padded = promise.encode();
+  padded.push(0);
+  assert!(
+    matches!(
+      LedgerPromise::decode(&padded),
+      Err(RegisterError::MalformedRecord)
+    ),
+    "an over-long body is refused"
+  );
+}
+
+/// A [`LedgerAcceptor`] answers a phase-one prepare only under the installed authority and a fresh epoch:
+/// it reports its whole log and raises its fence; a foreign generation, an unauthorised owner, or a stale
+/// epoch is refused by kind, and a refused prepare never moves the fence.
+#[test]
+fn a_ledger_acceptor_prepare_gates_and_reports_its_log() {
+  let object = ObjectId::new(HostId(1), 9);
+  let old_authority = Authority {
+    generation: 0,
+    owner: HostId(1),
+  };
+  let log = vec![entry(1, b'r'), entry(1, b's')];
+  let mut acceptor =
+    LedgerAcceptor::recovered(HostId(2), object, old_authority, HostEpoch(1), log.clone());
+  acceptor
+    .install_authority(Authority {
+      generation: 1,
+      owner: HostId(2),
+    })
+    .expect("installs the new authority");
+
+  // A prepare under a generation the holder has not installed is refused before the fence moves.
+  let foreign = Prepare {
+    owner: HostId(2),
+    object,
+    epoch: HostEpoch(2),
+    generation: 0,
+  };
+  assert!(matches!(
+    acceptor.prepare(&foreign),
+    Err(RegisterError::ForeignGeneration { .. })
+  ));
+  // A prepare from a principal the installed authority does not name as owner is refused.
+  let wrong_owner = Prepare {
+    owner: HostId(3),
+    object,
+    epoch: HostEpoch(2),
+    generation: 1,
+  };
+  assert!(matches!(
+    acceptor.prepare(&wrong_owner),
+    Err(RegisterError::Unauthorized)
+  ));
+
+  // The authorised prepare reports the whole log and raises the fence to the new epoch.
+  let prepare = Prepare {
+    owner: HostId(2),
+    object,
+    epoch: HostEpoch(2),
+    generation: 1,
+  };
+  let promise = acceptor
+    .prepare(&prepare)
+    .expect("the authorised prepare promises");
+  assert_eq!(promise.log, log, "the holder reports its whole log");
+  assert!(promise.binds(&prepare), "the promise binds to the prepare");
+
+  // With the fence now at epoch 2, a stale prepare under a lower epoch is refused (StaleNeverCommits).
+  let stale = Prepare {
+    owner: HostId(2),
+    object,
+    epoch: HostEpoch(1),
+    generation: 1,
+  };
+  assert!(matches!(
+    acceptor.prepare(&stale),
+    Err(RegisterError::StaleEpoch { .. })
+  ));
 }
