@@ -306,11 +306,27 @@ fn mesh_serve_ports(n: usize) -> Vec<Vec<(u16, u16)>> {
 
 /// Starts one daemon per node over the per-peer socket mesh: node `i` serves each peer `j` on `serve[i][j]`
 /// and dials peer `j` at peer `j`'s serve-for-`i` socket `serve[j][i]`. Returns the daemons in node order.
+/// The fleet's fault tolerance is `f = 1` (a three-node fleet's shape); [`start_mesh_with_f`] takes a larger
+/// `f` for a fleet that keeps a quorum through more deaths (2f + 1 nodes).
 fn start_mesh(
   nodes: Vec<(MachineProfile, HostId, Identity)>,
   hosts: &[HostId],
   certs: &[rustls::pki_types::CertificateDer<'static>],
   serve: &[Vec<(u16, u16)>],
+) -> Vec<Daemon> {
+  start_mesh_with_f(nodes, hosts, certs, serve, 1)
+}
+
+/// [`start_mesh`] with an explicit fault tolerance `f`: the fleet's quorum is `f + 1` and every object has
+/// `2f + 1` candidate holders, so a fleet of `2f + 1` nodes keeps a quorum through `f` deaths. A five-node
+/// `f = 2` fleet is the smallest whose takeover promotion spans **several** surviving holders (a quorum of
+/// three: the successor plus two others), the multi-holder promotion the record-plane coordinator drives.
+fn start_mesh_with_f(
+  nodes: Vec<(MachineProfile, HostId, Identity)>,
+  hosts: &[HostId],
+  certs: &[rustls::pki_types::CertificateDer<'static>],
+  serve: &[Vec<(u16, u16)>],
+  f: u32,
 ) -> Vec<Daemon> {
   let pid = std::process::id();
   let n = hosts.len();
@@ -334,7 +350,7 @@ fn start_mesh(
       let config = DaemonConfig::derive(&profile, &instance)
         .with_shards(1)
         .with_fleet(FleetMembership {
-          quorum: Quorum { f: 1 },
+          quorum: Quorum { f },
           peers: member_peers,
         });
       let transport = FleetTransport {
@@ -811,5 +827,114 @@ fn three_daemons_take_over_a_dead_owners_head() {
     held.1,
     id.bytes.to_vec(),
     "the taken-over head's value survived the promotion and re-commit"
+  );
+}
+
+/// Polls until every survivor in `survivors` holds `object`'s head as a candidate holder
+/// ([`Daemon::fleet_holder_head`]), or the deadline passes; returns whether they all did. Used to confirm a
+/// dead owner's head reached every surviving candidate before the death, so the takeover's promotion quorum
+/// (the successor plus `f` other holders) is available.
+fn poll_all_hold(survivors: &[&Daemon], object: ObjectId) -> bool {
+  let deadline = Instant::now() + Duration::from_secs(25);
+  while Instant::now() < deadline {
+    if survivors
+      .iter()
+      .all(|daemon| daemon.fleet_holder_head(object).is_some())
+    {
+      return true;
+    }
+    std::thread::yield_now();
+  }
+  false
+}
+
+/// AC (§4.8 "Promotion and takeover", one batched phase-one round across the neighbourhood): **five** daemons
+/// form one `f = 2` fleet; a volume is provisioned on the node that then dies, and the survivor rendezvous
+/// ranks first takes over its head by promoting over **several** surviving holders — the `f + 1 = 3` promise
+/// quorum a five-node fleet needs (the successor plus two other holders), reached over the record-plane
+/// coordinator's several sessions. This is the multi-holder promotion a per-peer ship task could not drive: it
+/// held only its own peer's session and could reach a one-holder (`f = 1`) quorum only, so at `f = 2` it would
+/// never assemble three promises and the takeover would starve. Five nodes keep a quorum through one death at
+/// `f = 2` (2f + 1 = 5), and every node is a candidate (the neighbourhood is the fleet), so the owner ships the
+/// head to all four others and, after the death, the successor adopts it from the quorum and re-commits it
+/// under the new epoch. Non-vacuous on the same two counts as the three-node takeover — the successor holds the
+/// head only as a candidate before the death, and the seeded membership never reassigns ownership — with the
+/// added force that the promotion **must** span more than one remote holder.
+#[test]
+fn five_daemons_take_over_a_dead_owners_head_over_a_multi_holder_quorum() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "e"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  assert_eq!(
+    hosts
+      .iter()
+      .collect::<std::collections::BTreeSet<_>>()
+      .len(),
+    n,
+    "the five machine identities give five distinct host ids"
+  );
+
+  let pid = std::process::id();
+  // Node A (index 0) is the owner that will die; the client provisions the volume on it.
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let serve = mesh_serve_ports(n);
+  let mut daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 2);
+
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  // Provision a volume on A; its object is the volume id, and its head's value is the id bytes.
+  let mut client = Client::connect(&instance_a);
+  let ReplyBody::Created { id } = client.call(&scratch("taken-over-5")) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("the volume was not created");
+  };
+  let object = ObjectId(id.bytes);
+
+  // Wait until all four other candidates hold A's head, so after A dies the successor plus two other holders
+  // — the f + 1 = 3 promise quorum — are all available.
+  let survivors: Vec<&Daemon> = daemons[1..].iter().collect();
+  assert!(
+    poll_all_hold(&survivors, object),
+    "all four surviving candidates hold A's head before A dies (the record replicated to every candidate)"
+  );
+
+  // A dies. The survivor rendezvous ranks first for the object takes it over.
+  let owner = daemons.remove(0);
+  owner.stop();
+  let successor =
+    rendezvous_first(&hosts[1..], object).expect("a survivor takes over the dead owner's object");
+  let successor_index = hosts[1..]
+    .iter()
+    .position(|host| *host == successor)
+    .expect("the successor is one of the survivors");
+
+  // The successor drives phase one over the surviving holders (a quorum of three), adopts the committed head,
+  // re-commits it under the new epoch, and reports it region-placed under its own ownership.
+  let served = poll_head_placed(&daemons[successor_index], object);
+  let held = daemons[successor_index].fleet_holder_head(object);
+
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    served,
+    "the successor took over the dead owner's head over a multi-holder quorum and served it region-placed"
+  );
+  let held = held.expect("the successor still holds the taken-over head");
+  assert_eq!(
+    held.0, successor,
+    "the successor is now the object's owner (the takeover reassigned ownership)"
+  );
+  assert_eq!(
+    held.1,
+    id.bytes.to_vec(),
+    "the taken-over head's value survived the multi-holder promotion and re-commit"
   );
 }
