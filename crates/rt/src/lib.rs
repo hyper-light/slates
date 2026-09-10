@@ -23,13 +23,14 @@
 //! costs nothing to clone, which is what `LocalWaker` would have saved (Phase 0 task 6).
 //!
 //! Modules: [`error`], [`control`], [`waker`], [`registry`], [`task`], [`queue`], [`timer`],
-//! [`driver`], [`sim`], [`shard`], [`runtime`], [`futures`], the async sockets ([`udp`] and [`tcp`],
-//! over one shared readiness future), and the OS drivers.
+//! [`driver`], [`sim`], [`shard`], [`runtime`], [`futures`], the async sockets ([`udp`] everywhere and
+//! `tcp` on Unix — the NFS mount server's, over one shared readiness future), and the OS drivers.
 
 pub mod control;
 pub mod driver;
 pub mod error;
 pub mod futures;
+mod netsys;
 pub mod queue;
 mod readiness;
 pub mod registry;
@@ -37,11 +38,16 @@ pub mod runtime;
 pub mod shard;
 pub mod sim;
 pub mod task;
+// Async TCP is the NFS loopback mount server's alone (macOS/Linux; Windows mounts through WinFsp), so
+// it stays a `rustix` module gated off Windows — the fleet transport is QUIC over UDP, not TCP.
+#[cfg(not(windows))]
 pub mod tcp;
 pub mod timer;
 pub mod udp;
 pub mod waker;
 
+#[cfg(target_os = "windows")]
+mod afd;
 #[cfg(target_os = "linux")]
 pub mod epoll;
 #[cfg(target_os = "windows")]

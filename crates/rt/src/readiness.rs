@@ -22,6 +22,9 @@ enum Interest {
   /// The socket has data to read, or a listener has a connection to accept.
   Readable,
   /// The socket has send-buffer space for a write (or connect) that returned `EAGAIN`/`EINPROGRESS`.
+  /// Only the TCP path awaits this, and TCP is off Windows (the NFS mount server's alone), so the
+  /// variant is too — UDP, the cross-platform transport, awaits readability only.
+  #[cfg(not(windows))]
   Writable,
 }
 
@@ -49,6 +52,7 @@ impl Future for Ready {
     let (raw, interest) = (self.raw, self.interest);
     let registered = registry::with_current(|ctx| match interest {
       Interest::Readable => ctx.register_readable(raw, word.word()),
+      #[cfg(not(windows))]
       Interest::Writable => ctx.register_writable(raw, word.word()),
     });
     match registered {
@@ -73,7 +77,8 @@ pub(crate) async fn readable(raw: i32) -> Result<(), RtError> {
 }
 
 /// Awaits `raw`'s writability once (a real socket fd whose send buffer filled, or a connect in
-/// progress).
+/// progress). TCP-only, so off Windows (the NFS mount server's alone).
+#[cfg(not(windows))]
 pub(crate) async fn writable(raw: i32) -> Result<(), RtError> {
   Ready {
     raw,

@@ -4,10 +4,12 @@
 use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT};
+use windows_sys::Win32::Networking::WinSock::SOCKET;
 use windows_sys::Win32::System::IO::{
   CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED_ENTRY, PostQueuedCompletionStatus,
 };
 
+use crate::afd::{Afd, Block, READABLE_EVENTS, WRITABLE_EVENTS, base_socket};
 use crate::driver::{Completion, Driver, DriverKind, Kick, nanos_since};
 use crate::error::RtError;
 
@@ -15,6 +17,9 @@ use crate::error::RtError;
 const KICK_KEY: usize = usize::MAX;
 /// Format: the completion key that marks a no-op; its user word rides in the overlapped pointer.
 const NOP_KEY: usize = usize::MAX - 1;
+/// Format: the completion key the AFD readiness device is associated under. Its completions carry a
+/// poll block in the overlapped pointer (its head is the block), not a user word in the key.
+const AFD_KEY: usize = usize::MAX - 2;
 
 /// Shape: entries drained per wait (see the kqueue driver for the reasoning).
 const EVENTS_PER_WAIT: usize = 64;
@@ -24,6 +29,9 @@ pub struct IocpDriver {
   port: HANDLE,
   epoch: Instant,
   entries: Vec<OVERLAPPED_ENTRY>,
+  /// The AFD readiness device, opened and associated with `port` on the first socket registration
+  /// (a shard that only kicks and times out never opens it). Socket readiness is polled through it.
+  afd: Option<Afd>,
 }
 
 impl std::fmt::Debug for IocpDriver {
@@ -57,7 +65,42 @@ impl IocpDriver {
       port: std::ptr::with_exposed_provenance_mut(port),
       epoch: Instant::now(),
       entries,
+      afd: None,
     }
+  }
+
+  /// The AFD readiness device, opened and associated with this port on first use (§4.6). Lazily,
+  /// because a driver that never awaits a socket needs no AFD handle.
+  fn afd(&mut self) -> Result<&Afd, RtError> {
+    if let Some(ref afd) = self.afd {
+      return Ok(afd);
+    }
+    let afd = Afd::open()?;
+    // Associate the AFD device with this port so its polls complete here under `AFD_KEY`.
+    // SAFETY: both handles are live and ours; `CreateIoCompletionPort` with an existing `port`
+    // associates `afd.handle()` with it and returns the port (null on failure).
+    let associated = unsafe { CreateIoCompletionPort(afd.handle(), self.port, AFD_KEY, 0) };
+    if associated.is_null() {
+      return Err(RtError::os("CreateIoCompletionPort(AFD)"));
+    }
+    // `insert` stores the device and hands back a reference to it — no `expect` on a re-read.
+    Ok(self.afd.insert(afd))
+  }
+
+  /// Arms a one-shot AFD poll for `events` on the socket `raw` names, waking `user_data` when it
+  /// fires. A Windows `SOCKET` fits in a positive `i32` in practice (kernel handle-table values), so
+  /// the readiness seam carries it as the same `i32` a Unix fd uses; it is reconstructed here as the
+  /// low 32 bits, unsigned. The leaked poll block is owned by the kernel until `wait` reclaims it.
+  fn arm(&mut self, raw: i32, events: u32, user_data: u64) -> Result<(), RtError> {
+    // The inverse of `netsys::Socket::raw_id`: reinterpret the `i32` as its 32 bits, then widen to the
+    // pointer-width `SOCKET` — bit-for-bit the handle the seam narrowed. No sign-losing `as` cast.
+    let socket = u32::from_ne_bytes(raw.to_ne_bytes()) as SOCKET;
+    let base = base_socket(socket)?;
+    let afd = self.afd()?;
+    // SAFETY: `afd()` associated the device with this port before returning it, so the poll's
+    // completion is delivered here and `wait` reclaims the block exactly once.
+    let _block = unsafe { afd.poll(base, events, user_data)? };
+    Ok(())
   }
 }
 
@@ -131,6 +174,22 @@ impl Driver for IocpDriver {
           user_data: u64::try_from(entry.lpOverlapped.addr()).unwrap_or(0),
           result: 0,
         }),
+        AFD_KEY => {
+          // A socket readiness poll fired: the overlapped pointer is the leaked poll block (its head
+          // is the `OVERLAPPED`), so reclaim it and wake the word it carried. The fired events are not
+          // needed — the readiness future just retries its non-blocking syscall (a spurious wake, e.g.
+          // for a since-dropped task, harmlessly wakes nothing).
+          if !entry.lpOverlapped.is_null() {
+            let block = entry.lpOverlapped.cast::<Block>();
+            // SAFETY: `block` is a `Block` leaked by `Afd::poll` (its `OVERLAPPED` head is what was
+            // armed) and delivered here exactly once by the port; `reclaim` takes ownership back.
+            let user_data = unsafe { Block::reclaim(block) };
+            out.push(Completion {
+              user_data,
+              result: 0,
+            });
+          }
+        }
         key => out.push(Completion {
           user_data: u64::try_from(key).unwrap_or(0),
           result: i32::try_from(entry.dwNumberOfBytesTransferred).unwrap_or(i32::MAX),
@@ -153,21 +212,15 @@ impl Driver for IocpDriver {
     Ok(())
   }
 
-  fn register_readable(&mut self, _raw: i32, _user_data: u64) -> Result<(), RtError> {
-    // Owed (§4.10a): this completion-native driver does not carry socket readiness yet; a
-    // typed refusal, never a silent drop. The readiness-native drivers (kqueue, epoll) do.
-    Err(RtError::DriverRefused {
-      call: "register_readable",
-      code: None,
-    })
+  fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
+    // One-shot AFD poll for the read edges (data, an incoming connection, EOF, an error): it completes
+    // on this port when any fires, and `wait` wakes `user_data`. The readiness-native drivers (kqueue,
+    // epoll) do this with `EVFILT_READ`/`EPOLLIN`; AFD is the Windows equivalent.
+    self.arm(raw, READABLE_EVENTS, user_data)
   }
 
-  fn register_writable(&mut self, _raw: i32, _user_data: u64) -> Result<(), RtError> {
-    // Owed (§4.6): this completion-native driver does not carry socket write-readiness yet; a
-    // typed refusal, never a silent drop. The readiness-native drivers (kqueue, epoll) do.
-    Err(RtError::DriverRefused {
-      call: "register_writable",
-      code: None,
-    })
+  fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
+    // One-shot AFD poll for the write edges (send-buffer space, a connect result, an error).
+    self.arm(raw, WRITABLE_EVENTS, user_data)
   }
 }

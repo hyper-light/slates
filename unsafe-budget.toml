@@ -14,13 +14,25 @@
 #   the file-backed map of a memory object (1), the descriptor a child inherits (1), the two
 #   atomic views of mapped words (2), and the Windows section (create, open, view, drop, the two
 #   byte views and the lock: 8).
-# slates-rt (20): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
+# slates-rt (48): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
 #   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
 #   the IOCP calls are Win32 (6); the UDP readiness registration (§4.10a, added 2026-09-07): the
 #   kqueue read-filter `kevent` (unsafe by signature, one change record, 1) and the epoll
 #   `BorrowedFd::borrow_raw` of a live socket for one `epoll_ctl` (1); the TCP write-readiness
 #   registration (§4.6, added 2026-09-09 for the async loopback server): the kqueue write-filter
 #   `kevent` (1) and the epoll `BorrowedFd::borrow_raw` for the `EPOLLOUT` `epoll_ctl` (1).
+#   The Windows socket stack (added 2026-09-09, compiled only for Windows — the daemon and the
+#   QUIC fleet transport run there; TCP stays macOS/Linux for the NFS mount): the **AFD readiness
+#   reactor** `afd.rs` that gives the completion-native IOCP driver edge readiness the way wepoll/mio
+#   do — the ntdll FFI windows-sys does not wrap (`NtCreateFile` of `\Device\Afd`, `NtDeviceIoControlFile`
+#   for `IOCTL_AFD_POLL`, `RtlNtStatusToDosError`, `CloseHandle` on drop), `WSAIoctl(SIO_BASE_HANDLE)`
+#   for the base socket, a zeroed `OVERLAPPED` poll block, and the `Box::into_raw`/`from_raw` that leak
+#   one block into the kernel per poll and reclaim it on completion (11); the **Winsock 2 datagram
+#   seam** `netsys.rs` (the platform UDP arm behind the cross-platform socket) — `WSAStartup`, a zeroed
+#   `WSADATA`, `WSAGetLastError`, `closesocket` on drop, `socket`/`ioctlsocket(FIONBIO)`/`bind`/
+#   `getsockname`/`recvfrom`/`sendto`, and the `S_addr` address-union read (14); and the IOCP driver's
+#   `iocp.rs` AFD wiring — associating the AFD device with the port, arming a poll, and reclaiming a
+#   delivered block (3). All are Win32/ntdll FFI without a safe wrapper, each with a `// SAFETY:` line.
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
 # slates-base (6): rustix marks kevent unsafe because the kernel fills the output list; one
@@ -69,7 +81,7 @@
 [budget]
 slates-machine = 43
 slates-mem = 16
-slates-rt = 20
+slates-rt = 48
 slates-base = 6
 slates-vfs = 0
 slates-land = 3
