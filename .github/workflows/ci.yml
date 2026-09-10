@@ -167,6 +167,16 @@ jobs:
           cargo test -p slates-ipc --test rings
           cargo test -p slates-ipc --test rendezvous
           cargo test -p slates-rt --test udp
+      # The full daemon lifecycle end to end on Windows: an in-process `slates-server` daemon starts,
+      # a client finds it through the Win32 rendezvous bootstrap object, and drives create → duplicate
+      # refused → snapshot → clone → attach/lease → status → list → detach → resize → destroy over the
+      # rings. This composes the pieces the steps above prove individually (shared memory, the rings and
+      # their Event wake, the rendezvous, the IOCP/AFD runtime the daemon's shards run on) into the whole
+      # Windows client↔daemon stack — the "full daemon lifecycle awaits the rendezvous end to end" item,
+      # now that the rendezvous is proven above. The single in-process case (no cross-process anchor
+      # restart) is the deterministic core; the restart/anchor path stays macOS/Linux.
+      - name: Test the daemon lifecycle end to end (native Windows)
+        run: cargo test -p slates-client --test client the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed
       # The live WinFsp mount (§4.6): mount a slates volume at a drive letter through the real kernel
       # FSD, then create/write/read/list/delete a file through the Windows filesystem and unmount. This
       # drives the whole `FSP_FILE_SYSTEM_INTERFACE` — the hand-transcribed FFI, the callback
@@ -247,10 +257,11 @@ jobs:
         env:
           WINFSP_LIB: C:\Program Files (x86)\WinFsp\lib
         run: cargo clippy -p slates-mem -p slates-ipc -p slates-rt -p slates-client -p slates-server -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python --all-targets -- -D warnings
-      # The Win32 paths a native runner can actually exercise (the daemon-spawning server/client tests
-      # are not run on Windows yet — the full daemon lifecycle there awaits the Win32 rendezvous end to
-      # end; the pieces are proven by `windows-lint`). WinFsp is installed above, so the live mount runs.
-      - name: Test the Win32 memory, wake, AFD, rendezvous, and WinFsp mount paths
+      # The Win32 paths a native runner exercises, including the **full daemon lifecycle end to end**
+      # (an in-process daemon a client reaches through the Win32 rendezvous, driving the whole verb set)
+      # — no longer owed now that the rendezvous is proven; the cross-process anchor-restart path stays
+      # macOS/Linux. WinFsp is installed above, so the live mount runs too.
+      - name: Test the Win32 memory, wake, AFD, rendezvous, daemon lifecycle, and WinFsp mount paths
         env:
           WINFSP_LIB: C:\Program Files (x86)\WinFsp\lib
           WINFSP_TEST_MOUNT: "1"
@@ -259,4 +270,5 @@ jobs:
           cargo test -p slates-ipc --test rings
           cargo test -p slates-ipc --test rendezvous
           cargo test -p slates-rt --test udp
+          cargo test -p slates-client --test client the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed
           cargo test -p slates-bridge-winfsp --test mount -- --nocapture
