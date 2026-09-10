@@ -87,10 +87,7 @@ fn timing() -> DetectorTiming {
 }
 
 fn budget() -> CommitBudget {
-  CommitBudget {
-    deadline_ns: DEADLINE_NS,
-    poll_interval_ns: POLL_NS,
-  }
+  CommitBudget::hard(DEADLINE_NS, POLL_NS)
 }
 
 /// What one live probe round produced at the prober: whether it timed out, the gossip any acknowledgement

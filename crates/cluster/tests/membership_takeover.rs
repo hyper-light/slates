@@ -91,10 +91,7 @@ fn timing() -> DetectorTiming {
 }
 
 fn budget() -> CommitBudget {
-  CommitBudget {
-    deadline_ns: DEADLINE_NS,
-    poll_interval_ns: POLL_NS,
-  }
+  CommitBudget::hard(DEADLINE_NS, POLL_NS)
 }
 
 /// AC (§4.8, boot step 6 live): a silent peer's real probe timeout drives the survivor's detector to

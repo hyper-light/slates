@@ -180,10 +180,7 @@ fn run_commit(serve: [bool; 2]) -> Result<Placement, String> {
         &record(b"head@v1"),
         Quorum { f: 1 },
         remotes,
-        CommitBudget {
-          deadline_ns: DEADLINE_NS,
-          poll_interval_ns: POLL_NS,
-        },
+        CommitBudget::hard(DEADLINE_NS, POLL_NS),
       )
       .await
       .outcome
@@ -215,10 +212,7 @@ fn f0_commits_locally_with_no_dispatch() {
         &record(b"head@v1"),
         Quorum { f: 0 },
         Vec::new(),
-        CommitBudget {
-          deadline_ns: DEADLINE_NS,
-          poll_interval_ns: POLL_NS,
-        },
+        CommitBudget::hard(DEADLINE_NS, POLL_NS),
       )
       .await
       .outcome
@@ -259,10 +253,7 @@ fn a_commit_under_a_solo_configuration_places_locally() {
         &record(b"head@v1"),
         &mut owner_acceptor,
         Vec::new(),
-        CommitBudget {
-          deadline_ns: DEADLINE_NS,
-          poll_interval_ns: POLL_NS,
-        },
+        CommitBudget::hard(DEADLINE_NS, POLL_NS),
       )
       .await;
       let placed = committed
@@ -376,10 +367,7 @@ fn a_retry_reuses_the_connection_with_advancing_packet_numbers() {
 
         let mut owner_acceptor = Acceptor::new(OWNER, authority());
         let candidates = [OWNER, HostId(2), HostId(3)];
-        let budget = CommitBudget {
-          deadline_ns: DEADLINE_NS,
-          poll_interval_ns: POLL_NS,
-        };
+        let budget = CommitBudget::hard(DEADLINE_NS, POLL_NS);
         let rec = record(b"head@v1");
 
         let first = commit_record(

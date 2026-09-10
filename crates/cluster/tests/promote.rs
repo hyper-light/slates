@@ -184,10 +184,7 @@ fn run_promotion() -> Outcome {
         &prepare,
         Quorum { f: 1 },
         vec![(other, endpoint)],
-        CommitBudget {
-          deadline_ns: DEADLINE_NS,
-          poll_interval_ns: POLL_NS,
-        },
+        CommitBudget::hard(DEADLINE_NS, POLL_NS),
       )
       .await;
       let result = match outcome {
@@ -260,10 +257,7 @@ fn f0_promotes_locally_with_no_dispatch() {
         &prepare,
         Quorum { f: 0 },
         Vec::new(),
-        CommitBudget {
-          deadline_ns: DEADLINE_NS,
-          poll_interval_ns: POLL_NS,
-        },
+        CommitBudget::hard(DEADLINE_NS, POLL_NS),
       )
       .await;
       let result = match outcome {

@@ -143,10 +143,7 @@ fn run_owner_commit() -> bool {
         .commit_head(
           &record,
           vec![(A, endpoint)],
-          CommitBudget {
-            deadline_ns: DEADLINE_NS,
-            poll_interval_ns: POLL_NS,
-          },
+          CommitBudget::hard(DEADLINE_NS, POLL_NS),
         )
         .await
         .outcome
@@ -194,10 +191,7 @@ fn the_solo_runtime_commits_a_head_locally() {
         .commit_head(
           &record,
           Vec::new(),
-          CommitBudget {
-            deadline_ns: DEADLINE_NS,
-            poll_interval_ns: POLL_NS,
-          },
+          CommitBudget::hard(DEADLINE_NS, POLL_NS),
         )
         .await
         .outcome

@@ -3,7 +3,9 @@
 //! cluster milestone): `slates-db` owns synchronous acceptance and the register protocol (the
 //! [`Acceptor`], [`Placement`], [`Quorum`], the record and its identity); `slates-transport` carries
 //! the mutually-authenticated request/reply; and this crate owns the dispatch, the collection, the
-//! deadline and the cancellation. Both a local and a remote holder run the *same* acceptance rules —
+//! deadline (with progress-based extension, §4.8 "late work" — a commit whose quorum is still filling
+//! is given more time rather than declared failed), and the cancellation. Both a local and a remote
+//! holder run the *same* acceptance rules —
 //! the owner holds locally through its own [`Acceptor`], each remote holder through one reached over
 //! the transport.
 //!
@@ -48,8 +50,10 @@ use slates_db::register::{
   Quorum, Record, candidates_for,
 };
 use slates_rt::error::RtError;
-use slates_rt::futures::{cancel, sleep, spawn_child};
+use slates_rt::futures::{cancel, now_ns, sleep, spawn_child};
 use slates_transport::endpoint::Endpoint;
+
+use crate::progress::{DeadlineExtender, ExtensionOutcome, ProgressWitness};
 
 /// The stream a record request rides on a holder connection.
 /// Format: the register-ship RPC uses one stream per connection; the holder's `serve_once` accepts
@@ -124,27 +128,146 @@ pub async fn serve_record(
     .await
 }
 
-/// The timing budget for a commit's dispatch, both the caller's to derive (owed — a measured RTT
-/// budget; nothing here is a hidden constant): the deadline before an unfinished commit is reported
-/// uncertain, and the interval the collection loop parks between wake-ups.
+/// The timing budget for a commit's dispatch, the caller's to derive (owed — a measured RTT budget;
+/// nothing here is a hidden constant): the deadline before an unfinished commit is reported uncertain,
+/// the interval the collection loop parks between wake-ups, and the **progress-extension policy** (§4.8
+/// "late work"). A commit whose quorum is still filling as it nears the deadline is granted a bounded
+/// extension rather than declared uncertain; a stalled one (no new acknowledgement within the stall
+/// window) is left to time out. The degenerate is [`hard`](CommitBudget::hard): no extension, so the
+/// deadline is absolute — the behaviour every `f = 0` / laptop caller uses, the *same* code path a
+/// fleet runs with extensions enabled (R8: the extender always runs, with a zero budget at the
+/// degenerate).
 #[derive(Clone, Copy, Debug)]
 pub struct CommitBudget {
-  /// How long to wait for a quorum before reporting the commit uncertain.
+  /// How long to wait for a quorum before reporting the commit uncertain (the initial deadline, which a
+  /// granted extension grows).
   pub deadline_ns: u64,
   /// The poll interval the collection loop sleeps between checking for acknowledgements.
   pub poll_interval_ns: u64,
+  /// The fraction of the current deadline (as the integer ratio `numerator / denominator`, so no float
+  /// enters the decision) at which an extension is first considered.
+  lookahead_numerator: u64,
+  lookahead_denominator: u64,
+  /// How much each granted extension adds to the deadline.
+  extension_ns: u64,
+  /// How many extensions a single dispatch may be granted before its deadline is absolute.
+  max_extensions: u32,
+  /// The span of no new acknowledgement after which a dispatch is judged stalled, not merely slow.
+  stall_window_ns: u64,
 }
 
-/// What a dispatch task reports back to the owner's collection loop: a holder's reply *and its
-/// endpoint returned* (so the connection is reused across commits — its packet-number space stays
-/// continuous across a retry, RFC 9000 §12.3), or the deadline.
-enum Reply {
-  /// A holder's reply bytes (empty if it refused) and its endpoint (boxed — an endpoint is large,
-  /// while the deadline variant is empty), handed back for reuse.
-  From(HostId, Vec<u8>, Box<Endpoint>),
-  /// The commit deadline elapsed.
-  Deadline,
+impl CommitBudget {
+  /// A hard-deadline budget: the dispatch waits until `deadline_ns` and is then reported uncertain, with
+  /// no progress extension. This is the degenerate — `max_extensions = 0`, so the extension policy
+  /// reduces to the absolute deadline — that the laptop and every current caller use; the `f > 0` caller
+  /// that wants late-work tolerance builds one with [`with_extension`](CommitBudget::with_extension).
+  /// `poll_interval_ns` is the collection loop's park between wake-ups.
+  pub fn hard(deadline_ns: u64, poll_interval_ns: u64) -> CommitBudget {
+    CommitBudget {
+      deadline_ns,
+      poll_interval_ns,
+      // No extension: the lookahead falls at the deadline itself (1/1) and zero grants are allowed, so
+      // the extender returns Continue until `deadline_ns` and Expire at it — an absolute deadline.
+      lookahead_numerator: 1,
+      lookahead_denominator: 1,
+      extension_ns: 0,
+      max_extensions: 0,
+      // Never consulted while `max_extensions` is 0 (no extension is ever considered); set to the
+      // deadline so the field is never a smaller hidden bound than the deadline it accompanies.
+      stall_window_ns: deadline_ns,
+    }
+  }
+
+  /// A progress-extending budget (§4.8 "late work"): a dispatch still gathering acknowledgements as it
+  /// passes the `lookahead_numerator / lookahead_denominator` fraction of its deadline is granted up to
+  /// `max_extensions` extensions of `extension_ns` each, provided its acknowledged set advanced within
+  /// `stall_window_ns`; a stalled dispatch is left to time out at the current deadline. Every value is
+  /// the caller's to derive from the operation's class (its measured per-holder RTT and quorum width);
+  /// nothing here is a hidden constant.
+  pub fn with_extension(
+    deadline_ns: u64,
+    poll_interval_ns: u64,
+    lookahead_numerator: u64,
+    lookahead_denominator: u64,
+    extension_ns: u64,
+    max_extensions: u32,
+    stall_window_ns: u64,
+  ) -> CommitBudget {
+    CommitBudget {
+      deadline_ns,
+      poll_interval_ns,
+      lookahead_numerator,
+      lookahead_denominator,
+      extension_ns,
+      max_extensions,
+      stall_window_ns,
+    }
+  }
+
+  /// The extension policy this budget describes, as a fresh [`DeadlineExtender`] seeded at `deadline_ns`.
+  fn extender(&self) -> DeadlineExtender {
+    DeadlineExtender::new(
+      self.deadline_ns,
+      self.lookahead_numerator,
+      self.lookahead_denominator,
+      self.extension_ns,
+      self.max_extensions,
+    )
+  }
 }
+
+/// The dispatch collection loop's wait-and-decide step (§4.8 "late work"), shared by the commit
+/// ([`collect_acks`]) and promotion ([`collect_promises`]) loops so both age a slow dispatch the same
+/// way. It parks one poll interval, then judges from the dispatch's own progress — the size of its
+/// acknowledged (or promised) set — whether a dispatch that has reached its deadline is still filling
+/// its quorum (extend) or has stalled / spent its extension budget (time out). The [`hard`] budget's
+/// zero extension budget makes this an absolute deadline, so the laptop's behaviour is unchanged (R8).
+///
+/// [`hard`]: CommitBudget::hard
+struct DispatchWait {
+  extender: DeadlineExtender,
+  witness: ProgressWitness,
+  poll_interval_ns: u64,
+  started_ns: u64,
+}
+
+impl DispatchWait {
+  /// A wait seeded from `budget`, its clock started at `now` (the moment collection begins, so the
+  /// elapsed time the extender measures is time spent gathering acknowledgements).
+  fn new(budget: CommitBudget, now: u64) -> DispatchWait {
+    DispatchWait {
+      extender: budget.extender(),
+      witness: ProgressWitness::new(budget.stall_window_ns, now),
+      poll_interval_ns: budget.poll_interval_ns,
+      started_ns: now,
+    }
+  }
+
+  /// Parks one poll interval, then reports whether the dispatch may keep waiting given how many distinct
+  /// acknowledgements it has gathered so far (`gathered`). Returns `false` when the dispatch has reached
+  /// its deadline and is stalled, or has spent its extension budget — the collection loop then stops and
+  /// the commit is reported uncertain. A dispatch below its deadline, or still filling its quorum near
+  /// it, keeps waiting.
+  async fn keep_waiting(&mut self, gathered: usize) -> bool {
+    sleep(self.poll_interval_ns).await;
+    let now = now_ns();
+    self
+      .witness
+      .observe(u64::try_from(gathered).unwrap_or(u64::MAX), now);
+    let elapsed = now.saturating_sub(self.started_ns);
+    !matches!(
+      self.extender.evaluate(elapsed, &self.witness, now),
+      ExtensionOutcome::Expire
+    )
+  }
+}
+
+/// What a dispatch task reports back to the owner's collection loop: a holder's reply bytes (empty if it
+/// refused) *and its endpoint returned boxed* (an endpoint is large), so the connection is reused across
+/// commits — its packet-number space stays continuous across a retry, RFC 9000 §12.3. The deadline is no
+/// longer a message: it is the collection loop's own progress-extension decision ([`DispatchWait`]), so a
+/// report is always a holder's reply.
+struct Reply(HostId, Vec<u8>, Box<Endpoint>);
 
 /// Whether `acked` (distinct candidates) commits under `quorum` for `candidates`.
 fn is_placed(candidates: &[HostId], acked: &[HostId], quorum: Quorum) -> bool {
@@ -169,9 +292,10 @@ async fn collect_acks(
 ) -> (Vec<(HostId, Endpoint)>, bool) {
   let mut reusable: Vec<(HostId, Endpoint)> = Vec::new();
   let mut timed_out = false;
+  let mut wait = DispatchWait::new(budget, now_ns());
   while !is_placed(candidates, acked, quorum) {
     match rx.try_recv() {
-      Ok(Reply::From(host, reply, endpoint)) => {
+      Ok(Reply(host, reply, endpoint)) => {
         reusable.push((host, *endpoint));
         if let Ok(ack) = Ack::decode(&reply)
           && ack.holder == host
@@ -182,16 +306,19 @@ async fn collect_acks(
           acked.push(host);
         }
       }
-      Ok(Reply::Deadline) => {
-        timed_out = true;
-        break;
+      // Nothing to receive: park a poll interval and let the progress-extension policy decide whether a
+      // dispatch at its deadline is still filling its quorum (keep waiting) or has stalled (time out).
+      Err(TryRecvError::Empty) => {
+        if !wait.keep_waiting(acked.len()).await {
+          timed_out = true;
+          break;
+        }
       }
-      Err(TryRecvError::Empty) => sleep(budget.poll_interval_ns).await,
       Err(TryRecvError::Disconnected) => break,
     }
   }
   // Recover the endpoint of any task that already finished, so it too is reused.
-  while let Ok(Reply::From(host, _, endpoint)) = rx.try_recv() {
+  while let Ok(Reply(host, _, endpoint)) = rx.try_recv() {
     reusable.push((host, *endpoint));
   }
   (reusable, timed_out)
@@ -212,8 +339,10 @@ pub struct Committed {
 /// `f + 1`"). The owner (`owner`) holds it locally through `owner_acceptor`; the `remote_holders` (a
 /// connected [`Endpoint`] per remaining candidate) are each shipped the record concurrently — one task
 /// per holder, so a slow holder never serializes the others — and the loop collects **distinct,
-/// binding** acknowledgements until the placement is `placed(quorum)` or the deadline elapses, polling
-/// at the budget's interval between wake-ups. It returns a [`Committed`]: on quorum the [`Placement`];
+/// binding** acknowledgements until the placement is `placed(quorum)` or the budget's deadline expires,
+/// polling at the budget's interval between wake-ups. A commit whose quorum is still filling as it nears
+/// the deadline is granted the budget's progress extension rather than declared uncertain (§4.8 "late
+/// work"); a stalled one is left to time out. It returns a [`Committed`]: on quorum the [`Placement`];
 /// on the deadline [`ClusterError::Uncertain`] (partial acceptance may have occurred); if every holder
 /// answered short of quorum [`ClusterError::NotPlaced`] — together with the holder connections that
 /// replied, handed back for reuse (so a retry reuses the same connection and its continuous
@@ -248,8 +377,9 @@ pub async fn commit_record(
     };
   }
 
-  // Dispatch each remote holder in its own task, reporting to one channel; a deadline task closes the
-  // wait. Children of this task, so they are cancelled if this future is dropped (no orphans).
+  // Dispatch each remote holder in its own task, reporting to one channel; the collection loop below
+  // bounds the wait itself (its progress-extension policy), so no deadline task is needed. Children of
+  // this task, so they are cancelled if this future is dropped (no orphans).
   let (tx, rx) = channel::<Reply>();
   let record_bytes = record.encode();
   let mut tasks = Vec::new();
@@ -261,20 +391,12 @@ pub async fn commit_record(
         .request(RECORD_STREAM, &bytes)
         .await
         .unwrap_or_default();
-      let _ = tx.send(Reply::From(host, reply, Box::new(endpoint)));
+      let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     match spawned {
       Ok(task) => tasks.push(task),
       Err(e) => return spawn_failed(&tasks, e),
     }
-  }
-  let deadline_tx = tx.clone();
-  match spawn_child(async move {
-    sleep(budget.deadline_ns).await;
-    let _ = deadline_tx.send(Reply::Deadline);
-  }) {
-    Ok(task) => tasks.push(task),
-    Err(e) => return spawn_failed(&tasks, e),
   }
   drop(tx); // so the channel disconnects once every task has ended
 
@@ -409,9 +531,10 @@ async fn collect_promises(
 ) -> (Vec<(HostId, Endpoint)>, bool) {
   let mut reusable: Vec<(HostId, Endpoint)> = Vec::new();
   let mut timed_out = false;
+  let mut wait = DispatchWait::new(budget, now_ns());
   while !quorum.committed(promised.len()) {
     match rx.try_recv() {
-      Ok(Reply::From(host, reply, endpoint)) => {
+      Ok(Reply(host, reply, endpoint)) => {
         reusable.push((host, *endpoint));
         if let Ok(promise) = Promise::decode(&reply)
           && promise.holder == host
@@ -423,15 +546,18 @@ async fn collect_promises(
           fold_adopted(adopted, promise.highest);
         }
       }
-      Ok(Reply::Deadline) => {
-        timed_out = true;
-        break;
+      // Nothing to receive: park a poll interval and let the progress-extension policy decide whether a
+      // promotion at its deadline is still filling its quorum (keep waiting) or has stalled (time out).
+      Err(TryRecvError::Empty) => {
+        if !wait.keep_waiting(promised.len()).await {
+          timed_out = true;
+          break;
+        }
       }
-      Err(TryRecvError::Empty) => sleep(budget.poll_interval_ns).await,
       Err(TryRecvError::Disconnected) => break,
     }
   }
-  while let Ok(Reply::From(host, _, endpoint)) = rx.try_recv() {
+  while let Ok(Reply(host, _, endpoint)) = rx.try_recv() {
     reusable.push((host, *endpoint));
   }
   (reusable, timed_out)
@@ -455,8 +581,10 @@ fn fold_adopted(adopted: &mut Option<Accepted>, reported: Option<Accepted>) {
 /// batched round"). The new owner (`new_owner`) promises locally through `owner_acceptor` (it is a
 /// candidate — the surviving holder the takeover named); the `remote_holders` are each sent the prepare
 /// concurrently — one task per holder, so a slow holder never serializes the others — and the loop
-/// collects **distinct, binding** promises until a quorum promised or the deadline elapses, folding the
-/// newest adopted record as it goes. It returns a [`Promoted`]: on a quorum the [`Promotion`] (safe to
+/// collects **distinct, binding** promises until a quorum promised or the budget's deadline expires (a
+/// promotion still filling its quorum near the deadline earns the budget's progress extension, the same
+/// §4.8 "late work" policy the commit uses), folding the newest adopted record as it goes. It returns a
+/// [`Promoted`]: on a quorum the [`Promotion`] (safe to
 /// serve — `f + 1` promises intersect every prior `f + 1` commit, so the adoption covers the committed
 /// prefix); on the deadline [`ClusterError::Uncertain`]; short of quorum [`ClusterError::NotPlaced`] —
 /// with the replying holders' connections handed back for the adoption re-commit. Remaining tasks are
@@ -489,8 +617,9 @@ pub async fn promote_record(
     };
   }
 
-  // Dispatch each remote holder in its own task, reporting to one channel; a deadline task closes the
-  // wait. Children of this task, so they are cancelled if this future is dropped (no orphans).
+  // Dispatch each remote holder in its own task, reporting to one channel; the collection loop below
+  // bounds the wait itself (its progress-extension policy), so no deadline task is needed. Children of
+  // this task, so they are cancelled if this future is dropped (no orphans).
   let (tx, rx) = channel::<Reply>();
   let prepare_bytes = prepare.encode();
   let mut tasks = Vec::new();
@@ -502,20 +631,12 @@ pub async fn promote_record(
         .request(PROMOTE_STREAM, &bytes)
         .await
         .unwrap_or_default();
-      let _ = tx.send(Reply::From(host, reply, Box::new(endpoint)));
+      let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     match spawned {
       Ok(task) => tasks.push(task),
       Err(e) => return promote_spawn_failed(&tasks, e),
     }
-  }
-  let deadline_tx = tx.clone();
-  match spawn_child(async move {
-    sleep(budget.deadline_ns).await;
-    let _ = deadline_tx.send(Reply::Deadline);
-  }) {
-    Ok(task) => tasks.push(task),
-    Err(e) => return promote_spawn_failed(&tasks, e),
   }
   drop(tx); // so the channel disconnects once every task has ended
 
