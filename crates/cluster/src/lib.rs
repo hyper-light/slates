@@ -38,6 +38,7 @@ pub mod membership;
 pub mod progress;
 pub mod raft;
 pub mod raft_wire;
+pub mod routing;
 pub mod swim;
 
 use std::sync::mpsc::{TryRecvError, channel};
