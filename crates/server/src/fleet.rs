@@ -200,11 +200,8 @@ pub async fn run_membership(transport: FleetTransport) {
   // The probe client dials the peer's advertised probe address with the startup retry (the handshake is
   // not retransmitted, so a lost initial packet — the peer not yet listening — is recovered by re-dialing).
   // The identity is borrowed here for the probe dial and the two serve-side accepts above; it is then moved
-  // into the record ship loop, which dials the peer's record address *lazily* — only when it first has a
-  // head to place. A boot-time record dial would leave that session idle across the whole formation window
-  // (seconds) before its first use, and an idle-then-reused session's first request stalls; dialing at the
-  // moment of first use keeps the session warm from establish through the commit. Detached: cancelled by
-  // the runtime's shutdown.
+  // into the record ship loop, which dials the peer's record address at its own boot (see `ship_records`).
+  // Detached: cancelled by the runtime's shutdown.
   let Some(probe_client) = dial(&identity, &name, peer.address, &peer.certificate, budget).await else {
     return;
   };
