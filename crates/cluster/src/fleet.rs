@@ -18,16 +18,25 @@
 //! installed the new configuration refuses an older-generation record), so the owner's own acceptor
 //! adopts the new authority the moment the configuration moves.
 //!
-//! Scope (this piece): the authority core and its N=1-vs-fleet differential (R8). Deliberately **not**
-//! here, and owed as the next pieces, each at a real boundary:
+//! Scope (this piece): the authority core and its N=1-vs-fleet differential (R8).
+//!
+//! **Wired into the daemon (2026-09-10):** `slates-server` depends on `slates-cluster`, and each shard's
+//! `ShardState` holds a `FleetNode` (`FleetNode::solo` at boot — the laptop `f = 0`). The daemon's
+//! placement authority — every `place`/`region_placed`/`await_placed`/`host_epoch` the verbs read — now
+//! comes from `fleet.configuration()`, so the register/placement path runs the fleet's configuration
+//! group rather than a bare `Configuration` (R8: the same code the fleet runs, degenerate at N=1). Verb
+//! and daemon-lifecycle behaviour is unchanged at N=1.
+//!
+//! Deliberately **not** here yet, and owed as the next pieces, each at a real boundary:
 //!
 //! - the object→owner routing registry — *which* of a dead host's objects this node holds — so
 //!   cross-node takeover can be driven per object (the `ConfigGroup`'s single-owner `Configuration`
 //!   models this node's authority over its own objects, not a per-object table);
 //! - the live probe/gossip loop that feeds [`observe`](FleetNode::observe) from the [`crate::detector`],
 //!   and the async register lifecycle (commit a head, on takeover run the promotion) driven from it;
-//! - wiring this into the server daemon's control shard at boot (a `slates-server` → `slates-cluster`
-//!   dependency and the boot-order step).
+//! - propagating a control-shard membership change to the worker shards' configurations (at N=1 there
+//!   are none, so each shard's solo `FleetNode` agrees; a fleet's control shard `observe`s and the new
+//!   configuration must reach the shards that place objects).
 //!
 //! Those are transport- and server-layer pieces; this authority core is confirmable on its own.
 

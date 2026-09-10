@@ -94,9 +94,13 @@ pub struct ShardState {
   pub content_range: (usize, usize),
   /// The partition.
   pub db: Db,
-  /// The register configuration (§4.8): the owner host, its epoch, its neighbourhood and
-  /// the quorum; `Configuration::solo` at `f = 0`, the same type a fleet uses.
-  pub config_register: slates_db::Configuration,
+  /// The owner runtime this node takes part in a region as (§4.8, boot step 6): the SWIM membership
+  /// view, the configuration group, and the owner's register acceptor, composed by `slates-cluster`'s
+  /// `FleetNode`. `FleetNode::solo` at `f = 0` (the laptop) — the same code path a fleet runs (R8), a
+  /// membership event folding into the configuration through [`slates_cluster::FleetNode::observe`]. The
+  /// placement authority the verbs read is `fleet.configuration()`; the live probe/gossip loop that
+  /// drives `observe` and the cross-node commit are the next fleet pieces.
+  pub fleet: slates_cluster::fleet::FleetNode,
   /// The landing runtime: grants, leases and the audit log (§4.15), mirrored to the
   /// database's durable records.
   pub landing: crate::landing::LandingState,

@@ -1365,6 +1365,7 @@ dependencies = [
  "slates-base",
  "slates-bridge-core",
  "slates-bridge-nfs",
+ "slates-cluster",
  "slates-db",
  "slates-ipc",
  "slates-land",

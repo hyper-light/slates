@@ -432,7 +432,12 @@ fn init_shard(
   // machine, so a recorded holder set and a volume id's creator-host bits mean the same
   // thing when Phase 8 adds peers. One host, `f = 0`, on a laptop.
   let host = slates_db::HostId(host_id_of(identity));
-  let config_register = slates_db::Configuration::solo(host);
+  // The owner runtime this node takes part in a region as (§4.8, boot step 6): membership + the
+  // configuration group + the owner's acceptor, composed by `slates-cluster`. `solo` is the laptop
+  // `f = 0` degenerate — one member, itself the owner — the same code path a fleet runs (R8). The
+  // placement authority the verbs read is `fleet.configuration()`; the live probe/gossip loop that
+  // folds membership into it (and the cross-node commit) are the next fleet pieces.
+  let fleet = slates_cluster::fleet::FleetNode::solo(host);
   // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
   let content = match AnchorSegment::open_content(env) {
@@ -460,7 +465,7 @@ fn init_shard(
     content,
     content_range,
     db,
-    config_register,
+    fleet,
     landing: crate::landing::LandingState::default(),
     store,
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),

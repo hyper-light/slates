@@ -2531,8 +2531,8 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
 /// volume's candidate holders, so the placement object is the volume's 128-bit id (whose high half
 /// names the creator host), not the volume-unique snapshot id.
 fn placement_of(state: &ShardState, volume: DbVolumeId) -> PlacementState {
-  let placement = state.config_register.place(ObjectId(volume.bytes));
-  if state.config_register.region_placed(&placement) {
+  let placement = state.fleet.configuration().place(ObjectId(volume.bytes));
+  if state.fleet.configuration().region_placed(&placement) {
     PlacementState::Placed {
       region: placement.acked.iter().map(|h| h.0).collect(),
       mirror: None,
@@ -2551,9 +2551,8 @@ fn placed_state(state: &ShardState, volume: DbVolumeId, head: DbSnapshotId) -> P
     // 128-bit id (its high half names the creator host); the old code truncated it to that high half
     // alone, so every volume of one creator collided to one placement object — fixed by ObjectId.
     let object = ObjectId(volume.bytes);
-    state
-      .config_register
-      .region_placed(&state.config_register.place(object))
+    let config = state.fleet.configuration();
+    config.region_placed(&config.place(object))
   } else {
     match state.db.partition().snapshot(volume, head) {
       Some(record) => matches!(record.placed, PlacementState::Placed { .. }),
@@ -2563,7 +2562,7 @@ fn placed_state(state: &ShardState, volume: DbVolumeId, head: DbSnapshotId) -> P
   PlacedState {
     region,
     mirror_age_ns: None,
-    host_epoch: state.config_register.host_epoch.0,
+    host_epoch: state.fleet.configuration().host_epoch.0,
   }
 }
 
@@ -2586,12 +2585,16 @@ fn await_placed(
   let target = snapshot.map_or(record.head, to_db_snapshot);
   // The snapshot places on its volume's candidate holders — the placement object is the volume id.
   let _ = target;
-  let placement = state.config_register.place(ObjectId(volume.bytes));
+  let placement = state.fleet.configuration().place(ObjectId(volume.bytes));
   let db_scope = match scope {
     Scope::Region => DurabilityScope::Region,
     Scope::Mirror => DurabilityScope::Mirror,
   };
-  match state.config_register.await_placed(db_scope, &placement) {
+  match state
+    .fleet
+    .configuration()
+    .await_placed(db_scope, &placement)
+  {
     Ok(placed) => ReplyBody::Placed {
       placed,
       mirror_age_ns: None,
