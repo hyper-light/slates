@@ -36,16 +36,11 @@ jobs:
       # R3: every numeric literal in a tuning position carries its derivation (AC-0.2).
       - name: Literal check
         run: cargo xtask literals
-      # slates mlocks its RAM (hermetic, RAM-only, no swap — R1), so the daemon's provisioning budget
-      # is bounded by RLIMIT_MEMLOCK (`profile.lock.bytes` → the per-shard reserve, §4.2). CI runners
-      # default to a small mlock limit, which starves the in-process daemon the client/server tests
-      # spawn — every provision refuses `BudgetExceeded { available: 0 }`. Raise the limit the way a
-      # real deployment provisions slates (databases that mlock do the same); best-effort with `|| true`
-      # where the runner already permits unlimited or does not honor the soft limit.
+      # The daemon provisions from usable memory and degrades honestly when the OS grants little
+      # lockable RAM (§4.2 D-12; docs/bugs/2026-09-10-provisioning-budget-from-mlock-limit.md), so the
+      # tests run under the runner's default mlock limit — no `ulimit` bump, which the runners ignore.
       - name: Test
-        run: |
-          ulimit -l unlimited 2>/dev/null || true
-          cargo test --workspace
+        run: cargo test --workspace
       - name: AC-1.1 model suite over 10^6 generated operations
         run: cargo test -p slates-vfs --release --test model -- --ignored ac_1_1
       - name: AC-1.2 differential suite against tmpfs (Linux)
@@ -60,9 +55,7 @@ jobs:
       # The end-to-end CLI flow spawns a real anchor and daemon; it needs the machine to
       # itself (a busy parallel suite starves the daemon), so it is its own step.
       - name: The slates CLI flow (anchor + daemon)
-        run: |
-          ulimit -l unlimited 2>/dev/null || true
-          SLATES_TEST_CLI=1 cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture
+        run: SLATES_TEST_CLI=1 cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture
       # The FSKit shim's Swift wire codec must agree with the Rust codec byte for byte (it shares the
       # golden vector). Compile and run its cross-check on the macOS runner, where swiftc lives.
       # ShimWire.swift is a pure library of the codec types; ShimWireMain.swift is the @main driver,

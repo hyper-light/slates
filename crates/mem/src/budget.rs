@@ -257,12 +257,14 @@ pub fn slab_bytes(page: u64, burst_p99_slots: u64, slot_bytes: u64) -> Derived<u
   )
 }
 
-/// The region size for a shard: its share of the lock capacity divided among the size classes.
-pub fn region_bytes(lock_capacity: u64, shards: u64, classes: u64) -> Derived<u64> {
+/// The region size for a shard: its share of a memory `capacity` divided among the size classes. The
+/// caller decides what the capacity is — the daemon's default reserve derives it from usable memory
+/// (§4.2 D-12 honest degradation), a locked reserve from the OS lock capacity.
+pub fn region_bytes(capacity: u64, shards: u64, classes: u64) -> Derived<u64> {
   derived!(
-    lock_capacity / shards.max(1) / classes.max(1),
-    "lock capacity / shards / classes",
-    ["lock.bytes", "rt.shards", "mem.classes"]
+    capacity / shards.max(1) / classes.max(1),
+    "memory capacity / shards / classes",
+    ["mem.capacity", "rt.shards", "mem.classes"]
   )
 }
 

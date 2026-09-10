@@ -123,7 +123,16 @@ impl DaemonConfig {
     let mut runtime =
       RuntimeConfig::from_profile(profile, admission.get(), admission.get(), LATENCY_BUDGET_NS);
     let shards = u64::from(runtime.shards.max(1));
-    let reserve = region_bytes(profile.lock.bytes, shards, MEMORY_CLASSES);
+    // §4.2 D-12 "honest degradation": the default provisioning reserve is USABLE memory, not the OS
+    // lock LIMIT. A volume's arena is locked only when a client asks (`require_locked`, verbs.rs); by
+    // default it is a normal, usable — if unlocked — mapping (crate mem's lock sequence keeps unmapped
+    // regions "usable, unlocked, and counted"). Deriving the reserve from the mlock limit refused every
+    // volume where the OS grants little lockable RAM — the design's own failure case, "a locked-down CI
+    // container refuses mlock; lock capacity 0" (§4.2 boot order). Usable memory lets the daemon
+    // provision there (degraded: those pages may swap), while a `require_locked` volume still respects
+    // the lock capacity best-effort. On a machine that can lock freely the two are the same — the lock
+    // probe already records `memory.available` when `RLIMIT_MEMLOCK` is unlimited (`probes.rs`).
+    let reserve = region_bytes(profile.facts.memory.available, shards, MEMORY_CLASSES);
     derivations.push(note("reserve_per_shard", &reserve));
     let page = profile.facts.page.base;
     let tables: Derived<u64> = derived!(
