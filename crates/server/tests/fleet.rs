@@ -624,3 +624,76 @@ fn a_provisioned_head_replicates_across_the_fleet() {
     "the provisioned head replicated to the peer holder and reached the f=1 quorum"
   );
 }
+
+/// AC (§4.8, boot step 6, durable holds): in a two-node `f = 1` fleet, the peer holder **durably holds**
+/// the head the owner replicates to it — the accepted record survives in the shard state (in the object's
+/// per-object acceptor and the routing view), not only in the transient serve task that received it. This
+/// is exactly the state a survivor's phase-one recovery reads on a takeover: the newest committed record,
+/// recoverable from a holder. Non-vacuous: the holder holds nothing for the object until the owner's record
+/// commit reaches it over the transport, so `fleet_holder_head` turning `Some` — naming the owner and the
+/// head's value — is the proof the holder accepted and stored the replicated record, distinct from the
+/// owner's own `fleet_head_placed` (which reports the quorum, not what any one holder retains).
+#[test]
+fn a_holder_durably_holds_the_owners_replicated_head() {
+  let _serial = serialize_fleet_tests();
+  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let host_a = a.host;
+  let pid = std::process::id();
+  let instance_a = format!("fleet-{}-{pid}", a.host.0);
+  let peer_of_a = Peer {
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start(a, peer_of_a);
+  let daemon_b = start(b, peer_of_b);
+
+  // Let the fleet form before provisioning, as the replication test does.
+  let settle = Instant::now() + FORMATION_SETTLE;
+  while Instant::now() < settle {
+    std::hint::spin_loop();
+  }
+
+  // Provision a volume on A; its object is the volume id, and its head's value is the id bytes.
+  let mut client = Client::connect(&instance_a);
+  let ReplyBody::Created { id } = client.call(&scratch("held")) else {
+    daemon_a.stop();
+    daemon_b.stop();
+    panic!("the volume was not created");
+  };
+  let object = ObjectId(id.bytes);
+
+  // A ships the head to B (the holder) over the record connection; B accepts it into the object's durable
+  // acceptor and tracks it in its routing view. Poll until B reports it durably holds A's head.
+  let deadline = Instant::now() + Duration::from_secs(15);
+  let mut held = None;
+  while Instant::now() < deadline {
+    if let Some(record) = daemon_b.fleet_holder_head(object) {
+      held = Some(record);
+      break;
+    }
+    std::hint::spin_loop();
+  }
+
+  daemon_a.stop();
+  daemon_b.stop();
+  let held = held.expect("B durably holds the head A replicated to it");
+  assert_eq!(
+    held.0, host_a,
+    "B records A as the owner of the held object"
+  );
+  assert_eq!(
+    held.1,
+    id.bytes.to_vec(),
+    "B holds the head's value (the volume id bytes)"
+  );
+}

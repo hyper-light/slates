@@ -385,6 +385,46 @@ impl Daemon {
       .unwrap_or(false)
   }
 
+  /// The head this node **durably holds** for `object` as a candidate holder (§4.8 "records are sent to
+  /// all candidates"): the object's current owner (as this node's routing view records it) and the value
+  /// of the highest record this node has accepted for it, or `None` if this node backs no such object. A
+  /// test or an operator reads this to observe that a survivor durably holds an owner's replicated head —
+  /// the state phase-one recovery reads on a takeover. Non-vacuous: before the head replicates, or on a
+  /// laptop, this node holds nothing and the answer is `None`. Runs a one-shot query on the control shard,
+  /// bounded by the liveness budget; `None` if the daemon is stopping or the shard does not answer in time.
+  pub fn fleet_holder_head(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Option<(slates_db::HostId, Vec<u8>)> {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
+      return None;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        let held = state::with_state(|s| {
+          let owner = s.fleet.object_owner(object)?;
+          let (_, positions) = s.holder_records.get(&object)?.persisted();
+          let value = positions
+            .into_iter()
+            .filter(|(held_object, _, _, _)| *held_object == object)
+            .max_by_key(|(_, sequence, epoch, _)| (*sequence, epoch.0))
+            .map(|(_, _, _, value)| value)?;
+          Some((owner, value))
+        })
+        .flatten();
+        let _ = tx.send(held);
+      })
+      .is_err()
+    {
+      return None;
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .ok()
+      .flatten()
+  }
+
   /// The shards.
   pub fn shards(&self) -> &[ShardId] {
     &self.shards
@@ -622,6 +662,7 @@ fn init_shard(
     current_request: slates_wire::request::RequestId::default(),
     placed_heads: std::collections::BTreeMap::new(),
     formed_probe_peers: std::collections::BTreeSet::new(),
+    holder_records: std::collections::BTreeMap::new(),
   };
   let rebuilt = verbs::rebuild_recovered(&mut state);
   if rebuilt.skipped > 0 {

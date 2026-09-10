@@ -23,21 +23,25 @@
 //!   folds the acknowledgement (or lets a timeout age the suspicion), then folds the detector's view into
 //!   the shard's `FleetNode` and records any takeover;
 //! - the **serve** tasks accept the peer on this node's per-peer sockets and answer its probes (so the peer
-//!   sees this node alive) and its register record commits (so this node backs the peer as a holder);
+//!   sees this node alive) and its register record commits ([`serve_peer_records`] accepts each into this
+//!   node's **durable per-object hold** in the shard state, so it backs the peer as a candidate holder and
+//!   the record survives for a takeover to read);
 //! - the **ship** task dials the peer's record address and replicates this node's unplaced volume heads to
 //!   it each period (the cross-node commit, §4.8 "committed at `f + 1`").
 //!
 //! The `FleetNode` lives in the shard state (the verbs read it for placement), so it is touched only
 //! through brief synchronous [`state::with_state`] — never held across an await. At `f = 0` (the laptop)
 //! there is no fleet transport and this loop does not run; the placement path still runs the same
-//! `FleetNode`, degenerate (R8). Phase-one recovery of a taken-over object's head and serving it under the
-//! new epoch is owed; here the routing view records the reassignment `sync_peer` computes.
+//! `FleetNode`, degenerate (R8). The records a survivor's phase-one recovery reads are now durable (the
+//! per-object holds above, tracked in the routing view); **driving** the takeover — installing the
+//! successor authority on the holders and running the promotion over them before serving the taken-over
+//! head under the new epoch — is owed; here the routing view records the reassignment `sync_peer` computes.
 
 use rustls::pki_types::CertificateDer;
 use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::fleet::sync_peer;
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once, serve_probe};
-use slates_cluster::{CommitBudget, commit_record, serve_record};
+use slates_cluster::{CommitBudget, commit_record};
 use slates_db::register::{Acceptor, Authority, HostId, ObjectId, Quorum, Record};
 use slates_rt::futures;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
@@ -387,14 +391,62 @@ async fn serve_peer_records(mut endpoint: Endpoint, local: HostId, peer_host: Ho
   if endpoint.establish().await.is_err() {
     return;
   }
-  let Some(authority) = state::with_state(|s| Authority {
-    generation: s.fleet.configuration().version,
-    owner: peer_host,
-  }) else {
-    return;
+  // Serve the peer's record commits into this node's **durable** per-object holds in the shard state, so
+  // an accepted record survives past this task — the state a survivor's phase-one recovery reads on a
+  // takeover. The handler runs synchronously inside `serve_once` (a brief `with_state` borrow, no await
+  // held across it). A serve failure — the peer's connection dropped when it died — ends the loop.
+  loop {
+    let served = endpoint
+      .serve_once(|request| match Record::decode(&request) {
+        Ok(record) => state::with_state(|s| accept_held_record(s, local, peer_host, &record))
+          .unwrap_or_default(),
+        Err(_) => Vec::new(),
+      })
+      .await;
+    if served.is_err() {
+      return;
+    }
+  }
+}
+
+/// Accepts one register record this node holds as a **candidate holder** for the peer that owns it, into
+/// the object's durable acceptor in the shard state (§4.8 "records are sent to all candidates"). The
+/// acceptor is created on the object's first record under the authority `{owner: peer, generation: the
+/// configuration version}` — `peer` is the socket's TLS-authenticated identity, so a record whose owner
+/// field is not this socket's peer is refused [`Unauthorized`](slates_db::register::RegisterError) by
+/// [`Acceptor::accept`], and one under a foreign generation or a stale epoch is refused likewise. On
+/// acceptance the object is tracked in the routing view as backed for that owner, so the owner's death
+/// hands [`sync_peer`]'s takeover computation this object. Returns the binding acknowledgement's bytes,
+/// or an empty reply on any refusal (the owner then counts nothing toward its quorum).
+fn accept_held_record(
+  state: &mut ShardState,
+  local: HostId,
+  peer_host: HostId,
+  record: &Record,
+) -> Vec<u8> {
+  let generation = state.fleet.configuration().version;
+  let accepted = {
+    let acceptor = state
+      .holder_records
+      .entry(record.object)
+      .or_insert_with(|| {
+        Acceptor::new(
+          local,
+          Authority {
+            generation,
+            owner: peer_host,
+          },
+        )
+      });
+    acceptor.accept(record)
   };
-  let mut acceptor = Acceptor::new(local, authority);
-  while serve_record(&mut endpoint, &mut acceptor).await.is_ok() {}
+  match accepted {
+    Ok(ack) => {
+      state.fleet.track_object(record.object, peer_host);
+      ack.encode()
+    }
+    Err(_) => Vec::new(),
+  }
 }
 
 /// A volume head this node owns that is not yet region-placed, with everything the register commit needs.

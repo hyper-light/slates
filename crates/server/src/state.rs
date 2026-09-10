@@ -9,7 +9,7 @@ use slates_anchor::AnchorSegment;
 use slates_base::OsHost;
 use slates_db::Db;
 use slates_db::catalog::{Principal, VolumeId};
-use slates_db::register::{ObjectId, Placement};
+use slates_db::register::{Acceptor, ObjectId, Placement};
 use slates_ipc::DaemonEnd;
 use slates_ipc::protocol::ReplyBody;
 use slates_mem::SharedObject;
@@ -183,6 +183,26 @@ pub struct ShardState {
   /// tell whether the fleet's direct mesh is up, which a formation observer must wait for rather than the
   /// seeded view. Empty on a laptop (no fleet loop runs).
   pub formed_probe_peers: std::collections::BTreeSet<slates_db::HostId>,
+  /// The register records this node holds as a **candidate holder** for other owners' objects (§4.8
+  /// "records are sent to all candidates; committed at `f + 1`"): one durable [`Acceptor`] per object
+  /// this node backs, keyed by the object. A peer's record commit — served on the per-peer record socket
+  /// by [`crate::fleet::serve_peer_records`] — is accepted into the object's acceptor and **stored here**,
+  /// so the record survives the serve task (the task-local acceptor it replaced held nothing a survivor
+  /// could read). It is exactly the state phase-one recovery reads on a takeover: when the owner dies, the
+  /// survivor that rendezvous ranks first for the object promotes over the holders, each answering from
+  /// this hold, and adopts the newest committed record (§4.8 "the new owner runs phase one … adopts the
+  /// newest reported record").
+  ///
+  /// **One acceptor per object** (not per owner): each object has a single owner at a time, so its
+  /// acceptor carries one [`slates_db::register::Authority`] — the object's current owner under the
+  /// configuration generation — which a takeover re-installs to the successor with
+  /// [`slates_db::register::Acceptor::install_authority`]. This keeps every acceptor within the register's
+  /// "one authorized owner per generation" model (the *per-object authority* a single acceptor would need
+  /// to serve several owners at once is the owed refinement noted on [`slates_db::register::Authority`]),
+  /// and lets a promotion for an object route to its hold by object id regardless of which peer socket
+  /// carried the message. The acceptor's authority owner is the socket's TLS-authenticated peer, so a
+  /// record whose owner field is not that peer is refused. Empty on a laptop (no fleet loop runs).
+  pub holder_records: BTreeMap<ObjectId, Acceptor>,
 }
 
 /// A work volume's accumulated declared operations (§4.16), composed into an increment on submit.
