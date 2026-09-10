@@ -204,8 +204,16 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    the boundary otherwise), and `forget_stream` now **resets the per-stream credit watermark** (so a reused
    stream id starts fresh; the stale watermark had blocked the connection-credit ratchet on a reused
    connection).
-   **Owed on the connection:** a real probe timeout, connection IDs, several frames per packet (an MTU
-   budget), and loom on the state machine.
+   **RTT estimation is now built** (`rtt.rs`, RFC 9002 §5.3/§6.2.1): the `RttEstimator` folds each sample
+   into a smoothed RTT and its variation, tracks the minimum, removes the peer's ack delay above that
+   floor, and computes the probe timeout (PTO); `handle_incoming` reports the largest packet an
+   acknowledgement newly frees (the sample point, §5.1) and the `Endpoint` — which holds the clock —
+   measures `now − send time` and folds it in, proven over a live loopback round trip
+   (`a_request_gets_a_reply_over_a_live_session` asserts a non-zero smoothed RTT). The control law is
+   unit-tested at N=1 against the RFC's arithmetic. **Owed on the connection:** driving the tail-loss
+   probe from the estimated PTO on a *timed* receive (the estimate and the probe mechanism both exist;
+   the timer that arms it needs the runtime's timed receive), connection IDs, several frames per packet
+   (an MTU budget), and loom on the state machine.
    The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c); its
    fencing step rides membership. The **`Keyring`'s population is built** (`enrollment.rs`, slice 6):
    `Enrollment::from_membership` turns an admitted-membership record (the shared control secret + the
@@ -344,8 +352,10 @@ the dual-level (`MaxStreamData` + `MaxData`) credit law + congestion control is 
 stream and request/reply exchanges over the wire. Proven **end-to-end over loopback UDP** by
 `crates/transport/tests/session.rs`: `a_stream_flows_over_a_live_session` (handshake + a stream
 reassembled exactly), `a_request_gets_a_reply_over_a_live_session`, and
-`repeated_exchanges_never_reuse_packet_numbers` (connection reuse, monotonic packet numbers). **Owed:**
-timer-based tail-loss recovery driven from an RTT-derived probe timeout (the probe *mechanism* exists;
-today the endpoint drives it heuristically when a send stalls, adequate over the lossless fabric but not
-an RTT timer), connection IDs, and several frames per packet (an MTU budget). CRYPTO frames are
-`rustls::quic`'s, not ours; the handshake keys drive the record protection.
+`repeated_exchanges_never_reuse_packet_numbers` (connection reuse, monotonic packet numbers). The
+endpoint now **estimates the RTT** (`rtt.rs`) from each acknowledgement's sample point, over its own
+clock (a live round trip yields a non-zero smoothed RTT). **Owed:** arming the tail-loss probe from that
+estimated PTO on a *timed* receive (the estimate and the probe mechanism both exist; today the endpoint
+drives the probe heuristically when a send stalls — adequate over the lossless fabric but not an RTT
+timer, which needs the runtime's timed receive), connection IDs, and several frames per packet (an MTU
+budget). CRYPTO frames are `rustls::quic`'s, not ours; the handshake keys drive the record protection.

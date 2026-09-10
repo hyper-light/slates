@@ -11,8 +11,14 @@
 //! acknowledgements flow, and a transfer is complete only when every packet is acknowledged. Over the
 //! lossless simulation fabric no retransmission is needed; the loss-recovery and probe paths are proven
 //! by the `connection` oracle, and driving the probe from a real timeout is owed with the runtime timer.
-//! Remaining connection work: flow-credit enforcement, congestion control, connection IDs, and
-//! multiplexing many streams. The `Arc` here is rustls's config (D-8 exception 2), in `crate::handshake`.
+//! Flow-control (per-stream and connection-wide credit), congestion control, and multi-stream
+//! multiplexing are enforced by the [`Connection`] this drives; RTT is estimated here (this end holds
+//! the clock — see [`Endpoint::smoothed_rtt`]). Remaining connection work: connection IDs, an MTU budget
+//! (several frames per packet), and driving the tail-loss probe from the estimated PTO on a timed
+//! receive. The `Arc` here is rustls's config (D-8 exception 2), in `crate::handshake`.
+
+use std::collections::BTreeMap;
+use std::time::Instant;
 
 use rustix::net::SocketAddrV4;
 use rustls::quic::{ClientConnection, KeyChange, Keys, ServerConnection};
@@ -21,6 +27,7 @@ use slates_rt::udp::UdpSocket;
 use crate::connection::{Connection, initial_receive_window};
 use crate::handshake::{HandshakeError, Identity, client_connection, server_connection};
 use crate::packet_number::{MAX_PACKET_NUMBER_BYTES, decode_packet_number, encode_packet_number};
+use crate::rtt::RttEstimator;
 use crate::session::{Frame, decode_frames, encode_frames};
 
 /// Format: RFC 9000 §17.3 — bit 6 of a short-header first byte, always 1 ("fixed bit"); a packet with
@@ -125,6 +132,12 @@ pub struct Endpoint {
   conn: Connection,
   rx_largest: u64,
   frame_cap: usize,
+  /// The RTT estimator (RFC 9002 §5.3), fed from this end's clock: when an acknowledgement newly frees
+  /// a packet, the round trip is `now` minus that packet's send time. Drives the probe timeout.
+  rtt: RttEstimator,
+  /// The send time of each ack-eliciting packet still awaiting acknowledgement, keyed by packet number,
+  /// for the RTT sample. Pruned as packets are acknowledged, so it stays within the in-flight window.
+  send_times: BTreeMap<u64, Instant>,
 }
 
 impl Endpoint {
@@ -147,6 +160,8 @@ impl Endpoint {
       conn: Connection::new(initial_receive_window(frame_cap)),
       rx_largest: 0,
       frame_cap,
+      rtt: RttEstimator::new(),
+      send_times: BTreeMap::new(),
     })
   }
 
@@ -169,7 +184,21 @@ impl Endpoint {
       conn: Connection::new(initial_receive_window(frame_cap)),
       rx_largest: 0,
       frame_cap,
+      rtt: RttEstimator::new(),
+      send_times: BTreeMap::new(),
     })
+  }
+
+  /// The smoothed round-trip time this end has estimated (nanoseconds), zero before any acknowledgement
+  /// yields a sample (RFC 9002 §5.3). A live exchange feeds it through [`Endpoint::receive_into`].
+  pub fn smoothed_rtt(&self) -> u64 {
+    self.rtt.smoothed_rtt()
+  }
+
+  /// The probe timeout this end would arm to recover a tail loss (RFC 9002 §6.2.1), from the estimated
+  /// RTT; before any sample, twice the initial RTT. (Driving a timed receive from it is owed.)
+  pub fn pto(&self) -> u64 {
+    self.rtt.pto(0)
   }
 
   /// The next packet number the connection will assign — its packet-number cursor, monotonic across
@@ -227,19 +256,33 @@ impl Endpoint {
     while let Some((pn, frames)) = self.conn.poll_transmit(self.frame_cap) {
       let datagram = protect_packet(keys, pn, self.conn.tx_largest_acked(), &frames)?;
       self.socket.send_to(&datagram, self.peer)?;
+      // Record the send time for the RTT sample; pruned when the packet is acknowledged. A pure
+      // acknowledgement packet's entry is never sampled and is swept when a later packet is acknowledged.
+      self.send_times.insert(pn, Instant::now());
     }
     Ok(())
   }
 
   /// Receives one protected packet, reconstructs its number against the persistent decode cursor
-  /// (advancing it), and feeds it to the connection.
+  /// (advancing it), feeds it to the connection, and folds an RTT sample in when the acknowledgement
+  /// newly frees a packet (RFC 9002 §5.1: the round trip is now minus that packet's send time).
   async fn receive_into(&mut self) -> Result<(), EndpointError> {
     let mut buf = [0u8; 2048];
     let (n, _from) = self.socket.recv_from(&mut buf).await?;
+    let now = Instant::now();
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
     let (pn, frames) = unprotect_packet(keys, self.rx_largest, &buf[..n])?;
     self.rx_largest = self.rx_largest.max(pn);
-    self.conn.handle_incoming(pn, &frames);
+    if let Some(largest) = self.conn.handle_incoming(pn, &frames) {
+      if let Some(sent_at) = self.send_times.get(&largest) {
+        let sample =
+          u64::try_from(now.saturating_duration_since(*sent_at).as_nanos()).unwrap_or(u64::MAX);
+        // This dialect does not carry the peer's reported ack delay yet, so it is zero.
+        self.rtt.on_sample(sample, 0);
+      }
+      // Prune the send times the acknowledgement covered, bounding the map to the in-flight window.
+      self.send_times.retain(|&sent_pn, _| sent_pn > largest);
+    }
     Ok(())
   }
 

@@ -204,10 +204,13 @@ fn a_request_gets_a_reply_over_a_live_session() {
         )
         .map_err(|e| format!("{e:?}"))?;
         client.establish().await.map_err(|e| format!("{e:?}"))?;
-        client
+        let reply = client
           .request(STREAM_ID, &request)
           .await
-          .map_err(|e| format!("{e:?}"))
+          .map_err(|e| format!("{e:?}"))?;
+        // The server acknowledged the request (its acknowledgement rode the reply's data packets), so
+        // the client has folded in an RTT sample over the real loopback round trip (RFC 9002 §5.3).
+        Ok::<_, String>((reply, client.smoothed_rtt()))
       }
       .await;
       let _ = result_tx.send(outcome);
@@ -217,10 +220,16 @@ fn a_request_gets_a_reply_over_a_live_session() {
   sim.run_until_idle();
 
   match result_rx.try_recv() {
-    Ok(Ok(reply)) => assert_eq!(
-      reply, expected_reply,
-      "the reply arrived over the live session"
-    ),
+    Ok(Ok((reply, smoothed_rtt))) => {
+      assert_eq!(
+        reply, expected_reply,
+        "the reply arrived over the live session"
+      );
+      assert!(
+        smoothed_rtt > 0,
+        "the client estimated the round-trip time from the request's acknowledgement"
+      );
+    }
     other => panic!("the request/reply did not complete: {other:?}"),
   }
 }

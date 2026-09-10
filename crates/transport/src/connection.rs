@@ -250,9 +250,14 @@ impl Connection {
   /// stream's advertised send credit, and queues for retransmission whatever a new acknowledgement
   /// declares lost. An acknowledgement-only packet does not oblige an acknowledgement in return
   /// (RFC 9002 §2), which keeps two ends from trading acknowledgements forever.
-  pub fn handle_incoming(&mut self, pn: u64, frames: &[Frame]) {
+  ///
+  /// Returns the largest packet number this packet's acknowledgements *newly* freed, if any — the RTT
+  /// sample point (RFC 9002 §5.1). The caller, which holds the clock, measures the round trip as `now`
+  /// minus that packet's send time and folds it into its [`crate::rtt::RttEstimator`].
+  pub fn handle_incoming(&mut self, pn: u64, frames: &[Frame]) -> Option<u64> {
     self.acks.record(pn);
     let mut ack_eliciting = false;
+    let mut newly_acked_largest: Option<u64> = None;
     for frame in frames {
       match frame {
         Frame::Stream {
@@ -279,6 +284,9 @@ impl Connection {
         } => {
           let acked = self.sent.on_ack_frame(*largest, *range, ranges);
           self.congestion.on_ack(acked.bytes);
+          // The largest packet number this ACK newly frees is the RTT sample point (RFC 9002 §5.1);
+          // fold it into the running maximum this call reports, for the caller's RTT estimator.
+          newly_acked_largest = newly_acked_largest.max(acked.pns.iter().copied().max());
           // ACK-of-ACK (RFC 9000 §13.2.4): for each of our packets the peer just acknowledged that had
           // carried an acknowledgement of ours, the peer now has that acknowledgement — so we can stop
           // tracking the packets it covered, bounding the receive-side ack set.
@@ -327,6 +335,7 @@ impl Connection {
       self.sent_acks = self.sent_acks.split_off(&largest_acked);
     }
     self.queue_retransmit(lost.frames);
+    newly_acked_largest
   }
 
   /// Retransmits the oldest in-flight packet when the connection has stalled with packets still in
@@ -823,6 +832,41 @@ mod tests {
     assert!(
       retransmits >= 1,
       "the probe recovered the single lost packet"
+    );
+  }
+
+  /// `handle_incoming` reports the largest packet number an acknowledgement *newly* frees — the RTT
+  /// sample point (RFC 9002 §5.1) the endpoint measures the round trip from — and reports `None` for a
+  /// packet that frees nothing (an acknowledgement-only packet carries no data to acknowledge back).
+  #[test]
+  fn handle_incoming_reports_the_rtt_sample_point() {
+    let window = initial_receive_window(FRAME_CAP);
+    let mut a = Connection::new(window);
+    let mut b = Connection::new(window);
+    a.open(1, &stream_content(1, 24));
+    // `a` sends its data packets (all ack-eliciting) to `b`; none carry an acknowledgement yet, so `b`
+    // reports no sample point for them.
+    let mut a_pns = Vec::new();
+    while let Some((pn, frames)) = a.poll_transmit(FRAME_CAP) {
+      a_pns.push(pn);
+      assert_eq!(
+        b.handle_incoming(pn, &frames),
+        None,
+        "a's data packets acknowledge nothing back"
+      );
+    }
+    let _ = b.read_stream(1);
+    // `b`'s acknowledgement frees a's data packets; `a` reports the largest as the sample point.
+    let mut sample_point = None;
+    while let Some((pn, frames)) = b.poll_transmit(FRAME_CAP) {
+      if let Some(largest) = a.handle_incoming(pn, &frames) {
+        sample_point = Some(largest);
+      }
+    }
+    assert_eq!(
+      sample_point,
+      a_pns.iter().copied().max(),
+      "the sample point is a's largest acknowledged packet"
     );
   }
 
