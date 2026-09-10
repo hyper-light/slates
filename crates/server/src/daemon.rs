@@ -361,7 +361,7 @@ impl Daemon {
   /// not yet placed, the daemon is stopping, or it is a laptop (no fleet loop runs). Runs a one-shot query
   /// on the control shard, bounded by the liveness budget.
   pub fn fleet_head_placed(&self, object: slates_db::register::ObjectId) -> bool {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shard_of_object(object))
     else {
       return false;
     };
@@ -415,7 +415,7 @@ impl Daemon {
   /// with no snapshot, or for one this node does not own. Runs a one-shot query on the control shard,
   /// bounded by the liveness budget.
   pub fn fleet_head_manifest(&self, object: slates_db::register::ObjectId) -> Option<[u8; 32]> {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shard_of_object(object))
     else {
       return None;
     };
@@ -482,6 +482,14 @@ impl Daemon {
   /// The shards.
   pub fn shards(&self) -> &[ShardId] {
     &self.shards
+  }
+
+  /// The shard that owns the volume `object` names — the partition its id encodes (`verbs::owner_of`),
+  /// where the volume, its placement and its seal live (D-7: one owning shard per volume). An owner-shard
+  /// fact is queried there, never on the control shard.
+  fn shard_of_object(&self, object: slates_db::register::ObjectId) -> Option<ShardId> {
+    let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
+    self.shards.get(usize::from(partition)).copied()
   }
 
   /// The segment (the daemon's own mapping).

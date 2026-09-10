@@ -262,8 +262,9 @@ fn rifl_scenario() {
     client: client.client,
     sequence: client.sequence,
   };
-  let ReplyBody::Created { id: volume } = client.call_as(id, &scratch("once")) else {
-    panic!("create");
+  let created = client.call_as(id, &scratch("once"));
+  let ReplyBody::Created { id: volume } = created else {
+    panic!("create: {created:?}");
   };
   // The retry: the same reply, no second volume.
   let ReplyBody::Created { id: again } = client.call_as(id, &scratch("once")) else {

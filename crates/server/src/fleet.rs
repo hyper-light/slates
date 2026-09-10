@@ -52,9 +52,18 @@
 //! recorded placed durably ([`record_placed_seals`]). A holder serves the content exchanges from
 //! [`ShardState::held_content`] on the record session's content streams. After a takeover the successor
 //! serves the adopted head's content: it materializes the volume under its original id from the archive it
-//! holds, or fetches it by identity from a recorded holder ([`materialize_pending`]). Owed: content-defined
-//! chunking and the compress-or-not cost model (D-17), the hedge trigger from a measured p95, anti-entropy
-//! and the healer, and the per-shard record plane (the loop runs on the control shard's volumes).
+//! holds, or fetches it by identity from a recorded holder ([`materialize_pending`]) — on the shard the
+//! taken-over id routes to, with the head's promotion epoch, so the successor's next seals of the object
+//! are written at the epoch its holders fenced it at.
+//!
+//! **Every shard is an owner** (D-7): the control shard alone holds the peer sessions and probes, but a
+//! volume lives, seals and records its placement on its owner shard. So the probe loop hands each peer
+//! state it folds to every other shard's `FleetNode` (all copies of the configuration advance
+//! identically), and the record plane reaches every owner shard each period through [`crate::xshard`]:
+//! the seal walk and the head values run there, the archives and heads move here by value for the
+//! dispatch, and the acknowledgements and durable placements are recorded back there. Owed:
+//! content-defined chunking and the compress-or-not cost model (D-17), the hedge trigger from a measured
+//! p95, anti-entropy and the healer.
 //!
 //! The `FleetNode` lives in the shard state (the verbs read it for placement), so it is touched only
 //! through brief synchronous [`state::with_state`] — never held across an await. At `f = 0` (the laptop)
@@ -65,7 +74,7 @@ use rustls::pki_types::CertificateDer;
 use slates_archive::Archive;
 use slates_cluster::content::{fetch_content, is_content_stream, put_content};
 use slates_cluster::detector::{Detector, DetectorTiming};
-use slates_cluster::fleet::sync_peer;
+use slates_cluster::fleet::{apply_peer_state, sync_peer};
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once, serve_probe};
 use slates_cluster::{
   ClusterError, CommitBudget, PROMOTE_STREAM, RECORD_STREAM, Stragglers, commit_record,
@@ -91,6 +100,7 @@ use crate::daemon::HEARTBEAT_NS;
 use crate::head::{HeadValue, PlacedHead, SealJob};
 use crate::state::{self, ShardState};
 use crate::verbs;
+use crate::xshard::{call_within, run_on};
 
 /// Format: RFC 9000 §14.1 — the smallest maximum UDP payload every QUIC path is required to carry without
 /// path-MTU discovery (which the transport marks owed, `endpoint.rs`). Sizing a fleet datagram within it
@@ -397,6 +407,9 @@ async fn probe_peer(
   let fanout = usize::try_from(timing.gossip_transmits).unwrap_or(1);
   let mut detector = Detector::new(local, timing);
   detector.join(peer_host);
+  // This shard (the control shard) probes; every other shard is an owner with its own copy of the
+  // configuration (D-7), so each state this detector folds is handed to the rest as well.
+  let (origin, shards) = state::with_state(|s| (s.shard, s.shards.clone())).unwrap_or_default();
   // Bring the probe session up on one socket, retrying the handshake there each period until it completes —
   // so a formation-race handshake that partially reached the peer's pinned `accept` finishes rather than
   // stranding the session (which would leave this peer unprobed and the N·(N−1) mesh un-formed). Once up it
@@ -477,6 +490,15 @@ async fn probe_peer(
       reconcile_held_authority(s);
       !s.fleet.configuration().neighbourhood.contains(&peer_host)
     });
+    // Hand the peer's state to every other shard's `FleetNode`, so all copies of the configuration advance
+    // identically (the version a head is written under, the neighbourhood its candidates are drawn from).
+    // A spawn refused at a shard's admission bound is retried next period (the fold is idempotent).
+    let peer_state = detector.membership().state(peer_host);
+    for shard in shards.iter().copied().filter(|shard| *shard != origin) {
+      let _ = run_on(origin, shard, move |s| {
+        apply_peer_state(&mut s.fleet, peer_host, peer_state);
+      });
+    }
     if retired == Some(true) {
       // The peer is retired and gone from the direct mesh. Its objects' phase-one recovery is now driven by
       // the record-ship task (over the surviving candidate holders); this probe task for the dead peer ends.
@@ -612,6 +634,8 @@ fn accept_held_record(
 /// A volume head this node owns that is not yet held by every candidate, with everything the register commit
 /// needs and the candidates that already acknowledged it (so the coordinator ships only to the rest).
 struct Head {
+  /// The shard that owns the volume — where its placement is recorded.
+  shard: u16,
   object: ObjectId,
   record: Record,
   candidates: Vec<HostId>,
@@ -648,12 +672,16 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
       continue; // The newest seal's content is not yet placed: the head waits for it.
     };
     let placement = config.place(object);
-    let acked = state
-      .placed_heads
-      .get(&object)
+    let recorded = state.placed_heads.get(&object);
+    let acked = recorded
       .filter(|head| head.sequence == sequence)
       .map(|head| head.placement.acked.clone())
       .unwrap_or_default();
+    // The head is written at the greater of the host's epoch and the epoch the object was last written or
+    // adopted under: a taken-over object's holders fenced it at its promotion epoch (see `PlacedHead`).
+    let epoch = recorded
+      .map_or(config.host_epoch, |head| head.epoch)
+      .max(config.host_epoch);
     // Every remote candidate that has not acked still needs the head; when none remain the head is done.
     let outstanding = placement
       .candidates
@@ -663,12 +691,13 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
       continue;
     }
     heads.push(Head {
+      shard: state.shard,
       object,
       record: Record {
         owner: local,
         object,
         sequence,
-        epoch: config.host_epoch,
+        epoch,
         generation: config.version,
         value: value.to_record_bytes(),
       },
@@ -718,6 +747,8 @@ fn head_value_of(
 
 /// A seal whose archive is complete and whose content is not yet placed: the put to run this period.
 struct ContentWork {
+  /// The shard that owns the volume — where the seal lives and its acknowledgements are recorded.
+  shard: u16,
   object: ObjectId,
   snapshot: DbSnapshotId,
   sequence: u64,
@@ -892,6 +923,7 @@ fn content_work(state: &mut ShardState, object: ObjectId, quorum: Quorum) -> Opt
   }
   let archive = job.archive.take()?;
   Some(ContentWork {
+    shard: state.shard,
     object,
     snapshot: job.snapshot,
     sequence: job.sequence,
@@ -911,6 +943,7 @@ fn content_work(state: &mut ShardState, object: ObjectId, quorum: Quorum) -> Opt
 /// merged into the seal whatever the round's outcome (each acknowledgement is a distinct holder's verified,
 /// durable hold), and the archive is put back for the next round. Returns the dispatch to settle.
 async fn put_seal_content(
+  origin: u16,
   local: HostId,
   work: ContentWork,
   budget: CommitBudget,
@@ -954,14 +987,22 @@ async fn put_seal_content(
     };
     (placement, Some(dispatch))
   };
-  state::with_state(|s| {
-    let Some(job) = s.seals.get_mut(&work.object) else {
+  // The seal lives on the owner shard: put the archive back and merge the round's acknowledgements there.
+  let ContentWork {
+    shard,
+    object,
+    snapshot,
+    archive,
+    ..
+  } = work;
+  let _ = run_on(origin, shard, move |s| {
+    let Some(job) = s.seals.get_mut(&object) else {
       return; // The seal was superseded meanwhile; its archive is dropped with it.
     };
-    if job.snapshot != work.snapshot {
+    if job.snapshot != snapshot {
       return;
     }
-    job.archive = Some(work.archive);
+    job.archive = Some(archive);
     if let Some(placement) = placement {
       job.rounds = job.rounds.saturating_add(1);
       for host in placement.acked {
@@ -978,7 +1019,8 @@ async fn put_seal_content(
 /// content that is not placed"): the snapshot's manifest identity (`SnapshotIdentified`) and its region
 /// placement (`SnapshotPlaced`, the content holders), the facts `status` and `await placed(region)` answer
 /// from and a restart resumes from. The seal is then dropped — its archive with it; the volume holds the
-/// bytes, and its holders serve them by identity.
+/// bytes, and its holders serve them by identity. Runs on the owner shard, where the seal and the volume's
+/// database partition live.
 fn record_placed_seals(state: &mut ShardState) {
   let quorum = state.fleet.configuration().quorum;
   let now = state.clock.monotonic_ns();
@@ -1037,7 +1079,7 @@ const MATERIALIZE_REFUSED: &str = "fleet.materialize";
 /// recorded content holder over its live session (§4.10 "fetches … by identity from a recorded holder"),
 /// held once verified, and then materialized. An object whose content is not yet reachable stays pending
 /// and is retried next period.
-async fn materialize_pending(budget: CommitBudget) {
+async fn materialize_pending(origin: u16, budget: CommitBudget) {
   let pending: Vec<(ObjectId, HeadValue)> = state::with_state(|s| {
     s.pending_materializations
       .iter()
@@ -1071,34 +1113,58 @@ async fn materialize_pending(budget: CommitBudget) {
         continue;
       }
     }
-    state::with_state(|s| materialize(s, object, &head));
+    materialize(origin, object, head).await;
   }
 }
 
 /// Materializes one taken-over volume from the content this node holds for its head (see
-/// [`materialize_pending`]); on success the object is no longer pending, on a refusal it is counted and
-/// stays pending.
-fn materialize(state: &mut ShardState, object: ObjectId, head: &HeadValue) {
+/// [`materialize_pending`]) **on the shard the volume's id routes to** — the partition its id names is
+/// where every verb for it will run (`verbs::owner_of`), so that is where it must live. The archive and
+/// the head move there by value; on success the object is no longer pending, on a refusal (or a shard
+/// that does not answer this period) it is counted and stays pending.
+async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
   let Some(manifest) = head.manifest else {
     return;
   };
-  let Some(archive) = state.held_content.archive_of(&manifest) else {
+  let id = DbVolumeId { bytes: object.0 };
+  let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
+  let taken = state::with_state(|s| {
+    let archive = s.held_content.archive_of(&manifest)?;
+    // The takeover's placement of the head (its sequence, promotion epoch and acknowledging holders),
+    // recorded here where the promotion ran; it moves to the owner shard with the volume.
+    let placed = s.placed_heads.get(&object).cloned()?;
+    // The partition the id names, as this daemon's runtime shard (the shard list is in partition order).
+    let target = s.shards.get(usize::from(partition)).copied()?;
+    Some((archive, placed, target))
+  })
+  .flatten();
+  let Some((archive, placed, target)) = taken else {
     return;
   };
-  let sequence = state
-    .placed_heads
-    .get(&object)
-    .map_or(0, |placed| placed.sequence);
   let region = head.content_holders.clone();
-  let id = DbVolumeId { bytes: object.0 };
-  match verbs::materialize_taken_over(state, id, head, sequence, region, &archive) {
-    Ok(()) => {
-      state.pending_materializations.remove(&object);
+  let served = call_within(
+    origin,
+    target,
+    move |s| {
+      let sequence = placed.sequence;
+      let served = verbs::materialize_taken_over(s, id, &head, sequence, region, &archive).is_ok();
+      if served {
+        // The owner shard now owns the head's placement — its record plane writes the object's next
+        // heads at the promotion epoch and ships only to holders still missing this one.
+        s.placed_heads.insert(object, placed);
+      }
+      served
+    },
+    HEARTBEAT_NS,
+  )
+  .await;
+  state::with_state(|s| {
+    if served == Some(true) {
+      s.pending_materializations.remove(&object);
+    } else {
+      *s.refusals.entry(MATERIALIZE_REFUSED).or_insert(0) += 1;
     }
-    Err(_) => {
-      *state.refusals.entry(MATERIALIZE_REFUSED).or_insert(0) += 1;
-    }
-  }
+  });
 }
 
 /// The status refusal count under which the fleet loop records a peer whose serve sockets could not be
@@ -1231,6 +1297,9 @@ async fn run_record_plane(local: HostId, budget: CommitBudget) {
     return;
   };
   let mut owner_acceptor = Acceptor::new(local, authority);
+  // This shard (the control shard) holds the peer sessions and coordinates; every shard owns volumes, so
+  // each period reaches every owner shard for its seals and heads (`xshard`).
+  let (origin, shards) = state::with_state(|s| (s.shard, s.shards.clone())).unwrap_or_default();
   // Dispatches whose holders are still in flight. Bounded: each is spent within the dispatch span
   // (`CommitBudget::max_deadline_ns`), so at most that span's worth of periods' dispatches are ever held.
   let mut in_flight: Vec<Dispatch> = Vec::new();
@@ -1244,51 +1313,80 @@ async fn run_record_plane(local: HostId, budget: CommitBudget) {
     if let Some(authority) = owner_authority(local) {
       let _ = owner_acceptor.install_authority(authority);
     }
-    run_record_period(local, budget, &mut owner_acceptor, &mut in_flight).await;
+    for shard in shards.iter().copied() {
+      run_record_period(
+        origin,
+        shard,
+        local,
+        budget,
+        &mut owner_acceptor,
+        &mut in_flight,
+      )
+      .await;
+    }
+    // Drive each owed takeover over all this object's surviving candidate holders (phase-one recovery). A
+    // drive that does not place leaves the object pending, so the next period retries. The holds and the
+    // takeovers are this node's (they arrive over this shard's sessions), so this runs here.
+    let owed = state::with_state(|s| takeovers(s, local)).unwrap_or_default();
+    for object in owed {
+      in_flight.extend(drive_takeover(object, local, budget).await);
+    }
+    // Serve the content of each adopted head, from what this node holds or a recorded holder, on the
+    // shard the taken-over id routes to.
+    materialize_pending(origin, budget).await;
     futures::sleep(HEARTBEAT_NS).await;
   }
 }
 
-/// One period of the record plane, in the order the design's placement rule requires: seals advance and
-/// their content is put (content places first), then the heads naming placed content ship, then the seals
-/// whose content and head both placed are recorded durably, then owed takeovers are driven and adopted
-/// heads' content served.
+/// One period of the record plane for the volumes `shard` owns, in the order the design's placement rule
+/// requires: seals advance and their content is put (content places first), then the heads naming placed
+/// content ship, then the seals whose content and head both placed are recorded durably. The seal walk,
+/// the head values and every recording run **on the owner shard** (its volumes, database partition and
+/// configuration copy live there); the archives and heads move to this shard for the dispatch by value.
+/// A shard that does not answer within a period is skipped this period (its work is retried next).
 async fn run_record_period(
+  origin: u16,
+  shard: u16,
   local: HostId,
   budget: CommitBudget,
   owner_acceptor: &mut Acceptor,
   in_flight: &mut Vec<Dispatch>,
 ) {
-  // Advance this node's seals one bounded slice each and put the completed archives' content to their
+  // Advance the shard's seals one bounded slice each and put the completed archives' content to their
   // candidates (§4.10) — content places before the head that names it ships.
-  let seals = state::with_state(|s| {
-    let slice_bytes = s.config.archive_slice_bytes;
-    let created_unix = u64::try_from(s.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND;
-    advance_seals(s, local, slice_bytes, created_unix)
-  })
+  let seals = call_within(
+    origin,
+    shard,
+    move |s| {
+      let slice_bytes = s.config.archive_slice_bytes;
+      let created_unix = u64::try_from(s.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND;
+      advance_seals(s, local, slice_bytes, created_unix)
+    },
+    HEARTBEAT_NS,
+  )
+  .await
   .unwrap_or_default();
   for work in seals {
-    if let Some(dispatch) = put_seal_content(local, work, budget).await {
+    if let Some(dispatch) = put_seal_content(origin, local, work, budget).await {
       in_flight.push(dispatch);
     }
   }
   // Ship each unplaced head to all its candidate holders at once, committed at `f + 1`.
-  let work = state::with_state(|s| unplaced_heads(s, local)).unwrap_or_default();
+  let work = call_within(
+    origin,
+    shard,
+    move |s| unplaced_heads(s, local),
+    HEARTBEAT_NS,
+  )
+  .await
+  .unwrap_or_default();
   for head in work {
-    if let Some(dispatch) = ship_head(owner_acceptor, local, &head, budget).await {
+    if let Some(dispatch) = ship_head(origin, owner_acceptor, local, &head, budget).await {
       in_flight.push(dispatch);
     }
   }
   // Record durably each seal whose content and head have both placed.
-  state::with_state(record_placed_seals);
-  // Drive each owed takeover over all this object's surviving candidate holders (phase-one recovery). A
-  // drive that does not place leaves the object pending, so the next period retries.
-  let owed = state::with_state(|s| takeovers(s, local)).unwrap_or_default();
-  for object in owed {
-    in_flight.extend(drive_takeover(object, local, budget).await);
-  }
-  // Serve the content of each adopted head, from what this node holds or a recorded holder.
-  materialize_pending(budget).await;
+  let _ = run_on(origin, shard, record_placed_seals);
 }
 
 /// Format: nanoseconds per second, for the archive header's creation time in Unix seconds.
@@ -1302,6 +1400,7 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 /// counts only its own round — and discarding its acknowledgements re-shipped that straggler forever at
 /// `f > 1`. Returns the dispatch to settle, or `None` if no holder could be reached this period.
 async fn ship_head(
+  origin: u16,
   owner_acceptor: &mut Acceptor,
   local: HostId,
   head: &Head,
@@ -1330,7 +1429,11 @@ async fn ship_head(
     Err(ClusterError::Uncertain { placement } | ClusterError::NotPlaced { placement }) => placement,
     Err(_) => return Some(dispatch), // A runtime refusal dispatched nothing; retry next period.
   };
-  record_acks(head.object, head.record.sequence, placement);
+  // The placement is the owner shard's fact: record it there.
+  let (object, sequence, epoch) = (head.object, head.record.sequence, head.record.epoch);
+  let _ = run_on(origin, head.shard, move |s| {
+    record_acks_in(s, object, sequence, epoch, placement);
+  });
   Some(dispatch)
 }
 
@@ -1341,30 +1444,39 @@ async fn ship_head(
 /// placement (the head register's newest position is the head); an older round's acknowledgements are
 /// ignored. `unplaced_heads` reads the merged set to ship only to the candidates still missing the head,
 /// and the verbs read it for `region_placed`.
-fn record_acks(object: ObjectId, sequence: u64, placement: Placement) {
-  state::with_state(|s| {
-    let entry = s.placed_heads.entry(object).or_insert_with(|| PlacedHead {
+fn record_acks_in(
+  state: &mut ShardState,
+  object: ObjectId,
+  sequence: u64,
+  epoch: HostEpoch,
+  placement: Placement,
+) {
+  let entry = state
+    .placed_heads
+    .entry(object)
+    .or_insert_with(|| PlacedHead {
       sequence,
+      epoch,
       placement: Placement {
         candidates: placement.candidates.clone(),
         acked: Vec::new(),
         mirror_acked: None,
       },
     });
-    if entry.sequence > sequence {
-      return; // A stale round for a superseded head.
+  if entry.sequence > sequence {
+    return; // A stale round for a superseded head.
+  }
+  if entry.sequence < sequence {
+    entry.sequence = sequence;
+    entry.placement.candidates = placement.candidates.clone();
+    entry.placement.acked.clear();
+  }
+  entry.epoch = entry.epoch.max(epoch);
+  for host in placement.acked {
+    if !entry.placement.acked.contains(&host) {
+      entry.placement.acked.push(host);
     }
-    if entry.sequence < sequence {
-      entry.sequence = sequence;
-      entry.placement.candidates = placement.candidates.clone();
-      entry.placement.acked.clear();
-    }
-    for host in placement.acked {
-      if !entry.placement.acked.contains(&host) {
-        entry.placement.acked.push(host);
-      }
-    }
-  });
+  }
 }
 
 /// Borrows out of the shard state the live sessions of the holders satisfying `wanted`, leaving each borrowed
@@ -1521,6 +1633,7 @@ async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -
         object,
         PlacedHead {
           sequence,
+          epoch: prepare.epoch,
           placement,
         },
       );

@@ -34,6 +34,7 @@ pub mod nfs;
 pub mod peer;
 pub mod state;
 pub mod verbs;
+pub mod xshard;
 
 pub use config::{DaemonConfig, FleetMembership};
 pub use daemon::{Daemon, SegmentSource};

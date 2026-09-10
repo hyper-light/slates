@@ -294,20 +294,30 @@ pub fn sync_membership(view: &Membership, fleet: &mut FleetNode) -> Vec<Reassign
 /// own peer removes that coupling: each peer is joined and retired by its own detector alone. Returns the
 /// takeovers a death produced (empty otherwise).
 pub fn sync_peer(view: &Membership, fleet: &mut FleetNode, peer: HostId) -> Vec<Reassignment> {
+  apply_peer_state(fleet, peer, view.state(peer))
+}
+
+/// Folds one peer's believed `state` into `fleet` — the step [`sync_peer`] takes for the view it reads it
+/// from, exposed so a node's other shards apply the **same** state to their own `FleetNode`s (every shard
+/// is an owner with its own copy of the configuration, D-7; the control shard, which alone probes, hands
+/// each the state it folded, so all copies advance identically and deterministically). A confirmed death
+/// retires the peer and returns the objects this node takes over; an alive peer is folded in (idempotent);
+/// a suspect, or a peer not yet seen, leaves the view untouched — a suspect is still a member until a
+/// confirmed death.
+pub fn apply_peer_state(
+  fleet: &mut FleetNode,
+  peer: HostId,
+  state: Option<MemberState>,
+) -> Vec<Reassignment> {
   if peer == fleet.host() {
     return Vec::new();
   }
-  match view.state(peer) {
-    // Confirmed dead: retire it (and take over the objects that fall to this node).
+  match state {
     Some(state) if state.liveness == Liveness::Dead => fleet.observe(peer, state).takeovers,
-    // Alive: fold it in so the membership holds it (idempotent once held; recovers it after a transient
-    // suspicion during formation).
     Some(state) if state.liveness == Liveness::Alive => {
       fleet.observe(peer, state);
       Vec::new()
     }
-    // Suspect or not yet seen: leave the fleet's current view untouched — a suspect is still a member until
-    // a confirmed death, exactly as `sync_membership` treats it.
     _ => Vec::new(),
   }
 }

@@ -170,10 +170,17 @@ struct Peer {
 
 /// Starts the daemon for `this`, configured to join a fleet with `peer` as its one peer.
 fn start(this: Node, peer: Peer) -> Daemon {
+  start_sharded(this, peer, 1)
+}
+
+/// [`start`] with `shards` shards: a volume then lands on the shard its name routes to, so a fleet test can
+/// place a volume on a shard other than the control shard (the one holding the peer sessions) and prove the
+/// record plane reaches every owner shard (D-7: one owning shard per volume).
+fn start_sharded(this: Node, peer: Peer, shards: u16) -> Daemon {
   let pid = std::process::id();
   let instance = format!("fleet-{}-{pid}", this.host.0);
   let config = DaemonConfig::derive(&this.profile, &instance)
-    .with_shards(1)
+    .with_shards(shards)
     .with_fleet(FleetMembership {
       quorum: Quorum { f: 1 },
       peers: vec![peer.host],
@@ -338,6 +345,18 @@ fn start_mesh_with_f(
   serve: &[Vec<(u16, u16)>],
   f: u32,
 ) -> Vec<Daemon> {
+  start_mesh_with(nodes, hosts, certs, serve, f, 1)
+}
+
+/// [`start_mesh_with_f`] with `shards` shards per daemon (see [`start_sharded`]).
+fn start_mesh_with(
+  nodes: Vec<(MachineProfile, HostId, Identity)>,
+  hosts: &[HostId],
+  certs: &[rustls::pki_types::CertificateDer<'static>],
+  serve: &[Vec<(u16, u16)>],
+  f: u32,
+  shards: u16,
+) -> Vec<Daemon> {
   let pid = std::process::id();
   let n = hosts.len();
   nodes
@@ -358,7 +377,7 @@ fn start_mesh_with_f(
       let member_peers: Vec<HostId> = (0..n).filter(|&j| j != i).map(|j| hosts[j]).collect();
       let instance = format!("fleet3-{}-{pid}", host.0);
       let config = DaemonConfig::derive(&profile, &instance)
-        .with_shards(1)
+        .with_shards(shards)
         .with_fleet(FleetMembership {
           quorum: Quorum { f },
           peers: member_peers,
@@ -1186,12 +1205,16 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
   let head_placed = poll_head_placed(&daemons[successor_index], object);
 
   // The successor serves the volume once it materialized it: its `status` answers instead of refusing.
-  let served = poll_status_answers(&format!("fleet3-{}-{pid}", successor.0), id);
+  let successor_instance = format!("fleet3-{}-{pid}", successor.0);
+  let served = poll_status_answers(&successor_instance, id);
   let got = if served {
     Some(read_hello_over_nfs(&daemons[successor_index], "served"))
   } else {
     None
   };
+  // The successor goes on writing the object: a further seal on it places over the remaining holder.
+  let resealed =
+    served && reseal_places(&successor_instance, &daemons[successor_index], "served", id);
 
   for daemon in daemons {
     daemon.stop();
@@ -1205,6 +1228,180 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
     got.as_deref(),
     Some(CONTENT),
     "the file written on the dead owner reads back byte for byte over the successor's NFS port"
+  );
+  assert!(
+    resealed,
+    "a seal taken on the successor after the takeover places — its head written at the promotion \
+     epoch the holders fenced the object at, not the successor's lower host epoch"
+  );
+}
+
+/// Writes a further file into `name` on `daemon` over NFS and seals it, then polls the snapshot's
+/// `await placed(region)` on `instance` until it places or the deadline passes. After a takeover this
+/// is the proof the successor keeps **writing** the object: its holders fenced the object at the
+/// promotion epoch, so a head written at the successor's lower host epoch would be refused `StaleEpoch`
+/// and never place.
+fn reseal_places(instance: &str, daemon: &Daemon, name: &str, volume: VolumeId) -> bool {
+  let port = daemon.nfs_port().expect("the daemon serves NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
+  let root_fh = mount(&mut stream, &format!("/{name}"), 1);
+  let file_fh = create(&mut stream, &root_fh, "again.txt", 2);
+  write(&mut stream, &file_fh, CONTENT, 3);
+  drop(stream);
+  let mut client = Client::connect(instance);
+  let ReplyBody::Snapshotted { id: snapshot } = client.call(&RequestBody::Snapshot { volume })
+  else {
+    return false;
+  };
+  poll_snapshot_placed(&mut client, volume, snapshot)
+}
+
+/// Shape: the number of shards the multi-shard fleet tests run — two, the smallest count with a shard other
+/// than the control shard.
+const TWO_SHARDS: u16 = 2;
+/// Shape: the partition the multi-shard tests place their volume on — the one that is not the control
+/// shard (partition 0), so the record plane must reach it across shards.
+const OTHER_PARTITION: u16 = 1;
+
+/// The mount name whose owner partition (`verbs::owner_of_name`) is `partition` among `partitions` — the
+/// first of `prefix-0`, `prefix-1`, … that routes there — so a test places a volume on a chosen shard
+/// (a create routes by name, and the id it mints encodes that partition).
+fn name_on_partition(prefix: &str, partition: u16, partitions: usize) -> String {
+  (0..256u32)
+    .map(|attempt| format!("{prefix}-{attempt}"))
+    .find(|name| slates_server::verbs::owner_of_name(name, partitions) == partition)
+    .expect("some name routes to the partition")
+}
+
+/// AC (D-7 "one owning shard per volume"; §4.10; R8): the record plane serves **every** owner shard, not
+/// only the control shard that holds the peer sessions. In a two-node `f = 1` fleet of two-shard daemons a
+/// volume is placed on the shard that is not the control shard (its name routes there, its id encodes the
+/// partition); a file written over NFS (the cross-shard bridge queue) and sealed has its content
+/// replicated to the peer and its snapshot placed — the seal walked and recorded on the owner shard, the
+/// archive and head moved to the control shard's coordinator by value. Non-vacuous: the volume's partition
+/// is asserted not to be the control shard's, and before this the control-shard-only loop never saw it.
+#[test]
+fn a_volume_on_a_non_control_shard_replicates_its_content_and_places() {
+  let _serial = serialize_fleet_tests();
+  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let pid = std::process::id();
+  let instance_a = format!("fleet-{}-{pid}", a.host.0);
+  let peer_of_a = Peer {
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start_sharded(a, peer_of_a, TWO_SHARDS);
+  let daemon_b = start_sharded(b, peer_of_b, TWO_SHARDS);
+  let settle = Instant::now() + FORMATION_SETTLE;
+  while Instant::now() < settle {
+    std::thread::yield_now();
+  }
+
+  let name = name_on_partition("sealed2", OTHER_PARTITION, usize::from(TWO_SHARDS));
+  let mut client = Client::connect(&instance_a);
+  let ReplyBody::Created { id } = client.call(&scratch(&name)) else {
+    daemon_a.stop();
+    daemon_b.stop();
+    panic!("the volume was not created");
+  };
+  let on_other_shard = slates_server::verbs::owner_of(id) == OTHER_PARTITION;
+  let object = ObjectId(id.bytes);
+  write_hello_over_nfs(&daemon_a, &name);
+  let ReplyBody::Snapshotted { id: snapshot } = client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    daemon_a.stop();
+    daemon_b.stop();
+    panic!("the snapshot was not taken");
+  };
+
+  let placed = poll_snapshot_placed(&mut client, id, snapshot);
+  let manifest = daemon_a.fleet_head_manifest(object);
+  let held = manifest.is_some_and(|manifest| daemon_b.fleet_holder_content(manifest));
+
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    on_other_shard,
+    "the volume lives on the shard that is not the control shard"
+  );
+  assert!(
+    placed,
+    "a snapshot of a volume on another shard placed at the f=1 quorum: `await placed(snapshot, region)`"
+  );
+  assert!(held, "B holds the snapshot's content whole");
+}
+
+/// AC (D-7; §4.8 "Promotion and takeover" → serve; §4.10): a takeover successor materializes a dead
+/// owner's volume **on the shard its id routes to**, so every verb for it finds it: three two-shard daemons,
+/// the volume on the owner's non-control shard, written over NFS and sealed; the owner dies; the successor's
+/// `status` for the id — routed by the id's partition to *its* non-control shard — answers, and the file
+/// reads back byte for byte over the successor's NFS port. Non-vacuous: materialized on the control shard
+/// (where the holds and the fetched archive live) the id would route to a shard with no such volume.
+#[test]
+fn a_takeover_successor_serves_a_volume_on_a_non_control_shard() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let serve = mesh_serve_ports(n);
+  let mut daemons = start_mesh_with(nodes, &hosts, &certs, &serve, 1, TWO_SHARDS);
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let name = name_on_partition("served2", OTHER_PARTITION, usize::from(TWO_SHARDS));
+  let sealed = seal_hello_on_owner(&instance_a, &daemons, &name);
+  let id = match sealed {
+    Ok(id) => id,
+    Err(why) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("setup: {why}");
+    }
+  };
+  let on_other_shard = slates_server::verbs::owner_of(id) == OTHER_PARTITION;
+  let object = ObjectId(id.bytes);
+
+  let owner = daemons.remove(0);
+  owner.stop();
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
+  let successor_index = if successor == hosts[1] { 0 } else { 1 };
+  let head_placed = poll_head_placed(&daemons[successor_index], object);
+  let served = poll_status_answers(&format!("fleet3-{}-{pid}", successor.0), id);
+  let got = if served {
+    Some(read_hello_over_nfs(&daemons[successor_index], &name))
+  } else {
+    None
+  };
+
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(on_other_shard, "the volume lives on the non-control shard");
+  assert!(head_placed, "the successor took over the dead owner's head");
+  assert!(
+    served,
+    "the successor serves the taken-over volume on the shard its id routes to"
+  );
+  assert_eq!(
+    got.as_deref(),
+    Some(CONTENT),
+    "the file reads back byte for byte over the successor's NFS port"
   );
 }
 

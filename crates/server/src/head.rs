@@ -21,7 +21,7 @@
 
 use slates_archive::Archive;
 use slates_db::catalog::{NamePolicy, Principal, SizeClass, SnapshotId};
-use slates_db::register::{HostId, Placement};
+use slates_db::register::{HostEpoch, HostId, Placement};
 use slates_vfs::export::SnapshotArchiver;
 use slates_wire::Wire;
 
@@ -65,12 +65,21 @@ impl HeadValue {
 }
 
 /// The placement the record plane has recorded for a volume's head at one sequence: the head's
-/// acknowledging candidates so far (merged across rounds). A newer sequence supersedes an older one —
-/// the head register's newest position is the head.
+/// acknowledging candidates so far (merged across rounds), and the epoch the head was written under. A
+/// newer sequence supersedes an older one — the head register's newest position is the head.
+///
+/// The epoch matters after a takeover: the successor promoted the object at an epoch above the dead
+/// owner's, and every holder raised its fence for the object to it (§4.8 "every holder raises its fence
+/// for that host to the new epoch"), so the successor's later writes to that object — its next seals — must
+/// carry at least that epoch or be refused `StaleEpoch`. The record plane writes each head at the greater
+/// of the configuration's host epoch and the epoch recorded here, so a taken-over object keeps writing
+/// under its promotion epoch and a fresh object under the host's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacedHead {
   /// The head sequence this placement is for.
   pub sequence: u64,
+  /// The epoch the head at this sequence was written (or adopted) under.
+  pub epoch: HostEpoch,
   /// The acknowledging candidates.
   pub placement: Placement,
 }
