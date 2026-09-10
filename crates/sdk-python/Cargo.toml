@@ -12,6 +12,12 @@ description = "The Python SDK (§2.3, D-19; Phase 5): a PyO3 extension over the 
 name = "slates"
 crate-type = ["cdylib"]
 
+[features]
+# Forwards blake3's pure-Rust backend so the extension cross-lints for a Windows target from a host
+# with no MSVC assembler (the maturin build on the native Windows runner uses the SIMD C path). Off
+# by default.
+pure-hash = ["slates-client/pure-hash"]
+
 [dependencies]
 slates-client = { workspace = true }
 slates-wire = { workspace = true }

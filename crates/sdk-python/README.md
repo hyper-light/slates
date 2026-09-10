@@ -32,6 +32,19 @@ client = slates.Client.connect("default", 5_000_000, 10_000_000)
 A connection is pinned to the thread that made it (the rings are single-consumer), so use one
 `Client` per thread. Connecting where no daemon answers raises `slates.SlatesError`.
 
+`AsyncClient` resolves each verb on a running `asyncio` loop by the completion channel's readiness
+(`loop.add_reader`), never blocking the loop. **On Windows** the completion channel is a socket
+(D-10), and `add_reader` on a socket needs a `SelectorEventLoop` — the default `ProactorEventLoop`
+has none — so set the selector policy before you run the loop:
+
+```python
+import asyncio, sys
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+```
+
+On macOS and Linux the default loop already polls fds, so nothing extra is needed.
+
 ## Volume lifecycle
 
 ```python

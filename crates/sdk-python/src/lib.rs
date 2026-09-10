@@ -676,8 +676,11 @@ struct AsyncClient {
   pending: HashMap<u64, Pending>,
   /// Whether the completion fd is registered with the loop's reader set.
   reader_on: bool,
-  /// The completion fd, cached after the first async call enables it.
-  completion_fd: Option<i32>,
+  /// The completion handle `add_reader` polls, cached after the first async call enables it. An
+  /// `i64` holds both a Unix fd and a Windows completion `SOCKET` (D-10): on Windows the loop must be
+  /// a `SelectorEventLoop`, whose `add_reader` accepts a socket — the default Proactor loop has no
+  /// `add_reader` (a caller sets `WindowsSelectorEventLoopPolicy`).
+  completion_fd: Option<i64>,
   /// The running loop, held to remove the reader when no request is in flight.
   event_loop: Option<Py<PyAny>>,
 }
@@ -1305,7 +1308,13 @@ fn ensure_reader<'py>(
   }
   let fd = {
     let mut this = slf.borrow_mut();
-    let fd = this.inner.enable_async_completion().map_err(refusal)?;
+    let handle = this.inner.enable_async_completion().map_err(refusal)?;
+    // A Unix fd is an `i32`; a Windows completion `SOCKET` is a kernel handle-table value that fits in
+    // an `i64`. Both cross to the loop's `add_reader` as one integer.
+    #[cfg(unix)]
+    let fd = i64::from(handle);
+    #[cfg(windows)]
+    let fd = i64::try_from(handle).unwrap_or(i64::MAX);
     this.completion_fd = Some(fd);
     fd
   };

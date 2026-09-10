@@ -11,6 +11,11 @@ description = "The TypeScript/Node SDK (§2.3, D-19; Phase 5): a napi-rs addon o
 # The Node addon is a cdylib; napi names the loadable `.node` from it.
 crate-type = ["cdylib"]
 
+[features]
+# Forwards blake3's pure-Rust backend so the addon cross-lints for a Windows target from a host with
+# no MSVC assembler (the napi build on the native Windows runner uses the SIMD C path). Off by default.
+pure-hash = ["slates-client/pure-hash"]
+
 [dependencies]
 slates-client = { workspace = true }
 # The napi-rs binding (D-19: "napi-rs SDK with uv_poll completion"). napi 2 + the derive macros;

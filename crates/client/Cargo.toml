@@ -8,6 +8,12 @@ rust-version.workspace = true
 readme.workspace = true
 description = "The Rust client: the rendezvous, one request in flight over the rings with spin-then-park, request ids with exactly-once retries across a daemon restart, and the lifecycle verbs of §4.4 as typed calls (design §4.4, §4.7, §4.9; Phase 2 task 5)."
 
+[features]
+# Forwards blake3's pure-Rust backend (no C build script) so a downstream crate can cross-lint for a
+# Windows target from a host that has no MSVC assembler. Off by default; production uses the SIMD C
+# path. See `crates/machine`'s `pure-hash`.
+pure-hash = ["slates-machine/pure-hash"]
+
 [dependencies]
 slates-machine = { workspace = true }
 slates-ipc = { workspace = true }
