@@ -316,6 +316,45 @@ impl Daemon {
       .unwrap_or_default()
   }
 
+  /// Whether this daemon's fleet has formed its **direct probe mesh** (§4.8): every peer in the
+  /// configured neighbourhood has a live probe session — the handshake completed and the peer was
+  /// recorded in `formed_probe_peers`. Unlike [`fleet_members`](Daemon::fleet_members), which reads the
+  /// membership's optimistically **seeded** alive set (every configured peer is believed alive from boot,
+  /// before any is contacted), this reflects sessions that have actually formed. A formation observer
+  /// waits on this so it does not act on a fleet whose mesh is not yet up — for instance retiring a node
+  /// that dies before its peers ever probed it, which no survivor could then detect. A laptop (no peers)
+  /// is trivially meshed. Runs a one-shot query on the control shard, bounded by the liveness budget;
+  /// `false` if the daemon is stopping, is not on a shard, or the shard does not answer in time.
+  pub fn fleet_meshed(&self) -> bool {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
+      return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        let meshed = state::with_state(|s| {
+          // The peers to reach are the neighbourhood less this node; the mesh is up when every one has a
+          // formed probe session. A laptop has an empty peer set and is meshed at once.
+          let host = s.fleet.host();
+          s.fleet
+            .configuration()
+            .neighbourhood
+            .iter()
+            .filter(|&&peer| peer != host)
+            .all(|peer| s.formed_probe_peers.contains(peer))
+        })
+        .unwrap_or(false);
+        let _ = tx.send(meshed);
+      })
+      .is_err()
+    {
+      return false;
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .unwrap_or(false)
+  }
+
   /// Whether this daemon's fleet has **region-placed** the head of `object` (§4.8): its control-shard
   /// membership loop replicated the head's record to the candidate holders and recorded a quorum of
   /// acknowledgements. A test or an operator reads this to observe cross-node replication; `false` if it is
@@ -582,6 +621,7 @@ fn init_shard(
     next_span_id: 1,
     current_request: slates_wire::request::RequestId::default(),
     placed_heads: std::collections::BTreeMap::new(),
+    formed_probe_peers: std::collections::BTreeSet::new(),
   };
   let rebuilt = verbs::rebuild_recovered(&mut state);
   if rebuilt.skipped > 0 {

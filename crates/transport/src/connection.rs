@@ -355,6 +355,23 @@ impl Connection {
     probed
   }
 
+  /// Allocates the next packet number and a bare, decryptable payload — a re-advertisement of the
+  /// connection's current flow-control credit — for a **handshake-confirmation** packet
+  /// ([`Endpoint::establish`](crate::Endpoint::establish)). TLS 1.3 leaves the server unable to know its
+  /// final flight was received (the client finishes on *sending* it, the server on *receiving* it); QUIC
+  /// closes that with a HANDSHAKE_DONE frame the peer can decrypt only once it holds the 1-RTT keys
+  /// (RFC 9000 §19.20, RFC 9001 §4.1.2). This is the minimal equivalent over slates's dialect: a real
+  /// packet, so it carries a fresh number from this connection's send space and is never confused with a
+  /// raw handshake datagram, but built from a `MaxData` credit frame — idempotent (re-advertising the
+  /// same ceiling changes nothing) and **not** ack-eliciting (RFC 9002 §2), so decoding it obliges no
+  /// acknowledgement and two ends never trade confirmations forever. It is not tracked for
+  /// retransmission: the endpoint resends a confirmation with a *fresh* number each probe timeout, so no
+  /// number is ever reused under the packet keys (RFC 9001 §9.5).
+  pub fn emit_confirm(&mut self) -> (u64, Vec<Frame>) {
+    let pn = self.sent.next_pn();
+    (pn, vec![self.flow.connection_credit_frame()])
+  }
+
   /// Drains the bytes now contiguous on receive stream `stream_id` (in order, each once) and slides
   /// that stream's flow-control window forward by what was consumed, so the next acknowledgement
   /// advertises fresh credit a window ahead of its new read cursor. Empty if the stream is unknown.

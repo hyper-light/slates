@@ -13,7 +13,7 @@
 
 /// Format: RFC 9002 §6.2.1 `kGranularity` — the timer granularity, 1 ms. The PTO's variation term never
 /// falls below it, so the timeout never undercuts what a timer can resolve. A protocol constant.
-const GRANULARITY_NS: u64 = 1_000_000;
+pub const GRANULARITY_NS: u64 = 1_000_000;
 /// Format: RFC 9002 §6.2.2 `kInitialRtt` — 333 ms, the RTT assumed before any sample is taken, from
 /// which the PTO starts. A protocol constant.
 const INITIAL_RTT_NS: u64 = 333_000_000;
@@ -96,6 +96,18 @@ impl RttEstimator {
       .smoothed_rtt
       .saturating_add(variation)
       .saturating_add(max_ack_delay)
+  }
+
+  /// The initial PTO (RFC 9002 §6.2.2): twice the initial RTT, the timeout before any sample — the same
+  /// value [`pto`](RttEstimator::pto) returns before a sample, but returned even after one. The handshake
+  /// caps its retransmit interval at this: once the first flight's round trip has seeded a *tiny* smoothed
+  /// RTT (a loopback or same-host peer), `pto` drops to about the timer granularity, which would retry the
+  /// handshake so aggressively it exhausts its retransmit budget in tens of milliseconds — too impatient
+  /// for a peer whose shard is briefly busy establishing the rest of a mesh. The conservative initial PTO
+  /// is the right ceiling for establishing a connection, where the in-progress sample is not yet a
+  /// trustworthy basis for giving up.
+  pub fn initial_pto(&self) -> u64 {
+    INITIAL_PTO_MULTIPLIER.saturating_mul(INITIAL_RTT_NS)
   }
 
   /// The smoothed RTT (nanoseconds), for the connection's diagnostics and assertions.

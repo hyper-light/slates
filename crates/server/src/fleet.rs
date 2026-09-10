@@ -316,6 +316,9 @@ async fn probe_peer(
   let Some(endpoint) = dial(identity, &name, address, &certificate).await else {
     return;
   };
+  // The direct probe session to this peer has formed — record it, so the daemon can tell the real mesh
+  // is up (`fleet_meshed`) rather than trusting the membership's optimistically seeded alive set.
+  state::with_state(|s| s.formed_probe_peers.insert(peer_host));
   let timing = detector_timing(neighbourhood);
   let fanout = usize::try_from(timing.gossip_transmits).unwrap_or(1);
   let mut detector = Detector::new(local, timing);
@@ -367,7 +370,8 @@ async fn probe_peer(
       && gone
     {
       // The peer is retired and its objects reassigned in the routing view; phase-one recovery and serving
-      // the taken-over head under the new epoch are owed. Nothing more to probe — end the loop.
+      // the taken-over head under the new epoch are owed. It is no longer part of the direct mesh.
+      state::with_state(|s| s.formed_probe_peers.remove(&peer_host));
       return;
     }
     futures::sleep(HEARTBEAT_NS).await;

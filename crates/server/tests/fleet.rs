@@ -352,6 +352,51 @@ fn start_mesh(
     .collect()
 }
 
+/// AC (§4.8, boot step 6, N-node): three daemons form the full **direct probe mesh** — each of the three
+/// nodes establishes a live probe session to each of its two peers, N·(N−1) = 6 sessions over
+/// `Endpoint::accept`, and every node reports its own mesh complete ([`Daemon::fleet_meshed`], every
+/// configured peer probed, not merely believed alive by the seeded membership). This is the N-node
+/// formation the two-node fleet tests exercise at their single-peer degenerate, now at the smallest fleet
+/// whose mesh is non-trivial: each node dials two peers on distinct sockets and serves two on its own
+/// per-peer sockets, and all six handshakes complete concurrently as the daemons boot one after another.
+/// It asserts **formation only** — the death-and-retirement half is
+/// [`three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node`], held apart (ignored) because a
+/// survivor's probe of the *dead* node hits a runtime scheduling flake unrelated to forming the mesh.
+#[test]
+fn three_daemons_form_a_full_mesh() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+
+  // Poll until every node's full direct mesh has formed (all six probe sessions established), bounded by
+  // the formation deadline.
+  let deadline = Instant::now() + FORMATION_DEADLINE;
+  while Instant::now() < deadline && !daemons.iter().all(Daemon::fleet_meshed) {
+    std::hint::spin_loop();
+  }
+  let meshed: Vec<(&str, bool)> = names
+    .iter()
+    .copied()
+    .zip(daemons.iter().map(Daemon::fleet_meshed))
+    .collect();
+  let all_meshed = meshed.iter().all(|&(_, m)| m);
+  // Stop the daemons before asserting, so a failure leaves none running.
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    all_meshed,
+    "the three-node direct probe mesh did not fully form within the deadline: {meshed:?}"
+  );
+}
+
 /// AC (§4.8, boot step 6, N-node): **three** daemons form one live fleet over the per-peer socket mesh —
 /// each node serves each of its two peers on its own advertised socket pair (since `Endpoint::accept` pins
 /// one peer per socket) and dials each peer's — and when one node dies, the **two survivors each detect it
@@ -359,16 +404,16 @@ fn start_mesh(
 /// death at `f = 1` (2f + 1 = 3), so it is the shape a fault-tolerant fleet actually runs; the retirement by
 /// both survivors is the non-vacuous proof each ran its membership loop end to end over real UDP sessions.
 ///
-/// Ignored pending robust N-node mesh formation. The membership *code* is the general N-peer loop, proven at
-/// N = 2 by the two tests above (the two-node fleet is the single-peer degenerate). At N = 3 the mesh has
-/// N·(N−1) = 6 probe sessions to establish over `Endpoint::accept`, and some intermittently fail to form (a
-/// dialer's handshake flights not reaching the peer's serve, or a partial-handshake stall) — a peer this node
-/// never managed to probe is then never seen to die, so a survivor fails to retire the dead node. The fix is
-/// the robust connection management the transport marks owed (a fixed-port mesh so both ends know each
-/// other's addresses and use `Endpoint::server`/`client` with no first-datagram learning, or an accept side
-/// that re-learns across a dialer's flights); handshake retransmission (`Endpoint::establish`) is in place but
-/// does not on its own make every session of the mesh form. Un-ignore when that lands.
-#[ignore = "N-node mesh formation over Endpoint::accept is not yet reliable (owed transport connection management); the N-peer code is proven at N=2 above"]
+/// Ignored on the **retirement** half, not formation: the N-node mesh now forms reliably — asserted on its
+/// own by [`three_daemons_form_a_full_mesh`] above (all six probe sessions establish), which the transport's
+/// handshake confirmation and fast establish retransmission (`Endpoint::establish`, `endpoint.rs`) made
+/// solid. What remains flaky is a survivor's *probe of the dead node* timing out: the SWIM probe's
+/// bounded-wait occasionally strands on a runtime scheduling hazard (a spawned probe task's own sleep timer
+/// not firing while its parent runs), so one survivor sometimes fails to age the dead node to death within
+/// the retirement deadline. That is a runtime/detector-robustness issue independent of forming the mesh, and
+/// it also flakes the two-node retirement test above; un-ignore when the probe's timeout is made robust to
+/// it (a self-timed exchange bound, or the runtime timer fix). See `docs/wip/GAPS.md`.
+#[ignore = "retirement half flaky on a runtime probe-timeout hazard (formation is reliable — see three_daemons_form_a_full_mesh)"]
 #[test]
 fn three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node() {
   let _serial = serialize_fleet_tests();
@@ -408,7 +453,9 @@ fn three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node() {
 
 /// Polls until every daemon sees each of its peers alive (the fleet has formed), or fails at the formation
 /// deadline naming who is still missing. Polling rather than a fixed settle returns as soon as the mesh is
-/// up and tolerates a slower-forming larger mesh.
+/// up and tolerates a slower-forming larger mesh. This reads the membership's alive set; the stronger
+/// direct-mesh check ([`Daemon::fleet_meshed`], every probe session actually formed) is asserted on its
+/// own by [`three_daemons_form_a_full_mesh`].
 fn assert_fleet_forms(daemons: &[Daemon], hosts: &[HostId], names: &[&str]) {
   let formed = |daemon: &Daemon, i: usize| {
     let members = daemon.fleet_members();

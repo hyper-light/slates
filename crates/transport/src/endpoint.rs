@@ -29,7 +29,7 @@ use slates_rt::udp::UdpSocket;
 use crate::connection::{Connection, initial_receive_window};
 use crate::handshake::{HandshakeError, Identity, client_connection, server_connection};
 use crate::packet_number::{MAX_PACKET_NUMBER_BYTES, decode_packet_number, encode_packet_number};
-use crate::rtt::RttEstimator;
+use crate::rtt::{GRANULARITY_NS, RttEstimator};
 use crate::session::{Frame, decode_frames, encode_frames};
 
 /// Format: RFC 9000 §17.3 — bit 6 of a short-header first byte, always 1 ("fixed bit"); a packet with
@@ -74,6 +74,19 @@ const HANDSHAKE_TURN_CEILING: usize = 16;
 /// and never retransmits), so the exact value is not performance-tuned — only large enough that the wait,
 /// `MAX_HANDSHAKE_RETRANSMITS` × the initial probe timeout ≈ twenty seconds, spans a plausible boot skew.
 const MAX_HANDSHAKE_RETRANSMITS: u32 = 32;
+
+/// How many consecutive probe-timeout silences end the server's handshake-confirmation wait
+/// ([`Endpoint::confirm_handshake`]). A client that has not yet heard the server's confirmation
+/// retransmits its final flight every probe timeout; so once the server — which already holds that
+/// flight and knows the exchange is mutually complete — has seen the peer fall silent this many
+/// timeouts running, the client has received a confirmation and stopped, and the server may leave. A
+/// client still in need keeps the server here by retransmitting (each received flight resets the count),
+/// and the server resends the confirmation on each of these silences, so a confirmation lost inside the
+/// window is still recovered; the whole wait is additionally capped by `MAX_HANDSHAKE_RETRANSMITS`
+/// received datagrams (banned item 8: no unbounded wait).
+/// Shape: a small tail-loss tolerance — on any path a client answers a live confirmation within one
+/// round trip, so a handful of silent timeouts is conclusive; the exact value is not performance-tuned.
+const HANDSHAKE_CONFIRM_SILENCE: u32 = 3;
 
 /// A refusal on the endpoint.
 #[derive(Debug)]
@@ -128,6 +141,12 @@ impl Quic {
       Quic::Client(c) => c.is_handshaking(),
       Quic::Server(s) => s.is_handshaking(),
     }
+  }
+  /// Whether this is the TLS **client** — the side that, in TLS 1.3, finishes the handshake the instant
+  /// it *sends* its Certificate/Finished flight, so it (not the server) bears the tail-loss risk that
+  /// [`Endpoint::confirm_handshake`] closes.
+  fn is_client(&self) -> bool {
+    matches!(self, Quic::Client(_))
   }
 }
 
@@ -271,6 +290,13 @@ impl Endpoint {
     let mut buf = [0u8; 2048];
     let mut sent_at: Option<Instant> = None;
     let mut last_flight: Vec<u8> = Vec::new();
+    // The peer's flight this end last fed to `read_hs`. Retransmits that raced this end's reply arrive as
+    // an exact re-send of a flight already consumed; `read_hs` treats its input as an ordered byte stream
+    // and would fault on the repeat (a fresh `ClientHello` where it expects the client's `Finished`), so a
+    // datagram identical to this is skipped rather than fed. The aggressive early backoff makes such a
+    // raced duplicate common — the peer answers before this end's next retransmit would have fired — so
+    // this is what keeps the fast retransmit from corrupting an otherwise-healthy handshake.
+    let mut last_consumed: Vec<u8> = Vec::new();
     for _ in 0..HANDSHAKE_TURN_CEILING {
       let out = self.drain_handshake();
       if !out.is_empty() {
@@ -279,7 +305,11 @@ impl Endpoint {
         last_flight = out;
       }
       if !self.quic.is_handshaking() && self.keys.is_some() {
-        return Ok(());
+        // The TLS bytes are all exchanged, but TLS 1.3 leaves the two ends *asymmetrically* finished —
+        // the client the moment it sends its final flight, the server only when it receives it — so a
+        // dropped final flight would strand the server. Confirm delivery before returning (RFC 9001
+        // §4.1.2, RFC 9000 §19.20).
+        return self.confirm_handshake(&last_flight).await;
       }
       // Receive the peer's next flight, retransmitting our last flight each probe timeout so a dropped
       // handshake packet — the common case being a peer not yet listening when we first sent — is recovered
@@ -288,12 +318,24 @@ impl Endpoint {
       // fresh port: a fresh-port re-dial would race the server's `accept`, which pins the first source it
       // hears. The accept side, still to learn its peer, has no flight yet and no peer to send to, so it
       // simply waits. Bounded by a retransmit ceiling (banned item 8: no unbounded wait).
+      // The retransmit interval backs off exponentially from the timer granularity toward the probe
+      // timeout, rather than waiting a full probe timeout each time. The dominant handshake loss is a peer
+      // not yet listening when this node first dials it (a fleet forms as its nodes boot one after
+      // another); a flat two-thirds-of-a-second wait would then reach a peer that binds its socket a
+      // moment later only on the *next* such tick — up to that long after it is reachable — which loses the
+      // race to form every session of an N-node mesh before an early death. Starting at the granularity
+      // and doubling reaches a slow-to-listen peer within milliseconds while the ceiling keeps a peer that
+      // never answers from being retried faster than the estimated round trip; the retransmit count still
+      // bounds the whole wait (banned item 8: no unbounded wait).
       let (n, from) = {
-        let mut retransmits = 0u32;
+        let mut attempts = 0u32;
+        let mut backoff = GRANULARITY_NS;
         loop {
           let received = {
             let mut recv = std::pin::pin!(self.socket.recv_from(&mut buf));
-            let mut timer = std::pin::pin!(slates_rt::futures::sleep(self.probe_timeout()));
+            let mut timer = std::pin::pin!(slates_rt::futures::sleep(
+              backoff.min(self.handshake_probe_ceiling())
+            ));
             std::future::poll_fn(|cx| {
               if let std::task::Poll::Ready(result) = std::future::Future::poll(recv.as_mut(), cx) {
                 return std::task::Poll::Ready(Some(result));
@@ -306,12 +348,26 @@ impl Endpoint {
             .await
           };
           match received {
-            Some(result) => break result?,
+            Some(result) => {
+              let (rn, rfrom) = result?;
+              // Skip an exact re-send of the flight already consumed (a peer retransmit that raced this
+              // end's reply): feeding it to `read_hs` would fault the handshake stream. It still counts
+              // against the bound, so a peer flooding duplicates cannot loop this forever (banned item 8).
+              if !last_consumed.is_empty() && buf[..rn] == last_consumed[..] {
+                attempts += 1;
+                if attempts > MAX_HANDSHAKE_RETRANSMITS {
+                  return Err(EndpointError::NotReady);
+                }
+                continue;
+              }
+              break (rn, rfrom);
+            }
             None => {
-              retransmits += 1;
-              if retransmits > MAX_HANDSHAKE_RETRANSMITS {
+              attempts += 1;
+              if attempts > MAX_HANDSHAKE_RETRANSMITS {
                 return Err(EndpointError::NotReady);
               }
+              backoff = backoff.saturating_mul(2);
               if !self.learn_peer && !last_flight.is_empty() {
                 self.socket.send_to(&last_flight, self.peer)?;
                 sent_at = Some(Instant::now());
@@ -338,9 +394,161 @@ impl Endpoint {
         self.peer = from;
         self.learn_peer = false;
       }
+      // Remember this flight so a later exact re-send of it (a peer retransmit) is recognized and skipped
+      // above rather than fed to `read_hs` a second time.
+      last_consumed.clear();
+      last_consumed.extend_from_slice(&buf[..n]);
       self.quic.read_hs(&buf[..n])?;
     }
     Err(EndpointError::NotReady)
+  }
+
+  /// Confirms the handshake's final flight was delivered before `establish` returns, closing the
+  /// TLS-1.3 tail-loss hole (RFC 9001 §4.1.2, RFC 9000 §19.20): TLS 1.3 finishes the **client** the
+  /// instant it *sends* its Certificate/Finished flight but the **server** only when it *receives* that
+  /// flight, so a dropped final flight would leave the client believing it is done while the server
+  /// waits forever (retransmitting its own flight into a client that has stopped listening — the exact
+  /// stall an N-node fleet's mesh hit). The two sides play complementary roles, and the residual
+  /// two-army uncertainty is resolved the way QUIC resolves it — the server, which upon finishing
+  /// already holds the client's flight, announces completion, and the client waits to hear it.
+  async fn confirm_handshake(&mut self, last_flight: &[u8]) -> Result<(), EndpointError> {
+    if self.quic.is_client() {
+      self.confirm_as_client(last_flight).await
+    } else {
+      self.confirm_as_server().await
+    }
+  }
+
+  /// The client's half of handshake confirmation: it cannot know its final flight (`last_flight`)
+  /// arrived, so it waits for **any decryptable 1-RTT packet** from the server — proof the server
+  /// reached its own 1-RTT keys, which in TLS 1.3 it can only do by receiving this flight — and
+  /// retransmits the flight on each probe timeout (and at once on a raw handshake datagram, which means
+  /// the server is still waiting) until then. Bounded by the handshake retransmit ceiling (banned
+  /// item 8).
+  async fn confirm_as_client(&mut self, last_flight: &[u8]) -> Result<(), EndpointError> {
+    let mut buf = [0u8; 2048];
+    let mut retransmits = 0u32;
+    let mut backoff = GRANULARITY_NS;
+    loop {
+      let period = backoff.min(self.handshake_probe_ceiling());
+      match self.receive_raw(&mut buf, period).await? {
+        Some(n) => {
+          // A packet that unprotects under the 1-RTT keys is the server's confirmation: it has its keys,
+          // so it received our final flight, and the handshake is complete both ways.
+          if self.ingest(&buf[..n]).is_ok() {
+            return Ok(());
+          }
+          // Otherwise a raw handshake retransmit (the server has not seen our final flight yet): resend
+          // it at once. A received datagram is progress — the peer is alive and still asking — so it does
+          // not count toward the give-up budget, which counts only silent timeouts.
+          self.socket.send_to(last_flight, self.peer)?;
+        }
+        None => {
+          retransmits += 1;
+          if retransmits > MAX_HANDSHAKE_RETRANSMITS {
+            return Err(EndpointError::NotReady);
+          }
+          backoff = backoff.saturating_mul(2);
+          self.socket.send_to(last_flight, self.peer)?;
+        }
+      }
+    }
+  }
+
+  /// The server's half of handshake confirmation: having received the client's final flight, it already
+  /// knows the exchange is mutually complete, so it announces that with a 1-RTT confirmation the client
+  /// can decrypt and resends it whenever it still sees the client's raw flight retransmits (the client
+  /// has not heard the confirmation yet). It leaves the moment the client sends **1-RTT traffic of its
+  /// own** — a probe or a record commit, which the client only sends once it has the confirmation and has
+  /// left its own handshake — or, as a fallback for a client that establishes but then sends nothing,
+  /// once the client has fallen silent for [`HANDSHAKE_CONFIRM_SILENCE`] backoff intervals grown to the
+  /// ceiling (roughly a second of quiet — far longer than the client's own matched backoff would leave a
+  /// still-needed flight unretransmitted). A datagram that unprotects as 1-RTT is dropped, not ingested:
+  /// the client's exchange retransmits it to the serve loop this returns into, so no half-consumed
+  /// request is left buffered where that loop would deadlock. Bounded overall by
+  /// `MAX_HANDSHAKE_RETRANSMITS` silent timeouts (banned item 8).
+  async fn confirm_as_server(&mut self) -> Result<(), EndpointError> {
+    let mut buf = [0u8; 2048];
+    self.send_confirm()?;
+    let mut silent = 0u32;
+    let mut backoff = GRANULARITY_NS;
+    loop {
+      let period = backoff.min(self.handshake_probe_ceiling());
+      match self.receive_raw(&mut buf, period).await? {
+        Some(n) => {
+          // A datagram that unprotects under the 1-RTT keys is the client's own application traffic — it
+          // has our confirmation and moved on, so the handshake is done. Drop this datagram (do not
+          // ingest it): the client's exchange retransmits it to the serve loop this returns into.
+          let confirmed = self
+            .keys
+            .as_ref()
+            .is_some_and(|keys| unprotect_packet(keys, self.rx_largest, &buf[..n]).is_ok());
+          if confirmed {
+            return Ok(());
+          }
+          // A raw handshake retransmit: the client has not heard our confirmation. Resend it, and reset
+          // the silence and its backoff — the client is still here and asking.
+          silent = 0;
+          backoff = GRANULARITY_NS;
+          self.send_confirm()?;
+        }
+        None => {
+          silent += 1;
+          if silent > MAX_HANDSHAKE_RETRANSMITS {
+            return Ok(());
+          }
+          // Fall out once the quiet has spanned enough intervals *and* those intervals have grown to the
+          // ceiling — so the fallback exit only fires after a genuinely long silence, never mid-formation
+          // while the client is still retransmitting on its own (matched) backoff.
+          if silent > HANDSHAKE_CONFIRM_SILENCE && backoff >= self.handshake_probe_ceiling() {
+            return Ok(());
+          }
+          backoff = backoff.saturating_mul(2);
+          self.send_confirm()?;
+        }
+      }
+    }
+  }
+
+  /// Sends one 1-RTT handshake-confirmation packet to the peer (see [`Connection::emit_confirm`]): a
+  /// fresh packet number and a re-advertised flow-control credit, protected under the local 1-RTT keys.
+  fn send_confirm(&mut self) -> Result<(), EndpointError> {
+    let (pn, frames) = self.conn.emit_confirm();
+    let largest_acked = self.conn.tx_largest_acked();
+    let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
+    let datagram = protect_packet(keys, pn, largest_acked, &frames)?;
+    self.socket.send_to(&datagram, self.peer)?;
+    Ok(())
+  }
+
+  /// Receives one datagram into `buf`, or `Ok(None)` if `timeout_ns` elapses first — the confirmation
+  /// loops' clock. Unlike [`receive_within`](Endpoint::receive_within), it does not ingest what it
+  /// receives: a datagram in the confirmation window may be a peer 1-RTT confirmation or a raw handshake
+  /// retransmit, and the caller inspects the raw bytes to tell them apart.
+  async fn receive_raw(
+    &mut self,
+    buf: &mut [u8],
+    timeout_ns: u64,
+  ) -> Result<Option<usize>, EndpointError> {
+    let outcome = {
+      let mut recv = std::pin::pin!(self.socket.recv_from(buf));
+      let mut timer = std::pin::pin!(slates_rt::futures::sleep(timeout_ns));
+      std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(received) = std::future::Future::poll(recv.as_mut(), cx) {
+          return std::task::Poll::Ready(Some(received));
+        }
+        if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
+          return std::task::Poll::Ready(None);
+        }
+        std::task::Poll::Pending
+      })
+      .await
+    };
+    match outcome {
+      Some(Ok((n, _from))) => Ok(Some(n)),
+      Some(Err(e)) => Err(e.into()),
+      None => Ok(None),
+    }
   }
 
   /// Drains every handshake byte the connection currently has to send, across encryption-level
@@ -447,11 +655,25 @@ impl Endpoint {
     self.rtt.pto(0)
   }
 
+  /// The ceiling on the exponential-backoff retransmit interval *during the handshake* — the conservative
+  /// initial PTO, not the estimated one. The first flight's round trip seeds a smoothed RTT that, on a
+  /// loopback or same-host peer, is a few microseconds, dropping [`probe_timeout`](Endpoint::probe_timeout)
+  /// to about the timer granularity; capping the handshake's retry there would exhaust its retransmit
+  /// budget in tens of milliseconds and abandon a peer whose shard is momentarily busy establishing the
+  /// rest of a mesh. Establishing a connection stays patient against the initial PTO instead (RFC 9002
+  /// §6.2.2), while the post-handshake reliable exchanges still arm against the true estimate.
+  fn handshake_probe_ceiling(&self) -> u64 {
+    self.rtt.initial_pto()
+  }
+
   /// Waits for the next packet within the probe timeout; on a timeout, drives tail-loss recovery by probing
   /// the oldest in-flight packet ([`Connection::probe`]) so the caller's next flush retransmits it. The
   /// reliable exchanges call this in place of a bare receive, so a lost packet or a lost acknowledgement —
   /// which a real datagram socket can drop and which no later acknowledgement would expose — cannot stall
   /// them. A probe with nothing in flight is a no-op, so a timeout while merely waiting on the peer is free.
+  /// This wait is not self-bounded: a reliable exchange retransmits until it completes or its **caller**
+  /// stops it (the fleet probe races it against a deadline and cancels it — [`crate::endpoint`] callers own
+  /// the bound), which is what a peer that dies mid-exchange relies on to not strand the loop.
   async fn receive_or_probe(&mut self) -> Result<(), EndpointError> {
     if !self.receive_within(self.probe_timeout()).await? {
       self.conn.probe();
@@ -558,7 +780,9 @@ impl Endpoint {
       }
     };
 
-    // Phase two: send the reply on the same stream id until the peer has acknowledged it whole.
+    // Phase two: send the reply on the same stream id until the peer has acknowledged it whole. This is an
+    // active exchange (a reply is in flight awaiting acknowledgement), so it carries the stall bound — a
+    // peer that stops acknowledging is abandoned rather than retransmitted into forever.
     let reply = handler(request);
     self.conn.open(request_id, &reply);
     loop {

@@ -176,6 +176,13 @@ pub struct ShardState {
   /// `await_placed`) consults this — a head with a stored quorum placement is region-placed; without one it
   /// is the local append (`f = 0`, or not yet replicated). Empty on a laptop (no fleet loop runs).
   pub placed_heads: BTreeMap<ObjectId, Placement>,
+  /// The fleet peers this node has established a live probe session with (§4.8): a peer is inserted the
+  /// moment its probe session's handshake completes, so this is the set of peers the direct mesh has
+  /// actually formed to — distinct from the membership's optimistically **seeded** alive set, which holds
+  /// every configured peer from boot before any is contacted. The daemon reads it (`fleet_meshed`) to
+  /// tell whether the fleet's direct mesh is up, which a formation observer must wait for rather than the
+  /// seeded view. Empty on a laptop (no fleet loop runs).
+  pub formed_probe_peers: std::collections::BTreeSet<slates_db::HostId>,
 }
 
 /// A work volume's accumulated declared operations (§4.16), composed into an increment on submit.
