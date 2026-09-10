@@ -274,6 +274,62 @@ mod tests {
     assert_eq!(decode_frames(&encode_frames(&frames)), Ok(frames));
   }
 
+  /// Golden vectors for the wire format (CLAUDE.md §4 "golden vectors for everything in a format"): the
+  /// exact bytes each frame kind encodes to, fixed little-endian per D-15. A change to the wire layout —
+  /// which every peer and every future version must agree on — breaks this, not just a silent re-encode.
+  #[test]
+  fn the_frames_encode_to_their_golden_bytes() {
+    // MaxData: kind 3, then the ceiling as u64 LE.
+    assert_eq!(
+      encode_frames(&[Frame::MaxData { max: 5 }]),
+      vec![3, 5, 0, 0, 0, 0, 0, 0, 0]
+    );
+    // MaxStreamData: kind 4, stream id (1) u64 LE, ceiling (256 = 0x0100) u64 LE.
+    assert_eq!(
+      encode_frames(&[Frame::MaxStreamData {
+        stream_id: 1,
+        max: 256
+      }]),
+      vec![4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]
+    );
+    // Ack: kind 2, largest (2) u64 LE, first range (1) u64 LE, additional-range count (1) u16 LE, then
+    // that range's gap (0) and length (3) as u64 LE each.
+    assert_eq!(
+      encode_frames(&[Frame::Ack {
+        largest: 2,
+        range: 1,
+        ranges: vec![AckRange { gap: 0, len: 3 }],
+      }]),
+      vec![
+        2, // KIND_ACK
+        2, 0, 0, 0, 0, 0, 0, 0, // largest
+        1, 0, 0, 0, 0, 0, 0, 0, // first range
+        1, 0, // one additional range
+        0, 0, 0, 0, 0, 0, 0, 0, // gap
+        3, 0, 0, 0, 0, 0, 0, 0, // len
+      ]
+    );
+    // Stream: kind 1, stream id (7) u64 LE, offset (4) u64 LE, fin flag (1), data length (2) u32 LE, data.
+    assert_eq!(
+      encode_frames(&[Frame::Stream {
+        stream_id: 7,
+        offset: 4,
+        fin: true,
+        data: vec![0xAA, 0xBB],
+      }]),
+      vec![
+        1, // KIND_STREAM
+        7, 0, 0, 0, 0, 0, 0, 0, // stream id
+        4, 0, 0, 0, 0, 0, 0, 0, // offset
+        1, // STREAM_FIN
+        2, 0, 0, 0, // data length
+        0xAA, 0xBB, // data
+      ]
+    );
+    // PADDING is a single zero byte the decoder consumes with no frame produced.
+    assert_eq!(decode_frames(&[0]), Ok(Vec::new()));
+  }
+
   /// An empty payload decodes to no frames.
   #[test]
   fn an_empty_payload_decodes_to_no_frames() {
