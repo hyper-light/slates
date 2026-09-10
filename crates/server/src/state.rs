@@ -9,6 +9,7 @@ use slates_anchor::AnchorSegment;
 use slates_base::OsHost;
 use slates_db::Db;
 use slates_db::catalog::{Principal, VolumeId};
+use slates_db::register::{ObjectId, Placement};
 use slates_ipc::DaemonEnd;
 use slates_ipc::protocol::ReplyBody;
 use slates_mem::SharedObject;
@@ -169,6 +170,12 @@ pub struct ShardState {
   /// with the real request identity without threading it through every handler. The shard is
   /// single-threaded and runs one verb at a time with no awaits inside (§4.7), so this is unambiguous.
   pub current_request: slates_wire::request::RequestId,
+  /// The region placement the fleet has committed for each object this node owns (§4.8): the acknowledging
+  /// set the control-shard membership loop recorded when it replicated the object's head record to its
+  /// candidate holders and reached the quorum. The placement authority the verbs read (`region_placed`,
+  /// `await_placed`) consults this — a head with a stored quorum placement is region-placed; without one it
+  /// is the local append (`f = 0`, or not yet replicated). Empty on a laptop (no fleet loop runs).
+  pub placed_heads: BTreeMap<ObjectId, Placement>,
 }
 
 /// A work volume's accumulated declared operations (§4.16), composed into an increment on submit.

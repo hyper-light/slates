@@ -25,11 +25,11 @@
 use std::sync::mpsc::{TryRecvError, channel};
 
 use rustls::pki_types::CertificateDer;
-use slates_cluster::CommitBudget;
 use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::fleet::sync_membership;
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once, serve_probe};
-use slates_db::register::HostId;
+use slates_cluster::{CommitBudget, commit_record, serve_record};
+use slates_db::register::{Acceptor, Authority, HostId, ObjectId, Quorum, Record};
 use slates_rt::error::RtError;
 use slates_rt::futures::{self, cancel, spawn_child};
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
@@ -38,12 +38,28 @@ use slates_transport::endpoint::Endpoint;
 use slates_transport::handshake::Identity;
 
 use crate::daemon::HEARTBEAT_NS;
-use crate::state;
+use crate::state::{self, ShardState};
 
-/// Format: the transport receive window in frames — the number of framed chunks a session buffers. A SWIM
-/// message and a register record are each a few frames, so a small window carries them; matches the value
-/// the transport's own session tests exercise (`crates/transport/tests/session.rs`).
-const FLEET_FRAME_CAP: usize = 16;
+/// Format: RFC 9000 §14.1 — the smallest maximum UDP payload every QUIC path is required to carry without
+/// path-MTU discovery (which the transport marks owed, `endpoint.rs`). Sizing a fleet datagram within it
+/// keeps it deliverable unfragmented on any conformant path.
+const MIN_DATAGRAM_BYTES: usize = 1200;
+
+/// Format: an upper bound on one packet's non-payload bytes for the frame-cap derivation — the RFC 9000
+/// §17.3 short header (first byte + a packet number ≤ 4 bytes → 5), the RFC 9001 §5.3 AEAD tag (16), and
+/// one RFC 9000 §19.8 STREAM-frame header (type + stream-id + offset + length varints + fin, ≤ 43). Rounded
+/// up to 64, a safe margin so a full-cap frame's packet never crosses [`MIN_DATAGRAM_BYTES`].
+const FLEET_PACKET_OVERHEAD: usize = 64;
+
+/// Derived: the largest stream-frame payload whose packet still fits within [`MIN_DATAGRAM_BYTES`] (§4.9
+/// "Frame caps per class from measured MTU and class budgets"; the frame cap is `Endpoint`'s
+/// `max_frame_len`, which also floors the initial receive window at `(REORDER_THRESHOLD + 1) × cap`). At
+/// this cap a whole fleet message — a SWIM probe, a register record, or its acknowledgement, each at most a
+/// few hundred bytes — rides a single frame inside one receive window, so a commit completes in one round
+/// trip. At the previous 16-byte cap a 68-byte record fragmented into five frames across a 64-byte window
+/// and needed ten credit-gated round trips, which lost the commit's deadline under core contention.
+/// Anchored to [`MIN_DATAGRAM_BYTES`] less [`FLEET_PACKET_OVERHEAD`].
+const FLEET_FRAME_CAP: usize = MIN_DATAGRAM_BYTES - FLEET_PACKET_OVERHEAD;
 
 /// Derived: SWIM's infection factor rounded to a per-bit integer weight for `λ·ln(n+1)` (§4.8; SWIM §4.1).
 /// `λ·ln(x) = λ·ln(2)·log2(x)`, and the bit-length of `x` is `⌊log2(x)⌋+1`, so with SWIM's high-probability
@@ -73,8 +89,12 @@ const POLL_PER_PERIOD: u64 = 10;
 pub struct FleetPeer {
   /// The peer's host id.
   pub host: HostId,
-  /// The peer's advertised address — where it accepts probes, and where this node dials it.
+  /// The peer's advertised probe address — where it accepts SWIM probes, and where this node dials it.
   pub address: SocketAddrV4,
+  /// The peer's advertised record address — where it accepts register record commits (a separate socket
+  /// from the probe one, because the SWIM and register wire formats are not distinguished by content on a
+  /// shared stream; the connection-ID demux that would multiplex them on one socket is owed).
+  pub record_address: SocketAddrV4,
   /// The peer's operator-provisioned certificate, pinned for the mutual-TLS session.
   pub certificate: CertificateDer<'static>,
 }
@@ -88,8 +108,11 @@ pub struct FleetTransport {
   pub identity: Identity,
   /// The TLS server name this node presents and its peers pin.
   pub name: String,
-  /// This node's advertised address — where it accepts peers' probes; bound on the control shard.
+  /// This node's advertised probe address — where it accepts peers' SWIM probes; bound on the control shard.
   pub bind: SocketAddrV4,
+  /// This node's advertised record address — where it accepts peers' register record commits; bound on the
+  /// control shard, a separate socket from the probe one.
+  pub record_bind: SocketAddrV4,
   /// The peers this node probes and is probed by.
   pub peers: Vec<FleetPeer>,
 }
@@ -133,38 +156,93 @@ pub async fn run_membership(transport: FleetTransport) {
     identity,
     name,
     bind,
+    record_bind,
     peers,
   } = transport;
   let Some(peer) = peers.into_iter().next() else {
-    // No peer to probe — nothing to do (the placement path still runs the FleetNode, degenerate).
+    // No peer — nothing to do (the placement path still runs the FleetNode, degenerate).
     return;
   };
   let neighbourhood = 2; // this node and its one peer (the two-node fleet).
   let local = state::with_state(|s| s.fleet.host()).unwrap_or(HostId(0));
+  let budget = probe_budget();
 
-  // The serve side accepts the peer on the advertised socket (bound here, on the control shard — a runtime
-  // context), constructed with a borrow of the identity and then moved to its task.
-  let Ok(accept) = UdpSocket::bind(bind) else {
+  // The two serve sides accept the peer on this node's two advertised sockets (bound here, on the control
+  // shard — a runtime context) and answer, one SWIM probes and one register record commits. Each is built
+  // with a borrow of the identity and moved to its task; the serve tasks must be up before the client dials
+  // below, so a peer's dial finds a listener (its initial packet is buffered on the bound socket meanwhile).
+  let (Ok(probe_accept), Ok(record_accept)) = (UdpSocket::bind(bind), UdpSocket::bind(record_bind)) else {
     return;
   };
-  let Ok(serve_endpoint) = Endpoint::accept(
-    accept,
-    &identity,
-    std::slice::from_ref(&peer.certificate),
-    FLEET_FRAME_CAP,
+  let (Ok(probe_serve), Ok(record_serve)) = (
+    Endpoint::accept(
+      probe_accept,
+      &identity,
+      std::slice::from_ref(&peer.certificate),
+      FLEET_FRAME_CAP,
+    ),
+    Endpoint::accept(
+      record_accept,
+      &identity,
+      std::slice::from_ref(&peer.certificate),
+      FLEET_FRAME_CAP,
+    ),
   ) else {
     return;
   };
-  if let Ok(task) = futures::spawn(serve_peer_probes(serve_endpoint, local, neighbourhood)) {
+  if let Ok(task) = futures::spawn(serve_peer_probes(probe_serve, local, neighbourhood)) {
+    let _ = futures::detach(task);
+  }
+  if let Ok(task) = futures::spawn(serve_peer_records(record_serve, local, peer.host)) {
     let _ = futures::detach(task);
   }
 
-  // The probe side owns the identity (not `Clone`, so only one task may hold it) and rebuilds its client
-  // session on each attempt: the handshake is not retransmitted (owed), so a lost initial packet at startup
-  // (the peer not yet listening) is recovered by re-dialing until the peer's accept socket is up. Detached:
-  // it lives as long as the shard and is cancelled by the runtime's shutdown.
-  if let Ok(task) = futures::spawn(probe_peer(identity, name, peer, local, neighbourhood)) {
+  // The probe client dials the peer's advertised probe address with the startup retry (the handshake is
+  // not retransmitted, so a lost initial packet — the peer not yet listening — is recovered by re-dialing).
+  // The identity is borrowed here for the probe dial and the two serve-side accepts above; it is then moved
+  // into the record ship loop, which dials the peer's record address *lazily* — only when it first has a
+  // head to place. A boot-time record dial would leave that session idle across the whole formation window
+  // (seconds) before its first use, and an idle-then-reused session's first request stalls; dialing at the
+  // moment of first use keeps the session warm from establish through the commit. Detached: cancelled by
+  // the runtime's shutdown.
+  let Some(probe_client) = dial(&identity, &name, peer.address, &peer.certificate, budget).await else {
+    return;
+  };
+  if let Ok(task) = futures::spawn(probe_peer(probe_client, peer.host, local, neighbourhood)) {
     let _ = futures::detach(task);
+  }
+  if let Ok(task) = futures::spawn(ship_records(
+    identity,
+    name,
+    peer.record_address,
+    peer.certificate,
+    peer.host,
+    local,
+    budget,
+  )) {
+    let _ = futures::detach(task);
+  }
+}
+
+/// Dials `address` and completes the handshake, re-dialing from a fresh socket until the peer's accept side
+/// answers (the session-plane handshake is not retransmitted — owed — so a lost initial packet at startup
+/// stalls otherwise). `None` if the runtime refuses a socket or endpoint.
+async fn dial(
+  identity: &Identity,
+  name: &str,
+  address: SocketAddrV4,
+  certificate: &CertificateDer<'static>,
+  budget: CommitBudget,
+) -> Option<Endpoint> {
+  loop {
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).ok()?;
+    let client =
+      Endpoint::client(socket, address, identity, certificate, name, FLEET_FRAME_CAP).ok()?;
+    match establish_bounded(client, budget).await {
+      Ok(Some(established)) => return Some(established),
+      Ok(None) => continue,
+      Err(_) => return None,
+    }
   }
 }
 
@@ -231,44 +309,13 @@ async fn serve_peer_probes(mut endpoint: Endpoint, local: HostId, neighbourhood:
   {}
 }
 
-/// The probe side: complete the client session's handshake and, each protocol period, probe the peer, fold
-/// the outcome, and fold the detector's converged view into the shard's `FleetNode` (§4.8). While the
-/// session is alive a successful probe reuses it (continuous packet numbers); a timeout drops it and the
-/// loop keeps ticking so the suspicion ages to death (the peer is unreachable — the single accepted session
-/// cannot be re-established), driving the takeover the moment the fleet retires it.
-async fn probe_peer(
-  identity: Identity,
-  name: String,
-  peer: FleetPeer,
-  local: HostId,
-  neighbourhood: usize,
-) {
-  let peer_host = peer.host;
+/// The probe side (its session already established): each protocol period, probe the peer, fold the outcome,
+/// and fold the detector's converged view into the shard's `FleetNode` (§4.8). While the session is alive a
+/// successful probe reuses it (continuous packet numbers); a timeout drops it and the loop keeps ticking so
+/// the suspicion ages to death (the peer is unreachable — the single session cannot be re-established),
+/// driving the takeover the moment the fleet retires it.
+async fn probe_peer(endpoint: Endpoint, peer_host: HostId, local: HostId, neighbourhood: usize) {
   let budget = probe_budget();
-
-  // Establish the client session, re-dialing from a fresh socket until the peer's accept side answers (the
-  // handshake is not retransmitted, so a lost initial packet at startup is recovered only by re-dialing).
-  let endpoint = loop {
-    let Ok(socket) = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)) else {
-      return;
-    };
-    let Ok(client) = Endpoint::client(
-      socket,
-      peer.address,
-      &identity,
-      &peer.certificate,
-      &name,
-      FLEET_FRAME_CAP,
-    ) else {
-      return;
-    };
-    match establish_bounded(client, budget).await {
-      Ok(Some(established)) => break established,
-      Ok(None) => continue,
-      Err(_) => return,
-    }
-  };
-
   let timing = detector_timing(neighbourhood);
   let fanout = usize::try_from(timing.gossip_transmits).unwrap_or(1);
   let mut detector = Detector::new(local, timing);
@@ -318,6 +365,136 @@ async fn probe_peer(
       // The peer is retired and its objects reassigned in the routing view; phase-one recovery and serving
       // the taken-over head under the new epoch are owed. Nothing more to probe — end the loop.
       return;
+    }
+    futures::sleep(HEARTBEAT_NS).await;
+  }
+}
+
+/// The record serve side (§4.8 "records are sent to all candidates"): complete the accepted session's
+/// handshake and loop accepting the peer's register record commits into a holder acceptor for the peer's
+/// objects — this node backs the peer as a candidate holder. The acceptor's authority names the peer as the
+/// owner under the configuration's generation, so a record from the peer is authorized and one from a stale
+/// writer is refused. A serve failure (the peer's connection dropped) ends the loop.
+async fn serve_peer_records(mut endpoint: Endpoint, local: HostId, peer_host: HostId) {
+  if endpoint.establish().await.is_err() {
+    return;
+  }
+  let Some(authority) = state::with_state(|s| Authority {
+    generation: s.fleet.configuration().version,
+    owner: peer_host,
+  }) else {
+    return;
+  };
+  let mut acceptor = Acceptor::new(local, authority);
+  while serve_record(&mut endpoint, &mut acceptor).await.is_ok() {}
+}
+
+/// A volume head this node owns that is not yet region-placed, with everything the register commit needs.
+struct Head {
+  object: ObjectId,
+  record: Record,
+  candidates: Vec<HostId>,
+  quorum: Quorum,
+}
+
+/// The volume heads this node owns that are not yet region-placed (§4.8): for each volume on the shard whose
+/// object has no stored quorum placement, the record to commit (under the configuration's epoch and
+/// generation) and the candidates and quorum the configuration computes for it. Read under `with_state`.
+fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
+  let config = state.fleet.configuration();
+  let mut heads = Vec::new();
+  for (_, slot) in state.volumes.iter() {
+    let object = ObjectId(slot.id.bytes);
+    if state.placed_heads.contains_key(&object) {
+      continue;
+    }
+    let placement = config.place(object);
+    heads.push(Head {
+      object,
+      record: Record {
+        owner: local,
+        object,
+        sequence: 0,
+        epoch: config.host_epoch,
+        generation: config.version,
+        value: slot.id.bytes.to_vec(),
+      },
+      candidates: placement.candidates,
+      quorum: config.quorum,
+    });
+  }
+  heads
+}
+
+/// The record ship side (§4.8 "records are sent to all candidates; committed at `f + 1`"): each protocol
+/// period this node replicates its unplaced volume heads to the peer holder, recording the acknowledging
+/// [`Placement`] in `placed_heads` so the placement authority the verbs read reports the head region-placed.
+/// A head already at a quorum placement is skipped (idempotent), so a placed head costs one map lookup.
+///
+/// The peer session is dialed **lazily** — only once there is a head to place — and then reused across
+/// commits (its packet-number space stays continuous, RFC 9000 §12.3). Dialing at first use, rather than at
+/// boot, is what keeps the session warm from its handshake through its first commit: a session dialed at
+/// boot sits idle across the whole formation window (seconds of probing before the first volume is
+/// provisioned), and an idle-then-reused session's first request stalls — the reused socket's first receive
+/// after the long gap does not deliver the reply. A commit that loses its session (a straggler timeout drops
+/// it) clears it, so the next period with an unplaced head redials. Reconnecting after a mid-run loss also
+/// needs the peer's serve side to re-accept the new session, which — like the transport's other reconnection
+/// work — is owed; so a lost session is retried, but a peer that has torn its accept side down is reached
+/// only once it rebuilds.
+async fn ship_records(
+  identity: Identity,
+  name: String,
+  record_address: SocketAddrV4,
+  certificate: CertificateDer<'static>,
+  peer_host: HostId,
+  local: HostId,
+  budget: CommitBudget,
+) {
+  let Some(authority) = state::with_state(|s| Authority {
+    generation: s.fleet.configuration().version,
+    owner: local,
+  }) else {
+    return;
+  };
+  let mut owner_acceptor = Acceptor::new(local, authority);
+  // Dial the peer's record session at boot, alongside the probe session, so the peer's serve side completes
+  // its handshake now rather than waiting idle for a first use seconds later (an idle accept socket does not
+  // wake promptly on a datagram that arrives long after its handshake — the same reuse stall the commit
+  // itself would hit). The session then stays open, reused across commits; a commit that loses it redials.
+  let mut session = dial(&identity, &name, record_address, &certificate, budget).await;
+  loop {
+    let work = state::with_state(|s| unplaced_heads(s, local)).unwrap_or_default();
+    // A session lost to a straggler timeout is redialed the next period there is a head to place.
+    if !work.is_empty() && session.is_none() {
+      session = dial(&identity, &name, record_address, &certificate, budget).await;
+    }
+    for head in work {
+      let Some(endpoint) = session.take() else {
+        // No live session (dial failed, or a prior head this period lost it): leave the rest for a retry.
+        break;
+      };
+      let committed = commit_record(
+        local,
+        &mut owner_acceptor,
+        &head.candidates,
+        &head.record,
+        head.quorum,
+        vec![(peer_host, endpoint)],
+        budget,
+      )
+      .await;
+      // Keep the holder's connection for the next commit when it replied; a lost one clears the session so
+      // the next period redials.
+      session = committed
+        .reusable
+        .into_iter()
+        .find(|(host, _)| *host == peer_host)
+        .map(|(_, endpoint)| endpoint);
+      if let Ok(placement) = committed.outcome {
+        state::with_state(|s| {
+          s.placed_heads.insert(head.object, placement);
+        });
+      }
     }
     futures::sleep(HEARTBEAT_NS).await;
   }

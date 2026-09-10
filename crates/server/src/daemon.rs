@@ -316,6 +316,35 @@ impl Daemon {
       .unwrap_or_default()
   }
 
+  /// Whether this daemon's fleet has **region-placed** the head of `object` (§4.8): its control-shard
+  /// membership loop replicated the head's record to the candidate holders and recorded a quorum of
+  /// acknowledgements. A test or an operator reads this to observe cross-node replication; `false` if it is
+  /// not yet placed, the daemon is stopping, or it is a laptop (no fleet loop runs). Runs a one-shot query
+  /// on the control shard, bounded by the liveness budget.
+  pub fn fleet_head_placed(&self, object: slates_db::register::ObjectId) -> bool {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied()) else {
+      return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        let placed = state::with_state(|s| {
+          let quorum = s.fleet.configuration().quorum;
+          s.placed_heads
+            .get(&object)
+            .is_some_and(|placement| placement.placed(quorum))
+        })
+        .unwrap_or(false);
+        let _ = tx.send(placed);
+      })
+      .is_err()
+    {
+      return false;
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .unwrap_or(false)
+  }
+
   /// The shards.
   pub fn shards(&self) -> &[ShardId] {
     &self.shards
@@ -551,6 +580,7 @@ fn init_shard(
     telemetry: slates_wire::observe::SpanSink::with_capacity(telemetry_capacity),
     next_span_id: 1,
     current_request: slates_wire::request::RequestId::default(),
+    placed_heads: std::collections::BTreeMap::new(),
   };
   let rebuilt = verbs::rebuild_recovered(&mut state);
   if rebuilt.skipped > 0 {

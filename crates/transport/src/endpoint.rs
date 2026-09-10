@@ -9,13 +9,15 @@
 //! with that header as associated data, and **header protection** (§5.4) masking the first byte and the
 //! packet-number field); and reliable single-stream delivery driven by the [`Connection`] —
 //! acknowledgements flow, and a transfer is complete only when every packet is acknowledged. Over the
-//! lossless simulation fabric no retransmission is needed; the loss-recovery and probe paths are proven
-//! by the `connection` oracle, and driving the probe from a real timeout is owed with the runtime timer.
-//! Flow-control (per-stream and connection-wide credit), congestion control, and multi-stream
-//! multiplexing are enforced by the [`Connection`] this drives; RTT is estimated here (this end holds
-//! the clock — see [`Endpoint::smoothed_rtt`]). Remaining connection work: connection IDs, an MTU budget
-//! (several frames per packet), and driving the tail-loss probe from the estimated PTO on a timed
-//! receive. The `Arc` here is rustls's config (D-8 exception 2), in `crate::handshake`.
+//! lossless simulation fabric no retransmission is needed; over a real datagram socket a lost packet or a
+//! lost acknowledgement is recovered by the tail-loss probe — every reliable exchange waits for the next
+//! packet only up to the estimated PTO ([`Endpoint::receive_or_probe`], RFC 9002 §6.2.1) and, on a
+//! timeout, retransmits the oldest in-flight packet ([`Connection::probe`]) — the loss-recovery and probe
+//! paths themselves are proven by the `connection` oracle. Flow-control (per-stream and connection-wide
+//! credit), congestion control, and multi-stream multiplexing are enforced by the [`Connection`] this
+//! drives; RTT is estimated here (this end holds the clock — see [`Endpoint::smoothed_rtt`]). Remaining
+//! connection work: connection IDs and an MTU budget (several frames per packet). The `Arc` here is
+//! rustls's config (D-8 exception 2), in `crate::handshake`.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -230,7 +232,7 @@ impl Endpoint {
   }
 
   /// The smoothed round-trip time this end has estimated (nanoseconds), zero before any acknowledgement
-  /// yields a sample (RFC 9002 §5.3). A live exchange feeds it through [`Endpoint::receive_into`].
+  /// yields a sample (RFC 9002 §5.3). A live exchange feeds it through [`Endpoint::ingest`].
   pub fn smoothed_rtt(&self) -> u64 {
     self.rtt.smoothed_rtt()
   }
@@ -256,15 +258,28 @@ impl Endpoint {
   /// not come), and otherwise receives the peer's next flight.
   pub async fn establish(&mut self) -> Result<(), EndpointError> {
     let mut buf = [0u8; 2048];
+    let mut sent_at: Option<Instant> = None;
     for _ in 0..HANDSHAKE_TURN_CEILING {
       let out = self.drain_handshake();
       if !out.is_empty() {
         self.socket.send_to(&out, self.peer)?;
+        sent_at = Some(Instant::now());
       }
       if !self.quic.is_handshaking() && self.keys.is_some() {
         return Ok(());
       }
       let (n, from) = self.socket.recv_from(&mut buf).await?;
+      // The handshake's own round trip seeds the RTT estimator (RFC 9002 §5.1: the handshake gives the
+      // first sample): the time from this end's last flight to the peer's reply. Without it the probe
+      // timeout the reliable exchanges arm against would stay at the conservative initial RTT (two thirds
+      // of a second) until the first post-handshake acknowledgement — far too coarse for a loopback or
+      // LAN commit to recover a dropped packet within its budget. A coalesced or split flight makes this
+      // an approximation, which is all a seed needs to be.
+      if let Some(flight) = sent_at.take() {
+        let sample = u64::try_from(Instant::now().saturating_duration_since(flight).as_nanos())
+          .unwrap_or(u64::MAX);
+        self.rtt.on_sample(sample, 0);
+      }
       // A server built by `accept` adopts the source of the first datagram it hears as its peer, so its
       // reply (drained and sent on the next turn) reaches the client that dialed it. Only the first
       // receive sets it; thereafter the peer is pinned.
@@ -310,15 +325,56 @@ impl Endpoint {
     Ok(())
   }
 
-  /// Receives one protected packet, reconstructs its number against the persistent decode cursor
-  /// (advancing it), feeds it to the connection, and folds an RTT sample in when the acknowledgement
-  /// newly frees a packet (RFC 9002 §5.1: the round trip is now minus that packet's send time).
-  async fn receive_into(&mut self) -> Result<(), EndpointError> {
+  /// Receives one packet, but waits at most `timeout_ns` for it: the socket receive is raced against a
+  /// timer, and `Ok(false)` is returned if the timer wins (no packet arrived in time). This is the
+  /// loss-recovery clock the reliable exchanges ([`request`], [`serve_once`], [`send_stream`],
+  /// [`recv_stream`]) drive — over the lossless simulation fabric a packet always arrives, but over a real
+  /// datagram socket a lost packet (or a lost acknowledgement) would otherwise stall the exchange forever,
+  /// since a dropped tail leaves no later acknowledgement to expose the gap. On a timeout the caller
+  /// probes ([`Connection::probe`]) to retransmit the oldest in-flight packet and flushes it. The timer
+  /// also re-drives the receive itself: a fresh `recv_from` on the next call reads any datagram already
+  /// delivered to the socket, so the exchange makes progress even if a single readiness wake was missed.
+  ///
+  /// [`request`]: Endpoint::request
+  /// [`serve_once`]: Endpoint::serve_once
+  /// [`send_stream`]: Endpoint::send_stream
+  /// [`recv_stream`]: Endpoint::recv_stream
+  async fn receive_within(&mut self, timeout_ns: u64) -> Result<bool, EndpointError> {
     let mut buf = [0u8; 2048];
-    let (n, _from) = self.socket.recv_from(&mut buf).await?;
+    let outcome = {
+      let mut recv = std::pin::pin!(self.socket.recv_from(&mut buf));
+      let mut timer = std::pin::pin!(slates_rt::futures::sleep(timeout_ns));
+      std::future::poll_fn(|cx| {
+        // Prefer a delivered packet over the timer when both are ready, so a live exchange never trades a
+        // received packet for a spurious retransmission.
+        if let std::task::Poll::Ready(received) = std::future::Future::poll(recv.as_mut(), cx) {
+          return std::task::Poll::Ready(Some(received));
+        }
+        if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
+          return std::task::Poll::Ready(None);
+        }
+        std::task::Poll::Pending
+      })
+      .await
+    };
+    match outcome {
+      Some(Ok((n, _from))) => {
+        self.ingest(&buf[..n])?;
+        Ok(true)
+      }
+      Some(Err(e)) => Err(e.into()),
+      None => Ok(false),
+    }
+  }
+
+  /// Folds one received datagram into the connection: reconstructs its packet number against the persistent
+  /// decode cursor (advancing it), feeds its frames to the connection, and folds an RTT sample in when the
+  /// acknowledgement newly frees a packet (RFC 9002 §5.1: the round trip is now minus that packet's send
+  /// time).
+  fn ingest(&mut self, datagram: &[u8]) -> Result<(), EndpointError> {
     let now = Instant::now();
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
-    let (pn, frames) = unprotect_packet(keys, self.rx_largest, &buf[..n])?;
+    let (pn, frames) = unprotect_packet(keys, self.rx_largest, datagram)?;
     self.rx_largest = self.rx_largest.max(pn);
     if let Some(largest) = self.conn.handle_incoming(pn, &frames) {
       if let Some(sent_at) = self.send_times.get(&largest) {
@@ -329,6 +385,25 @@ impl Endpoint {
       }
       // Prune the send times the acknowledgement covered, bounding the map to the in-flight window.
       self.send_times.retain(|&sent_pn, _| sent_pn > largest);
+    }
+    Ok(())
+  }
+
+  /// The probe timeout to arm a stalled reliable exchange against (RFC 9002 §6.2.1), from this end's RTT
+  /// estimator; before any sample it is twice the initial RTT, so a lost first packet is still recovered.
+  /// This dialect carries no peer ack-delay, so the max-ack-delay term is zero.
+  fn probe_timeout(&self) -> u64 {
+    self.rtt.pto(0)
+  }
+
+  /// Waits for the next packet within the probe timeout; on a timeout, drives tail-loss recovery by probing
+  /// the oldest in-flight packet ([`Connection::probe`]) so the caller's next flush retransmits it. The
+  /// reliable exchanges call this in place of a bare receive, so a lost packet or a lost acknowledgement —
+  /// which a real datagram socket can drop and which no later acknowledgement would expose — cannot stall
+  /// them. A probe with nothing in flight is a no-op, so a timeout while merely waiting on the peer is free.
+  async fn receive_or_probe(&mut self) -> Result<(), EndpointError> {
+    if !self.receive_within(self.probe_timeout()).await? {
+      self.conn.probe();
     }
     Ok(())
   }
@@ -346,7 +421,7 @@ impl Endpoint {
         self.conn.forget_stream(stream_id);
         return Ok(());
       }
-      self.receive_into().await?;
+      self.receive_or_probe().await?;
     }
   }
 
@@ -357,7 +432,7 @@ impl Endpoint {
   pub async fn recv_stream(&mut self, stream_id: u64) -> Result<Vec<u8>, EndpointError> {
     let mut received = Vec::new();
     loop {
-      self.receive_into().await?;
+      self.receive_or_probe().await?;
       // Drain *before* flushing: reading slides the flow-control window forward, and the flush that
       // follows advertises credit reflecting what was just read. Flushing first would advertise a
       // round-stale window and stall a transfer larger than one window at the window boundary.
@@ -397,7 +472,7 @@ impl Endpoint {
         self.conn.forget_stream(stream_id);
         return Ok(reply);
       }
-      self.receive_into().await?;
+      self.receive_or_probe().await?;
     }
   }
 
@@ -415,7 +490,7 @@ impl Endpoint {
     // rides one stream, so its id is the one that arrives.
     let mut request = Vec::new();
     let request_id = loop {
-      self.receive_into().await?;
+      self.receive_or_probe().await?;
       let ids = self.conn.recv_stream_ids();
       for &id in &ids {
         request.extend_from_slice(&self.conn.read_stream(id));
@@ -441,7 +516,7 @@ impl Endpoint {
         self.conn.forget_stream(request_id);
         return Ok(());
       }
-      self.receive_into().await?;
+      self.receive_or_probe().await?;
     }
   }
 }
