@@ -41,12 +41,24 @@ pub const REORDER_THRESHOLD: u64 = 3;
 #[derive(Debug, Default)]
 pub struct AckGenerator {
   received: BTreeSet<u64>,
+  /// The highest packet number ACK-of-ACK has confirmed and dropped from `received`. A sender's packet
+  /// numbers only ever increase (a retransmission rides a *fresh* number, RFC 9000 §12.3), so any number
+  /// at or below this floor was seen and processed already — it is a duplicate even though it is no
+  /// longer in the bounded set. Without it, a network duplicate of a confirmed packet would look new.
+  confirmed_floor: Option<u64>,
 }
 
 impl AckGenerator {
   /// A generator that has seen nothing yet.
   pub fn new() -> AckGenerator {
     AckGenerator::default()
+  }
+
+  /// Whether packet number `pn` has already been received and processed — either still tracked in the
+  /// set, or at/below the confirmed floor (dropped by ACK-of-ACK but, since numbers only increase, never
+  /// legitimately reused). A duplicate's frames must not be applied again (RFC 9000 §12.3).
+  pub fn is_duplicate(&self, pn: u64) -> bool {
+    self.received.contains(&pn) || self.confirmed_floor.is_some_and(|floor| pn <= floor)
   }
 
   /// Records a received packet number.
@@ -56,9 +68,15 @@ impl AckGenerator {
 
   /// Confirms the peer has received an acknowledgement of ours covering packets up to `largest` (RFC
   /// 9000 §13.2.4): those packets need never be acknowledged again — the peer has freed them and will
-  /// not ask for them — so drop them, which is what bounds this set. A later duplicate of a dropped
-  /// packet is simply recorded and acknowledged again (idempotent), so dropping is always safe.
+  /// not ask for them — so drop them, which is what bounds this set. The confirmed floor advances to
+  /// `largest` so a later network duplicate of a dropped packet is recognized as the duplicate it is
+  /// ([`is_duplicate`](AckGenerator::is_duplicate)) rather than processed afresh.
   pub fn confirm(&mut self, largest: u64) {
+    self.confirmed_floor = Some(
+      self
+        .confirmed_floor
+        .map_or(largest, |floor| floor.max(largest)),
+    );
     // Keep everything strictly above `largest`; drop `<= largest`.
     self.received = self.received.split_off(&largest.saturating_add(1));
   }
@@ -318,6 +336,32 @@ mod tests {
   /// Shape: an additional-range budget larger than any gap these small tests create, so the ACK
   /// reports every run (the cap itself is exercised by `the_ack_range_budget_bounds_the_frame`).
   const AMPLE_RANGES: usize = 8;
+
+  /// A packet number is a duplicate once it has been received (RFC 9000 §12.3), and stays a duplicate
+  /// after ACK-of-ACK prunes it from the tracked set: the confirmed floor recognizes it, since a
+  /// sender's numbers only ever increase and one at or below the floor can only be a repeat. A genuinely
+  /// higher, unseen number is not a duplicate.
+  #[test]
+  fn a_seen_or_confirmed_packet_number_is_a_duplicate() {
+    let mut acks = AckGenerator::new();
+    assert!(!acks.is_duplicate(5), "unseen before it arrives");
+    acks.record(5);
+    assert!(acks.is_duplicate(5), "seen and still tracked");
+
+    // ACK-of-ACK confirms up to 5 and drops it from the tracked set — yet 5, and anything below, remain
+    // duplicates: the sender will never issue a number that low again (a retransmit rides a fresh one).
+    acks.confirm(5);
+    assert_eq!(acks.tracked(), 0, "confirm pruned the tracked set");
+    assert!(
+      acks.is_duplicate(5),
+      "still a duplicate below the confirmed floor"
+    );
+    assert!(
+      acks.is_duplicate(2),
+      "anything at or below the floor is a duplicate"
+    );
+    assert!(!acks.is_duplicate(6), "a higher, unseen number is new");
+  }
 
   /// The ACK reports *every* contiguous run of received packet numbers as multiple ranges (RFC 9000
   /// §19.3), so a packet received below a gap is acknowledged, not only the top run.

@@ -90,6 +90,10 @@ pub struct Connection {
   /// acknowledges such a packet, the entry is consumed to bound the receive-side ack set. Entries are
   /// dropped on acknowledgement or loss, so the map stays within the in-flight ack-bearing packets.
   sent_acks: BTreeMap<u64, u64>,
+  /// Received packets discarded as duplicates of a packet number already processed (RFC 9000 §12.3) —
+  /// the non-vacuity counter proving the dedup path runs (a redelivered datagram never re-applies its
+  /// frames).
+  duplicates: u64,
 }
 
 impl Connection {
@@ -118,6 +122,7 @@ impl Connection {
       // `FlowController::connection_max` with nothing consumed); both ends derive the same one (R8).
       peer_max_data: window_ahead,
       sent_acks: BTreeMap::new(),
+      duplicates: 0,
     }
   }
 
@@ -255,6 +260,16 @@ impl Connection {
   /// sample point (RFC 9002 §5.1). The caller, which holds the clock, measures the round trip as `now`
   /// minus that packet's send time and folds it into its [`crate::rtt::RttEstimator`].
   pub fn handle_incoming(&mut self, pn: u64, frames: &[Frame]) -> Option<u64> {
+    // Discard a packet whose number was already processed (RFC 9000 §12.3): its frames must not be
+    // applied twice. A retransmission always rides a *fresh* number (a probe takes `next_pn`), so a
+    // repeated number is never a re-request but a true duplicate the network delivered twice — the
+    // shape that let a redelivered probe reply read as a live ack before this. Dropped whole: no stream
+    // re-offer, no acknowledgement re-processed, no RTT sample, no loss pass, and no re-acknowledgement
+    // owed (the peer holds our original ack — it did not retransmit, the network duplicated).
+    if self.acks.is_duplicate(pn) {
+      self.duplicates = self.duplicates.saturating_add(1);
+      return None;
+    }
     self.acks.record(pn);
     let mut ack_eliciting = false;
     let mut newly_acked_largest: Option<u64> = None;
@@ -312,7 +327,18 @@ impl Connection {
     if ack_eliciting {
       self.ack_owed = true;
     }
-    // A just-processed acknowledgement may have opened a gap past the reorder threshold.
+    self.detect_and_queue_losses();
+    newly_acked_largest
+  }
+
+  /// After an acknowledgement is processed, runs loss detection and queues what it declares lost for
+  /// retransmission: a gap past the reorder threshold declares its packets lost (their bytes leave the
+  /// congestion window as a loss event, RFC 9002 §7.3.1), those packets' ACK-of-ACK entries are dropped
+  /// (a lost packet is never acknowledged, so its entry would otherwise linger and its acknowledgement
+  /// content is regenerated in the retransmission), and the ACK-of-ACK map is bounded to the recent
+  /// unacknowledged window (an entry at or below the peer's largest acknowledged that survived the
+  /// confirm and loss passes is a probed or abandoned packet the peer will never acknowledge).
+  fn detect_and_queue_losses(&mut self) {
     let lost = self.sent.take_lost();
     if let Some(highest_pn) = lost.highest_pn {
       let lost_bytes: u64 = lost.frames.iter().map(tracked_bytes).sum();
@@ -322,20 +348,13 @@ impl Connection {
         .congestion
         .on_loss(lost_bytes, highest_pn, largest_sent);
     }
-    // Drop the ACK-of-ACK bookkeeping for lost packets: a lost packet is never acknowledged, so its
-    // entry would otherwise linger; its acknowledgement content is regenerated in the retransmission.
     for pn in &lost.pns {
       self.sent_acks.remove(pn);
     }
-    // Bound the ACK-of-ACK map to the recent unacknowledged window: an entry at or below the peer's
-    // largest acknowledged that survived the confirm and loss passes is a probed or abandoned packet the
-    // peer will never acknowledge, so drop it. Later acknowledgements cover the same received packets, so
-    // no receive-set pruning is lost.
     if let Some(largest_acked) = self.sent.largest_acked() {
       self.sent_acks = self.sent_acks.split_off(&largest_acked);
     }
     self.queue_retransmit(lost.frames);
-    newly_acked_largest
   }
 
   /// Retransmits the oldest in-flight packet when the connection has stalled with packets still in
@@ -470,6 +489,13 @@ impl Connection {
   /// path actually ran, so a test over a lossy channel cannot pass with a dead retransmit path.
   pub fn retransmitted(&self) -> u64 {
     self.retransmitted
+  }
+
+  /// How many received packets were discarded as duplicates of an already-processed packet number (RFC
+  /// 9000 §12.3) — the non-vacuity counter proving the dedup path runs, so a redelivered datagram's
+  /// frames are provably never applied twice.
+  pub fn duplicates_discarded(&self) -> u64 {
+    self.duplicates
   }
 
   /// The largest packet number the peer has acknowledged (for sizing the truncated packet number the
@@ -705,6 +731,47 @@ mod tests {
       "no frame of the forgotten stream is retransmitted"
     );
     assert_eq!(sender.retransmitted(), retransmitted_before);
+  }
+
+  /// AC (§4.10a §8, RFC 9000 §12.3): a packet whose number was already processed is discarded — its
+  /// frames are not applied again and it owes no fresh acknowledgement. Retransmissions ride fresh
+  /// numbers, so a repeated number is always a network duplicate (the redelivered probe reply that used
+  /// to read as a live ack was exactly this). Non-vacuous: the duplicate counter moves, and the receiver
+  /// that owed an acknowledgement after the first receipt owes none after the duplicate.
+  #[test]
+  fn a_duplicate_packet_number_is_discarded_not_processed_again() {
+    let window = initial_receive_window(FRAME_CAP);
+    let mut sender = Connection::new(window);
+    let mut receiver = Connection::new(window);
+    sender.open(7, &stream_content(0xAB, 40));
+    let (pn, frames) = sender
+      .poll_transmit(FRAME_CAP)
+      .expect("the request goes out");
+
+    // First receipt: this packet's stream bytes are delivered and an acknowledgement becomes owed.
+    assert_eq!(receiver.handle_incoming(pn, &frames), None);
+    assert!(
+      !receiver.read_stream(7).is_empty(),
+      "the first receipt delivered the packet's stream bytes"
+    );
+    assert_eq!(receiver.duplicates_discarded(), 0);
+    assert!(
+      receiver.poll_transmit(FRAME_CAP).is_some(),
+      "the first receipt owes an acknowledgement"
+    );
+
+    // The very same packet number arrives again (a network duplicate): discarded and counted, it
+    // delivers no further bytes and owes no new acknowledgement — it created no work at all.
+    assert_eq!(receiver.handle_incoming(pn, &frames), None);
+    assert_eq!(receiver.duplicates_discarded(), 1);
+    assert!(
+      receiver.read_stream(7).is_empty(),
+      "the duplicate delivered no further bytes"
+    );
+    assert!(
+      receiver.poll_transmit(FRAME_CAP).is_none(),
+      "the duplicate owed no fresh acknowledgement"
+    );
   }
 
   /// AC (§4.10a §8): three streams multiplexed over one connection each arrive exactly, in order, with
