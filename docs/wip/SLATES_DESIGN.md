@@ -1785,7 +1785,11 @@ needed to restore a host's copies within the recovery budget and from the accept
 probability under coincident failures (Copysets); candidate holders per object are rendezvous
 over the neighbourhood; a neighbourhood change moves only the objects whose candidates changed,
 add before remove. The copyset count is computed at every configuration change and compared with
-its bound; exceeding it is a placement bug, not a tripwire.
+its bound; exceeding it is a placement bug, not a tripwire. (Implemented: `Configuration::copyset_count`
+is the actual `owner_copysets` partition, `coincident_loss` its `#copysets·C(F,R)/C(H,R)` loss under a
+coincident failure of `F` hosts, and `within_loss_bound(ε, F)` the check — computable from any
+configuration; the operator's accepted `ε` and the coincident-failure size are the durability policy that
+gates a refusal, the last wiring owed.)
 
 **Mirroring.** Every committed record and its content is shipped to the mirror region's
 neighbourhood of the owner asynchronously, in epoch and sequence order, by the same put

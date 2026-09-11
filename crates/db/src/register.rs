@@ -1258,6 +1258,39 @@ impl Configuration {
     )
   }
 
+  /// The number of distinct **copysets** this owner's objects spread over under the current neighbourhood
+  /// and failure domains (§4.8, D-14): the actual [`owner_copysets`] partition — one at the candidate
+  /// floor, linear in the scatter width above it, and larger when the domains are too poor to fill the
+  /// copysets. The count a durability check reads at every configuration change (research §3.1).
+  pub fn copyset_count(&self) -> usize {
+    let with_domains: Vec<(HostId, DomainId)> = self
+      .neighbourhood
+      .iter()
+      .map(|host| (*host, self.domains.get(host).copied().unwrap_or(host.0)))
+      .collect();
+    owner_copysets(self.owner, &with_domains, self.quorum).len()
+  }
+
+  /// The probability that a coincident failure of `failed` hosts among the neighbourhood loses some object:
+  /// `#copysets · C(failed, R) / C(H, R)` with `H` the neighbourhood size and `R = f + 1` content copies
+  /// (research §3.1; [A: Cidon et al., ATC 2013]). Monotone in the copyset count at a fixed neighbourhood
+  /// size, so the bounded, linear-count, domain-distinct neighbourhood is the low-loss one; at `f = 0` (the
+  /// laptop) it is the owner's own loss.
+  pub fn coincident_loss(&self, failed: u64) -> f64 {
+    let hosts = u64::try_from(self.neighbourhood.len()).unwrap_or(u64::MAX);
+    let copysets = u64::try_from(self.copyset_count()).unwrap_or(u64::MAX);
+    let copies = u64::from(self.quorum.f).saturating_add(1);
+    coincident_loss_probability(copysets, hosts, failed, copies)
+  }
+
+  /// Whether the configuration keeps its coincident-loss probability within the operator's accepted
+  /// `epsilon` under a coincident failure of `failed` hosts (§4.8: the copyset count checked against its
+  /// durability bound at every configuration change; a breach is a recovery-vs-durability conflict to
+  /// resolve — more copies, more bandwidth, or tighter failure domains — never a silent over-scatter).
+  pub fn within_loss_bound(&self, epsilon: f64, failed: u64) -> bool {
+    self.coincident_loss(failed) <= epsilon
+  }
+
   /// Whether the region scope is placed for `placement` under this configuration.
   pub fn region_placed(&self, placement: &Placement) -> bool {
     placement.placed(self.quorum)
@@ -1763,6 +1796,52 @@ mod tests {
     assert!(
       together,
       "without declared domains 2 and 3 co-hold — so the domain constraint is what forbids it"
+    );
+  }
+
+  /// AC (§4.8, D-14): a configuration reports its copyset count and coincident-loss probability and checks
+  /// the loss against an accepted bound — the durability check the design runs at every configuration
+  /// change. Poorer failure domains at the same size make more, shorter copysets and at least as high a
+  /// loss (the recovery-vs-durability trade the check surfaces), never a silent over-scatter.
+  #[test]
+  fn a_configuration_reports_its_copyset_count_and_checks_the_loss_bound() {
+    let owner = HostId(1);
+    let floor = Configuration {
+      version: 0,
+      owner,
+      host_epoch: FIRST_EPOCH,
+      neighbourhood: vec![owner, HostId(2), HostId(3)],
+      domains: std::collections::BTreeMap::new(),
+      quorum: Quorum { f: 1 },
+      has_mirror: false,
+    };
+    assert_eq!(floor.copyset_count(), 1, "the floor neighbourhood is one copyset");
+    assert!(floor.within_loss_bound(1.0, 2), "the floor is within an accept-all bound");
+
+    // Same neighbourhood size, poorer failure domains: the four co-holders share one domain, so no two can
+    // co-hold — the greedy makes four short copysets instead of two, a higher coincident loss.
+    let rich = Configuration {
+      neighbourhood: (1..=5u64).map(HostId).collect(),
+      ..floor.clone()
+    };
+    let one_domain: std::collections::BTreeMap<HostId, DomainId> =
+      (2..=5u64).map(|h| (HostId(h), 99)).collect();
+    let poor = Configuration {
+      domains: one_domain,
+      ..rich.clone()
+    };
+    assert!(
+      poor.copyset_count() > rich.copyset_count(),
+      "poorer domains make more, shorter copysets at the same size"
+    );
+    assert!(
+      poor.coincident_loss(2) >= rich.coincident_loss(2),
+      "more copysets at the same neighbourhood size is at least as high a coincident loss"
+    );
+    assert!(poor.coincident_loss(2) > 0.0, "the poor configuration can lose data");
+    assert!(
+      !poor.within_loss_bound(0.0, 2),
+      "a zero accepted-loss bound rejects a configuration that can lose data"
     );
   }
 
