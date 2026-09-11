@@ -248,6 +248,87 @@ pub fn candidates_for(
   chosen
 }
 
+/// A host's **failure domain** — the node in the failure-domain tree (§4.8: thread, process, host, rack,
+/// zone, region) at the level replication spreads across, typically a rack. Two hosts in the same domain
+/// share a fate (a rack power loss), so a copyset must not put two copies in one domain, or a single domain
+/// failure could take a whole copyset.
+pub type DomainId = u64;
+
+/// The **fixed copysets** an owner's objects place onto within its neighbourhood, the Copyset Replication
+/// construction restricted to distinct failure domains ("derived approach without loss",
+/// `research/metadata-replication.md` §3.1; [A: Cidon et al., ATC 2013]). Each copyset is the owner plus up
+/// to `2f` co-holders drawn from **distinct** failure domains (none sharing the owner's, since the owner is
+/// in every copyset), so a candidate set is `2f + 1` across `2f + 1` domains and no single domain failure
+/// loses more than one copy. The neighbourhood's co-holders are partitioned across `≈⌈|co-holders|/2f⌉`
+/// copysets — a count **linear** in the scatter width — rather than the `Θ(S^(2f))` an object-by-object
+/// rendezvous over the raw hosts would make. Deterministic: every host builds the same copysets from the
+/// same neighbourhood, so an object routes to its holders with no directory. At `f = 0` the only copyset is
+/// the owner alone (the laptop degenerate). A neighbourhood too domain-poor to fill `2f` distinct domains
+/// yields shorter copysets (fewer copies) — a real deficiency the copyset-count/loss check surfaces, never
+/// papered over.
+pub fn owner_copysets(
+  owner: HostId,
+  neighbourhood: &[(HostId, DomainId)],
+  quorum: Quorum,
+) -> Vec<Vec<HostId>> {
+  let co_holders = quorum.candidates().saturating_sub(1); // 2f
+  if co_holders == 0 {
+    return vec![vec![owner]];
+  }
+  let owner_domain = neighbourhood
+    .iter()
+    .find(|(host, _)| *host == owner)
+    .map(|(_, domain)| *domain);
+  // Usable co-holders: neither the owner nor a host sharing the owner's domain (which could never sit in a
+  // copyset with the owner without repeating that domain).
+  let mut usable: Vec<(HostId, DomainId)> = neighbourhood
+    .iter()
+    .copied()
+    .filter(|(host, domain)| *host != owner && Some(*domain) != owner_domain)
+    .collect();
+  // A deterministic order — by domain then host id — so every node builds the same copysets.
+  usable.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.0.cmp(&b.0.0)));
+  // Greedy first-fit: each co-holder joins the first group with room that does not already hold its domain,
+  // so every group has distinct domains and the groups stay near the minimal `⌈|usable|/2f⌉`.
+  let mut groups: Vec<Vec<(HostId, DomainId)>> = Vec::new();
+  for (host, domain) in usable {
+    match groups
+      .iter_mut()
+      .find(|group| group.len() < co_holders && group.iter().all(|(_, d)| *d != domain))
+    {
+      Some(group) => group.push((host, domain)),
+      None => groups.push(vec![(host, domain)]),
+    }
+  }
+  if groups.is_empty() {
+    return vec![vec![owner]];
+  }
+  groups
+    .into_iter()
+    .map(|group| {
+      let mut copyset = vec![owner];
+      copyset.extend(group.into_iter().map(|(host, _)| host));
+      copyset
+    })
+    .collect()
+}
+
+/// The copyset `object` places onto: **rendezvous over the copysets**, not over the raw hosts — the highest
+/// rendezvous weight, keyed on a copyset's first co-holder (the owner heads every copyset, so it cannot
+/// discriminate; the co-holder groups are disjoint, so their first members are distinct keys). Deterministic
+/// and balanced across objects, so the owner's objects spread evenly over its copysets. `None` only if there
+/// are no copysets.
+pub fn copyset_for(object: ObjectId, copysets: &[Vec<HostId>]) -> Option<Vec<HostId>> {
+  copysets
+    .iter()
+    .max_by_key(|copyset| {
+      let key = copyset.get(1).or_else(|| copyset.first());
+      let weight = key.map_or(0, |host| rendezvous_weight(host.0, &object));
+      (weight, key.copied().unwrap_or(HostId(0)))
+    })
+    .cloned()
+}
+
 /// The rendezvous weight of a host for an object: a hash of the pair, so the ranking is
 /// pseudo-random per object and stable across hosts (FNV-1a over the two words; the placement
 /// research calls for a good mixer, and this is replaced by the measured one when placement is
@@ -1674,6 +1755,88 @@ mod tests {
     assert_eq!(scatter_width(100 * gb, gb, 0, 1), 3);
     // The laptop: f=0 → the floor is 1 (the host itself), and a bigger recovery need cannot lower it.
     assert_eq!(scatter_width(0, gb, 1_000_000_000, 0), 1);
+  }
+
+  /// AC (§4.8 "Placement"; `research/metadata-replication.md` §3.1): the fixed copysets are the owner plus
+  /// `2f` co-holders across **distinct** failure domains, they partition the neighbourhood's co-holders into
+  /// a **linear** count (not the per-object super-linear one), and a host sharing the owner's domain is never
+  /// a co-holder. This is the "without loss" construction — no single domain failure loses a whole copyset.
+  #[test]
+  fn the_fixed_copysets_are_distinct_domain_and_minimal() {
+    let owner = HostId(1);
+    // Owner in domain 10; four co-holders in four distinct domains; one host shares the owner's domain.
+    let neighbourhood = vec![
+      (owner, 10),
+      (HostId(2), 20),
+      (HostId(3), 30),
+      (HostId(4), 40),
+      (HostId(5), 50),
+      (HostId(6), 10), // shares the owner's domain — must never co-hold
+    ];
+    let copysets = owner_copysets(owner, &neighbourhood, Quorum { f: 1 });
+    // f=1 → 2 co-holders per copyset; four usable co-holders → 2 copysets (linear, ⌈4/2⌉).
+    assert_eq!(
+      copysets.len(),
+      2,
+      "the co-holders partition into ⌈4/2⌉ copysets"
+    );
+    let domain_of = |h: HostId| neighbourhood.iter().find(|(x, _)| *x == h).map(|(_, d)| *d);
+    let mut covered = std::collections::BTreeSet::new();
+    for copyset in &copysets {
+      assert_eq!(copyset[0], owner, "the owner heads every copyset");
+      assert_eq!(copyset.len(), 3, "2f+1 = 3 holders");
+      let domains: Vec<_> = copyset.iter().map(|h| domain_of(*h)).collect();
+      let distinct: std::collections::BTreeSet<_> = domains.iter().collect();
+      assert_eq!(
+        distinct.len(),
+        domains.len(),
+        "no copyset repeats a failure domain"
+      );
+      assert!(
+        !copyset[1..].contains(&HostId(6)),
+        "a host in the owner's domain never co-holds"
+      );
+      covered.extend(copyset[1..].iter().copied());
+    }
+    assert_eq!(
+      covered,
+      [HostId(2), HostId(3), HostId(4), HostId(5)]
+        .into_iter()
+        .collect(),
+      "every usable co-holder is covered exactly once"
+    );
+  }
+
+  /// AC (§4.8 "Placement"): `copyset_for` maps an object to exactly one of the owner's copysets,
+  /// deterministically, and spreads objects across them — rendezvous over the copysets, not the hosts.
+  #[test]
+  fn an_object_maps_to_one_copyset_deterministically_and_spread() {
+    let owner = HostId(1);
+    let neighbourhood: Vec<(HostId, DomainId)> = (0..8u64)
+      .map(|i| (HostId(i + 2), i)) // eight co-holders, each its own domain
+      .chain(std::iter::once((owner, 100)))
+      .collect();
+    let copysets = owner_copysets(owner, &neighbourhood, Quorum { f: 1 });
+    assert_eq!(copysets.len(), 4, "eight co-holders, 2 each → 4 copysets");
+    let mut hit = std::collections::BTreeSet::new();
+    for local in 0..256u64 {
+      let object = ObjectId::new(owner, local);
+      let chosen = copyset_for(object, &copysets).expect("a copyset");
+      assert_eq!(
+        copyset_for(object, &copysets).as_deref(),
+        Some(chosen.as_slice()),
+        "deterministic"
+      );
+      assert!(
+        copysets.contains(&chosen),
+        "the choice is one of the fixed copysets"
+      );
+      hit.insert(chosen);
+    }
+    assert!(hit.len() > 1, "objects spread over more than one copyset");
+    // The laptop degenerate: f=0 → one copyset, the owner alone.
+    let solo = owner_copysets(owner, &[(owner, 0)], Quorum { f: 0 });
+    assert_eq!(solo, vec![vec![owner]]);
   }
 
   /// The object a takeover test promotes. A committed head "v1" lives at sequence 0, epoch 1,
