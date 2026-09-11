@@ -189,6 +189,7 @@ fn start_sharded(this: Node, peer: Peer, shards: u16) -> Daemon {
       quorum: Quorum { f: 1 },
       peers: vec![peer.host],
       host: this.host,
+      domains: std::collections::BTreeMap::new(),
     });
   let transport = FleetTransport {
     identity: this.identity,
@@ -478,6 +479,7 @@ fn start_mesh_with(
           quorum: Quorum { f },
           peers: member_peers,
           host,
+          domains: std::collections::BTreeMap::new(),
         });
       let transport = FleetTransport {
         identity,

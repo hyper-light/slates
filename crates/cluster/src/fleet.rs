@@ -43,7 +43,9 @@
 //!
 //! Those are transport- and server-layer pieces; this authority core is confirmable on its own.
 
-use slates_db::register::{Acceptor, Authority, Configuration, HostId, ObjectId, Quorum, Record};
+use slates_db::register::{
+  Acceptor, Authority, Configuration, DomainId, HostId, ObjectId, Quorum, Record,
+};
 use slates_transport::endpoint::Endpoint;
 
 use crate::config_group::{ConfigGroup, Reconfiguration};
@@ -113,6 +115,13 @@ impl FleetNode {
   /// This node's host id — the owner of the objects it serves and the writer of their registers.
   pub fn host(&self) -> HostId {
     self.host
+  }
+
+  /// Installs the fleet's failure-domain map into the configuration group (§4.8, D-14) — see
+  /// [`ConfigGroup::set_domains`]. The daemon calls this at boot with the map the deployment manifest
+  /// declares; a laptop or an undeclared deployment leaves it empty (unique-per-host).
+  pub fn set_domains(&mut self, domains: std::collections::BTreeMap<HostId, DomainId>) {
+    self.group.set_domains(domains);
   }
 
   /// The current configuration (the authority the async register drivers carry): the owner, the host

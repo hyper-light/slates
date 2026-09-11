@@ -31,7 +31,7 @@
 use std::mem::size_of;
 
 use slates_db::register::{
-  Configuration, HostEpoch, HostId, ObjectId, Quorum, candidates_for, rendezvous_first,
+  Configuration, DomainId, HostEpoch, HostId, ObjectId, Quorum, candidates_for, rendezvous_first,
   select_neighbourhood,
 };
 
@@ -200,6 +200,15 @@ impl ConfigGroup {
   /// over-wide one).
   pub fn set_scatter(&mut self, scatter: u64) {
     self.scatter = scatter;
+  }
+
+  /// Installs the fleet's failure-domain map (§4.8, D-14) — each host's declared domain from the deployment
+  /// manifest — so placement forms copysets across distinct domains. A host absent from the map is its own
+  /// domain (unique-per-host); an empty map is the laptop and any undeclared deployment (the prior
+  /// behaviour). Set once at boot; the neighbourhood the map is read against changes with reconcile, the
+  /// domain assignment does not.
+  pub fn set_domains(&mut self, domains: std::collections::BTreeMap<HostId, DomainId>) {
+    self.configuration.domains = domains;
   }
 
   /// The solo configuration group — one voter, `owner`, `f = 0`, version zero (the laptop degenerate).

@@ -88,6 +88,9 @@ struct NodeText {
   address: SocketAddrV4,
   certificate: String,
   key: String,
+  /// The node's failure domain, if the operator declared one (`DomainId` is a `u64`). Absent = the node is
+  /// its own domain (unique-per-host), the default.
+  domain: Option<u64>,
 }
 
 /// The manifest as text values: what the JSON says, checked for shape.
@@ -132,11 +135,20 @@ fn node_text(entry: &serde_json::Value, index: usize) -> Result<NodeText, Manife
       field: format!("{path}address"),
       expected: "an IPv4 address with the base port, like `10.0.0.1:7000`",
     })?;
+  // `domain` is optional: present only for a real failure-domain topology, and then a non-negative integer.
+  let domain = match entry.get("domain") {
+    None => None,
+    Some(value) => Some(value.as_u64().ok_or_else(|| ManifestError::Field {
+      field: format!("{path}domain"),
+      expected: "a non-negative integer failure-domain id",
+    })?),
+  };
   Ok(NodeText {
     node: string_field(entry, &path, "node")?,
     address,
     certificate: string_field(entry, &path, "certificate")?,
     key: string_field(entry, &path, "key")?,
+    domain,
   })
 }
 
@@ -207,6 +219,7 @@ fn load_plan(selection: &FleetSelection) -> Result<FleetPlan, ManifestError> {
       node: node.node.clone(),
       address: node.address,
       certificate,
+      domain: node.domain,
     });
   }
   let manifest = FleetManifest {
@@ -259,6 +272,25 @@ mod tests {
     );
     assert_eq!(stated.nodes[1].certificate, "b.crt.der");
     assert_eq!(stated.nodes[1].key, "b.key.der");
+    assert_eq!(stated.nodes[1].domain, None, "no failure domain declared: unique-per-host");
+  }
+
+  /// A node may declare an optional failure domain; a non-integer one is named by its path.
+  #[test]
+  fn a_declared_domain_parses_and_a_bad_one_is_named() {
+    let with_domain = MANIFEST.replace(
+      r#""certificate": "a.crt.der", "key": "a.key.der""#,
+      r#""certificate": "a.crt.der", "key": "a.key.der", "domain": 7"#,
+    );
+    let stated = parse(&with_domain).expect("parses");
+    assert_eq!(stated.nodes[0].domain, Some(7), "the declared domain is parsed");
+    assert_eq!(stated.nodes[1].domain, None, "an undeclared node has no domain");
+
+    let bad = with_domain.replace(r#""domain": 7"#, r#""domain": "rack-1""#);
+    match parse(&bad) {
+      Err(ManifestError::Field { field, .. }) => assert_eq!(field, "nodes[0].domain"),
+      other => panic!("expected a field error for a non-integer domain, got {other:?}"),
+    }
   }
 
   /// A missing or malformed field is named by its path into the document.

@@ -700,7 +700,12 @@ fn init_shard(
   // membership into it (and the cross-node commit) are the next fleet pieces.
   let fleet = match &config.fleet {
     Some(membership) => {
-      slates_cluster::fleet::FleetNode::new(host, membership.quorum, &membership.peers)
+      let mut node =
+        slates_cluster::fleet::FleetNode::new(host, membership.quorum, &membership.peers);
+      // Install the deployment's failure-domain map so placement forms copysets across distinct domains
+      // (D-14); hosts the manifest does not place stay unique-per-host.
+      node.set_domains(membership.domains.clone());
+      node
     }
     None => slates_cluster::fleet::FleetNode::solo(host),
   };

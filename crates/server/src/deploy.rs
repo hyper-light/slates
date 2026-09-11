@@ -26,7 +26,7 @@
 // naming the TLS crate itself.
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use slates_db::HostId;
-use slates_db::register::Quorum;
+use slates_db::register::{DomainId, Quorum};
 use slates_rt::tcp::SocketAddrV4;
 use slates_transport::handshake::Identity;
 
@@ -44,6 +44,12 @@ pub struct FleetNodeEntry {
   /// The node's operator-provisioned certificate (DER): what its peers pin, and what its member id is
   /// derived from.
   pub certificate: CertificateDer<'static>,
+  /// The node's failure domain (a rack, zone or machine id the operator assigns), so placement forms
+  /// copysets across distinct domains (D-14). `None` — the default — makes the node its own domain
+  /// (unique-per-host); the operator declares one only for a real topology (co-located nodes sharing a
+  /// domain). Never derived from the address: several nodes deliberately share one host (and IP) in a test
+  /// or dev fleet, and collapsing them into one domain would leave an object no distinct-domain co-holder.
+  pub domain: Option<DomainId>,
 }
 
 /// The shared manifest, as values: the fleet's TLS name, its fault tolerance and its nodes in manifest
@@ -305,6 +311,14 @@ pub fn plan(
       certificate: peer.certificate.clone(),
     });
   }
+  // The fleet's failure-domain map: every node that declares one, keyed by member id. A node without a
+  // declaration is absent — its own domain (unique-per-host), the safe default `candidates_for` falls back
+  // to. Built from the whole manifest so any owner can form copysets across its neighbourhood's domains.
+  let domains: std::collections::BTreeMap<HostId, DomainId> = manifest
+    .nodes
+    .iter()
+    .filter_map(|n| n.domain.map(|domain| (host_id_of_certificate(&n.certificate), domain)))
+    .collect();
   let identity = Identity::from_der(entry.certificate.clone(), key);
   let pins: Vec<CertificateDer<'static>> = peers.iter().map(|p| p.certificate.clone()).collect();
   check_identity(&entry.node, &identity, &entry.certificate, &pins)?;
@@ -313,6 +327,7 @@ pub fn plan(
       quorum: manifest.quorum,
       peers: peer_hosts,
       host,
+      domains,
     },
     transport: FleetTransport {
       identity,
@@ -351,6 +366,8 @@ mod tests {
       node: node.to_owned(),
       address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
       certificate,
+      // Undeclared by default (unique-per-host); a test that exercises domains sets it explicitly.
+      domain: None,
     }
   }
 
@@ -392,6 +409,32 @@ mod tests {
       .iter()
       .position(|n| host_id_of_certificate(&n.certificate) == host)
       .expect("the host is a manifest node")
+  }
+
+  /// AC (§4.8, D-14): the plan carries each node's declared failure domain to the membership, keyed by the
+  /// certificate-derived member id, so placement forms copysets across distinct domains. A node that
+  /// declares none is absent — its own domain (unique-per-host, the default).
+  #[test]
+  fn the_plan_carries_declared_failure_domains_to_the_membership() {
+    let (mut manifest, keys) = manifest();
+    // a and b share failure domain 7 (co-located, e.g. one rack); c declares none.
+    manifest.nodes[0].domain = Some(7);
+    manifest.nodes[1].domain = Some(7);
+    let plan = plan(&manifest, "a", key_of(&keys, "a")).expect("a valid plan");
+    let a = host_id_of_certificate(&manifest.nodes[0].certificate);
+    let b = host_id_of_certificate(&manifest.nodes[1].certificate);
+    let c = host_id_of_certificate(&manifest.nodes[2].certificate);
+    assert_eq!(
+      plan.membership.domains.get(&a),
+      Some(&7),
+      "a's declared domain reached the membership under its member id"
+    );
+    assert_eq!(plan.membership.domains.get(&b), Some(&7), "b shares a's domain");
+    assert_eq!(
+      plan.membership.domains.get(&c),
+      None,
+      "an undeclared node is absent from the map — its own domain (unique-per-host)"
+    );
   }
 
   /// The two sides of every session agree: my dial addresses for a peer are that peer's own serve binds,

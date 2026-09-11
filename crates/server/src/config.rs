@@ -3,7 +3,9 @@
 
 use slates_anchor::Geometry;
 use slates_db::partition::PartitionCaps;
-use slates_db::register::{HostId, Quorum};
+use std::collections::BTreeMap;
+
+use slates_db::register::{DomainId, HostId, Quorum};
 use slates_ipc::RegionGeometry;
 use slates_machine::{Derived, MachineProfile, derived};
 use slates_mem::budget::region_bytes;
@@ -104,6 +106,10 @@ pub struct FleetMembership {
   /// they pin); a laptop has no fleet membership and takes its machine identity's hash instead
   /// (`init_shard`).
   pub host: HostId,
+  /// Each fleet member's failure domain (from the manifest), so placement forms copysets across distinct
+  /// domains (D-14). A host absent from the map is its own domain (unique-per-host) — the default when the
+  /// deployment declares none. Installed into the configuration group at boot (`init_shard`).
+  pub domains: BTreeMap<HostId, DomainId>,
 }
 
 /// The daemon's configuration.

@@ -1829,8 +1829,9 @@ neighbourhood — until a deployment has sized its recovery (implemented: `Confi
 neighbourhood to this width; placement and takeover route each object through the fixed-copyset
 construction in `candidates_for`, so above the floor the number of copysets stays linear in S, not
 `Θ(S^{2f})`, and a takeover successor is always a host that held the object — placement carries a per-host
-failure-domain map so no copyset repeats a domain, defaulting to unique-per-host (each host its own) with
-the manifest source that populates it owed); hedge delay = measured p95 put latency per
+failure-domain map so no copyset repeats a domain, defaulting to unique-per-host (each host its own); an
+operator declares a node's domain with an optional per-node `domain` in the deployment manifest, threaded
+to the configuration group at boot); hedge delay = measured p95 put latency per
 class; probation threshold = late
 count over the measured window that exceeds the hedge rate's variance; detection timeout for
 membership from RTT p99 × k; auto-seal cadence as before; healer cadence from the measured
