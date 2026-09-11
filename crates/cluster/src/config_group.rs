@@ -36,7 +36,8 @@ use slates_db::register::{
 };
 
 use crate::membership::Membership;
-use crate::raft::RaftNode;
+use crate::raft::{AppendEntries, RaftNode, RequestVote};
+use crate::raft_wire::RaftMessage;
 
 /// A configuration change as it rides the Raft log — the command a committed [`LogEntry`](crate::raft::LogEntry)
 /// carries, decoded and applied to the [`Configuration`] in commit order so every voter reaches the same
@@ -189,6 +190,87 @@ impl ConfigGroup {
       applied: 0,
       scatter,
     }
+  }
+
+  /// A **multi-voter** configuration group (§4.8, D-14): the [`RaftNode`] over `voters` — the config-group
+  /// members, this `owner` among them — so a configuration change commits only at a majority of the voters,
+  /// replicated over the fleet transport. Unlike [`new`](ConfigGroup::new), the lone-voter degenerate that
+  /// self-elects, this waits for an election over the transport (the drive loop calls [`campaign`](
+  /// ConfigGroup::campaign), [`replication_for`](ConfigGroup::replication_for) and
+  /// [`handle_raft`](ConfigGroup::handle_raft)); a change is proposed with
+  /// [`propose_change`](ConfigGroup::propose_change) and applies as the acknowledgements arrive.
+  pub fn new_group(owner: HostId, quorum: Quorum, voters: Vec<HostId>) -> ConfigGroup {
+    let raft = RaftNode::new(owner, voters);
+    let mut configuration = Configuration::solo(owner);
+    configuration.quorum = quorum;
+    let scatter = u64::try_from(quorum.candidates()).unwrap_or(u64::MAX);
+    ConfigGroup {
+      raft,
+      configuration,
+      applied: 0,
+      scatter,
+    }
+  }
+
+  /// Becomes a candidate on an election timeout and returns the [`RequestVote`]s to ship to the other voters
+  /// over the transport (the multi-voter election; [`handle_raft`](ConfigGroup::handle_raft) folds the
+  /// replies back).
+  pub fn campaign(&mut self) -> Vec<RequestVote> {
+    self.raft.start_election()
+  }
+
+  /// The [`AppendEntries`] the leader replicates to `follower` now — its next log slice, or a heartbeat when
+  /// there is nothing new — or `None` when this node is not the leader. The drive loop ships it over the
+  /// transport and folds the reply back through [`handle_raft`](ConfigGroup::handle_raft).
+  pub fn replication_for(&self, follower: HostId) -> Option<AppendEntries> {
+    self.raft.replicate_to(follower)
+  }
+
+  /// Handles one Raft message received over the transport — a vote request or reply, or an append or its
+  /// reply — driving the [`RaftNode`] and returning the reply to ship back (a vote request and an append are
+  /// answered; the replies are folded, no answer). Applies whatever newly committed: a follower applies on
+  /// the append, the leader once a majority acknowledges (the commit index advances on the reply).
+  pub fn handle_raft(&mut self, message: RaftMessage) -> Option<RaftMessage> {
+    let reply = match message {
+      RaftMessage::RequestVote(request) => {
+        Some(RaftMessage::VoteReply(self.raft.on_request_vote(request)))
+      }
+      RaftMessage::VoteReply(reply) => {
+        self.raft.on_vote_reply(reply);
+        None
+      }
+      RaftMessage::AppendEntries(append) => {
+        Some(RaftMessage::AppendReply(self.raft.on_append_entries(append)))
+      }
+      RaftMessage::AppendReply(reply) => {
+        self.raft.on_append_reply(reply);
+        None
+      }
+    };
+    self.apply_committed();
+    reply
+  }
+
+  /// Proposes a configuration change on the leader **without waiting**: the entry is appended, and commits —
+  /// and applies — only once a majority of voters acknowledge it over the transport (the drive loop feeds
+  /// their replies through [`handle_raft`](ConfigGroup::handle_raft)). Returns whether the leader appended
+  /// it (a non-leader, or a no-op change already reflected in the configuration, returns `false`). The
+  /// synchronous [`reconfigure`](ConfigGroup::reconfigure) is the lone-voter degenerate of this.
+  pub fn propose_change(&mut self, change: Reconfiguration) -> bool {
+    let (command, would_change) = match change {
+      Reconfiguration::Admit(host) => (
+        ConfigCommand::Admit(host),
+        !self.configuration.neighbourhood.contains(&host),
+      ),
+      Reconfiguration::Retire(host) => (
+        ConfigCommand::Retire(host),
+        host != self.configuration.owner && self.configuration.neighbourhood.contains(&host),
+      ),
+    };
+    if !would_change {
+      return false;
+    }
+    self.raft.append_command(command.encode())
   }
 
   /// Raises the scatter width the neighbourhood is bounded to (§4.8 "Placement") above its default
