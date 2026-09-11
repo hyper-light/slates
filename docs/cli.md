@@ -55,7 +55,9 @@ slates anchor --fleet /etc/slates/fleet.json --node a
 - `name` is the TLS name every node's certificate carries (its subject alternative name); peers
   verify each other's sessions under it. Certificates and keys are DER files the operator
   provisions, named relative to the manifest; every certificate is read (peers pin them, and a
-  node's member id is derived from its certificate), only this node's key is read.
+  node's member id is derived from its certificate), only this node's key is read. Material the TLS
+  stack cannot use (a key that does not match the certificate, a key shape it does not take) stops
+  the boot naming the node.
 - `f` is the fault tolerance: a write commits once `f + 1` nodes hold it, so a fleet of `2f + 1`
   keeps committing through `f` deaths. A manifest that could never commit (`fewer than f + 1`
   nodes) is refused.

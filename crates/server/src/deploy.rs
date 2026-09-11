@@ -119,6 +119,16 @@ pub enum DeployError {
   },
   /// The manifest lists no node at all.
   NoNodes,
+  /// This node's key and certificate, or a peer's pinned certificate, cannot be used by the TLS stack
+  /// (a key shape the provider does not take, a key that does not match the certificate, a certificate
+  /// that cannot be a trust anchor). Checked once at boot so it is a refusal by name here, not a mesh
+  /// that never forms with only `fleet.accept` refusal counts in `status` to show for it.
+  Identity {
+    /// The node whose material was checked.
+    node: String,
+    /// The TLS stack's reason.
+    reason: String,
+  },
 }
 
 impl std::fmt::Display for DeployError {
@@ -140,6 +150,10 @@ impl std::fmt::Display for DeployError {
         f.saturating_add(1)
       ),
       Self::NoNodes => out.write_str("the manifest lists no nodes"),
+      Self::Identity { node, reason } => write!(
+        out,
+        "node `{node}`'s key, certificate or pins cannot be used for TLS: {reason}"
+      ),
     }
   }
 }
@@ -240,10 +254,35 @@ fn serve_address(server: &FleetNodeEntry, client: usize, plane: Plane) -> Option
     .map(|port| SocketAddrV4::new(*server.address.ip(), port))
 }
 
+/// Checks, once, that the TLS stack can build this node's server side from its identity with every
+/// peer's certificate pinned — the same construction the membership loop's `Endpoint::accept` makes per
+/// peer at boot — so a key the provider rejects, a key that does not match the certificate, or a pin
+/// that cannot be a trust anchor is refused here by name. A solo node has no pins; its own certificate
+/// stands in (it is what a peer would pin), since the verifier needs one anchor to build at all.
+fn check_identity(
+  node: &str,
+  identity: &Identity,
+  own: &CertificateDer<'static>,
+  pins: &[CertificateDer<'static>],
+) -> Result<(), DeployError> {
+  let anchors: &[CertificateDer<'static>] = if pins.is_empty() {
+    std::slice::from_ref(own)
+  } else {
+    pins
+  };
+  slates_transport::handshake::server_config(identity, anchors)
+    .map(|_| ())
+    .map_err(|e| DeployError::Identity {
+      node: node.to_owned(),
+      reason: e.to_string(),
+    })
+}
+
 /// This node's plan from the shared manifest: `node` selects its entry, `key` is its private key (the
 /// one secret the manifest does not carry — each node reads only its own). Every peer's dial addresses
 /// are the peer's serve ports for this node's index, and this node's serve binds are its own block's
-/// ports for each peer's index, so the two sides of every session agree by construction.
+/// ports for each peer's index, so the two sides of every session agree by construction. The identity
+/// and the pins are checked against the TLS stack before the plan is returned.
 pub fn plan(
   manifest: &FleetManifest,
   node: &str,
@@ -281,6 +320,9 @@ pub fn plan(
       certificate: peer.certificate.clone(),
     });
   }
+  let identity = Identity::from_der(entry.certificate.clone(), key);
+  let pins: Vec<CertificateDer<'static>> = peers.iter().map(|p| p.certificate.clone()).collect();
+  check_identity(&entry.node, &identity, &entry.certificate, &pins)?;
   Ok(FleetPlan {
     membership: FleetMembership {
       quorum: manifest.quorum,
@@ -288,7 +330,7 @@ pub fn plan(
       host,
     },
     transport: FleetTransport {
-      identity: Identity::from_der(entry.certificate.clone(), key),
+      identity,
       name: manifest.name.clone(),
       peers,
     },
@@ -300,29 +342,60 @@ mod tests {
   use super::*;
   use slates_rt::tcp::Ipv4Addr;
 
-  fn entry(node: &str, port: u16, certificate: &[u8]) -> FleetNodeEntry {
+  /// Shape: the fleet's TLS name in these tests; every minted certificate carries it.
+  const NAME: &str = "slates-fleet";
+
+  /// A self-signed identity minted with `rcgen`, as the fleet tests mint them: the certificate (what a
+  /// manifest carries and peers pin) and the key (what only the node itself reads).
+  fn mint() -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
+    let key = rcgen::KeyPair::generate().expect("a key pair");
+    let cert = rcgen::CertificateParams::new(vec![NAME.to_owned()])
+      .expect("certificate params")
+      .self_signed(&key)
+      .expect("a self-signed certificate");
+    (
+      cert.der().clone(),
+      PrivateKeyDer::try_from(key.serialize_der()).expect("a PKCS#8 key"),
+    )
+  }
+
+  fn entry(node: &str, port: u16, certificate: CertificateDer<'static>) -> FleetNodeEntry {
     FleetNodeEntry {
       node: node.to_owned(),
       address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
-      certificate: CertificateDer::from(certificate.to_vec()),
+      certificate,
     }
   }
 
-  fn key() -> PrivateKeyDer<'static> {
-    // Any DER-shaped bytes: the plan only carries the key into the identity; no handshake runs here.
-    PrivateKeyDer::try_from(vec![0x30, 0x03, 0x02, 0x01, 0x01]).expect("a PKCS#8 key shape")
-  }
-
-  fn manifest() -> FleetManifest {
-    FleetManifest {
-      name: "slates-fleet".to_owned(),
+  /// A three-node manifest with minted identities; each node's key beside it, in manifest order.
+  fn manifest() -> (FleetManifest, Vec<PrivateKeyDer<'static>>) {
+    let minted: Vec<(CertificateDer<'static>, PrivateKeyDer<'static>)> =
+      (0..3).map(|_| mint()).collect();
+    let mut keys = Vec::new();
+    let mut certs = Vec::new();
+    for (cert, key) in minted {
+      certs.push(cert);
+      keys.push(key);
+    }
+    let manifest = FleetManifest {
+      name: NAME.to_owned(),
       quorum: Quorum { f: 1 },
       nodes: vec![
-        entry("a", 40_000, b"cert-a"),
-        entry("b", 41_000, b"cert-b"),
-        entry("c", 42_000, b"cert-c"),
+        entry("a", 40_000, certs[0].clone()),
+        entry("b", 41_000, certs[1].clone()),
+        entry("c", 42_000, certs[2].clone()),
       ],
-    }
+    };
+    (manifest, keys)
+  }
+
+  /// The key of the node named `node` in a manifest built by [`manifest`].
+  fn key_of(keys: &[PrivateKeyDer<'static>], node: &str) -> PrivateKeyDer<'static> {
+    let index = ["a", "b", "c"]
+      .iter()
+      .position(|n| *n == node)
+      .expect("a known node");
+    keys[index].clone_key()
   }
 
   /// The manifest index of the node `peer` names (by its certificate-derived id).
@@ -357,10 +430,10 @@ mod tests {
   /// computes.
   #[test]
   fn every_pair_of_plans_agrees_on_its_sockets_and_ids() {
-    let manifest = manifest();
+    let (manifest, keys) = manifest();
     let plans: Vec<FleetPlan> = ["a", "b", "c"]
       .iter()
-      .map(|node| plan(&manifest, node, key()).expect("a plan"))
+      .map(|node| plan(&manifest, node, key_of(&keys, node)).expect("a plan"))
       .collect();
     for (i, mine) in plans.iter().enumerate() {
       let my_host = host_id_of_certificate(&manifest.nodes[i].certificate);
@@ -385,9 +458,9 @@ mod tests {
   /// serves a (index 0) on 41 000/41 001 — the formula `base + 2·index (+ 1)`.
   #[test]
   fn the_port_layout_is_base_plus_twice_the_index() {
-    let manifest = manifest();
-    let a = plan(&manifest, "a", key()).expect("a plan");
-    let b_host = host_id_of_certificate(&CertificateDer::from(b"cert-b".as_slice()));
+    let (manifest, keys) = manifest();
+    let a = plan(&manifest, "a", key_of(&keys, "a")).expect("a plan");
+    let b_host = host_id_of_certificate(&manifest.nodes[1].certificate);
     let to_b = a
       .transport
       .peers
@@ -404,43 +477,44 @@ mod tests {
   /// Each refusal names what the operator must fix.
   #[test]
   fn a_bad_manifest_is_refused_by_name() {
-    let mut duplicate_name = manifest();
+    let (mut duplicate_name, keys) = manifest();
     duplicate_name.nodes[2].node = "a".to_owned();
     assert_eq!(
-      plan(&duplicate_name, "b", key()).err(),
+      plan(&duplicate_name, "b", key_of(&keys, "b")).err(),
       Some(DeployError::DuplicateNode {
         node: "a".to_owned()
       })
     );
-    let mut duplicate_cert = manifest();
-    duplicate_cert.nodes[2].certificate = CertificateDer::from(b"cert-a".to_vec());
+    let (mut duplicate_cert, keys) = manifest();
+    duplicate_cert.nodes[2].certificate = duplicate_cert.nodes[0].certificate.clone();
     assert_eq!(
-      plan(&duplicate_cert, "b", key()).err(),
+      plan(&duplicate_cert, "b", key_of(&keys, "b")).err(),
       Some(DeployError::DuplicateCertificate {
         first: "a".to_owned(),
         second: "c".to_owned()
       })
     );
+    let (unknown, keys) = manifest();
     assert_eq!(
-      plan(&manifest(), "d", key()).err(),
+      plan(&unknown, "d", key_of(&keys, "a")).err(),
       Some(DeployError::UnknownNode {
         node: "d".to_owned()
       })
     );
-    let mut overflow = manifest();
+    let (mut overflow, keys) = manifest();
     overflow.nodes[1].address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, u16::MAX - 2);
     assert_eq!(
-      plan(&overflow, "a", key()).err(),
+      plan(&overflow, "a", key_of(&keys, "a")).err(),
       Some(DeployError::PortBlockOverflows {
         node: "b".to_owned(),
         base: u16::MAX - 2,
         needed: 6
       })
     );
-    let mut too_few = manifest();
+    let (mut too_few, keys) = manifest();
     too_few.quorum = Quorum { f: 3 };
     assert_eq!(
-      plan(&too_few, "a", key()).err(),
+      plan(&too_few, "a", key_of(&keys, "a")).err(),
       Some(DeployError::QuorumUnreachable { nodes: 3, f: 3 })
     );
     let empty = FleetManifest {
@@ -448,18 +522,42 @@ mod tests {
       quorum: Quorum { f: 0 },
       nodes: Vec::new(),
     };
-    assert_eq!(plan(&empty, "a", key()).err(), Some(DeployError::NoNodes));
+    assert_eq!(
+      plan(&empty, "a", key_of(&keys, "a")).err(),
+      Some(DeployError::NoNodes)
+    );
+  }
+
+  /// Material the TLS stack cannot use is refused at plan time, naming the node: another node's key
+  /// (it does not match this node's certificate), and bytes that are not a key at all.
+  #[test]
+  fn an_unusable_identity_is_refused_at_plan_time() {
+    let (manifest, keys) = manifest();
+    let wrong_key = plan(&manifest, "a", key_of(&keys, "b"));
+    assert!(
+      matches!(wrong_key, Err(DeployError::Identity { ref node, .. }) if node == "a"),
+      "another node's key is refused: {:?}",
+      wrong_key.err()
+    );
+    let garbage = PrivateKeyDer::try_from(vec![0x30, 0x03, 0x02, 0x01, 0x01]).expect("a DER shape");
+    let not_a_key = plan(&manifest, "a", garbage);
+    assert!(
+      matches!(not_a_key, Err(DeployError::Identity { ref node, .. }) if node == "a"),
+      "bytes that are not a key are refused: {:?}",
+      not_a_key.err()
+    );
   }
 
   /// A one-node manifest at `f = 0` is the laptop: no peers, the node its own only member (R8).
   #[test]
   fn a_single_node_manifest_is_the_solo_degenerate() {
+    let (cert, key) = mint();
     let solo = FleetManifest {
-      name: "x".to_owned(),
+      name: NAME.to_owned(),
       quorum: Quorum { f: 0 },
-      nodes: vec![entry("only", 50_000, b"cert-only")],
+      nodes: vec![entry("only", 50_000, cert)],
     };
-    let plan = plan(&solo, "only", key()).expect("a plan");
+    let plan = plan(&solo, "only", key).expect("a plan");
     assert!(plan.transport.peers.is_empty());
     assert!(plan.membership.peers.is_empty());
     assert_eq!(plan.membership.quorum, Quorum { f: 0 });
