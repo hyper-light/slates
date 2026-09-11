@@ -182,6 +182,75 @@ hosts drawn from the owner's neighbourhood by rendezvous. S is derived from the 
 re-replication bandwidth needed to restore f+1 copies of a host's data within the recovery budget,
 and from the loss probability the operator accepts.
 
+### 3.1 The verified formulas and the derivation of S (the "verify the formula" open item, closed 2026-09-11)
+
+Read the full paper [A: Cidon et al., ATC 2013; PDF `scs.stanford.edu/~rumble/papers/cidon_copysets.pdf`,
+read 2026-09-11], §2.1–§4.2, and Tables 2–3. The exact results (R = copies per chunk, N = nodes,
+S = scatter width, a *copyset* = a set of R nodes that together hold every copy of some chunk — data is
+lost exactly when a copyset's R nodes fail coincidentally):
+
+- **Permutations and copyset count (Copyset Replication).** The scheme lays down `P = ⌈S/(R−1)⌉`
+  permutations of the N nodes and cuts each into consecutive groups of R, so a node lands in
+  `S = P·(R−1)` other nodes' groups (the scatter width) and the cluster has
+  **`#copysets = P·(N/R) = ⌈S/(R−1)⌉·N/R`** distinct copysets — *linear in S*. Each copyset overlaps every
+  other by at most one node (scatter width is exactly R−1 per permutation), and the copysets cover the
+  nodes equally.
+- **Random replication copyset count.** For `S < N/2`, random replication makes **`N·C(S, R−1)`** copysets
+  — `Θ(S^(R−1))`, super-linear — approaching `C(N, R)` as `S → N`. This is why per-object rendezvous over the
+  *whole* region (S = N−1) is catastrophic: every R-subset that any chunk lands on is a copyset.
+- **Loss probability under a coincident failure of `Fᵤ` nodes.** A given copyset's R nodes are all inside
+  the failed set with probability `C(Fᵤ, R)/C(N, R)`; for the small target probabilities that matter,
+  **`P(loss) ≈ #copysets · C(Fᵤ, R) / C(N, R)`** (the paper's exact "in a failure of R nodes,
+  `P(loss) = #copysets / C(N, R)`" is the `Fᵤ = R` case). Minimising `#copysets` minimises `P(loss)`
+  monotonically — the whole point of the scheme.
+- **Recovery time vs S (Table 2, a 100 GB node, 39 nodes, 1 Gb/s).** Recovery time falls as S rises
+  (S=2 → 642 s, S=8 → 235 s, S=14 → 177 s, S=20 → 128 s): S other nodes re-replicate the lost copies in
+  parallel, so the parallel floor is **`t_recover ≈ D/(S·B)`** (D = a node's replicated bytes, B = a node's
+  re-replication bandwidth), plus a fixed detection/coordination overhead the table shows dominating at
+  large S. This is the recovery-parallelism *lower* bound on S — unlike RAMCloud, which recovers a master's
+  data from backups spread across **all** nodes and so pins S at the minimum R−1 (P=1); slates recovers a
+  dead host's copies from the survivors that hold them, i.e. from its neighbourhood, so slates is the
+  HDFS/Facebook case where **S is recovery-constrained** and must be derived, not pinned.
+
+**slates's derivation of S (per host, per region).** Let `R = f+1` be the number of *content* copies
+(the durability-binding class — records keep 2f+1, more), `D` the RAM bytes a host replicates, `B` its
+measured re-replication bandwidth, `T` the recovery budget (the time a lost host's copies must be
+restored within), `ε` the accepted coincident-loss probability, and `Fᵤ = ⌈p·N⌉` the coincident-failure
+size to design against (the Copysets power-outage scenario uses `p = 1%`). Then:
+
+1. **Recovery floor (lower bound):** `S_recover = ⌈ D / (B · T) ⌉` — the least parallelism that restores
+   D bytes within T. (The fixed overhead is folded into T as a margin; the floor is the transfer term.)
+2. **Candidate floor:** `S ≥ 2f+1` — the neighbourhood must hold a full candidate set (owner + 2f).
+3. **Durability ceiling (upper bound):** the copyset count the chosen S implies,
+   `⌈S/(R−1)⌉·N/R`, must keep `P(loss) ≤ ε`, i.e.
+   `⌈S/(R−1)⌉·N/R ≤ ε·C(N, R)/C(Fᵤ, R)`.
+4. **Derived S:** `S = max(2f+1, S_recover)` — the *smallest* S meeting recovery, which by monotonicity is
+   also the *lowest-loss* S meeting recovery. Then evaluate the ceiling (3): if S violates it, recovery
+   budget and durability target are in genuine conflict at this (N, R, B, D), and the fix is more copies
+   (raise f), more bandwidth, a longer T, or tighter failure domains — never silently over-scattering.
+   "The copyset count is computed at every configuration change and compared with its bound; exceeding it
+   is a placement bug, not a tripwire" (§4.8).
+
+**The construction — fixed copysets, not rendezvous-over-hosts ("derived approach without loss").** To
+realise the *linear* copyset count (and thus the lowest loss at the derived S), the neighbourhood's S
+hosts are cut into **fixed copysets** by the Copysets permutation construction, restricted so no copyset
+repeats a failure domain (reshuffle until the domain constraint holds, as the paper's own rack-aware
+variant does); an object then maps by rendezvous to **one** fixed copyset — *rendezvous over the copysets*,
+not over the hosts. Rendezvous over the S hosts directly would re-introduce the `Θ(S^(R−1))` random count
+inside the neighbourhood and forfeit the durability the bounding was for. At the minimal `S = 2f+1` the
+neighbourhood *is* one copyset and the two coincide; the fixed-copyset construction only matters once the
+recovery floor pushes S above the candidate floor, which is exactly the Meta-scale case.
+
+**Laptop degenerate (R8).** One node, one failure domain: `f = 0`, `R = 1`, the neighbourhood is the host
+itself, S = 0, one copyset (the host), `P(loss)` is the host's own loss — the same formula family at N=1,
+no branch.
+
+**The measured anchors (R3).** `D` from the host's provisioned RAM-copy budget; `B` from the network
+profile's sustained re-replication throughput; `T` and `ε` and `p` are the operator's durability policy
+(regional configuration), with defensible defaults (`T` = the recovery budget already named for takeover,
+`p = 1%` from the Copysets outage scenario, `ε` the accepted per-incident loss) until a deployment states
+its own. The copyset-count check is exact and runs at every configuration change.
+
 ## 4. The design (the A-6 proposal, revised)
 
 1. **Configuration masters.** One consensus group per region (the Raft dialect of D-14) holds
@@ -263,9 +332,11 @@ grows); the regional group's commit rate (should be near zero outside failures).
 
 ## 8. Items to verify
 
-FaRM's reconfiguration steps and its Zookeeper usage (paper body not fetched); the Copysets
-formula for loss probability versus copyset count (abstract only); Hermes' exact reconfiguration
-protocol (abstract only). None changes the design; each is a citation to complete in Phase 8.
+FaRM's reconfiguration steps and its Zookeeper usage (paper body not fetched); ~~the Copysets
+formula for loss probability versus copyset count (abstract only)~~ **[CLOSED 2026-09-11 — full paper
+read, formulas verified and the scatter-width derivation written up in §3.1]**; Hermes' exact
+reconfiguration protocol (abstract only). None changes the design; each is a citation to complete in
+Phase 8.
 
 ## 9. The six remainders, solved (2026-09-04, after Ada's review)
 
