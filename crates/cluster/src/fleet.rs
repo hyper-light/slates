@@ -124,6 +124,19 @@ impl FleetNode {
     self.group.set_domains(domains);
   }
 
+  /// Sets the scatter width the neighbourhood is bounded to (§4.8 "Placement", D-14) and re-reconciles, so
+  /// the bounded neighbourhood — and, if it changed, the acceptor's authority — reflects the new width at
+  /// once. The daemon calls this at boot with the derived scatter width (from its data budget, stated
+  /// re-replication bandwidth and the recovery budget); a wider width grows the neighbourhood up to the
+  /// alive set, the candidate floor keeps it one copyset.
+  pub fn set_scatter(&mut self, scatter: u64) {
+    self.group.set_scatter(scatter);
+    if self.group.reconcile(&self.membership) {
+      let authority = Self::authority(self.group.configuration());
+      let _ = self.acceptor.install_authority(authority);
+    }
+  }
+
   /// The current configuration (the authority the async register drivers carry): the owner, the host
   /// epoch, the neighbourhood the candidates are drawn from, the quorum, and the version a request
   /// carries. Read per request; written only through the membership events [`observe`](FleetNode::observe)

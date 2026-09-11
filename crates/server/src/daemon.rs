@@ -705,6 +705,9 @@ fn init_shard(
       // Install the deployment's failure-domain map so placement forms copysets across distinct domains
       // (D-14); hosts the manifest does not place stay unique-per-host.
       node.set_domains(membership.domains.clone());
+      // Bound the neighbourhood to the derived scatter width — the candidate floor unless the deployment
+      // stated a re-replication bandwidth that recovery needs a wider neighbourhood to meet (§4.8, D-14).
+      node.set_scatter(config.derived_scatter(membership.quorum));
       node
     }
     None => slates_cluster::fleet::FleetNode::solo(host),

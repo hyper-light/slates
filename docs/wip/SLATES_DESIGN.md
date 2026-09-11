@@ -1831,7 +1831,10 @@ construction in `candidates_for`, so above the floor the number of copysets stay
 `Θ(S^{2f})`, and a takeover successor is always a host that held the object — placement carries a per-host
 failure-domain map so no copyset repeats a domain, defaulting to unique-per-host (each host its own); an
 operator declares a node's domain with an optional per-node `domain` in the deployment manifest, threaded
-to the configuration group at boot); hedge delay = measured p95 put latency per
+to the configuration group at boot; the daemon derives S at boot as `scatter_width(D, B, T, f)` — D the
+RAM content reserve, T the recovery budget, B the operator's stated re-replication bandwidth (0 by default,
+so S is the floor; measuring B needs a real network, §4.10a, deferred)); hedge delay = measured p95 put
+latency per
 class; probation threshold = late
 count over the measured window that exceeds the hedge rate's variance; detection timeout for
 membership from RTT p99 × k; auto-seal cadence as before; healer cadence from the measured

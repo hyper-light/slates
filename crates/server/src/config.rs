@@ -5,7 +5,7 @@ use slates_anchor::Geometry;
 use slates_db::partition::PartitionCaps;
 use std::collections::BTreeMap;
 
-use slates_db::register::{DomainId, HostId, Quorum};
+use slates_db::register::{DomainId, HostId, Quorum, scatter_width};
 use slates_ipc::RegionGeometry;
 use slates_machine::{Derived, MachineProfile, derived};
 use slates_mem::budget::region_bytes;
@@ -142,6 +142,12 @@ pub struct DaemonConfig {
   pub instance: String,
   /// The operator's failover SLO, the lease term's ceiling (§4.4 "Derived constants", D-16).
   pub failover_slo_ns: u64,
+  /// The operator's stated per-node **re-replication bandwidth** in bytes/second, the anchor `B` of the
+  /// scatter-width derivation (§4.8 "Placement", D-14): how fast this node restores a lost host's copies.
+  /// `0` — the default — leaves the scatter width at the candidate floor (one copyset); a deployment states
+  /// its link so recovery sizes a wider neighbourhood, until the network-empirical measurement (§4.10a,
+  /// deferred: bandwidth "needs a real network to measure") supplies it. See [`DaemonConfig::derived_scatter`].
+  pub rereplication_bytes_per_second: u64,
   /// Derived: the bytes one archive-walk slice may hash — half the step budget at the machine's measured
   /// BLAKE3 throughput — so a seal (§4.10) is archived in bounded slices (§4.3) that never take the whole
   /// step from the clients.
@@ -368,6 +374,9 @@ impl DaemonConfig {
       page: usize::try_from(page).unwrap_or(1).max(1),
       instance: instance.to_owned(),
       failover_slo_ns: FAILOVER_SLO_NS,
+      // Unstated by default: the scatter width stays at the candidate floor until a deployment states its
+      // re-replication bandwidth (or the deferred network-empirical measurement supplies it).
+      rereplication_bytes_per_second: 0,
       archive_slice_bytes: archive_slice_bytes.get(),
       // The laptop default: no fleet, `f = 0`, solo. An operator deploying a fleet sets this (with
       // `with_fleet`); the derivation from the machine profile is the same either way (R8).
@@ -382,6 +391,32 @@ impl DaemonConfig {
   pub fn with_failover_slo(mut self, failover_slo_ns: u64) -> DaemonConfig {
     self.failover_slo_ns = failover_slo_ns.max(1);
     self
+  }
+
+  /// The same configuration with the operator's stated re-replication bandwidth (bytes/second), the `B`
+  /// anchor of the scatter-width derivation. `0` leaves the scatter width at the candidate floor.
+  pub fn with_rereplication_bandwidth(mut self, bytes_per_second: u64) -> DaemonConfig {
+    self.rereplication_bytes_per_second = bytes_per_second;
+    self
+  }
+
+  /// The scatter width the neighbourhood is bounded to (§4.8 "Placement", D-14), derived from this node's
+  /// replicated data budget `D` (its RAM content reserve across shards), its operator-stated re-replication
+  /// bandwidth `B` and the recovery budget `T` (`slates_db::replay::RECOVERY_BUDGET_NS`):
+  /// `scatter_width(D, B, T, f)` — the smallest S that restores the copies within T, never below the
+  /// candidate floor `2f + 1`. With `B` unstated (`0`) this is exactly the floor (one copyset), so the
+  /// bounded neighbourhood is unchanged from the default; a stated bandwidth sizes a wider neighbourhood for
+  /// recovery parallelism, which the fixed-copyset construction then keeps loss-free.
+  pub fn derived_scatter(&self, quorum: Quorum) -> u64 {
+    let data_bytes = self
+      .reserve_per_shard
+      .saturating_mul(u64::from(self.runtime.shards.max(1)));
+    scatter_width(
+      data_bytes,
+      self.rereplication_bytes_per_second,
+      slates_db::replay::RECOVERY_BUDGET_NS,
+      u64::from(quorum.f),
+    )
   }
 
   /// The same configuration over `shards` shards, unpinned (tests and benches that share a
@@ -408,4 +443,44 @@ fn note<T: std::fmt::Debug>(name: &str, d: &Derived<T>) -> String {
     "{name} = {:?}: {} (anchors {:?})",
     d.value, d.formula, d.anchors
   )
+}
+
+#[cfg(test)]
+mod tests {
+  use std::time::Duration;
+
+  use slates_machine::ProfileOptions;
+
+  use super::*;
+
+  /// AC (§4.8 "Placement", D-14): the derived scatter width is the recovery floor — the candidate floor
+  /// `2f + 1` when the re-replication bandwidth is unstated, wider when a stated bandwidth is too slow to
+  /// restore the data budget within the recovery budget, and back at the floor when it is ample.
+  #[test]
+  fn the_derived_scatter_is_the_recovery_floor_above_the_candidate_floor() {
+    let profile = MachineProfile::measure(ProfileOptions {
+      budget_per_probe: Duration::from_millis(1),
+      codecs: false,
+      core_matrix: false,
+    });
+    let quorum = Quorum { f: 1 }; // candidate floor 2f + 1 = 3
+    let config = DaemonConfig::derive(&profile, "scatter-test").with_shards(1);
+
+    assert_eq!(
+      config.derived_scatter(quorum),
+      3,
+      "an unstated bandwidth leaves the scatter at the candidate floor"
+    );
+    let slow = config.clone().with_rereplication_bandwidth(1);
+    assert!(
+      slow.derived_scatter(quorum) > 3,
+      "a bandwidth too slow to restore the data budget within the recovery budget widens the scatter"
+    );
+    let ample = config.with_rereplication_bandwidth(u64::MAX);
+    assert_eq!(
+      ample.derived_scatter(quorum),
+      3,
+      "a bandwidth that restores the data budget within the budget leaves the scatter at the floor"
+    );
+  }
 }
