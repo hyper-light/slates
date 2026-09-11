@@ -18,10 +18,12 @@ fn id(byte: u8) -> [u8; 32] {
 /// A home cohort and its owner at fault tolerance `f`, and a mirror region at the same `f` on a
 /// disjoint set of hosts (a separate failure domain).
 fn regions(f: u32) -> (Cohort, Owner, Mirror) {
+  let domains = std::collections::BTreeMap::new(); // unique-per-host in both regions
   let home_neighbourhood: Vec<HostId> = (1..=8u64).map(HostId).collect();
   let home = Cohort::new(
     HostId(1),
     &home_neighbourhood,
+    &domains,
     ObjectId::new(HostId(1), 42),
     Quorum { f },
   );
@@ -30,6 +32,7 @@ fn regions(f: u32) -> (Cohort, Owner, Mirror) {
   let mirror = Mirror::new(
     HostId(101),
     &mirror_neighbourhood,
+    &domains,
     ObjectId::new(HostId(1), 42),
     Quorum { f },
   );

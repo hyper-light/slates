@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use slates_db::register::{HostId, ObjectId, Quorum, candidates_for, rendezvous_first};
+use slates_db::register::{DomainId, HostId, ObjectId, Quorum, candidates_for, rendezvous_first};
 
 /// The objects this node holds a copy of, keyed to their current owner. Bounded by what this node
 /// actually holds (its own objects and the peers' it backs), not the region's whole object set.
@@ -84,6 +84,7 @@ impl Routing {
     &mut self,
     dead: HostId,
     neighbourhood: &[HostId],
+    domains: &BTreeMap<HostId, DomainId>,
     quorum: Quorum,
   ) -> Vec<Reassignment> {
     let affected: Vec<ObjectId> = self
@@ -95,7 +96,7 @@ impl Routing {
     let mut mine = Vec::new();
     for object in affected {
       // The object's surviving holders: its copyset under the dead owner, minus the dead host.
-      let survivors: Vec<HostId> = candidates_for(dead, neighbourhood, object, quorum)
+      let survivors: Vec<HostId> = candidates_for(dead, neighbourhood, domains, object, quorum)
         .into_iter()
         .filter(|host| *host != dead)
         .collect();
@@ -148,6 +149,7 @@ mod tests {
   #[test]
   fn a_death_reassigns_the_dead_owners_objects_by_rendezvous() {
     let neighbourhood = vec![SELF, PEER, OTHER];
+    let domains = std::collections::BTreeMap::new(); // unique-per-host
     let mut routing = Routing::new(SELF);
 
     // This node holds one of its own objects and backs many of the peer's.
@@ -159,7 +161,7 @@ mod tests {
     }
 
     let taken: BTreeSet<ObjectId> = routing
-      .take_over(PEER, &neighbourhood, Quorum { f: 1 })
+      .take_over(PEER, &neighbourhood, &domains, Quorum { f: 1 })
       .into_iter()
       .map(|r| r.object)
       .collect();
@@ -201,7 +203,7 @@ mod tests {
     let mut routing = Routing::new(SELF);
     let orphan = ObjectId::new(PEER, 0);
     routing.track(orphan, PEER);
-    let taken = routing.take_over(PEER, &[PEER], Quorum { f: 1 });
+    let taken = routing.take_over(PEER, &[PEER], &std::collections::BTreeMap::new(), Quorum { f: 1 });
     assert!(taken.is_empty());
     assert_eq!(
       routing.owner_of(orphan),
@@ -221,6 +223,7 @@ mod tests {
     // The dead owner plus four co-holders at f=1 → 2f=2 per copyset → two fixed copysets (above the floor
     // of three), so a host in one copyset never held an object placed on the other.
     let neighbourhood = vec![dead, SELF, OTHER, HostId(4), HostId(5)];
+    let domains = std::collections::BTreeMap::new(); // unique-per-host
     let quorum = Quorum { f: 1 };
     let mut routing = Routing::new(SELF);
     let objects: Vec<ObjectId> = (0..128u64).map(|i| ObjectId::new(dead, i)).collect();
@@ -228,13 +231,13 @@ mod tests {
       routing.track(object, dead);
     }
 
-    routing.take_over(dead, &neighbourhood, quorum);
+    routing.take_over(dead, &neighbourhood, &domains, quorum);
 
     let mut owners = BTreeSet::new();
     let mut copysets = BTreeSet::new();
     for &object in &objects {
       let new_owner = routing.owner_of(object).expect("reassigned, not dropped");
-      let copyset = candidates_for(dead, &neighbourhood, object, quorum);
+      let copyset = candidates_for(dead, &neighbourhood, &domains, object, quorum);
       assert!(
         copyset.contains(&new_owner),
         "the successor {new_owner:?} must have held the object (be in its copyset {copyset:?})"

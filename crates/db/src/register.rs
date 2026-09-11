@@ -175,9 +175,10 @@ impl Placement {
     owner: HostId,
     quorum: Quorum,
     neighbourhood: &[HostId],
+    domains: &std::collections::BTreeMap<HostId, DomainId>,
     object: ObjectId,
   ) -> Placement {
-    let candidates = candidates_for(owner, neighbourhood, object, quorum);
+    let candidates = candidates_for(owner, neighbourhood, domains, object, quorum);
     let acked = if quorum.committed(1) {
       vec![owner]
     } else {
@@ -222,21 +223,25 @@ impl Placement {
 /// total when the neighbourhood is domain-rich enough. Rendezvous runs over the *copysets*, not the raw
 /// hosts, so the number of distinct copysets stays linear in the scatter width, not the `Θ(S^{2f})` a
 /// per-object rendezvous over the hosts would make (research §3.1; [A: Cidon et al., ATC 2013]).
-/// Deterministic — every host computes the same set from the object id and the neighbourhood, with no
-/// directory (§4.8 "Placement"). At `f = 0` this is the owner alone; at the candidate floor `S = 2f+1` the
-/// neighbourhood is a single copyset, so this is the owner plus its `2f` co-holders — the same set the
-/// former per-object rendezvous produced, leaving the floor unchanged.
+/// Deterministic — every host computes the same set from the object id, the neighbourhood and the domain
+/// map, with no directory (§4.8 "Placement"). `domains` gives each host's failure domain (a host absent
+/// from it is its own, `host.0`), so no copyset repeats a domain. At `f = 0` this is the owner alone; at
+/// the candidate floor `S = 2f+1` the neighbourhood is a single copyset, so this is the owner plus its `2f`
+/// co-holders — the same set the former per-object rendezvous produced, leaving the floor unchanged.
 pub fn candidates_for(
   owner: HostId,
   neighbourhood: &[HostId],
+  domains: &std::collections::BTreeMap<HostId, DomainId>,
   object: ObjectId,
   quorum: Quorum,
 ) -> Vec<HostId> {
-  // Failure domains default to unique-per-host — each host is its own domain (`host.0`) until a deployment
-  // declares the domain tree (§4.8, owed). The copyset construction consumes `(host, domain)` pairs, so a
-  // richer domain source replaces this derivation here alone, without changing any caller.
-  let with_domains: Vec<(HostId, DomainId)> =
-    neighbourhood.iter().map(|host| (*host, host.0)).collect();
+  // Pair each neighbourhood host with its failure domain — the deployment's, or `host.0` (its own) when
+  // undeclared (unique-per-host, the safe laptop/flat-cluster default) — so the copyset construction keeps
+  // every copyset across distinct domains. A richer domain source is thus a change to the map alone.
+  let with_domains: Vec<(HostId, DomainId)> = neighbourhood
+    .iter()
+    .map(|host| (*host, domains.get(host).copied().unwrap_or(host.0)))
+    .collect();
   let copysets = owner_copysets(owner, &with_domains, quorum);
   copyset_for(object, &copysets).unwrap_or_else(|| vec![owner])
 }
@@ -1203,6 +1208,12 @@ pub struct Configuration {
   pub host_epoch: HostEpoch,
   /// The neighbourhood the owner's candidates are drawn from (the owner alone on a laptop).
   pub neighbourhood: Vec<HostId>,
+  /// The failure domain of each fleet host, so copysets are formed across **distinct** domains (D-14: "a
+  /// fixed set of hosts across failure domains") — a rack or machine failure then takes at most one copy of
+  /// any object. A host absent from the map is its **own** domain (`host.0`, unique-per-host), the safe
+  /// default a laptop and an undeclared deployment keep; a deployment populates it from the manifest so
+  /// co-located hosts share a domain. Consumed only by [`candidates_for`], never on a read path.
+  pub domains: std::collections::BTreeMap<HostId, DomainId>,
   /// The quorum the fault-domain tree fixes (`f = 0` on a laptop).
   pub quorum: Quorum,
   /// Whether a mirror region exists.
@@ -1218,6 +1229,8 @@ impl Configuration {
       owner,
       host_epoch: FIRST_EPOCH,
       neighbourhood: vec![owner],
+      // Unique-per-host by default: no host is listed, so each is its own failure domain.
+      domains: std::collections::BTreeMap::new(),
       quorum: Quorum { f: 0 },
       has_mirror: false,
     }
@@ -1236,7 +1249,13 @@ impl Configuration {
 
   /// The placement an object takes when the owner first holds it (`Placement::local`).
   pub fn place(&self, object: ObjectId) -> Placement {
-    Placement::local(self.owner, self.quorum, &self.neighbourhood, object)
+    Placement::local(
+      self.owner,
+      self.quorum,
+      &self.neighbourhood,
+      &self.domains,
+      object,
+    )
   }
 
   /// Whether the region scope is placed for `placement` under this configuration.
@@ -1297,6 +1316,7 @@ mod tests {
     let candidates = candidates_for(
       config.owner,
       &config.neighbourhood,
+      &config.domains,
       object_id,
       config.quorum,
     );
@@ -1328,6 +1348,7 @@ mod tests {
       // A floor neighbourhood at f=1: owner + 2f = one copyset of three, so every object has three
       // candidates (above the floor an object takes just its one copyset, tested separately).
       neighbourhood: vec![owner, HostId(2), HostId(3)],
+      domains: std::collections::BTreeMap::new(),
       quorum: Quorum { f: 1 },
       has_mirror: false,
     };
@@ -1660,18 +1681,19 @@ mod tests {
   fn copyset_candidates_are_deterministic_owner_first_and_spread_above_the_floor() {
     let owner = HostId(1);
     let quorum = Quorum { f: 2 }; // candidate floor 2f+1 = 5
+    let domains = std::collections::BTreeMap::new(); // unique-per-host: domains do not constrain here
 
     // At the floor: a five-host neighbourhood is one copyset, and every object shares it.
     let floor = vec![owner, HostId(2), HostId(3), HostId(4), HostId(5)];
-    let one = candidates_for(owner, &floor, ObjectId::new(owner, 0), quorum);
+    let one = candidates_for(owner, &floor, &domains, ObjectId::new(owner, 0), quorum);
     assert_eq!(one.len(), 5, "the floor neighbourhood is a single copyset of 2f+1");
     assert_eq!(one[0], owner, "owner first");
     for local in 0..256u64 {
       let object = ObjectId::new(owner, local);
-      let a = candidates_for(owner, &floor, object, quorum);
+      let a = candidates_for(owner, &floor, &domains, object, quorum);
       assert_eq!(
         a,
-        candidates_for(owner, &floor, object, quorum),
+        candidates_for(owner, &floor, &domains, object, quorum),
         "deterministic"
       );
       assert_eq!(a, one, "at the floor every object shares the one copyset");
@@ -1683,7 +1705,7 @@ mod tests {
     let mut sets = std::collections::BTreeSet::new();
     for local in 0..256u64 {
       let object = ObjectId::new(owner, local);
-      let a = candidates_for(owner, &wide, object, quorum);
+      let a = candidates_for(owner, &wide, &domains, object, quorum);
       assert_eq!(a[0], owner, "owner first");
       assert_eq!(a.len(), 5, "each candidate set is one copyset of 2f+1, not the whole wide neighbourhood");
       sets.insert(a);
@@ -1691,6 +1713,56 @@ mod tests {
     assert!(
       sets.len() > 1,
       "above the floor objects spread across more than one copyset (a linear, not per-object, count)"
+    );
+  }
+
+  /// AC (§4.8 "Placement", D-14): with declared failure domains, no copyset holds two hosts of the same
+  /// domain, so a domain (rack or machine) failure takes at most one copy of any object. The domain map
+  /// overrides the unique-per-host default — hosts that co-hold under unique-per-host are split apart when
+  /// they share a declared domain.
+  #[test]
+  fn a_copyset_never_repeats_a_declared_failure_domain() {
+    let owner = HostId(1);
+    let neigh = vec![owner, HostId(2), HostId(3), HostId(4), HostId(5)];
+    let quorum = Quorum { f: 1 }; // copysets of 2f+1 = 3
+    // Two domains of two hosts each (2,3 share; 4,5 share); the owner alone in a third.
+    let domains: std::collections::BTreeMap<HostId, DomainId> = [
+      (owner, 100u64),
+      (HostId(2), 10),
+      (HostId(3), 10),
+      (HostId(4), 20),
+      (HostId(5), 20),
+    ]
+    .into_iter()
+    .collect();
+    let mut split = true;
+    for local in 0..256u64 {
+      let object = ObjectId::new(owner, local);
+      let candidates = candidates_for(owner, &neigh, &domains, object, quorum);
+      assert_eq!(candidates[0], owner, "owner heads the copyset");
+      let doms: Vec<DomainId> = candidates.iter().map(|h| domains[h]).collect();
+      let distinct: std::collections::BTreeSet<DomainId> = doms.iter().copied().collect();
+      assert_eq!(
+        distinct.len(),
+        doms.len(),
+        "no copyset repeats a failure domain: {candidates:?}"
+      );
+      if candidates.contains(&HostId(2)) && candidates.contains(&HostId(3)) {
+        split = false;
+      }
+    }
+    assert!(split, "hosts 2 and 3 share a domain, so they never co-hold");
+
+    // Non-vacuity: under unique-per-host (an empty map) those same two hosts DO co-hold for some object —
+    // the declared domain is what split them, not the object ids or the neighbourhood shape.
+    let empty = std::collections::BTreeMap::new();
+    let together = (0..256u64).any(|local| {
+      let c = candidates_for(owner, &neigh, &empty, ObjectId::new(owner, local), quorum);
+      c.contains(&HostId(2)) && c.contains(&HostId(3))
+    });
+    assert!(
+      together,
+      "without declared domains 2 and 3 co-hold — so the domain constraint is what forbids it"
     );
   }
 
@@ -1709,6 +1781,7 @@ mod tests {
     let neigh = vec![owner, HostId(2), HostId(3), HostId(4), HostId(5)];
     let survivors: Vec<HostId> = neigh.iter().copied().filter(|h| *h != owner).collect();
     let quorum = Quorum { f: 2 };
+    let domains = std::collections::BTreeMap::new(); // unique-per-host
     let mut winners = std::collections::BTreeSet::new();
     for local in 0..256u64 {
       let object = ObjectId::new(owner, local);
@@ -1722,7 +1795,7 @@ mod tests {
       // The rendezvous-first survivor is one of the object's candidate holders — placement and takeover
       // draw from the same copyset, so the successor always held a copy.
       assert!(
-        candidates_for(owner, &neigh, object, quorum).contains(&first),
+        candidates_for(owner, &neigh, &domains, object, quorum).contains(&first),
         "the successor is a candidate holder of the object"
       );
       winners.insert(first);

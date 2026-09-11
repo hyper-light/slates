@@ -193,9 +193,12 @@ impl FleetNode {
     // this node the ones it wins (the rest go to other survivors, recorded but not returned).
     let takeovers = if update.liveness == Liveness::Dead {
       let quorum = self.group.configuration().quorum;
-      self
-        .routing
-        .take_over(subject, &self.group.configuration().neighbourhood, quorum)
+      self.routing.take_over(
+        subject,
+        &self.group.configuration().neighbourhood,
+        &self.group.configuration().domains,
+        quorum,
+      )
     } else {
       Vec::new()
     };

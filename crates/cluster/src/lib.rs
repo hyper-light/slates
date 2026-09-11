@@ -557,6 +557,7 @@ pub async fn commit_under_configuration(
   let candidates = candidates_for(
     configuration.owner,
     &configuration.neighbourhood,
+    &configuration.domains,
     record.object,
     configuration.quorum,
   );
@@ -845,6 +846,7 @@ pub async fn promote_under_configuration(
   let candidates = candidates_for(
     configuration.owner,
     &configuration.neighbourhood,
+    &configuration.domains,
     object,
     configuration.quorum,
   );

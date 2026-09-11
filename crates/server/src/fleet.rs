@@ -1761,7 +1761,8 @@ fn takeovers(state: &ShardState, local: HostId) -> Vec<ObjectId> {
     .iter()
     .copied()
     .filter(|object| {
-      candidates_for(local, &config.neighbourhood, *object, config.quorum).contains(&local)
+      candidates_for(local, &config.neighbourhood, &config.domains, *object, config.quorum)
+        .contains(&local)
     })
     .collect()
 }
@@ -1783,7 +1784,7 @@ async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -
   // node does not hold the object or is not a candidate for it.
   let prepared = state::with_state(|s| {
     let config = s.fleet.configuration();
-    let candidates = candidates_for(local, &config.neighbourhood, object, config.quorum);
+    let candidates = candidates_for(local, &config.neighbourhood, &config.domains, object, config.quorum);
     if !candidates.contains(&local) {
       return None;
     }

@@ -319,6 +319,7 @@ impl ConfigGroup {
     let object_survivors: Vec<HostId> = candidates_for(
       dead,
       &self.configuration.neighbourhood,
+      &self.configuration.domains,
       object,
       self.configuration.quorum,
     )
@@ -406,6 +407,7 @@ impl ConfigGroup {
     let object_survivors: Vec<HostId> = candidates_for(
       dead,
       &self.configuration.neighbourhood,
+      &self.configuration.domains,
       object,
       self.configuration.quorum,
     )
@@ -580,8 +582,9 @@ mod tests {
     assert_eq!(before.len(), 5, "a wide neighbourhood, above the floor");
 
     let object = ObjectId::new(OWNER, 7);
-    // The object's holders under the dead owner — the copyset placement puts it on.
-    let holders = candidates_for(OWNER, &before, object, Quorum { f: 1 });
+    // The object's holders under the dead owner — the copyset placement puts it on (the group's own
+    // domain map, so this matches what the takeover computes internally).
+    let holders = candidates_for(OWNER, &before, &group.configuration().domains, object, Quorum { f: 1 });
     assert_eq!(holders.len(), 3, "the object takes one copyset of 2f+1, not the whole neighbourhood");
 
     let new = group

@@ -1828,8 +1828,9 @@ loss probability, defaulting to the candidate floor 2f+1 — one copyset, the ti
 neighbourhood — until a deployment has sized its recovery (implemented: `ConfigGroup` bounds every
 neighbourhood to this width; placement and takeover route each object through the fixed-copyset
 construction in `candidates_for`, so above the floor the number of copysets stays linear in S, not
-`Θ(S^{2f})`, and a takeover successor is always a host that held the object — the failure domains default
-to unique-per-host until the manifest declares them, owed); hedge delay = measured p95 put latency per
+`Θ(S^{2f})`, and a takeover successor is always a host that held the object — placement carries a per-host
+failure-domain map so no copyset repeats a domain, defaulting to unique-per-host (each host its own) with
+the manifest source that populates it owed); hedge delay = measured p95 put latency per
 class; probation threshold = late
 count over the measured window that exceeds the hedge rate's variance; detection timeout for
 membership from RTT p99 × k; auto-seal cadence as before; healer cadence from the measured

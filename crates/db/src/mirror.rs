@@ -19,7 +19,7 @@
 //! holders stalls its lag without ever committing a record the home did not.
 
 use crate::ledger::{Cohort, Owner, Reach};
-use crate::register::{HostId, ObjectId, Quorum};
+use crate::register::{DomainId, HostId, ObjectId, Quorum};
 
 /// A volume's mirror region: a cohort of the mirror's candidate holders and the writer that replays
 /// the home region's committed records onto them in epoch order.
@@ -33,8 +33,14 @@ impl Mirror {
   /// The mirror region for `object`: its own `2f + 1` candidate holders drawn from the mirror
   /// region's neighbourhood, with an empty log. The `quorum` is the mirror region's fault-domain
   /// tree, independent of the home region's.
-  pub fn new(owner: HostId, neighbourhood: &[HostId], object: ObjectId, quorum: Quorum) -> Mirror {
-    let cohort = Cohort::new(owner, neighbourhood, object, quorum);
+  pub fn new(
+    owner: HostId,
+    neighbourhood: &[HostId],
+    domains: &std::collections::BTreeMap<HostId, DomainId>,
+    object: ObjectId,
+    quorum: Quorum,
+  ) -> Mirror {
+    let cohort = Cohort::new(owner, neighbourhood, domains, object, quorum);
     let writer = Owner::bootstrap(&cohort);
     Mirror { cohort, writer }
   }

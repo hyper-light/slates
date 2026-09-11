@@ -24,9 +24,11 @@ fn id(byte: u8) -> [u8; 32] {
 /// cohort rather than assuming them.
 fn fleet(f: u32) -> (Cohort, Owner) {
   let neighbourhood: Vec<HostId> = (1..=8u64).map(HostId).collect();
+  let domains = std::collections::BTreeMap::new(); // unique-per-host
   let cohort = Cohort::new(
     HostId(1),
     &neighbourhood,
+    &domains,
     ObjectId::new(HostId(1), 42),
     Quorum { f },
   );

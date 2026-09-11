@@ -40,8 +40,8 @@
 use std::collections::BTreeMap;
 
 use crate::register::{
-  Authority, FIRST_EPOCH, Fence, HostEpoch, HostId, ObjectId, Prepare, Quorum, RegisterError,
-  candidates_for,
+  Authority, DomainId, FIRST_EPOCH, Fence, HostEpoch, HostId, ObjectId, Prepare, Quorum,
+  RegisterError, candidates_for,
 };
 
 /// One entry in a holder's log. Its position is its index in the log (dense, `0`-based); it carries
@@ -109,8 +109,14 @@ impl Cohort {
   /// The cohort for `object`: the rendezvous candidates from the owner's neighbourhood (owner
   /// first, `2f + 1` total), each an empty holder at the first epoch. At `f = 0` this is the owner
   /// alone.
-  pub fn new(owner: HostId, neighbourhood: &[HostId], object: ObjectId, quorum: Quorum) -> Cohort {
-    let candidates = candidates_for(owner, neighbourhood, object, quorum);
+  pub fn new(
+    owner: HostId,
+    neighbourhood: &[HostId],
+    domains: &BTreeMap<HostId, DomainId>,
+    object: ObjectId,
+    quorum: Quorum,
+  ) -> Cohort {
+    let candidates = candidates_for(owner, neighbourhood, domains, object, quorum);
     let mut holders = BTreeMap::new();
     for candidate in &candidates {
       holders.insert(*candidate, Holder::default());
