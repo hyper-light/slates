@@ -10,7 +10,9 @@
 
 use std::mem::size_of;
 
-use slates_db::register::HostId;
+use slates_db::register::{
+  DomainId, HostEpoch, HostId, Neighbourhood, Quorum, RegionalConfiguration,
+};
 use slates_transport::endpoint::{Endpoint, EndpointError};
 
 use crate::raft::{
@@ -389,6 +391,113 @@ pub async fn request_raft(
   Ok(RaftMessage::decode(&reply).ok())
 }
 
+/// Encodes a [`RegionalConfiguration`] for the wire — a **learner** fetches it from a council voter to catch
+/// up on the committed configuration (§4.8, D-14: the council is a small elected set but the region is large,
+/// so a non-voter member *learns* the configuration rather than voting on it). Little-endian throughout,
+/// each map as a count then its entries, so two nodes encode it identically.
+pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> {
+  let mut out = Vec::new();
+  put_u64(&mut out, config.version);
+  put_u32(&mut out, config.quorum.f);
+  out.push(u8::from(config.has_mirror));
+  encode_hosts(&mut out, &config.members);
+  put_u32(
+    &mut out,
+    u32::try_from(config.neighbourhoods.len()).unwrap_or(u32::MAX),
+  );
+  for (owner, neighbourhood) in &config.neighbourhoods {
+    put_u64(&mut out, owner.0);
+    put_u64(&mut out, neighbourhood.generation);
+    encode_hosts(&mut out, &neighbourhood.hosts);
+  }
+  put_u32(
+    &mut out,
+    u32::try_from(config.epochs.len()).unwrap_or(u32::MAX),
+  );
+  for (host, epoch) in &config.epochs {
+    put_u64(&mut out, host.0);
+    put_u64(&mut out, epoch.0);
+  }
+  put_u32(
+    &mut out,
+    u32::try_from(config.domains.len()).unwrap_or(u32::MAX),
+  );
+  for (host, domain) in &config.domains {
+    put_u64(&mut out, host.0);
+    put_u64(&mut out, *domain);
+  }
+  out
+}
+
+/// Decodes a [`RegionalConfiguration`], or a typed refusal for hostile or truncated bytes — every declared
+/// count is bounded against the bytes that arrived before allocating (a lying count is
+/// [`RaftWireError::LengthMismatch`]), so a hostile datagram cannot force an over-allocation or a panic.
+pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfiguration, RaftWireError> {
+  let (version, rest) = take_u64(bytes)?;
+  let (f, rest) = take_u32(rest)?;
+  let (has_mirror, rest) = take_bool(rest)?;
+  let (members, rest) = decode_hosts(rest)?;
+  let (neighbourhoods, rest) = decode_neighbourhoods(rest)?;
+  let (epochs, rest) = decode_epochs(rest)?;
+  let (domains, rest) = decode_domains(rest)?;
+  expect_end(rest)?;
+  Ok(RegionalConfiguration {
+    version,
+    members,
+    neighbourhoods,
+    epochs,
+    domains,
+    quorum: Quorum { f },
+    has_mirror,
+  })
+}
+
+/// Decodes the neighbourhoods map (count, then each `(owner, generation, hosts)`), bounding the count.
+fn decode_neighbourhoods(
+  bytes: &[u8],
+) -> Result<(std::collections::BTreeMap<HostId, Neighbourhood>, &[u8]), RaftWireError> {
+  let (count, mut rest) = take_count(bytes)?;
+  let mut neighbourhoods = std::collections::BTreeMap::new();
+  for _ in 0..count {
+    let (owner, tail) = take_u64(rest)?;
+    let (generation, tail) = take_u64(tail)?;
+    let (hosts, tail) = decode_hosts(tail)?;
+    neighbourhoods.insert(HostId(owner), Neighbourhood { hosts, generation });
+    rest = tail;
+  }
+  Ok((neighbourhoods, rest))
+}
+
+/// Decodes the epochs map (count, then each `(host, epoch)`), bounding the count.
+fn decode_epochs(
+  bytes: &[u8],
+) -> Result<(std::collections::BTreeMap<HostId, HostEpoch>, &[u8]), RaftWireError> {
+  let (count, mut rest) = take_count(bytes)?;
+  let mut epochs = std::collections::BTreeMap::new();
+  for _ in 0..count {
+    let (host, tail) = take_u64(rest)?;
+    let (epoch, tail) = take_u64(tail)?;
+    epochs.insert(HostId(host), HostEpoch(epoch));
+    rest = tail;
+  }
+  Ok((epochs, rest))
+}
+
+/// Decodes the domains map (count, then each `(host, domain)`), bounding the count.
+fn decode_domains(
+  bytes: &[u8],
+) -> Result<(std::collections::BTreeMap<HostId, DomainId>, &[u8]), RaftWireError> {
+  let (count, mut rest) = take_count(bytes)?;
+  let mut domains = std::collections::BTreeMap::new();
+  for _ in 0..count {
+    let (host, tail) = take_u64(rest)?;
+    let (domain, tail) = take_u64(tail)?;
+    domains.insert(HostId(host), domain);
+    rest = tail;
+  }
+  Ok((domains, rest))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -513,6 +622,40 @@ mod tests {
     assert_eq!(
       RaftMessage::decode(&bytes),
       Err(RaftWireError::BadFlag { flag: 2 })
+    );
+  }
+
+  /// A regional configuration round-trips through encode/decode unchanged — members, per-owner
+  /// neighbourhoods, epochs, domains, quorum, version and mirror flag — so a learner decodes exactly what a
+  /// voter encoded.
+  #[test]
+  fn a_regional_configuration_round_trips() {
+    use slates_db::register::RegionalConfiguration;
+    let mut domains = std::collections::BTreeMap::new();
+    domains.insert(A, 7);
+    let config =
+      RegionalConfiguration::formed(vec![A, B, HostId(3)], Quorum { f: 1 }, domains, 3, true);
+    let bytes = encode_regional_configuration(&config);
+    assert_eq!(
+      decode_regional_configuration(&bytes),
+      Ok(config),
+      "round-trip is identity"
+    );
+  }
+
+  /// A regional configuration whose leading (members) count lies — more entries than the bytes back — is
+  /// refused before allocating, not panicked.
+  #[test]
+  fn a_lying_regional_configuration_count_is_refused() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // version
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // quorum.f
+    bytes.push(0); // has_mirror
+    bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // members count = huge
+    assert_eq!(
+      decode_regional_configuration(&bytes),
+      Err(RaftWireError::LengthMismatch),
+      "a count beyond the bytes is refused"
     );
   }
 }

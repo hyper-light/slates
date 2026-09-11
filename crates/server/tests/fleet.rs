@@ -700,6 +700,87 @@ fn a_council_commits_a_membership_retirement_over_the_transport() {
   );
 }
 
+/// AC (§4.8, D-14, learners): the council votes with a **small** set — the members up to the candidate floor
+/// `2f + 1` — and the rest are **learners** that do not vote but fetch the committed configuration over the
+/// transport. Five members at `f = 1` gives three voters and two learners. A learner never leads; and when
+/// the council commits a change (here a member's retirement), the learner **learns it by fetching** — its
+/// regional membership and placement neighbourhood drop the retired member — even though it cast no vote.
+/// This is the design's config-learning path that keeps the consensus group small while the region is large.
+#[test]
+fn a_learner_fetches_the_councils_committed_configuration_over_the_transport() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "e"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+
+  assert_fleet_forms(&daemons, &hosts, &names);
+  // The council votes with the three lowest-id members (the candidate floor 2f+1 = 3); the other two are
+  // learners (hosts not among the three lowest ids).
+  let mut by_id = hosts.clone();
+  by_id.sort_by_key(|host| host.0);
+  let voters: Vec<HostId> = by_id.iter().take(3).copied().collect();
+  let learner_hosts: Vec<HostId> = hosts
+    .iter()
+    .copied()
+    .filter(|h| !voters.contains(h))
+    .collect();
+  let observed_host = learner_hosts[0];
+  let dead = learner_hosts[1];
+  let observed_index = hosts
+    .iter()
+    .position(|h| *h == observed_host)
+    .expect("observed learner");
+
+  // A learner never leads the council (it is not a voter) — hold that across a window.
+  let learner_never_leads = holds_for(COUNCIL_STABILITY_WINDOW, || {
+    !daemons[observed_index].council_leads()
+  });
+
+  // Kill the other learner, and inject its death into the voters. (Real SWIM detection of a killed node
+  // under this 5-node + learner-polling load is slow and orthogonal to what this proves; the rejoin test
+  // injects deaths for the same reason.) The voters then commit its retirement over the transport — and the
+  // observed learner, which is NOT injected, learns it only by **fetching** the committed configuration
+  // from a voter, so its regional membership and placement neighbourhood drop the dead member with no vote.
+  let mut survivors: Vec<(HostId, Daemon)> = hosts.iter().copied().zip(daemons).collect();
+  let dead_pos = survivors
+    .iter()
+    .position(|(host, _)| *host == dead)
+    .expect("the killed learner is present");
+  survivors.remove(dead_pos).1.stop();
+  for (host, daemon) in &survivors {
+    if voters.contains(host) {
+      daemon.observe_peer_dead(dead, FALSE_DEATH_INCARNATION);
+    }
+  }
+  let observed_pos = survivors
+    .iter()
+    .position(|(host, _)| *host == observed_host)
+    .expect("the observed learner survives");
+  let learned = poll_until(COUNCIL_RETIRE_DEADLINE, || {
+    let daemon = &survivors[observed_pos].1;
+    !daemon.council_members().contains(&dead) && !daemon.placement_neighbourhood().contains(&dead)
+  });
+
+  for (_, daemon) in survivors {
+    daemon.stop();
+  }
+  assert!(
+    learner_never_leads,
+    "the learner {observed_host:?} never leads the council — it is a non-voter"
+  );
+  assert!(
+    learned,
+    "the learner {observed_host:?} fetched the council's committed retirement of {dead:?} — its regional \
+     membership and placement neighbourhood dropped the dead member, though it cast no vote"
+  );
+}
+
 /// AC (§4.8, boot step 6, N-node): **three** daemons form one live fleet over the per-peer socket mesh —
 /// each node serves each of its two peers on its own advertised socket pair (since `the demultiplexed serve sockets` pins
 /// one peer per socket) and dials each peer's — and when one node dies, the **two survivors each detect it

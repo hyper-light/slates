@@ -79,7 +79,9 @@ use slates_cluster::content::{fetch_content, is_content_stream, put_content};
 use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::fleet::{apply_peer_state, sync_peer};
 use slates_cluster::membership::Liveness;
-use slates_cluster::raft_wire::RaftMessage;
+use slates_cluster::raft_wire::{
+  RaftMessage, decode_regional_configuration, encode_regional_configuration,
+};
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once};
 use slates_cluster::{
   ClusterError, CommitBudget, PROMOTE_STREAM, RECORD_STREAM, Stragglers, commit_record,
@@ -773,6 +775,9 @@ async fn serve_peer_records(
           state::with_state(|s| s.held_content.serve(local, &request)).unwrap_or_default()
         }
         CONFIG_STREAM => state::with_state(|s| serve_council(s, &request)).unwrap_or_default(),
+        CONFIG_FETCH_STREAM => {
+          state::with_state(|s| serve_config_fetch(s, &request)).unwrap_or_default()
+        }
         _ => Vec::new(),
       })
       .await;
@@ -1532,6 +1537,11 @@ fn owner_authority(local: HostId) -> Option<Authority> {
 /// `raft_wire::RAFT_STREAM` is a separate single-plane context; here the council shares the record session.)
 const CONFIG_STREAM: u64 = 7;
 
+/// Format: the stream id a **learner** fetches the committed regional configuration on (§4.8, D-14). A
+/// non-voter member does not vote in the council; it asks a voter for its configuration over this stream and
+/// adopts a newer one — the design's config-learning path, distinct from the Raft stream (7) above.
+const CONFIG_FETCH_STREAM: u64 = 8;
+
 /// The configuration council's election timeout, in record-plane heartbeat periods: a follower that goes
 /// this many periods without a leader's append presumes the leader gone and campaigns. The per-node spread
 /// ([`election_jitter`]) adds a further `[0, this)`, making the effective timeout uniform in `[this, 2·this)`
@@ -1567,6 +1577,26 @@ fn serve_council(state: &mut ShardState, request: &[u8]) -> Vec<u8> {
   }
 }
 
+/// Answers a **learner**'s configuration fetch on [`CONFIG_FETCH_STREAM`] (§4.8, D-14): a non-voter member
+/// asks this node for the committed regional configuration, sending its own current version; this returns
+/// the configuration encoded **only if this node's is newer**, else an empty reply. So a caught-up learner's
+/// periodic fetch costs an eight-byte request and an empty reply rather than a full-configuration transfer —
+/// most fetches are no-ops at the near-zero config-commit rate. A malformed or short request is treated as
+/// version zero (the full configuration is returned). Runs synchronously inside `serve_once`.
+fn serve_config_fetch(state: &ShardState, request: &[u8]) -> Vec<u8> {
+  let learner_version = request
+    .get(..std::mem::size_of::<u64>())
+    .and_then(|bytes| <[u8; std::mem::size_of::<u64>()]>::try_from(bytes).ok())
+    .map(u64::from_le_bytes)
+    .unwrap_or(0);
+  let config = state.council.configuration();
+  if config.version > learner_version {
+    encode_regional_configuration(config)
+  } else {
+    Vec::new()
+  }
+}
+
 /// Ships each `(host, request)` to that host on [`CONFIG_STREAM`] over its borrowed record session,
 /// concurrently — one child task per session, each bounded by the dispatch deadline and handing its endpoint
 /// back whatever the outcome ([`request_within`]) — and returns every reply with its endpoint, so a slow or
@@ -1576,6 +1606,7 @@ fn serve_council(state: &mut ShardState, request: &[u8]) -> Vec<u8> {
 /// terminal, so a per-period round never accumulates task slots (banned item 8).
 async fn broadcast(
   requests: Vec<(HostId, Vec<u8>, Endpoint)>,
+  stream: u64,
   budget: CommitBudget,
 ) -> Vec<(HostId, Vec<u8>, Endpoint)> {
   if requests.is_empty() {
@@ -1587,7 +1618,7 @@ async fn broadcast(
   for (host, request, endpoint) in requests {
     let tx = tx.clone();
     if let Ok(task) = futures::spawn_child(async move {
-      let (reply, endpoint) = request_within(endpoint, CONFIG_STREAM, &request, deadline_ns).await;
+      let (reply, endpoint) = request_within(endpoint, stream, &request, deadline_ns).await;
       let _ = tx.send((host, reply, endpoint));
     }) {
       tasks.push(task);
@@ -1646,7 +1677,7 @@ async fn drive_council_replication(others: &[HostId], budget: CommitBudget) {
       None => kept.push((host, endpoint)),
     }
   }
-  let replied = broadcast(requests, budget).await;
+  let replied = broadcast(requests, CONFIG_STREAM, budget).await;
   let mut recovered = kept;
   let mut replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -1686,7 +1717,7 @@ async fn drive_council_election(others: &[HostId], budget: CommitBudget) {
     .into_iter()
     .map(|(host, endpoint)| (host, pre_bytes.clone(), endpoint))
     .collect();
-  let replied = broadcast(requests, budget).await;
+  let replied = broadcast(requests, CONFIG_STREAM, budget).await;
   let mut sessions = Vec::with_capacity(replied.len());
   let mut pre_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -1717,7 +1748,7 @@ async fn drive_council_election(others: &[HostId], budget: CommitBudget) {
     .into_iter()
     .map(|(host, endpoint)| (host, vote_bytes.clone(), endpoint))
     .collect();
-  let replied = broadcast(requests, budget).await;
+  let replied = broadcast(requests, CONFIG_STREAM, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
   let mut vote_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -1747,17 +1778,26 @@ async fn drive_config_council(
   seen_contact: &mut u64,
   attempt: &mut u32,
 ) {
-  let Some((is_leader, contact, others)) = state::with_state(|s| {
-    let others: Vec<HostId> = s
-      .council
-      .voters()
-      .into_iter()
-      .filter(|voter| *voter != local)
-      .collect();
-    (s.council.is_leader(), s.council.leader_contact(), others)
+  let Some((is_voter, is_leader, contact, voters)) = state::with_state(|s| {
+    let voters = s.council.voters();
+    (
+      s.council.is_voter(local),
+      s.council.is_leader(),
+      s.council.leader_contact(),
+      voters,
+    )
   }) else {
     return;
   };
+
+  // A learner (non-voter member): it does not drive the Raft — it fetches the committed configuration from
+  // the voters and adopts the newest (§4.8, D-14). The adopted configuration is installed into placement by
+  // `sync_config_from_council`, exactly as a voter's committed one is.
+  if !is_voter {
+    drive_learner_fetch(&voters, budget).await;
+    return;
+  }
+  let others: Vec<HostId> = voters.into_iter().filter(|voter| *voter != local).collect();
 
   if is_leader {
     // As the region's configuration master, track its membership from this node's own SWIM view: propose
@@ -1793,6 +1833,50 @@ async fn drive_config_council(
     // makes this node leader next period; a lost one waits out the timer again.
     *seen_contact = state::with_state(|s| s.council.leader_contact()).unwrap_or(*seen_contact);
   }
+}
+
+/// Drives a **learner** (a non-voter member) one period: fetches the committed regional configuration from
+/// the council voters it has a session to and adopts the newest (§4.8, D-14 — the council is a small elected
+/// set, so a non-voter learns the configuration rather than voting on it; the adopted configuration is then
+/// installed into placement by [`sync_config_from_council`] exactly as a voter's committed one is). The
+/// bare fetch is broadcast to every voter session and the highest-version reply adopted, so a lagging
+/// voter's stale copy never holds the learner back; every borrowed session is returned. A design refinement
+/// (owed) is the piggyback rule — fetching only when a stale-configuration refusal names a newer version
+/// (§4.8), rather than polling each period — but polling is correct and the config-commit rate is near zero.
+async fn drive_learner_fetch(voters: &[HostId], budget: CommitBudget) {
+  let sessions = take_sessions(|host| voters.contains(&host));
+  if sessions.is_empty() {
+    return;
+  }
+  // The fetch carries this learner's current configuration version, so a voter returns the configuration
+  // only when it has a newer one (a caught-up learner's fetch is then an empty reply, not a full transfer).
+  let request = state::with_state(|s| s.council.configuration().version)
+    .unwrap_or(0)
+    .to_le_bytes()
+    .to_vec();
+  let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, request.clone(), endpoint))
+    .collect();
+  let replied = broadcast(requests, CONFIG_FETCH_STREAM, budget).await;
+  let mut recovered = Vec::with_capacity(replied.len());
+  let mut fetched: Vec<Vec<u8>> = Vec::new();
+  for (host, reply, endpoint) in replied {
+    if !reply.is_empty() {
+      fetched.push(reply);
+    }
+    recovered.push((host, endpoint));
+  }
+  return_sessions(recovered);
+  // Adopt the newest fetched configuration (`adopt` only moves forward, so folding all replies leaves the
+  // learner on the highest version any reachable voter returned).
+  state::with_state(|s| {
+    for bytes in &fetched {
+      if let Ok(configuration) = decode_regional_configuration(bytes) {
+        s.council.adopt(configuration);
+      }
+    }
+  });
 }
 
 /// Installs the configuration the council has committed into this node's placement view and takes over any

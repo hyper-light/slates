@@ -728,6 +728,22 @@ fn handoff_of(env: &[(String, String)]) -> Result<(Handoff, usize), ServerError>
   Ok((handoff, len))
 }
 
+/// The council's voter set from the region `members` (§4.8, D-14 — "a small elected council per region"):
+/// the members with the lowest ids up to the candidate floor `2f + 1`, so the council tolerates `f` voter
+/// failures while staying small even in a large region; the members beyond it are **learners** that fetch
+/// the committed configuration rather than voting. Deterministic from the members (sorted by id), so every
+/// node computes the same voter set — the consensus group they all agree on. At `2f + 1` members or fewer
+/// every member votes (no learners), so a small fleet is unchanged.
+fn council_voters(
+  members: &[slates_db::HostId],
+  quorum: slates_db::register::Quorum,
+) -> Vec<slates_db::HostId> {
+  let mut sorted = members.to_vec();
+  sorted.sort_unstable_by_key(|host| host.0);
+  sorted.truncate(quorum.candidates().min(sorted.len()));
+  sorted
+}
+
 /// Runs on the shard: attaches the segment, recovers the partition, builds the store and
 /// installs the state, then spawns the server loop as a poller.
 fn init_shard(
@@ -809,10 +825,15 @@ fn init_shard(
     Some(membership) => {
       let mut members = membership.peers.clone();
       members.push(host);
+      // The council votes with a **small** set (§4.8, D-14 — "a small elected council per region"): the
+      // members with the lowest ids up to the candidate floor `2f+1`, so it tolerates `f` voter failures
+      // while staying small even in a large region; the rest are learners that fetch the committed
+      // configuration. Deterministic from the members, so every node derives the same voter set.
+      let voters = council_voters(&members, membership.quorum);
       slates_cluster::config_group::RegionalCouncil::new(
         host,
-        members.clone(),
         members,
+        voters,
         membership.quorum,
         membership.domains.clone(),
         config.derived_scatter(membership.quorum),

@@ -636,6 +636,27 @@ impl RegionalCouncil {
     proposed
   }
 
+  /// Whether `node` is a **voter** of this council — a member of the Raft consensus set. A non-voter
+  /// (a **learner**) does not vote; it learns the committed configuration by fetching it from a voter and
+  /// [`adopt`](RegionalCouncil::adopt)ing it. The drive loop reads this to take the voter path (drive the
+  /// Raft) or the learner path (fetch).
+  pub fn is_voter(&self, node: HostId) -> bool {
+    self.raft.all_voters().contains(&node)
+  }
+
+  /// Adopts a configuration a **learner** fetched from a council voter (§4.8, D-14: the council is a small
+  /// elected set, so a non-voter member learns the committed configuration rather than voting on it).
+  /// Returns whether it advanced — a fetch that is not newer than what this node already has (it is current,
+  /// or the fetch raced a newer local view) is ignored, so adoption only moves forward. Only the drive
+  /// loop's learner branch calls this; a voter's configuration is the deterministic fold of its Raft log.
+  pub fn adopt(&mut self, configuration: RegionalConfiguration) -> bool {
+    if configuration.version <= self.configuration.version {
+      return false;
+    }
+    self.configuration = configuration;
+    true
+  }
+
   /// Applies every committed but not-yet-applied command to the regional configuration, in commit order —
   /// the deterministic fold every voter makes, so the configuration is the same on all of them.
   fn apply_committed(&mut self) {
