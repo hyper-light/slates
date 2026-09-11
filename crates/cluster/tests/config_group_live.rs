@@ -1,19 +1,20 @@
-//! The **distributed configuration group** live over the simulated UDP fabric (§4.8, D-14): a multi-voter
-//! [`ConfigGroup`] elects a leader over the transport, and a configuration change proposed on the leader
-//! replicates to the voter, commits at a majority, and applies at *both* — the config-group Raft driven
-//! over real mutually-authenticated sessions, not the lone-voter degenerate the laptop runs. The safety of
-//! the Raft dialect is proven in `tests/raft.rs`; here we prove the config group's own `Admit`/`Retire`
-//! changes ride the transport and commit. Test by use (R5); real network/process deployment is a further
-//! gate (the demux + fleet loop).
+//! The **regional configuration council** live over the simulated UDP fabric (§4.8, D-14): a multi-voter
+//! [`RegionalCouncil`] elects a leader through the full **pre-vote** round (Raft §9.6) over the transport,
+//! and a membership change proposed on the leader replicates to the voter, commits at a majority, and
+//! applies to the regional configuration at *both* — the config-group Raft driven over real
+//! mutually-authenticated sessions, not the lone-voter degenerate. The Raft dialect's safety is proven in
+//! `tests/raft.rs`; here we prove the council's own changes ride the transport and commit. Test by use (R5);
+//! real network/process deployment is a further gate (the daemon fleet-loop config plane).
 
 // Test harness: an unwrap or expect here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, channel};
 
 use rustix::net::{Ipv4Addr, SocketAddrV4};
 use rustls::pki_types::PrivateKeyDer;
-use slates_cluster::config_group::{ConfigGroup, Reconfiguration};
+use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
 use slates_cluster::raft_wire::{RaftMessage, request_raft};
 use slates_db::register::{HostId, Quorum};
 use slates_rt::runtime::RuntimeConfig;
@@ -27,6 +28,8 @@ const FRAME_CAP: usize = 16;
 const LEADER: HostId = HostId(1);
 const VOTER: HostId = HostId(2);
 const ADMITTED: HostId = HostId(3);
+/// The candidate floor at f=1 (2f+1), the scatter the two-host council's neighbourhoods are bounded to.
+const SCATTER: u64 = 3;
 
 fn config() -> RuntimeConfig {
   RuntimeConfig {
@@ -65,17 +68,30 @@ async fn recv_port(rx: Receiver<u16>) -> u16 {
   }
 }
 
-/// What the live distributed config change produced at the leader and the voter.
+/// A two-voter council on `node`, members and voters both `[LEADER, VOTER]`, at f=1.
+fn council(node: HostId) -> RegionalCouncil {
+  RegionalCouncil::new(
+    node,
+    vec![LEADER, VOTER],
+    vec![LEADER, VOTER],
+    Quorum { f: 1 },
+    BTreeMap::new(),
+    SCATTER,
+    false,
+  )
+}
+
+/// What the live distributed membership change produced at the leader and the voter.
 struct Outcome {
   leader_leads: bool,
   leader_admitted: bool,
   voter_admitted: bool,
 }
 
-/// Drives one live round: the leader (`1`) wins the voter's (`2`) vote over an authenticated session,
-/// proposes admitting host `3` to the neighbourhood, and replicates it — the change commits at the majority
-/// and applies at both nodes, all over the transport.
-fn run_distributed_config_change() -> Outcome {
+/// Drives one live round: the leader (`1`) wins the voter's (`2`) pre-vote then vote over an authenticated
+/// session, proposes admitting host `3` to the region, and replicates it — the change commits at the
+/// majority and applies to the regional configuration at both nodes, all over the transport.
+fn run_distributed_membership_change() -> Outcome {
   let mut sim = SimRuntime::new(&config(), 1).unwrap();
   let id = sim.shard_ids()[0];
 
@@ -89,7 +105,7 @@ fn run_distributed_config_change() -> Outcome {
   let (result_tx, result_rx) = channel::<Outcome>();
   let (voter_tx, voter_rx) = channel::<bool>();
 
-  // The voter: handshake, then serve the vote request and the two appends into its own config group.
+  // The voter: handshake, then answer the pre-vote, the vote request, and the two appends into its council.
   sim
     .spawn_on(id, async move {
       let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -106,13 +122,13 @@ fn run_distributed_config_change() -> Outcome {
       .unwrap();
       endpoint.establish().await.unwrap();
 
-      let mut voter = ConfigGroup::new_group(VOTER, Quorum { f: 1 }, vec![LEADER, VOTER]);
-      // Serve the vote, then the append carrying the entry, then the heartbeat carrying the commit index.
-      for _ in 0..3 {
+      let mut voter = council(VOTER);
+      // Serve the pre-vote, the vote request, the append carrying the entry, then the commit heartbeat.
+      for _ in 0..4 {
         endpoint
           .serve_once(|_, request| match RaftMessage::decode(&request) {
             Ok(message) => voter
-              .handle_raft(message)
+              .answer(message)
               .map(|reply| reply.encode())
               .unwrap_or_default(),
             Err(_) => Vec::new(),
@@ -120,11 +136,11 @@ fn run_distributed_config_change() -> Outcome {
           .await
           .unwrap();
       }
-      let _ = voter_tx.send(voter.configuration().neighbourhood.contains(&ADMITTED));
+      let _ = voter_tx.send(voter.configuration().members.contains(&ADMITTED));
     })
     .unwrap();
 
-  // The leader: dial, win the election, propose the change, and replicate it to commit and propagate.
+  // The leader: dial, win the pre-vote and the vote, propose the change, and replicate it to commit.
   sim
     .spawn_on(id, async move {
       let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -142,35 +158,35 @@ fn run_distributed_config_change() -> Outcome {
       .unwrap();
       endpoint.establish().await.unwrap();
 
-      let mut leader = ConfigGroup::new_group(LEADER, Quorum { f: 1 }, vec![LEADER, VOTER]);
+      let mut leader = council(LEADER);
 
-      // Win the election over the transport.
-      let vote = leader.campaign().into_iter().next().unwrap();
-      if let Some(reply) = request_raft(&mut endpoint, &RaftMessage::RequestVote(vote))
-        .await
-        .unwrap()
-      {
-        leader.handle_raft(reply);
+      // The full pre-vote → vote election over the transport: drain every follow-on message (the pre-votes,
+      // then the real vote requests the granted pre-vote yields) until the exchange settles.
+      let mut pending = leader.election_timeout();
+      while let Some(request) = pending.pop() {
+        if let Some(reply) = request_raft(&mut endpoint, &request).await.unwrap() {
+          pending.extend(leader.fold_reply(reply));
+        }
       }
 
-      // Propose a configuration change; at more than one voter it commits and applies only over the wire.
-      let proposed = leader.propose_change(Reconfiguration::Admit(ADMITTED));
+      // Propose a membership change; at more than one voter it commits and applies only over the wire.
+      let proposed = leader.propose(Reconfiguration::Admit(ADMITTED));
 
       // Round one replicates the entry (the voter appends, the leader commits at the majority); round two's
       // heartbeat carries the advanced commit index, so the voter applies too.
       for _ in 0..2 {
-        let append = leader.replication_for(VOTER).expect("an append to replicate");
-        if let Some(reply) = request_raft(&mut endpoint, &RaftMessage::AppendEntries(append))
-          .await
-          .unwrap()
+        if let Some(append) = leader.replication_for(VOTER)
+          && let Some(reply) = request_raft(&mut endpoint, &RaftMessage::AppendEntries(append))
+            .await
+            .unwrap()
         {
-          leader.handle_raft(reply);
+          leader.fold_reply(reply);
         }
       }
 
       let _ = result_tx.send(Outcome {
         leader_leads: leader.is_leader() && proposed,
-        leader_admitted: leader.configuration().neighbourhood.contains(&ADMITTED),
+        leader_admitted: leader.configuration().members.contains(&ADMITTED),
         voter_admitted: false,
       });
     })
@@ -182,15 +198,15 @@ fn run_distributed_config_change() -> Outcome {
   outcome
 }
 
-/// A multi-voter configuration group elects a leader over the transport and commits a configuration change
-/// at the majority, applying it at both voters — the config group is genuinely distributed, not the
-/// lone-voter degenerate.
+/// A regional council elects a leader through the pre-vote round over the transport and commits a membership
+/// change at the majority, applying it to the regional configuration at both voters — the config group is
+/// genuinely distributed, not the lone-voter degenerate.
 #[test]
-fn a_multi_voter_config_change_commits_and_applies_across_the_transport() {
-  let outcome = run_distributed_config_change();
+fn a_regional_council_commits_a_membership_change_across_the_transport() {
+  let outcome = run_distributed_membership_change();
   assert!(
     outcome.leader_leads,
-    "the leader won the election over the transport and proposed the change"
+    "the leader won the pre-vote and the vote over the transport and proposed the change"
   );
   assert!(
     outcome.leader_admitted,
@@ -198,6 +214,6 @@ fn a_multi_voter_config_change_commits_and_applies_across_the_transport() {
   );
   assert!(
     outcome.voter_admitted,
-    "and replicated then applied at the voter — the config group commits across the transport"
+    "and replicated then applied at the voter — the council commits across the transport"
   );
 }

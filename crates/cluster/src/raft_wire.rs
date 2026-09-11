@@ -14,7 +14,8 @@ use slates_db::register::HostId;
 use slates_transport::endpoint::{Endpoint, EndpointError};
 
 use crate::raft::{
-  AppendEntries, AppendReply, LogEntry, RaftNode, RequestVote, VoteReply, VoterConfig,
+  AppendEntries, AppendReply, LogEntry, PreVote, PreVoteReply, RaftNode, RequestVote, VoteReply,
+  VoterConfig,
 };
 
 /// A Raft message on the wire.
@@ -28,6 +29,11 @@ pub enum RaftMessage {
   AppendEntries(AppendEntries),
   /// An append reply.
   AppendReply(AppendReply),
+  /// A pre-vote request (Raft §9.6): "could a real election win?", asked without inflating the term, so a
+  /// partitioned node cannot disrupt a healthy leader.
+  PreVote(PreVote),
+  /// A pre-vote reply.
+  PreVoteReply(PreVoteReply),
 }
 
 /// A refusal to decode a Raft message from received bytes (the closed hostile-input taxonomy).
@@ -54,6 +60,9 @@ const TAG_REQUEST_VOTE: u8 = 1;
 const TAG_VOTE_REPLY: u8 = 2;
 const TAG_APPEND_ENTRIES: u8 = 3;
 const TAG_APPEND_REPLY: u8 = 4;
+/// Format: the pre-election tag bytes, continuing the leading-tag sequence.
+const TAG_PRE_VOTE: u8 = 5;
+const TAG_PRE_VOTE_REPLY: u8 = 6;
 
 /// Shape: the largest entry count, command length or voter count a decoder accepts before allocating —
 /// a hostile datagram cannot force an unbounded allocation. Far above any real Raft batch or fleet size.
@@ -98,6 +107,19 @@ impl RaftMessage {
         put_u64(&mut out, reply.term);
         out.push(u8::from(reply.success));
         put_u64(&mut out, reply.match_index);
+      }
+      RaftMessage::PreVote(request) => {
+        out.push(TAG_PRE_VOTE);
+        put_u64(&mut out, request.term);
+        put_u64(&mut out, request.candidate.0);
+        put_u64(&mut out, request.last_log_index);
+        put_u64(&mut out, request.last_log_term);
+      }
+      RaftMessage::PreVoteReply(reply) => {
+        out.push(TAG_PRE_VOTE_REPLY);
+        put_u64(&mut out, reply.voter.0);
+        put_u64(&mut out, reply.term);
+        out.push(u8::from(reply.granted));
       }
     }
     out
@@ -165,6 +187,30 @@ impl RaftMessage {
           term,
           success,
           match_index,
+        }))
+      }
+      TAG_PRE_VOTE => {
+        let (term, rest) = take_u64(rest)?;
+        let (candidate, rest) = take_u64(rest)?;
+        let (last_log_index, rest) = take_u64(rest)?;
+        let (last_log_term, rest) = take_u64(rest)?;
+        expect_end(rest)?;
+        Ok(RaftMessage::PreVote(PreVote {
+          term,
+          candidate: HostId(candidate),
+          last_log_index,
+          last_log_term,
+        }))
+      }
+      TAG_PRE_VOTE_REPLY => {
+        let (voter, rest) = take_u64(rest)?;
+        let (term, rest) = take_u64(rest)?;
+        let (granted, rest) = take_bool(rest)?;
+        expect_end(rest)?;
+        Ok(RaftMessage::PreVoteReply(PreVoteReply {
+          voter: HostId(voter),
+          term,
+          granted,
         }))
       }
       other => Err(RaftWireError::UnknownTag { tag: other }),
@@ -320,6 +366,7 @@ pub async fn serve_raft_once(
 ) -> Result<(), EndpointError> {
   endpoint
     .serve_once(|_, request| match RaftMessage::decode(&request) {
+      Ok(RaftMessage::PreVote(pre)) => RaftMessage::PreVoteReply(node.on_pre_vote(pre)).encode(),
       Ok(RaftMessage::RequestVote(vote)) => {
         RaftMessage::VoteReply(node.on_request_vote(vote)).encode()
       }
@@ -391,6 +438,17 @@ mod tests {
         term: 5,
         success: true,
         match_index: 4,
+      }),
+      RaftMessage::PreVote(PreVote {
+        term: 8,
+        candidate: A,
+        last_log_index: 4,
+        last_log_term: 3,
+      }),
+      RaftMessage::PreVoteReply(PreVoteReply {
+        voter: B,
+        term: 8,
+        granted: false,
       }),
     ];
     for message in messages {
