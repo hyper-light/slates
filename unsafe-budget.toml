@@ -14,7 +14,7 @@
 #   the file-backed map of a memory object (1), the descriptor a child inherits (1), the two
 #   atomic views of mapped words (2), and the Windows section (create, open, view, drop, the two
 #   byte views and the lock: 8).
-# slates-rt (48): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
+# slates-rt (49): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
 #   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
 #   the IOCP calls are Win32 (6); the UDP readiness registration (§4.10a, added 2026-09-07): the
 #   kqueue read-filter `kevent` (unsafe by signature, one change record, 1) and the epoll
@@ -73,6 +73,8 @@
 # slates-land (3): the macOS libc calls rustix does not wrap, each on a descriptor the writer
 #   owns: fcntl(F_BARRIERFSYNC) as the data barrier, fcntl(F_FULLFSYNC) as the media barrier,
 #   renameatx_np(RENAME_SWAP) as the exchange.
+#   the Winsock `getsockopt(SO_RCVBUF)` of a live socket (§4.10a, added 2026-09-10 for the
+#   demultiplexer's per-session queue sizing; Win32, unsafe by signature, 1).
 #
 # slates-archive (0): the archive format is byte buffers written and read in field order
 #   through a sequential reader/writer (`wire.rs`), never a cast; content-addressed and verified
@@ -81,7 +83,7 @@
 [budget]
 slates-machine = 43
 slates-mem = 16
-slates-rt = 48
+slates-rt = 49
 slates-base = 6
 slates-vfs = 0
 slates-land = 3

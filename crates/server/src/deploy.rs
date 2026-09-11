@@ -10,13 +10,10 @@
 //!   pins for the mutual-TLS session, so it is the one fact about a node every other node holds, and the
 //!   id follows from it without a registry (D-14: ids route to owners, no global catalog). Two nodes
 //!   sharing a certificate would be one member; the plan refuses that (`DuplicateCertificate`).
-//! - **The socket layout.** The membership loop binds one serve socket per peer per plane
-//!   ([`FleetPeer`]: `Endpoint::accept` pins one peer per socket, until the connection-ID demux that would
-//!   multiplex them is built). Rather than have the operator write `N·(N−1)` address pairs, each node
-//!   advertises one base port and owns the block of `2N` ports from it: it serves the node at manifest
-//!   index `j` on `base + 2j` (probes) and `base + 2j + 1` (records), and the node at index `j` dials it
-//!   there ([`serve_port`]). Node `i`'s own pair (`2i`, `2i + 1`) is unused — a fixed layout with one
-//!   formula beats one with a gap to compute. A block that would run past the port range is refused
+//! - **The socket layout.** A node serves every peer on one socket per plane
+//!   (`slates_transport::demux`: sessions are told apart by the connection id in each packet), so it
+//!   advertises one base port and owns the next: it serves probes on `base` and records on `base + 1`
+//!   ([`serve_port`]), and every peer dials it there. A base at the very end of the port range is refused
 //!   (`PortBlockOverflows`), never wrapped.
 //!
 //! This module is pure: it takes the manifest as values (the certificate and key bytes already read) and
@@ -41,8 +38,8 @@ use crate::fleet::{FleetPeer, FleetTransport};
 pub struct FleetNodeEntry {
   /// The operator's name for the node — what `--node NAME` selects. Unique within the manifest.
   pub node: String,
-  /// The node's advertised address: the IP its peers dial, and the **base** of its port block (see the
-  /// module doc: the node owns `2N` ports from here).
+  /// The node's advertised address: the IP its peers dial, and the **base** of its two ports (see the
+  /// module doc: probes on it, records on the next).
   pub address: SocketAddrV4,
   /// The node's operator-provisioned certificate (DER): what its peers pin, and what its member id is
   /// derived from.
@@ -70,9 +67,8 @@ pub struct FleetPlan {
   pub transport: FleetTransport,
 }
 
-/// Which of a node's two per-peer serve sockets: the SWIM probe plane or the register record plane (the
-/// two ride separate sockets because their wire formats are not distinguished by content on a shared
-/// stream — the connection-ID demux that would multiplex them is owed, `crate::fleet`).
+/// Which of a node's two serve sockets: the SWIM probe plane or the register record plane (the two ride
+/// separate sockets because their wire formats are not distinguished by content on a shared stream).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Plane {
   /// SWIM probes and their acknowledgements.
@@ -101,7 +97,7 @@ pub enum DeployError {
     /// The second.
     second: String,
   },
-  /// A node's port block, `2N` ports from its base, runs past the port range.
+  /// A node's two ports, from its base, run past the port range.
   PortBlockOverflows {
     /// The node.
     node: String,
@@ -160,9 +156,8 @@ impl std::fmt::Display for DeployError {
 
 impl std::error::Error for DeployError {}
 
-/// Format: a node serves each peer on two ports (one per plane), so a node's block is two ports per
-/// manifest entry (its own pair unused, see the module doc).
-const PORTS_PER_ENTRY: u16 = 2;
+/// Format: a node serves on two ports, one per plane — probes on its base, records on the next.
+const PORTS_PER_NODE: u16 = 2;
 
 /// A node's member id: the leading eight bytes of the BLAKE3 hash of its DER certificate, little-endian
 /// (the same cut `daemon::host_id_of` takes of the machine identity's hash on a laptop). Every node of a
@@ -176,21 +171,14 @@ pub fn host_id_of_certificate(certificate: &CertificateDer<'_>) -> HostId {
   ]))
 }
 
-/// The port a node with port block base `base` serves manifest entry `peer_index` on, for `plane`
-/// (`base + 2·index`, `+ 1` for the record plane), or the overflow when the block runs past `u16`.
-pub fn serve_port(base: u16, peer_index: usize, plane: Plane) -> Option<u16> {
-  let index = u16::try_from(peer_index).ok()?;
-  let offset = index.checked_mul(PORTS_PER_ENTRY)?;
+/// The port a node with base port `base` serves `plane` on (`base` for probes, `base + 1` for records),
+/// or the overflow when it runs past `u16`.
+pub fn serve_port(base: u16, plane: Plane) -> Option<u16> {
   let plane_offset = match plane {
     Plane::Probe => 0,
     Plane::Record => 1,
   };
-  base.checked_add(offset)?.checked_add(plane_offset)
-}
-
-/// The ports a manifest of `entries` nodes needs per node: its whole block.
-fn block_len(entries: usize) -> Option<u16> {
-  u16::try_from(entries).ok()?.checked_mul(PORTS_PER_ENTRY)
+  base.checked_add(plane_offset)
 }
 
 /// Checks what must hold for any node's plan: at least one node, a quorum some set of nodes can reach,
@@ -209,7 +197,6 @@ fn validate(manifest: &FleetManifest, node: &str) -> Result<usize, DeployError> 
       f: manifest.quorum.f,
     });
   }
-  let block = block_len(manifest.nodes.len());
   for (index, entry) in manifest.nodes.iter().enumerate() {
     for other in &manifest.nodes[..index] {
       if other.node == entry.node {
@@ -224,16 +211,12 @@ fn validate(manifest: &FleetManifest, node: &str) -> Result<usize, DeployError> 
         });
       }
     }
-    // The block's last port must exist: `base + 2N − 1`.
-    let fits = block
-      .and_then(|len| len.checked_sub(1))
-      .and_then(|last| entry.address.port().checked_add(last))
-      .is_some();
-    if !fits {
+    // The node's last port must exist: `base + 1`.
+    if serve_port(entry.address.port(), Plane::Record).is_none() {
       return Err(DeployError::PortBlockOverflows {
         node: entry.node.clone(),
         base: entry.address.port(),
-        needed: block.unwrap_or(u16::MAX),
+        needed: PORTS_PER_NODE,
       });
     }
   }
@@ -246,12 +229,11 @@ fn validate(manifest: &FleetManifest, node: &str) -> Result<usize, DeployError> 
     })
 }
 
-/// The serve address of manifest entry `server` for entry `client` on `plane`: the server's IP, and the
-/// port its block assigns the client. `validate` proved every block fits, so the overflow arm is unreachable
-/// after it; it is kept typed rather than panicked (banned item 6).
-fn serve_address(server: &FleetNodeEntry, client: usize, plane: Plane) -> Option<SocketAddrV4> {
-  serve_port(server.address.port(), client, plane)
-    .map(|port| SocketAddrV4::new(*server.address.ip(), port))
+/// The address manifest entry `server` serves `plane` on: its IP and the plane's port. `validate` proved
+/// every node's ports fit, so the overflow arm is unreachable after it; it is kept typed rather than
+/// panicked (banned item 6).
+fn serve_address(server: &FleetNodeEntry, plane: Plane) -> Option<SocketAddrV4> {
+  serve_port(server.address.port(), plane).map(|port| SocketAddrV4::new(*server.address.ip(), port))
 }
 
 /// Checks, once, that the TLS stack can build this node's server side from its identity with every
@@ -280,9 +262,9 @@ fn check_identity(
 
 /// This node's plan from the shared manifest: `node` selects its entry, `key` is its private key (the
 /// one secret the manifest does not carry — each node reads only its own). Every peer's dial addresses
-/// are the peer's serve ports for this node's index, and this node's serve binds are its own block's
-/// ports for each peer's index, so the two sides of every session agree by construction. The identity
-/// and the pins are checked against the TLS stack before the plan is returned.
+/// are that peer's two serve ports, and this node's serve binds are its own two, so the two sides of every
+/// session agree by construction. The identity and the pins are checked against the TLS stack before the
+/// plan is returned.
 pub fn plan(
   manifest: &FleetManifest,
   node: &str,
@@ -291,23 +273,28 @@ pub fn plan(
   let this = validate(manifest, node)?;
   let entry = &manifest.nodes[this];
   let host = host_id_of_certificate(&entry.certificate);
+  let overflow = |node: &FleetNodeEntry| DeployError::PortBlockOverflows {
+    node: node.node.clone(),
+    base: node.address.port(),
+    needed: PORTS_PER_NODE,
+  };
+  let (Some(probe_bind), Some(record_bind)) = (
+    serve_address(entry, Plane::Probe),
+    serve_address(entry, Plane::Record),
+  ) else {
+    return Err(overflow(entry));
+  };
   let mut peers = Vec::with_capacity(manifest.nodes.len().saturating_sub(1));
   let mut peer_hosts = Vec::with_capacity(peers.capacity());
   for (index, peer) in manifest.nodes.iter().enumerate() {
     if index == this {
       continue;
     }
-    let (Some(address), Some(record_address), Some(probe_bind), Some(record_bind)) = (
-      serve_address(peer, this, Plane::Probe),
-      serve_address(peer, this, Plane::Record),
-      serve_address(entry, index, Plane::Probe),
-      serve_address(entry, index, Plane::Record),
+    let (Some(address), Some(record_address)) = (
+      serve_address(peer, Plane::Probe),
+      serve_address(peer, Plane::Record),
     ) else {
-      return Err(DeployError::PortBlockOverflows {
-        node: peer.node.clone(),
-        base: peer.address.port(),
-        needed: block_len(manifest.nodes.len()).unwrap_or(u16::MAX),
-      });
+      return Err(overflow(peer));
     };
     let peer_host = host_id_of_certificate(&peer.certificate);
     peer_hosts.push(peer_host);
@@ -315,8 +302,6 @@ pub fn plan(
       host: peer_host,
       address,
       record_address,
-      probe_bind,
-      record_bind,
       certificate: peer.certificate.clone(),
     });
   }
@@ -332,6 +317,8 @@ pub fn plan(
     transport: FleetTransport {
       identity,
       name: manifest.name.clone(),
+      probe_bind,
+      record_bind,
       peers,
     },
   })
@@ -407,27 +394,9 @@ mod tests {
       .expect("the host is a manifest node")
   }
 
-  /// Both planes of one ordered pair agree: my dial address for the peer is the peer's serve bind for
-  /// me, and the peer's dial address for me is my serve bind for it.
-  fn assert_pair_agrees(mine: &FleetPeer, theirs: &FleetPeer) {
-    assert_eq!(mine.address, theirs.probe_bind, "probe: dial == their bind");
-    assert_eq!(
-      mine.record_address, theirs.record_bind,
-      "record: dial == their bind"
-    );
-    assert_eq!(
-      theirs.address, mine.probe_bind,
-      "probe: their dial == my bind"
-    );
-    assert_eq!(
-      theirs.record_address, mine.record_bind,
-      "record: their dial == my bind"
-    );
-  }
-
-  /// The two sides of every session agree: b's dial address for a is a's serve bind for b, on both
-  /// planes, for every ordered pair — and every peer's id is the certificate-derived one every other node
-  /// computes.
+  /// The two sides of every session agree: my dial addresses for a peer are that peer's own serve binds,
+  /// on both planes, for every ordered pair — and every peer's id is the certificate-derived one every
+  /// other node computes.
   #[test]
   fn every_pair_of_plans_agrees_on_its_sockets_and_ids() {
     let (manifest, keys) = manifest();
@@ -443,23 +412,24 @@ mod tests {
       for peer in &mine.transport.peers {
         let j = index_of(&manifest, peer.host);
         assert_ne!(j, i);
-        let theirs = plans[j]
-          .transport
-          .peers
-          .iter()
-          .find(|p| p.host == my_host)
-          .expect("the peer lists this node");
-        assert_pair_agrees(peer, theirs);
+        let theirs = &plans[j].transport;
+        assert_eq!(peer.address, theirs.probe_bind, "probe: dial == their bind");
+        assert_eq!(
+          peer.record_address, theirs.record_bind,
+          "record: dial == their bind"
+        );
       }
     }
   }
 
-  /// The layout by number: node a (base 40 000) serves b (index 1) on 40 002/40 003, and b (base 41 000)
-  /// serves a (index 0) on 41 000/41 001 — the formula `base + 2·index (+ 1)`.
+  /// The layout by number: node a (base 40 000) serves probes on 40 000 and records on 40 001, and dials
+  /// b (base 41 000) at 41 000/41 001 — `base` and `base + 1`.
   #[test]
-  fn the_port_layout_is_base_plus_twice_the_index() {
+  fn the_port_layout_is_the_base_and_the_next() {
     let (manifest, keys) = manifest();
     let a = plan(&manifest, "a", key_of(&keys, "a")).expect("a plan");
+    assert_eq!(a.transport.probe_bind.port(), 40_000);
+    assert_eq!(a.transport.record_bind.port(), 40_001);
     let b_host = host_id_of_certificate(&manifest.nodes[1].certificate);
     let to_b = a
       .transport
@@ -467,11 +437,9 @@ mod tests {
       .iter()
       .find(|p| p.host == b_host)
       .expect("b");
-    assert_eq!(to_b.probe_bind.port(), 40_002);
-    assert_eq!(to_b.record_bind.port(), 40_003);
     assert_eq!(to_b.address.port(), 41_000);
     assert_eq!(to_b.record_address.port(), 41_001);
-    assert_eq!(serve_port(u16::MAX - 1, 1, Plane::Record), None);
+    assert_eq!(serve_port(u16::MAX, Plane::Record), None);
   }
 
   /// Each refusal names what the operator must fix.
@@ -502,13 +470,13 @@ mod tests {
       })
     );
     let (mut overflow, keys) = manifest();
-    overflow.nodes[1].address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, u16::MAX - 2);
+    overflow.nodes[1].address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, u16::MAX);
     assert_eq!(
       plan(&overflow, "a", key_of(&keys, "a")).err(),
       Some(DeployError::PortBlockOverflows {
         node: "b".to_owned(),
-        base: u16::MAX - 2,
-        needed: 6
+        base: u16::MAX,
+        needed: 2
       })
     );
     let (mut too_few, keys) = manifest();

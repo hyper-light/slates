@@ -728,6 +728,7 @@ fn init_shard(
     current_request: slates_wire::request::RequestId::default(),
     placed_heads: std::collections::BTreeMap::new(),
     formed_probe_peers: std::collections::BTreeSet::new(),
+    demuxes: Vec::new(),
     holder_records: std::collections::BTreeMap::new(),
     pending_takeovers: std::collections::BTreeSet::new(),
     record_sessions: std::collections::BTreeMap::new(),

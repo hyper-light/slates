@@ -87,6 +87,11 @@ pub(crate) fn sim_fabric_reset() {
   SIM_FABRIC.with(|f| *f.borrow_mut() = SimFabric::new());
 }
 
+/// Shape: the receive buffer a simulated datagram socket reports (`UdpSocket::recv_buffer_bytes`) — the
+/// smaller of the default kernel datagram buffers on the machines this runs on (Linux 208 KiB, macOS
+/// 768 KiB), so a consumer sized from it in simulation is sized as it would be on the stricter host.
+pub const SIM_RECV_BUFFER_BYTES: usize = 208 * 1024;
+
 /// Binds a simulated UDP port on this thread's fabric.
 pub fn sim_udp_bind() -> u16 {
   SIM_FABRIC.with(|f| f.borrow_mut().bind())

@@ -184,6 +184,9 @@ pub struct ShardState {
   /// tell whether the fleet's direct mesh is up, which a formation observer must wait for rather than the
   /// seeded view. Empty on a laptop (no fleet loop runs).
   pub formed_probe_peers: std::collections::BTreeSet<slates_db::HostId>,
+  /// The serve-socket demultiplexers the membership loop runs on this shard (the control shard's two
+  /// planes; empty elsewhere and on a laptop), for the status report to read their counters.
+  pub demuxes: Vec<&'static slates_transport::demux::Demux>,
   /// The register records this node holds as a **candidate holder** for other owners' objects (§4.8
   /// "records are sent to all candidates; committed at `f + 1`"): one durable [`Acceptor`] per object
   /// this node backs, keyed by the object. A peer's record commit — served on the per-peer record socket

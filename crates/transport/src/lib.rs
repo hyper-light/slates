@@ -38,6 +38,7 @@ pub mod accept;
 pub mod congestion;
 pub mod conn;
 pub mod connection;
+pub mod demux;
 pub mod endpoint;
 pub mod enrollment;
 pub mod flow;

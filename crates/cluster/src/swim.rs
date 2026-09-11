@@ -450,8 +450,8 @@ pub enum ProbeOutcome {
 /// a dead peer times out rather than looking alive forever (`docs/bugs/2026-09-10-swim-stale-ack.md`).
 ///
 /// **Robustness (keeping the session).** A timeout is a *transient miss*, not a verdict: a lost packet, a
-/// moment's scheduling jitter, or a nonce-rejected stale reply all produce one. Because a single accepted
-/// session cannot be re-established (`Endpoint::accept` pins one source), dropping it on one miss would
+/// moment's scheduling jitter, or a nonce-rejected stale reply all produce one. Dropping the session on one
+/// miss (a fresh handshake to replace it, and a verdict taken from one packet) would
 /// retire a peer on any transient glitch — which is what made both survivors retire a *live* peer during
 /// formation. So the session is kept and the caller re-probes it: the ping carries this node's suspicion,
 /// the still-live peer refutes it (SWIM's incarnation refutation, [`crate::detector::Detector`]), and the

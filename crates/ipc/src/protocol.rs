@@ -443,6 +443,16 @@ pub struct FleetReport {
   /// Peers with a formed probe session (the direct mesh), summed over the shards: the mesh is up when
   /// this reaches the member count less one.
   pub peers_probed: u32,
+  /// Packets the node's serve sockets dropped because their connection id named no live session (a
+  /// stale packet, a stray, or a session already closed), summed over the planes.
+  pub unknown_id: u64,
+  /// Datagrams the serve sockets dropped because a session's inbox was full, summed over the planes.
+  pub inbox_full: u64,
+  /// Handshakes from new dialers refused because every session slot was taken, summed over the planes.
+  pub sessions_refused: u64,
+  /// Sessions closed because their peer established a new one (a re-dial after a loss), summed over the
+  /// planes.
+  pub replaced: u64,
 }
 
 /// The daemon's status.

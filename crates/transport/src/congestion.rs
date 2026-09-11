@@ -17,7 +17,7 @@
 /// Format: the initial congestion window, in max-size datagrams (RFC 9002 §7.2, `kInitialWindow` — "10
 /// times the max datagram size"). A protocol constant, not a tunable: it is the standard's starting
 /// point, from which the control law takes over.
-const INITIAL_WINDOW_DATAGRAMS: u64 = 10;
+pub const INITIAL_WINDOW_DATAGRAMS: u64 = 10;
 /// Format: the minimum congestion window, in max-size datagrams (RFC 9002 §7.2, `kMinimumWindow` — "2
 /// times the max datagram size"). The window never shrinks below this, so a connection always makes
 /// progress. A protocol constant.

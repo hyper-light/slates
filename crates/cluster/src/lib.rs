@@ -289,8 +289,8 @@ struct Reply(HostId, Vec<u8>, Box<Endpoint>);
 /// of the dispatch's reply channel, kept open so each straggler task — bounded by the dispatch's full span
 /// ([`CommitBudget::max_deadline_ns`], the same bound the collection loop used) — hands its **session** back
 /// here when it finishes, instead of having it dropped by a cancellation. The caller recovers the sessions
-/// later ([`Stragglers::recover`]) and reuses them, so an early quorum costs no slow holder its session —
-/// which the per-peer-socket mesh cannot re-establish (`Endpoint::accept` pins one source). The straggler's
+/// later ([`Stragglers::recover`]) and reuses them, so an early quorum costs no slow holder its session
+/// (re-establishing one means a fresh handshake and the peer replacing its session). The straggler's
 /// reply itself is not folded (the dispatch already resolved without it); a commit re-ships to that holder
 /// next period over the recovered session, idempotently. Empty when nothing was dispatched.
 pub struct Stragglers {
@@ -336,8 +336,8 @@ impl Stragglers {
 /// reply bytes (empty on a timeout or a transport error) **together with the endpoint, kept whatever the
 /// outcome**. This is what lets a dispatch task *always* hand its holder's session back to the collection
 /// loop — a straggler that never replies still returns its endpoint at the deadline rather than blocking
-/// until it is cancelled and its session dropped. A dropped session cannot be re-established in the
-/// per-peer-socket mesh (`Endpoint::accept` pins one source), so keeping it is what lets the caller retry a
+/// until it is cancelled and its session dropped. A dropped session costs a fresh handshake to replace,
+/// so keeping it is what lets the caller retry a
 /// load-timed-out commit or promotion over the same warm session instead of stranding the object
 /// (`docs/bugs/2026-09-10-swim-stale-ack.md` records the same discipline for the SWIM probe). The deadline
 /// is the collection loop's own bound — its full progress-extended span
@@ -364,6 +364,12 @@ async fn request_within(
     })
     .await
   };
+  if reply.is_none() {
+    // The deadline won: the `request` future was dropped mid-exchange. Forget the abandoned stream so
+    // its half-sent frames do not ride the next flush on this reused session and reach the peer folded
+    // into an unrelated request (`docs/bugs/2026-09-10-abandoned-request-retransmit-lockstep.md`).
+    endpoint.forget_stream(stream_id);
+  }
   (reply.unwrap_or_default(), endpoint)
 }
 

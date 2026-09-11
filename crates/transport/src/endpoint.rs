@@ -15,23 +15,33 @@
 //! timeout, retransmits the oldest in-flight packet ([`Connection::probe`]) — the loss-recovery and probe
 //! paths themselves are proven by the `connection` oracle. Flow-control (per-stream and connection-wide
 //! credit), congestion control, and multi-stream multiplexing are enforced by the [`Connection`] this
-//! drives; RTT is estimated here (this end holds the clock — see [`Endpoint::smoothed_rtt`]). Remaining
-//! connection work: connection IDs and an MTU budget (several frames per packet). The `Arc` here is
-//! rustls's config (D-8 exception 2), in `crate::handshake`.
+//! drives; RTT is estimated here (this end holds the clock — see [`Endpoint::smoothed_rtt`]). Every
+//! 1-RTT packet carries the session's **connection id** — eight bytes both ends derive from the TLS
+//! exporter once the handshake completes ([`Endpoint::connection_id`]) — so a socket shared by several
+//! peers routes each packet to its session (`crate::demux`); an endpoint reaches the wire through its
+//! own socket or such a shared one (`Link`). Remaining connection work: an MTU budget (several frames
+//! per packet). The `Arc` here is rustls's config (D-8 exception 2), in `crate::handshake`.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::task::Poll;
 use std::time::Instant;
 
 use rustix::net::SocketAddrV4;
-use rustls::quic::{ClientConnection, KeyChange, Keys, ServerConnection};
+use rustls::pki_types::CertificateDer;
+use rustls::quic::{KeyChange, Keys};
 use slates_rt::udp::UdpSocket;
 
 use crate::connection::{Connection, initial_receive_window};
+use crate::demux::{Demux, DemuxId, Slot, with_demux};
 use crate::handshake::{HandshakeError, Identity, client_connection, server_connection};
 use crate::packet_number::{MAX_PACKET_NUMBER_BYTES, decode_packet_number, encode_packet_number};
 use crate::rtt::{GRANULARITY_NS, RttEstimator};
 use crate::session::{Frame, decode_frames, encode_frames};
 
+/// Format: RFC 9000 §14.1 — the smallest datagram every QUIC path must carry (1200 bytes); the fleet's
+/// frame cap and a receive queue's sizing derive from it.
+pub const MIN_DATAGRAM_BYTES: usize = 1200;
 /// Format: RFC 9000 §17.3 — bit 6 of a short-header first byte, always 1 ("fixed bit"); a packet with
 /// it clear is not a valid short header.
 const FIXED_BIT: u8 = 0x40;
@@ -41,10 +51,16 @@ const SHORT_HEADER_RESERVED_MASK: u8 = 0x18;
 /// Format: RFC 9000 §17.3 — bits 0-1 of a short-header first byte carry the packet-number length minus
 /// one, so a stored 0..=3 means a 1..=4 byte field.
 const PACKET_NUMBER_LENGTH_MASK: u8 = 0x03;
-/// Shape: this slice binds one UDP socket to one peer, so a packet needs no connection ID to tell
-/// connections apart; the destination connection ID is therefore zero-length. A non-zero ID (for
-/// connection migration, or several connections on one socket) is owed.
-const CONNECTION_ID_BYTES: usize = 0;
+/// Format: RFC 9000 §17.2/§17.3 — the destination connection id every short header carries, eight
+/// bytes (within the standard's 0..=20). Both ends derive it from the TLS exporter once the handshake
+/// completes ([`Endpoint::connection_id`]), so it is unique per session and never negotiated on the
+/// wire; a socket shared by several peers routes each 1-RTT packet by it (`crate::demux`).
+pub const CONNECTION_ID_BYTES: usize = 8;
+/// A session's connection id (see [`CONNECTION_ID_BYTES`]).
+pub type ConnectionId = [u8; CONNECTION_ID_BYTES];
+/// Format: the TLS exporter label the connection id is derived under (RFC 8446 §7.5, RFC 5705): a
+/// label private to this dialect, so no other exporter use can collide with it.
+const CONNECTION_ID_LABEL: &[u8] = b"slates connection id v1";
 /// The offset of the packet-number field: past the single first byte and the connection ID.
 /// Format: RFC 9000 §17.3 short-header layout.
 const PACKET_NUMBER_OFFSET: usize = 1 + CONNECTION_ID_BYTES;
@@ -88,6 +104,11 @@ const MAX_HANDSHAKE_RETRANSMITS: u32 = 32;
 /// round trip, so a handful of silent timeouts is conclusive; the exact value is not performance-tuned.
 const HANDSHAKE_CONFIRM_SILENCE: u32 = 3;
 
+/// Format: the most doublings the probe-timeout backoff applies — enough that a timeout of the timer
+/// granularity (RFC 9002 §6.1.2, one millisecond) climbs past any initial PTO (`1 ms × 2^12 ≈ 4 s`), the
+/// ceiling the backed-off timeout is held under anyway; a shift no larger than this cannot overflow.
+const PTO_BACKOFF_SHIFT_CAP: u32 = 12;
+
 /// A refusal on the endpoint.
 #[derive(Debug)]
 pub enum EndpointError {
@@ -104,6 +125,9 @@ pub enum EndpointError {
   Header,
   /// The frames inside a packet did not decode.
   Frames(crate::session::SessionError),
+  /// The demultiplexer closed this session: its peer established a new one (a re-dial after a loss),
+  /// or the peer was retired. The reader ends its loop; nothing more arrives here.
+  Closed,
 }
 
 impl From<rustls::Error> for EndpointError {
@@ -117,37 +141,53 @@ impl From<slates_rt::error::RtError> for EndpointError {
   }
 }
 
-/// The two QUIC connection kinds behind one interface, so the endpoint drives either.
-enum Quic {
-  Client(ClientConnection),
-  Server(ServerConnection),
-}
+/// The QUIC connection behind the endpoint — rustls's own client/server enum, so the handshake, the
+/// exporter (the connection id) and the peer's certificate come from one type whichever side this is.
+type Quic = rustls::quic::Connection;
 
-impl Quic {
-  fn write_hs(&mut self, out: &mut Vec<u8>) -> Option<KeyChange> {
-    match self {
-      Quic::Client(c) => c.write_hs(out),
-      Quic::Server(s) => s.write_hs(out),
-    }
-  }
-  fn read_hs(&mut self, data: &[u8]) -> Result<(), rustls::Error> {
-    match self {
-      Quic::Client(c) => c.read_hs(data),
-      Quic::Server(s) => s.read_hs(data),
-    }
-  }
-  fn is_handshaking(&self) -> bool {
-    match self {
-      Quic::Client(c) => c.is_handshaking(),
-      Quic::Server(s) => s.is_handshaking(),
-    }
-  }
+/// What the endpoint asks of the connection beyond rustls's own surface.
+trait QuicExt {
   /// Whether this is the TLS **client** — the side that, in TLS 1.3, finishes the handshake the instant
   /// it *sends* its Certificate/Finished flight, so it (not the server) bears the tail-loss risk that
   /// [`Endpoint::confirm_handshake`] closes.
+  fn is_client(&self) -> bool;
+  /// The connection id both ends derive from the TLS exporter (RFC 8446 §7.5) — refused by rustls
+  /// before the handshake completes.
+  fn export_connection_id(&self) -> Result<ConnectionId, rustls::Error>;
+  /// The peer's end-entity certificate, once the handshake authenticated it.
+  fn peer_certificate(&self) -> Option<CertificateDer<'static>>;
+}
+
+impl QuicExt for Quic {
   fn is_client(&self) -> bool {
     matches!(self, Quic::Client(_))
   }
+  fn export_connection_id(&self) -> Result<ConnectionId, rustls::Error> {
+    self.export_keying_material([0u8; CONNECTION_ID_BYTES], CONNECTION_ID_LABEL, None)
+  }
+  fn peer_certificate(&self) -> Option<CertificateDer<'static>> {
+    self
+      .peer_certificates()
+      .and_then(|chain| chain.first())
+      .cloned()
+  }
+}
+
+/// How an endpoint reaches the wire: its own socket (one socket, one peer — a dialing client, or a
+/// server told its peer), or a socket shared with other sessions through a demultiplexer, which routes
+/// each received datagram to this session's inbox by connection id (`crate::demux`). Sends go straight
+/// to the socket either way.
+enum Link {
+  /// This endpoint's own socket.
+  Own(UdpSocket),
+  /// A shared socket: sends through the demultiplexer's socket, receives from this session's inbox. The
+  /// demultiplexer is named by id (looked up on this shard), so the endpoint stays `Send`.
+  Shared {
+    /// The demultiplexer (process-lifetime, one per socket) on this shard.
+    demux: DemuxId,
+    /// This session's slot in it.
+    slot: Slot,
+  },
 }
 
 /// One end of a session: the UDP socket, the peer, the QUIC handshake state, the 1-RTT keys once
@@ -157,10 +197,12 @@ impl Quic {
 /// cursor; `frame_cap` sizes each frame and the receive window. Completed streams are forgotten after
 /// each exchange so a long-lived connection does not accumulate them without bound.
 pub struct Endpoint {
-  socket: UdpSocket,
+  link: Link,
   peer: SocketAddrV4,
   quic: Quic,
   keys: Option<Keys>,
+  /// The connection id, once derived from the completed handshake ([`Endpoint::connection_id`]).
+  cid: Option<ConnectionId>,
   conn: Connection,
   rx_largest: u64,
   frame_cap: usize,
@@ -170,12 +212,31 @@ pub struct Endpoint {
   /// The send time of each ack-eliciting packet still awaiting acknowledgement, keyed by packet number,
   /// for the RTT sample. Pruned as packets are acknowledged, so it stays within the in-flight window.
   send_times: BTreeMap<u64, Instant>,
-  /// Whether this endpoint learns its peer address from the first datagram it receives. A server created
-  /// by [`accept`](Endpoint::accept) does not know the client's address until the client dials it, so the
-  /// first `recv_from` in [`establish`](Endpoint::establish) adopts that source as the peer; a `client` or
-  /// `server` built with a known peer has this `false` and keeps its pinned peer. Mutual TLS still gates
-  /// who may complete the handshake (`allowed_clients`), so adopting the source is not a trust decision.
-  learn_peer: bool,
+  /// A client's final handshake flight, kept after establishment: a raw handshake datagram arriving on
+  /// an established session is a server still asking for it (its confirmation raced this end's exit
+  /// from the handshake), and is answered by resending it. Empty on a server.
+  final_flight: Vec<u8>,
+  /// Datagrams an established session discarded rather than folded — a raw handshake retransmit, a
+  /// packet naming another session, one that did not open under the keys (RFC 9000 §12.2: an
+  /// undecryptable packet is discarded, never fatal). A counter, so a test can assert the discard path
+  /// ran.
+  discarded: u64,
+  /// Consecutive probe timeouts without an acknowledgement in between (RFC 9002 §6.2.1's PTO count):
+  /// each one doubles the next probe timeout, so a peer that has gone silent is retransmitted to at a
+  /// falling rate rather than every estimated round trip — on a loopback path a few hundred
+  /// microseconds, which would send thousands of retransmits a second into a dead port and starve the
+  /// shard's live sessions. Reset to zero by the next acknowledgement.
+  pto_count: u32,
+}
+
+impl Drop for Endpoint {
+  fn drop(&mut self) {
+    // A session on a shared socket gives its slot back, so the demultiplexer forgets its routes and can
+    // reuse the slot under a new generation.
+    if let Link::Shared { demux, slot } = &self.link {
+      let _ = with_demux(*demux, |d| d.release(*slot));
+    }
+  }
 }
 
 impl Endpoint {
@@ -191,16 +252,19 @@ impl Endpoint {
   ) -> Result<Endpoint, EndpointError> {
     let client = client_connection(identity, pinned, name).map_err(EndpointError::Handshake)?;
     Ok(Endpoint {
-      socket,
+      link: Link::Own(socket),
       peer,
       quic: Quic::Client(client),
       keys: None,
+      cid: None,
       conn: Connection::new(initial_receive_window(frame_cap)),
       rx_largest: 0,
       frame_cap,
       rtt: RttEstimator::new(),
       send_times: BTreeMap::new(),
-      learn_peer: false,
+      final_flight: Vec::new(),
+      discarded: 0,
+      pto_count: 0,
     })
   }
 
@@ -216,49 +280,125 @@ impl Endpoint {
   ) -> Result<Endpoint, EndpointError> {
     let server = server_connection(identity, allowed_clients).map_err(EndpointError::Handshake)?;
     Ok(Endpoint {
-      socket,
+      link: Link::Own(socket),
       peer,
       quic: Quic::Server(server),
       keys: None,
+      cid: None,
       conn: Connection::new(initial_receive_window(frame_cap)),
       rx_largest: 0,
       frame_cap,
       rtt: RttEstimator::new(),
       send_times: BTreeMap::new(),
-      learn_peer: false,
+      final_flight: Vec::new(),
+      discarded: 0,
+      pto_count: 0,
     })
   }
 
-  /// A server end that **accepts a client without knowing its address in advance** — the counterpart of
-  /// [`server`](Endpoint::server) for a fleet node whose one advertised socket a peer dials from an
-  /// address chosen at dial time (§4.8; the fleet transport). It presents `identity` and requires a client
-  /// certificate among `allowed_clients` (mutual authentication — the same trust `server` enforces, so an
-  /// unauthorised dialer's handshake fails), and adopts the source of the first datagram it receives as
-  /// its peer (`learn_peer`). One accepted `socket` serves one peer; a node accepting *several* peers on
-  /// one socket needs the connection-ID demux the endpoint marks owed. The caller drives
-  /// [`establish`](Endpoint::establish) as usual; it learns the peer on the first receive.
-  pub fn accept(
-    socket: UdpSocket,
-    identity: &Identity,
-    allowed_clients: &[rustls::pki_types::CertificateDer<'static>],
-    frame_cap: usize,
+  /// A server end a demultiplexer opened for a dialer it heard from `peer` on its shared socket
+  /// (`crate::demux`): it presents the demultiplexer's identity and requires the dialer's certificate
+  /// among its allowed clients (mutual authentication — the same trust `server` enforces), and reads
+  /// its datagrams from its inbox at `slot`. The consumer drives [`establish`](Endpoint::establish) as
+  /// for any endpoint; once the handshake completes the session's connection id is bound in the
+  /// demultiplexer so the peer's 1-RTT packets route here.
+  pub(crate) fn accepted(
+    demux: DemuxId,
+    slot: Slot,
+    peer: SocketAddrV4,
+    on: &Demux,
   ) -> Result<Endpoint, EndpointError> {
-    let server = server_connection(identity, allowed_clients).map_err(EndpointError::Handshake)?;
-    // A harmless placeholder until the first datagram's source is adopted: the socket's own address,
-    // which is never sent to (the first send follows the first receive, which sets the real peer).
-    let peer = socket.local_addr().map_err(EndpointError::Io)?;
+    let server = on.server_connection().map_err(EndpointError::Handshake)?;
+    let frame_cap = on.frame_cap();
     Ok(Endpoint {
-      socket,
+      link: Link::Shared { demux, slot },
       peer,
       quic: Quic::Server(server),
       keys: None,
+      cid: None,
       conn: Connection::new(initial_receive_window(frame_cap)),
       rx_largest: 0,
       frame_cap,
       rtt: RttEstimator::new(),
       send_times: BTreeMap::new(),
-      learn_peer: true,
+      final_flight: Vec::new(),
+      discarded: 0,
+      pto_count: 0,
     })
+  }
+
+  /// Datagrams this established session discarded rather than folded (see the field): a raw handshake
+  /// retransmit answered and dropped, a packet for another session, one that did not open.
+  pub fn discarded(&self) -> u64 {
+    self.discarded
+  }
+
+  /// The peer's end-entity certificate, once the handshake authenticated it — how a server that
+  /// accepted a session on a shared socket tells which peer dialed it.
+  pub fn peer_certificate(&self) -> Option<CertificateDer<'static>> {
+    self.quic.peer_certificate()
+  }
+
+  /// This session's connection id — the eight bytes both ends derive from the TLS exporter once the
+  /// handshake completes (never negotiated on the wire), carried in every 1-RTT short header. Refused
+  /// `NotReady` before the handshake completes. The first derivation on a shared link binds the id (and
+  /// the peer's certificate) in the demultiplexer, so the peer's packets route to this session — and
+  /// replaces any session the same peer established before.
+  pub fn connection_id(&mut self) -> Result<ConnectionId, EndpointError> {
+    if let Some(cid) = self.cid {
+      return Ok(cid);
+    }
+    if self.quic.is_handshaking() {
+      return Err(EndpointError::NotReady);
+    }
+    let cid = self.quic.export_connection_id()?;
+    self.cid = Some(cid);
+    if let Link::Shared { demux, slot } = &self.link {
+      let peer = self.quic.peer_certificate().map(|c| c.as_ref().to_vec());
+      with_demux(*demux, |d| d.bind(*slot, cid, peer)).ok_or(EndpointError::Closed)?;
+    }
+    Ok(cid)
+  }
+
+  /// Sends one datagram to the peer over this endpoint's link.
+  fn send(&self, datagram: &[u8]) -> Result<(), EndpointError> {
+    match &self.link {
+      Link::Own(socket) => socket
+        .send_to(datagram, self.peer)
+        .map(|_| ())
+        .map_err(EndpointError::Io),
+      Link::Shared { demux, .. } => {
+        with_demux(*demux, |d| d.send_to(datagram, self.peer)).ok_or(EndpointError::Closed)?
+      }
+    }
+  }
+
+  /// Receives one datagram over the link into `buf` — its length and source — or `Ok(None)` if
+  /// `timeout_ns` elapses first. The receive is raced against a timer; a delivered datagram is preferred
+  /// when both are ready, so a live exchange never trades a received packet for a spurious
+  /// retransmission. On a shared link the datagram comes from this session's inbox, which the
+  /// demultiplexer fills; `Closed` once the demultiplexer closed the session.
+  async fn recv_within(
+    &self,
+    buf: &mut [u8],
+    timeout_ns: u64,
+  ) -> Result<Option<(usize, SocketAddrV4)>, EndpointError> {
+    let outcome = match &self.link {
+      Link::Own(socket) => within(socket.recv_from(buf), timeout_ns)
+        .await
+        .map(|received| received.map_err(EndpointError::Io)),
+      Link::Shared { demux, slot } => {
+        within(
+          std::future::poll_fn(|cx| {
+            with_demux(*demux, |d| d.poll_recv(*slot, buf, cx))
+              .unwrap_or(Poll::Ready(Err(EndpointError::Closed)))
+          }),
+          timeout_ns,
+        )
+        .await
+      }
+    };
+    outcome.transpose()
   }
 
   /// The smoothed round-trip time this end has estimated (nanoseconds), zero before any acknowledgement
@@ -300,7 +440,7 @@ impl Endpoint {
     for _ in 0..HANDSHAKE_TURN_CEILING {
       let out = self.drain_handshake();
       if !out.is_empty() {
-        self.socket.send_to(&out, self.peer)?;
+        self.send(&out)?;
         sent_at = Some(Instant::now());
         last_flight = out;
       }
@@ -308,7 +448,11 @@ impl Endpoint {
         // The TLS bytes are all exchanged, but TLS 1.3 leaves the two ends *asymmetrically* finished —
         // the client the moment it sends its final flight, the server only when it receives it — so a
         // dropped final flight would strand the server. Confirm delivery before returning (RFC 9001
-        // §4.1.2, RFC 9000 §19.20).
+        // §4.1.2, RFC 9000 §19.20). A client keeps its final flight past establishment, to answer a
+        // server whose confirmation raced this exit and that is still asking for the flight.
+        if self.quic.is_client() {
+          self.final_flight = last_flight.clone();
+        }
         return self.confirm_handshake(&last_flight).await;
       }
       // Receive the peer's next flight, retransmitting our last flight each probe timeout so a dropped
@@ -327,29 +471,13 @@ impl Endpoint {
       // and doubling reaches a slow-to-listen peer within milliseconds while the ceiling keeps a peer that
       // never answers from being retried faster than the estimated round trip; the retransmit count still
       // bounds the whole wait (banned item 8: no unbounded wait).
-      let (n, from) = {
+      let n = {
         let mut attempts = 0u32;
         let mut backoff = GRANULARITY_NS;
         loop {
-          let received = {
-            let mut recv = std::pin::pin!(self.socket.recv_from(&mut buf));
-            let mut timer = std::pin::pin!(slates_rt::futures::sleep(
-              backoff.min(self.handshake_probe_ceiling())
-            ));
-            std::future::poll_fn(|cx| {
-              if let std::task::Poll::Ready(result) = std::future::Future::poll(recv.as_mut(), cx) {
-                return std::task::Poll::Ready(Some(result));
-              }
-              if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
-                return std::task::Poll::Ready(None);
-              }
-              std::task::Poll::Pending
-            })
-            .await
-          };
-          match received {
-            Some(result) => {
-              let (rn, rfrom) = result?;
+          let period = backoff.min(self.handshake_probe_ceiling());
+          match self.recv_within(&mut buf, period).await? {
+            Some((rn, _from)) => {
               // Skip an exact re-send of the flight already consumed (a peer retransmit that raced this
               // end's reply): feeding it to `read_hs` would fault the handshake stream. It still counts
               // against the bound, so a peer flooding duplicates cannot loop this forever (banned item 8).
@@ -360,7 +488,7 @@ impl Endpoint {
                 }
                 continue;
               }
-              break (rn, rfrom);
+              break rn;
             }
             None => {
               attempts += 1;
@@ -368,8 +496,10 @@ impl Endpoint {
                 return Err(EndpointError::NotReady);
               }
               backoff = backoff.saturating_mul(2);
-              if !self.learn_peer && !last_flight.is_empty() {
-                self.socket.send_to(&last_flight, self.peer)?;
+              // A server the demultiplexer opened has no flight until it has read the client's first, so it
+              // simply waits; a dialer resends its last flight.
+              if !last_flight.is_empty() {
+                self.send(&last_flight)?;
                 sent_at = Some(Instant::now());
               }
             }
@@ -386,13 +516,6 @@ impl Endpoint {
         let sample = u64::try_from(Instant::now().saturating_duration_since(flight).as_nanos())
           .unwrap_or(u64::MAX);
         self.rtt.on_sample(sample, 0);
-      }
-      // A server built by `accept` adopts the source of the first datagram it hears as its peer, so its
-      // reply (drained and sent on the next turn) reaches the client that dialed it. Only the first
-      // receive sets it; thereafter the peer is pinned.
-      if self.learn_peer {
-        self.peer = from;
-        self.learn_peer = false;
       }
       // Remember this flight so a later exact re-send of it (a peer retransmit) is recognized and skipped
       // above rather than fed to `read_hs` a second time.
@@ -431,8 +554,8 @@ impl Endpoint {
     let mut backoff = GRANULARITY_NS;
     loop {
       let period = backoff.min(self.handshake_probe_ceiling());
-      match self.receive_raw(&mut buf, period).await? {
-        Some(n) => {
+      match self.recv_within(&mut buf, period).await? {
+        Some((n, _)) => {
           // A packet that unprotects under the 1-RTT keys is the server's confirmation: it has its keys,
           // so it received our final flight, and the handshake is complete both ways.
           if self.ingest(&buf[..n]).is_ok() {
@@ -441,7 +564,7 @@ impl Endpoint {
           // Otherwise a raw handshake retransmit (the server has not seen our final flight yet): resend
           // it at once. A received datagram is progress — the peer is alive and still asking — so it does
           // not count toward the give-up budget, which counts only silent timeouts.
-          self.socket.send_to(last_flight, self.peer)?;
+          self.send(last_flight)?;
         }
         None => {
           retransmits += 1;
@@ -449,7 +572,7 @@ impl Endpoint {
             return Err(EndpointError::NotReady);
           }
           backoff = backoff.saturating_mul(2);
-          self.socket.send_to(last_flight, self.peer)?;
+          self.send(last_flight)?;
         }
       }
     }
@@ -474,15 +597,16 @@ impl Endpoint {
     let mut backoff = GRANULARITY_NS;
     loop {
       let period = backoff.min(self.handshake_probe_ceiling());
-      match self.receive_raw(&mut buf, period).await? {
-        Some(n) => {
+      match self.recv_within(&mut buf, period).await? {
+        Some((n, _)) => {
           // A datagram that unprotects under the 1-RTT keys is the client's own application traffic — it
           // has our confirmation and moved on, so the handshake is done. Drop this datagram (do not
           // ingest it): the client's exchange retransmits it to the serve loop this returns into.
+          let cid = self.connection_id()?;
           let confirmed = self
             .keys
             .as_ref()
-            .is_some_and(|keys| unprotect_packet(keys, self.rx_largest, &buf[..n]).is_ok());
+            .is_some_and(|keys| unprotect_packet(keys, &cid, self.rx_largest, &buf[..n]).is_ok());
           if confirmed {
             return Ok(());
           }
@@ -513,42 +637,13 @@ impl Endpoint {
   /// Sends one 1-RTT handshake-confirmation packet to the peer (see [`Connection::emit_confirm`]): a
   /// fresh packet number and a re-advertised flow-control credit, protected under the local 1-RTT keys.
   fn send_confirm(&mut self) -> Result<(), EndpointError> {
+    let cid = self.connection_id()?;
     let (pn, frames) = self.conn.emit_confirm();
     let largest_acked = self.conn.tx_largest_acked();
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
-    let datagram = protect_packet(keys, pn, largest_acked, &frames)?;
-    self.socket.send_to(&datagram, self.peer)?;
+    let datagram = protect_packet(keys, &cid, pn, largest_acked, &frames)?;
+    self.send(&datagram)?;
     Ok(())
-  }
-
-  /// Receives one datagram into `buf`, or `Ok(None)` if `timeout_ns` elapses first — the confirmation
-  /// loops' clock. Unlike [`receive_within`](Endpoint::receive_within), it does not ingest what it
-  /// receives: a datagram in the confirmation window may be a peer 1-RTT confirmation or a raw handshake
-  /// retransmit, and the caller inspects the raw bytes to tell them apart.
-  async fn receive_raw(
-    &mut self,
-    buf: &mut [u8],
-    timeout_ns: u64,
-  ) -> Result<Option<usize>, EndpointError> {
-    let outcome = {
-      let mut recv = std::pin::pin!(self.socket.recv_from(buf));
-      let mut timer = std::pin::pin!(slates_rt::futures::sleep(timeout_ns));
-      std::future::poll_fn(|cx| {
-        if let std::task::Poll::Ready(received) = std::future::Future::poll(recv.as_mut(), cx) {
-          return std::task::Poll::Ready(Some(received));
-        }
-        if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
-          return std::task::Poll::Ready(None);
-        }
-        std::task::Poll::Pending
-      })
-      .await
-    };
-    match outcome {
-      Some(Ok((n, _from))) => Ok(Some(n)),
-      Some(Err(e)) => Err(e.into()),
-      None => Ok(None),
-    }
   }
 
   /// Drains every handshake byte the connection currently has to send, across encryption-level
@@ -573,10 +668,11 @@ impl Endpoint {
   /// number (from the connection's continuous packet-number space) and its frames, which are protected
   /// under the local 1-RTT keys (the number sized against what the peer has acknowledged) and sent.
   fn flush(&mut self) -> Result<(), EndpointError> {
+    let cid = self.connection_id()?;
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
     while let Some((pn, frames)) = self.conn.poll_transmit(self.frame_cap) {
-      let datagram = protect_packet(keys, pn, self.conn.tx_largest_acked(), &frames)?;
-      self.socket.send_to(&datagram, self.peer)?;
+      let datagram = protect_packet(keys, &cid, pn, self.conn.tx_largest_acked(), &frames)?;
+      self.send(&datagram)?;
       // Record the send time for the RTT sample; pruned when the packet is acknowledged. A pure
       // acknowledgement packet's entry is never sampled and is swept when a later packet is acknowledged.
       self.send_times.insert(pn, Instant::now());
@@ -584,45 +680,58 @@ impl Endpoint {
     Ok(())
   }
 
-  /// Receives one packet, but waits at most `timeout_ns` for it: the socket receive is raced against a
-  /// timer, and `Ok(false)` is returned if the timer wins (no packet arrived in time). This is the
-  /// loss-recovery clock the reliable exchanges ([`request`], [`serve_once`], [`send_stream`],
-  /// [`recv_stream`]) drive — over the lossless simulation fabric a packet always arrives, but over a real
-  /// datagram socket a lost packet (or a lost acknowledgement) would otherwise stall the exchange forever,
-  /// since a dropped tail leaves no later acknowledgement to expose the gap. On a timeout the caller
-  /// probes ([`Connection::probe`]) to retransmit the oldest in-flight packet and flushes it. The timer
-  /// also re-drives the receive itself: a fresh `recv_from` on the next call reads any datagram already
-  /// delivered to the socket, so the exchange makes progress even if a single readiness wake was missed.
+  /// Receives one packet, but waits at most `timeout_ns` for it, and folds it into the connection:
+  /// `Ok(false)` if the timer wins (no packet arrived in time). This is the loss-recovery clock the
+  /// reliable exchanges ([`request`], [`serve_once`], [`send_stream`], [`recv_stream`]) drive — over the
+  /// lossless simulation fabric a packet always arrives, but over a real datagram socket a lost packet
+  /// (or a lost acknowledgement) would otherwise stall the exchange forever, since a dropped tail leaves
+  /// no later acknowledgement to expose the gap. On a timeout the caller probes ([`Connection::probe`])
+  /// to retransmit the oldest in-flight packet and flushes it. The timer also re-drives the receive
+  /// itself: a fresh receive on the next call reads any datagram already delivered, so the exchange makes
+  /// progress even if a single readiness wake was missed.
   ///
   /// [`request`]: Endpoint::request
   /// [`serve_once`]: Endpoint::serve_once
   /// [`send_stream`]: Endpoint::send_stream
   /// [`recv_stream`]: Endpoint::recv_stream
-  async fn receive_within(&mut self, timeout_ns: u64) -> Result<bool, EndpointError> {
+  async fn receive_and_ingest(&mut self, timeout_ns: u64) -> Result<bool, EndpointError> {
     let mut buf = [0u8; 2048];
-    let outcome = {
-      let mut recv = std::pin::pin!(self.socket.recv_from(&mut buf));
-      let mut timer = std::pin::pin!(slates_rt::futures::sleep(timeout_ns));
-      std::future::poll_fn(|cx| {
-        // Prefer a delivered packet over the timer when both are ready, so a live exchange never trades a
-        // received packet for a spurious retransmission.
-        if let std::task::Poll::Ready(received) = std::future::Future::poll(recv.as_mut(), cx) {
-          return std::task::Poll::Ready(Some(received));
-        }
-        if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
-          return std::task::Poll::Ready(None);
-        }
-        std::task::Poll::Pending
-      })
-      .await
-    };
-    match outcome {
-      Some(Ok((n, _from))) => {
-        self.ingest(&buf[..n])?;
+    match self.recv_within(&mut buf, timeout_ns).await? {
+      Some((n, _from)) => {
+        self.fold_or_discard(&buf[..n])?;
         Ok(true)
       }
-      Some(Err(e)) => Err(e.into()),
       None => Ok(false),
+    }
+  }
+
+  /// Folds a received datagram into the connection, or discards it (counted) when it is not this
+  /// session's 1-RTT traffic: a raw handshake datagram is the peer still finishing the handshake this end
+  /// has left — a stale retransmit that raced it — and is answered (a server resends its confirmation, a
+  /// client its final flight) so the peer completes too; a packet naming another session, or one that
+  /// does not open under the keys, is dropped as RFC 9000 §12.2 has it, never fatal to the session. Only
+  /// a decoded packet whose frames are malformed (the peer broke the protocol), a closed session, or a
+  /// socket refusal end the exchange.
+  fn fold_or_discard(&mut self, datagram: &[u8]) -> Result<(), EndpointError> {
+    if !is_short_header(datagram) {
+      self.discarded = self.discarded.saturating_add(1);
+      if self.quic.is_client() {
+        if !self.final_flight.is_empty() {
+          let flight = self.final_flight.clone();
+          self.send(&flight)?;
+        }
+      } else {
+        self.send_confirm()?;
+      }
+      return Ok(());
+    }
+    match self.ingest(datagram) {
+      Ok(()) => Ok(()),
+      Err(EndpointError::Header | EndpointError::Tls(_) | EndpointError::NotReady) => {
+        self.discarded = self.discarded.saturating_add(1);
+        Ok(())
+      }
+      Err(other) => Err(other),
     }
   }
 
@@ -632,10 +741,13 @@ impl Endpoint {
   /// time).
   fn ingest(&mut self, datagram: &[u8]) -> Result<(), EndpointError> {
     let now = Instant::now();
+    let cid = self.connection_id()?;
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
-    let (pn, frames) = unprotect_packet(keys, self.rx_largest, datagram)?;
+    let (pn, frames) = unprotect_packet(keys, &cid, self.rx_largest, datagram)?;
     self.rx_largest = self.rx_largest.max(pn);
     if let Some(largest) = self.conn.handle_incoming(pn, &frames) {
+      // An acknowledgement ends a run of probe timeouts: the next timeout starts from the estimate again.
+      self.pto_count = 0;
       if let Some(sent_at) = self.send_times.get(&largest) {
         let sample =
           u64::try_from(now.saturating_duration_since(*sent_at).as_nanos()).unwrap_or(u64::MAX);
@@ -675,8 +787,28 @@ impl Endpoint {
   /// stops it (the fleet probe races it against a deadline and cancels it — [`crate::endpoint`] callers own
   /// the bound), which is what a peer that dies mid-exchange relies on to not strand the loop.
   async fn receive_or_probe(&mut self) -> Result<(), EndpointError> {
-    if !self.receive_within(self.probe_timeout()).await? {
+    // The probe timer is armed only while ack-eliciting packets are in flight (RFC 9002 §6.2.1): an idle
+    // session — a server between requests, a client between exchanges — has nothing to retransmit, so it
+    // waits at the conservative initial PTO instead of the estimated one, which on a loopback path is
+    // a few hundred microseconds and would wake every idle session thousands of times a second, starving
+    // the live exchanges on a busy shard. The long idle re-drive stays as the safety net against a
+    // missed readiness wake.
+    // With packets in flight the timeout backs off exponentially over consecutive expirations (RFC 9002
+    // §6.2.1: "the PTO period MUST be set to twice its current value" after each one), climbing from the
+    // estimate up to the conservative initial PTO the estimator started from — so a peer that has gone
+    // silent is retransmitted to a few times per second, not a few thousand.
+    let timeout = if self.conn.in_flight_count() == 0 {
+      self.rtt.initial_pto()
+    } else {
+      let doublings = 1u64 << self.pto_count.min(PTO_BACKOFF_SHIFT_CAP);
+      self
+        .probe_timeout()
+        .saturating_mul(doublings)
+        .min(self.rtt.initial_pto())
+    };
+    if !self.receive_and_ingest(timeout).await? {
       self.conn.probe();
+      self.pto_count = self.pto_count.saturating_add(1);
     }
     Ok(())
   }
@@ -733,6 +865,11 @@ impl Endpoint {
     stream_id: u64,
     request: &[u8],
   ) -> Result<Vec<u8>, EndpointError> {
+    // Start from a clean stream: a caller that abandoned an earlier exchange on this id at its deadline
+    // (the fleet probe does) may have left that exchange's reply — arrived late, complete, unread — in the
+    // receive side, and this exchange would otherwise read *that* reply as its own and stay one reply
+    // behind on every exchange after it (a peer retired while answering every probe on time).
+    self.conn.forget_stream(stream_id);
     self.conn.open(stream_id, request);
     let mut reply = Vec::new();
     loop {
@@ -749,6 +886,17 @@ impl Endpoint {
     }
   }
 
+  /// Forgets `stream_id` on this session: drops any in-flight frames of an exchange abandoned mid-flight
+  /// and its receive state. A caller that races [`request`](Endpoint::request) against its own deadline
+  /// and keeps the session for reuse (the fleet's `request_within`) calls this when the deadline wins, so
+  /// the abandoned exchange's stream does not ride the next flush on the reused session — its stale bytes
+  /// would otherwise reach the peer alongside the next request and be folded into an unrelated exchange
+  /// (`docs/bugs/2026-09-10-abandoned-request-retransmit-lockstep.md`: the same discipline `request`
+  /// applies to its *own* stream, now available to the deadline-racing caller for the stream it abandons).
+  pub fn forget_stream(&mut self, stream_id: u64) {
+    self.conn.forget_stream(stream_id);
+  }
+
   /// The server side of one request/reply exchange: receives a request stream, passes its stream id
   /// and bytes to `handler`, and sends the reply back on the same stream id, returning once the reply
   /// is acknowledged. The stream id is the request's **kind** on a session that carries several RPCs
@@ -760,16 +908,24 @@ impl Endpoint {
   where
     H: FnOnce(u64, Vec<u8>) -> Vec<u8>,
   {
-    // Phase one: receive the request in full, acknowledging and *draining* as it arrives — draining is
+    // Phase one: receive one request in full, acknowledging and *draining* as it arrives — draining is
     // what slides the flow-control window forward, so a request larger than one window keeps flowing
-    // (without it the credit never grows past the initial window and the sender stalls). The request
-    // rides one stream, so its id is the one that arrives.
-    let mut request = Vec::new();
-    let request_id = loop {
+    // (without it the credit never grows past the initial window and the sender stalls). Each request
+    // **kind** rides its own stream id, and the bytes of each are kept apart in `pending` keyed by id: a
+    // peer that reused this session after abandoning an earlier exchange at its deadline (the fleet's
+    // `request_within` races `request` against a deadline and cancels it) may still have that exchange's
+    // stream half-open, and folding its stray bytes into an unrelated request would hand the handler a
+    // corrupt message. The first stream to reach its `fin` is this request; it is served with *its own*
+    // bytes, and any other stream's partial bytes stay buffered for the exchange they belong to.
+    let mut pending: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let (request_id, request) = loop {
       self.receive_or_probe().await?;
       let ids = self.conn.recv_stream_ids();
       for &id in &ids {
-        request.extend_from_slice(&self.conn.read_stream(id));
+        let chunk = self.conn.read_stream(id);
+        if !chunk.is_empty() {
+          pending.entry(id).or_default().extend_from_slice(&chunk);
+        }
       }
       // Flush *after* draining, so the acknowledgement advertises credit that reflects what was just
       // read — draining slides the flow-control window, and advertising before it would lag a round and
@@ -779,7 +935,7 @@ impl Endpoint {
         .into_iter()
         .find(|&id| self.conn.recv_stream_complete(id))
       {
-        break id;
+        break (id, pending.remove(&id).unwrap_or_default());
       }
     };
 
@@ -806,16 +962,19 @@ impl Endpoint {
 /// data, then masks the first byte and the packet-number field with the local header-protection key.
 fn protect_packet(
   keys: &Keys,
+  cid: &ConnectionId,
   pn: u64,
   largest_acked: Option<u64>,
   frames: &[Frame],
 ) -> Result<Vec<u8>, EndpointError> {
-  // The short header: fixed bit set, spin/reserved/key-phase zero, low bits = packet-number length.
+  // The short header: fixed bit set, spin/reserved/key-phase zero, low bits = packet-number length; then
+  // the connection id, then the packet number.
   let encoded = encode_packet_number(pn, largest_acked);
   let pn_len = encoded.len();
   let first_byte = FIXED_BIT | u8::try_from(pn_len - 1).unwrap_or(0);
   let mut packet = Vec::with_capacity(PACKET_NUMBER_OFFSET + pn_len);
   packet.push(first_byte);
+  packet.extend_from_slice(cid);
   packet.extend_from_slice(encoded.as_slice());
   let header_len = packet.len();
 
@@ -854,12 +1013,18 @@ fn protect_packet(
 /// 1-RTT key with the unmasked header as associated data.
 fn unprotect_packet(
   keys: &Keys,
+  cid: &ConnectionId,
   rx_largest: u64,
   datagram: &[u8],
 ) -> Result<(u64, Vec<Frame>), EndpointError> {
   let sample_len = keys.remote.header.sample_len();
   if datagram.len() < HEADER_PROTECTION_SAMPLE_OFFSET + sample_len {
     return Err(EndpointError::NotReady);
+  }
+  // The connection id is not header-protected (RFC 9001 §5.4.1 masks only the first byte and the
+  // packet number): a packet naming another session is refused before any crypto.
+  if connection_id_of(datagram).as_ref() != Some(cid) {
+    return Err(EndpointError::Header);
   }
   let mut packet = datagram.to_vec();
 
@@ -888,6 +1053,38 @@ fn unprotect_packet(
   let plaintext = keys.remote.packet.decrypt_in_place(pn, &aad, &mut buf)?;
   let frames = decode_frames(plaintext).map_err(EndpointError::Frames)?;
   Ok((pn, frames))
+}
+
+/// Whether a datagram is a 1-RTT short-header packet rather than a raw handshake flight: the fixed bit
+/// (RFC 9000 §17.3) is set on every short header and is not masked by header protection (RFC 9001
+/// §5.4.1 masks only the five low bits), while a TLS handshake message's first byte is its type, all of
+/// which are small (RFC 8446 §4: `client_hello` 1 … `finished` 20) — the bit is never set there.
+pub(crate) fn is_short_header(datagram: &[u8]) -> bool {
+  datagram.first().is_some_and(|first| first & FIXED_BIT != 0)
+}
+
+/// The connection id a short-header packet carries (the bytes after the first), if it is long enough.
+pub(crate) fn connection_id_of(datagram: &[u8]) -> Option<ConnectionId> {
+  datagram
+    .get(1..1 + CONNECTION_ID_BYTES)
+    .and_then(|bytes| bytes.try_into().ok())
+}
+
+/// Races a receive against a timer of `timeout_ns`: its output if it lands first, `None` on the timer.
+/// A delivered datagram is preferred when both are ready.
+async fn within<F: Future>(receive: F, timeout_ns: u64) -> Option<F::Output> {
+  let mut receive = std::pin::pin!(receive);
+  let mut timer = std::pin::pin!(slates_rt::futures::sleep(timeout_ns));
+  std::future::poll_fn(|cx| {
+    if let Poll::Ready(out) = receive.as_mut().poll(cx) {
+      return Poll::Ready(Some(out));
+    }
+    if timer.as_mut().poll(cx).is_ready() {
+      return Poll::Ready(None);
+    }
+    Poll::Pending
+  })
+  .await
 }
 
 #[cfg(test)]
@@ -944,13 +1141,64 @@ mod tests {
     (client_keys.unwrap(), server_keys.unwrap())
   }
 
+  /// The connection id the packet tests use — any eight bytes; the exporter derivation is tested on its
+  /// own below.
+  const CID: ConnectionId = [7, 6, 5, 4, 3, 2, 1, 0];
+
   /// The plaintext short header a given packet number would have with no header protection, for the
   /// non-vacuity comparison below.
   fn plaintext_header(pn: u64) -> Vec<u8> {
     let encoded = encode_packet_number(pn, None);
     let mut header = vec![FIXED_BIT | u8::try_from(encoded.len() - 1).unwrap()];
+    header.extend_from_slice(&CID);
     header.extend_from_slice(encoded.as_slice());
     header
+  }
+
+  /// AC (§4.10a §8 "connection IDs"): both ends of a completed handshake derive the **same** connection
+  /// id from the TLS exporter, two handshakes derive **different** ones (the id is a function of the
+  /// session's secrets, so it is unique per session), and before completion the derivation is refused.
+  /// Drives an in-process handshake between two QUIC connections to completion (no socket).
+  fn drive_handshake(client: &mut Quic, server: &mut Quic) {
+    for _ in 0..HANDSHAKE_TURN_CEILING {
+      if !client.is_handshaking() && !server.is_handshaking() {
+        break;
+      }
+      let mut to_server = Vec::new();
+      client.write_hs(&mut to_server);
+      if !to_server.is_empty() {
+        server.read_hs(&to_server).unwrap();
+      }
+      let mut to_client = Vec::new();
+      server.write_hs(&mut to_client);
+      if !to_client.is_empty() {
+        client.read_hs(&to_client).unwrap();
+      }
+    }
+  }
+
+  #[test]
+  fn both_ends_derive_one_connection_id_per_session() {
+    let identity = self_signed("slates-node");
+    let (client, server) = connect(&identity, &identity, "slates-node").unwrap();
+    let (mut client, mut server) = (Quic::Client(client), Quic::Server(server));
+    assert!(
+      client.export_connection_id().is_err(),
+      "no id before the handshake completes"
+    );
+    drive_handshake(&mut client, &mut server);
+    let at_client = client.export_connection_id().unwrap();
+    let at_server = server.export_connection_id().unwrap();
+    assert_eq!(at_client, at_server, "one id, derived at both ends");
+    let (other_client, other_server) = connect(&identity, &identity, "slates-node").unwrap();
+    let (mut other_client, mut other_server) =
+      (Quic::Client(other_client), Quic::Server(other_server));
+    drive_handshake(&mut other_client, &mut other_server);
+    assert_ne!(
+      other_client.export_connection_id().unwrap(),
+      at_client,
+      "another session, another id"
+    );
   }
 
   /// AC (§4.10a §8): a packet protected under the local keys opens under the peer's remote keys,
@@ -967,12 +1215,17 @@ mod tests {
     let mut any_masked = false;
     let mut rx_largest = 0u64;
     for pn in 0..8u64 {
-      let wire = protect_packet(&client_keys, pn, None, &frames).unwrap();
+      let wire = protect_packet(&client_keys, &CID, pn, None, &frames).unwrap();
       let plain = plaintext_header(pn);
       if wire[..plain.len()] != plain[..] {
         any_masked = true;
       }
-      let (got_pn, got_frames) = unprotect_packet(&server_keys, rx_largest, &wire).unwrap();
+      assert_eq!(
+        connection_id_of(&wire),
+        Some(CID),
+        "the id rides in the clear, so a demultiplexer can route by it"
+      );
+      let (got_pn, got_frames) = unprotect_packet(&server_keys, &CID, rx_largest, &wire).unwrap();
       assert_eq!(got_pn, pn, "reconstructed packet number");
       assert_eq!(got_frames, frames, "recovered frames");
       rx_largest = rx_largest.max(got_pn);
@@ -994,21 +1247,28 @@ mod tests {
       fin: true,
       data: b"payload".to_vec(),
     }];
-    let wire = protect_packet(&client_keys, 3, None, &frames).unwrap();
+    let wire = protect_packet(&client_keys, &CID, 3, None, &frames).unwrap();
 
     // Flip the last byte (inside the AEAD tag): opening must fail.
     let mut tampered = wire.clone();
     let last = tampered.len() - 1;
     tampered[last] ^= 0x01;
     assert!(
-      unprotect_packet(&server_keys, 0, &tampered).is_err(),
+      unprotect_packet(&server_keys, &CID, 0, &tampered).is_err(),
       "a tampered packet must not open"
     );
 
     // A packet shorter than the header-protection sample is refused as not-ready, not a panic.
     assert!(matches!(
-      unprotect_packet(&server_keys, 0, &wire[..4]),
+      unprotect_packet(&server_keys, &CID, 0, &wire[..4]),
       Err(EndpointError::NotReady)
+    ));
+
+    // A packet naming another session's id is refused at the header, before any crypto.
+    let other: ConnectionId = [9; CONNECTION_ID_BYTES];
+    assert!(matches!(
+      unprotect_packet(&server_keys, &other, 0, &wire),
+      Err(EndpointError::Header)
     ));
   }
 }

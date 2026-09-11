@@ -61,10 +61,9 @@ slates anchor --fleet /etc/slates/fleet.json --node a
 - `f` is the fault tolerance: a write commits once `f + 1` nodes hold it, so a fleet of `2f + 1`
   keeps committing through `f` deaths. A manifest that could never commit (`fewer than f + 1`
   nodes) is refused.
-- `address` is the IP peers dial and the **base of a port block**: a node serves the node at
-  manifest position `j` on `base + 2j` (probes) and `base + 2j + 1` (records), two UDP ports per
-  node in the manifest, so open `2N` ports from the base. Every node computes the same map from
-  the same file; the manifest's node order matters and must be identical everywhere.
+- `address` is the IP peers dial and the node's base port: it serves probes on that UDP port and
+  records on the next, every peer on the same two sockets, so open those two ports. Every node
+  computes the same map from the same file.
 
 `slates status` on any node shows its place in the fleet: `fleet_host` (its member id),
 `fleet_f`, `fleet_host_epoch`, `fleet_members` (the members it holds alive) and

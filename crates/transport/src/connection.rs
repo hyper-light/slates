@@ -419,6 +419,13 @@ impl Connection {
       .is_some_and(StreamAssembler::is_complete)
   }
 
+  /// Ack-eliciting packets sent and not yet acknowledged: what a probe timeout would retransmit. Zero on
+  /// an idle connection, which therefore needs no probe timer (RFC 9002 §6.2.1 arms the PTO only while
+  /// such packets are in flight).
+  pub fn in_flight_count(&self) -> usize {
+    self.sent.in_flight_count()
+  }
+
   /// Whether every send stream has originated its whole data and every ack-eliciting packet has been
   /// acknowledged (nothing buffered to retransmit, nothing in flight).
   pub fn send_complete(&self) -> bool {
@@ -437,6 +444,15 @@ impl Connection {
     self.send_order.retain(|&id| id != stream_id);
     self.send_cursor = 0;
     self.recv_streams.remove(&stream_id);
+    // Nothing of the stream is retransmitted after it is forgotten: not from the queue of frames already
+    // declared lost, and not from a packet still in flight that a later loss or probe would resend —
+    // otherwise an exchange abandoned at its deadline (a fleet probe) keeps re-asking the peer with the
+    // stale request, and the peer's answers to it shadow every later exchange on the id.
+    self
+      .retransmit
+      .retain(|frame| !matches!(frame, Frame::Stream { stream_id: id, .. } if *id == stream_id));
+    let dropped = self.sent.forget_stream(stream_id);
+    self.congestion.on_probe_removed(dropped);
     // Forget the per-stream flow-control watermark too, so reusing this id starts fresh; the
     // connection-wide consumed total is kept (its bytes stay counted, so the peer's credit never
     // regresses). Leaving a stale watermark would stall a reused stream (its offsets fall below it).
@@ -633,6 +649,62 @@ mod tests {
     (0..len)
       .map(|i| u8::try_from((usize::from(seed).wrapping_add(i)) % 251).unwrap_or(0))
       .collect()
+  }
+
+  /// Sends one request on stream 1 and shows the probe path live: unacknowledged, a probe resends it
+  /// (the retransmit counter moves). Returns the sender with the request still in flight.
+  fn request_in_flight_and_probed() -> Connection {
+    let mut sender = Connection::new(initial_receive_window(FRAME_CAP));
+    sender.open(1, &stream_content(9, 40));
+    let (_pn, frames) = sender
+      .poll_transmit(FRAME_CAP)
+      .expect("the request goes out");
+    assert!(
+      frames
+        .iter()
+        .any(|f| matches!(f, Frame::Stream { stream_id: 1, .. }))
+    );
+    assert_eq!(sender.in_flight_count(), 1);
+    assert!(sender.probe(), "a probe finds the packet in flight");
+    let (_pn, resent) = sender
+      .poll_transmit(FRAME_CAP)
+      .expect("the probe retransmits");
+    assert!(
+      resent
+        .iter()
+        .any(|f| matches!(f, Frame::Stream { stream_id: 1, .. }))
+    );
+    assert!(sender.retransmitted() >= 1, "the retransmit path ran");
+    sender
+  }
+
+  /// AC (§4.8 "Membership" — a probe abandoned at its deadline; RFC 9000 §2.4): once a stream is
+  /// forgotten, none of its data is ever retransmitted — not from a packet still in flight that a probe
+  /// would resend, and not from the lost-frame queue — and its bytes leave the in-flight accounting. Non-
+  /// vacuous: before the forget, the same probe resends the packet (`request_in_flight_and_probed`), so
+  /// the path that would have re-asked with the stale request is shown live and then shown closed.
+  #[test]
+  fn a_forgotten_streams_frames_are_never_retransmitted() {
+    let mut sender = request_in_flight_and_probed();
+    let retransmitted_before = sender.retransmitted();
+    // The exchange is abandoned: forgotten. Nothing of it may go out again.
+    sender.forget_stream(1);
+    assert_eq!(
+      sender.in_flight_count(),
+      0,
+      "its packets carried nothing else"
+    );
+    assert_eq!(
+      sender.bytes_in_flight(),
+      0,
+      "its bytes left the in-flight accounting"
+    );
+    assert!(!sender.probe(), "a probe finds nothing to resend");
+    assert!(
+      sender.poll_transmit(FRAME_CAP).is_none(),
+      "no frame of the forgotten stream is retransmitted"
+    );
+    assert_eq!(sender.retransmitted(), retransmitted_before);
   }
 
   /// AC (§4.10a §8): three streams multiplexed over one connection each arrive exactly, in order, with

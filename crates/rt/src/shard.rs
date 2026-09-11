@@ -519,21 +519,61 @@ impl ShardContext {
   /// wake that lands during the spin costs a cache-line transfer instead of a kernel wake.
   pub fn run(&'static self) {
     registry::set_current(Some(self));
+    // Driver I/O completions are harvested only when the shard waits ([`park`]). Under continuous task
+    // readiness the loop below never reaches `park` — a shard whose client never lets `serve_round` go
+    // idle re-queues its serve task every step — so without this an I/O-bound task (a fleet node's
+    // datagram demux, whose socket readiness only `wait` delivers) would starve indefinitely behind the
+    // CPU-bound one, and its peers' packets would sit unread in the kernel while the shard spins. So a
+    // run that stays busy without ever waiting harvests the driver without blocking once it has gone a
+    // step budget (`step_budget_ns`, "a step longer than a peer's wake starves the shard" — §4.3) since
+    // its last wait: I/O then keeps pace with tasks under any load, and an idle shard (which reaches
+    // `park` every loop) pays nothing for it.
+    let step_budget_ns = self
+      .with_inner(|inner| inner.config.step_budget_ns)
+      .unwrap_or(0)
+      .max(1);
+    let mut last_wait_ns = self.now_ns();
     loop {
       let outcome = self.step();
       if outcome.exit {
         break;
       }
       if outcome.did_work {
+        let now = self.now_ns();
+        if now.saturating_sub(last_wait_ns) >= step_budget_ns {
+          self.harvest_io();
+          last_wait_ns = now;
+        }
         continue;
       }
       if self.active.get() && self.spin_until_work(outcome.next_deadline_ns) {
         continue;
       }
       self.park(outcome.next_deadline_ns);
+      last_wait_ns = self.now_ns();
     }
     registry::set_current(None);
     self.exited.set(true);
+  }
+
+  /// Harvests the driver's ready I/O completions **without blocking** (a zero timeout) and queues their
+  /// tasks, for a continuously busy [`run`] that would otherwise never reach [`park`] where I/O is
+  /// harvested. Unlike `park` it does not set the parked flag: the shard is not waiting, so a concurrent
+  /// kick must not believe it is. A driver error other than loss is left for the next real wait to
+  /// surface; loss is likewise deferred (this is a best-effort poll, not the loop's liveness point).
+  fn harvest_io(&self) {
+    self.with_inner(|inner| {
+      let mut completions = std::mem::take(&mut inner.completions);
+      let result = inner.driver.wait(Some(0), &mut completions);
+      for c in completions.drain(..) {
+        inner.counters.completions += 1;
+        self.local.push(Encoded::from_word(c.user_data).slot());
+      }
+      inner.completions = completions;
+      if matches!(result, Err(RtError::DriverLost)) {
+        inner.counters.driver_lost += 1;
+      }
+    });
   }
 
   /// Spins for the configured window watching the rings and the driver; true when something

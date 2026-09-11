@@ -632,8 +632,8 @@ const FLEET_NODES: [&str; 3] = ["a", "b", "c"];
 /// Shape: the fleet's fault tolerance — three nodes at `f = 1` keep a commit quorum through one death
 /// (`2f + 1 = 3` candidates, `f + 1 = 2` acknowledgements).
 const FLEET_F: u32 = 1;
-/// Shape: the ports a node's block spans per manifest node — one per plane (`slates_server::deploy`).
-const PORTS_PER_ENTRY: u16 = 2;
+/// Shape: the ports a node serves on — one per plane, its base and the next (`slates_server::deploy`).
+const PORTS_PER_NODE: u16 = 2;
 /// Shape: the bottom of the port range the test searches for a node's free port block — above the
 /// well-known and registered ports a shared machine has bound.
 const PORT_FLOOR: u16 = 20_000;
@@ -744,9 +744,9 @@ fn free_port_block(from: u16, count: u16) -> u16 {
   panic!("no block of {count} free loopback UDP ports found from {from}");
 }
 
-/// One free port block per node (two ports per manifest node), disjoint, from a pid-derived start.
+/// One free port pair per node, disjoint, from a pid-derived start.
 fn port_blocks() -> Vec<u16> {
-  let block = PORTS_PER_ENTRY * u16::try_from(FLEET_NODES.len()).unwrap();
+  let block = PORTS_PER_NODE;
   let offset = std::process::id() % u32::from(PORT_SPAN);
   let start = u16::try_from(u32::from(PORT_FLOOR) + offset).unwrap();
   let mut bases = Vec::with_capacity(FLEET_NODES.len());
@@ -804,6 +804,10 @@ struct FleetView {
   host: String,
   members: Vec<String>,
   peers_probed: u32,
+  /// The serve sockets' drop counters and the refusal lines, so a failed assertion shows what the
+  /// daemon refused or dropped.
+  dropped: String,
+  refusals: String,
 }
 
 fn fleet_view(instance: &str) -> Option<FleetView> {
@@ -816,10 +820,20 @@ fn fleet_view(instance: &str) -> Option<FleetView> {
     .map(str::to_owned)
     .collect();
   members.sort();
+  let dropped = format!(
+    "unknown_id={} inbox_full={} refused={} replaced={}",
+    value_of(&out, "fleet_unknown_id"),
+    value_of(&out, "fleet_inbox_full"),
+    value_of(&out, "fleet_sessions_refused"),
+    value_of(&out, "fleet_replaced")
+  );
+  let refusals: Vec<&str> = out.lines().filter(|l| l.contains(" refused ")).collect();
   Some(FleetView {
     host: value_of(&out, "fleet_host"),
     members,
     peers_probed: value_of(&out, "fleet_peers_probed").parse().unwrap(),
+    dropped,
+    refusals: refusals.join("; "),
   })
 }
 
@@ -867,6 +881,16 @@ fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
       view.peers_probed,
       u32::try_from(FLEET_NODES.len() - 1).unwrap(),
       "both peers probed: {views:?}"
+    );
+    // A clean formation: the serve sockets routed every packet to its session, dropped nothing, refused
+    // no dialer, replaced no session — and the daemon refused nothing.
+    assert_eq!(
+      view.dropped, "unknown_id=0 inbox_full=0 refused=0 replaced=0",
+      "the serve sockets dropped nothing forming the fleet: {views:?}"
+    );
+    assert!(
+      view.refusals.is_empty(),
+      "nothing refused forming the fleet: {views:?}"
     );
   }
   let mut hosts: Vec<String> = formed.iter().map(|v| v.host.clone()).collect();

@@ -262,6 +262,31 @@ impl SentTracker {
     self.in_flight.len()
   }
 
+  /// Drops stream `stream_id`'s data frames from every packet still in flight — the stream was
+  /// forgotten (its exchange abandoned or complete), so a loss or a probe must not retransmit its bytes
+  /// (RFC 9000 §2.4: data of a reset stream is not retransmitted) — and forgets the packets that carried
+  /// nothing else. Returns the stream bytes dropped, so the caller can take them out of the congestion
+  /// controller's in-flight count. Packets that still carry other frames stay tracked for their
+  /// acknowledgement.
+  pub fn forget_stream(&mut self, stream_id: u64) -> u64 {
+    let mut dropped = 0u64;
+    self.in_flight.retain(|_, packet| {
+      packet.frames.retain(|frame| match frame {
+        Frame::Stream {
+          stream_id: id,
+          data,
+          ..
+        } if *id == stream_id => {
+          dropped = dropped.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+          false
+        }
+        _ => true,
+      });
+      !packet.frames.is_empty()
+    });
+    dropped
+  }
+
   /// The largest packet number the peer has acknowledged, or `None` before the first ACK — the value
   /// that sizes the truncated packet number a sender writes (RFC 9000 §17.1 via `packet_number`).
   pub fn largest_acked(&self) -> Option<u64> {

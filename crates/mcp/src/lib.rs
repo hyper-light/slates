@@ -793,6 +793,10 @@ pub fn daemon_json(r: &DaemonReport) -> Value {
       "host_epoch": r.fleet.host_epoch,
       "members": r.fleet.members,
       "peers_probed": r.fleet.peers_probed,
+      "unknown_id": r.fleet.unknown_id,
+      "inbox_full": r.fleet.inbox_full,
+      "sessions_refused": r.fleet.sessions_refused,
+      "replaced": r.fleet.replaced,
     },
   })
 }

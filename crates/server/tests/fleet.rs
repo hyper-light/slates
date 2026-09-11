@@ -4,7 +4,7 @@
 //! advertised socket, accepts each peer on its own per-peer socket, probes over the transport each protocol
 //! period, replicates its volume heads to the peer holders, and folds the acknowledgements into the
 //! `FleetNode` the verbs read for placement. The tests observe the whole boot-step-6 path in the daemon,
-//! over real (loopback) UDP sessions with mutual TLS, using `Endpoint::accept` so no node is told a peer's
+//! over real (loopback) UDP sessions with mutual TLS, using `the demultiplexed serve sockets` so no node is told a peer's
 //! dial address in advance (only its advertised one). Daemons run concurrently in one process (the runtime's
 //! shard ids are process-global, so their shards do not collide); each is given a distinct machine identity
 //! so its host id — the fleet member id — is distinct.
@@ -189,14 +189,12 @@ fn start_sharded(this: Node, peer: Peer, shards: u16) -> Daemon {
   let transport = FleetTransport {
     identity: this.identity,
     name: NAME.to_owned(),
-    // One peer, so this node serves it on this node's own advertised addresses (the per-peer serve socket
-    // is this node's single advertised pair). An N-node fleet gives each peer its own serve pair.
+    probe_bind: this.address,
+    record_bind: this.record_address,
     peers: vec![FleetPeer {
       host: peer.host,
       address: peer.address,
       record_address: peer.record_address,
-      probe_bind: this.address,
-      record_bind: this.record_address,
       certificate: peer.certificate,
     }],
   };
@@ -212,7 +210,7 @@ fn start_sharded(this: Node, peer: Peer, shards: u16) -> Daemon {
 }
 
 /// AC (§4.8, boot step 6): two daemons form a live fleet — their control-shard membership loops dial,
-/// accept and probe each other over the transport (using `Endpoint::accept`, so neither is told the other's
+/// accept and probe each other over the transport (using `the demultiplexed serve sockets`, so neither is told the other's
 /// dial address in advance) — and when one dies, the survivor **detects it over the transport and retires
 /// it**. The retirement is the non-vacuous proof the loop ran end to end: the seeded configuration would
 /// hold the peer alive forever, so a peer that transitions from alive to gone did so only because the loop
@@ -304,33 +302,21 @@ fn loopback(port: u16) -> SocketAddrV4 {
   SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
 }
 
-/// One (probe, record) port pair per ordered pair (server `i` serves client `j`, `i != j`): `serve[i][j]`.
-/// The full-mesh grid is naturally two-index, so the range loops are kept.
-#[allow(clippy::needless_range_loop)]
-fn mesh_serve_ports(n: usize) -> Vec<Vec<(u16, u16)>> {
-  let flat = free_ports(2 * n * (n - 1));
-  let mut serve = vec![vec![(0u16, 0u16); n]; n];
-  let mut cursor = 0;
-  for i in 0..n {
-    for j in 0..n {
-      if i != j {
-        serve[i][j] = (flat[cursor], flat[cursor + 1]);
-        cursor += 2;
-      }
-    }
-  }
-  serve
+/// One (probe, record) serve port pair per node: `serve[i]` is what node `i` binds and every peer dials.
+fn mesh_serve_ports(n: usize) -> Vec<(u16, u16)> {
+  let flat = free_ports(2 * n);
+  flat.chunks(2).map(|pair| (pair[0], pair[1])).collect()
 }
 
-/// Starts one daemon per node over the per-peer socket mesh: node `i` serves each peer `j` on `serve[i][j]`
-/// and dials peer `j` at peer `j`'s serve-for-`i` socket `serve[j][i]`. Returns the daemons in node order.
+/// Starts one daemon per node: node `i` serves every peer on its own pair `serve[i]` and dials peer `j` at
+/// `serve[j]`. Returns the daemons in node order.
 /// The fleet's fault tolerance is `f = 1` (a three-node fleet's shape); [`start_mesh_with_f`] takes a larger
 /// `f` for a fleet that keeps a quorum through more deaths (2f + 1 nodes).
 fn start_mesh(
   nodes: Vec<(MachineProfile, HostId, Identity)>,
   hosts: &[HostId],
   certs: &[rustls::pki_types::CertificateDer<'static>],
-  serve: &[Vec<(u16, u16)>],
+  serve: &[(u16, u16)],
 ) -> Vec<Daemon> {
   start_mesh_with_f(nodes, hosts, certs, serve, 1)
 }
@@ -343,7 +329,7 @@ fn start_mesh_with_f(
   nodes: Vec<(MachineProfile, HostId, Identity)>,
   hosts: &[HostId],
   certs: &[rustls::pki_types::CertificateDer<'static>],
-  serve: &[Vec<(u16, u16)>],
+  serve: &[(u16, u16)],
   f: u32,
 ) -> Vec<Daemon> {
   start_mesh_with(nodes, hosts, certs, serve, f, 1)
@@ -354,7 +340,7 @@ fn start_mesh_with(
   nodes: Vec<(MachineProfile, HostId, Identity)>,
   hosts: &[HostId],
   certs: &[rustls::pki_types::CertificateDer<'static>],
-  serve: &[Vec<(u16, u16)>],
+  serve: &[(u16, u16)],
   f: u32,
   shards: u16,
 ) -> Vec<Daemon> {
@@ -368,10 +354,8 @@ fn start_mesh_with(
         .filter(|&j| j != i)
         .map(|j| FleetPeer {
           host: hosts[j],
-          address: loopback(serve[j][i].0),
-          record_address: loopback(serve[j][i].1),
-          probe_bind: loopback(serve[i][j].0),
-          record_bind: loopback(serve[i][j].1),
+          address: loopback(serve[j].0),
+          record_address: loopback(serve[j].1),
           certificate: certs[j].clone(),
         })
         .collect();
@@ -387,6 +371,8 @@ fn start_mesh_with(
       let transport = FleetTransport {
         identity,
         name: NAME.to_owned(),
+        probe_bind: loopback(serve[i].0),
+        record_bind: loopback(serve[i].1),
         peers,
       };
       Daemon::start_with_fleet(
@@ -404,7 +390,7 @@ fn start_mesh_with(
 
 /// AC (§4.8, boot step 6, N-node): three daemons form the full **direct probe mesh** — each of the three
 /// nodes establishes a live probe session to each of its two peers, N·(N−1) = 6 sessions over
-/// `Endpoint::accept`, and every node reports its own mesh complete ([`Daemon::fleet_meshed`], every
+/// `the demultiplexed serve sockets`, and every node reports its own mesh complete ([`Daemon::fleet_meshed`], every
 /// configured peer probed, not merely believed alive by the seeded membership). This is the N-node
 /// formation the two-node fleet tests exercise at their single-peer degenerate, now at the smallest fleet
 /// whose mesh is non-trivial: each node dials two peers on distinct sockets and serves two on its own
@@ -448,7 +434,7 @@ fn three_daemons_form_a_full_mesh() {
 }
 
 /// AC (§4.8, boot step 6, N-node): **three** daemons form one live fleet over the per-peer socket mesh —
-/// each node serves each of its two peers on its own advertised socket pair (since `Endpoint::accept` pins
+/// each node serves each of its two peers on its own advertised socket pair (since `the demultiplexed serve sockets` pins
 /// one peer per socket) and dials each peer's — and when one node dies, the **two survivors each detect it
 /// over the transport and retire it**. Three nodes is the smallest fleet that keeps a quorum through a single
 /// death at `f = 1` (2f + 1 = 3), so it is the shape a fault-tolerant fleet actually runs; the retirement by

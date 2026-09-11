@@ -798,7 +798,22 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     peers_probed: shards
       .iter()
       .fold(0u32, |sum, shard| sum.saturating_add(shard.peers_probed)),
+    unknown_id: demux_sum(state, |c| c.unknown_id),
+    inbox_full: demux_sum(state, |c| c.inbox_full),
+    sessions_refused: demux_sum(state, |c| c.sessions_refused),
+    replaced: demux_sum(state, |c| c.replaced),
   }
+}
+
+/// One counter summed over the serve-socket demultiplexers this shard runs (none on a laptop, or on a
+/// shard other than the control shard).
+fn demux_sum(
+  state: &ShardState,
+  counter: impl Fn(&slates_transport::demux::DemuxCounters) -> u64,
+) -> u64 {
+  state.demuxes.iter().fold(0u64, |sum, demux| {
+    sum.saturating_add(counter(&demux.counters()))
+  })
 }
 
 /// The daemon's view: the anchor's words in the segment and the process-wide counters, over

@@ -295,8 +295,10 @@ hecate `WIRE_SECURITY.md` to slates's D-15 (TLS 1.3, not Noise). **Ratify before
 > law (4d), `rustls::quic` TLS 1.3 handshake (4e), the packet-number codec (4g, `packet_number.rs`),
 > and the live `Endpoint` that wires the handshake, full RFC 9001 packet protection (short header +
 > truncated packet number + payload AEAD + **header protection**), and a stream together over the UDP
-> socket (4f, `endpoint.rs` + `tests/session.rs`) are built; congestion control, connection IDs, and
-> multi-stream multiplexing remain.
+> socket (4f, `endpoint.rs` + `tests/session.rs`) are built; congestion control is built
+> (`congestion.rs`); connection IDs are built (A-14: eight bytes both ends derive from the TLS
+> exporter, carried in every short header, and a demultiplexer over one socket, `demux.rs`);
+> multi-stream multiplexing remains.
 
 slates's session plane carries every **reliable** class (version chains, merge records, content
 transfer, cross-region). It is an owned RFC 9000/9002-shaped dialect — adapting hecate-quic's

@@ -723,7 +723,7 @@ fn signal_value(signal: &slates_client::Signal) -> String {
 fn daemon_status_text(report: &DaemonReport) -> String {
   let members: Vec<String> = report.fleet.members.iter().map(u64::to_string).collect();
   let mut out = format!(
-    "pid: {}\ngeneration: {}\nrestarts: {}\nheartbeat_age_ns: {}\nclients_reaped: {}\nclients_refused: {}\nshards: {}\nfleet_host: {}\nfleet_f: {}\nfleet_host_epoch: {}\nfleet_members: {}\nfleet_peers_probed: {}\n",
+    "pid: {}\ngeneration: {}\nrestarts: {}\nheartbeat_age_ns: {}\nclients_reaped: {}\nclients_refused: {}\nshards: {}\nfleet_host: {}\nfleet_f: {}\nfleet_host_epoch: {}\nfleet_members: {}\nfleet_peers_probed: {}\nfleet_unknown_id: {}\nfleet_inbox_full: {}\nfleet_sessions_refused: {}\nfleet_replaced: {}\n",
     report.pid,
     report.generation,
     report.restarts,
@@ -735,7 +735,11 @@ fn daemon_status_text(report: &DaemonReport) -> String {
     report.fleet.f,
     report.fleet.host_epoch,
     members.join(" "),
-    report.fleet.peers_probed
+    report.fleet.peers_probed,
+    report.fleet.unknown_id,
+    report.fleet.inbox_full,
+    report.fleet.sessions_refused,
+    report.fleet.replaced
   );
   for shard in &report.shards {
     out.push_str(&format!(

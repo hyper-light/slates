@@ -56,6 +56,11 @@ mod imp {
     }
   }
 
+  /// The socket's kernel receive buffer (`SO_RCVBUF`) in bytes.
+  pub(crate) fn recv_buffer_bytes(socket: &Socket) -> Result<usize, RtError> {
+    rustix::net::sockopt::socket_recv_buffer_size(&socket.fd).map_err(|e| refused("getsockopt", e))
+  }
+
   pub(crate) fn dgram_socket() -> Result<Socket, RtError> {
     // `SocketFlags` on `socket()` is Linux-only, so non-blocking/cloexec are set after creation.
     let fd = socket_with(
@@ -110,10 +115,10 @@ mod imp {
   use std::sync::OnceLock;
 
   use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_UDP, SOCK_DGRAM, SOCKADDR,
-    SOCKADDR_IN, SOCKET, SOCKET_ERROR, WSADATA, WSAEINTR, WSAEWOULDBLOCK, WSAGetLastError,
-    WSAStartup, bind as ws_bind, closesocket, getsockname, ioctlsocket, recvfrom as ws_recvfrom,
-    sendto as ws_sendto, socket as ws_socket,
+    AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_UDP, SO_RCVBUF, SOCK_DGRAM,
+    SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSADATA, WSAEINTR, WSAEWOULDBLOCK,
+    WSAGetLastError, WSAStartup, bind as ws_bind, closesocket, getsockname, getsockopt,
+    ioctlsocket, recvfrom as ws_recvfrom, sendto as ws_sendto, socket as ws_socket,
   };
 
   use super::{Io, Ipv4Addr, SocketAddrV4};
@@ -197,6 +202,27 @@ mod imp {
       return Err(last("ioctlsocket(FIONBIO)"));
     }
     Ok(socket)
+  }
+
+  /// The socket's kernel receive buffer (`SO_RCVBUF`) in bytes.
+  pub(crate) fn recv_buffer_bytes(socket: &Socket) -> Result<usize, RtError> {
+    let mut bytes: i32 = 0;
+    // The option is an `int`: its length is that type's size, which always fits an `i32`.
+    let mut len: i32 = i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
+    // SAFETY: `SO_RCVBUF` is an `int`; the out pointer and its length name one live local `i32`.
+    let outcome = unsafe {
+      getsockopt(
+        socket.socket,
+        SOL_SOCKET,
+        SO_RCVBUF,
+        (&raw mut bytes).cast::<u8>(),
+        &raw mut len,
+      )
+    };
+    if outcome == SOCKET_ERROR {
+      return Err(last("getsockopt(SO_RCVBUF)"));
+    }
+    usize::try_from(bytes).map_err(|_| last("getsockopt(SO_RCVBUF)"))
   }
 
   /// A `SOCKADDR_IN` for `addr` (network byte order for the port and address, as the wire wants).
@@ -314,4 +340,4 @@ mod imp {
 }
 
 pub(crate) use imp::Socket;
-pub(crate) use imp::{bind, dgram_socket, local_addr, recv_from, send_to};
+pub(crate) use imp::{bind, dgram_socket, local_addr, recv_buffer_bytes, recv_from, send_to};

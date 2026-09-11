@@ -70,6 +70,16 @@ impl UdpSocket {
     }
   }
 
+  /// The socket's receive buffer in bytes — what the kernel queues for it before dropping datagrams
+  /// (`SO_RCVBUF`); a consumer that redistributes the socket among several sessions sizes each session's
+  /// queue from it. On the simulation fabric, a stated stand-in (the fabric's mailbox is unbounded).
+  pub fn recv_buffer_bytes(&self) -> Result<usize, RtError> {
+    match &self.inner {
+      Inner::Real { socket } => netsys::recv_buffer_bytes(socket),
+      Inner::Sim { .. } => Ok(crate::sim::SIM_RECV_BUFFER_BYTES),
+    }
+  }
+
   /// Sends a datagram to `addr` (a non-blocking send; the bytes accepted are returned). In simulation
   /// the datagram is delivered to `addr`'s port on the fabric and any waiting receiver is woken.
   pub fn send_to(&self, buf: &[u8], addr: SocketAddrV4) -> Result<usize, RtError> {
