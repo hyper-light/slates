@@ -712,6 +712,38 @@ fn init_shard(
     }
     None => slates_cluster::fleet::FleetNode::solo(host),
   };
+  // The regional configuration council (§4.8, D-14 — the "configuration master"): the multi-voter Raft the
+  // fleet-loop config plane drives over the transport to agree on the region's configuration. Its voters and
+  // members are the fleet (the small-council degenerate of a large fleet, R8); a laptop runs a solo council
+  // that self-leads (`f = 0`). The scatter each neighbourhood is bounded to is the same derived width the
+  // per-node placement uses, so the council's derived configuration matches what placement reads today.
+  let council = match &config.fleet {
+    Some(membership) => {
+      let mut members = membership.peers.clone();
+      members.push(host);
+      slates_cluster::config_group::RegionalCouncil::new(
+        host,
+        members.clone(),
+        members,
+        membership.quorum,
+        membership.domains.clone(),
+        config.derived_scatter(membership.quorum),
+        false,
+      )
+    }
+    None => {
+      let quorum = slates_db::register::Quorum { f: 0 };
+      slates_cluster::config_group::RegionalCouncil::new(
+        host,
+        vec![host],
+        vec![host],
+        quorum,
+        std::collections::BTreeMap::new(),
+        config.derived_scatter(quorum),
+        false,
+      )
+    }
+  };
   // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
   let content = match AnchorSegment::open_content(env) {
@@ -773,6 +805,7 @@ fn init_shard(
     holder_records: std::collections::BTreeMap::new(),
     pending_takeovers: std::collections::BTreeSet::new(),
     record_sessions: std::collections::BTreeMap::new(),
+    council,
     held_content: slates_cluster::content::ContentHold::new(),
     seals: std::collections::BTreeMap::new(),
     pending_materializations: std::collections::BTreeMap::new(),

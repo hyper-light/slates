@@ -444,6 +444,10 @@ pub struct RegionalCouncil {
   configuration: RegionalConfiguration,
   applied: u64,
   scatter: u64,
+  /// Monotone count of appends this node has answered from a leader — the drive loop's election timer reads
+  /// it: while it advances, a leader is alive and this node does not campaign; once it stalls for the
+  /// election timeout, the leader is presumed gone and a pre-election begins.
+  leader_contact: u64,
 }
 
 impl RegionalCouncil {
@@ -467,6 +471,7 @@ impl RegionalCouncil {
       configuration,
       applied: 0,
       scatter,
+      leader_contact: 0,
     }
   }
 
@@ -479,6 +484,16 @@ impl RegionalCouncil {
   /// Whether this node leads the council (only the leader may propose).
   pub fn is_leader(&self) -> bool {
     self.raft.is_leader()
+  }
+
+  /// The council's voter set — the small consensus group the drive loop ships elections and replication to.
+  pub fn voters(&self) -> Vec<HostId> {
+    self.raft.all_voters()
+  }
+
+  /// The leader-contact count (see the field): the drive loop's election timer resets while this advances.
+  pub fn leader_contact(&self) -> u64 {
+    self.leader_contact
   }
 
   /// **DRIVE**: begins a **pre-election** on an election timeout (Raft §9.6), returning the [`PreVote`]s to
@@ -510,6 +525,10 @@ impl RegionalCouncil {
       }
       RaftMessage::AppendEntries(append) => {
         let reply = self.raft.on_append_entries(append);
+        if reply.success {
+          // A valid append from the current leader is a heartbeat — reset the election timer.
+          self.leader_contact = self.leader_contact.saturating_add(1);
+        }
         self.apply_committed();
         Some(RaftMessage::AppendReply(reply))
       }

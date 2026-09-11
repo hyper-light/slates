@@ -103,6 +103,11 @@ pub struct ShardState {
   /// what the fleet has actually committed; the live probe/gossip loop that drives `observe` and the
   /// cross-node commit run in `crate::fleet` on the control shard.
   pub fleet: slates_cluster::fleet::FleetNode,
+  /// The regional configuration council (§4.8, D-14 — the "configuration master"): the multi-voter Raft the
+  /// control shard's config plane drives over the transport to agree on the region's configuration
+  /// (`crate::fleet::run_config_council`). A laptop runs a solo council that self-leads (R8). Only the
+  /// control shard drives and serves it; other shards hold an inert copy of the same boot state.
+  pub council: slates_cluster::config_group::RegionalCouncil,
   /// The landing runtime: grants, leases and the audit log (§4.15), mirrored to the
   /// database's durable records.
   pub landing: crate::landing::LandingState,
