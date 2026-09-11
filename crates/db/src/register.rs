@@ -1316,6 +1316,143 @@ impl Configuration {
   }
 }
 
+/// A host's bounded neighbourhood as the regional council fixes it (§4.8, D-14): the scatter set across
+/// failure domains, and the **generation** it was fixed at — so a membership change moves only the hosts
+/// whose rendezvous rank crossed the cut ("add before remove", stable), and a stale writer's neighbourhood
+/// is told from the current one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Neighbourhood {
+  /// The owner plus its scatter-width co-holders across failure domains (the owner heads it).
+  pub hosts: Vec<HostId>,
+  /// The configuration generation this neighbourhood was fixed at.
+  pub generation: u64,
+}
+
+/// The **regional configuration** the council agrees on (§4.8, D-14 — the "configuration master", a small
+/// elected council per region): the whole region's membership, each owner's bounded neighbourhood, each
+/// host's fencing epoch, and the failure-domain map. The council decides these — on membership, takeover,
+/// neighbourhood and home changes only, never per write — and every node learns them; a node derives its
+/// own single-owner [`Configuration`] for the placement path with [`configuration_for`](
+/// RegionalConfiguration::configuration_for). This is the multi-owner form the design specifies
+/// (`neighbourhoods` keyed by owner); the single-owner [`Configuration`] is one owner's slice of it.
+/// `version` advances on every change, so a request under a stale version is refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegionalConfiguration {
+  /// Advances on every membership, neighbourhood, epoch or takeover change (near-zero rate outside failures).
+  pub version: u64,
+  /// The members the council agrees are in the region (the alive set it has admitted), in id order.
+  pub members: Vec<HostId>,
+  /// Each member's bounded neighbourhood — the scatter set the placement path draws candidates from.
+  pub neighbourhoods: std::collections::BTreeMap<HostId, Neighbourhood>,
+  /// Each host's fencing epoch (bumped on takeover, so a resumed stale owner's records are refused).
+  pub epochs: std::collections::BTreeMap<HostId, HostEpoch>,
+  /// Each host's failure domain (unique-per-host when absent), so copysets form across distinct domains.
+  pub domains: std::collections::BTreeMap<HostId, DomainId>,
+  /// The quorum the failure-domain tree fixes (`f = 0` on a laptop).
+  pub quorum: Quorum,
+  /// Whether a mirror region exists.
+  pub has_mirror: bool,
+}
+
+impl RegionalConfiguration {
+  /// The regional configuration a fleet forms with (§4.8, boot): every member at the first epoch, each with
+  /// its bounded neighbourhood computed at generation zero. `scatter` bounds every neighbourhood (the
+  /// candidate floor `2f+1` unless recovery has sized it wider); `domains` gives each host's failure domain.
+  pub fn formed(
+    members: Vec<HostId>,
+    quorum: Quorum,
+    domains: std::collections::BTreeMap<HostId, DomainId>,
+    scatter: u64,
+    has_mirror: bool,
+  ) -> RegionalConfiguration {
+    let mut members = members;
+    members.sort_unstable_by_key(|host| host.0);
+    let epochs = members.iter().map(|&host| (host, FIRST_EPOCH)).collect();
+    let mut config = RegionalConfiguration {
+      version: 0,
+      members,
+      neighbourhoods: std::collections::BTreeMap::new(),
+      epochs,
+      domains,
+      quorum,
+      has_mirror,
+    };
+    config.fix_neighbourhoods(scatter);
+    config
+  }
+
+  /// Fixes every member's bounded neighbourhood from the current membership (`select_neighbourhood`): the
+  /// owner plus its scatter-width co-holders by rendezvous, at the current version's generation.
+  fn fix_neighbourhoods(&mut self, scatter: u64) {
+    let generation = self.version;
+    let members = self.members.clone();
+    self.neighbourhoods = members
+      .iter()
+      .map(|&owner| {
+        let hosts = select_neighbourhood(owner, &members, scatter);
+        (owner, Neighbourhood { hosts, generation })
+      })
+      .collect();
+  }
+
+  /// The single-owner [`Configuration`] `owner` reads for placement — its bounded neighbourhood, its host
+  /// epoch, the failure domains and the quorum — derived from the regional configuration. `None` if `owner`
+  /// is not a member.
+  pub fn configuration_for(&self, owner: HostId) -> Option<Configuration> {
+    let neighbourhood = self.neighbourhoods.get(&owner)?;
+    Some(Configuration {
+      version: self.version,
+      owner,
+      host_epoch: self.epochs.get(&owner).copied().unwrap_or(FIRST_EPOCH),
+      neighbourhood: neighbourhood.hosts.clone(),
+      domains: self.domains.clone(),
+      quorum: self.quorum,
+      has_mirror: self.has_mirror,
+    })
+  }
+
+  /// Admits `member` to the region (a join the council agrees on): a no-op if already a member. Refixes the
+  /// neighbourhoods and advances the version. Returns whether the membership changed.
+  pub fn admit(&mut self, member: HostId, scatter: u64) -> bool {
+    if self.members.contains(&member) {
+      return false;
+    }
+    self.members.push(member);
+    self.members.sort_unstable_by_key(|host| host.0);
+    self.epochs.entry(member).or_insert(FIRST_EPOCH);
+    self.version = self.version.saturating_add(1);
+    self.fix_neighbourhoods(scatter);
+    true
+  }
+
+  /// Retires `member` from the region (a departure the council agrees on). Refixes the neighbourhoods and
+  /// advances the version. Its epoch is kept, so a record from the retired host under an old epoch is still
+  /// fenced if it returns. Returns whether the membership changed.
+  pub fn retire(&mut self, member: HostId, scatter: u64) -> bool {
+    if !self.members.contains(&member) {
+      return false;
+    }
+    self.members.retain(|host| *host != member);
+    self.neighbourhoods.remove(&member);
+    self.version = self.version.saturating_add(1);
+    self.fix_neighbourhoods(scatter);
+    true
+  }
+
+  /// Takes over a dead host (§4.8): bumps its fencing epoch (so its in-flight records are refused as
+  /// `StaleEpoch`), retires it, and refixes the neighbourhoods. The dead host's objects are reassigned by
+  /// rendezvous over the survivors (the routing view), not stored here. Returns the host's new epoch.
+  pub fn take_over(&mut self, dead: HostId, scatter: u64) -> HostEpoch {
+    let bumped = {
+      let epoch = self.epochs.entry(dead).or_insert(FIRST_EPOCH);
+      epoch.0 = epoch.0.saturating_add(1);
+      *epoch
+    };
+    self.retire(dead, scatter);
+    bumped
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1842,6 +1979,95 @@ mod tests {
     assert!(
       !poor.within_loss_bound(0.0, 2),
       "a zero accepted-loss bound rejects a configuration that can lose data"
+    );
+  }
+
+  /// AC (§4.8, D-14): the regional configuration the council agrees on derives each owner's single-owner
+  /// placement view — its bounded neighbourhood, its host epoch, the failure domains — so every node reads
+  /// the same configuration the council fixed, and a non-member has none.
+  #[test]
+  fn the_regional_configuration_derives_each_owners_placement_view() {
+    let members = vec![HostId(1), HostId(2), HostId(3), HostId(4), HostId(5)];
+    let scatter = 3; // the candidate floor at f=1
+    let regional = RegionalConfiguration::formed(
+      members.clone(),
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    for &owner in &members {
+      let config = regional.configuration_for(owner).expect("a member has a configuration");
+      assert_eq!(config.owner, owner);
+      assert_eq!(config.neighbourhood.len(), 3, "bounded to the scatter width");
+      assert_eq!(config.neighbourhood[0], owner, "the owner heads its own neighbourhood");
+      assert_eq!(config.host_epoch, FIRST_EPOCH);
+      assert_eq!(config.quorum, Quorum { f: 1 });
+    }
+    assert!(
+      regional.configuration_for(HostId(99)).is_none(),
+      "a non-member has no configuration"
+    );
+  }
+
+  /// AC (§4.8, D-14): admitting and retiring members refixes the neighbourhoods and advances the version, so
+  /// a request under a stale version is refused; admitting an existing member is a no-op.
+  #[test]
+  fn admitting_and_retiring_members_refixes_neighbourhoods_and_advances_the_version() {
+    let scatter = 3;
+    let mut regional = RegionalConfiguration::formed(
+      vec![HostId(1), HostId(2), HostId(3)],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    let before = regional.version;
+    assert!(regional.admit(HostId(4), scatter), "a new member is admitted");
+    assert!(regional.version > before, "the version advanced");
+    assert!(regional.members.contains(&HostId(4)));
+    assert!(
+      regional.configuration_for(HostId(4)).is_some(),
+      "the admitted member now has a placement view"
+    );
+    assert!(
+      !regional.admit(HostId(4), scatter),
+      "admitting an existing member is a no-op"
+    );
+    assert!(regional.retire(HostId(2), scatter), "a member is retired");
+    assert!(!regional.members.contains(&HostId(2)));
+    assert!(
+      regional.configuration_for(HostId(2)).is_none(),
+      "a retired member has no configuration"
+    );
+  }
+
+  /// AC (§4.8, D-14): a takeover bumps the dead host's fencing epoch (so its stale records are refused) and
+  /// retires it, keeping the bumped epoch so a returning stale host is still fenced.
+  #[test]
+  fn a_takeover_bumps_the_dead_hosts_epoch_and_retires_it() {
+    let scatter = 3;
+    let mut regional = RegionalConfiguration::formed(
+      vec![HostId(1), HostId(2), HostId(3)],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    let before = regional.epochs[&HostId(2)];
+    let bumped = regional.take_over(HostId(2), scatter);
+    assert!(
+      bumped.0 > before.0,
+      "the dead host's epoch is bumped, fencing its in-flight records"
+    );
+    assert!(
+      !regional.members.contains(&HostId(2)),
+      "the dead host is retired from the region"
+    );
+    assert_eq!(
+      regional.epochs.get(&HostId(2)),
+      Some(&bumped),
+      "the bumped epoch is kept, so a returning stale host is still fenced"
     );
   }
 
