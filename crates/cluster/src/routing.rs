@@ -203,7 +203,12 @@ mod tests {
     let mut routing = Routing::new(SELF);
     let orphan = ObjectId::new(PEER, 0);
     routing.track(orphan, PEER);
-    let taken = routing.take_over(PEER, &[PEER], &std::collections::BTreeMap::new(), Quorum { f: 1 });
+    let taken = routing.take_over(
+      PEER,
+      &[PEER],
+      &std::collections::BTreeMap::new(),
+      Quorum { f: 1 },
+    );
     assert!(taken.is_empty());
     assert_eq!(
       routing.owner_of(orphan),

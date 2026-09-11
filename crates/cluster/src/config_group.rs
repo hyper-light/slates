@@ -532,7 +532,9 @@ impl RegionalCouncil {
         self.apply_committed();
         Some(RaftMessage::AppendReply(reply))
       }
-      RaftMessage::VoteReply(_) | RaftMessage::PreVoteReply(_) | RaftMessage::AppendReply(_) => None,
+      RaftMessage::VoteReply(_) | RaftMessage::PreVoteReply(_) | RaftMessage::AppendReply(_) => {
+        None
+      }
     }
   }
 
@@ -772,8 +774,18 @@ mod tests {
     let object = ObjectId::new(OWNER, 7);
     // The object's holders under the dead owner — the copyset placement puts it on (the group's own
     // domain map, so this matches what the takeover computes internally).
-    let holders = candidates_for(OWNER, &before, &group.configuration().domains, object, Quorum { f: 1 });
-    assert_eq!(holders.len(), 3, "the object takes one copyset of 2f+1, not the whole neighbourhood");
+    let holders = candidates_for(
+      OWNER,
+      &before,
+      &group.configuration().domains,
+      object,
+      Quorum { f: 1 },
+    );
+    assert_eq!(
+      holders.len(),
+      3,
+      "the object takes one copyset of 2f+1, not the whole neighbourhood"
+    );
 
     let new = group
       .take_over(OWNER, object)
@@ -922,7 +934,10 @@ mod tests {
     while let Some(request) = pending.pop() {
       pending.extend(exchange(&mut leader, &mut follower, request));
     }
-    assert!(leader.is_leader(), "the leader won the pre-vote then the real vote");
+    assert!(
+      leader.is_leader(),
+      "the leader won the pre-vote then the real vote"
+    );
 
     // Propose admitting a new member (not itself a voter); it commits and applies only at the majority.
     assert!(
@@ -932,7 +947,11 @@ mod tests {
     // Round one replicates the entry; round two's heartbeat carries the commit index to the follower.
     for _ in 0..2 {
       if let Some(append) = leader.replication_for(A) {
-        exchange(&mut leader, &mut follower, RaftMessage::AppendEntries(append));
+        exchange(
+          &mut leader,
+          &mut follower,
+          RaftMessage::AppendEntries(append),
+        );
       }
     }
     assert!(

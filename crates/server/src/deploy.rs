@@ -317,7 +317,10 @@ pub fn plan(
   let domains: std::collections::BTreeMap<HostId, DomainId> = manifest
     .nodes
     .iter()
-    .filter_map(|n| n.domain.map(|domain| (host_id_of_certificate(&n.certificate), domain)))
+    .filter_map(|n| {
+      n.domain
+        .map(|domain| (host_id_of_certificate(&n.certificate), domain))
+    })
     .collect();
   let identity = Identity::from_der(entry.certificate.clone(), key);
   let pins: Vec<CertificateDer<'static>> = peers.iter().map(|p| p.certificate.clone()).collect();
@@ -429,7 +432,11 @@ mod tests {
       Some(&7),
       "a's declared domain reached the membership under its member id"
     );
-    assert_eq!(plan.membership.domains.get(&b), Some(&7), "b shares a's domain");
+    assert_eq!(
+      plan.membership.domains.get(&b),
+      Some(&7),
+      "b shares a's domain"
+    );
     assert_eq!(
       plan.membership.domains.get(&c),
       None,

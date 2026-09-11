@@ -1856,7 +1856,11 @@ mod tests {
     // At the floor: a five-host neighbourhood is one copyset, and every object shares it.
     let floor = vec![owner, HostId(2), HostId(3), HostId(4), HostId(5)];
     let one = candidates_for(owner, &floor, &domains, ObjectId::new(owner, 0), quorum);
-    assert_eq!(one.len(), 5, "the floor neighbourhood is a single copyset of 2f+1");
+    assert_eq!(
+      one.len(),
+      5,
+      "the floor neighbourhood is a single copyset of 2f+1"
+    );
     assert_eq!(one[0], owner, "owner first");
     for local in 0..256u64 {
       let object = ObjectId::new(owner, local);
@@ -1877,7 +1881,11 @@ mod tests {
       let object = ObjectId::new(owner, local);
       let a = candidates_for(owner, &wide, &domains, object, quorum);
       assert_eq!(a[0], owner, "owner first");
-      assert_eq!(a.len(), 5, "each candidate set is one copyset of 2f+1, not the whole wide neighbourhood");
+      assert_eq!(
+        a.len(),
+        5,
+        "each candidate set is one copyset of 2f+1, not the whole wide neighbourhood"
+      );
       sets.insert(a);
     }
     assert!(
@@ -1952,8 +1960,15 @@ mod tests {
       quorum: Quorum { f: 1 },
       has_mirror: false,
     };
-    assert_eq!(floor.copyset_count(), 1, "the floor neighbourhood is one copyset");
-    assert!(floor.within_loss_bound(1.0, 2), "the floor is within an accept-all bound");
+    assert_eq!(
+      floor.copyset_count(),
+      1,
+      "the floor neighbourhood is one copyset"
+    );
+    assert!(
+      floor.within_loss_bound(1.0, 2),
+      "the floor is within an accept-all bound"
+    );
 
     // Same neighbourhood size, poorer failure domains: the four co-holders share one domain, so no two can
     // co-hold — the greedy makes four short copysets instead of two, a higher coincident loss.
@@ -1975,7 +1990,10 @@ mod tests {
       poor.coincident_loss(2) >= rich.coincident_loss(2),
       "more copysets at the same neighbourhood size is at least as high a coincident loss"
     );
-    assert!(poor.coincident_loss(2) > 0.0, "the poor configuration can lose data");
+    assert!(
+      poor.coincident_loss(2) > 0.0,
+      "the poor configuration can lose data"
+    );
     assert!(
       !poor.within_loss_bound(0.0, 2),
       "a zero accepted-loss bound rejects a configuration that can lose data"
@@ -1997,10 +2015,19 @@ mod tests {
       false,
     );
     for &owner in &members {
-      let config = regional.configuration_for(owner).expect("a member has a configuration");
+      let config = regional
+        .configuration_for(owner)
+        .expect("a member has a configuration");
       assert_eq!(config.owner, owner);
-      assert_eq!(config.neighbourhood.len(), 3, "bounded to the scatter width");
-      assert_eq!(config.neighbourhood[0], owner, "the owner heads its own neighbourhood");
+      assert_eq!(
+        config.neighbourhood.len(),
+        3,
+        "bounded to the scatter width"
+      );
+      assert_eq!(
+        config.neighbourhood[0], owner,
+        "the owner heads its own neighbourhood"
+      );
       assert_eq!(config.host_epoch, FIRST_EPOCH);
       assert_eq!(config.quorum, Quorum { f: 1 });
     }
@@ -2023,7 +2050,10 @@ mod tests {
       false,
     );
     let before = regional.version;
-    assert!(regional.admit(HostId(4), scatter), "a new member is admitted");
+    assert!(
+      regional.admit(HostId(4), scatter),
+      "a new member is admitted"
+    );
     assert!(regional.version > before, "the version advanced");
     assert!(regional.members.contains(&HostId(4)));
     assert!(

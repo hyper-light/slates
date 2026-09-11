@@ -147,15 +147,8 @@ fn run_distributed_membership_change() -> Outcome {
       let _ = leader_port_tx.send(socket.local_addr().unwrap().port());
       let voter_port = recv_port(voter_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, voter_port);
-      let mut endpoint = Endpoint::client(
-        socket,
-        peer,
-        &leader_identity,
-        &voter_cert,
-        NAME,
-        FRAME_CAP,
-      )
-      .unwrap();
+      let mut endpoint =
+        Endpoint::client(socket, peer, &leader_identity, &voter_cert, NAME, FRAME_CAP).unwrap();
       endpoint.establish().await.unwrap();
 
       let mut leader = council(LEADER);

@@ -272,7 +272,10 @@ mod tests {
     );
     assert_eq!(stated.nodes[1].certificate, "b.crt.der");
     assert_eq!(stated.nodes[1].key, "b.key.der");
-    assert_eq!(stated.nodes[1].domain, None, "no failure domain declared: unique-per-host");
+    assert_eq!(
+      stated.nodes[1].domain, None,
+      "no failure domain declared: unique-per-host"
+    );
   }
 
   /// A node may declare an optional failure domain; a non-integer one is named by its path.
@@ -283,8 +286,15 @@ mod tests {
       r#""certificate": "a.crt.der", "key": "a.key.der", "domain": 7"#,
     );
     let stated = parse(&with_domain).expect("parses");
-    assert_eq!(stated.nodes[0].domain, Some(7), "the declared domain is parsed");
-    assert_eq!(stated.nodes[1].domain, None, "an undeclared node has no domain");
+    assert_eq!(
+      stated.nodes[0].domain,
+      Some(7),
+      "the declared domain is parsed"
+    );
+    assert_eq!(
+      stated.nodes[1].domain, None,
+      "an undeclared node has no domain"
+    );
 
     let bad = with_domain.replace(r#""domain": 7"#, r#""domain": "rack-1""#);
     match parse(&bad) {
