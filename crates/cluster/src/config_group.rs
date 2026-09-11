@@ -587,6 +587,47 @@ impl RegionalCouncil {
     self.raft.append_command(command.encode())
   }
 
+  /// Whether the council's log is fully committed — nothing proposed is still in flight
+  /// (`last_log_index == commit_index`). [`reconcile_alive`](RegionalCouncil::reconcile_alive) reads it so
+  /// a change proposed but not yet committed is **not re-proposed** each period: unlike the solo
+  /// [`ConfigGroup`], the council's [`propose`](RegionalCouncil::propose) commits only later over the
+  /// transport, so `configuration.members` does not reflect the change until then, and an ungated reconcile
+  /// would append a duplicate command every period until the first commits (the apply step would no-op them,
+  /// but the log would bloat against the near-zero commit rate the design makes a tripwire). Serialises
+  /// reconfiguration to one batch per commit cycle, which the rare configuration change can afford.
+  pub fn caught_up(&self) -> bool {
+    self.raft.last_log_index() == self.raft.commit_index()
+  }
+
+  /// Reconciles the regional membership with a SWIM `alive` set **as the leader** (§4.8 "the configuration
+  /// master decides membership"): proposes admitting every alive host not yet a member and retiring every
+  /// member no longer alive, each through the council log so it commits at a majority over the transport and
+  /// applies on every voter. Returns whether anything was proposed. A non-leader proposes nothing — the
+  /// leader is the one configuration master and decides from its own SWIM view (it probes every member), so
+  /// a follower's own detection need not propose. Gated on [`caught_up`](RegionalCouncil::caught_up) so a
+  /// change in flight is not re-proposed; a member already present, or already gone, is not proposed either
+  /// (`propose`'s own `would_change` gate), so the log grows only for real changes.
+  pub fn reconcile_alive(&mut self, alive: &[HostId]) -> bool {
+    if !self.is_leader() || !self.caught_up() {
+      return false;
+    }
+    let mut proposed = false;
+    for host in alive {
+      proposed |= self.propose(Reconfiguration::Admit(*host));
+    }
+    let stale: Vec<HostId> = self
+      .configuration
+      .members
+      .iter()
+      .copied()
+      .filter(|member| !alive.contains(member))
+      .collect();
+    for host in stale {
+      proposed |= self.propose(Reconfiguration::Retire(host));
+    }
+    proposed
+  }
+
   /// Applies every committed but not-yet-applied command to the regional configuration, in commit order —
   /// the deterministic fold every voter makes, so the configuration is the same on all of them.
   fn apply_committed(&mut self) {
@@ -920,6 +961,26 @@ mod tests {
     )
   }
 
+  /// Elects `leader` over `follower` through the full pre-vote then real-vote round (§9.6), draining every
+  /// follow-on message until the exchange settles — the in-process form of the transport election.
+  fn elect(leader: &mut RegionalCouncil, follower: &mut RegionalCouncil) {
+    let mut pending = leader.election_timeout();
+    while let Some(request) = pending.pop() {
+      pending.extend(exchange(leader, follower, request));
+    }
+  }
+
+  /// Runs `rounds` replication rounds from `leader` to `follower` (round one replicates the entry and the
+  /// leader commits at the majority; round two's heartbeat carries the advanced commit index, so the
+  /// follower applies too).
+  fn replicate(leader: &mut RegionalCouncil, follower: &mut RegionalCouncil, rounds: usize) {
+    for _ in 0..rounds {
+      if let Some(append) = leader.replication_for(A) {
+        exchange(leader, follower, RaftMessage::AppendEntries(append));
+      }
+    }
+  }
+
   /// AC (§4.8, D-14): the regional council elects a leader and commits a membership change at a majority,
   /// applying it to the regional configuration on every voter — the distributed configuration master. A
   /// member admitted by the council need not be a voter of it (the council is small; the region is not).
@@ -929,13 +990,7 @@ mod tests {
     let mut leader = council(OWNER);
     let mut follower = council(A);
 
-    // Elect the leader through the full pre-vote round (§9.6): it asks whether a real election could win,
-    // then holds it — draining every follow-on message (the pre-votes, then the real vote requests) until
-    // the exchange settles.
-    let mut pending = leader.election_timeout();
-    while let Some(request) = pending.pop() {
-      pending.extend(exchange(&mut leader, &mut follower, request));
-    }
+    elect(&mut leader, &mut follower);
     assert!(
       leader.is_leader(),
       "the leader won the pre-vote then the real vote"
@@ -946,16 +1001,7 @@ mod tests {
       leader.propose(Reconfiguration::Admit(B)),
       "the leader appended the membership change"
     );
-    // Round one replicates the entry; round two's heartbeat carries the commit index to the follower.
-    for _ in 0..2 {
-      if let Some(append) = leader.replication_for(A) {
-        exchange(
-          &mut leader,
-          &mut follower,
-          RaftMessage::AppendEntries(append),
-        );
-      }
-    }
+    replicate(&mut leader, &mut follower, 2);
     assert!(
       leader.configuration().members.contains(&B),
       "the membership change committed and applied at the leader"
@@ -967,6 +1013,50 @@ mod tests {
     assert!(
       leader.configuration().configuration_for(B).is_some(),
       "the admitted member now has a placement view derived from the regional configuration"
+    );
+  }
+
+  /// AC (§4.8, D-14, the configuration master decides membership): the **leader** reconciles the regional
+  /// membership from a SWIM alive set — a newly-alive host is proposed for admission, committed at the
+  /// majority and applied on every voter; a **non-leader** proposes nothing; and a change **in flight** is
+  /// not re-proposed (the caught-up gate keeps a not-yet-committed change from bloating the log each period).
+  /// The retire-over-the-transport half is proven end to end in the daemon (`server/tests/fleet.rs`).
+  #[test]
+  fn the_leader_reconciles_regional_membership_from_the_alive_view() {
+    let mut leader = council(OWNER);
+    let mut follower = council(A);
+
+    elect(&mut leader, &mut follower);
+    assert!(leader.is_leader());
+
+    // The region starts [OWNER, A]; host B has now joined the alive view.
+    let alive = vec![OWNER, A, B];
+    assert!(
+      !follower.reconcile_alive(&alive),
+      "a non-leader proposes nothing — only the leader is the configuration master"
+    );
+    assert!(
+      leader.reconcile_alive(&alive),
+      "the leader proposes admitting the new member"
+    );
+    assert!(
+      !leader.reconcile_alive(&alive),
+      "a change still in flight is not re-proposed (the caught-up gate — no duplicate log entry)"
+    );
+
+    // The entry commits at the majority and applies on both voters.
+    replicate(&mut leader, &mut follower, 2);
+    assert!(
+      leader.configuration().members.contains(&B),
+      "B is admitted to the regional membership at the leader"
+    );
+    assert!(
+      follower.configuration().members.contains(&B),
+      "and at the follower — the council agrees on the reconciled membership"
+    );
+    assert!(
+      !leader.reconcile_alive(&alive),
+      "the settled membership reconciles to a no-op — the log grows only for real changes"
     );
   }
 }

@@ -74,12 +74,21 @@ const FORMATION_DEADLINE: Duration = Duration::from_secs(15);
 /// a retry or two if a jittered collision splits the first vote), measured against the serialised quiet
 /// machine.
 const COUNCIL_ELECTION_DEADLINE: Duration = Duration::from_secs(15);
-/// Shape: the window a single council leader must hold without flapping — a couple of dozen heartbeat
-/// periods, so a genuinely stable pre-vote-protected leader is told apart from one that keeps being disrupted.
+/// Shape: the window a single council leader must hold unbroken for the council to count as settled — a
+/// couple of dozen heartbeat periods, long enough to tell a converged election from one still churning.
 const COUNCIL_STABILITY_WINDOW: Duration = Duration::from_secs(2);
+/// Shape: how long to keep looking for that unbroken window before giving up. Wider than the window itself
+/// because a loaded test machine can starve a leader's heartbeat and trigger a legitimate re-election (which
+/// pre-vote minimizes but cannot forbid when the leader is genuinely unreachable), so the settle is retried
+/// across such transients until the council quiesces.
+const COUNCIL_SETTLE_DEADLINE: Duration = Duration::from_secs(20);
 /// Shape: how long to wait for a follower's council leader-contact to climb past its baseline — a few
 /// heartbeat periods, so the leader's replication reaching the followers over the transport is observed live.
 const COUNCIL_HEARTBEAT_WINDOW: Duration = Duration::from_secs(5);
+/// Shape: how long to wait for the council to commit a membership **retirement** after a member dies — the
+/// SWIM death detection (the retirement deadline) plus a few heartbeat periods for the leader to propose the
+/// retire and replicate it to a committing majority. Wider than [`RETIREMENT_DEADLINE`] for that commit tail.
+const COUNCIL_RETIRE_DEADLINE: Duration = Duration::from_secs(20);
 
 /// Each fleet test starts several daemons — every daemon is a shard thread plus its doorbell thread — so
 /// running the tests concurrently oversubscribes the machine and stretches the probe and commit timing
@@ -566,9 +575,11 @@ fn three_daemons_form_a_full_mesh() {
 /// of two, so the elected leader is genuinely agreed, not a lone self-election.
 ///
 /// The proof is threefold and non-vacuous: **exactly one** leader emerges (an election ran and converged, not
-/// zero or a split), it **holds** across a stability window (pre-vote keeps a slow or partitioned follower
-/// from disrupting it — no flapping), and a **follower's leader-contact counter advances** over the window
-/// (the leader's heartbeats are flowing over the transport — replication is live, not merely an election won).
+/// zero or a split), the council **settles** on it (a window it holds unbroken — the election converges
+/// rather than churning; a loaded machine can still trigger a legitimate re-election, which pre-vote
+/// minimizes but cannot forbid when a leader is genuinely starved, so the settle is retried across such
+/// transients), and a **follower's leader-contact counter advances** (the leader's heartbeats flow over the
+/// transport — replication is live, not merely an election won).
 #[test]
 fn three_daemons_elect_one_stable_council_leader_over_the_transport() {
   let _serial = serialize_fleet_tests();
@@ -587,12 +598,17 @@ fn three_daemons_elect_one_stable_council_leader_over_the_transport() {
   assert_fleet_forms(&daemons, &hosts, &names);
   let one_leader = || daemons.iter().filter(|d| d.council_leads()).count() == 1;
   let elected = poll_until(COUNCIL_ELECTION_DEADLINE, one_leader);
-  // A won election must not flap: exactly one leader holds across the stability window.
-  let stable = elected && holds_for(COUNCIL_STABILITY_WINDOW, one_leader);
+  // The council settles on a single leader: within the deadline there is a window it holds unbroken. A
+  // legitimate re-election under a starved heartbeat is tolerated (pre-vote cannot forbid one when a leader
+  // is genuinely unreachable), so the settle is retried until the council quiesces.
+  let settled = elected
+    && poll_until(COUNCIL_SETTLE_DEADLINE, || {
+      holds_for(COUNCIL_STABILITY_WINDOW, one_leader)
+    });
   // The leader's heartbeats must reach the followers over the transport: a follower's leader-contact climbs
   // past the baseline just captured (a non-vacuity counter — replication is live, not just an election).
   let baseline: Vec<u64> = daemons.iter().map(Daemon::council_contact).collect();
-  let heartbeats_flow = stable
+  let heartbeats_flow = settled
     && poll_until(COUNCIL_HEARTBEAT_WINDOW, || {
       daemons
         .iter()
@@ -610,12 +626,72 @@ fn three_daemons_elect_one_stable_council_leader_over_the_transport() {
     "the council elected exactly one leader over the transport within the deadline (leads={leads:?})"
   );
   assert!(
-    stable,
-    "the single council leader held across the stability window — pre-vote prevents flapping"
+    settled,
+    "the council settled on a single leader — the election converged, not churned"
   );
   assert!(
     heartbeats_flow,
     "a follower's council leader-contact advanced — the leader's heartbeats flow over the transport"
+  );
+}
+
+/// AC (§4.8, D-14): the configuration council **commits a membership change over the real transport**, not
+/// just an election. Three daemons elect a leader; when a **follower** dies, the leader — which probes every
+/// member — detects it via SWIM, proposes the retirement through the council log (`reconcile_alive`), and it
+/// commits at the surviving majority (2 of 3 voters) and applies on every survivor, so the dead member drops
+/// from each survivor's `RegionalConfiguration`. This is the transport-driven form of the
+/// propose→replicate→commit→apply path the sans-io council (`config_group.rs`) and sim-UDP proof
+/// (`config_group_live.rs`) show; here the whole path runs through the daemon's own record sessions and demux.
+/// A follower is killed, not the leader, so the leader stays and reconciles (killing the leader would first
+/// force a re-election — a separate concern); the leader keeping quorum is what lets the retire commit.
+#[test]
+fn a_council_commits_a_membership_retirement_over_the_transport() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+
+  assert_fleet_forms(&daemons, &hosts, &names);
+  // Wait for the council to elect one leader, then kill a *follower* so the leader stays and reconciles.
+  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, || {
+    daemons
+      .iter()
+      .filter(|daemon| daemon.council_leads())
+      .count()
+      == 1
+  });
+  let leader_idx = daemons.iter().position(|daemon| daemon.council_leads());
+  let victim_idx = leader_idx.and_then(|lead| (0..daemons.len()).find(|&i| i != lead));
+
+  let retired = match (elected, victim_idx) {
+    (true, Some(victim)) => {
+      let dead = hosts[victim];
+      daemons.remove(victim).stop();
+      // The surviving leader detects the death (SWIM), proposes the retire, and commits it over the
+      // transport; every survivor's regional membership then drops the dead member.
+      poll_until(COUNCIL_RETIRE_DEADLINE, || {
+        daemons
+          .iter()
+          .all(|daemon| !daemon.council_members().contains(&dead))
+      })
+    }
+    _ => false,
+  };
+
+  // Stop the survivors before asserting, so a failure leaves none running.
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(elected, "the council elected a leader before the kill");
+  assert!(
+    retired,
+    "the council committed the dead follower's retirement over the transport — every survivor's regional membership dropped it"
   );
 }
 

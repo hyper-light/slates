@@ -1763,6 +1763,14 @@ async fn drive_config_council(
   };
 
   if is_leader {
+    // As the region's configuration master, track its membership from this node's own SWIM view: propose
+    // any admit or retire, which the replication below commits over the transport and applies on every
+    // voter. Only the leader proposes (`reconcile_alive`); it probes every member, so a follower's own
+    // detection need not.
+    state::with_state(|s| {
+      let alive = s.fleet.membership().alive();
+      s.council.reconcile_alive(&alive)
+    });
     drive_council_replication(&others, budget).await;
     *idle = 0;
     return;

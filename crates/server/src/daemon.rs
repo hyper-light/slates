@@ -403,6 +403,31 @@ impl Daemon {
       .unwrap_or(0)
   }
 
+  /// The **regional membership** this daemon's configuration council has committed and applied so far
+  /// (§4.8, D-14) — the members of the `RegionalConfiguration`, the region the council masters. A one-shot
+  /// control-shard query, bounded by the liveness budget; empty if the daemon is stopping, is not on a
+  /// shard, or does not answer in time. Exposed so a fleet test can observe a membership change (a
+  /// retirement or admission) commit across the council over the transport.
+  pub fn council_members(&self) -> Vec<slates_db::HostId> {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
+      return Vec::new();
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        let members =
+          state::with_state(|s| s.council.configuration().members.clone()).unwrap_or_default();
+        let _ = tx.send(members);
+      })
+      .is_err()
+    {
+      return Vec::new();
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .unwrap_or_default()
+  }
+
   /// Test and operator support: folds a `Dead` belief about `peer` at `incarnation` into this node's
   /// membership on the control shard — the same effect its failure detector has when it ages a peer to
   /// death (§4.8). Exposed so **rejoin** can be driven deterministically: a real process kill cannot be
