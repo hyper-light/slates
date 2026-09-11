@@ -7,10 +7,14 @@ use slates_mem::MemError;
 /// A typed refusal from the IPC crate; never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcError {
-  /// The daemon is not reachable at the endpoint.
+  /// The daemon is not reachable at the endpoint: `why` says what the client found (no rendezvous
+  /// there, a claim it never answered, no rendezvous on this platform), so an operator reading
+  /// "no daemon" learns which of those it was.
   DaemonUnavailable {
     /// The endpoint tried.
     endpoint: String,
+    /// What the client found.
+    why: &'static str,
   },
   /// The peer's credentials are not the daemon's user.
   PeerRefused {
@@ -63,7 +67,9 @@ pub enum IpcError {
 impl fmt::Display for IpcError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      Self::DaemonUnavailable { endpoint } => write!(f, "daemon unavailable at {endpoint}"),
+      Self::DaemonUnavailable { endpoint, why } => {
+        write!(f, "daemon unavailable at {endpoint}: {why}")
+      }
       Self::PeerRefused { uid } => write!(f, "peer refused (uid {uid})"),
       Self::RingFull => f.write_str("ring full"),
       Self::BadSlot { reason } => write!(f, "bad slot: {reason}"),

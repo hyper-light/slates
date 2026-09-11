@@ -17,10 +17,13 @@
 //! Modules: [`config`] (the daemon's derivations from the profile), [`state`] (the shard's
 //! state and the client and volume records), [`verbs`] (the dispatcher), [`daemon`] (start,
 //! recovery, the control shard, shutdown), [`doorbell`] (the thread that turns a client's
-//! ring into the driver's kick), [`error`].
+//! ring into the driver's kick), [`fleet`] (the membership loop and the record plane a fleet node
+//! runs), [`deploy`] (a node's socket map and member ids from the operator's one shared manifest),
+//! [`error`].
 
 pub mod config;
 pub mod daemon;
+pub mod deploy;
 pub mod doorbell;
 pub mod error;
 pub mod fleet;
@@ -38,6 +41,7 @@ pub mod xshard;
 
 pub use config::{DaemonConfig, FleetMembership};
 pub use daemon::{Daemon, SegmentSource};
+pub use deploy::{DeployError, FleetManifest, FleetNodeEntry, FleetPlan};
 pub use fleet::{FleetPeer, FleetTransport};
 
 pub use error::ServerError;

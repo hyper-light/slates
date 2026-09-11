@@ -23,6 +23,7 @@ mod args;
 mod daemon;
 #[cfg(target_os = "linux")]
 mod exec;
+mod fleet;
 mod format;
 mod mount;
 mod parent;
@@ -80,13 +81,15 @@ fn main() -> ExitCode {
 fn report_failure(failure: &Failure, json: bool) -> ExitCode {
   let (code, kind) = match failure {
     Failure::Refused(_) => (EXIT_REFUSED, "refused"),
-    Failure::Unavailable(_) => (EXIT_UNAVAILABLE, "unavailable"),
+    Failure::Unavailable { .. } => (EXIT_UNAVAILABLE, "unavailable"),
     Failure::Failed(_) => (EXIT_FAILED, "failed"),
   };
   if json {
     let message = match failure {
       Failure::Refused(text) | Failure::Failed(text) => text.clone(),
-      Failure::Unavailable(instance) => format!("no daemon at instance {instance}"),
+      Failure::Unavailable { instance, cause } => {
+        format!("no daemon at instance {instance}: {cause}")
+      }
     };
     eprintln!(
       "{}",
@@ -95,8 +98,10 @@ fn report_failure(failure: &Failure, json: bool) -> ExitCode {
   } else {
     match failure {
       Failure::Refused(text) => eprintln!("slates: refused: {text}"),
-      Failure::Unavailable(instance) => {
-        eprintln!("slates: no daemon at instance {instance} (is `slates anchor` running?)");
+      Failure::Unavailable { instance, cause } => {
+        eprintln!(
+          "slates: no daemon at instance {instance}: {cause} (is `slates anchor` running?)"
+        );
       }
       Failure::Failed(text) => eprintln!("slates: {text}"),
     }
@@ -124,8 +129,14 @@ fn run_exec(_request: &args::ExecRequest) -> Result<(), Failure> {
 pub(crate) enum Failure {
   /// The daemon refused; the typed refusal, printed.
   Refused(String),
-  /// No daemon at the instance.
-  Unavailable(String),
+  /// No daemon at the instance, and why the client concluded so (the rendezvous absent, a claim
+  /// unanswered, a daemon that stopped answering) — the operator's first clue.
+  Unavailable {
+    /// The instance asked for.
+    instance: String,
+    /// The client's reason.
+    cause: String,
+  },
   /// The command itself failed (the anchor or the daemon).
   Failed(String),
 }

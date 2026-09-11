@@ -30,8 +30,8 @@ pub mod error;
 pub use client::{Attachment, Client, CreateSpec, Deadlines, Landing, Rebased, Session, Submitted};
 pub use error::ClientError;
 pub use slates_ipc::protocol::{
-  AbsenceIs, ActionCount, AuditEntry, DaemonReport, Filter, GrantScope, GrantSummary, Intent,
-  LandingOutcome, LandingSummary, NamePolicy, PlacedState, Refusal, RefusalCount, Scope,
+  AbsenceIs, ActionCount, AuditEntry, DaemonReport, Filter, FleetReport, GrantScope, GrantSummary,
+  Intent, LandingOutcome, LandingSummary, NamePolicy, PlacedState, Refusal, RefusalCount, Scope,
   ShardReport, Signal, SizeClass, SnapshotId, StatusReport, VolumeId, VolumeSummary, WorkOp,
 };
 /// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async

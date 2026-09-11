@@ -422,6 +422,27 @@ pub struct ShardReport {
   /// Chokepoint spans this shard has shed since boot because its bounded sink was full (§4.14
   /// "bounded rings report dropped spans"): the explicit telemetry-loss signal, never a silent gap.
   pub spans_dropped: u64,
+  /// Fleet peers this shard has a formed probe session to (§4.8 "Membership"). The membership loop runs
+  /// on the control shard, so only its part counts; the other shards form none. Zero on a laptop.
+  pub peers_probed: u32,
+}
+
+/// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
+/// A laptop reports itself: `f = 0`, one member, no peers probed — the same fields, the degenerate values
+/// (R8).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct FleetReport {
+  /// This node's member id — what its peers, a recorded holder set and its volume ids name it by.
+  pub host: u64,
+  /// The fault tolerance the node is configured for: a write commits at `f + 1` acknowledgements.
+  pub f: u32,
+  /// This node's current host epoch (its authority; 1 on a laptop, higher after a takeover promotion).
+  pub host_epoch: u64,
+  /// The members the membership view holds alive, this node among them.
+  pub members: Vec<u64>,
+  /// Peers with a formed probe session (the direct mesh), summed over the shards: the mesh is up when
+  /// this reaches the member count less one.
+  pub peers_probed: u32,
 }
 
 /// The daemon's status.
@@ -441,6 +462,8 @@ pub struct DaemonReport {
   pub clients_refused: u64,
   /// Every shard's part, by partition.
   pub shards: Vec<ShardReport>,
+  /// The daemon's place in its fleet.
+  pub fleet: FleetReport,
 }
 
 /// A volume's summary in a listing.

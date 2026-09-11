@@ -292,7 +292,7 @@ mod structural {
     ("slates-bridge-winfsp", "the volume (§4.6)"),
     (
       "slates-cli",
-      "the launcher's namespace setup and mount install (§4.12)",
+      "the launcher's namespace setup and mount install (§4.12); reads the operator's fleet manifest and certificate files (§2.6 step 6)",
     ),
   ];
 

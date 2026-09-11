@@ -539,10 +539,16 @@ startup).
 > `f` (a record-plane coordinator promoting over every surviving holder), and §4.10 content replication —
 > a sealed snapshot archived in bounded slices, put to `f + 1` candidates by missing set, verified before
 > held, its head naming the placed content, and a takeover successor serving the content under the
-> original id. **Owed** to generalize it: the N-node connection-ID demux (many peers on one socket), full
-> multi-process deployment, and the rest of §4.10 (content-defined chunking and the cost model,
-> anti-entropy, the healer, remote attach, live shipping, migration, mirroring). The health plane's
-> refusal to serve before every chokepoint registers arrives with task 6's signals.
+> original id. **Deployed as real processes** (A-13): an operator starts every node from one shared
+> manifest (`slates daemon|anchor --fleet PATH --node NAME`); each node derives the same member ids
+> from the certificates and the same per-pair socket map from one port block per node
+> (`crates/server/src/deploy.rs`), and `slates status` reports the node's place in the fleet — proven by
+> three `slates daemon` processes forming an `f = 1` fleet, placing a sealed snapshot across processes,
+> retiring a `SIGKILL`ed owner and serving its volume from the successor (`crates/cli/tests/cli.rs`).
+> **Owed** to generalize it: the N-node connection-ID demux (many peers on one socket) and the rest of
+> §4.10 (content-defined chunking and the cost model, anti-entropy, the healer, remote attach, live
+> shipping, migration, mirroring). The health plane's refusal to serve before every chokepoint registers
+> arrives with task 6's signals.
 > A-9 correction: rebuilding scratch volumes empty and dropping snapshots is acknowledged
 > content loss (BUG-11), not content recovery. Anchor-owned bytes/roots and validated base
 > identity handoff are required before the design's restart-survival promise can be offered.
@@ -1746,6 +1752,21 @@ target, so a slow far peer is not mistaken for a failed near one. Every paramete
 measured RTT, loss, and convergence (`research/survey-hyperscale.md` §8.4 gives the formula per
 parameter; the local-health multiplier is a small integer cap, 3×–4×, not the raw `(LHM+1)`,
 which over-dilates timers under sustained probe failure).
+
+**Deployment.** A fleet is described once, in one manifest every node starts from with its own
+name: the fleet's TLS name, `f`, and each node's advertised address and operator-provisioned
+certificate (§4.13 enrollment distributes these; until it does, DER files beside the manifest). A
+node's member id is the leading eight bytes of the BLAKE3 hash of its certificate — the one fact
+about a node every peer already holds, since it pins it — so ids agree fleet-wide without a
+registry (D-14). A node's advertised port is the base of a block of two ports per manifest node: it
+serves the node at manifest position `j` on `base + 2j` (probes) and `base + 2j + 1` (records), and
+that node dials it there, so both ends of every session are computed from the same file and can
+never disagree. A manifest with fewer than `f + 1` nodes, a repeated name or certificate, or a block
+past the port range is refused by name. `status` reports the node's member id, `f`, host epoch,
+the members it holds alive and the peers it has probed. A laptop has no manifest: its member id is
+its machine identity's hash and it is its own one member at `f = 0` — the same code path (R8).
+(A-13, `crates/server/src/deploy.rs`; proven by three real daemon processes in
+`crates/cli/tests/cli.rs`.)
 
 **Slow versus stuck.** A long operation that waits on remote progress — a mirror catching up, a
 put filling its quorum — is told apart from a stalled one by a progress witness (a monotone,
@@ -4462,3 +4483,15 @@ Applied in the same change to: §2.6 (boot step 6 status — cross-node commit),
 - Owed still: the takeover's phase-one recovery and serving the taken-over head under the new epoch (the head-record recovery needs the held records made durable plus a promotion over the survivors; the content serve needs §4.10 content replication); the connection-ID demux (many peers on one socket); reconnection after a mid-run session loss (the ship loop redials, but the peer's accept side rebuilding is owed); full real (multi-process) network deployment; the loom/shuttle pass.
 - Evidence: RFC 9002 §5.1/§5.3/§6.2.1 (RTT sampling, smoothing, PTO), RFC 9000 §14.1 (minimum datagram); the register protocol and its f-parameterization are A-6/A-10.
 - What it does not change: the rules R1–R10; the register protocol, its refusal taxonomy, and the one-quorum rule; the RAM-only and grant-gated-landing rules; the N=1≡fleet degenerate (the same commit path runs at `f = 0` with the owner its own sole candidate). Multi-process deployment and the N-node transport remain gated.
+
+### A-13 (accepted 2026-09-10) — Multi-process fleet deployment from one shared manifest: member ids from certificates, the socket map from one port block per node, the node's place in the fleet in `status`
+Applied in the same change to: §2.6 (boot step 6 status — deployed as real processes), §4.8 (Membership — new "Deployment"), GAPS §1 (Registers/configuration status), the `slates-server` deployment plan (`crates/server/src/deploy.rs`) and membership config (`FleetMembership.host`), the `slates-ipc` status protocol (`FleetReport`, `ShardReport.peers_probed`), the MCP `slates.status` schema, the `slates` command (`--fleet PATH --node NAME` on `daemon` and `anchor`; `crates/cli/src/fleet.rs`; `status` fleet lines), `docs/cli.md`, `README.md`, and the real-process test (`crates/cli/tests/cli.rs`).
+- Authorization: Ada's "build all of fleet" (2026-09-10); this records the deployment mechanism implemented under that directive. Until now `FleetTransport` was built only by tests: no real fleet could be started from the binary.
+- One manifest, every node (§2.6 boot step 6): a JSON file naming the fleet's TLS name, `f`, and each node's name, advertised address and operator-provisioned DER certificate and key paths (relative to the manifest). Every node starts from the same file with its own `--node`; the command reads every certificate (the pins) and only its own key. Reads only — the command already reads host paths; the daemon still names none (R1).
+- Member ids from certificates: a node's `HostId` is the leading eight bytes of the BLAKE3 hash of its DER certificate (`deploy::host_id_of_certificate`), the same cut the laptop takes of its machine identity's hash. The certificate is the one fact about a node every peer holds, so the ids agree fleet-wide with no registry (D-14). `FleetMembership` now carries the node's own id (`host`); `init_shard` builds the `FleetNode` over it when a fleet is configured and over the machine identity's hash otherwise — one definition of "who am I", two sources, no mode switch in behaviour.
+- The socket map from one port block per node: the membership loop binds one serve socket per peer per plane (until the connection-ID demux), so rather than `N·(N−1)` operator-written address pairs each node advertises one base port and owns `2N` ports from it — it serves the node at manifest position `j` on `base + 2j` (probes) and `base + 2j + 1` (records), and that node dials it there (`deploy::serve_port`). Both ends of every session are computed from the same file; the unit test proves, for every ordered pair of plans, that a dial address equals the other side's serve bind on both planes. Refused by name: no nodes, fewer than `f + 1` nodes (nothing could ever commit), a repeated name, a repeated certificate (one member twice), a block past the port range (never wrapped).
+- The node's place in the fleet is observable from outside the process: `DaemonReport.fleet` (`host`, `f`, `host_epoch`, `members` the membership holds alive, `peers_probed` — formed probe sessions, summed over the shards' parts since only the control shard forms any), rendered by `slates status` as `fleet_*` lines and under `"fleet"` in `--json` and the MCP `slates.status`. A laptop reports the same fields, degenerate (R8).
+- Proof by real processes (`crates/cli/tests/cli.rs`, `SLATES_TEST_CLI=1`): three `slates daemon --fleet` processes, self-signed identities minted by the test as the operator would provision them, one manifest, three loopback port blocks found free by binding them; every process reports the same three certificate-derived members and both peers probed; a volume created and (where `mount_nfs` exists) written through a kernel mount on one node, sealed, places across processes at `f = 1` while its peers refuse `volume stat` for it (holders, not servers); the owner is `SIGKILL`ed; both survivors' `status` retires it (two members, one peer probed); the successor's `volume stat` answers with the name and `placed: true`; and the payload reads back through a kernel mount of the successor. The deployment proof runs wherever the CLI flow runs; the content read-back skips loudly without `mount_nfs`.
+- Evidence: §4.8 "certificates provisioned by the operator" (the pin is the identity); D-14 (ids route to owners, no global catalog); the per-peer socket mesh measured in A-11/A-12 (formation 60/60, suite 25/25 under load) that the layout serves unchanged.
+- Found and fixed on the way (a runtime bug the real-process test exposed 4/4): the shard's idle spin asked every registered poller whether it was ready and reported "work arrived" without waking the poller; the control loop's doorbell poller consumes its flag when asked, so a client's rendezvous claim that landed during a spin was lost until another client rang or the claimant's one-second claim wait ran out — a false "no daemon" (exit 3) against a live daemon. The spin now wakes the pollers it finds ready (`crates/rt/src/shard.rs`), gated by `crates/rt/tests/pollers.rs`; `docs/bugs/2026-09-10-idle-spin-consumes-poller-readiness.md`. The `slates` exit-3 message and `IpcError::DaemonUnavailable` now carry the client's reason (rendezvous absent, claim unanswered, daemon gone).
+- What it does not change: the rules R1–R10; the register protocol, its refusal taxonomy and the one-quorum rule; the membership loop and record plane (they receive the same `FleetTransport` the tests build); the N=1≡fleet degenerate. Enrollment (§4.13 distributing certificates), the connection-ID demux (which would collapse the port block to one port per node), and the rest of §4.10 remain owed.

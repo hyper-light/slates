@@ -18,7 +18,7 @@ entitlement. These limitations are open correctness/integration work, not option
 ## Running a daemon
 
 ```
-slates anchor [--instance NAME] [--quick] [--shards N]
+slates anchor [--instance NAME] [--quick] [--shards N] [--fleet PATH --node NAME]
 ```
 
 The anchor measures the machine profile (seconds; `--quick` for tests), creates the shared
@@ -29,6 +29,45 @@ and the measured daemon start). `SIGINT` or `SIGTERM` stops both. This path is i
 an anonymous shared segment alone does not establish locked residency or no swapping.
 
 `slates daemon` run alone measures a profile and serves without an anchor (development).
+
+## Deploying a fleet
+
+A fleet is several daemons on several machines that replicate each other's volume heads and
+content and take over for a dead member. Every node is started from **one shared manifest** with
+its own `--node`:
+
+```
+slates anchor --fleet /etc/slates/fleet.json --node a
+```
+
+```json
+{
+  "name": "slates-fleet",
+  "f": 1,
+  "nodes": [
+    { "node": "a", "address": "10.0.0.1:7000", "certificate": "a.crt.der", "key": "a.key.der" },
+    { "node": "b", "address": "10.0.0.2:7000", "certificate": "b.crt.der", "key": "b.key.der" },
+    { "node": "c", "address": "10.0.0.3:7000", "certificate": "c.crt.der", "key": "c.key.der" }
+  ]
+}
+```
+
+- `name` is the TLS name every node's certificate carries (its subject alternative name); peers
+  verify each other's sessions under it. Certificates and keys are DER files the operator
+  provisions, named relative to the manifest; every certificate is read (peers pin them, and a
+  node's member id is derived from its certificate), only this node's key is read.
+- `f` is the fault tolerance: a write commits once `f + 1` nodes hold it, so a fleet of `2f + 1`
+  keeps committing through `f` deaths. A manifest that could never commit (`fewer than f + 1`
+  nodes) is refused.
+- `address` is the IP peers dial and the **base of a port block**: a node serves the node at
+  manifest position `j` on `base + 2j` (probes) and `base + 2j + 1` (records), two UDP ports per
+  node in the manifest, so open `2N` ports from the base. Every node computes the same map from
+  the same file; the manifest's node order matters and must be identical everywhere.
+
+`slates status` on any node shows its place in the fleet: `fleet_host` (its member id),
+`fleet_f`, `fleet_host_epoch`, `fleet_members` (the members it holds alive) and
+`fleet_peers_probed` (peers with a formed session; the mesh is up when this is the member count
+less one). A single daemon shows the same lines, degenerate: `f` 0, itself the one member.
 
 ## Client verbs
 

@@ -78,10 +78,30 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   if let Some(shards) = options.shards {
     config = config.with_shards(shards);
   }
+  // A fleet node (§2.6 boot step 6): the shared manifest gives the membership the placement authority is
+  // built over and the transport the membership loop drives; a laptop passes neither and runs the same
+  // placement path, degenerate (R8).
+  let transport = match &options.fleet {
+    Some(selection) => {
+      let plan = crate::fleet::load(selection)?;
+      eprintln!(
+        "slates daemon: fleet node `{}` of `{}`: member {} with {} peer(s) at f = {}",
+        selection.node,
+        plan.transport.name,
+        plan.membership.host.0,
+        plan.membership.peers.len(),
+        plan.membership.quorum.f
+      );
+      config = config.with_fleet(plan.membership);
+      Some(plan.transport)
+    }
+    None => None,
+  };
   for line in &config.derivations {
     eprintln!("slates daemon: {line}");
   }
-  let daemon = Daemon::start(&profile, config, source).map_err(|e| failed("start", e))?;
+  let daemon = Daemon::start_with_fleet(&profile, config, source, transport)
+    .map_err(|e| failed("start", e))?;
   eprintln!(
     "slates daemon: instance {} serving on {} shards{}",
     options.instance,

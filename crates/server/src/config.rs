@@ -98,6 +98,12 @@ pub struct FleetMembership {
   /// The peer hosts this node's neighbourhood is drawn from, believed alive at boot; SWIM refines the
   /// live set from here. This host is always a member and is never listed among its own peers.
   pub peers: Vec<HostId>,
+  /// This node's own member id — the id its peers know it by, so a recorded holder set names this node
+  /// the way every other node names it. A deployed node derives it from its certificate
+  /// (`crate::deploy::host_id_of_certificate`, the same derivation its peers apply to the certificate
+  /// they pin); a laptop has no fleet membership and takes its machine identity's hash instead
+  /// (`init_shard`).
+  pub host: HostId,
 }
 
 /// The daemon's configuration.

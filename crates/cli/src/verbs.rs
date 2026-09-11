@@ -14,8 +14,17 @@ use crate::format::volume_id_text;
 fn failure_of(e: ClientError, instance: &str) -> Failure {
   match e {
     ClientError::Refused(refusal) => Failure::Refused(format!("{refusal:?}")),
-    ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. })
-    | ClientError::DaemonGone { .. } => Failure::Unavailable(instance.to_owned()),
+    // Both are "no daemon" to the caller (exit 3), but the cause is kept: a rendezvous that is not
+    // there, a claim the daemon never answered, or a daemon that stopped answering are different
+    // things for an operator to chase.
+    ClientError::Ipc(e @ slates_ipc::IpcError::DaemonUnavailable { .. }) => Failure::Unavailable {
+      instance: instance.to_owned(),
+      cause: e.to_string(),
+    },
+    e @ ClientError::DaemonGone { .. } => Failure::Unavailable {
+      instance: instance.to_owned(),
+      cause: e.to_string(),
+    },
     other => Failure::Failed(other.to_string()),
   }
 }
@@ -709,17 +718,24 @@ fn signal_value(signal: &slates_client::Signal) -> String {
   }
 }
 
-/// The daemon's status: the daemon's lines, then one block per shard.
+/// The daemon's status: the daemon's lines, its place in the fleet (a laptop: `f` 0, itself the one
+/// member, no peers probed), then one block per shard.
 fn daemon_status_text(report: &DaemonReport) -> String {
+  let members: Vec<String> = report.fleet.members.iter().map(u64::to_string).collect();
   let mut out = format!(
-    "pid: {}\ngeneration: {}\nrestarts: {}\nheartbeat_age_ns: {}\nclients_reaped: {}\nclients_refused: {}\nshards: {}\n",
+    "pid: {}\ngeneration: {}\nrestarts: {}\nheartbeat_age_ns: {}\nclients_reaped: {}\nclients_refused: {}\nshards: {}\nfleet_host: {}\nfleet_f: {}\nfleet_host_epoch: {}\nfleet_members: {}\nfleet_peers_probed: {}\n",
     report.pid,
     report.generation,
     report.restarts,
     report.heartbeat_age_ns,
     report.clients_reaped,
     report.clients_refused,
-    report.shards.len()
+    report.shards.len(),
+    report.fleet.host,
+    report.fleet.f,
+    report.fleet.host_epoch,
+    members.join(" "),
+    report.fleet.peers_probed
   );
   for shard in &report.shards {
     out.push_str(&format!(

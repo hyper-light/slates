@@ -514,6 +514,7 @@ pub mod platform {
     rustix::net::connect(&socket, &address(instance)?).map_err(|_| {
       IpcError::DaemonUnavailable {
         endpoint: instance.to_owned(),
+        why: "the rendezvous socket refused the connection (no daemon listening)",
       }
     })?;
     rustix::net::send(&socket, &wanted.to_le_bytes(), SendFlags::empty())
@@ -860,6 +861,7 @@ pub mod platform {
     let object = SharedObject::open(&handoff, HEADER_BYTES + SLOTS * SLOT_BYTES).map_err(|_| {
       IpcError::DaemonUnavailable {
         endpoint: instance.to_owned(),
+        why: "the rendezvous object is not there (no daemon has created it)",
       }
     })?;
     if u32::from_le_bytes([
@@ -926,6 +928,7 @@ pub mod platform {
           word.store(FREE, Ordering::Release);
           return Err(IpcError::DaemonUnavailable {
             endpoint: instance.to_owned(),
+            why: "the daemon did not answer the claim within the claim wait",
           });
         }
         #[cfg(not(windows))]
@@ -1039,6 +1042,7 @@ pub mod platform {
   pub(super) fn connect(instance: &str, _wanted: u32) -> Result<Connected, IpcError> {
     Err(IpcError::DaemonUnavailable {
       endpoint: instance.to_owned(),
+      why: "no rendezvous exists on this platform",
     })
   }
 }

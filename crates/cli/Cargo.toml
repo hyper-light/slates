@@ -31,5 +31,9 @@ slates-rt = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
+[dev-dependencies]
+# Self-signed fleet identities for the multi-process deployment test (as the server's fleet tests mint them).
+rcgen = { workspace = true }
+
 [lints]
 workspace = true

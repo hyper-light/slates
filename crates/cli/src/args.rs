@@ -10,8 +10,8 @@ use crate::format::{parse_size, parse_snapshot, parse_volume_id};
 /// The usage text: the verbs.
 pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
 
-  anchor   [--quick] [--shards N]                  run the anchor: own the segment, supervise the daemon
-  daemon   [--quick] [--shards N]                  run the daemon (alone, or as the anchor's child)
+  anchor   [--quick] [--shards N] [--fleet PATH --node NAME]   run the anchor: own the segment, supervise the daemon
+  daemon   [--quick] [--shards N] [--fleet PATH --node NAME]   run the daemon (alone, or as the anchor's child)
   profile  [--quick] [--json]                      measure and print the machine profile
   mcp [--instance NAME] [--http PORT]               serve the MCP tools (stdio, or loopback HTTP)
 
@@ -99,6 +99,18 @@ pub(crate) struct ProcessOptions {
   pub quick: bool,
   /// Shards, when the caller overrides the derivation (tests).
   pub shards: Option<u16>,
+  /// The fleet to join, when this daemon is a fleet node (§2.6 boot step 6); a laptop has none.
+  pub fleet: Option<FleetSelection>,
+}
+
+/// Which fleet node this process is: the operator's shared manifest and this node's name in it
+/// (`--fleet PATH --node NAME`; `slates_server::deploy` derives everything else from the two).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FleetSelection {
+  /// The path of the shared manifest.
+  pub manifest: String,
+  /// This node's name in it.
+  pub node: String,
 }
 
 /// Options of `profile`.
@@ -350,6 +362,8 @@ pub(crate) enum Command {
 const VALUES: &[&str] = &[
   "--instance",
   "--shards",
+  "--fleet",
+  "--node",
   "--bounded",
   "--dynamic",
   "--base",
@@ -513,6 +527,22 @@ fn shards_of(taken: &Taken) -> Result<Option<u16>, ParseError> {
     .transpose()
 }
 
+/// `--fleet PATH --node NAME`, both or neither: a manifest without the node to be in it, or a node
+/// without the manifest naming it, is a usage error.
+fn fleet_of(taken: &Taken) -> Result<Option<FleetSelection>, ParseError> {
+  match (taken.value("--fleet"), taken.value("--node")) {
+    (Some(manifest), Some(node)) => Ok(Some(FleetSelection {
+      manifest: manifest.to_owned(),
+      node: node.to_owned(),
+    })),
+    (Some(_), None) => Err(ParseError::Missing(
+      "--node NAME (which node of the fleet this is)",
+    )),
+    (None, Some(_)) => Err(ParseError::Missing("--fleet PATH (the fleet manifest)")),
+    (None, None) => Ok(None),
+  }
+}
+
 fn size_of(taken: &Taken) -> Result<SizeClass, ParseError> {
   match (taken.value("--bounded"), taken.value("--dynamic")) {
     (Some(limit), None) => Ok(SizeClass::Bounded {
@@ -588,13 +618,14 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
     [] => Err(ParseError::Help),
     ["anchor" | "daemon"] => {
       taken.only(&Spec {
-        values: &["--shards"],
+        values: &["--shards", "--fleet", "--node"],
         switches: &["--quick"],
       })?;
       let options = ProcessOptions {
         instance: taken.instance(),
         quick: taken.switch("--quick"),
         shards: shards_of(&taken)?,
+        fleet: fleet_of(&taken)?,
       };
       Ok(if words[0] == "anchor" {
         Command::Anchor(options)
@@ -1058,6 +1089,7 @@ mod tests {
         instance: "z".into(),
         quick: true,
         shards: Some(2),
+        fleet: None,
       }))
     );
     assert_eq!(
@@ -1074,6 +1106,34 @@ mod tests {
         http: Some(8787),
       }))
     );
+  }
+
+  /// A fleet node (§2.6 boot step 6): `--fleet PATH --node NAME` on the daemon or the anchor, both or
+  /// neither — one without the other is a usage error naming the missing one.
+  #[test]
+  fn the_grammar_parses_a_fleet_node() {
+    assert_eq!(
+      parse(&args(
+        "daemon --instance a --fleet /etc/slates/fleet.json --node a"
+      )),
+      Ok(Command::Daemon(ProcessOptions {
+        instance: "a".into(),
+        quick: false,
+        shards: None,
+        fleet: Some(FleetSelection {
+          manifest: "/etc/slates/fleet.json".into(),
+          node: "a".into(),
+        }),
+      }))
+    );
+    assert!(matches!(
+      parse(&args("daemon --fleet fleet.json")),
+      Err(ParseError::Missing(_))
+    ));
+    assert!(matches!(
+      parse(&args("anchor --node a")),
+      Err(ParseError::Missing(_))
+    ));
   }
 
   /// The merge grammar (§4.16): green, work, edit, submit, versions and changed-since parse to

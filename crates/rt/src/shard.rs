@@ -166,7 +166,9 @@ impl ShardSeed {
 /// A poller: a task that owns an inbound ring the loop cannot see (a client's command ring
 /// in shared memory, §4.3 "drain inbound rings (client command rings, ...)"). The loop asks
 /// `ready` each step and during the idle spin, and wakes the task when it says so; the task
-/// yields with [`crate::futures::idle`] and is polled again only when woken.
+/// yields with [`crate::futures::idle`] and is polled again only when woken. `ready` may consume
+/// its signal when asked (the daemon's doorbell flag does), so every asker wakes the task on a
+/// yes — the step and the spin both go through `wake_ready_pollers`, never a bare `ready()`.
 pub struct Poller {
   slot: u32,
   generation: u32,
@@ -546,11 +548,12 @@ impl ShardContext {
     }
     let spin_end = now.saturating_add(spin_ns);
     loop {
+      // A poller's question may consume its signal (the daemon's doorbell flag is swapped to false
+      // when asked), so the spin wakes the pollers it finds ready rather than only reporting them:
+      // asked here and dropped, a ring would be lost until the next one (`tests/pollers.rs`).
       if self.has_inbound()
         || self
-          .with_inner(|inner| {
-            inner.driver.has_pending() || inner.pollers.iter().any(|p| (p.ready)())
-          })
+          .with_inner(|inner| inner.driver.has_pending() || self.wake_ready_pollers(inner))
           .unwrap_or(false)
       {
         self.with_inner(|inner| inner.counters.spin_hits += 1);

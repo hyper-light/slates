@@ -184,6 +184,7 @@ fn start_sharded(this: Node, peer: Peer, shards: u16) -> Daemon {
     .with_fleet(FleetMembership {
       quorum: Quorum { f: 1 },
       peers: vec![peer.host],
+      host: this.host,
     });
   let transport = FleetTransport {
     identity: this.identity,
@@ -381,6 +382,7 @@ fn start_mesh_with(
         .with_fleet(FleetMembership {
           quorum: Quorum { f },
           peers: member_peers,
+          host,
         });
       let transport = FleetTransport {
         identity,

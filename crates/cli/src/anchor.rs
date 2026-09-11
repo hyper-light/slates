@@ -91,6 +91,14 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
     args.push("--shards".to_owned());
     args.push(shards.to_string());
   }
+  // A fleet node's daemon joins the fleet; the anchor only passes the selection through (the daemon
+  // reads the manifest, so a restart re-reads an operator's edit).
+  if let Some(fleet) = &options.fleet {
+    args.push("--fleet".to_owned());
+    args.push(fleet.manifest.clone());
+    args.push("--node".to_owned());
+    args.push(fleet.node.clone());
+  }
   // Until a start is measured, the budget holds one start: a daemon that fails once
   // before it ever beat is restarted once.
   let policy = RestartPolicy::derive(RECOVERY_BUDGET_NS, RECOVERY_BUDGET_NS);

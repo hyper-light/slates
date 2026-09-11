@@ -16,9 +16,9 @@ use slates_db::catalog::{
 };
 use slates_db::register::ObjectId;
 use slates_ipc::protocol::{
-  DaemonReport, Direction, HealthSignal, Intent, NamePolicy, PlacedState, Refusal, RefusalCount,
-  ReplyBody, RequestBody, Scope, ShardReport, Signal, SizeClass, SnapshotId, StatusReport,
-  VolumeId, VolumeSummary, WorkOp, pack, unpack,
+  DaemonReport, Direction, FleetReport, HealthSignal, Intent, NamePolicy, PlacedState, Refusal,
+  RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal, SizeClass, SnapshotId,
+  StatusReport, VolumeId, VolumeSummary, WorkOp, pack, unpack,
 };
 use slates_ipc::slot::SlotKind;
 use slates_ipc::{IpcError, Request};
@@ -775,6 +775,29 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     signals,
     spans_held: u64::try_from(state.telemetry.len()).unwrap_or(u64::MAX),
     spans_dropped: state.telemetry.dropped(),
+    peers_probed: u32::try_from(state.formed_probe_peers.len()).unwrap_or(u32::MAX),
+  }
+}
+
+/// The daemon's place in its fleet (§4.8), from this shard's placement authority — every shard's
+/// `FleetNode` advances identically (the control shard hands it each peer state it folds) — with the
+/// formed probe sessions summed over the shards' parts (only the control shard forms any).
+fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
+  let configuration = state.fleet.configuration();
+  FleetReport {
+    host: state.fleet.host().0,
+    f: configuration.quorum.f,
+    host_epoch: configuration.host_epoch.0,
+    members: state
+      .fleet
+      .membership()
+      .alive()
+      .into_iter()
+      .map(|host| host.0)
+      .collect(),
+    peers_probed: shards
+      .iter()
+      .fold(0u32, |sum, shard| sum.saturating_add(shard.peers_probed)),
   }
 }
 
@@ -793,6 +816,7 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
       )
     })
     .unwrap_or((0, 0, 0));
+  let fleet = fleet_report(state, &shards);
   ReplyBody::DaemonStatus {
     report: DaemonReport {
       pid: std::process::id(),
@@ -802,6 +826,7 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
       clients_reaped: crate::daemon::CLIENTS_REAPED.load(Ordering::Acquire),
       clients_refused: crate::daemon::CLIENTS_REFUSED.load(Ordering::Acquire),
       shards,
+      fleet,
     },
   }
 }

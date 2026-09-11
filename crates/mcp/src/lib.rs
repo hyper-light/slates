@@ -787,6 +787,13 @@ pub fn daemon_json(r: &DaemonReport) -> Value {
     "clients_reaped": r.clients_reaped,
     "clients_refused": r.clients_refused,
     "shards": r.shards.len(),
+    "fleet": {
+      "host": r.fleet.host,
+      "f": r.fleet.f,
+      "host_epoch": r.fleet.host_epoch,
+      "members": r.fleet.members,
+      "peers_probed": r.fleet.peers_probed,
+    },
   })
 }
 

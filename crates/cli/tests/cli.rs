@@ -618,3 +618,464 @@ fn the_profile_and_the_usage_print() {
     .unwrap();
   assert_eq!(output.status.code(), Some(2));
 }
+
+/// Shape: how long a three-process fleet gets for each phase — to form its mesh, to place a sealed
+/// snapshot across processes, to retire a killed node, and for the successor to serve. Each is a few
+/// protocol periods on loopback (the in-process fleet tests hold them to 15–25 s), widened for three
+/// daemons booting one after another on a shared machine.
+const FLEET_WAIT: Duration = Duration::from_secs(40);
+/// Shape: the fleet's TLS name — every test certificate carries it and every node verifies its peers'
+/// sessions under it.
+const FLEET_NAME: &str = "slates-fleet";
+/// Shape: the nodes of the test fleet, in manifest order (the order fixes the port layout).
+const FLEET_NODES: [&str; 3] = ["a", "b", "c"];
+/// Shape: the fleet's fault tolerance — three nodes at `f = 1` keep a commit quorum through one death
+/// (`2f + 1 = 3` candidates, `f + 1 = 2` acknowledgements).
+const FLEET_F: u32 = 1;
+/// Shape: the ports a node's block spans per manifest node — one per plane (`slates_server::deploy`).
+const PORTS_PER_ENTRY: u16 = 2;
+/// Shape: the bottom of the port range the test searches for a node's free port block — above the
+/// well-known and registered ports a shared machine has bound.
+const PORT_FLOOR: u16 = 20_000;
+/// Shape: the width of that range; the search starts at a pid-derived offset into it so two test
+/// processes on one machine start apart.
+const PORT_SPAN: u16 = 30_000;
+/// Shape: how many candidate bases the search tries before failing (a block of six consecutive free UDP
+/// ports is found within a handful on a shared machine).
+const PORT_ATTEMPTS: u16 = 2_000;
+/// Shape: the bytes written on the owner and read back on its successor.
+const FLEET_PAYLOAD: &str =
+  "sealed on the owner, replicated to its holders, served by its successor";
+/// Shape: the volume's name in the fleet flow — also its NFS export name.
+const FLEET_VOLUME: &str = "served";
+
+/// A `slates daemon --fleet` process: killed (as a crash would kill it) and reaped when dropped, so a
+/// failed assertion leaves no daemon behind.
+struct FleetProcess {
+  child: Child,
+}
+
+impl Drop for FleetProcess {
+  fn drop(&mut self) {
+    let _ = self.child.kill();
+    let _ = self.child.wait();
+  }
+}
+
+/// A scratch directory for the manifest and the DER files (`mktemp -d`, named with the process id),
+/// removed when dropped — even when an assertion fails.
+struct ScratchDir {
+  path: String,
+}
+
+impl Drop for ScratchDir {
+  fn drop(&mut self) {
+    let _ = Command::new("rm").args(["-rf", &self.path]).output();
+  }
+}
+
+fn scratch_dir() -> ScratchDir {
+  let out = Command::new("mktemp")
+    .args(["-d", "-t", &format!("slates-fleet-{}", std::process::id())])
+    .output()
+    .unwrap();
+  assert!(out.status.success(), "mktemp -d");
+  ScratchDir {
+    path: String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+  }
+}
+
+/// A self-signed identity for `node` carrying the fleet's TLS name, written as DER files into `dir`: the
+/// test's stand-in for the operator-provisioned certificate and key (§4.8 "certificates provisioned by the
+/// operator"). The test writes the operator's files the daemon reads; test code is outside the R1 wall
+/// (it writes only into the scratch directory it removes).
+#[allow(clippy::disallowed_methods)]
+fn mint_identity(dir: &str, node: &str) {
+  let key = rcgen::KeyPair::generate().unwrap();
+  let cert = rcgen::CertificateParams::new(vec![FLEET_NAME.to_owned()])
+    .unwrap()
+    .self_signed(&key)
+    .unwrap();
+  std::fs::write(format!("{dir}/{node}.crt.der"), cert.der().as_ref()).unwrap();
+  std::fs::write(format!("{dir}/{node}.key.der"), key.serialize_der()).unwrap();
+}
+
+/// The shared manifest (the documented shape, `crates/cli/src/fleet.rs`): every node with its loopback
+/// base port and its DER files, written into `dir`; returns its path.
+#[allow(clippy::disallowed_methods)]
+fn write_manifest(dir: &str, bases: &[u16]) -> String {
+  let nodes: Vec<serde_json::Value> = FLEET_NODES
+    .iter()
+    .zip(bases)
+    .map(|(node, base)| {
+      serde_json::json!({
+        "node": node,
+        "address": format!("127.0.0.1:{base}"),
+        "certificate": format!("{node}.crt.der"),
+        "key": format!("{node}.key.der"),
+      })
+    })
+    .collect();
+  let manifest = serde_json::json!({ "name": FLEET_NAME, "f": FLEET_F, "nodes": nodes });
+  let path = format!("{dir}/fleet.json");
+  std::fs::write(&path, manifest.to_string()).unwrap();
+  path
+}
+
+/// A base port whose `count` consecutive UDP loopback ports are all free right now — bound together so
+/// the OS confirms the whole block, dropped before the daemons bind them — searched upward from `from`
+/// within the attempt bound. Tests may use `std::net` (as the server's fleet tests do); the daemon never
+/// links it (R1).
+fn free_port_block(from: u16, count: u16) -> u16 {
+  let mut base = from;
+  for _ in 0..PORT_ATTEMPTS {
+    let sockets: Vec<Option<std::net::UdpSocket>> = (0..count)
+      .map(|k| {
+        base
+          .checked_add(k)
+          .and_then(|port| std::net::UdpSocket::bind(("127.0.0.1", port)).ok())
+      })
+      .collect();
+    if sockets.iter().all(Option::is_some) {
+      return base;
+    }
+    base = base.checked_add(count).unwrap_or(PORT_FLOOR);
+  }
+  panic!("no block of {count} free loopback UDP ports found from {from}");
+}
+
+/// One free port block per node (two ports per manifest node), disjoint, from a pid-derived start.
+fn port_blocks() -> Vec<u16> {
+  let block = PORTS_PER_ENTRY * u16::try_from(FLEET_NODES.len()).unwrap();
+  let offset = std::process::id() % u32::from(PORT_SPAN);
+  let start = u16::try_from(u32::from(PORT_FLOOR) + offset).unwrap();
+  let mut bases = Vec::with_capacity(FLEET_NODES.len());
+  let mut from = start;
+  for _ in FLEET_NODES {
+    let base = free_port_block(from, block);
+    bases.push(base);
+    from = base.checked_add(block).unwrap_or(PORT_FLOOR);
+  }
+  bases
+}
+
+/// Starts `slates daemon --fleet MANIFEST --node NODE` alone (no anchor) at `instance`.
+fn start_fleet_daemon(instance: &str, manifest: &str, node: &str) -> FleetProcess {
+  let child = slates()
+    .args([
+      "--instance",
+      instance,
+      "daemon",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--fleet",
+      manifest,
+      "--node",
+      node,
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::inherit())
+    .spawn()
+    .unwrap();
+  FleetProcess { child }
+}
+
+/// Waits until the daemon at `instance` answers a verb, bounded by the start wait.
+fn wait_answers(instance: &str) {
+  let started = Instant::now();
+  loop {
+    let (code, _, _) = run(instance, &["volume", "list"]);
+    if code == 0 {
+      return;
+    }
+    assert!(
+      started.elapsed() < START_WAIT,
+      "the fleet daemon at {instance} came up: still {code}"
+    );
+    pause();
+  }
+}
+
+/// The fleet lines of `slates status`: this node's member id, the members it holds alive, and the peers
+/// it has a formed probe session to.
+#[derive(Debug)]
+struct FleetView {
+  host: String,
+  members: Vec<String>,
+  peers_probed: u32,
+}
+
+fn fleet_view(instance: &str) -> Option<FleetView> {
+  let (code, out, _) = run(instance, &["status"]);
+  if code != 0 {
+    return None;
+  }
+  let mut members: Vec<String> = value_of(&out, "fleet_members")
+    .split_whitespace()
+    .map(str::to_owned)
+    .collect();
+  members.sort();
+  Some(FleetView {
+    host: value_of(&out, "fleet_host"),
+    members,
+    peers_probed: value_of(&out, "fleet_peers_probed").parse().unwrap(),
+  })
+}
+
+/// Polls every node's fleet view until each holds `members` members alive with `probed` peers probed, or
+/// the fleet wait passes; returns the views then (the caller asserts on them, so a failure shows every
+/// node's view).
+fn wait_fleet_views(instances: &[String], members: usize, probed: u32) -> Vec<Option<FleetView>> {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let views: Vec<Option<FleetView>> = instances.iter().map(|i| fleet_view(i)).collect();
+    let settled = views.iter().all(|view| {
+      view
+        .as_ref()
+        .is_some_and(|v| v.members.len() == members && v.peers_probed == probed)
+    });
+    if settled || Instant::now() >= deadline {
+      return views;
+    }
+    pause();
+  }
+}
+
+/// Every process derived the same fleet from the one manifest: the same three member ids (its own among
+/// them, distinct per node) and both peers probed.
+fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
+  let formed: Vec<&FleetView> = views
+    .iter()
+    .map(|v| {
+      v.as_ref()
+        .unwrap_or_else(|| panic!("every node answers status: {views:?}"))
+    })
+    .collect();
+  let members = &formed[0].members;
+  assert_eq!(members.len(), FLEET_NODES.len(), "three members: {views:?}");
+  for view in &formed {
+    assert_eq!(
+      &view.members, members,
+      "every process holds the same members: {views:?}"
+    );
+    assert!(
+      members.contains(&view.host),
+      "a node is among its own members: {views:?}"
+    );
+    assert_eq!(
+      view.peers_probed,
+      u32::try_from(FLEET_NODES.len() - 1).unwrap(),
+      "both peers probed: {views:?}"
+    );
+  }
+  let mut hosts: Vec<String> = formed.iter().map(|v| v.host.clone()).collect();
+  hosts.sort();
+  hosts.dedup();
+  assert_eq!(
+    hosts.len(),
+    FLEET_NODES.len(),
+    "distinct member ids: {views:?}"
+  );
+  hosts
+}
+
+/// Writes the payload as `hello.txt` through a kernel mount at `path` (the shell writes; R1).
+fn write_payload_through(path: &str) {
+  let wrote = Command::new("sh")
+    .arg("-c")
+    .arg(format!(
+      "printf '%s' '{FLEET_PAYLOAD}' > '{path}/hello.txt'"
+    ))
+    .output()
+    .unwrap();
+  assert!(
+    wrote.status.success(),
+    "write through the owner's mount: {}",
+    String::from_utf8_lossy(&wrote.stderr)
+  );
+}
+
+/// Provisions the volume on the owner, writes the payload into it through a real kernel mount where
+/// `mount_nfs` exists (the mount is released before the owner dies, so no kernel client is left talking to
+/// a dead server), and seals it; returns the id and the snapshot.
+fn seal_on_owner(instance: &str, mountable: bool) -> (String, String) {
+  let (code, out, err) = run(
+    instance,
+    &["volume", "create", FLEET_VOLUME, "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  if mountable {
+    let mount_point = MountPoint {
+      path: fresh_mount_point(),
+    };
+    mount_and_check(instance, &id, &mount_point.path);
+    write_payload_through(&mount_point.path);
+    unmount_and_check(instance, &mount_point.path);
+  } else {
+    eprintln!(
+      "mount_nfs is not on this host: the fleet flow seals an empty volume (the content read-back runs on macOS/BSD)"
+    );
+  }
+  let (code, out, err) = run(instance, &["volume", "snapshot", &id]);
+  assert_eq!(code, 0, "{err}");
+  (id, value_of(&out, "snapshot"))
+}
+
+/// Polls the owner's `volume placed ID --snapshot N` until it answers placed (at `f = 1`, a peer process
+/// acknowledged the content and the head) or the fleet wait passes.
+fn wait_placed(instance: &str, id: &str, snapshot: &str) {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    let (code, out, err) = run(instance, &["volume", "placed", id, "--snapshot", snapshot]);
+    assert_eq!(code, 0, "{err}");
+    if value_of(&out, "placed") == "true" {
+      return;
+    }
+    assert!(
+      Instant::now() < deadline,
+      "the snapshot placed across processes within the fleet wait"
+    );
+    pause();
+  }
+}
+
+/// Before the owner dies its peers hold the head as candidates but serve no such volume: `volume stat`
+/// refuses on both — the transition the takeover makes is then observable, not vacuous.
+fn assert_not_served(instances: &[String], id: &str) {
+  for instance in instances {
+    let (code, _, err) = run(instance, &["volume", "stat", id]);
+    assert_eq!(code, 1, "a holder does not serve the owner's volume: {err}");
+    assert!(err.contains("NotFound"), "{err}");
+  }
+}
+
+/// The survivors retired the dead node: two members, one peer probed, the dead id gone.
+fn assert_retired(views: &[Option<FleetView>], dead: &str) {
+  for view in views {
+    let view = view
+      .as_ref()
+      .unwrap_or_else(|| panic!("every survivor answers status: {views:?}"));
+    assert_eq!(
+      view.members.len(),
+      2,
+      "two members after the death: {views:?}"
+    );
+    assert!(
+      !view.members.contains(&dead.to_owned()),
+      "the dead node is retired: {views:?}"
+    );
+    assert_eq!(view.peers_probed, 1, "one peer left in the mesh: {views:?}");
+  }
+}
+
+/// Polls the survivors' `volume stat ID` until one serves the volume (the successor materialized it under
+/// its id, named and placed) or the fleet wait passes; returns the successor's instance.
+fn wait_successor(instances: &[String], id: &str) -> String {
+  let deadline = Instant::now() + FLEET_WAIT;
+  loop {
+    for instance in instances {
+      let (code, out, _) = run(instance, &["volume", "stat", id]);
+      if code == 0 {
+        assert_eq!(value_of(&out, "name"), FLEET_VOLUME);
+        assert_eq!(value_of(&out, "placed"), "true");
+        return instance.clone();
+      }
+    }
+    assert!(
+      Instant::now() < deadline,
+      "a survivor took the volume over and serves it within the fleet wait"
+    );
+    pause();
+  }
+}
+
+/// The payload written on the dead owner reads back through a real kernel mount of the successor's
+/// volume — where `mount_nfs` exists; elsewhere the read-back skips loudly.
+fn read_on_successor(instance: &str, id: &str, mountable: bool) {
+  if !mountable {
+    eprintln!(
+      "mount_nfs is not on this host: skipping the read-back through the successor's mount"
+    );
+    return;
+  }
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  mount_and_check(instance, id, &mount_point.path);
+  let readback = Command::new("cat")
+    .arg(format!("{}/hello.txt", mount_point.path))
+    .output()
+    .unwrap();
+  assert_eq!(
+    String::from_utf8_lossy(&readback.stdout),
+    FLEET_PAYLOAD,
+    "the file written on the dead owner reads back byte for byte through the successor's mount"
+  );
+  unmount_and_check(instance, &mount_point.path);
+}
+
+/// AC (§2.6 boot step 6 "multi-process deployment"; §4.8 "Membership", "Promotion and takeover"; §4.10;
+/// R8): three real `slates daemon --fleet` **processes**, each started from the **same** manifest with its
+/// own `--node`, form one `f = 1` fleet over loopback UDP — every process derives the same three member
+/// ids from the certificates (each node's `status` lists the same members, its own among them) and probes
+/// both peers. A volume sealed on one node **places across processes** (`volume placed` at `f = 1` needs
+/// a peer process's acknowledgement) while its peers serve no such volume. Killed with SIGKILL, the owner
+/// is retired by both survivors (their `status` drops it), and the survivor rendezvous ranks first takes
+/// the volume over and serves it under its id — the file written on the dead owner reading back through a
+/// real kernel mount of the successor where `mount_nfs` exists (elsewhere that step skips loudly; the
+/// deployment proof stands). Gated like the other process flows (`SLATES_TEST_CLI=1`): three daemons with
+/// spinning shards need the machine to themselves.
+#[test]
+fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owners_death() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the fleet deployment flow: set SLATES_TEST_CLI=1 to run it (three daemons; needs the machine to itself)"
+    );
+    return;
+  }
+  let pid = std::process::id();
+  let scratch = scratch_dir();
+  for node in FLEET_NODES {
+    mint_identity(&scratch.path, node);
+  }
+  let manifest = write_manifest(&scratch.path, &port_blocks());
+  let instances: Vec<String> = FLEET_NODES
+    .iter()
+    .map(|node| format!("cli-fleet-{node}-{pid}"))
+    .collect();
+  let mut daemons: Vec<FleetProcess> = FLEET_NODES
+    .iter()
+    .zip(&instances)
+    .map(|(node, instance)| start_fleet_daemon(instance, &manifest, node))
+    .collect();
+  for instance in &instances {
+    wait_answers(instance);
+  }
+
+  // Formation: one manifest, three processes, one fleet.
+  let hosts = assert_formed(&wait_fleet_views(
+    &instances,
+    FLEET_NODES.len(),
+    u32::try_from(FLEET_NODES.len() - 1).unwrap(),
+  ));
+  let owner_host = fleet_view(&instances[0]).unwrap().host;
+  assert!(hosts.contains(&owner_host));
+
+  // Placement across processes, then the owner's death as a crash would deal it.
+  let mountable = mount_nfs_available();
+  let (id, snapshot) = seal_on_owner(&instances[0], mountable);
+  wait_placed(&instances[0], &id, &snapshot);
+  let survivors = instances[1..].to_vec();
+  assert_not_served(&survivors, &id);
+  drop(daemons.remove(0));
+
+  // Retirement, takeover, serve.
+  assert_retired(&wait_fleet_views(&survivors, 2, 1), &owner_host);
+  let successor = wait_successor(&survivors, &id);
+  read_on_successor(&successor, &id, mountable);
+
+  drop(daemons);
+  drop(scratch);
+}

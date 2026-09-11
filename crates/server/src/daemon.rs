@@ -650,10 +650,14 @@ fn init_shard(
     headroom.get(),
   );
   let shard = registry::current_shard().unwrap_or(partition);
-  // The node's host id: the machine identity's hash, stable across restarts, distinct per
-  // machine, so a recorded holder set and a volume id's creator-host bits mean the same
-  // thing when Phase 8 adds peers. One host, `f = 0`, on a laptop.
-  let host = slates_db::HostId(host_id_of(identity));
+  // The node's host id — what a recorded holder set and a volume id's creator-host bits name it by. A
+  // fleet node's is the member id its manifest derives from its certificate (`crate::deploy`), so it is
+  // the id its peers know it by; a laptop (no fleet) takes the machine identity's hash, stable across
+  // restarts and distinct per machine. One host, `f = 0`, on a laptop.
+  let host = config
+    .fleet
+    .as_ref()
+    .map_or_else(|| slates_db::HostId(host_id_of(identity)), |m| m.host);
   // The owner runtime this node takes part in a region as (§4.8, boot step 6): membership + the
   // configuration group + the owner's acceptor, composed by `slates-cluster`. Built from the configured
   // fleet membership (its quorum and peers) when the operator deploys a fleet, or the laptop `f = 0`

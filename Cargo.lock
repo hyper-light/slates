@@ -1197,6 +1197,7 @@ name = "slates-cli"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rcgen",
  "rustix",
  "serde_json",
  "slates-anchor",
