@@ -342,8 +342,9 @@ impl Stragglers {
 /// (`docs/bugs/2026-09-10-swim-stale-ack.md` records the same discipline for the SWIM probe). The deadline
 /// is the collection loop's own bound — its full progress-extended span
 /// ([`CommitBudget::max_deadline_ns`]) — so a reply that arrives while the loop is still extending is not
-/// cut off early.
-async fn request_within(
+/// cut off early. Shared by the record and content dispatch here and the daemon's configuration plane (the
+/// council's Raft over its own stream), so the timed, session-preserving request discipline is one.
+pub async fn request_within(
   mut endpoint: Endpoint,
   stream_id: u64,
   request: &[u8],

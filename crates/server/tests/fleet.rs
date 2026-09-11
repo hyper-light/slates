@@ -69,6 +69,17 @@ const REJOIN_DEADLINE: Duration = Duration::from_secs(15);
 /// because a larger mesh has more sessions to establish (each node dials and accepts every peer) and the
 /// daemons start one after another.
 const FORMATION_DEADLINE: Duration = Duration::from_secs(15);
+/// Shape: how long to wait, after the mesh forms, for the configuration council to elect a single leader over
+/// the transport — several election timeouts (ELECTION_HEARTBEATS heartbeat periods plus per-node jitter, and
+/// a retry or two if a jittered collision splits the first vote), measured against the serialised quiet
+/// machine.
+const COUNCIL_ELECTION_DEADLINE: Duration = Duration::from_secs(15);
+/// Shape: the window a single council leader must hold without flapping — a couple of dozen heartbeat
+/// periods, so a genuinely stable pre-vote-protected leader is told apart from one that keeps being disrupted.
+const COUNCIL_STABILITY_WINDOW: Duration = Duration::from_secs(2);
+/// Shape: how long to wait for a follower's council leader-contact to climb past its baseline — a few
+/// heartbeat periods, so the leader's replication reaching the followers over the transport is observed live.
+const COUNCIL_HEARTBEAT_WINDOW: Duration = Duration::from_secs(5);
 
 /// Each fleet test starts several daemons — every daemon is a shard thread plus its doorbell thread — so
 /// running the tests concurrently oversubscribes the machine and stretches the probe and commit timing
@@ -543,6 +554,68 @@ fn three_daemons_form_a_full_mesh() {
   assert!(
     all_meshed,
     "the three-node direct probe mesh did not fully form within the deadline: {meshed:?}"
+  );
+}
+
+/// AC (§4.8, D-14, the distributed configuration council): three daemons' councils, driven from each node's
+/// record-plane coordinator over the **real** fleet transport (the council's Raft rides `CONFIG_STREAM` on
+/// the same record sessions), **elect a single leader** — the configuration master for the region — and the
+/// leader's per-period heartbeats keep the two followers in contact. This is the transport-driven form of
+/// the sans-io council proven in `slates-cluster` (`config_group.rs`) and over sim UDP (`config_group_live.rs`);
+/// here it runs end to end through the daemon's own sessions and demux. Three nodes at `f = 1` is a majority
+/// of two, so the elected leader is genuinely agreed, not a lone self-election.
+///
+/// The proof is threefold and non-vacuous: **exactly one** leader emerges (an election ran and converged, not
+/// zero or a split), it **holds** across a stability window (pre-vote keeps a slow or partitioned follower
+/// from disrupting it — no flapping), and a **follower's leader-contact counter advances** over the window
+/// (the leader's heartbeats are flowing over the transport — replication is live, not merely an election won).
+#[test]
+fn three_daemons_elect_one_stable_council_leader_over_the_transport() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+
+  // The council elects only over live record sessions, so wait for the direct mesh first (the record links
+  // come up alongside the probe mesh), then for exactly one leader to emerge over the transport.
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let one_leader = || daemons.iter().filter(|d| d.council_leads()).count() == 1;
+  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, one_leader);
+  // A won election must not flap: exactly one leader holds across the stability window.
+  let stable = elected && holds_for(COUNCIL_STABILITY_WINDOW, one_leader);
+  // The leader's heartbeats must reach the followers over the transport: a follower's leader-contact climbs
+  // past the baseline just captured (a non-vacuity counter — replication is live, not just an election).
+  let baseline: Vec<u64> = daemons.iter().map(Daemon::council_contact).collect();
+  let heartbeats_flow = stable
+    && poll_until(COUNCIL_HEARTBEAT_WINDOW, || {
+      daemons
+        .iter()
+        .zip(baseline.iter())
+        .any(|(daemon, &base)| !daemon.council_leads() && daemon.council_contact() > base)
+    });
+
+  // Stop the daemons before asserting, so a failure leaves none running.
+  let leads: Vec<bool> = daemons.iter().map(Daemon::council_leads).collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    elected,
+    "the council elected exactly one leader over the transport within the deadline (leads={leads:?})"
+  );
+  assert!(
+    stable,
+    "the single council leader held across the stability window — pre-vote prevents flapping"
+  );
+  assert!(
+    heartbeats_flow,
+    "a follower's council leader-contact advanced — the leader's heartbeats flow over the transport"
   );
 }
 

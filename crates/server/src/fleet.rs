@@ -71,16 +71,19 @@
 //! there is no fleet transport and this loop does not run; the placement path still runs the same
 //! `FleetNode`, degenerate (R8).
 
+use std::sync::mpsc::{TryRecvError, channel};
+
 use rustls::pki_types::CertificateDer;
 use slates_archive::Archive;
 use slates_cluster::content::{fetch_content, is_content_stream, put_content};
 use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::fleet::{apply_peer_state, sync_peer};
 use slates_cluster::membership::Liveness;
+use slates_cluster::raft_wire::RaftMessage;
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once};
 use slates_cluster::{
   ClusterError, CommitBudget, PROMOTE_STREAM, RECORD_STREAM, Stragglers, commit_record,
-  promote_record,
+  promote_record, request_within,
 };
 use slates_db::Op;
 use slates_db::catalog::{
@@ -772,6 +775,7 @@ async fn serve_peer_records(
         stream if is_content_stream(stream) => {
           state::with_state(|s| s.held_content.serve(local, &request)).unwrap_or_default()
         }
+        CONFIG_STREAM => state::with_state(|s| serve_council(s, &request)).unwrap_or_default(),
         _ => Vec::new(),
       })
       .await;
@@ -1514,6 +1518,278 @@ fn owner_authority(local: HostId) -> Option<Authority> {
   })
 }
 
+// ── The configuration council plane (§4.8, D-14) ─────────────────────────────────────────────────────
+//
+// The regional configuration council's Raft ([`ShardState::council`]) is driven over the **same** record
+// sessions the coordinator already holds and served on the **same** socket the peer records arrive on — one
+// more stream id ([`CONFIG_STREAM`]) on each. Driving it from the record-plane coordinator ([`drive_config_
+// council`], called once per period) is deliberate: the council's borrow of the voter sessions is then
+// sequential with the record ships in the same task, so it never contends with them; a separate task would
+// have to either share the sessions (contend) or open a third socket per node, and the one coordinator needs
+// neither. The serve side is one arm in [`serve_peer_records`]; the drive side is a concurrent, session-
+// preserving fan-out ([`broadcast`]) of the leader's replication or a follower's election.
+
+/// Format: the stream id the configuration council's Raft messages ride on a record session — distinct from
+/// the record commit (1), the phase-one prepare (2) and the content exchanges (4/5/6) the same session
+/// multiplexes, so `serve_peer_records` dispatches a council message by its stream. (The standalone
+/// `raft_wire::RAFT_STREAM` is a separate single-plane context; here the council shares the record session.)
+const CONFIG_STREAM: u64 = 7;
+
+/// The configuration council's election timeout, in record-plane heartbeat periods: a follower that goes
+/// this many periods without a leader's append presumes the leader gone and campaigns. The per-node spread
+/// ([`election_jitter`]) adds a further `[0, this)`, making the effective timeout uniform in `[this, 2·this)`
+/// — Raft's randomized-election-timeout range (§9.3), which keeps co-timed followers from splitting the vote.
+/// Derived: ten is Raft's order-of-magnitude ratio of election timeout to heartbeat interval (Ongaro §9), so
+/// a live leader's per-period heartbeat refreshes contact well inside the window while a real leader loss is
+/// still detected within a bounded few periods.
+const ELECTION_HEARTBEATS: u32 = 10;
+
+/// A deterministic per-node offset in `[0, ELECTION_HEARTBEATS)` added to the election timeout so two
+/// followers that lose the leader in the same period do not campaign in lockstep and split the vote — the
+/// determinism-clean analogue of Raft's randomized election timeout (§9.3), reproducible in the simulator.
+/// It rotates each `attempt`, so a persistent split (two ids that collide modulo the window) breaks within a
+/// few attempts rather than by luck.
+fn election_jitter(local: HostId, attempt: u32) -> u32 {
+  let window = u64::from(ELECTION_HEARTBEATS);
+  u32::try_from(local.0.wrapping_add(u64::from(attempt)) % window).unwrap_or(0)
+}
+
+/// Answers one configuration-council Raft message a peer shipped on [`CONFIG_STREAM`] (§4.8, D-14): the
+/// council serves a pre-vote, a vote request, or an append — applying whatever an append newly commits to
+/// the regional configuration and refreshing this node's leader contact — and returns the reply to ship
+/// back. A reply-typed or malformed message is answered with nothing (the sender counts no reply). Runs
+/// synchronously inside `serve_once`, no await held across it.
+fn serve_council(state: &mut ShardState, request: &[u8]) -> Vec<u8> {
+  match RaftMessage::decode(request) {
+    Ok(message) => state
+      .council
+      .answer(message)
+      .map(|reply| reply.encode())
+      .unwrap_or_default(),
+    Err(_) => Vec::new(),
+  }
+}
+
+/// Ships each `(host, request)` to that host on [`CONFIG_STREAM`] over its borrowed record session,
+/// concurrently — one child task per session, each bounded by the dispatch deadline and handing its endpoint
+/// back whatever the outcome ([`request_within`]) — and returns every reply with its endpoint, so a slow or
+/// dead voter never serializes the reachable ones and no session is dropped. The council is small and
+/// near-silent, but a heartbeat to a dead follower must not delay the live ones, so the fan-out is the same
+/// concurrent, session-preserving shape as a record commit ([`commit_record`]). Each child is joined once
+/// terminal, so a per-period round never accumulates task slots (banned item 8).
+async fn broadcast(
+  requests: Vec<(HostId, Vec<u8>, Endpoint)>,
+  budget: CommitBudget,
+) -> Vec<(HostId, Vec<u8>, Endpoint)> {
+  if requests.is_empty() {
+    return Vec::new();
+  }
+  let deadline_ns = budget.max_deadline_ns();
+  let (tx, rx) = channel::<(HostId, Vec<u8>, Endpoint)>();
+  let mut tasks = Vec::new();
+  for (host, request, endpoint) in requests {
+    let tx = tx.clone();
+    if let Ok(task) = futures::spawn_child(async move {
+      let (reply, endpoint) = request_within(endpoint, CONFIG_STREAM, &request, deadline_ns).await;
+      let _ = tx.send((host, reply, endpoint));
+    }) {
+      tasks.push(task);
+    }
+    // A spawn failure drops the cloned `tx` and the moved endpoint: that voter yields no reply this round
+    // (its link task re-establishes the session), and the channel still disconnects once the rest end.
+  }
+  drop(tx); // so the channel disconnects when the last child has reported
+  let mut replies = Vec::with_capacity(tasks.len());
+  let poll_ns = (deadline_ns / POLL_PER_PERIOD).max(1);
+  loop {
+    match rx.try_recv() {
+      Ok(triple) => replies.push(triple),
+      // The children always report within the deadline; park a poll interval between wake-ups.
+      Err(TryRecvError::Empty) => futures::sleep(poll_ns).await,
+      // Every child has reported and dropped its sender: the round is complete.
+      Err(TryRecvError::Disconnected) => break,
+    }
+  }
+  // Reap the now-terminal children (all senders are gone, so each has finished): a joinable child of this
+  // perpetual coordinator would otherwise linger in the arena. The joins are immediate.
+  for task in tasks {
+    let _ = futures::join(task).await;
+  }
+  replies
+}
+
+/// Drives one replication round as the council **leader**: ships each other voter the append it is owed (a
+/// heartbeat, or the entries it still lacks) over its borrowed record session, concurrently, and folds each
+/// reply — the leader advances its commit index as a majority acknowledge, and the regional configuration
+/// applies whatever newly commits. Borrows only the voter sessions; a voter with no live session is not
+/// reached this round and is retried next period.
+async fn drive_council_replication(others: &[HostId], budget: CommitBudget) {
+  let sessions = take_sessions(|host| others.contains(&host));
+  if sessions.is_empty() {
+    return;
+  }
+  // The append owed each borrowed voter, built under a brief borrow (the endpoints stay out here).
+  let appends: std::collections::BTreeMap<HostId, Vec<u8>> = state::with_state(|s| {
+    sessions
+      .iter()
+      .filter_map(|(host, _)| {
+        s.council
+          .replication_for(*host)
+          .map(|append| (*host, RaftMessage::AppendEntries(append).encode()))
+      })
+      .collect()
+  })
+  .unwrap_or_default();
+  // Pair each session with its append; a voter owed nothing keeps its session without a dispatch.
+  let mut requests = Vec::new();
+  let mut kept = Vec::new();
+  for (host, endpoint) in sessions {
+    match appends.get(&host) {
+      Some(bytes) => requests.push((host, bytes.clone(), endpoint)),
+      None => kept.push((host, endpoint)),
+    }
+  }
+  let replied = broadcast(requests, budget).await;
+  let mut recovered = kept;
+  let mut replies = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    replies.push(reply);
+    recovered.push((host, endpoint));
+  }
+  state::with_state(|s| {
+    for reply in replies {
+      if let Ok(message) = RaftMessage::decode(&reply) {
+        s.council.fold_reply(message);
+      }
+    }
+  });
+  return_sessions(recovered);
+}
+
+/// Drives an election as a **follower** whose leader contact has lapsed (Raft §9.6, the full pre-vote then
+/// real vote over the transport): begins the pre-election and broadcasts the pre-vote to every other voter;
+/// on a granted majority the real vote requests go out the same way, and folding their replies makes this
+/// node leader once its own majority grants. Every borrowed voter session is returned whatever the outcome.
+/// A node that already leads, or the sole voter (which `election_timeout` self-elects with no messages),
+/// sends nothing.
+async fn drive_council_election(others: &[HostId], budget: CommitBudget) {
+  // Begin the pre-election; `election_timeout` returns one (identical) pre-vote per other voter, so the
+  // first is the message to broadcast. Empty means this node already leads or self-elected — nothing to do.
+  let Some(Some(pre_vote)) = state::with_state(|s| s.council.election_timeout().into_iter().next())
+  else {
+    return;
+  };
+  let sessions = take_sessions(|host| others.contains(&host));
+  if sessions.is_empty() {
+    return;
+  }
+  // Phase one — the pre-vote round over the borrowed voter sessions.
+  let pre_bytes = pre_vote.encode();
+  let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, pre_bytes.clone(), endpoint))
+    .collect();
+  let replied = broadcast(requests, budget).await;
+  let mut sessions = Vec::with_capacity(replied.len());
+  let mut pre_replies = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    pre_replies.push(reply);
+    sessions.push((host, endpoint));
+  }
+  // Fold the pre-vote replies; a granted majority yields the real vote request to broadcast next (the
+  // follow-on of a pre-vote reply is always a vote request — the term is advanced only now).
+  let vote = state::with_state(|s| {
+    let mut vote = None;
+    for reply in &pre_replies {
+      if let Ok(message) = RaftMessage::decode(reply)
+        && let Some(request) = s.council.fold_reply(message).into_iter().next()
+      {
+        vote = Some(request);
+      }
+    }
+    vote
+  })
+  .flatten();
+  let Some(vote) = vote else {
+    return_sessions(sessions);
+    return;
+  };
+  // Phase two — the real vote round over the same sessions.
+  let vote_bytes = vote.encode();
+  let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, vote_bytes.clone(), endpoint))
+    .collect();
+  let replied = broadcast(requests, budget).await;
+  let mut recovered = Vec::with_capacity(replied.len());
+  let mut vote_replies = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    vote_replies.push(reply);
+    recovered.push((host, endpoint));
+  }
+  state::with_state(|s| {
+    for reply in vote_replies {
+      if let Ok(message) = RaftMessage::decode(&reply) {
+        s.council.fold_reply(message);
+      }
+    }
+  });
+  return_sessions(recovered);
+}
+
+/// Drives this node's configuration council one period from the record-plane coordinator (§4.8, D-14). As
+/// **leader** it replicates a heartbeat to every voter (holding the term and carrying the commit index); as
+/// a **follower** it counts the periods since the leader last made contact and, once past the jittered
+/// election timeout, campaigns; the **sole voter** self-elects with no messages. `idle`, `seen_contact` and
+/// `attempt` persist across periods (the coordinator owns them): the follower's election timer, the last
+/// leader-contact value it saw, and its jitter rotation.
+async fn drive_config_council(
+  local: HostId,
+  budget: CommitBudget,
+  idle: &mut u32,
+  seen_contact: &mut u64,
+  attempt: &mut u32,
+) {
+  let Some((is_leader, contact, others)) = state::with_state(|s| {
+    let others: Vec<HostId> = s
+      .council
+      .voters()
+      .into_iter()
+      .filter(|voter| *voter != local)
+      .collect();
+    (s.council.is_leader(), s.council.leader_contact(), others)
+  }) else {
+    return;
+  };
+
+  if is_leader {
+    drive_council_replication(&others, budget).await;
+    *idle = 0;
+    return;
+  }
+  if others.is_empty() {
+    // The sole voter (a one-node council, the fleet degenerate): self-elect, then it leads next period.
+    let _ = state::with_state(|s| s.council.election_timeout());
+    *idle = 0;
+    return;
+  }
+  // A follower: reset the timer while the leader keeps making contact; otherwise age toward an election.
+  if contact != *seen_contact {
+    *seen_contact = contact;
+    *idle = 0;
+    return;
+  }
+  *idle = idle.saturating_add(1);
+  if *idle >= ELECTION_HEARTBEATS.saturating_add(election_jitter(local, *attempt)) {
+    *attempt = attempt.saturating_add(1);
+    *idle = 0;
+    drive_council_election(&others, budget).await;
+    // Re-baseline the contact counter so a fresh campaign is not immediately retriggered: a won election
+    // makes this node leader next period; a lost one waits out the timer again.
+    *seen_contact = state::with_state(|s| s.council.leader_contact()).unwrap_or(*seen_contact);
+  }
+}
+
 /// The record-plane coordinator (§4.8 "records are sent to all candidates; committed at `f + 1`"; "Promotion
 /// and takeover"): one task per node that, each period, ships every unplaced head to all its candidates in
 /// one commit and drives every owed takeover over all surviving holders, borrowing the holder sessions the
@@ -1541,8 +1817,24 @@ async fn run_record_plane(local: HostId, budget: CommitBudget) {
   // Dispatches whose holders are still in flight. Bounded: each is spent within the dispatch span
   // (`CommitBudget::max_deadline_ns`), so at most that span's worth of periods' dispatches are ever held.
   let mut in_flight: Vec<Dispatch> = Vec::new();
+  // The configuration council is driven from this one coordinator (§4.8, D-14): its brief borrow of the
+  // voter sessions is sequential with the record ships below, so it never contends for them. These persist
+  // across periods — the follower's election timer, the last leader contact it saw, and its jitter rotation.
+  let mut council_idle: u32 = 0;
+  let mut council_seen_contact: u64 = 0;
+  let mut council_attempt: u32 = 0;
   loop {
     in_flight.retain_mut(|dispatch| !dispatch.settle());
+    // Drive the configuration authority first — an election or a replication heartbeat over the transport —
+    // then the records under the configuration it maintains.
+    drive_config_council(
+      local,
+      budget,
+      &mut council_idle,
+      &mut council_seen_contact,
+      &mut council_attempt,
+    )
+    .await;
     // Keep the owner's hold writing under the current configuration generation: the version advances on
     // every join or retirement (`FleetNode::observe` keeps the node's own acceptor in step the same way), and
     // a record under a stale generation is refused `ForeignGeneration` by the owner's own hold — so without
@@ -1761,8 +2053,14 @@ fn takeovers(state: &ShardState, local: HostId) -> Vec<ObjectId> {
     .iter()
     .copied()
     .filter(|object| {
-      candidates_for(local, &config.neighbourhood, &config.domains, *object, config.quorum)
-        .contains(&local)
+      candidates_for(
+        local,
+        &config.neighbourhood,
+        &config.domains,
+        *object,
+        config.quorum,
+      )
+      .contains(&local)
     })
     .collect()
 }
@@ -1784,7 +2082,13 @@ async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -
   // node does not hold the object or is not a candidate for it.
   let prepared = state::with_state(|s| {
     let config = s.fleet.configuration();
-    let candidates = candidates_for(local, &config.neighbourhood, &config.domains, object, config.quorum);
+    let candidates = candidates_for(
+      local,
+      &config.neighbourhood,
+      &config.domains,
+      object,
+      config.quorum,
+    );
     if !candidates.contains(&local) {
       return None;
     }

@@ -17,8 +17,10 @@
 //! bridge, and **takeover** ([`take_over`](ConfigGroup::take_over)) — when SWIM declares the owner dead,
 //! the group reassigns the volume to the rendezvous-first survivor, bumps the host epoch, and advances
 //! the generation, so a resumed stale owner is fenced (by the advanced configuration generation in this
-//! single-generation model — `ConfigurationStale`/`ForeignGeneration`). Owed: driving the Raft live over
-//! timers and the transport (this slice drives it sans-io) and joint consensus to change the voter set.
+//! single-generation model — `ConfigurationStale`/`ForeignGeneration`). The [`RegionalCouncil`] below now
+//! runs this Raft **live over the fleet transport**: the daemon's record-plane coordinator drives its
+//! election and replication (`slates_server::fleet`), so this module stays sans-io and the drive lives
+//! there. Owed: joint consensus to change the voter set.
 //! The per-host epoch fence and the new owner's phase-one recovery are now **built** for the
 //! transport-driven register — `install_authority`/`prepare`/`promote_over_holders`
 //! ([`slates_db::register`]) and the live `promote_record`/`promote_under_configuration`

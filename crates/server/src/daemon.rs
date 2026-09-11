@@ -355,6 +355,54 @@ impl Daemon {
       .unwrap_or(false)
   }
 
+  /// Whether this daemon's regional configuration council (§4.8, D-14) currently believes itself the
+  /// **leader** — the elected configuration master for the region. A one-shot query on the control shard,
+  /// bounded by the liveness budget; `false` if the daemon is stopping, is not on a shard, or does not
+  /// answer in time. Exposed so a fleet test can prove the council elected a single stable leader over the
+  /// real transport.
+  pub fn council_leads(&self) -> bool {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
+      return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        let leads = state::with_state(|s| s.council.is_leader()).unwrap_or(false);
+        let _ = tx.send(leads);
+      })
+      .is_err()
+    {
+      return false;
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .unwrap_or(false)
+  }
+
+  /// This daemon's council **leader-contact** counter (§4.8): the number of leader appends its council has
+  /// answered. A follower's counter advancing across periods is the proof that the leader's heartbeats are
+  /// flowing over the transport — replication is live, not merely an election won (a non-vacuity counter).
+  /// A one-shot control-shard query, bounded by the liveness budget; `0` if the daemon is stopping, is not
+  /// on a shard, or does not answer in time.
+  pub fn council_contact(&self) -> u64 {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
+      return 0;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        let contact = state::with_state(|s| s.council.leader_contact()).unwrap_or(0);
+        let _ = tx.send(contact);
+      })
+      .is_err()
+    {
+      return 0;
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .unwrap_or(0)
+  }
+
   /// Test and operator support: folds a `Dead` belief about `peer` at `incarnation` into this node's
   /// membership on the control shard — the same effect its failure detector has when it ages a peer to
   /// death (§4.8). Exposed so **rejoin** can be driven deterministically: a real process kill cannot be
