@@ -295,6 +295,103 @@ pub fn rendezvous_first(hosts: &[HostId], object: ObjectId) -> Option<HostId> {
   ranked.first().map(|(_, host)| *host)
 }
 
+/// The number of **distinct copysets** Copyset Replication lays down over `hosts` nodes at scatter width
+/// `scatter` with `copies` copies per chunk — `⌈scatter/(copies−1)⌉ · hosts / copies`, **linear in the
+/// scatter width** [A: Cidon et al., "Copysets", USENIX ATC 2013, §4; read 2026-09-11]. A copyset is a set
+/// of `copies` nodes that together hold every copy of some chunk, so a chunk is lost exactly when one
+/// copyset's nodes all fail coincidentally; the loss probability grows with this count
+/// ([`coincident_loss_probability`]), which is why it is bounded. With `copies ≤ 1` (the laptop degenerate,
+/// no redundancy) each host is its own single-node copyset, so the count is `hosts`.
+///
+/// Verified against the paper's worked examples: `hosts = 9, scatter = 4, copies = 3` gives `6`
+/// (two permutations of three), and `hosts = 5000, scatter = 10, copies = 3` gives `8333` ("about 8,300").
+pub fn copyset_count(hosts: u64, scatter: u64, copies: u64) -> u64 {
+  if copies <= 1 {
+    return hosts;
+  }
+  let permutations = scatter.div_ceil(copies - 1);
+  permutations.saturating_mul(hosts) / copies
+}
+
+/// The number of copysets **random replication** would create at the same parameters — `hosts · C(scatter,
+/// copies−1)`, which is `Θ(scatter^(copies−1))`, super-linear (Cidon et al. §3, for `scatter < hosts/2`).
+/// This is what per-object rendezvous over the raw host set produces, and what the fixed-copyset
+/// construction exists to avoid; kept so the non-vacuity of the bounding is testable (the copyset count
+/// must stay far below this). Verified: `hosts = 9, scatter = 4, copies = 3` gives `54` (the paper's value).
+pub fn random_copyset_count(hosts: u64, scatter: u64, copies: u64) -> u64 {
+  if copies <= 1 {
+    return hosts;
+  }
+  hosts.saturating_mul(binomial(scatter, copies - 1))
+}
+
+/// `C(n, k)` computed iteratively without overflow for the small `k` (`copies − 1`) placement uses;
+/// saturating so an out-of-range input cannot panic. `C(n, k) = 0` for `k > n`.
+fn binomial(n: u64, k: u64) -> u64 {
+  if k > n {
+    return 0;
+  }
+  let k = k.min(n - k);
+  let mut result: u64 = 1;
+  for i in 0..k {
+    result = result.saturating_mul(n - i) / (i + 1);
+  }
+  result
+}
+
+/// The **scatter width** for a host (§4.8 "Placement"; the derivation in
+/// `research/metadata-replication.md` §3.1): `S = max(2f+1, ⌈D/(B·T)⌉)` — the least parallelism that
+/// re-replicates a dead host's `data_bytes` (`D`) within the recovery budget `budget_ns` (`T`) at
+/// per-host re-replication bandwidth `bandwidth_bytes_per_s` (`B`), never below the candidate floor `2f+1`
+/// (the neighbourhood must hold a full candidate set). This is the *smallest* S meeting recovery, which by
+/// the monotonicity of the loss probability in the copyset count is also the *lowest-loss* S meeting it —
+/// "derived without loss". The caller then checks the copyset count the returned S implies against the
+/// accepted loss probability ([`coincident_loss_probability`]); a violation is a genuine recovery-vs-
+/// durability conflict, not something to paper over by scattering wider. When the bandwidth or budget is
+/// unknown (`0`), the candidate floor stands — recovery cannot be sized, so the tightest, lowest-loss
+/// neighbourhood is used.
+pub fn scatter_width(data_bytes: u64, bandwidth_bytes_per_s: u64, budget_ns: u64, f: u64) -> u64 {
+  let candidate_floor = 2 * f + 1;
+  if bandwidth_bytes_per_s == 0 || budget_ns == 0 {
+    return candidate_floor;
+  }
+  // S_recover = ⌈ D / (B · T_seconds) ⌉ = ⌈ D · 1e9 / (B · T_ns) ⌉, in u128 so a large host budget cannot
+  // overflow the numerator.
+  /// Format: nanoseconds per second, to turn the recovery budget (in nanoseconds) into a rate divisor.
+  const NANOS_PER_SECOND: u128 = 1_000_000_000;
+  let numerator = u128::from(data_bytes).saturating_mul(NANOS_PER_SECOND);
+  let denominator = u128::from(bandwidth_bytes_per_s)
+    .saturating_mul(u128::from(budget_ns))
+    .max(1);
+  let recover = numerator.div_ceil(denominator);
+  let recover = u64::try_from(recover).unwrap_or(u64::MAX);
+  candidate_floor.max(recover)
+}
+
+/// The probability that a coincident failure of `failed` of `hosts` nodes loses at least one chunk, given
+/// `copysets` distinct copysets of `copies` nodes each: `≈ copysets · C(failed, copies) / C(hosts, copies)`
+/// (Cidon et al. §3; the exact `copysets / C(hosts, copies)` is the `failed = copies` case). The binomial
+/// ratio is a product of `copies` fractions each below one, evaluated in `f64` (this is a cold-path
+/// durability check at a configuration change, never a data-path cost). Zero when fewer than `copies`
+/// nodes fail (no full copyset can be inside the failed set) or there is no redundancy (`copies ≤ 1`).
+pub fn coincident_loss_probability(copysets: u64, hosts: u64, failed: u64, copies: u64) -> f64 {
+  if copies <= 1 || failed < copies || hosts < copies {
+    return 0.0;
+  }
+  // C(failed, copies) / C(hosts, copies) = ∏_{i=0}^{copies-1} (failed - i) / (hosts - i).
+  #[allow(clippy::cast_precision_loss)]
+  let ratio: f64 = (0..copies)
+    .map(|i| (failed - i) as f64 / (hosts - i) as f64)
+    .product();
+  #[allow(clippy::cast_precision_loss)]
+  let expected = copysets as f64 * ratio;
+  // The expected number of failed copysets bounds the loss probability from above (union bound); clamp to a
+  // probability so a caller reads it as one.
+  /// Format: certainty — the most a probability can be.
+  const CERTAIN: f64 = 1.0;
+  expected.min(CERTAIN)
+}
+
 /// A holder's fence for one host: the highest epoch it has accepted a record under (§4.8
 /// "Promotion and takeover"). A record under a lower epoch is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1499,6 +1596,84 @@ mod tests {
       winners.len() > 1,
       "the successor spreads over more than one survivor"
     );
+  }
+
+  /// AC (§4.8 "Placement"; `research/metadata-replication.md` §3.1): the copyset-count formulas match the
+  /// Copysets paper's own worked examples exactly — the oracle for the placement math [A: Cidon et al., ATC
+  /// 2013]. The fixed-copyset count is orders of magnitude below the random one at the same parameters (the
+  /// non-vacuity the whole bounding rests on).
+  #[test]
+  fn the_copyset_counts_match_the_copysets_paper() {
+    // Paper §4: N=9, R=3, S=4 → two permutations of three → 6 copysets; random → 9·C(4,2) = 54.
+    assert_eq!(
+      copyset_count(9, 4, 3),
+      6,
+      "minimal scheme, paper's small example"
+    );
+    assert_eq!(
+      random_copyset_count(9, 4, 3),
+      54,
+      "random scheme, paper's small example"
+    );
+    // Paper §3: N=5000, R=3, S=10 → ⌈10/2⌉·5000/3 = 8333 ("about 8,300").
+    assert_eq!(copyset_count(5000, 10, 3), 8333, "paper's large example");
+    // The laptop degenerate: no redundancy, each host its own copyset.
+    assert_eq!(copyset_count(1, 0, 1), 1, "one host, one copyset");
+  }
+
+  /// AC (§4.8): the loss-probability formula reproduces the paper's headline figures for Facebook's HDFS
+  /// (R=3, S=10, 1% of the nodes failing coincidentally): Copyset Replication ≈ 0.78 %, random replication
+  /// ≈ 22.8 % — so bounding the copysets cuts the loss by ~30×. This is the durability the scatter-width
+  /// derivation buys.
+  #[test]
+  fn the_loss_probability_reproduces_the_paper_facebook_figures() {
+    let (hosts, copies, failed) = (5000, 3, 50); // 1% of 5000
+    let copyset =
+      coincident_loss_probability(copyset_count(hosts, 10, copies), hosts, failed, copies);
+    let random = coincident_loss_probability(
+      random_copyset_count(hosts, 10, copies),
+      hosts,
+      failed,
+      copies,
+    );
+    assert!(
+      (0.006..0.010).contains(&copyset),
+      "Copyset Replication ≈ 0.78 % (got {copyset})"
+    );
+    assert!(
+      (0.18..0.26).contains(&random),
+      "random replication ≈ 22.8 % (got {random})"
+    );
+    assert!(
+      random > copyset * 20.0,
+      "bounding the copysets cuts the loss by more than an order of magnitude"
+    );
+    // Fewer than R coincident failures cannot lose a full copyset.
+    assert_eq!(
+      coincident_loss_probability(copyset_count(hosts, 10, copies), hosts, 2, copies),
+      0.0
+    );
+  }
+
+  /// AC (§4.8 "Placement"): the scatter width is the recovery-parallelism floor, never below the candidate
+  /// floor `2f+1`, and unknown recovery inputs fall back to that floor. `S = max(2f+1, ⌈D/(B·T)⌉)`.
+  #[test]
+  fn the_scatter_width_is_the_recovery_floor_above_the_candidate_floor() {
+    // 100 GB to restore, 1 GB/s, a 10 s budget → ⌈100/(1·10)⌉ = 10 nodes; f=1 floor is 3, so recovery wins.
+    let gb: u64 = 1 << 30;
+    let s = scatter_width(100 * gb, gb, 10 * 1_000_000_000, 1);
+    assert_eq!(s, 10, "recovery parallelism dominates the candidate floor");
+    // A tiny host: recovery needs one node, but the candidate floor 2f+1 = 5 (f=2) stands.
+    assert_eq!(
+      scatter_width(gb, gb, 60 * 1_000_000_000, 2),
+      5,
+      "the candidate floor is the lower bound"
+    );
+    // Unknown bandwidth or budget → the candidate floor, the tightest, lowest-loss neighbourhood.
+    assert_eq!(scatter_width(100 * gb, 0, 10_000_000_000, 1), 3);
+    assert_eq!(scatter_width(100 * gb, gb, 0, 1), 3);
+    // The laptop: f=0 → the floor is 1 (the host itself), and a bigger recovery need cannot lower it.
+    assert_eq!(scatter_width(0, gb, 1_000_000_000, 0), 1);
   }
 
   /// The object a takeover test promotes. A committed head "v1" lives at sequence 0, epoch 1,
