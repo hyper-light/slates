@@ -49,7 +49,7 @@ use std::sync::mpsc::{TryRecvError, channel};
 use slates_db::ledger::{self, LedgerAcceptor, LedgerPromise};
 use slates_db::register::{
   Accepted, Acceptor, Ack, Configuration, HostId, ObjectId, Placement, Prepare, Promise, Promotion,
-  Quorum, Record, candidates_for,
+  Quorum, Record, Refusal, candidates_for, decode_refusal, encode_refusal,
 };
 use slates_rt::error::RtError;
 use slates_rt::futures::{cancel, now_ns, sleep, spawn_child};
@@ -123,7 +123,10 @@ pub async fn serve_record(
     .serve_once(|_, request| match Record::decode(&request) {
       Ok(record) => match acceptor.accept(&record) {
         Ok(ack) => ack.encode(),
-        Err(_) => Vec::new(),
+        // A sender on an older configuration is refused `ConfigurationStale` carrying this holder's newer
+        // version, which rides back so the sender refreshes and retries (§4.8 the piggyback rule); every
+        // other refusal is an empty reply the sender counts as no acknowledgement ([`encode_refusal`]).
+        Err(error) => encode_refusal(&error),
       },
       Err(_) => Vec::new(),
     })
@@ -396,7 +399,7 @@ pub(crate) async fn collect_bound(
   quorum: Quorum,
   budget: CommitBudget,
   acked: &mut Vec<HostId>,
-  binds: impl Fn(HostId, &[u8]) -> bool,
+  mut binds: impl FnMut(HostId, &[u8]) -> bool,
 ) -> (Vec<(HostId, Endpoint)>, bool) {
   let mut reusable: Vec<(HostId, Endpoint)> = Vec::new();
   let mut timed_out = false;
@@ -438,6 +441,12 @@ pub struct Committed {
   pub reusable: Vec<(HostId, Endpoint)>,
   /// The holders still in flight at the return, whose sessions the caller recovers later.
   pub stragglers: Stragglers,
+  /// The newest configuration version a holder named when it refused this record as
+  /// [`ConfigurationStale`](slates_db::register::RegisterError::ConfigurationStale) — `Some(version)` only
+  /// when a holder is on a strictly newer configuration than this sender (§4.8 the piggyback rule). The
+  /// caller refreshes its configuration toward it and retries within the operation's budget; `None` when no
+  /// holder was ahead. Purely a hint off the reply — it never affects whether the record placed.
+  pub stale_version: Option<u64>,
 }
 
 /// Commits `record` across its `candidates` (§4.8 "records are sent to all candidates; committed at
@@ -482,6 +491,7 @@ pub async fn commit_record(
       outcome: Ok(build(&acked)),
       reusable: Vec::new(),
       stragglers: Stragglers::none(),
+      stale_version: None,
     };
   }
 
@@ -509,13 +519,28 @@ pub async fn commit_record(
   }
   drop(tx); // so the channel disconnects once every task has ended
 
+  // The newest configuration version any holder named when it refused this record as stale (§4.8 the
+  // piggyback rule). The collection closure — an `FnMut` polled once per reply — keeps the running maximum in
+  // this local, which is read after the round; a plain `&mut` capture (not a `Cell`) so the future the sim
+  // runtime drives stays `Send` across the collection's await.
+  let mut stale_seen: Option<u64> = None;
   let (reusable, timed_out) = collect_bound(
     &mut rx,
     candidates,
     quorum,
     budget,
     &mut acked,
-    |host, reply| Ack::decode(reply).is_ok_and(|ack| ack.holder == host && ack.binds(record)),
+    |host, reply| {
+      if Ack::decode(reply).is_ok_and(|ack| ack.holder == host && ack.binds(record)) {
+        return true;
+      }
+      // Not an acknowledgement. A holder on a newer configuration rides its current version back; keep the
+      // newest across the round so the caller refreshes toward it and retries within the operation's budget.
+      if let Some(Refusal::ConfigurationStale { version }) = decode_refusal(reply) {
+        stale_seen = Some(stale_seen.map_or(version, |seen| seen.max(version)));
+      }
+      false
+    },
   )
   .await;
 
@@ -537,6 +562,7 @@ pub async fn commit_record(
     outcome,
     reusable,
     stragglers,
+    stale_version: stale_seen,
   }
 }
 
@@ -584,6 +610,7 @@ fn spawn_failed(tasks: &[slates_rt::TaskId], error: RtError) -> Committed {
     outcome: Err(ClusterError::Runtime(error)),
     reusable: Vec::new(),
     stragglers: Stragglers::none(),
+    stale_version: None,
   }
 }
 

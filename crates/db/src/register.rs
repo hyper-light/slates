@@ -707,6 +707,60 @@ impl Ack {
   }
 }
 
+/// Format: the one-byte tag that marks a record reply as a carried refusal rather than an [`Ack`] (§4.8 the
+/// piggyback rule). A `ConfigurationStale` reply is `[STALE_REFUSAL_TAG][version: u64 LE]` — nine bytes,
+/// which [`Ack::decode`] rejects on length ([`ACK_BYTES`] is 72), so the two reply shapes never collide.
+const STALE_REFUSAL_TAG: u8 = 1;
+
+/// A record refusal a *sender* acts on, decoded from a holder's reply that is not an [`Ack`]. The only
+/// refusal carried back on the record wire is [`ConfigurationStale`](RegisterError::ConfigurationStale): a
+/// holder on a newer configuration names its current `version` so the stale sender refreshes and retries
+/// (§4.8 "refreshes consume the operation's bounded retry budget"). Every other refusal carries nothing back
+/// (an empty reply the sender counts as no acknowledgement) — see [`encode_refusal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+  /// The holder is on a newer configuration; `version` is its current one, the version the sender refreshes
+  /// toward.
+  ConfigurationStale {
+    /// The holder's current (newer) configuration version.
+    version: u64,
+  },
+}
+
+/// The wire form of a record refusal the sender acts on (§4.8 the piggyback rule). A
+/// [`ConfigurationStale`](RegisterError::ConfigurationStale) rides back so a sender on an older configuration
+/// refreshes and retries within its budget. Every other refusal encodes to an **empty** reply — the sender
+/// counts no acknowledgement and retries as before: an [`Unauthorized`](RegisterError::Unauthorized) or
+/// [`ConflictingPosition`](RegisterError::ConflictingPosition) is not a staleness a refresh resolves, and a
+/// [`StaleEpoch`](RegisterError::StaleEpoch) on the record path is shadowed by this gate — a superseded owner
+/// is at an older generation, so it is refused `ConfigurationStale` before the fence is reached, and the
+/// refresh that refusal drives installs the configuration that reassigns the object away (the design's "the
+/// latter refusal ends the sender's authority", realized through the version refresh).
+pub fn encode_refusal(error: &RegisterError) -> Vec<u8> {
+  match error {
+    RegisterError::ConfigurationStale { version } => {
+      let mut out = Vec::with_capacity(1 + size_of::<u64>());
+      out.push(STALE_REFUSAL_TAG);
+      out.extend_from_slice(&version.to_le_bytes());
+      out
+    }
+    _ => Vec::new(),
+  }
+}
+
+/// Decodes a holder's record reply that did not decode as an [`Ack`] into the [`Refusal`] the sender acts on,
+/// or `None` if it carries nothing actionable (an empty reply, or bytes that are neither an ack nor a tagged
+/// refusal — including hostile input, which is simply ignored). The length and tag disambiguate: a carried
+/// `ConfigurationStale` is exactly `1 + 8` bytes led by [`STALE_REFUSAL_TAG`], which no [`Ack`] (72 bytes)
+/// can match.
+pub fn decode_refusal(bytes: &[u8]) -> Option<Refusal> {
+  if bytes.len() != 1 + size_of::<u64>() || bytes[0] != STALE_REFUSAL_TAG {
+    return None;
+  }
+  let version = u64::from_le_bytes(bytes[1..].try_into().ok()?);
+  Some(Refusal::ConfigurationStale { version })
+}
+
 /// The highest record a holder has accepted for one object (§4.8 "reports the highest record it holds
 /// for each object"): the ledger position, the epoch it was accepted under, and the value. A holder
 /// reports this in its [`Promise`] so the new owner can adopt the newest across a quorum. Ordered by
@@ -976,14 +1030,29 @@ impl Acceptor {
   }
 
   /// Accepts `record` under this holder's authority and fence, storing it before acknowledging, or
-  /// refusing with a typed reason. The order is authority (a foreign generation or unauthorized owner
-  /// refuses before touching the fence), then the fence (a stale epoch refuses), then the position (a
-  /// *different* value at a position already accepted is a conflict — a committed position is never
-  /// rewritten; the *same* value re-acknowledges idempotently). On acceptance the promise is raised and
+  /// refusing with a typed reason. The order is authority (a stale or foreign configuration generation, or
+  /// an unauthorized owner, refuses before touching the fence), then the fence (a stale epoch refuses), then
+  /// the position (a *different* value at a position already accepted is a conflict — a committed position is
+  /// never rewritten; the *same* value re-acknowledges idempotently). On acceptance the promise is raised and
   /// the accepted `(epoch, value)` recorded — recording the new epoch even when the value is unchanged
   /// (BUG-12) — before the [`Ack`] is returned.
+  ///
+  /// The configuration-generation gate is split by direction, so the sender learns *which way* it is out of
+  /// step and reacts (§4.8 the piggyback rule, "a receiver with a newer configuration refuses with
+  /// `ConfigurationStale{version}` and the current version"). A record from an **older** configuration than
+  /// this holder's is the stale-sender case: refused [`ConfigurationStale`](RegisterError::ConfigurationStale)
+  /// naming this holder's current (newer) version, so the sender refreshes its configuration and retries
+  /// within the operation's budget. A record from a **newer** configuration is the stale-holder case: this
+  /// holder cannot validate authority under a generation it has not installed, so it still refuses
+  /// ([`ForeignGeneration`](RegisterError::ForeignGeneration), naming its current generation) — and refreshes
+  /// reactively, having now seen a request that carries a newer version.
   pub fn accept(&mut self, record: &Record) -> Result<Ack, RegisterError> {
-    if record.generation != self.authority.generation {
+    if record.generation < self.authority.generation {
+      return Err(RegisterError::ConfigurationStale {
+        version: self.authority.generation,
+      });
+    }
+    if record.generation > self.authority.generation {
       return Err(RegisterError::ForeignGeneration {
         current: self.authority.generation,
       });
@@ -1748,10 +1817,13 @@ mod tests {
     );
   }
 
-  /// AC (§4.13/§4.8): a record from a principal the authority does not authorize, or under a foreign
-  /// generation, is refused — there is no unauthenticated acceptance.
+  /// AC (§4.13/§4.8): a record from a principal the authority does not authorize is refused — there is no
+  /// unauthenticated acceptance. And the configuration-generation gate is split by direction (§4.8 the
+  /// piggyback rule): a record from an **older** configuration is [`ConfigurationStale`] naming the holder's
+  /// current (newer) version so the sender refreshes; one from a **newer** configuration is
+  /// [`ForeignGeneration`] naming the holder's current version (the holder is behind and refreshes reactively).
   #[test]
-  fn authority_refuses_wrong_owner_and_generation() {
+  fn authority_refuses_wrong_owner_and_splits_the_generation_gate_by_direction() {
     let owner = HostId(1);
     let authority = Authority {
       generation: 7,
@@ -1772,7 +1844,9 @@ mod tests {
       Err(RegisterError::Unauthorized)
     );
 
-    let foreign_generation = Record {
+    // A record from an older configuration (6 < 7): the sender is stale — refused with the holder's current
+    // (newer) version, the value the sender refreshes toward and retries under.
+    let older_configuration = Record {
       owner,
       object: ObjectId::new(HostId(1), 1),
       sequence: 0,
@@ -1781,9 +1855,60 @@ mod tests {
       value: b"x".to_vec(),
     };
     assert_eq!(
-      acceptor.accept(&foreign_generation),
+      acceptor.accept(&older_configuration),
+      Err(RegisterError::ConfigurationStale { version: 7 })
+    );
+
+    // A record from a newer configuration (8 > 7): this holder is behind — it cannot validate authority under
+    // a generation it has not installed, so it refuses naming its own current generation (and refreshes).
+    let newer_configuration = Record {
+      owner,
+      object: ObjectId::new(HostId(1), 1),
+      sequence: 0,
+      epoch: HostEpoch(1),
+      generation: 8,
+      value: b"x".to_vec(),
+    };
+    assert_eq!(
+      acceptor.accept(&newer_configuration),
       Err(RegisterError::ForeignGeneration { current: 7 })
     );
+  }
+
+  /// AC (§4.8 the piggyback rule): a `ConfigurationStale` refusal rides back on the record wire carrying the
+  /// holder's current version and decodes to exactly that; every other refusal, and an ack-shaped reply,
+  /// carries nothing actionable (so a sender's `Ack::decode`-then-`decode_refusal` never confuses the two).
+  #[test]
+  fn a_configuration_stale_refusal_rides_back_and_other_replies_do_not() {
+    // The one carried refusal round-trips its version.
+    let wire = encode_refusal(&RegisterError::ConfigurationStale { version: 42 });
+    assert_eq!(
+      decode_refusal(&wire),
+      Some(Refusal::ConfigurationStale { version: 42 })
+    );
+
+    // Other refusals carry nothing back (an empty reply the sender counts as no acknowledgement).
+    for other in [
+      RegisterError::Unauthorized,
+      RegisterError::ConflictingPosition,
+      RegisterError::StaleEpoch { current: 3 },
+    ] {
+      assert!(encode_refusal(&other).is_empty());
+    }
+
+    // An ack-shaped reply (72 bytes) and hostile input never decode as a refusal — length and tag disambiguate.
+    let ack = Ack {
+      holder: HostId(2),
+      object: ObjectId::new(HostId(1), 1),
+      sequence: 0,
+      generation: 7,
+      identity: [0u8; 32],
+    }
+    .encode();
+    assert_eq!(decode_refusal(&ack), None);
+    assert_eq!(decode_refusal(&[]), None);
+    assert_eq!(decode_refusal(&[STALE_REFUSAL_TAG]), None); // tag but no version
+    assert_eq!(decode_refusal(&[9, 0, 0, 0, 0, 0, 0, 0, 0]), None); // right length, unknown tag
   }
 
   /// AC (§4.8, A-9 — the per-host epoch fence): when the configuration group bumps a failed owner's fencing

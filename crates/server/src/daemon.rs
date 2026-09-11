@@ -929,6 +929,7 @@ fn init_shard(
     demuxes: Vec::new(),
     holder_records: std::collections::BTreeMap::new(),
     pending_takeovers: std::collections::BTreeSet::new(),
+    config_refresh_wanted: false,
     record_sessions: std::collections::BTreeMap::new(),
     council,
     held_content: slates_cluster::content::ContentHold::new(),

@@ -221,6 +221,16 @@ pub struct ShardState {
   /// window while every survivor brings its holds' authority into step). Empty on a laptop (no fleet loop
   /// runs) and whenever no takeover is outstanding.
   pub pending_takeovers: std::collections::BTreeSet<ObjectId>,
+  /// A learner has evidence its configuration is behind the region and should refresh from a voter next
+  /// period (§4.8 the reactive piggyback). Set when this node **received** a record naming a newer
+  /// configuration generation than its own (the holder-behind case, [`crate::fleet::accept_held_record`]),
+  /// or when a holder **refused** one of this node's records as `ConfigurationStale` naming a newer version
+  /// (the stale-sender case, surfaced by `commit_record` and read in [`crate::fleet::ship_head`]). The
+  /// record-plane coordinator fetches once when it is set (or when this node's own SWIM view diverges from
+  /// its installed membership) and clears it — so an idle learner whose view matches its configuration sends
+  /// nothing, replacing the per-period conditional poll. Only meaningful on the control shard (which drives
+  /// and serves the council); inert elsewhere and on a laptop.
+  pub config_refresh_wanted: bool,
   /// This node's client record sessions to its candidate holder peers (§4.8), keyed by peer host: each
   /// per-peer link task ([`crate::fleet::establish_record_link`]) brings its session up on one socket and
   /// installs it here as `Some`; the record-plane coordinator borrows a session for each dispatch — leaving

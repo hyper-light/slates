@@ -89,9 +89,15 @@ fn record(value: &[u8]) -> Record {
 
 /// Runs an `f = 1` commit — owner `1`, candidate holders `2` and `3` — over the sim fabric. `serve[i]`
 /// says whether holder `i + 2` serves the record (an available holder) or handshakes but never serves
-/// it (an unavailable/slow holder the dispatch must not wait for). Returns the commit's placement, or
-/// the `ClusterError` display string.
-fn run_commit(serve: [bool; 2]) -> Result<Placement, String> {
+/// it (an unavailable/slow holder the dispatch must not wait for). `holder_generation` is the configuration
+/// generation the holders' acceptors run under — equal to the owner's for a normal commit, or higher to model
+/// a holder on a **newer** configuration, which refuses the owner's record `ConfigurationStale` and rides its
+/// version back (§4.8 the piggyback rule). Returns the commit's placement (or the `ClusterError` display
+/// string) and the newest stale version any holder rode back.
+fn run_commit_full(
+  serve: [bool; 2],
+  holder_generation: u64,
+) -> (Result<Placement, String>, Option<u64>) {
   let mut sim = SimRuntime::new(&config(), 1).unwrap();
   let id = sim.shard_ids()[0];
 
@@ -144,7 +150,13 @@ fn run_commit(serve: [bool; 2]) -> Result<Placement, String> {
         .unwrap();
         endpoint.establish().await.unwrap();
         if should_serve {
-          let mut acceptor = Acceptor::new(holder_id, authority());
+          let mut acceptor = Acceptor::new(
+            holder_id,
+            Authority {
+              generation: holder_generation,
+              owner: OWNER,
+            },
+          );
           serve_record(&mut endpoint, &mut acceptor).await.unwrap();
         }
         // An unavailable holder handshakes then leaves without serving; the owner must not block on it.
@@ -173,7 +185,7 @@ fn run_commit(serve: [bool; 2]) -> Result<Placement, String> {
 
       let mut owner_acceptor = Acceptor::new(OWNER, authority());
       let candidates = [OWNER, HostId(2), HostId(3)];
-      let outcome = commit_record(
+      let committed = commit_record(
         OWNER,
         &mut owner_acceptor,
         &candidates,
@@ -182,15 +194,21 @@ fn run_commit(serve: [bool; 2]) -> Result<Placement, String> {
         remotes,
         CommitBudget::hard(DEADLINE_NS, POLL_NS),
       )
-      .await
-      .outcome
-      .map_err(|e: ClusterError| e.to_string());
-      let _ = result_tx.send(outcome);
+      .await;
+      let stale = committed.stale_version;
+      let outcome = committed.outcome.map_err(|e: ClusterError| e.to_string());
+      let _ = result_tx.send((outcome, stale));
     })
     .unwrap();
 
   sim.run_until_idle();
   result_rx.try_recv().unwrap()
+}
+
+/// The placement of a normal `f = 1` commit — holders on the owner's own configuration generation, so they
+/// accept — discarding the (`None`) stale hint.
+fn run_commit(serve: [bool; 2]) -> Result<Placement, String> {
+  run_commit_full(serve, GENERATION).0
 }
 
 /// AC (acceptance history 1): the same `commit_record` at `f = 0` places on the owner's local hold
@@ -310,6 +328,38 @@ fn insufficient_acknowledgements_do_not_place() {
     ),
     Ok(placement) => panic!("a sub-quorum commit must not place: {placement:?}"),
   }
+}
+
+/// AC (§4.8 the piggyback rule): when the holders are on a **newer** configuration than the owner, each
+/// refuses the owner's record `ConfigurationStale` and rides its current version back; `commit_record`
+/// surfaces the newest such version as `stale_version`, the cue for the owner to refresh its configuration
+/// and retry within its budget. The record itself does **not** place — every holder answered, but only the
+/// owner's own local hold acknowledged (one, below the f=1 quorum of two), so it is a known `NotPlaced`, not
+/// a timeout. Non-vacuous: the surfaced version is exactly the holders' newer generation, not a bare flag,
+/// and a normal commit (holders on the owner's generation) surfaces `None`.
+#[test]
+fn a_holder_on_a_newer_configuration_rides_its_version_back_and_the_owner_does_not_place() {
+  let (outcome, stale) = run_commit_full([true, true], GENERATION + 1);
+  assert_eq!(
+    stale,
+    Some(GENERATION + 1),
+    "both holders on the newer generation refused ConfigurationStale, riding their version back"
+  );
+  match outcome {
+    Err(not_placed) => assert!(
+      not_placed.contains("not placed"),
+      "a stale-refused commit is a known non-placement, not a timeout: {not_placed}"
+    ),
+    Ok(placement) => panic!("a stale-refused commit must not place: {placement:?}"),
+  }
+
+  // A normal commit — holders on the owner's own generation — accepts and surfaces no stale hint.
+  let (placed, none) = run_commit_full([true, true], GENERATION);
+  assert!(
+    placed.is_ok(),
+    "a same-generation commit places: {placed:?}"
+  );
+  assert_eq!(none, None, "no holder was ahead, so nothing rides back");
 }
 
 /// AC (acceptance history 4): a retry of the same record **reuses the connection** — the second commit

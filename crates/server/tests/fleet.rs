@@ -742,21 +742,22 @@ fn a_learner_fetches_the_councils_committed_configuration_over_the_transport() {
     !daemons[observed_index].council_leads()
   });
 
-  // Kill the other learner, and inject its death into the voters. (Real SWIM detection of a killed node
-  // under this 5-node + learner-polling load is slow and orthogonal to what this proves; the rejoin test
-  // injects deaths for the same reason.) The voters then commit its retirement over the transport — and the
-  // observed learner, which is NOT injected, learns it only by **fetching** the committed configuration
-  // from a voter, so its regional membership and placement neighbourhood drop the dead member with no vote.
+  // Kill the other learner, and inject its death into every survivor. (Real SWIM detection of a killed node
+  // under this 5-node load is slow and orthogonal to what this proves; the rejoin test injects deaths for the
+  // same reason.) The voters commit its retirement over the transport. The observed learner casts no vote in
+  // that commit; it learns the retirement **reactively** (§4.8 the piggyback rule): its own SWIM now sees the
+  // dead member, so its membership diverges from its installed configuration and it **fetches** the committed
+  // configuration from a voter — its regional membership and placement neighbourhood then drop the dead member,
+  // though it took no part in the consensus. The injection is only the deterministic SWIM cue; the learning is
+  // the fetch, and an idle learner whose view still matched its configuration would have sent nothing.
   let mut survivors: Vec<(HostId, Daemon)> = hosts.iter().copied().zip(daemons).collect();
   let dead_pos = survivors
     .iter()
     .position(|(host, _)| *host == dead)
     .expect("the killed learner is present");
   survivors.remove(dead_pos).1.stop();
-  for (host, daemon) in &survivors {
-    if voters.contains(host) {
-      daemon.observe_peer_dead(dead, FALSE_DEATH_INCARNATION);
-    }
+  for (_, daemon) in &survivors {
+    daemon.observe_peer_dead(dead, FALSE_DEATH_INCARNATION);
   }
   let observed_pos = survivors
     .iter()

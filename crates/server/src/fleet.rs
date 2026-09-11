@@ -93,7 +93,7 @@ use slates_db::catalog::{
 };
 use slates_db::register::{
   Acceptor, Authority, FIRST_EPOCH, HostEpoch, HostId, ObjectId, Placement, Prepare, Quorum,
-  Record, candidates_for,
+  Record, candidates_for, encode_refusal,
 };
 use slates_rt::futures;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
@@ -831,8 +831,11 @@ fn reconcile_held_authority(state: &mut ShardState) {
 /// field is not this socket's peer is refused [`Unauthorized`](slates_db::register::RegisterError) by
 /// [`Acceptor::accept`], and one under a foreign generation or a stale epoch is refused likewise. On
 /// acceptance the object is tracked in the routing view as backed for that owner, so the owner's death
-/// hands [`sync_peer`]'s takeover computation this object. Returns the binding acknowledgement's bytes,
-/// or an empty reply on any refusal (the owner then counts nothing toward its quorum).
+/// hands [`sync_peer`]'s takeover computation this object. Returns the binding acknowledgement's bytes; a
+/// sender on an *older* configuration is refused `ConfigurationStale` carrying this node's newer version so
+/// it refreshes and retries (§4.8 the piggyback rule), and every other refusal is an empty reply the owner
+/// counts as no acknowledgement. A record naming a *newer* configuration than this node's flags a reactive
+/// refresh (this node is the one behind) before it is refused.
 fn accept_held_record(
   state: &mut ShardState,
   local: HostId,
@@ -840,6 +843,14 @@ fn accept_held_record(
   record: &Record,
 ) -> Vec<u8> {
   let generation = state.fleet.configuration().version;
+  // The reactive piggyback, holder-behind direction (§4.8 "every fleet request carries the sender's
+  // configuration version"): a record naming a newer generation than this node's own is evidence this node's
+  // configuration is stale. Flag a refresh so the coordinator fetches the committed configuration from a
+  // voter next period; the record itself is still refused below (this holder cannot validate authority under
+  // a generation it has not installed), and the owner re-ships it once this node has caught up.
+  if record.generation > state.council.configuration().version {
+    state.config_refresh_wanted = true;
+  }
   let accepted = {
     let acceptor = state
       .holder_records
@@ -860,7 +871,10 @@ fn accept_held_record(
       state.fleet.track_object(record.object, peer_host);
       ack.encode()
     }
-    Err(_) => Vec::new(),
+    // A refusal the sender acts on rides back on the wire (a `ConfigurationStale` naming this node's newer
+    // version, so a stale sender refreshes and retries); every other refusal is an empty reply the sender
+    // counts as no acknowledgement ([`encode_refusal`]).
+    Err(error) => encode_refusal(&error),
   }
 }
 
@@ -1765,6 +1779,28 @@ async fn drive_council_election(others: &[HostId], budget: CommitBudget) {
   return_sessions(recovered);
 }
 
+/// Whether this node's own SWIM membership view differs from the members of the configuration it has
+/// installed — the signal a learner uses to fetch the council's committed configuration reactively (§4.8 the
+/// piggyback rule). It compares this node's **alive** set against the configuration's **members**, which is
+/// exactly the predicate the council leader reconciles from ([`RegionalCouncil::reconcile_alive`] admits an
+/// alive non-member and takes over a member no longer alive), so a divergence means the council has — or, if
+/// this node's view is ahead of the leader's, soon will have — a newer configuration this node must install:
+/// to admit a newcomer, retire a departed member, or take over a failed owner's objects (the quiescent
+/// successor's only cue, as it receives no records for the dead owner's objects). Equal in steady state, so a
+/// converged learner fetches nothing. Compared as sets; both include this node.
+fn membership_diverges_from_config(state: &ShardState) -> bool {
+  let alive: std::collections::BTreeSet<HostId> =
+    state.fleet.membership().alive().into_iter().collect();
+  let members: std::collections::BTreeSet<HostId> = state
+    .council
+    .configuration()
+    .members
+    .iter()
+    .copied()
+    .collect();
+  alive != members
+}
+
 /// Drives this node's configuration council one period from the record-plane coordinator (§4.8, D-14). As
 /// **leader** it replicates a heartbeat to every voter (holding the term and carrying the commit index); as
 /// a **follower** it counts the periods since the leader last made contact and, once past the jittered
@@ -1790,11 +1826,24 @@ async fn drive_config_council(
     return;
   };
 
-  // A learner (non-voter member): it does not drive the Raft — it fetches the committed configuration from
-  // the voters and adopts the newest (§4.8, D-14). The adopted configuration is installed into placement by
-  // `sync_config_from_council`, exactly as a voter's committed one is.
+  // A learner (non-voter member): it does not drive the Raft. It fetches the committed configuration from a
+  // voter and adopts the newest (§4.8, D-14) — but **reactively**, only when it has evidence its configuration
+  // is behind the region (§4.8 the piggyback rule), never on a bare period, so an idle learner whose view
+  // matches its configuration sends nothing. The evidence is either flagged from the data plane
+  // (`config_refresh_wanted` — a `ConfigurationStale` refusal it received to a record it sent, or a record it
+  // accepted naming a newer generation) or read here from its own SWIM view diverging from its installed
+  // membership ([`membership_diverges_from_config`] — the signal a quiescent takeover successor needs, since
+  // it learns a failed owner's retirement and its own reassignment only by installing the committed
+  // configuration). The adopted configuration is installed into placement by `sync_config_from_council`,
+  // exactly as a voter's committed one is.
   if !is_voter {
-    drive_learner_fetch(&voters, budget).await;
+    let wanted =
+      state::with_state(|s| s.config_refresh_wanted || membership_diverges_from_config(s))
+        .unwrap_or(false);
+    if wanted {
+      drive_learner_fetch(&voters, budget).await;
+      let _ = state::with_state(|s| s.config_refresh_wanted = false);
+    }
     return;
   }
   let others: Vec<HostId> = voters.into_iter().filter(|voter| *voter != local).collect();
@@ -2093,6 +2142,18 @@ async fn ship_head(
     budget,
   )
   .await;
+  // The reactive piggyback, stale-sender direction (§4.8 "a receiver with a newer configuration refuses
+  // ConfigurationStale{version}; refreshes consume the operation's bounded retry budget"): a holder on a
+  // newer configuration refused this record and named its version. Flag a refresh — this owner is behind —
+  // so the coordinator fetches the committed configuration next period; the head stays unplaced and re-ships
+  // under the refreshed generation. Gated on the version being strictly newer than what this node now holds.
+  if let Some(version) = committed.stale_version {
+    let _ = state::with_state(|s| {
+      if version > s.council.configuration().version {
+        s.config_refresh_wanted = true;
+      }
+    });
+  }
   let dispatch = Dispatch::new(taken, &committed.reusable, committed.stragglers);
   return_sessions(committed.reusable);
   let placement = match committed.outcome {
