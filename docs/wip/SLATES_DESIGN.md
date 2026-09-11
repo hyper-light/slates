@@ -1824,7 +1824,10 @@ remains live.
 
 **Derived constants.** f from the failure-domain tree (0 on a laptop); candidates = 2f+1; commit
 at f+1; scatter width S from measured re-replication bandwidth × recovery budget and the accepted
-loss probability; hedge delay = measured p95 put latency per class; probation threshold = late
+loss probability, defaulting to the candidate floor 2f+1 — one copyset, the tightest and lowest-loss
+neighbourhood — until a deployment has sized its recovery (implemented: `ConfigGroup` bounds every
+neighbourhood to this width, raised above the floor only with the fixed-copyset construction so the
+copyset count stays linear); hedge delay = measured p95 put latency per class; probation threshold = late
 count over the measured window that exceeds the hedge rate's variance; detection timeout for
 membership from RTT p99 × k; auto-seal cadence as before; healer cadence from the measured
 put-failure rate; membership lease from heartbeat RTT p99 × k; election timeout for the

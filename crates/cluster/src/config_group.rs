@@ -30,7 +30,9 @@
 
 use std::mem::size_of;
 
-use slates_db::register::{Configuration, HostEpoch, HostId, ObjectId, Quorum, rendezvous_first};
+use slates_db::register::{
+  Configuration, HostEpoch, HostId, ObjectId, Quorum, rendezvous_first, select_neighbourhood,
+};
 
 use crate::membership::Membership;
 use crate::raft::RaftNode;
@@ -150,6 +152,15 @@ pub struct ConfigGroup {
   raft: RaftNode,
   configuration: Configuration,
   applied: u64,
+  /// The scatter width (§4.8 "Placement", D-14) — the size the neighbourhood is bounded to, so the
+  /// copyset count stays linear in the fleet (not `Θ(S^f)`) at any size. It defaults to the **candidate
+  /// floor** `2f+1` ([`Quorum::candidates`]) — [`scatter_width`](slates_db::register::scatter_width) with
+  /// the recovery term unsized, the tightest and lowest-loss neighbourhood, exactly one copyset (owner +
+  /// `2f`) — and is raised by [`set_scatter`] to the derived width once a deployment sizes its recovery
+  /// (data per host, re-replication bandwidth, recovery budget). `0` is the explicit *unbounded* escape
+  /// (the whole alive set) a test uses; it is never a resting default, because unbounded rendezvous over
+  /// the region is the `Θ(S^f)` data-loss case the bounding exists to prevent.
+  scatter: u64,
 }
 
 impl ConfigGroup {
@@ -167,11 +178,27 @@ impl ConfigGroup {
     // The neighbourhood quorum is the only thing that differs from the laptop configuration; the voter
     // set, version, epoch and (empty) neighbourhood are the same, grown later by reconcile.
     configuration.quorum = quorum;
+    // Bound the neighbourhood from birth to the candidate floor `2f+1` (`scatter_width` with the recovery
+    // term unsized) — one copyset, the lowest-loss placement — never the unbounded alive set; `set_scatter`
+    // raises it once a deployment sizes its recovery bandwidth and budget.
+    let scatter = u64::try_from(quorum.candidates()).unwrap_or(u64::MAX);
     ConfigGroup {
       raft,
       configuration,
       applied: 0,
+      scatter,
     }
+  }
+
+  /// Raises the scatter width the neighbourhood is bounded to (§4.8 "Placement") above its default
+  /// candidate floor — the derived [`scatter_width`](slates_db::register::scatter_width) a fleet passes
+  /// once it has sized its recovery (data per host `D`, re-replication bandwidth `B`, budget `T`). A width
+  /// above `2f+1` needs the fixed-copyset construction in placement to keep the copyset count linear (owed
+  /// with the copyset rewrite of `candidates_for`); `0` is the explicit unbounded escape. Read by
+  /// [`reconcile`]; the next reconcile applies it (growing an under-wide neighbourhood, bounding an
+  /// over-wide one).
+  pub fn set_scatter(&mut self, scatter: u64) {
+    self.scatter = scatter;
   }
 
   /// The solo configuration group — one voter, `owner`, `f = 0`, version zero (the laptop degenerate).
@@ -308,8 +335,14 @@ impl ConfigGroup {
   /// proposal (owed).
   pub fn reconcile(&mut self, view: &Membership) -> bool {
     let alive = view.alive();
+    // The neighbourhood is the **bounded** scatter set the owner draws candidates from — not every alive
+    // host (D-14: its size, the scatter width, bounds the copyset count, so it must not grow with the
+    // fleet). `select_neighbourhood` picks the owner plus the top `scatter-1` alive hosts by rendezvous,
+    // deterministically and stably; the width defaults to the candidate floor `2f+1` (one copyset) and is
+    // raised only when a deployment sizes its recovery. Admit the selected, retire whatever fell out.
+    let target = select_neighbourhood(self.configuration.owner, &alive, self.scatter);
     let mut changed = false;
-    for &host in &alive {
+    for &host in &target {
       changed |= self.reconfigure(Reconfiguration::Admit(host));
     }
     let stale: Vec<HostId> = self
@@ -317,7 +350,7 @@ impl ConfigGroup {
       .neighbourhood
       .iter()
       .copied()
-      .filter(|host| !alive.contains(host))
+      .filter(|host| !target.contains(host))
       .collect();
     for host in stale {
       changed |= self.reconfigure(Reconfiguration::Retire(host));
@@ -420,7 +453,11 @@ mod tests {
   /// bridge — advancing the version, and is a no-op when the view already matches.
   #[test]
   fn reconcile_tracks_the_membership_view() {
-    let mut group = ConfigGroup::solo(OWNER);
+    // f=1: the candidate floor is 2f+1 = 3, so the owner and both alive peers fit the bounded
+    // neighbourhood (at f=0 the owner is the only holder and no peer would be admitted — the bound is the
+    // point). The neighbourhood's internal order is rendezvous-derived, not observable, so the assertions
+    // test membership, not order (R5).
+    let mut group = ConfigGroup::new(OWNER, Quorum { f: 1 });
     let mut view = Membership::new(OWNER);
     view.apply(
       A,
@@ -438,7 +475,13 @@ mod tests {
     );
 
     assert!(group.reconcile(&view), "alive peers are admitted");
-    assert_eq!(group.configuration().neighbourhood, vec![OWNER, A, B]);
+    let mut admitted = group.configuration().neighbourhood.clone();
+    admitted.sort_unstable_by_key(|host| host.0);
+    assert_eq!(
+      admitted,
+      vec![OWNER, A, B],
+      "the owner and both alive peers fill the f=1 candidate floor"
+    );
     let after_admit = group.configuration().version;
     assert!(after_admit >= 2, "the version advanced once per admit");
 
@@ -457,7 +500,13 @@ mod tests {
       },
     );
     assert!(group.reconcile(&view), "a dead peer is retired");
-    assert_eq!(group.configuration().neighbourhood, vec![OWNER, A]);
+    let mut survivors = group.configuration().neighbourhood.clone();
+    survivors.sort_unstable_by_key(|host| host.0);
+    assert_eq!(
+      survivors,
+      vec![OWNER, A],
+      "B is retired from the neighbourhood; the owner and the surviving peer remain"
+    );
     assert!(group.configuration().version > after_admit);
   }
 

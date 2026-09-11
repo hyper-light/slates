@@ -532,6 +532,49 @@ mod tests {
     );
   }
 
+  /// AC (§4.8 "Placement", D-14): a fleet strictly larger than the candidate floor bounds each owner's
+  /// neighbourhood to exactly `2f+1` — one copyset, the lowest-loss placement — never the whole alive set.
+  /// Unbounded placement scatters every object over all N nodes (the `Θ(S^f)` data-loss case the Copysets
+  /// research forbids); the derived floor holds the copyset count linear. Non-vacuous: the neighbourhood is
+  /// a strict subset of the five-node fleet, and every candidate an object lands on is drawn from it.
+  #[test]
+  fn a_fleet_wider_than_the_candidate_floor_bounds_the_neighbourhood_to_one_copyset() {
+    // Five hosts at f=1: the candidate floor is 2f+1 = 3, so SELF's neighbourhood is itself plus two peers,
+    // not all five (SELF, A, B exist; two more push the fleet past the floor).
+    let d = HostId(4);
+    let e = HostId(5);
+    let peers = [A, B, d, e];
+    let node = FleetNode::new(SELF, Quorum { f: 1 }, &peers);
+    let hood = node.configuration().neighbourhood.clone();
+    assert_eq!(
+      hood.len(),
+      3,
+      "bounded to the candidate floor 2f+1 = 3, not the fleet size 5 (unbounded would scatter over all \
+       five — the Θ(S^f) data-loss case)"
+    );
+    assert_eq!(hood[0], SELF, "the owner heads its own neighbourhood");
+
+    // Deterministic: the same fleet builds the identical bounded neighbourhood.
+    let again = FleetNode::new(SELF, Quorum { f: 1 }, &peers);
+    assert_eq!(
+      again.configuration().neighbourhood,
+      hood,
+      "the bound is deterministic — the same alive set yields the same neighbourhood"
+    );
+
+    // Every candidate an object lands on is drawn from the bounded neighbourhood — an object is confined to
+    // the owner's one copyset, never scattered across the wider fleet.
+    for i in 0..32u64 {
+      let placed = node.configuration().place(ObjectId::new(SELF, i));
+      for holder in &placed.candidates {
+        assert!(
+          hood.contains(holder),
+          "a candidate holder must come from the bounded neighbourhood, not the wider fleet"
+        );
+      }
+    }
+  }
+
   /// AC (§4.8 takeover, driven by membership): when a peer this node backs dies, `observe` reassigns
   /// the peer's objects and returns the ones that fall to this node — the same rendezvous computation
   /// the routing view runs, folded in from the death event. Non-vacuous: this node takes some of the

@@ -248,6 +248,46 @@ pub fn candidates_for(
   chosen
 }
 
+/// The **bounded neighbourhood** the configuration assigns `owner` from the alive set (§4.8 "Placement";
+/// D-14 "a fixed set of hosts across failure domains whose size — the scatter width — bounds the copyset
+/// count"): the owner plus the top `scatter - 1` other alive hosts by rendezvous weight *keyed on the
+/// owner*, so the choice is deterministic (every node computes the same neighbourhood for `owner`),
+/// owner-specific (a different owner scatters over a different set), and stable — a membership change moves
+/// only the hosts whose rendezvous rank crossed the cut, the "add before remove" the design calls for
+/// (§4.8). The caller (`ConfigGroup`) passes the derived scatter width, defaulting to the candidate floor
+/// `2f+1` ([`Quorum::candidates`]) so the neighbourhood is one copyset when recovery is unsized;
+/// `scatter = 0` is the explicit *unbounded* escape (the whole alive set, in id order) a test uses, never a
+/// resting default. The owner is always included; the neighbourhood never exceeds `scatter`.
+pub fn select_neighbourhood(owner: HostId, alive: &[HostId], scatter: u64) -> Vec<HostId> {
+  let mut chosen = vec![owner];
+  let bound = usize::try_from(scatter).unwrap_or(usize::MAX);
+  if scatter == 0 {
+    // Unbounded: the whole alive set (owner first, the rest in id order for determinism).
+    let mut rest: Vec<HostId> = alive.iter().copied().filter(|h| *h != owner).collect();
+    rest.sort_unstable_by_key(|h| h.0);
+    chosen.extend(rest);
+    return chosen;
+  }
+  // Rank the other alive hosts by rendezvous weight keyed on the owner (a neighbourhood is the owner's own
+  // scatter set, so the owner is the natural rendezvous key, `ObjectId::new(owner, 0)`), highest first, the
+  // host id breaking ties for a total, stable order.
+  let key = ObjectId::new(owner, 0);
+  let mut ranked: Vec<(u64, HostId)> = alive
+    .iter()
+    .copied()
+    .filter(|h| *h != owner)
+    .map(|h| (rendezvous_weight(h.0, &key), h))
+    .collect();
+  ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+  for (_, host) in ranked {
+    if chosen.len() >= bound {
+      break;
+    }
+    chosen.push(host);
+  }
+  chosen
+}
+
 /// A host's **failure domain** — the node in the failure-domain tree (§4.8: thread, process, host, rack,
 /// zone, region) at the level replication spreads across, typically a rack. Two hosts in the same domain
 /// share a fate (a rack power loss), so a copyset must not put two copies in one domain, or a single domain
@@ -1837,6 +1877,44 @@ mod tests {
     // The laptop degenerate: f=0 → one copyset, the owner alone.
     let solo = owner_copysets(owner, &[(owner, 0)], Quorum { f: 0 });
     assert_eq!(solo, vec![vec![owner]]);
+  }
+
+  /// AC (§4.8 "Placement", D-14): the bounded neighbourhood is the owner plus the top `scatter-1` alive
+  /// hosts, deterministic and owner-specific, never over `scatter`; `scatter = 0` is unbounded. Different
+  /// owners scatter over different sets, and the selection is stable — the same host enters or leaves only
+  /// as its rendezvous rank crosses the cut.
+  #[test]
+  fn the_bounded_neighbourhood_is_deterministic_owner_specific_and_capped() {
+    let alive: Vec<HostId> = (1..=20u64).map(HostId).collect();
+    let owner = HostId(1);
+    // Unbounded: the whole alive set.
+    assert_eq!(select_neighbourhood(owner, &alive, 0).len(), 20);
+    // Bounded to a scatter width of 5: owner + 4.
+    let n = select_neighbourhood(owner, &alive, 5);
+    assert_eq!(n.len(), 5, "never over the scatter width");
+    assert_eq!(n[0], owner, "the owner is always in its own neighbourhood");
+    assert_eq!(
+      select_neighbourhood(owner, &alive, 5),
+      n,
+      "deterministic — every node computes the same set"
+    );
+    // Owner-specific: a different owner scatters over a (generally) different set.
+    let other = select_neighbourhood(HostId(2), &alive, 5);
+    let a: std::collections::BTreeSet<_> = n.iter().copied().collect();
+    let b: std::collections::BTreeSet<_> = other.iter().copied().collect();
+    assert_ne!(a, b, "different owners get different neighbourhoods");
+    // Stable under a join: adding host 99 keeps most of the neighbourhood (add-before-remove).
+    let mut grown = alive.clone();
+    grown.push(HostId(99));
+    let after: std::collections::BTreeSet<_> = select_neighbourhood(owner, &grown, 5)
+      .into_iter()
+      .filter(|h| *h != HostId(99))
+      .collect();
+    let kept = a.intersection(&after).count();
+    assert!(
+      kept >= 3,
+      "a join disturbs at most one member of a 5-host neighbourhood"
+    );
   }
 
   /// The object a takeover test promotes. A committed head "v1" lives at sequence 0, epoch 1,
