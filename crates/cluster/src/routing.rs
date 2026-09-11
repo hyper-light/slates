@@ -8,15 +8,16 @@
 //! global catalog, D-12), so this holds only an `object → current owner` map for the objects this node
 //! actually holds — its own, and the peers' it backs — never every object in the region. The takeover
 //! winner is recomputed the same way every host computes placement:
-//! [`slates_db::register::rendezvous_first`] over the survivors, the identical total order
-//! [`slates_db::register::candidates_for`] ranks candidates by, so the survivor a dead owner's object
-//! falls to is agreed with no coordination (the worked example's "rendezvous ranks first among
-//! {B, C, D}"). A single-generation takeover's fencing and the phase-one recovery of the dead owner's
+//! [`slates_db::register::rendezvous_first`] over the object's *surviving holders* — the copyset
+//! [`slates_db::register::candidates_for`] places it on, minus the dead host — so the survivor a dead
+//! owner's object falls to is agreed with no coordination (the worked example's "rendezvous ranks first
+//! among {B, C, D}"), and is always a host that held a copy. A single-generation takeover's fencing and
+//! the phase-one recovery of the dead owner's
 //! head live in [`crate::config_group`] and the register; this module answers only *which* objects.
 
 use std::collections::BTreeMap;
 
-use slates_db::register::{HostId, ObjectId, rendezvous_first};
+use slates_db::register::{HostId, ObjectId, Quorum, candidates_for, rendezvous_first};
 
 /// The objects this node holds a copy of, keyed to their current owner. Bounded by what this node
 /// actually holds (its own objects and the peers' it backs), not the region's whole object set.
@@ -72,16 +73,19 @@ impl Routing {
 
   /// Folds a `dead` host leaving the `neighbourhood` (which still lists `dead`) into the routing view:
   /// for each object this node holds that `dead` owned, the new owner is the survivor that rendezvous
-  /// ranks first (the same computation every host runs, so every survivor agrees on who takes each
-  /// object). The recorded owner is updated for every such object; the ones that fall to *this* node are
-  /// returned as the takeovers this node must drive (phase-one recovery then serving). An object with no
-  /// surviving holder at all is dropped (its last copy left with `dead`).
-  pub fn take_over(&mut self, dead: HostId, neighbourhood: &[HostId]) -> Vec<Reassignment> {
-    let survivors: Vec<HostId> = neighbourhood
-      .iter()
-      .copied()
-      .filter(|host| *host != dead)
-      .collect();
+  /// ranks first **among the object's holders** — the copyset `candidates_for` placed it on (under `dead`
+  /// as owner, at `quorum`), minus `dead`. Every survivor runs the same computation, so all agree on who
+  /// takes each object, and the winner always held a copy: above the candidate floor a neighbourhood host
+  /// outside the object's copyset never held it and must never be named its owner. The recorded owner is
+  /// updated for every such object; the ones that fall to *this* node are returned as the takeovers this
+  /// node must drive (phase-one recovery then serving). An object whose every holder left with `dead` is
+  /// dropped (its last copy is gone).
+  pub fn take_over(
+    &mut self,
+    dead: HostId,
+    neighbourhood: &[HostId],
+    quorum: Quorum,
+  ) -> Vec<Reassignment> {
     let affected: Vec<ObjectId> = self
       .owners
       .iter()
@@ -90,6 +94,11 @@ impl Routing {
       .collect();
     let mut mine = Vec::new();
     for object in affected {
+      // The object's surviving holders: its copyset under the dead owner, minus the dead host.
+      let survivors: Vec<HostId> = candidates_for(dead, neighbourhood, object, quorum)
+        .into_iter()
+        .filter(|host| *host != dead)
+        .collect();
       match rendezvous_first(&survivors, object) {
         Some(new_owner) => {
           self.owners.insert(object, new_owner);
@@ -97,7 +106,7 @@ impl Routing {
             mine.push(Reassignment { object, new_owner });
           }
         }
-        // No survivor holds it — the last copy left with the dead host; this node cannot serve it.
+        // No surviving holder — the object's every copy left with the dead host; this node cannot serve it.
         None => {
           self.owners.remove(&object);
         }
@@ -150,7 +159,7 @@ mod tests {
     }
 
     let taken: BTreeSet<ObjectId> = routing
-      .take_over(PEER, &neighbourhood)
+      .take_over(PEER, &neighbourhood, Quorum { f: 1 })
       .into_iter()
       .map(|r| r.object)
       .collect();
@@ -192,12 +201,57 @@ mod tests {
     let mut routing = Routing::new(SELF);
     let orphan = ObjectId::new(PEER, 0);
     routing.track(orphan, PEER);
-    let taken = routing.take_over(PEER, &[PEER]);
+    let taken = routing.take_over(PEER, &[PEER], Quorum { f: 1 });
     assert!(taken.is_empty());
     assert_eq!(
       routing.owner_of(orphan),
       None,
       "no survivor: the object is dropped"
+    );
+  }
+
+  /// AC (§4.8 "Promotion and takeover", D-14): above the candidate floor a dead owner's objects are
+  /// reassigned only to a host in each object's own copyset — one that actually held a copy — never to a
+  /// neighbourhood host outside it. This is the copyset-consistent takeover the NoLoss invariant needs: a
+  /// wide neighbourhood splits into several copysets, and each object's successor is drawn from the right
+  /// one, not by a single rendezvous over the whole neighbourhood (which could name a non-holder).
+  #[test]
+  fn a_takeover_above_the_floor_stays_within_each_objects_copyset() {
+    let dead = HostId(10);
+    // The dead owner plus four co-holders at f=1 → 2f=2 per copyset → two fixed copysets (above the floor
+    // of three), so a host in one copyset never held an object placed on the other.
+    let neighbourhood = vec![dead, SELF, OTHER, HostId(4), HostId(5)];
+    let quorum = Quorum { f: 1 };
+    let mut routing = Routing::new(SELF);
+    let objects: Vec<ObjectId> = (0..128u64).map(|i| ObjectId::new(dead, i)).collect();
+    for &object in &objects {
+      routing.track(object, dead);
+    }
+
+    routing.take_over(dead, &neighbourhood, quorum);
+
+    let mut owners = BTreeSet::new();
+    let mut copysets = BTreeSet::new();
+    for &object in &objects {
+      let new_owner = routing.owner_of(object).expect("reassigned, not dropped");
+      let copyset = candidates_for(dead, &neighbourhood, object, quorum);
+      assert!(
+        copyset.contains(&new_owner),
+        "the successor {new_owner:?} must have held the object (be in its copyset {copyset:?})"
+      );
+      assert_ne!(new_owner, dead, "never the dead owner");
+      owners.insert(new_owner);
+      copysets.insert(copyset);
+    }
+    // Non-vacuity: the objects really split across more than one copyset (so the within-copyset check is not
+    // trivially met by a single global set), and their successors span more than one host.
+    assert!(
+      copysets.len() > 1,
+      "the wide neighbourhood split into multiple copysets"
+    );
+    assert!(
+      owners.len() > 1,
+      "successors spread across copysets, not funnelled to one host"
     );
   }
 }

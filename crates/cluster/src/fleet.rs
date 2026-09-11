@@ -192,9 +192,10 @@ impl FleetNode {
     // is exactly the survivors, so the routing view ranks each dead-owned object over them and hands
     // this node the ones it wins (the rest go to other survivors, recorded but not returned).
     let takeovers = if update.liveness == Liveness::Dead {
+      let quorum = self.group.configuration().quorum;
       self
         .routing
-        .take_over(subject, &self.group.configuration().neighbourhood)
+        .take_over(subject, &self.group.configuration().neighbourhood, quorum)
     } else {
       Vec::new()
     };

@@ -1826,8 +1826,11 @@ remains live.
 at f+1; scatter width S from measured re-replication bandwidth × recovery budget and the accepted
 loss probability, defaulting to the candidate floor 2f+1 — one copyset, the tightest and lowest-loss
 neighbourhood — until a deployment has sized its recovery (implemented: `ConfigGroup` bounds every
-neighbourhood to this width, raised above the floor only with the fixed-copyset construction so the
-copyset count stays linear); hedge delay = measured p95 put latency per class; probation threshold = late
+neighbourhood to this width; placement and takeover route each object through the fixed-copyset
+construction in `candidates_for`, so above the floor the number of copysets stays linear in S, not
+`Θ(S^{2f})`, and a takeover successor is always a host that held the object — the failure domains default
+to unique-per-host until the manifest declares them, owed); hedge delay = measured p95 put latency per
+class; probation threshold = late
 count over the measured window that exceeds the hedge rate's variance; detection timeout for
 membership from RTT p99 × k; auto-seal cadence as before; healer cadence from the measured
 put-failure rate; membership lease from heartbeat RTT p99 × k; election timeout for the

@@ -31,7 +31,8 @@
 use std::mem::size_of;
 
 use slates_db::register::{
-  Configuration, HostEpoch, HostId, ObjectId, Quorum, rendezvous_first, select_neighbourhood,
+  Configuration, HostEpoch, HostId, ObjectId, Quorum, candidates_for, rendezvous_first,
+  select_neighbourhood,
 };
 
 use crate::membership::Membership;
@@ -303,28 +304,44 @@ impl ConfigGroup {
     changed
   }
 
-  /// Applies a committed takeover: reassigns the volume to the rendezvous-first survivor, bumps the host
-  /// epoch, and drops the dead owner. A no-op if `dead` is no longer the owner or no survivor remains
-  /// (the caller validated both before proposing; this stays safe if the log order changed them).
+  /// Applies a committed takeover: reassigns the volume to the rendezvous-first survivor of the object's
+  /// copyset, bumps the host epoch, and drops the dead owner. A no-op if `dead` is no longer the owner or
+  /// no holder of the object survives (the caller validated both before proposing; this stays safe if the
+  /// log order changed them).
   fn apply_take_over(&mut self, dead: HostId, object: ObjectId) -> bool {
     if dead != self.configuration.owner {
       return false;
     }
-    let survivors: Vec<HostId> = self
-      .configuration
-      .neighbourhood
-      .iter()
-      .copied()
-      .filter(|host| *host != dead)
-      .collect();
-    let Some(successor) = rendezvous_first(&survivors, object) else {
+    // The successor is the rendezvous-first of the object's surviving holders — the copyset `candidates_for`
+    // places it on (under `dead`, at this quorum), minus the dead host — so the new owner held a copy
+    // (copyset-consistent with placement and the routing view; above the candidate floor a neighbourhood
+    // host outside the object's copyset never held it and must never be named its owner).
+    let object_survivors: Vec<HostId> = candidates_for(
+      dead,
+      &self.configuration.neighbourhood,
+      object,
+      self.configuration.quorum,
+    )
+    .into_iter()
+    .filter(|host| *host != dead)
+    .collect();
+    let Some(successor) = rendezvous_first(&object_survivors, object) else {
       return false;
     };
     self.configuration.owner = successor;
     // Bump the authority so the dead owner's in-flight records are fenced (the next epoch, a monotonic
     // step like the version, never a tunable).
     self.configuration.host_epoch = HostEpoch(self.configuration.host_epoch.0.saturating_add(1));
-    self.configuration.neighbourhood = survivors;
+    // The dead host leaves the neighbourhood entirely; the new owner keeps the rest of the survivors (not
+    // just this object's copyset — its other objects have their own copysets within the same neighbourhood).
+    let neighbourhood: Vec<HostId> = self
+      .configuration
+      .neighbourhood
+      .iter()
+      .copied()
+      .filter(|host| *host != dead)
+      .collect();
+    self.configuration.neighbourhood = neighbourhood;
     true
   }
 
@@ -359,10 +376,10 @@ impl ConfigGroup {
   }
 
   /// Takes over the volume from a dead owner (§4.8 "Promotion and takeover"): SWIM has declared the
-  /// current owner `dead`, so the group assigns the volume to the survivor of the neighbourhood that
+  /// current owner `dead`, so the group assigns the volume to the survivor of the object's copyset that
   /// rendezvous ranks first for `object`, **bumps the host epoch** (the successor serves under the new
   /// epoch), drops the dead owner from the neighbourhood, and advances the version. Returns the new
-  /// configuration, or a [`TakeoverError`] if the named host is not the owner or no survivor remains.
+  /// configuration, or a [`TakeoverError`] if the named host is not the owner or no holder survives.
   ///
   /// In this single-generation model a resumed stale owner is fenced by the advanced generation: it
   /// still holds the old configuration, so its request is refused `ConfigurationStale`, and a record it
@@ -384,14 +401,18 @@ impl ConfigGroup {
         owner: self.configuration.owner,
       });
     }
-    let survivors: Vec<HostId> = self
-      .configuration
-      .neighbourhood
-      .iter()
-      .copied()
-      .filter(|host| *host != dead)
-      .collect();
-    if rendezvous_first(&survivors, object).is_none() {
+    // The object's surviving holders: the copyset `candidates_for` places it on, minus the dead host — the
+    // same set `apply_take_over` chooses the successor from, so validation and application agree.
+    let object_survivors: Vec<HostId> = candidates_for(
+      dead,
+      &self.configuration.neighbourhood,
+      object,
+      self.configuration.quorum,
+    )
+    .into_iter()
+    .filter(|host| *host != dead)
+    .collect();
+    if rendezvous_first(&object_survivors, object).is_none() {
       return Err(TakeoverError::NoSurvivor);
     }
     // Propose the takeover through the configuration log; at f = 0 it commits and applies at once.
@@ -514,10 +535,12 @@ mod tests {
   /// neighbourhood, bumps the host epoch, drops the dead owner, and advances the generation.
   #[test]
   fn take_over_reassigns_to_the_rendezvous_first_survivor_and_bumps_the_epoch() {
-    let mut group = ConfigGroup::solo(OWNER);
+    // f=1 with a floor neighbourhood [OWNER, A, B] — one copyset, so the object's surviving holders are
+    // exactly [A, B] and the successor is the one they rendezvous-rank first (the copyset-consistent
+    // choice; the above-floor multi-copyset case is proven separately).
+    let mut group = ConfigGroup::new(OWNER, Quorum { f: 1 });
     group.reconfigure(Reconfiguration::Admit(A));
     group.reconfigure(Reconfiguration::Admit(B));
-    group.reconfigure(Reconfiguration::Admit(C));
     assert_eq!(group.configuration().host_epoch, HostEpoch(1));
     let before = group.configuration().version;
 
@@ -527,7 +550,7 @@ mod tests {
       .expect("a survivor takes over")
       .clone();
 
-    let survivors = [A, B, C];
+    let survivors = [A, B];
     assert!(survivors.contains(&new.owner), "a survivor took over");
     assert_eq!(
       new.owner,
@@ -540,6 +563,45 @@ mod tests {
       "the dead owner left the neighbourhood"
     );
     assert!(new.version > before, "the generation advanced");
+  }
+
+  /// AC (§4.8 "Promotion and takeover", D-14): above the candidate floor the takeover assigns the object
+  /// to a survivor of *that object's* copyset (a host that held a copy), and the new owner keeps the whole
+  /// surviving neighbourhood — not just the one copyset — because its other objects have their own copysets
+  /// within it.
+  #[test]
+  fn take_over_above_the_floor_picks_from_the_objects_copyset_and_keeps_the_neighbourhood() {
+    // OWNER + four co-holders at f=1 → 2f=2 per copyset → two fixed copysets, above the floor of three.
+    let mut group = ConfigGroup::new(OWNER, Quorum { f: 1 });
+    for host in [A, B, C, HostId(5)] {
+      group.reconfigure(Reconfiguration::Admit(host));
+    }
+    let before = group.configuration().neighbourhood.clone();
+    assert_eq!(before.len(), 5, "a wide neighbourhood, above the floor");
+
+    let object = ObjectId::new(OWNER, 7);
+    // The object's holders under the dead owner — the copyset placement puts it on.
+    let holders = candidates_for(OWNER, &before, object, Quorum { f: 1 });
+    assert_eq!(holders.len(), 3, "the object takes one copyset of 2f+1, not the whole neighbourhood");
+
+    let new = group
+      .take_over(OWNER, object)
+      .expect("a holder survives")
+      .clone();
+    assert!(
+      holders.contains(&new.owner),
+      "the successor held the object (is in its copyset)"
+    );
+    assert_ne!(new.owner, OWNER, "never the dead owner");
+    assert!(
+      !new.neighbourhood.contains(&OWNER),
+      "the dead owner left the neighbourhood"
+    );
+    assert_eq!(
+      new.neighbourhood.len(),
+      before.len() - 1,
+      "the new owner keeps the whole surviving neighbourhood, not just the object's copyset"
+    );
   }
 
   /// Taking over a host that is not the current owner is refused — a non-owner death is a neighbourhood

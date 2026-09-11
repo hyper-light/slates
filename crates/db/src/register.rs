@@ -217,35 +217,28 @@ impl Placement {
   }
 }
 
-/// The candidate holders for `object`: the owner, then the highest-ranked of the neighbourhood
-/// by rendezvous (highest-random-weight) hashing, to `2f + 1` total. Deterministic, so every
-/// host computes the same set from the object id and the neighbourhood, with no directory
-/// (§4.8 "Placement"). At `f = 0` this is the owner alone.
+/// The candidate holders for `object`: the owner plus the co-holders of the one **copyset** the object
+/// rendezvous-maps onto within the owner's neighbourhood (`owner_copysets` then `copyset_for`), `2f + 1`
+/// total when the neighbourhood is domain-rich enough. Rendezvous runs over the *copysets*, not the raw
+/// hosts, so the number of distinct copysets stays linear in the scatter width, not the `Θ(S^{2f})` a
+/// per-object rendezvous over the hosts would make (research §3.1; [A: Cidon et al., ATC 2013]).
+/// Deterministic — every host computes the same set from the object id and the neighbourhood, with no
+/// directory (§4.8 "Placement"). At `f = 0` this is the owner alone; at the candidate floor `S = 2f+1` the
+/// neighbourhood is a single copyset, so this is the owner plus its `2f` co-holders — the same set the
+/// former per-object rendezvous produced, leaving the floor unchanged.
 pub fn candidates_for(
   owner: HostId,
   neighbourhood: &[HostId],
   object: ObjectId,
   quorum: Quorum,
 ) -> Vec<HostId> {
-  let mut chosen = vec![owner];
-  let wanted = quorum.candidates();
-  if wanted <= 1 {
-    return chosen;
-  }
-  let mut ranked: Vec<(u64, HostId)> = neighbourhood
-    .iter()
-    .filter(|h| **h != owner)
-    .map(|h| (rendezvous_weight(h.0, &object), *h))
-    .collect();
-  // Highest weight first; the host id breaks a tie, so the order is total and stable.
-  ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-  for (_, host) in ranked {
-    if chosen.len() >= wanted {
-      break;
-    }
-    chosen.push(host);
-  }
-  chosen
+  // Failure domains default to unique-per-host — each host is its own domain (`host.0`) until a deployment
+  // declares the domain tree (§4.8, owed). The copyset construction consumes `(host, domain)` pairs, so a
+  // richer domain source replaces this derivation here alone, without changing any caller.
+  let with_domains: Vec<(HostId, DomainId)> =
+    neighbourhood.iter().map(|host| (*host, host.0)).collect();
+  let copysets = owner_copysets(owner, &with_domains, quorum);
+  copyset_for(object, &copysets).unwrap_or_else(|| vec![owner])
 }
 
 /// The **bounded neighbourhood** the configuration assigns `owner` from the alive set (§4.8 "Placement";
@@ -1332,7 +1325,9 @@ mod tests {
       version: 0,
       owner,
       host_epoch: FIRST_EPOCH,
-      neighbourhood: vec![owner, HostId(2), HostId(3), HostId(4)],
+      // A floor neighbourhood at f=1: owner + 2f = one copyset of three, so every object has three
+      // candidates (above the floor an object takes just its one copyset, tested separately).
+      neighbourhood: vec![owner, HostId(2), HostId(3)],
       quorum: Quorum { f: 1 },
       has_mirror: false,
     };
@@ -1657,26 +1652,45 @@ mod tests {
     );
   }
 
-  /// Rendezvous placement is deterministic and owner-first, and spreads objects across the
-  /// neighbourhood (a non-vacuity check that the ranking is not constant).
+  /// Copyset placement through `candidates_for` is deterministic and owner-first. At the candidate floor
+  /// the neighbourhood is a single copyset every object shares; above the floor objects spread across the
+  /// (linearly many) fixed copysets — rendezvous over the copysets, not the raw hosts (research §3.1), so a
+  /// per-object candidate set is one copyset, never an arbitrary `2f+1`-subset of a wide neighbourhood.
   #[test]
-  fn rendezvous_candidates_are_deterministic_owner_first_and_spread() {
+  fn copyset_candidates_are_deterministic_owner_first_and_spread_above_the_floor() {
     let owner = HostId(1);
-    let neigh = vec![owner, HostId(2), HostId(3), HostId(4), HostId(5)];
-    let quorum = Quorum { f: 2 };
-    let mut seconds = std::collections::BTreeSet::new();
+    let quorum = Quorum { f: 2 }; // candidate floor 2f+1 = 5
+
+    // At the floor: a five-host neighbourhood is one copyset, and every object shares it.
+    let floor = vec![owner, HostId(2), HostId(3), HostId(4), HostId(5)];
+    let one = candidates_for(owner, &floor, ObjectId::new(owner, 0), quorum);
+    assert_eq!(one.len(), 5, "the floor neighbourhood is a single copyset of 2f+1");
+    assert_eq!(one[0], owner, "owner first");
     for local in 0..256u64 {
       let object = ObjectId::new(owner, local);
-      let a = candidates_for(owner, &neigh, object, quorum);
-      let b = candidates_for(owner, &neigh, object, quorum);
-      assert_eq!(a, b, "deterministic");
-      assert_eq!(a.len(), 5, "2f+1 = 5");
+      let a = candidates_for(owner, &floor, object, quorum);
+      assert_eq!(
+        a,
+        candidates_for(owner, &floor, object, quorum),
+        "deterministic"
+      );
+      assert_eq!(a, one, "at the floor every object shares the one copyset");
+    }
+
+    // Above the floor: owner + eight co-holders → 2f=4 per copyset → two fixed copysets the objects spread
+    // across, each still a `2f+1` set headed by the owner (the linear-count "without loss" placement).
+    let wide: Vec<HostId> = (1..=9u64).map(HostId).collect();
+    let mut sets = std::collections::BTreeSet::new();
+    for local in 0..256u64 {
+      let object = ObjectId::new(owner, local);
+      let a = candidates_for(owner, &wide, object, quorum);
       assert_eq!(a[0], owner, "owner first");
-      seconds.insert(a[1]);
+      assert_eq!(a.len(), 5, "each candidate set is one copyset of 2f+1, not the whole wide neighbourhood");
+      sets.insert(a);
     }
     assert!(
-      seconds.len() > 1,
-      "objects spread over more than one second holder"
+      sets.len() > 1,
+      "above the floor objects spread across more than one copyset (a linear, not per-object, count)"
     );
   }
 
@@ -1705,11 +1719,11 @@ mod tests {
         "deterministic"
       );
       assert!(survivors.contains(&first), "the winner is a survivor");
-      // The owner's first *other* candidate for this object is exactly the rendezvous-first survivor.
-      assert_eq!(
-        candidates_for(owner, &neigh, object, quorum)[1],
-        first,
-        "agrees with the candidate ranking"
+      // The rendezvous-first survivor is one of the object's candidate holders — placement and takeover
+      // draw from the same copyset, so the successor always held a copy.
+      assert!(
+        candidates_for(owner, &neigh, object, quorum).contains(&first),
+        "the successor is a candidate holder of the object"
       );
       winners.insert(first);
     }
