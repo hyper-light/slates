@@ -76,7 +76,8 @@ use slates_archive::Archive;
 use slates_cluster::content::{fetch_content, is_content_stream, put_content};
 use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::fleet::{apply_peer_state, sync_peer};
-use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once, serve_probe};
+use slates_cluster::membership::Liveness;
+use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once};
 use slates_cluster::{
   ClusterError, CommitBudget, PROMOTE_STREAM, RECORD_STREAM, Stragglers, commit_record,
   promote_record,
@@ -286,7 +287,12 @@ pub async fn run_membership(transport: FleetTransport) {
       let _ = futures::detach(task);
     }
   }
-  if let Ok(task) = futures::spawn(accept_probes(probe_demux, local, neighbourhood)) {
+  if let Ok(task) = futures::spawn(accept_probes(
+    probe_demux,
+    local,
+    neighbourhood,
+    roster.clone(),
+  )) {
     let _ = futures::detach(task);
   }
   if let Ok(task) = futures::spawn(accept_records(record_demux, local, roster)) {
@@ -349,10 +355,20 @@ async fn run_demux(demux: &'static Demux) {
 /// session, ended by the session's failure or its replacement by the peer's re-dial. Bounded by the
 /// demultiplexer's session slots (`SESSIONS_PER_PEER` per peer): a task ends and releases its slot before
 /// another session for the same peer can be opened past that.
-async fn accept_probes(demux: &'static Demux, local: HostId, neighbourhood: usize) {
+async fn accept_probes(
+  demux: &'static Demux,
+  local: HostId,
+  neighbourhood: usize,
+  roster: Vec<(CertificateDer<'static>, HostId)>,
+) {
   loop {
     let session = demux.accept().await;
-    if let Ok(task) = futures::spawn(serve_peer_probes(session, local, neighbourhood)) {
+    if let Ok(task) = futures::spawn(serve_peer_probes(
+      session,
+      local,
+      neighbourhood,
+      roster.clone(),
+    )) {
       let _ = futures::detach(task);
     }
   }
@@ -425,20 +441,188 @@ async fn establish_session(
   }
 }
 
-/// The serve side: complete the accepted session's handshake and loop answering the peer's probes (§4.8).
-/// Its own detector builds the acknowledgement gossip; a serve failure (the peer's connection dropped when
-/// it died) ends the loop, which is correct — a dead peer sends no more probes to answer.
-async fn serve_peer_probes(mut endpoint: Endpoint, local: HostId, neighbourhood: usize) {
+/// The serve side: complete the accepted session's handshake and loop answering the peer's probes (§4.8),
+/// **re-admitting a peer that has come back**. A serve session's own detector builds the acknowledgement
+/// gossip as before; on top of that, the authenticated prober's own liveness is folded into the shared
+/// `FleetNode` and this node's belief *about the prober* is echoed in the reply — the SWIM rejoin path
+/// (hyperscale's `reset_peer_for_rejoin`, realized here without a separate death tracker or incarnation
+/// bump because [`Membership::refute`] already bumps past the death it hears). A serve failure ends this
+/// loop, but the peer's re-dial opens a fresh session the accept loop serves, so a returning peer is always
+/// answered.
+///
+/// **How a return heals.** This node retired peer B, so [`probe_peer`] idled and closed B's sessions. B is
+/// alive (a false suspicion) or restarted, and its own probe reaches this node here. This node believes B
+/// `Dead@N`, so the reply echoes `(B, Dead@N)`; B applies it to *itself*, refutes to `alive@N+1`
+/// ([`Membership::refute`], which uses the death incarnation it heard, so even a restarted B at incarnation
+/// zero jumps past `N`), and gossips that alive. B's next probe carries `(B, alive@N+1)`, which this fold
+/// adopts (a higher incarnation overrides the death), re-admitting B — after which the idled [`probe_peer`]
+/// sees B back in the neighbourhood and resumes. The fold is **scoped to the authenticated prober** (its own
+/// state only), so it can never re-admit or flap a *third* peer another detector retired — the [`sync_peer`]
+/// discipline. An unauthenticated prober (its certificate not in `roster`) is answered but never folded: a
+/// ping's `from` is unauthenticated, so only the certificate the handshake proved may move membership.
+async fn serve_peer_probes(
+  mut endpoint: Endpoint,
+  local: HostId,
+  neighbourhood: usize,
+  roster: Vec<(CertificateDer<'static>, HostId)>,
+) {
   if endpoint.establish().await.is_err() {
     return;
   }
+  let prober = endpoint.peer_certificate().and_then(|presented| {
+    roster
+      .iter()
+      .find(|(certificate, _)| *certificate == presented)
+      .map(|(_, host)| *host)
+  });
   let timing = detector_timing(neighbourhood);
   let fanout = usize::try_from(timing.gossip_transmits).unwrap_or(1);
   let mut detector = Detector::new(local, timing);
-  while serve_probe(&mut endpoint, &mut detector, local, fanout)
-    .await
-    .is_ok()
-  {}
+  loop {
+    let served = endpoint
+      .serve_once(|_stream, request| match SwimMessage::decode(&request) {
+        Ok(message) => {
+          detector.apply_gossip_from(message.from(), message.gossip());
+          if let Some(coordinate) = message.coordinate() {
+            detector.learn_coordinate(message.from(), coordinate.clone());
+          }
+          let mut gossip = detector.gossip(fanout);
+          if let Some(peer) = prober {
+            state::with_state(|s| {
+              // Fold the authenticated prober's own asserted liveness (scoped to it) — a higher incarnation
+              // re-admits it, a stale one is ignored (`FleetNode::observe`'s incarnation-gated merge).
+              if let Some(asserted) = message
+                .gossip()
+                .iter()
+                .find(|(host, _)| *host == peer)
+                .map(|(_, state)| *state)
+              {
+                apply_peer_state(&mut s.fleet, peer, Some(asserted));
+              }
+              // Echo this node's belief about the prober so a peer this node believes dead learns of it and
+              // self-refutes. Only when not already carried and not `Alive` (an alive belief needs no echo).
+              if let Some(belief) = s.fleet.membership().state(peer)
+                && belief.liveness != Liveness::Alive
+                && !gossip.iter().any(|(host, _)| *host == peer)
+              {
+                gossip.push((peer, belief));
+              }
+            });
+          }
+          SwimMessage::Ack {
+            from: local,
+            nonce: message.nonce().unwrap_or(0),
+            gossip,
+            coordinate: detector.coordinate(),
+          }
+          .encode()
+        }
+        Err(_) => Vec::new(),
+      })
+      .await;
+    if served.is_err() {
+      return;
+    }
+  }
+}
+
+/// At the top of a probe cycle, decides whether to probe this peer or idle. Returns `false` when the peer is
+/// **retired** (not in the neighbourhood) — the caller idles the task (it does not end: a believed-dead peer
+/// is never dialed, since that establish would block on a peer that will not answer, and no probe session is
+/// held; when the peer rejoins — its own probe reaching this node's serve side re-admits it at a higher
+/// incarnation, [`serve_peer_probes`] — the neighbourhood regains it and probing resumes). On the resume
+/// from idle it realigns `detector` to the fleet's re-admitted belief, so the detector tracks the peer as
+/// alive and can detect a *future* death rather than carrying its stale death forever. Returns `true` to
+/// probe.
+fn resume_if_in_mesh(detector: &mut Detector, peer_host: HostId, was_idle: &mut bool) -> bool {
+  let in_mesh = state::with_state(|s| s.fleet.configuration().neighbourhood.contains(&peer_host))
+    .unwrap_or(false);
+  if !in_mesh {
+    *was_idle = true;
+    return false;
+  }
+  if *was_idle {
+    if let Some(state) = state::with_state(|s| s.fleet.membership().state(peer_host)).flatten() {
+      detector.apply(peer_host, state);
+    }
+    *was_idle = false;
+  }
+  true
+}
+
+/// Folds this peer's detector view into the shard's `FleetNode` and returns whether the peer is now
+/// **retired** (out of the neighbourhood). Peer-scoped ([`sync_peer`], not `sync_membership`): each peer has
+/// its own detector whose gossip carries other peers' states, so folding the whole view would let one
+/// detector re-join a peer another has retired and flap it — scoped to this peer, a retirement sticks the
+/// moment this detector ages it out. A death may hand this node objects to take over (it is the
+/// rendezvous-first survivor); those are recorded and every held acceptor's authority is brought into step
+/// with the routing view, so this node can promote what it takes over and answer another survivor's
+/// promotion of the rest (§4.8 "Promotion and takeover"; no coordination — every survivor computes the same
+/// winner). The folded state is then handed to every other shard's configuration copy so all advance
+/// identically (D-7); a spawn refused at a shard's admission bound is retried next period (the fold is
+/// idempotent).
+fn fold_peer_state(detector: &Detector, peer_host: HostId, origin: u16, shards: &[u16]) -> bool {
+  let retired = state::with_state(|s| {
+    let takeovers = sync_peer(detector.membership(), &mut s.fleet, peer_host);
+    for reassignment in &takeovers {
+      s.pending_takeovers.insert(reassignment.object);
+    }
+    reconcile_held_authority(s);
+    !s.fleet.configuration().neighbourhood.contains(&peer_host)
+  })
+  .unwrap_or(false);
+  let peer_state = detector.membership().state(peer_host);
+  for shard in shards.iter().copied().filter(|shard| *shard != origin) {
+    let _ = run_on(origin, shard, move |s| {
+      apply_peer_state(&mut s.fleet, peer_host, peer_state);
+    });
+  }
+  retired
+}
+
+/// Sends one probe over `session` (when established) and folds its outcome into `detector`, returning the
+/// session to carry forward. An acknowledgement clears the suspicion and learns the peer's gossip, RTT and
+/// coordinate; a timeout is a **transient miss**, not a verdict — a lost packet, scheduling jitter, or a
+/// nonce-rejected stale reply — so the session is kept and re-probed next period (only silence across the
+/// suspicion window ages the peer to death), while the ping the next period carries this node's suspicion
+/// for a still-live peer to refute; a runtime refusal (never expected from the inline probe) drops it. The
+/// detector ticks only when a probe actually goes out, so an unestablished session never resolves as a miss.
+#[allow(clippy::too_many_arguments)]
+async fn probe_and_apply(
+  detector: &mut Detector,
+  session: Option<Endpoint>,
+  local: HostId,
+  peer_host: HostId,
+  fanout: usize,
+  nonce: u64,
+  budget: CommitBudget,
+) -> Option<Endpoint> {
+  let open = session?;
+  detector.tick();
+  let ping = SwimMessage::Ping {
+    from: local,
+    nonce,
+    gossip: detector.gossip(fanout),
+  };
+  match probe_once(open, &ping, budget).await {
+    Ok((
+      returned,
+      ProbeOutcome::Acked {
+        gossip,
+        rtt_ns,
+        coordinate,
+      },
+    )) => {
+      detector.on_ack(peer_host);
+      detector.apply_gossip(&gossip);
+      #[allow(clippy::cast_precision_loss)]
+      detector.observe_rtt(peer_host, rtt_ns as f64);
+      detector.learn_coordinate(peer_host, coordinate);
+      returned
+    }
+    Ok((returned, ProbeOutcome::TimedOut)) => returned,
+    Err(_) => None,
+  }
 }
 
 /// The probe side: dial the peer's probe address (so a slow or not-yet-listening peer never blocks the other
@@ -488,8 +672,16 @@ async fn probe_peer(
   // earlier probe, carrying a lower nonce) is rejected rather than counted as this probe's reply — the
   // fix for a survivor accepting a dead peer's buffered acknowledgements (`docs/bugs/2026-09-10-swim-stale-ack.md`).
   let mut probe_nonce: u64 = 0;
+  // Set while this peer is retired, so the resume that follows realigns the detector to the re-admitted
+  // belief before it probes again.
+  let mut was_idle = false;
 
   loop {
+    // Idle while this peer is retired; on the resume, the detector is realigned to the re-admitted belief.
+    if !resume_if_in_mesh(&mut detector, peer_host, &mut was_idle) {
+      futures::sleep(HEARTBEAT_NS).await;
+      continue;
+    }
     (client, session) =
       establish_session(client, session, identity, &name, address, &certificate).await;
     if session.is_some() && !recorded_mesh {
@@ -498,79 +690,32 @@ async fn probe_peer(
       state::with_state(|s| s.formed_probe_peers.insert(peer_host));
       recorded_mesh = true;
     }
-    if let Some(open) = session.take() {
-      detector.tick();
+    if session.is_some() {
       probe_nonce += 1;
-      let ping = SwimMessage::Ping {
-        from: local,
-        nonce: probe_nonce,
-        gossip: detector.gossip(fanout),
-      };
-      match probe_once(open, &ping, budget).await {
-        Ok((
-          returned,
-          ProbeOutcome::Acked {
-            gossip,
-            rtt_ns,
-            coordinate,
-          },
-        )) => {
-          detector.on_ack(peer_host);
-          detector.apply_gossip(&gossip);
-          #[allow(clippy::cast_precision_loss)]
-          detector.observe_rtt(peer_host, rtt_ns as f64);
-          detector.learn_coordinate(peer_host, coordinate);
-          session = returned;
-        }
-        // A timeout is a **transient miss**, not a verdict — a lost packet, a moment's scheduling jitter, or
-        // a nonce-rejected stale reply. The session is **kept and re-probed** next period: the ping carries
-        // this node's suspicion, a still-live peer refutes it (its acknowledgement's gossip clears the
-        // suspicion), and only a peer that stays silent across the detector's suspicion window ages to death.
-        // Dropping it on one miss would retire a live peer on any glitch (the formation flake). A runtime
-        // refusal (never expected from the inline probe) drops the session.
-        Ok((returned, ProbeOutcome::TimedOut)) => {
-          session = returned;
-        }
-        Err(_) => {}
-      }
+      session = probe_and_apply(
+        &mut detector,
+        session.take(),
+        local,
+        peer_host,
+        fanout,
+        probe_nonce,
+        budget,
+      )
+      .await;
     }
 
-    // Fold this peer's liveness into the shard's FleetNode (brief, synchronous — never held across an await).
-    // Peer-scoped ([`sync_peer`], not `sync_membership`): each peer has its own detector, and a detector's
-    // gossip carries other peers' states, so folding the whole view would let one peer's detector re-join a
-    // peer another has retired — they would flap it until every detector converged. Scoped to this peer, the
-    // retirement sticks the moment this detector ages it out.
-    let retired = state::with_state(|s| {
-      let takeovers = sync_peer(detector.membership(), &mut s.fleet, peer_host);
-      // A death may hand this node objects to take over (it is the rendezvous-first survivor) and changes
-      // the routing owner of others it merely holds a copy of. Record the ones to drive, and bring every
-      // held acceptor's authority into step with the routing view — so this node can promote the objects it
-      // takes over and can answer *another* survivor's promotion of the rest (the configuration group's
-      // taken-over authority, applied locally with no coordination — every survivor computes the same
-      // rendezvous winner, §4.8 "Promotion and takeover").
-      for reassignment in &takeovers {
-        s.pending_takeovers.insert(reassignment.object);
-      }
-      reconcile_held_authority(s);
-      !s.fleet.configuration().neighbourhood.contains(&peer_host)
-    });
-    // Hand the peer's state to every other shard's `FleetNode`, so all copies of the configuration advance
-    // identically (the version a head is written under, the neighbourhood its candidates are drawn from).
-    // A spawn refused at a shard's admission bound is retried next period (the fold is idempotent).
-    let peer_state = detector.membership().state(peer_host);
-    for shard in shards.iter().copied().filter(|shard| *shard != origin) {
-      let _ = run_on(origin, shard, move |s| {
-        apply_peer_state(&mut s.fleet, peer_host, peer_state);
-      });
-    }
-    if retired == Some(true) {
+    let retired = fold_peer_state(&detector, peer_host, origin, &shards);
+    if retired {
       // The peer is retired and gone from the direct mesh. Its objects' phase-one recovery is now driven by
-      // the record-ship task (over the surviving candidate holders); this probe task for the dead peer ends,
-      // and the sessions it dialed into this node are closed so their serve tasks end and free their slots.
+      // the record-ship task (over the surviving candidate holders); the probe session is dropped and the
+      // sessions it dialed into this node are closed so their serve tasks end and free their slots. The task
+      // does **not** end — the top of the loop idles it until the peer rejoins, so a false retirement (or a
+      // restart) heals without a supervisor re-spawning anything.
       state::with_state(|s| s.formed_probe_peers.remove(&peer_host));
       demuxes.0.close_peer(&certificate);
       demuxes.1.close_peer(&certificate);
-      return;
+      session = None;
+      recorded_mesh = false;
     }
     futures::sleep(HEARTBEAT_NS).await;
   }
@@ -1292,8 +1437,14 @@ async fn establish_record_link(identity: &'static Identity, dial: PeerDial) {
     let retired =
       state::with_state(|s| !s.fleet.configuration().neighbourhood.contains(&peer_host));
     if retired == Some(true) {
+      // The peer is retired. Drop its record session and **idle** — this task does not end, so if the peer
+      // rejoins (its probe reaches this node's serve side, which re-admits it — [`serve_peer_probes`]) this
+      // loop sees it back in the neighbourhood and re-establishes. A believed-dead peer is never dialed
+      // (that establish would block on a peer that will not answer, `docs/bugs/2026-09-10-*`), so idling
+      // costs nothing until the peer is alive again.
       state::with_state(|s| s.record_sessions.remove(&peer_host));
-      return;
+      futures::sleep(HEARTBEAT_NS).await;
+      continue;
     }
     // Absent means no session (never established, or lost); a `None` entry means the coordinator has it out
     // on a dispatch — not this task's to touch.

@@ -355,6 +355,39 @@ impl Daemon {
       .unwrap_or(false)
   }
 
+  /// Test and operator support: folds a `Dead` belief about `peer` at `incarnation` into this node's
+  /// membership on the control shard — the same effect its failure detector has when it ages a peer to
+  /// death (§4.8). Exposed so **rejoin** can be driven deterministically: a real process kill cannot be
+  /// exercised in-process (a stopped daemon's serve socket is leaked to the process's lifetime and cannot be
+  /// rebound, as a live deployment's OS would free it), so a test injects the (possibly false) death here
+  /// and lets the still-live peer's own probing drive the recovery — the peer learns of the death from this
+  /// node's probe echo, refutes past `incarnation` ([`Membership::refute`](slates_cluster::membership)), and
+  /// is re-admitted. Synchronous (waits for the fold), bounded by the liveness budget; a no-op on a laptop
+  /// or a stopping daemon. Injected at a high `incarnation` so it wins over the current belief.
+  pub fn observe_peer_dead(&self, peer: slates_db::HostId, incarnation: u64) {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
+      return;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        state::with_state(|s| {
+          let dead = slates_cluster::membership::MemberState {
+            liveness: slates_cluster::membership::Liveness::Dead,
+            incarnation,
+          };
+          let _ = slates_cluster::fleet::apply_peer_state(&mut s.fleet, peer, Some(dead));
+        });
+        let _ = tx.send(());
+      })
+      .is_err()
+    {
+      return;
+    }
+    let _ = rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS));
+  }
+
   /// Whether this daemon's fleet has **region-placed** the head of `object` (§4.8): its control-shard
   /// membership loop replicated the head's record to the candidate holders and recorded a quorum of
   /// acknowledgements. A test or an operator reads this to observe cross-node replication; `false` if it is

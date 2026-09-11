@@ -60,6 +60,10 @@ const FORMATION_SETTLE: Duration = Duration::from_secs(2);
 /// past the probe timeout plus the suspicion window. The fleet tests are serialised (see
 /// [`serialize_fleet_tests`]), so this is measured against a quiet machine.
 const RETIREMENT_DEADLINE: Duration = Duration::from_secs(10);
+/// Shape: how long to wait for a survivor to re-admit a peer that has come back (restarted as itself). Wider
+/// than retirement: the returning node must establish, learn of its own death from the survivor's echo,
+/// self-refute, and have its refutation adopted — a few protocol periods past a fresh formation.
+const REJOIN_DEADLINE: Duration = Duration::from_secs(15);
 /// Shape: how long to wait for an N-node fleet to fully form (every node seeing every peer alive) before the
 /// test fails. Polled, not a fixed settle, so it returns the instant the mesh is up; the deadline is wide
 /// because a larger mesh has more sessions to establish (each node dials and accepts every peer) and the
@@ -273,6 +277,113 @@ fn a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it() {
   assert!(
     retired,
     "daemon A's membership loop detected B's death over the transport and retired it"
+  );
+}
+
+/// Shape: the incarnation the test injects a false death at — comfortably above any incarnation a quiet,
+/// serialized formation could reach, so the injected death wins over A's current belief about B (a higher
+/// incarnation always overrides). Chosen high on purpose; the exact value is immaterial past that.
+const FALSE_DEATH_INCARNATION: u64 = 1_000;
+
+/// Polls `condition` (yielding between checks — the test thread is not a runtime task) until it holds or
+/// `within` elapses; returns whether it held.
+fn poll_until(within: Duration, mut condition: impl FnMut() -> bool) -> bool {
+  let deadline = Instant::now() + within;
+  while Instant::now() < deadline {
+    if condition() {
+      return true;
+    }
+    std::thread::yield_now();
+  }
+  false
+}
+
+/// Polls that `condition` stays true for the whole `window`; returns whether it never broke — the stability
+/// check a "did not flap" assertion needs.
+fn holds_for(window: Duration, mut condition: impl FnMut() -> bool) -> bool {
+  let deadline = Instant::now() + window;
+  while Instant::now() < deadline {
+    if !condition() {
+      return false;
+    }
+    std::thread::yield_now();
+  }
+  true
+}
+
+/// AC (§4.8, rejoin): a peer the fleet **retired** is **re-admitted when it comes back**, by SWIM
+/// refutation, realized to slates' spec — the configuration group is the membership authority, SWIM is only
+/// detection, and re-admission needs no separate incarnation tracker or bump because [`Membership::refute`]
+/// bumps past the death incarnation it hears. A is made to (falsely) retire B — B is alive throughout, so
+/// this drives the pure re-admission path deterministically, without a process kill (a killed daemon's serve
+/// socket is leaked to the process lifetime and cannot be rebound in-process, though a real deployment's OS
+/// frees it). B keeps probing A; A, believing B dead, echoes that in its acknowledgement
+/// ([`serve_peer_probes`]); B self-refutes past the death incarnation and gossips its new life, which A
+/// adopts — re-admitting B — after which A's idled [`probe_peer`] resumes. Non-vacuous on three counts: B is
+/// shown retired first (the injected death took hold), then shown back, then shown to **stay** back over a
+/// further settle, proving the re-admission is stable and not a flap.
+#[test]
+fn a_falsely_retired_peer_rejoins_by_refutation() {
+  let _serial = serialize_fleet_tests();
+  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let host_b = b.host;
+  let peer_of_a = Peer {
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start(a, peer_of_a);
+  let daemon_b = start(b, peer_of_b);
+
+  // Let the direct probe mesh form and settle (a fixed wait, not an early return): the seeded membership
+  // holds every peer alive from boot, so B must actually be probing A — and their sessions steady — before
+  // the injection, so B hears A's echo and refutes over a stable session rather than one mid-formation.
+  let settle = Instant::now() + FORMATION_SETTLE;
+  while Instant::now() < settle {
+    std::thread::yield_now();
+  }
+  assert!(
+    daemon_a.fleet_meshed() && daemon_b.fleet_meshed(),
+    "the fleet's direct probe mesh formed"
+  );
+
+  // A falsely retires B — a false positive; B is alive and still probing A. This is the same fold A's
+  // detector performs when it ages a peer to death.
+  daemon_a.observe_peer_dead(host_b, FALSE_DEATH_INCARNATION);
+  let retired = poll_until(RETIREMENT_DEADLINE, || {
+    !daemon_a.fleet_members().contains(&host_b)
+  });
+
+  // B, alive and still probing A, learns of its death from A's echo, refutes, and A re-admits it.
+  let rejoined = poll_until(REJOIN_DEADLINE, || {
+    daemon_a.fleet_members().contains(&host_b)
+  });
+
+  // The re-admission is stable — B does not flap back out over a further settle.
+  let stable = rejoined
+    && holds_for(FORMATION_SETTLE, || {
+      daemon_a.fleet_members().contains(&host_b)
+    });
+
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    retired,
+    "A retired B after the injected false death took hold"
+  );
+  assert!(rejoined, "A re-admitted B after B refuted its false death");
+  assert!(
+    stable,
+    "B stayed admitted after rejoining — the re-admission did not flap"
   );
 }
 
