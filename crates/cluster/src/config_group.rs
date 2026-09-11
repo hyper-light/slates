@@ -31,8 +31,8 @@
 use std::mem::size_of;
 
 use slates_db::register::{
-  Configuration, DomainId, HostEpoch, HostId, ObjectId, Quorum, candidates_for, rendezvous_first,
-  select_neighbourhood,
+  Configuration, DomainId, HostEpoch, HostId, ObjectId, Quorum, RegionalConfiguration,
+  candidates_for, rendezvous_first, select_neighbourhood,
 };
 
 use crate::membership::Membership;
@@ -514,6 +514,137 @@ impl ConfigGroup {
   }
 }
 
+/// The **regional configuration council** on one node (§4.8, D-14 — the "configuration master", a small
+/// elected council per region): the multi-voter [`RaftNode`] over the council voters, producing the
+/// [`RegionalConfiguration`] every node learns. Membership changes commit at a majority over the transport
+/// — the leader [`propose`](RegionalCouncil::propose)s, the followers serve, and each committed command
+/// applies to the regional configuration — the distributed form of the per-node [`ConfigGroup`]. The drive
+/// primitives ride the same [`RaftMessage`] wire the fleet transport carries.
+pub struct RegionalCouncil {
+  raft: RaftNode,
+  configuration: RegionalConfiguration,
+  applied: u64,
+  scatter: u64,
+}
+
+impl RegionalCouncil {
+  /// A council on this `node` (one of the `voters`) holding the region's `members` at `quorum` and the
+  /// failure `domains`, each neighbourhood bounded to `scatter`. The Raft waits for an election over the
+  /// transport (the drive loop); the configuration starts at the formed region.
+  pub fn new(
+    node: HostId,
+    members: Vec<HostId>,
+    voters: Vec<HostId>,
+    quorum: Quorum,
+    domains: std::collections::BTreeMap<HostId, DomainId>,
+    scatter: u64,
+    has_mirror: bool,
+  ) -> RegionalCouncil {
+    let raft = RaftNode::new(node, voters);
+    let configuration =
+      RegionalConfiguration::formed(members, quorum, domains, scatter, has_mirror);
+    RegionalCouncil {
+      raft,
+      configuration,
+      applied: 0,
+      scatter,
+    }
+  }
+
+  /// The regional configuration the council has agreed on so far — every node's placement view derives from
+  /// it ([`RegionalConfiguration::configuration_for`]).
+  pub fn configuration(&self) -> &RegionalConfiguration {
+    &self.configuration
+  }
+
+  /// Whether this node leads the council (only the leader may propose).
+  pub fn is_leader(&self) -> bool {
+    self.raft.is_leader()
+  }
+
+  /// Becomes a candidate on an election timeout, returning the vote requests to ship to the other voters.
+  pub fn campaign(&mut self) -> Vec<RequestVote> {
+    self.raft.start_election()
+  }
+
+  /// The append the leader replicates to `follower` now (or a heartbeat), or `None` when not the leader.
+  pub fn replication_for(&self, follower: HostId) -> Option<AppendEntries> {
+    self.raft.replicate_to(follower)
+  }
+
+  /// Handles one Raft message received over the transport, returning the reply to ship back and applying
+  /// whatever newly committed to the regional configuration (a follower on the append, the leader once a
+  /// majority acknowledges).
+  pub fn handle_raft(&mut self, message: RaftMessage) -> Option<RaftMessage> {
+    let reply = match message {
+      RaftMessage::RequestVote(request) => {
+        Some(RaftMessage::VoteReply(self.raft.on_request_vote(request)))
+      }
+      RaftMessage::VoteReply(reply) => {
+        self.raft.on_vote_reply(reply);
+        None
+      }
+      RaftMessage::AppendEntries(append) => {
+        Some(RaftMessage::AppendReply(self.raft.on_append_entries(append)))
+      }
+      RaftMessage::AppendReply(reply) => {
+        self.raft.on_append_reply(reply);
+        None
+      }
+    };
+    self.apply_committed();
+    reply
+  }
+
+  /// Proposes a membership change on the leader **without waiting**: it commits — and applies to the
+  /// regional configuration — only once a majority of the council acknowledge it over the transport. Returns
+  /// whether the leader appended it (a non-leader, or a change already reflected in the membership, returns
+  /// `false`).
+  pub fn propose(&mut self, change: Reconfiguration) -> bool {
+    let (command, would_change) = match change {
+      Reconfiguration::Admit(host) => (
+        ConfigCommand::Admit(host),
+        !self.configuration.members.contains(&host),
+      ),
+      Reconfiguration::Retire(host) => (
+        ConfigCommand::Retire(host),
+        self.configuration.members.contains(&host),
+      ),
+    };
+    if !would_change {
+      return false;
+    }
+    self.raft.append_command(command.encode())
+  }
+
+  /// Applies every committed but not-yet-applied command to the regional configuration, in commit order —
+  /// the deterministic fold every voter makes, so the configuration is the same on all of them.
+  fn apply_committed(&mut self) {
+    let committed = self.raft.committed_entries().to_vec();
+    while let Some(entry) = committed.get(usize::try_from(self.applied).unwrap_or(usize::MAX)) {
+      if let Some(command) = ConfigCommand::decode(&entry.command) {
+        self.apply_regional(command);
+      }
+      self.applied = self.applied.saturating_add(1);
+    }
+  }
+
+  /// Applies one committed command to the regional configuration.
+  fn apply_regional(&mut self, command: ConfigCommand) {
+    match command {
+      ConfigCommand::Admit(host) => {
+        self.configuration.admit(host, self.scatter);
+      }
+      ConfigCommand::Retire(host) => {
+        self.configuration.retire(host, self.scatter);
+      }
+      ConfigCommand::TakeOver { dead, .. } => {
+        self.configuration.take_over(dead, self.scatter);
+      }
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -779,6 +910,67 @@ mod tests {
       ConfigCommand::decode(&[9, 9, 9]),
       None,
       "an unknown tag decodes to nothing"
+    );
+  }
+
+  /// Ships one Raft message from `from` to `to` and folds any reply back into `from` — one leg of the
+  /// council's drive loop, in process (the transport-carried form is proven in `config_group_live`).
+  fn drive(from: &mut RegionalCouncil, to: &mut RegionalCouncil, message: RaftMessage) {
+    if let Some(reply) = to.handle_raft(message) {
+      from.handle_raft(reply);
+    }
+  }
+
+  /// A two-voter council on `node`, holding `[OWNER, A]` as its members and voters at f=1.
+  fn council(node: HostId) -> RegionalCouncil {
+    RegionalCouncil::new(
+      node,
+      vec![OWNER, A],
+      vec![OWNER, A],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    )
+  }
+
+  /// AC (§4.8, D-14): the regional council elects a leader and commits a membership change at a majority,
+  /// applying it to the regional configuration on every voter — the distributed configuration master. A
+  /// member admitted by the council need not be a voter of it (the council is small; the region is not).
+  /// The drive rides the same Raft the transport carries (`config_group_live` proves it over sim UDP).
+  #[test]
+  fn a_regional_council_commits_a_membership_change_at_a_majority() {
+    let mut leader = council(OWNER);
+    let mut follower = council(A);
+
+    // Elect the leader: it campaigns, the follower votes, the leader tallies the majority.
+    for vote in leader.campaign() {
+      drive(&mut leader, &mut follower, RaftMessage::RequestVote(vote));
+    }
+    assert!(leader.is_leader(), "the leader won the council's vote");
+
+    // Propose admitting a new member (not itself a voter); it commits and applies only at the majority.
+    assert!(
+      leader.propose(Reconfiguration::Admit(B)),
+      "the leader appended the membership change"
+    );
+    // Round one replicates the entry; round two's heartbeat carries the commit index to the follower.
+    for _ in 0..2 {
+      if let Some(append) = leader.replication_for(A) {
+        drive(&mut leader, &mut follower, RaftMessage::AppendEntries(append));
+      }
+    }
+    assert!(
+      leader.configuration().members.contains(&B),
+      "the membership change committed and applied at the leader"
+    );
+    assert!(
+      follower.configuration().members.contains(&B),
+      "and at the follower — the council agrees on the regional configuration"
+    );
+    assert!(
+      leader.configuration().configuration_for(B).is_some(),
+      "the admitted member now has a placement view derived from the regional configuration"
     );
   }
 }
