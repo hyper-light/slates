@@ -1,8 +1,9 @@
 //! The per-object routing view (§4.8 "Promotion and takeover", D-14): which objects this node holds a
 //! copy of, and — when a peer leaves the neighbourhood — which of that peer's objects this node takes
-//! over. It complements [`crate::config_group::ConfigGroup`], whose single-owner `Configuration` models
-//! *this* node's authority over its *own* objects; a cross-node takeover instead asks about a *peer's*
-//! objects, which needs a per-object view of who owns what this node participates in.
+//! over. It complements the regional configuration ([`crate::config_group::RegionalCouncil`]), whose
+//! per-owner `Configuration` models each node's authority over its *own* objects; a cross-node takeover
+//! instead asks about a *peer's* objects, which needs a per-object view of who owns what this node
+//! participates in.
 //!
 //! Placement is computed by rendezvous, never stored in a directory (D-14: "ids route to owners"; no
 //! global catalog, D-12), so this holds only an `object → current owner` map for the objects this node

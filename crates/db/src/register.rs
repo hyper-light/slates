@@ -252,7 +252,7 @@ pub fn candidates_for(
 /// owner*, so the choice is deterministic (every node computes the same neighbourhood for `owner`),
 /// owner-specific (a different owner scatters over a different set), and stable — a membership change moves
 /// only the hosts whose rendezvous rank crossed the cut, the "add before remove" the design calls for
-/// (§4.8). The caller (`ConfigGroup`) passes the derived scatter width, defaulting to the candidate floor
+/// (§4.8). The caller (the regional configuration council) passes the derived scatter width, defaulting to the candidate floor
 /// `2f+1` ([`Quorum::candidates`]) so the neighbourhood is one copyset when recovery is unsized;
 /// `scatter = 0` is the explicit *unbounded* escape (the whole alive set, in id order) a test uses, never a
 /// resting default. The owner is always included; the neighbourhood never exceeds `scatter`.
