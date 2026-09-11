@@ -1896,15 +1896,31 @@ fn sync_config_from_council(local: HostId) {
     if s.council.configuration().version == s.fleet.configuration().version {
       return;
     }
-    let (configuration, members) = {
+    let (configuration, members, epochs) = {
       let regional = s.council.configuration();
-      (regional.configuration_for(local), regional.members.clone())
+      (
+        regional.configuration_for(local),
+        regional.members.clone(),
+        regional.epochs.clone(),
+      )
     };
     let Some(configuration) = configuration else {
       return;
     };
     for reassignment in s.fleet.install_configuration(configuration, &members) {
       s.pending_takeovers.insert(reassignment.object);
+    }
+    // Raise the fence for every held object to its owner's committed fencing epoch (§4.8 "every holder
+    // raises its fence for that host to the new epoch"). A failed owner's epoch was bumped by the council's
+    // takeover, so this fences a resumed stale owner `StaleEpoch` across all its objects **at once** — done
+    // before `reconcile_held_authority` re-owns those objects to the successor, so the fence is read against
+    // the *departed* owner. Monotonic (a live owner's unchanged epoch is a no-op), additive on top of the
+    // configuration-generation fence. (The FencedRegister per-host model this realizes, A-9, still owes its
+    // TLA+ revalidation before the modeled StaleNeverCommits result formally applies; design §4.8.)
+    for acceptor in s.holder_records.values_mut() {
+      if let Some(epoch) = epochs.get(&acceptor.owner()) {
+        acceptor.raise_fence(*epoch);
+      }
     }
     reconcile_held_authority(s);
   });

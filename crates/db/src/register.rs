@@ -958,6 +958,23 @@ impl Acceptor {
     (self.fence.seen, accepted)
   }
 
+  /// The authorized owner this acceptor currently serves under. A holder reads it to raise the fence for a
+  /// **departed** owner when it installs a configuration that bumped that host's epoch (see
+  /// [`raise_fence`](Acceptor::raise_fence)).
+  pub fn owner(&self) -> HostId {
+    self.authority.owner
+  }
+
+  /// Raises this holder's fence for the object to at least `epoch` (§4.8 "Promotion and takeover": "every
+  /// holder raises its fence for that host to the new epoch"). When the configuration group bumps a failed
+  /// host's fencing epoch, a holder installing that configuration raises the fence for the objects that host
+  /// owned **at once** — before the per-object phase-one prepare — so a resumed stale owner writing under the
+  /// old epoch is refused `StaleEpoch` immediately across all of them. Monotonic: a lower epoch is ignored,
+  /// so this only ever strengthens the fence (it can never admit a record the fence already refused).
+  pub fn raise_fence(&mut self, epoch: HostEpoch) {
+    let _ = self.fence.accept(epoch);
+  }
+
   /// Accepts `record` under this holder's authority and fence, storing it before acknowledging, or
   /// refusing with a typed reason. The order is authority (a foreign generation or unauthorized owner
   /// refuses before touching the fence), then the fence (a stale epoch refuses), then the position (a
@@ -1766,6 +1783,58 @@ mod tests {
     assert_eq!(
       acceptor.accept(&foreign_generation),
       Err(RegisterError::ForeignGeneration { current: 7 })
+    );
+  }
+
+  /// AC (§4.8, A-9 — the per-host epoch fence): when the configuration group bumps a failed owner's fencing
+  /// epoch, a holder raises its fence to it, and the owner's later records under the **old** epoch are
+  /// refused `StaleEpoch` — the immediate fence a configuration install installs, before any per-object
+  /// phase-one prepare. Monotonic: raising to a lower epoch is a no-op.
+  #[test]
+  fn a_raised_fence_refuses_a_record_under_the_old_epoch() {
+    let owner = HostId(1);
+    let authority = Authority {
+      generation: 0,
+      owner,
+    };
+    let mut acceptor = Acceptor::new(HostId(2), authority);
+    let object = ObjectId::new(HostId(1), 5);
+    // The owner commits a record at epoch 1.
+    let at_epoch_1 = Record {
+      owner,
+      object,
+      sequence: 0,
+      epoch: HostEpoch(1),
+      generation: 0,
+      value: b"v1".to_vec(),
+    };
+    assert!(acceptor.accept(&at_epoch_1).is_ok());
+
+    // The council takes the failed owner over: the committed fencing epoch bumps to 2, and the holder raises
+    // its fence to it on installing the configuration.
+    acceptor.raise_fence(HostEpoch(2));
+
+    // A resumed stale owner's later record under the old epoch 1 is now refused StaleEpoch.
+    let zombie = Record {
+      owner,
+      object,
+      sequence: 1,
+      epoch: HostEpoch(1),
+      generation: 0,
+      value: b"stale".to_vec(),
+    };
+    assert_eq!(
+      acceptor.accept(&zombie),
+      Err(RegisterError::StaleEpoch { current: 2 }),
+      "a record under the pre-takeover epoch is fenced"
+    );
+
+    // Monotonic: raising to a lower epoch does not lower the fence.
+    acceptor.raise_fence(HostEpoch(1));
+    assert_eq!(
+      acceptor.accept(&zombie),
+      Err(RegisterError::StaleEpoch { current: 2 }),
+      "the fence only strengthens"
     );
   }
 

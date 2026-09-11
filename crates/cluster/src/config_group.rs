@@ -125,8 +125,13 @@ fn take_host(bytes: &[u8]) -> Option<(HostId, &[u8])> {
 pub enum Reconfiguration {
   /// Admit a member to the neighbourhood (a join the membership view learned).
   Admit(HostId),
-  /// Retire a member from the neighbourhood (a death the membership view confirmed).
+  /// Retire a member from the neighbourhood (a clean departure — no fencing epoch bump).
   Retire(HostId),
+  /// Take over a **failed** member (§4.8 "Promotion and takeover", line 1730 "Host failure increments the
+  /// host epoch"): bump its fencing epoch **and** retire it, so a resumed stale owner's records under the
+  /// old epoch are refused `StaleEpoch`. This is what the leader proposes for a SWIM-confirmed death, the
+  /// per-host counterpart of a clean [`Retire`](Reconfiguration::Retire).
+  TakeOver(HostId),
 }
 
 /// A refusal to take over a dead owner's volume.
@@ -248,7 +253,10 @@ impl ConfigGroup {
         ConfigCommand::Admit(host),
         !self.configuration.neighbourhood.contains(&host),
       ),
-      Reconfiguration::Retire(host) => (
+      Reconfiguration::Retire(host) | Reconfiguration::TakeOver(host) => (
+        // This single-owner group (the retired per-node form) fences by the configuration generation, not a
+        // per-host epoch, so a takeover here is just a retirement; the per-host epoch bump is the regional
+        // council's ([`RegionalCouncil`]).
         ConfigCommand::Retire(host),
         host != self.configuration.owner && self.configuration.neighbourhood.contains(&host),
       ),
@@ -588,6 +596,16 @@ impl RegionalCouncil {
         ConfigCommand::Retire(host),
         self.configuration.members.contains(&host),
       ),
+      Reconfiguration::TakeOver(host) => (
+        // Per-host takeover: bump the host's fencing epoch and retire it. The `object` field is vestigial
+        // here (the council's `take_over` bumps the whole host's epoch, not one object — the per-object
+        // `TakeOver` is the retired [`ConfigGroup`]'s form), so a canonical placeholder is passed.
+        ConfigCommand::TakeOver {
+          dead: host,
+          object: ObjectId::new(host, 0),
+        },
+        self.configuration.members.contains(&host),
+      ),
     };
     if !would_change {
       return false;
@@ -631,7 +649,9 @@ impl RegionalCouncil {
       .filter(|member| !alive.contains(member))
       .collect();
     for host in stale {
-      proposed |= self.propose(Reconfiguration::Retire(host));
+      // A member no longer alive **failed** (SWIM confirmed its death), so take it over — bump its fencing
+      // epoch and retire it (§4.8 line 1730 "Host failure increments the host epoch"), not a clean retire.
+      proposed |= self.propose(Reconfiguration::TakeOver(host));
     }
     proposed
   }
@@ -1086,6 +1106,54 @@ mod tests {
     assert!(
       !leader.reconcile_alive(&alive),
       "the settled membership reconciles to a no-op — the log grows only for real changes"
+    );
+  }
+
+  /// AC (§4.8, A-9 — "Host failure increments the host epoch"): the leader takes over a **failed** member by
+  /// committing a `TakeOver` — bumping the member's fencing epoch AND retiring it — so a resumed stale owner
+  /// is fenced by the advanced epoch (`StaleEpoch`), not only by the configuration generation. A holder
+  /// raises its fence to this committed epoch on install (`server::fleet`; the FencedRegister TLA+
+  /// revalidation the design mandates for A-9 is owed before the modeled result formally applies).
+  #[test]
+  fn the_leader_takes_over_a_failed_member_bumping_its_epoch() {
+    let mut leader = council(OWNER);
+    let mut follower = council(A);
+    elect(&mut leader, &mut follower);
+    assert!(leader.is_leader());
+
+    let a_epoch_before = leader
+      .configuration()
+      .epochs
+      .get(&A)
+      .copied()
+      .expect("A is a member");
+
+    // A is no longer alive: the leader proposes its takeover (an epoch bump plus a retirement).
+    assert!(
+      leader.reconcile_alive(&[OWNER]),
+      "the leader proposes the failed member's takeover"
+    );
+    replicate(&mut leader, &mut follower, 2);
+
+    assert!(
+      !leader.configuration().members.contains(&A),
+      "the failed member is retired"
+    );
+    let a_epoch_after = leader
+      .configuration()
+      .epochs
+      .get(&A)
+      .copied()
+      .expect("the retired member's epoch is kept, to keep fencing its records");
+    assert!(
+      a_epoch_after.0 > a_epoch_before.0,
+      "the takeover bumped the failed member's fencing epoch ({} -> {})",
+      a_epoch_before.0,
+      a_epoch_after.0
+    );
+    assert!(
+      follower.configuration().epochs.get(&A).copied() == Some(a_epoch_after),
+      "and the follower applied the same bump — the council agrees on the fencing epoch"
     );
   }
 }
