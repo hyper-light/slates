@@ -553,24 +553,21 @@ fn resume_if_in_mesh(detector: &mut Detector, peer_host: HostId, was_idle: &mut 
   true
 }
 
-/// Folds this peer's detector view into the shard's `FleetNode` and returns whether the peer is now
-/// **retired** (out of the neighbourhood). Peer-scoped ([`sync_peer`], not `sync_membership`): each peer has
-/// its own detector whose gossip carries other peers' states, so folding the whole view would let one
-/// detector re-join a peer another has retired and flap it — scoped to this peer, a retirement sticks the
-/// moment this detector ages it out. A death may hand this node objects to take over (it is the
-/// rendezvous-first survivor); those are recorded and every held acceptor's authority is brought into step
-/// with the routing view, so this node can promote what it takes over and answer another survivor's
-/// promotion of the rest (§4.8 "Promotion and takeover"; no coordination — every survivor computes the same
-/// winner). The folded state is then handed to every other shard's configuration copy so all advance
-/// identically (D-7); a spawn refused at a shard's admission bound is retried next period (the fold is
-/// idempotent).
+/// Folds this peer's detector view into the shard's `FleetNode` membership and returns whether the peer is
+/// now **retired** (out of the configuration's neighbourhood). Peer-scoped ([`sync_peer`], not
+/// `sync_membership`): each peer has its own detector whose gossip carries other peers' states, so folding
+/// the whole view would let one detector re-join a peer another has retired and flap it — scoped to this
+/// peer, this node's belief about it sticks the moment its detector ages it out. This only advances the
+/// **failure view**; the configuration is the regional council's (D-14), so a death drives no takeover here
+/// — the council leader reconciles the retirement from the folded view and, when it commits, the record
+/// plane installs the new configuration and takes over what fell to this node ([`sync_config_from_council`]).
+/// The folded state is handed to every other shard's membership copy so all advance identically (D-7); a
+/// spawn refused at a shard's admission bound is retried next period (the fold is idempotent). "Retired" is
+/// read from the configuration, so it reflects the council's committed retirement, not one detector's
+/// suspicion.
 fn fold_peer_state(detector: &Detector, peer_host: HostId, origin: u16, shards: &[u16]) -> bool {
   let retired = state::with_state(|s| {
-    let takeovers = sync_peer(detector.membership(), &mut s.fleet, peer_host);
-    for reassignment in &takeovers {
-      s.pending_takeovers.insert(reassignment.object);
-    }
-    reconcile_held_authority(s);
+    sync_peer(detector.membership(), &mut s.fleet, peer_host);
     !s.fleet.configuration().neighbourhood.contains(&peer_host)
   })
   .unwrap_or(false);
@@ -1798,6 +1795,37 @@ async fn drive_config_council(
   }
 }
 
+/// Installs the configuration the council has committed into this node's placement view and takes over any
+/// object whose owner it has retired (§4.8, D-14 — the council is the authority, this node places under what
+/// it agreed). Derives this node's owner view from the regional configuration (`configuration_for`) and
+/// installs it ([`FleetNode::install_configuration`]): the placement configuration the verbs read is updated,
+/// the owner acceptor's authority is brought into step (records write under the current generation), and the
+/// departed owners' objects this node now owns are returned — recorded as pending takeovers the record plane
+/// drives, with every held acceptor's authority brought into step so this node can promote what it took over
+/// and answer another survivor's promotion of the rest. Idempotent: an unchanged configuration takes over
+/// nothing, so the coordinator calls it every period.
+fn sync_config_from_council(local: HostId) {
+  state::with_state(|s| {
+    // Nothing new committed since the last install: the version advances on every change, so an equal
+    // version is the same configuration — skip the diff and the members clone (config changes are the
+    // near-zero-rate the design makes a tripwire, so most periods skip here).
+    if s.council.configuration().version == s.fleet.configuration().version {
+      return;
+    }
+    let (configuration, members) = {
+      let regional = s.council.configuration();
+      (regional.configuration_for(local), regional.members.clone())
+    };
+    let Some(configuration) = configuration else {
+      return;
+    };
+    for reassignment in s.fleet.install_configuration(configuration, &members) {
+      s.pending_takeovers.insert(reassignment.object);
+    }
+    reconcile_held_authority(s);
+  });
+}
+
 /// The record-plane coordinator (§4.8 "records are sent to all candidates; committed at `f + 1`"; "Promotion
 /// and takeover"): one task per node that, each period, ships every unplaced head to all its candidates in
 /// one commit and drives every owed takeover over all surviving holders, borrowing the holder sessions the
@@ -1843,6 +1871,11 @@ async fn run_record_plane(local: HostId, budget: CommitBudget) {
       &mut council_attempt,
     )
     .await;
+    // Install the configuration the council has agreed into this node's placement view, and take over any
+    // object whose owner the council has now retired (§4.8, D-14 — the council is the authority; a departed
+    // owner's objects that rendezvous first to this node over the new neighbourhood are owed a phase-one
+    // recovery, driven below).
+    sync_config_from_council(local);
     // Keep the owner's hold writing under the current configuration generation: the version advances on
     // every join or retirement (`FleetNode::observe` keeps the node's own acceptor in step the same way), and
     // a record under a stale generation is refused `ForeignGeneration` by the owner's own hold — so without

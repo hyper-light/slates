@@ -1,78 +1,67 @@
 //! The owner runtime on one node (§4.8; the design's boot step 6, §2.6; D-14): the single object the
-//! control shard holds to take part in a region — the SWIM membership view, the configuration group,
-//! and the node's own register acceptor, kept in step. Boot step 6 names exactly this composition —
-//! "the control shard joins membership, learns its neighbourhood and host epoch from the regional
-//! configuration, and begins replication to its candidate holders" — and the laptop is its `f = 0`
-//! degenerate: one member, one voter, the owner's local hold the commit, the *same code path* as a
-//! fleet (R8), never a mode switch.
+//! control shard holds to take part in a region — the SWIM membership view, this node's **current
+//! configuration** (what the regional council has agreed and this node places under), and the node's own
+//! register acceptor, kept in step. Boot step 6 names exactly this composition — "the control shard joins
+//! membership, learns its neighbourhood and host epoch from the regional configuration, and begins
+//! replication to its candidate holders" — and the laptop is its `f = 0` degenerate: one member, a solo
+//! council that self-leads, the owner's local hold the commit, the *same code path* as a fleet (R8), never
+//! a mode switch.
 //!
-//! The ownership split is unchanged: the register protocol (`slates-db`) owns synchronous acceptance;
-//! the async commit/promote drivers of [`crate`] own the transport dispatch; this composes them with
-//! the failure detector's view ([`crate::membership`]) and the configuration authority
-//! ([`crate::config_group`]). This module is the **synchronous** runtime — it turns a membership event
-//! into the right configuration action and keeps the owner's acceptor authority in step with the
-//! configuration version — so the async drivers borrow [`FleetNode::configuration`] and
-//! [`FleetNode::owner_acceptor`] to ship records and prepares over the wire against a consistent
-//! authority. Keeping the three in step is the real work here: a neighbourhood change advances the
-//! configuration version, and the owner must write its next records under that version (a holder that
-//! installed the new configuration refuses an older-generation record), so the owner's own acceptor
-//! adopts the new authority the moment the configuration moves.
+//! **The configuration authority is the regional council, not this module** (D-14, one configuration group
+//! per region): the council ([`crate::config_group::RegionalCouncil`]) reconciles the region's membership,
+//! neighbourhoods and host epochs by consensus over the transport; every node **installs** the committed
+//! configuration ([`install_configuration`](FleetNode::install_configuration)) and reads it per request
+//! ([`configuration`](FleetNode::configuration)). This module composes that installed configuration with the
+//! failure detector's view ([`crate::membership`]) and the owner's acceptor, and keeps the acceptor's
+//! authority in step with the installed version — a holder on the new configuration refuses an
+//! older-generation record, so the owner must write under the current version.
 //!
-//! Scope (this piece): the authority core and its N=1-vs-fleet differential (R8).
+//! The split of work: the register protocol (`slates-db`) owns synchronous acceptance; the async
+//! commit/promote drivers of [`crate`] own the transport dispatch; the council owns the configuration; this
+//! composes them. [`observe`](FleetNode::observe) folds a SWIM event into the membership view — the failure
+//! view the council leader reconciles the configuration from ([`RegionalCouncil::reconcile_alive`](crate::config_group::RegionalCouncil::reconcile_alive)),
+//! not a local reconcile. [`install_configuration`](FleetNode::install_configuration) installs a committed
+//! configuration and hands back the objects a departed owner's retirement gives this node to take over (the
+//! per-object routing view, [`crate::routing`], computes the rendezvous winner over the new neighbourhood).
+//! [`sync_membership`]/[`sync_peer`] bridge a detector's converged view into the membership each round.
 //!
-//! **Wired into the daemon (2026-09-10):** `slates-server` depends on `slates-cluster`, and each shard's
-//! `ShardState` holds a `FleetNode` (`FleetNode::solo` at boot — the laptop `f = 0`). The daemon's
-//! placement authority — every `place`/`region_placed`/`await_placed`/`host_epoch` the verbs read — now
-//! comes from `fleet.configuration()`, so the register/placement path runs the fleet's configuration
-//! group rather than a bare `Configuration` (R8: the same code the fleet runs, degenerate at N=1). Verb
-//! and daemon-lifecycle behaviour is unchanged at N=1.
-//!
-//! The per-object routing view (`crate::routing`) is composed in: [`track_object`](FleetNode::track_object)
-//! records what this node holds, and [`observe`](FleetNode::observe) folds a death into a takeover,
-//! returning the objects that fall to this node ([`Observed::takeovers`]). [`sync_membership`] bridges a
-//! detector's converged SWIM view into the runtime — the piece the live probe loop calls each round.
-//!
-//! Deliberately **not** here yet, and owed as the next pieces, each at a real boundary:
-//!
-//! - the live probe/gossip *loop* itself — running the [`crate::detector`] over the transport on a timer,
-//!   calling [`sync_membership`] each round, and driving each returned takeover's phase-one recovery and
-//!   serve; and the async register lifecycle (commit a head on write) driven from it;
-//! - propagating a control-shard membership change to the worker shards' configurations (at N=1 there
-//!   are none, so each shard's solo `FleetNode` agrees; a fleet's control shard `observe`s and the new
-//!   configuration must reach the shards that place objects).
-//!
-//! Those are transport- and server-layer pieces; this authority core is confirmable on its own.
+//! **Driven live by the daemon** (`slates-server`): each shard's `ShardState` holds a `FleetNode`; the
+//! control-shard record-plane coordinator drives the council over the transport and installs its committed
+//! configuration into the `FleetNode` each period, so every `place`/`region_placed`/`await_placed`/`host_epoch`
+//! the verbs read comes from what the council agreed. At `f = 0` the solo council self-leads and its formed
+//! region is authoritative at once — the same code the fleet runs, degenerate at N=1 (R8).
+
+use std::collections::BTreeMap;
 
 use slates_db::register::{
-  Acceptor, Authority, Configuration, DomainId, HostId, ObjectId, Quorum, Record,
+  Acceptor, Authority, Configuration, HostId, ObjectId, Quorum, Record, RegionalConfiguration,
 };
 use slates_transport::endpoint::Endpoint;
 
-use crate::config_group::{ConfigGroup, Reconfiguration};
 use crate::membership::{Liveness, MemberState, Membership};
 use crate::routing::{Reassignment, Routing};
 use crate::{CommitBudget, Committed, commit_under_configuration};
 
-/// What folding a membership event in produced (`FleetNode::observe`): whether the configuration
-/// changed, and the objects this node must now take over (a dead owner's objects that fell to it).
-#[derive(Debug, Default)]
-pub struct Observed {
-  /// Whether the configuration version advanced (a member joined or was retired).
-  pub config_changed: bool,
-  /// The objects the event handed this node — a dead owner's objects it backed that rendezvous now
-  /// ranks first to it. Each needs phase-one recovery of the dead owner's head, then serving.
-  pub takeovers: Vec<Reassignment>,
-}
-
-/// The owner runtime on one node: the SWIM view, the configuration authority, and the owner's own
-/// register acceptor, composed and kept in step. Built at a fault tolerance (`f = 0` is the laptop);
-/// [`observe`](FleetNode::observe) folds a membership event into the configuration and the acceptor's
-/// authority; [`configuration`](FleetNode::configuration) and [`owner_acceptor`](FleetNode::owner_acceptor)
-/// are what the async register drivers consume.
+/// The owner runtime on one node: the SWIM view, this node's **current configuration** (the view the
+/// configuration council has agreed on and this node placed under), and the owner's own register acceptor,
+/// composed and kept in step. The configuration is no longer reconciled here — the regional council
+/// ([`crate::config_group::RegionalCouncil`], one per region, D-14) is the authority; this node
+/// **installs** the committed configuration the council produces ([`install_configuration`](FleetNode::install_configuration))
+/// and reads it per request ([`configuration`](FleetNode::configuration)). [`observe`](FleetNode::observe)
+/// folds a SWIM membership event into the view (the leader reconciles the council from it); the async
+/// register drivers consume [`configuration`](FleetNode::configuration) and
+/// [`owner_acceptor`](FleetNode::owner_acceptor). At `f = 0` the council is the sole voter and the installed
+/// configuration is the formed laptop region — the same code path a fleet runs (R8).
 pub struct FleetNode {
   host: HostId,
   membership: Membership,
-  group: ConfigGroup,
+  configuration: Configuration,
+  /// The region's members as of the last installed configuration — the whole region, not this node's
+  /// neighbourhood. A takeover triggers on a member **leaving the region** (a retirement/death), read by
+  /// diffing this against the newly installed configuration's members; a host merely re-ranked out of this
+  /// owner's bounded neighbourhood (which can happen once the scatter width exceeds the member count) is
+  /// still alive and is **not** taken over.
+  members: Vec<HostId>,
   acceptor: Acceptor,
   routing: Routing,
 }
@@ -94,16 +83,33 @@ impl FleetNode {
         },
       );
     }
-    let mut group = ConfigGroup::new(host, quorum);
-    group.reconcile(&membership);
-    let acceptor = Acceptor::new(host, Self::authority(group.configuration()));
+    let mut members = vec![host];
+    members.extend_from_slice(peers);
+    members.sort_unstable_by_key(|host| host.0);
+    members.dedup();
+    let configuration = Self::owner_view(host, quorum, &members);
+    let acceptor = Acceptor::new(host, Self::authority(&configuration));
     FleetNode {
       host,
       membership,
-      group,
+      configuration,
+      members,
       acceptor,
       routing: Routing::new(host),
     }
+  }
+
+  /// The owner's view of the region `members` at `quorum`, each neighbourhood bounded to the candidate floor
+  /// `2f+1` (the lowest-loss default the council raises once a deployment sizes its recovery) — the initial
+  /// configuration this node places under before the council commits anything. The daemon installs the
+  /// council's committed configuration over this at boot
+  /// ([`install_configuration`](FleetNode::install_configuration)); a standalone node (a laptop, a test)
+  /// keeps it — the `f = 0` degenerate is the region `{host}` alone.
+  fn owner_view(host: HostId, quorum: Quorum, members: &[HostId]) -> Configuration {
+    let scatter = u64::try_from(quorum.candidates()).unwrap_or(u64::MAX);
+    RegionalConfiguration::formed(members.to_vec(), quorum, BTreeMap::new(), scatter, false)
+      .configuration_for(host)
+      .unwrap_or_else(|| Configuration::solo(host))
   }
 
   /// The laptop node — one member, one voter, `f = 0`, the owner's local hold the commit. The `f = 0`
@@ -117,32 +123,53 @@ impl FleetNode {
     self.host
   }
 
-  /// Installs the fleet's failure-domain map into the configuration group (§4.8, D-14) — see
-  /// [`ConfigGroup::set_domains`]. The daemon calls this at boot with the map the deployment manifest
-  /// declares; a laptop or an undeclared deployment leaves it empty (unique-per-host).
-  pub fn set_domains(&mut self, domains: std::collections::BTreeMap<HostId, DomainId>) {
-    self.group.set_domains(domains);
-  }
-
-  /// Sets the scatter width the neighbourhood is bounded to (§4.8 "Placement", D-14) and re-reconciles, so
-  /// the bounded neighbourhood — and, if it changed, the acceptor's authority — reflects the new width at
-  /// once. The daemon calls this at boot with the derived scatter width (from its data budget, stated
-  /// re-replication bandwidth and the recovery budget); a wider width grows the neighbourhood up to the
-  /// alive set, the candidate floor keeps it one copyset.
-  pub fn set_scatter(&mut self, scatter: u64) {
-    self.group.set_scatter(scatter);
-    if self.group.reconcile(&self.membership) {
-      let authority = Self::authority(self.group.configuration());
-      let _ = self.acceptor.install_authority(authority);
-    }
+  /// Installs the configuration the regional council has committed for this owner, given the region's
+  /// `members` it was derived from (§4.8, D-14 — the council is the authority; this node places under the
+  /// configuration it agreed). Sets it as this node's current configuration, brings the owner's acceptor
+  /// authority into step (the generation is the configuration's version, so the owner writes its next records
+  /// under the current generation, which a holder on the new configuration requires), and returns the objects
+  /// this node must now **take over**: for every owner that **left the region** since the previously
+  /// installed configuration — a retirement or death, *not* a mere neighbourhood re-ranking (which leaves a
+  /// live host still serving its objects) — the departed owner's objects this node holds that now rendezvous
+  /// first to it over the new neighbourhood (`routing.take_over`, which reassigns them in the routing view).
+  /// Idempotent — re-installing an unchanged membership retires no one and returns nothing, so the daemon may
+  /// call it every period.
+  pub fn install_configuration(
+    &mut self,
+    configuration: Configuration,
+    members: &[HostId],
+  ) -> Vec<Reassignment> {
+    let retired: Vec<HostId> = self
+      .members
+      .iter()
+      .copied()
+      .filter(|member| !members.contains(member))
+      .collect();
+    let takeovers: Vec<Reassignment> = retired
+      .iter()
+      .flat_map(|dead| {
+        self.routing.take_over(
+          *dead,
+          &configuration.neighbourhood,
+          &configuration.domains,
+          configuration.quorum,
+        )
+      })
+      .collect();
+    self.members = members.to_vec();
+    self.configuration = configuration;
+    let _ = self
+      .acceptor
+      .install_authority(Self::authority(&self.configuration));
+    takeovers
   }
 
   /// The current configuration (the authority the async register drivers carry): the owner, the host
-  /// epoch, the neighbourhood the candidates are drawn from, the quorum, and the version a request
-  /// carries. Read per request; written only through the membership events [`observe`](FleetNode::observe)
-  /// folds in.
+  /// epoch, the neighbourhood the candidates are drawn from, the quorum, and the version a request carries.
+  /// Read per request; written only by [`install_configuration`](FleetNode::install_configuration) when the
+  /// council commits a change.
   pub fn configuration(&self) -> &Configuration {
-    self.group.configuration()
+    &self.configuration
   }
 
   /// The SWIM membership view — the alive set the neighbourhood tracks, and the state the live probe
@@ -184,62 +211,18 @@ impl FleetNode {
     }
   }
 
-  /// Folds a gossiped membership `update` about `subject` into the runtime (§4.8 "membership fed by
-  /// SWIM"): applies it to the view, and if the view changed, reconciles the configuration's
-  /// neighbourhood to the new alive set (admitting a fresh member, retiring a dead one). When the
-  /// configuration version advances, the owner's own acceptor adopts the new authority — so the owner
-  /// writes its next records under the current version, which a holder that installed the new
-  /// configuration requires. And when the update is a *death*, the routing view reassigns the dead
-  /// host's objects this node backs, so the ones that rendezvous now ranks first to this node are
-  /// returned as takeovers to drive. Returns both effects in an [`Observed`].
-  ///
-  /// At `f = 0` there are no peers to hear about, so `observe` is only ever a self-refutation (a no-op
-  /// for the neighbourhood, and this node backs no peer's object) — the same code path, exercised
-  /// trivially, that a fleet drives with real peers. It never removes this host (the owner is never
-  /// retired), so the runtime always has an owner.
-  pub fn observe(&mut self, subject: HostId, update: MemberState) -> Observed {
-    if self.membership.apply(subject, update).is_none() {
-      return Observed::default();
-    }
-    let config_changed = self.group.reconcile(&self.membership);
-    if config_changed {
-      // The version moved; keep the owner's acceptor authority in step (install_authority accepts an
-      // equal-or-higher generation, so a monotonically advancing version is always adopted, keeping the
-      // owner writing under the current generation). The owner is unchanged, so this never fences the
-      // owner's own committed records — it raises the generation future records are written under.
-      let authority = Self::authority(self.group.configuration());
-      let _ = self.acceptor.install_authority(authority);
-    }
-    // A death reassigns the dead host's objects this node holds a copy of. The reconciled neighbourhood
-    // is exactly the survivors, so the routing view ranks each dead-owned object over them and hands
-    // this node the ones it wins (the rest go to other survivors, recorded but not returned).
-    let takeovers = if update.liveness == Liveness::Dead {
-      let quorum = self.group.configuration().quorum;
-      self.routing.take_over(
-        subject,
-        &self.group.configuration().neighbourhood,
-        &self.group.configuration().domains,
-        quorum,
-      )
-    } else {
-      Vec::new()
-    };
-    Observed {
-      config_changed,
-      takeovers,
-    }
-  }
-
-  /// Reconfigures the neighbourhood directly (an operator admit/retire, not a SWIM-driven change),
-  /// keeping the owner's acceptor authority in step exactly as [`observe`](FleetNode::observe) does.
-  /// Returns whether the configuration changed.
-  pub fn reconfigure(&mut self, change: Reconfiguration) -> bool {
-    let changed = self.group.reconfigure(change);
-    if changed {
-      let authority = Self::authority(self.group.configuration());
-      let _ = self.acceptor.install_authority(authority);
-    }
-    changed
+  /// Folds a gossiped membership `update` about `subject` into the SWIM view (§4.8 "membership fed by
+  /// SWIM"), returning whether the view changed. The configuration is **not** reconciled here — the regional
+  /// council is the authority (D-14, one configuration group per region): the council leader reconciles the
+  /// region from this view ([`RegionalCouncil::reconcile_alive`](crate::config_group::RegionalCouncil::reconcile_alive))
+  /// and every node installs the committed result ([`install_configuration`](FleetNode::install_configuration)),
+  /// which is also where a departed owner's objects are taken over. So `observe` only advances the failure
+  /// view the leader reconciles from; a non-leader's view still feeds the leader (SWIM disseminates it) and
+  /// the leader's committed configuration comes back to it. At `f = 0` the sole-voter council is its own
+  /// leader, so the view still drives the configuration through the same path (R8). It never removes this
+  /// host — the owner is never retired.
+  pub fn observe(&mut self, subject: HostId, update: MemberState) -> bool {
+    self.membership.apply(subject, update).is_some()
   }
 
   /// Commits one of this node's own heads through the register path under the current authority — the
@@ -250,8 +233,8 @@ impl FleetNode {
   /// dispatch, driven against *this* node's configuration and acceptor so authority and dispatch cannot
   /// diverge. At `f = 0` the local hold is the commit, no dispatch, the same code path (R8).
   ///
-  /// This borrows the configuration (`&self.group`) and the acceptor (`&mut self.acceptor`) — disjoint
-  /// fields — so no clone is needed on the write path; the configuration is read, not copied, per
+  /// This borrows the configuration (`&self.configuration`) and the acceptor (`&mut self.acceptor`) —
+  /// disjoint fields — so no clone is needed on the write path; the configuration is read, not copied, per
   /// commit. The caller supplies the connected candidate holders (the live probe/gossip loop that keeps
   /// them connected is owed) and the derived budget.
   pub async fn commit_head(
@@ -261,7 +244,7 @@ impl FleetNode {
     budget: CommitBudget,
   ) -> Committed {
     commit_under_configuration(
-      self.group.configuration(),
+      &self.configuration,
       record,
       &mut self.acceptor,
       remote_holders,
@@ -271,44 +254,32 @@ impl FleetNode {
   }
 }
 
-/// Folds a SWIM `view` (a [`crate::detector::Detector`]'s converged membership) into `fleet` — the
-/// bridge the live probe/gossip loop calls after each round to carry the detector's view into the owner
-/// runtime (§4.8 "membership fed by SWIM"). A host the fleet's neighbourhood holds that the view now
-/// believes **dead** is folded in as a death (retiring it and handing this node the objects that fall to
-/// it); a host the view believes **alive** that the fleet does not yet hold has joined. A *suspect* is
-/// left untouched — it is still a member until a confirmed death, so only a death retires it. Returns
-/// the takeovers the deaths produced. Idempotent: a view already matching the fleet is a no-op, so the
-/// loop can call it every round.
-pub fn sync_membership(view: &Membership, fleet: &mut FleetNode) -> Vec<Reassignment> {
-  let mut takeovers = Vec::new();
-  // Deaths first: fold each confirmed-dead member the fleet still holds, which retires it and may hand
-  // this node its objects. The neighbourhood is cloned because `observe` mutates the fleet.
-  let neighbourhood: Vec<HostId> = fleet.configuration().neighbourhood.clone();
-  for host in neighbourhood {
-    if host == fleet.host() {
-      continue;
-    }
-    if let Some(state) = view.state(host)
+/// Folds a SWIM `view` (a [`crate::detector::Detector`]'s converged membership) into `fleet`'s membership —
+/// the bridge the probe loop calls after each round to carry the detector's view into the owner runtime
+/// (§4.8 "membership fed by SWIM"). A host this node currently believes **alive** that the view now believes
+/// **dead** is folded as a death; every host the view believes **alive** is folded (a join or refutation); a
+/// *suspect* is left untouched (still a member until a confirmed death). Returns whether the membership
+/// changed. The configuration is the council's (D-14), so this only advances the failure view the council
+/// leader reconciles from — a death's takeovers come from [`install_configuration`](FleetNode::install_configuration)
+/// once the council commits the retirement. Idempotent: a view already matching is a no-op.
+pub fn sync_membership(view: &Membership, fleet: &mut FleetNode) -> bool {
+  let mut changed = false;
+  // Deaths: a host this node believes alive that the view now confirms dead.
+  for host in fleet.membership().alive() {
+    if host != fleet.host()
+      && let Some(state) = view.state(host)
       && state.liveness == Liveness::Dead
     {
-      takeovers.extend(fleet.observe(host, state).takeovers);
+      changed |= fleet.observe(host, state);
     }
   }
-  // Joins: a host the view believes alive that the fleet's neighbourhood does not yet hold.
-  let known: std::collections::BTreeSet<HostId> = fleet
-    .configuration()
-    .neighbourhood
-    .iter()
-    .copied()
-    .collect();
+  // Joins and refutations: every host the view believes alive.
   for host in view.alive() {
-    if !known.contains(&host)
-      && let Some(state) = view.state(host)
-    {
-      fleet.observe(host, state);
+    if let Some(state) = view.state(host) {
+      changed |= fleet.observe(host, state);
     }
   }
-  takeovers
+  changed
 }
 
 /// Folds only `peer`'s liveness from `view` into `fleet` — the same alive-joins-it, dead-retires-it,
@@ -317,34 +288,30 @@ pub fn sync_membership(view: &Membership, fleet: &mut FleetNode) -> Vec<Reassign
 /// gossip carries the *other* peers' states too (SWIM disseminates the whole view), so if each detector
 /// folded the whole view with `sync_membership`, one detector would re-join a peer another has just retired
 /// — the two would flap it until every detector independently converged. Scoping the fold to the detector's
-/// own peer removes that coupling: each peer is joined and retired by its own detector alone. Returns the
-/// takeovers a death produced (empty otherwise).
-pub fn sync_peer(view: &Membership, fleet: &mut FleetNode, peer: HostId) -> Vec<Reassignment> {
+/// own peer removes that coupling: each peer is joined and retired by its own detector alone. Returns
+/// whether the membership changed (the takeovers a death produces come from
+/// [`install_configuration`](FleetNode::install_configuration) once the council commits the retirement).
+pub fn sync_peer(view: &Membership, fleet: &mut FleetNode, peer: HostId) -> bool {
   apply_peer_state(fleet, peer, view.state(peer))
 }
 
-/// Folds one peer's believed `state` into `fleet` — the step [`sync_peer`] takes for the view it reads it
-/// from, exposed so a node's other shards apply the **same** state to their own `FleetNode`s (every shard
-/// is an owner with its own copy of the configuration, D-7; the control shard, which alone probes, hands
-/// each the state it folded, so all copies advance identically and deterministically). A confirmed death
-/// retires the peer and returns the objects this node takes over; an alive peer is folded in (idempotent);
-/// a suspect, or a peer not yet seen, leaves the view untouched — a suspect is still a member until a
-/// confirmed death.
-pub fn apply_peer_state(
-  fleet: &mut FleetNode,
-  peer: HostId,
-  state: Option<MemberState>,
-) -> Vec<Reassignment> {
+/// Folds one peer's believed `state` into `fleet`'s membership — the step [`sync_peer`] takes for the view
+/// it reads it from, exposed so a node's other shards apply the **same** state to their own `FleetNode`s
+/// (every shard is an owner with its own membership view, D-7; the control shard, which alone probes, hands
+/// each the state it folded, so all views advance identically and deterministically). A confirmed death and
+/// an alive peer are both folded (idempotent); a suspect, or a peer not yet seen, leaves the view untouched
+/// (a suspect is still a member until a confirmed death). Returns whether the membership changed — the
+/// takeovers a death produces come from [`install_configuration`](FleetNode::install_configuration) once the
+/// council commits the retirement.
+pub fn apply_peer_state(fleet: &mut FleetNode, peer: HostId, state: Option<MemberState>) -> bool {
   if peer == fleet.host() {
-    return Vec::new();
+    return false;
   }
   match state {
-    Some(state) if state.liveness == Liveness::Dead => fleet.observe(peer, state).takeovers,
-    Some(state) if state.liveness == Liveness::Alive => {
-      fleet.observe(peer, state);
-      Vec::new()
+    Some(state) if state.liveness == Liveness::Dead || state.liveness == Liveness::Alive => {
+      fleet.observe(peer, state)
     }
-    _ => Vec::new(),
+    _ => false,
   }
 }
 
@@ -397,24 +364,53 @@ mod tests {
     !placement.acked.is_empty()
   }
 
-  /// The invariants the owner runtime holds at *every* scale (checked identically at N=1 and in a
-  /// fleet — the R8 differential): the owner is a live member; the neighbourhood is exactly the alive
-  /// set; and the owner's acceptor authorizes a head under the configuration's current version (its
-  /// authority is in step) but refuses one under a stale generation.
+  /// A test-only configuration for `owner` over `members` at `quorum`, each neighbourhood bounded to the
+  /// candidate floor — the shape [`FleetNode::install_configuration`] receives from the council.
+  fn config(owner: HostId, members: &[HostId], quorum: Quorum) -> Configuration {
+    let scatter = u64::try_from(quorum.candidates()).unwrap_or(u64::MAX);
+    RegionalConfiguration::formed(
+      members.to_vec(),
+      quorum,
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    )
+    .configuration_for(owner)
+    .unwrap_or_else(|| Configuration::solo(owner))
+  }
+
+  /// Installs a council configuration built from `members` at `quorum` into `node` (deriving its owner view
+  /// and passing the region members), returning the takeovers — the shape the daemon's council sync gives.
+  fn install(node: &mut FleetNode, members: &[HostId], quorum: Quorum) -> Vec<Reassignment> {
+    let configuration = config(node.host(), members, quorum);
+    node.install_configuration(configuration, members)
+  }
+
+  /// Installs `regional`'s view for `node`'s owner (used where the version must advance through real
+  /// admits/retires on the regional configuration), returning the takeovers.
+  fn install_regional(node: &mut FleetNode, regional: &RegionalConfiguration) -> Vec<Reassignment> {
+    let owner = node.host();
+    let configuration = regional
+      .configuration_for(owner)
+      .unwrap_or_else(|| Configuration::solo(owner));
+    node.install_configuration(configuration, &regional.members)
+  }
+
+  /// The invariants the owner runtime holds at *every* scale (checked identically at N=1 and in a fleet —
+  /// the R8 differential): the owner is in its own neighbourhood, and its acceptor authorizes a head under
+  /// the configuration's current version (its authority is in step with the installed configuration) but
+  /// refuses one under a stale generation. The neighbourhood tracking the alive set is now the council's
+  /// property (it reconciles the region from the membership and every node installs the result), proven in
+  /// `config_group.rs`; here the runtime's own invariant is that it places and fences under whatever
+  /// configuration it has installed.
   fn assert_runtime_invariants(node: &mut FleetNode) {
     let owner = node.configuration().owner;
     let version = node.configuration().version;
     let neighbourhood = node.configuration().neighbourhood.clone();
-    let alive = node.membership().alive();
 
-    assert!(alive.contains(&owner), "the owner is a live member");
-    let mut sorted_neighbourhood = neighbourhood.clone();
-    sorted_neighbourhood.sort_by_key(|h| h.0);
-    let mut sorted_alive = alive.clone();
-    sorted_alive.sort_by_key(|h| h.0);
-    assert_eq!(
-      sorted_neighbourhood, sorted_alive,
-      "the neighbourhood is exactly the alive set"
+    assert!(
+      neighbourhood.contains(&owner),
+      "the owner is in its own neighbourhood"
     );
     assert!(
       owner_accepts_under(node, version),
@@ -469,46 +465,64 @@ mod tests {
     assert_runtime_invariants(&mut node);
   }
 
-  /// AC (§4.8): the runtime folds a SWIM view into the configuration — a fresh alive member grows the
-  /// neighbourhood and advances the version; a death retires it; and the owner's acceptor authority
-  /// stays in step across each change (checked by the invariants after every step).
+  /// AC (§4.8, D-14): the runtime installs the configuration the council commits — a member the council
+  /// admitted appears in the neighbourhood at the committed version, one it retired is gone, and the owner's
+  /// acceptor authority stays in step across each install (checked by the invariants). The council decides
+  /// the configuration (proven in `config_group.rs`); the runtime places and fences under what it installs.
   #[test]
-  fn the_runtime_tracks_the_swim_view_and_keeps_authority_in_step() {
+  fn installing_a_configuration_updates_placement_and_keeps_authority_in_step() {
     let mut node = FleetNode::new(SELF, Quorum { f: 1 }, &[]);
     assert_runtime_invariants(&mut node);
-    let v0 = node.configuration().version;
 
-    // A joins: the neighbourhood grows, the version advances, the authority stays in step.
-    assert!(
-      node.observe(A, alive(0)).config_changed,
-      "a fresh member changes the config"
+    // The council reaches a configuration by admitting A then B (two committed changes advance the version).
+    let mut regional = RegionalConfiguration::formed(
+      vec![SELF],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
     );
+    regional.admit(A, 3);
+    regional.admit(B, 3);
+    install_regional(&mut node, &regional);
     assert!(node.configuration().neighbourhood.contains(&A));
-    assert!(node.configuration().version > v0, "the version advanced");
+    assert!(node.configuration().neighbourhood.contains(&B));
+    assert!(
+      node.configuration().version > 0,
+      "each committed admit advanced the version"
+    );
     assert_runtime_invariants(&mut node);
 
-    // B joins likewise.
-    assert!(node.observe(B, alive(0)).config_changed);
-    assert_runtime_invariants(&mut node);
-    let with_both = node.configuration().version;
-
-    // A stale re-assertion of A (lower/equal incarnation, already alive) changes nothing.
-    assert!(
-      !node.observe(A, alive(0)).config_changed,
-      "a stale update is a no-op"
-    );
-    assert_eq!(node.configuration().version, with_both, "no version churn");
-
-    // A dies: it is retired from the neighbourhood, the version advances, the authority stays in step.
-    assert!(
-      node.observe(A, dead(1)).config_changed,
-      "a death changes the config"
-    );
+    // The council retires A: install the new configuration. A is gone; the version advanced; the owner's
+    // acceptor authority stays in step (the invariants check it authorizes the new version and refuses the old).
+    regional.retire(A, 3);
+    install_regional(&mut node, &regional);
     assert!(
       !node.configuration().neighbourhood.contains(&A),
-      "the dead member is retired"
+      "the retired member is gone from the neighbourhood"
     );
     assert_runtime_invariants(&mut node);
+  }
+
+  /// `observe` advances only the SWIM view (the council leader reconciles the configuration from it); it
+  /// does not itself change the configuration — a fresh member is seen alive, a death seen dead.
+  #[test]
+  fn observe_advances_the_membership_view() {
+    let mut node = FleetNode::new(SELF, Quorum { f: 1 }, &[]);
+    assert!(node.observe(A, alive(0)), "a fresh member changes the view");
+    assert_eq!(
+      node.membership().state(A).map(|s| s.liveness),
+      Some(Liveness::Alive)
+    );
+    assert!(
+      !node.observe(A, alive(0)),
+      "a stale re-assertion changes nothing"
+    );
+    assert!(node.observe(A, dead(1)), "a death changes the view");
+    assert_eq!(
+      node.membership().state(A).map(|s| s.liveness),
+      Some(Liveness::Dead)
+    );
   }
 
   /// AC (R8, the named differential): the owner runtime has identical observable semantics at N=1 and
@@ -517,29 +531,26 @@ mod tests {
   /// only a different N in one formula family.
   #[test]
   fn the_owner_runtime_has_identical_semantics_at_n1_and_in_a_fleet() {
-    // N=1: the laptop. No peers ever arrive; the invariants hold throughout.
+    // N=1: the laptop. Its solo council's formed configuration is the region {SELF}; the invariants hold.
     let mut laptop = FleetNode::solo(SELF);
-    assert_runtime_invariants(&mut laptop);
-    // The only membership event possible at N=1 is about the local node; it never changes the
-    // neighbourhood (self is never retired), and the invariants still hold.
-    laptop.observe(SELF, alive(1));
     assert_runtime_invariants(&mut laptop);
     assert_eq!(laptop.configuration().neighbourhood, vec![SELF]);
 
-    // Fleet: the same runtime with two peers. The invariants hold at construction and after each
-    // membership event — the identical assertions the laptop passed.
+    // Fleet: the same runtime, installing the council's configurations. The invariants hold after each
+    // install — the identical assertions the laptop passed, the same `install_configuration` code path.
     let mut fleet = FleetNode::new(SELF, Quorum { f: 1 }, &[A, B]);
     assert_runtime_invariants(&mut fleet);
-    fleet.observe(A, dead(1));
+    // The council retires A, then B (deaths committed): install each committed configuration.
+    install(&mut fleet, &[SELF, B], Quorum { f: 1 });
     assert_runtime_invariants(&mut fleet);
-    fleet.observe(B, dead(1));
+    install(&mut fleet, &[SELF], Quorum { f: 1 });
     assert_runtime_invariants(&mut fleet);
-    // Every peer gone, the fleet has degenerated to exactly the laptop's observable configuration:
-    // one member, itself the owner — reached by the same code, no mode switch.
+    // Every peer gone, the fleet has degenerated to exactly the laptop's observable configuration: one
+    // member, itself the owner — reached by the same code, no mode switch.
     assert_eq!(
       fleet.configuration().neighbourhood,
       vec![SELF],
-      "with every peer dead the fleet configuration equals the laptop's"
+      "with every peer retired the fleet configuration equals the laptop's"
     );
     assert_eq!(fleet.configuration().owner, laptop.configuration().owner);
   }
@@ -601,144 +612,129 @@ mod tests {
     }
   }
 
-  /// AC (§4.8 takeover, driven by membership): when a peer this node backs dies, `observe` reassigns
-  /// the peer's objects and returns the ones that fall to this node — the same rendezvous computation
-  /// the routing view runs, folded in from the death event. Non-vacuous: this node takes some of the
-  /// dead peer's objects and the other survivor takes the rest.
+  /// AC (§4.8 takeover, driven by the council's configuration): when the council retires an owner this node
+  /// backs, installing the new configuration reassigns the retired owner's objects and returns the ones that
+  /// fall to this node — the rendezvous computation the routing view runs over the new neighbourhood.
+  /// Non-vacuous: this node takes some of the retired owner's objects and the other survivor takes the rest.
   #[test]
-  fn a_peer_death_hands_this_node_the_objects_that_fall_to_it() {
+  fn installing_a_retirement_hands_this_node_the_objects_that_fall_to_it() {
     let mut node = FleetNode::new(SELF, Quorum { f: 1 }, &[A, B]);
+    install(&mut node, &[SELF, A, B], Quorum { f: 1 });
     // This node holds a copy of many of A's objects (it backs them as a candidate).
     let a_objects: Vec<ObjectId> = (0..64u64).map(|i| ObjectId::new(A, i)).collect();
     for &object in &a_objects {
       node.track_object(object, A);
     }
 
-    let observed = node.observe(A, dead(1));
-    assert!(
-      observed.config_changed,
-      "A's death retired it from the neighbourhood, advancing the config"
-    );
-    // Every returned takeover is one of A's objects, now owned by this node.
-    for reassignment in &observed.takeovers {
+    // The council retires A: install the configuration without it. The install hands back A's objects that
+    // now rendezvous first to this node.
+    let takeovers = install(&mut node, &[SELF, B], Quorum { f: 1 });
+    for reassignment in &takeovers {
       assert_eq!(reassignment.new_owner, SELF);
       assert_eq!(node.object_owner(reassignment.object), Some(SELF));
       assert!(a_objects.contains(&reassignment.object));
     }
     // Non-vacuity: this node took some but not all — the other survivor (B) took the rest.
     assert!(
-      !observed.takeovers.is_empty(),
+      !takeovers.is_empty(),
       "this node took over some of A's objects"
     );
     assert!(
-      observed.takeovers.len() < a_objects.len(),
+      takeovers.len() < a_objects.len(),
       "the other survivor took the rest (a real split)"
     );
   }
 
-  /// The R8 degenerate of takeover: at `f = 0` (the laptop) this node backs no peer's object, so a
-  /// membership event yields no takeover — the same code path a fleet drives, exercised trivially.
+  /// The R8 degenerate of takeover: at `f = 0` (the laptop) this node backs no peer's object, so installing
+  /// its (unchanged) configuration yields no takeover — the same code path a fleet drives, exercised trivially.
   #[test]
   fn the_solo_runtime_takes_over_nothing() {
     let mut node = FleetNode::solo(SELF);
     node.track_object(ObjectId::new(SELF, 0), SELF);
-    let observed = node.observe(SELF, alive(1));
+    let takeovers = install(&mut node, &[SELF], Quorum { f: 0 });
     assert!(
-      observed.takeovers.is_empty(),
-      "the laptop takes over nothing (it backs no peer's object)"
+      takeovers.is_empty(),
+      "the laptop takes over nothing (it backs no peer's object, and no owner departed)"
     );
   }
 
   /// AC (§4.8, the probe-loop bridge): `sync_membership` folds a detector's converged SWIM view into the
-  /// owner runtime — a member the view believes dead is retired and its backed objects taken over, a
-  /// member the view believes alive is admitted — the same effects `observe` gives, driven from the view.
-  /// It is idempotent, so the live loop can call it every round.
+  /// owner runtime's **membership** — a member the view believes dead is folded dead, one it believes alive
+  /// is folded alive — the failure view the council leader reconciles the configuration from. It returns
+  /// whether the view changed and is idempotent, so the live loop can call it every round.
   #[test]
   fn sync_membership_folds_deaths_and_joins_from_the_view() {
     let mut fleet = FleetNode::new(SELF, Quorum { f: 1 }, &[A]);
-    let a_objects: Vec<ObjectId> = (0..32u64).map(|i| ObjectId::new(A, i)).collect();
-    for &object in &a_objects {
-      fleet.track_object(object, A);
-    }
     // The SWIM view: A has died (a later incarnation overrides its alive record), and B has joined.
     let mut view = Membership::new(SELF);
     view.apply(A, alive(0));
     view.apply(A, dead(1));
     view.apply(B, alive(0));
 
-    let takeovers = sync_membership(&view, &mut fleet);
-
     assert!(
-      !fleet.configuration().neighbourhood.contains(&A),
-      "the dead member A is retired"
+      sync_membership(&view, &mut fleet),
+      "the view's death and join change the membership"
     );
-    assert!(
-      fleet.configuration().neighbourhood.contains(&B),
-      "the alive member B is admitted"
+    assert_eq!(
+      fleet.membership().state(A).map(|s| s.liveness),
+      Some(Liveness::Dead),
+      "the dead member A is folded dead"
     );
-    assert!(!takeovers.is_empty(), "this node took over A's objects");
-    for reassignment in &takeovers {
-      assert_eq!(reassignment.new_owner, SELF);
-      assert_eq!(fleet.object_owner(reassignment.object), Some(SELF));
-    }
+    assert_eq!(
+      fleet.membership().state(B).map(|s| s.liveness),
+      Some(Liveness::Alive),
+      "the alive member B is folded alive"
+    );
 
-    // Idempotent: syncing the same view again retires nothing and takes over nothing.
+    // Idempotent: syncing the same view again changes nothing.
     assert!(
-      sync_membership(&view, &mut fleet).is_empty(),
+      !sync_membership(&view, &mut fleet),
       "a second sync of the same view is a no-op"
     );
   }
 
-  /// `sync_peer` folds only the peer it names: retiring it on its death (taking over its objects) or
-  /// keeping it a member while alive — and never touching another peer, even one the view's gossip
-  /// carries. This is what lets a node run one detector per peer: a peer this node has retired must not be
-  /// re-joined from another peer's detector, or the two would flap it (the coupling `sync_membership`'s
-  /// whole-view fold has, which `sync_peer` is built to avoid).
+  /// `sync_peer` folds only the peer it names into the membership — its own death or its being alive — and
+  /// never touches another peer, even one the view's gossip carries. This is what lets a node run one
+  /// detector per peer: a peer this node has folded dead must not be re-touched from another peer's
+  /// detector, or the two would flap it (the coupling `sync_membership`'s whole-view fold has, which
+  /// `sync_peer` is built to avoid).
   #[test]
   fn sync_peer_folds_only_the_peer_it_names() {
     let mut fleet = FleetNode::new(SELF, Quorum { f: 1 }, &[A, B]);
-    let a_objects: Vec<ObjectId> = (0..8u64).map(|i| ObjectId::new(A, i)).collect();
-    for &object in &a_objects {
-      fleet.track_object(object, A);
-    }
 
     // A's own detector has seen A die; its gossip still carries B alive (a per-peer detector disseminates
-    // the whole view). Folding it *scoped to A* retires A and hands this node A's objects — B is untouched.
+    // the whole view). Folding it *scoped to A* folds A dead — B is untouched by A's fold.
     let mut a_view = Membership::new(SELF);
     a_view.apply(A, alive(0));
     a_view.apply(A, dead(1));
     a_view.apply(B, alive(0));
-    let takeovers = sync_peer(&a_view, &mut fleet, A);
     assert!(
-      !fleet.configuration().neighbourhood.contains(&A),
-      "A is retired by its own detector"
+      sync_peer(&a_view, &mut fleet, A),
+      "A's own detector folds A dead"
     );
-    assert!(
-      fleet.configuration().neighbourhood.contains(&B),
-      "B is untouched by A's fold"
+    assert_eq!(
+      fleet.membership().state(A).map(|s| s.liveness),
+      Some(Liveness::Dead),
+      "A is folded dead by its own detector"
     );
-    assert!(!takeovers.is_empty(), "this node took over A's objects");
 
-    // B's detector still believes A alive (stale gossip about the peer this node just retired). Folding it
-    // *scoped to B* must NOT re-join A — the flap the per-peer detectors would suffer under a whole-view
+    // B's detector still carries A (stale gossip about the peer this node just folded dead). Folding it
+    // *scoped to B* must NOT re-touch A — the flap the per-peer detectors would suffer under a whole-view
     // fold is exactly what this prevents.
     let mut b_view = Membership::new(SELF);
     b_view.apply(A, alive(0));
     b_view.apply(B, alive(0));
     let _ = sync_peer(&b_view, &mut fleet, B);
-    assert!(
-      !fleet.configuration().neighbourhood.contains(&A),
-      "A stays retired — B's detector never re-joins it"
-    );
-    assert!(
-      fleet.configuration().neighbourhood.contains(&B),
-      "B is still a member"
+    assert_eq!(
+      fleet.membership().state(A).map(|s| s.liveness),
+      Some(Liveness::Dead),
+      "A stays dead — B's detector never re-touches it"
     );
 
-    // Idempotent: a second fold of A's death is a no-op.
+    // Idempotent: a second fold of A's death changes nothing.
     assert!(
-      sync_peer(&a_view, &mut fleet, A).is_empty(),
-      "a second sync of A's death takes over nothing"
+      !sync_peer(&a_view, &mut fleet, A),
+      "a second fold of A's death is a no-op"
     );
   }
 }

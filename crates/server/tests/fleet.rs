@@ -674,11 +674,15 @@ fn a_council_commits_a_membership_retirement_over_the_transport() {
       let dead = hosts[victim];
       daemons.remove(victim).stop();
       // The surviving leader detects the death (SWIM), proposes the retire, and commits it over the
-      // transport; every survivor's regional membership then drops the dead member.
+      // transport; every survivor then drops the dead member from BOTH its committed regional membership
+      // (`council_members`) AND the neighbourhood it actually places under (`placement_neighbourhood`,
+      // installed from the council) — the authority switchover: the council's committed configuration is
+      // what placement reads, so the commit reaches the placement path, not just the council's own state.
       poll_until(COUNCIL_RETIRE_DEADLINE, || {
-        daemons
-          .iter()
-          .all(|daemon| !daemon.council_members().contains(&dead))
+        daemons.iter().all(|daemon| {
+          !daemon.council_members().contains(&dead)
+            && !daemon.placement_neighbourhood().contains(&dead)
+        })
       })
     }
     _ => false,
@@ -691,7 +695,8 @@ fn a_council_commits_a_membership_retirement_over_the_transport() {
   assert!(elected, "the council elected a leader before the kill");
   assert!(
     retired,
-    "the council committed the dead follower's retirement over the transport — every survivor's regional membership dropped it"
+    "the council committed the dead follower's retirement over the transport and it reached placement — \
+     every survivor dropped it from both its regional membership and its placement neighbourhood"
   );
 }
 

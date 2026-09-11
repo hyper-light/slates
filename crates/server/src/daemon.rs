@@ -428,6 +428,33 @@ impl Daemon {
       .unwrap_or_default()
   }
 
+  /// This daemon's **placement** neighbourhood (§4.8, D-14): the neighbourhood of the configuration the node
+  /// currently places under — the owner view it **installed from the council** (`FleetNode::configuration`),
+  /// the set the verbs draw candidates from. Distinct from [`council_members`](Daemon::council_members) (the
+  /// council's committed region) and [`fleet_members`](Daemon::fleet_members) (the SWIM alive set): this is
+  /// what the placement path actually reads, so a test can prove a council-committed change reaches
+  /// placement. A one-shot control-shard query, bounded by the liveness budget; empty if the daemon is
+  /// stopping, is not on a shard, or does not answer in time.
+  pub fn placement_neighbourhood(&self) -> Vec<slates_db::HostId> {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
+      return Vec::new();
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        let neighbourhood =
+          state::with_state(|s| s.fleet.configuration().neighbourhood.clone()).unwrap_or_default();
+        let _ = tx.send(neighbourhood);
+      })
+      .is_err()
+    {
+      return Vec::new();
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .unwrap_or_default()
+  }
+
   /// Test and operator support: folds a `Dead` belief about `peer` at `incarnation` into this node's
   /// membership on the control shard — the same effect its failure detector has when it ages a peer to
   /// death (§4.8). Exposed so **rejoin** can be driven deterministically: a real process kill cannot be
@@ -771,25 +798,13 @@ fn init_shard(
   // no peers)`, so it is the same code path a fleet runs (R8), not a branch in behaviour. The placement
   // authority the verbs read is `fleet.configuration()`; the live probe/gossip loop that folds
   // membership into it (and the cross-node commit) are the next fleet pieces.
-  let fleet = match &config.fleet {
-    Some(membership) => {
-      let mut node =
-        slates_cluster::fleet::FleetNode::new(host, membership.quorum, &membership.peers);
-      // Install the deployment's failure-domain map so placement forms copysets across distinct domains
-      // (D-14); hosts the manifest does not place stay unique-per-host.
-      node.set_domains(membership.domains.clone());
-      // Bound the neighbourhood to the derived scatter width — the candidate floor unless the deployment
-      // stated a re-replication bandwidth that recovery needs a wider neighbourhood to meet (§4.8, D-14).
-      node.set_scatter(config.derived_scatter(membership.quorum));
-      node
-    }
-    None => slates_cluster::fleet::FleetNode::solo(host),
-  };
-  // The regional configuration council (§4.8, D-14 — the "configuration master"): the multi-voter Raft the
-  // fleet-loop config plane drives over the transport to agree on the region's configuration. Its voters and
-  // members are the fleet (the small-council degenerate of a large fleet, R8); a laptop runs a solo council
-  // that self-leads (`f = 0`). The scatter each neighbourhood is bounded to is the same derived width the
-  // per-node placement uses, so the council's derived configuration matches what placement reads today.
+  // The regional configuration council (§4.8, D-14 — the "configuration master", one per region): the
+  // multi-voter Raft the fleet-loop config plane drives over the transport to agree on the region's
+  // configuration. Its voters and members are the fleet (the small-council degenerate of a large fleet, R8);
+  // a laptop runs a solo council that self-leads (`f = 0`). Each neighbourhood is bounded to the derived
+  // scatter width — the candidate floor unless the deployment stated a re-replication bandwidth recovery
+  // needs a wider one (§4.8, D-14) — and the failure-domain map places copysets across distinct domains
+  // (a host the manifest does not place stays unique-per-host).
   let council = match &config.fleet {
     Some(membership) => {
       let mut members = membership.peers.clone();
@@ -817,6 +832,22 @@ fn init_shard(
       )
     }
   };
+  // The owner runtime (§2.6 boot step 6, D-14): the SWIM view, this node's current configuration, and its
+  // register acceptor. The **council is the authority** (D-14, one configuration group per region), so the
+  // node installs the council's committed `configuration_for(this host)` over the bootstrap the constructor
+  // built — placement then reads what the council agreed. A laptop's solo council self-leads, so its formed
+  // configuration is authoritative at once (R8); the record plane re-installs it each period as the council
+  // commits changes.
+  let mut fleet = match &config.fleet {
+    Some(membership) => {
+      slates_cluster::fleet::FleetNode::new(host, membership.quorum, &membership.peers)
+    }
+    None => slates_cluster::fleet::FleetNode::solo(host),
+  };
+  let council_members = council.configuration().members.clone();
+  if let Some(configuration) = council.configuration().configuration_for(host) {
+    let _ = fleet.install_configuration(configuration, &council_members);
+  }
   // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
   let content = match AnchorSegment::open_content(env) {

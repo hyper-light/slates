@@ -86,9 +86,11 @@ fn run_owner_commit() -> bool {
   let (holder_port_tx, holder_port_rx) = channel::<u16>();
   let (result_tx, result_rx) = channel::<bool>();
 
-  // The owner runtime's configuration version after admitting A and B is what the holder must serve
-  // under; the owner and the test agree on it by construction (two admits from the solo neighbourhood).
-  let generation = 2;
+  // The owner runtime's configuration version is what the holder must serve under; the owner and the test
+  // agree on it by construction. `FleetNode::new` installs the council's **formed** region {OWNER, A, B} —
+  // version 0, the initial region (admits/retires the council later commits advance it), so the record and
+  // the holder's acceptor both bind generation 0.
+  let generation = 0;
 
   // Holder A: handshake, then serve the record under the owner's authority.
   sim
@@ -128,8 +130,8 @@ fn run_owner_commit() -> bool {
         Endpoint::client(socket, peer, &owner_identity, &holder_cert, NAME, FRAME_CAP).unwrap();
       endpoint.establish().await.unwrap();
 
-      // The owner runtime: f = 1, peers A and B. Its configuration version is 2 (A and B admitted),
-      // matching the holder's authority; its neighbourhood is {OWNER, A, B}, three candidates.
+      // The owner runtime: f = 1, peers A and B. Its configuration is the formed region {OWNER, A, B} at
+      // version 0, matching the holder's authority; its neighbourhood is three candidates.
       let mut node = FleetNode::new(OWNER, Quorum { f: 1 }, &[A, B]);
       let record = Record {
         owner: node.host(),

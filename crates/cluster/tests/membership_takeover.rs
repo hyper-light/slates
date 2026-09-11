@@ -1,12 +1,14 @@
-//! The live membership → takeover path end to end over the simulated UDP fabric (§4.8): a survivor
-//! probes a peer it backs over a real mutually-authenticated session; the peer is silent (it completes
-//! the handshake, then never answers a probe), so the real timeout drives the survivor's failure
-//! detector to declare it dead; `sync_membership` folds that converged view into the survivor's
-//! `FleetNode`, which retires the dead peer and hands the survivor the peer's objects that rendezvous
-//! now ranks first to it. This joins the pieces proven separately — the SWIM probe over the transport
-//! (`swim.rs`), the detector's suspect→dead aging (the detector's own tests), the detector→fleet bridge
-//! and the routing takeover (`fleet.rs`) — into the whole live path a fleet node's control-shard loop
-//! runs. Test by use (R5); real multi-node process deployment is a further gate.
+//! The live membership → takeover path end to end over the simulated UDP fabric (§4.8, D-14): a survivor
+//! probes a peer it backs over a real mutually-authenticated session; the peer is silent (it completes the
+//! handshake, then never answers a probe), so the real timeout drives the survivor's failure detector to
+//! declare it dead; `sync_membership` folds that converged view into the survivor's `FleetNode` membership,
+//! and installing the configuration the council commits for the retirement (the region without the dead
+//! peer) hands the survivor the peer's objects that rendezvous now ranks first to it. This joins the pieces
+//! proven separately — the SWIM probe over the transport (`swim.rs`), the detector's suspect→dead aging
+//! (the detector's own tests), the detector→membership fold and the install-driven routing takeover
+//! (`fleet.rs`) — into the live path a fleet node's control-shard loop runs. The council's own
+//! reconcile-and-commit of that retirement over the transport is proven in `config_group_live`. Test by use
+//! (R5); real multi-node process deployment is a further gate.
 
 // Test harness: an unwrap here is a failed test.
 #![allow(clippy::unwrap_used)]
@@ -18,8 +20,9 @@ use rustls::pki_types::PrivateKeyDer;
 use slates_cluster::CommitBudget;
 use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::fleet::{FleetNode, sync_membership};
+use slates_cluster::membership::Liveness;
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once};
-use slates_db::register::{HostId, ObjectId, Quorum};
+use slates_db::register::{Configuration, HostId, ObjectId, Quorum, RegionalConfiguration};
 use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::SimRuntime;
 use slates_rt::udp::UdpSocket;
@@ -178,13 +181,25 @@ fn a_silent_peer_is_detected_dead_and_its_objects_are_taken_over() {
         }
 
         // Drive the detector: the unanswered probe suspects the peer on the resolving tick, and the
-        // suspicion ages to death over the window. Each tick, fold the view into the fleet; when the peer
-        // is dead, the fold retires it and returns the objects the survivor takes over.
+        // suspicion ages to death over the window. Each tick, fold the detector's view into the fleet's
+        // membership; once the peer is folded dead, install the configuration the council would commit for
+        // its retirement (the region without it) — the survivor then takes over the dead-owned objects that
+        // rendezvous first to it. (The council's reconcile-and-commit of that retirement over the transport
+        // is proven in `config_group_live`; here the detector→membership→install→takeover path is driven.)
         for _ in 0..TICK_CEILING {
           detector.tick();
-          let takeovers = sync_membership(detector.membership(), &mut fleet);
-          if !takeovers.is_empty() {
-            // Every taken object is one this node backed and now owns; the dead peer is retired.
+          sync_membership(detector.membership(), &mut fleet);
+          if fleet.membership().state(DEAD).map(|s| s.liveness) == Some(Liveness::Dead) {
+            let retired = RegionalConfiguration::formed(
+              vec![SURVIVOR],
+              Quorum { f: 1 },
+              std::collections::BTreeMap::new(),
+              3,
+              false,
+            )
+            .configuration_for(SURVIVOR)
+            .unwrap_or_else(|| Configuration::solo(SURVIVOR));
+            let takeovers = fleet.install_configuration(retired, &[SURVIVOR]);
             for reassignment in &takeovers {
               if reassignment.new_owner != SURVIVOR {
                 return Err("a takeover was not assigned to the survivor".to_owned());
@@ -195,6 +210,9 @@ fn a_silent_peer_is_detected_dead_and_its_objects_are_taken_over() {
             }
             if fleet.configuration().neighbourhood.contains(&DEAD) {
               return Err("the dead peer was not retired from the neighbourhood".to_owned());
+            }
+            if takeovers.is_empty() {
+              return Err("the survivor took over none of the dead peer's objects".to_owned());
             }
             return Ok(takeovers.len());
           }

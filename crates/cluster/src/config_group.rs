@@ -454,8 +454,10 @@ pub struct RegionalCouncil {
 
 impl RegionalCouncil {
   /// A council on this `node` (one of the `voters`) holding the region's `members` at `quorum` and the
-  /// failure `domains`, each neighbourhood bounded to `scatter`. The Raft waits for an election over the
-  /// transport (the drive loop); the configuration starts at the formed region.
+  /// failure `domains`, each neighbourhood bounded to `scatter`. A multi-voter council waits for an election
+  /// over the transport (the drive loop); a **sole voter** self-elects at once (the `f = 0` laptop
+  /// degenerate — the same council code a fleet runs, immediately its own leader so it may reconcile and
+  /// propose with no messages, R8). The configuration starts at the formed region.
   pub fn new(
     node: HostId,
     members: Vec<HostId>,
@@ -465,7 +467,13 @@ impl RegionalCouncil {
     scatter: u64,
     has_mirror: bool,
   ) -> RegionalCouncil {
-    let raft = RaftNode::new(node, voters);
+    let mut raft = RaftNode::new(node, voters);
+    // A council of one is immediately its own majority: elect at once so the laptop's council is the
+    // authority with no drive loop (there is no fleet transport at `f = 0`). A multi-voter council does
+    // not self-elect — it must win a real election over the transport.
+    if raft.all_voters().len() == 1 {
+      let _ = raft.start_election();
+    }
     let configuration =
       RegionalConfiguration::formed(members, quorum, domains, scatter, has_mirror);
     RegionalCouncil {
