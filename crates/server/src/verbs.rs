@@ -18,7 +18,7 @@ use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration};
 use slates_ipc::protocol::{
   DaemonReport, Direction, FleetReport, HealthSignal, Intent, NamePolicy, PlacedState, Refusal,
   RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal, SizeClass, SnapshotId,
-  StatusReport, VolumeId, VolumeSummary, WorkOp, pack, unpack,
+  StatusReport, VolumeId, VolumeSummary, WorkOp, decode_body, encode_body, pack, unpack,
 };
 use slates_ipc::slot::SlotKind;
 use slates_ipc::{IpcError, Request};
@@ -251,11 +251,11 @@ fn home_redirect(
 }
 
 /// Routes an operator's `PromoteRegion` to the **control shard**, where the root group is driven (§4.8, D-14 —
-/// region-loss promotion at operator cadence). The root group's `propose` is synchronous, so when the client
-/// landed on the control shard the promotion is proposed inline; otherwise the propose runs on the control
-/// shard and the reply is delivered back to the origin (the single-target form of the status scatter). The
-/// operator issues this on the root leader; a follower's root group cannot propose, so it refuses
-/// `NotRootLeader`.
+/// region-loss promotion at operator cadence), and delivers the reply back to the client's shard. The work runs
+/// in a task on the control shard because it may forward over the transport (an `await`), which `serve` cannot:
+/// this node either proposes the promotion (when it leads the root group), forwards it to the leader it knows
+/// (so the operator may issue it on **any** node — [`promote_region_here_or_forward`]), or refuses
+/// `NotRootLeader` when no leader is known.
 fn promote_region_on_root(
   state: &mut ShardState,
   client_index: u32,
@@ -265,21 +265,21 @@ fn promote_region_on_root(
   let Some(control) = state.shards.first().copied() else {
     return Served::Reply(refused(Refusal::NotFound));
   };
-  if state.shard == control {
-    return Served::Reply(propose_region_promotion(state, region));
-  }
   let origin = state.shard;
   let task = SpawnRequest::new(
     Box::pin(async move {
-      let reply = crate::state::with_state(|s| propose_region_promotion(s, region))
-        .unwrap_or_else(|| refused(Refusal::NotFound));
-      let back = SpawnRequest::new(
-        Box::pin(async move {
-          crate::state::deliver(client_index, request, reply, false);
-        }),
-        None,
-      );
-      let _ = slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)));
+      let reply = promote_region_here_or_forward(region).await;
+      if origin == control {
+        crate::state::deliver(client_index, request, reply, false);
+      } else {
+        let back = SpawnRequest::new(
+          Box::pin(async move {
+            crate::state::deliver(client_index, request, reply, false);
+          }),
+          None,
+        );
+        let _ = slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)));
+      }
     }),
     None,
   );
@@ -287,6 +287,70 @@ fn promote_region_on_root(
     return Served::Reply(refused(Refusal::NotFound));
   }
   Served::Forwarded
+}
+
+/// On the control shard, either proposes the region-loss promotion here (when this node leads the root group)
+/// or forwards it to the leader this node knows, so the operator may issue `promote-region` on **any** node,
+/// not only the leader (§4.8, D-14). The leader is a redirection hint ([`RootGroup::leader`]): a stale hint or
+/// an unavailable leader session yields `NotRootLeader`, which the operator retries — never a wrong outcome
+/// (the target proposes only if it is in fact the leader). `PromoteRegion` is idempotent, so a forward that is
+/// retried after it already took is a no-op.
+async fn promote_region_here_or_forward(region: u64) -> ReplyBody {
+  enum Route {
+    Here,
+    Forward(HostId),
+    NoLeader,
+  }
+  let route = crate::state::with_state(|s| {
+    if s.root.is_leader() {
+      Route::Here
+    } else {
+      match s.root.leader() {
+        Some(leader) => Route::Forward(leader),
+        None => Route::NoLeader,
+      }
+    }
+  })
+  .unwrap_or(Route::NoLeader);
+  match route {
+    Route::Here => crate::state::with_state(|s| propose_region_promotion(s, region))
+      .unwrap_or_else(|| refused(Refusal::NotFound)),
+    Route::Forward(leader) => {
+      let request = encode_body(&RequestBody::PromoteRegion { region });
+      match crate::fleet::forward_over_leader_session(
+        leader,
+        request,
+        crate::daemon::LIVENESS_BUDGET_NS,
+      )
+      .await
+      {
+        Some(reply) if !reply.is_empty() => {
+          decode_body::<ReplyBody>(&reply).unwrap_or_else(|_| refused(Refusal::NotRootLeader))
+        }
+        // No live session to the leader, or the forward timed out: the operator retries (the promotion is
+        // idempotent, so a retry after it took is a no-op).
+        _ => refused(Refusal::NotRootLeader),
+      }
+    }
+    Route::NoLeader => refused(Refusal::NotRootLeader),
+  }
+}
+
+/// Serves a verb forwarded from another node over the fleet transport (§4.8 "Lookup"): decodes the request
+/// body, runs it here, and returns the encoded reply. Today only the operator's region-loss `PromoteRegion` is
+/// forwarded (to the root leader); general volume-verb forwarding — a request reaching a remotely-homed
+/// volume's owner, which also relays the requester's principal — is the owed cross-region routing (slice 2).
+pub(crate) fn serve_forward(state: &mut ShardState, request: &[u8]) -> Vec<u8> {
+  let Ok(body) = decode_body::<RequestBody>(request) else {
+    return Vec::new();
+  };
+  let reply = match body {
+    RequestBody::PromoteRegion { region } => propose_region_promotion(state, region),
+    _ => refused(Refusal::Unsupported {
+      feature: "forwarded verb".to_owned(),
+    }),
+  };
+  encode_body(&reply)
 }
 
 /// Proposes a lost region's promotion to its declared mirror on this shard's root group (§4.8, D-14). Refuses

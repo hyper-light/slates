@@ -783,6 +783,9 @@ async fn serve_peer_records(
         ROOT_FETCH_STREAM => {
           state::with_state(|s| serve_root_fetch(s, &request)).unwrap_or_default()
         }
+        FORWARD_STREAM => {
+          state::with_state(|s| verbs::serve_forward(s, &request)).unwrap_or_default()
+        }
         _ => Vec::new(),
       })
       .await;
@@ -1571,6 +1574,12 @@ const ROOT_STREAM: u64 = 9;
 /// does not vote in the root group; it asks a root voter for the root configuration over this stream and
 /// adopts a newer one.
 const ROOT_FETCH_STREAM: u64 = 10;
+
+/// Format: the stream id a **forwarded verb** rides on a record session (§4.8 "Lookup") — a request a node
+/// cannot serve locally is forwarded to the node that can (today the operator's `PromoteRegion` to the root
+/// leader; general volume-verb forwarding to a remotely-homed volume's owner is owed). The request is an
+/// encoded `RequestBody`, the reply an encoded `ReplyBody` ([`slates_ipc::protocol::encode_body`]).
+const FORWARD_STREAM: u64 = 11;
 
 /// The configuration council's election timeout, in record-plane heartbeat periods: a follower that goes
 /// this many periods without a leader's append presumes the leader gone and campaigns. The per-node spread
@@ -2619,6 +2628,24 @@ fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
       }
     }
   });
+}
+
+/// Forwards a request to one peer over its record session and returns the reply bytes (§4.8 "Lookup" — a verb
+/// a node cannot serve locally is sent to the node that can, over [`FORWARD_STREAM`]). Borrows the peer's
+/// session the same way a dispatch does ([`take_sessions`]/[`return_sessions`], so it does not corrupt the
+/// coordinator's use — whichever misses the session retries), returning it whatever the outcome
+/// ([`request_within`]). `None` when the peer has no live session here (the caller retries); an empty `Some`
+/// when the request timed out. Called from the control shard, where the record sessions live.
+pub(crate) async fn forward_over_leader_session(
+  peer: HostId,
+  request: Vec<u8>,
+  deadline_ns: u64,
+) -> Option<Vec<u8>> {
+  let mut sessions = take_sessions(|host| host == peer);
+  let (_, endpoint) = sessions.pop()?;
+  let (reply, endpoint) = request_within(endpoint, FORWARD_STREAM, &request, deadline_ns).await;
+  return_sessions(vec![(peer, endpoint)]);
+  Some(reply)
 }
 
 /// The pending takeovers this node should drive: the objects it owes a takeover for

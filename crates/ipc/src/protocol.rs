@@ -975,6 +975,19 @@ fn unframe<M: Wire>(bytes: &[u8]) -> Result<M, IpcError> {
   })
 }
 
+/// Serialises a request or reply body to the schema-checked bytes the message wire uses (the framing
+/// [`pack`] applies before slotting), for a body that travels **outside** the client ring — a verb forwarded
+/// to another node over the fleet transport so a request reaches the volume's owner or the operator's command
+/// reaches the leader (§4.8 "Lookup"). [`decode_body`] is its inverse, refusing another schema.
+pub fn encode_body<M: Wire>(message: &M) -> Vec<u8> {
+  frame(message)
+}
+
+/// Decodes a body [`encode_body`] produced, refusing a body of another schema or a truncated one.
+pub fn decode_body<M: Wire>(bytes: &[u8]) -> Result<M, IpcError> {
+  unframe(bytes)
+}
+
 /// Format: a bulk reference in a slot's payload: offset (8), length (8).
 const BULK_REF_BYTES: usize = 16;
 

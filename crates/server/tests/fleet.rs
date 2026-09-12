@@ -1136,16 +1136,15 @@ fn an_operator_promotes_a_lost_regions_mirror_over_the_transport() {
   );
 }
 
-/// AC (§4.8, D-14, §4.12): the operator's region-loss promotion is reachable **over the client protocol** —
-/// the `RequestBody::PromoteRegion` the `slates promote-region` verb sends, the surface the design mandates
-/// ("the operator issues it (a CLI verb over this)"). A client connected to the root leader promotes a
-/// region's declared mirror; the daemon routes the request to its control shard, proposes on the root group,
-/// and every node re-homes the region's volumes to the mirror. (`an_operator_promotes...` proves the
-/// loss-detection and the promotion via the daemon method; this proves the client → IPC → `serve` →
-/// control-shard → root-group path the CLI drives.) All three stay alive — this isolates the client path,
-/// not loss detection — so the region is promoted while live (the re-home is what is observed).
+/// AC (§4.8, D-14, §4.12): the operator issues `promote-region` on **any** node, not only the root leader. A
+/// client connected to a **follower** sends `RequestBody::PromoteRegion`; the follower forwards it to the
+/// leader it knows over the fleet transport ([`FORWARD_STREAM`]), the leader proposes it on the root group,
+/// and every node re-homes the region's volumes to the mirror. This proves the client → IPC → `serve` →
+/// forward-over-the-mesh → root-leader → root-group path the CLI drives. (`an_operator_promotes...` proves the
+/// loss detection and the promotion via the daemon method on the leader; this proves the follower forwarding.)
+/// All three stay alive, isolating the forwarding path (the re-home is what is observed).
 #[test]
-fn a_client_promotes_a_regions_mirror_over_the_promote_verb() {
+fn a_client_on_a_follower_promotes_a_region_by_forwarding_to_the_leader() {
   let _serial = serialize_fleet_tests();
   let pid = std::process::id();
   let names = ["a", "b", "c"];
@@ -1183,26 +1182,26 @@ fn a_client_promotes_a_regions_mirror_over_the_promote_verb() {
   let mirror = RegionId(0);
   let volume = ObjectId::new(hosts[1], 7); // a volume created in region 1
 
-  // Send `PromoteRegion` over a client to the **current** root leader, re-finding it each poll iteration and
-  // reconnecting if it changed: root leadership can flap under load, and only the leader can propose, so a
-  // client pinned to an ex-leader would be refused `NotRootLeader` forever. `PromoteRegion` is idempotent, so
-  // re-sending is safe. This mirrors how the daemon-side test re-issues on the current leader.
-  let mut leader_client: Option<(HostId, Client)> = None;
-  let promoted = elected
-    && poll_until(COUNCIL_RETIRE_DEADLINE, || {
-      if let Some((host, _)) = daemons.iter().find(|(_, daemon)| daemon.root_leads()) {
-        let host = *host;
-        if leader_client.as_ref().map(|(held, _)| *held) != Some(host) {
-          leader_client = Some((host, Client::connect(&format!("fleet3-{}-{pid}", host.0))));
-        }
-        if let Some((_, client)) = leader_client.as_mut() {
-          let _ = client.call(&RequestBody::PromoteRegion { region: lost.0 });
-        }
-      }
-      daemons
-        .iter()
-        .all(|(_, daemon)| daemon.region_home(volume, lost) == mirror)
-    });
+  // Pick a follower — a node that does not lead the root group — and promote the region through a client
+  // connected to it. The follower cannot propose, so it forwards the operator's PromoteRegion to the leader it
+  // knows; the leader proposes it and every node re-homes. Re-issued each poll iteration (idempotent), so a
+  // transient leadership change (the follower briefly leading, or its known leader changing) rides through.
+  let follower = daemons
+    .iter()
+    .find(|(_, daemon)| !daemon.root_leads())
+    .map(|(host, _)| *host);
+  let promoted = match (elected, follower) {
+    (true, Some(follower)) => {
+      let mut client = Client::connect(&format!("fleet3-{}-{pid}", follower.0));
+      poll_until(COUNCIL_RETIRE_DEADLINE, || {
+        let _ = client.call(&RequestBody::PromoteRegion { region: lost.0 });
+        daemons
+          .iter()
+          .all(|(_, daemon)| daemon.region_home(volume, lost) == mirror)
+      })
+    }
+    _ => false,
+  };
 
   for (_, daemon) in daemons {
     daemon.stop();
@@ -1210,8 +1209,8 @@ fn a_client_promotes_a_regions_mirror_over_the_promote_verb() {
   assert!(elected, "the root group elected a single leader");
   assert!(
     promoted,
-    "a client's PromoteRegion committed on the root leader — every node re-homed the region's volumes to the \
-     mirror, so the operator's CLI promotion reaches the root group over the client protocol"
+    "a client's PromoteRegion on a follower was forwarded to the root leader and committed — every node \
+     re-homed the region's volumes to the mirror, so the operator may promote from any node"
   );
 }
 
