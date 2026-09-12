@@ -1101,19 +1101,18 @@ fn an_operator_promotes_a_lost_regions_mirror_over_the_transport() {
           .iter()
           .all(|(_, daemon)| daemon.region_home(volume, lost) == lost)
       });
-      // The operator promotes the lost region's mirror on the surviving root leader.
-      let proposed = survivors
-        .iter()
-        .find(|(_, daemon)| daemon.root_leads())
-        .map(|(_, daemon)| daemon.promote_region(lost))
-        .unwrap_or(false);
-      // Every survivor then re-homes the lost region's volumes to the mirror.
-      let promoted = proposed
-        && poll_until(COUNCIL_RETIRE_DEADLINE, || {
-          survivors
-            .iter()
-            .all(|(_, daemon)| daemon.region_home(volume, lost) == mirror)
-        });
+      // The operator promotes the lost region's mirror on the surviving root leader, re-issued each poll
+      // iteration until it commits and re-homes everywhere: root leadership can flap under load between
+      // finding the leader and the commit landing, and `PromoteRegion` is idempotent (home_of follows the
+      // committed promotion; a second identical promotion is a no-op once applied).
+      let promoted = poll_until(COUNCIL_RETIRE_DEADLINE, || {
+        if let Some((_, leader)) = survivors.iter().find(|(_, daemon)| daemon.root_leads()) {
+          leader.promote_region(lost);
+        }
+        survivors
+          .iter()
+          .all(|(_, daemon)| daemon.region_home(volume, lost) == mirror)
+      });
       (not_retired, promoted)
     }
     _ => (false, false),
