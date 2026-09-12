@@ -11,7 +11,8 @@
 use std::mem::size_of;
 
 use slates_db::register::{
-  DomainId, HostEpoch, HostId, Neighbourhood, Quorum, RegionalConfiguration,
+  DomainId, HostEpoch, HostId, Neighbourhood, OBJECT_BYTES, ObjectId, Quorum, RegionId,
+  RegionalConfiguration, RootConfiguration,
 };
 use slates_transport::endpoint::{Endpoint, EndpointError};
 
@@ -498,6 +499,110 @@ fn decode_domains(
   Ok((domains, rest))
 }
 
+/// Encodes a [`RootConfiguration`] for the wire — the cross-region counterpart of
+/// [`encode_regional_configuration`], carried when a region catches up on the root group's committed state
+/// (§4.8, D-14). Little-endian throughout, each collection as a count then its entries, so two nodes encode
+/// it identically: version, the regions, the moved homes (`(volume, region)` each), and the promotions
+/// (`(lost, mirror)` each).
+pub fn encode_root_configuration(config: &RootConfiguration) -> Vec<u8> {
+  let mut out = Vec::new();
+  put_u64(&mut out, config.version);
+  put_u32(
+    &mut out,
+    u32::try_from(config.regions.len()).unwrap_or(u32::MAX),
+  );
+  for region in &config.regions {
+    put_u64(&mut out, region.0);
+  }
+  put_u32(
+    &mut out,
+    u32::try_from(config.homes.len()).unwrap_or(u32::MAX),
+  );
+  for (volume, region) in &config.homes {
+    out.extend_from_slice(&volume.0);
+    put_u64(&mut out, region.0);
+  }
+  put_u32(
+    &mut out,
+    u32::try_from(config.promotions.len()).unwrap_or(u32::MAX),
+  );
+  for (lost, mirror) in &config.promotions {
+    put_u64(&mut out, lost.0);
+    put_u64(&mut out, mirror.0);
+  }
+  out
+}
+
+/// Decodes a [`RootConfiguration`], or a typed refusal for hostile or truncated bytes — every declared count
+/// is bounded against the bytes that arrived before allocating (a lying count is
+/// [`RaftWireError::LengthMismatch`]), so a hostile datagram cannot force an over-allocation or a panic.
+pub fn decode_root_configuration(bytes: &[u8]) -> Result<RootConfiguration, RaftWireError> {
+  let (version, rest) = take_u64(bytes)?;
+  let (regions, rest) = decode_regions(rest)?;
+  let (homes, rest) = decode_homes(rest)?;
+  let (promotions, rest) = decode_promotions(rest)?;
+  expect_end(rest)?;
+  Ok(RootConfiguration {
+    version,
+    regions,
+    homes,
+    promotions,
+  })
+}
+
+/// Decodes the regions list (count, then each region id), bounding the count.
+fn decode_regions(bytes: &[u8]) -> Result<(Vec<RegionId>, &[u8]), RaftWireError> {
+  let (count, mut rest) = take_count(bytes)?;
+  let mut regions = Vec::with_capacity(count);
+  for _ in 0..count {
+    let (region, tail) = take_u64(rest)?;
+    regions.push(RegionId(region));
+    rest = tail;
+  }
+  Ok((regions, rest))
+}
+
+/// Decodes the moved-homes map (count, then each `(volume, region)`), bounding the count.
+fn decode_homes(
+  bytes: &[u8],
+) -> Result<(std::collections::BTreeMap<ObjectId, RegionId>, &[u8]), RaftWireError> {
+  let (count, mut rest) = take_count(bytes)?;
+  let mut homes = std::collections::BTreeMap::new();
+  for _ in 0..count {
+    let (volume, tail) = take_object(rest)?;
+    let (region, tail) = take_u64(tail)?;
+    homes.insert(volume, RegionId(region));
+    rest = tail;
+  }
+  Ok((homes, rest))
+}
+
+/// Decodes the promotions map (count, then each `(lost, mirror)`), bounding the count.
+fn decode_promotions(
+  bytes: &[u8],
+) -> Result<(std::collections::BTreeMap<RegionId, RegionId>, &[u8]), RaftWireError> {
+  let (count, mut rest) = take_count(bytes)?;
+  let mut promotions = std::collections::BTreeMap::new();
+  for _ in 0..count {
+    let (lost, tail) = take_u64(rest)?;
+    let (mirror, tail) = take_u64(tail)?;
+    promotions.insert(RegionId(lost), RegionId(mirror));
+    rest = tail;
+  }
+  Ok((promotions, rest))
+}
+
+/// Reads an object id at the front of `bytes`, returning it and the remainder, or `Truncated`.
+fn take_object(bytes: &[u8]) -> Result<(ObjectId, &[u8]), RaftWireError> {
+  if bytes.len() < OBJECT_BYTES {
+    return Err(RaftWireError::Truncated);
+  }
+  let (head, rest) = bytes.split_at(OBJECT_BYTES);
+  let mut id = [0u8; OBJECT_BYTES];
+  id.copy_from_slice(head);
+  Ok((ObjectId(id), rest))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -654,6 +759,35 @@ mod tests {
     bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // members count = huge
     assert_eq!(
       decode_regional_configuration(&bytes),
+      Err(RaftWireError::LengthMismatch),
+      "a count beyond the bytes is refused"
+    );
+  }
+
+  /// A root configuration round-trips through encode/decode unchanged — regions, moved homes and promotions —
+  /// so a region decodes exactly what the root group encoded.
+  #[test]
+  fn a_root_configuration_round_trips() {
+    let mut config = RootConfiguration::formed(vec![RegionId(0), RegionId(1), RegionId(2)]);
+    assert!(config.move_home(ObjectId::new(HostId(1), 7), RegionId(1)));
+    assert!(config.promote_region(RegionId(2), RegionId(0)));
+    let bytes = encode_root_configuration(&config);
+    assert_eq!(
+      decode_root_configuration(&bytes),
+      Ok(config),
+      "round-trip is identity"
+    );
+  }
+
+  /// A root configuration whose leading (regions) count lies — more entries than the bytes back — is refused
+  /// before allocating, not panicked.
+  #[test]
+  fn a_lying_root_configuration_count_is_refused() {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // version
+    bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // regions count = huge
+    assert_eq!(
+      decode_root_configuration(&bytes),
       Err(RaftWireError::LengthMismatch),
       "a count beyond the bytes is refused"
     );

@@ -21,6 +21,13 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HostId(pub u64);
 
+/// A region in the fleet (§4.8, D-14 — "a root group across regions holds region membership"). A region is
+/// one regional configuration group's domain; the **root group** agrees on which regions exist, where a
+/// moved volume is homed, and which region a lost region is promoted to. One region on a laptop (the sole
+/// region, id `0`), so the root group is the degenerate self-leading group R8 requires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RegionId(pub u64);
+
 /// A register object's id — the identifier of any register the owner writes (a volume head, a chain
 /// version, a landing lease, a catalog entry): 128 bits whose **high 8 bytes name the creator host**
 /// and whose low 8 bytes are a unique per-creator suffix (§4.8 "Lookup"; the catalog's `VolumeId` is
@@ -63,7 +70,7 @@ impl ObjectId {
 }
 
 /// The width of an encoded object id (16 bytes) — its place in every register wire layout.
-const OBJECT_BYTES: usize = size_of::<ObjectId>();
+pub const OBJECT_BYTES: usize = size_of::<ObjectId>();
 
 /// Reads an object id from the front of a decode split; the caller has already checked the length, so
 /// a mismatch falls back to the zero id rather than panicking (the hostile-input rule).
@@ -1539,6 +1546,118 @@ impl RegionalConfiguration {
   }
 }
 
+/// The root configuration — the cross-region state the **root group** agrees on (§4.8, D-14: "a root group
+/// across regions holds region membership and moved homes"; line 1690 "a root group across regions holds
+/// region membership and cross-region promotions"). It is the region-level counterpart of a
+/// [`RegionalConfiguration`]: where the regional configuration holds a region's host membership, the root
+/// configuration holds the *regions* themselves, the volumes whose home region has moved, and the region each
+/// lost region has been promoted to. Written **only** on a region-membership change, a home move, or a
+/// region-loss promotion — never per write (banned item 10), a near-zero rate the design makes a tripwire. On
+/// a laptop it holds the sole region, so the root group is the degenerate self-leading group (R8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootConfiguration {
+  /// Advances on every region-membership, home or promotion change, so a request under a stale root version
+  /// is refused exactly as a regional one is.
+  pub version: u64,
+  /// The regions the root group agrees exist, in id order.
+  pub regions: Vec<RegionId>,
+  /// The volumes whose home region has **moved** away from their creator region (moved volumes only, §4.8
+  /// line 1616 `homes: Art<VolumeId, Region>`); a volume absent here is homed in its creator region. Keyed by
+  /// the volume's object id (a volume id carries its creator host, §4.8 "Lookup").
+  pub homes: std::collections::BTreeMap<ObjectId, RegionId>,
+  /// Each **lost** region and the region promoted to serve it (§4.8 "region loss promotes the mirror through
+  /// the root group"): a volume homed in a lost region is served from its promotion, recomputed at lookup
+  /// (per-region, like a per-host takeover — no global catalog, D-12). A region present here is no longer in
+  /// `regions`.
+  pub promotions: std::collections::BTreeMap<RegionId, RegionId>,
+}
+
+impl RootConfiguration {
+  /// The formed root configuration over `regions` (version 0, no moved homes, no promotions) — on a laptop,
+  /// the sole region. Regions are sorted and de-duplicated so two nodes form an identical configuration.
+  pub fn formed(regions: Vec<RegionId>) -> RootConfiguration {
+    let mut regions = regions;
+    regions.sort_unstable_by_key(|region| region.0);
+    regions.dedup();
+    RootConfiguration {
+      version: 0,
+      regions,
+      homes: std::collections::BTreeMap::new(),
+      promotions: std::collections::BTreeMap::new(),
+    }
+  }
+
+  /// Admits `region` to the root membership (a region joins the fleet). Returns whether it changed — an
+  /// already-present region is a no-op, so the root log grows only for real changes.
+  pub fn admit_region(&mut self, region: RegionId) -> bool {
+    if self.regions.contains(&region) {
+      return false;
+    }
+    self.regions.push(region);
+    self.regions.sort_unstable_by_key(|region| region.0);
+    self.version = self.version.saturating_add(1);
+    true
+  }
+
+  /// Retires `region` cleanly from the root membership (an operator removal, not a loss — no promotion, since
+  /// nothing must be served from a mirror). Returns whether it changed.
+  pub fn retire_region(&mut self, region: RegionId) -> bool {
+    if !self.regions.contains(&region) {
+      return false;
+    }
+    self.regions.retain(|r| *r != region);
+    self.version = self.version.saturating_add(1);
+    true
+  }
+
+  /// Promotes `mirror` to serve a **lost** `region` (§4.8 "region loss promotes the mirror through the root
+  /// group"): records the promotion and drops the lost region from the membership, so a volume homed in the
+  /// lost region is thereafter served from `mirror` ([`home_of`](RootConfiguration::home_of)). Returns whether
+  /// it changed — a no-op if `region` or `mirror` is not a member, or the two are the same (a region cannot be
+  /// promoted to itself).
+  pub fn promote_region(&mut self, region: RegionId, mirror: RegionId) -> bool {
+    if region == mirror || !self.regions.contains(&region) || !self.regions.contains(&mirror) {
+      return false;
+    }
+    self.regions.retain(|r| *r != region);
+    self.promotions.insert(region, mirror);
+    self.version = self.version.saturating_add(1);
+    true
+  }
+
+  /// Moves `volume`'s home to region `to` (§4.8 "the homes of moved volumes"; "a region-home move also carries
+  /// root-group authority"). Returns whether it changed — a no-op if `to` is not a member or the volume is
+  /// already homed there.
+  pub fn move_home(&mut self, volume: ObjectId, to: RegionId) -> bool {
+    if !self.regions.contains(&to) || self.homes.get(&volume) == Some(&to) {
+      return false;
+    }
+    self.homes.insert(volume, to);
+    self.version = self.version.saturating_add(1);
+    true
+  }
+
+  /// The region a `volume` is served from, given its `creator_region` (the region of the host that created
+  /// it — the volume id carries the creator host, §4.8 "Lookup", and the caller maps that host to its region).
+  /// It is the volume's explicitly moved home if it has one, otherwise its creator region; then any promotion
+  /// of that region is followed (a lost region's volumes route to its successor), to a fixed point bounded by
+  /// the region count so a malformed promotion cycle cannot loop. This is the root-group analogue of
+  /// [`configuration_for`](RegionalConfiguration::configuration_for): it names *where* a volume lives, where
+  /// the regional configuration names *who* owns an object.
+  pub fn home_of(&self, volume: ObjectId, creator_region: RegionId) -> RegionId {
+    let mut region = self.homes.get(&volume).copied().unwrap_or(creator_region);
+    // Follow promotions to a fixed point; the promotion count bounds the chain, so even a malformed cycle
+    // terminates rather than spinning.
+    for _ in 0..self.promotions.len() {
+      match self.promotions.get(&region) {
+        Some(&next) if next != region => region = next,
+        _ => break,
+      }
+    }
+    region
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -2846,6 +2965,86 @@ mod tests {
     assert!(
       !promotion.promoted(Quorum { f: 1 }),
       "one promise is not a quorum at f=1 — the new owner must not serve yet"
+    );
+  }
+
+  /// AC (§4.8, D-14 — the root configuration): region admits and retires are idempotent no-ops when already
+  /// reflected, so the root log grows only for real changes.
+  #[test]
+  fn the_root_configuration_reconciles_region_membership() {
+    let (r0, r1) = (RegionId(0), RegionId(1));
+    let mut root = RootConfiguration::formed(vec![r0]);
+    assert_eq!(root.version, 0);
+
+    // Admitting a region is a real change; re-admitting it is a no-op.
+    assert!(root.admit_region(r1));
+    assert!(root.regions.contains(&r1));
+    assert!(!root.admit_region(r1), "re-admitting a region is a no-op");
+
+    // A clean retirement drops a region; retiring an absent one is a no-op.
+    assert!(root.retire_region(r0));
+    assert!(!root.regions.contains(&r0));
+    assert!(
+      !root.retire_region(r0),
+      "retiring an absent region is a no-op"
+    );
+  }
+
+  /// AC (§4.8, D-14 — the root configuration): a volume with no move is served from its creator region; a
+  /// moved volume from its recorded home; a home move to a non-member region, or one already in place, is a
+  /// no-op.
+  #[test]
+  fn the_root_configuration_homes_a_moved_volume() {
+    let (r0, r1) = (RegionId(0), RegionId(1));
+    let volume = ObjectId::new(HostId(1), 7);
+    let mut root = RootConfiguration::formed(vec![r0, r1]);
+
+    // A volume with no move is homed in its creator region.
+    assert_eq!(root.home_of(volume, r0), r0);
+
+    // Moving the volume's home to r1 changes where it is served; the same move again is a no-op.
+    assert!(root.move_home(volume, r1));
+    assert_eq!(root.home_of(volume, r0), r1, "served from its moved home");
+    assert!(
+      !root.move_home(volume, r1),
+      "the same home again is a no-op"
+    );
+
+    // A home move to a non-member region is refused (no such region to serve from).
+    assert!(!root.move_home(volume, RegionId(9)));
+  }
+
+  /// AC (§4.8 "region loss promotes the mirror through the root group"): promoting a lost region to its
+  /// mirror drops the lost region from the membership and routes a volume homed there to the mirror; the
+  /// promotion is followed to a fixed point across a chain, and self-/non-member promotions are refused.
+  #[test]
+  fn a_promoted_region_serves_the_lost_regions_volumes() {
+    let (r0, r1, r2) = (RegionId(0), RegionId(1), RegionId(2));
+    let volume = ObjectId::new(HostId(1), 7); // created in region r0
+    let mut root = RootConfiguration::formed(vec![r0, r1, r2]);
+
+    // r0 is lost; r1 is promoted to serve it.
+    assert!(root.promote_region(r0, r1));
+    assert!(
+      !root.regions.contains(&r0),
+      "the lost region drops from membership"
+    );
+    assert_eq!(
+      root.home_of(volume, r0),
+      r1,
+      "a volume homed in the lost region is served from its promotion"
+    );
+
+    // A region cannot be promoted to itself, and a non-member cannot be promoted.
+    assert!(!root.promote_region(r1, r1));
+    assert!(!root.promote_region(r0, r2), "r0 is no longer a member");
+
+    // A chained promotion (r1 now lost, promoted to r2) follows to the fixed point.
+    assert!(root.promote_region(r1, r2));
+    assert_eq!(
+      root.home_of(volume, r0),
+      r2,
+      "the promotion chain r0 -> r1 -> r2 resolves to the surviving region"
     );
   }
 }
