@@ -230,6 +230,52 @@ fn probe_budget() -> CommitBudget {
   CommitBudget::hard(HEARTBEAT_NS, (HEARTBEAT_NS / POLL_PER_PERIOD).max(1))
 }
 
+/// Shape: the lookahead fraction (numerator/denominator, kept a ratio so no float enters the decision) at
+/// which a still-progressing consensus/record round is first considered for an extension — the last quarter
+/// of its current deadline (hyperscale's measured 0.75 late-work lookahead, cited by
+/// [`slates_cluster::progress::DeadlineExtender`]).
+const CONSENSUS_LOOKAHEAD_NUMERATOR: u64 = 3;
+const CONSENSUS_LOOKAHEAD_DENOMINATOR: u64 = 4;
+
+/// The record-plane and configuration-consensus budget (§4.8 "late work"). Unlike a single SWIM probe
+/// ([`probe_budget`], a hard deadline — one missed probe is absorbed by the suspicion window), a record
+/// commit, a takeover promotion, a Raft replication round, an election or a learner fetch **gathers replies
+/// from several holders or voters at once**, and under CPU starvation — a noisy shared-tenant neighbour, a
+/// hypervisor steal, the kernel saturated by another process's syscalls — those replies arrive *late but
+/// still arrive*. A hard deadline would declare the round uncertain at the period boundary and re-dispatch it
+/// every period: a false-timeout storm that adds transport and scheduling load precisely when the machine is
+/// already starved, so the round never converges and the fleet thrashes rather than degrading gracefully
+/// (task #31; observed as consensus/takeover tests missing their deadlines under load). This budget instead
+/// **extends while the round is still making progress** — its acknowledged set advanced within the stall
+/// window — and times out only a round that has genuinely stalled (a dead holder), so a slow-but-progressing
+/// fleet converges. It is the `f > 0` caller's use of the extension mechanism the design built for exactly
+/// this; at `f = 0` (laptop) there are no peers to gather from, so the extender never fires and the behaviour
+/// is the hard budget's (R8). Every parameter is derived from the protocol's own periods:
+///
+/// - **base deadline** = one period ([`HEARTBEAT_NS`]): a healthy round completes far inside a period
+///   (sub-millisecond loopback RTT plus processing), so at full health this behaves as the hard budget did
+///   and adds no latency;
+/// - **poll interval** = a tenth of a period ([`POLL_PER_PERIOD`]), the collection loop's park between
+///   wake-ups, as the probe uses;
+/// - **extension** = one period per grant, up to [`ELECTION_HEARTBEATS`] grants: a progressing round may
+///   extend up to about the election timeout — the coherent cap, because a round still gathering replies past
+///   that point is one the election timer would already be displacing the leader over, so the extension and
+///   the election do not fight (a leader that keeps making progress holds its term; one that stalls yields);
+/// - **stall window** = the SWIM suspicion span ([`SUSPICION_PERIODS`] periods): a round that gathers no new
+///   reply for as long as a peer may go unheard before it is suspected is judged stalled, not merely slow, and
+///   is left to time out at its current deadline.
+fn consensus_budget() -> CommitBudget {
+  CommitBudget::with_extension(
+    HEARTBEAT_NS,
+    (HEARTBEAT_NS / POLL_PER_PERIOD).max(1),
+    CONSENSUS_LOOKAHEAD_NUMERATOR,
+    CONSENSUS_LOOKAHEAD_DENOMINATOR,
+    HEARTBEAT_NS,
+    ELECTION_HEARTBEATS,
+    HEARTBEAT_NS.saturating_mul(u64::from(SUSPICION_PERIODS)),
+  )
+}
+
 /// Runs the fleet membership loop for `transport` on the control shard (§4.8, boot step 6). It binds this
 /// node's two serve sockets (one per plane, every peer on each through a demultiplexer) and spawns their
 /// receive and accept loops; for each peer it dials the peer's advertised addresses and spawns the probe and
@@ -253,7 +299,11 @@ pub async fn run_membership(transport: FleetTransport) {
   let identity: &'static Identity = Box::leak(Box::new(identity));
   let neighbourhood = peers.len().saturating_add(1); // this node and its peers.
   let local = state::with_state(|s| s.fleet.host()).unwrap_or(HostId(0));
-  let budget = probe_budget();
+  // The record plane and the configuration consensus gather replies from several holders/voters, so they run
+  // under the progress-extending budget (tolerating late-but-progressing replies under CPU starvation);
+  // the per-peer SWIM probe below keeps its own hard [`probe_budget`] (a single miss is absorbed by the
+  // suspicion window, so a probe needs no extension). See [`consensus_budget`].
+  let budget = consensus_budget();
 
   // One serve socket per plane, shared by every peer through a demultiplexer (bound here on the control
   // shard, before the dials, so a peer's dial finds a listener). A serve socket that cannot be bound (the
@@ -1704,7 +1754,10 @@ async fn broadcast(
   }
   drop(tx); // so the channel disconnects when the last child has reported
   let mut replies = Vec::with_capacity(tasks.len());
-  let poll_ns = (deadline_ns / POLL_PER_PERIOD).max(1);
+  // The poll cadence is the budget's own fine-grained interval (a tenth of a period), not a fraction of the
+  // full extended deadline: a round whose replies have all arrived returns within one interval of the last,
+  // whatever the deadline the extension budget allows it to wait to.
+  let poll_ns = budget.poll_interval_ns.max(1);
   loop {
     match rx.try_recv() {
       Ok(triple) => replies.push(triple),
