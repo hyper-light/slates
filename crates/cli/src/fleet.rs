@@ -28,6 +28,7 @@ use core::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
 
 use slates_db::register::{Quorum, RegionId};
+use slates_server::DurabilityBound;
 use slates_server::deploy::{
   CertificateDer, FleetManifest, FleetNodeEntry, FleetPlan, PrivateKeyDer,
 };
@@ -100,6 +101,7 @@ struct NodeText {
 struct ManifestText {
   name: String,
   quorum: Quorum,
+  durability: Option<DurabilityBound>,
   nodes: Vec<NodeText>,
 }
 
@@ -191,8 +193,38 @@ fn parse(text: &str) -> Result<ManifestText, ManifestError> {
   Ok(ManifestText {
     name,
     quorum: Quorum { f },
+    durability: durability_text(&document)?,
     nodes,
   })
+}
+
+/// Parses the optional fleet-level `durability` policy (§4.8, D-14 — "the copyset count check at every
+/// configuration change"): an object with `accepted_loss` (a probability in `[0.0, 1.0]`) and
+/// `coincident_failures` (a host count). Absent — the default — leaves the check disabled; present, both
+/// fields are required and each is named by its path when malformed.
+fn durability_text(document: &serde_json::Value) -> Result<Option<DurabilityBound>, ManifestError> {
+  let Some(value) = document.get("durability") else {
+    return Ok(None);
+  };
+  let accepted_loss = value
+    .get("accepted_loss")
+    .and_then(serde_json::Value::as_f64)
+    .filter(|loss| (0.0..=1.0).contains(loss))
+    .ok_or(ManifestError::Field {
+      field: "durability.accepted_loss".to_owned(),
+      expected: "a probability in [0.0, 1.0]",
+    })?;
+  let coincident_failures = value
+    .get("coincident_failures")
+    .and_then(serde_json::Value::as_u64)
+    .ok_or(ManifestError::Field {
+      field: "durability.coincident_failures".to_owned(),
+      expected: "a non-negative integer host count",
+    })?;
+  Ok(Some(DurabilityBound {
+    accepted_loss,
+    coincident_failures,
+  }))
 }
 
 /// Reads a file the manifest names, relative to the manifest's directory.
@@ -238,6 +270,7 @@ fn load_plan(selection: &FleetSelection) -> Result<FleetPlan, ManifestError> {
   let manifest = FleetManifest {
     name: stated.name,
     quorum: stated.quorum,
+    durability: stated.durability,
     nodes,
   };
   let Some(key) = key else {
@@ -338,6 +371,36 @@ mod tests {
     match parse(&bad) {
       Err(ManifestError::Field { field, .. }) => assert_eq!(field, "nodes[0].region"),
       other => panic!("expected a field error for a non-integer region, got {other:?}"),
+    }
+  }
+
+  /// A fleet may declare an optional durability policy; it is absent by default, and a malformed field (an
+  /// accepted loss outside `[0, 1]`) is named by its path.
+  #[test]
+  fn a_declared_durability_policy_parses_and_a_bad_one_is_named() {
+    assert_eq!(
+      parse(MANIFEST).expect("parses").durability,
+      None,
+      "no durability policy by default"
+    );
+
+    let with_durability = MANIFEST.replace(
+      r#""f": 1,"#,
+      r#""f": 1, "durability": { "accepted_loss": 0.01, "coincident_failures": 10 },"#,
+    );
+    assert_eq!(
+      parse(&with_durability).expect("parses").durability,
+      Some(DurabilityBound {
+        accepted_loss: 0.01,
+        coincident_failures: 10,
+      }),
+      "the declared durability policy is parsed"
+    );
+
+    let bad = with_durability.replace("0.01", "5.0"); // a probability above 1.0
+    match parse(&bad) {
+      Err(ManifestError::Field { field, .. }) => assert_eq!(field, "durability.accepted_loss"),
+      other => panic!("expected a field error for an out-of-range accepted_loss, got {other:?}"),
     }
   }
 

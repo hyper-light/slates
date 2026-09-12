@@ -30,7 +30,7 @@ use slates_db::register::{DomainId, Quorum, RegionId};
 use slates_rt::tcp::SocketAddrV4;
 use slates_transport::handshake::Identity;
 
-use crate::config::FleetMembership;
+use crate::config::{DurabilityBound, FleetMembership};
 use crate::fleet::{FleetPeer, FleetTransport};
 
 /// One node of the shared manifest: what every node knows about every node.
@@ -65,6 +65,10 @@ pub struct FleetManifest {
   pub name: String,
   /// The fault tolerance `f`: a write commits at `f + 1` acknowledgements of `2f + 1` candidates (§4.8).
   pub quorum: Quorum,
+  /// The operator's durability policy, if declared (§4.8 "the copyset count check at every configuration
+  /// change"): a fleet-wide accepted coincident-loss probability under a stated failure count. `None` leaves
+  /// the check disabled (the default). Every node reads the same policy from the same manifest.
+  pub durability: Option<DurabilityBound>,
   /// Every node, in manifest order.
   pub nodes: Vec<FleetNodeEntry>,
 }
@@ -348,6 +352,7 @@ pub fn plan(
       host,
       domains,
       regions,
+      durability: manifest.durability,
     },
     transport: FleetTransport {
       identity,
@@ -406,6 +411,7 @@ mod tests {
     let manifest = FleetManifest {
       name: NAME.to_owned(),
       quorum: Quorum { f: 1 },
+      durability: None,
       nodes: vec![
         entry("a", 40_000, certs[0].clone()),
         entry("b", 41_000, certs[1].clone()),
@@ -587,6 +593,7 @@ mod tests {
     let empty = FleetManifest {
       name: "x".to_owned(),
       quorum: Quorum { f: 0 },
+      durability: None,
       nodes: Vec::new(),
     };
     assert_eq!(
@@ -622,6 +629,7 @@ mod tests {
     let solo = FleetManifest {
       name: NAME.to_owned(),
       quorum: Quorum { f: 0 },
+      durability: None,
       nodes: vec![entry("only", 50_000, cert)],
     };
     let plan = plan(&solo, "only", key).expect("a plan");

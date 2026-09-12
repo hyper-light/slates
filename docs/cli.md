@@ -71,6 +71,12 @@ slates anchor --fleet /etc/slates/fleet.json --node a
   exist and routes cross-region, and a node with no `region` is in the single default region (a fleet
   that declares none is one region). Neither is derived from the address — several nodes may share one
   host and IP in a test or dev fleet without sharing a domain or region.
+- `durability` is an optional fleet-level object, `{ "accepted_loss": <0..1>, "coincident_failures": <n> }`,
+  the operator's accepted probability of losing some object when `coincident_failures` hosts fail at once.
+  It is unset by default (no check). When set, every configuration change is checked against it and a breach
+  is **surfaced** as a health signal (never silently over-scattered): a breach is a recovery-vs-durability
+  conflict to resolve by raising `f`, the re-replication bandwidth, or the failure-domain granularity. It is
+  a policy, so it is stated, never derived.
 
 `slates status` on any node shows its place in the fleet: `fleet_host` (its member id),
 `fleet_f`, `fleet_host_epoch`, `fleet_members` (the members it holds alive) and

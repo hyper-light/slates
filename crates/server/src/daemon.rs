@@ -28,7 +28,7 @@ use slates_vfs::clock::HostClock;
 use slates_vfs::volume::{Store, StoreConfig};
 use slates_wire::observe::{Chokepoint, ChokepointRegistry};
 
-use crate::config::DaemonConfig;
+use crate::config::{DaemonConfig, DurabilityBound};
 use crate::doorbell::{DoorbellThread, Waits};
 use crate::error::ServerError;
 use crate::state::{self, ClientSlot, ShardState};
@@ -129,6 +129,25 @@ pub static CLIENTS_REAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// a process-global word (like the health signals) so a verb handler on any shard can report it to a
 /// client — `slates mount` reads it to run `mount_nfs localhost:PORT`.
 pub static NFS_PORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Configuration changes whose installed configuration **breached** the operator's declared durability bound
+/// (§4.8 "the copyset count check at every configuration change"; D-14). A health signal, surfaced not
+/// silently over-scattered: a breach is a recovery-vs-durability conflict for the operator to resolve. Zero
+/// when no durability policy is declared (the default) or every installed configuration stays within it.
+pub static DURABILITY_BREACHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Checks a just-installed `configuration` against the operator's durability `bound`, counting a breach as a
+/// health signal ([`DURABILITY_BREACHES`]) — surfaced at every configuration change, never a silent
+/// over-scatter (§4.8, D-14). A no-op when no bound is declared.
+pub(crate) fn record_durability(
+  configuration: &slates_db::register::Configuration,
+  bound: Option<DurabilityBound>,
+) {
+  if let Some(bound) = bound
+    && bound.breached_by(configuration)
+  {
+    DURABILITY_BREACHES.fetch_add(1, Ordering::Relaxed);
+  }
+}
 
 impl Daemon {
   /// Starts the daemon from a profile.
@@ -1001,6 +1020,14 @@ fn init_shard(
   };
   let council_members = council.configuration().members.clone();
   if let Some(configuration) = council.configuration().configuration_for(host) {
+    // Surface a durability breach in the formed configuration at boot (§4.8, D-14); a no-op with no policy.
+    record_durability(
+      &configuration,
+      config
+        .fleet
+        .as_ref()
+        .and_then(|membership| membership.durability),
+    );
     let _ = fleet.install_configuration(configuration, &council_members);
   }
   // The root group across regions (§4.8, D-14): the regions the fleet spans and the representative host of
@@ -1389,6 +1416,57 @@ mod tests {
         .into_iter()
         .map(Chokepoint::name)
         .collect::<Vec<_>>()
+    );
+  }
+
+  /// A configuration change that breaches the operator's durability bound moves the breach health signal
+  /// (§4.8 "the copyset count check at every configuration change") — the non-vacuity counter proving the
+  /// check runs at install; a change with no policy, or one within the bound, does not move it.
+  #[test]
+  fn a_breaching_configuration_moves_the_durability_signal() {
+    use super::{DURABILITY_BREACHES, record_durability};
+    use crate::config::DurabilityBound;
+    use slates_db::register::{HostId, Quorum, RegionalConfiguration};
+    use std::sync::atomic::Ordering;
+
+    let configuration = RegionalConfiguration::formed(
+      vec![HostId(1), HostId(2), HostId(3)],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    )
+    .configuration_for(HostId(1))
+    .expect("the owner has a placement view");
+
+    // No policy, and a policy that accepts any loss, both leave the signal unmoved.
+    let quiet = DURABILITY_BREACHES.load(Ordering::Relaxed);
+    record_durability(&configuration, None);
+    record_durability(
+      &configuration,
+      Some(DurabilityBound {
+        accepted_loss: 1.0,
+        coincident_failures: 2,
+      }),
+    );
+    assert_eq!(
+      DURABILITY_BREACHES.load(Ordering::Relaxed),
+      quiet,
+      "no breach without a policy or within the accepted loss"
+    );
+
+    // A zero-loss policy is breached by the redundant configuration, moving the signal.
+    record_durability(
+      &configuration,
+      Some(DurabilityBound {
+        accepted_loss: 0.0,
+        coincident_failures: 2,
+      }),
+    );
+    assert_eq!(
+      DURABILITY_BREACHES.load(Ordering::Relaxed),
+      quiet + 1,
+      "a breach at a configuration change moves the health signal"
     );
   }
 }

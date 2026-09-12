@@ -39,7 +39,7 @@ pub mod state;
 pub mod verbs;
 pub mod xshard;
 
-pub use config::{DaemonConfig, FleetMembership};
+pub use config::{DaemonConfig, DurabilityBound, FleetMembership};
 pub use daemon::{Daemon, SegmentSource};
 pub use deploy::{DeployError, FleetManifest, FleetNodeEntry, FleetPlan};
 pub use fleet::{FleetPeer, FleetTransport};

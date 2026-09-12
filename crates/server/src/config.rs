@@ -5,7 +5,7 @@ use slates_anchor::Geometry;
 use slates_db::partition::PartitionCaps;
 use std::collections::BTreeMap;
 
-use slates_db::register::{DomainId, HostId, Quorum, RegionId, scatter_width};
+use slates_db::register::{Configuration, DomainId, HostId, Quorum, RegionId, scatter_width};
 use slates_ipc::RegionGeometry;
 use slates_machine::{Derived, MachineProfile, derived};
 use slates_mem::budget::region_bytes;
@@ -116,6 +116,40 @@ pub struct FleetMembership {
   /// the deployment declares none, which collapses to a single-region fleet whose root group is the degenerate
   /// self-leading group (R8). This node's own region is `regions[host]` (or the sole region if absent).
   pub regions: BTreeMap<HostId, RegionId>,
+  /// The operator's durability policy, if declared (§4.8 "the copyset count check at every configuration
+  /// change"): the accepted coincident-loss probability under a stated simultaneous failure count. `None` —
+  /// the default — leaves the check disabled (an accepted loss probability is a policy, not a machine
+  /// measurement, so it is never derived — it is the operator's). When set, every configuration change is
+  /// checked against it and a breach is **surfaced** (a counted health signal), never silently over-scattered:
+  /// a breach is a recovery-vs-durability conflict for the operator to resolve (more copies, more bandwidth,
+  /// tighter failure domains).
+  pub durability: Option<DurabilityBound>,
+}
+
+/// An operator durability policy (§4.8, D-14; research §3.1): the accepted coincident-loss probability
+/// `accepted_loss` under a coincident failure of `coincident_failures` hosts. It bounds the copyset count a
+/// configuration may reach — a wider scatter spreads objects over more copysets, raising the chance some
+/// copyset lies entirely within a coincident failure. The operator states both (the accepted risk and the
+/// failure scale it is accepted under); neither is derived, because an accepted loss probability is a policy,
+/// not a machine measurement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DurabilityBound {
+  /// The largest coincident-loss probability the operator accepts (`0.0` accepts none; `1.0` accepts any —
+  /// the disabled bound).
+  pub accepted_loss: f64,
+  /// The number of hosts assumed to fail at once when evaluating the loss (the failure scale the policy is
+  /// stated under — e.g. a power-domain outage of some fraction of the region).
+  pub coincident_failures: u64,
+}
+
+impl DurabilityBound {
+  /// Whether `configuration` **breaches** this bound — its coincident-loss probability under the policy's
+  /// failure count exceeds the accepted loss. A breach is surfaced at the configuration change, never
+  /// silently accepted (§4.8): the resolution is the operator's (raise `f`, the re-replication bandwidth, or
+  /// the failure-domain granularity), not a quiet over-scatter.
+  pub fn breached_by(&self, configuration: &Configuration) -> bool {
+    !configuration.within_loss_bound(self.accepted_loss, self.coincident_failures)
+  }
 }
 
 /// The daemon's configuration.
@@ -487,6 +521,47 @@ mod tests {
       ample.derived_scatter(quorum),
       3,
       "a bandwidth that restores the data budget within the budget leaves the scatter at the floor"
+    );
+  }
+
+  /// AC (§4.8 "the copyset count check at every configuration change", D-14): an operator durability bound is
+  /// breached when a configuration's coincident-loss probability exceeds the accepted loss — a policy that
+  /// accepts **no** loss is breached by any redundant configuration (its loss is positive), while a policy
+  /// that accepts **any** loss is never breached. The check reads the existing `within_loss_bound`.
+  #[test]
+  fn a_durability_bound_surfaces_a_breach() {
+    use slates_db::register::RegionalConfiguration;
+    let owner = HostId(1);
+    let regional = RegionalConfiguration::formed(
+      vec![owner, HostId(2), HostId(3)],
+      Quorum { f: 1 },
+      BTreeMap::new(),
+      3,
+      false,
+    );
+    let configuration = regional
+      .configuration_for(owner)
+      .expect("the owner has a placement view");
+
+    // Accept no loss: any redundant (f = 1) configuration has a positive coincident-loss probability, so a
+    // coincident failure of the two copies breaches the zero-loss policy.
+    let strict = DurabilityBound {
+      accepted_loss: 0.0,
+      coincident_failures: 2,
+    };
+    assert!(
+      strict.breached_by(&configuration),
+      "a zero-loss policy is breached by any redundant configuration"
+    );
+
+    // Accept any loss: never breached.
+    let lax = DurabilityBound {
+      accepted_loss: 1.0,
+      coincident_failures: 2,
+    };
+    assert!(
+      !lax.breached_by(&configuration),
+      "a policy that accepts any loss is never breached"
     );
   }
 }

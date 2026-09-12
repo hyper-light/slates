@@ -2261,6 +2261,15 @@ fn sync_config_from_council(local: HostId) {
     let Some(configuration) = configuration else {
       return;
     };
+    // Surface a durability breach in the newly-committed configuration (§4.8, D-14 — the copyset count check
+    // at every configuration change); a no-op when no operator durability policy is declared.
+    crate::daemon::record_durability(
+      &configuration,
+      s.config
+        .fleet
+        .as_ref()
+        .and_then(|membership| membership.durability),
+    );
     for reassignment in s.fleet.install_configuration(configuration, &members) {
       s.pending_takeovers.insert(reassignment.object);
     }

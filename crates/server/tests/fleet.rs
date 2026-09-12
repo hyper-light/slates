@@ -211,6 +211,7 @@ fn start_sharded(this: Node, peer: Peer, shards: u16) -> Daemon {
       host: this.host,
       domains: std::collections::BTreeMap::new(),
       regions: std::collections::BTreeMap::new(),
+      durability: None,
     });
   let transport = FleetTransport {
     identity: this.identity,
@@ -525,6 +526,7 @@ fn start_mesh_with(
           host,
           domains: std::collections::BTreeMap::new(),
           regions: regions.clone(),
+          durability: None,
         });
       let transport = FleetTransport {
         identity,
