@@ -615,6 +615,31 @@ impl Daemon {
       .unwrap_or_default()
   }
 
+  /// Like [`Self::placement_neighbourhood`] but read on the shard at `shard_index` rather than the control
+  /// shard. The placement verbs (`place`/`region_placed`/`await_placed`/`host_epoch`) run on a volume's owner
+  /// shard, which may not be the control shard, so every shard must read the committed configuration; this
+  /// lets a fleet test prove a council-committed change reaches every shard (`sync_config_from_council`'s
+  /// fan-out). Empty if there is no such shard or it does not answer in time.
+  pub fn placement_neighbourhood_on_shard(&self, shard_index: usize) -> Vec<slates_db::HostId> {
+    let (Some(runtime), Some(&target)) = (self.runtime.as_ref(), self.shards.get(shard_index))
+    else {
+      return Vec::new();
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(target, async move {
+        let neighbourhood =
+          state::with_state(|s| s.fleet.configuration().neighbourhood.clone()).unwrap_or_default();
+        let _ = tx.send(neighbourhood);
+      })
+      .is_err()
+    {
+      return Vec::new();
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .unwrap_or_default()
+  }
+
   /// Test and operator support: folds a `Dead` belief about `peer` at `incarnation` into this node's
   /// membership on the control shard — the same effect its failure detector has when it ages a peer to
   /// death (§4.8). Exposed so **rejoin** can be driven deterministically: a real process kill cannot be

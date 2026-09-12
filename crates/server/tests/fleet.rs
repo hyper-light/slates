@@ -762,6 +762,86 @@ fn a_council_commits_a_membership_retirement_over_the_transport() {
   );
 }
 
+/// AC (§4.8, D-7 "one owning shard per volume"): the placement verbs (`place`/`region_placed`/`await_placed`/
+/// `host_epoch`) run on a volume's **owner** shard, which may not be the control shard that drives the
+/// council, so the committed configuration must reach **every** shard. Here each daemon runs two shards; when
+/// the council commits a follower's retirement, a **non-control** shard drops the dead member from its
+/// placement neighbourhood too — proving the control shard fans its committed configuration out to the others
+/// (`sync_config_from_council`'s fan-out). Without it a volume owned on another shard would report a stale
+/// placement after the membership change. A follower is retired (the leader stays and reconciles); the death
+/// is injected for a deterministic SWIM cue, as the learner test does.
+#[test]
+fn a_committed_retirement_reaches_every_shards_placement_view() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  let regions = std::collections::BTreeMap::new();
+  let mirrors = std::collections::BTreeMap::new();
+  // Two shards per daemon: the council runs on the control shard (index 0); shard index 1 is a non-control
+  // shard that also owns volumes and answers the placement verbs.
+  let mut daemons = start_mesh_with(nodes, &hosts, &certs, &serve, 1, 2, &regions, &mirrors);
+
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, || {
+    daemons
+      .iter()
+      .filter(|daemon| daemon.council_leads())
+      .count()
+      == 1
+  });
+  let leader_idx = daemons.iter().position(|daemon| daemon.council_leads());
+  let victim_idx = leader_idx.and_then(|lead| (0..daemons.len()).find(|&i| i != lead));
+
+  let (on_control_shard, on_non_control_shard) = match (elected, victim_idx) {
+    (true, Some(victim)) => {
+      let dead = hosts[victim];
+      daemons.remove(victim).stop();
+      for daemon in &daemons {
+        daemon.observe_peer_dead(dead, FALSE_DEATH_INCARNATION);
+      }
+      // The leader reconciles the injected death, commits the retirement, and every survivor's control shard
+      // drops the dead member from the neighbourhood it places under...
+      let on_control = poll_until(COUNCIL_RETIRE_DEADLINE, || {
+        daemons
+          .iter()
+          .all(|daemon| !daemon.placement_neighbourhood().contains(&dead))
+      });
+      // ...and so does the non-control shard — the fan-out under test.
+      let on_non_control = on_control
+        && poll_until(COUNCIL_RETIRE_DEADLINE, || {
+          daemons
+            .iter()
+            .all(|daemon| !daemon.placement_neighbourhood_on_shard(1).contains(&dead))
+        });
+      (on_control, on_non_control)
+    }
+    _ => (false, false),
+  };
+
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    elected,
+    "the council elected a leader before the retirement"
+  );
+  assert!(
+    on_control_shard,
+    "every survivor's control shard dropped the dead member from its placement neighbourhood"
+  );
+  assert!(
+    on_non_control_shard,
+    "every survivor's non-control shard dropped it too — the control shard fans its committed configuration to \
+     every shard, so placement is consistent on whatever shard owns a volume"
+  );
+}
+
 /// AC (§4.8, D-14 — the root group across regions, driven over the daemon transport): three daemons, each in
 /// its own region and thus its region's representative (so all three are root-group voters), elect one root
 /// leader over the transport; when a follower's region is lost (its only host is killed), the surviving root
@@ -1106,26 +1186,21 @@ fn a_committed_promotion_reaches_every_shards_lookup_view() {
   let mirror = RegionId(0);
   let volume = ObjectId::new(hosts[1], 7); // a volume created in region 1
 
-  let proposed = elected
-    && daemons
-      .iter()
-      .find(|(_, daemon)| daemon.root_leads())
-      .map(|(_, daemon)| daemon.promote_region(lost))
-      .unwrap_or(false);
-
-  // The control shard re-homes the promoted region's volumes to the mirror (the existing behaviour)...
-  let on_control_shard = proposed
+  // Promote on the current root leader, re-issued each poll iteration until it takes and propagates. Under
+  // suite-end load the root leadership can briefly flap — or a propose can reach a leader that then loses
+  // leadership before it commits — and `PromoteRegion` is idempotent (home_of follows the committed promotion;
+  // a second identical promotion is a no-op once applied), so retrying through a transient gap is safe. The
+  // region must re-home to the mirror on BOTH the control shard (`region_home`) and a non-control shard
+  // (`region_home_on_shard` — the fan-out under test), so a client reads the same home wherever it lands.
+  let promoted = elected
     && poll_until(COUNCIL_RETIRE_DEADLINE, || {
-      daemons
-        .iter()
-        .all(|(_, daemon)| daemon.region_home(volume, lost) == mirror)
-    });
-  // ...and so does the non-control shard — the fan-out under test.
-  let on_non_control_shard = on_control_shard
-    && poll_until(COUNCIL_RETIRE_DEADLINE, || {
-      daemons
-        .iter()
-        .all(|(_, daemon)| daemon.region_home_on_shard(1, volume, lost) == mirror)
+      if let Some((_, leader)) = daemons.iter().find(|(_, daemon)| daemon.root_leads()) {
+        leader.promote_region(lost);
+      }
+      daemons.iter().all(|(_, daemon)| {
+        daemon.region_home(volume, lost) == mirror
+          && daemon.region_home_on_shard(1, volume, lost) == mirror
+      })
     });
 
   for (_, daemon) in daemons {
@@ -1136,17 +1211,9 @@ fn a_committed_promotion_reaches_every_shards_lookup_view() {
     "the root group elected a single leader among the region representatives"
   );
   assert!(
-    proposed,
-    "the operator's promotion was proposed on the root leader"
-  );
-  assert!(
-    on_control_shard,
-    "every control shard re-homes the promoted region's volumes to the mirror"
-  );
-  assert!(
-    on_non_control_shard,
-    "every non-control shard re-homes them too — the control shard fans its committed root configuration to \
-     every shard, so the cross-region lookup guard is consistent wherever a client lands"
+    promoted,
+    "the operator's promotion committed and re-homed the region's volumes to the mirror on every shard — \
+     control and non-control — so the cross-region lookup guard is consistent wherever a client lands"
   );
 }
 

@@ -74,13 +74,28 @@ the fix.
 
 ## Sibling sweep
 
-- **Placement configuration is not fanned out either** (open, tracked in GAPS row 27). A non-control
-  owner shard reads a stale placement configuration after a membership change, so verb reads that go
-  through `Configuration` (`region_placed`/`place`/`host_epoch`) can be stale there. It is partially
-  masked today because the placement *report* (`committed_placement`) reads `placed_heads`, which the
-  record plane records per owner shard via `xshard`. Fixing it is entangled with distributing takeover
-  (each `install_configuration` returns reassignments the owner shard should drive), so it is a
-  separate increment, not folded into this root-only fan-out.
+- **Placement configuration was not fanned out either — now fixed in the follow-on
+  (`fan_configuration_to_shards`).** A non-control owner shard read a stale placement configuration
+  after a membership change, so verb reads through `Configuration`
+  (`region_placed`/`place`/`host_epoch`) could be stale there (partially masked because the placement
+  *report* `committed_placement` reads `placed_heads`, recorded per owner shard via `xshard`). It turned
+  out **not** to be entangled with distributing takeover after all: peer records — and so the
+  held-record fences and the routing that drives takeover — live on the control shard, so a non-control
+  shard tracks no held object and its `install_configuration` returns no reassignment to drive. So the
+  fan-out is pure read configuration: `sync_config_from_council` now returns the committed
+  `(configuration, members)` and fans them to every other shard, each installing them read-only
+  (version-gated). Test `a_committed_retirement_reaches_every_shards_placement_view` (same shape,
+  non-vacuity-checked). Takeover stays correctly centralized on the control shard.
+- **A longer suite surfaced a pre-existing flake** in `a_committed_promotion_reaches_every_shards_lookup_view`
+  (the test added with this root fix). Adding the placement test lengthened the fleet suite (21 tests,
+  ~114s) and it failed once at suite-end on `every control shard re-homes...` — `proposed` was true (a
+  leader accepted the operator promote) but the commit never propagated, i.e. the leader lost root
+  leadership before the entry committed under load. It passed 5/5 in isolation and 6/6 under eight CPU
+  spinners; the fd limit is 1048576, so not exhaustion. Fixed by folding the **idempotent**
+  `promote_region` into the result poll — re-issued on the current leader each iteration until the region
+  re-homes on every shard (a second identical `PromoteRegion` is a no-op once applied). Lesson: a
+  test's one-shot operator consensus action must be retried in the poll, because leadership can flap
+  under load between the leader check and the commit.
 - No other per-shard state read on a client path depends on a control-shard-only configuration: the
   detector's failure view is already fanned (`fold_peer_state`), and `placed_heads` is recorded per
   owner shard.
