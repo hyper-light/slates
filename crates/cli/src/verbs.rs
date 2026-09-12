@@ -563,6 +563,10 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     }
     Verb::List => emit_list(client, json)?,
     Verb::DaemonStatus => emit_daemon_status(client, json)?,
+    Verb::PromoteRegion { region } => {
+      client.promote_region(*region)?;
+      emit_ok("region promoted", json);
+    }
     Verb::Status { volume, drift } => emit_status(client, *volume, *drift, json)?,
     // `mount`/`unmount` run `mount_nfs`/`umount` (CLI/OS operations whose failure is a `Failure`, not a
     // `ClientError`), so [`run`] handles them before this dispatch; they never reach here.

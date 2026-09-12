@@ -252,6 +252,15 @@ pub enum RequestBody {
   /// The daemon's own status (§4.14 `slates.status`: every shard's counters and health
   /// signals, and the anchor's view of the daemon as the segment holds it).
   DaemonStatus,
+  /// Promote a lost region's declared mirror (§4.8, D-14 — region-loss promotion at operator cadence): the
+  /// operator, having judged the region truly lost, proposes `PromoteRegion` on the root group so the lost
+  /// region's volumes re-home to the mirror. Issued on the root leader; a follower refuses `NotRootLeader`,
+  /// a region with no declared mirror refuses `Unsupported`. Operator-initiated, never automatic, so a merely
+  /// partitioned region is not failed over into a second owner.
+  PromoteRegion {
+    /// The lost region's id.
+    region: u64,
+  },
   /// Await a durability scope for a volume's head, or a snapshot (§4.8 D-18): returns when the
   /// scope is placed. At `f = 0` the region is the local append (already placed) and the
   /// mirror is refused `Unsupported`.
@@ -789,6 +798,9 @@ pub enum Refusal {
     /// The region id that now homes the volume.
     region: u64,
   },
+  /// A region-loss promotion (`PromoteRegion`) was issued on a node that is not the root leader, so it cannot
+  /// propose the change (§4.8, D-14). The operator re-issues it on the root leader (`status` names it).
+  NotRootLeader,
 }
 
 /// A reply body.

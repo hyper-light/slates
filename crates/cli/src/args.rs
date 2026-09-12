@@ -151,6 +151,12 @@ pub(crate) enum Verb {
   List,
   /// The daemon's status (`status` with no volume).
   DaemonStatus,
+  /// Promote a lost region's declared mirror on the root group (§4.8, D-14 — operator-initiated region-loss
+  /// promotion). Issued on the root leader, after the operator judges the region truly lost.
+  PromoteRegion {
+    /// The lost region's id.
+    region: u64,
+  },
   /// Status (`volume stat`, `status ID`).
   Status {
     /// The volume.
@@ -712,6 +718,14 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
       taken.only(&NONE)?;
       Ok(client(&taken, Verb::DaemonStatus))
     }
+    ["promote-region", region] => {
+      taken.only(&NONE)?;
+      let region = region.parse::<u64>().map_err(|e| ParseError::BadValue {
+        what: "region",
+        reason: e.to_string(),
+      })?;
+      Ok(client(&taken, Verb::PromoteRegion { region }))
+    }
     ["mount", id, path] => {
       taken.only(&NONE)?;
       Ok(client(
@@ -1106,6 +1120,21 @@ mod tests {
         http: Some(8787),
       }))
     );
+  }
+
+  /// `promote-region N` parses to the operator's region-loss promotion (§4.8, D-14 — "the operator issues it
+  /// (a CLI verb over this)"); a non-integer region is a usage error naming the bad value.
+  #[test]
+  fn the_grammar_parses_promote_region() {
+    let Command::Client(request) = parse(&args("promote-region 1 --instance a")).unwrap() else {
+      panic!("client");
+    };
+    assert_eq!(request.instance, "a");
+    assert_eq!(request.verb, Verb::PromoteRegion { region: 1 });
+    assert!(matches!(
+      parse(&args("promote-region notaregion")),
+      Err(ParseError::BadValue { what: "region", .. })
+    ));
   }
 
   /// A fleet node (§2.6 boot step 6): `--fleet PATH --node NAME` on the daemon or the anchor, both or

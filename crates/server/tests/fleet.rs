@@ -1136,6 +1136,85 @@ fn an_operator_promotes_a_lost_regions_mirror_over_the_transport() {
   );
 }
 
+/// AC (§4.8, D-14, §4.12): the operator's region-loss promotion is reachable **over the client protocol** —
+/// the `RequestBody::PromoteRegion` the `slates promote-region` verb sends, the surface the design mandates
+/// ("the operator issues it (a CLI verb over this)"). A client connected to the root leader promotes a
+/// region's declared mirror; the daemon routes the request to its control shard, proposes on the root group,
+/// and every node re-homes the region's volumes to the mirror. (`an_operator_promotes...` proves the
+/// loss-detection and the promotion via the daemon method; this proves the client → IPC → `serve` →
+/// control-shard → root-group path the CLI drives.) All three stay alive — this isolates the client path,
+/// not loss detection — so the region is promoted while live (the re-home is what is observed).
+#[test]
+fn a_client_promotes_a_regions_mirror_over_the_promote_verb() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  let regions: std::collections::BTreeMap<HostId, RegionId> = [
+    (hosts[0], RegionId(0)),
+    (hosts[1], RegionId(1)),
+    (hosts[2], RegionId(2)),
+  ]
+  .into_iter()
+  .collect();
+  let mirrors: std::collections::BTreeMap<RegionId, RegionId> =
+    [(RegionId(1), RegionId(0)), (RegionId(2), RegionId(0))]
+      .into_iter()
+      .collect();
+  let daemons =
+    start_mesh_with_regions_and_mirrors(nodes, &hosts, &certs, &serve, 1, &regions, &mirrors);
+
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let daemons: Vec<(HostId, Daemon)> = hosts.iter().copied().zip(daemons).collect();
+  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, || {
+    daemons
+      .iter()
+      .filter(|(_, daemon)| daemon.root_leads())
+      .count()
+      == 1
+  });
+  let lost = RegionId(1);
+  let mirror = RegionId(0);
+  let volume = ObjectId::new(hosts[1], 7); // a volume created in region 1
+
+  // Send `PromoteRegion` over a client to the **current** root leader, re-finding it each poll iteration and
+  // reconnecting if it changed: root leadership can flap under load, and only the leader can propose, so a
+  // client pinned to an ex-leader would be refused `NotRootLeader` forever. `PromoteRegion` is idempotent, so
+  // re-sending is safe. This mirrors how the daemon-side test re-issues on the current leader.
+  let mut leader_client: Option<(HostId, Client)> = None;
+  let promoted = elected
+    && poll_until(COUNCIL_RETIRE_DEADLINE, || {
+      if let Some((host, _)) = daemons.iter().find(|(_, daemon)| daemon.root_leads()) {
+        let host = *host;
+        if leader_client.as_ref().map(|(held, _)| *held) != Some(host) {
+          leader_client = Some((host, Client::connect(&format!("fleet3-{}-{pid}", host.0))));
+        }
+        if let Some((_, client)) = leader_client.as_mut() {
+          let _ = client.call(&RequestBody::PromoteRegion { region: lost.0 });
+        }
+      }
+      daemons
+        .iter()
+        .all(|(_, daemon)| daemon.region_home(volume, lost) == mirror)
+    });
+
+  for (_, daemon) in daemons {
+    daemon.stop();
+  }
+  assert!(elected, "the root group elected a single leader");
+  assert!(
+    promoted,
+    "a client's PromoteRegion committed on the root leader — every node re-homed the region's volumes to the \
+     mirror, so the operator's CLI promotion reaches the root group over the client protocol"
+  );
+}
+
 /// AC (§4.8 "Lookup", D-14): the cross-region lookup guard (`verbs::home_redirect`) runs on whatever shard a
 /// client's request lands on, so the committed root configuration must reach **every** shard of a multi-shard
 /// daemon — not only the control shard that drives the root group over the transport. Here each daemon runs

@@ -81,7 +81,11 @@ slates anchor --fleet /etc/slates/fleet.json --node a
   `{ "0": 1, "1": 0 }` (region 0's data is mirrored to region 1). A region with a mirror is **not** failed
   over automatically when its hosts are lost — a region that is merely partitioned would be failed over while
   still serving, creating a second owner — so it stays in the fleet until an operator deliberately promotes
-  its mirror; a region with no mirror is simply retired when its hosts are all lost. Empty by default.
+  its mirror; a region with no mirror is simply retired when its hosts are all lost. Empty by default. The
+  operator promotes a lost region's mirror with `slates promote-region REGION`, issued on the root leader
+  (`slates status` shows which node leads the root group): it commits `PromoteRegion` on the root group and
+  every node re-homes the lost region's volumes to the mirror. Issued on a follower it is refused
+  `NotRootLeader`; a region with no declared mirror is refused `Unsupported`.
 
 `slates status` on any node shows its place in the fleet: `fleet_host` (its member id),
 `fleet_f`, `fleet_host_epoch`, `fleet_members` (the members it holds alive) and
@@ -119,6 +123,7 @@ slates attach ID [--read | --write] [--snapshot N] [--json]
 slates detach ATTACHMENT [--json]
 slates status [--json]
 slates status ID [--drift] [--json]
+slates promote-region REGION [--json]
 slates base read ID PATH
 slates base rewitness ID [PATH ...] [--json]
 slates base pin ID [PATH ...] [--json]

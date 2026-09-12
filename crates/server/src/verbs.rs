@@ -206,6 +206,7 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::Detach { .. }
     | RequestBody::List
     | RequestBody::DaemonStatus
+    | RequestBody::PromoteRegion { .. }
     | RequestBody::Grants
     | RequestBody::Audit { .. }
     | RequestBody::Acknowledge { .. }
@@ -247,6 +248,69 @@ fn home_redirect(
   let object = ObjectId(volume.bytes);
   let home = root.home_of(object, region_of(object.creator()));
   (home != region_of(own_host)).then_some(home.0)
+}
+
+/// Routes an operator's `PromoteRegion` to the **control shard**, where the root group is driven (§4.8, D-14 —
+/// region-loss promotion at operator cadence). The root group's `propose` is synchronous, so when the client
+/// landed on the control shard the promotion is proposed inline; otherwise the propose runs on the control
+/// shard and the reply is delivered back to the origin (the single-target form of the status scatter). The
+/// operator issues this on the root leader; a follower's root group cannot propose, so it refuses
+/// `NotRootLeader`.
+fn promote_region_on_root(
+  state: &mut ShardState,
+  client_index: u32,
+  request: u64,
+  region: u64,
+) -> Served {
+  let Some(control) = state.shards.first().copied() else {
+    return Served::Reply(refused(Refusal::NotFound));
+  };
+  if state.shard == control {
+    return Served::Reply(propose_region_promotion(state, region));
+  }
+  let origin = state.shard;
+  let task = SpawnRequest::new(
+    Box::pin(async move {
+      let reply = crate::state::with_state(|s| propose_region_promotion(s, region))
+        .unwrap_or_else(|| refused(Refusal::NotFound));
+      let back = SpawnRequest::new(
+        Box::pin(async move {
+          crate::state::deliver(client_index, request, reply, false);
+        }),
+        None,
+      );
+      let _ = slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)));
+    }),
+    None,
+  );
+  if slates_rt::registry::send_control(control, Control::Spawn(Box::new(task))).is_err() {
+    return Served::Reply(refused(Refusal::NotFound));
+  }
+  Served::Forwarded
+}
+
+/// Proposes a lost region's promotion to its declared mirror on this shard's root group (§4.8, D-14). Refuses
+/// `Unsupported` when the region has no declared mirror (the operator declares mirrors in the manifest), and
+/// `NotRootLeader` when this node's root group is not the leader, so cannot propose. Idempotent: a promotion
+/// re-proposed after it has committed is a no-op (`RootConfiguration::home_of` follows the recorded promotion).
+fn propose_region_promotion(state: &mut ShardState, region: u64) -> ReplyBody {
+  let region = slates_db::register::RegionId(region);
+  let Some(&mirror) = state.region_mirrors.get(&region) else {
+    return refused(Refusal::Unsupported {
+      feature: "region-loss promotion (the region has no declared mirror)".to_owned(),
+    });
+  };
+  if state
+    .root
+    .propose(slates_cluster::root_group::RootCommand::PromoteRegion {
+      lost: region,
+      mirror,
+    })
+  {
+    ReplyBody::Acknowledged
+  } else {
+    refused(Refusal::NotRootLeader)
+  }
 }
 
 /// Serves one request for one client: the completion window first (a retry returns the
@@ -298,6 +362,9 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   }
   if let RequestBody::DaemonStatus = body {
     return scatter_status(state, client.index(), request.request);
+  }
+  if let RequestBody::PromoteRegion { region } = body {
+    return promote_region_on_root(state, client.index(), request.request, region);
   }
   if let RequestBody::Acknowledge { up_to } = body {
     return scatter_acknowledge(state, client.index(), request.request, client_id, up_to);
@@ -941,6 +1008,7 @@ fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::GrantMismatch => "grant_mismatch",
     Refusal::GrantInvalid => "grant_invalid",
     Refusal::HomedElsewhere { .. } => "homed_elsewhere",
+    Refusal::NotRootLeader => "not_root_leader",
   }
 }
 
@@ -1043,6 +1111,9 @@ fn dispatch_inner(
       let mine = shard_report(state);
       daemon_report(state, vec![mine])
     }
+    // `serve` routes this to the control shard (`promote_region_on_root`) before dispatch; this defensive arm
+    // proposes on whatever shard reached it — correct on the control shard, refused `NotRootLeader` otherwise.
+    RequestBody::PromoteRegion { region } => propose_region_promotion(state, region),
     RequestBody::AwaitPlaced {
       volume,
       snapshot,

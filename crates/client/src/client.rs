@@ -1118,6 +1118,21 @@ impl Client {
     }
   }
 
+  /// Promotes a lost region's declared mirror on the root group (§4.8, D-14 — operator-initiated region-loss
+  /// promotion). `Ok` once the promotion is accepted: it commits on the root group and every node re-homes the
+  /// lost region's volumes to the mirror. Refused `NotRootLeader` when this daemon's root group is not the
+  /// leader — the operator re-issues it on the leader (`status` names it) — or `Unsupported` when the region
+  /// has no declared mirror. The operator issues this only after judging the region truly lost; a merely
+  /// partitioned region is never failed over automatically, so its mirror is not promoted into a second owner.
+  pub fn promote_region(&mut self, region: u64) -> Result<(), ClientError> {
+    match self.call(&RequestBody::PromoteRegion { region })? {
+      ReplyBody::Acknowledged => Ok(()),
+      _ => Err(ClientError::UnexpectedReply {
+        verb: "promote_region",
+      }),
+    }
+  }
+
   /// Creates a green volume — a shared merge target (§4.16); its id.
   pub fn create_green(
     &mut self,
