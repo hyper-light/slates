@@ -211,6 +211,122 @@ fn run_commit(serve: [bool; 2]) -> Result<Placement, String> {
   run_commit_full(serve, GENERATION).0
 }
 
+/// The count of live task slots after an `f = 1` commit whose owner then **parks forever** — a stand-in for
+/// the perpetual record-plane coordinator (`slates_server::fleet::run_record_plane`) under which every commit
+/// runs. The holders handshake but never serve, so each of the two dispatch tasks the commit spawns waits for
+/// a reply that never comes and times out at the deadline (completing). Because the owner never finishes, it
+/// never reaps its children on completion; a dispatch task whose slot is not **detached** would linger there
+/// forever (banned item 8: unbounded task growth). With the slots detached, only the parked owner remains.
+fn live_tasks_after_a_parked_commit() -> usize {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+
+  let owner_identity = self_signed(NAME);
+  let owner_cert = owner_identity.certificate();
+  let holder_identities = [self_signed(NAME), self_signed(NAME)];
+  let holder_certs = [
+    holder_identities[0].certificate(),
+    holder_identities[1].certificate(),
+  ];
+
+  let mut owner_port_tx = Vec::new();
+  let mut owner_port_rx = Vec::new();
+  let mut holder_port_tx = Vec::new();
+  let mut holder_port_rx = Vec::new();
+  for _ in 0..2 {
+    let (otx, orx) = channel::<u16>();
+    let (htx, hrx) = channel::<u16>();
+    owner_port_tx.push(otx);
+    owner_port_rx.push(orx);
+    holder_port_tx.push(htx);
+    holder_port_rx.push(hrx);
+  }
+
+  // The holders: handshake, then leave without serving — each dispatch task waits for a reply that never
+  // comes and times out at the deadline (a completed task whose slot is then reclaimable).
+  let holder_setup = holder_identities
+    .into_iter()
+    .zip(owner_port_rx)
+    .zip(holder_port_tx);
+  for ((holder_identity, orx), htx) in holder_setup {
+    let owner_cert = owner_cert.clone();
+    sim
+      .spawn_on(id, async move {
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let _ = htx.send(socket.local_addr().unwrap().port());
+        let owner_port = recv_port(orx).await;
+        let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, owner_port);
+        let mut endpoint = Endpoint::server(
+          socket,
+          peer,
+          &holder_identity,
+          std::slice::from_ref(&owner_cert),
+          FRAME_CAP,
+        )
+        .unwrap();
+        endpoint.establish().await.unwrap();
+      })
+      .unwrap();
+  }
+
+  // The owner: dial both holders, commit (dispatching two tasks), then park forever — never finishing, so it
+  // never reaps its children by completing; only detaching their slots keeps them from leaking.
+  sim
+    .spawn_on(id, async move {
+      let dial = owner_port_tx
+        .into_iter()
+        .zip(holder_port_rx)
+        .zip(holder_certs);
+      let mut remotes = Vec::new();
+      for (index, ((owner_port_tx, holder_port_rx), holder_cert)) in dial.enumerate() {
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let _ = owner_port_tx.send(socket.local_addr().unwrap().port());
+        let holder_port = recv_port(holder_port_rx).await;
+        let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, holder_port);
+        let mut endpoint =
+          Endpoint::client(socket, peer, &owner_identity, &holder_cert, NAME, FRAME_CAP).unwrap();
+        endpoint.establish().await.unwrap();
+        remotes.push((HostId(u64::try_from(index).unwrap_or(0) + 2), endpoint));
+      }
+      let mut owner_acceptor = Acceptor::new(OWNER, authority());
+      let candidates = [OWNER, HostId(2), HostId(3)];
+      let _committed = commit_record(
+        OWNER,
+        &mut owner_acceptor,
+        &candidates,
+        &record(b"head@v1"),
+        Quorum { f: 1 },
+        remotes,
+        CommitBudget::hard(DEADLINE_NS, POLL_NS),
+      )
+      .await;
+      // Stand in for the perpetual coordinator: never finish, so children are never reaped by the parent's
+      // completion — a leaked (joinable, un-detached) dispatch task slot would live forever here.
+      loop {
+        slates_rt::futures::idle().await;
+      }
+    })
+    .unwrap();
+
+  sim.run_until_idle();
+  sim.context(id).unwrap().live_tasks()
+}
+
+/// AC (§4.8; banned item 8 — no unbounded task growth): the dispatch tasks a commit spawns are children of
+/// the record-plane coordinator, which never finishes; each task's slot must be reaped when the task
+/// terminates, not linger until the (perpetual) parent does. After a commit whose owner then parks forever,
+/// only the parked owner's slot remains — both dispatch tasks' slots were reaped on completion. Before the
+/// fix (the slots were joinable and never joined or detached) the two completed dispatch tasks leaked their
+/// slots and this count was three.
+#[test]
+fn a_commits_dispatch_task_slots_are_reaped_under_a_perpetual_parent() {
+  assert_eq!(
+    live_tasks_after_a_parked_commit(),
+    1,
+    "only the parked owner remains; both dispatch task slots were reaped on completion, not leaked"
+  );
+}
+
 /// AC (acceptance history 1): the same `commit_record` at `f = 0` places on the owner's local hold
 /// alone — one candidate, commit at one — with no dispatch (the laptop degenerate; the observable
 /// outcome, placed, is the same as the successful `f = 1` case). Run on the sim only to drive the

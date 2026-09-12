@@ -53,7 +53,7 @@ use slates_db::register::{
   Quorum, Record, Refusal, candidates_for, decode_refusal, encode_refusal,
 };
 use slates_rt::error::RtError;
-use slates_rt::futures::{cancel, now_ns, sleep, spawn_child};
+use slates_rt::futures::{cancel, detach, now_ns, sleep, spawn_child};
 use slates_transport::endpoint::Endpoint;
 
 use crate::progress::{DeadlineExtender, ExtensionOutcome, ProgressWitness};
@@ -545,6 +545,16 @@ pub async fn commit_record(
   )
   .await;
 
+  // Detach every dispatch task so its slot is reaped when it terminates, not held (joinable) until this
+  // caller finishes — and the caller is the perpetual record-plane coordinator, so an un-detached slot would
+  // leak forever, one per dispatched holder per period (banned item 8: no unbounded task growth). A task that
+  // already replied is reaped now; a straggler still in flight self-reaps on completion, having handed its
+  // session back over the channel `stragglers` drains — detaching does not cancel it, so the early-quorum and
+  // timed-out stragglers still finish and return their sessions.
+  for task in &tasks {
+    let _ = detach(*task);
+  }
+
   // Whatever is still running is left to finish — a straggler cut off by a cancellation (an early quorum
   // at f > 1, or a commit that timed out just before its reply) would lose its session, which the
   // per-peer-socket mesh cannot re-establish. Each straggler is bounded by the dispatch's full span and
@@ -806,6 +816,14 @@ pub async fn promote_record(
   )
   .await;
 
+  // Detach every dispatch task so its slot is reaped on termination, not held (joinable) until this
+  // perpetual caller finishes — an un-detached slot would leak, one per holder per takeover (banned item 8).
+  // Detaching does not cancel: a straggler still promising self-reaps on completion, having handed its
+  // session back over the channel `stragglers` drains.
+  for task in &tasks {
+    let _ = detach(*task);
+  }
+
   // Whatever is still running is left to finish (bounded by the dispatch's span) and hands its session
   // back through the channel — recovered by the caller from `stragglers`, never dropped.
   let stragglers = Stragglers::pending(rx);
@@ -1065,6 +1083,14 @@ pub async fn promote_ledger_record(
     &mut logs,
   )
   .await;
+
+  // Detach every dispatch task so its slot is reaped on termination, not held (joinable) until this
+  // perpetual caller finishes — an un-detached slot would leak, one per holder per ledger takeover (banned
+  // item 8). Detaching does not cancel: a straggler still promising self-reaps on completion, having handed
+  // its session back over the channel `stragglers` drains.
+  for task in &tasks {
+    let _ = detach(*task);
+  }
 
   // Whatever is still running is left to finish (bounded by the dispatch's span) and hands its session
   // back through the channel — recovered by the caller from `stragglers`, never dropped.

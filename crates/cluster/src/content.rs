@@ -47,7 +47,7 @@ use slates_archive::format::{ArchiveError, Chunk};
 use slates_archive::{Archive, ContentStore, Node, chunks_for};
 use slates_db::register::{HostId, ObjectId, Placement, Quorum};
 use slates_rt::error::RtError;
-use slates_rt::futures::{now_ns, spawn_child};
+use slates_rt::futures::{detach, now_ns, spawn_child};
 use slates_transport::endpoint::Endpoint;
 
 use crate::{
@@ -603,9 +603,18 @@ fn dispatch_round(
       let (reply, endpoint) = request_within(endpoint, stream, &bytes, deadline_ns).await;
       let _ = reply_tx.send(Reply(host, reply, Box::new(endpoint)));
     });
-    if let Err(error) = spawned {
-      drop(tx);
-      return Err((error, rx));
+    match spawned {
+      // Detach at once so the task's slot is reaped when it terminates, not held (joinable) until this
+      // perpetual caller finishes — an un-detached content dispatch would leak a slot per holder per put
+      // (banned item 8). Detaching does not cancel: the task still runs and hands its session back over the
+      // channel the caller drains.
+      Ok(task) => {
+        let _ = detach(task);
+      }
+      Err(error) => {
+        drop(tx);
+        return Err((error, rx));
+      }
     }
   }
   drop(tx); // so the channel disconnects once every task has ended
