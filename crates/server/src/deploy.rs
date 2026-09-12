@@ -331,6 +331,10 @@ pub fn plan(
       peers: peer_hosts,
       host,
       domains,
+      // A single region by default (every host in region 0), so the root group is the degenerate
+      // self-leading group; the operator's per-node region declaration in the manifest — the cross-region
+      // deployment — is the owed follow-on, exactly as the failure-domain declaration was for neighbourhoods.
+      regions: std::collections::BTreeMap::new(),
     },
     transport: FleetTransport {
       identity,

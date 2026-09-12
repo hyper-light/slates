@@ -93,7 +93,7 @@ use slates_db::catalog::{
 };
 use slates_db::register::{
   Acceptor, Authority, FIRST_EPOCH, HostEpoch, HostId, ObjectId, Placement, Prepare, Quorum,
-  Record, candidates_for, encode_refusal,
+  Record, RegionId, candidates_for, encode_refusal,
 };
 use slates_rt::futures;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
@@ -778,6 +778,7 @@ async fn serve_peer_records(
         CONFIG_FETCH_STREAM => {
           state::with_state(|s| serve_config_fetch(s, &request)).unwrap_or_default()
         }
+        ROOT_STREAM => state::with_state(|s| serve_root(s, &request)).unwrap_or_default(),
         _ => Vec::new(),
       })
       .await;
@@ -1556,6 +1557,11 @@ const CONFIG_STREAM: u64 = 7;
 /// adopts a newer one — the design's config-learning path, distinct from the Raft stream (7) above.
 const CONFIG_FETCH_STREAM: u64 = 8;
 
+/// Format: the stream id the **root group's** Raft messages ride on a record session (§4.8, D-14 — the root
+/// group across regions), distinct from the regional council's stream (7): the same session multiplexes both
+/// consensus planes, and `serve_peer_records` dispatches a root message to the root group by this stream.
+const ROOT_STREAM: u64 = 9;
+
 /// The configuration council's election timeout, in record-plane heartbeat periods: a follower that goes
 /// this many periods without a leader's append presumes the leader gone and campaigns. The per-node spread
 /// ([`election_jitter`]) adds a further `[0, this)`, making the effective timeout uniform in `[this, 2·this)`
@@ -1584,6 +1590,21 @@ fn serve_council(state: &mut ShardState, request: &[u8]) -> Vec<u8> {
   match RaftMessage::decode(request) {
     Ok(message) => state
       .council
+      .answer(message)
+      .map(|reply| reply.encode())
+      .unwrap_or_default(),
+    Err(_) => Vec::new(),
+  }
+}
+
+/// Answers a root-group Raft request received over the transport ([`ROOT_STREAM`]) — the cross-region
+/// counterpart of [`serve_council`]: runs it through this node's [`RootGroup`](slates_cluster::root_group::RootGroup),
+/// returning the reply to ship back and applying whatever newly committed to the root configuration. A
+/// reply-typed or malformed message is answered with nothing.
+fn serve_root(state: &mut ShardState, request: &[u8]) -> Vec<u8> {
+  match RaftMessage::decode(request) {
+    Ok(message) => state
+      .root
       .answer(message)
       .map(|reply| reply.encode())
       .unwrap_or_default(),
@@ -1884,6 +1905,203 @@ async fn drive_config_council(
   }
 }
 
+/// The regions currently **alive** as this node sees them (§4.8, D-14): the distinct regions of the SWIM
+/// alive set, mapped through the fleet's host→region assignment (a host absent from the map is in the sole
+/// region `RegionId(0)`). The root group's leader reconciles the region membership against this — an alive
+/// host's region is an alive region, and a region with no alive host is retired.
+fn alive_regions(state: &ShardState) -> Vec<RegionId> {
+  let mut regions: Vec<RegionId> = state
+    .fleet
+    .membership()
+    .alive()
+    .into_iter()
+    .map(|host| {
+      state
+        .node_regions
+        .get(&host)
+        .copied()
+        .unwrap_or(RegionId(0))
+    })
+    .collect();
+  regions.sort_unstable_by_key(|region| region.0);
+  regions.dedup();
+  regions
+}
+
+/// Drives this node's **root group** one period from the record-plane coordinator (§4.8, D-14 — the root
+/// group across regions), the cross-region counterpart of [`drive_config_council`] and structurally its
+/// parallel (a third such consensus group would motivate factoring the shared Raft-drive shape). As the
+/// elected root master it reconciles the region membership from the regions currently alive
+/// ([`alive_regions`]) and replicates over the transport ([`ROOT_STREAM`]); the sole voter self-elects; a
+/// follower ages toward an election. A node that is **not** a root voter (not a region representative) does
+/// nothing here — the root **learner** that fetches the committed root configuration is the owed follow-on,
+/// so a non-representative host does not yet track the root configuration (nor does the verb path read it
+/// yet). `idle`, `seen_contact` and `attempt` are the root group's own persistent election-timer state,
+/// distinct from the council's.
+async fn drive_root_group(
+  local: HostId,
+  budget: CommitBudget,
+  idle: &mut u32,
+  seen_contact: &mut u64,
+  attempt: &mut u32,
+) {
+  let Some((is_voter, is_leader, contact, voters)) = state::with_state(|s| {
+    let voters = s.root.voters();
+    (
+      s.root.is_voter(local),
+      s.root.is_leader(),
+      s.root.leader_contact(),
+      voters,
+    )
+  }) else {
+    return;
+  };
+  if !is_voter {
+    return;
+  }
+  let others: Vec<HostId> = voters.into_iter().filter(|voter| *voter != local).collect();
+
+  if is_leader {
+    // As the root master, reconcile the region membership from this node's own alive view: propose admitting
+    // any newly-alive region and retiring any region no host is alive in, committed over the transport by the
+    // replication below and applied on every root voter.
+    state::with_state(|s| {
+      let alive = alive_regions(s);
+      s.root.reconcile_regions(&alive)
+    });
+    drive_root_replication(&others, budget).await;
+    *idle = 0;
+    return;
+  }
+  if others.is_empty() {
+    // The sole root voter (a single-region fleet's degenerate): self-elect, then it leads next period.
+    let _ = state::with_state(|s| s.root.election_timeout());
+    *idle = 0;
+    return;
+  }
+  // A follower: reset the timer while the leader keeps making contact; otherwise age toward an election.
+  if contact != *seen_contact {
+    *seen_contact = contact;
+    *idle = 0;
+    return;
+  }
+  *idle = idle.saturating_add(1);
+  if *idle >= ELECTION_HEARTBEATS.saturating_add(election_jitter(local, *attempt)) {
+    *attempt = attempt.saturating_add(1);
+    *idle = 0;
+    drive_root_election(&others, budget).await;
+    *seen_contact = state::with_state(|s| s.root.leader_contact()).unwrap_or(*seen_contact);
+  }
+}
+
+/// The root group's replication round over the transport — the parallel of [`drive_council_replication`] on
+/// [`ROOT_STREAM`], reading [`ShardState::root`]: builds the append owed each borrowed root voter under a
+/// brief borrow, ships them concurrently, folds the replies, and returns every session.
+async fn drive_root_replication(others: &[HostId], budget: CommitBudget) {
+  let sessions = take_sessions(|host| others.contains(&host));
+  if sessions.is_empty() {
+    return;
+  }
+  let appends: std::collections::BTreeMap<HostId, Vec<u8>> = state::with_state(|s| {
+    sessions
+      .iter()
+      .filter_map(|(host, _)| {
+        s.root
+          .replication_for(*host)
+          .map(|append| (*host, RaftMessage::AppendEntries(append).encode()))
+      })
+      .collect()
+  })
+  .unwrap_or_default();
+  let mut requests = Vec::new();
+  let mut kept = Vec::new();
+  for (host, endpoint) in sessions {
+    match appends.get(&host) {
+      Some(bytes) => requests.push((host, bytes.clone(), endpoint)),
+      None => kept.push((host, endpoint)),
+    }
+  }
+  let replied = broadcast(requests, ROOT_STREAM, budget).await;
+  let mut recovered = kept;
+  let mut replies = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    replies.push(reply);
+    recovered.push((host, endpoint));
+  }
+  state::with_state(|s| {
+    for reply in replies {
+      if let Ok(message) = RaftMessage::decode(&reply) {
+        s.root.fold_reply(message);
+      }
+    }
+  });
+  return_sessions(recovered);
+}
+
+/// The root group's pre-vote then vote election over the transport — the parallel of
+/// [`drive_council_election`] on [`ROOT_STREAM`], reading [`ShardState::root`].
+async fn drive_root_election(others: &[HostId], budget: CommitBudget) {
+  let Some(Some(pre_vote)) = state::with_state(|s| s.root.election_timeout().into_iter().next())
+  else {
+    return;
+  };
+  let sessions = take_sessions(|host| others.contains(&host));
+  if sessions.is_empty() {
+    return;
+  }
+  // Phase one — the pre-vote round over the borrowed root-voter sessions.
+  let pre_bytes = pre_vote.encode();
+  let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, pre_bytes.clone(), endpoint))
+    .collect();
+  let replied = broadcast(requests, ROOT_STREAM, budget).await;
+  let mut sessions = Vec::with_capacity(replied.len());
+  let mut pre_replies = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    pre_replies.push(reply);
+    sessions.push((host, endpoint));
+  }
+  // Fold the pre-vote replies; a granted majority yields the real vote request to broadcast next.
+  let vote = state::with_state(|s| {
+    let mut vote = None;
+    for reply in &pre_replies {
+      if let Ok(message) = RaftMessage::decode(reply)
+        && let Some(request) = s.root.fold_reply(message).into_iter().next()
+      {
+        vote = Some(request);
+      }
+    }
+    vote
+  })
+  .flatten();
+  let Some(vote) = vote else {
+    return_sessions(sessions);
+    return;
+  };
+  // Phase two — the real vote round over the same sessions.
+  let vote_bytes = vote.encode();
+  let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, vote_bytes.clone(), endpoint))
+    .collect();
+  let replied = broadcast(requests, ROOT_STREAM, budget).await;
+  let mut recovered = Vec::with_capacity(replied.len());
+  let mut vote_replies = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    vote_replies.push(reply);
+    recovered.push((host, endpoint));
+  }
+  state::with_state(|s| {
+    for reply in vote_replies {
+      if let Ok(message) = RaftMessage::decode(&reply) {
+        s.root.fold_reply(message);
+      }
+    }
+  });
+  return_sessions(recovered);
+}
+
 /// Drives a **learner** (a non-voter member) one period: fetches the committed regional configuration from
 /// the council voters it has a session to and adopts the newest (§4.8, D-14 — the council is a small elected
 /// set, so a non-voter learns the configuration rather than voting on it; the adopted configuration is then
@@ -2008,6 +2226,11 @@ async fn run_record_plane(local: HostId, budget: CommitBudget) {
   let mut council_idle: u32 = 0;
   let mut council_seen_contact: u64 = 0;
   let mut council_attempt: u32 = 0;
+  // The root group's own election-timer state (§4.8, D-14 — the cross-region authority), distinct from the
+  // council's: it is a separate Raft over the region representatives, driven from this same coordinator.
+  let mut root_idle: u32 = 0;
+  let mut root_seen_contact: u64 = 0;
+  let mut root_attempt: u32 = 0;
   loop {
     in_flight.retain_mut(|dispatch| !dispatch.settle());
     // Drive the configuration authority first — an election or a replication heartbeat over the transport —
@@ -2018,6 +2241,16 @@ async fn run_record_plane(local: HostId, budget: CommitBudget) {
       &mut council_idle,
       &mut council_seen_contact,
       &mut council_attempt,
+    )
+    .await;
+    // Drive the root group across regions on the same coordinator (§4.8, D-14): a brief borrow of the
+    // root-voter sessions, sequential with the council's and the record ships, so it never contends.
+    drive_root_group(
+      local,
+      budget,
+      &mut root_idle,
+      &mut root_seen_contact,
+      &mut root_attempt,
     )
     .await;
     // Install the configuration the council has agreed into this node's placement view, and take over any

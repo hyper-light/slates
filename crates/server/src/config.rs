@@ -5,7 +5,7 @@ use slates_anchor::Geometry;
 use slates_db::partition::PartitionCaps;
 use std::collections::BTreeMap;
 
-use slates_db::register::{DomainId, HostId, Quorum, scatter_width};
+use slates_db::register::{DomainId, HostId, Quorum, RegionId, scatter_width};
 use slates_ipc::RegionGeometry;
 use slates_machine::{Derived, MachineProfile, derived};
 use slates_mem::budget::region_bytes;
@@ -110,6 +110,12 @@ pub struct FleetMembership {
   /// domains (D-14). A host absent from the map is its own domain (unique-per-host) — the default when the
   /// deployment declares none. Installed into the configuration group at boot (`init_shard`).
   pub domains: BTreeMap<HostId, DomainId>,
+  /// Each fleet member's **region** (§4.8, D-14 — "a root group across regions holds region membership"), so
+  /// the root group agrees on which regions exist and the regional council scopes its membership to the hosts
+  /// of one region. A host absent from the map is in the **sole region** [`RegionId(0)`] — the default when
+  /// the deployment declares none, which collapses to a single-region fleet whose root group is the degenerate
+  /// self-leading group (R8). This node's own region is `regions[host]` (or the sole region if absent).
+  pub regions: BTreeMap<HostId, RegionId>,
 }
 
 /// The daemon's configuration.

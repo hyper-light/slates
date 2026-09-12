@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use rustls::pki_types::PrivateKeyDer;
 use slates_db::HostId;
-use slates_db::register::{ObjectId, Quorum, rendezvous_first};
+use slates_db::register::{ObjectId, Quorum, RegionId, rendezvous_first};
 use slates_ipc::protocol::{
   Direction, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass, SnapshotId, VolumeId, pack,
   unpack,
@@ -210,6 +210,7 @@ fn start_sharded(this: Node, peer: Peer, shards: u16) -> Daemon {
       peers: vec![peer.host],
       host: this.host,
       domains: std::collections::BTreeMap::new(),
+      regions: std::collections::BTreeMap::new(),
     });
   let transport = FleetTransport {
     identity: this.identity,
@@ -464,10 +465,32 @@ fn start_mesh_with_f(
   serve: &[(u16, u16)],
   f: u32,
 ) -> Vec<Daemon> {
-  start_mesh_with(nodes, hosts, certs, serve, f, 1)
+  start_mesh_with(
+    nodes,
+    hosts,
+    certs,
+    serve,
+    f,
+    1,
+    &std::collections::BTreeMap::new(),
+  )
 }
 
-/// [`start_mesh_with_f`] with `shards` shards per daemon (see [`start_sharded`]).
+/// [`start_mesh_with_f`] but assigning each host a **region** (§4.8, D-14), so the root group spans more than
+/// one region and its cross-region drive runs over the transport rather than the single-region degenerate.
+fn start_mesh_with_regions(
+  nodes: Vec<(MachineProfile, HostId, Identity)>,
+  hosts: &[HostId],
+  certs: &[rustls::pki_types::CertificateDer<'static>],
+  serve: &[(u16, u16)],
+  f: u32,
+  regions: &std::collections::BTreeMap<HostId, slates_db::register::RegionId>,
+) -> Vec<Daemon> {
+  start_mesh_with(nodes, hosts, certs, serve, f, 1, regions)
+}
+
+/// [`start_mesh_with_f`] with `shards` shards per daemon (see [`start_sharded`]) and each host's `regions`
+/// (empty = the single-region default).
 fn start_mesh_with(
   nodes: Vec<(MachineProfile, HostId, Identity)>,
   hosts: &[HostId],
@@ -475,6 +498,7 @@ fn start_mesh_with(
   serve: &[(u16, u16)],
   f: u32,
   shards: u16,
+  regions: &std::collections::BTreeMap<HostId, slates_db::register::RegionId>,
 ) -> Vec<Daemon> {
   let pid = std::process::id();
   let n = hosts.len();
@@ -500,6 +524,7 @@ fn start_mesh_with(
           peers: member_peers,
           host,
           domains: std::collections::BTreeMap::new(),
+          regions: regions.clone(),
         });
       let transport = FleetTransport {
         identity,
@@ -697,6 +722,78 @@ fn a_council_commits_a_membership_retirement_over_the_transport() {
     retired,
     "the council committed the dead follower's retirement over the transport and it reached placement — \
      every survivor dropped it from both its regional membership and its placement neighbourhood"
+  );
+}
+
+/// AC (§4.8, D-14 — the root group across regions, driven over the daemon transport): three daemons, each in
+/// its own region and thus its region's representative (so all three are root-group voters), elect one root
+/// leader over the transport; when a follower's region is lost (its only host is killed), the surviving root
+/// leader detects the death, proposes the region's retirement, and commits it over the transport — every
+/// survivor's committed root region membership (`root_regions`) drops the lost region. The whole path runs
+/// through the daemon's own record sessions and demultiplexer on [`ROOT_STREAM`], the cross-region counterpart
+/// of the regional council's commit path. A follower is killed, not the root leader, so the leader stays and
+/// reconciles (killing the leader would force a re-election first — a separate concern).
+///
+/// The council and the root group are separate consensus planes over the same transport. Here each daemon is
+/// its own single-host region purely to exercise the cross-region **drive** with the fewest daemons; a real
+/// deployment aligns them (a region's council over its hosts, the root group over region representatives) and
+/// declares regions in the manifest — the owed cross-region deployment.
+#[test]
+fn the_root_group_commits_a_region_retirement_over_the_transport() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  // Each host is its own region, so all three are region representatives (root voters) and the root group
+  // spans them; region i is `RegionId(i)`, aligned with the daemon index.
+  let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
+    .iter()
+    .enumerate()
+    .map(|(i, &host)| (host, RegionId(u64::try_from(i).unwrap_or(0))))
+    .collect();
+  let mut daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
+
+  assert_fleet_forms(&daemons, &hosts, &names);
+  // Wait for the root group to elect one leader, then kill a *follower* so the leader stays and reconciles.
+  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, || {
+    daemons.iter().filter(|daemon| daemon.root_leads()).count() == 1
+  });
+  let leader_idx = daemons.iter().position(|daemon| daemon.root_leads());
+  let victim_idx = leader_idx.and_then(|lead| (0..daemons.len()).find(|&i| i != lead));
+
+  let retired = match (elected, victim_idx) {
+    (true, Some(victim)) => {
+      let lost = RegionId(u64::try_from(victim).unwrap_or(0));
+      daemons.remove(victim).stop();
+      // The surviving root leader detects the death (SWIM), sees the lost region has no alive host, proposes
+      // its retirement, and commits it over the transport; every survivor drops the region from its committed
+      // root membership.
+      poll_until(COUNCIL_RETIRE_DEADLINE, || {
+        daemons
+          .iter()
+          .all(|daemon| !daemon.root_regions().contains(&lost))
+      })
+    }
+    _ => false,
+  };
+
+  // Stop the survivors before asserting, so a failure leaves none running.
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    elected,
+    "the root group elected a single leader over the transport before the kill"
+  );
+  assert!(
+    retired,
+    "the root group committed the lost region's retirement over the transport — every survivor dropped it \
+     from its committed root region membership"
   );
 }
 
@@ -1697,7 +1794,15 @@ fn a_takeover_successor_serves_a_volume_on_a_non_control_shard() {
   let pid = std::process::id();
   let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
   let serve = mesh_serve_ports(n);
-  let mut daemons = start_mesh_with(nodes, &hosts, &certs, &serve, 1, TWO_SHARDS);
+  let mut daemons = start_mesh_with(
+    nodes,
+    &hosts,
+    &certs,
+    &serve,
+    1,
+    TWO_SHARDS,
+    &std::collections::BTreeMap::new(),
+  );
   assert_fleet_forms(&daemons, &hosts, &names);
 
   let name = name_on_partition("served2", OTHER_PARTITION, usize::from(TWO_SHARDS));

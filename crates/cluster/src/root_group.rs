@@ -287,6 +287,36 @@ impl RootGroup {
     self.raft.last_log_index() == self.raft.commit_index()
   }
 
+  /// Reconciles the region membership with the set of regions currently **alive** — as the leader — the
+  /// cross-region counterpart of [`RegionalCouncil::reconcile_alive`](crate::config_group::RegionalCouncil::reconcile_alive):
+  /// proposes admitting every alive region not yet a member and retiring every member region no host is alive
+  /// in, each through the root log so it commits at a majority over the transport and applies on every voter.
+  /// Returns whether anything was proposed. A non-leader proposes nothing (only the elected root master
+  /// decides), and the [`caught_up`](RootGroup::caught_up) gate keeps a change in flight from being
+  /// re-proposed, so the log grows only for real changes. A lost region is **retired** here (the region-loss
+  /// **promotion** to a configured mirror — §4.8 "region loss promotes the mirror through the root group" — is
+  /// the owed refinement; without a mirror declared, a region with no live host simply leaves the membership).
+  pub fn reconcile_regions(&mut self, alive: &[RegionId]) -> bool {
+    if !self.is_leader() || !self.caught_up() {
+      return false;
+    }
+    let mut proposed = false;
+    for region in alive {
+      proposed |= self.propose(RootCommand::AdmitRegion(*region));
+    }
+    let stale: Vec<RegionId> = self
+      .configuration
+      .regions
+      .iter()
+      .copied()
+      .filter(|region| !alive.contains(region))
+      .collect();
+    for region in stale {
+      proposed |= self.propose(RootCommand::RetireRegion(region));
+    }
+    proposed
+  }
+
   /// Whether `node` is a **voter** of this root group — a host of its Raft consensus set. A non-voter learns
   /// the committed root configuration by fetching it and [`adopt`](RootGroup::adopt)ing it.
   pub fn is_voter(&self, node: HostId) -> bool {
@@ -481,5 +511,41 @@ mod tests {
         "a volume homed in the lost region is served from its promoted mirror"
       );
     }
+  }
+
+  /// AC (§4.8, D-14): the leader reconciles the region membership from the alive set — a newly-alive region is
+  /// admitted, a region no host is alive in is retired, each committed at the majority; a non-leader proposes
+  /// nothing, and a change still in flight is not re-proposed (the caught-up gate).
+  #[test]
+  fn the_leader_reconciles_region_membership_from_the_alive_set() {
+    let mut leader = group(P0); // regions [R0, R1]
+    let mut follower = group(P1);
+    elect(&mut leader, &mut follower);
+    assert!(leader.is_leader());
+
+    // R2 has become alive; R1 has lost every host. A non-leader proposes nothing.
+    let alive = [R0, R2];
+    assert!(
+      !follower.reconcile_regions(&alive),
+      "a non-leader proposes nothing"
+    );
+    assert!(
+      leader.reconcile_regions(&alive),
+      "the leader proposes admitting R2 and retiring R1"
+    );
+    assert!(
+      !leader.reconcile_regions(&alive),
+      "a change in flight is not re-proposed (the caught-up gate)"
+    );
+
+    replicate(&mut leader, &mut follower, 2);
+    for g in [&leader, &follower] {
+      assert!(g.configuration().regions.contains(&R2), "R2 was admitted");
+      assert!(!g.configuration().regions.contains(&R1), "R1 was retired");
+    }
+    assert!(
+      !leader.reconcile_regions(&alive),
+      "the settled membership reconciles to a no-op — the log grows only for real changes"
+    );
   }
 }

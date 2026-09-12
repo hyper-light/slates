@@ -428,6 +428,54 @@ impl Daemon {
       .unwrap_or_default()
   }
 
+  /// Whether this daemon leads the **root group** across regions (§4.8, D-14 — the root master). A one-shot
+  /// control-shard query bounded by the liveness budget; `false` if the daemon is stopping, is not on a
+  /// shard, or does not answer in time. Exposed so a fleet test can prove the root group elected a leader
+  /// over the transport.
+  pub fn root_leads(&self) -> bool {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
+      return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        let leads = state::with_state(|s| s.root.is_leader()).unwrap_or(false);
+        let _ = tx.send(leads);
+      })
+      .is_err()
+    {
+      return false;
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .unwrap_or(false)
+  }
+
+  /// The **region membership** this daemon's root group has committed and applied so far (§4.8, D-14) — the
+  /// regions of the `RootConfiguration`. A one-shot control-shard query bounded by the liveness budget; empty
+  /// if the daemon is stopping, is not on a shard, or does not answer in time. Exposed so a fleet test can
+  /// observe a region change (a promotion or a lost region's retirement) commit across the root group over the
+  /// transport.
+  pub fn root_regions(&self) -> Vec<slates_db::register::RegionId> {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
+      return Vec::new();
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        let regions =
+          state::with_state(|s| s.root.configuration().regions.clone()).unwrap_or_default();
+        let _ = tx.send(regions);
+      })
+      .is_err()
+    {
+      return Vec::new();
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .unwrap_or_default()
+  }
+
   /// This daemon's **placement** neighbourhood (§4.8, D-14): the neighbourhood of the configuration the node
   /// currently places under — the owner view it **installed from the council** (`FleetNode::configuration`),
   /// the set the verbs draw candidates from. Distinct from [`council_members`](Daemon::council_members) (the
@@ -744,6 +792,92 @@ fn council_voters(
   sorted
 }
 
+/// A host's region, or the sole region `RegionId(0)` when the deployment declares none (§4.8, D-14 — the
+/// single-region default, which collapses the root group to the degenerate self-leading group, R8).
+fn region_of(
+  host: slates_db::HostId,
+  regions: &std::collections::BTreeMap<slates_db::HostId, slates_db::register::RegionId>,
+) -> slates_db::register::RegionId {
+  regions
+    .get(&host)
+    .copied()
+    .unwrap_or(slates_db::register::RegionId(0))
+}
+
+/// The regions the fleet spans (§4.8, D-14 — the root group's region membership): the distinct regions of
+/// `members`, sorted and de-duplicated so every node forms the same initial root configuration.
+fn fleet_regions(
+  members: &[slates_db::HostId],
+  regions: &std::collections::BTreeMap<slates_db::HostId, slates_db::register::RegionId>,
+) -> Vec<slates_db::register::RegionId> {
+  let mut out: Vec<slates_db::register::RegionId> = members
+    .iter()
+    .map(|host| region_of(*host, regions))
+    .collect();
+  out.sort_unstable_by_key(|region| region.0);
+  out.dedup();
+  out
+}
+
+/// The root group's voters — one representative host per region (the lowest host id in each region), the
+/// small elected set that carries the cross-region consensus (§4.8, D-14 — "a small set, one or a few per
+/// region"). Deterministic from the members and their regions, so every node derives the same voter set.
+fn root_voters(
+  members: &[slates_db::HostId],
+  regions: &std::collections::BTreeMap<slates_db::HostId, slates_db::register::RegionId>,
+) -> Vec<slates_db::HostId> {
+  let mut by_region: std::collections::BTreeMap<slates_db::register::RegionId, slates_db::HostId> =
+    std::collections::BTreeMap::new();
+  for &host in members {
+    let region = region_of(host, regions);
+    by_region
+      .entry(region)
+      .and_modify(|rep| {
+        if host.0 < rep.0 {
+          *rep = host;
+        }
+      })
+      .or_insert(host);
+  }
+  let mut voters: Vec<slates_db::HostId> = by_region.into_values().collect();
+  voters.sort_unstable_by_key(|host| host.0);
+  voters
+}
+
+/// Builds this node's root group and the host→region map it reconciles from (§4.8, D-14 — the root group
+/// across regions). A fleet with declared regions forms the regions its members span with one representative
+/// host per region as the voters; a fleet with none is a single region (id 0); a laptop is the sole region,
+/// its node the sole self-leading voter (R8). Extracted from [`init_shard`] to keep it within the complexity
+/// bound.
+fn build_root_group(
+  config: &DaemonConfig,
+  host: slates_db::HostId,
+) -> (
+  slates_cluster::root_group::RootGroup,
+  std::collections::BTreeMap<slates_db::HostId, slates_db::register::RegionId>,
+) {
+  match &config.fleet {
+    Some(membership) => {
+      let mut all_members = membership.peers.clone();
+      all_members.push(host);
+      let regions = fleet_regions(&all_members, &membership.regions);
+      let voters = root_voters(&all_members, &membership.regions);
+      (
+        slates_cluster::root_group::RootGroup::new(host, regions, voters),
+        membership.regions.clone(),
+      )
+    }
+    None => (
+      slates_cluster::root_group::RootGroup::new(
+        host,
+        vec![slates_db::register::RegionId(0)],
+        vec![host],
+      ),
+      std::collections::BTreeMap::new(),
+    ),
+  }
+}
+
 /// Runs on the shard: attaches the segment, recovers the partition, builds the store and
 /// installs the state, then spawns the server loop as a poller.
 fn init_shard(
@@ -869,6 +1003,10 @@ fn init_shard(
   if let Some(configuration) = council.configuration().configuration_for(host) {
     let _ = fleet.install_configuration(configuration, &council_members);
   }
+  // The root group across regions (§4.8, D-14): the regions the fleet spans and the representative host of
+  // each (the root voters), driven over the transport by the control shard's config plane
+  // (`crate::fleet::drive_root_group`), exactly as the regional council is.
+  let (root, node_regions) = build_root_group(config, host);
   // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
   let content = match AnchorSegment::open_content(env) {
@@ -932,6 +1070,8 @@ fn init_shard(
     config_refresh_wanted: false,
     record_sessions: std::collections::BTreeMap::new(),
     council,
+    root,
+    node_regions,
     held_content: slates_cluster::content::ContentHold::new(),
     seals: std::collections::BTreeMap::new(),
     pending_materializations: std::collections::BTreeMap::new(),

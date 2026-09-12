@@ -108,6 +108,16 @@ pub struct ShardState {
   /// (`crate::fleet::run_config_council`). A laptop runs a solo council that self-leads (R8). Only the
   /// control shard drives and serves it; other shards hold an inert copy of the same boot state.
   pub council: slates_cluster::config_group::RegionalCouncil,
+  /// The **root configuration group** across regions (§4.8, D-14 — "a root group across regions holds region
+  /// membership and cross-region promotions"): the multi-voter Raft the control shard's config plane drives
+  /// over the transport (among the region representatives) to agree on the `RootConfiguration` — which regions
+  /// exist, moved volume homes, and region promotions. A single-region fleet (the default) runs a solo root
+  /// group that self-leads (R8). Only the control shard drives and serves it; other shards hold an inert copy.
+  pub root: slates_cluster::root_group::RootGroup,
+  /// Each fleet member's region (§4.8, D-14), the host→region map the root group's leader reconciles the
+  /// region membership from (an alive host's region is an alive region). A host absent is in the sole region
+  /// `RegionId(0)`. Set at boot from the fleet membership; empty on a laptop.
+  pub node_regions: std::collections::BTreeMap<slates_db::HostId, slates_db::register::RegionId>,
   /// The landing runtime: grants, leases and the audit log (§4.15), mirrored to the
   /// database's durable records.
   pub landing: crate::landing::LandingState,
