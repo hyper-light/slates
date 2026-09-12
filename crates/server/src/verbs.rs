@@ -86,12 +86,16 @@ fn unpin_origin(state: &mut ShardState, origin: Handle<VolumeSlot>, snapshot: Sn
   }
 }
 
-/// A fresh volume id: the shard in the high bytes (the creator host's place in Phase 8), the
-/// clock and a counter below, so ids never repeat on this host.
+/// A fresh volume id (§4.8 "Lookup"): the **creator host** in the high 8 bytes — the fleet member id, so the
+/// id routes to its creator's node and region (`ObjectId::creator`), which the cross-region lookup depends on —
+/// then the owner **partition** (bytes 8-9, what `owner_of` reads to route to the owner shard within the node)
+/// and a per-host counter (the low 6 bytes), so ids never repeat on this host. (Before, the high bytes carried
+/// the partition, a Phase-8 placeholder: the id then named no creator host, so a cross-region lookup could not
+/// resolve the creator's region — the reason slice-1's guard misrouted a real volume.)
 fn fresh_volume_id(state: &mut ShardState) -> DbVolumeId {
   let mut bytes = [0u8; 16];
-  bytes[..2].copy_from_slice(&state.partition.to_be_bytes());
-  bytes[2..10].copy_from_slice(&state.clock.monotonic_ns().to_be_bytes());
+  bytes[..8].copy_from_slice(&state.fleet.host().0.to_be_bytes());
+  bytes[8..10].copy_from_slice(&state.partition.to_be_bytes());
   let count = state.db.next_seq();
   bytes[10..].copy_from_slice(&count.to_be_bytes()[2..]);
   DbVolumeId { bytes }
@@ -134,10 +138,10 @@ pub enum Served {
   Forwarded,
 }
 
-/// The owner shard a volume id names (its first two bytes; §4.8 "Lookup": ids route to
-/// owners, no index).
+/// The owner shard a volume id names (bytes 8-9, just below the creator host in the high 8 bytes; §4.8
+/// "Lookup": ids route to owners, no index).
 pub fn owner_of(volume: VolumeId) -> u16 {
-  u16::from_be_bytes([volume.bytes[0], volume.bytes[1]])
+  u16::from_be_bytes([volume.bytes[8], volume.bytes[9]])
 }
 
 /// Format: the FNV-1a 64-bit offset basis (Fowler, Noll, Vo; the reference constants).
@@ -261,6 +265,7 @@ fn promote_region_on_root(
   client_index: u32,
   request: u64,
   region: u64,
+  principal: Principal,
 ) -> Served {
   let Some(control) = state.shards.first().copied() else {
     return Served::Reply(refused(Refusal::NotFound));
@@ -268,7 +273,7 @@ fn promote_region_on_root(
   let origin = state.shard;
   let task = SpawnRequest::new(
     Box::pin(async move {
-      let reply = promote_region_here_or_forward(region).await;
+      let reply = promote_region_here_or_forward(region, principal).await;
       if origin == control {
         crate::state::deliver(client_index, request, reply, false);
       } else {
@@ -295,7 +300,7 @@ fn promote_region_on_root(
 /// an unavailable leader session yields `NotRootLeader`, which the operator retries — never a wrong outcome
 /// (the target proposes only if it is in fact the leader). `PromoteRegion` is idempotent, so a forward that is
 /// retried after it already took is a no-op.
-async fn promote_region_here_or_forward(region: u64) -> ReplyBody {
+async fn promote_region_here_or_forward(region: u64, principal: Principal) -> ReplyBody {
   enum Route {
     Here,
     Forward(HostId),
@@ -316,7 +321,10 @@ async fn promote_region_here_or_forward(region: u64) -> ReplyBody {
     Route::Here => crate::state::with_state(|s| propose_region_promotion(s, region))
       .unwrap_or_else(|| refused(Refusal::NotFound)),
     Route::Forward(leader) => {
-      let request = encode_body(&RequestBody::PromoteRegion { region });
+      let request = encode_body(&ForwardedRequest {
+        principal,
+        body: RequestBody::PromoteRegion { region },
+      });
       match crate::fleet::forward_over_leader_session(
         leader,
         request,
@@ -336,21 +344,135 @@ async fn promote_region_here_or_forward(region: u64) -> ReplyBody {
   }
 }
 
-/// Serves a verb forwarded from another node over the fleet transport (§4.8 "Lookup"): decodes the request
-/// body, runs it here, and returns the encoded reply. Today only the operator's region-loss `PromoteRegion` is
-/// forwarded (to the root leader); general volume-verb forwarding — a request reaching a remotely-homed
-/// volume's owner, which also relays the requester's principal — is the owed cross-region routing (slice 2).
-pub(crate) fn serve_forward(state: &mut ShardState, request: &[u8]) -> Vec<u8> {
-  let Ok(body) = decode_body::<RequestBody>(request) else {
+/// A request forwarded to another node over the fleet transport (§4.8 "Lookup"), carrying the requester's
+/// `principal` alongside the `body`: the receiving node runs the verb under that principal (relayed over the
+/// mutual-TLS session — a peer vouches for the principal it authenticated locally; §4.13 refines the
+/// granularity). [`serve_forward`] serves it; [`encode_body`]/[`decode_body`] are its wire.
+#[derive(Wire, Clone, Debug)]
+pub(crate) struct ForwardedRequest {
+  /// The requester's principal, as the origin node authenticated it.
+  pub principal: Principal,
+  /// The verb to run on the owner.
+  pub body: RequestBody,
+}
+
+/// Whether a verb is a **read** safe to forward to a volume's owner without a completion record: a
+/// volume-scoped query that mutates nothing, so re-serving a retried forward is idempotent (§4.8 "Lookup").
+/// Writes are not forwarded yet — they need the origin's request id relayed for owner-side idempotency (owed).
+fn is_forwardable_read(body: &RequestBody) -> bool {
+  matches!(
+    body,
+    RequestBody::Status { .. } | RequestBody::Versions { .. } | RequestBody::ChangedSince { .. }
+  )
+}
+
+/// Serves a verb forwarded from another node over the fleet transport (§4.8 "Lookup"): decodes the
+/// [`ForwardedRequest`], runs it here, and returns the encoded reply. The operator's region-loss
+/// `PromoteRegion` is proposed on the root group; a forwardable **read** of a volume this node owns is run on
+/// the volume's owner shard under the relayed principal — with no completion record, since reads are
+/// idempotent (`dispatch`, not `run_recorded`) — reached by a cross-shard call so the reply is produced
+/// asynchronously (hence [`slates_transport::endpoint::Endpoint::serve_once_async`]). Any other verb (a write,
+/// today) is refused `Unsupported`: write forwarding needs the origin request id relayed for owner-side
+/// idempotency, and is owed. `control` is the shard this serve loop runs on (the `xshard` origin).
+pub(crate) async fn serve_forward(control: u16, request: &[u8]) -> Vec<u8> {
+  let Ok(ForwardedRequest { principal, body }) = decode_body::<ForwardedRequest>(request) else {
     return Vec::new();
   };
-  let reply = match body {
-    RequestBody::PromoteRegion { region } => propose_region_promotion(state, region),
-    _ => refused(Refusal::Unsupported {
-      feature: "forwarded verb".to_owned(),
-    }),
+  if let RequestBody::PromoteRegion { region } = body {
+    return encode_body(
+      &crate::state::with_state(|s| propose_region_promotion(s, region))
+        .unwrap_or_else(|| refused(Refusal::NotFound)),
+    );
+  }
+  if is_forwardable_read(&body)
+    && let Some(volume) = volume_of(&body)
+  {
+    let owner = owner_of(volume);
+    let shard = crate::state::with_state(|s| shard_of_partition(s, owner)).flatten();
+    let reply = match shard {
+      Some(shard) => crate::xshard::call_within(
+        control,
+        shard,
+        move |s| dispatch(s, 0, &principal, body),
+        crate::daemon::LIVENESS_BUDGET_NS,
+      )
+      .await
+      .unwrap_or_else(|| refused(Refusal::NotFound)),
+      None => refused(Refusal::NotFound),
+    };
+    return encode_body(&reply);
+  }
+  encode_body(&refused(Refusal::Unsupported {
+    feature: "forwarded verb".to_owned(),
+  }))
+}
+
+/// Whether a volume's home region is its creator's region — i.e. no move or promotion has changed where it is
+/// served, so its owner node is its creator ([`ObjectId::creator`]), the node a read forwards to. When they
+/// differ (a moved or promoted volume), the owner is no longer the creator and forwarding needs the home
+/// region's placement (owed), so the guard refuses `HomedElsewhere` for the caller to re-route instead.
+fn homed_at_creator(state: &ShardState, volume: VolumeId, home_region: u64) -> bool {
+  let creator = ObjectId(volume.bytes).creator();
+  let creator_region = state
+    .node_regions
+    .get(&creator)
+    .map(|region| region.0)
+    .unwrap_or(0);
+  home_region == creator_region
+}
+
+/// Forwards a read of a remotely-homed volume to its owner node (its creator, [`homed_at_creator`]) over the
+/// fleet transport and delivers the reply back to the client (§4.8 "Lookup"). Runs in a task on the control
+/// shard — where the record sessions live — because the forward is an await: the owner serves the read on its
+/// own owner shard ([`serve_forward`]) under the relayed principal and returns the reply, which is delivered to
+/// the client on its origin shard. An unreachable owner or an undecodable reply falls back to `HomedElsewhere`
+/// naming the home region, so the caller re-routes rather than seeing a wrong answer.
+fn forward_read_to_owner(
+  state: &mut ShardState,
+  client_index: u32,
+  request: u64,
+  principal: Principal,
+  volume: VolumeId,
+  region: u64,
+  body: RequestBody,
+) -> Served {
+  let Some(control) = state.shards.first().copied() else {
+    return Served::Reply(refused(Refusal::NotFound));
   };
-  encode_body(&reply)
+  let origin = state.shard;
+  let owner = ObjectId(volume.bytes).creator();
+  let request_bytes = encode_body(&ForwardedRequest { principal, body });
+  let task = SpawnRequest::new(
+    Box::pin(async move {
+      let reply = match crate::fleet::forward_over_leader_session(
+        owner,
+        request_bytes,
+        crate::daemon::LIVENESS_BUDGET_NS,
+      )
+      .await
+      {
+        Some(bytes) if !bytes.is_empty() => decode_body::<ReplyBody>(&bytes)
+          .unwrap_or_else(|_| refused(Refusal::HomedElsewhere { region })),
+        _ => refused(Refusal::HomedElsewhere { region }),
+      };
+      if origin == control {
+        crate::state::deliver(client_index, request, reply, false);
+      } else {
+        let back = SpawnRequest::new(
+          Box::pin(async move {
+            crate::state::deliver(client_index, request, reply, false);
+          }),
+          None,
+        );
+        let _ = slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)));
+      }
+    }),
+    None,
+  );
+  if slates_rt::registry::send_control(control, Control::Spawn(Box::new(task))).is_err() {
+    return Served::Reply(refused(Refusal::NotFound));
+  }
+  Served::Forwarded
 }
 
 /// Proposes a lost region's promotion to its declared mirror on this shard's root group (§4.8, D-14). Refuses
@@ -428,19 +550,39 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     return scatter_status(state, client.index(), request.request);
   }
   if let RequestBody::PromoteRegion { region } = body {
-    return promote_region_on_root(state, client.index(), request.request, region);
+    return promote_region_on_root(
+      state,
+      client.index(),
+      request.request,
+      region,
+      principal.clone(),
+    );
   }
   if let RequestBody::Acknowledge { up_to } = body {
     return scatter_acknowledge(state, client.index(), request.request, client_id, up_to);
   }
   // Cross-region routing (§4.8 "Lookup"): a request for a volume homed in another region — moved there, or
-  // failed over there by a region-loss promotion — is not served here; refuse, naming the home region, so the
-  // caller re-routes to it (the redirect the design's refusal-driven lookup uses, the data-plane counterpart
-  // of the configuration-version piggyback). A single-region fleet never reaches the map (the fast path in
-  // `homed_elsewhere`), so local and laptop deployments pay nothing.
+  // failed over there by a region-loss promotion. A forwardable **read** of a volume whose owner is its
+  // creator (no move or promotion changed the home) is forwarded to that owner over the fleet transport and
+  // served there, so a client reads a cross-region volume without re-connecting; anything else — a write, or a
+  // moved/promoted volume whose owner is no longer its creator — is refused `HomedElsewhere` naming the home
+  // region, for the caller to re-route (write forwarding and moved-owner routing are owed). A single-region
+  // fleet never reaches the map (the fast path in `homed_elsewhere`), so local and laptop deployments pay
+  // nothing.
   if let Some(volume) = volume_of(&body)
     && let Some(region) = homed_elsewhere(state, volume)
   {
+    if is_forwardable_read(&body) && homed_at_creator(state, volume, region) {
+      return forward_read_to_owner(
+        state,
+        client.index(),
+        request.request,
+        principal,
+        volume,
+        region,
+        body,
+      );
+    }
     return Served::Reply(record_completion(
       state,
       id,

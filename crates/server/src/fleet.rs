@@ -756,37 +756,41 @@ async fn serve_peer_records(
   // Serve the peer's commits and prepares against this node's **durable** per-object holds in the shard
   // state, so an accepted record survives past this task — the state a survivor's phase-one recovery reads
   // on a takeover — and a prepare is answered from it. The handler runs synchronously inside `serve_once` (a
-  // brief `with_state` borrow, no await held across it). A serve failure ends the loop.
-  // Each request kind rides its own stream id, so the dispatch is by kind: a record commit, a phase-one
-  // prepare, or a content exchange (an offer, a put, a fetch — §4.10) — never a guess from the bytes.
+  // brief `with_state` borrow, no await held across it) — except a forwarded verb ([`FORWARD_STREAM`]), whose
+  // reply comes from an `xshard` call to the volume's owner shard, so it is served asynchronously
+  // (`serve_once_async`); the request is acknowledged before the handler awaits, so the peer just waits for the
+  // reply. A serve failure ends the loop. Each request kind rides its own stream id, so the dispatch is by
+  // kind: a record commit, a phase-one prepare, a content exchange (§4.10), a consensus step, or a forwarded
+  // verb — never a guess from the bytes.
+  let control = state::with_state(|s| s.shard).unwrap_or_default();
   loop {
     let served = endpoint
-      .serve_once(|stream, request| match stream {
-        RECORD_STREAM => Record::decode(&request)
-          .ok()
-          .and_then(|record| {
-            state::with_state(|s| accept_held_record(s, local, peer_host, &record))
-          })
-          .unwrap_or_default(),
-        PROMOTE_STREAM => Prepare::decode(&request)
-          .ok()
-          .and_then(|prepare| state::with_state(|s| serve_held_promotion(s, &prepare)))
-          .unwrap_or_default(),
-        stream if is_content_stream(stream) => {
-          state::with_state(|s| s.held_content.serve(local, &request)).unwrap_or_default()
+      .serve_once_async(|stream, request| async move {
+        match stream {
+          RECORD_STREAM => Record::decode(&request)
+            .ok()
+            .and_then(|record| {
+              state::with_state(|s| accept_held_record(s, local, peer_host, &record))
+            })
+            .unwrap_or_default(),
+          PROMOTE_STREAM => Prepare::decode(&request)
+            .ok()
+            .and_then(|prepare| state::with_state(|s| serve_held_promotion(s, &prepare)))
+            .unwrap_or_default(),
+          stream if is_content_stream(stream) => {
+            state::with_state(|s| s.held_content.serve(local, &request)).unwrap_or_default()
+          }
+          CONFIG_STREAM => state::with_state(|s| serve_council(s, &request)).unwrap_or_default(),
+          CONFIG_FETCH_STREAM => {
+            state::with_state(|s| serve_config_fetch(s, &request)).unwrap_or_default()
+          }
+          ROOT_STREAM => state::with_state(|s| serve_root(s, &request)).unwrap_or_default(),
+          ROOT_FETCH_STREAM => {
+            state::with_state(|s| serve_root_fetch(s, &request)).unwrap_or_default()
+          }
+          FORWARD_STREAM => verbs::serve_forward(control, &request).await,
+          _ => Vec::new(),
         }
-        CONFIG_STREAM => state::with_state(|s| serve_council(s, &request)).unwrap_or_default(),
-        CONFIG_FETCH_STREAM => {
-          state::with_state(|s| serve_config_fetch(s, &request)).unwrap_or_default()
-        }
-        ROOT_STREAM => state::with_state(|s| serve_root(s, &request)).unwrap_or_default(),
-        ROOT_FETCH_STREAM => {
-          state::with_state(|s| serve_root_fetch(s, &request)).unwrap_or_default()
-        }
-        FORWARD_STREAM => {
-          state::with_state(|s| verbs::serve_forward(s, &request)).unwrap_or_default()
-        }
-        _ => Vec::new(),
       })
       .await;
     if served.is_err() {

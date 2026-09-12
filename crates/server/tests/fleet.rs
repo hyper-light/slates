@@ -1214,6 +1214,72 @@ fn a_client_on_a_follower_promotes_a_region_by_forwarding_to_the_leader() {
   );
 }
 
+/// AC (§4.8 "Lookup", slice 2): a client reads a volume homed in **another region**, and the read is served.
+/// Three daemons, each its own region; a volume is created on node a (region 0). A client on node b (region 1)
+/// reads that volume's `Status`: b's serve path sees it is homed elsewhere and **forwards** the read to the
+/// volume's owner — a, its creator — over the fleet transport (`FORWARD_STREAM`), a serves it on the owner
+/// shard under the relayed principal, and the reply is relayed back, so the client on b gets the volume's state
+/// without connecting to region 0. This is the cross-region routing slice 1 (791f2bd) only refused; the forward
+/// makes it a served request (`verbs::serve_forward` + the `homed_elsewhere` guard's forward, over
+/// `serve_once_async`). The read is polled: it succeeds once the root configuration has formed on b (so the
+/// lookup guard fires) and the b→a session is up.
+#[test]
+fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  let regions: std::collections::BTreeMap<HostId, RegionId> = [
+    (hosts[0], RegionId(0)),
+    (hosts[1], RegionId(1)),
+    (hosts[2], RegionId(2)),
+  ]
+  .into_iter()
+  .collect();
+  let daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
+
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  // Create a volume on node a (region 0): it is owned by a, its creator.
+  let mut client_a = Client::connect(&format!("fleet3-{}-{pid}", hosts[0].0));
+  let created = client_a.call(&scratch("cross-region"));
+  let id = match created {
+    ReplyBody::Created { id } => id,
+    other => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("create on node a did not return an id: {other:?}");
+    }
+  };
+
+  // A client on node b (region 1) reads the volume's Status. b forwards the read to a and relays the reply.
+  // Polled: it turns from a transient refusal (the root configuration not yet formed on b, so the lookup guard
+  // does not fire and b routes locally, or the b→a session not yet up) into the served Status.
+  let mut client_b = Client::connect(&format!("fleet3-{}-{pid}", hosts[1].0));
+  let served = poll_until(COUNCIL_RETIRE_DEADLINE, || {
+    matches!(
+      client_b.call(&RequestBody::Status { volume: id }),
+      ReplyBody::Status { .. }
+    )
+  });
+
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    served,
+    "a client on region 1 read a volume homed in region 0 — the read was forwarded to its owner and served, \
+     so the cross-region lookup is a served request, not a refusal"
+  );
+}
+
 /// AC (§4.8 "Lookup", D-14): the cross-region lookup guard (`verbs::home_redirect`) runs on whatever shard a
 /// client's request lands on, so the committed root configuration must reach **every** shard of a multi-shard
 /// daemon — not only the control shard that drives the root group over the transport. Here each daemon runs
