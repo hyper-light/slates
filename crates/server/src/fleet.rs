@@ -230,11 +230,13 @@ fn probe_budget() -> CommitBudget {
   CommitBudget::hard(HEARTBEAT_NS, (HEARTBEAT_NS / POLL_PER_PERIOD).max(1))
 }
 
-/// Shape: the lookahead fraction (numerator/denominator, kept a ratio so no float enters the decision) at
-/// which a still-progressing consensus/record round is first considered for an extension — the last quarter
+/// Shape: the numerator of the lookahead fraction (kept a ratio so no float enters the decision) at which a
+/// still-progressing consensus/record round is first considered for an extension — 3 of 4, the last quarter
 /// of its current deadline (hyperscale's measured 0.75 late-work lookahead, cited by
 /// [`slates_cluster::progress::DeadlineExtender`]).
 const CONSENSUS_LOOKAHEAD_NUMERATOR: u64 = 3;
+/// Shape: the denominator of that same lookahead fraction — 3/4, the last quarter of the deadline (see
+/// [`CONSENSUS_LOOKAHEAD_NUMERATOR`]).
 const CONSENSUS_LOOKAHEAD_DENOMINATOR: u64 = 4;
 
 /// The record-plane and configuration-consensus budget (§4.8 "late work"). Unlike a single SWIM probe
