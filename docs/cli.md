@@ -64,6 +64,13 @@ slates anchor --fleet /etc/slates/fleet.json --node a
 - `address` is the IP peers dial and the node's base port: it serves probes on that UDP port and
   records on the next, every peer on the same two sockets, so open those two ports. Every node
   computes the same map from the same file.
+- `domain` and `region` are optional per-node non-negative integers, both unset by default and set
+  only for a real topology. `domain` is the node's failure domain (a rack or zone id): placement forms
+  each object's copyset across distinct domains, so nodes that share a `domain` are treated as
+  co-located. `region` is the node's region: the root group across regions agrees on which regions
+  exist and routes cross-region, and a node with no `region` is in the single default region (a fleet
+  that declares none is one region). Neither is derived from the address — several nodes may share one
+  host and IP in a test or dev fleet without sharing a domain or region.
 
 `slates status` on any node shows its place in the fleet: `fleet_host` (its member id),
 `fleet_f`, `fleet_host_epoch`, `fleet_members` (the members it holds alive) and

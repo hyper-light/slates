@@ -27,7 +27,7 @@
 use core::net::SocketAddrV4;
 use std::path::{Path, PathBuf};
 
-use slates_db::register::Quorum;
+use slates_db::register::{Quorum, RegionId};
 use slates_server::deploy::{
   CertificateDer, FleetManifest, FleetNodeEntry, FleetPlan, PrivateKeyDer,
 };
@@ -91,6 +91,9 @@ struct NodeText {
   /// The node's failure domain, if the operator declared one (`DomainId` is a `u64`). Absent = the node is
   /// its own domain (unique-per-host), the default.
   domain: Option<u64>,
+  /// The node's region, if the operator declared one (`RegionId` is a `u64`). Absent = the sole region 0,
+  /// the single-region default (the root group is then the degenerate self-leading group).
+  region: Option<u64>,
 }
 
 /// The manifest as text values: what the JSON says, checked for shape.
@@ -143,12 +146,21 @@ fn node_text(entry: &serde_json::Value, index: usize) -> Result<NodeText, Manife
       expected: "a non-negative integer failure-domain id",
     })?),
   };
+  // `region` is optional: present only for a genuine multi-region deployment, and then a non-negative integer.
+  let region = match entry.get("region") {
+    None => None,
+    Some(value) => Some(value.as_u64().ok_or_else(|| ManifestError::Field {
+      field: format!("{path}region"),
+      expected: "a non-negative integer region id",
+    })?),
+  };
   Ok(NodeText {
     node: string_field(entry, &path, "node")?,
     address,
     certificate: string_field(entry, &path, "certificate")?,
     key: string_field(entry, &path, "key")?,
     domain,
+    region,
   })
 }
 
@@ -220,6 +232,7 @@ fn load_plan(selection: &FleetSelection) -> Result<FleetPlan, ManifestError> {
       address: node.address,
       certificate,
       domain: node.domain,
+      region: node.region.map(RegionId),
     });
   }
   let manifest = FleetManifest {
@@ -300,6 +313,31 @@ mod tests {
     match parse(&bad) {
       Err(ManifestError::Field { field, .. }) => assert_eq!(field, "nodes[0].domain"),
       other => panic!("expected a field error for a non-integer domain, got {other:?}"),
+    }
+  }
+
+  /// A node may declare an optional region; a non-integer one is named by its path.
+  #[test]
+  fn a_declared_region_parses_and_a_bad_one_is_named() {
+    let with_region = MANIFEST.replace(
+      r#""certificate": "a.crt.der", "key": "a.key.der""#,
+      r#""certificate": "a.crt.der", "key": "a.key.der", "region": 2"#,
+    );
+    let stated = parse(&with_region).expect("parses");
+    assert_eq!(
+      stated.nodes[0].region,
+      Some(2),
+      "the declared region is parsed"
+    );
+    assert_eq!(
+      stated.nodes[1].region, None,
+      "an undeclared node has no region"
+    );
+
+    let bad = with_region.replace(r#""region": 2"#, r#""region": "east""#);
+    match parse(&bad) {
+      Err(ManifestError::Field { field, .. }) => assert_eq!(field, "nodes[0].region"),
+      other => panic!("expected a field error for a non-integer region, got {other:?}"),
     }
   }
 

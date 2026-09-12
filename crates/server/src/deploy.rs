@@ -26,7 +26,7 @@
 // naming the TLS crate itself.
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use slates_db::HostId;
-use slates_db::register::{DomainId, Quorum};
+use slates_db::register::{DomainId, Quorum, RegionId};
 use slates_rt::tcp::SocketAddrV4;
 use slates_transport::handshake::Identity;
 
@@ -50,6 +50,11 @@ pub struct FleetNodeEntry {
   /// domain). Never derived from the address: several nodes deliberately share one host (and IP) in a test
   /// or dev fleet, and collapsing them into one domain would leave an object no distinct-domain co-holder.
   pub domain: Option<DomainId>,
+  /// The node's **region** (the operator assigns it), so the root group across regions agrees on which
+  /// regions exist and routes cross-region (§4.8, D-14). `None` — the default — puts the node in the sole
+  /// region [`RegionId(0)`], which collapses to a single-region fleet whose root group is the degenerate
+  /// self-leading group (R8); the operator declares one only for a genuine multi-region deployment.
+  pub region: Option<RegionId>,
 }
 
 /// The shared manifest, as values: the fleet's TLS name, its fault tolerance and its nodes in manifest
@@ -322,6 +327,17 @@ pub fn plan(
         .map(|domain| (host_id_of_certificate(&n.certificate), domain))
     })
     .collect();
+  // The fleet's region map: every node that declares one, keyed by member id. A node without a declaration
+  // is absent — the sole region `RegionId(0)`, the default `region_of` falls back to. Built from the whole
+  // manifest so the root group agrees on which regions exist and each node knows every peer's region.
+  let regions: std::collections::BTreeMap<HostId, RegionId> = manifest
+    .nodes
+    .iter()
+    .filter_map(|n| {
+      n.region
+        .map(|region| (host_id_of_certificate(&n.certificate), region))
+    })
+    .collect();
   let identity = Identity::from_der(entry.certificate.clone(), key);
   let pins: Vec<CertificateDer<'static>> = peers.iter().map(|p| p.certificate.clone()).collect();
   check_identity(&entry.node, &identity, &entry.certificate, &pins)?;
@@ -331,10 +347,7 @@ pub fn plan(
       peers: peer_hosts,
       host,
       domains,
-      // A single region by default (every host in region 0), so the root group is the degenerate
-      // self-leading group; the operator's per-node region declaration in the manifest — the cross-region
-      // deployment — is the owed follow-on, exactly as the failure-domain declaration was for neighbourhoods.
-      regions: std::collections::BTreeMap::new(),
+      regions,
     },
     transport: FleetTransport {
       identity,
@@ -375,6 +388,8 @@ mod tests {
       certificate,
       // Undeclared by default (unique-per-host); a test that exercises domains sets it explicitly.
       domain: None,
+      // Undeclared by default (the sole region); a test that exercises regions sets it explicitly.
+      region: None,
     }
   }
 
@@ -445,6 +460,36 @@ mod tests {
       plan.membership.domains.get(&c),
       None,
       "an undeclared node is absent from the map — its own domain (unique-per-host)"
+    );
+  }
+
+  /// AC (§4.8, D-14): the plan carries each node's declared region to the membership, keyed by the
+  /// certificate-derived member id, so the root group agrees on which regions exist. A node that declares
+  /// none is absent — the sole region 0, the default.
+  #[test]
+  fn the_plan_carries_declared_regions_to_the_membership() {
+    let (mut manifest, keys) = manifest();
+    // a and b are in region 1; c declares none (so it falls to the sole region 0).
+    manifest.nodes[0].region = Some(RegionId(1));
+    manifest.nodes[1].region = Some(RegionId(1));
+    let plan = plan(&manifest, "a", key_of(&keys, "a")).expect("a valid plan");
+    let a = host_id_of_certificate(&manifest.nodes[0].certificate);
+    let b = host_id_of_certificate(&manifest.nodes[1].certificate);
+    let c = host_id_of_certificate(&manifest.nodes[2].certificate);
+    assert_eq!(
+      plan.membership.regions.get(&a),
+      Some(&RegionId(1)),
+      "a's declared region reached the membership under its member id"
+    );
+    assert_eq!(
+      plan.membership.regions.get(&b),
+      Some(&RegionId(1)),
+      "b shares a's region"
+    );
+    assert_eq!(
+      plan.membership.regions.get(&c),
+      None,
+      "an undeclared node is absent from the map — the sole region 0"
     );
   }
 
