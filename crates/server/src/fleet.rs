@@ -2290,6 +2290,30 @@ fn sync_config_from_council(local: HostId) {
   });
 }
 
+/// Propagates the committed root configuration from the control shard — the only shard that drives the root
+/// group over the transport ([`drive_root_group`]) — to every other shard, each **adopting** it (§4.8
+/// "Lookup", D-14). Every shard serves clients, and each answers the cross-region lookup guard
+/// ([`crate::verbs::home_redirect`]) for the clients that land on it from its own `s.root`, so a home moved or
+/// promoted on the control shard must reach the others or a client on another shard would read the
+/// pre-promotion home. Version-gated by [`RootGroup::adopt`] (an equal-or-older configuration is ignored), so
+/// a converged fleet costs one bounded cross-shard message per shard and no state change — the near-zero rate
+/// the root-group commit itself runs at. A non-control shard never votes or receives root Raft traffic; it
+/// holds a read-only committed copy, the same shape a root learner adopts over the wire, here a same-process
+/// copy. Idempotent, so the coordinator calls it every period. (The council's placement configuration is not
+/// yet fanned out this way — a non-control shard reads a stale placement configuration after a membership
+/// change, entangled with distributing takeover; tracked in GAPS row 27.)
+fn sync_root_to_shards(origin: u16, shards: &[u16]) {
+  let Some(configuration) = state::with_state(|s| s.root.configuration().clone()) else {
+    return;
+  };
+  for shard in shards.iter().copied().filter(|shard| *shard != origin) {
+    let configuration = configuration.clone();
+    let _ = run_on(origin, shard, move |s| {
+      s.root.adopt(configuration);
+    });
+  }
+}
+
 /// The record-plane coordinator (§4.8 "records are sent to all candidates; committed at `f + 1`"; "Promotion
 /// and takeover"): one task per node that, each period, ships every unplaced head to all its candidates in
 /// one commit and drives every owed takeover over all surviving holders, borrowing the holder sessions the
@@ -2355,6 +2379,10 @@ async fn run_record_plane(local: HostId, budget: CommitBudget) {
     // owner's objects that rendezvous first to this node over the new neighbourhood are owed a phase-one
     // recovery, driven below).
     sync_config_from_council(local);
+    // Fan the committed root configuration out to every other shard so the cross-region lookup guard reads the
+    // same home wherever a client lands (§4.8 "Lookup"); a no-op each period the root configuration is
+    // unchanged (`RootGroup::adopt` is version-gated).
+    sync_root_to_shards(origin, &shards);
     // Keep the owner's hold writing under the current configuration generation: the version advances on
     // every join or retirement (`FleetNode::observe` keeps the node's own acceptor in step the same way), and
     // a record under a stale generation is refused `ForeignGeneration` by the owner's own hold — so without

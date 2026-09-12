@@ -1057,6 +1057,99 @@ fn an_operator_promotes_a_lost_regions_mirror_over_the_transport() {
   );
 }
 
+/// AC (§4.8 "Lookup", D-14): the cross-region lookup guard (`verbs::home_redirect`) runs on whatever shard a
+/// client's request lands on, so the committed root configuration must reach **every** shard of a multi-shard
+/// daemon — not only the control shard that drives the root group over the transport. Here each daemon runs
+/// two shards; after an operator promotion commits, a **non-control** shard re-homes the promoted region's
+/// volumes to the mirror too, proving the control shard fans its committed root configuration out to the
+/// others (`sync_root_to_shards`). Without that fan-out a client landing on another shard would read the
+/// pre-promotion home. (The lost-region / not-auto-retired semantics are covered by
+/// `an_operator_promotes_a_lost_regions_mirror_over_the_transport`; this isolates the multi-shard consistency,
+/// so it promotes a region without killing its host — all three stay alive as root voters.)
+#[test]
+fn a_committed_promotion_reaches_every_shards_lookup_view() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  let regions: std::collections::BTreeMap<HostId, RegionId> = [
+    (hosts[0], RegionId(0)),
+    (hosts[1], RegionId(1)),
+    (hosts[2], RegionId(2)),
+  ]
+  .into_iter()
+  .collect();
+  let mirrors: std::collections::BTreeMap<RegionId, RegionId> =
+    [(RegionId(1), RegionId(0)), (RegionId(2), RegionId(0))]
+      .into_iter()
+      .collect();
+  // Two shards per daemon: the record plane (and the root group) runs on the control shard (index 0); shard
+  // index 1 is a non-control shard that also serves clients and answers the lookup guard.
+  let daemons = start_mesh_with(nodes, &hosts, &certs, &serve, 1, 2, &regions, &mirrors);
+
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let daemons: Vec<(HostId, Daemon)> = hosts.iter().copied().zip(daemons).collect();
+  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, || {
+    daemons
+      .iter()
+      .filter(|(_, daemon)| daemon.root_leads())
+      .count()
+      == 1
+  });
+
+  let lost = RegionId(1);
+  let mirror = RegionId(0);
+  let volume = ObjectId::new(hosts[1], 7); // a volume created in region 1
+
+  let proposed = elected
+    && daemons
+      .iter()
+      .find(|(_, daemon)| daemon.root_leads())
+      .map(|(_, daemon)| daemon.promote_region(lost))
+      .unwrap_or(false);
+
+  // The control shard re-homes the promoted region's volumes to the mirror (the existing behaviour)...
+  let on_control_shard = proposed
+    && poll_until(COUNCIL_RETIRE_DEADLINE, || {
+      daemons
+        .iter()
+        .all(|(_, daemon)| daemon.region_home(volume, lost) == mirror)
+    });
+  // ...and so does the non-control shard — the fan-out under test.
+  let on_non_control_shard = on_control_shard
+    && poll_until(COUNCIL_RETIRE_DEADLINE, || {
+      daemons
+        .iter()
+        .all(|(_, daemon)| daemon.region_home_on_shard(1, volume, lost) == mirror)
+    });
+
+  for (_, daemon) in daemons {
+    daemon.stop();
+  }
+  assert!(
+    elected,
+    "the root group elected a single leader among the region representatives"
+  );
+  assert!(
+    proposed,
+    "the operator's promotion was proposed on the root leader"
+  );
+  assert!(
+    on_control_shard,
+    "every control shard re-homes the promoted region's volumes to the mirror"
+  );
+  assert!(
+    on_non_control_shard,
+    "every non-control shard re-homes them too — the control shard fans its committed root configuration to \
+     every shard, so the cross-region lookup guard is consistent wherever a client lands"
+  );
+}
+
 /// AC (§4.8, D-14, learners): the council votes with a **small** set — the members up to the candidate floor
 /// `2f + 1` — and the rest are **learners** that do not vote but fetch the committed configuration over the
 /// transport. Five members at `f = 1` gives three voters and two learners. A learner never leads; and when

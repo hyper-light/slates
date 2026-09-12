@@ -558,6 +558,36 @@ impl Daemon {
       .unwrap_or(creator_region)
   }
 
+  /// Like [`Self::region_home`] but answered on the shard at `shard_index` (an index into this daemon's shard
+  /// list) rather than the control shard. The cross-region lookup guard (`verbs::home_redirect`) runs on
+  /// whatever shard a client lands on, so every shard must read the committed root configuration; this lets a
+  /// fleet test prove a promotion committed on the control shard reaches the others (`sync_root_to_shards`).
+  /// Returns `creator_region` if there is no such shard or it does not answer in time.
+  pub fn region_home_on_shard(
+    &self,
+    shard_index: usize,
+    volume: slates_db::register::ObjectId,
+    creator_region: slates_db::register::RegionId,
+  ) -> slates_db::register::RegionId {
+    let (Some(runtime), Some(&target)) = (self.runtime.as_ref(), self.shards.get(shard_index))
+    else {
+      return creator_region;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(target, async move {
+        let home = state::with_state(|s| s.root.configuration().home_of(volume, creator_region))
+          .unwrap_or(creator_region);
+        let _ = tx.send(home);
+      })
+      .is_err()
+    {
+      return creator_region;
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .unwrap_or(creator_region)
+  }
+
   /// This daemon's **placement** neighbourhood (§4.8, D-14): the neighbourhood of the configuration the node
   /// currently places under — the owner view it **installed from the council** (`FleetNode::configuration`),
   /// the set the verbs draw candidates from. Distinct from [`council_members`](Daemon::council_members) (the
