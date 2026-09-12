@@ -85,8 +85,8 @@ use slates_cluster::raft_wire::{
 };
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once};
 use slates_cluster::{
-  ClusterError, CommitBudget, PROMOTE_STREAM, RECORD_STREAM, Stragglers, commit_record,
-  promote_record, request_within,
+  ClusterError, CommitBudget, DispatchWait, PROMOTE_STREAM, RECORD_STREAM, Stragglers,
+  commit_record, promote_record, request_within,
 };
 use slates_db::Op;
 use slates_db::catalog::{
@@ -1754,23 +1754,39 @@ async fn broadcast(
   }
   drop(tx); // so the channel disconnects when the last child has reported
   let mut replies = Vec::with_capacity(tasks.len());
-  // The poll cadence is the budget's own fine-grained interval (a tenth of a period), not a fraction of the
-  // full extended deadline: a round whose replies have all arrived returns within one interval of the last,
-  // whatever the deadline the extension budget allows it to wait to.
-  let poll_ns = budget.poll_interval_ns.max(1);
+  // Collect **progress-aware**, not to the flat deadline: a round is done when every child has reported, or
+  // when it has *stalled* — no new reply within the stall window ([`DispatchWait`], the same policy the
+  // record commit uses). This is decisive under a membership change: a dead voter that is still a voter
+  // until the council retires it never replies, and waiting the full extended deadline for it every period
+  // (§4.8 "late work") would stall the very retirement that removes it — a broadcast to a dead peer took the
+  // whole `max_deadline` (~1.1 s) each period, slowing every consensus round behind it
+  // (docs/bugs/2026-09-12-broadcast-waits-out-dead-voter.md). The reachable quorum replies fast; once
+  // replies stall, the round returns and the leader folds what it has and re-ships next period (idempotent).
+  let mut wait = DispatchWait::new(budget, slates_rt::futures::now_ns());
+  let mut all_reported = false;
   loop {
-    match rx.try_recv() {
-      Ok(triple) => replies.push(triple),
-      // The children always report within the deadline; park a poll interval between wake-ups.
-      Err(TryRecvError::Empty) => futures::sleep(poll_ns).await,
-      // Every child has reported and dropped its sender: the round is complete.
-      Err(TryRecvError::Disconnected) => break,
+    loop {
+      match rx.try_recv() {
+        Ok(triple) => replies.push(triple),
+        Err(TryRecvError::Empty) => break,
+        Err(TryRecvError::Disconnected) => {
+          all_reported = true;
+          break;
+        }
+      }
+    }
+    if all_reported || !wait.keep_waiting(replies.len()).await {
+      break;
     }
   }
-  // Reap the now-terminal children (all senders are gone, so each has finished): a joinable child of this
-  // perpetual coordinator would otherwise linger in the arena. The joins are immediate.
+  // A child that has not reported is a voter timing out at its own deadline. Do **not** join it here —
+  // that would wait out the very deadline the progress-aware stop exists to avoid. Detach every child: a
+  // reported one is already terminal (immediate), an unreported one returns its endpoint at
+  // [`request_within`]'s deadline and self-cleans — bounded, never orphaned (banned item 9). Its session is
+  // not returned to the pool this round, so the per-peer link task re-establishes it (a no-op for a live
+  // voter that simply replied late, since its reply was collected and its endpoint returned above).
   for task in tasks {
-    let _ = futures::join(task).await;
+    let _ = futures::detach(task);
   }
   replies
 }

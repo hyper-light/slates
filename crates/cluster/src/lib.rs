@@ -244,7 +244,7 @@ impl CommitBudget {
 /// zero extension budget makes this an absolute deadline, so the laptop's behaviour is unchanged (R8).
 ///
 /// [`hard`]: CommitBudget::hard
-struct DispatchWait {
+pub struct DispatchWait {
   extender: DeadlineExtender,
   witness: ProgressWitness,
   poll_interval_ns: u64,
@@ -254,7 +254,7 @@ struct DispatchWait {
 impl DispatchWait {
   /// A wait seeded from `budget`, its clock started at `now` (the moment collection begins, so the
   /// elapsed time the extender measures is time spent gathering acknowledgements).
-  fn new(budget: CommitBudget, now: u64) -> DispatchWait {
+  pub fn new(budget: CommitBudget, now: u64) -> DispatchWait {
     DispatchWait {
       extender: budget.extender(),
       witness: ProgressWitness::new(budget.stall_window_ns, now),
@@ -268,7 +268,7 @@ impl DispatchWait {
   /// its deadline and is stalled, or has spent its extension budget — the collection loop then stops and
   /// the commit is reported uncertain. A dispatch below its deadline, or still filling its quorum near
   /// it, keeps waiting.
-  async fn keep_waiting(&mut self, gathered: usize) -> bool {
+  pub async fn keep_waiting(&mut self, gathered: usize) -> bool {
     sleep(self.poll_interval_ns).await;
     let now = now_ns();
     self
