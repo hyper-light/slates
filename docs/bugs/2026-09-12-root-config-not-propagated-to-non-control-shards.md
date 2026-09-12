@@ -82,10 +82,17 @@ the fix.
   out **not** to be entangled with distributing takeover after all: peer records — and so the
   held-record fences and the routing that drives takeover — live on the control shard, so a non-control
   shard tracks no held object and its `install_configuration` returns no reassignment to drive. So the
-  fan-out is pure read configuration: `sync_config_from_council` now returns the committed
-  `(configuration, members)` and fans them to every other shard, each installing them read-only
-  (version-gated). Test `a_committed_retirement_reaches_every_shards_placement_view` (same shape,
-  non-vacuity-checked). Takeover stays correctly centralized on the control shard.
+  fan-out is pure read configuration. `fan_configs_to_shards` fans **both** the placement configuration
+  and the root configuration in one cross-shard message per shard, **every period** — not only on change:
+  `run_on` → `send_control` returns `ControlFull` for a live shard whose control channel is momentarily
+  full, so a fan dropped on the one period a configuration changed would leave that shard stale until the
+  next change; re-fanning heals it next period (the idempotent-retry discipline `fold_peer_state` uses for
+  the SWIM view), and the receiving install/adopt are version-gated so an unchanged re-fan is a no-op
+  there. (A first pass source-gated the root fan for efficiency, `877ac24`; that silently removed the
+  self-heal, so it was reverted — R4: robustness is never traded for a small perf gain. The real
+  efficiency win, one dispatch for both configurations, is kept.) Test
+  `a_committed_retirement_reaches_every_shards_placement_view` (same shape, non-vacuity-checked). Takeover
+  stays correctly centralized on the control shard.
 - **A longer suite surfaced a pre-existing flake** in `a_committed_promotion_reaches_every_shards_lookup_view`
   (the test added with this root fix). Adding the placement test lengthened the fleet suite (21 tests,
   ~114s) and it failed once at suite-end on `every control shard re-homes...` — `proposed` was true (a

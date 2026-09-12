@@ -172,6 +172,14 @@ impl FleetNode {
     &self.configuration
   }
 
+  /// The regional members the last installed configuration named (the argument
+  /// [`install_configuration`](FleetNode::install_configuration) last received). Paired with
+  /// [`configuration`](FleetNode::configuration) when a node fans its committed configuration to its other
+  /// shards, so each installs the same `(configuration, members)` the council committed.
+  pub fn members(&self) -> &[HostId] {
+    &self.members
+  }
+
   /// The SWIM membership view — the alive set the neighbourhood tracks, and the state the live probe
   /// loop (owed) reads and gossips.
   pub fn membership(&self) -> &Membership {

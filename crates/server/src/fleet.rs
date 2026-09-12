@@ -2243,117 +2243,93 @@ async fn drive_learner_fetch(voters: &[HostId], budget: CommitBudget) {
 /// drives, with every held acceptor's authority brought into step so this node can promote what it took over
 /// and answer another survivor's promotion of the rest. Idempotent: an unchanged configuration takes over
 /// nothing, so the coordinator calls it every period.
-fn sync_config_from_council(local: HostId, origin: u16, shards: &[u16]) {
-  // Install on this control shard — the takeover drive and the held-record fences live here, because the peer
-  // records arrive on this shard — and return the committed configuration and members so they can be fanned to
-  // every other shard for read consistency.
-  let installed: Option<(slates_db::register::Configuration, Vec<HostId>)> =
-    state::with_state(|s| {
-      // Nothing new committed since the last install: the version advances on every change, so an equal
-      // version is the same configuration — skip the diff and the members clone (config changes are the
-      // near-zero-rate the design makes a tripwire, so most periods skip here).
-      if s.council.configuration().version == s.fleet.configuration().version {
-        return None;
-      }
-      let (configuration, members, epochs) = {
-        let regional = s.council.configuration();
-        (
-          regional.configuration_for(local),
-          regional.members.clone(),
-          regional.epochs.clone(),
-        )
-      };
-      let configuration = configuration?;
-      // Surface a durability breach in the newly-committed configuration (§4.8, D-14 — the copyset count check
-      // at every configuration change); a no-op when no operator durability policy is declared.
-      crate::daemon::record_durability(
-        &configuration,
-        s.config
-          .fleet
-          .as_ref()
-          .and_then(|membership| membership.durability),
-      );
-      for reassignment in s
+fn sync_config_from_council(local: HostId) {
+  // The takeover drive and the held-record fences live on this control shard — the peer records arrive here —
+  // so the install runs only here, and only when the council has committed something new (source-gated: the
+  // version advances on every change, so an equal version is the same configuration, the near-zero rate the
+  // design makes a tripwire). The committed configuration reaches the node's other shards separately, every
+  // period, through [`fan_configs_to_shards`], so a failed cross-shard dispatch self-heals.
+  state::with_state(|s| {
+    if s.council.configuration().version == s.fleet.configuration().version {
+      return;
+    }
+    let (configuration, members, epochs) = {
+      let regional = s.council.configuration();
+      (
+        regional.configuration_for(local),
+        regional.members.clone(),
+        regional.epochs.clone(),
+      )
+    };
+    let Some(configuration) = configuration else {
+      return;
+    };
+    // Surface a durability breach in the newly-committed configuration (§4.8, D-14 — the copyset count check
+    // at every configuration change); a no-op when no operator durability policy is declared.
+    crate::daemon::record_durability(
+      &configuration,
+      s.config
         .fleet
-        .install_configuration(configuration.clone(), &members)
-      {
-        s.pending_takeovers.insert(reassignment.object);
+        .as_ref()
+        .and_then(|membership| membership.durability),
+    );
+    for reassignment in s.fleet.install_configuration(configuration, &members) {
+      s.pending_takeovers.insert(reassignment.object);
+    }
+    // Raise the fence for every held object to its owner's committed fencing epoch (§4.8 "every holder
+    // raises its fence for that host to the new epoch"). A failed owner's epoch was bumped by the council's
+    // takeover, so this fences a resumed stale owner `StaleEpoch` across all its objects **at once** — done
+    // before `reconcile_held_authority` re-owns those objects to the successor, so the fence is read against
+    // the *departed* owner. Monotonic (a live owner's unchanged epoch is a no-op), additive on top of the
+    // configuration-generation fence. (The FencedRegister per-host model this realizes, A-9, still owes its
+    // TLA+ revalidation before the modeled StaleNeverCommits result formally applies; design §4.8.)
+    for acceptor in s.holder_records.values_mut() {
+      if let Some(epoch) = epochs.get(&acceptor.owner()) {
+        acceptor.raise_fence(*epoch);
       }
-      // Raise the fence for every held object to its owner's committed fencing epoch (§4.8 "every holder
-      // raises its fence for that host to the new epoch"). A failed owner's epoch was bumped by the council's
-      // takeover, so this fences a resumed stale owner `StaleEpoch` across all its objects **at once** — done
-      // before `reconcile_held_authority` re-owns those objects to the successor, so the fence is read against
-      // the *departed* owner. Monotonic (a live owner's unchanged epoch is a no-op), additive on top of the
-      // configuration-generation fence. (The FencedRegister per-host model this realizes, A-9, still owes its
-      // TLA+ revalidation before the modeled StaleNeverCommits result formally applies; design §4.8.)
-      for acceptor in s.holder_records.values_mut() {
-        if let Some(epoch) = epochs.get(&acceptor.owner()) {
-          acceptor.raise_fence(*epoch);
-        }
-      }
-      reconcile_held_authority(s);
-      Some((configuration, members))
-    })
-    .flatten();
-  if let Some((configuration, members)) = installed {
-    fan_configuration_to_shards(origin, shards, &configuration, &members);
-  }
+    }
+    reconcile_held_authority(s);
+  });
 }
 
-/// Fans the committed placement configuration from the control shard — the only shard that drives the council
-/// and installs its commits ([`sync_config_from_council`]) — to every other shard for **read** consistency
-/// (§4.8, D-7 "one owning shard per volume"). The placement verbs (`place`/`region_placed`/`await_placed`/
-/// `host_epoch`) run on a volume's owner shard, which may not be this control shard, so each shard must read
-/// the configuration the council committed or a volume owned elsewhere would report a stale placement after a
-/// membership change. Each shard installs it for **reads only**, version-gated (idempotent, so a converged
-/// fleet is a no-op): takeover stays on the control shard (the holds and peer sessions are here), and a
-/// non-control shard tracks no held object, so its install returns no reassignment to drive. Uses the same
-/// per-period `run_on` cross-shard call as the SWIM failure view ([`fold_peer_state`]) and the root
-/// configuration ([`sync_root_to_shards`]).
-fn fan_configuration_to_shards(
-  origin: u16,
-  shards: &[u16],
-  configuration: &slates_db::register::Configuration,
-  members: &[HostId],
-) {
-  for shard in shards.iter().copied().filter(|shard| *shard != origin) {
-    let configuration = configuration.clone();
-    let members = members.to_vec();
-    let _ = run_on(origin, shard, move |s| {
-      if configuration.version > s.fleet.configuration().version {
-        let _ = s.fleet.install_configuration(configuration, &members);
-      }
-    });
-  }
-}
-
-/// Propagates the committed root configuration from the control shard — the only shard that drives the root
-/// group over the transport ([`drive_root_group`]) — to every other shard, each **adopting** it (§4.8
-/// "Lookup", D-14). Every shard serves clients, and each answers the cross-region lookup guard
-/// ([`crate::verbs::home_redirect`]) for the clients that land on it from its own `s.root`, so a home moved or
-/// promoted on the control shard must reach the others or a client on another shard would read the
-/// pre-promotion home. Version-gated by [`RootGroup::adopt`] (an equal-or-older configuration is ignored), so
-/// a converged fleet costs one bounded cross-shard message per shard and no state change — the near-zero rate
-/// the root-group commit itself runs at. A non-control shard never votes or receives root Raft traffic; it
-/// holds a read-only committed copy, the same shape a root learner adopts over the wire, here a same-process
-/// copy. **Source-gated** on the root configuration version through `last_version`: a converged fleet does no
-/// work at all — no clone, no cross-shard message — the fan runs only when a root commit advances the version
-/// (the near-zero rate the root group runs at), so an idle period is free. Every shard boots the same root
-/// configuration (`build_root_group` from the same membership), so an unchanged version is already consistent.
-/// (The council's placement configuration is fanned the same way by [`fan_configuration_to_shards`].)
-fn sync_root_to_shards(origin: u16, shards: &[u16], last_version: &mut u64) {
-  let configuration = match state::with_state(|s| {
-    let version = s.root.configuration().version;
-    (version != *last_version).then(|| s.root.configuration().clone())
-  }) {
-    Some(Some(configuration)) => configuration,
-    _ => return,
+/// Fans the control shard's current committed configurations — the council's placement `Configuration` and the
+/// root group's `RootConfiguration` — to every other shard each period (§4.8, D-7 "one owning shard per
+/// volume", §4.8 "Lookup"). Every shard serves clients: the placement verbs (`place`/`region_placed`/
+/// `await_placed`/`host_epoch`) and the cross-region lookup guard ([`crate::verbs::home_redirect`]) run on a
+/// volume's owner shard, which may not be this control shard, so each shard must read what the council and the
+/// root group committed or a volume owned elsewhere would report a stale placement or home after a membership
+/// change, move or promotion. Only the control shard drives the council and the root group and installs their
+/// commits (`sync_config_from_council`, `drive_root_group`); every other shard holds a read-only copy fanned
+/// from here.
+///
+/// **Re-fanned every period, not only on change** — the same idempotent-retry discipline [`fold_peer_state`]
+/// uses for the SWIM view: `run_on` is refused when a shard's control channel is momentarily full
+/// ([`RtError::ControlFull`]), and a fan dropped on the one period a configuration changed would otherwise
+/// leave that shard stale until the next change. Re-fanning heals it next period, and the receiving side is
+/// version-gated (`install_configuration` installs only a newer version; `RootGroup::adopt` ignores an
+/// equal-or-older one), so a re-fan of an unchanged configuration is a no-op there. Both configurations ride
+/// **one** cross-shard message per shard, and both are bounded (a bounded neighbourhood; regions, moved homes
+/// and promotions), so the per-period cost is bounded at every scale. A non-control shard tracks no held
+/// object, so its `install_configuration` returns no reassignment to drive — takeover stays on this shard.
+fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
+  let Some((placement, members, root)) = state::with_state(|s| {
+    (
+      s.fleet.configuration().clone(),
+      s.fleet.members().to_vec(),
+      s.root.configuration().clone(),
+    )
+  }) else {
+    return;
   };
-  *last_version = configuration.version;
   for shard in shards.iter().copied().filter(|shard| *shard != origin) {
-    let configuration = configuration.clone();
+    let placement = placement.clone();
+    let members = members.clone();
+    let root = root.clone();
     let _ = run_on(origin, shard, move |s| {
-      s.root.adopt(configuration);
+      if placement.version > s.fleet.configuration().version {
+        let _ = s.fleet.install_configuration(placement, &members);
+      }
+      s.root.adopt(root);
     });
   }
 }
@@ -2396,8 +2372,6 @@ async fn run_record_plane(local: HostId, budget: CommitBudget) {
   let mut root_idle: u32 = 0;
   let mut root_seen_contact: u64 = 0;
   let mut root_attempt: u32 = 0;
-  // The root configuration version last fanned to the other shards, so a converged fleet re-fans nothing.
-  let mut root_fanned_version: u64 = 0;
   loop {
     in_flight.retain_mut(|dispatch| !dispatch.settle());
     // Drive the configuration authority first — an election or a replication heartbeat over the transport —
@@ -2424,11 +2398,12 @@ async fn run_record_plane(local: HostId, budget: CommitBudget) {
     // object whose owner the council has now retired (§4.8, D-14 — the council is the authority; a departed
     // owner's objects that rendezvous first to this node over the new neighbourhood are owed a phase-one
     // recovery, driven below).
-    sync_config_from_council(local, origin, &shards);
-    // Fan the committed root configuration out to every other shard so the cross-region lookup guard reads the
-    // same home wherever a client lands (§4.8 "Lookup"); a no-op each period the root configuration is
-    // unchanged (`RootGroup::adopt` is version-gated).
-    sync_root_to_shards(origin, &shards, &mut root_fanned_version);
+    sync_config_from_council(local);
+    // Fan the committed placement and root configurations out to every other shard, every period, so a client
+    // reads the same placement and cross-region home wherever it lands (§4.8 "Lookup", D-7). Re-fanned every
+    // period so a dispatch a full control channel refused self-heals; the receiving install/adopt are
+    // version-gated, so an unchanged configuration is a no-op there (see `fan_configs_to_shards`).
+    fan_configs_to_shards(origin, &shards);
     // Keep the owner's hold writing under the current configuration generation: the version advances on
     // every join or retirement (`FleetNode::observe` keeps the node's own acceptor in step the same way), and
     // a record under a stale generation is refused `ForeignGeneration` by the owner's own hold — so without
