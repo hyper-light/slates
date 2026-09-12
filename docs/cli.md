@@ -77,6 +77,11 @@ slates anchor --fleet /etc/slates/fleet.json --node a
   is **surfaced** as a health signal (never silently over-scattered): a breach is a recovery-vs-durability
   conflict to resolve by raising `f`, the re-replication bandwidth, or the failure-domain granularity. It is
   a policy, so it is stated, never derived.
+- `mirrors` is an optional fleet-level object mapping a region id to its mirror region id, e.g.
+  `{ "0": 1, "1": 0 }` (region 0's data is mirrored to region 1). A region with a mirror is **not** failed
+  over automatically when its hosts are lost — a region that is merely partitioned would be failed over while
+  still serving, creating a second owner — so it stays in the fleet until an operator deliberately promotes
+  its mirror; a region with no mirror is simply retired when its hosts are all lost. Empty by default.
 
 `slates status` on any node shows its place in the fleet: `fleet_host` (its member id),
 `fleet_f`, `fleet_host_epoch`, `fleet_members` (the members it holds alive) and

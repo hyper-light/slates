@@ -118,6 +118,11 @@ pub struct ShardState {
   /// region membership from (an alive host's region is an alive region). A host absent is in the sole region
   /// `RegionId(0)`. Set at boot from the fleet membership; empty on a laptop.
   pub node_regions: std::collections::BTreeMap<slates_db::HostId, slates_db::register::RegionId>,
+  /// Each region's designated mirror (§4.8 — region-loss promotion): the reconcile leaves a lost mirrored
+  /// region for a deliberate operator promotion (not auto-retire), and `Daemon::promote_region` looks up the
+  /// mirror to promote here. Set at boot from the fleet membership; empty on a laptop or when none declared.
+  pub region_mirrors:
+    std::collections::BTreeMap<slates_db::register::RegionId, slates_db::register::RegionId>,
   /// The landing runtime: grants, leases and the audit log (§4.15), mirrored to the
   /// database's durable records.
   pub landing: crate::landing::LandingState,

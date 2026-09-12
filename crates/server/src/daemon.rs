@@ -495,6 +495,69 @@ impl Daemon {
       .unwrap_or_default()
   }
 
+  /// Promotes a lost region's mirror through the root group (§4.8 "region loss promotes the mirror through the
+  /// root group at operator cadence"): a deliberate operator failover, never automatic — a region that is
+  /// merely partitioned must not be failed over while it is still serving (that would promote a second owner,
+  /// split-brain). If this node leads the root group and `lost` has a declared mirror, it proposes
+  /// `PromoteRegion{lost, mirror}`; the root group commits it over the transport, and every node then routes
+  /// `lost`'s volumes to the mirror ([`RootConfiguration::home_of`](slates_db::register::RootConfiguration::home_of)).
+  /// Returns whether the promotion was proposed — `false` if this node is not the root leader, or `lost` has
+  /// no mirror, or is not a current region. A one-shot control-shard action, bounded by the liveness budget;
+  /// the operator issues it (a CLI verb over this) after judging the region truly lost.
+  pub fn promote_region(&self, lost: slates_db::register::RegionId) -> bool {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
+      return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        let proposed = state::with_state(|s| match s.region_mirrors.get(&lost) {
+          Some(&mirror) => s
+            .root
+            .propose(slates_cluster::root_group::RootCommand::PromoteRegion { lost, mirror }),
+          None => false,
+        })
+        .unwrap_or(false);
+        let _ = tx.send(proposed);
+      })
+      .is_err()
+    {
+      return false;
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .unwrap_or(false)
+  }
+
+  /// The region a `volume` created in `creator_region` is served from, per this daemon's committed root
+  /// configuration (§4.8 — its moved home if any, else its creator region, then any region promotion of that
+  /// region followed to a fixed point): `RootConfiguration::home_of`. Returns `creator_region` if the daemon
+  /// is not on a shard or does not answer in time. Exposed so a fleet test can prove a region-loss promotion
+  /// re-homes the lost region's volumes to the mirror.
+  pub fn region_home(
+    &self,
+    volume: slates_db::register::ObjectId,
+    creator_region: slates_db::register::RegionId,
+  ) -> slates_db::register::RegionId {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
+      return creator_region;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        let home = state::with_state(|s| s.root.configuration().home_of(volume, creator_region))
+          .unwrap_or(creator_region);
+        let _ = tx.send(home);
+      })
+      .is_err()
+    {
+      return creator_region;
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+      .unwrap_or(creator_region)
+  }
+
   /// This daemon's **placement** neighbourhood (§4.8, D-14): the neighbourhood of the configuration the node
   /// currently places under — the owner view it **installed from the council** (`FleetNode::configuration`),
   /// the set the verbs draw candidates from. Distinct from [`council_members`](Daemon::council_members) (the
@@ -874,6 +937,7 @@ fn build_root_group(
 ) -> (
   slates_cluster::root_group::RootGroup,
   std::collections::BTreeMap<slates_db::HostId, slates_db::register::RegionId>,
+  std::collections::BTreeMap<slates_db::register::RegionId, slates_db::register::RegionId>,
 ) {
   match &config.fleet {
     Some(membership) => {
@@ -884,6 +948,7 @@ fn build_root_group(
       (
         slates_cluster::root_group::RootGroup::new(host, regions, voters),
         membership.regions.clone(),
+        membership.region_mirrors.clone(),
       )
     }
     None => (
@@ -892,6 +957,7 @@ fn build_root_group(
         vec![slates_db::register::RegionId(0)],
         vec![host],
       ),
+      std::collections::BTreeMap::new(),
       std::collections::BTreeMap::new(),
     ),
   }
@@ -1033,7 +1099,7 @@ fn init_shard(
   // The root group across regions (§4.8, D-14): the regions the fleet spans and the representative host of
   // each (the root voters), driven over the transport by the control shard's config plane
   // (`crate::fleet::drive_root_group`), exactly as the regional council is.
-  let (root, node_regions) = build_root_group(config, host);
+  let (root, node_regions, region_mirrors) = build_root_group(config, host);
   // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
   let content = match AnchorSegment::open_content(env) {
@@ -1099,6 +1165,7 @@ fn init_shard(
     council,
     root,
     node_regions,
+    region_mirrors,
     held_content: slates_cluster::content::ContentHold::new(),
     seals: std::collections::BTreeMap::new(),
     pending_materializations: std::collections::BTreeMap::new(),

@@ -116,6 +116,12 @@ pub struct FleetMembership {
   /// the deployment declares none, which collapses to a single-region fleet whose root group is the degenerate
   /// self-leading group (R8). This node's own region is `regions[host]` (or the sole region if absent).
   pub regions: BTreeMap<HostId, RegionId>,
+  /// Each region's designated **mirror** region (§4.8 "region loss promotes the mirror through the root
+  /// group"): where a region's data is asynchronously copied, and the region an operator promotes it to on
+  /// loss. A region absent from the map has no mirror. Read by the root group's reconcile (a lost region with
+  /// a mirror is left for a deliberate operator promotion, not auto-retired) and by the operator promotion
+  /// (`Daemon::promote_region` looks up the lost region's mirror here). Fleet-wide, from the manifest.
+  pub region_mirrors: BTreeMap<RegionId, RegionId>,
   /// The operator's durability policy, if declared (§4.8 "the copyset count check at every configuration
   /// change"): the accepted coincident-loss probability under a stated simultaneous failure count. `None` —
   /// the default — leaves the check disabled (an accepted loss probability is a policy, not a machine

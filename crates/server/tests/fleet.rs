@@ -212,6 +212,7 @@ fn start_sharded(this: Node, peer: Peer, shards: u16) -> Daemon {
       domains: std::collections::BTreeMap::new(),
       regions: std::collections::BTreeMap::new(),
       durability: None,
+      region_mirrors: std::collections::BTreeMap::new(),
     });
   let transport = FleetTransport {
     identity: this.identity,
@@ -474,6 +475,7 @@ fn start_mesh_with_f(
     f,
     1,
     &std::collections::BTreeMap::new(),
+    &std::collections::BTreeMap::new(),
   )
 }
 
@@ -487,11 +489,39 @@ fn start_mesh_with_regions(
   f: u32,
   regions: &std::collections::BTreeMap<HostId, slates_db::register::RegionId>,
 ) -> Vec<Daemon> {
-  start_mesh_with(nodes, hosts, certs, serve, f, 1, regions)
+  start_mesh_with(
+    nodes,
+    hosts,
+    certs,
+    serve,
+    f,
+    1,
+    regions,
+    &std::collections::BTreeMap::new(),
+  )
 }
 
-/// [`start_mesh_with_f`] with `shards` shards per daemon (see [`start_sharded`]) and each host's `regions`
-/// (empty = the single-region default).
+/// [`start_mesh_with_regions`] that also declares each region's **mirror** (§4.8 — region-loss promotion), so
+/// a lost mirrored region awaits an operator promotion rather than being auto-retired.
+fn start_mesh_with_regions_and_mirrors(
+  nodes: Vec<(MachineProfile, HostId, Identity)>,
+  hosts: &[HostId],
+  certs: &[rustls::pki_types::CertificateDer<'static>],
+  serve: &[(u16, u16)],
+  f: u32,
+  regions: &std::collections::BTreeMap<HostId, slates_db::register::RegionId>,
+  mirrors: &std::collections::BTreeMap<
+    slates_db::register::RegionId,
+    slates_db::register::RegionId,
+  >,
+) -> Vec<Daemon> {
+  start_mesh_with(nodes, hosts, certs, serve, f, 1, regions, mirrors)
+}
+
+/// [`start_mesh_with_f`] with `shards` shards per daemon (see [`start_sharded`]), each host's `regions`
+/// (empty = the single-region default) and each region's `mirrors`. A test-only fixture builder whose many
+/// setup inputs are each distinct fleet-shape parameters.
+#[allow(clippy::too_many_arguments)]
 fn start_mesh_with(
   nodes: Vec<(MachineProfile, HostId, Identity)>,
   hosts: &[HostId],
@@ -500,6 +530,10 @@ fn start_mesh_with(
   f: u32,
   shards: u16,
   regions: &std::collections::BTreeMap<HostId, slates_db::register::RegionId>,
+  mirrors: &std::collections::BTreeMap<
+    slates_db::register::RegionId,
+    slates_db::register::RegionId,
+  >,
 ) -> Vec<Daemon> {
   let pid = std::process::id();
   let n = hosts.len();
@@ -527,6 +561,7 @@ fn start_mesh_with(
           domains: std::collections::BTreeMap::new(),
           regions: regions.clone(),
           durability: None,
+          region_mirrors: mirrors.clone(),
         });
       let transport = FleetTransport {
         identity,
@@ -910,6 +945,115 @@ fn a_root_learner_fetches_the_committed_region_membership_over_the_transport() {
     learned,
     "the learner fetched the committed retirement of the lost region — it dropped from the learner's root \
      membership though it cast no vote"
+  );
+}
+
+/// AC (§4.8, D-14 — region-loss promotion, at operator cadence): a region with a declared **mirror** is not
+/// auto-failed-over when its hosts are lost (promoting a merely-partitioned region would create a second
+/// owner — split-brain); it stays in the root membership until an **operator** deliberately promotes it. Three
+/// daemons, each its own region and a root voter; regions 1 and 2 both mirror to region 0. A follower's region
+/// is lost (its host killed); it is **not** auto-retired (unlike a mirror-less region), and its volumes still
+/// route to it. The operator then promotes it on the surviving root leader, which commits `PromoteRegion` over
+/// the transport, and every survivor re-homes the lost region's volumes to the mirror
+/// (`RootConfiguration::home_of`). The victim's death is injected for a deterministic SWIM cue.
+#[test]
+fn an_operator_promotes_a_lost_regions_mirror_over_the_transport() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  // Each host is its own region; regions 1 and 2 both mirror to region 0, so whichever follower we lose is a
+  // mirrored region that must await an operator promotion rather than being auto-retired.
+  let regions: std::collections::BTreeMap<HostId, RegionId> = [
+    (hosts[0], RegionId(0)),
+    (hosts[1], RegionId(1)),
+    (hosts[2], RegionId(2)),
+  ]
+  .into_iter()
+  .collect();
+  let mirrors: std::collections::BTreeMap<RegionId, RegionId> =
+    [(RegionId(1), RegionId(0)), (RegionId(2), RegionId(0))]
+      .into_iter()
+      .collect();
+  let daemons =
+    start_mesh_with_regions_and_mirrors(nodes, &hosts, &certs, &serve, 1, &regions, &mirrors);
+
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut survivors: Vec<(HostId, Daemon)> = hosts.iter().copied().zip(daemons).collect();
+  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, || {
+    survivors
+      .iter()
+      .filter(|(_, daemon)| daemon.root_leads())
+      .count()
+      == 1
+  });
+  let leader_host = survivors
+    .iter()
+    .find(|(_, daemon)| daemon.root_leads())
+    .map(|(host, _)| *host);
+  // A mirrored region's host (region 1 or 2) that is NOT the root leader, so the leader stays and the root
+  // group keeps quorum (2 of 3 voters).
+  let victim_host = [hosts[1], hosts[2]]
+    .into_iter()
+    .find(|host| Some(*host) != leader_host);
+
+  let (not_auto_retired, promoted) = match (elected, victim_host) {
+    (true, Some(victim)) => {
+      let lost = regions[&victim];
+      let mirror = mirrors[&lost];
+      let volume = ObjectId::new(victim, 7); // a volume created in the lost region
+      let victim_pos = survivors
+        .iter()
+        .position(|(host, _)| *host == victim)
+        .expect("the victim is present");
+      survivors.remove(victim_pos).1.stop();
+      for (_, daemon) in &survivors {
+        daemon.observe_peer_dead(victim, FALSE_DEATH_INCARNATION);
+      }
+      // The mirrored lost region is NOT auto-retired: it stays a member and its volumes still route to it.
+      let not_retired = holds_for(COUNCIL_STABILITY_WINDOW, || {
+        survivors
+          .iter()
+          .all(|(_, daemon)| daemon.region_home(volume, lost) == lost)
+      });
+      // The operator promotes the lost region's mirror on the surviving root leader.
+      let proposed = survivors
+        .iter()
+        .find(|(_, daemon)| daemon.root_leads())
+        .map(|(_, daemon)| daemon.promote_region(lost))
+        .unwrap_or(false);
+      // Every survivor then re-homes the lost region's volumes to the mirror.
+      let promoted = proposed
+        && poll_until(COUNCIL_RETIRE_DEADLINE, || {
+          survivors
+            .iter()
+            .all(|(_, daemon)| daemon.region_home(volume, lost) == mirror)
+        });
+      (not_retired, promoted)
+    }
+    _ => (false, false),
+  };
+
+  for (_, daemon) in survivors {
+    daemon.stop();
+  }
+  assert!(
+    elected,
+    "the root group elected a leader among the region representatives"
+  );
+  assert!(
+    not_auto_retired,
+    "a mirrored lost region is not auto-retired — its volumes still route to it, awaiting an operator promotion"
+  );
+  assert!(
+    promoted,
+    "the operator's promotion committed over the transport — every survivor re-homes the lost region's \
+     volumes to the mirror"
   );
 }
 
@@ -1917,6 +2061,7 @@ fn a_takeover_successor_serves_a_volume_on_a_non_control_shard() {
     &serve,
     1,
     TWO_SHARDS,
+    &std::collections::BTreeMap::new(),
     &std::collections::BTreeMap::new(),
   );
   assert_fleet_forms(&daemons, &hosts, &names);

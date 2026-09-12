@@ -2013,11 +2013,12 @@ async fn drive_root_group(
 
   if is_leader {
     // As the root master, reconcile the region membership from this node's own alive view: propose admitting
-    // any newly-alive region and retiring any region no host is alive in, committed over the transport by the
-    // replication below and applied on every root voter.
+    // any newly-alive region and retiring any **mirror-less** region no host is alive in (a lost region with a
+    // mirror is left for a deliberate operator promotion — §4.8, split-brain safety), committed over the
+    // transport by the replication below and applied on every root voter.
     state::with_state(|s| {
       let alive = alive_regions(s);
-      s.root.reconcile_regions(&alive)
+      s.root.reconcile_regions(&alive, &s.region_mirrors)
     });
     drive_root_replication(&others, budget).await;
     *idle = 0;

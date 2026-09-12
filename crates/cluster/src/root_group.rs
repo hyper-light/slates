@@ -289,14 +289,22 @@ impl RootGroup {
 
   /// Reconciles the region membership with the set of regions currently **alive** — as the leader — the
   /// cross-region counterpart of [`RegionalCouncil::reconcile_alive`](crate::config_group::RegionalCouncil::reconcile_alive):
-  /// proposes admitting every alive region not yet a member and retiring every member region no host is alive
-  /// in, each through the root log so it commits at a majority over the transport and applies on every voter.
-  /// Returns whether anything was proposed. A non-leader proposes nothing (only the elected root master
-  /// decides), and the [`caught_up`](RootGroup::caught_up) gate keeps a change in flight from being
-  /// re-proposed, so the log grows only for real changes. A lost region is **retired** here (the region-loss
-  /// **promotion** to a configured mirror — §4.8 "region loss promotes the mirror through the root group" — is
-  /// the owed refinement; without a mirror declared, a region with no live host simply leaves the membership).
-  pub fn reconcile_regions(&mut self, alive: &[RegionId]) -> bool {
+  /// proposes admitting every alive region not yet a member, and retiring a member region no host is alive in
+  /// **only when it has no mirror** in `mirrors` — each through the root log so it commits at a majority over
+  /// the transport and applies on every voter. Returns whether anything was proposed. A non-leader proposes
+  /// nothing (only the elected root master decides), and the [`caught_up`](RootGroup::caught_up) gate keeps a
+  /// change in flight from being re-proposed, so the log grows only for real changes.
+  ///
+  /// A lost region **with a mirror is left in place** for a deliberate operator promotion (§4.8 "region loss
+  /// promotes the mirror through the root group at operator cadence"): auto-failing-over a region that is
+  /// merely partitioned would promote its mirror while it is still serving — a second owner (split-brain). A
+  /// lost region **without a mirror** has no failover target, so its confirmed loss is a clean retirement (no
+  /// second owner is created, and SWIM re-admits it on recovery).
+  pub fn reconcile_regions(
+    &mut self,
+    alive: &[RegionId],
+    mirrors: &std::collections::BTreeMap<RegionId, RegionId>,
+  ) -> bool {
     if !self.is_leader() || !self.caught_up() {
       return false;
     }
@@ -312,6 +320,16 @@ impl RootGroup {
       .filter(|region| !alive.contains(region))
       .collect();
     for region in stale {
+      // A lost region that has a **mirror** is not auto-retired: cross-region failover is deliberate
+      // ("region loss promotes the mirror through the root group at operator cadence", §4.8), because a region
+      // that is merely partitioned — not truly lost — would otherwise be failed over while it is still
+      // serving, promoting a second owner (split-brain). It stays in the membership, unreachable, until an
+      // operator promotes it (`PromoteRegion`, driven by the daemon's operator control). A lost region with
+      // **no** mirror has no failover target, so its confirmed loss is a clean retirement — no second owner is
+      // ever created, and SWIM re-admits the region if it recovers.
+      if mirrors.contains_key(&region) {
+        continue;
+      }
       proposed |= self.propose(RootCommand::RetireRegion(region));
     }
     proposed
@@ -523,29 +541,64 @@ mod tests {
     elect(&mut leader, &mut follower);
     assert!(leader.is_leader());
 
-    // R2 has become alive; R1 has lost every host. A non-leader proposes nothing.
+    // R2 has become alive; R1 has lost every host and has **no mirror**, so it is retired. A non-leader
+    // proposes nothing.
     let alive = [R0, R2];
+    let no_mirrors = std::collections::BTreeMap::new();
     assert!(
-      !follower.reconcile_regions(&alive),
+      !follower.reconcile_regions(&alive, &no_mirrors),
       "a non-leader proposes nothing"
     );
     assert!(
-      leader.reconcile_regions(&alive),
-      "the leader proposes admitting R2 and retiring R1"
+      leader.reconcile_regions(&alive, &no_mirrors),
+      "the leader proposes admitting R2 and retiring the mirror-less lost R1"
     );
     assert!(
-      !leader.reconcile_regions(&alive),
+      !leader.reconcile_regions(&alive, &no_mirrors),
       "a change in flight is not re-proposed (the caught-up gate)"
     );
 
     replicate(&mut leader, &mut follower, 2);
     for g in [&leader, &follower] {
       assert!(g.configuration().regions.contains(&R2), "R2 was admitted");
-      assert!(!g.configuration().regions.contains(&R1), "R1 was retired");
+      assert!(
+        !g.configuration().regions.contains(&R1),
+        "the mirror-less lost R1 was retired"
+      );
     }
     assert!(
-      !leader.reconcile_regions(&alive),
+      !leader.reconcile_regions(&alive, &no_mirrors),
       "the settled membership reconciles to a no-op — the log grows only for real changes"
     );
+  }
+
+  /// AC (§4.8 — region-loss promotion at operator cadence): a lost region that has a **mirror** is left in
+  /// the membership (it awaits a deliberate operator promotion, not an automatic failover of a possibly-just-
+  /// partitioned region — split-brain), whereas a mirror-less lost region is retired.
+  #[test]
+  fn a_lost_mirrored_region_is_not_auto_retired() {
+    let mut leader = group(P0); // regions [R0, R1]
+    let mut follower = group(P1);
+    elect(&mut leader, &mut follower);
+    assert!(leader.is_leader());
+
+    // R1 is lost. With R0 declared as its mirror, the reconcile does not retire it.
+    let mirrors = std::collections::BTreeMap::from([(R1, R0)]);
+    assert!(
+      !leader.reconcile_regions(&[R0], &mirrors),
+      "a lost region with a mirror is not auto-retired — cross-region failover is the operator's"
+    );
+    assert!(
+      leader.configuration().regions.contains(&R1),
+      "the mirrored lost region stays in the membership, awaiting an operator promotion"
+    );
+
+    // The same region with no mirror declared is retired on its loss (no failover target).
+    assert!(
+      leader.reconcile_regions(&[R0], &std::collections::BTreeMap::new()),
+      "a mirror-less lost region is retired"
+    );
+    replicate(&mut leader, &mut follower, 2);
+    assert!(!leader.configuration().regions.contains(&R1));
   }
 }

@@ -69,6 +69,10 @@ pub struct FleetManifest {
   /// change"): a fleet-wide accepted coincident-loss probability under a stated failure count. `None` leaves
   /// the check disabled (the default). Every node reads the same policy from the same manifest.
   pub durability: Option<DurabilityBound>,
+  /// Each region's designated mirror (§4.8 "region loss promotes the mirror through the root group"), region
+  /// id → mirror region id. Empty by default (no region has a mirror). A lost region with a mirror is failed
+  /// over to it by a deliberate operator promotion.
+  pub region_mirrors: std::collections::BTreeMap<RegionId, RegionId>,
   /// Every node, in manifest order.
   pub nodes: Vec<FleetNodeEntry>,
 }
@@ -353,6 +357,7 @@ pub fn plan(
       domains,
       regions,
       durability: manifest.durability,
+      region_mirrors: manifest.region_mirrors.clone(),
     },
     transport: FleetTransport {
       identity,
@@ -412,6 +417,7 @@ mod tests {
       name: NAME.to_owned(),
       quorum: Quorum { f: 1 },
       durability: None,
+      region_mirrors: std::collections::BTreeMap::new(),
       nodes: vec![
         entry("a", 40_000, certs[0].clone()),
         entry("b", 41_000, certs[1].clone()),
@@ -594,6 +600,7 @@ mod tests {
       name: "x".to_owned(),
       quorum: Quorum { f: 0 },
       durability: None,
+      region_mirrors: std::collections::BTreeMap::new(),
       nodes: Vec::new(),
     };
     assert_eq!(
@@ -630,6 +637,7 @@ mod tests {
       name: NAME.to_owned(),
       quorum: Quorum { f: 0 },
       durability: None,
+      region_mirrors: std::collections::BTreeMap::new(),
       nodes: vec![entry("only", 50_000, cert)],
     };
     let plan = plan(&solo, "only", key).expect("a plan");

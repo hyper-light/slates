@@ -102,6 +102,7 @@ struct ManifestText {
   name: String,
   quorum: Quorum,
   durability: Option<DurabilityBound>,
+  region_mirrors: std::collections::BTreeMap<RegionId, RegionId>,
   nodes: Vec<NodeText>,
 }
 
@@ -194,8 +195,38 @@ fn parse(text: &str) -> Result<ManifestText, ManifestError> {
     name,
     quorum: Quorum { f },
     durability: durability_text(&document)?,
+    region_mirrors: mirrors_text(&document)?,
     nodes,
   })
+}
+
+/// Parses the optional fleet-level `mirrors` object (§4.8 "region loss promotes the mirror through the root
+/// group"): a map of region id to its mirror region id, e.g. `{ "0": 1, "1": 0 }`. Absent — the default —
+/// leaves every region without a mirror; present, each key must be a region id and each value a region id,
+/// named by its path when malformed.
+fn mirrors_text(
+  document: &serde_json::Value,
+) -> Result<std::collections::BTreeMap<RegionId, RegionId>, ManifestError> {
+  let Some(value) = document.get("mirrors") else {
+    return Ok(std::collections::BTreeMap::new());
+  };
+  let object = value.as_object().ok_or(ManifestError::Field {
+    field: "mirrors".to_owned(),
+    expected: "an object mapping a region id to its mirror region id",
+  })?;
+  let mut mirrors = std::collections::BTreeMap::new();
+  for (key, mirror) in object {
+    let region = key.parse::<u64>().map_err(|_| ManifestError::Field {
+      field: format!("mirrors.{key}"),
+      expected: "a region id key (a non-negative integer)",
+    })?;
+    let mirror = mirror.as_u64().ok_or_else(|| ManifestError::Field {
+      field: format!("mirrors.{key}"),
+      expected: "a mirror region id (a non-negative integer)",
+    })?;
+    mirrors.insert(RegionId(region), RegionId(mirror));
+  }
+  Ok(mirrors)
 }
 
 /// Parses the optional fleet-level `durability` policy (§4.8, D-14 — "the copyset count check at every
@@ -271,6 +302,7 @@ fn load_plan(selection: &FleetSelection) -> Result<FleetPlan, ManifestError> {
     name: stated.name,
     quorum: stated.quorum,
     durability: stated.durability,
+    region_mirrors: stated.region_mirrors,
     nodes,
   };
   let Some(key) = key else {
@@ -401,6 +433,35 @@ mod tests {
     match parse(&bad) {
       Err(ManifestError::Field { field, .. }) => assert_eq!(field, "durability.accepted_loss"),
       other => panic!("expected a field error for an out-of-range accepted_loss, got {other:?}"),
+    }
+  }
+
+  /// A fleet may declare region mirrors; the map is empty by default and a malformed mirror is named by its
+  /// path.
+  #[test]
+  fn declared_region_mirrors_parse_and_a_bad_one_is_named() {
+    assert!(
+      parse(MANIFEST).expect("parses").region_mirrors.is_empty(),
+      "no region mirrors by default"
+    );
+
+    let with_mirrors = MANIFEST.replace(r#""f": 1,"#, r#""f": 1, "mirrors": { "0": 1, "1": 0 },"#);
+    let mirrors = parse(&with_mirrors).expect("parses").region_mirrors;
+    assert_eq!(
+      mirrors.get(&RegionId(0)),
+      Some(&RegionId(1)),
+      "region 0's mirror is region 1"
+    );
+    assert_eq!(
+      mirrors.get(&RegionId(1)),
+      Some(&RegionId(0)),
+      "region 1's mirror is region 0"
+    );
+
+    let bad = with_mirrors.replace(r#""1": 0"#, r#""1": "west""#);
+    match parse(&bad) {
+      Err(ManifestError::Field { field, .. }) => assert_eq!(field, "mirrors.1"),
+      other => panic!("expected a field error for a non-integer mirror, got {other:?}"),
     }
   }
 
