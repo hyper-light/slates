@@ -14,7 +14,7 @@ use slates_db::catalog::{
   SizeClass as DbSizeClass, SnapshotId as DbSnapshotId, SnapshotRecord, VolumeId as DbVolumeId,
   VolumeRecord, VolumeState,
 };
-use slates_db::register::ObjectId;
+use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration};
 use slates_ipc::protocol::{
   DaemonReport, Direction, FleetReport, HealthSignal, Intent, NamePolicy, PlacedState, Refusal,
   RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal, SizeClass, SnapshotId,
@@ -213,6 +213,42 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
   }
 }
 
+/// The region a `volume` is homed in, if it is **not** this node's own region — the cross-region redirect
+/// signal (§4.8 "Lookup": a home move or region-loss promotion is a configuration exception; the answer comes
+/// from the current owner). `None` when the volume is homed here (served locally as usual).
+///
+/// Fast path: a single-region fleet (the local and laptop default) homes every volume in the one region, so
+/// this is a single length check and never a per-request map lookup — cross-region routing costs nothing where
+/// there is one region. A volume's home is its explicitly moved home if any, else its creator region (the
+/// creator host is the high half of the volume's object id), then any region-loss promotion of that region
+/// ([`RootConfiguration::home_of`]). Reads this shard's committed root configuration (as current as the
+/// placement reads on the same shard).
+fn homed_elsewhere(state: &ShardState, volume: VolumeId) -> Option<u64> {
+  home_redirect(
+    state.root.configuration(),
+    &state.node_regions,
+    state.fleet.host(),
+    volume,
+  )
+}
+
+/// The pure cross-region redirect decision (see [`homed_elsewhere`]): the region a `volume` is homed in when
+/// that is not `own_host`'s region, else `None`. A single-region fleet short-circuits before any map lookup.
+fn home_redirect(
+  root: &RootConfiguration,
+  node_regions: &std::collections::BTreeMap<HostId, RegionId>,
+  own_host: HostId,
+  volume: VolumeId,
+) -> Option<u64> {
+  if root.regions.len() <= 1 {
+    return None;
+  }
+  let region_of = |host: HostId| node_regions.get(&host).copied().unwrap_or(RegionId(0));
+  let object = ObjectId(volume.bytes);
+  let home = root.home_of(object, region_of(object.creator()));
+  (home != region_of(own_host)).then_some(home.0)
+}
+
 /// Serves one request for one client: the completion window first (a retry returns the
 /// retained reply; a stale retry is refused), then the verb here, on its owner shard, or
 /// across every shard; the completion is recorded when the reply is known.
@@ -265,6 +301,20 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   }
   if let RequestBody::Acknowledge { up_to } = body {
     return scatter_acknowledge(state, client.index(), request.request, client_id, up_to);
+  }
+  // Cross-region routing (§4.8 "Lookup"): a request for a volume homed in another region — moved there, or
+  // failed over there by a region-loss promotion — is not served here; refuse, naming the home region, so the
+  // caller re-routes to it (the redirect the design's refusal-driven lookup uses, the data-plane counterpart
+  // of the configuration-version piggyback). A single-region fleet never reaches the map (the fast path in
+  // `homed_elsewhere`), so local and laptop deployments pay nothing.
+  if let Some(volume) = volume_of(&body)
+    && let Some(region) = homed_elsewhere(state, volume)
+  {
+    return Served::Reply(record_completion(
+      state,
+      id,
+      refused(Refusal::HomedElsewhere { region }),
+    ));
   }
   let owner = match &body {
     RequestBody::Create { name, .. } => Some(owner_of_name(name, state.shards.len())),
@@ -890,6 +940,7 @@ fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::LandingLeaseHeld { .. } => "landing_lease_held",
     Refusal::GrantMismatch => "grant_mismatch",
     Refusal::GrantInvalid => "grant_invalid",
+    Refusal::HomedElsewhere { .. } => "homed_elsewhere",
   }
 }
 
@@ -3792,4 +3843,71 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
     }
   }
   (snapshots, attachments)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{HostId, ObjectId, RegionId, VolumeId, home_redirect};
+  use slates_db::register::RootConfiguration;
+
+  /// AC (§4.8 "Lookup"): a volume homed in another region is redirected there (naming that region); a volume
+  /// homed in this node's own region is served locally (`None`); and a single-region fleet always serves
+  /// locally — the fast path, taken before any map lookup.
+  #[test]
+  fn a_cross_region_volume_is_redirected_to_its_home_region() {
+    let (r0, r1) = (RegionId(0), RegionId(1));
+    let own_in_r0 = HostId(1);
+    let creator_in_r1 = HostId(2);
+    let node_regions = std::collections::BTreeMap::from([(own_in_r0, r0), (creator_in_r1, r1)]);
+
+    // A volume created by a host in region 1, seen at a node in region 0, redirects to region 1.
+    let remote = VolumeId {
+      bytes: ObjectId::new(creator_in_r1, 7).0,
+    };
+    let two_regions = RootConfiguration::formed(vec![r0, r1]);
+    assert_eq!(
+      home_redirect(&two_regions, &node_regions, own_in_r0, remote),
+      Some(1),
+      "a volume created in another region redirects to that region"
+    );
+
+    // A volume created in this node's own region is served locally.
+    let local = VolumeId {
+      bytes: ObjectId::new(own_in_r0, 7).0,
+    };
+    assert_eq!(
+      home_redirect(&two_regions, &node_regions, own_in_r0, local),
+      None,
+      "a locally-homed volume is served here"
+    );
+
+    // A single-region fleet always serves locally — the fast path, whatever the creator.
+    let one_region = RootConfiguration::formed(vec![r0]);
+    assert_eq!(
+      home_redirect(&one_region, &node_regions, own_in_r0, remote),
+      None,
+      "a single-region fleet never redirects"
+    );
+  }
+
+  /// A region-loss promotion re-homes the lost region's volumes: a volume created in a promoted-away region is
+  /// redirected to its mirror, following `home_of`'s promotion chain.
+  #[test]
+  fn a_promoted_regions_volume_redirects_to_its_mirror() {
+    let (r0, r1, r2) = (RegionId(0), RegionId(1), RegionId(2));
+    let own_in_r0 = HostId(1);
+    let creator_in_r2 = HostId(3);
+    let node_regions = std::collections::BTreeMap::from([(own_in_r0, r0), (creator_in_r2, r2)]);
+    let volume = VolumeId {
+      bytes: ObjectId::new(creator_in_r2, 7).0,
+    };
+
+    let mut root = RootConfiguration::formed(vec![r0, r1, r2]);
+    assert!(root.promote_region(r2, r1)); // region 2 lost, promoted to region 1
+    assert_eq!(
+      home_redirect(&root, &node_regions, own_in_r0, volume),
+      Some(1),
+      "a volume created in the promoted-away region redirects to its mirror"
+    );
+  }
 }

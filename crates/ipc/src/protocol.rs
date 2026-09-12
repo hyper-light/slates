@@ -781,6 +781,14 @@ pub enum Refusal {
   GrantMismatch,
   /// The grant is missing, expired or revoked.
   GrantInvalid,
+  /// The volume is homed in another region (§4.8 "Lookup" — a home move or region-loss promotion is a
+  /// configuration exception): this node's region does not serve it, and the answer must come from the named
+  /// home region. Names the region so the caller re-routes there (the cross-region redirect, the data-plane
+  /// counterpart of the configuration-version piggyback).
+  HomedElsewhere {
+    /// The region id that now homes the volume.
+    region: u64,
+  },
 }
 
 /// A reply body.
