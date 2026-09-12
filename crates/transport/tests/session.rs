@@ -141,9 +141,12 @@ fn a_stream_flows_over_a_live_session() {
   }
 }
 
-/// A request/reply exchange completes over a live session: the client sends a request, the server
-/// transforms it and replies, the client receives exactly the reply — the RPC seam register/placement
-/// will ride (§4.8 lookups route to the owner). Do X, expect Y.
+/// A request/reply exchange completes over a live session, the server producing its reply
+/// **asynchronously** (`serve_once_async`, the shape a forwarded verb needs — its reply comes from another
+/// shard or await; here the handler yields before replying, exercising the pending-await path): the client
+/// sends a request, the server transforms it and replies, the client receives exactly the reply — the RPC
+/// seam register/placement and cross-region forwarding will ride (§4.8 lookups route to the owner). Do X,
+/// expect Y.
 #[test]
 fn a_request_gets_a_reply_over_a_live_session() {
   let mut sim = SimRuntime::new(&config(), 1).unwrap();
@@ -181,7 +184,12 @@ fn a_request_gets_a_reply_over_a_live_session() {
       .unwrap();
       server.establish().await.unwrap();
       server
-        .serve_once(|_, req| req.iter().map(|b| b.wrapping_add(1)).collect())
+        .serve_once_async(|_, req| async move {
+          // Yield before producing the reply, so the pending-await path of `serve_once_async` is exercised
+          // (a forwarded verb's reply comes from an `xshard` await, not synchronously).
+          slates_rt::futures::sleep(1_000).await;
+          req.iter().map(|b| b.wrapping_add(1)).collect()
+        })
         .await
         .unwrap();
     })

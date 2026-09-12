@@ -908,6 +908,23 @@ impl Endpoint {
   where
     H: FnOnce(u64, Vec<u8>) -> Vec<u8>,
   {
+    // The synchronous handler is the common case (a record commit, a prepare, a config step — served in a
+    // brief `with_state` borrow); it is the async form with a ready reply, so the two share one body.
+    self
+      .serve_once_async(|id, request| core::future::ready(handler(id, request)))
+      .await
+  }
+
+  /// Serves one request whose reply is produced **asynchronously** — the shape a forwarded verb needs, where
+  /// the reply comes from another shard (`xshard` to the volume's owner) or another await (§4.8 "Lookup").
+  /// Identical to [`serve_once`] but the handler returns a future: the request is received and acknowledged
+  /// (phase one) before the handler is awaited, so the peer is simply waiting for the reply while the handler
+  /// runs — no retransmission, no protocol change. The reply then goes out on the same stream (phase two).
+  pub async fn serve_once_async<H, F>(&mut self, handler: H) -> Result<(), EndpointError>
+  where
+    H: FnOnce(u64, Vec<u8>) -> F,
+    F: core::future::Future<Output = Vec<u8>>,
+  {
     // Phase one: receive one request in full, acknowledging and *draining* as it arrives — draining is
     // what slides the flow-control window forward, so a request larger than one window keeps flowing
     // (without it the credit never grows past the initial window and the sender stalls). Each request
@@ -942,7 +959,7 @@ impl Endpoint {
     // Phase two: send the reply on the same stream id until the peer has acknowledged it whole. This is an
     // active exchange (a reply is in flight awaiting acknowledgement), so it carries the stall bound — a
     // peer that stops acknowledging is abandoned rather than retransmitted into forever.
-    let reply = handler(request_id, request);
+    let reply = handler(request_id, request).await;
     self.conn.open(request_id, &reply);
     loop {
       self.flush()?;
