@@ -178,6 +178,13 @@ impl RootGroup {
     self.raft.is_leader()
   }
 
+  /// The host that currently leads the root group — itself when it leads, else the last leader it heard from
+  /// (`None` while unsettled). A redirection hint for an operator command that must reach the leader (a
+  /// region-loss promotion); a stale hint costs a retry, never a safety violation.
+  pub fn leader(&self) -> Option<HostId> {
+    self.raft.leader()
+  }
+
   /// The group's voter set — the small consensus group the drive loop ships elections and replication to.
   pub fn voters(&self) -> Vec<HostId> {
     self.raft.all_voters()

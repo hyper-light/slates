@@ -244,6 +244,11 @@ pub struct RaftNode {
   votes: BTreeSet<HostId>,
   pre_votes: BTreeSet<HostId>,
   has_leader: bool,
+  /// The leader this node currently believes in — a follower learns it from an accepted append; a leader is
+  /// itself (via [`leader`](RaftNode::leader)). A **redirection hint** only (for an operator command that must
+  /// reach the leader), never consulted for safety. `None` when campaigning, stepped down, or a leader that
+  /// lost its quorum.
+  leader_hint: Option<HostId>,
   contacts: BTreeSet<HostId>,
   log: Vec<LogEntry>,
   commit_index: u64,
@@ -267,6 +272,7 @@ impl RaftNode {
       votes: BTreeSet::new(),
       pre_votes: BTreeSet::new(),
       has_leader: false,
+      leader_hint: None,
       contacts: BTreeSet::new(),
       log: Vec::new(),
       commit_index: 0,
@@ -298,6 +304,7 @@ impl RaftNode {
       votes: BTreeSet::new(),
       pre_votes: BTreeSet::new(),
       has_leader: false,
+      leader_hint: None,
       contacts: BTreeSet::new(),
       log,
       commit_index: 0,
@@ -329,6 +336,19 @@ impl RaftNode {
     self.role == Role::Leader
   }
 
+  /// The leader this node currently knows — itself when it leads, else the last leader it accepted an append
+  /// from (`None` when campaigning, stepped down, or a leader that lost its quorum). A **redirection hint**
+  /// only: an operator command that must reach the leader is forwarded here, and a stale hint costs a retry,
+  /// never a safety violation (the target refuses if it is not in fact the leader). Never consulted on a
+  /// safety path.
+  pub fn leader(&self) -> Option<HostId> {
+    if self.role == Role::Leader {
+      Some(self.id)
+    } else {
+      self.leader_hint
+    }
+  }
+
   /// Who this node voted for in its current term, if anyone.
   pub fn voted_for(&self) -> Option<HostId> {
     self.voted_for
@@ -342,6 +362,7 @@ impl RaftNode {
   /// `start_election` is what keeps a partitioned, term-inflated node from disrupting a healthy leader.
   pub fn on_election_timeout(&mut self) -> Vec<PreVote> {
     self.has_leader = false;
+    self.leader_hint = None;
     self.role = Role::PreCandidate;
     self.pre_votes = BTreeSet::from([self.id]);
     if self.is_majority(&self.pre_votes) {
@@ -474,6 +495,7 @@ impl RaftNode {
     self.current_term = term;
     self.voted_for = None;
     self.role = Role::Follower;
+    self.leader_hint = None;
     self.votes.clear();
   }
 
@@ -684,6 +706,7 @@ impl RaftNode {
     }
     self.role = Role::Follower;
     self.has_leader = true;
+    self.leader_hint = Some(request.leader);
 
     if request.last_included_index > self.snapshot_index {
       let keeps_suffix =
@@ -790,6 +813,7 @@ impl RaftNode {
     // and note the contact, so we refuse pre-votes that would disrupt this leader (§9.6).
     self.role = Role::Follower;
     self.has_leader = true;
+    self.leader_hint = Some(request.leader);
 
     // Consistency check: our log must contain the previous entry with the leader's term.
     if request.prev_log_index > 0
@@ -857,6 +881,7 @@ impl RaftNode {
     if !self.is_majority(&reachable) {
       self.role = Role::Follower;
       self.has_leader = false;
+      self.leader_hint = None;
     }
     self.contacts.clear();
   }
@@ -1410,6 +1435,37 @@ mod tests {
       Role::Follower,
       "a leader cut off from a majority steps down"
     );
+  }
+
+  /// The leader-redirection hint ([`RaftNode::leader`]): a leader reports itself, a follower learns the leader
+  /// from an accepted append, and campaigning forgets it. A hint for redirecting an operator command to the
+  /// leader — never a safety input.
+  #[test]
+  fn the_leader_hint_tracks_the_current_leader() {
+    // A leader reports itself.
+    let leader = elected_leader(A, vec![A, B, C]);
+    assert_eq!(leader.leader(), Some(A));
+
+    // A fresh follower knows no leader until it accepts an append, then reports its sender.
+    let mut node = RaftNode::new(B, vec![A, B, C]);
+    assert_eq!(node.leader(), None);
+    node.on_append_entries(AppendEntries {
+      term: 1,
+      leader: A,
+      prev_log_index: 0,
+      prev_log_term: 0,
+      entries: Vec::new(),
+      leader_commit: 0,
+    });
+    assert_eq!(
+      node.leader(),
+      Some(A),
+      "a follower learns the leader from its append"
+    );
+
+    // Campaigning forgets the hint, so a candidate never redirects to a stale leader.
+    node.on_election_timeout();
+    assert_eq!(node.leader(), None, "a campaigning node forgets its leader");
   }
 
   /// A leader that keeps hearing from a follower stays leader across checks — the contact refreshes the
