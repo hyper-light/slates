@@ -2336,13 +2336,20 @@ fn fan_configuration_to_shards(
 /// a converged fleet costs one bounded cross-shard message per shard and no state change — the near-zero rate
 /// the root-group commit itself runs at. A non-control shard never votes or receives root Raft traffic; it
 /// holds a read-only committed copy, the same shape a root learner adopts over the wire, here a same-process
-/// copy. Idempotent, so the coordinator calls it every period. (The council's placement configuration is not
-/// yet fanned out this way — a non-control shard reads a stale placement configuration after a membership
-/// change, entangled with distributing takeover; tracked in GAPS row 27.)
-fn sync_root_to_shards(origin: u16, shards: &[u16]) {
-  let Some(configuration) = state::with_state(|s| s.root.configuration().clone()) else {
-    return;
+/// copy. **Source-gated** on the root configuration version through `last_version`: a converged fleet does no
+/// work at all — no clone, no cross-shard message — the fan runs only when a root commit advances the version
+/// (the near-zero rate the root group runs at), so an idle period is free. Every shard boots the same root
+/// configuration (`build_root_group` from the same membership), so an unchanged version is already consistent.
+/// (The council's placement configuration is fanned the same way by [`fan_configuration_to_shards`].)
+fn sync_root_to_shards(origin: u16, shards: &[u16], last_version: &mut u64) {
+  let configuration = match state::with_state(|s| {
+    let version = s.root.configuration().version;
+    (version != *last_version).then(|| s.root.configuration().clone())
+  }) {
+    Some(Some(configuration)) => configuration,
+    _ => return,
   };
+  *last_version = configuration.version;
   for shard in shards.iter().copied().filter(|shard| *shard != origin) {
     let configuration = configuration.clone();
     let _ = run_on(origin, shard, move |s| {
@@ -2389,6 +2396,8 @@ async fn run_record_plane(local: HostId, budget: CommitBudget) {
   let mut root_idle: u32 = 0;
   let mut root_seen_contact: u64 = 0;
   let mut root_attempt: u32 = 0;
+  // The root configuration version last fanned to the other shards, so a converged fleet re-fans nothing.
+  let mut root_fanned_version: u64 = 0;
   loop {
     in_flight.retain_mut(|dispatch| !dispatch.settle());
     // Drive the configuration authority first — an election or a replication heartbeat over the transport —
@@ -2419,7 +2428,7 @@ async fn run_record_plane(local: HostId, budget: CommitBudget) {
     // Fan the committed root configuration out to every other shard so the cross-region lookup guard reads the
     // same home wherever a client lands (§4.8 "Lookup"); a no-op each period the root configuration is
     // unchanged (`RootGroup::adopt` is version-gated).
-    sync_root_to_shards(origin, &shards);
+    sync_root_to_shards(origin, &shards, &mut root_fanned_version);
     // Keep the owner's hold writing under the current configuration generation: the version advances on
     // every join or retirement (`FleetNode::observe` keeps the node's own acceptor in step the same way), and
     // a record under a stale generation is refused `ForeignGeneration` by the owner's own hold — so without
