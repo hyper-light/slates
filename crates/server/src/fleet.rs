@@ -80,7 +80,8 @@ use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::fleet::{apply_peer_state, sync_peer};
 use slates_cluster::membership::Liveness;
 use slates_cluster::raft_wire::{
-  RaftMessage, decode_regional_configuration, encode_regional_configuration,
+  RaftMessage, decode_regional_configuration, decode_root_configuration,
+  encode_regional_configuration, encode_root_configuration,
 };
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once};
 use slates_cluster::{
@@ -779,6 +780,9 @@ async fn serve_peer_records(
           state::with_state(|s| serve_config_fetch(s, &request)).unwrap_or_default()
         }
         ROOT_STREAM => state::with_state(|s| serve_root(s, &request)).unwrap_or_default(),
+        ROOT_FETCH_STREAM => {
+          state::with_state(|s| serve_root_fetch(s, &request)).unwrap_or_default()
+        }
         _ => Vec::new(),
       })
       .await;
@@ -1562,6 +1566,12 @@ const CONFIG_FETCH_STREAM: u64 = 8;
 /// consensus planes, and `serve_peer_records` dispatches a root message to the root group by this stream.
 const ROOT_STREAM: u64 = 9;
 
+/// Format: the stream id a **root learner** fetches the committed root configuration on (§4.8, D-14) — the
+/// cross-region parallel of [`CONFIG_FETCH_STREAM`]. A region member that is not its region's representative
+/// does not vote in the root group; it asks a root voter for the root configuration over this stream and
+/// adopts a newer one.
+const ROOT_FETCH_STREAM: u64 = 10;
+
 /// The configuration council's election timeout, in record-plane heartbeat periods: a follower that goes
 /// this many periods without a leader's append presumes the leader gone and campaigns. The per-node spread
 /// ([`election_jitter`]) adds a further `[0, this)`, making the effective timeout uniform in `[this, 2·this)`
@@ -1609,6 +1619,24 @@ fn serve_root(state: &mut ShardState, request: &[u8]) -> Vec<u8> {
       .map(|reply| reply.encode())
       .unwrap_or_default(),
     Err(_) => Vec::new(),
+  }
+}
+
+/// Answers a **root learner**'s fetch (§4.8, D-14) — the cross-region parallel of [`serve_config_fetch`]: the
+/// request carries the learner's root configuration version, and this root voter returns its committed root
+/// configuration only when it holds a newer one (a caught-up learner's fetch is then an empty reply, not a
+/// full transfer).
+fn serve_root_fetch(state: &ShardState, request: &[u8]) -> Vec<u8> {
+  let learner_version = request
+    .get(..std::mem::size_of::<u64>())
+    .and_then(|bytes| <[u8; std::mem::size_of::<u64>()]>::try_from(bytes).ok())
+    .map(u64::from_le_bytes)
+    .unwrap_or(0);
+  let config = state.root.configuration();
+  if config.version > learner_version {
+    encode_root_configuration(config)
+  } else {
+    Vec::new()
   }
 }
 
@@ -1928,6 +1956,19 @@ fn alive_regions(state: &ShardState) -> Vec<RegionId> {
   regions
 }
 
+/// Whether this node's own alive view of the regions differs from the region membership in the root
+/// configuration it holds — the signal a **root learner** uses to fetch the committed root configuration
+/// reactively (§4.8, D-14), the cross-region parallel of [`membership_diverges_from_config`]. Compared as
+/// sets over [`alive_regions`] and the root configuration's regions; equal in steady state, so a converged
+/// learner fetches nothing. (This rests on the all-to-all mesh, where a node's SWIM sees every region's
+/// hosts; a region-scoped mesh would need a version-carrying signal instead — owed with region-scoped SWIM.)
+fn root_diverges(state: &ShardState) -> bool {
+  let alive: std::collections::BTreeSet<RegionId> = alive_regions(state).into_iter().collect();
+  let known: std::collections::BTreeSet<RegionId> =
+    state.root.configuration().regions.iter().copied().collect();
+  alive != known
+}
+
 /// Drives this node's **root group** one period from the record-plane coordinator (§4.8, D-14 — the root
 /// group across regions), the cross-region counterpart of [`drive_config_council`] and structurally its
 /// parallel (a third such consensus group would motivate factoring the shared Raft-drive shape). As the
@@ -1957,6 +1998,15 @@ async fn drive_root_group(
     return;
   };
   if !is_voter {
+    // A root learner (a region member that is not its region's representative): it does not drive the Raft.
+    // It fetches the committed root configuration from a root voter and adopts the newest (§4.8, D-14) —
+    // reactively, only when its own alive view of the regions diverges from the root configuration it holds
+    // ([`root_diverges`]), so a converged learner sends nothing. The cross-region parallel of the config
+    // learner's reactive fetch.
+    let wanted = state::with_state(|s| root_diverges(s)).unwrap_or(false);
+    if wanted {
+      drive_root_learner_fetch(&voters, budget).await;
+    }
     return;
   }
   let others: Vec<HostId> = voters.into_iter().filter(|voter| *voter != local).collect();
@@ -2100,6 +2150,43 @@ async fn drive_root_election(others: &[HostId], budget: CommitBudget) {
     }
   });
   return_sessions(recovered);
+}
+
+/// Drives a **root learner** one period: fetches the committed root configuration from the root voters it has
+/// a session to and adopts the newest (§4.8, D-14) — the cross-region parallel of [`drive_learner_fetch`].
+/// The fetch carries this learner's root version, so a caught-up learner's fetch is an empty reply, not a
+/// full transfer; every borrowed session is returned. `adopt` only moves forward, so folding all replies
+/// leaves the learner on the highest version any reachable voter returned.
+async fn drive_root_learner_fetch(voters: &[HostId], budget: CommitBudget) {
+  let sessions = take_sessions(|host| voters.contains(&host));
+  if sessions.is_empty() {
+    return;
+  }
+  let request = state::with_state(|s| s.root.configuration().version)
+    .unwrap_or(0)
+    .to_le_bytes()
+    .to_vec();
+  let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, request.clone(), endpoint))
+    .collect();
+  let replied = broadcast(requests, ROOT_FETCH_STREAM, budget).await;
+  let mut recovered = Vec::with_capacity(replied.len());
+  let mut fetched: Vec<Vec<u8>> = Vec::new();
+  for (host, reply, endpoint) in replied {
+    if !reply.is_empty() {
+      fetched.push(reply);
+    }
+    recovered.push((host, endpoint));
+  }
+  return_sessions(recovered);
+  state::with_state(|s| {
+    for bytes in &fetched {
+      if let Ok(configuration) = decode_root_configuration(bytes) {
+        s.root.adopt(configuration);
+      }
+    }
+  });
 }
 
 /// Drives a **learner** (a non-voter member) one period: fetches the committed regional configuration from

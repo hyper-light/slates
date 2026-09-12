@@ -797,6 +797,120 @@ fn the_root_group_commits_a_region_retirement_over_the_transport() {
   );
 }
 
+/// AC (§4.8, D-14 — root learners): a region member that is **not** its region's representative does not vote
+/// in the root group; it learns the committed root configuration by **fetching** it from a root voter. Four
+/// daemons in three regions — region 0 holds two hosts (its representative, a root voter, and a second member,
+/// the **learner**), regions 1 and 2 one host each (both root voters) — so the three representatives form the
+/// root group and one region-0 member is a pure learner. When a single-host region is lost (its host killed)
+/// the surviving root leader commits its retirement over the transport, and the learner — which cast no vote —
+/// drops the region from its committed root membership only by fetching, the cross-region parallel of the
+/// regional config learner. A follower voter is killed, not the leader, so the leader stays and reconciles.
+#[test]
+fn a_root_learner_fetches_the_committed_region_membership_over_the_transport() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  // Regions: hosts 0 and 1 in region 0 (so region 0 has a non-representative member — the learner); host 2 in
+  // region 1; host 3 in region 2. Regions 1 and 2 are single-host, so losing either loses a whole region.
+  let regions: std::collections::BTreeMap<HostId, RegionId> = [
+    (hosts[0], RegionId(0)),
+    (hosts[1], RegionId(0)),
+    (hosts[2], RegionId(1)),
+    (hosts[3], RegionId(2)),
+  ]
+  .into_iter()
+  .collect();
+  let daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
+
+  assert_fleet_forms(&daemons, &hosts, &names);
+  // Region 0's representative is its lowest-id host (a root voter); the other region-0 member is the learner.
+  let r0_rep = if hosts[0].0 <= hosts[1].0 {
+    hosts[0]
+  } else {
+    hosts[1]
+  };
+  let learner_host = if r0_rep == hosts[0] {
+    hosts[1]
+  } else {
+    hosts[0]
+  };
+
+  let mut survivors: Vec<(HostId, Daemon)> = hosts.iter().copied().zip(daemons).collect();
+  // Elect one root leader among the three representatives.
+  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, || {
+    survivors
+      .iter()
+      .filter(|(_, daemon)| daemon.root_leads())
+      .count()
+      == 1
+  });
+  let leader_host = survivors
+    .iter()
+    .find(|(_, daemon)| daemon.root_leads())
+    .map(|(host, _)| *host);
+  // A single-host region's host that is NOT the root leader: kill it so its region is lost while the leader
+  // stays and reconciles, and the root group keeps quorum (2 of 3 voters).
+  let victim_host = [hosts[2], hosts[3]]
+    .into_iter()
+    .find(|host| Some(*host) != leader_host);
+
+  let learned = match (elected, victim_host) {
+    (true, Some(victim)) => {
+      let lost = regions[&victim];
+      let victim_pos = survivors
+        .iter()
+        .position(|(host, _)| *host == victim)
+        .expect("the victim is present");
+      survivors.remove(victim_pos).1.stop();
+      // Inject the victim's death into every survivor for a deterministic SWIM cue (real multi-node detection
+      // under load is slow and orthogonal to what this proves — the council learner test injects likewise):
+      // the root leader then reconciles the lost region promptly, and the learner's alive view drops it so it
+      // fetches. The learning is still the fetch, not the injection.
+      for (_, daemon) in &survivors {
+        daemon.observe_peer_dead(victim, FALSE_DEATH_INCARNATION);
+      }
+      let learner_pos = survivors
+        .iter()
+        .position(|(host, _)| *host == learner_host)
+        .expect("the learner survives");
+      // The surviving root leader detects the death, commits the lost region's retirement over the transport;
+      // the learner (a non-voter) drops it from its committed root membership only by fetching from a voter.
+      poll_until(COUNCIL_RETIRE_DEADLINE, || {
+        !survivors[learner_pos].1.root_regions().contains(&lost)
+      })
+    }
+    _ => false,
+  };
+
+  // The learner never leads the root group — it is not a voter.
+  let learner_leads = survivors
+    .iter()
+    .any(|(host, daemon)| *host == learner_host && daemon.root_leads());
+
+  for (_, daemon) in survivors {
+    daemon.stop();
+  }
+  assert!(
+    elected,
+    "the root group elected a single leader among the region representatives"
+  );
+  assert!(
+    !learner_leads,
+    "the region-0 learner never leads the root group — it is not a voter"
+  );
+  assert!(
+    learned,
+    "the learner fetched the committed retirement of the lost region — it dropped from the learner's root \
+     membership though it cast no vote"
+  );
+}
+
 /// AC (§4.8, D-14, learners): the council votes with a **small** set — the members up to the candidate floor
 /// `2f + 1` — and the rest are **learners** that do not vote but fetch the committed configuration over the
 /// transport. Five members at `f = 1` gives three voters and two learners. A learner never leads; and when
