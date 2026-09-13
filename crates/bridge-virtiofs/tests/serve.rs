@@ -35,6 +35,7 @@ use slates_machine::derived;
 use slates_rt::futures;
 use slates_rt::readiness::readable;
 use slates_rt::runtime::{Runtime, RuntimeConfig};
+use slates_vfs::error::VfsError;
 use slates_vfs::volume::{Store, Volume};
 
 /// Shape: the runtime configuration the runtime's own tests use (one shard, small arenas).
@@ -170,9 +171,9 @@ struct OwnedVolume {
 }
 
 impl BridgeAccess for OwnedVolume {
-  fn with_bridge<R>(&mut self, f: impl FnOnce(&mut dyn Bridge) -> R) -> R {
+  fn with_bridge<R>(&mut self, f: impl FnOnce(&mut dyn Bridge) -> R) -> Result<R, VfsError> {
     let mut bridge = VolumeBridge::new(vid(), &mut self.volume, &mut self.store);
-    f(&mut bridge)
+    Ok(f(&mut bridge))
   }
 }
 
@@ -187,12 +188,16 @@ fn request() -> GuestAttachRequest {
   GuestAttachRequest {
     transport: GuestTransport::InProcess,
     volume: vid(),
-    consumer_rights: Rights {
-      read: true,
-      write: true,
-    },
     dax: false,
     notification_queue: false,
+  }
+}
+
+/// The access list of these tests: every authenticated consumer may read and write.
+fn rw(_consumer: &Principal) -> Rights {
+  Rights {
+    read: true,
+    write: true,
   }
 }
 
@@ -213,6 +218,7 @@ fn admitted_over_pipes() -> (AdmittedDevice<PipeVmm>, OwnedFd, OwnedFd) {
     seam,
     DeviceConfig::new(FsTag::new("slates").unwrap()),
     credits(),
+    rw,
   )
   .unwrap();
   (admitted, kick_write, call_read)
@@ -355,6 +361,7 @@ fn a_seam_without_a_doorbell_ends_the_loop_at_once() {
       seam,
       DeviceConfig::new(FsTag::new("slates").unwrap()),
       credits(),
+      rw,
     )
     .unwrap();
     let id = register(DEVICE_BOUND).unwrap();

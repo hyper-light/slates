@@ -161,16 +161,16 @@ impl UnsupportedReason {
   }
 }
 
-/// What a caller asks for when it attaches a guest device to a volume.
+/// What a caller asks for when it attaches a guest device to a volume. The consumer's rights are
+/// not here: they are a function of the authenticated consumer (the volume's access list, §4.13),
+/// which [`admit`] takes separately and consults only after the seam has established who the
+/// consumer is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GuestAttachRequest {
   /// The seam form.
   pub transport: GuestTransport,
   /// The volume the device serves.
   pub volume: VolumeId,
-  /// The rights the volume's access list grants the consumer (computed by the daemon from the
-  /// record, §4.13; never declared by the guest).
-  pub consumer_rights: Rights,
   /// Whether DAX is requested (refused).
   pub dax: bool,
   /// Whether a notification queue is requested (refused).
@@ -362,14 +362,16 @@ fn configure<S: VmmSeam>(
 }
 
 /// Admits a guest device for `request` over `seam`, in the contract's order: unsupported forms are
-/// refused untouched; the consumer is authenticated; the attachment is admitted; the queues are
-/// read, the memory mapped and the queues validated; the tag is published. A failure releases the
-/// seam and returns it with the typed error.
+/// refused untouched; the consumer is authenticated; its rights are read (`rights`, the volume's
+/// access list for that consumer, §4.13 — asked only once the consumer is known); the attachment is
+/// admitted; the queues are read, the memory mapped and the queues validated; the tag is published.
+/// A failure releases the seam and returns it with the typed error.
 pub fn admit<S: VmmSeam>(
   request: GuestAttachRequest,
   mut seam: S,
   config: DeviceConfig,
   credits: AttachmentCredits,
+  rights: impl FnOnce(&Principal) -> Rights,
 ) -> Result<AdmittedDevice<S>, AdmissionRefused<S>> {
   if let Some(reason) = unsupported(&request) {
     return Err(refuse(
@@ -384,13 +386,9 @@ pub fn admit<S: VmmSeam>(
     Ok(consumer) => consumer,
     Err(e) => return Err(refuse(seam, AdmissionError::ConsumerRefused(e))),
   };
+  let granted = rights(&consumer);
   let mut attachments = Attachments::new();
-  let attachment = match attachments.attach(
-    request.volume,
-    View::Current,
-    consumer,
-    request.consumer_rights,
-  ) {
+  let attachment = match attachments.attach(request.volume, View::Current, consumer, granted) {
     Ok(id) => id,
     Err(e) => return Err(refuse(seam, AdmissionError::Authority(e))),
   };
@@ -411,7 +409,7 @@ pub fn admit<S: VmmSeam>(
     attachments,
     attachment,
     transport: request.transport,
-    rights: request.consumer_rights,
+    rights: granted,
     ledger: CreditLedger::new(credits),
     state: AttachmentState::Live,
     counters: AdmissionCounters::default(),

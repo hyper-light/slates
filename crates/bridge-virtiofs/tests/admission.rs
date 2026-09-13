@@ -48,12 +48,16 @@ fn request(transport: GuestTransport) -> GuestAttachRequest {
   GuestAttachRequest {
     transport,
     volume: vid(),
-    consumer_rights: slates_bridge_core::Rights {
-      read: true,
-      write: true,
-    },
     dax: false,
     notification_queue: false,
+  }
+}
+
+/// The access list of these tests: every authenticated consumer may read and write.
+fn rw(_consumer: &Principal) -> slates_bridge_core::Rights {
+  slates_bridge_core::Rights {
+    read: true,
+    write: true,
   }
 }
 
@@ -82,7 +86,14 @@ fn config() -> DeviceConfig {
 #[test]
 fn admission_authenticates_the_consumer_before_any_queue_memory_or_tag() {
   let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 501 }));
-  let admitted = admit(request(GuestTransport::InProcess), seam, config(), roomy()).unwrap();
+  let admitted = admit(
+    request(GuestTransport::InProcess),
+    seam,
+    config(),
+    roomy(),
+    rw,
+  )
+  .unwrap();
   assert_eq!(
     admitted.seam().calls(),
     vec![
@@ -100,7 +111,14 @@ fn admission_authenticates_the_consumer_before_any_queue_memory_or_tag() {
   );
 
   let seam = SimVmm::new(&QUEUE_SIZES, Err(SeamError::ConsumerUnverified));
-  let refused = admit(request(GuestTransport::InProcess), seam, config(), roomy()).unwrap_err();
+  let refused = admit(
+    request(GuestTransport::InProcess),
+    seam,
+    config(),
+    roomy(),
+    rw,
+  )
+  .unwrap_err();
   assert_eq!(
     refused.error,
     AdmissionError::ConsumerRefused(SeamError::ConsumerUnverified)
@@ -132,6 +150,7 @@ fn an_unsupported_form_is_refused_typed_before_the_seam_is_touched() {
     SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 })),
     config(),
     roomy(),
+    rw,
   )
   .unwrap_err();
   assert_eq!(
@@ -152,7 +171,8 @@ fn an_unsupported_form_is_refused_typed_before_the_seam_is_touched() {
       notify,
       SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 })),
       config(),
-      roomy()
+      roomy(),
+      rw
     )
     .unwrap_err()
     .error,
@@ -168,6 +188,7 @@ fn an_unsupported_form_is_refused_typed_before_the_seam_is_touched() {
     SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 })),
     config(),
     roomy(),
+    rw,
   )
   .unwrap_err();
   assert_eq!(
@@ -191,6 +212,7 @@ fn requests_are_charged_against_the_credits_and_released_on_completion() {
     seam,
     config(),
     credits(2, 1 << 20),
+    rw,
   )
   .unwrap();
   let mut store = store();
@@ -239,6 +261,7 @@ fn a_chain_beyond_the_byte_credit_is_refused_before_access_and_faults_the_device
     seam,
     config(),
     credits(4, 100),
+    rw,
   )
   .unwrap();
   let mut store = store();
@@ -285,6 +308,7 @@ fn revocation_refuses_before_access_and_the_terminal_step_reclaims() {
     seam,
     config(),
     credits(1, 1 << 20),
+    rw,
   )
   .unwrap();
   let mut store = store();
@@ -424,7 +448,14 @@ fn assert_reclaimed(
 #[test]
 fn the_capability_report_is_truthful() {
   let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 }));
-  let admitted = admit(request(GuestTransport::InProcess), seam, config(), roomy()).unwrap();
+  let admitted = admit(
+    request(GuestTransport::InProcess),
+    seam,
+    config(),
+    roomy(),
+    rw,
+  )
+  .unwrap();
   let report = admitted.capability();
   assert_eq!(report.transport, GuestTransport::InProcess);
   assert!(report.supported);

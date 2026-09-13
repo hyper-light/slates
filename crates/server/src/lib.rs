@@ -37,6 +37,10 @@ pub mod nfs;
 pub mod peer;
 pub mod state;
 pub mod verbs;
+// The virtio-fs guest transport (§4.6 A-9): a guest device served on the volume's owning shard; its
+// loop rides the runtime's Unix descriptor readiness, so it is gated like the NFS transport.
+#[cfg(unix)]
+pub mod virtiofs;
 pub mod xshard;
 
 pub use config::{DaemonConfig, DurabilityBound, FleetMembership};

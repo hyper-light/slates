@@ -28,6 +28,7 @@ use slates_bridge_core::Bridge;
 use slates_rt::error::RtError;
 use slates_rt::futures;
 use slates_rt::readiness::readable;
+use slates_vfs::error::VfsError;
 
 use crate::admission::{
   AdmittedDevice, Doorbell, Drained, ReclaimError, Reclaimed, ServeError, VmmSeam,
@@ -142,10 +143,11 @@ impl Future for RegisterWaker {
 }
 
 /// How the loop reaches the bridge for a pass: the daemon builds a transient `VolumeBridge` over
-/// the shard's state; a test lends an owned volume.
+/// the shard's state; a test lends an owned volume. Refused typed when the volume is gone
+/// (destroyed under a live device), which ends the loop.
 pub trait BridgeAccess {
-  /// Runs `f` with the bridge.
-  fn with_bridge<R>(&mut self, f: impl FnOnce(&mut dyn Bridge) -> R) -> R;
+  /// Runs `f` with the bridge, or refuses when there is no volume to bridge to.
+  fn with_bridge<R>(&mut self, f: impl FnOnce(&mut dyn Bridge) -> R) -> Result<R, VfsError>;
 }
 
 /// Why the loop ended.
@@ -162,6 +164,8 @@ pub enum EndReason {
   /// The seam has no descriptor doorbell: the in-process VMM drives service itself, so there is
   /// nothing for a loop to wait on.
   NoDoorbell,
+  /// The volume the device served is gone (destroyed under the device).
+  VolumeGone(VfsError),
 }
 
 /// What the loop reports when it ends: why, the terminal step's outcome, and its counters.
@@ -184,7 +188,9 @@ async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
   passes: &mut u64,
 ) -> Result<(), ServeError> {
   loop {
-    let pass = bridge.with_bridge(|b| admitted.service(b))?;
+    let pass = bridge
+      .with_bridge(|b| admitted.service(b))
+      .map_err(ServeError::Authority)??;
     *passes = passes.saturating_add(1);
     if !pass.more_pending {
       return Ok(());
@@ -223,6 +229,9 @@ async fn serve_round<S: VmmSeam, B: BridgeAccess>(
   match serve_until_idle(admitted, bridge, &mut counters.1).await {
     Ok(()) => None,
     Err(ServeError::Revoked) => Some(EndReason::Revoked),
+    Err(ServeError::Authority(VfsError::NotFound)) => {
+      Some(EndReason::VolumeGone(VfsError::NotFound))
+    }
     Err(e) => Some(EndReason::Faulted(e)),
   }
 }
@@ -241,7 +250,9 @@ pub async fn serve_loop<S: VmmSeam, B: BridgeAccess>(
       break reason;
     }
   };
-  let reclaimed = bridge.with_bridge(|b| admitted.reclaim(b));
+  let reclaimed = bridge
+    .with_bridge(|b| admitted.reclaim(b))
+    .unwrap_or_else(|gone| Err(ReclaimError::Authority(gone)));
   unregister(id);
   ServeEnd {
     why,
