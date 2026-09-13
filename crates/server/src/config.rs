@@ -241,6 +241,12 @@ pub struct DaemonConfig {
   /// is local; a fleet node names its quorum and peers, and the placement authority, configuration group
   /// and owner acceptor are built over them at boot.
   pub fleet: Option<FleetMembership>,
+  /// Derived: a guest device attachment's credits (§4.6 A-9, §4.9): the request credit is the shard's
+  /// admission limit (`requests_in_flight_per_shard`), the byte credit the §4.9 window over the measured
+  /// memcpy bandwidth and the wake p99 as the kick round trip, with one request's worst case as the frame.
+  /// Unix only, as the guest transport is.
+  #[cfg(unix)]
+  pub guest_credits: slates_bridge_virtiofs::credit::AttachmentCredits,
   /// Every derivation, for the boot log.
   pub derivations: Vec<String>,
 }
@@ -442,6 +448,8 @@ impl DaemonConfig {
     );
     derivations.push(note("idle_window_ns", &idle_window));
     runtime.spin_ns = idle_window.get();
+    #[cfg(unix)]
+    let guest_credits = guest_credits(profile, admission.get(), &mut derivations);
     DaemonConfig {
       runtime,
       geometry,
@@ -465,9 +473,51 @@ impl DaemonConfig {
       // The laptop default: no fleet, `f = 0`, solo. An operator deploying a fleet sets this (with
       // `with_fleet`); the derivation from the machine profile is the same either way (R8).
       fleet: None,
+      #[cfg(unix)]
+      guest_credits,
       derivations,
     }
   }
+}
+
+/// A guest device attachment's credits from the profile (§4.6 A-9, §4.9): the request credit is the
+/// shard's admission limit; the byte credit is the credit window over the measured memcpy bandwidth (the
+/// largest measured copy size, the streaming rate a request copy runs at) and the wake p99 (the floor of
+/// a kick's round trip through the driver), with one request's worst case — the device's readable cap
+/// plus its writable cap — as the frame, under the provisioning latency budget.
+#[cfg(unix)]
+fn guest_credits(
+  profile: &MachineProfile,
+  requests_in_flight_per_shard: usize,
+  derivations: &mut Vec<String>,
+) -> slates_bridge_virtiofs::credit::AttachmentCredits {
+  use slates_bridge_virtiofs::credit::AttachmentCredits;
+  use slates_bridge_virtiofs::device::{readable_cap, writable_cap};
+  let bandwidth_bytes_per_ns: Derived<u64> = derived!(
+    profile
+      .memcpy
+      .iter()
+      .max_by_key(|point| point.bytes)
+      .map_or(1, |point| point.bytes_per_second / NANOS_PER_SECOND)
+      .max(1),
+    "memcpy bytes per second at the largest measured copy size / 1e9 (at least one byte per nanosecond)",
+    ["memcpy"]
+  );
+  derivations.push(note(
+    "guest_bandwidth_bytes_per_ns",
+    &bandwidth_bytes_per_ns,
+  ));
+  let frame = readable_cap().get().saturating_add(writable_cap().get());
+  let credits = AttachmentCredits::derive(
+    requests_in_flight_per_shard,
+    bandwidth_bytes_per_ns.get(),
+    profile.wake.p99_ns.max(1),
+    frame,
+    LATENCY_BUDGET_NS,
+  );
+  derivations.push(note("guest_requests_credit", &credits.requests));
+  derivations.push(note("guest_bytes_credit", &credits.bytes));
+  credits
 }
 
 impl DaemonConfig {

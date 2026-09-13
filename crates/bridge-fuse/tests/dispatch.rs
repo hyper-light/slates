@@ -498,3 +498,66 @@ fn readdirplus_dispatches_with_entry_attributes_and_references() {
     "READDIRPLUS takes a lookup reference on each returned entry"
   );
 }
+
+/// Format: `FUSE_BATCH_FORGET`, the batched forget's opcode (`include/uapi/linux/fuse.h`).
+const FUSE_BATCH_FORGET: u32 = 42;
+
+/// FUSE_BATCH_FORGET — the batched form of FORGET the kernel sends over `/dev/fuse` and the
+/// high-priority queue of virtio-fs carries (virtio 1.2 §5.11.6.2) — drops every listed reference
+/// and, like FORGET, has no reply. A count that claims more entries than the body holds applies
+/// only the complete entries present: the parser never reads past the body.
+#[test]
+fn batch_forget_drops_every_listed_reference_with_no_reply() {
+  let mut m = mock();
+  let mut out = [0u8; 256];
+  // fuse_batch_forget_in: count (4), dummy (4); then count × fuse_forget_one: nodeid (8), nlookup (8).
+  let mut body = Vec::new();
+  body.extend_from_slice(&2u32.to_le_bytes());
+  body.extend_from_slice(&0u32.to_le_bytes());
+  for (nodeid, nlookup) in [(2u64, 3u64), (3u64, 4u64)] {
+    body.extend_from_slice(&nodeid.to_le_bytes());
+    body.extend_from_slice(&nlookup.to_le_bytes());
+  }
+  let n = dispatch(&message(FUSE_BATCH_FORGET, 1, 0, &body), &mut m, &mut out);
+  assert_eq!(n, 0, "BATCH_FORGET has no reply (was ENOSYS: {n} bytes)");
+  assert_eq!(m.forgotten, 7, "both entries' references were dropped");
+
+  let mut overclaimed = Vec::new();
+  overclaimed.extend_from_slice(&u32::MAX.to_le_bytes());
+  overclaimed.extend_from_slice(&0u32.to_le_bytes());
+  overclaimed.extend_from_slice(&2u64.to_le_bytes());
+  overclaimed.extend_from_slice(&5u64.to_le_bytes());
+  overclaimed.extend_from_slice(&[0xFF; 7]);
+  let n = dispatch(
+    &message(FUSE_BATCH_FORGET, 2, 0, &overclaimed),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(n, 0);
+  assert_eq!(
+    m.forgotten, 12,
+    "the one complete entry applied; the claimed count and the trailing partial entry did not"
+  );
+}
+
+/// FUSE_DESTROY — the kernel's last request at unmount (on virtio-fs, when the guest unmounts the
+/// tag) — is served, not answered ENOSYS: the attachment's references are swept (the bridge's
+/// `sweep_attachment`, since the kernel guarantees no FORGET per outstanding reference) and the
+/// reply is an empty success.
+#[test]
+fn destroy_sweeps_the_attachment_and_replies_success() {
+  let mut m = mock();
+  let mut out = [0u8; 256];
+  let n = dispatch(
+    &message(Opcode::Destroy.to_wire(), 1, 0, &[]),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(n, OUT_HEADER_LEN, "an empty success reply");
+  assert_eq!(
+    u32::from_le_bytes(out[4..8].try_into().unwrap()),
+    0,
+    "DESTROY succeeds (not ENOSYS)"
+  );
+  assert_eq!(m.swept, 1, "the attachment's references were swept once");
+}

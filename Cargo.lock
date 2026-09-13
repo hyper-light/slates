@@ -1181,6 +1181,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-bridge-virtiofs"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "slates-bridge-core",
+ "slates-bridge-fuse",
+ "slates-db",
+ "slates-machine",
+ "slates-mem",
+ "slates-rt",
+ "slates-vfs",
+ "slates-wire",
+]
+
+[[package]]
 name = "slates-bridge-winfsp"
 version = "0.1.0"
 dependencies = [
@@ -1369,7 +1384,9 @@ dependencies = [
  "slates-archive",
  "slates-base",
  "slates-bridge-core",
+ "slates-bridge-fuse",
  "slates-bridge-nfs",
+ "slates-bridge-virtiofs",
  "slates-cluster",
  "slates-db",
  "slates-ipc",

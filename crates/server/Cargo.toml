@@ -32,6 +32,10 @@ rustix = { workspace = true }
 # The NFS loopback mount server is the macOS/Linux mount path (Windows mounts through WinFsp), and it
 # rides `slates_rt::tcp`, which is Unix-only, so the daemon's NFS transport (`crate::nfs`) is too.
 slates-bridge-nfs = { workspace = true }
+# The virtio-fs guest device (§4.6 A-9): its loop rides the runtime's Unix descriptor readiness, and a
+# Linux guest is hosted from a Linux or macOS host, so the daemon's guest transport (`crate::virtiofs`)
+# is Unix-only too.
+slates-bridge-virtiofs = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
@@ -39,6 +43,8 @@ windows-sys = { workspace = true }
 [dev-dependencies]
 # self-signed fleet identities for the two-daemon membership test (as the cluster tests mint them).
 rcgen = { workspace = true }
+# The guest-device test builds the FUSE requests a guest kernel would (the codec's ABI constants).
+slates-bridge-fuse = { workspace = true }
 
 [lints]
 workspace = true

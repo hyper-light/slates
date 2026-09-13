@@ -1,0 +1,30 @@
+[package]
+name = "slates-bridge-virtiofs"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The virtio-fs guest device (§4.6 A-9, D-2, RQ-20; Phase 4): a sans-io split-virtqueue machine over a bounded guest-memory seam, the FUSE-over-virtio request cycle over the shared Bridge through the FUSE codec, device admission that authenticates the consumer before any queue exists and charges every request against the attachment's credits, and the device loop as a perpetual task on the owning shard over the runtime. The VMM seam is in-process or an inherited descriptor; DAX is not advertised."
+
+[dependencies]
+slates-bridge-core = { workspace = true }
+slates-bridge-fuse = { workspace = true }
+slates-vfs = { workspace = true }
+slates-machine = { workspace = true }
+slates-wire = { workspace = true }
+slates-db = { workspace = true }
+slates-rt = { workspace = true }
+
+[dev-dependencies]
+slates-mem = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+# The runtime test's doorbell: a pipe pair the simulated VMM owns, drained and kicked through
+# `rustix` (descriptor I/O on a memory object, never a host path). The crate's own source holds no
+# descriptor — the seam owns and drains the doorbell; the loop only awaits its number.
+rustix = { workspace = true }
+
+[lints]
+workspace = true

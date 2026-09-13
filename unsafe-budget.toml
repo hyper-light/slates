@@ -139,3 +139,10 @@ slates-bridge-fskit = 9
 # descriptor. All are Win32/WinFsp FFI without a safe wrapper; there is no `unsafe impl Send`/`Sync`
 # (the volume is owned by one thread and shared only over channels, R2/D-7).
 slates-bridge-winfsp = 86
+# slates-bridge-virtiofs (0): the virtqueue machine and the FUSE-over-virtio device read and write
+# guest memory only through the `GuestMemory` seam — bounded, checked copies into byte arrays, fields
+# decoded in order, never a cast or a pointer into the guest (the FUSE codec's discipline). The
+# simulated seams are `Vec<u8>` and `Cell`/`RefCell`; the doorbell descriptors are `rustix` reads and
+# writes on owned descriptors. A real shared mapping (the later VMM leg) will go through
+# `slates_mem::SharedObject`'s atomic views, whose unsafe already lives in slates-mem.
+slates-bridge-virtiofs = 0
