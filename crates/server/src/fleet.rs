@@ -840,7 +840,7 @@ async fn serve_peer_records(
           ROOT_FETCH_STREAM => {
             state::with_state(|s| serve_root_fetch(s, &request)).unwrap_or_default()
           }
-          FORWARD_STREAM => verbs::serve_forward(control, &request).await,
+          FORWARD_STREAM => verbs::serve_forward(control, peer_host, &request).await,
           _ => Vec::new(),
         }
       })

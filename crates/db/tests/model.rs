@@ -824,6 +824,58 @@ fn completions_are_exactly_once_across_recovery() {
   assert_eq!(db.partition().completion(0, 7, 4), Seen::Completed(vec![4]));
 }
 
+/// The idempotency key is globally unique: two **distinct origin hosts** with the *same* (client, sequence)
+/// keep independent completions, so a cross-node forwarded write (keyed by its authenticated origin) never
+/// returns — or is deduplicated against — a local client that happens to share its per-node id (§4.8, task
+/// #29). Non-vacuous: the two records carry different results, and each origin reads back its own; a shared
+/// (client, sequence) key would have overwritten one with the other.
+#[test]
+fn completions_from_distinct_origins_do_not_collide() {
+  let mut seg = segment("slates-db-completion-origins", LOG_BYTES);
+  let mut db = open(&mut seg);
+  for (origin, result) in [(1u64, vec![10u8]), (2u64, vec![20u8])] {
+    db.mutate(
+      &mut seg,
+      &Op::CompletionRecorded {
+        record: CompletionRecord {
+          origin,
+          client: 7,
+          sequence: 3,
+          result,
+        },
+      },
+      0,
+    )
+    .unwrap();
+  }
+  assert_eq!(
+    db.partition().completion(1, 7, 3),
+    Seen::Completed(vec![10])
+  );
+  assert_eq!(
+    db.partition().completion(2, 7, 3),
+    Seen::Completed(vec![20])
+  );
+  // A third origin has seen nothing — the key distinguishes the origin, not just the client.
+  assert_eq!(db.partition().completion(3, 7, 3), Seen::New);
+  // An acknowledgement from one origin does not release the other's completion.
+  db.mutate(
+    &mut seg,
+    &Op::CompletionsAcknowledged {
+      origin: 1,
+      client: 7,
+      up_to: 3,
+    },
+    0,
+  )
+  .unwrap();
+  assert_eq!(db.partition().completion(1, 7, 3), Seen::Acknowledged);
+  assert_eq!(
+    db.partition().completion(2, 7, 3),
+    Seen::Completed(vec![20])
+  );
+}
+
 /// The snapshot cadence: a small policy snapshots often, the log is trimmed behind each, and
 /// recovery restores the snapshot plus its tail; a full ring snapshots and retries.
 #[test]

@@ -1280,6 +1280,92 @@ fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
   );
 }
 
+/// AC (§4.8 "Lookup", slice 2 — writes; task #29): a client on one region issues a **write** to a volume
+/// homed in another region; it is forwarded to the owner, executed there, and is **exactly-once** on retry.
+/// Three daemons, each its own region; a volume is created on node a (region 0). A client on node b (region 1)
+/// first reads the volume's `Status` (to know the forward path is up — the root configuration formed on b and
+/// the b→a session is live, so the write below is not raced by the still-forming config), then takes a
+/// `Snapshot` of it. b forwards the write to a, which runs it through the completion window keyed by b's
+/// **authenticated** origin ([`verbs::serve_forward`] → `run_forwarded`), and returns the snapshot id. A
+/// **retry of the same request id** returns the **same** snapshot id — a answered from its record, not a
+/// second snapshot — proving the forwarded write is idempotent under the globally-unique completion key (the
+/// per-node client id could otherwise collide with an owner-local client). Non-vacuous: a second snapshot
+/// would carry a different id, so the equality is the exactly-once proof.
+#[test]
+fn a_client_writes_a_cross_region_volume_by_forwarding_to_its_owner() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  let regions: std::collections::BTreeMap<HostId, RegionId> = [
+    (hosts[0], RegionId(0)),
+    (hosts[1], RegionId(1)),
+    (hosts[2], RegionId(2)),
+  ]
+  .into_iter()
+  .collect();
+  let daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
+
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  // Create a volume on node a (region 0): it is owned by a, its creator.
+  let mut client_a = Client::connect(&format!("fleet3-{}-{pid}", hosts[0].0));
+  let id = match client_a.call(&scratch("cross-region-write")) {
+    ReplyBody::Created { id } => id,
+    other => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("create on node a did not return an id: {other:?}");
+    }
+  };
+
+  // A client on node b (region 1). Wait until a cross-region *read* is served — that proves the root
+  // configuration has formed on b (the lookup guard fires) and the b→a session is up — so the write below is
+  // not raced by the forming config. A read takes no snapshot, so this readiness poll is side-effect free.
+  let mut client_b = Client::connect(&format!("fleet3-{}-{pid}", hosts[1].0));
+  let ready = poll_until(COUNCIL_RETIRE_DEADLINE, || {
+    matches!(
+      client_b.call(&RequestBody::Status { volume: id }),
+      ReplyBody::Status { .. }
+    )
+  });
+
+  // One forwarded write. `call` assigns a fresh request id; a transient forward failure is retried on the
+  // **same** id (`call_retry`), so a is never asked for a second snapshot while the first is in flight.
+  let mut first = client_b.call(&RequestBody::Snapshot { volume: id });
+  let deadline = Instant::now() + COUNCIL_RETIRE_DEADLINE;
+  while !matches!(first, ReplyBody::Snapshotted { .. }) && Instant::now() < deadline {
+    std::thread::yield_now();
+    first = client_b.call_retry(&RequestBody::Snapshot { volume: id });
+  }
+  // A further retry of the same id must return the recorded reply.
+  let retry = client_b.call_retry(&RequestBody::Snapshot { volume: id });
+
+  for daemon in daemons {
+    daemon.stop();
+  }
+
+  assert!(ready, "b's cross-region forward path to region 0 came up");
+  let ReplyBody::Snapshotted { id: snap1 } = first else {
+    panic!("the forwarded Snapshot of a cross-region volume was not served: {first:?}");
+  };
+  let ReplyBody::Snapshotted { id: snap2 } = retry else {
+    panic!("the retried forwarded Snapshot was not served: {retry:?}");
+  };
+  assert_eq!(
+    snap1, snap2,
+    "the retried forwarded write returned the owner's recorded reply (the same snapshot id), not a second \
+     snapshot — the forwarded write is exactly-once under the globally-unique completion key"
+  );
+}
+
 /// AC (§4.8 "Lookup", D-14): the cross-region lookup guard (`verbs::home_redirect`) runs on whatever shard a
 /// client's request lands on, so the committed root configuration must reach **every** shard of a multi-shard
 /// daemon — not only the control shard that drives the root group over the transport. Here each daemon runs
@@ -1584,9 +1670,20 @@ impl Client {
 
   fn call(&mut self, body: &RequestBody) -> ReplyBody {
     self.sequence += 1;
+    self.send_at(self.sequence, body)
+  }
+
+  /// Re-sends the **same** request id as the last [`call`](Self::call) (its sequence is not advanced): a
+  /// retry. A recorded verb (a write) must answer from its completion record, not re-execute — the
+  /// exactly-once check a forwarded write needs.
+  fn call_retry(&mut self, body: &RequestBody) -> ReplyBody {
+    self.send_at(self.sequence, body)
+  }
+
+  fn send_at(&mut self, sequence: u32, body: &RequestBody) -> ReplyBody {
     let id = RequestId {
       client: self.client,
-      sequence: self.sequence,
+      sequence,
     };
     let index = self.end.next_request_index();
     let slot = pack(

@@ -324,6 +324,10 @@ async fn promote_region_here_or_forward(region: u64, principal: Principal) -> Re
       let request = encode_body(&ForwardedRequest {
         principal,
         body: RequestBody::PromoteRegion { region },
+        // PromoteRegion is proposed on the root group and is itself idempotent (a retry after it took is a
+        // no-op), so it needs no completion record — the request id and watermark are unused for it.
+        request: 0,
+        ack_up_to: None,
       });
       match crate::fleet::forward_over_leader_session(
         leader,
@@ -354,11 +358,18 @@ pub(crate) struct ForwardedRequest {
   pub principal: Principal,
   /// The verb to run on the owner.
   pub body: RequestBody,
+  /// The origin's request id (packed word): the owner keys the completion under `(origin host, client,
+  /// sequence)`, so a forwarded **write** is idempotent — a retry re-forwarded with the same id answers from
+  /// the record instead of re-executing. (A read carries it too but does not record.)
+  pub request: u64,
+  /// The client's acknowledged-sequence watermark, relayed so the owner prunes this client's forwarded
+  /// completions the way a local client's are pruned by its acknowledgements (§4.9 RIFL; banned item 8).
+  /// `None` before the client has acknowledged anything.
+  pub ack_up_to: Option<u32>,
 }
 
 /// Whether a verb is a **read** safe to forward to a volume's owner without a completion record: a
 /// volume-scoped query that mutates nothing, so re-serving a retried forward is idempotent (§4.8 "Lookup").
-/// Writes are not forwarded yet — they need the origin's request id relayed for owner-side idempotency (owed).
 fn is_forwardable_read(body: &RequestBody) -> bool {
   matches!(
     body,
@@ -366,16 +377,38 @@ fn is_forwardable_read(body: &RequestBody) -> bool {
   )
 }
 
+/// Whether a verb is a **write** to an existing volume that is safe to forward to that volume's owner: a
+/// volume-scoped mutation ([`volume_of`] names the volume, [`mutates_shard_image`] changes it). Forwarded
+/// under a completion record keyed by the origin's request id, so a retried forward is exactly-once (§4.8
+/// "Lookup"; the owner runs it through [`run_forwarded`]). A create (no existing volume, routed by name) is
+/// not one of these — it is placed by the local partitioning, not a home redirect.
+fn is_forwardable_write(body: &RequestBody) -> bool {
+  volume_of(body).is_some() && mutates_shard_image(body)
+}
+
 /// Serves a verb forwarded from another node over the fleet transport (§4.8 "Lookup"): decodes the
-/// [`ForwardedRequest`], runs it here, and returns the encoded reply. The operator's region-loss
-/// `PromoteRegion` is proposed on the root group; a forwardable **read** of a volume this node owns is run on
-/// the volume's owner shard under the relayed principal — with no completion record, since reads are
-/// idempotent (`dispatch`, not `run_recorded`) — reached by a cross-shard call so the reply is produced
-/// asynchronously (hence [`slates_transport::endpoint::Endpoint::serve_once_async`]). Any other verb (a write,
-/// today) is refused `Unsupported`: write forwarding needs the origin request id relayed for owner-side
-/// idempotency, and is owed. `control` is the shard this serve loop runs on (the `xshard` origin).
-pub(crate) async fn serve_forward(control: u16, request: &[u8]) -> Vec<u8> {
-  let Ok(ForwardedRequest { principal, body }) = decode_body::<ForwardedRequest>(request) else {
+/// [`ForwardedRequest`], runs it on the volume's owner shard under the relayed principal, and returns the
+/// encoded reply. `origin` is the **authenticated** forwarding peer (its mutual-TLS certificate, resolved by
+/// the serve loop) — never a self-reported field, so a node cannot forge another's completion key. The
+/// verb reaches its owner shard by a cross-shard call, so the reply is produced asynchronously (hence
+/// [`slates_transport::endpoint::Endpoint::serve_once_async`]).
+///
+/// - `PromoteRegion` (operator region-loss) is proposed on the root group.
+/// - A forwardable **read** ([`is_forwardable_read`]) runs with no completion record — reads are idempotent.
+/// - A forwardable **write** ([`is_forwardable_write`]) runs through [`run_forwarded`], whose completion is
+///   keyed by `(origin, client, sequence)`, so a retried forward is exactly-once; the relayed acknowledgement
+///   watermark prunes this client's forwarded completions first (RIFL, banned item 8).
+/// - Anything else is refused `Unsupported`.
+///
+/// `control` is the shard this serve loop runs on (the `xshard` origin).
+pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) -> Vec<u8> {
+  let Ok(ForwardedRequest {
+    principal,
+    body,
+    request,
+    ack_up_to,
+  }) = decode_body::<ForwardedRequest>(bytes)
+  else {
     return Vec::new();
   };
   if let RequestBody::PromoteRegion { region } = body {
@@ -384,27 +417,69 @@ pub(crate) async fn serve_forward(control: u16, request: &[u8]) -> Vec<u8> {
         .unwrap_or_else(|| refused(Refusal::NotFound)),
     );
   }
-  if is_forwardable_read(&body)
-    && let Some(volume) = volume_of(&body)
-  {
-    let owner = owner_of(volume);
-    let shard = crate::state::with_state(|s| shard_of_partition(s, owner)).flatten();
-    let reply = match shard {
-      Some(shard) => crate::xshard::call_within(
-        control,
-        shard,
-        move |s| dispatch(s, 0, &principal, body),
-        crate::daemon::LIVENESS_BUDGET_NS,
-      )
-      .await
-      .unwrap_or_else(|| refused(Refusal::NotFound)),
-      None => refused(Refusal::NotFound),
-    };
-    return encode_body(&reply);
+  let Some(volume) = volume_of(&body) else {
+    return encode_body(&refused(Refusal::Unsupported {
+      feature: "forwarded verb".to_owned(),
+    }));
+  };
+  let owner = owner_of(volume);
+  let Some(shard) = crate::state::with_state(|s| shard_of_partition(s, owner)).flatten() else {
+    return encode_body(&refused(Refusal::NotFound));
+  };
+  let origin_host = origin.0;
+  let id = RequestId::from_word(request);
+  let reply = if is_forwardable_read(&body) {
+    crate::xshard::call_within(
+      control,
+      shard,
+      move |s| dispatch(s, 0, &principal, body),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await
+  } else if is_forwardable_write(&body) {
+    crate::xshard::call_within(
+      control,
+      shard,
+      move |s| {
+        if let Some(up_to) = ack_up_to {
+          prune_forwarded(s, origin_host, id.client, up_to);
+        }
+        run_forwarded(s, origin_host, id, 0, &principal, body)
+      },
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await
+  } else {
+    Some(refused(Refusal::Unsupported {
+      feature: "forwarded verb".to_owned(),
+    }))
+  };
+  encode_body(&reply.unwrap_or_else(|| refused(Refusal::NotFound)))
+}
+
+/// Prunes a forwarded client's completions on this (owner) node up to the acknowledgement watermark the
+/// origin relayed, the same way a local client's are pruned by its acknowledgements — so forwarded
+/// completions do not grow unbounded (§4.9 RIFL; banned item 8). A no-op when the watermark has not advanced,
+/// so a stream of forwarded writes at a steady watermark writes no acknowledgement records.
+fn prune_forwarded(state: &mut ShardState, origin: u64, client: u32, up_to: u32) {
+  let advances = state
+    .db
+    .partition()
+    .acknowledged_up_to(origin, client)
+    .is_none_or(|current| up_to > current);
+  if !advances {
+    return;
   }
-  encode_body(&refused(Refusal::Unsupported {
-    feature: "forwarded verb".to_owned(),
-  }))
+  let now = state.clock.monotonic_ns();
+  let _ = state.db.mutate(
+    &mut state.segment,
+    &Op::CompletionsAcknowledged {
+      origin,
+      client,
+      up_to,
+    },
+    now,
+  );
 }
 
 /// Whether a volume's home region is its creator's region — i.e. no move or promotion has changed where it is
@@ -421,13 +496,15 @@ fn homed_at_creator(state: &ShardState, volume: VolumeId, home_region: u64) -> b
   home_region == creator_region
 }
 
-/// Forwards a read of a remotely-homed volume to its owner node (its creator, [`homed_at_creator`]) over the
-/// fleet transport and delivers the reply back to the client (§4.8 "Lookup"). Runs in a task on the control
-/// shard — where the record sessions live — because the forward is an await: the owner serves the read on its
-/// own owner shard ([`serve_forward`]) under the relayed principal and returns the reply, which is delivered to
-/// the client on its origin shard. An unreachable owner or an undecodable reply falls back to `HomedElsewhere`
-/// naming the home region, so the caller re-routes rather than seeing a wrong answer.
-fn forward_read_to_owner(
+/// Forwards a read or write of a remotely-homed volume to its owner node (its creator, [`homed_at_creator`])
+/// over the fleet transport and delivers the reply back to the client (§4.8 "Lookup"). Runs in a task on the
+/// control shard — where the record sessions live — because the forward is an await: the owner serves the
+/// verb on its own owner shard ([`serve_forward`]) under the relayed principal and returns the reply, which
+/// is delivered to the client on its origin shard. A **write** carries the origin request id (so the owner's
+/// completion record makes a retried forward exactly-once) and the client's acknowledgement watermark (so the
+/// owner prunes this client's forwarded completions). An unreachable owner or an undecodable reply falls back
+/// to `HomedElsewhere` naming the home region, so the caller re-routes rather than seeing a wrong answer.
+fn forward_to_owner(
   state: &mut ShardState,
   client_index: u32,
   request: u64,
@@ -441,7 +518,18 @@ fn forward_read_to_owner(
   };
   let origin = state.shard;
   let owner = ObjectId(volume.bytes).creator();
-  let request_bytes = encode_body(&ForwardedRequest { principal, body });
+  // Relay the client's acknowledgement watermark (this node's own-host window for the client) so the owner
+  // prunes the forwarded completions the same way this node's acknowledgements prune the local ones.
+  let ack_up_to = state
+    .db
+    .partition()
+    .acknowledged_up_to(state.fleet.host().0, RequestId::from_word(request).client);
+  let request_bytes = encode_body(&ForwardedRequest {
+    principal,
+    body,
+    request,
+    ack_up_to,
+  });
   let task = SpawnRequest::new(
     Box::pin(async move {
       let reply = match crate::fleet::forward_over_leader_session(
@@ -571,18 +659,20 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     return scatter_acknowledge(state, client.index(), request.request, client_id, up_to);
   }
   // Cross-region routing (§4.8 "Lookup"): a request for a volume homed in another region — moved there, or
-  // failed over there by a region-loss promotion. A forwardable **read** of a volume whose owner is its
-  // creator (no move or promotion changed the home) is forwarded to that owner over the fleet transport and
-  // served there, so a client reads a cross-region volume without re-connecting; anything else — a write, or a
-  // moved/promoted volume whose owner is no longer its creator — is refused `HomedElsewhere` naming the home
-  // region, for the caller to re-route (write forwarding and moved-owner routing are owed). A single-region
-  // fleet never reaches the map (the fast path in `homed_elsewhere`), so local and laptop deployments pay
-  // nothing.
+  // failed over there by a region-loss promotion. A forwardable **read** or **write** of a volume whose owner
+  // is its creator (no move or promotion changed the home) is forwarded to that owner over the fleet transport
+  // and served there, so a client reaches a cross-region volume without re-connecting; a write is exactly-once
+  // (its completion is recorded on the owner under the origin's authenticated identity). A moved/promoted
+  // volume whose owner is no longer its creator is refused `HomedElsewhere` naming the home region, for the
+  // caller to re-route (moved-owner routing is owed, task #30). A single-region fleet never reaches the map
+  // (the fast path in `homed_elsewhere`), so local and laptop deployments pay nothing.
   if let Some(volume) = volume_of(&body)
     && let Some(region) = homed_elsewhere(state, volume)
   {
-    if is_forwardable_read(&body) && homed_at_creator(state, volume, region) {
-      return forward_read_to_owner(
+    if (is_forwardable_read(&body) || is_forwardable_write(&body))
+      && homed_at_creator(state, volume, region)
+    {
+      return forward_to_owner(
         state,
         client.index(),
         request.request,

@@ -272,6 +272,17 @@ impl Partition {
       .map_or(Seen::New, |w| w.lookup(sequence))
   }
 
+  /// The highest sequence a client has acknowledged (its completion window's watermark), or `None` if it has
+  /// acknowledged nothing. The origin reads its local client's watermark (`origin` = its own host) to relay
+  /// it with a forwarded write, so the owner prunes the forwarded client's completions the same way a local
+  /// client's are pruned — by acknowledgement, not left to grow (§4.9 RIFL; banned item 8).
+  pub fn acknowledged_up_to(&self, origin: u64, client: u32) -> Option<u32> {
+    self
+      .completions
+      .get(&(origin, client))
+      .and_then(ClientWindow::acknowledged_up_to)
+  }
+
   /// The grants made for a principal (a walk of the table; a `slates grants` read, never a
   /// hot path).
   pub fn grants_of(&self, principal: &Principal) -> Vec<&GrantRecord> {
