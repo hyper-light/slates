@@ -110,9 +110,9 @@ impl Connection {
   /// A fresh connection with no streams yet, advertising `window_ahead` bytes of receive credit ahead
   /// of each stream's read cursor (see [`initial_receive_window`]).
   pub fn new(window_ahead: u64) -> Connection {
-    // The congestion window counts in max-datagram units. This dialect sends one frame per packet, so
-    // the max datagram is the connection's frame cap, which the receive window is `REORDER_THRESHOLD +
-    // 1` of (see `initial_receive_window`); recover it from `window_ahead` so `new` keeps one argument.
+    // The congestion window counts in max-datagram units: the packet budget a caller fills
+    // (`poll_transmit`), which the receive window is `REORDER_THRESHOLD + 1` of (see
+    // `initial_receive_window`); recover it from `window_ahead` so `new` keeps one argument.
     let max_datagram = window_ahead / (REORDER_THRESHOLD + 1);
     Connection {
       send_streams: BTreeMap::new(),
@@ -162,58 +162,73 @@ impl Connection {
 
   /// The next packet to send, as `(packet_number, frames)`, or `None` when there is nothing to send
   /// right now (nothing to retransmit, no send stream with fresh data within its credit, and no
-  /// acknowledgement owed). Puts at most one ack-eliciting frame in the packet — a retransmitted frame
-  /// first, otherwise a fresh frame from the next send stream that has one (round-robin) — and, if an
-  /// acknowledgement is owed, appends it followed by the current per-stream receive credit. Only a
-  /// packet that carries an ack-eliciting frame is tracked for loss (RFC 9002 §2).
-  pub fn poll_transmit(&mut self, max_frame_len: usize) -> Option<(u64, Vec<Frame>)> {
-    // One ack-eliciting frame: a retransmission takes priority over fresh stream data. Fresh data is
-    // gated by two limits — the congestion window (a retransmission is recovery, not new load, so it is
-    // never gated) and the connection-wide flow-control credit the peer advertised (`peer_max_data`),
-    // which bounds the *total* fresh bytes across all streams (each stream is also bounded by its own
-    // `MaxStreamData`, inside `StreamSender`). `can_send` still lets a lone frame go when nothing is in
-    // flight, so congestion never stalls the connection; a fresh frame is capped to the remaining
-    // connection credit so `connection_sent` never crosses the ceiling.
-    let connection_credit = self.peer_max_data.saturating_sub(self.connection_sent);
-    let fresh_cap = max_frame_len.min(usize::try_from(connection_credit).unwrap_or(max_frame_len));
-    let (reliable, fresh) = match self.retransmit.pop_front() {
-      Some(frame) => (Some(frame), false),
-      None if self.congestion.can_send(max_frame_len as u64) && connection_credit > 0 => {
-        (self.next_fresh_frame(fresh_cap), true)
-      }
-      None => (None, false),
-    };
-
-    let mut frames = Vec::new();
-    if let Some(frame) = reliable.clone() {
-      frames.push(frame);
+  /// acknowledgement owed). Fills the packet up to `packet_budget` stream bytes with **several**
+  /// ack-eliciting frames (RFC 9000 §12.2 — a packet carries as many frames as fit): every queued
+  /// retransmission first, then fresh frames from the send streams round-robin, each frame at most the
+  /// budget long, until the budget, the congestion window or the connection credit is spent; then, if an
+  /// acknowledgement is owed, the acknowledgement followed by the current receive credit. Only a packet
+  /// that carries an ack-eliciting frame is tracked for loss (RFC 9002 §2). A caller that passes its
+  /// per-frame cap as the budget gets one frame per packet, the shape every session ran before; a larger
+  /// budget packs several — the MTU budget of §4.9 ("frame caps per class from measured MTU").
+  pub fn poll_transmit(&mut self, packet_budget: usize) -> Option<(u64, Vec<Frame>)> {
+    // Retransmissions take priority over fresh stream data and are never gated (recovery, not new load).
+    // Fresh data is gated by two limits — the congestion window and the connection-wide flow-control
+    // credit the peer advertised (`peer_max_data`), which bounds the *total* fresh bytes across all
+    // streams (each stream is also bounded by its own `MaxStreamData`, inside `StreamSender`).
+    // `can_send` still lets a lone frame go when nothing is in flight, so congestion never stalls the
+    // connection; a fresh frame is capped to the remaining connection credit so `connection_sent` never
+    // crosses the ceiling.
+    let mut reliable: Vec<Frame> = Vec::new();
+    let mut packed: usize = 0;
+    while packed < packet_budget {
+      let Some(frame) = self.retransmit.pop_front() else {
+        break;
+      };
+      let bytes = tracked_bytes(&frame);
+      // A retransmission re-adds bytes a loss or probe earlier freed to the in-flight count (never to
+      // the connection total — those bytes were counted when first sent).
+      self.congestion.on_sent(bytes);
+      packed = packed.saturating_add(usize::try_from(bytes).unwrap_or(usize::MAX));
+      reliable.push(frame);
     }
+    while packed < packet_budget {
+      let room = packet_budget - packed;
+      let connection_credit = self.peer_max_data.saturating_sub(self.connection_sent);
+      if connection_credit == 0 || !self.congestion.can_send(room as u64) {
+        break;
+      }
+      let fresh_cap = room.min(usize::try_from(connection_credit).unwrap_or(room));
+      let Some(frame) = self.next_fresh_frame(fresh_cap) else {
+        break;
+      };
+      let bytes = tracked_bytes(&frame);
+      // A fresh frame's bytes advance the connection-wide sent total and the congestion window's
+      // in-flight count as they are picked, so the next pick sees the credit and window it has left.
+      self.connection_sent = self.connection_sent.saturating_add(bytes);
+      self.congestion.on_sent(bytes);
+      packed = packed.saturating_add(usize::try_from(bytes).unwrap_or(usize::MAX));
+      reliable.push(frame);
+    }
+
+    let mut frames = reliable.clone();
     // The largest packet number this packet's acknowledgement covers, if it carries one — recorded for
     // ACK-of-ACK once the packet is known to be ack-eliciting (so the peer will acknowledge it back).
-    let ack_largest = self.push_acknowledgement(&mut frames, max_frame_len);
+    let ack_largest = self.push_acknowledgement(&mut frames, packet_budget);
     if frames.is_empty() {
       return None;
     }
 
     let pn = self.sent.next_pn();
-    // Track only the ack-eliciting frame for loss/retransmission; the acknowledgement and credit frames
-    // are regenerated fresh each time, never retransmitted stale. Its stream bytes enter the congestion
-    // window's in-flight count (a retransmission re-adds bytes a loss or probe earlier freed); a *fresh*
-    // frame's bytes also advance the connection-wide sent total (a retransmission does not — those bytes
-    // were already counted against the connection window when first sent).
-    if let Some(frame) = reliable {
-      let bytes = tracked_bytes(&frame);
-      self.congestion.on_sent(bytes);
-      if fresh {
-        self.connection_sent = self.connection_sent.saturating_add(bytes);
-      }
-      // ACK-of-ACK: this packet is ack-eliciting (it carries a stream frame), so the peer will
+    // Track the ack-eliciting frames for loss/retransmission; the acknowledgement and credit frames are
+    // regenerated fresh each time, never retransmitted stale.
+    if !reliable.is_empty() {
+      // ACK-of-ACK: this packet is ack-eliciting (it carries stream frames), so the peer will
       // acknowledge it; if it also carries an acknowledgement of ours, remember what that covered, so
       // that when the peer acks this packet we can stop tracking the packets it acknowledged.
       if let Some(largest) = ack_largest {
         self.sent_acks.insert(pn, largest);
       }
-      self.sent.on_sent(pn, vec![frame]);
+      self.sent.on_sent(pn, reliable);
     }
     Some((pn, frames))
   }
@@ -823,6 +838,97 @@ mod tests {
     assert!(
       receiver.poll_transmit(FRAME_CAP).is_none(),
       "the duplicate owed no fresh acknowledgement"
+    );
+  }
+
+  /// Shape: a packet budget of several frames for the multi-frame tests — four frame caps, so a packet
+  /// carries up to four stream frames and the multi-frame paths (tracking, loss, probe, ACK-of-ACK) run.
+  const PACKET_BUDGET: usize = 4 * FRAME_CAP;
+
+  /// Like [`transfer`] but every packet is filled to [`PACKET_BUDGET`] (several frames per packet) and
+  /// delivered in reverse order per batch with the channel's drops — the multi-frame path under loss and
+  /// reorder. Returns the received streams, the retransmit count, and the **most frames seen in one
+  /// packet** (the non-vacuity counter: the packing path must actually have packed).
+  fn transfer_packed(
+    streams: &[(u64, Vec<u8>)],
+    mut channel: Channel,
+  ) -> (BTreeMap<u64, Vec<u8>>, u64, usize) {
+    let window = initial_receive_window(PACKET_BUDGET);
+    let mut sender = Connection::new(window);
+    for (id, content) in streams {
+      sender.open(*id, content);
+    }
+    let mut receiver = Connection::new(window);
+    let mut received: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    let mut widest = 0usize;
+    let mut guard = 0u64;
+    loop {
+      guard += 1;
+      assert!(guard < 1_000_000, "the connection must make progress");
+      let mut batch = Vec::new();
+      while let Some(packet) = sender.poll_transmit(PACKET_BUDGET) {
+        let stream_frames = packet
+          .1
+          .iter()
+          .filter(|frame| matches!(frame, Frame::Stream { .. }))
+          .count();
+        widest = widest.max(stream_frames);
+        batch.push(packet);
+      }
+      let sent = !batch.is_empty();
+      for (pn, frames) in batch.into_iter().rev() {
+        if !channel.drops() {
+          receiver.handle_incoming(pn, &frames);
+        }
+      }
+      for id in receiver.recv_stream_ids() {
+        received
+          .entry(id)
+          .or_default()
+          .extend(receiver.read_stream(id));
+      }
+      let acked = pump(&mut receiver, &mut sender, &mut channel, None);
+      let all_recv = streams
+        .iter()
+        .all(|(id, _)| receiver.recv_stream_complete(*id));
+      if sender.send_complete() && all_recv {
+        break;
+      }
+      if !(sent || acked) && !sender.probe() {
+        break;
+      }
+    }
+    (received, sender.retransmitted(), widest)
+  }
+
+  /// AC (§4.9 "frame caps per class from measured MTU"; RFC 9000 §12.2): a packet carries **several**
+  /// frames when the budget allows, and the multiplexed streams still arrive exactly once, in order, under
+  /// loss and reorder — the loss detector, the probe and ACK-of-ACK all handle a packet whose frames span
+  /// streams. Non-vacuous: the widest packet seen carried more than one stream frame, and something was
+  /// retransmitted (the loss path ran on multi-frame packets).
+  #[test]
+  fn several_frames_per_packet_survive_loss_and_reorder() {
+    let streams = vec![
+      (1u64, stream_content(1, 500)),
+      (3u64, stream_content(2, 20)),
+      (7u64, stream_content(3, 300)),
+    ];
+    // Drop the third and eleventh packets seen.
+    let (received, retransmits, widest) = transfer_packed(&streams, Channel::new(vec![3, 11]));
+    for (id, content) in &streams {
+      assert_eq!(
+        received.get(id),
+        Some(content),
+        "stream {id} arrived exactly across multi-frame packets"
+      );
+    }
+    assert!(
+      widest > 1,
+      "the packing path ran: the widest packet carried {widest} stream frames"
+    );
+    assert!(
+      retransmits > 0,
+      "the loss path ran on multi-frame packets ({retransmits} frames retransmitted)"
     );
   }
 

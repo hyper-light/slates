@@ -31,8 +31,8 @@ const LOSS_REDUCTION_DIVISOR: u64 = 2;
 /// (`ssthresh`), the bytes currently in flight, and the recovery-period watermark.
 #[derive(Debug)]
 pub struct Congestion {
-  /// The max datagram size the window is counted in (this dialect sends one frame per packet, so it is
-  /// the connection's frame cap).
+  /// The max datagram size the window is counted in — the connection's packet budget, the most stream
+  /// bytes one packet carries across its frames (`Connection::poll_transmit`).
   max_datagram: u64,
   /// The congestion window in bytes: the most in-flight data the sender allows itself.
   window: u64,
