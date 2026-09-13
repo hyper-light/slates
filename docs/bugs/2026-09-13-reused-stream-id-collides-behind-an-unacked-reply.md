@@ -107,3 +107,39 @@ never received (the trace showed the server's first ingest was `pn=1` = B).
   kind (`stream_kind`), which every existing dispatch site already matched on — none changed.
 - The MTU budget (piece 2 of the charter) is not started: several frames per packet and DPLPMTUD remain
   owed (`docs/wip/fleet-transport.md`).
+
+## Piece 2(b), path-MTU discovery — measured, not landed (2026-09-13)
+
+Built on top of the packet fill (`ae3eab1`): a PING frame (RFC 9000 §19.2, `KIND_PING = 5`) so a padded
+probe packet is acknowledgeable; a sans-io `Dplpmtud` (RFC 8899 §5: Base → Searching → SearchComplete /
+Error, `MAX_PROBES = 3`, a step search from 1200 to 1500, black-hole detection, a probe timer) proven at
+N=1 with an injected path (six unit tests green); the connection tracking a probe under its packet number
+with nothing to retransmit; the endpoint deriving its packet budget from the PLPMTU less the protected
+packet overhead and emitting a due probe on every flush and idle re-drive. Two by-use failures never closed,
+each traced to a number:
+
+- The live discovery test stalled at a PLPMTU of **1350** (two confirmed steps) however many exchanges
+  followed; the sim fabric carries 2048-byte datagrams, so the 1425 probe was deliverable. Its
+  acknowledgement never arrived and no loss pass declared it lost; the probe timer (added) fires only in
+  the receive loop's timeout branch, which an exchanging client never reaches.
+- The SWIM late-target live test's second probe (a multi-frame ping, 16-byte frames) never completed at
+  the target. The trace showed **`can_send=false` with 16 bytes in flight**: once the packet budget and
+  the per-frame cap are *separate* values (the discovery's budget of the PLPMTU less overhead, ≈ 1171,
+  against 16-byte frames), a congestion gate that asks whether the whole budget fits the window
+  (`can_send(room)`) refuses every frame after the first — a window counted in frame caps never admits a
+  path's worth of budget — and a multi-frame request stalls behind its own first frame. In the landed
+  tree budget and cap are one value (`poll_transmit(max_frame_len)`), so the gate is exact there; the
+  constraint for the separated design is that the gate must ask about the **next frame**
+  (`can_send(min(room, frame_cap))`), which was applied in the attempt and did not by itself close the
+  test — a further run of the cluster crate then did not complete within ten minutes (the `extend` live
+  test), a hang the landed tree does not have.
+
+Also found: the RTT sample point took the probe packet's send time when a probe and a data packet were
+acknowledged together (fixed to sample the largest acknowledged *data* packet); the simulated fabric
+delivers within one step, so a request/reply exchange that no longer parks on a timer reports a zero
+simulated round trip — the SWIM live test's `rtt_ns > 0` measured an incidental park, not a round trip.
+
+The discovery machinery is therefore recorded here and **not landed**: the branch carries piece 1, piece
+2(a) with the congestion-gate correction, and this record. The next attempt should start from the two
+traces above: a probe must be resolved by its own timer while the session exchanges (RFC 8899 §5.1.1),
+and the live test must be traced for the hang before any further mechanism is added.
