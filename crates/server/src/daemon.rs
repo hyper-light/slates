@@ -676,6 +676,36 @@ impl Daemon {
       .is_ok()
   }
 
+  /// Test support: **starves** this daemon's control shard for `span_ns` — the CPU starvation a shared,
+  /// oversubscribed box inflicts on a live daemon (measured here at load average 41: a live root voter was
+  /// retired and re-admitted in a loop), injected deterministically so the fleet's tolerance of it is a
+  /// test, not a hope. The hold is a task spawned onto the control shard that spins on the shard clock
+  /// until the span has passed: the shard is cooperative, so while the hold runs nothing else on that shard
+  /// does — its probe serve tasks (so its acknowledgements to every peer's probes stop for the whole span,
+  /// then resume), its own probes, its record plane and its consensus loops. Admission is retried while the
+  /// control channel is full ([`Self::spawn_admitted`]); `None` when there is no control shard or the hold
+  /// was not admitted within the observe budget, otherwise the receiver the hold reports its **measured
+  /// span** (nanoseconds) on when it ends — so a test proves the starvation it relied on actually held.
+  /// Returns at once: the caller watches the rest of the fleet while the shard is held.
+  pub fn starve_control_shard(&self, span_ns: u64) -> Option<std::sync::mpsc::Receiver<u64>> {
+    let control = self.shards.first().copied()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    if !self.spawn_admitted(control, OBSERVE_BUDGET_NS, || {
+      let tx = tx.clone();
+      async move {
+        let started = slates_rt::futures::now_ns();
+        let end = started.saturating_add(span_ns);
+        while slates_rt::futures::now_ns() < end {
+          std::hint::spin_loop();
+        }
+        let _ = tx.send(slates_rt::futures::now_ns().saturating_sub(started));
+      }
+    }) {
+      return None;
+    }
+    Some(rx)
+  }
+
   /// Whether this daemon's fleet has **region-placed** the head of `object` (§4.8): its control-shard
   /// membership loop replicated the head's record to the candidate holders and recorded a quorum of
   /// acknowledgements. A test or an operator reads this to observe cross-node replication: `Some(false)` if

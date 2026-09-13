@@ -448,15 +448,24 @@ pub enum ProbeOutcome {
 /// never blocks a protocol period forever). The **endpoint is returned for reuse whatever the outcome** —
 /// acknowledged *or* timed out — so its packet-number space stays continuous across probe periods
 /// (RFC 9000 §12.3) and, crucially, a single missed probe does not drop the session. The budget is the
-/// caller's to derive (owed — a measured RTT budget).
+/// caller's to derive from the peer's measured round trip (`slates_server::fleet::ProbeTiming`).
 ///
 /// **Correctness (the nonce).** The reply counts only if it echoes this probe's nonce, so a *stale*
-/// acknowledgement — one the peer sent to an earlier probe before it died, that a real datagram socket
-/// buffered and the reliable transport redelivered on the reused probe stream — does not satisfy the probe;
-/// a dead peer times out rather than looking alive forever (`docs/bugs/2026-09-10-swim-stale-ack.md`).
+/// acknowledgement — one the peer sent to an earlier probe, that a real datagram socket buffered and the
+/// reliable transport redelivered on the reused probe stream — does not satisfy the probe; a dead peer
+/// times out rather than looking alive forever (`docs/bugs/2026-09-10-swim-stale-ack.md`).
 ///
-/// **Robustness (keeping the session).** A timeout is a *transient miss*, not a verdict: a lost packet, a
-/// moment's scheduling jitter, or a nonce-rejected stale reply all produce one. Dropping the session on one
+/// **A stale reply is no verdict either way.** It is discarded and the **same probe is re-sent** (same
+/// nonce) within the remaining deadline, rather than ending the wait as a miss. The session serves one
+/// exchange at a time: a ping that reached the peer while it still held an earlier, abandoned probe's reply
+/// unacknowledged was dropped there as a duplicate of that exchange's stream — so a stale reply is exactly
+/// the sign that this probe will not be answered unless re-sent. A peer that answers *late* (starved of CPU,
+/// then back) thereby costs one more round trip, not a miss per late reply; a dead peer has no fresh nonce
+/// to echo and still times out
+/// (`docs/bugs/2026-09-13-swim-fixed-probe-deadline-kills-a-starved-live-peer.md`).
+///
+/// **Robustness (keeping the session).** A timeout is a *transient miss*, not a verdict: a lost packet or a
+/// moment's scheduling jitter produces one. Dropping the session on one
 /// miss (a fresh handshake to replace it, and a verdict taken from one packet) would
 /// retire a peer on any transient glitch — which is what made both survivors retire a *live* peer during
 /// formation. So the session is kept and the caller re-probes it: the ping carries this node's suspicion,
@@ -472,16 +481,16 @@ pub async fn probe_once(
   let expected = probe.nonce();
   let started_ns = now_ns();
 
-  // Drive the request inline, racing it against the deadline. On the deadline the request future is dropped
+  // Drive the exchange inline, racing it against the deadline. On the deadline the exchange future is dropped
   // (releasing the borrow of `endpoint`) and the endpoint is still owned here, so it is returned for reuse —
   // the reliable exchange is not self-bounded, so this deadline is the caller-owned bound it relies on.
   let received = {
-    let mut request = std::pin::pin!(endpoint.request(PROBE_STREAM, &bytes));
+    let mut exchange = std::pin::pin!(exchange_until_echoed(&mut endpoint, &bytes, expected));
     let mut deadline = std::pin::pin!(sleep(budget.deadline_ns));
     std::future::poll_fn(|cx| {
       // Prefer a delivered reply over the deadline when both are ready, so a probe that just made it is not
       // traded for a timeout.
-      if let std::task::Poll::Ready(result) = std::future::Future::poll(request.as_mut(), cx) {
+      if let std::task::Poll::Ready(result) = std::future::Future::poll(exchange.as_mut(), cx) {
         return std::task::Poll::Ready(Some(result));
       }
       if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
@@ -492,26 +501,61 @@ pub async fn probe_once(
     .await
   };
 
-  // A reply counts only if it decodes as an acknowledgement echoing this probe's nonce; a request error, a
-  // wrong-nonce (stale) reply, or the deadline (`None`) is a probe failure — all keeping the endpoint.
+  // The echoed acknowledgement is the probe's success; a request error, a reply that is no acknowledgement
+  // at all, or the deadline (`None`) is a probe failure — all keeping the endpoint.
   let outcome = match received {
-    Some(Ok(reply)) => match SwimMessage::decode(&reply) {
+    Some(Ok(Some(Echoed {
+      from,
+      gossip,
+      coordinate,
+    }))) => ProbeOutcome::Acked {
+      from,
+      gossip,
+      rtt_ns: now_ns().saturating_sub(started_ns),
+      coordinate,
+    },
+    Some(Ok(None) | Err(_)) | None => ProbeOutcome::TimedOut,
+  };
+  Ok((Some(endpoint), outcome))
+}
+
+/// An acknowledgement that echoed the probe's nonce: who answered, what it gossiped, and its coordinate.
+struct Echoed {
+  from: HostId,
+  gossip: Vec<(HostId, MemberState)>,
+  coordinate: NetworkCoordinate,
+}
+
+/// Sends `bytes` on the probe stream and awaits the acknowledgement echoing `expected`, **re-sending** on
+/// each stale acknowledgement (one echoing another nonce — see [`probe_once`]) until the echo arrives;
+/// `None` for a reply that is not an acknowledgement at all (a malformed or foreign message — a probe
+/// failure). Each turn consumes one stale reply, of which the peer holds at most one per probe abandoned
+/// before it; the wait as a whole is bounded by the deadline [`probe_once`] races it against, which drops it.
+async fn exchange_until_echoed(
+  endpoint: &mut Endpoint,
+  bytes: &[u8],
+  expected: Option<u64>,
+) -> Result<Option<Echoed>, EndpointError> {
+  loop {
+    let reply = endpoint.request(PROBE_STREAM, bytes).await?;
+    match SwimMessage::decode(&reply) {
       Ok(SwimMessage::Ack {
         from,
         nonce,
         gossip,
         coordinate,
-      }) if Some(nonce) == expected => ProbeOutcome::Acked {
-        from,
-        gossip,
-        rtt_ns: now_ns().saturating_sub(started_ns),
-        coordinate,
-      },
-      _ => ProbeOutcome::TimedOut,
-    },
-    Some(Err(_)) | None => ProbeOutcome::TimedOut,
-  };
-  Ok((Some(endpoint), outcome))
+      }) if Some(nonce) == expected => {
+        return Ok(Some(Echoed {
+          from,
+          gossip,
+          coordinate,
+        }));
+      }
+      // A stale acknowledgement — discarded, and the probe re-sent.
+      Ok(SwimMessage::Ack { .. }) => {}
+      _ => return Ok(None),
+    }
+  }
 }
 
 /// Serves one SWIM probe on a node (§4.8): receives a peer's message over `endpoint`, folds its

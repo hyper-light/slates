@@ -1610,6 +1610,23 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 > observation accessors are `Option`-typed, so a shard that did not answer never satisfies a test
 > predicate. Record:
 > `docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md`.
+> Same day, the load-41 flap that record left owed — SWIM retiring a *live*, CPU-starved voter and the
+> root leader retiring/re-admitting its region in a loop — is fixed at its four causes. The probe deadline
+> is now **derived** ("detection timeout for membership from RTT p99 × k"): the transport's RFC 9002 probe
+> timeout over the peer's measured probe round trips, floored at the heartbeat as the scheduler quantum,
+> doubled per consecutive miss, capped at the anchor's liveness budget (`ProbeTiming`,
+> `server/src/fleet.rs`). A suspected member stays in the probe rotation (SWIM §4.2 — it had dropped out,
+> so its acknowledgement never registered and the Lifeguard window froze at four periods). Every ping to a
+> suspected peer carries the suspicion (Lifeguard's buddy system, `Detector::ping_gossip`), so a peer back
+> from a stall refutes from the probe it answers even after the gossip's `λ·ln(n+1)` transmits are spent.
+> And a stale acknowledgement re-sends the probe within its deadline instead of counting as a miss. By use:
+> a peer whose control shard is held busy for 3 s (`Daemon::starve_control_shard`) is kept, where it was
+> retired at ~1.2 s before (`a_starved_but_live_peer_is_not_retired`, 4/4 failing → 3/3 passing). A truly
+> dead peer is now declared after six backed-off misses (≈ 4 s at rest) instead of 1.2 s — the Lifeguard
+> trade. Running the gated three-process deployment test for this also corrected the contact predicate of
+> the same day: a dead consensus voter stayed probed and linked (Raft's voter set does not shrink on a
+> committed retirement), so `keeps_direct_contact_with` now excludes a peer the membership holds dead.
+> Record: `docs/bugs/2026-09-13-swim-fixed-probe-deadline-kills-a-starved-live-peer.md`.
 
 **Role.** The authoritative record of volumes, snapshots, lineage, leases, attachments,
 accounting, completion records, grants, chains and the operation log; served locally in

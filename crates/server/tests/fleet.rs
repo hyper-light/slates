@@ -30,7 +30,7 @@ use slates_ipc::protocol::{
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
-use slates_server::daemon::host_id_of;
+use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS, host_id_of};
 use slates_server::deploy::member_id;
 use slates_server::head::HeadValue;
 use slates_server::{
@@ -503,6 +503,92 @@ fn a_falsely_retired_peer_rejoins_by_refutation() {
     stable,
     "B stayed admitted after rejoining — the re-admission did not flap"
   );
+}
+
+/// Derived: how long [`a_starved_but_live_peer_is_not_retired`] starves B's control shard — three anchor
+/// liveness budgets ([`LIVENESS_BUDGET_NS`]). Past the silence at which the old fixed probe deadline (one
+/// heartbeat, so six misses in a row) declared a peer dead (≈ 1.2 s at rest), and past the suspicion's
+/// `λ·ln(n+1)` gossip transmits (four pings at two nodes), so the probe B finally answers carries A's
+/// suspicion only by the buddy system; and within what the derived deadline tolerates (its backoff reaches
+/// the liveness-budget cap by the fifth probe, so six misses need ≈ 4 s of silence at rest, more under load).
+const STARVATION_NS: u64 = 3 * LIVENESS_BUDGET_NS;
+
+/// AC (§4.8 "Derived constants" — "detection timeout for membership from RTT p99 × k; SWIM period = max(k ×
+/// RTT p99, scheduler quantum)"): a peer that is **alive but starved of CPU** is not retired. B's control
+/// shard is held busy for [`STARVATION_NS`] ([`Daemon::starve_control_shard`]) — the starvation a shared,
+/// oversubscribed box inflicts on a live daemon (measured on this box at load average 41: a live root voter
+/// retired and re-admitted in a loop, the region count flapping 3→2→3→2→3 with nothing killed), injected
+/// deterministically — so B's acknowledgements to A's probes stop for the whole span, then resume. A must
+/// keep B a member throughout: its probe deadline is derived from the measured round trip and backs off
+/// toward the liveness budget on each miss, so six late acknowledgements are not six misses; the probe B
+/// finally answers carries A's suspicion (Lifeguard's buddy system), so B refutes it from that very probe;
+/// and B's late answer to an abandoned earlier probe is discarded and the probe re-sent, not counted as a
+/// miss. Non-vacuous: the hold is proven to have held (its measured span comes back from the shard it ran
+/// on), A's view is watched for the whole span and a settle past it, and the mesh is shown whole after.
+#[test]
+fn a_starved_but_live_peer_is_not_retired() {
+  let _serial = serialize_fleet_tests();
+  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let host_b = b.host;
+  let peer_of_a = Peer {
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start(a, peer_of_a);
+  let daemon_b = start(b, peer_of_b);
+
+  // The direct probe mesh forms, then settles: a few answered probes seed A's measured round trip to B.
+  let formed = poll_until(&[&daemon_a, &daemon_b], FORMATION_DEADLINE, || {
+    daemon_a.fleet_meshed() == Some(true) && daemon_b.fleet_meshed() == Some(true)
+  });
+  let settle = Instant::now() + FORMATION_SETTLE;
+  while Instant::now() < settle {
+    std::thread::yield_now();
+  }
+
+  // Starve B: its control shard runs nothing else — no acknowledgements to A — for the whole span.
+  let hold = daemon_b.starve_control_shard(STARVATION_NS);
+  // A must keep B through the span and a settle past it (a retirement that lands late is still one).
+  let kept = holds_for(
+    Duration::from_nanos(STARVATION_NS) + FORMATION_SETTLE,
+    || {
+      daemon_a
+        .fleet_members()
+        .is_some_and(|members| members.contains(&host_b))
+    },
+  );
+  let held_ns = hold.and_then(|done| {
+    done
+      .recv_timeout(Duration::from_nanos(OBSERVE_BUDGET_NS))
+      .ok()
+  });
+  // B is back: both sides see the mesh whole.
+  let meshed_after = poll_until(&[&daemon_a, &daemon_b], FORMATION_DEADLINE, || {
+    daemon_a.fleet_meshed() == Some(true) && daemon_b.fleet_meshed() == Some(true)
+  });
+
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(formed, "the fleet's direct probe mesh formed");
+  assert!(
+    held_ns.is_some_and(|held| held >= STARVATION_NS),
+    "B's control shard was held for the whole span (measured {held_ns:?} ns of {STARVATION_NS})"
+  );
+  assert!(
+    kept,
+    "A kept B a member through B's starvation and a settle past it — a starved live peer is not retired"
+  );
+  assert!(meshed_after, "the mesh is whole again after B's starvation");
 }
 
 /// AC (§4.8 "Recovery"; task #22 — a restart is a join under a **new** ephemeral id): a peer that restarts

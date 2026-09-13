@@ -95,6 +95,23 @@ fn budget() -> CommitBudget {
   CommitBudget::hard(DEADLINE_NS, POLL_NS)
 }
 
+/// Serves one probe on `endpoint`, giving up after `within_ns` — so a target waiting for a probe that never
+/// comes ends, and the simulation runs idle instead of advancing time forever on the session's re-drive timer.
+async fn serve_within(endpoint: &mut Endpoint, detector: &mut Detector, within_ns: u64) -> bool {
+  let mut serve = std::pin::pin!(serve_probe(endpoint, detector, TARGET, GOSSIP_FANOUT));
+  let mut deadline = std::pin::pin!(slates_rt::futures::sleep(within_ns));
+  std::future::poll_fn(|cx| {
+    if let std::task::Poll::Ready(served) = std::future::Future::poll(serve.as_mut(), cx) {
+      return std::task::Poll::Ready(served.is_ok());
+    }
+    if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+      return std::task::Poll::Ready(false);
+    }
+    std::task::Poll::Pending
+  })
+  .await
+}
+
 /// What one live probe round produced at the prober: whether it timed out, the gossip any acknowledgement
 /// carried, and the prober's belief about the target after resolving the probe with one further tick.
 struct ProbeResult {
@@ -116,6 +133,10 @@ enum TargetMode {
   /// stand-in for the buffered/redelivered acknowledgement of an earlier probe, which the prober must not
   /// count as this probe's answer.
   StaleNonce,
+  /// Answers the first request with a **stale**-nonce acknowledgement — the late reply to an earlier probe
+  /// the prober abandoned at its deadline — and then serves the next request properly: the prober must
+  /// discard the stale reply, re-send its probe within its deadline, and count the real answer.
+  StaleThenServes,
 }
 
 /// Runs one live probe round: the prober (`1`) probes the target (`2`) over a mutually-authenticated
@@ -190,6 +211,33 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
               .encode()
             })
             .await;
+        }
+        TargetMode::StaleThenServes => {
+          // First the late reply of an earlier, abandoned probe: a stale nonce and no gossip, so a stale
+          // reply wrongly counted is told from the served one by the rumour only the served one carries.
+          let coordinate = Detector::new(TARGET, timing()).coordinate();
+          let _ = endpoint
+            .serve_once(move |_, _request| {
+              SwimMessage::Ack {
+                from: TARGET,
+                nonce: STALE_NONCE,
+                gossip: Vec::new(),
+                coordinate,
+              }
+              .encode()
+            })
+            .await;
+          // Then the real answer to the probe the prober re-sends — bounded, so a prober that never
+          // re-sends (the defect) leaves the fabric idle rather than this target waiting forever.
+          let mut detector = Detector::new(TARGET, timing());
+          detector.apply(
+            RUMOUR,
+            MemberState {
+              liveness: Liveness::Suspect,
+              incarnation: 1,
+            },
+          );
+          let _ = serve_within(&mut endpoint, &mut detector, DEADLINE_NS).await;
         }
         // An unserved target handshakes then leaves; the prober's probe must not block on it.
         TargetMode::Silent => {}
@@ -345,5 +393,38 @@ fn a_stale_nonce_acknowledgement_is_rejected_and_the_peer_is_suspected() {
       }
     )),
     "the rejected acknowledgement's gossip was not folded into the prober — its contents were discarded"
+  );
+}
+
+/// A probe answered first with a **stale** acknowledgement — the late reply to an earlier probe abandoned at
+/// its deadline — and then, once re-sent, with the real one is **acknowledged**, not failed (§4.8). A stale
+/// reply is no verdict on this probe either way: it does not count as its answer (the test above), and it
+/// must not end its wait as a miss — on the one-exchange-at-a-time session a ping that reached the peer while
+/// it still held that earlier reply unacknowledged was dropped as a duplicate of it, so the prober re-sends
+/// the same ping (same nonce) within its own deadline. Before this every stale reply was an immediate miss,
+/// so a peer that answered late once was a miss closer to death while answering every probe. Non-vacuous:
+/// the acknowledgement counted carries the *served* gossip (the rumour), which the stale reply did not, so
+/// it is the re-sent probe's answer; and the target stays alive.
+#[test]
+fn a_stale_acknowledgement_is_discarded_and_the_resent_probe_is_acknowledged() {
+  let result = run_probe(TargetMode::StaleThenServes);
+  assert!(
+    !result.timed_out,
+    "the stale reply was discarded and the re-sent probe acknowledged within the deadline"
+  );
+  assert_eq!(
+    result.target_after_resolution,
+    Some(Liveness::Alive),
+    "a target that answers the re-sent probe stays alive"
+  );
+  assert!(
+    result.ack_gossip.contains(&(
+      RUMOUR,
+      MemberState {
+        liveness: Liveness::Suspect,
+        incarnation: 1,
+      }
+    )),
+    "the acknowledgement counted is the served one — it carries the target's gossip, which the stale reply did not"
   );
 }

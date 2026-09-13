@@ -103,10 +103,11 @@ use slates_rt::udp::UdpSocket;
 use slates_transport::demux::Demux;
 use slates_transport::endpoint::{Endpoint, MIN_DATAGRAM_BYTES};
 use slates_transport::handshake::Identity;
+use slates_transport::rtt::RttEstimator;
 use slates_vfs::clock::Clock;
 use slates_vfs::export::{Progress, SnapshotArchiver};
 
-use crate::daemon::HEARTBEAT_NS;
+use crate::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
 use crate::head::{HeadValue, PlacedHead, SealJob};
 use crate::state::{self, ShardState};
 use crate::verbs;
@@ -222,13 +223,74 @@ fn detector_timing(neighbourhood: usize) -> DetectorTiming {
   }
 }
 
-/// The probe budget: how long a probe waits for its acknowledgement before it is a failure, and how often
-/// the wait is polled. Derived: the deadline is one protocol period ([`HEARTBEAT_NS`], the daemon's beat
-/// cadence — "SWIM period = max(k × RTT p99, scheduler quantum)", §4.8), so a probe completes within its
-/// period (it returns early on the acknowledgement); the poll interval is a tenth of it, so the loop wakes
-/// promptly on the reply without spinning. A measured RTT budget is the owed refinement.
-fn probe_budget() -> CommitBudget {
-  CommitBudget::hard(HEARTBEAT_NS, (HEARTBEAT_NS / POLL_PER_PERIOD).max(1))
+/// The probe's timing law for one peer (§4.8 "Derived constants": "detection timeout for membership from
+/// RTT p99 × k; SWIM period = max(k × RTT p99, scheduler quantum)") — the measured round trip of this peer's
+/// acknowledgements and how many probes in a row it has missed, from which each probe's deadline is derived
+/// (nothing here is a hidden constant):
+///
+/// - **From the measured round trip**: the RFC 9002 §6.2.1 probe timeout, `smoothed_rtt + max(4 · rttvar,
+///   granularity)` — Jacobson's mean-deviation bound on the round-trip tail (SIGCOMM 1988; the RTO the
+///   Internet runs on), the running form of "RTT p99 × k" with `k` in the four deviations — over the
+///   transport's own estimator ([`RttEstimator`]), fed by every acknowledged probe (a timed-out probe yields
+///   no sample: Karn's rule). A peer whose acknowledgements have grown slow (its shard starved on a loaded
+///   box) is waited for accordingly, and the estimate follows it back down.
+/// - **Floored at the scheduler quantum**: [`HEARTBEAT_NS`], the daemon's beat — the finest cadence anything
+///   on the control shard is scheduled at, so no deadline is set finer than the scheduler resolves (on a quiet
+///   loopback the estimate is ~50 ms, below it: the floor keeps the quiet behaviour exactly what it was).
+/// - **Backed off on each consecutive miss**: doubled per miss (RFC 9002 §6.2.4's exponential backoff — the
+///   miss produced no sample, so the wait must grow without one), so silence is probed at 1×, 2×, 4× … the
+///   estimate, not at a fixed beat six times over.
+/// - **Capped at the liveness budget**: [`LIVENESS_BUDGET_NS`], the anchor's own definition of a live daemon
+///   (one that beats within it) — a peer that cannot acknowledge within it is not merely slow, so no probe
+///   waits longer, and a dead peer is still declared within a bounded span (six misses ≈ 4 s at rest).
+///
+/// The suspicion window ([`SUSPICION_PERIODS`]) still counts *probes*, so it dilates with the deadline: the
+/// misses that kill a peer are misses of an adaptive, backed-off wait — a live peer starved for seconds is no
+/// longer six 100 ms deadlines late; it is a slow peer the estimator and the backoff wait for
+/// (`docs/bugs/2026-09-13-swim-fixed-probe-deadline-kills-a-starved-live-peer.md`).
+struct ProbeTiming {
+  rtt: RttEstimator,
+  consecutive_misses: u32,
+}
+
+impl ProbeTiming {
+  /// A fresh law: no sample yet — the first deadline is the RFC 9002 §6.2.2 initial probe timeout (twice the
+  /// initial RTT), conservative until the first acknowledgement seeds the estimate — and no misses.
+  fn new() -> ProbeTiming {
+    ProbeTiming {
+      rtt: RttEstimator::new(),
+      consecutive_misses: 0,
+    }
+  }
+
+  /// This probe's deadline: `max(pto, HEARTBEAT_NS) × 2^misses`, capped at `LIVENESS_BUDGET_NS` (the
+  /// derivation on the type). The peer acknowledges inline, so no acknowledgement delay is added to the
+  /// probe timeout.
+  fn deadline_ns(&self) -> u64 {
+    let base = self.rtt.pto(0).max(HEARTBEAT_NS);
+    // A shift by the word width or more is already past the cap: saturate rather than overflow.
+    let backoff = 1u64
+      .checked_shl(self.consecutive_misses)
+      .unwrap_or(u64::MAX);
+    base.saturating_mul(backoff).min(LIVENESS_BUDGET_NS)
+  }
+
+  /// The budget for this probe: its derived deadline, polled at the collection-loop cadence (a tenth of a
+  /// period, [`POLL_PER_PERIOD`]).
+  fn budget(&self) -> CommitBudget {
+    CommitBudget::hard(self.deadline_ns(), (HEARTBEAT_NS / POLL_PER_PERIOD).max(1))
+  }
+
+  /// The probe was acknowledged in `rtt_ns`: a sample for the estimate, and the backoff resets.
+  fn acknowledged(&mut self, rtt_ns: u64) {
+    self.rtt.on_sample(rtt_ns, 0);
+    self.consecutive_misses = 0;
+  }
+
+  /// The probe timed out: no sample (Karn's rule), one more consecutive miss to back off on.
+  fn missed(&mut self) {
+    self.consecutive_misses = self.consecutive_misses.saturating_add(1);
+  }
 }
 
 /// Shape: the numerator of the lookahead fraction (kept a ratio so no float enters the decision) at which a
@@ -650,13 +712,15 @@ fn fold_peer_state(detector: &Detector, peer_host: HostId, origin: u16, shards: 
   retired
 }
 
-/// Sends one probe over `session` (when established) and folds its outcome into `detector`, returning the
-/// session to carry forward. An acknowledgement clears the suspicion and learns the peer's gossip, RTT and
-/// coordinate; a timeout is a **transient miss**, not a verdict — a lost packet, scheduling jitter, or a
-/// nonce-rejected stale reply — so the session is kept and re-probed next period (only silence across the
-/// suspicion window ages the peer to death), while the ping the next period carries this node's suspicion
-/// for a still-live peer to refute; a runtime refusal (never expected from the inline probe) drops it. The
-/// detector ticks only when a probe actually goes out, so an unestablished session never resolves as a miss.
+/// Sends one probe over `session` (when established) and folds its outcome into `detector` and `timing`,
+/// returning the session to carry forward. An acknowledgement clears the suspicion, learns the peer's gossip
+/// and coordinate, and feeds its round trip to the deadline law ([`ProbeTiming`]); a timeout is a
+/// **transient miss**, not a verdict — a lost packet, or a peer too starved to answer within the deadline —
+/// so the session is kept and re-probed next period at a backed-off deadline (only silence across the
+/// suspicion window ages the peer to death), while every ping to a suspected peer carries the suspicion for
+/// a still-live peer to refute ([`Detector::ping_gossip`]); a runtime refusal (never expected from the inline
+/// probe) drops it. The detector ticks only when a probe actually goes out, so an unestablished session never
+/// resolves as a miss.
 #[allow(clippy::too_many_arguments)]
 async fn probe_and_apply(
   detector: &mut Detector,
@@ -665,16 +729,18 @@ async fn probe_and_apply(
   peer_host: HostId,
   fanout: usize,
   nonce: u64,
-  budget: CommitBudget,
+  timing: &mut ProbeTiming,
 ) -> Option<Endpoint> {
   let open = session?;
   detector.tick();
   let ping = SwimMessage::Ping {
     from: local,
     nonce,
-    gossip: detector.gossip(fanout),
+    // The buddy system: a ping to a peer this node suspects always carries that suspicion, so the peer
+    // refutes it from this very probe rather than after the gossip budget is spent.
+    gossip: detector.ping_gossip(peer_host, fanout),
   };
-  match probe_once(open, &ping, budget).await {
+  match probe_once(open, &ping, timing.budget()).await {
     Ok((
       returned,
       ProbeOutcome::Acked {
@@ -692,6 +758,7 @@ async fn probe_and_apply(
       // probed id, so this is the ordinary credit. The gossip (other members' states) is folded regardless.
       if from == peer_host {
         detector.on_ack(peer_host);
+        timing.acknowledged(rtt_ns);
         #[allow(clippy::cast_precision_loss)]
         detector.observe_rtt(peer_host, rtt_ns as f64);
         detector.learn_coordinate(peer_host, coordinate);
@@ -699,7 +766,10 @@ async fn probe_and_apply(
       detector.apply_gossip(&gossip);
       returned
     }
-    Ok((returned, ProbeOutcome::TimedOut)) => returned,
+    Ok((returned, ProbeOutcome::TimedOut)) => {
+      timing.missed();
+      returned
+    }
     Err(_) => None,
   }
 }
@@ -710,12 +780,12 @@ async fn probe_and_apply(
 /// task and its own detector; `sync_membership` folds each detector's view without disturbing the peers it
 /// does not track, so N detectors compose into one membership. The session is **reused whatever a probe's
 /// outcome** — an acknowledgement and a timeout both hand it back ([`probe_once`]) — so a single missed
-/// probe (a lost packet, scheduling jitter, a nonce-rejected stale reply) does not drop it: the next period
-/// re-probes, a still-live peer refutes the suspicion the ping carried, and only a peer silent across the
-/// suspicion window ages to death and is retired (driving the takeover). Dropping the session on one miss
-/// would retire a live peer on any transient glitch (`docs/bugs/2026-09-10-swim-stale-ack.md`); a re-dial
-/// now replaces a lost session at the peer, but a probe verdict still rests on the suspicion window, not
-/// on one miss.
+/// probe (a lost packet, a peer too starved to answer in time) does not drop it: the next period re-probes
+/// at a backed-off deadline ([`ProbeTiming`]), a still-live peer refutes the suspicion every ping to it
+/// carries, and only a peer silent across the suspicion window ages to death and is retired (driving the
+/// takeover). Dropping the session on one miss would retire a live peer on any transient glitch
+/// (`docs/bugs/2026-09-10-swim-stale-ack.md`); a re-dial now replaces a lost session at the peer, but a
+/// probe verdict still rests on the suspicion window, not on one miss.
 async fn probe_peer(
   identity: &'static Identity,
   dial: PeerDial,
@@ -729,7 +799,7 @@ async fn probe_peer(
     address,
     certificate,
   } = dial;
-  let budget = probe_budget();
+  let mut probe_timing = ProbeTiming::new();
   let timing = detector_timing(neighbourhood);
   let fanout = usize::try_from(timing.gossip_transmits).unwrap_or(1);
   let mut detector = Detector::new(local, timing);
@@ -778,7 +848,7 @@ async fn probe_peer(
         peer_host,
         fanout,
         probe_nonce,
-        budget,
+        &mut probe_timing,
       )
       .await;
     }
@@ -1547,12 +1617,25 @@ fn count_refusal(kind: &'static str) {
 /// for 1,500 periods while its sole reachable voter was the one just killed;
 /// `docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md`); probing only the copyset left
 /// that voter's liveness known here by gossip alone. Both voter sets are small and bounded (one
-/// representative per region; an elected council), and a dead voter's link and probe idle the moment its
-/// group commits its retirement — which reaching the surviving voters is exactly what makes possible.
+/// representative per region; an elected council).
+///
+/// A peer this node's membership holds **dead** is excluded whatever its role. The voter sets are Raft's
+/// (`all_voters`) and do not shrink when the configuration retires a member (no membership change is
+/// wired), so judged by role alone a dead voter stayed probed and linked for good — its probe session still
+/// counted as formed (`fleet_peers_probed` in `slates status` stayed at two after the owner's death in the
+/// three-process deployment test) and its record link re-dialed into the void, a handshake budget at a
+/// time. A retired peer that comes back is re-admitted alive by its own probes ([`serve_peer_probes`]) and
+/// regains contact then — which is what reaching the surviving voters makes possible.
 pub(crate) fn keeps_direct_contact_with(state: &ShardState, peer: HostId) -> bool {
-  state.fleet.configuration().neighbourhood.contains(&peer)
-    || state.council.is_voter(peer)
-    || state.root.is_voter(peer)
+  let believed_dead = state
+    .fleet
+    .membership()
+    .state(peer)
+    .is_some_and(|belief| belief.liveness == Liveness::Dead);
+  !believed_dead
+    && (state.fleet.configuration().neighbourhood.contains(&peer)
+      || state.council.is_voter(peer)
+      || state.root.is_voter(peer))
 }
 
 /// Keeps one peer's client record session up for the coordinator (§4.8) — a candidate holder's, or a
@@ -3169,4 +3252,73 @@ fn highest_held_epoch(acceptor: &Acceptor, object: ObjectId) -> HostEpoch {
     .map(|(_, _, epoch, _)| epoch)
     .max_by_key(|epoch| epoch.0)
     .unwrap_or(FIRST_EPOCH)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A millisecond in nanoseconds, so the samples read as round times.
+  const MS: u64 = 1_000_000;
+
+  /// The probe deadline follows the design's law, by use: before any sample it is the conservative initial
+  /// probe timeout; a quiet-loopback round trip floors it at the beat; each consecutive miss doubles it; the
+  /// liveness budget caps it however many misses; an acknowledgement resets the backoff; and a slow peer's
+  /// measured round trip raises it above the floor, still within the cap.
+  #[test]
+  fn the_probe_deadline_is_derived_from_the_round_trip_backed_off_and_capped() {
+    let mut timing = ProbeTiming::new();
+    assert_eq!(
+      timing.deadline_ns(),
+      RttEstimator::new().pto(0),
+      "before any sample: the initial probe timeout"
+    );
+    // The measured quiet-loopback probe round trip (p99 17 ms): its probe timeout sits below the beat.
+    timing.acknowledged(17 * MS);
+    assert_eq!(
+      timing.deadline_ns(),
+      HEARTBEAT_NS,
+      "a quiet round trip floors the deadline at the beat"
+    );
+    timing.missed();
+    assert_eq!(
+      timing.deadline_ns(),
+      2 * HEARTBEAT_NS,
+      "one miss doubles it"
+    );
+    timing.missed();
+    assert_eq!(
+      timing.deadline_ns(),
+      4 * HEARTBEAT_NS,
+      "two misses quadruple it"
+    );
+    for _ in 0..8 {
+      timing.missed();
+    }
+    assert_eq!(
+      timing.deadline_ns(),
+      LIVENESS_BUDGET_NS,
+      "however many misses, the liveness budget caps it"
+    );
+    timing.acknowledged(17 * MS);
+    assert_eq!(
+      timing.deadline_ns(),
+      HEARTBEAT_NS,
+      "an acknowledgement resets the backoff"
+    );
+
+    // A slow peer — its acknowledgements take 300 ms — is waited for above the floor, within the cap.
+    let mut slow = ProbeTiming::new();
+    slow.acknowledged(300 * MS);
+    assert!(
+      slow.deadline_ns() > HEARTBEAT_NS && slow.deadline_ns() <= LIVENESS_BUDGET_NS,
+      "a slow peer's deadline follows its round trip: {} ns",
+      slow.deadline_ns()
+    );
+    assert_eq!(
+      slow.deadline_ns(),
+      slow.rtt.pto(0),
+      "above the floor the deadline is the estimator's probe timeout itself"
+    );
+  }
 }

@@ -321,6 +321,30 @@ impl Detector {
     batch
   }
 
+  /// The gossip batch to piggyback on a direct ping to `target`: the ordinary batch
+  /// ([`gossip`](Detector::gossip)) plus, whenever this node currently **suspects** `target`, that
+  /// suspicion — even after its transmit budget is spent (Lifeguard's **buddy system**; memberlist's
+  /// `probeNode` sends a suspect message with every ping to a node it suspects). The suspected member then
+  /// hears it from the very probe it answers and refutes at once, the refutation riding the acknowledgement
+  /// back. Without it a member that comes back from a stall after the suspicion's `λ·ln(n+1)` transmits are
+  /// exhausted is never told it is suspected, never refutes, and is declared dead while answering every probe:
+  /// a direct acknowledgement does not clear a suspicion (only an alive at a higher incarnation does, SWIM
+  /// §4.2), so the refutation is the only way back. The batch stays within `max`: the least-fresh entry makes
+  /// room.
+  pub fn ping_gossip(&mut self, target: HostId, max: usize) -> Vec<(HostId, MemberState)> {
+    let mut batch = self.gossip(max);
+    if let Some(state) = self.membership.state(target)
+      && state.liveness == Liveness::Suspect
+      && !batch.iter().any(|(host, _)| *host == target)
+    {
+      if batch.len() >= max {
+        batch.pop();
+      }
+      batch.insert(0, (target, state));
+    }
+    batch
+  }
+
   /// Applies a received gossip batch, folding each update into the view (and re-enqueueing anything it
   /// adopts so the change spreads onward — the infection continues).
   pub fn apply_gossip(&mut self, updates: &[(HostId, MemberState)]) {
@@ -510,28 +534,45 @@ impl Detector {
     }
   }
 
-  /// The next alive peer to probe, in **randomized** order (SWIM §4). Each round is a fresh shuffled
-  /// permutation of the alive peers, advanced one per period; when the round is exhausted a new
+  /// Whether `member` is one this node probes: alive or suspected — a member until it is dead.
+  fn is_probed(&self, member: HostId) -> bool {
+    matches!(
+      self.membership.state(member).map(|state| state.liveness),
+      Some(Liveness::Alive | Liveness::Suspect)
+    )
+  }
+
+  /// The next peer to probe — alive **or suspected** — in **randomized** order (SWIM §4). A suspected
+  /// member is still a member and is probed until it is dead (SWIM §4.2; memberlist's `probe` skips only
+  /// dead and left nodes): its direct acknowledgement then counts ([`on_ack`](Detector::on_ack) credits the
+  /// member being probed), and each further miss keeps raising the local-health multiplier. Dropping a
+  /// suspect from the rotation left the suspicion to age with no probe going out in the detector's name —
+  /// no acknowledgement could register, the multiplier froze where the first miss left it, and a peer
+  /// starved for two seconds died at a window of four periods instead of the cap's six
+  /// (`docs/bugs/2026-09-13-swim-fixed-probe-deadline-kills-a-starved-live-peer.md`). Each round is a fresh
+  /// shuffled permutation of those peers, advanced one per period; when the round is exhausted a new
   /// permutation is drawn — so every member is probed once per round and the worst-case wait for a first
   /// probe is one round, not the unbounded delay a fixed rotation can suffer. Members that died mid-round
-  /// are skipped, and `None` is returned only when no alive peer remains.
+  /// are skipped, and `None` is returned only when no live-or-suspected peer remains.
   fn next_target(&mut self) -> Option<HostId> {
     loop {
       // Advance through the current shuffled round, skipping any member that died mid-round.
       while self.cursor < self.order.len() {
         let candidate = self.order[self.cursor];
         self.cursor += 1;
-        if self.membership.state(candidate).map(|state| state.liveness) == Some(Liveness::Alive) {
+        if self.is_probed(candidate) {
           return Some(candidate);
         }
       }
-      // The round is exhausted. Draw a fresh permutation from the current alive peers; if none remain,
-      // there is no target. The fresh set is drawn from alive members, so the next pass returns its
-      // first member — the loop makes at most one further pass, and terminates without a step count.
+      // The round is exhausted. Draw a fresh permutation from the current live-or-suspected peers; if none
+      // remain, there is no target. The fresh set is drawn from them, so the next pass returns its first
+      // member — the loop makes at most one further pass, and terminates without a step count.
+      let suspected = self.membership.suspects().into_iter().map(|(host, _)| host);
       let mut fresh: Vec<HostId> = self
         .membership
         .alive()
         .into_iter()
+        .chain(suspected)
         .filter(|host| *host != self.local)
         .collect();
       if fresh.is_empty() {
@@ -695,6 +736,135 @@ mod tests {
     assert!(
       detector.gossip(10).iter().all(|(host, _)| *host != A),
       "after its transmit budget the change is dropped — the buffer is bounded"
+    );
+  }
+
+  /// A suspected member is still probed (SWIM §4.2): the period after a member is suspected still pings it,
+  /// its direct acknowledgement counts as a successful probe (the local health recovers), and a further miss
+  /// keeps worsening the local health (the suspicion window keeps dilating) — it leaves the rotation only when
+  /// it is dead.
+  #[test]
+  fn a_suspected_member_is_still_probed_and_its_acknowledgement_counts() {
+    let mut detector = Detector::new(
+      LOCAL,
+      DetectorTiming {
+        suspicion_periods: 10,
+        gossip_transmits: 2,
+        health_max: 3,
+        suspicion_min: 10,
+        confirmations_expected: 1,
+      },
+    );
+    detector.join(A);
+    detector.tick(); // probe A; A never answers
+    // Suspected on the resolving tick — and that tick still probes it; the miss worsened the local health.
+    let while_suspected = detector.tick();
+    let state = detector.membership().state(A).map(|s| s.liveness);
+    let health = [detector.health_multiplier()];
+    // A further miss keeps worsening the local health, so the suspicion window keeps dilating.
+    let again = detector.tick();
+    let worsened = detector.health_multiplier();
+    // A's direct acknowledgement of the probe it is still sent counts: the local health recovers a step,
+    // while the suspicion itself stands (only the member's refutation clears it, SWIM §4.2).
+    detector.on_ack(A);
+    let after_ack = detector.tick();
+    let recovered = detector.health_multiplier();
+    let still = detector.membership().state(A).map(|s| s.liveness);
+
+    assert_eq!(state, Some(Liveness::Suspect), "A was suspected");
+    assert_eq!(
+      (while_suspected, again, after_ack),
+      (
+        Some(Ping { to: A }),
+        Some(Ping { to: A }),
+        Some(Ping { to: A })
+      ),
+      "a suspected member stays in the probe rotation"
+    );
+    assert_eq!(
+      (health, worsened, recovered),
+      ([2], 3, 2),
+      "each miss worsened the local health and the suspected member's acknowledgement was credited"
+    );
+    assert_eq!(
+      still,
+      Some(Liveness::Suspect),
+      "an acknowledgement alone does not clear a suspicion"
+    );
+  }
+
+  /// A dead member leaves the probe rotation: with its only peer dead, the detector has nothing to probe.
+  #[test]
+  fn a_dead_member_is_not_probed() {
+    let mut detector = Detector::new(LOCAL, timing(2, 2));
+    detector.join(A);
+    assert_eq!(
+      detector.tick(),
+      Some(Ping { to: A }),
+      "an alive peer is probed"
+    );
+    detector.apply(
+      A,
+      MemberState {
+        liveness: Liveness::Dead,
+        incarnation: 0,
+      },
+    );
+    assert_eq!(detector.tick(), None, "a dead member is not probed");
+  }
+
+  /// Lifeguard's buddy system: a direct ping to a member this node **suspects** carries the suspicion even
+  /// after its gossip transmit budget is spent, so the member can refute it from the very probe it answers —
+  /// a member that comes back late is told it is suspected rather than dying while answering every probe.
+  #[test]
+  fn a_ping_to_a_suspected_member_always_carries_the_suspicion() {
+    // One transmit per change: the suspicion's ordinary dissemination is spent after a single batch.
+    let mut detector = Detector::new(LOCAL, timing(10, 1));
+    detector.join(A);
+    detector.tick(); // probe A
+    detector.tick(); // A never answered: suspected, the suspicion enqueued for its one transmit
+    let suspicion = detector.membership().state(A).expect("A is known");
+    assert_eq!(suspicion.liveness, Liveness::Suspect);
+
+    let first = detector.ping_gossip(A, 10);
+    assert!(
+      first.contains(&(A, suspicion)),
+      "the first ping carries the suspicion (its one transmit)"
+    );
+    assert!(
+      detector.gossip(10).iter().all(|(host, _)| *host != A),
+      "the transmit budget is spent: ordinary gossip no longer carries it"
+    );
+    let again = detector.ping_gossip(A, 10);
+    assert!(
+      again.contains(&(A, suspicion)),
+      "a ping to the suspected member still carries the suspicion — the buddy system"
+    );
+
+    // A ping to another member gets only the ordinary batch — the suspicion is not injected into it.
+    detector.join(B);
+    let other = detector.ping_gossip(B, 10);
+    assert!(
+      other.iter().all(|(host, _)| *host != A),
+      "a ping to a member not suspected carries no injected suspicion"
+    );
+
+    // Once A refutes (alive at a higher incarnation) the injection stops: after the refutation's own single
+    // transmit, a ping to A carries nothing about it.
+    detector.apply(
+      A,
+      MemberState {
+        liveness: Liveness::Alive,
+        incarnation: suspicion.incarnation + 1,
+      },
+    );
+    let _ = detector.gossip(10);
+    assert!(
+      detector
+        .ping_gossip(A, 10)
+        .iter()
+        .all(|(host, _)| *host != A),
+      "a refuted suspicion is no longer injected"
     );
   }
 
