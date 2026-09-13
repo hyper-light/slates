@@ -163,7 +163,10 @@ fn run_distributed_membership_change() -> Outcome {
       }
 
       // Propose a membership change; at more than one voter it commits and applies only over the wire.
-      let proposed = leader.propose(Reconfiguration::Admit(ADMITTED));
+      let proposed = leader.propose(Reconfiguration::Admit {
+        host: ADMITTED,
+        domain: None,
+      });
 
       // Round one replicates the entry (the voter appends, the leader commits at the majority); round two's
       // heartbeat carries the advanced commit index, so the voter applies too.

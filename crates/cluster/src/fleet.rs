@@ -490,8 +490,8 @@ mod tests {
       3,
       false,
     );
-    regional.admit(A, 3);
-    regional.admit(B, 3);
+    regional.admit(A, None, 3);
+    regional.admit(B, None, 3);
     install_regional(&mut node, &regional);
     assert!(node.configuration().neighbourhood.contains(&A));
     assert!(node.configuration().neighbourhood.contains(&B));

@@ -485,6 +485,30 @@ impl Daemon {
     })
   }
 
+  /// The failure domains the regional configuration currently declares, by member (§4.8, D-14 — copysets
+  /// form across distinct domains); a member absent from the map is unique-per-host. A one-shot
+  /// control-shard query ([`Self::observe`]); `None` when the daemon could not observe it. Exposed so a
+  /// fleet test can prove a restarted node's new member id inherited its node's declared domain through the
+  /// council's admission (task #22).
+  pub fn council_domains(
+    &self,
+  ) -> Option<std::collections::BTreeMap<slates_db::HostId, slates_db::register::DomainId>> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| s.council.configuration().domains.clone())
+    })
+  }
+
+  /// The refusals this daemon's control shard has counted, by kind — the same counts `slates status`
+  /// reports (§4.14): a peer refused at a serve socket, a serve bind that failed, a membership announcement
+  /// whose generation was stale or whose member id did not derive from its certificate (task #22), and the
+  /// rest. A one-shot control-shard query ([`Self::observe`]); `None` when the daemon could not observe it.
+  /// Exposed so a test proves a refusal was counted rather than silently absorbed (banned item 9).
+  pub fn fleet_refusals(&self) -> Option<std::collections::BTreeMap<&'static str, u64>> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| s.refusals.clone())
+    })
+  }
+
   /// Whether this daemon leads the **root group** across regions (§4.8, D-14 — the root master). A one-shot
   /// control-shard query ([`Self::observe`]); `None` when the daemon could not observe it — unknown, never
   /// "not the leader". Exposed so a fleet test can prove the root group elected a leader over the transport.

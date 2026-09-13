@@ -94,8 +94,8 @@ use slates_db::catalog::{
   PlacementState, SnapshotId as DbSnapshotId, VolumeId as DbVolumeId, VolumeRecord,
 };
 use slates_db::register::{
-  Acceptor, Authority, FIRST_EPOCH, HostEpoch, HostId, ObjectId, Placement, Prepare, Quorum,
-  Record, RegionId, candidates_for, encode_refusal,
+  Acceptor, Authority, DomainId, FIRST_EPOCH, HostEpoch, HostId, ObjectId, Placement, Prepare,
+  Quorum, Record, RegionId, candidates_for, encode_refusal,
 };
 use slates_rt::futures;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
@@ -351,6 +351,33 @@ fn learn_member(
     }
   }
   outcome
+}
+
+/// The failure domain the fleet configuration declares for the node behind member `host`, if any (§4.8, D-14
+/// — copysets form across distinct domains; `None` is unique-per-host). The declaration is keyed by each
+/// node's generation-0 seed id (the manifest precomputes `member_id(anchor, 0)` per node), so a member
+/// announced at a later generation — a restart, or an anchored daemon's first boot — is resolved to its node
+/// through the anchor it was learned under (this node's own through its origin anchor) and looked up by that
+/// node's seed (task #22: the new id inherits the node's domain, since the domain is the node's, not the
+/// incarnation's). No fleet configuration, or no declaration for the node, is `None`.
+fn declared_domain(state: &ShardState, host: HostId) -> Option<DomainId> {
+  let fleet = state.config.fleet.as_ref()?;
+  if let Some(domain) = fleet.domains.get(&host) {
+    return Some(*domain);
+  }
+  let anchor = if host == state.fleet.host() {
+    state.origin_anchor
+  } else {
+    state
+      .learned_members
+      .iter()
+      .find(|(_, learned)| learned.host == host)
+      .map(|(anchor, _)| *anchor)?
+  };
+  fleet
+    .domains
+    .get(&crate::deploy::member_id(anchor, 0))
+    .copied()
 }
 
 /// The member id currently learned for `anchor` (task #22): the control shard's learned map, `None` off it
@@ -1126,26 +1153,19 @@ async fn serve_peer_records(mut endpoint: Endpoint, local: HostId, roster: Vec<R
   if endpoint.establish().await.is_err() {
     return;
   }
-  // Two ids for the authenticated peer (task #22 two-id model). `peer_anchor` is its **stable** cert-anchor
-  // (`host_id_of_certificate` of the very certificate it presented — the RIFL completion origin keys on it, so
-  // a forwarded write stays exactly-once across the forwarding node's restart). Its **ephemeral** member id —
-  // what records and ownership key on — is whatever is currently learned for its rostered anchor (its seed
-  // until it announces itself; a restart moves it), resolved per request so a node that restarted mid-session
-  // is served under the id it now writes as.
-  let Some((rostered_anchor, seed, peer_anchor)) =
-    endpoint.peer_certificate().and_then(|presented| {
-      roster
-        .iter()
-        .find(|peer| peer.certificate == presented)
-        .map(|peer| {
-          (
-            peer.anchor,
-            peer.seed,
-            crate::deploy::host_id_of_certificate(&presented),
-          )
-        })
-    })
-  else {
+  // Two ids for the authenticated peer (task #22 two-id model). `peer_anchor` is its **stable** anchor — the
+  // one the roster holds for the certificate it presented, the same anchor its member ids derive from and its
+  // announcements are validated against, so every plane names the node by one id. The RIFL completion origin
+  // keys on it, so a forwarded write stays exactly-once across the forwarding node's restart. Its **ephemeral**
+  // member id — what records and ownership key on — is whatever is currently learned for that anchor (its
+  // seed until it announces itself; a restart moves it), resolved per request so a node that restarted
+  // mid-session is served under the id it now writes as.
+  let Some((peer_anchor, seed)) = endpoint.peer_certificate().and_then(|presented| {
+    roster
+      .iter()
+      .find(|peer| peer.certificate == presented)
+      .map(|peer| (peer.anchor, peer.seed))
+  }) else {
     count_refusal(ACCEPT_REFUSED);
     return;
   };
@@ -1169,7 +1189,7 @@ async fn serve_peer_records(mut endpoint: Endpoint, local: HostId, roster: Vec<R
               state::with_state(|s| {
                 let peer_host = s
                   .learned_members
-                  .get(&rostered_anchor)
+                  .get(&peer_anchor)
                   .map_or(seed, |learned| learned.host);
                 accept_held_record(s, local, peer_host, &record)
               })
@@ -2527,9 +2547,16 @@ async fn drive_config_council(
     // As the region's configuration master, track its membership from this node's own SWIM view: propose
     // any admit or retire, which the replication below commits over the transport and applies on every
     // voter. Only the leader proposes (`reconcile_alive`); it probes every member, so a follower's own
-    // detection need not.
+    // detection need not. Each alive member is proposed with the failure domain its node declares, so an
+    // admission — a restarted node's new id among them (task #22) — carries the domain into the configuration.
     state::with_state(|s| {
-      let alive = s.fleet.membership().alive();
+      let alive: Vec<(HostId, Option<DomainId>)> = s
+        .fleet
+        .membership()
+        .alive()
+        .into_iter()
+        .map(|host| (host, declared_domain(s, host)))
+        .collect();
       s.council.reconcile_alive(&alive)
     });
     drive_council_replication(&others, budget, in_flight).await;

@@ -21,9 +21,9 @@
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::PrivateKeyDer;
-use slates_anchor::AnchorSegment;
+use slates_anchor::{AnchorSegment, Geometry};
 use slates_db::HostId;
-use slates_db::register::{ObjectId, Quorum, RegionId, rendezvous_first};
+use slates_db::register::{DomainId, ObjectId, Quorum, RegionId, rendezvous_first};
 use slates_ipc::protocol::{
   Direction, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass, SnapshotId, VolumeId, pack,
   unpack,
@@ -687,27 +687,28 @@ fn a_restarted_peer_rejoins_under_a_new_member_id_and_the_old_is_retired() {
 
 /// Two identities from one certificate and key — what a node presents before and after a restart: the same
 /// operator-provisioned certificate (its stable anchor), a fresh process (a new generation).
-fn same_identity_twice() -> (Identity, Identity) {
+fn same_identity(count: usize) -> Vec<Identity> {
   let key = rcgen::KeyPair::generate().unwrap();
   let cert = rcgen::CertificateParams::new(vec![NAME.to_owned()])
     .unwrap()
     .self_signed(&key)
     .unwrap();
   let der = PrivateKeyDer::try_from(key.serialize_der()).unwrap();
-  (
-    Identity::from_der(cert.der().clone(), der.clone_key()),
-    Identity::from_der(cert.der().clone(), der),
-  )
+  (0..count)
+    .map(|_| Identity::from_der(cert.der().clone(), der.clone_key()))
+    .collect()
 }
 
 /// One fleet node's configuration at `f = 1` on one shard: its `host` (the generation-0 seed the daemon
-/// overrides with its real generation), its stable `anchor`, and its `peers` by their seed ids.
+/// overrides with its real generation), its stable `anchor`, its `peers` by their seed ids, and the failure
+/// `domains` the deployment declares by seed id (a node absent is unique-per-host).
 fn fleet_config(
   profile: &MachineProfile,
   instance: &str,
   anchor: HostId,
   host: HostId,
   peers: &[FleetPeer],
+  domains: &std::collections::BTreeMap<HostId, DomainId>,
 ) -> DaemonConfig {
   DaemonConfig::derive(profile, instance)
     .with_shards(1)
@@ -716,11 +717,39 @@ fn fleet_config(
       peers: peers.iter().map(|peer| peer.host).collect(),
       host,
       origin_anchor: anchor,
-      domains: std::collections::BTreeMap::new(),
+      domains: domains.clone(),
       regions: std::collections::BTreeMap::new(),
       durability: None,
       region_mirrors: std::collections::BTreeMap::new(),
     })
+}
+
+/// An anchor segment on which the anchor has recorded one daemon start — `record_start` is what increments
+/// the generation before every daemon start — so the daemon that attaches it boots at generation one and
+/// derives `member_id(anchor, 1)` as its own id: the real restart path, the test playing the anchor (as the
+/// client restart oracle does). The start stamp is the anchor's clock reading, immaterial with no anchor to
+/// read it. Returns the handoff to start the daemon over, and the segment, which must outlive the daemon.
+fn generation_one_segment(
+  name: &str,
+  profile: &MachineProfile,
+  geometry: Geometry,
+  pid: u32,
+) -> (SegmentSource, AnchorSegment) {
+  let segment = AnchorSegment::create(name, &profile.facts.identity, geometry)
+    .expect("the generation-one anchor segment");
+  segment
+    .supervision()
+    .expect("the segment's supervision block")
+    .record_start(u64::from(pid), 0, false);
+  let (handoff, len) = segment.handoff().expect("the segment hands off");
+  (
+    SegmentSource::Handoff {
+      handoff,
+      len,
+      content: None,
+    },
+    segment,
+  )
 }
 
 /// Starts one fleet daemon serving on its own `bind` pair and dialing each of `peers` where its entry says —
@@ -807,7 +836,15 @@ fn assert_restart_learned(formed: bool, knew_old: bool, learned: &Learned) {
     learned.meshed_to_new,
     "the probe mesh formed to the restarted node under its new id — it is probed, not merely believed"
   );
+  assert!(
+    learned.domain_carried,
+    "the admission carried B's declared failure domain to its new id — the domain is the node's, not the incarnation's"
+  );
 }
+
+/// Shape: the failure domain the restart scenario declares for node B (any id distinct from unique-per-host),
+/// so the restarted node's new member id must be seen to inherit it through the council's admission.
+const RESTARTED_NODE_DOMAIN: DomainId = 7;
 
 /// The takeover half of the restart scenario's verdict: the old id's volume placed on, served by, and read
 /// back from the survivor that took it over.
@@ -841,6 +878,8 @@ struct RestartFleet {
   b_again_serve: (u16, u16),
   /// The restart's peer entries, taken by [`restart_b`].
   peers_of_b_again: Vec<FleetPeer>,
+  /// The failure domains the deployment declares, by seed id: B's node in [`RESTARTED_NODE_DOMAIN`].
+  domains: std::collections::BTreeMap<HostId, DomainId>,
   instance_a: String,
   instance_c: String,
   instance_b_again: String,
@@ -875,7 +914,10 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
   let (profile_a, host_a, identity_a) = fleet_node("a");
   let (profile_c, host_c, identity_c) = fleet_node("c");
   let (profile_b, host_b, _) = fleet_node("b");
-  let (b_first, b_again) = same_identity_twice();
+  let mut b_identities = same_identity(2).into_iter();
+  let (Some(b_first), Some(b_again)) = (b_identities.next(), b_identities.next()) else {
+    panic!("B's identity twice");
+  };
   let anchor_a = anchor_of(&profile_a);
   let anchor_b = anchor_of(&profile_b);
   let anchor_c = anchor_of(&profile_c);
@@ -906,9 +948,34 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
   let instance_b = format!("fleet3-{}-{pid}", host_b.0);
   let instance_c = format!("fleet3-{}-{pid}", host_c.0);
   let instance_b_again = format!("fleet3-{}-{pid}", b_new.0);
-  let config_a = fleet_config(&profile_a, &instance_a, anchor_a, host_a, &peers_of_a);
-  let config_b = fleet_config(&profile_b, &instance_b, anchor_b, host_b, &peers_of_b);
-  let config_c = fleet_config(&profile_c, &instance_c, anchor_c, host_c, &peers_of_c);
+  // The deployment declares B's node in a failure domain (by its seed id, as a manifest does); the restart's
+  // new id must inherit it through its admission.
+  let domains: std::collections::BTreeMap<HostId, DomainId> =
+    [(host_b, RESTARTED_NODE_DOMAIN)].into_iter().collect();
+  let config_a = fleet_config(
+    &profile_a,
+    &instance_a,
+    anchor_a,
+    host_a,
+    &peers_of_a,
+    &domains,
+  );
+  let config_b = fleet_config(
+    &profile_b,
+    &instance_b,
+    anchor_b,
+    host_b,
+    &peers_of_b,
+    &domains,
+  );
+  let config_c = fleet_config(
+    &profile_c,
+    &instance_c,
+    anchor_c,
+    host_c,
+    &peers_of_c,
+    &domains,
+  );
   let fresh = |host: HostId| SegmentSource::Create {
     name: format!("slates-seg-fleet3-{}-{pid}", host.0),
   };
@@ -967,6 +1034,7 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
     b_again: Some(b_again),
     b_again_serve,
     peers_of_b_again,
+    domains,
     instance_a,
     instance_c,
     instance_b_again,
@@ -979,10 +1047,8 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
 }
 
 /// Restarts B: a second daemon with B's certificate attaches an anchor segment on which the anchor has
-/// recorded the start — `record_start` is what increments the generation before every daemon start — so it
-/// derives `member_id(anchor_B, 1)` as its own id. The real restart path, the test playing the anchor (as the
-/// client restart oracle does); the start stamp is the anchor's clock reading, immaterial with no anchor to
-/// read it. The segment is returned so it outlives the daemon.
+/// recorded the start ([`generation_one_segment`]), so it derives `member_id(anchor_B, 1)` as its own id.
+/// The segment is returned so it outlives the daemon.
 fn restart_b(fleet: &mut RestartFleet, pid: u32) -> (Daemon, AnchorSegment) {
   let peers = std::mem::take(&mut fleet.peers_of_b_again);
   let identity = fleet
@@ -995,29 +1061,21 @@ fn restart_b(fleet: &mut RestartFleet, pid: u32) -> (Daemon, AnchorSegment) {
     fleet.anchor_b,
     fleet.host_b,
     &peers,
+    &fleet.domains,
   );
-  let segment = AnchorSegment::create(
+  let (source, segment) = generation_one_segment(
     &format!("slates-seg-fleet3-again-{}-{pid}", fleet.host_b.0),
-    &fleet.profile_b.facts.identity,
+    &fleet.profile_b,
     config.geometry,
-  )
-  .expect("the restart's anchor segment");
-  segment
-    .supervision()
-    .expect("the segment's supervision block")
-    .record_start(u64::from(pid), 0, false);
-  let (handoff, len) = segment.handoff().expect("the segment hands off");
+    pid,
+  );
   let daemon = start_fleet_node(
     &fleet.profile_b,
     config,
     identity,
     fleet.b_again_serve,
     peers,
-    SegmentSource::Handoff {
-      handoff,
-      len,
-      content: None,
-    },
+    source,
   );
   (daemon, segment)
 }
@@ -1028,6 +1086,7 @@ struct Learned {
   retired_old: bool,
   committed: bool,
   meshed_to_new: bool,
+  domain_carried: bool,
 }
 
 /// Whether every survivor's observed alive membership satisfies `predicate` (an unobservable one never does).
@@ -1048,8 +1107,21 @@ fn all_council(survivors: &[Daemon], predicate: impl Fn(&[HostId]) -> bool) -> b
   })
 }
 
+/// Whether every survivor's observed committed failure-domain map satisfies `predicate`.
+fn all_domains(
+  survivors: &[Daemon],
+  predicate: impl Fn(&std::collections::BTreeMap<HostId, DomainId>) -> bool,
+) -> bool {
+  survivors.iter().all(|daemon| {
+    daemon
+      .council_domains()
+      .is_some_and(|domains| predicate(&domains))
+  })
+}
+
 /// Polls the survivors until they learn the restart: the new id admitted, the old retired, both committed into
-/// the regional configuration, and the probe mesh formed to the new incarnation on every side.
+/// the regional configuration, the probe mesh formed to the new incarnation on every side, and the node's
+/// declared failure domain carried to the new id by its admission.
 fn observe_learned(observed: &[&Daemon], fleet: &RestartFleet, b_again: &Daemon) -> Learned {
   let (host_b, b_new) = (fleet.host_b, fleet.b_new);
   let survivors = &fleet.survivors;
@@ -1070,11 +1142,17 @@ fn observe_learned(observed: &[&Daemon], fleet: &RestartFleet, b_again: &Daemon)
       .all(|daemon| daemon.fleet_meshed() == Some(true))
       && b_again.fleet_meshed() == Some(true)
   });
+  let domain_carried = poll_until(observed, COUNCIL_RETIRE_DEADLINE, || {
+    all_domains(survivors, |domains| {
+      domains.get(&b_new) == Some(&RESTARTED_NODE_DOMAIN)
+    })
+  });
   Learned {
     admitted_new,
     retired_old,
     committed,
     meshed_to_new,
+    domain_carried,
   }
 }
 
@@ -1092,6 +1170,261 @@ fn successor_serves(observed: &[&Daemon], fleet: &RestartFleet) -> (bool, bool, 
   let served = poll_status_answers(observed, instance, fleet.id);
   let got = served.then(|| read_hello_over_nfs(daemon, &fleet.name));
   (head_placed, served, got)
+}
+
+/// The refusals the serve side counts for a membership announcement it will not fold (task #22), under the
+/// keys `Daemon::fleet_refusals` reports them — the same counts `slates status` prints.
+const STALE_GENERATION_REFUSAL: &str = "fleet.member_generation_stale";
+const FORGED_ID_REFUSAL: &str = "fleet.member_id_forged";
+
+/// Shape: the anchor the forged announcer is configured with — B's anchor with its lowest bit flipped, any
+/// anchor other than the one A's roster holds for B's certificate.
+fn forged_anchor_of(anchor: HostId) -> HostId {
+  HostId(anchor.0 ^ 1)
+}
+
+/// AC (§4.8 "Recovery" — "a restarted host rejoins as a new member and holds nothing until its generation
+/// ... [is] validated"; task #22, **over the wire**): an announcement whose generation is **stale**, or whose
+/// member id is not the one the announcer's certificate derives to (**forged**), is refused at the serve side
+/// — counted in the refusals `slates status` reports, never folded into membership, and never acknowledged.
+/// A and B form, B at generation one (its anchor segment recorded a start, as the anchor does before every
+/// daemon start), so A learns `member_id(anchor_B, 1)`. Then two more daemons present **B's certificate** to
+/// A: one on a fresh segment — generation zero, B's seed id: a stale or replayed boot — and one configured
+/// with an anchor that is not the one A's roster holds for B's certificate, so the id it announces is one
+/// B's certificate cannot derive — a forgery, from a holder of B's key, the strongest position a forger can
+/// hold. Non-vacuous: A's `fleet.member_generation_stale` and `fleet.member_id_forged` refusals both move;
+/// A's alive membership holds exactly {A, B at generation one} once both were counted — the stale seed and
+/// the forged id never enter it; and the two refused announcers, never acknowledged, age A to death in their
+/// own views — a refusal is silence, not an answer the announcer could count itself alive from.
+#[test]
+fn a_stale_or_forged_announcement_is_refused_and_counted() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let mut fleet = refusal_fleet_forms(pid);
+  let (host_a, b_new, anchor_b) = (fleet.host_a, fleet.b_new, fleet.anchor_b);
+  let learned_new = poll_until(&[&fleet.daemon_a, &fleet.daemon_b], REJOIN_DEADLINE, || {
+    knows_exactly(&fleet.daemon_a, &[host_a, b_new]) && fleet.daemon_a.fleet_meshed() == Some(true)
+  });
+  let stale = announce_as_b(&mut fleet, anchor_b, pid);
+  let forged = announce_as_b(&mut fleet, forged_anchor_of(anchor_b), pid);
+  let refused = observe_refused(&fleet, &stale, &forged);
+  stale.stop();
+  forged.stop();
+  fleet.daemon_b.stop();
+  fleet.daemon_a.stop();
+  drop(fleet.segment_b);
+  assert!(
+    learned_new,
+    "A learned B's generation-one id on contact and its mesh formed to it"
+  );
+  assert_refused(&refused);
+}
+
+/// The refusal scenario's fleet: A and B (B at generation one) running, and what the two announcers that
+/// present B's certificate need — its profile, two more copies of its identity, the entry for A they dial,
+/// and the serve pairs they bind.
+struct RefusalFleet {
+  daemon_a: Daemon,
+  daemon_b: Daemon,
+  /// B's generation-one segment, which outlives its daemon.
+  segment_b: AnchorSegment,
+  host_a: HostId,
+  anchor_a: HostId,
+  b_new: HostId,
+  anchor_b: HostId,
+  profile_b: MachineProfile,
+  cert_a: rustls::pki_types::CertificateDer<'static>,
+  serve_a: (u16, u16),
+  /// B's identity twice more — one per announcer, taken in turn.
+  b_identities: Vec<Identity>,
+  /// The serve pairs the announcers bind, taken in turn.
+  announcer_serve: Vec<(u16, u16)>,
+}
+
+/// Starts A on a fresh segment and B on a generation-one anchor segment, each dialing the other.
+fn refusal_fleet_forms(pid: u32) -> RefusalFleet {
+  let (profile_a, host_a, identity_a) = fleet_node("a");
+  let (profile_b, host_b, _) = fleet_node("b");
+  let mut b_identities = same_identity(3);
+  let identity_b = b_identities.pop().expect("B's identity three times");
+  let anchor_a = anchor_of(&profile_a);
+  let anchor_b = anchor_of(&profile_b);
+  let b_new = member_id(anchor_b, 1);
+  let serve = mesh_serve_ports(4);
+  let cert_a = identity_a.certificate();
+  let cert_b = identity_b.certificate();
+  let peers_of_a = vec![fleet_peer_at(anchor_b, host_b, serve[1], &cert_b)];
+  let peers_of_b = vec![fleet_peer_at(anchor_a, host_a, serve[0], &cert_a)];
+  let no_domains = std::collections::BTreeMap::new();
+  let instance_a = format!("refusal-{}-{pid}", host_a.0);
+  let instance_b = format!("refusal-{}-{pid}", b_new.0);
+  let config_a = fleet_config(
+    &profile_a,
+    &instance_a,
+    anchor_a,
+    host_a,
+    &peers_of_a,
+    &no_domains,
+  );
+  let config_b = fleet_config(
+    &profile_b,
+    &instance_b,
+    anchor_b,
+    host_b,
+    &peers_of_b,
+    &no_domains,
+  );
+  let daemon_a = start_fleet_node(
+    &profile_a,
+    config_a,
+    identity_a,
+    serve[0],
+    peers_of_a,
+    SegmentSource::Create {
+      name: format!("slates-seg-{instance_a}"),
+    },
+  );
+  let (source_b, segment_b) = generation_one_segment(
+    &format!("slates-seg-{instance_b}"),
+    &profile_b,
+    config_b.geometry,
+    pid,
+  );
+  let daemon_b = start_fleet_node(
+    &profile_b, config_b, identity_b, serve[1], peers_of_b, source_b,
+  );
+  RefusalFleet {
+    daemon_a,
+    daemon_b,
+    segment_b,
+    host_a,
+    anchor_a,
+    b_new,
+    anchor_b,
+    profile_b,
+    cert_a,
+    serve_a: serve[0],
+    b_identities,
+    announcer_serve: vec![serve[2], serve[3]],
+  }
+}
+
+/// Starts a daemon presenting **B's certificate** to A, configured with `anchor` and its generation-zero id
+/// on a fresh segment, dialing A. With B's own anchor it announces B's seed at generation zero — **stale**, A
+/// having learned generation one. With any other anchor it announces an id B's certificate does not derive
+/// to — **forged**.
+fn announce_as_b(fleet: &mut RefusalFleet, anchor: HostId, pid: u32) -> Daemon {
+  let host = member_id(anchor, 0);
+  let identity = fleet.b_identities.pop().expect("an identity per announcer");
+  let serve = fleet
+    .announcer_serve
+    .pop()
+    .expect("a serve pair per announcer");
+  let instance = format!("refusal-{}-{pid}", host.0);
+  let peers = vec![fleet_peer_at(
+    fleet.anchor_a,
+    fleet.host_a,
+    fleet.serve_a,
+    &fleet.cert_a,
+  )];
+  let config = fleet_config(
+    &fleet.profile_b,
+    &instance,
+    anchor,
+    host,
+    &peers,
+    &std::collections::BTreeMap::new(),
+  );
+  start_fleet_node(
+    &fleet.profile_b,
+    config,
+    identity,
+    serve,
+    peers,
+    SegmentSource::Create {
+      name: format!("slates-seg-{instance}"),
+    },
+  )
+}
+
+/// Whether `daemon`'s observed alive membership is exactly `expected` (an unobservable one never is).
+fn knows_exactly(daemon: &Daemon, expected: &[HostId]) -> bool {
+  daemon.fleet_members().is_some_and(|members| {
+    members.len() == expected.len() && expected.iter().all(|host| members.contains(host))
+  })
+}
+
+/// The count A's control shard reports for one refusal `kind` — zero when unobservable, so a poll on it waits.
+fn refusal_count(daemon: &Daemon, kind: &str) -> u64 {
+  daemon
+    .fleet_refusals()
+    .and_then(|refusals| refusals.get(kind).copied())
+    .unwrap_or(0)
+}
+
+/// What A and the two announcers showed once both had announced.
+struct Refused {
+  stale_counted: bool,
+  forged_counted: bool,
+  membership_held: bool,
+  stale_unanswered: bool,
+  forged_unanswered: bool,
+}
+
+/// Polls A until both refusals are counted, then holds its membership over a settle window, and waits for
+/// each announcer — never acknowledged — to age A to death in its own view.
+fn observe_refused(fleet: &RefusalFleet, stale: &Daemon, forged: &Daemon) -> Refused {
+  let a = &fleet.daemon_a;
+  let observed: Vec<&Daemon> = vec![a, &fleet.daemon_b, stale, forged];
+  let (host_a, b_new) = (fleet.host_a, fleet.b_new);
+  let stale_counted = poll_until(&observed, REJOIN_DEADLINE, || {
+    refusal_count(a, STALE_GENERATION_REFUSAL) >= 1
+  });
+  let forged_counted = poll_until(&observed, REJOIN_DEADLINE, || {
+    refusal_count(a, FORGED_ID_REFUSAL) >= 1
+  });
+  let membership_held = holds_for(FORMATION_SETTLE, || knows_exactly(a, &[host_a, b_new]));
+  let aged_a = |announcer: &Daemon| {
+    poll_until(&observed, RETIREMENT_DEADLINE, || {
+      announcer
+        .fleet_members()
+        .is_some_and(|members| !members.contains(&host_a))
+    })
+  };
+  let stale_unanswered = aged_a(stale);
+  let forged_unanswered = aged_a(forged);
+  Refused {
+    stale_counted,
+    forged_counted,
+    membership_held,
+    stale_unanswered,
+    forged_unanswered,
+  }
+}
+
+/// The refusal scenario's verdict, each assertion named so a failure says which part of the refusal did not
+/// happen.
+fn assert_refused(refused: &Refused) {
+  assert!(
+    refused.stale_counted,
+    "A counted the generation-zero announcement as `fleet.member_generation_stale`"
+  );
+  assert!(
+    refused.forged_counted,
+    "A counted the announcement from the wrong anchor as `fleet.member_id_forged`"
+  );
+  assert!(
+    refused.membership_held,
+    "A's alive membership held exactly {{A, B at generation one}}: neither the stale seed nor the forged id was folded"
+  );
+  assert!(
+    refused.stale_unanswered,
+    "the stale announcer was never acknowledged — A aged to death in its view"
+  );
+  assert!(
+    refused.forged_unanswered,
+    "the forged announcer was never acknowledged — A aged to death in its view"
+  );
 }
 
 /// `count` distinct free localhost UDP ports, all bound at once so the OS hands back distinct ports, then
