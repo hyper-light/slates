@@ -1594,7 +1594,7 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 > voter outside a node's copyset was **unreachable from it by construction**; an election still won
 > through the in-copyset voters, and the first loss that removed them left a leader that could never
 > regain a majority (0 replication rounds in 1516 periods under load). Fixed: the dial set is the
-> neighbourhood or a council/root voter (`keeps_record_session_to`, `server/src/fleet.rs`); the by-use
+> neighbourhood or a council/root voter (`keeps_direct_contact_with`, `server/src/fleet.rs`); the by-use
 > proof `a_root_learner_fetches_the_committed_region_membership_over_the_transport` converges in 5.37 s
 > under 12 busy-spin processes where it capped before. Found and fixed on the way: `broadcast` dropped
 > its stragglers at its progress-aware stop (now the record plane's shape — a `Dispatch` per round, a
@@ -1603,8 +1603,11 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 > and the daemon's test-facing `observe`/`observe_peer_dead` swallowing `ControlFull` under load. The
 > RTT-derived election timeout named under "Derived constants" was **measured inert on one host** (SWIM
 > RTT p99 17 ms, consensus broadcast p99 33 ms, both inside a 100 ms heartbeat) — owed for a real WAN; the
-> 10× heartbeat ratio remains. Owed: driving `check_quorum` from the coordinator; `Option`-typed
-> observation accessors; SWIM probing of consensus voters outside the copyset. Record:
+> 10× heartbeat ratio remains. Follow-up, same day: `check_quorum` is driven from the coordinator on the
+> election-timeout cadence (a leader that hears from no majority in a window steps down; unit-tested in both
+> groups), and SWIM probes consensus voters directly (`keeps_direct_contact_with`: one predicate for the
+> record link, the probe's resume and retire-on-fold, and the formation gate). Owed: `Option`-typed
+> observation accessors. Record:
 > `docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md`.
 
 **Role.** The authoritative record of volumes, snapshots, lineage, leases, attachments,

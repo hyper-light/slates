@@ -30,7 +30,7 @@ A measurement artefact prolonged the misdiagnosis and is recorded so it is not r
 
 ## Fix
 
-`crates/server/src/fleet.rs`: `keeps_record_session_to(state, peer)` — the set of peers this node keeps a record session to is everything `take_sessions` is ever asked for: the record neighbourhood **or a voter of this region's council or of the root group**. `establish_record_link`'s retire predicate uses it. A learner reaches voters to fetch; a voter reaches voters to replicate and elect. Both voter sets are small and bounded (one representative per region; an elected council), and a dead voter's link idles the moment its group commits its retirement — which reaching the surviving voters is exactly what makes possible.
+`crates/server/src/fleet.rs`: `keeps_direct_contact_with(state, peer)` — the set of peers this node keeps a record session to is everything `take_sessions` is ever asked for: the record neighbourhood **or a voter of this region's council or of the root group**. `establish_record_link`'s retire predicate uses it. A learner reaches voters to fetch; a voter reaches voters to replicate and elect. Both voter sets are small and bounded (one representative per region; an elected council), and a dead voter's link idles the moment its group commits its retirement — which reaching the surviving voters is exactly what makes possible.
 
 ## Sibling fixes shipped in the same change (each a real defect, none this bug's cause)
 
@@ -38,11 +38,16 @@ A measurement artefact prolonged the misdiagnosis and is recorded so it is not r
 - **Raft Figure 2 follower timer-resets** (`crates/cluster/src/config_group.rs`, `root_group.rs`, `answer`): a **granted vote** advances `leader_contact`; a **current-or-newer-term append** advances it **even when the log-consistency check rejects it** (`append_term >= reply.term`), replacing the `reply.success`-only gate. Four by-use unit tests.
 - **The daemon's test-facing API no longer swallows `ControlFull`** (`crates/server/src/daemon.rs`). `observe` and `observe_peer_dead` spawn a task onto the control shard through its bounded control channel, which under load is routinely full; a refused spawn returned `None`/nothing at once — the harness's own false negative under exactly the load it exists to prove robustness against (an injected death that never landed; a leader that "was not"; a region membership "empty", which the `learned` predicate would read as *learned*). `spawn_admitted` retries until admitted or the budget elapses, parking a tenth of a period between attempts — the tree's policy for a full control channel is backpressure, never a drop (`verbs::forward`; `fleet::fan_configs_to_shards`). `observe_peer_dead` now returns whether the death landed and folded within the observe budget, and the test asserts it.
 
-## Sibling findings (reported, not fixed here)
+## Sibling findings
 
-- `Raft::check_quorum` (CheckQuorum, §6.2) is implemented and unit-tested but never driven by the coordinator, so a leader cut off from its followers never steps down.
-- The observation accessors (`root_regions`, `root_leads`, …) map a *genuine* observe timeout to a default value (empty / `false`); a predicate like `!root_regions().contains(&lost)` is then true on a wedged shard. The honest type is `Option<T>`, with the poll treating `None` as "not yet"; owed.
-- SWIM probes follow the same record neighbourhood, so a node learns a consensus voter's liveness outside its copyset only by gossip; direct probing of consensus voters would tighten leader liveness detection.
+Fixed in the follow-up "consensus liveness" commit (same day):
+
+- **CheckQuorum is now driven.** `RegionalCouncil::check_quorum` / `RootGroup::check_quorum` wrap `Raft::check_quorum` (§6.2), and the coordinator ticks it on the election-timeout cadence: the leader's `idle` counts its own periods, and every `ELECTION_HEARTBEATS` of them the group judges whether a majority was heard from (the append replies it folds, timely or late — which the straggler port guarantees are all counted) and steps the leader down if not, so a leader cut off from its followers yields instead of sitting on a term it cannot hold. By-use unit tests in both groups: the first tick still counts the electing majority; a follower's acknowledgement keeps the leader; a whole silent window steps it down. The fleet suite at rest and the target test under load show no false step-down.
+- **SWIM now probes consensus voters directly.** One predicate, `keeps_direct_contact_with` (record neighbourhood ∨ council voter ∨ root voter), governs every direct-contact decision: the record link's dial/idle, the probe task's resume, the probe's retire-on-fold (`fold_peer_state`), and the formation gate (`Daemon::fleet_meshed`, so a test no longer proceeds while the voters' probe sessions are still establishing under load). The first cut changed only the resume and **regressed**: `fold_peer_state` still judged "retired" by the neighbourhood alone, and on retired the probe task closes the peer on **both** planes — so an out-of-copyset voter was probed, judged retired, and had its freshly dialed record session torn down every period, the link task re-dialing it (~20 s) only for the next probe to close it again (measured: 1 of 3 load runs capped at 300 s between two ~6 s passes). Fixed before commit. Any future "is this peer mine to reach" check must use the predicate, never `neighbourhood.contains` directly.
+
+Still owed at this commit:
+
+- The observation accessors (`root_regions`, `root_leads`, …) map a *genuine* observe timeout to a default value (empty / `false`); a predicate like `!root_regions().contains(&lost)` is then true on a wedged shard. The honest type is `Option<T>`, with a poll treating `None` as "not yet" and a stability hold treating it as "not held".
 
 ## Validation
 

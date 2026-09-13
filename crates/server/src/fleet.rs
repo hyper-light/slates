@@ -597,16 +597,16 @@ async fn serve_peer_probes(
 }
 
 /// At the top of a probe cycle, decides whether to probe this peer or idle. Returns `false` when the peer is
-/// **retired** (not in the neighbourhood) — the caller idles the task (it does not end: a believed-dead peer
-/// is never dialed, since that establish would block on a peer that will not answer, and no probe session is
-/// held; when the peer rejoins — its own probe reaching this node's serve side re-admits it at a higher
-/// incarnation, [`serve_peer_probes`] — the neighbourhood regains it and probing resumes). On the resume
-/// from idle it realigns `detector` to the fleet's re-admitted belief, so the detector tracks the peer as
-/// alive and can detect a *future* death rather than carrying its stale death forever. Returns `true` to
-/// probe.
+/// **retired** — not one this node keeps direct contact with ([`keeps_direct_contact_with`]: its record
+/// neighbourhood, its council's voters, the root group's voters) — and the caller idles the task (it does not
+/// end: a believed-dead peer is never dialed, since that establish would block on a peer that will not
+/// answer, and no probe session is held; when the peer rejoins — its own probe reaching this node's serve
+/// side re-admits it at a higher incarnation, [`serve_peer_probes`] — the mesh regains it and probing
+/// resumes). On the resume from idle it realigns `detector` to the fleet's re-admitted belief, so the
+/// detector tracks the peer as alive and can detect a *future* death rather than carrying its stale death
+/// forever. Returns `true` to probe.
 fn resume_if_in_mesh(detector: &mut Detector, peer_host: HostId, was_idle: &mut bool) -> bool {
-  let in_mesh = state::with_state(|s| s.fleet.configuration().neighbourhood.contains(&peer_host))
-    .unwrap_or(false);
+  let in_mesh = state::with_state(|s| keeps_direct_contact_with(s, peer_host)).unwrap_or(false);
   if !in_mesh {
     *was_idle = true;
     return false;
@@ -629,13 +629,16 @@ fn resume_if_in_mesh(detector: &mut Detector, peer_host: HostId, was_idle: &mut 
 /// — the council leader reconciles the retirement from the folded view and, when it commits, the record
 /// plane installs the new configuration and takes over what fell to this node ([`sync_config_from_council`]).
 /// The folded state is handed to every other shard's membership copy so all advance identically (D-7); a
-/// spawn refused at a shard's admission bound is retried next period (the fold is idempotent). "Retired" is
-/// read from the configuration, so it reflects the council's committed retirement, not one detector's
-/// suspicion.
+/// spawn refused at a shard's admission bound is retried next period (the fold is idempotent). "Retired"
+/// means no longer a peer this node keeps direct contact with ([`keeps_direct_contact_with`] — read from the
+/// committed configuration and the consensus voter sets, not from one detector's suspicion); the caller then
+/// closes the peer's sessions on both planes, so this must be the **same** predicate the link task and the
+/// probe's resume use, or a consensus voter outside the copyset is probed, judged retired, and has its
+/// freshly dialed record session torn down every period.
 fn fold_peer_state(detector: &Detector, peer_host: HostId, origin: u16, shards: &[u16]) -> bool {
   let retired = state::with_state(|s| {
     sync_peer(detector.membership(), &mut s.fleet, peer_host);
-    !s.fleet.configuration().neighbourhood.contains(&peer_host)
+    !keeps_direct_contact_with(s, peer_host)
   })
   .unwrap_or(false);
   let peer_state = detector.membership().state(peer_host);
@@ -1529,28 +1532,31 @@ fn count_refusal(kind: &'static str) {
   state::with_state(|s| *s.refusals.entry(kind).or_insert(0) += 1);
 }
 
-/// Whether this node keeps a record session up to `peer` — the peers the coordinator ever borrows a session
-/// to ([`take_sessions`]): a **candidate holder** in this owner's bounded record neighbourhood (§4.8, D-14 —
-/// the copyset, `select_neighbourhood` at the scatter width, so at the candidate floor `2f + 1` an owner
-/// reaches just `2f` holders), a **voter of this region's configuration council**, or a **voter of the root
-/// group** across regions. The two consensus groups ride the same per-peer record session as the record
-/// plane (their streams multiplex on it), but their voter sets are *not* subsets of the copyset: a root voter
-/// is another region's representative, and a council voter need not be a candidate holder. Keeping sessions
-/// only to the copyset left a consensus voter outside it unreachable from this node for good — an election
-/// still succeeded through whichever voters happened to be in-copyset, and the first loss that removed them
-/// left a leader that could never again reach a majority (the root leader replicating to none of its live
-/// voters for 1,500 periods while its sole reachable voter was the one just killed;
-/// `docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md`). Both voter sets are small and bounded
-/// (one representative per region; an elected council), and a dead voter's link ends the moment its group
-/// commits its retirement — which reaching the surviving voters is exactly what makes possible.
-fn keeps_record_session_to(state: &ShardState, peer: HostId) -> bool {
+/// Whether this node keeps **direct contact** with `peer` — a record session dialed and kept up for the
+/// coordinator ([`establish_record_link`]) and a SWIM probe of its own ([`probe_peer`]): the peers the
+/// coordinator ever borrows a session to ([`take_sessions`]) and whose liveness it must see first-hand. That
+/// is a **candidate holder** in this owner's bounded record neighbourhood (§4.8, D-14 — the copyset,
+/// `select_neighbourhood` at the scatter width, so at the candidate floor `2f + 1` an owner reaches just `2f`
+/// holders), a **voter of this region's configuration council**, or a **voter of the root group** across
+/// regions. The two consensus groups ride the same per-peer record session as the record plane (their
+/// streams multiplex on it), but their voter sets are *not* subsets of the copyset: a root voter is another
+/// region's representative, and a council voter need not be a candidate holder. Keeping sessions only to the
+/// copyset left a consensus voter outside it unreachable from this node for good — an election still
+/// succeeded through whichever voters happened to be in-copyset, and the first loss that removed them left a
+/// leader that could never again reach a majority (the root leader replicating to none of its live voters
+/// for 1,500 periods while its sole reachable voter was the one just killed;
+/// `docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md`); probing only the copyset left
+/// that voter's liveness known here by gossip alone. Both voter sets are small and bounded (one
+/// representative per region; an elected council), and a dead voter's link and probe idle the moment its
+/// group commits its retirement — which reaching the surviving voters is exactly what makes possible.
+pub(crate) fn keeps_direct_contact_with(state: &ShardState, peer: HostId) -> bool {
   state.fleet.configuration().neighbourhood.contains(&peer)
     || state.council.is_voter(peer)
     || state.root.is_voter(peer)
 }
 
 /// Keeps one peer's client record session up for the coordinator (§4.8) — a candidate holder's, or a
-/// consensus voter's ([`keeps_record_session_to`]): a per-peer task that brings the session up on **one**
+/// consensus voter's ([`keeps_direct_contact_with`]): a per-peer task that brings the session up on **one**
 /// socket — one handshake attempt per period, retried until the peer's pinned `accept` completes rather than
 /// a fresh-port re-dial being ignored — and installs it in the shard state ([`ShardState::record_sessions`]),
 /// where the coordinator borrows it for each dispatch. If the coordinator ever loses it (a borrow that ended
@@ -1569,7 +1575,7 @@ async fn establish_record_link(identity: &'static Identity, dial: PeerDial) {
   } = dial;
   let mut client: Option<Endpoint> = client_for(identity, &name, address, &certificate);
   loop {
-    let retired = state::with_state(|s| !keeps_record_session_to(s, peer_host));
+    let retired = state::with_state(|s| !keeps_direct_contact_with(s, peer_host));
     if retired == Some(true) {
       // The peer is retired. Drop its record session and **idle** — this task does not end, so if the peer
       // rejoins (its probe reaches this node's serve side, which re-admits it — [`serve_peer_probes`]) this
@@ -2179,7 +2185,16 @@ async fn drive_config_council(
       s.council.reconcile_alive(&alive)
     });
     drive_council_replication(&others, budget, in_flight).await;
-    *idle = 0;
+    // CheckQuorum (Raft §6.2) on the election-timeout cadence: `idle` counts the leader's periods since its
+    // last tick; every [`ELECTION_HEARTBEATS`] of them the council judges whether a majority was heard from
+    // (the append replies folded above, timely or late) and steps this node down if not — so a leader cut
+    // off from its followers yields rather than sitting on a term it can no longer hold. The same counter
+    // ages a follower toward its election; either role resets it at its own timer event.
+    *idle = idle.saturating_add(1);
+    if *idle >= ELECTION_HEARTBEATS {
+      *idle = 0;
+      state::with_state(|s| s.council.check_quorum());
+    }
     return;
   }
   if others.is_empty() {
@@ -2294,7 +2309,14 @@ async fn drive_root_group(
       s.root.reconcile_regions(&alive, &s.region_mirrors)
     });
     drive_root_replication(&others, budget, in_flight).await;
-    *idle = 0;
+    // CheckQuorum (Raft §6.2) on the election-timeout cadence, as the council's above: every
+    // [`ELECTION_HEARTBEATS`] leader periods the root group judges whether a majority of its voters was heard
+    // from and steps this node down if not.
+    *idle = idle.saturating_add(1);
+    if *idle >= ELECTION_HEARTBEATS {
+      *idle = 0;
+      state::with_state(|s| s.root.check_quorum());
+    }
     return;
   }
   if others.is_empty() {
@@ -2699,7 +2721,8 @@ async fn run_record_plane(local: HostId, budget: CommitBudget, progress: &'stati
   let mut in_flight: Vec<Dispatch> = Vec::new();
   // The configuration council is driven from this one coordinator (§4.8, D-14): its brief borrow of the
   // voter sessions is sequential with the record ships below, so it never contends for them. These persist
-  // across periods — the follower's election timer, the last leader contact it saw, and its jitter rotation.
+  // across periods — the election timer (a follower ages toward a campaign on it; a leader ticks CheckQuorum
+  // on it), the last leader contact it saw, and its jitter rotation.
   let mut council_idle: u32 = 0;
   let mut council_seen_contact: u64 = 0;
   let mut council_attempt: u32 = 0;

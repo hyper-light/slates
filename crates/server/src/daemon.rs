@@ -425,27 +425,30 @@ impl Daemon {
       .unwrap_or_default()
   }
 
-  /// Whether this daemon's fleet has formed its **direct probe mesh** (§4.8): every peer in the
-  /// configured neighbourhood has a live probe session — the handshake completed and the peer was
-  /// recorded in `formed_probe_peers`. Unlike [`fleet_members`](Daemon::fleet_members), which reads the
+  /// Whether this daemon's fleet has formed its **direct probe mesh** (§4.8): every peer this node keeps
+  /// direct contact with — its record neighbourhood and its council and root voters
+  /// (`fleet::keeps_direct_contact_with`) — has a live probe session: the handshake completed and the peer
+  /// was recorded in `formed_probe_peers`. Unlike [`fleet_members`](Daemon::fleet_members), which reads the
   /// membership's optimistically **seeded** alive set (every configured peer is believed alive from boot,
   /// before any is contacted), this reflects sessions that have actually formed. A formation observer
   /// waits on this so it does not act on a fleet whose mesh is not yet up — for instance retiring a node
-  /// that dies before its peers ever probed it, which no survivor could then detect. A laptop (no peers)
-  /// is trivially meshed. Runs a one-shot query on the control shard, bounded by the liveness budget;
-  /// `false` if the daemon is stopping, is not on a shard, or the shard does not answer in time.
+  /// that dies before its peers ever probed it, which no survivor could then detect; and it must cover the
+  /// consensus voters outside the copyset, or a test proceeds while those probe sessions are still
+  /// establishing under load. A laptop (no peers) is trivially meshed. Runs a one-shot query on the control
+  /// shard, bounded by the liveness budget; `false` if the daemon is stopping, is not on a shard, or the
+  /// shard does not answer in time.
   pub fn fleet_meshed(&self) -> bool {
     self
       .observe(self.shards.first().copied(), || {
         state::with_state(|s| {
-          // The peers to reach are the neighbourhood less this node; the mesh is up when every one has a
-          // formed probe session. A laptop has an empty peer set and is meshed at once.
+          // The peers to reach are every configured member this node keeps direct contact with, less this
+          // node; the mesh is up when every one has a formed probe session. A laptop has an empty peer set
+          // and is meshed at once.
           let host = s.fleet.host();
           s.fleet
-            .configuration()
-            .neighbourhood
+            .members()
             .iter()
-            .filter(|&&peer| peer != host)
+            .filter(|&&peer| peer != host && crate::fleet::keeps_direct_contact_with(s, peer))
             .all(|peer| s.formed_probe_peers.contains(peer))
         })
       })

@@ -209,6 +209,16 @@ impl RegionalCouncil {
     self.raft.replicate_to(follower)
   }
 
+  /// **DRIVE**: the leader's CheckQuorum tick (Raft §6.2), on the election-timeout cadence: a leader that has
+  /// not heard from a majority of voters since the previous tick **steps down**, so a leader cut off from its
+  /// followers stops acting as one — it neither blocks the majority side's fresh election nor sits on a term
+  /// it can no longer hold — and the contact window resets. The window is fed by the append replies the
+  /// drive loop folds, timely or late ([`fold_reply`](RegionalCouncil::fold_reply)). A non-leader is
+  /// unaffected; the sole voter is its own majority and never steps down (the laptop degenerate, R8).
+  pub fn check_quorum(&mut self) {
+    self.raft.check_quorum();
+  }
+
   /// **SERVE**: answers a request received over the transport — a pre-vote, a vote request, or an append —
   /// returning the reply to ship back and applying whatever newly committed to the regional configuration
   /// (a follower applies on the append). A reply (`VoteReply`/`PreVoteReply`/`AppendReply`) is not a request
@@ -588,6 +598,35 @@ mod tests {
       follower.leader_contact(),
       after_rejected,
       "and it is not contact — the timer does not reset for a deposed leader"
+    );
+  }
+
+  /// AC (§4.8, D-14 — Raft §6.2 CheckQuorum, driven on the election-timeout cadence by the coordinator): a
+  /// leader that hears from no majority across a whole window **steps down**, so a leader cut off from its
+  /// followers does not sit on a term it cannot hold; one whose followers keep acknowledging stays. By use:
+  /// the first tick after the election still counts the majority that elected it; a replication round's
+  /// acknowledgement refreshes the window; a whole window with no acknowledgement steps the leader down.
+  #[test]
+  fn a_leader_that_hears_from_no_majority_steps_down_at_its_check_quorum_tick() {
+    let mut leader = council(OWNER);
+    let mut follower = council(A);
+    elect(&mut leader, &mut follower);
+    assert!(leader.is_leader());
+    leader.check_quorum();
+    assert!(
+      leader.is_leader(),
+      "the first window still counts the majority that elected it"
+    );
+    replicate(&mut leader, &mut follower, 1);
+    leader.check_quorum();
+    assert!(
+      leader.is_leader(),
+      "a follower's acknowledgement this window keeps it leader"
+    );
+    leader.check_quorum();
+    assert!(
+      !leader.is_leader(),
+      "a whole window with no acknowledgement steps it down"
     );
   }
 
