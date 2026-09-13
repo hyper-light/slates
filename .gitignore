@@ -10,3 +10,6 @@ docs/wip/models/*_TTrace_*.tla
 # Editors
 .idea/
 .vscode/
+
+# Claude Code agent worktrees (scratch checkouts, each its own branch)
+.claude/worktrees/
