@@ -51,6 +51,9 @@ pub struct PartitionCaps {
 /// One client's completion state, as the snapshot carries it.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct ClientCompletions {
+  /// The host id (`HostId.0`) whose client this is (this node for a local client; the authenticated origin
+  /// for a forwarded one) — the high half of the globally-unique completion key.
+  pub origin: u64,
   /// The client.
   pub client: u32,
   /// Every sequence up to and including this one is acknowledged.
@@ -109,7 +112,7 @@ pub struct Partition {
   lease_timers: BTreeMap<VolumeId, slates_rt::timer::TimerId>,
   attachments: Slab<AttachmentRecord>,
   attachment_index: Art<Handle<AttachmentRecord>>,
-  completions: BTreeMap<u32, ClientWindow<Vec<u8>>>,
+  completions: BTreeMap<(u64, u32), ClientWindow<Vec<u8>>>,
   grants: BTreeMap<u64, GrantRecord>,
   landing_leases: Art<LandingLeaseRecord>,
   landings: BTreeMap<u64, LandingRecord>,
@@ -259,11 +262,13 @@ impl Partition {
     self.attachments.get(h).ok()
   }
 
-  /// What a client's window knows about a sequence.
-  pub fn completion(&self, client: u32, sequence: u32) -> Seen<Vec<u8>> {
+  /// What a client's window knows about a sequence. The key is `(origin, client)`: `origin` is this node's
+  /// own host for a local client and the authenticated forwarding peer for a cross-node forwarded verb, so a
+  /// forwarded request never collides with a local client sharing its per-node id (§4.8 "Lookup").
+  pub fn completion(&self, origin: u64, client: u32, sequence: u32) -> Seen<Vec<u8>> {
     self
       .completions
-      .get(&client)
+      .get(&(origin, client))
       .map_or(Seen::New, |w| w.lookup(sequence))
   }
 
@@ -363,16 +368,18 @@ impl Partition {
         Ok(())
       }
       Op::AttachmentRemoved { id } => self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound),
-      Op::CompletionRecorded { record } => match self.completion(record.client, record.sequence) {
-        Seen::Acknowledged => Err(DbError::StaleCompletion {
-          acknowledged_up_to: self
-            .completions
-            .get(&record.client)
-            .and_then(ClientWindow::acknowledged_up_to)
-            .unwrap_or(0),
-        }),
-        Seen::New | Seen::Completed(_) => Ok(()),
-      },
+      Op::CompletionRecorded { record } => {
+        match self.completion(record.origin, record.client, record.sequence) {
+          Seen::Acknowledged => Err(DbError::StaleCompletion {
+            acknowledged_up_to: self
+              .completions
+              .get(&(record.origin, record.client))
+              .and_then(ClientWindow::acknowledged_up_to)
+              .unwrap_or(0),
+          }),
+          Seen::New | Seen::Completed(_) => Ok(()),
+        }
+      }
       Op::CompletionsAcknowledged { .. } => Ok(()),
       Op::GrantIssued { record } => {
         if self.grants.contains_key(&record.id) {
@@ -529,15 +536,19 @@ impl Partition {
       Op::CompletionRecorded { record } => {
         self
           .completions
-          .entry(record.client)
+          .entry((record.origin, record.client))
           .or_default()
           .record(record.sequence, record.result.clone());
         Ok(())
       }
-      Op::CompletionsAcknowledged { client, up_to } => {
+      Op::CompletionsAcknowledged {
+        origin,
+        client,
+        up_to,
+      } => {
         self
           .completions
-          .entry(*client)
+          .entry((*origin, *client))
           .or_default()
           .acknowledge(*up_to);
         Ok(())
@@ -727,12 +738,14 @@ impl Partition {
       completions: self
         .completions
         .iter()
-        .map(|(client, w)| ClientCompletions {
+        .map(|((origin, client), w)| ClientCompletions {
+          origin: *origin,
           client: *client,
           acknowledged_up_to: w.acknowledged_up_to(),
           records: w
             .retained_entries()
             .map(|(sequence, result)| CompletionRecord {
+              origin: *origin,
               client: *client,
               sequence,
               result: result.clone(),
@@ -757,7 +770,7 @@ impl Partition {
 
   fn restore_completions(&mut self, completions: &[ClientCompletions]) {
     for c in completions {
-      let w = self.completions.entry(c.client).or_default();
+      let w = self.completions.entry((c.origin, c.client)).or_default();
       for r in &c.records {
         w.record(r.sequence, r.result.clone());
       }

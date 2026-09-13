@@ -118,6 +118,9 @@ pub enum Op {
   },
   /// A client acknowledged completions.
   CompletionsAcknowledged {
+    /// The host id (`HostId.0`) whose client this is (this node for a local client; the authenticated origin
+    /// for a forwarded one) — the high half of the globally-unique completion key.
+    origin: u64,
     /// The client.
     client: u32,
     /// Every sequence up to and including this one.

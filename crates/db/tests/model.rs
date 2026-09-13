@@ -355,12 +355,14 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     },
     Step::Complete(c, s) => Op::CompletionRecorded {
       record: CompletionRecord {
+        origin: 0,
         client: *c,
         sequence: *s,
         result: vec![u8::try_from(*s).unwrap_or(0); 3],
       },
     },
     Step::Acknowledge(c, s) => Op::CompletionsAcknowledged {
+      origin: 0,
       client: *c,
       up_to: *s,
     },
@@ -779,6 +781,7 @@ fn completions_are_exactly_once_across_recovery() {
     &mut seg,
     &Op::CompletionRecorded {
       record: CompletionRecord {
+        origin: 0,
         client: 7,
         sequence: 3,
         result: vec![1, 2, 3],
@@ -791,6 +794,7 @@ fn completions_are_exactly_once_across_recovery() {
     &mut seg,
     &Op::CompletionRecorded {
       record: CompletionRecord {
+        origin: 0,
         client: 7,
         sequence: 4,
         result: vec![4],
@@ -802,21 +806,22 @@ fn completions_are_exactly_once_across_recovery() {
   drop(db);
   let (mut db, _) = recover(&mut seg, 0, caps(), 0).unwrap();
   assert_eq!(
-    db.partition().completion(7, 3),
+    db.partition().completion(0, 7, 3),
     Seen::Completed(vec![1, 2, 3])
   );
-  assert_eq!(db.partition().completion(7, 5), Seen::New);
+  assert_eq!(db.partition().completion(0, 7, 5), Seen::New);
   db.mutate(
     &mut seg,
     &Op::CompletionsAcknowledged {
+      origin: 0,
       client: 7,
       up_to: 3,
     },
     0,
   )
   .unwrap();
-  assert_eq!(db.partition().completion(7, 3), Seen::Acknowledged);
-  assert_eq!(db.partition().completion(7, 4), Seen::Completed(vec![4]));
+  assert_eq!(db.partition().completion(0, 7, 3), Seen::Acknowledged);
+  assert_eq!(db.partition().completion(0, 7, 4), Seen::Completed(vec![4]));
 }
 
 /// The snapshot cadence: a small policy snapshots often, the log is trimmed behind each, and

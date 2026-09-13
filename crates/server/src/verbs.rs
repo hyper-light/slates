@@ -508,7 +508,14 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     Err(_) => return Served::Reply(refused(Refusal::NotFound)),
   };
   let id = RequestId::from_word(request.request);
-  match state.db.partition().completion(id.client, id.sequence) {
+  // A local client's completion key is this node's own host (the globally-unique key's high half); a
+  // forwarded verb keys on its authenticated origin instead (see `record_completion`, `serve_forward`).
+  let origin = state.fleet.host().0;
+  match state
+    .db
+    .partition()
+    .completion(origin, id.client, id.sequence)
+  {
     Seen::Completed(bytes) => {
       return Served::Reply(
         ReplyBody::from_bytes(&bytes).unwrap_or_else(|_| refused(Refusal::DuplicateRequest)),
@@ -526,6 +533,7 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       Err(IpcError::BadSlot { reason }) => {
         return Served::Reply(record_completion(
           state,
+          origin,
           id,
           refused(Refusal::BadRequest {
             reason: reason.to_owned(),
@@ -535,6 +543,7 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       Err(e) => {
         return Served::Reply(record_completion(
           state,
+          origin,
           id,
           refused(Refusal::BadRequest {
             reason: e.to_string(),
@@ -585,6 +594,7 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     }
     return Served::Reply(record_completion(
       state,
+      origin,
       id,
       refused(Refusal::HomedElsewhere { region }),
     ));
@@ -598,7 +608,12 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     && owner != state.partition
   {
     let Some(shard) = shard_of_partition(state, owner) else {
-      return Served::Reply(record_completion(state, id, refused(Refusal::NotFound)));
+      return Served::Reply(record_completion(
+        state,
+        origin,
+        id,
+        refused(Refusal::NotFound),
+      ));
     };
     return forward(
       state,
@@ -610,13 +625,14 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       shard,
     );
   }
-  Served::Reply(run_recorded(state, id, client_id, &principal, body))
+  Served::Reply(run_recorded(state, origin, id, client_id, &principal, body))
 }
 
 /// Runs a verb on this shard with its effects and its completion record in one durable step
 /// (`Db::begin` … `commit`: one log record, so a crash leaves both or neither, AC-2.3).
 fn run_recorded(
   state: &mut ShardState,
+  origin: u64,
   id: RequestId,
   client_id: u32,
   principal: &Principal,
@@ -634,7 +650,7 @@ fn run_recorded(
   let label = u32::from(mutates_shard_image(&body)); // before `dispatch` moves `body`
   state.db.begin();
   let reply = dispatch(state, client_id, principal, body);
-  let reply = record_completion(state, id, reply);
+  let reply = record_completion(state, origin, id, reply);
   let append_start = state.clock.monotonic_ns();
   let reply = match state.db.commit(&mut state.segment) {
     Ok(_) => reply,
@@ -690,27 +706,40 @@ pub(crate) fn emit_span(
 /// in one step.
 fn run_forwarded(
   state: &mut ShardState,
+  origin: u64,
   id: RequestId,
   client_id: u32,
   principal: &Principal,
   body: RequestBody,
 ) -> ReplyBody {
-  match state.db.partition().completion(id.client, id.sequence) {
+  match state
+    .db
+    .partition()
+    .completion(origin, id.client, id.sequence)
+  {
     Seen::Completed(bytes) => {
       return ReplyBody::from_bytes(&bytes).unwrap_or_else(|_| refused(Refusal::DuplicateRequest));
     }
     Seen::Acknowledged => return refused(Refusal::DuplicateRequest),
     Seen::New => {}
   }
-  run_recorded(state, id, client_id, principal, body)
+  run_recorded(state, origin, id, client_id, principal, body)
 }
 
 /// Records the completion (RIFL) and counts the refusal; the reply is then durable and may be
-/// sent.
-pub fn record_completion(state: &mut ShardState, id: RequestId, reply: ReplyBody) -> ReplyBody {
+/// sent. `origin` is the host whose client issued the request — this node's own host for a local client,
+/// the authenticated forwarding peer for a cross-node forwarded verb — so the completion key is globally
+/// unique and a forwarded request never collides with a local client sharing its per-node id (§4.8).
+pub fn record_completion(
+  state: &mut ShardState,
+  origin: u64,
+  id: RequestId,
+  reply: ReplyBody,
+) -> ReplyBody {
   let now = state.clock.monotonic_ns();
   let record = Op::CompletionRecorded {
     record: CompletionRecord {
+      origin,
       client: id.client,
       sequence: id.sequence,
       result: reply.to_bytes(),
@@ -788,7 +817,9 @@ fn send_forward(
       let id = RequestId::from_word(request);
       let reply = crate::state::with_state(|s| {
         s.last_work_ns = s.clock.monotonic_ns();
-        run_forwarded(s, id, client_id, &principal, body)
+        // A same-node cross-shard forward serves a local client, so its completion keys on this node's host.
+        let origin = s.fleet.host().0;
+        run_forwarded(s, origin, id, client_id, &principal, body)
       })
       .unwrap_or_else(|| refused(Refusal::NotFound));
       let back = SpawnRequest::new(
@@ -3282,9 +3313,12 @@ fn list(state: &mut ShardState, principal: &Principal) -> ReplyBody {
 
 fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32) -> ReplyBody {
   let now = state.clock.monotonic_ns();
+  // A local client acknowledges its own completions, keyed under this node's own host.
+  let origin = state.fleet.host().0;
   match state.db.mutate(
     &mut state.segment,
     &Op::CompletionsAcknowledged {
+      origin,
       client: client_id,
       up_to,
     },
@@ -3500,11 +3534,18 @@ fn retry_deferred(state: &mut ShardState) -> bool {
       read_ns,
     } = entry;
     let id = RequestId::from_word(request);
+    // A deferred reply is the local client's own (its shard is here), so its completion keys on this node's
+    // own host; a cross-node forward records on the owner under its authenticated origin instead.
+    let origin = state.fleet.host().0;
     let reply = if recorded {
       reply
     } else {
-      match state.db.partition().completion(id.client, id.sequence) {
-        Seen::New => record_completion(state, id, reply),
+      match state
+        .db
+        .partition()
+        .completion(origin, id.client, id.sequence)
+      {
+        Seen::New => record_completion(state, origin, id, reply),
         _ => reply,
       }
     };

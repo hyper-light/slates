@@ -311,9 +311,17 @@ pub struct AttachmentRecord {
   pub principal: Principal,
 }
 
-/// A completion record (RIFL, §4.9).
+/// A completion record (RIFL, §4.9). The idempotency key is **globally unique**: `origin` is the host whose
+/// client issued the request — this node's own host for a local client, and the *authenticated* forwarding
+/// peer for a cross-node forwarded verb (§4.8 "Lookup") — so a forwarded request from another node's client
+/// can never collide with a local client that happens to share its (per-node) id.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct CompletionRecord {
+  /// The host id (`HostId.0`) whose client issued the request — this node for a local client, the
+  /// authenticated forwarding peer for a cross-node forwarded verb. Part of the idempotency key, so per-node
+  /// client ids stay globally unique. Stored as the raw `u64` (host ids serialize as `u64`; `HostId` is an
+  /// in-memory wrapper).
+  pub origin: u64,
   /// The client.
   pub client: u32,
   /// The sequence.
