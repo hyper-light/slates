@@ -9,8 +9,10 @@ use crate::wire::{Reader, Writer};
 
 /// Shape: the maximum write the daemon accepts in one request: one arena chunk (256 KiB at a
 /// 4 KiB page, the FUSE big-write convention and the ramp's ceiling). The kernel is told this
-/// at INIT and never sends a larger write.
-const MAX_WRITE: u32 = 256 * 1024;
+/// at INIT and never sends a larger write. Public because it is the anchor of the virtio-fs
+/// device's readable-bytes cap (`slates-bridge-virtiofs`): the largest request a guest kernel can
+/// send is a full write, so the two must be the same number.
+pub const MAX_WRITE: u32 = 256 * 1024;
 /// Shape: the read-ahead the daemon suggests, matched to `MAX_WRITE`.
 const MAX_READAHEAD: u32 = 256 * 1024;
 /// Shape: the time granularity the daemon reports: one nanosecond (times are monotonic ns).

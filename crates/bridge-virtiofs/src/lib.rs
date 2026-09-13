@@ -36,8 +36,11 @@
 //!
 //! Modules: [`memory`] (the guest-memory seam and its typed refusals), [`sim`] (the simulated guest
 //! memory the tests own), [`virtqueue`] (the split-virtqueue machine: layout validation, the chain
-//! walk with every check the contract names, the used ring).
+//! walk with every check the contract names, the used ring), [`device`] (the FUSE-over-virtio
+//! request cycle: gather, dispatch through the FUSE codec onto the shared `Bridge`, scatter,
+//! publish; the hiprio queue; INIT/DESTROY; the derived caps; DAX not advertised).
 
+pub mod device;
 pub mod memory;
 pub mod sim;
 pub mod virtqueue;

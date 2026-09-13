@@ -100,6 +100,11 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     // no-op, the same as FLUSH. They carry `fh` first, exactly as FLUSH does (audit BUG-7).
     Opcode::Flush | Opcode::FSync | Opcode::FSyncDir => serve_flush(bridge, &request, cx, out),
     Opcode::Forget => serve_forget(bridge, &request, cx),
+    Opcode::BatchForget => serve_batch_forget(bridge, &request, cx),
+    // DESTROY is the kernel's last request at unmount: the attachment's references are swept (the
+    // kernel does not guarantee a FORGET per outstanding reference, §4.6 `sweep_attachment`) and the
+    // reply is an empty success; it was ENOSYS before, so nothing was ever swept at unmount.
+    Opcode::Destroy => serve_destroy(bridge, &request, cx, out),
     Opcode::MkDir => serve_mkdir(bridge, &request, cx, out),
     Opcode::Unlink => serve_unlink(bridge, &request, cx, false, out),
     Opcode::RmDir => serve_unlink(bridge, &request, cx, true, out),
@@ -545,6 +550,43 @@ fn serve_forget(bridge: &mut dyn Bridge, req: &Request<'_>, cx: &OpContext) -> u
     .unwrap_or(0);
   bridge.forget(ObjectId::new(req.header.nodeid, 0), cx, nlookup);
   0
+}
+
+fn serve_batch_forget(bridge: &mut dyn Bridge, req: &Request<'_>, cx: &OpContext) -> usize {
+  // `fuse_batch_forget_in`: count (4), dummy (4); then `count` × `fuse_forget_one`: nodeid (8),
+  // nlookup (8). BATCH_FORGET has no reply. The count is bounded by the body: only the complete
+  // entries present are applied, so an overclaimed count never reads past the message.
+  const HEAD: usize = 2 * size_of::<u32>();
+  const ENTRY: usize = 2 * size_of::<u64>();
+  let Some(entries) = req.body.get(HEAD..) else {
+    return 0;
+  };
+  let claimed = req
+    .body
+    .get(..size_of::<u32>())
+    .map(|b| u32::from_le_bytes(b.try_into().unwrap_or_default()))
+    .map_or(0, |count| usize::try_from(count).unwrap_or(usize::MAX));
+  let (whole, _partial) = entries.as_chunks::<ENTRY>();
+  for entry in whole.iter().take(claimed) {
+    let nodeid = u64::from_le_bytes(entry[..size_of::<u64>()].try_into().unwrap_or_default());
+    let nlookup = u64::from_le_bytes(entry[size_of::<u64>()..].try_into().unwrap_or_default());
+    bridge.forget(ObjectId::new(nodeid, 0), cx, nlookup);
+  }
+  0
+}
+
+fn serve_destroy(
+  bridge: &mut dyn Bridge,
+  req: &Request<'_>,
+  cx: &OpContext,
+  out: &mut [u8],
+) -> usize {
+  reply(
+    req.header.unique,
+    bridge.sweep_attachment(cx),
+    |()| Vec::new(),
+    out,
+  )
 }
 
 fn serve_mkdir(
