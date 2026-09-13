@@ -22,8 +22,16 @@
 //! owner is refused `StaleEpoch`; the phase-one recovery and adoption the new owner then runs live in
 //! `slates_db::register` (`install_authority`/`prepare`) and [`crate`]
 //! (`promote_record`/`promote_under_configuration`), oracle-tested for Continuity and StaleNeverCommits.
-//! Owed: joint consensus to change the voter set; the FencedRegister TLA+ revalidation for the per-host
-//! epoch fence (A-9, §4.8 lines 1710-1712).
+//!
+//! The **voter set follows the committed membership**: the council's voters are a pure function of its
+//! members ([`council_voters`] — the lowest ids up to the candidate floor `2f + 1`, "a small elected
+//! council per region"), so whenever a committed admit, retire or takeover changes the members, the leader
+//! moves the Raft voter set to match through the core's joint-consensus change
+//! ([`reconcile_voters`](RegionalCouncil::reconcile_voters)): a dead voter leaves the consensus set and
+//! stops counting toward every majority, and the next member in id order — a learner until then — is
+//! promoted in its place, so the council keeps tolerating `f` failures. Before this the voter set was fixed
+//! at boot and never shrank (`docs/bugs/2026-09-13-raft-voter-set-never-shrinks.md`).
+//! Owed: the FencedRegister TLA+ revalidation for the per-host epoch fence (A-9, §4.8 lines 1710-1712).
 
 use std::mem::size_of;
 
@@ -119,6 +127,21 @@ pub enum Reconfiguration {
   TakeOver(HostId),
 }
 
+/// The council's voter set for the region `members` (§4.8, D-14 — "a small elected council per region"):
+/// the members with the lowest ids up to the candidate floor `2f + 1`, so the council tolerates `f` voter
+/// failures while staying small even in a large region; the members beyond it are **learners** that fetch
+/// the committed configuration rather than voting. Deterministic from the members (sorted by id), so every
+/// node computes the same voter set — the consensus group they all agree on. At `2f + 1` members or fewer
+/// every member votes (no learners), so a small fleet is unchanged. The boot-time voter set and the target
+/// the leader moves the Raft to after every committed membership change are both this function.
+pub fn council_voters(members: &[HostId], quorum: Quorum) -> Vec<HostId> {
+  let mut sorted = members.to_vec();
+  sorted.sort_unstable_by_key(|host| host.0);
+  sorted.dedup();
+  sorted.truncate(quorum.candidates().min(sorted.len()));
+  sorted
+}
+
 /// The **regional configuration council** on one node (§4.8, D-14 — the "configuration master", a small
 /// elected council per region): the multi-voter [`RaftNode`] over the council voters, producing the
 /// [`RegionalConfiguration`] every node learns. Membership changes commit at a majority over the transport
@@ -128,6 +151,11 @@ pub enum Reconfiguration {
 pub struct RegionalCouncil {
   raft: RaftNode,
   configuration: RegionalConfiguration,
+  /// The formed configuration every voter's fold starts from: the committed log is applied onto this, so a
+  /// learner promoted to voter — whose `configuration` is one it *adopted* from a fetch — re-folds the whole
+  /// log from the same base as every other voter, instead of applying the log's commands a second time on
+  /// top of the adopted state (a takeover's epoch bump would otherwise be doubled there).
+  base: RegionalConfiguration,
   applied: u64,
   scatter: u64,
   /// Monotone count of the events that defer this node's own election — a leader's append answered here, or a
@@ -164,6 +192,7 @@ impl RegionalCouncil {
       RegionalConfiguration::formed(members, quorum, domains, scatter, has_mirror);
     RegionalCouncil {
       raft,
+      base: configuration.clone(),
       configuration,
       applied: 0,
       scatter,
@@ -182,9 +211,11 @@ impl RegionalCouncil {
     self.raft.is_leader()
   }
 
-  /// The council's voter set — the small consensus group the drive loop ships elections and replication to.
+  /// The peers the drive loop ships elections and replication to: the council's current voters, plus —
+  /// while a membership change's entry is still uncommitted — the voters it is removing, so a live member
+  /// demoted to learner receives the entry that removes it ([`RaftNode::replication_targets`]).
   pub fn voters(&self) -> Vec<HostId> {
-    self.raft.all_voters()
+    self.raft.replication_targets()
   }
 
   /// The leader-contact count (see the field): the drive loop's election timer resets while this advances.
@@ -360,12 +391,38 @@ impl RegionalCouncil {
     proposed
   }
 
-  /// Whether `node` is a **voter** of this council — a member of the Raft consensus set. A non-voter
-  /// (a **learner**) does not vote; it learns the committed configuration by fetching it from a voter and
-  /// [`adopt`](RegionalCouncil::adopt)ing it. The drive loop reads this to take the voter path (drive the
-  /// Raft) or the learner path (fetch).
+  /// Whether `node` is a **voter** of this council — a member of the Raft consensus set in effect now. A
+  /// non-voter (a **learner**) does not vote; it learns the committed configuration by fetching it from a
+  /// voter and [`adopt`](RegionalCouncil::adopt)ing it. The drive loop reads this to take the voter path
+  /// (drive the Raft) or the learner path (fetch). A voter a committed change removed is no longer one.
   pub fn is_voter(&self, node: HostId) -> bool {
-    self.raft.all_voters().contains(&node)
+    self.raft.is_voter(node)
+  }
+
+  /// **DRIVE** (leader): keeps the council's Raft voter set equal to [`council_voters`] of the committed
+  /// membership, one joint change at a time (Raft §6): when a committed admit, retire or takeover has moved
+  /// the members so that the target voter set differs from the one in force, the leader begins the joint
+  /// change to it; once that entry has committed (the log is caught up again) it completes the change; and
+  /// once `C_new` has committed the voters match the target and this is a no-op. Gated on
+  /// [`caught_up`](RegionalCouncil::caught_up) like [`reconcile_alive`](RegionalCouncil::reconcile_alive),
+  /// so a change in flight is never re-proposed. Returns whether it appended a configuration entry. A dead
+  /// voter thereby leaves the consensus set — it stops counting toward every majority — and the next member
+  /// in id order is promoted in its place, so the council keeps tolerating `f` failures; a leader the target
+  /// no longer names steps down once `C_new` commits (the core's rule) and the new voters elect among
+  /// themselves.
+  pub fn reconcile_voters(&mut self) -> bool {
+    if !self.is_leader() || !self.caught_up() {
+      return false;
+    }
+    if self.raft.in_joint_configuration() {
+      // The joint entry has committed: leave the joint phase for the new voter set alone.
+      return self.raft.complete_membership_change();
+    }
+    let target = council_voters(&self.configuration.members, self.configuration.quorum);
+    if target.is_empty() || target == self.raft.all_voters() {
+      return false;
+    }
+    self.raft.begin_membership_change(target)
   }
 
   /// Adopts a configuration a **learner** fetched from a council voter (§4.8, D-14: the council is a small
@@ -382,9 +439,15 @@ impl RegionalCouncil {
   }
 
   /// Applies every committed but not-yet-applied command to the regional configuration, in commit order —
-  /// the deterministic fold every voter makes, so the configuration is the same on all of them.
+  /// the deterministic fold every voter makes, so the configuration is the same on all of them. The fold
+  /// starts from the formed base: a node's first fold replaces whatever configuration it holds (a learner's
+  /// adopted one, once it is promoted to voter and the leader replicates the log to it) with the base, so
+  /// the log's commands are applied exactly once from the same starting point on every voter.
   fn apply_committed(&mut self) {
     let committed = self.raft.committed_entries().to_vec();
+    if self.applied == 0 && !committed.is_empty() {
+      self.configuration = self.base.clone();
+    }
     while let Some(entry) = committed.get(usize::try_from(self.applied).unwrap_or(usize::MAX)) {
       if let Some(command) = ConfigCommand::decode(&entry.command) {
         self.apply_regional(command);
@@ -719,6 +782,239 @@ mod tests {
     assert!(
       follower.configuration().epochs.get(&A).copied() == Some(a_epoch_after),
       "and the follower applied the same bump — the council agrees on the fencing epoch"
+    );
+  }
+
+  const C: HostId = HostId(4);
+
+  /// A council per node over `members` at f=1, every node seeded with the same voters
+  /// ([`council_voters`]: the lowest ids up to the candidate floor of three).
+  fn councils(members: &[HostId]) -> std::collections::BTreeMap<HostId, RegionalCouncil> {
+    let quorum = Quorum { f: 1 };
+    let voters = council_voters(members, quorum);
+    members
+      .iter()
+      .map(|&node| {
+        (
+          node,
+          RegionalCouncil::new(
+            node,
+            members.to_vec(),
+            voters.clone(),
+            quorum,
+            std::collections::BTreeMap::new(),
+            3,
+            false,
+          ),
+        )
+      })
+      .collect()
+  }
+
+  /// Elects `candidate` with the votes of the `reachable` peers (the full pre-vote then vote round): each
+  /// request is broadcast to every reachable peer and every reply folded, until the exchange settles.
+  fn elect_among(
+    councils: &mut std::collections::BTreeMap<HostId, RegionalCouncil>,
+    candidate: HostId,
+    reachable: &[HostId],
+  ) {
+    let mut pending = councils
+      .get_mut(&candidate)
+      .map(RegionalCouncil::election_timeout)
+      .unwrap_or_default();
+    while let Some(request) = pending.pop() {
+      // The requests are identical copies, one per voter: one broadcast serves them all.
+      pending.clear();
+      for &peer in reachable.iter().filter(|peer| **peer != candidate) {
+        let reply = councils
+          .get_mut(&peer)
+          .and_then(|council| council.answer(request.clone()));
+        if let Some(reply) = reply
+          && let Some(council) = councils.get_mut(&candidate)
+        {
+          pending.extend(council.fold_reply(reply));
+        }
+      }
+    }
+  }
+
+  /// One replication round from `leader` to each of its targets that is `reachable`: the peer answers the
+  /// append and the leader folds the reply (round one carries the entry, round two the commit index).
+  fn replicate_round(
+    councils: &mut std::collections::BTreeMap<HostId, RegionalCouncil>,
+    leader: HostId,
+    reachable: &[HostId],
+  ) {
+    let targets: Vec<HostId> = councils
+      .get(&leader)
+      .map(RegionalCouncil::voters)
+      .unwrap_or_default()
+      .into_iter()
+      .filter(|peer| *peer != leader && reachable.contains(peer))
+      .collect();
+    for peer in targets {
+      let Some(append) = councils.get(&leader).and_then(|l| l.replication_for(peer)) else {
+        continue;
+      };
+      let reply = councils
+        .get_mut(&peer)
+        .and_then(|council| council.answer(RaftMessage::AppendEntries(append)));
+      if let Some(reply) = reply
+        && let Some(council) = councils.get_mut(&leader)
+      {
+        council.fold_reply(reply);
+      }
+    }
+  }
+
+  /// `rounds` replication rounds from `leader` to its reachable targets.
+  fn settle(
+    councils: &mut std::collections::BTreeMap<HostId, RegionalCouncil>,
+    leader: HostId,
+    reachable: &[HostId],
+    rounds: usize,
+  ) {
+    for _ in 0..rounds {
+      replicate_round(councils, leader, reachable);
+    }
+  }
+
+  /// Drives the voter set to follow the committed membership through its three leader periods — begin the
+  /// joint change, complete it once its entry committed, then find nothing more to do — with the
+  /// replication rounds each needs, returning what each period's `reconcile_voters` reported.
+  fn drive_voter_change(
+    councils: &mut std::collections::BTreeMap<HostId, RegionalCouncil>,
+    leader: HostId,
+    reachable: &[HostId],
+  ) -> [bool; 3] {
+    let began = councils
+      .get_mut(&leader)
+      .is_some_and(RegionalCouncil::reconcile_voters);
+    settle(councils, leader, reachable, 1);
+    let completed = councils
+      .get_mut(&leader)
+      .is_some_and(RegionalCouncil::reconcile_voters);
+    settle(councils, leader, reachable, 2);
+    let more = councils
+      .get_mut(&leader)
+      .is_some_and(RegionalCouncil::reconcile_voters);
+    [began, completed, more]
+  }
+
+  /// AC (§4.8, D-14; Raft §6): a voter the council **retires** leaves the Raft voter set — it stops
+  /// counting toward every majority — and the survivors commit alone under the new majority. Three voters
+  /// {OWNER, A, B}; B dies; the leader takes B over (committed by OWNER and A), then moves the voter set:
+  /// the joint change and `C_new` each commit with OWNER and A; afterwards `is_voter(B)` is false on both
+  /// survivors and a further change commits with A's acknowledgement alone. Before this the voter set was
+  /// fixed at boot: `is_voter(B)` stayed true after the takeover and every later commit still needed two
+  /// acknowledgements of {OWNER, A, B} — one of them the dead B's
+  /// (docs/bugs/2026-09-13-raft-voter-set-never-shrinks.md).
+  #[test]
+  fn a_retired_voter_leaves_the_council_and_the_survivors_commit_alone() {
+    let members = [OWNER, A, B];
+    let mut councils = councils(&members);
+    elect_among(&mut councils, OWNER, &members);
+    assert!(councils[&OWNER].is_leader());
+
+    // B dies: the leader takes it over, and the survivors commit the takeover (two of three). The takeover
+    // alone leaves the voter set untouched — the voter change follows.
+    let survivors = [OWNER, A];
+    let proposed = councils
+      .get_mut(&OWNER)
+      .is_some_and(|leader| leader.reconcile_alive(&survivors));
+    settle(&mut councils, OWNER, &survivors, 2);
+    assert_eq!(
+      (
+        proposed,
+        councils[&OWNER].configuration().members.contains(&B),
+        councils[&OWNER].is_voter(B),
+      ),
+      (true, false, true),
+      "the takeover was proposed, committed and retired B; B still votes until the voter change"
+    );
+
+    // The voter set follows the committed membership: the joint change, then C_new, each committed by
+    // the two survivors; then nothing more to do.
+    assert_eq!(
+      drive_voter_change(&mut councils, OWNER, &survivors),
+      [true, true, false],
+      "began the joint change, completed it once committed, then settled"
+    );
+    assert_eq!(
+      (
+        councils[&OWNER].is_voter(B),
+        councils[&A].is_voter(B),
+        councils[&OWNER].voters(),
+      ),
+      (false, false, vec![OWNER, A]),
+      "B left the voter set on both survivors"
+    );
+
+    // A further change commits with A's acknowledgement alone — a majority of the two remaining voters.
+    let admitted = councils
+      .get_mut(&OWNER)
+      .is_some_and(|leader| leader.propose(Reconfiguration::Admit(C)));
+    settle(&mut councils, OWNER, &survivors, 2);
+    assert_eq!(
+      (
+        admitted,
+        councils[&OWNER].configuration().members.contains(&C),
+        councils[&A].configuration().members.contains(&C),
+      ),
+      (true, true, true),
+      "the survivors commit and apply a further change alone"
+    );
+  }
+
+  /// AC (§4.8, D-14 — "a small elected council"): beyond the candidate floor the extra members are learners;
+  /// when a voter dies the next member in id order is **promoted** to voter in its place, so the council
+  /// keeps tolerating `f` failures — and the promoted learner, which had *adopted* a fetched configuration
+  /// as learners do, re-folds the committed log from the formed base, so its configuration equals the
+  /// voters' exactly (members, version and the dead voter's fencing epoch, bumped once, not twice). Four
+  /// members at f=1: voters {OWNER, A, B}, learner C; B dies; C becomes a voter.
+  #[test]
+  fn a_learner_is_promoted_when_a_voter_dies() {
+    let members = [OWNER, A, B, C];
+    let mut councils = councils(&members);
+    let learner_at_boot = !councils[&C].is_voter(C);
+    elect_among(&mut councils, OWNER, &[OWNER, A, B]);
+    assert!(councils[&OWNER].is_leader());
+
+    // B dies; the leader takes it over, committed by OWNER and A. The learner then fetches and adopts the
+    // committed configuration, as the fleet's learner path does.
+    let alive = [OWNER, A, C];
+    let proposed = councils
+      .get_mut(&OWNER)
+      .is_some_and(|leader| leader.reconcile_alive(&alive));
+    settle(&mut councils, OWNER, &alive, 2);
+    let fetched = councils[&OWNER].configuration().clone();
+    let adopted = councils
+      .get_mut(&C)
+      .is_some_and(|learner| learner.adopt(fetched));
+    assert_eq!(
+      (learner_at_boot, proposed, adopted),
+      (true, true, true),
+      "C was a learner beyond the candidate floor; B's takeover committed; C adopted the fetched configuration"
+    );
+
+    // The voter set follows: C is the next member in id order, so it is promoted in B's place.
+    assert_eq!(
+      drive_voter_change(&mut councils, OWNER, &alive),
+      [true, true, false]
+    );
+    assert_eq!(
+      (
+        councils[&OWNER].is_voter(C),
+        councils[&C].is_voter(C),
+        councils[&OWNER].is_voter(B),
+      ),
+      (true, true, false),
+      "C is a voter now on the leader and on itself; the dead B is not"
+    );
+    assert_eq!(
+      councils[&C].configuration(),
+      councils[&OWNER].configuration(),
+      "the promoted learner re-folded the log from the base: its configuration is the leader's, exactly"
     );
   }
 }

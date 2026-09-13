@@ -84,6 +84,7 @@ use slates_cluster::raft_wire::{
   RaftMessage, decode_regional_configuration, decode_root_configuration,
   encode_regional_configuration, encode_root_configuration,
 };
+use slates_cluster::root_group::root_representatives;
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once};
 use slates_cluster::{
   ClusterError, CommitBudget, DispatchWait, PROMOTE_STREAM, RECORD_STREAM, Reply, Stragglers,
@@ -1013,20 +1014,31 @@ fn accept_held_record(
   if record.generation > state.council.configuration().version {
     state.config_refresh_wanted = true;
   }
-  let accepted = {
-    let acceptor = state
-      .holder_records
-      .entry(record.object)
-      .or_insert_with(|| {
-        Acceptor::new(
-          local,
-          Authority {
-            generation,
-            owner: peer_host,
-          },
-        )
-      });
-    acceptor.accept(record)
+  let accepted = match state.holder_records.get_mut(&record.object) {
+    Some(acceptor) => acceptor.accept(record),
+    None => {
+      // The object's first record: the acceptor exists only once it has **accepted** one. A refused first
+      // record — this holder has not yet installed the generation the record names (the owner installed the
+      // committed configuration a heartbeat before this holder did), or it is unauthorized — leaves no
+      // acceptor behind. Creating one anyway pinned it at this holder's *stale* generation: the routing view
+      // learns an object only on acceptance, so `reconcile_held_authority` never raised that acceptor at the
+      // install, and it refused every re-ship of the head `ForeignGeneration` for good — a volume provisioned
+      // in the window between the owner's install and the holder's never placed
+      // (`docs/bugs/2026-09-13-raft-voter-set-never-shrinks.md`, sibling). With no acceptor left behind, the
+      // owner's next re-ship after the install creates it at the current generation and is accepted.
+      let mut acceptor = Acceptor::new(
+        local,
+        Authority {
+          generation,
+          owner: peer_host,
+        },
+      );
+      let result = acceptor.accept(record);
+      if result.is_ok() {
+        state.holder_records.insert(record.object, acceptor);
+      }
+      result
+    }
   };
   match accepted {
     Ok(ack) => {
@@ -2265,7 +2277,11 @@ async fn drive_config_council(
     // detection need not.
     state::with_state(|s| {
       let alive = s.fleet.membership().alive();
-      s.council.reconcile_alive(&alive)
+      s.council.reconcile_alive(&alive);
+      // The voter set follows the committed membership (Raft §6, one joint change at a time): a retired voter
+      // leaves the consensus set — it stops counting toward every majority — and the next member in id order
+      // is promoted in its place, so the council keeps tolerating `f` failures.
+      s.council.reconcile_voters()
     });
     drive_council_replication(&others, budget, in_flight).await;
     // CheckQuorum (Raft §6.2) on the election-timeout cadence: `idle` counts the leader's periods since its
@@ -2301,6 +2317,14 @@ async fn drive_config_council(
     // makes this node leader next period; a lost one waits out the timer again.
     *seen_contact = state::with_state(|s| s.council.leader_contact()).unwrap_or(*seen_contact);
   }
+}
+
+/// Each alive region's **representative** host as this node sees it (§4.8, D-14): the lowest-id host of the
+/// SWIM alive set in each region ([`root_representatives`] over the alive hosts and the fleet's host→region
+/// assignment). The root leader moves the root voter set to the representatives of the committed regions
+/// (`RootGroup::reconcile_voters`), so a region whose representative died is carried by its next live host.
+fn alive_representatives(state: &ShardState) -> std::collections::BTreeMap<RegionId, HostId> {
+  root_representatives(&state.fleet.membership().alive(), &state.node_regions)
 }
 
 /// The regions currently **alive** as this node sees them (§4.8, D-14): the distinct regions of the SWIM
@@ -2389,7 +2413,12 @@ async fn drive_root_group(
     // transport by the replication below and applied on every root voter.
     state::with_state(|s| {
       let alive = alive_regions(s);
-      s.root.reconcile_regions(&alive, &s.region_mirrors)
+      s.root.reconcile_regions(&alive, &s.region_mirrors);
+      // The root voter set follows the committed regions and their live representatives (Raft §6, one joint
+      // change at a time): a dead representative leaves the root consensus set, and a region whose
+      // representative died is carried by its next live host.
+      let representatives = alive_representatives(s);
+      s.root.reconcile_voters(&representatives)
     });
     drive_root_replication(&others, budget, in_flight).await;
     // CheckQuorum (Raft §6.2) on the election-timeout cadence, as the council's above: every

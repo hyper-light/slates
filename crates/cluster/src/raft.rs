@@ -35,8 +35,13 @@
 //! [`complete_membership_change`](RaftNode::complete_membership_change) append `C_old,new`/`C_new`
 //! configuration entries that take effect the moment they are appended (the effective configuration is
 //! derived from the log, so a truncated entry reverts it) and replicate like any entry; compaction folds
-//! a discarded configuration into the base, and install-snapshot carries it, so it is never lost. This
-//! completes the dialect's core.
+//! a discarded configuration into the base, and install-snapshot carries it, so it is never lost. One
+//! change is in flight at a time (a configuration entry is appended only once the previous one has
+//! committed — Ongaro's thesis §4.1, the rule that keeps two changes from producing disjoint majorities);
+//! a leader whose own removal commits **steps down** (§4.2.2); a node outside its effective configuration
+//! never campaigns; and the leader keeps replicating to the **outgoing** voters until the entry that
+//! removes them commits, so a live member demoted to learner learns its own removal
+//! ([`replication_targets`](RaftNode::replication_targets)). This completes the dialect's core.
 //!
 //! Degenerate on a laptop (`f = 0`): one voter, itself; a pre-vote and an election each reach a majority
 //! of one at once, an appended entry commits at once, and the lone voter is always its own quorum so it
@@ -360,7 +365,13 @@ impl RaftNode {
   /// win. A single voter's pre-vote already carries a majority, so it proceeds straight to a real
   /// election and leads (the `f = 0` degenerate, no messages). Preferring this over a direct
   /// `start_election` is what keeps a partitioned, term-inflated node from disrupting a healthy leader.
+  /// A node that is **not a voter** of its effective configuration — removed by a committed membership
+  /// change, or a learner that never was one — does not campaign at all (Ongaro's thesis §4.2.3: a
+  /// removed server that kept campaigning would disrupt the cluster it no longer belongs to).
   pub fn on_election_timeout(&mut self) -> Vec<PreVote> {
+    if !self.is_voter(self.id) {
+      return Vec::new();
+    }
     self.has_leader = false;
     self.leader_hint = None;
     self.role = Role::PreCandidate;
@@ -531,6 +542,96 @@ impl RaftNode {
       set.extend(new);
     }
     set.into_iter().collect()
+  }
+
+  /// Whether `node` votes under the configuration in effect now — the base set, or either set of a joint
+  /// change in flight. A removed voter stops being one the moment the entry that removes it is appended.
+  pub fn is_voter(&self, node: HostId) -> bool {
+    self.all_voters().contains(&node)
+  }
+
+  /// The peers the leader replicates to: every current voter ([`all_voters`](RaftNode::all_voters)),
+  /// plus — while the latest configuration entry is still uncommitted — the **outgoing** voters of the
+  /// configuration it replaces. An outgoing voter that is alive (a member demoted to learner because a
+  /// lower-id member joined the council) thereby receives the entry that removes it in the same rounds
+  /// that commit it, learns it is no longer a voter, and stops campaigning; a dead one costs nothing
+  /// (there is no session to it). Bounded: the extra targets drop out the moment the change commits.
+  pub fn replication_targets(&self) -> Vec<HostId> {
+    let mut set: BTreeSet<HostId> = self.all_voters().into_iter().collect();
+    if self.latest_config_index() > self.commit_index
+      && let Some(outgoing) = self.config_before_latest()
+    {
+      set.extend(outgoing.voters);
+      if let Some(joint) = outgoing.joint {
+        set.extend(joint);
+      }
+    }
+    set.into_iter().collect()
+  }
+
+  /// The one-based log index of the most recent configuration entry, or zero when the log holds none
+  /// (the effective configuration is then the base).
+  fn latest_config_index(&self) -> u64 {
+    self
+      .log
+      .iter()
+      .rposition(|entry| entry.config.is_some())
+      .and_then(|position| u64::try_from(position).ok())
+      .map_or(0, |position| {
+        self
+          .snapshot_index
+          .saturating_add(position)
+          .saturating_add(1)
+      })
+  }
+
+  /// The configuration the latest configuration entry replaced: the previous configuration entry in the
+  /// log, or the base when it is the only one. `None` when the log holds no configuration entry.
+  fn config_before_latest(&self) -> Option<VoterConfig> {
+    let latest = self.log.iter().rposition(|entry| entry.config.is_some())?;
+    let previous = self.log[..latest]
+      .iter()
+      .rev()
+      .find_map(|entry| entry.config.clone());
+    Some(previous.unwrap_or(VoterConfig {
+      voters: self.voters.clone(),
+      joint: self.joint.clone(),
+    }))
+  }
+
+  /// The configuration in force **at the commit index**: the most recent configuration entry at or below
+  /// it, or the base when none is committed — what a leader consults to learn that its own removal has
+  /// committed.
+  fn committed_config(&self) -> VoterConfig {
+    let committed = usize::try_from(self.commit_index.saturating_sub(self.snapshot_index))
+      .unwrap_or(usize::MAX)
+      .min(self.log.len());
+    for entry in self.log[..committed].iter().rev() {
+      if let Some(config) = &entry.config {
+        return config.clone();
+      }
+    }
+    VoterConfig {
+      voters: self.voters.clone(),
+      joint: self.joint.clone(),
+    }
+  }
+
+  /// A leader whose own removal has **committed** steps down (Ongaro's thesis §4.2.2): once the sole
+  /// configuration in force at the commit index no longer names it, it stops leading — it managed the
+  /// cluster through the change and now hands over to the new voters, who elect among themselves. While
+  /// the change is still joint it keeps leading (the old configuration still names it).
+  fn step_down_if_removed(&mut self) {
+    if self.role != Role::Leader {
+      return;
+    }
+    let committed = self.committed_config();
+    if committed.joint.is_none() && !committed.voters.contains(&self.id) {
+      self.role = Role::Follower;
+      self.has_leader = false;
+      self.leader_hint = None;
+      self.votes.clear();
+    }
   }
 
   /// The voter configuration in effect now: the most recent configuration entry in the log (a
@@ -910,15 +1011,17 @@ impl RaftNode {
   /// Begins a membership change to `new_voters` (Raft §6 joint consensus): the node enters a **joint
   /// configuration** where every decision — election, commit, CheckQuorum — needs a majority of both the
   /// old and the new voter sets, so no two disjoint majorities can form across the change. Only the
-  /// leader begins one, and not while another is in flight. Returns whether it started.
-  ///
-  /// This slice models the joint configuration and its overlapping-majority rule; wiring the transition
-  /// through the log — the `C_old,new` and `C_new` entries that take effect the moment they are appended,
-  /// and revert on truncation — is the owed second half (§6, the safety subtlety that a config change
-  /// takes effect on append, not on commit).
+  /// leader begins one, not while another is in flight, and not while the previous configuration entry
+  /// is still uncommitted (one change at a time — Ongaro's thesis §4.1: two configuration entries in
+  /// flight could let disjoint majorities form). An empty target is refused (a group cannot vote itself
+  /// out of existence). Returns whether it started.
   pub fn begin_membership_change(&mut self, new_voters: Vec<HostId>) -> bool {
     let current = self.effective_config();
-    if self.role != Role::Leader || current.joint.is_some() {
+    if self.role != Role::Leader
+      || current.joint.is_some()
+      || new_voters.is_empty()
+      || self.latest_config_index() > self.commit_index
+    {
       return false;
     }
     // Append the joint configuration `C_old,new` as a log entry — it takes effect on append (§6), so the
@@ -936,14 +1039,17 @@ impl RaftNode {
 
   /// Completes a membership change: leaves the joint configuration, adopting the new voter set as the
   /// sole configuration (Raft §6, the transition to `C_new`). Only valid while a change is in flight, and
-  /// only once the joint configuration has itself committed (the caller's obligation until the change is
-  /// log-driven). Returns whether it completed.
+  /// only once the joint configuration entry has itself **committed** — enforced here, so a caller cannot
+  /// leave the joint phase early. Returns whether it completed. A leader not named by `C_new` keeps
+  /// leading until that entry commits, then steps down ([`advance_leader_commit`] applies §4.2.2).
+  ///
+  /// [`advance_leader_commit`]: RaftNode::advance_leader_commit
   pub fn complete_membership_change(&mut self) -> bool {
     let current = self.effective_config();
     let Some(new_voters) = current.joint else {
       return false;
     };
-    if self.role != Role::Leader {
+    if self.role != Role::Leader || self.latest_config_index() > self.commit_index {
       return false;
     }
     // Append the final configuration `C_new` (§6): the change is done once this commits.
@@ -978,7 +1084,8 @@ impl RaftNode {
   /// Advances the leader's commit index (Raft §5.4.2): the highest index a majority of voters hold whose
   /// entry is from the **current term**. Earlier-term entries are not committed by replica count alone —
   /// they commit only once a current-term entry above them does — which is the safety subtlety Raft's
-  /// figure 8 exposes.
+  /// figure 8 exposes. A commit that carries the leader's own removal into force steps it down
+  /// ([`step_down_if_removed`](RaftNode::step_down_if_removed)).
   fn advance_leader_commit(&mut self) {
     if self.role != Role::Leader {
       return;
@@ -993,6 +1100,7 @@ impl RaftNode {
           .collect();
         if self.is_majority(&holders) {
           self.commit_index = candidate;
+          self.step_down_if_removed();
           return;
         }
       }
@@ -1607,13 +1715,25 @@ mod tests {
   }
 
   /// Completing a change leaves the joint configuration for the new voter set alone, after which a
-  /// majority is measured against the new set only.
+  /// majority is measured against the new set only. It completes only once the joint entry has committed
+  /// under both sets (the core enforces the gate).
   #[test]
   fn completing_a_change_adopts_the_new_configuration() {
     let mut leader = elected_leader(A, vec![A, B, C]);
     leader.begin_membership_change(vec![C, D, E]);
     assert!(leader.in_joint_configuration());
 
+    // Commit the joint entry: B with A carries the old set {A,B,C}; C and D carry the new set {C,D,E}.
+    let term = leader.term();
+    for follower in [B, C, D] {
+      leader.on_append_reply(AppendReply {
+        follower,
+        term,
+        success: true,
+        match_index: 1,
+      });
+    }
+    assert_eq!(leader.commit_index(), 1, "the joint entry committed");
     assert!(leader.complete_membership_change(), "the change completes");
     assert!(!leader.in_joint_configuration(), "no longer joint");
     assert_eq!(
@@ -1629,6 +1749,130 @@ mod tests {
     let mut follower = RaftNode::new(A, vec![A, B, C]);
     assert!(!follower.begin_membership_change(vec![C, D, E]));
     assert!(!follower.in_joint_configuration());
+  }
+
+  /// A leader whose own removal commits **steps down** (Ongaro's thesis §4.2.2) — and only then: while the
+  /// change is joint the old configuration still names it and it keeps leading. Both configurations commit
+  /// the joint entry; `C_new` commits under the new majority alone; the leader is then a follower, no
+  /// longer a voter, and never campaigns again.
+  #[test]
+  fn a_removed_leader_steps_down_once_its_removal_commits() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    assert!(leader.begin_membership_change(vec![B, C]));
+    let term = leader.term();
+    let reply = |follower, match_index| AppendReply {
+      follower,
+      term,
+      success: true,
+      match_index,
+    };
+    // The joint entry (index 1): B with A carries the old set but not the new one, so the change cannot
+    // complete yet; C's acknowledgement commits it, and the joint configuration still names the leader.
+    leader.on_append_reply(reply(B, 1));
+    let completed_early = leader.complete_membership_change();
+    leader.on_append_reply(reply(C, 1));
+    let joint = (completed_early, leader.commit_index(), leader.is_leader());
+    assert_eq!(
+      joint,
+      (false, 1, true),
+      "no completion before the joint entry commits; committed by C; still leading while joint"
+    );
+    let completed = leader.complete_membership_change();
+    assert_eq!(
+      (completed, leader.all_voters()),
+      (true, vec![B, C]),
+      "C_new is appended once the joint entry committed"
+    );
+    // C_new (index 2) commits under the new majority alone (B and C): the leader steps down, is no longer
+    // a voter, and never campaigns again.
+    leader.on_append_reply(reply(B, 2));
+    leader.on_append_reply(reply(C, 2));
+    let campaign = leader.on_election_timeout();
+    assert_eq!(
+      (
+        leader.commit_index(),
+        leader.role(),
+        leader.is_voter(A),
+        campaign.is_empty()
+      ),
+      (2, Role::Follower, false, true),
+      "committed under the new majority; the removed leader stepped down and does not campaign"
+    );
+  }
+
+  /// One change at a time (thesis §4.1): a change cannot begin while the previous configuration entry is
+  /// uncommitted, a joint change cannot complete before its joint entry commits, and an empty voter set is
+  /// never a target.
+  #[test]
+  fn a_change_waits_for_the_previous_configuration_entry_to_commit() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    assert!(
+      !leader.begin_membership_change(Vec::new()),
+      "an empty voter set is refused"
+    );
+    assert!(leader.begin_membership_change(vec![A, B]));
+    assert!(
+      !leader.complete_membership_change(),
+      "the joint entry is not yet committed"
+    );
+    let term = leader.term();
+    let reply = |follower, match_index| AppendReply {
+      follower,
+      term,
+      success: true,
+      match_index,
+    };
+    leader.on_append_reply(reply(B, 1));
+    assert_eq!(
+      leader.commit_index(),
+      1,
+      "A and B carry both the old and the new set"
+    );
+    assert!(leader.complete_membership_change());
+    assert!(
+      !leader.begin_membership_change(vec![A]),
+      "C_new is uncommitted: no further change may begin"
+    );
+    leader.on_append_reply(reply(B, 2));
+    assert_eq!(leader.commit_index(), 2);
+    assert!(
+      leader.begin_membership_change(vec![A]),
+      "once it commits the next change may begin"
+    );
+  }
+
+  /// Outgoing voters stay replication targets until the entry that removes them commits — so a live
+  /// member demoted to learner receives it — and drop out the moment it does.
+  #[test]
+  fn outgoing_voters_are_replicated_to_until_their_removal_commits() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    assert!(leader.begin_membership_change(vec![A, B]));
+    let term = leader.term();
+    let reply = |follower, match_index| AppendReply {
+      follower,
+      term,
+      success: true,
+      match_index,
+    };
+    leader.on_append_reply(reply(B, 1));
+    assert!(leader.complete_membership_change());
+    assert_eq!(
+      leader.all_voters(),
+      vec![A, B],
+      "C_new is in effect on append"
+    );
+    assert_eq!(
+      leader.replication_targets(),
+      vec![A, B, C],
+      "C, outgoing, is still replicated to while C_new is uncommitted"
+    );
+    leader.on_append_reply(reply(B, 2));
+    assert_eq!(leader.commit_index(), 2);
+    assert_eq!(
+      leader.replication_targets(),
+      vec![A, B],
+      "committed: the outgoing voter drops out"
+    );
   }
 
   /// Compaction (Raft §7) folds the committed prefix into a snapshot and discards it, bounding the log,

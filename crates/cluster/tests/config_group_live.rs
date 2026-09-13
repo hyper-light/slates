@@ -191,6 +191,199 @@ fn run_distributed_membership_change() -> Outcome {
   outcome
 }
 
+/// A voter of the three-voter council that has **died**: it has no endpoint, answers nothing, and the two
+/// live voters must retire it and carry the council alone.
+const DEAD: HostId = HostId(4);
+/// Shape: the requests the live voter serves in the voter-removal round — the leader's sequence over the
+/// transport is one pre-vote and one vote (the election), then four two-round replications (the takeover,
+/// the joint configuration entry, `C_new`, and the further admission — each an entry round and a commit
+/// heartbeat).
+const REMOVAL_SERVES: usize = 10;
+
+/// A three-voter council on `node`, members and voters `[LEADER, VOTER, DEAD]` at f=1 (the candidate floor:
+/// every member votes).
+fn council_of_three(node: HostId) -> RegionalCouncil {
+  RegionalCouncil::new(
+    node,
+    vec![LEADER, VOTER, DEAD],
+    vec![LEADER, VOTER, DEAD],
+    Quorum { f: 1 },
+    BTreeMap::new(),
+    SCATTER,
+    false,
+  )
+}
+
+/// What the live voter removal produced at the leader and the surviving voter.
+struct RemovalOutcome {
+  leader_leads: bool,
+  dead_retired_at_leader: bool,
+  dead_is_voter_at_leader: bool,
+  dead_is_voter_at_voter: bool,
+  leader_voters: Vec<HostId>,
+  admitted_at_leader: bool,
+  admitted_at_voter: bool,
+}
+
+/// Drives the live voter removal: the leader (`1`) wins the live voter's (`2`) pre-vote then vote — a majority
+/// of three with the dead voter (`4`) silent — takes the dead voter over, moves the voter set to the two
+/// survivors through the joint change and `C_new` (each committed by the live voter's acknowledgement alone,
+/// carried as configuration entries on the wire), and then commits a further change under the new majority
+/// of two. Every step rides the transport; the live voter's council applies the same log.
+fn run_voter_removal_over_the_transport() -> RemovalOutcome {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+
+  let leader_identity = self_signed(NAME);
+  let leader_cert = leader_identity.certificate();
+  let voter_identity = self_signed(NAME);
+  let voter_cert = voter_identity.certificate();
+
+  let (leader_port_tx, leader_port_rx) = channel::<u16>();
+  let (voter_port_tx, voter_port_rx) = channel::<u16>();
+  let (result_tx, result_rx) = channel::<RemovalOutcome>();
+  let (voter_tx, voter_rx) = channel::<(bool, bool)>();
+
+  // The live voter: handshake, then serve the leader's whole sequence into its council.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = voter_port_tx.send(socket.local_addr().unwrap().port());
+      let leader_port = recv_port(leader_port_rx).await;
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, leader_port);
+      let mut endpoint = Endpoint::server(
+        socket,
+        peer,
+        &voter_identity,
+        std::slice::from_ref(&leader_cert),
+        FRAME_CAP,
+      )
+      .unwrap();
+      endpoint.establish().await.unwrap();
+
+      let mut voter = council_of_three(VOTER);
+      for _ in 0..REMOVAL_SERVES {
+        endpoint
+          .serve_once(|_, request| match RaftMessage::decode(&request) {
+            Ok(message) => voter
+              .answer(message)
+              .map(|reply| reply.encode())
+              .unwrap_or_default(),
+            Err(_) => Vec::new(),
+          })
+          .await
+          .unwrap();
+      }
+      let _ = voter_tx.send((
+        voter.is_voter(DEAD),
+        voter.configuration().members.contains(&ADMITTED),
+      ));
+    })
+    .unwrap();
+
+  // The leader: dial the live voter, win the election, retire the dead voter, move the voter set, commit on.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = leader_port_tx.send(socket.local_addr().unwrap().port());
+      let voter_port = recv_port(voter_port_rx).await;
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, voter_port);
+      let mut endpoint =
+        Endpoint::client(socket, peer, &leader_identity, &voter_cert, NAME, FRAME_CAP).unwrap();
+      endpoint.establish().await.unwrap();
+
+      let mut leader = council_of_three(LEADER);
+
+      // The election over the transport: the requests come one per other voter and are identical, so one
+      // is sent to the live voter and the rest dropped (the dead voter would never answer); a granted pre-vote
+      // from the live voter is a majority of three with the leader's own, as is the real vote.
+      let mut pending = leader.election_timeout();
+      while let Some(request) = pending.pop() {
+        pending.clear();
+        if let Some(reply) = request_raft(&mut endpoint, &request).await.unwrap() {
+          pending.extend(leader.fold_reply(reply));
+        }
+      }
+      let leader_leads = leader.is_leader();
+
+      // Two replication rounds to the live voter: the entry, then the commit heartbeat.
+      let replicate = async |leader: &mut RegionalCouncil, endpoint: &mut Endpoint| {
+        for _ in 0..2 {
+          if let Some(append) = leader.replication_for(VOTER)
+            && let Some(reply) = request_raft(endpoint, &RaftMessage::AppendEntries(append))
+              .await
+              .unwrap()
+          {
+            leader.fold_reply(reply);
+          }
+        }
+      };
+
+      // The dead voter is taken over (committed by the live voter's acknowledgement: two of three).
+      leader.reconcile_alive(&[LEADER, VOTER]);
+      replicate(&mut leader, &mut endpoint).await;
+      let dead_retired_at_leader = !leader.configuration().members.contains(&DEAD);
+      // The voter set follows: the joint change, then C_new, each committed by the live voter alone.
+      leader.reconcile_voters();
+      replicate(&mut leader, &mut endpoint).await;
+      leader.reconcile_voters();
+      replicate(&mut leader, &mut endpoint).await;
+      // A further change commits under the new majority of two.
+      leader.propose(Reconfiguration::Admit(ADMITTED));
+      replicate(&mut leader, &mut endpoint).await;
+
+      let _ = result_tx.send(RemovalOutcome {
+        leader_leads,
+        dead_retired_at_leader,
+        dead_is_voter_at_leader: leader.is_voter(DEAD),
+        dead_is_voter_at_voter: true,
+        leader_voters: leader.voters(),
+        admitted_at_leader: leader.configuration().members.contains(&ADMITTED),
+        admitted_at_voter: false,
+      });
+    })
+    .unwrap();
+
+  sim.run_until_idle();
+  let mut outcome = result_rx.try_recv().unwrap();
+  let (dead_is_voter_at_voter, admitted_at_voter) = voter_rx.try_recv().unwrap();
+  outcome.dead_is_voter_at_voter = dead_is_voter_at_voter;
+  outcome.admitted_at_voter = admitted_at_voter;
+  outcome
+}
+
+/// AC (§4.8, D-14; Raft §6): over the transport, a council whose voter **died** retires it from the Raft
+/// voter set — the configuration entries ride the wire, the joint change and `C_new` each commit on the one
+/// live voter's acknowledgement, and afterwards the dead voter counts toward no majority: a further change
+/// commits with the live voter alone and applies at both. Before this the voter set was fixed at boot: the
+/// dead voter stayed a voter for good and the council kept needing two of {leader, live voter, dead}.
+#[test]
+fn a_dead_voter_is_removed_from_the_council_across_the_transport() {
+  let outcome = run_voter_removal_over_the_transport();
+  assert!(
+    outcome.leader_leads,
+    "the leader won the pre-vote and the vote with the live voter — a majority of three"
+  );
+  assert!(
+    outcome.dead_retired_at_leader,
+    "the dead voter's takeover committed at the majority"
+  );
+  assert!(
+    !outcome.dead_is_voter_at_leader,
+    "the dead voter left the leader's voter set: {:?}",
+    outcome.leader_voters
+  );
+  assert!(
+    !outcome.dead_is_voter_at_voter,
+    "and the live voter's — the configuration entries replicated over the wire"
+  );
+  assert_eq!(outcome.leader_voters, vec![LEADER, VOTER]);
+  assert!(
+    outcome.admitted_at_leader && outcome.admitted_at_voter,
+    "a further change commits under the new majority of two and applies at both"
+  );
+}
+
 /// A regional council elects a leader through the pre-vote round over the transport and commits a membership
 /// change at the majority, applying it to the regional configuration at both voters — the config group is
 /// genuinely distributed, not the lone-voter degenerate.

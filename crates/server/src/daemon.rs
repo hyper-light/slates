@@ -906,22 +906,6 @@ fn handoff_of(env: &[(String, String)]) -> Result<(Handoff, usize), ServerError>
   Ok((handoff, len))
 }
 
-/// The council's voter set from the region `members` (§4.8, D-14 — "a small elected council per region"):
-/// the members with the lowest ids up to the candidate floor `2f + 1`, so the council tolerates `f` voter
-/// failures while staying small even in a large region; the members beyond it are **learners** that fetch
-/// the committed configuration rather than voting. Deterministic from the members (sorted by id), so every
-/// node computes the same voter set — the consensus group they all agree on. At `2f + 1` members or fewer
-/// every member votes (no learners), so a small fleet is unchanged.
-fn council_voters(
-  members: &[slates_db::HostId],
-  quorum: slates_db::register::Quorum,
-) -> Vec<slates_db::HostId> {
-  let mut sorted = members.to_vec();
-  sorted.sort_unstable_by_key(|host| host.0);
-  sorted.truncate(quorum.candidates().min(sorted.len()));
-  sorted
-}
-
 /// A host's region, or the sole region `RegionId(0)` when the deployment declares none (§4.8, D-14 — the
 /// single-region default, which collapses the root group to the degenerate self-leading group, R8).
 fn region_of(
@@ -949,27 +933,19 @@ fn fleet_regions(
   out
 }
 
-/// The root group's voters — one representative host per region (the lowest host id in each region), the
-/// small elected set that carries the cross-region consensus (§4.8, D-14 — "a small set, one or a few per
-/// region"). Deterministic from the members and their regions, so every node derives the same voter set.
+/// The root group's voters at boot — one representative host per region (the lowest host id in each region,
+/// [`slates_cluster::root_group::root_representatives`]), the small elected set that carries the cross-region
+/// consensus (§4.8, D-14 — "a small set, one or a few per region"). Deterministic from the members and their
+/// regions, so every node derives the same voter set; thereafter the root leader keeps the voter set equal to
+/// the representatives of the regions still committed and alive (`fleet::alive_representatives`).
 fn root_voters(
   members: &[slates_db::HostId],
   regions: &std::collections::BTreeMap<slates_db::HostId, slates_db::register::RegionId>,
 ) -> Vec<slates_db::HostId> {
-  let mut by_region: std::collections::BTreeMap<slates_db::register::RegionId, slates_db::HostId> =
-    std::collections::BTreeMap::new();
-  for &host in members {
-    let region = region_of(host, regions);
-    by_region
-      .entry(region)
-      .and_modify(|rep| {
-        if host.0 < rep.0 {
-          *rep = host;
-        }
-      })
-      .or_insert(host);
-  }
-  let mut voters: Vec<slates_db::HostId> = by_region.into_values().collect();
+  let mut voters: Vec<slates_db::HostId> =
+    slates_cluster::root_group::root_representatives(members, regions)
+      .into_values()
+      .collect();
   voters.sort_unstable_by_key(|host| host.0);
   voters
 }
@@ -1109,7 +1085,7 @@ fn init_shard(
       // members with the lowest ids up to the candidate floor `2f+1`, so it tolerates `f` voter failures
       // while staying small even in a large region; the rest are learners that fetch the committed
       // configuration. Deterministic from the members, so every node derives the same voter set.
-      let voters = council_voters(&members, membership.quorum);
+      let voters = slates_cluster::config_group::council_voters(&members, membership.quorum);
       slates_cluster::config_group::RegionalCouncil::new(
         host,
         members,

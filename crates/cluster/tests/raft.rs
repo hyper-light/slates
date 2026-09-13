@@ -349,3 +349,46 @@ fn a_joint_change_commits_only_with_both_configurations() {
     "a majority of both configurations commits the joint entry and the command"
   );
 }
+
+/// A voter that dies is **removed** and the survivors commit under the new majority (Raft §6; thesis
+/// §4.1): in a three-node cluster C stops exchanging messages; the leader moves the configuration to
+/// {A, B} — the joint entry commits with A and B (a majority of both sets), `C_new` commits with them alone
+/// — after which C is a voter on neither survivor and a further entry commits with A and B, where before
+/// every commit still needed two of three including the dead C. Election Safety holds throughout.
+#[test]
+fn a_removed_voter_leaves_and_the_survivors_commit_under_the_new_majority() {
+  let c = HostId(3);
+  let mut cluster = Cluster::new(3);
+  cluster.elect(A, &all(3));
+  assert!(cluster.at(A).is_leader());
+
+  // C dies: only A and B exchange messages from here on.
+  let survivors: BTreeSet<HostId> = [A, B].into_iter().collect();
+  assert!(cluster.at(A).begin_membership_change(vec![A, B]));
+  cluster.replicate(A, &survivors);
+  assert_eq!(
+    cluster.at(A).commit_index(),
+    1,
+    "the joint entry commits: A and B carry the old set and the new"
+  );
+  assert!(cluster.at(A).complete_membership_change());
+  cluster.replicate(A, &survivors);
+  assert_eq!(
+    cluster.at(A).commit_index(),
+    2,
+    "C_new commits under the new majority alone"
+  );
+  assert!(
+    !cluster.at(A).is_voter(c) && !cluster.at(B).is_voter(c),
+    "C left the voter set on both survivors"
+  );
+
+  cluster.at(A).append_command(b"after".to_vec());
+  cluster.replicate(A, &survivors);
+  assert_eq!(
+    cluster.at(A).commit_index(),
+    3,
+    "a further entry commits with A and B alone — the dead voter no longer counts"
+  );
+  cluster.assert_at_most_one_leader_per_term();
+}

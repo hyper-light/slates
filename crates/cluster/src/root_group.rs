@@ -18,7 +18,16 @@
 //! replication over the cross-region transport) lives in the daemon, exactly as the regional council's drive
 //! does. This module realizes the root group's state machine and consensus; wiring it to the cross-region
 //! transport is the daemon's, and is owed.
+//!
+//! The **voter set follows the committed regions**: the root voters are the representatives of the regions
+//! in the committed root configuration ([`root_representatives`] — the lowest-id live host of each
+//! region), so when a committed retirement or promotion drops a region, or a region's representative host
+//! changes, the leader moves the Raft voter set to match through the core's joint-consensus change
+//! ([`reconcile_voters`](RootGroup::reconcile_voters)); a dead representative stops counting toward every
+//! root majority. Before this the voter set was fixed at boot and never shrank
+//! (`docs/bugs/2026-09-13-raft-voter-set-never-shrinks.md`).
 
+use std::collections::BTreeMap;
 use std::mem::size_of;
 
 use slates_db::register::{HostId, OBJECT_BYTES, ObjectId, RegionId, RootConfiguration};
@@ -132,6 +141,32 @@ fn take_object(bytes: &[u8]) -> Option<(ObjectId, &[u8])> {
   Some((ObjectId(id), rest))
 }
 
+/// Each region's **representative** host among `hosts` — the lowest host id in the region — the one host
+/// per region that carries the root group's consensus (§4.8, D-14 — "a small set, one or a few per
+/// region"). A host absent from `regions` is in the sole region `RegionId(0)`. Deterministic from the hosts
+/// and their regions, so every node derives the same representatives: at boot from the manifest's members
+/// (the initial root voters), and each period from the hosts currently alive (the target
+/// [`RootGroup::reconcile_voters`] moves the voter set to, so a region whose representative died is carried
+/// by its next host).
+pub fn root_representatives(
+  hosts: &[HostId],
+  regions: &BTreeMap<HostId, RegionId>,
+) -> BTreeMap<RegionId, HostId> {
+  let mut by_region: BTreeMap<RegionId, HostId> = BTreeMap::new();
+  for &host in hosts {
+    let region = regions.get(&host).copied().unwrap_or(RegionId(0));
+    by_region
+      .entry(region)
+      .and_modify(|representative| {
+        if host.0 < representative.0 {
+          *representative = host;
+        }
+      })
+      .or_insert(host);
+  }
+  by_region
+}
+
 /// The **root configuration group** on one node (§4.8, D-14 — the root group across regions): the multi-voter
 /// [`RaftNode`] over the root-group hosts, producing the [`RootConfiguration`] every region learns. A change
 /// commits at a majority over the (cross-region) transport — the leader [`propose`](RootGroup::propose)s, the
@@ -140,6 +175,9 @@ fn take_object(bytes: &[u8]) -> Option<(ObjectId, &[u8])> {
 pub struct RootGroup {
   raft: RaftNode,
   configuration: RootConfiguration,
+  /// The formed configuration every voter's fold starts from (see the regional council's `base`): a node
+  /// promoted to voter re-folds the whole log from this, never on top of an adopted configuration.
+  base: RootConfiguration,
   applied: u64,
   /// Monotone count of the events that defer this node's own election — a leader's append answered here, or a
   /// vote this node granted a candidate (Raft Figure 2's two follower timer-resets). The drive loop's election
@@ -161,9 +199,11 @@ impl RootGroup {
     if raft.all_voters().len() == 1 {
       let _ = raft.start_election();
     }
+    let configuration = RootConfiguration::formed(regions);
     RootGroup {
       raft,
-      configuration: RootConfiguration::formed(regions),
+      base: configuration.clone(),
+      configuration,
       applied: 0,
       leader_contact: 0,
     }
@@ -187,9 +227,11 @@ impl RootGroup {
     self.raft.leader()
   }
 
-  /// The group's voter set — the small consensus group the drive loop ships elections and replication to.
+  /// The peers the drive loop ships elections and replication to: the group's current voters, plus — while a
+  /// membership change's entry is still uncommitted — the voters it is removing, so a live host demoted from
+  /// representative receives the entry that removes it ([`RaftNode::replication_targets`]).
   pub fn voters(&self) -> Vec<HostId> {
-    self.raft.all_voters()
+    self.raft.replication_targets()
   }
 
   /// The leader-contact count (see the field): the drive loop's election timer resets while this advances.
@@ -372,10 +414,41 @@ impl RootGroup {
     proposed
   }
 
-  /// Whether `node` is a **voter** of this root group — a host of its Raft consensus set. A non-voter learns
-  /// the committed root configuration by fetching it and [`adopt`](RootGroup::adopt)ing it.
+  /// Whether `node` is a **voter** of this root group — a host of its Raft consensus set in effect now. A
+  /// non-voter learns the committed root configuration by fetching it and [`adopt`](RootGroup::adopt)ing it.
+  /// A voter a committed change removed is no longer one.
   pub fn is_voter(&self, node: HostId) -> bool {
-    self.raft.all_voters().contains(&node)
+    self.raft.is_voter(node)
+  }
+
+  /// **DRIVE** (leader): keeps the root group's Raft voter set equal to the representatives of the regions in
+  /// the committed root configuration — `representatives` is the caller's current map of each alive region
+  /// to its representative host ([`root_representatives`] over the hosts alive now) — one joint change at a
+  /// time (Raft §6), exactly as [`RegionalCouncil::reconcile_voters`](crate::config_group::RegionalCouncil::reconcile_voters):
+  /// begin the joint change when the target differs from the voters in force, complete it once the joint
+  /// entry has committed, no-op once `C_new` has. A committed region without a representative in the map
+  /// (no host of it alive yet) contributes no voter; an empty target is never proposed. Returns whether it
+  /// appended a configuration entry. A dead representative thereby leaves the root consensus set; a region
+  /// whose representative died is carried by its next live host once the caller's map names it.
+  pub fn reconcile_voters(&mut self, representatives: &BTreeMap<RegionId, HostId>) -> bool {
+    if !self.is_leader() || !self.caught_up() {
+      return false;
+    }
+    if self.raft.in_joint_configuration() {
+      return self.raft.complete_membership_change();
+    }
+    let mut target: Vec<HostId> = self
+      .configuration
+      .regions
+      .iter()
+      .filter_map(|region| representatives.get(region).copied())
+      .collect();
+    target.sort_unstable_by_key(|host| host.0);
+    target.dedup();
+    if target.is_empty() || target == self.raft.all_voters() {
+      return false;
+    }
+    self.raft.begin_membership_change(target)
   }
 
   /// Adopts a root configuration fetched from a group voter (§4.8, D-14: the root group is a small elected
@@ -391,9 +464,14 @@ impl RootGroup {
   }
 
   /// Applies every committed but not-yet-applied command to the root configuration, in commit order — the
-  /// deterministic fold every voter makes, so the configuration is the same on all of them.
+  /// deterministic fold every voter makes, so the configuration is the same on all of them. The fold starts
+  /// from the formed base (a node's first fold replaces an adopted configuration with it), so a host
+  /// promoted to voter applies the log exactly once from the same starting point as every other voter.
   fn apply_committed(&mut self) {
     let committed = self.raft.committed_entries().to_vec();
+    if self.applied == 0 && !committed.is_empty() {
+      self.configuration = self.base.clone();
+    }
     while let Some(entry) = committed.get(usize::try_from(self.applied).unwrap_or(usize::MAX)) {
       if let Some(command) = RootCommand::decode(&entry.command) {
         self.apply_root(command);
@@ -430,6 +508,153 @@ mod tests {
   const R0: RegionId = RegionId(0);
   const R1: RegionId = RegionId(1);
   const R2: RegionId = RegionId(2);
+  const P2: HostId = HostId(3);
+
+  /// A root group per representative host: the regions `[R0, R1, R2]` with `[P0, P1, P2]` as their
+  /// representatives and voters.
+  fn groups() -> BTreeMap<HostId, RootGroup> {
+    [P0, P1, P2]
+      .into_iter()
+      .map(|node| {
+        (
+          node,
+          RootGroup::new(node, vec![R0, R1, R2], vec![P0, P1, P2]),
+        )
+      })
+      .collect()
+  }
+
+  /// Elects `candidate` with the votes of the `reachable` peers (pre-vote then vote), broadcasting each
+  /// request and folding every reply until the exchange settles.
+  fn elect_among(
+    groups: &mut BTreeMap<HostId, RootGroup>,
+    candidate: HostId,
+    reachable: &[HostId],
+  ) {
+    let mut pending = groups
+      .get_mut(&candidate)
+      .map(RootGroup::election_timeout)
+      .unwrap_or_default();
+    while let Some(request) = pending.pop() {
+      pending.clear();
+      for &peer in reachable.iter().filter(|peer| **peer != candidate) {
+        let reply = groups
+          .get_mut(&peer)
+          .and_then(|group| group.answer(request.clone()));
+        if let Some(reply) = reply
+          && let Some(group) = groups.get_mut(&candidate)
+        {
+          pending.extend(group.fold_reply(reply));
+        }
+      }
+    }
+  }
+
+  /// One replication round from `leader` to each of its targets that is `reachable`.
+  fn replicate_round(
+    groups: &mut BTreeMap<HostId, RootGroup>,
+    leader: HostId,
+    reachable: &[HostId],
+  ) {
+    let targets: Vec<HostId> = groups
+      .get(&leader)
+      .map(RootGroup::voters)
+      .unwrap_or_default()
+      .into_iter()
+      .filter(|peer| *peer != leader && reachable.contains(peer))
+      .collect();
+    for peer in targets {
+      let Some(append) = groups.get(&leader).and_then(|l| l.replication_for(peer)) else {
+        continue;
+      };
+      let reply = groups
+        .get_mut(&peer)
+        .and_then(|group| group.answer(RaftMessage::AppendEntries(append)));
+      if let Some(reply) = reply
+        && let Some(group) = groups.get_mut(&leader)
+      {
+        group.fold_reply(reply);
+      }
+    }
+  }
+
+  /// AC (§4.8, D-14; Raft §6): a retired region's **representative leaves the root voter set** — it stops
+  /// counting toward every root majority — and the surviving representatives commit alone. Three regions
+  /// with representatives {P0, P1, P2}; region R2's hosts die; the leader retires R2 (committed by P0 and
+  /// P1), then moves the voter set to the representatives of the committed regions: the joint change and
+  /// `C_new` each commit with P0 and P1; afterwards `is_voter(P2)` is false on both survivors and a further
+  /// root change commits with P1's acknowledgement alone. Before this the root voter set was fixed at boot
+  /// and the dead representative counted toward every majority for good.
+  #[test]
+  fn a_retired_regions_representative_leaves_the_root_voters() {
+    let mut groups = groups();
+    elect_among(&mut groups, P0, &[P0, P1, P2]);
+    assert!(groups[&P0].is_leader());
+
+    // Region R2's hosts die: the leader retires the region (no mirror), committed by the survivors. The
+    // retirement alone leaves the voter set untouched — the voter change follows.
+    let survivors = [P0, P1];
+    let proposed = groups
+      .get_mut(&P0)
+      .is_some_and(|leader| leader.reconcile_regions(&[R0, R1], &BTreeMap::new()));
+    replicate_round(&mut groups, P0, &survivors);
+    replicate_round(&mut groups, P0, &survivors);
+    assert_eq!(
+      (
+        proposed,
+        groups[&P0].configuration().regions.contains(&R2),
+        groups[&P0].is_voter(P2),
+      ),
+      (true, false, true),
+      "the retirement was proposed, committed and dropped R2; P2 still votes until the voter change"
+    );
+
+    // The voter set follows the committed regions' representatives: the joint change, then C_new, each
+    // committed by the survivors; then nothing more.
+    let representatives: BTreeMap<RegionId, HostId> = [(R0, P0), (R1, P1)].into_iter().collect();
+    let mut steps = Vec::new();
+    for rounds in [1, 2, 0] {
+      steps.push(
+        groups
+          .get_mut(&P0)
+          .is_some_and(|leader| leader.reconcile_voters(&representatives)),
+      );
+      for _ in 0..rounds {
+        replicate_round(&mut groups, P0, &survivors);
+      }
+    }
+    assert_eq!(
+      steps,
+      vec![true, true, false],
+      "began the joint change, completed it once committed, then settled"
+    );
+    assert_eq!(
+      (
+        groups[&P0].is_voter(P2),
+        groups[&P1].is_voter(P2),
+        groups[&P0].voters(),
+      ),
+      (false, false, vec![P0, P1]),
+      "P2 left the root voter set on both survivors"
+    );
+
+    // A further root change commits with P1's acknowledgement alone.
+    let admitted = RegionId(3);
+    let proposed = groups
+      .get_mut(&P0)
+      .is_some_and(|leader| leader.propose(RootCommand::AdmitRegion(admitted)));
+    replicate_round(&mut groups, P0, &survivors);
+    replicate_round(&mut groups, P0, &survivors);
+    assert_eq!(
+      (
+        proposed,
+        groups[&P0].configuration().regions.contains(&admitted),
+        groups[&P1].configuration().regions.contains(&admitted),
+      ),
+      (true, true, true),
+      "the surviving representatives commit and apply a further change alone"
+    );
+  }
 
   /// Each root command round-trips through encode/decode, and a malformed entry decodes to `None` (applied as
   /// a safe no-op rather than panicking).
