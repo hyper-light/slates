@@ -343,9 +343,11 @@ pub fn plan(
     ) else {
       return Err(overflow(peer));
     };
-    let peer_host = member_id(host_id_of_certificate(&peer.certificate), 0);
+    let peer_anchor = host_id_of_certificate(&peer.certificate);
+    let peer_host = member_id(peer_anchor, 0);
     peer_hosts.push(peer_host);
     peers.push(FleetPeer {
+      anchor: peer_anchor,
       host: peer_host,
       address,
       record_address,

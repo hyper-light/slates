@@ -109,7 +109,7 @@ use slates_vfs::export::{Progress, SnapshotArchiver};
 
 use crate::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
 use crate::head::{HeadValue, PlacedHead, SealJob};
-use crate::state::{self, ShardState};
+use crate::state::{self, LearnedMember, ShardState};
 use crate::verbs;
 use crate::xshard::{call_within, run_on};
 
@@ -158,7 +158,14 @@ pub(crate) const POLL_PER_PERIOD: u64 = 10;
 /// pins (§4.8 "TLS 1.3 via rustls with certificates provisioned by the operator") — which is also how the
 /// serve side tells which peer dialed it (`serve_peer_records`).
 pub struct FleetPeer {
-  /// The peer's host id.
+  /// The peer's **stable anchor** — what its certificate stands for across restarts: the certificate's hash
+  /// in a deployment (`deploy::host_id_of_certificate`), the machine identity's on an in-process fleet. Every
+  /// member id the peer ever holds derives from it (`deploy::member_id(anchor, generation)`), so an id it
+  /// announces is validated against this (task #22).
+  pub anchor: HostId,
+  /// The peer's generation-0 **seed** member id, `member_id(anchor, 0)` — the id the manifest precomputes and
+  /// this node knows the peer by until the peer announces its current one on contact (a placeholder: an
+  /// anchored daemon's first boot is already generation one).
   pub host: HostId,
   /// The peer's advertised probe address — where it accepts this node's SWIM probes, and where this node
   /// dials it.
@@ -189,9 +196,11 @@ pub struct FleetTransport {
   pub peers: Vec<FleetPeer>,
 }
 
-/// What this node dials to reach one peer on one plane: the peer's host, the address on that plane, and the
-/// certificate to pin; `name` is the fleet's TLS name the session is verified under.
+/// What this node dials to reach one peer on one plane: the peer's stable anchor and its seed member id (the
+/// task follows the peer's *current* id from there, task #22), the address on that plane, and the certificate
+/// to pin; `name` is the fleet's TLS name the session is verified under.
 struct PeerDial {
+  anchor: HostId,
   host: HostId,
   name: String,
   address: SocketAddrV4,
@@ -202,6 +211,153 @@ struct PeerDial {
 /// establishes to replace it (the old is closed once the new binds, so two suffice; a third dialer from
 /// the same peer is refused typed until one releases).
 const SESSIONS_PER_PEER: usize = 2;
+
+/// A fleet peer as the serve side knows it: the certificate the handshake must present (mutual TLS admits
+/// only these), the **stable anchor** that certificate stands for, and the generation-0 **seed** id the
+/// manifest precomputed for it. The peer's *current* member id is not here: it is learned on contact and kept
+/// in [`ShardState::learned_members`] by anchor (task #22).
+#[derive(Clone)]
+struct Rostered {
+  certificate: CertificateDer<'static>,
+  anchor: HostId,
+  seed: HostId,
+}
+
+/// The peer a probe task tracks: its stable anchor (fixed for the task's life) and its **current** member id,
+/// which follows what the peer announces on contact (task #22) — a restart moves it to the new id.
+struct ProbedPeer {
+  anchor: HostId,
+  host: HostId,
+}
+
+/// Refused: a peer announced a member id that is not `member_id(anchor, generation)` for the certificate it
+/// presented — an id it could not have derived (a forgery, or a corrupted announcement). Counted in the
+/// status report's refusals, never folded.
+const MEMBER_ID_FORGED: &str = "fleet.member_id_forged";
+/// Refused: a peer announced a **lower** daemon generation than the one already learned for its anchor — a
+/// stale or replayed boot (§4.8 "a restarted host rejoins as a new member and holds nothing until its
+/// generation ... [is] validated"); the higher generation is the current incarnation, so this announcement is
+/// counted and never folded.
+const MEMBER_GENERATION_STALE: &str = "fleet.member_generation_stale";
+
+/// What learning an announced identity on contact concluded ([`classify_announced`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LearnedOutcome {
+  /// The id already known for this anchor at this generation — the ordinary contact.
+  Current,
+  /// A higher generation than known: the peer **restarted** and is a new member; `old` is the id it held
+  /// before (its seed, or its previous incarnation's id), to be retired and taken over.
+  Restarted { old: HostId },
+  /// A lower generation than known: a stale or replayed boot, refused.
+  Stale,
+  /// The announced id is not the one its anchor and generation derive to, refused.
+  Forged,
+}
+
+/// The pure decision of learn-on-contact (task #22; §4.8 "a restarted host rejoins as a new member and holds
+/// nothing until its generation ... [is] validated"): given what is `known` for `anchor` — nothing yet, or
+/// the generation and id last learned — an announcement `(generation, announced)` is **forged** unless
+/// `announced == member_id(anchor, generation)` (the id is self-certifying against the anchor the
+/// authenticated certificate stands for), **stale** if its generation is below the known one, **current** if
+/// equal, and a **restart** if above. Pure and deterministic, so it is tested by use without a fleet.
+fn classify_announced(
+  known: Option<&LearnedMember>,
+  anchor: HostId,
+  generation: u64,
+  announced: HostId,
+) -> LearnedOutcome {
+  if announced != crate::deploy::member_id(anchor, generation) {
+    return LearnedOutcome::Forged;
+  }
+  match known {
+    Some(known) if generation < known.generation => LearnedOutcome::Stale,
+    Some(known) if generation == known.generation => LearnedOutcome::Current,
+    Some(known) => LearnedOutcome::Restarted { old: known.host },
+    // An anchor never seen: nothing precedes this announcement, so nothing is retired — it is current from
+    // here. Only a rostered certificate reaches this (the handshake admits no other), so this is a seed the
+    // boot seeding has not yet written, never an unknown node.
+    None => LearnedOutcome::Current,
+  }
+}
+
+/// Learns a peer's announced identity on contact and folds what it implies (task #22): classifies the
+/// announcement ([`classify_announced`]); records a current or restarted id under the peer's anchor; and, on
+/// a restart, folds the old id **dead** at its current incarnation — the same incarnation-gated fold a
+/// detector's death takes, so the council leader's next reconcile takes it over, bumping its fencing epoch
+/// and retiring it — and the new id **alive**, so the leader admits it; and carries the peer's region over to
+/// the new id (the region is the node's, not the incarnation's). A stale or forged announcement is counted
+/// and folds nothing. Idempotent: a repeat of the same announcement is `Current`. Runs on the control shard,
+/// which alone keeps the learned map; the probe loop hands the old id's death to the other shards.
+fn learn_member(
+  state: &mut ShardState,
+  anchor: HostId,
+  generation: u64,
+  announced: HostId,
+) -> LearnedOutcome {
+  let outcome = classify_announced(
+    state.learned_members.get(&anchor),
+    anchor,
+    generation,
+    announced,
+  );
+  match outcome {
+    LearnedOutcome::Forged => {
+      *state.refusals.entry(MEMBER_ID_FORGED).or_insert(0) += 1;
+    }
+    LearnedOutcome::Stale => {
+      *state.refusals.entry(MEMBER_GENERATION_STALE).or_insert(0) += 1;
+    }
+    LearnedOutcome::Current => {
+      state
+        .learned_members
+        .entry(anchor)
+        .or_insert(LearnedMember {
+          generation,
+          host: announced,
+        });
+    }
+    LearnedOutcome::Restarted { old } => {
+      state.learned_members.insert(
+        anchor,
+        LearnedMember {
+          generation,
+          host: announced,
+        },
+      );
+      if let Some(region) = state.node_regions.get(&old).copied() {
+        state.node_regions.insert(announced, region);
+      }
+      let old_incarnation = state
+        .fleet
+        .membership()
+        .state(old)
+        .map_or(0, |belief| belief.incarnation);
+      apply_peer_state(
+        &mut state.fleet,
+        old,
+        Some(MemberState {
+          liveness: Liveness::Dead,
+          incarnation: old_incarnation,
+        }),
+      );
+      apply_peer_state(
+        &mut state.fleet,
+        announced,
+        Some(MemberState {
+          liveness: Liveness::Alive,
+          incarnation: 0,
+        }),
+      );
+    }
+  }
+  outcome
+}
+
+/// The member id currently learned for `anchor` (task #22): the control shard's learned map, `None` off it
+/// or for an anchor it has never seeded.
+fn current_member(anchor: HostId) -> Option<HostId> {
+  state::with_state(|s| s.learned_members.get(&anchor).map(|learned| learned.host)).flatten()
+}
 
 /// The SWIM/Lifeguard timing for a neighbourhood of `neighbourhood` members (this node plus its peers),
 /// derived from the design's stated formulas (§4.8 "Derived constants"): the base suspicion window is
@@ -382,11 +538,31 @@ pub async fn run_membership(transport: FleetTransport, progress: &'static Atomic
   };
   // The roster: which peer a certificate names — mutual TLS admits only these, and the record serve side
   // resolves the peer it authenticated through it.
-  let roster: Vec<(CertificateDer<'static>, HostId)> = peers
+  let roster: Vec<Rostered> = peers
     .iter()
-    .map(|peer| (peer.certificate.clone(), peer.host))
+    .map(|peer| Rostered {
+      certificate: peer.certificate.clone(),
+      anchor: peer.anchor,
+      seed: peer.host,
+    })
     .collect();
-  let allowed: Vec<CertificateDer<'static>> = roster.iter().map(|(cert, _)| cert.clone()).collect();
+  let allowed: Vec<CertificateDer<'static>> =
+    roster.iter().map(|peer| peer.certificate.clone()).collect();
+  // Seed learn-on-contact (task #22): each peer is known by its manifest seed — its generation-0 id — until it
+  // announces itself; a first contact at a higher generation (an anchored daemon's first boot is already
+  // generation one) replaces the seed exactly as a restart would, retiring the placeholder and admitting the
+  // id the peer really holds.
+  state::with_state(|s| {
+    for peer in &roster {
+      s.learned_members.insert(
+        peer.anchor,
+        LearnedMember {
+          generation: 0,
+          host: peer.seed,
+        },
+      );
+    }
+  });
   let max_sessions = peers.len().saturating_mul(SESSIONS_PER_PEER);
   let probe_demux = Demux::start(
     probe_socket,
@@ -422,6 +598,7 @@ pub async fn run_membership(transport: FleetTransport, progress: &'static Atomic
 
   for peer in peers {
     let FleetPeer {
+      anchor,
       host,
       address,
       record_address,
@@ -430,12 +607,14 @@ pub async fn run_membership(transport: FleetTransport, progress: &'static Atomic
     // The client sides each keep their own session up — the probe task the peer's probe address, the record
     // link task the record address — so a slow or not-yet-listening peer never blocks another peer's setup.
     let probe_dial = PeerDial {
+      anchor,
       host,
       name: name.clone(),
       address,
       certificate: certificate.clone(),
     };
     let record_dial = PeerDial {
+      anchor,
       host,
       name: name.clone(),
       address: record_address,
@@ -480,7 +659,7 @@ async fn accept_probes(
   demux: &'static Demux,
   local: HostId,
   neighbourhood: usize,
-  roster: Vec<(CertificateDer<'static>, HostId)>,
+  roster: Vec<Rostered>,
 ) {
   loop {
     let session = demux.accept().await;
@@ -498,11 +677,7 @@ async fn accept_probes(
 /// Accepts every record session a peer dials on the record socket and serves it over this node's durable
 /// holds (§4.8): one serve task per session, which resolves the peer it authenticated through `roster`.
 /// Bounded as [`accept_probes`] is.
-async fn accept_records(
-  demux: &'static Demux,
-  local: HostId,
-  roster: Vec<(CertificateDer<'static>, HostId)>,
-) {
+async fn accept_records(demux: &'static Demux, local: HostId, roster: Vec<Rostered>) {
   loop {
     let session = demux.accept().await;
     if let Ok(task) = futures::spawn(serve_peer_records(session, local, roster.clone())) {
@@ -585,20 +760,24 @@ async fn serve_peer_probes(
   mut endpoint: Endpoint,
   local: HostId,
   neighbourhood: usize,
-  roster: Vec<(CertificateDer<'static>, HostId)>,
+  roster: Vec<Rostered>,
 ) {
   if endpoint.establish().await.is_err() {
     return;
   }
-  // Only a **rostered** certificate may move membership (auth); the prober's *current* member id is the id it
-  // announces on the wire (`message.from()`), learned on contact — a restart announces a higher-generation id
-  // (task #22 learn-on-contact). At generation 0 that announced id equals the roster's precomputed seed, so
-  // this is the same id the roster would have named.
-  let authenticated = endpoint.peer_certificate().is_some_and(|presented| {
+  // Only a **rostered** certificate may move membership (auth): the anchor it stands for is what the prober's
+  // announced id and generation are validated against ([`learn_member`], task #22 learn-on-contact) — a
+  // restart's higher-generation id is admitted as a **new member** and its old id retired in that one fold; a
+  // stale or forged announcement is refused, counted, and not answered. An unrostered prober is answered but
+  // never folded (a ping's `from` is unauthenticated). This node's own generation rides every acknowledgement,
+  // so the prober validates this node the same way.
+  let rostered_anchor = endpoint.peer_certificate().and_then(|presented| {
     roster
       .iter()
-      .any(|(certificate, _)| *certificate == presented)
+      .find(|peer| peer.certificate == presented)
+      .map(|peer| peer.anchor)
   });
+  let local_generation = state::with_state(|s| s.member_generation).unwrap_or(0);
   let timing = detector_timing(neighbourhood);
   let fanout = usize::try_from(timing.gossip_transmits).unwrap_or(1);
   let mut detector = Detector::new(local, timing);
@@ -611,39 +790,46 @@ async fn serve_peer_probes(
             detector.learn_coordinate(message.from(), coordinate.clone());
           }
           let mut gossip = detector.gossip(fanout);
-          if authenticated {
+          if let (Some(anchor), Some(generation)) = (rostered_anchor, message.generation()) {
             let peer = message.from();
-            state::with_state(|s| {
-              // Learn the authenticated prober alive under its **announced** member id (task #22
-              // learn-on-contact): a restart's higher-generation id is admitted as a **new member** here,
-              // while its old id ages out via the probe side (`probe_and_apply` stops crediting an id whose
-              // node now answers under a different one). Prefer the incarnation the prober asserts for itself
-              // (an A-15 refutation of a suspicion); otherwise a fresh alive. The incarnation-gated merge
-              // (`FleetNode::observe`) leaves a *retired* old id dead (alive@0 does not outrank a death) and,
-              // at generation 0, folds the same seed id already believed alive from boot — inert.
-              let asserted = message
-                .gossip()
-                .iter()
-                .find(|(host, _)| *host == peer)
-                .map(|(_, state)| *state)
-                .unwrap_or(MemberState {
-                  liveness: Liveness::Alive,
-                  incarnation: 0,
-                });
-              apply_peer_state(&mut s.fleet, peer, Some(asserted));
-              // Echo this node's belief about the prober so a peer this node believes dead learns of it and
-              // self-refutes. Only when not already carried and not `Alive` (an alive belief needs no echo).
-              if let Some(belief) = s.fleet.membership().state(peer)
-                && belief.liveness != Liveness::Alive
-                && !gossip.iter().any(|(host, _)| *host == peer)
-              {
-                gossip.push((peer, belief));
+            // Prefer the incarnation the prober asserts for itself (an A-15 refutation of a suspicion);
+            // otherwise a fresh alive. The incarnation-gated merge (`FleetNode::observe`) leaves a *retired* id
+            // dead (alive@0 does not outrank a death) and folds an already-believed seed inertly.
+            let asserted = message
+              .gossip()
+              .iter()
+              .find(|(host, _)| *host == peer)
+              .map(|(_, state)| *state)
+              .unwrap_or(MemberState {
+                liveness: Liveness::Alive,
+                incarnation: 0,
+              });
+            let admitted = state::with_state(|s| match learn_member(s, anchor, generation, peer) {
+              LearnedOutcome::Stale | LearnedOutcome::Forged => false,
+              LearnedOutcome::Current | LearnedOutcome::Restarted { .. } => {
+                apply_peer_state(&mut s.fleet, peer, Some(asserted));
+                // Echo this node's belief about the prober so a peer this node believes dead learns of it and
+                // self-refutes. Only when not already carried and not `Alive` (an alive belief needs no echo).
+                if let Some(belief) = s.fleet.membership().state(peer)
+                  && belief.liveness != Liveness::Alive
+                  && !gossip.iter().any(|(host, _)| *host == peer)
+                {
+                  gossip.push((peer, belief));
+                }
+                true
               }
-            });
+            })
+            .unwrap_or(false);
+            if !admitted {
+              // A superseded or forged incarnation gets no acknowledgement: one would let it count itself
+              // alive. The refusal was counted for the status report.
+              return Vec::new();
+            }
           }
           SwimMessage::Ack {
             from: local,
             nonce: message.nonce().unwrap_or(0),
+            generation: local_generation,
             gossip,
             coordinate: detector.coordinate(),
           }
@@ -726,7 +912,8 @@ async fn probe_and_apply(
   detector: &mut Detector,
   session: Option<Endpoint>,
   local: HostId,
-  peer_host: HostId,
+  local_generation: u64,
+  peer: &ProbedPeer,
   fanout: usize,
   nonce: u64,
   timing: &mut ProbeTiming,
@@ -736,32 +923,36 @@ async fn probe_and_apply(
   let ping = SwimMessage::Ping {
     from: local,
     nonce,
+    generation: local_generation,
     // The buddy system: a ping to a peer this node suspects always carries that suspicion, so the peer
     // refutes it from this very probe rather than after the gossip budget is spent.
-    gossip: detector.ping_gossip(peer_host, fanout),
+    gossip: detector.ping_gossip(peer.host, fanout),
   };
   match probe_once(open, &ping, timing.budget()).await {
     Ok((
       returned,
       ProbeOutcome::Acked {
         from,
+        generation,
         gossip,
         rtt_ns,
         coordinate,
       },
     )) => {
-      // Learn-on-contact (task #22, §4.8 "Recovery"): credit `peer_host` only if the node still answers under
-      // the id we probed. If it answers under a **different** id, it has restarted under a new ephemeral
-      // member id (a higher generation) — we do not credit the old id, so it ages to death over the suspicion
-      // window and its objects are taken over (#30), while the node's new id is learned as alive from its own
-      // probes of this node (`serve_peer_probes`). At generation 0 (a first boot) the announced id equals the
-      // probed id, so this is the ordinary credit. The gossip (other members' states) is folded regardless.
-      if from == peer_host {
-        detector.on_ack(peer_host);
+      // Learn-on-contact (task #22, §4.8 "Recovery"): credit the id probed only if the node still answers
+      // under it. A node answering under a **different** id is learned there and then: a valid higher
+      // generation is a restart, folded at once (its old id dead and taken over, the new alive and admitted)
+      // and picked up by [`probe_peer`], which switches this task to the new id next period; a stale or
+      // forged announcement is refused and counted, never credited. The gossip (other members' states) is
+      // folded regardless.
+      if from == peer.host {
+        detector.on_ack(peer.host);
         timing.acknowledged(rtt_ns);
         #[allow(clippy::cast_precision_loss)]
-        detector.observe_rtt(peer_host, rtt_ns as f64);
-        detector.learn_coordinate(peer_host, coordinate);
+        detector.observe_rtt(peer.host, rtt_ns as f64);
+        detector.learn_coordinate(peer.host, coordinate);
+      } else {
+        let _ = state::with_state(|s| learn_member(s, peer.anchor, generation, from));
       }
       detector.apply_gossip(&gossip);
       returned
@@ -772,6 +963,49 @@ async fn probe_and_apply(
     }
     Err(_) => None,
   }
+}
+
+/// Switches a probe task to the id its peer now holds (task #22): whichever side learned a restart since the
+/// last period — the task itself from an acknowledgement, or the serve side from the peer's own probe — the
+/// peer's previous id is folded **dead** in this task's detector (never probed again, its death handed to
+/// the other shards as any fold is) and the new id joins fresh; the mesh record moves with it, and the
+/// round-trip law starts over for what is a new member on the same wire. A no-op while the peer's id is
+/// unchanged, which is every period but the one after a restart.
+fn follow_current_id(
+  detector: &mut Detector,
+  peer: &mut ProbedPeer,
+  timing: &mut ProbeTiming,
+  origin: u16,
+  shards: &[u16],
+) {
+  let Some(current) = current_member(peer.anchor) else {
+    return;
+  };
+  if current == peer.host {
+    return;
+  }
+  let old = peer.host;
+  let death = MemberState {
+    liveness: Liveness::Dead,
+    incarnation: detector
+      .membership()
+      .state(old)
+      .map_or(0, |belief| belief.incarnation),
+  };
+  detector.apply(old, death);
+  detector.join(current);
+  state::with_state(|s| {
+    if s.formed_probe_peers.remove(&old) {
+      s.formed_probe_peers.insert(current);
+    }
+  });
+  for shard in shards.iter().copied().filter(|shard| *shard != origin) {
+    let _ = run_on(origin, shard, move |s| {
+      apply_peer_state(&mut s.fleet, old, Some(death));
+    });
+  }
+  *timing = ProbeTiming::new();
+  peer.host = current;
 }
 
 /// The probe side: dial the peer's probe address (so a slow or not-yet-listening peer never blocks the other
@@ -794,16 +1028,20 @@ async fn probe_peer(
   demuxes: (&'static Demux, &'static Demux),
 ) {
   let PeerDial {
-    host: peer_host,
+    anchor,
+    host: seed,
     name,
     address,
     certificate,
   } = dial;
+  // The peer's current member id, its seed until learned otherwise (task #22): the loop below follows it.
+  let mut peer = ProbedPeer { anchor, host: seed };
+  let local_generation = state::with_state(|s| s.member_generation).unwrap_or(0);
   let mut probe_timing = ProbeTiming::new();
   let timing = detector_timing(neighbourhood);
   let fanout = usize::try_from(timing.gossip_transmits).unwrap_or(1);
   let mut detector = Detector::new(local, timing);
-  detector.join(peer_host);
+  detector.join(peer.host);
   // This shard (the control shard) probes; every other shard is an owner with its own copy of the
   // configuration (D-7), so each state this detector folds is handed to the rest as well.
   let (origin, shards) = state::with_state(|s| (s.shard, s.shards.clone())).unwrap_or_default();
@@ -826,8 +1064,9 @@ async fn probe_peer(
   let mut was_idle = false;
 
   loop {
+    follow_current_id(&mut detector, &mut peer, &mut probe_timing, origin, &shards);
     // Idle while this peer is retired; on the resume, the detector is realigned to the re-admitted belief.
-    if !resume_if_in_mesh(&mut detector, peer_host, &mut was_idle) {
+    if !resume_if_in_mesh(&mut detector, peer.host, &mut was_idle) {
       futures::sleep(HEARTBEAT_NS).await;
       continue;
     }
@@ -836,7 +1075,7 @@ async fn probe_peer(
     if session.is_some() && !recorded_mesh {
       // The direct probe session to this peer has formed — record it, so the daemon can tell the real mesh
       // is up (`fleet_meshed`) rather than trusting the membership's optimistically seeded alive set.
-      state::with_state(|s| s.formed_probe_peers.insert(peer_host));
+      state::with_state(|s| s.formed_probe_peers.insert(peer.host));
       recorded_mesh = true;
     }
     if session.is_some() {
@@ -845,7 +1084,8 @@ async fn probe_peer(
         &mut detector,
         session.take(),
         local,
-        peer_host,
+        local_generation,
+        &peer,
         fanout,
         probe_nonce,
         &mut probe_timing,
@@ -853,14 +1093,14 @@ async fn probe_peer(
       .await;
     }
 
-    let retired = fold_peer_state(&detector, peer_host, origin, &shards);
+    let retired = fold_peer_state(&detector, peer.host, origin, &shards);
     if retired {
       // The peer is retired and gone from the direct mesh. Its objects' phase-one recovery is now driven by
       // the record-ship task (over the surviving candidate holders); the probe session is dropped and the
       // sessions it dialed into this node are closed so their serve tasks end and free their slots. The task
       // does **not** end — the top of the loop idles it until the peer rejoins, so a false retirement (or a
       // restart) heals without a supervisor re-spawning anything.
-      state::with_state(|s| s.formed_probe_peers.remove(&peer_host));
+      state::with_state(|s| s.formed_probe_peers.remove(&peer.host));
       demuxes.0.close_peer(&certificate);
       demuxes.1.close_peer(&certificate);
       session = None;
@@ -882,24 +1122,30 @@ async fn probe_peer(
 /// the handshake authenticated — its certificate names it in `roster` (mutual TLS admits only roster
 /// certificates; one not found is counted, never served). A serve failure (the peer's connection dropped
 /// when it died, or its session replaced by a re-dial) ends the loop.
-async fn serve_peer_records(
-  mut endpoint: Endpoint,
-  local: HostId,
-  roster: Vec<(CertificateDer<'static>, HostId)>,
-) {
+async fn serve_peer_records(mut endpoint: Endpoint, local: HostId, roster: Vec<Rostered>) {
   if endpoint.establish().await.is_err() {
     return;
   }
-  // Two ids for the authenticated peer (task #22 two-id model): `peer_host` is its **ephemeral** member id
-  // (from the roster — records and ownership key on it), and `peer_anchor` its **stable** cert-anchor
+  // Two ids for the authenticated peer (task #22 two-id model). `peer_anchor` is its **stable** cert-anchor
   // (`host_id_of_certificate` of the very certificate it presented — the RIFL completion origin keys on it, so
-  // a forwarded write stays exactly-once across the forwarding node's restart).
-  let Some((peer_host, peer_anchor)) = endpoint.peer_certificate().and_then(|presented| {
-    roster
-      .iter()
-      .find(|(certificate, _)| *certificate == presented)
-      .map(|(_, host)| (*host, crate::deploy::host_id_of_certificate(&presented)))
-  }) else {
+  // a forwarded write stays exactly-once across the forwarding node's restart). Its **ephemeral** member id —
+  // what records and ownership key on — is whatever is currently learned for its rostered anchor (its seed
+  // until it announces itself; a restart moves it), resolved per request so a node that restarted mid-session
+  // is served under the id it now writes as.
+  let Some((rostered_anchor, seed, peer_anchor)) =
+    endpoint.peer_certificate().and_then(|presented| {
+      roster
+        .iter()
+        .find(|peer| peer.certificate == presented)
+        .map(|peer| {
+          (
+            peer.anchor,
+            peer.seed,
+            crate::deploy::host_id_of_certificate(&presented),
+          )
+        })
+    })
+  else {
     count_refusal(ACCEPT_REFUSED);
     return;
   };
@@ -920,7 +1166,13 @@ async fn serve_peer_records(
           RECORD_STREAM => Record::decode(&request)
             .ok()
             .and_then(|record| {
-              state::with_state(|s| accept_held_record(s, local, peer_host, &record))
+              state::with_state(|s| {
+                let peer_host = s
+                  .learned_members
+                  .get(&rostered_anchor)
+                  .map_or(seed, |learned| learned.host);
+                accept_held_record(s, local, peer_host, &record)
+              })
             })
             .unwrap_or_default(),
           PROMOTE_STREAM => Prepare::decode(&request)
@@ -1651,13 +1903,26 @@ pub(crate) fn keeps_direct_contact_with(state: &ShardState, peer: HostId) -> boo
 /// voter again under this configuration), so it is not an unbounded retry of a dead peer (banned item 8).
 async fn establish_record_link(identity: &'static Identity, dial: PeerDial) {
   let PeerDial {
-    host: peer_host,
+    anchor,
+    host: seed,
     name,
     address,
     certificate,
   } = dial;
+  let mut peer_host = seed;
   let mut client: Option<Endpoint> = client_for(identity, &name, address, &certificate);
   loop {
+    // Follow the peer's current id (task #22): a restart is a new process, so the session to its previous
+    // incarnation is dead by definition — drop it, and from here keep the link under the id the peer now
+    // writes as (dialed again once the council admits it, as any newly admitted member is).
+    if let Some(current) = current_member(anchor)
+      && current != peer_host
+    {
+      state::with_state(|s| {
+        s.record_sessions.remove(&peer_host);
+      });
+      peer_host = current;
+    }
     let retired = state::with_state(|s| !keeps_direct_contact_with(s, peer_host));
     if retired == Some(true) {
       // The peer is retired. Drop its record session and **idle** — this task does not end, so if the peer
@@ -3329,6 +3594,55 @@ mod tests {
       slow.deadline_ns(),
       slow.rtt.pto(0),
       "above the floor the deadline is the estimator's probe timeout itself"
+    );
+  }
+
+  /// Learn-on-contact's decision, by use (task #22, §4.8 "Recovery"): an announced id must derive from the
+  /// peer's anchor and generation; a higher generation than known is a restart naming the id to retire; an
+  /// equal one is the ordinary contact; a lower one is stale; and an anchor never seen is current from its
+  /// first announcement.
+  #[test]
+  fn an_announced_identity_is_current_restarted_stale_or_forged() {
+    let anchor = HostId(0xA11C);
+    let seed = crate::deploy::member_id(anchor, 0);
+    let next = crate::deploy::member_id(anchor, 1);
+    let known = LearnedMember {
+      generation: 0,
+      host: seed,
+    };
+    assert_eq!(
+      classify_announced(Some(&known), anchor, 0, seed),
+      LearnedOutcome::Current,
+      "the seed at generation 0 is the ordinary contact"
+    );
+    assert_eq!(
+      classify_announced(Some(&known), anchor, 1, next),
+      LearnedOutcome::Restarted { old: seed },
+      "a higher generation is a restart, naming the seed as the id to retire"
+    );
+    let restarted = LearnedMember {
+      generation: 1,
+      host: next,
+    };
+    assert_eq!(
+      classify_announced(Some(&restarted), anchor, 0, seed),
+      LearnedOutcome::Stale,
+      "the old generation announced after the new one is stale"
+    );
+    assert_eq!(
+      classify_announced(Some(&known), anchor, 1, seed),
+      LearnedOutcome::Forged,
+      "the seed id is not what generation 1 derives to"
+    );
+    assert_eq!(
+      classify_announced(Some(&known), anchor, 0, HostId(7)),
+      LearnedOutcome::Forged,
+      "an id that derives from nothing is forged"
+    );
+    assert_eq!(
+      classify_announced(None, anchor, 3, crate::deploy::member_id(anchor, 3)),
+      LearnedOutcome::Current,
+      "an anchor never seen is current from its first announcement"
     );
   }
 }

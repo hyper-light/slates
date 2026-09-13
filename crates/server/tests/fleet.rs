@@ -21,6 +21,7 @@
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::PrivateKeyDer;
+use slates_anchor::AnchorSegment;
 use slates_db::HostId;
 use slates_db::register::{ObjectId, Quorum, RegionId, rendezvous_first};
 use slates_ipc::protocol::{
@@ -218,6 +219,9 @@ fn node(name: &str, probe_port: u16, record_port: u16) -> Node {
 
 /// The addresses and certificate of a node's one peer.
 struct Peer {
+  /// The peer's stable anchor (its machine-identity hash on an in-process fleet), from which every member id
+  /// it announces derives (task #22).
+  anchor: HostId,
   host: HostId,
   address: SocketAddrV4,
   record_address: SocketAddrV4,
@@ -264,6 +268,7 @@ fn start_with_policy(
     probe_bind: this.address,
     record_bind: this.record_address,
     peers: vec![FleetPeer {
+      anchor: peer.anchor,
       host: peer.host,
       address: peer.address,
       record_address: peer.record_address,
@@ -300,12 +305,14 @@ fn a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it() {
 
   let host_b = b.host;
   let peer_of_a = Peer {
+    anchor: b.origin_anchor,
     host: b.host,
     address: b.address,
     record_address: b.record_address,
     certificate: b.identity.certificate(),
   };
   let peer_of_b = Peer {
+    anchor: a.origin_anchor,
     host: a.host,
     address: a.address,
     record_address: a.record_address,
@@ -453,12 +460,14 @@ fn a_falsely_retired_peer_rejoins_by_refutation() {
   let b = node("b", pb_probe, pb_record);
   let host_b = b.host;
   let peer_of_a = Peer {
+    anchor: b.origin_anchor,
     host: b.host,
     address: b.address,
     record_address: b.record_address,
     certificate: b.identity.certificate(),
   };
   let peer_of_b = Peer {
+    anchor: a.origin_anchor,
     host: a.host,
     address: a.address,
     record_address: a.record_address,
@@ -544,12 +553,14 @@ fn a_starved_but_live_peer_is_not_retired() {
   let b = node("b", pb_probe, pb_record);
   let host_b = b.host;
   let peer_of_a = Peer {
+    anchor: b.origin_anchor,
     host: b.host,
     address: b.address,
     record_address: b.record_address,
     certificate: b.identity.certificate(),
   };
   let peer_of_b = Peer {
+    anchor: a.origin_anchor,
     host: a.host,
     address: a.address,
     record_address: a.record_address,
@@ -604,10 +615,11 @@ fn a_starved_but_live_peer_is_not_retired() {
 
 /// AC (§4.8 "Recovery"; task #22 — a restart is a join under a **new** ephemeral id): a peer that restarts
 /// comes back under a NEW member id (a higher daemon generation), and its OLD id is **retired**, not rejoined
-/// as its old self. A and B form; A knows B under its generation-0 member id. Then B's old process ends (its
-/// leaked in-process sockets cannot be rebound to truly restart, so — as the rejoin test does for detection —
-/// the return is injected: B's old id dead, its new id `member_id(B_anchor, 1)` alive, exactly the fold the
-/// live learn-on-contact produces when B's new-id probes reach A and its old id stops answering). A **admits
+/// as its old self. A and B form; A knows B under its generation-0 member id. Then B's old process ends and
+/// its return under a new generation is **injected** into A (B's old id dead, its new id
+/// `member_id(B_anchor, 1)` alive — the fold the live learn-on-contact makes), which isolates the fold from
+/// the wire; the wire-level proof, a real second daemon presenting B's certificate at generation one and
+/// learned on contact, is [`a_restarted_peer_is_learned_on_contact_under_its_new_generation`]. A **admits
 /// B's new id** and **retires the old** — the design's "rejoins with a new ephemeral id", the contrast to the
 /// rejoin test above where a *falsely*-suspected peer (same generation, same id) refutes and keeps its id.
 /// Non-vacuous: B's old and new ids differ (the id is ephemeral), the old is shown known first, then retired,
@@ -625,12 +637,14 @@ fn a_restarted_peer_rejoins_under_a_new_member_id_and_the_old_is_retired() {
     "the member id is ephemeral — a restart holds a new id, not its old self"
   );
   let peer_of_a = Peer {
+    anchor: b.origin_anchor,
     host: b.host,
     address: b.address,
     record_address: b.record_address,
     certificate: b.identity.certificate(),
   };
   let peer_of_b = Peer {
+    anchor: a.origin_anchor,
     host: a.host,
     address: a.address,
     record_address: a.record_address,
@@ -680,6 +694,415 @@ fn a_restarted_peer_rejoins_under_a_new_member_id_and_the_old_is_retired() {
     retired_old,
     "A retired B's old member id — the restart does not rejoin as its old self"
   );
+}
+
+/// Two identities from one certificate and key — what a node presents before and after a restart: the same
+/// operator-provisioned certificate (its stable anchor), a fresh process (a new generation).
+fn same_identity_twice() -> (Identity, Identity) {
+  let key = rcgen::KeyPair::generate().unwrap();
+  let cert = rcgen::CertificateParams::new(vec![NAME.to_owned()])
+    .unwrap()
+    .self_signed(&key)
+    .unwrap();
+  let der = PrivateKeyDer::try_from(key.serialize_der()).unwrap();
+  (
+    Identity::from_der(cert.der().clone(), der.clone_key()),
+    Identity::from_der(cert.der().clone(), der),
+  )
+}
+
+/// One fleet node's configuration at `f = 1` on one shard: its `host` (the generation-0 seed the daemon
+/// overrides with its real generation), its stable `anchor`, and its `peers` by their seed ids.
+fn fleet_config(
+  profile: &MachineProfile,
+  instance: &str,
+  anchor: HostId,
+  host: HostId,
+  peers: &[FleetPeer],
+) -> DaemonConfig {
+  DaemonConfig::derive(profile, instance)
+    .with_shards(1)
+    .with_fleet(FleetMembership {
+      quorum: Quorum { f: 1 },
+      peers: peers.iter().map(|peer| peer.host).collect(),
+      host,
+      origin_anchor: anchor,
+      domains: std::collections::BTreeMap::new(),
+      regions: std::collections::BTreeMap::new(),
+      durability: None,
+      region_mirrors: std::collections::BTreeMap::new(),
+    })
+}
+
+/// Starts one fleet daemon serving on its own `bind` pair and dialing each of `peers` where its entry says —
+/// so a test may dial a peer at an address it will only serve later — over `source` (a fresh segment, or an
+/// anchor segment a restart attaches).
+fn start_fleet_node(
+  profile: &MachineProfile,
+  config: DaemonConfig,
+  identity: Identity,
+  bind: (u16, u16),
+  peers: Vec<FleetPeer>,
+  source: SegmentSource,
+) -> Daemon {
+  let transport = FleetTransport {
+    identity,
+    name: NAME.to_owned(),
+    probe_bind: loopback(bind.0),
+    record_bind: loopback(bind.1),
+    peers,
+  };
+  Daemon::start_with_fleet(profile, config, source, Some(transport))
+    .expect("the fleet daemon starts")
+}
+
+/// AC (§4.8 "Recovery" — "a restarted host rejoins as a new member and holds nothing until its generation
+/// ... [is] validated"; task #22, **over the wire**): a node that restarts announces a higher daemon
+/// generation on its first probe and is learned on contact — its new member id admitted and probed, its old
+/// id retired and its objects taken over — with nothing injected. Three nodes form (`f = 1`, so two
+/// survivors keep the council's majority); B seals a volume whose head A and C hold; B's process ends; a
+/// second daemon presents **B's certificate** at generation one — its anchor segment records the start, as
+/// the anchor does before every daemon start — on the address A and C dial for B, and probes them. A and C
+/// validate the announced id (`member_id(anchor_B, 1)`) against B's anchor, fold the old id dead and the new
+/// alive, and the council commits the takeover and the admission; the survivor rendezvous ranks first takes
+/// over B's volume and serves it. Non-vacuous: the new id is not the old (the id is ephemeral); the old is
+/// shown known before and retired after; the new is admitted, **committed** into the regional configuration,
+/// and **probed** (A's and C's meshes form to it, so a later death of the new incarnation is detectable, not
+/// merely believed from its own pings); and B's file reads back from the successor over NFS. The contrast
+/// is [`a_falsely_retired_peer_rejoins_by_refutation`]: the same generation refutes and keeps its id.
+#[test]
+fn a_restarted_peer_is_learned_on_contact_under_its_new_generation() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let mut fleet = restart_fleet_forms_and_seals(pid);
+  assert_ne!(
+    fleet.host_b, fleet.b_new,
+    "the member id is ephemeral — a restart holds a new id, not its old self"
+  );
+  let (daemon_b_again, segment) = restart_b(&mut fleet, pid);
+  let observed: Vec<&Daemon> = vec![&fleet.survivors[0], &fleet.survivors[1], &daemon_b_again];
+  let learned = observe_learned(&observed, &fleet, &daemon_b_again);
+  let (head_placed, served, got) = successor_serves(&observed, &fleet);
+
+  let (formed, knew_old) = (fleet.formed, fleet.knew_old);
+  daemon_b_again.stop();
+  for daemon in fleet.survivors {
+    daemon.stop();
+  }
+  drop(segment);
+  assert_restart_learned(formed, knew_old, &learned);
+  assert_successor_served(head_placed, served, got.as_deref());
+}
+
+/// The membership half of the restart scenario's verdict: the pre-restart facts and what the survivors
+/// learned — each assertion named, so a failure says which step of learn-on-contact did not happen.
+fn assert_restart_learned(formed: bool, knew_old: bool, learned: &Learned) {
+  assert!(formed, "old B's mesh to A and C formed before it sealed");
+  assert!(
+    knew_old,
+    "A knew B under its generation-0 member id before the restart"
+  );
+  assert!(
+    learned.admitted_new,
+    "the survivors admitted B's generation-1 member id, learned from its own probes"
+  );
+  assert!(
+    learned.retired_old,
+    "the survivors retired B's old member id — a restart does not rejoin as its old self"
+  );
+  assert!(
+    learned.committed,
+    "the council committed the admission and the takeover into the regional configuration"
+  );
+  assert!(
+    learned.meshed_to_new,
+    "the probe mesh formed to the restarted node under its new id — it is probed, not merely believed"
+  );
+}
+
+/// The takeover half of the restart scenario's verdict: the old id's volume placed on, served by, and read
+/// back from the survivor that took it over.
+fn assert_successor_served(head_placed: bool, served: bool, got: Option<&[u8]>) {
+  assert!(
+    head_placed,
+    "the survivor rendezvous ranked first took over the volume the old incarnation owned"
+  );
+  assert!(served, "the successor serves the taken-over volume");
+  assert_eq!(
+    got,
+    Some(CONTENT),
+    "the file B sealed reads back byte for byte from the successor over NFS"
+  );
+}
+
+/// The restart scenario's fleet after old B has sealed its volume and ended: the two survivors (A, then C),
+/// what the restart of B needs (its profile, anchor, seed, second identity, peers and serve pair), the ids
+/// and instances the assertions read, the sealed volume, and the two facts observed before the restart.
+struct RestartFleet {
+  survivors: Vec<Daemon>,
+  host_a: HostId,
+  host_c: HostId,
+  host_b: HostId,
+  b_new: HostId,
+  anchor_b: HostId,
+  profile_b: MachineProfile,
+  /// The restart's identity (B's certificate and key), taken by [`restart_b`] — an `Identity` holds a
+  /// private key and is not `Clone`, so it moves.
+  b_again: Option<Identity>,
+  b_again_serve: (u16, u16),
+  /// The restart's peer entries, taken by [`restart_b`].
+  peers_of_b_again: Vec<FleetPeer>,
+  instance_a: String,
+  instance_c: String,
+  instance_b_again: String,
+  id: VolumeId,
+  object: ObjectId,
+  name: String,
+  formed: bool,
+  knew_old: bool,
+}
+
+/// A peer entry dialed at `at`, pinned to `certificate`, known by its `anchor` and seed `host`.
+fn fleet_peer_at(
+  anchor: HostId,
+  host: HostId,
+  at: (u16, u16),
+  certificate: &rustls::pki_types::CertificateDer<'static>,
+) -> FleetPeer {
+  FleetPeer {
+    anchor,
+    host,
+    address: loopback(at.0),
+    record_address: loopback(at.1),
+    certificate: certificate.clone(),
+  }
+}
+
+/// Starts A, C and old B, lets old B's mesh form, seals a volume on B whose head A and C hold, and ends B's
+/// process. A and C dial B at the pair its **restart** will serve on (an in-process daemon's sockets are
+/// leaked to the process, so a restart cannot rebind old B's; a deployment's address is the manifest's and
+/// does not move), so their probes of B form only once the restart serves there.
+fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
+  let (profile_a, host_a, identity_a) = fleet_node("a");
+  let (profile_c, host_c, identity_c) = fleet_node("c");
+  let (profile_b, host_b, _) = fleet_node("b");
+  let (b_first, b_again) = same_identity_twice();
+  let anchor_a = anchor_of(&profile_a);
+  let anchor_b = anchor_of(&profile_b);
+  let anchor_c = anchor_of(&profile_c);
+  let b_new = member_id(anchor_b, 1);
+  let serve = mesh_serve_ports(3);
+  let again = free_ports(2);
+  let b_again_serve = (again[0], again[1]);
+  let cert_a = identity_a.certificate();
+  let cert_b = b_first.certificate();
+  let cert_c = identity_c.certificate();
+  let peers_of_a = vec![
+    fleet_peer_at(anchor_b, host_b, b_again_serve, &cert_b),
+    fleet_peer_at(anchor_c, host_c, serve[2], &cert_c),
+  ];
+  let peers_of_c = vec![
+    fleet_peer_at(anchor_a, host_a, serve[0], &cert_a),
+    fleet_peer_at(anchor_b, host_b, b_again_serve, &cert_b),
+  ];
+  let peers_of_b = vec![
+    fleet_peer_at(anchor_a, host_a, serve[0], &cert_a),
+    fleet_peer_at(anchor_c, host_c, serve[2], &cert_c),
+  ];
+  let peers_of_b_again = vec![
+    fleet_peer_at(anchor_a, host_a, serve[0], &cert_a),
+    fleet_peer_at(anchor_c, host_c, serve[2], &cert_c),
+  ];
+  let instance_a = format!("fleet3-{}-{pid}", host_a.0);
+  let instance_b = format!("fleet3-{}-{pid}", host_b.0);
+  let instance_c = format!("fleet3-{}-{pid}", host_c.0);
+  let instance_b_again = format!("fleet3-{}-{pid}", b_new.0);
+  let config_a = fleet_config(&profile_a, &instance_a, anchor_a, host_a, &peers_of_a);
+  let config_b = fleet_config(&profile_b, &instance_b, anchor_b, host_b, &peers_of_b);
+  let config_c = fleet_config(&profile_c, &instance_c, anchor_c, host_c, &peers_of_c);
+  let fresh = |host: HostId| SegmentSource::Create {
+    name: format!("slates-seg-fleet3-{}-{pid}", host.0),
+  };
+  let daemon_a = start_fleet_node(
+    &profile_a,
+    config_a,
+    identity_a,
+    serve[0],
+    peers_of_a,
+    fresh(host_a),
+  );
+  let daemon_c = start_fleet_node(
+    &profile_c,
+    config_c,
+    identity_c,
+    serve[2],
+    peers_of_c,
+    fresh(host_c),
+  );
+  let daemon_b = start_fleet_node(
+    &profile_b,
+    config_b,
+    b_first,
+    serve[1],
+    peers_of_b,
+    fresh(host_b),
+  );
+  // Old B dials A and C, so its mesh forms; then it seals the volume the restart's takeover will move.
+  let mut daemons = vec![daemon_b, daemon_a, daemon_c];
+  let formed = poll_until(&[&daemons[0]], FORMATION_DEADLINE, || {
+    daemons[0].fleet_meshed() == Some(true)
+  });
+  let knew_old = daemons[1]
+    .fleet_members()
+    .is_some_and(|members| members.contains(&host_b));
+  let name = format!("restarted-{pid}");
+  let id = match seal_hello_on_owner(&instance_b, &daemons, &name) {
+    Ok(id) => id,
+    Err(why) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("setup: formed={formed}, {why}");
+    }
+  };
+  let old_b = daemons.remove(0);
+  old_b.stop();
+  RestartFleet {
+    survivors: daemons,
+    host_a,
+    host_c,
+    host_b,
+    b_new,
+    anchor_b,
+    profile_b,
+    b_again: Some(b_again),
+    b_again_serve,
+    peers_of_b_again,
+    instance_a,
+    instance_c,
+    instance_b_again,
+    id,
+    object: ObjectId(id.bytes),
+    name,
+    formed,
+    knew_old,
+  }
+}
+
+/// Restarts B: a second daemon with B's certificate attaches an anchor segment on which the anchor has
+/// recorded the start — `record_start` is what increments the generation before every daemon start — so it
+/// derives `member_id(anchor_B, 1)` as its own id. The real restart path, the test playing the anchor (as the
+/// client restart oracle does); the start stamp is the anchor's clock reading, immaterial with no anchor to
+/// read it. The segment is returned so it outlives the daemon.
+fn restart_b(fleet: &mut RestartFleet, pid: u32) -> (Daemon, AnchorSegment) {
+  let peers = std::mem::take(&mut fleet.peers_of_b_again);
+  let identity = fleet
+    .b_again
+    .take()
+    .expect("the restart's identity is taken once");
+  let config = fleet_config(
+    &fleet.profile_b,
+    &fleet.instance_b_again,
+    fleet.anchor_b,
+    fleet.host_b,
+    &peers,
+  );
+  let segment = AnchorSegment::create(
+    &format!("slates-seg-fleet3-again-{}-{pid}", fleet.host_b.0),
+    &fleet.profile_b.facts.identity,
+    config.geometry,
+  )
+  .expect("the restart's anchor segment");
+  segment
+    .supervision()
+    .expect("the segment's supervision block")
+    .record_start(u64::from(pid), 0, false);
+  let (handoff, len) = segment.handoff().expect("the segment hands off");
+  let daemon = start_fleet_node(
+    &fleet.profile_b,
+    config,
+    identity,
+    fleet.b_again_serve,
+    peers,
+    SegmentSource::Handoff {
+      handoff,
+      len,
+      content: None,
+    },
+  );
+  (daemon, segment)
+}
+
+/// What the survivors learned of the restart on contact.
+struct Learned {
+  admitted_new: bool,
+  retired_old: bool,
+  committed: bool,
+  meshed_to_new: bool,
+}
+
+/// Whether every survivor's observed alive membership satisfies `predicate` (an unobservable one never does).
+fn all_members(survivors: &[Daemon], predicate: impl Fn(&[HostId]) -> bool) -> bool {
+  survivors.iter().all(|daemon| {
+    daemon
+      .fleet_members()
+      .is_some_and(|members| predicate(&members))
+  })
+}
+
+/// Whether every survivor's observed committed regional membership satisfies `predicate`.
+fn all_council(survivors: &[Daemon], predicate: impl Fn(&[HostId]) -> bool) -> bool {
+  survivors.iter().all(|daemon| {
+    daemon
+      .council_members()
+      .is_some_and(|members| predicate(&members))
+  })
+}
+
+/// Polls the survivors until they learn the restart: the new id admitted, the old retired, both committed into
+/// the regional configuration, and the probe mesh formed to the new incarnation on every side.
+fn observe_learned(observed: &[&Daemon], fleet: &RestartFleet, b_again: &Daemon) -> Learned {
+  let (host_b, b_new) = (fleet.host_b, fleet.b_new);
+  let survivors = &fleet.survivors;
+  let admitted_new = poll_until(observed, REJOIN_DEADLINE, || {
+    all_members(survivors, |members| members.contains(&b_new))
+  });
+  let retired_old = poll_until(observed, RETIREMENT_DEADLINE, || {
+    all_members(survivors, |members| !members.contains(&host_b))
+  });
+  let committed = poll_until(observed, COUNCIL_RETIRE_DEADLINE, || {
+    all_council(survivors, |members| {
+      members.contains(&b_new) && !members.contains(&host_b)
+    })
+  });
+  let meshed_to_new = poll_until(observed, COUNCIL_SETTLE_DEADLINE, || {
+    survivors
+      .iter()
+      .all(|daemon| daemon.fleet_meshed() == Some(true))
+      && b_again.fleet_meshed() == Some(true)
+  });
+  Learned {
+    admitted_new,
+    retired_old,
+    committed,
+    meshed_to_new,
+  }
+}
+
+/// The old id's volume is taken over by the survivor rendezvous ranks first, which must serve it: whether the
+/// head placed there, whether `status` answers there, and the file read back over its NFS port.
+fn successor_serves(observed: &[&Daemon], fleet: &RestartFleet) -> (bool, bool, Option<Vec<u8>>) {
+  let successor =
+    rendezvous_first(&[fleet.host_a, fleet.host_c], fleet.object).expect("a survivor takes over");
+  let (daemon, instance) = if successor == fleet.host_a {
+    (&fleet.survivors[0], &fleet.instance_a)
+  } else {
+    (&fleet.survivors[1], &fleet.instance_c)
+  };
+  let head_placed = poll_head_placed(observed, daemon, fleet.object);
+  let served = poll_status_answers(observed, instance, fleet.id);
+  let got = served.then(|| read_hello_over_nfs(daemon, &fleet.name));
+  (head_placed, served, got)
 }
 
 /// `count` distinct free localhost UDP ports, all bound at once so the OS hands back distinct ports, then
@@ -817,6 +1240,12 @@ fn start_mesh_with(
 ) -> Vec<Daemon> {
   let pid = std::process::id();
   let n = hosts.len();
+  // Each node's stable anchor (the machine-identity hash its member ids derive from, task #22), so every
+  // peer entry names the anchor the announced ids are validated against.
+  let anchors: Vec<HostId> = nodes
+    .iter()
+    .map(|(profile, _, _)| anchor_of(profile))
+    .collect();
   nodes
     .into_iter()
     .enumerate()
@@ -824,6 +1253,7 @@ fn start_mesh_with(
       let peers: Vec<FleetPeer> = (0..n)
         .filter(|&j| j != i)
         .map(|j| FleetPeer {
+          anchor: anchors[j],
           host: hosts[j],
           address: loopback(serve[j].0),
           record_address: loopback(serve[j].1),
@@ -2173,12 +2603,14 @@ fn a_provisioned_head_replicates_across_the_fleet() {
   let pid = std::process::id();
   let instance_a = format!("fleet-{}-{pid}", a.host.0);
   let peer_of_a = Peer {
+    anchor: b.origin_anchor,
     host: b.host,
     address: b.address,
     record_address: b.record_address,
     certificate: b.identity.certificate(),
   };
   let peer_of_b = Peer {
+    anchor: a.origin_anchor,
     host: a.host,
     address: a.address,
     record_address: a.record_address,
@@ -2252,12 +2684,14 @@ fn a_holder_durably_holds_the_owners_replicated_head() {
   let pid = std::process::id();
   let instance_a = format!("fleet-{}-{pid}", a.host.0);
   let peer_of_a = Peer {
+    anchor: b.origin_anchor,
     host: b.host,
     address: b.address,
     record_address: b.record_address,
     certificate: b.identity.certificate(),
   };
   let peer_of_b = Peer {
+    anchor: a.origin_anchor,
     host: a.host,
     address: a.address,
     record_address: a.record_address,
@@ -2636,12 +3070,14 @@ fn a_sealed_snapshots_content_replicates_to_the_holder_and_places() {
   let pid = std::process::id();
   let instance_a = format!("fleet-{}-{pid}", a.host.0);
   let peer_of_a = Peer {
+    anchor: b.origin_anchor,
     host: b.host,
     address: b.address,
     record_address: b.record_address,
     certificate: b.identity.certificate(),
   };
   let peer_of_b = Peer {
+    anchor: a.origin_anchor,
     host: a.host,
     address: a.address,
     record_address: a.record_address,
@@ -2824,12 +3260,14 @@ fn a_volume_on_a_non_control_shard_replicates_its_content_and_places() {
   let pid = std::process::id();
   let instance_a = format!("fleet-{}-{pid}", a.host.0);
   let peer_of_a = Peer {
+    anchor: b.origin_anchor,
     host: b.host,
     address: b.address,
     record_address: b.record_address,
     certificate: b.identity.certificate(),
   };
   let peer_of_b = Peer {
+    anchor: a.origin_anchor,
     host: a.host,
     address: a.address,
     record_address: a.record_address,
@@ -3111,6 +3549,7 @@ fn a_peer_whose_serve_socket_cannot_be_bound_is_counted_not_silently_skipped() {
   let pid = std::process::id();
   let instance_a = format!("fleet-{}-{pid}", a.host.0);
   let peer_of_a = Peer {
+    anchor: b.origin_anchor,
     host: b.host,
     address: b.address,
     record_address: b.record_address,
