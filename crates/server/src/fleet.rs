@@ -1107,8 +1107,24 @@ async fn probe_peer(
       session = None;
       recorded_mesh = false;
     }
-    futures::sleep(HEARTBEAT_NS).await;
+    // The next probe waits one beat at full health, more as this node's own probes fail (Lifeguard).
+    futures::sleep(probe_period_ns(detector.health_multiplier())).await;
   }
+}
+
+/// The probe **cadence** — how long the probe task waits before its next probe of a peer — dilated by the
+/// detector's Lifeguard local-health multiplier (`health + 1`, capped at [`LOCAL_HEALTH_CAP`] + 1): a node
+/// whose own probes are failing probes less aggressively (Lifeguard §3.1's local-health-aware probe;
+/// memberlist scales its probe interval by its awareness score), so a degraded prober neither floods a
+/// struggling peer nor counts misses faster than its own health warrants —
+/// [`Detector::health_multiplier`] is defined as the caller's multiplier on its probe-period timer.
+/// Derived: one heartbeat period ([`HEARTBEAT_NS`], the beat every fleet loop runs at) × the multiplier,
+/// so full health is exactly the beat. Measured 2026-09-13: first wired, it was **wrongly** rejected on a
+/// 495 s retirement hang that was a holder acceptor born stale (`accept_held_record`, fixed in
+/// `docs/bugs/2026-09-13-holder-acceptor-born-stale-never-placed.md`); re-measured on the fixed tree the
+/// same test passes 3/3 at 11.3 s with the dilation and the starvation test at 8.8 s.
+fn probe_period_ns(health_multiplier: u32) -> u64 {
+  HEARTBEAT_NS.saturating_mul(u64::from(health_multiplier))
 }
 
 /// The record serve side (§4.8 "records are sent to all candidates"; "Promotion and takeover"): complete
@@ -3672,6 +3688,28 @@ mod tests {
       classify_announced(None, anchor, 3, crate::deploy::member_id(anchor, 3)),
       LearnedOutcome::Current,
       "an anchor never seen is current from its first announcement"
+    );
+  }
+
+  /// The probe cadence follows the Lifeguard local health: exactly one beat at full health, `health + 1`
+  /// beats as the node's own probes fail, never past the cap — a degraded prober probes less aggressively.
+  #[test]
+  fn the_probe_cadence_is_one_beat_dilated_by_the_local_health() {
+    assert_eq!(
+      probe_period_ns(1),
+      HEARTBEAT_NS,
+      "full health: exactly the beat"
+    );
+    assert_eq!(
+      probe_period_ns(2),
+      2 * HEARTBEAT_NS,
+      "one step of ill health: two beats"
+    );
+    let capped = LOCAL_HEALTH_CAP + 1;
+    assert_eq!(
+      probe_period_ns(capped),
+      u64::from(capped) * HEARTBEAT_NS,
+      "at the cap: three beats, never more"
     );
   }
 }

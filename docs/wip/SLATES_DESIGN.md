@@ -1627,11 +1627,13 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 > the same day: a dead consensus voter stayed probed and linked (Raft's voter set does not shrink on a
 > committed retirement), so `keeps_direct_contact_with` now excludes a peer the membership holds dead.
 > Record: `docs/bugs/2026-09-13-swim-fixed-probe-deadline-kills-a-starved-live-peer.md`.
-> Follow-up, same day: wiring the Lifeguard probe-cadence dilation that `Detector::health_multiplier`
-> documents as the caller's (`probe_period_ns`: one beat × the multiplier) was **measured-and-rejected** —
-> it hung `three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node` (a peer folded `Dead`
-> re-appeared in the alive SWIM membership under the dilated timing; 4000-period non-convergence vs 10 s
-> green with the flat beat), root cause not established, so the flat one-beat period stays until it is. A
+> Follow-up, same day: the Lifeguard probe-cadence dilation that `Detector::health_multiplier`
+> documents as the caller's (`probe_period_ns`: one beat × the multiplier, capped 3×) is wired. Its first
+> wiring was recorded as measured-and-rejected on a 495 s hang of
+> `three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node`; that attribution was **wrong** — the
+> hang was a holder acceptor born stale on a refused first record (fixed with the Raft membership work,
+> `docs/bugs/2026-09-13-holder-acceptor-born-stale-never-placed.md`). Re-measured on the fixed tree the
+> same test passes 3/3 at 11.3 s with the dilation, the starvation test at 8.8 s. A
 > fresh stream id per exchange (RFC 9000 §2.1) also stays owed: the id doubles as the server's dispatch
 > kind, the SWIM re-send compensates, and no repro of the reuse collision could be built on the simulated
 > fabric. Both are recorded in the ledger with their mechanism.
