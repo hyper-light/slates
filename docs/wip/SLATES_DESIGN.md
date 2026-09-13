@@ -1645,6 +1645,16 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 > acknowledgement pruned its completion window under the ephemeral member id while records are keyed on
 > the stable anchor. Records: `docs/bugs/2026-09-13-durability-refusal.md`,
 > `docs/bugs/2026-09-13-acknowledge-prunes-under-the-ephemeral-id.md`.
+> Task #22 (2026-09-13): a restart is now learned on contact over the wire. Every SWIM ping and
+> acknowledgement announces the sender's daemon generation; a receiver validates the announced id as
+> `member_id(anchor, generation)` for the anchor its certificate stands for (`FleetPeer::anchor`), refuses
+> a lower generation or a non-deriving id (counted, unanswered), and admits a higher one as a new member
+> while folding the old id dead — the council commits the takeover and the admission, and the probe task
+> follows the peer to its new id so the restarted node is probed, not merely believed. Proven by use with
+> a real generation-1 restart over an anchor segment
+> (`a_restarted_peer_is_learned_on_contact_under_its_new_generation`). Owed: the Raft voter sets do not
+> yet follow a restart; the restarted node's failure domain is not carried on `Admit`. Record:
+> `docs/wip/ephemeral-id.md`.
 
 **Role.** The authoritative record of volumes, snapshots, lineage, leases, attachments,
 accounting, completion records, grants, chains and the operation log; served locally in

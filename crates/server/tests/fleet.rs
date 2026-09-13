@@ -3323,12 +3323,14 @@ fn start_policed_pair(durability: DurabilityBound) -> (Daemon, Daemon, String) {
   let b = node("b", pb_probe, pb_record);
   let instance_a = format!("fleet-{}-{}", a.host.0, std::process::id());
   let peer_of_a = Peer {
+    anchor: b.origin_anchor,
     host: b.host,
     address: b.address,
     record_address: b.record_address,
     certificate: b.identity.certificate(),
   };
   let peer_of_b = Peer {
+    anchor: a.origin_anchor,
     host: a.host,
     address: a.address,
     record_address: a.record_address,
