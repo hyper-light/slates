@@ -1655,6 +1655,15 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 > (`a_restarted_peer_is_learned_on_contact_under_its_new_generation`). Owed: the Raft voter sets do not
 > yet follow a restart; the restarted node's failure domain is not carried on `Admit`. Record:
 > `docs/wip/ephemeral-id.md`.
+> Same day: the Raft voter set now follows the committed membership. `RegionalCouncil::reconcile_voters`
+> / `RootGroup::reconcile_voters` drive the core's joint change so a retired voter leaves the consensus
+> set (three voters, one dead: the two survivors commit alone; a fourth member is promoted at `f = 1`), a
+> removed leader steps down once `C_new` commits, a node outside its configuration never campaigns, and
+> outgoing voters receive their removal until it commits. The believed-dead contact clause stays, no
+> longer papering over a stale set. Record: `docs/bugs/2026-09-13-raft-voter-set-never-shrinks.md`. A
+> holder-side defect it exposed — an acceptor created by a refused first record pinned at a stale
+> generation, so a head provisioned in the install window never placed — is fixed
+> (`docs/bugs/2026-09-13-holder-acceptor-born-stale-never-placed.md`).
 
 **Role.** The authoritative record of volumes, snapshots, lineage, leases, attachments,
 accounting, completion records, grants, chains and the operation log; served locally in
