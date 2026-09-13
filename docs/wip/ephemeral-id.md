@@ -49,6 +49,52 @@ its volumes have been taken over by its neighbours"* (line 3854).
 5. The council then commits `TakeOver(old)` and `Admit(new)` through its existing `reconcile_alive`, which
    installs the configuration, bumps the old id's fencing epoch, and takes its objects over.
 
+## The follow-up (Ada: "Then fix these?"), same day
+
+6. **An admission carries the node's failure domain.** `ConfigCommand::Admit { host, domain }` — the
+   council log entry gained a presence byte and, when present, the little-endian domain id
+   (`crates/cluster/src/config_group.rs`; round-trip test covers both forms). `reconcile_alive` takes each
+   alive host with the domain its node declares; the leader resolves it (`fleet::declared_domain`) from the
+   deployment's declaration, which is keyed by the node's generation-0 seed: a member at a later generation
+   is mapped to its node through the anchor it was learned under (this node's own through its origin anchor)
+   and looked up by `member_id(anchor, 0)`. `RegionalConfiguration::admit` inserts the domain;
+   `retire` now **drops** it, so the map stays bounded to the members while every restart admits a new id
+   (banned item 8 — before, admissions never touched the map, so it could not grow; now it can, and it is
+   pruned). The epoch is still kept on retire (fencing).
+7. **The refusals are observable and proven over the wire.** `Daemon::fleet_refusals` (the status report's
+   counts) and `Daemon::council_domains` (the committed domain map) are one-shot control-shard observations
+   like the other accessors.
+8. **The RIFL completion origin is the rostered anchor.** `serve_peer_records` no longer hashes the presented
+   certificate a second time: the anchor the roster holds for that certificate — the same one the member id
+   derives from and announcements are validated against — is both the learned-id key and the forwarded
+   write's origin. In a deployment the two were equal; on an in-process fleet they now are too (one id per
+   node on every plane).
+
+Tests and numbers for the follow-up (2026-09-13, same box, loads 7–8):
+
+- `config_group::tests::an_admission_carries_the_members_declared_domain` (leader admits B with a domain
+  and C without; both voters agree) and the reconcile test now carries B's domain to the follower; cluster
+  unit 116/116, `config_group_live` 1/1.
+- `register::tests::an_admission_carries_the_members_domain_and_a_retirement_drops_it` (db).
+- By use: `a_restarted_peer_is_learned_on_contact_under_its_new_generation` now declares B's node in a
+  failure domain and asserts the restart's new id is committed under it on every survivor
+  (`council_domains`). **Before** (the same tree with the admission carrying no domain — `declared_domain`
+  neutralized for the run, then reverted): FAILED on `domain_carried` after 445.46 s (the poll ran out its
+  4000-period daemon-time budget; every earlier step passed). **After:** passed 4.49 s (load 7.2).
+- By use, new: `a_stale_or_forged_announcement_is_refused_and_counted`. A and B form, B at generation one;
+  then a daemon on a fresh segment (generation zero, B's seed) and a daemon configured with a flipped anchor
+  (an id B's certificate cannot derive) both present **B's certificate** to A. Asserted: A's
+  `fleet.member_generation_stale` and `fleet.member_id_forged` both ≥ 1; A's alive membership held exactly
+  {A, B₁} over a settle window once both were counted; each refused announcer, never acknowledged, aged A to
+  death in its own view. Passed 8.91 s (load 7.5). Its before-state is "unobservable", not "failing": the
+  counters existed since `ca0577a` but no accessor exposed them. Design note found on the way: a same-cert
+  dialer **replaces** the peer's live session at the serve demultiplexer (`Demux::bind`, by certificate), so
+  a stale or replayed boot holding B's key can bounce B's real session at A; A's own belief about B is
+  unaffected (it rides A's dial to B), and the announcer still gets no acknowledgement.
+- Siblings re-run one at a time, green: `a_restarted_peer_rejoins_under_a_new_member_id_and_the_old_is_retired`
+  3.77 s; `a_falsely_retired_peer_rejoins_by_refutation` 5.78 s. Server lib 21/21, db register 32/32.
+- Gates clean again (fmt, clippy `-D warnings` — one test split for cognitive complexity — `xtask check`).
+
 ## Tests and numbers (2026-09-13, 18-core shared box, load averages as noted)
 
 - Pure: `fleet::tests::an_announced_identity_is_current_restarted_stale_or_forged` (server);
@@ -80,18 +126,13 @@ its volumes have been taken over by its neighbours"* (line 3854).
 
 - **The Raft voter sets do not follow a restart.** The new id is admitted as a *member*, but the council's
   and the root group's voter sets are Raft's `all_voters`, fixed at formation to the seeds — a restarted
-  voter's new id is a learner until Raft membership change lands (the parallel item), and a dead seed keeps
-  counting toward every majority.
-- **A restarted node's failure domain.** The council's domain map is keyed by member id at formation, so a
-  new id has no declared domain (unique-per-host, the safe default — copysets never repeat it — but the
-  operator's declaration is lost). Carrying the domain on `Admit` (a council log change) closes it.
-- **No wire-level test of a stale or forged refusal yet** — the pure classifier covers the decision; the
-  serve side's "no acknowledgement" and the counters need an in-process accessor for the status report's
-  refusals to assert by use.
+  voter's new id is a learner until Raft membership change lands (the parallel raft-membership item), and a
+  dead seed keeps counting toward every majority. Left to that branch deliberately: both touch
+  `config_group.rs`, and the `Admit { host, domain }` log change here will need a merge against it.
 - **The gated three-process deployment test** (`SLATES_TEST_CLI=1 … three_daemon_processes_deploy…`) was not
   run here (the integrator's, on a quiet box). It is the one that exercises real anchored daemons announcing
   generation 1 on their first boot, so the seeds are replaced on first contact; the in-process suite's
-  daemons are generation 0 and match their seeds.
-- `verbs::serve_forward`'s RIFL origin stays `host_id_of_certificate(presented)`: in a deployment that equals
-  the rostered anchor; on an in-process fleet it differs from the machine-identity anchor, harmlessly (both
-  ends of that path use the certificate hash).
+  daemons are generation 0 and match their seeds. It now also covers the manifest's domains riding an
+  admission (`declared_domain` over a manifest-keyed map).
+- The three items closed above (domain on `Admit`, the refusal accessor and wire-level test, the RIFL origin)
+  were owed here in the first report; they are done.

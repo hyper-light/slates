@@ -1504,15 +1504,19 @@ impl RegionalConfiguration {
     })
   }
 
-  /// Admits `member` to the region (a join the council agrees on): a no-op if already a member. Refixes the
+  /// Admits `member` to the region (a join the council agrees on) with the failure `domain` its node
+  /// declares, if any (`None` leaves it unique-per-host): a no-op if already a member. Refixes the
   /// neighbourhoods and advances the version. Returns whether the membership changed.
-  pub fn admit(&mut self, member: HostId, scatter: u64) -> bool {
+  pub fn admit(&mut self, member: HostId, domain: Option<DomainId>, scatter: u64) -> bool {
     if self.members.contains(&member) {
       return false;
     }
     self.members.push(member);
     self.members.sort_unstable_by_key(|host| host.0);
     self.epochs.entry(member).or_insert(FIRST_EPOCH);
+    if let Some(domain) = domain {
+      self.domains.insert(member, domain);
+    }
     self.version = self.version.saturating_add(1);
     self.fix_neighbourhoods(scatter);
     true
@@ -1520,13 +1524,17 @@ impl RegionalConfiguration {
 
   /// Retires `member` from the region (a departure the council agrees on). Refixes the neighbourhoods and
   /// advances the version. Its epoch is kept, so a record from the retired host under an old epoch is still
-  /// fenced if it returns. Returns whether the membership changed.
+  /// fenced if it returns; its failure domain is dropped — only members are placed across domains, and an
+  /// admission carries a returning node's domain afresh — so the domain map stays bounded to the members
+  /// while every restart admits a new member id (task #22; banned item 8). Returns whether the membership
+  /// changed.
   pub fn retire(&mut self, member: HostId, scatter: u64) -> bool {
     if !self.members.contains(&member) {
       return false;
     }
     self.members.retain(|host| *host != member);
     self.neighbourhoods.remove(&member);
+    self.domains.remove(&member);
     self.version = self.version.saturating_add(1);
     self.fix_neighbourhoods(scatter);
     true
@@ -2364,7 +2372,7 @@ mod tests {
     );
     let before = regional.version;
     assert!(
-      regional.admit(HostId(4), scatter),
+      regional.admit(HostId(4), None, scatter),
       "a new member is admitted"
     );
     assert!(regional.version > before, "the version advanced");
@@ -2374,7 +2382,7 @@ mod tests {
       "the admitted member now has a placement view"
     );
     assert!(
-      !regional.admit(HostId(4), scatter),
+      !regional.admit(HostId(4), None, scatter),
       "admitting an existing member is a no-op"
     );
     assert!(regional.retire(HostId(2), scatter), "a member is retired");
@@ -2382,6 +2390,37 @@ mod tests {
     assert!(
       regional.configuration_for(HostId(2)).is_none(),
       "a retired member has no configuration"
+    );
+  }
+
+  /// AC (§4.8, D-14; task #22): an admission carries the failure domain the member's node declares, so the
+  /// member places under it at once (a restarted node's new id inherits its node's domain this way), and a
+  /// retirement drops the domain again, so the map stays bounded to the members while every restart admits
+  /// a new id (banned item 8).
+  #[test]
+  fn an_admission_carries_the_members_domain_and_a_retirement_drops_it() {
+    let scatter = 3;
+    let mut regional = RegionalConfiguration::formed(
+      vec![HostId(1), HostId(2), HostId(3)],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    // Shape: the failure domain the admitted member's node declares — any id distinct from unique-per-host.
+    let declared_domain: DomainId = 7;
+    assert!(regional.admit(HostId(4), Some(declared_domain), scatter));
+    assert_eq!(
+      regional
+        .configuration_for(HostId(4))
+        .and_then(|configuration| configuration.domains.get(&HostId(4)).copied()),
+      Some(declared_domain),
+      "the admitted member places under the failure domain its admission carried"
+    );
+    assert!(regional.retire(HostId(4), scatter));
+    assert!(
+      !regional.domains.contains_key(&HostId(4)),
+      "a retired member's domain is dropped — the map stays bounded to the members"
     );
   }
 

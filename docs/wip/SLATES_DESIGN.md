@@ -1666,6 +1666,13 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 > holder-side defect it exposed — an acceptor created by a refused first record pinned at a stale
 > generation, so a head provisioned in the install window never placed — is fixed
 > (`docs/bugs/2026-09-13-holder-acceptor-born-stale-never-placed.md`).
+> Task #22 closed (same day): the two-id model is implemented. A node's stable anchor keys
+> authentication and the completion-record origin; its ephemeral member id is derived from the anchor and
+> the anchor segment's start count, and keys membership, ownership, rendezvous and takeover. Peers learn
+> the id on contact, so a restart retires the old id and admits the new one under the node's declared
+> failure domain, with the council committing both — and, with the Raft membership change above, the
+> voter set follows the restarted voter's new id. Stale and forged announcements are counted and never
+> acknowledged, proven over the wire in-process.
 
 **Role.** The authoritative record of volumes, snapshots, lineage, leases, attachments,
 accounting, completion records, grants, chains and the operation log; served locally in

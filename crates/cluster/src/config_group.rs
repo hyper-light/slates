@@ -45,8 +45,15 @@ use crate::raft_wire::RaftMessage;
 /// configuration. The Raft core treats it as opaque bytes; this is the config group's interpretation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfigCommand {
-  /// Admit a member to the neighbourhood.
-  Admit(HostId),
+  /// Admit a member to the neighbourhood, with the failure domain the operator declared for its node when
+  /// there is one (task #22: the domains a region formed with are keyed by the member ids of that formation,
+  /// so a restarted node's new id inherits its node's domain only through the admission that carries it).
+  Admit {
+    /// The member admitted.
+    host: HostId,
+    /// Its declared failure domain; `None` is unique-per-host, the default when none is declared.
+    domain: Option<DomainId>,
+  },
   /// Retire a member from the neighbourhood.
   Retire(HostId),
   /// Take over a **failed host** (§4.8 line 1730 "Host failure increments the host epoch"): bump its
@@ -63,16 +70,27 @@ pub enum ConfigCommand {
 const COMMAND_ADMIT: u8 = 0;
 const COMMAND_RETIRE: u8 = 1;
 const COMMAND_TAKE_OVER: u8 = 2;
+/// Format: an admission's domain is a presence byte — absent (unique-per-host) or present, in which case
+/// the domain id follows as a little-endian u64.
+const DOMAIN_ABSENT: u8 = 0;
+const DOMAIN_PRESENT: u8 = 1;
 
 impl ConfigCommand {
-  /// The command's canonical bytes for the log: the tag, then the host id (and, for a takeover, the
-  /// object), little-endian.
+  /// The command's canonical bytes for the log: the tag, then the host id, then for an admission its
+  /// domain (a presence byte, and the id when present), little-endian.
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::new();
     match self {
-      ConfigCommand::Admit(host) => {
+      ConfigCommand::Admit { host, domain } => {
         out.push(COMMAND_ADMIT);
         out.extend_from_slice(&host.0.to_le_bytes());
+        match domain {
+          Some(domain) => {
+            out.push(DOMAIN_PRESENT);
+            out.extend_from_slice(&domain.to_le_bytes());
+          }
+          None => out.push(DOMAIN_ABSENT),
+        }
       }
       ConfigCommand::Retire(host) => {
         out.push(COMMAND_RETIRE);
@@ -91,7 +109,16 @@ impl ConfigCommand {
   pub fn decode(bytes: &[u8]) -> Option<ConfigCommand> {
     let (&tag, rest) = bytes.split_first()?;
     match tag {
-      COMMAND_ADMIT => Some(ConfigCommand::Admit(take_host(rest)?.0)),
+      COMMAND_ADMIT => {
+        let (host, rest) = take_host(rest)?;
+        let (&presence, rest) = rest.split_first()?;
+        let domain = match presence {
+          DOMAIN_ABSENT => None,
+          DOMAIN_PRESENT => Some(take_word(rest)?.0),
+          _ => return None,
+        };
+        Some(ConfigCommand::Admit { host, domain })
+      }
       COMMAND_RETIRE => Some(ConfigCommand::Retire(take_host(rest)?.0)),
       COMMAND_TAKE_OVER => Some(ConfigCommand::TakeOver {
         dead: take_host(rest)?.0,
@@ -103,21 +130,34 @@ impl ConfigCommand {
 
 /// Reads a u64 host id at the front of `bytes`, returning it and the remainder, or `None` if truncated.
 fn take_host(bytes: &[u8]) -> Option<(HostId, &[u8])> {
+  let (word, rest) = take_word(bytes)?;
+  Some((HostId(word), rest))
+}
+
+/// Reads a little-endian u64 at the front of `bytes` — a host id, or an admission's domain id — returning
+/// it and the remainder, or `None` if fewer than eight bytes remain.
+fn take_word(bytes: &[u8]) -> Option<(u64, &[u8])> {
   if bytes.len() < size_of::<u64>() {
     return None;
   }
   let (head, rest) = bytes.split_at(size_of::<u64>());
   let mut word = [0u8; size_of::<u64>()];
   word.copy_from_slice(head);
-  Some((HostId(u64::from_le_bytes(word)), rest))
+  Some((u64::from_le_bytes(word), rest))
 }
 
 /// A proposed change to the configuration — the vocabulary the SWIM view and takeover speak to the
 /// group. Applied locally at `f = 0`; carried through consensus at `f > 0` (owed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reconfiguration {
-  /// Admit a member to the neighbourhood (a join the membership view learned).
-  Admit(HostId),
+  /// Admit a member to the neighbourhood (a join the membership view learned), with the failure domain the
+  /// operator declared for its node when there is one (`None` is unique-per-host).
+  Admit {
+    /// The member to admit.
+    host: HostId,
+    /// Its declared failure domain, carried into the configuration by the admission (task #22).
+    domain: Option<DomainId>,
+  },
   /// Retire a member from the neighbourhood (a clean departure — no fencing epoch bump).
   Retire(HostId),
   /// Take over a **failed** member (§4.8 "Promotion and takeover", line 1730 "Host failure increments the
@@ -326,8 +366,8 @@ impl RegionalCouncil {
   /// `false`).
   pub fn propose(&mut self, change: Reconfiguration) -> bool {
     let (command, would_change) = match change {
-      Reconfiguration::Admit(host) => (
-        ConfigCommand::Admit(host),
+      Reconfiguration::Admit { host, domain } => (
+        ConfigCommand::Admit { host, domain },
         !self.configuration.members.contains(&host),
       ),
       Reconfiguration::Retire(host) => (
@@ -367,21 +407,23 @@ impl RegionalCouncil {
   /// leader is the one configuration master and decides from its own SWIM view (it probes every member), so
   /// a follower's own detection need not propose. Gated on [`caught_up`](RegionalCouncil::caught_up) so a
   /// change in flight is not re-proposed; a member already present, or already gone, is not proposed either
-  /// (`propose`'s own `would_change` gate), so the log grows only for real changes.
-  pub fn reconcile_alive(&mut self, alive: &[HostId]) -> bool {
+  /// (`propose`'s own `would_change` gate), so the log grows only for real changes. Each alive host comes
+  /// with the failure domain its node declares, if any, so an admission carries it into the configuration
+  /// (task #22: a restarted node's new id inherits its node's domain this way).
+  pub fn reconcile_alive(&mut self, alive: &[(HostId, Option<DomainId>)]) -> bool {
     if !self.is_leader() || !self.caught_up() {
       return false;
     }
     let mut proposed = false;
-    for host in alive {
-      proposed |= self.propose(Reconfiguration::Admit(*host));
+    for &(host, domain) in alive {
+      proposed |= self.propose(Reconfiguration::Admit { host, domain });
     }
     let stale: Vec<HostId> = self
       .configuration
       .members
       .iter()
       .copied()
-      .filter(|member| !alive.contains(member))
+      .filter(|member| !alive.iter().any(|(host, _)| host == member))
       .collect();
     for host in stale {
       // A member no longer alive **failed** (SWIM confirmed its death), so take it over — bump its fencing
@@ -459,8 +501,8 @@ impl RegionalCouncil {
   /// Applies one committed command to the regional configuration.
   fn apply_regional(&mut self, command: ConfigCommand) {
     match command {
-      ConfigCommand::Admit(host) => {
-        self.configuration.admit(host, self.scatter);
+      ConfigCommand::Admit { host, domain } => {
+        self.configuration.admit(host, domain, self.scatter);
       }
       ConfigCommand::Retire(host) => {
         self.configuration.retire(host, self.scatter);
@@ -485,7 +527,14 @@ mod tests {
   #[test]
   fn config_command_round_trips() {
     let commands = [
-      ConfigCommand::Admit(A),
+      ConfigCommand::Admit {
+        host: A,
+        domain: Some(DECLARED_DOMAIN),
+      },
+      ConfigCommand::Admit {
+        host: B,
+        domain: None,
+      },
       ConfigCommand::Retire(B),
       ConfigCommand::TakeOver { dead: OWNER },
     ];
@@ -519,6 +568,48 @@ mod tests {
     match to.answer(request) {
       Some(reply) => from.fold_reply(reply),
       None => Vec::new(),
+    }
+  }
+
+  /// Shape: a failure domain an admission carries in these tests — any id, distinct from unique-per-host.
+  const DECLARED_DOMAIN: DomainId = 7;
+  /// A fourth host, admitted without a declared domain.
+  const C: HostId = HostId(4);
+
+  /// An admission carries the member's declared failure domain into the configuration (task #22 — a
+  /// restarted node's new id inherits its node's domain through this), and one without a declaration stays
+  /// unique-per-host: the leader admits `B` in the declared domain and `C` without one; both commit at the
+  /// majority and apply on every voter with the same domains.
+  #[test]
+  fn an_admission_carries_the_members_declared_domain() {
+    let mut leader = council(OWNER);
+    let mut follower = council(A);
+    elect(&mut leader, &mut follower);
+    assert!(leader.propose(Reconfiguration::Admit {
+      host: B,
+      domain: Some(DECLARED_DOMAIN),
+    }));
+    assert!(leader.propose(Reconfiguration::Admit {
+      host: C,
+      domain: None,
+    }));
+    replicate(&mut leader, &mut follower, 2);
+    for (name, council) in [("leader", &leader), ("follower", &follower)] {
+      let configuration = council.configuration();
+      assert!(
+        configuration.members.contains(&B) && configuration.members.contains(&C),
+        "both admissions applied at the {name}"
+      );
+      assert_eq!(
+        configuration.domains.get(&B),
+        Some(&DECLARED_DOMAIN),
+        "the declared domain rode the admission into the {name}'s configuration"
+      );
+      assert_eq!(
+        configuration.domains.get(&C),
+        None,
+        "no declaration: the member stays unique-per-host at the {name}"
+      );
     }
   }
 
@@ -572,7 +663,10 @@ mod tests {
 
     // Propose admitting a new member (not itself a voter); it commits and applies only at the majority.
     assert!(
-      leader.propose(Reconfiguration::Admit(B)),
+      leader.propose(Reconfiguration::Admit {
+        host: B,
+        domain: None,
+      }),
       "the leader appended the membership change"
     );
     replicate(&mut leader, &mut follower, 2);
@@ -706,8 +800,8 @@ mod tests {
     elect(&mut leader, &mut follower);
     assert!(leader.is_leader());
 
-    // The region starts [OWNER, A]; host B has now joined the alive view.
-    let alive = vec![OWNER, A, B];
+    // The region starts [OWNER, A]; host B has now joined the alive view, its node declaring a failure domain.
+    let alive = vec![(OWNER, None), (A, None), (B, Some(DECLARED_DOMAIN))];
     assert!(
       !follower.reconcile_alive(&alive),
       "a non-leader proposes nothing — only the leader is the configuration master"
@@ -730,6 +824,11 @@ mod tests {
     assert!(
       follower.configuration().members.contains(&B),
       "and at the follower — the council agrees on the reconciled membership"
+    );
+    assert_eq!(
+      follower.configuration().domains.get(&B),
+      Some(&DECLARED_DOMAIN),
+      "the admission carried B's declared failure domain to every voter (task #22)"
     );
     assert!(
       !leader.reconcile_alive(&alive),
@@ -758,7 +857,7 @@ mod tests {
 
     // A is no longer alive: the leader proposes its takeover (an epoch bump plus a retirement).
     assert!(
-      leader.reconcile_alive(&[OWNER]),
+      leader.reconcile_alive(&[(OWNER, None)]),
       "the leader proposes the failed member's takeover"
     );
     replicate(&mut leader, &mut follower, 2);
@@ -784,8 +883,6 @@ mod tests {
       "and the follower applied the same bump — the council agrees on the fencing epoch"
     );
   }
-
-  const C: HostId = HostId(4);
 
   /// A council per node over `members` at f=1, every node seeded with the same voters
   /// ([`council_voters`]: the lowest ids up to the candidate floor of three).
@@ -919,9 +1016,11 @@ mod tests {
     // B dies: the leader takes it over, and the survivors commit the takeover (two of three). The takeover
     // alone leaves the voter set untouched — the voter change follows.
     let survivors = [OWNER, A];
+    let alive: Vec<(HostId, Option<DomainId>)> =
+      survivors.iter().map(|host| (*host, None)).collect();
     let proposed = councils
       .get_mut(&OWNER)
-      .is_some_and(|leader| leader.reconcile_alive(&survivors));
+      .is_some_and(|leader| leader.reconcile_alive(&alive));
     settle(&mut councils, OWNER, &survivors, 2);
     assert_eq!(
       (
@@ -951,9 +1050,12 @@ mod tests {
     );
 
     // A further change commits with A's acknowledgement alone — a majority of the two remaining voters.
-    let admitted = councils
-      .get_mut(&OWNER)
-      .is_some_and(|leader| leader.propose(Reconfiguration::Admit(C)));
+    let admitted = councils.get_mut(&OWNER).is_some_and(|leader| {
+      leader.propose(Reconfiguration::Admit {
+        host: C,
+        domain: None,
+      })
+    });
     settle(&mut councils, OWNER, &survivors, 2);
     assert_eq!(
       (
@@ -983,9 +1085,11 @@ mod tests {
     // B dies; the leader takes it over, committed by OWNER and A. The learner then fetches and adopts the
     // committed configuration, as the fleet's learner path does.
     let alive = [OWNER, A, C];
+    let declared: Vec<(HostId, Option<DomainId>)> =
+      alive.iter().map(|host| (*host, None)).collect();
     let proposed = councils
       .get_mut(&OWNER)
-      .is_some_and(|leader| leader.reconcile_alive(&alive));
+      .is_some_and(|leader| leader.reconcile_alive(&declared));
     settle(&mut councils, OWNER, &alive, 2);
     let fetched = councils[&OWNER].configuration().clone();
     let adopted = councils

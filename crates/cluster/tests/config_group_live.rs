@@ -163,7 +163,10 @@ fn run_distributed_membership_change() -> Outcome {
       }
 
       // Propose a membership change; at more than one voter it commits and applies only over the wire.
-      let proposed = leader.propose(Reconfiguration::Admit(ADMITTED));
+      let proposed = leader.propose(Reconfiguration::Admit {
+        host: ADMITTED,
+        domain: None,
+      });
 
       // Round one replicates the entry (the voter appends, the leader commits at the majority); round two's
       // heartbeat carries the advanced commit index, so the voter applies too.
@@ -320,7 +323,7 @@ fn run_voter_removal_over_the_transport() -> RemovalOutcome {
       };
 
       // The dead voter is taken over (committed by the live voter's acknowledgement: two of three).
-      leader.reconcile_alive(&[LEADER, VOTER]);
+      leader.reconcile_alive(&[(LEADER, None), (VOTER, None)]);
       replicate(&mut leader, &mut endpoint).await;
       let dead_retired_at_leader = !leader.configuration().members.contains(&DEAD);
       // The voter set follows: the joint change, then C_new, each committed by the live voter alone.
@@ -329,7 +332,10 @@ fn run_voter_removal_over_the_transport() -> RemovalOutcome {
       leader.reconcile_voters();
       replicate(&mut leader, &mut endpoint).await;
       // A further change commits under the new majority of two.
-      leader.propose(Reconfiguration::Admit(ADMITTED));
+      leader.propose(Reconfiguration::Admit {
+        host: ADMITTED,
+        domain: None,
+      });
       replicate(&mut leader, &mut endpoint).await;
 
       let _ = result_tx.send(RemovalOutcome {
