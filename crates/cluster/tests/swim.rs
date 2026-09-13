@@ -230,6 +230,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
 
       let (timed_out, ack_gossip, rtt_ns) = match outcome {
         ProbeOutcome::Acked {
+          from: _,
           gossip,
           rtt_ns,
           coordinate,

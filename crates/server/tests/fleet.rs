@@ -423,6 +423,77 @@ fn a_falsely_retired_peer_rejoins_by_refutation() {
   );
 }
 
+/// AC (§4.8 "Recovery"; task #22 — a restart is a join under a **new** ephemeral id): a peer that restarts
+/// comes back under a NEW member id (a higher daemon generation), and its OLD id is **retired**, not rejoined
+/// as its old self. A and B form; A knows B under its generation-0 member id. Then B's old process ends (its
+/// leaked in-process sockets cannot be rebound to truly restart, so — as the rejoin test does for detection —
+/// the return is injected: B's old id dead, its new id `member_id(B_anchor, 1)` alive, exactly the fold the
+/// live learn-on-contact produces when B's new-id probes reach A and its old id stops answering). A **admits
+/// B's new id** and **retires the old** — the design's "rejoins with a new ephemeral id", the contrast to the
+/// rejoin test above where a *falsely*-suspected peer (same generation, same id) refutes and keeps its id.
+/// Non-vacuous: B's old and new ids differ (the id is ephemeral), the old is shown known first, then retired,
+/// and the new admitted.
+#[test]
+fn a_restarted_peer_rejoins_under_a_new_member_id_and_the_old_is_retired() {
+  let _serial = serialize_fleet_tests();
+  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let b_old = b.host; // B's generation-0 member id — what A seeds and knows it by.
+  let b_new = member_id(b.origin_anchor, 1); // B's member id after one restart (generation 1).
+  assert_ne!(
+    b_old, b_new,
+    "the member id is ephemeral — a restart holds a new id, not its old self"
+  );
+  let peer_of_a = Peer {
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start(a, peer_of_a);
+  let daemon_b = start(b, peer_of_b);
+
+  // Form + settle, then confirm A knows B under its old (generation-0) id.
+  let settle = Instant::now() + FORMATION_SETTLE;
+  while Instant::now() < settle {
+    std::thread::yield_now();
+  }
+  let knew_old = daemon_a.fleet_members().contains(&b_old);
+
+  // B's old process ends (a restart's old incarnation is gone), then its return under a new generation is
+  // injected into A: the old id dead, the new id alive.
+  daemon_b.stop();
+  daemon_a.observe_peer_restart(b_old, b_new, FALSE_DEATH_INCARNATION);
+
+  let admitted_new = poll_until(REJOIN_DEADLINE, || {
+    daemon_a.fleet_members().contains(&b_new)
+  });
+  let retired_old = poll_until(RETIREMENT_DEADLINE, || {
+    !daemon_a.fleet_members().contains(&b_old)
+  });
+
+  daemon_a.stop();
+  assert!(
+    knew_old,
+    "A knew B under its generation-0 member id before the restart"
+  );
+  assert!(
+    admitted_new,
+    "A admitted B's new (generation-1) member id — a restart is a join under a new id"
+  );
+  assert!(
+    retired_old,
+    "A retired B's old member id — the restart does not rejoin as its old self"
+  );
+}
+
 /// `count` distinct free localhost UDP ports, all bound at once so the OS hands back distinct ports, then
 /// dropped before the daemons rebind them (binding one at a time could repeat a port). The generalization of
 /// [`four_free_ports`] the N-node mesh needs.

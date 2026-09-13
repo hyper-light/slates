@@ -673,6 +673,55 @@ impl Daemon {
     let _ = rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS));
   }
 
+  /// Injects a peer's **restart** into this node's membership for a test (§4.8 "Recovery"; task #22): the peer
+  /// at `old` has come back under a **new** ephemeral member id `new` (a higher daemon generation), so `old`
+  /// is folded `Dead` at `death_incarnation` (its process is gone — its objects are taken over) and `new` is
+  /// folded `Alive` (a new member joins). This is exactly the fold the live `serve_peer_probes` /
+  /// `probe_and_apply` learn-on-contact produces when the returning node's probes announce `new` and its `old`
+  /// id stops answering — driven directly here because an in-process daemon cannot rebind its leaked fleet
+  /// sockets to actually restart (the same reason the rejoin test injects `observe_peer_dead`).
+  pub fn observe_peer_restart(
+    &self,
+    old: slates_db::HostId,
+    new: slates_db::HostId,
+    death_incarnation: u64,
+  ) {
+    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
+    else {
+      return;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if runtime
+      .spawn_on(control, async move {
+        state::with_state(|s| {
+          // The old id is dead at a high incarnation (so it outranks its seeded-alive belief); the new id
+          // joins alive. `apply_peer_state` is the incarnation-gated fold the detector uses.
+          let _ = slates_cluster::fleet::apply_peer_state(
+            &mut s.fleet,
+            old,
+            Some(slates_cluster::membership::MemberState {
+              liveness: slates_cluster::membership::Liveness::Dead,
+              incarnation: death_incarnation,
+            }),
+          );
+          let _ = slates_cluster::fleet::apply_peer_state(
+            &mut s.fleet,
+            new,
+            Some(slates_cluster::membership::MemberState {
+              liveness: slates_cluster::membership::Liveness::Alive,
+              incarnation: 0,
+            }),
+          );
+        });
+        let _ = tx.send(());
+      })
+      .is_err()
+    {
+      return;
+    }
+    let _ = rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS));
+  }
+
   /// Whether this daemon's fleet has **region-placed** the head of `object` (§4.8): its control-shard
   /// membership loop replicated the head's record to the candidate holders and recorded a quorum of
   /// acknowledgements. A test or an operator reads this to observe cross-node replication; `false` if it is

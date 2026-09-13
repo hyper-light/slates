@@ -78,7 +78,7 @@ use slates_archive::Archive;
 use slates_cluster::content::{fetch_content, is_content_stream, put_content};
 use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::fleet::{apply_peer_state, sync_peer};
-use slates_cluster::membership::Liveness;
+use slates_cluster::membership::{Liveness, MemberState};
 use slates_cluster::raft_wire::{
   RaftMessage, decode_regional_configuration, decode_root_configuration,
   encode_regional_configuration, encode_root_configuration,
@@ -527,11 +527,14 @@ async fn serve_peer_probes(
   if endpoint.establish().await.is_err() {
     return;
   }
-  let prober = endpoint.peer_certificate().and_then(|presented| {
+  // Only a **rostered** certificate may move membership (auth); the prober's *current* member id is the id it
+  // announces on the wire (`message.from()`), learned on contact — a restart announces a higher-generation id
+  // (task #22 learn-on-contact). At generation 0 that announced id equals the roster's precomputed seed, so
+  // this is the same id the roster would have named.
+  let authenticated = endpoint.peer_certificate().is_some_and(|presented| {
     roster
       .iter()
-      .find(|(certificate, _)| *certificate == presented)
-      .map(|(_, host)| *host)
+      .any(|(certificate, _)| *certificate == presented)
   });
   let timing = detector_timing(neighbourhood);
   let fanout = usize::try_from(timing.gossip_transmits).unwrap_or(1);
@@ -545,18 +548,26 @@ async fn serve_peer_probes(
             detector.learn_coordinate(message.from(), coordinate.clone());
           }
           let mut gossip = detector.gossip(fanout);
-          if let Some(peer) = prober {
+          if authenticated {
+            let peer = message.from();
             state::with_state(|s| {
-              // Fold the authenticated prober's own asserted liveness (scoped to it) — a higher incarnation
-              // re-admits it, a stale one is ignored (`FleetNode::observe`'s incarnation-gated merge).
-              if let Some(asserted) = message
+              // Learn the authenticated prober alive under its **announced** member id (task #22
+              // learn-on-contact): a restart's higher-generation id is admitted as a **new member** here,
+              // while its old id ages out via the probe side (`probe_and_apply` stops crediting an id whose
+              // node now answers under a different one). Prefer the incarnation the prober asserts for itself
+              // (an A-15 refutation of a suspicion); otherwise a fresh alive. The incarnation-gated merge
+              // (`FleetNode::observe`) leaves a *retired* old id dead (alive@0 does not outrank a death) and,
+              // at generation 0, folds the same seed id already believed alive from boot — inert.
+              let asserted = message
                 .gossip()
                 .iter()
                 .find(|(host, _)| *host == peer)
                 .map(|(_, state)| *state)
-              {
-                apply_peer_state(&mut s.fleet, peer, Some(asserted));
-              }
+                .unwrap_or(MemberState {
+                  liveness: Liveness::Alive,
+                  incarnation: 0,
+                });
+              apply_peer_state(&mut s.fleet, peer, Some(asserted));
               // Echo this node's belief about the prober so a peer this node believes dead learns of it and
               // self-refutes. Only when not already carried and not `Alive` (an alive belief needs no echo).
               if let Some(belief) = s.fleet.membership().state(peer)
@@ -663,16 +674,25 @@ async fn probe_and_apply(
     Ok((
       returned,
       ProbeOutcome::Acked {
+        from,
         gossip,
         rtt_ns,
         coordinate,
       },
     )) => {
-      detector.on_ack(peer_host);
+      // Learn-on-contact (task #22, §4.8 "Recovery"): credit `peer_host` only if the node still answers under
+      // the id we probed. If it answers under a **different** id, it has restarted under a new ephemeral
+      // member id (a higher generation) — we do not credit the old id, so it ages to death over the suspicion
+      // window and its objects are taken over (#30), while the node's new id is learned as alive from its own
+      // probes of this node (`serve_peer_probes`). At generation 0 (a first boot) the announced id equals the
+      // probed id, so this is the ordinary credit. The gossip (other members' states) is folded regardless.
+      if from == peer_host {
+        detector.on_ack(peer_host);
+        #[allow(clippy::cast_precision_loss)]
+        detector.observe_rtt(peer_host, rtt_ns as f64);
+        detector.learn_coordinate(peer_host, coordinate);
+      }
       detector.apply_gossip(&gossip);
-      #[allow(clippy::cast_precision_loss)]
-      detector.observe_rtt(peer_host, rtt_ns as f64);
-      detector.learn_coordinate(peer_host, coordinate);
       returned
     }
     Ok((returned, ProbeOutcome::TimedOut)) => returned,

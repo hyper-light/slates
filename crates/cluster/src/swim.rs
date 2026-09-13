@@ -422,6 +422,12 @@ pub enum ProbeOutcome {
   /// (`rtt_ns`) for it to feed the Vivaldi coordinate (`detector.observe_rtt`) so per-peer RTT prediction
   /// learns from real samples.
   Acked {
+    /// The member id the acknowledging node **announced** as its own (`Ack.from`). On a mutually-TLS
+    /// authenticated session this rides back from the node the caller probed; the caller compares it to the
+    /// id it probed and, if they differ, the node has restarted under a new ephemeral member id (a higher
+    /// generation) — the caller stops crediting the old id (it ages out) and the node's new id is learned
+    /// from its own probes (§4.8 "Recovery"; task #22 learn-on-contact).
+    from: HostId,
     /// The membership updates the acknowledgement carried.
     gossip: Vec<(HostId, MemberState)>,
     /// The measured round-trip time of this probe, in nanoseconds (the shard clock).
@@ -491,11 +497,12 @@ pub async fn probe_once(
   let outcome = match received {
     Some(Ok(reply)) => match SwimMessage::decode(&reply) {
       Ok(SwimMessage::Ack {
+        from,
         nonce,
         gossip,
         coordinate,
-        ..
       }) if Some(nonce) == expected => ProbeOutcome::Acked {
+        from,
         gossip,
         rtt_ns: now_ns().saturating_sub(started_ns),
         coordinate,
