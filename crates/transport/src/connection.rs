@@ -36,6 +36,16 @@ use crate::flow::FlowController;
 use crate::session::Frame;
 use crate::stream::{StreamAssembler, StreamSender};
 
+/// The most receive reassemblers kept for streams below the exchange floor — late replies of abandoned
+/// exchanges still arriving ([`Connection::discard_streams_below`]).
+/// Derived: `REORDER_THRESHOLD + 1`, one in-flight packet window — a peer serves one exchange at a time
+/// and this end abandons at most one per deadline, so more stragglers than fit one loss-detection window
+/// can only be a peer replaying the past; the oldest is forgotten first. Anchored to `conn::REORDER_THRESHOLD`.
+// The threshold is a small count (three); it cannot truncate on any pointer width, and `usize::try_from`
+// is not usable in a const.
+#[allow(clippy::cast_possible_truncation)]
+pub const LATE_REPLY_STREAMS: usize = (REORDER_THRESHOLD + 1) as usize;
+
 /// The initial receive-window credit, in bytes, for a frame cap of `max_frame_len`.
 /// Derived: `(REORDER_THRESHOLD + 1) × max_frame_len` — the least in-flight data that keeps
 /// reorder-based loss detection working. A loss is declared when `REORDER_THRESHOLD` later packets are
@@ -413,6 +423,42 @@ impl Connection {
     self.recv_streams.keys().copied().collect()
   }
 
+  /// Drains and discards every receive stream whose id is below `floor` — the late replies of exchanges
+  /// the caller has abandoned (a stream id is never reused within a connection, RFC 9000 §2.1, so an id
+  /// below the current exchange's can only be an older exchange's). The bytes are **read**, not dropped:
+  /// reading slides the flow-control cursors forward, so every byte the peer sent is credited back to it
+  /// through the next acknowledgement's `MaxData`/`MaxStreamData` — a late reply left unread would leak
+  /// its length from the peer's connection credit for good, one abandoned exchange at a time. A stream
+  /// that has reached its `fin` is then forgotten; one still arriving is kept until it does, and the
+  /// set of such stragglers is bounded: a peer serves one exchange at a time, so at most one late reply
+  /// can be in flight per abandoned exchange, and the caller abandons at most one exchange per deadline —
+  /// the reassemblers below the floor are capped at [`LATE_REPLY_STREAMS`], the oldest forgotten first
+  /// (its remaining bytes are then deduplicated on arrival by the packet-number space, never re-offered).
+  pub fn discard_streams_below(&mut self, floor: u64) {
+    let late: Vec<u64> = self
+      .recv_streams
+      .keys()
+      .copied()
+      .filter(|&id| id < floor)
+      .collect();
+    for id in &late {
+      let _ = self.read_stream(*id);
+      if self.recv_stream_complete(*id) {
+        self.forget_stream(*id);
+      }
+    }
+    let mut lingering: Vec<u64> = self
+      .recv_streams
+      .keys()
+      .copied()
+      .filter(|&id| id < floor)
+      .collect();
+    while lingering.len() > LATE_REPLY_STREAMS {
+      let oldest = lingering.remove(0);
+      self.forget_stream(oldest);
+    }
+  }
+
   /// The sender's current congestion window in bytes — the most in-flight data it allows itself. Grows
   /// on acknowledgement and reduces on loss; exposed so a test can witness that response.
   pub fn congestion_window(&self) -> u64 {
@@ -472,6 +518,12 @@ impl Connection {
       .retain(|frame| !matches!(frame, Frame::Stream { stream_id: id, .. } if *id == stream_id));
     let dropped = self.sent.forget_stream(stream_id);
     self.congestion.on_probe_removed(dropped);
+    // The dropped bytes were fresh sends counted against the peer's connection-wide credit
+    // (`connection_sent`) when first framed; they will never be delivered, so the credit they took is
+    // given back — otherwise each abandoned exchange under loss would leak its unacknowledged bytes from
+    // the connection window for the session's lifetime, a bounded but permanent narrowing. Bytes the
+    // peer already acknowledged were delivered and stay counted; only what was still in flight refunds.
+    self.connection_sent = self.connection_sent.saturating_sub(dropped);
     // Forget the per-stream flow-control watermark too, so reusing this id starts fresh; the
     // connection-wide consumed total is kept (its bytes stay counted, so the peer's credit never
     // regresses). Leaving a stale watermark would stall a reused stream (its offsets fall below it).

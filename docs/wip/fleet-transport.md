@@ -214,6 +214,15 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    probe from the estimated PTO on a *timed* receive (the estimate and the probe mechanism both exist;
    the timer that arms it needs the runtime's timed receive), connection IDs, several frames per packet
    (an MTU budget), and loom on the state machine.
+   **Status (2026-09-13):** connection IDs landed earlier (`4dd4e6e`, one socket per plane). Every
+   exchange now rides a **fresh stream id** (RFC 9000 §2.1): the kind in the low `STREAM_KIND_BITS`,
+   a per-connection exchange sequence above (`Endpoint::request(kind, ..)`, `abandon_exchange`,
+   `Connection::discard_streams_below`, the server serving the newest complete request and yielding an
+   abandoned reply to it) — the collision an abandoned exchange caused behind its unacknowledged reply
+   is closed at the transport and the SWIM re-send it had forced is gone
+   (`docs/bugs/2026-09-13-reused-stream-id-collides-behind-an-unacked-reply.md`). Still owed: several
+   frames per packet (the MTU budget), per-path MTU discovery (DPLPMTUD, RFC 8899 — the replacement for
+   a fixed 1200-byte cap the research names), the timed tail-loss probe, and loom on the state machine.
    The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c); its
    fencing step rides membership. The **`Keyring`'s population is built** (`enrollment.rs`, slice 6):
    `Enrollment::from_membership` turns an admitted-membership record (the shared control secret + the

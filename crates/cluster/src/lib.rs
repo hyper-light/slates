@@ -398,10 +398,11 @@ pub async fn request_within(
     .await
   };
   if reply.is_none() {
-    // The deadline won: the `request` future was dropped mid-exchange. Forget the abandoned stream so
-    // its half-sent frames do not ride the next flush on this reused session and reach the peer folded
-    // into an unrelated request (`docs/bugs/2026-09-10-abandoned-request-retransmit-lockstep.md`).
-    endpoint.forget_stream(stream_id);
+    // The deadline won: the `request` future was dropped mid-exchange. Abandon the exchange so its
+    // half-sent frames do not ride the next flush on this reused session and reach the peer folded into an
+    // unrelated request (`docs/bugs/2026-09-10-abandoned-request-retransmit-lockstep.md`); its late reply,
+    // arriving on its own now-older stream id, is discarded below the next exchange's floor.
+    endpoint.abandon_exchange();
   }
   (reply.unwrap_or_default(), endpoint)
 }

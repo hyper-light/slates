@@ -406,10 +406,18 @@ impl Detector {
   /// round-robin over the alive peers and returns the [`Ping`] to send — or `None` when there are no
   /// peers to probe.
   pub fn tick(&mut self) -> Option<Ping> {
+    // A suspected member whose probe was answered this period is not aged toward death by the same tick
+    // that credits the answer: the acknowledgement is direct evidence of life. The suspicion itself stands
+    // until the member refutes it (SWIM §4.2 — a direct acknowledgement never clears a suspicion), so a
+    // member back from a stall stays in doubt, but it cannot be declared dead on a period that heard from
+    // it — which is what a late-but-answered probe used to do when the answer landed exactly as the
+    // window expired (`docs/bugs/2026-09-13-reused-stream-id-collides-behind-an-unacked-reply.md`).
+    let mut heard_from: Option<HostId> = None;
     if let Some(target) = self.probing.take() {
       if self.acked {
         // The probe was answered (directly or through a relay): the node looks healthy.
         self.improve_health();
+        heard_from = Some(target);
       } else {
         // The probe went wholly unanswered: raise the local-health multiplier (Lifeguard — this is as
         // much a signal about us as about the target) and suspect a still-alive target.
@@ -431,7 +439,7 @@ impl Detector {
         }
       }
     }
-    self.age_suspicions();
+    self.age_suspicions(heard_from);
 
     let target = self.next_target()?;
     self.probing = Some(target);
@@ -504,11 +512,12 @@ impl Detector {
     }
   }
 
-  /// Ages each suspected member's counter by one period; a member suspected for its whole suspicion
+  /// Ages each suspected member's counter by one period — except `heard_from`, the member whose probe was
+  /// answered this period (see [`tick`](Detector::tick)) — and a member suspected for its whole suspicion
   /// window — the confirmation-count timeout for how many independent peers suspect it, dilated by the
   /// local-health multiplier — is declared dead (at the incarnation it was suspected under). Counters and
   /// confirmations for members no longer suspected (refuted or already dead) are dropped.
-  fn age_suspicions(&mut self) {
+  fn age_suspicions(&mut self, heard_from: Option<HostId>) {
     let suspects = self.membership.suspects();
     let suspect_ids: Vec<HostId> = suspects.iter().map(|(host, _)| *host).collect();
     self.suspicion.retain(|host, _| suspect_ids.contains(host));
@@ -516,6 +525,9 @@ impl Detector {
       .confirmations
       .retain(|host, _| suspect_ids.contains(host));
     for (host, incarnation) in suspects {
+      if heard_from == Some(host) {
+        continue;
+      }
       let confirmations = self.confirmations.get(&host).map_or(0, BTreeSet::len);
       let window = self.suspicion_window(u64::try_from(confirmations).unwrap_or(u64::MAX));
       let periods = self.suspicion.entry(host).or_insert(0);
@@ -790,6 +802,34 @@ mod tests {
       still,
       Some(Liveness::Suspect),
       "an acknowledgement alone does not clear a suspicion"
+    );
+  }
+
+  /// A suspected member whose probe is **answered** on the very period its window would expire is not
+  /// declared dead by that tick — an acknowledgement is evidence of life — while the suspicion itself
+  /// stands (only a refutation clears it), and a further silent period does declare it dead. The rule that
+  /// kept a peer back from a CPU stall alive when its first answered probe landed as the window ran out.
+  #[test]
+  fn an_answered_probe_does_not_age_a_suspect_to_death_that_period() {
+    // Window of two periods: suspected on the resolving tick, aged once, then dead on the next.
+    let mut detector = Detector::new(LOCAL, timing(2, 2));
+    detector.join(A);
+    detector.tick(); // probe A; unanswered
+    detector.tick(); // A suspected (aged 1); probes A again; unanswered
+    // This tick would age A to 2 = the window and kill it — but A answered the probe just resolved.
+    detector.on_ack(A);
+    detector.tick();
+    assert_eq!(
+      detector.membership().state(A).map(|s| s.liveness),
+      Some(Liveness::Suspect),
+      "an answered probe spares the suspect this period; the suspicion stands"
+    );
+    // Silent again: the next tick ages it to the window and declares it dead.
+    detector.tick();
+    assert_eq!(
+      detector.membership().state(A).map(|s| s.liveness),
+      Some(Liveness::Dead),
+      "a further silent period declares the suspect dead"
     );
   }
 

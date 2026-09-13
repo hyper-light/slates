@@ -8,6 +8,7 @@
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::future::Future;
 use std::sync::mpsc::channel;
 
 use rustix::net::{Ipv4Addr, SocketAddrV4};
@@ -340,6 +341,177 @@ fn repeated_exchanges_never_reuse_packet_numbers() {
   match result_rx.try_recv() {
     Ok(Ok(())) => {}
     other => panic!("repeated exchanges did not keep packet numbers monotonic: {other:?}"),
+  }
+}
+
+/// Shape: how long (simulated nanoseconds) the abandoning client waits before its next request — long enough
+/// that the server has received the abandoned request and put its reply on the wire (a few timer ticks on
+/// the loopback fabric), short next to the initial probe timeout so the server's reply is still in flight,
+/// unacknowledged, when the next request arrives.
+const SETTLE_NS: u64 = 2_000_000;
+/// Shape: the bound on each end's wait for an exchange that a defect could otherwise leave waiting forever
+/// (the simulation advances time to every re-drive timer, so an unbounded wait never goes idle). Several
+/// times the initial probe timeout, so a served exchange completes and a dropped one fails the test.
+const EXCHANGE_BOUND_NS: u64 = 4_000_000_000;
+
+/// Runs `future` to completion or until `within_ns` of simulated time pass — `None` on the deadline. The
+/// bound a test needs on an exchange that a defect could leave waiting forever.
+async fn within<F: Future>(within_ns: u64, future: F) -> Option<F::Output> {
+  let mut future = std::pin::pin!(future);
+  let mut deadline = std::pin::pin!(slates_rt::futures::sleep(within_ns));
+  std::future::poll_fn(|cx| {
+    if let std::task::Poll::Ready(output) = future.as_mut().poll(cx) {
+      return std::task::Poll::Ready(Some(output));
+    }
+    if deadline.as_mut().poll(cx).is_ready() {
+      return std::task::Poll::Ready(None);
+    }
+    std::task::Poll::Pending
+  })
+  .await
+}
+
+/// Polls `future` exactly once, under the running task's own context, and drops it — the shape of a caller
+/// whose deadline fires after its request was flushed but before it read the reply (the fleet probe racing
+/// `request` against a deadline). Returns whether the single poll already completed it. Polled with the
+/// task's real waker (never a detached one): a readiness interest the poll registers must stay wakeable, or
+/// the runtime holds the registration as pending work and the simulation never goes idle.
+async fn poll_once_then_abandon<F: Future>(future: F) -> bool {
+  let mut future = std::pin::pin!(future);
+  std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx).is_ready())).await
+}
+
+/// AC (RFC 9000 §2.1 — a stream id is never reused within a connection; §4.10a §8): a request that reaches
+/// the peer while the peer still holds the **abandoned** previous exchange's reply unacknowledged is
+/// **served**, and the late reply to the abandoned exchange is never read as the new one's. The client
+/// flushes request A (one poll), gives it up, lets the server receive A and put its reply on the wire, then
+/// sends request B and must receive B's own transform within a bound. On a stream id reused per request
+/// kind, B rode A's id: at the server B's offset-0 frame was a duplicate of A's completed stream (deduped,
+/// never served) while A's reply awaited an acknowledgement that never came, and at the client A's late
+/// reply could be read as B's — the collision that starved a live peer's probes
+/// (`docs/bugs/2026-09-13-reused-stream-id-collides-behind-an-unacked-reply.md`).
+#[test]
+fn a_request_behind_an_abandoned_exchanges_unacknowledged_reply_is_served() {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+  let server_identity = self_signed(NAME);
+  let client_identity = self_signed(NAME);
+  let server_cert = server_identity.certificate();
+  let client_cert = client_identity.certificate();
+  let (server_port_tx, server_port_rx) = channel();
+  let (client_port_tx, client_port_rx) = channel();
+  let (served_tx, served_rx) = channel();
+  let (result_tx, result_rx) = channel();
+
+  // The server: serve two requests in turn, each bounded, reporting what it served — so a request the
+  // transport drops is visible as "never served" rather than as a hang.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = server_port_tx.send(socket.local_addr().unwrap().port());
+      let client_port = recv_port(client_port_rx).await;
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, client_port);
+      let mut server = Endpoint::server(
+        socket,
+        peer,
+        &server_identity,
+        std::slice::from_ref(&client_cert),
+        FRAME_CAP,
+      )
+      .unwrap();
+      server.establish().await.unwrap();
+      // Three serves: the warm-up exchange (which also takes the server past its handshake confirmation,
+      // where a client's first 1-RTT datagram is dropped by design and left to the client's retransmit),
+      // then A, then B.
+      for _ in 0..3 {
+        let served_tx = served_tx.clone();
+        let outcome = within(
+          EXCHANGE_BOUND_NS,
+          server.serve_once(move |_, req| {
+            let _ = served_tx.send(req.clone());
+            req.iter().map(|b| b.wrapping_add(7)).collect()
+          }),
+        )
+        .await;
+        if outcome.is_none() {
+          break;
+        }
+      }
+    })
+    .unwrap();
+
+  // The client: a completed warm-up exchange, then A flushed and abandoned, a settle, then B awaited
+  // within the bound.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = client_port_tx.send(socket.local_addr().unwrap().port());
+      let server_port = recv_port(server_port_rx).await;
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+      let outcome = async {
+        let mut client = Endpoint::client(
+          socket,
+          peer,
+          &client_identity,
+          &server_cert,
+          NAME,
+          FRAME_CAP,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        client.establish().await.map_err(|e| format!("{e:?}"))?;
+        let warm = within(EXCHANGE_BOUND_NS, client.request(STREAM_ID, b"warm-up"))
+          .await
+          .ok_or_else(|| "the warm-up exchange never completed".to_owned())?
+          .map_err(|e| format!("{e:?}"))?;
+        if warm
+          != b"warm-up"
+            .iter()
+            .map(|b| b.wrapping_add(7))
+            .collect::<Vec<u8>>()
+        {
+          return Err("the warm-up reply was wrong".to_owned());
+        }
+        let completed_early = poll_once_then_abandon(client.request(STREAM_ID, b"request A")).await;
+        client.abandon_exchange();
+        slates_rt::futures::sleep(SETTLE_NS).await;
+        let reply_b = within(EXCHANGE_BOUND_NS, client.request(STREAM_ID, b"request B"))
+          .await
+          .ok_or_else(|| "request B was never answered within the bound".to_owned())?
+          .map_err(|e| format!("{e:?}"))?;
+        Ok::<_, String>((completed_early, reply_b))
+      }
+      .await;
+      let _ = result_tx.send(outcome);
+    })
+    .unwrap();
+
+  sim.run_until_idle();
+
+  let served: Vec<Vec<u8>> = served_rx.try_iter().collect();
+  match result_rx.try_recv() {
+    Ok(Ok((completed_early, reply_b))) => {
+      assert!(
+        !completed_early,
+        "one poll flushes the request but cannot complete it — the reply needs a round trip"
+      );
+      assert!(
+        served.iter().any(|r| r == b"request A"),
+        "the server received the abandoned request A (the collision is set up): served {served:?}"
+      );
+      assert!(
+        served.iter().any(|r| r == b"request B"),
+        "the server served request B behind A's unacknowledged reply: served {served:?}"
+      );
+      assert_eq!(
+        reply_b,
+        b"request B"
+          .iter()
+          .map(|b| b.wrapping_add(7))
+          .collect::<Vec<u8>>(),
+        "B's reply is B's own transform, not A's late reply"
+      );
+    }
+    other => panic!("the exchange behind an abandoned reply failed: {other:?}; served {served:?}"),
   }
 }
 
