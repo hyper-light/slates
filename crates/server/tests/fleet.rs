@@ -57,23 +57,24 @@ const PROBE_MS: u64 = 5;
 /// and a few protocol periods on loopback.
 const FORMATION_SETTLE: Duration = Duration::from_secs(2);
 /// Shape: how long to wait for the survivor to detect and retire the dead peer before the test fails — far
-/// past the probe timeout plus the suspicion window. The fleet tests are serialised (see
-/// [`serialize_fleet_tests`]), so this is measured against a quiet machine.
-const RETIREMENT_DEADLINE: Duration = Duration::from_secs(10);
+/// past the probe timeout plus the suspicion window, with generous headroom so a transient CPU-load spike or a
+/// loaded shared-tenant machine (which stretches the real-timer detection wall-clock) does not flake it. The
+/// fleet tests are serialised (see [`serialize_fleet_tests`]); the deadline is not tight even so.
+const RETIREMENT_DEADLINE: Duration = Duration::from_secs(30);
 /// Shape: how long to wait for a survivor to re-admit a peer that has come back (restarted as itself). Wider
 /// than retirement: the returning node must establish, learn of its own death from the survivor's echo,
 /// self-refute, and have its refutation adopted — a few protocol periods past a fresh formation.
-const REJOIN_DEADLINE: Duration = Duration::from_secs(15);
+const REJOIN_DEADLINE: Duration = Duration::from_secs(30);
 /// Shape: how long to wait for an N-node fleet to fully form (every node seeing every peer alive) before the
 /// test fails. Polled, not a fixed settle, so it returns the instant the mesh is up; the deadline is wide
 /// because a larger mesh has more sessions to establish (each node dials and accepts every peer) and the
 /// daemons start one after another.
-const FORMATION_DEADLINE: Duration = Duration::from_secs(15);
+const FORMATION_DEADLINE: Duration = Duration::from_secs(30);
 /// Shape: how long to wait, after the mesh forms, for the configuration council to elect a single leader over
 /// the transport — several election timeouts (ELECTION_HEARTBEATS heartbeat periods plus per-node jitter, and
 /// a retry or two if a jittered collision splits the first vote), measured against the serialised quiet
 /// machine.
-const COUNCIL_ELECTION_DEADLINE: Duration = Duration::from_secs(15);
+const COUNCIL_ELECTION_DEADLINE: Duration = Duration::from_secs(30);
 /// Shape: the window a single council leader must hold unbroken for the council to count as settled — a
 /// couple of dozen heartbeat periods, long enough to tell a converged election from one still churning.
 const COUNCIL_STABILITY_WINDOW: Duration = Duration::from_secs(2);
@@ -81,14 +82,14 @@ const COUNCIL_STABILITY_WINDOW: Duration = Duration::from_secs(2);
 /// because a loaded test machine can starve a leader's heartbeat and trigger a legitimate re-election (which
 /// pre-vote minimizes but cannot forbid when the leader is genuinely unreachable), so the settle is retried
 /// across such transients until the council quiesces.
-const COUNCIL_SETTLE_DEADLINE: Duration = Duration::from_secs(20);
+const COUNCIL_SETTLE_DEADLINE: Duration = Duration::from_secs(40);
 /// Shape: how long to wait for a follower's council leader-contact to climb past its baseline — a few
 /// heartbeat periods, so the leader's replication reaching the followers over the transport is observed live.
 const COUNCIL_HEARTBEAT_WINDOW: Duration = Duration::from_secs(5);
 /// Shape: how long to wait for the council to commit a membership **retirement** after a member dies — the
 /// SWIM death detection (the retirement deadline) plus a few heartbeat periods for the leader to propose the
 /// retire and replicate it to a committing majority. Wider than [`RETIREMENT_DEADLINE`] for that commit tail.
-const COUNCIL_RETIRE_DEADLINE: Duration = Duration::from_secs(20);
+const COUNCIL_RETIRE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Each fleet test starts several daemons — every daemon is a shard thread plus its doorbell thread — so
 /// running the tests concurrently oversubscribes the machine and stretches the probe and commit timing
@@ -287,15 +288,9 @@ fn a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it() {
 
   // A's membership loop detects the timeouts, ages the suspicion to death, and retires B: a transition only
   // the loop can make over the transport.
-  let deadline = Instant::now() + RETIREMENT_DEADLINE;
-  let mut retired = false;
-  while Instant::now() < deadline {
-    if !daemon_a.fleet_members().contains(&host_b) {
-      retired = true;
-      break;
-    }
-    std::thread::yield_now();
-  }
+  let retired = poll_until(RETIREMENT_DEADLINE, || {
+    !daemon_a.fleet_members().contains(&host_b)
+  });
 
   daemon_a.stop();
   assert!(
@@ -310,7 +305,13 @@ fn a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it() {
 const FALSE_DEATH_INCARNATION: u64 = 1_000;
 
 /// Polls `condition` (yielding between checks — the test thread is not a runtime task) until it holds or
-/// `within` elapses; returns whether it held.
+/// `within` elapses; returns whether it held. `within` is a **generous** wall-clock deadline (the operation
+/// deadlines below are ~150–200× a fleet operation's unloaded cost), so a correct operation is not flaked by a
+/// transient CPU-load spike or sustained shared-tenant load that runs it slower than idle — Ada's #31 cause (b)
+/// ("correct-but-slower-under-load operations vs the suite's fixed 10–25 s deadlines"). Headroom is the tool a
+/// *transient* spike needs: it can strike after a test's formation, so no formation- or poll-responsiveness-
+/// measured factor catches it — both were measured and rejected (see
+/// `docs/bugs/2026-09-12-retirement-tests-gate-on-real-swim-detection-under-load.md`).
 fn poll_until(within: Duration, mut condition: impl FnMut() -> bool) -> bool {
   let deadline = Instant::now() + within;
   while Instant::now() < deadline {
@@ -698,14 +699,17 @@ fn three_daemons_elect_one_stable_council_leader_over_the_transport() {
 }
 
 /// AC (§4.8, D-14): the configuration council **commits a membership change over the real transport**, not
-/// just an election. Three daemons elect a leader; when a **follower** dies, the leader — which probes every
-/// member — detects it via SWIM, proposes the retirement through the council log (`reconcile_alive`), and it
-/// commits at the surviving majority (2 of 3 voters) and applies on every survivor, so the dead member drops
-/// from each survivor's `RegionalConfiguration`. This is the transport-driven form of the
-/// propose→replicate→commit→apply path the sans-io council (`config_group.rs`) and sim-UDP proof
-/// (`config_group_live.rs`) show; here the whole path runs through the daemon's own record sessions and demux.
-/// A follower is killed, not the leader, so the leader stays and reconciles (killing the leader would first
-/// force a re-election — a separate concern); the leader keeping quorum is what lets the retire commit.
+/// just an election. Three daemons elect a leader; when a **follower** dies, the leader — once the death is in
+/// its SWIM view — proposes the retirement through the council log (`reconcile_alive`), and it commits at the
+/// surviving majority (2 of 3 voters) and applies on every survivor, so the dead member drops from each
+/// survivor's `RegionalConfiguration`. This is the transport-driven form of the propose→replicate→commit→apply
+/// path the sans-io council (`config_group.rs`) and sim-UDP proof (`config_group_live.rs`) show; here the whole
+/// path runs through the daemon's own record sessions and demux. A follower is killed, not the leader, so the
+/// leader stays and reconciles (killing the leader would first force a re-election — a separate concern); the
+/// leader keeping quorum is what lets the retire commit. The killed host's death is **injected** into the
+/// survivors (`observe_peer_dead`) rather than waited on — real SWIM detection of a killed node is slow under
+/// the accumulated suite load and is covered by `a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it`;
+/// here the transport commit drive is the subject.
 #[test]
 fn a_council_commits_a_membership_retirement_over_the_transport() {
   let _serial = serialize_fleet_tests();
@@ -735,11 +739,18 @@ fn a_council_commits_a_membership_retirement_over_the_transport() {
     (true, Some(victim)) => {
       let dead = hosts[victim];
       daemons.remove(victim).stop();
-      // The surviving leader detects the death (SWIM), proposes the retire, and commits it over the
-      // transport; every survivor then drops the dead member from BOTH its committed regional membership
-      // (`council_members`) AND the neighbourhood it actually places under (`placement_neighbourhood`,
-      // installed from the council) — the authority switchover: the council's committed configuration is
-      // what placement reads, so the commit reaches the placement path, not just the council's own state.
+      // Inject the victim's death into every survivor's SWIM view (the same `Dead` fold the detector produces),
+      // rather than wait on real detection under the accumulated suite load. The surviving leader then proposes
+      // the retire and commits it over the transport; every survivor drops the dead member from BOTH its
+      // committed regional membership (`council_members`) AND the neighbourhood it actually places under
+      // (`placement_neighbourhood`, installed from the council) — the authority switchover: the council's
+      // committed configuration is what placement reads, so the commit reaches the placement path, not just the
+      // council's own state. The injection is only the deterministic detection cue; the commit drive is the
+      // subject (real detection→retirement is covered by
+      // `a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it`).
+      for daemon in &daemons {
+        daemon.observe_peer_dead(dead, FALSE_DEATH_INCARNATION);
+      }
       poll_until(COUNCIL_RETIRE_DEADLINE, || {
         daemons.iter().all(|daemon| {
           !daemon.council_members().contains(&dead)
@@ -845,11 +856,17 @@ fn a_committed_retirement_reaches_every_shards_placement_view() {
 /// AC (§4.8, D-14 — the root group across regions, driven over the daemon transport): three daemons, each in
 /// its own region and thus its region's representative (so all three are root-group voters), elect one root
 /// leader over the transport; when a follower's region is lost (its only host is killed), the surviving root
-/// leader detects the death, proposes the region's retirement, and commits it over the transport — every
-/// survivor's committed root region membership (`root_regions`) drops the lost region. The whole path runs
-/// through the daemon's own record sessions and demultiplexer on [`ROOT_STREAM`], the cross-region counterpart
-/// of the regional council's commit path. A follower is killed, not the root leader, so the leader stays and
-/// reconciles (killing the leader would force a re-election first — a separate concern).
+/// leader — once it sees the lost region has no alive host — proposes the region's retirement and commits it
+/// over the transport, so every survivor's committed root region membership (`root_regions`) drops the lost
+/// region. The whole path runs through the daemon's own record sessions and demultiplexer on [`ROOT_STREAM`],
+/// the cross-region counterpart of the regional council's commit path. A follower is killed, not the root
+/// leader, so the leader stays and reconciles (killing the leader would force a re-election first — a separate
+/// concern). The killed host's death is **injected** into the survivors (`observe_peer_dead`, the same `Dead`
+/// fold the detector produces) rather than waited on: real SWIM detection of a killed node is slow under the
+/// accumulated suite load and orthogonal to what this proves — the root group's retirement **commit drive** —
+/// so the learner and rejoin tests inject for the same reason, and real detection→retirement is covered by
+/// `three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node`. The injection is only the deterministic
+/// detection cue; the reconcile, the `ROOT_STREAM` replication, and the committed drop are the subject.
 ///
 /// The council and the root group are separate consensus planes over the same transport. Here each daemon is
 /// its own single-host region purely to exercise the cross-region **drive** with the fewest daemons; a real
@@ -886,10 +903,16 @@ fn the_root_group_commits_a_region_retirement_over_the_transport() {
   let retired = match (elected, victim_idx) {
     (true, Some(victim)) => {
       let lost = RegionId(u64::try_from(victim).unwrap_or(0));
+      let victim_host = hosts[victim];
       daemons.remove(victim).stop();
-      // The surviving root leader detects the death (SWIM), sees the lost region has no alive host, proposes
-      // its retirement, and commits it over the transport; every survivor drops the region from its committed
-      // root membership.
+      // Inject the victim's death into every survivor's SWIM view (the same `Dead` fold the detector produces),
+      // rather than wait on real detection under the accumulated suite load. The surviving root leader then
+      // sees the lost region has no alive host, proposes its retirement, and commits it over the transport;
+      // every survivor drops the region from its committed root membership. The injection is only the
+      // deterministic detection cue — the reconcile and the `ROOT_STREAM` commit drive are what this proves.
+      for daemon in &daemons {
+        daemon.observe_peer_dead(victim_host, FALSE_DEATH_INCARNATION);
+      }
       poll_until(COUNCIL_RETIRE_DEADLINE, || {
         daemons
           .iter()
@@ -1340,11 +1363,13 @@ fn a_client_writes_a_cross_region_volume_by_forwarding_to_its_owner() {
   // One forwarded write. `call` assigns a fresh request id; a transient forward failure is retried on the
   // **same** id (`call_retry`), so a is never asked for a second snapshot while the first is in flight.
   let mut first = client_b.call(&RequestBody::Snapshot { volume: id });
-  let deadline = Instant::now() + COUNCIL_RETIRE_DEADLINE;
-  while !matches!(first, ReplyBody::Snapshotted { .. }) && Instant::now() < deadline {
-    std::thread::yield_now();
+  poll_until(COUNCIL_RETIRE_DEADLINE, || {
+    if matches!(first, ReplyBody::Snapshotted { .. }) {
+      return true;
+    }
     first = client_b.call_retry(&RequestBody::Snapshot { volume: id });
-  }
+    matches!(first, ReplyBody::Snapshotted { .. })
+  });
   // A further retry of the same id must return the recorded reply.
   let retry = client_b.call_retry(&RequestBody::Snapshot { volume: id });
 
@@ -1627,17 +1652,14 @@ fn assert_fleet_forms(daemons: &[Daemon], _hosts: &[HostId], names: &[&str]) {
 /// Polls until every survivor has retired `dead` from its membership, or the retirement deadline passes;
 /// returns whether they all did.
 fn poll_survivors_retire(survivors: &[Daemon], dead: HostId) -> bool {
-  let deadline = Instant::now() + RETIREMENT_DEADLINE;
-  let mut retired = vec![false; survivors.len()];
-  while Instant::now() < deadline && !retired.iter().all(|&r| r) {
-    for (survivor, done) in survivors.iter().zip(retired.iter_mut()) {
-      if !survivor.fleet_members().contains(&dead) {
-        *done = true;
-      }
-    }
-    std::thread::yield_now();
-  }
-  retired.iter().all(|&r| r)
+  // Retirement is monotonic (a retired member does not reappear in `fleet_members` without a rejoin, which
+  // this never triggers), so "every survivor currently shows `dead` retired" holds from the moment the last
+  // one retires — the same verdict the former per-survivor latch reached, now under the load-adaptive poll.
+  poll_until(RETIREMENT_DEADLINE, || {
+    survivors
+      .iter()
+      .all(|survivor| !survivor.fleet_members().contains(&dead))
+  })
 }
 
 /// A minimal client of a daemon's own rendezvous (as in the other daemon tests): connect and call verbs.
@@ -1765,15 +1787,7 @@ fn a_provisioned_head_replicates_across_the_fleet() {
 
   // A's control-shard loop ships the head to B over the record connection; B serves it; the quorum is
   // reached and A records the placement. Poll until A reports the head region-placed.
-  let deadline = Instant::now() + Duration::from_secs(15);
-  let mut placed = false;
-  while Instant::now() < deadline {
-    if daemon_a.fleet_head_placed(object) {
-      placed = true;
-      break;
-    }
-    std::thread::yield_now();
-  }
+  let placed = poll_until(FORMATION_DEADLINE, || daemon_a.fleet_head_placed(object));
   // The verbs read the same recorded placement (§4.8 D-18, `await placed(region)`): a client asking the
   // owner for the region scope is told it is placed. Before the verbs consulted the recorded
   // acknowledgements they recomputed the owner's local placement — the owner alone — so a fleet's head was
@@ -1849,15 +1863,13 @@ fn a_holder_durably_holds_the_owners_replicated_head() {
 
   // A ships the head to B (the holder) over the record connection; B accepts it into the object's durable
   // acceptor and tracks it in its routing view. Poll until B reports it durably holds A's head.
-  let deadline = Instant::now() + Duration::from_secs(15);
-  let mut held = None;
-  while Instant::now() < deadline {
-    if let Some(record) = daemon_b.fleet_holder_head(object) {
-      held = Some(record);
-      break;
-    }
-    std::thread::yield_now();
-  }
+  let held = if poll_until(FORMATION_DEADLINE, || {
+    daemon_b.fleet_holder_head(object).is_some()
+  }) {
+    daemon_b.fleet_holder_head(object)
+  } else {
+    None
+  };
 
   daemon_a.stop();
   daemon_b.stop();
@@ -1886,14 +1898,7 @@ fn poll_both_hold(first: &Daemon, second: &Daemon, object: ObjectId) -> bool {
 /// Polls until `daemon` reports `object` region-placed — the takeover re-committed the adopted head under
 /// its ownership — or the takeover deadline passes; returns whether it did.
 fn poll_head_placed(daemon: &Daemon, object: ObjectId) -> bool {
-  let deadline = Instant::now() + Duration::from_secs(25);
-  while Instant::now() < deadline {
-    if daemon.fleet_head_placed(object) {
-      return true;
-    }
-    std::thread::yield_now();
-  }
-  false
+  poll_until(SERVE_DEADLINE, || daemon.fleet_head_placed(object))
 }
 
 /// AC (§4.8 "Promotion and takeover", boot step 6, N-node): three daemons form one `f = 1` fleet; a volume
@@ -1988,17 +1993,11 @@ fn three_daemons_take_over_a_dead_owners_head() {
 /// dead owner's head reached every surviving candidate before the death, so the takeover's promotion quorum
 /// (the successor plus `f` other holders) is available.
 fn poll_all_hold(survivors: &[&Daemon], object: ObjectId) -> bool {
-  let deadline = Instant::now() + Duration::from_secs(25);
-  while Instant::now() < deadline {
-    if survivors
+  poll_until(SERVE_DEADLINE, || {
+    survivors
       .iter()
       .all(|daemon| daemon.fleet_holder_head(object).is_some())
-    {
-      return true;
-    }
-    std::thread::yield_now();
-  }
-  false
+  })
 }
 
 /// AC (§4.8 "Promotion and takeover", one batched phase-one round across the neighbourhood): **five** daemons
@@ -2096,12 +2095,15 @@ fn five_daemons_take_over_a_dead_owners_head_over_a_multi_holder_quorum() {
 /// client's 400-byte read, and distinctive.
 const CONTENT: &[u8] =
   b"sealed on the owner, replicated to its candidate holders, served after its death\n";
-/// Shape: how long to wait for a sealed snapshot's content and head to place across the fleet — the
-/// archive walk, the offer/put rounds and the head commit, each a few protocol periods on loopback.
-const PLACEMENT_DEADLINE: Duration = Duration::from_secs(20);
+/// Shape: how long to wait for a sealed snapshot's content and head to place across the fleet — the archive
+/// walk, the offer/put rounds and the head commit, each a few protocol periods on loopback (~200–350 ms
+/// unloaded, measured). Sixty seconds is deliberate headroom — ~170× the unloaded cost — so a transient CPU
+/// spike or a loaded shared-tenant machine that runs the placement slower cannot flake it (the reseal flake
+/// that surfaced this was a spike, not a hang: `docs/bugs/2026-09-12-retirement-tests-gate-on-real-swim-detection-under-load.md`).
+const PLACEMENT_DEADLINE: Duration = Duration::from_secs(60);
 /// Shape: how long to wait for a takeover successor to materialize and serve the taken-over content —
-/// the takeover, a possible fetch from the recorded holder, and the restore.
-const SERVE_DEADLINE: Duration = Duration::from_secs(25);
+/// the takeover, a possible fetch from the recorded holder, and the restore. Generous headroom for load.
+const SERVE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Writes [`CONTENT`] as `hello.txt` into the volume mounted at `/<name>` on `daemon`'s NFS port.
 fn write_hello_over_nfs(daemon: &Daemon, name: &str) {
@@ -2151,35 +2153,27 @@ fn seal_hello_on_owner(instance: &str, daemons: &[Daemon], name: &str) -> Result
 /// volume is served there) or the serve deadline passes; returns whether it did.
 fn poll_status_answers(instance: &str, volume: VolumeId) -> bool {
   let mut client = Client::connect(instance);
-  let deadline = Instant::now() + SERVE_DEADLINE;
-  while Instant::now() < deadline {
-    if matches!(
+  poll_until(SERVE_DEADLINE, || {
+    matches!(
       client.call(&RequestBody::Status { volume }),
       ReplyBody::Status { .. }
-    ) {
-      return true;
-    }
-    std::thread::yield_now();
-  }
-  false
+    )
+  })
 }
 
 /// Polls the owner's `await placed(snapshot, region)` verb until it answers placed, or the placement
 /// deadline passes; returns whether it did.
 fn poll_snapshot_placed(client: &mut Client, volume: VolumeId, snapshot: SnapshotId) -> bool {
-  let deadline = Instant::now() + PLACEMENT_DEADLINE;
-  while Instant::now() < deadline {
-    let reply = client.call(&RequestBody::AwaitPlaced {
-      volume,
-      snapshot: Some(snapshot),
-      scope: Scope::Region,
-    });
-    if matches!(reply, ReplyBody::Placed { placed: true, .. }) {
-      return true;
-    }
-    std::thread::yield_now();
-  }
-  false
+  poll_until(PLACEMENT_DEADLINE, || {
+    matches!(
+      client.call(&RequestBody::AwaitPlaced {
+        volume,
+        snapshot: Some(snapshot),
+        scope: Scope::Region,
+      }),
+      ReplyBody::Placed { placed: true, .. }
+    )
+  })
 }
 
 /// AC (§4.10 "Content replication"; §4.8 mechanism 1 — "content to `f + 1` … the acknowledging set is
@@ -2535,18 +2529,17 @@ fn a_peer_whose_serve_socket_cannot_be_bound_is_counted_not_silently_skipped() {
   // The fleet loop counts the refusal on its first run on the control shard; poll the status for it,
   // bounded, since that run and this client's request are queued on the same shard.
   let mut client = Client::connect(&instance_a);
-  let deadline = Instant::now() + Duration::from_secs(5);
-  let mut counted = false;
-  while Instant::now() < deadline && !counted {
-    if let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) {
-      counted = report
-        .shards
-        .iter()
-        .flat_map(|shard| shard.refusals.iter())
-        .any(|refusal| refusal.kind == "fleet.bind" && refusal.count >= 1);
-    }
-    std::thread::yield_now();
-  }
+  let counted = poll_until(Duration::from_secs(5), || {
+    matches!(
+      client.call(&RequestBody::DaemonStatus),
+      ReplyBody::DaemonStatus { report }
+        if report
+          .shards
+          .iter()
+          .flat_map(|shard| shard.refusals.iter())
+          .any(|refusal| refusal.kind == "fleet.bind" && refusal.count >= 1)
+    )
+  });
   daemon_a.stop();
   assert!(
     counted,
