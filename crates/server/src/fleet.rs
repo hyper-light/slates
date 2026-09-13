@@ -71,6 +71,7 @@
 //! there is no fleet transport and this loop does not run; the placement path still runs the same
 //! `FleetNode`, degenerate (R8).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{TryRecvError, channel};
 
 use rustls::pki_types::CertificateDer;
@@ -283,7 +284,7 @@ fn consensus_budget() -> CommitBudget {
 /// receive and accept loops; for each peer it dials the peer's advertised addresses and spawns the probe and
 /// record-link tasks; then the one record-plane coordinator. A two-node fleet is the single-peer degenerate.
 /// Detached tasks: they live as long as the shard and are cancelled by the runtime's shutdown.
-pub async fn run_membership(transport: FleetTransport) {
+pub async fn run_membership(transport: FleetTransport, progress: &'static AtomicU64) {
   let FleetTransport {
     identity,
     name,
@@ -395,7 +396,7 @@ pub async fn run_membership(transport: FleetTransport) {
   // One record-plane coordinator for all peers (§4.8 "records are sent to all candidates"): it borrows every
   // holder session the link tasks keep up, so it ships each head to all candidates in one commit and drives
   // each takeover over all surviving holders (the `f > 1` promotion a per-peer ship task could not reach).
-  if let Ok(task) = futures::spawn(run_record_plane(local, budget)) {
+  if let Ok(task) = futures::spawn(run_record_plane(local, budget, progress)) {
     let _ = futures::detach(task);
   }
 }
@@ -2458,7 +2459,12 @@ fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
 /// period, so it writes under the current generation after a membership change. The connection-ID demux that
 /// would carry all sessions over one socket is owed and would leave this coordinator unchanged — only the
 /// socket count beneath the link tasks falls from O(N) to one.
-async fn run_record_plane(local: HostId, budget: CommitBudget) {
+/// `progress` is this daemon's forward-progress heartbeat (§4.14): the coordinator bumps it once per period,
+/// so an out-of-band observer ([`crate::daemon::Daemon::fleet_progress`], read directly off the atomic — no
+/// shard round-trip) can tell a coordinator that is merely **slow under CPU load** (still cycling, fewer
+/// periods per wall-second) from one that has **stalled** (no bump). A test's `poll_until` charges its budget
+/// against these periods, not wall-clock, so a correct-but-starved operation is never falsely failed.
+async fn run_record_plane(local: HostId, budget: CommitBudget, progress: &'static AtomicU64) {
   let Some(authority) = owner_authority(local) else {
     return;
   };
@@ -2481,6 +2487,9 @@ async fn run_record_plane(local: HostId, budget: CommitBudget) {
   let mut root_seen_contact: u64 = 0;
   let mut root_attempt: u32 = 0;
   loop {
+    // Forward-progress heartbeat: one bump per coordinator period. An observer reads it to tell a fleet that
+    // is slow under CPU load (still cycling) from one that has stalled (no bump) — see `progress`.
+    progress.fetch_add(1, Ordering::Relaxed);
     in_flight.retain_mut(|dispatch| !dispatch.settle());
     // Drive the configuration authority first — an election or a replication heartbeat over the transport —
     // then the records under the configuration it maintains.

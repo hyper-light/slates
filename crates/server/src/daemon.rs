@@ -40,6 +40,13 @@ pub const HEARTBEAT_NS: u64 = 100_000_000;
 /// Shape: the anchor's liveness budget for `daemon.alive` (a second; the supervisor's
 /// input until the CLI takes the operator's value).
 pub const LIVENESS_BUDGET_NS: u64 = 1_000_000_000;
+/// How long an out-of-band observation ([`Daemon::observe`]) waits for the control shard to service its
+/// one-shot query before giving up. A live shard answers within a few coordinator periods (~[`HEARTBEAT_NS`]
+/// each), but under heavy CPU load a period stretches toward a liveness budget; ample headroom for a
+/// merely-slow shard to answer means an observation is not lost to a false timeout and misread as a real
+/// change (a peer "left", a leader "lost"), while a genuinely wedged shard still yields `None`.
+/// Derived: ten liveness budgets ([`LIVENESS_BUDGET_NS`]).
+pub const OBSERVE_BUDGET_NS: u64 = 10 * LIVENESS_BUDGET_NS;
 
 /// Where the segment comes from.
 #[derive(Clone, Debug)]
@@ -73,6 +80,12 @@ pub struct Daemon {
   /// The loopback port the NFS transport (§4.6) listens on, when it is serving; `None` if the
   /// listener could not be bound. A client mounts `nfs://localhost:PORT`.
   nfs_port: Option<u16>,
+  /// This daemon's forward-progress heartbeat (§4.14): the fleet coordinator bumps it once per period. Read
+  /// directly ([`Self::fleet_progress`], no shard round-trip) so an observer can tell a coordinator that is
+  /// slow under CPU load (still cycling, fewer periods per wall-second) from one that has stalled (no bump).
+  /// Stays zero for a laptop (no fleet loop runs). Leaked to `&'static` at boot — one per daemon, shared with
+  /// the coordinator task — so both the handle here and the task hold the one atomic without `Arc` (D-8).
+  fleet_progress: &'static std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -259,9 +272,15 @@ impl Daemon {
     // probing its peers, serving their probes, and folding the converged view into the `FleetNode` the
     // verbs read for placement. A laptop passes no transport and runs no loop (R8: the same placement path,
     // degenerate). The loop's perpetual tasks are detached and cancelled by `runtime.shutdown()`.
+    // The fleet coordinator's forward-progress heartbeat (§4.14), shared with this handle so a test or an
+    // operator can read it directly under CPU load (no shard round-trip). Leaked once per boot like the
+    // identity — the daemon is process-lifetime — so the handle and the coordinator task hold the one atomic
+    // without an `Arc` (D-8). A laptop spawns no coordinator, so it stays zero.
+    let fleet_progress: &'static std::sync::atomic::AtomicU64 =
+      Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
     if let Some(transport) = fleet_transport {
       runtime.spawn_on(control, async move {
-        crate::fleet::run_membership(transport).await;
+        crate::fleet::run_membership(transport, fleet_progress).await;
       })?;
     }
     // The NFS transport (§4.6): one loopback listener served on the control shard. A supervising
@@ -297,6 +316,7 @@ impl Daemon {
       config,
       shards,
       nfs_port,
+      fleet_progress,
     })
   }
 
@@ -311,27 +331,58 @@ impl Daemon {
     &self.config
   }
 
-  /// The hosts this daemon's fleet currently sees alive (§4.8) — this node and the peers its control-shard
-  /// membership loop has probed and found live — for a test or an operator to observe the membership the
-  /// verbs read for placement. It runs a one-shot query on the control shard and returns its answer; empty
-  /// if the daemon is stopping, is not on a shard, or the shard does not answer within the liveness budget
-  /// (the bound the daemon's own heartbeat already lives under). A laptop (no fleet) reports itself alone.
-  pub fn fleet_members(&self) -> Vec<slates_db::HostId> {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
-    else {
-      return Vec::new();
-    };
+  /// Runs `query` on this daemon's shard at `target` and returns its answer, or `None` when the daemon could
+  /// not observe it — it is stopping, has no such shard, or the shard stayed unresponsive for the whole
+  /// [`OBSERVE_BUDGET_NS`]. That budget is **generous on purpose**: under noisy, heavy CPU load a live shard
+  /// can be starved of the scheduler for several seconds before it services this one-shot query, and a tight
+  /// budget would return `None` — which the observation accessors map to their default (empty/false), a
+  /// **false negative** a caller reads as a real change (a peer "left", a leader "lost"). Waiting generously
+  /// makes an accessor report the shard's true state whenever it is merely slow, and give up only when it is
+  /// genuinely wedged. The test thread parks on the channel (it does not spin), so it does not itself steal
+  /// CPU from the shard it is waiting on. `query` returns `Option<T>`; its own `None` (shard state gone) folds
+  /// into the same "could not observe."
+  fn observe<T: Send + 'static>(
+    &self,
+    target: Option<ShardId>,
+    query: impl FnOnce() -> Option<T> + Send + 'static,
+  ) -> Option<T> {
+    let runtime = self.runtime.as_ref()?;
+    let target = target?;
     let (tx, rx) = std::sync::mpsc::channel();
     if runtime
-      .spawn_on(control, async move {
-        let alive = state::with_state(|s| s.fleet.membership().alive()).unwrap_or_default();
-        let _ = tx.send(alive);
+      .spawn_on(target, async move {
+        let _ = tx.send(query());
       })
       .is_err()
     {
-      return Vec::new();
+      return None;
     }
-    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
+    rx.recv_timeout(std::time::Duration::from_nanos(OBSERVE_BUDGET_NS))
+      .ok()
+      .flatten()
+  }
+
+  /// This daemon's fleet coordinator **forward-progress** count — periods the control-shard fleet loop has
+  /// executed (§4.14). Read **directly** off the shared atomic, with no shard round-trip, so it is reported
+  /// even when that shard is too CPU-starved to answer a query. A test charges its `poll_until` budget against
+  /// this (periods, not wall-clock): a correct-but-slow operation — the coordinator still cycling, just fewer
+  /// periods per wall-second under load — is never failed, while a genuinely stalled fleet (this count frozen)
+  /// still is. Zero for a laptop (no coordinator runs).
+  pub fn fleet_progress(&self) -> u64 {
+    self
+      .fleet_progress
+      .load(std::sync::atomic::Ordering::Relaxed)
+  }
+
+  /// The hosts this daemon's fleet currently sees alive (§4.8) — this node and the peers its control-shard
+  /// membership loop has probed and found live — for a test or an operator to observe the membership the
+  /// verbs read for placement. `None` if the daemon could not observe it in time ([`Self::observe`]); a
+  /// laptop (no fleet) reports itself alone.
+  pub fn fleet_members(&self) -> Vec<slates_db::HostId> {
+    self
+      .observe(self.shards.first().copied(), || {
+        state::with_state(|s| s.fleet.membership().alive())
+      })
       .unwrap_or_default()
   }
 
@@ -345,14 +396,9 @@ impl Daemon {
   /// is trivially meshed. Runs a one-shot query on the control shard, bounded by the liveness budget;
   /// `false` if the daemon is stopping, is not on a shard, or the shard does not answer in time.
   pub fn fleet_meshed(&self) -> bool {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
-    else {
-      return false;
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(control, async move {
-        let meshed = state::with_state(|s| {
+    self
+      .observe(self.shards.first().copied(), || {
+        state::with_state(|s| {
           // The peers to reach are the neighbourhood less this node; the mesh is up when every one has a
           // formed probe session. A laptop has an empty peer set and is meshed at once.
           let host = s.fleet.host();
@@ -363,14 +409,7 @@ impl Daemon {
             .filter(|&&peer| peer != host)
             .all(|peer| s.formed_probe_peers.contains(peer))
         })
-        .unwrap_or(false);
-        let _ = tx.send(meshed);
       })
-      .is_err()
-    {
-      return false;
-    }
-    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
       .unwrap_or(false)
   }
 
@@ -380,21 +419,10 @@ impl Daemon {
   /// answer in time. Exposed so a fleet test can prove the council elected a single stable leader over the
   /// real transport.
   pub fn council_leads(&self) -> bool {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
-    else {
-      return false;
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(control, async move {
-        let leads = state::with_state(|s| s.council.is_leader()).unwrap_or(false);
-        let _ = tx.send(leads);
+    self
+      .observe(self.shards.first().copied(), || {
+        state::with_state(|s| s.council.is_leader())
       })
-      .is_err()
-    {
-      return false;
-    }
-    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
       .unwrap_or(false)
   }
 
@@ -404,21 +432,10 @@ impl Daemon {
   /// A one-shot control-shard query, bounded by the liveness budget; `0` if the daemon is stopping, is not
   /// on a shard, or does not answer in time.
   pub fn council_contact(&self) -> u64 {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
-    else {
-      return 0;
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(control, async move {
-        let contact = state::with_state(|s| s.council.leader_contact()).unwrap_or(0);
-        let _ = tx.send(contact);
+    self
+      .observe(self.shards.first().copied(), || {
+        state::with_state(|s| s.council.leader_contact())
       })
-      .is_err()
-    {
-      return 0;
-    }
-    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
       .unwrap_or(0)
   }
 
@@ -428,22 +445,10 @@ impl Daemon {
   /// shard, or does not answer in time. Exposed so a fleet test can observe a membership change (a
   /// retirement or admission) commit across the council over the transport.
   pub fn council_members(&self) -> Vec<slates_db::HostId> {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
-    else {
-      return Vec::new();
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(control, async move {
-        let members =
-          state::with_state(|s| s.council.configuration().members.clone()).unwrap_or_default();
-        let _ = tx.send(members);
+    self
+      .observe(self.shards.first().copied(), || {
+        state::with_state(|s| s.council.configuration().members.clone())
       })
-      .is_err()
-    {
-      return Vec::new();
-    }
-    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
       .unwrap_or_default()
   }
 
@@ -452,21 +457,10 @@ impl Daemon {
   /// shard, or does not answer in time. Exposed so a fleet test can prove the root group elected a leader
   /// over the transport.
   pub fn root_leads(&self) -> bool {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
-    else {
-      return false;
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(control, async move {
-        let leads = state::with_state(|s| s.root.is_leader()).unwrap_or(false);
-        let _ = tx.send(leads);
+    self
+      .observe(self.shards.first().copied(), || {
+        state::with_state(|s| s.root.is_leader())
       })
-      .is_err()
-    {
-      return false;
-    }
-    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
       .unwrap_or(false)
   }
 
@@ -476,22 +470,10 @@ impl Daemon {
   /// observe a region change (a promotion or a lost region's retirement) commit across the root group over the
   /// transport.
   pub fn root_regions(&self) -> Vec<slates_db::register::RegionId> {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
-    else {
-      return Vec::new();
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(control, async move {
-        let regions =
-          state::with_state(|s| s.root.configuration().regions.clone()).unwrap_or_default();
-        let _ = tx.send(regions);
+    self
+      .observe(self.shards.first().copied(), || {
+        state::with_state(|s| s.root.configuration().regions.clone())
       })
-      .is_err()
-    {
-      return Vec::new();
-    }
-    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
       .unwrap_or_default()
   }
 
@@ -539,22 +521,10 @@ impl Daemon {
     volume: slates_db::register::ObjectId,
     creator_region: slates_db::register::RegionId,
   ) -> slates_db::register::RegionId {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
-    else {
-      return creator_region;
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(control, async move {
-        let home = state::with_state(|s| s.root.configuration().home_of(volume, creator_region))
-          .unwrap_or(creator_region);
-        let _ = tx.send(home);
+    self
+      .observe(self.shards.first().copied(), move || {
+        state::with_state(|s| s.root.configuration().home_of(volume, creator_region))
       })
-      .is_err()
-    {
-      return creator_region;
-    }
-    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
       .unwrap_or(creator_region)
   }
 
@@ -569,22 +539,10 @@ impl Daemon {
     volume: slates_db::register::ObjectId,
     creator_region: slates_db::register::RegionId,
   ) -> slates_db::register::RegionId {
-    let (Some(runtime), Some(&target)) = (self.runtime.as_ref(), self.shards.get(shard_index))
-    else {
-      return creator_region;
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(target, async move {
-        let home = state::with_state(|s| s.root.configuration().home_of(volume, creator_region))
-          .unwrap_or(creator_region);
-        let _ = tx.send(home);
+    self
+      .observe(self.shards.get(shard_index).copied(), move || {
+        state::with_state(|s| s.root.configuration().home_of(volume, creator_region))
       })
-      .is_err()
-    {
-      return creator_region;
-    }
-    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
       .unwrap_or(creator_region)
   }
 
@@ -596,22 +554,10 @@ impl Daemon {
   /// placement. A one-shot control-shard query, bounded by the liveness budget; empty if the daemon is
   /// stopping, is not on a shard, or does not answer in time.
   pub fn placement_neighbourhood(&self) -> Vec<slates_db::HostId> {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
-    else {
-      return Vec::new();
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(control, async move {
-        let neighbourhood =
-          state::with_state(|s| s.fleet.configuration().neighbourhood.clone()).unwrap_or_default();
-        let _ = tx.send(neighbourhood);
+    self
+      .observe(self.shards.first().copied(), || {
+        state::with_state(|s| s.fleet.configuration().neighbourhood.clone())
       })
-      .is_err()
-    {
-      return Vec::new();
-    }
-    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
       .unwrap_or_default()
   }
 
@@ -621,22 +567,10 @@ impl Daemon {
   /// lets a fleet test prove a council-committed change reaches every shard (`sync_config_from_council`'s
   /// fan-out). Empty if there is no such shard or it does not answer in time.
   pub fn placement_neighbourhood_on_shard(&self, shard_index: usize) -> Vec<slates_db::HostId> {
-    let (Some(runtime), Some(&target)) = (self.runtime.as_ref(), self.shards.get(shard_index))
-    else {
-      return Vec::new();
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(target, async move {
-        let neighbourhood =
-          state::with_state(|s| s.fleet.configuration().neighbourhood.clone()).unwrap_or_default();
-        let _ = tx.send(neighbourhood);
+    self
+      .observe(self.shards.get(shard_index).copied(), || {
+        state::with_state(|s| s.fleet.configuration().neighbourhood.clone())
       })
-      .is_err()
-    {
-      return Vec::new();
-    }
-    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
       .unwrap_or_default()
   }
 
@@ -728,27 +662,15 @@ impl Daemon {
   /// not yet placed, the daemon is stopping, or it is a laptop (no fleet loop runs). Runs a one-shot query
   /// on the control shard, bounded by the liveness budget.
   pub fn fleet_head_placed(&self, object: slates_db::register::ObjectId) -> bool {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shard_of_object(object))
-    else {
-      return false;
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(control, async move {
-        let placed = state::with_state(|s| {
+    self
+      .observe(self.shard_of_object(object), move || {
+        state::with_state(|s| {
           let quorum = s.fleet.configuration().quorum;
           s.placed_heads
             .get(&object)
             .is_some_and(|head| head.placement.placed(quorum))
         })
-        .unwrap_or(false);
-        let _ = tx.send(placed);
       })
-      .is_err()
-    {
-      return false;
-    }
-    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
       .unwrap_or(false)
   }
 
@@ -759,21 +681,10 @@ impl Daemon {
   /// owner's content put reaches it and verifies. Runs a one-shot query on the control shard, bounded by
   /// the liveness budget; `false` if the daemon is stopping or the shard does not answer in time.
   pub fn fleet_holder_content(&self, manifest: [u8; 32]) -> bool {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
-    else {
-      return false;
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(control, async move {
-        let held = state::with_state(|s| s.held_content.holds_manifest(&manifest)).unwrap_or(false);
-        let _ = tx.send(held);
+    self
+      .observe(self.shards.first().copied(), move || {
+        state::with_state(|s| s.held_content.holds_manifest(&manifest))
       })
-      .is_err()
-    {
-      return false;
-    }
-    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
       .unwrap_or(false)
   }
 

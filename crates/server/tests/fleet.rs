@@ -91,6 +91,27 @@ const COUNCIL_HEARTBEAT_WINDOW: Duration = Duration::from_secs(5);
 /// SWIM death detection (the retirement deadline) plus a few heartbeat periods for the leader to propose the
 /// retire and replicate it to a committing majority. Wider than [`RETIREMENT_DEADLINE`] for that commit tail.
 const COUNCIL_RETIRE_DEADLINE: Duration = Duration::from_secs(60);
+/// Shape: the budget of fleet-coordinator **periods** [`poll_until`] gives the slowest observed daemon to
+/// satisfy its condition before the operation is judged genuinely non-convergent. The wait is charged in the
+/// daemon's own periods ([`slates_server::Daemon::fleet_progress`]), not wall-clock — that is what makes it
+/// robust to noisy, heavy CPU load: fleet convergence is **period-driven** (a bounded number of probe/commit
+/// rounds), so it completes in about the same number of periods however slowly those periods run under load,
+/// whereas a fixed wall-clock deadline breaks the moment load stretches those periods out. This is many times
+/// the periods any fleet operation needs — formation, election, retirement and takeover each converge in tens
+/// of periods — so a correct operation never reaches it however starved, and only a genuine non-convergence
+/// does. Gating on the **minimum** progress across the observed daemons (not a sum) is what keeps a single
+/// starved daemon holding the wait open rather than being masked by peers that keep ticking. Sized well past
+/// the periods any operation needs even with leadership flap under heavy load — measured: the operations that
+/// converge do so in far fewer, and only a genuine non-convergence reaches this.
+const PERIOD_BUDGET: u64 = 4000;
+/// Shape: the wall-clock window of **zero** fleet-coordinator progress after which [`poll_until`] calls the
+/// fleet stalled (frozen or dead) rather than merely slow. This is the sole wall-clock bound in the wait and
+/// it fires only when the min observed `fleet_progress` does not advance at all for this long — i.e. every
+/// observed coordinator got no CPU for the whole window. It is generous on purpose: under heavy CPU load a
+/// live coordinator can be starved of the scheduler for tens of seconds while still being perfectly alive, so
+/// a tight window (the per-operation deadline) false-declares it dead; only a truly wedged or dead coordinator
+/// makes no progress at all for this many minutes.
+const FROZEN_CAP: Duration = Duration::from_secs(300);
 
 /// Each fleet test starts several daemons — every daemon is a shard thread plus its doorbell thread — so
 /// running the tests concurrently oversubscribes the machine and stretches the probe and commit timing
@@ -299,7 +320,7 @@ fn a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it() {
 
   // A's membership loop detects the timeouts, ages the suspicion to death, and retires B: a transition only
   // the loop can make over the transport.
-  let retired = poll_until(RETIREMENT_DEADLINE, || {
+  let retired = poll_until(&[&daemon_a], RETIREMENT_DEADLINE, || {
     !daemon_a.fleet_members().contains(&host_b)
   });
 
@@ -315,23 +336,66 @@ fn a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it() {
 /// incarnation always overrides). Chosen high on purpose; the exact value is immaterial past that.
 const FALSE_DEATH_INCARNATION: u64 = 1_000;
 
-/// Polls `condition` (yielding between checks — the test thread is not a runtime task) until it holds or
-/// `within` elapses; returns whether it held. `within` is a **generous** wall-clock deadline (the operation
-/// deadlines below are ~150–200× a fleet operation's unloaded cost), so a correct operation is not flaked by a
-/// transient CPU-load spike or sustained shared-tenant load that runs it slower than idle — Ada's #31 cause (b)
-/// ("correct-but-slower-under-load operations vs the suite's fixed 10–25 s deadlines"). Headroom is the tool a
-/// *transient* spike needs: it can strike after a test's formation, so no formation- or poll-responsiveness-
-/// measured factor catches it — both were measured and rejected (see
-/// `docs/bugs/2026-09-12-retirement-tests-gate-on-real-swim-detection-under-load.md`).
-fn poll_until(within: Duration, mut condition: impl FnMut() -> bool) -> bool {
-  let deadline = Instant::now() + within;
-  while Instant::now() < deadline {
+/// Polls `condition` (yielding between checks — the test thread is not a runtime task) until it holds, then
+/// returns `true`. **Robust to noisy and heavy CPU load:** the wait is charged against the fleet's own forward
+/// progress — the fleet-coordinator **periods** each of `daemons` has executed ([`Daemon::fleet_progress`],
+/// read directly off a lock-free atomic, so it is reported even when a shard is too CPU-starved to answer a
+/// query) — and **not** raw wall-clock. It returns `false` only when the operation has genuinely failed to
+/// converge: either the **slowest** observed daemon executed a whole [`PERIOD_BUDGET`] of its own periods with
+/// the condition never holding (a real non-convergence, judged in the daemon's own time), or no observed
+/// daemon made **any** forward progress for the `within` window (every observed coordinator frozen or dead —
+/// the only wall-clock bound, and it never fires while the fleet is still progressing).
+///
+/// This is why it does not flake under load where a fixed wall-clock deadline did. Fleet convergence is
+/// period-driven, so under a CPU-load spike or sustained shared-tenant load the daemons run *fewer periods per
+/// wall-second* but still converge in about the same number of periods; charging the budget in periods lets
+/// the wait stretch in exact proportion to the slowdown, however large, and only a fleet that stops making
+/// progress fails. Gating on the **minimum** progress across `daemons` (not a sum) is what keeps one starved
+/// daemon holding the wait open rather than being masked by peers that keep ticking — the flaw a process-wide
+/// tick count has. The two schemes that measured a *proxy* for load — the poll thread's own responsiveness,
+/// and a load factor sampled once at formation — were measured-and-rejected (see
+/// `docs/bugs/2026-09-12-retirement-tests-gate-on-real-swim-detection-under-load.md`); charging the daemons'
+/// own continuous progress is what neither did. Pass every daemon whose state the condition reads; a laptop
+/// (no coordinator, progress stuck at zero) makes the wait fall through to the `within` frozen-window bound.
+fn poll_until(daemons: &[&Daemon], within: Duration, mut condition: impl FnMut() -> bool) -> bool {
+  let start = min_progress(daemons);
+  let mut last = start;
+  let mut last_advance = Instant::now();
+  loop {
     if condition() {
       return true;
     }
+    let now = min_progress(daemons);
+    if now != last {
+      // The slowest observed daemon advanced — the fleet is alive (however slow under load); reset the
+      // frozen-window timer and keep waiting until it has had a full period budget to converge.
+      last = now;
+      last_advance = Instant::now();
+    }
+    if now.saturating_sub(start) >= PERIOD_BUDGET {
+      // The slowest observed daemon ran a whole budget of its own periods, condition never met: a genuine
+      // non-convergence (judged in daemon-time, so CPU load cannot cause it — periods, not wall-clock).
+      return false;
+    }
+    if last_advance.elapsed() >= within.max(FROZEN_CAP) {
+      // No observed daemon made ANY forward progress for the frozen cap: every observed coordinator is frozen
+      // or dead (a wedge), not merely slow. The only wall-clock bound; generous ([`FROZEN_CAP`]) so a
+      // coordinator merely starved of the scheduler for tens of seconds under heavy load is not called dead.
+      return false;
+    }
     std::thread::yield_now();
   }
-  false
+}
+
+/// The **minimum** fleet-coordinator progress ([`Daemon::fleet_progress`]) across `daemons` — the slowest
+/// one's period count, the figure [`poll_until`] gates on so a single starved daemon is never masked by peers
+/// that keep ticking. Zero when `daemons` is empty or none has a running coordinator.
+fn min_progress(daemons: &[&Daemon]) -> u64 {
+  daemons
+    .iter()
+    .map(|d| d.fleet_progress())
+    .min()
+    .unwrap_or(0)
 }
 
 /// Polls that `condition` stays true for the whole `window`; returns whether it never broke — the stability
@@ -395,12 +459,12 @@ fn a_falsely_retired_peer_rejoins_by_refutation() {
   // A falsely retires B — a false positive; B is alive and still probing A. This is the same fold A's
   // detector performs when it ages a peer to death.
   daemon_a.observe_peer_dead(host_b, FALSE_DEATH_INCARNATION);
-  let retired = poll_until(RETIREMENT_DEADLINE, || {
+  let retired = poll_until(&[&daemon_a, &daemon_b], RETIREMENT_DEADLINE, || {
     !daemon_a.fleet_members().contains(&host_b)
   });
 
   // B, alive and still probing A, learns of its death from A's echo, refutes, and A re-admits it.
-  let rejoined = poll_until(REJOIN_DEADLINE, || {
+  let rejoined = poll_until(&[&daemon_a, &daemon_b], REJOIN_DEADLINE, || {
     daemon_a.fleet_members().contains(&host_b)
   });
 
@@ -472,10 +536,10 @@ fn a_restarted_peer_rejoins_under_a_new_member_id_and_the_old_is_retired() {
   daemon_b.stop();
   daemon_a.observe_peer_restart(b_old, b_new, FALSE_DEATH_INCARNATION);
 
-  let admitted_new = poll_until(REJOIN_DEADLINE, || {
+  let admitted_new = poll_until(&[&daemon_a], REJOIN_DEADLINE, || {
     daemon_a.fleet_members().contains(&b_new)
   });
-  let retired_old = poll_until(RETIREMENT_DEADLINE, || {
+  let retired_old = poll_until(&[&daemon_a], RETIREMENT_DEADLINE, || {
     !daemon_a.fleet_members().contains(&b_old)
   });
 
@@ -699,12 +763,13 @@ fn three_daemons_form_a_full_mesh() {
   let serve = mesh_serve_ports(n);
   let daemons = start_mesh(nodes, &hosts, &certs, &serve);
 
-  // Poll until every node's full direct mesh has formed (all six probe sessions established), bounded by
-  // the formation deadline.
-  let deadline = Instant::now() + FORMATION_DEADLINE;
-  while Instant::now() < deadline && !daemons.iter().all(Daemon::fleet_meshed) {
-    std::thread::yield_now();
-  }
+  // Poll until every node's full direct mesh has formed (all six probe sessions established). Robust to CPU
+  // load: `poll_until` charges the fleet's own forward progress, not wall-clock (see its docs).
+  poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    FORMATION_DEADLINE,
+    || daemons.iter().all(Daemon::fleet_meshed),
+  );
   let meshed: Vec<(&str, bool)> = names
     .iter()
     .copied()
@@ -751,20 +816,21 @@ fn three_daemons_elect_one_stable_council_leader_over_the_transport() {
   // The council elects only over live record sessions, so wait for the direct mesh first (the record links
   // come up alongside the probe mesh), then for exactly one leader to emerge over the transport.
   assert_fleet_forms(&daemons, &hosts, &names);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
   let one_leader = || daemons.iter().filter(|d| d.council_leads()).count() == 1;
-  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, one_leader);
+  let elected = poll_until(&observed, COUNCIL_ELECTION_DEADLINE, one_leader);
   // The council settles on a single leader: within the deadline there is a window it holds unbroken. A
   // legitimate re-election under a starved heartbeat is tolerated (pre-vote cannot forbid one when a leader
   // is genuinely unreachable), so the settle is retried until the council quiesces.
   let settled = elected
-    && poll_until(COUNCIL_SETTLE_DEADLINE, || {
+    && poll_until(&observed, COUNCIL_SETTLE_DEADLINE, || {
       holds_for(COUNCIL_STABILITY_WINDOW, one_leader)
     });
   // The leader's heartbeats must reach the followers over the transport: a follower's leader-contact climbs
   // past the baseline just captured (a non-vacuity counter — replication is live, not just an election).
   let baseline: Vec<u64> = daemons.iter().map(Daemon::council_contact).collect();
   let heartbeats_flow = settled
-    && poll_until(COUNCIL_HEARTBEAT_WINDOW, || {
+    && poll_until(&observed, COUNCIL_HEARTBEAT_WINDOW, || {
       daemons
         .iter()
         .zip(baseline.iter())
@@ -817,13 +883,17 @@ fn a_council_commits_a_membership_retirement_over_the_transport() {
 
   assert_fleet_forms(&daemons, &hosts, &names);
   // Wait for the council to elect one leader, then kill a *follower* so the leader stays and reconciles.
-  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, || {
-    daemons
-      .iter()
-      .filter(|daemon| daemon.council_leads())
-      .count()
-      == 1
-  });
+  let elected = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_ELECTION_DEADLINE,
+    || {
+      daemons
+        .iter()
+        .filter(|daemon| daemon.council_leads())
+        .count()
+        == 1
+    },
+  );
   let leader_idx = daemons.iter().position(|daemon| daemon.council_leads());
   let victim_idx = leader_idx.and_then(|lead| (0..daemons.len()).find(|&i| i != lead));
 
@@ -843,12 +913,16 @@ fn a_council_commits_a_membership_retirement_over_the_transport() {
       for daemon in &daemons {
         daemon.observe_peer_dead(dead, FALSE_DEATH_INCARNATION);
       }
-      poll_until(COUNCIL_RETIRE_DEADLINE, || {
-        daemons.iter().all(|daemon| {
-          !daemon.council_members().contains(&dead)
-            && !daemon.placement_neighbourhood().contains(&dead)
-        })
-      })
+      poll_until(
+        &daemons.iter().collect::<Vec<_>>(),
+        COUNCIL_RETIRE_DEADLINE,
+        || {
+          daemons.iter().all(|daemon| {
+            !daemon.council_members().contains(&dead)
+              && !daemon.placement_neighbourhood().contains(&dead)
+          })
+        },
+      )
     }
     _ => false,
   };
@@ -891,13 +965,17 @@ fn a_committed_retirement_reaches_every_shards_placement_view() {
   let mut daemons = start_mesh_with(nodes, &hosts, &certs, &serve, 1, 2, &regions, &mirrors);
 
   assert_fleet_forms(&daemons, &hosts, &names);
-  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, || {
-    daemons
-      .iter()
-      .filter(|daemon| daemon.council_leads())
-      .count()
-      == 1
-  });
+  let elected = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_ELECTION_DEADLINE,
+    || {
+      daemons
+        .iter()
+        .filter(|daemon| daemon.council_leads())
+        .count()
+        == 1
+    },
+  );
   let leader_idx = daemons.iter().position(|daemon| daemon.council_leads());
   let victim_idx = leader_idx.and_then(|lead| (0..daemons.len()).find(|&i| i != lead));
 
@@ -910,18 +988,26 @@ fn a_committed_retirement_reaches_every_shards_placement_view() {
       }
       // The leader reconciles the injected death, commits the retirement, and every survivor's control shard
       // drops the dead member from the neighbourhood it places under...
-      let on_control = poll_until(COUNCIL_RETIRE_DEADLINE, || {
-        daemons
-          .iter()
-          .all(|daemon| !daemon.placement_neighbourhood().contains(&dead))
-      });
-      // ...and so does the non-control shard — the fan-out under test.
-      let on_non_control = on_control
-        && poll_until(COUNCIL_RETIRE_DEADLINE, || {
+      let on_control = poll_until(
+        &daemons.iter().collect::<Vec<_>>(),
+        COUNCIL_RETIRE_DEADLINE,
+        || {
           daemons
             .iter()
-            .all(|daemon| !daemon.placement_neighbourhood_on_shard(1).contains(&dead))
-        });
+            .all(|daemon| !daemon.placement_neighbourhood().contains(&dead))
+        },
+      );
+      // ...and so does the non-control shard — the fan-out under test.
+      let on_non_control = on_control
+        && poll_until(
+          &daemons.iter().collect::<Vec<_>>(),
+          COUNCIL_RETIRE_DEADLINE,
+          || {
+            daemons
+              .iter()
+              .all(|daemon| !daemon.placement_neighbourhood_on_shard(1).contains(&dead))
+          },
+        );
       (on_control, on_non_control)
     }
     _ => (false, false),
@@ -986,9 +1072,11 @@ fn the_root_group_commits_a_region_retirement_over_the_transport() {
 
   assert_fleet_forms(&daemons, &hosts, &names);
   // Wait for the root group to elect one leader, then kill a *follower* so the leader stays and reconciles.
-  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, || {
-    daemons.iter().filter(|daemon| daemon.root_leads()).count() == 1
-  });
+  let elected = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_ELECTION_DEADLINE,
+    || daemons.iter().filter(|daemon| daemon.root_leads()).count() == 1,
+  );
   let leader_idx = daemons.iter().position(|daemon| daemon.root_leads());
   let victim_idx = leader_idx.and_then(|lead| (0..daemons.len()).find(|&i| i != lead));
 
@@ -1005,11 +1093,15 @@ fn the_root_group_commits_a_region_retirement_over_the_transport() {
       for daemon in &daemons {
         daemon.observe_peer_dead(victim_host, FALSE_DEATH_INCARNATION);
       }
-      poll_until(COUNCIL_RETIRE_DEADLINE, || {
-        daemons
-          .iter()
-          .all(|daemon| !daemon.root_regions().contains(&lost))
-      })
+      poll_until(
+        &daemons.iter().collect::<Vec<_>>(),
+        COUNCIL_RETIRE_DEADLINE,
+        || {
+          daemons
+            .iter()
+            .all(|daemon| !daemon.root_regions().contains(&lost))
+        },
+      )
     }
     _ => false,
   };
@@ -1075,13 +1167,17 @@ fn a_root_learner_fetches_the_committed_region_membership_over_the_transport() {
 
   let mut survivors: Vec<(HostId, Daemon)> = hosts.iter().copied().zip(daemons).collect();
   // Elect one root leader among the three representatives.
-  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, || {
-    survivors
-      .iter()
-      .filter(|(_, daemon)| daemon.root_leads())
-      .count()
-      == 1
-  });
+  let elected = poll_until(
+    &survivors.iter().map(|(_, d)| d).collect::<Vec<_>>(),
+    COUNCIL_ELECTION_DEADLINE,
+    || {
+      survivors
+        .iter()
+        .filter(|(_, daemon)| daemon.root_leads())
+        .count()
+        == 1
+    },
+  );
   let leader_host = survivors
     .iter()
     .find(|(_, daemon)| daemon.root_leads())
@@ -1113,9 +1209,11 @@ fn a_root_learner_fetches_the_committed_region_membership_over_the_transport() {
         .expect("the learner survives");
       // The surviving root leader detects the death, commits the lost region's retirement over the transport;
       // the learner (a non-voter) drops it from its committed root membership only by fetching from a voter.
-      poll_until(COUNCIL_RETIRE_DEADLINE, || {
-        !survivors[learner_pos].1.root_regions().contains(&lost)
-      })
+      poll_until(
+        &survivors.iter().map(|(_, d)| d).collect::<Vec<_>>(),
+        COUNCIL_RETIRE_DEADLINE,
+        || !survivors[learner_pos].1.root_regions().contains(&lost),
+      )
     }
     _ => false,
   };
@@ -1180,13 +1278,17 @@ fn an_operator_promotes_a_lost_regions_mirror_over_the_transport() {
 
   assert_fleet_forms(&daemons, &hosts, &names);
   let mut survivors: Vec<(HostId, Daemon)> = hosts.iter().copied().zip(daemons).collect();
-  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, || {
-    survivors
-      .iter()
-      .filter(|(_, daemon)| daemon.root_leads())
-      .count()
-      == 1
-  });
+  let elected = poll_until(
+    &survivors.iter().map(|(_, d)| d).collect::<Vec<_>>(),
+    COUNCIL_ELECTION_DEADLINE,
+    || {
+      survivors
+        .iter()
+        .filter(|(_, daemon)| daemon.root_leads())
+        .count()
+        == 1
+    },
+  );
   let leader_host = survivors
     .iter()
     .find(|(_, daemon)| daemon.root_leads())
@@ -1220,14 +1322,18 @@ fn an_operator_promotes_a_lost_regions_mirror_over_the_transport() {
       // iteration until it commits and re-homes everywhere: root leadership can flap under load between
       // finding the leader and the commit landing, and `PromoteRegion` is idempotent (home_of follows the
       // committed promotion; a second identical promotion is a no-op once applied).
-      let promoted = poll_until(COUNCIL_RETIRE_DEADLINE, || {
-        if let Some((_, leader)) = survivors.iter().find(|(_, daemon)| daemon.root_leads()) {
-          leader.promote_region(lost);
-        }
-        survivors
-          .iter()
-          .all(|(_, daemon)| daemon.region_home(volume, lost) == mirror)
-      });
+      let promoted = poll_until(
+        &survivors.iter().map(|(_, d)| d).collect::<Vec<_>>(),
+        COUNCIL_RETIRE_DEADLINE,
+        || {
+          if let Some((_, leader)) = survivors.iter().find(|(_, daemon)| daemon.root_leads()) {
+            leader.promote_region(lost);
+          }
+          survivors
+            .iter()
+            .all(|(_, daemon)| daemon.region_home(volume, lost) == mirror)
+        },
+      );
       (not_retired, promoted)
     }
     _ => (false, false),
@@ -1286,13 +1392,17 @@ fn a_client_on_a_follower_promotes_a_region_by_forwarding_to_the_leader() {
 
   assert_fleet_forms(&daemons, &hosts, &names);
   let daemons: Vec<(HostId, Daemon)> = hosts.iter().copied().zip(daemons).collect();
-  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, || {
-    daemons
-      .iter()
-      .filter(|(_, daemon)| daemon.root_leads())
-      .count()
-      == 1
-  });
+  let elected = poll_until(
+    &daemons.iter().map(|(_, d)| d).collect::<Vec<_>>(),
+    COUNCIL_ELECTION_DEADLINE,
+    || {
+      daemons
+        .iter()
+        .filter(|(_, daemon)| daemon.root_leads())
+        .count()
+        == 1
+    },
+  );
   let lost = RegionId(1);
   let mirror = RegionId(0);
   let volume = ObjectId::new(hosts[1], 7); // a volume created in region 1
@@ -1308,12 +1418,16 @@ fn a_client_on_a_follower_promotes_a_region_by_forwarding_to_the_leader() {
   let promoted = match (elected, follower) {
     (true, Some(follower)) => {
       let mut client = Client::connect(&format!("fleet3-{}-{pid}", follower.0));
-      poll_until(COUNCIL_RETIRE_DEADLINE, || {
-        let _ = client.call(&RequestBody::PromoteRegion { region: lost.0 });
-        daemons
-          .iter()
-          .all(|(_, daemon)| daemon.region_home(volume, lost) == mirror)
-      })
+      poll_until(
+        &daemons.iter().map(|(_, d)| d).collect::<Vec<_>>(),
+        COUNCIL_RETIRE_DEADLINE,
+        || {
+          let _ = client.call(&RequestBody::PromoteRegion { region: lost.0 });
+          daemons
+            .iter()
+            .all(|(_, daemon)| daemon.region_home(volume, lost) == mirror)
+        },
+      )
     }
     _ => false,
   };
@@ -1378,12 +1492,16 @@ fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
   // Polled: it turns from a transient refusal (the root configuration not yet formed on b, so the lookup guard
   // does not fire and b routes locally, or the b→a session not yet up) into the served Status.
   let mut client_b = Client::connect(&format!("fleet3-{}-{pid}", hosts[1].0));
-  let served = poll_until(COUNCIL_RETIRE_DEADLINE, || {
-    matches!(
-      client_b.call(&RequestBody::Status { volume: id }),
-      ReplyBody::Status { .. }
-    )
-  });
+  let served = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_RETIRE_DEADLINE,
+    || {
+      matches!(
+        client_b.call(&RequestBody::Status { volume: id }),
+        ReplyBody::Status { .. }
+      )
+    },
+  );
 
   for daemon in daemons {
     daemon.stop();
@@ -1445,23 +1563,31 @@ fn a_client_writes_a_cross_region_volume_by_forwarding_to_its_owner() {
   // configuration has formed on b (the lookup guard fires) and the b→a session is up — so the write below is
   // not raced by the forming config. A read takes no snapshot, so this readiness poll is side-effect free.
   let mut client_b = Client::connect(&format!("fleet3-{}-{pid}", hosts[1].0));
-  let ready = poll_until(COUNCIL_RETIRE_DEADLINE, || {
-    matches!(
-      client_b.call(&RequestBody::Status { volume: id }),
-      ReplyBody::Status { .. }
-    )
-  });
+  let ready = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_RETIRE_DEADLINE,
+    || {
+      matches!(
+        client_b.call(&RequestBody::Status { volume: id }),
+        ReplyBody::Status { .. }
+      )
+    },
+  );
 
   // One forwarded write. `call` assigns a fresh request id; a transient forward failure is retried on the
   // **same** id (`call_retry`), so a is never asked for a second snapshot while the first is in flight.
   let mut first = client_b.call(&RequestBody::Snapshot { volume: id });
-  poll_until(COUNCIL_RETIRE_DEADLINE, || {
-    if matches!(first, ReplyBody::Snapshotted { .. }) {
-      return true;
-    }
-    first = client_b.call_retry(&RequestBody::Snapshot { volume: id });
-    matches!(first, ReplyBody::Snapshotted { .. })
-  });
+  poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_RETIRE_DEADLINE,
+    || {
+      if matches!(first, ReplyBody::Snapshotted { .. }) {
+        return true;
+      }
+      first = client_b.call_retry(&RequestBody::Snapshot { volume: id });
+      matches!(first, ReplyBody::Snapshotted { .. })
+    },
+  );
   // A further retry of the same id must return the recorded reply.
   let retry = client_b.call_retry(&RequestBody::Snapshot { volume: id });
 
@@ -1520,13 +1646,17 @@ fn a_committed_promotion_reaches_every_shards_lookup_view() {
 
   assert_fleet_forms(&daemons, &hosts, &names);
   let daemons: Vec<(HostId, Daemon)> = hosts.iter().copied().zip(daemons).collect();
-  let elected = poll_until(COUNCIL_ELECTION_DEADLINE, || {
-    daemons
-      .iter()
-      .filter(|(_, daemon)| daemon.root_leads())
-      .count()
-      == 1
-  });
+  let elected = poll_until(
+    &daemons.iter().map(|(_, d)| d).collect::<Vec<_>>(),
+    COUNCIL_ELECTION_DEADLINE,
+    || {
+      daemons
+        .iter()
+        .filter(|(_, daemon)| daemon.root_leads())
+        .count()
+        == 1
+    },
+  );
 
   let lost = RegionId(1);
   let mirror = RegionId(0);
@@ -1539,15 +1669,19 @@ fn a_committed_promotion_reaches_every_shards_lookup_view() {
   // region must re-home to the mirror on BOTH the control shard (`region_home`) and a non-control shard
   // (`region_home_on_shard` — the fan-out under test), so a client reads the same home wherever it lands.
   let promoted = elected
-    && poll_until(COUNCIL_RETIRE_DEADLINE, || {
-      if let Some((_, leader)) = daemons.iter().find(|(_, daemon)| daemon.root_leads()) {
-        leader.promote_region(lost);
-      }
-      daemons.iter().all(|(_, daemon)| {
-        daemon.region_home(volume, lost) == mirror
-          && daemon.region_home_on_shard(1, volume, lost) == mirror
-      })
-    });
+    && poll_until(
+      &daemons.iter().map(|(_, d)| d).collect::<Vec<_>>(),
+      COUNCIL_RETIRE_DEADLINE,
+      || {
+        if let Some((_, leader)) = daemons.iter().find(|(_, daemon)| daemon.root_leads()) {
+          leader.promote_region(lost);
+        }
+        daemons.iter().all(|(_, daemon)| {
+          daemon.region_home(volume, lost) == mirror
+            && daemon.region_home_on_shard(1, volume, lost) == mirror
+        })
+      },
+    );
 
   for (_, daemon) in daemons {
     daemon.stop();
@@ -1626,10 +1760,14 @@ fn a_learner_fetches_the_councils_committed_configuration_over_the_transport() {
     .iter()
     .position(|(host, _)| *host == observed_host)
     .expect("the observed learner survives");
-  let learned = poll_until(COUNCIL_RETIRE_DEADLINE, || {
-    let daemon = &survivors[observed_pos].1;
-    !daemon.council_members().contains(&dead) && !daemon.placement_neighbourhood().contains(&dead)
-  });
+  let learned = poll_until(
+    &survivors.iter().map(|(_, d)| d).collect::<Vec<_>>(),
+    COUNCIL_RETIRE_DEADLINE,
+    || {
+      let daemon = &survivors[observed_pos].1;
+      !daemon.council_members().contains(&dead) && !daemon.placement_neighbourhood().contains(&dead)
+    },
+  );
 
   for (_, daemon) in survivors {
     daemon.stop();
@@ -1697,7 +1835,11 @@ fn three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node() {
   let placed_after_retirement = all_retired && {
     let mut client = Client::connect(&format!("fleet3-{}-{pid}", hosts[0].0));
     match client.call(&scratch("after-retirement")) {
-      ReplyBody::Created { id } => poll_head_placed(&daemons[0], ObjectId(id.bytes)),
+      ReplyBody::Created { id } => poll_head_placed(
+        &daemons.iter().collect::<Vec<_>>(),
+        &daemons[0],
+        ObjectId(id.bytes),
+      ),
       _ => false,
     }
   };
@@ -1722,15 +1864,14 @@ fn three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node() {
 /// a node killed before its peers meshed to it could never be retired. Polling rather than a fixed settle
 /// returns as soon as the mesh is up and tolerates a slower-forming larger mesh.
 fn assert_fleet_forms(daemons: &[Daemon], _hosts: &[HostId], names: &[&str]) {
-  let deadline = Instant::now() + FORMATION_DEADLINE;
-  while Instant::now() < deadline {
-    if daemons.iter().all(Daemon::fleet_meshed) {
-      return;
-    }
-    std::thread::yield_now();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  if poll_until(&observed, FORMATION_DEADLINE, || {
+    daemons.iter().all(Daemon::fleet_meshed)
+  }) {
+    return;
   }
-  // Past the deadline and still not meshed: assert with a message naming the first unmeshed node (its
-  // seeded members view is shown to make the seeded-vs-formed distinction legible on a failure).
+  // Still not meshed: assert with a message naming the first unmeshed node (its seeded members view is shown
+  // to make the seeded-vs-formed distinction legible on a failure).
   for (i, daemon) in daemons.iter().enumerate() {
     assert!(
       daemon.fleet_meshed(),
@@ -1747,11 +1888,15 @@ fn poll_survivors_retire(survivors: &[Daemon], dead: HostId) -> bool {
   // Retirement is monotonic (a retired member does not reappear in `fleet_members` without a rejoin, which
   // this never triggers), so "every survivor currently shows `dead` retired" holds from the moment the last
   // one retires — the same verdict the former per-survivor latch reached, now under the load-adaptive poll.
-  poll_until(RETIREMENT_DEADLINE, || {
-    survivors
-      .iter()
-      .all(|survivor| !survivor.fleet_members().contains(&dead))
-  })
+  poll_until(
+    &survivors.iter().collect::<Vec<_>>(),
+    RETIREMENT_DEADLINE,
+    || {
+      survivors
+        .iter()
+        .all(|survivor| !survivor.fleet_members().contains(&dead))
+    },
+  )
 }
 
 /// A minimal client of a daemon's own rendezvous (as in the other daemon tests): connect and call verbs.
@@ -1879,7 +2024,9 @@ fn a_provisioned_head_replicates_across_the_fleet() {
 
   // A's control-shard loop ships the head to B over the record connection; B serves it; the quorum is
   // reached and A records the placement. Poll until A reports the head region-placed.
-  let placed = poll_until(FORMATION_DEADLINE, || daemon_a.fleet_head_placed(object));
+  let placed = poll_until(&[&daemon_a, &daemon_b], FORMATION_DEADLINE, || {
+    daemon_a.fleet_head_placed(object)
+  });
   // The verbs read the same recorded placement (§4.8 D-18, `await placed(region)`): a client asking the
   // owner for the region scope is told it is placed. Before the verbs consulted the recorded
   // acknowledgements they recomputed the owner's local placement — the owner alone — so a fleet's head was
@@ -1955,7 +2102,7 @@ fn a_holder_durably_holds_the_owners_replicated_head() {
 
   // A ships the head to B (the holder) over the record connection; B accepts it into the object's durable
   // acceptor and tracks it in its routing view. Poll until B reports it durably holds A's head.
-  let held = if poll_until(FORMATION_DEADLINE, || {
+  let held = if poll_until(&[&daemon_a, &daemon_b], FORMATION_DEADLINE, || {
     daemon_b.fleet_holder_head(object).is_some()
   }) {
     daemon_b.fleet_holder_head(object)
@@ -1989,8 +2136,11 @@ fn poll_both_hold(first: &Daemon, second: &Daemon, object: ObjectId) -> bool {
 
 /// Polls until `daemon` reports `object` region-placed — the takeover re-committed the adopted head under
 /// its ownership — or the takeover deadline passes; returns whether it did.
-fn poll_head_placed(daemon: &Daemon, object: ObjectId) -> bool {
-  poll_until(SERVE_DEADLINE, || daemon.fleet_head_placed(object))
+fn poll_head_placed(gate: &[&Daemon], observed: &Daemon, object: ObjectId) -> bool {
+  // Gate on ALL the daemons the placement depends on (the owner/successor AND its candidate holders), not
+  // only the one we read `fleet_head_placed` from: a head places only when a holder acknowledges it, so if a
+  // holder is the one starved under load, the wait must be charged against ITS progress too.
+  poll_until(gate, SERVE_DEADLINE, || observed.fleet_head_placed(object))
 }
 
 /// AC (§4.8 "Promotion and takeover", boot step 6, N-node): three daemons form one `f = 1` fleet; a volume
@@ -2058,7 +2208,11 @@ fn three_daemons_take_over_a_dead_owners_head() {
 
   // The successor drives phase one over the surviving holder, adopts the committed head, re-commits it under
   // the new epoch, and reports it region-placed under its own ownership.
-  let served = poll_head_placed(&daemons[successor_index], object);
+  let served = poll_head_placed(
+    &daemons.iter().collect::<Vec<_>>(),
+    &daemons[successor_index],
+    object,
+  );
   let held = daemons[successor_index].fleet_holder_head(object);
 
   for daemon in daemons {
@@ -2085,7 +2239,7 @@ fn three_daemons_take_over_a_dead_owners_head() {
 /// dead owner's head reached every surviving candidate before the death, so the takeover's promotion quorum
 /// (the successor plus `f` other holders) is available.
 fn poll_all_hold(survivors: &[&Daemon], object: ObjectId) -> bool {
-  poll_until(SERVE_DEADLINE, || {
+  poll_until(survivors, SERVE_DEADLINE, || {
     survivors
       .iter()
       .all(|daemon| daemon.fleet_holder_head(object).is_some())
@@ -2161,7 +2315,11 @@ fn five_daemons_take_over_a_dead_owners_head_over_a_multi_holder_quorum() {
 
   // The successor drives phase one over the surviving holders (a quorum of three), adopts the committed head,
   // re-commits it under the new epoch, and reports it region-placed under its own ownership.
-  let served = poll_head_placed(&daemons[successor_index], object);
+  let served = poll_head_placed(
+    &daemons.iter().collect::<Vec<_>>(),
+    &daemons[successor_index],
+    object,
+  );
   let held = daemons[successor_index].fleet_holder_head(object);
 
   for daemon in daemons {
@@ -2229,7 +2387,12 @@ fn seal_hello_on_owner(instance: &str, daemons: &[Daemon], name: &str) -> Result
   else {
     return Err("the snapshot was not taken".to_owned());
   };
-  let placed = poll_snapshot_placed(&mut client, id, snapshot);
+  let placed = poll_snapshot_placed(
+    &daemons.iter().collect::<Vec<_>>(),
+    &mut client,
+    id,
+    snapshot,
+  );
   let survivors: Vec<&Daemon> = daemons[1..].iter().collect();
   let all_hold = poll_all_hold(&survivors, ObjectId(id.bytes));
   if placed && all_hold {
@@ -2243,9 +2406,9 @@ fn seal_hello_on_owner(instance: &str, daemons: &[Daemon], name: &str) -> Result
 
 /// Polls `status` for `volume` at the daemon reached at `instance` until it answers with a report (the
 /// volume is served there) or the serve deadline passes; returns whether it did.
-fn poll_status_answers(instance: &str, volume: VolumeId) -> bool {
+fn poll_status_answers(daemons: &[&Daemon], instance: &str, volume: VolumeId) -> bool {
   let mut client = Client::connect(instance);
-  poll_until(SERVE_DEADLINE, || {
+  poll_until(daemons, SERVE_DEADLINE, || {
     matches!(
       client.call(&RequestBody::Status { volume }),
       ReplyBody::Status { .. }
@@ -2255,8 +2418,13 @@ fn poll_status_answers(instance: &str, volume: VolumeId) -> bool {
 
 /// Polls the owner's `await placed(snapshot, region)` verb until it answers placed, or the placement
 /// deadline passes; returns whether it did.
-fn poll_snapshot_placed(client: &mut Client, volume: VolumeId, snapshot: SnapshotId) -> bool {
-  poll_until(PLACEMENT_DEADLINE, || {
+fn poll_snapshot_placed(
+  daemons: &[&Daemon],
+  client: &mut Client,
+  volume: VolumeId,
+  snapshot: SnapshotId,
+) -> bool {
+  poll_until(daemons, PLACEMENT_DEADLINE, || {
     matches!(
       client.call(&RequestBody::AwaitPlaced {
         volume,
@@ -2318,7 +2486,7 @@ fn a_sealed_snapshots_content_replicates_to_the_holder_and_places() {
     panic!("the snapshot was not taken");
   };
 
-  let placed = poll_snapshot_placed(&mut client, id, snapshot);
+  let placed = poll_snapshot_placed(&[&daemon_a, &daemon_b], &mut client, id, snapshot);
   let manifest = daemon_a.fleet_head_manifest(object);
   let held = manifest.is_some_and(|manifest| daemon_b.fleet_holder_content(manifest));
 
@@ -2382,11 +2550,15 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
   owner.stop();
   let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
   let successor_index = if successor == hosts[1] { 0 } else { 1 };
-  let head_placed = poll_head_placed(&daemons[successor_index], object);
+  let head_placed = poll_head_placed(
+    &daemons.iter().collect::<Vec<_>>(),
+    &daemons[successor_index],
+    object,
+  );
 
   // The successor serves the volume once it materialized it: its `status` answers instead of refusing.
   let successor_instance = format!("fleet3-{}-{pid}", successor.0);
-  let served = poll_status_answers(&successor_instance, id);
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &successor_instance, id);
   let got = if served {
     Some(read_hello_over_nfs(&daemons[successor_index], "served"))
   } else {
@@ -2433,7 +2605,7 @@ fn reseal_places(instance: &str, daemon: &Daemon, name: &str, volume: VolumeId) 
   else {
     return false;
   };
-  poll_snapshot_placed(&mut client, volume, snapshot)
+  poll_snapshot_placed(&[daemon], &mut client, volume, snapshot)
 }
 
 /// Shape: the number of shards the multi-shard fleet tests run — two, the smallest count with a shard other
@@ -2504,7 +2676,7 @@ fn a_volume_on_a_non_control_shard_replicates_its_content_and_places() {
     panic!("the snapshot was not taken");
   };
 
-  let placed = poll_snapshot_placed(&mut client, id, snapshot);
+  let placed = poll_snapshot_placed(&[&daemon_a, &daemon_b], &mut client, id, snapshot);
   let manifest = daemon_a.fleet_head_manifest(object);
   let held = manifest.is_some_and(|manifest| daemon_b.fleet_holder_content(manifest));
 
@@ -2570,8 +2742,16 @@ fn a_takeover_successor_serves_a_volume_on_a_non_control_shard() {
   owner.stop();
   let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
   let successor_index = if successor == hosts[1] { 0 } else { 1 };
-  let head_placed = poll_head_placed(&daemons[successor_index], object);
-  let served = poll_status_answers(&format!("fleet3-{}-{pid}", successor.0), id);
+  let head_placed = poll_head_placed(
+    &daemons.iter().collect::<Vec<_>>(),
+    &daemons[successor_index],
+    object,
+  );
+  let served = poll_status_answers(
+    &daemons.iter().collect::<Vec<_>>(),
+    &format!("fleet3-{}-{pid}", successor.0),
+    id,
+  );
   let got = if served {
     Some(read_hello_over_nfs(&daemons[successor_index], &name))
   } else {
@@ -2621,7 +2801,7 @@ fn a_peer_whose_serve_socket_cannot_be_bound_is_counted_not_silently_skipped() {
   // The fleet loop counts the refusal on its first run on the control shard; poll the status for it,
   // bounded, since that run and this client's request are queued on the same shard.
   let mut client = Client::connect(&instance_a);
-  let counted = poll_until(Duration::from_secs(5), || {
+  let counted = poll_until(&[&daemon_a], Duration::from_secs(5), || {
     matches!(
       client.call(&RequestBody::DaemonStatus),
       ReplyBody::DaemonStatus { report }
