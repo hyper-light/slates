@@ -15,11 +15,22 @@
 
 use std::collections::BTreeMap;
 
+use slates_bridge_core::{Attachments, OpContext, Rights, View};
+use slates_bridge_fuse::abi::IN_HEADER_LEN;
+use slates_bridge_virtiofs::admission::{Doorbell, SeamError, VmmSeam};
+use slates_bridge_virtiofs::device::DeviceConfig;
 use slates_bridge_virtiofs::memory::{GuestAddr, GuestMemory, GuestRange};
 use slates_bridge_virtiofs::sim::SimGuestMemory;
 use slates_bridge_virtiofs::virtqueue::{
   DESCRIPTOR_LEN, QueueLayout, VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE,
 };
+use slates_db::catalog::{Principal, VolumeId};
+use slates_mem::arena::ChunkArena;
+use slates_mem::region::Region;
+use slates_vfs::clock::StepClock;
+use slates_vfs::names::NameEquivalence;
+use slates_vfs::quota::Quota;
+use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
 
 /// Format: virtio 1.2 §2.7.6 — the available ring's `idx` follows its `flags` (two `le16`).
 pub const AVAIL_IDX_OFFSET: u64 = 2;
@@ -72,6 +83,9 @@ struct SimQueue {
   used_seen: u16,
   free: Vec<u16>,
   chains: BTreeMap<u16, ChainRecord>,
+  /// Every head made available, in order; the device completes in order, so the heads past
+  /// `used_seen` are the chains still pending.
+  published: Vec<u16>,
 }
 
 /// The simulated guest driver.
@@ -97,6 +111,7 @@ impl SimDriver {
         used_seen: 0,
         free: (0..*size).rev().collect(),
         chains: BTreeMap::new(),
+        published: Vec::new(),
       })
       .collect();
     SimDriver {
@@ -183,7 +198,18 @@ impl SimDriver {
     self.write(entry, &head.to_le_bytes());
     let idx = self.queues[queue].avail_idx.wrapping_add(1);
     self.queues[queue].avail_idx = idx;
+    self.queues[queue].published.push(head);
     self.write_avail_idx(queue, idx);
+  }
+
+  /// The writable ranges of every chain on `queue` published but not yet reaped, in order.
+  pub fn pending_writable(&self, queue: usize) -> Vec<GuestRange> {
+    let q = &self.queues[queue];
+    q.published
+      .iter()
+      .skip(usize::from(q.used_seen))
+      .flat_map(|head| q.chains[head].writable.iter().copied())
+      .collect()
   }
 
   /// Writes `queue`'s available index outright (a hostile driver's move).
@@ -335,4 +361,192 @@ fn pieces(total: u32, split: usize) -> Vec<u32> {
     *last += total - each * split;
   }
   out
+}
+
+// ------------------------------------------------------------------- the scratch-volume fixture
+
+/// Shape: the page and a small arena for the test volumes.
+pub const PAGE: usize = 4096;
+pub const REGION_PAGES: usize = 4096;
+
+/// A store over a small RAM arena.
+pub fn store() -> Store {
+  let mut arena = ChunkArena::new(PAGE);
+  arena
+    .add_region(Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
+    .unwrap();
+  Store::new(
+    &StoreConfig {
+      page: PAGE,
+      cache_line: 128,
+      max_dirs: 64,
+      max_inodes: 256,
+      max_chunks: REGION_PAGES,
+      max_dir_blocks: 64,
+      dir_cutover: 16,
+    },
+    arena,
+    0,
+  )
+}
+
+/// A scratch volume on a deterministic clock, so two volumes driven identically agree byte for byte.
+pub fn volume(store: &mut Store) -> Volume {
+  Volume::create(
+    store,
+    VolumeConfig {
+      prefix: 1,
+      names: NameEquivalence::Exact,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 16,
+      clock: Box::new(StepClock::new(1_000_000_000, 1)),
+    },
+  )
+  .unwrap()
+}
+
+/// The volume id every test attaches.
+pub fn vid() -> VolumeId {
+  VolumeId { bytes: [7; 16] }
+}
+
+/// A read-write current-view context, minted through the attachment registry (the only way).
+pub fn context() -> OpContext {
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      vid(),
+      View::Current,
+      Principal::Uid { uid: 0 },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  attachments.context(id).unwrap()
+}
+
+/// A FUSE request: the header then the body, `len` set to the total.
+pub fn message(opcode: u32, unique: u64, nodeid: u64, body: &[u8]) -> Vec<u8> {
+  let total = IN_HEADER_LEN + body.len();
+  let mut m = vec![0u8; total];
+  m[0..4].copy_from_slice(&u32::try_from(total).unwrap().to_le_bytes());
+  m[4..8].copy_from_slice(&opcode.to_le_bytes());
+  m[8..16].copy_from_slice(&unique.to_le_bytes());
+  m[16..24].copy_from_slice(&nodeid.to_le_bytes());
+  m[IN_HEADER_LEN..].copy_from_slice(body);
+  m
+}
+
+/// The errno a FUSE reply carries (negated on the wire).
+pub fn reply_error(reply: &[u8]) -> i32 {
+  i32::from_le_bytes(reply[4..8].try_into().unwrap())
+}
+
+// --------------------------------------------------------------------- the simulated VMM seam
+
+/// One call the device made on the seam, in the order made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeamCall {
+  Consumer,
+  Memory,
+  Queues,
+  Publish,
+}
+
+/// A simulated host VMM (the in-process form): it owns the guest — its memory and the driver
+/// that writes the rings — answers the consumer question the way the harness configured it,
+/// records every call the device makes and its order, and notes the notifications raised and
+/// whether it was released.
+pub struct SimVmm {
+  guest: SimDriver,
+  consumer: Result<Principal, SeamError>,
+  calls: Vec<SeamCall>,
+  published: Option<DeviceConfig>,
+  notified: Vec<u16>,
+  released: bool,
+}
+
+impl std::fmt::Debug for SimVmm {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("SimVmm")
+      .field("calls", &self.calls)
+      .field("released", &self.released)
+      .finish()
+  }
+}
+
+impl SimVmm {
+  /// A VMM whose guest has queues of `sizes` and whose harness established `consumer`.
+  pub fn new(sizes: &[u16], consumer: Result<Principal, SeamError>) -> SimVmm {
+    SimVmm {
+      guest: SimDriver::new(sizes),
+      consumer,
+      calls: Vec::new(),
+      published: None,
+      notified: Vec::new(),
+      released: false,
+    }
+  }
+
+  pub fn guest(&self) -> &SimDriver {
+    &self.guest
+  }
+
+  pub fn guest_mut(&mut self) -> &mut SimDriver {
+    &mut self.guest
+  }
+
+  pub fn calls(&self) -> Vec<SeamCall> {
+    self.calls.clone()
+  }
+
+  pub fn published(&self) -> Option<DeviceConfig> {
+    self.published
+  }
+
+  pub fn notified(&self) -> Vec<u16> {
+    self.notified.clone()
+  }
+
+  pub fn released(&self) -> bool {
+    self.released
+  }
+}
+
+impl VmmSeam for SimVmm {
+  fn consumer(&mut self) -> Result<Principal, SeamError> {
+    self.calls.push(SeamCall::Consumer);
+    self.consumer.clone()
+  }
+
+  fn memory(&mut self) -> Result<&mut dyn GuestMemory, SeamError> {
+    self.calls.push(SeamCall::Memory);
+    Ok(&mut self.guest.memory)
+  }
+
+  fn queues(&mut self) -> Result<Vec<QueueLayout>, SeamError> {
+    self.calls.push(SeamCall::Queues);
+    Ok(self.guest.layouts())
+  }
+
+  fn publish(&mut self, config: &DeviceConfig) -> Result<(), SeamError> {
+    self.calls.push(SeamCall::Publish);
+    self.published = Some(*config);
+    Ok(())
+  }
+
+  fn notify_used(&mut self, queue: u16) -> Result<(), SeamError> {
+    self.notified.push(queue);
+    Ok(())
+  }
+
+  fn doorbell(&self) -> Doorbell {
+    Doorbell::InProcess
+  }
+
+  fn release(&mut self) {
+    self.released = true;
+  }
 }

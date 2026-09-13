@@ -43,6 +43,7 @@ use slates_bridge_fuse::reply::ReplyHeader;
 use slates_bridge_fuse::request::InHeader;
 use slates_machine::{Derived, derived};
 
+use crate::credit::{ChainAdmission, CreditError};
 use crate::memory::{GuestMemory, GuestMemoryError, GuestRange};
 use crate::virtqueue::{
   ChainCaps, DescriptorChain, QueueLayout, Virtqueue, VirtqueueCounters, VirtqueueError,
@@ -267,6 +268,8 @@ pub enum DeviceError {
     /// The bytes.
     bytes: u64,
   },
+  /// A chain the attachment's credits refused (§4.6 A-9), before it was consumed or touched.
+  CreditRefused(CreditError),
   /// A queue refusal.
   Virtqueue(VirtqueueError),
   /// A guest-memory refusal.
@@ -308,6 +311,7 @@ impl fmt::Display for DeviceError {
         "queue {queue}: {writable} writable bytes, a FUSE reply header needs {need}"
       ),
       Self::BufferTooLarge { bytes } => write!(f, "a {bytes}-byte copy is not addressable"),
+      Self::CreditRefused(e) => write!(f, "credit refused: {e}"),
       Self::Virtqueue(e) => write!(f, "virtqueue: {e}"),
       Self::Memory(e) => write!(f, "guest memory: {e}"),
     }
@@ -422,9 +426,11 @@ impl Device {
   }
 
   /// Serves up to `batch` chains available on `queue`, in ring order, each through `bridge` under
-  /// `cx`: gather, dispatch, scatter, publish. Bounded by `batch` so a pass never runs past the
-  /// shard's step budget (§4.3 "bounded work everywhere"); `more_pending` tells the caller to come
-  /// back. A malformed request faults the device: the refusal is returned now and on every later
+  /// `cx`: peek (the walk validates the chain), admit (the attachment's credits are charged, before
+  /// any buffer is touched), advance, gather, dispatch, scatter, publish, complete (the charge is
+  /// released). Bounded by `batch` so a pass never runs past the shard's step budget (§4.3 "bounded
+  /// work everywhere"); `more_pending` tells the caller to come back. A malformed request, or a
+  /// chain the credits refuse, faults the device: the refusal is returned now and on every later
   /// pass until the driver reconfigures.
   pub fn service_queue(
     &mut self,
@@ -433,6 +439,7 @@ impl Device {
     bridge: &mut dyn Bridge,
     cx: &OpContext,
     batch: u32,
+    admission: &mut dyn ChainAdmission,
   ) -> Result<Serviced, DeviceError> {
     if let Some(fault) = &self.fault {
       return Err(fault.clone());
@@ -440,17 +447,19 @@ impl Device {
     let index = self.queue_index(queue)?;
     let mut served: u32 = 0;
     while served < batch {
-      let Some(chain) = self.queues[index].pop(memory)? else {
+      let Some(chain) = self.queues[index].peek(memory)? else {
         break;
       };
+      if let Err(refusal) = admission.admit(&chain) {
+        return Err(self.record_fault(DeviceError::CreditRefused(refusal)));
+      }
+      self.queues[index].advance();
       let written = match self.serve_chain(queue, &chain, memory, bridge, cx) {
         Ok(written) => written,
-        Err(refusal) => {
-          self.fault = Some(refusal.clone());
-          return Err(refusal);
-        }
+        Err(refusal) => return Err(self.record_fault(refusal)),
       };
       self.queues[index].push_used(memory, &chain, written)?;
+      admission.complete(&chain, written);
       served = served.saturating_add(1);
     }
     Ok(Serviced {
@@ -458,6 +467,12 @@ impl Device {
       more_pending: self.queues[index].pending(memory)? > 0,
       interrupt_wanted: self.queues[index].interrupts_wanted(memory)?,
     })
+  }
+
+  /// Records the fault that stops the device and hands the refusal back.
+  fn record_fault(&mut self, refusal: DeviceError) -> DeviceError {
+    self.fault = Some(refusal.clone());
+    refusal
   }
 
   /// The position of `queue` in the configured queues, or the typed refusal.

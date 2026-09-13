@@ -10,26 +10,17 @@
 
 mod common;
 
-use common::SimDriver;
-use slates_bridge_core::{Attachments, OpContext, Rights, View, VolumeBridge};
+use common::{SimDriver, context, message, reply_error, store, vid, volume};
+use slates_bridge_core::{OpContext, VolumeBridge};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode, flags};
 use slates_bridge_fuse::bridge::dispatch;
 use slates_bridge_fuse::reply::EntryOut;
+use slates_bridge_virtiofs::credit::Unlimited;
 use slates_bridge_virtiofs::device::{
   Device, DeviceConfig, DeviceError, FIRST_REQUEST_QUEUE, FsTag, HIPRIO_QUEUE, TAG_LEN,
 };
 use slates_bridge_virtiofs::virtqueue::VirtqueueError;
-use slates_db::catalog::{Principal, VolumeId};
-use slates_mem::arena::ChunkArena;
-use slates_mem::region::Region;
-use slates_vfs::clock::StepClock;
-use slates_vfs::names::NameEquivalence;
-use slates_vfs::quota::Quota;
-use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
 
-/// Shape: the page and a small arena for the test volumes.
-const PAGE: usize = 4096;
-const REGION_PAGES: usize = 4096;
 /// Shape: the reply room posted for every request-queue request: 8 KiB holds any reply in the
 /// script (a 2 000-byte read, a 4 KiB readdir, the headers).
 const REPLY_CAP: u32 = 8192;
@@ -47,78 +38,8 @@ const ENOENT: i32 = 2;
 const EIO: i32 = 5;
 /// Format: `O_RDWR`.
 const O_RDWR: u32 = 2;
-
-fn store() -> Store {
-  let mut arena = ChunkArena::new(PAGE);
-  arena
-    .add_region(Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
-    .unwrap();
-  Store::new(
-    &StoreConfig {
-      page: PAGE,
-      cache_line: 128,
-      max_dirs: 64,
-      max_inodes: 256,
-      max_chunks: REGION_PAGES,
-      max_dir_blocks: 64,
-      dir_cutover: 16,
-    },
-    arena,
-    0,
-  )
-}
-
-/// A scratch volume on a deterministic clock, so two volumes driven identically agree byte for byte.
-fn volume(store: &mut Store) -> Volume {
-  Volume::create(
-    store,
-    VolumeConfig {
-      prefix: 1,
-      names: NameEquivalence::Exact,
-      quota: Quota::Bounded { limit: 1 << 30 },
-      journal_bytes: 1 << 16,
-      clock: Box::new(StepClock::new(1_000_000_000, 1)),
-    },
-  )
-  .unwrap()
-}
-
-fn vid() -> VolumeId {
-  VolumeId { bytes: [7; 16] }
-}
-
-/// A read-write current-view context, minted through the attachment registry.
-fn context() -> OpContext {
-  let mut attachments = Attachments::new();
-  let id = attachments
-    .attach(
-      vid(),
-      View::Current,
-      Principal::Uid { uid: 0 },
-      Rights {
-        read: true,
-        write: true,
-      },
-    )
-    .unwrap();
-  attachments.context(id).unwrap()
-}
-
-/// A FUSE request: the header then the body, `len` set to the total.
-fn message(opcode: u32, unique: u64, nodeid: u64, body: &[u8]) -> Vec<u8> {
-  let total = IN_HEADER_LEN + body.len();
-  let mut m = vec![0u8; total];
-  m[0..4].copy_from_slice(&u32::try_from(total).unwrap().to_le_bytes());
-  m[4..8].copy_from_slice(&opcode.to_le_bytes());
-  m[8..16].copy_from_slice(&unique.to_le_bytes());
-  m[16..24].copy_from_slice(&nodeid.to_le_bytes());
-  m[IN_HEADER_LEN..].copy_from_slice(body);
-  m
-}
-
-fn reply_error(reply: &[u8]) -> i32 {
-  i32::from_le_bytes(reply[4..8].try_into().unwrap())
-}
+/// Format: the FUSE node id of the root directory.
+const ROOT: u64 = 1;
 
 fn u64_at(bytes: &[u8], at: usize) -> u64 {
   u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
@@ -180,6 +101,18 @@ fn name_body(name: &str) -> Vec<u8> {
   b
 }
 
+/// One service pass of `queue` with no credit accounting (the codec-level tests).
+fn serve(
+  device: &mut Device,
+  queue: u16,
+  driver: &mut SimDriver,
+  bridge: &mut VolumeBridge<'_>,
+  cx: &OpContext,
+  batch: u32,
+) -> Result<slates_bridge_virtiofs::device::Serviced, DeviceError> {
+  device.service_queue(queue, &mut driver.memory, bridge, cx, batch, &mut Unlimited)
+}
+
 /// The two legs of the oracle: the device over one scratch volume and direct dispatch over another.
 struct Legs<'a, 'v> {
   driver: &'a mut SimDriver,
@@ -206,16 +139,15 @@ impl Legs<'_, '_> {
     let head = self
       .driver
       .submit(usize::from(queue), &request, capacity, split);
-    let serviced = self
-      .device
-      .service_queue(
-        queue,
-        &mut self.driver.memory,
-        self.via_device,
-        self.cx,
-        BATCH,
-      )
-      .unwrap();
+    let serviced = serve(
+      self.device,
+      queue,
+      self.driver,
+      self.via_device,
+      self.cx,
+      BATCH,
+    )
+    .unwrap();
     assert_eq!(serviced.served, 1, "{opcode:?}: one chain served");
     let (id, len) = self
       .driver
@@ -242,9 +174,6 @@ fn device_and_driver() -> (Device, SimDriver) {
   device.configure(&driver.layouts(), &driver.memory).unwrap();
   (device, driver)
 }
-
-/// Format: the FUSE node id of the root directory.
-const ROOT: u64 = 1;
 
 /// Phase 1 of the cycle: INIT (with DAX offered and not advertised), a lookup miss, CREATE; returns
 /// the created inode and its handle, read from the reply both legs agreed on.
@@ -409,18 +338,19 @@ fn init_does_not_advertise_dax_map_alignment() {
   let cx = context();
   let offered = u32::try_from(flags::BIG_WRITES | flags::DONT_MASK | FUSE_MAP_ALIGNMENT).unwrap();
   let request = message(Opcode::Init.to_wire(), 1, 0, &init_body(offered));
-  let head = driver.submit(usize::from(FIRST_REQUEST_QUEUE), &request, REPLY_CAP, 1);
-  device
-    .service_queue(
-      FIRST_REQUEST_QUEUE,
-      &mut driver.memory,
-      &mut bridge,
-      &cx,
-      BATCH,
-    )
-    .unwrap();
-  let (_, len) = driver.reap(usize::from(FIRST_REQUEST_QUEUE)).unwrap();
-  let reply = driver.reply_of(usize::from(FIRST_REQUEST_QUEUE), head, len);
+  let rq = usize::from(FIRST_REQUEST_QUEUE);
+  let head = driver.submit(rq, &request, REPLY_CAP, 1);
+  serve(
+    &mut device,
+    FIRST_REQUEST_QUEUE,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    BATCH,
+  )
+  .unwrap();
+  let (_, len) = driver.reap(rq).unwrap();
+  let reply = driver.reply_of(rq, head, len);
   // fuse_init_out: major (4), minor (4), max_readahead (4), flags (4).
   let negotiated = u32::from_le_bytes(
     reply[OUT_HEADER_LEN + 12..OUT_HEADER_LEN + 16]
@@ -437,8 +367,7 @@ fn init_does_not_advertise_dax_map_alignment() {
     0,
     "a wanted flag is kept (non-vacuous)"
   );
-  let n = device.negotiated().unwrap();
-  assert_eq!(n.flags & FUSE_MAP_ALIGNMENT, 0);
+  assert_eq!(device.negotiated().unwrap().flags & FUSE_MAP_ALIGNMENT, 0);
 }
 
 /// §4.3 "bounded work everywhere": a service pass takes at most its batch and reports more pending;
@@ -459,19 +388,25 @@ fn a_service_pass_is_bounded_by_its_batch() {
       1,
     );
   }
-  let first = device
-    .service_queue(FIRST_REQUEST_QUEUE, &mut driver.memory, &mut bridge, &cx, 2)
-    .unwrap();
+  let first = serve(
+    &mut device,
+    FIRST_REQUEST_QUEUE,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    2,
+  )
+  .unwrap();
   assert_eq!((first.served, first.more_pending), (2, true));
-  let second = device
-    .service_queue(
-      FIRST_REQUEST_QUEUE,
-      &mut driver.memory,
-      &mut bridge,
-      &cx,
-      10,
-    )
-    .unwrap();
+  let second = serve(
+    &mut device,
+    FIRST_REQUEST_QUEUE,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    10,
+  )
+  .unwrap();
   assert_eq!((second.served, second.more_pending), (3, false));
   assert!(
     second.interrupt_wanted,
@@ -491,9 +426,7 @@ fn a_malformed_request_faults_the_device() {
   let cx = context();
   let rq = FIRST_REQUEST_QUEUE;
   driver.submit(usize::from(rq), &[1u8; 10], REPLY_CAP, 1);
-  let refused = device
-    .service_queue(rq, &mut driver.memory, &mut bridge, &cx, BATCH)
-    .unwrap_err();
+  let refused = serve(&mut device, rq, &mut driver, &mut bridge, &cx, BATCH).unwrap_err();
   assert_eq!(
     refused,
     DeviceError::RequestTooShort {
@@ -503,9 +436,7 @@ fn a_malformed_request_faults_the_device() {
     }
   );
   assert_eq!(
-    device
-      .service_queue(rq, &mut driver.memory, &mut bridge, &cx, BATCH)
-      .unwrap_err(),
+    serve(&mut device, rq, &mut driver, &mut bridge, &cx, BATCH).unwrap_err(),
     refused,
     "the fault persists"
   );
@@ -518,9 +449,7 @@ fn a_malformed_request_faults_the_device() {
     1,
   );
   assert_eq!(
-    device
-      .service_queue(rq, &mut driver.memory, &mut bridge, &cx, BATCH)
-      .unwrap_err(),
+    serve(&mut device, rq, &mut driver, &mut bridge, &cx, BATCH).unwrap_err(),
     DeviceError::ReplyBufferTooSmall {
       queue: rq,
       writable: 8,
@@ -545,15 +474,15 @@ fn a_reply_larger_than_the_posted_buffer_is_answered_eio() {
     40,
     1,
   );
-  device
-    .service_queue(
-      FIRST_REQUEST_QUEUE,
-      &mut driver.memory,
-      &mut bridge,
-      &cx,
-      BATCH,
-    )
-    .unwrap();
+  serve(
+    &mut device,
+    FIRST_REQUEST_QUEUE,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    BATCH,
+  )
+  .unwrap();
   let (_, len) = driver.reap(rq).unwrap();
   let reply = driver.reply_of(rq, head, len);
   assert_eq!(len, u32::try_from(OUT_HEADER_LEN).unwrap());
@@ -566,17 +495,22 @@ fn a_reply_larger_than_the_posted_buffer_is_answered_eio() {
 /// typed through the device.
 #[test]
 fn configuration_is_validated_before_any_queue_exists() {
-  let driver = SimDriver::new(&QUEUE_SIZES);
+  let mut driver = SimDriver::new(&QUEUE_SIZES);
   let mut device = Device::new(DeviceConfig::new(FsTag::new("slates").unwrap()));
   let mut store = store();
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
   let cx = context();
-  let mut memory = SimDriver::new(&QUEUE_SIZES).memory;
   assert_eq!(
-    device
-      .service_queue(FIRST_REQUEST_QUEUE, &mut memory, &mut bridge, &cx, BATCH)
-      .unwrap_err(),
+    serve(
+      &mut device,
+      FIRST_REQUEST_QUEUE,
+      &mut driver,
+      &mut bridge,
+      &cx,
+      BATCH
+    )
+    .unwrap_err(),
     DeviceError::NotConfigured
   );
   assert_eq!(
@@ -596,9 +530,7 @@ fn configuration_is_validated_before_any_queue_exists() {
   );
   device.configure(&driver.layouts(), &driver.memory).unwrap();
   assert_eq!(
-    device
-      .service_queue(2, &mut memory, &mut bridge, &cx, BATCH)
-      .unwrap_err(),
+    serve(&mut device, 2, &mut driver, &mut bridge, &cx, BATCH).unwrap_err(),
     DeviceError::QueueIndexOutOfRange {
       queue: 2,
       queues: 2

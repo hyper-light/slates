@@ -38,8 +38,16 @@
 //! memory the tests own), [`virtqueue`] (the split-virtqueue machine: layout validation, the chain
 //! walk with every check the contract names, the used ring), [`device`] (the FUSE-over-virtio
 //! request cycle: gather, dispatch through the FUSE codec onto the shared `Bridge`, scatter,
-//! publish; the hiprio queue; INIT/DESTROY; the derived caps; DAX not advertised).
+//! publish; the hiprio queue; INIT/DESTROY; the derived caps; DAX not advertised), [`credit`] (the
+//! attachment's request and byte credits, derived from the shard's admission limit and the §4.9
+//! credit window, charged per chain before access), [`admission`] (the `VmmSeam`, the ordered
+//! admission that authenticates the consumer first, the admitted device's service pass, revocation
+//! and the owned terminal step), [`capability`] (the truthful transport report `attach` and
+//! `status` carry, DAX not advertised).
 
+pub mod admission;
+pub mod capability;
+pub mod credit;
 pub mod device;
 pub mod memory;
 pub mod sim;

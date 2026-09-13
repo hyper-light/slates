@@ -516,7 +516,22 @@ impl Virtqueue {
   /// Takes the next available chain, validated whole before any buffer is touched: `Ok(None)`
   /// when the driver has published nothing new, `Ok(Some(chain))` when one was taken, and a typed
   /// refusal that faults the queue (repeated on every later pop) when the chain is malformed.
+  /// [`Virtqueue::peek`] then [`Virtqueue::advance`].
   pub fn pop(
+    &mut self,
+    memory: &dyn GuestMemory,
+  ) -> Result<Option<DescriptorChain>, VirtqueueError> {
+    let chain = self.peek(memory)?;
+    if chain.is_some() {
+      self.advance();
+    }
+    Ok(chain)
+  }
+
+  /// Validates the next available chain without consuming it, so a caller can admit it (charge
+  /// its credits, §4.6 A-9) before it is taken; the same chain comes back until [`Virtqueue::advance`]
+  /// consumes it. `Ok(None)` when nothing is published; a malformed chain faults the queue.
+  pub fn peek(
     &mut self,
     memory: &dyn GuestMemory,
   ) -> Result<Option<DescriptorChain>, VirtqueueError> {
@@ -546,13 +561,16 @@ impl Virtqueue {
       }));
     }
     match self.walk(memory, head) {
-      Ok(chain) => {
-        self.next_avail = self.next_avail.wrapping_add(1);
-        self.counters.chains_popped = self.counters.chains_popped.saturating_add(1);
-        Ok(Some(chain))
-      }
+      Ok(chain) => Ok(Some(chain)),
       Err(refusal) => Err(self.record_fault(refusal)),
     }
+  }
+
+  /// Consumes the chain the last [`Virtqueue::peek`] returned: the device's available position
+  /// moves past it and the pop counter moves.
+  pub fn advance(&mut self) {
+    self.next_avail = self.next_avail.wrapping_add(1);
+    self.counters.chains_popped = self.counters.chains_popped.saturating_add(1);
   }
 
   /// Publishes a used element for `chain`: the element (`id`, `len`) is written whole, then the
