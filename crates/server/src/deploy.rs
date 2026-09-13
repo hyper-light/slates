@@ -190,6 +190,26 @@ pub fn host_id_of_certificate(certificate: &CertificateDer<'_>) -> HostId {
   ]))
 }
 
+/// A node's **ephemeral member id** for the boot with daemon `generation`: the leading eight bytes of
+/// `BLAKE3(cert DER ‖ generation)` (§4.8 "Recovery": *"the node rejoins with a new ephemeral id — a restart
+/// is a join"*). The certificate is the stable anchor every peer pins ([`host_id_of_certificate`], kept for
+/// authentication and the RIFL completion origin so a forwarded write stays exactly-once across a restart);
+/// the **generation** (the anchor's `SUP_GENERATION`, incremented at every daemon start) makes the id change
+/// per boot, so a restarted node is a **new member** whose old id's objects are taken over by neighbours —
+/// rather than rejoining as its old self and contending for objects the group is already reassigning. A peer
+/// recomputes and verifies this id from the certificate it authenticated and the generation the node
+/// announces, so it needs no registry (D-14). Generation 0 (a first boot, or an anchorless solo laptop) is
+/// the degenerate: one member id for the life of the process, the same on every node (R8).
+pub fn member_id(certificate: &CertificateDer<'_>, generation: u64) -> HostId {
+  let mut hasher = blake3::Hasher::new();
+  hasher.update(certificate.as_ref());
+  hasher.update(&generation.to_le_bytes());
+  let bytes = *hasher.finalize().as_bytes();
+  HostId(u64::from_le_bytes([
+    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+  ]))
+}
+
 /// The port a node with base port `base` serves `plane` on (`base` for probes, `base + 1` for records),
 /// or the overflow when it runs past `u16`.
 pub fn serve_port(base: u16, plane: Plane) -> Option<u16> {
@@ -389,6 +409,40 @@ mod tests {
       cert.der().clone(),
       PrivateKeyDer::try_from(key.serialize_der()).expect("a PKCS#8 key"),
     )
+  }
+
+  /// AC (§4.8 "Recovery", task #22 — the ephemeral member id): a node's member id changes with the daemon
+  /// generation, so a restart (a higher generation) is a **new member** (a join), while the certificate —
+  /// the stable anchor peers pin for auth and the RIFL completion origin — is unchanged. Two generations of
+  /// one certificate give two distinct ids; the member id is distinct from the stable cert anchor (the
+  /// two-id split); distinct certificates give distinct ids at one generation; and generation 0 (the solo /
+  /// first-boot degenerate) is deterministic.
+  #[test]
+  fn the_member_id_is_ephemeral_per_generation_over_a_stable_certificate() {
+    let (cert_a, _) = mint();
+    let (cert_b, _) = mint();
+
+    let boot0 = member_id(&cert_a, 0);
+    let boot1 = member_id(&cert_a, 1);
+    assert_ne!(
+      boot0, boot1,
+      "a higher generation is a new member id (a restart is a join)"
+    );
+    assert_ne!(
+      boot0,
+      host_id_of_certificate(&cert_a),
+      "the ephemeral member id is distinct from the stable cert anchor (auth + the RIFL origin)"
+    );
+    assert_ne!(
+      member_id(&cert_a, 0),
+      member_id(&cert_b, 0),
+      "distinct certificates give distinct member ids"
+    );
+    assert_eq!(
+      member_id(&cert_a, 0),
+      boot0,
+      "generation 0 is deterministic (the solo / first-boot degenerate)"
+    );
   }
 
   fn entry(node: &str, port: u16, certificate: CertificateDer<'static>) -> FleetNodeEntry {
