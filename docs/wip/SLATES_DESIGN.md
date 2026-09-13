@@ -1635,6 +1635,16 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 > fresh stream id per exchange (RFC 9000 §2.1) also stays owed: the id doubles as the server's dispatch
 > kind, the SWIM re-send compensates, and no repro of the reuse collision could be built on the simulated
 > fabric. Both are recorded in the ledger with their mechanism.
+> Same day: the durability policy now gates writes. `DurabilityBound::shortfall` answers
+> `within_loss_bound(ε, F)` with its numbers at every configuration install (boot, council commit,
+> cross-shard fan — every shard measures, one change counts once), and `verbs::dispatch` refuses a create,
+> clone, snapshot or green advance `DurabilityUnmet` with the measured coincident loss, the accepted ε and
+> the failure count while the committed configuration's loss is above ε; the gate sits after the
+> completion-record lookup so exactly-once holds across a breach, reads and destroys continue, and `f = 0`
+> is never short (a single copy has no coincident loss). Found and fixed on the way: a local client's
+> acknowledgement pruned its completion window under the ephemeral member id while records are keyed on
+> the stable anchor. Records: `docs/bugs/2026-09-13-durability-refusal.md`,
+> `docs/bugs/2026-09-13-acknowledge-prunes-under-the-ephemeral-id.md`.
 
 **Role.** The authoritative record of volumes, snapshots, lineage, leases, attachments,
 accounting, completion records, grants, chains and the operation log; served locally in
