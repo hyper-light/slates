@@ -1077,10 +1077,23 @@ fn init_shard(
   // fleet node's is the member id its manifest derives from its certificate (`crate::deploy`), so it is
   // the id its peers know it by; a laptop (no fleet) takes the machine identity's hash, stable across
   // restarts and distinct per machine. One host, `f = 0`, on a laptop.
-  let host = config
-    .fleet
-    .as_ref()
-    .map_or_else(|| slates_db::HostId(host_id_of(identity)), |m| m.host);
+  // This node's two identities (§4.8 "Recovery"; task #22). The **stable cert-anchor** — derived from the
+  // certificate, unchanged across restarts — keys a client's completion record, so a retry meets its record
+  // even after the daemon restarts (exactly-once survives). The **ephemeral member id** folds in the anchor's
+  // generation (incremented at every daemon start, `SUP_GENERATION`), so a restart holds a new id and is a new
+  // member whose old objects the group takes over; generation 0 (a first boot, or a fresh test segment)
+  // reproduces the manifest's precomputed gen-0 seed, so a fresh fleet forms with no exchange. A laptop uses
+  // the same derivations over its own identity (R8). `config.fleet.host` is that gen-0 seed and is ignored
+  // here in favour of this node's real generation.
+  let origin_anchor = config.fleet.as_ref().map_or_else(
+    || slates_db::HostId(host_id_of(identity)),
+    |m| m.origin_anchor,
+  );
+  let generation = segment
+    .supervision()
+    .map(|supervision| supervision.generation())
+    .unwrap_or(0);
+  let host = crate::deploy::member_id(origin_anchor, generation);
   // The owner runtime this node takes part in a region as (§4.8, boot step 6): membership + the
   // configuration group + the owner's acceptor, composed by `slates-cluster`. Built from the configured
   // fleet membership (its quorum and peers) when the operator deploys a fleet, or the laptop `f = 0`
@@ -1183,6 +1196,7 @@ fn init_shard(
     content_range,
     db,
     fleet,
+    origin_anchor,
     landing: crate::landing::LandingState::default(),
     store,
     volumes: Slab::new(config.caps.segment_slots, config.caps.volumes),

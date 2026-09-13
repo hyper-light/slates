@@ -191,18 +191,20 @@ pub fn host_id_of_certificate(certificate: &CertificateDer<'_>) -> HostId {
 }
 
 /// A node's **ephemeral member id** for the boot with daemon `generation`: the leading eight bytes of
-/// `BLAKE3(cert DER ‖ generation)` (§4.8 "Recovery": *"the node rejoins with a new ephemeral id — a restart
-/// is a join"*). The certificate is the stable anchor every peer pins ([`host_id_of_certificate`], kept for
-/// authentication and the RIFL completion origin so a forwarded write stays exactly-once across a restart);
-/// the **generation** (the anchor's `SUP_GENERATION`, incremented at every daemon start) makes the id change
-/// per boot, so a restarted node is a **new member** whose old id's objects are taken over by neighbours —
-/// rather than rejoining as its old self and contending for objects the group is already reassigning. A peer
-/// recomputes and verifies this id from the certificate it authenticated and the generation the node
-/// announces, so it needs no registry (D-14). Generation 0 (a first boot, or an anchorless solo laptop) is
-/// the degenerate: one member id for the life of the process, the same on every node (R8).
-pub fn member_id(certificate: &CertificateDer<'_>, generation: u64) -> HostId {
+/// `BLAKE3(anchor ‖ generation)` (§4.8 "Recovery": *"the node rejoins with a new ephemeral id — a restart is a
+/// join"*). The **anchor** is the node's stable identity — `host_id_of_certificate` of the certificate its
+/// peers pin (a fleet), or the machine-identity hash (a laptop, `daemon::host_id_of`) — the thing that does
+/// not change across a restart, kept for authentication and the RIFL completion origin so a forwarded write
+/// stays exactly-once across a restart. The **generation** (the anchor segment's `SUP_GENERATION`, incremented
+/// at every daemon start) makes the id change per boot, so a restarted node is a **new member** whose old id's
+/// objects are taken over by neighbours — rather than rejoining as its old self and contending for objects the
+/// group is already reassigning. A peer recomputes this id from the anchor it authenticated (the certificate)
+/// and the generation the node announces, so it needs no registry (D-14). Generation 0 (a first boot, or a
+/// fresh segment) is the precomputable seed the manifest carries, so a fresh fleet forms with no exchange, and
+/// on a laptop it is one member id for the life of the process (R8).
+pub fn member_id(anchor: HostId, generation: u64) -> HostId {
   let mut hasher = blake3::Hasher::new();
-  hasher.update(certificate.as_ref());
+  hasher.update(&anchor.0.to_le_bytes());
   hasher.update(&generation.to_le_bytes());
   let bytes = *hasher.finalize().as_bytes();
   HostId(u64::from_le_bytes([
@@ -311,7 +313,13 @@ pub fn plan(
 ) -> Result<FleetPlan, DeployError> {
   let this = validate(manifest, node)?;
   let entry = &manifest.nodes[this];
-  let host = host_id_of_certificate(&entry.certificate);
+  // The membership is seeded with each node's **generation-0 member id** — the id it holds on a first boot,
+  // precomputable from the certificate the manifest carries, so a fresh fleet forms with no exchange (§4.8).
+  // A node that has restarted holds a higher-generation id ([`member_id`]); the daemon overrides its own
+  // `host` with its anchor generation, and a peer's current id is learned on contact (task #22). The
+  // certificate stays the stable anchor for auth and the RIFL origin (`host_id_of_certificate`).
+  let origin_anchor = host_id_of_certificate(&entry.certificate);
+  let host = member_id(origin_anchor, 0);
   let overflow = |node: &FleetNodeEntry| DeployError::PortBlockOverflows {
     node: node.node.clone(),
     base: node.address.port(),
@@ -335,7 +343,7 @@ pub fn plan(
     ) else {
       return Err(overflow(peer));
     };
-    let peer_host = host_id_of_certificate(&peer.certificate);
+    let peer_host = member_id(host_id_of_certificate(&peer.certificate), 0);
     peer_hosts.push(peer_host);
     peers.push(FleetPeer {
       host: peer_host,
@@ -352,7 +360,7 @@ pub fn plan(
     .iter()
     .filter_map(|n| {
       n.domain
-        .map(|domain| (host_id_of_certificate(&n.certificate), domain))
+        .map(|domain| (member_id(host_id_of_certificate(&n.certificate), 0), domain))
     })
     .collect();
   // The fleet's region map: every node that declares one, keyed by member id. A node without a declaration
@@ -363,7 +371,7 @@ pub fn plan(
     .iter()
     .filter_map(|n| {
       n.region
-        .map(|region| (host_id_of_certificate(&n.certificate), region))
+        .map(|region| (member_id(host_id_of_certificate(&n.certificate), 0), region))
     })
     .collect();
   let identity = Identity::from_der(entry.certificate.clone(), key);
@@ -374,6 +382,7 @@ pub fn plan(
       quorum: manifest.quorum,
       peers: peer_hosts,
       host,
+      origin_anchor,
       domains,
       regions,
       durability: manifest.durability,
@@ -421,27 +430,28 @@ mod tests {
   fn the_member_id_is_ephemeral_per_generation_over_a_stable_certificate() {
     let (cert_a, _) = mint();
     let (cert_b, _) = mint();
+    let anchor_a = host_id_of_certificate(&cert_a);
+    let anchor_b = host_id_of_certificate(&cert_b);
 
-    let boot0 = member_id(&cert_a, 0);
-    let boot1 = member_id(&cert_a, 1);
+    let boot0 = member_id(anchor_a, 0);
+    let boot1 = member_id(anchor_a, 1);
     assert_ne!(
       boot0, boot1,
       "a higher generation is a new member id (a restart is a join)"
     );
     assert_ne!(
-      boot0,
-      host_id_of_certificate(&cert_a),
+      boot0, anchor_a,
       "the ephemeral member id is distinct from the stable cert anchor (auth + the RIFL origin)"
     );
     assert_ne!(
-      member_id(&cert_a, 0),
-      member_id(&cert_b, 0),
-      "distinct certificates give distinct member ids"
+      member_id(anchor_a, 0),
+      member_id(anchor_b, 0),
+      "distinct anchors give distinct member ids"
     );
     assert_eq!(
-      member_id(&cert_a, 0),
+      member_id(anchor_a, 0),
       boot0,
-      "generation 0 is deterministic (the solo / first-boot degenerate)"
+      "generation 0 is deterministic (the precomputable seed / laptop degenerate)"
     );
   }
 
@@ -495,7 +505,7 @@ mod tests {
     manifest
       .nodes
       .iter()
-      .position(|n| host_id_of_certificate(&n.certificate) == host)
+      .position(|n| member_id(host_id_of_certificate(&n.certificate), 0) == host)
       .expect("the host is a manifest node")
   }
 
@@ -509,9 +519,9 @@ mod tests {
     manifest.nodes[0].domain = Some(7);
     manifest.nodes[1].domain = Some(7);
     let plan = plan(&manifest, "a", key_of(&keys, "a")).expect("a valid plan");
-    let a = host_id_of_certificate(&manifest.nodes[0].certificate);
-    let b = host_id_of_certificate(&manifest.nodes[1].certificate);
-    let c = host_id_of_certificate(&manifest.nodes[2].certificate);
+    let a = member_id(host_id_of_certificate(&manifest.nodes[0].certificate), 0);
+    let b = member_id(host_id_of_certificate(&manifest.nodes[1].certificate), 0);
+    let c = member_id(host_id_of_certificate(&manifest.nodes[2].certificate), 0);
     assert_eq!(
       plan.membership.domains.get(&a),
       Some(&7),
@@ -539,9 +549,9 @@ mod tests {
     manifest.nodes[0].region = Some(RegionId(1));
     manifest.nodes[1].region = Some(RegionId(1));
     let plan = plan(&manifest, "a", key_of(&keys, "a")).expect("a valid plan");
-    let a = host_id_of_certificate(&manifest.nodes[0].certificate);
-    let b = host_id_of_certificate(&manifest.nodes[1].certificate);
-    let c = host_id_of_certificate(&manifest.nodes[2].certificate);
+    let a = member_id(host_id_of_certificate(&manifest.nodes[0].certificate), 0);
+    let b = member_id(host_id_of_certificate(&manifest.nodes[1].certificate), 0);
+    let c = member_id(host_id_of_certificate(&manifest.nodes[2].certificate), 0);
     assert_eq!(
       plan.membership.regions.get(&a),
       Some(&RegionId(1)),
@@ -570,7 +580,7 @@ mod tests {
       .map(|node| plan(&manifest, node, key_of(&keys, node)).expect("a plan"))
       .collect();
     for (i, mine) in plans.iter().enumerate() {
-      let my_host = host_id_of_certificate(&manifest.nodes[i].certificate);
+      let my_host = member_id(host_id_of_certificate(&manifest.nodes[i].certificate), 0);
       assert_eq!(mine.membership.host, my_host);
       assert_eq!(mine.membership.peers.len(), 2);
       assert!(!mine.membership.peers.contains(&my_host));
@@ -595,7 +605,7 @@ mod tests {
     let a = plan(&manifest, "a", key_of(&keys, "a")).expect("a plan");
     assert_eq!(a.transport.probe_bind.port(), 40_000);
     assert_eq!(a.transport.record_bind.port(), 40_001);
-    let b_host = host_id_of_certificate(&manifest.nodes[1].certificate);
+    let b_host = member_id(host_id_of_certificate(&manifest.nodes[1].certificate), 0);
     let to_b = a
       .transport
       .peers

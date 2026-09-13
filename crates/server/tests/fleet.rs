@@ -31,6 +31,7 @@ use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 use slates_server::daemon::host_id_of;
+use slates_server::deploy::member_id;
 use slates_server::head::HeadValue;
 use slates_server::{
   Daemon, DaemonConfig, FleetMembership, FleetPeer, FleetTransport, SegmentSource,
@@ -159,7 +160,12 @@ fn four_free_ports() -> [u16; 4] {
 /// and its two advertised addresses (probe and record).
 struct Node {
   profile: MachineProfile,
+  /// This node's generation-0 member id (`member_id(origin_anchor, 0)`) — what the daemon computes for
+  /// itself on a fresh (generation-0) test segment, and what its peers seed it as (task #22).
   host: HostId,
+  /// This node's stable anchor (`HostId(host_id_of(machine identity))`) — the daemon derives its runtime
+  /// member id `member_id(origin_anchor, generation)` from it and keys completion records on it.
+  origin_anchor: HostId,
   identity: Identity,
   address: SocketAddrV4,
   record_address: SocketAddrV4,
@@ -175,9 +181,13 @@ fn unique() -> u64 {
 fn node(name: &str, probe_port: u16, record_port: u16) -> Node {
   let mut profile = profile(name);
   profile.facts.identity.cpu = format!("{}-{}", profile.facts.identity.cpu, unique());
-  let host = HostId(host_id_of(&profile.facts.identity));
+  // The stable anchor is the machine-identity hash (a laptop's anchor); the member id folds in generation 0
+  // (a fresh test segment), matching what the daemon computes for itself and what peers seed it as (task #22).
+  let origin_anchor = HostId(host_id_of(&profile.facts.identity));
+  let host = member_id(origin_anchor, 0);
   Node {
     host,
+    origin_anchor,
     identity: self_signed(),
     address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, probe_port),
     record_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, record_port),
@@ -210,6 +220,7 @@ fn start_sharded(this: Node, peer: Peer, shards: u16) -> Daemon {
       quorum: Quorum { f: 1 },
       peers: vec![peer.host],
       host: this.host,
+      origin_anchor: this.origin_anchor,
       domains: std::collections::BTreeMap::new(),
       regions: std::collections::BTreeMap::new(),
       durability: None,
@@ -430,8 +441,17 @@ fn free_ports(count: usize) -> Vec<u16> {
 fn fleet_node(name: &str) -> (MachineProfile, HostId, Identity) {
   let mut profile = profile(name);
   profile.facts.identity.cpu = format!("{}-{}", profile.facts.identity.cpu, unique());
-  let host = HostId(host_id_of(&profile.facts.identity));
+  // The returned `HostId` is the generation-0 **member id** (`member_id(anchor, 0)`), what the daemon computes
+  // for itself on a fresh test segment; the stable anchor is recomputed from the profile where a
+  // `FleetMembership`'s `origin_anchor` needs it ([`anchor_of`]) (task #22).
+  let host = member_id(anchor_of(&profile), 0);
   (profile, host, self_signed())
+}
+
+/// The stable anchor of a test node — the machine-identity hash the daemon uses as a laptop's anchor and from
+/// which it derives its runtime member id `member_id(origin_anchor, generation)` (task #22).
+fn anchor_of(profile: &MachineProfile) -> HostId {
+  HostId(host_id_of(&profile.facts.identity))
 }
 
 fn loopback(port: u16) -> SocketAddrV4 {
@@ -559,6 +579,7 @@ fn start_mesh_with(
           quorum: Quorum { f },
           peers: member_peers,
           host,
+          origin_anchor: anchor_of(&profile),
           domains: std::collections::BTreeMap::new(),
           regions: regions.clone(),
           durability: None,

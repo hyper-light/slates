@@ -100,12 +100,17 @@ pub struct FleetMembership {
   /// The peer hosts this node's neighbourhood is drawn from, believed alive at boot; SWIM refines the
   /// live set from here. This host is always a member and is never listed among its own peers.
   pub peers: Vec<HostId>,
-  /// This node's own member id — the id its peers know it by, so a recorded holder set names this node
-  /// the way every other node names it. A deployed node derives it from its certificate
-  /// (`crate::deploy::host_id_of_certificate`, the same derivation its peers apply to the certificate
-  /// they pin); a laptop has no fleet membership and takes its machine identity's hash instead
-  /// (`init_shard`).
+  /// This node's own **generation-0 seed** member id — the id its peers know it by on a first boot, so a
+  /// recorded holder set names this node the way every other node names it. `member_id(origin_anchor, 0)`
+  /// (`crate::deploy`): the precomputable seed a fresh fleet forms on with no exchange. The daemon's *runtime*
+  /// member id folds in its real generation (`init_shard`), so a restart holds a higher-generation id and is a
+  /// new member (task #22); this seeded value is what peers assume until they learn its current id on contact.
   pub host: HostId,
+  /// This node's **stable cert-anchor** — `deploy::host_id_of_certificate` of its own certificate (a laptop
+  /// uses its machine-identity hash). Unchanged across restarts, unlike the ephemeral member id. The daemon
+  /// derives its runtime member id `member_id(origin_anchor, generation)` from it, and keys a client's
+  /// completion record on it so a retry meets its record after a restart (§4.8; task #22 two-id model).
+  pub origin_anchor: HostId,
   /// Each fleet member's failure domain (from the manifest), so placement forms copysets across distinct
   /// domains (D-14). A host absent from the map is its own domain (unique-per-host) — the default when the
   /// deployment declares none. Installed into the configuration group at boot (`init_shard`).

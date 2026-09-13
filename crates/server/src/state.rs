@@ -103,6 +103,14 @@ pub struct ShardState {
   /// what the fleet has actually committed; the live probe/gossip loop that drives `observe` and the
   /// cross-node commit run in `crate::fleet` on the control shard.
   pub fleet: slates_cluster::fleet::FleetNode,
+  /// This node's **stable cert-anchor** — `deploy::host_id_of_certificate` of its own certificate, the id that
+  /// does **not** change across a restart (§4.8; task #22 two-id model). Distinct from `fleet.host()`, which
+  /// is the **ephemeral** member id (per boot, so a restart is a new member). The anchor keys a client's
+  /// **completion record** (the RIFL origin's high half), so a retry meets its record across a daemon restart —
+  /// exactly-once survives the ephemeral id changing. Ownership, rendezvous and `ObjectId::creator` use the
+  /// ephemeral `fleet.host()`; only the completion origin uses this. On a laptop it is the identity's own
+  /// cert anchor, stable per machine (R8).
+  pub origin_anchor: slates_db::HostId,
   /// The regional configuration council (§4.8, D-14 — the "configuration master"): the multi-voter Raft the
   /// control shard's config plane drives over the transport to agree on the region's configuration
   /// (`crate::fleet::run_config_council`). A laptop runs a solo council that self-leads (R8). Only the

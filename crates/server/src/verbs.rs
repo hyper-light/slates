@@ -547,12 +547,13 @@ fn forward_to_owner(
     return Served::Reply(refused(Refusal::NotFound));
   };
   let origin = state.shard;
-  // Relay the client's acknowledgement watermark (this node's own-host window for the client) so the owner
-  // prunes the forwarded completions the same way this node's acknowledgements prune the local ones.
+  // Relay the client's acknowledgement watermark (this node's own-anchor window for the client) so the owner
+  // prunes the forwarded completions the same way this node's acknowledgements prune the local ones. Keyed on
+  // the stable cert-anchor — the same id the local completion record uses (task #22) — not the ephemeral id.
   let ack_up_to = state
     .db
     .partition()
-    .acknowledged_up_to(state.fleet.host().0, RequestId::from_word(request).client);
+    .acknowledged_up_to(state.origin_anchor.0, RequestId::from_word(request).client);
   let request_bytes = encode_body(&ForwardedRequest {
     principal,
     body,
@@ -625,9 +626,11 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     Err(_) => return Served::Reply(refused(Refusal::NotFound)),
   };
   let id = RequestId::from_word(request.request);
-  // A local client's completion key is this node's own host (the globally-unique key's high half); a
-  // forwarded verb keys on its authenticated origin instead (see `record_completion`, `serve_forward`).
-  let origin = state.fleet.host().0;
+  // A local client's completion key is this node's **stable cert-anchor** (the globally-unique key's high
+  // half) — not the ephemeral member id, so a retry meets its completion record across a daemon restart (the
+  // member id changes per boot; the anchor does not — task #22). A forwarded verb keys on its authenticated
+  // origin's anchor instead (see `record_completion`, `serve_forward`).
+  let origin = state.origin_anchor.0;
   match state
     .db
     .partition()
@@ -937,8 +940,9 @@ fn send_forward(
       let id = RequestId::from_word(request);
       let reply = crate::state::with_state(|s| {
         s.last_work_ns = s.clock.monotonic_ns();
-        // A same-node cross-shard forward serves a local client, so its completion keys on this node's host.
-        let origin = s.fleet.host().0;
+        // A same-node cross-shard forward serves a local client, so its completion keys on this node's stable
+        // cert-anchor (the same id the local `serve` path uses — task #22), not the ephemeral member id.
+        let origin = s.origin_anchor.0;
         run_forwarded(s, origin, id, client_id, &principal, body)
       })
       .unwrap_or_else(|| refused(Refusal::NotFound));

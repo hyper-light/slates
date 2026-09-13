@@ -796,11 +796,15 @@ async fn serve_peer_records(
   if endpoint.establish().await.is_err() {
     return;
   }
-  let Some(peer_host) = endpoint.peer_certificate().and_then(|presented| {
+  // Two ids for the authenticated peer (task #22 two-id model): `peer_host` is its **ephemeral** member id
+  // (from the roster — records and ownership key on it), and `peer_anchor` its **stable** cert-anchor
+  // (`host_id_of_certificate` of the very certificate it presented — the RIFL completion origin keys on it, so
+  // a forwarded write stays exactly-once across the forwarding node's restart).
+  let Some((peer_host, peer_anchor)) = endpoint.peer_certificate().and_then(|presented| {
     roster
       .iter()
       .find(|(certificate, _)| *certificate == presented)
-      .map(|(_, host)| *host)
+      .map(|(_, host)| (*host, crate::deploy::host_id_of_certificate(&presented)))
   }) else {
     count_refusal(ACCEPT_REFUSED);
     return;
@@ -840,7 +844,7 @@ async fn serve_peer_records(
           ROOT_FETCH_STREAM => {
             state::with_state(|s| serve_root_fetch(s, &request)).unwrap_or_default()
           }
-          FORWARD_STREAM => verbs::serve_forward(control, peer_host, &request).await,
+          FORWARD_STREAM => verbs::serve_forward(control, peer_anchor, &request).await,
           _ => Vec::new(),
         }
       })
