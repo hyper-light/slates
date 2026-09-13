@@ -103,6 +103,14 @@ pub struct ShardState {
   /// what the fleet has actually committed; the live probe/gossip loop that drives `observe` and the
   /// cross-node commit run in `crate::fleet` on the control shard.
   pub fleet: slates_cluster::fleet::FleetNode,
+  /// The durability the installed configuration **cannot** hold to the operator's declared policy (§4.8
+  /// "Placement" — the policy "that gates a refusal"): the measured shortfall, or `None` when the
+  /// configuration is within the accepted loss or no policy is declared (the default, and every laptop —
+  /// a single copy has no coincident loss, so `f = 0` is never short, R8). Measured at every configuration
+  /// install — boot, a council commit, the cross-shard fan — by `DurabilityBound::shortfall`, and read per
+  /// write by the verbs as a field (`verbs::dispatch` refuses a write that would commit a new head or seal
+  /// `DurabilityUnmet` with these numbers), never recomputed on the write path.
+  pub durability_shortfall: Option<crate::config::DurabilityShortfall>,
   /// This node's **stable cert-anchor** — `deploy::host_id_of_certificate` of its own certificate, the id that
   /// does **not** change across a restart (§4.8; task #22 two-id model). Distinct from `fleet.host()`, which
   /// is the **ephemeral** member id (per boot, so a restart is a new member). The anchor keys a client's

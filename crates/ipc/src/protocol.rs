@@ -699,8 +699,9 @@ pub struct AuditEntry {
   pub outcome: Option<String>,
 }
 
-/// The closed refusal taxonomy on the wire (§4.4, §4.13).
-#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+/// The closed refusal taxonomy on the wire (§4.4, §4.13). (`Eq` is not derived because the durability
+/// refusal carries the measured loss probabilities, which are floating point.)
+#[derive(Wire, Clone, Debug, PartialEq)]
 pub enum Refusal {
   /// Not found.
   NotFound,
@@ -801,10 +802,26 @@ pub enum Refusal {
   /// A region-loss promotion (`PromoteRegion`) was issued on a node that is not the root leader, so it cannot
   /// propose the change (§4.8, D-14). The operator re-issues it on the root leader (`status` names it).
   NotRootLeader,
+  /// The write would commit a new head or seal that the fleet's committed configuration cannot hold to the
+  /// operator's declared durability (§4.8 "Placement" — "the operator's accepted ε and the coincident-failure
+  /// size are the durability policy that gates a refusal"; D-14, D-18): under a coincident failure of
+  /// `coincident_failures` hosts the configuration's copysets lose data with probability `coincident_loss`,
+  /// above the accepted `accepted_loss` (the operator's ε). Measured at the configuration change that
+  /// installed the configuration, never per write; the resolution is the operator's — more copies, more
+  /// re-replication bandwidth, tighter failure domains, or a policy that accepts the loss — never a silent
+  /// degrade. Reads, destroys, resizes and status continue.
+  DurabilityUnmet {
+    /// The configuration's measured coincident-loss probability under the policy's failure count.
+    coincident_loss: f64,
+    /// The loss probability the operator's policy accepts (its ε).
+    accepted_loss: f64,
+    /// The number of hosts the policy assumes fail at once.
+    coincident_failures: u64,
+  },
 }
 
-/// A reply body.
-#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+/// A reply body. (`Eq` is not derived: a [`Refusal`] may carry measured probabilities.)
+#[derive(Wire, Clone, Debug, PartialEq)]
 pub enum ReplyBody {
   /// Created.
   Created {
