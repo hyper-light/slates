@@ -130,9 +130,11 @@ pub struct RegionalCouncil {
   configuration: RegionalConfiguration,
   applied: u64,
   scatter: u64,
-  /// Monotone count of appends this node has answered from a leader — the drive loop's election timer reads
-  /// it: while it advances, a leader is alive and this node does not campaign; once it stalls for the
-  /// election timeout, the leader is presumed gone and a pre-election begins.
+  /// Monotone count of the events that defer this node's own election — a leader's append answered here, or a
+  /// vote this node granted a candidate (Raft Figure 2's two follower timer-resets). The drive loop's election
+  /// timer reads it: while it advances, either a leader is alive or a candidate this node backed is still
+  /// contesting the election, so this node does not campaign; once it stalls for the election timeout, contact
+  /// is presumed lost and a pre-election begins.
   leader_contact: u64,
 }
 
@@ -215,12 +217,31 @@ impl RegionalCouncil {
     match request {
       RaftMessage::PreVote(pre) => Some(RaftMessage::PreVoteReply(self.raft.on_pre_vote(pre))),
       RaftMessage::RequestVote(vote) => {
-        Some(RaftMessage::VoteReply(self.raft.on_request_vote(vote)))
+        let reply = self.raft.on_request_vote(vote);
+        if reply.granted {
+          // Granting a vote defers this node's own election (Raft §5.2, Figure 2 "Rules for Servers →
+          // Followers": the election timer resets on *granting a vote* as well as on a current leader's
+          // append). So the candidate this node just voted for has a full election timeout to win and send
+          // its first heartbeat before this node would campaign in competition. Without this reset a fleet
+          // livelocks under heavy CPU load: a newly elected leader is slow to send its first append (its
+          // coordinator loop is starved for the core), the voters that elected it keep aging out and campaign
+          // against it, and leadership never settles (docs/bugs/2026-09-13-election-timer-not-reset-on-vote-grant.md).
+          self.leader_contact = self.leader_contact.saturating_add(1);
+        }
+        Some(RaftMessage::VoteReply(reply))
       }
       RaftMessage::AppendEntries(append) => {
+        let append_term = append.term;
         let reply = self.raft.on_append_entries(append);
-        if reply.success {
-          // A valid append from the current leader is a heartbeat — reset the election timer.
+        // Any append from a current-or-newer-term leader is contact from the leader — reset the election timer
+        // (Raft §5.2, Figure 2 "Followers": the timer resets on *receiving AppendEntries from the current
+        // leader"). This holds even when the log-consistency check rejects the append (`reply.success == false`
+        // while the follower is still catching its log up): the leader is live and this node must not campaign
+        // against it — `on_append_entries` has already set `has_leader`, so this node also refuses others'
+        // pre-votes, and gating the timer on `success` instead would leave it aging while it defends the leader,
+        // campaigning uselessly (its own pre-vote refused by that leader) until it catches up. A stale-term
+        // append (`append_term < reply.term`, from a deposed leader) is not contact and does not reset.
+        if append_term >= reply.term {
           self.leader_contact = self.leader_contact.saturating_add(1);
         }
         self.apply_committed();
@@ -493,6 +514,80 @@ mod tests {
     assert!(
       leader.configuration().configuration_for(B).is_some(),
       "the admitted member now has a placement view derived from the regional configuration"
+    );
+  }
+
+  /// AC (§4.8, D-14 — Raft Figure 2's follower timer-resets): **granting a real vote** advances the voter's
+  /// leader-contact signal, so the drive loop's election timer resets and the voter defers its own campaign a
+  /// full timeout — the candidate it just backed gets time to win and send its first heartbeat instead of
+  /// being campaigned against (docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md, sibling
+  /// fixes). By use: after the election the follower has granted a real vote but answered no append yet, and
+  /// its contact has advanced; the leader's first heartbeat then advances it again.
+  #[test]
+  fn granting_a_vote_defers_the_voters_own_election() {
+    let mut leader = council(OWNER);
+    let mut follower = council(A);
+    assert_eq!(
+      follower.leader_contact(),
+      0,
+      "no contact before any election"
+    );
+    elect(&mut leader, &mut follower);
+    assert!(leader.is_leader());
+    let after_vote = follower.leader_contact();
+    assert!(
+      after_vote > 0,
+      "granting the real vote advanced the follower's contact — the drive loop defers its campaign"
+    );
+    replicate(&mut leader, &mut follower, 1);
+    assert!(
+      follower.leader_contact() > after_vote,
+      "the leader's first heartbeat advances it again"
+    );
+  }
+
+  /// AC (§4.8, D-14 — Raft Figure 2's follower timer-resets): an append from the **current** leader resets the
+  /// election timer **even when the log-consistency check rejects it** — a follower still catching its log up
+  /// has a live leader and must not campaign against it (the previous `success`-only gate left it aging while
+  /// it defended that very leader). A stale-term append is not contact and does not reset. By use: a
+  /// current-term append naming a previous entry the follower does not hold is answered `success: false`,
+  /// yet the contact signal advances; an append at a stale term is refused without advancing it.
+  #[test]
+  fn a_current_leaders_rejected_append_still_resets_the_election_timer() {
+    let mut leader = council(OWNER);
+    let mut follower = council(A);
+    elect(&mut leader, &mut follower);
+    let before = follower.leader_contact();
+    // Name a previous entry the follower cannot hold: rejected by the consistency check, yet live contact.
+    let mut rejected = leader
+      .replication_for(A)
+      .expect("the leader owes its follower a heartbeat");
+    rejected.prev_log_index = rejected.prev_log_index.saturating_add(10);
+    rejected.prev_log_term = rejected.prev_log_term.saturating_add(1);
+    let reply = follower.answer(RaftMessage::AppendEntries(rejected));
+    assert!(
+      matches!(reply, Some(RaftMessage::AppendReply(ref r)) if !r.success),
+      "the append was rejected by the log-consistency check"
+    );
+    let after_rejected = follower.leader_contact();
+    assert!(
+      after_rejected > before,
+      "a rejected current-term append is still leader contact — the election timer resets"
+    );
+    // A stale-term append (a deposed leader's) is refused and is not contact.
+    let mut stale = leader
+      .replication_for(A)
+      .expect("the leader owes its follower a heartbeat");
+    stale.term = 0;
+    let reply = follower.answer(RaftMessage::AppendEntries(stale));
+    assert!(
+      matches!(reply, Some(RaftMessage::AppendReply(ref r)) if !r.success),
+      "a stale-term append is refused"
+    );
+    assert_eq!(
+      follower.leader_contact(),
+      after_rejected,
+      "and it is not contact — the timer does not reset for a deposed leader"
     );
   }
 

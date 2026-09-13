@@ -86,7 +86,7 @@ use slates_cluster::raft_wire::{
 };
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once};
 use slates_cluster::{
-  ClusterError, CommitBudget, DispatchWait, PROMOTE_STREAM, RECORD_STREAM, Stragglers,
+  ClusterError, CommitBudget, DispatchWait, PROMOTE_STREAM, RECORD_STREAM, Reply, Stragglers,
   commit_record, promote_record, request_within,
 };
 use slates_db::Op;
@@ -150,7 +150,7 @@ const LOCAL_HEALTH_CAP: u32 = 2;
 /// Derived: how many times the collection loop polls for a reply within one protocol period — ten, so the
 /// loop wakes within a tenth of a period of the acknowledgement (10 ms at the default cadence) without
 /// spinning. A finer value measured from the RTT is the owed refinement.
-const POLL_PER_PERIOD: u64 = 10;
+pub(crate) const POLL_PER_PERIOD: u64 = 10;
 
 /// A fleet peer this node probes and is probed by (§4.8): its host id, the two addresses this node dials to
 /// reach it (its probe and record sockets), and the operator-provisioned certificate the mutual-TLS session
@@ -1312,7 +1312,12 @@ async fn put_seal_content(
       budget,
     )
     .await;
-    let dispatch = Dispatch::new(taken, &placed.reusable, placed.stragglers);
+    let dispatch = Dispatch::new(
+      taken,
+      &placed.reusable,
+      placed.stragglers,
+      LateReplies::Discard,
+    );
     return_sessions(placed.reusable);
     let placement = match placed.outcome {
       Ok(placement) => Some(placement),
@@ -1524,16 +1529,37 @@ fn count_refusal(kind: &'static str) {
   state::with_state(|s| *s.refusals.entry(kind).or_insert(0) += 1);
 }
 
-/// Keeps one candidate holder's client record session up for the coordinator (§4.8): a per-peer task that
-/// brings the session up on **one** socket — one handshake attempt per period, retried until the peer's
-/// pinned `accept` completes rather than a fresh-port re-dial being ignored — and installs it in the shard
-/// state ([`ShardState::record_sessions`]), where the coordinator borrows it for each dispatch. If the
-/// coordinator ever loses it (a borrow that ended without a return), the entry is gone and this task
-/// re-establishes on a fresh socket. Per peer — never in the coordinator — because a handshake attempt to a
-/// peer that is slow to come up is bounded but long (the retransmit ceiling), and in the coordinator it would
-/// stall every other peer's commits and every takeover behind one slow link. Ends when the peer is retired
-/// from the neighbourhood, dropping its session (a retired peer is never a candidate again under this
-/// configuration), so it is not an unbounded retry of a dead peer (banned item 8).
+/// Whether this node keeps a record session up to `peer` — the peers the coordinator ever borrows a session
+/// to ([`take_sessions`]): a **candidate holder** in this owner's bounded record neighbourhood (§4.8, D-14 —
+/// the copyset, `select_neighbourhood` at the scatter width, so at the candidate floor `2f + 1` an owner
+/// reaches just `2f` holders), a **voter of this region's configuration council**, or a **voter of the root
+/// group** across regions. The two consensus groups ride the same per-peer record session as the record
+/// plane (their streams multiplex on it), but their voter sets are *not* subsets of the copyset: a root voter
+/// is another region's representative, and a council voter need not be a candidate holder. Keeping sessions
+/// only to the copyset left a consensus voter outside it unreachable from this node for good — an election
+/// still succeeded through whichever voters happened to be in-copyset, and the first loss that removed them
+/// left a leader that could never again reach a majority (the root leader replicating to none of its live
+/// voters for 1,500 periods while its sole reachable voter was the one just killed;
+/// `docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md`). Both voter sets are small and bounded
+/// (one representative per region; an elected council), and a dead voter's link ends the moment its group
+/// commits its retirement — which reaching the surviving voters is exactly what makes possible.
+fn keeps_record_session_to(state: &ShardState, peer: HostId) -> bool {
+  state.fleet.configuration().neighbourhood.contains(&peer)
+    || state.council.is_voter(peer)
+    || state.root.is_voter(peer)
+}
+
+/// Keeps one peer's client record session up for the coordinator (§4.8) — a candidate holder's, or a
+/// consensus voter's ([`keeps_record_session_to`]): a per-peer task that brings the session up on **one**
+/// socket — one handshake attempt per period, retried until the peer's pinned `accept` completes rather than
+/// a fresh-port re-dial being ignored — and installs it in the shard state ([`ShardState::record_sessions`]),
+/// where the coordinator borrows it for each dispatch. If the coordinator ever loses it (a borrow that ended
+/// without a return), the entry is gone and this task re-establishes on a fresh socket. Per peer — never in
+/// the coordinator — because a handshake attempt to a peer that is slow to come up is bounded but long (the
+/// retransmit ceiling), and in the coordinator it would stall every other peer's commits and every takeover
+/// behind one slow link. Idles when the peer is retired from every set this node reaches it for — its
+/// neighbourhood and its consensus groups — dropping its session (a retired peer is never a candidate or a
+/// voter again under this configuration), so it is not an unbounded retry of a dead peer (banned item 8).
 async fn establish_record_link(identity: &'static Identity, dial: PeerDial) {
   let PeerDial {
     host: peer_host,
@@ -1543,8 +1569,7 @@ async fn establish_record_link(identity: &'static Identity, dial: PeerDial) {
   } = dial;
   let mut client: Option<Endpoint> = client_for(identity, &name, address, &certificate);
   loop {
-    let retired =
-      state::with_state(|s| !s.fleet.configuration().neighbourhood.contains(&peer_host));
+    let retired = state::with_state(|s| !keeps_record_session_to(s, peer_host));
     if retired == Some(true) {
       // The peer is retired. Drop its record session and **idle** — this task does not end, so if the peer
       // rejoins (its probe reaches this node's serve side, which re-admits it — [`serve_peer_probes`]) this
@@ -1572,18 +1597,51 @@ async fn establish_record_link(identity: &'static Identity, dial: PeerDial) {
 }
 
 /// A dispatch the coordinator made whose holders may still be in flight: the [`Stragglers`] to recover
-/// sessions from, and the holders borrowed for it that have not yet come back (each returns through the
-/// dispatch's `reusable` at its return, or through the stragglers later). Once the stragglers are spent, a
-/// holder still outstanding never returned its session: it is dropped from the shard state as lost, so its
-/// link task re-establishes it — a borrow that ended without a return is a loss by definition.
+/// sessions from, the holders borrowed for it that have not yet come back (each returns through the
+/// dispatch's `reusable` at its return, or through the stragglers later), and what a **late reply** means
+/// to this dispatch ([`LateReplies`]). Once the stragglers are spent, a holder still outstanding never
+/// returned its session: it is dropped from the shard state as lost, so its link task re-establishes it —
+/// a borrow that ended without a return is a loss by definition. Every fan-out the coordinator makes is one
+/// of these, settled at the top of each period: a record commit, a takeover promotion, a council or root
+/// replication or election round, a learner fetch. Bounded: the dispatches alive are at most the rounds a
+/// period makes times the periods a straggler may take, its request deadline
+/// ([`CommitBudget::max_deadline_ns`]).
 struct Dispatch {
   stragglers: Stragglers,
   outstanding: Vec<HostId>,
+  late: LateReplies,
+}
+
+/// What a dispatch does with a reply that arrives **after** its progress-aware stop ([`Dispatch::settle`]).
+/// The stop bounds how long a round *waits* (§4.8 "late work";
+/// `docs/bugs/2026-09-12-broadcast-waits-out-dead-voter.md`); it must not discard the *work* that then
+/// arrives, or a slow-but-live voter costs its acknowledgement every round — under sustained CPU starvation,
+/// forever, which is how an elected leader with its sessions intact still never committed
+/// (`docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md`).
+#[derive(Clone, Copy)]
+enum LateReplies {
+  /// A record commit or takeover promotion: the late reply is dropped — the round already resolved without
+  /// it, and the record re-ships to that holder next period, idempotently, over its recovered session.
+  Discard,
+  /// A configuration-council Raft round: fold a late vote or append reply into the council.
+  Council,
+  /// A root-group Raft round: fold a late vote or append reply into the root group.
+  Root,
+  /// A config learner's fetch: adopt a late, newer regional configuration.
+  ConfigFetch,
+  /// A root learner's fetch: adopt a late, newer root configuration.
+  RootFetch,
 }
 
 impl Dispatch {
-  /// Records a dispatch over the `taken` holders, of which `reusable` came back at its return.
-  fn new(taken: Vec<HostId>, reusable: &[(HostId, Endpoint)], stragglers: Stragglers) -> Self {
+  /// Records a dispatch over the `taken` holders, of which `reusable` came back at its return, and how a
+  /// reply that comes back later is treated.
+  fn new(
+    taken: Vec<HostId>,
+    reusable: &[(HostId, Endpoint)],
+    stragglers: Stragglers,
+    late: LateReplies,
+  ) -> Self {
     let outstanding = taken
       .into_iter()
       .filter(|host| !reusable.iter().any(|(returned, _)| returned == host))
@@ -1591,13 +1649,31 @@ impl Dispatch {
     Self {
       stragglers,
       outstanding,
+      late,
     }
   }
 
-  /// Recovers whatever stragglers have finished into the shard state; `true` once the dispatch is spent
-  /// (every straggler accounted for, any holder still outstanding marked lost) and can be dropped.
+  /// Recovers whatever stragglers have finished into the shard state — each late reply folded as
+  /// [`LateReplies`] directs, each session returned; `true` once the dispatch is spent (every straggler
+  /// accounted for, any holder still outstanding marked lost) and can be dropped.
   fn settle(&mut self) -> bool {
-    let (recovered, done) = self.stragglers.recover();
+    let late = self.late;
+    let (recovered, done) = match late {
+      LateReplies::Discard => self.stragglers.recover(),
+      _ => {
+        let (arrived, done) = self.stragglers.recover_replies();
+        let mut recovered = Vec::with_capacity(arrived.len());
+        let mut replies = Vec::new();
+        for (host, reply, endpoint) in arrived {
+          if !reply.is_empty() {
+            replies.push(reply);
+          }
+          recovered.push((host, endpoint));
+        }
+        fold_late_replies(late, &replies);
+        (recovered, done)
+      }
+    };
     self
       .outstanding
       .retain(|host| !recovered.iter().any(|(returned, _)| returned == host));
@@ -1611,6 +1687,48 @@ impl Dispatch {
       });
     }
     done
+  }
+}
+
+/// Folds a consensus or learner-fetch round's late replies as `late` directs (see [`LateReplies`]).
+fn fold_late_replies(late: LateReplies, replies: &[Vec<u8>]) {
+  state::with_state(|s| {
+    for bytes in replies {
+      match late {
+        LateReplies::Discard => {}
+        LateReplies::Council => {
+          if let Some(message) = late_raft_reply(bytes) {
+            s.council.fold_reply(message);
+          }
+        }
+        LateReplies::Root => {
+          if let Some(message) = late_raft_reply(bytes) {
+            s.root.fold_reply(message);
+          }
+        }
+        LateReplies::ConfigFetch => {
+          if let Ok(configuration) = decode_regional_configuration(bytes) {
+            s.council.adopt(configuration);
+          }
+        }
+        LateReplies::RootFetch => {
+          if let Ok(configuration) = decode_root_configuration(bytes) {
+            s.root.adopt(configuration);
+          }
+        }
+      }
+    }
+  });
+}
+
+/// A late Raft reply worth folding: a vote or an append reply, each of which folds with no follow-on
+/// message and is exactly the acknowledgement a slow voter would otherwise cost. A late **pre-vote** reply
+/// is dropped: completing a pre-election here would owe follow-on vote requests a settle cannot ship, and
+/// the next campaign simply re-runs its pre-vote.
+fn late_raft_reply(bytes: &[u8]) -> Option<RaftMessage> {
+  match RaftMessage::decode(bytes) {
+    Ok(RaftMessage::PreVoteReply(_)) | Err(_) => None,
+    Ok(message) => Some(message),
   }
 }
 
@@ -1666,6 +1784,10 @@ const FORWARD_STREAM: u64 = 11;
 /// this many periods without a leader's append presumes the leader gone and campaigns. The per-node spread
 /// ([`election_jitter`]) adds a further `[0, this)`, making the effective timeout uniform in `[this, 2·this)`
 /// — Raft's randomized-election-timeout range (§9.3), which keeps co-timed followers from splitting the vote.
+/// The design's absolute form, "election timeout ≥ 10 × broadcast RTT p99", is owed for a real WAN: measured
+/// here, both the SWIM probe RTT (p99 17 ms) and the consensus broadcast round-trip (p99 33 ms) stay far
+/// inside one heartbeat even under heavy CPU load, so a period-counted timeout derived from either sits at
+/// this floor and changes nothing on one host (docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md).
 /// Derived: ten is Raft's order-of-magnitude ratio of election timeout to heartbeat interval (Ongaro §9), so
 /// a live leader's per-period heartbeat refreshes contact well inside the window while a real leader loss is
 /// still detected within a bounded few periods.
@@ -1750,34 +1872,41 @@ fn serve_config_fetch(state: &ShardState, request: &[u8]) -> Vec<u8> {
   }
 }
 
-/// Ships each `(host, request)` to that host on [`CONFIG_STREAM`] over its borrowed record session,
-/// concurrently — one child task per session, each bounded by the dispatch deadline and handing its endpoint
-/// back whatever the outcome ([`request_within`]) — and returns every reply with its endpoint, so a slow or
-/// dead voter never serializes the reachable ones and no session is dropped. The council is small and
-/// near-silent, but a heartbeat to a dead follower must not delay the live ones, so the fan-out is the same
-/// concurrent, session-preserving shape as a record commit ([`commit_record`]). Each child is joined once
-/// terminal, so a per-period round never accumulates task slots (banned item 8).
+/// Ships each `(host, request)` to that host on `stream` over its borrowed record session, concurrently —
+/// one child task per session, each bounded by the dispatch deadline and handing its reply and endpoint
+/// back whatever the outcome ([`request_within`]) — and returns the replies that arrived before the round's
+/// progress-aware stop, each with its endpoint, **and the round's [`Stragglers`]**: the still-open reply
+/// channel through which every child not yet reported hands its reply and endpoint when it finishes. The
+/// caller records both as a [`Dispatch`] the coordinator settles each period, so a slow or dead voter never
+/// serializes the reachable ones, and a slow-but-live one costs neither its session nor its reply. The
+/// council is small and near-silent, but a heartbeat to a dead follower must not delay the live ones, so the
+/// fan-out is the same concurrent, session-preserving shape as a record commit ([`commit_record`]) — the
+/// stragglers handed back exactly as that commit hands back its own. Each child is detached once the round
+/// returns, so a per-period round never accumulates task slots (banned item 8): a reported child is already
+/// terminal, and an unreported one finishes at [`request_within`]'s deadline and self-reaps, having reported
+/// through the channel.
 async fn broadcast(
   requests: Vec<(HostId, Vec<u8>, Endpoint)>,
   stream: u64,
   budget: CommitBudget,
-) -> Vec<(HostId, Vec<u8>, Endpoint)> {
+) -> (Vec<(HostId, Vec<u8>, Endpoint)>, Stragglers) {
   if requests.is_empty() {
-    return Vec::new();
+    return (Vec::new(), Stragglers::none());
   }
   let deadline_ns = budget.max_deadline_ns();
-  let (tx, rx) = channel::<(HostId, Vec<u8>, Endpoint)>();
+  let (tx, rx) = channel::<Reply>();
   let mut tasks = Vec::new();
   for (host, request, endpoint) in requests {
     let tx = tx.clone();
     if let Ok(task) = futures::spawn_child(async move {
       let (reply, endpoint) = request_within(endpoint, stream, &request, deadline_ns).await;
-      let _ = tx.send((host, reply, endpoint));
+      let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
     }) {
       tasks.push(task);
     }
-    // A spawn failure drops the cloned `tx` and the moved endpoint: that voter yields no reply this round
-    // (its link task re-establishes the session), and the channel still disconnects once the rest end.
+    // A spawn failure drops the cloned `tx` and the moved endpoint: that voter yields no reply, stays
+    // outstanding on the dispatch and is marked lost when it settles (its link task re-establishes the
+    // session), and the channel still disconnects once the rest end.
   }
   drop(tx); // so the channel disconnects when the last child has reported
   let mut replies = Vec::with_capacity(tasks.len());
@@ -1794,7 +1923,7 @@ async fn broadcast(
   loop {
     loop {
       match rx.try_recv() {
-        Ok(triple) => replies.push(triple),
+        Ok(Reply(host, reply, endpoint)) => replies.push((host, reply, *endpoint)),
         Err(TryRecvError::Empty) => break,
         Err(TryRecvError::Disconnected) => {
           all_reported = true;
@@ -1806,16 +1935,15 @@ async fn broadcast(
       break;
     }
   }
-  // A child that has not reported is a voter timing out at its own deadline. Do **not** join it here —
-  // that would wait out the very deadline the progress-aware stop exists to avoid. Detach every child: a
-  // reported one is already terminal (immediate), an unreported one returns its endpoint at
-  // [`request_within`]'s deadline and self-cleans — bounded, never orphaned (banned item 9). Its session is
-  // not returned to the pool this round, so the per-peer link task re-establishes it (a no-op for a live
-  // voter that simply replied late, since its reply was collected and its endpoint returned above).
+  // A child that has not reported is a voter replying late, or timing out at its own deadline. Do **not**
+  // join it here — that would wait out the very deadline the progress-aware stop exists to avoid. Detach
+  // every child (a reported one is already terminal; an unreported one self-reaps at its deadline) and keep
+  // the channel open as the round's stragglers: the late reply and its endpoint arrive there, and the
+  // dispatch's settle folds the one and returns the other. Nothing is dropped, so nothing is orphaned.
   for task in tasks {
     let _ = futures::detach(task);
   }
-  replies
+  (replies, Stragglers::pending(rx))
 }
 
 /// Drives one replication round as the council **leader**: ships each other voter the append it is owed (a
@@ -1823,7 +1951,11 @@ async fn broadcast(
 /// reply — the leader advances its commit index as a majority acknowledge, and the regional configuration
 /// applies whatever newly commits. Borrows only the voter sessions; a voter with no live session is not
 /// reached this round and is retried next period.
-async fn drive_council_replication(others: &[HostId], budget: CommitBudget) {
+async fn drive_council_replication(
+  others: &[HostId],
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
   let sessions = take_sessions(|host| others.contains(&host));
   if sessions.is_empty() {
     return;
@@ -1849,7 +1981,8 @@ async fn drive_council_replication(others: &[HostId], budget: CommitBudget) {
       None => kept.push((host, endpoint)),
     }
   }
-  let replied = broadcast(requests, CONFIG_STREAM, budget).await;
+  let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
+  let (replied, stragglers) = broadcast(requests, CONFIG_STREAM, budget).await;
   let mut recovered = kept;
   let mut replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -1863,6 +1996,14 @@ async fn drive_council_replication(others: &[HostId], budget: CommitBudget) {
       }
     }
   });
+  // A voter that replies late is settled by the coordinator: its acknowledgement is folded then and its
+  // session returned, so a slow follower never costs the leader its ack or its session.
+  in_flight.push(Dispatch::new(
+    sent,
+    &recovered,
+    stragglers,
+    LateReplies::Council,
+  ));
   return_sessions(recovered);
 }
 
@@ -1872,7 +2013,11 @@ async fn drive_council_replication(others: &[HostId], budget: CommitBudget) {
 /// node leader once its own majority grants. Every borrowed voter session is returned whatever the outcome.
 /// A node that already leads, or the sole voter (which `election_timeout` self-elects with no messages),
 /// sends nothing.
-async fn drive_council_election(others: &[HostId], budget: CommitBudget) {
+async fn drive_council_election(
+  others: &[HostId],
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
   // Begin the pre-election; `election_timeout` returns one (identical) pre-vote per other voter, so the
   // first is the message to broadcast. Empty means this node already leads or self-elected — nothing to do.
   let Some(Some(pre_vote)) = state::with_state(|s| s.council.election_timeout().into_iter().next())
@@ -1889,13 +2034,22 @@ async fn drive_council_election(others: &[HostId], budget: CommitBudget) {
     .into_iter()
     .map(|(host, endpoint)| (host, pre_bytes.clone(), endpoint))
     .collect();
-  let replied = broadcast(requests, CONFIG_STREAM, budget).await;
+  let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
+  let (replied, stragglers) = broadcast(requests, CONFIG_STREAM, budget).await;
   let mut sessions = Vec::with_capacity(replied.len());
   let mut pre_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
     pre_replies.push(reply);
     sessions.push((host, endpoint));
   }
+  // A voter whose pre-vote reply is late is settled by the coordinator: its session comes back then (the
+  // late pre-vote reply itself is not folded — the next campaign re-runs its pre-vote).
+  in_flight.push(Dispatch::new(
+    sent,
+    &sessions,
+    stragglers,
+    LateReplies::Council,
+  ));
   // Fold the pre-vote replies; a granted majority yields the real vote request to broadcast next (the
   // follow-on of a pre-vote reply is always a vote request — the term is advanced only now).
   let vote = state::with_state(|s| {
@@ -1920,7 +2074,8 @@ async fn drive_council_election(others: &[HostId], budget: CommitBudget) {
     .into_iter()
     .map(|(host, endpoint)| (host, vote_bytes.clone(), endpoint))
     .collect();
-  let replied = broadcast(requests, CONFIG_STREAM, budget).await;
+  let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
+  let (replied, stragglers) = broadcast(requests, CONFIG_STREAM, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
   let mut vote_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -1934,6 +2089,13 @@ async fn drive_council_election(others: &[HostId], budget: CommitBudget) {
       }
     }
   });
+  // A late vote still counts when it arrives: the coordinator folds it as it settles the round.
+  in_flight.push(Dispatch::new(
+    sent,
+    &recovered,
+    stragglers,
+    LateReplies::Council,
+  ));
   return_sessions(recovered);
 }
 
@@ -1971,6 +2133,7 @@ async fn drive_config_council(
   idle: &mut u32,
   seen_contact: &mut u64,
   attempt: &mut u32,
+  in_flight: &mut Vec<Dispatch>,
 ) {
   let Some((is_voter, is_leader, contact, voters)) = state::with_state(|s| {
     let voters = s.council.voters();
@@ -1999,7 +2162,7 @@ async fn drive_config_council(
       state::with_state(|s| s.config_refresh_wanted || membership_diverges_from_config(s))
         .unwrap_or(false);
     if wanted {
-      drive_learner_fetch(&voters, budget).await;
+      drive_learner_fetch(&voters, budget, in_flight).await;
       let _ = state::with_state(|s| s.config_refresh_wanted = false);
     }
     return;
@@ -2015,7 +2178,7 @@ async fn drive_config_council(
       let alive = s.fleet.membership().alive();
       s.council.reconcile_alive(&alive)
     });
-    drive_council_replication(&others, budget).await;
+    drive_council_replication(&others, budget, in_flight).await;
     *idle = 0;
     return;
   }
@@ -2035,7 +2198,7 @@ async fn drive_config_council(
   if *idle >= ELECTION_HEARTBEATS.saturating_add(election_jitter(local, *attempt)) {
     *attempt = attempt.saturating_add(1);
     *idle = 0;
-    drive_council_election(&others, budget).await;
+    drive_council_election(&others, budget, in_flight).await;
     // Re-baseline the contact counter so a fresh campaign is not immediately retriggered: a won election
     // makes this node leader next period; a lost one waits out the timer again.
     *seen_contact = state::with_state(|s| s.council.leader_contact()).unwrap_or(*seen_contact);
@@ -2094,6 +2257,7 @@ async fn drive_root_group(
   idle: &mut u32,
   seen_contact: &mut u64,
   attempt: &mut u32,
+  in_flight: &mut Vec<Dispatch>,
 ) {
   let Some((is_voter, is_leader, contact, voters)) = state::with_state(|s| {
     let voters = s.root.voters();
@@ -2114,7 +2278,7 @@ async fn drive_root_group(
     // learner's reactive fetch.
     let wanted = state::with_state(|s| root_diverges(s)).unwrap_or(false);
     if wanted {
-      drive_root_learner_fetch(&voters, budget).await;
+      drive_root_learner_fetch(&voters, budget, in_flight).await;
     }
     return;
   }
@@ -2129,7 +2293,7 @@ async fn drive_root_group(
       let alive = alive_regions(s);
       s.root.reconcile_regions(&alive, &s.region_mirrors)
     });
-    drive_root_replication(&others, budget).await;
+    drive_root_replication(&others, budget, in_flight).await;
     *idle = 0;
     return;
   }
@@ -2149,7 +2313,7 @@ async fn drive_root_group(
   if *idle >= ELECTION_HEARTBEATS.saturating_add(election_jitter(local, *attempt)) {
     *attempt = attempt.saturating_add(1);
     *idle = 0;
-    drive_root_election(&others, budget).await;
+    drive_root_election(&others, budget, in_flight).await;
     *seen_contact = state::with_state(|s| s.root.leader_contact()).unwrap_or(*seen_contact);
   }
 }
@@ -2157,7 +2321,11 @@ async fn drive_root_group(
 /// The root group's replication round over the transport — the parallel of [`drive_council_replication`] on
 /// [`ROOT_STREAM`], reading [`ShardState::root`]: builds the append owed each borrowed root voter under a
 /// brief borrow, ships them concurrently, folds the replies, and returns every session.
-async fn drive_root_replication(others: &[HostId], budget: CommitBudget) {
+async fn drive_root_replication(
+  others: &[HostId],
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
   let sessions = take_sessions(|host| others.contains(&host));
   if sessions.is_empty() {
     return;
@@ -2181,7 +2349,8 @@ async fn drive_root_replication(others: &[HostId], budget: CommitBudget) {
       None => kept.push((host, endpoint)),
     }
   }
-  let replied = broadcast(requests, ROOT_STREAM, budget).await;
+  let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
+  let (replied, stragglers) = broadcast(requests, ROOT_STREAM, budget).await;
   let mut recovered = kept;
   let mut replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -2195,12 +2364,24 @@ async fn drive_root_replication(others: &[HostId], budget: CommitBudget) {
       }
     }
   });
+  // A voter that replies late is settled by the coordinator: its acknowledgement is folded then and its
+  // session returned, so a slow follower never costs the leader its ack or its session.
+  in_flight.push(Dispatch::new(
+    sent,
+    &recovered,
+    stragglers,
+    LateReplies::Root,
+  ));
   return_sessions(recovered);
 }
 
 /// The root group's pre-vote then vote election over the transport — the parallel of
 /// [`drive_council_election`] on [`ROOT_STREAM`], reading [`ShardState::root`].
-async fn drive_root_election(others: &[HostId], budget: CommitBudget) {
+async fn drive_root_election(
+  others: &[HostId],
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
   let Some(Some(pre_vote)) = state::with_state(|s| s.root.election_timeout().into_iter().next())
   else {
     return;
@@ -2215,13 +2396,22 @@ async fn drive_root_election(others: &[HostId], budget: CommitBudget) {
     .into_iter()
     .map(|(host, endpoint)| (host, pre_bytes.clone(), endpoint))
     .collect();
-  let replied = broadcast(requests, ROOT_STREAM, budget).await;
+  let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
+  let (replied, stragglers) = broadcast(requests, ROOT_STREAM, budget).await;
   let mut sessions = Vec::with_capacity(replied.len());
   let mut pre_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
     pre_replies.push(reply);
     sessions.push((host, endpoint));
   }
+  // A voter whose pre-vote reply is late is settled by the coordinator: its session comes back then (the
+  // late pre-vote reply itself is not folded — the next campaign re-runs its pre-vote).
+  in_flight.push(Dispatch::new(
+    sent,
+    &sessions,
+    stragglers,
+    LateReplies::Root,
+  ));
   // Fold the pre-vote replies; a granted majority yields the real vote request to broadcast next.
   let vote = state::with_state(|s| {
     let mut vote = None;
@@ -2245,7 +2435,8 @@ async fn drive_root_election(others: &[HostId], budget: CommitBudget) {
     .into_iter()
     .map(|(host, endpoint)| (host, vote_bytes.clone(), endpoint))
     .collect();
-  let replied = broadcast(requests, ROOT_STREAM, budget).await;
+  let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
+  let (replied, stragglers) = broadcast(requests, ROOT_STREAM, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
   let mut vote_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -2259,6 +2450,13 @@ async fn drive_root_election(others: &[HostId], budget: CommitBudget) {
       }
     }
   });
+  // A late vote still counts when it arrives: the coordinator folds it as it settles the round.
+  in_flight.push(Dispatch::new(
+    sent,
+    &recovered,
+    stragglers,
+    LateReplies::Root,
+  ));
   return_sessions(recovered);
 }
 
@@ -2267,7 +2465,11 @@ async fn drive_root_election(others: &[HostId], budget: CommitBudget) {
 /// The fetch carries this learner's root version, so a caught-up learner's fetch is an empty reply, not a
 /// full transfer; every borrowed session is returned. `adopt` only moves forward, so folding all replies
 /// leaves the learner on the highest version any reachable voter returned.
-async fn drive_root_learner_fetch(voters: &[HostId], budget: CommitBudget) {
+async fn drive_root_learner_fetch(
+  voters: &[HostId],
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
   let sessions = take_sessions(|host| voters.contains(&host));
   if sessions.is_empty() {
     return;
@@ -2280,7 +2482,8 @@ async fn drive_root_learner_fetch(voters: &[HostId], budget: CommitBudget) {
     .into_iter()
     .map(|(host, endpoint)| (host, request.clone(), endpoint))
     .collect();
-  let replied = broadcast(requests, ROOT_FETCH_STREAM, budget).await;
+  let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
+  let (replied, stragglers) = broadcast(requests, ROOT_FETCH_STREAM, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
   let mut fetched: Vec<Vec<u8>> = Vec::new();
   for (host, reply, endpoint) in replied {
@@ -2289,6 +2492,13 @@ async fn drive_root_learner_fetch(voters: &[HostId], budget: CommitBudget) {
     }
     recovered.push((host, endpoint));
   }
+  // A late fetch reply is adopted when it arrives (the coordinator settles the round's stragglers).
+  in_flight.push(Dispatch::new(
+    sent,
+    &recovered,
+    stragglers,
+    LateReplies::RootFetch,
+  ));
   return_sessions(recovered);
   state::with_state(|s| {
     for bytes in &fetched {
@@ -2307,7 +2517,11 @@ async fn drive_root_learner_fetch(voters: &[HostId], budget: CommitBudget) {
 /// voter's stale copy never holds the learner back; every borrowed session is returned. A design refinement
 /// (owed) is the piggyback rule — fetching only when a stale-configuration refusal names a newer version
 /// (§4.8), rather than polling each period — but polling is correct and the config-commit rate is near zero.
-async fn drive_learner_fetch(voters: &[HostId], budget: CommitBudget) {
+async fn drive_learner_fetch(
+  voters: &[HostId],
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
   let sessions = take_sessions(|host| voters.contains(&host));
   if sessions.is_empty() {
     return;
@@ -2322,7 +2536,8 @@ async fn drive_learner_fetch(voters: &[HostId], budget: CommitBudget) {
     .into_iter()
     .map(|(host, endpoint)| (host, request.clone(), endpoint))
     .collect();
-  let replied = broadcast(requests, CONFIG_FETCH_STREAM, budget).await;
+  let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
+  let (replied, stragglers) = broadcast(requests, CONFIG_FETCH_STREAM, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
   let mut fetched: Vec<Vec<u8>> = Vec::new();
   for (host, reply, endpoint) in replied {
@@ -2331,6 +2546,13 @@ async fn drive_learner_fetch(voters: &[HostId], budget: CommitBudget) {
     }
     recovered.push((host, endpoint));
   }
+  // A late fetch reply is adopted when it arrives (the coordinator settles the round's stragglers).
+  in_flight.push(Dispatch::new(
+    sent,
+    &recovered,
+    stragglers,
+    LateReplies::ConfigFetch,
+  ));
   return_sessions(recovered);
   // Adopt the newest fetched configuration (`adopt` only moves forward, so folding all replies leaves the
   // learner on the highest version any reachable voter returned).
@@ -2499,6 +2721,7 @@ async fn run_record_plane(local: HostId, budget: CommitBudget, progress: &'stati
       &mut council_idle,
       &mut council_seen_contact,
       &mut council_attempt,
+      &mut in_flight,
     )
     .await;
     // Drive the root group across regions on the same coordinator (§4.8, D-14): a brief borrow of the
@@ -2509,6 +2732,7 @@ async fn run_record_plane(local: HostId, budget: CommitBudget, progress: &'stati
       &mut root_idle,
       &mut root_seen_contact,
       &mut root_attempt,
+      &mut in_flight,
     )
     .await;
     // Install the configuration the council has agreed into this node's placement view, and take over any
@@ -2650,7 +2874,12 @@ async fn ship_head(
       }
     });
   }
-  let dispatch = Dispatch::new(taken, &committed.reusable, committed.stragglers);
+  let dispatch = Dispatch::new(
+    taken,
+    &committed.reusable,
+    committed.stragglers,
+    LateReplies::Discard,
+  );
   return_sessions(committed.reusable);
   let placement = match committed.outcome {
     Ok(placement) => placement,
@@ -2851,6 +3080,7 @@ async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -
     taken,
     &promoted.reusable,
     promoted.stragglers,
+    LateReplies::Discard,
   ));
   return_sessions(promoted.reusable);
   // Safe adoption: re-commit the adopted head under the new epoch over the holders, reaching the quorum.
@@ -2874,6 +3104,7 @@ async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -
       taken,
       &committed.reusable,
       committed.stragglers,
+      LateReplies::Discard,
     ));
     return_sessions(committed.reusable);
     if let Ok(placement) = committed.outcome

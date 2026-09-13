@@ -1201,7 +1201,10 @@ fn a_root_learner_fetches_the_committed_region_membership_over_the_transport() {
       // the root leader then reconciles the lost region promptly, and the learner's alive view drops it so it
       // fetches. The learning is still the fetch, not the injection.
       for (_, daemon) in &survivors {
-        daemon.observe_peer_dead(victim, FALSE_DEATH_INCARNATION);
+        assert!(
+          daemon.observe_peer_dead(victim, FALSE_DEATH_INCARNATION),
+          "the injected death reached the survivor's control shard and folded within the observe budget"
+        );
       }
       let learner_pos = survivors
         .iter()

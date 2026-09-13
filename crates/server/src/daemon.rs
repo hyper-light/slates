@@ -338,28 +338,67 @@ impl Daemon {
   /// budget would return `None` — which the observation accessors map to their default (empty/false), a
   /// **false negative** a caller reads as a real change (a peer "left", a leader "lost"). Waiting generously
   /// makes an accessor report the shard's true state whenever it is merely slow, and give up only when it is
-  /// genuinely wedged. The test thread parks on the channel (it does not spin), so it does not itself steal
-  /// CPU from the shard it is waiting on. `query` returns `Option<T>`; its own `None` (shard state gone) folds
-  /// into the same "could not observe."
+  /// genuinely wedged. The same holds for **admission**: the query is a task spawned onto the shard through
+  /// its bounded control channel, which under that same load is routinely *full* — and a spawn refused
+  /// `ControlFull` used to return `None` at once, the identical false negative with no wait at all. The spawn
+  /// is now retried until admitted or the budget elapses ([`Daemon::spawn_admitted`]). The test thread parks
+  /// (it does not spin), so it does not itself steal CPU from the shard it is waiting on. `query` returns
+  /// `Option<T>`; its own `None` (shard state gone) folds into the same "could not observe." It is `Clone`
+  /// because each admission attempt builds a fresh task (a refused spawn's future is dropped by the runtime).
   fn observe<T: Send + 'static>(
     &self,
     target: Option<ShardId>,
-    query: impl FnOnce() -> Option<T> + Send + 'static,
+    query: impl FnOnce() -> Option<T> + Clone + Send + 'static,
   ) -> Option<T> {
-    let runtime = self.runtime.as_ref()?;
     let target = target?;
     let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(target, async move {
+    if !self.spawn_admitted(target, OBSERVE_BUDGET_NS, || {
+      let tx = tx.clone();
+      let query = query.clone();
+      async move {
         let _ = tx.send(query());
-      })
-      .is_err()
-    {
+      }
+    }) {
       return None;
     }
     rx.recv_timeout(std::time::Duration::from_nanos(OBSERVE_BUDGET_NS))
       .ok()
       .flatten()
+  }
+
+  /// Spawns the task `make` builds onto `target`, retrying while the shard's control channel is **full** —
+  /// its admission bound, routinely reached under heavy CPU load — until it is admitted or `budget_ns`
+  /// elapses, parking a tenth of a period between attempts (the tree's collection-loop cadence,
+  /// [`crate::fleet::POLL_PER_PERIOD`]; the calling thread parks, it does not spin, so it steals no CPU from
+  /// the shard it waits on). The tree's policy for a full control channel is backpressure, never a drop
+  /// (`verbs::forward` keeps and retries; `fleet::fan_configs_to_shards` re-fans next period); a test-facing
+  /// observation or injection that silently dropped on the same refusal read a *starved* shard as a *fact* —
+  /// an injected death that never landed, a leader that "was not", a region membership "empty" — the
+  /// harness's own false negative under exactly the load it exists to prove robustness against
+  /// (docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md). `false` when the daemon has no
+  /// runtime, the shard is gone, or the budget elapsed unadmitted. `make` is called once per attempt because
+  /// a refused spawn's future is dropped by the runtime.
+  fn spawn_admitted<F>(&self, target: ShardId, budget_ns: u64, make: impl Fn() -> F) -> bool
+  where
+    F: std::future::Future<Output = ()> + Send + 'static,
+  {
+    let Some(runtime) = self.runtime.as_ref() else {
+      return false;
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_nanos(budget_ns);
+    let park = std::time::Duration::from_nanos(HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD);
+    // The park is a timed wait on a channel nobody sends on — the same parked (not spinning) wait the
+    // observation itself uses on its reply channel; the sender is held so the wait runs its full span.
+    let (_park_sender, park_receiver) = std::sync::mpsc::channel::<()>();
+    loop {
+      match runtime.spawn_on(target, make()) {
+        Ok(()) => return true,
+        Err(slates_rt::RtError::ControlFull { .. }) if std::time::Instant::now() < deadline => {
+          let _ = park_receiver.recv_timeout(park);
+        }
+        Err(_) => return false,
+      }
+    }
   }
 
   /// This daemon's fleet coordinator **forward-progress** count — periods the control-shard fleet loop has
@@ -581,16 +620,21 @@ impl Daemon {
   /// rebound, as a live deployment's OS would free it), so a test injects the (possibly false) death here
   /// and lets the still-live peer's own probing drive the recovery — the peer learns of the death from this
   /// node's probe echo, refutes past `incarnation` ([`Membership::refute`](slates_cluster::membership)), and
-  /// is re-admitted. Synchronous (waits for the fold), bounded by the liveness budget; a no-op on a laptop
-  /// or a stopping daemon. Injected at a high `incarnation` so it wins over the current belief.
-  pub fn observe_peer_dead(&self, peer: slates_db::HostId, incarnation: u64) {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
-    else {
-      return;
+  /// is re-admitted. Synchronous: the injection is spawned onto the control shard — retried while that
+  /// shard's control channel is full under load, never silently dropped ([`Daemon::spawn_admitted`]) — and
+  /// this waits for the fold, both bounded by the generous [`OBSERVE_BUDGET_NS`] (a starved shard can take
+  /// seconds to service it). Returns whether the death **landed and folded** within that budget, so a test
+  /// asserts the cue it relies on actually reached the daemon instead of reading a starved shard's silence as
+  /// delivery; `false` on a laptop, a stopping daemon, or a shard that stayed unresponsive. Injected at a high
+  /// `incarnation` so it wins over the current belief.
+  pub fn observe_peer_dead(&self, peer: slates_db::HostId, incarnation: u64) -> bool {
+    let Some(control) = self.shards.first().copied() else {
+      return false;
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(control, async move {
+    if !self.spawn_admitted(control, OBSERVE_BUDGET_NS, || {
+      let tx = tx.clone();
+      async move {
         state::with_state(|s| {
           let dead = slates_cluster::membership::MemberState {
             liveness: slates_cluster::membership::Liveness::Dead,
@@ -599,12 +643,12 @@ impl Daemon {
           let _ = slates_cluster::fleet::apply_peer_state(&mut s.fleet, peer, Some(dead));
         });
         let _ = tx.send(());
-      })
-      .is_err()
-    {
-      return;
+      }
+    }) {
+      return false;
     }
-    let _ = rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS));
+    rx.recv_timeout(std::time::Duration::from_nanos(OBSERVE_BUDGET_NS))
+      .is_ok()
   }
 
   /// Injects a peer's **restart** into this node's membership for a test (§4.8 "Recovery"; task #22): the peer

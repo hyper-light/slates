@@ -1588,6 +1588,24 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 > Server wiring, regional configuration consensus and the acceptance gates below remain open.
 > A-9 changes the required §4.8 contract; model refinement/revalidation remains explicitly owed
 > before closure. No checker, tool installation or new CI job is authorized by this amendment.
+>
+> **Status (2026-09-13).** The council and root group ride the per-peer **record** sessions, but those
+> were kept only to the owner's copyset (`select_neighbourhood` at the scatter width), so a consensus
+> voter outside a node's copyset was **unreachable from it by construction**; an election still won
+> through the in-copyset voters, and the first loss that removed them left a leader that could never
+> regain a majority (0 replication rounds in 1516 periods under load). Fixed: the dial set is the
+> neighbourhood or a council/root voter (`keeps_record_session_to`, `server/src/fleet.rs`); the by-use
+> proof `a_root_learner_fetches_the_committed_region_membership_over_the_transport` converges in 5.37 s
+> under 12 busy-spin processes where it capped before. Found and fixed on the way: `broadcast` dropped
+> its stragglers at its progress-aware stop (now the record plane's shape — a `Dispatch` per round, a
+> late `AppendReply`/`VoteReply` folded on arrival, standard Raft); two Raft Figure 2 follower
+> timer-resets (a granted vote; a current-leader append even when its log check rejects it, unit-tested);
+> and the daemon's test-facing `observe`/`observe_peer_dead` swallowing `ControlFull` under load. The
+> RTT-derived election timeout named under "Derived constants" was **measured inert on one host** (SWIM
+> RTT p99 17 ms, consensus broadcast p99 33 ms, both inside a 100 ms heartbeat) — owed for a real WAN; the
+> 10× heartbeat ratio remains. Owed: driving `check_quorum` from the coordinator; `Option`-typed
+> observation accessors; SWIM probing of consensus voters outside the copyset. Record:
+> `docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md`.
 
 **Role.** The authoritative record of volumes, snapshots, lineage, leases, attachments,
 accounting, completion records, grants, chains and the operation log; served locally in

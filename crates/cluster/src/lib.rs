@@ -287,7 +287,7 @@ impl DispatchWait {
 /// commits — its packet-number space stays continuous across a retry, RFC 9000 §12.3. The deadline is no
 /// longer a message: it is the collection loop's own progress-extension decision ([`DispatchWait`]), so a
 /// report is always a holder's reply.
-struct Reply(HostId, Vec<u8>, Box<Endpoint>);
+pub struct Reply(pub HostId, pub Vec<u8>, pub Box<Endpoint>);
 
 /// The holder replies still in flight when a dispatch returned at quorum (or timed out): the receiving end
 /// of the dispatch's reply channel, kept open so each straggler task — bounded by the dispatch's full span
@@ -304,12 +304,14 @@ pub struct Stragglers {
 impl Stragglers {
   /// No stragglers: nothing was dispatched (a local quorum at `f = 0`, or a spawn failure that cancelled the
   /// tasks already started).
-  fn none() -> Self {
+  pub fn none() -> Self {
     Self { replies: None }
   }
 
   /// The stragglers of a dispatch whose reply channel is `replies` — every task still running sends there.
-  fn pending(replies: std::sync::mpsc::Receiver<Reply>) -> Self {
+  /// Public so the daemon's consensus fan-out (`slates_server::fleet::broadcast`) hands its own stragglers
+  /// back the same way a record commit does, instead of dropping the channel and losing them.
+  pub fn pending(replies: std::sync::mpsc::Receiver<Reply>) -> Self {
     Self {
       replies: Some(replies),
     }
@@ -326,6 +328,32 @@ impl Stragglers {
     loop {
       match replies.try_recv() {
         Ok(Reply(host, _, endpoint)) => recovered.push((host, *endpoint)),
+        Err(TryRecvError::Empty) => return (recovered, false),
+        Err(TryRecvError::Disconnected) => {
+          self.replies = None;
+          return (recovered, true);
+        }
+      }
+    }
+  }
+
+  /// Like [`recover`](Stragglers::recover), but hands back each finished straggler's **reply** with its
+  /// session — for a caller whose late reply still means something. A consensus round is one: a late
+  /// `AppendReply` is the acknowledgement that advances the leader's match index toward a commit, a late
+  /// `VoteReply` the vote that elects, and Raft folds any response on arrival gated only by its term (the
+  /// leader rules of Figure 2 carry no timing condition; a stale-term or wrong-role reply is ignored on
+  /// fold). Dropping such a reply at the round's progress-aware stop would cost a slow-but-live voter its
+  /// acknowledgement every round — under sustained CPU starvation, forever. A record commit needs none of
+  /// this (it re-ships idempotently) and uses `recover`. A straggler that timed out reports an empty reply
+  /// and still returns its session.
+  pub fn recover_replies(&mut self) -> (Vec<(HostId, Vec<u8>, Endpoint)>, bool) {
+    let mut recovered = Vec::new();
+    let Some(replies) = self.replies.as_ref() else {
+      return (recovered, true);
+    };
+    loop {
+      match replies.try_recv() {
+        Ok(Reply(host, bytes, endpoint)) => recovered.push((host, bytes, *endpoint)),
         Err(TryRecvError::Empty) => return (recovered, false),
         Err(TryRecvError::Disconnected) => {
           self.replies = None;
