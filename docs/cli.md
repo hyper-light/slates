@@ -152,6 +152,13 @@ one exception is `base read`, which streams a file's raw bytes with or without `
 NFS bridge; `slates unmount PATH` removes it. `slates mcp` serves the MCP tools over stdio, or
 loopback Streamable HTTP with `--http PORT`.
 
+A fleet whose deployment manifest declares a `durability` policy (`accepted_loss`, `coincident_failures`)
+refuses a volume create, clone, snapshot or merge submit with `DurabilityUnmet { coincident_loss,
+accepted_loss, coincident_failures }` while its committed configuration's coincident-loss probability is
+above the accepted one — the resolution is the operator's (more copies, more re-replication bandwidth,
+tighter failure domains, or a policy that accepts the loss); reads, destroys, resizes and `status`
+continue, and `status` counts the refusals under `durability_unmet`.
+
 Exit codes: 0 done; 1 the daemon refused (the refusal is named on stderr, e.g.
 `AlreadyExists`); 2 usage; 3 no daemon at the instance; 4 the command itself failed.
 

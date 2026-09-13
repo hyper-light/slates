@@ -11,8 +11,9 @@ use slates_mem::MemError;
 use slates_rt::RtError;
 use slates_vfs::error::VfsError;
 
-/// A typed refusal from the daemon; never a panic.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A typed refusal from the daemon; never a panic. (`Eq` is not derived: a [`Refusal`] may carry measured
+/// probabilities.)
+#[derive(Debug, Clone, PartialEq)]
 pub enum ServerError {
   /// The runtime refused.
   Runtime(RtError),

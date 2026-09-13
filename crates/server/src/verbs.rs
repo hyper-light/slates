@@ -1370,7 +1370,26 @@ fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::GrantInvalid => "grant_invalid",
     Refusal::HomedElsewhere { .. } => "homed_elsewhere",
     Refusal::NotRootLeader => "not_root_leader",
+    Refusal::DurabilityUnmet { .. } => "durability_unmet",
   }
+}
+
+/// Whether a verb's completion **commits a new head or seal the fleet replicates** — a creation head
+/// (`Create`, `CreateGreen`, `CreateWork`, `Clone`), a sealed snapshot (`Snapshot`), or a green advance
+/// (`Submit`) — and so claims the durability the committed configuration places it at (§4.8, D-18). These
+/// are the writes the operator's durability policy gates ([`Refusal::DurabilityUnmet`]). Owner-local live
+/// edits (`Edit`, `Declare`, `Rebase` — lost with the host by D-18's own statement), catalog changes
+/// (`Resize`), destroys, attachments, grants, landings and every read claim no placement and continue.
+fn claims_placed_durability(body: &RequestBody) -> bool {
+  matches!(
+    body,
+    RequestBody::Create { .. }
+      | RequestBody::CreateGreen { .. }
+      | RequestBody::CreateWork { .. }
+      | RequestBody::Clone { .. }
+      | RequestBody::Snapshot { .. }
+      | RequestBody::Submit { .. }
+  )
 }
 
 /// Whether a verb changes the set of volumes or a volume's roots, so the shard must republish its
@@ -1401,6 +1420,20 @@ fn dispatch(
   body: RequestBody,
 ) -> ReplyBody {
   let republish = mutates_shard_image(&body);
+  // The durability gate (§4.8 "Placement" — the operator's ε and coincident-failure size "gate a refusal"):
+  // a write that would commit a new head or seal is refused, with the measured shortfall, while the
+  // installed configuration cannot hold it to the declared policy. A field read: the shortfall was measured
+  // when the configuration was installed. It sits after every completion-record lookup (`serve`,
+  // `run_forwarded`), so a retry of a write that succeeded before the breach still meets its recorded reply.
+  if claims_placed_durability(&body)
+    && let Some(shortfall) = state.durability_shortfall
+  {
+    return refused(Refusal::DurabilityUnmet {
+      coincident_loss: shortfall.coincident_loss,
+      accepted_loss: shortfall.accepted_loss,
+      coincident_failures: shortfall.coincident_failures,
+    });
+  }
   let reply = dispatch_inner(state, client_id, principal, body);
   // Publish the shard's recovery image after a successful volume-set or roots change, so a restart
   // recovers it from anchor-owned RAM (§4.8). A refusal changed nothing, so it needs no publish.
@@ -3437,8 +3470,12 @@ fn list(state: &mut ShardState, principal: &Principal) -> ReplyBody {
 
 fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32) -> ReplyBody {
   let now = state.clock.monotonic_ns();
-  // A local client acknowledges its own completions, keyed under this node's own host.
-  let origin = state.fleet.host().0;
+  // A local client acknowledges its own completions, keyed under this node's **stable cert-anchor** — the
+  // same key `serve` records and looks them up under (task #22 two-id model), never the ephemeral member
+  // id: pruning under a key nothing is recorded under released no record (the windows grew unbounded,
+  // banned item 8) and a retry after acknowledgement met its record again instead of `DuplicateRequest`
+  // (`docs/bugs/2026-09-13-acknowledge-prunes-under-the-ephemeral-id.md`).
+  let origin = state.origin_anchor.0;
   match state.db.mutate(
     &mut state.segment,
     &Op::CompletionsAcknowledged {
@@ -3659,8 +3696,10 @@ fn retry_deferred(state: &mut ShardState) -> bool {
     } = entry;
     let id = RequestId::from_word(request);
     // A deferred reply is the local client's own (its shard is here), so its completion keys on this node's
-    // own host; a cross-node forward records on the owner under its authenticated origin instead.
-    let origin = state.fleet.host().0;
+    // **stable cert-anchor** — the key `serve` records and looks up under (task #22 two-id model), never the
+    // ephemeral member id, or a retry of a deferred request finds no record and runs again; a cross-node
+    // forward records on the owner under its authenticated origin instead.
+    let origin = state.origin_anchor.0;
     let reply = if recorded {
       reply
     } else {

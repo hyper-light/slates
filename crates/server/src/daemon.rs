@@ -148,17 +148,41 @@ pub static NFS_PORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 /// when no durability policy is declared (the default) or every installed configuration stays within it.
 pub static DURABILITY_BREACHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Checks a just-installed `configuration` against the operator's durability `bound`, counting a breach as a
-/// health signal ([`DURABILITY_BREACHES`]) — surfaced at every configuration change, never a silent
-/// over-scatter (§4.8, D-14). A no-op when no bound is declared.
+/// Measures a just-installed `configuration` against the operator's durability `bound` — the design's
+/// `within_loss_bound(ε, F)` check at every configuration change (§4.8 "Placement", D-14) — returning the
+/// **shortfall** the write path refuses with (`None` within the bound, or with no bound declared) and counting
+/// a breach as a health signal ([`DURABILITY_BREACHES`]), surfaced never a silent over-scatter. Called where a
+/// configuration change is first seen on this node (the control shard's boot and council install); a shard
+/// that receives the same configuration by fan measures it with [`DurabilityBound::shortfall`] alone, so one
+/// change moves the signal once.
 pub(crate) fn record_durability(
   configuration: &slates_db::register::Configuration,
   bound: Option<DurabilityBound>,
-) {
-  if let Some(bound) = bound
-    && bound.breached_by(configuration)
-  {
+) -> Option<crate::config::DurabilityShortfall> {
+  let shortfall = bound.and_then(|bound| bound.shortfall(configuration));
+  if shortfall.is_some() {
     DURABILITY_BREACHES.fetch_add(1, Ordering::Relaxed);
+  }
+  shortfall
+}
+
+/// Measures the configuration a shard forms at boot against the operator's durability policy (§4.8, D-14):
+/// the shortfall that shard's writes are refused with (`None` with no policy). Every shard measures — each
+/// holds its own copy of the configuration and serves its own writes — but only the control shard (`counts`)
+/// records the breach, so one boot moves the health signal once, not once per shard.
+fn boot_durability(
+  config: &DaemonConfig,
+  configuration: &slates_db::register::Configuration,
+  counts: bool,
+) -> Option<crate::config::DurabilityShortfall> {
+  let bound = config
+    .fleet
+    .as_ref()
+    .and_then(|membership| membership.durability);
+  if counts {
+    record_durability(configuration, bound)
+  } else {
+    bound.and_then(|bound| bound.shortfall(configuration))
   }
 }
 
@@ -1146,15 +1170,10 @@ fn init_shard(
     None => slates_cluster::fleet::FleetNode::solo(host),
   };
   let council_members = council.configuration().members.clone();
+  let mut durability_shortfall = None;
   if let Some(configuration) = council.configuration().configuration_for(host) {
-    // Surface a durability breach in the formed configuration at boot (§4.8, D-14); a no-op with no policy.
-    record_durability(
-      &configuration,
-      config
-        .fleet
-        .as_ref()
-        .and_then(|membership| membership.durability),
-    );
+    let counts = config_shards.first() == Some(&shard);
+    durability_shortfall = boot_durability(config, &configuration, counts);
     let _ = fleet.install_configuration(configuration, &council_members);
   }
   // The root group across regions (§4.8, D-14): the regions the fleet spans and the representative host of
@@ -1189,6 +1208,7 @@ fn init_shard(
     content_range,
     db,
     fleet,
+    durability_shortfall,
     origin_anchor,
     landing: crate::landing::LandingState::default(),
     store,
@@ -1568,15 +1588,18 @@ mod tests {
     .configuration_for(HostId(1))
     .expect("the owner has a placement view");
 
-    // No policy, and a policy that accepts any loss, both leave the signal unmoved.
+    // No policy, and a policy that accepts any loss, both leave the signal unmoved and measure no shortfall.
     let quiet = DURABILITY_BREACHES.load(Ordering::Relaxed);
-    record_durability(&configuration, None);
-    record_durability(
-      &configuration,
-      Some(DurabilityBound {
-        accepted_loss: 1.0,
-        coincident_failures: 2,
-      }),
+    assert_eq!(record_durability(&configuration, None), None);
+    assert_eq!(
+      record_durability(
+        &configuration,
+        Some(DurabilityBound {
+          accepted_loss: 1.0,
+          coincident_failures: 2,
+        }),
+      ),
+      None
     );
     assert_eq!(
       DURABILITY_BREACHES.load(Ordering::Relaxed),
@@ -1584,8 +1607,9 @@ mod tests {
       "no breach without a policy or within the accepted loss"
     );
 
-    // A zero-loss policy is breached by the redundant configuration, moving the signal.
-    record_durability(
+    // A zero-loss policy is breached by the redundant configuration, moving the signal — and the measured
+    // shortfall comes back, the fact the write path refuses with.
+    let shortfall = record_durability(
       &configuration,
       Some(DurabilityBound {
         accepted_loss: 0.0,
@@ -1596,6 +1620,13 @@ mod tests {
       DURABILITY_BREACHES.load(Ordering::Relaxed),
       quiet + 1,
       "a breach at a configuration change moves the health signal"
+    );
+    let shortfall = shortfall.expect("a breach measures its shortfall");
+    assert!(
+      shortfall.coincident_loss > 0.0
+        && shortfall.accepted_loss == 0.0
+        && shortfall.coincident_failures == 2,
+      "the shortfall carries the measured loss, the accepted ε and the failure count: {shortfall:?}"
     );
   }
 }

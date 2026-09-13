@@ -6,8 +6,9 @@ use std::fmt;
 use slates_ipc::IpcError;
 use slates_ipc::protocol::Refusal;
 
-/// A typed refusal from the client; never a panic.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A typed refusal from the client; never a panic. (`Eq` is not derived: a daemon [`Refusal`] may carry
+/// measured probabilities.)
+#[derive(Debug, Clone, PartialEq)]
 pub enum ClientError {
   /// The daemon refused the verb.
   Refused(Refusal),

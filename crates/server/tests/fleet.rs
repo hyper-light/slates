@@ -24,8 +24,8 @@ use rustls::pki_types::PrivateKeyDer;
 use slates_db::HostId;
 use slates_db::register::{ObjectId, Quorum, RegionId, rendezvous_first};
 use slates_ipc::protocol::{
-  Direction, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass, SnapshotId, VolumeId, pack,
-  unpack,
+  Direction, NamePolicy, Refusal, ReplyBody, RequestBody, Scope, SizeClass, SnapshotId, VolumeId,
+  pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
@@ -34,7 +34,7 @@ use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS, host_id_of};
 use slates_server::deploy::member_id;
 use slates_server::head::HeadValue;
 use slates_server::{
-  Daemon, DaemonConfig, FleetMembership, FleetPeer, FleetTransport, SegmentSource,
+  Daemon, DaemonConfig, DurabilityBound, FleetMembership, FleetPeer, FleetTransport, SegmentSource,
 };
 
 mod common;
@@ -233,6 +233,17 @@ fn start(this: Node, peer: Peer) -> Daemon {
 /// place a volume on a shard other than the control shard (the one holding the peer sessions) and prove the
 /// record plane reaches every owner shard (D-7: one owning shard per volume).
 fn start_sharded(this: Node, peer: Peer, shards: u16) -> Daemon {
+  start_with_policy(this, peer, shards, None)
+}
+
+/// [`start_sharded`] under the operator's `durability` policy (§4.8 "Placement"): the accepted coincident-loss
+/// probability and the failure count it is stated under, which gate the fleet's writes.
+fn start_with_policy(
+  this: Node,
+  peer: Peer,
+  shards: u16,
+  durability: Option<DurabilityBound>,
+) -> Daemon {
   let pid = std::process::id();
   let instance = format!("fleet-{}-{pid}", this.host.0);
   let config = DaemonConfig::derive(&this.profile, &instance)
@@ -244,7 +255,7 @@ fn start_sharded(this: Node, peer: Peer, shards: u16) -> Daemon {
       origin_anchor: this.origin_anchor,
       domains: std::collections::BTreeMap::new(),
       regions: std::collections::BTreeMap::new(),
-      durability: None,
+      durability,
       region_mirrors: std::collections::BTreeMap::new(),
     });
   let transport = FleetTransport {
@@ -2863,6 +2874,143 @@ fn a_volume_on_a_non_control_shard_replicates_its_content_and_places() {
     "a snapshot of a volume on another shard placed at the f=1 quorum: `await placed(snapshot, region)`"
   );
   assert!(held, "B holds the snapshot's content whole");
+}
+
+/// Starts a two-node `f = 1` fleet of two-shard daemons under one `durability` policy on both nodes and
+/// waits for its direct probe mesh to form; returns the daemons and A's instance name. The policy the two
+/// durability tests below differ by is the only input that differs between them.
+fn start_policed_pair(durability: DurabilityBound) -> (Daemon, Daemon, String) {
+  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let instance_a = format!("fleet-{}-{}", a.host.0, std::process::id());
+  let peer_of_a = Peer {
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start_with_policy(a, peer_of_a, TWO_SHARDS, Some(durability));
+  let daemon_b = start_with_policy(b, peer_of_b, TWO_SHARDS, Some(durability));
+  let formed = poll_until(&[&daemon_a, &daemon_b], FORMATION_DEADLINE, || {
+    daemon_a.fleet_meshed() == Some(true) && daemon_b.fleet_meshed() == Some(true)
+  });
+  if !formed {
+    daemon_a.stop();
+    daemon_b.stop();
+    panic!("the fleet's direct probe mesh formed");
+  }
+  (daemon_a, daemon_b, instance_a)
+}
+
+/// AC (§4.8 "Placement" — "the operator's accepted ε and the coincident-failure size are the durability policy
+/// that gates a refusal"; D-14, D-18; D-7 every shard is an owner): in a live two-node `f = 1` fleet whose
+/// policy accepts no loss under two coincident failures — which no `f = 1` copyset survives, so the committed
+/// configuration's loss is above ε — a volume create is refused `DurabilityUnmet` with the measured loss on
+/// **every** owner shard: the control shard, which measured the configuration it installed, and the other
+/// shard, which measured the copy fanned to it (a volume named onto it). Reads continue (`List` answers), and
+/// the refusals are counted under their kind on the shards that refused. Non-vacuous: the same fleet with a
+/// policy the configuration meets creates and seals (the next test) — only the policy differs.
+#[test]
+fn a_fleet_refuses_a_write_its_configuration_cannot_hold_to_the_declared_durability() {
+  let _serial = serialize_fleet_tests();
+  let (daemon_a, daemon_b, instance_a) = start_policed_pair(DurabilityBound {
+    accepted_loss: 0.0,
+    coincident_failures: 2,
+  });
+  let mut client = Client::connect(&instance_a);
+
+  let on_control = client.call(&scratch(&name_on_partition(
+    "short",
+    0,
+    usize::from(TWO_SHARDS),
+  )));
+  let on_other = client.call(&scratch(&name_on_partition(
+    "short",
+    OTHER_PARTITION,
+    usize::from(TWO_SHARDS),
+  )));
+  let listed = client.call(&RequestBody::List);
+  let status = client.call(&RequestBody::DaemonStatus);
+  daemon_a.stop();
+  daemon_b.stop();
+
+  let short = |reply: &ReplyBody| match reply {
+    ReplyBody::Refused {
+      refusal:
+        Refusal::DurabilityUnmet {
+          coincident_loss,
+          accepted_loss,
+          coincident_failures,
+        },
+    } => *coincident_loss > *accepted_loss && *accepted_loss == 0.0 && *coincident_failures == 2,
+    _ => false,
+  };
+  assert!(
+    short(&on_control),
+    "the control shard refuses the write with the shortfall it measured at install: {on_control:?}"
+  );
+  assert!(
+    short(&on_other),
+    "the other owner shard refuses with the shortfall it measured from the fanned configuration: {on_other:?}"
+  );
+  assert!(
+    matches!(&listed, ReplyBody::Listed { volumes } if volumes.is_empty()),
+    "reads continue, and the refused creates created nothing: {listed:?}"
+  );
+  let ReplyBody::DaemonStatus { report } = status else {
+    panic!("status is served while writes are refused");
+  };
+  let counted: u64 = report
+    .shards
+    .iter()
+    .flat_map(|shard| shard.refusals.iter())
+    .filter(|refusal| refusal.kind == "durability_unmet")
+    .map(|refusal| refusal.count)
+    .sum();
+  assert_eq!(
+    counted, 2,
+    "one counted refusal per refusing shard: {report:?}"
+  );
+}
+
+/// AC (§4.8 "Placement"; R8 the policy, not a mode, decides): the same two-node `f = 1` fleet under a policy
+/// its configuration meets — no loss accepted under a **single** failure, which holds at most one of a
+/// copyset's two copies — creates a volume on the non-control shard and seals it as any unpoliced fleet
+/// does. The contrast to the refusing fleet above: identical daemons, only the failure count differs.
+#[test]
+fn a_fleet_within_its_declared_durability_creates_and_seals() {
+  let _serial = serialize_fleet_tests();
+  let (daemon_a, daemon_b, instance_a) = start_policed_pair(DurabilityBound {
+    accepted_loss: 0.0,
+    coincident_failures: 1,
+  });
+  let mut client = Client::connect(&instance_a);
+  let created = client.call(&scratch(&name_on_partition(
+    "within",
+    OTHER_PARTITION,
+    usize::from(TWO_SHARDS),
+  )));
+  let sealed = match &created {
+    ReplyBody::Created { id } => Some(client.call(&RequestBody::Snapshot { volume: *id })),
+    _ => None,
+  };
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    matches!(created, ReplyBody::Created { .. }),
+    "a write within the declared durability is accepted: {created:?}"
+  );
+  assert!(
+    matches!(sealed, Some(ReplyBody::Snapshotted { .. })),
+    "a seal within the declared durability is accepted: {sealed:?}"
+  );
 }
 
 /// AC (D-7; §4.8 "Promotion and takeover" → serve; §4.10): a takeover successor materializes a dead

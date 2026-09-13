@@ -159,8 +159,41 @@ impl DurabilityBound {
   /// silently accepted (§4.8): the resolution is the operator's (raise `f`, the re-replication bandwidth, or
   /// the failure-domain granularity), not a quiet over-scatter.
   pub fn breached_by(&self, configuration: &Configuration) -> bool {
-    !configuration.within_loss_bound(self.accepted_loss, self.coincident_failures)
+    self.shortfall(configuration).is_some()
   }
+
+  /// The **measured shortfall** of `configuration` against this bound — the design's `within_loss_bound(ε, F)`
+  /// check (§4.8 "Placement"), answered with its numbers: `None` when the configuration's coincident-loss
+  /// probability under the policy's failure count is within the accepted ε, otherwise the probability the
+  /// configuration actually carries beside the ε it was held to and the failure count it was measured under.
+  /// This is the durability policy "that gates a refusal": the daemon measures it once at every configuration
+  /// change (a cold path — `Configuration::coincident_loss` is a few floating-point products) and keeps the
+  /// result on the shard, where the verbs read it per write as a field, never recomputing it.
+  pub fn shortfall(&self, configuration: &Configuration) -> Option<DurabilityShortfall> {
+    let coincident_loss = configuration.coincident_loss(self.coincident_failures);
+    if coincident_loss <= self.accepted_loss {
+      return None;
+    }
+    Some(DurabilityShortfall {
+      coincident_loss,
+      accepted_loss: self.accepted_loss,
+      coincident_failures: self.coincident_failures,
+    })
+  }
+}
+
+/// A committed configuration's durability **shortfall** against the operator's policy (§4.8 "Placement"):
+/// the coincident-loss probability it carries under the policy's failure count, above the accepted ε. The
+/// fact a write is refused with ([`Refusal::DurabilityUnmet`](slates_ipc::protocol::Refusal)) — measured at
+/// the configuration change, read per write.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DurabilityShortfall {
+  /// The configuration's measured coincident-loss probability under `coincident_failures` failures.
+  pub coincident_loss: f64,
+  /// The loss probability the policy accepts (its ε).
+  pub accepted_loss: f64,
+  /// The number of hosts the policy assumes fail at once.
+  pub coincident_failures: u64,
 }
 
 /// The daemon's configuration.
@@ -573,6 +606,65 @@ mod tests {
     assert!(
       !lax.breached_by(&configuration),
       "a policy that accepts any loss is never breached"
+    );
+  }
+
+  /// AC (§4.8 "Placement" — the `within_loss_bound(ε, F)` check answered with its numbers): a breach reports
+  /// its **measured shortfall** — the configuration's coincident-loss probability under the policy's failure
+  /// count, beside the ε it was held to and that count — so a refusal can carry the fact, not a flag. A
+  /// policy stated under a failure count no copyset can fall wholly inside (one host, at `f = 1`) has no
+  /// shortfall even at zero accepted loss; and a single-copy laptop configuration is never short (R8).
+  #[test]
+  fn a_breach_reports_its_measured_shortfall() {
+    use slates_db::register::RegionalConfiguration;
+    let owner = HostId(1);
+    let configuration = RegionalConfiguration::formed(
+      vec![owner, HostId(2), HostId(3)],
+      Quorum { f: 1 },
+      BTreeMap::new(),
+      3,
+      false,
+    )
+    .configuration_for(owner)
+    .expect("the owner has a placement view");
+
+    let strict = DurabilityBound {
+      accepted_loss: 0.0,
+      coincident_failures: 2,
+    };
+    let shortfall = strict
+      .shortfall(&configuration)
+      .expect("two coincident failures can lose an f = 1 copyset");
+    assert_eq!(
+      shortfall.coincident_loss,
+      configuration.coincident_loss(2),
+      "the shortfall carries the configuration's own measured loss"
+    );
+    assert!(
+      shortfall.coincident_loss > shortfall.accepted_loss,
+      "a shortfall is a loss above the accepted ε"
+    );
+    assert_eq!(shortfall.accepted_loss, 0.0);
+    assert_eq!(shortfall.coincident_failures, 2);
+
+    let one_failure = DurabilityBound {
+      accepted_loss: 0.0,
+      coincident_failures: 1,
+    };
+    assert_eq!(
+      one_failure.shortfall(&configuration),
+      None,
+      "one failing host cannot hold both copies of an f = 1 copyset: no shortfall even at zero accepted loss"
+    );
+
+    let laptop =
+      RegionalConfiguration::formed(vec![owner], Quorum { f: 0 }, BTreeMap::new(), 1, false)
+        .configuration_for(owner)
+        .expect("the solo owner has a placement view");
+    assert_eq!(
+      strict.shortfall(&laptop),
+      None,
+      "a single copy has no coincident loss: the laptop is never short under any policy (R8)"
     );
   }
 }

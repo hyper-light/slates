@@ -2700,9 +2700,10 @@ fn sync_config_from_council(local: HostId) {
     let Some(configuration) = configuration else {
       return;
     };
-    // Surface a durability breach in the newly-committed configuration (§4.8, D-14 — the copyset count check
-    // at every configuration change); a no-op when no operator durability policy is declared.
-    crate::daemon::record_durability(
+    // Measure the newly-committed configuration against the durability policy (§4.8, D-14 — the copyset count
+    // check at every configuration change): a breach is counted, and the measured shortfall is what this
+    // shard's writes are refused with from now on; a no-op when no operator durability policy is declared.
+    s.durability_shortfall = crate::daemon::record_durability(
       &configuration,
       s.config
         .fleet
@@ -2763,6 +2764,15 @@ fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
     let root = root.clone();
     let _ = run_on(origin, shard, move |s| {
       if placement.version > s.fleet.configuration().version {
+        // This shard serves its own writes, so it measures the fanned configuration against the durability
+        // policy for itself (the shortfall its writes are refused with); the control shard already counted
+        // this change's breach, so the measurement here moves no signal.
+        s.durability_shortfall = s
+          .config
+          .fleet
+          .as_ref()
+          .and_then(|membership| membership.durability)
+          .and_then(|bound| bound.shortfall(&placement));
         let _ = s.fleet.install_configuration(placement, &members);
       }
       s.root.adopt(root);

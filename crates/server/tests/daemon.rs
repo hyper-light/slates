@@ -15,7 +15,9 @@ use slates_ipc::protocol::{
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
-use slates_server::{Daemon, DaemonConfig, SegmentSource};
+use slates_server::daemon::host_id_of;
+use slates_server::deploy::member_id;
+use slates_server::{Daemon, DaemonConfig, DurabilityBound, FleetMembership, SegmentSource};
 use slates_wire::request::RequestId;
 
 /// Shape: the probe budget of the quick profile these tests measure (milliseconds); the
@@ -126,6 +128,145 @@ fn scratch(name: &str) -> RequestBody {
     require_locked: false,
     base: None,
   }
+}
+
+/// A daemon configured as a member of an `f = 1` fleet of three (itself and two peers it never reaches — no
+/// transport runs, so no probe, session or record plane is involved), under the operator's `durability`
+/// policy. The placement configuration is formed at boot from the declared members (§4.8, boot step 6), so
+/// what the policy allows is decided without a network; this is the smallest daemon that has a durability to
+/// fall short of.
+fn fleet_daemon(name: &str, durability: Option<DurabilityBound>) -> (Daemon, String) {
+  let profile = profile();
+  let instance = format!("srv-{name}-{}", std::process::id());
+  let origin_anchor = slates_db::HostId(host_id_of(&profile.facts.identity));
+  let host = member_id(origin_anchor, 0);
+  // The peers' ids only need to be distinct from this node's; the configuration is formed over all three.
+  let peers = vec![
+    slates_db::HostId(host.0.wrapping_add(1)),
+    slates_db::HostId(host.0.wrapping_add(2)),
+  ];
+  let config = DaemonConfig::derive(&profile, &instance)
+    .with_shards(TEST_SHARDS)
+    .with_fleet(FleetMembership {
+      quorum: slates_db::register::Quorum { f: 1 },
+      peers,
+      host,
+      origin_anchor,
+      domains: std::collections::BTreeMap::new(),
+      regions: std::collections::BTreeMap::new(),
+      durability,
+      region_mirrors: std::collections::BTreeMap::new(),
+    });
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-{name}"),
+    },
+  )
+  .unwrap();
+  (daemon, instance)
+}
+
+/// AC (§4.8 "Placement" — "the operator's accepted ε and the coincident-failure size are the durability policy
+/// that gates a refusal"; D-14, D-18): a write that would commit a new head or seal is refused, **typed and
+/// with the measured shortfall**, while the fleet's configuration cannot hold it to the declared durability;
+/// within the policy it is accepted; and with no policy declared it is accepted as before. Three daemons of
+/// the same fleet shape (`f = 1`, three members) differ only in their policy: one that accepts no loss under
+/// two coincident failures — which an `f = 1` copyset cannot survive, so the configuration's loss is above ε
+/// — refuses `Create` with `DurabilityUnmet` carrying that loss, the ε and the failure count, counts it, and
+/// still serves reads (`List`, `DaemonStatus`); one that accepts no loss under a **single** failure (no
+/// `f = 1` copyset falls wholly inside one host) creates and snapshots; one with no policy does the same.
+/// Non-vacuous: the refusing daemon and an accepting one are the same code and fleet shape — only the ε and
+/// the failure count decide.
+#[test]
+fn a_write_the_declared_durability_cannot_cover_is_refused_typed() {
+  // The configuration cannot hold a write to this: any f = 1 copyset is lost when its two holders fail at
+  // once, so its coincident-loss probability under two failures is positive, above an ε of zero.
+  let (strict, strict_instance) = fleet_daemon(
+    "durability-strict",
+    Some(DurabilityBound {
+      accepted_loss: 0.0,
+      coincident_failures: 2,
+    }),
+  );
+  let mut client = Client::connect(&strict_instance);
+  let reply = client.call(&scratch("short"));
+  let ReplyBody::Refused {
+    refusal:
+      Refusal::DurabilityUnmet {
+        coincident_loss,
+        accepted_loss,
+        coincident_failures,
+      },
+  } = reply
+  else {
+    strict.stop();
+    panic!("a write the configuration cannot hold to the policy is refused typed, got {reply:?}");
+  };
+  assert!(
+    coincident_loss > accepted_loss,
+    "the refusal carries the measured loss ({coincident_loss}) above the accepted ε ({accepted_loss})"
+  );
+  assert_eq!(
+    accepted_loss, 0.0,
+    "the ε is the operator's declared accepted loss"
+  );
+  assert_eq!(
+    coincident_failures, 2,
+    "the failure count is the one the policy was stated under"
+  );
+  // Reads continue: the listing answers (empty — nothing was created), and the status counts the refusal.
+  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    strict.stop();
+    panic!("a read is served while writes are refused");
+  };
+  assert!(volumes.is_empty(), "the refused create created nothing");
+  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    strict.stop();
+    panic!("status is served while writes are refused");
+  };
+  let counted: u64 = report
+    .shards
+    .iter()
+    .flat_map(|shard| shard.refusals.iter())
+    .filter(|refusal| refusal.kind == "durability_unmet")
+    .map(|refusal| refusal.count)
+    .sum();
+  assert_eq!(
+    counted, 1,
+    "the refusal is counted under its own kind: {report:?}"
+  );
+  strict.stop();
+
+  // Within the policy: a single failing host holds at most one of an f = 1 copyset's two copies, so the
+  // loss under one failure is zero — within an ε of zero. The same fleet shape creates and snapshots.
+  let (tolerant, tolerant_instance) = fleet_daemon(
+    "durability-tolerant",
+    Some(DurabilityBound {
+      accepted_loss: 0.0,
+      coincident_failures: 1,
+    }),
+  );
+  let mut client = Client::connect(&tolerant_instance);
+  let ReplyBody::Created { id } = client.call(&scratch("within")) else {
+    tolerant.stop();
+    panic!("a write within the declared durability is accepted");
+  };
+  let ReplyBody::Snapshotted { .. } = client.call(&RequestBody::Snapshot { volume: id }) else {
+    tolerant.stop();
+    panic!("a seal within the declared durability is accepted");
+  };
+  tolerant.stop();
+
+  // No policy: accepted as before (the default — an accepted loss is the operator's to state, never derived).
+  let (unpoliced, unpoliced_instance) = fleet_daemon("durability-none", None);
+  let mut client = Client::connect(&unpoliced_instance);
+  let ReplyBody::Created { .. } = client.call(&scratch("unpoliced")) else {
+    unpoliced.stop();
+    panic!("with no policy a write is accepted as before");
+  };
+  unpoliced.stop();
 }
 
 /// Create, a duplicate name, snapshot, clone: the ids and the refusal.
