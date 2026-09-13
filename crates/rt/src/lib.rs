@@ -32,7 +32,7 @@ pub mod error;
 pub mod futures;
 mod netsys;
 pub mod queue;
-mod readiness;
+pub mod readiness;
 pub mod registry;
 pub mod runtime;
 pub mod shard;

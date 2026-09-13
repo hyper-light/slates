@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use slates_bridge_core::{Attachments, OpContext, Rights, View};
 use slates_bridge_fuse::abi::IN_HEADER_LEN;
-use slates_bridge_virtiofs::admission::{Doorbell, SeamError, VmmSeam};
+use slates_bridge_virtiofs::admission::{Doorbell, Drained, SeamError, VmmSeam};
 use slates_bridge_virtiofs::device::DeviceConfig;
 use slates_bridge_virtiofs::memory::{GuestAddr, GuestMemory, GuestRange};
 use slates_bridge_virtiofs::sim::SimGuestMemory;
@@ -544,6 +544,10 @@ impl VmmSeam for SimVmm {
 
   fn doorbell(&self) -> Doorbell {
     Doorbell::InProcess
+  }
+
+  fn drain_doorbell(&mut self) -> Result<Drained, SeamError> {
+    Ok(Drained::Nothing)
   }
 
   fn release(&mut self) {

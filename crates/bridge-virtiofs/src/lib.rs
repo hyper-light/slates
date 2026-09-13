@@ -43,12 +43,18 @@
 //! credit window, charged per chain before access), [`admission`] (the `VmmSeam`, the ordered
 //! admission that authenticates the consumer first, the admitted device's service pass, revocation
 //! and the owned terminal step), [`capability`] (the truthful transport report `attach` and
-//! `status` carry, DAX not advertised).
+//! `status` carry, DAX not advertised), `serve` (Unix: the perpetual device loop on the owning
+//! shard over `slates-rt`, woken by the doorbell descriptor, revoked by message, ending in the
+//! terminal step).
 
 pub mod admission;
 pub mod capability;
 pub mod credit;
 pub mod device;
 pub mod memory;
+// The device loop rides the runtime's descriptor readiness, which is Unix (kqueue/epoll); a guest
+// device is served from a Linux or macOS host, never from Windows.
+#[cfg(unix)]
+pub mod serve;
 pub mod sim;
 pub mod virtqueue;

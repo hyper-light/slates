@@ -60,8 +60,20 @@ pub enum Doorbell {
   /// The VMM calls the device's service pass itself (the in-process form).
   InProcess,
   /// An OS descriptor (an eventfd, or a pipe's read end) that becomes readable on a kick; the
-  /// device's loop awaits it through the shard's driver (§4.3) and drains it.
+  /// device's loop awaits it through the shard's driver (§4.3) and asks the seam to drain it. The
+  /// seam owns the descriptor and keeps it non-blocking; the loop only ever holds its number.
   Descriptor(i32),
+}
+
+/// What draining the doorbell found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drained {
+  /// One or more kicks were pending and are now consumed.
+  Kicked,
+  /// Nothing was pending (a spurious wake).
+  Nothing,
+  /// The VMM closed its end: the guest is gone, which is a revocation.
+  HungUp,
 }
 
 /// A typed refusal from the seam.
@@ -114,6 +126,9 @@ pub trait VmmSeam {
   fn notify_used(&mut self, queue: u16) -> Result<(), SeamError>;
   /// How the device learns of new buffers.
   fn doorbell(&self) -> Doorbell;
+  /// Consumes every pending kick on a descriptor doorbell (the eventfd's counter, a pipe's bytes)
+  /// without blocking, reporting a hangup; the in-process form has nothing to drain.
+  fn drain_doorbell(&mut self) -> Result<Drained, SeamError>;
   /// Tears the guest's view of the device down: unmaps, closes, forgets. The terminal step's last
   /// action, and the cleanup of a failed admission. Idempotent.
   fn release(&mut self);
@@ -447,6 +462,11 @@ impl<S: VmmSeam> AdmittedDevice<S> {
   /// The doorbell the device waits on.
   pub fn doorbell(&self) -> Doorbell {
     self.seam.doorbell()
+  }
+
+  /// Drains the doorbell through the seam.
+  pub fn drain_doorbell(&mut self) -> Result<Drained, SeamError> {
+    self.seam.drain_doorbell()
   }
 
   /// The authenticated context an operation would run under, or the registry's refusal (after

@@ -6,7 +6,10 @@
 //! stream awaits readability for `read`/`accept` and writability for a `write` whose send buffer
 //! filled. The driver decides how the edge is watched (kqueue `EVFILT_READ`/`EVFILT_WRITE`, epoll
 //! `EPOLLIN`/`EPOLLOUT`); the future is the same either way, which is why it lives here and not in the
-//! socket modules.
+//! socket modules. [`readable`] is public because a bridge queue's doorbell is the same edge: the
+//! virtio-fs device (`slates-bridge-virtiofs`, §4.6) awaits the kick descriptor its VMM handed it —
+//! an eventfd or a pipe — through the shard's driver exactly as a socket is awaited, and drains it
+//! itself; the driver seam's doc names "the bridge queues" as a user of `wait` for this reason.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -66,8 +69,9 @@ impl Future for Ready {
   }
 }
 
-/// Awaits `raw`'s readability once (a real socket fd, or a simulated fabric port).
-pub(crate) async fn readable(raw: i32) -> Result<(), RtError> {
+/// Awaits `raw`'s readability once (a real socket fd, a simulated fabric port, or a bridge
+/// queue's doorbell descriptor).
+pub async fn readable(raw: i32) -> Result<(), RtError> {
   Ready {
     raw,
     interest: Interest::Readable,

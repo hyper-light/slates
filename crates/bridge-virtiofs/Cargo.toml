@@ -17,13 +17,14 @@ slates-wire = { workspace = true }
 slates-db = { workspace = true }
 slates-rt = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-# The doorbell descriptors (a pipe or an eventfd the VMM hands over): read to drain a kick, written to
-# raise a used-buffer notification. Descriptor I/O on a memory object, never a host path.
-rustix = { workspace = true }
-
 [dev-dependencies]
 slates-mem = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+# The runtime test's doorbell: a pipe pair the simulated VMM owns, drained and kicked through
+# `rustix` (descriptor I/O on a memory object, never a host path). The crate's own source holds no
+# descriptor — the seam owns and drains the doorbell; the loop only awaits its number.
+rustix = { workspace = true }
 
 [lints]
 workspace = true
