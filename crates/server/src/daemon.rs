@@ -415,14 +415,12 @@ impl Daemon {
 
   /// The hosts this daemon's fleet currently sees alive (§4.8) — this node and the peers its control-shard
   /// membership loop has probed and found live — for a test or an operator to observe the membership the
-  /// verbs read for placement. `None` if the daemon could not observe it in time ([`Self::observe`]); a
-  /// laptop (no fleet) reports itself alone.
-  pub fn fleet_members(&self) -> Vec<slates_db::HostId> {
-    self
-      .observe(self.shards.first().copied(), || {
-        state::with_state(|s| s.fleet.membership().alive())
-      })
-      .unwrap_or_default()
+  /// verbs read for placement. `None` when the daemon could not observe it ([`Self::observe`]) — which a
+  /// caller must treat as *unknown*, never as an empty membership; a laptop (no fleet) reports itself alone.
+  pub fn fleet_members(&self) -> Option<Vec<slates_db::HostId>> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| s.fleet.membership().alive())
+    })
   }
 
   /// Whether this daemon's fleet has formed its **direct probe mesh** (§4.8): every peer this node keeps
@@ -435,88 +433,77 @@ impl Daemon {
   /// that dies before its peers ever probed it, which no survivor could then detect; and it must cover the
   /// consensus voters outside the copyset, or a test proceeds while those probe sessions are still
   /// establishing under load. A laptop (no peers) is trivially meshed. Runs a one-shot query on the control
-  /// shard, bounded by the liveness budget; `false` if the daemon is stopping, is not on a shard, or the
-  /// shard does not answer in time.
-  pub fn fleet_meshed(&self) -> bool {
-    self
-      .observe(self.shards.first().copied(), || {
-        state::with_state(|s| {
-          // The peers to reach are every configured member this node keeps direct contact with, less this
-          // node; the mesh is up when every one has a formed probe session. A laptop has an empty peer set
-          // and is meshed at once.
-          let host = s.fleet.host();
-          s.fleet
-            .members()
-            .iter()
-            .filter(|&&peer| peer != host && crate::fleet::keeps_direct_contact_with(s, peer))
-            .all(|peer| s.formed_probe_peers.contains(peer))
-        })
+  /// shard; `None` when the daemon could not observe it ([`Self::observe`]), which a caller must treat as
+  /// *unknown*, never as "not meshed".
+  pub fn fleet_meshed(&self) -> Option<bool> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| {
+        // The peers to reach are every configured member this node keeps direct contact with, less this
+        // node; the mesh is up when every one has a formed probe session. A laptop has an empty peer set
+        // and is meshed at once.
+        let host = s.fleet.host();
+        s.fleet
+          .members()
+          .iter()
+          .filter(|&&peer| peer != host && crate::fleet::keeps_direct_contact_with(s, peer))
+          .all(|peer| s.formed_probe_peers.contains(peer))
       })
-      .unwrap_or(false)
+    })
   }
 
   /// Whether this daemon's regional configuration council (§4.8, D-14) currently believes itself the
-  /// **leader** — the elected configuration master for the region. A one-shot query on the control shard,
-  /// bounded by the liveness budget; `false` if the daemon is stopping, is not on a shard, or does not
-  /// answer in time. Exposed so a fleet test can prove the council elected a single stable leader over the
-  /// real transport.
-  pub fn council_leads(&self) -> bool {
-    self
-      .observe(self.shards.first().copied(), || {
-        state::with_state(|s| s.council.is_leader())
-      })
-      .unwrap_or(false)
+  /// **leader** — the elected configuration master for the region. A one-shot query on the control shard
+  /// ([`Self::observe`]); `None` when the daemon could not observe it, which a caller must treat as
+  /// *unknown*, never as "not the leader". Exposed so a fleet test can prove the council elected a single
+  /// stable leader over the real transport.
+  pub fn council_leads(&self) -> Option<bool> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| s.council.is_leader())
+    })
   }
 
-  /// This daemon's council **leader-contact** counter (§4.8): the number of leader appends its council has
-  /// answered. A follower's counter advancing across periods is the proof that the leader's heartbeats are
-  /// flowing over the transport — replication is live, not merely an election won (a non-vacuity counter).
-  /// A one-shot control-shard query, bounded by the liveness budget; `0` if the daemon is stopping, is not
-  /// on a shard, or does not answer in time.
-  pub fn council_contact(&self) -> u64 {
-    self
-      .observe(self.shards.first().copied(), || {
-        state::with_state(|s| s.council.leader_contact())
-      })
-      .unwrap_or(0)
+  /// This daemon's council **leader-contact** counter (§4.8): the number of leader appends and granted votes
+  /// its council has answered. A follower's counter advancing across periods is the proof that the leader's
+  /// heartbeats are flowing over the transport — replication is live, not merely an election won (a
+  /// non-vacuity counter). A one-shot control-shard query ([`Self::observe`]); `None` when the daemon could
+  /// not observe it — unknown, not zero.
+  pub fn council_contact(&self) -> Option<u64> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| s.council.leader_contact())
+    })
   }
 
   /// The **regional membership** this daemon's configuration council has committed and applied so far
   /// (§4.8, D-14) — the members of the `RegionalConfiguration`, the region the council masters. A one-shot
-  /// control-shard query, bounded by the liveness budget; empty if the daemon is stopping, is not on a
-  /// shard, or does not answer in time. Exposed so a fleet test can observe a membership change (a
-  /// retirement or admission) commit across the council over the transport.
-  pub fn council_members(&self) -> Vec<slates_db::HostId> {
-    self
-      .observe(self.shards.first().copied(), || {
-        state::with_state(|s| s.council.configuration().members.clone())
-      })
-      .unwrap_or_default()
+  /// control-shard query ([`Self::observe`]); `None` when the daemon could not observe it — unknown, never
+  /// an empty membership (a predicate "no longer a member" must not be satisfied by a shard that did not
+  /// answer). Exposed so a fleet test can observe a membership change (a retirement or admission) commit
+  /// across the council over the transport.
+  pub fn council_members(&self) -> Option<Vec<slates_db::HostId>> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| s.council.configuration().members.clone())
+    })
   }
 
   /// Whether this daemon leads the **root group** across regions (§4.8, D-14 — the root master). A one-shot
-  /// control-shard query bounded by the liveness budget; `false` if the daemon is stopping, is not on a
-  /// shard, or does not answer in time. Exposed so a fleet test can prove the root group elected a leader
-  /// over the transport.
-  pub fn root_leads(&self) -> bool {
-    self
-      .observe(self.shards.first().copied(), || {
-        state::with_state(|s| s.root.is_leader())
-      })
-      .unwrap_or(false)
+  /// control-shard query ([`Self::observe`]); `None` when the daemon could not observe it — unknown, never
+  /// "not the leader". Exposed so a fleet test can prove the root group elected a leader over the transport.
+  pub fn root_leads(&self) -> Option<bool> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| s.root.is_leader())
+    })
   }
 
   /// The **region membership** this daemon's root group has committed and applied so far (§4.8, D-14) — the
-  /// regions of the `RootConfiguration`. A one-shot control-shard query bounded by the liveness budget; empty
-  /// if the daemon is stopping, is not on a shard, or does not answer in time. Exposed so a fleet test can
-  /// observe a region change (a promotion or a lost region's retirement) commit across the root group over the
+  /// regions of the `RootConfiguration`. A one-shot control-shard query ([`Self::observe`]); `None` when the
+  /// daemon could not observe it — unknown, never an empty membership (a predicate "the lost region is
+  /// gone" must not be satisfied by a shard that did not answer). Exposed so a fleet test can observe a
+  /// region change (a promotion or a lost region's retirement) commit across the root group over the
   /// transport.
-  pub fn root_regions(&self) -> Vec<slates_db::register::RegionId> {
-    self
-      .observe(self.shards.first().copied(), || {
-        state::with_state(|s| s.root.configuration().regions.clone())
-      })
-      .unwrap_or_default()
+  pub fn root_regions(&self) -> Option<Vec<slates_db::register::RegionId>> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| s.root.configuration().regions.clone())
+    })
   }
 
   /// Promotes a lost region's mirror through the root group (§4.8 "region loss promotes the mirror through the
@@ -525,67 +512,51 @@ impl Daemon {
   /// split-brain). If this node leads the root group and `lost` has a declared mirror, it proposes
   /// `PromoteRegion{lost, mirror}`; the root group commits it over the transport, and every node then routes
   /// `lost`'s volumes to the mirror ([`RootConfiguration::home_of`](slates_db::register::RootConfiguration::home_of)).
-  /// Returns whether the promotion was proposed — `false` if this node is not the root leader, or `lost` has
-  /// no mirror, or is not a current region. A one-shot control-shard action, bounded by the liveness budget;
-  /// the operator issues it (a CLI verb over this) after judging the region truly lost.
-  pub fn promote_region(&self, lost: slates_db::register::RegionId) -> bool {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
-    else {
-      return false;
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(control, async move {
-        let proposed = state::with_state(|s| match s.region_mirrors.get(&lost) {
-          Some(&mirror) => s
-            .root
-            .propose(slates_cluster::root_group::RootCommand::PromoteRegion { lost, mirror }),
-          None => false,
-        })
-        .unwrap_or(false);
-        let _ = tx.send(proposed);
+  /// Returns whether the promotion was proposed — `Some(false)` if this node is not the root leader, or `lost`
+  /// has no mirror, or is not a current region; `None` when the daemon could not be reached to ask
+  /// ([`Self::observe`]: stopping, no shard, or unresponsive for the observe budget). A one-shot
+  /// control-shard action; the operator issues it (a CLI verb over this) after judging the region truly lost.
+  pub fn promote_region(&self, lost: slates_db::register::RegionId) -> Option<bool> {
+    self.observe(self.shards.first().copied(), move || {
+      state::with_state(|s| match s.region_mirrors.get(&lost) {
+        Some(&mirror) => s
+          .root
+          .propose(slates_cluster::root_group::RootCommand::PromoteRegion { lost, mirror }),
+        None => false,
       })
-      .is_err()
-    {
-      return false;
-    }
-    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
-      .unwrap_or(false)
+    })
   }
 
   /// The region a `volume` created in `creator_region` is served from, per this daemon's committed root
   /// configuration (§4.8 — its moved home if any, else its creator region, then any region promotion of that
-  /// region followed to a fixed point): `RootConfiguration::home_of`. Returns `creator_region` if the daemon
-  /// is not on a shard or does not answer in time. Exposed so a fleet test can prove a region-loss promotion
-  /// re-homes the lost region's volumes to the mirror.
+  /// region followed to a fixed point): `RootConfiguration::home_of`. `None` when the daemon could not
+  /// observe it ([`Self::observe`]) — unknown, never "still the creator region" (a shard that did not answer
+  /// must not read as "not yet promoted" or as "still lost"). Exposed so a fleet test can prove a region-loss
+  /// promotion re-homes the lost region's volumes to the mirror.
   pub fn region_home(
     &self,
     volume: slates_db::register::ObjectId,
     creator_region: slates_db::register::RegionId,
-  ) -> slates_db::register::RegionId {
-    self
-      .observe(self.shards.first().copied(), move || {
-        state::with_state(|s| s.root.configuration().home_of(volume, creator_region))
-      })
-      .unwrap_or(creator_region)
+  ) -> Option<slates_db::register::RegionId> {
+    self.observe(self.shards.first().copied(), move || {
+      state::with_state(|s| s.root.configuration().home_of(volume, creator_region))
+    })
   }
 
   /// Like [`Self::region_home`] but answered on the shard at `shard_index` (an index into this daemon's shard
   /// list) rather than the control shard. The cross-region lookup guard (`verbs::home_redirect`) runs on
   /// whatever shard a client lands on, so every shard must read the committed root configuration; this lets a
   /// fleet test prove a promotion committed on the control shard reaches the others (`sync_root_to_shards`).
-  /// Returns `creator_region` if there is no such shard or it does not answer in time.
+  /// `None` when there is no such shard or it could not be observed.
   pub fn region_home_on_shard(
     &self,
     shard_index: usize,
     volume: slates_db::register::ObjectId,
     creator_region: slates_db::register::RegionId,
-  ) -> slates_db::register::RegionId {
-    self
-      .observe(self.shards.get(shard_index).copied(), move || {
-        state::with_state(|s| s.root.configuration().home_of(volume, creator_region))
-      })
-      .unwrap_or(creator_region)
+  ) -> Option<slates_db::register::RegionId> {
+    self.observe(self.shards.get(shard_index).copied(), move || {
+      state::with_state(|s| s.root.configuration().home_of(volume, creator_region))
+    })
   }
 
   /// This daemon's **placement** neighbourhood (§4.8, D-14): the neighbourhood of the configuration the node
@@ -593,27 +564,26 @@ impl Daemon {
   /// the set the verbs draw candidates from. Distinct from [`council_members`](Daemon::council_members) (the
   /// council's committed region) and [`fleet_members`](Daemon::fleet_members) (the SWIM alive set): this is
   /// what the placement path actually reads, so a test can prove a council-committed change reaches
-  /// placement. A one-shot control-shard query, bounded by the liveness budget; empty if the daemon is
-  /// stopping, is not on a shard, or does not answer in time.
-  pub fn placement_neighbourhood(&self) -> Vec<slates_db::HostId> {
-    self
-      .observe(self.shards.first().copied(), || {
-        state::with_state(|s| s.fleet.configuration().neighbourhood.clone())
-      })
-      .unwrap_or_default()
+  /// placement. A one-shot control-shard query ([`Self::observe`]); `None` when the daemon could not observe
+  /// it — unknown, never an empty neighbourhood.
+  pub fn placement_neighbourhood(&self) -> Option<Vec<slates_db::HostId>> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| s.fleet.configuration().neighbourhood.clone())
+    })
   }
 
   /// Like [`Self::placement_neighbourhood`] but read on the shard at `shard_index` rather than the control
   /// shard. The placement verbs (`place`/`region_placed`/`await_placed`/`host_epoch`) run on a volume's owner
   /// shard, which may not be the control shard, so every shard must read the committed configuration; this
   /// lets a fleet test prove a council-committed change reaches every shard (`sync_config_from_council`'s
-  /// fan-out). Empty if there is no such shard or it does not answer in time.
-  pub fn placement_neighbourhood_on_shard(&self, shard_index: usize) -> Vec<slates_db::HostId> {
-    self
-      .observe(self.shards.get(shard_index).copied(), || {
-        state::with_state(|s| s.fleet.configuration().neighbourhood.clone())
-      })
-      .unwrap_or_default()
+  /// fan-out). `None` when there is no such shard or it could not be observed.
+  pub fn placement_neighbourhood_on_shard(
+    &self,
+    shard_index: usize,
+  ) -> Option<Vec<slates_db::HostId>> {
+    self.observe(self.shards.get(shard_index).copied(), || {
+      state::with_state(|s| s.fleet.configuration().neighbourhood.clone())
+    })
   }
 
   /// Test and operator support: folds a `Dead` belief about `peer` at `incarnation` into this node's
@@ -660,20 +630,23 @@ impl Daemon {
   /// folded `Alive` (a new member joins). This is exactly the fold the live `serve_peer_probes` /
   /// `probe_and_apply` learn-on-contact produces when the returning node's probes announce `new` and its `old`
   /// id stops answering — driven directly here because an in-process daemon cannot rebind its leaked fleet
-  /// sockets to actually restart (the same reason the rejoin test injects `observe_peer_dead`).
+  /// sockets to actually restart (the same reason the rejoin test injects `observe_peer_dead`). Delivered
+  /// like [`Self::observe_peer_dead`]: admission retried while the control channel is full
+  /// ([`Self::spawn_admitted`]), the fold awaited, both within the observe budget; returns whether it
+  /// **landed and folded**, so a test asserts its cue reached the daemon.
   pub fn observe_peer_restart(
     &self,
     old: slates_db::HostId,
     new: slates_db::HostId,
     death_incarnation: u64,
-  ) {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shards.first().copied())
-    else {
-      return;
+  ) -> bool {
+    let Some(control) = self.shards.first().copied() else {
+      return false;
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(control, async move {
+    if !self.spawn_admitted(control, OBSERVE_BUDGET_NS, || {
+      let tx = tx.clone();
+      async move {
         state::with_state(|s| {
           // The old id is dead at a high incarnation (so it outranks its seeded-alive belief); the new id
           // joins alive. `apply_peer_state` is the incarnation-gated fold the detector uses.
@@ -695,73 +668,56 @@ impl Daemon {
           );
         });
         let _ = tx.send(());
-      })
-      .is_err()
-    {
-      return;
+      }
+    }) {
+      return false;
     }
-    let _ = rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS));
+    rx.recv_timeout(std::time::Duration::from_nanos(OBSERVE_BUDGET_NS))
+      .is_ok()
   }
 
   /// Whether this daemon's fleet has **region-placed** the head of `object` (§4.8): its control-shard
   /// membership loop replicated the head's record to the candidate holders and recorded a quorum of
-  /// acknowledgements. A test or an operator reads this to observe cross-node replication; `false` if it is
-  /// not yet placed, the daemon is stopping, or it is a laptop (no fleet loop runs). Runs a one-shot query
-  /// on the control shard, bounded by the liveness budget.
-  pub fn fleet_head_placed(&self, object: slates_db::register::ObjectId) -> bool {
-    self
-      .observe(self.shard_of_object(object), move || {
-        state::with_state(|s| {
-          let quorum = s.fleet.configuration().quorum;
-          s.placed_heads
-            .get(&object)
-            .is_some_and(|head| head.placement.placed(quorum))
-        })
+  /// acknowledgements. A test or an operator reads this to observe cross-node replication: `Some(false)` if
+  /// it is not yet placed (or this is a laptop, where no fleet loop runs); `None` when the owner shard could
+  /// not be observed ([`Self::observe`]) — unknown, never "not placed". Runs a one-shot query on the object's
+  /// owner shard.
+  pub fn fleet_head_placed(&self, object: slates_db::register::ObjectId) -> Option<bool> {
+    self.observe(self.shard_of_object(object), move || {
+      state::with_state(|s| {
+        let quorum = s.fleet.configuration().quorum;
+        s.placed_heads
+          .get(&object)
+          .is_some_and(|head| head.placement.placed(quorum))
       })
-      .unwrap_or(false)
+    })
   }
 
   /// Whether this node **holds whole**, as a content candidate, the snapshot content with `manifest`
   /// identity (§4.10 "Content replication"): every chunk the manifest references, verified on arrival. A
   /// test or an operator reads this to observe that a holder received an owner's sealed content over the
   /// wire — the bytes a takeover successor materializes from. Non-vacuous: a holder holds nothing until the
-  /// owner's content put reaches it and verifies. Runs a one-shot query on the control shard, bounded by
-  /// the liveness budget; `false` if the daemon is stopping or the shard does not answer in time.
-  pub fn fleet_holder_content(&self, manifest: [u8; 32]) -> bool {
-    self
-      .observe(self.shards.first().copied(), move || {
-        state::with_state(|s| s.held_content.holds_manifest(&manifest))
-      })
-      .unwrap_or(false)
+  /// owner's content put reaches it and verifies. Runs a one-shot query on the control shard
+  /// ([`Self::observe`]); `None` when the daemon could not observe it — unknown, never "does not hold".
+  pub fn fleet_holder_content(&self, manifest: [u8; 32]) -> Option<bool> {
+    self.observe(self.shards.first().copied(), move || {
+      state::with_state(|s| s.held_content.holds_manifest(&manifest))
+    })
   }
 
   /// The manifest identity of the head snapshot of the volume `object` names, once the content plane has
   /// archived it (§4.10; recorded durably as `SnapshotIdentified`), or `None` before then, for a volume
-  /// with no snapshot, or for one this node does not own. Runs a one-shot query on the control shard,
-  /// bounded by the liveness budget.
+  /// with no snapshot, for one this node does not own, or when the owner shard could not be observed
+  /// ([`Self::observe`]). Runs a one-shot query on the object's owner shard.
   pub fn fleet_head_manifest(&self, object: slates_db::register::ObjectId) -> Option<[u8; 32]> {
-    let (Some(runtime), Some(control)) = (self.runtime.as_ref(), self.shard_of_object(object))
-    else {
-      return None;
-    };
-    let (tx, rx) = std::sync::mpsc::channel();
-    if runtime
-      .spawn_on(control, async move {
-        let identity = state::with_state(|s| {
-          let id = slates_db::catalog::VolumeId { bytes: object.0 };
-          let record = s.db.partition().volume(id)?;
-          s.db.partition().snapshot(id, record.head)?.identity
-        })
-        .flatten();
-        let _ = tx.send(identity);
+    self.observe(self.shard_of_object(object), move || {
+      state::with_state(|s| {
+        let id = slates_db::catalog::VolumeId { bytes: object.0 };
+        let record = s.db.partition().volume(id)?;
+        s.db.partition().snapshot(id, record.head)?.identity
       })
-      .is_err()
-    {
-      return None;
-    }
-    rx.recv_timeout(std::time::Duration::from_nanos(LIVENESS_BUDGET_NS))
-      .ok()
       .flatten()
+    })
   }
 
   /// The head this node **durably holds** for `object` as a candidate holder (§4.8 "records are sent to

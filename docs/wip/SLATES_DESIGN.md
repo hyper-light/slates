@@ -1606,8 +1606,9 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 > 10× heartbeat ratio remains. Follow-up, same day: `check_quorum` is driven from the coordinator on the
 > election-timeout cadence (a leader that hears from no majority in a window steps down; unit-tested in both
 > groups), and SWIM probes consensus voters directly (`keeps_direct_contact_with`: one predicate for the
-> record link, the probe's resume and retire-on-fold, and the formation gate). Owed: `Option`-typed
-> observation accessors. Record:
+> record link, the probe's resume and retire-on-fold, and the formation gate); and the test-facing
+> observation accessors are `Option`-typed, so a shard that did not answer never satisfies a test
+> predicate. Record:
 > `docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md`.
 
 **Role.** The authoritative record of volumes, snapshots, lineage, leases, attachments,
