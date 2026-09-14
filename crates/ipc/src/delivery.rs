@@ -1240,7 +1240,7 @@ mod tests {
   /// consumer finds when its harness is broken or hostile, each a typed fault and never a hang.
   #[cfg(unix)]
   mod descriptors {
-    use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+    use std::os::fd::{IntoRawFd, OwnedFd};
 
     use super::super::{DeliveryFault, RECORD_BYTES, encode, take_named};
 

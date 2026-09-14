@@ -34,16 +34,34 @@ fn drive(vol: &mut Volume, store: &mut Store, steps: &[Step]) {
 /// taking new bytes from the head (the sealed post-state) at the hunks' post offsets.
 fn apply_document(doc: &OpsDocument, base: &PathState, head: &PathState) -> Option<PathState> {
   let mut out = base.clone();
-  // Renamed subtrees are detached first, removals apply, then the subtrees attach at their
-  // new paths: a rename over a removed directory and a rename out of one both read right.
+  // The document's one order (the deriver's module doc): renamed subtrees are detached first; the
+  // removals outside every rename target apply (a rename over a removed directory reads right);
+  // the subtrees attach at their new paths; then the removals beneath a rename target apply — they
+  // are named by their post-rename paths, which exist only once the subtree is attached (a removal
+  // inside a renamed directory reads right).
+  // Renames nest: an inner directory renamed inside a renamed parent has its source in base
+  // coordinates and its target in post-rename coordinates. Detaching the deepest source first
+  // takes the inner subtree out before the outer subtree is taken (so the outer carries no stale
+  // copy of it), and attaching the shallowest target first puts the outer subtree in place before
+  // the inner one attaches beneath its new name.
+  let mut renames: Vec<&(Box<str>, Box<str>)> = doc.dirs_renamed.iter().collect();
+  renames.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
   let mut detached = Vec::new();
-  for (from, to) in &doc.dirs_renamed {
+  for (from, to) in renames {
     detached.push((detach_dir(&mut out, from), to.clone()));
   }
-  remove_paths(&mut out, doc);
+  detached.sort_by_key(|(_, to)| to.len());
+  let under_target = |p: &str| {
+    doc.dirs_renamed.iter().any(|(_, to)| {
+      p.strip_prefix(to.as_ref())
+        .is_some_and(|r| r.starts_with('/'))
+    })
+  };
+  remove_paths(&mut out, doc, |p| !under_target(p));
   for (subtree, to) in detached {
     attach_dir(&mut out, subtree, &to);
   }
+  remove_paths(&mut out, doc, under_target);
   for s in &doc.symlinks {
     out
       .symlinks
@@ -139,12 +157,13 @@ fn attach_dir(out: &mut PathState, sub: Subtree, to: &str) {
   }
 }
 
-fn remove_paths(out: &mut PathState, doc: &OpsDocument) {
-  for p in &doc.removed {
+/// Applies the document's removals whose path `select` accepts (the two phases of the one order).
+fn remove_paths(out: &mut PathState, doc: &OpsDocument, select: impl Fn(&str) -> bool) {
+  for p in doc.removed.iter().filter(|p| select(p)) {
     out.files.remove(p.as_ref());
     out.symlinks.remove(p.as_ref());
   }
-  for d in &doc.dirs_removed {
+  for d in doc.dirs_removed.iter().filter(|d| select(d)) {
     let prefix = format!("{d}/");
     out.files.retain(|k, _| !k.starts_with(&prefix));
     out.symlinks.retain(|k, _| !k.starts_with(&prefix));
@@ -341,3 +360,87 @@ fn a_fixed_history_has_a_golden_identity() {
 
 /// Format: the identity of the fixed history above, recorded on 2026-09-05 (macOS, aarch64).
 const GOLDEN_IDENTITY: &str = "0899b4cbb4dfb4aac43d00de3d87c239e658d9bd7e5ee89f3f525a4acaeee531";
+
+/// Runs `prefix` to a base snapshot and `suffix` to a head, derives, and applies the document with
+/// the reference applier; the applied files, symlinks and directory paths must equal the head's.
+fn derive_and_apply_equals_head(prefix: &[Step], suffix: &[Step]) {
+  let mut store = store();
+  let mut vol = volume_with(
+    &mut store,
+    Quota::Bounded { limit: 1 << 30 },
+    NameEquivalence::Exact,
+  );
+  drive(&mut vol, &mut store, prefix);
+  let base = vol.snapshot(&mut store).unwrap();
+  let base_state = snapshot_state(&vol, &store, base);
+  drive(&mut vol, &mut store, suffix);
+  let head = head_state(&vol, &store);
+  let doc = vol.derive(&store, base).unwrap();
+  let applied = apply_document(&doc, &base_state, &head).expect("every hunk inside its sources");
+  assert!(
+    same_files(&applied, &head),
+    "files: applied {:?} head {:?} doc {doc:?}",
+    applied.files.keys().collect::<Vec<_>>(),
+    head.files.keys().collect::<Vec<_>>()
+  );
+  assert_eq!(applied.symlinks, head.symlinks, "symlinks {doc:?}");
+  let mut applied_dirs = applied.dir_paths();
+  applied_dirs.sort();
+  let mut head_dirs = head.dir_paths();
+  head_dirs.sort();
+  assert_eq!(applied_dirs, head_dirs, "directories {doc:?}");
+}
+
+fn at(components: &[&str]) -> Vec<String> {
+  components.iter().map(|c| (*c).to_owned()).collect()
+}
+
+/// T-1.18 (deriver; the applier's one order — renamed directories detach, then removals apply, then
+/// the subtrees attach): a removal beneath a directory renamed in the same increment is named by
+/// its **post-rename** path, because at the removal step the subtree is detached and the base path
+/// no longer exists. Found by the generative oracle after 120,300 cases (2026-09-14): base `/A/e`;
+/// unlink `/A/e`, rename `/A` → `/a`; the document said `removed: ["/A/e"]`, the applier removed
+/// nothing and attached `/a/e`, and the head had no files
+/// (`docs/bugs/2026-09-14-deriver-names-a-removal-under-a-rename-by-its-base-path.md`).
+#[test]
+fn a_removal_beneath_a_renamed_directory_is_named_by_its_post_rename_path() {
+  use Step::*;
+  derive_and_apply_equals_head(
+    &[Mkdir(at(&[]), "A".into()), Create(at(&["A"]), "e".into())],
+    &[
+      Unlink(at(&["A"]), "e".into()),
+      Rename(at(&[]), "A".into(), at(&[]), "a".into()),
+    ],
+  );
+}
+
+/// The siblings of the case above: a subdirectory removed beneath a renamed parent, a symlink removed
+/// beneath one, and a removal beneath a directory renamed twice deep (the deepest rename maps it).
+#[test]
+fn removals_beneath_renamed_directories_follow_every_rename_shape() {
+  use Step::*;
+  derive_and_apply_equals_head(
+    &[
+      Mkdir(at(&[]), "A".into()),
+      Mkdir(at(&["A"]), "b".into()),
+      Symlink(at(&["A"]), "d".into()),
+    ],
+    &[
+      Rmdir(at(&["A"]), "b".into()),
+      Unlink(at(&["A"]), "d".into()),
+      Rename(at(&[]), "A".into(), at(&[]), "a".into()),
+    ],
+  );
+  derive_and_apply_equals_head(
+    &[
+      Mkdir(at(&[]), "A".into()),
+      Mkdir(at(&["A"]), "b".into()),
+      Create(at(&["A", "b"]), "e".into()),
+    ],
+    &[
+      Unlink(at(&["A", "b"]), "e".into()),
+      Rename(at(&["A"]), "b".into(), at(&["A"]), "C".into()),
+      Rename(at(&[]), "A".into(), at(&[]), "a".into()),
+    ],
+  );
+}

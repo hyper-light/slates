@@ -16,9 +16,12 @@
 //! (or whose home no longer names it) costs a walk.
 //!
 //! An applier reads the document as a set with one order: renamed directories are detached
-//! from their base paths, then removals apply, then the detached subtrees attach at their new
-//! paths, then directories are created, then symlinks, then files; a file's base reference
-//! names its base path before any of that, so it is looked up in the base as it was.
+//! from their base paths; the removals outside every rename target apply (a rename over a
+//! removed directory); the detached subtrees attach at their new paths; the removals beneath a
+//! rename target apply — a removal inside a renamed directory is named by its **post-rename**
+//! path, the only one that exists at that step (found by the generative oracle after 120,300
+//! cases, 2026-09-14); then directories are created, then symlinks, then files. A file's base
+//! reference names its base path before any of that, so it is looked up in the base as it was.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -426,6 +429,14 @@ pub fn derive(vol: &Volume, store: &Store, base: SnapshotId) -> Result<OpsDocume
     .map(|(from, _)| from.clone())
     .collect();
   doc.dirs_removed.retain(|p| !sources.contains(p));
+  // A removal beneath a renamed directory is named by its post-rename path: the applier's one order
+  // detaches renamed subtrees first, so at the removal step the base path no longer exists and only
+  // the post-rename one does. The paths were journaled and classified under their base names; each
+  // is rewritten through the renames it lies under, deepest source first, and again for a renamed
+  // ancestor of that source (two renames compose).
+  for path in doc.removed.iter_mut().chain(doc.dirs_removed.iter_mut()) {
+    *path = post_rename_path(path, &doc.dirs_renamed);
+  }
   doc.dirs_created.sort();
   doc.dirs_created.dedup();
   doc.dirs_removed.sort();
@@ -435,6 +446,30 @@ pub fn derive(vol: &Volume, store: &Store, base: SnapshotId) -> Result<OpsDocume
   doc.symlinks.sort_by(|a, b| a.path.cmp(&b.path));
   doc.files.sort_by(|a, b| a.path.cmp(&b.path));
   Ok(doc)
+}
+
+/// The path an entry beneath renamed directories has once the renames have applied: the deepest
+/// renamed source that is a proper ancestor of `path` maps its prefix to the rename's target, and the
+/// result is mapped again for a renamed ancestor of that target's source (a directory renamed inside
+/// a directory that was itself renamed) until no source matches. A path under no renamed source is
+/// returned as it was. Bounded by the rename count: each pass consumes one rename.
+fn post_rename_path(path: &str, renames: &[(Box<str>, Box<str>)]) -> Box<str> {
+  let mut current: String = path.to_owned();
+  for _ in 0..renames.len() {
+    let deepest = renames
+      .iter()
+      .filter(|(from, _)| {
+        current
+          .strip_prefix(from.as_ref())
+          .is_some_and(|rest| rest.starts_with('/'))
+      })
+      .max_by_key(|(from, _)| from.len());
+    let Some((from, to)) = deepest else {
+      break;
+    };
+    current = format!("{to}{}", &current[from.len()..]);
+  }
+  current.into_boxed_str()
 }
 
 impl Deriver<'_> {

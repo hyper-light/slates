@@ -1,0 +1,80 @@
+# The deriver named a removal beneath a renamed directory by its base path, which no applier step can reach
+
+Date: 2026-09-14
+Area: `crates/vfs/src/derive.rs` (the ops-document deriver, §4.16 "Composition at seal", Phase 1 task 14)
+and its reference applier in `crates/vfs/tests/derive.rs`
+Severity: correctness of the increment's ops document — an unlink inside a directory renamed in the
+same increment was lost on application, so the merged post-state kept a file the work had deleted.
+
+## Symptom
+
+`crates/vfs/tests/derive.rs::net_apply_equals_raw_replay` (T-1.18/AC-1.15, the generative oracle:
+300 cases per run) failed intermittently — once in the base-fuse integration run on main, once for the
+base-fuse agent at `4f5deae`, and in a hunt every ~100 runs (run 92 of 600; run 401 of 2,000 in a
+private target directory). Its shrunk input:
+
+```
+prefix = [Mkdir([], "A"), Create(["A"], "e")]
+suffix = [Unlink(["A"], "e"), Rename([], "A", [], "a")]
+files: applied ["/a/e"] head []
+doc = OpsDocument { dirs_renamed: [("/A", "/a")], removed: ["/A/e"], .. }
+```
+
+The rate: 1 failure in roughly 30,000 generated histories, because the case needs a removal inside
+a directory the same increment renames, and the six-name, two-deep generator rarely produces both.
+
+## Root cause
+
+Two halves, one rule.
+
+1. The deriver classified every journaled path under its **base** name (`classify_path` on the
+   touched set), so a removal beneath a renamed directory was emitted as `removed: ["/A/e"]`. The
+   post-processing in `derive` already mapped `dirs_removed` against rename **sources** but never
+   rewrote a removal *beneath* a source, and `walk_subtree` over the renamed directory reads the
+   head's subtree, where the removed entry no longer exists — so nothing emitted `/a/e`.
+2. The document's stated order ("renamed directories are detached, then removals apply, then the
+   subtrees attach") cannot apply a removal inside a renamed directory at all: at the removal step
+   the subtree is detached, so neither `/A/e` nor `/a/e` exists. The reference applier followed that
+   order and silently removed nothing; the re-attached subtree brought `/a/e` back.
+
+## Fix
+
+The one order, restated in the deriver's module doc and realized in the reference applier: renamed
+subtrees detach (deepest source first); removals **outside** every rename target apply (a rename over
+a removed directory); the subtrees attach (shallowest target first); removals **beneath** a rename
+target apply, named by their **post-rename** paths — the only paths that exist at that step. The
+deriver rewrites every `removed` and `dirs_removed` path beneath a renamed source through the renames
+it lies under (`post_rename_path`: the deepest matching source, repeated for a renamed ancestor of
+that target's source, bounded by the rename count), so the emitted document is applicable. The
+nested-rename shape (`/A/b` → `/A/C` inside `/A` → `/a`, whose inner target is in post-rename
+coordinates) needs the deepest-first detach and shallowest-first attach, or the outer subtree carries
+a stale copy of the inner one.
+
+Failing tests first, `crates/vfs/tests/derive.rs`:
+- `a_removal_beneath_a_renamed_directory_is_named_by_its_post_rename_path` (the shrunk case) —
+  before: `files: applied ["/a/e"] head []`; after: ok.
+- `removals_beneath_renamed_directories_follow_every_rename_shape` (a removed subdirectory and a
+  removed symlink beneath a renamed parent; a removal beneath a directory renamed inside a renamed
+  parent) — before: `dirs_removed: ["/A/b"], removed: ["/A/d"]` applied nothing; after the deriver
+  fix alone the nested shape still applied `["/a/b/e"]`; after the applier order: ok.
+
+The golden identity (`a_fixed_history_has_a_golden_identity`) is unchanged: that history has no
+removal beneath a rename, so its document bytes are identical. The generative oracle: 0 failures in
+12,000 cases on the fix (40 runs), plus the long run recorded in the commit.
+
+## Impact
+
+Any increment that deleted an entry inside a directory it also renamed produced a document whose
+application kept the deleted entry. The merge engine's own deriver (`crates/merge`, `Increment`)
+consumes the journal directly and was not affected; the vfs `OpsDocument` reaches the wire through
+`derive` and is what a holder or a later reader applies, so the correction is to the document's
+contract, not only to the test.
+
+## Sibling sweep
+
+- `dirs_removed` entries that are themselves a rename source are already dropped (the rename carries
+  the move); unchanged.
+- A file *renamed* (not removed) inside a renamed directory is carried by the parent's rename and
+  skipped by `walk_subtree` ("what moved unchanged with a renamed parent is skipped"); unchanged.
+- `symlinks` and `files` of the post-state are already named by their head paths (they come from
+  the head walk); only the removal classes were named by base paths.
