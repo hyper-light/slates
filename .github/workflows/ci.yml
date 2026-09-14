@@ -220,8 +220,15 @@ jobs:
         with:
           toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
-      - name: loom (every interleaving of the ring)
-        run: RUSTFLAGS="--cfg loom" cargo test -p slates-mem --lib --release loom
+      # AC-0.7 / T-0.3: every loom model in the workspace — the one-producer ring, the two contending
+      # producers, the lapping producer, the handle core (a handle crossing threads against its slot's
+      # reuse) and the runtime's kick-if-parked protocol — under the bounds `slates_mem::loom_bounds`
+      # carries in code (a preemption bound of 2 and a 224-branch cap, each Derived: there), so this
+      # lane sets no environment variable and explores exactly what a laptop run explores. The models
+      # print the interleavings they explored (`--nocapture`), so the log carries the numbers
+      # `docs/wip/concurrency.md` records.
+      - name: loom (every bounded interleaving of the rings, the handle core and the parking protocol)
+        run: RUSTFLAGS="--cfg loom" cargo test -p slates-mem -p slates-rt --lib --release loom -- --nocapture
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
@@ -272,3 +279,24 @@ jobs:
           cargo test -p slates-rt --test udp
           cargo test -p slates-client --test client the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed
           cargo test -p slates-bridge-winfsp --test mount -- --nocapture
+
+  # Part 6 "Concurrency", nightly: shuttle's randomized schedules over the pure cores — T-1.6 (two
+  # agents clone-and-write on one base through the store's owner) and T-6.7 (sixteen agents submit
+  # with random overlaps to one green through its owner), each under a fixed seed and a schedule
+  # budget that are Derived: constants in the test files, so a failing schedule replays from the seed
+  # shuttle prints. shuttle is a dev-dependency built only under `--cfg shuttle`; nothing shipped
+  # links it. The nightly cadence here is the repository's (a push to main, as `windows-nightly`).
+  # TSan, the other nightly tool the design names, is owed (it needs the nightly toolchain's
+  # `-Zsanitizer=thread` and a Linux target; `docs/wip/concurrency.md`).
+  shuttle-nightly:
+    name: shuttle (vfs clones, merge green; nightly cadence)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: shuttle (T-1.6 two agents on one base; T-6.7 sixteen agents on one green)
+        run: RUSTFLAGS="--cfg shuttle" cargo test -p slates-vfs -p slates-merge --test shuttle_clones --test shuttle_green -- --nocapture
