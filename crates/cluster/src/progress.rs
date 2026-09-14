@@ -27,7 +27,9 @@
 /// chunks acknowledged); only its *advance* matters, so the witness is unit-agnostic.
 pub struct ProgressWitness {
   last_measure: u64,
-  last_advance_ns: u64,
+  /// When the measure last advanced — `None` until it first does: a witness that has never advanced has
+  /// witnessed no progress, whatever the clock says, so its birth is not an advance.
+  last_advance_ns: Option<u64>,
   stall_window_ns: u64,
 }
 
@@ -36,9 +38,10 @@ impl ProgressWitness {
   /// no advance after which the operation is judged stalled (derived from the operation's expected
   /// per-step latency — long enough that a genuinely working step is not called stuck).
   pub fn new(stall_window_ns: u64, now_ns: u64) -> ProgressWitness {
+    let _ = now_ns;
     ProgressWitness {
       last_measure: 0,
-      last_advance_ns: now_ns,
+      last_advance_ns: None,
       stall_window_ns,
     }
   }
@@ -49,14 +52,16 @@ impl ProgressWitness {
   pub fn observe(&mut self, measure: u64, now_ns: u64) {
     if measure > self.last_measure {
       self.last_measure = measure;
-      self.last_advance_ns = now_ns;
+      self.last_advance_ns = Some(now_ns);
     }
   }
 
   /// Whether the operation is progressing at `now_ns`: its measure advanced within the stall window. A
   /// witness that has gone a whole stall window with no advance is stalled.
   pub fn is_progressing(&self, now_ns: u64) -> bool {
-    now_ns.saturating_sub(self.last_advance_ns) < self.stall_window_ns
+    self
+      .last_advance_ns
+      .is_some_and(|advanced| now_ns.saturating_sub(advanced) < self.stall_window_ns)
   }
 
   /// The highest progress measure reported so far.
@@ -192,6 +197,30 @@ mod tests {
     assert!(
       !witness.is_progressing(26),
       "a full stall window (20) past the last advance at t=5"
+    );
+  }
+
+  /// A witness that has **never** advanced is not progressing — not even within its first stall window
+  /// after birth. An operation that has gathered nothing since it was dispatched has made no progress to
+  /// witness; treating its birth as an advance let the deadline extender grant an extension to a round
+  /// with zero acknowledgements at its lookahead, purely because the stall window had not elapsed since
+  /// dispatch — the seal hedge then never fired at the p95 (`server::fleet`).
+  #[test]
+  fn a_witness_that_never_advanced_is_not_progressing() {
+    let witness = ProgressWitness::new(STALL_WINDOW, 0);
+    assert!(
+      !witness.is_progressing(1),
+      "nothing has advanced: no progress to witness, whatever the clock says"
+    );
+    assert!(
+      !witness.is_progressing(STALL_WINDOW - 1),
+      "still nothing, still not progressing — birth is not an advance"
+    );
+    let mut advanced = ProgressWitness::new(STALL_WINDOW, 0);
+    advanced.observe(1, 3);
+    assert!(
+      advanced.is_progressing(3 + STALL_WINDOW - 1),
+      "one real advance: progressing for a stall window from it"
     );
   }
 

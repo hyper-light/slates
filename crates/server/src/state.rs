@@ -306,6 +306,28 @@ pub struct ShardState {
   /// `f + 1` hold it, and is dropped once the head naming it places and the snapshot is recorded placed.
   /// Empty on a laptop and whenever every owned snapshot is placed.
   pub seals: BTreeMap<ObjectId, crate::head::SealJob>,
+  /// The measured put latency of this node's **content class** (§4.8 "Derived constants": "hedge delay =
+  /// measured p95 put latency per class"): one reading per binding content acknowledgement this owner
+  /// shard has collected — the time from the round's dispatch to that holder's verified acknowledgement.
+  /// Its p95 is the hedge trigger: how long the first content round to `f + 1` candidates is given before
+  /// the remaining candidates are hedged. Bounded to a window of the newest readings; empty until the
+  /// first content acknowledgement, and on a laptop, where no content round runs — the trigger is then
+  /// one period (R8, the same code with an empty window).
+  pub put_latency: crate::fleet::PutLatency,
+  /// The measured **put-failure rate** of this owner shard's content class (§4.8 "Derived constants":
+  /// "healer cadence from the measured put-failure rate"): how many content rounds ended placed and how
+  /// many ended short (uncertain at the deadline, or every holder answering short of quorum), over the
+  /// shard's lifetime. The healer's cadence is derived from their ratio ([`crate::fleet::heal_period_ns`]):
+  /// a shard whose puts fail often walks its placed content sooner. Both zero on a laptop.
+  pub put_outcomes: crate::fleet::PutOutcomes,
+  /// The healer's position (§4.10 "anti-entropy … the healer"): which owned volume's placed snapshot it
+  /// re-offers next, in id order, and when it last did — one snapshot per healer period, a bounded slice
+  /// of the walk over everything this node has placed. Idle on a laptop (nothing is placed remotely).
+  pub healer: crate::fleet::HealerCursor,
+  /// How many placed snapshots the healer has **repaired** — re-put to a recorded holder that answered an
+  /// offer with chunks it lacked — the non-vacuity counter a test reads (`fleet_repairs`): a healer that
+  /// walks but never repairs anything cannot masquerade as working.
+  pub repairs: u64,
   /// Taken-over objects whose head this node adopted and placed but whose **content** it has not yet
   /// materialized into a served volume (§4.10 "Promotion and takeover" → serve): the adopted head
   /// value, kept until the manifest's archive is held (already, as a content candidate, or fetched

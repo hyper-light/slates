@@ -2157,6 +2157,23 @@ reported; `await placed(mirror)` refuses at its deadline with `NotPlaced{mirror}
 sets; auto-seal still runs (it bounds the archive's staleness and drives dedup); migration and
 mirroring have no targets and their verbs refuse `Unsupported`.
 
+> **Status (2026-09-13).** The hedge, the healer and the cost model are built to the derived-constants
+> rule. A seal's content round is collected only until the measured p95 put latency and then hedged —
+> the coordinator free, a slow holder's acknowledgement folded later, never dropped. The healer walks
+> one placed snapshot per period derived from the measured put-failure rate, re-offering it through the
+> ordinary rounds so a holder that lost content is repaired by exactly the chunks it lacks and one that
+> lost nothing costs one round trip. Every chunk is stored under the §4.11 cost model over the boot
+> profile's codec points, a byte's neutral worth its measured memcpy cost — at which a copy read once
+> is raw, the design's hot-volume rule; the archive class's `value_of_byte` and the live pressure/load
+> signals are the derivations that remain. The walk records the dedup gain and file-size distribution
+> FastCDC is gated on. Record: `docs/wip/content-replication.md`. Integration found and fixed two
+> defects: the hedge widened its targets on the count of rounds that had *placed* rather than on the
+> clock, so a first round whose only holder was unavailable re-aimed at it until the holder returned
+> (3.2 s against a 3 s hold, one run in three) — the trigger is now time outstanding since the first
+> attempt (`hedge_targets`); and a progress witness reported "progressing" for a stall window after
+> birth with nothing observed, granting a zero-acknowledgement round its extension — it now advances
+> only on a real advance (`docs/bugs/2026-09-13-hedge-keyed-on-placed-round-count-never-widens.md`).
+
 ### 4.11 Compression, deduplication, hashing, archive (D-17)
 
 **Cost model.** Inputs from the profile (codec throughput per level, hash throughput, memcpy

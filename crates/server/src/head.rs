@@ -105,6 +105,17 @@ pub struct SealJob {
   /// Content rounds run so far: the first goes to `f + 1` candidates (the owner and `f` more), later
   /// ones hedge to the rest (§4.8 "hedged to the remaining candidates").
   pub rounds: u32,
+  /// When the first content round was dispatched (the shard clock, nanoseconds), once it has been: the
+  /// hedge round to the remaining candidates is held until this is older than the **measured** p95 put
+  /// latency (§4.8 "hedged to the remaining candidates after the measured p95 put latency"), so a first
+  /// round that is merely a little slow is not doubled up on, while one that has fallen into the tail is.
+  /// `None` until the first round goes out.
+  pub first_round_at_ns: Option<u64>,
+  /// Whether this job is the **healer's** re-offer of an already-placed snapshot (§4.10 "anti-entropy …
+  /// the healer") rather than a fresh seal: the snapshot's placement is already recorded, so the job is
+  /// kept past the "already placed" drop, and a holder that answers the offer with chunks it lacked is a
+  /// **repair**, counted. Its rounds are the ordinary content rounds — the same put, hedge and record path.
+  pub healing: bool,
 }
 
 #[cfg(test)]

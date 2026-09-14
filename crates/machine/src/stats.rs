@@ -25,6 +25,12 @@ impl Percentile {
     numerator: 1,
     denominator: 2,
   };
+  /// Shape: the hedge tail (§4.8 "hedge delay = measured p95 put latency per class"; Dean & Barroso's
+  /// hedged requests fire at the 95th percentile of the class's latency); nineteen in twenty.
+  pub const P95: Percentile = Percentile {
+    numerator: 95,
+    denominator: 100,
+  };
   /// Shape: the tail slates ratchets on everywhere (Part 6); one in a hundred.
   pub const P99: Percentile = Percentile {
     numerator: 99,

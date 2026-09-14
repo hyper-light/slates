@@ -4,6 +4,7 @@
 //! and named, and a chunk whose payload does not match its declared identity is refused.
 
 use slates_archive::archive::Archive;
+use slates_archive::codec::{CodecPolicy, CodecRate, NEUTRAL_PERMILLE};
 use slates_archive::format::{ArchiveError, Chunk, Encoding};
 use slates_archive::manifest::{Entry, Node, NodeMeta};
 
@@ -175,6 +176,144 @@ proptest! {
     let _ = Archive::decode(&bytes);
     prop_assert!(true);
   }
+}
+
+/// A profile-shaped policy: LZ4 fast and weak, zstd levels slower and stronger — the shape the boot
+/// probe measures, as the numbers of one measured box.
+fn measured_policy() -> CodecPolicy {
+  CodecPolicy {
+    // A byte's neutral worth from a measured 10 GB/s memcpy.
+    byte_ns_scaled: CodecPolicy::byte_worth_from_memcpy(10_000_000_000),
+    lz4: Some(CodecRate::from_throughput(
+      0,
+      700_000_000,
+      3_000_000_000,
+      476,
+    )),
+    zstd: vec![
+      CodecRate::from_throughput(1, 400_000_000, 1_200_000_000, 346),
+      CodecRate::from_throughput(3, 250_000_000, 1_100_000_000, 320),
+      CodecRate::from_throughput(9, 60_000_000, 1_000_000_000, 300),
+      CodecRate::from_throughput(19, 4_000_000, 900_000_000, 280),
+    ],
+    value_of_byte_permille: NEUTRAL_PERMILLE,
+    value_of_cpu_permille: NEUTRAL_PERMILLE,
+    expected_reads: 1,
+  }
+}
+
+/// Text-like bytes: a structured document, compressible by every codec.
+fn structured(len: usize) -> Vec<u8> {
+  let mut raw = Vec::with_capacity(len);
+  let mut line = 0u32;
+  while raw.len() < len {
+    raw.extend_from_slice(format!("line {} of a structured document\n", line % 97).as_bytes());
+    line += 1;
+  }
+  raw.truncate(len);
+  raw
+}
+
+/// Incompressible bytes: a xorshift stream.
+fn noise(len: usize) -> Vec<u8> {
+  let mut x = 0x9E37_79B9_7F4A_7C15u64;
+  (0..len)
+    .map(|_| {
+      x ^= x << 13;
+      x ^= x >> 7;
+      x ^= x << 17;
+      (x >> 56) as u8
+    })
+    .collect()
+}
+
+/// Shape: how much more than neutral a byte is worth when the tests make bytes precious — ten thousand
+/// memcpys. With these points a byte must be worth ~50 memcpys before any codec pays, and near ~100
+/// LZ4's speed and zstd-1's ratio tie (measured: at exactly 100× the model picked LZ4); at ten thousand
+/// the ratio codec's extra saving dwarfs every cost, so the arm exercises the zstd branch well clear of
+/// that crossover.
+const PRECIOUS_BYTES: u64 = 10_000;
+
+/// D-17 / §4.11 (the cost model), by use: at neutral a structured chunk read once is stored **raw**
+/// (moving a byte is cheaper than compressing it — "hot volumes stay raw unless pressure raises
+/// `value_of_byte`"); with bytes made precious the same chunk is stored zstd at a level the model
+/// chose (recorded on the chunk, non-zero), smaller than raw, and restores byte for byte; a noise
+/// chunk is stored raw under either, with no codec cost; and the whole archive under the policy
+/// round-trips. The manifest identity is the raw bytes' — the decision never touches it.
+#[cfg(feature = "zstd")]
+#[test]
+fn the_cost_model_chooses_a_level_for_structured_data_and_raw_for_noise() {
+  let text = structured(8192);
+  let at_neutral = Archive::chunk_with(text.clone(), &measured_policy());
+  assert_eq!(
+    at_neutral.encoding,
+    Encoding::Raw,
+    "at neutral a chunk read once stays raw"
+  );
+  let mut policy = measured_policy();
+  policy.value_of_byte_permille = NEUTRAL_PERMILLE * PRECIOUS_BYTES;
+  let chunk = Archive::chunk_with(text.clone(), &policy);
+  assert_eq!(
+    chunk.encoding,
+    Encoding::Zstd,
+    "structured data is zstd under the model"
+  );
+  assert!(
+    chunk.level > 0,
+    "the model recorded the level it chose: {}",
+    chunk.level
+  );
+  assert!(chunk.stored_len < chunk.raw_len, "and it saved space");
+  assert_eq!(Archive::content(&chunk).expect("decodes"), text);
+  assert_eq!(
+    chunk.identity,
+    Archive::raw_chunk(text.clone()).identity,
+    "the identity is the raw bytes'"
+  );
+
+  let random = noise(8192);
+  let raw = Archive::chunk_with(random.clone(), &policy);
+  assert_eq!(raw.encoding, Encoding::Raw, "noise stays raw");
+  assert_eq!(Archive::content(&raw).expect("decodes"), random);
+
+  let archive = Archive {
+    base_page_size: 4096,
+    chunk_min: 4096,
+    chunk_max: 65_536,
+    created_unix: 0,
+    volume_id: 1,
+    snapshot_id: 1,
+    name_policy_id: 1,
+    unicode_version: 15,
+    manifest: Node::Directory(Vec::new()),
+    chunks: vec![chunk, raw],
+  };
+  let decoded = Archive::decode(&archive.encode()).expect("a policy-built archive decodes");
+  assert_eq!(decoded, archive);
+}
+
+/// Determinism under one policy: the same bytes under the same measured policy encode to the same
+/// archive bytes, twice — the decision is a pure function of the data and the policy.
+#[cfg(feature = "zstd")]
+#[test]
+fn the_same_policy_encodes_the_same_bytes_identically() {
+  let policy = measured_policy();
+  let build = || Archive {
+    base_page_size: 4096,
+    chunk_min: 4096,
+    chunk_max: 65_536,
+    created_unix: 0,
+    volume_id: 1,
+    snapshot_id: 1,
+    name_policy_id: 1,
+    unicode_version: 15,
+    manifest: Node::Directory(Vec::new()),
+    chunks: vec![
+      Archive::chunk_with(structured(8192), &policy),
+      Archive::chunk_with(noise(4096), &policy),
+    ],
+  };
+  assert_eq!(build().encode(), build().encode());
 }
 
 /// Highly compressible data is stored LZ4 (smaller than raw), round-trips, and decodes to the

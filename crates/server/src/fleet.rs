@@ -62,9 +62,13 @@
 //! state it folds to every other shard's `FleetNode` (all copies of the configuration advance
 //! identically), and the record plane reaches every owner shard each period through [`crate::xshard`]:
 //! the seal walk and the head values run there, the archives and heads move here by value for the
-//! dispatch, and the acknowledgements and durable placements are recorded back there. Owed:
-//! content-defined chunking and the compress-or-not cost model (D-17), the hedge trigger from a measured
-//! p95, anti-entropy and the healer.
+//! dispatch, and the acknowledgements and durable placements are recorded back there. The hedge to the
+//! remaining candidates fires on the **measured p95** of the content class's put latency ([`PutLatency`],
+//! [`hedge_delay_ns`]), one period before any reading. **Anti-entropy and the healer** are one step per
+//! healer period ([`heal_one_placed_snapshot`]): a placed snapshot is re-offered to its candidates through
+//! the same rounds — a holder that lost content is put exactly what it lacks (a repair, counted), one that
+//! lost nothing is put no bytes — at a cadence derived from the measured put-failure rate
+//! ([`heal_period_ns`]). Owed: content-defined chunking and the compress-or-not cost model (D-17).
 //!
 //! The `FleetNode` lives in the shard state (the verbs read it for placement), so it is touched only
 //! through brief synchronous [`state::with_state`] — never held across an await. At `f = 0` (the laptop)
@@ -76,7 +80,7 @@ use std::sync::mpsc::{TryRecvError, channel};
 
 use rustls::pki_types::CertificateDer;
 use slates_archive::Archive;
-use slates_cluster::content::{fetch_content, is_content_stream, put_content};
+use slates_cluster::content::{ContentMessage, fetch_content, is_content_stream, put_content};
 use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::fleet::{apply_peer_state, sync_peer};
 use slates_cluster::membership::{Liveness, MemberState};
@@ -1466,6 +1470,16 @@ struct ContentWork {
   acked: Vec<HostId>,
   quorum: Quorum,
   round: u32,
+  /// Whether the first round has been outstanding for the measured hedge delay ([`hedge_delay_ns`]) — the
+  /// design's trigger for hedging to the remaining candidates. Decided by the clock in [`content_work`],
+  /// **not** by the round count: a first round whose only holder's session is unavailable (borrowed by a
+  /// straggler, its shard starved) produces no placement and so never advanced the count, and the put
+  /// re-aimed at that same holder every period until it came back — 3.2 s against a 3 s hold, traced —
+  /// while the hedge delay had long elapsed.
+  hedged: bool,
+  /// This round's budget ([`content_budget`]): its collection stops at the owner shard's measured hedge
+  /// delay, computed from the shard's put-latency window at the moment the work is handed out.
+  budget: CommitBudget,
 }
 
 /// The status refusal count under which the fleet loop records a snapshot it could not archive (a
@@ -1495,7 +1509,16 @@ fn advance_seals(
       continue;
     };
     if !state.seals.contains_key(&object)
-      && !start_seal(state, local, object, handle, head, sequence, created_unix)
+      && !start_seal(
+        state,
+        local,
+        object,
+        handle,
+        head,
+        sequence,
+        created_unix,
+        false,
+      )
     {
       continue;
     }
@@ -1506,7 +1529,71 @@ fn advance_seals(
       work.push(item);
     }
   }
+  heal_one_placed_snapshot(state, local, created_unix);
   work
+}
+
+/// The healer's step (§4.10 "anti-entropy walks Merkle manifests between recorded holders and repairs only
+/// differing subtrees; the healer replays puts …"; §4.8 "Derived constants": "healer cadence from the
+/// measured put-failure rate"): once per healer period ([`heal_period_ns`]) it re-opens a seal job for the
+/// **next** owned volume whose head snapshot is recorded placed — a `healing` job, seeded with the owner as
+/// the only acknowledged holder — so the ordinary content rounds re-**offer** the archive to every candidate:
+/// a holder that lost nothing answers with an empty missing set and is put zero bytes (the Merkle identity
+/// diff finds no differing subtree), a holder that lost content is put exactly what it lacks and counts as
+/// a repair, and the placement is re-recorded. One snapshot per period, in volume-id order, wrapping: a
+/// bounded slice of the walk over everything this node has placed (§4.3 bounded work). Nothing to do while
+/// a seal for the volume is already in progress, on a laptop (nothing is placed remotely), or between steps.
+fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix: u64) {
+  let now = state.clock.monotonic_ns();
+  if state
+    .healer
+    .last_step_ns
+    .is_some_and(|last| now.saturating_sub(last) < heal_period_ns(&state.put_outcomes))
+  {
+    return;
+  }
+  let mut volumes: Vec<(DbVolumeId, slates_mem::Handle<crate::state::VolumeSlot>)> =
+    state.by_id.iter().map(|(id, h)| (*id, *h)).collect();
+  volumes.sort_unstable_by_key(|(id, _)| id.bytes);
+  // The next volume after the cursor, wrapping to the first: one step of a round-robin walk.
+  let start = state.healer.after.map_or(0, |after| {
+    volumes.partition_point(|(id, _)| id.bytes <= after.bytes)
+  });
+  let candidate = volumes
+    .iter()
+    .skip(start)
+    .chain(volumes.iter().take(start))
+    .find_map(|(id, handle)| {
+      let object = ObjectId(id.bytes);
+      let record = state.db.partition().volume(*id)?;
+      if record.epoch == 0 || state.seals.contains_key(&object) {
+        return None;
+      }
+      let snapshot = state.db.partition().snapshot(*id, record.head)?;
+      matches!(snapshot.placed, PlacementState::Placed { .. }).then_some((
+        *id,
+        *handle,
+        object,
+        record.head,
+        record.epoch,
+      ))
+    });
+  state.healer.last_step_ns = Some(now);
+  let Some((id, handle, object, head, sequence)) = candidate else {
+    state.healer.after = None;
+    return;
+  };
+  state.healer.after = Some(id);
+  start_seal(
+    state,
+    local,
+    object,
+    handle,
+    head,
+    sequence,
+    created_unix,
+    true,
+  );
 }
 
 /// The head snapshot of `id` that still needs sealing — its id and the head sequence — or `None` when the
@@ -1528,6 +1615,15 @@ fn sealable_head(
     .snapshot(id, head)
     .is_some_and(|snapshot| matches!(snapshot.placed, PlacementState::Placed { .. }));
   if placed {
+    // A finished seal is dropped — unless it is the healer's re-offer of this placed snapshot, which is
+    // kept until its round has run (§4.10 "the healer"); it is dropped when it re-records the placement.
+    if state
+      .seals
+      .get(&object)
+      .is_some_and(|job| job.healing && job.snapshot == head)
+    {
+      return Some((head, sequence));
+    }
     state.seals.remove(&object);
     return None;
   }
@@ -1543,7 +1639,9 @@ fn sealable_head(
 
 /// Starts the seal of `head` for `object`: the archive walk over the volume's snapshot, and the content
 /// placement with the owner already counted (it holds its own content) when it is a candidate. `false`,
-/// counted, if the snapshot cannot be walked.
+/// counted, if the snapshot cannot be walked. A `healing` seal is the healer's re-offer of an
+/// already-placed snapshot ([`heal_one_placed_snapshot`]).
+#[allow(clippy::too_many_arguments)]
 fn start_seal(
   state: &mut ShardState,
   local: HostId,
@@ -1552,6 +1650,7 @@ fn start_seal(
   head: DbSnapshotId,
   sequence: u64,
   created_unix: u64,
+  healing: bool,
 ) -> bool {
   let Ok(slot) = state.volumes.get(handle) else {
     return false;
@@ -1562,6 +1661,7 @@ fn start_seal(
     verbs::core_snapshot(slates_ipc::protocol::SnapshotId { value: head.value }),
     object.local(),
     created_unix,
+    state.config.codec.clone(),
   );
   let Ok(archiver) = archiver else {
     *state.refusals.entry(SEAL_REFUSED).or_insert(0) += 1;
@@ -1583,6 +1683,8 @@ fn start_seal(
       manifest: None,
       content,
       rounds: 0,
+      first_round_at_ns: None,
+      healing,
     },
   );
   true
@@ -1622,14 +1724,179 @@ fn advance_seal(
   }
 }
 
+/// Derived: how many put-latency readings the owner shard keeps for the content class's p95 — the
+/// acknowledgements of one recovery budget of seals. A seal is put to at most `2f` remote candidates, one
+/// reading each, and the fleet's shape gives `f = 1` a floor of two; a hundred seals' worth
+/// ([`PUT_LATENCY_SEALS`]) is the window over which the p95 is stable to one reading (nearest rank at
+/// `95 / 100` moves one slot per twenty readings) yet forgets a load regime within a hundred seals — the
+/// same "measured window" the probation threshold reads (§4.8 "late count over the measured window").
+/// Anchored to [`PUT_LATENCY_SEALS`] × the candidate floor's remote count.
+const PUT_LATENCY_WINDOW: usize = PUT_LATENCY_SEALS * 2;
+
+/// Shape: the seals whose acknowledgements the put-latency window spans — a hundred, the smallest count at
+/// which the nearest-rank p95 is resolved to a single reading (`(100 − 1) × 95 / 100 = 94`, the 95th of
+/// a hundred), so the trigger is a real tail, not the median of a handful.
+const PUT_LATENCY_SEALS: usize = 100;
+
+/// The measured put latency of the content class on one owner shard (§4.8 "Derived constants": "hedge
+/// delay = measured p95 put latency per class"): the newest [`PUT_LATENCY_WINDOW`] readings in arrival
+/// order, each the time from a put round's dispatch to one holder's verified acknowledgement. The p95 over
+/// them — the reading nineteen in twenty acknowledgements arrive within — is the hedge trigger
+/// ([`hedge_delay_ns`]). Bounded: the oldest reading leaves as the newest arrives (banned item 8).
+#[derive(Debug, Default)]
+pub struct PutLatency {
+  readings_ns: std::collections::VecDeque<u64>,
+}
+
+impl PutLatency {
+  /// Records one acknowledgement's latency, forgetting the oldest reading past the window.
+  pub fn record(&mut self, latency_ns: u64) {
+    if self.readings_ns.len() >= PUT_LATENCY_WINDOW {
+      self.readings_ns.pop_front();
+    }
+    self.readings_ns.push_back(latency_ns);
+  }
+
+  /// How many readings the window holds.
+  pub fn len(&self) -> usize {
+    self.readings_ns.len()
+  }
+
+  /// Whether no acknowledgement has been timed yet.
+  pub fn is_empty(&self) -> bool {
+    self.readings_ns.is_empty()
+  }
+
+  /// The p95 of the window's readings (nearest rank, the machine crate's percentile law), or `None`
+  /// before any reading.
+  pub fn p95_ns(&self) -> Option<u64> {
+    slates_machine::stats::Sample::new(self.readings_ns.iter().copied().collect())
+      .percentile(slates_machine::stats::Percentile::P95)
+  }
+}
+
+/// The measured put-failure rate of one owner shard's content class (§4.8 "Derived constants": "healer
+/// cadence from the measured put-failure rate"): content rounds that ended placed against rounds that
+/// ended short. Lifetime counters (monotonic, never reset) — the rate is their ratio, so a long quiet
+/// stretch dilutes an old burst of failures exactly as the design's "measured rate" intends.
+#[derive(Debug, Default)]
+pub struct PutOutcomes {
+  /// Content rounds whose placement reached the quorum.
+  pub placed: u64,
+  /// Content rounds that ended short of quorum — uncertain at the deadline, or every holder short.
+  pub short: u64,
+}
+
+impl PutOutcomes {
+  /// Records one content round's outcome.
+  pub fn record(&mut self, placed: bool) {
+    if placed {
+      self.placed = self.placed.saturating_add(1);
+    } else {
+      self.short = self.short.saturating_add(1);
+    }
+  }
+}
+
+/// Where the healer is in its walk over this node's placed content (§4.10 "the healer"): the volume it
+/// re-offers next (in volume-id order; `None` restarts the walk from the first), and when it last
+/// re-offered one, so one snapshot is walked per healer period.
+#[derive(Debug, Default)]
+pub struct HealerCursor {
+  /// The volume after which the next walk step starts (`None`: from the beginning).
+  pub after: Option<DbVolumeId>,
+  /// When the healer last re-offered a snapshot (the shard clock), or `None` before its first step.
+  pub last_step_ns: Option<u64>,
+}
+
+/// Derived: the healer walks one placed snapshot per this many coordinator periods when **no** put has
+/// ever failed — the slowest cadence, a hundred periods (ten seconds at the default beat), so an idle
+/// fleet spends one offer round trip per placed snapshot per hundred periods on verifying what it placed;
+/// as the measured put-failure rate rises the cadence quickens toward one snapshot per period
+/// ([`heal_period_ns`]). Anchored to the put-latency window's seal count ([`PUT_LATENCY_SEALS`]): the
+/// healer covers a window of seals in a window of periods.
+const HEAL_PERIODS_AT_REST: u64 = PUT_LATENCY_SEALS as u64;
+
+/// The healer's period (§4.8 "Derived constants": "healer cadence from the measured put-failure rate"):
+/// `HEARTBEAT_NS × HEAL_PERIODS_AT_REST × placed / (placed + short × HEAL_PERIODS_AT_REST)` — one
+/// snapshot per [`HEAL_PERIODS_AT_REST`] periods while every round places, tightening in proportion to
+/// the share of rounds that ended short until, when short rounds are as common as placed ones, it is one
+/// snapshot per period, the fastest the coordinator runs. Before any round (a fresh boot, the laptop) it
+/// is the at-rest cadence: nothing has failed. Integer arithmetic; never below one period.
+fn heal_period_ns(outcomes: &PutOutcomes) -> u64 {
+  let placed = outcomes.placed.max(1);
+  let weighted_short = outcomes.short.saturating_mul(HEAL_PERIODS_AT_REST);
+  let periods = HEAL_PERIODS_AT_REST
+    .saturating_mul(placed)
+    .checked_div(placed.saturating_add(weighted_short))
+    .unwrap_or(HEAL_PERIODS_AT_REST)
+    .max(1);
+  HEARTBEAT_NS.saturating_mul(periods)
+}
+
+/// The hedge delay (§4.8 "Derived constants": "hedge delay = measured p95 put latency per class"): how long
+/// a seal's first content round is given before the remaining candidates are hedged — the measured p95 of
+/// the content class's put latency on this owner shard. Before any reading (the first seal of a boot, and
+/// the laptop, where no round runs) it is one period ([`HEARTBEAT_NS`]) — the cadence the rounds are driven
+/// at, so the first hedge waits exactly one round, the same code path with an empty window (R8). Dean &
+/// Barroso's hedged requests: "send the request to a replica … after the request has been outstanding for
+/// longer than the 95th-percentile expected latency for this class of requests" (CACM 2013).
+fn hedge_delay_ns(latency: &PutLatency) -> u64 {
+  latency.p95_ns().unwrap_or(HEARTBEAT_NS)
+}
+
+/// The budget of one content round: its collection **stops at the hedge delay** ([`hedge_delay_ns`]) so the
+/// coordinator is free to hedge the remaining candidates the moment the first round has been outstanding
+/// for the measured p95 — a hedge is a second request *while the first is still in flight*, which a round
+/// awaited to the full span could never make — while every holder task keeps the full span
+/// ([`consensus_budget`]'s, the coherent cap) so a slow holder's acknowledgement still arrives, as a
+/// straggler, and is folded into the seal ([`LateReplies::Content`]) rather than lost. Derived: base
+/// deadline = the hedge delay; one extension of `span − hedge delay` (granted only to a round still
+/// gathering acknowledgements at the delay — the ratified late-work rule — so a round with none at the p95
+/// expires there and is hedged); the stall window = the hedge delay itself (an acknowledgement within one
+/// delay is progress); poll = the collection cadence ([`POLL_PER_PERIOD`]).
+fn content_budget(latency: &PutLatency) -> CommitBudget {
+  let hedge_delay = hedge_delay_ns(latency);
+  let span = consensus_budget().max_deadline_ns().max(hedge_delay);
+  CommitBudget::with_extension(
+    hedge_delay,
+    (HEARTBEAT_NS / POLL_PER_PERIOD).max(1),
+    1,
+    1,
+    span.saturating_sub(hedge_delay),
+    1,
+    hedge_delay,
+  )
+}
+
+/// Folds one holder's bound content acknowledgement into `job` — the same merge whether it arrived in the
+/// round that dispatched it or later, as a straggler ([`LateReplies::Content`]); the placement is the
+/// distinct acknowledging candidates, so a repeat is inert.
+fn fold_content_ack(job: &mut SealJob, holder: HostId) {
+  if !job.content.acked.contains(&holder) {
+    job.content.acked.push(holder);
+  }
+}
+
 /// The content put `object`'s seal calls for this period — its archive moved out for the dispatch — or
-/// `None` once the content is placed (the head naming it then ships through `unplaced_heads`) or while
-/// the archive is out on a put.
+/// `None` once the content is placed (the head naming it then ships through `unplaced_heads`), while the
+/// archive is out on a put, or while the **first round is still within the hedge delay**: the hedge round
+/// to the remaining candidates goes out only once the first round has been outstanding for longer than the
+/// measured p95 put latency ([`hedge_delay_ns`]) — the design's trigger, replacing the period the rounds
+/// happen to be driven at (§4.8 "hedged to the remaining candidates after the measured p95 put latency").
 fn content_work(state: &mut ShardState, object: ObjectId, quorum: Quorum) -> Option<ContentWork> {
+  let hedge_delay = hedge_delay_ns(&state.put_latency);
+  let budget = content_budget(&state.put_latency);
+  let now = state.clock.monotonic_ns();
   let job = state.seals.get_mut(&object)?;
   if job.content.placed(quorum) {
     return None;
   }
+  let hedged = match job.first_round_at_ns {
+    Some(first_round_at) if now.saturating_sub(first_round_at) < hedge_delay => return None,
+    Some(_) => true,
+    None => false,
+  };
   let archive = job.archive.take()?;
   Some(ContentWork {
     shard: state.shard,
@@ -1641,22 +1908,36 @@ fn content_work(state: &mut ShardState, object: ObjectId, quorum: Quorum) -> Opt
     acked: job.content.acked.clone(),
     quorum,
     round: job.rounds,
+    hedged,
+    budget,
   })
+}
+
+/// The holders one content round goes to (§4.8 mechanism 1: "content is sent to `f + 1` candidates first,
+/// hedged to the remaining candidates after the measured p95 put latency"): until the first round has been
+/// outstanding for the hedge delay, the first `f` remote candidates in rendezvous order (the owner is the
+/// `f + 1`-th copy); once it has — `hedged` — every remaining candidate. Pure, so the rule is tested at N=1:
+/// the trigger is the clock, never the count of rounds that placed.
+fn hedge_targets(hedged: bool, remote: Vec<HostId>, first_round: usize) -> Vec<HostId> {
+  if hedged {
+    remote
+  } else {
+    remote.into_iter().take(first_round).collect()
+  }
 }
 
 /// Runs one content round for a seal (§4.8 mechanism 1: "content is sent to `f + 1` candidates first,
 /// hedged to the remaining candidates after the measured p95 put latency"): the first round goes to the
 /// first `f` remote candidates in rendezvous order (the owner is the `f + 1`-th copy), every later round
-/// hedges to all remaining candidates — the round's own deadline is the hedge trigger until the p95 is
-/// measured (owed). The holders' sessions are borrowed for the put and returned; the acknowledging set is
-/// merged into the seal whatever the round's outcome (each acknowledgement is a distinct holder's verified,
-/// durable hold), and the archive is put back for the next round. Returns the dispatch to settle.
-async fn put_seal_content(
-  origin: u16,
-  local: HostId,
-  work: ContentWork,
-  budget: CommitBudget,
-) -> Option<Dispatch> {
+/// hedges to all remaining candidates — held back by [`content_work`] until the first round has been
+/// outstanding for the measured p95 ([`hedge_delay_ns`]). The holders' sessions are borrowed for the put
+/// and returned; the acknowledging set is merged into the seal whatever the round's outcome (each
+/// acknowledgement is a distinct holder's verified, durable hold), every acknowledgement's latency is
+/// recorded into the owner shard's put-latency window (the readings the next hedge is sized from), the
+/// first round's dispatch time is noted, and the archive is put back for the next round. Returns the
+/// dispatch to settle.
+async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Option<Dispatch> {
+  let budget = work.budget;
   let hedge = usize::try_from(work.quorum.f).unwrap_or(0);
   let remote: Vec<HostId> = work
     .candidates
@@ -1664,14 +1945,12 @@ async fn put_seal_content(
     .copied()
     .filter(|host| *host != local && !work.acked.contains(host))
     .collect();
-  let targets: Vec<HostId> = if work.round == 0 {
-    remote.into_iter().take(hedge).collect()
-  } else {
-    remote
-  };
+  let targets = hedge_targets(work.hedged, remote, hedge);
   let holders = take_sessions(|host| targets.contains(&host));
-  let (placement, dispatch) = if holders.is_empty() {
-    (None, None)
+  let dispatched_ns = futures::now_ns();
+  let manifest = work.archive.manifest.identity();
+  let (placement, latencies_ns, refilled, dispatch) = if holders.is_empty() {
+    (None, Vec::new(), Vec::new(), None)
   } else {
     let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
     let placed = put_content(
@@ -1685,11 +1964,20 @@ async fn put_seal_content(
       budget,
     )
     .await;
+    // A holder still in flight when the collection stopped at the hedge delay answers later: its
+    // acknowledgement is folded into this seal, not dropped, so hedging never costs a slow holder its hold.
     let dispatch = Dispatch::new(
       taken,
       &placed.reusable,
       placed.stragglers,
-      LateReplies::Discard,
+      LateReplies::Content {
+        shard: work.shard,
+        object: work.object,
+        snapshot: work.snapshot,
+        sequence: work.sequence,
+        manifest,
+        dispatched_ns,
+      },
     );
     return_sessions(placed.reusable);
     let placement = match placed.outcome {
@@ -1699,17 +1987,29 @@ async fn put_seal_content(
       }
       Err(_) => None,
     };
-    (placement, Some(dispatch))
+    (
+      placement,
+      placed.latencies_ns,
+      placed.refilled,
+      Some(dispatch),
+    )
   };
-  // The seal lives on the owner shard: put the archive back and merge the round's acknowledgements there.
+  // The seal lives on the owner shard: put the archive back, merge the round's acknowledgements, record
+  // their latencies (the content class's readings the next hedge is sized from), and note when the first
+  // round went out (the hedge is held until it has been outstanding for the measured p95).
   let ContentWork {
     shard,
     object,
     snapshot,
     archive,
+    round,
+    quorum,
     ..
   } = work;
   let _ = run_on(origin, shard, move |s| {
+    for (_, latency_ns) in &latencies_ns {
+      s.put_latency.record(*latency_ns);
+    }
     let Some(job) = s.seals.get_mut(&object) else {
       return; // The seal was superseded meanwhile; its archive is dropped with it.
     };
@@ -1717,13 +2017,26 @@ async fn put_seal_content(
       return;
     }
     job.archive = Some(archive);
+    if round == 0 && job.first_round_at_ns.is_none() {
+      job.first_round_at_ns = Some(dispatched_ns);
+    }
     if let Some(placement) = placement {
       job.rounds = job.rounds.saturating_add(1);
-      for host in placement.acked {
-        if !job.content.acked.contains(&host) {
-          job.content.acked.push(host);
-        }
+      // A healing round that shipped bytes to a holder repaired it: that holder had lost content the
+      // placement recorded it as holding (§4.10 "repairs only differing subtrees").
+      if job.healing {
+        let repaired = refilled
+          .iter()
+          .filter(|host| placement.acked.contains(host))
+          .count();
+        s.repairs = s
+          .repairs
+          .saturating_add(u64::try_from(repaired).unwrap_or(u64::MAX));
       }
+      for host in placement.acked {
+        fold_content_ack(job, host);
+      }
+      s.put_outcomes.record(job.content.placed(quorum));
     }
   });
   dispatch
@@ -2033,6 +2346,24 @@ enum LateReplies {
   ConfigFetch,
   /// A root learner's fetch: adopt a late, newer root configuration.
   RootFetch,
+  /// A seal's content round: a holder's acknowledgement that arrived after the round's collection stopped
+  /// at the hedge delay is **folded into the seal** on its owner shard — bound to the object, sequence and
+  /// manifest it was put for, and timed into the put-latency window — never discarded: the stop bounds how
+  /// long the round waits before hedging, not whether a slow holder's verified hold counts.
+  Content {
+    /// The owner shard the seal lives on.
+    shard: u16,
+    /// The object whose seal the round put.
+    object: ObjectId,
+    /// The snapshot sealed (a superseded seal ignores the fold).
+    snapshot: DbSnapshotId,
+    /// The head sequence the content is placed for.
+    sequence: u64,
+    /// The manifest identity put.
+    manifest: [u8; 32],
+    /// When the round was dispatched, for the straggler's latency reading.
+    dispatched_ns: u64,
+  },
 }
 
 impl Dispatch {
@@ -2072,7 +2403,11 @@ impl Dispatch {
           }
           recovered.push((host, endpoint));
         }
-        fold_late_replies(late, &replies);
+        if let LateReplies::Content { .. } = late {
+          fold_late_content(late, &replies);
+        } else {
+          fold_late_replies(late, &replies);
+        }
         (recovered, done)
       }
     };
@@ -2093,6 +2428,48 @@ impl Dispatch {
 }
 
 /// Folds a consensus or learner-fetch round's late replies as `late` directs (see [`LateReplies`]).
+/// Folds a content round's late acknowledgements into the seal they were put for, on the seal's **owner
+/// shard** (the seal lives there; this runs on the control shard, so it hops with [`run_on`]): each reply
+/// that decodes as a bound acknowledgement from a candidate is merged into the placement and its latency —
+/// from the round's dispatch to now — recorded into the owner shard's put-latency window. A superseded
+/// seal ignores the fold. Only a `LateReplies::Content` reaches here.
+fn fold_late_content(late: LateReplies, replies: &[Vec<u8>]) {
+  let LateReplies::Content {
+    shard,
+    object,
+    snapshot,
+    sequence,
+    manifest,
+    dispatched_ns,
+  } = late
+  else {
+    return;
+  };
+  let acked: Vec<HostId> = replies
+    .iter()
+    .filter_map(|bytes| match ContentMessage::decode(bytes) {
+      Ok(ContentMessage::Ack(ack)) if ack.binds(object, sequence, &manifest) => Some(ack.holder),
+      _ => None,
+    })
+    .collect();
+  if acked.is_empty() {
+    return;
+  }
+  let latency_ns = futures::now_ns().saturating_sub(dispatched_ns);
+  let origin = state::with_state(|s| s.shard).unwrap_or_default();
+  let _ = run_on(origin, shard, move |s| {
+    for holder in &acked {
+      s.put_latency.record(latency_ns);
+      if let Some(job) = s.seals.get_mut(&object)
+        && job.snapshot == snapshot
+        && job.content.candidates.contains(holder)
+      {
+        fold_content_ack(job, *holder);
+      }
+    }
+  });
+}
+
 fn fold_late_replies(late: LateReplies, replies: &[Vec<u8>]) {
   state::with_state(|s| {
     for bytes in replies {
@@ -2118,6 +2495,8 @@ fn fold_late_replies(late: LateReplies, replies: &[Vec<u8>]) {
             s.root.adopt(configuration);
           }
         }
+        // Folded on the seal's owner shard by [`fold_late_content`], outside this borrow.
+        LateReplies::Content { .. } => {}
       }
     }
   });
@@ -3260,7 +3639,7 @@ async fn run_record_period(
   .await
   .unwrap_or_default();
   for work in seals {
-    if let Some(dispatch) = put_seal_content(origin, local, work, budget).await {
+    if let Some(dispatch) = put_seal_content(origin, local, work).await {
       in_flight.push(dispatch);
     }
   }
@@ -3737,6 +4116,125 @@ mod tests {
       probe_period_ns(capped),
       u64::from(capped) * HEARTBEAT_NS,
       "at the cap: three beats, never more"
+    );
+  }
+
+  /// The hedge delay follows the design's law, by use: one period before any reading (the first seal of a
+  /// boot, the laptop); then the measured p95 of the content class's put latency — the reading nineteen in
+  /// twenty acknowledgements arrive within — and the window is bounded: the oldest reading leaves as the
+  /// newest arrives, so a load regime is forgotten within a window of seals.
+  #[test]
+  fn the_hedge_delay_is_the_measured_p95_over_a_bounded_window() {
+    let mut latency = PutLatency::default();
+    assert_eq!(
+      hedge_delay_ns(&latency),
+      HEARTBEAT_NS,
+      "before any reading: one period"
+    );
+    // Twenty prompt acknowledgements and one slow one: the p95 (nearest rank, the 20th of 21 sorted) is
+    // the slowest prompt reading, not the outlier — a single straggler does not become the trigger.
+    for _ in 0..20 {
+      latency.record(10 * MS);
+    }
+    latency.record(900 * MS);
+    assert_eq!(
+      hedge_delay_ns(&latency),
+      10 * MS,
+      "one slow acknowledgement in twenty-one does not move the p95"
+    );
+    // Fill the window with slow readings: the p95 follows the new regime, and the window stays bounded.
+    for _ in 0..PUT_LATENCY_WINDOW {
+      latency.record(50 * MS);
+    }
+    assert_eq!(latency.len(), PUT_LATENCY_WINDOW, "the window is bounded");
+    assert_eq!(
+      hedge_delay_ns(&latency),
+      50 * MS,
+      "the prompt regime was forgotten within one window"
+    );
+  }
+
+  /// A content round that has gathered **no** acknowledgement when the hedge delay elapses expires there —
+  /// it is not extended — so the coordinator hedges the remaining candidates at the measured p95 (§4.8
+  /// "hedged to the remaining candidates after the measured p95 put latency"; Dean & Barroso). Before this
+  /// the round's progress witness was born "advancing" and the extension was granted unconditionally at
+  /// the delay, so a first round to a starved holder ran the full span (3.2 s measured against a 3 s
+  /// hold) and the hedge never fired — one run in three, on the sub-poll timing of the deadline race.
+  #[test]
+  fn a_round_with_no_acknowledgement_at_the_hedge_delay_expires_rather_than_extends() {
+    let mut latency = PutLatency::default();
+    latency.record(10 * MS);
+    let budget = content_budget(&latency);
+    let hedge_delay = hedge_delay_ns(&latency);
+    let started = 1_000 * MS;
+    let mut wait = DispatchWait::new(budget, started);
+    // At the hedge delay with nothing gathered: the round must expire, not be extended to the full span.
+    let judged = wait.judge(0, started + hedge_delay);
+    assert!(
+      !judged,
+      "a round with no acknowledgement at the p95 expires so the hedge can fire; it was extended"
+    );
+    // The same round with one acknowledgement gathered just before the delay is still filling: extended.
+    let mut filling = DispatchWait::new(budget, started);
+    filling.witness_mut().observe(1, started + hedge_delay / 2);
+    assert!(
+      filling.judge(1, started + hedge_delay),
+      "a round that gathered an acknowledgement within the delay is still filling and is extended"
+    );
+  }
+
+  /// The hedge widens the round's targets on the **clock**, not on the count of rounds that placed: before the
+  /// hedge delay a round goes to the first `f` remote candidates; once the first round has been outstanding
+  /// for the delay, to every remaining one — even if no round has placed yet (the first round's only holder
+  /// was unavailable, so it produced no placement and the count never moved; keyed on the count, the put
+  /// re-aimed at that holder for the whole 3 s hold).
+  #[test]
+  fn the_hedge_widens_the_targets_on_the_clock_not_the_placed_round_count() {
+    let remote = vec![HostId(2), HostId(3), HostId(4)];
+    assert_eq!(
+      hedge_targets(false, remote.clone(), 1),
+      vec![HostId(2)],
+      "before the delay: the first f remote candidates only"
+    );
+    assert_eq!(
+      hedge_targets(true, remote.clone(), 1),
+      remote,
+      "at the delay: every remaining candidate, whatever the placed-round count"
+    );
+  }
+
+  /// The healer's cadence follows the measured put-failure rate, by use: the at-rest cadence while every
+  /// round places, tightening in proportion to the share of rounds that ended short, down to one period —
+  /// never below it — when short rounds are as common as placed ones.
+  #[test]
+  fn the_healer_cadence_tightens_with_the_measured_put_failure_rate() {
+    let mut outcomes = PutOutcomes::default();
+    assert_eq!(
+      heal_period_ns(&outcomes),
+      HEARTBEAT_NS * HEAL_PERIODS_AT_REST,
+      "before any round, and while none has failed: the at-rest cadence"
+    );
+    for _ in 0..HEAL_PERIODS_AT_REST {
+      outcomes.record(true);
+    }
+    assert_eq!(
+      heal_period_ns(&outcomes),
+      HEARTBEAT_NS * HEAL_PERIODS_AT_REST,
+      "a hundred placed rounds and no short one: still at rest"
+    );
+    outcomes.record(false);
+    let one_short = heal_period_ns(&outcomes);
+    assert!(
+      (HEARTBEAT_NS..HEARTBEAT_NS * HEAL_PERIODS_AT_REST).contains(&one_short),
+      "one short round in a hundred tightens the cadence: {one_short} ns"
+    );
+    for _ in 0..HEAL_PERIODS_AT_REST {
+      outcomes.record(false);
+    }
+    assert_eq!(
+      heal_period_ns(&outcomes),
+      HEARTBEAT_NS,
+      "short rounds as common as placed ones: one snapshot per period, the floor"
     );
   }
 }

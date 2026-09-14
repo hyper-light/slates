@@ -270,15 +270,27 @@ impl DispatchWait {
   /// it, keeps waiting.
   pub async fn keep_waiting(&mut self, gathered: usize) -> bool {
     sleep(self.poll_interval_ns).await;
-    let now = now_ns();
+    self.judge(gathered, now_ns())
+  }
+
+  /// The decision [`keep_waiting`](DispatchWait::keep_waiting) takes once its poll interval has passed,
+  /// pure in the clock: records `gathered` as the dispatch's progress at `now_ns` and asks the extender
+  /// whether the dispatch may keep waiting. Separated from the sleep so the rule is testable at N=1
+  /// against an injected clock — the way the extender and the witness are.
+  pub fn judge(&mut self, gathered: usize, now_ns: u64) -> bool {
     self
       .witness
-      .observe(u64::try_from(gathered).unwrap_or(u64::MAX), now);
-    let elapsed = now.saturating_sub(self.started_ns);
+      .observe(u64::try_from(gathered).unwrap_or(u64::MAX), now_ns);
+    let elapsed = now_ns.saturating_sub(self.started_ns);
     !matches!(
-      self.extender.evaluate(elapsed, &self.witness, now),
+      self.extender.evaluate(elapsed, &self.witness, now_ns),
       ExtensionOutcome::Expire
     )
+  }
+
+  /// The dispatch's progress witness, for a test to feed an acknowledgement it observed at a given time.
+  pub fn witness_mut(&mut self) -> &mut ProgressWitness {
+    &mut self.witness
   }
 }
 
@@ -417,29 +429,46 @@ fn is_placed(candidates: &[HostId], acked: &[HostId], quorum: Quorum) -> bool {
   .placed(quorum)
 }
 
+/// What a quorum collection gathered: the replying holders' endpoints for reuse, whether the deadline
+/// was reached, and the **latency** of every binding acknowledgement — the time from the round's
+/// dispatch to that holder's acknowledgement, the reading the design's hedge trigger is measured from
+/// (§4.8 "hedge delay = measured p95 put latency per class").
+pub(crate) struct Collected {
+  /// The replying holders' endpoints, for reuse.
+  pub reusable: Vec<(HostId, Endpoint)>,
+  /// Whether the budget's deadline was reached before the quorum.
+  pub timed_out: bool,
+  /// Each binding acknowledgement's holder and its latency in nanoseconds since the dispatch.
+  pub latencies_ns: Vec<(HostId, u64)>,
+}
+
 /// Collects replies until quorum or the deadline: records into `acked` each reply from a distinct
 /// candidate that `binds` (the caller's check that the reply is *this* dispatch's acknowledgement from
 /// *that* holder — a record acknowledgement's identity binding, a content acknowledgement's manifest
-/// binding), keeps every replying holder's endpoint for reuse, and returns the reusable endpoints and
-/// whether the deadline was reached. Recovers the endpoints of tasks that finished after the loop.
-/// Shared by every quorum dispatch (records, content) so the binding-and-quorum discipline is one.
+/// binding), keeps every replying holder's endpoint for reuse, times each binding acknowledgement from
+/// `dispatched_ns` (the round's dispatch, on the shard clock), and returns what it gathered. Recovers
+/// the endpoints of tasks that finished after the loop. Shared by every quorum dispatch (records,
+/// content) so the binding-and-quorum discipline is one.
 pub(crate) async fn collect_bound(
   rx: &mut std::sync::mpsc::Receiver<Reply>,
   candidates: &[HostId],
   quorum: Quorum,
   budget: CommitBudget,
+  dispatched_ns: u64,
   acked: &mut Vec<HostId>,
   mut binds: impl FnMut(HostId, &[u8]) -> bool,
-) -> (Vec<(HostId, Endpoint)>, bool) {
+) -> Collected {
   let mut reusable: Vec<(HostId, Endpoint)> = Vec::new();
+  let mut latencies_ns = Vec::new();
   let mut timed_out = false;
-  let mut wait = DispatchWait::new(budget, now_ns());
+  let mut wait = DispatchWait::new(budget, dispatched_ns);
   while !is_placed(candidates, acked, quorum) {
     match rx.try_recv() {
       Ok(Reply(host, reply, endpoint)) => {
         reusable.push((host, *endpoint));
         if candidates.contains(&host) && !acked.contains(&host) && binds(host, &reply) {
           acked.push(host);
+          latencies_ns.push((host, now_ns().saturating_sub(dispatched_ns)));
         }
       }
       // Nothing to receive: park a poll interval and let the progress-extension policy decide whether a
@@ -457,7 +486,11 @@ pub(crate) async fn collect_bound(
   while let Ok(Reply(host, _, endpoint)) = rx.try_recv() {
     reusable.push((host, *endpoint));
   }
-  (reusable, timed_out)
+  Collected {
+    reusable,
+    timed_out,
+    latencies_ns,
+  }
 }
 
 /// A commit's outcome and the holder connections still open for the next commit — a holder that
@@ -554,11 +587,18 @@ pub async fn commit_record(
   // this local, which is read after the round; a plain `&mut` capture (not a `Cell`) so the future the sim
   // runtime drives stays `Send` across the collection's await.
   let mut stale_seen: Option<u64> = None;
-  let (reusable, timed_out) = collect_bound(
+  // The record class's acknowledgement latencies are gathered too; the record commit re-ships
+  // idempotently every period, so nothing here hedges on them yet (the content class is the hedged one).
+  let Collected {
+    reusable,
+    timed_out,
+    latencies_ns: _,
+  } = collect_bound(
     &mut rx,
     candidates,
     quorum,
     budget,
+    now_ns(),
     &mut acked,
     |host, reply| {
       if Ack::decode(reply).is_ok_and(|ack| ack.holder == host && ack.binds(record)) {
