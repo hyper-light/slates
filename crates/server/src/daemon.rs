@@ -735,6 +735,22 @@ impl Daemon {
     })
   }
 
+  /// The **measured put latency** of the content class on the shard that owns `object` (§4.8 "Derived
+  /// constants": "hedge delay = measured p95 put latency per class"): how many binding content
+  /// acknowledgements that owner shard has timed, and their p95 in nanoseconds — the hedge trigger the next
+  /// content round will use. A test reads this as the non-vacuity counter of the measured trigger: a seal
+  /// whose content placed must have left readings behind, and the p95 must be what it hedged on. `None` when
+  /// the owner shard could not be observed ([`Self::observe`]); `Some((0, None))` before any acknowledgement,
+  /// and on a laptop, where no content round runs.
+  pub fn fleet_put_latency(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Option<(usize, Option<u64>)> {
+    self.observe(self.shard_of_object(object), || {
+      state::with_state(|s| (s.put_latency.len(), s.put_latency.p95_ns()))
+    })
+  }
+
   /// The manifest identity of the head snapshot of the volume `object` names, once the content plane has
   /// archived it (§4.10; recorded durably as `SnapshotIdentified`), or `None` before then, for a volume
   /// with no snapshot, for one this node does not own, or when the owner shard could not be observed
@@ -1230,6 +1246,7 @@ fn init_shard(
     region_mirrors,
     held_content: slates_cluster::content::ContentHold::new(),
     seals: std::collections::BTreeMap::new(),
+    put_latency: crate::fleet::PutLatency::default(),
     pending_materializations: std::collections::BTreeMap::new(),
   };
   let rebuilt = verbs::rebuild_recovered(&mut state);

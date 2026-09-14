@@ -273,6 +273,14 @@ pub struct ShardState {
   /// `f + 1` hold it, and is dropped once the head naming it places and the snapshot is recorded placed.
   /// Empty on a laptop and whenever every owned snapshot is placed.
   pub seals: BTreeMap<ObjectId, crate::head::SealJob>,
+  /// The measured put latency of this node's **content class** (§4.8 "Derived constants": "hedge delay =
+  /// measured p95 put latency per class"): one reading per binding content acknowledgement this owner
+  /// shard has collected — the time from the round's dispatch to that holder's verified acknowledgement.
+  /// Its p95 is the hedge trigger: how long the first content round to `f + 1` candidates is given before
+  /// the remaining candidates are hedged. Bounded to a window of the newest readings; empty until the
+  /// first content acknowledgement, and on a laptop, where no content round runs — the trigger is then
+  /// one period (R8, the same code with an empty window).
+  pub put_latency: crate::fleet::PutLatency,
   /// Taken-over objects whose head this node adopted and placed but whose **content** it has not yet
   /// materialized into a served volume (§4.10 "Promotion and takeover" → serve): the adopted head
   /// value, kept until the manifest's archive is held (already, as a content candidate, or fetched

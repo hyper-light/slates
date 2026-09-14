@@ -51,7 +51,7 @@ use slates_rt::futures::{detach, now_ns, spawn_child};
 use slates_transport::endpoint::Endpoint;
 
 use crate::{
-  ClusterError, CommitBudget, DispatchWait, Reply, Stragglers, collect_bound, is_placed,
+  ClusterError, Collected, CommitBudget, DispatchWait, Reply, Stragglers, collect_bound, is_placed,
   request_within,
 };
 
@@ -582,6 +582,11 @@ pub struct ContentPlaced {
   pub reusable: Vec<(HostId, Endpoint)>,
   /// The holders still in flight at the return, whose sessions the caller recovers later.
   pub stragglers: Stragglers,
+  /// The **put latency** of each holder that acknowledged this round, in nanoseconds from the put round's
+  /// dispatch to its verified acknowledgement — the readings of the content class the owner's hedge
+  /// trigger is measured from (§4.8 "hedge delay = measured p95 put latency per class"). Empty when the
+  /// round dispatched nothing (the owner's local hold at `f = 0`) or no holder acknowledged.
+  pub latencies_ns: Vec<(HostId, u64)>,
 }
 
 /// One request of a dispatch round: the holder, its session, and the request bytes.
@@ -722,6 +727,7 @@ pub async fn put_content(
       outcome: Ok(build(&acked)),
       reusable: Vec::new(),
       stragglers: Stragglers::none(),
+      latencies_ns: Vec::new(),
     };
   }
   let deadline_ns = budget.max_deadline_ns();
@@ -749,6 +755,7 @@ pub async fn put_content(
         outcome: Err(ClusterError::Runtime(error)),
         reusable: sessions_of(gather(&mut rx, budget).await),
         stragglers: Stragglers::none(),
+        latencies_ns: Vec::new(),
       };
     }
   };
@@ -762,8 +769,12 @@ pub async fn put_content(
       }),
       reusable,
       stragglers: Stragglers::none(),
+      latencies_ns: Vec::new(),
     };
   }
+  // The put latency is timed from the put round's dispatch: the offer round before it is the holder
+  // reporting what it lacks, not the transfer the hedge trigger is sized for.
+  let dispatched_ns = now_ns();
   let mut rx = match dispatch_round(puts, CONTENT_PUT_STREAM, deadline_ns) {
     Ok(rx) => rx,
     Err((error, mut rx)) => {
@@ -772,14 +783,20 @@ pub async fn put_content(
         outcome: Err(ClusterError::Runtime(error)),
         reusable,
         stragglers: Stragglers::none(),
+        latencies_ns: Vec::new(),
       };
     }
   };
-  let (mut returned, timed_out) = collect_bound(
+  let Collected {
+    reusable: mut returned,
+    timed_out,
+    latencies_ns,
+  } = collect_bound(
     &mut rx,
     candidates,
     quorum,
     budget,
+    dispatched_ns,
     &mut acked,
     |host, reply| {
       matches!(
@@ -803,6 +820,7 @@ pub async fn put_content(
     outcome,
     reusable,
     stragglers,
+    latencies_ns,
   }
 }
 

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use rustls::pki_types::PrivateKeyDer;
 use slates_db::HostId;
-use slates_db::register::{ObjectId, Quorum, RegionId, rendezvous_first};
+use slates_db::register::{ObjectId, Quorum, RegionId, candidates_for, rendezvous_first};
 use slates_ipc::protocol::{
   Direction, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass, SnapshotId, VolumeId, pack,
   unpack,
@@ -2675,6 +2675,141 @@ fn a_sealed_snapshots_content_replicates_to_the_holder_and_places() {
   assert!(
     held,
     "B holds the snapshot's content whole, by the manifest identity the head names"
+  );
+}
+
+/// Shape: how long the first-round content candidate is starved in
+/// [`a_slow_first_round_candidate_is_hedged_after_the_measured_p95`] — three liveness budgets, the same hold
+/// the SWIM starvation test uses: far past any measured put p95 on loopback (sub-millisecond to tens of
+/// milliseconds), so a hedge that fires on the measured p95 places the seal through the third candidate long
+/// before the hold ends, while a first round that waits out the hold itself does not.
+const HEDGE_STARVATION_NS: u64 = 3 * LIVENESS_BUDGET_NS;
+
+/// AC (§4.8 mechanism 1 — "content to `f + 1` candidates first, hedged to the remaining candidates after the
+/// measured p95 put latency"; §4.8 "Derived constants": "hedge delay = measured p95 put latency per class";
+/// §4.10 "a candidate holder slow: Masked (the hedge completes the put elsewhere)"): in a three-node `f = 1`
+/// fleet the owner A seals twice. The first seal's put to its first-round candidate is answered promptly and
+/// leaves **measured** put-latency readings on A. Then that candidate's control shard is held busy for
+/// [`HEDGE_STARVATION_NS`] and A seals again: the first content round to it cannot be acknowledged, so the
+/// put must be **hedged** to the remaining candidate after the measured p95 — a few milliseconds — and the
+/// seal places through that candidate **while the first is still held**. Non-vacuous three ways: the
+/// readings are shown to exist before the second seal (the trigger had something to measure), the second
+/// seal is shown placed before the hold ends (the hedge fired on the measured p95, not on the hold's end),
+/// and the held candidate is shown *not* to hold the second manifest at that moment (the placement came
+/// through the hedge, not the first round).
+/// The owner's two remote content candidates for `object` in the owner's own rendezvous order — exactly the
+/// set and order the owner's put computes (`candidates_for` over its placement neighbourhood, no domains
+/// declared in-process, `f = 1`): the first is the first-round candidate, the second the hedge. Returned as
+/// indexes into `hosts`.
+fn remote_candidate_indexes(
+  owner: &Daemon,
+  hosts: &[HostId],
+  object: ObjectId,
+) -> Option<(usize, usize)> {
+  let neighbourhood = owner.placement_neighbourhood()?;
+  let candidates = candidates_for(
+    hosts[0],
+    &neighbourhood,
+    &std::collections::BTreeMap::new(),
+    object,
+    Quorum { f: 1 },
+  );
+  let remote: Vec<usize> = candidates
+    .into_iter()
+    .filter(|host| *host != hosts[0])
+    .filter_map(|host| hosts.iter().position(|h| *h == host))
+    .collect();
+  Some((*remote.first()?, *remote.get(1)?))
+}
+
+#[test]
+fn a_slow_first_round_candidate_is_hedged_after_the_measured_p95() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let serve = mesh_serve_ports(n);
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let all: Vec<&Daemon> = daemons.iter().collect();
+
+  // The first seal: a prompt first round, so A measures the content class's put latency.
+  let setup = seal_hello_on_owner(&instance_a, &daemons, "hedged").and_then(|id| {
+    let object = ObjectId(id.bytes);
+    remote_candidate_indexes(&daemons[0], &hosts, object)
+      .map(|(first_index, hedge_index)| (id, object, first_index, hedge_index))
+      .ok_or_else(|| "a three-node f = 1 fleet gives the owner two remote candidates".to_owned())
+  });
+  let (id, object, first_index, hedge_index) = match setup {
+    Ok(setup) => setup,
+    Err(why) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("setup: {why}");
+    }
+  };
+  let measured = daemons[0].fleet_put_latency(object);
+  let mut client = Client::connect(&instance_a);
+
+  // Hold the first-round candidate's control shard, then seal again: the second put cannot be answered
+  // by it, so the hedge must carry the seal to the other candidate on the measured p95.
+  write_hello_over_nfs(&daemons[0], "hedged");
+  let hold = daemons[first_index].starve_control_shard(HEDGE_STARVATION_NS);
+  let started = Instant::now();
+  let ReplyBody::Snapshotted { id: second } = client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("the second snapshot was not taken");
+  };
+  let placed = poll_snapshot_placed(&all, &mut client, id, second);
+  let placed_after = started.elapsed();
+  let manifest = daemons[0].fleet_head_manifest(object);
+  let hedge_holds = manifest
+    .is_some_and(|manifest| daemons[hedge_index].fleet_holder_content(manifest) == Some(true));
+  let held_still_starved = placed_after < Duration::from_nanos(HEDGE_STARVATION_NS);
+  let held_ns = hold.and_then(|done| {
+    done
+      .recv_timeout(Duration::from_nanos(OBSERVE_BUDGET_NS))
+      .ok()
+  });
+  let after = daemons[0].fleet_put_latency(object);
+
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    measured.is_some_and(|(count, p95)| count > 0 && p95.is_some()),
+    "the first seal left measured put-latency readings on the owner: {measured:?}"
+  );
+  assert!(
+    held_ns.is_some_and(|held| held >= HEDGE_STARVATION_NS),
+    "the first-round candidate's control shard was held for the whole span ({held_ns:?} ns)"
+  );
+  eprintln!(
+    "hedge: measured before the hold {measured:?} (readings, p95 ns); second seal placed after \
+     {placed_after:?} against a {HEDGE_STARVATION_NS} ns hold; readings after {after:?}"
+  );
+  assert!(
+    placed && held_still_starved,
+    "the second seal placed through the hedge while the first-round candidate was still held \
+     (placed={placed} after {placed_after:?}, hold {HEDGE_STARVATION_NS} ns)"
+  );
+  assert!(
+    hedge_holds,
+    "the hedged candidate holds the second seal's content whole — the placement came through the hedge"
+  );
+  assert!(
+    after.is_some_and(|(count, _)| measured.is_some_and(|(before, _)| count > before)),
+    "the hedged put left further readings: {measured:?} → {after:?}"
   );
 }
 
