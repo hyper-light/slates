@@ -295,18 +295,39 @@ pub enum RequestBody {
     /// Every record at or after this sequence.
     since: u64,
   },
+  /// Drain one shard's telemetry ring (§4.14): the chokepoint spans it holds, up to the bound one reply
+  /// carries, with the loss marker for the batch and the per-chokepoint freshness. A read that consumes
+  /// (the ring is a queue); its completion is recorded like any verb, so a retry returns the same batch.
+  Telemetry {
+    /// The shard's partition, as `DaemonStatus` reports it.
+    partition: u16,
+  },
 }
 
-/// What a health signal's absence means (§4.14, A-9): a missing sample is never silently read as
-/// "healthy". A `None` value carries this so a consumer knows whether the gap is benign or a fault.
-#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AbsenceIs {
-  /// The value has simply not been measured yet (a fresh daemon's replay time before any replay);
-  /// its absence is not a fault, only "not known".
-  Unknown,
-  /// The value should be present; its absence means a producer that ought to be reporting is not,
-  /// which is itself a degradation, not a healthy zero.
-  Degraded,
+/// What a signal's absence means (§4.14, A-9): a missing sample is never silently read as "healthy".
+/// One vocabulary for the health signals here and the chokepoint spans in `slates-wire`.
+pub use slates_wire::observe::AbsenceIs;
+/// Who observes a signal (§4.14): shared with the chokepoint registry.
+pub use slates_wire::observe::Observer;
+
+/// What a health signal's `freshness_ns` is measured from (§4.14 "freshness"): the registry states it,
+/// so the report cannot age one signal by a rule it invented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreshnessBasis {
+  /// Computed when the report is built: age zero by construction.
+  AtReport,
+  /// A boot-time fact (the last replay's duration): its age is the time since boot.
+  SinceBoot,
+}
+
+impl FreshnessBasis {
+  /// The basis's name in the registry table.
+  pub const fn name(self) -> &'static str {
+    match self {
+      FreshnessBasis::AtReport => "measured at report (age 0)",
+      FreshnessBasis::SinceBoot => "measured at boot (age = time since boot)",
+    }
+  }
 }
 
 /// A health signal (§4.14): a value, whether it is present, what its absence would mean, and how old
@@ -384,6 +405,66 @@ impl HealthSignal {
       | HealthSignal::ShardClients
       | HealthSignal::ShardDeferred => AbsenceIs::Degraded,
     }
+  }
+
+  /// What this signal's `freshness_ns` is measured from (§4.14): the report ages each signal by the
+  /// registry's rule, not one of its own.
+  pub const fn freshness(self) -> FreshnessBasis {
+    match self {
+      HealthSignal::LogReplayNs => FreshnessBasis::SinceBoot,
+      HealthSignal::CatalogVolumes
+      | HealthSignal::LeaseExpiring
+      | HealthSignal::RingDepth
+      | HealthSignal::ShardClients
+      | HealthSignal::ShardDeferred => FreshnessBasis::AtReport,
+    }
+  }
+
+  /// What produces this signal's value (§4.14 "expected producer"): the shard structure it is read
+  /// from. Every one is the owning shard's own accounting, so a live shard always has it.
+  pub const fn producer(self) -> &'static str {
+    match self {
+      HealthSignal::CatalogVolumes => "the shard's volume catalog",
+      HealthSignal::LogReplayNs => "the last recovery replay",
+      HealthSignal::LeaseExpiring => "the shard's lease table against the failover SLO",
+      HealthSignal::RingDepth => "the clients' command rings, summed",
+      HealthSignal::ShardClients => "the shard's client slots",
+      HealthSignal::ShardDeferred => "the shard's deferred-reply queue",
+    }
+  }
+
+  /// Who observes this signal (§4.14 "observer"): every shard signal is self-observed by the shard
+  /// that reports it. The host-observed signals of the catalog (the anchor's view of the daemon) are the
+  /// `DaemonReport`'s own words, not registry entries yet.
+  pub const fn observer(self) -> Observer {
+    match self {
+      HealthSignal::CatalogVolumes
+      | HealthSignal::LogReplayNs
+      | HealthSignal::LeaseExpiring
+      | HealthSignal::RingDepth
+      | HealthSignal::ShardClients
+      | HealthSignal::ShardDeferred => Observer::OwnerShard,
+    }
+  }
+
+  /// The registry as the Markdown table `docs/wip/observability.md` carries — one row per signal in
+  /// report order, every column a registry method — so the document is generated from the code and the
+  /// doc-truth test fails the moment either drifts.
+  pub fn registry_table() -> String {
+    let mut table = String::from(
+      "| Signal | Absence means | Freshness | Producer | Observer |\n|---|---|---|---|---|\n",
+    );
+    for signal in HealthSignal::ALL {
+      table.push_str(&format!(
+        "| `{}` | {} | {} | {} | {} |\n",
+        signal.name(),
+        signal.absence().name(),
+        signal.freshness().name(),
+        signal.producer(),
+        signal.observer().name(),
+      ));
+    }
+    table
   }
 }
 
@@ -483,6 +564,107 @@ pub struct DaemonReport {
   pub shards: Vec<ShardReport>,
   /// The daemon's place in its fleet.
   pub fleet: FleetReport,
+}
+
+/// One bounded drain of a shard's telemetry ring (§4.14): the operator-facing export of the chokepoint
+/// spans. The ring is a queue — this batch is gone from the shard once reported — bounded to what one
+/// reply carries (the shard's derived quota), so `remaining` says whether to drain again. Loss is never
+/// silent: `shed_before` marks the spans the bounded ring shed between the previous drain and this one,
+/// `dropped_total` the loss since boot, and `missing_links` the spans whose cause was not carried across
+/// a boundary. `chokepoints` is the registry in roster order with each chokepoint's freshness judged
+/// against `horizon_ns`, and `spans` names its chokepoint by roster index into it.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct TelemetryReport {
+  /// The shard drained.
+  pub partition: u16,
+  /// The monotonic time of the drain on the shard's clock (the spans' `end_ns` are on the same clock).
+  pub now_ns: u64,
+  /// The time this batch covers: since the previous drain, or since boot for the first.
+  pub window_ns: u64,
+  /// The freshness horizon applied to every chokepoint (the failover SLO, §4.14): a newest span older
+  /// than this is not reported as a live value.
+  pub horizon_ns: u64,
+  /// Spans shed by the bounded ring between the previous drain and this one — the typed loss marker for
+  /// the batch, lost before its first span.
+  pub shed_before: u64,
+  /// Spans shed since boot.
+  pub dropped_total: u64,
+  /// Spans still held after this bounded drain; drain again to read them.
+  pub remaining: u64,
+  /// Spans in this batch whose cause existed but was not carried to the shard (`CauseRecord::Missing`).
+  pub missing_links: u64,
+  /// The chokepoint registry, in roster order, with this batch's per-chokepoint freshness.
+  pub chokepoints: Vec<ChokepointReport>,
+  /// The spans, oldest first.
+  pub spans: Vec<SpanRecord>,
+}
+
+/// One chokepoint's entry in a [`TelemetryReport`] (§4.14): its registry definition and whether this
+/// batch shows it live. `latest_age_ns` is the newest span's age when the batch holds one; `fresh` says
+/// whether that age is within the horizon — when it is not, the value is typed absent (`absence` says
+/// what that means) rather than reported as current, and `expected` says whether a producer of this
+/// chokepoint runs on this host at all.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct ChokepointReport {
+  /// The registry name (`shard.op`).
+  pub name: String,
+  /// The dimension name the span's `label` codes (`verb`), empty for none.
+  pub dimension: String,
+  /// Spans of this chokepoint in this batch.
+  pub spans: u64,
+  /// The newest span's age at the drain (`now_ns − end_ns`), when the batch holds one.
+  pub latest_age_ns: Option<u64>,
+  /// Whether the newest span is within the horizon — the value is current. False with a
+  /// `latest_age_ns` is a stale last sighting, not a live value.
+  pub fresh: bool,
+  /// What "not fresh" means for this chokepoint (the registry's word).
+  pub absence: AbsenceIs,
+  /// The expected producer's name (the registry's word).
+  pub producer: String,
+  /// Whether that producer runs on this host (a laptop runs no replication; no host runs the archive
+  /// codec yet), so an operator can tell "nothing here can produce it" from "idle".
+  pub expected: bool,
+}
+
+/// One chokepoint span as exported (§4.14, the three-id law on the wire): the roster index of its
+/// chokepoint, its content-free dimension code, the request identity (for replay), the trace (128 bits
+/// as two words) and span identities, its cause, and its monotonic start and end.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct SpanRecord {
+  /// The chokepoint's roster index (into [`TelemetryReport::chokepoints`]).
+  pub point: u32,
+  /// The content-free dimension code.
+  pub label: u32,
+  /// The request's client id.
+  pub request_client: u32,
+  /// The request's sequence within its client.
+  pub request_sequence: u32,
+  /// The trace id's high 64 bits.
+  pub trace_high: u64,
+  /// The trace id's low 64 bits.
+  pub trace_low: u64,
+  /// The span id.
+  pub span: u64,
+  /// What caused the span.
+  pub cause: CauseRecord,
+  /// The monotonic start (ns).
+  pub start_ns: u64,
+  /// The monotonic end (ns).
+  pub end_ns: u64,
+}
+
+/// A span's cause on the wire (§4.14 "`caused_by`"): the form of `slates_wire::observe::Cause`.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CauseRecord {
+  /// The span opened its trace at an entry point.
+  Root,
+  /// Caused by this span of the same trace.
+  Span {
+    /// The causing span's id.
+    id: u64,
+  },
+  /// A cause existed but was not carried across the boundary — the explicit missing link.
+  Missing,
 }
 
 /// A volume's summary in a listing.
@@ -949,6 +1131,11 @@ pub enum ReplyBody {
     /// The records.
     records: Vec<AuditEntry>,
   },
+  /// One shard's telemetry drain (§4.14).
+  Telemetry {
+    /// The batch.
+    report: TelemetryReport,
+  },
 }
 
 /// A message body on the ring: the schema hash then the canonical encoding.
@@ -1088,7 +1275,151 @@ pub fn unpack<M: Wire>(
 
 #[cfg(test)]
 mod health_signal_registry {
-  use super::{AbsenceIs, HealthSignal};
+  use super::{AbsenceIs, FreshnessBasis, HealthSignal};
+
+  /// The design document, whose "*Health signal catalog.*" paragraph is the catalog of record.
+  const DESIGN: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../docs/wip/SLATES_DESIGN.md"
+  );
+  /// The living observability record whose registry table is generated from this module.
+  const RECORD: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../docs/wip/observability.md"
+  );
+  /// The markers around the generated health-signal table in the record.
+  const TABLE_BEGIN: &str = "<!-- health-signals:begin -->\n";
+  const TABLE_END: &str = "<!-- health-signals:end -->";
+  /// Registry signals the design's catalog does not list yet — a reviewed drift list that only
+  /// shrinks (CLAUDE §4, expected-failure lists): the shard emits these two as counts of its own client
+  /// slots and deferred-reply queue, and the design's §4.14 catalog owes them (or the registry a
+  /// rename). Adding a name here is a design change; removing one is what fixing the catalog does.
+  const DESIGN_CATALOG_DRIFT: &[&str] = &["shard.clients", "shard.deferred"];
+
+  /// The signal names the design's "*Health signal catalog.*" sentence lists (`name{label}` tokens in
+  /// backticks, labels stripped).
+  fn design_catalog() -> Vec<String> {
+    let design = std::fs::read_to_string(DESIGN).expect("the design document is readable");
+    let sentence = design
+      .lines()
+      .find_map(|line| line.strip_prefix("*Health signal catalog.* "))
+      .expect("the design has a `*Health signal catalog.*` paragraph");
+    let mut names = Vec::new();
+    let mut rest = sentence;
+    while let Some(start) = rest.find('`') {
+      let after = &rest[start + 1..];
+      let Some(end) = after.find('`') else { break };
+      let token = &after[..end];
+      // A catalog token is `name{label}` or `name` (dotted or underscored: `mirror_age{volume}`);
+      // `(value, freshness_ns)` and the like carry a space or a comma and are skipped.
+      if !token.contains(' ') && !token.contains(',') && !token.contains('(') {
+        let name = token.split_once('{').map_or(token, |(name, _)| name);
+        names.push(name.to_owned());
+      }
+      rest = &after[end + 1..];
+    }
+    names
+  }
+
+  /// Every registry signal is one the design's §4.14 catalog names, except the reviewed drift list —
+  /// and the drift list is exactly the registry's names the catalog lacks, so it can only shrink as the
+  /// design catches up (doc-truth, GAP-A9-12). Do: read the design's catalog sentence. Expect: each
+  /// registry name is in it or on the list, and every listed name is genuinely absent from it.
+  #[test]
+  fn every_registry_signal_is_in_the_designs_catalog_or_on_the_reviewed_drift_list() {
+    let catalog = design_catalog();
+    assert!(
+      catalog.len() > HealthSignal::ALL.len(),
+      "the design's catalog is the wider set: {catalog:?}"
+    );
+    for signal in HealthSignal::ALL {
+      let name = signal.name();
+      let in_catalog = catalog.iter().any(|listed| listed == name);
+      let on_list = DESIGN_CATALOG_DRIFT.contains(&name);
+      assert!(
+        in_catalog || on_list,
+        "{name} is emitted by the registry but neither in the design's §4.14 catalog nor on the reviewed drift list"
+      );
+      assert!(
+        !(in_catalog && on_list),
+        "{name} is now in the design's catalog: remove it from DESIGN_CATALOG_DRIFT (the list only shrinks)"
+      );
+    }
+  }
+
+  /// The generated block of the record between its markers.
+  fn recorded_table() -> String {
+    let record = std::fs::read_to_string(RECORD).expect("docs/wip/observability.md is readable");
+    let start = record
+      .find(TABLE_BEGIN)
+      .expect("the record has the health-signals:begin marker")
+      + TABLE_BEGIN.len();
+    let end = record[start..]
+      .find(TABLE_END)
+      .expect("the record has the health-signals:end marker")
+      + start;
+    record[start..end].to_owned()
+  }
+
+  /// The health-signal table in `docs/wip/observability.md` is generated from the registry (doc-truth):
+  /// the block between the markers equals `HealthSignal::registry_table()` byte for byte. Do: read the
+  /// record. Expect: equality; `--ignored regenerate_the_health_signal_table` rewrites it deliberately.
+  #[test]
+  fn the_recorded_health_signal_table_is_the_registry() {
+    assert_eq!(
+      recorded_table(),
+      HealthSignal::registry_table(),
+      "docs/wip/observability.md's health-signal table drifted from the registry; run `cargo test -p slates-ipc --lib -- --ignored regenerate_the_health_signal_table`"
+    );
+  }
+
+  /// The deliberate writer: rewrites the generated block of the record from the registry. Ignored, so a
+  /// normal test run never mutates the tree; run with `--ignored` after a registry change.
+  #[test]
+  #[ignore = "rewrites docs/wip/observability.md from the registry; run deliberately with --ignored"]
+  fn regenerate_the_health_signal_table() {
+    let record = std::fs::read_to_string(RECORD).expect("docs/wip/observability.md is readable");
+    let start = record
+      .find(TABLE_BEGIN)
+      .expect("the record has the health-signals:begin marker")
+      + TABLE_BEGIN.len();
+    let end = record[start..]
+      .find(TABLE_END)
+      .expect("the record has the health-signals:end marker")
+      + start;
+    let rewritten = format!(
+      "{}{}{}",
+      &record[..start],
+      HealthSignal::registry_table(),
+      &record[end..]
+    );
+    // The design's `--ignored regenerate` writer rewriting a tracked document in the repository (CLAUDE
+    // §4 "Doc-truth tests"); shipped code never reaches this call.
+    #[allow(clippy::disallowed_methods)]
+    std::fs::write(RECORD, rewritten).expect("the record is writable");
+  }
+
+  /// Every health signal states its freshness basis (§4.14): `log.replay_ns` is a boot-time fact aged
+  /// since boot; every other signal is computed at the report. Pinned so a new signal must decide how
+  /// it ages rather than inherit age zero.
+  #[test]
+  fn every_signal_states_its_freshness_basis() {
+    for signal in HealthSignal::ALL {
+      let expected = if matches!(signal, HealthSignal::LogReplayNs) {
+        FreshnessBasis::SinceBoot
+      } else {
+        FreshnessBasis::AtReport
+      };
+      assert_eq!(
+        signal.freshness(),
+        expected,
+        "{} ages by its basis",
+        signal.name()
+      );
+      assert!(!signal.producer().is_empty());
+      assert!(!signal.observer().name().is_empty());
+    }
+  }
 
   /// The health-signal registry is closed (§4.14, GAP-A9-12): `ALL` emits the canonical set in order,
   /// its names are unique and dotted, and the set is pinned here as the doc-truth — so an addition, a

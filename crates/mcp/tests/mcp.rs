@@ -242,7 +242,105 @@ fn assert_volume_lifecycle(server: &mut McpServer) {
 
   let status = call(server, "slates.status", json!({}));
   assert_eq!(status["pid"], std::process::id());
-  assert_eq!(status["shards"], 2);
+  assert_status_exports_the_registries(&status);
+}
+
+/// `slates.status` — the same `daemon_json` the CLI's `status --json` prints — carries every shard's
+/// block with the health signals and the telemetry drain (§4.14; §4.12 parity: the JSON form is the
+/// text form's definition, not a subset). Expect: two shard blocks; a measured `catalog.volumes` as a
+/// number with its absence meaning; the nine chokepoints in roster order; `shard.op` fresh on some
+/// shard after the lifecycle verbs; `archive.chunk` typed absent (`unknown`), never reported, with no
+/// producer on this host; and a span carrying the request, trace, span and cause identities distinctly.
+fn assert_status_exports_the_registries(status: &Value) {
+  let shards = status["shards"]
+    .as_array()
+    .expect("every shard's block, not a bare count");
+  assert_eq!(shards.len(), 2);
+  let signals = shards[0]["signals"].as_array().expect("the health signals");
+  assert!(
+    signals.iter().any(|s| s["name"] == "catalog.volumes"
+      && s["value"].is_u64()
+      && s["absence"] == "degraded"
+      && s["freshness_ns"].is_u64()),
+    "catalog.volumes is a measured number with its absence meaning: {signals:?}"
+  );
+  assert_chokepoint_registry(shards);
+  assert_span_identities(shards);
+  for shard in shards {
+    let drain = &shard["telemetry"];
+    assert!(drain["shed_before"].is_u64() && drain["dropped_total"].is_u64());
+    assert!(drain["remaining"].is_u64() && drain["missing_links"].is_u64());
+    assert!(drain["window_ns"].is_u64() && drain["horizon_ns"].is_u64());
+  }
+}
+
+/// A shard block's telemetry registry entries.
+fn chokepoints_of(shard: &Value) -> Vec<Value> {
+  shard["telemetry"]["chokepoints"]
+    .as_array()
+    .expect("the telemetry drain's registry")
+    .clone()
+}
+
+/// The nine chokepoints in roster order; `archive.chunk` typed absent, never reported, with no
+/// producer here; `shard.op` fresh on some shard after the lifecycle verbs.
+fn assert_chokepoint_registry(shards: &[Value]) {
+  let names: Vec<String> = chokepoints_of(&shards[0])
+    .iter()
+    .map(|c| c["name"].as_str().unwrap().to_owned())
+    .collect();
+  assert_eq!(
+    names,
+    [
+      "bridge.request",
+      "ring.request",
+      "shard.op",
+      "log.append",
+      "ship.record",
+      "consensus.step",
+      "archive.chunk",
+      "land.entry",
+      "merge.verdict",
+    ],
+    "the registry, in roster order"
+  );
+  let archive = chokepoints_of(&shards[0])
+    .into_iter()
+    .find(|c| c["name"] == "archive.chunk")
+    .unwrap();
+  assert_eq!(archive["fresh"], false, "nothing produces it here");
+  assert!(
+    archive["latest_age_ns"].is_null(),
+    "never reported: no age, not a zero"
+  );
+  assert_eq!(archive["absence"], "unknown");
+  assert_eq!(archive["expected"], false);
+  assert!(
+    shards.iter().any(|shard| chokepoints_of(shard)
+      .iter()
+      .any(|c| c["name"] == "shard.op" && c["fresh"] == true)),
+    "the lifecycle verbs left a fresh shard.op on some shard: {shards:?}"
+  );
+}
+
+/// A drained span carries the request, a 32-hex trace, the span id and a typed cause.
+fn assert_span_identities(shards: &[Value]) {
+  let span = shards
+    .iter()
+    .flat_map(|shard| shard["telemetry"]["spans"].as_array().unwrap().clone())
+    .next()
+    .expect("a drained span");
+  assert!(span["request"]["client"].is_u64() && span["request"]["sequence"].is_u64());
+  assert_eq!(
+    span["trace"].as_str().unwrap().len(),
+    32,
+    "a 128-bit trace as hex"
+  );
+  assert!(span["span"].is_u64());
+  assert!(
+    ["root", "span", "missing"].contains(&span["cause"]["kind"].as_str().unwrap()),
+    "a typed cause: {span}"
+  );
 }
 
 /// Attach and the base operations over MCP: over an overlay of a real, readable directory (so the

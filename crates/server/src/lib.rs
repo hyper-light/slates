@@ -19,7 +19,8 @@
 //! recovery, the control shard, shutdown), [`doorbell`] (the thread that turns a client's
 //! ring into the driver's kick), [`fleet`] (the membership loop and the record plane a fleet node
 //! runs), [`deploy`] (a node's socket map and member ids from the operator's one shared manifest),
-//! [`error`].
+//! [`telemetry`] (the chokepoint spans' per-shard rings and the bounded `Telemetry` drain the status
+//! surfaces read, §4.14), [`error`].
 
 pub mod config;
 pub mod daemon;
@@ -36,6 +37,7 @@ pub mod landing;
 pub mod nfs;
 pub mod peer;
 pub mod state;
+pub mod telemetry;
 pub mod verbs;
 pub mod xshard;
 

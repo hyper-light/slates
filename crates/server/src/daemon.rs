@@ -1215,8 +1215,13 @@ fn init_shard(
     works: std::collections::BTreeMap::new(),
     ack_scatters: std::collections::BTreeMap::new(),
     telemetry: slates_wire::observe::SpanSink::with_capacity(telemetry_capacity),
-    next_span_id: 1,
-    current_request: slates_wire::request::RequestId::default(),
+    // The shard's span opener folds in this node's member id and the partition, so every trace and
+    // span id it mints is distinct across the daemon and the fleet without coordination (§4.14).
+    tracer: slates_wire::observe::Tracer::new(host.0, partition),
+    current_span: None,
+    forwarded_rings: std::collections::BTreeMap::new(),
+    telemetry_quota: config.telemetry_spans_per_reply,
+    last_drain_ns: now,
     placed_heads: std::collections::BTreeMap::new(),
     formed_probe_peers: std::collections::BTreeSet::new(),
     demuxes: Vec::new(),

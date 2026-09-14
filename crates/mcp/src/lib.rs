@@ -21,9 +21,10 @@
 
 use serde_json::{Value, json};
 use slates_client::{
-  Attachment, Client, ClientError, CreateSpec, DaemonReport, Filter, Intent, Landing,
-  LandingOutcome, LandingSummary, NamePolicy, Rebased, SizeClass, SnapshotId, StatusReport,
-  Submitted, VolumeId, VolumeSummary, WorkOp,
+  Attachment, CauseRecord, ChokepointReport, Client, ClientError, CreateSpec, DaemonReport, Filter,
+  Intent, Landing, LandingOutcome, LandingSummary, NamePolicy, Rebased, ShardReport, Signal,
+  SizeClass, SnapshotId, SpanRecord, StatusReport, Submitted, TelemetryReport, VolumeId,
+  VolumeSummary, WorkOp,
 };
 
 pub mod http;
@@ -329,8 +330,8 @@ impl McpServer {
   }
 
   fn status(&mut self) -> Result<Value, McpError> {
-    let report = self.client.daemon_status().map_err(refusal)?;
-    Ok(daemon_json(&report))
+    let (report, telemetry) = gather_daemon_status(&mut self.client).map_err(refusal)?;
+    Ok(daemon_json(&report, &telemetry))
   }
 
   /// Plans a landing onto a host directory (§4.15). MCP never passes a grant (R10), so the reply is
@@ -571,7 +572,7 @@ fn tool_list() -> Vec<Value> {
     ),
     tool(
       "slates.status",
-      "The daemon's status: generation, restarts, shard count.",
+      "The daemon's status: generation, restarts, its place in the fleet, every shard's counters and health signals (each with what its absence means), and each shard's telemetry drain — the chokepoint spans since the last drain with their request, trace, span and cause identities, the loss markers, and every chokepoint's freshness.",
       json!({}),
       json!([]),
     ),
@@ -776,9 +777,27 @@ fn hex32(bytes: &[u8; 32]) -> String {
   bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The daemon's status as JSON (the top-level counters and the shard count). Public so the CLI's
-/// `--json` emits the same schema as the MCP surface (§4.12 schema parity).
-pub fn daemon_json(r: &DaemonReport) -> Value {
+/// The daemon's status with every shard's telemetry ring drained (§4.14): the one gather both
+/// operator surfaces use — `slates status` and the MCP `slates.status` — so the CLI and MCP read one
+/// definition (§4.12 parity). Each shard's drain is bounded to one reply; what it left behind is in its
+/// `remaining` and the next status reads it.
+pub fn gather_daemon_status(
+  client: &mut Client,
+) -> Result<(DaemonReport, Vec<TelemetryReport>), ClientError> {
+  let report = client.daemon_status()?;
+  let mut telemetry = Vec::with_capacity(report.shards.len());
+  for shard in &report.shards {
+    telemetry.push(client.telemetry(shard.partition)?);
+  }
+  Ok((report, telemetry))
+}
+
+/// The daemon's status as JSON: the daemon's counters, every shard's block (its counters, refusals,
+/// health signals with what their absence means, and its telemetry drain), and its place in the fleet.
+/// Public so the CLI's `--json` emits the same schema as the MCP surface (§4.12 schema parity — the
+/// text form's per-shard lines and this are one definition). A shard whose drain was not gathered
+/// carries `"telemetry": null`.
+pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
   json!({
     "pid": r.pid,
     "generation": r.generation,
@@ -786,7 +805,10 @@ pub fn daemon_json(r: &DaemonReport) -> Value {
     "heartbeat_age_ns": r.heartbeat_age_ns,
     "clients_reaped": r.clients_reaped,
     "clients_refused": r.clients_refused,
-    "shards": r.shards.len(),
+    "shards": r.shards.iter().map(|shard| {
+      let drain = telemetry.iter().find(|batch| batch.partition == shard.partition);
+      shard_json(shard, drain)
+    }).collect::<Vec<_>>(),
     "fleet": {
       "host": r.fleet.host,
       "f": r.fleet.f,
@@ -798,6 +820,98 @@ pub fn daemon_json(r: &DaemonReport) -> Value {
       "sessions_refused": r.fleet.sessions_refused,
       "replaced": r.fleet.replaced,
     },
+  })
+}
+
+/// One shard's block of the daemon's status as JSON (§4.14): the fields the text form prints per
+/// shard, its health signals, and its telemetry drain when gathered.
+fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
+  json!({
+    "partition": s.partition,
+    "clients": s.clients,
+    "volumes": s.volumes,
+    "served": s.served,
+    "refusals": s.refusals.iter().map(|r| json!({ "kind": r.kind, "count": r.count })).collect::<Vec<_>>(),
+    "replayed_records": s.replayed_records,
+    "replay_ns": s.replay_ns,
+    "torn_tail": s.torn_tail,
+    "reserve_bytes": s.reserve_bytes,
+    "committed_bytes": s.committed_bytes,
+    "version_slots": s.version_slots,
+    "committed_versions": s.committed_versions,
+    "signals": s.signals.iter().map(signal_json).collect::<Vec<_>>(),
+    "spans_held": s.spans_held,
+    "spans_dropped": s.spans_dropped,
+    "peers_probed": s.peers_probed,
+    "telemetry": telemetry.map(telemetry_json),
+  })
+}
+
+/// A health signal as JSON (§4.14, A-9): the measured value, or `null` with `absence` saying what the
+/// gap means — a measured zero is `0`, never conflated with an absent value.
+pub fn signal_json(s: &Signal) -> Value {
+  json!({
+    "name": s.name,
+    "value": s.value,
+    "absence": s.absence.name(),
+    "freshness_ns": s.freshness_ns,
+  })
+}
+
+/// A shard's telemetry drain as JSON (§4.14): the batch's window, horizon and loss markers, the
+/// registry in roster order with each chokepoint's freshness, and the spans with their three identities
+/// distinct — the request as `{client, sequence}`, the trace as 32 hex characters, the span id, and the
+/// cause as `{kind, span}`.
+pub fn telemetry_json(t: &TelemetryReport) -> Value {
+  json!({
+    "partition": t.partition,
+    "now_ns": t.now_ns,
+    "window_ns": t.window_ns,
+    "horizon_ns": t.horizon_ns,
+    "shed_before": t.shed_before,
+    "dropped_total": t.dropped_total,
+    "remaining": t.remaining,
+    "missing_links": t.missing_links,
+    "chokepoints": t.chokepoints.iter().map(chokepoint_json).collect::<Vec<_>>(),
+    "spans": t.spans.iter().map(|span| span_json(span, &t.chokepoints)).collect::<Vec<_>>(),
+  })
+}
+
+/// One chokepoint's freshness entry as JSON (§4.14): `fresh` is the typed judgement; `latest_age_ns`
+/// is `null` when nothing reported it in the batch, and a last sighting's age when one did but is past
+/// the horizon — stated as an age, never as a live value.
+fn chokepoint_json(c: &ChokepointReport) -> Value {
+  json!({
+    "name": c.name,
+    "dimension": c.dimension,
+    "spans": c.spans,
+    "latest_age_ns": c.latest_age_ns,
+    "fresh": c.fresh,
+    "absence": c.absence.name(),
+    "producer": c.producer,
+    "expected": c.expected,
+  })
+}
+
+/// One span as JSON, its chokepoint named through the batch's registry entries.
+fn span_json(s: &SpanRecord, chokepoints: &[ChokepointReport]) -> Value {
+  let point = chokepoints
+    .get(usize::try_from(s.point).unwrap_or(usize::MAX))
+    .map_or("", |entry| entry.name.as_str());
+  let cause = match s.cause {
+    CauseRecord::Root => json!({ "kind": "root", "span": Value::Null }),
+    CauseRecord::Span { id } => json!({ "kind": "span", "span": id }),
+    CauseRecord::Missing => json!({ "kind": "missing", "span": Value::Null }),
+  };
+  json!({
+    "point": point,
+    "label": s.label,
+    "request": { "client": s.request_client, "sequence": s.request_sequence },
+    "trace": format!("{:016x}{:016x}", s.trace_high, s.trace_low),
+    "span": s.span,
+    "cause": cause,
+    "start_ns": s.start_ns,
+    "end_ns": s.end_ns,
   })
 }
 
