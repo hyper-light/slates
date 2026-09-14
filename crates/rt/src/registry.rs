@@ -50,6 +50,90 @@ pub struct Entry {
   /// shard, so a message to a spinning shard costs no syscall (§4.7 "Wake strategy"; the
   /// protocol and its loom model live in [`crate::parking`]).
   pub parking: Parking,
+  /// The shard's forward-progress pulse, for an observer on any thread (see [`Pulse`]).
+  pub pulse: Pulse,
+}
+
+/// A shard's forward-progress pulse, readable from any thread with no shard round-trip (§4.14; the same
+/// discipline as the fleet coordinator's period count in `slates-server`): the loop's step count, its
+/// driver-wait count, the tasks it has admitted and completed, the admissions it has **refused** because
+/// its arena was full, and its longest single poll — stored by the owning shard from its own `Counters`
+/// (which live behind the shard's single-threaded borrow) once per step. An observer reads them to tell a
+/// shard that is stepping — alive, however slowly under CPU load — from one that has stopped: parked with
+/// no kick (a wedge), or held inside one long poll (`longest_step_ns` climbs); and to tell a shard whose
+/// task arena is saturating (`admission_refused` climbs, so a new operation's task cannot be spawned) from
+/// one merely slow. It is the instrument a stall diagnosis needs precisely when the shard would not answer
+/// a query. The only writer is the shard; `Relaxed` on every side, statistics (R2).
+///
+/// Shape: on its own cache line (the largest line we target, Apple silicon's 128 bytes) — the owning shard
+/// stores every step, so the line must be shared with no word another thread writes (the control flag,
+/// the ring's tail) or the shard would pay a transfer per step; a foreign read moves the line once.
+#[repr(align(128))]
+#[derive(Debug, Default)]
+pub struct Pulse {
+  steps: AtomicU64,
+  waits: AtomicU64,
+  spawns: AtomicU64,
+  completed: AtomicU64,
+  admission_refused: AtomicU64,
+  longest_step_ns: AtomicU64,
+}
+
+impl Pulse {
+  /// The owning shard records its step and task counts after a step (one plain store each, a line it owns).
+  pub fn record(
+    &self,
+    steps: u64,
+    spawns: u64,
+    completed: u64,
+    admission_refused: u64,
+    longest_step_ns: u64,
+  ) {
+    self.steps.store(steps, Ordering::Relaxed);
+    self.spawns.store(spawns, Ordering::Relaxed);
+    self.completed.store(completed, Ordering::Relaxed);
+    self
+      .admission_refused
+      .store(admission_refused, Ordering::Relaxed);
+    self
+      .longest_step_ns
+      .store(longest_step_ns, Ordering::Relaxed);
+  }
+
+  /// The owning shard records its driver-wait count as it enters a wait.
+  pub fn record_waits(&self, waits: u64) {
+    self.waits.store(waits, Ordering::Relaxed);
+  }
+
+  /// Loop iterations the shard has run.
+  pub fn steps(&self) -> u64 {
+    self.steps.load(Ordering::Relaxed)
+  }
+
+  /// Driver waits the shard has entered.
+  pub fn waits(&self) -> u64 {
+    self.waits.load(Ordering::Relaxed)
+  }
+
+  /// Tasks the shard has admitted to its arena.
+  pub fn spawns(&self) -> u64 {
+    self.spawns.load(Ordering::Relaxed)
+  }
+
+  /// Tasks whose future returned on the shard.
+  pub fn completed(&self) -> u64 {
+    self.completed.load(Ordering::Relaxed)
+  }
+
+  /// Admissions the shard refused because its task arena was full (the operation's task could not spawn).
+  pub fn admission_refused(&self) -> u64 {
+    self.admission_refused.load(Ordering::Relaxed)
+  }
+
+  /// The shard's longest single poll, nanoseconds (a step longer than a peer's wake starves the shard).
+  pub fn longest_step_ns(&self) -> u64 {
+    self.longest_step_ns.load(Ordering::Relaxed)
+  }
 }
 
 static ENTRIES: [OnceLock<&'static Entry>; MAX_SHARDS] = [const { OnceLock::new() }; MAX_SHARDS];
@@ -79,6 +163,7 @@ pub fn register(
     kick,
     ring_full_events: AtomicU64::new(0),
     parking: Parking::new(),
+    pulse: Pulse::default(),
   }));
   let _ = ENTRIES[usize::from(id)].set(entry);
   Ok((id, receiver))

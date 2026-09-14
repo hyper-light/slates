@@ -659,6 +659,18 @@ impl ShardContext {
     let (drained, batch) = self
       .with_inner(|inner| {
         inner.counters.steps += 1;
+        // The pulse an observer on another thread reads (`registry::Pulse`): a handful of plain stores on a
+        // line this core owns, so a stall diagnosis sees the arena saturating (`admission_refused`) or a
+        // long poll (`longest_step_ns`) without a shard round-trip.
+        if let Some(entry) = self.entry {
+          entry.pulse.record(
+            inner.counters.steps,
+            inner.counters.spawns,
+            inner.counters.completed,
+            inner.counters.admission_refused,
+            inner.counters.longest_step_ns,
+          );
+        }
         let mut work = self.drain_control(inner);
         work |= self.drain_inbound(inner);
         work |= self.expire_timers(inner);
@@ -723,6 +735,9 @@ impl ShardContext {
     self
       .with_inner(|inner| {
         inner.counters.waits += 1;
+        if let Some(entry) = self.entry {
+          entry.pulse.record_waits(inner.counters.waits);
+        }
         let timeout = deadline_ns.map(|d| d.saturating_sub(inner.driver.now_ns()));
         let mut completions = std::mem::take(&mut inner.completions);
         let result = inner.driver.wait(timeout, &mut completions);
