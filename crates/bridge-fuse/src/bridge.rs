@@ -172,17 +172,17 @@ fn split_ns(ns: i64) -> (u64, u32) {
   (ns / NS_PER_SEC, u32::try_from(ns % NS_PER_SEC).unwrap_or(0))
 }
 
-/// A FUSE `fuse_attr` from neutral attributes. Preserves the pre-extraction mapping exactly,
-/// including the wire change time taken from the modification time — a quirk carried unchanged
-/// for the GAP-A9-3 bridge sweep to correct (NFS reads the true change time from the neutral
-/// attributes, so the quirk does not spread).
+/// A FUSE `fuse_attr` from neutral attributes: each wire time is the neutral time of the same
+/// name. (Until the GAP-A9-3 sweep of 2026-09-14 the wire change time was taken from the
+/// modification time, so a `stat` through a FUSE mount reported `ctime == mtime` — a chmod, which
+/// moves only the change time, was invisible to a tool watching it.)
 fn fuse_attr(node: &NodeAttr) -> Attr {
   Attr {
     ino: node.ino,
     size: node.size,
     blocks: node.size.div_ceil(BYTES_PER_BLOCK),
     mtime: split_ns(node.mtime),
-    ctime: split_ns(node.mtime),
+    ctime: split_ns(node.ctime),
     atime: split_ns(node.atime),
     mode: node.mode,
     nlink: node.nlink,
@@ -190,6 +190,23 @@ fn fuse_attr(node: &NodeAttr) -> Attr {
     gid: node.gid,
     blksize: BLKSIZE,
   }
+}
+
+/// Format: the set-user-id, set-group-id and group-execute mode bits (`<sys/stat.h>` `S_ISUID`,
+/// `S_ISGID`, `S_IXGRP`), for `FATTR_KILL_SUIDGID`.
+const S_ISUID: u32 = 0o4000;
+const S_ISGID: u32 = 0o2000;
+const S_IXGRP: u32 = 0o010;
+
+/// The mode `FATTR_KILL_SUIDGID` asks for: the set-user-id bit cleared, and the set-group-id bit
+/// cleared when the group-execute bit is set (a set-group-id bit without group execute is
+/// mandatory locking, not a privilege — the kernel's own `should_remove_suid` rule).
+fn kill_privileges(mode: u32) -> u32 {
+  let mut mode = mode & !S_ISUID;
+  if mode & S_IXGRP != 0 {
+    mode &= !S_ISGID;
+  }
+  mode
 }
 
 /// Takes the FUSE lookup reference on an entry the mount returns (LOOKUP/CREATE/MKDIR/SYMLINK): the
@@ -719,6 +736,16 @@ fn serve_rename(
   let Ok(r) = RenameIn::parse(opcode, req.body, flagged) else {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   };
+  // A flag the seam does not carry (RENAME_WHITEOUT, or any bit the header has not defined) is
+  // refused with the errno `renameat2` itself gives an unsupported flag, before anything moves —
+  // never dropped and performed as a plain rename (§4.6; audit BUG-10). The kernel's FUSE client
+  // refuses these itself; a guest over virtio-fs may not.
+  if r.flags & !RenameIn::RENAME_CARRIED != 0 {
+    return write_or_drop(
+      ReplyHeader::write_error(req.header.unique, EINVAL, out),
+      out,
+    );
+  }
   let from = match resolve(bridge, cx, req.header.nodeid) {
     Ok(object) => object,
     Err(e) => return reply_err(req.header.unique, e, out),
@@ -748,25 +775,70 @@ fn serve_setattr(
   let Ok(s) = SetAttrIn::parse(req.body) else {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   };
+  // A `valid` bit the edge does not honour is refused before the seam, never acknowledged with a
+  // success that ignored it (§4.6 "Never acknowledge an ignored `setattr` field"; audit BUG-8).
+  if s.valid & !SetAttrIn::FATTR_HONOURED != 0 {
+    return write_or_drop(
+      ReplyHeader::write_error(req.header.unique, EINVAL, out),
+      out,
+    );
+  }
   let object = match resolve(bridge, cx, req.header.nodeid) {
     Ok(object) => object,
     Err(e) => return reply_err(req.header.unique, e, out),
   };
-  // Translate the FUSE `valid` bitmask into the neutral "which fields to set".
-  let changes = SetAttr {
-    size: (s.valid & SetAttrIn::FATTR_SIZE != 0).then_some(s.size),
-    mode: (s.valid & SetAttrIn::FATTR_MODE != 0).then_some(s.mode),
-    uid: (s.valid & SetAttrIn::FATTR_UID != 0).then_some(s.uid),
-    gid: (s.valid & SetAttrIn::FATTR_GID != 0).then_some(s.gid),
-    atime: (s.valid & SetAttrIn::FATTR_ATIME != 0).then_some(s.atime),
-    mtime: (s.valid & SetAttrIn::FATTR_MTIME != 0).then_some(s.mtime),
-    ctime: (s.valid & SetAttrIn::FATTR_CTIME != 0).then_some(s.ctime),
+  let changes = match setattr_changes(bridge, object, cx, &s) {
+    Ok(changes) => changes,
+    Err(e) => return reply_err(req.header.unique, e, out),
   };
   let result = bridge.setattr(object, cx, changes).map(|n| AttrOut {
     attr_valid: CACHE_FOREVER,
     attr: fuse_attr(&n),
   });
   reply(req.header.unique, result, |a| a.to_bytes(), out)
+}
+
+/// Translates a `SETATTR` request's `valid` mask and fields into the neutral "which fields to
+/// set" (§4.6): a time flagged `*_NOW` (`UTIME_NOW`) is resolved through the volume's own clock —
+/// the NOW resolution the design places at the transport (AC-3.10) — rather than the value the
+/// kernel filled in from its clock; `FATTR_KILL_SUIDGID` becomes a mode change that clears the
+/// privilege bits of the requested mode, or of the object's current mode when no mode was
+/// requested (the one field this needs read back through the seam).
+fn setattr_changes(
+  bridge: &mut dyn Bridge,
+  object: ObjectId,
+  cx: &OpContext,
+  s: &SetAttrIn,
+) -> Result<SetAttr, VfsError> {
+  let set = |bit: u32| s.valid & bit != 0;
+  let now = if set(SetAttrIn::FATTR_ATIME_NOW) || set(SetAttrIn::FATTR_MTIME_NOW) {
+    Some(bridge.now())
+  } else {
+    None
+  };
+  let mut mode = set(SetAttrIn::FATTR_MODE).then_some(s.mode);
+  if set(SetAttrIn::FATTR_KILL_SUIDGID) {
+    let current = match mode {
+      Some(mode) => mode,
+      None => bridge.getattr(object, cx)?.mode,
+    };
+    mode = Some(kill_privileges(current));
+  }
+  Ok(SetAttr {
+    size: set(SetAttrIn::FATTR_SIZE).then_some(s.size),
+    mode,
+    uid: set(SetAttrIn::FATTR_UID).then_some(s.uid),
+    gid: set(SetAttrIn::FATTR_GID).then_some(s.gid),
+    atime: match now {
+      Some(now) if set(SetAttrIn::FATTR_ATIME_NOW) => Some(now),
+      _ => set(SetAttrIn::FATTR_ATIME).then_some(s.atime),
+    },
+    mtime: match now {
+      Some(now) if set(SetAttrIn::FATTR_MTIME_NOW) => Some(now),
+      _ => set(SetAttrIn::FATTR_MTIME).then_some(s.mtime),
+    },
+    ctime: set(SetAttrIn::FATTR_CTIME).then_some(s.ctime),
+  })
 }
 
 fn serve_statfs(
