@@ -128,9 +128,19 @@ const OWNER_READ: u32 = 0o400;
 const OWNER_WRITE: u32 = 0o200;
 /// Format: the owner execute permission bit.
 const OWNER_EXECUTE: u32 = 0o100;
-/// Format: `FILE_SYNC` (`stable_how` = 2, RFC 1813 §3.3.7): the data and its metadata are committed
-/// to stable storage before the reply. slates lands every write in the anchor segment synchronously
-/// (there is no write-back buffer), so a WRITE is always `FILE_SYNC` and a later COMMIT is a no-op.
+/// Format: `UNSTABLE` (`stable_how` = 0, RFC 1813 §3.3.7): the server may reply before the data is
+/// stable; the client keeps its copy until a COMMIT (or a later stable WRITE) answers with the same
+/// write verifier, and re-sends it when the verifier changed (the server restarted in between).
+/// An `UNSTABLE` write is answered `UNSTABLE` — the bytes are in the volume, not yet in the
+/// recovery image — and the client's COMMIT is the barrier that publishes them.
+const UNSTABLE: u32 = 0;
+/// Format: `FILE_SYNC` (`stable_how` = 2, RFC 1813 §3.3.7): the data and its metadata are stable
+/// before the reply. slates makes a write stable by publishing the shard's recovery image into
+/// anchor-owned RAM (§4.8, D-18: daemon-restart survival); the host that runs this export does that
+/// at its barrier after the write and before it sends the reply, and answers a refused barrier with
+/// `NFS3ERR_IO` ([`io_failure_reply`]) rather than claim a stability the bytes do not have. A
+/// `DATA_SYNC` request (`stable_how` = 1) is answered `FILE_SYNC` too: the barrier publishes data
+/// and metadata together, a stronger level than asked, which the protocol allows.
 const FILE_SYNC: u32 = 2;
 /// Format: `time_how` DONT_CHANGE (RFC 1813 §3.3.2): leave the time field unchanged.
 const TIME_DONT_CHANGE: u32 = 0;
@@ -199,6 +209,12 @@ pub struct Export<'b> {
   /// created object then inherits its parent's group. Set after construction ([`Self::set_owner_gid`])
   /// so `new`'s many call sites stay unchanged — the group is not part of the authenticated identity.
   owner_gid: Option<u32>,
+  /// The write verifier (RFC 1813 `writeverf3`) every WRITE and COMMIT reply carries: eight bytes a
+  /// client compares across calls to learn whether the server lost its unstable writes in between
+  /// (a restart), in which case it re-sends them. The host that can restart sets it per boot
+  /// ([`Self::set_write_verifier`]); a standalone export, which has no restart to survive, keeps the
+  /// volume-derived default.
+  write_verifier: [u8; size_of::<u64>()],
 }
 
 impl<'b> Export<'b> {
@@ -216,12 +232,15 @@ impl<'b> Export<'b> {
   ) -> Result<Export<'b>, VfsError> {
     let mut attachments = Attachments::new();
     let attachment = attachments.attach(volume, View::Current, subject, rights)?;
+    let mut fsid = [0u8; size_of::<u64>()];
+    fsid.copy_from_slice(&volume.bytes[..size_of::<u64>()]);
     Ok(Export {
       bridge,
       volume,
       attachments,
       attachment,
       owner_gid: None,
+      write_verifier: fsid,
     })
   }
 
@@ -230,6 +249,14 @@ impl<'b> Export<'b> {
   /// with the credential's gid; a mount with no such credential leaves it `None` (parent-inherited).
   pub fn set_owner_gid(&mut self, gid: Option<u32>) {
     self.owner_gid = gid;
+  }
+
+  /// Sets the write verifier (RFC 1813 `writeverf3`) this export answers WRITE and COMMIT with: the
+  /// host's per-boot value, unique to the running instance, so a client that holds unstable writes
+  /// from before a daemon restart sees it change and re-sends them (§3.3.7: "unique between
+  /// instances of the NFS version 3 protocol server, where uncommitted data may be lost").
+  pub fn set_write_verifier(&mut self, verifier: [u8; size_of::<u64>()]) {
+    self.write_verifier = verifier;
   }
 
   /// The authenticated context for a request, built from the export's attachment. Refuses when the
@@ -528,18 +555,22 @@ impl<'b> Export<'b> {
   }
 
   /// NFSPROC3_WRITE: write the request's data at `offset` to the file a handle names, over the
-  /// shared interface under the export's context. slates lands every write in the anchor
-  /// synchronously, so the reply is always `FILE_SYNC`; a write against a read-only export or a
-  /// pinned view is refused by the seam before any effect.
+  /// shared interface under the export's context. The reply's `committed` level is what the write
+  /// asked for, made true by the host: an `UNSTABLE` write is answered `UNSTABLE` (the bytes are in
+  /// the volume; the client's later COMMIT publishes them), and a `DATA_SYNC` or `FILE_SYNC` write is
+  /// answered `FILE_SYNC` because the host's barrier publishes the shard's recovery image before it
+  /// sends the reply (§4.8) — and replaces this reply with `NFS3ERR_IO` when that barrier is refused
+  /// ([`io_failure_reply`]). A write against a read-only export or a pinned view is refused by the
+  /// seam before any effect.
   pub fn write(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
     let mut writer = XdrWriter::new();
     match self.write_result(args) {
-      Ok((post, count)) => {
+      Ok((post, count, committed)) => {
         Nfsstat3::Ok.encode(&mut writer);
         encode_wcc(&mut writer, Some(post));
         writer.u32(count);
-        writer.u32(FILE_SYNC);
-        writer.fixed(&self.write_verifier());
+        writer.u32(committed);
+        writer.fixed(&self.write_verifier);
       }
       Err((status, post)) => {
         status.encode(&mut writer);
@@ -552,16 +583,15 @@ impl<'b> Export<'b> {
   fn write_result(
     &mut self,
     args: &mut XdrReader<'_>,
-  ) -> Result<(Fattr3, u32), (Nfsstat3, Option<Fattr3>)> {
+  ) -> Result<(Fattr3, u32, u32), (Nfsstat3, Option<Fattr3>)> {
     // WRITE3args: the file handle, the offset, the byte count, the requested stability, the data.
-    // The count and stability are advisory here — the data length is authoritative and slates
-    // always commits FILE_SYNC — but they are decoded so a malformed request is a typed refusal,
-    // and the data length is capped at the offered transfer size so a hostile length is refused
-    // before allocating.
+    // The count is advisory (the data length is authoritative); the stability decides the reply's
+    // `committed` level. Both are decoded so a malformed request is a typed refusal, and the data
+    // length is capped at the offered transfer size so a hostile length is refused before allocating.
     let handle = Nfsfh3::decode(args).map_err(|_| (Nfsstat3::Badhandle, None))?;
     let offset = args.u64().map_err(|_| (Nfsstat3::Inval, None))?;
     let _count = args.u32().map_err(|_| (Nfsstat3::Inval, None))?;
-    let _stable = args.u32().map_err(|_| (Nfsstat3::Inval, None))?;
+    let stable = args.u32().map_err(|_| (Nfsstat3::Inval, None))?;
     let data = args
       .opaque(usize::try_from(MAX_TRANSFER).unwrap_or(0))
       .map_err(|_| (Nfsstat3::Inval, None))?
@@ -575,31 +605,29 @@ impl<'b> Export<'b> {
       .map_err(|e| (nfsstat_of(&e), None))?;
     // The post-op attributes reflect the file after the write (the wcc's post half).
     let node = self.attrs_of(&identity).map_err(|s| (s, None))?;
-    Ok((self.fattr3(&node), written))
+    let committed = if stable == UNSTABLE {
+      UNSTABLE
+    } else {
+      FILE_SYNC
+    };
+    Ok((self.fattr3(&node), written, committed))
   }
 
-  /// The write verifier the export returns (RFC 1813 `writeverf3`): eight bytes a client compares
-  /// across a server restart to decide whether to resend unstable writes. slates derives it from
-  /// the volume id, stable for the life of the volume; a boot-id-based verifier that also changes
-  /// on a daemon restart is owed with the §4.8 recovery wiring. Since every slates write is already
-  /// `FILE_SYNC`, no client resend depends on this today.
-  fn write_verifier(&self) -> [u8; size_of::<u64>()] {
-    self.fsid().to_be_bytes()
-  }
-
-  /// NFSPROC3_COMMIT: flush a file's writes to stable storage (RFC 1813 §3.3.21). Every slates write
-  /// already lands `FILE_SYNC` — synchronously durable in the anchor segment before its reply (see
-  /// `write`) — so a commit has nothing to flush: it resolves the handle, returns the file's current
-  /// `wcc_data` and the same `writeverf3` a write returns, and answers `NFS3_OK`. A client `fsync`
-  /// (which the kernel issues as COMMIT) therefore succeeds over the mount, as the git, sqlite and
-  /// editor workloads require. Without this a COMMIT is `PROC_UNAVAIL` and the client's `fsync` fails.
+  /// NFSPROC3_COMMIT: make a file's unstable writes stable (RFC 1813 §3.3.21). The bytes an
+  /// `UNSTABLE` write left in the volume become stable when the shard's recovery image is published
+  /// into anchor-owned RAM (§4.8); the host that runs this export does that at its barrier after the
+  /// commit and before it sends the reply (and answers a refused barrier with `NFS3ERR_IO`,
+  /// [`io_failure_reply`]). The commit itself resolves the handle and returns the file's current
+  /// `wcc_data` and the same `writeverf3` a write returns, so a client `fsync` (which the kernel
+  /// issues as COMMIT) succeeds over the mount, as the git, sqlite and editor workloads require.
+  /// Without this a COMMIT is `PROC_UNAVAIL` and the client's `fsync` fails.
   pub fn commit(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
     let mut writer = XdrWriter::new();
     match self.commit_result(args) {
       Ok(post) => {
         Nfsstat3::Ok.encode(&mut writer);
         encode_wcc(&mut writer, Some(post));
-        writer.fixed(&self.write_verifier());
+        writer.fixed(&self.write_verifier);
       }
       Err((status, post)) => {
         status.encode(&mut writer);
@@ -613,16 +641,17 @@ impl<'b> Export<'b> {
     &mut self,
     args: &mut XdrReader<'_>,
   ) -> Result<Fattr3, (Nfsstat3, Option<Fattr3>)> {
-    // COMMIT3args: the file handle, the offset, the byte count. Both range fields are advisory —
-    // slates commits every write FILE_SYNC, so the whole file is already stable regardless of the
-    // requested range — but they are decoded so a malformed request is a typed refusal.
+    // COMMIT3args: the file handle, the offset, the byte count. Both range fields are advisory — the
+    // host's barrier publishes the whole shard image, so every byte of the file is made stable
+    // regardless of the requested range — but they are decoded so a malformed request is a typed
+    // refusal.
     let handle = Nfsfh3::decode(args).map_err(|_| (Nfsstat3::Badhandle, None))?;
     let _offset = args.u64().map_err(|_| (Nfsstat3::Inval, None))?;
     let _count = args.u32().map_err(|_| (Nfsstat3::Inval, None))?;
     let identity = self
       .resolve_handle(&handle)
       .map_err(|status| (status, None))?;
-    // The commit changes nothing; the file's current attributes are the wcc's post half.
+    // The commit changes nothing in the volume; the file's current attributes are the wcc's post half.
     let node = self.attrs_of(&identity).map_err(|status| (status, None))?;
     Ok(self.fattr3(&node))
   }
@@ -1474,6 +1503,52 @@ fn granted_access(mode: u32, requested: u32) -> u32 {
 fn encode_wcc(writer: &mut XdrWriter, post: Option<Fattr3>) {
   writer.bool(false);
   PostOpAttr(post).encode(writer);
+}
+
+/// The `stable_how` a WRITE call asks for (RFC 1813 §3.3.7: `UNSTABLE`, `DATA_SYNC` or
+/// `FILE_SYNC`), decoded from its arguments — the file handle, the offset and the count precede
+/// it — or `None` for a call that does not decode that far. The host's barrier reads it to decide
+/// whether the write's reply may go out before the shard's recovery image is published: only an
+/// `UNSTABLE` write may (its client commits later); any other level is published first.
+pub fn write_stable_how(args: &mut XdrReader<'_>) -> Option<u32> {
+  Nfsfh3::decode(args).ok()?;
+  args.u64().ok()?;
+  args.u32().ok()?;
+  args.u32().ok()
+}
+
+/// Whether a WRITE's decoded `stable_how` asks for a reply before the data is stable (`UNSTABLE`).
+pub fn is_unstable(stable_how: u32) -> bool {
+  stable_how == UNSTABLE
+}
+
+/// The reply for a mutating procedure whose effect the host could not make stable — its barrier
+/// (publishing the shard's recovery image, §4.8) was refused after the effect took place in the
+/// volume: `NFS3ERR_IO` with the procedure's failure shape, every attribute absent, so the client
+/// learns the operation is not stable rather than being told it is (D-18: an acknowledgement
+/// promises daemon-restart survival only when the bytes are recoverable). `None` for a procedure
+/// that mutates nothing, which never needs a barrier. The failure shapes are RFC 1813's `resfail`
+/// arms: `wcc_data` for SETATTR, WRITE, CREATE, MKDIR, SYMLINK, MKNOD, REMOVE, RMDIR and COMMIT;
+/// two `wcc_data` for RENAME; a `post_op_attr` and a `wcc_data` for LINK.
+pub fn io_failure_reply(procedure: u32) -> Option<Vec<u8>> {
+  let mut writer = XdrWriter::new();
+  Nfsstat3::Io.encode(&mut writer);
+  match procedure {
+    NFSPROC3_SETATTR | NFSPROC3_WRITE | NFSPROC3_CREATE | NFSPROC3_MKDIR | NFSPROC3_SYMLINK
+    | NFSPROC3_MKNOD | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_COMMIT => {
+      encode_wcc(&mut writer, None)
+    }
+    NFSPROC3_RENAME => {
+      encode_wcc(&mut writer, None);
+      encode_wcc(&mut writer, None);
+    }
+    NFSPROC3_LINK => {
+      PostOpAttr(None).encode(&mut writer);
+      encode_wcc(&mut writer, None);
+    }
+    _ => return None,
+  }
+  Some(writer.into_bytes())
 }
 
 /// Encodes a CREATE/MKDIR/SYMLINK reply (they share the shape, RFC 1813 §3.3.8-10): on success the

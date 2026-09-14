@@ -134,6 +134,18 @@ pub static RECOVERY_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// inodes, whose base recovery is its own gate); the rest of the shard still publishes (a health
 /// signal, §4.8).
 pub static PUBLISH_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Shard publishes refused outright — the image did not fit its content-object slot, or the slot
+/// could not be written — so nothing changed since the last committed image survives a restart until
+/// a publish succeeds (a health signal, §4.8). A data-plane barrier that meets this answers its
+/// client `NFS3ERR_IO`; a control verb's completion record is already committed with its effect, so
+/// the refusal is counted here and surfaced, never swallowed (the §4.2 admission sizing of the slot
+/// is the owed closure, docs/wip/recovery.md).
+pub static PUBLISH_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Mount-transport mutations acknowledged as stable whose volume the committed recovery image does
+/// not carry (an overlay with base-backed inodes, whose recovery through its base is the owed gate,
+/// docs/wip/recovery.md): the acknowledgement is not backed by anchor-owned RAM, which this surfaces
+/// as a health signal rather than hides (§4.8, D-18).
+pub static BARRIER_UNCAPTURED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Connects refused at the daemon's derived client bound (a health signal, AC-2.6).
 pub static CLIENTS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Clients found dead and reclaimed (a health signal; T-2.3).
@@ -1187,6 +1199,7 @@ fn init_shard(
     segment,
     content,
     content_range,
+    write_verifier: now.to_be_bytes(),
     db,
     fleet,
     origin_anchor,
@@ -1240,15 +1253,17 @@ fn init_shard(
     );
   }
   if rebuilt != verbs::Rebuilt::default() {
-    // Say what recovery did, not more: identities were rebuilt (content is recreated empty until it
-    // is anchor-backed, BUG-11), and the content-less local snapshots and attachments were dropped.
+    // Say what recovery did, not more: volumes rebuilt from their recovery images in anchor-owned
+    // RAM (content, tree and snapshots restored, §4.8), the ones that could not be (refused, never
+    // presented empty), and what the images did not carry and was reconciled out of the catalog.
     eprintln!(
-      "slates-server: shard {shard}: rebuilt {} volume identities (content empty; {} skipped), {} merge volumes (green chains replayed, works reset), dropped {} local snapshots and {} attachments",
+      "slates-server: shard {shard}: recovered {} volumes from their images ({} refused), {} merge volumes (green chains replayed, works reset), reconciled out {} unrecovered local snapshots and {} attachments, trimmed {} unacknowledged snapshots the images carried",
       rebuilt.volumes,
       rebuilt.skipped,
       rebuilt.merge_volumes,
       rebuilt.snapshots_dropped,
-      rebuilt.attachments_dropped
+      rebuilt.attachments_dropped,
+      rebuilt.snapshots_trimmed
     );
   }
   state::install(state);

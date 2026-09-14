@@ -37,6 +37,18 @@
 //! fresh ephemeral one, so the loopback
 //! port is stable across restarts; a standalone daemon (tests) still binds its own. Owed here (one
 //! minor, situational refinement): the attribute-cache timeout from the measured loopback GETATTR RTT.
+//!
+//! **The data-plane barrier (§4.8, D-18).** A mutation served here changes the shard's volumes
+//! without a control verb, so nothing else republishes the shard's recovery image; every mutating
+//! procedure that succeeded therefore runs [`crate::verbs::publish_shard`] on the owner shard
+//! *before* its reply is sent ([`barrier`]), so the reply's stability claim — a `FILE_SYNC` write, a
+//! COMMIT, a create or a rename the protocol defines as stable — is true for daemon-restart survival.
+//! The one exception is an `UNSTABLE` write, answered `UNSTABLE` and made stable by the client's
+//! later COMMIT; the write verifier ([`crate::state::ShardState::write_verifier`], per boot) is how a
+//! client learns a restart lost the unstable writes it still holds and re-sends them (RFC 1813
+//! §3.3.7). A refused publish replaces the reply with `NFS3ERR_IO` — the effect is in the volume but
+//! not stable, and the client is told so rather than promised survival.
+//!
 //! The §4.6 differential oracle (line 1368) is *not* owed here: it
 //! mounts the same volume via FSKit *and* via NFS and compares the abstract states — two real
 //! kernel mounts — so it is gated on the FSKit mount, hence on the Apple Developer entitlement that
@@ -54,11 +66,14 @@ use slates_bridge_core::{Rights, VolumeBridge, new_handle_store};
 use slates_bridge_nfs::mount::{MOUNT_PROGRAM, MOUNTPROC3_MNT};
 use slates_bridge_nfs::nfs::{Fattr3, Nfsfh3};
 use slates_bridge_nfs::procedures::{
-  Export, NFS_MAXNAMELEN, NFS_PROGRAM, NFSPROC3_LOOKUP, NFSPROC3_READDIR, NFSPROC3_READDIRPLUS,
+  Export, NFS_MAXNAMELEN, NFS_PROGRAM, NFSPROC3_COMMIT, NFSPROC3_CREATE, NFSPROC3_LINK,
+  NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_MKNOD, NFSPROC3_READDIR, NFSPROC3_READDIRPLUS,
+  NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK,
+  NFSPROC3_WRITE, io_failure_reply, is_unstable, write_stable_how,
 };
 use slates_bridge_nfs::xdr::XdrReader;
 use slates_bridge_nfs::{
-  AcceptStatus, MultiExport, RpcError, VolumeSet, auth_sys_gid, auth_sys_uid, parse_call,
+  AcceptStatus, MultiExport, Nfsstat3, RpcError, VolumeSet, auth_sys_gid, auth_sys_uid, parse_call,
   read_record, reply_bytes, request_volume, root_volume, serve_call, write_record,
 };
 use slates_db::catalog::{Principal, VolumeId};
@@ -152,6 +167,7 @@ fn with_export<R>(
   f: impl FnOnce(&mut Export<'_>) -> R,
 ) -> Option<R> {
   let handle = *s.by_id.get(&volume)?;
+  let write_verifier = s.write_verifier;
   let ShardState { store, volumes, .. } = s;
   let slot = volumes.get_mut(handle).ok()?;
   let mut handles = new_handle_store();
@@ -164,7 +180,65 @@ fn with_export<R>(
   );
   let mut export = Export::new(&mut bridge, volume, subject, rights).ok()?;
   export.set_owner_gid(owner_gid);
+  // The per-boot write verifier (§4.6, RFC 1813 §3.3.7): a client compares it across a restart to
+  // learn its unstable writes were lost and re-send them.
+  export.set_write_verifier(write_verifier);
   Some(f(&mut export))
+}
+
+/// Whether a served call's effect must be in the shard's recovery image before its reply goes out
+/// (the §4.8 barrier, D-18): a mutating NFS procedure that succeeded — every one except an `UNSTABLE`
+/// write, which its client makes stable with a later COMMIT (itself a barrier). A refused call
+/// changed nothing, and a read never needs one.
+fn needs_barrier(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> bool {
+  if program != NFS_PROGRAM || !nfs_ok(results) {
+    return false;
+  }
+  match procedure {
+    NFSPROC3_WRITE => {
+      write_stable_how(&mut XdrReader::new(args)).is_none_or(|stable| !is_unstable(stable))
+    }
+    NFSPROC3_SETATTR | NFSPROC3_CREATE | NFSPROC3_MKDIR | NFSPROC3_SYMLINK | NFSPROC3_MKNOD
+    | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_RENAME | NFSPROC3_LINK | NFSPROC3_COMMIT => true,
+    _ => false,
+  }
+}
+
+/// Whether an NFS reply's leading status is `NFS3_OK` (RFC 1813: every NFS result starts with its
+/// `nfsstat3`).
+fn nfs_ok(results: &[u8]) -> bool {
+  XdrReader::new(results)
+    .u32()
+    .is_ok_and(|status| status == Nfsstat3::Ok as u32)
+}
+
+/// The barrier after a served mutation (§4.8, D-18): publishes the shard's recovery image on this
+/// (owner) shard so the effect survives a daemon restart before the reply claims it does. A refused
+/// publish — the image did not fit its slot, or the slot could not be written — replaces the reply
+/// with `NFS3ERR_IO` (the effect is in the volume, not stable; the client is told so, never promised
+/// survival). A publish that committed without the touched `volume` (a volume the image cannot yet
+/// hold: an overlay with base-backed inodes, whose recovery is the owed base gate) is counted as an
+/// unbacked acknowledgement ([`crate::daemon::BARRIER_UNCAPTURED`]) and the reply stands, so an
+/// overlay keeps working over the mount while the gap is surfaced rather than hidden.
+fn barrier(
+  procedure: u32,
+  volume: Option<VolumeId>,
+  reply: (AcceptStatus, Vec<u8>),
+) -> (AcceptStatus, Vec<u8>) {
+  let outcome = state::with_state(crate::verbs::publish_shard);
+  match outcome {
+    Some(Ok(published)) => {
+      if volume.is_some_and(|touched| !published.captured(touched)) {
+        crate::daemon::BARRIER_UNCAPTURED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+      }
+      reply
+    }
+    // A refused publish, or no shard state on this thread (which cannot serve a mutation either).
+    _ => match io_failure_reply(procedure) {
+      Some(failed) => (AcceptStatus::Success, failed),
+      None => reply,
+    },
+  }
 }
 
 /// The rights every NFS request runs under (§4.13): read-write, so a mount can read and write the
@@ -330,13 +404,22 @@ fn serve_local(
     mount_rights(),
     requester.owner_gid,
   );
-  let result = serve_call(
+  let served = serve_call(
     &mut service,
     program,
     procedure,
     &mut XdrReader::new(args),
     port,
   );
+  // The barrier (§4.8, D-18): a mutation's effect is published into anchor-owned RAM before its
+  // reply leaves this shard, so the reply's stability claim is true for daemon-restart survival.
+  let result = if matches!(served.0, AcceptStatus::Success)
+    && needs_barrier(program, procedure, args, &served.1)
+  {
+    barrier(procedure, target_volume(program, procedure, args), served)
+  } else {
+    served
+  };
   let _ = state::with_state(|s| {
     let end_ns = s.clock.monotonic_ns();
     emit_span(

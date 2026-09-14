@@ -93,6 +93,13 @@ pub struct ShardState {
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),
+  /// The NFS write verifier this shard's exports answer WRITE and COMMIT with (RFC 1813
+  /// `writeverf3`, §4.6): the shard's boot instant, so it is unique to this daemon instance and a
+  /// client that holds unstable writes from before a restart sees it change and re-sends them.
+  /// Format: the boot instant's monotonic nanoseconds, big-endian — a monotonic clock never repeats
+  /// within a host's uptime, and a host reboot discards every client's unstable state with the
+  /// anchor's RAM, so no older instance is ever confused with a newer one.
+  pub write_verifier: [u8; size_of::<u64>()],
   /// The partition.
   pub db: Db,
   /// The owner runtime this node takes part in a region as (§4.8, boot step 6): the SWIM membership

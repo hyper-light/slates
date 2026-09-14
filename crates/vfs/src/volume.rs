@@ -541,6 +541,15 @@ impl Volume {
     self.snapshots.len()
   }
 
+  /// The ids of the snapshots the volume holds, in slot order (§4.8: what a recovery compares
+  /// against the catalog's acknowledged snapshots to trim an image ahead of the log).
+  pub fn snapshot_ids(&self) -> impl Iterator<Item = SnapshotId> + '_ {
+    self.snapshots.iter().map(|(h, _)| SnapshotId {
+      index: h.index(),
+      generation: h.generation(),
+    })
+  }
+
   /// Looks a name up in a directory.
   pub fn lookup(
     &self,
@@ -1739,14 +1748,7 @@ impl Volume {
     // slices afterward. Idempotent against a re-entered destroy — the count is zero the second time.
     store.versions.credit_retention(self.retained_versions());
     let mut queue = Vec::new();
-    let snapshots: Vec<SnapshotId> = self
-      .snapshots
-      .iter()
-      .map(|(h, _)| SnapshotId {
-        index: h.index(),
-        generation: h.generation(),
-      })
-      .collect();
+    let snapshots: Vec<SnapshotId> = self.snapshot_ids().collect();
     for id in snapshots {
       if let Ok(s) = self.snapshots.remove(snapshot_handle(id)) {
         queue.extend(s.deadlist.items().iter().copied());

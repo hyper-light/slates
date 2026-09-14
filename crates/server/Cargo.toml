@@ -39,6 +39,10 @@ windows-sys = { workspace = true }
 [dev-dependencies]
 # self-signed fleet identities for the two-daemon membership test (as the cluster tests mint them).
 rcgen = { workspace = true }
+# The typed client, for the recovery oracle (§4.8 A-9, AC-2.12): it drives the same verbs a session
+# drives across a daemon restart (create, snapshot, clone, status, the exactly-once retry). Its lib
+# depends only on machine/ipc/wire, so this is not a cycle.
+slates-client = { workspace = true }
 
 [lints]
 workspace = true
