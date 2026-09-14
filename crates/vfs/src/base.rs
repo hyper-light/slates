@@ -557,6 +557,22 @@ impl Overlay<'_> {
     name: &str,
   ) -> Result<(), VfsError> {
     let located = self.vol.lookup(store, dir, name)?;
+    // Its content, when a snapshot pins it, is retained (§4.2): secured before the entry goes.
+    let retention = self.vol.retention_of_drop(store, located.inode)?;
+    self.vol.secure_retention(store, retention)?;
+    let dropped = self.drop_unloaded_secured(store, dir, name, located);
+    self.vol.settle_retention(store);
+    dropped
+  }
+
+  /// The removal proper, under a secured retention.
+  fn drop_unloaded_secured(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    located: crate::volume::Located,
+  ) -> Result<(), VfsError> {
     let d = self.vol.make_current_dir(store, dir)?;
     let mut retired = crate::dirtree::Retired::new();
     let epoch = self.vol.epoch;
@@ -1739,12 +1755,18 @@ impl Overlay<'_> {
       }
       Child::File(no) | Child::Symlink(no) => {
         // The disk holds the bytes: the entry leaves the overlay. The next lookup reloads it
-        // from the listing as an untouched base entry, and its cached bytes go with it.
+        // from the listing as an untouched base entry, and its cached bytes go with it — retained
+        // (§4.2) when a snapshot still pins them, secured before anything changes.
+        let retention = self.vol.retention_of_drop(store, no)?;
+        self.vol.secure_retention(store, retention)?;
         if let Some(f) = self.vol.base_forget(no) {
           self.host.close_file(f);
         }
-        self.drop_entry(store, dir, name)?;
-        self.vol.drop_link(store, no)?;
+        let dropped = self
+          .drop_entry(store, dir, name)
+          .and_then(|()| self.vol.drop_link(store, no));
+        self.vol.settle_retention(store);
+        dropped?;
       }
     }
     Ok(())

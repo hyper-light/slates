@@ -1254,6 +1254,8 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     spans_held: u64::try_from(state.telemetry.len()).unwrap_or(u64::MAX),
     spans_dropped: state.telemetry.dropped(),
     peers_probed: u32::try_from(state.formed_probe_peers.len()).unwrap_or(u32::MAX),
+    retained_bytes: state.store.budget.retained(),
+    retained_versions: state.store.versions.retained(),
   }
 }
 
@@ -4066,37 +4068,26 @@ fn release_recovered_bytes(
   }
 }
 
-/// Re-acquires a recovered volume's version-slab credits (§4.2 accounting through recovery): its
-/// logical inode allowance and its retained-version charge, both admitted before the restart. If the
-/// slab shrank below what the recovered state needs, recovery cannot represent it and fails, returning
-/// the byte reservation and re-grown hold so a refused recovery leaks neither.
+/// Re-acquires a recovered volume's version-slab credit (§4.2 accounting through recovery): its
+/// logical inode allowance, admitted before the restart. (Its retention — retained versions and
+/// bytes — is re-established by the rebuild itself, `Volume::from_image`.) If the slab shrank below
+/// what the recovered state needs, recovery cannot represent it and fails, returning the byte
+/// reservation and re-grown hold so a refused recovery leaks neither.
 fn recover_version_reservations(
   store: &mut slates_vfs::volume::Store,
-  volume: &Volume,
   allowance: u64,
   reservation: Option<slates_mem::budget::Reservation>,
   held: u64,
 ) -> Result<Option<slates_mem::budget::VersionCredit>, String> {
-  let version_credit = match store.versions.reserve(allowance) {
-    Ok(c) => Some(c),
+  match store.versions.reserve(allowance) {
+    Ok(c) => Ok(Some(c)),
     Err(e) => {
       release_recovered_bytes(store, reservation, held);
-      return Err(format!(
+      Err(format!(
         "recovered inode allowance exceeds the version slab: {e}"
-      ));
+      ))
     }
-  };
-  let retained = volume.retained_versions();
-  if store.versions.charge_retention(retained).is_err() {
-    if let Some(c) = version_credit {
-      store.versions.release(c);
-    }
-    release_recovered_bytes(store, reservation, held);
-    return Err(format!(
-      "recovered retained versions ({retained}) exceed the version slab"
-    ));
   }
-  Ok(version_credit)
 }
 
 fn rebuild_volume(
@@ -4131,6 +4122,8 @@ fn rebuild_volume(
   // teardown it is released through `budget_hold`, the same as a running volume's.
   let held = volume.budget_hold();
   if held > 0 && state.store.budget.grow(held).is_err() {
+    // The rebuilt volume returns its slots, blocks and retention rather than leaking them.
+    let _ = volume.discard_partial(&mut state.store);
     if let Some(r) = reservation {
       state.store.budget.release(r);
     }
@@ -4142,10 +4135,17 @@ fn rebuild_volume(
   let _ = volume.set_inode_allowance(allowance);
   let entries = entry_allowance(size).max(volume.entry_usage().0);
   let _ = volume.set_entry_allowance(entries);
-  // Re-acquire the version reservation and re-establish the retained-version charge (§4.2 accounting
-  // through recovery), giving back the byte reservation and re-grown hold if the slab shrank.
+  // Re-acquire the version reservation (§4.2 accounting through recovery), giving back the byte
+  // reservation and re-grown hold — and the rebuilt volume's slots, blocks and retention — if the
+  // slab shrank.
   let version_credit =
-    recover_version_reservations(&mut state.store, &volume, allowance, reservation, held)?;
+    match recover_version_reservations(&mut state.store, allowance, reservation, held) {
+      Ok(credit) => credit,
+      Err(reason) => {
+        let _ = volume.discard_partial(&mut state.store);
+        return Err(reason);
+      }
+    };
   let slot = VolumeSlot {
     id: record.id,
     name: record.name.clone(),

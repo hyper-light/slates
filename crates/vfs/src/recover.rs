@@ -583,7 +583,7 @@ impl Volume {
       last_snapshot: self.last_snapshot.map(snap_ref),
       inodes,
       snapshots,
-      orphans: self.orphans.iter().map(|no| no.0).collect(),
+      orphans: self.orphans.keys().map(|no| no.0).collect(),
     })
   }
 
@@ -957,7 +957,14 @@ impl Volume {
     vol.last_snapshot = image.last_snapshot.map(to_snapshot_id);
     // Restore the orphan tracking (§4.8): the inodes are already rebuilt with the rest, and marking
     // them orphans again means a reacquired handle's last close reclaims them rather than leaking.
-    vol.orphans = image.orphans.iter().map(|no| InodeNo(*no)).collect();
+    vol.orphans = image.orphans.iter().map(|no| (InodeNo(*no), 0)).collect();
+    // Re-establish the retention the rebuilt deadlists and orphans hold against the shard budgets
+    // (§4.2 accounting through recovery); a shard that cannot back what was admitted before the
+    // restart refuses, and the half-built volume returns its slots and blocks rather than leaking.
+    if let Err(refusal) = vol.reestablish_retention(store) {
+      let _ = vol.discard_partial(store);
+      return Err(refusal);
+    }
     Ok(vol)
   }
 
@@ -1139,7 +1146,36 @@ impl Volume {
     }
     self.rebuild_entries(store, &snap.inodes, &kinds, &dirs)?;
     self.fill_content(store, &snap.inodes)?;
+    self.seal_open_content(store, &snap.inodes)?;
     self.restore_identities(store, &snap.inodes)?;
+    Ok(())
+  }
+
+  /// Seals the open extent of each of a snapshot's private files after the content pass: a frozen
+  /// snapshot's content is immutable, so an open (in-place-writable) extent has no purpose there,
+  /// and only a sealed chunk can be listed on the snapshot's deadlist and counted as its retained
+  /// bytes (§4.2). The head's files keep their open last window, as the live volume's do.
+  fn seal_open_content(
+    &mut self,
+    store: &mut Store,
+    inodes: &[InodeImage],
+  ) -> Result<(), VfsError> {
+    for image_inode in inodes {
+      let no = InodeNo(image_inode.no);
+      let handle =
+        trie::get(&store.tries, self.inode_root, no).ok_or(VfsError::RecoveryIncomplete)?;
+      let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
+      let sealed_body = match body {
+        Body::Open { open, mut sealed } => {
+          if let Some(extent) = store.content.seal(open)? {
+            crate::volume::insert_extent(&mut sealed, extent);
+          }
+          Body::Sealed(sealed)
+        }
+        other => other,
+      };
+      store.inodes.get_mut(handle)?.body = sealed_body;
+    }
     Ok(())
   }
 

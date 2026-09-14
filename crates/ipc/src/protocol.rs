@@ -434,6 +434,13 @@ pub struct ShardReport {
   /// Fleet peers this shard has a formed probe session to (§4.8 "Membership"). The membership loop runs
   /// on the control shard, so only its part counts; the other shards form none. Zero on a laptop.
   pub peers_probed: u32,
+  /// The part of `committed_bytes` that is snapshot-retained content (§4.2 retention, the byte
+  /// dimension): arena blocks the heads have let go of that their snapshots still pin, charged from
+  /// unpromised capacity. Distinguishes bytes held for snapshots from promised entitlement.
+  pub retained_bytes: u64,
+  /// The part of `committed_versions` that is snapshot-retained inode versions (§4.2 retention,
+  /// the inode dimension).
+  pub retained_versions: u64,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.

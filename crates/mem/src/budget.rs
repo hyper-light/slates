@@ -65,17 +65,23 @@ impl Ledger {
 }
 
 /// A shard's byte reserve and its accounting (§4.2 atomic admission). The capacity is the effective
-/// capacity — the usable, prepared arena; the committed bytes are the entitlement handed to volumes;
-/// and the headroom is the operation headroom kept free for the bounded temporary coexistence of
-/// in-flight operations (a copy-up holds a source chunk and its new extent at once). Every
-/// admission — a bounded reservation or a dynamic growth alike — leaves the headroom free and takes
-/// only from capacity not already committed, so growth consumes only unpromised space and a burst
-/// never meets exhaustion. This is the one capacity owner for content bytes: control-path
-/// reservations and dynamic growth both go through it, with no second, looser test against raw free
+/// capacity — the usable, prepared arena; the committed bytes are the entitlement handed to volumes
+/// plus the bytes their snapshots retain; and the headroom is the operation headroom kept free for
+/// the bounded temporary coexistence of in-flight operations (a copy-up holds a source chunk and its
+/// new extent at once). Every admission — a bounded reservation, a dynamic growth or a retention
+/// charge alike — leaves the headroom free and takes only from capacity not already committed, so
+/// growth and retention consume only unpromised space and a burst never meets exhaustion. This is
+/// the one capacity owner for content bytes: control-path reservations, dynamic growth and the
+/// retained bytes of snapshots all go through it, with no second, looser test against raw free
 /// memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardBudget {
   ledger: Ledger,
+  /// The part of `committed` that is snapshot-retained content (§4.2 retention, the byte
+  /// dimension): chunks the heads have let go of that their snapshots still pin, charged at their
+  /// arena block length. Reported beside the reservations so the status distinguishes promised
+  /// entitlement from bytes held on behalf of snapshots.
+  retained: u64,
 }
 
 /// A reservation of bytes for one bounded volume.
@@ -92,6 +98,7 @@ impl ShardBudget {
   pub const fn new(reserve: u64, headroom: u64) -> Self {
     Self {
       ledger: Ledger::new(reserve, headroom),
+      retained: 0,
     }
   }
 
@@ -100,9 +107,15 @@ impl ShardBudget {
     self.ledger.reserve
   }
 
-  /// Bytes committed to volumes (their entitlement).
+  /// Bytes committed: every volume's entitlement (reservations and admitted growth) plus the bytes
+  /// their snapshots retain.
   pub const fn committed(&self) -> u64 {
     self.ledger.committed
+  }
+
+  /// The snapshot-retained part of the committed bytes (§4.2 retention).
+  pub const fn retained(&self) -> u64 {
+    self.retained
   }
 
   /// The operation headroom kept free of every admission (§4.2).
@@ -141,6 +154,24 @@ impl ShardBudget {
       .take(increment)
       .map(|bytes| Reservation { bytes })
   }
+
+  /// Charges `bytes` of snapshot-retained content against the *unpromised* capacity — the arena less
+  /// every reservation, every admitted growth and the operation headroom (§4.2: "a new retained
+  /// snapshot ... cannot use up a writer's promised future space"). Refused whole, with nothing
+  /// changed, if no unpromised capacity remains, so a volume's snapshots never spend a neighbour's
+  /// entitlement. A running charge, not a held credit: the owner credits it back symmetrically as
+  /// retained chunks are freed.
+  pub fn charge_retention(&mut self, bytes: u64) -> Result<(), MemError> {
+    let taken = self.ledger.take(bytes)?;
+    self.retained = self.retained.saturating_add(taken);
+    Ok(())
+  }
+
+  /// Returns `bytes` of retention charge as retained chunks are freed.
+  pub fn credit_retention(&mut self, bytes: u64) {
+    self.ledger.give(bytes);
+    self.retained = self.retained.saturating_sub(bytes);
+  }
 }
 
 /// A credit of inode-version slots reserved for one volume's logical inode allowance (§4.2). Held
@@ -169,6 +200,9 @@ pub struct VersionCredit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionBudget {
   ledger: Ledger,
+  /// The part of `committed` that is snapshot-retained inode versions (§4.2 retention, the inode
+  /// dimension), reported beside the reserved allowances.
+  retained: u64,
 }
 
 impl VersionBudget {
@@ -178,6 +212,7 @@ impl VersionBudget {
   pub const fn new(slots: u64, headroom: u64) -> Self {
     Self {
       ledger: Ledger::new(slots, headroom),
+      retained: 0,
     }
   }
 
@@ -186,9 +221,15 @@ impl VersionBudget {
     self.ledger.reserve
   }
 
-  /// Version slots committed to volumes (their reserved logical allowances).
+  /// Version slots committed: every volume's reserved logical allowance plus the versions their
+  /// snapshots retain.
   pub const fn committed(&self) -> u64 {
     self.ledger.committed
+  }
+
+  /// The snapshot-retained part of the committed slots (§4.2 retention).
+  pub const fn retained(&self) -> u64 {
+    self.retained
   }
 
   /// The copy-up headroom kept free of every reservation (§4.2).
@@ -220,12 +261,15 @@ impl VersionBudget {
   /// reservation this is a running charge, not a held credit — the caller credits it back symmetrically
   /// as retained versions are freed.
   pub fn charge_retention(&mut self, slots: u64) -> Result<(), MemError> {
-    self.ledger.take(slots).map(drop)
+    let taken = self.ledger.take(slots)?;
+    self.retained = self.retained.saturating_add(taken);
+    Ok(())
   }
 
   /// Returns `slots` of retained-version charge to the slab as retained versions are freed.
   pub fn credit_retention(&mut self, slots: u64) {
     self.ledger.give(slots);
+    self.retained = self.retained.saturating_sub(slots);
   }
 }
 
@@ -374,6 +418,39 @@ mod tests {
     assert_eq!(v.committed(), 60, "a refused reservation changes nothing");
     v.release(a);
     assert_eq!(v.admittable(), 99, "release returns the credit's slots");
+  }
+
+  /// The byte dimension's retention charge draws only from unpromised capacity — never from a
+  /// reservation or the headroom — is refused whole at the boundary, and is credited back as the
+  /// retained chunks go, with the retained sub-account tracking exactly the retention part of the
+  /// committed bytes (§4.2 "a new retained snapshot ... cannot use up a writer's promised future
+  /// space").
+  #[test]
+  fn retained_bytes_are_charged_from_unpromised_capacity_and_credited_back() {
+    let mut b = ShardBudget::new(100, 10);
+    let sacred = b.reserve(60).unwrap(); // a bounded volume's promise
+    assert_eq!(b.admittable(), 30, "100 − 60 reserved − 10 headroom");
+    b.charge_retention(30).unwrap();
+    assert_eq!(b.retained(), 30);
+    assert_eq!(
+      b.committed(),
+      90,
+      "the reservation and the retention are both committed"
+    );
+    // The promise and the headroom are not for retention: refused whole, offering nothing.
+    assert!(matches!(
+      b.charge_retention(1),
+      Err(MemError::BudgetExceeded {
+        requested: 1,
+        available: 0
+      })
+    ));
+    assert_eq!(b.retained(), 30, "a refused charge changes nothing");
+    b.credit_retention(30);
+    assert_eq!(b.retained(), 0);
+    assert_eq!(b.committed(), 60, "only the reservation remains");
+    b.release(sacred);
+    assert_eq!(b.committed(), 0);
   }
 
   #[test]
