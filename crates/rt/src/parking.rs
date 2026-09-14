@@ -87,6 +87,14 @@ impl Parking {
   pub fn kicks_skipped(&self) -> u64 {
     self.kicks_skipped.load(Ordering::Relaxed)
   }
+
+  /// Whether the shard is announcing itself parked right now — an **observer's snapshot** (a stall
+  /// diagnosis reading it beside the shard's pulse, `registry::Pulse`), never part of the protocol above:
+  /// a sender must go through [`kick_if_parked`](Self::kick_if_parked), whose fence is what makes the
+  /// answer safe to act on. `Relaxed`: a snapshot that may be a moment stale is what an observer wants.
+  pub fn parked(&self) -> bool {
+    self.parked.load(Ordering::Relaxed)
+  }
 }
 
 // Two attributes rather than `all(test, loom)`: clippy's test-context rule (unwrap allowed in

@@ -42,6 +42,7 @@ mod common;
 use std::net::TcpStream;
 
 use common::nfs::{create, lookup, mount, read, write};
+use common::trace;
 use slates_transport::handshake::Identity;
 use slates_wire::request::RequestId;
 
@@ -113,6 +114,135 @@ const PERIOD_BUDGET: u64 = 4000;
 /// a tight window (the per-operation deadline) false-declares it dead; only a truly wedged or dead coordinator
 /// makes no progress at all for this many minutes.
 const FROZEN_CAP: Duration = Duration::from_secs(300);
+/// Shape: how often a wait in progress is sampled into the opt-in trace ([`trace`]) — once a second of wall
+/// time, so a stall leaves a bounded, legible record (a wait frozen for [`FROZEN_CAP`] is three hundred
+/// lines) and a healthy wait a handful; a change of verdict is always recorded at once.
+const TRACE_SAMPLE: Duration = Duration::from_secs(1);
+
+/// The trace of one wait ([`trace`], on only when `SLATES_FLEET_TRACE` names a file): its site (the file
+/// and line that called the wait, so no call site needs a label), when it began and last sampled, how
+/// many times the condition was asked since, and the slowest ask it saw — so a stall names the wait, what
+/// the observed coordinators and shards did meanwhile, and whether the condition itself was the slow part
+/// (an observation reaching its budget on a starved shard shows as an ask of about that budget).
+struct WaitTrace {
+  site: &'static std::panic::Location<'static>,
+  began: Instant,
+  last_sample: Instant,
+  asks_since_sample: u64,
+  slowest_ask: Duration,
+}
+
+impl WaitTrace {
+  /// Opens the trace of a `kind` of wait at `site`, recording the observed daemons' state as it begins.
+  fn begin(
+    kind: &str,
+    site: &'static std::panic::Location<'static>,
+    daemons: &[&Daemon],
+  ) -> WaitTrace {
+    if trace::enabled() {
+      trace::record(format_args!(
+        "{kind} begin {} {}",
+        site_of(site),
+        describe(daemons)
+      ));
+    }
+    let now = Instant::now();
+    WaitTrace {
+      site,
+      began: now,
+      last_sample: now,
+      asks_since_sample: 0,
+      slowest_ask: Duration::ZERO,
+    }
+  }
+
+  /// One more ask of the condition that `took` this long and did not hold; samples a line once
+  /// [`TRACE_SAMPLE`] has passed since the last, with the wait's daemon-time position (the slowest observed
+  /// coordinator's period count, the periods it advanced since the wait began, and how long its progress
+  /// has been frozen).
+  fn asked(
+    &mut self,
+    took: Duration,
+    daemons: &[&Daemon],
+    progress: u64,
+    advanced: u64,
+    frozen_for: Duration,
+  ) {
+    if !trace::enabled() {
+      return;
+    }
+    self.asks_since_sample += 1;
+    self.slowest_ask = self.slowest_ask.max(took);
+    if self.last_sample.elapsed() < TRACE_SAMPLE {
+      return;
+    }
+    trace::record(format_args!(
+      "poll {} wall={:.3}s min_progress={progress} advanced={advanced} frozen_for={:.3}s asks={} \
+       slowest_ask={:.3}s {}",
+      site_of(self.site),
+      self.began.elapsed().as_secs_f64(),
+      frozen_for.as_secs_f64(),
+      self.asks_since_sample,
+      self.slowest_ask.as_secs_f64(),
+      describe(daemons)
+    ));
+    self.last_sample = Instant::now();
+    self.asks_since_sample = 0;
+    self.slowest_ask = Duration::ZERO;
+  }
+
+  /// Closes the trace with the wait's `verdict` and the daemons' state at its end.
+  fn end(&self, kind: &str, verdict: &str, daemons: &[&Daemon], progress: u64, advanced: u64) {
+    if trace::enabled() {
+      trace::record(format_args!(
+        "{kind} end {} verdict={verdict} wall={:.3}s min_progress={progress} advanced={advanced} {}",
+        site_of(self.site),
+        self.began.elapsed().as_secs_f64(),
+        describe(daemons)
+      ));
+    }
+  }
+}
+
+/// A wait's site as `file:line` (the basename only), from the caller location a `#[track_caller]` wait
+/// captures — the label of the wait in the trace, needing no change at any call site.
+fn site_of(site: &std::panic::Location<'_>) -> String {
+  let file = site.file().rsplit('/').next().unwrap_or(site.file());
+  format!("{file}:{}", site.line())
+}
+
+/// Every observed daemon for a trace line: its instance, its coordinator's period count
+/// ([`Daemon::fleet_progress`]) and each of its shards' pulse ([`Daemon::shard_pulses`]) — both read
+/// directly, so a daemon too starved to answer a query is still described.
+fn describe(daemons: &[&Daemon]) -> String {
+  daemons
+    .iter()
+    .map(|daemon| {
+      let shards: Vec<String> = daemon
+        .shard_pulses()
+        .iter()
+        .map(|pulse| {
+          format!(
+            "{}:steps={} waits={} parked={} kicks_skipped={} ring_full={}",
+            pulse.shard,
+            pulse.steps,
+            pulse.waits,
+            pulse.parked,
+            pulse.kicks_skipped,
+            pulse.ring_full_events
+          )
+        })
+        .collect();
+      format!(
+        "{}[periods={} {}]",
+        daemon.config().instance,
+        daemon.fleet_progress(),
+        shards.join(" ")
+      )
+    })
+    .collect::<Vec<_>>()
+    .join(" ")
+}
 
 /// Each fleet test starts several daemons — every daemon is a shard thread plus its doorbell thread — so
 /// running the tests concurrently oversubscribes the machine and stretches the probe and commit timing
@@ -383,14 +513,20 @@ const FALSE_DEATH_INCARNATION: u64 = 1_000;
 /// the observe budget — and a condition must map `None` to `false` (`== Some(true)`, `is_some_and(..)`),
 /// so a poll keeps waiting on an unanswered shard instead of reading its silence as the change it waits for
 /// (a "no longer contains" predicate on an *empty default* was a false pass on a wedged shard).
+#[track_caller]
 fn poll_until(daemons: &[&Daemon], within: Duration, mut condition: impl FnMut() -> bool) -> bool {
+  let mut wait = WaitTrace::begin("poll", std::panic::Location::caller(), daemons);
   let start = min_progress(daemons);
   let mut last = start;
   let mut last_advance = Instant::now();
   loop {
+    let asked = Instant::now();
     if condition() {
+      let now = min_progress(daemons);
+      wait.end("poll", "held", daemons, now, now.saturating_sub(start));
       return true;
     }
+    let took = asked.elapsed();
     let now = min_progress(daemons);
     if now != last {
       // The slowest observed daemon advanced — the fleet is alive (however slow under load); reset the
@@ -398,15 +534,19 @@ fn poll_until(daemons: &[&Daemon], within: Duration, mut condition: impl FnMut()
       last = now;
       last_advance = Instant::now();
     }
-    if now.saturating_sub(start) >= PERIOD_BUDGET {
+    let advanced = now.saturating_sub(start);
+    wait.asked(took, daemons, now, advanced, last_advance.elapsed());
+    if advanced >= PERIOD_BUDGET {
       // The slowest observed daemon ran a whole budget of its own periods, condition never met: a genuine
       // non-convergence (judged in daemon-time, so CPU load cannot cause it — periods, not wall-clock).
+      wait.end("poll", "period budget spent", daemons, now, advanced);
       return false;
     }
     if last_advance.elapsed() >= within.max(FROZEN_CAP) {
       // No observed daemon made ANY forward progress for the frozen cap: every observed coordinator is frozen
       // or dead (a wedge), not merely slow. The only wall-clock bound; generous ([`FROZEN_CAP`]) so a
       // coordinator merely starved of the scheduler for tens of seconds under heavy load is not called dead.
+      wait.end("poll", "frozen", daemons, now, advanced);
       return false;
     }
     std::thread::yield_now();
@@ -428,13 +568,35 @@ fn min_progress(daemons: &[&Daemon]) -> u64 {
 /// check a "did not flap" assertion needs. As with [`poll_until`], an observation the daemon could not make
 /// (`None`) never satisfies `condition`: a hold is only proven over observed samples, so an unanswered shard
 /// fails the hold rather than passing it.
+#[track_caller]
 fn holds_for(window: Duration, mut condition: impl FnMut() -> bool) -> bool {
-  let deadline = Instant::now() + window;
+  let site = std::panic::Location::caller();
+  let began = Instant::now();
+  let deadline = began + window;
+  // How many samples the hold rests on: under load each ask can take seconds, so a hold proven over one
+  // sample is a weak proof, and the trace says so.
+  let mut asks: u64 = 0;
   while Instant::now() < deadline {
+    asks += 1;
     if !condition() {
+      if trace::enabled() {
+        trace::record(format_args!(
+          "hold {} broke after {:.3}s of {:.3}s asks={asks}",
+          site_of(site),
+          began.elapsed().as_secs_f64(),
+          window.as_secs_f64()
+        ));
+      }
       return false;
     }
     std::thread::yield_now();
+  }
+  if trace::enabled() {
+    trace::record(format_args!(
+      "hold {} held {:.3}s asks={asks}",
+      site_of(site),
+      window.as_secs_f64()
+    ));
   }
   true
 }
@@ -442,10 +604,20 @@ fn holds_for(window: Duration, mut condition: impl FnMut() -> bool) -> bool {
 /// A fixed [`FORMATION_SETTLE`] window of yielding on the clock — the test thread is not a runtime task, so
 /// it cannot `futures::sleep`; used only *after* a polled formation, to let freshly formed sessions steady
 /// (a few probes answered, a measured round trip seeded) before the test acts on them.
+#[track_caller]
 fn settle() {
-  let deadline = Instant::now() + FORMATION_SETTLE;
+  let site = std::panic::Location::caller();
+  let began = Instant::now();
+  let deadline = began + FORMATION_SETTLE;
   while Instant::now() < deadline {
     std::thread::yield_now();
+  }
+  if trace::enabled() {
+    trace::record(format_args!(
+      "settle {} took {:.3}s",
+      site_of(site),
+      began.elapsed().as_secs_f64()
+    ));
   }
 }
 
@@ -2894,6 +3066,12 @@ impl Client {
     loop {
       match connect(instance) {
         Ok(connected) => {
+          if trace::enabled() {
+            trace::record(format_args!(
+              "client connect {instance} took {:.3}s",
+              started.elapsed().as_secs_f64()
+            ));
+          }
           let client = connected.region.client_id();
           return Client {
             end: ClientEnd::with_doorbell(connected.region, connected.doorbell),
@@ -2904,7 +3082,13 @@ impl Client {
         Err(IpcError::DaemonUnavailable { .. }) if started.elapsed() < CREDIT_WAIT => {
           std::thread::yield_now();
         }
-        Err(e) => panic!("{e}"),
+        Err(e) => {
+          trace::record(format_args!(
+            "client connect {instance} failed after {:.3}s: {e}",
+            started.elapsed().as_secs_f64()
+          ));
+          panic!("{e}")
+        }
       }
     }
   }
@@ -2936,14 +3120,38 @@ impl Client {
     )
     .unwrap();
     let started = Instant::now();
+    // The verb's kind for the trace: the variant name, the first word of its debug form.
+    let verb = format!("{body:?}");
+    let verb = verb.split([' ', '{', '(']).next().unwrap_or("?").to_owned();
     loop {
       match self.end.send(&slot) {
         Ok(()) => break,
         Err(IpcError::RingFull) if started.elapsed() < CREDIT_WAIT => std::thread::yield_now(),
-        Err(e) => panic!("{e}"),
+        Err(e) => {
+          trace::record(format_args!(
+            "client {verb} send failed after {:.3}s: {e}",
+            started.elapsed().as_secs_f64()
+          ));
+          panic!("{e}")
+        }
       }
     }
-    let reply = self.end.wait(Some(DEADLINE_NS)).unwrap();
+    let reply = match self.end.wait(Some(DEADLINE_NS)) {
+      Ok(reply) => reply,
+      Err(e) => {
+        trace::record(format_args!(
+          "client {verb} reply failed after {:.3}s: {e}",
+          started.elapsed().as_secs_f64()
+        ));
+        panic!("client {verb}: {e}")
+      }
+    };
+    if trace::enabled() {
+      trace::record(format_args!(
+        "client {verb} replied in {:.3}s",
+        started.elapsed().as_secs_f64()
+      ));
+    }
     unpack(self.end.region(), reply.kind, &reply.payload).unwrap()
   }
 }

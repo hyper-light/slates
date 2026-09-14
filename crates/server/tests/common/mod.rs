@@ -3,3 +3,4 @@
 #![allow(dead_code)]
 
 pub(crate) mod nfs;
+pub(crate) mod trace;

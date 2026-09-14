@@ -50,6 +50,49 @@ pub struct Entry {
   /// shard, so a message to a spinning shard costs no syscall (§4.7 "Wake strategy"; the
   /// protocol and its loom model live in [`crate::parking`]).
   pub parking: Parking,
+  /// The shard's forward-progress pulse, for an observer on any thread (see [`Pulse`]).
+  pub pulse: Pulse,
+}
+
+/// A shard's forward-progress pulse, readable from any thread with no shard round-trip (§4.14; the same
+/// discipline as the fleet coordinator's period count in `slates-server`): the loop's step count and its
+/// driver-wait count, stored by the owning shard from its own `Counters` (which live behind the shard's
+/// single-threaded borrow) once per step and once per wait. An observer reads it to tell a shard that is
+/// stepping — alive, however slowly under CPU load — from one that has stopped: parked with no kick (a
+/// wedge), or held inside one poll (a spin, a blocking call). It is the instrument a stall diagnosis needs
+/// precisely when the shard would not answer a query. The only writer is the shard; `Relaxed` on both
+/// sides, a statistic (R2).
+///
+/// Shape: on its own cache line (the largest line we target, Apple silicon's 128 bytes) — the owning shard
+/// stores every step, so the line must be shared with no word another thread writes (the control flag,
+/// the ring's tail) or the shard would pay a transfer per step; a foreign read moves the line once.
+#[repr(align(128))]
+#[derive(Debug, Default)]
+pub struct Pulse {
+  steps: AtomicU64,
+  waits: AtomicU64,
+}
+
+impl Pulse {
+  /// The owning shard records its step count after a step.
+  pub fn record_steps(&self, steps: u64) {
+    self.steps.store(steps, Ordering::Relaxed);
+  }
+
+  /// The owning shard records its driver-wait count as it enters a wait.
+  pub fn record_waits(&self, waits: u64) {
+    self.waits.store(waits, Ordering::Relaxed);
+  }
+
+  /// Loop iterations the shard has run.
+  pub fn steps(&self) -> u64 {
+    self.steps.load(Ordering::Relaxed)
+  }
+
+  /// Driver waits the shard has entered.
+  pub fn waits(&self) -> u64 {
+    self.waits.load(Ordering::Relaxed)
+  }
 }
 
 static ENTRIES: [OnceLock<&'static Entry>; MAX_SHARDS] = [const { OnceLock::new() }; MAX_SHARDS];
@@ -79,6 +122,7 @@ pub fn register(
     kick,
     ring_full_events: AtomicU64::new(0),
     parking: Parking::new(),
+    pulse: Pulse::default(),
   }));
   let _ = ENTRIES[usize::from(id)].set(entry);
   Ok((id, receiver))

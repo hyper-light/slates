@@ -97,6 +97,28 @@ impl std::fmt::Debug for Daemon {
   }
 }
 
+/// One shard's forward-progress pulse (§4.14), read by [`Daemon::shard_pulses`] straight off the runtime's
+/// registry. A stall diagnosis reads it beside the coordinator's period count ([`Daemon::fleet_progress`]):
+/// a coordinator not advancing on a shard whose `steps` still climb is a coordinator awaiting something (a
+/// peer's reply, another shard's answer); one on a shard whose `steps` are frozen while `parked` is set is
+/// a shard waiting in its driver for a kick that has not come; frozen and not parked is a shard held inside
+/// one poll (a spin, a blocking call) or not being scheduled at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardPulse {
+  /// The shard's runtime id.
+  pub shard: u16,
+  /// Loop iterations the shard has run.
+  pub steps: u64,
+  /// Driver waits (parks) the shard has entered.
+  pub waits: u64,
+  /// Whether the shard announced itself parked at the moment of the read (a snapshot).
+  pub parked: bool,
+  /// Kicks senders skipped because the shard was not parked (§4.7 "Wake strategy": the saving, counted).
+  pub kicks_skipped: u64,
+  /// Times a foreign sender found the shard's wake ring full and spun (a tripwire).
+  pub ring_full_events: u64,
+}
+
 /// Set by the doorbell thread each time it kicks; the control task's poller reads it.
 static DOORBELL_RANG: AtomicBool = AtomicBool::new(false);
 /// Shape: pending NFS connections the kernel queues before the accept loop takes them. A mount opens a
@@ -459,6 +481,29 @@ impl Daemon {
     self
       .fleet_progress
       .load(std::sync::atomic::Ordering::Relaxed)
+  }
+
+  /// Every shard's forward-progress pulse ([`ShardPulse`], §4.14), read **directly** from the runtime's
+  /// registry with no shard round-trip — the discipline of [`Self::fleet_progress`] — so it is reported even
+  /// when a shard is too starved, or too wedged, to answer a query. In shard order; a shard whose registry
+  /// entry is gone is omitted. Zero-cost to the shards beyond one plain store per step: reading moves each
+  /// pulse's cache line once, so an observer samples it, never spins on it.
+  pub fn shard_pulses(&self) -> Vec<ShardPulse> {
+    self
+      .shards
+      .iter()
+      .filter_map(|shard| {
+        let entry = registry::entry(shard.0)?;
+        Some(ShardPulse {
+          shard: shard.0,
+          steps: entry.pulse.steps(),
+          waits: entry.pulse.waits(),
+          parked: entry.parking.parked(),
+          kicks_skipped: entry.parking.kicks_skipped(),
+          ring_full_events: entry.ring_full_events.load(Ordering::Relaxed),
+        })
+      })
+      .collect()
   }
 
   /// The hosts this daemon's fleet currently sees alive (§4.8) — this node and the peers its control-shard
