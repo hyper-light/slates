@@ -24,6 +24,9 @@ const ATTACHMENT_SEGMENT: usize = 256;
 /// Format: the first owner epoch. Zero is reserved as "no epoch", so a live owner starts at one and
 /// a takeover raises it (§4.8).
 const FIRST_EPOCH: u64 = 1;
+/// Format: the first attachment generation. Zero is reserved as "no generation", so an admitted
+/// attachment starts at one and every barrier that closes its generation raises it (§4.4).
+const FIRST_GENERATION: u64 = 1;
 
 /// The object a request addresses (§4.6): its inode number and a stable generation. Identity
 /// survives copy-on-write; the generation distinguishes a re-minted number across incarnations (§6
@@ -84,6 +87,24 @@ struct Attachment {
   rights: Rights,
   epoch: u64,
   state: AttachmentState,
+  /// The attachment generation new requests are admitted into (§4.4 "Every request belongs to a
+  /// live attachment generation"). A barrier closes it — raises it — so a write admitted before
+  /// the barrier and one admitted after can never belong to the same generation.
+  generation: u64,
+  /// Requests admitted and not yet ended ([`Attachments::begin`]/[`Attachments::end`]). A barrier
+  /// cannot close a generation while one is outstanding.
+  in_flight: u32,
+}
+
+/// What a barrier closed (§4.6 "Writeback and snapshot barrier"): every live attachment of the
+/// volume and the generation each left behind. The caller publishes its root only after this is
+/// in hand; new requests on those attachments belong to the next generation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Barrier {
+  /// The volume.
+  pub volume: VolumeId,
+  /// Each live attachment of the volume with the generation the barrier closed.
+  pub closed: Vec<(AttachmentId, u64)>,
 }
 
 /// A handle to an attachment. It is generation-checked by the registry, so a revoked or reused
@@ -119,6 +140,10 @@ pub struct OpContext {
   pub rights: Rights,
   /// The owner epoch the attachment was admitted under (checked against the current epoch).
   pub epoch: u64,
+  /// The attachment generation the request was admitted into (§4.4): a barrier raises the
+  /// attachment's generation, so a request admitted before it and one admitted after carry
+  /// different values and no write can straddle both.
+  pub generation: u64,
   /// The POSIX group a created object takes, when the request's credential names one (an NFS
   /// `AUTH_SYS` gid). `None` when it does not — for `AUTH_NONE`, and for transports with no such
   /// credential (FUSE, FSKit) — and the object then inherits its parent directory's group (the
@@ -175,8 +200,65 @@ impl Attachments {
       rights,
       epoch,
       state: AttachmentState::Live,
+      generation: FIRST_GENERATION,
+      in_flight: 0,
     })?;
     Ok(AttachmentId(handle))
+  }
+
+  /// Admits one request on `id`: the validated context (as [`Attachments::context`]) with the
+  /// request counted in flight on its attachment until [`Attachments::end`]. A transport that
+  /// serves requests one at a time (the FUSE loop) brackets each with `begin`/`end`, so a barrier
+  /// sees exactly the requests the seam may still be applying.
+  pub fn begin(&mut self, id: AttachmentId) -> Result<OpContext, VfsError> {
+    let context = self.context(id)?;
+    if let Ok(attachment) = self.registry.get_mut(id.0) {
+      attachment.in_flight = attachment.in_flight.saturating_add(1);
+    }
+    Ok(context)
+  }
+
+  /// Ends a request admitted with [`Attachments::begin`]. Ending on an attachment with none in
+  /// flight, or one already drained, changes nothing.
+  pub fn end(&mut self, id: AttachmentId) {
+    if let Ok(attachment) = self.registry.get_mut(id.0) {
+      attachment.in_flight = attachment.in_flight.saturating_sub(1);
+    }
+  }
+
+  /// The generation a new request on `id` would be admitted into, or `None` for an unknown
+  /// attachment.
+  pub fn generation(&self, id: AttachmentId) -> Option<u64> {
+    self.registry.get(id.0).map(|a| a.generation).ok()
+  }
+
+  /// Closes the current generation of every live attachment on `volume` (§4.4 "Attachment
+  /// lifecycle"; §4.6 "Writeback and snapshot barrier"): a snapshot, submit or detach calls this
+  /// after it has stopped admitting into the closing generation and before it publishes, so every
+  /// request admitted before it belongs to a closed generation and every request after to the
+  /// next — no write straddles both. It refuses, changing nothing, while any attachment of the
+  /// volume — live, or revoked with a request still outstanding (a consumer lost mid-request) —
+  /// has a request in flight: a typed `BarrierIncomplete` naming the attachment and the
+  /// generation that could not close, never a clean barrier over a failed participant. The
+  /// explicit failed-consumer cleanup ([`Attachments::drain`] of a revoked attachment) clears
+  /// the obstacle; a live one clears itself when its request ends.
+  pub fn barrier(&mut self, volume: VolumeId) -> Result<Barrier, VfsError> {
+    for (handle, attachment) in self.registry.iter() {
+      if attachment.volume == volume && attachment.in_flight > 0 {
+        return Err(VfsError::BarrierIncomplete {
+          attachment: AttachmentId(handle).key(),
+          generation: attachment.generation,
+        });
+      }
+    }
+    let mut closed = Vec::new();
+    for (handle, attachment) in self.registry.iter_mut_all() {
+      if attachment.volume == volume && attachment.state == AttachmentState::Live {
+        closed.push((AttachmentId(handle), attachment.generation));
+        attachment.generation = attachment.generation.saturating_add(1);
+      }
+    }
+    Ok(Barrier { volume, closed })
   }
 
   /// Marks an attachment revoked: it admits no new effect (a later [`Attachments::context`] on it
@@ -227,6 +309,7 @@ impl Attachments {
       subject: attachment.subject.clone(),
       rights: attachment.rights,
       epoch: attachment.epoch,
+      generation: attachment.generation,
       // Set by the transport edge that has a credential group (the NFS export overlays the mounting
       // user's gid); the attachment registry itself carries no group.
       owner_gid: None,

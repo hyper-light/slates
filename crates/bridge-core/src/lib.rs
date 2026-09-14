@@ -85,6 +85,11 @@ pub struct SetAttr {
   pub atime: Option<i64>,
   /// A new modification time (nanoseconds since the Unix epoch), if set.
   pub mtime: Option<i64>,
+  /// A new change time (nanoseconds since the Unix epoch), if set. Only a kernel flushing the
+  /// timestamps it kept under a writeback cache asks for this (FUSE `FATTR_CTIME`); NFSv3's `sattr3`
+  /// and FSKit carry no such field and leave it `None`, and the change time then advances to the
+  /// volume's clock as for any attribute change.
+  pub ctime: Option<i64>,
 }
 
 /// The `renameat2` flags a rename carries. The operation layer preserves them and an
@@ -124,6 +129,66 @@ pub struct FsStat {
   /// reports case behaviour reads it here — NFS `PATHCONF`'s `case_insensitive`, and WinFsp/FSKit as
   /// they mature — so the property lives once, in the neutral filesystem-info the volume already fills.
   pub case_sensitive: bool,
+}
+
+/// How long a transport's kernel may cache an object's name and attributes (§4.6 "Cache
+/// posture"): forever for an object only the daemon mutates — it invalidates explicitly through
+/// [`Bridge::invalidations`] — and a bounded window for a live base source, which an outsider may
+/// change beneath the volume without a hint ("watchers may miss outsider writes"), so the window
+/// is the base filesystem's timestamp granularity: the span inside which a revalidation could not
+/// tell a change apart anyway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheLifetime {
+  /// Until an explicit invalidation.
+  Forever,
+  /// At most `ns` nanoseconds, then revalidate through the seam.
+  Bounded {
+    /// The window in nanoseconds.
+    ns: u64,
+  },
+}
+
+/// One kernel cache entry a transport must drop or expire (§4.6 `notify`): the seam produces
+/// these for every change the transport did not make itself — a mutation through the SDK or
+/// another attachment (from the volume's journal) or an outsider's change beneath a base
+/// directory (from a watcher hint) — and the transport writes them to its kernel before it
+/// serves the next request, so a tool never reads a name or attributes newer than the daemon's
+/// view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Invalidation {
+  /// The cached mapping of `name` in directory `parent` is stale. `expire` asks the kernel to
+  /// revalidate the name on its next use rather than drop it now — the live-source case, where a
+  /// busy directory must not be torn down (FUSE `FUSE_EXPIRE_ONLY`); a mutation the daemon applied
+  /// drops it outright.
+  Entry {
+    /// The directory.
+    parent: u64,
+    /// The name.
+    name: String,
+    /// Expire rather than drop.
+    expire: bool,
+  },
+  /// The cached attributes of `ino` are stale, and its cached data too when `data` is set (a
+  /// content change or a drift; a metadata change leaves the pages alone).
+  Inode {
+    /// The inode.
+    ino: u64,
+    /// Whether the cached data is stale as well.
+    data: bool,
+  },
+}
+
+/// Where a transport has delivered invalidations up to: its position in the volume's journal and
+/// in the base plane's hint sequence. The transport owns it (it owns the kernel cache), takes it
+/// from [`Bridge::seen`] after its own requests — its own changes need no invalidation in its own
+/// kernel — and passes it to [`Bridge::invalidations`] before the next; the seam keeps no
+/// per-transport state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InvalidationCursor {
+  /// The newest journal sequence already accounted for.
+  pub journal_seq: u64,
+  /// The newest hint sequence already accounted for.
+  pub hint_seq: u64,
 }
 
 /// The one VFS operation layer (§4.6). Every request identifies its object by [`ObjectId`] (a
@@ -261,4 +326,28 @@ pub trait Bridge {
   /// calls this once when an attachment ends — a FUSE unmount, a lost connection — since FUSE does
   /// not guarantee a `FORGET` per outstanding reference. Idempotent.
   fn sweep_attachment(&mut self, cx: &OpContext) -> Result<(), VfsError>;
+  /// How long the transport's kernel may cache `object`'s name and attributes (§4.6 "Cache
+  /// posture"): forever unless the object follows a live base source. A transport stamps every
+  /// entry and attribute reply with it. The default is forever, for a bridge with no live source.
+  fn cache_lifetime(&mut self, _object: ObjectId, _cx: &OpContext) -> CacheLifetime {
+    CacheLifetime::Forever
+  }
+  /// Appends to `out` every kernel invalidation owed since `cursor` — changes the transport
+  /// named by `cx` did not make itself — and returns the cursor to pass next time. Bounded by the
+  /// journal's retention budget and by the entries loaded under the hinted directories. The
+  /// default reports nothing, for a bridge that changes only through its own transport.
+  fn invalidations(
+    &mut self,
+    _cx: &OpContext,
+    cursor: InvalidationCursor,
+    _out: &mut Vec<Invalidation>,
+  ) -> Result<InvalidationCursor, VfsError> {
+    Ok(cursor)
+  }
+  /// The cursor at this moment: a transport takes it after serving its own request, so its own
+  /// changes are never invalidated in its own kernel, and at mount time, when the kernel holds
+  /// nothing yet.
+  fn seen(&mut self, _cx: &OpContext) -> InvalidationCursor {
+    InvalidationCursor::default()
+  }
 }

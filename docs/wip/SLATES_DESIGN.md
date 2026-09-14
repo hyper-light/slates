@@ -1346,6 +1346,38 @@ the verdict that every entry beneath still matches its listing fingerprint.
 > statfs capacity (BUG-5–BUG-10). Invalidation encoding is not proof of delivered kernel
 > coherence. virtio-fs, macOS and Windows adapters remain planned; no mounted suite was rerun.
 
+> **Status (GAP-A9-3/-4 sweep, 2026-09-14).** The shared operation layer routes every verb of an overlay
+> volume through the base plane — lookups load the listing on demand, and
+> create/mkdir/symlink/link/unlink/rmdir/rename and every field of setattr copy the witness up, leave
+> whiteouts with the listing reloaded, and refuse a name the base holds
+> (`crates/bridge-core/tests/base_overlay.rs` over the simulated host: 8 of 10 cases failed before). The
+> FUSE edge resolves `UTIME_NOW` through the volume's clock, honours `FATTR_KILL_SUIDGID` and
+> `FATTR_CTIME`, refuses a `valid` bit it does not honour and a `renameat2` flag the seam does not carry
+> with `EINVAL`, and reports the true change time; extended attributes are `ENOSYS`, the precise
+> unsupported error (the volume core carries none). Eighteen vectors transcribed by hand from
+> `include/uapi/linux/fuse.h` (7.46) check the opcodes, every INIT flag against its neighbours
+> (`FUSE_FILE_OPS` is bit 2; bit 8 is `FUSE_SPLICE_MOVE` — the sentence above naming bit 8 `FILE_OPS` is
+> wrong), the `FATTR_*`/`RENAME_*` bits, the notify codes and the byte offsets of every struct the codec
+> reads or writes; they found that `flags2` had been read from a padding word that does not exist and
+> `INIT_EXT` never echoed, so no second-word capability had ever negotiated — fixed, and
+> `FUSE_HAS_EXPIRE_ONLY` now negotiates. `statfs` reports the capacity the shard budget can honour (a
+> dynamic volume's `max` is no longer shown). Invalidations are real: the seam produces them from the
+> journal (a change through the SDK or another attachment) and from watcher hints (expire-only entries
+> for the live entries beneath a hinted directory), the FUSE loop writes them before each request, and a
+> live base entry's name and attributes carry the base filesystem's timestamp granularity as their
+> lifetime while the volume's own objects are cached until invalidated. The mount-helper handshake is
+> deadline-bounded and reaps or cancels its helper on every exit, the socket handed to the child as its
+> standard input (proven against real processes on macOS); open/close beyond the 65,536-slot handle
+> arena reuses generation-checked slots with one segment allocated. Attachments carry generations and
+> in-flight pins; `barrier(volume)` closes every live generation or refuses
+> `BarrierIncomplete{attachment, generation}` over a consumer lost mid-request, and a snapshot between
+> two barriers holds exactly the earlier generation's write. Owed: the Linux lane's first compile of the
+> serve loop and `mount()` (Docker could not start on the development box), the mounted conformance run,
+> a per-volume attachment registry in the daemon so the snapshot verb runs the barrier and reports its
+> coverage (server-visible against client-flushed) and the writeback flush (`FUSE_NOTIFY_RETRIEVE`), the
+> owner fields of base entries (they report uid/gid 0), a ready-device attachment binding on the wire,
+> and `RENAME_EXCHANGE`. Record: `docs/wip/base-fuse.md`.
+
 **Role.** Present the root mount and every attached volume to the kernel; translate kernel
 requests into shard operations by handle; emit invalidations; read base files for overlay
 volumes; never write to disk.

@@ -232,6 +232,30 @@ impl DigestBudget {
   }
 }
 
+/// A live base entry an attached transport must expire from its kernel's cache: a watcher hint
+/// said the directory holding it changed beneath the volume, so its name and attributes may no
+/// longer be what the kernel holds (§4.6). Only untouched entries — an unwitnessed file or
+/// symlink, a merged subdirectory — follow the disk; the volume's own entries are unaffected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaleBaseEntry {
+  /// The directory the entry hangs in.
+  pub dir: InodeNo,
+  /// The entry's name there.
+  pub name: Box<str>,
+  /// The entry's inode.
+  pub child: InodeNo,
+}
+
+/// What a hint left stale for a transport: the hinted directories themselves (their attributes,
+/// and a listing cache if the transport keeps one) and the live entries beneath them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StaleBaseEntries {
+  /// The hinted directories.
+  pub dirs: Vec<InodeNo>,
+  /// The live entries beneath them.
+  pub entries: Vec<StaleBaseEntry>,
+}
+
 /// Entries a fresh listing lacks (by name) and unwitnessed files it still lists with their
 /// fingerprints.
 type Stale = (Vec<String>, Vec<(InodeNo, Fingerprint)>);
@@ -282,6 +306,13 @@ pub struct BasePlane {
   /// The kept digests homed in each directory, so a watcher hint naming a directory revalidates
   /// exactly the digests beneath it.
   digests_by_dir: BTreeMap<InodeNo, BTreeSet<InodeNo>>,
+  /// The hint sequence: one more per watcher hint drained, so an attached transport can ask
+  /// which directories were hinted since it last delivered kernel invalidations (§4.6 "A drift
+  /// report or a watcher hint on a base path invalidates the kernel's entry and attributes").
+  hint_seq: u64,
+  /// The hint sequence at which each loaded directory's listing was last invalidated by a hint.
+  /// Bounded by the listings table: pruned to the loaded directories on every drain.
+  stale_since: BTreeMap<InodeNo, u64>,
 }
 
 impl BasePlane {
@@ -314,7 +345,23 @@ impl BasePlane {
       digest_stats: DigestStats::default(),
       digests: BTreeMap::new(),
       digests_by_dir: BTreeMap::new(),
+      hint_seq: 0,
+      stale_since: BTreeMap::new(),
     }
+  }
+
+  /// The base filesystem's timestamp granularity plus the measured clock resolution (§4.5's
+  /// racy window; `HostFacts`): the window inside which a revalidation of a live entry cannot
+  /// tell a change apart, hence the longest a transport may cache a live base entry's name and
+  /// attributes (§4.6 "Live source names/attributes/content cannot have an indefinite kernel
+  /// cache lifetime").
+  pub fn timestamp_granularity_ns(&self) -> u64 {
+    self.facts.timestamp_granularity_ns.max(1)
+  }
+
+  /// The hint sequence now (see [`Overlay::take_stale_base_entries`]).
+  pub fn hint_seq(&self) -> u64 {
+    self.hint_seq
   }
 
   /// A clone's plane: the same root and facts, the origin's witnesses, its own listings.
@@ -437,6 +484,25 @@ impl Volume {
   /// Whether the volume has a base.
   pub fn is_overlay(&self) -> bool {
     self.base.is_some()
+  }
+
+  /// Whether inode `no` follows the live disk: an untouched (unwitnessed) base file or symlink, or
+  /// a merged directory whose listing is the base's. A transport may cache such an object's name
+  /// and attributes only for the base filesystem's timestamp granularity, never indefinitely
+  /// (§4.6 "only pinned/immutable views can justify retention without a source check"); every
+  /// other object is the volume's own and is invalidated explicitly when it changes.
+  pub fn is_live_source(&self, store: &Store, no: InodeNo) -> bool {
+    let Some(plane) = self.base.as_ref() else {
+      return false;
+    };
+    match self.inode(store, no).map(|i| &i.body) {
+      Ok(Body::Base(_)) => !plane.is_witnessed(no),
+      Ok(Body::Directory(dir)) => store
+        .dirs
+        .get(*dir)
+        .is_ok_and(|node| node.base == BaseDirState::Merged),
+      _ => false,
+    }
   }
 
   /// The base plane's tables, for inspection.
@@ -2109,13 +2175,22 @@ impl Overlay<'_> {
     })
   }
 
-  /// Drains the watcher's hints: a changed directory invalidates its listing, re-checks the
-  /// witnessed entries homed there and re-verifies the digests kept beneath it; an overflow
-  /// invalidates everything, re-checks every witness and drops every kept digest (§4.15).
+  /// Drains the watcher's hints: a changed directory invalidates its listing, marks it stale for
+  /// every attached transport's kernel cache (see [`Overlay::take_stale_base_entries`]),
+  /// re-checks the witnessed entries homed there and re-verifies the digests kept beneath it
+  /// (§4.15); an overflow does all of these for every loaded directory and drops every kept
+  /// digest.
   pub fn process_hints(&mut self, store: &mut Store) -> Result<(), VfsError> {
     let hints = self.host.hints();
     let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
+    if !hints.is_empty() {
+      // The stale marks are bounded by the loaded directories: a mark for a directory whose
+      // listing is gone is dropped before new ones are added.
+      let loaded = &plane.listings;
+      plane.stale_since.retain(|no, _| loaded.contains_key(no));
+    }
     for hint in hints {
+      plane.hint_seq = plane.hint_seq.saturating_add(1);
       match hint {
         Hint::Changed(dir) => {
           let hit = plane
@@ -2128,12 +2203,15 @@ impl Overlay<'_> {
               l.entries = None;
             }
             plane.recheck.insert(no);
+            plane.stale_since.insert(no, plane.hint_seq);
           }
         }
         Hint::Overflow => {
           plane.watch = WatchState::Overflowed;
-          for l in plane.listings.values_mut() {
+          let seq = plane.hint_seq;
+          for (no, l) in &mut plane.listings {
             l.entries = None;
+            plane.stale_since.insert(*no, seq);
           }
           plane.recheck_all = true;
         }
@@ -2429,5 +2507,185 @@ impl Overlay<'_> {
       }
     }
     Ok(pinned)
+  }
+
+  // ------------------------------------------------- metadata copy-ups and by-inode verbs
+
+  /// A read-only open of an untouched base file is answered from the daemon's descriptor on the
+  /// backing file (§4.6 "Base files"): the descriptor is opened now, through the entry's home,
+  /// so it keeps the inode's data alive if the name is unlinked or renamed over while the file is
+  /// open — unlink-while-open on a base file serves the bytes the opener saw, never `ENOENT`.
+  /// A witnessed, copied-up or non-base inode needs nothing here.
+  pub fn open_base(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+    let untouched = matches!(self.vol.inode(store, no)?.body, Body::Base(_))
+      && !self.vol.base.as_ref().is_some_and(|b| b.is_witnessed(no));
+    if !untouched {
+      return Ok(());
+    }
+    self.descriptor(store, no).map(|_| ())
+  }
+
+  /// `chown` with a metadata-only copy-up: the witness is recorded and nothing is pinned (§4.5
+  /// "Metadata-only changes copy up the witness and pin nothing"), so the landing has the base
+  /// the ownership change was made against.
+  pub fn chown(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    uid: u32,
+    gid: u32,
+  ) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Metadata)?;
+    self.vol.chown(store, no, uid, gid)
+  }
+
+  /// `set_times` with a metadata-only copy-up (the same rule as [`Overlay::chown`]).
+  pub fn set_times(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    atime: Option<i64>,
+    mtime: Option<i64>,
+    ctime: Option<i64>,
+  ) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Metadata)?;
+    self.vol.set_times(store, no, atime, mtime, ctime)
+  }
+
+  /// The by-inode-number forms of the base-aware namespace verbs, for the bridge (which speaks
+  /// inode numbers, not handles — the same shape as the plain `Volume::*_no` wrappers). Every
+  /// metadata mutation of a merged directory goes through these, never the plain verbs, so a
+  /// base name gets its whiteout (with the listing reloaded first), a base entry gets its witness,
+  /// and a name the base holds is refused (§4.6 "Base lookups and metadata mutations go through the
+  /// same overlay rules as reads and writes"; AC-1.17).
+  pub fn create_file_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    mode: u32,
+  ) -> Result<InodeNo, VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.create_file(store, dir, name, mode)
+  }
+
+  /// `mkdir` by inode number; the new directory's inode number (see [`Overlay::create_file_no`]).
+  pub fn mkdir_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    mode: u32,
+  ) -> Result<InodeNo, VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    let handle = self.mkdir(store, dir, name, mode)?;
+    Ok(store.dirs.get(handle)?.inode)
+  }
+
+  /// `symlink` by inode number (see [`Overlay::create_file_no`]).
+  pub fn symlink_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    target: &str,
+  ) -> Result<InodeNo, VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.symlink(store, dir, name, target)
+  }
+
+  /// `link` by inode number (see [`Overlay::create_file_no`]).
+  pub fn link_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    target: InodeNo,
+  ) -> Result<(), VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.link(store, dir, name, target)
+  }
+
+  /// `unlink` by inode number (see [`Overlay::create_file_no`]).
+  pub fn unlink_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+  ) -> Result<(), VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.unlink(store, dir, name)
+  }
+
+  /// `rmdir` by inode number (see [`Overlay::create_file_no`]).
+  pub fn rmdir_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+  ) -> Result<(), VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.rmdir(store, dir, name)
+  }
+
+  /// `rename` by inode numbers (see [`Overlay::create_file_no`]).
+  pub fn rename_no(
+    &mut self,
+    store: &mut Store,
+    from_dir_no: InodeNo,
+    from_name: &str,
+    to_dir_no: InodeNo,
+    to_name: &str,
+  ) -> Result<(), VfsError> {
+    let from = self.vol.current_dir(store, from_dir_no)?;
+    let to = self.vol.current_dir(store, to_dir_no)?;
+    self.rename(store, from, from_name, to, to_name)
+  }
+
+  // ---------------------------------------------------------------- kernel coherence
+
+  /// The directories a watcher hint invalidated since hint sequence `since`, with the live
+  /// entries beneath them, for a transport to expire from its kernel's cache before the daemon
+  /// answers another request (§4.6). Hints are drained first ([`Overlay::process_hints`]). Only
+  /// entries the kernel can hold are listed: the materialized untouched files and symlinks and
+  /// the merged subdirectories of each hinted directory — bounded by what the volume has loaded,
+  /// never the base's whole tree. The caller keeps `since` and advances it to
+  /// [`BasePlane::hint_seq`] once delivered; the marks stay for other transports.
+  pub fn take_stale_base_entries(
+    &mut self,
+    store: &mut Store,
+    since: u64,
+  ) -> Result<StaleBaseEntries, VfsError> {
+    self.process_hints(store)?;
+    let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
+    let dirs: Vec<InodeNo> = plane
+      .stale_since
+      .iter()
+      .filter(|(_, seq)| **seq > since)
+      .map(|(no, _)| *no)
+      .collect();
+    let mut stale = StaleBaseEntries::default();
+    for dir_no in dirs {
+      let Ok(dir) = self.vol.current_dir(store, dir_no) else {
+        continue;
+      };
+      stale.dirs.push(dir_no);
+      for entry in store.dirs.get(dir)?.iter(&store.blocks) {
+        let child = match entry.child {
+          Child::File(no) | Child::Symlink(no) if self.unloaded_file(store, no) => no,
+          Child::Dir(handle) => match store.dirs.get(handle) {
+            Ok(node) if node.base == BaseDirState::Merged => node.inode,
+            _ => continue,
+          },
+          _ => continue,
+        };
+        stale.entries.push(StaleBaseEntry {
+          dir: dir_no,
+          name: entry.name.into(),
+          child,
+        });
+      }
+    }
+    Ok(stale)
   }
 }

@@ -86,8 +86,16 @@ impl BridgeAccess for ShardBridge {
       let handle = *s.by_id.get(&volume)?;
       let ShardState { store, volumes, .. } = s;
       let slot = volumes.get_mut(handle).ok()?;
-      let mut bridge =
-        VolumeBridge::attached(volume, &mut slot.volume, store, handles, slot.host.as_mut());
+      let mut bridge = VolumeBridge::attached(
+        volume,
+        &mut slot.volume,
+        store,
+        handles,
+        slot
+          .host
+          .as_mut()
+          .map(|host| host as &mut dyn slates_vfs::host::HostFs),
+      );
       Some(f(&mut bridge))
     })
     .flatten()

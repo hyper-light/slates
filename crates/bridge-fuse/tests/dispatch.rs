@@ -8,21 +8,32 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use slates_bridge_core::{
-  Attachments, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, Rights, SetAttr, View,
+  Attachments, CacheLifetime, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, Rights, SetAttr,
+  View,
 };
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use slates_bridge_fuse::bridge::{Bridge, DirEntry, ENOSYS};
-use slates_bridge_fuse::reply::EntryOut;
+use slates_bridge_fuse::reply::{AttrOut, EntryOut};
+use slates_bridge_fuse::request::{RenameIn, SetAttrIn};
 use slates_db::catalog::{Principal, VolumeId};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
-/// A one-file mock: the root directory (inode 1) holds "hello" (inode 2) with some bytes.
+/// A one-file mock: the root directory (inode 1) holds "hello" (inode 2) with some bytes. It
+/// records what reaches the seam (the counters and the last `setattr`/`rename` arguments), so a
+/// test can assert both what the edge passed through and what it refused before the seam.
 struct Mock {
   content: Vec<u8>,
+  mode: u32,
+  mtime: i64,
+  ctime: i64,
   forgotten: u64,
   referenced: u64,
   swept: u64,
+  setattr_calls: u64,
+  last_setattr: Option<SetAttr>,
+  rename_calls: u64,
+  last_rename: Option<RenameFlags>,
 }
 
 /// Format: the file mode of a regular file, and of a directory.
@@ -30,6 +41,14 @@ const FILE_MODE: u32 = 0o100_644;
 const DIR_MODE: u32 = 0o040_755;
 /// Format: `ENOENT`.
 const ENOENT: i32 = 2;
+/// Format: `EINVAL`.
+const EINVAL: i32 = 22;
+/// Shape: the mock volume's "now" — a value no kernel-filled time in these tests equals, so a
+/// resolved `UTIME_NOW` is told apart from a passed-through kernel time.
+const NOW_NS: i64 = 1_700_000_000_000_000_000;
+/// Shape: the mock's bounded cache window for its live-source file: 1.5 s, so both the seconds
+/// and the nanoseconds halves of the wire lifetime are exercised.
+const LIVE_WINDOW_NS: u64 = 1_500_000_000;
 
 impl Mock {
   fn file_attr(&self) -> NodeAttr {
@@ -37,14 +56,14 @@ impl Mock {
       ino: 2,
       generation: 1,
       kind: Kind::File,
-      mode: FILE_MODE,
+      mode: self.mode,
       nlink: 1,
       uid: 0,
       gid: 0,
       size: self.content.len() as u64,
       atime: 0,
-      mtime: 0,
-      ctime: 0,
+      mtime: self.mtime,
+      ctime: self.ctime,
     }
   }
 }
@@ -231,23 +250,48 @@ impl Bridge for Mock {
     _cx: &OpContext,
     _on: &str,
     _nn: &str,
-    _flags: RenameFlags,
+    flags: RenameFlags,
   ) -> Result<(), VfsError> {
-    Err(VfsError::Invalid)
+    self.rename_calls = self.rename_calls.saturating_add(1);
+    self.last_rename = Some(flags);
+    Ok(())
   }
   fn setattr(
     &mut self,
-    _object: ObjectId,
+    object: ObjectId,
     _cx: &OpContext,
-    _changes: SetAttr,
+    changes: SetAttr,
   ) -> Result<NodeAttr, VfsError> {
-    Err(VfsError::Invalid)
+    if object.inode != 2 {
+      return Err(VfsError::NotFound);
+    }
+    self.setattr_calls = self.setattr_calls.saturating_add(1);
+    self.last_setattr = Some(changes);
+    if let Some(mode) = changes.mode {
+      self.mode = mode;
+    }
+    if let Some(mtime) = changes.mtime {
+      self.mtime = mtime;
+    }
+    if let Some(ctime) = changes.ctime {
+      self.ctime = ctime;
+    }
+    Ok(self.file_attr())
   }
   fn statfs(&mut self, _object: ObjectId, _cx: &OpContext) -> Result<FsStat, VfsError> {
     Err(VfsError::Invalid)
   }
   fn now(&mut self) -> i64 {
-    0
+    NOW_NS
+  }
+  fn cache_lifetime(&mut self, object: ObjectId, _cx: &OpContext) -> CacheLifetime {
+    // The file follows a live source in this mock (a bounded window of 1.5 s); the root is the
+    // volume's own (forever).
+    if object.inode == 2 {
+      CacheLifetime::Bounded { ns: LIVE_WINDOW_NS }
+    } else {
+      CacheLifetime::Forever
+    }
   }
   fn change_token(&mut self, _object: ObjectId, _cx: &OpContext) -> Result<u64, VfsError> {
     Ok(0)
@@ -300,10 +344,46 @@ fn reply_error(out: &[u8], n: usize) -> i32 {
 fn mock() -> Mock {
   Mock {
     content: b"hello world".to_vec(),
+    mode: FILE_MODE,
+    mtime: 0,
+    ctime: 0,
     forgotten: 0,
     referenced: 0,
     swept: 0,
+    setattr_calls: 0,
+    last_setattr: None,
+    rename_calls: 0,
+    last_rename: None,
   }
+}
+
+/// A `fuse_setattr_in` body (88 bytes) with the given `valid` mask and the kernel-filled fields:
+/// mode, atime/mtime/ctime in seconds (nanoseconds zero), on the file inode 2.
+fn setattr_body(valid: u32, mode: u32, atime_s: u64, mtime_s: u64, ctime_s: u64) -> Vec<u8> {
+  let mut body = vec![0u8; 88];
+  body[0..4].copy_from_slice(&valid.to_le_bytes());
+  body[32..40].copy_from_slice(&atime_s.to_le_bytes());
+  body[40..48].copy_from_slice(&mtime_s.to_le_bytes());
+  body[48..56].copy_from_slice(&ctime_s.to_le_bytes());
+  body[68..72].copy_from_slice(&mode.to_le_bytes());
+  body
+}
+
+/// A `fuse_rename2_in` body: newdir 1 (the root), the given flags, then `old\0new\0`.
+fn rename2_body(flags: u32) -> Vec<u8> {
+  let mut body = vec![0u8; 16];
+  body[0..8].copy_from_slice(&1u64.to_le_bytes());
+  body[8..12].copy_from_slice(&flags.to_le_bytes());
+  body.extend_from_slice(b"old\0new\0");
+  body
+}
+
+/// The reply's `fuse_attr_out.attr` change and modification times in seconds (ctime at 16 + 40,
+/// mtime at 16 + 32 within the body after the 16-byte header).
+fn reply_times(out: &[u8]) -> (u64, u64) {
+  let mtime = u64::from_le_bytes(out[OUT_HEADER_LEN + 16 + 32..][..8].try_into().unwrap());
+  let ctime = u64::from_le_bytes(out[OUT_HEADER_LEN + 16 + 40..][..8].try_into().unwrap());
+  (mtime, ctime)
 }
 
 /// LOOKUP reaches the bridge and its entry reply decodes; a missing name is ENOENT.
@@ -496,6 +576,294 @@ fn readdirplus_dispatches_with_entry_attributes_and_references() {
   assert_eq!(
     m.referenced, 1,
     "READDIRPLUS takes a lookup reference on each returned entry"
+  );
+}
+
+/// A time flagged `FATTR_ATIME_NOW`/`FATTR_MTIME_NOW` (`UTIME_NOW`) is resolved through the
+/// volume's own clock (`Bridge::now`), the NOW resolution the design places at the transport
+/// (AC-3.10) — not passed through as the value the kernel filled in from *its* clock; a time set
+/// explicitly (`utimensat` with a value) is passed through. Failed at `991c84e`: the kernel's
+/// value was passed through for both.
+#[test]
+fn setattr_now_flags_resolve_to_the_volume_clock_not_the_kernels_value() {
+  let mut m = mock();
+  let mut out = [0u8; 256];
+  let valid = SetAttrIn::FATTR_ATIME
+    | SetAttrIn::FATTR_ATIME_NOW
+    | SetAttrIn::FATTR_MTIME
+    | SetAttrIn::FATTR_MTIME_NOW;
+  let n = dispatch(
+    &message(
+      Opcode::SetAttr.to_wire(),
+      1,
+      2,
+      &setattr_body(valid, 0, 111, 222, 0),
+    ),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(
+    u32::from_le_bytes(out[4..8].try_into().unwrap()),
+    0,
+    "success"
+  );
+  assert_eq!(n, OUT_HEADER_LEN + AttrOut::LEN);
+  let changes = m.last_setattr.expect("the seam was reached");
+  assert_eq!(changes.atime, Some(NOW_NS), "atime is the volume's now");
+  assert_eq!(changes.mtime, Some(NOW_NS), "mtime is the volume's now");
+
+  // An explicit mtime with a NOW atime: the explicit value passes through, the NOW resolves.
+  let valid = SetAttrIn::FATTR_ATIME | SetAttrIn::FATTR_ATIME_NOW | SetAttrIn::FATTR_MTIME;
+  dispatch(
+    &message(
+      Opcode::SetAttr.to_wire(),
+      2,
+      2,
+      &setattr_body(valid, 0, 111, 222, 0),
+    ),
+    &mut m,
+    &mut out,
+  );
+  let changes = m.last_setattr.unwrap();
+  assert_eq!(changes.atime, Some(NOW_NS));
+  assert_eq!(
+    changes.mtime,
+    Some(222 * 1_000_000_000),
+    "an explicit time passes through"
+  );
+  assert_eq!(m.setattr_calls, 2);
+}
+
+/// `FATTR_CTIME` — a kernel flushing the timestamps it kept under its writeback cache — is
+/// carried to the seam as the change time, never dropped.
+#[test]
+fn setattr_carries_the_change_time_a_writeback_kernel_flushes() {
+  let mut m = mock();
+  let mut out = [0u8; 256];
+  let valid = SetAttrIn::FATTR_MTIME | SetAttrIn::FATTR_CTIME;
+  dispatch(
+    &message(
+      Opcode::SetAttr.to_wire(),
+      1,
+      2,
+      &setattr_body(valid, 0, 0, 222, 333),
+    ),
+    &mut m,
+    &mut out,
+  );
+  let changes = m.last_setattr.expect("the seam was reached");
+  assert_eq!(changes.mtime, Some(222 * 1_000_000_000));
+  assert_eq!(
+    changes.ctime,
+    Some(333 * 1_000_000_000),
+    "the change time is carried"
+  );
+  assert_eq!(changes.atime, None, "a time not asked for is not set");
+}
+
+/// A `valid` bit the edge does not honour is refused `EINVAL` before the seam — never a success
+/// that silently ignored a requested field (§4.6; audit BUG-8). Failed at `991c84e`: the unknown
+/// bit was ignored and the mode applied with a success reply.
+#[test]
+fn setattr_with_an_unhonoured_valid_bit_is_einval_and_never_reaches_the_seam() {
+  let mut m = mock();
+  let mut out = [0u8; 256];
+  // A header bit above every FATTR the kernel defines today, alongside a legitimate mode change.
+  let unknown = 1u32 << 20;
+  let n = dispatch(
+    &message(
+      Opcode::SetAttr.to_wire(),
+      1,
+      2,
+      &setattr_body(SetAttrIn::FATTR_MODE | unknown, 0o600, 0, 0, 0),
+    ),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(reply_error(&out, n), -EINVAL, "refused, not acknowledged");
+  assert_eq!(m.setattr_calls, 0, "nothing reached the seam");
+  assert_eq!(m.mode, FILE_MODE, "the mode is untouched");
+}
+
+/// `FATTR_KILL_SUIDGID` (a truncate by a caller without `CAP_FSETID`) clears the set-user-id bit
+/// and — the group-execute bit being set — the set-group-id bit, from the object's current mode
+/// when no mode was requested, and is applied together with the size. Failed at `991c84e`: the
+/// bit was ignored and the file kept its privileges.
+#[test]
+fn setattr_kill_suidgid_clears_the_privilege_bits() {
+  let mut m = mock();
+  m.mode = 0o106_755; // S_IFREG | S_ISUID | S_ISGID | rwxr-xr-x
+  let mut out = [0u8; 256];
+  let valid = SetAttrIn::FATTR_SIZE | SetAttrIn::FATTR_KILL_SUIDGID;
+  let mut body = setattr_body(valid, 0, 0, 0, 0);
+  body[16..24].copy_from_slice(&5u64.to_le_bytes()); // size
+  let n = dispatch(
+    &message(Opcode::SetAttr.to_wire(), 1, 2, &body),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(
+    u32::from_le_bytes(out[4..8].try_into().unwrap()),
+    0,
+    "success"
+  );
+  assert_eq!(n, OUT_HEADER_LEN + AttrOut::LEN);
+  let changes = m.last_setattr.expect("the seam was reached");
+  assert_eq!(changes.size, Some(5));
+  assert_eq!(
+    changes.mode,
+    Some(0o100_755),
+    "suid and sgid cleared, the rest kept"
+  );
+
+  // A set-group-id bit without group execute is mandatory locking, not a privilege: kept.
+  m.mode = 0o102_745; // S_IFREG | S_ISGID | rwxr--r-x
+  dispatch(
+    &message(Opcode::SetAttr.to_wire(), 2, 2, &body),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(m.last_setattr.unwrap().mode, Some(0o102_745));
+}
+
+/// A `RENAME2` flag the seam does not carry (`RENAME_WHITEOUT`, or a bit the header has not
+/// defined) is refused `EINVAL` before the seam — never dropped and performed as a plain rename
+/// (§4.6; audit BUG-10) — while the carried flags reach the seam as themselves. Failed at
+/// `991c84e`: the flag was dropped and the rename performed.
+#[test]
+fn rename2_with_a_flag_the_seam_does_not_carry_is_einval_and_never_reaches_the_seam() {
+  let mut m = mock();
+  let mut out = [0u8; 256];
+  for foreign in [RenameIn::RENAME_WHITEOUT, 1u32 << 9] {
+    let n = dispatch(
+      &message(Opcode::Rename2.to_wire(), 1, 1, &rename2_body(foreign)),
+      &mut m,
+      &mut out,
+    );
+    assert_eq!(
+      reply_error(&out, n),
+      -EINVAL,
+      "flag {foreign:#x} is refused"
+    );
+    assert_eq!(m.rename_calls, 0, "nothing reached the seam");
+  }
+
+  let n = dispatch(
+    &message(
+      Opcode::Rename2.to_wire(),
+      2,
+      1,
+      &rename2_body(RenameIn::RENAME_NOREPLACE),
+    ),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(n, OUT_HEADER_LEN, "an empty success reply");
+  assert_eq!(
+    m.last_rename,
+    Some(RenameFlags {
+      no_replace: true,
+      exchange: false,
+    }),
+    "a carried flag reaches the seam as itself"
+  );
+}
+
+/// The extended-attribute operations (`SETXATTR`, `GETXATTR`, `LISTXATTR`, `REMOVEXATTR`) are
+/// answered `ENOSYS`, the precise unsupported error: the kernel turns a daemon's `ENOSYS` into
+/// `EOPNOTSUPP` for the caller and stops asking, so a tool sees "not supported", never an ignored
+/// success (§4.6 "Extended attributes ... have explicit capability contracts"; T-1.21 xattrs). The
+/// volume core carries no extended attributes (`crates/vfs/src/export.rs`).
+#[test]
+fn xattr_operations_are_answered_enosys_the_precise_unsupported_error() {
+  /// Format: `FUSE_SETXATTR`, `FUSE_GETXATTR`, `FUSE_LISTXATTR`, `FUSE_REMOVEXATTR`.
+  const XATTR_OPCODES: [u32; 4] = [21, 22, 23, 24];
+  let mut m = mock();
+  let mut out = [0u8; 256];
+  for opcode in XATTR_OPCODES {
+    // fuse_setxattr_in / fuse_getxattr_in bodies are irrelevant: the opcode is unserved.
+    let n = dispatch(&message(opcode, 1, 2, b"user.k\0v"), &mut m, &mut out);
+    assert_eq!(reply_error(&out, n), -ENOSYS, "opcode {opcode}");
+  }
+}
+
+/// An attribute reply carries the object's change time in the wire change time, not its
+/// modification time: a chmod moves only the change time, and a tool watching it sees the move.
+/// Failed at `991c84e`: the wire ctime was the mtime (a quirk carried since the extraction).
+#[test]
+fn replies_carry_the_change_time_not_the_modification_time() {
+  let mut m = mock();
+  m.mtime = 100 * 1_000_000_000;
+  m.ctime = 200 * 1_000_000_000;
+  let mut out = [0u8; 256];
+  dispatch(
+    &message(Opcode::GetAttr.to_wire(), 1, 2, &[0u8; 16]),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(
+    reply_times(&out),
+    (100, 200),
+    "(mtime, ctime) as the object has them"
+  );
+}
+
+/// The kernel cache lifetime a reply carries is the seam's posture for that object (§4.6 "Cache
+/// posture"): a live-source object's LOOKUP entry and GETATTR attributes carry the bounded window
+/// (1.5 s: seconds 1, nanoseconds 500,000,000, at `fuse_entry_out`'s offsets 16/24 and 32/36 and
+/// `fuse_attr_out`'s 0 and 8), and the volume's own root carries forever. Before the sweep every
+/// reply carried forever, whatever the source.
+#[test]
+fn replies_carry_the_seams_cache_lifetime_for_each_object() {
+  let mut m = mock();
+  let mut out = [0u8; 512];
+  dispatch(
+    &message(Opcode::Lookup.to_wire(), 1, 1, b"hello\0"),
+    &mut m,
+    &mut out,
+  );
+  let entry = &out[OUT_HEADER_LEN..];
+  let at_u64 = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
+  let at_u32 = |at: usize| u32::from_le_bytes(entry[at..at + 4].try_into().unwrap());
+  assert_eq!(
+    (at_u64(16), at_u32(32)),
+    (1, 500_000_000),
+    "entry_valid and entry_valid_nsec: the live-source window"
+  );
+  assert_eq!(
+    (at_u64(24), at_u32(36)),
+    (1, 500_000_000),
+    "attr_valid and attr_valid_nsec"
+  );
+
+  dispatch(
+    &message(Opcode::GetAttr.to_wire(), 2, 2, &[0u8; 16]),
+    &mut m,
+    &mut out,
+  );
+  let attrs = &out[OUT_HEADER_LEN..];
+  assert_eq!(
+    (
+      u64::from_le_bytes(attrs[0..8].try_into().unwrap()),
+      u32::from_le_bytes(attrs[8..12].try_into().unwrap())
+    ),
+    (1, 500_000_000),
+    "a GETATTR of the live file carries the window"
+  );
+
+  dispatch(
+    &message(Opcode::GetAttr.to_wire(), 3, 1, &[0u8; 16]),
+    &mut m,
+    &mut out,
+  );
+  let attrs = &out[OUT_HEADER_LEN..];
+  assert_eq!(
+    (
+      u64::from_le_bytes(attrs[0..8].try_into().unwrap()),
+      u32::from_le_bytes(attrs[8..12].try_into().unwrap())
+    ),
+    (u64::MAX, 0),
+    "the volume's own root is cached until an explicit invalidation"
   );
 }
 

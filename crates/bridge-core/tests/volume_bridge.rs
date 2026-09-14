@@ -14,8 +14,9 @@ use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
 use slates_vfs::clock::HostClock;
+use slates_vfs::error::VfsError;
 use slates_vfs::names::NameEquivalence;
-use slates_vfs::quota::Quota;
+use slates_vfs::quota::{BudgetGrowth, Quota};
 use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
 
 /// Shape: the page and a small arena for the test volume.
@@ -376,6 +377,129 @@ fn open_handles_are_reused_so_memory_stays_bounded() {
   );
 }
 
+/// A scratch volume with one closed file and the lent-in handle map (`attached`), whose occupancy
+/// and allocated slots the AC-3.12 tests observe from outside: `(store, volume, handles, root,
+/// the file's inode)`.
+fn lent_handles_fixture() -> (Store, Volume, slates_mem::Slab<u64>, u64, u64) {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut handles = slates_bridge_core::new_handle_store();
+  let cx = rw_cx();
+  let (root, ino) = {
+    let mut bridge = VolumeBridge::attached(
+      VolumeId { bytes: [0; 16] },
+      &mut vol,
+      &mut store,
+      &mut handles,
+      None,
+    );
+    let root = bridge.root(&cx).unwrap();
+    let (attr, fh) = bridge.create(oid(root), &cx, "h", 0o644, 0).unwrap();
+    bridge.release(oid(attr.ino), &cx, fh).unwrap();
+    (root, attr.ino)
+  };
+  (store, vol, handles, root, ino)
+}
+
+/// AC-3.12/T-3.15: open/close beyond the handle arena's capacity in *total operations* reuses
+/// generational slots with bounded memory — more cycles than the arena has slots leave one
+/// segment allocated (well under the capacity) and no handle open.
+#[test]
+fn open_close_beyond_the_arena_capacity_reuses_slots_with_bounded_memory() {
+  let (mut store, mut vol, mut handles, _root, ino) = lent_handles_fixture();
+  let capacity = handles.max_slots();
+  let cx = rw_cx();
+  {
+    let mut bridge = VolumeBridge::attached(
+      VolumeId { bytes: [0; 16] },
+      &mut vol,
+      &mut store,
+      &mut handles,
+      None,
+    );
+    for _ in 0..=capacity {
+      let fh = bridge.open(oid(ino), &cx, 0).unwrap();
+      bridge.release(oid(ino), &cx, fh).unwrap();
+    }
+  }
+  assert_eq!(handles.len(), 0, "nothing left open");
+  assert!(
+    handles.slots() < capacity,
+    "{} slots allocated for one concurrent open across {} operations: bounded memory",
+    handles.slots(),
+    capacity + 1
+  );
+}
+
+/// AC-3.12/T-3.15: a stale handle from a reused slot never acts on the slot's new holder — open
+/// A, release it, open B (the same slot, a new generation); releasing A's handle again must not
+/// drop B's open reference, which still keeps the inode alive across an unlink, and B's own
+/// release reclaims it.
+#[test]
+fn a_stale_handle_from_a_reused_slot_never_acts_on_the_slots_new_holder() {
+  let (mut store, mut vol, mut handles, root, ino) = lent_handles_fixture();
+  let cx = rw_cx();
+  let mut bridge = VolumeBridge::attached(
+    VolumeId { bytes: [0; 16] },
+    &mut vol,
+    &mut store,
+    &mut handles,
+    None,
+  );
+  let stale = bridge.open(oid(ino), &cx, 0).unwrap();
+  bridge.release(oid(ino), &cx, stale).unwrap();
+  let live = bridge.open(oid(ino), &cx, 0).unwrap();
+  assert_ne!(stale, live, "the reused slot carries a new generation");
+  bridge.release(oid(ino), &cx, stale).unwrap();
+  bridge.unlink(oid(root), &cx, "h").unwrap();
+  assert!(
+    bridge.getattr(oid(ino), &cx).is_ok(),
+    "the stale release touched nothing: the live open still pins the unlinked inode"
+  );
+  bridge.release(oid(ino), &cx, live).unwrap();
+  assert!(
+    bridge.getattr(oid(ino), &cx).is_err(),
+    "reclaimed by the live release"
+  );
+}
+
+/// AC-3.12/T-3.15: at the arena's bound the next open is a typed refusal (the FUSE edge's
+/// `EMFILE`), one release makes room for exactly one more, and releasing everything empties the
+/// map.
+#[test]
+fn an_open_past_the_handle_bound_is_a_typed_refusal_lifted_by_one_release() {
+  let (mut store, mut vol, mut handles, _root, ino) = lent_handles_fixture();
+  let capacity = handles.max_slots();
+  let cx = rw_cx();
+  {
+    let mut bridge = VolumeBridge::attached(
+      VolumeId { bytes: [0; 16] },
+      &mut vol,
+      &mut store,
+      &mut handles,
+      None,
+    );
+    let mut open = Vec::with_capacity(capacity);
+    while open.len() < capacity {
+      open.push(bridge.open(oid(ino), &cx, 0).unwrap());
+    }
+    assert!(
+      matches!(
+        bridge.open(oid(ino), &cx, 0),
+        Err(VfsError::Memory(slates_mem::MemError::SlabFull { .. }))
+      ),
+      "the open past the bound is a typed refusal"
+    );
+    let freed = open.pop().unwrap();
+    bridge.release(oid(ino), &cx, freed).unwrap();
+    open.push(bridge.open(oid(ino), &cx, 0).unwrap());
+    for fh in open.drain(..) {
+      bridge.release(oid(ino), &cx, fh).unwrap();
+    }
+  }
+  assert_eq!(handles.len(), 0);
+}
+
 /// A write under a read-only attachment is refused before any effect, though a read is allowed
 /// (Ada review: authorization of an actual write, not only ACCESS reporting).
 #[test]
@@ -643,6 +767,93 @@ fn statfs_reports_the_real_capacity_not_an_invented_figure() {
   assert!(
     empty.bfree - after.bfree >= (200 * 1024) / BLOCK,
     "free fell by at least the written blocks"
+  );
+}
+
+/// statfs of a dynamic volume reports only the capacity the shard can honour (§4.6 "logical
+/// capacity and remaining space that the physical claim can honor"), not the volume's bare
+/// ceiling: a volume allowed to grow to 1 GiB on a shard whose budget is the 16 MiB test arena
+/// reports a total within that budget, its free space falls with its own writes, and it falls
+/// again when another dynamic volume takes capacity from the same shard budget — the space it
+/// could no longer honour. Failed at `9a960bb`: the total was the 1 GiB ceiling (a `df` the
+/// shard could not back).
+#[test]
+fn statfs_of_a_dynamic_volume_reports_only_what_the_shard_can_honour() {
+  const BLOCK: u64 = 4096;
+  const CEILING: u64 = 1 << 30;
+  let mut store = store();
+  let budget_capacity = store.budget.capacity();
+  assert!(
+    budget_capacity < CEILING,
+    "the fixture's arena is far below the ceiling"
+  );
+  let dynamic = |prefix: u16| VolumeConfig {
+    prefix,
+    names: NameEquivalence::Exact,
+    quota: Quota::Dynamic {
+      max: CEILING,
+      source: Box::new(BudgetGrowth),
+      granted: 0,
+      denied: 0,
+    },
+    journal_bytes: 1 << 16,
+    clock: Box::new(HostClock::default()),
+  };
+  let mut first = Volume::create(&mut store, dynamic(1)).unwrap();
+  let mut second = Volume::create(&mut store, dynamic(2)).unwrap();
+  let cx = rw_cx();
+
+  let (empty, root) = {
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut first, &mut store);
+    let root = bridge.root(&cx).unwrap();
+    (bridge.statfs(oid(root), &cx).unwrap(), root)
+  };
+  assert!(
+    empty.blocks * BLOCK <= budget_capacity,
+    "the total is within what the shard can honour ({} blocks, budget {budget_capacity})",
+    empty.blocks
+  );
+  assert!(
+    empty.bavail * BLOCK <= budget_capacity,
+    "and so is the free space"
+  );
+
+  // The volume's own write takes from its free space.
+  let after_write = {
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut first, &mut store);
+    let (attr, _fh) = bridge.create(oid(root), &cx, "f", 0o644, 0).unwrap();
+    bridge
+      .write(oid(attr.ino), &cx, 0, &vec![0u8; 200 * 1024])
+      .unwrap();
+    bridge.statfs(oid(root), &cx).unwrap()
+  };
+  assert!(
+    empty.bavail - after_write.bavail >= (200 * 1024) / BLOCK,
+    "free fell by at least the written blocks"
+  );
+
+  // Another dynamic volume takes 4 MiB of the same shard budget: the first can no longer honour it.
+  {
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut second, &mut store);
+    let other_root = bridge.root(&cx).unwrap();
+    let (attr, _fh) = bridge.create(oid(other_root), &cx, "g", 0o644, 0).unwrap();
+    bridge
+      .write(oid(attr.ino), &cx, 0, &vec![0u8; 4 << 20])
+      .unwrap();
+  }
+  let after_other = {
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut first, &mut store);
+    bridge.statfs(oid(root), &cx).unwrap()
+  };
+  assert!(
+    after_write.bavail - after_other.bavail >= (4 << 20) / BLOCK,
+    "another volume's growth reduced what this one can honour ({} -> {} blocks)",
+    after_write.bavail,
+    after_other.bavail
+  );
+  assert!(
+    after_other.blocks < after_write.blocks,
+    "the reported total shrank with it, never a fixed ceiling"
   );
 }
 

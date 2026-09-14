@@ -126,9 +126,9 @@ impl ReadIn {
   }
 }
 
-/// The fields of a `SETATTR` body slates applies (`struct fuse_setattr_in`): a `valid`
-/// bitmask, then fh, size, and later mode. slates reads `valid`, `size` and `mode`; the mask
-/// says which the kernel set.
+/// The fields of a `SETATTR` body (`struct fuse_setattr_in`): a `valid` bitmask, then every
+/// settable field. The mask says which the kernel set; the edge applies each set field through the
+/// seam and never acknowledges one it ignored (§4.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SetAttrIn {
   /// Which fields the kernel set (the `FATTR_*` bits).
@@ -147,6 +147,9 @@ pub struct SetAttrIn {
   /// The new modification time in nanoseconds since the Unix epoch (when `valid` has
   /// [`SetAttrIn::FATTR_MTIME`]).
   pub mtime: i64,
+  /// The new change time in nanoseconds since the Unix epoch (when `valid` has
+  /// [`SetAttrIn::FATTR_CTIME`] — a kernel flushing the timestamps it kept under a writeback cache).
+  pub ctime: i64,
 }
 
 impl SetAttrIn {
@@ -162,14 +165,43 @@ impl SetAttrIn {
   pub const FATTR_ATIME: u32 = 1 << 4;
   /// Format: `FATTR_MTIME`, the `valid` bit for the modification time.
   pub const FATTR_MTIME: u32 = 1 << 5;
+  /// Format: `FATTR_FH`, the `valid` bit saying `fh` names the open file the change is through (a
+  /// qualifier, not a field to apply).
+  pub const FATTR_FH: u32 = 1 << 6;
+  /// Format: `FATTR_ATIME_NOW`, the `valid` bit saying the access time is "now" (`UTIME_NOW`): the
+  /// edge resolves it through the volume's own clock, not the value the kernel filled in.
+  pub const FATTR_ATIME_NOW: u32 = 1 << 7;
+  /// Format: `FATTR_MTIME_NOW`, the `valid` bit saying the modification time is "now".
+  pub const FATTR_MTIME_NOW: u32 = 1 << 8;
+  /// Format: `FATTR_LOCKOWNER`, the `valid` bit saying `lock_owner` is set (a qualifier for POSIX
+  /// locks, which slates does not serve; carries no field to apply).
+  pub const FATTR_LOCKOWNER: u32 = 1 << 9;
+  /// Format: `FATTR_CTIME`, the `valid` bit for the change time (`include/uapi/linux/fuse.h`).
+  pub const FATTR_CTIME: u32 = 1 << 10;
+  /// Format: `FATTR_KILL_SUIDGID`, the `valid` bit asking the filesystem to clear the set-user-id
+  /// and set-group-id bits with this change (a truncate by a caller without `CAP_FSETID`; sent by
+  /// kernels that negotiated `FUSE_HANDLE_KILLPRIV_V2`).
+  pub const FATTR_KILL_SUIDGID: u32 = 1 << 11;
+  /// Format: every `valid` bit the edge honours — each is applied, resolved or refused, never
+  /// acknowledged and ignored (§4.6). A mask with a bit outside this set is refused before the seam.
+  pub const FATTR_HONOURED: u32 = Self::FATTR_MODE
+    | Self::FATTR_UID
+    | Self::FATTR_GID
+    | Self::FATTR_SIZE
+    | Self::FATTR_ATIME
+    | Self::FATTR_MTIME
+    | Self::FATTR_FH
+    | Self::FATTR_ATIME_NOW
+    | Self::FATTR_MTIME_NOW
+    | Self::FATTR_LOCKOWNER
+    | Self::FATTR_CTIME
+    | Self::FATTR_KILL_SUIDGID;
 
-  /// Reads the fields slates honors from `fuse_setattr_in`, in wire order. The struct is valid
-  /// (4), padding (4), fh (8), size (8), lock_owner (8), atime (8), mtime (8), ctime (8),
-  /// atimensec (4), mtimensec (4), ctimensec (4), mode (4), unused4 (4), uid (4), gid (4),
-  /// unused5 (4). Times are seconds plus a nanosecond part, combined into the volume core's
-  /// nanosecond form.
-  #[allow(clippy::type_complexity)]
-  fn parse_fields(body: &[u8]) -> Option<(u32, u64, i64, i64, u32, u32, u32)> {
+  /// Reads the fields from `fuse_setattr_in`, in wire order. The struct is valid (4), padding (4),
+  /// fh (8), size (8), lock_owner (8), atime (8), mtime (8), ctime (8), atimensec (4), mtimensec
+  /// (4), ctimensec (4), mode (4), unused4 (4), uid (4), gid (4), unused5 (4). Times are seconds
+  /// plus a nanosecond part, combined into the volume core's nanosecond form.
+  fn parse_fields(body: &[u8]) -> Option<SetAttrIn> {
     let mut r = Reader::new(body);
     let op = Opcode::SetAttr.to_wire();
     let valid = r.u32(op).ok()?;
@@ -178,42 +210,42 @@ impl SetAttrIn {
     r.skip(size_of::<u64>(), op).ok()?; // lock_owner
     let atime_sec = r.u64(op).ok()?;
     let mtime_sec = r.u64(op).ok()?;
-    r.skip(size_of::<u64>(), op).ok()?; // ctime
+    let ctime_sec = r.u64(op).ok()?;
     let atime_nsec = r.u32(op).ok()?;
     let mtime_nsec = r.u32(op).ok()?;
-    r.skip(size_of::<u32>(), op).ok()?; // ctimensec
+    let ctime_nsec = r.u32(op).ok()?;
     let mode = r.u32(op).ok()?;
     r.skip(size_of::<u32>(), op).ok()?; // unused4
     let uid = r.u32(op).ok()?;
     let gid = r.u32(op).ok()?;
-    Some((
+    Some(SetAttrIn {
       valid,
       size,
-      combine_time(atime_sec, atime_nsec),
-      combine_time(mtime_sec, mtime_nsec),
       mode,
       uid,
       gid,
-    ))
+      atime: combine_time(atime_sec, atime_nsec),
+      mtime: combine_time(mtime_sec, mtime_nsec),
+      ctime: combine_time(ctime_sec, ctime_nsec),
+    })
   }
 
-  /// Parses a setattr body; refuses one too short for the fields.
+  /// Format: `sizeof(struct fuse_setattr_in)` — the whole struct the kernel sends; a shorter body
+  /// is malformed and refused, even where the fields read happen to fit (§4.9's hostile-input
+  /// rule: a parser of external bytes checks the length against the class before use).
+  pub const LEN: usize = 88;
+
+  /// Parses a setattr body; refuses one shorter than the struct.
   pub fn parse(body: &[u8]) -> Result<SetAttrIn, FuseError> {
-    let (valid, size, atime, mtime, mode, uid, gid) =
-      Self::parse_fields(body).ok_or(FuseError::ShortBody {
-        opcode: Opcode::SetAttr.to_wire(),
-        have: body.len(),
-        need: body.len().saturating_add(1),
-      })?;
-    Ok(SetAttrIn {
-      valid,
-      size,
-      mode,
-      uid,
-      gid,
-      atime,
-      mtime,
-    })
+    let short = FuseError::ShortBody {
+      opcode: Opcode::SetAttr.to_wire(),
+      have: body.len(),
+      need: Self::LEN,
+    };
+    if body.len() < Self::LEN {
+      return Err(short);
+    }
+    Self::parse_fields(body).ok_or(short)
   }
 }
 
@@ -244,10 +276,16 @@ pub struct RenameIn<'a> {
 }
 
 impl RenameIn<'_> {
-  /// Format: `RENAME_NOREPLACE`, fail if the destination exists.
+  /// Format: `RENAME_NOREPLACE`, fail if the destination exists (`include/uapi/linux/fs.h`).
   pub const RENAME_NOREPLACE: u32 = 1 << 0;
   /// Format: `RENAME_EXCHANGE`, atomically exchange the two paths.
   pub const RENAME_EXCHANGE: u32 = 1 << 1;
+  /// Format: `RENAME_WHITEOUT`, leave a whiteout at the source — an overlayfs-only flag the FUSE
+  /// kernel client never forwards; named so the edge's refusal of it is tested against the header.
+  pub const RENAME_WHITEOUT: u32 = 1 << 2;
+  /// Format: the `renameat2` flags the edge carries to the seam; any other bit is refused
+  /// `EINVAL` before the seam, never dropped (§4.6 "never ... discard a `renameat2` flag").
+  pub const RENAME_CARRIED: u32 = Self::RENAME_NOREPLACE | Self::RENAME_EXCHANGE;
 }
 
 impl<'a> RenameIn<'a> {

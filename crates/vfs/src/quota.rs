@@ -166,6 +166,18 @@ impl Quota {
       Self::Dynamic { max, .. } => *max,
     }
   }
+
+  /// The capacity the physical claim can honour right now (§4.6 `statfs`: "logical capacity and
+  /// remaining space that the physical claim can honor"): a bounded quota's whole limit, since its
+  /// reservation is held; a dynamic quota's granted bytes plus what the shard `budget` could still
+  /// admit, never past its `max`. This — not the bare ceiling — is what a transport reports as the
+  /// filesystem's size, so `df` on a dynamic volume never shows a total the shard cannot back.
+  pub fn honourable_limit(&self, budget: &ShardBudget) -> u64 {
+    match self {
+      Self::Bounded { limit } => *limit,
+      Self::Dynamic { max, granted, .. } => (*max).min(granted.saturating_add(budget.admittable())),
+    }
+  }
 }
 
 #[cfg(test)]

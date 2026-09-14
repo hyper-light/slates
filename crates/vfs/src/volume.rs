@@ -637,6 +637,14 @@ impl Volume {
     self.quota.limit()
   }
 
+  /// The capacity the physical claim can honour now (§4.6 `statfs`): a bounded volume's whole
+  /// quota (its reservation is held), a dynamic volume's granted bytes plus what the shard budget
+  /// in `store` could still admit, never past its `max`. A transport reports this as the
+  /// filesystem's size, so a dynamic volume's `df` never shows a total the shard cannot back.
+  pub fn honourable_capacity_bytes(&self, store: &Store) -> u64 {
+    self.quota.honourable_limit(&store.budget)
+  }
+
   /// The newest epoch whose objects the head shares with a snapshot or its clone origin.
   fn shared_epoch(&self) -> Option<Epoch> {
     match (self.last_snapshot_epoch(), self.origin_epoch) {
@@ -1450,25 +1458,33 @@ impl Volume {
     self.clock.wall_ns()
   }
 
-  /// Sets the access and modification times (a `utimens`), so a bridge honors a `setattr` of times
-  /// instead of ignoring it (§4.6). Times are nanoseconds since the Unix epoch. Copy-on-write; the
-  /// change time advances. `UTIME_NOW`/`UTIME_OMIT` resolution belongs to the transport that
-  /// carries those flags (owed, AC-3.10); this takes explicit values.
+  /// Sets the times a `setattr` names (a `utimens`), so a bridge honors a `setattr` of times
+  /// instead of ignoring it (§4.6 "never acknowledge an ignored `setattr` field"). Each time is
+  /// nanoseconds since the Unix epoch and is set only when `Some`; a `None` leaves that field as it
+  /// is (`UTIME_OMIT`). The change time is set to `ctime` when the caller supplies one — a kernel
+  /// flushing its own writeback-cached timestamps (`FATTR_CTIME`) is the authority on it — and
+  /// otherwise advances to now, as POSIX requires for an attribute change. `UTIME_NOW` is resolved
+  /// by the transport into an explicit value through [`Volume::wall_ns`] (AC-3.10). Copy-on-write.
   pub fn set_times(
     &mut self,
     store: &mut Store,
     no: InodeNo,
-    atime: i64,
-    mtime: i64,
+    atime: Option<i64>,
+    mtime: Option<i64>,
+    ctime: Option<i64>,
   ) -> Result<(), VfsError> {
     self.live()?;
     let handle = self.make_current_inode(store, no)?;
     let now = self.clock.wall_ns();
     let inode = store.inodes.get_mut(handle)?;
     let prev = inode.version;
-    inode.attrs.atime = atime;
-    inode.attrs.mtime = mtime;
-    inode.attrs.ctime = now;
+    if let Some(atime) = atime {
+      inode.attrs.atime = atime;
+    }
+    if let Some(mtime) = mtime {
+      inode.attrs.mtime = mtime;
+    }
+    inode.attrs.ctime = ctime.unwrap_or(now);
     inode.version += 1;
     self.record(Op::Setattr, "", Some(no), prev);
     Ok(())

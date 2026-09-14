@@ -4235,7 +4235,7 @@ fn populate_restored(
           volume.write(store, no, 0, bytes)?;
         }
         let mtime = i64::try_from(meta.mtime_ns).unwrap_or(i64::MAX);
-        volume.set_times(store, no, mtime, mtime)?;
+        volume.set_times(store, no, Some(mtime), Some(mtime), None)?;
       }
     }
   }

@@ -151,4 +151,8 @@ pub mod flags {
   pub const INIT_EXT: u64 = 1 << 30;
   /// Format: FUSE_DONT_MASK — the kernel applies the umask itself, so the mode arrives unmasked.
   pub const DONT_MASK: u64 = 1 << 6;
+  /// Format: FUSE_HAS_EXPIRE_ONLY — the kernel honours `FUSE_EXPIRE_ONLY` on an entry
+  /// invalidation (revalidate the name on its next use rather than drop it now; 6.2+). In the
+  /// second flags word (`flags2`), hence the bit above 31.
+  pub const HAS_EXPIRE_ONLY: u64 = 1 << 35;
 }

@@ -104,17 +104,23 @@ impl Attr {
 }
 
 /// A `LOOKUP`/`CREATE`/`MKDIR` entry reply (`struct fuse_entry_out`): nodeid, generation,
-/// entry_valid, attr_valid, their nsec parts, then `fuse_attr`.
+/// entry_valid, attr_valid, their nsec parts, then `fuse_attr`. The lifetimes are the seam's
+/// cache posture for the object (§4.6): forever for the volume's own objects, the base
+/// filesystem's timestamp granularity for a live base entry.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EntryOut {
   /// The node id (inode).
   pub nodeid: u64,
   /// The generation (so a reused node id is distinguished).
   pub generation: u64,
-  /// How long the kernel may cache the name → node mapping (seconds); slates caches forever.
+  /// How long the kernel may cache the name → node mapping (whole seconds).
   pub entry_valid: u64,
-  /// How long the kernel may cache the attributes (seconds); slates caches forever.
+  /// How long the kernel may cache the attributes (whole seconds).
   pub attr_valid: u64,
+  /// The nanoseconds part of `entry_valid`.
+  pub entry_valid_nsec: u32,
+  /// The nanoseconds part of `attr_valid`.
+  pub attr_valid_nsec: u32,
   /// The attributes.
   pub attr: Attr,
 }
@@ -130,8 +136,8 @@ impl EntryOut {
     w.u64(self.generation);
     w.u64(self.entry_valid);
     w.u64(self.attr_valid);
-    w.u32(0); // entry_valid_nsec
-    w.u32(0); // attr_valid_nsec
+    w.u32(self.entry_valid_nsec);
+    w.u32(self.attr_valid_nsec);
     self.attr.write(&mut w);
     w.into_bytes()
   }
@@ -141,8 +147,10 @@ impl EntryOut {
 /// word, then `fuse_attr`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AttrOut {
-  /// How long the kernel may cache the attributes (seconds).
+  /// How long the kernel may cache the attributes (whole seconds).
   pub attr_valid: u64,
+  /// The nanoseconds part of `attr_valid`.
+  pub attr_valid_nsec: u32,
   /// The attributes.
   pub attr: Attr,
 }
@@ -155,7 +163,7 @@ impl AttrOut {
   pub fn to_bytes(&self) -> Vec<u8> {
     let mut w = Writer::new();
     w.u64(self.attr_valid);
-    w.u32(0); // attr_valid_nsec
+    w.u32(self.attr_valid_nsec);
     w.u32(0); // dummy
     self.attr.write(&mut w);
     w.into_bytes()

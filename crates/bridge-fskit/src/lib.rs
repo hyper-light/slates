@@ -555,6 +555,8 @@ impl ShimRequest {
           gid: *gid,
           atime: *atime,
           mtime: *mtime,
+          // The shim wire carries no change time; it advances to the volume's clock.
+          ctime: None,
         },
       ),
       ShimRequest::Root => out.push(OP_ROOT),
@@ -838,6 +840,8 @@ fn serve_rest(request: ShimRequest, bridge: &mut dyn Bridge, cx: &OpContext) -> 
         gid,
         atime,
         mtime,
+        // The shim wire carries no change time; it advances to the volume's clock.
+        ctime: None,
       };
       reply(bridge.setattr(object, cx, changes), |a| ok_attr(&a))
     }
