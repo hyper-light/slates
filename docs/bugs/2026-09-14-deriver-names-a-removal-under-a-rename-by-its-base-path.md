@@ -115,6 +115,13 @@ Failing test first: `a_renamed_directorys_old_name_recreated_with_a_new_entry_re
 the document above; after: ok. The three earlier regression tests still pass under the new rule
 (the first shape now emits its removal from the subtree pass rather than the rewrite).
 
+**Closing evidence (2026-09-14 08:59–10:26):** the generative oracle `net_apply_equals_raw_replay`
+ran 4,000 times × 300 cases = **1,200,000 generated histories with 0 failures** on the closed rule
+(`cargo test -p slates-vfs --test derive net_apply_equals_raw_replay -- --exact`, a private target
+directory, this box). The earlier rules failed at 120,300, 49,500 and 202,200 cases respectively,
+so this sample is 6× the longest any partial fix survived. The oracle stays in the suite at 300
+cases per run; a nightly run at this length is owed to CI.
+
 ## Impact
 
 Any increment that deleted an entry inside a directory it also renamed produced a document whose

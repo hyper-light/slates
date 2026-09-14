@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "suite": "fsx",
+  "transport": "native-macos-nfs",
+  "host": {
+    "os": "macOS 26.4.1 (25E253)",
+    "kernel": "Darwin 25.4.0",
+    "arch": "arm64",
+    "privilege": "unprivileged"
+  },
+  "date": "2026-09-14",
+  "command": "cd <mount>/conformance-<pid>/fsx && <scratch>/tools/fsx -N 10000 -S 1 -l 262144 -q -P <scratch>/fsx-logs fsx.bin",
+  "bound": "10000 operations, seed 1, file length 262144 bytes",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "fsx",
+      "operations": 10000,
+      "seed": 1,
+      "file_length": 262144,
+      "ok": true
+    }
+  },
+  "expected_failure_list": null,
+  "duration_ms": 8109,
+  "notes": [
+    "fsx: freebsd/freebsd-src@42c6944 tools/regression/fsx/fsx.c (APSL 2.0), sha256 b064208bec8519e80038ee1da8cb9c0f7c512a3242bbf4c06809a88ce15ae019, built `cc -O2 -w -include time.h` unchanged",
+    "the exerciser's .fsxlog/.fsxgood files were kept outside the mount (-P)"
+  ]
+}

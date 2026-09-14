@@ -22,11 +22,16 @@ use slates_db::register::HostId;
 use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::SimRuntime;
 use slates_rt::udp::UdpSocket;
-use slates_transport::endpoint::Endpoint;
+use slates_transport::endpoint::{Endpoint, MIN_DATAGRAM_BYTES};
 use slates_transport::handshake::Identity;
 
 const NAME: &str = "slates-node";
-const FRAME_CAP: usize = 16;
+// Shape: the fleet's frame class — a whole SWIM message (a ping or an acknowledgement carrying gossip and a
+// coordinate, a few hundred bytes) in one frame inside one receive window, as the daemon's cap derived
+// from the RFC 9000 §14.1 minimum datagram gives it — so a probe exchange is one round trip and the round
+// trip it measures is the path's. At the previous 16-byte cap the acknowledgement fragmented across three
+// credit-gated windows and a 1 ms path measured 3 ms.
+const FRAME_CAP: usize = MIN_DATAGRAM_BYTES;
 const PROBER: HostId = HostId(1);
 const TARGET: HostId = HostId(2);
 // A change the target already knows, seeded so its acknowledgement carries gossip the prober learns.
@@ -43,6 +48,11 @@ const TARGET_GENERATION: u64 = 0;
 // Test values; a production caller derives the deadline from a measured RTT budget (owed).
 const DEADLINE_NS: u64 = 20_000_000;
 const POLL_NS: u64 = 1_000;
+// Shape: the modelled path's one-way delay — half a millisecond, so a probe's round trip on the virtual
+// clock is a known one millisecond the prober must report exactly (before the fabric modelled latency, the
+// "real round-trip time" this harness saw was a millisecond the transport spent redelivering a first
+// datagram its handshake confirmation had dropped — an accident, not a measurement).
+const PROBE_ONE_WAY_NS: u64 = 500_000;
 
 fn config() -> RuntimeConfig {
   RuntimeConfig {
@@ -154,6 +164,11 @@ const SECOND_PROBE_NONCE: u64 = 0xBCDE;
 // Shape: how long the late target sleeps before serving — past the prober's deadline, so the first probe
 // is abandoned before any reply exists; two deadlines leaves no doubt on the simulated clock.
 const LATE_SLEEP_NS: u64 = 2 * DEADLINE_NS;
+// Shape: the bound on each of the late target's serves — two deadlines, so the first serve (its reply's
+// acknowledgement rides the prober's second probe, sent exactly `LATE_SLEEP_NS` after the first deadline)
+// outlasts that instant instead of tying with it on the simulated clock, where a tie is decided by task
+// order, not by the protocol. The bound still ends the target if no second probe ever comes.
+const LATE_SERVE_BOUND_NS: u64 = 2 * DEADLINE_NS;
 
 /// Runs one live probe round: the prober (`1`) probes the target (`2`) over a mutually-authenticated
 /// session. In [`TargetMode::Serves`] the target serves the probe (seeding a rumour so its acknowledgement
@@ -163,6 +178,8 @@ const LATE_SLEEP_NS: u64 = 2 * DEADLINE_NS;
 /// acknowledged probe keeps the target alive; an unanswered or rejected one suspects it).
 fn run_probe(mode: TargetMode) -> ProbeResult {
   let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  // A modelled path, so the round trip the probe measures is the path's, known to the nanosecond.
+  slates_rt::sim::sim_udp_set_delay(slates_rt::sim::SimDelay::in_order(PROBE_ONE_WAY_NS, 0));
   let id = sim.shard_ids()[0];
 
   let prober_identity = self_signed(NAME);
@@ -251,7 +268,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
             },
           );
           for _ in 0..2 {
-            if !serve_within(&mut endpoint, &mut detector, DEADLINE_NS).await {
+            if !serve_within(&mut endpoint, &mut detector, LATE_SERVE_BOUND_NS).await {
               break;
             }
           }
@@ -380,9 +397,10 @@ fn a_live_probe_is_acknowledged_and_carries_gossip() {
     )),
     "the acknowledgement carried the target's gossip to the prober"
   );
-  assert!(
-    result.rtt_ns > 0,
-    "the probe measured a real round-trip time"
+  assert_eq!(
+    result.rtt_ns,
+    2 * PROBE_ONE_WAY_NS,
+    "the probe measured the path's round trip on the virtual clock, exactly"
   );
   assert!(
     result.coordinate_moved,

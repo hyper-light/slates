@@ -1,0 +1,12 @@
+# Reviewed expected failures: pjdfstest over the native macOS NFS loopback mount, run as root.
+#
+# One case per line: `tests/<dir>/<file>.t:<case>  <reviewed reason>`. A run fails when a case
+# fails that is not listed here, and when a listed case passes (the list only shrinks — strike
+# it). The record `docs/wip/conformance/records/native-macos-nfs.pjdfstest.json` names this
+# file's BLAKE3, so editing it without re-running the suite fails the doc-truth test
+# (`crates/conformance/tests/matrix.rs`).
+#
+# Nothing is listed yet: no root run has been reviewed. The first root run is the CI macOS
+# lane's (`.github/workflows/ci.yml`, job `conformance`); its record and per-file outputs are the
+# input to this review. The unprivileged laptop run is judged against
+# `native-macos-nfs.unprivileged.pjdfstest.txt`.

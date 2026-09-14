@@ -670,7 +670,7 @@ fn puts_for(
   let mut reusable = Vec::new();
   let mut refilled = Vec::new();
   for Reply(host, reply, endpoint) in offered {
-    match ContentMessage::decode(&reply) {
+    match ContentMessage::decode(&reply.bytes) {
       Ok(ContentMessage::Missing {
         object: offered_object,
         sequence: offered_sequence,
@@ -867,7 +867,7 @@ pub async fn fetch_content(
   let request = ContentMessage::Fetch { manifest }.encode();
   let (reply, endpoint) =
     request_within(endpoint, CONTENT_FETCH_STREAM, &request, deadline_ns).await;
-  let archive = match ContentMessage::decode(&reply) {
+  let archive = match ContentMessage::decode(&reply.bytes) {
     Ok(ContentMessage::Have { archive }) => Archive::decode(&archive)
       .ok()
       .filter(|archive| archive.manifest.identity() == manifest),

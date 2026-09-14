@@ -1,0 +1,13 @@
+# Reviewed expected failures: pjdfstest over the native macOS NFS loopback mount, run as an
+# ordinary user (pjdfstest's README requires root; this list exists so a laptop run is judged
+# against the failures an unprivileged run is known to have, never against the root list).
+#
+# One case per line: `tests/<dir>/<file>.t:<case>  <reviewed reason>`; the run fails on an
+# unlisted failure and on a listed case that passes (the list only shrinks).
+#
+# Nothing is listed yet. The 2026-09-14 run's 3,331 unexpected failures are categorized by cause
+# in docs/wip/conformance.md §3.4 rather than listed here, because the categories are either
+# consequences of running without root (the sticky-directory and chown suites) or one declared
+# transport limit (no fifos or sockets, docs/bugs/2026-09-14-nfs-special-files-refused-as-eio.md);
+# listing them case by case would make the unprivileged run look reviewed when it is the root
+# run that pjdfstest defines.

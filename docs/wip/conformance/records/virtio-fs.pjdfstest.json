@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "suite": "pjdfstest",
+  "transport": "virtio-fs",
+  "host": {
+    "os": "macOS 26.4.1 (25E253)",
+    "kernel": "Darwin 25.4.0",
+    "arch": "arm64",
+    "privilege": "unprivileged"
+  },
+  "date": "2026-09-14",
+  "command": "",
+  "bound": "",
+  "outcome": {
+    "kind": "skipped",
+    "reason": {
+      "kind": "owed",
+      "reason": "no live Linux guest: the device half is proven only by the simulated guest driver (docs/wip/virtiofs.md), and AC-9.7 says a simulation cannot close the transport guarantee"
+    }
+  },
+  "expected_failure_list": null,
+  "duration_ms": 0,
+  "notes": []
+}

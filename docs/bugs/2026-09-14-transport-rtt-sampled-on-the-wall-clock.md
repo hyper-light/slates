@@ -1,0 +1,42 @@
+# The transport sampled its round trips on the wall clock while its timers ran on the runtime clock — under simulation a 160 ms path measured as microseconds; and two handshake defects the correct estimate exposed
+
+- **Date:** 2026-09-14
+- **Subsystem:** the session-plane endpoint (`crates/transport/src/endpoint.rs`: the RTT samples in `establish_turns`, `flush` and `ingest`; the server's handshake confirmation `confirm_as_server`; the request server `serve_once_async`).
+- **Severity:** measurement correctness on every path, and a hidden per-session cost on a real WAN. On a real daemon the samples and the timers ran on two monotonic clocks that agree, so nothing broke in production; under the simulation driver — the only place a WAN can be proven on this box — the estimator was meaningless, and the two handshake defects it hid cost every real WAN session's first exchange about three round trips.
+- **Found by:** building the fabric's latency model for the WAN proof (`docs/wip/wan-timeout.md`) and asserting, by use, that an endpoint over a modelled 80 ms ± 20 ms path reports a smoothed RTT inside the path's 120–200 ms band (`crates/transport/tests/session.rs::an_endpoint_measures_the_paths_round_trip_on_the_runtime_clock`). It reported 27,547 ns (2026-09-14 08:45).
+
+## Symptom
+
+`Endpoint::smoothed_rtt()` and `pto()` were wall-clock quantities. On the loopback every simulation ran on until today, a round trip is a few hundred wall microseconds, so the value looked plausible and the probe timeout it armed (`smoothed + max(4·rttvar, 1 ms)`) was ~1 ms — the same ~1 ms the true virtual round trip of zero would arm through the granularity floor, which is why nothing noticed. Over the modelled 160 ms path the estimate was still microseconds: a 1 ms probe timeout on a 160 ms path retransmits every exchange's packet at 1, 2, 4, … ms until the real reply lands, and the fleet's derivation ("election timeout ≥ 10 × broadcast RTT p99", §4.8) could not have been fed from the transport's estimate at all.
+
+## Root cause — three defects
+
+1. **Two clocks.** `establish_turns`, `flush` and `ingest` stamped send times with `std::time::Instant::now()` and computed samples from it, while every receive timeout (`recv_within`, `receive_or_probe`, the handshake backoff) slept on the runtime's clock (`slates_rt::futures::sleep`) — the shard driver's monotonic clock on a daemon, the **virtual** clock under `SimRuntime`. The RFC 9002 §5.3 law in `rtt.rs` is clock-free by design ("the caller measures a sample as now − the send time"); the endpoint was the caller, and it chose the wrong clock. Fix: `slates_rt::futures::now_ns()` for every stamp and sample (`send_times: BTreeMap<u64, u64>`).
+2. **The first 1-RTT datagram dropped.** With the estimate correct, the far-path test's first exchange took 429 ms against a 160 ms path (the next five: 177, 166, 158, 191, 166 ms). `confirm_as_server` left the confirmation phase when the client's first 1-RTT datagram arrived — proof the client had the confirmation — but **dropped** that datagram, relying on the client's probe-timeout retransmit to redeliver it to the serve loop. On the loopback the retransmit came a millisecond later; on a 160 ms path it came one probe timeout later (`smoothed + 4·rttvar` after the handshake's seed ≈ 3 round trips). Fix: ingest the datagram; `serve_once_async` now drains the connection's received streams at the top of its loop (before its first completeness check, flushing after the drain as before), so a request already in the connection — ingested during confirmation, or while the previous reply awaited its acknowledgement — is served at once. A stream receive (`recv_stream`) reads the connection directly and is unaffected; a first attempt that drained inside the confirmation hung the content and stream tests (bytes moved into the request buffer that `recv_stream` never reads) and was withdrawn.
+3. **The handshake seed re-stamped on every retransmit** (Karn's rule violated, RFC 6298 §3). The same test then reported a smoothed RTT of 106.7 ms, below the band. `establish_turns` re-stamped `sent_at` each time it retransmitted its flight, so on a 160 ms path — where the granularity-based backoff retransmits the ClientHello at 1, 3, 7, 15, 31, 63 and 127 ms — the seed was the reply's arrival minus the last retransmit, 160 − 127 = 33 ms, which six true 160 ms samples smoothed to exactly the 106.7 ms observed (33 → 48.9 → 62.8 → 75 → 85.6 → 94.9 → 103 → 107). Fix: the flight's first send is its stamp; a reply to a retransmitted flight samples from the first send — an over-estimate when the first copy was lost, which only makes the seed more conservative.
+
+## Impact
+
+- Under simulation, every consumer of the transport's estimate — the probe timeout, the handshake-probe ceiling, the SWIM probe's `ProbeTiming` before this change's fleet work — measured the wrong clock. No production daemon was affected by (1); (2) and (3) cost every real WAN session its first exchange (≈ 3 RTT, one-time) and seeded every WAN path's estimate low (spurious probe retransmits until real samples corrected it).
+- Two existing tests had passed on accidents the fix removed: `session.rs::a_request_gets_a_reply_over_a_live_session` asserted only `smoothed_rtt > 0` (wall microseconds), and `cluster/tests/swim.rs::a_live_probe_is_acknowledged_and_carries_gossip` asserted `rtt_ns > 0` and a Vivaldi coordinate move that only the dropped-and-redelivered ping's virtual millisecond had produced. Both now run over a modelled half-millisecond path and assert the exact 1 ms round trip. `swim.rs::a_late_targets_next_probe_is_acknowledged_on_its_own_stream` had its late target's serve bound tie, on the virtual clock, with the prober's second probe (both exactly `LATE_SLEEP_NS` after the first deadline) — a task-order tie the 10 % shift in the probe schedule flipped; the bound is now two deadlines.
+
+- The swim harness's frame cap was 16 bytes: at that cap the acknowledgement (gossip and a coordinate, a few hundred bytes) fragments across three credit-gated windows, so a 1 ms path measured 3 ms — the fragmentation `FLEET_FRAME_CAP`'s own derivation records for a 68-byte record ("ten credit-gated round trips"). The harness now uses the fleet's frame class (`MIN_DATAGRAM_BYTES`), one message per frame, and the exchange is one round trip. The trace that settled it (virtual clock): prober established 2.0 ms, target established 2.5 ms (the ping ingested there), phase one saw stream 257 present but incomplete twice at 2.5 ms, the reply fully acknowledged at 5.5 ms.
+
+## Exact edits
+
+- `crates/transport/src/endpoint.rs`: `use slates_rt::futures::now_ns`; `send_times: BTreeMap<u64, u64>`; `sent_at: Option<u64>` stamped at the flight's first send only; `ingest` computes `now.saturating_sub(sent_at)`; `confirm_as_server` ingests the first 1-RTT datagram instead of dropping it; `serve_once_async` phase one drains, then flushes, then checks for a complete request, then receives.
+- `crates/transport/tests/session.rs`: the far-path test (new) and the exact-oracle form of the request/reply test.
+- `crates/cluster/tests/swim.rs`: the modelled path, the exact round-trip assertion, the two-deadline serve bound.
+
+## Verification
+
+- Before: `an_endpoint_measures_the_paths_round_trip_on_the_runtime_clock` → smoothed 27,547 ns; `a_request_gets_a_reply_over_a_live_session` (exact form) → 144,591 ns for a 1 ms path (2026-09-14 08:45:33).
+- After (1) alone: exchanges `[429513332, 176792602, 166253469, 157946919, 190674367, 166109653]` ns — the first exchange's probe-timeout penalty (defect 2).
+- After (1)+(2): smoothed 106,708,223 ns — the re-stamped seed (defect 3).
+- After all three: `cargo test -p slates-transport` 88 + 5 + 1 + 10 tests green; `cargo test -p slates-cluster` 134 lib + every integration binary green (2026-09-14 09:13, load ~11 on 18 cores, the runs are on the virtual clock so the load does not bear on them); `cargo clippy -p slates-transport -p slates-cluster -p slates-server --all-targets -- -D warnings` clean.
+
+## Siblings swept
+
+- `crates/cluster/src/swim.rs` (`probe_once`) and `crates/cluster/src/lib.rs` (`request_within`) already sampled on `now_ns()` — consistent with the fix.
+- No other `Instant` or `SystemTime` use remains in `crates/transport/src`.
+- The daemon's own clocks (`HostClock`, the verbs) are a separate domain; the 2026-09-14 racy-rule record covers the one mixing found there.

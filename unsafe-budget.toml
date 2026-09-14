@@ -168,3 +168,5 @@ slates-bridge-virtiofs = 0
 # `statfs` of the path would touch the very mount the daemon serves. The Linux read of
 # `/proc/self/mountinfo` is safe rustix; the parser, verification and entry are pure.
 slates-bridge-oci = 1
+# slates-conformance (0): pure parsers and records; no FFI, no I/O.
+slates-conformance = 0

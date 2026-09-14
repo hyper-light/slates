@@ -1,0 +1,9 @@
+# Reviewed expected failures: pjdfstest over the Linux lane's adapter (a root `mount -t nfs` of
+# the daemon's NFSv3 loopback export by the OS client — LIMITED: not the FUSE bridge), run as root.
+#
+# One case per line: `tests/<dir>/<file>.t:<case>  <reviewed reason>`; the run fails on an
+# unlisted failure and on a listed case that passes (the list only shrinks).
+#
+# Nothing is listed yet: the Linux lane (`.github/workflows/ci.yml`, job `conformance`) has not
+# produced its first record. When the FUSE bridge is served by the daemon and the lane mounts it,
+# this file is the FUSE list and the adapter's cases move to their own review.

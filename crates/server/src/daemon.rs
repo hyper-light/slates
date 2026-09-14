@@ -590,6 +590,26 @@ impl Daemon {
     })
   }
 
+  /// The configuration council's **election timing** as this daemon last derived it (§4.8 "Derived
+  /// constants": "election timeout ≥ 10 × broadcast RTT p99 with the randomization span from RTT
+  /// variance"; `slates_cluster::timing::ElectionTiming`): the base and span in coordinator periods, the
+  /// measured tail and spread they were derived from, and the round trips behind them — so an observer
+  /// tells a measured floor (samples counted) from a defaulted one. On a loopback fleet it is the floor,
+  /// ten periods, by construction; across a WAN it is ten times the measured tail. A one-shot control-shard
+  /// query ([`Self::observe`]); `None` when the daemon could not observe it — unknown, never the floor.
+  pub fn council_timing(&self) -> Option<slates_cluster::timing::ElectionTiming> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| s.council_timing)
+    })
+  }
+
+  /// The root group's election timing, derived as [`Self::council_timing`] is over the root voters' paths.
+  pub fn root_timing(&self) -> Option<slates_cluster::timing::ElectionTiming> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| s.root_timing)
+    })
+  }
+
   /// The **regional membership** this daemon's configuration council has committed and applied so far
   /// (§4.8, D-14) — the members of the `RegionalConfiguration`, the region the council masters. A one-shot
   /// control-shard query ([`Self::observe`]); `None` when the daemon could not observe it — unknown, never
@@ -1467,6 +1487,9 @@ fn init_shard(
     pending_takeovers: std::collections::BTreeSet::new(),
     config_refresh_wanted: false,
     record_sessions: std::collections::BTreeMap::new(),
+    peer_paths: std::collections::BTreeMap::new(),
+    council_timing: slates_cluster::timing::ElectionTiming::floor(),
+    root_timing: slates_cluster::timing::ElectionTiming::floor(),
     council,
     root,
     node_regions,
