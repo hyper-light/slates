@@ -830,13 +830,20 @@ impl Bridge for VolumeBridge<'_> {
   fn statfs(&mut self, _object: ObjectId, cx: &OpContext) -> Result<FsStat, VfsError> {
     self.authorize_read(cx)?;
     let accounting = self.volume.accounting();
-    // Truthful space (audit BUG-9): the total is the volume's real quota ceiling, the used is its
-    // referenced bytes, and the free is the remaining quota — not an invented multiple of the used
-    // amount, which the previous `blocks = 2 * used` / `free = used` reported. The total and used
-    // are the same pair the quota admits writes against, so `df` shows the real capacity a write
-    // will be refused past (a dynamic volume's total is its `max`).
+    // Truthful space (audit BUG-9; §4.6 "logical capacity and remaining space that the physical
+    // claim can honor"): the total is the capacity the claim can honour now — a bounded volume's
+    // whole quota, a dynamic volume's granted bytes plus what the shard budget could still admit,
+    // never past its ceiling — the used is the referenced bytes, and the free is their difference.
+    // Not an invented multiple of the used amount (the previous `blocks = 2 * used` / `free =
+    // used`), and not a dynamic volume's bare `max` either (which showed a total the shard could
+    // not back). The total and used are the pair the quota admits writes against, so `df` shows
+    // the real capacity a write will be refused past. Block rounding is checked: a `div_ceil` on
+    // each side, so the free count is rounded down and never over-promises a partial block.
     let block = u64::from(BLOCK_SIZE);
-    let total_blocks = self.volume.capacity_bytes().div_ceil(block);
+    let total_blocks = self
+      .volume
+      .honourable_capacity_bytes(self.store)
+      .div_ceil(block);
     let used_blocks = accounting.referenced_bytes.div_ceil(block);
     let free_blocks = total_blocks.saturating_sub(used_blocks);
     // Backed inode availability (§4.2: "statfs includes backed inode availability"): the volume's

@@ -518,6 +518,14 @@ impl Volume {
     self.quota.limit()
   }
 
+  /// The capacity the physical claim can honour now (§4.6 `statfs`): a bounded volume's whole
+  /// quota (its reservation is held), a dynamic volume's granted bytes plus what the shard budget
+  /// in `store` could still admit, never past its `max`. A transport reports this as the
+  /// filesystem's size, so a dynamic volume's `df` never shows a total the shard cannot back.
+  pub fn honourable_capacity_bytes(&self, store: &Store) -> u64 {
+    self.quota.honourable_limit(&store.budget)
+  }
+
   /// The newest epoch whose objects the head shares with a snapshot or its clone origin.
   fn shared_epoch(&self) -> Option<Epoch> {
     match (self.last_snapshot_epoch(), self.origin_epoch) {

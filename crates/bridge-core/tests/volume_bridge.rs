@@ -15,7 +15,7 @@ use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
 use slates_vfs::clock::HostClock;
 use slates_vfs::names::NameEquivalence;
-use slates_vfs::quota::Quota;
+use slates_vfs::quota::{BudgetGrowth, Quota};
 use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
 
 /// Shape: the page and a small arena for the test volume.
@@ -643,6 +643,93 @@ fn statfs_reports_the_real_capacity_not_an_invented_figure() {
   assert!(
     empty.bfree - after.bfree >= (200 * 1024) / BLOCK,
     "free fell by at least the written blocks"
+  );
+}
+
+/// statfs of a dynamic volume reports only the capacity the shard can honour (§4.6 "logical
+/// capacity and remaining space that the physical claim can honor"), not the volume's bare
+/// ceiling: a volume allowed to grow to 1 GiB on a shard whose budget is the 16 MiB test arena
+/// reports a total within that budget, its free space falls with its own writes, and it falls
+/// again when another dynamic volume takes capacity from the same shard budget — the space it
+/// could no longer honour. Failed at `9a960bb`: the total was the 1 GiB ceiling (a `df` the
+/// shard could not back).
+#[test]
+fn statfs_of_a_dynamic_volume_reports_only_what_the_shard_can_honour() {
+  const BLOCK: u64 = 4096;
+  const CEILING: u64 = 1 << 30;
+  let mut store = store();
+  let budget_capacity = store.budget.capacity();
+  assert!(
+    budget_capacity < CEILING,
+    "the fixture's arena is far below the ceiling"
+  );
+  let dynamic = |prefix: u16| VolumeConfig {
+    prefix,
+    names: NameEquivalence::Exact,
+    quota: Quota::Dynamic {
+      max: CEILING,
+      source: Box::new(BudgetGrowth),
+      granted: 0,
+      denied: 0,
+    },
+    journal_bytes: 1 << 16,
+    clock: Box::new(HostClock::default()),
+  };
+  let mut first = Volume::create(&mut store, dynamic(1)).unwrap();
+  let mut second = Volume::create(&mut store, dynamic(2)).unwrap();
+  let cx = rw_cx();
+
+  let (empty, root) = {
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut first, &mut store);
+    let root = bridge.root(&cx).unwrap();
+    (bridge.statfs(oid(root), &cx).unwrap(), root)
+  };
+  assert!(
+    empty.blocks * BLOCK <= budget_capacity,
+    "the total is within what the shard can honour ({} blocks, budget {budget_capacity})",
+    empty.blocks
+  );
+  assert!(
+    empty.bavail * BLOCK <= budget_capacity,
+    "and so is the free space"
+  );
+
+  // The volume's own write takes from its free space.
+  let after_write = {
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut first, &mut store);
+    let (attr, _fh) = bridge.create(oid(root), &cx, "f", 0o644, 0).unwrap();
+    bridge
+      .write(oid(attr.ino), &cx, 0, &vec![0u8; 200 * 1024])
+      .unwrap();
+    bridge.statfs(oid(root), &cx).unwrap()
+  };
+  assert!(
+    empty.bavail - after_write.bavail >= (200 * 1024) / BLOCK,
+    "free fell by at least the written blocks"
+  );
+
+  // Another dynamic volume takes 4 MiB of the same shard budget: the first can no longer honour it.
+  {
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut second, &mut store);
+    let other_root = bridge.root(&cx).unwrap();
+    let (attr, _fh) = bridge.create(oid(other_root), &cx, "g", 0o644, 0).unwrap();
+    bridge
+      .write(oid(attr.ino), &cx, 0, &vec![0u8; 4 << 20])
+      .unwrap();
+  }
+  let after_other = {
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut first, &mut store);
+    bridge.statfs(oid(root), &cx).unwrap()
+  };
+  assert!(
+    after_write.bavail - after_other.bavail >= (4 << 20) / BLOCK,
+    "another volume's growth reduced what this one can honour ({} -> {} blocks)",
+    after_write.bavail,
+    after_other.bavail
+  );
+  assert!(
+    after_other.blocks < after_write.blocks,
+    "the reported total shrank with it, never a fixed ceiling"
   );
 }
 
