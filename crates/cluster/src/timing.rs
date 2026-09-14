@@ -41,13 +41,14 @@ use slates_transport::rtt::RttEstimator;
 
 use crate::CommitBudget;
 
-/// Derived: Raft's order-of-magnitude ratio of election timeout to broadcast time — "broadcastTime should
-/// be an order of magnitude less than the election timeout" (Ongaro & Ousterhout 2014, §5.6; the paper's
+/// Raft's order-of-magnitude ratio of election timeout to broadcast time — "broadcastTime should be an
+/// order of magnitude less than the election timeout" (Ongaro & Ousterhout 2014, §5.6; the paper's
 /// example ranges are 0.5–20 ms against 10–500 ms) — fixed at ten by the design's rule "election timeout
 /// ≥ 10 × broadcast RTT p99" (§4.8 "Derived constants"). It is also the leader's CheckQuorum cadence
 /// (Raft §6.2: a leader that hears from no majority within an election timeout steps down) and the cap on
 /// a consensus round's progress extensions (one period each, so a round is never extended past the
 /// election timeout it would be displacing the leader over).
+/// Derived: ten — the paper's order of magnitude, the design's multiplier (§4.8), an anchor not a tunable.
 pub const ELECTION_MARGIN: u64 = 10;
 
 /// The measured path to one peer: the transport's RFC 9002 §5.3 estimator over every round trip this node

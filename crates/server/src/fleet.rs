@@ -91,9 +91,10 @@ use slates_cluster::raft_wire::{
 };
 use slates_cluster::root_group::root_representatives;
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once};
+use slates_cluster::timing::{ElectionTimer, ElectionTiming, PathRtt, RoundAnchors, round_budget};
 use slates_cluster::{
-  ClusterError, CommitBudget, PROMOTE_STREAM, RECORD_STREAM, Stragglers, broadcast, commit_record,
-  promote_record, request_within,
+  ClusterError, CommitBudget, PROMOTE_STREAM, RECORD_STREAM, Stragglers, TimedReply, broadcast,
+  commit_record, promote_record, request_within,
 };
 use slates_db::Op;
 use slates_db::catalog::{
@@ -413,16 +414,18 @@ fn detector_timing(neighbourhood: usize) -> DetectorTiming {
 }
 
 /// The probe's timing law for one peer (§4.8 "Derived constants": "detection timeout for membership from
-/// RTT p99 × k; SWIM period = max(k × RTT p99, scheduler quantum)") — the measured round trip of this peer's
-/// acknowledgements and how many probes in a row it has missed, from which each probe's deadline is derived
+/// RTT p99 × k; SWIM period = max(k × RTT p99, scheduler quantum)") — the measured round trip of the path to
+/// this peer and how many probes in a row it has missed, from which each probe's deadline is derived
 /// (nothing here is a hidden constant):
 ///
 /// - **From the measured round trip**: the RFC 9002 §6.2.1 probe timeout, `smoothed_rtt + max(4 · rttvar,
 ///   granularity)` — Jacobson's mean-deviation bound on the round-trip tail (SIGCOMM 1988; the RTO the
 ///   Internet runs on), the running form of "RTT p99 × k" with `k` in the four deviations — over the
-///   transport's own estimator ([`RttEstimator`]), fed by every acknowledged probe (a timed-out probe yields
-///   no sample: Karn's rule). A peer whose acknowledgements have grown slow (its shard starved on a loaded
-///   box) is waited for accordingly, and the estimate follows it back down.
+///   **shared path estimate** (`ShardState::peer_paths`, [`PathRtt`]), fed by every acknowledged probe (a
+///   timed-out probe yields no sample: Karn's rule) and, since 2026-09-14, by every consensus round's reply
+///   to this peer — one estimate per path, the same one the election timeout is derived from. A peer whose
+///   acknowledgements have grown slow (its shard starved on a loaded box) is waited for accordingly, and
+///   the estimate follows it back down.
 /// - **Floored at the scheduler quantum**: [`HEARTBEAT_NS`], the daemon's beat — the finest cadence anything
 ///   on the control shard is scheduled at, so no deadline is set finer than the scheduler resolves (on a quiet
 ///   loopback the estimate is ~50 ms, below it: the floor keeps the quiet behaviour exactly what it was).
@@ -433,30 +436,35 @@ fn detector_timing(neighbourhood: usize) -> DetectorTiming {
 ///   (one that beats within it) — a peer that cannot acknowledge within it is not merely slow, so no probe
 ///   waits longer, and a dead peer is still declared within a bounded span (six misses ≈ 4 s at rest).
 ///
+/// The probe **period** the design names, `max(k × RTT p99, scheduler quantum)`, holds by construction: the
+/// probe task awaits each probe's outcome — its acknowledgement, or this deadline — before sleeping the
+/// quantum ([`probe_period_ns`]), so probes never overlap and the cadence is at least the path's round trip
+/// plus a beat.
+///
 /// The suspicion window ([`SUSPICION_PERIODS`]) still counts *probes*, so it dilates with the deadline: the
 /// misses that kill a peer are misses of an adaptive, backed-off wait — a live peer starved for seconds is no
 /// longer six 100 ms deadlines late; it is a slow peer the estimator and the backoff wait for
 /// (`docs/bugs/2026-09-13-swim-fixed-probe-deadline-kills-a-starved-live-peer.md`).
 struct ProbeTiming {
-  rtt: RttEstimator,
   consecutive_misses: u32,
 }
 
 impl ProbeTiming {
-  /// A fresh law: no sample yet — the first deadline is the RFC 9002 §6.2.2 initial probe timeout (twice the
-  /// initial RTT), conservative until the first acknowledgement seeds the estimate — and no misses.
+  /// A fresh law: no misses. Before the path has a sample the deadline is the RFC 9002 §6.2.2 initial probe
+  /// timeout (twice the initial RTT), conservative until the first acknowledgement seeds the estimate.
   fn new() -> ProbeTiming {
     ProbeTiming {
-      rtt: RttEstimator::new(),
       consecutive_misses: 0,
     }
   }
 
-  /// This probe's deadline: `max(pto, HEARTBEAT_NS) × 2^misses`, capped at `LIVENESS_BUDGET_NS` (the
-  /// derivation on the type). The peer acknowledges inline, so no acknowledgement delay is added to the
-  /// probe timeout.
-  fn deadline_ns(&self) -> u64 {
-    let base = self.rtt.pto(0).max(HEARTBEAT_NS);
+  /// This probe's deadline over the path's measured tail (`None` before any sample): `max(tail or the
+  /// initial probe timeout, HEARTBEAT_NS) × 2^misses`, capped at `LIVENESS_BUDGET_NS` (the derivation on
+  /// the type). The peer acknowledges inline, so no acknowledgement delay is added.
+  fn deadline_ns(&self, path_tail_ns: Option<u64>) -> u64 {
+    let base = path_tail_ns
+      .unwrap_or_else(|| RttEstimator::new().initial_pto())
+      .max(HEARTBEAT_NS);
     // A shift by the word width or more is already past the cap: saturate rather than overflow.
     let backoff = 1u64
       .checked_shl(self.consecutive_misses)
@@ -466,13 +474,16 @@ impl ProbeTiming {
 
   /// The budget for this probe: its derived deadline, polled at the collection-loop cadence (a tenth of a
   /// period, [`POLL_PER_PERIOD`]).
-  fn budget(&self) -> CommitBudget {
-    CommitBudget::hard(self.deadline_ns(), (HEARTBEAT_NS / POLL_PER_PERIOD).max(1))
+  fn budget(&self, path_tail_ns: Option<u64>) -> CommitBudget {
+    CommitBudget::hard(
+      self.deadline_ns(path_tail_ns),
+      (HEARTBEAT_NS / POLL_PER_PERIOD).max(1),
+    )
   }
 
-  /// The probe was acknowledged in `rtt_ns`: a sample for the estimate, and the backoff resets.
-  fn acknowledged(&mut self, rtt_ns: u64) {
-    self.rtt.on_sample(rtt_ns, 0);
+  /// The probe was acknowledged: the backoff resets (the round trip itself is the path estimate's sample,
+  /// folded by the caller into the shared path).
+  fn acknowledged(&mut self) {
     self.consecutive_misses = 0;
   }
 
@@ -480,6 +491,55 @@ impl ProbeTiming {
   fn missed(&mut self) {
     self.consecutive_misses = self.consecutive_misses.saturating_add(1);
   }
+}
+
+/// The measured tail of the path to `peer` (`None` before its first round trip), read off the shared path
+/// estimate on this shard.
+fn path_tail_ns(peer: HostId) -> Option<u64> {
+  state::with_state(|s| s.peer_paths.get(&peer).and_then(PathRtt::tail_ns)).flatten()
+}
+
+/// The slowest measured peer path's tail (`None` with no path measured) — what bounds a round to any set of
+/// peers this node dispatches to, so the coordinator's period budget is derived from it.
+fn slowest_path_tail_ns() -> Option<u64> {
+  state::with_state(|s| s.peer_paths.values().filter_map(PathRtt::tail_ns).max()).flatten()
+}
+
+/// Folds one completed round trip to `peer` into its shared path estimate.
+fn sample_path(state: &mut ShardState, peer: HostId, round_trip_ns: u64) {
+  state
+    .peer_paths
+    .entry(peer)
+    .or_default()
+    .on_sample(round_trip_ns);
+}
+
+/// Samples the path to every voter that answered inside a consensus round (Karn's rule: a timed-out exchange
+/// is no sample; a refusal that came back is).
+fn sample_voter_paths(state: &mut ShardState, replies: &[(HostId, TimedReply)]) {
+  for (host, reply) in replies {
+    if let Some(round_trip_ns) = reply.round_trip_ns {
+      sample_path(state, *host, round_trip_ns);
+    }
+  }
+}
+
+/// A group's election timing this period, derived from the measured paths to its other voters
+/// (`ElectionTiming::derive`, the floor with none measured), recorded on the shard for the daemon's
+/// observation accessors through `record`.
+fn derive_group_timing(
+  others: &[HostId],
+  record: impl FnOnce(&mut ShardState, ElectionTiming),
+) -> ElectionTiming {
+  state::with_state(|s| {
+    let timing = ElectionTiming::derive(
+      HEARTBEAT_NS,
+      others.iter().filter_map(|host| s.peer_paths.get(host)),
+    );
+    record(s, timing);
+    timing
+  })
+  .unwrap_or_else(ElectionTiming::floor)
 }
 
 /// Shape: the numerator of the lookahead fraction (kept a ratio so no float enters the decision) at which a
@@ -491,43 +551,54 @@ const CONSENSUS_LOOKAHEAD_NUMERATOR: u64 = 3;
 /// [`CONSENSUS_LOOKAHEAD_NUMERATOR`]).
 const CONSENSUS_LOOKAHEAD_DENOMINATOR: u64 = 4;
 
-/// The record-plane and configuration-consensus budget (§4.8 "late work"). Unlike a single SWIM probe
-/// ([`probe_budget`], a hard deadline — one missed probe is absorbed by the suspicion window), a record
-/// commit, a takeover promotion, a Raft replication round, an election or a learner fetch **gathers replies
-/// from several holders or voters at once**, and under CPU starvation — a noisy shared-tenant neighbour, a
-/// hypervisor steal, the kernel saturated by another process's syscalls — those replies arrive *late but
-/// still arrive*. A hard deadline would declare the round uncertain at the period boundary and re-dispatch it
-/// every period: a false-timeout storm that adds transport and scheduling load precisely when the machine is
-/// already starved, so the round never converges and the fleet thrashes rather than degrading gracefully
-/// (task #31; observed as consensus/takeover tests missing their deadlines under load). This budget instead
-/// **extends while the round is still making progress** — its acknowledged set advanced within the stall
-/// window — and times out only a round that has genuinely stalled (a dead holder), so a slow-but-progressing
-/// fleet converges. It is the `f > 0` caller's use of the extension mechanism the design built for exactly
-/// this; at `f = 0` (laptop) there are no peers to gather from, so the extender never fires and the behaviour
-/// is the hard budget's (R8). Every parameter is derived from the protocol's own periods:
-///
-/// - **base deadline** = one period ([`HEARTBEAT_NS`]): a healthy round completes far inside a period
-///   (sub-millisecond loopback RTT plus processing), so at full health this behaves as the hard budget did
-///   and adds no latency;
-/// - **poll interval** = a tenth of a period ([`POLL_PER_PERIOD`]), the collection loop's park between
-///   wake-ups, as the probe uses;
-/// - **extension** = one period per grant, up to [`ELECTION_HEARTBEATS`] grants: a progressing round may
-///   extend up to about the election timeout — the coherent cap, because a round still gathering replies past
-///   that point is one the election timer would already be displacing the leader over, so the extension and
-///   the election do not fight (a leader that keeps making progress holds its term; one that stalls yields);
-/// - **stall window** = the SWIM suspicion span ([`SUSPICION_PERIODS`] periods): a round that gathers no new
-///   reply for as long as a peer may go unheard before it is suspected is judged stalled, not merely slow, and
-///   is left to time out at its current deadline.
-fn consensus_budget() -> CommitBudget {
-  CommitBudget::with_extension(
-    HEARTBEAT_NS,
-    (HEARTBEAT_NS / POLL_PER_PERIOD).max(1),
+/// The anchors the record-plane and consensus round budget is derived from — the coordinator's own periods
+/// ([`round_budget`]): the heartbeat as the period, the SWIM suspicion span as the stall window, the
+/// collection cadence as the poll, and the last quarter of the deadline as the lookahead.
+const ROUND_ANCHORS: RoundAnchors = RoundAnchors {
+  heartbeat_ns: HEARTBEAT_NS,
+  stall_periods: SUSPICION_PERIODS,
+  polls_per_period: POLL_PER_PERIOD,
+  lookahead: (
     CONSENSUS_LOOKAHEAD_NUMERATOR,
     CONSENSUS_LOOKAHEAD_DENOMINATOR,
-    HEARTBEAT_NS,
-    ELECTION_HEARTBEATS,
-    HEARTBEAT_NS.saturating_mul(u64::from(SUSPICION_PERIODS)),
-  )
+  ),
+};
+
+/// The record-plane and configuration-consensus budget for one period (§4.8 "late work"). Unlike a single
+/// SWIM probe ([`ProbeTiming::budget`], a hard deadline — one missed probe is absorbed by the suspicion
+/// window), a record commit, a takeover promotion, a Raft replication round, an election or a learner fetch
+/// **gathers replies from several holders or voters at once**, and under CPU starvation — a noisy
+/// shared-tenant neighbour, a hypervisor steal, the kernel saturated by another process's syscalls — those
+/// replies arrive *late but still arrive*. A hard deadline would declare the round uncertain at the period
+/// boundary and re-dispatch it every period: a false-timeout storm that adds transport and scheduling load
+/// precisely when the machine is already starved, so the round never converges and the fleet thrashes rather
+/// than degrading gracefully (task #31; observed as consensus/takeover tests missing their deadlines under
+/// load). This budget instead **extends while the round is still making progress** — its acknowledged set
+/// advanced within the stall window — and times out only a round that has genuinely stalled (a dead
+/// holder), so a slow-but-progressing fleet converges. At `f = 0` (laptop) there are no peers to gather
+/// from, so the extender never fires and the behaviour is the hard budget's (R8).
+///
+/// Every parameter is derived from the protocol's own periods and the **measured path** ([`round_budget`],
+/// `slowest_tail_ns` the slowest measured peer path's round-trip tail this period, [`slowest_path_tail_ns`]):
+///
+/// - **base deadline** = `max(one period, tail)`: a round is given the slowest peer's round-trip tail before
+///   it can be judged stalled with no reply at all — a healthy loopback round completes far inside a period,
+///   so on one host this is the one period it always was, but a fixed period expired every round to voters
+///   more than three quarters of a period away with their replies still in flight, and no council across a
+///   WAN could elect (`docs/bugs/2026-09-14-consensus-round-expires-inside-the-wan-rtt.md`);
+/// - **poll interval** = a tenth of a period ([`POLL_PER_PERIOD`]), the collection loop's park between
+///   wake-ups, as the probe uses;
+/// - **extension** = one period per grant, up to `ELECTION_MARGIN` grants (the election margin the timing
+///   law fixes at Raft's ten): a progressing round may extend up to about the floor election timeout — the
+///   coherent cap, because a round still gathering replies past that point is one the election timer would
+///   already be displacing the leader over, so the extension and the election do not fight (a leader that
+///   keeps making progress holds its term; one that stalls yields);
+/// - **stall window** = `max(the SWIM suspicion span, tail)` ([`SUSPICION_PERIODS`] periods): a round that
+///   gathers no new reply for as long as a peer may go unheard before it is suspected — or for one round-trip
+///   tail, whichever is longer — is judged stalled, not merely slow, and is left to time out at its current
+///   deadline.
+fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
+  round_budget(&ROUND_ANCHORS, slowest_tail_ns)
 }
 
 /// Runs the fleet membership loop for `transport` on the control shard (§4.8, boot step 6). It binds this
@@ -553,11 +624,23 @@ pub async fn run_membership(transport: FleetTransport, progress: &'static Atomic
   let identity: &'static Identity = Box::leak(Box::new(identity));
   let neighbourhood = peers.len().saturating_add(1); // this node and its peers.
   let local = state::with_state(|s| s.fleet.host()).unwrap_or(HostId(0));
-  // The record plane and the configuration consensus gather replies from several holders/voters, so they run
-  // under the progress-extending budget (tolerating late-but-progressing replies under CPU starvation);
-  // the per-peer SWIM probe below keeps its own hard [`probe_budget`] (a single miss is absorbed by the
-  // suspicion window, so a probe needs no extension). See [`consensus_budget`].
-  let budget = consensus_budget();
+  // The boot line of the fleet's derived timing (R3: every derived value logged with its inputs). Nothing is
+  // measured yet, so every value is at its floor; each period re-derives it from the measured paths, and
+  // `Daemon::council_timing` / `slates status` read the live values.
+  let floor = ElectionTiming::floor();
+  let round = consensus_budget(None);
+  eprintln!(
+    "slates-server: fleet timing: election timeout = {} × max(broadcast RTT tail over the voters, heartbeat {} ns) = {} periods at the floor (span the same over the tail's spread: {} periods); round budget base = max(heartbeat, tail) = {} ns, stall = max({} periods, tail) = {} ns, extensions {} × {} ns; no path measured yet",
+    slates_cluster::timing::ELECTION_MARGIN,
+    HEARTBEAT_NS,
+    floor.base_periods,
+    floor.span_periods,
+    round.deadline_ns,
+    SUSPICION_PERIODS,
+    HEARTBEAT_NS.saturating_mul(u64::from(SUSPICION_PERIODS)),
+    slates_cluster::timing::ELECTION_MARGIN,
+    HEARTBEAT_NS,
+  );
 
   // One serve socket per plane, shared by every peer through a demultiplexer (bound here on the control
   // shard, before the dials, so a peer's dial finds a listener). A serve socket that cannot be bound (the
@@ -670,7 +753,7 @@ pub async fn run_membership(transport: FleetTransport, progress: &'static Atomic
   // One record-plane coordinator for all peers (§4.8 "records are sent to all candidates"): it borrows every
   // holder session the link tasks keep up, so it ships each head to all candidates in one commit and drives
   // each takeover over all surviving holders (the `f > 1` promotion a per-peer ship task could not reach).
-  if let Ok(task) = futures::spawn(run_record_plane(local, budget, progress)) {
+  if let Ok(task) = futures::spawn(run_record_plane(local, progress)) {
     let _ = futures::detach(task);
   }
 }
@@ -982,7 +1065,7 @@ async fn probe_and_apply(
     // refutes it from this very probe rather than after the gossip budget is spent.
     gossip: detector.ping_gossip(peer.host, fanout),
   };
-  match probe_once(open, &ping, timing.budget()).await {
+  match probe_once(open, &ping, timing.budget(path_tail_ns(peer.host))).await {
     Ok((
       returned,
       ProbeOutcome::Acked {
@@ -1001,7 +1084,10 @@ async fn probe_and_apply(
       // folded regardless.
       if from == peer.host {
         detector.on_ack(peer.host);
-        timing.acknowledged(rtt_ns);
+        timing.acknowledged();
+        // The acknowledged round trip samples the shared path to this peer — the estimate the next probe's
+        // deadline, the election timing and the round budget are all derived from.
+        let _ = state::with_state(|s| sample_path(s, peer.host, rtt_ns));
         #[allow(clippy::cast_precision_loss)]
         detector.observe_rtt(peer.host, rtt_ns as f64);
         detector.learn_coordinate(peer.host, coordinate);
@@ -1059,6 +1145,9 @@ fn follow_current_id(
     });
   }
   *timing = ProbeTiming::new();
+  // The old id's path estimate goes with it: a restarted node is a new member on the same wire, and its
+  // path is measured afresh under the new id (bounded: one estimate per live rostered id).
+  let _ = state::with_state(|s| s.peer_paths.remove(&old));
   peer.host = current;
 }
 
@@ -1542,6 +1631,7 @@ fn advance_seals(
   local: HostId,
   slice_bytes: u64,
   created_unix: u64,
+  round: CommitBudget,
 ) -> Vec<ContentWork> {
   let quorum = state.fleet.configuration().quorum;
   let mut work = Vec::new();
@@ -1569,7 +1659,7 @@ fn advance_seals(
     if !advance_seal(state, object, handle, slice_bytes) {
       continue;
     }
-    if let Some(item) = content_work(state, object, quorum) {
+    if let Some(item) = content_work(state, object, quorum, round) {
       work.push(item);
     }
   }
@@ -1899,9 +1989,9 @@ fn hedge_delay_ns(latency: &PutLatency) -> u64 {
 /// gathering acknowledgements at the delay — the ratified late-work rule — so a round with none at the p95
 /// expires there and is hedged); the stall window = the hedge delay itself (an acknowledgement within one
 /// delay is progress); poll = the collection cadence ([`POLL_PER_PERIOD`]).
-fn content_budget(latency: &PutLatency) -> CommitBudget {
+fn content_budget(latency: &PutLatency, round: CommitBudget) -> CommitBudget {
   let hedge_delay = hedge_delay_ns(latency);
-  let span = consensus_budget().max_deadline_ns().max(hedge_delay);
+  let span = round.max_deadline_ns().max(hedge_delay);
   CommitBudget::with_extension(
     hedge_delay,
     (HEARTBEAT_NS / POLL_PER_PERIOD).max(1),
@@ -1928,9 +2018,14 @@ fn fold_content_ack(job: &mut SealJob, holder: HostId) {
 /// to the remaining candidates goes out only once the first round has been outstanding for longer than the
 /// measured p95 put latency ([`hedge_delay_ns`]) — the design's trigger, replacing the period the rounds
 /// happen to be driven at (§4.8 "hedged to the remaining candidates after the measured p95 put latency").
-fn content_work(state: &mut ShardState, object: ObjectId, quorum: Quorum) -> Option<ContentWork> {
+fn content_work(
+  state: &mut ShardState,
+  object: ObjectId,
+  quorum: Quorum,
+  round: CommitBudget,
+) -> Option<ContentWork> {
   let hedge_delay = hedge_delay_ns(&state.put_latency);
-  let budget = content_budget(&state.put_latency);
+  let budget = content_budget(&state.put_latency, round);
   let now = state.clock.monotonic_ns();
   let job = state.seals.get_mut(&object)?;
   if job.content.placed(quorum) {
@@ -2440,11 +2535,9 @@ impl Dispatch {
       _ => {
         let (arrived, done) = self.stragglers.recover_replies();
         let mut recovered = Vec::with_capacity(arrived.len());
-        let mut replies = Vec::new();
+        let mut replies = Vec::with_capacity(arrived.len());
         for (host, reply, endpoint) in arrived {
-          if !reply.bytes.is_empty() {
-            replies.push(reply.bytes);
-          }
+          replies.push((host, reply));
           recovered.push((host, endpoint));
         }
         if let LateReplies::Content { .. } = late {
@@ -2477,7 +2570,7 @@ impl Dispatch {
 /// that decodes as a bound acknowledgement from a candidate is merged into the placement and its latency —
 /// from the round's dispatch to now — recorded into the owner shard's put-latency window. A superseded
 /// seal ignores the fold. Only a `LateReplies::Content` reaches here.
-fn fold_late_content(late: LateReplies, replies: &[Vec<u8>]) {
+fn fold_late_content(late: LateReplies, replies: &[(HostId, TimedReply)]) {
   let LateReplies::Content {
     shard,
     object,
@@ -2491,7 +2584,7 @@ fn fold_late_content(late: LateReplies, replies: &[Vec<u8>]) {
   };
   let acked: Vec<HostId> = replies
     .iter()
-    .filter_map(|bytes| match ContentMessage::decode(bytes) {
+    .filter_map(|(_, reply)| match ContentMessage::decode(&reply.bytes) {
       Ok(ContentMessage::Ack(ack)) if ack.binds(object, sequence, &manifest) => Some(ack.holder),
       _ => None,
     })
@@ -2514,9 +2607,16 @@ fn fold_late_content(late: LateReplies, replies: &[Vec<u8>]) {
   });
 }
 
-fn fold_late_replies(late: LateReplies, replies: &[Vec<u8>]) {
+/// Folds a consensus or learner-fetch round's late replies as `late` directs (see [`LateReplies`]). A late
+/// consensus reply also samples the path to its voter — the tail of the round trip is exactly what the
+/// election timing and the round budget must see.
+fn fold_late_replies(late: LateReplies, replies: &[(HostId, TimedReply)]) {
   state::with_state(|s| {
-    for bytes in replies {
+    if matches!(late, LateReplies::Council | LateReplies::Root) {
+      sample_voter_paths(s, replies);
+    }
+    for (_, reply) in replies {
+      let bytes = &reply.bytes;
       match late {
         LateReplies::Discard => {}
         LateReplies::Council => {
@@ -2604,29 +2704,6 @@ const ROOT_FETCH_STREAM: u64 = 10;
 /// leader; general volume-verb forwarding to a remotely-homed volume's owner is owed). The request is an
 /// encoded `RequestBody`, the reply an encoded `ReplyBody` ([`slates_ipc::protocol::encode_body`]).
 const FORWARD_STREAM: u64 = 11;
-
-/// The configuration council's election timeout, in record-plane heartbeat periods: a follower that goes
-/// this many periods without a leader's append presumes the leader gone and campaigns. The per-node spread
-/// ([`election_jitter`]) adds a further `[0, this)`, making the effective timeout uniform in `[this, 2·this)`
-/// — Raft's randomized-election-timeout range (§9.3), which keeps co-timed followers from splitting the vote.
-/// The design's absolute form, "election timeout ≥ 10 × broadcast RTT p99", is owed for a real WAN: measured
-/// here, both the SWIM probe RTT (p99 17 ms) and the consensus broadcast round-trip (p99 33 ms) stay far
-/// inside one heartbeat even under heavy CPU load, so a period-counted timeout derived from either sits at
-/// this floor and changes nothing on one host (docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md).
-/// Derived: ten is Raft's order-of-magnitude ratio of election timeout to heartbeat interval (Ongaro §9), so
-/// a live leader's per-period heartbeat refreshes contact well inside the window while a real leader loss is
-/// still detected within a bounded few periods.
-const ELECTION_HEARTBEATS: u32 = 10;
-
-/// A deterministic per-node offset in `[0, ELECTION_HEARTBEATS)` added to the election timeout so two
-/// followers that lose the leader in the same period do not campaign in lockstep and split the vote — the
-/// determinism-clean analogue of Raft's randomized election timeout (§9.3), reproducible in the simulator.
-/// It rotates each `attempt`, so a persistent split (two ids that collide modulo the window) breaks within a
-/// few attempts rather than by luck.
-fn election_jitter(local: HostId, attempt: u32) -> u32 {
-  let window = u64::from(ELECTION_HEARTBEATS);
-  u32::try_from(local.0.wrapping_add(u64::from(attempt)) % window).unwrap_or(0)
-}
 
 /// Answers one configuration-council Raft message a peer shipped on [`CONFIG_STREAM`] (§4.8, D-14): the
 /// council serves a pre-vote, a vote request, or an append — applying whatever an append newly commits to
@@ -2737,12 +2814,13 @@ async fn drive_council_replication(
   let mut recovered = kept;
   let mut replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
-    replies.push(reply.bytes);
+    replies.push((host, reply));
     recovered.push((host, endpoint));
   }
   state::with_state(|s| {
-    for reply in replies {
-      if let Ok(message) = RaftMessage::decode(&reply) {
+    sample_voter_paths(s, &replies);
+    for (_, reply) in replies {
+      if let Ok(message) = RaftMessage::decode(&reply.bytes) {
         s.council.fold_reply(message);
       }
     }
@@ -2790,7 +2868,7 @@ async fn drive_council_election(
   let mut sessions = Vec::with_capacity(replied.len());
   let mut pre_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
-    pre_replies.push(reply.bytes);
+    pre_replies.push((host, reply));
     sessions.push((host, endpoint));
   }
   // A voter whose pre-vote reply is late is settled by the coordinator: its session comes back then (the
@@ -2804,9 +2882,10 @@ async fn drive_council_election(
   // Fold the pre-vote replies; a granted majority yields the real vote request to broadcast next (the
   // follow-on of a pre-vote reply is always a vote request — the term is advanced only now).
   let vote = state::with_state(|s| {
+    sample_voter_paths(s, &pre_replies);
     let mut vote = None;
-    for reply in &pre_replies {
-      if let Ok(message) = RaftMessage::decode(reply)
+    for (_, reply) in &pre_replies {
+      if let Ok(message) = RaftMessage::decode(&reply.bytes)
         && let Some(request) = s.council.fold_reply(message).into_iter().next()
       {
         vote = Some(request);
@@ -2830,12 +2909,13 @@ async fn drive_council_election(
   let mut recovered = Vec::with_capacity(replied.len());
   let mut vote_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
-    vote_replies.push(reply.bytes);
+    vote_replies.push((host, reply));
     recovered.push((host, endpoint));
   }
   state::with_state(|s| {
-    for reply in vote_replies {
-      if let Ok(message) = RaftMessage::decode(&reply) {
+    sample_voter_paths(s, &vote_replies);
+    for (_, reply) in vote_replies {
+      if let Ok(message) = RaftMessage::decode(&reply.bytes) {
         s.council.fold_reply(message);
       }
     }
@@ -2881,9 +2961,7 @@ fn membership_diverges_from_config(state: &ShardState) -> bool {
 async fn drive_config_council(
   local: HostId,
   budget: CommitBudget,
-  idle: &mut u32,
-  seen_contact: &mut u64,
-  attempt: &mut u32,
+  timer: &mut ElectionTimer,
   in_flight: &mut Vec<Dispatch>,
 ) {
   let Some((is_voter, is_leader, contact, voters)) = state::with_state(|s| {
@@ -2919,6 +2997,10 @@ async fn drive_config_council(
     return;
   }
   let others: Vec<HostId> = voters.into_iter().filter(|voter| *voter != local).collect();
+  // This period's election timing, derived from the measured paths to the other voters (§4.8 "Derived
+  // constants"): ten times the slowest voter's round-trip tail, floored at ten periods — the floor on any
+  // loopback, and what `Daemon::council_timing` reports.
+  let timing = derive_group_timing(&others, |s, timing| s.council_timing = timing);
 
   if is_leader {
     // As the region's configuration master, track its membership from this node's own SWIM view: propose
@@ -2941,14 +3023,11 @@ async fn drive_config_council(
       s.council.reconcile_voters()
     });
     drive_council_replication(&others, budget, in_flight).await;
-    // CheckQuorum (Raft §6.2) on the election-timeout cadence: `idle` counts the leader's periods since its
-    // last tick; every [`ELECTION_HEARTBEATS`] of them the council judges whether a majority was heard from
-    // (the append replies folded above, timely or late) and steps this node down if not — so a leader cut
-    // off from its followers yields rather than sitting on a term it can no longer hold. The same counter
-    // ages a follower toward its election; either role resets it at its own timer event.
-    *idle = idle.saturating_add(1);
-    if *idle >= ELECTION_HEARTBEATS {
-      *idle = 0;
+    // CheckQuorum (Raft §6.2) on the election-timeout cadence: every derived base of leader periods the
+    // council judges whether a majority was heard from (the append replies folded above, timely or late)
+    // and steps this node down if not — so a leader cut off from its followers yields rather than sitting
+    // on a term it can no longer hold.
+    if timer.leader_period(&timing) {
       state::with_state(|s| s.council.check_quorum());
     }
     return;
@@ -2956,23 +3035,18 @@ async fn drive_config_council(
   if others.is_empty() {
     // The sole voter (a one-node council, the fleet degenerate): self-elect, then it leads next period.
     let _ = state::with_state(|s| s.council.election_timeout());
-    *idle = 0;
+    timer.reset();
     return;
   }
-  // A follower: reset the timer while the leader keeps making contact; otherwise age toward an election.
-  if contact != *seen_contact {
-    *seen_contact = contact;
-    *idle = 0;
-    return;
-  }
-  *idle = idle.saturating_add(1);
-  if *idle >= ELECTION_HEARTBEATS.saturating_add(election_jitter(local, *attempt)) {
-    *attempt = attempt.saturating_add(1);
-    *idle = 0;
+  // A follower: the timer resets while the leader keeps making contact; otherwise it ages toward its
+  // jittered timeout under this period's derived timing and campaigns there.
+  if timer.follower_period(contact, &timing, local) {
     drive_council_election(&others, budget, in_flight).await;
     // Re-baseline the contact counter so a fresh campaign is not immediately retriggered: a won election
     // makes this node leader next period; a lost one waits out the timer again.
-    *seen_contact = state::with_state(|s| s.council.leader_contact()).unwrap_or(*seen_contact);
+    if let Some(contact) = state::with_state(|s| s.council.leader_contact()) {
+      timer.rebaseline(contact);
+    }
   }
 }
 
@@ -3033,9 +3107,7 @@ fn root_diverges(state: &ShardState) -> bool {
 async fn drive_root_group(
   local: HostId,
   budget: CommitBudget,
-  idle: &mut u32,
-  seen_contact: &mut u64,
-  attempt: &mut u32,
+  timer: &mut ElectionTimer,
   in_flight: &mut Vec<Dispatch>,
 ) {
   let Some((is_voter, is_leader, contact, voters)) = state::with_state(|s| {
@@ -3062,6 +3134,8 @@ async fn drive_root_group(
     return;
   }
   let others: Vec<HostId> = voters.into_iter().filter(|voter| *voter != local).collect();
+  // This period's election timing over the paths to the other root voters, as the council's.
+  let timing = derive_group_timing(&others, |s, timing| s.root_timing = timing);
 
   if is_leader {
     // As the root master, reconcile the region membership from this node's own alive view: propose admitting
@@ -3078,12 +3152,10 @@ async fn drive_root_group(
       s.root.reconcile_voters(&representatives)
     });
     drive_root_replication(&others, budget, in_flight).await;
-    // CheckQuorum (Raft §6.2) on the election-timeout cadence, as the council's above: every
-    // [`ELECTION_HEARTBEATS`] leader periods the root group judges whether a majority of its voters was heard
-    // from and steps this node down if not.
-    *idle = idle.saturating_add(1);
-    if *idle >= ELECTION_HEARTBEATS {
-      *idle = 0;
+    // CheckQuorum (Raft §6.2) on the election-timeout cadence, as the council's above: every derived base
+    // of leader periods the root group judges whether a majority of its voters was heard from and steps
+    // this node down if not.
+    if timer.leader_period(&timing) {
       state::with_state(|s| s.root.check_quorum());
     }
     return;
@@ -3091,21 +3163,16 @@ async fn drive_root_group(
   if others.is_empty() {
     // The sole root voter (a single-region fleet's degenerate): self-elect, then it leads next period.
     let _ = state::with_state(|s| s.root.election_timeout());
-    *idle = 0;
+    timer.reset();
     return;
   }
-  // A follower: reset the timer while the leader keeps making contact; otherwise age toward an election.
-  if contact != *seen_contact {
-    *seen_contact = contact;
-    *idle = 0;
-    return;
-  }
-  *idle = idle.saturating_add(1);
-  if *idle >= ELECTION_HEARTBEATS.saturating_add(election_jitter(local, *attempt)) {
-    *attempt = attempt.saturating_add(1);
-    *idle = 0;
+  // A follower: the timer resets while the leader keeps making contact; otherwise it ages toward its
+  // jittered timeout under this period's derived timing and campaigns there.
+  if timer.follower_period(contact, &timing, local) {
     drive_root_election(&others, budget, in_flight).await;
-    *seen_contact = state::with_state(|s| s.root.leader_contact()).unwrap_or(*seen_contact);
+    if let Some(contact) = state::with_state(|s| s.root.leader_contact()) {
+      timer.rebaseline(contact);
+    }
   }
 }
 
@@ -3145,12 +3212,13 @@ async fn drive_root_replication(
   let mut recovered = kept;
   let mut replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
-    replies.push(reply.bytes);
+    replies.push((host, reply));
     recovered.push((host, endpoint));
   }
   state::with_state(|s| {
-    for reply in replies {
-      if let Ok(message) = RaftMessage::decode(&reply) {
+    sample_voter_paths(s, &replies);
+    for (_, reply) in replies {
+      if let Ok(message) = RaftMessage::decode(&reply.bytes) {
         s.root.fold_reply(message);
       }
     }
@@ -3192,7 +3260,7 @@ async fn drive_root_election(
   let mut sessions = Vec::with_capacity(replied.len());
   let mut pre_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
-    pre_replies.push(reply.bytes);
+    pre_replies.push((host, reply));
     sessions.push((host, endpoint));
   }
   // A voter whose pre-vote reply is late is settled by the coordinator: its session comes back then (the
@@ -3205,9 +3273,10 @@ async fn drive_root_election(
   ));
   // Fold the pre-vote replies; a granted majority yields the real vote request to broadcast next.
   let vote = state::with_state(|s| {
+    sample_voter_paths(s, &pre_replies);
     let mut vote = None;
-    for reply in &pre_replies {
-      if let Ok(message) = RaftMessage::decode(reply)
+    for (_, reply) in &pre_replies {
+      if let Ok(message) = RaftMessage::decode(&reply.bytes)
         && let Some(request) = s.root.fold_reply(message).into_iter().next()
       {
         vote = Some(request);
@@ -3231,12 +3300,13 @@ async fn drive_root_election(
   let mut recovered = Vec::with_capacity(replied.len());
   let mut vote_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
-    vote_replies.push(reply.bytes);
+    vote_replies.push((host, reply));
     recovered.push((host, endpoint));
   }
   state::with_state(|s| {
-    for reply in vote_replies {
-      if let Ok(message) = RaftMessage::decode(&reply) {
+    sample_voter_paths(s, &vote_replies);
+    for (_, reply) in vote_replies {
+      if let Ok(message) = RaftMessage::decode(&reply.bytes) {
         s.root.fold_reply(message);
       }
     }
@@ -3487,7 +3557,7 @@ fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
 /// shard round-trip) can tell a coordinator that is merely **slow under CPU load** (still cycling, fewer
 /// periods per wall-second) from one that has **stalled** (no bump). A test's `poll_until` charges its budget
 /// against these periods, not wall-clock, so a correct-but-starved operation is never falsely failed.
-async fn run_record_plane(local: HostId, budget: CommitBudget, progress: &'static AtomicU64) {
+async fn run_record_plane(local: HostId, progress: &'static AtomicU64) {
   let Some(authority) = owner_authority(local) else {
     return;
   };
@@ -3499,44 +3569,29 @@ async fn run_record_plane(local: HostId, budget: CommitBudget, progress: &'stati
   // (`CommitBudget::max_deadline_ns`), so at most that span's worth of periods' dispatches are ever held.
   let mut in_flight: Vec<Dispatch> = Vec::new();
   // The configuration council is driven from this one coordinator (§4.8, D-14): its brief borrow of the
-  // voter sessions is sequential with the record ships below, so it never contends for them. These persist
-  // across periods — the election timer (a follower ages toward a campaign on it; a leader ticks CheckQuorum
-  // on it), the last leader contact it saw, and its jitter rotation.
-  let mut council_idle: u32 = 0;
-  let mut council_seen_contact: u64 = 0;
-  let mut council_attempt: u32 = 0;
-  // The root group's own election-timer state (§4.8, D-14 — the cross-region authority), distinct from the
+  // voter sessions is sequential with the record ships below, so it never contends for them. Its election
+  // timer persists across periods (a follower ages toward a campaign on it; a leader ticks CheckQuorum on it;
+  // it keeps the last leader contact it saw and its jitter rotation).
+  let mut council_timer = ElectionTimer::new();
+  // The root group's own election timer (§4.8, D-14 — the cross-region authority), distinct from the
   // council's: it is a separate Raft over the region representatives, driven from this same coordinator.
-  let mut root_idle: u32 = 0;
-  let mut root_seen_contact: u64 = 0;
-  let mut root_attempt: u32 = 0;
+  let mut root_timer = ElectionTimer::new();
   loop {
     // Forward-progress heartbeat: one bump per coordinator period. An observer reads it to tell a fleet that
     // is slow under CPU load (still cycling) from one that has stalled (no bump) — see `progress`.
     progress.fetch_add(1, Ordering::Relaxed);
     in_flight.retain_mut(|dispatch| !dispatch.settle());
+    // This period's round budget, derived from the slowest measured peer path — every dispatch below (a
+    // council or root round, a record commit, a takeover promotion, a content put, a learner fetch) gathers
+    // replies from peers, so the round must outlast the farthest one's round trip ([`consensus_budget`]).
+    // On one host every path is inside a heartbeat and this is the budget it always was (R8).
+    let budget = consensus_budget(slowest_path_tail_ns());
     // Drive the configuration authority first — an election or a replication heartbeat over the transport —
     // then the records under the configuration it maintains.
-    drive_config_council(
-      local,
-      budget,
-      &mut council_idle,
-      &mut council_seen_contact,
-      &mut council_attempt,
-      &mut in_flight,
-    )
-    .await;
+    drive_config_council(local, budget, &mut council_timer, &mut in_flight).await;
     // Drive the root group across regions on the same coordinator (§4.8, D-14): a brief borrow of the
     // root-voter sessions, sequential with the council's and the record ships, so it never contends.
-    drive_root_group(
-      local,
-      budget,
-      &mut root_idle,
-      &mut root_seen_contact,
-      &mut root_attempt,
-      &mut in_flight,
-    )
-    .await;
+    drive_root_group(local, budget, &mut root_timer, &mut in_flight).await;
     // Install the configuration the council has agreed into this node's placement view, and take over any
     // object whose owner the council has now retired (§4.8, D-14 — the council is the authority; a departed
     // owner's objects that rendezvous first to this node over the new neighbourhood are owed a phase-one
@@ -3602,7 +3657,7 @@ async fn run_record_period(
     move |s| {
       let slice_bytes = s.config.archive_slice_bytes;
       let created_unix = u64::try_from(s.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND;
-      advance_seals(s, local, slice_bytes, created_unix)
+      advance_seals(s, local, slice_bytes, created_unix, budget)
     },
     HEARTBEAT_NS,
   )
@@ -3970,26 +4025,28 @@ mod tests {
   fn the_probe_deadline_is_derived_from_the_round_trip_backed_off_and_capped() {
     let mut timing = ProbeTiming::new();
     assert_eq!(
-      timing.deadline_ns(),
-      RttEstimator::new().pto(0),
+      timing.deadline_ns(None),
+      RttEstimator::new().initial_pto(),
       "before any sample: the initial probe timeout"
     );
     // The measured quiet-loopback probe round trip (p99 17 ms): its probe timeout sits below the beat.
-    timing.acknowledged(17 * MS);
+    let mut path = PathRtt::new();
+    path.on_sample(17 * MS);
+    timing.acknowledged();
     assert_eq!(
-      timing.deadline_ns(),
+      timing.deadline_ns(path.tail_ns()),
       HEARTBEAT_NS,
       "a quiet round trip floors the deadline at the beat"
     );
     timing.missed();
     assert_eq!(
-      timing.deadline_ns(),
+      timing.deadline_ns(path.tail_ns()),
       2 * HEARTBEAT_NS,
       "one miss doubles it"
     );
     timing.missed();
     assert_eq!(
-      timing.deadline_ns(),
+      timing.deadline_ns(path.tail_ns()),
       4 * HEARTBEAT_NS,
       "two misses quadruple it"
     );
@@ -3997,29 +4054,30 @@ mod tests {
       timing.missed();
     }
     assert_eq!(
-      timing.deadline_ns(),
+      timing.deadline_ns(path.tail_ns()),
       LIVENESS_BUDGET_NS,
       "however many misses, the liveness budget caps it"
     );
-    timing.acknowledged(17 * MS);
+    timing.acknowledged();
     assert_eq!(
-      timing.deadline_ns(),
+      timing.deadline_ns(path.tail_ns()),
       HEARTBEAT_NS,
       "an acknowledgement resets the backoff"
     );
 
     // A slow peer — its acknowledgements take 300 ms — is waited for above the floor, within the cap.
-    let mut slow = ProbeTiming::new();
-    slow.acknowledged(300 * MS);
+    let mut slow_path = PathRtt::new();
+    slow_path.on_sample(300 * MS);
+    let slow = ProbeTiming::new();
+    let deadline = slow.deadline_ns(slow_path.tail_ns());
     assert!(
-      slow.deadline_ns() > HEARTBEAT_NS && slow.deadline_ns() <= LIVENESS_BUDGET_NS,
-      "a slow peer's deadline follows its round trip: {} ns",
-      slow.deadline_ns()
+      deadline > HEARTBEAT_NS && deadline <= LIVENESS_BUDGET_NS,
+      "a slow peer's deadline follows its round trip: {deadline} ns"
     );
     assert_eq!(
-      slow.deadline_ns(),
-      slow.rtt.pto(0),
-      "above the floor the deadline is the estimator's probe timeout itself"
+      Some(deadline),
+      slow_path.tail_ns(),
+      "above the floor the deadline is the path's measured tail itself"
     );
   }
 
@@ -4139,7 +4197,7 @@ mod tests {
   fn a_round_with_no_acknowledgement_at_the_hedge_delay_expires_rather_than_extends() {
     let mut latency = PutLatency::default();
     latency.record(10 * MS);
-    let budget = content_budget(&latency);
+    let budget = content_budget(&latency, consensus_budget(None));
     let hedge_delay = hedge_delay_ns(&latency);
     let started = 1_000 * MS;
     let mut wait = DispatchWait::new(budget, started);

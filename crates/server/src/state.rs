@@ -338,6 +338,21 @@ pub struct ShardState {
   /// which the link task re-establishes; a retired peer's entry is removed with it. Empty on a laptop (no
   /// fleet loop runs).
   pub record_sessions: BTreeMap<slates_db::HostId, Option<slates_transport::endpoint::Endpoint>>,
+  /// The measured **path** to each peer (§4.8 "Derived constants": "election timeout ≥ 10 × broadcast RTT
+  /// p99"; `slates_cluster::timing::PathRtt`): the transport's RFC 9002 estimator over every round trip
+  /// this node timed to that peer — its SWIM probe's acknowledgement each period, and every consensus
+  /// round's reply, timely or late. One estimate per path, read by the probe's deadline law
+  /// (`crate::fleet::ProbeTiming`), the council's and root group's election timing, and the coordinator's
+  /// round budget. Bounded by the roster: an entry per rostered peer, removed with a retired id. Empty on a
+  /// laptop (no peers, no fleet loop).
+  pub peer_paths: BTreeMap<slates_db::HostId, slates_cluster::timing::PathRtt>,
+  /// The configuration council's election timing as derived this period from the paths to its other
+  /// voters (the floor with none measured): the base and span in coordinator periods, the tail and spread
+  /// they came from, and the samples behind them — what `Daemon::council_timing` reports. Only the control
+  /// shard derives it; a laptop's stays at the floor.
+  pub council_timing: slates_cluster::timing::ElectionTiming,
+  /// The root group's election timing, derived as the council's is over the root voters' paths.
+  pub root_timing: slates_cluster::timing::ElectionTiming,
   /// What this node holds as a **content candidate** for other owners' snapshots (§4.10 "Content
   /// replication"): the distinct chunks by identity and each manifest held whole, verified before
   /// anything is stored — served on the record session's content stream by the fleet loop. It is what
