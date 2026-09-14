@@ -62,8 +62,11 @@ pub(crate) struct Listing {
   pub(crate) dir: HostDir,
   fingerprint: Option<Fingerprint>,
   entries: Option<Vec<BaseEntry>>,
-  /// The volume clock when the entries were read, for the racy rule.
-  read_at_ns: u64,
+  /// The host's clock when the entries were read (`HostFs::now_ns`, the fingerprints' own
+  /// domain), for the racy rule (§4.5): a witness is racy when the listing was read within the
+  /// timestamp granularity of the file's last change, a comparison that only means something
+  /// between two readings of the filesystem's clock.
+  read_at_ns: i64,
   watch: WatchState,
 }
 
@@ -604,7 +607,11 @@ impl Overlay<'_> {
   /// them; unloaded (unwitnessed) entries the disk no longer has leave the node.
   fn load_listing(&mut self, store: &mut Store, dir: Handle<DirNode>) -> Result<(), VfsError> {
     let dir_no = store.dirs.get(dir)?.inode;
-    let now = self.vol.clock.monotonic_ns();
+    // The read time is taken from the host's clock, never the volume's: the racy rule compares
+    // it with the files' timestamps, which live in the host's domain (the daemon's `HostClock`
+    // counts from its own creation, so a subtraction across the two domains called every
+    // witness racy — docs/bugs/2026-09-14-racy-rule-compares-monotonic-with-wall-clock.md).
+    let now = self.host.now_ns();
     let policy = self.vol.policy;
     let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
     let listing = plane
@@ -1522,7 +1529,6 @@ impl Overlay<'_> {
       })
       .unwrap_or(0);
     let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
-    let read_at = i64::try_from(read_at).unwrap_or(i64::MAX);
     let racy = read_at.saturating_sub(fp.mtime_ns) <= granularity;
     let bytes = self.read_whole(file, fp.size)?;
     let identity = *blake3::hash(&bytes).as_bytes();

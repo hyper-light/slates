@@ -145,12 +145,14 @@ fn create_over_a_base_costs_one_open_and_no_memory_whatever_the_tree_size() {
 }
 
 /// The base of the worked example: `src/lib.rs` and `src/main.rs`, with `lib.rs` read once
-/// and then edited by the agent (copied up).
+/// and then edited by the agent (copied up). The files' timestamp tick closes before the volume
+/// lists them, as on a real disk written before the agent starts, so the witness is not racy.
 fn worked_example() -> (SimHost, Store, Volume, slates_vfs::ids::InodeNo) {
   let mut host = SimHost::new();
   host.mkdir("/src");
   host.replace_file("/src/lib.rs", b"pub fn lib() {}");
   host.replace_file("/src/main.rs", b"fn main() {}");
+  host.advance_ns(2);
   let mut store = store();
   let mut vol = overlay(&mut host, &mut store);
   assert_eq!(
@@ -347,6 +349,58 @@ fn a_racy_in_place_edit_is_caught_by_rehashing() {
   assert_eq!(
     vol.with_host(&mut host).status(&mut store).unwrap().drift,
     vec![("/notes.txt".to_owned(), DriftKind::Modified)]
+  );
+}
+
+/// Format: a wall-clock instant at Unix scale (2023-11-14T22:13:20Z in nanoseconds), where a
+/// real host's file timestamps live.
+const UNIX_SCALE_NS: i64 = 1_700_000_000_000_000_000;
+
+/// The racy rule (§4.5) is a question about the filesystem's clock: a witness is racy only when
+/// the listing was read within the timestamp granularity of the file's last change *in the host's
+/// clock*. With the daemon's own clock (`HostClock`, monotonic nanoseconds since the clock was
+/// made) and a host whose timestamps sit at Unix scale, a file a whole second older than the
+/// listing is not racy; comparing the two clock domains called every such witness racy and
+/// re-hashed every drift check (docs/bugs/2026-09-14-racy-rule-compares-monotonic-with-wall-clock.md).
+#[test]
+fn a_witness_is_racy_only_within_the_hosts_own_clock() {
+  let mut host = SimHost::new();
+  host.set_granularity_ns(1_000);
+  host.advance_ns(UNIX_SCALE_NS);
+  host.replace_file("/old.txt", b"written a second ago");
+  host.advance_ns(1_000_000_000);
+  let mut store = store();
+  let root = host.root();
+  let facts = host.facts(root).unwrap();
+  let mut vol = Volume::create_overlay(
+    &mut store,
+    VolumeConfig {
+      prefix: 7,
+      names: NameEquivalence::Exact,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 20,
+      clock: Box::new(slates_vfs::clock::HostClock::new()),
+    },
+    BaseConfig {
+      root,
+      facts,
+      large_class_bytes: LARGE,
+    },
+  )
+  .unwrap();
+  let f = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/old.txt")
+    .unwrap()
+    .inode;
+  vol
+    .with_host(&mut host)
+    .chmod(&mut store, f, 0o600)
+    .unwrap();
+  let witness = vol.base_plane().unwrap().witness(f).unwrap();
+  assert!(
+    !witness.racy,
+    "a file a second older than the listing, at a microsecond granularity, is not racy"
   );
 }
 
