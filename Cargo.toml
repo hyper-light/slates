@@ -105,8 +105,9 @@ unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "deny"
 unused_must_use = "deny"
 unreachable_pub = "warn"
-# `--cfg loom` selects loom's atomics for the interleaving tests (AC-0.7).
-unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)"] }
+# `--cfg loom` selects loom's atomics for the interleaving tests (AC-0.7); `--cfg shuttle` builds
+# the randomized-schedule tests of the pure cores (T-1.6, T-6.7) against the shuttle dev-dependency.
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(loom)", "cfg(shuttle)"] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

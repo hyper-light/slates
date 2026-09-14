@@ -20,7 +20,8 @@
 //! formulas live next to their values as `Derived` (§4.2, "Derived constants").
 //!
 //! Modules: [`handle`], [`segmented`], [`slab`], [`buddy`], [`region`], [`lock`], [`prefault`],
-//! [`arena`], [`ring`], [`mpsc`], [`budget`], [`error`].
+//! [`arena`], [`ring`], [`mpsc`], [`budget`], [`error`]; under `--cfg loom`, `loom_bounds` holds
+//! the exploration bounds every loom model in the workspace checks through (AC-0.7).
 
 pub mod arena;
 pub mod buddy;
@@ -28,6 +29,8 @@ pub mod budget;
 pub mod error;
 pub mod handle;
 pub mod lock;
+#[cfg(loom)]
+pub mod loom_bounds;
 pub mod mpsc;
 pub mod prefault;
 pub mod region;

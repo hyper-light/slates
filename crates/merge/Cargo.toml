@@ -14,5 +14,10 @@ blake3 = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 
+# shuttle builds only under `RUSTFLAGS="--cfg shuttle"` for the sixteen-agent randomized schedule of
+# T-6.7 (`tests/shuttle_green.rs`); a dev-dependency, so nothing shipped links it.
+[target.'cfg(shuttle)'.dev-dependencies]
+shuttle = "0.9"
+
 [lints]
 workspace = true

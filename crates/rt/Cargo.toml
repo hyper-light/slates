@@ -22,6 +22,11 @@ io-uring = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
+# loom builds only under `RUSTFLAGS="--cfg loom"` for the parking protocol's interleaving model
+# (AC-0.7); the memory crate's rings swap to loom's atomics under the same flag.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [dev-dependencies]
 iai-callgrind = { workspace = true }
 

@@ -22,15 +22,17 @@
 //! executor uses `Waker` with a vtable that is thread-safe by construction; the `Copy` encoding
 //! costs nothing to clone, which is what `LocalWaker` would have saved (Phase 0 task 6).
 //!
-//! Modules: [`error`], [`control`], [`waker`], [`registry`], [`task`], [`queue`], [`timer`],
-//! [`driver`], [`sim`], [`shard`], [`runtime`], [`futures`], the async sockets ([`udp`] everywhere and
-//! `tcp` on Unix — the NFS mount server's, over one shared readiness future), and the OS drivers.
+//! Modules: [`error`], [`control`], [`waker`], [`registry`], [`parking`] (the kick-if-parked
+//! protocol and its loom model), [`task`], [`queue`], [`timer`], [`driver`], [`sim`], [`shard`],
+//! [`runtime`], [`futures`], the async sockets ([`udp`] everywhere and `tcp` on Unix — the NFS
+//! mount server's, over one shared readiness future), and the OS drivers.
 
 pub mod control;
 pub mod driver;
 pub mod error;
 pub mod futures;
 mod netsys;
+pub mod parking;
 pub mod queue;
 pub mod readiness;
 pub mod registry;

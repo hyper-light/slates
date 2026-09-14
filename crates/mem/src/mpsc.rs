@@ -189,36 +189,131 @@ mod tests {
   }
 }
 
-#[cfg(all(test, loom))]
+// Two attributes rather than `all(test, loom)`: clippy's test-context rule (unwrap allowed in
+// tests) recognizes only a bare `cfg(test)`, and an unwrap here is a failed model, as it should be.
+#[cfg(test)]
+#[cfg(loom)]
 mod loom_tests {
-  use super::*;
+  use std::sync::atomic::{AtomicU64, Ordering as StdOrdering};
 
-  #[test]
-  fn every_interleaving_of_two_producers_and_one_consumer_loses_nothing() {
-    loom::model(|| {
-      let ring: &'static MpscRing = Box::leak(Box::new(MpscRing::new(2).unwrap()));
-      let a = loom::thread::spawn(move || {
-        while ring.push(1).is_err() {
-          loom::thread::yield_now();
-        }
-      });
-      let b = loom::thread::spawn(move || {
-        while ring.push(2).is_err() {
-          loom::thread::yield_now();
-        }
-      });
-      let mut c = ring.consumer();
+  use super::*;
+  use crate::loom_bounds;
+
+  /// Format: a word is `producer << 32 | sequence`, so the consumer can attribute it.
+  const PRODUCER_SHIFT: u32 = 32;
+
+  /// Full-ring refusals met across every explored interleaving of the lapping model (a plain
+  /// counter outside loom's model: the non-vacuity check that the refusal path ran).
+  static REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+  /// Runs `producers` threads each pushing `words_per_producer` words through a ring of
+  /// `capacity` slots into one consumer, under every explored interleaving, and asserts that
+  /// every word arrives exactly once and each producer's order is kept; a word refused by a
+  /// full ring is handed back and lands on the retry.
+  fn producers_into_one_consumer(
+    name: &str,
+    capacity: usize,
+    producers: u64,
+    words_per_producer: u64,
+  ) {
+    loom_bounds::explore(name, move || {
+      let ring: &'static MpscRing = Box::leak(Box::new(MpscRing::new(capacity).unwrap()));
+      let pushing: Vec<_> = (0..producers)
+        .map(|producer| {
+          loom::thread::spawn(move || {
+            for sequence in 0..words_per_producer {
+              let mut pending = (producer << PRODUCER_SHIFT) | sequence;
+              while let Err(back) = ring.push(pending) {
+                REFUSALS.fetch_add(1, StdOrdering::Relaxed);
+                pending = back;
+                loom::thread::yield_now();
+              }
+            }
+          })
+        })
+        .collect();
+      let mut consumer = ring.consumer();
       let mut got = Vec::new();
-      while got.len() < 2 {
-        match c.pop() {
-          Some(v) => got.push(v),
+      let total = usize::try_from(producers * words_per_producer).unwrap();
+      while got.len() < total {
+        match consumer.pop() {
+          Some(word) => got.push(word),
           None => loom::thread::yield_now(),
         }
       }
-      a.join().unwrap();
-      b.join().unwrap();
-      got.sort_unstable();
-      assert_eq!(got, vec![1, 2]);
+      for producer in pushing {
+        producer.join().unwrap();
+      }
+      assert_eq!(consumer.pop(), None, "nothing beyond the words pushed");
+      assert!(ring.is_empty());
+      let mut every_word = got.clone();
+      every_word.sort_unstable();
+      let expected: Vec<u64> = (0..producers)
+        .flat_map(|producer| {
+          (0..words_per_producer).map(move |sequence| (producer << PRODUCER_SHIFT) | sequence)
+        })
+        .collect();
+      assert_eq!(every_word, expected, "every word exactly once");
+      for producer in 0..producers {
+        let in_order: Vec<u64> = got
+          .iter()
+          .filter(|word| *word >> PRODUCER_SHIFT == producer)
+          .map(|word| word & ((1 << PRODUCER_SHIFT) - 1))
+          .collect();
+        assert_eq!(
+          in_order,
+          (0..words_per_producer).collect::<Vec<u64>>(),
+          "producer {producer}'s order kept"
+        );
+      }
     });
+  }
+
+  /// Shape: producers in the contention model — the design's "two producers" (T-0.3), the
+  /// fewest that contend on the tail's compare-and-swap.
+  const CONTENDING_PRODUCERS: u64 = 2;
+  /// Shape: words per contending producer — two, so each producer has an order the consumer
+  /// must keep across the other's interleaved claims.
+  const CONTENDING_WORDS: u64 = 2;
+  /// Shape: the contention model's capacity — every word fits at once, so the model isolates
+  /// the claim race (a producer following a tail another moved) from the full-ring wait, which
+  /// the lapping model covers with one spinner; loom explores two spinners' voluntary yields
+  /// into executions past any honest bound (measured 2026-09-13, `docs/wip/concurrency.md`).
+  const CONTENDING_CAPACITY: usize = 4;
+
+  /// T-0.3 (AC-0.7): every interleaving of two producers and one consumer, the producers
+  /// contending for slots, delivers every word exactly once and keeps each producer's order.
+  #[test]
+  fn every_interleaving_of_two_contending_producers_keeps_each_order_and_loses_nothing() {
+    producers_into_one_consumer(
+      "mpsc ring, two contending producers",
+      CONTENDING_CAPACITY,
+      CONTENDING_PRODUCERS,
+      CONTENDING_WORDS,
+    );
+  }
+
+  /// Shape: the lapping model's capacity, the smallest power of two at which the producer meets
+  /// a full ring and the sequence numbers lap within the model's words.
+  const LAPPING_CAPACITY: usize = 2;
+  /// Shape: words in the lapping model, one more than the capacity, so every execution meets a
+  /// full ring with its refusal retried and pushes into the second lap.
+  const LAPPING_WORDS: u64 = 3;
+
+  /// T-0.3 (AC-0.7): every interleaving of a producer lapping a two-slot ring and its consumer
+  /// delivers the words in order, none lost, none duplicated; the full-ring refusal hands the
+  /// word back and the retry lands it; at least one interleaving met a full ring.
+  #[test]
+  fn every_interleaving_of_a_producer_lapping_the_ring_is_fifo_without_loss() {
+    producers_into_one_consumer(
+      "mpsc ring, one producer lapping the ring",
+      LAPPING_CAPACITY,
+      1,
+      LAPPING_WORDS,
+    );
+    assert!(
+      REFUSALS.load(StdOrdering::Relaxed) > 0,
+      "some interleaving met a full ring and retried"
+    );
   }
 }

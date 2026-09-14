@@ -189,31 +189,64 @@ mod tests {
   }
 }
 
-#[cfg(all(test, loom))]
+// Two attributes rather than `all(test, loom)`: clippy's test-context rule (unwrap allowed in
+// tests) recognizes only a bare `cfg(test)`, and an unwrap here is a failed model, as it should be.
+#[cfg(test)]
+#[cfg(loom)]
 mod loom_tests {
-  use super::*;
+  use std::sync::atomic::{AtomicU64, Ordering as StdOrdering};
 
+  use super::*;
+  use crate::loom_bounds;
+
+  /// Shape: the ring's capacity in the model, the smallest power of two at which the producer
+  /// meets a full ring and both indices wrap within the model's words.
+  const CAPACITY: usize = 2;
+  /// Shape: the words pushed, one more than the capacity, so every execution covers a full ring
+  /// with its refusal retried and one wrap of the head and the tail.
+  const WORDS: u64 = 3;
+
+  /// Full-ring refusals met across every explored interleaving (a plain counter outside loom's
+  /// model, so a silently-dead refusal path can never masquerade as a passing model).
+  static REFUSALS: AtomicU64 = AtomicU64::new(0);
+
+  /// T-0.3 (AC-0.7): every interleaving of one producer and one consumer over a two-slot ring
+  /// delivers the three words in order, none lost, none duplicated; a word refused by a full
+  /// ring is handed back and lands on the retry; at least one interleaving met a full ring.
   #[test]
   fn every_interleaving_of_one_producer_and_one_consumer_is_fifo_without_loss() {
-    loom::model(|| {
-      let ring: &'static SpscRing = Box::leak(Box::new(SpscRing::new(2).unwrap()));
-      let (mut p, mut c) = ring.split();
-      let producer = loom::thread::spawn(move || {
-        for i in 1..=3u64 {
-          while p.push(i).is_err() {
+    loom_bounds::explore("spsc ring, one producer and one consumer", || {
+      let ring: &'static SpscRing = Box::leak(Box::new(SpscRing::new(CAPACITY).unwrap()));
+      let (mut producer, mut consumer) = ring.split();
+      let pushing = loom::thread::spawn(move || {
+        for word in 1..=WORDS {
+          let mut pending = word;
+          while let Err(back) = producer.push(pending) {
+            REFUSALS.fetch_add(1, StdOrdering::Relaxed);
+            pending = back;
             loom::thread::yield_now();
           }
         }
       });
       let mut got = Vec::new();
-      while got.len() < 3 {
-        match c.pop() {
-          Some(v) => got.push(v),
+      while got.len() < usize::try_from(WORDS).unwrap() {
+        match consumer.pop() {
+          Some(word) => got.push(word),
           None => loom::thread::yield_now(),
         }
       }
-      producer.join().unwrap();
-      assert_eq!(got, vec![1, 2, 3]);
+      pushing.join().unwrap();
+      assert_eq!(
+        got,
+        (1..=WORDS).collect::<Vec<u64>>(),
+        "in order, nothing lost, nothing duplicated"
+      );
+      assert_eq!(consumer.pop(), None, "nothing beyond the words pushed");
+      assert!(ring.is_empty());
     });
+    assert!(
+      REFUSALS.load(StdOrdering::Relaxed) > 0,
+      "some interleaving met a full ring and retried"
+    );
   }
 }

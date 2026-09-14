@@ -697,33 +697,35 @@ impl ShardContext {
     }
   }
 
-  /// Parks in the driver until a kick, a completion or `deadline_ns`.
+  /// Parks in the driver until a kick, a completion or `deadline_ns`. The parking announcement
+  /// comes first and the inbox re-check second, so a message that landed between the loop's last
+  /// look and here is seen now, and one that lands after sees the announcement and kicks (the
+  /// protocol and its loom model: [`crate::parking`]).
   pub fn park(&'static self, deadline_ns: Option<u64>) {
-    // Parked first, then the re-check: a message that landed between the loop's last look and
-    // here is seen now, and one that lands after sees the flag and kicks (both sides are
-    // sequentially consistent; see `registry::kick_if_parked`).
-    if let Some(entry) = self.entry {
-      entry
-        .parked
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-      if self.has_inbound() {
-        entry
-          .parked
-          .store(false, std::sync::atomic::Ordering::SeqCst);
-        return;
+    let mut lost = false;
+    match self.entry {
+      Some(entry) => {
+        entry.parking.park_unless_pending(
+          || self.has_inbound(),
+          || lost = self.wait_in_driver(deadline_ns),
+        );
       }
+      None => lost = self.wait_in_driver(deadline_ns),
     }
-    let lost = self
+    if lost {
+      self.fail_all();
+    }
+  }
+
+  /// The driver's blocking wait until a kick, a completion or `deadline_ns`, its completions
+  /// queued; true when the driver was lost.
+  fn wait_in_driver(&'static self, deadline_ns: Option<u64>) -> bool {
+    self
       .with_inner(|inner| {
         inner.counters.waits += 1;
         let timeout = deadline_ns.map(|d| d.saturating_sub(inner.driver.now_ns()));
         let mut completions = std::mem::take(&mut inner.completions);
         let result = inner.driver.wait(timeout, &mut completions);
-        if let Some(entry) = self.entry {
-          entry
-            .parked
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        }
         for c in completions.drain(..) {
           inner.counters.completions += 1;
           self.local.push(Encoded::from_word(c.user_data).slot());
@@ -741,10 +743,7 @@ impl ShardContext {
           }
         }
       })
-      .unwrap_or(false);
-    if lost {
-      self.fail_all();
-    }
+      .unwrap_or(false)
   }
 
   /// Cancels every task with a terminal completion and exits: the driver is gone.
