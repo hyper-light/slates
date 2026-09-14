@@ -2722,6 +2722,7 @@ fn edit(
   let Some(w) = state.works.get_mut(&work_id) else {
     return refused(Refusal::NotFound);
   };
+  let path = crate::merge_service::canonical_path(path);
   let is_new = !w.content.contains_key(path);
   let old_len = w.content.get(path).map_or(0, |c| c.len() as u64);
   {
@@ -2776,24 +2777,45 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
   let Some(w) = state.works.get_mut(&work_id) else {
     return refused(Refusal::NotFound);
   };
+  // Every path the operation names is keyed canonically (no leading slash), as `edit` keys its
+  // path and the origin walk its entries; a symlink's target is a link string, kept as given.
+  let key = |path: String| crate::merge_service::canonical_path(&path).to_owned();
   let volume_op = match op {
     WorkOp::Unlink { path } => {
+      let path = key(path);
       w.content.remove(&path);
       VolumeOp::Unlink { path }
     }
     WorkOp::Rename { from, to } => {
+      let (from, to) = (key(from), key(to));
       if let Some(bytes) = w.content.remove(&from) {
         w.content.insert(to.clone(), bytes);
       }
       VolumeOp::Rename { from, to }
     }
-    WorkOp::Mkdir { path } => VolumeOp::Mkdir { path },
-    WorkOp::Rmdir { path } => VolumeOp::Rmdir { path },
-    WorkOp::SetMode { path, mode } => VolumeOp::SetMode { path, mode },
-    WorkOp::Symlink { path, target } => VolumeOp::Symlink { path, target },
-    WorkOp::Link { path, target } => VolumeOp::Link { path, target },
-    WorkOp::SetXattr { path, name, value } => VolumeOp::SetXattr { path, name, value },
-    WorkOp::RemoveXattr { path, name } => VolumeOp::RemoveXattr { path, name },
+    WorkOp::Mkdir { path } => VolumeOp::Mkdir { path: key(path) },
+    WorkOp::Rmdir { path } => VolumeOp::Rmdir { path: key(path) },
+    WorkOp::SetMode { path, mode } => VolumeOp::SetMode {
+      path: key(path),
+      mode,
+    },
+    WorkOp::Symlink { path, target } => VolumeOp::Symlink {
+      path: key(path),
+      target,
+    },
+    WorkOp::Link { path, target } => VolumeOp::Link {
+      path: key(path),
+      target: key(target),
+    },
+    WorkOp::SetXattr { path, name, value } => VolumeOp::SetXattr {
+      path: key(path),
+      name,
+      value,
+    },
+    WorkOp::RemoveXattr { path, name } => VolumeOp::RemoveXattr {
+      path: key(path),
+      name,
+    },
   };
   w.journal.push(volume_op);
   ReplyBody::Declared

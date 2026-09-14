@@ -105,6 +105,13 @@ pub(crate) enum MergeRole {
   },
 }
 
+/// A path as the merge plane keys it: the volume's absolute path without its leading slashes (the
+/// form the origin walk produces and the ops document names), so a declaration made with a leading
+/// slash and a read without one meet the same entry.
+pub(crate) fn canonical_path(path: &str) -> &str {
+  path.trim_start_matches('/')
+}
+
 /// The merge role of `volume`, or `None` for a plain volume or one with no record.
 pub(crate) fn merge_role(state: &ShardState, volume: DbVolumeId) -> Option<MergeRole> {
   let record = state.db.partition().volume(volume)?;
@@ -475,7 +482,7 @@ pub(crate) fn read(
   if !rights_of(&record, principal).read {
     return forbidden("read");
   }
-  let key = path.trim_start_matches('/');
+  let key = canonical_path(path);
   match record.policy.role {
     Role::Green { .. } => read_green(state, record.id, key, at),
     Role::Work { .. } => match at {

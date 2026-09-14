@@ -455,6 +455,73 @@ fn json_merge_queries(instance: &str) {
     out.trim().starts_with('{') && out.contains("\"accepted\":true"),
     "submit json accepted: {out}"
   );
+  json_merge_reader(instance, &green);
+}
+
+/// A green reader through the CLI (§4.16 "Attachments and versions"; AC-6.13/T-6.15): `attach GREEN
+/// --read --json` pins the head version (`"version":1`); a second work lands version 2 with a new file;
+/// `read GREEN PATH --attachment A` still refuses the new file (exit 1, the pinned view) while `read
+/// GREEN PATH` at the head streams it; `advance A --json` re-pins to 2 naming the invalidated path;
+/// then the attached read streams the bytes.
+fn json_merge_reader(instance: &str, green: &str) {
+  let attachment = json_merge_reader_pins(instance, green);
+  json_merge_reader_advances(instance, green, &attachment);
+}
+
+/// The attach pins version 1; a second work lands version 2; the attached read refuses the later file
+/// while the head streams it. Returns the attachment id.
+fn json_merge_reader_pins(instance: &str, green: &str) -> String {
+  let (code, out, err) = run(instance, &["attach", green, "--read", "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.contains("\"version\":1"),
+    "a green attachment pins the head: {out}"
+  );
+  let attachment = json_field(&out, "attachment");
+  json_land_second_version(instance, green);
+  let (code, _, err) = run(
+    instance,
+    &["read", green, "/g.txt", "--attachment", &attachment],
+  );
+  assert_eq!(code, 1, "the pinned view lacks the later file: {err}");
+  assert!(err.contains("NotFound"), "{err}");
+  let (code, out, err) = run(instance, &["read", green, "/g.txt"]);
+  assert_eq!(code, 0, "{err}");
+  assert_eq!(out, "later", "the head streams the later file's bytes");
+  attachment
+}
+
+/// A second work over `green` creates `/g.txt` and submits: version 2.
+fn json_land_second_version(instance: &str, green: &str) {
+  let (code, out, _) = run(instance, &["work", green, "workjson2"]);
+  assert_eq!(code, 0);
+  let work = value_of(&out, "id");
+  let (code, _, err) = run(instance, &["edit", &work, "/g.txt", "0", "0", "later"]);
+  assert_eq!(code, 0, "{err}");
+  let (code, out, err) = run(instance, &["submit", &work, "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.contains("\"version\":2"),
+    "the second work lands version 2: {out}"
+  );
+}
+
+/// `advance` re-pins to 2 naming the invalidated path; the attached read then streams the bytes.
+fn json_merge_reader_advances(instance: &str, green: &str, attachment: &str) {
+  let (code, out, err) = run(instance, &["advance", attachment, "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.contains("\"version\":2") && out.contains("\"invalidated\":[\"g.txt\"]"),
+    "advance names the invalidated path: {out}"
+  );
+  let (code, out, err) = run(
+    instance,
+    &["read", green, "/g.txt", "--attachment", attachment],
+  );
+  assert_eq!(code, 0, "{err}");
+  assert_eq!(out, "later", "the advanced view streams the bytes");
+  let (code, _, err) = run(instance, &["detach", attachment]);
+  assert_eq!(code, 0, "{err}");
 }
 
 /// `green`/`work` under `--json` emit JSON objects (the merge create verbs; `edit` is the same form).

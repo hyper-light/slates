@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use slates_client::{GrantScope, Intent, NamePolicy, SizeClass};
+use slates_client::{GrantScope, GreenBase, Intent, NamePolicy, ReadAt, SizeClass};
 
 use crate::format::{parse_size, parse_snapshot, parse_volume_id};
 
@@ -23,13 +23,15 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   volume clone ID SNAPSHOT NAME [--json]
   volume resize ID (--bounded SIZE | --dynamic MAX) [--json]
   volume destroy ID [--json]
-  green NAME [--json]                              create a green merge target
+  green NAME [--require-evidence] [--base VOLUME --snapshot N] [--json]   create a green merge target
   versions GREEN [--json]                          its head version
   changed-since GREEN VERSION [--json]             files changed since a version
   work GREEN NAME [--json]                         a work volume over a green
   edit WORK PATH AT DELETE TEXT [--json]           declare an edit (a splice)
-  submit WORK [--json]                             submit a work's increment
+  submit WORK [--evidence HEX] [--json]            submit a work's increment
   rebase WORK [--json]                             rebase a work onto its green's head
+  advance ATTACHMENT [VERSION] [--json]            re-pin a green attachment (the head when no VERSION)
+  read VOLUME PATH [--version N | --attachment A]  a file's bytes at a view (raw bytes)
   volume placed ID [--snapshot N] [--mirror] [--json]   await a durability scope
   attach ID [--read | --write] [--snapshot N] [--json]
   detach ATTACHMENT [--json]
@@ -189,12 +191,30 @@ pub(crate) enum Verb {
     /// The snapshot.
     snapshot: slates_client::SnapshotId,
   },
-  /// Create a green volume (§4.16 merge).
+  /// Create a green volume (§4.16 merge), from scratch or over a complete immutable base.
   Green {
     /// The name.
     name: String,
     /// Whether an increment must carry evidence.
     evidence: bool,
+    /// The complete immutable base (a volume's snapshot), or none for a scratch green.
+    base: Option<GreenBase>,
+  },
+  /// Re-pin a green attachment to a version, or the head.
+  Advance {
+    /// The attachment.
+    attachment: u64,
+    /// The version, or the head when none.
+    version: Option<u64>,
+  },
+  /// A file's bytes at a view: a green's head, a version, or an attachment's pinned version.
+  Read {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The file.
+    path: String,
+    /// The view.
+    at: ReadAt,
   },
   /// A green's head version.
   Versions {
@@ -232,6 +252,8 @@ pub(crate) enum Verb {
   Submit {
     /// The work volume.
     work: slates_client::VolumeId,
+    /// The evidence references (opaque identities), possibly none.
+    evidence: Vec<[u8; 32]>,
   },
   /// Rebase a work volume onto its green's head (the corrective path).
   Rebase {
@@ -400,6 +422,9 @@ const VALUES: &[&str] = &[
   "--at",
   "--http",
   "--term",
+  "--evidence",
+  "--version",
+  "--attachment",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
@@ -412,6 +437,7 @@ const SWITCHES: &[&str] = &[
   "--drift",
   "--mirror",
   "--session",
+  "--require-evidence",
 ];
 
 /// Parses `exec --volume V --at PATH -- CMD ...`: the flags before `--`, the command after it.
@@ -670,6 +696,98 @@ const NONE: Spec = Spec {
   switches: &[],
 };
 
+/// `green NAME [--require-evidence] [--base VOLUME --snapshot N]`: a green from scratch, or over the
+/// complete immutable base the pair names (one without the other is a usage refusal).
+fn parse_green(taken: &Taken, name: &str) -> Result<Command, ParseError> {
+  taken.only(&Spec {
+    values: &["--base", "--snapshot"],
+    switches: &["--require-evidence"],
+  })?;
+  let base = match (taken.value("--base"), taken.value("--snapshot")) {
+    (None, None) => None,
+    (Some(base), Some(snap)) => Some(GreenBase {
+      volume: volume(base)?,
+      snapshot: snapshot(snap)?,
+    }),
+    _ => {
+      return Err(ParseError::BadValue {
+        what: "--base",
+        reason: "--base VOLUME and --snapshot N go together".to_owned(),
+      });
+    }
+  };
+  Ok(client(
+    taken,
+    Verb::Green {
+      name: name.to_owned(),
+      evidence: taken.switch("--require-evidence"),
+      base,
+    },
+  ))
+}
+
+/// `advance ATTACHMENT [VERSION]`: the head when no version is given.
+fn parse_advance(
+  taken: &Taken,
+  attachment: &str,
+  version: Option<&str>,
+) -> Result<Command, ParseError> {
+  taken.only(&NONE)?;
+  Ok(client(
+    taken,
+    Verb::Advance {
+      attachment: number(attachment)?,
+      version: version.map(number).transpose()?,
+    },
+  ))
+}
+
+/// `read VOLUME PATH [--version N | --attachment A]`: the head when neither is given.
+fn parse_read(taken: &Taken, id: &str, path: &str) -> Result<Command, ParseError> {
+  taken.only(&Spec {
+    values: &["--version", "--attachment"],
+    switches: &[],
+  })?;
+  let at = match (taken.value("--version"), taken.value("--attachment")) {
+    (Some(version), _) => ReadAt::Version {
+      version: number(version)?,
+    },
+    (None, Some(attachment)) => ReadAt::Attachment {
+      attachment: number(attachment)?,
+    },
+    (None, None) => ReadAt::Head,
+  };
+  Ok(client(
+    taken,
+    Verb::Read {
+      volume: volume(id)?,
+      path: path.to_owned(),
+      at,
+    },
+  ))
+}
+
+/// `submit WORK [--evidence HEX]`: the evidence reference, when given, as the 64-hex identity.
+fn parse_submit(taken: &Taken, work: &str) -> Result<Command, ParseError> {
+  taken.only(&Spec {
+    values: &["--evidence"],
+    switches: &[],
+  })?;
+  let evidence = taken
+    .value("--evidence")
+    .map(manifest_hash)
+    .transpose()?
+    .into_iter()
+    .collect();
+  Ok(client(
+    taken,
+    Verb::Submit {
+      work: volume(work)?,
+      evidence,
+    },
+  ))
+}
+
 /// Parses the arguments (without the program name).
 pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
   if arguments.first().map(String::as_str) == Some("exec") {
@@ -901,16 +1019,12 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
         .unwrap_or(0);
       Ok(client(&taken, Verb::Audit { since }))
     }
-    ["green", name] => {
-      taken.only(&NONE)?;
-      Ok(client(
-        &taken,
-        Verb::Green {
-          name: (*name).to_owned(),
-          evidence: false,
-        },
-      ))
+    ["green", name] => parse_green(&taken, name),
+    ["advance", attachment, rest @ ..] if rest.len() <= 1 => {
+      parse_advance(&taken, attachment, rest.first().copied())
     }
+    ["read", id, path] => parse_read(&taken, id, path),
+    ["read", ..] => Err(ParseError::Missing("VOLUME PATH")),
     ["versions", id] => {
       taken.only(&NONE)?;
       Ok(client(&taken, Verb::Versions { green: volume(id)? }))
@@ -948,15 +1062,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
         },
       ))
     }
-    ["submit", work] => {
-      taken.only(&NONE)?;
-      Ok(client(
-        &taken,
-        Verb::Submit {
-          work: volume(work)?,
-        },
-      ))
-    }
+    ["submit", work] => parse_submit(&taken, work),
     ["rebase", work] => {
       taken.only(&NONE)?;
       Ok(client(
@@ -1258,6 +1364,75 @@ mod tests {
     ));
   }
 
+  /// The merge service's grammar (§4.16 as a service): a green over a complete immutable base with
+  /// evidence required (one of the base pair alone is a usage refusal), an advance to the head or a
+  /// version, a read at the head, a version or an attachment, and a submit carrying evidence.
+  #[test]
+  fn the_grammar_parses_the_base_reader_and_evidence_forms() {
+    let verb = |text: &str| -> Verb {
+      let Command::Client(request) = parse(&args(text)).unwrap() else {
+        panic!("client");
+      };
+      request.verb
+    };
+    let id = "00000000000000000000000000000001";
+    let vid = parse_volume_id(id).unwrap();
+    assert_eq!(
+      verb(&format!(
+        "green over --require-evidence --base {id} --snapshot 3"
+      )),
+      Verb::Green {
+        name: "over".into(),
+        evidence: true,
+        base: Some(GreenBase {
+          volume: vid,
+          snapshot: slates_client::SnapshotId { value: 3 },
+        }),
+      }
+    );
+    assert!(matches!(
+      parse(&args(&format!("green half --base {id}"))),
+      Err(ParseError::BadValue { .. })
+    ));
+    assert_eq!(
+      verb("advance 7"),
+      Verb::Advance {
+        attachment: 7,
+        version: None,
+      }
+    );
+    assert_eq!(
+      verb("advance 7 2"),
+      Verb::Advance {
+        attachment: 7,
+        version: Some(2),
+      }
+    );
+    assert_eq!(
+      verb(&format!("read {id} /f --attachment 7")),
+      Verb::Read {
+        volume: vid,
+        path: "/f".into(),
+        at: ReadAt::Attachment { attachment: 7 },
+      }
+    );
+    assert_eq!(
+      verb(&format!("read {id} f --version 2")),
+      Verb::Read {
+        volume: vid,
+        path: "f".into(),
+        at: ReadAt::Version { version: 2 },
+      }
+    );
+    assert_eq!(
+      verb(&format!("submit {id} --evidence {}", "ab".repeat(32))),
+      Verb::Submit {
+        work: vid,
+        evidence: vec![[0xab; 32]],
+      }
+    );
+  }
+
   /// The merge grammar (§4.16): green, work, edit, submit, versions and changed-since parse to
   /// their verbs.
   #[test]
@@ -1275,6 +1450,7 @@ mod tests {
       Verb::Green {
         name: "shared".into(),
         evidence: false,
+        base: None,
       }
     );
     assert_eq!(
@@ -1305,7 +1481,13 @@ mod tests {
         bytes: b"hello".to_vec(),
       }
     );
-    assert_eq!(verb(&format!("submit {id}")), Verb::Submit { work: vid });
+    assert_eq!(
+      verb(&format!("submit {id}")),
+      Verb::Submit {
+        work: vid,
+        evidence: Vec::new(),
+      }
+    );
     assert_eq!(verb(&format!("rebase {id}")), Verb::Rebase { work: vid });
   }
 

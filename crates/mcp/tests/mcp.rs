@@ -186,6 +186,110 @@ fn assert_declare_namespace_ops(server: &mut McpServer, green: &str) {
     submitted["accepted"], true,
     "the namespace ops submit cleanly: {submitted}"
   );
+  assert_attach_advance_read(server, green);
+}
+
+/// Calls a tool expecting a JSON-RPC error, returning its message.
+fn call_refused(server: &mut McpServer, name: &str, arguments: Value) -> String {
+  let request = json!({
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": { "name": name, "arguments": arguments },
+  });
+  let reply = server.handle(&request).expect("a call gets a reply");
+  reply["error"]["message"]
+    .as_str()
+    .unwrap_or_else(|| panic!("tool {name} was not refused: {reply}"))
+    .to_owned()
+}
+
+/// A green reader over MCP (§4.16 "Attachments and versions"; AC-6.13/T-6.15): `slates.attach.attach`
+/// pins the head version; a further work lands a new version; `slates.fs.read` at the attachment still
+/// serves the pinned view (a file born after the pin is refused typed) while a read at the head sees
+/// the new file; `slates.merge.advance` re-pins and names the invalidated path; then the read serves it.
+fn assert_attach_advance_read(server: &mut McpServer, green: &str) {
+  let (attachment, head_after) = assert_attach_pins_then_a_version_lands(server, green);
+  assert_reads_move_only_by_advance(server, green, attachment, head_after);
+}
+
+/// `slates.attach.attach` pins the green's head; a further work lands the next version. Returns the
+/// attachment and the new head.
+fn assert_attach_pins_then_a_version_lands(server: &mut McpServer, green: &str) -> (u64, u64) {
+  let attached = call(server, "slates.attach.attach", json!({ "volume": green }));
+  let attachment = attached["attachment"].as_u64().unwrap();
+  let pinned = attached["version"].as_u64().unwrap();
+  let head_before = call(server, "slates.merge.versions", json!({ "green": green }))["head"]
+    .as_u64()
+    .unwrap();
+  assert_eq!(pinned, head_before, "the attachment pins the head");
+
+  let work = call(
+    server,
+    "slates.merge.create_work",
+    json!({ "green": green, "name": "later" }),
+  )["work"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  call(
+    server,
+    "slates.merge.edit",
+    json!({ "work": work, "path": "/later.txt", "at": 0, "text": "after the pin" }),
+  );
+  let submitted = call(server, "slates.merge.submit", json!({ "work": work }));
+  assert_eq!(submitted["accepted"], true, "{submitted}");
+  let head_after = submitted["version"].as_u64().unwrap();
+  assert_eq!(head_after, pinned + 1);
+  (attachment, head_after)
+}
+
+/// The attached read serves the pinned view (the later file refused typed) while the head serves it;
+/// `slates.merge.advance` re-pins naming the invalidated path; then the attached read serves it too.
+fn assert_reads_move_only_by_advance(
+  server: &mut McpServer,
+  green: &str,
+  attachment: u64,
+  head_after: u64,
+) {
+  let refused = call_refused(
+    server,
+    "slates.fs.read",
+    json!({ "volume": green, "path": "/later.txt", "attachment": attachment }),
+  );
+  assert!(
+    refused.contains("NotFound"),
+    "the pinned view lacks the later file: {refused}"
+  );
+  let at_head = call(
+    server,
+    "slates.fs.read",
+    json!({ "volume": green, "path": "/later.txt" }),
+  );
+  assert_eq!(at_head["text"], "after the pin");
+  assert_eq!(at_head["len"], 13);
+
+  let advanced = call(
+    server,
+    "slates.merge.advance",
+    json!({ "attachment": attachment }),
+  );
+  assert_eq!(advanced["version"], head_after);
+  assert_eq!(advanced["invalidated"], json!(["later.txt"]));
+  let at_pin = call(
+    server,
+    "slates.fs.read",
+    json!({ "volume": green, "path": "later.txt", "attachment": attachment }),
+  );
+  assert_eq!(at_pin["text"], "after the pin");
+  assert_eq!(
+    call(
+      server,
+      "slates.attach.detach",
+      json!({ "attachment": attachment })
+    ),
+    json!({ "detached": true })
+  );
 }
 
 /// The volume lifecycle over MCP: create, list, stat, snapshot, clone, resize, destroy, and status.

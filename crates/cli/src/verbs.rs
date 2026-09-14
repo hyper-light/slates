@@ -2,8 +2,8 @@
 
 use slates_client::{
   AuditEntry, ChokepointReport, Client, ClientError, CreateSpec, DaemonReport, Deadlines,
-  GrantScope, GrantSummary, Intent, Landing, Rebased, Scope, SnapshotId, StatusReport, Submitted,
-  TelemetryReport, VolumeId, VolumeSummary,
+  GrantScope, GrantSummary, GreenBase, Intent, Landing, Rebased, Scope, SnapshotId, StatusReport,
+  Submitted, TelemetryReport, VolumeId, VolumeSummary,
 };
 use slates_db::replay::RECOVERY_BUDGET_NS;
 use slates_server::daemon::LIVENESS_BUDGET_NS;
@@ -133,14 +133,19 @@ fn serve_mcp_stdio(mut server: slates_mcp::McpServer) -> Result<(), Failure> {
 }
 
 /// The merge verbs (§4.16), split out to keep [`serve`] under the cognitive-complexity bound.
-/// `green NAME`: the new green's id, as text or a JSON `{ "id" }` under `--json`.
+/// `green NAME [--base VOLUME --snapshot N]`: the new green's id, as text or a JSON `{ "id" }` under
+/// `--json`.
 fn merge_green(
   client: &mut Client,
   name: &str,
   evidence: bool,
+  base: Option<GreenBase>,
   json: bool,
 ) -> Result<(), ClientError> {
-  let id = client.create_green(name, evidence)?;
+  let id = match base {
+    None => client.create_green(name, evidence)?,
+    Some(base) => client.create_green_over(name, evidence, base)?,
+  };
   if json {
     println!("{}", serde_json::json!({ "id": volume_id_text(id) }));
   } else {
@@ -188,9 +193,48 @@ fn merge_edit(
   Ok(())
 }
 
+/// `advance ATTACHMENT [VERSION]`: the version now pinned and the invalidated paths, as text lines or
+/// a JSON `{ "version", "invalidated" }`.
+fn merge_advance(
+  client: &mut Client,
+  attachment: u64,
+  version: Option<u64>,
+  json: bool,
+) -> Result<(), ClientError> {
+  let advanced = client.advance(attachment, version)?;
+  if json {
+    println!(
+      "{}",
+      serde_json::json!({ "version": advanced.version, "invalidated": advanced.invalidated })
+    );
+  } else {
+    println!("version: {}", advanced.version);
+    for path in advanced.invalidated {
+      println!("{path}");
+    }
+  }
+  Ok(())
+}
+
 fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError> {
   match verb {
-    Verb::Green { name, evidence } => merge_green(client, name, *evidence, json)?,
+    Verb::Green {
+      name,
+      evidence,
+      base,
+    } => merge_green(client, name, *evidence, *base, json)?,
+    Verb::Advance {
+      attachment,
+      version,
+    } => merge_advance(client, *attachment, *version, json)?,
+    Verb::Read { volume, path, at } => {
+      use std::io::Write;
+      // Raw bytes, like `base read`: a file's content streams unwrapped, `--json` or not.
+      let bytes = client.read(*volume, path, *at)?;
+      let mut out = std::io::stdout().lock();
+      let _ = out.write_all(&bytes);
+      let _ = out.flush();
+    }
     Verb::Versions { green } => {
       let head = client.versions(*green)?;
       if json {
@@ -217,8 +261,8 @@ fn serve_merge(client: &mut Client, verb: &Verb, json: bool) -> Result<(), Clien
       delete_len,
       bytes,
     } => merge_edit(client, *work, path, *at, *delete_len, bytes, json)?,
-    Verb::Submit { work } => {
-      let outcome = client.submit(*work)?;
+    Verb::Submit { work, evidence } => {
+      let outcome = client.submit_with_evidence(*work, evidence)?;
       if json {
         println!("{}", submit_json(&outcome));
       } else {
@@ -602,7 +646,9 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     | Verb::Work { .. }
     | Verb::Edit { .. }
     | Verb::Submit { .. }
-    | Verb::Rebase { .. } => serve_merge(client, verb, json)?,
+    | Verb::Rebase { .. }
+    | Verb::Advance { .. }
+    | Verb::Read { .. } => serve_merge(client, verb, json)?,
     Verb::Placed {
       volume,
       snapshot,
