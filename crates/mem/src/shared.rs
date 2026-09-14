@@ -239,10 +239,20 @@ mod platform {
   fn open_object(handoff: &Handoff) -> Result<OwnedFd, MemError> {
     match handoff {
       Handoff::Descriptor(raw) if *raw >= 0 => {
-        use std::os::fd::FromRawFd;
-        // SAFETY: the number names a descriptor the parent handed to this process by
-        // inheritance and nothing else in this process owns it (the handoff protocol).
-        Ok(unsafe { OwnedFd::from_raw_fd(*raw) })
+        use std::os::fd::BorrowedFd;
+        // The handed-off number is inherited state of this process, never owned here: it is
+        // **duplicated** (close-on-exec, so a child of this process does not inherit the duplicate)
+        // and the duplicate is what this object owns and closes. A process attaches one handoff
+        // more than once — the daemon reads the anchor's published profile before it starts, and
+        // every shard maps the segment again — and two owners of one number closed it twice (the
+        // second drop aborted the process under Rust's I/O-safety check; the daemon's shard mapping
+        // found the number already closed: `mmap` EBADF).
+        // Record: docs/bugs/2026-09-14-segment-handoff-descriptor-owned-twice.md.
+        // SAFETY: the number names a descriptor the parent handed to this process by inheritance;
+        // it stays open for the process's life (nothing here closes it), and the borrow lasts only
+        // for the duplication.
+        let inherited = unsafe { BorrowedFd::borrow_raw(*raw) };
+        rustix::io::fcntl_dupfd_cloexec(inherited, 0).map_err(|e| refused("dup", e))
       }
       _ => Err(MemError::OsRefused {
         call: "handoff",
@@ -580,5 +590,27 @@ mod tests {
     assert!(a.atomic_u64(3).is_err(), "misaligned");
     assert!(a.atomic_u64(4096).is_err(), "past the end");
     assert!(a.atomic_u32(4).is_ok());
+  }
+
+  /// AC (docs/bugs/2026-09-14-segment-handoff-descriptor-owned-twice.md): one handoff is attached more
+  /// than once by one process (the daemon reads the anchor's profile, then starts, then maps per shard),
+  /// and each attach owns its own descriptor — dropping two of them closes two duplicates, never the
+  /// inherited number twice (which aborted the process), and a third attach still finds the number open
+  /// (which failed `EBADF` before). Linux only: the other platforms hand off a name and open it afresh.
+  #[test]
+  #[cfg(target_os = "linux")]
+  #[cfg_attr(miri, ignore)] // memfd_create shared memory is not modelled by Miri
+  fn two_attaches_from_one_handoff_each_own_their_descriptor() {
+    let mut a = SharedObject::create("slates-mem-shared-test-twice", 4096).unwrap();
+    a.bytes_mut()[0..4].copy_from_slice(&[9, 8, 7, 6]);
+    let handoff = a.handoff().unwrap();
+    let first = SharedObject::open(&handoff, 4096).unwrap();
+    let second = SharedObject::open(&handoff, 4096).unwrap();
+    assert_eq!(&first.bytes()[0..4], &[9, 8, 7, 6]);
+    assert_eq!(&second.bytes()[0..4], &[9, 8, 7, 6]);
+    drop(first);
+    drop(second);
+    let third = SharedObject::open(&handoff, 4096).expect("the inherited number is still open");
+    assert_eq!(&third.bytes()[0..4], &[9, 8, 7, 6]);
   }
 }
