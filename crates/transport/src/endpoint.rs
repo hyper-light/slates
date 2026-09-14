@@ -239,6 +239,12 @@ pub struct Endpoint {
   /// an established session is a server still asking for it (its confirmation raced this end's exit
   /// from the handshake), and is answered by resending it. Empty on a server.
   final_flight: Vec<u8>,
+  /// The handshake flight this end last sent and has not seen answered, kept across `establish` calls so
+  /// the next call retransmits it (RFC 9002 §6.2); empty once established or before the first flight.
+  pending_flight: Vec<u8>,
+  /// Handshake budgets spent without establishing (`establish` calls that ended `NotReady`); reset to zero
+  /// on establishment.
+  handshake_budgets_spent: u32,
   /// Datagrams an established session discarded rather than folded — a raw handshake retransmit, a
   /// packet naming another session, one that did not open under the keys (RFC 9000 §12.2: an
   /// undecryptable packet is discarded, never fatal). A counter, so a test can assert the discard path
@@ -301,6 +307,8 @@ impl Endpoint {
       rtt: RttEstimator::new(),
       send_times: BTreeMap::new(),
       final_flight: Vec::new(),
+      pending_flight: Vec::new(),
+      handshake_budgets_spent: 0,
       discarded: 0,
       pto_count: 0,
       next_exchange: FIRST_EXCHANGE,
@@ -333,6 +341,8 @@ impl Endpoint {
       rtt: RttEstimator::new(),
       send_times: BTreeMap::new(),
       final_flight: Vec::new(),
+      pending_flight: Vec::new(),
+      handshake_budgets_spent: 0,
       discarded: 0,
       pto_count: 0,
       next_exchange: FIRST_EXCHANGE,
@@ -368,6 +378,8 @@ impl Endpoint {
       rtt: RttEstimator::new(),
       send_times: BTreeMap::new(),
       final_flight: Vec::new(),
+      pending_flight: Vec::new(),
+      handshake_budgets_spent: 0,
       discarded: 0,
       pto_count: 0,
       next_exchange: FIRST_EXCHANGE,
@@ -477,9 +489,38 @@ impl Endpoint {
   /// done (before blocking on a receive, so a finished peer never hangs waiting for a packet that will
   /// not come), and otherwise receives the peer's next flight.
   pub async fn establish(&mut self) -> Result<(), EndpointError> {
+    // The flight this end last sent and has not seen answered survives across calls (RFC 9002 §6.2: the
+    // probe timeout retransmits the pending flight), so a caller that retries the handshake each period
+    // on this same socket resends it — a peer that was not listening through one whole budget is reached
+    // by the next call. Before this the flight was a local of one call: a second call had nothing to
+    // resend, waited a whole budget in silence, and the socket could never establish again — the N-node
+    // mesh's formation stalled forever once a peer was starved past one budget under load
+    // (`docs/bugs/2026-09-14-handshake-retry-forgets-its-flight.md`).
+    let mut last_flight = std::mem::take(&mut self.pending_flight);
+    let outcome = self.establish_turns(&mut last_flight).await;
+    match &outcome {
+      Ok(()) => self.handshake_budgets_spent = 0,
+      Err(EndpointError::NotReady) => {
+        self.pending_flight = last_flight;
+        self.handshake_budgets_spent = self.handshake_budgets_spent.saturating_add(1);
+      }
+      Err(_) => {}
+    }
+    outcome
+  }
+
+  /// How many handshake budgets this end has spent without establishing: zero once established, one more
+  /// per `establish` call that ended `NotReady`. A dialer's caller reads it to decide between retrying on
+  /// this socket (its pending flight resent) and dialing afresh from a new port.
+  pub fn handshake_budgets_spent(&self) -> u32 {
+    self.handshake_budgets_spent
+  }
+
+  /// One `establish` call's turns over the connection; `last_flight` is the flight this end most recently
+  /// sent (carried in from the previous call and left for the next when the budget runs out).
+  async fn establish_turns(&mut self, last_flight: &mut Vec<u8>) -> Result<(), EndpointError> {
     let mut buf = [0u8; 2048];
     let mut sent_at: Option<Instant> = None;
-    let mut last_flight: Vec<u8> = Vec::new();
     // The peer's flight this end last fed to `read_hs`. Retransmits that raced this end's reply arrive as
     // an exact re-send of a flight already consumed; `read_hs` treats its input as an ordered byte stream
     // and would fault on the repeat (a fresh `ClientHello` where it expects the client's `Finished`), so a
@@ -492,7 +533,7 @@ impl Endpoint {
       if !out.is_empty() {
         self.send(&out)?;
         sent_at = Some(Instant::now());
-        last_flight = out;
+        *last_flight = out;
       }
       if !self.quic.is_handshaking() && self.keys.is_some() {
         // The TLS bytes are all exchanged, but TLS 1.3 leaves the two ends *asymmetrically* finished —
@@ -503,7 +544,7 @@ impl Endpoint {
         if self.quic.is_client() {
           self.final_flight = last_flight.clone();
         }
-        return self.confirm_handshake(&last_flight).await;
+        return self.confirm_handshake(last_flight.as_slice()).await;
       }
       // Receive the peer's next flight, retransmitting our last flight each probe timeout so a dropped
       // handshake packet — the common case being a peer not yet listening when we first sent — is recovered
@@ -549,7 +590,7 @@ impl Endpoint {
               // A server the demultiplexer opened has no flight until it has read the client's first, so it
               // simply waits; a dialer resends its last flight.
               if !last_flight.is_empty() {
-                self.send(&last_flight)?;
+                self.send(last_flight.as_slice())?;
                 sent_at = Some(Instant::now());
               }
             }

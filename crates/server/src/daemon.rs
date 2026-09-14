@@ -471,6 +471,17 @@ impl Daemon {
     })
   }
 
+  /// The peers this node has **formed a probe session** to (§4.8 formation; the members of
+  /// `formed_probe_peers`), for a formation observer to name which sessions are still missing when the
+  /// mesh has not formed — beside the seeded members ([`fleet_members`](Daemon::fleet_members)) and the
+  /// coordinator's period count ([`fleet_progress`](Daemon::fleet_progress)), the facts that tell a genuine
+  /// non-convergence from a wedge. `None` when the daemon could not observe it ([`Self::observe`]).
+  pub fn fleet_formed_probe_peers(&self) -> Option<Vec<slates_db::HostId>> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| s.formed_probe_peers.iter().copied().collect())
+    })
+  }
+
   /// Whether this daemon's fleet has formed its **direct probe mesh** (§4.8): every peer this node keeps
   /// direct contact with — its record neighbourhood and its council and root voters
   /// (`fleet::keeps_direct_contact_with`) — has a live probe session: the handshake completed and the peer

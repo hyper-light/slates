@@ -2812,14 +2812,35 @@ fn assert_fleet_forms(daemons: &[Daemon], _hosts: &[HostId], names: &[&str]) {
   }) {
     return;
   }
-  // Still not meshed: assert with a message naming the first unmeshed node (its seeded members view is shown
-  // to make the seeded-vs-formed distinction legible on a failure).
+  // Still not meshed: assert with a message naming every node's state — meshed or not, the members it
+  // sees (the seeded view, so seeded-vs-formed is legible), the peers it actually formed probe sessions
+  // to, and its coordinator's period count — so a failure says whether the coordinators were ticking
+  // (the period budget ran out: a genuine non-convergence) or frozen (no progress: a wedge), and which
+  // sessions never formed. The 2026-09-14 formation failure under load carried only "sees members",
+  // which could not distinguish the two (`docs/bugs/2026-09-14-handshake-retry-forgets-its-flight.md`).
+  let report: Vec<String> = daemons
+    .iter()
+    .enumerate()
+    .map(|(i, daemon)| {
+      format!(
+        "{}: meshed={:?} members={:?} formed_probe_peers={:?} periods={}",
+        names[i],
+        daemon.fleet_meshed(),
+        daemon.fleet_members(),
+        daemon.fleet_formed_probe_peers(),
+        daemon.fleet_progress()
+      )
+    })
+    .collect();
   for (i, daemon) in daemons.iter().enumerate() {
     assert!(
       daemon.fleet_meshed() == Some(true),
-      "node {} did not form its full probe mesh within the formation deadline (it sees members {:?})",
+      "node {} did not form its full probe mesh within the formation budget ({} periods of the slowest \
+       coordinator, or {:?} with no progress at all):\n{}",
       names[i],
-      daemon.fleet_members()
+      PERIOD_BUDGET,
+      FROZEN_CAP,
+      report.join("\n")
     );
   }
 }

@@ -988,3 +988,146 @@ fn an_accepted_server_learns_its_peer_and_replies() {
   let (counters, _) = counters_rx.try_recv().expect("the server reported");
   assert_eq!(counters.opened, 1, "{counters:?}");
 }
+
+/// Waits (yielding on the runtime) for a unit signal on a just-sent-once channel.
+async fn recv_signal(rx: std::sync::mpsc::Receiver<()>) {
+  loop {
+    if rx.try_recv().is_ok() {
+      return;
+    }
+    slates_rt::futures::sleep(1_000).await;
+  }
+}
+
+/// Discards every datagram queued on `socket` — the test's stand-in for a flight lost on the wire (the
+/// fabric never drops, so the loss is played by the receiver throwing the flight away before it listens).
+/// Returns how many it discarded, the non-vacuity count: the dialer's whole first budget must have
+/// arrived here and been thrown away for the scenario to be the one it claims.
+async fn discard_queued(socket: &UdpSocket) -> usize {
+  let mut buf = [0u8; 2048];
+  let mut discarded = 0;
+  while within(1_000, socket.recv_from(&mut buf)).await.is_some() {
+    discarded += 1;
+  }
+  discarded
+}
+
+/// AC (§4.8 formation; RFC 9002 §6.2 the probe timeout retransmits the pending flight): a dialer whose
+/// first `establish` ran out its retransmit budget against a peer that **lost every flight** (not listening
+/// yet: the fleet's boot-ordering shape, played here by the peer discarding everything queued before it
+/// starts its handshake) completes the handshake on a later `establish` call on the SAME socket once the
+/// peer listens — the pending flight is retransmitted across the caller's periods, not only within one
+/// call. Do: dial, spend the budget (typed `NotReady`), have the peer discard the queued flights and begin
+/// its handshake, call `establish` again. Expect: the discard count is at least one (the first budget's
+/// flights really were lost), the second call establishes, and a stream flows. Before the fix the second
+/// call had nothing to send — the flight was a local of the first call — so a peer starved past one budget
+/// was never reachable on that socket again, and the N-node mesh's formation stalled forever under load
+/// (`docs/bugs/2026-09-14-handshake-retry-forgets-its-flight.md`).
+#[test]
+fn a_dialer_that_outwaited_an_absent_peer_completes_the_handshake_once_the_peer_listens() {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+
+  let content: Vec<u8> = (0..200u16)
+    .map(|i| u8::try_from(i % 241).unwrap_or(0))
+    .collect();
+  let expected = content.clone();
+  let server_identity = self_signed(NAME);
+  let client_identity = self_signed(NAME);
+  let server_cert = server_identity.certificate();
+  let client_cert = client_identity.certificate();
+
+  let (server_port_tx, server_port_rx) = channel();
+  let (client_port_tx, client_port_rx) = channel();
+  let (outwaited_tx, outwaited_rx) = channel();
+  let (first_tx, first_rx) = channel();
+  let (discarded_tx, discarded_rx) = channel();
+  let (result_tx, result_rx) = channel();
+  let result_tx_server = result_tx.clone();
+
+  // The dialer: spend a whole budget against a peer that is not listening, report the typed outcome,
+  // then — the peer now listening — establish again on the same socket and send the stream.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = client_port_tx.send(socket.local_addr().unwrap().port());
+      let server_port = recv_port(server_port_rx).await;
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+      let mut client = Endpoint::client(
+        socket,
+        peer,
+        &client_identity,
+        &server_cert,
+        NAME,
+        FRAME_CAP,
+      )
+      .unwrap();
+      let first = client.establish().await;
+      let _ = first_tx.send(matches!(first, Err(EndpointError::NotReady)));
+      let _ = outwaited_tx.send(());
+      let outcome = async {
+        client.establish().await.map_err(|e| format!("{e:?}"))?;
+        client
+          .send_stream(STREAM_ID, &content)
+          .await
+          .map_err(|e| format!("{e:?}"))
+      }
+      .await;
+      if let Err(e) = outcome {
+        let _ = result_tx.send(Err(e));
+      }
+    })
+    .unwrap();
+
+  // The peer: bound from the start (so the dialer has an address) but not listening — it discards
+  // everything that arrived during the dialer's first budget, then handshakes and receives the stream.
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = server_port_tx.send(socket.local_addr().unwrap().port());
+      let client_port = recv_port(client_port_rx).await;
+      recv_signal(outwaited_rx).await;
+      let _ = discarded_tx.send(discard_queued(&socket).await);
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, client_port);
+      let outcome = async {
+        let mut server = Endpoint::server(
+          socket,
+          peer,
+          &server_identity,
+          std::slice::from_ref(&client_cert),
+          FRAME_CAP,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        server.establish().await.map_err(|e| format!("{e:?}"))?;
+        server
+          .recv_stream(STREAM_ID)
+          .await
+          .map_err(|e| format!("{e:?}"))
+      }
+      .await;
+      let _ = result_tx_server.send(outcome);
+    })
+    .unwrap();
+
+  sim.run_until_idle();
+
+  assert_eq!(
+    first_rx.try_recv(),
+    Ok(true),
+    "the first establish against a peer that is not listening ends typed NotReady after its budget"
+  );
+  let discarded = discarded_rx.try_recv().unwrap_or(0);
+  assert!(
+    discarded >= 1,
+    "the first budget's flights reached the peer and were thrown away ({discarded} discarded)"
+  );
+  match result_rx.try_recv() {
+    Ok(Ok(received)) => assert_eq!(
+      received, expected,
+      "the stream flowed over the session the second establish completed"
+    ),
+    other => panic!(
+      "the second establish on the same socket did not complete (peer discarded {discarded} flights): {other:?}"
+    ),
+  }
+}
