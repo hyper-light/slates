@@ -524,13 +524,37 @@ fn host_facts() -> (String, Option<String>) {
   (std::env::consts::OS.to_owned(), None)
 }
 
-/// The report for `situation`: the host facts read now, then every transport.
+/// The host facts a report carries, read **once per process** and kept: `uname`'s system name and
+/// release, and which OCI runtime the daemon's `PATH` holds. They are facts of the boot, not of the
+/// verb — the kernel and the `PATH` do not change under a running daemon — and reading them per
+/// `status` put a `uname` and one `access(2)` per `PATH` directory on the owner shard for every call
+/// (§4.3: a shard runs no blocking syscall off the driver; found integrating the OCI handoff,
+/// 2026-09-14). A process-lifetime singleton through `OnceLock` (D-8: no `Arc`).
+struct HostFacts {
+  os: String,
+  kernel: Option<String>,
+  oci_runtime: OciRuntime,
+}
+
+fn host_facts_once() -> &'static HostFacts {
+  static FACTS: std::sync::OnceLock<HostFacts> = std::sync::OnceLock::new();
+  FACTS.get_or_init(|| {
+    let (os, kernel) = host_facts();
+    HostFacts {
+      os,
+      kernel,
+      oci_runtime: probe_oci_runtime(),
+    }
+  })
+}
+
+/// The report for `situation`: the host facts (read once per process), then every transport.
 pub(crate) fn report(situation: &Situation) -> TransportReport {
-  let (os, kernel) = host_facts();
+  let facts = host_facts_once();
   TransportReport {
-    os,
-    kernel,
-    oci_runtime: probe_oci_runtime(),
+    os: facts.os.clone(),
+    kernel: facts.kernel.clone(),
+    oci_runtime: facts.oci_runtime.clone(),
     capabilities: capabilities(situation),
   }
 }
