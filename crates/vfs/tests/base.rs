@@ -145,12 +145,14 @@ fn create_over_a_base_costs_one_open_and_no_memory_whatever_the_tree_size() {
 }
 
 /// The base of the worked example: `src/lib.rs` and `src/main.rs`, with `lib.rs` read once
-/// and then edited by the agent (copied up).
+/// and then edited by the agent (copied up). The files' timestamp tick closes before the volume
+/// lists them, as on a real disk written before the agent starts, so the witness is not racy.
 fn worked_example() -> (SimHost, Store, Volume, slates_vfs::ids::InodeNo) {
   let mut host = SimHost::new();
   host.mkdir("/src");
   host.replace_file("/src/lib.rs", b"pub fn lib() {}");
   host.replace_file("/src/main.rs", b"fn main() {}");
+  host.advance_ns(2);
   let mut store = store();
   let mut vol = overlay(&mut host, &mut store);
   assert_eq!(
@@ -350,6 +352,58 @@ fn a_racy_in_place_edit_is_caught_by_rehashing() {
   );
 }
 
+/// Format: a wall-clock instant at Unix scale (2023-11-14T22:13:20Z in nanoseconds), where a
+/// real host's file timestamps live.
+const UNIX_SCALE_NS: i64 = 1_700_000_000_000_000_000;
+
+/// The racy rule (§4.5) is a question about the filesystem's clock: a witness is racy only when
+/// the listing was read within the timestamp granularity of the file's last change *in the host's
+/// clock*. With the daemon's own clock (`HostClock`, monotonic nanoseconds since the clock was
+/// made) and a host whose timestamps sit at Unix scale, a file a whole second older than the
+/// listing is not racy; comparing the two clock domains called every such witness racy and
+/// re-hashed every drift check (docs/bugs/2026-09-14-racy-rule-compares-monotonic-with-wall-clock.md).
+#[test]
+fn a_witness_is_racy_only_within_the_hosts_own_clock() {
+  let mut host = SimHost::new();
+  host.set_granularity_ns(1_000);
+  host.advance_ns(UNIX_SCALE_NS);
+  host.replace_file("/old.txt", b"written a second ago");
+  host.advance_ns(1_000_000_000);
+  let mut store = store();
+  let root = host.root();
+  let facts = host.facts(root).unwrap();
+  let mut vol = Volume::create_overlay(
+    &mut store,
+    VolumeConfig {
+      prefix: 7,
+      names: NameEquivalence::Exact,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 20,
+      clock: Box::new(slates_vfs::clock::HostClock::new()),
+    },
+    BaseConfig {
+      root,
+      facts,
+      large_class_bytes: LARGE,
+    },
+  )
+  .unwrap();
+  let f = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/old.txt")
+    .unwrap()
+    .inode;
+  vol
+    .with_host(&mut host)
+    .chmod(&mut store, f, 0o600)
+    .unwrap();
+  let witness = vol.base_plane().unwrap().witness(f).unwrap();
+  assert!(
+    !witness.racy,
+    "a file a second older than the listing, at a microsecond granularity, is not racy"
+  );
+}
+
 /// T-1.12: `rm -r` of a 40k-entry base directory then recreate two files inside; expect one
 /// opaque directory over the whiteout, two overlay entries, and a merged listing of exactly two.
 #[test]
@@ -464,6 +518,415 @@ fn a_watcher_overflow_rechecks_everything() {
     status.drift,
     vec![("/b.txt".to_owned(), DriftKind::Replaced)]
   );
+}
+
+// ------------------------------------------------------------------ the clean-file digest (§4.15)
+
+/// Format: the BLAKE3 of the empty input, the published BLAKE3 test vector for `input_len` 0
+/// (BLAKE3 specification, `test_vectors.json`).
+const BLAKE3_EMPTY: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+/// Format: the BLAKE3 of the one-byte input `0x00`, the published test vector for `input_len` 1
+/// (the vectors' input is the byte sequence 0, 1, 2, …, so its one-byte prefix is `0x00`).
+const BLAKE3_ONE_ZERO_BYTE: &str =
+  "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213";
+
+fn hex(bytes: &[u8]) -> String {
+  bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn digest_of(
+  vol: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+  path: &str,
+) -> Result<slates_vfs::base::Digest, VfsError> {
+  vol.with_host(host).digest(store, path)
+}
+
+/// AC-1.17 / T-1.21 (§4.15: "a verified content digest ... names exactly the current immutable
+/// file bytes"): a clean base file exports the BLAKE3 of the bytes the disk holds and their
+/// length, and the export does not diverge the entry; the entry the agent edited refuses
+/// `DigestNotClean` rather than name bytes that are not the disk's; a directory and a missing
+/// path refuse as themselves.
+#[test]
+fn a_clean_base_file_exports_its_verified_digest_and_a_diverged_entry_refuses() {
+  let (mut host, mut store, mut vol, _) = worked_example();
+  let digest = digest_of(&mut vol, &mut host, &mut store, "/src/main.rs").unwrap();
+  assert_eq!(digest.identity, *blake3::hash(b"fn main() {}").as_bytes());
+  assert_eq!(digest.size, 12);
+  assert_eq!(
+    digest_of(&mut vol, &mut host, &mut store, "/src/lib.rs"),
+    Err(VfsError::DigestNotClean),
+    "the agent's edit is not the disk's bytes"
+  );
+  assert_eq!(
+    digest_of(&mut vol, &mut host, &mut store, "/src"),
+    Err(VfsError::IsDirectory)
+  );
+  assert_eq!(
+    digest_of(&mut vol, &mut host, &mut store, "/src/none.rs"),
+    Err(VfsError::NotFound)
+  );
+  assert_eq!(
+    vol.base_plane().unwrap().digest_stats().computed,
+    1,
+    "one digest was computed"
+  );
+  assert!(
+    vol
+      .diverged(&store)
+      .iter()
+      .all(|d| d.path != "/src/main.rs"),
+    "a digest does not diverge the entry"
+  );
+}
+
+/// §4.15 "missing or stale cache knowledge cannot produce a clean digest": an outsider replaces
+/// the file with a new inode, overwrites it in place in a later tick, overwrites it again in the
+/// same tick with the same length (a fingerprint that cannot tell), and removes it; every export
+/// names the disk as it is at that moment, never an earlier digest.
+#[test]
+fn a_digest_is_never_stale_beneath_outsider_edits() {
+  let mut host = SimHost::new();
+  host.replace_file("/f", b"one");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let first = digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(first.identity, *blake3::hash(b"one").as_bytes());
+  assert_eq!(first.size, 3);
+
+  host.advance_ns(5);
+  host.replace_file("/f", b"two");
+  let replaced = digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(replaced.identity, *blake3::hash(b"two").as_bytes());
+
+  host.write_in_place("/f", b"three", 5);
+  let rewritten = digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(rewritten.identity, *blake3::hash(b"three").as_bytes());
+  assert_eq!(rewritten.size, 5);
+
+  // Same inode, same length, same tick: only the bytes differ.
+  host.write_in_place("/f", b"3hree", 0);
+  let racy = digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(racy.identity, *blake3::hash(b"3hree").as_bytes());
+
+  host.remove("/f");
+  assert_eq!(
+    digest_of(&mut vol, &mut host, &mut store, "/f"),
+    Err(VfsError::NotFound)
+  );
+}
+
+/// The determinism gate and the golden vectors (§4.15; the digest is hashed on the wire): an
+/// empty file and a one-byte file digest to the published BLAKE3 test vectors, a large-class file
+/// digested in bounded windows equals the whole-buffer hash (the byte oracle), and two exports of
+/// unchanged content are identical.
+#[test]
+fn a_digest_is_deterministic_and_matches_the_published_blake3_vectors() {
+  let mut host = SimHost::new();
+  host.replace_file("/empty", b"");
+  host.replace_file("/zero", &[0u8]);
+  let big: Vec<u8> = (0..(3 * LARGE))
+    .map(|i| u8::try_from(i % 251).unwrap())
+    .collect();
+  host.replace_file("/big", &big);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+
+  let empty = digest_of(&mut vol, &mut host, &mut store, "/empty").unwrap();
+  assert_eq!(hex(&empty.identity), BLAKE3_EMPTY);
+  assert_eq!(empty.size, 0);
+  let zero = digest_of(&mut vol, &mut host, &mut store, "/zero").unwrap();
+  assert_eq!(hex(&zero.identity), BLAKE3_ONE_ZERO_BYTE);
+  assert_eq!(zero.size, 1);
+  let large = digest_of(&mut vol, &mut host, &mut store, "/big").unwrap();
+  assert_eq!(
+    large.identity,
+    *blake3::hash(&big).as_bytes(),
+    "the windowed digest equals the whole-buffer hash"
+  );
+  assert_eq!(large.size, 3 * LARGE);
+  let again = digest_of(&mut vol, &mut host, &mut store, "/big").unwrap();
+  assert_eq!(
+    again, large,
+    "two exports of unchanged content are identical"
+  );
+}
+
+fn stats(vol: &Volume) -> slates_vfs::base::DigestStats {
+  vol.base_plane().unwrap().digest_stats()
+}
+
+fn inode_of(
+  vol: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+  path: &str,
+) -> slates_vfs::ids::InodeNo {
+  vol.with_host(host).resolve(store, path).unwrap().inode
+}
+
+/// The reuse path: a second export of unchanged content is served from the kept digest after the
+/// disk re-verified it — one hash, one reuse, one kept.
+fn assert_second_export_reuses(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
+  let first = digest_of(vol, host, store, "/a").unwrap();
+  let again = digest_of(vol, host, store, "/a").unwrap();
+  assert_eq!(first, again);
+  assert_eq!(stats(vol).computed, 1, "one hash");
+  assert_eq!(
+    stats(vol).revalidated,
+    1,
+    "the second export reused the verified digest"
+  );
+  assert_eq!(stats(vol).cached, 1);
+}
+
+/// A content write and a metadata change each drop the kept digest before the mutation and leave
+/// the entry `DigestNotClean` — never the pre-mutation digest.
+fn assert_write_and_chmod_invalidate(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
+  let a = inode_of(vol, host, store, "/a");
+  vol.with_host(host).write(store, a, 0, b"A").unwrap();
+  assert_eq!(
+    digest_of(vol, host, store, "/a"),
+    Err(VfsError::DigestNotClean),
+    "never the pre-mutation digest"
+  );
+  assert_eq!(stats(vol).invalidated, 1, "dropped before the write");
+  assert_eq!(stats(vol).cached, 0);
+
+  let b = inode_of(vol, host, store, "/b");
+  digest_of(vol, host, store, "/b").unwrap();
+  vol.with_host(host).chmod(store, b, 0o600).unwrap();
+  assert_eq!(
+    digest_of(vol, host, store, "/b"),
+    Err(VfsError::DigestNotClean),
+    "a metadata mutation diverges the entry too"
+  );
+  assert_eq!(stats(vol).invalidated, 2);
+}
+
+/// A rename and an unlink drop the kept digest as the entry leaves its name.
+fn assert_rename_and_unlink_invalidate(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
+  digest_of(vol, host, store, "/c").unwrap();
+  let root = vol.root();
+  vol
+    .with_host(host)
+    .rename(store, root, "c", root, "c2")
+    .unwrap();
+  assert_eq!(stats(vol).invalidated, 3);
+  assert_eq!(
+    digest_of(vol, host, store, "/c2"),
+    Err(VfsError::DigestNotClean)
+  );
+  assert_eq!(digest_of(vol, host, store, "/c"), Err(VfsError::NotFound));
+
+  digest_of(vol, host, store, "/d").unwrap();
+  vol.with_host(host).unlink(store, root, "d").unwrap();
+  assert_eq!(stats(vol).invalidated, 4);
+  assert_eq!(digest_of(vol, host, store, "/d"), Err(VfsError::NotFound));
+}
+
+/// §4.15 "invalidated before any mutation" over the bounded discovery cache (GAP-A9-13): a second
+/// export of unchanged content is served from the cached digest once the disk has re-verified it
+/// (the reuse path's counter moves, no second hash); a write drops the cached digest before the
+/// write is visible and every later export refuses `DigestNotClean` — never the pre-mutation
+/// digest; chmod, rename and unlink invalidate the same way, so no slot is left holding stale
+/// knowledge.
+#[test]
+fn a_second_export_reuses_the_verified_digest_and_a_mutation_invalidates_it_first() {
+  let mut host = SimHost::new();
+  for (name, bytes) in [
+    ("a", "alpha"),
+    ("b", "bravo"),
+    ("c", "charlie"),
+    ("d", "delta"),
+  ] {
+    host.replace_file(&format!("/{name}"), bytes.as_bytes());
+  }
+  // Past the timestamp granularity: the files' ticks are closed, so a digest may be kept.
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  assert_second_export_reuses(&mut vol, &mut host, &mut store);
+  assert_write_and_chmod_invalidate(&mut vol, &mut host, &mut store);
+  assert_rename_and_unlink_invalidate(&mut vol, &mut host, &mut store);
+  assert_eq!(stats(&vol).cached, 0, "no slot holds stale knowledge");
+  assert_eq!(store.digests.live(), 0, "every shard slot is returned");
+}
+
+/// Digests `capacity + 1` clean files: the cache fills, the last is refused a slot; returns the
+/// last file's path.
+fn fill_digest_cache(
+  vol: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+  capacity: usize,
+) -> String {
+  for index in 0..=capacity {
+    digest_of(vol, host, store, &format!("/f{index}")).unwrap();
+  }
+  assert_eq!(stats(vol).cached, u64::try_from(capacity).unwrap());
+  assert_eq!(
+    stats(vol).cache_full,
+    1,
+    "the one past the bound was refused a slot"
+  );
+  assert_eq!(store.digests.live(), capacity);
+  format!("/f{capacity}")
+}
+
+/// An invalidation frees a slot: the next export of `last` is kept, and the one after it reused.
+fn assert_slot_freed_on_invalidation(
+  vol: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+  capacity: usize,
+  last: &str,
+) {
+  let f0 = inode_of(vol, host, store, "/f0");
+  vol.with_host(host).write(store, f0, 0, b"F").unwrap();
+  assert_eq!(store.digests.live(), capacity - 1);
+  digest_of(vol, host, store, last).unwrap();
+  assert_eq!(stats(vol).cache_full, 2, "kept this time: a slot was free");
+  assert_eq!(store.digests.live(), capacity);
+  digest_of(vol, host, store, last).unwrap();
+  assert_eq!(stats(vol).revalidated, 1);
+}
+
+/// §4.15 "bounded cache discovery" (banned item 8): the shard's digest cache holds at most its
+/// derived capacity; past it a fresh digest is still exported but not kept — the typed refusal is
+/// counted and the next export hashes again — and an invalidation frees a slot, so the next
+/// export is kept and then reused.
+#[test]
+fn the_digest_cache_refuses_at_its_derived_bound_and_frees_a_slot_on_invalidation() {
+  let mut store = store();
+  let capacity = store.digests.capacity();
+  assert!(capacity > 0, "a store with inodes caches digests");
+  // The measured point for the record (docs/wip/clean-digest.md): the fixture's derived bound.
+  println!(
+    "digest cache capacity: {capacity} records for max_inodes 65536 (size_of::<Inode>() = {})",
+    std::mem::size_of::<slates_vfs::inode::Inode>()
+  );
+  let mut host = SimHost::new();
+  for index in 0..=capacity {
+    host.replace_file(&format!("/f{index}"), format!("file {index}").as_bytes());
+  }
+  host.advance_ns(2);
+  let mut vol = overlay(&mut host, &mut store);
+  let last = fill_digest_cache(&mut vol, &mut host, &mut store, capacity);
+  digest_of(&mut vol, &mut host, &mut store, &last).unwrap();
+  assert_eq!(
+    stats(&vol).cache_full,
+    2,
+    "still refused: nothing was freed"
+  );
+  assert_eq!(stats(&vol).revalidated, 0);
+  assert_slot_freed_on_invalidation(&mut vol, &mut host, &mut store, capacity, &last);
+}
+
+/// The racy rule (§4.5) applied to the cache: a digest computed while the file's timestamp tick is
+/// still open — within the filesystem's granularity of the host's clock — could be silently
+/// invalidated by a same-tick write the fingerprint cannot show, so it is exported but never kept;
+/// once the tick has closed it is kept and reused.
+#[test]
+fn a_digest_computed_inside_the_racy_window_is_not_cached() {
+  let mut host = SimHost::new();
+  host.set_granularity_ns(1_000);
+  host.replace_file("/f", b"fresh");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(stats(&vol).racy_uncached, 1);
+  assert_eq!(stats(&vol).cached, 0);
+  digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(stats(&vol).computed, 2, "hashed again, never reused");
+  assert_eq!(stats(&vol).revalidated, 0);
+
+  host.advance_ns(1_001);
+  digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(stats(&vol).cached, 1, "the tick has closed");
+  digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(stats(&vol).revalidated, 1);
+}
+
+/// §4.15 "watcher hints backed by revalidation" (T-1.21): a hint naming a directory makes the
+/// plane re-verify every digest kept beneath it against the disk — the hint triggers the check,
+/// the fingerprint decides — so an outsider's replacement is dropped and the next export hashes
+/// the new bytes, while the untouched neighbour survives the same hint and is reused; a later
+/// hint with nothing changed beneath the kept digests (an outsider created another file) re-checks
+/// and keeps them all. A hint alone never yields a digest.
+#[test]
+fn a_watcher_hint_revalidates_kept_digests_and_drops_only_the_changed() {
+  let mut host = SimHost::new();
+  host.mkdir("/d");
+  host.replace_file("/d/a", b"a one");
+  host.replace_file("/d/b", b"b one");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  digest_of(&mut vol, &mut host, &mut store, "/d/a").unwrap();
+  digest_of(&mut vol, &mut host, &mut store, "/d/b").unwrap();
+  assert_eq!(stats(&vol).cached, 2);
+  assert_hint_drops_only_the_replaced(&mut vol, &mut host, &mut store);
+  assert_hint_with_no_change_keeps(&mut vol, &mut host, &mut store);
+}
+
+/// An outsider replaces `a`: the watched directory hints; both kept digests beneath it are
+/// re-verified, only `a`'s is dropped, `a` is hashed again and `b` is reused.
+fn assert_hint_drops_only_the_replaced(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
+  host.replace_file("/d/a", b"a two");
+  host.advance_ns(2);
+  vol.with_host(host).status(store).unwrap();
+  assert_eq!(
+    stats(vol).hint_rechecked,
+    2,
+    "both digests beneath /d were re-verified"
+  );
+  assert_eq!(stats(vol).stale, 1, "only the replaced one was dropped");
+  assert_eq!(stats(vol).cached, 1);
+  let a = digest_of(vol, host, store, "/d/a").unwrap();
+  assert_eq!(a.identity, *blake3::hash(b"a two").as_bytes());
+  assert_eq!(stats(vol).computed, 3, "the replaced file was hashed again");
+  digest_of(vol, host, store, "/d/b").unwrap();
+  assert_eq!(stats(vol).revalidated, 1, "the neighbour was reused");
+  assert_eq!(stats(vol).cached, 2);
+}
+
+/// A hint with nothing changed beneath the kept digests (an outsider created `c`): both are
+/// re-verified and kept, and the next export is reused.
+fn assert_hint_with_no_change_keeps(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
+  host.replace_file("/d/c", b"c one");
+  host.advance_ns(2);
+  vol.with_host(host).status(store).unwrap();
+  assert_eq!(stats(vol).hint_rechecked, 4);
+  assert_eq!(stats(vol).stale, 1, "nothing beneath the hint had changed");
+  assert_eq!(stats(vol).cached, 2);
+  digest_of(vol, host, store, "/d/b").unwrap();
+  assert_eq!(stats(vol).revalidated, 2);
+}
+
+/// §4.15 "watcher overflow invalidates affected cache knowledge": on an overflow the watcher lost
+/// events, so every kept digest is dropped (counted) and returned to the shard, and the next
+/// export hashes again rather than trust knowledge the hints can no longer protect.
+#[test]
+fn a_watcher_overflow_drops_every_kept_digest() {
+  let mut host = SimHost::new();
+  host.replace_file("/a", b"a");
+  host.replace_file("/b", b"b");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  digest_of(&mut vol, &mut host, &mut store, "/a").unwrap();
+  digest_of(&mut vol, &mut host, &mut store, "/b").unwrap();
+  assert_eq!(stats(&vol).cached, 2);
+  host.watcher_overflow();
+  vol.with_host(&mut host).status(&mut store).unwrap();
+  assert_eq!(stats(&vol).dropped_on_overflow, 2);
+  assert_eq!(stats(&vol).cached, 0);
+  assert_eq!(store.digests.live(), 0, "every slot went back to the shard");
+  digest_of(&mut vol, &mut host, &mut store, "/a").unwrap();
+  assert_eq!(stats(&vol).computed, 3, "hashed again after the overflow");
+  assert_eq!(stats(&vol).revalidated, 0);
 }
 
 // ------------------------------------------------------------------ the oracle (T-1.10, AC-1.10)

@@ -2526,6 +2526,21 @@ missing or stale cache knowledge cannot produce a clean digest. Discovery uses b
 and cooperative slices. This is a planned optimization, validated by a counter and a byte
 oracle before it supports a fast path; no performance gain is assumed.
 
+> **Status (2026-09-14, digest).** The clean-file digest of this paragraph is implemented
+> single-node (`crates/vfs/src/base.rs` "digests"; `docs/wip/clean-digest.md`): `digest(volume,
+> path)` exports the BLAKE3 of an untouched base entry's bytes verified current — the listing
+> validated, the path re-opened and matched by identity to the held descriptor, the fingerprint
+> compared before and after a windowed hash — and refuses typed (`DigestNotClean` for any diverged
+> entry or symlink, `DigestUnverified` for a file changing under the hash) rather than ever export
+> a stale digest. Verified digests are kept in a per-shard cache bounded by a derived share of the
+> inode table (a typed, counted refusal at the bound; the export still succeeds), dropped before
+> every mutation of the entry and whenever the disk no longer matches, never kept when computed
+> inside the racy window (the host's own clock supplies "now" through `HostFs::now_ns`); a watcher
+> hint re-verifies the digests beneath the named directory by fingerprint and an overflow drops
+> them all. Validated by the counters (`DigestStats`) and the byte oracle (a windowed digest equals
+> the whole-buffer hash; the published BLAKE3 vectors). Owed: cooperative slicing of the hash
+> across shard steps, digests of sealed overlay content, SDK exposure.
+
 **Role.** Make an existing host directory the base of a volume without copying it; keep the
 agent's view honest when the disk moves; and write the agent's diverged entries back to that
 disk, or to any directory the human names, only under a grant, with a pure per-entry verdict, one

@@ -1,7 +1,7 @@
 //! The client verbs: one connection, one request, the reply printed in a stable plain form.
 
 use slates_client::{
-  AuditEntry, ChokepointReport, Client, ClientError, CreateSpec, DaemonReport, Deadlines,
+  AuditEntry, ChokepointReport, Client, ClientError, CreateSpec, DaemonReport, Deadlines, Digest,
   GrantScope, GrantSummary, Intent, Landing, Rebased, Scope, SnapshotId, StatusReport, Submitted,
   TelemetryReport, VolumeId, VolumeSummary,
 };
@@ -639,6 +639,15 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       let _ = out.write_all(&bytes);
       let _ = out.flush();
     }
+    Verb::Digest { volume, path } => {
+      let digest = client.digest(*volume, path)?;
+      if json {
+        println!("{}", digest_json(path, &digest));
+      } else {
+        println!("identity: {}", hex32(&digest.identity));
+        println!("size: {}", digest.size);
+      }
+    }
     Verb::Rewitness { volume, paths } => emit_rewitness(client, *volume, paths.clone(), json)?,
     Verb::Pin { volume, paths } => emit_pin(client, *volume, paths.clone(), json)?,
     Verb::Land {
@@ -747,6 +756,17 @@ fn print_landing(landing: slates_client::Landing) {
 /// Format: a 32-byte hash printed as 64 hexadecimal characters.
 fn hex32(bytes: &[u8; 32]) -> String {
   bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A clean file's digest as JSON (the MCP `slates.base.digest` schema): the path asked for, the
+/// BLAKE3 as 64 hex digits, and the length digested — the same bytes for the same content, so a
+/// script can compare two exports textually.
+fn digest_json(path: &str, digest: &Digest) -> serde_json::Value {
+  serde_json::json!({
+    "path": path,
+    "identity": hex32(&digest.identity),
+    "size": digest.size,
+  })
 }
 
 fn option_text<T: std::fmt::Display>(value: Option<T>) -> String {
@@ -938,8 +958,8 @@ pub(crate) fn profile(options: &ProfileOptions) -> Result<(), Failure> {
 
 #[cfg(test)]
 mod tests {
-  use super::{chokepoint_value, signal_value};
-  use slates_client::{AbsenceIs, ChokepointReport, Signal};
+  use super::{chokepoint_value, digest_json, signal_value};
+  use slates_client::{AbsenceIs, ChokepointReport, Digest, Signal};
 
   /// A chokepoint renders its activity when fresh, and `absent/<meaning>` when its newest span is past
   /// the horizon or it never reported — the stale age stated as a last sighting, never as a live value
@@ -970,6 +990,29 @@ mod tests {
     assert_eq!(
       chokepoint_value(&entry(0, None, false, false)),
       "absent/unknown (never; no producer here (client verb))"
+    );
+  }
+
+  /// `base digest --json` renders the MCP schema: the path, the BLAKE3 as 64 lowercase hex digits
+  /// and the size; the same digest renders to the same text twice (the determinism gate at the
+  /// CLI). Do: render a digest whose identity is the published BLAKE3 of the empty input. Expect:
+  /// that hex string, the size, the path, and an identical second rendering.
+  #[test]
+  fn a_digest_renders_to_json_as_hex_identity_size_and_path() {
+    /// Format: the BLAKE3 of the empty input, the published test vector for `input_len` 0.
+    const EMPTY_HEX: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+    let mut identity = [0u8; 32];
+    for (byte, pair) in identity.iter_mut().zip(EMPTY_HEX.as_bytes().chunks(2)) {
+      *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+    }
+    let digest = Digest { identity, size: 0 };
+    let rendered = digest_json("/src/lib.rs", &digest);
+    assert_eq!(rendered["identity"], EMPTY_HEX);
+    assert_eq!(rendered["size"], 0);
+    assert_eq!(rendered["path"], "/src/lib.rs");
+    assert_eq!(
+      rendered.to_string(),
+      digest_json("/src/lib.rs", &digest).to_string()
     );
   }
 

@@ -918,6 +918,75 @@ fn current_uid() -> u32 {
   rustix::process::getuid().as_raw()
 }
 
+/// §4.15 the clean-file digest over the wire (AC-1.17 / T-1.21): over an overlay of this crate's
+/// source tree, the digest of an untouched base file names exactly the bytes `read_base` returns,
+/// two exports encode to the same bytes (the determinism gate on the wire), a pinned (witnessed)
+/// entry refuses the typed `DigestNotClean` rather than a stale digest, and a scratch volume has
+/// no base to digest.
+fn digest_scenario() {
+  let (daemon, instance) = daemon("digest");
+  let mut client = Client::connect(&instance);
+  let base = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+  let ReplyBody::Created { id: overlay } = client.call(&RequestBody::Create {
+    name: "digest-over".into(),
+    size: SizeClass::Dynamic { max: 1 << 24 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: Some(base.to_owned()),
+  }) else {
+    panic!("create overlay");
+  };
+  let ReplyBody::BaseBytes { bytes } = client.call(&RequestBody::ReadBase {
+    volume: overlay,
+    path: "/lib.rs".into(),
+  }) else {
+    panic!("read_base");
+  };
+  let digest = RequestBody::Digest {
+    volume: overlay,
+    path: "/lib.rs".into(),
+  };
+  let ReplyBody::Digest { identity, size } = client.call(&digest) else {
+    panic!("digest");
+  };
+  assert_eq!(identity, *blake3::hash(&bytes).as_bytes());
+  assert_eq!(size, u64::try_from(bytes.len()).unwrap());
+  assert_eq!(
+    slates_ipc::protocol::encode_body(&client.call(&digest)),
+    slates_ipc::protocol::encode_body(&ReplyBody::Digest { identity, size }),
+    "two exports of unchanged content are byte-identical on the wire"
+  );
+  assert!(matches!(
+    client.call(&RequestBody::Pin {
+      volume: overlay,
+      paths: Some(vec!["/lib.rs".into()])
+    }),
+    ReplyBody::Pinned { entries: 1 }
+  ));
+  assert!(
+    matches!(
+      client.call(&digest),
+      ReplyBody::Refused {
+        refusal: Refusal::DigestNotClean
+      }
+    ),
+    "a pinned entry is witnessed, so it is no longer clean: typed, never stale"
+  );
+  let ReplyBody::Created { id: scratch_id } = client.call(&scratch("digest-scratch")) else {
+    panic!("create scratch");
+  };
+  assert!(matches!(
+    client.call(&RequestBody::Digest {
+      volume: scratch_id,
+      path: "/x".into()
+    }),
+    ReplyBody::Refused {
+      refusal: Refusal::Unsupported { .. }
+    }
+  ));
+  daemon.stop();
+}
+
 /// The scenarios run one daemon at a time (each daemon runs shard threads that spin while a
 /// client is active; several at once would starve each other on one machine).
 #[test]
@@ -927,6 +996,7 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
   lease_scenario();
   landing_refusal_scenario();
   bulk_and_overlay_scenario();
+  digest_scenario();
   // §4.2/§4.5 version-slab reservation scenarios run here, one daemon at a time, for the same reason.
   version_reservation_scenario();
   version_reservation_moves_on_resize_scenario();

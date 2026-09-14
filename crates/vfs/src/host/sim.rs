@@ -622,6 +622,11 @@ impl HostFs for SimHost {
   fn hints(&mut self) -> Vec<Hint> {
     std::mem::take(&mut self.hints)
   }
+
+  fn now_ns(&mut self) -> i64 {
+    self.calls += 1;
+    self.now_ns
+  }
 }
 
 impl SimHost {

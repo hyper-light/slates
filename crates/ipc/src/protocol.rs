@@ -384,6 +384,15 @@ pub enum RequestBody {
     /// The shard's partition, as `DaemonStatus` reports it.
     partition: u16,
   },
+  /// The verified content digest of a clean base file (§4.15 `digest`): the BLAKE3 of the bytes
+  /// the disk holds for an untouched entry, verified current at the export; an entry the volume
+  /// diverged refuses `DigestNotClean`, a file changing under the hash `DigestUnverified`. A read.
+  Digest {
+    /// The volume.
+    volume: VolumeId,
+    /// The path.
+    path: String,
+  },
 }
 
 /// What a signal's absence means (§4.14, A-9): a missing sample is never silently read as "healthy".
@@ -1111,6 +1120,13 @@ pub enum Refusal {
   /// The caller's consumer enrollment was revoked by a human; every later effect refuses (§4.13
   /// "Refusals added"; revocation reaches a live session before its next protected verb).
   ConsumerRevoked,
+  /// No clean digest exists for the entry (§4.15): it is not an untouched regular base file (the
+  /// volume created, copied up, pinned or lost it, or it is a symlink), so a digest would name
+  /// bytes that are not the disk's. Read and hash the bytes instead.
+  DigestNotClean,
+  /// The file changed on the disk while it was being digested (§4.15 "verified current"): nothing
+  /// stale is exported; retry.
+  DigestUnverified,
 }
 
 /// A reply body. (`Eq` is not derived: a [`Refusal`] may carry measured probabilities.)
@@ -1282,6 +1298,13 @@ pub enum ReplyBody {
   Telemetry {
     /// The batch.
     report: TelemetryReport,
+  },
+  /// A clean file's verified content digest (§4.15).
+  Digest {
+    /// BLAKE3 of the file's bytes as the disk holds them.
+    identity: [u8; 32],
+    /// The length digested, in bytes.
+    size: u64,
   },
 }
 

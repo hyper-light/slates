@@ -124,6 +124,8 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
     VfsError::Memory(MemError::BudgetExceeded { available, .. }) => Refusal::BudgetExceeded {
       available: *available,
     },
+    VfsError::DigestNotClean => Refusal::DigestNotClean,
+    VfsError::DigestUnverified => Refusal::DigestUnverified,
     other => Refusal::BadRequest {
       reason: format!("{other:?}"),
     },

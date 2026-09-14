@@ -43,6 +43,18 @@ pub enum VfsError {
   BaseDrift,
   /// A base-plane verb on a scratch volume, or a path the base does not hold.
   NotOverlay,
+  /// No clean digest exists for the entry (§4.15): it is not an untouched regular base file — the
+  /// volume created it, copied it up (a write, truncate, chmod, link or rename), pinned it or lost
+  /// it to drift, or it is a symlink — so a digest would name bytes that are not the disk's. Read
+  /// and hash the bytes instead.
+  DigestNotClean,
+  /// The file changed on the disk while it was being digested (§4.15 "verified current"): nothing
+  /// stale is exported; retry.
+  DigestUnverified,
+  /// The shard's digest cache is at its derived bound (§4.15 "bounded cache discovery", §4.2): a
+  /// fresh digest is exported but not kept. Raised by the cache's admission only, counted by the
+  /// plane, never surfaced by `digest` itself.
+  DigestCacheFull,
   /// A resource a recovery needs is missing or unreadable: a truncated or corrupt volume image,
   /// or a body this recovery slice does not yet capture (a base-backed entry). §4.8 (A-9)
   /// requires this over an empty success — a partial recovery must refuse, never silently
@@ -76,6 +88,9 @@ impl VfsError {
       Self::Destroying | Self::Archived | Self::Pinned => "EBUSY",
       Self::BaseUnavailable(_) | Self::BaseDrift | Self::RecoveryIncomplete => "EIO",
       Self::NotOverlay => "ENODEV",
+      Self::DigestNotClean => "ENODATA",
+      Self::DigestUnverified => "EAGAIN",
+      Self::DigestCacheFull => "ENOSPC",
       Self::PolicyMismatch => "EINVAL",
       Self::Memory(_) => "ENOMEM",
     }

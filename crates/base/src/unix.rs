@@ -155,6 +155,12 @@ impl HostFs for OsHost {
     })
   }
 
+  fn now_ns(&mut self) -> i64 {
+    // The clock `stat` stamps files from (`CLOCK_REALTIME`), in the fingerprints' nanoseconds.
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::Realtime);
+    stamp_ns(widen(now.tv_sec), widen(now.tv_nsec))
+  }
+
   fn fingerprint_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {
     let fd = self.dir(dir)?;
     rustix::fs::fstat(fd)

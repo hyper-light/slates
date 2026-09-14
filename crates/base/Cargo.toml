@@ -17,6 +17,8 @@ libc = { workspace = true }
 
 [dev-dependencies]
 slates-mem = { workspace = true }
+# The differential's other leg for the clean-file digest (§4.15): the standard library's bytes hashed here.
+blake3 = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

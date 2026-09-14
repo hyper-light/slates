@@ -1302,6 +1302,7 @@ dependencies = [
 name = "slates-base"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "libc",
  "rustix",
  "slates-machine",

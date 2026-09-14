@@ -6,7 +6,7 @@
 //! The surface covers the merge loop (§4.16: create a green, clone a work, edit content, declare
 //! namespace operations, submit, rebase, read the chain), the volume lifecycle (create, list, stat,
 //! snapshot, clone, resize, destroy), attach and
-//! detach, the base operations (read_base, rewitness, pin), `slates.status`, and `slates.land`
+//! detach, the base operations (read_base, digest, rewitness, pin), `slates.status`, and `slates.land`
 //! (materialize, which returns `GrantRequired`). Owed toward the full §4.12: `slates.fs` (the mount
 //! path), Streamable HTTP, resources and prompts.
 //!
@@ -120,6 +120,7 @@ impl McpServer {
       "slates.attach.attach" => self.attach(&args),
       "slates.attach.detach" => self.detach(&args),
       "slates.base.read_base" => self.read_base(&args),
+      "slates.base.digest" => self.digest(&args),
       "slates.base.rewitness" => self.rewitness(&args),
       "slates.base.pin" => self.pin(&args),
       "slates.land.materialize" => self.land_materialize(&args),
@@ -311,6 +312,21 @@ impl McpServer {
       "path": path,
       "len": bytes.len(),
       "text": String::from_utf8_lossy(&bytes),
+    }))
+  }
+
+  /// `slates.base.digest` (§4.15): a clean base file's verified content digest — the BLAKE3 as
+  /// 64 hex digits and the length digested; a diverged entry is the typed `DigestNotClean`
+  /// refusal, so an agent reads and hashes those bytes itself rather than trust a stale digest.
+  fn digest(&mut self, args: &Value) -> Result<Value, McpError> {
+    let volume = volume_arg(args, "volume")?;
+    let path = string_arg(args, "path")?;
+    let digest = self.client.digest(volume, &path).map_err(refusal)?;
+    let identity: String = digest.identity.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(json!({
+      "path": path,
+      "identity": identity,
+      "size": digest.size,
     }))
   }
 
@@ -542,6 +558,12 @@ fn tool_list() -> Vec<Value> {
     tool(
       "slates.base.read_base",
       "Read a file's bytes from a volume's base (the text form and the exact length).",
+      json!({ "volume": string, "path": string }),
+      json!(["volume", "path"]),
+    ),
+    tool(
+      "slates.base.digest",
+      "A clean base file's verified content digest: its BLAKE3 as hex and its length; refused `DigestNotClean` for an entry the volume changed.",
       json!({ "volume": string, "path": string }),
       json!(["volume", "path"]),
     ),

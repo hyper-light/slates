@@ -129,6 +129,11 @@ pub trait HostFs {
   fn watch(&mut self, dir: HostDir) -> WatchState;
   /// Drains the hints that arrived since the last call (never blocks).
   fn hints(&mut self) -> Vec<Hint>;
+  /// The host's clock, in the domain of its fingerprints' timestamps (the operating system's
+  /// wall clock in the units `fstat` reports; the simulated clock in the simulator). The racy
+  /// rule asks "is this file's timestamp tick still open?", a question about the filesystem's
+  /// clock, never the volume's monotonic one.
+  fn now_ns(&mut self) -> i64;
 }
 
 /// What a target filesystem offers the landing, probed inside the granted target (§4.15

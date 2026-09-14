@@ -17,6 +17,11 @@ use crate::{FsKind, granularity_for};
 
 /// Format: Windows file times count 100 ns intervals since 1601.
 const HUNDRED_NS: i64 = 100;
+/// Format: the FILETIME epoch (1601-01-01) precedes the Unix epoch (1970-01-01) by 11,644,473,600
+/// seconds, so a Unix time enters the FILETIME domain the fingerprints use by adding it.
+const FILETIME_EPOCH_OFFSET_S: i64 = 11_644_473_600;
+/// Format: nanoseconds per second.
+const NS_PER_S: i64 = 1_000_000_000;
 
 /// The Windows host.
 #[derive(Debug)]
@@ -170,6 +175,18 @@ impl HostFs for OsHost {
     Ok(HostFacts {
       timestamp_granularity_ns: granularity_for(FsKind::Unknown),
     })
+  }
+
+  fn now_ns(&mut self) -> i64 {
+    // The fingerprints' timestamps are FILETIME nanoseconds (`filetime_ns`), so "now" is too.
+    let since_unix = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap_or(std::time::Duration::ZERO);
+    i64::try_from(since_unix.as_secs())
+      .unwrap_or(i64::MAX)
+      .saturating_add(FILETIME_EPOCH_OFFSET_S)
+      .saturating_mul(NS_PER_S)
+      .saturating_add(i64::from(since_unix.subsec_nanos()))
   }
 
   fn fingerprint_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {

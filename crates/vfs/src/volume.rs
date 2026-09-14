@@ -111,6 +111,11 @@ pub struct Store {
   /// the shard's metadata may take is bounded by the class, not by the machine. Unbounded until the
   /// admitting owner sets the class ([`Store::set_metadata_class`]), so fixtures are unaffected.
   pub metadata: MetadataBudget,
+  /// The shard's clean-file digest cache budget (§4.15 "bounded cache discovery"): one counted
+  /// capacity every overlay volume on the shard keeps its verified digests under, derived from the
+  /// inode table's size ([`crate::base::digest_capacity`]), so the caches together never exceed
+  /// their share of the reserve; at the bound a fresh digest is exported but not kept.
+  pub digests: crate::base::DigestBudget,
 }
 
 impl std::fmt::Debug for Store {
@@ -172,6 +177,9 @@ impl Store {
         COPY_UP_VERSION_HEADROOM,
       ),
       metadata: MetadataBudget::new(u64::MAX),
+      digests: crate::base::DigestBudget::new(
+        crate::base::digest_capacity(config.max_inodes).get(),
+      ),
     }
   }
 
@@ -1976,6 +1984,15 @@ impl Volume {
     Ok(())
   }
 
+  /// An overlay's kept digests return their slots to the shard's digest budget at destroy, as the
+  /// retained versions return their charge; the cache is discovery, never state, so dropping it
+  /// loses nothing (§4.15). Nothing to do for a scratch volume.
+  fn release_digest_cache(&mut self, store: &mut Store) {
+    if let Some(plane) = self.base.as_mut() {
+      plane.drop_all_digests(store);
+    }
+  }
+
   /// Begins destroying the volume; the deadlists and the head's own objects are released in
   /// cooperative slices by [`Volume::destroy_step`].
   pub fn destroy(&mut self, store: &mut Store) -> Result<(), VfsError> {
@@ -1999,6 +2016,8 @@ impl Volume {
     let bytes = self.retention_charged;
     let versions = self.versions_charged;
     self.credit_retention(store, bytes, versions);
+    // The volume's kept clean-file digests return their slots to the shard's digest budget (§4.15).
+    self.release_digest_cache(store);
     let mut queue = Vec::new();
     let snapshots: Vec<SnapshotId> = self.snapshot_ids().collect();
     for id in snapshots {
@@ -2914,7 +2933,7 @@ impl Volume {
     self.live_inodes = self.live_inodes.saturating_sub(1);
     // The base plane's descriptor, if one was held, is closed by the owner of the host at its
     // next `process_hints`; the tables forget the inode now.
-    let _ = self.base_forget(no);
+    let _ = self.base_forget(store, no);
     Ok(())
   }
 

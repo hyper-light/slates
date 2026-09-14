@@ -3,7 +3,10 @@
 //! first write copies an entry up and records the witnessed base (the stat fingerprint and the
 //! BLAKE3 of the bytes the edit was based on); deletes leave whiteouts; renamed base directories
 //! record their origin (a redirect); drift is detected by fingerprints under the racy rule and
-//! reported, never absorbed; watcher hints make reports prompt and are never the truth.
+//! reported, never absorbed; watcher hints make reports prompt and are never the truth. A clean
+//! file — an untouched base entry — exports a verified content digest ([`Overlay::digest`],
+//! §4.15): the BLAKE3 of the bytes the disk holds, verified current at the export by the file's
+//! identity and fingerprint, refused typed rather than ever stale.
 //!
 //! Ownership: the host is owned by whoever opened the base directory (the shard in Phase 2, the
 //! test here) and lent to each operation as `&mut dyn HostFs`; a volume holds only handles and
@@ -59,8 +62,11 @@ pub(crate) struct Listing {
   pub(crate) dir: HostDir,
   fingerprint: Option<Fingerprint>,
   entries: Option<Vec<BaseEntry>>,
-  /// The volume clock when the entries were read, for the racy rule.
-  read_at_ns: u64,
+  /// The host's clock when the entries were read (`HostFs::now_ns`, the fingerprints' own
+  /// domain), for the racy rule (§4.5): a witness is racy when the listing was read within the
+  /// timestamp granularity of the file's last change, a comparison that only means something
+  /// between two readings of the filesystem's clock.
+  read_at_ns: i64,
   watch: WatchState,
 }
 
@@ -108,6 +114,124 @@ pub struct Diverged {
   pub kind: Divergence,
 }
 
+/// A clean file's verified content digest (§4.15): the BLAKE3 of the bytes the disk holds for an
+/// untouched base entry and their length, verified against the file's identity and fingerprint
+/// at the moment of export.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Digest {
+  /// BLAKE3 of the file's bytes.
+  pub identity: [u8; 32],
+  /// The length digested, in bytes.
+  pub size: u64,
+}
+
+/// The digest verb's counters (§4.15: "validated by a counter and a byte oracle"): every path
+/// the verb and its cache can take, so a test asserts the one it drove moved and a silently dead
+/// reuse path can never pass as a working one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DigestStats {
+  /// Digests computed by reading and hashing the file.
+  pub computed: u64,
+  /// Exports served from a kept digest after the disk re-verified its fingerprint (the reuse
+  /// path).
+  pub revalidated: u64,
+  /// Kept digests dropped because the volume was about to mutate, or removed, the entry
+  /// (§4.15 "invalidated before any mutation").
+  pub invalidated: u64,
+  /// Kept digests dropped because the disk no longer matched them (a listing refresh, an export's
+  /// re-check, or a watcher hint's revalidation).
+  pub stale: u64,
+  /// Exports refused `DigestUnverified`: the file changed while it was being digested.
+  pub unverified: u64,
+  /// Digests not kept because the shard's cache was at its bound (`DigestCacheFull`).
+  pub cache_full: u64,
+  /// Digests not kept because they were computed inside the racy window (§4.5): a same-tick
+  /// write could change the bytes without moving the fingerprint.
+  pub racy_uncached: u64,
+  /// Kept digests re-verified against the disk because a watcher hint named their directory
+  /// (§4.15 "watcher hints backed by revalidation"); the stale ones count under `stale` too.
+  pub hint_rechecked: u64,
+  /// Kept digests dropped because the watcher overflowed (§4.15 "watcher overflow invalidates
+  /// affected cache knowledge").
+  pub dropped_on_overflow: u64,
+  /// Digests held now.
+  pub cached: u64,
+}
+
+/// One kept digest: the directory the entry is homed in (a watcher hint names a directory), the
+/// fingerprint the digest was verified under, and the identity of the bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CachedDigest {
+  home: InodeNo,
+  fingerprint: Fingerprint,
+  identity: [u8; 32],
+}
+
+/// A cache record as the shard's budget sizes it: the key and the kept digest.
+pub(crate) type DigestRecord = (InodeNo, CachedDigest);
+
+/// The divisor between the inode table's bytes and the clean-file digest cache's (§4.15 "bounded
+/// cache discovery"). The inode table is a sixth of a shard's reserve (the daemon's
+/// `STORE_TABLE_DIVISOR`), so the cache is about one percent of the reserve — a planned
+/// optimization's share ("no performance gain is assumed"), to be re-derived from the measured
+/// digest hit rate once the fast path it serves is measured.
+/// Shape: one sixteenth of the inode table's bytes.
+const DIGEST_SHARE_OF_INODE_TABLE: usize = 16;
+
+/// Derived: the digest records a shard may keep — the bytes of a sixteenth of its inode table over
+/// one record's size — so the cache is bounded by the same reserve the tables are sized from
+/// (§4.2) and never grows with the base tree.
+pub fn digest_capacity(max_inodes: usize) -> slates_machine::Derived<usize> {
+  slates_machine::derived!(
+    max_inodes.saturating_mul(std::mem::size_of::<Inode>())
+      / DIGEST_SHARE_OF_INODE_TABLE
+      / std::mem::size_of::<DigestRecord>().max(1),
+    "max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>()",
+    ["store.max_inodes", "reserve_per_shard"]
+  )
+}
+
+/// The shard's digest-cache budget (§4.15 "bounded cache discovery", §4.2): one counted capacity
+/// every overlay volume on the shard keeps its verified digests under, so the caches together
+/// never exceed their derived share. At the bound admission refuses `DigestCacheFull` — the
+/// digest is still exported, only not kept — and the plane counts the refusal.
+#[derive(Debug)]
+pub struct DigestBudget {
+  capacity: usize,
+  live: usize,
+}
+
+impl DigestBudget {
+  /// A budget of `capacity` records, none kept.
+  pub(crate) fn new(capacity: usize) -> Self {
+    Self { capacity, live: 0 }
+  }
+
+  /// The records the shard may keep.
+  pub fn capacity(&self) -> usize {
+    self.capacity
+  }
+
+  /// The records kept now, across every volume on the shard.
+  pub fn live(&self) -> usize {
+    self.live
+  }
+
+  /// Takes one record's slot, or refuses at the bound.
+  fn take(&mut self) -> Result<(), VfsError> {
+    if self.live >= self.capacity {
+      return Err(VfsError::DigestCacheFull);
+    }
+    self.live += 1;
+    Ok(())
+  }
+
+  /// Returns one record's slot.
+  fn give(&mut self) {
+    self.live = self.live.saturating_sub(1);
+  }
+}
+
 /// Entries a fresh listing lacks (by name) and unwitnessed files it still lists with their
 /// fingerprints.
 type Stale = (Vec<String>, Vec<(InodeNo, Fingerprint)>);
@@ -149,6 +273,15 @@ pub struct BasePlane {
   /// Directories whose listings a hint invalidated and whose witnessed entries want a check.
   recheck: BTreeSet<InodeNo>,
   recheck_all: bool,
+  /// The digest verb's counters.
+  digest_stats: DigestStats,
+  /// Kept digests by the clean file's inode number (§4.15), each holding a slot of the shard's
+  /// [`DigestBudget`]; dropped before any mutation of the entry and whenever the disk no longer
+  /// matches.
+  digests: BTreeMap<InodeNo, CachedDigest>,
+  /// The kept digests homed in each directory, so a watcher hint naming a directory revalidates
+  /// exactly the digests beneath it.
+  digests_by_dir: BTreeMap<InodeNo, BTreeSet<InodeNo>>,
 }
 
 impl BasePlane {
@@ -178,6 +311,9 @@ impl BasePlane {
       watch: WatchState::Unavailable,
       recheck: BTreeSet::new(),
       recheck_all: false,
+      digest_stats: DigestStats::default(),
+      digests: BTreeMap::new(),
+      digests_by_dir: BTreeMap::new(),
     }
   }
 
@@ -206,6 +342,61 @@ impl BasePlane {
   /// Whether the inode is witnessed.
   pub fn is_witnessed(&self, no: InodeNo) -> bool {
     self.witnesses.contains_key(&no)
+  }
+
+  /// The digest verb's counters, for the tests that must see a path move.
+  pub fn digest_stats(&self) -> DigestStats {
+    self.digest_stats
+  }
+
+  /// Drops an inode's kept digest, returning its slot to the shard; whether one was kept. The
+  /// caller counts why.
+  fn forget_digest(&mut self, store: &mut Store, no: InodeNo) -> bool {
+    let Some(cached) = self.digests.remove(&no) else {
+      return false;
+    };
+    if let Some(homed) = self.digests_by_dir.get_mut(&cached.home) {
+      homed.remove(&no);
+      if homed.is_empty() {
+        self.digests_by_dir.remove(&cached.home);
+      }
+    }
+    store.digests.give();
+    self.digest_stats.cached = u64::try_from(self.digests.len()).unwrap_or(u64::MAX);
+    true
+  }
+
+  /// Keeps a verified digest under a slot of the shard's budget, or refuses `DigestCacheFull` at
+  /// the bound; an earlier digest of the inode is replaced, never double-counted.
+  fn remember_digest(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    cached: CachedDigest,
+  ) -> Result<(), VfsError> {
+    self.forget_digest(store, no);
+    store.digests.take()?;
+    self.digests.insert(no, cached);
+    self
+      .digests_by_dir
+      .entry(cached.home)
+      .or_default()
+      .insert(no);
+    self.digest_stats.cached = u64::try_from(self.digests.len()).unwrap_or(u64::MAX);
+    Ok(())
+  }
+
+  /// Drops every kept digest (a destroy, a watcher overflow): every slot goes back to the shard;
+  /// how many were dropped.
+  pub(crate) fn drop_all_digests(&mut self, store: &mut Store) -> u64 {
+    let dropped = u64::try_from(self.digests.len()).unwrap_or(u64::MAX);
+    for _ in 0..self.digests.len() {
+      store.digests.give();
+    }
+    self.digests.clear();
+    self.digests_by_dir.clear();
+    self.digest_stats.cached = 0;
+    dropped
   }
 }
 
@@ -371,9 +562,13 @@ impl Volume {
     }))
   }
 
-  /// Closes the descriptor an inode held, when its last link goes.
-  pub(crate) fn base_forget(&mut self, no: InodeNo) -> Option<HostFile> {
+  /// Closes the descriptor an inode held, when its last link goes; a digest kept for it is
+  /// dropped with it (the entry left the volume: invalidated).
+  pub(crate) fn base_forget(&mut self, store: &mut Store, no: InodeNo) -> Option<HostFile> {
     let plane = self.base.as_mut()?;
+    if plane.forget_digest(store, no) {
+      plane.digest_stats.invalidated += 1;
+    }
     plane.witnesses.remove(&no);
     plane.witness_homes.remove(&no);
     plane.drift.remove(&no);
@@ -412,7 +607,11 @@ impl Overlay<'_> {
   /// them; unloaded (unwitnessed) entries the disk no longer has leave the node.
   fn load_listing(&mut self, store: &mut Store, dir: Handle<DirNode>) -> Result<(), VfsError> {
     let dir_no = store.dirs.get(dir)?.inode;
-    let now = self.vol.clock.monotonic_ns();
+    // The read time is taken from the host's clock, never the volume's: the racy rule compares
+    // it with the files' timestamps, which live in the host's domain (the daemon's `HostClock`
+    // counts from its own creation, so a subtraction across the two domains called every
+    // witness racy — docs/bugs/2026-09-14-racy-rule-compares-monotonic-with-wall-clock.md).
+    let now = self.host.now_ns();
     let policy = self.vol.policy;
     let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
     let listing = plane
@@ -614,6 +813,26 @@ impl Overlay<'_> {
     if let Some(f) = self.plane()?.descriptors.remove(&no) {
       self.host.close_file(f);
     }
+    // A relist refreshes every untouched entry, changed or not; a kept digest is stale knowledge
+    // only when the listing's fingerprint no longer matches the one it was verified under.
+    let moved = self
+      .plane()?
+      .digests
+      .get(&no)
+      .is_some_and(|kept| kept.fingerprint != fp);
+    if moved && self.plane()?.forget_digest(store, no) {
+      self.plane()?.digest_stats.stale += 1;
+    }
+    self.adopt_fingerprint(store, no, fp)
+  }
+
+  /// An untouched entry takes the disk's fingerprint: its attributes and its base length.
+  fn adopt_fingerprint(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    fp: Fingerprint,
+  ) -> Result<(), VfsError> {
     let handle = self.vol.make_current_inode(store, no)?;
     let inode = store.inodes.get_mut(handle)?;
     inode.attrs.size = fp.size;
@@ -1304,6 +1523,12 @@ impl Overlay<'_> {
     if !is_base {
       return Ok(());
     }
+    // §4.15 "invalidated before any mutation": every mutation of a base entry — content or
+    // metadata — copies it up first, so the digest kept for it is dropped here, before the
+    // witness is recorded and before the mutation is visible.
+    if self.plane()?.forget_digest(store, no) {
+      self.plane()?.digest_stats.invalidated += 1;
+    }
     let (host_dir, name) = self.home_of(store, no)?;
     let file = self.host.open_file(host_dir, &name).map_err(host_refusal)?;
     let fp = self.host.fstat(file).map_err(host_refusal)?;
@@ -1320,7 +1545,6 @@ impl Overlay<'_> {
       })
       .unwrap_or(0);
     let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
-    let read_at = i64::try_from(read_at).unwrap_or(i64::MAX);
     let racy = read_at.saturating_sub(fp.mtime_ns) <= granularity;
     let bytes = self.read_whole(file, fp.size)?;
     let identity = *blake3::hash(&bytes).as_bytes();
@@ -1472,6 +1696,268 @@ impl Overlay<'_> {
     Ok(())
   }
 
+  // ---------------------------------------------------------------- digests
+
+  /// `digest` (§4.15): the verified content digest of a clean file — an untouched base entry,
+  /// whose bytes are exactly the disk's. The path resolves through the overlay (an absent or
+  /// whiteouted name is `NotFound`, a directory `IsDirectory`); an entry the volume diverged, or
+  /// a symlink, refuses `DigestNotClean`; then the file is verified current (its listing
+  /// validated, the path opened afresh and matched by identity to the descriptor the volume
+  /// holds), hashed in bounded windows, and its fingerprint compared again after the read, so a
+  /// file changing under the hash refuses `DigestUnverified` rather than export a digest of torn
+  /// bytes. A read, never a mutation: nothing is journaled and the entry does not diverge.
+  pub fn digest(&mut self, store: &mut Store, path: &str) -> Result<Digest, VfsError> {
+    let located = self.resolve(store, path)?;
+    let no = match located.child {
+      Child::File(no) => no,
+      Child::Dir(_) => return Err(VfsError::IsDirectory),
+      Child::Symlink(_) => return Err(VfsError::DigestNotClean),
+      Child::Whiteout => return Err(VfsError::NotFound),
+    };
+    if !self.is_clean(store, no) {
+      return Err(VfsError::DigestNotClean);
+    }
+    let (file, fingerprint) = self.verify_current(store, no)?;
+    // Discovery (§4.15): a kept digest is reused only after the disk re-verified the fingerprint
+    // it was computed under — the fingerprint is the truth, the cache never is; a kept digest
+    // the disk no longer matches is stale knowledge, dropped before anything else happens.
+    let kept = self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|b| b.digests.get(&no).copied());
+    if let Some(cached) = kept {
+      if cached.fingerprint == fingerprint {
+        self.plane()?.digest_stats.revalidated += 1;
+        return Ok(Digest {
+          identity: cached.identity,
+          size: fingerprint.size,
+        });
+      }
+      if self.plane()?.forget_digest(store, no) {
+        self.plane()?.digest_stats.stale += 1;
+      }
+    }
+    let identity = self.hash_file(store, file, fingerprint.size)?;
+    let after = self.host.fstat(file).map_err(host_refusal)?;
+    if after != fingerprint {
+      return Err(self.count_digest_refusal(VfsError::DigestUnverified));
+    }
+    self.plane()?.digest_stats.computed += 1;
+    self.keep_digest(store, no, fingerprint, identity)?;
+    Ok(Digest {
+      identity,
+      size: fingerprint.size,
+    })
+  }
+
+  /// Keeps a freshly verified digest for reuse, unless the racy rule (§4.5) forbids it: a digest
+  /// computed while the file's timestamp tick is still open — within the filesystem's granularity
+  /// of the host's clock — could be silently invalidated by a same-tick write the fingerprint
+  /// cannot show, so it is exported but never kept. At the shard's bound the digest is not kept
+  /// either; both are counted, neither refuses the export.
+  fn keep_digest(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    fingerprint: Fingerprint,
+    identity: [u8; 32],
+  ) -> Result<(), VfsError> {
+    let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
+    let last_change = fingerprint.mtime_ns.max(fingerprint.ctime_ns);
+    if self.host.now_ns().saturating_sub(last_change) <= granularity {
+      self.plane()?.digest_stats.racy_uncached += 1;
+      return Ok(());
+    }
+    let Some(home) = self.vol.inode(store, no)?.home.map(|h| h.parent) else {
+      return Ok(());
+    };
+    let cached = CachedDigest {
+      home,
+      fingerprint,
+      identity,
+    };
+    match self.plane()?.remember_digest(store, no, cached) {
+      Ok(()) => Ok(()),
+      Err(VfsError::DigestCacheFull) => {
+        self.plane()?.digest_stats.cache_full += 1;
+        Ok(())
+      }
+      Err(other) => Err(other),
+    }
+  }
+
+  /// Whether an entry is clean (§4.15): an untouched base file, so its bytes are exactly the
+  /// disk's — the complement of the diverged set for files: base-backed and unwitnessed.
+  fn is_clean(&self, store: &Store, no: InodeNo) -> bool {
+    let witnessed = self.vol.base.as_ref().is_some_and(|b| b.is_witnessed(no));
+    !witnessed
+      && matches!(
+        self.vol.inode(store, no).map(|i| &i.body),
+        Ok(Body::Base(_))
+      )
+  }
+
+  /// The descriptor and fingerprint of a clean file as the disk holds it right now (§4.15
+  /// "verified current"). The directory's listing is validated first (`follow_live_disk`); then
+  /// the path is opened afresh and its identity compared with the descriptor the volume holds,
+  /// because a file replaced beneath a held descriptor inside the directory's timestamp
+  /// granularity leaves the listing's fingerprint unchanged and the old inode alive behind the
+  /// descriptor — the one case the listing cannot tell. Two `fstat`s of one inode that disagree
+  /// mean it is changing now.
+  fn verify_current(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+  ) -> Result<(HostFile, Fingerprint), VfsError> {
+    self.follow_live_disk(store, no)?;
+    let (dir, name) = self.home_of(store, no)?;
+    let fresh = self.host.open_file(dir, &name).map_err(host_refusal)?;
+    let at_path = match self.host.fstat(fresh) {
+      Ok(fp) => fp,
+      Err(e) => {
+        self.host.close_file(fresh);
+        return Err(host_refusal(e));
+      }
+    };
+    let held = self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|b| b.descriptors.get(&no).copied());
+    let Some(held) = held else {
+      self.plane()?.descriptors.insert(no, fresh);
+      return Ok((fresh, at_path));
+    };
+    let served = match self.host.fstat(held) {
+      Ok(fp) => fp,
+      Err(e) => {
+        self.host.close_file(fresh);
+        return Err(host_refusal(e));
+      }
+    };
+    if (served.dev, served.ino) != (at_path.dev, at_path.ino) {
+      // The path holds another inode now: the descriptor serves a file the disk has replaced.
+      // An untouched entry shows the live disk, so the volume adopts the new inode and rereads
+      // the directory at its next use (its listing still names the old fingerprint).
+      self.host.close_file(held);
+      self.plane()?.descriptors.insert(no, fresh);
+      if self.plane()?.forget_digest(store, no) {
+        self.plane()?.digest_stats.stale += 1;
+      }
+      self.adopt_fingerprint(store, no, at_path)?;
+      self.invalidate_listing_of(store, no);
+      return Ok((fresh, at_path));
+    }
+    self.host.close_file(fresh);
+    if served != at_path {
+      return Err(self.count_digest_refusal(VfsError::DigestUnverified));
+    }
+    Ok((held, served))
+  }
+
+  /// Marks the listing of an entry's home directory for a reread at its next use.
+  fn invalidate_listing_of(&mut self, store: &Store, no: InodeNo) {
+    let Some(parent) = self
+      .vol
+      .inode(store, no)
+      .ok()
+      .and_then(|i| i.home)
+      .map(|h| h.parent)
+    else {
+      return;
+    };
+    if let Some(l) = self
+      .vol
+      .base
+      .as_mut()
+      .and_then(|b| b.listings.get_mut(&parent))
+    {
+      l.entries = None;
+    }
+  }
+
+  /// The BLAKE3 of an open file's first `size` bytes, read in windows of the store's chunk
+  /// size, so digesting a file costs one window of memory whatever its length (bounded work,
+  /// §4.3). A read that ends short of `size` means the file shrank under the hash:
+  /// `DigestUnverified`.
+  fn hash_file(&mut self, store: &Store, file: HostFile, size: u64) -> Result<[u8; 32], VfsError> {
+    let window = store.content.chunk_bytes().max(1);
+    let window_len = u64::try_from(window).unwrap_or(u64::MAX);
+    let mut buf = vec![0u8; usize::try_from(size.min(window_len)).unwrap_or(window)];
+    let mut hasher = blake3::Hasher::new();
+    let mut done: u64 = 0;
+    while done < size {
+      let want = usize::try_from((size - done).min(window_len)).unwrap_or(window);
+      let n = self
+        .host
+        .read_at(file, done, &mut buf[..want])
+        .map_err(host_refusal)?;
+      if n == 0 {
+        break;
+      }
+      hasher.update(&buf[..n]);
+      done = done.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+    }
+    if done != size {
+      return Err(self.count_digest_refusal(VfsError::DigestUnverified));
+    }
+    Ok(*hasher.finalize().as_bytes())
+  }
+
+  /// Counts a digest refusal on the path it names and hands it back.
+  fn count_digest_refusal(&mut self, refusal: VfsError) -> VfsError {
+    if let Some(plane) = self.vol.base.as_mut()
+      && refusal == VfsError::DigestUnverified
+    {
+      plane.digest_stats.unverified += 1;
+    }
+    refusal
+  }
+
+  /// A watcher hint named a directory: every digest kept for a file homed there is re-verified
+  /// against the disk now — the hint triggers the check, the fingerprint decides (§4.15 "watcher
+  /// hints backed by revalidation"; "hints alone never prove a source unchanged") — and one the
+  /// disk no longer matches is dropped as stale. Bounded by the digests kept beneath the
+  /// directory, which the shard's budget bounds.
+  fn revalidate_digests_under(&mut self, store: &mut Store, dir_no: InodeNo) {
+    let kept: Vec<InodeNo> = self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|b| b.digests_by_dir.get(&dir_no))
+      .map(|homed| homed.iter().copied().collect())
+      .unwrap_or_default();
+    for no in kept {
+      let Some(cached) = self
+        .vol
+        .base
+        .as_ref()
+        .and_then(|b| b.digests.get(&no).copied())
+      else {
+        continue;
+      };
+      let now = self.fingerprint_at_path(store, no);
+      let Some(plane) = self.vol.base.as_mut() else {
+        return;
+      };
+      plane.digest_stats.hint_rechecked += 1;
+      if now != Some(cached.fingerprint) && plane.forget_digest(store, no) {
+        plane.digest_stats.stale += 1;
+      }
+    }
+  }
+
+  /// The fingerprint of the entry at its disk path right now, or `None` when the path no longer
+  /// holds a file the host can open.
+  fn fingerprint_at_path(&mut self, store: &Store, no: InodeNo) -> Option<Fingerprint> {
+    let (dir, name) = self.home_of(store, no).ok()?;
+    let file = self.host.open_file(dir, &name).ok()?;
+    let fingerprint = self.host.fstat(file).ok();
+    self.host.close_file(file);
+    fingerprint
+  }
+
   // ---------------------------------------------------------------- drift
 
   /// Re-checks a witnessed entry against the disk (§4.5): what the held descriptor serves is
@@ -1615,8 +2101,9 @@ impl Overlay<'_> {
     })
   }
 
-  /// Drains the watcher's hints: a changed directory invalidates its listing and re-checks
-  /// the witnessed entries homed there; an overflow invalidates everything and re-checks all.
+  /// Drains the watcher's hints: a changed directory invalidates its listing, re-checks the
+  /// witnessed entries homed there and re-verifies the digests kept beneath it; an overflow
+  /// invalidates everything, re-checks every witness and drops every kept digest (§4.15).
   pub fn process_hints(&mut self, store: &mut Store) -> Result<(), VfsError> {
     let hints = self.host.hints();
     let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
@@ -1661,6 +2148,14 @@ impl Overlay<'_> {
       .collect();
     for no in targets {
       let _ = self.check_drift(store, no);
+    }
+    if all {
+      let dropped = self.plane()?.drop_all_digests(store);
+      self.plane()?.digest_stats.dropped_on_overflow += dropped;
+    } else {
+      for dir_no in dirs {
+        self.revalidate_digests_under(store, dir_no);
+      }
     }
     Ok(())
   }
@@ -1759,7 +2254,7 @@ impl Overlay<'_> {
         // (§4.2) when a snapshot still pins them, secured before anything changes.
         let retention = self.vol.retention_of_drop(store, no)?;
         self.vol.secure_retention(store, retention)?;
-        if let Some(f) = self.vol.base_forget(no) {
+        if let Some(f) = self.vol.base_forget(store, no) {
           self.host.close_file(f);
         }
         let dropped = self

@@ -325,6 +325,10 @@ impl HostFs for OsLand {
     self.host.facts(dir)
   }
 
+  fn now_ns(&mut self) -> i64 {
+    self.host.now_ns()
+  }
+
   fn fingerprint_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {
     self.host.fingerprint_dir(dir)
   }
