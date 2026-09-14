@@ -214,9 +214,36 @@ impl ChunkStore {
       .map_or(&[], |b| &b[..used.min(b.len())])
   }
 
-  /// Truncates an open extent to `len` bytes (zeroing nothing: the length caps reads).
-  pub fn truncate_open(open: &mut OpenExtent, len: u64) {
+  /// The arena block `materialized` bytes of one window take: the smallest power-of-two number
+  /// of pages holding them (the buddy's block), at most a chunk — the window's charge (§4.2
+  /// "allocator rounding").
+  pub fn block_bytes(&self, materialized: usize) -> usize {
+    let pages = materialized.max(1).div_ceil(self.page).next_power_of_two();
+    pages.saturating_mul(self.page).min(self.chunk_bytes)
+  }
+
+  /// Truncates an open extent to `len` bytes and rebuilds its block at the size the kept bytes
+  /// take when that is smaller — the block is the window's charge (§4.2 "allocator rounding"):
+  /// it is [`ChunkStore::block_bytes`] of the materialized length, growing and shrinking with it,
+  /// so the charged bytes and the arena's allocated bytes never diverge.
+  pub fn shrink_open(&mut self, open: &mut OpenExtent, len: u64) -> Result<(), VfsError> {
     open.len = open.len.min(len);
+    let keep = usize::try_from(open.len).unwrap_or(usize::MAX);
+    let want = self.block_bytes(keep);
+    if want >= open.block.len {
+      return Ok(());
+    }
+    let block = self.arena.alloc(want)?;
+    let mut carry = vec![0u8; keep];
+    if let Some(src) = self.arena.bytes(open.block) {
+      carry.copy_from_slice(&src[..keep]);
+    }
+    if let Some(dst) = self.arena.bytes_mut(block) {
+      dst[..keep].copy_from_slice(&carry);
+    }
+    self.arena.free(open.block)?;
+    open.block = block;
+    Ok(())
   }
 
   /// Seals an open extent into a chunk and returns the extent that names it (or `None` for an

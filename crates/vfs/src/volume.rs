@@ -2152,22 +2152,22 @@ impl Volume {
     self.last_snapshot_epoch().is_some_and(|snap| born <= snap) && self.owns(born)
   }
 
-  /// The arena bytes the pieces of `no`'s content selected by `touched` (by file offset) would
-  /// retain if the head released them now: each such piece's block length, when this volume retains
-  /// its birth epoch. A piece is a sealed or base-pinned chunk, or the open extent — which the
-  /// copy-up every mutation begins with seals into a chunk born at the extent's own epoch before
-  /// anything is released, so it is retained exactly as a sealed chunk of that epoch would be.
+  /// The arena bytes the pieces of `no`'s content selected by `touched` (by file offset and
+  /// length) would retain if the head released them now: each such piece's block length, when this
+  /// volume retains its birth epoch. A piece is a sealed or base-pinned chunk, or the open extent —
+  /// which the copy-up every mutation begins with seals into a chunk born at the extent's own epoch
+  /// before anything is released, so it is retained exactly as a sealed chunk of that epoch would be.
   fn retention_of_pieces(
     &self,
     store: &Store,
     no: InodeNo,
-    touched: impl Fn(u64) -> bool,
+    touched: impl Fn(u64, u64) -> bool,
   ) -> Result<u64, VfsError> {
     let inode = self.inode(store, no)?;
     let block_len = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
     let mut retained = body_extents(&inode.body)
       .iter()
-      .filter(|e| touched(e.off))
+      .filter(|e| touched(e.off, e.len))
       .filter_map(|e| match e.src {
         ExtentSrc::Chunk { chunk, .. } => store.content.chunk(chunk),
         ExtentSrc::Zero => None,
@@ -2177,7 +2177,7 @@ impl Volume {
       .fold(0u64, u64::saturating_add);
     if let Body::Open { open, .. } = &inode.body
       && open.len > 0
-      && touched(open.off)
+      && touched(open.off, open.len)
       && self.retains(open.born)
     {
       retained = retained.saturating_add(block_len(open.block.len));
@@ -2200,19 +2200,26 @@ impl Volume {
       .unwrap_or(u64::MAX)
       .max(1);
     let (first, last) = (off / chunk, end.saturating_sub(1) / chunk);
-    self.retention_of_pieces(store, no, |piece| {
+    self.retention_of_pieces(store, no, |piece, _| {
       let window = piece / chunk;
       window >= first && window <= last
     })
   }
 
   /// The retention a truncate to `len` causes: every piece wholly past the cut is released
-  /// (`clip_extents`); a partly clipped one keeps its chunk.
+  /// (`clip_extents`), and so is the chunk of a partly cut piece whose page count drops (the piece
+  /// is rebuilt at its new length); a partly cut piece that keeps its page count keeps its chunk.
   fn retention_of_truncate(&self, store: &Store, no: InodeNo, len: u64) -> Result<u64, VfsError> {
     if len >= self.inode(store, no)?.attrs.size {
       return Ok(0);
     }
-    self.retention_of_pieces(store, no, |piece| piece >= len)
+    let page = u64::try_from(store.content.page()).unwrap_or(1);
+    let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
+    self.retention_of_pieces(store, no, |piece, piece_len| {
+      piece >= len
+        || (piece + piece_len > len
+          && charged_window(len - piece, page, chunk) < charged_window(piece_len, page, chunk))
+    })
   }
 
   /// The retention an edit at `at` causes: the pieces past the cut, plus the piece holding `at`
@@ -2228,15 +2235,20 @@ impl Volume {
     let chunk = u64::try_from(store.content.chunk_bytes())
       .unwrap_or(u64::MAX)
       .max(1);
+    let page = u64::try_from(store.content.page()).unwrap_or(1);
     let window_start = at - at % chunk;
-    self.retention_of_pieces(store, no, |piece| {
-      piece >= at || (writes && piece == window_start)
+    self.retention_of_pieces(store, no, |piece, piece_len| {
+      piece >= at
+        || (piece == window_start
+          && (writes
+            || (piece + piece_len > at
+              && charged_window(at - piece, page, chunk) < charged_window(piece_len, page, chunk))))
     })
   }
 
   /// The retention the whole content of `no` causes when the head lets go of it.
   fn retention_of_content(&self, store: &Store, no: InodeNo) -> Result<u64, VfsError> {
-    self.retention_of_pieces(store, no, |_| true)
+    self.retention_of_pieces(store, no, |_, _| true)
   }
 
   /// The retention dropping one link of `no` causes: its whole content, when this is the last name
@@ -2997,11 +3009,13 @@ impl Volume {
     Ok(())
   }
 
-  /// The bytes a write will add to `referenced_bytes`: the materialized delta under the chunk
-  /// rule (§4.5, D-6). Content is materialized per chunk window: a write into a window
-  /// materializes the window from its start to the write's end, so `materialized(window) =
-  /// max(existing, end within window)`; inline content is materialized byte for byte until a
-  /// write ends past the inline threshold, when it spills into the first window.
+  /// The bytes a write will add to `referenced_bytes`: the charged delta under the chunk rule
+  /// (§4.5, D-6) with the allocator's rounding (§4.2). Content is materialized per chunk window: a
+  /// write into a window materializes the window from its start to the write's end, so
+  /// `materialized(window) = max(existing, end within window)`, and the window is charged its
+  /// arena block — the materialized length rounded up to the page ([`charged_window`]). Inline
+  /// content is charged byte for byte until a write ends past the inline threshold, when it spills
+  /// into the first window.
   pub(crate) fn write_charge(
     &self,
     store: &Store,
@@ -3011,16 +3025,19 @@ impl Volume {
   ) -> Result<u64, VfsError> {
     let inode = self.inode(store, no)?;
     let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
+    let page = u64::try_from(store.content.page()).unwrap_or(1);
     let inline = u64::try_from(store.inline_bytes).unwrap_or(0);
     let before = materialized_windows(&inode.body, chunk);
     let mut after = before.clone();
+    let mut inline_before = 0;
     if let Body::Inline(v) = &inode.body {
+      let len = u64::try_from(v.len()).unwrap_or(0);
       if end <= inline {
-        let len = u64::try_from(v.len()).unwrap_or(0);
         return Ok(end.saturating_sub(len));
       }
       // The inline bytes spill into the first window before the write applies.
-      after.insert(0, u64::try_from(v.len()).unwrap_or(0));
+      after.insert(0, len);
+      inline_before = len;
     }
     let mut cursor = off;
     while cursor < end {
@@ -3032,9 +3049,14 @@ impl Volume {
       *entry = (*entry).max(materialized);
       cursor = write_end;
     }
-    let total_before: u64 = before.values().sum();
-    let total_after: u64 = after.values().sum();
-    Ok(total_after.saturating_sub(total_before))
+    let charged = |windows: &std::collections::BTreeMap<u64, u64>| {
+      windows
+        .values()
+        .map(|m| charged_window(*m, page, chunk))
+        .fold(0u64, u64::saturating_add)
+    };
+    let total_before = charged(&before).saturating_add(inline_before);
+    Ok(charged(&after).saturating_sub(total_before))
   }
 
   pub(crate) fn apply_write(
@@ -3061,11 +3083,19 @@ impl Volume {
         Body::Inline(v)
       }
       Body::Inline(v) => {
-        // Spill the inline bytes into an open extent, then write.
-        let mut open =
-          store
-            .content
-            .open(0, usize::try_from(end.min(chunk)).unwrap_or(0), epoch)?;
+        // Spill the inline bytes into an open extent sized to what window 0 will hold — the inline
+        // bytes, extended by this write only when it lands in window 0 — then write. Sizing it to
+        // the write's end regardless gave a far write a whole-chunk block for a few inline bytes,
+        // which the physical charge (§4.2 allocator rounding) made visible as a phantom chunk.
+        let inline_len = u64::try_from(v.len()).unwrap_or(0);
+        let window_zero = if off < chunk {
+          end.min(chunk).max(inline_len)
+        } else {
+          inline_len
+        };
+        let mut open = store
+          .content
+          .open(0, usize::try_from(window_zero).unwrap_or(0), epoch)?;
         store.content.write_open(&mut open, 0, &v)?;
         let mut sealed = Vec::new();
         self.write_into(store, &mut open, &mut sealed, off, bytes)?
@@ -3188,6 +3218,7 @@ impl Volume {
       return Ok(());
     }
     let last = self.last_snapshot_epoch();
+    let epoch = self.epoch;
     let before = content_by_epoch(store, handle);
     let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
     let mut dead = Deadlist::default();
@@ -3197,25 +3228,25 @@ impl Volume {
         Body::Inline(v)
       }
       Body::Sealed(mut extents) => {
-        clip_extents(store, &mut extents, len, last, &mut dead)?;
+        clip_extents(store, &mut extents, len, last, epoch, &mut dead)?;
         Body::Sealed(extents)
       }
       Body::Open {
         mut open,
         mut sealed,
       } => {
-        clip_extents(store, &mut sealed, len, last, &mut dead)?;
+        clip_extents(store, &mut sealed, len, last, epoch, &mut dead)?;
         if open.off >= len {
           store.content.release_open(open)?;
           Body::Sealed(sealed)
         } else {
           let keep = len - open.off;
-          ChunkStore::truncate_open(&mut open, keep);
+          store.content.shrink_open(&mut open, keep)?;
           Body::Open { open, sealed }
         }
       }
       Body::Base(mut b) => {
-        clip_extents(store, &mut b.pinned, len, last, &mut dead)?;
+        clip_extents(store, &mut b.pinned, len, last, epoch, &mut dead)?;
         // Disk bytes past the cut are no longer the file's; a later extension is a hole.
         b.base_len = b.base_len.min(len);
         Body::Base(b)
@@ -3322,42 +3353,54 @@ impl ByEpoch {
   }
 }
 
-/// An inode's content bytes by birth epoch: inline bytes are born with the record, an extent's
-/// bytes with its chunk, an open extent's with the extent.
+/// An inode's content bytes by birth epoch — the bytes it is charged (§4.2 "physical_used
+/// includes allocator rounding"; D-13's `referenced` counts allocated bytes): inline bytes byte for
+/// byte, born with the record (they live in the inode); a chunk's whole arena block, born with the
+/// chunk; an open extent's whole block, born with the extent. A block is the buddy block its
+/// window's materialized length takes ([`charged_window`]), so the sum is exactly the arena the
+/// head holds.
 pub(crate) fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> Vec<(Epoch, u64)> {
   let Ok(inode) = store.inodes.get(handle) else {
     return Vec::new();
   };
-  let sealed_born = |e: &Extent| match e.src {
-    ExtentSrc::Chunk { chunk, .. } => store.content.chunk(chunk).map(|c| c.born),
+  let sealed_block = |e: &Extent| match e.src {
+    ExtentSrc::Chunk { chunk, .. } => store
+      .content
+      .chunk(chunk)
+      .map(|c| (c.born, u64::try_from(c.block.len).unwrap_or(u64::MAX))),
     ExtentSrc::Zero => None,
   };
   match &inode.body {
     Body::Inline(b) => vec![(inode.born, u64::try_from(b.len()).unwrap_or(0))],
-    Body::Sealed(extents) => extents
-      .iter()
-      .filter_map(|e| sealed_born(e).map(|born| (born, chunk_len(e))))
-      .collect(),
+    Body::Sealed(extents) => extents.iter().filter_map(sealed_block).collect(),
     Body::Open { open, sealed } => {
-      let mut out: Vec<(Epoch, u64)> = sealed
-        .iter()
-        .filter_map(|e| sealed_born(e).map(|born| (born, chunk_len(e))))
-        .collect();
-      out.push((open.born, open.len));
+      let mut out: Vec<(Epoch, u64)> = sealed.iter().filter_map(sealed_block).collect();
+      out.push((open.born, u64::try_from(open.block.len).unwrap_or(u64::MAX)));
       out
     }
-    Body::Base(b) => b
-      .pinned
-      .iter()
-      .filter_map(|e| sealed_born(e).map(|born| (born, chunk_len(e))))
-      .collect(),
+    Body::Base(b) => b.pinned.iter().filter_map(sealed_block).collect(),
     _ => Vec::new(),
   }
 }
 
+/// The bytes a window of `materialized` bytes is charged: its arena block — the smallest
+/// power-of-two number of pages holding the materialized length, at most a chunk, which is what
+/// the buddy arena hands out (§4.2 "physical_used includes allocator rounding"; §4.5
+/// "page-multiple growth from the buddy tree"). Zero for an empty window. The model oracle states
+/// the same rule (`crates/vfs/tests/model.rs`), and its first run under a bare page multiple found
+/// the buddy's rounding: a 15-page window takes 16.
+pub(crate) fn charged_window(materialized: u64, page: u64, chunk: u64) -> u64 {
+  if materialized == 0 {
+    return 0;
+  }
+  let page = page.max(1);
+  let pages = materialized.div_ceil(page).next_power_of_two();
+  pages.saturating_mul(page).min(chunk.max(1))
+}
+
 /// The materialized bytes per chunk window of a body: window index → bytes from the window's
 /// start (the chunk rule of §4.5: an extent covers its window from the window's start to the
-/// extent's end, at most one chunk).
+/// extent's end, at most one chunk). The charge is each window's [`charged_window`].
 fn materialized_windows(body: &Body, chunk: u64) -> std::collections::BTreeMap<u64, u64> {
   let mut map = std::collections::BTreeMap::new();
   let chunk = chunk.max(1);
@@ -3389,13 +3432,6 @@ pub(crate) fn stamp_all(attrs: &mut Attrs, now: i64) {
   attrs.mtime = now;
   attrs.ctime = now;
   attrs.btime = now;
-}
-
-pub(crate) fn chunk_len(e: &Extent) -> u64 {
-  match e.src {
-    ExtentSrc::Chunk { .. } => e.len,
-    ExtentSrc::Zero => 0,
-  }
 }
 
 /// Copies the overlap of `bytes` (at file offset `base`) into `out` (at file offset `off`).
@@ -3439,12 +3475,16 @@ pub(crate) fn insert_extent(list: &mut Vec<Extent>, e: Extent) {
   list.insert(at, e);
 }
 
-/// Clips extents to `len`, releasing the chunks fully beyond it; returns bytes freed.
+/// Clips extents to `len`, releasing the chunks fully beyond it; a partly cut extent whose block
+/// would shrink is rebuilt at its new length (the window's block is always the buddy block its
+/// materialized length takes, §4.2 "allocator rounding"), its old chunk released by the epoch rule
+/// like any window the head rewrites. Returns bytes freed.
 pub(crate) fn clip_extents(
   store: &mut Store,
   extents: &mut Vec<Extent>,
   len: u64,
   last: Option<Epoch>,
+  epoch: Epoch,
   dead: &mut Deadlist,
 ) -> Result<u64, VfsError> {
   let mut freed = 0u64;
@@ -3461,13 +3501,36 @@ pub(crate) fn clip_extents(
         src: e.src,
       };
       freed += e.len - clipped.len;
-      keep.push(clipped);
+      keep.push(rebuilt_if_smaller(store, clipped, last, epoch, dead)?);
     } else {
       keep.push(e);
     }
   }
   *extents = keep;
   Ok(freed)
+}
+
+/// A clipped extent, rebuilt into a fresh chunk of its new length's page multiple when its old
+/// chunk's block is larger (the old chunk released by the epoch rule); the extent itself otherwise.
+fn rebuilt_if_smaller(
+  store: &mut Store,
+  clipped: Extent,
+  last: Option<Epoch>,
+  epoch: Epoch,
+  dead: &mut Deadlist,
+) -> Result<Extent, VfsError> {
+  let ExtentSrc::Chunk { chunk, .. } = clipped.src else {
+    return Ok(clipped);
+  };
+  let block = store.content.chunk(chunk).map_or(0, |c| c.block.len);
+  let need = usize::try_from(clipped.len).unwrap_or(usize::MAX);
+  if store.content.block_bytes(need) >= block {
+    return Ok(clipped);
+  }
+  let open = store.content.reopen(&clipped, epoch)?;
+  let rebuilt = store.content.seal(open)?.unwrap_or(clipped);
+  store.content.release_chunk(chunk, last, dead)?;
+  Ok(rebuilt)
 }
 
 /// Every directory node reachable from `root` and born after `since`; a node born at or before

@@ -128,16 +128,49 @@ docs/bugs/2026-09-06-partial-volume-slab-leak-on-create-failure.md for the recov
   completion window in `verbs.rs` `serve`); main's later ephemeral-id follow-up (`ff8021c`) is the
   candidate fix. Not touched here.
 
+## 4a. Allocator rounding (piece 1, second commit)
+
+`write_charge` charged the materialized bytes from the window's start — §4.5's chunk-window rule as
+the model oracle encoded it — while the arena block a window takes is the buddy's: the smallest
+power-of-two number of pages holding the materialized length. A one-byte write at a window start
+charged one byte and took a page (4 KiB here, 16 KiB on the design's laptop), so a sparse writer
+could hold `page ×` its quota of arena: the "uncharged bytes can defeat the cap" finding in its
+allocator form, and the shape §4.2 names ("`physical_used` includes allocator rounding"; the
+reservation "covers the worst permitted allocation shape"). D-13's evidence points the same way:
+ZFS `referenced` counts allocated bytes.
+
+**The rule now built and stated by the model:** a window is charged its arena block —
+`charged_window(m) = min(chunk, page × next_power_of_two(ceil(m / page)))` — and the block tracks
+the materialized length in both directions: a truncate that cuts a window to a smaller block rebuilds
+it at its new length (`clip_extents` → `rebuilt_if_smaller`, `ChunkStore::shrink_open`), the old
+chunk released by the epoch rule (retained when a snapshot pins it — `retention_of_truncate` covers
+that window). So `referenced_bytes` and `unique_bytes` are physical (inline bytes, which live in the
+inode, stay byte for byte) and `allocated_bytes == Σ head blocks + retained blocks` exactly — the
+identity the charge oracle asserts. The first run of the model under a bare page multiple found the
+buddy's power-of-two rounding (a 15-page window takes 16; `minimal failing input: Write(0, 16378,
+…)`, real 65536 vs model 61440), which is why the rule names the buddy block, not the page multiple.
+
+**A defect the truthful charge exposed at once.** `apply_write`'s inline-spill arm sized window 0's
+block to the write's end capped at a chunk, whatever window the write landed in, so a far write into
+a few inline bytes gave window 0 a whole chunk (uncharged under the logical rule; charged and refused
+under the physical one). Fixed: window 0 is opened at what it will hold
+(docs/bugs/2026-09-13-inline-spill-sizes-window-zero-to-the-write-end.md).
+
+**Contract change (for the design amendment log).** T-1.3 (`crates/vfs/tests/edges.rs`) asserted
+"charges one chunk holding one byte" with `referenced_bytes == 1` beside `allocated_bytes == PAGE`;
+it now asserts `referenced_bytes == PAGE` — the charge is the block, so the two numbers are one.
+§4.5 "Write"/the chunk-window rule and the Phase 1 status line "the write charge is the materialized
+delta under the chunk-window rule, which the model encodes" should read: *charged by the chunk-window
+rule at the allocator's granule — each window its buddy block (the smallest power-of-two number of
+pages holding the materialized length, at most a chunk); a partly cut window is rebuilt at its new
+length; the model encodes the same rule.* Evidence: `cargo test -p slates-vfs --test charge` (the
+sparse writer: sixteen one-byte windows admitted, the seventeenth refused, the arena holds exactly
+the quota; a truncate returns the pages a window no longer takes) and the model oracle (7 passed,
+400 histories each) after the change.
+
 ## 5. Owed (this charter)
 
-1. **Allocator rounding in the write charge.** `write_charge` charges the materialized bytes from
-   the window's start (§4.5's chunk-window rule as the model oracle encodes it), but the arena block
-   is `materialized.next_multiple_of(page)`; a 1-byte write at a window start charges 1 byte and
-   allocates a page (4 KiB here, 16 KiB on the design's laptop), so a sparse writer can hold `page ×`
-   its quota physically. §4.2 says `physical_used` includes allocator rounding and the reservation
-   must cover the worst permitted shape; the honest fix is to charge the page-rounded window, which
-   makes physical arena use equal the charged bytes exactly. This changes the contract the model
-   oracle states, so it lands as its own commit with the model updated to the design's physical rule.
+1. ~~Allocator rounding in the write charge~~ — done (§4a).
 2. **The generated-history charge oracle** (proptest): writes, truncates, edits, unlinks, snapshots
    and snapshot destroys over a store holding a neighbour's reservation; at every step the arena's
    allocated bytes equal the head's charged blocks plus the retained bytes, every refusal changes

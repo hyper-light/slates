@@ -97,8 +97,10 @@ fn names_that_fold_equal_are_one_entry() {
   assert_eq!(exact.readdir(&store, root).unwrap().len(), 2);
 }
 
-/// T-1.3: a write at offset 10 GiB in a dynamic volume charges one chunk holding one byte,
-/// holes read as zeros, and the content memory taken is one page-multiple block.
+/// T-1.3: a write at offset 10 GiB in a dynamic volume charges one window holding one byte —
+/// the one page-multiple block it takes, never the hole (§4.2 "physical_used includes allocator
+/// rounding": the charge is the arena block, so the content memory taken and the bytes charged
+/// are one number) — and holes read as zeros.
 #[test]
 fn a_sparse_write_in_a_dynamic_volume_charges_one_chunk() {
   let mut store = store();
@@ -113,13 +115,13 @@ fn a_sparse_write_in_a_dynamic_volume_charges_one_chunk() {
   assert_eq!(&buf[..5], &[0, 0, 0, 0, b'x']);
   assert_eq!(
     vol.accounting().referenced_bytes,
-    1,
-    "one chunk, holding the one byte written at a window start"
+    u64::try_from(PAGE).unwrap(),
+    "one window, holding the one byte written at a window start, charged its one-page block"
   );
   assert_eq!(
     store.content.allocated_bytes(),
     PAGE,
-    "one page-multiple block"
+    "one page-multiple block: the bytes charged are the bytes taken"
   );
 }
 
