@@ -2855,6 +2855,7 @@ fn build_increment(
       base: base_version,
       doc,
       post_state,
+      evidence: Vec::new(),
     },
   ))
 }

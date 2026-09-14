@@ -29,6 +29,7 @@ pub mod engine;
 pub mod increment;
 pub mod map;
 pub mod ops_doc;
+pub mod origin;
 pub mod range;
 pub mod splice;
 pub mod verdict;
@@ -38,6 +39,7 @@ pub use engine::{ConflictWindow, Green, Increment, Outcome};
 pub use increment::{Base, DeriveError, VolumeOp, compose_volume};
 pub use map::{Mapped, map_range};
 pub use ops_doc::{Op, OpKind, OpsDoc, PathTable};
+pub use origin::Origin;
 pub use range::{Range, RangeSet};
 pub use splice::{Extent, Source, splice};
 pub use verdict::{

@@ -42,7 +42,9 @@ use crate::range::Range;
 use crate::verdict::MergeConflictClass;
 
 /// An increment submitted against a base version: the deriver's ops document and the sealed
-/// post-state its content operations' `src` offsets index into.
+/// post-state its content operations' `src` offsets index into, and the evidence references the
+/// submitter attached (§4.16 `Increment.evidence`: "opaque to slates" — a green with
+/// `require_evidence` refuses an increment without any; the engine never reads them).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Increment {
   /// The increment's identity (`blake3` of its declared work).
@@ -53,13 +55,20 @@ pub struct Increment {
   pub doc: OpsDoc,
   /// The sealed post-state bytes; a content op adds `post_state[src .. src + len]`.
   pub post_state: Vec<u8>,
+  /// The evidence references (BLAKE3 identities, opaque here) the submitter attached.
+  pub evidence: Vec<[u8; 32]>,
 }
+
+/// Format: the width of one evidence reference (a BLAKE3 identity) in the increment encoding — the
+/// divisor a declared evidence count is checked against before allocation.
+const EVIDENCE_BYTES: usize = size_of::<[u8; 32]>();
 
 impl Increment {
   /// Serializes the increment for the durable green chain (§4.16, §4.8): the identity, the base
-  /// version, then the ops document and the post-state, each length-delimited. The db stores these
-  /// bytes opaquely (it never parses a merge structure); the server encodes here on commit and
-  /// decodes on recovery. Little-endian and length-delimited so [`Increment::decode`] is exact.
+  /// version, then the ops document and the post-state, each length-delimited, then the evidence
+  /// references as a count and the identities. The db stores these bytes opaquely (it never parses
+  /// a merge structure); the server encodes here on commit and decodes on recovery. Little-endian
+  /// and length-delimited so [`Increment::decode`] is exact.
   pub fn encode(&self) -> Vec<u8> {
     let doc = self.doc.encode();
     let mut out = Vec::with_capacity(
@@ -68,7 +77,9 @@ impl Increment {
         + size_of::<u64>()
         + doc.len()
         + size_of::<u64>()
-        + self.post_state.len(),
+        + self.post_state.len()
+        + size_of::<u64>()
+        + self.evidence.len() * EVIDENCE_BYTES,
     );
     out.extend_from_slice(&self.id);
     out.extend_from_slice(&self.base.to_le_bytes());
@@ -76,13 +87,17 @@ impl Increment {
     out.extend_from_slice(&doc);
     out.extend_from_slice(&(self.post_state.len() as u64).to_le_bytes());
     out.extend_from_slice(&self.post_state);
+    out.extend_from_slice(&(self.evidence.len() as u64).to_le_bytes());
+    for reference in &self.evidence {
+      out.extend_from_slice(reference);
+    }
     out
   }
 
   /// Decodes an increment persisted by [`Increment::encode`] — the inverse used to replay a green's
   /// chain on recovery. Every length is bounds-checked against the bytes that remain before it is
-  /// read (a torn db entry never allocates a wild length), and any malformation is a typed
-  /// [`DocDecodeError`], never a panic.
+  /// read (a torn db entry never allocates a wild length; a wild evidence count is refused before
+  /// its table is reserved), and any malformation is a typed [`DocDecodeError`], never a panic.
   pub fn decode(bytes: &[u8]) -> Result<Increment, crate::ops_doc::DocDecodeError> {
     use crate::ops_doc::{DocDecodeError, OpsDoc, Reader};
     let mut reader = Reader::new(bytes);
@@ -94,6 +109,17 @@ impl Increment {
     let doc = OpsDoc::decode(reader.bytes(doc_len)?)?;
     let post_len = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
     let post_state = reader.bytes(post_len)?.to_vec();
+    let evidence_count =
+      usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
+    if evidence_count > reader.remaining() / EVIDENCE_BYTES {
+      return Err(DocDecodeError::Truncated);
+    }
+    let mut evidence = Vec::with_capacity(evidence_count);
+    for _ in 0..evidence_count {
+      let mut reference = [0u8; 32];
+      reference.copy_from_slice(reader.bytes(EVIDENCE_BYTES)?);
+      evidence.push(reference);
+    }
     if !reader.is_empty() {
       return Err(DocDecodeError::TrailingBytes);
     }
@@ -102,6 +128,7 @@ impl Increment {
       base,
       doc,
       post_state,
+      evidence,
     })
   }
 }
@@ -170,6 +197,21 @@ type XattrHistory = BTreeMap<(String, String), Vec<(u64, Option<Vec<u8>>)>>;
 
 /// A per-path directory-presence history: whether the directory existed at each version it changed.
 type DirHistory = BTreeMap<String, Vec<(u64, bool)>>;
+
+/// Format: the kind tags of [`Green::head_identity`]'s canonical encoding, one per dimension, so an
+/// entry of one table can never hash as an entry of another (a file named `d` and a directory `d`
+/// are distinct states).
+const IDENTITY_TAG_FILE: &[u8] = b"F";
+/// Format: see [`IDENTITY_TAG_FILE`].
+const IDENTITY_TAG_DIR: &[u8] = b"D";
+/// Format: see [`IDENTITY_TAG_FILE`].
+const IDENTITY_TAG_MODE: &[u8] = b"M";
+/// Format: see [`IDENTITY_TAG_FILE`].
+const IDENTITY_TAG_SYMLINK: &[u8] = b"S";
+/// Format: see [`IDENTITY_TAG_FILE`].
+const IDENTITY_TAG_HARDLINK: &[u8] = b"L";
+/// Format: see [`IDENTITY_TAG_FILE`].
+const IDENTITY_TAG_XATTR: &[u8] = b"X";
 
 /// A green volume's merge state. Each dimension is a current value plus the version it last changed
 /// at (the base-comparison index), and a per-path/key *history* of `(version, value)` entries so any
@@ -348,9 +390,142 @@ impl Green {
     Green::default()
   }
 
+  /// A green whose version 0 is `origin` — the state captured from a complete immutable base
+  /// (§4.16 "the origin version from a snapshot"; the A-9 requirement that a chain starts "from
+  /// scratch or a complete immutable base"). Every dimension is seeded at version 0 with a history
+  /// entry there, so a work based on version 0 composes against the origin, an untouched path takes
+  /// the fast path (last changed at 0 ≤ base 0), and `base_at(0)` reconstructs it. The head stays
+  /// 0: the origin is not a delta. Deterministic: the same origin seeds the same state, which is what
+  /// lets a holder recompute version 0 from the placed origin bytes.
+  pub fn with_origin(origin: &crate::origin::Origin) -> Green {
+    let mut green = Green::default();
+    let mut canonical = origin.clone();
+    canonical.canonicalize();
+    for (path, bytes) in canonical.files {
+      green.content.insert(path.clone(), bytes.clone());
+      green.last_changed.insert(path.clone(), 0);
+      green.content_history.insert(path, vec![(0, Some(bytes))]);
+    }
+    for path in canonical.dirs {
+      green.dirs.insert(path.clone());
+      green.dir_history.insert(path, vec![(0, true)]);
+    }
+    for (path, mode) in canonical.modes {
+      green.modes.insert(path.clone(), mode);
+      green.mode_changed.insert(path.clone(), 0);
+      green.mode_history.insert(path, vec![(0, Some(mode))]);
+    }
+    for (path, target) in canonical.symlinks {
+      green.symlinks.insert(path.clone(), target.clone());
+      green.symlink_changed.insert(path.clone(), 0);
+      green.symlink_history.insert(path, vec![(0, Some(target))]);
+    }
+    for (path, target) in canonical.hardlinks {
+      green.hardlinks.insert(path.clone(), target.clone());
+      green.hardlink_changed.insert(path.clone(), 0);
+      green.hardlink_history.insert(path, vec![(0, Some(target))]);
+    }
+    for (path, name, value) in canonical.xattrs {
+      let key = (path, name);
+      green.xattrs.insert(key.clone(), value.clone());
+      green.xattr_changed.insert(key.clone(), 0);
+      green.xattr_history.insert(key, vec![(0, Some(value))]);
+    }
+    green
+  }
+
   /// The head version (the number of committed deltas).
   pub fn head(&self) -> u64 {
     self.deltas.len() as u64
+  }
+
+  /// The identity of the green's state at the head (§4.16 "the manifest identity": what a holder
+  /// "recomputes … before serving the version" and "compares … with the record at every version",
+  /// D-27 "mismatch fatal-and-loud"): the BLAKE3 of a canonical encoding of every dimension — each
+  /// table in key order, every field length-prefixed and tagged by kind — so two engines that
+  /// applied the same increments to the same origin hash to the same identity, and a single
+  /// differing byte anywhere (a file's content, a mode, a link target, an attribute) changes it.
+  /// Pure: a function of the state alone; it reads no clock and allocates only the hasher's
+  /// scratch. Cost is proportional to the state (it hashes every file), which is the laptop-honest
+  /// form; the design's incremental Merkle identity over shared extents is the measured refinement.
+  pub fn head_identity(&self) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    let field = |hasher: &mut blake3::Hasher, bytes: &[u8]| {
+      hasher.update(&(bytes.len() as u64).to_le_bytes());
+      hasher.update(bytes);
+    };
+    for (path, bytes) in &self.content {
+      hasher.update(IDENTITY_TAG_FILE);
+      field(&mut hasher, path.as_bytes());
+      field(&mut hasher, bytes);
+    }
+    for path in &self.dirs {
+      hasher.update(IDENTITY_TAG_DIR);
+      field(&mut hasher, path.as_bytes());
+    }
+    for (path, mode) in &self.modes {
+      hasher.update(IDENTITY_TAG_MODE);
+      field(&mut hasher, path.as_bytes());
+      hasher.update(&mode.to_le_bytes());
+    }
+    for (path, target) in &self.symlinks {
+      hasher.update(IDENTITY_TAG_SYMLINK);
+      field(&mut hasher, path.as_bytes());
+      field(&mut hasher, target.as_bytes());
+    }
+    for (path, target) in &self.hardlinks {
+      hasher.update(IDENTITY_TAG_HARDLINK);
+      field(&mut hasher, path.as_bytes());
+      field(&mut hasher, target.as_bytes());
+    }
+    for ((path, name), value) in &self.xattrs {
+      hasher.update(IDENTITY_TAG_XATTR);
+      field(&mut hasher, path.as_bytes());
+      field(&mut hasher, name.as_bytes());
+      field(&mut hasher, value);
+    }
+    *hasher.finalize().as_bytes()
+  }
+
+  /// The paths any dimension of which changed at a version in `(from, to]` (§4.16 "`advance` …
+  /// invalidates exactly the paths the manifest diff between the two versions names"): what an
+  /// attachment moving from `from` to `to` must invalidate. Read off the per-dimension histories,
+  /// which hold every version a path changed at — not the last-changed index alone, which would
+  /// miss a path changed inside the span and again after it. Sorted, each path once.
+  pub fn changed_between(&self, from: u64, to: u64) -> Vec<String> {
+    let within = |version: u64| version > from && version <= to;
+    let mut changed: BTreeSet<String> = BTreeSet::new();
+    for (path, history) in &self.content_history {
+      if history.iter().any(|(version, _)| within(*version)) {
+        changed.insert(path.clone());
+      }
+    }
+    for (path, history) in &self.dir_history {
+      if history.iter().any(|(version, _)| within(*version)) {
+        changed.insert(path.clone());
+      }
+    }
+    for (path, history) in &self.mode_history {
+      if history.iter().any(|(version, _)| within(*version)) {
+        changed.insert(path.clone());
+      }
+    }
+    for (path, history) in &self.symlink_history {
+      if history.iter().any(|(version, _)| within(*version)) {
+        changed.insert(path.clone());
+      }
+    }
+    for (path, history) in &self.hardlink_history {
+      if history.iter().any(|(version, _)| within(*version)) {
+        changed.insert(path.clone());
+      }
+    }
+    for ((path, _), history) in &self.xattr_history {
+      if history.iter().any(|(version, _)| within(*version)) {
+        changed.insert(path.clone());
+      }
+    }
+    changed.into_iter().collect()
   }
 
   /// The green's current state as a deriver [`Base`](crate::increment::Base) — every file with its
@@ -512,8 +687,9 @@ impl Green {
   }
 
   /// A file's bytes at `version`, reconstructed from its history — the latest recorded value at or
-  /// before `version`, or `None` when the file was absent then.
-  fn content_at(&self, path: &str, version: u64) -> Option<Vec<u8>> {
+  /// before `version`, or `None` when the file was absent then. What a version-pinned attachment
+  /// reads (§4.16 "Attachments and versions": a reader's view moves only by `advance`).
+  pub fn content_at(&self, path: &str, version: u64) -> Option<Vec<u8>> {
     self.content_history.get(path).and_then(|history| {
       history
         .iter()
