@@ -447,6 +447,83 @@ pub async fn request_within(
   )
 }
 
+/// Ships each `(host, request)` to that host on `stream` over its borrowed session, concurrently — one
+/// child task per session, each bounded by the budget's full span and handing its timed reply and endpoint
+/// back whatever the outcome ([`request_within`]) — and returns the replies that arrived before the round's
+/// progress-aware stop, each with its endpoint, **and the round's [`Stragglers`]**: the still-open reply
+/// channel through which every child not yet reported hands its reply and endpoint when it finishes. The
+/// caller records both as a dispatch it settles each period, so a slow or dead voter never serializes the
+/// reachable ones, and a slow-but-live one costs neither its session nor its reply. This is the
+/// configuration council's and root group's fan-out in the daemon (a heartbeat to a dead follower must not
+/// delay the live ones, so it is the same concurrent, session-preserving shape as a record commit,
+/// [`commit_record`]) and the fabric harness's (`tests/wan_election.rs`), so the two prove one shape. Each
+/// child is detached once the round returns, so a per-period round never accumulates task slots (banned
+/// item 8): a reported child is already terminal, and an unreported one finishes at [`request_within`]'s
+/// deadline and self-reaps, having reported through the channel.
+///
+/// Collects **progress-aware**, not to the flat deadline ([`DispatchWait`], the policy the record commit
+/// uses): a round is done when every child has reported, or when it has *stalled* — no new reply within the
+/// stall window. Decisive under a membership change: a dead voter that is still a voter until the council
+/// retires it never replies, and waiting the full extended deadline for it every period would stall the
+/// very retirement that removes it (`docs/bugs/2026-09-12-broadcast-waits-out-dead-voter.md`). The stop
+/// must also leave a round time for its **first** reply: with a one-period base deadline every reply of a
+/// round to voters more than three quarters of a period away was still in flight at the stop — and since
+/// a late pre-vote reply is dropped, no such council could elect
+/// (`docs/bugs/2026-09-14-consensus-round-expires-inside-the-wan-rtt.md`); the caller derives the budget's
+/// base from the measured path ([`timing::round_budget`]).
+pub async fn broadcast(
+  requests: Vec<(HostId, Vec<u8>, Endpoint)>,
+  stream: u64,
+  budget: CommitBudget,
+) -> (Vec<(HostId, TimedReply, Endpoint)>, Stragglers) {
+  if requests.is_empty() {
+    return (Vec::new(), Stragglers::none());
+  }
+  let deadline_ns = budget.max_deadline_ns();
+  let (tx, rx) = channel::<Reply>();
+  let mut tasks = Vec::new();
+  for (host, request, endpoint) in requests {
+    let tx = tx.clone();
+    if let Ok(task) = spawn_child(async move {
+      let (reply, endpoint) = request_within(endpoint, stream, &request, deadline_ns).await;
+      let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
+    }) {
+      tasks.push(task);
+    }
+    // A spawn failure drops the cloned `tx` and the moved endpoint: that voter yields no reply, stays
+    // outstanding on the caller's dispatch and is marked lost when it settles, and the channel still
+    // disconnects once the rest end.
+  }
+  drop(tx); // so the channel disconnects when the last child has reported
+  let mut replies = Vec::with_capacity(tasks.len());
+  let mut wait = DispatchWait::new(budget, now_ns());
+  let mut all_reported = false;
+  loop {
+    loop {
+      match rx.try_recv() {
+        Ok(Reply(host, reply, endpoint)) => replies.push((host, reply, *endpoint)),
+        Err(TryRecvError::Empty) => break,
+        Err(TryRecvError::Disconnected) => {
+          all_reported = true;
+          break;
+        }
+      }
+    }
+    if all_reported || !wait.keep_waiting(replies.len()).await {
+      break;
+    }
+  }
+  // A child that has not reported is a voter replying late, or timing out at its own deadline. Do **not**
+  // join it here — that would wait out the very deadline the progress-aware stop exists to avoid. Detach
+  // every child (a reported one is already terminal; an unreported one self-reaps at its deadline) and keep
+  // the channel open as the round's stragglers: the late reply and its endpoint arrive there, and the
+  // caller's settle folds the one and returns the other. Nothing is dropped, so nothing is orphaned.
+  for task in tasks {
+    let _ = detach(task);
+  }
+  (replies, Stragglers::pending(rx))
+}
+
 /// Whether `acked` (distinct candidates) commits under `quorum` for `candidates`.
 fn is_placed(candidates: &[HostId], acked: &[HostId], quorum: Quorum) -> bool {
   Placement {

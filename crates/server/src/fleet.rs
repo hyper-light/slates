@@ -76,7 +76,6 @@
 //! `FleetNode`, degenerate (R8).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{TryRecvError, channel};
 
 use rustls::pki_types::CertificateDer;
 use slates_archive::Archive;
@@ -93,8 +92,8 @@ use slates_cluster::raft_wire::{
 use slates_cluster::root_group::root_representatives;
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once};
 use slates_cluster::{
-  ClusterError, CommitBudget, DispatchWait, PROMOTE_STREAM, RECORD_STREAM, Reply, Stragglers,
-  TimedReply, commit_record, promote_record, request_within,
+  ClusterError, CommitBudget, PROMOTE_STREAM, RECORD_STREAM, Stragglers, broadcast, commit_record,
+  promote_record, request_within,
 };
 use slates_db::Op;
 use slates_db::catalog::{
@@ -2698,80 +2697,6 @@ fn serve_config_fetch(state: &ShardState, request: &[u8]) -> Vec<u8> {
   }
 }
 
-/// Ships each `(host, request)` to that host on `stream` over its borrowed record session, concurrently —
-/// one child task per session, each bounded by the dispatch deadline and handing its reply and endpoint
-/// back whatever the outcome ([`request_within`]) — and returns the replies that arrived before the round's
-/// progress-aware stop, each with its endpoint, **and the round's [`Stragglers`]**: the still-open reply
-/// channel through which every child not yet reported hands its reply and endpoint when it finishes. The
-/// caller records both as a [`Dispatch`] the coordinator settles each period, so a slow or dead voter never
-/// serializes the reachable ones, and a slow-but-live one costs neither its session nor its reply. The
-/// council is small and near-silent, but a heartbeat to a dead follower must not delay the live ones, so the
-/// fan-out is the same concurrent, session-preserving shape as a record commit ([`commit_record`]) — the
-/// stragglers handed back exactly as that commit hands back its own. Each child is detached once the round
-/// returns, so a per-period round never accumulates task slots (banned item 8): a reported child is already
-/// terminal, and an unreported one finishes at [`request_within`]'s deadline and self-reaps, having reported
-/// through the channel.
-async fn broadcast(
-  requests: Vec<(HostId, Vec<u8>, Endpoint)>,
-  stream: u64,
-  budget: CommitBudget,
-) -> (Vec<(HostId, TimedReply, Endpoint)>, Stragglers) {
-  if requests.is_empty() {
-    return (Vec::new(), Stragglers::none());
-  }
-  let deadline_ns = budget.max_deadline_ns();
-  let (tx, rx) = channel::<Reply>();
-  let mut tasks = Vec::new();
-  for (host, request, endpoint) in requests {
-    let tx = tx.clone();
-    if let Ok(task) = futures::spawn_child(async move {
-      let (reply, endpoint) = request_within(endpoint, stream, &request, deadline_ns).await;
-      let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
-    }) {
-      tasks.push(task);
-    }
-    // A spawn failure drops the cloned `tx` and the moved endpoint: that voter yields no reply, stays
-    // outstanding on the dispatch and is marked lost when it settles (its link task re-establishes the
-    // session), and the channel still disconnects once the rest end.
-  }
-  drop(tx); // so the channel disconnects when the last child has reported
-  let mut replies = Vec::with_capacity(tasks.len());
-  // Collect **progress-aware**, not to the flat deadline: a round is done when every child has reported, or
-  // when it has *stalled* — no new reply within the stall window ([`DispatchWait`], the same policy the
-  // record commit uses). This is decisive under a membership change: a dead voter that is still a voter
-  // until the council retires it never replies, and waiting the full extended deadline for it every period
-  // (§4.8 "late work") would stall the very retirement that removes it — a broadcast to a dead peer took the
-  // whole `max_deadline` (~1.1 s) each period, slowing every consensus round behind it
-  // (docs/bugs/2026-09-12-broadcast-waits-out-dead-voter.md). The reachable quorum replies fast; once
-  // replies stall, the round returns and the leader folds what it has and re-ships next period (idempotent).
-  let mut wait = DispatchWait::new(budget, slates_rt::futures::now_ns());
-  let mut all_reported = false;
-  loop {
-    loop {
-      match rx.try_recv() {
-        Ok(Reply(host, reply, endpoint)) => replies.push((host, reply, *endpoint)),
-        Err(TryRecvError::Empty) => break,
-        Err(TryRecvError::Disconnected) => {
-          all_reported = true;
-          break;
-        }
-      }
-    }
-    if all_reported || !wait.keep_waiting(replies.len()).await {
-      break;
-    }
-  }
-  // A child that has not reported is a voter replying late, or timing out at its own deadline. Do **not**
-  // join it here — that would wait out the very deadline the progress-aware stop exists to avoid. Detach
-  // every child (a reported one is already terminal; an unreported one self-reaps at its deadline) and keep
-  // the channel open as the round's stragglers: the late reply and its endpoint arrive there, and the
-  // dispatch's settle folds the one and returns the other. Nothing is dropped, so nothing is orphaned.
-  for task in tasks {
-    let _ = futures::detach(task);
-  }
-  (replies, Stragglers::pending(rx))
-}
-
 /// Drives one replication round as the council **leader**: ships each other voter the append it is owed (a
 /// heartbeat, or the entries it still lacks) over its borrowed record session, concurrently, and folds each
 /// reply — the leader advances its commit index as a majority acknowledge, and the regional configuration
@@ -4032,6 +3957,7 @@ fn highest_held_epoch(acceptor: &Acceptor, object: ObjectId) -> HostEpoch {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use slates_cluster::DispatchWait;
 
   /// A millisecond in nanoseconds, so the samples read as round times.
   const MS: u64 = 1_000_000;

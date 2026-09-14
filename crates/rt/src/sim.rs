@@ -61,7 +61,7 @@ impl SimDelay {
   };
 
   /// A path of `one_way_ns ± jitter_ns` that keeps each flow in send order.
-  pub fn in_order(one_way_ns: u64, jitter_ns: u64) -> SimDelay {
+  pub const fn in_order(one_way_ns: u64, jitter_ns: u64) -> SimDelay {
     SimDelay {
       one_way_ns,
       jitter_ns,
@@ -70,7 +70,7 @@ impl SimDelay {
   }
 
   /// A path of `one_way_ns ± jitter_ns` whose jitter may reorder a flow.
-  pub fn reordering(one_way_ns: u64, jitter_ns: u64) -> SimDelay {
+  pub const fn reordering(one_way_ns: u64, jitter_ns: u64) -> SimDelay {
     SimDelay {
       one_way_ns,
       jitter_ns,
