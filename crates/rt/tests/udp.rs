@@ -128,3 +128,131 @@ fn a_simulated_udp_datagram_is_received() {
     other => panic!("the simulated recv did not complete: {other:?}"),
   }
 }
+
+// ── The fabric's latency model (§4.8 A-9: "independently delayed … messages") ────────────────────────
+
+/// Shape: the one-way delay of the modelled inter-region path — 80 ms, the far side of a real
+/// inter-region pair (see `docs/wip/wan-timeout.md` for the measured pairs it stands for).
+const ONE_WAY_NS: u64 = 80_000_000;
+/// Shape: the path's jitter, ± 20 ms around the one-way delay — a quarter of it, the spread the
+/// WAN proof was asked for.
+const JITTER_NS: u64 = 20_000_000;
+/// Shape: how far apart the sender spaces its datagrams — 5 ms, well inside the ± 20 ms jitter, so a
+/// model that allowed reordering would overtake often and one that keeps a flow in order is provably
+/// clamping rather than merely lucky.
+const SEND_GAP_NS: u64 = 5_000_000;
+/// Shape: the datagrams one flow sends — enough for the seeded jitter to draw an overtake when the model
+/// allows it (a run at this count showed several), few enough to keep the run short.
+const FLOW_LENGTH: usize = 32;
+
+/// Sends `FLOW_LENGTH` datagrams `SEND_GAP_NS` apart, each stamped with its virtual send time, and returns
+/// each datagram's (arrival, stamp) pair as the receiver saw them, in arrival order.
+fn run_stamped_flow(seed: u64, delay: slates_rt::sim::SimDelay) -> Vec<(u64, u64)> {
+  use slates_rt::sim::{SimRuntime, sim_udp_set_delay};
+
+  let mut sim = SimRuntime::new(&config(), seed).unwrap();
+  sim_udp_set_delay(delay);
+  let id = sim.shard_ids()[0];
+  let (port_tx, port_rx) = channel();
+  let (result_tx, result_rx) = channel();
+
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = port_tx.send(socket.local_addr().unwrap().port());
+      let mut arrivals = Vec::with_capacity(FLOW_LENGTH);
+      let mut buf = [0u8; 8];
+      for _ in 0..FLOW_LENGTH {
+        let (n, _) = socket.recv_from(&mut buf).await.unwrap();
+        assert_eq!(n, 8, "a whole stamp arrived");
+        let stamp = u64::from_le_bytes(buf);
+        arrivals.push((slates_rt::futures::now_ns(), stamp));
+      }
+      let _ = result_tx.send(arrivals);
+    })
+    .unwrap();
+
+  sim
+    .spawn_on(id, async move {
+      let port = loop {
+        if let Ok(p) = port_rx.try_recv() {
+          break p;
+        }
+        slates_rt::futures::sleep(1_000).await;
+      };
+      let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let dest = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+      for _ in 0..FLOW_LENGTH {
+        let stamp = slates_rt::futures::now_ns();
+        let _ = sender.send_to(&stamp.to_le_bytes(), dest);
+        slates_rt::futures::sleep(SEND_GAP_NS).await;
+      }
+    })
+    .unwrap();
+
+  sim.run_until_idle();
+  result_rx
+    .try_recv()
+    .expect("the receiver saw the whole flow")
+}
+
+/// AC (§4.3 the simulation driver; §4.8 A-9 "independently delayed … messages"): over a modelled path of
+/// 80 ms ± 20 ms one way, every datagram arrives on the virtual clock between 60 ms and 100 ms after it was
+/// sent — never before its delay, never past its jitter — and the flow arrives in the order it was sent
+/// even though the sends are spaced closer than the jitter (the model keeps a flow in order unless told
+/// otherwise). The zero-delay fabric is the test above, unchanged.
+#[test]
+fn a_delayed_simulated_datagram_arrives_within_its_jitter_and_in_order() {
+  use slates_rt::sim::SimDelay;
+
+  let arrivals = run_stamped_flow(7, SimDelay::in_order(ONE_WAY_NS, JITTER_NS));
+  assert_eq!(arrivals.len(), FLOW_LENGTH, "every datagram arrived");
+  let mut seen_below_delay_floor = false;
+  for (arrived, stamp) in &arrivals {
+    let flight = arrived.saturating_sub(*stamp);
+    assert!(
+      (ONE_WAY_NS - JITTER_NS..=ONE_WAY_NS + JITTER_NS).contains(&flight),
+      "a datagram flew {flight} ns; the path is {ONE_WAY_NS} ± {JITTER_NS} ns"
+    );
+    seen_below_delay_floor |= flight < ONE_WAY_NS;
+  }
+  assert!(
+    seen_below_delay_floor && arrivals.iter().any(|(a, s)| a - s > ONE_WAY_NS),
+    "the jitter was drawn on both sides of the delay (non-vacuity: the model jittered)"
+  );
+  let stamps: Vec<u64> = arrivals.iter().map(|(_, stamp)| *stamp).collect();
+  let mut sorted = stamps.clone();
+  sorted.sort_unstable();
+  assert_eq!(stamps, sorted, "the flow arrived in send order");
+}
+
+/// AC (§4.8 A-9 "reordered messages"): when the model says a path may reorder, the seeded jitter overtakes
+/// at least once within the flow — the same sends, spaced closer than the jitter, now arrive out of order —
+/// so a consumer's reorder handling can be exercised deterministically.
+#[test]
+fn a_reordering_path_overtakes_within_one_flow() {
+  use slates_rt::sim::SimDelay;
+
+  let arrivals = run_stamped_flow(7, SimDelay::reordering(ONE_WAY_NS, JITTER_NS));
+  assert_eq!(arrivals.len(), FLOW_LENGTH, "every datagram arrived");
+  let stamps: Vec<u64> = arrivals.iter().map(|(_, stamp)| *stamp).collect();
+  let overtakes = stamps.windows(2).filter(|pair| pair[1] < pair[0]).count();
+  assert!(
+    overtakes > 0,
+    "the reordering model let a later datagram overtake an earlier one at least once"
+  );
+}
+
+/// AC (D-20, deterministic simulation): the jitter is drawn from the simulation's seeded generator, so two
+/// runs with one seed produce the same arrival times to the nanosecond, and a different seed draws a
+/// different sequence — a failure history replays exactly.
+#[test]
+fn the_jitter_is_seeded_so_a_run_replays_exactly() {
+  use slates_rt::sim::SimDelay;
+
+  let first = run_stamped_flow(7, SimDelay::in_order(ONE_WAY_NS, JITTER_NS));
+  let again = run_stamped_flow(7, SimDelay::in_order(ONE_WAY_NS, JITTER_NS));
+  assert_eq!(first, again, "one seed, one history");
+  let other = run_stamped_flow(8, SimDelay::in_order(ONE_WAY_NS, JITTER_NS));
+  assert_ne!(first, other, "another seed draws another jitter sequence");
+}
