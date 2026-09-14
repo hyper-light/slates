@@ -1,15 +1,45 @@
 # §4.2 admission and residency — the all-cost charge (GAP-A9-1)
 
-> Status (2026-09-13, branch `agent/admission`): **the retained-content dimension is charged**
-> (piece 1a of the charter). A chunk a snapshot keeps alive after the head lets go of it is charged
-> against the shard's unpromised capacity by the operation that retains it, refused typed before any
-> mutation when the shard cannot back it, credited as it is freed, and re-established on recovery;
-> the charge/credit balance is proven against the drift-free deadlist walk. On the way, a data-loss
-> defect in chunk ownership was found and fixed first (docs/bugs/2026-09-13-snapshot-destroy-frees-
-> head-shared-chunks.md). Owed from this charter, in order: allocator rounding in the write charge,
-> the generated-history charge oracle, the metadata/transient ledger and the mapped-vs-usable
-> per-host ledger (piece 2), and entitlement through resize/pressure/recovery (piece 3). Each lands
-> as its own commit and extends this note.
+> Status (2026-09-13, branch `agent/admission`, seven commits on `c80b6f9`): **the per-host admission
+> is all-cost and atomic on one code path.** Content bytes are charged at the arena block a window
+> takes (allocator rounding included), snapshot-retained bytes are charged from unpromised capacity
+> by the operation that retains them, and every volume's metadata records are reserved from a
+> per-shard ledger laid out against the metadata class — each refused typed before any mutation,
+> credited as it is freed, re-established on recovery. Shard credits are disjoint mappings; the
+> effective capacity clamps total RAM to the tightest OS/job/cgroup bound; mapped and usable bytes
+> are both reported. An admitted claim is protected through resize (shrink refuses below use, grow
+> reserves first) and recovery (the claim and its retention are re-taken ahead of new ones) —
+> §§4a–4e below, each with its by-use tests and numbers. On the way two defects were found and fixed
+> first: a retained inode version freed the chunks its successor shared (data loss on
+> `destroy_snapshot`), and the inline spill sized window 0 to the write's end (a phantom chunk).
+> **Owed:** a memory-pressure signal that stops new admission (§4e names the design), the Windows
+> job-object bound, and the guest/open-reference bytes composed into the same picture (§5).
+>
+> **For the integrator — the ledger row (GAP-A9-1, Machine/memory/runtime):** *Per-host admission
+> is all-cost on one code path: content charged at its buddy block, snapshot retention charged from
+> unpromised capacity by the retaining operation (refused typed before mutation, balanced through
+> destroy and recovery), metadata laid out against the class and every volume's records reserved
+> from a per-shard ledger; effective capacity clamped to the OS/job/cgroup bound; mapped and usable
+> reported; an admitted claim protected through resize and recovery; proven by the charge oracle
+> (150 histories) and AC-2.11's neighbour test. Owed: a pressure signal that stops new admission,
+> the Windows job-object bound, guest and open-reference bytes (docs/wip/admission.md).*
+>
+> **For the integrator — the §4.2 status blockquote:** *Status (2026-09-13). The server establishes
+> the reservation: the shard budget is over the arena's buddy-usable capacity (BUG-2), a strict
+> volume locks its arena or refuses (BUG-1), dynamic growth is check-and-acquire against the one
+> budget (BUG-3), and the charge is all-cost — a window is charged the buddy block it takes,
+> snapshot-retained chunks are charged from unpromised capacity by the operation that retains them
+> (a write's reopen, a truncate's cut, an edit, the last name of a file; refused `NoSpace` before
+> mutation, as OpenZFS refuses a delete on a full pool), and every volume's records are reserved from
+> a per-shard metadata ledger laid out against the metadata class. The effective capacity is total
+> RAM clamped to the tightest OS/job/cgroup bound; `slates status` reports mapped, usable, committed,
+> retained and metadata bytes per shard. Credits are re-taken on recovery ahead of new claims; shrink
+> refuses below use. Not yet: a pressure signal that stops admission (the design: sample PSI /
+> `MemAvailable` at the profile refresh cadence on the control shard and apply a hold above
+> `committed`, never below it), the Windows job-object bound, guest request buffers and open-reference
+> maps in the same ledger, and a boot-time refusal of a hand-edited layout past the bound. GAP-A9-1's
+> contract gaps (BUG-1–3, uncharged metadata/transient/retained bytes) are closed; see
+> `docs/wip/admission.md`.*
 
 ## 1. The model as built
 
@@ -262,6 +292,34 @@ status` prints `mapped=` before `reserve=`.
    memory limit (`QueryInformationJobObject`, Win32 FFI under the unsafe budget), and a boot-time
    typed refusal when a shard's mapped classes exceed the host bound (today the classes are derived
    from the bound, so the sum fits by construction; the check would guard a hand-edited config).
-5. **Entitlement through resize, pressure and recovery** (piece 3): shrink refusing below retained
-   obligations, a pressure signal that stops admission without touching an admitted claim, and the
-   restart proof that an admitted claim survives.
+5. ~~Entitlement through resize and recovery~~ — done (§4e). **Pressure** is owed: the design is a
+   hold on each shard's budget — `admittable = capacity − committed − headroom − hold`, the hold
+   never reaching below `committed` so no admitted claim is touched — applied by the control shard
+   from a sampled pressure source (Linux PSI `memory.some`, else `MemAvailable`/`host_statistics64`)
+   at the profile's cheap-refresh cadence, and released as the sample recovers; the by-use proof is
+   a raised hold refusing a new reservation while an admitted volume's within-entitlement writes
+   land. It is not built here because no sampler drives it yet on this branch (code without a real
+   caller would be untestable by use, R5); `Facts::memory_available_now` is the sampler to start from.
+
+## 4e. Resize and recovery (piece 3)
+
+**Resize.** Grow reserves the additional entitlement first (the server's `resize`: the version
+reservation, then the byte reservation, each refused whole before anything changes) and shrink is
+applied after the core accepts the new limit; the core refuses a shrink below current use
+(`Quota::resize`, now against physical `referenced_bytes`) with nothing changed. Retained bytes are
+charged outside the quota, so a shrink cannot strand them ("shrink refuses below retained
+obligations" is met by construction: the obligations are not the quota's).
+
+**Recovery.** `rebuild_volume` re-takes the byte reservation and the dynamic hold before the
+rebuild, `from_image` re-establishes the retention charge, and the inode allowance and metadata
+records are re-reserved after — a rebuild the fresh shard cannot back is discarded whole. So an
+admitted claim survives a restart ahead of any new claim; the server-level restart oracle
+(`crates/client/tests/client.rs`, a session outliving a daemon restart) already exercises the
+reservation half.
+
+**Evidence.** `cargo test -p slates-vfs --test entitlement` — 3 passed: a shrink below current use
+is refused `NoSpace` with nothing changed and the claim stays spendable at its old limit; with two
+quarter claims and retention filling the unpromised half, a new claim is refused `BudgetExceeded`
+while A lands the other half of its own quota and B its whole quarter; after a rebuild on a fresh
+shard behind B's claim, the ledger holds both claims plus A's retention, a claim that would need the
+retained bytes is refused, A writes within its claim and B lands its whole claim.
