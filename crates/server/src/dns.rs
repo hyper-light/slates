@@ -101,6 +101,22 @@ impl std::fmt::Display for DnsError {
 
 impl std::error::Error for DnsError {}
 
+impl DnsError {
+  /// The refusal's kind as a status counter suffix (`fleet.resolve.<kind>` in `slates status`), so an
+  /// operator reading the counts sees *why* a peer's name is not resolving, not just that it is not.
+  pub fn kind(&self) -> &'static str {
+    match self {
+      Self::Name { .. } => "name",
+      Self::NoNameserver => "no-nameserver",
+      Self::Timeout { .. } => "timeout",
+      Self::Refused { .. } => "refused",
+      Self::NoAddress => "no-address",
+      Self::Malformed { .. } => "malformed",
+      Self::Io(_) => "io",
+    }
+  }
+}
+
 /// Format: the DNS message header is twelve bytes — id, flags, and the four section counts, each two bytes
 /// (RFC 1035 §4.1.1).
 const HEADER_BYTES: usize = 12;

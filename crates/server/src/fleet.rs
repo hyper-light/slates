@@ -774,8 +774,11 @@ pub async fn run_membership(transport: FleetTransport, progress: &'static Atomic
 /// The socket refusing ends it, counted (`fleet.serve`), so an operator sees a node that stopped accepting
 /// rather than a mesh that silently never re-forms.
 async fn run_demux(demux: &'static Demux) {
-  if demux.run().await.is_err() {
+  if let Err(e) = demux.run().await {
+    // Counted for `status`, and said once in the log with its reason: a node that silently stopped
+    // accepting sessions on a plane is a mesh that never forms with nothing to read but a count.
     count_refusal(SERVE_REFUSED);
+    eprintln!("slates-server: fleet: a serve socket's receive loop ended: {e:?}");
   }
 }
 
@@ -836,13 +839,17 @@ async fn client_for(
     NodeAddress::Ip(address) => *address,
     NodeAddress::Name { host, port } => {
       let Some(resolver) = resolver else {
-        count_refusal(RESOLVE_REFUSED);
+        count_refusal(RESOLVE_NO_RESOLVER);
         return None;
       };
       match dns::lookup(resolver, host).await {
         Ok(ip) => SocketAddrV4::new(ip, *port),
-        Err(_) => {
-          count_refusal(RESOLVE_REFUSED);
+        Err(e) => {
+          // The first refusal of each kind is logged once, so an operator's first look at the daemon's log
+          // names the cause; the counts in `status` carry the rest.
+          if count_refusal(resolve_refusal(&e)) == 1 {
+            eprintln!("slates-server: fleet: resolving `{host}`: {e}");
+          }
           return None;
         }
       }
@@ -850,6 +857,18 @@ async fn client_for(
   };
   let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).ok()?;
   Endpoint::client(socket, peer, identity, certificate, name, FLEET_FRAME_CAP).ok()
+}
+
+/// The status refusal name for a failed name lookup: `fleet.resolve.<kind>` ([`dns::DnsError::kind`]).
+fn resolve_refusal(error: &dns::DnsError) -> &'static str {
+  match error.kind() {
+    "timeout" => RESOLVE_TIMEOUT,
+    "refused" => RESOLVE_NXDOMAIN,
+    "no-address" => RESOLVE_NO_ADDRESS,
+    "malformed" => RESOLVE_MALFORMED,
+    "io" => RESOLVE_IO,
+    _ => RESOLVE_REFUSED,
+  }
 }
 
 /// Advances a session toward established, one handshake attempt per call (the probe and ship loops call it
@@ -2387,16 +2406,29 @@ const ACCEPT_REFUSED: &str = "fleet.accept";
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const SERVE_REFUSED: &str = "fleet.serve";
 
-/// The status refusal count under which a dial task records a peer's DNS name that did not resolve (no
-/// resolver, a timeout, `NXDOMAIN` for a pod not yet created, a malformed reply): the dial is skipped this
-/// period and made again the next, so a count that keeps rising names a peer the fleet cannot reach by name.
-/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+/// The status refusal counts under which a dial task records a peer's DNS name that did not resolve, by
+/// cause — the name itself invalid (`fleet.resolve`), no resolver configured, every attempt timed out,
+/// `NXDOMAIN` (a pod not yet created, or a name the cluster's DNS does not serve), an answer without an
+/// `A` record, a malformed reply, the runtime refusing the socket: the dial is skipped this period and made
+/// again the next, so a count that keeps rising names a peer the fleet cannot reach by name and says why.
+/// Format: refusal names in the daemon's status report, alongside the verbs' refusal kinds.
 const RESOLVE_REFUSED: &str = "fleet.resolve";
+const RESOLVE_NO_RESOLVER: &str = "fleet.resolve.no-resolver";
+const RESOLVE_TIMEOUT: &str = "fleet.resolve.timeout";
+const RESOLVE_NXDOMAIN: &str = "fleet.resolve.refused";
+const RESOLVE_NO_ADDRESS: &str = "fleet.resolve.no-address";
+const RESOLVE_MALFORMED: &str = "fleet.resolve.malformed";
+const RESOLVE_IO: &str = "fleet.resolve.io";
 
 /// Counts a fleet-loop refusal in the shard's status refusal counts, so a peer the loop could not set up is
 /// visible to an operator (the mesh will not form to it) rather than a swallowed error (banned item 9).
-pub(crate) fn count_refusal(kind: &'static str) {
-  state::with_state(|s| *s.refusals.entry(kind).or_insert(0) += 1);
+pub(crate) fn count_refusal(kind: &'static str) -> u64 {
+  state::with_state(|s| {
+    let count = s.refusals.entry(kind).or_insert(0);
+    *count += 1;
+    *count
+  })
+  .unwrap_or(0)
 }
 
 /// Whether this node keeps **direct contact** with `peer` — a record session dialed and kept up for the
