@@ -23,10 +23,10 @@ use serde_json::{Value, json};
 use slates_client::{
   AttachRequest, AttachTransport, Attachment, AttachmentCapability, CauseRecord, ChokepointReport,
   Client, ClientError, Conformance, CreateSpec, DaemonReport, DeleteWhileOpen, Established, Filter,
-  GreenBase, Intent, KernelCache, Landing, LandingOutcome, LandingSummary, NamePolicy, OciBinding,
-  OciRuntime, ReadAt, ReadWritePolicy, Rebased, Residency, ShardReport, Signal, SizeClass,
-  SnapshotId, SpanRecord, StatusReport, Submitted, TargetPathConstraint, TelemetryReport,
-  TransportReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
+  GreenBase, GroupReport, Intent, KernelCache, Landing, LandingOutcome, LandingSummary, NamePolicy,
+  OciBinding, OciRuntime, ReadAt, ReadWritePolicy, Rebased, Residency, ShardReport, Signal,
+  SizeClass, SnapshotId, SpanRecord, StatusReport, Submitted, TargetPathConstraint,
+  TelemetryReport, TransportReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
 };
 
 pub mod http;
@@ -1191,7 +1191,22 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
       "inbox_full": r.fleet.inbox_full,
       "sessions_refused": r.fleet.sessions_refused,
       "replaced": r.fleet.replaced,
+      "council": group_json(&r.fleet.council),
+      "root": group_json(&r.fleet.root),
     },
+  })
+}
+
+/// A consensus group's block of the fleet status as JSON (§4.8): whether this node leads it and the
+/// election timing it derived — the same fields the text form's `fleet_<group>_*` lines print.
+fn group_json(g: &GroupReport) -> Value {
+  json!({
+    "leads": g.leads,
+    "base_periods": g.base_periods,
+    "span_periods": g.span_periods,
+    "rtt_tail_ns": g.rtt_tail_ns,
+    "rtt_spread_ns": g.rtt_spread_ns,
+    "samples": g.samples,
   })
 }
 

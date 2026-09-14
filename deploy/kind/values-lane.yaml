@@ -1,0 +1,13 @@
+# The KIND lane's install values (docs/wip/kind-lane.md): the locally built image loaded into the cluster,
+# three nodes at f = 1, the production profile (no `--quick`). The identities are supplied on top of this
+# file by `cargo xtask kind certs` (a values file of self-signed DER certificates, one per pod).
+replicas: 3
+image:
+  repository: slates
+  tag: lane
+  pullPolicy: Never
+resources:
+  # Shape: the lane's per-node bound — small, so three nodes fit beside the kind control plane in the
+  # Docker VM; the daemon's effective capacity clamps to it (§4.2).
+  memory: 1Gi
+  cpu: 2

@@ -2219,6 +2219,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "rcgen",
  "rustix",
  "serde",
  "serde_json",

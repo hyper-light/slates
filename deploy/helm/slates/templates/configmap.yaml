@@ -1,0 +1,21 @@
+{{- /*
+The shared fleet manifest and every node's public certificate, mounted read-only at /etc/slates/fleet in
+every pod. It is rendered from `replicas`, so it changes only when the fleet's membership does (a scale is
+a configuration-group membership change, D-14's cold path), and the StatefulSet's checksum annotation
+restarts the pods on it. Public material only: the keys are in each pod's own Secret.
+*/ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "slates.fullname" . }}-fleet
+  labels:
+    {{- include "slates.labels" . | nindent 4 }}
+data:
+  fleet.json: |-
+    {{- include "slates.manifest" . | nindent 4 }}
+binaryData:
+  {{- range $index := until (int .Values.replicas) }}
+  {{- $pod := include "slates.podName" (dict "root" $ "index" $index) }}
+  {{- include "slates.identity" (dict "root" $ "index" $index) }}
+  {{ $pod }}.crt.der: {{ (index $.Values.certificates $pod).certificate }}
+  {{- end }}

@@ -408,10 +408,11 @@ fn start_with_policy(
     peers: vec![FleetPeer {
       anchor: peer.anchor,
       host: peer.host,
-      address: peer.address,
-      record_address: peer.record_address,
+      address: peer.address.into(),
+      record_address: peer.record_address.into(),
       certificate: peer.certificate,
     }],
+    resolver: None,
   };
   Daemon::start_with_fleet(
     &this.profile,
@@ -1343,23 +1344,28 @@ fn fleet_config(
     })
 }
 
-/// An anchor segment on which the anchor has recorded one daemon start — `record_start` is what increments
-/// the generation before every daemon start — so the daemon that attaches it boots at generation one and
-/// derives `member_id(anchor, 1)` as its own id: the real restart path, the test playing the anchor (as the
-/// client restart oracle does). The start stamp is the anchor's clock reading, immaterial with no anchor to
-/// read it. Returns the handoff to start the daemon over, and the segment, which must outlive the daemon.
-fn generation_one_segment(
+/// An anchor segment on which the anchor has recorded **two** daemon starts, so the daemon that attaches it
+/// boots at ephemeral incarnation one and derives `member_id(anchor, 1)` as its own id: the real restart
+/// path, the test playing the anchor (as the client restart oracle does). `record_start` increments the
+/// supervision generation before every start, and the daemon reads that generation down by one (an anchor
+/// numbers its first start generation one, which is the manifest's precomputed gen-zero seed, so incarnation
+/// is the restart count). The first recorded start here is that seed start (generation one, incarnation
+/// zero); the second is the restart (generation two, incarnation one). The start stamp is the anchor's clock
+/// reading, immaterial with no anchor to read it. Returns the handoff to start the daemon over, and the
+/// segment, which must outlive the daemon.
+fn incarnation_one_segment(
   name: &str,
   profile: &MachineProfile,
   geometry: Geometry,
   pid: u32,
 ) -> (SegmentSource, AnchorSegment) {
   let segment = AnchorSegment::create(name, &profile.facts.identity, geometry)
-    .expect("the generation-one anchor segment");
-  segment
+    .expect("the incarnation-one anchor segment");
+  let supervision = segment
     .supervision()
-    .expect("the segment's supervision block")
-    .record_start(u64::from(pid), 0, false);
+    .expect("the segment's supervision block");
+  supervision.record_start(u64::from(pid), 0, false);
+  supervision.record_start(u64::from(pid), 0, true);
   let (handoff, len) = segment.handoff().expect("the segment hands off");
   (
     SegmentSource::Handoff {
@@ -1388,6 +1394,7 @@ fn start_fleet_node(
     probe_bind: loopback(bind.0),
     record_bind: loopback(bind.1),
     peers,
+    resolver: None,
   };
   Daemon::start_with_fleet(profile, config, source, Some(transport))
     .expect("the fleet daemon starts")
@@ -1398,8 +1405,9 @@ fn start_fleet_node(
 /// generation on its first probe and is learned on contact — its new member id admitted and probed, its old
 /// id retired and its objects taken over — with nothing injected. Three nodes form (`f = 1`, so two
 /// survivors keep the council's majority); B seals a volume whose head A and C hold; B's process ends; a
-/// second daemon presents **B's certificate** at generation one — its anchor segment records the start, as
-/// the anchor does before every daemon start — on the address A and C dial for B, and probes them. A and C
+/// second daemon presents **B's certificate** at generation one — its anchor segment records a second start,
+/// the restart, the anchor recording one before every daemon start (so the daemon reads the generation down
+/// by one to its restart count) — on the address A and C dial for B, and probes them. A and C
 /// validate the announced id (`member_id(anchor_B, 1)`) against B's anchor, fold the old id dead and the new
 /// alive, and the council commits the takeover and the admission; the survivor rendezvous ranks first takes
 /// over B's volume and serves it. Non-vacuous: the new id is not the old (the id is ephemeral); the old is
@@ -1519,8 +1527,8 @@ fn fleet_peer_at(
   FleetPeer {
     anchor,
     host,
-    address: loopback(at.0),
-    record_address: loopback(at.1),
+    address: loopback(at.0).into(),
+    record_address: loopback(at.1).into(),
     certificate: certificate.clone(),
   }
 }
@@ -1668,8 +1676,8 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
 }
 
 /// Restarts B: a second daemon with B's certificate attaches an anchor segment on which the anchor has
-/// recorded the start ([`generation_one_segment`]), so it derives `member_id(anchor_B, 1)` as its own id.
-/// The segment is returned so it outlives the daemon.
+/// recorded a second start ([`incarnation_one_segment`]), so it derives `member_id(anchor_B, 1)` as its own
+/// id. The segment is returned so it outlives the daemon.
 fn restart_b(fleet: &mut RestartFleet, pid: u32) -> (Daemon, AnchorSegment) {
   let peers = std::mem::take(&mut fleet.peers_of_b_again);
   let identity = fleet
@@ -1684,7 +1692,7 @@ fn restart_b(fleet: &mut RestartFleet, pid: u32) -> (Daemon, AnchorSegment) {
     &peers,
     &fleet.domains,
   );
-  let (source, segment) = generation_one_segment(
+  let (source, segment) = incarnation_one_segment(
     &format!("slates-seg-fleet3-again-{}-{pid}", fleet.host_b.0),
     &fleet.profile_b,
     config.geometry,
@@ -1808,8 +1816,9 @@ fn forged_anchor_of(anchor: HostId) -> HostId {
 /// ... [is] validated"; task #22, **over the wire**): an announcement whose generation is **stale**, or whose
 /// member id is not the one the announcer's certificate derives to (**forged**), is refused at the serve side
 /// — counted in the refusals `slates status` reports, never folded into membership, and never acknowledged.
-/// A and B form, B at generation one (its anchor segment recorded a start, as the anchor does before every
-/// daemon start), so A learns `member_id(anchor_B, 1)`. Then two more daemons present **B's certificate** to
+/// A and B form, B at generation one (its anchor segment recorded a second start — the restart — as the
+/// anchor records one before every daemon start, so the daemon reads that generation down by one), so A
+/// learns `member_id(anchor_B, 1)`. Then two more daemons present **B's certificate** to
 /// A: one on a fresh segment — generation zero, B's seed id: a stale or replayed boot — and one configured
 /// with an anchor that is not the one A's roster holds for B's certificate, so the id it announces is one
 /// B's certificate cannot derive — a forgery, from a holder of B's key, the strongest position a forger can
@@ -1847,7 +1856,7 @@ fn a_stale_or_forged_announcement_is_refused_and_counted() {
 struct RefusalFleet {
   daemon_a: Daemon,
   daemon_b: Daemon,
-  /// B's generation-one segment, which outlives its daemon.
+  /// B's incarnation-one segment (the anchor recorded a restart on it), which outlives its daemon.
   segment_b: AnchorSegment,
   host_a: HostId,
   anchor_a: HostId,
@@ -1862,7 +1871,8 @@ struct RefusalFleet {
   announcer_serve: Vec<(u16, u16)>,
 }
 
-/// Starts A on a fresh segment and B on a generation-one anchor segment, each dialing the other.
+/// Starts A on a fresh segment and B on an incarnation-one anchor segment (a recorded restart), each dialing
+/// the other.
 fn refusal_fleet_forms(pid: u32) -> RefusalFleet {
   let (profile_a, host_a, identity_a) = fleet_node("a");
   let (profile_b, host_b, _) = fleet_node("b");
@@ -1905,7 +1915,7 @@ fn refusal_fleet_forms(pid: u32) -> RefusalFleet {
       name: format!("slates-seg-{instance_a}"),
     },
   );
-  let (source_b, segment_b) = generation_one_segment(
+  let (source_b, segment_b) = incarnation_one_segment(
     &format!("slates-seg-{instance_b}"),
     &profile_b,
     config_b.geometry,
@@ -2198,8 +2208,8 @@ fn start_mesh_with(
         .map(|j| FleetPeer {
           anchor: anchors[j],
           host: hosts[j],
-          address: loopback(serve[j].0),
-          record_address: loopback(serve[j].1),
+          address: loopback(serve[j].0).into(),
+          record_address: loopback(serve[j].1).into(),
           certificate: certs[j].clone(),
         })
         .collect();
@@ -2223,6 +2233,7 @@ fn start_mesh_with(
         probe_bind: loopback(serve[i].0),
         record_bind: loopback(serve[i].1),
         peers,
+        resolver: None,
       };
       Daemon::start_with_fleet(
         &profile,
@@ -2405,6 +2416,7 @@ fn a_loopback_fleet_derives_its_election_timing_at_the_measured_floor() {
     });
   let timings: Vec<Option<slates_cluster::timing::ElectionTiming>> =
     daemons.iter().map(Daemon::council_timing).collect();
+  let reported = council_reports_over_the_wire(&hosts);
   for daemon in daemons {
     daemon.stop();
   }
@@ -2423,6 +2435,48 @@ fn a_loopback_fleet_derives_its_election_timing_at_the_measured_floor() {
       (timing.base_periods, timing.span_periods),
       (floor.base_periods, floor.span_periods),
       "the derived timing is the floor on a loopback fleet: {timing:?}"
+    );
+  }
+  assert_status_carries_the_council(&reported, &floor);
+}
+
+/// The council block of every mesh node's `DaemonStatus`, read over the wire — what an operator's
+/// `slates status` prints (`fleet_council_*`): each node's control shard's council leadership and derived
+/// timing, so a status read on a pod reports what the in-process accessor reports.
+fn council_reports_over_the_wire(hosts: &[HostId]) -> Vec<slates_ipc::protocol::GroupReport> {
+  let pid = std::process::id();
+  hosts
+    .iter()
+    .map(|host| {
+      let mut client = Client::connect(&format!("fleet3-{}-{pid}", host.0));
+      match client.call(&RequestBody::DaemonStatus) {
+        ReplyBody::DaemonStatus { report } => report.fleet.council.clone(),
+        other => panic!("status answers on every node: {other:?}"),
+      }
+    })
+    .collect()
+}
+
+/// Exactly one node reports itself the leader over the wire, and every node's status carries measured
+/// samples and the derived timing at `floor`.
+fn assert_status_carries_the_council(
+  reported: &[slates_ipc::protocol::GroupReport],
+  floor: &slates_cluster::timing::ElectionTiming,
+) {
+  assert_eq!(
+    reported.iter().filter(|group| group.leads).count(),
+    1,
+    "exactly one node reports itself the council's leader over the wire: {reported:?}"
+  );
+  for group in reported {
+    assert!(
+      group.samples > 0,
+      "the status carries the measured samples, not the default: {reported:?}"
+    );
+    assert_eq!(
+      (group.base_periods, group.span_periods),
+      (floor.base_periods, floor.span_periods),
+      "the status carries the derived timing: {reported:?}"
     );
   }
 }
@@ -3534,6 +3588,127 @@ fn poll_survivors_retire(survivors: &[Daemon], dead: HostId) -> bool {
       })
     },
   )
+}
+
+/// Shape: the memory bound the lane's pod runs under (`deploy/kind/values-lane.yaml`, Guaranteed QoS
+/// `memory: 1Gi`): the cgroup bound the profile reports as `memory.limit`, from which the daemon derives its
+/// client and task budgets — the container's budgets, reproduced on this machine.
+const POD_MEMORY_BYTES: u64 = 1 << 30;
+
+/// AC-2.6 (admission stays within the task arena; refusals typed), §4.8 boot step 6: a fleet node under a
+/// container's memory bound admits its clients. The daemon derives its task budget from its client bound;
+/// the fleet's own tasks (two per peer to dial it, up to `SESSIONS_PER_PEER` serve tasks per plane per peer,
+/// and its loops) must be inside that budget, or the admission task that seats a client on its shard is
+/// refused by the arena and dropped unrun — the client's channel closes under it and `slates status` never
+/// answers. The KIND lane hit exactly this on 2026-09-14: one pod of a five-replica fleet (four peers) at
+/// 1 GiB never became Ready (`docs/bugs/2026-09-14-fleet-tasks-outside-the-task-budget-poison-client-admission.md`).
+/// Here, the pod's shape: node A under the pod's bound has one real peer, B, **which dials in** (A accepts
+/// B's sessions and holds a serve task for each — the tasks a peer adds to a node it reaches), plus as many
+/// silent peers as A's client-only task budget has slots (none answers; A's dial tasks to them alone fill an
+/// arena sized without the fleet). Once B's probe session to A is up, one client asks A for `status`.
+/// Non-vacuous: B's session formed (so A serves it) and the premise (A's peers exceed its client-only
+/// budget) are both asserted, and the answer counts the client seated on its shard.
+///
+/// Written failing on the lane's branch (with the arena full the daemons' shutdown never completed, so it
+/// hung past its reply deadline rather than failing); green once the fleet's task share landed on main
+/// (`DaemonConfig::with_fleet`, 2026-09-14, `docs/bugs/2026-09-14-fleet-tasks-admitted-against-the-clients-budget.md`).
+#[test]
+fn a_fleet_node_under_a_containers_memory_bound_still_admits_a_client() {
+  let pid = std::process::id();
+  let (mut profile_a, host_a, identity_a) = fleet_node("bounded-a");
+  profile_a.facts.memory.limit = Some(POD_MEMORY_BYTES);
+  let (profile_b, host_b, identity_b) = fleet_node("bounded-b");
+  let anchor_a = anchor_of(&profile_a);
+  let anchor_b = anchor_of(&profile_b);
+  let instance_a = format!("bounded-{}-{pid}", host_a.0);
+  let instance_b = format!("bounded-{}-{pid}", host_b.0);
+  // The budget A derives for its clients alone (no fleet joined yet): the silent peers are sized from it.
+  let client_only_budget = DaemonConfig::derive(&profile_a, &instance_a)
+    .with_shards(1)
+    .runtime
+    .tasks_per_shard;
+  let serve = mesh_serve_ports(2);
+  let cert_a = identity_a.certificate();
+  let cert_b = identity_b.certificate();
+  let ports = free_ports(2 * client_only_budget);
+  let mut peers_of_a = vec![fleet_peer_at(anchor_b, host_b, serve[1], &cert_b)];
+  peers_of_a.extend((0..client_only_budget).map(|index| {
+    let silent_anchor = HostId(u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1));
+    fleet_peer_at(
+      silent_anchor,
+      member_id(silent_anchor, 0),
+      (ports[2 * index], ports[2 * index + 1]),
+      &self_signed().certificate(),
+    )
+  }));
+  let peer_count = peers_of_a.len();
+  let peers_of_b = vec![fleet_peer_at(anchor_a, host_a, serve[0], &cert_a)];
+  let no_domains = std::collections::BTreeMap::new();
+  let config_a = fleet_config(
+    &profile_a,
+    &instance_a,
+    anchor_a,
+    host_a,
+    &peers_of_a,
+    &no_domains,
+  );
+  let config_b = fleet_config(
+    &profile_b,
+    &instance_b,
+    anchor_b,
+    host_b,
+    &peers_of_b,
+    &no_domains,
+  );
+  let daemon_a = start_fleet_node(
+    &profile_a,
+    config_a,
+    identity_a,
+    serve[0],
+    peers_of_a,
+    SegmentSource::Create {
+      name: format!("slates-seg-{instance_a}"),
+    },
+  );
+  let daemon_b = start_fleet_node(
+    &profile_b,
+    config_b,
+    identity_b,
+    serve[1],
+    peers_of_b,
+    SegmentSource::Create {
+      name: format!("slates-seg-{instance_b}"),
+    },
+  );
+  // B's probe session to A is up — A accepted it and serves it — before the client arrives.
+  let served_b = poll_until(&[&daemon_b], FORMATION_DEADLINE, || {
+    daemon_b.fleet_meshed() == Some(true)
+  });
+  let mut client = Client::connect(&instance_a);
+  let report = match client.call(&RequestBody::DaemonStatus) {
+    ReplyBody::DaemonStatus { report } => report,
+    other => panic!("status answers: {other:?}"),
+  };
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    served_b,
+    "B's probe session to A formed, so A holds a serve task for it"
+  );
+  assert!(
+    peer_count > client_only_budget,
+    "the premise: A's peers ({peer_count}) exceed its client-only task budget ({client_only_budget})"
+  );
+  assert_eq!(
+    report.shards.iter().map(|shard| shard.clients).sum::<u32>(),
+    1,
+    "the client is seated on its shard and counted"
+  );
+  assert!(
+    report.fleet.members.contains(&host_a.0),
+    "the node holds itself alive: {:?}",
+    report.fleet.members
+  );
 }
 
 /// A minimal client of a daemon's own rendezvous (as in the other daemon tests): connect and call verbs.

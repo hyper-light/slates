@@ -1,0 +1,18 @@
+slates fleet "{{ .Release.Name }}": {{ .Values.replicas }} node(s) at f = {{ include "slates.f" . }} in namespace {{ .Release.Namespace }}.
+
+Each node is a pod {{ include "slates.fullname" . }}-N, addressed by its peers as
+{{ include "slates.fullname" . }}-N.{{ include "slates.fullname" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}
+on UDP ports {{ .Values.fleet.basePort }} + 2N and the next. Nothing is stored on disk (R1).
+
+The fleet's view from any node:
+
+  kubectl -n {{ .Release.Namespace }} exec {{ include "slates.fullname" . }}-0 -- /slates status
+
+reports fleet_members (every member it holds alive), fleet_peers_probed (the mesh is up when this is
+{{ sub (int .Values.replicas) 1 }}), fleet_council_leads (one node reports true) and the council's derived
+election timing (fleet_council_base_periods, fleet_council_rtt_tail_ns, fleet_council_samples).
+
+A pod is Ready once its own `slates status` answers. Scale with
+`helm upgrade {{ .Release.Name }} <chart> --set replicas=N` (and one identity per new pod under
+`certificates`): the manifest is re-rendered and every pod restarts on it — a membership change of the
+configuration group.

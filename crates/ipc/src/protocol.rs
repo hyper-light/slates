@@ -630,6 +630,28 @@ pub struct RefusalCount {
   pub count: u64,
 }
 
+/// One consensus group's state on a node, as `status` reports it (§4.8 "Configuration, by consensus";
+/// "Derived constants": *"election timeout for the configuration group ≥ 10 × broadcast RTT p99 with the
+/// randomization span from RTT variance"*): whether this node currently leads it, and the election timing
+/// it last derived — the base and span in coordinator periods, the measured round-trip tail and spread
+/// they came from, and the samples behind them, so an observer tells a measured timing from the floor it
+/// would default to. The regional council and the root group each report one.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct GroupReport {
+  /// Whether this node believes itself the group's elected leader.
+  pub leads: bool,
+  /// The base election timeout in coordinator periods.
+  pub base_periods: u32,
+  /// The randomization span in coordinator periods.
+  pub span_periods: u32,
+  /// The broadcast round-trip tail the base was derived from (nanoseconds); zero before any sample.
+  pub rtt_tail_ns: u64,
+  /// The round-trip variation the span was derived from (nanoseconds); zero before any sample.
+  pub rtt_spread_ns: u64,
+  /// The round trips measured across the voter paths that fed the derivation.
+  pub samples: u64,
+}
+
 /// One shard's part of the daemon's status.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct ShardReport {
@@ -684,6 +706,13 @@ pub struct ShardReport {
   /// the usable (buddy-allocatable) part the budget admits against (§4.2 "segment, slab and buddy
   /// geometry report usable capacity, not mapping length": both, so the difference is visible).
   pub mapped_bytes: u64,
+  /// Whether this is the control shard — the one that runs the membership loop, drives the consensus
+  /// groups and holds their live timing; the other shards hold inert copies.
+  pub control: bool,
+  /// The regional configuration council as this shard holds it (live on the control shard).
+  pub council: GroupReport,
+  /// The root group across regions as this shard holds it (live on the control shard).
+  pub root: GroupReport,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -712,6 +741,11 @@ pub struct FleetReport {
   /// Sessions closed because their peer established a new one (a re-dial after a loss), summed over the
   /// planes.
   pub replaced: u64,
+  /// The regional configuration council (§4.8, D-14) as the control shard drives it: whether this node
+  /// leads it, and the election timing it derived from the measured voter paths.
+  pub council: GroupReport,
+  /// The root group across regions, likewise; the degenerate self-leading group in a single-region fleet.
+  pub root: GroupReport,
 }
 
 /// The daemon's status.
@@ -1677,10 +1711,12 @@ pub enum ReplyBody {
     /// The refusal.
     refusal: Refusal,
   },
-  /// The daemon's status.
+  /// The daemon's status. Boxed: the report is the one cold, wide reply (every shard's part and the
+  /// fleet's two consensus groups), and boxing it keeps every hot reply's enum at its narrow size — the
+  /// codec encodes a box as its content.
   DaemonStatus {
     /// The report.
-    report: DaemonReport,
+    report: Box<DaemonReport>,
   },
   /// The awaited scope's placement.
   Placed {

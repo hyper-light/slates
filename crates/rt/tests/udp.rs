@@ -78,6 +78,58 @@ fn a_udp_datagram_is_received_through_the_driver() {
   rt.shutdown();
 }
 
+/// AC (§4.3; docs/bugs/2026-09-14-epoll-readiness-re-add-eexist.md): a socket is awaited **again** after
+/// its first datagram — the shape of every receive loop (the fleet's serve sockets, a mount's stream) —
+/// and the driver re-arms its readiness rather than refusing the second registration. A receiver awaits
+/// two datagrams on one socket, each sent only after it blocked (so each await registers with the
+/// driver); the second must arrive as the first did. On the epoll driver (Linux with io_uring refused, as
+/// under a container's default seccomp profile) the second registration was `EEXIST` before the fix, so
+/// the second await failed and the loop ended; kqueue and io_uring re-arm per await and passed either way.
+#[test]
+fn a_second_receive_on_the_same_socket_registers_readiness_again() {
+  let rt = Runtime::start(&config()).unwrap();
+  let id = rt.shard_ids()[0];
+  let receiver = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let target = receiver.local_addr().unwrap();
+
+  let (tx, rx) = channel();
+  rt.spawn_on(id, async move {
+    let mut buf = [0u8; 64];
+    let first = receiver
+      .recv_from(&mut buf)
+      .await
+      .map(|(n, _)| buf[..n].to_vec());
+    let _ = tx.send(first);
+    let second = receiver
+      .recv_from(&mut buf)
+      .await
+      .map(|(n, _)| buf[..n].to_vec());
+    let _ = tx.send(second);
+  })
+  .unwrap();
+  // Two sends, each after the receiver has blocked on its await (a runtime sleep apart).
+  rt.spawn_on(id, async move {
+    let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    slates_rt::futures::sleep(5_000_000).await;
+    let _ = sender.send_to(b"first", target);
+    slates_rt::futures::sleep(20_000_000).await;
+    let _ = sender.send_to(b"second", target);
+  })
+  .unwrap();
+
+  for expected in [&b"first"[..], &b"second"[..]] {
+    match rx.recv_timeout(Duration::from_secs(5)) {
+      Ok(Ok(bytes)) => assert_eq!(bytes, expected),
+      Ok(Err(e)) => panic!("recv_from of {expected:?} failed: {e:?}"),
+      Err(e) => {
+        let counters = rt.shutdown();
+        panic!("timed out waiting for {expected:?} ({e}); counters {counters:#?}");
+      }
+    }
+  }
+  rt.shutdown();
+}
+
 /// The simulated UDP fabric delivers deterministically at N=1 (§4.10a "sim arm first"): a receiver
 /// awaits recv_from (registering fabric interest), a sender delivers, and the datagram arrives — the
 /// whole plane with no OS network, driven to idle. Uses `slates_rt::sim::SimRuntime`.

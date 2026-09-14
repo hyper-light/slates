@@ -1,0 +1,14 @@
+# The KIND lane's cluster (docs/wip/kind-lane.md): one control plane and five workers, because a node is
+# a failure domain — the chart's required anti-affinity places one member per node, and the scale step
+# runs five replicas. Every node is a container in the Docker VM; the pods' UDP planes run pod to pod
+# over the cluster's default CNI (kindnet), no NAT between pods, which is what the session plane's
+# source pinning needs.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+  - role: worker
+  - role: worker
+  - role: worker

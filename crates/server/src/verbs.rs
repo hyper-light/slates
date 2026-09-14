@@ -17,10 +17,10 @@ use slates_db::catalog::{
 use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration, rendezvous_first};
 use slates_ipc::protocol::{
   AttachRequest, AttachTransport, DaemonReport, Direction, Established, FleetReport,
-  FreshnessBasis, HealthSignal, Intent, NamePolicy, OciBinding, PlacedState, ReadWritePolicy,
-  Refusal, RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal, SizeClass, SnapshotId,
-  StatusReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp, decode_body, encode_body, pack,
-  unpack,
+  FreshnessBasis, GroupReport, HealthSignal, Intent, NamePolicy, OciBinding, PlacedState,
+  ReadWritePolicy, Refusal, RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal,
+  SizeClass, SnapshotId, StatusReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
+  decode_body, encode_body, pack, unpack,
 };
 use slates_ipc::slot::SlotKind;
 use slates_ipc::{IpcError, Request};
@@ -1422,14 +1422,45 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     metadata_bytes: state.store.metadata.capacity(),
     committed_metadata: state.store.metadata.committed(),
     mapped_bytes: u64::try_from(state.store.content.mapped_bytes()).unwrap_or(u64::MAX),
+    control: is_control_shard(state),
+    council: group_report(state.council.is_leader(), state.council_timing),
+    root: group_report(state.root.is_leader(), state.root_timing),
+  }
+}
+
+/// Whether `state` is the control shard's — the first of the daemon's shards, the one that runs the
+/// membership loop and drives the consensus groups (`Daemon::council_leads` observes the same shard).
+fn is_control_shard(state: &ShardState) -> bool {
+  state.shards.first() == Some(&state.shard)
+}
+
+/// A consensus group's status line: whether this node leads it, and the election timing it derived.
+fn group_report(leads: bool, timing: slates_cluster::timing::ElectionTiming) -> GroupReport {
+  GroupReport {
+    leads,
+    base_periods: timing.base_periods,
+    span_periods: timing.span_periods,
+    rtt_tail_ns: timing.broadcast_rtt_tail_ns,
+    rtt_spread_ns: timing.broadcast_rtt_spread_ns,
+    samples: timing.samples,
   }
 }
 
 /// The daemon's place in its fleet (§4.8), from this shard's placement authority — every shard's
 /// `FleetNode` advances identically (the control shard hands it each peer state it folds) — with the
-/// formed probe sessions summed over the shards' parts (only the control shard forms any).
+/// formed probe sessions summed over the shards' parts (only the control shard forms any) and the
+/// consensus groups' state taken from the control shard's part (the only live one).
 fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
   let configuration = state.fleet.configuration();
+  let control = shards.iter().find(|shard| shard.control);
+  let council = control.map_or_else(
+    || group_report(state.council.is_leader(), state.council_timing),
+    |shard| shard.council.clone(),
+  );
+  let root = control.map_or_else(
+    || group_report(state.root.is_leader(), state.root_timing),
+    |shard| shard.root.clone(),
+  );
   FleetReport {
     host: state.fleet.host().0,
     f: configuration.quorum.f,
@@ -1448,6 +1479,8 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     inbox_full: demux_sum(state, |c| c.inbox_full),
     sessions_refused: demux_sum(state, |c| c.sessions_refused),
     replaced: demux_sum(state, |c| c.replaced),
+    council,
+    root,
   }
 }
 
@@ -1479,7 +1512,7 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
     .unwrap_or((0, 0, 0));
   let fleet = fleet_report(state, &shards);
   ReplyBody::DaemonStatus {
-    report: DaemonReport {
+    report: Box::new(DaemonReport {
       pid: std::process::id(),
       generation,
       restarts,
@@ -1488,7 +1521,7 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
       clients_refused: crate::daemon::CLIENTS_REFUSED.load(Ordering::Acquire),
       shards,
       fleet,
-    },
+    }),
   }
 }
 

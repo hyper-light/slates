@@ -25,6 +25,8 @@
 //!   ratchet over the bench examples, keyed by machine identity (see `ratchet.rs`).
 //! - `cargo xtask conformance (plan | run --suite S | all | matrix [--write]) [--records DIR]
 //!   [--scratch DIR] [--keep]` — the conformance evidence harness (see `conformance/mod.rs`).
+//! - `cargo xtask kind (image | smoke) [--tag TAG] [--keep]` — the KIND fleet lane: the image, one node
+//!   of it in Docker (see `kind.rs`; docs/wip/kind-lane.md).
 //!
 //! This is a development tool, not shipped code. It reads sources and runs cargo, so it is the one
 //! place in the workspace where `std::fs` reads and `std::process` are ordinary; it still obeys the
@@ -35,6 +37,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 mod conformance;
+mod kind;
 mod ratchet;
 mod unsafe_budget;
 mod version;
@@ -106,8 +109,12 @@ fn main() -> ExitCode {
       let options = conformance::parse(&root, &args[1..])?;
       conformance::run(&root, &options)
     }),
+    "kind" => workspace_root().and_then(|root| {
+      let options = kind::parse(&args[1..])?;
+      kind::run(&root, &options)
+    }),
     other => Err(Failure(format!(
-      "unknown task `{other}`; tasks: structural, literals, unsafe, version, npm-reserve, check, ratchet, conformance"
+      "unknown task `{other}`; tasks: structural, literals, unsafe, version, npm-reserve, check, ratchet, conformance, kind"
     ))),
   };
   match outcome {

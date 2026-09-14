@@ -1,0 +1,17 @@
+apiVersion: v2
+name: slates
+description: >-
+  A slates fleet on Kubernetes: a StatefulSet of RAM-only daemons that replicate each other's volume
+  heads and content over UDP and take over for a dead member (design §4.8; docs/deploy.md). No
+  PersistentVolume, ever — disk is the source of truth and is written only inside a granted landing (R1).
+type: application
+# The chart's version and the daemon's are one: bump both with the workspace version.
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.29.0-0"
+keywords:
+  - filesystem
+  - copy-on-write
+  - in-memory
+sources:
+  - https://github.com/adalundhe/slates

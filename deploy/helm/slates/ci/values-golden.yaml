@@ -1,0 +1,15 @@
+# The values the golden render is made with (xtask/tests/helm_chart.rs): three fixed, fake identities so
+# `helm template` is deterministic byte for byte. The bytes are not certificates — `helm template` never
+# reads them — and a daemon given them would refuse at boot by name (`DeployError::Identity`).
+replicas: 3
+certificates:
+  slates-0:
+    certificate: c2xhdGVzLTAgY2VydGlmaWNhdGUgKGZha2UgZm9yIHRoZSBnb2xkZW4gcmVuZGVyKQ==
+    key: c2xhdGVzLTAga2V5IChmYWtlIGZvciB0aGUgZ29sZGVuIHJlbmRlcik=
+  slates-1:
+    certificate: c2xhdGVzLTEgY2VydGlmaWNhdGUgKGZha2UgZm9yIHRoZSBnb2xkZW4gcmVuZGVyKQ==
+    key: c2xhdGVzLTEga2V5IChmYWtlIGZvciB0aGUgZ29sZGVuIHJlbmRlcik=
+  slates-2:
+    certificate: c2xhdGVzLTIgY2VydGlmaWNhdGUgKGZha2UgZm9yIHRoZSBnb2xkZW4gcmVuZGVyKQ==
+    key: c2xhdGVzLTIga2V5IChmYWtlIGZvciB0aGUgZ29sZGVuIHJlbmRlcik=
+fullnameOverride: slates

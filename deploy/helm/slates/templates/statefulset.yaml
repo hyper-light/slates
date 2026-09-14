@@ -1,0 +1,164 @@
+{{- /*
+The fleet: a StatefulSet (stable per-pod names — the manifest's node names and DNS addresses) with
+`podManagementPolicy: Parallel` (the fleet forms as its nodes come up; a peer not yet listening is
+retried by the dialer) and NO volumeClaimTemplates: slates is RAM-only, its §4.8 registers live in RAM
+replicated to 2f + 1 holders, and a node that loses its RAM rejoins and is re-filled (R1; "restart = join").
+A DaemonSet was considered and rejected: no stable per-pod DNS name.
+*/ -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "slates.fullname" . }}
+  labels:
+    {{- include "slates.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "slates.fullname" . }}
+  replicas: {{ int .Values.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      {{- include "slates.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "slates.selectorLabels" . | nindent 8 }}
+      annotations:
+        # The manifest is the fleet's membership: a change of it (a scale) restarts every pod on the new
+        # manifest, the fleet re-forming — D-14's cold path, never a per-write concern.
+        checksum/fleet: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # R10: no privilege. The daemon runs as the image's non-root user with every capability dropped and
+      # a read-only root filesystem — a RAM-only service writes no file (R1), so any write it attempted
+      # would fail loudly here rather than land on a node's disk.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          # A node is a failure domain (D-14 copysets): two members never share one.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "slates.selectorLabels" . | nindent 18 }}
+      topologySpreadConstraints:
+        # Across zones the members spread where the cluster has zones; a cluster without zone labels
+        # still schedules (`whenUnsatisfiable`).
+        - topologyKey: {{ .Values.topologySpread.zoneKey }}
+          maxSkew: 1
+          whenUnsatisfiable: {{ .Values.topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "slates.selectorLabels" . | nindent 14 }}
+      {{- if .Values.netem.enabled }}
+      # The KIND lane's network shaping (values.yaml `netem`; docs/wip/kind-lane.md §4). Lane-only: this is
+      # the one privileged container, it is not slates, and a production install never enables it.
+      initContainers:
+        - name: netem
+          image: {{ .Values.netem.image }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            capabilities:
+              add: ["NET_ADMIN"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              case "$POD_NAME" in
+              {{- range .Values.netem.pods }}
+                {{ include "slates.fullname" $ }}-{{ . }}) tc qdisc add dev eth0 root netem delay {{ $.Values.netem.delay }} {{ $.Values.netem.jitter }} loss {{ $.Values.netem.loss }} && echo "netem on $POD_NAME: delay {{ $.Values.netem.delay }} {{ $.Values.netem.jitter }} loss {{ $.Values.netem.loss }}" ;;
+              {{- end }}
+                *) echo "no netem on $POD_NAME" ;;
+              esac
+      {{- end }}
+      containers:
+        - name: slates
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The anchor is PID 1 (Dockerfile): it supervises the daemon and takes SIGTERM. The pod's own
+          # name selects its manifest entry — the same file for every pod.
+          args:
+            - anchor
+            - --fleet
+            - /etc/slates/fleet/fleet.json
+            - --node
+            - $(POD_NAME)
+            {{- range .Values.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            # Guaranteed QoS: requests equal limits, so the §4.2 effective capacity is exactly this bound.
+            requests:
+              memory: {{ .Values.resources.memory }}
+              cpu: {{ .Values.resources.cpu }}
+            limits:
+              memory: {{ .Values.resources.memory }}
+              cpu: {{ .Values.resources.cpu }}
+          readinessProbe:
+            # The daemon's own health signal (§4.14): `slates status` exits 0 only when the daemon serves
+            # (3 when no daemon answers, 4 when the anchor failed) — never a bare port check.
+            exec:
+              command: ["/slates", "status"]
+            initialDelaySeconds: {{ .Values.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readiness.periodSeconds }}
+            timeoutSeconds: {{ .Values.readiness.timeoutSeconds }}
+          # No liveness probe: the anchor already kills a daemon whose heartbeat lapses and restarts it
+          # under its derived bound (crates/anchor), which is finer than a pod restart.
+          volumeMounts:
+            - name: fleet
+              mountPath: /etc/slates/fleet
+              readOnly: true
+            # The pod's own key alone, at one fixed path every manifest entry names (`../keys/node.key.der`
+            # relative to the manifest): `subPathExpr` selects it by the pod's name from the projected volume
+            # of every pod's Secret (a mountPath is never expanded, a subPathExpr is).
+            - name: identities
+              mountPath: /etc/slates/keys/node.key.der
+              subPathExpr: $(POD_NAME).key.der
+              readOnly: true
+      volumes:
+        - name: fleet
+          configMap:
+            name: {{ include "slates.fullname" . }}-fleet
+        # Every pod's Secret projected into one volume; the container mounts its own key from it alone
+        # (secrets.yaml explains the shape).
+        - name: identities
+          projected:
+            # Owner and group read: the files are root-owned with the pod's fsGroup, and the daemon runs as
+            # that group's non-root user.
+            defaultMode: 0440
+            sources:
+              {{- range $index := until (int .Values.replicas) }}
+              {{- $pod := include "slates.podName" (dict "root" $ "index" $index) }}
+              - secret:
+                  name: {{ $pod }}-identity
+                  items:
+                    - key: {{ $pod }}.key.der
+                      path: {{ $pod }}.key.der
+              {{- end }}

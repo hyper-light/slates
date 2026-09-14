@@ -25,6 +25,9 @@
 pub mod config;
 pub mod daemon;
 pub mod deploy;
+// Name resolution for a peer named by DNS in the manifest (the Kubernetes deployment): an asynchronous
+// A-record client over the runtime's UDP, resolved at every dial so a rescheduled peer is found.
+pub mod dns;
 pub mod doorbell;
 pub mod error;
 pub mod fleet;
@@ -54,7 +57,8 @@ pub mod xshard;
 
 pub use config::{DaemonConfig, DurabilityBound, FleetMembership};
 pub use daemon::{Daemon, SegmentSource};
-pub use deploy::{DeployError, FleetManifest, FleetNodeEntry, FleetPlan};
+pub use deploy::{DeployError, FleetManifest, FleetNodeEntry, FleetPlan, NodeAddress};
+pub use dns::Resolver;
 pub use fleet::{FleetPeer, FleetTransport};
 
 pub use error::ServerError;

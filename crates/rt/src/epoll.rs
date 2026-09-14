@@ -124,40 +124,60 @@ impl Driver for EpollDriver {
   }
 
   fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
-    // SAFETY: `raw` is a live socket the caller (a UdpSocket) owns for the registration; the borrow
-    // is used only for this epoll_ctl call and not retained.
-    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
     // One-shot readable interest whose u64 data carries the waker word; the `wait` loop above turns
     // the ready event into a completion keyed by that word.
-    epoll::add(
-      &self.epfd,
-      fd,
-      EventData::new_u64(user_data),
+    self.arm(
+      raw,
+      user_data,
       EventFlags::IN | EventFlags::ONESHOT,
+      ("epoll_ctl(ADD readable)", "epoll_ctl(MOD readable)"),
     )
-    .map_err(|e| refused("epoll_ctl(ADD readable)", e))?;
-    Ok(())
   }
 
   fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
-    // SAFETY: `raw` is a live socket the caller (a TcpStream) owns for the registration; the borrow
-    // is used only for this epoll_ctl call and not retained.
-    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
     // One-shot writable interest whose u64 data carries the waker word; the `wait` loop turns the
     // ready event into a completion keyed by that word (§4.6, TCP send backpressure to a stalled
     // client).
-    epoll::add(
-      &self.epfd,
-      fd,
-      EventData::new_u64(user_data),
+    self.arm(
+      raw,
+      user_data,
       EventFlags::OUT | EventFlags::ONESHOT,
+      ("epoll_ctl(ADD writable)", "epoll_ctl(MOD writable)"),
     )
-    .map_err(|e| refused("epoll_ctl(ADD writable)", e))?;
-    Ok(())
   }
 
   fn has_pending(&self) -> bool {
     !self.nops.is_empty()
+  }
+}
+
+impl EpollDriver {
+  /// Arms one-shot `flags` interest on `raw` under the waker word `user_data`: `EPOLL_CTL_ADD` for a
+  /// descriptor this epoll instance has not seen, and `EPOLL_CTL_MOD` for one it has — a one-shot
+  /// registration is *disabled* after it fires, not removed, so the descriptor stays in the interest
+  /// list and a second `ADD` is refused `EEXIST` (epoll(7): "EPOLLONESHOT … the user must call
+  /// epoll_ctl with EPOLL_CTL_MOD to rearm"). Every await re-arms, so a receive loop's second await
+  /// — the fleet's serve sockets after their first datagram — is the `MOD`
+  /// (docs/bugs/2026-09-14-epoll-readiness-re-add-eexist.md).
+  fn arm(
+    &self,
+    raw: i32,
+    user_data: u64,
+    flags: EventFlags,
+    calls: (&'static str, &'static str),
+  ) -> Result<(), RtError> {
+    let (add_call, modify_call) = calls;
+    // SAFETY: `raw` is a live socket the caller (a UdpSocket or TcpStream) owns for the registration;
+    // the borrow is used only for these epoll_ctl calls and not retained.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
+    let data = EventData::new_u64(user_data);
+    match epoll::add(&self.epfd, fd, data, flags) {
+      Ok(()) => Ok(()),
+      Err(rustix::io::Errno::EXIST) => {
+        epoll::modify(&self.epfd, fd, data, flags).map_err(|e| refused(modify_call, e))
+      }
+      Err(e) => Err(refused(add_call, e)),
+    }
   }
 }
 

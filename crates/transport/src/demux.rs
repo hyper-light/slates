@@ -43,13 +43,10 @@ use rustls::pki_types::CertificateDer;
 use slates_rt::udp::{SocketAddrV4, UdpSocket};
 
 use crate::endpoint::{
-  ConnectionId, Endpoint, EndpointError, MIN_DATAGRAM_BYTES, connection_id_of, is_short_header,
+  ConnectionId, DATAGRAM_BYTES, Endpoint, EndpointError, MIN_DATAGRAM_BYTES, connection_id_of,
+  is_short_header,
 };
 use crate::handshake::{HandshakeError, Identity, server_connection};
-
-/// Shape: the largest datagram the receive loop reads — the same buffer the endpoint uses; a fleet
-/// packet never exceeds the RFC 9000 §14.1 minimum datagram.
-const DATAGRAM_BYTES: usize = 2048;
 
 /// A demultiplexer's id in this shard's table (see the module doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

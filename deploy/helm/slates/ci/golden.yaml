@@ -1,0 +1,254 @@
+---
+# Source: slates/templates/secrets.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: slates-0-identity
+  labels:
+    helm.sh/chart: slates-0.1.0
+    app.kubernetes.io/name: slates
+    app.kubernetes.io/instance: slates
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    slates.lundhe.audio/node: slates-0
+type: Opaque
+data:
+  slates-0.key.der: c2xhdGVzLTAga2V5IChmYWtlIGZvciB0aGUgZ29sZGVuIHJlbmRlcik=
+  slates-0.crt.der: c2xhdGVzLTAgY2VydGlmaWNhdGUgKGZha2UgZm9yIHRoZSBnb2xkZW4gcmVuZGVyKQ==
+
+---
+# Source: slates/templates/secrets.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: slates-1-identity
+  labels:
+    helm.sh/chart: slates-0.1.0
+    app.kubernetes.io/name: slates
+    app.kubernetes.io/instance: slates
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    slates.lundhe.audio/node: slates-1
+type: Opaque
+data:
+  slates-1.key.der: c2xhdGVzLTEga2V5IChmYWtlIGZvciB0aGUgZ29sZGVuIHJlbmRlcik=
+  slates-1.crt.der: c2xhdGVzLTEgY2VydGlmaWNhdGUgKGZha2UgZm9yIHRoZSBnb2xkZW4gcmVuZGVyKQ==
+
+---
+# Source: slates/templates/secrets.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: slates-2-identity
+  labels:
+    helm.sh/chart: slates-0.1.0
+    app.kubernetes.io/name: slates
+    app.kubernetes.io/instance: slates
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+    slates.lundhe.audio/node: slates-2
+type: Opaque
+data:
+  slates-2.key.der: c2xhdGVzLTIga2V5IChmYWtlIGZvciB0aGUgZ29sZGVuIHJlbmRlcik=
+  slates-2.crt.der: c2xhdGVzLTIgY2VydGlmaWNhdGUgKGZha2UgZm9yIHRoZSBnb2xkZW4gcmVuZGVyKQ==
+
+---
+# Source: slates/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: slates-fleet
+  labels:
+    helm.sh/chart: slates-0.1.0
+    app.kubernetes.io/name: slates
+    app.kubernetes.io/instance: slates
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+data:
+  fleet.json: |-
+    {
+      "f": 1,
+      "name": "slates-fleet",
+      "nodes": [
+        {
+          "address": "slates-0.slates.slates.svc.cluster.local:7000",
+          "certificate": "slates-0.crt.der",
+          "key": "../keys/node.key.der",
+          "node": "slates-0"
+        },
+        {
+          "address": "slates-1.slates.slates.svc.cluster.local:7002",
+          "certificate": "slates-1.crt.der",
+          "key": "../keys/node.key.der",
+          "node": "slates-1"
+        },
+        {
+          "address": "slates-2.slates.slates.svc.cluster.local:7004",
+          "certificate": "slates-2.crt.der",
+          "key": "../keys/node.key.der",
+          "node": "slates-2"
+        }
+      ]
+    }
+binaryData:
+  slates-0.crt.der: c2xhdGVzLTAgY2VydGlmaWNhdGUgKGZha2UgZm9yIHRoZSBnb2xkZW4gcmVuZGVyKQ==
+  slates-1.crt.der: c2xhdGVzLTEgY2VydGlmaWNhdGUgKGZha2UgZm9yIHRoZSBnb2xkZW4gcmVuZGVyKQ==
+  slates-2.crt.der: c2xhdGVzLTIgY2VydGlmaWNhdGUgKGZha2UgZm9yIHRoZSBnb2xkZW4gcmVuZGVyKQ==
+
+---
+# Source: slates/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: slates
+  labels:
+    helm.sh/chart: slates-0.1.0
+    app.kubernetes.io/name: slates
+    app.kubernetes.io/instance: slates
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: slates
+    app.kubernetes.io/instance: slates
+
+---
+# Source: slates/templates/statefulset.yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: slates
+  labels:
+    helm.sh/chart: slates-0.1.0
+    app.kubernetes.io/name: slates
+    app.kubernetes.io/instance: slates
+    app.kubernetes.io/version: "0.1.0"
+    app.kubernetes.io/managed-by: Helm
+spec:
+  serviceName: slates
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: slates
+      app.kubernetes.io/instance: slates
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: slates
+        app.kubernetes.io/instance: slates
+      annotations:
+        # The manifest is the fleet's membership: a change of it (a scale) restarts every pod on the new
+        # manifest, the fleet re-forming — D-14's cold path, never a per-write concern.
+        checksum/fleet: 376ce02ca9808ea04056d236e356fce86df33511362eee579a37c6ff20ecd0da
+    spec:
+      # R10: no privilege. The daemon runs as the image's non-root user with every capability dropped and
+      # a read-only root filesystem — a RAM-only service writes no file (R1), so any write it attempted
+      # would fail loudly here rather than land on a node's disk.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      affinity:
+        podAntiAffinity:
+          # A node is a failure domain (D-14 copysets): two members never share one.
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: slates
+                  app.kubernetes.io/instance: slates
+      topologySpreadConstraints:
+        # Across zones the members spread where the cluster has zones; a cluster without zone labels
+        # still schedules (`whenUnsatisfiable`).
+        - topologyKey: topology.kubernetes.io/zone
+          maxSkew: 1
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: slates
+              app.kubernetes.io/instance: slates
+      containers:
+        - name: slates
+          image: "slates:lane"
+          imagePullPolicy: IfNotPresent
+          # The anchor is PID 1 (Dockerfile): it supervises the daemon and takes SIGTERM. The pod's own
+          # name selects its manifest entry — the same file for every pod.
+          args:
+            - anchor
+            - --fleet
+            - /etc/slates/fleet/fleet.json
+            - --node
+            - $(POD_NAME)
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            # Guaranteed QoS: requests equal limits, so the §4.2 effective capacity is exactly this bound.
+            requests:
+              memory: 1Gi
+              cpu: 2
+            limits:
+              memory: 1Gi
+              cpu: 2
+          readinessProbe:
+            # The daemon's own health signal (§4.14): `slates status` exits 0 only when the daemon serves
+            # (3 when no daemon answers, 4 when the anchor failed) — never a bare port check.
+            exec:
+              command: ["/slates", "status"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          # No liveness probe: the anchor already kills a daemon whose heartbeat lapses and restarts it
+          # under its derived bound (crates/anchor), which is finer than a pod restart.
+          volumeMounts:
+            - name: fleet
+              mountPath: /etc/slates/fleet
+              readOnly: true
+            # The pod's own key alone, at one fixed path every manifest entry names (`../keys/node.key.der`
+            # relative to the manifest): `subPathExpr` selects it by the pod's name from the projected volume
+            # of every pod's Secret (a mountPath is never expanded, a subPathExpr is).
+            - name: identities
+              mountPath: /etc/slates/keys/node.key.der
+              subPathExpr: $(POD_NAME).key.der
+              readOnly: true
+      volumes:
+        - name: fleet
+          configMap:
+            name: slates-fleet
+        # Every pod's Secret projected into one volume; the container mounts its own key from it alone
+        # (secrets.yaml explains the shape).
+        - name: identities
+          projected:
+            # Owner and group read: the files are root-owned with the pod's fsGroup, and the daemon runs as
+            # that group's non-root user.
+            defaultMode: 0440
+            sources:
+              - secret:
+                  name: slates-0-identity
+                  items:
+                    - key: slates-0.key.der
+                      path: slates-0.key.der
+              - secret:
+                  name: slates-1-identity
+                  items:
+                    - key: slates-1.key.der
+                      path: slates-1.key.der
+              - secret:
+                  name: slates-2-identity
+                  items:
+                    - key: slates-2.key.der
+                      path: slates-2.key.der

@@ -856,6 +856,71 @@ fn two_clients_share_one_accepting_socket_and_each_gets_its_own_reply() {
   );
 }
 
+/// Shape: a roster large enough that the certificate-authority hints rustls would list made the server's
+/// flight overflow the receiver's datagram (64 admitted peers: 3,024 bytes against 2,048, measured
+/// 2026-09-14); a fleet of this size and larger must handshake like a fleet of two.
+const LARGE_ROSTER: usize = 64;
+
+/// §4.8 (every node holds the whole roster) with §4.9 (a fleet message rides one datagram), by use: a
+/// server admitting a **large roster** still completes a dialer's handshake and serves its request. Do:
+/// a server that admits 64 peers; one of them dials, handshakes and asks once. Expect: the reply, one
+/// session opened, none refused. Non-vacuous: before the roster verifier dropped the hints, this dial
+/// faulted at the dialer with `Tls(InvalidMessage(HandshakePayloadTooLarge))` — the server's first flight
+/// truncated at the receiver — which is how the KIND lane's 38-peer node could never be dialed.
+#[test]
+fn a_server_admitting_a_large_roster_still_completes_a_dialers_handshake() {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+  let server_identity = self_signed(NAME);
+  let server_cert = server_identity.certificate();
+  let dialer = self_signed(NAME);
+  let mut allowed: Vec<_> = (1..LARGE_ROSTER)
+    .map(|_| self_signed(NAME).certificate())
+    .collect();
+  allowed.push(dialer.certificate());
+  let (port_tx, port_rx) = channel();
+  let (served_tx, _served_rx) = channel();
+  let (done_tx, done_rx) = channel();
+  let (counters_tx, counters_rx) = channel();
+  let (result_tx, result_rx) = channel();
+  sim
+    .spawn_on(
+      id,
+      serve_shared_socket(ServerPlan {
+        identity: server_identity,
+        allowed,
+        max_sessions: 1,
+        sessions: vec![1],
+        add: 5,
+        port_txs: vec![port_tx],
+        served_tx,
+        done_rx,
+        clients: 1,
+        counters_tx,
+      }),
+    )
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let outcome = dial_and_request(dialer, server_cert, port_rx, vec![b"roster".to_vec()]).await;
+      let _ = result_tx.send(outcome);
+      let _ = done_tx.send(());
+    })
+    .unwrap();
+  sim.run_until_idle();
+
+  let outcome = result_rx.try_recv().expect("the dialer finished");
+  let expected: Vec<u8> = b"roster".iter().map(|b| b.wrapping_add(5)).collect();
+  assert_eq!(
+    outcome.as_deref(),
+    Ok(&[expected][..]),
+    "the dialer handshook with a server admitting {LARGE_ROSTER} peers and was served"
+  );
+  let (counters, _live) = counters_rx.try_recv().expect("the server reported");
+  assert_eq!(counters.opened, 1, "one session: {counters:?}");
+  assert_eq!(counters.sessions_refused, 0, "{counters:?}");
+}
+
 /// AC (§4.10a §8, hostile): a datagram shaped like a 1-RTT packet but naming **no session** is dropped
 /// and counted — never a panic, never delivered to a live session — and the live session keeps serving
 /// afterwards (the demultiplexer's routing, not the session's crypto, refused it). Non-vacuous: the

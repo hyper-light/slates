@@ -106,12 +106,80 @@ pub fn server_config(
   let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider())
     .build()
     .map_err(|e| HandshakeError::Setup(e.to_string()))?;
+  // structural: allow — D-8 exception 2: `with_client_cert_verifier` takes `Arc` by signature.
+  let verifier = Arc::new(RosterVerifier { inner: verifier });
   let mut config = ServerConfig::builder_with_provider(provider())
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_client_cert_verifier(verifier)
     .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())?;
   config.send_tls13_tickets = 0;
   Ok(config)
+}
+
+/// The roster verifier: rustls's web-PKI client verifier over the admitted certificates, with **no
+/// certificate-authority hints**. The default verifier lists every admitted certificate's subject in
+/// the CertificateRequest (`root_hint_subjects`, RFC 8446 §4.2.4), so a server's handshake flight grew
+/// with its roster — a 64-peer roster made a 3,024-byte flight against the receiver's 2,048-byte
+/// datagram buffer (694 bytes with one peer), and the KIND lane's 38-peer node could never be dialed
+/// (`Tls(InvalidMessage(HandshakePayloadTooLarge))` at every dialer, forever; 2026-09-14). A fleet peer
+/// always presents its one enrolled certificate whatever the server hints, so the hints carry nothing
+/// (RFC 8446 §4.2.4 makes them optional). Every other decision — which certificates are admitted, the
+/// signature checks, the schemes — is the inner verifier's, unchanged.
+#[derive(Debug)]
+struct RosterVerifier {
+  // structural: allow — D-8 exception 2: rustls hands its verifier out as `Arc<dyn ..>` by signature.
+  inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+}
+
+impl rustls::server::danger::ClientCertVerifier for RosterVerifier {
+  fn offer_client_auth(&self) -> bool {
+    self.inner.offer_client_auth()
+  }
+
+  fn client_auth_mandatory(&self) -> bool {
+    self.inner.client_auth_mandatory()
+  }
+
+  fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+    &[]
+  }
+
+  fn verify_client_cert(
+    &self,
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+    now: rustls::pki_types::UnixTime,
+  ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+    self
+      .inner
+      .verify_client_cert(end_entity, intermediates, now)
+  }
+
+  fn verify_tls12_signature(
+    &self,
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &rustls::DigitallySignedStruct,
+  ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    self.inner.verify_tls12_signature(message, cert, dss)
+  }
+
+  fn verify_tls13_signature(
+    &self,
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &rustls::DigitallySignedStruct,
+  ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    self.inner.verify_tls13_signature(message, cert, dss)
+  }
+
+  fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+    self.inner.supported_verify_schemes()
+  }
+
+  fn requires_raw_public_keys(&self) -> bool {
+    self.inner.requires_raw_public_keys()
+  }
 }
 
 /// A client config that trusts exactly `pinned_server` (the peer's enrolled certificate) and
@@ -232,6 +300,88 @@ mod tests {
       }
     }
     Ok(())
+  }
+
+  /// Shape: the largest handshake flight a fleet server may send, measured at the receiver's datagram
+  /// buffer (`crate::endpoint::DATAGRAM_BYTES`): a flight past it is truncated on receipt and faults the
+  /// peer's handshake; the assertion is against that bound, from the endpoint, not a copy.
+  const FLIGHT_BOUND: usize = crate::endpoint::DATAGRAM_BYTES;
+
+  /// A self-signed Ed25519 identity: its signatures are a fixed 64 bytes, so a flight it signs is the
+  /// same size on every run — a measurement can compare two flights exactly (an ECDSA signature's DER
+  /// form varies by a byte or two with the nonce, which made the comparison below flake).
+  fn self_signed_ed25519(name: &str) -> Identity {
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+    let cert = rcgen::CertificateParams::new(vec![name.to_owned()])
+      .unwrap()
+      .self_signed(&key)
+      .unwrap();
+    Identity::from_der(
+      cert.der().clone(),
+      PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+    )
+  }
+
+  /// The server's first flight (the bytes it writes after reading the ClientHello) for a server with
+  /// `server_identity` that admits `client_identity` among a roster of `allowed` certificates: what a
+  /// dialer must receive whole. The two identities are the caller's, so only the roster differs between
+  /// two measurements.
+  fn server_first_flight(
+    server_identity: &Identity,
+    client_identity: &Identity,
+    allowed: usize,
+  ) -> usize {
+    let mut roster: Vec<CertificateDer<'static>> = (1..allowed)
+      .map(|_| self_signed("slates-fleet").certificate())
+      .collect();
+    roster.push(client_identity.certificate());
+    let mut client = client_connection(
+      client_identity,
+      &server_identity.certificate(),
+      "slates-fleet",
+    )
+    .unwrap();
+    let mut server = server_connection(server_identity, &roster).unwrap();
+    let mut hello = Vec::new();
+    client.write_hs(&mut hello);
+    server.read_hs(&hello).unwrap();
+    let mut flight = Vec::new();
+    server.write_hs(&mut flight);
+    // `write_hs` writes up to the next encryption-level boundary; drain the whole flight as the
+    // endpoint does.
+    loop {
+      let before = flight.len();
+      server.write_hs(&mut flight);
+      if flight.len() == before {
+        break;
+      }
+    }
+    flight.len()
+  }
+
+  /// §4.8 ("certificates provisioned by the operator" — every node holds the whole roster) with §4.9
+  /// (a fleet message rides one datagram): a server's handshake flight must not grow with the size of
+  /// the roster it admits, or a large fleet's every handshake overflows the receiver's datagram buffer
+  /// and faults. Do: measure the server's first flight admitting 1 and 64 clients. Expect: the two are
+  /// the same size and inside the receiver's bound. Before 2026-09-14 rustls's default client verifier
+  /// listed every admitted certificate's subject in the CertificateRequest (`root_hint_subjects`) —
+  /// 64 rosters made a 2.8 KiB flight against a 2 KiB buffer, and the KIND lane's 38-peer node could
+  /// never be dialed (`Tls(InvalidMessage(HandshakePayloadTooLarge))` at the dialer, forever).
+  #[test]
+  fn a_servers_handshake_flight_does_not_grow_with_the_roster_it_admits() {
+    let server_identity = self_signed_ed25519("slates-fleet");
+    let client_identity = self_signed_ed25519("slates-fleet");
+    let one = server_first_flight(&server_identity, &client_identity, 1);
+    let many = server_first_flight(&server_identity, &client_identity, 64);
+    assert!(
+      one <= FLIGHT_BOUND,
+      "a one-peer roster's server flight fits the receiver's datagram: {one} > {FLIGHT_BOUND}"
+    );
+    assert_eq!(
+      many, one,
+      "a 64-peer roster's server flight ({many} bytes) is the one-peer flight's size ({one} bytes): the \
+       roster is not carried in the handshake"
+    );
   }
 
   /// The riskiest, most-blind piece of the `Connection`, probed in isolation: the handshake's 1-RTT

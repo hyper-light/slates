@@ -378,7 +378,9 @@ impl Daemon {
               Ok(task) => {
                 let _ = futures::detach(task);
               }
-              Err(_) => crate::fleet::count_refusal(LOOP_SPAWN_REFUSED),
+              Err(_) => {
+                crate::fleet::count_refusal(LOOP_SPAWN_REFUSED);
+              }
             }
           })?;
         }
@@ -1152,6 +1154,20 @@ pub fn host_id_of(identity: &Identity) -> u64 {
   ])
 }
 
+/// This boot's **ephemeral incarnation** — what the member id folds in (`member_id(anchor, incarnation)`,
+/// §4.8 "Recovery", task #22) — from the anchor's `SUP_GENERATION`. The design's invariant is that a **first
+/// boot is incarnation 0**, so its member id *is* the manifest's precomputed gen-0 seed and a fresh fleet
+/// forms with no learn-on-contact. `SUP_GENERATION` counts *starts* (the anchor's `record_start` increments
+/// it on every start, so a first boot reads 1), so the incarnation is one less — the number of *restarts*,
+/// zero on a first boot. A daemon run alone (no anchor, generation 0) is likewise incarnation 0. Before this
+/// was applied, an anchored first boot ran as `member_id(anchor, 1)` while its peers seeded and probed
+/// `member_id(anchor, 0)`, so no probe was ever credited and an anchored fleet could not form on a real
+/// deployment (`docs/bugs/2026-09-14-anchored-first-boot-generation-off-by-one.md`; the in-process tests run
+/// daemons with no anchor, generation 0, so they never exercised it).
+fn boot_incarnation(supervision_generation: u64) -> u64 {
+  supervision_generation.saturating_sub(1)
+}
+
 /// The content object's name for a segment named `seg_name`: the segment name with its `seg`
 /// marker replaced by `con`, so it stays the same length (within the platform's shared-object name
 /// limit the segment already meets) and is distinct from the segment's own name.
@@ -1346,21 +1362,22 @@ fn init_shard(
   // restarts and distinct per machine. One host, `f = 0`, on a laptop.
   // This node's two identities (§4.8 "Recovery"; task #22). The **stable cert-anchor** — derived from the
   // certificate, unchanged across restarts — keys a client's completion record, so a retry meets its record
-  // even after the daemon restarts (exactly-once survives). The **ephemeral member id** folds in the anchor's
-  // generation (incremented at every daemon start, `SUP_GENERATION`), so a restart holds a new id and is a new
-  // member whose old objects the group takes over; generation 0 (a first boot, or a fresh test segment)
-  // reproduces the manifest's precomputed gen-0 seed, so a fresh fleet forms with no exchange. A laptop uses
-  // the same derivations over its own identity (R8). `config.fleet.host` is that gen-0 seed and is ignored
-  // here in favour of this node's real generation.
+  // even after the daemon restarts (exactly-once survives). The **ephemeral member id** folds in this boot's
+  // incarnation, so a restart holds a new id and is a new member whose old objects the group takes over;
+  // incarnation 0 (a first boot, or a fresh test segment) reproduces the manifest's precomputed gen-0 seed,
+  // so a fresh fleet forms with no learn-on-contact. A laptop uses the same derivations over its own identity
+  // (R8). `config.fleet.host` is that gen-0 seed and is ignored here in favour of this node's real incarnation.
   let origin_anchor = config.fleet.as_ref().map_or_else(
     || slates_db::HostId(host_id_of(identity)),
     |m| m.origin_anchor,
   );
-  let generation = segment
-    .supervision()
-    .map(|supervision| supervision.generation())
-    .unwrap_or(0);
-  let host = crate::deploy::member_id(origin_anchor, generation);
+  let incarnation = boot_incarnation(
+    segment
+      .supervision()
+      .map(|supervision| supervision.generation())
+      .unwrap_or(0),
+  );
+  let host = crate::deploy::member_id(origin_anchor, incarnation);
   // The owner runtime this node takes part in a region as (§4.8, boot step 6): membership + the
   // configuration group + the owner's acceptor, composed by `slates-cluster`. Built from the configured
   // fleet membership (its quorum and peers) when the operator deploys a fleet, or the laptop `f = 0`
@@ -1502,7 +1519,7 @@ fn init_shard(
     last_drain_ns: now,
     placed_heads: std::collections::BTreeMap::new(),
     formed_probe_peers: std::collections::BTreeSet::new(),
-    member_generation: generation,
+    member_generation: incarnation,
     learned_members: std::collections::BTreeMap::new(),
     demuxes: Vec::new(),
     holder_records: std::collections::BTreeMap::new(),
@@ -1651,7 +1668,9 @@ async fn control_loop(
     Ok(task) => {
       let _ = futures::detach(task);
     }
-    Err(_) => crate::fleet::count_refusal(LOOP_SPAWN_REFUSED),
+    Err(_) => {
+      crate::fleet::count_refusal(LOOP_SPAWN_REFUSED);
+    }
   }
   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
   // by the daemon's client capacity, refused typed beyond it (AC-2.6). A client's shard is
@@ -1827,6 +1846,46 @@ mod limits {
 mod tests {
   use super::registered_chokepoints;
   use slates_wire::observe::Chokepoint;
+
+  /// AC (§4.8 "Recovery", task #22; docs/bugs/2026-09-14-anchored-first-boot-generation-off-by-one.md): a
+  /// node's member id on a **first boot** is the manifest's precomputed gen-0 seed, whether it runs under an
+  /// anchor (whose `SUP_GENERATION` reads 1 on the first start) or alone (generation 0) — else its peers,
+  /// which seed and probe `member_id(anchor, 0)`, never credit a probe and an anchored fleet cannot form. A
+  /// **restart** (a higher start count) is a distinct member id (a new incarnation the group takes over).
+  #[test]
+  fn an_anchored_first_boot_holds_the_manifest_gen_zero_seed() {
+    use super::boot_incarnation;
+    use crate::deploy::member_id;
+    use slates_db::HostId;
+
+    let anchor = HostId(0x0123_4567_89ab_cdef);
+    let seed = member_id(anchor, 0);
+    assert_eq!(
+      boot_incarnation(0),
+      0,
+      "a daemon alone (no anchor) is incarnation 0"
+    );
+    assert_eq!(
+      boot_incarnation(1),
+      0,
+      "an anchored first boot (SUP_GENERATION 1) is incarnation 0"
+    );
+    assert_eq!(
+      member_id(anchor, boot_incarnation(1)),
+      seed,
+      "an anchored first boot's member id is the manifest's gen-0 seed"
+    );
+    assert_eq!(
+      boot_incarnation(2),
+      1,
+      "a first restart (start count 2) is incarnation 1"
+    );
+    assert_ne!(
+      member_id(anchor, boot_incarnation(2)),
+      seed,
+      "a restart is a distinct member id the group takes over"
+    );
+  }
 
   /// The daemon declares every chokepoint span, so the observability gate opens and it serves (§2.6,
   /// §4.14). This is the daemon side of the roster doc-truth: if a `register` line were dropped from

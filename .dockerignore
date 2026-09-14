@@ -1,0 +1,12 @@
+# The build context for the Dockerfile: the workspace sources and manifests only. Build products,
+# history, documentation, the chart and the CI definitions are not inputs to the binary.
+target/
+.git/
+.claude/
+.github/
+docs/
+deploy/
+**/node_modules/
+**/*.node
+**/__pycache__/
+**/.venv/

@@ -94,6 +94,18 @@ const PACKET_NUMBER_OFFSET: usize = 1 + CONNECTION_ID_BYTES;
 const HEADER_PROTECTION_SAMPLE_OFFSET: usize =
   PACKET_NUMBER_OFFSET + MAX_PACKET_NUMBER_BYTES as usize;
 
+/// The largest datagram either end sends or reads — a handshake flight, or a 1-RTT packet (which never
+/// exceeds [`MIN_DATAGRAM_BYTES`]). A handshake flight is sent whole in one datagram and read into a
+/// buffer of this size, so a flight past it would be truncated on receipt and fault the peer's
+/// handshake: the sender refuses such a flight typed instead (`EndpointError::FlightTooLarge`), and the
+/// server keeps its flight roster-independent (`handshake::server_config` sends no
+/// certificate-authority hints). Fragmenting a flight into minimum-size datagrams (RFC 9000 §19.6 CRYPTO
+/// frames with offsets) is the owed general form.
+/// Measured: a mutual-TLS 1.3 server flight with one self-signed ECDSA P-256 certificate is 694 bytes
+/// (2026-09-14, `handshake::tests`); this holds that flight with a chain of two more such certificates
+/// (about 450 bytes each) and room for their extensions, and is the power of two above.
+pub const DATAGRAM_BYTES: usize = 2048;
+
 /// The handshake turn ceiling: the most drain-send-receive turns `establish` takes before it refuses
 /// a stuck handshake with `NotReady`, so the loop is bounded (banned item 8 — no unbounded loop). It
 /// caps only the failure path (a peer that never completes), so its exact value is not performance-
@@ -155,6 +167,16 @@ pub enum EndpointError {
   /// The demultiplexer closed this session: its peer established a new one (a re-dial after a loss),
   /// or the peer was retired. The reader ends its loop; nothing more arrives here.
   Closed,
+  /// This end's handshake flight exceeds the datagram either end reads ([`DATAGRAM_BYTES`]): sent, it
+  /// would be truncated at the peer and fault its handshake with no way to say why. Refused here,
+  /// typed, before a byte leaves — a certificate chain too long for one datagram, until flights are
+  /// fragmented into CRYPTO frames (the owed general form).
+  FlightTooLarge {
+    /// The flight's size.
+    bytes: usize,
+    /// The datagram bound.
+    cap: usize,
+  },
 }
 
 impl From<rustls::Error> for EndpointError {
@@ -526,7 +548,7 @@ impl Endpoint {
   /// One `establish` call's turns over the connection; `last_flight` is the flight this end most recently
   /// sent (carried in from the previous call and left for the next when the budget runs out).
   async fn establish_turns(&mut self, last_flight: &mut Vec<u8>) -> Result<(), EndpointError> {
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; DATAGRAM_BYTES];
     let mut sent_at: Option<u64> = None;
     // The peer's flight this end last fed to `read_hs`. Retransmits that raced this end's reply arrive as
     // an exact re-send of a flight already consumed; `read_hs` treats its input as an ordered byte stream
@@ -538,6 +560,12 @@ impl Endpoint {
     for _ in 0..HANDSHAKE_TURN_CEILING {
       let out = self.drain_handshake();
       if !out.is_empty() {
+        if out.len() > DATAGRAM_BYTES {
+          return Err(EndpointError::FlightTooLarge {
+            bytes: out.len(),
+            cap: DATAGRAM_BYTES,
+          });
+        }
         self.send(&out)?;
         sent_at = Some(now_ns());
         *last_flight = out;
@@ -649,7 +677,7 @@ impl Endpoint {
   /// the server is still waiting) until then. Bounded by the handshake retransmit ceiling (banned
   /// item 8).
   async fn confirm_as_client(&mut self, last_flight: &[u8]) -> Result<(), EndpointError> {
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; DATAGRAM_BYTES];
     let mut retransmits = 0u32;
     let mut backoff = GRANULARITY_NS;
     loop {
@@ -696,7 +724,7 @@ impl Endpoint {
   /// `docs/bugs/2026-09-14-transport-rtt-sampled-on-the-wall-clock.md`). Bounded overall by
   /// `MAX_HANDSHAKE_RETRANSMITS` silent timeouts (banned item 8).
   async fn confirm_as_server(&mut self) -> Result<(), EndpointError> {
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; DATAGRAM_BYTES];
     self.send_confirm()?;
     let mut silent = 0u32;
     let mut backoff = GRANULARITY_NS;
@@ -796,7 +824,7 @@ impl Endpoint {
   /// [`send_stream`]: Endpoint::send_stream
   /// [`recv_stream`]: Endpoint::recv_stream
   async fn receive_and_ingest(&mut self, timeout_ns: u64) -> Result<bool, EndpointError> {
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; DATAGRAM_BYTES];
     match self.recv_within(&mut buf, timeout_ns).await? {
       Some((n, _from)) => {
         self.fold_or_discard(&buf[..n])?;

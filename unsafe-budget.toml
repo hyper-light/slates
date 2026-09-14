@@ -5,22 +5,26 @@
 # budget to the current count. A budget only goes down. Raising one is an edit here that names the
 # new site and its reason. What each crate still holds, as of the counts below:
 #
-# slates-machine (43): Apple sysctl, mach host statistics and IOKit power queries, for which no
+# slates-machine (44): Apple sysctl, mach host statistics and IOKit power queries, for which no
 #   safe wrapper exists (7 sites, one helper each); the macOS thread-affinity hint (1); the
 #   file-backed map of the profile segment (1); the Win32 facts, probes and section (the rest,
-#   compiled only for Windows).
+#   compiled only for Windows) — raised 43 → 44 on 2026-09-14 for `GetProcessAffinityMask`, the
+#   mask the core matrix puts back on the calling thread after it pinned it (a spawned daemon
+#   inherited the one-core mask: docs/bugs/2026-09-14-core-matrix-leaves-the-anchor-pinned-to-one-core.md).
 # slates-mem (16): the Windows working-set raise and VirtualLock/VirtualUnlock (memmap2 covers
 #   Unix) (4); the shared memory object of §4.7 (`shared.rs`, added 2026-09-05 for Phase 2):
 #   the file-backed map of a memory object (1), the descriptor a child inherits (1), the two
 #   atomic views of mapped words (2), and the Windows section (create, open, view, drop, the two
 #   byte views and the lock: 8).
-# slates-rt (49): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
+# slates-rt (48): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
 #   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
 #   the IOCP calls are Win32 (6); the UDP readiness registration (§4.10a, added 2026-09-07): the
 #   kqueue read-filter `kevent` (unsafe by signature, one change record, 1) and the epoll
-#   `BorrowedFd::borrow_raw` of a live socket for one `epoll_ctl` (1); the TCP write-readiness
-#   registration (§4.6, added 2026-09-09 for the async loopback server): the kqueue write-filter
-#   `kevent` (1) and the epoll `BorrowedFd::borrow_raw` for the `EPOLLOUT` `epoll_ctl` (1).
+#   `BorrowedFd::borrow_raw` of a live socket for the `epoll_ctl` that arms either interest (1 — the
+#   readable and writable registrations share one helper since 2026-09-14, when the epoll re-add
+#   defect was fixed: docs/bugs/2026-09-14-epoll-readiness-re-add-eexist.md; 49 → 48); the TCP
+#   write-readiness registration (§4.6, added 2026-09-09 for the async loopback server): the kqueue
+#   write-filter `kevent` (1).
 #   The Windows socket stack (added 2026-09-09, compiled only for Windows — the daemon and the
 #   QUIC fleet transport run there; TCP stays macOS/Linux for the NFS mount): the **AFD readiness
 #   reactor** `afd.rs` that gives the completion-native IOCP driver edge readiness the way wepoll/mio
@@ -97,7 +101,7 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 43
+slates-machine = 44
 slates-mem = 16
 # 2026-09-14 (+11, registry slot reclamation — `docs/bugs/2026-09-14-shard-registry-leaks-every-slot-for-the-process-lifetime.md`):
 # `driver::KickFd` — the slot-owned kick descriptor: `Sync`/`Send` impls (2), `with`, `fd`, `close` (3
@@ -114,7 +118,10 @@ slates-mem = 16
 # extended to `'static` over a heap box the context drops last, after its tasks: 1), and
 # `registry::read_counted` (the entry deref under the reader count, which a re-registration waits on
 # before freeing the previous entry: 1 — the counted form every foreign reader now takes).
-slates-rt = 64
+# 2026-09-14 (−1, the KIND lane: the epoll one-shot re-arm — `docs/bugs/2026-09-14-epoll-readiness-re-add-eexist.md`):
+# the second `BorrowedFd::borrow_raw` of the readiness re-add is gone with the re-add itself (the
+# descriptor is re-armed with `EPOLL_CTL_MOD` through the one remaining borrow).
+slates-rt = 63
 slates-base = 6
 slates-vfs = 0
 slates-land = 3

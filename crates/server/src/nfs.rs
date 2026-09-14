@@ -772,7 +772,9 @@ pub async fn serve(listener: TcpListener, port: u16) {
       }
       // The arena refused the connection's serve task: the connection is dropped (the kernel client
       // reconnects) and the refusal counted, never silent (banned item 9).
-      Err(_) => crate::fleet::count_refusal(SERVE_SPAWN_REFUSED),
+      Err(_) => {
+        crate::fleet::count_refusal(SERVE_SPAWN_REFUSED);
+      }
     }
   }
 }
