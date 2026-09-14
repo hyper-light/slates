@@ -1356,6 +1356,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-bridge-oci"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
+]
+
+[[package]]
 name = "slates-bridge-virtiofs"
 version = "0.1.0"
 dependencies = [
@@ -1564,6 +1572,7 @@ dependencies = [
  "slates-bridge-core",
  "slates-bridge-fuse",
  "slates-bridge-nfs",
+ "slates-bridge-oci",
  "slates-bridge-virtiofs",
  "slates-client",
  "slates-cluster",

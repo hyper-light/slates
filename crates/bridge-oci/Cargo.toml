@@ -1,0 +1,23 @@
+[package]
+name = "slates-bridge-oci"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The OCI attachment form (§4.6 A-9, RQ-20; Phase 4): the kernel's mount table read as a query that never touches a mount, the verification that a host path is the mount point of this volume's export, and the runtime-specification `mounts` entry the harness hands its OCI runtime. slates never enters a namespace, creates a directory or asks for a privilege; the runtime binds."
+
+[dependencies]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `getfsstat(MNT_NOWAIT)`: the one FFI call for which no safe wrapper exists (rustix has no mount-table
+# query); it returns the kernel's cached table without contacting any filesystem.
+libc = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# A read-only open and read of `/proc/self/mountinfo`, the kernel's own table (a query, never a write).
+rustix = { workspace = true }
+
+[lints]
+workspace = true

@@ -1511,6 +1511,32 @@ until mapping isolation, pinning and teardown have been established for that VMM
 > yet on the `attach`/`status` wire, and the conformance evidence is the simulated guest driver
 > until a live Linux guest runs (AC-9.7). Record: `docs/wip/virtiofs.md`.
 
+> **Status (OCI handoff and the capability report, 2026-09-14).** `attach` and `status` report every
+> transport with the six facts above (`crates/server/src/transports.rs`, pure over one platform seam;
+> `crates/ipc/src/protocol.rs` `TransportReport`/`AttachmentCapability`): the record form, the NFS
+> loopback mount (offered on macOS exactly when the listener bound; refused `MountNeedsPrivilege` on
+> Linux, R10), the FUSE/FSKit/WinFsp bridges (`BridgeNotWired` on their platform until the daemon
+> serves them), the container bind, and the virtio-fs guest transports from the device's own report;
+> each fact is read from the machine or stated from what the tree holds, a refused transport carries
+> its typed reason and claims no evidence, and a request for a form the host cannot offer refuses
+> `AttachmentUnsupported{transport, reason}` before the lease or the record. The OCI form is built:
+> the daemon verifies that the named host path is the mount point of this volume's export through the
+> kernel's mount table — never by touching the mount (`crates/bridge-oci`: `getfsstat(MNT_NOWAIT)`,
+> `/proc/self/mountinfo`) — records the authorized binding (`AttachForm::Oci`) and returns the
+> runtime-specification `mounts` entry (`type: bind`, `rbind` + `ro`/`rw` by the attachment's policy)
+> with the table's evidence; the runtime binds; an unbound path is refused
+> `ChosenPathUnavailable{reason}`. T-4.13 is proven by use on macOS over Docker Desktop's share of the
+> NFS-loopback mount (`crates/cli/tests/cli.rs`) with a CI Linux variant over a real FUSE mount
+> (`crates/bridge-fuse/tests/oci_container.rs`): the same workload on the host path and in the
+> container agrees byte for byte and in names and sizes, an edit on either side is the other's view,
+> the read-only bind refuses a write. Measured and reported typed (`SharingSemantics.delete_while_open`):
+> the runtime's share holds every file a container touched open beyond the container's lifetime, so an
+> in-container delete over the NFS mount is silly-renamed to `.nfs.*` by the macOS NFS client
+> (Appendix C), blocking `rmdir` and the plain unmount until the share lets go. A guest form requested
+> over the ring refuses `SeamNotOnWire` (the harness hands the VMM seam in-process) or the device's own
+> `BindingNotBuilt`. Owed: the bind on Linux once the daemon serves the FUSE mount; a live guest for
+> AC-9.7. Record: `docs/wip/oci-handoff.md`.
+
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
 the set of contributing writable attachments, stop admission into the closing generation,

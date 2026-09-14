@@ -136,6 +136,21 @@ fn schema_hashes_are_stable_and_distinct() {
   assert_eq!(again, Sample::SCHEMA_HASH);
 }
 
+/// A boxed value is transparent: the same bytes, the same schema and hash as the value itself, and
+/// either side decodes it boxed or not — a `Box` is where a cold field lives, not a wire shape.
+#[test]
+fn a_boxed_value_is_transparent_on_the_wire() {
+  let boxed: Box<Sample> = Box::new(sample());
+  assert_eq!(hex(&boxed.to_bytes()), RECORDED_SAMPLE_HEX);
+  assert_eq!(<Box<Sample>>::SCHEMA, Sample::SCHEMA);
+  assert_eq!(<Box<Sample>>::SCHEMA_HASH, Sample::SCHEMA_HASH);
+  assert_eq!(
+    *Box::<Sample>::from_bytes(&sample().to_bytes()).unwrap(),
+    sample()
+  );
+  assert_eq!(Sample::from_bytes(&boxed.to_bytes()).unwrap(), *boxed);
+}
+
 #[test]
 fn a_framed_sample_survives_a_full_frame_round_trip() {
   let framer = Framer::new(

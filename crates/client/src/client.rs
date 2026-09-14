@@ -8,10 +8,10 @@ use std::time::Instant;
 
 use slates_ipc::delivery::{Capability, Delivered, DeliveryFault, attest_proof};
 use slates_ipc::protocol::{
-  AuditEntry, DaemonReport, Direction, Filter, GrantScope, GrantSummary, GreenBase, Intent,
-  LandingOutcome, LandingSummary, MergeWindow, NamePolicy, Principal, ReadAt, ReplyBody,
-  RequestBody, Rights, Scope, SizeClass, SnapshotId, StatusReport, TelemetryReport, VolumeId,
-  VolumeSummary, WorkOp, pack, unpack,
+  AttachRequest, AttachmentCapability, AuditEntry, DaemonReport, Direction, Established, Filter,
+  GrantScope, GrantSummary, GreenBase, Intent, LandingOutcome, LandingSummary, MergeWindow,
+  NamePolicy, Principal, ReadAt, ReplyBody, RequestBody, Rights, Scope, SizeClass, SnapshotId,
+  StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp, pack, unpack,
 };
 use slates_ipc::{ClientEnd, Connected, IpcError, connect_as};
 use slates_machine::{Derived, derived};
@@ -128,6 +128,10 @@ pub struct Attachment {
   pub path: Option<String>,
   /// The green version the attachment pins (§4.16), or none for a plain or work volume.
   pub version: Option<u64>,
+  /// What the daemon established for the requested form (§4.4).
+  pub established: Established,
+  /// The transport's report for this attachment: the six facts of §4.6 A-9.
+  pub capability: AttachmentCapability,
 }
 
 /// The result of an `advance` (§4.16 "Attachments and versions"): the version the attachment now
@@ -1582,28 +1586,46 @@ impl Client {
     }
   }
 
-  /// Attaches (the client form; a write intent takes the lease).
+  /// Attaches in the record form under the root mount (a write intent takes the lease).
   pub fn attach(
     &mut self,
     volume: VolumeId,
     snapshot: Option<SnapshotId>,
     intent: Intent,
   ) -> Result<Attachment, ClientError> {
+    self.attach_with(volume, snapshot, intent, AttachRequest::Root)
+  }
+
+  /// Attaches in `form` (§4.4 `attach(volume|snapshot, consumer, transport, chosen_path?)`; §4.6
+  /// A-9): the daemon establishes the form and reports it with the transport's capability, or refuses
+  /// the form typed (`Refusal::AttachmentUnsupported{transport, reason}`) before any effect.
+  pub fn attach_with(
+    &mut self,
+    volume: VolumeId,
+    snapshot: Option<SnapshotId>,
+    intent: Intent,
+    form: AttachRequest,
+  ) -> Result<Attachment, ClientError> {
     match self.call(&RequestBody::Attach {
       volume,
       snapshot,
       intent,
+      form,
     })? {
       ReplyBody::Attached {
         attachment,
         lease_epoch,
         path,
         version,
+        established,
+        capability,
       } => Ok(Attachment {
         attachment,
         lease_epoch,
         path,
         version,
+        established,
+        capability,
       }),
       _ => Err(ClientError::UnexpectedReply { verb: "attach" }),
     }

@@ -36,9 +36,15 @@ pub mod merge_service;
 // (both cross-platform) but does not serve NFS — the mount arrives with the WinFsp bridge.
 #[cfg(unix)]
 pub mod nfs;
+// The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount
+// table and the runtime-specification entry; paired per platform inside, so it compiles everywhere.
+pub mod oci;
 pub mod peer;
 pub mod state;
 pub mod telemetry;
+// The transport capability report of §4.6 A-9 (what `attach` and `status` say each transport can do
+// on this host); pure over one platform seam, so it compiles and tests everywhere.
+pub mod transports;
 pub mod verbs;
 // The virtio-fs guest transport (§4.6 A-9): a guest device served on the volume's owning shard; its
 // loop rides the runtime's Unix descriptor readiness, so it is gated like the NFS transport.

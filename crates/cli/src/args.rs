@@ -33,7 +33,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   advance ATTACHMENT [VERSION] [--json]            re-pin a green attachment (the head when no VERSION)
   read VOLUME PATH [--version N | --attachment A]  a file's bytes at a view (raw bytes)
   volume placed ID [--snapshot N] [--mirror] [--json]   await a durability scope
-  attach ID [--read | --write] [--snapshot N] [--json]
+  attach ID [--read | --write] [--snapshot N]
+            [--oci-source HOST_PATH --oci-destination CONTAINER_PATH] [--json]
   detach ATTACHMENT [--json]
   status [--json]                                  the daemon's status
   status ID [--drift] [--json]
@@ -304,6 +305,9 @@ pub(crate) enum Verb {
     snapshot: Option<slates_client::SnapshotId>,
     /// The intent.
     intent: Intent,
+    /// The form: the record under the root mount, or a container bind of the host mount at
+    /// `--oci-source` to `--oci-destination` (§4.6 A-9).
+    form: slates_client::AttachRequest,
   },
   /// Detach.
   Detach {
@@ -484,6 +488,8 @@ const VALUES: &[&str] = &[
   "--exclude",
   "--volume",
   "--at",
+  "--oci-source",
+  "--oci-destination",
   "--http",
   "--term",
   "--evidence",
@@ -1014,7 +1020,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
     ["volume", rest @ ..] => parse_volume(&taken, rest),
     ["attach", id] => {
       taken.only(&Spec {
-        values: &["--snapshot"],
+        values: &["--snapshot", "--oci-source", "--oci-destination"],
         switches: &["--read", "--write"],
       })?;
       let snapshot = taken.value("--snapshot").map(snapshot).transpose()?;
@@ -1023,12 +1029,25 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
       } else {
         Intent::Read
       };
+      let form = match (
+        taken.value("--oci-source"),
+        taken.value("--oci-destination"),
+      ) {
+        (Some(source), Some(destination)) => slates_client::AttachRequest::Oci {
+          source: source.to_owned(),
+          destination: destination.to_owned(),
+        },
+        (None, None) => slates_client::AttachRequest::Root,
+        (Some(_), None) => return Err(ParseError::Missing("--oci-destination CONTAINER_PATH")),
+        (None, Some(_)) => return Err(ParseError::Missing("--oci-source HOST_PATH")),
+      };
       Ok(client(
         &taken,
         Verb::Attach {
           volume: volume(id)?,
           snapshot,
           intent,
+          form,
         },
       ))
     }
@@ -1469,6 +1488,7 @@ mod tests {
         volume: parse_volume_id("00000000000000000000000000000001").unwrap(),
         snapshot: Some(slates_client::SnapshotId { value: 3 }),
         intent: Intent::Write,
+        form: slates_client::AttachRequest::Root,
       }
     );
     assert_eq!(
@@ -1493,6 +1513,41 @@ mod tests {
         instance: "m".into(),
         http: Some(8787),
       }))
+    );
+  }
+
+  /// The container bind form of `attach` (§4.6 A-9): both paths make the form; one alone is a usage
+  /// refusal naming the missing flag.
+  #[test]
+  fn the_attach_grammar_takes_the_container_bind_flags_together() {
+    let Ok(Command::Client(request)) = parse(&args(
+      "attach 00000000000000000000000000000001 --write --oci-source /Users/me/mnt --oci-destination /work",
+    )) else {
+      panic!("client");
+    };
+    assert_eq!(
+      request.verb,
+      Verb::Attach {
+        volume: parse_volume_id("00000000000000000000000000000001").unwrap(),
+        snapshot: None,
+        intent: Intent::Write,
+        form: slates_client::AttachRequest::Oci {
+          source: "/Users/me/mnt".to_owned(),
+          destination: "/work".to_owned(),
+        },
+      }
+    );
+    assert_eq!(
+      parse(&args(
+        "attach 00000000000000000000000000000001 --oci-source /Users/me/mnt"
+      )),
+      Err(ParseError::Missing("--oci-destination CONTAINER_PATH"))
+    );
+    assert_eq!(
+      parse(&args(
+        "attach 00000000000000000000000000000001 --oci-destination /work"
+      )),
+      Err(ParseError::Missing("--oci-source HOST_PATH"))
     );
   }
 

@@ -18,9 +18,10 @@
 //! exported attachment and filesystem service"), so it hands the seam in by value and learns the
 //! outcome — admission refused, the loop's end and what was reclaimed — through the `on_end`
 //! callback it supplied; nothing about the guest is stored in the daemon's records in this leg (the
-//! durable `AttachmentRecord` for a guest form, and `attach`/`status` carrying
-//! [`guest_transport_capabilities`] over the wire, are the next leg). A guest device is never a
-//! privilege: no mount, no socket on disk, no directory (R10).
+//! durable `AttachmentRecord` for a guest form is the next leg). `attach`/`status` carry
+//! [`guest_transport_capabilities`] over the wire through `crate::transports`, fact for fact, and a
+//! guest form asked for over the ring is refused typed there (no seam rides the ring). A guest device
+//! is never a privilege: no mount, no socket on disk, no directory (R10).
 
 use std::future::Future;
 

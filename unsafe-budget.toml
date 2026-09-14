@@ -162,3 +162,9 @@ slates-bridge-winfsp = 86
 # writes on owned descriptors. A real shared mapping (the later VMM leg) will go through
 # `slates_mem::SharedObject`'s atomic views, whose unsafe already lives in slates-mem.
 slates-bridge-virtiofs = 0
+# slates-bridge-oci (1): the macOS `getfsstat(MNT_NOWAIT)` pair — the count query and the fill of a
+# buffer sized for exactly that count, plus the `set_len` to what the kernel wrote — in one block
+# (added 2026-09-14 for the OCI attachment form, §4.6 A-9): rustix has no mount-table query, and a
+# `statfs` of the path would touch the very mount the daemon serves. The Linux read of
+# `/proc/self/mountinfo` is safe rustix; the parser, verification and entry are pure.
+slates-bridge-oci = 1

@@ -318,7 +318,7 @@ pub enum Consumer {
   Launcher,
 }
 
-/// The form of an attachment.
+/// The form of an attachment. Append-only.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub enum AttachForm {
   /// Under the root mount.
@@ -327,6 +327,16 @@ pub enum AttachForm {
   ChosenPath {
     /// The path.
     path: String,
+  },
+  /// A container bind (§4.6 A-9): the verified host mount point bound by the OCI runtime at a path
+  /// inside the container; the authorized binding the record carries.
+  Oci {
+    /// The host mount point (the bind's source).
+    source: String,
+    /// The container path (the bind's destination).
+    destination: String,
+    /// Whether the bind is read-only.
+    read_only: bool,
   },
 }
 
