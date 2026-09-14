@@ -80,12 +80,6 @@ pub struct Daemon {
   /// The loopback port the NFS transport (§4.6) listens on, when it is serving; `None` if the
   /// listener could not be bound. A client mounts `nfs://localhost:PORT`.
   nfs_port: Option<u16>,
-  /// This daemon's forward-progress heartbeat (§4.14): the fleet coordinator bumps it once per period. Read
-  /// directly ([`Self::fleet_progress`], no shard round-trip) so an observer can tell a coordinator that is
-  /// slow under CPU load (still cycling, fewer periods per wall-second) from one that has stalled (no bump).
-  /// Stays zero for a laptop (no fleet loop runs). Leaked to `&'static` at boot — one per daemon, shared with
-  /// the coordinator task — so both the handle here and the task hold the one atomic without `Arc` (D-8).
-  fleet_progress: &'static std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -332,7 +326,7 @@ impl Daemon {
     let listener = Listener::open(&config.instance)?;
     let kicks: Vec<slates_rt::driver::Kick> = shards
       .iter()
-      .filter_map(|s| registry::entry(s.0).map(|e| e.kick))
+      .filter_map(|s| registry::with_entry(s.0, |e| e.kick))
       .collect();
     let waits = match listener.doorbell_waiter()? {
       Some((object, offset)) => Waits::Word { object, offset },
@@ -358,15 +352,13 @@ impl Daemon {
     // probing its peers, serving their probes, and folding the converged view into the `FleetNode` the
     // verbs read for placement. A laptop passes no transport and runs no loop (R8: the same placement path,
     // degenerate). The loop's perpetual tasks are detached and cancelled by `runtime.shutdown()`.
-    // The fleet coordinator's forward-progress heartbeat (§4.14), shared with this handle so a test or an
-    // operator can read it directly under CPU load (no shard round-trip). Leaked once per boot like the
-    // identity — the daemon is process-lifetime — so the handle and the coordinator task hold the one atomic
-    // without an `Arc` (D-8). A laptop spawns no coordinator, so it stays zero.
-    let fleet_progress: &'static std::sync::atomic::AtomicU64 =
-      Box::leak(Box::new(std::sync::atomic::AtomicU64::new(0)));
+    // The fleet coordinator's forward-progress heartbeat (§4.14) lives on the control shard's registry
+    // pulse (`Pulse::progress`), which an observer reads directly under CPU load (no shard round-trip)
+    // and which outlives the shard as its entry does — no allocation per boot (before 2026-09-14 an atomic
+    // was leaked per daemon start). A laptop spawns no coordinator, so it stays zero.
     if let Some(transport) = fleet_transport {
       runtime.spawn_on(control, async move {
-        crate::fleet::run_membership(transport, fleet_progress).await;
+        crate::fleet::run_membership(transport).await;
       })?;
     }
     // The NFS transport (§4.6): one loopback listener served on the control shard. A supervising
@@ -405,7 +397,6 @@ impl Daemon {
       config,
       shards,
       nfs_port,
-      fleet_progress,
     })
   }
 
@@ -498,8 +489,10 @@ impl Daemon {
   /// still is. Zero for a laptop (no coordinator runs).
   pub fn fleet_progress(&self) -> u64 {
     self
-      .fleet_progress
-      .load(std::sync::atomic::Ordering::Relaxed)
+      .shards
+      .first()
+      .and_then(|control| registry::with_entry(control.0, |entry| entry.pulse.progress()))
+      .unwrap_or(0)
   }
 
   /// Every shard's forward-progress pulse ([`ShardPulse`], §4.14), read **directly** from the runtime's
@@ -512,8 +505,7 @@ impl Daemon {
       .shards
       .iter()
       .filter_map(|shard| {
-        let entry = registry::entry(shard.0)?;
-        Some(ShardPulse {
+        registry::with_entry(shard.0, |entry| ShardPulse {
           shard: shard.0,
           steps: entry.pulse.steps(),
           waits: entry.pulse.waits(),
@@ -1769,7 +1761,7 @@ async fn heartbeat_loop(segment: AnchorSegment) {
 
 #[cfg(target_os = "linux")]
 fn kick_fd_of(shard: ShardId) -> Option<i32> {
-  match registry::entry(shard.0).map(|e| e.kick) {
+  match registry::with_entry(shard.0, |e| e.kick) {
     Some(slates_rt::driver::Kick::Eventfd(fd)) => fd.raw(),
     _ => None,
   }

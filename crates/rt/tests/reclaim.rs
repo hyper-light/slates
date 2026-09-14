@@ -11,6 +11,19 @@
 use slates_rt::registry::MAX_SHARDS;
 use slates_rt::runtime::{Runtime, RuntimeConfig};
 
+/// The tests of this binary measure process-global state — the registry's slots, the descriptor table —
+/// so they run one at a time (a test harness lock, D-8's stated exception): under parallel threads another
+/// test's runtime takes the freed slot the stale-waker test expects to see reused, or moves the
+/// descriptor count the leak test compares (3 of 10 parallel runs failed that way on 2026-09-14).
+#[allow(clippy::disallowed_types)] // a test harness lock (D-8's stated exception), poison recovered
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+  SERIAL
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn config(shards: u16) -> RuntimeConfig {
   RuntimeConfig {
     shards,
@@ -39,6 +52,7 @@ fn open_descriptors() -> usize {
 /// shards, not on shards ever created. Before the fix the 1025th start refused `TooManyShards`.
 #[test]
 fn a_shut_down_runtimes_slot_is_reclaimed_so_more_runtimes_than_slots_may_run_in_turn() {
+  let _serial = serial();
   for round in 0..=MAX_SHARDS {
     let runtime = Runtime::start(&config(1)).unwrap_or_else(|e| {
       panic!("runtime {round} refused after {round} shut-down runtimes: {e:?}")
@@ -54,6 +68,7 @@ fn a_shut_down_runtimes_slot_is_reclaimed_so_more_runtimes_than_slots_may_run_in
 #[cfg(unix)]
 #[test]
 fn a_shut_down_runtime_closes_every_descriptor_it_opened() {
+  let _serial = serial();
   // One warm-up cycle so lazily-opened process-wide descriptors (the thread-local storage of the
   // first shard thread, the allocator's) are in the baseline.
   let _ = Runtime::start(&config(2)).unwrap().shutdown();
@@ -77,6 +92,7 @@ fn a_shut_down_runtime_closes_every_descriptor_it_opened() {
 /// not move: the slot was live), so the arena's generation check is what refused it.
 #[test]
 fn a_wake_minted_for_a_dead_shard_is_refused_by_the_slots_new_holder() {
+  let _serial = serial();
   use std::sync::atomic::{AtomicU64, Ordering};
   use std::task::{Context, Poll};
   static POLLS: AtomicU64 = AtomicU64::new(0);

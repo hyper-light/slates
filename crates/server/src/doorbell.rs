@@ -6,13 +6,16 @@
 //! shutdown (no fire-and-forget).
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread::JoinHandle;
 
 use slates_rt::driver::Kick;
 
 /// The daemon's doorbell thread.
 pub struct DoorbellThread {
-  stop: &'static AtomicBool,
+  /// The stop signal: a sender the thread's receiver sees go away (or deliver) at its next turn. A
+  /// channel, not a shared flag, so nothing is leaked per boot and nothing is shared by reference.
+  stop: Option<Sender<()>>,
   handle: Option<JoinHandle<()>>,
   waker: Option<(slates_mem::SharedObject, usize)>,
 }
@@ -42,9 +45,7 @@ impl DoorbellThread {
   /// Starts the thread: it waits as `waits` says, sets `rang`, and kicks `kicks` (every
   /// shard, the control shard first) each time.
   pub fn start(waits: Waits, kicks: Vec<Kick>, rang: &'static AtomicBool) -> DoorbellThread {
-    // The flag lives for the process: the thread holds it as `&'static` and the daemon stops
-    // the thread through it.
-    let stop: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let (stop, stop_signal) = channel();
     let waker = match &waits {
       Waits::Word { object, offset } => object
         .handoff()
@@ -55,10 +56,10 @@ impl DoorbellThread {
     };
     let handle = std::thread::Builder::new()
       .name("slates-doorbell".to_owned())
-      .spawn(move || run(waits, kicks, stop, rang))
+      .spawn(move || run(waits, kicks, &stop_signal, rang))
       .ok();
     DoorbellThread {
-      stop,
+      stop: Some(stop),
       handle,
       waker,
     }
@@ -66,7 +67,8 @@ impl DoorbellThread {
 
   /// Stops the thread and joins it.
   pub fn stop(&mut self) {
-    self.stop.store(true, Ordering::Release);
+    // Dropping the sender is the signal: the thread's next `try_recv` reads `Disconnected`.
+    drop(self.stop.take());
     if let Some((object, offset)) = &self.waker
       && let Ok(word) = object.atomic_u32(*offset)
     {
@@ -85,7 +87,12 @@ impl Drop for DoorbellThread {
   }
 }
 
-fn run(waits: Waits, kicks: Vec<Kick>, stop: &'static AtomicBool, rang_flag: &'static AtomicBool) {
+/// Whether the daemon has asked the thread to stop: the sender was dropped (or sent).
+fn stopped(stop: &Receiver<()>) -> bool {
+  !matches!(stop.try_recv(), Err(TryRecvError::Empty))
+}
+
+fn run(waits: Waits, kicks: Vec<Kick>, stop: &Receiver<()>, rang_flag: &'static AtomicBool) {
   // The value last acted on: a ring that lands while the shards are being kicked shows as a
   // change on the next comparison, never lost (the wait compares against `seen`, not against
   // a fresh read).
@@ -96,7 +103,7 @@ fn run(waits: Waits, kicks: Vec<Kick>, stop: &'static AtomicBool, rang_flag: &'s
       .unwrap_or(0),
     Waits::Socket(_) => 0,
   };
-  while !stop.load(Ordering::Acquire) {
+  while !stopped(stop) {
     let rang = match &waits {
       Waits::Word { object, offset } => match object.atomic_u32(*offset) {
         Ok(word) => {
@@ -110,7 +117,7 @@ fn run(waits: Waits, kicks: Vec<Kick>, stop: &'static AtomicBool, rang_flag: &'s
       },
       Waits::Socket(fd) => platform::socket_readable(*fd),
     };
-    if stop.load(Ordering::Acquire) {
+    if stopped(stop) {
       break;
     }
     if rang {

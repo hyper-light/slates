@@ -355,6 +355,7 @@ fn node(name: &str, probe_port: u16, record_port: u16) -> Node {
 }
 
 /// The addresses and certificate of a node's one peer.
+#[derive(Clone)]
 struct Peer {
   /// The peer's stable anchor (its machine-identity hash on an in-process fleet), from which every member id
   /// it announces derives (task #22).
@@ -647,9 +648,9 @@ fn form_and_settle(daemons: &[&Daemon]) -> bool {
 /// refutation, realized to slates' spec — the configuration group is the membership authority, SWIM is only
 /// detection, and re-admission needs no separate incarnation tracker or bump because [`Membership::refute`]
 /// bumps past the death incarnation it hears. A is made to (falsely) retire B — B is alive throughout, so
-/// this drives the pure re-admission path deterministically, without a process kill (a killed daemon's serve
-/// socket is leaked to the process lifetime and cannot be rebound in-process, though a real deployment's OS
-/// frees it). B keeps probing A; A, believing B dead, echoes that in its acknowledgement
+/// this drives the pure re-admission path deterministically, without a process kill (the restart path —
+/// a stopped daemon's serve ports freed and bound again — is
+/// [`a_stopped_daemons_serve_ports_are_freed_so_its_restart_binds_the_same_addresses`]). B keeps probing A; A, believing B dead, echoes that in its acknowledgement
 /// ([`serve_peer_probes`]); B self-refutes past the death incarnation and gossips its new life, which A
 /// adopts — re-admitting B — after which A's idled [`probe_peer`] resumes. Non-vacuous on three counts: B is
 /// shown retired first (the injected death took hold), then shown back, then shown to **stay** back over a
@@ -870,6 +871,77 @@ async fn dial_record_socket(
     }
   }
   let _ = report.send((index, outcome));
+}
+
+/// §4.3 (a per-shard singleton is owned by its shard and dropped with it) by use, at the fleet: a
+/// **stopped daemon's serve ports are free again**, so a daemon started in its place binds the same
+/// addresses and joins the fleet. Do: form a two-node fleet; stop B; start a fresh B on B's exact probe and
+/// record addresses. Expect: the restart counts no `fleet.bind` refusal (the addresses bound), and the
+/// mesh re-forms — A and the restarted B each see their probe session formed — within the formation
+/// deadline. Non-vacuous: the first fleet is shown formed, so the addresses were held; before 2026-09-14
+/// a daemon's demultiplexers were leaked with their sockets to the process lifetime, so the restart's
+/// bind was refused (`fleet.bind`) and it took no part in the fleet — the reason the restart tests dial a
+/// restart at a *different* pair (`restart_fleet_forms_and_seals`).
+#[test]
+fn a_stopped_daemons_serve_ports_are_freed_so_its_restart_binds_the_same_addresses() {
+  let _serial = serialize_fleet_tests();
+  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  // The restart presents B's certificate again (the operator-provisioned identity does not change) at B's
+  // addresses; on a fresh test segment it is generation 0 like the first, so it rejoins under B's id.
+  let mut b_identities = same_identity(2).into_iter();
+  let (Some(b_first), Some(b_again)) = (b_identities.next(), b_identities.next()) else {
+    panic!("B's identity twice");
+  };
+  let b = Node {
+    identity: b_first,
+    ..b
+  };
+  let b_again = Node {
+    identity: b_again,
+    ..node("b", pb_probe, pb_record)
+  };
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start(a, peer_of_a);
+  let daemon_b = start(b, peer_of_b.clone());
+  let formed = form_and_settle(&[&daemon_a, &daemon_b]);
+  daemon_b.stop();
+
+  let daemon_b_again = start(b_again, peer_of_b);
+  // The mesh re-forms only if the restart bound B's addresses; polled for that (the positive event), then
+  // the refusal counts are read once — a bind refusal never clears, so it is either there or not.
+  let reformed = poll_until(&[&daemon_a, &daemon_b_again], FORMATION_DEADLINE, || {
+    daemon_a.fleet_meshed() == Some(true) && daemon_b_again.fleet_meshed() == Some(true)
+  });
+  let refusals = daemon_b_again.fleet_refusals();
+  daemon_a.stop();
+  daemon_b_again.stop();
+
+  assert!(formed, "the first fleet formed, so B's addresses were held");
+  assert!(
+    !refusals
+      .as_ref()
+      .is_some_and(|refusals| refusals.contains_key("fleet.bind")),
+    "the restart bound B's addresses (no fleet.bind refusal): {refusals:?}"
+  );
+  assert!(
+    reformed,
+    "the mesh re-formed to the restart at the same addresses: {refusals:?}"
+  );
 }
 
 /// Shape: the index of the record plane in `Daemon::fleet_demux_counters` (the probe plane comes first).
@@ -1454,9 +1526,11 @@ fn fleet_peer_at(
 }
 
 /// Starts A, C and old B, lets old B's mesh form, seals a volume on B whose head A and C hold, and ends B's
-/// process. A and C dial B at the pair its **restart** will serve on (an in-process daemon's sockets are
-/// leaked to the process, so a restart cannot rebind old B's; a deployment's address is the manifest's and
-/// does not move), so their probes of B form only once the restart serves there.
+/// process. A and C dial B at the pair its **restart** will serve on — a distinct pair, so old B's last
+/// datagrams in flight cannot reach the restart (a deployment's address is the manifest's and does not
+/// move; that a stopped daemon's ports are free again for a restart is proven by
+/// [`a_stopped_daemons_serve_ports_are_freed_so_its_restart_binds_the_same_addresses`]) — so their probes
+/// of B form only once the restart serves there.
 fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
   let (profile_a, host_a, identity_a) = fleet_node("a");
   let (profile_c, host_c, identity_c) = fleet_node("c");

@@ -264,8 +264,14 @@ impl Runtime {
           let Ok(ctx) = ShardContext::build(seed) else {
             return Counters::default();
           };
+          let id = ctx.id;
           ctx.run();
-          ctx.counters()
+          let counters = ctx.counters();
+          // The loop has returned on this thread: the current-context cell is cleared, the arena is
+          // empty, and nothing foreign dereferences a context — so this thread, which built it,
+          // frees it. The slot's entry stays (retired by `shutdown`'s `unregister` after the join).
+          registry::reclaim_context(id);
+          counters
         })
         .map_err(|e| RtError::DriverRefused {
           call: "thread spawn",
@@ -346,11 +352,15 @@ impl std::fmt::Debug for LocalRuntime {
 
 impl Drop for LocalRuntime {
   /// The shard ran on this thread and its loop has returned by the time the value drops (every
-  /// `run_until_*` returns before), so its slot is given back here: the kick descriptor closes and
-  /// the slot is reusable by the next runtime.
+  /// `run_until_*` returns before), so its context is freed and its slot given back here: the kick
+  /// descriptor closes and the slot is reusable by the next runtime.
   fn drop(&mut self) {
-    registry::note_arena_generation(self.ctx.id, self.ctx.arena_generation_high());
-    registry::unregister(self.ctx.id);
+    let id = self.ctx.id;
+    registry::note_arena_generation(id, self.ctx.arena_generation_high());
+    // The context was built and run on this thread (the handle is `!Send`), and every `run_until_*`
+    // returned before this drop: free it here, then give the slot back.
+    registry::reclaim_context(id);
+    registry::unregister(id);
   }
 }
 

@@ -17,9 +17,10 @@
 //! serve loop then ends with [`EndpointError::Closed`]) — reconnection after a mid-run loss, by
 //! construction.
 //!
-//! **Ownership and bounds (D-8, banned item 8).** The demultiplexer is leaked to `&'static` — one per
-//! socket per boot, process-lifetime like the socket — and its state is a `RefCell` on the one shard
-//! thread that runs it (no lock, no `Arc`). Sessions live in a slab of at most `max_sessions` slots
+//! **Ownership and bounds (D-8, banned item 8).** The demultiplexer is owned by the shard that starts it,
+//! for that shard's life (`ShardContext::keep`: one per socket per boot, handed to the shard's tasks as
+//! `&'static` and dropped with the shard's context after them, its socket closed and its port free
+//! again) — and its state is a `RefCell` on the one shard thread that runs it (no lock, no `Arc`). Sessions live in a slab of at most `max_sessions` slots
 //! (the caller derives it: the fleet passes two per peer — the live session and a re-dial replacing it),
 //! named by generational [`Slot`]s so a stale handle is a typed miss. Each session's inbox holds as
 //! many datagrams as the socket's own kernel receive buffer would (`SO_RCVBUF` over the minimum datagram
@@ -55,21 +56,42 @@ const DATAGRAM_BYTES: usize = 2048;
 pub struct DemuxId(u32);
 
 thread_local! {
-  /// The demultiplexers this shard runs, by id. Grows by one per socket per boot (each is leaked for the
-  /// process's lifetime), so it is bounded by the sockets a node serves on.
-  static DEMUXES: RefCell<Vec<&'static Demux>> = const { RefCell::new(Vec::new()) };
+  /// The demultiplexers this shard runs, by id: one entry per socket started on this thread, cleared
+  /// by the demultiplexer's own drop (it is owned by its shard's context and dropped with it), so a
+  /// later demultiplexer on the same thread — the next simulation's, the next local runtime's — is
+  /// never confused with a dropped one. Bounded by the sockets a node serves on.
+  static DEMUXES: RefCell<Vec<Option<&'static Demux>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Runs `f` on the demultiplexer `id` names on this shard, or `None` if this thread runs no such
-/// demultiplexer.
+/// demultiplexer (or the thread is ending and its table is already gone).
 pub(crate) fn with_demux<R>(id: DemuxId, f: impl FnOnce(&'static Demux) -> R) -> Option<R> {
-  let demux = DEMUXES.with(|table| {
-    table
-      .borrow()
-      .get(usize::try_from(id.0).unwrap_or(usize::MAX))
-      .copied()
-  })?;
+  let demux = DEMUXES
+    .try_with(|table| {
+      table
+        .borrow()
+        .get(usize::try_from(id.0).unwrap_or(usize::MAX))
+        .copied()
+        .flatten()
+    })
+    .ok()
+    .flatten()?;
   Some(f(demux))
+}
+
+impl Drop for Demux {
+  /// Forgets this demultiplexer's id on its thread: an endpoint that names it after this finds
+  /// nothing (`Closed`), never a dropped table entry. The socket closes with the value.
+  fn drop(&mut self) {
+    let _ = DEMUXES.try_with(|table| {
+      if let Some(slot) = table
+        .borrow_mut()
+        .get_mut(usize::try_from(self.id.0).unwrap_or(usize::MAX))
+      {
+        *slot = None;
+      }
+    });
+  }
 }
 
 /// A session's slot in the demultiplexer's table: an index and the generation it was allotted under,
@@ -146,15 +168,18 @@ pub struct Demux {
 impl Demux {
   /// Takes ownership of `socket` and serves up to `max_sessions` peers on it, presenting `identity` and
   /// requiring each dialer's certificate among `allowed` (mutual TLS — the same trust a single-peer
-  /// server enforces). Leaked to `&'static`: one demultiplexer per socket per boot. The caller spawns
-  /// [`Demux::run`] on the shard that will drive the sessions, and owns that task.
+  /// server enforces). Owned by the calling shard for its life (`ShardContext::keep`) and handed out
+  /// as `&'static` to that shard's tasks; dropped — the socket closed, its port free again — when the
+  /// shard's context is, after its tasks. Before 2026-09-14 it was leaked, so a stopped in-process
+  /// daemon never freed its serve ports. Refused when the caller is not on a shard thread. The caller
+  /// spawns [`Demux::run`] on the shard that will drive the sessions, and owns that task.
   pub fn start(
     socket: UdpSocket,
     identity: &'static Identity,
     allowed: Vec<CertificateDer<'static>>,
     frame_cap: usize,
     max_sessions: usize,
-  ) -> &'static Demux {
+  ) -> Result<&'static Demux, EndpointError> {
     let max_sessions = max_sessions.max(1);
     let mut slots = Vec::with_capacity(max_sessions);
     slots.resize_with(max_sessions, || None);
@@ -169,7 +194,7 @@ impl Demux {
       .map(|bytes| bytes / MIN_DATAGRAM_BYTES)
       .unwrap_or(1)
       .max(1);
-    let demux: &'static Demux = Box::leak(Box::new(Demux {
+    let demux = Demux {
       id,
       socket,
       identity,
@@ -187,9 +212,12 @@ impl Demux {
         accept_waker: None,
         counters: DemuxCounters::default(),
       }),
-    }));
-    DEMUXES.with(|table| table.borrow_mut().push(demux));
-    demux
+    };
+    let demux: &'static Demux = slates_rt::registry::with_current(|ctx| ctx.keep(demux)).ok_or(
+      EndpointError::Io(slates_rt::error::RtError::NotOnShardThread),
+    )?;
+    DEMUXES.with(|table| table.borrow_mut().push(Some(demux)));
+    Ok(demux)
   }
 
   /// This demultiplexer's id on its shard — what an endpoint on its socket names it by.

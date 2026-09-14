@@ -139,7 +139,7 @@ impl ShardSeed {
     kick: registry::RegisterKick,
   ) -> Result<ShardSeed, RtError> {
     let (id, control) = registry::register(config.ring_entries, config.tasks_per_shard, kick)?;
-    let kick = registry::entry(id).map_or(Kick::None, |entry| entry.kick);
+    let kick = registry::with_entry(id, |entry| entry.kick).unwrap_or(Kick::None);
     Ok(ShardSeed {
       id,
       driver,
@@ -218,6 +218,26 @@ pub struct ShardContext {
   nested_borrows: Cell<u64>,
   entry: Option<&'static Entry>,
   inner: RefCell<ShardInner>,
+  /// Declared after `inner`, so it drops after the tasks: a task may hold a kept value.
+  kept: Kept,
+}
+
+/// Values a shard owns for its life and drops with its context, after its tasks (§4.3: a per-shard
+/// singleton — a socket's demultiplexer, a fleet identity — is `&'static` to the shard's tasks, and
+/// this is what makes that `'static` a promise the context's end keeps rather than a leak, as
+/// `Box::leak` was before 2026-09-14). Shape: filled at boot only (one entry per socket or identity a
+/// shard serves), never per operation, so it needs no bound of its own; dropped last-in-first-out so
+/// a value kept later (a demultiplexer over an identity) goes before what it borrows.
+#[derive(Default)]
+struct Kept(RefCell<Vec<Box<dyn std::any::Any>>>);
+
+impl Drop for Kept {
+  fn drop(&mut self) {
+    let mut values = self.0.borrow_mut();
+    while let Some(value) = values.pop() {
+      drop(value);
+    }
+  }
 }
 
 impl std::fmt::Debug for ShardContext {
@@ -229,9 +249,13 @@ impl std::fmt::Debug for ShardContext {
 }
 
 impl ShardContext {
-  /// Builds the context from its seed on the calling thread (which builds the driver too) and
-  /// leaks it: a shard lives for the process (one runtime in production), and the leak is what
-  /// lets every reference to it be a plain `&'static` with no unsafe code.
+  /// Builds the context from its seed on the calling thread (which builds the driver too). The
+  /// context is handed out as `&'static` — every task, waker-side path and the thread's current-context
+  /// cell name it that way — but it is not leaked: its slot keeps the box's raw pointer and the same
+  /// thread frees it once its loop has returned (`registry::reclaim_context`; the multi-thread
+  /// worker after `run`, `LocalRuntime` and `SimRuntime` in `Drop`). No other thread ever
+  /// dereferences a context (a wake routes by id through the registry entry), so the `'static` is a
+  /// promise the loop's exit keeps, not a leak. Before 2026-09-14 the box was leaked outright.
   pub fn build(seed: ShardSeed) -> Result<&'static ShardContext, RtError> {
     let config = seed.config;
     let driver = (seed.driver)(seed.kick)?;
@@ -253,7 +277,7 @@ impl ShardContext {
       config.timers_per_shard,
       driver.now_ns(),
     );
-    Ok(Box::leak(Box::new(ShardContext {
+    let context = Box::into_raw(Box::new(ShardContext {
       id: seed.id,
       local: LocalQueue::new(config.tasks_per_shard),
       outbound: seed.outbound,
@@ -276,7 +300,31 @@ impl ShardContext {
         shutting_down: false,
         pollers: Vec::new(),
       }),
-    })))
+      kept: Kept::default(),
+    }));
+    let id = seed.id;
+    registry::attach_context(id, context);
+    // SAFETY: `context` came from `Box::into_raw` just above — valid, aligned, uniquely owned — and
+    // is freed only by `registry::reclaim_context`, which this thread calls after its loop returned
+    // and every reference derived here is gone.
+    Ok(unsafe { &*context })
+  }
+
+  /// Gives the shard `value` to own for its life and hands back a `'static` reference to it: the
+  /// form a per-shard singleton takes (a socket's demultiplexer, the fleet identity its sessions
+  /// present) so every task of the shard can borrow it plainly. Dropped with the context — on the
+  /// owning thread after its loop returned and every task is gone — last kept first. Call it at
+  /// boot, once per singleton (see [`Kept`]); it is not for per-operation values.
+  pub fn keep<T: 'static>(&self, value: T) -> &'static T {
+    let boxed: Box<T> = Box::new(value);
+    let reference: &T = &boxed;
+    // SAFETY: extends the borrow to `'static`. The value lives in a heap box whose allocation never
+    // moves (only the `Box` handle does, into `kept`) and is dropped only with this context —
+    // `registry::reclaim_context`, on the owning thread after its loop returned and its task arena
+    // emptied — so no task, the only holder of such a reference, outlives it.
+    let reference: &'static T = unsafe { &*std::ptr::from_ref(reference) };
+    self.kept.0.borrow_mut().push(boxed);
+    reference
   }
 
   /// Runs `f` with the mutable state, or refuses a nested borrow (counted).
@@ -287,6 +335,14 @@ impl ShardContext {
         self.nested_borrows.set(self.nested_borrows.get() + 1);
         None
       }
+    }
+  }
+
+  /// Marks one period of forward progress of an application loop on this shard, for an observer on
+  /// any thread (`registry::Pulse::progress`).
+  pub fn beat_progress(&self) {
+    if let Some(entry) = self.entry {
+      entry.pulse.beat();
     }
   }
 
@@ -350,10 +406,14 @@ impl ShardContext {
     self.pair_full_events.get()
   }
 
-  /// Sends a word to `target` over the pair ring, if one exists; kicks the target.
-  pub fn send_to(&self, target: u16, word: u64) -> bool {
+  /// Sends a word to `target` over the pair ring, if one exists; kicks the target. A full ring is
+  /// retried only while the target is live and has not left its loop: a target that exited never
+  /// drains the ring again, so the wake is counted stale and the send reports `false` rather than
+  /// spinning for good (the same fault `registry::send_foreign` had: a shutdown in which one shard
+  /// left before a peer's last wakes to it would have hung the peer, and the join).
+  pub fn send_to(&self, target: u16, word: u64) -> registry::PairSend {
     let Some(Some(ring)) = self.outbound.get(usize::from(target)) else {
-      return false;
+      return registry::PairSend::NoRing;
     };
     let (mut producer, _) = ring.split();
     let mut pending = word;
@@ -363,17 +423,45 @@ impl ShardContext {
         Err(back) => {
           pending = back;
           self.pair_full_events.set(self.pair_full_events.get() + 1);
-          if let Some(entry) = registry::entry(target) {
+          let live = registry::with_entry(target, |entry| {
             entry.kick.kick();
+            !entry.exited.load(std::sync::atomic::Ordering::Acquire)
+          });
+          if live != Some(true) {
+            registry::count_stale(target);
+            return registry::PairSend::Gone;
           }
-          std::thread::yield_now();
+          self.drain_while_waiting();
         }
       }
     }
-    if let Some(entry) = registry::entry(target) {
-      entry.kick.kick();
+    let _ = registry::with_entry(target, |entry| entry.kick.kick());
+    registry::PairSend::Sent
+  }
+
+  /// The multi-producer path from a shard thread to a shard it keeps no pair ring to (another
+  /// runtime's): the same turns as a foreign thread's send, but draining this shard's own rings
+  /// between them, so it never blocks its peers while it waits ([`Self::drain_while_waiting`]).
+  pub fn send_foreign_draining(&self, target: u16, word: u64) {
+    let mut pending = word;
+    loop {
+      match registry::try_send_foreign(target, pending) {
+        registry::TrySend::Landed | registry::TrySend::Gone => return,
+        registry::TrySend::Full(back) => {
+          pending = back;
+          self.drain_while_waiting();
+        }
+      }
     }
-    true
+  }
+
+  /// One waiting turn of a shard whose send found a full ring: drain what its own peers sent it (so
+  /// a peer spinning on a full ring *to this shard* is released — two shards saturating each other's
+  /// rings would otherwise each wait for the other to drain, for good), then yield. Skipped when the
+  /// state is borrowed (a wake from inside a borrow): the next turn drains.
+  fn drain_while_waiting(&self) {
+    let _ = self.with_inner(|inner| self.drain_inbound(inner));
+    std::thread::yield_now();
   }
 
   // ------------------------------------------------------------------ admission
@@ -550,8 +638,10 @@ impl ShardContext {
     loop {
       let outcome = self.step();
       if outcome.exit {
-        // The slot's next holder starts its task generations past this shard's (slot reuse).
+        // The slot's next holder starts its task generations past this shard's (slot reuse), and a
+        // sender still spinning on this shard's full ring learns nothing will drain it.
         registry::note_arena_generation(self.id, self.arena_generation_high());
+        registry::note_exited(self.id);
         break;
       }
       if outcome.did_work {

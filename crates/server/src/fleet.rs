@@ -75,8 +75,6 @@
 //! there is no fleet transport and this loop does not run; the placement path still runs the same
 //! `FleetNode`, degenerate (R8).
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use rustls::pki_types::CertificateDer;
 use slates_archive::Archive;
 use slates_cluster::content::{
@@ -608,7 +606,7 @@ fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
 /// receive and accept loops; for each peer it dials the peer's advertised addresses and spawns the probe and
 /// record-link tasks; then the one record-plane coordinator. A two-node fleet is the single-peer degenerate.
 /// Detached tasks: they live as long as the shard and are cancelled by the runtime's shutdown.
-pub async fn run_membership(transport: FleetTransport, progress: &'static AtomicU64) {
+pub async fn run_membership(transport: FleetTransport) {
   let FleetTransport {
     identity,
     name,
@@ -620,10 +618,14 @@ pub async fn run_membership(transport: FleetTransport, progress: &'static Atomic
     // No peers — nothing to probe; the placement path still runs the `FleetNode`, degenerate (R8).
     return;
   }
-  // The identity is process-lifetime and shared by every serve session and client dial — it is not `Clone`
-  // (it holds a private key), so it is leaked to `&'static` and each task borrows the one copy. One leak per
-  // daemon boot.
-  let identity: &'static Identity = Box::leak(Box::new(identity));
+  // The identity is shared by every serve session and client dial of this shard — it is not `Clone` (it
+  // holds a private key), so the control shard owns the one copy for its life (`ShardContext::keep`) and
+  // each task borrows it as `&'static`; it is dropped with the shard's context, after every task. Before
+  // 2026-09-14 it was leaked once per daemon boot.
+  let Some(identity) = slates_rt::registry::with_current(|ctx| ctx.keep(identity)) else {
+    count_refusal(BIND_REFUSED);
+    return;
+  };
   let neighbourhood = peers.len().saturating_add(1); // this node and its peers.
   let local = state::with_state(|s| s.fleet.host()).unwrap_or(HostId(0));
   // The boot line of the fleet's derived timing (R3: every derived value logged with its inputs). Nothing is
@@ -682,20 +684,28 @@ pub async fn run_membership(transport: FleetTransport, progress: &'static Atomic
     }
   });
   let max_sessions = peers.len().saturating_mul(SESSIONS_PER_PEER);
-  let probe_demux = Demux::start(
-    probe_socket,
-    identity,
-    allowed.clone(),
-    FLEET_FRAME_CAP,
-    max_sessions,
-  );
-  let record_demux = Demux::start(
-    record_socket,
-    identity,
-    allowed,
-    FLEET_FRAME_CAP,
-    max_sessions,
-  );
+  // The demultiplexers are owned by this shard for its life and dropped with it (their sockets closed,
+  // the ports free again — a restarted node binds the same addresses); a start refused here means this
+  // loop is not on a shard thread, counted like a socket that would not bind.
+  let (Ok(probe_demux), Ok(record_demux)) = (
+    Demux::start(
+      probe_socket,
+      identity,
+      allowed.clone(),
+      FLEET_FRAME_CAP,
+      max_sessions,
+    ),
+    Demux::start(
+      record_socket,
+      identity,
+      allowed,
+      FLEET_FRAME_CAP,
+      max_sessions,
+    ),
+  ) else {
+    count_refusal(BIND_REFUSED);
+    return;
+  };
   state::with_state(|s| s.demuxes = vec![probe_demux, record_demux]);
   for demux in [probe_demux, record_demux] {
     spawn_detached(run_demux(demux), LOOP_SPAWN_REFUSED);
@@ -752,7 +762,7 @@ pub async fn run_membership(transport: FleetTransport, progress: &'static Atomic
   // One record-plane coordinator for all peers (§4.8 "records are sent to all candidates"): it borrows every
   // holder session the link tasks keep up, so it ships each head to all candidates in one commit and drives
   // each takeover over all surviving holders (the `f > 1` promotion a per-peer ship task could not reach).
-  spawn_detached(run_record_plane(local, progress), LOOP_SPAWN_REFUSED);
+  spawn_detached(run_record_plane(local), LOOP_SPAWN_REFUSED);
 }
 
 /// A serve socket's receive loop as a task, for the daemon's life: it routes every datagram to its session.
@@ -3579,7 +3589,7 @@ fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
 /// shard round-trip) can tell a coordinator that is merely **slow under CPU load** (still cycling, fewer
 /// periods per wall-second) from one that has **stalled** (no bump). A test's `poll_until` charges its budget
 /// against these periods, not wall-clock, so a correct-but-starved operation is never falsely failed.
-async fn run_record_plane(local: HostId, progress: &'static AtomicU64) {
+async fn run_record_plane(local: HostId) {
   let Some(authority) = owner_authority(local) else {
     return;
   };
@@ -3601,7 +3611,7 @@ async fn run_record_plane(local: HostId, progress: &'static AtomicU64) {
   loop {
     // Forward-progress heartbeat: one bump per coordinator period. An observer reads it to tell a fleet that
     // is slow under CPU load (still cycling) from one that has stalled (no bump) — see `progress`.
-    progress.fetch_add(1, Ordering::Relaxed);
+    slates_rt::registry::with_current(|ctx| ctx.beat_progress());
     in_flight.retain_mut(|dispatch| !dispatch.settle());
     // This period's round budget, derived from the slowest measured peer path — every dispatch below (a
     // council or root round, a record commit, a takeover promotion, a content put, a learner fetch) gathers

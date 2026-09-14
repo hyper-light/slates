@@ -79,8 +79,6 @@ slates-rt -p slates-mem --all-targets -- -D warnings` clean; `cargo xtask check`
 - `SimRuntime` registers the same way and now unregisters through `Runtime::shutdown`'s path for
   its shards; its `SimShared` clock is still `Box::leak`ed per simulation (small, bounded per
   simulation; owed to the same treatment).
-- `daemon.rs`'s `fleet_progress` atomic and `fleet.rs`'s identity are leaked per daemon boot (D-8's
-  stated singletons); bounded per daemon, but a process that boots daemons repeatedly (the suite)
-  still grows by two small allocations per boot — owed: hang them on the shard's entry too.
-- The demultiplexer socket is leaked per daemon by design (`fleet.rs`); with the registry fixed, that
-  is now the largest remaining per-daemon leak in the suite and the next candidate.
+- `daemon.rs`'s `fleet_progress` atomic, `fleet.rs`'s identity, the demultiplexer sockets and the
+  shard contexts themselves: **closed the same day** —
+  `docs/bugs/2026-09-14-shard-context-and-fleet-sockets-leak-per-boot.md`.

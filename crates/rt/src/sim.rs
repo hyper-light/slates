@@ -475,6 +475,25 @@ impl std::fmt::Debug for SimRuntime {
   }
 }
 
+impl Drop for SimRuntime {
+  /// The simulation's shards were built and stepped on this thread; every `run_until_*` returned
+  /// before this drop. Each context is freed (`reclaim_context`, which also clears the thread's
+  /// current-context cell a bare step left pointing at it) and its slot given back — before this, a
+  /// simulation reclaimed nothing (its slots were never unregistered, so a test binary spent one of
+  /// the registry's slots per simulation for good). The shared clock and per-shard flags are still
+  /// leaked: a retired entry's `Kick::Sim` points at the flag and may be kicked by a stale waker
+  /// until the slot's next registration, so they must outlive the entry — the same treatment as the
+  /// kick descriptor is owed to them (recorded, small: a few atomics each).
+  fn drop(&mut self) {
+    for ctx in &self.shards {
+      let id = ctx.id;
+      crate::registry::note_arena_generation(id, ctx.arena_generation_high());
+      crate::registry::reclaim_context(id);
+      crate::registry::unregister(id);
+    }
+  }
+}
+
 impl SimRuntime {
   /// Builds `config.shards` simulated shards sharing one clock seeded by `seed`.
   pub fn new(config: &RuntimeConfig, seed: u64) -> Result<SimRuntime, RtError> {

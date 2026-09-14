@@ -752,8 +752,9 @@ async fn serve_shared_socket(plan: ServerPlan) {
 
 async fn serve_shared_socket_on_shard(plan: ServerPlan) {
   let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-  let identity: &'static Identity = Box::leak(Box::new(plan.identity));
-  let demux = Demux::start(socket, identity, plan.allowed, FRAME_CAP, plan.max_sessions);
+  let identity: &'static Identity =
+    slates_rt::registry::with_current(|ctx| ctx.keep(plan.identity)).unwrap();
+  let demux = Demux::start(socket, identity, plan.allowed, FRAME_CAP, plan.max_sessions).unwrap();
   let port = demux.local_addr().unwrap().port();
   for tx in plan.port_txs {
     let _ = tx.send(port);
