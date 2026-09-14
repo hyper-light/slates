@@ -802,6 +802,11 @@ fn the_digest_cache_refuses_at_its_derived_bound_and_frees_a_slot_on_invalidatio
   let mut store = store();
   let capacity = store.digests.capacity();
   assert!(capacity > 0, "a store with inodes caches digests");
+  // The measured point for the record (docs/wip/clean-digest.md): the fixture's derived bound.
+  println!(
+    "digest cache capacity: {capacity} records for max_inodes 65536 (size_of::<Inode>() = {})",
+    std::mem::size_of::<slates_vfs::inode::Inode>()
+  );
   let mut host = SimHost::new();
   for index in 0..=capacity {
     host.replace_file(&format!("/f{index}"), format!("file {index}").as_bytes());
