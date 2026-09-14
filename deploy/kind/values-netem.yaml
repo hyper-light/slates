@@ -1,0 +1,12 @@
+# The KIND lane's WAN profile (docs/wip/kind-lane.md §4; the §4.8 timing owed "over a real path"): an init
+# container with CAP_NET_ADMIN shapes the egress of pods 0 and 1 with `tc netem` before their daemon
+# starts — delay 80 ms ± 20 ms (the Japan East → East US one-way profile the fabric proof used, so the
+# pod-0 ↔ pod-1 round trip is ~160 ms and each of them to pod 2 is ~80 ms). LANE ONLY: never a
+# production value (values.yaml `netem`). `loss` is overridden per run (`--set netem.loss=1%`).
+netem:
+  enabled: true
+  image: slates-netem:lane
+  delay: 80ms
+  jitter: 20ms
+  loss: 0%
+  pods: [0, 1]

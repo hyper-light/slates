@@ -349,3 +349,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: shuttle (T-1.6 two agents on one base; T-6.7 sixteen agents on one green)
         run: RUSTFLAGS="--cfg shuttle" cargo test -p slates-vfs -p slates-merge --test shuttle_clones --test shuttle_green -- --nocapture
+
+  # The KIND fleet lane (docs/wip/kind-lane.md; docs/deploy.md; §4.8 "Deployment" and the WAN timing status
+  # of 2026-09-14, which owed "the KIND lane over a real path"): the fleet on real Linux pods over a real
+  # network, installed by the Helm chart. `cargo xtask kind all` drives every step and deletes the cluster
+  # at the end: the image from the Dockerfile (release profile, distroless, non-root), a kind cluster of one
+  # control plane and five workers (a node is a failure domain: one member per node), the chart at three
+  # replicas with readiness from `slates status`, formation (every pod holds the same three members, both
+  # peers probed, one council leader), a volume sealed on one pod placed at f + 1, the owner's pod deleted
+  # with no grace as the SIGKILL takeover — the survivors retire it and the successor serves the volume —
+  # the replacement pod rejoining by its DNS name at a new IP, the scale to five (f = 2) and back to three
+  # (the configuration group's membership change), and the WAN profiles through a lane-only NET_ADMIN init
+  # container running `tc netem` (80 ms ± 20 ms; the same with 1 % loss; the 350 ms handshake ceiling), each
+  # pod's derived council timing checked against ⌈10 × tail / 100 ms⌉ and the leader's stability over a
+  # three-minute window. kind, kubectl and helm are installed by their actions, pinned to the versions the
+  # lane was validated with on 2026-09-14 — non-Rust tooling admitted for this lane by the charter that
+  # commissioned it, as the conformance lane's suites are. A full run is tens of minutes (a cold release
+  # build in Docker on the runner, six node containers, three shaped windows), so it runs on the push
+  # cadence like the other long lanes; the chart's own gates run in `gates` on every pull request.
+  kind:
+    name: KIND fleet lane (chart, formation, takeover, scale, WAN profiles)
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
+      - uses: helm/kind-action@v1
+        with:
+          version: v0.33.0
+          install_only: true
+      - name: The chart's gates (helm lint; the golden render)
+        run: cargo test -p xtask --test helm_chart
+      - name: The lane, end to end (the cluster is deleted at the end whatever happens)
+        run: cargo xtask kind all
