@@ -16,7 +16,9 @@ use crate::reply::{Attr, AttrOut, DirBuffer, EntryOut, OpenOut, ReplyHeader, Sta
 use crate::request::{ReadIn, RenameIn, Request, SetAttrIn, WriteIn, parse_name};
 
 pub use slates_bridge_core::{Bridge, DirEntry};
-use slates_bridge_core::{FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr};
+use slates_bridge_core::{
+  CacheLifetime, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr,
+};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
@@ -24,8 +26,9 @@ use slates_vfs::inode::Kind;
 pub const ENOSYS: i32 = 38;
 /// Format: `EIO`, the errno for a request the codec could not parse.
 pub const EIO: i32 = 5;
-/// Format: how long the kernel may cache an entry or attributes: forever, since slates
-/// invalidates explicitly on every mutation (§4.6 "Cache posture").
+/// Format: how long the kernel may cache an entry or attributes of the volume's own objects:
+/// forever, since slates invalidates explicitly on every mutation (§4.6 "Cache posture"). A live
+/// base entry gets the seam's bounded lifetime instead ([`Bridge::cache_lifetime`]).
 pub const CACHE_FOREVER: u64 = u64::MAX;
 /// Format: the FUSE node id of the root directory; the kernel always names the root by it, and
 /// the edge resolves it to the volume's real root inode number.
@@ -223,16 +226,57 @@ fn referenced(
   Ok(node)
 }
 
-/// A FUSE `fuse_entry_out` from neutral attributes, cached forever (slates invalidates on every
-/// mutation, §4.6).
-fn entry_out(node: &NodeAttr) -> EntryOut {
+/// The wire cache lifetime (whole seconds, nanoseconds) for `object` — the seam's posture (§4.6):
+/// forever for the volume's own objects, which slates invalidates explicitly on every mutation
+/// through another transport, and the base filesystem's timestamp granularity for a live base
+/// entry, which an outsider may change with no hint.
+fn valid_for(bridge: &mut dyn Bridge, cx: &OpContext, ino: u64) -> (u64, u32) {
+  /// Format: nanoseconds per second, splitting a lifetime into (seconds, nanoseconds).
+  const NS_PER_SEC: u64 = 1_000_000_000;
+  match bridge.cache_lifetime(ObjectId::new(ino, 0), cx) {
+    CacheLifetime::Forever => (CACHE_FOREVER, 0),
+    CacheLifetime::Bounded { ns } => (ns / NS_PER_SEC, u32::try_from(ns % NS_PER_SEC).unwrap_or(0)),
+  }
+}
+
+/// A FUSE `fuse_entry_out` from neutral attributes with the object's cache lifetime.
+fn entry_out(node: &NodeAttr, valid: (u64, u32)) -> EntryOut {
   EntryOut {
     nodeid: node.ino,
     generation: node.generation,
-    entry_valid: CACHE_FOREVER,
-    attr_valid: CACHE_FOREVER,
+    entry_valid: valid.0,
+    attr_valid: valid.0,
+    entry_valid_nsec: valid.1,
+    attr_valid_nsec: valid.1,
     attr: fuse_attr(node),
   }
+}
+
+/// An entry reply for a successful entry-returning operation: the lifetime is read from the seam
+/// for the object the entry names.
+fn entry_reply(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  result: Result<NodeAttr, VfsError>,
+) -> Result<EntryOut, VfsError> {
+  let node = result?;
+  let valid = valid_for(bridge, cx, node.ino);
+  Ok(entry_out(&node, valid))
+}
+
+/// An attribute reply (`GETATTR`/`SETATTR`) with the object's cache lifetime.
+fn attr_reply(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  result: Result<NodeAttr, VfsError>,
+) -> Result<AttrOut, VfsError> {
+  let node = result?;
+  let (attr_valid, attr_valid_nsec) = valid_for(bridge, cx, node.ino);
+  Ok(AttrOut {
+    attr_valid,
+    attr_valid_nsec,
+    attr: fuse_attr(&node),
+  })
 }
 
 /// A FUSE `fuse_statfs_out` from neutral filesystem statistics.
@@ -307,7 +351,8 @@ fn serve_lookup(
   let result = bridge
     .lookup(parent, cx, name)
     .and_then(|n| referenced(bridge, cx, n));
-  reply(req.header.unique, result, |n| entry_out(n).to_bytes(), out)
+  let result = entry_reply(bridge, cx, result);
+  reply(req.header.unique, result, |e| e.to_bytes(), out)
 }
 
 fn serve_getattr(
@@ -320,10 +365,8 @@ fn serve_getattr(
     Ok(object) => object,
     Err(e) => return reply_err(req.header.unique, e, out),
   };
-  let result = bridge.getattr(object, cx).map(|n| AttrOut {
-    attr_valid: CACHE_FOREVER,
-    attr: fuse_attr(&n),
-  });
+  let result = bridge.getattr(object, cx);
+  let result = attr_reply(bridge, cx, result);
   reply(req.header.unique, result, |a| a.to_bytes(), out)
 }
 
@@ -463,7 +506,13 @@ fn serve_readdirplus(
     if !synthetic && bridge.reference(child, cx).is_err() {
       break;
     }
-    if !dir.push_plus(&entry_out(&node), cookie, dtype(entry.kind), &entry.name) {
+    let valid = valid_for(bridge, cx, entry.ino);
+    if !dir.push_plus(
+      &entry_out(&node, valid),
+      cookie,
+      dtype(entry.kind),
+      &entry.name,
+    ) {
       if !synthetic {
         bridge.forget(child, cx, 1);
       }
@@ -508,7 +557,8 @@ fn serve_create(
       if let Err(e) = bridge.reference(ObjectId::new(node.ino, node.generation), cx) {
         return reply_err(req.header.unique, e, out);
       }
-      let mut body = entry_out(&node).to_bytes();
+      let valid = valid_for(bridge, cx, node.ino);
+      let mut body = entry_out(&node, valid).to_bytes();
       body.extend_from_slice(&OpenOut { fh, open_flags: 0 }.to_bytes());
       write_or_drop(ReplyHeader::write_ok(req.header.unique, &body, out), out)
     }
@@ -628,7 +678,8 @@ fn serve_mkdir(
   let result = bridge
     .mkdir(parent, cx, name, mode)
     .and_then(|n| referenced(bridge, cx, n));
-  reply(req.header.unique, result, |n| entry_out(n).to_bytes(), out)
+  let result = entry_reply(bridge, cx, result);
+  reply(req.header.unique, result, |e| e.to_bytes(), out)
 }
 
 fn serve_unlink(
@@ -674,7 +725,8 @@ fn serve_symlink(
   let result = bridge
     .symlink(parent, cx, name, target)
     .and_then(|n| referenced(bridge, cx, n));
-  reply(req.header.unique, result, |n| entry_out(n).to_bytes(), out)
+  let result = entry_reply(bridge, cx, result);
+  reply(req.header.unique, result, |e| e.to_bytes(), out)
 }
 
 fn serve_link(bridge: &mut dyn Bridge, req: &Request<'_>, cx: &OpContext, out: &mut [u8]) -> usize {
@@ -699,7 +751,8 @@ fn serve_link(bridge: &mut dyn Bridge, req: &Request<'_>, cx: &OpContext, out: &
   let result = bridge
     .link(target, new_parent, cx, name)
     .and_then(|n| referenced(bridge, cx, n));
-  reply(req.header.unique, result, |n| entry_out(n).to_bytes(), out)
+  let result = entry_reply(bridge, cx, result);
+  reply(req.header.unique, result, |e| e.to_bytes(), out)
 }
 
 fn serve_readlink(
@@ -791,10 +844,8 @@ fn serve_setattr(
     Ok(changes) => changes,
     Err(e) => return reply_err(req.header.unique, e, out),
   };
-  let result = bridge.setattr(object, cx, changes).map(|n| AttrOut {
-    attr_valid: CACHE_FOREVER,
-    attr: fuse_attr(&n),
-  });
+  let result = bridge.setattr(object, cx, changes);
+  let result = attr_reply(bridge, cx, result);
   reply(req.header.unique, result, |a| a.to_bytes(), out)
 }
 

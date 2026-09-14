@@ -36,7 +36,12 @@ pub struct InitNegotiation {
   pub version_mismatch: bool,
 }
 
-/// The flags slates asks for (the connection keeps whatever the kernel also offers).
+/// The flags slates asks for (the connection keeps whatever the kernel also offers). Each is a
+/// capability slates implements completely: readdirplus has its handler, writeback its flush
+/// through `setattr`, explicit data invalidation and expire-only entries their notifications.
+/// `INIT_EXT` is echoed so the kernel reads the reply's second word at all (`process_init_reply`
+/// takes `flags2` only from a reply whose `flags` carry `FUSE_INIT_EXT`); without it no
+/// second-word capability reaches the kernel however the intersection came out.
 fn wanted() -> u64 {
   flags::WRITEBACK_CACHE
     | flags::PARALLEL_DIROPS
@@ -45,6 +50,8 @@ fn wanted() -> u64 {
     | flags::EXPLICIT_INVAL_DATA
     | flags::BIG_WRITES
     | flags::DONT_MASK
+    | flags::INIT_EXT
+    | flags::HAS_EXPIRE_ONLY
 }
 
 /// Negotiates from a `fuse_init_in` body (major, minor, max_readahead, flags, then flags2 and
@@ -56,14 +63,15 @@ pub fn negotiate(body: &[u8]) -> Result<InitNegotiation, FuseError> {
   let minor = r.u32(opcode)?;
   let kernel_readahead = r.u32(opcode)?;
   let mut kernel_flags = u64::from(r.u32(opcode)?);
-  // The kernel's second flags word rides in `flags2` when it set INIT_EXT and the body carries
-  // it (7.36+); slates reads it only to intersect, never requires it.
-  // Format: with FUSE_INIT_EXT the body carries two more 32-bit words (a reserved word then
-  // flags2); slates reads flags2 into the high half of the flags word.
-  const EXT_WORDS: usize = 2 * size_of::<u32>();
+  // The kernel's second flags word, `flags2`, follows `flags` directly when the kernel set
+  // INIT_EXT and the body carries it (7.36+; `struct fuse_init_in { major, minor, max_readahead,
+  // flags, flags2, unused[11] }`); slates reads it only to intersect, never requires it. Until
+  // 2026-09-14 the codec skipped a word it took for reserved padding and read `unused[0]` — always
+  // zero — so no second-word capability could ever be negotiated; the independent header vector
+  // (`tests/abi.rs`) found it.
+  // Format: the high half of the flags word is `flags2`.
   const HIGH_HALF_SHIFT: u32 = 32;
-  if kernel_flags & flags::INIT_EXT != 0 && r.remaining() >= EXT_WORDS {
-    let _reserved_before_flags2 = r.u32(opcode)?;
+  if kernel_flags & flags::INIT_EXT != 0 && r.remaining() >= size_of::<u32>() {
     kernel_flags |= u64::from(r.u32(opcode)?) << HIGH_HALF_SHIFT;
   }
   if major < FUSE_KERNEL_VERSION {

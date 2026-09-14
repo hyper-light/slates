@@ -64,14 +64,25 @@ pub fn inval_inode(ino: u64, off: i64, len: i64, out: &mut [u8]) -> Result<usize
   write_notification(Notify::InvalInode.code(), &w.into_bytes(), out)
 }
 
-/// Encodes a `FUSE_NOTIFY_INVAL_ENTRY`: drop the cached mapping of `name` in directory
-/// `parent`. `fuse_notify_inval_entry_out`: parent (8), namelen (4), flags (4), then the name
-/// and a terminating NUL.
-pub fn inval_entry(parent: u64, name: &str, out: &mut [u8]) -> Result<usize, FuseError> {
+/// Format: `FUSE_EXPIRE_ONLY`, the `fuse_notify_inval_entry_out.flags` bit asking the kernel to
+/// expire the entry — revalidate the name on its next use — rather than drop it now, which fails
+/// on a directory in use (`include/uapi/linux/fuse.h`; honoured by a kernel that negotiated
+/// `FUSE_HAS_EXPIRE_ONLY`).
+pub const EXPIRE_ONLY: u32 = 1 << 0;
+
+/// Encodes a `FUSE_NOTIFY_INVAL_ENTRY`: drop (or, with `flags` carrying [`EXPIRE_ONLY`], expire)
+/// the cached mapping of `name` in directory `parent`. `fuse_notify_inval_entry_out`: parent (8),
+/// namelen (4), flags (4), then the name and a terminating NUL.
+pub fn inval_entry(
+  parent: u64,
+  name: &str,
+  flags: u32,
+  out: &mut [u8],
+) -> Result<usize, FuseError> {
   let mut w = Writer::new();
   w.u64(parent);
   w.u32(u32::try_from(name.len()).unwrap_or(u32::MAX));
-  w.u32(0); // flags
+  w.u32(flags);
   w.bytes(name.as_bytes());
   w.bytes(&[0]); // the name is NUL-terminated on the wire
   write_notification(Notify::InvalEntry.code(), &w.into_bytes(), out)
@@ -129,7 +140,7 @@ mod tests {
   #[test]
   fn inval_entry_encodes_the_name() {
     let mut out = [0u8; 64];
-    let n = inval_entry(1, "stale.txt", &mut out).unwrap();
+    let n = inval_entry(1, "stale.txt", 0, &mut out).unwrap();
     assert_eq!(code_of(&out), Notify::InvalEntry.code());
     assert_eq!(
       u64::from_le_bytes(out[OUT_HEADER_LEN..OUT_HEADER_LEN + 8].try_into().unwrap()),

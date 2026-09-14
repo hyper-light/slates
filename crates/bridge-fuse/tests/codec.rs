@@ -142,6 +142,7 @@ fn a_success_reply_is_the_header_then_the_body() {
       nlink: 1,
       ..Attr::default()
     },
+    ..EntryOut::default()
   };
   let body = entry.to_bytes();
   assert_eq!(body.len(), EntryOut::LEN);

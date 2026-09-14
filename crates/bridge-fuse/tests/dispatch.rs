@@ -8,7 +8,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use slates_bridge_core::{
-  Attachments, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, Rights, SetAttr, View,
+  Attachments, CacheLifetime, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, Rights, SetAttr,
+  View,
 };
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use slates_bridge_fuse::bridge::{Bridge, DirEntry, ENOSYS};
@@ -45,6 +46,9 @@ const EINVAL: i32 = 22;
 /// Shape: the mock volume's "now" — a value no kernel-filled time in these tests equals, so a
 /// resolved `UTIME_NOW` is told apart from a passed-through kernel time.
 const NOW_NS: i64 = 1_700_000_000_000_000_000;
+/// Shape: the mock's bounded cache window for its live-source file: 1.5 s, so both the seconds
+/// and the nanoseconds halves of the wire lifetime are exercised.
+const LIVE_WINDOW_NS: u64 = 1_500_000_000;
 
 impl Mock {
   fn file_attr(&self) -> NodeAttr {
@@ -279,6 +283,15 @@ impl Bridge for Mock {
   }
   fn now(&mut self) -> i64 {
     NOW_NS
+  }
+  fn cache_lifetime(&mut self, object: ObjectId, _cx: &OpContext) -> CacheLifetime {
+    // The file follows a live source in this mock (a bounded window of 1.5 s); the root is the
+    // volume's own (forever).
+    if object.inode == 2 {
+      CacheLifetime::Bounded { ns: LIVE_WINDOW_NS }
+    } else {
+      CacheLifetime::Forever
+    }
   }
   fn change_token(&mut self, _object: ObjectId, _cx: &OpContext) -> Result<u64, VfsError> {
     Ok(0)
@@ -792,6 +805,65 @@ fn replies_carry_the_change_time_not_the_modification_time() {
     reply_times(&out),
     (100, 200),
     "(mtime, ctime) as the object has them"
+  );
+}
+
+/// The kernel cache lifetime a reply carries is the seam's posture for that object (§4.6 "Cache
+/// posture"): a live-source object's LOOKUP entry and GETATTR attributes carry the bounded window
+/// (1.5 s: seconds 1, nanoseconds 500,000,000, at `fuse_entry_out`'s offsets 16/24 and 32/36 and
+/// `fuse_attr_out`'s 0 and 8), and the volume's own root carries forever. Before the sweep every
+/// reply carried forever, whatever the source.
+#[test]
+fn replies_carry_the_seams_cache_lifetime_for_each_object() {
+  let mut m = mock();
+  let mut out = [0u8; 512];
+  dispatch(
+    &message(Opcode::Lookup.to_wire(), 1, 1, b"hello\0"),
+    &mut m,
+    &mut out,
+  );
+  let entry = &out[OUT_HEADER_LEN..];
+  let at_u64 = |at: usize| u64::from_le_bytes(entry[at..at + 8].try_into().unwrap());
+  let at_u32 = |at: usize| u32::from_le_bytes(entry[at..at + 4].try_into().unwrap());
+  assert_eq!(
+    (at_u64(16), at_u32(32)),
+    (1, 500_000_000),
+    "entry_valid and entry_valid_nsec: the live-source window"
+  );
+  assert_eq!(
+    (at_u64(24), at_u32(36)),
+    (1, 500_000_000),
+    "attr_valid and attr_valid_nsec"
+  );
+
+  dispatch(
+    &message(Opcode::GetAttr.to_wire(), 2, 2, &[0u8; 16]),
+    &mut m,
+    &mut out,
+  );
+  let attrs = &out[OUT_HEADER_LEN..];
+  assert_eq!(
+    (
+      u64::from_le_bytes(attrs[0..8].try_into().unwrap()),
+      u32::from_le_bytes(attrs[8..12].try_into().unwrap())
+    ),
+    (1, 500_000_000),
+    "a GETATTR of the live file carries the window"
+  );
+
+  dispatch(
+    &message(Opcode::GetAttr.to_wire(), 3, 1, &[0u8; 16]),
+    &mut m,
+    &mut out,
+  );
+  let attrs = &out[OUT_HEADER_LEN..];
+  assert_eq!(
+    (
+      u64::from_le_bytes(attrs[0..8].try_into().unwrap()),
+      u32::from_le_bytes(attrs[8..12].try_into().unwrap())
+    ),
+    (u64::MAX, 0),
+    "the volume's own root is cached until an explicit invalidation"
   );
 }
 

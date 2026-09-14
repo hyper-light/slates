@@ -15,7 +15,7 @@ use slates_bridge_fuse::abi::{
 };
 use slates_bridge_fuse::reply::{Attr, AttrOut, DirBuffer, EntryOut, OpenOut, StatfsOut, WriteOut};
 use slates_bridge_fuse::request::{InHeader, ReadIn, RenameIn, SetAttrIn, WriteIn};
-use slates_bridge_fuse::{Notify, delete, inval_entry, inval_inode, negotiate};
+use slates_bridge_fuse::{EXPIRE_ONLY, Notify, delete, inval_entry, inval_inode, negotiate};
 
 /// `enum fuse_opcode`, transcribed: every opcode slates serves, with the header's value.
 const OPCODES: &[(Opcode, u32)] = &[
@@ -60,7 +60,8 @@ const UNSERVED_OPCODES: &[u32] = &[
   4096, // CUSE_INIT
 ];
 
-/// The `FUSE_INIT` flags the codec names, with the header's bit for each.
+/// The `FUSE_INIT` flags the codec names, with the header's bit for each (`FUSE_HAS_EXPIRE_ONLY`
+/// is `1ULL << 35`: the fourth bit of the second word, `flags2`).
 const INIT_FLAGS: &[(u64, u64)] = &[
   (flags::BIG_WRITES, 1 << 5),
   (flags::DONT_MASK, 1 << 6),
@@ -70,15 +71,17 @@ const INIT_FLAGS: &[(u64, u64)] = &[
   (flags::PARALLEL_DIROPS, 1 << 18),
   (flags::EXPLICIT_INVAL_DATA, 1 << 25),
   (flags::INIT_EXT, 1 << 30),
+  (flags::HAS_EXPIRE_ONLY, 1 << 35),
 ];
 
 /// Header bits the codec must never have confused with the ones above: `FUSE_FILE_OPS`,
 /// `FUSE_SPLICE_MOVE` (the bit the writeback flag once wrongly carried), `FUSE_HANDLE_KILLPRIV_V2`,
-/// `FUSE_HAS_EXPIRE_ONLY`, `FUSE_PASSTHROUGH`, `FUSE_OVER_IO_URING`.
+/// `FUSE_CREATE_SUPP_GROUP` (the `flags2` neighbour of `HAS_EXPIRE_ONLY`), `FUSE_PASSTHROUGH`,
+/// `FUSE_OVER_IO_URING`.
 const FILE_OPS: u64 = 1 << 2;
 const SPLICE_MOVE: u64 = 1 << 8;
 const HANDLE_KILLPRIV_V2: u64 = 1 << 28;
-const HAS_EXPIRE_ONLY: u64 = 1 << 35;
+const CREATE_SUPP_GROUP: u64 = 1 << 34;
 const PASSTHROUGH: u64 = 1 << 37;
 const OVER_IO_URING: u64 = 1 << 41;
 
@@ -151,25 +154,16 @@ fn init_flags_carry_the_headers_bits() {
   }
   assert_ne!(flags::WRITEBACK_CACHE, SPLICE_MOVE);
   assert_ne!(flags::WRITEBACK_CACHE, FILE_OPS);
-  for named in [
-    flags::BIG_WRITES,
-    flags::DONT_MASK,
-    flags::DO_READDIRPLUS,
-    flags::READDIRPLUS_AUTO,
-    flags::WRITEBACK_CACHE,
-    flags::PARALLEL_DIROPS,
-    flags::EXPLICIT_INVAL_DATA,
-    flags::INIT_EXT,
-  ] {
+  for (named, _) in INIT_FLAGS {
     for foreign in [
       FILE_OPS,
       SPLICE_MOVE,
       HANDLE_KILLPRIV_V2,
-      HAS_EXPIRE_ONLY,
+      CREATE_SUPP_GROUP,
       PASSTHROUGH,
       OVER_IO_URING,
     ] {
-      assert_ne!(named, foreign, "a named flag is never a foreign bit");
+      assert_ne!(*named, foreign, "a named flag is never a foreign bit");
     }
   }
 }
@@ -193,15 +187,28 @@ fn a_kernel_offering_every_bit_negotiates_only_the_named_flags() {
     | flags::READDIRPLUS_AUTO
     | flags::WRITEBACK_CACHE
     | flags::PARALLEL_DIROPS
-    | flags::EXPLICIT_INVAL_DATA;
+    | flags::EXPLICIT_INVAL_DATA
+    | flags::INIT_EXT
+    | flags::HAS_EXPIRE_ONLY;
   assert_eq!(n.flags & !named, 0, "no foreign bit leaks: {:#x}", n.flags);
-  for foreign in [HANDLE_KILLPRIV_V2, PASSTHROUGH, OVER_IO_URING] {
+  assert_eq!(
+    n.flags & (flags::INIT_EXT | flags::HAS_EXPIRE_ONLY),
+    flags::INIT_EXT | flags::HAS_EXPIRE_ONLY,
+    "flags2 is read from byte 16 (right after flags) and INIT_EXT echoed, so a second-word \
+     capability negotiates; the codec had skipped a word and read unused[0] until 2026-09-14"
+  );
+  for foreign in [
+    HANDLE_KILLPRIV_V2,
+    CREATE_SUPP_GROUP,
+    PASSTHROUGH,
+    OVER_IO_URING,
+  ] {
     assert_eq!(n.flags & foreign, 0);
   }
   assert_eq!(n.minor, FUSE_KERNEL_MINOR_VERSION, "the lesser minor");
 
   // The same words with INIT_EXT clear: the second word is not read at all, so a high bit the
-  // kernel did not declare cannot be negotiated.
+  // kernel did not declare cannot be negotiated — HAS_EXPIRE_ONLY included.
   put_u32(&mut body, 12, !u32::try_from(flags::INIT_EXT).unwrap());
   let n = negotiate(&body).unwrap();
   assert_eq!(n.flags >> 32, 0, "flags2 is ignored without INIT_EXT");
@@ -228,15 +235,16 @@ fn the_init_reply_has_the_headers_layout() {
     "max_readahead is the lesser of the kernel's 1 MiB and slates' chunk"
   );
   assert_eq!(
-    u64::from(u32_at(&reply, 12)) & flags::WRITEBACK_CACHE,
-    flags::WRITEBACK_CACHE
+    u64::from(u32_at(&reply, 12)) & (flags::WRITEBACK_CACHE | flags::INIT_EXT),
+    flags::WRITEBACK_CACHE | flags::INIT_EXT,
+    "flags: the low word, INIT_EXT echoed so the kernel reads flags2"
   );
   assert_eq!(u32_at(&reply, 20), 256 * 1024, "max_write");
   assert_eq!(u32_at(&reply, 24), 1, "time_gran: one nanosecond");
   assert_eq!(
-    u32_at(&reply, 32),
-    0,
-    "flags2: nothing named in the high word"
+    u64::from(u32_at(&reply, 32)) << 32,
+    flags::HAS_EXPIRE_ONLY,
+    "flags2: HAS_EXPIRE_ONLY, the one named bit of the high word"
   );
   assert!(
     reply[36..].iter().all(|b| *b == 0),
@@ -406,6 +414,8 @@ fn entry_out_is_written_at_the_headers_offsets() {
     generation: 9,
     entry_valid: u64::MAX,
     attr_valid: 3,
+    entry_valid_nsec: 11,
+    attr_valid_nsec: 22,
     attr: Attr {
       ino: 5,
       size: 100,
@@ -426,16 +436,21 @@ fn entry_out_is_written_at_the_headers_offsets() {
     [5, 9, u64::MAX, 3],
     "nodeid, generation, entry_valid, attr_valid"
   );
-  assert_eq!((u32_at(&b, 32), u32_at(&b, 36)), (0, 0), "the nsec parts");
+  assert_eq!(
+    (u32_at(&b, 32), u32_at(&b, 36)),
+    (11, 22),
+    "entry_valid_nsec, attr_valid_nsec"
+  );
   assert_fuse_attr_at(&b, 40);
 
   // fuse_attr_out: attr_valid 0, attr_valid_nsec 8, dummy 12, then the same fuse_attr from 16.
   let a = AttrOut {
     attr_valid: 7,
+    attr_valid_nsec: 33,
     attr: entry.attr,
   }
   .to_bytes();
-  assert_eq!(u64_at(&a, 0), 7);
+  assert_eq!((u64_at(&a, 0), u32_at(&a, 8), u32_at(&a, 12)), (7, 33, 0));
   assert_eq!(&a[16..], &b[40..], "the attributes follow at 16");
 }
 
@@ -572,7 +587,7 @@ fn an_inode_invalidation_is_written_at_the_headers_offsets() {
 #[test]
 fn entry_and_delete_notifications_are_written_at_the_headers_offsets() {
   let mut out = [0u8; 128];
-  let n = inval_entry(3, "name", &mut out).unwrap();
+  let n = inval_entry(3, "name", 0, &mut out).unwrap();
   assert_eq!(n, 16 + 16 + 5);
   assert_eq!(
     (
@@ -585,6 +600,9 @@ fn entry_and_delete_notifications_are_written_at_the_headers_offsets() {
     "FUSE_NOTIFY_INVAL_ENTRY; parent, namelen, flags"
   );
   assert_eq!(&out[32..37], b"name\0");
+  // FUSE_EXPIRE_ONLY is the flags word's bit 0.
+  inval_entry(3, "name", EXPIRE_ONLY, &mut out).unwrap();
+  assert_eq!((EXPIRE_ONLY, u32_at(&out, 28)), (1, 1), "FUSE_EXPIRE_ONLY");
 
   let n = delete(3, 9, "gone", &mut out).unwrap();
   assert_eq!(n, 16 + 24 + 5);

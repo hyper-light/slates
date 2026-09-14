@@ -27,9 +27,13 @@ use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::inode::{Attrs, Kind};
+use slates_vfs::journal::Op;
 use slates_vfs::volume::{Store, Volume};
 
-use crate::{Bridge, DirEntry, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr, View};
+use crate::{
+  Bridge, CacheLifetime, DirEntry, FsStat, Invalidation, InvalidationCursor, NodeAttr, ObjectId,
+  OpContext, RenameFlags, SetAttr, View,
+};
 
 /// Shape: the read cap, one arena chunk (256 KiB), matched to the INIT negotiation; here it
 /// bounds a single reply buffer.
@@ -276,6 +280,80 @@ impl<'v> VolumeBridge<'v> {
     }?;
     let kind = self.volume.kind(self.store, inode)?;
     Ok(node_attr(no, kind, &attrs))
+  }
+
+  /// The kernel invalidations one journal record owes (§4.6): a content or attribute change on an
+  /// inode drops that inode's cached attributes (and its data for a content change or a drift); a
+  /// namespace change drops the name's cached mapping in its parent and the parent's attributes (a
+  /// rename both names). A record whose path no longer resolves over the volume's nodes (the entry
+  /// has since gone) owes nothing the kernel could still hold under that name.
+  fn journal_invalidations(
+    &mut self,
+    op: &Op,
+    path: &str,
+    inode: Option<InodeNo>,
+    out: &mut Vec<Invalidation>,
+  ) {
+    let data = matches!(
+      op,
+      Op::Overwrite { .. }
+        | Op::Extend { .. }
+        | Op::Truncate { .. }
+        | Op::Insert { .. }
+        | Op::Delete { .. }
+        | Op::Witness
+        | Op::Drift
+    );
+    match op {
+      Op::Overwrite { .. }
+      | Op::Extend { .. }
+      | Op::Truncate { .. }
+      | Op::Insert { .. }
+      | Op::Delete { .. }
+      | Op::Setattr
+      | Op::Witness
+      | Op::Drift => {
+        if let Some(no) = inode {
+          out.push(Invalidation::Inode { ino: no.0, data });
+        }
+      }
+      Op::Create
+      | Op::Mkdir
+      | Op::Unlink
+      | Op::Rmdir
+      | Op::Link
+      | Op::Symlink
+      | Op::Whiteout
+      | Op::Redirect { .. } => self.entry_invalidation(path, out),
+      Op::Rename { from } => {
+        self.entry_invalidation(from, out);
+        self.entry_invalidation(path, out);
+      }
+      Op::Snapshot => {}
+    }
+  }
+
+  /// The entry and parent-attribute invalidations for the name at `path`.
+  fn entry_invalidation(&mut self, path: &str, out: &mut Vec<Invalidation>) {
+    let (dir, name) = match path.rfind('/') {
+      Some(0) => ("/", &path[1..]),
+      Some(at) => (&path[..at], &path[at + 1..]),
+      None => ("/", path),
+    };
+    if name.is_empty() {
+      return;
+    }
+    if let Ok(located) = self.volume.resolve(self.store, dir) {
+      out.push(Invalidation::Entry {
+        parent: located.inode.0,
+        name: name.to_owned(),
+        expire: false,
+      });
+      out.push(Invalidation::Inode {
+        ino: located.inode.0,
+        data: true,
+      });
+    }
   }
 
   /// Whether `name` exists in directory `dir` — through the overlay rules for an overlay volume, so
@@ -818,6 +896,80 @@ impl Bridge for VolumeBridge<'_> {
 
   fn now(&mut self) -> i64 {
     self.volume.wall_ns()
+  }
+
+  fn cache_lifetime(&mut self, object: ObjectId, cx: &OpContext) -> CacheLifetime {
+    // A live base source — an untouched base entry, a merged directory — may change beneath the
+    // volume without a hint, so the kernel may hold its name and attributes only for the base
+    // filesystem's timestamp granularity (§4.6; the racy window of §4.5); the volume's own objects
+    // are invalidated explicitly and may be held until then. A context for another volume gets no
+    // lifetime worth caching.
+    if cx.volume != self.volume_id {
+      return CacheLifetime::Bounded { ns: 1 };
+    }
+    let no = InodeNo(object.inode);
+    match self.volume.base_plane() {
+      Some(plane) if self.volume.is_live_source(self.store, no) => CacheLifetime::Bounded {
+        ns: plane.timestamp_granularity_ns(),
+      },
+      _ => CacheLifetime::Forever,
+    }
+  }
+
+  fn invalidations(
+    &mut self,
+    cx: &OpContext,
+    cursor: InvalidationCursor,
+    out: &mut Vec<Invalidation>,
+  ) -> Result<InvalidationCursor, VfsError> {
+    self.authorize_read(cx)?;
+    // 1. The journal: every record since the cursor is a change this transport did not make (it
+    //    advanced past its own after serving them), so each names a kernel entry to drop. A
+    //    content record carries its inode; a namespace record carries the new path, whose parent
+    //    is resolved over the volume's own nodes (a mutation's path is always loaded).
+    let records: Vec<(Op, Box<str>, Option<InodeNo>)> = self
+      .volume
+      .op_log()
+      .since(cursor.journal_seq)
+      .map(|r| (r.op.clone(), r.path.clone(), r.inode))
+      .collect();
+    for (op, path, inode) in records {
+      self.journal_invalidations(&op, &path, inode, out);
+    }
+    // 2. The base plane: every directory a watcher hint invalidated since the cursor, with the
+    //    live entries beneath it, expired (not dropped: a busy directory must keep working) so the
+    //    kernel revalidates each name and re-fetches its attributes on the next use.
+    if let Some(host) = self.host.as_mut() {
+      let stale = self
+        .volume
+        .with_host(host)
+        .take_stale_base_entries(self.store, cursor.hint_seq)?;
+      for dir in stale.dirs {
+        out.push(Invalidation::Inode {
+          ino: dir.0,
+          data: true,
+        });
+      }
+      for entry in stale.entries {
+        out.push(Invalidation::Entry {
+          parent: entry.dir.0,
+          name: entry.name.into_string(),
+          expire: true,
+        });
+        out.push(Invalidation::Inode {
+          ino: entry.child.0,
+          data: true,
+        });
+      }
+    }
+    Ok(self.seen(cx))
+  }
+
+  fn seen(&mut self, _cx: &OpContext) -> InvalidationCursor {
+    InvalidationCursor {
+      journal_seq: self.volume.op_log().head_seq(),
+      hint_seq: self.volume.base_plane().map_or(0, |plane| plane.hint_seq()),
+    }
   }
 
   fn change_token(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError> {
