@@ -249,6 +249,10 @@ pub struct DaemonConfig {
   /// per copy — "archived volumes compress once") and the live memory-pressure and load signals. Raw-only
   /// when the profile measured no codec.
   pub codec: slates_archive::CodecPolicy,
+  /// Derived: the spans one `Telemetry` reply carries (§4.14; `crate::telemetry::spans_per_reply`): what
+  /// one bulk chunk of a client's region holds past the report's fixed part, measured from the wire
+  /// encoding at boot.
+  pub telemetry_spans_per_reply: usize,
   /// The fleet this node joins (§4.8, boot step 6), or `None` for the laptop (`f = 0`, solo — the
   /// degenerate of the same code path, R8). A single-host daemon leaves this `None` and every placement
   /// is local; a fleet node names its quorum and peers, and the placement authority, configuration group
@@ -355,6 +359,14 @@ impl DaemonConfig {
       codec.lz4.is_some(),
       codec.zstd.iter().map(|rate| rate.level).collect::<Vec<_>>(),
       codec.byte_ns_scaled
+    ));
+    // A reply rides one bulk chunk (one page each direction per slot), so a telemetry drain carries
+    // what a chunk holds past the report's fixed part (§4.14 bounded export).
+    let telemetry_spans_per_reply =
+      crate::telemetry::spans_per_reply(usize::try_from(BULK_CHUNK_BYTES).unwrap_or(usize::MAX));
+    derivations.push(note(
+      "telemetry_spans_per_reply",
+      &telemetry_spans_per_reply,
     ));
     let geometry = Geometry {
       partitions: runtime.shards.max(1),
@@ -493,6 +505,7 @@ impl DaemonConfig {
       rereplication_bytes_per_second: 0,
       archive_slice_bytes: archive_slice_bytes.get(),
       codec,
+      telemetry_spans_per_reply: telemetry_spans_per_reply.get(),
       // The laptop default: no fleet, `f = 0`, solo. An operator deploying a fleet sets this (with
       // `with_fleet`); the derivation from the machine profile is the same either way (R8).
       fleet: None,

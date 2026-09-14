@@ -9,7 +9,7 @@ use std::time::Instant;
 use slates_ipc::protocol::{
   AuditEntry, DaemonReport, Direction, Filter, GrantScope, GrantSummary, Intent, LandingOutcome,
   LandingSummary, MergeWindow, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass, SnapshotId,
-  StatusReport, VolumeId, VolumeSummary, WorkOp, pack, unpack,
+  StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect_as};
 use slates_machine::{Derived, derived};
@@ -1332,6 +1332,17 @@ impl Client {
       _ => Err(ClientError::UnexpectedReply {
         verb: "daemon_status",
       }),
+    }
+  }
+
+  /// One shard's telemetry drain (§4.14): the chokepoint spans its bounded ring holds, up to one
+  /// reply's quota, with the loss marker for the batch, the spans left for the next drain, and every
+  /// chokepoint's freshness. A read that consumes; a retry returns the same batch (its completion is
+  /// recorded like any verb).
+  pub fn telemetry(&mut self, partition: u16) -> Result<TelemetryReport, ClientError> {
+    match self.call(&RequestBody::Telemetry { partition })? {
+      ReplyBody::Telemetry { report } => Ok(report),
+      _ => Err(ClientError::UnexpectedReply { verb: "telemetry" }),
     }
   }
 

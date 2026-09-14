@@ -2406,15 +2406,27 @@ it uses content addressing. The RAM-only trust boundary and any allowed sharing 
 > not a daemon dependency yet, so those land with fleet integration (§4.8); the archive is not wired
 > into the daemon and its codec is Phase 7, so `archive.chunk` lands with §4.10 — each then through the
 > same cross-crate seam. Instrumenting them before their subsystems run would be untestable code (R5).
-> Also owed: `ring.request` for a *forwarded* reply (its origin span crosses the shard boundary, so
-> `read_ns` 0 marks it owed rather than timing it wrongly); the cross-shard aggregation of the per-shard
-> sinks into the single control-shard sink (the `Control::Spawn` path the bridge queue uses); real
-> cross-boundary trace propagation; and `(value, freshness)` on the daemon-level counters.
-> **Typed absence on the shard health signals is done** (A-9): `Signal.value` is now `Option<u64>` with
-> an `AbsenceIs` (`Unknown`/`Degraded`, `HealthSignal::absence()`), so an absent sample is never a
-> silent healthy zero — a live `catalog.volumes: 0` reads as `0`, a genuinely absent signal (a future
-> mirror age at f = 0, a non-reporting shard) as `absent/<meaning>`; pinned by `every_signal_types_its_absence`
-> and a status-render unit test.
+
+> **Status (2026-09-13).** The registries are the documentation's source: `Chokepoint` and
+> `HealthSignal` declare each entry's dimension, absence meaning, expected producer, observer and
+> freshness horizon/basis, render the tables in `docs/wip/observability.md`, and doc-truth tests compare
+> them byte for byte and against this section's own roster and catalog sentences. The three-id law is
+> enforced by type: a span is opened only by a shard `Tracer` — a root from its request at a ring read
+> or bridge call, a child within the span that caused it (same request and trace, `Cause::Span`), or
+> unlinked with `Cause::Missing` when the cause crossed a boundary that carried none — and trace ids
+> are minted, never derived from the request word. The ring read opens the trace; the verb, its log
+> append, a merge verdict or landing entry open within it; a same-node forward carries the context to
+> the owner and the origin's ring span ends when the reply is written. The export is the `Telemetry`
+> verb: a per-shard drain bounded to one bulk chunk (derived at boot: 50 spans of 68 bytes past a
+> 679-byte fixed part in 4096), carrying `shed_before`/`dropped_total`/`remaining`/`missing_links` as
+> typed loss markers and, for every chokepoint, its newest span's age judged against the failover-SLO
+> horizon — older or none is typed absent with the registry's word and whether a producer runs on this
+> host, never a stale value. `slates status`, `status --json` and the MCP `slates.status` drain every
+> shard through one gather and now carry every shard's signals and telemetry. Owed: cross-node trace
+> propagation (the fleet envelope has no trace context; marked missing), the
+> `ship.record`/`consensus.step`/`archive.chunk` emitters with their subsystems, `(value, freshness)`
+> on the daemon-level counters, a deadline on the status scatter, and paging of the daemon report past
+> one chunk.
 
 Chokepoint spans (bridge request, ring request, shard operation, log append, replication ship,
 consensus step, archive chunk) with the three-id law; spans emitted asynchronously through

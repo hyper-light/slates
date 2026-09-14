@@ -93,6 +93,19 @@ slates anchor --fleet /etc/slates/fleet.json --node a
 `fleet_peers_probed` (peers with a formed session; the mesh is up when this is the member count
 less one). A single daemon shows the same lines, degenerate: `f` 0, itself the one member.
 
+Then one block per shard: its counters (`shard N: clients=… volumes=… served=…`), its refusals by
+kind, its health signals (`shard N catalog.volumes: 3 (age 0 ns)` — a signal that is absent prints
+`absent/unknown` or `absent/degraded`, never a bare `0`), and its telemetry. `status` **drains** each
+shard's bounded telemetry ring (the chokepoint spans recorded since the previous `status`, up to what
+one reply carries): `shard N drain: spans=… window_ns=… horizon_ns=… shed_before=… dropped_total=…
+remaining=… missing_links=…` — `shed_before` is the loss marker (spans the ring shed since the
+previous drain, before this batch), `remaining` what the bound left for the next `status`,
+`missing_links` spans whose cause was not carried across a boundary — followed by one line per
+chokepoint of the registry (`shard N span shard.op: spans=3 latest_age_ns=812`). A chokepoint whose
+newest span is older than the horizon (the failover SLO), or that has none, prints
+`absent/unknown (…)` with its last sighting as an age and whether any producer of it runs on this
+host, never a stale age as a live value.
+
 ## Client verbs
 
 The instance is `--instance`, else `SLATES_ENDPOINT`, else `default`.
@@ -148,7 +161,12 @@ volume-lifecycle verbs (`create`, `snapshot`, `clone`, `resize`, `destroy`, `des
 verbs (`green`, `work`, `edit`) — with the same fields as the text form and the same schema the MCP
 surface emits (one definition, two surfaces). A creating verb returns `{"id": "<hex>"}` (the same
 key across `create`, `clone`, `green` and `work`); an outcome-only verb returns `{"ok": true}`. The
-one exception is `base read`, which streams a file's raw bytes with or without `--json`.
+one exception is `base read`, which streams a file's raw bytes with or without `--json`. `status
+--json` carries every shard's block under `shards` (an array: the counters, `refusals`, `signals`
+with each signal's `value` — `null` when absent — and its `absence` meaning, and `telemetry`: the
+drain's markers, the `chokepoints` registry with each chokepoint's `fresh`/`latest_age_ns`/`absence`/
+`expected`, and the `spans` with their `request`, `trace`, `span` and `cause` identities), exactly what
+the text form prints and the MCP `slates.status` tool returns.
 `slates mount ID PATH` mounts the volume at an existing user-owned directory over the loopback
 NFS bridge; `slates unmount PATH` removes it. `slates mcp` serves the MCP tools over stdio, or
 loopback Streamable HTTP with `--http PORT`.

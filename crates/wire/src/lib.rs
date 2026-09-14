@@ -38,6 +38,6 @@ pub use codec::Wire;
 pub use error::WireError;
 pub use frame::{FrameCaps, Framer};
 pub use header::{Class, Flags, Header};
-pub use observe::{CausedBy, Chokepoint, SpanContext, SpanId, TraceId};
+pub use observe::{AbsenceIs, Cause, Chokepoint, SpanContext, SpanId, TraceId};
 pub use request::RequestId;
 pub use slates_wire_derive::Wire;

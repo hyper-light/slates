@@ -219,19 +219,34 @@ pub struct ShardState {
   /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
   /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.
   pub works: BTreeMap<VolumeId, WorkState>,
-  /// This shard's bounded telemetry sink (§4.14): the chokepoint spans emitted on the shard, held
-  /// shed-first (the newest kept, the oldest dropped and counted). Per-shard and thread-local, so it
-  /// needs no lock (R2) — the design's "per-shard rings"; a control-shard aggregation is owed.
+  /// This shard's bounded telemetry ring (§4.14): the chokepoint spans emitted on the shard, held
+  /// shed-first (the newest kept, the oldest dropped and counted), drained by the `Telemetry` verb
+  /// (`crate::telemetry`) in batches bounded to one reply. Per-shard and thread-local, so it needs no
+  /// lock (R2) — the design's "per-shard rings"; the status scatter is their aggregation.
   pub telemetry: slates_wire::observe::SpanSink,
-  /// The next span id this shard assigns (§4.14, the three-id law): a per-shard monotonic counter, so
-  /// every span this shard emits has a distinct id within the shard (and distinct across the daemon
-  /// with the partition in view). It never resets except by a restart.
-  pub next_span_id: u64,
-  /// The request the shard is serving right now (§4.14): set at the start of `run_recorded`, so a
-  /// fine-grained chokepoint deeper in a verb (a `merge.verdict`, a `land.entry`) can stamp its span
-  /// with the real request identity without threading it through every handler. The shard is
-  /// single-threaded and runs one verb at a time with no awaits inside (§4.7), so this is unambiguous.
-  pub current_request: slates_wire::request::RequestId,
+  /// This shard's opener of spans (§4.14, the three-id law): it mints the shard's trace and span ids
+  /// (the node and partition folded in, so they are distinct daemon- and fleet-wide) and is the only
+  /// way to open a span — a root from the request it serves, a child from the context that caused it.
+  pub tracer: slates_wire::observe::Tracer,
+  /// The innermost open span's context while the shard serves (§4.14): the `ring.request` span from
+  /// the slot read, then the `shard.op` span while its verb runs — so a chokepoint deeper in a verb (a
+  /// `log.append`, a `merge.verdict`, a `land.entry`) opens its span *within* the one that caused it,
+  /// sharing its request and trace and naming it, without threading the context through every handler.
+  /// The shard is single-threaded and runs one verb at a time with no awaits inside (§4.7), so this is
+  /// unambiguous; `None` between requests, and for work whose cause crossed a boundary that carried
+  /// none (the span then declares its cause missing).
+  pub current_span: Option<slates_wire::observe::SpanContext>,
+  /// The `ring.request` spans of requests this shard forwarded to another shard, or scattered, by request
+  /// word (§4.14): opened at the slot read, ended when the reply comes back through `deliver` and is
+  /// written, so a forwarded reply's ring span is timed from read to reply like a local one. Bounded by
+  /// the forwards in flight — the clients' credit (`clients_per_shard × slots`, the same bound
+  /// `pending_forwards` keeps); past it a span is shed and counted rather than held.
+  pub forwarded_rings: BTreeMap<u64, slates_wire::observe::OpenSpan>,
+  /// Derived: how many spans one `Telemetry` reply carries (`crate::telemetry::spans_per_reply`): what
+  /// one bulk chunk holds past the report's fixed part.
+  pub telemetry_quota: usize,
+  /// When this shard's ring was last drained (boot at first), so a batch reports the window it covers.
+  pub last_drain_ns: u64,
   /// The region placement the fleet has committed for each object this node owns (§4.8): the acknowledging
   /// set the control-shard membership loop recorded when it replicated the object's head record to its
   /// candidate holders and reached the quorum. The placement authority the verbs read (`region_placed`,
@@ -374,11 +389,12 @@ pub struct Deferred {
   pub reply: ReplyBody,
   /// Whether its completion record exists already (the owner partition recorded it).
   pub recorded: bool,
-  /// The monotonic time the request was read from the ring, for the `ring.request` span (§4.14),
-  /// emitted when this deferred reply is finally written. Zero means "unknown" — a reply that arrived
-  /// from another shard (a forward's `deliver`), whose `ring.request` span at the origin is owed and
-  /// so is not emitted here rather than emitted with a wrong duration.
-  pub read_ns: u64,
+  /// The request's open `ring.request` span (§4.14), opened at the slot read and ended when this
+  /// deferred reply is finally written — a reply deferred by a full ring, or one that came back from
+  /// another shard, is timed from read to reply like a synchronous one. `None` only for a reply whose
+  /// ring span was shed at the forwarding bound (counted as loss) or never opened (a forward that
+  /// never reached its owner after the bound).
+  pub ring: Option<slates_wire::observe::OpenSpan>,
 }
 
 /// A forward waiting for room on the owner shard's control channel.
@@ -395,6 +411,9 @@ pub struct PendingForward {
   pub body: slates_ipc::protocol::RequestBody,
   /// The owner shard (the runtime's id).
   pub owner: u16,
+  /// The origin's `ring.request` span context (§4.14), carried to the owner so the verb's `shard.op`
+  /// opens within it — one trace across the shard boundary, its cause named.
+  pub cause: Option<slates_wire::observe::SpanContext>,
 }
 
 impl std::fmt::Debug for PendingForward {
@@ -466,15 +485,15 @@ pub fn any_ring_ready() -> bool {
 /// ring and the server task woken.
 pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool) {
   let server = with_state(|s| {
+    // The origin's `ring.request` span (§4.14), opened at the slot read and kept while the request was
+    // away on another shard; it ends when this reply is written into the client's ring.
+    let ring = s.forwarded_rings.remove(&request);
     s.deferred.push(Deferred {
       client_index,
       request,
       reply,
       recorded,
-      // A cross-shard reply (a forward's return or a scatter's part): the origin's `ring.request`
-      // span start was not threaded across the shard boundary, so it is not emitted (owed), not
-      // emitted with a wrong duration.
-      read_ns: 0,
+      ring,
     });
     s.server_task
   })

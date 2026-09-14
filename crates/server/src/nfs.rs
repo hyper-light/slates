@@ -71,7 +71,7 @@ use slates_wire::observe::Chokepoint;
 use slates_wire::request::RequestId;
 
 use crate::state::{self, ShardState};
-use crate::verbs::{emit_span, owner_of, owner_of_name};
+use crate::verbs::{owner_of, owner_of_name};
 
 /// Shape: bytes read from a connection per `read` when more of an RPC record is needed (see the
 /// blocking server in bridge-nfs for the reasoning): one large transfer fits, the assembler stitches
@@ -312,18 +312,28 @@ fn root_mount_name(program: u32, procedure: u32, args: &[u8]) -> Option<String> 
 /// user's subject and the group its created objects take).
 fn serve_local(
   requester: Requester,
+  xid: u32,
   program: u32,
   procedure: u32,
   args: &[u8],
   port: u16,
 ) -> (AcceptStatus, Vec<u8>) {
   // The `bridge.request` chokepoint span (§4.14): one NFS bridge call from arrival to reply, served on
-  // this shard's volumes. The label is the NFS procedure — content-free (an operation code, never a
-  // path or bytes). A bridge call is not a RIFL-replayed client verb, so it carries no client request
-  // identity (the default); its span id and trace still connect it. The clock and sink are reached
+  // this shard's volumes, opened as a root — the kernel's call is the entry point of its trace. Its
+  // request identity for replay is the RPC transaction id under the mount's port (an NFS client
+  // retransmits a call under the same xid, exactly what a replay identity names); the label is the NFS
+  // procedure — content-free (an operation code, never a path or bytes). The clock and ring are reached
   // through `with_state`, taken at the call's edges — outside `serve_call`'s own per-operation borrows,
   // so there is no re-entrant borrow.
-  let start_ns = state::with_state(|s| s.clock.monotonic_ns()).unwrap_or(0);
+  let request = RequestId {
+    client: u32::from(port),
+    sequence: xid,
+  };
+  let open = state::with_state(|s| {
+    let start_ns = s.clock.monotonic_ns();
+    s.tracer
+      .open_root(request, Chokepoint::BridgeRequest, start_ns)
+  });
   let mut service = MultiExport::new(
     ShardVolumeSet,
     requester.subject,
@@ -337,17 +347,12 @@ fn serve_local(
     &mut XdrReader::new(args),
     port,
   );
-  let _ = state::with_state(|s| {
-    let end_ns = s.clock.monotonic_ns();
-    emit_span(
-      s,
-      Chokepoint::BridgeRequest,
-      procedure,
-      RequestId::default(),
-      start_ns,
-      end_ns,
-    );
-  });
+  if let Some(open) = open {
+    let _ = state::with_state(|s| {
+      let end_ns = s.clock.monotonic_ns();
+      crate::telemetry::emit(s, open.end(procedure, end_ns));
+    });
+  }
   result
 }
 
@@ -355,10 +360,12 @@ fn serve_local(
 /// (the same cross-shard spawn the client forward uses, §4.3), which spawns a task back on `origin`
 /// that hands the reply to this awaiting task. Returns a system error if the owner shard is gone. The
 /// mounting user's `subject` rides to the owner, so the request runs as the same user there (§4.13).
+#[allow(clippy::too_many_arguments)] // one RPC call's whole identity: where, who, its xid, program, procedure, args, port
 async fn serve_remote(
   owner: u16,
   origin: u16,
   requester: Requester,
+  xid: u32,
   program: u32,
   procedure: u32,
   args: Vec<u8>,
@@ -367,7 +374,7 @@ async fn serve_remote(
   let call_id = register_pending();
   let owner_task = SpawnRequest::new(
     Box::pin(async move {
-      let outcome = serve_local(requester, program, procedure, &args, port);
+      let outcome = serve_local(requester, xid, program, procedure, &args, port);
       let back = SpawnRequest::new(
         Box::pin(async move {
           deliver_reply(call_id, outcome);
@@ -703,8 +710,8 @@ async fn reply_for(
     return reply_bytes(xid, status, &results);
   }
   let (status, results) = match route(program, procedure, &args) {
-    Some(owner) => serve_remote(owner, this, requester, program, procedure, args, port).await,
-    None => serve_local(requester, program, procedure, &args, port),
+    Some(owner) => serve_remote(owner, this, requester, xid, program, procedure, args, port).await,
+    None => serve_local(requester, xid, program, procedure, &args, port),
   };
   reply_bytes(xid, status, &results)
 }

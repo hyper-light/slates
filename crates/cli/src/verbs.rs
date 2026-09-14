@@ -1,8 +1,9 @@
 //! The client verbs: one connection, one request, the reply printed in a stable plain form.
 
 use slates_client::{
-  AuditEntry, Client, ClientError, CreateSpec, DaemonReport, Deadlines, GrantScope, GrantSummary,
-  Intent, Landing, Rebased, Scope, SnapshotId, StatusReport, Submitted, VolumeId, VolumeSummary,
+  AuditEntry, ChokepointReport, Client, ClientError, CreateSpec, DaemonReport, Deadlines,
+  GrantScope, GrantSummary, Intent, Landing, Rebased, Scope, SnapshotId, StatusReport, Submitted,
+  TelemetryReport, VolumeId, VolumeSummary,
 };
 use slates_db::replay::RECOVERY_BUDGET_NS;
 use slates_server::daemon::LIVENESS_BUDGET_NS;
@@ -293,13 +294,14 @@ fn emit_list(client: &mut Client, json: bool) -> Result<(), ClientError> {
   Ok(())
 }
 
-/// `status` (no volume): the daemon's status as text, or JSON (the MCP `daemon_json` schema).
+/// `status` (no volume): the daemon's status as text, or JSON (the MCP `daemon_json` schema), with
+/// every shard's telemetry ring drained (§4.14) — the same gather the MCP `slates.status` makes.
 fn emit_daemon_status(client: &mut Client, json: bool) -> Result<(), ClientError> {
-  let report = client.daemon_status()?;
+  let (report, telemetry) = slates_mcp::gather_daemon_status(client)?;
   if json {
-    println!("{}", slates_mcp::daemon_json(&report));
+    println!("{}", slates_mcp::daemon_json(&report, &telemetry));
   } else {
-    print!("{}", daemon_status_text(&report));
+    print!("{}", daemon_status_text(&report, &telemetry));
   }
   Ok(())
 }
@@ -794,9 +796,53 @@ fn signal_value(signal: &slates_client::Signal) -> String {
   }
 }
 
+/// A chokepoint's activity as text (§4.14): `spans=N latest_age_ns=A` when its newest span is within
+/// the horizon; otherwise `absent/<meaning>` — with the last sighting's age when there was one, stated
+/// as an age, never as a live value — and whether any producer of it runs on this host.
+fn chokepoint_value(point: &ChokepointReport) -> String {
+  let producer = if point.expected {
+    format!("producer {} expected here", point.producer)
+  } else {
+    format!("no producer here ({})", point.producer)
+  };
+  match (point.fresh, point.latest_age_ns) {
+    (true, Some(age)) => format!("spans={} latest_age_ns={age}", point.spans),
+    (_, Some(age)) => format!(
+      "absent/{} (last seen {age} ns ago; {producer})",
+      point.absence.name()
+    ),
+    (_, None) => format!("absent/{} (never; {producer})", point.absence.name()),
+  }
+}
+
+/// One shard's telemetry drain as text (§4.14): the batch line (its window, horizon, loss markers and
+/// remainder), then one line per chokepoint in roster order.
+fn telemetry_text(batch: &TelemetryReport) -> String {
+  let mut out = format!(
+    "shard {} drain: spans={} window_ns={} horizon_ns={} shed_before={} dropped_total={} remaining={} missing_links={}\n",
+    batch.partition,
+    batch.spans.len(),
+    batch.window_ns,
+    batch.horizon_ns,
+    batch.shed_before,
+    batch.dropped_total,
+    batch.remaining,
+    batch.missing_links
+  );
+  for point in &batch.chokepoints {
+    out.push_str(&format!(
+      "shard {} span {}: {}\n",
+      batch.partition,
+      point.name,
+      chokepoint_value(point)
+    ));
+  }
+  out
+}
+
 /// The daemon's status: the daemon's lines, its place in the fleet (a laptop: `f` 0, itself the one
-/// member, no peers probed), then one block per shard.
-fn daemon_status_text(report: &DaemonReport) -> String {
+/// member, no peers probed), then one block per shard with its health signals and its telemetry drain.
+fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> String {
   let members: Vec<String> = report.fleet.members.iter().map(u64::to_string).collect();
   let mut out = format!(
     "pid: {}\ngeneration: {}\nrestarts: {}\nheartbeat_age_ns: {}\nclients_reaped: {}\nclients_refused: {}\nshards: {}\nfleet_host: {}\nfleet_f: {}\nfleet_host_epoch: {}\nfleet_members: {}\nfleet_peers_probed: {}\nfleet_unknown_id: {}\nfleet_inbox_full: {}\nfleet_sessions_refused: {}\nfleet_replaced: {}\n",
@@ -849,6 +895,12 @@ fn daemon_status_text(report: &DaemonReport) -> String {
       "shard {} telemetry: spans_held={} spans_dropped={}\n",
       shard.partition, shard.spans_held, shard.spans_dropped
     ));
+    if let Some(batch) = telemetry
+      .iter()
+      .find(|batch| batch.partition == shard.partition)
+    {
+      out.push_str(&telemetry_text(batch));
+    }
   }
   out
 }
@@ -881,8 +933,40 @@ pub(crate) fn profile(options: &ProfileOptions) -> Result<(), Failure> {
 
 #[cfg(test)]
 mod tests {
-  use super::signal_value;
-  use slates_client::{AbsenceIs, Signal};
+  use super::{chokepoint_value, signal_value};
+  use slates_client::{AbsenceIs, ChokepointReport, Signal};
+
+  /// A chokepoint renders its activity when fresh, and `absent/<meaning>` when its newest span is past
+  /// the horizon or it never reported — the stale age stated as a last sighting, never as a live value
+  /// (§4.14 freshness, AC-0.11). Do: render a fresh, a stale and a never-reported entry. Expect:
+  /// `spans=… latest_age_ns=…`, `absent/unknown (last seen … ago; …)`, and `absent/unknown (never; no
+  /// producer here …)` respectively.
+  #[test]
+  fn a_chokepoint_renders_fresh_activity_or_typed_absence() {
+    let entry =
+      |spans: u64, latest_age_ns: Option<u64>, fresh: bool, expected: bool| ChokepointReport {
+        name: "shard.op".to_owned(),
+        dimension: "verb".to_owned(),
+        spans,
+        latest_age_ns,
+        fresh,
+        absence: AbsenceIs::Unknown,
+        producer: "client verb".to_owned(),
+        expected,
+      };
+    assert_eq!(
+      chokepoint_value(&entry(3, Some(1_000), true, true)),
+      "spans=3 latest_age_ns=1000"
+    );
+    assert_eq!(
+      chokepoint_value(&entry(3, Some(20_000_000_000), false, true)),
+      "absent/unknown (last seen 20000000000 ns ago; producer client verb expected here)"
+    );
+    assert_eq!(
+      chokepoint_value(&entry(0, None, false, false)),
+      "absent/unknown (never; no producer here (client verb))"
+    );
+  }
 
   /// A health signal renders its measured value, and a genuinely absent signal renders
   /// `absent/<meaning>` — never a bare `0` a reader could mistake for a measured zero (§4.14 A-9).

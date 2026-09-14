@@ -11,8 +11,8 @@
 use std::time::{Duration, Instant};
 
 use slates_ipc::protocol::{
-  Direction, Filter, GrantScope, Intent, NamePolicy, Refusal, ReplyBody, RequestBody, SizeClass,
-  VolumeId, pack, unpack,
+  AbsenceIs, CauseRecord, Direction, Filter, GrantScope, Intent, NamePolicy, Refusal, ReplyBody,
+  RequestBody, SizeClass, SpanRecord, TelemetryReport, VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
@@ -421,12 +421,16 @@ fn rifl_scenario() {
     client.call(&RequestBody::Acknowledge { up_to: id.sequence }),
     ReplyBody::Acknowledged
   ));
-  assert!(matches!(
-    client.call_as(id, &scratch("once")),
-    ReplyBody::Refused {
-      refusal: Refusal::DuplicateRequest
-    }
-  ));
+  let stale = client.call_as(id, &scratch("once"));
+  assert!(
+    matches!(
+      stale,
+      ReplyBody::Refused {
+        refusal: Refusal::DuplicateRequest
+      }
+    ),
+    "a retry of an acknowledged request is a stale duplicate, got {stale:?} (the original volume was {volume:?})"
+  );
   daemon.stop();
 }
 
@@ -1122,33 +1126,254 @@ fn version_stats_scenario() {
   daemon.stop();
 }
 
-/// The live chokepoint spans are emitted for real, not just registered (§4.14): running verbs leaves
-/// spans in the shards' bounded telemetry sinks — `shard.op` and `log.append` for every verb, plus
-/// `ring.request` for a synchronously-served reply — and the daemon status reports the held count.
-/// Do: read the held span count, run several verbs, read it again. Expect: it moved up — the live
-/// non-vacuity witness that the registered emitters actually emit (a dead emit path would keep it at
-/// zero while the registration gate still passed). The count is reported per shard and summed here.
+/// Shape: verbs between two acknowledgements in the overflow loop, so the completion records a client
+/// leaves unacknowledged stay a small window while the ring fills (the raw test client never
+/// acknowledges on its own).
+const ACK_EVERY: usize = 32;
+
+/// One request's spans are one trace with their causes named, the trace distinct from the request
+/// identity; a chokepoint no producer exercises here reports typed absence; and overflowing a shard's
+/// ring is reported as a typed loss marker, never a silent gap — followed by use through the
+/// `Telemetry` drain the status surfaces read (§4.14 three-id law; AC-0.11/T-0.11 "drop a producer and
+/// overflow telemetry"). Do: run one `Create`, drain both shards' rings, follow the request's id through
+/// the spans. Expect: its `ring.request` is a root on the client's shard; its `shard.op` — on the owner,
+/// which may be the other shard — is caused by that ring span and shares its trace; its `log.append`
+/// is caused by the `shard.op` and lies within it; the trace is not the request word widened;
+/// `shard.op` is fresh on the owner while `archive.chunk`, `ship.record` and `consensus.step` are
+/// absent/unknown with no producer on this laptop. Then run more verbs than a ring holds without
+/// draining. Expect: the owner's next drain marks `shed_before > 0` and `dropped_total > 0`, carries at
+/// most the reply quota, and the batches until `remaining` is 0 add up to what the ring held.
 fn telemetry_scenario() {
-  let (daemon, instance) = daemon("telemetry");
+  let profile = profile();
+  let instance = format!("srv-telemetry-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let ring_capacity = usize::try_from(config.region.slots).unwrap();
+  let quota = config.telemetry_spans_per_reply;
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: "slates-seg-telemetry".to_owned(),
+    },
+  )
+  .unwrap();
   let mut client = Client::connect(&instance);
-  let held = |client: &mut Client| -> u64 {
-    let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
-      panic!("daemon status");
-    };
-    report.shards.iter().map(|s| s.spans_held).sum()
+
+  // One verb, then both rings drained: the request's spans across the shards, by its identity.
+  let created = RequestId {
+    client: client.client,
+    sequence: client.sequence + 1,
   };
-  let before = held(&mut client);
-  for i in 0..8 {
-    let ReplyBody::Created { .. } = client.call(&scratch(&format!("tele-{i}"))) else {
-      panic!("create");
-    };
-  }
-  let after = held(&mut client);
-  assert!(
-    after > before,
-    "the shard.op emitter is live: verbs leave spans in the shards' telemetry sinks (before={before}, after={after})"
-  );
+  let ReplyBody::Created { id } = client.call(&scratch("tele-one")) else {
+    panic!("create");
+  };
+  let batches: Vec<TelemetryReport> = (0..TEST_SHARDS)
+    .map(|partition| drain(&mut client, partition))
+    .collect();
+  let owner = assert_one_trace_with_its_causes(&batches, created);
+  assert_laptop_absences(&batches);
+  overflow_and_drain(&mut client, id, owner, ring_capacity, quota);
   daemon.stop();
+}
+
+/// Drains one shard's telemetry ring.
+fn drain(client: &mut Client, partition: u16) -> TelemetryReport {
+  let ReplyBody::Telemetry { report } = client.call(&RequestBody::Telemetry { partition }) else {
+    panic!("telemetry drain of shard {partition}");
+  };
+  report
+}
+
+/// A span's chokepoint name, through its batch's registry entries.
+fn point_of(batch: &TelemetryReport, span: &SpanRecord) -> String {
+  batch.chokepoints[usize::try_from(span.point).unwrap()]
+    .name
+    .clone()
+}
+
+/// The request's spans across the drained batches, each with the batch it came from.
+fn spans_of(
+  batches: &[TelemetryReport],
+  request: RequestId,
+) -> Vec<(&TelemetryReport, &SpanRecord)> {
+  batches
+    .iter()
+    .flat_map(|batch| {
+      batch
+        .spans
+        .iter()
+        .filter(|span| {
+          span.request_client == request.client && span.request_sequence == request.sequence
+        })
+        .map(move |span| (batch, span))
+    })
+    .collect()
+}
+
+/// Follows `created` through the chokepoints it crossed (§4.14 three-id law): `ring.request` is a
+/// root; `shard.op` (on the owner, possibly the other shard) is caused by it and shares its trace;
+/// `log.append` is caused by `shard.op` and lies within it; the trace is not the request word; three
+/// distinct span ids; `shard.op` fresh and expected on the owner. Returns the owner's partition.
+fn assert_one_trace_with_its_causes(batches: &[TelemetryReport], created: RequestId) -> u16 {
+  let mine = spans_of(batches, created);
+  let find = |name: &str| -> (&TelemetryReport, &SpanRecord) {
+    *mine
+      .iter()
+      .find(|(batch, span)| point_of(batch, span) == name)
+      .unwrap_or_else(|| panic!("the create's {name} span was drained: {mine:?}"))
+  };
+  let (ring_shard, ring) = find("ring.request");
+  let (op_shard, op) = find("shard.op");
+  let (append_shard, append) = find("log.append");
+  assert_eq!(
+    ring.cause,
+    CauseRecord::Root,
+    "the slot read opens the trace"
+  );
+  assert_eq!(
+    op.cause,
+    CauseRecord::Span { id: ring.span },
+    "the verb is caused by the ring read, across the shard boundary when the owner is the other shard (ring on shard {}, verb on shard {})",
+    ring_shard.partition,
+    op_shard.partition
+  );
+  assert_eq!(
+    append.cause,
+    CauseRecord::Span { id: op.span },
+    "the log append is caused by the verb"
+  );
+  assert_one_trace_distinct_from_the_request(ring, op, append, created);
+  assert_eq!(
+    op_shard.partition, append_shard.partition,
+    "the append is on the verb's shard"
+  );
+  assert!(
+    op.start_ns <= append.start_ns && append.end_ns <= op.end_ns,
+    "the append lies within the verb on the one clock they share"
+  );
+  let op_entry = op_shard
+    .chokepoints
+    .iter()
+    .find(|c| c.name == "shard.op")
+    .unwrap();
+  assert!(op_entry.fresh && op_entry.spans >= 1 && op_entry.expected);
+  assert!(op_entry.latest_age_ns.is_some());
+  op_shard.partition
+}
+
+/// The three spans share one trace that is not the request word widened, under three distinct span
+/// ids (§4.14 three-id law: the identities are distinct in value, not only in type).
+fn assert_one_trace_distinct_from_the_request(
+  ring: &SpanRecord,
+  op: &SpanRecord,
+  append: &SpanRecord,
+  created: RequestId,
+) {
+  let trace = (ring.trace_high, ring.trace_low);
+  assert_eq!(
+    (op.trace_high, op.trace_low),
+    trace,
+    "one trace for the request"
+  );
+  assert_eq!((append.trace_high, append.trace_low), trace);
+  assert_ne!(
+    trace,
+    (0, created.word()),
+    "the trace is its own identity, not the request word widened"
+  );
+  let mut ids = vec![ring.span, op.span, append.span];
+  ids.sort_unstable();
+  ids.dedup();
+  assert_eq!(ids.len(), 3, "three distinct span ids");
+}
+
+/// Every batch carries the whole registry; the chokepoints no producer exercises on a laptop are typed
+/// absent — not fresh, no age, `unknown`, not expected — and same-node forwards carry their cause.
+fn assert_laptop_absences(batches: &[TelemetryReport]) {
+  for batch in batches {
+    assert_eq!(
+      batch.chokepoints.len(),
+      9,
+      "the whole registry, every batch"
+    );
+    for name in ["archive.chunk", "ship.record", "consensus.step"] {
+      let entry = batch.chokepoints.iter().find(|c| c.name == name).unwrap();
+      assert!(
+        !entry.fresh,
+        "{name} has no producer on a laptop: not fresh"
+      );
+      assert_eq!(
+        entry.latest_age_ns, None,
+        "{name} never reported: no age, not a zero"
+      );
+      assert_eq!(entry.absence, AbsenceIs::Unknown, "{name}: typed absence");
+      assert!(!entry.expected, "{name}: no producer runs here");
+    }
+    assert_eq!(
+      batch.missing_links, 0,
+      "same-node forwards carry their cause"
+    );
+  }
+}
+
+/// Overflow: more verbs than a ring holds, undrained — the owner shard of `id` gets two spans per
+/// status, so `ring_capacity` calls shed at least `ring_capacity` spans there. Expect: the next drain
+/// marks the loss (`shed_before`, `dropped_total`), carries at most the reply quota, and the batches
+/// until `remaining` is 0 add up to what the ring held, with no loss between back-to-back drains.
+fn overflow_and_drain(
+  client: &mut Client,
+  id: slates_ipc::protocol::VolumeId,
+  owner: u16,
+  ring_capacity: usize,
+  quota: usize,
+) {
+  for count in 1..=ring_capacity {
+    let ReplyBody::Status { .. } = client.call(&RequestBody::Status { volume: id }) else {
+      panic!("status");
+    };
+    if count % ACK_EVERY == 0 {
+      let up_to = client.sequence;
+      let ReplyBody::Acknowledged = client.call(&RequestBody::Acknowledge { up_to }) else {
+        panic!("acknowledge");
+      };
+    }
+  }
+  let first = drain(client, owner);
+  assert!(
+    first.shed_before > 0,
+    "the ring shed spans before this batch and says so (capacity {ring_capacity}): {first:?}"
+  );
+  assert!(first.dropped_total >= first.shed_before);
+  assert!(
+    first.spans.len() <= quota,
+    "a batch never exceeds the reply quota {quota}"
+  );
+  // The batches until the ring is empty add up to what it held at the first drain; no batch after the
+  // first carries loss (none happened between the drains).
+  let held = first.spans.len() + usize::try_from(first.remaining).unwrap();
+  let mut drained = first.spans.len();
+  let mut remaining = first.remaining;
+  let mut rounds = 0usize;
+  while remaining > 0 {
+    let more = drain(client, owner);
+    assert_eq!(more.shed_before, 0, "no loss between back-to-back drains");
+    drained += more.spans.len();
+    remaining = more.remaining;
+    rounds += 1;
+    assert!(rounds <= held / quota.max(1) + 2, "the drain converges");
+  }
+  // The drains are verbs on the owner too, each leaving its own spans in the ring after draining it
+  // (never more than one verb's spans between two drains), so the total is the held count plus those.
+  assert!(
+    drained >= held && drained <= held + rounds * 3,
+    "the batches add up to what the ring held (held {held}, drained {drained}, rounds {rounds})"
+  );
+  println!(
+    "telemetry: ring capacity {ring_capacity} spans, reply quota {quota}; after {ring_capacity} status verbs the owner shard {owner} shed {} (dropped_total {}), held {held}, drained {drained} over {} batches",
+    first.shed_before,
+    first.dropped_total,
+    rounds + 1
+  );
 }
 
 /// Destroying a snapshot over the wire, and the clone pin around it (§4.5/§4.2): a snapshot a clone

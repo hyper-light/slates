@@ -191,16 +191,28 @@ impl<H: LandFs> Observer<H> for SpanObserver {
   }
 }
 
-/// Drains a landing's observed entry timings into the shard's telemetry sink as `land.entry` spans
-/// (§4.14), each stamped with the request the shard is serving and one of the shard's own span ids, and
-/// folds the observer's shed count into the sink's loss total. Called after `land` returns, so the sink
-/// is clear of the landing's borrows.
+/// Drains a landing's observed entry timings into the shard's telemetry ring as `land.entry` spans
+/// (§4.14), each opened within the `shard.op` span of the verb that ran the landing — sharing its
+/// request and trace and naming it as the cause — and folds the observer's shed count into the ring's
+/// loss total. Called after `land` returns, so the ring is clear of the landing's borrows.
 #[cfg(unix)]
 fn drain_land_spans(state: &mut ShardState, observer: SpanObserver) {
-  let request = state.current_request;
+  let cause = state.current_span;
   let dropped = observer.dropped;
   for (start_ns, end_ns) in observer.entries {
-    crate::verbs::emit_span(state, Chokepoint::LandEntry, 0, request, start_ns, end_ns);
+    let open = match cause {
+      Some(cause) => state
+        .tracer
+        .open_within(&cause, Chokepoint::LandEntry, start_ns),
+      // A landing always runs inside a recorded verb; without its span the cause is declared missing
+      // rather than invented.
+      None => state.tracer.open_unlinked(
+        slates_wire::request::RequestId::default(),
+        Chokepoint::LandEntry,
+        start_ns,
+      ),
+    };
+    crate::telemetry::emit(state, open.end(0, end_ns));
   }
   state.telemetry.record_dropped(dropped);
 }

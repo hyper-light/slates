@@ -16,9 +16,10 @@ use slates_db::catalog::{
 };
 use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration, rendezvous_first};
 use slates_ipc::protocol::{
-  DaemonReport, Direction, FleetReport, HealthSignal, Intent, NamePolicy, PlacedState, Refusal,
-  RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal, SizeClass, SnapshotId,
-  StatusReport, VolumeId, VolumeSummary, WorkOp, decode_body, encode_body, pack, unpack,
+  DaemonReport, Direction, FleetReport, FreshnessBasis, HealthSignal, Intent, NamePolicy,
+  PlacedState, Refusal, RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal,
+  SizeClass, SnapshotId, StatusReport, VolumeId, VolumeSummary, WorkOp, decode_body, encode_body,
+  pack, unpack,
 };
 use slates_ipc::slot::SlotKind;
 use slates_ipc::{IpcError, Request};
@@ -35,7 +36,7 @@ use slates_vfs::quota::{BudgetGrowth, Quota};
 use slates_vfs::recover::{KeyedImage, ShardImage, VolumeImage};
 use slates_vfs::volume::{DestroyProgress, Volume, VolumeConfig};
 use slates_wire::Wire;
-use slates_wire::observe::{Chokepoint, Span, SpanContext, SpanId, TraceId};
+use slates_wire::observe::{Chokepoint, SpanContext};
 use slates_wire::request::{RequestId, Seen};
 
 use crate::error::{refusal_of_db, refusal_of_vfs};
@@ -252,6 +253,7 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::Grants
     | RequestBody::Audit { .. }
     | RequestBody::Acknowledge { .. }
+    | RequestBody::Telemetry { .. }
     | RequestBody::Grant { .. }
     | RequestBody::Enroll { .. }
     | RequestBody::Attest { .. }
@@ -493,7 +495,8 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
         if let Some(up_to) = ack_up_to {
           prune_forwarded(s, origin_host, id.client, up_to);
         }
-        run_forwarded(s, origin_host, id, 0, &principal, body)
+        // The fleet envelope carries no trace context yet: the verb's span declares its cause missing.
+        run_forwarded(s, origin_host, id, 0, &principal, body, None)
       },
       crate::daemon::LIVENESS_BUDGET_NS,
     )
@@ -804,6 +807,8 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     // A grant is served where its landing was presented: the volume's owner shard, which the landing id
     // names — not the client's shard, where nothing is awaiting.
     RequestBody::Grant { landing, .. } => Some(owner_of_landing(*landing)),
+    // A telemetry drain names its shard: it runs there, on that shard's own ring (§4.14).
+    RequestBody::Telemetry { partition } => Some(*partition),
     other => volume_of(other).map(owner_of),
   };
   if let Some(owner) = owner
@@ -840,67 +845,45 @@ fn run_recorded(
   principal: &Principal,
   body: RequestBody,
 ) -> ReplyBody {
-  // The request the shard is serving, so a fine-grained chokepoint deeper in the verb (a `merge.verdict`)
-  // can stamp its span with the real identity without threading it through every handler.
-  state.current_request = id;
   // Two chokepoint spans measure one verb (§4.14): `shard.op` over the whole verb (one verb on its
   // owner shard, no awaits inside), and `log.append` over the durable `Db::commit` within it (one
-  // op-log record appended and published). The `shard.op` label is content-free — a read (0) or a
-  // mutation (1), the `{verb}` dimension at the coarsest honest granularity (a finer per-verb code is
-  // a follow-up); the `log.append` label is the partition. Neither carries a path, a name or bytes.
+  // op-log record appended and published). Each opens *within* the span that caused it — `shard.op`
+  // within the `ring.request` span of the slot read (carried here from the origin shard when the verb
+  // was forwarded), `log.append` within `shard.op` — so a request's spans are one trace with their
+  // causes named; a verb whose cause crossed a boundary that carried none (a cross-node forward) opens
+  // unlinked and says so. The `shard.op` label is content-free — a read (0) or a mutation (1), the
+  // `{verb}` dimension at the coarsest honest granularity (a finer per-verb code is a follow-up); the
+  // `log.append` label is the partition. Neither carries a path, a name or bytes.
   let start_ns = state.clock.monotonic_ns();
   let label = u32::from(mutates_shard_image(&body)); // before `dispatch` moves `body`
+  let op = match state.current_span {
+    Some(cause) => state
+      .tracer
+      .open_within(&cause, Chokepoint::ShardOp, start_ns),
+    None => state
+      .tracer
+      .open_unlinked(id, Chokepoint::ShardOp, start_ns),
+  };
+  // The verb's own span is the cause of everything deeper in it (a `merge.verdict`, a `land.entry`).
+  let outer = state.current_span.replace(op.context());
   state.db.begin();
   let reply = dispatch(state, client_id, principal, body);
   let reply = record_completion(state, origin, id, reply);
-  let append_start = state.clock.monotonic_ns();
+  let append = state.tracer.open_within(
+    &op.context(),
+    Chokepoint::LogAppend,
+    state.clock.monotonic_ns(),
+  );
   let reply = match state.db.commit(&mut state.segment) {
     Ok(_) => reply,
     Err(e) => refused(refusal_of_db(&e)),
   };
   let end_ns = state.clock.monotonic_ns();
-  emit_span(state, Chokepoint::ShardOp, label, id, start_ns, end_ns);
+  state.current_span = outer;
   let partition_label = u32::from(state.partition);
-  emit_span(
-    state,
-    Chokepoint::LogAppend,
-    partition_label,
-    id,
-    append_start,
-    end_ns,
-  );
+  crate::telemetry::emit(state, op.end(label, end_ns));
+  crate::telemetry::emit(state, append.end(partition_label, end_ns));
   reply
-}
-
-/// Emits one chokepoint span (§4.14) into this shard's bounded telemetry sink: the request identity
-/// (real, for replay), a fresh per-shard span id, and — until cross-boundary trace propagation (from
-/// the bridge or client) is wired — a trace seeded from the request word so a request's spans still
-/// correlate. `caused_by` is none (no upstream causal event is threaded yet). Emission is a sink push:
-/// no await, no lock, so it never blocks the verb it measures; a full sink sheds the oldest span and
-/// counts it (§4.14 shed-first, loss explicit). `label` is the span's content-free dimension code.
-/// `pub(crate)` so the NFS bridge path (`crate::nfs`) emits `bridge.request` through the same helper.
-pub(crate) fn emit_span(
-  state: &mut ShardState,
-  point: Chokepoint,
-  label: u32,
-  id: RequestId,
-  start_ns: u64,
-  end_ns: u64,
-) {
-  let span = SpanId(state.next_span_id);
-  state.next_span_id = state.next_span_id.saturating_add(1);
-  state.telemetry.emit(Span {
-    point,
-    label,
-    context: SpanContext {
-      request: id,
-      trace: TraceId(u128::from(id.word())),
-      span,
-      caused_by: None,
-    },
-    start_ns,
-    end_ns,
-  });
 }
 
 /// The owner's side of a forwarded verb: its own completion window first (a retry of a
@@ -913,6 +896,7 @@ fn run_forwarded(
   client_id: u32,
   principal: &Principal,
   body: RequestBody,
+  cause: Option<SpanContext>,
 ) -> ReplyBody {
   match state
     .db
@@ -925,7 +909,12 @@ fn run_forwarded(
     Seen::Acknowledged => return refused(Refusal::DuplicateRequest),
     Seen::New => {}
   }
-  run_recorded(state, origin, id, client_id, principal, body)
+  // The origin's `ring.request` span context, when the forward carried one (a same-node shard), is the
+  // cause of this verb's `shard.op` (§4.14); a cross-node forward carries none yet, and the span says so.
+  state.current_span = cause;
+  let reply = run_recorded(state, origin, id, client_id, principal, body);
+  state.current_span = None;
+  reply
 }
 
 /// Records the completion (RIFL) and counts the refusal; the reply is then durable and may be
@@ -968,6 +957,9 @@ fn forward(
   body: RequestBody,
   owner: u16,
 ) -> Served {
+  // The `ring.request` span context of this slot read rides to the owner, so the verb's `shard.op` there
+  // opens within it: one trace across the shard boundary, the cause named (§4.14).
+  let cause = state.current_span;
   match send_forward(
     state.shard,
     client_index,
@@ -976,6 +968,7 @@ fn forward(
     &principal,
     &body,
     owner,
+    cause,
   ) {
     Ok(()) => Served::Forwarded,
     Err(slates_rt::RtError::ControlFull { .. }) => {
@@ -995,6 +988,7 @@ fn forward(
         principal,
         body,
         owner,
+        cause,
       });
       Served::Forwarded
     }
@@ -1002,7 +996,9 @@ fn forward(
   }
 }
 
-/// Spawns the owner's task for one forward; the reply comes back as a task on `origin`.
+/// Spawns the owner's task for one forward; the reply comes back as a task on `origin`. `cause` is the
+/// origin's `ring.request` span context, the cause of the verb's `shard.op` on the owner (§4.14).
+#[allow(clippy::too_many_arguments)] // a forward's whole identity: where from, who, what, where to, and its cause
 fn send_forward(
   origin: u16,
   client_index: u32,
@@ -1011,6 +1007,7 @@ fn send_forward(
   principal: &Principal,
   body: &RequestBody,
   owner: u16,
+  cause: Option<SpanContext>,
 ) -> Result<(), slates_rt::RtError> {
   let principal = principal.clone();
   let body = body.clone();
@@ -1022,7 +1019,7 @@ fn send_forward(
         // A same-node cross-shard forward serves a local client, so its completion keys on this node's stable
         // cert-anchor (the same id the local `serve` path uses — task #22), not the ephemeral member id.
         let origin = s.origin_anchor.0;
-        run_forwarded(s, origin, id, client_id, &principal, body)
+        run_forwarded(s, origin, id, client_id, &principal, body, cause)
       })
       .unwrap_or_else(|| refused(Refusal::NotFound));
       let back = SpawnRequest::new(
@@ -1050,6 +1047,7 @@ fn retry_forwards(state: &mut ShardState) -> bool {
       &pending.principal,
       &pending.body,
       pending.owner,
+      pending.cause,
     ) {
       Ok(()) => any = true,
       Err(slates_rt::RtError::ControlFull { .. }) => {
@@ -1057,12 +1055,15 @@ fn retry_forwards(state: &mut ShardState) -> bool {
         break;
       }
       Err(_) => {
+        // A forward that never reached its owner: refused here, its `ring.request` span ending with the
+        // refusal's write like any deferred reply's.
+        let ring = state.forwarded_rings.remove(&pending.request);
         state.deferred.push(Deferred {
           client_index: pending.client_index,
           request: pending.request,
           reply: refused(Refusal::NotFound),
           recorded: false,
-          read_ns: 0, // a forward that never reached its owner; the origin's ring.request is owed
+          ring,
         });
         any = true;
       }
@@ -1358,26 +1359,28 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
   // an absent one. The `None` case is reserved for a signal that genuinely cannot be measured in a state
   // (a mirror age at f = 0, a signal from a shard that is not reporting); the type keeps that
   // distinguishable from a numeric zero rather than conflated with it.
-  let measure = |signal: HealthSignal| -> (Option<u64>, u64) {
+  let measure = |signal: HealthSignal| -> Option<u64> {
     match signal {
-      HealthSignal::CatalogVolumes => (Some(catalog_volumes), 0),
-      HealthSignal::LogReplayNs => (Some(log_replay_ns), since_boot),
-      HealthSignal::LeaseExpiring => (Some(lease_expiring), 0),
-      HealthSignal::RingDepth => (Some(ring_depth), 0),
-      HealthSignal::ShardClients => (Some(shard_clients), 0),
-      HealthSignal::ShardDeferred => (Some(shard_deferred), 0),
+      HealthSignal::CatalogVolumes => Some(catalog_volumes),
+      HealthSignal::LogReplayNs => Some(log_replay_ns),
+      HealthSignal::LeaseExpiring => Some(lease_expiring),
+      HealthSignal::RingDepth => Some(ring_depth),
+      HealthSignal::ShardClients => Some(shard_clients),
+      HealthSignal::ShardDeferred => Some(shard_deferred),
     }
   };
+  // Each signal ages by the registry's stated basis (§4.14): a report-time value is age zero, a
+  // boot-time fact is as old as the boot.
   let signals = HealthSignal::ALL
     .iter()
-    .map(|&signal| {
-      let (value, freshness_ns) = measure(signal);
-      Signal {
-        name: signal.name().to_owned(),
-        value,
-        absence: signal.absence(),
-        freshness_ns,
-      }
+    .map(|&signal| Signal {
+      name: signal.name().to_owned(),
+      value: measure(signal),
+      absence: signal.absence(),
+      freshness_ns: match signal.freshness() {
+        FreshnessBasis::AtReport => 0,
+        FreshnessBasis::SinceBoot => since_boot,
+      },
     })
     .collect();
   ShardReport {
@@ -1661,6 +1664,7 @@ fn dispatch_inner(
       let mine = shard_report(state);
       daemon_report(state, vec![mine])
     }
+    RequestBody::Telemetry { partition } => crate::telemetry::drain_verb(state, partition),
     // `serve` routes this to the control shard (`promote_region_on_root`) before dispatch; this defensive arm
     // proposes on whatever shard reached it — correct on the control shard, refused `NotRootLeader` otherwise.
     RequestBody::PromoteRegion { region } => propose_region_promotion(state, region),
@@ -2899,23 +2903,26 @@ fn submit(state: &mut ShardState, work: VolumeId) -> ReplyBody {
     };
     engine.submit(&inc)
   };
-  // The `merge.verdict` chokepoint span (§4.14): one increment judged (accept, identical, or conflict).
-  // The label is content-free — accepted (1) or conflict (0); the request is the one the shard is
-  // serving (set in `run_recorded`). It never carries a path, a name or bytes.
+  // The `merge.verdict` chokepoint span (§4.14): one increment judged (accept, identical, or conflict),
+  // opened within the `shard.op` span of the submit that caused it (set in `run_recorded`). The label
+  // is content-free — accepted (1) or conflict (0). It never carries a path, a name or bytes.
   let verdict_end = state.clock.monotonic_ns();
   let accepted = u32::from(matches!(
     &outcome,
     slates_merge::engine::Outcome::Accepted { .. }
   ));
-  let request = state.current_request;
-  emit_span(
-    state,
-    Chokepoint::MergeVerdict,
-    accepted,
-    request,
-    verdict_start,
-    verdict_end,
-  );
+  let verdict = match state.current_span {
+    Some(cause) => state
+      .tracer
+      .open_within(&cause, Chokepoint::MergeVerdict, verdict_start),
+    // A submit always runs inside a recorded verb; without its span the cause is declared missing.
+    None => state.tracer.open_unlinked(
+      RequestId::default(),
+      Chokepoint::MergeVerdict,
+      verdict_start,
+    ),
+  };
+  crate::telemetry::emit(state, verdict.end(accepted, verdict_end));
   match outcome {
     slates_merge::engine::Outcome::Accepted { version } => {
       // The pre-check passed and the shard is single-threaded, so this append fits the budget; a
@@ -3945,7 +3952,8 @@ fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32) -> ReplyBody 
   // same key `serve` records and looks them up under (task #22 two-id model), never the ephemeral member
   // id: pruning under a key nothing is recorded under released no record (the windows grew unbounded,
   // banned item 8) and a retry after acknowledgement met its record again instead of `DuplicateRequest`
-  // (`docs/bugs/2026-09-13-acknowledge-prunes-under-the-ephemeral-id.md`).
+  // (`docs/bugs/2026-09-13-acknowledge-prunes-under-the-ephemeral-id.md`; found independently three
+  // times the same day — also `…-acknowledge-keyed-on-ephemeral-member-id.md`).
   let origin = state.origin_anchor.0;
   match state.db.mutate(
     &mut state.segment,
@@ -4163,7 +4171,7 @@ fn retry_deferred(state: &mut ShardState) -> bool {
       request,
       reply,
       recorded,
-      read_ns,
+      ring,
     } = entry;
     let id = RequestId::from_word(request);
     // A deferred reply is the local client's own (its shard is here), so its completion keys on this node's
@@ -4185,20 +4193,12 @@ fn retry_deferred(state: &mut ShardState) -> bool {
     };
     if send_reply(state, client_index, request, &reply) {
       any = true;
-      // The `ring.request` span (§4.14) for a reply that was deferred (its ring was full) and is now
-      // written — but only when the read time is known (a local request). A cross-shard reply carries
-      // `read_ns` 0, whose origin-side span is owed, so it is skipped rather than timed wrongly.
-      if read_ns != 0 {
+      // The `ring.request` span (§4.14) for a reply that was deferred (its ring was full, or it came
+      // back from another shard) and is now written: from the slot read to the reply written.
+      if let Some(ring) = ring {
         let written_ns = state.clock.monotonic_ns();
         let label = u32::from(state.partition);
-        emit_span(
-          state,
-          Chokepoint::RingRequest,
-          label,
-          id,
-          read_ns,
-          written_ns,
-        );
+        crate::telemetry::emit(state, ring.end(label, written_ns));
       }
     } else {
       state.deferred.push(Deferred {
@@ -4206,7 +4206,7 @@ fn retry_deferred(state: &mut ShardState) -> bool {
         request,
         reply,
         recorded: true,
-        read_ns,
+        ring,
       });
     }
   }
@@ -4237,39 +4237,62 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     if matches!(request.kind, SlotKind::Heartbeat | SlotKind::Cancel) {
       continue;
     }
-    match serve(state, handle, &request) {
+    // The `ring.request` span (§4.14) opens the request's trace as a root at the slot read: the client
+    // is the entry point, its request id the replay identity. `now` (this round's single clock read,
+    // §4.7) stands for the read time — a small, conservative over-estimate within one batch, not a
+    // per-request clock read on the hot path. Everything the request causes on this shard opens within
+    // this context; a forward carries it to the owner.
+    let ring = state.tracer.open_root(
+      RequestId::from_word(request.request),
+      Chokepoint::RingRequest,
+      now,
+    );
+    state.current_span = Some(ring.context());
+    let served = serve(state, handle, &request);
+    state.current_span = None;
+    match served {
       Served::Reply(reply) => {
         if send_reply(state, index, request.request, &reply) {
-          // Written synchronously: the `ring.request` span (§4.14) from the ring read to the reply
-          // written. `now` (this round's single clock read, §4.7) stands for the read time — a small,
-          // conservative over-estimate within one batch, not a per-request clock read on the hot path.
+          // Written synchronously: the span ends at the reply written.
           let written_ns = state.clock.monotonic_ns();
           let label = u32::from(state.partition);
-          emit_span(
-            state,
-            Chokepoint::RingRequest,
-            label,
-            RequestId::from_word(request.request),
-            now,
-            written_ns,
-          );
+          crate::telemetry::emit(state, ring.end(label, written_ns));
         } else {
-          // The ring was full: keep the read time so the span is complete when `retry_deferred` writes.
+          // The ring was full: the open span rides the deferred reply and ends when it is written.
           state.deferred.push(Deferred {
             client_index: index,
             request: request.request,
             reply,
             recorded: true,
-            read_ns: now,
+            ring: Some(ring),
           });
         }
       }
-      // A forwarded request: its reply returns from the owner shard via `deliver` (read_ns 0), so its
-      // origin-side `ring.request` span is owed — not emitted here with a wrong duration.
-      Served::Forwarded => {}
+      // A forwarded (or scattered) request: its reply returns through `deliver`, which takes the open
+      // span back out and ends it at the write.
+      Served::Forwarded => remember_forwarded_ring(state, request.request, ring),
     }
   }
   any
+}
+
+/// Keeps the open `ring.request` span of a request that left this shard, until its reply comes back
+/// through `deliver` (§4.14). Bounded by the clients' credit — the forwards that can be in flight — and
+/// past that bound the span is shed and counted, never held unbounded (ban 8).
+fn remember_forwarded_ring(
+  state: &mut ShardState,
+  request: u64,
+  ring: slates_wire::observe::OpenSpan,
+) {
+  let bound = state
+    .config
+    .clients_per_shard
+    .saturating_mul(usize::try_from(state.config.region.slots).unwrap_or(1));
+  if state.forwarded_rings.len() >= bound {
+    state.telemetry.record_dropped(1);
+    return;
+  }
+  state.forwarded_rings.insert(request, ring);
 }
 
 /// Writes a reply into the client's completion ring; false when the ring is full (the reply
