@@ -1230,6 +1230,7 @@ fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
     "spans_held": s.spans_held,
     "spans_dropped": s.spans_dropped,
     "peers_probed": s.peers_probed,
+    "tasks_refused": s.tasks_refused,
     "telemetry": telemetry.map(telemetry_json),
   })
 }

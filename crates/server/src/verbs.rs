@@ -1425,6 +1425,8 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     control: is_control_shard(state),
     council: group_report(state.council.is_leader(), state.council_timing),
     root: group_report(state.root.is_leader(), state.root_timing),
+    tasks_refused: slates_rt::registry::with_current(|ctx| ctx.counters().admission_refused)
+      .unwrap_or(0),
   }
 }
 
@@ -4647,17 +4649,10 @@ fn reap_client(state: &mut ShardState, handle: Handle<ClientSlot>, client_id: u3
   state.deferred.retain(|d| d.client_index != index);
   // The slot goes last: the region's mapping and the control channel close with it.
   let _ = state.clients.remove(handle);
-  // The id returns to the control shard's live set as a task there (sharing by move).
+  // The id returns to the control shard's live set (directly on it, or as a task there — sharing by
+  // move); a return the control shard's channel refuses is counted and logged, never dropped.
   if let Some(control) = state.shards.first().copied() {
-    let forget = Box::new(SpawnRequest::new(
-      Box::pin(async move {
-        crate::state::with_handed(|handed| {
-          handed.remove(&client_id);
-        });
-      }),
-      None,
-    ));
-    let _ = slates_rt::registry::send_control(control, Control::Spawn(forget));
+    crate::daemon::release_client_id(client_id, control);
   }
   removed
 }

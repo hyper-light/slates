@@ -64,6 +64,15 @@ pub enum IpcError {
     /// The bound.
     limit: usize,
   },
+  /// A client was assigned an id and a region but its handoff failed after that (the peer's socket
+  /// refusing, a descriptor that could not be duplicated): the daemon releases the id and the client
+  /// sees its connect fail. Carries the id so the release is exact, and the cause.
+  HandoffLost {
+    /// The id the daemon had assigned.
+    client_id: u32,
+    /// What failed.
+    cause: Box<IpcError>,
+  },
   /// The consumer capability the harness delivers on an inherited descriptor (§4.13; `delivery`)
   /// could not be taken: which fault. A process spawned as a consumer whose delivery is unusable is
   /// refused here rather than bound to the account's ambient authority; only `Absent` means the
@@ -95,6 +104,12 @@ impl fmt::Display for IpcError {
       Self::Unsupported { feature } => write!(f, "unsupported here: {feature}"),
       Self::DeadlineExceeded => f.write_str("deadline exceeded"),
       Self::TooManyClients { limit } => write!(f, "too many clients (the bound is {limit})"),
+      Self::HandoffLost { client_id, cause } => {
+        write!(
+          f,
+          "the handoff to client {client_id} failed after admission: {cause}"
+        )
+      }
       Self::CapabilityNotDelivered { fault } => {
         write!(f, "consumer capability not delivered: {fault}")
       }

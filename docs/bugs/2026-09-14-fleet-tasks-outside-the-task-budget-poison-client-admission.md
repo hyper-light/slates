@@ -72,7 +72,15 @@ readiness never passes and no local verb reaches it — the operator sees a layo
 capacity refusal. From the failing test's run: with the arena full the daemons' shutdown did not complete
 either (the test hung past 300 s after its reply deadline) — to be confirmed with the fix in place.
 
-## Exact edits (the fix, pending)
+## Resolution (2026-09-14, on main)
+
+Items 1–2 landed as the fleet's derived task share (`5de244d`, `docs/bugs/2026-09-14-fleet-tasks-admitted-against-the-clients-budget.md`);
+items 3–5 as the admission fixes in `docs/bugs/2026-09-14-refused-admissions-leaked-ids-and-were-never-told.md`
+(the guard, the typed refusal on both platforms, `tasks_refused` in status); the test above is un-ignored
+and green (1.57 s) — its 38-peer node also needed the roster-sized handshake flight fix
+(`docs/bugs/2026-09-14-servers-handshake-flight-grows-with-its-roster.md`). The edits as specified:
+
+## Exact edits (as specified on the branch)
 
 1. `crates/server/src/fleet.rs`: name the fleet's task shape — `FLEET_LOOP_TASKS` (2 receive loops, 2
    accept loops, 1 coordinator), `DIAL_TASKS_PER_PEER` (2), `SERVE_PLANES` (2), `SESSIONS_PER_PEER` (2,

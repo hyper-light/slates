@@ -122,8 +122,29 @@ pub struct ShardPulse {
   pub ring_full_events: u64,
 }
 
-/// Set by the doorbell thread each time it kicks; the control task's poller reads it.
-static DOORBELL_RANG: AtomicBool = AtomicBool::new(false);
+/// One doorbell flag per control shard, indexed by the shard's registry id: set by the daemon's doorbell
+/// thread each time it kicks, swapped off by that daemon's control task poller. A table, not one flag,
+/// because a process that runs several daemons (the test suites; a bench) must give each its own — with
+/// one process-wide flag, one daemon's poller consumed the ring meant for another, whose control loop
+/// then never ran its accept round and left a client's claim unanswered for the whole claim wait
+/// (found by the typed-refusal test under the parallel daemon suite, 2026-09-14; one daemon per process
+/// never saw it). Shape: one entry per registry slot (`MAX_SHARDS`), each on its own cache line — the
+/// doorbell thread writes and the control shard swaps its entry, so two daemons' entries must never
+/// share a line.
+static DOORBELL_RANG: [DoorbellFlag; slates_rt::registry::MAX_SHARDS] =
+  [const { DoorbellFlag(AtomicBool::new(false)) }; slates_rt::registry::MAX_SHARDS];
+
+/// A daemon's doorbell flag on its own cache line (see [`DOORBELL_RANG`]).
+#[repr(align(128))]
+struct DoorbellFlag(AtomicBool);
+
+/// The doorbell flag of the daemon whose control shard is `control` (see [`DOORBELL_RANG`]).
+fn doorbell_flag(control: u16) -> &'static AtomicBool {
+  &DOORBELL_RANG
+    .get(usize::from(control))
+    .unwrap_or(&DOORBELL_RANG[0])
+    .0
+}
 /// Shape: pending NFS connections the kernel queues before the accept loop takes them. A mount opens a
 /// small, bounded number of connections; the OS clamps the backlog to the system maximum anyway. Unix
 /// only, with the NFS transport.
@@ -151,8 +172,88 @@ fn nfs_listener() -> Result<TcpListener, RtError> {
 }
 /// Shards whose initialization refused (a health signal; the daemon serves the rest).
 pub static INIT_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Clients handed to a shard that had no state to take them (a health signal).
+/// Clients handed to a shard that could not seat them — no state to take them, the seat task refused by
+/// the shard's arena and dropped unrun, the shard's client table full — each with its id given back to
+/// the control shard's live set (a health signal; before 2026-09-14 a refused seat kept the id, so the
+/// client reconnected under it, was told `SessionTaken`, and the node refused every client once the bound
+/// was consumed: `docs/bugs/2026-09-14-fleet-tasks-outside-the-task-budget-poison-client-admission.md`).
 pub static HANDOFF_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Client ids that could not be given back to the control shard's live set after a lost handoff or a
+/// reaped client (the control shard's channel full or gone when the forget task was sent): each is a
+/// slot of the client bound held until the daemon restarts, counted here and logged once, never silent.
+pub static RELEASE_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Accept rounds of the rendezvous that ended in an error other than a typed refusal (a peer's socket
+/// refusing mid-handoff, a region that could not be created): counted here and logged once, where before
+/// the round's error was dropped and the peer left with no handoff.
+pub static ACCEPTS_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Gives `client_id` back to the control shard's live set (`state::with_handed`), from any shard: directly
+/// when the caller runs on the control shard, otherwise as a forget task on it (sharing by move). A forget
+/// task the control shard's channel refuses is counted `RELEASE_LOST` and logged once — the id then holds a
+/// slot of the client bound until the daemon restarts, a visible fault rather than a silent one. The one
+/// release path for a reaped client (`verbs::reap_client`) and a lost admission ([`Admission`]).
+pub(crate) fn release_client_id(client_id: u32, control: u16) {
+  if registry::current_shard() == Some(control) {
+    state::with_handed(|handed| {
+      handed.remove(&client_id);
+    });
+    return;
+  }
+  let forget = Box::new(SpawnRequest::new(
+    Box::pin(async move {
+      state::with_handed(|handed| {
+        handed.remove(&client_id);
+      });
+    }),
+    None,
+  ));
+  if let Err(e) = registry::send_control(control, Control::Spawn(forget))
+    && RELEASE_LOST.fetch_add(1, Ordering::AcqRel) == 0
+  {
+    eprintln!(
+      "slates-server: client {client_id}'s id could not be given back to the control shard: {e} (first \
+       occurrence; later ones are counted)"
+    );
+  }
+}
+
+/// One client's admission, from its id's entry in the control shard's live set to its seat on its shard.
+/// Moved into the seat task; dropped **unseated** — the task refused by the shard's arena and dropped
+/// unrun, or the shard's client table refusing the slot — it gives the id back and counts the lost
+/// handoff, so a refused admission never leaks an id (cancellation safety by construction: the terminal
+/// step owns the release).
+struct Admission {
+  client_id: u32,
+  control: u16,
+  seated: bool,
+}
+
+impl Admission {
+  /// The terminal step: the client's slot is in its shard's table. A method, not a field write, so the
+  /// seat task captures the **whole** guard: an `async move` block captures a `Copy` field it assigns
+  /// (`seated`) by copy and leaves the guard behind in the accept loop, where it dropped unseated at
+  /// once and gave back the id of a client that was seated (the 2021 disjoint-capture rule; found by
+  /// the typed-refusal test on 2026-09-14).
+  fn seat(&mut self) {
+    self.seated = true;
+  }
+}
+
+impl Drop for Admission {
+  fn drop(&mut self) {
+    if self.seated {
+      return;
+    }
+    release_client_id(self.client_id, self.control);
+    if HANDOFF_LOST.fetch_add(1, Ordering::AcqRel) == 0 {
+      eprintln!(
+        "slates-server: client {}'s seat was refused by its shard; its id is given back (first \
+         occurrence; later ones are counted)",
+        self.client_id
+      );
+    }
+  }
+}
 /// Volumes the recovered catalog holds that a shard could not rebuild (a health signal).
 pub static RECOVERY_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -332,7 +433,11 @@ impl Daemon {
       Some((object, offset)) => Waits::Word { object, offset },
       None => Waits::Socket(listener.raw_fd().unwrap_or(-1)),
     };
-    let doorbell = DoorbellThread::start(waits, kicks, &DOORBELL_RANG);
+    let doorbell = DoorbellThread::start(
+      waits,
+      kicks,
+      doorbell_flag(shards.first().map_or(0, |shard| shard.0)),
+    );
     let control_config = config.clone();
     let control_env = segment.handoff_env()?;
     let control_identity = identity.clone();
@@ -1656,11 +1761,13 @@ async fn control_loop(
   let Ok(segment) = AnchorSegment::attach(&handoff, len, &identity) else {
     return;
   };
+  // This loop runs on the control shard, the first of `shards`; its doorbell flag is that shard's.
+  let control = shards.first().map_or(0, |shard| shard.0);
   if let Some(task) = futures::current_task() {
     let _ = registry::with_current(|ctx| {
       ctx.register_poller(
         task,
-        Box::new(|| DOORBELL_RANG.swap(false, Ordering::AcqRel)),
+        Box::new(move || doorbell_flag(control).swap(false, Ordering::AcqRel)),
       )
     });
   }
@@ -1690,25 +1797,66 @@ async fn control_loop(
           CLIENTS_REFUSED.fetch_add(1, Ordering::AcqRel);
           return Err(slates_ipc::IpcError::TooManyClients { limit: bound });
         }
+        // The id is reserved in the live set **here**, at admission, not once the accept round returns:
+        // an accept round serves every pending connection before it returns, so a burst of connects
+        // inside one round was admitted against a live set that did not yet count the earlier ones —
+        // the bound of one admitted two (2026-09-14). A region that cannot be created gives the
+        // reservation back at once.
+        state::with_handed(|h| h.insert(client_id));
         let shard = shards[usize::try_from(client_id).unwrap_or(0) % shards.len().max(1)];
-        let region = ClientRegion::create(
+        let region = match ClientRegion::create(
           &format!("slates-cr-{}-{client_id}", config.instance),
           client_id,
           shard.0,
           config.region,
-        )?;
+        ) {
+          Ok(region) => region,
+          Err(e) => {
+            state::with_handed(|h| h.remove(&client_id));
+            return Err(e);
+          }
+        };
         Ok(Prepared {
           region,
           kick_fd: kick_fd_of(shard),
         })
       },
     );
-    if let Ok(accepted) = accepted {
+    let accepted = match accepted {
+      Ok(accepted) => accepted,
+      // The client was admitted (its id reserved) and its handoff then failed: the id goes back, the
+      // loss is counted and logged once. Any other failure of the round is counted and logged once;
+      // the round admitted nothing.
+      Err(slates_ipc::IpcError::HandoffLost { client_id, cause }) => {
+        state::with_handed(|h| h.remove(&client_id));
+        if HANDOFF_LOST.fetch_add(1, Ordering::AcqRel) == 0 {
+          eprintln!(
+            "slates-server: client {client_id}'s handoff failed after admission: {cause} (first \
+             occurrence; later ones are counted)"
+          );
+        }
+        Vec::new()
+      }
+      Err(e) => {
+        if ACCEPTS_FAILED.fetch_add(1, Ordering::AcqRel) == 0 {
+          eprintln!(
+            "slates-server: a rendezvous accept round failed: {e} (first occurrence; later ones are \
+             counted)"
+          );
+        }
+        Vec::new()
+      }
+    };
+    {
       for a in accepted {
         let shard = ShardId(a.region.shard());
         let principal = Principal::Uid { uid: a.uid };
         let client_id = a.client_id;
-        state::with_handed(|h| h.insert(client_id));
+        let mut admission = Admission {
+          client_id,
+          control,
+          seated: false,
+        };
         // Dup the completion eventfd (Linux) for the daemon's end to nudge on a reply to a parked
         // client, so an async SDK event loop wakes (D-19); the original stays in the slot's control for
         // liveness. macOS/Windows have no completion fd yet.
@@ -1726,7 +1874,7 @@ async fn control_loop(
             // a wake makes it mark the new client too before it idles again.
             let server = state::with_state(|s| {
               let last_seen_ns = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
-              if let Err(e) = s.clients.insert(ClientSlot {
+              match s.clients.insert(ClientSlot {
                 end,
                 principal,
                 client_id,
@@ -1735,7 +1883,10 @@ async fn control_loop(
                 control,
                 revoked: false,
               }) {
-                eprintln!("slates-server: client {client_id} refused by the shard's table: {e}");
+                Ok(_) => admission.seat(),
+                Err(e) => {
+                  eprintln!("slates-server: client {client_id} refused by the shard's table: {e}");
+                }
               }
               s.server_task
             });
@@ -1846,6 +1997,74 @@ mod limits {
 mod tests {
   use super::registered_chokepoints;
   use slates_wire::observe::Chokepoint;
+
+  /// Shape: a runtime for the admission guard's test — one shard, a few task slots.
+  fn guard_runtime() -> slates_rt::runtime::LocalRuntime {
+    slates_rt::runtime::LocalRuntime::new(&slates_rt::runtime::RuntimeConfig {
+      shards: 1,
+      tasks_per_shard: 8,
+      timers_per_shard: 8,
+      ring_entries: 8,
+      step_budget_ns: 1_000_000,
+      timer_tick_ns: 100_000,
+      batch: 8,
+      pin: false,
+      cores: Vec::new(),
+      page_bytes: 4096,
+      spin_ns: 0,
+    })
+    .expect("a local runtime")
+  }
+
+  /// AC-2.6 (a refused admission never leaks an id): the seat task moved onto a shard and dropped
+  /// **unrun** — what a full task arena does to it — gives the client's id back to the live set; a task
+  /// that seats its client keeps the id. Do: on a shard, reserve two ids; build two guards; drop one
+  /// unseated and the other after `seat`. Expect: the unseated one's id is gone from the live set, the
+  /// seated one's stays, and the lost-handoff count moved by exactly one. On the guard's own shard the
+  /// release is direct; from another shard it is a forget task, exercised by the daemon tests' multi-
+  /// shard admissions.
+  #[test]
+  fn an_admission_dropped_unseated_gives_its_id_back() {
+    let runtime = guard_runtime();
+    let shard = runtime.shard_id().0;
+    let (tx, rx) = std::sync::mpsc::channel();
+    runtime
+      .spawn(async move {
+        crate::state::with_handed(|handed| {
+          handed.insert(41);
+          handed.insert(42);
+        });
+        let lost_before = super::HANDOFF_LOST.load(std::sync::atomic::Ordering::Acquire);
+        let unseated = super::Admission {
+          client_id: 41,
+          control: shard,
+          seated: false,
+        };
+        let mut seated = super::Admission {
+          client_id: 42,
+          control: shard,
+          seated: false,
+        };
+        seated.seat();
+        drop(unseated);
+        drop(seated);
+        let live = crate::state::with_handed(|handed| handed.clone());
+        let lost = super::HANDOFF_LOST.load(std::sync::atomic::Ordering::Acquire) - lost_before;
+        let _ = tx.send((live, lost));
+      })
+      .expect("the task is admitted");
+    runtime.run_until_idle();
+    let (live, lost) = rx.try_recv().expect("the task reported");
+    assert!(
+      !live.contains(&41),
+      "the unseated admission's id was given back: {live:?}"
+    );
+    assert!(
+      live.contains(&42),
+      "the seated admission's id stays live: {live:?}"
+    );
+    assert_eq!(lost, 1, "one lost handoff counted");
+  }
 
   /// AC (§4.8 "Recovery", task #22; docs/bugs/2026-09-14-anchored-first-boot-generation-off-by-one.md): a
   /// node's member id on a **first boot** is the manifest's precomputed gen-0 seed, whether it runs under an

@@ -93,6 +93,8 @@ pub struct Listener {
   next_client: u32,
   /// Cross-uid connects refused (the audit counter of §4.13).
   refused: u64,
+  /// Connects refused at the daemon's client bound, each answered typed (AC-2.6).
+  capacity_refused: u64,
 }
 
 impl std::fmt::Debug for Listener {
@@ -111,6 +113,7 @@ impl Listener {
       inner: platform::Listener::open(instance)?,
       next_client: 1,
       refused: 0,
+      capacity_refused: 0,
     })
   }
 
@@ -144,6 +147,9 @@ impl Listener {
         }
         Ok(None) => break,
         Err(IpcError::PeerRefused { .. }) => self.refused += 1,
+        // Answered typed to the client by the platform's `accept_one` (the bound in the refusal),
+        // counted here, and the next pending connection is served: a full daemon keeps answering.
+        Err(IpcError::TooManyClients { .. }) => self.capacity_refused += 1,
         Err(e) => return Err(e),
       }
     }
@@ -153,6 +159,11 @@ impl Listener {
   /// Cross-uid connects refused so far.
   pub fn refused(&self) -> u64 {
     self.refused
+  }
+
+  /// Connects refused at the client bound so far, each answered typed.
+  pub fn capacity_refused(&self) -> u64 {
+    self.capacity_refused
   }
 
   /// The daemon-wide doorbell word clients ring when a shard is parked (macOS, Windows: the
@@ -318,6 +329,10 @@ pub mod platform {
   const HANDOFF_AT_LEN: usize = 4;
   /// Format: descriptors in the handoff: the region, the completion eventfd, the shard's kick.
   const HANDOFF_FDS: usize = 3;
+  /// Format: the client id a refusal handoff names — never assigned (a hello of zero asks for a fresh
+  /// id), so a handoff naming it carries no region: its length word is the client bound the connect
+  /// was refused at (`IpcError::TooManyClients`).
+  const REFUSED_CLIENT: u32 = 0;
   /// Shape: the listen backlog (connections pending accept); the control shard drains them
   /// every loop, so the backlog only covers one loop of arrivals.
   const BACKLOG: i32 = 64;
@@ -450,12 +465,33 @@ pub mod platform {
         0
       };
       let client_id = assign(wanted);
-      let Prepared { region, kick_fd } = make_region(client_id)?;
-      let (handoff, len) = region.handoff()?;
+      let Prepared { region, kick_fd } = match make_region(client_id) {
+        Ok(prepared) => prepared,
+        // The bound is reached: the client is told so, typed — a handoff naming client `REFUSED_CLIENT`
+        // with the bound in the length word and no descriptors — where before the socket was dropped
+        // and the client read a short handoff it could not interpret (2026-09-14).
+        Err(IpcError::TooManyClients { limit }) => {
+          let mut body = [0u8; HANDOFF_BYTES];
+          body[HANDOFF_AT_CLIENT..HANDOFF_AT_LEN].copy_from_slice(&REFUSED_CLIENT.to_le_bytes());
+          body[HANDOFF_AT_LEN..]
+            .copy_from_slice(&u64::try_from(limit).unwrap_or(u64::MAX).to_le_bytes());
+          rustix::net::send(&peer, &body, SendFlags::empty()).map_err(|e| refused("send", e))?;
+          return Err(IpcError::TooManyClients { limit });
+        }
+        Err(e) => return Err(e),
+      };
+      // From here the client holds an id the daemon reserved: a failure is reported with that id so
+      // the daemon gives it back (`IpcError::HandoffLost`), never a reservation held for a client that
+      // was never seated.
+      let lost = |cause: IpcError| IpcError::HandoffLost {
+        client_id,
+        cause: Box::new(cause),
+      };
+      let (handoff, len) = region.handoff().map_err(lost)?;
       let Handoff::Descriptor(raw) = handoff else {
-        return Err(IpcError::Layout {
+        return Err(lost(IpcError::Layout {
           reason: "a Linux region hands off a descriptor",
-        });
+        }));
       };
       let kick = match kick_fd {
         Some(fd) => rustix::io::dup(
@@ -463,9 +499,9 @@ pub mod platform {
           // leaked for the process; borrowing it for the duplicate is sound.
           unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
         )
-        .map_err(|e| refused("dup", e))?,
+        .map_err(|e| lost(refused("dup", e)))?,
         None => rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
-          .map_err(|e| refused("eventfd", e))?,
+          .map_err(|e| lost(refused("eventfd", e)))?,
       };
       // SAFETY: the number is the duplicate `handoff` created for a child to inherit; this
       // process owns it and closes it after the send.
@@ -474,7 +510,7 @@ pub mod platform {
         0,
         rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
       )
-      .map_err(|e| refused("eventfd", e))?;
+      .map_err(|e| lost(refused("eventfd", e)))?;
       let mut body = [0u8; HANDOFF_BYTES];
       body[HANDOFF_AT_CLIENT..HANDOFF_AT_LEN].copy_from_slice(&client_id.to_le_bytes());
       body[HANDOFF_AT_LEN..].copy_from_slice(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
@@ -489,7 +525,7 @@ pub mod platform {
         &mut control,
         SendFlags::empty(),
       )
-      .map_err(|e| refused("sendmsg", e))?;
+      .map_err(|e| lost(refused("sendmsg", e)))?;
       Ok(Some(Accepted {
         client_id,
         uid,
@@ -533,6 +569,17 @@ pub mod platform {
     if received.bytes != HANDOFF_BYTES {
       return Err(IpcError::Layout {
         reason: "short handoff message",
+      });
+    }
+    let mut client_word = [0u8; size_of::<u32>()];
+    client_word.copy_from_slice(&body[HANDOFF_AT_CLIENT..HANDOFF_AT_LEN]);
+    if u32::from_le_bytes(client_word) == REFUSED_CLIENT {
+      // The daemon's typed refusal: no region, the bound in the length word (any descriptor that
+      // came with it is closed with `control`).
+      let mut limit_word = [0u8; size_of::<u64>()];
+      limit_word.copy_from_slice(&body[HANDOFF_AT_LEN..HANDOFF_BYTES]);
+      return Err(IpcError::TooManyClients {
+        limit: usize::try_from(u64::from_le_bytes(limit_word)).unwrap_or(usize::MAX),
       });
     }
     let mut fds: Vec<OwnedFd> = Vec::new();
@@ -621,6 +668,11 @@ pub mod platform {
   const READY: u32 = 2;
   /// Format: the client opened the region; the daemon reclaims the slot.
   const DONE: u32 = 3;
+  /// Format: the daemon refused the claim at its client bound: the bound is in the slot's length
+  /// word, no region is named; the client reads it typed (`IpcError::TooManyClients`) and marks the
+  /// slot `DONE`. Before 2026-09-14 a refused claim was left `CLAIMED` and the client waited out
+  /// its claim wait to report the daemon unavailable.
+  const REFUSED: u32 = 4;
   /// Shape: how long a client waits for the daemon to answer a claim before reporting it
   /// unavailable (nanoseconds): the control shard's loop is microseconds, so a second is a
   /// dead daemon.
@@ -775,17 +827,37 @@ pub mod platform {
               ])
             };
             let client_id = assign(wanted);
-            let Prepared { region, .. } = make_region(client_id)?;
-            let (handoff, len) = region.handoff()?;
+            let Prepared { region, .. } = match make_region(client_id) {
+              Ok(prepared) => prepared,
+              Err(IpcError::TooManyClients { limit }) => {
+                let at = slot_at(i);
+                self.object.bytes_mut()[at + AT_LEN..at + AT_LEN + 8]
+                  .copy_from_slice(&u64::try_from(limit).unwrap_or(u64::MAX).to_le_bytes());
+                let word = state(&self.object, i)?;
+                word.store(REFUSED, Ordering::Release);
+                wake::wake_one(word)?;
+                #[cfg(windows)]
+                let _ = self.ready_event.signal();
+                return Err(IpcError::TooManyClients { limit });
+              }
+              Err(e) => return Err(e),
+            };
+            // From here the client holds an id the daemon reserved: a failure is reported with that
+            // id so the daemon gives it back (`IpcError::HandoffLost`).
+            let lost = |cause: IpcError| IpcError::HandoffLost {
+              client_id,
+              cause: Box::new(cause),
+            };
+            let (handoff, len) = region.handoff().map_err(lost)?;
             let Handoff::Name(name) = handoff else {
-              return Err(IpcError::Layout {
+              return Err(lost(IpcError::Layout {
                 reason: "a region here hands off a name",
-              });
+              }));
             };
             if name.len() > NAME_BYTES {
-              return Err(IpcError::Layout {
+              return Err(lost(IpcError::Layout {
                 reason: "region name longer than the slot holds",
-              });
+              }));
             }
             let at = slot_at(i);
             let pid = {
@@ -805,9 +877,9 @@ pub mod platform {
               bytes[at + AT_NAME..at + AT_NAME + NAME_BYTES].fill(0);
               bytes[at + AT_NAME..at + AT_NAME + name.len()].copy_from_slice(name.as_bytes());
             }
-            let word = state(&self.object, i)?;
+            let word = state(&self.object, i).map_err(lost)?;
             word.store(READY, Ordering::Release);
-            wake::wake_one(word)?;
+            wake::wake_one(word).map_err(lost)?;
             // Cross-process wake for the waiting client on Windows (the word wake above is
             // process-local there, D-10); the auto-reset Event holds a signal raised before the
             // client waits, so a served-before-the-wait claim is not lost.
@@ -922,6 +994,18 @@ pub mod platform {
         let now = word.load(Ordering::Acquire);
         if now == READY {
           break;
+        }
+        if now == REFUSED {
+          // The daemon's typed refusal at its client bound: read the bound, give the slot back.
+          let limit = u64::from_le_bytes(
+            object.bytes()[at + AT_LEN..at + AT_LEN + 8]
+              .try_into()
+              .unwrap_or([0; 8]),
+          );
+          word.store(DONE, Ordering::Release);
+          return Err(IpcError::TooManyClients {
+            limit: usize::try_from(limit).unwrap_or(usize::MAX),
+          });
         }
         let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if elapsed >= CLAIM_WAIT_NS {

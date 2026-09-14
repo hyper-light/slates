@@ -713,6 +713,12 @@ pub struct ShardReport {
   pub council: GroupReport,
   /// The root group across regions as this shard holds it (live on the control shard).
   pub root: GroupReport,
+  /// Task admissions this shard's runtime arena refused since boot (§4.3 "a task exceeding the budget
+  /// is a counted bug signal"; §4.14): the shard's derived task budget covers every task the daemon
+  /// spawns on it — clients' cross-shard work, its own loops, the fleet's share — so a count here is a
+  /// sizing defect surfacing, never expected load. A refused client admission is what left a fleet
+  /// node unable to seat any client on 2026-09-14.
+  pub tasks_refused: u64,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.

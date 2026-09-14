@@ -2818,3 +2818,59 @@ fn the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier()
   green_attachment_scenario();
   submission_barrier_scenario();
 }
+
+/// Shape: how long a refused connect may take to be answered — well inside the bootstrap claim wait
+/// (a second), which is what a client that was never answered used to spend before reporting the daemon
+/// unavailable; a typed refusal is a reply, not a timeout.
+const REFUSAL_ANSWER: Duration = Duration::from_millis(500);
+
+/// AC-2.6 (§4.7 admission: "refused typed beyond it"), by use: a connect past the daemon's derived client
+/// bound is refused **typed** — `IpcError::TooManyClients { limit }` — at the rendezvous, where before the
+/// client read a short handoff (Linux) or waited out its claim and reported the daemon unavailable (macOS,
+/// Windows): the daemon refused the region but never told the client. Do: a one-shard daemon whose client
+/// bound is one; connect one client; connect a second. Expect: the second connect answers
+/// `TooManyClients { limit: 1 }` at once (inside [`REFUSAL_ANSWER`]), the daemon's status counts one
+/// refused client, and the first client still runs verbs. Non-vacuous: the first connect succeeded, so
+/// the bound was reached, not missing.
+#[test]
+fn a_connect_past_the_client_bound_is_refused_typed_at_the_rendezvous() {
+  let profile = profile();
+  let instance = format!("srv-bound-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance).with_shards(1);
+  config.clients_per_shard = 1;
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: "slates-seg-bound".to_owned(),
+    },
+  )
+  .unwrap();
+  let mut first = Client::connect(&instance);
+  let asked = Instant::now();
+  let second = connect(&instance).map(|_| ());
+  let took = asked.elapsed();
+  let created = matches!(
+    first.call(&scratch("still-served")),
+    ReplyBody::Created { .. }
+  );
+  let refused_count = match first.call(&RequestBody::DaemonStatus) {
+    ReplyBody::DaemonStatus { report } => Some(report.clients_refused),
+    _ => None,
+  };
+  daemon.stop();
+  assert!(
+    matches!(second, Err(IpcError::TooManyClients { limit: 1 })),
+    "the second connect is refused typed at the bound of one: {second:?} (after {took:?})"
+  );
+  assert!(
+    took < REFUSAL_ANSWER,
+    "the refusal is a reply, not a timeout: {took:?}"
+  );
+  assert!(created, "the first client still runs verbs");
+  assert_eq!(
+    refused_count,
+    Some(1),
+    "the daemon's status counts the refused connect"
+  );
+}
