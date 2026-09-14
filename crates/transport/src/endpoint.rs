@@ -15,7 +15,11 @@
 //! timeout, retransmits the oldest in-flight packet ([`Connection::probe`]) — the loss-recovery and probe
 //! paths themselves are proven by the `connection` oracle. Flow-control (per-stream and connection-wide
 //! credit), congestion control, and multi-stream multiplexing are enforced by the [`Connection`] this
-//! drives; RTT is estimated here (this end holds the clock — see [`Endpoint::smoothed_rtt`]). Every
+//! drives; RTT is estimated here, on the **runtime's clock** — the same clock every timeout below sleeps
+//! on, so under the simulation driver a modelled path's delay is what the estimate measures (it sampled
+//! the wall clock until 2026-09-14, so on the fabric a 160 ms path measured as microseconds and armed a
+//! millisecond probe timeout: `docs/bugs/2026-09-14-transport-rtt-sampled-on-the-wall-clock.md`; see
+//! [`Endpoint::smoothed_rtt`]). Every
 //! 1-RTT packet carries the session's **connection id** — eight bytes both ends derive from the TLS
 //! exporter once the handshake completes ([`Endpoint::connection_id`]) — so a socket shared by several
 //! peers routes each packet to its session (`crate::demux`); an endpoint reaches the wire through its
@@ -25,11 +29,11 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::task::Poll;
-use std::time::Instant;
 
 use rustix::net::SocketAddrV4;
 use rustls::pki_types::CertificateDer;
 use rustls::quic::{KeyChange, Keys};
+use slates_rt::futures::now_ns;
 use slates_rt::udp::UdpSocket;
 
 use crate::connection::{Connection, initial_receive_window};
@@ -234,7 +238,10 @@ pub struct Endpoint {
   rtt: RttEstimator,
   /// The send time of each ack-eliciting packet still awaiting acknowledgement, keyed by packet number,
   /// for the RTT sample. Pruned as packets are acknowledged, so it stays within the in-flight window.
-  send_times: BTreeMap<u64, Instant>,
+  /// When each in-flight packet was sent, by packet number, on the runtime clock (nanoseconds) — the
+  /// clock the receive timeouts sleep on, so a sample is the path's round trip in the same time the probe
+  /// timeout is armed in.
+  send_times: BTreeMap<u64, u64>,
   /// A client's final handshake flight, kept after establishment: a raw handshake datagram arriving on
   /// an established session is a server still asking for it (its confirmation raced this end's exit
   /// from the handshake), and is answered by resending it. Empty on a server.
@@ -520,7 +527,7 @@ impl Endpoint {
   /// sent (carried in from the previous call and left for the next when the budget runs out).
   async fn establish_turns(&mut self, last_flight: &mut Vec<u8>) -> Result<(), EndpointError> {
     let mut buf = [0u8; 2048];
-    let mut sent_at: Option<Instant> = None;
+    let mut sent_at: Option<u64> = None;
     // The peer's flight this end last fed to `read_hs`. Retransmits that raced this end's reply arrive as
     // an exact re-send of a flight already consumed; `read_hs` treats its input as an ordered byte stream
     // and would fault on the repeat (a fresh `ClientHello` where it expects the client's `Finished`), so a
@@ -532,7 +539,7 @@ impl Endpoint {
       let out = self.drain_handshake();
       if !out.is_empty() {
         self.send(&out)?;
-        sent_at = Some(Instant::now());
+        sent_at = Some(now_ns());
         *last_flight = out;
       }
       if !self.quic.is_handshaking() && self.keys.is_some() {
@@ -588,10 +595,14 @@ impl Endpoint {
               }
               backoff = backoff.saturating_mul(2);
               // A server the demultiplexer opened has no flight until it has read the client's first, so it
-              // simply waits; a dialer resends its last flight.
+              // simply waits; a dialer resends its last flight. The flight's send time is **not** re-stamped
+              // (Karn's rule, RFC 6298 §3): the reply answers the flight, not its latest copy, and stamping
+              // each retransmit seeded a 160 ms path at 33 ms — the reply's arrival minus the last of the
+              // backoff's 1, 3, 7, …, 127 ms retransmits — which six real samples smoothed to only 107 ms
+              // (2026-09-14). A reply to a retransmitted flight now samples from the first send: an
+              // over-estimate when the first copy was lost, which only makes the seed more conservative.
               if !last_flight.is_empty() {
                 self.send(last_flight.as_slice())?;
-                sent_at = Some(Instant::now());
               }
             }
           }
@@ -604,9 +615,7 @@ impl Endpoint {
       // LAN commit to recover a dropped packet within its budget. A coalesced or split flight (or one that
       // followed a retransmit) makes this an approximation, which is all a seed needs to be.
       if let Some(flight) = sent_at.take() {
-        let sample = u64::try_from(Instant::now().saturating_duration_since(flight).as_nanos())
-          .unwrap_or(u64::MAX);
-        self.rtt.on_sample(sample, 0);
+        self.rtt.on_sample(now_ns().saturating_sub(flight), 0);
       }
       // Remember this flight so a later exact re-send of it (a peer retransmit) is recognized and skipped
       // above rather than fed to `read_hs` a second time.
@@ -677,9 +686,14 @@ impl Endpoint {
   /// left its own handshake — or, as a fallback for a client that establishes but then sends nothing,
   /// once the client has fallen silent for [`HANDSHAKE_CONFIRM_SILENCE`] backoff intervals grown to the
   /// ceiling (roughly a second of quiet — far longer than the client's own matched backoff would leave a
-  /// still-needed flight unretransmitted). A datagram that unprotects as 1-RTT is dropped, not ingested:
-  /// the client's exchange retransmits it to the serve loop this returns into, so no half-consumed
-  /// request is left buffered where that loop would deadlock. Bounded overall by
+  /// still-needed flight unretransmitted). That first 1-RTT datagram is **ingested**, its stream bytes left
+  /// in the connection for whichever receive the caller runs next — a serve loop drains them into its
+  /// pending requests at the top of its first iteration; a stream receive reads them directly — so the
+  /// request is served at once. It used to be dropped, leaving the client's probe-timeout retransmit to
+  /// redeliver it: invisible on a loopback, where the retransmit came a millisecond later, but on a
+  /// 160 ms path — once the estimate measured the path rather than the wall clock — it cost every
+  /// session's first exchange one probe timeout, measured 429 ms against the path's 160 ms (2026-09-14,
+  /// `docs/bugs/2026-09-14-transport-rtt-sampled-on-the-wall-clock.md`). Bounded overall by
   /// `MAX_HANDSHAKE_RETRANSMITS` silent timeouts (banned item 8).
   async fn confirm_as_server(&mut self) -> Result<(), EndpointError> {
     let mut buf = [0u8; 2048];
@@ -691,14 +705,10 @@ impl Endpoint {
       match self.recv_within(&mut buf, period).await? {
         Some((n, _)) => {
           // A datagram that unprotects under the 1-RTT keys is the client's own application traffic — it
-          // has our confirmation and moved on, so the handshake is done. Drop this datagram (do not
-          // ingest it): the client's exchange retransmits it to the serve loop this returns into.
-          let cid = self.connection_id()?;
-          let confirmed = self
-            .keys
-            .as_ref()
-            .is_some_and(|keys| unprotect_packet(keys, &cid, self.rx_largest, &buf[..n]).is_ok());
-          if confirmed {
+          // has our confirmation and moved on, so the handshake is done. Ingest it, so the receive the
+          // caller runs next finds it already in the connection rather than waiting a probe timeout for
+          // the client's retransmit of it.
+          if self.ingest(&buf[..n]).is_ok() {
             return Ok(());
           }
           // A raw handshake retransmit: the client has not heard our confirmation. Resend it, and reset
@@ -766,7 +776,7 @@ impl Endpoint {
       self.send(&datagram)?;
       // Record the send time for the RTT sample; pruned when the packet is acknowledged. A pure
       // acknowledgement packet's entry is never sampled and is swept when a later packet is acknowledged.
-      self.send_times.insert(pn, Instant::now());
+      self.send_times.insert(pn, now_ns());
     }
     Ok(())
   }
@@ -831,7 +841,7 @@ impl Endpoint {
   /// acknowledgement newly frees a packet (RFC 9002 §5.1: the round trip is now minus that packet's send
   /// time).
   fn ingest(&mut self, datagram: &[u8]) -> Result<(), EndpointError> {
-    let now = Instant::now();
+    let now = now_ns();
     let cid = self.connection_id()?;
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
     let (pn, frames) = unprotect_packet(keys, &cid, self.rx_largest, datagram)?;
@@ -840,10 +850,8 @@ impl Endpoint {
       // An acknowledgement ends a run of probe timeouts: the next timeout starts from the estimate again.
       self.pto_count = 0;
       if let Some(sent_at) = self.send_times.get(&largest) {
-        let sample =
-          u64::try_from(now.saturating_duration_since(*sent_at).as_nanos()).unwrap_or(u64::MAX);
         // This dialect does not carry the peer's reported ack delay yet, so it is zero.
-        self.rtt.on_sample(sample, 0);
+        self.rtt.on_sample(now.saturating_sub(*sent_at), 0);
       }
       // Prune the send times the acknowledgement covered, bounding the map to the in-flight window.
       self.send_times.retain(|&sent_pn, _| sent_pn > largest);
@@ -1039,6 +1047,14 @@ impl Endpoint {
     // retransmits of exchanges already served or abandoned and are discarded the same way, never served
     // twice. (`docs/bugs/2026-09-13-reused-stream-id-collides-behind-an-unacked-reply.md`.)
     let (request_id, request) = loop {
+      // Drain first, so a request already in the connection — ingested while the handshake was being
+      // confirmed, or while the previous reply awaited its acknowledgement — is found complete before any
+      // datagram is awaited; then flush *after* draining, so the acknowledgement advertises credit that
+      // reflects what was just read — draining slides the flow-control window, and advertising before it
+      // would lag a round and stall a request larger than one window at the window boundary (the flush
+      // also carries the final ACK of the datagram just received, and is a no-op with nothing to send).
+      self.drain_requests();
+      self.flush()?;
       if let Some(id) = self.newest_complete_request() {
         let request = self.pending_requests.remove(&id).unwrap_or_default();
         self.serve_floor = id.saturating_add(1);
@@ -1049,11 +1065,6 @@ impl Endpoint {
         break (id, request);
       }
       self.receive_or_probe().await?;
-      self.drain_requests();
-      // Flush *after* draining, so the acknowledgement advertises credit that reflects what was just
-      // read — draining slides the flow-control window, and advertising before it would lag a round and
-      // stall a request larger than one window at the window boundary (also carries the final ACK).
-      self.flush()?;
     };
 
     // Phase two: send the reply on the request's own stream id until the peer has acknowledged it whole.
