@@ -1332,6 +1332,7 @@ dependencies = [
  "iai-callgrind",
  "io-uring",
  "libc",
+ "loom",
  "rustix",
  "slates-machine",
  "slates-mem",

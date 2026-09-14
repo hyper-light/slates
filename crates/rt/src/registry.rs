@@ -25,6 +25,7 @@ use slates_mem::{Encoded, MpscRing};
 use crate::control::Control;
 use crate::driver::Kick;
 use crate::error::RtError;
+use crate::parking::Parking;
 use crate::shard::ShardContext;
 
 /// Shape: the bound on shard ids per process: more than any host's core count, few enough that
@@ -45,12 +46,10 @@ pub struct Entry {
   pub kick: Kick,
   /// How many times a producer found the ring full and had to spin (a tripwire, GAPS §7).
   pub ring_full_events: AtomicU64,
-  /// Whether the shard is parked in its driver: set by the shard before it waits (and
-  /// re-checked against what may have arrived), cleared when it wakes; a sender kicks only a
-  /// parked shard, so a message to a spinning shard costs no syscall (§4.7 "Wake strategy").
-  pub parked: AtomicBool,
-  /// Kicks skipped because the shard was spinning (the saving, counted).
-  pub kicks_skipped: AtomicU64,
+  /// The shard's parking announcement and the kicks it saved: a sender kicks only a parked
+  /// shard, so a message to a spinning shard costs no syscall (§4.7 "Wake strategy"; the
+  /// protocol and its loom model live in [`crate::parking`]).
+  pub parking: Parking,
 }
 
 static ENTRIES: [OnceLock<&'static Entry>; MAX_SHARDS] = [const { OnceLock::new() }; MAX_SHARDS];
@@ -79,8 +78,7 @@ pub fn register(
     control_pending: AtomicBool::new(false),
     kick,
     ring_full_events: AtomicU64::new(0),
-    parked: AtomicBool::new(false),
-    kicks_skipped: AtomicU64::new(0),
+    parking: Parking::new(),
   }));
   let _ = ENTRIES[usize::from(id)].set(entry);
   Ok((id, receiver))
@@ -137,19 +135,7 @@ pub fn send_foreign(target: u16, word: u64) {
       }
     }
   }
-  kick_if_parked(entry);
-}
-
-/// Kicks the shard's driver when the shard is parked in it. The push or the pending flag was
-/// stored before this load and the shard stores its parked flag before its own re-check, both
-/// sequentially consistent, so either the shard sees the message or this sees the shard
-/// parked; a lost wake needs both to miss, which the total order forbids.
-fn kick_if_parked(entry: &Entry) {
-  if entry.parked.load(Ordering::SeqCst) {
-    entry.kick.kick();
-  } else {
-    entry.kicks_skipped.fetch_add(1, Ordering::Relaxed);
-  }
+  entry.parking.kick_if_parked(|| entry.kick.kick());
 }
 
 /// Sends a control message to a shard from any thread and kicks it; refused when the shard's
@@ -159,7 +145,7 @@ pub fn send_control(target: u16, message: Control) -> Result<(), RtError> {
   match entry.control.try_send(message) {
     Ok(()) => {
       entry.control_pending.store(true, Ordering::SeqCst);
-      kick_if_parked(entry);
+      entry.parking.kick_if_parked(|| entry.kick.kick());
       Ok(())
     }
     Err(TrySendError::Full(_)) => Err(RtError::ControlFull { shard: target }),

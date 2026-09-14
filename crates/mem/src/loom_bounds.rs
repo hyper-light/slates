@@ -56,7 +56,8 @@ pub fn builder() -> loom::model::Builder {
 /// Checks `model` under the bounds and returns how many executions loom explored, printing the
 /// count under the model's `name` so a run's record does not depend on loom's own logging. The
 /// counter is a leaked word the model closure bumps once per execution (loom calls the closure
-/// once per explored interleaving).
+/// once per explored interleaving). A failing model reports the count reached before the
+/// failing interleaving, then fails as loom reported it.
 ///
 /// # Panics
 ///
@@ -65,11 +66,17 @@ pub fn builder() -> loom::model::Builder {
 /// past the branch cap.
 pub fn explore(name: &str, model: impl Fn() + Send + Sync + 'static) -> u64 {
   let explored: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
-  builder().check(move || {
-    explored.fetch_add(1, Ordering::Relaxed);
-    model();
-  });
+  let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    builder().check(move || {
+      explored.fetch_add(1, Ordering::Relaxed);
+      model();
+    });
+  }));
   let count = explored.load(Ordering::Relaxed);
+  if let Err(failure) = outcome {
+    eprintln!("loom: {name}: failed at interleaving {count} (preemption bound {PREEMPTION_BOUND})");
+    std::panic::resume_unwind(failure);
+  }
   eprintln!("loom: {name}: explored {count} interleavings (preemption bound {PREEMPTION_BOUND})");
   assert!(count > 0, "loom: {name}: explored no interleaving");
   count

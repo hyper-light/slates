@@ -414,3 +414,136 @@ mod tests {
     assert_eq!(slab.slots(), 8);
   }
 }
+
+// Two attributes rather than `all(test, loom)`: clippy's test-context rule (unwrap allowed in
+// tests) recognizes only a bare `cfg(test)`, and an unwrap here is a failed model, as it should be.
+#[cfg(test)]
+#[cfg(loom)]
+mod loom_tests {
+  use std::sync::atomic::{AtomicU64, Ordering};
+
+  use super::*;
+  use crate::handle::Encoded;
+  use crate::loom_bounds;
+  use crate::mpsc::MpscRing;
+  use crate::ring::SpscRing;
+
+  /// Shape: the owning shard's id in the packed word; the peer routes the word back by it.
+  const SHARD: u16 = 3;
+  /// Shape: the rings' capacity, the smallest power of two; each ring carries one word.
+  const RING_CAPACITY: usize = 2;
+  /// Shape: the slab's segment and bound, one slot, so the reuse must land in the freed slot.
+  const SLOTS: usize = 1;
+  /// Format: the slot's first occupant and its replacement, distinct so a read tells them apart.
+  const FIRST: u64 = 0x11;
+  /// Format: the replacement.
+  const SECOND: u64 = 0x22;
+
+  /// Requests that found their handle live, across every explored interleaving.
+  static LIVE_HITS: AtomicU64 = AtomicU64::new(0);
+  /// Requests refused as stale, across every explored interleaving.
+  static STALE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+  /// Applies a request that came back from the peer: the packed word names a handle; a live one
+  /// reads the occupant it was issued for, a stale one is the typed refusal, and nothing else.
+  fn apply(slab: &Slab<u64>, word: u64) {
+    let encoded = Encoded::from_word(word);
+    assert_eq!(encoded.shard(), SHARD, "routed back to its owner");
+    let handle: Handle<u64> = Handle::from_raw(encoded.slot(), encoded.generation());
+    match slab.get(handle) {
+      Ok(value) => {
+        assert_eq!(
+          *value, FIRST,
+          "a live handle names the occupant it was issued for"
+        );
+        LIVE_HITS.fetch_add(1, Ordering::Relaxed);
+      }
+      Err(MemError::StaleHandle { index, generation }) => {
+        assert_eq!((index, generation), (handle.index(), handle.generation()));
+        STALE_MISSES.fetch_add(1, Ordering::Relaxed);
+      }
+      Err(other) => panic!("a stale handle is refused as such, not {other:?}"),
+    }
+  }
+
+  /// T-0.1 under loom (AC-0.7, the handle core): the owning shard issues a handle and publishes
+  /// it to a peer thread over a ring; the peer's request naming the handle travels back over the
+  /// shard's multi-producer ring while the shard frees the slot and reuses it. In every
+  /// interleaving the request either finds the handle live and reads the first occupant, or is
+  /// refused as stale with the handle's own index and generation; it never reads the new
+  /// occupant. Both outcomes are reached in some interleaving.
+  ///
+  /// The handle is published before the peer starts and the shard yields once after starting
+  /// it, so both orders are explored: the yield makes "the peer completes before the shard's
+  /// first look" loom's initial schedule, and the other order comes from loom letting the
+  /// shard's acquire load read the older sequence (nothing synchronizes the two threads before
+  /// the join). Without both, loom never reached the live outcome (measured 2026-09-13: a peer
+  /// spinning for the publication is re-run only when the shard yields, 19 interleavings; and
+  /// loom's partial-order reduction backtracks only the shard's last look at the requests, the
+  /// drain after the reuse, 5 interleavings). The return path is the concurrent one, and the
+  /// one the doctrine is about.
+  #[test]
+  fn a_handle_returning_after_its_slot_was_reused_is_a_typed_miss_never_the_new_occupant() {
+    loom_bounds::explore(
+      "handles: a handle crossing threads against its slot's reuse",
+      || {
+        let to_peer: &'static SpscRing = Box::leak(Box::new(SpscRing::new(RING_CAPACITY).unwrap()));
+        let from_peer: &'static MpscRing =
+          Box::leak(Box::new(MpscRing::new(RING_CAPACITY).unwrap()));
+        let (mut publish, receive) = to_peer.split();
+        let mut slab: Slab<u64> = Slab::new(SLOTS, SLOTS);
+        let first = slab.insert(FIRST).unwrap();
+        publish.push(first.encode(SHARD).unwrap().word()).unwrap();
+        let peer = loom::thread::spawn(move || {
+          let mut receive = receive;
+          let word = receive.pop().expect("published before the peer started");
+          // The request back names the handle by the packed word it arrived as.
+          let mut pending = word;
+          while let Err(back) = from_peer.push(pending) {
+            pending = back;
+            loom::thread::yield_now();
+          }
+        });
+        let mut requests = from_peer.consumer();
+        let mut applied = 0;
+        // Give the peer its first chance to run before the shard's first look (the doc above).
+        loom::thread::yield_now();
+        // First chance: the request may already be back.
+        if let Some(word) = requests.pop() {
+          apply(&slab, word);
+          applied += 1;
+        }
+        // The slot is freed and reused under a new generation.
+        assert_eq!(slab.remove(first).unwrap(), FIRST);
+        let second = slab.insert(SECOND).unwrap();
+        assert_eq!(second.index(), first.index(), "the freed slot was reused");
+        assert_ne!(second.generation(), first.generation());
+        // Second chance: the one request is applied exactly once.
+        while applied < 1 {
+          match requests.pop() {
+            Some(word) => {
+              apply(&slab, word);
+              applied += 1;
+            }
+            None => loom::thread::yield_now(),
+          }
+        }
+        peer.join().unwrap();
+        assert_eq!(
+          *slab.get(second).unwrap(),
+          SECOND,
+          "the new occupant is untouched"
+        );
+        assert!(matches!(slab.get(first), Err(MemError::StaleHandle { .. })));
+      },
+    );
+    assert!(
+      LIVE_HITS.load(Ordering::Relaxed) > 0,
+      "some interleaving applied the request while the handle was live"
+    );
+    assert!(
+      STALE_MISSES.load(Ordering::Relaxed) > 0,
+      "some interleaving applied the request after the slot's reuse"
+    );
+  }
+}
