@@ -1554,8 +1554,8 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
 }
 
 /// Whether a verb changes the set of volumes or a volume's roots, so the shard must republish its
-/// recovery image (§4.8). Data-plane content writes go through the bridge, not here, and carry their
-/// own barrier (owed with the mount path, docs/wip/recovery.md).
+/// recovery image (§4.8). Data-plane content writes go through the mount transport, not here, and
+/// stand behind the same barrier there (`crate::nfs`, after every mutating procedure).
 fn mutates_shard_image(body: &RequestBody) -> bool {
   matches!(
     body,
@@ -1600,9 +1600,22 @@ fn dispatch(
   }
   let reply = dispatch_inner(state, client_id, principal, body);
   // Publish the shard's recovery image after a successful volume-set or roots change, so a restart
-  // recovers it from anchor-owned RAM (§4.8). A refusal changed nothing, so it needs no publish.
-  if republish && !matches!(reply, ReplyBody::Refused { .. }) {
-    publish_shard(state);
+  // recovers it from anchor-owned RAM (§4.8). This runs inside the verb's completion transaction
+  // (`run_recorded`: `Db::begin` … `commit`), so the effect is published *before* the completion
+  // record commits: an acknowledged effect is always in the image, and a crash between the two
+  // leaves an image ahead of the catalog, which recovery trims back to the catalog's acknowledged
+  // state (`rebuild_recovered`). A refusal changed nothing, so it needs no publish. A refused publish
+  // is counted and surfaced (`PUBLISH_REFUSED`); the effect and its record still commit, because the
+  // database transaction has no undo — the §4.2 sizing that makes the slot always fit is the owed
+  // closure (docs/wip/recovery.md).
+  if republish
+    && !matches!(reply, ReplyBody::Refused { .. })
+    && let Err(e) = publish_shard(state)
+  {
+    eprintln!(
+      "slates-server: partition {}: a verb's effect was not published before its record: {e}",
+      state.partition
+    );
   }
   reply
 }
@@ -4100,8 +4113,9 @@ fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32) -> ReplyBody 
   // same key `serve` records and looks them up under (task #22 two-id model), never the ephemeral member
   // id: pruning under a key nothing is recorded under released no record (the windows grew unbounded,
   // banned item 8) and a retry after acknowledgement met its record again instead of `DuplicateRequest`
-  // (`docs/bugs/2026-09-13-acknowledge-prunes-under-the-ephemeral-id.md`; found independently three
-  // times the same day — also `…-acknowledge-keyed-on-ephemeral-member-id.md`).
+  // (`docs/bugs/2026-09-13-acknowledge-prunes-under-the-ephemeral-id.md`; found independently four
+  // times in two days — also `…-acknowledge-keyed-on-ephemeral-member-id.md` and
+  // `2026-09-14-ack-keyed-under-ephemeral-member-id.md`).
   let origin = state.origin_anchor.0;
   match state.db.mutate(
     &mut state.segment,
@@ -4519,33 +4533,44 @@ pub struct Rebuilt {
   /// Volumes given a live tree again.
   pub volumes: usize,
   /// Volumes the catalog holds that could not be rebuilt (logged with the reason; a health
-  /// signal, `RECOVERY_SKIPPED`).
+  /// signal, `RECOVERY_SKIPPED`): refused, never presented empty (§4.8).
   pub skipped: usize,
-  /// Snapshots the daemon's memory alone held, reconciled out of the catalog.
+  /// Local snapshots the catalog recorded that the recovery image did not carry (an image that could
+  /// not be published before the crash), reconciled out of the catalog.
   pub snapshots_dropped: usize,
   /// Attachments reconciled out of the catalog (their clients attach again).
   pub attachments_dropped: usize,
+  /// Snapshots the recovery image carried that the catalog never recorded — a crash between a
+  /// verb's publish and its completion record — dropped from the rebuilt volume, so no
+  /// unacknowledged effect is partially present (AC-2.3).
+  pub snapshots_trimmed: usize,
+  /// Volumes the catalog held as `Destroying` whose destroy this recovery completed: the old
+  /// process's cooperative slices never ran to their `VolumeDestroyed` record, and a fresh shard has
+  /// nothing of theirs to free, so the record is written here and their origins unpinned.
+  pub destroys_completed: usize,
+  /// Snapshot pins corrected to the catalog's live clones (the image carries the pins the old
+  /// process held; a destroy completing after the last publish, or a clone's record never
+  /// committing, leaves them ahead of the catalog).
+  pub pins_reconciled: usize,
   /// Merge volumes rebuilt (§4.16): greens with their persisted chain replayed, works reset to a
   /// fresh clone of their green's head (their scratch edits did not survive).
   pub merge_volumes: usize,
 }
 
-/// Rebuilds the recovered catalog's volumes into live state after a daemon start over a
-/// segment with history: each volume that is not destroyed gets a live tree again (an
-/// overlay's base re-opened from the recorded path, a scratch empty; RAM only, so what the
-/// old process held is gone: R1, D-26), its reservation taken again, and what only that
-/// process's memory held is reconciled in the log so the catalog stays true: snapshots
-/// placed nowhere but locally are destroyed and the head reset, attachments removed.
-/// Leases keep their terms (the wheel was rebuilt by recovery) and expire on their own.
-/// Rebuilds the shard's volumes from the recovered catalog after a restart. This restores each
-/// volume's **identity and policy** (name, size, name-equivalence) from the anchor-persisted
-/// records — *not* its content: a rebuilt volume's scratch bytes are recreated **empty** and its
-/// unplaced local snapshots are dropped ([`reconcile_lost`]), because volume content (the CoW
-/// dirtree, the arena, the inode table) is not yet anchor-backed. Restoring content across a
-/// restart is BUG-11 / GAP-A9-6 (§4.8, D-18): the owed re-architecture that persists content roots,
-/// bytes and witnesses in anchor-owned RAM with an atomic recovery boundary. The counts this
-/// returns name the loss honestly (`snapshots_dropped`, `attachments_dropped`), never dress it as
-/// content survival.
+/// Rebuilds the recovered catalog's volumes into live state after a daemon start over a segment
+/// with history (§2.6 boot step 2, §4.8 "Recovery", A-9): each volume the catalog holds that is not
+/// destroyed is rebuilt from its recovery image in anchor-owned RAM — its identity and policy from
+/// the catalog record, its content, tree, snapshots and inode-number prefix from the image
+/// ([`rebuild_volume`]) — with its reservations taken again; an overlay re-opens its base from the
+/// recorded path (its diverged state in an image is the owed base gate). A scratch volume whose
+/// image is missing refuses `RecoveryIncomplete` (never presented empty, §4.8). Then what the
+/// image did not carry is reconciled in the log so the catalog stays true ([`reconcile_lost`]):
+/// a local snapshot the image lacks is destroyed and the head reset, attachments are removed. The
+/// catalog is the authority on what was acknowledged, so the image is trimmed back to it too: a
+/// snapshot the image carries that the catalog never recorded (a crash between a verb's publish
+/// and its completion record) is dropped from the rebuilt volume, so no unacknowledged effect is
+/// partially present (AC-2.3). Leases keep their terms (the wheel was rebuilt by recovery) and
+/// expire on their own. The counts name what happened, never more.
 pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   let records: Vec<VolumeRecord> = state
     .db
@@ -4580,6 +4605,7 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
         Ok(prefix) => {
           rebuilt.volumes += 1;
           max_prefix = max_prefix.max(prefix.wrapping_add(1).max(1));
+          rebuilt.snapshots_trimmed += trim_unrecorded_snapshots(state, record.id);
         }
         Err(reason) => {
           rebuilt.skipped += 1;
@@ -4598,7 +4624,91 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   // Hand out prefixes past every recovered one, so a new volume never collides with a recovered
   // volume's inode numbers (the prefixes came from the images, not from `next_prefix`).
   state.next_prefix = max_prefix;
+  rebuilt.destroys_completed = complete_recovered_destroys(state);
+  rebuilt.pins_reconciled = reconcile_clone_pins(state);
   rebuilt
+}
+
+/// Completes every destroy the catalog holds in flight (`Destroying`, §4.8): the old process marked
+/// the volume and was to free its tree in cooperative slices ending in a `VolumeDestroyed` record;
+/// the slices never ran, and a fresh shard holds nothing of the volume to free (it is not rebuilt),
+/// so the record is written now — each a recorded operation, so replay agrees — and the volume's
+/// lineage edge goes with it, which is what lets [`reconcile_clone_pins`] release its origin's pin.
+/// Returns how many were completed.
+fn complete_recovered_destroys(state: &mut ShardState) -> usize {
+  let destroying: Vec<DbVolumeId> = state
+    .db
+    .partition()
+    .volumes()
+    .into_iter()
+    .filter(|v| v.state == VolumeState::Destroying)
+    .map(|v| v.id)
+    .collect();
+  let now = state.clock.monotonic_ns();
+  let mut completed = 0;
+  for id in destroying {
+    if state
+      .db
+      .mutate(&mut state.segment, &Op::VolumeDestroyed { id }, now)
+      .is_ok()
+    {
+      completed += 1;
+    }
+  }
+  completed
+}
+
+/// Sets every rebuilt snapshot's clone pins to the catalog's live clones of it (§4.8, the catalog
+/// is the authority): the image carries the pins the old process held, which are ahead of the catalog
+/// when a clone's record never committed (a crash between its publish and its record) or when a
+/// clone's destroy completed after the last publish (the unpin is never published), and behind it
+/// when a clone's image predates... never — a clone is recorded only after its publish. A pin left
+/// ahead would refuse the snapshot's destroy forever; one left behind would free a clone's shared
+/// tree. Returns how many pins were changed.
+fn reconcile_clone_pins(state: &mut ShardState) -> usize {
+  // The catalog's live clones per (origin volume, origin snapshot).
+  let mut recorded: std::collections::BTreeMap<([u8; 16], u64), u32> =
+    std::collections::BTreeMap::new();
+  for record in state.db.partition().volumes() {
+    if matches!(
+      record.state,
+      VolumeState::Destroying | VolumeState::Destroyed
+    ) {
+      continue;
+    }
+    if let Some(edge) = state.db.partition().lineage(record.id) {
+      *recorded
+        .entry((edge.origin_volume.bytes, edge.origin_snapshot.value))
+        .or_insert(0) += 1;
+    }
+  }
+  let rebuilt: Vec<(DbVolumeId, Handle<VolumeSlot>)> =
+    state.by_id.iter().map(|(id, h)| (*id, *h)).collect();
+  let mut changed = 0;
+  for (id, handle) in rebuilt {
+    let Ok(slot) = state.volumes.get_mut(handle) else {
+      continue;
+    };
+    let snapshots: Vec<slates_vfs::ids::SnapshotId> = slot.volume.snapshot_ids().collect();
+    for snapshot in snapshots {
+      let wanted = recorded
+        .get(&(id.bytes, db_snapshot_value(snapshot)))
+        .copied()
+        .unwrap_or(0);
+      let Ok(mut held) = slot.volume.clone_pins(snapshot) else {
+        continue;
+      };
+      while held < wanted && slot.volume.pin(snapshot).is_ok() {
+        held += 1;
+        changed += 1;
+      }
+      while held > wanted && slot.volume.unpin(snapshot).is_ok() {
+        held -= 1;
+        changed += 1;
+      }
+    }
+  }
+  changed
 }
 
 /// Rebuilds a recovered green volume (§4.16, §4.8): a fresh merge engine with its persisted chain
@@ -4677,16 +4787,42 @@ fn recover_images(state: &ShardState) -> std::collections::BTreeMap<[u8; 16], Vo
   }
 }
 
+/// What a shard publish committed (§4.8): the volumes the new image carries, and the ones it could
+/// not image and left to their own recovery path.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Published {
+  /// Volumes skipped because they could not be imaged (an overlay with base-backed inodes, whose base
+  /// recovery is its own gate); every other volume of the shard is in the committed image.
+  pub skipped: Vec<DbVolumeId>,
+  /// The committed frame's bytes (the image plus its slot header), what the slot now holds.
+  pub frame_bytes: usize,
+}
+
+impl Published {
+  /// Whether the committed image carries `volume`: the barrier's question for the volume a
+  /// data-plane mutation touched.
+  pub fn captured(&self, volume: DbVolumeId) -> bool {
+    !self.skipped.contains(&volume)
+  }
+}
+
 /// Publishes the shard's volumes as one recovery image into its slice of the anchor content object
-/// (§4.8), so a restart recovers their content from anchor-owned RAM. A no-op without a content
-/// object. Efficiency gate: it re-images every volume on each call; an incremental or
-/// barrier-batched publish is owed (docs/wip/recovery.md).
-pub fn publish_shard(state: &mut ShardState) {
+/// (§4.8), so a restart recovers their content from anchor-owned RAM. This is the **barrier** every
+/// acknowledgement of a mutation stands behind (D-18): a control verb publishes before its completion
+/// record commits ([`dispatch`]), and a data-plane mutation through the mount transport publishes
+/// before its reply claims stability (`crate::nfs`). `Ok` names what the committed image carries;
+/// `Err` is a refused publish — the image did not fit its slot (`NoSpace`) or the slot could not be
+/// written — after which nothing changed since the last committed image survives a restart, so the
+/// caller must not acknowledge stability. Returns `Ok` with nothing published when the daemon has no
+/// content object (a degraded build with no anchor-backed recovery). Efficiency gate: it re-images
+/// every volume on each call; an incremental publish is the owed refinement (docs/wip/recovery.md).
+pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::VfsError> {
   let (start, end) = state.content_range;
   if state.content.is_none() || end <= start {
-    return;
+    return Ok(Published::default());
   }
   let mut keyed = Vec::new();
+  let mut published = Published::default();
   for (_, slot) in state.volumes.iter() {
     match slot.volume.to_image(&state.store) {
       Ok(image) => keyed.push(KeyedImage {
@@ -4694,7 +4830,7 @@ pub fn publish_shard(state: &mut ShardState) {
         image,
       }),
       // A volume the image cannot yet hold (an overlay with base-backed inodes, whose base recovery
-      // is its own gate) is *skipped*, not a barrier — publishing the rest of the shard, so one such
+      // is its own gate) is *skipped*, not a refusal — publishing the rest of the shard, so one such
       // volume never blocks every other volume's recovery. The skipped volume recovers by its own
       // path (an overlay reopens its base); a scratch volume that could not be imaged refuses on
       // recovery rather than presenting empty, which is contained to that volume.
@@ -4704,32 +4840,33 @@ pub fn publish_shard(state: &mut ShardState) {
           "slates-server: partition {}: a volume was not imaged, skipped: {e}",
           state.partition
         );
+        published.skipped.push(slot.id);
       }
     }
   }
   let shard = ShardImage::new(keyed);
-  if let Some(object) = state.content.as_mut()
-    && let Some(slice) = object.bytes_mut().get_mut(start..end)
-    && let Err(e) = shard.write_to(slice)
-  {
-    eprintln!(
-      "slates-server: partition {}: shard image not published: {e}",
-      state.partition
-    );
+  let Some(object) = state.content.as_mut() else {
+    return Ok(Published::default());
+  };
+  let Some(slice) = object.bytes_mut().get_mut(start..end) else {
+    return Err(slates_vfs::VfsError::NoSpace);
+  };
+  match shard.write_to(slice) {
+    Ok(frame_bytes) => {
+      published.frame_bytes = frame_bytes;
+      Ok(published)
+    }
+    Err(e) => {
+      crate::daemon::PUBLISH_REFUSED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+      eprintln!(
+        "slates-server: partition {}: shard image not published: {e}",
+        state.partition
+      );
+      Err(e)
+    }
   }
 }
 
-/// One recovered volume's live tree, reservation and slot.
-/// Recreates one volume from its catalog record: a fresh, **empty** scratch volume with the
-/// record's identity, size policy and name-equivalence. It does not restore content — the bytes an
-/// agent had written before the restart are gone until content is anchor-backed (BUG-11 /
-/// GAP-A9-6). An overlay volume's base is still on disk, so its untouched base entries are served
-/// again; only the in-memory overlay (the diverged, copied-up state) is lost.
-/// Rebuilds one recovered volume into the shard's store, returning its inode-number prefix (so the
-/// caller advances `next_prefix` past it). A scratch volume is rebuilt from its recovery image when
-/// one is present (its content, tree and prefix restored, §4.8); with a content object but no image
-/// the volume's content was lost, which refuses (`RecoveryIncomplete`) rather than presenting empty;
-/// without any content object (a degraded build) it is recreated empty as before (BUG-11).
 /// Returns a recovered volume's byte reservation and re-grown dynamic hold to the shard budget, for
 /// a recovery that must be refused after they were taken.
 fn release_recovered_bytes(
@@ -4769,6 +4906,16 @@ fn recover_version_reservations(
   }
 }
 
+/// Rebuilds one recovered volume into the shard's store, returning its inode-number prefix (so the
+/// caller advances `next_prefix` past it). A scratch volume is rebuilt from its recovery image when
+/// one is present (its content, tree, snapshots and prefix restored, §4.8); with a content object but
+/// no image the volume's content was lost, which refuses (`RecoveryIncomplete`) rather than
+/// presenting empty; without any content object (a degraded build with no anchor-backed recovery) it
+/// is recreated empty, the BUG-11 behaviour that build cannot better. An overlay re-opens its base
+/// from the recorded path (its untouched base entries are on disk; its diverged state in an image is
+/// the owed base gate). The volume's reservations — bytes, re-grown dynamic hold, inode and entry
+/// allowances, version credits — are taken again (§4.2 accounting through recovery), and every one
+/// is given back if a later step refuses.
 fn rebuild_volume(
   state: &mut ShardState,
   record: &VolumeRecord,
@@ -4873,8 +5020,20 @@ fn build_recovered_volume(
     (BaseRecord::Scratch, Some(image)) => {
       let quota = quota_for(size);
       let journal = journal_bytes_for(state, &quota);
-      let volume = Volume::from_image(&mut state.store, image, Box::new(HostClock::new()), journal)
-        .map_err(|e| e.to_string())?;
+      let mut volume =
+        Volume::from_image(&mut state.store, image, Box::new(HostClock::new()), journal)
+          .map_err(|e| e.to_string())?;
+      // The catalog is the authority on the acknowledged size policy (§4.8, AC-2.3): a resize
+      // publishes its image before its record commits, so a crash between the two leaves the image
+      // carrying a quota no client was ever told about. The recovered volume takes the record's
+      // limit; one whose bytes exceed the acknowledged limit cannot be represented honestly and
+      // refuses rather than serving an unacknowledged capacity.
+      let acknowledged = quota.limit();
+      if volume.capacity_bytes() != acknowledged {
+        volume.resize(acknowledged).map_err(|e| {
+          format!("RecoveryIncomplete: the image's quota exceeds the acknowledged size policy: {e}")
+        })?;
+      }
       Ok((volume, None, image.prefix))
     }
     (BaseRecord::Scratch, None) if state.content.is_some() => {
@@ -4900,13 +5059,47 @@ fn build_recovered_volume(
   }
 }
 
-/// Reconciles what the old process's memory alone held: local-only snapshots (and the head
-/// they may have been) and attachments; each a recorded operation, so replay agrees.
-/// Drops the state a rebuilt volume cannot honor: its **local** (unplaced) snapshots and its
-/// attachments, whose in-memory content did not survive the restart. Returns the (snapshots,
-/// attachments) dropped, so the caller reports the loss rather than implying it was recovered. A
-/// placed snapshot (one durably held elsewhere) is not dropped here; only local, content-less
-/// snapshots are. This is the honest reconciliation until content is anchor-backed (BUG-11).
+/// Trims the rebuilt volume back to the catalog (§4.8, AC-2.3): a verb publishes its effect before
+/// its completion record commits ([`dispatch`] inside `run_recorded`), so a crash between the two
+/// leaves the image carrying a snapshot the catalog never acknowledged. The catalog is the authority
+/// on what was acknowledged; such a snapshot is destroyed in the volume — its tree returned to the
+/// store — so the unacknowledged effect is not partially present and a retry of the verb makes a
+/// fresh one. Returns how many were trimmed. A snapshot the catalog does record is untouched.
+fn trim_unrecorded_snapshots(state: &mut ShardState, volume: DbVolumeId) -> usize {
+  let Some(handle) = state.by_id.get(&volume).copied() else {
+    return 0;
+  };
+  let recorded: std::collections::BTreeSet<u64> = state
+    .db
+    .partition()
+    .snapshots_of(volume)
+    .iter()
+    .map(|s| s.id.value)
+    .collect();
+  let ShardState { store, volumes, .. } = state;
+  let Ok(slot) = volumes.get_mut(handle) else {
+    return 0;
+  };
+  let unrecorded: Vec<slates_vfs::ids::SnapshotId> = slot
+    .volume
+    .snapshot_ids()
+    .filter(|id| !recorded.contains(&db_snapshot_value(*id)))
+    .collect();
+  let mut trimmed = 0;
+  for id in unrecorded {
+    if slot.volume.destroy_snapshot(store, id).is_ok() {
+      trimmed += 1;
+    }
+  }
+  trimmed
+}
+
+/// The catalog's snapshot id value for a vfs snapshot id: the slot and generation packed as
+/// `(index << 32) | generation` (the inverse of the unpacking in [`recovered_snapshot`]).
+fn db_snapshot_value(id: slates_vfs::ids::SnapshotId) -> u64 {
+  (u64::from(id.index) << u32::BITS) | u64::from(id.generation)
+}
+
 /// Whether the volume's recovery image rebuilt this snapshot into the vfs volume (§4.8), so it is
 /// kept rather than reconciled out of the catalog. The db snapshot id packs the vfs snapshot's slot
 /// and generation as `(index << 32) | generation`.
@@ -4928,6 +5121,14 @@ fn recovered_snapshot(
   slot.volume.snapshot_info(vfs_id).is_ok()
 }
 
+/// Reconciles the catalog with what recovery could honour, each change a recorded operation so
+/// replay agrees (§4.8): a **local** (unplaced) snapshot the volume's recovery image did not carry
+/// is destroyed and, if it was the head, the head is reset — its content did not reach anchor-owned
+/// RAM before the crash (an image that could not be published), so the catalog must not claim it;
+/// one the image *did* rebuild is kept, its content and the head that points at it surviving the
+/// restart. A placed snapshot (durably held elsewhere) is never dropped here. Attachments are
+/// removed (their clients attach again). Returns the (snapshots, attachments) reconciled out, so the
+/// caller reports exactly that.
 fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usize) {
   let now = state.clock.monotonic_ns();
   // Local-only snapshots that the volume's recovery image did not bring back are genuinely lost and

@@ -1564,6 +1564,7 @@ dependencies = [
  "slates-bridge-fuse",
  "slates-bridge-nfs",
  "slates-bridge-virtiofs",
+ "slates-client",
  "slates-cluster",
  "slates-db",
  "slates-ipc",

@@ -138,6 +138,25 @@ pub(crate) fn read(stream: &mut TcpStream, file_fh: &[u8], xid: u32) -> Vec<u8> 
   read_opaque(&reply, off).0
 }
 
+/// NFS FSSTAT `fh` → the volume's (total bytes, free bytes): the quota the export serves as the
+/// filesystem's capacity (the truthful `statfs`, BUG-9), what a recovered volume's acknowledged size
+/// policy is observed through.
+pub(crate) fn fsstat(stream: &mut TcpStream, fh: &[u8], xid: u32) -> (u64, u64) {
+  let mut args = Vec::new();
+  opaque(fh, &mut args);
+  let reply = call(stream, NFS_PROGRAM, 18, &args, xid);
+  assert_eq!(status(&reply), 0, "FSSTAT succeeded");
+  let mut off = 4;
+  let follows = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+  off += 4;
+  if follows == 1 {
+    off += 84; // post_op_attr fattr3
+  }
+  let tbytes = u64::from_be_bytes(reply[off..off + 8].try_into().unwrap());
+  let fbytes = u64::from_be_bytes(reply[off + 8..off + 16].try_into().unwrap());
+  (tbytes, fbytes)
+}
+
 /// READDIRPLUS `dir_fh` and return the entry names (skipping each entry's fileid, cookie, optional
 /// attributes and optional handle).
 pub(crate) fn readdirplus(stream: &mut TcpStream, dir_fh: &[u8], xid: u32) -> Vec<String> {

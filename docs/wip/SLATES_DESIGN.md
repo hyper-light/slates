@@ -551,9 +551,18 @@ startup).
 > generalize it: the rest of §4.10 (content-defined chunking and the cost model, anti-entropy, the
 > healer, remote attach, live shipping, migration, mirroring). The health plane's refusal to serve
 > before every chokepoint registers arrives with task 6's signals.
-> A-9 correction: rebuilding scratch volumes empty and dropping snapshots is acknowledged
-> content loss (BUG-11), not content recovery. Anchor-owned bytes/roots and validated base
-> identity handoff are required before the design's restart-survival promise can be offered.
+> A-9 (2026-09-14): daemon-restart content recovery is implemented and proven. A scratch volume's
+> bytes, roots and snapshots are captured into an anchor-owned content object at every barrier —
+> control verbs inside their completion transaction, and mount-transport mutations before their
+> stability reply — and rebuilt from it on restart (`crates/server` publish barrier,
+> `crates/vfs/src/recover.rs`); the catalog is the recovery authority, so an image a crash left
+> ahead of the log is trimmed to what was acknowledged. Proven by the recovery oracle
+> (`crates/server/tests/recovery.rs`, AC-2.12/T-2.14): bytes written over the NFS transport after
+> the last control verb survive a real daemon restart byte-identically, and a crash injected at
+> every durable step resumes to a clean reference. Owed: an overlay's diverged (base-plane) state
+> and validated base-identity handoff; the §4.2 content-object sizing that makes a publish never
+> refuse. (The earlier correction stands as history: rebuilding scratch volumes empty was
+> acknowledged content loss, BUG-11, now closed.)
 
 ---
 
@@ -1629,7 +1638,9 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 > Separate commit `d9cb6e5` fixes acceptance-epoch refresh and removes BUG-13's candidate-zero
 > reachability restriction; its commit reports a before/after regression and 40 passing DB
 > tests, not rerun here. Direct adoption-value checks and message-level histories remain owed. Mirror simulation does not establish transport, byte placement or time lag.
-> Server wiring, regional configuration consensus and the acceptance gates below remain open.
+> Server wiring and local content recovery are wired and proven (GAP-A9-6 content half closed
+> 2026-09-14; base plane owed); regional configuration consensus and the acceptance gates below
+> remain open.
 > A-9 changes the required §4.8 contract; model refinement/revalidation remains explicitly owed
 > before closure. No checker, tool installation or new CI job is authorized by this amendment.
 >

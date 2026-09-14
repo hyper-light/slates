@@ -8,6 +8,29 @@
 > I/O), and the fuller **§4.2 admission accounting** (content-object sizing is a first, derived cut).
 > This doc is the assistant-owned record; the numbered requirements live in `SLATES_DESIGN.md` §4.2
 > and §4.8 (A-9), and the gap ledger is `GAPS.md`.
+>
+> **Update 2026-09-13 (agent/recovery-restart): the data-plane content barrier is landed, and the
+> process-level content-bytes proof runs here — the mount-capability blocker was overcome by driving
+> the daemon's own NFS loopback transport (no kernel mount, no privilege), the same path
+> `crates/server/tests/nfs_mount.rs` already proves reaches real volumes.** A mutation served over the
+> NFS transport now publishes the shard's recovery image on its owner shard before its reply claims
+> stability (§4.8, D-18), so a `FILE_SYNC` write, a COMMIT, a create or a rename survives a daemon
+> restart; an `UNSTABLE` write is answered `UNSTABLE` and made stable by the client's COMMIT; a refused
+> publish answers `NFS3ERR_IO` rather than promise survival, and the per-boot write verifier tells a
+> client its unstable writes were lost (RFC 1813 §3.3.7). The recovery oracle
+> (`crates/server/tests/recovery.rs`) proves it across three tests: (1) bytes written over NFS *after*
+> the last control verb read back byte-identical across a real in-process daemon restart — the head
+> and a snapshot's frozen bytes (through a clone); (2) a **crash injected at every durable step** of a
+> create → write → snapshot → write → resize scenario — before the publish, between the publish and the
+> completion record, and after both — recovers to the catalog's acknowledged state and the resume
+> reaches a separate clean run's reference; (3) a clone's pin on its origin snapshot, and a destroy in
+> flight, reconcile to the catalog across a restart. The catalog is the authority on recovery: an image
+> that a crash left ahead of the log is trimmed back (an unrecorded snapshot dropped, an unacknowledged
+> resize's quota reverted), a `Destroying` volume's destroy is completed, and clone pins are reconciled
+> to the recorded clones. **Still owed:** the base
+> plane (an overlay's diverged state is not imaged, counted `BARRIER_UNCAPTURED`), the §4.2 sizing that
+> makes the content-object slot always fit (a refused control-verb publish is counted `PUBLISH_REFUSED`
+> but its record still commits, no transaction undo), and the fuller §4.2 admission accounting.
 
 ## 1. The requirement (settled, not a choice)
 
@@ -139,16 +162,52 @@ volume.
    BUG-11's empty recreate and prefix reassignment), refusing `RecoveryIncomplete` for a db volume with
    no image rather than presenting it empty. Gated by the existing client restart test, now threading
    the content object: the volume is recovered from its image across a real daemon restart.
+8. **Data-plane barrier and recovery as the catalog's authority.** *(Landed 2026-09-13,
+   `agent/recovery-restart`.)* Two gaps closed together. **The barrier** (`crates/server/src/nfs.rs`
+   `barrier`/`needs_barrier`, `crates/bridge-nfs/src/procedures.rs`): every mutation served over the
+   NFS transport that succeeded — except an `UNSTABLE` write, whose client commits later — runs
+   `verbs::publish_shard` on the owner shard before its reply leaves, so the mount reply's stability
+   claim is true for daemon-restart survival; `publish_shard` returns a typed
+   `Result<Published, VfsError>` (never swallowed), a refused publish becomes `NFS3ERR_IO`, and the
+   NFS WRITE honours `stable_how` with a per-boot write verifier. A control verb's publish moved
+   *inside* its completion transaction (`run_recorded`), so an effect is always published before its
+   record commits. **Recovery as the catalog's authority** (`crates/server/src/verbs.rs`): the catalog
+   records what was acknowledged, so a rebuilt volume is trimmed back to it — `trim_unrecorded_snapshots`
+   drops a snapshot the image carries that no record acknowledged (a crash between publish and record),
+   `build_recovered_volume` reverts an image's quota to the acknowledged size policy,
+   `complete_recovered_destroys` finishes a `Destroying` volume the old process's slices never
+   completed, and `reconcile_clone_pins` sets each snapshot's clone pins to the recorded live clones
+   (`Volume::pin`/`clone_pins` added). Gated `crates/server/tests/recovery.rs` (three tests): bytes
+   written over NFS after the last control verb read back byte-identical across a real daemon restart; a
+   crash injected at every durable step of a create→write→snapshot→write→resize scenario (before the
+   publish, between publish and record, after both) recovering to the catalog's acknowledged state with
+   the resume reaching a separate clean run's reference; and a clone's pin plus a destroy in flight
+   reconciling across a restart. Non-vacuity is in the test docs: without the trim the between-publish
+   state shows a hidden snapshot (unique ≠ referenced bytes); without the pin reconciliation the
+   snapshot's destroy is refused after any restart; without the destroy completion the clone stays
+   `Destroying` forever.
 
 ## 4. Owed, as individual gates
 
-- **Data-plane content barrier and the process content-bytes proof.** File content is written through
-  the bridge (FUSE/NFS), not the control client, so a barrier there must `publish_shard` after a
-  content write, and the end-to-end "write bytes → kill → restart → read the same bytes through the
-  client" proof needs a mount — which needs host capabilities (Ada's step-4 gate). The content-bytes
-  survival itself is already proven at the library level (through a real `SharedObject` handoff); what
-  the mount adds is the last process hop. Until then the control path proves catalog, roots and prefix
-  recovery across a real restart.
+- **Data-plane content barrier and the process content-bytes proof.** *(Landed 2026-09-13,
+  `agent/recovery-restart`, `crates/server/src/nfs.rs` `barrier`/`needs_barrier`,
+  `crates/bridge-nfs/src/procedures.rs`, `crates/server/tests/recovery.rs`.)* A mutation served over
+  the daemon's NFS transport publishes the shard's recovery image on its owner shard *before* its
+  reply claims stability, so a `FILE_SYNC` write, a COMMIT, a create, a rename and the rest survive a
+  daemon restart; an `UNSTABLE` write is answered `UNSTABLE` and made stable by the client's later
+  COMMIT (both barriers); a refused publish answers `NFS3ERR_IO`; a per-boot write verifier
+  (`ShardState::write_verifier`) lets a client learn a restart lost its unstable writes and re-send
+  them (RFC 1813 §3.3.7). The end-to-end proof needed no kernel mount: the recovery oracle drives the
+  daemon's own NFS loopback (the `crates/server/tests/nfs_mount.rs` path — no host capability, no
+  privilege) and reads bytes written after the last control verb back byte-identical across a real
+  in-process daemon restart, plus a crash injected at every durable step with a resume that reaches a
+  separate clean run's reference. The kernel-mount hop (a real `mount_nfs`) remains the only piece
+  gated on host capabilities, and it dispatches onto this same barrier. **Owed within this:** the base
+  plane — an overlay's diverged state is not imaged (`to_image` refuses a base-backed body), so a
+  stable mount acknowledgement on an overlay is counted `BARRIER_UNCAPTURED` rather than made durable
+  (the base gate below); and the §4.2 slot sizing that makes `publish_shard` always fit, so a
+  control-verb publish is never refused after its effect and record commit (counted `PUBLISH_REFUSED`
+  until then, no transaction undo).
 - **Host-environment acceptance — explicitly pending.** Three acceptance gates wait on environments
   this machine does not provide, and are held pending by decision, not overlooked: **mounted POSIX
   behavior** (a real FUSE/FSKit/NFS mount driving pjdfstest/fsx/fsstress against a volume as a normal

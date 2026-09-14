@@ -652,6 +652,15 @@ impl Volume {
     self.snapshots.len()
   }
 
+  /// The ids of the snapshots the volume holds, in slot order (§4.8: what a recovery compares
+  /// against the catalog's acknowledged snapshots to trim an image ahead of the log).
+  pub fn snapshot_ids(&self) -> impl Iterator<Item = SnapshotId> + '_ {
+    self.snapshots.iter().map(|(h, _)| SnapshotId {
+      index: h.index(),
+      generation: h.generation(),
+    })
+  }
+
   /// Looks a name up in a directory.
   pub fn lookup(
     &self,
@@ -1883,6 +1892,28 @@ impl Volume {
     Ok(())
   }
 
+  /// Pins snapshot `id` as a clone's origin would (the inverse of [`Volume::unpin`]): one more clone
+  /// shares its tree, so a destroy of the snapshot is refused until that clone is gone. Recovery uses
+  /// it to bring a rebuilt snapshot's pins up to the catalog's recorded clones (§4.8).
+  pub fn pin(&mut self, id: SnapshotId) -> Result<(), VfsError> {
+    let snap = self
+      .snapshots
+      .get_mut(snapshot_handle(id))
+      .map_err(|_| VfsError::StaleHandle)?;
+    snap.clone_refs = snap.clone_refs.checked_add(1).ok_or(VfsError::Invalid)?;
+    Ok(())
+  }
+
+  /// The clones pinning snapshot `id` (§4.5): what a recovery compares against the catalog's
+  /// recorded clones, since the image carries the pins the old process held.
+  pub fn clone_pins(&self, id: SnapshotId) -> Result<u32, VfsError> {
+    self
+      .snapshots
+      .get(snapshot_handle(id))
+      .map(|snap| snap.clone_refs)
+      .map_err(|_| VfsError::StaleHandle)
+  }
+
   /// Destroys a snapshot: its dead objects go to the previous snapshot if that one still
   /// shares them, else they are released; a snapshot pinned by a clone is refused.
   pub fn destroy_snapshot(&mut self, store: &mut Store, id: SnapshotId) -> Result<(), VfsError> {
@@ -1969,14 +2000,7 @@ impl Volume {
     let versions = self.versions_charged;
     self.credit_retention(store, bytes, versions);
     let mut queue = Vec::new();
-    let snapshots: Vec<SnapshotId> = self
-      .snapshots
-      .iter()
-      .map(|(h, _)| SnapshotId {
-        index: h.index(),
-        generation: h.generation(),
-      })
-      .collect();
+    let snapshots: Vec<SnapshotId> = self.snapshot_ids().collect();
     for id in snapshots {
       if let Ok(s) = self.snapshots.remove(snapshot_handle(id)) {
         queue.extend(s.deadlist.items().iter().copied());
