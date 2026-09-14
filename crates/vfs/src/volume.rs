@@ -1943,6 +1943,26 @@ impl Volume {
     u64::try_from(count).unwrap_or(u64::MAX)
   }
 
+  /// The retained content bytes (§4.2 retention, the byte dimension): the arena blocks of chunks
+  /// the head has overwritten, truncated or unlinked that its snapshots still pin, held on their
+  /// deadlists as `Dead::Chunk`. This is the physical arena capacity a volume's snapshots hold
+  /// beyond its head-reachable `referenced_bytes` — charged at the block length the arena actually
+  /// lost (allocator rounding included, as `physical_used` must). Computed from the deadlists and
+  /// the live chunk records — the source of truth — so it cannot drift from a maintained counter;
+  /// a chunk already freed through a retained inode version's release contributes nothing.
+  pub fn retained_bytes(&self, store: &Store) -> u64 {
+    self
+      .snapshots
+      .iter()
+      .flat_map(|(_, snap)| snap.deadlist.items().iter())
+      .filter_map(|dead| match dead {
+        Dead::Chunk(handle, _) => store.content.chunk(*handle),
+        _ => None,
+      })
+      .map(|chunk| u64::try_from(chunk.block.len).unwrap_or(u64::MAX))
+      .fold(0u64, u64::saturating_add)
+  }
+
   /// Sets the volume's namespace (entry) allowance (§4.2), refusing `NoSpace` if it is below the
   /// entries the volume already holds, so an allowance is never set below current use.
   pub fn set_entry_allowance(&mut self, allowance: u64) -> Result<(), VfsError> {
