@@ -4,6 +4,8 @@ use std::fmt;
 
 use slates_mem::MemError;
 
+use crate::delivery::DeliveryFault;
+
 /// A typed refusal from the IPC crate; never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcError {
@@ -62,6 +64,14 @@ pub enum IpcError {
     /// The bound.
     limit: usize,
   },
+  /// The consumer capability the harness delivers on an inherited descriptor (§4.13; `delivery`)
+  /// could not be taken: which fault. A process spawned as a consumer whose delivery is unusable is
+  /// refused here rather than bound to the account's ambient authority; only `Absent` means the
+  /// process was not spawned as a consumer at all.
+  CapabilityNotDelivered {
+    /// The fault.
+    fault: DeliveryFault,
+  },
 }
 
 impl fmt::Display for IpcError {
@@ -85,6 +95,9 @@ impl fmt::Display for IpcError {
       Self::Unsupported { feature } => write!(f, "unsupported here: {feature}"),
       Self::DeadlineExceeded => f.write_str("deadline exceeded"),
       Self::TooManyClients { limit } => write!(f, "too many clients (the bound is {limit})"),
+      Self::CapabilityNotDelivered { fault } => {
+        write!(f, "consumer capability not delivered: {fault}")
+      }
     }
   }
 }

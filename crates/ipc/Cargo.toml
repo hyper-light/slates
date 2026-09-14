@@ -12,6 +12,10 @@ description = "Local IPC: shared-memory command and completion rings per client,
 slates-machine = { workspace = true }
 slates-mem = { workspace = true }
 slates-wire = { workspace = true }
+# The attestation proof a consumer presents (`delivery::attest_proof`, §4.13): a keyed BLAKE3 over the
+# channel's client id under the delivered capability. Its backend follows `slates-machine`'s
+# (`pure-hash` forwards the pure-Rust one for a Windows cross-lint from a host without MSVC).
+blake3 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
