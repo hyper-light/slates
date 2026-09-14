@@ -85,6 +85,36 @@ document above; after the `fold` change alone still empty (no head-side director
 after `path_of_dir`: ok. Oracle on the completed fix: 0 failures in 36,000 cases (two 60-run
 batches), plus the long run recorded in the commit.
 
+## The third shape (202,200 cases on the second fix), and the rule that closes all three
+
+```
+prefix = [Mkdir([], "d"), Mkdir(["d"], "C")]
+suffix = [Rename([], "d", [], "a"), Mkdir([], "d"), Symlink(["d"], "C")]
+doc = { dirs_renamed: [("/d","/a")], dirs_created: ["/d"], dirs_removed: ["/a/C"], symlinks: ["/d/C"] }
+directories: applied ["", "/a", "/d"] head ["", "/a", "/a/C", "/d"]
+```
+
+A renamed directory's old name re-created as a fresh directory holding a new entry at a path the
+base held a subdirectory at. The symlink at `/d/C` classified as base=Dir, head=Symlink ("a directory
+gave way to a symlink") and emitted `dirs_removed: ["/d/C"]`; the first fix's post-hoc rewrite then
+mapped it to `/a/C` because `/d` is a rename source — but this `/d/C` is the *new* `/d`'s child, not
+the renamed subtree's, and `/a/C` still exists in the head. Nothing should be removed.
+
+The rule that closes all three shapes, replacing the post-hoc rewrite: **a path's base side is read
+through the renames, never by its head name.** The deriver collects the increment's directory renames
+(`find_renames`: a head directory whose inode the base held at another path) before any path is
+classified. Beneath a renamed *target*, a head path's base side is the entry at the source-relative
+base path; beneath a renamed *source*, the base subtree was carried away, so a head entry there is
+new and nothing is removed (`base_path_of`). Removals inside a renamed subtree come from the one
+place that can see them — the base subtree under the source compared with the head subtree under
+the target (`walk_subtree`'s new pass over `readdir_in`), named by their post-rename paths. The
+applier's two-phase removal order (removals beneath a target apply after the subtree attaches) is
+unchanged and is what makes those removals applicable.
+
+Failing test first: `a_renamed_directorys_old_name_recreated_with_a_new_entry_reads_right` — before:
+the document above; after: ok. The three earlier regression tests still pass under the new rule
+(the first shape now emits its removal from the subtree pass rather than the rewrite).
+
 ## Impact
 
 Any increment that deleted an entry inside a directory it also renamed produced a document whose

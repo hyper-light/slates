@@ -461,3 +461,21 @@ fn a_directory_renamed_away_and_back_with_a_child_created_meanwhile_reads_right(
     ],
   );
 }
+
+/// A directory renamed away and its old name re-created as a fresh directory holding a new entry
+/// at a path the base held a subdirectory at (`/d/C` a directory in the base; `/d` → `/a`, mkdir
+/// `/d`, symlink `/d/C`): the document must remove nothing under the renamed source, create the
+/// new `/d`, and place the symlink. Found by the generative oracle after 202,200 cases on the
+/// second fix (2026-09-14).
+#[test]
+fn a_renamed_directorys_old_name_recreated_with_a_new_entry_reads_right() {
+  use Step::*;
+  derive_and_apply_equals_head(
+    &[Mkdir(at(&[]), "d".into()), Mkdir(at(&["d"]), "C".into())],
+    &[
+      Rename(at(&[]), "d".into(), at(&[]), "a".into()),
+      Mkdir(at(&[]), "d".into()),
+      Symlink(at(&["d"]), "C".into()),
+    ],
+  );
+}

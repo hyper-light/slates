@@ -203,6 +203,13 @@ struct Deriver<'a> {
   maps: BTreeMap<InodeNo, ContentMap>,
   /// Every path the work touched, on either side.
   touched: BTreeSet<String>,
+  /// The directory renames of the increment, `(base path, head path)`, known before any path is
+  /// classified: a path's base side is read **through** them. Beneath a renamed source the base
+  /// subtree was carried away, so a head entry there is new and nothing is removed; beneath a renamed
+  /// target the base side is the entry at the source-relative base path. Reading the base by the
+  /// head's name alone misfiled a fresh directory's child at a renamed source as replacing the base
+  /// subdirectory the rename had moved (the third shape the oracle found, 2026-09-14).
+  renames: Vec<(String, String)>,
 }
 
 impl Deriver<'_> {
@@ -293,9 +300,55 @@ impl Deriver<'_> {
     })
   }
 
+  /// Collects the increment's directory renames from the touched paths: a head directory whose
+  /// inode the base held at another path. Known before classification so every path's base side
+  /// is read through them.
+  fn find_renames(&mut self) {
+    let mut renames = Vec::new();
+    for path in &self.touched {
+      let Ok(located) = self.vol.resolve(self.store, path) else {
+        continue;
+      };
+      if !matches!(located.child, Child::Dir(_)) {
+        continue;
+      }
+      if let Some(from) = self
+        .vol
+        .path_of_dir_in(self.store, self.base, located.inode)
+        && from != *path
+      {
+        renames.push((from, path.clone()));
+      }
+    }
+    renames.sort();
+    renames.dedup();
+    self.renames = renames;
+  }
+
+  /// The base path whose entry is the base side of head path `path`, read through the renames:
+  /// beneath a renamed target, the source-relative path; beneath a renamed source, none (the base
+  /// subtree there was carried away); otherwise the path itself.
+  fn base_path_of(&self, path: &str) -> Option<String> {
+    if let Some((rename, rest)) = beneath(path, &self.renames, |r| &r.1) {
+      return Some(format!("{}{rest}", rename.0));
+    }
+    if beneath(path, &self.renames, |r| &r.0).is_some() {
+      return None;
+    }
+    Some(path.to_owned())
+  }
+
+  /// What the base holds on the base side of head path `path`, read through the renames.
+  fn base_side(&self, path: &str) -> Entry {
+    match self.base_path_of(path) {
+      Some(base_path) => classify(self.vol.resolve_in(self.store, self.base, &base_path)),
+      None => Entry::None,
+    }
+  }
+
   /// One touched path into the document.
   fn classify_path(&self, path: &str, doc: &mut OpsDocument) -> Result<(), VfsError> {
-    let base = classify(self.vol.resolve_in(self.store, self.base, path));
+    let base = self.base_side(path);
     let head = classify(self.vol.resolve(self.store, path));
     match (base, head) {
       (Entry::None, Entry::None) => {}
@@ -409,8 +462,10 @@ pub fn derive(vol: &Volume, store: &Store, base: SnapshotId) -> Result<OpsDocume
     base,
     maps: BTreeMap::new(),
     touched: BTreeSet::new(),
+    renames: Vec::new(),
   };
   d.fold(&records);
+  d.find_renames();
   let mut doc = OpsDocument::default();
   let mut classified: BTreeSet<String> = BTreeSet::new();
   for path in d.touched.clone() {
@@ -447,14 +502,6 @@ pub fn derive(vol: &Volume, store: &Store, base: SnapshotId) -> Result<OpsDocume
     .map(|(from, _)| from.clone())
     .collect();
   doc.dirs_removed.retain(|p| !sources.contains(p));
-  // A removal beneath a renamed directory is named by its post-rename path: the applier's one order
-  // detaches renamed subtrees first, so at the removal step the base path no longer exists and only
-  // the post-rename one does. The paths were journaled and classified under their base names; each
-  // is rewritten through the renames it lies under, deepest source first, and again for a renamed
-  // ancestor of that source (two renames compose).
-  for path in doc.removed.iter_mut().chain(doc.dirs_removed.iter_mut()) {
-    *path = post_rename_path(path, &doc.dirs_renamed);
-  }
   doc.dirs_created.sort();
   doc.dirs_created.dedup();
   doc.dirs_removed.sort();
@@ -466,28 +513,23 @@ pub fn derive(vol: &Volume, store: &Store, base: SnapshotId) -> Result<OpsDocume
   Ok(doc)
 }
 
-/// The path an entry beneath renamed directories has once the renames have applied: the deepest
-/// renamed source that is a proper ancestor of `path` maps its prefix to the rename's target, and the
-/// result is mapped again for a renamed ancestor of that target's source (a directory renamed inside
-/// a directory that was itself renamed) until no source matches. A path under no renamed source is
-/// returned as it was. Bounded by the rename count: each pass consumes one rename.
-fn post_rename_path(path: &str, renames: &[(Box<str>, Box<str>)]) -> Box<str> {
-  let mut current: String = path.to_owned();
-  for _ in 0..renames.len() {
-    let deepest = renames
-      .iter()
-      .filter(|(from, _)| {
-        current
-          .strip_prefix(from.as_ref())
-          .is_some_and(|rest| rest.starts_with('/'))
-      })
-      .max_by_key(|(from, _)| from.len());
-    let Some((from, to)) = deepest else {
-      break;
-    };
-    current = format!("{to}{}", &current[from.len()..]);
-  }
-  current.into_boxed_str()
+/// The deepest of `renames` whose `side` path is a proper ancestor of `path`, and the rest of `path`
+/// beneath it (beginning with `/`).
+fn beneath<'r, 'p>(
+  path: &'p str,
+  renames: &'r [(String, String)],
+  side: fn(&(String, String)) -> &str,
+) -> Option<(&'r (String, String), &'p str)> {
+  renames
+    .iter()
+    .filter_map(|rename| {
+      let ancestor = side(rename);
+      path
+        .strip_prefix(ancestor)
+        .filter(|rest| rest.starts_with('/'))
+        .map(|rest| (rename, rest))
+    })
+    .max_by_key(|(rename, _)| side(rename).len())
 }
 
 impl Deriver<'_> {
@@ -562,6 +604,30 @@ impl Deriver<'_> {
           }
         }
         Child::Dir(_) => {}
+      }
+    }
+    // The base entries beneath the renamed source that the head no longer holds beneath the target
+    // are removals, named by their post-rename paths (the applier's one order removes them after
+    // the subtree attaches). A created directory has no base subtree.
+    if let Some(base_dir) = base_dir
+      && let Ok(base_located) = self.vol.resolve_in(self.store, self.base, base_dir)
+      && let Child::Dir(base_node) = base_located.child
+    {
+      let head_names: BTreeSet<String> = self
+        .vol
+        .readdir(self.store, dir)?
+        .iter()
+        .map(|r| r.name.to_owned())
+        .collect();
+      for row in self.vol.readdir_in(self.store, base_node)? {
+        if head_names.contains(row.name) {
+          continue;
+        }
+        let gone = format!("{}/{}", head_dir.trim_end_matches('/'), row.name);
+        match row.kind {
+          crate::inode::Kind::Dir => doc.dirs_removed.push(gone.into()),
+          crate::inode::Kind::File | crate::inode::Kind::Symlink => doc.removed.push(gone.into()),
+        }
       }
     }
     Ok(())
