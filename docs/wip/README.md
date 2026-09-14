@@ -9,6 +9,9 @@ notes are evidence and history, not competing specifications. Implementation sta
 
 - `SLATES_DESIGN.md` — the unified design and phased implementation plan (the deliverable; v3 of 2026-09-05 integrates A-1 through A-9 as listed in the design, including the Hecate contract correction, with the amendment log kept as history).
 - `GAPS.md` — the gap ledger: what is specced, what is open, what is owed, armed tripwires.
+- `conformance.md` — the transport conformance evidence matrix (AC-9.7, GAP-A9-15): one cell per
+  transport × suite, generated from `conformance/records/` by `cargo xtask conformance`; every
+  cell RAN, LIMITED, SKIPPED or OWED with its reason and the command behind it.
 - `ARCHITECT_NOTES.md` — running notes taken while reading the research (inputs, not decisions).
 - `models/` — TLA+ models of the fenced register and of holder-set reconfiguration with TLC configurations; architecture artifacts, checked on 2026-09-04 with results in `GAPS.md` §10; A-9 changes the required §4.8 contract, so refinement/revalidation is owed before closure; no checker was run or installation authorized. Never CI jobs.
 

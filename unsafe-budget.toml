@@ -146,3 +146,5 @@ slates-bridge-winfsp = 86
 # writes on owned descriptors. A real shared mapping (the later VMM leg) will go through
 # `slates_mem::SharedObject`'s atomic views, whose unsafe already lives in slates-mem.
 slates-bridge-virtiofs = 0
+# slates-conformance (0): pure parsers and records; no FFI, no I/O.
+slates-conformance = 0

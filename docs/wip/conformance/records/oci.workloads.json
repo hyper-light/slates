@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "suite": "workloads",
+  "transport": "oci",
+  "host": {
+    "os": "macOS 26.4.1 (25E253)",
+    "kernel": "Darwin 25.4.0",
+    "arch": "arm64",
+    "privilege": "unprivileged"
+  },
+  "date": "2026-09-14",
+  "command": "",
+  "bound": "",
+  "outcome": {
+    "kind": "skipped",
+    "reason": {
+      "kind": "owed",
+      "reason": "the OCI handoff (the attach verb's container form, crates/server) is under construction; there is no container attachment form to drive a suite through"
+    }
+  },
+  "expected_failure_list": null,
+  "duration_ms": 0,
+  "notes": []
+}

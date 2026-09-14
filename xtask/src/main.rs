@@ -16,6 +16,8 @@
 //! - `cargo xtask check` — structural, literals and the unsafe budget.
 //! - `cargo xtask ratchet [--record] [--tighten] [--reset] [--runs N]` — the performance
 //!   ratchet over the bench examples, keyed by machine identity (see `ratchet.rs`).
+//! - `cargo xtask conformance (plan | run --suite S | all | matrix [--write]) [--records DIR]
+//!   [--scratch DIR] [--keep]` — the conformance evidence harness (see `conformance/mod.rs`).
 //!
 //! This is a development tool, not shipped code. It reads sources and runs cargo, so it is the one
 //! place in the workspace where `std::fs` reads and `std::process` are ordinary; it still obeys the
@@ -25,6 +27,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod conformance;
 mod ratchet;
 mod unsafe_budget;
 
@@ -75,8 +78,12 @@ fn main() -> ExitCode {
       };
       ratchet::run(&root, flags)
     }),
+    "conformance" => workspace_root().and_then(|root| {
+      let options = conformance::parse(&root, &args[1..])?;
+      conformance::run(&root, &options)
+    }),
     other => Err(Failure(format!(
-      "unknown task `{other}`; tasks: structural, literals, unsafe, check, ratchet"
+      "unknown task `{other}`; tasks: structural, literals, unsafe, check, ratchet, conformance"
     ))),
   };
   match outcome {

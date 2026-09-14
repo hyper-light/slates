@@ -280,6 +280,50 @@ jobs:
           cargo test -p slates-client --test client the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed
           cargo test -p slates-bridge-winfsp --test mount -- --nocapture
 
+  # Part 6 "Conformance" and "Real workloads", example 8 "Hermeticity"; AC-9.7/T-9.1 (GAP-A9-15): the
+  # suites the design names — pjdfstest, fsx, fsstress — plus the workload suite and the filesystem-write
+  # tracer, over each runner's native transport, driven by the harness (`cargo xtask conformance`, record and
+  # matrix in docs/wip/conformance.md). The three C suites are fetched from pinned upstream commits, verified
+  # by SHA-256 and built with the system cc inside the runner's temp — not vendored (fsx is APSL 2.0 and
+  # fsstress GPL-2.0; licences do not enter this MIT tree by a lane's hand) and not installed. They are the
+  # only non-Rust tooling of this lane, and the design itself names them (Part 6). macOS runs the daemon's
+  # NFS loopback mount as shipped (`slates mount`, no privilege); Linux reaches the same export through a root
+  # `mount -t nfs` by the OS client, recorded LIMITED because no daemon transport serves the FUSE bridge yet;
+  # the tracer is strace on Linux and `sudo fs_usage` on macOS. The daemon never runs as root (R10).
+  # Records go to the runner's temp and are uploaded as artifacts; the tracked matrix is regenerated from
+  # them deliberately (`cargo xtask conformance matrix --write`), never by CI, so a run's date cannot drift
+  # the doc-truth test. A suite that does not meet its verdict fails the step after writing its record.
+  conformance:
+    name: conformance (pjdfstest, fsx, fsstress, workloads, hermeticity)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      # strace for the tracer; the NFS client for the root-mount adapter; the workload tools the design
+      # names that the image lacks (inotify-tools for the watcher, ripgrep, sqlite3, vim).
+      - name: Suite tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y strace nfs-common inotify-tools ripgrep sqlite3 vim
+      # ripgrep for the rg workload and fswatch for the watcher; the rest ships with the image.
+      - name: Suite tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ripgrep fswatch
+      - name: Plan, then run every suite this runner can (each verdict gates the step; records kept)
+        run: cargo xtask conformance all --records "$RUNNER_TEMP/conformance-records" --scratch "$RUNNER_TEMP/conformance-scratch"
+      - name: Upload the records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-records-${{ matrix.os }}
+          path: ${{ runner.temp }}/conformance-records
+
   # Part 6 "Concurrency", nightly: shuttle's randomized schedules over the pure cores — T-1.6 (two
   # agents clone-and-write on one base through the store's owner) and T-6.7 (sixteen agents submit
   # with random overlaps to one green through its owner), each under a fixed seed and a schedule
