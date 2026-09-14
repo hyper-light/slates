@@ -21,5 +21,10 @@ unicode-normalization = { workspace = true }
 libc = { workspace = true }
 proptest = { workspace = true }
 
+# shuttle builds only under `RUSTFLAGS="--cfg shuttle"` for the randomized two-agent schedule of
+# T-1.6 (`tests/shuttle_clones.rs`); a dev-dependency, so nothing shipped links it.
+[target.'cfg(shuttle)'.dev-dependencies]
+shuttle = "0.9"
+
 [lints]
 workspace = true
