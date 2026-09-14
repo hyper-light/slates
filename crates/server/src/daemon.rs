@@ -111,6 +111,15 @@ pub struct ShardPulse {
   pub steps: u64,
   /// Driver waits (parks) the shard has entered.
   pub waits: u64,
+  /// Tasks the shard has admitted to its arena.
+  pub spawns: u64,
+  /// Tasks whose future returned on the shard.
+  pub completed: u64,
+  /// Admissions the shard refused because its task arena was full — a new operation's task could not be
+  /// spawned (the signal that an observation flood or a leak has saturated the shard, §4.3 "Task arena full").
+  pub admission_refused: u64,
+  /// The shard's longest single poll, nanoseconds (a step longer than a peer's wake starves the shard, §4.3).
+  pub longest_step_ns: u64,
   /// Whether the shard announced itself parked at the moment of the read (a snapshot).
   pub parked: bool,
   /// Kicks senders skipped because the shard was not parked (§4.7 "Wake strategy": the saving, counted).
@@ -498,6 +507,10 @@ impl Daemon {
           shard: shard.0,
           steps: entry.pulse.steps(),
           waits: entry.pulse.waits(),
+          spawns: entry.pulse.spawns(),
+          completed: entry.pulse.completed(),
+          admission_refused: entry.pulse.admission_refused(),
+          longest_step_ns: entry.pulse.longest_step_ns(),
           parked: entry.parking.parked(),
           kicks_skipped: entry.parking.kicks_skipped(),
           ring_full_events: entry.ring_full_events.load(Ordering::Relaxed),
