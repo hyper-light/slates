@@ -905,7 +905,21 @@ async fn establish_session(
       {
         (Some(endpoint), None)
       }
-      Err(_) => (None, None),
+      Err(EndpointError::NotReady) => {
+        // Counted, and said once: a dialer that keeps dialing afresh names the peer it cannot reach.
+        if count_refusal(DIAL_REDIAL) == 1 {
+          eprintln!(
+            "slates-server: fleet: no reply from {address} through {ESTABLISH_BUDGETS_BEFORE_REDIAL} handshake budgets; dialing afresh from a new port"
+          );
+        }
+        (None, None)
+      }
+      Err(e) => {
+        if count_refusal(DIAL_FAULT) == 1 {
+          eprintln!("slates-server: fleet: the handshake to {address} faulted: {e:?}");
+        }
+        (None, None)
+      }
     },
     None => (
       client_for(identity, name, address, certificate, resolver).await,
@@ -947,7 +961,10 @@ async fn serve_peer_probes(
   neighbourhood: usize,
   roster: Vec<Rostered>,
 ) {
-  if endpoint.establish().await.is_err() {
+  if let Err(e) = endpoint.establish().await {
+    if count_refusal(ACCEPT_HANDSHAKE_REFUSED) == 1 {
+      eprintln!("slates-server: fleet: a dialer's probe-plane handshake did not complete: {e:?}");
+    }
     return;
   }
   // Only a **rostered** certificate may move membership (auth): the anchor it stands for is what the prober's
@@ -1140,6 +1157,10 @@ async fn probe_and_apply(
         detector.observe_rtt(peer.host, rtt_ns as f64);
         detector.learn_coordinate(peer.host, coordinate);
       } else {
+        // The peer answered under a **different** id than the one probed (a restart, task #22): learn it, so
+        // `follow_current_id` switches this task to the peer's current id next period. In steady state (no
+        // restart) this never fires — on a first boot every node's id is its manifest gen-0 seed
+        // (`daemon::boot_incarnation`), so a probe is credited to the id it was sent to.
         let _ = state::with_state(|s| learn_member(s, peer.anchor, generation, from));
       }
       detector.apply_gossip(&gossip);
@@ -1340,7 +1361,10 @@ fn probe_period_ns(health_multiplier: u32) -> u64 {
 /// certificates; one not found is counted, never served). A serve failure (the peer's connection dropped
 /// when it died, or its session replaced by a re-dial) ends the loop.
 async fn serve_peer_records(mut endpoint: Endpoint, local: HostId, roster: Vec<Rostered>) {
-  if endpoint.establish().await.is_err() {
+  if let Err(e) = endpoint.establish().await {
+    if count_refusal(ACCEPT_HANDSHAKE_REFUSED) == 1 {
+      eprintln!("slates-server: fleet: a dialer's record-plane handshake did not complete: {e:?}");
+    }
     return;
   }
   // Two ids for the authenticated peer (task #22 two-id model). `peer_anchor` is its **stable** anchor — the
@@ -2419,6 +2443,20 @@ const RESOLVE_NXDOMAIN: &str = "fleet.resolve.refused";
 const RESOLVE_NO_ADDRESS: &str = "fleet.resolve.no-address";
 const RESOLVE_MALFORMED: &str = "fleet.resolve.malformed";
 const RESOLVE_IO: &str = "fleet.resolve.io";
+
+/// The status refusal counts under which a dial task records a handshake that ran out its budgets with
+/// the peer silent (`fleet.dial.redial`: the socket is dropped and the next period dials afresh) and one
+/// the transport faulted (`fleet.dial.fault`: a peer whose half-open state for this source is gone, a
+/// certificate the pin refuses, a malformed flight). A count that keeps rising names a peer this node
+/// cannot establish a session with, and the log's first line of each says why.
+/// Format: refusal names in the daemon's status report, alongside the verbs' refusal kinds.
+const DIAL_REDIAL: &str = "fleet.dial.redial";
+const DIAL_FAULT: &str = "fleet.dial.fault";
+
+/// The status refusal count under which the serve side records an accepted session whose handshake did
+/// not complete (the dialer gave up, or its flight faulted); the log's first line says why.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const ACCEPT_HANDSHAKE_REFUSED: &str = "fleet.accept.handshake";
 
 /// Counts a fleet-loop refusal in the shard's status refusal counts, so a peer the loop could not set up is
 /// visible to an operator (the mesh will not form to it) rather than a swallowed error (banned item 9).
