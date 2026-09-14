@@ -170,6 +170,14 @@ accept-side handshakes.
 > adds the fleet's own share (per peer its two loops and the serve tasks of the sessions the demultiplexer
 > holds on each plane; the plane loops; the coordinator) to the shard's task arena, and a refused fleet spawn
 > is counted typed; `docs/bugs/2026-09-14-fleet-tasks-admitted-against-the-clients-budget.md`.
+> **One stall on the shared box (2026-09-14 17:49–17:54):** the suite's 26th test
+> (`a_stale_or_forged_announcement_is_refused_and_counted`) made no output for 300 s and was killed by the
+> stall detector, on a box whose Docker Desktop VM (two unrelated kind clusters) held 250 % CPU and 38 GB
+> resident with swap at 15.9 of 17.4 GB. The test passed alone at once (9.00 s, traced: every poll held
+> with the daemons advancing) and the next two full runs passed 38/38 in 197.38 s and 203.09 s. Classified
+> as the box, not the tree: no code path changed between the stalled run and the passing ones that the
+> test exercises (the run's diff was the simulation's ownership and the rendezvous refusal answer). Watch
+> for a recurrence at the same test before reading it as a defect.
 
 ## Part 5 — the integrator's row sentences
 

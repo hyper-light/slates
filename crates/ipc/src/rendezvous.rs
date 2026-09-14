@@ -505,7 +505,7 @@ pub mod platform {
         // Any other refusal of the region (one that could not be created): the client is told there is
         // no region for it (a refusal with no bound), never left to read a closed socket.
         Err(e) => {
-          send_refusal(&peer, NO_BOUND)?;
+          send_refusal(&peer, super::NO_BOUND)?;
           return Err(e);
         }
       };
@@ -607,7 +607,7 @@ pub mod platform {
       // came with it is closed with `control`).
       let mut limit_word = [0u8; size_of::<u64>()];
       limit_word.copy_from_slice(&body[HANDOFF_AT_LEN..HANDOFF_BYTES]);
-      return Err(refusal_of(
+      return Err(super::refusal_of(
         usize::try_from(u64::from_le_bytes(limit_word)).unwrap_or(usize::MAX),
         instance,
       ));
