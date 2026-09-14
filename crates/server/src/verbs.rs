@@ -3437,8 +3437,11 @@ fn list(state: &mut ShardState, principal: &Principal) -> ReplyBody {
 
 fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32) -> ReplyBody {
   let now = state.clock.monotonic_ns();
-  // A local client acknowledges its own completions, keyed under this node's own host.
-  let origin = state.fleet.host().0;
+  // A local client acknowledges its own completions, keyed under this node's **stable cert-anchor** — the
+  // same key `serve` records and checks them under (task #22). Keyed on the ephemeral member id, the
+  // acknowledgement landed in a window the retry check never reads, so a retry after the acknowledgement
+  // returned the retained reply instead of `DuplicateRequest` (docs/bugs/2026-09-14-ack-keyed-on-ephemeral-member-id.md).
+  let origin = state.origin_anchor.0;
   match state.db.mutate(
     &mut state.segment,
     &Op::CompletionsAcknowledged {
@@ -3659,8 +3662,11 @@ fn retry_deferred(state: &mut ShardState) -> bool {
     } = entry;
     let id = RequestId::from_word(request);
     // A deferred reply is the local client's own (its shard is here), so its completion keys on this node's
-    // own host; a cross-node forward records on the owner under its authenticated origin instead.
-    let origin = state.fleet.host().0;
+    // stable cert-anchor — the key `serve` checks a retry under (task #22); a cross-node forward records on
+    // the owner under its authenticated origin's anchor instead. Keyed on the ephemeral member id, a retry
+    // of a deferred request found no record and ran the verb again (the sibling of the acknowledgement key
+    // defect, docs/bugs/2026-09-14-ack-keyed-on-ephemeral-member-id.md).
+    let origin = state.origin_anchor.0;
     let reply = if recorded {
       reply
     } else {
