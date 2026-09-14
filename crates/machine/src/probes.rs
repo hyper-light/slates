@@ -249,12 +249,20 @@ pub fn wake(budget: Duration) -> WakeLatency {
   }
 }
 
-/// Measures the ring round trip for every core pair (or the sampled subset above the limit).
+/// Measures the ring round trip for every core pair (or the sampled subset above the limit). Each pair
+/// pins the calling thread to one core; the affinity the thread came in with is put back when the matrix
+/// is done, because a process spawned afterwards inherits the calling thread's mask — the anchor measures
+/// the profile and then spawns the daemon, and a daemon born on a one-core mask counted one core, computed
+/// a different machine identity and refused the anchor's segment
+/// (docs/bugs/2026-09-14-core-matrix-leaves-the-anchor-pinned-to-one-core.md). A mask that cannot be put
+/// back is reported as `Pinning::Refused`: the thread is then mis-pinned and the placement of nothing
+/// measured after it can be vouched for.
 pub fn core_matrix(cores: &[CoreFacts], budget: Duration) -> (Vec<CorePairRtt>, Pinning) {
   let pairs = pair_list(cores);
   if pairs.is_empty() {
     return (Vec::new(), Pinning::Refused);
   }
+  let came_in_with = platform::current_affinity();
   let per_pair = budget / u32::try_from(pairs.len()).unwrap_or(u32::MAX).max(1);
   let mut pinning = Pinning::Pinned;
   let mut out = Vec::with_capacity(pairs.len());
@@ -262,6 +270,11 @@ pub fn core_matrix(cores: &[CoreFacts], budget: Duration) -> (Vec<CorePairRtt>, 
     let (rtt, how) = ring_round_trip(a, b, per_pair);
     pinning = weaker(pinning, how);
     out.push(CorePairRtt { a, b, rtt });
+  }
+  if let Some(affinity) = came_in_with
+    && !platform::restore_affinity(&affinity)
+  {
+    pinning = Pinning::Refused;
   }
   (out, pinning)
 }
@@ -688,6 +701,21 @@ mod platform {
     }
   }
 
+  /// The calling thread's CPU affinity as the OS holds it (Linux: the scheduler's mask), to be put back
+  /// after the matrix pinned the thread.
+  #[cfg(target_os = "linux")]
+  pub(super) struct Affinity(rustix::thread::CpuSet);
+
+  #[cfg(target_os = "linux")]
+  pub(super) fn current_affinity() -> Option<Affinity> {
+    rustix::thread::sched_getaffinity(None).ok().map(Affinity)
+  }
+
+  #[cfg(target_os = "linux")]
+  pub(super) fn restore_affinity(affinity: &Affinity) -> bool {
+    rustix::thread::sched_setaffinity(None, &affinity.0).is_ok()
+  }
+
   #[cfg(target_os = "macos")]
   unsafe extern "C" {
     fn thread_policy_set(
@@ -698,12 +726,12 @@ mod platform {
     ) -> libc::c_int;
   }
 
+  /// Sets the calling thread's affinity tag (mach/thread_policy.h): a tag of zero means "no affinity",
+  /// any other groups threads that share it; a hint, not a pin. Returns whether the kernel took it.
   #[cfg(target_os = "macos")]
-  pub(super) fn pin_current(core: u32) -> Pinning {
+  fn set_affinity_tag(mut tag: libc::c_int) -> bool {
     /// Format: THREAD_AFFINITY_POLICY, the affinity-tag hint (mach/thread_policy.h).
     const THREAD_AFFINITY_POLICY: libc::c_uint = 4;
-    // A tag of zero means "no affinity"; cores are numbered from zero, so the tag is core + 1.
-    let mut tag: libc::c_int = libc::c_int::try_from(core).unwrap_or(0).saturating_add(1);
     // SAFETY: the calling thread's own mach port and a one-integer policy of the stated count.
     let rc = unsafe {
       thread_policy_set(
@@ -713,16 +741,57 @@ mod platform {
         1,
       )
     };
-    if rc == libc::KERN_SUCCESS {
+    rc == libc::KERN_SUCCESS
+  }
+
+  #[cfg(target_os = "macos")]
+  pub(super) fn pin_current(core: u32) -> Pinning {
+    // Cores are numbered from zero and zero is the null tag, so the tag is core + 1.
+    let tag = libc::c_int::try_from(core).unwrap_or(0).saturating_add(1);
+    if set_affinity_tag(tag) {
       Pinning::Hint
     } else {
       Pinning::Refused
     }
   }
 
+  /// macOS holds no readable mask: the thread came in with the null tag (no affinity), which is what
+  /// is put back.
+  #[cfg(target_os = "macos")]
+  pub(super) struct Affinity;
+
+  #[cfg(target_os = "macos")]
+  pub(super) fn current_affinity() -> Option<Affinity> {
+    Some(Affinity)
+  }
+
+  /// Puts the null tag back. A kernel that refused the hint when pinning (Apple silicon:
+  /// `KERN_NOT_SUPPORTED`) refuses this the same way — the thread was never tagged then, and the
+  /// matrix already reports `Refused` for it.
+  #[cfg(target_os = "macos")]
+  pub(super) fn restore_affinity(_affinity: &Affinity) -> bool {
+    /// Format: THREAD_AFFINITY_TAG_NULL — no affinity (mach/thread_policy.h).
+    const NULL_TAG: libc::c_int = 0;
+    set_affinity_tag(NULL_TAG)
+  }
+
   #[cfg(not(any(target_os = "linux", target_os = "macos")))]
   pub(super) fn pin_current(_core: u32) -> Pinning {
     Pinning::Refused
+  }
+
+  /// Nothing pins here, so nothing is put back.
+  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+  pub(super) struct Affinity;
+
+  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+  pub(super) fn current_affinity() -> Option<Affinity> {
+    None
+  }
+
+  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+  pub(super) fn restore_affinity(_affinity: &Affinity) -> bool {
+    true
   }
 
   pub(super) fn lock_capacity(facts: &Facts) -> LockCapacity {
@@ -787,8 +856,8 @@ mod platform {
     VirtualUnlock,
   };
   use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, GetCurrentThread, GetProcessWorkingSetSize, SetEvent,
-    SetThreadAffinityMask,
+    CreateEventW, GetCurrentProcess, GetCurrentThread, GetProcessAffinityMask,
+    GetProcessWorkingSetSize, SetEvent, SetThreadAffinityMask,
   };
 
   fn event() -> HANDLE {
@@ -851,18 +920,39 @@ mod platform {
     None
   }
 
+  /// Sets the calling thread's affinity mask; the previous mask, or zero when refused.
+  fn set_thread_affinity(mask: usize) -> usize {
+    // SAFETY: the calling thread's pseudo-handle and a mask within the process's.
+    unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) }
+  }
+
   pub(super) fn pin_current(core: u32) -> Pinning {
     if core >= usize::BITS {
       return Pinning::Refused;
     }
     let mask: usize = 1usize << core;
-    // SAFETY: the calling thread's pseudo-handle and a one-bit mask.
-    let previous = unsafe { SetThreadAffinityMask(GetCurrentThread(), mask) };
-    if previous == 0 {
+    if set_thread_affinity(mask) == 0 {
       Pinning::Refused
     } else {
       Pinning::Pinned
     }
+  }
+
+  /// The mask the calling thread came in with: the process's affinity mask, which a thread never pinned
+  /// before the matrix runs on (the anchor's main thread).
+  pub(super) struct Affinity(usize);
+
+  pub(super) fn current_affinity() -> Option<Affinity> {
+    let mut process: usize = 0;
+    let mut system: usize = 0;
+    // SAFETY: the current process pseudo-handle and two writable usize outputs.
+    let ok =
+      unsafe { GetProcessAffinityMask(GetCurrentProcess(), &raw mut process, &raw mut system) };
+    (ok != 0 && process != 0).then_some(Affinity(process))
+  }
+
+  pub(super) fn restore_affinity(affinity: &Affinity) -> bool {
+    set_thread_affinity(affinity.0) != 0
   }
 
   pub(super) fn lock_capacity(facts: &Facts) -> LockCapacity {
@@ -949,6 +1039,26 @@ mod tests {
     } else {
       assert_eq!(pinning, Pinning::Pinned);
     }
+  }
+
+  /// AC (§4.1; docs/bugs/2026-09-14-core-matrix-leaves-the-anchor-pinned-to-one-core.md): the matrix
+  /// pins the calling thread per pair and gives it its affinity back — a process spawned afterwards
+  /// inherits the calling thread's mask (the anchor spawns the daemon after measuring), and must see the
+  /// machine, not one core. Asserted on the visible fact: the parallelism the thread can use is the
+  /// same after the matrix as before. Where the OS pins (Linux, Windows) this failed before the restore
+  /// with a machine of two or more cores (the thread was left on the last measured core: 1 ≠ n); macOS
+  /// only hints, so the fact holds there by construction.
+  #[test]
+  fn the_core_matrix_gives_the_calling_thread_its_affinity_back() {
+    let facts = Facts::query();
+    let before = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let n = facts.cores.len().min(4);
+    let (_, pinning) = core_matrix(&facts.cores[..n], short());
+    let after = std::thread::available_parallelism().map_or(1, |n| n.get());
+    assert_eq!(
+      after, before,
+      "the calling thread's usable parallelism is unchanged by the matrix ({pinning:?})"
+    );
   }
 
   #[test]

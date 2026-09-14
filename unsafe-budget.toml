@@ -5,10 +5,12 @@
 # budget to the current count. A budget only goes down. Raising one is an edit here that names the
 # new site and its reason. What each crate still holds, as of the counts below:
 #
-# slates-machine (43): Apple sysctl, mach host statistics and IOKit power queries, for which no
+# slates-machine (44): Apple sysctl, mach host statistics and IOKit power queries, for which no
 #   safe wrapper exists (7 sites, one helper each); the macOS thread-affinity hint (1); the
 #   file-backed map of the profile segment (1); the Win32 facts, probes and section (the rest,
-#   compiled only for Windows).
+#   compiled only for Windows) — raised 43 → 44 on 2026-09-14 for `GetProcessAffinityMask`, the
+#   mask the core matrix puts back on the calling thread after it pinned it (a spawned daemon
+#   inherited the one-core mask: docs/bugs/2026-09-14-core-matrix-leaves-the-anchor-pinned-to-one-core.md).
 # slates-mem (16): the Windows working-set raise and VirtualLock/VirtualUnlock (memmap2 covers
 #   Unix) (4); the shared memory object of §4.7 (`shared.rs`, added 2026-09-05 for Phase 2):
 #   the file-backed map of a memory object (1), the descriptor a child inherits (1), the two
@@ -97,7 +99,7 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 43
+slates-machine = 44
 slates-mem = 16
 slates-rt = 49
 slates-base = 6
