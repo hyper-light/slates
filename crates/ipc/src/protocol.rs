@@ -441,6 +441,11 @@ pub struct ShardReport {
   /// The part of `committed_versions` that is snapshot-retained inode versions (§4.2 retention,
   /// the inode dimension).
   pub retained_versions: u64,
+  /// The shard's metadata ledger (§4.2 metadata dimension): the metadata class less its slabs'
+  /// maximum footprint — what volume records (journal budgets, volume objects) may take.
+  pub metadata_bytes: u64,
+  /// Metadata bytes reserved for the records of the volumes the shard owns.
+  pub committed_metadata: u64,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.

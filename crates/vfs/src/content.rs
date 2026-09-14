@@ -139,6 +139,12 @@ impl ChunkStore {
     self.arena.allocated_bytes()
   }
 
+  /// The most bytes the chunk-record slab can ever hold (§4.2 metadata dimension): its bound in
+  /// records times a record slot's bytes.
+  pub const fn max_record_footprint_bytes(&self) -> usize {
+    self.chunks.max_footprint_bytes()
+  }
+
   /// The arena, for adding regions.
   pub fn arena_mut(&mut self) -> &mut ChunkArena {
     &mut self.arena

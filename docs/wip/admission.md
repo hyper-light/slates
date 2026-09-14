@@ -184,14 +184,52 @@ whole windows and every write lands. Unlike `model.rs`, these histories destroy 
 where a chunk freed twice or too early shows (the C1 defect's class). `cargo test -p slates-vfs
 --test charge_oracle`: 1 passed, 150 cases, 2.35 s.
 
+## 4c. The metadata dimension (piece 1b)
+
+**The finding.** The store's slabs (directory nodes, directory blocks, inode versions, inode-table
+nodes, chunk records) are lazily allocated heap segments bounded only by their caps, and the caps
+were not laid out against the shard's metadata class: `max_dir_blocks` equalled `max_dirs =
+reserve / size_of::<DirNode>() / 6` while a block carries a 4 KiB entry area inline, so the block
+slab alone could grow to roughly forty times the directory-node share — several times the whole
+class — and every volume's journal (`quota × 1 %`, at least a page, a heap `VecDeque`) and object
+were uncharged. Metadata could defeat the per-host cap while the byte ledger looked healthy.
+
+**The layout now built.** The metadata class is the shard's second memory class (one reserve,
+`StoreCaps::metadata_class_bytes`). Each slab's bound is the class over the true cost of its
+dimension's unit — `Slab::<T>::slot_bytes()` (the value plus its generation and vacancy link):
+an inode is a version slot and a table slot (`inode_unit_bytes`), a directory a node and one block
+(`directory_unit_bytes`; the block bound is the directory bound, a large directory's extra blocks
+coming out of the same count), a chunk record one per arena page — each slab dimension taking a
+sixth of the class (`STORE_TABLE_DIVISOR`), so the slabs' maximum footprints sum to about a third of
+it. At boot the daemon calls `Store::set_metadata_class(class)`: the slabs' maximum footprint
+(`Store::slab_footprint_bytes`) comes off the top and the remainder is the **records ledger**
+(`MetadataBudget`, crates/mem/src/budget.rs); a layout whose slabs alone exceed the class is refused
+before serving (`ServerError::Memory(BudgetExceeded)`). Every create — scratch, clone, taken-over —
+reserves `Volume::metadata_footprint(journal_bytes, page)` (the journal's whole retention budget,
+the volume object, the snapshot slab's first segment) from that ledger before the volume exists,
+whole or refused `BudgetExceeded`; the credit rides in the volume's slot, is released on destroy and
+on every failure path, and is re-acquired on recovery (a refused recovery discards the rebuilt
+volume). `ShardReport` carries `metadata_bytes`/`committed_metadata`; `slates status` prints them.
+Not counted: the open-reference maps (bounded by the bridge's handle slab) and the db partition's
+tables (in the anchor segment, sized from `table_bytes` — the third class with the client regions).
+
+**Evidence.** `cargo test -p slates-vfs --test metadata` (a class the slabs fill is refused; the
+ledger is the class less the slabs; two volumes' records fit, a third is refused, a release backs
+another). `cargo test -p slates-server --lib
+the_derived_slab_bounds_lay_the_metadata_class_out_with_room_for_records` (the derived caps' slabs
+fit the class with at least half left for records — with the old block bound the class was refused).
+`cargo test -p slates-server --test daemon a_metadata_class_bounds_the_volume_records_a_shard_admits
+-- --exact` (a daemon whose class holds its slabs plus 64 KiB of records: creates land until the
+ledger binds, the next is refused `BudgetExceeded` while bytes and version slots are plainly roomy,
+a destroy returns the records and a fresh create lands; 0.87 s).
+
 ## 5. Owed (this charter)
 
 1. ~~Allocator rounding in the write charge~~ — done (§4a).
 2. ~~The generated-history charge oracle~~ — done (§4b).
-3. **Metadata and transient bytes** (piece 1b): the per-volume journal (`journal_bytes`, a heap
-   `VecDeque` bounded per volume) and the fixed per-volume record cost charged as part of the
-   volume's claim against a metadata ledger; the client regions and guest request buffers
-   (`DaemonConfig::guest_credits` on main) composed into the same per-host picture.
+3. ~~Metadata bytes~~ — done (§4c). Still owed in this dimension: the open-reference maps (~48 B per
+   open inode, bounded by the bridge's handle slab) and the guest request buffers
+   (`DaemonConfig::guest_credits` on main, derived at boot) composed into the same per-host picture.
 4. **Disjoint per-shard credits and the truthful per-host ledger** (piece 2): the boot-time sum of
    every shard's mapped classes checked against the host's effective capacity with a typed refusal,
    mapped versus usable reported per shard.

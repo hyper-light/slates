@@ -66,6 +66,10 @@ pub struct VolumeSlot {
   /// The inode-version reservation (§4.2 inode dimension): the volume's logical inode allowance
   /// reserved against the shard's version slab, returned on teardown so the slab is never over-offered.
   pub version_credit: Option<slates_mem::budget::VersionCredit>,
+  /// The metadata reservation (§4.2 metadata dimension): the volume's records — its journal budget,
+  /// its object, its snapshot slab's first segment — reserved against the shard's metadata ledger at
+  /// admission, returned on teardown so the class is never over-offered.
+  pub metadata_credit: Option<slates_mem::budget::MetadataCredit>,
 }
 
 impl std::fmt::Debug for VolumeSlot {

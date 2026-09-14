@@ -49,6 +49,20 @@ impl<T> Slab<T> {
     self.slots.reserve_segments(count);
   }
 
+  /// The bytes one slot takes: the value plus its generation and vacancy link (§4.2 "segment,
+  /// slab and buddy geometry report usable capacity": what a slot costs, not what its value alone
+  /// would).
+  pub const fn slot_bytes() -> usize {
+    size_of::<Slot<T>>()
+  }
+
+  /// The most bytes this slab can ever hold: its bound in slots times a slot's bytes — the
+  /// footprint an admission must count for the slab (§4.2 metadata dimension), since its segments
+  /// grow toward the bound as slots are used.
+  pub const fn max_footprint_bytes(&self) -> usize {
+    self.max_slots.saturating_mul(Self::slot_bytes())
+  }
+
   /// Occupied slots.
   pub const fn len(&self) -> usize {
     self.len

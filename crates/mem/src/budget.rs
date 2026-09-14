@@ -273,6 +273,65 @@ impl VersionBudget {
   }
 }
 
+/// A credit of metadata bytes reserved for one volume's records (§4.2 metadata dimension): its
+/// journal's retention budget and its own record. Held in the volume's server slot and returned to
+/// the [`MetadataBudget`] on teardown, exactly as a byte [`Reservation`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataCredit {
+  /// Bytes reserved.
+  pub bytes: u64,
+}
+
+/// The shard's metadata ledger (§4.2 resource vector, the metadata dimension): the part of the
+/// shard's metadata class that its slabs cannot take — the class less every slab's maximum
+/// footprint — from which each volume's records (its journal budget, its volume object, its
+/// snapshot slab's first segment) are reserved at admission, whole or not at all. So the sum of
+/// every volume's metadata is bounded by the class rather than by the heap: "an uncharged heap
+/// allocation cannot sit outside the bound" (§4.2). Unbounded (`u64::MAX`) until the admitting
+/// owner sets the class, so fixtures and non-admitting callers are unaffected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataBudget {
+  ledger: Ledger,
+}
+
+impl MetadataBudget {
+  /// A ledger over `bytes` of metadata capacity, with no headroom: the slabs' own headroom is
+  /// inside their maximum footprint, already subtracted from the class.
+  pub const fn new(bytes: u64) -> Self {
+    Self {
+      ledger: Ledger::new(bytes, 0),
+    }
+  }
+
+  /// The metadata bytes the ledger is over.
+  pub const fn capacity(&self) -> u64 {
+    self.ledger.reserve
+  }
+
+  /// Bytes reserved for volumes' records.
+  pub const fn committed(&self) -> u64 {
+    self.ledger.committed
+  }
+
+  /// Bytes a further reservation may still take.
+  pub const fn admittable(&self) -> u64 {
+    self.ledger.admittable()
+  }
+
+  /// Reserves `bytes` for one volume's records, whole or not at all.
+  pub fn reserve(&mut self, bytes: u64) -> Result<MetadataCredit, MemError> {
+    self
+      .ledger
+      .take(bytes)
+      .map(|bytes| MetadataCredit { bytes })
+  }
+
+  /// Returns a credit's bytes to the ledger.
+  pub fn release(&mut self, credit: MetadataCredit) {
+    self.ledger.give(credit.bytes);
+  }
+}
+
 /// The dynamic-growth increment: at the measured p99 allocation rate (the p99 is the safety
 /// margin over the median), the increment must outlast the measured time to prepare the next
 /// one; never smaller than one slab.

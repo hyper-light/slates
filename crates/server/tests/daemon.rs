@@ -1269,3 +1269,135 @@ fn merge_declare_scenario() {
   declare_xattr_part(&mut client, green);
   daemon.stop();
 }
+
+/// Shape: the records room the metadata-ledger daemon gets above its slabs: 64 KiB — enough for a
+/// few 1 MiB volumes (each reserves its 1 % journal budget, its object and a page of snapshot
+/// slots, about 15 KiB), so the ledger binds within a handful of creates.
+const RECORDS_ROOM: u64 = 64 * 1024;
+/// Shape: the most creates the metadata scenario tries before calling the ledger unbounded.
+const RECORD_PROBES: usize = 16;
+
+/// AC-0.10 (§4.2 metadata dimension), through the real create and destroy verbs (no mount): a
+/// volume's records — its journal budget, its object, its snapshot slab's first segment — are
+/// reserved against the shard's metadata ledger at create, so a daemon whose metadata class holds
+/// its slabs plus a few volumes' records refuses the next create (`BudgetExceeded`) while bytes and
+/// version slots plainly remain, and admits again once a destroy returns the records. Non-vacuous:
+/// uncharged, every create here lands (the byte budget and the version slab are far larger).
+#[test]
+fn a_metadata_class_bounds_the_volume_records_a_shard_admits() {
+  let profile = profile();
+  let instance = format!("srv-metadata-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance).with_shards(1);
+  // The class holds the slabs' maximum footprint plus a few volumes' records, no more.
+  config.store.metadata_class_bytes = slab_footprint_of(&config) + RECORDS_ROOM;
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-metadata-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  let mut client = Client::connect(&instance);
+  let created = create_until_the_ledger_refuses(&mut client);
+  assert!(
+    !created.is_empty(),
+    "at least one volume's records fit the room"
+  );
+  // The refusal is the metadata ledger's: bytes and version slots are plainly roomy, the ledger is
+  // committed up to its capacity.
+  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    panic!("daemon status");
+  };
+  let shard = &report.shards[0];
+  assert!(
+    shard.committed_bytes < shard.reserve_bytes / 2
+      && shard.committed_versions < shard.version_slots / 2,
+    "bytes ({} of {}) and version slots ({} of {}) plainly remain",
+    shard.committed_bytes,
+    shard.reserve_bytes,
+    shard.committed_versions,
+    shard.version_slots
+  );
+  assert!(
+    shard.committed_metadata > 0 && shard.committed_metadata <= shard.metadata_bytes,
+    "the records are reserved against the ledger ({} of {})",
+    shard.committed_metadata,
+    shard.metadata_bytes
+  );
+  // Destroy one; its records return as the destroy completes, and a fresh volume is admitted again.
+  assert!(matches!(
+    client.call(&RequestBody::Destroy { volume: created[0] }),
+    ReplyBody::Destroyed
+  ));
+  wait_for_volume_count(&mut client, created.len() - 1);
+  assert!(
+    matches!(
+      client.call(&scratch("records-again")),
+      ReplyBody::Created { .. }
+    ),
+    "the records a destroy returned back a new volume"
+  );
+  daemon.stop();
+}
+
+/// The slabs' maximum footprint under a derived config's caps (§4.2 metadata dimension), computed
+/// from a store built on those caps over a one-page arena — arithmetic on the bounds, no segments.
+fn slab_footprint_of(config: &DaemonConfig) -> u64 {
+  let page = config.page;
+  let mut arena = slates_mem::arena::ChunkArena::new(page);
+  arena
+    .add_region(slates_mem::region::Region::map(page, page, false).unwrap())
+    .unwrap();
+  slates_vfs::volume::Store::new(
+    &slates_vfs::volume::StoreConfig {
+      page,
+      cache_line: config.cache_line,
+      max_dirs: config.store.max_dirs,
+      max_inodes: config.store.max_inodes,
+      max_chunks: config.store.max_chunks,
+      max_dir_blocks: config.store.max_dir_blocks,
+      dir_cutover: config.store.dir_cutover,
+    },
+    arena,
+    0,
+  )
+  .slab_footprint_bytes()
+}
+
+/// Creates 1 MiB scratch volumes until the create is refused at the ledger (`BudgetExceeded`),
+/// returning the ids that landed; any other outcome, or more than `RECORD_PROBES` creates, fails.
+fn create_until_the_ledger_refuses(client: &mut Client) -> Vec<slates_ipc::protocol::VolumeId> {
+  let mut created = Vec::new();
+  loop {
+    assert!(
+      created.len() < RECORD_PROBES,
+      "the ledger must bind within the records room"
+    );
+    match client.call(&scratch(&format!("records-{}", created.len()))) {
+      ReplyBody::Created { id } => created.push(id),
+      ReplyBody::Refused {
+        refusal: Refusal::BudgetExceeded { .. },
+      } => return created,
+      other => panic!("a create lands or refuses at the metadata ledger: {other:?}"),
+    }
+  }
+}
+
+/// Waits, within the credit budget, until the daemon lists exactly `count` volumes (a destroy
+/// completes in cooperative slices).
+fn wait_for_volume_count(client: &mut Client, count: usize) {
+  let started = Instant::now();
+  loop {
+    let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+      panic!("list");
+    };
+    if volumes.len() == count {
+      return;
+    }
+    assert!(
+      started.elapsed() < CREDIT_WAIT,
+      "destroy completes in slices: {volumes:?}"
+    );
+  }
+}

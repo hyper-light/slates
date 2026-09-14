@@ -11,8 +11,9 @@
 use std::collections::BTreeMap;
 
 use slates_machine::{Derived, derived};
+use slates_mem::MemError;
 use slates_mem::arena::ChunkArena;
-use slates_mem::budget::{ShardBudget, VersionBudget};
+use slates_mem::budget::{MetadataBudget, ShardBudget, VersionBudget};
 use slates_mem::{Handle, Slab};
 
 use crate::clock::Clock;
@@ -57,6 +58,26 @@ pub const LINK_MAX: u32 = 32_767;
 /// Anchor: the copy-up's atomicity on the single-threaded shard.
 const COPY_UP_VERSION_HEADROOM: u64 = 1;
 
+/// The metadata bytes one logical inode costs at its bound (§4.2 metadata dimension): a version
+/// slot and an inode-table slot, each at its slab's true slot cost. The admitting owner derives the
+/// shard's inode cap from its metadata class over this unit.
+pub fn inode_unit_bytes() -> usize {
+  Slab::<Inode>::slot_bytes().saturating_add(Slab::<TrieNode>::slot_bytes())
+}
+
+/// The metadata bytes one directory costs at its bound (§4.2 metadata dimension): a directory
+/// node and one block of entries (every directory past the cut-over holds at least one), each at
+/// its slab's true slot cost. The admitting owner derives the shard's directory and block caps from
+/// its metadata class over this unit.
+pub fn directory_unit_bytes() -> usize {
+  Slab::<DirNode>::slot_bytes().saturating_add(Slab::<DirBlock>::slot_bytes())
+}
+
+/// The metadata bytes one chunk record costs (§4.2 metadata dimension): a chunk slab slot.
+pub fn chunk_record_bytes() -> usize {
+  Slab::<crate::content::Chunk>::slot_bytes()
+}
+
 /// The shard's store: slabs and the chunk arena every volume on the shard allocates from.
 pub struct Store {
   /// Directory nodes.
@@ -84,6 +105,12 @@ pub struct Store {
   /// merely capped — no volume's advertised allowance can be un-backed capacity another volume also
   /// holds. It lives beside the slab it accounts, reached without a lock.
   pub versions: VersionBudget,
+  /// The shard's metadata ledger (§4.2 resource vector, the metadata dimension): the metadata class
+  /// less every slab's maximum footprint, from which each volume's records — its journal budget,
+  /// its volume object, its snapshot slab's first segment — are reserved at admission, so the heap
+  /// the shard's metadata may take is bounded by the class, not by the machine. Unbounded until the
+  /// admitting owner sets the class ([`Store::set_metadata_class`]), so fixtures are unaffected.
+  pub metadata: MetadataBudget,
 }
 
 impl std::fmt::Debug for Store {
@@ -144,7 +171,38 @@ impl Store {
         u64::try_from(config.max_inodes).unwrap_or(u64::MAX),
         COPY_UP_VERSION_HEADROOM,
       ),
+      metadata: MetadataBudget::new(u64::MAX),
     }
+  }
+
+  /// The most bytes the store's slabs can ever hold together — directory nodes, directory blocks,
+  /// inode versions, inode-table nodes and chunk records at their bounds, each slot at its true
+  /// cost (§4.2 "segment, slab and buddy geometry report usable capacity"). The part of the
+  /// metadata class the slabs may grow into; the rest is the volume records' ledger.
+  pub fn slab_footprint_bytes(&self) -> u64 {
+    let bytes = |footprint: usize| u64::try_from(footprint).unwrap_or(u64::MAX);
+    bytes(self.dirs.max_footprint_bytes())
+      .saturating_add(bytes(self.blocks.max_footprint_bytes()))
+      .saturating_add(bytes(self.inodes.max_footprint_bytes()))
+      .saturating_add(bytes(self.tries.max_footprint_bytes()))
+      .saturating_add(bytes(self.content.max_record_footprint_bytes()))
+  }
+
+  /// Sets the shard's metadata class (§4.2): the slabs' maximum footprint is taken off the top and
+  /// the remainder becomes the volume records' ledger, returned. Refused `BudgetExceeded` — nothing
+  /// changed — when the slabs alone would exceed the class, so a boot that laid the tables out past
+  /// its class learns it before serving rather than admitting records it cannot back.
+  pub fn set_metadata_class(&mut self, class_bytes: u64) -> Result<u64, MemError> {
+    let slabs = self.slab_footprint_bytes();
+    if slabs >= class_bytes {
+      return Err(MemError::BudgetExceeded {
+        requested: slabs,
+        available: class_bytes,
+      });
+    }
+    let records = class_bytes - slabs;
+    self.metadata = MetadataBudget::new(records);
+    Ok(records)
   }
 }
 
@@ -316,6 +374,22 @@ pub(crate) struct VolumeSeed {
 }
 
 impl Volume {
+  /// The metadata bytes one volume's records take at their bound (§4.2 metadata dimension), for
+  /// the admitting owner to reserve from the shard's metadata ledger before the volume exists: its
+  /// journal's whole retention budget (`journal_bytes`, the records the op log keeps before the
+  /// oldest leave), its own object, and its snapshot slab's first segment (one page of snapshot
+  /// slots). The per-inode and per-directory structures are the slabs', already inside the class;
+  /// the open-reference maps are bounded by the bridge's handle slab and are not counted here.
+  pub fn metadata_footprint(journal_bytes: usize, page: usize) -> u64 {
+    let bytes = |count: usize| u64::try_from(count).unwrap_or(u64::MAX);
+    let snapshot_segment = crate::snapshot::initial_capacity(page)
+      .get()
+      .saturating_mul(Slab::<Snapshot>::slot_bytes());
+    bytes(journal_bytes)
+      .saturating_add(bytes(size_of::<Volume>()))
+      .saturating_add(bytes(snapshot_segment))
+  }
+
   /// Creates an empty scratch volume with a root directory.
   pub fn create(store: &mut Store, mut config: VolumeConfig) -> Result<Volume, VfsError> {
     let epoch = Epoch(0);
