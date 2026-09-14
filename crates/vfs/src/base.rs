@@ -123,13 +123,104 @@ pub struct Digest {
 }
 
 /// The digest verb's counters (§4.15: "validated by a counter and a byte oracle"): every path
-/// the verb can take, so a test asserts the one it drove moved.
+/// the verb and its cache can take, so a test asserts the one it drove moved and a silently dead
+/// reuse path can never pass as a working one.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DigestStats {
   /// Digests computed by reading and hashing the file.
   pub computed: u64,
+  /// Exports served from a kept digest after the disk re-verified its fingerprint (the reuse
+  /// path).
+  pub revalidated: u64,
+  /// Kept digests dropped because the volume was about to mutate, or removed, the entry
+  /// (§4.15 "invalidated before any mutation").
+  pub invalidated: u64,
+  /// Kept digests dropped because the disk no longer matched them (a listing refresh, an export's
+  /// re-check, or a watcher hint's revalidation).
+  pub stale: u64,
   /// Exports refused `DigestUnverified`: the file changed while it was being digested.
   pub unverified: u64,
+  /// Digests not kept because the shard's cache was at its bound (`DigestCacheFull`).
+  pub cache_full: u64,
+  /// Digests not kept because they were computed inside the racy window (§4.5): a same-tick
+  /// write could change the bytes without moving the fingerprint.
+  pub racy_uncached: u64,
+  /// Digests held now.
+  pub cached: u64,
+}
+
+/// One kept digest: the directory the entry is homed in (a watcher hint names a directory), the
+/// fingerprint the digest was verified under, and the identity of the bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CachedDigest {
+  home: InodeNo,
+  fingerprint: Fingerprint,
+  identity: [u8; 32],
+}
+
+/// A cache record as the shard's budget sizes it: the key and the kept digest.
+pub(crate) type DigestRecord = (InodeNo, CachedDigest);
+
+/// The divisor between the inode table's bytes and the clean-file digest cache's (§4.15 "bounded
+/// cache discovery"). The inode table is a sixth of a shard's reserve (the daemon's
+/// `STORE_TABLE_DIVISOR`), so the cache is about one percent of the reserve — a planned
+/// optimization's share ("no performance gain is assumed"), to be re-derived from the measured
+/// digest hit rate once the fast path it serves is measured.
+/// Shape: one sixteenth of the inode table's bytes.
+const DIGEST_SHARE_OF_INODE_TABLE: usize = 16;
+
+/// Derived: the digest records a shard may keep — the bytes of a sixteenth of its inode table over
+/// one record's size — so the cache is bounded by the same reserve the tables are sized from
+/// (§4.2) and never grows with the base tree.
+pub fn digest_capacity(max_inodes: usize) -> slates_machine::Derived<usize> {
+  slates_machine::derived!(
+    max_inodes.saturating_mul(std::mem::size_of::<Inode>())
+      / DIGEST_SHARE_OF_INODE_TABLE
+      / std::mem::size_of::<DigestRecord>().max(1),
+    "max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>()",
+    ["store.max_inodes", "reserve_per_shard"]
+  )
+}
+
+/// The shard's digest-cache budget (§4.15 "bounded cache discovery", §4.2): one counted capacity
+/// every overlay volume on the shard keeps its verified digests under, so the caches together
+/// never exceed their derived share. At the bound admission refuses `DigestCacheFull` — the
+/// digest is still exported, only not kept — and the plane counts the refusal.
+#[derive(Debug)]
+pub struct DigestBudget {
+  capacity: usize,
+  live: usize,
+}
+
+impl DigestBudget {
+  /// A budget of `capacity` records, none kept.
+  pub(crate) fn new(capacity: usize) -> Self {
+    Self { capacity, live: 0 }
+  }
+
+  /// The records the shard may keep.
+  pub fn capacity(&self) -> usize {
+    self.capacity
+  }
+
+  /// The records kept now, across every volume on the shard.
+  pub fn live(&self) -> usize {
+    self.live
+  }
+
+  /// Takes one record's slot, or refuses at the bound.
+  fn take(&mut self) -> Result<(), VfsError> {
+    if self.live >= self.capacity {
+      return Err(VfsError::DigestCacheFull);
+    }
+    self.live += 1;
+    Ok(())
+  }
+
+  /// Returns one record's slot.
+  fn give(&mut self) {
+    self.live = self.live.saturating_sub(1);
+  }
 }
 
 /// Entries a fresh listing lacks (by name) and unwitnessed files it still lists with their
@@ -175,6 +266,13 @@ pub struct BasePlane {
   recheck_all: bool,
   /// The digest verb's counters.
   digest_stats: DigestStats,
+  /// Kept digests by the clean file's inode number (§4.15), each holding a slot of the shard's
+  /// [`DigestBudget`]; dropped before any mutation of the entry and whenever the disk no longer
+  /// matches.
+  digests: BTreeMap<InodeNo, CachedDigest>,
+  /// The kept digests homed in each directory, so a watcher hint naming a directory revalidates
+  /// exactly the digests beneath it.
+  digests_by_dir: BTreeMap<InodeNo, BTreeSet<InodeNo>>,
 }
 
 impl BasePlane {
@@ -205,6 +303,8 @@ impl BasePlane {
       recheck: BTreeSet::new(),
       recheck_all: false,
       digest_stats: DigestStats::default(),
+      digests: BTreeMap::new(),
+      digests_by_dir: BTreeMap::new(),
     }
   }
 
@@ -238,6 +338,53 @@ impl BasePlane {
   /// The digest verb's counters, for the tests that must see a path move.
   pub fn digest_stats(&self) -> DigestStats {
     self.digest_stats
+  }
+
+  /// Drops an inode's kept digest, returning its slot to the shard; whether one was kept. The
+  /// caller counts why.
+  fn forget_digest(&mut self, store: &mut Store, no: InodeNo) -> bool {
+    let Some(cached) = self.digests.remove(&no) else {
+      return false;
+    };
+    if let Some(homed) = self.digests_by_dir.get_mut(&cached.home) {
+      homed.remove(&no);
+      if homed.is_empty() {
+        self.digests_by_dir.remove(&cached.home);
+      }
+    }
+    store.digests.give();
+    self.digest_stats.cached = u64::try_from(self.digests.len()).unwrap_or(u64::MAX);
+    true
+  }
+
+  /// Keeps a verified digest under a slot of the shard's budget, or refuses `DigestCacheFull` at
+  /// the bound; an earlier digest of the inode is replaced, never double-counted.
+  fn remember_digest(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    cached: CachedDigest,
+  ) -> Result<(), VfsError> {
+    self.forget_digest(store, no);
+    store.digests.take()?;
+    self.digests.insert(no, cached);
+    self
+      .digests_by_dir
+      .entry(cached.home)
+      .or_default()
+      .insert(no);
+    self.digest_stats.cached = u64::try_from(self.digests.len()).unwrap_or(u64::MAX);
+    Ok(())
+  }
+
+  /// Drops every kept digest (a destroy): every slot goes back to the shard.
+  pub(crate) fn drop_all_digests(&mut self, store: &mut Store) {
+    for _ in 0..self.digests.len() {
+      store.digests.give();
+    }
+    self.digests.clear();
+    self.digests_by_dir.clear();
+    self.digest_stats.cached = 0;
   }
 }
 
@@ -403,9 +550,13 @@ impl Volume {
     }))
   }
 
-  /// Closes the descriptor an inode held, when its last link goes.
-  pub(crate) fn base_forget(&mut self, no: InodeNo) -> Option<HostFile> {
+  /// Closes the descriptor an inode held, when its last link goes; a digest kept for it is
+  /// dropped with it (the entry left the volume: invalidated).
+  pub(crate) fn base_forget(&mut self, store: &mut Store, no: InodeNo) -> Option<HostFile> {
     let plane = self.base.as_mut()?;
+    if plane.forget_digest(store, no) {
+      plane.digest_stats.invalidated += 1;
+    }
     plane.witnesses.remove(&no);
     plane.witness_homes.remove(&no);
     plane.drift.remove(&no);
@@ -629,6 +780,10 @@ impl Overlay<'_> {
   ) -> Result<(), VfsError> {
     if let Some(f) = self.plane()?.descriptors.remove(&no) {
       self.host.close_file(f);
+    }
+    // The listing says the disk moved beneath the entry: a digest kept for it is stale knowledge.
+    if self.plane()?.forget_digest(store, no) {
+      self.plane()?.digest_stats.stale += 1;
     }
     self.adopt_fingerprint(store, no, fp)
   }
@@ -1330,6 +1485,12 @@ impl Overlay<'_> {
     if !is_base {
       return Ok(());
     }
+    // §4.15 "invalidated before any mutation": every mutation of a base entry — content or
+    // metadata — copies it up first, so the digest kept for it is dropped here, before the
+    // witness is recorded and before the mutation is visible.
+    if self.plane()?.forget_digest(store, no) {
+      self.plane()?.digest_stats.invalidated += 1;
+    }
     let (host_dir, name) = self.home_of(store, no)?;
     let file = self.host.open_file(host_dir, &name).map_err(host_refusal)?;
     let fp = self.host.fstat(file).map_err(host_refusal)?;
@@ -1520,16 +1681,73 @@ impl Overlay<'_> {
       return Err(VfsError::DigestNotClean);
     }
     let (file, fingerprint) = self.verify_current(store, no)?;
+    // Discovery (§4.15): a kept digest is reused only after the disk re-verified the fingerprint
+    // it was computed under — the fingerprint is the truth, the cache never is; a kept digest
+    // the disk no longer matches is stale knowledge, dropped before anything else happens.
+    let kept = self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|b| b.digests.get(&no).copied());
+    if let Some(cached) = kept {
+      if cached.fingerprint == fingerprint {
+        self.plane()?.digest_stats.revalidated += 1;
+        return Ok(Digest {
+          identity: cached.identity,
+          size: fingerprint.size,
+        });
+      }
+      if self.plane()?.forget_digest(store, no) {
+        self.plane()?.digest_stats.stale += 1;
+      }
+    }
     let identity = self.hash_file(store, file, fingerprint.size)?;
     let after = self.host.fstat(file).map_err(host_refusal)?;
     if after != fingerprint {
       return Err(self.count_digest_refusal(VfsError::DigestUnverified));
     }
     self.plane()?.digest_stats.computed += 1;
+    self.keep_digest(store, no, fingerprint, identity)?;
     Ok(Digest {
       identity,
       size: fingerprint.size,
     })
+  }
+
+  /// Keeps a freshly verified digest for reuse, unless the racy rule (§4.5) forbids it: a digest
+  /// computed while the file's timestamp tick is still open — within the filesystem's granularity
+  /// of the host's clock — could be silently invalidated by a same-tick write the fingerprint
+  /// cannot show, so it is exported but never kept. At the shard's bound the digest is not kept
+  /// either; both are counted, neither refuses the export.
+  fn keep_digest(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    fingerprint: Fingerprint,
+    identity: [u8; 32],
+  ) -> Result<(), VfsError> {
+    let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
+    let last_change = fingerprint.mtime_ns.max(fingerprint.ctime_ns);
+    if self.host.now_ns().saturating_sub(last_change) <= granularity {
+      self.plane()?.digest_stats.racy_uncached += 1;
+      return Ok(());
+    }
+    let Some(home) = self.vol.inode(store, no)?.home.map(|h| h.parent) else {
+      return Ok(());
+    };
+    let cached = CachedDigest {
+      home,
+      fingerprint,
+      identity,
+    };
+    match self.plane()?.remember_digest(store, no, cached) {
+      Ok(()) => Ok(()),
+      Err(VfsError::DigestCacheFull) => {
+        self.plane()?.digest_stats.cache_full += 1;
+        Ok(())
+      }
+      Err(other) => Err(other),
+    }
   }
 
   /// Whether an entry is clean (§4.15): an untouched base file, so its bytes are exactly the
@@ -1587,6 +1805,9 @@ impl Overlay<'_> {
       // the directory at its next use (its listing still names the old fingerprint).
       self.host.close_file(held);
       self.plane()?.descriptors.insert(no, fresh);
+      if self.plane()?.forget_digest(store, no) {
+        self.plane()?.digest_stats.stale += 1;
+      }
       self.adopt_fingerprint(store, no, at_path)?;
       self.invalidate_listing_of(store, no);
       return Ok((fresh, at_path));
@@ -1941,7 +2162,7 @@ impl Overlay<'_> {
       Child::File(no) | Child::Symlink(no) => {
         // The disk holds the bytes: the entry leaves the overlay. The next lookup reloads it
         // from the listing as an untouched base entry, and its cached bytes go with it.
-        if let Some(f) = self.vol.base_forget(no) {
+        if let Some(f) = self.vol.base_forget(store, no) {
           self.host.close_file(f);
         }
         self.drop_entry(store, dir, name)?;

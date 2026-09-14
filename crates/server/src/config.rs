@@ -354,6 +354,12 @@ impl DaemonConfig {
       ["reserve_per_shard", "page"]
     );
     derivations.push(note("max_chunks", &max_chunks));
+    // The clean-file digest cache's bound (§4.15), derived by the store from the inode table it sizes;
+    // computed here too so the boot log carries every derived value with its inputs (R3).
+    derivations.push(note(
+      "digest_cache_entries",
+      &slates_vfs::base::digest_capacity(max_inodes.get()),
+    ));
     let store = StoreCaps {
       max_inodes: max_inodes.get(),
       max_dirs: max_dirs.get(),

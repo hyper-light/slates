@@ -599,6 +599,197 @@ fn a_digest_is_deterministic_and_matches_the_published_blake3_vectors() {
   );
 }
 
+fn stats(vol: &Volume) -> slates_vfs::base::DigestStats {
+  vol.base_plane().unwrap().digest_stats()
+}
+
+fn inode_of(
+  vol: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+  path: &str,
+) -> slates_vfs::ids::InodeNo {
+  vol.with_host(host).resolve(store, path).unwrap().inode
+}
+
+/// The reuse path: a second export of unchanged content is served from the kept digest after the
+/// disk re-verified it — one hash, one reuse, one kept.
+fn assert_second_export_reuses(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
+  let first = digest_of(vol, host, store, "/a").unwrap();
+  let again = digest_of(vol, host, store, "/a").unwrap();
+  assert_eq!(first, again);
+  assert_eq!(stats(vol).computed, 1, "one hash");
+  assert_eq!(
+    stats(vol).revalidated,
+    1,
+    "the second export reused the verified digest"
+  );
+  assert_eq!(stats(vol).cached, 1);
+}
+
+/// A content write and a metadata change each drop the kept digest before the mutation and leave
+/// the entry `DigestNotClean` — never the pre-mutation digest.
+fn assert_write_and_chmod_invalidate(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
+  let a = inode_of(vol, host, store, "/a");
+  vol.with_host(host).write(store, a, 0, b"A").unwrap();
+  assert_eq!(
+    digest_of(vol, host, store, "/a"),
+    Err(VfsError::DigestNotClean),
+    "never the pre-mutation digest"
+  );
+  assert_eq!(stats(vol).invalidated, 1, "dropped before the write");
+  assert_eq!(stats(vol).cached, 0);
+
+  let b = inode_of(vol, host, store, "/b");
+  digest_of(vol, host, store, "/b").unwrap();
+  vol.with_host(host).chmod(store, b, 0o600).unwrap();
+  assert_eq!(
+    digest_of(vol, host, store, "/b"),
+    Err(VfsError::DigestNotClean),
+    "a metadata mutation diverges the entry too"
+  );
+  assert_eq!(stats(vol).invalidated, 2);
+}
+
+/// A rename and an unlink drop the kept digest as the entry leaves its name.
+fn assert_rename_and_unlink_invalidate(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
+  digest_of(vol, host, store, "/c").unwrap();
+  let root = vol.root();
+  vol
+    .with_host(host)
+    .rename(store, root, "c", root, "c2")
+    .unwrap();
+  assert_eq!(stats(vol).invalidated, 3);
+  assert_eq!(
+    digest_of(vol, host, store, "/c2"),
+    Err(VfsError::DigestNotClean)
+  );
+  assert_eq!(digest_of(vol, host, store, "/c"), Err(VfsError::NotFound));
+
+  digest_of(vol, host, store, "/d").unwrap();
+  vol.with_host(host).unlink(store, root, "d").unwrap();
+  assert_eq!(stats(vol).invalidated, 4);
+  assert_eq!(digest_of(vol, host, store, "/d"), Err(VfsError::NotFound));
+}
+
+/// §4.15 "invalidated before any mutation" over the bounded discovery cache (GAP-A9-13): a second
+/// export of unchanged content is served from the cached digest once the disk has re-verified it
+/// (the reuse path's counter moves, no second hash); a write drops the cached digest before the
+/// write is visible and every later export refuses `DigestNotClean` — never the pre-mutation
+/// digest; chmod, rename and unlink invalidate the same way, so no slot is left holding stale
+/// knowledge.
+#[test]
+fn a_second_export_reuses_the_verified_digest_and_a_mutation_invalidates_it_first() {
+  let mut host = SimHost::new();
+  for (name, bytes) in [
+    ("a", "alpha"),
+    ("b", "bravo"),
+    ("c", "charlie"),
+    ("d", "delta"),
+  ] {
+    host.replace_file(&format!("/{name}"), bytes.as_bytes());
+  }
+  // Past the timestamp granularity: the files' ticks are closed, so a digest may be kept.
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  assert_second_export_reuses(&mut vol, &mut host, &mut store);
+  assert_write_and_chmod_invalidate(&mut vol, &mut host, &mut store);
+  assert_rename_and_unlink_invalidate(&mut vol, &mut host, &mut store);
+  assert_eq!(stats(&vol).cached, 0, "no slot holds stale knowledge");
+  assert_eq!(store.digests.live(), 0, "every shard slot is returned");
+}
+
+/// Digests `capacity + 1` clean files: the cache fills, the last is refused a slot; returns the
+/// last file's path.
+fn fill_digest_cache(
+  vol: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+  capacity: usize,
+) -> String {
+  for index in 0..=capacity {
+    digest_of(vol, host, store, &format!("/f{index}")).unwrap();
+  }
+  assert_eq!(stats(vol).cached, u64::try_from(capacity).unwrap());
+  assert_eq!(
+    stats(vol).cache_full,
+    1,
+    "the one past the bound was refused a slot"
+  );
+  assert_eq!(store.digests.live(), capacity);
+  format!("/f{capacity}")
+}
+
+/// An invalidation frees a slot: the next export of `last` is kept, and the one after it reused.
+fn assert_slot_freed_on_invalidation(
+  vol: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+  capacity: usize,
+  last: &str,
+) {
+  let f0 = inode_of(vol, host, store, "/f0");
+  vol.with_host(host).write(store, f0, 0, b"F").unwrap();
+  assert_eq!(store.digests.live(), capacity - 1);
+  digest_of(vol, host, store, last).unwrap();
+  assert_eq!(stats(vol).cache_full, 2, "kept this time: a slot was free");
+  assert_eq!(store.digests.live(), capacity);
+  digest_of(vol, host, store, last).unwrap();
+  assert_eq!(stats(vol).revalidated, 1);
+}
+
+/// §4.15 "bounded cache discovery" (banned item 8): the shard's digest cache holds at most its
+/// derived capacity; past it a fresh digest is still exported but not kept — the typed refusal is
+/// counted and the next export hashes again — and an invalidation frees a slot, so the next
+/// export is kept and then reused.
+#[test]
+fn the_digest_cache_refuses_at_its_derived_bound_and_frees_a_slot_on_invalidation() {
+  let mut store = store();
+  let capacity = store.digests.capacity();
+  assert!(capacity > 0, "a store with inodes caches digests");
+  let mut host = SimHost::new();
+  for index in 0..=capacity {
+    host.replace_file(&format!("/f{index}"), format!("file {index}").as_bytes());
+  }
+  host.advance_ns(2);
+  let mut vol = overlay(&mut host, &mut store);
+  let last = fill_digest_cache(&mut vol, &mut host, &mut store, capacity);
+  digest_of(&mut vol, &mut host, &mut store, &last).unwrap();
+  assert_eq!(
+    stats(&vol).cache_full,
+    2,
+    "still refused: nothing was freed"
+  );
+  assert_eq!(stats(&vol).revalidated, 0);
+  assert_slot_freed_on_invalidation(&mut vol, &mut host, &mut store, capacity, &last);
+}
+
+/// The racy rule (§4.5) applied to the cache: a digest computed while the file's timestamp tick is
+/// still open — within the filesystem's granularity of the host's clock — could be silently
+/// invalidated by a same-tick write the fingerprint cannot show, so it is exported but never kept;
+/// once the tick has closed it is kept and reused.
+#[test]
+fn a_digest_computed_inside_the_racy_window_is_not_cached() {
+  let mut host = SimHost::new();
+  host.set_granularity_ns(1_000);
+  host.replace_file("/f", b"fresh");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(stats(&vol).racy_uncached, 1);
+  assert_eq!(stats(&vol).cached, 0);
+  digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(stats(&vol).computed, 2, "hashed again, never reused");
+  assert_eq!(stats(&vol).revalidated, 0);
+
+  host.advance_ns(1_001);
+  digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(stats(&vol).cached, 1, "the tick has closed");
+  digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(stats(&vol).revalidated, 1);
+}
+
 // ------------------------------------------------------------------ the oracle (T-1.10, AC-1.10)
 
 /// One step of a generated history: the agent's or an outsider's.

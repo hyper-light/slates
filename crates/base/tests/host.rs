@@ -82,6 +82,14 @@ fn the_host_lists_opens_and_reads_the_workspace_tree() {
     "the listing's fingerprint is the file's"
   );
   assert_eq!(read_whole(&mut host, file, expected.len() + 16), expected);
+  // The host's clock is in its fingerprints' domain (the racy rule's "now"): a file written in
+  // the past has a modification time no later than now.
+  assert!(
+    host.now_ns() >= fp.mtime_ns,
+    "now ({}) precedes the manifest's mtime ({}): the clocks are in different domains",
+    host.now_ns(),
+    fp.mtime_ns
+  );
 }
 
 fn read_whole(host: &mut OsHost, file: slates_vfs::host::HostFile, cap: usize) -> Vec<u8> {

@@ -84,6 +84,11 @@ pub struct Store {
   /// merely capped — no volume's advertised allowance can be un-backed capacity another volume also
   /// holds. It lives beside the slab it accounts, reached without a lock.
   pub versions: VersionBudget,
+  /// The shard's clean-file digest cache budget (§4.15 "bounded cache discovery"): one counted
+  /// capacity every overlay volume on the shard keeps its verified digests under, derived from the
+  /// inode table's size ([`crate::base::digest_capacity`]), so the caches together never exceed
+  /// their share of the reserve; at the bound a fresh digest is exported but not kept.
+  pub digests: crate::base::DigestBudget,
 }
 
 impl std::fmt::Debug for Store {
@@ -143,6 +148,9 @@ impl Store {
       versions: VersionBudget::new(
         u64::try_from(config.max_inodes).unwrap_or(u64::MAX),
         COPY_UP_VERSION_HEADROOM,
+      ),
+      digests: crate::base::DigestBudget::new(
+        crate::base::digest_capacity(config.max_inodes).get(),
       ),
     }
   }
@@ -1727,6 +1735,15 @@ impl Volume {
     Ok(())
   }
 
+  /// An overlay's kept digests return their slots to the shard's digest budget at destroy, as the
+  /// retained versions return their charge; the cache is discovery, never state, so dropping it
+  /// loses nothing (§4.15). Nothing to do for a scratch volume.
+  fn release_digest_cache(&mut self, store: &mut Store) {
+    if let Some(plane) = self.base.as_mut() {
+      plane.drop_all_digests(store);
+    }
+  }
+
   /// Begins destroying the volume; the deadlists and the head's own objects are released in
   /// cooperative slices by [`Volume::destroy_step`].
   pub fn destroy(&mut self, store: &mut Store) -> Result<(), VfsError> {
@@ -1738,6 +1755,7 @@ impl Volume {
     // the budget accounting is settled here, at destroy, while `destroy_step` frees the slots in
     // slices afterward. Idempotent against a re-entered destroy — the count is zero the second time.
     store.versions.credit_retention(self.retained_versions());
+    self.release_digest_cache(store);
     let mut queue = Vec::new();
     let snapshots: Vec<SnapshotId> = self
       .snapshots
@@ -2392,7 +2410,7 @@ impl Volume {
     self.live_inodes = self.live_inodes.saturating_sub(1);
     // The base plane's descriptor, if one was held, is closed by the owner of the host at its
     // next `process_hints`; the tables forget the inode now.
-    let _ = self.base_forget(no);
+    let _ = self.base_forget(store, no);
     Ok(())
   }
 
