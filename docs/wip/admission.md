@@ -223,6 +223,34 @@ fit the class with at least half left for records — with the old block bound t
 ledger binds, the next is refused `BudgetExceeded` while bytes and version slots are plainly roomy,
 a destroy returns the records and a fresh create lands; 0.87 s).
 
+## 4d. Effective capacity and mapped versus usable (piece 2)
+
+**Disjoint shard credits.** Each shard maps its own arena region of `reserve_per_shard` bytes, its
+own slabs and its own share of client regions, so no two shards are ever handed the same bytes:
+the "control owner distributes disjoint capacity credits to shards" rule is realized by disjoint
+mappings laid out at boot, and the write path consumes local credits with no shared lock (D-7).
+The laptop is the fleet's degenerate: the same accounting at N = 1 (R8).
+
+**Effective capacity.** The reserve was derived from the machine's total RAM (1f40689's stable
+virtual ceiling, kept). It is now clamped to the tightest bound the OS, a job or a cgroup sets on
+the process (§4.2 "effective capacity ... constrained by OS/job/cgroup/lock limits"):
+`MemoryFacts::limit` — on Linux the smallest `memory.max` (cgroup v2) or `memory.limit_in_bytes`
+(v1) up the process's cgroup path from `/proc/self/cgroup` (a parent's limit binds its children),
+on every Unix a finite `RLIMIT_AS`/`RLIMIT_DATA`; Windows reports none yet (the job object's limit
+is owed). `effective_capacity(total, limit) = min(total, limit)` is the pure decision, cfg-free and
+unit-tested with hostile limit texts (`max`, empty, signs, suffixes, overflow → no bound, never a
+guessed one); the reserve is `region_bytes(effective, shards, classes)` and the boot log records
+`effective_capacity_bytes` with its inputs. A container limited to 2 GiB on a 128 GiB host no
+longer derives 42 GiB shard reserves it would be killed for using. Raw free memory still never
+enters (it is a fluctuating snapshot). The profile field is `#[serde(default)]`, so a profile
+written before it existed still reads.
+
+**Mapped versus usable.** `ShardReport::mapped_bytes` (the arena's address space) now stands beside
+`reserve_bytes` (the buddy-allocatable capacity the budget admits against), so the difference is
+visible rather than implied (§4.2 "geometry report usable capacity, not mapping length"; BUG-2's
+budget-over-usable rule is unchanged and still gated by `crates/mem/tests/capacity.rs`). `slates
+status` prints `mapped=` before `reserve=`.
+
 ## 5. Owed (this charter)
 
 1. ~~Allocator rounding in the write charge~~ — done (§4a).
@@ -230,9 +258,10 @@ a destroy returns the records and a fresh create lands; 0.87 s).
 3. ~~Metadata bytes~~ — done (§4c). Still owed in this dimension: the open-reference maps (~48 B per
    open inode, bounded by the bridge's handle slab) and the guest request buffers
    (`DaemonConfig::guest_credits` on main, derived at boot) composed into the same per-host picture.
-4. **Disjoint per-shard credits and the truthful per-host ledger** (piece 2): the boot-time sum of
-   every shard's mapped classes checked against the host's effective capacity with a typed refusal,
-   mapped versus usable reported per shard.
+4. ~~Effective capacity and mapped versus usable~~ — done (§4d). Still owed: the Windows job-object
+   memory limit (`QueryInformationJobObject`, Win32 FFI under the unsafe budget), and a boot-time
+   typed refusal when a shard's mapped classes exceed the host bound (today the classes are derived
+   from the bound, so the sum fits by construction; the check would guard a hand-edited config).
 5. **Entitlement through resize, pressure and recovery** (piece 3): shrink refusing below retained
    obligations, a pressure signal that stops admission without touching an admitted claim, and the
    restart proof that an admitted claim survives.

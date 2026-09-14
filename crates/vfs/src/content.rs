@@ -139,6 +139,12 @@ impl ChunkStore {
     self.arena.allocated_bytes()
   }
 
+  /// The bytes the arena maps (its address space), of which the budget's usable capacity is at most
+  /// the buddy-allocatable part (§4.2 mapped versus usable).
+  pub fn mapped_bytes(&self) -> usize {
+    self.arena.mapped_bytes()
+  }
+
   /// The most bytes the chunk-record slab can ever hold (§4.2 metadata dimension): its bound in
   /// records times a record slot's bytes.
   pub const fn max_record_footprint_bytes(&self) -> usize {

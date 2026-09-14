@@ -1258,6 +1258,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     retained_versions: state.store.versions.retained(),
     metadata_bytes: state.store.metadata.capacity(),
     committed_metadata: state.store.metadata.committed(),
+    mapped_bytes: u64::try_from(state.store.content.mapped_bytes()).unwrap_or(u64::MAX),
   }
 }
 

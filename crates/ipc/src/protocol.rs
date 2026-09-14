@@ -446,6 +446,10 @@ pub struct ShardReport {
   pub metadata_bytes: u64,
   /// Metadata bytes reserved for the records of the volumes the shard owns.
   pub committed_metadata: u64,
+  /// The bytes the shard's content arena maps — its address space — of which `reserve_bytes` is
+  /// the usable (buddy-allocatable) part the budget admits against (§4.2 "segment, slab and buddy
+  /// geometry report usable capacity, not mapping length": both, so the difference is visible).
+  pub mapped_bytes: u64,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.

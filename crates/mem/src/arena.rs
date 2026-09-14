@@ -170,6 +170,13 @@ impl ChunkArena {
     Ok(())
   }
 
+  /// The bytes the arena's regions map — the address space taken, which the buddy's usable
+  /// [`ChunkArena::capacity`] is at most (§4.2 "segment, slab and buddy geometry report usable
+  /// capacity, not mapping length": both are reported, so the difference is visible).
+  pub fn mapped_bytes(&self) -> usize {
+    self.slots.iter().map(|s| s.region.len()).sum()
+  }
+
   /// The bytes of an extent.
   pub fn bytes(&self, extent: Extent) -> Option<&[u8]> {
     let slot = self.slots.get(usize::from(extent.region))?;

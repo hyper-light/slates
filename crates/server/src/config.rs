@@ -245,8 +245,21 @@ impl DaemonConfig {
     // is a lazy anonymous mapping — it costs no physical RAM until a volume stores bytes, so a virtual
     // ceiling over total is honest), and total is stable, whereas free memory is a fluctuating snapshot
     // that would make the ceiling — and whether the daemon can provision at all — depend on whatever
-    // else the machine is doing at boot (racy under a busy host or a parallel test suite).
-    let reserve = region_bytes(profile.facts.memory.total, shards, MEMORY_CLASSES);
+    // else the machine is doing at boot (racy under a busy host or a parallel test suite). Total is
+    // clamped to the tightest OS/job/cgroup bound on the process when one is set (§4.2 "effective
+    // capacity"): a container's `memory.max` or a finite `RLIMIT_AS` is a hard limit the OS enforces
+    // by killing or refusing, so admitting past it would be a promise the host cannot keep; like
+    // total, a configured bound is stable across the boot.
+    let effective: Derived<u64> = derived!(
+      slates_machine::facts::effective_capacity(
+        profile.facts.memory.total,
+        profile.facts.memory.limit
+      ),
+      "min(memory.total, the OS/job/cgroup bound when one is set)",
+      ["memory.total", "memory.limit"]
+    );
+    derivations.push(note("effective_capacity_bytes", &effective));
+    let reserve = region_bytes(effective.get(), shards, MEMORY_CLASSES);
     derivations.push(note("reserve_per_shard", &reserve));
     let page = profile.facts.page.base;
     let tables: Derived<u64> = derived!(
@@ -643,6 +656,49 @@ mod tests {
     assert!(
       records >= class / 2,
       "at least half the class is left for records ({records} of {class}; slabs {slabs})"
+    );
+  }
+
+  /// AC-0.10 (§4.2 "effective capacity ... constrained by OS/job/cgroup limits"): a bound set on
+  /// the process below its physical memory caps every shard's reserve, so the classes summed over
+  /// the shards never exceed what the host will let the process use; without a bound, or with one
+  /// above total, the reserve is the share of total 1f40689 chose. Non-vacuous: derived from total
+  /// alone, a quarter-of-total bound leaves the reserve four times what the bound allows.
+  #[test]
+  fn a_memory_bound_below_total_caps_the_reserve() {
+    let mut profile = MachineProfile::measure(ProfileOptions {
+      budget_per_probe: Duration::from_millis(1),
+      codecs: false,
+      core_matrix: false,
+    });
+    let total = profile.facts.memory.total;
+    profile.facts.memory.limit = None;
+    let unbounded = DaemonConfig::derive(&profile, "bound-none");
+    let shards = u64::from(unbounded.runtime.shards.max(1));
+    assert_eq!(
+      unbounded.reserve_per_shard,
+      total / shards / MEMORY_CLASSES,
+      "no bound: the reserve is the share of total"
+    );
+    profile.facts.memory.limit = Some(total / 4);
+    let bounded = DaemonConfig::derive(&profile, "bound-quarter");
+    assert_eq!(
+      bounded.reserve_per_shard,
+      total / 4 / shards / MEMORY_CLASSES,
+      "a quarter-of-total bound: the reserve is the share of the bound"
+    );
+    assert!(
+      bounded.reserve_per_shard * shards * MEMORY_CLASSES <= total / 4,
+      "the classes over every shard fit the bound ({} × {shards} × {MEMORY_CLASSES} ≤ {})",
+      bounded.reserve_per_shard,
+      total / 4
+    );
+    profile.facts.memory.limit = Some(total.saturating_mul(2));
+    let above = DaemonConfig::derive(&profile, "bound-above");
+    assert_eq!(
+      above.reserve_per_shard,
+      total / shards / MEMORY_CLASSES,
+      "a bound above total does not raise the reserve"
     );
   }
 }
