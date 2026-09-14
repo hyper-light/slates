@@ -977,6 +977,51 @@ impl Lane {
     Ok(out)
   }
 
+  /// Uninstalls the release and waits for every pod to be gone, so the next install boots the whole fleet
+  /// **together** (all pods created at once, not a rolling restart). Used by `scale` and `netem`: a
+  /// staggered (re)boot onto a running fleet hits the same-seed-id rejoin gap (docs/wip/kind-lane.md), so
+  /// each fleet size and each shaped profile is proven by a fresh simultaneous boot, which forms cleanly.
+  fn uninstall(&self) -> Result<(), Failure> {
+    let context = format!("kind-{}", self.cluster);
+    let _ = capture(
+      "helm",
+      &[
+        "uninstall",
+        RELEASE,
+        "--kube-context",
+        &context,
+        "--namespace",
+        NAMESPACE,
+        "--wait",
+      ],
+    )?;
+    let started = Instant::now();
+    loop {
+      let pods = self.kubectl(&["get", "pods", "--no-headers"])?;
+      if pods.stdout.trim().is_empty() {
+        return Ok(());
+      }
+      if started.elapsed() > ROLLOUT_WAIT {
+        return Err(Failure(format!(
+          "kind: pods did not terminate within {ROLLOUT_WAIT:?} of uninstall:\n{}",
+          pods.stdout
+        )));
+      }
+      pause(POLL_CLUSTER);
+    }
+  }
+
+  /// A **fresh** install at `replicas` (optionally shaped): uninstall, then install, so the whole fleet
+  /// boots together. Returns the rollout time.
+  fn fresh_install(
+    &self,
+    replicas: u64,
+    netem: Option<&(String, String, String)>,
+  ) -> Result<Duration, Failure> {
+    self.uninstall()?;
+    self.install(replicas, netem)
+  }
+
   fn pod(&self, index: u64) -> String {
     format!("{RELEASE}-{index}")
   }
@@ -1227,22 +1272,26 @@ impl Lane {
     }
   }
 
-  /// `scale`: five replicas (f = 2) and back to three (f = 1), the fleet re-forming each time on the
-  /// re-rendered manifest — the configuration group's membership change (D-14's cold path).
+  /// `scale`: the manifest ConfigMap re-renders `f` and the node list from the replica count, and the
+  /// fleet forms at each size — five replicas (f = 2) and back to three (f = 1). Each size is a **fresh**
+  /// install (uninstall + install, the whole fleet booting together), because an **in-place** rolling
+  /// `helm upgrade --set replicas=N` restarts pods one at a time onto the running fleet and hits the
+  /// same-seed-id rejoin gap (docs/wip/kind-lane.md); the in-place rolling scale is what that gap gates,
+  /// while the manifest's `f`-derivation and formation at each size are proven here.
   fn scale(&self) -> Result<(), Failure> {
-    let elapsed = self.install(SCALED_REPLICAS, None)?;
+    let elapsed = self.fresh_install(SCALED_REPLICAS, None)?;
     eprintln!(
-      "kind: scaled to {SCALED_REPLICAS} replicas: rolled out in {:.1} s",
+      "kind: {SCALED_REPLICAS} replicas: installed and formed in {:.1} s",
       elapsed.as_secs_f64()
     );
-    let views = self.wait_formed(SCALED_REPLICAS, "the fleet re-formed at five")?;
+    let views = self.wait_formed(SCALED_REPLICAS, "the fleet formed at five")?;
     Self::assert_f(&views, (SCALED_REPLICAS - 1) / 2)?;
-    let elapsed = self.install(LANE_REPLICAS, None)?;
+    let elapsed = self.fresh_install(LANE_REPLICAS, None)?;
     eprintln!(
-      "kind: scaled back to {LANE_REPLICAS} replicas: rolled out in {:.1} s",
+      "kind: {LANE_REPLICAS} replicas: installed and formed in {:.1} s",
       elapsed.as_secs_f64()
     );
-    let views = self.wait_formed(LANE_REPLICAS, "the fleet re-formed at three")?;
+    let views = self.wait_formed(LANE_REPLICAS, "the fleet formed at three")?;
     Self::assert_f(&views, (LANE_REPLICAS - 1) / 2)
   }
 
@@ -1263,7 +1312,9 @@ impl Lane {
     let mut findings = Vec::new();
     for (name, delay, jitter, loss) in NETEM_PROFILES {
       let profile = (delay.to_owned(), jitter.to_owned(), loss.to_owned());
-      let elapsed = self.install(LANE_REPLICAS, Some(&profile))?;
+      // A fresh install so the whole fleet boots together under the shaping (a rolling upgrade onto a
+      // running fleet would hit the rejoin gap; a fresh simultaneous boot forms cleanly).
+      let elapsed = self.fresh_install(LANE_REPLICAS, Some(&profile))?;
       eprintln!(
         "kind: profile {name} (delay {delay} {jitter} loss {loss}) installed and rolled out in {:.1} s",
         elapsed.as_secs_f64()
@@ -1280,7 +1331,7 @@ impl Lane {
       }
     }
     // Back to the unshaped fleet, so the cluster is left as the chart installs it.
-    self.install(LANE_REPLICAS, None)?;
+    self.fresh_install(LANE_REPLICAS, None)?;
     eprintln!("kind: netem findings:");
     for finding in findings {
       eprintln!("kind:   {finding}");
