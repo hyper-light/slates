@@ -179,6 +179,20 @@ impl<T: Wire> Wire for Option<T> {
   }
 }
 
+/// A boxed value is transparent on the wire: the same bytes and the same schema as the value itself
+/// (a `Box` is where a large, cold field lives in memory so the enum that carries the message stays
+/// small — never a shape a receiver can see), so either side may hold the field boxed or not.
+impl<T: Wire> Wire for Box<T> {
+  const SCHEMA: &'static str = T::SCHEMA;
+  const SCHEMA_HASH: u64 = T::SCHEMA_HASH;
+  fn encode(&self, out: &mut Vec<u8>) {
+    T::encode(self, out);
+  }
+  fn decode(input: &mut &[u8]) -> Result<Self, WireError> {
+    T::decode(input).map(Box::new)
+  }
+}
+
 impl<const N: usize> Wire for [u8; N] {
   const SCHEMA: &'static str = "[u8;N]";
   const SCHEMA_HASH: u64 = crate::schema::mix(crate::schema::fnv64("[u8;N]"), &[N as u64]);

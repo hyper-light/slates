@@ -11,8 +11,8 @@
 use std::time::{Duration, Instant};
 
 use slates_ipc::protocol::{
-  AbsenceIs, CauseRecord, Direction, Filter, GrantScope, Intent, NamePolicy, Refusal, ReplyBody,
-  RequestBody, SizeClass, SpanRecord, TelemetryReport, VolumeId, pack, unpack,
+  AbsenceIs, AttachRequest, CauseRecord, Direction, Filter, GrantScope, Intent, NamePolicy,
+  Refusal, ReplyBody, RequestBody, SizeClass, SpanRecord, TelemetryReport, VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
@@ -305,10 +305,12 @@ fn attach_and_status(client: &mut Client, id: slates_ipc::protocol::VolumeId) ->
     attachment,
     lease_epoch,
     path,
+    ..
   } = client.call(&RequestBody::Attach {
     volume: id,
     snapshot: None,
     intent: Intent::Write,
+    form: AttachRequest::Root,
   })
   else {
     panic!("attach");
@@ -447,6 +449,7 @@ fn lease_scenario() {
     volume: id,
     snapshot: None,
     intent: Intent::Write,
+    form: AttachRequest::Root,
   }) else {
     panic!("attach");
   };
@@ -458,6 +461,7 @@ fn lease_scenario() {
     volume: id,
     snapshot: None,
     intent: Intent::Read,
+    form: AttachRequest::Root,
   }) else {
     panic!("attach read");
   };
@@ -466,6 +470,7 @@ fn lease_scenario() {
     volume: id,
     snapshot: None,
     intent: Intent::Write,
+    form: AttachRequest::Root,
   }) else {
     panic!("attach write");
   };

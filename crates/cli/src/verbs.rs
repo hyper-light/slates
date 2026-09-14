@@ -413,8 +413,32 @@ fn emit_attach(
         .path
         .unwrap_or_else(|| "(none until a bridge exists)".to_owned())
     );
+    println!(
+      "established: {}",
+      slates_mcp::established_json(&attached.established)["form"]
+        .as_str()
+        .unwrap_or("unknown")
+    );
+    print!("{}", capability_text(&attached.capability));
   }
   Ok(())
+}
+
+/// One transport's six facts on one `transport:` line (§4.6 A-9), in the vocabulary the JSON uses.
+fn capability_text(c: &slates_client::AttachmentCapability) -> String {
+  format!(
+    "transport: {} supported={} reason={} target={} read_write={} cache={} open_state={} residency={} conformance={}\n",
+    slates_mcp::transport_name(c.transport),
+    c.supported,
+    c.unsupported_reason
+      .map_or("none", slates_mcp::unsupported_reason_name),
+    slates_mcp::target_path_name(c.target_path),
+    slates_mcp::read_write_name(c.read_write),
+    slates_mcp::kernel_cache_text(c.sharing.cache),
+    c.sharing.server_open_state,
+    slates_mcp::residency_name(c.residency),
+    slates_mcp::conformance_name(c.conformance),
+  )
 }
 
 /// `base rewitness`: the paths whose base drifted, one per text line or a JSON `{ "paths" }` (the key
@@ -804,7 +828,21 @@ fn status_text(report: &StatusReport) -> String {
     report.placed.region,
     option_text(report.placed.mirror_age_ns),
     report.placed.host_epoch
-  )
+  ) + &transports_text(&report.transports)
+}
+
+/// The host's transport report as text (§4.6 A-9): the host facts, then one line per transport.
+fn transports_text(report: &slates_client::TransportReport) -> String {
+  let mut text = format!(
+    "os: {}\nkernel: {}\noci_runtime: {}\n",
+    report.os,
+    report.kernel.as_deref().unwrap_or("absent/not_stated"),
+    slates_mcp::oci_runtime_text(&report.oci_runtime)
+  );
+  for capability in &report.capabilities {
+    text.push_str(&capability_text(capability));
+  }
+  text
 }
 
 /// A health signal's value as text: the measured number, or `absent/<meaning>` when the signal has no

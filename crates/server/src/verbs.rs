@@ -16,10 +16,11 @@ use slates_db::catalog::{
 };
 use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration, rendezvous_first};
 use slates_ipc::protocol::{
-  DaemonReport, Direction, FleetReport, FreshnessBasis, HealthSignal, Intent, NamePolicy,
-  PlacedState, Refusal, RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal,
-  SizeClass, SnapshotId, StatusReport, VolumeId, VolumeSummary, WorkOp, decode_body, encode_body,
-  pack, unpack,
+  AttachRequest, AttachTransport, DaemonReport, Direction, Established, FleetReport,
+  FreshnessBasis, HealthSignal, Intent, NamePolicy, PlacedState, ReadWritePolicy, Refusal,
+  RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal, SizeClass, SnapshotId,
+  StatusReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp, decode_body, encode_body, pack,
+  unpack,
 };
 use slates_ipc::slot::SlotKind;
 use slates_ipc::{IpcError, Request};
@@ -1535,6 +1536,7 @@ fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::ConsumerRevoked => "consumer_revoked",
     Refusal::DigestNotClean => "digest_not_clean",
     Refusal::DigestUnverified => "digest_unverified",
+    Refusal::AttachmentUnsupported { .. } => "attachment_unsupported",
   }
 }
 
@@ -1675,7 +1677,8 @@ fn dispatch_inner(
       volume,
       snapshot,
       intent,
-    } => attach(state, client_id, principal, volume, snapshot, intent),
+      form,
+    } => attach(state, client_id, principal, volume, snapshot, intent, form),
     RequestBody::Detach { attachment } => detach(state, principal, attachment),
     RequestBody::Resize { volume, size } => resize(state, principal, volume, size),
     RequestBody::Destroy { volume } => destroy(state, principal, volume),
@@ -3282,6 +3285,10 @@ fn clone(
   }
 }
 
+/// Attaches in the requested form (§4.4 `attach(volume|snapshot, consumer, transport, chosen_path?)`;
+/// §4.6 A-9). The form is checked before any effect, so a refused form rolls nothing back ("Refusal
+/// rolls back owned resources" holds by having taken none); the reply carries what was established
+/// and the transport's report for this attachment.
 fn attach(
   state: &mut ShardState,
   client_id: u32,
@@ -3289,12 +3296,20 @@ fn attach(
   volume: VolumeId,
   snapshot: Option<SnapshotId>,
   intent: Intent,
+  form: AttachRequest,
 ) -> ReplyBody {
   let (_, record) = match find(state, volume) {
     Ok(x) => x,
     Err(r) => return *r,
   };
   let rights = rights_of(&record, principal);
+  // The container bind is not established by this daemon yet: refused typed, nothing touched.
+  if let AttachRequest::Oci { .. } = &form {
+    return refused(Refusal::AttachmentUnsupported {
+      transport: AttachTransport::Oci,
+      reason: UnsupportedReason::BridgeNotWired,
+    });
+  }
   let now = state.clock.monotonic_ns();
   let lease_epoch = match intent {
     Intent::Read => {
@@ -3351,10 +3366,19 @@ fn attach(
   if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
     return refused(refusal_of_db(&e));
   }
+  // The report for this attachment: the record form, narrowed to the intent (a reader on a volume it
+  // could write is still read-only through this attachment).
+  let mut capability = crate::transports::root(&crate::transports::situation(state, &rights));
+  capability.read_write = match intent {
+    Intent::Read => ReadWritePolicy::ReadOnly,
+    Intent::Write => ReadWritePolicy::ReadWrite,
+  };
   ReplyBody::Attached {
     attachment,
     lease_epoch,
     path: None,
+    established: Established::Record,
+    capability,
   }
 }
 
@@ -3657,9 +3681,11 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
     Ok(x) => x,
     Err(r) => return *r,
   };
-  if !rights_of(&record, principal).read {
+  let rights = rights_of(&record, principal);
+  if !rights.read {
     return forbidden("status");
   }
+  let transports = crate::transports::report(&crate::transports::situation(state, &rights));
   let Ok(slot) = state.volumes.get_mut(handle) else {
     return refused(Refusal::NotFound);
   };
@@ -3700,6 +3726,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       nfs_port: u16::try_from(crate::daemon::NFS_PORT.load(std::sync::atomic::Ordering::Acquire))
         .ok()
         .filter(|port| *port != 0),
+      transports: Box::new(transports),
     },
   }
 }

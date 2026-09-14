@@ -7,9 +7,10 @@ use std::os::windows::io::RawSocket;
 use std::time::Instant;
 
 use slates_ipc::protocol::{
-  AuditEntry, DaemonReport, Direction, Filter, GrantScope, GrantSummary, Intent, LandingOutcome,
-  LandingSummary, MergeWindow, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass, SnapshotId,
-  StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp, pack, unpack,
+  AttachRequest, AttachmentCapability, AuditEntry, DaemonReport, Direction, Established, Filter,
+  GrantScope, GrantSummary, Intent, LandingOutcome, LandingSummary, MergeWindow, NamePolicy,
+  ReplyBody, RequestBody, Scope, SizeClass, SnapshotId, StatusReport, TelemetryReport, VolumeId,
+  VolumeSummary, WorkOp, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect_as};
 use slates_machine::{Derived, derived};
@@ -124,6 +125,10 @@ pub struct Attachment {
   pub lease_epoch: Option<u64>,
   /// The path a bridge publishes (none until a bridge exists).
   pub path: Option<String>,
+  /// What the daemon established for the requested form (§4.4).
+  pub established: Established,
+  /// The transport's report for this attachment: the six facts of §4.6 A-9.
+  pub capability: AttachmentCapability,
 }
 
 /// The client.
@@ -1277,26 +1282,44 @@ impl Client {
     }
   }
 
-  /// Attaches (the client form; a write intent takes the lease).
+  /// Attaches in the record form under the root mount (a write intent takes the lease).
   pub fn attach(
     &mut self,
     volume: VolumeId,
     snapshot: Option<SnapshotId>,
     intent: Intent,
   ) -> Result<Attachment, ClientError> {
+    self.attach_with(volume, snapshot, intent, AttachRequest::Root)
+  }
+
+  /// Attaches in `form` (§4.4 `attach(volume|snapshot, consumer, transport, chosen_path?)`; §4.6
+  /// A-9): the daemon establishes the form and reports it with the transport's capability, or refuses
+  /// the form typed (`Refusal::AttachmentUnsupported{transport, reason}`) before any effect.
+  pub fn attach_with(
+    &mut self,
+    volume: VolumeId,
+    snapshot: Option<SnapshotId>,
+    intent: Intent,
+    form: AttachRequest,
+  ) -> Result<Attachment, ClientError> {
     match self.call(&RequestBody::Attach {
       volume,
       snapshot,
       intent,
+      form,
     })? {
       ReplyBody::Attached {
         attachment,
         lease_epoch,
         path,
+        established,
+        capability,
       } => Ok(Attachment {
         attachment,
         lease_epoch,
         path,
+        established,
+        capability,
       }),
       _ => Err(ClientError::UnexpectedReply { verb: "attach" }),
     }

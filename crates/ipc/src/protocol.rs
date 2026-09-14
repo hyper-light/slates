@@ -222,6 +222,8 @@ pub enum RequestBody {
     snapshot: Option<SnapshotId>,
     /// The intent.
     intent: Intent,
+    /// The form (§4.4 `attach(…, transport, chosen_path?)`; §4.6 A-9).
+    form: AttachRequest,
   },
   /// Detach.
   Detach {
@@ -911,6 +913,208 @@ pub struct StatusReport {
   /// The daemon's NFS loopback port (§4.6), so a client can mount the volume with `mount_nfs
   /// localhost:PORT`; `None` when the daemon is not serving NFS (the listener could not bind).
   pub nfs_port: Option<u16>,
+  /// Every transport this host offers or refuses for the volume, with the six facts of §4.6 A-9, as
+  /// the caller's rights allow. Boxed: a cold report that would otherwise make every reply's move
+  /// larger (the provisioning reply stays small, R9); the wire bytes are the report's own.
+  pub transports: Box<TransportReport>,
+}
+
+/// The transports an attachment can take (§4.6 A-9 "supported transport"; RQ-20: host processes, OCI
+/// containers and Linux guests consume the same VFS). `status` reports each with the six facts of
+/// [`AttachmentCapability`], offered or refused with a typed reason; a request names its form through
+/// [`AttachRequest`]. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachTransport {
+  /// The record form under the daemon's root mount (§4.4 `AttachForm::Root`): the SDK's attachment
+  /// with its lease; the daemon establishes no path of its own for it.
+  Root,
+  /// The macOS host mount: the daemon's NFSv3 loopback export, mounted by the client with `mount_nfs`
+  /// at an existing user-owned directory (`slates mount`) and no privilege (§4.6 "macOS fallback").
+  NfsLoopback,
+  /// The Linux host mount over `/dev/fuse` through `fusermount3` (§4.6 "Linux").
+  Fuse,
+  /// The macOS FSKit module (§4.6 "macOS 26+").
+  Fskit,
+  /// The Windows WinFsp volume on a drive letter (§4.6 "Windows").
+  WinFsp,
+  /// A bind of an established host mount into a container's mount namespace, performed by the host's
+  /// OCI runtime (§4.6 A-9 "A host OCI runtime passes the established host attachment into the
+  /// container mount namespace"); slates records the authorized binding and reports the `mounts` entry.
+  Oci,
+}
+
+/// Where a transport puts the volume (§4.6 A-9 "target-path constraints").
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetPathConstraint {
+  /// Under the daemon's root mount, `<root>/<volume>`; the caller chooses nothing.
+  RootMount,
+  /// An existing directory the caller owns and names; never created by slates (AC-3.5).
+  UserOwnedExistingDirectory,
+  /// A destination inside the container's root filesystem, created there by the OCI runtime and bound
+  /// from the host mount point; no host directory is created and no image is built (§4.6 A-9).
+  ContainerDestination,
+  /// A drive letter (an object-namespace junction), never a directory (§4.6 "Windows").
+  DriveLetter,
+}
+
+/// What the attachment's rights let a consumer do through the transport (§4.6 A-9 "read/write policy").
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadWritePolicy {
+  /// Reads only: every mutation is refused (`EROFS` at a mount, `ro` on a bind).
+  ReadOnly,
+  /// Reads and writes, under the volume's lease.
+  ReadWrite,
+}
+
+/// How a transport's kernel client caches names, attributes and data (§4.6 A-9 "sharing/cache
+/// semantics").
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelCache {
+  /// Not established: no kernel client exists for the form (the record form), or none has negotiated.
+  NotEstablished,
+  /// The kernel client's own timeouts, chosen at mount time by the mounting command (the NFS loopback
+  /// mount asks for `actimeo=1`, `crates/cli/src/mount.rs`); the server is stateless and keeps no open
+  /// state, so coherence is the client's timeout, not an invalidation.
+  ClientTimeouts,
+  /// Negotiated with the kernel or guest at `FUSE_INIT`.
+  Negotiated {
+    /// Whether writeback caching was negotiated (dirty pages held by the client until written back).
+    writeback: bool,
+    /// Whether explicit data invalidation was negotiated.
+    explicit_invalidation: bool,
+  },
+  /// The container's view is the host mount's: the bind adds no cache of its own; a runtime that hosts
+  /// containers in a VM adds its guest's page cache over the share it makes of the host path.
+  InheritedFromHostMount,
+}
+
+/// The sharing and cache semantics of a transport (§4.6 A-9).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharingSemantics {
+  /// One owning shard serves the volume in order (D-7): every transport shares one view.
+  pub one_owning_shard: bool,
+  /// Whether the server keeps per-consumer open state (FUSE and a guest device do; NFS does not).
+  pub server_open_state: bool,
+  /// The kernel-side cache.
+  pub cache: KernelCache,
+}
+
+/// Where the bytes can reside (§4.6 A-9 "residency boundary"; R1: never on a disk).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Residency {
+  /// Only the daemon's RAM.
+  DaemonRam,
+  /// The daemon's RAM and the mounting kernel's page cache on the same host.
+  DaemonRamAndKernelCache,
+  /// The daemon's RAM, the host kernel's cache, and the VM's page cache over its share of the host path
+  /// — every OCI runtime on macOS hosts its containers in a Linux VM.
+  DaemonRamKernelCacheAndRuntimeVm,
+}
+
+/// The evidence behind a transport's report (§4.6 A-9 "conformance evidence"; AC-9.7 "A skipped lane
+/// or pure simulation cannot close its transport guarantee"): the kind of by-use test this tree holds
+/// for the transport on this platform — never a claim that it ran here.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Conformance {
+  /// No by-use evidence for this transport on this platform.
+  None,
+  /// The lifecycle verbs driven over the ring: attach, lease, detach (`crates/server/tests/daemon.rs`).
+  VerbLifecycleTest,
+  /// A real kernel mount driven by use (`crates/cli/tests/cli.rs`, the live mount flow).
+  LiveKernelMountTest,
+  /// The same filesystem workload inside a real container and on the host (T-4.13).
+  ContainerWorkloadTest,
+}
+
+/// Why a transport is not offered here: the `reason` of [`Refusal::AttachmentUnsupported`] and of a
+/// refused entry in the report. Append-only.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnsupportedReason {
+  /// The transport does not exist on this operating system.
+  HostPlatform,
+  /// The daemon's loopback listener did not bind, so there is no export to mount.
+  ListenerNotBound,
+  /// Mounting the transport needs a privilege slates never asks for (R10): the Linux kernel refuses an
+  /// NFS mount in an unprivileged user namespace.
+  MountNeedsPrivilege,
+  /// The bridge exists as a crate but the daemon does not establish or serve it yet.
+  BridgeNotWired,
+  /// A container bind needs an established host mount, and no host mount transport is offered here.
+  HostMountRequired,
+}
+
+/// One transport's report (§4.6 A-9: "supported transport, target-path constraints, read/write policy,
+/// sharing/cache semantics, residency boundary and conformance evidence").
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachmentCapability {
+  /// The transport.
+  pub transport: AttachTransport,
+  /// Whether this daemon establishes it on this host, now.
+  pub supported: bool,
+  /// Why not, when it does not; `None` exactly when `supported`.
+  pub unsupported_reason: Option<UnsupportedReason>,
+  /// The target-path constraint.
+  pub target_path: TargetPathConstraint,
+  /// The read/write policy as the caller's rights (and, on an `attach`, its intent) allow.
+  pub read_write: ReadWritePolicy,
+  /// The sharing and cache semantics.
+  pub sharing: SharingSemantics,
+  /// The residency boundary.
+  pub residency: Residency,
+  /// The conformance evidence.
+  pub conformance: Conformance,
+}
+
+/// The OCI runtime found on the daemon's `PATH` (§4.6 A-9 "Capabilities differ by host, kernel,
+/// runtime"): a fact about this host, not a requirement — the harness may hold its own runtime.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum OciRuntime {
+  /// The first of `runc`, `crun`, `youki`, `docker`, `podman`, `nerdctl` found, in that order.
+  Found {
+    /// The command's name.
+    name: String,
+  },
+  /// The `PATH` was probed and holds none of them.
+  NoneOnPath,
+  /// The `PATH` was not probed on this platform.
+  NotProbed,
+}
+
+/// The host's transport report (§4.6 A-9): the facts that qualify it, then every transport.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct TransportReport {
+  /// The operating system as the kernel names itself (`uname` sysname; `windows` there).
+  pub os: String,
+  /// The kernel release (`uname` release); `None` where the OS states none.
+  pub kernel: Option<String>,
+  /// The OCI runtime on the daemon's `PATH`.
+  pub oci_runtime: OciRuntime,
+  /// Every transport, in a fixed order, offered or refused with its reason.
+  pub capabilities: Vec<AttachmentCapability>,
+}
+
+/// The form an attach asks for (§4.4 `attach(volume|snapshot, consumer, transport, chosen_path?)`).
+/// Append-only.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum AttachRequest {
+  /// The record form under the root mount.
+  Root,
+  /// A bind of the established host mount at `source` — a mount point of this volume on this host,
+  /// by its real path — to `destination` inside a container, for the host's OCI runtime to perform.
+  Oci {
+    /// The host mount point (the bind's `source`).
+    source: String,
+    /// The path inside the container (the bind's `destination`).
+    destination: String,
+  },
+}
+
+/// What an attach established (§4.4 "establish the path or device, then publish `Bound`").
+/// Append-only.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum Established {
+  /// The record under the root mount; no path of its own.
+  Record,
 }
 
 /// An action name and how many entries take it.
@@ -1127,6 +1331,15 @@ pub enum Refusal {
   /// The file changed on the disk while it was being digested (§4.15 "verified current"): nothing
   /// stale is exported; retry.
   DigestUnverified,
+  /// The requested attachment form is not offered here (§4.6 A-9 "Requesting an unsupported form
+  /// returns `AttachmentUnsupported{transport, reason}`"); refused before any effect, and `status`
+  /// reports every transport with its reason.
+  AttachmentUnsupported {
+    /// The transport requested.
+    transport: AttachTransport,
+    /// What is missing.
+    reason: UnsupportedReason,
+  },
 }
 
 /// A reply body. (`Eq` is not derived: a [`Refusal`] may carry measured probabilities.)
@@ -1197,6 +1410,10 @@ pub enum ReplyBody {
     lease_epoch: Option<u64>,
     /// The path a bridge publishes (none until a bridge exists).
     path: Option<String>,
+    /// What was established for the requested form.
+    established: Established,
+    /// The transport's report for this attachment (§4.6 A-9 "must be reported by `attach`").
+    capability: AttachmentCapability,
   },
   /// Detached.
   Detached,

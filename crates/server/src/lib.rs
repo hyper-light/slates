@@ -38,6 +38,9 @@ pub mod nfs;
 pub mod peer;
 pub mod state;
 pub mod telemetry;
+// The transport capability report of §4.6 A-9 (what `attach` and `status` say each transport can do
+// on this host); pure over one platform seam, so it compiles and tests everywhere.
+pub mod transports;
 pub mod verbs;
 // The virtio-fs guest transport (§4.6 A-9): a guest device served on the volume's owning shard; its
 // loop rides the runtime's Unix descriptor readiness, so it is gated like the NFS transport.

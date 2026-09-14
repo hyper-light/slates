@@ -32,10 +32,12 @@ pub use client::{
 };
 pub use error::ClientError;
 pub use slates_ipc::protocol::{
-  AbsenceIs, ActionCount, AuditEntry, CauseRecord, ChokepointReport, DaemonReport, Filter,
-  FleetReport, GrantScope, GrantSummary, Intent, LandingOutcome, LandingSummary, NamePolicy,
-  PlacedState, Refusal, RefusalCount, Scope, ShardReport, Signal, SizeClass, SnapshotId,
-  SpanRecord, StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp,
+  AbsenceIs, ActionCount, AttachRequest, AttachTransport, AttachmentCapability, AuditEntry,
+  CauseRecord, ChokepointReport, Conformance, DaemonReport, Established, Filter, FleetReport,
+  GrantScope, GrantSummary, Intent, KernelCache, LandingOutcome, LandingSummary, NamePolicy,
+  OciRuntime, PlacedState, ReadWritePolicy, Refusal, RefusalCount, Residency, Scope, ShardReport,
+  SharingSemantics, Signal, SizeClass, SnapshotId, SpanRecord, StatusReport, TargetPathConstraint,
+  TelemetryReport, TransportReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
 };
 /// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async
 /// caller holds it between the send and the reply the completion fd signals (§4.7, D-19).

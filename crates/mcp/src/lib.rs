@@ -21,9 +21,11 @@
 
 use serde_json::{Value, json};
 use slates_client::{
-  Attachment, CauseRecord, ChokepointReport, Client, ClientError, CreateSpec, DaemonReport, Filter,
-  Intent, Landing, LandingOutcome, LandingSummary, NamePolicy, Rebased, ShardReport, Signal,
-  SizeClass, SnapshotId, SpanRecord, StatusReport, Submitted, TelemetryReport, VolumeId,
+  AttachTransport, Attachment, AttachmentCapability, CauseRecord, ChokepointReport, Client,
+  ClientError, Conformance, CreateSpec, DaemonReport, Established, Filter, Intent, KernelCache,
+  Landing, LandingOutcome, LandingSummary, NamePolicy, OciRuntime, ReadWritePolicy, Rebased,
+  Residency, ShardReport, Signal, SizeClass, SnapshotId, SpanRecord, StatusReport, Submitted,
+  TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
   VolumeSummary, WorkOp,
 };
 
@@ -731,7 +733,152 @@ pub fn status_json(r: &StatusReport) -> Value {
       "host_epoch": r.placed.host_epoch,
       "mirror_age_ns": r.placed.mirror_age_ns,
     },
+    "transports": transport_report_json(&r.transports),
   })
+}
+
+/// A transport's name on both surfaces (§4.6 A-9; one vocabulary for the CLI text and the JSON).
+pub fn transport_name(transport: AttachTransport) -> &'static str {
+  match transport {
+    AttachTransport::Root => "root",
+    AttachTransport::NfsLoopback => "nfs_loopback",
+    AttachTransport::Fuse => "fuse",
+    AttachTransport::Fskit => "fskit",
+    AttachTransport::WinFsp => "winfsp",
+    AttachTransport::Oci => "oci",
+  }
+}
+
+/// A refusal reason's name on both surfaces.
+pub fn unsupported_reason_name(reason: UnsupportedReason) -> &'static str {
+  match reason {
+    UnsupportedReason::HostPlatform => "host_platform",
+    UnsupportedReason::ListenerNotBound => "listener_not_bound",
+    UnsupportedReason::MountNeedsPrivilege => "mount_needs_privilege",
+    UnsupportedReason::BridgeNotWired => "bridge_not_wired",
+    UnsupportedReason::HostMountRequired => "host_mount_required",
+  }
+}
+
+/// A target-path constraint's name on both surfaces.
+pub fn target_path_name(target: TargetPathConstraint) -> &'static str {
+  match target {
+    TargetPathConstraint::RootMount => "root_mount",
+    TargetPathConstraint::UserOwnedExistingDirectory => "user_owned_existing_directory",
+    TargetPathConstraint::ContainerDestination => "container_destination",
+    TargetPathConstraint::DriveLetter => "drive_letter",
+  }
+}
+
+/// A read/write policy's name on both surfaces.
+pub fn read_write_name(policy: ReadWritePolicy) -> &'static str {
+  match policy {
+    ReadWritePolicy::ReadOnly => "read_only",
+    ReadWritePolicy::ReadWrite => "read_write",
+  }
+}
+
+/// A residency boundary's name on both surfaces.
+pub fn residency_name(residency: Residency) -> &'static str {
+  match residency {
+    Residency::DaemonRam => "daemon_ram",
+    Residency::DaemonRamAndKernelCache => "daemon_ram_and_kernel_cache",
+    Residency::DaemonRamKernelCacheAndRuntimeVm => "daemon_ram_kernel_cache_and_runtime_vm",
+  }
+}
+
+/// A conformance evidence class's name on both surfaces.
+pub fn conformance_name(conformance: Conformance) -> &'static str {
+  match conformance {
+    Conformance::None => "none",
+    Conformance::VerbLifecycleTest => "verb_lifecycle_test",
+    Conformance::LiveKernelMountTest => "live_kernel_mount_test",
+    Conformance::ContainerWorkloadTest => "container_workload_test",
+  }
+}
+
+/// A kernel cache posture as text: its kind, and for a negotiated one what was negotiated.
+pub fn kernel_cache_text(cache: KernelCache) -> String {
+  match cache {
+    KernelCache::NotEstablished => "not_established".to_owned(),
+    KernelCache::ClientTimeouts => "client_timeouts".to_owned(),
+    KernelCache::Negotiated {
+      writeback,
+      explicit_invalidation,
+    } => format!("negotiated(writeback={writeback},explicit_invalidation={explicit_invalidation})"),
+    KernelCache::InheritedFromHostMount => "inherited_from_host_mount".to_owned(),
+  }
+}
+
+/// A kernel cache posture as JSON: `{ "kind" }`, with the negotiated flags when negotiated.
+fn kernel_cache_json(cache: KernelCache) -> Value {
+  match cache {
+    KernelCache::NotEstablished => json!({ "kind": "not_established" }),
+    KernelCache::ClientTimeouts => json!({ "kind": "client_timeouts" }),
+    KernelCache::Negotiated {
+      writeback,
+      explicit_invalidation,
+    } => json!({
+      "kind": "negotiated",
+      "writeback": writeback,
+      "explicit_invalidation": explicit_invalidation,
+    }),
+    KernelCache::InheritedFromHostMount => json!({ "kind": "inherited_from_host_mount" }),
+  }
+}
+
+/// The OCI runtime probe as text: the command found, or the typed absence.
+pub fn oci_runtime_text(runtime: &OciRuntime) -> String {
+  match runtime {
+    OciRuntime::Found { name } => name.clone(),
+    OciRuntime::NoneOnPath => "absent/none_on_path".to_owned(),
+    OciRuntime::NotProbed => "absent/not_probed".to_owned(),
+  }
+}
+
+/// The OCI runtime probe as JSON: the command's name, or `null` with the typed absence beside it.
+fn oci_runtime_json(runtime: &OciRuntime) -> Value {
+  match runtime {
+    OciRuntime::Found { name } => json!({ "name": name, "absence": Value::Null }),
+    OciRuntime::NoneOnPath => json!({ "name": Value::Null, "absence": "none_on_path" }),
+    OciRuntime::NotProbed => json!({ "name": Value::Null, "absence": "not_probed" }),
+  }
+}
+
+/// One transport's capability as JSON: the six facts of §4.6 A-9 and the refusal reason when not
+/// supported. Public so the CLI's `--json` emits the same schema as the MCP surface (§4.12 parity).
+pub fn capability_json(c: &AttachmentCapability) -> Value {
+  json!({
+    "transport": transport_name(c.transport),
+    "supported": c.supported,
+    "unsupported_reason": c.unsupported_reason.map(unsupported_reason_name),
+    "target_path": target_path_name(c.target_path),
+    "read_write": read_write_name(c.read_write),
+    "sharing": {
+      "one_owning_shard": c.sharing.one_owning_shard,
+      "server_open_state": c.sharing.server_open_state,
+      "cache": kernel_cache_json(c.sharing.cache),
+    },
+    "residency": residency_name(c.residency),
+    "conformance": conformance_name(c.conformance),
+  })
+}
+
+/// The host's transport report as JSON (§4.6 A-9). Public for the CLI's `--json status`.
+pub fn transport_report_json(r: &TransportReport) -> Value {
+  json!({
+    "os": r.os,
+    "kernel": r.kernel,
+    "oci_runtime": oci_runtime_json(&r.oci_runtime),
+    "capabilities": r.capabilities.iter().map(capability_json).collect::<Vec<_>>(),
+  })
+}
+
+/// What an attach established, as JSON: its form.
+pub fn established_json(established: &Established) -> Value {
+  match established {
+    Established::Record => json!({ "form": "record" }),
+  }
 }
 
 /// A landing's summary as JSON: entries per action, bytes to write, and entries the filter excluded.
@@ -758,14 +905,17 @@ pub fn outcome_json(o: &LandingOutcome) -> Value {
   })
 }
 
-/// An attachment as JSON: its id (for detach), the lease epoch for a write attachment, and the path
-/// (none until a bridge exists). Public so the CLI's `--json attach` emits the same schema as the MCP
-/// surface (§4.12 schema parity — one definition, two surfaces).
+/// An attachment as JSON: its id (for detach), the lease epoch for a write attachment, the path
+/// (none until a bridge exists), what was established, and the transport's capability report (§4.6
+/// A-9). Public so the CLI's `--json attach` emits the same schema as the MCP surface (§4.12 schema
+/// parity — one definition, two surfaces).
 pub fn attachment_json(a: &Attachment) -> Value {
   json!({
     "attachment": a.attachment,
     "lease_epoch": a.lease_epoch,
     "path": a.path,
+    "established": established_json(&a.established),
+    "capability": capability_json(&a.capability),
   })
 }
 
