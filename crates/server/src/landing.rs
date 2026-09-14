@@ -488,9 +488,51 @@ pub fn grant_verb(
   }
 }
 
+/// Format: the domain tags that separate the issuer secret's uses — an enrollment proof can never
+/// verify as a revocation proof or a grant proof, whatever the bytes after the tag.
+const ENROLL_DOMAIN: &[u8] = b"slates.enroll";
+/// Format: see `ENROLL_DOMAIN`.
+const REVOKE_DOMAIN: &[u8] = b"slates.revoke";
+
+/// The proof of issuer authority an `Enroll` request carries (§4.13 "Principals": a *trusted* enrollment
+/// establishes a consumer — the same human surface that issues grants): the keyed hash, under the issuer
+/// secret, of the enrollment domain tag and the account the consumer is enrolled under.
+pub fn enroll_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  account: u32,
+) -> [u8; 32] {
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(ENROLL_DOMAIN);
+  hasher.update(&account.to_le_bytes());
+  *hasher.finalize().as_bytes()
+}
+
+/// The proof of issuer authority a `Revoke` request carries: the keyed hash, under the issuer secret, of
+/// the revocation domain tag and the consumer revoked.
+pub fn revoke_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  consumer: u64,
+) -> [u8; 32] {
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(REVOKE_DOMAIN);
+  hasher.update(&consumer.to_le_bytes());
+  *hasher.finalize().as_bytes()
+}
+
+/// The proof a workload presents to bind its channel to an enrolled consumer (§4.13 "a consumer channel
+/// is bound at rendezvous using a capability delivered and retained outside other agents' reach"): the
+/// keyed hash, under the consumer's secret capability, of the client id the daemon assigned this channel
+/// — so a proof captured from one session cannot bind another (the id differs), and the capability itself
+/// never crosses the ring.
+pub fn attest_proof(consumer_secret: &[u8; 32], client_id: u32) -> [u8; 32] {
+  let mut hasher = blake3::Hasher::new_keyed(consumer_secret);
+  hasher.update(&client_id.to_le_bytes());
+  *hasher.finalize().as_bytes()
+}
+
 /// Whether two proofs are equal, visiting every byte whatever the first difference (no early exit), so
 /// the comparison's time does not depend on how much of a forged proof happened to match.
-fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
   let mut difference = 0u8;
   for (x, y) in a.iter().zip(b.iter()) {
     difference |= x ^ y;
@@ -606,6 +648,9 @@ fn to_wire_volume(id: DbVolumeId) -> VolumeId {
 fn session_of(principal: &Principal) -> u64 {
   match principal {
     Principal::Uid { uid } => u64::from(*uid),
+    // A consumer's session is its own, not its account's: two consumers under one uid never share a
+    // session-scoped grant (§4.13 "distinct consumers sharing a uid cannot use each other's grant rights").
+    Principal::Consumer { consumer, .. } => *consumer,
     Principal::Sid { .. } | Principal::Certificate { .. } => 0,
   }
 }

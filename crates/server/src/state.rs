@@ -37,6 +37,11 @@ pub struct ClientSlot {
   /// the daemon learns of a dead client, and whose peer end closing tells the client the
   /// daemon died; held for the client's life).
   pub control: Option<slates_ipc::rendezvous::platform::Control>,
+  /// Set when the consumer this channel attested as has since been revoked by a human (§4.13): every
+  /// later verb on the channel refuses `ConsumerRevoked` before any effect. A local flag — the
+  /// revocation is fanned to every shard's slots when it commits — so the per-verb gate is one read,
+  /// never a cross-shard call on a write path (banned item 10).
+  pub revoked: bool,
 }
 
 impl std::fmt::Debug for ClientSlot {

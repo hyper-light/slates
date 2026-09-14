@@ -1433,6 +1433,7 @@ async fn control_loop(
                 pid,
                 last_seen_ns,
                 control,
+                revoked: false,
               }) {
                 eprintln!("slates-server: client {client_id} refused by the shard's table: {e}");
               }

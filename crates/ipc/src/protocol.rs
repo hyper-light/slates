@@ -58,6 +58,36 @@ pub struct Filter {
   pub exclude: Vec<String>,
 }
 
+/// A principal on the wire (§4.13), as a `share` names one: the host account, or an enrolled consumer
+/// under one. The daemon maps it to the catalog's principal (`verbs::to_db_principal`); a certificate
+/// or SID principal is never named by a client, so neither is on the wire.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum Principal {
+  /// A Unix user.
+  Uid {
+    /// The uid.
+    uid: u32,
+  },
+  /// An enrolled consumer under a host account.
+  Consumer {
+    /// The account.
+    account: u32,
+    /// The consumer id.
+    consumer: u64,
+  },
+}
+
+/// Rights on a volume (§4.13 "Access lists"), as a `share` grants them.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Rights {
+  /// Attach for reading, snapshot reads, status, read_base, versions, export.
+  pub read: bool,
+  /// Attach for writing, the mutating verbs, snapshot, clone, submit, rebase, pin, rewitness, land.
+  pub write: bool,
+  /// Resize, destroy, archive, changing the list, revoking leases.
+  pub admin: bool,
+}
+
 /// A grant's scope (§4.15 step 3): one landing of the bound manifest, or every landing of the
 /// volume into the target for the session.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,6 +290,46 @@ pub enum RequestBody {
     term_ns: u64,
     /// The proof of issuer authority.
     proof: [u8; 32],
+  },
+  /// Enroll a consumer under a host account (§4.13 "Principals"): the human surface, proving issuer
+  /// authority as for a grant, mints a consumer id and the secret capability the workload will bind its
+  /// channel with. The secret is returned once, to the human, who delivers it to the workload through the
+  /// trusted harness — never over a channel other agents share.
+  Enroll {
+    /// The host account (uid) the consumer runs under.
+    account: u32,
+    /// The proof of issuer authority: `BLAKE3_keyed(issuer_secret, "enroll" ‖ account)`.
+    proof: [u8; 32],
+  },
+  /// Bind this channel to an enrolled consumer (§4.13: "a consumer channel is bound at rendezvous using a
+  /// capability delivered and retained outside other agents' reach"): the workload's first verb. The
+  /// proof is `BLAKE3_keyed(consumer_secret, client_id)`, so a proof captured from another session does
+  /// not bind this one. Refused `ConsumerNotEnrolled` (no such consumer, or the proof does not verify) or
+  /// `ConsumerRevoked`; after it, the channel's principal is the consumer and every right is checked
+  /// against it.
+  Attest {
+    /// The consumer.
+    consumer: u64,
+    /// The proof of the capability.
+    proof: [u8; 32],
+  },
+  /// Revoke a consumer's enrollment (§4.13): the human surface, proving issuer authority; every later
+  /// effect from a channel bound to it refuses `ConsumerRevoked`.
+  Revoke {
+    /// The consumer.
+    consumer: u64,
+    /// The proof of issuer authority: `BLAKE3_keyed(issuer_secret, "revoke" ‖ consumer)`.
+    proof: [u8; 32],
+  },
+  /// Set a principal's rights on a volume (§4.13 "Access lists": `admin` covers changing the list; the
+  /// owner holds every right). Rights all false remove the entry.
+  Share {
+    /// The volume.
+    volume: VolumeId,
+    /// The principal given (or denied) rights.
+    principal: Principal,
+    /// The rights.
+    rights: Rights,
   },
   /// The daemon's own status (§4.14 `slates.status`: every shard's counters and health
   /// signals, and the anchor's view of the daemon as the segment holds it).
@@ -979,6 +1049,20 @@ pub enum ReplyBody {
     /// The grant id the landing now carries (`land ... --grant N`).
     grant: u64,
   },
+  /// A consumer was enrolled: its id and — once, to the human surface — the secret capability it
+  /// attests with.
+  Enrolled {
+    /// The consumer id.
+    consumer: u64,
+    /// The capability, shown once.
+    secret: [u8; 32],
+  },
+  /// The channel is bound to the consumer it attested.
+  Attested,
+  /// The consumer's enrollment is revoked.
+  Revoked,
+  /// The principal's rights on the volume are set.
+  Shared,
 }
 
 /// A message body on the ring: the schema hash then the canonical encoding.

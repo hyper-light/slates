@@ -6,9 +6,9 @@
 use slates_wire::Wire;
 
 use crate::catalog::{
-  AccessEntry, AttachmentRecord, AuditRecord, CompletionRecord, GrantRecord, GrantState,
-  LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord, LineageEdge, PlacementState,
-  SizeClass, SnapshotId, SnapshotRecord, VolumeId, VolumeRecord, VolumeState,
+  AccessEntry, AttachmentRecord, AuditRecord, CompletionRecord, ConsumerRecord, GrantRecord,
+  GrantState, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord, LineageEdge,
+  PlacementState, SizeClass, SnapshotId, SnapshotRecord, VolumeId, VolumeRecord, VolumeState,
 };
 
 /// One mutation.
@@ -191,6 +191,17 @@ pub enum Op {
     /// The manifest identity.
     identity: [u8; 32],
   },
+  /// A consumer was enrolled under an account by the human surface (§4.13). Appended at the end for
+  /// append-only evolution.
+  ConsumerEnrolled {
+    /// The record.
+    record: ConsumerRecord,
+  },
+  /// A consumer's enrollment was revoked by the human surface (§4.13).
+  ConsumerRevoked {
+    /// The consumer.
+    consumer: u64,
+  },
 }
 
 impl Op {
@@ -207,6 +218,8 @@ impl Op {
       Op::SnapshotTaken { .. } => "snapshot_taken",
       Op::SnapshotPlaced { .. } => "snapshot_placed",
       Op::SnapshotIdentified { .. } => "snapshot_identified",
+      Op::ConsumerEnrolled { .. } => "consumer_enrolled",
+      Op::ConsumerRevoked { .. } => "consumer_revoked",
       Op::SnapshotDestroyed { .. } => "snapshot_destroyed",
       Op::LineageAdded { .. } => "lineage_added",
       Op::LeaseTaken { .. } => "lease_taken",

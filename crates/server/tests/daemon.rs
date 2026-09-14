@@ -613,6 +613,129 @@ fn a_grant_is_accepted_only_with_a_verified_proof_bound_to_the_presented_landing
   grant_scenario();
 }
 
+/// AC-2.13 / T-2.15 (§4.13 "Principals", "Access lists"): distinct consumers sharing a uid cannot use
+/// each other's VFS or grant rights. The human surface enrolls a consumer under the account; a workload
+/// binds its channel to it with the capability (a forged capability refuses `ConsumerNotEnrolled`); the
+/// consumer sees nothing of the account's volume until the owner shares it (`Forbidden` before any
+/// lookup), then only the right shared (read, not write); a workload cannot mint enrollment authority
+/// (`GrantIssuerUnverified`); once the human revokes the consumer, its very next verb refuses
+/// `ConsumerRevoked` before any effect. Non-vacuous: the forged and the genuine capability differ only in
+/// the secret, and the shared and the unshared right differ only in the access entry.
+#[test]
+fn distinct_consumers_under_one_uid_hold_only_the_rights_shared_with_them_until_revoked() {
+  let (daemon, instance) = daemon("consumers");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let account = current_uid();
+  let mut owner = Client::connect(&instance);
+  let mut workload = Client::connect(&instance);
+
+  // A workload cannot mint enrollment authority: a forged proof refuses.
+  let forged = slates_server::landing::enroll_proof(&[0u8; 32], account);
+  assert!(matches!(
+    workload.call(&RequestBody::Enroll {
+      account,
+      proof: forged
+    }),
+    ReplyBody::Refused {
+      refusal: Refusal::GrantIssuerUnverified
+    }
+  ));
+  // The human surface enrolls a consumer and receives its capability once.
+  let (consumer, capability) = enroll(&mut owner, &secret, account);
+
+  // A forged capability does not bind the channel.
+  let wrong = slates_server::landing::attest_proof(&[0u8; 32], workload.client);
+  assert!(matches!(
+    workload.call(&RequestBody::Attest {
+      consumer,
+      proof: wrong
+    }),
+    ReplyBody::Refused {
+      refusal: Refusal::ConsumerNotEnrolled
+    }
+  ));
+  // The genuine capability binds it; the channel's principal is now the consumer.
+  let proof = slates_server::landing::attest_proof(&capability, workload.client);
+  let attested = workload.call(&RequestBody::Attest { consumer, proof });
+  assert!(
+    matches!(attested, ReplyBody::Attested),
+    "the genuine capability binds the channel, got {attested:?}"
+  );
+
+  // The account owns a volume; the consumer, sharing the uid, sees none of it until shared.
+  let ReplyBody::Created { id } = owner.call(&scratch("private")) else {
+    panic!("create");
+  };
+  assert!(matches!(
+    workload.call(&RequestBody::Status { volume: id }),
+    ReplyBody::Refused {
+      refusal: Refusal::Forbidden { .. }
+    }
+  ));
+  // The owner shares read only: the consumer can read its status, not write (snapshot).
+  assert!(matches!(
+    owner.call(&RequestBody::Share {
+      volume: id,
+      principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+      rights: slates_ipc::protocol::Rights {
+        read: true,
+        write: false,
+        admin: false
+      },
+    }),
+    ReplyBody::Shared
+  ));
+  assert!(matches!(
+    workload.call(&RequestBody::Status { volume: id }),
+    ReplyBody::Status { .. }
+  ));
+  assert!(matches!(
+    workload.call(&RequestBody::Snapshot { volume: id }),
+    ReplyBody::Refused {
+      refusal: Refusal::Forbidden { .. }
+    }
+  ));
+
+  // The human revokes the consumer: its next verb refuses before any effect, and stays refused.
+  let revoke = slates_server::landing::revoke_proof(&secret, consumer);
+  assert!(matches!(
+    owner.call(&RequestBody::Revoke {
+      consumer,
+      proof: revoke
+    }),
+    ReplyBody::Revoked
+  ));
+  assert!(matches!(
+    workload.call(&RequestBody::Status { volume: id }),
+    ReplyBody::Refused {
+      refusal: Refusal::ConsumerRevoked
+    }
+  ));
+  assert!(matches!(
+    workload.call(&RequestBody::List),
+    ReplyBody::Refused {
+      refusal: Refusal::ConsumerRevoked
+    }
+  ));
+  daemon.stop();
+}
+
+/// The human surface enrolls a consumer under `account`, proving issuer authority with the daemon's
+/// secret; returns the consumer id and the capability shown once.
+fn enroll(client: &mut Client, secret: &[u8; 32], account: u32) -> (u64, [u8; 32]) {
+  let proof = slates_server::landing::enroll_proof(secret, account);
+  let ReplyBody::Enrolled { consumer, secret } = client.call(&RequestBody::Enroll { account, proof })
+  else {
+    panic!("the human surface's enrollment was refused");
+  };
+  (consumer, secret)
+}
+
+/// This process's uid — the account every client of these tests rendezvouses as.
+fn current_uid() -> u32 {
+  rustix::process::getuid().as_raw()
+}
+
 /// The scenarios run one daemon at a time (each daemon runs shard threads that spin while a
 /// client is active; several at once would starve each other on one machine).
 #[test]

@@ -9,10 +9,10 @@ use slates_base::OsHost;
 use slates_db::DurabilityScope;
 use slates_db::Op;
 use slates_db::catalog::{
-  AccessEntry, AttachForm, AttachmentRecord, BaseRecord, CompletionRecord, Consumer, LeaseRecord,
-  LineageEdge, NamePolicy as DbNamePolicy, PlacementState, PolicyRecord, Principal, Rights, Role,
-  SizeClass as DbSizeClass, SnapshotId as DbSnapshotId, SnapshotRecord, VolumeId as DbVolumeId,
-  VolumeRecord, VolumeState,
+  AccessEntry, AttachForm, AttachmentRecord, BaseRecord, CompletionRecord, Consumer,
+  ConsumerRecord, LeaseRecord, LineageEdge, NamePolicy as DbNamePolicy, PlacementState,
+  PolicyRecord, Principal, Rights, Role, SizeClass as DbSizeClass, SnapshotId as DbSnapshotId,
+  SnapshotRecord, VolumeId as DbVolumeId, VolumeRecord, VolumeState,
 };
 use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration, rendezvous_first};
 use slates_ipc::protocol::{
@@ -56,6 +56,26 @@ pub(crate) fn to_db_volume(id: VolumeId) -> DbVolumeId {
 
 fn to_wire_volume(id: DbVolumeId) -> VolumeId {
   VolumeId { bytes: id.bytes }
+}
+
+/// A wire principal (as `share` names one) as the catalog's.
+fn to_db_principal(principal: &slates_ipc::protocol::Principal) -> Principal {
+  match principal {
+    slates_ipc::protocol::Principal::Uid { uid } => Principal::Uid { uid: *uid },
+    slates_ipc::protocol::Principal::Consumer { account, consumer } => Principal::Consumer {
+      account: *account,
+      consumer: *consumer,
+    },
+  }
+}
+
+/// Wire rights as the catalog's.
+fn to_db_rights(rights: slates_ipc::protocol::Rights) -> Rights {
+  Rights {
+    read: rights.read,
+    write: rights.write,
+    admin: rights.admin,
+  }
 }
 
 pub(crate) fn to_db_snapshot(id: SnapshotId) -> DbSnapshotId {
@@ -232,8 +252,19 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::Grants
     | RequestBody::Audit { .. }
     | RequestBody::Acknowledge { .. }
-    | RequestBody::Grant { .. } => None,
+    | RequestBody::Grant { .. }
+    | RequestBody::Enroll { .. }
+    | RequestBody::Attest { .. }
+    | RequestBody::Revoke { .. } => None,
+    RequestBody::Share { volume, .. } => Some(*volume),
   }
+}
+
+/// The partition that owns a consumer id — the one its enrollment was recorded on (the id carries it
+/// exactly as a landing id does, `landing_id`), so a revocation routes to the record and an attestation
+/// reads it there (§4.8 "Lookup": ids route to owners).
+pub fn owner_of_consumer(id: u64) -> u16 {
+  owner_of_landing(id)
 }
 
 /// The region a `volume` is homed in, if it is **not** this node's own region — the cross-region redirect
@@ -690,6 +721,27 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       }
     }
   };
+  // A channel bound to a consumer the human has since revoked refuses every effect (§4.13), before any
+  // lookup or mutation, whatever the verb — one local read (the revocation was fanned to this slot).
+  if state.clients.get(client).is_ok_and(|slot| slot.revoked) {
+    *state.refusals.entry("consumer_revoked").or_insert(0) += 1;
+    return Served::Reply(record_completion(
+      state,
+      origin,
+      id,
+      refused(Refusal::ConsumerRevoked),
+    ));
+  }
+  if let RequestBody::Attest { consumer, proof } = body {
+    return attest_on_channel(
+      state,
+      client.index(),
+      request.request,
+      client_id,
+      consumer,
+      proof,
+    );
+  }
   if let RequestBody::List = body {
     return scatter_list(state, client.index(), request.request, principal);
   }
@@ -749,6 +801,8 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     // A grant is served where its landing was presented: the volume's owner shard, which the landing id
     // names — not the client's shard, where nothing is awaiting.
     RequestBody::Grant { landing, .. } => Some(owner_of_landing(*landing)),
+    // A revocation is recorded where the consumer's enrollment is: the partition its id names.
+    RequestBody::Revoke { consumer, .. } => Some(owner_of_consumer(*consumer)),
     other => volume_of(other).map(owner_of),
   };
   if let Some(owner) = owner
@@ -1489,6 +1543,9 @@ fn mutates_shard_image(body: &RequestBody) -> bool {
       | RequestBody::Destroy { .. }
       | RequestBody::Snapshot { .. }
       | RequestBody::DestroySnapshot { .. }
+      | RequestBody::Share { .. }
+      | RequestBody::Enroll { .. }
+      | RequestBody::Revoke { .. }
   )
 }
 
@@ -1600,6 +1657,160 @@ fn dispatch_inner(
       term_ns,
       proof,
     } => crate::landing::grant_verb(state, principal, landing, manifest, scope, term_ns, proof),
+    RequestBody::Enroll { account, proof } => enroll(state, account, proof),
+    RequestBody::Revoke { consumer, proof } => revoke(state, consumer, proof),
+    RequestBody::Share {
+      volume,
+      principal: subject,
+      rights,
+    } => share(state, principal, volume, &subject, rights),
+    // Bound in `serve`, where the channel's slot is in hand; never reaches the dispatch.
+    RequestBody::Attest { .. } => refused(Refusal::BadRequest {
+      reason: "attest is served on the channel".to_owned(),
+    }),
+  }
+}
+
+/// Enrolls a consumer under `account` (§4.13 "Principals"): the human surface's proof of issuer authority
+/// verifies, a consumer id and a secret capability are minted, the hash of the capability is recorded
+/// durably (never the capability), and the capability is returned once for the human to deliver to the
+/// workload through the trusted harness. Refused `GrantIssuerUnverified` — counted — when the proof does
+/// not verify: an agent cannot enroll itself.
+fn enroll(state: &mut ShardState, account: u32, proof: [u8; 32]) -> ReplyBody {
+  let expected = crate::landing::enroll_proof(&state.issuer_secret, account);
+  if !crate::landing::constant_time_eq(&expected, &proof) {
+    *state.refusals.entry("grant_issuer_unverified").or_insert(0) += 1;
+    return refused(Refusal::GrantIssuerUnverified);
+  }
+  let mut secret = [0u8; 32];
+  if slates_transport::handshake::secure_random(&mut secret).is_err() {
+    return refused(Refusal::Unsupported {
+      feature: "the crypto provider's secure random".to_owned(),
+    });
+  }
+  // The consumer id: this partition's next sequence, owner-tagged like a landing id, so two shards never
+  // mint the same id and the human's revocation names one consumer.
+  let consumer = landing_id(state.partition, state.db.next_seq());
+  let record = ConsumerRecord {
+    consumer,
+    account,
+    secret,
+    revoked: false,
+  };
+  let now = state.clock.monotonic_ns();
+  match state
+    .db
+    .mutate(&mut state.segment, &Op::ConsumerEnrolled { record }, now)
+  {
+    Ok(_) => ReplyBody::Enrolled { consumer, secret },
+    Err(e) => refused(refusal_of_db(&e)),
+  }
+}
+
+/// Revokes a consumer's enrollment (§4.13): the human surface's proof verifies, the durable record is
+/// marked, and every later effect from a channel bound to the consumer refuses `ConsumerRevoked`.
+fn revoke(state: &mut ShardState, consumer: u64, proof: [u8; 32]) -> ReplyBody {
+  let expected = crate::landing::revoke_proof(&state.issuer_secret, consumer);
+  if !crate::landing::constant_time_eq(&expected, &proof) {
+    *state.refusals.entry("grant_issuer_unverified").or_insert(0) += 1;
+    return refused(Refusal::GrantIssuerUnverified);
+  }
+  let now = state.clock.monotonic_ns();
+  match state
+    .db
+    .mutate(&mut state.segment, &Op::ConsumerRevoked { consumer }, now)
+  {
+    Ok(_) => ReplyBody::Revoked,
+    Err(e) => refused(refusal_of_db(&e)),
+  }
+}
+
+/// Sets `subject`'s rights on `volume` (§4.13 "Access lists": `admin` covers changing the list; the owner
+/// holds every right). All-false rights remove the entry; the owner's own rights are not an entry and
+/// cannot be reduced here.
+fn share(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  subject: &slates_ipc::protocol::Principal,
+  rights: slates_ipc::protocol::Rights,
+) -> ReplyBody {
+  let (_, record) = match find(state, volume) {
+    Ok(x) => x,
+    Err(r) => return *r,
+  };
+  if !rights_of(&record, principal).admin {
+    return forbidden("share");
+  }
+  let subject = to_db_principal(subject);
+  let rights = to_db_rights(rights);
+  let mut access: Vec<AccessEntry> = record
+    .access
+    .iter()
+    .filter(|entry| entry.principal != subject)
+    .cloned()
+    .collect();
+  if rights.read || rights.write || rights.admin {
+    access.push(AccessEntry {
+      principal: subject,
+      rights,
+    });
+  }
+  let now = state.clock.monotonic_ns();
+  match state.db.mutate(
+    &mut state.segment,
+    &Op::AccessChanged {
+      id: to_db_volume(volume),
+      access,
+    },
+    now,
+  ) {
+    Ok(_) => ReplyBody::Shared,
+    Err(e) => refused(refusal_of_db(&e)),
+  }
+}
+
+/// Binds the channel at `client` to the enrolled consumer it attests (§4.13): the proof — the consumer's
+/// secret capability keyed over this channel's client id — is verified against the durable record's hash
+/// of that capability, so a proof captured from another session does not bind this one; the channel's
+/// principal becomes the consumer, and every later right is checked against it. Refused
+/// `ConsumerNotEnrolled` (no such consumer, an account other than the channel's, or a proof that does not
+/// verify) or `ConsumerRevoked`, each counted.
+fn attest(
+  state: &mut ShardState,
+  client: Handle<ClientSlot>,
+  client_id: u32,
+  consumer: u64,
+  proof: [u8; 32],
+) -> ReplyBody {
+  let Some(record) = state.db.partition().consumer(consumer).cloned() else {
+    *state.refusals.entry("consumer_not_enrolled").or_insert(0) += 1;
+    return refused(Refusal::ConsumerNotEnrolled);
+  };
+  if record.revoked {
+    *state.refusals.entry("consumer_revoked").or_insert(0) += 1;
+    return refused(Refusal::ConsumerRevoked);
+  }
+  // The channel's account must be the one the consumer was enrolled under: a consumer is a workload
+  // *within* an account, never a way across accounts.
+  let account_matches = match state.clients.get(client) {
+    Ok(slot) => matches!(slot.principal, Principal::Uid { uid } if uid == record.account),
+    Err(_) => false,
+  };
+  let expected = crate::landing::attest_proof(&record.secret, client_id);
+  if !account_matches || !crate::landing::constant_time_eq(&expected, &proof) {
+    *state.refusals.entry("consumer_not_enrolled").or_insert(0) += 1;
+    return refused(Refusal::ConsumerNotEnrolled);
+  }
+  match state.clients.get_mut(client) {
+    Ok(slot) => {
+      slot.principal = Principal::Consumer {
+        account: record.account,
+        consumer,
+      };
+      ReplyBody::Attested
+    }
+    Err(_) => refused(Refusal::NotFound),
   }
 }
 
