@@ -323,16 +323,14 @@ fn a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it() {
 
   // Let the fleet form: the loops establish their sessions and exchange probes over the transport. The
   // test thread is not a runtime task, so it waits by yielding on the clock (as the other daemon tests do
-  // — the runtime's `futures::sleep` is unavailable off a shard).
-  let settle = Instant::now() + FORMATION_SETTLE;
-  while Instant::now() < settle {
-    std::thread::yield_now();
-  }
+  // — the runtime's `futures::sleep` is unavailable off a shard); formation is polled, then a settle.
+  let formed = form_and_settle(&[&daemon_a, &daemon_b]);
   assert!(
-    daemon_a
-      .fleet_members()
-      .is_some_and(|members| members.contains(&host_b)),
-    "the fleet is up: A holds B in its membership"
+    formed
+      && daemon_a
+        .fleet_members()
+        .is_some_and(|members| members.contains(&host_b)),
+    "the fleet is up: the direct probe mesh formed and A holds B in its membership"
   );
 
   // B dies — its shards, and so its serve loop, stop — so A's probes of B now time out.
@@ -441,6 +439,31 @@ fn holds_for(window: Duration, mut condition: impl FnMut() -> bool) -> bool {
   true
 }
 
+/// A fixed [`FORMATION_SETTLE`] window of yielding on the clock — the test thread is not a runtime task, so
+/// it cannot `futures::sleep`; used only *after* a polled formation, to let freshly formed sessions steady
+/// (a few probes answered, a measured round trip seeded) before the test acts on them.
+fn settle() {
+  let deadline = Instant::now() + FORMATION_SETTLE;
+  while Instant::now() < deadline {
+    std::thread::yield_now();
+  }
+}
+
+/// Waits for every daemon's direct probe mesh to form — polled in daemon time ([`poll_until`]), so a
+/// formation slowed by CPU load is waited out rather than asserted early — and then a fixed [`settle`] so
+/// the sessions steady. Returns whether the mesh formed. A fixed settle alone, followed by an assertion
+/// that the mesh had formed, failed the rejoin test at load average 48 on 2026-09-14 (a formation that
+/// takes longer than two seconds under load is slow, not wrong): only the steadying is a fixed window.
+fn form_and_settle(daemons: &[&Daemon]) -> bool {
+  let formed = poll_until(daemons, FORMATION_DEADLINE, || {
+    daemons
+      .iter()
+      .all(|daemon| daemon.fleet_meshed() == Some(true))
+  });
+  settle();
+  formed
+}
+
 /// AC (§4.8, rejoin): a peer the fleet **retired** is **re-admitted when it comes back**, by SWIM
 /// refutation, realized to slates' spec — the configuration group is the membership authority, SWIM is only
 /// detection, and re-admission needs no separate incarnation tracker or bump because [`Membership::refute`]
@@ -476,15 +499,12 @@ fn a_falsely_retired_peer_rejoins_by_refutation() {
   let daemon_a = start(a, peer_of_a);
   let daemon_b = start(b, peer_of_b);
 
-  // Let the direct probe mesh form and settle (a fixed wait, not an early return): the seeded membership
-  // holds every peer alive from boot, so B must actually be probing A — and their sessions steady — before
-  // the injection, so B hears A's echo and refutes over a stable session rather than one mid-formation.
-  let settle = Instant::now() + FORMATION_SETTLE;
-  while Instant::now() < settle {
-    std::thread::yield_now();
-  }
+  // Let the direct probe mesh form (polled, so a formation slowed by load is waited out) and then settle:
+  // the seeded membership holds every peer alive from boot, so B must actually be probing A — and their
+  // sessions steady — before the injection, so B hears A's echo and refutes over a stable session rather
+  // than one mid-formation.
   assert!(
-    daemon_a.fleet_meshed() == Some(true) && daemon_b.fleet_meshed() == Some(true),
+    form_and_settle(&[&daemon_a, &daemon_b]),
     "the fleet's direct probe mesh formed"
   );
 
@@ -573,10 +593,7 @@ fn a_starved_but_live_peer_is_not_retired() {
   let formed = poll_until(&[&daemon_a, &daemon_b], FORMATION_DEADLINE, || {
     daemon_a.fleet_meshed() == Some(true) && daemon_b.fleet_meshed() == Some(true)
   });
-  let settle = Instant::now() + FORMATION_SETTLE;
-  while Instant::now() < settle {
-    std::thread::yield_now();
-  }
+  settle();
 
   // Starve B: its control shard runs nothing else — no acknowledgements to A — for the whole span.
   let hold = daemon_b.starve_control_shard(STARVATION_NS);
@@ -653,11 +670,11 @@ fn a_restarted_peer_rejoins_under_a_new_member_id_and_the_old_is_retired() {
   let daemon_a = start(a, peer_of_a);
   let daemon_b = start(b, peer_of_b);
 
-  // Form + settle, then confirm A knows B under its old (generation-0) id.
-  let settle = Instant::now() + FORMATION_SETTLE;
-  while Instant::now() < settle {
-    std::thread::yield_now();
-  }
+  // Form (polled) + settle, then confirm A knows B under its old (generation-0) id.
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet's direct probe mesh formed before the test acts"
+  );
   let knew_old = daemon_a
     .fleet_members()
     .is_some_and(|members| members.contains(&b_old));
@@ -2973,12 +2990,13 @@ fn a_provisioned_head_replicates_across_the_fleet() {
   let daemon_a = start(a, peer_of_a);
   let daemon_b = start(b, peer_of_b);
 
-  // Let the fleet form before provisioning: the loops dial and establish their sessions over the transport,
-  // undisturbed by the client and the placement polling below (which run on the same control shard).
-  let settle = Instant::now() + FORMATION_SETTLE;
-  while Instant::now() < settle {
-    std::thread::yield_now();
-  }
+  // Let the fleet form (polled) before provisioning: the loops dial and establish their sessions over the
+  // transport, undisturbed by the client and the placement polling below (which run on the same control
+  // shard).
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet's direct probe mesh formed before the test acts"
+  );
 
   // Provision a volume on A; its object is the volume id.
   let mut client = Client::connect(&instance_a);
@@ -3054,11 +3072,11 @@ fn a_holder_durably_holds_the_owners_replicated_head() {
   let daemon_a = start(a, peer_of_a);
   let daemon_b = start(b, peer_of_b);
 
-  // Let the fleet form before provisioning, as the replication test does.
-  let settle = Instant::now() + FORMATION_SETTLE;
-  while Instant::now() < settle {
-    std::thread::yield_now();
-  }
+  // Let the fleet form (polled) before provisioning, as the replication test does.
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet's direct probe mesh formed before the test acts"
+  );
 
   // Provision a volume on A; its object is the volume id, and its head's value is the id bytes.
   let mut client = Client::connect(&instance_a);
@@ -3439,10 +3457,10 @@ fn a_sealed_snapshots_content_replicates_to_the_holder_and_places() {
   };
   let daemon_a = start(a, peer_of_a);
   let daemon_b = start(b, peer_of_b);
-  let settle = Instant::now() + FORMATION_SETTLE;
-  while Instant::now() < settle {
-    std::thread::yield_now();
-  }
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet's direct probe mesh formed before the test acts"
+  );
 
   let mut client = Client::connect(&instance_a);
   let ReplyBody::Created { id } = client.call(&scratch("sealed")) else {
@@ -3843,10 +3861,10 @@ fn a_volume_on_a_non_control_shard_replicates_its_content_and_places() {
   };
   let daemon_a = start_sharded(a, peer_of_a, TWO_SHARDS);
   let daemon_b = start_sharded(b, peer_of_b, TWO_SHARDS);
-  let settle = Instant::now() + FORMATION_SETTLE;
-  while Instant::now() < settle {
-    std::thread::yield_now();
-  }
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet's direct probe mesh formed before the test acts"
+  );
 
   let name = name_on_partition("sealed2", OTHER_PARTITION, usize::from(TWO_SHARDS));
   let mut client = Client::connect(&instance_a);
