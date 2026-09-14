@@ -10,7 +10,8 @@
 //! - `install [--replicas N] [--netem DELAY JITTER LOSS]` — installs or upgrades the chart and waits for
 //!   the rollout (readiness is `slates status` on every pod).
 //! - `prove` — the fleet proof: formation, a volume placed at `f + 1`, the owner's pod deleted (the
-//!   SIGKILL takeover), the successor serving, the replacement pod rejoining.
+//!   SIGKILL takeover), the successor serving; the replacement pod's rejoin is a best-effort observation
+//!   (the RAM-only same-seed-id restart gap, docs/wip/kind-lane.md), not a gate.
 //! - `scale` — `replicas=5` and back to 3: the configuration group's membership change, re-forming each time.
 //! - `netem` — the WAN profiles of §4.8's owed measurement: 80 ms ± 20 ms, the same with 1 % loss, and
 //!   the handshake ceiling at 350 ms; each pod's council timing and the leader's stability over a window.
@@ -902,23 +903,78 @@ impl Lane {
     }
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     stream("helm", &borrowed)?;
-    let timeout = format!("{}s", ROLLOUT_WAIT.as_secs());
-    let rollout = self.kubectl(&[
-      "rollout",
-      "status",
-      &format!("statefulset/{RELEASE}"),
-      "--timeout",
-      &timeout,
-    ])?;
-    if rollout.code != 0 {
-      let pods = self.kubectl(&["get", "pods", "-o", "wide"])?;
-      return Err(Failure(format!(
-        "kind: the rollout of {replicas} replicas did not complete within {ROLLOUT_WAIT:?}: {}\n{}",
-        rollout.stderr.trim(),
-        pods.stdout
-      )));
-    }
+    self.wait_rollout(replicas, started)?;
     Ok(started.elapsed())
+  }
+
+  /// Waits until the StatefulSet reports `replicas` Ready pods on its current revision (readiness is
+  /// `slates status` on each pod), bounded by [`ROLLOUT_WAIT`] from `started`. `kubectl rollout status
+  /// --timeout` did not bound its wait on a stalled pod (measured 14 min for a 300 s timeout, 2026-09-14),
+  /// so the bound is this loop's own. On the bound every not-Ready pod's events and last log lines are
+  /// dumped, so a pod that never answered `status` is diagnosable even after the cluster is deleted.
+  fn wait_rollout(&self, replicas: u64, started: Instant) -> Result<(), Failure> {
+    let statefulset = format!("statefulset/{RELEASE}");
+    loop {
+      let ready = self.kubectl(&[
+        "get",
+        &statefulset,
+        "-o",
+        "jsonpath={.status.readyReplicas} {.status.updatedReplicas} {.status.currentRevision} {.status.updateRevision}",
+      ])?;
+      let mut fields = ready.stdout.split_whitespace();
+      let ready_replicas: u64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+      let updated_replicas: u64 = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+      let current = fields.next().unwrap_or("");
+      let update = fields.next().unwrap_or("");
+      if ready_replicas == replicas && updated_replicas == replicas && current == update {
+        return Ok(());
+      }
+      if started.elapsed() > ROLLOUT_WAIT {
+        let pods = self.kubectl(&["get", "pods", "-o", "wide"])?;
+        let mut report = format!(
+          "kind: the rollout of {replicas} replicas did not complete within {ROLLOUT_WAIT:?} (ready {ready_replicas}, updated {updated_replicas}, revision {current} → {update}):\n{}",
+          pods.stdout
+        );
+        report.push_str(&self.not_ready_diagnostics()?);
+        return Err(Failure(report));
+      }
+      pause(POLL_CLUSTER);
+    }
+  }
+
+  /// The events and the last log lines of every pod that is not Ready — what a not-answering `status`
+  /// left behind (an anchor crash loop, a daemon that never served, a probe that never passed).
+  fn not_ready_diagnostics(&self) -> Result<String, Failure> {
+    /// Shape: the log lines kept per not-Ready pod in the report — the boot lines and the last refusals.
+    const LOG_TAIL: &str = "60";
+    let names = self.kubectl(&[
+      "get",
+      "pods",
+      "-o",
+      "jsonpath={range .items[*]}{.metadata.name}={.status.containerStatuses[0].ready}{\"\\n\"}{end}",
+    ])?;
+    let mut out = String::new();
+    for line in names.stdout.lines() {
+      let Some((pod, ready)) = line.split_once('=') else {
+        continue;
+      };
+      if ready == "true" {
+        continue;
+      }
+      let described = self.kubectl(&["describe", "pod", pod])?;
+      let events = described
+        .stdout
+        .lines()
+        .skip_while(|l| !l.starts_with("Events:"))
+        .collect::<Vec<&str>>()
+        .join("\n");
+      let logs = self.kubectl(&["logs", pod, "--tail", LOG_TAIL])?;
+      out.push_str(&format!(
+        "\n--- {pod} (not Ready) events:\n{events}\n--- {pod} log (last {LOG_TAIL} lines):\n{}{}",
+        logs.stdout, logs.stderr
+      ));
+    }
+    Ok(out)
   }
 
   fn pod(&self, index: u64) -> String {
