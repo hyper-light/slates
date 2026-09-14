@@ -62,6 +62,29 @@ The golden identity (`a_fixed_history_has_a_golden_identity`) is unchanged: that
 removal beneath a rename, so its document bytes are identical. The generative oracle: 0 failures in
 12,000 cases on the fix (40 runs), plus the long run recorded in the commit.
 
+## The second shape, found by the long run on the first fix (49,500 cases)
+
+```
+prefix = [Mkdir([], "e")]
+suffix = [Rename([], "e", [], "a"), Mkdir(["a"], "a"), Rename([], "a", [], "e")]
+directories: applied ["", "/e"] head ["", "/e", "/e/a"]   doc = OpsDocument { (empty) }
+```
+
+A directory renamed away and back within one increment journals a child created meanwhile under
+the transient name `/a/a`, which resolves to nothing in the base or the head, while the child's real
+head path `/e/a` is never journaled and the parent classifies as unchanged (the same inode on both
+sides, so no subtree walk reaches it). The document was empty. Root cause: `fold` collected the
+journaled **names**; only content-written inodes were also touched at every path they have.
+
+Fix: every inode a record names is touched at its head and base paths — a directory through the
+node's parent chain (`Volume::path_of_dir`, the new head twin of `path_of_dir_in`; `path_of_inode`
+names files only, so the directory form was needed), a file or symlink through its home and links —
+so a transient journaled name can never hide a change. Failing test first:
+`a_directory_renamed_away_and_back_with_a_child_created_meanwhile_reads_right` — before: the empty
+document above; after the `fold` change alone still empty (no head-side directory accessor existed);
+after `path_of_dir`: ok. Oracle on the completed fix: 0 failures in 36,000 cases (two 60-run
+batches), plus the long run recorded in the commit.
+
 ## Impact
 
 Any increment that deleted an entry inside a directory it also renamed produced a document whose

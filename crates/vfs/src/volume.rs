@@ -1712,6 +1712,35 @@ impl Volume {
     Some(format!("/{}", parts.join("/")))
   }
 
+  /// The path of a directory inode in the head, through the node's own name and parent chain
+  /// (the head twin of [`Self::path_of_dir_in`]); `None` when the head does not hold it. The
+  /// deriver names a journaled directory by this, not by the transient name it was journaled
+  /// under (a directory renamed away and back within one increment).
+  pub fn path_of_dir(&self, store: &Store, no: InodeNo) -> Option<String> {
+    let inode = self.inode(store, no).ok()?;
+    let Body::Directory(dir) = inode.body else {
+      return None;
+    };
+    let mut parts: Vec<Box<str>> = Vec::new();
+    let mut current = dir;
+    let mut guard = 0usize;
+    while let Ok(node) = store.dirs.get(current) {
+      let Some(parent_no) = node.parent else { break };
+      parts.push(node.name.clone());
+      let Ok(p) = self.inode(store, parent_no) else {
+        break;
+      };
+      let Body::Directory(d) = p.body else { break };
+      current = d;
+      guard += 1;
+      if guard > usize::from(u16::MAX) {
+        break;
+      }
+    }
+    parts.reverse();
+    Some(format!("/{}", parts.join("/")))
+  }
+
   /// The path of a directory inode as a snapshot held it, through the node's own name and
   /// parent chain; `None` when the snapshot did not hold it.
   pub fn path_of_dir_in(&self, store: &Store, id: SnapshotId, no: InodeNo) -> Option<String> {

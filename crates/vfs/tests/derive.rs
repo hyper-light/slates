@@ -444,3 +444,20 @@ fn removals_beneath_renamed_directories_follow_every_rename_shape() {
     ],
   );
 }
+
+/// A directory renamed away and back within one increment (`/e` → `/a`, then `/a` → `/e`), with an
+/// entry created beneath it while it was away: the document must carry the created entry at its
+/// head path with no net rename. Found by the generative oracle after 49,500 cases on the first
+/// fix of the post-rename removal (2026-09-14).
+#[test]
+fn a_directory_renamed_away_and_back_with_a_child_created_meanwhile_reads_right() {
+  use Step::*;
+  derive_and_apply_equals_head(
+    &[Mkdir(at(&[]), "e".into())],
+    &[
+      Rename(at(&[]), "e".into(), at(&[]), "a".into()),
+      Mkdir(at(&["a"]), "a".into()),
+      Rename(at(&[]), "a".into(), at(&[]), "e".into()),
+    ],
+  );
+}

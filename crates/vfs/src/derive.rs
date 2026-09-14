@@ -228,9 +228,27 @@ impl Deriver<'_> {
         self.touched.insert(from.to_string());
       }
     }
-    // A content-written inode is touched at every path it has, on both sides.
-    let written: Vec<InodeNo> = self.maps.keys().copied().collect();
-    for no in written {
+    // Every inode a record names is touched at every path it has, on both sides — not only at the
+    // name it was journaled under. A name can be transient: a directory renamed away and back
+    // within the increment (`/e` → `/a` → `/e`) journals a child created meanwhile as `/a/a`, a
+    // path that resolves to nothing in the base or the head, while the child's real head path
+    // `/e/a` is never journaled and the parent classifies as unchanged (the same inode both sides,
+    // so no subtree walk reaches it). Found by the generative oracle after 49,500 cases,
+    // 2026-09-14. Content-written inodes were already touched this way.
+    let named: BTreeSet<InodeNo> = records
+      .iter()
+      .filter_map(|r| r.inode)
+      .chain(self.maps.keys().copied())
+      .collect();
+    for no in named {
+      // A directory is named through its node's parent chain (`path_of_dir`); a file or symlink
+      // through its home and its links.
+      if let Some(p) = self.vol.path_of_dir(self.store, no) {
+        self.touched.insert(p);
+      }
+      if let Some(p) = self.vol.path_of_dir_in(self.store, self.base, no) {
+        self.touched.insert(p);
+      }
       for p in self.head_paths(no) {
         self.touched.insert(p);
       }
