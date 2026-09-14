@@ -1,0 +1,102 @@
+# Values of the slates chart (docs/deploy.md). Every number here is either the operator's stated policy
+# (marked "Shape:") or derived from another value by the templates (marked "Derived:"); none is a tuning
+# constant of the daemon, which derives its own from the machine it runs on (R3).
+
+# Shape: the fleet's size. The fault tolerance is derived from it: f = ⌊(replicas − 1) / 2⌋, so 2f + 1 ≤
+# replicas — three nodes survive one death at f = 1, five survive two at f = 2. A change of this value is
+# a configuration-group membership change (D-14's cold path): the manifest ConfigMap is re-rendered and
+# every pod restarts on it (the checksum annotation), the fleet re-forming as they come up.
+replicas: 3
+
+image:
+  # The image the Dockerfile at the repository root builds: the `slates` binary on distroless, non-root.
+  repository: slates
+  tag: lane
+  # The KIND lane loads the image into the cluster (`kind load docker-image`), so it is never pulled; a
+  # registry-served production image is pulled once per node as usual.
+  pullPolicy: IfNotPresent
+
+fleet:
+  # Shape: the fleet's TLS name — every node's certificate carries it as a subject alternative name and
+  # every peer verifies its sessions under it (docs/cli.md "Deploying a fleet").
+  name: slates-fleet
+  # Shape: the first node's base UDP port. Node N serves SWIM probes on basePort + 2N and register
+  # records on the next port (`slates_server::deploy`: one block of two ports per node, in manifest
+  # order), each pod at its own IP; nothing in front of them — the fleet's session plane pins each peer's
+  # source, so no kube-proxy or load balancer may sit between two nodes.
+  basePort: 7000
+  # The operator's durability policy, optional (docs/cli.md): the accepted probability of losing some
+  # object when `coincident_failures` hosts fail at once. A policy, so it is stated, never derived.
+  # durability:
+  #   accepted_loss: 0.01
+  #   coincident_failures: 1
+
+# Shape: the cluster's DNS suffix, for each node's per-pod name
+# `<release>-N.<release>.<namespace>.svc.<clusterDomain>` — the manifest's address, resolved by the daemon at
+# every dial (a rescheduled pod is found at its new IP).
+clusterDomain: cluster.local
+
+# The per-pod identities: for every pod `<release>-N` (N below `replicas`), its DER certificate and DER
+# private key, base64-encoded. Operator-provisioned (§4.13 enrollment distributes them in the design;
+# until then, minted by the operator's own authority — every certificate must carry `fleet.name` as a
+# subject alternative name and be pinned by its peers, which the manifest does by listing it). The chart
+# never generates a certificate: an identity that changed on a `helm upgrade` would change the node's
+# member id and every peer's pin. The KIND lane mints self-signed ones with `cargo xtask kind certs`
+# and passes them here. The roster's allow-list is exactly this set: each node pins every listed
+# certificate and admits no other (`slates_server::deploy`), and its member id is derived from its own.
+#
+# certificates:
+#   slates-0:
+#     certificate: <base64 DER>
+#     key: <base64 DER>
+certificates: {}
+
+resources:
+  # Shape: the memory each node is given. Requests equal limits, so the pod is Guaranteed QoS and the
+  # daemon's effective capacity (§4.2) clamps to exactly this cgroup bound — a RAM-only service must not
+  # be evicted or reclaimed under it. The daemon fits its arenas to the bound at boot.
+  memory: 1Gi
+  # Shape: the CPUs each node is given, requests equal to limits likewise; the daemon derives its shard
+  # count (one thread per core) from the cgroup quota.
+  cpu: 2
+
+# The nodes a fleet runs on must not swap: a swapped page of a RAM-only service is a disk write the
+# design forbids (R1) and a latency cliff the design's timing does not model. Kubernetes disables swap on
+# nodes by default (`failSwapOn: true`); a cluster that enables it must keep these pods off it.
+nodeSelector: {}
+tolerations: []
+
+# A node is a failure domain (D-14: copysets form across distinct domains), so two members never share a
+# node — required, not preferred. Across zones the spread is preferred: a cluster without zone labels
+# (kind) still schedules.
+topologySpread:
+  zoneKey: topology.kubernetes.io/zone
+  whenUnsatisfiable: ScheduleAnyway
+
+readiness:
+  # Readiness is the daemon's own health signal (§4.14): `slates status` answers exit 0 only when the
+  # daemon serves; never a bare port check. Shape: the probe cadence, seconds.
+  periodSeconds: 5
+  # Shape: how long one `slates status` may take before it counts as a failure, seconds — a status is a
+  # rendezvous and one request, milliseconds on a healthy node.
+  timeoutSeconds: 3
+  # Shape: how long the anchor gets to measure the machine profile and boot the daemon before the first
+  # probe, seconds.
+  initialDelaySeconds: 5
+
+# Extra arguments to `slates anchor` (after `--fleet PATH --node NAME`); `--quick` skips the full machine
+# profile measurement at boot (a test cluster), never a production value.
+extraArgs: []
+
+# The KIND lane's network shaping (docs/wip/kind-lane.md §4): NEVER in a production install. When enabled,
+# an init container with CAP_NET_ADMIN — the one privileged piece, and it is not slates — runs
+# `tc qdisc add dev eth0 root netem ...` in the pod's network namespace before the daemon starts, on the
+# pods listed. The daemon itself still runs non-root with every capability dropped.
+netem:
+  enabled: false
+  image: slates-netem:lane
+  delay: 80ms
+  jitter: 20ms
+  loss: 0%
+  # The ordinals shaped (the others stay on the unshaped path).
+  pods: [0, 1]

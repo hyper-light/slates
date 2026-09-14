@@ -1,0 +1,20 @@
+{{- /*
+The headless Service that gives every pod its stable DNS name, `<fullname>-N.<fullname>.<ns>.svc` — the
+manifest's address for node N, which the daemon resolves at every dial. Headless (no cluster IP, no
+kube-proxy): the fleet's UDP planes run pod to pod, and the session plane's demultiplexer pins each
+peer's source address, so nothing may rewrite it. Not-ready pods are published: a node's name must
+resolve before it is ready, since readiness is the fleet having formed through those very names.
+No ports are declared: the DNS records need none, and each node's UDP block is its own (basePort + 2N).
+*/ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "slates.fullname" . }}
+  labels:
+    {{- include "slates.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "slates.selectorLabels" . | nindent 4 }}
