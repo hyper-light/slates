@@ -305,6 +305,7 @@ fn attach_and_status(client: &mut Client, id: slates_ipc::protocol::VolumeId) ->
     attachment,
     lease_epoch,
     path,
+    version,
   } = client.call(&RequestBody::Attach {
     volume: id,
     snapshot: None,
@@ -315,6 +316,7 @@ fn attach_and_status(client: &mut Client, id: slates_ipc::protocol::VolumeId) ->
   };
   assert_eq!(lease_epoch, Some(1));
   assert_eq!(path, None, "no bridge yet");
+  assert_eq!(version, None, "a plain volume pins no green version");
   let ReplyBody::Status { report } = client.call(&RequestBody::Status { volume: id }) else {
     panic!("status");
   };
@@ -1521,6 +1523,7 @@ fn green_chain_scenario() {
   let ReplyBody::GreenCreated { id } = client.call(&RequestBody::CreateGreen {
     name: "g".to_owned(),
     require_evidence: false,
+    base: None,
   }) else {
     panic!("create green");
   };
@@ -1529,6 +1532,7 @@ fn green_chain_scenario() {
     client.call(&RequestBody::CreateGreen {
       name: "g".to_owned(),
       require_evidence: false,
+      base: None,
     }),
     ReplyBody::Refused {
       refusal: Refusal::AlreadyExists { .. }
@@ -1552,6 +1556,7 @@ fn merge_submit_scenario() {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
     name: "green".to_owned(),
     require_evidence: false,
+    base: None,
   }) else {
     panic!("create green");
   };
@@ -1583,8 +1588,10 @@ fn merge_submit_scenario() {
   declare(&mut client, b, b"world");
 
   // A merges on the fast path; the chain advances.
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit { work: a })
-  else {
+  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
+    work: a,
+    evidence: Vec::new(),
+  }) else {
     panic!("submit a");
   };
   assert!(
@@ -1615,8 +1622,10 @@ fn merge_submit_scenario() {
   );
 
   // B, still based on version 0, touched the same file — it conflicts rather than clobbering A.
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit { work: b })
-  else {
+  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
+    work: b,
+    evidence: Vec::new(),
+  }) else {
     panic!("submit b");
   };
   assert_eq!(version, None, "B is not accepted");
@@ -1636,6 +1645,7 @@ fn merge_modify_scenario() {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
     name: "g2".to_owned(),
     require_evidence: false,
+    base: None,
   }) else {
     panic!("create green");
   };
@@ -1660,7 +1670,10 @@ fn merge_modify_scenario() {
   };
   edit(&mut client, seed, 0, 0, b"hello");
   assert!(matches!(
-    client.call(&RequestBody::Submit { work: seed }),
+    client.call(&RequestBody::Submit {
+      work: seed,
+      evidence: Vec::new()
+    }),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -1675,9 +1688,10 @@ fn merge_modify_scenario() {
   };
   assert_eq!(base, 1, "the work is based on the green's head, version 1");
   edit(&mut client, modw, 0, 5, b"world");
-  let ReplyBody::Submitted { version, conflicts } =
-    client.call(&RequestBody::Submit { work: modw })
-  else {
+  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
+    work: modw,
+    evidence: Vec::new(),
+  }) else {
     panic!("submit");
   };
   assert!(
@@ -1697,6 +1711,7 @@ fn merge_lagging_scenario() {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
     name: "g3".to_owned(),
     require_evidence: false,
+    base: None,
   }) else {
     panic!("create green");
   };
@@ -1725,7 +1740,10 @@ fn merge_lagging_scenario() {
   let (seed, _) = work(&mut client, "seed");
   create_file(&mut client, seed, "base", b"x");
   assert!(matches!(
-    client.call(&RequestBody::Submit { work: seed }),
+    client.call(&RequestBody::Submit {
+      work: seed,
+      evidence: Vec::new()
+    }),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -1739,15 +1757,20 @@ fn merge_lagging_scenario() {
   create_file(&mut client, b, "b", b"b-content");
   // B submits first, advancing the green to version 2; A now lags at base 1.
   assert!(matches!(
-    client.call(&RequestBody::Submit { work: b }),
+    client.call(&RequestBody::Submit {
+      work: b,
+      evidence: Vec::new()
+    }),
     ReplyBody::Submitted {
       version: Some(2),
       ..
     }
   ));
   // A, based on version 1, touched a different file — it merges past version 2 as version 3.
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit { work: a })
-  else {
+  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
+    work: a,
+    evidence: Vec::new(),
+  }) else {
     panic!("submit a");
   };
   assert!(
@@ -1817,9 +1840,10 @@ fn rebase_clean_part(client: &mut Client, green: slates_ipc::protocol::VolumeId)
   assert_eq!(version, Some(2), "the work is rebased onto the head");
   assert_eq!(green_head(client, green), 2, "a rebase commits nothing");
 
-  let ReplyBody::Submitted { version, conflicts } =
-    client.call(&RequestBody::Submit { work: tail })
-  else {
+  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
+    work: tail,
+    evidence: Vec::new(),
+  }) else {
     panic!("submit");
   };
   assert!(
@@ -1838,7 +1862,10 @@ fn rebase_conflict_part(client: &mut Client, green: slates_ipc::protocol::Volume
   edit_f(client, winner, 0, 2, b"PP");
   edit_f(client, loser, 0, 2, b"QQ");
   assert!(matches!(
-    client.call(&RequestBody::Submit { work: winner }),
+    client.call(&RequestBody::Submit {
+      work: winner,
+      evidence: Vec::new()
+    }),
     ReplyBody::Submitted {
       version: Some(4),
       ..
@@ -1871,6 +1898,7 @@ fn merge_rebase_scenario() {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
     name: "g5".to_owned(),
     require_evidence: false,
+    base: None,
   }) else {
     panic!("create green");
   };
@@ -1879,7 +1907,10 @@ fn merge_rebase_scenario() {
   let seed = work_over(&mut client, green, "seed");
   edit_f(&mut client, seed, 0, 0, b"0123456789");
   assert!(matches!(
-    client.call(&RequestBody::Submit { work: seed }),
+    client.call(&RequestBody::Submit {
+      work: seed,
+      evidence: Vec::new()
+    }),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -1888,7 +1919,10 @@ fn merge_rebase_scenario() {
   let front = work_over(&mut client, green, "front");
   edit_f(&mut client, front, 0, 0, b"AB");
   assert!(matches!(
-    client.call(&RequestBody::Submit { work: front }),
+    client.call(&RequestBody::Submit {
+      work: front,
+      evidence: Vec::new()
+    }),
     ReplyBody::Submitted {
       version: Some(2),
       ..
@@ -1940,9 +1974,10 @@ fn declare_metadata_part(client: &mut Client, green: slates_ipc::protocol::Volum
       mode: 0o644,
     },
   );
-  let ReplyBody::Submitted { version, conflicts } =
-    client.call(&RequestBody::Submit { work: meta })
-  else {
+  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
+    work: meta,
+    evidence: Vec::new(),
+  }) else {
     panic!("submit meta");
   };
   assert!(
@@ -1980,16 +2015,19 @@ fn declare_xattr_part(client: &mut Client, green: slates_ipc::protocol::VolumeId
   let other = set(client, "xattr-c", b"BB");
 
   // The first sets the attribute; it advances the green to version 3, storing "AA".
-  let ReplyBody::Submitted { version, .. } = client.call(&RequestBody::Submit { work: first })
-  else {
+  let ReplyBody::Submitted { version, .. } = client.call(&RequestBody::Submit {
+    work: first,
+    evidence: Vec::new(),
+  }) else {
     panic!("submit xattr-a");
   };
   assert_eq!(version, Some(3), "the first xattr set is version 3");
 
   // The second, based on 2, sets a different value — it conflicts against the stored "AA".
-  let ReplyBody::Submitted { version, conflicts } =
-    client.call(&RequestBody::Submit { work: other })
-  else {
+  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit {
+    work: other,
+    evidence: Vec::new(),
+  }) else {
     panic!("submit xattr-c");
   };
   assert_eq!(
@@ -2011,6 +2049,7 @@ fn merge_declare_scenario() {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
     name: "g6".to_owned(),
     require_evidence: false,
+    base: None,
   }) else {
     panic!("create green");
   };
@@ -2018,7 +2057,10 @@ fn merge_declare_scenario() {
   let seed = work_over(&mut client, green, "seed");
   edit_f(&mut client, seed, 0, 0, b"hello");
   assert!(matches!(
-    client.call(&RequestBody::Submit { work: seed }),
+    client.call(&RequestBody::Submit {
+      work: seed,
+      evidence: Vec::new()
+    }),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -2159,4 +2201,613 @@ fn wait_for_volume_count(client: &mut Client, count: usize) {
       "destroy completes in slices: {volumes:?}"
     );
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The merge *service* (§4.16, D-27; the A-9 integration requirement; AC-6.8, AC-6.13/T-6.15): the
+// roles enforced at every verb, a green's chain started only from scratch or a complete immutable
+// base, version-pinned attachments moved only by `advance`, and the submission barrier with every
+// input retained. Folded into one serial test for the same reason as the lifecycle umbrella.
+
+use slates_ipc::protocol::{GreenBase, ReadAt};
+
+/// Creates a green from scratch.
+fn green(
+  client: &mut Client,
+  name: &str,
+  require_evidence: bool,
+) -> slates_ipc::protocol::VolumeId {
+  let ReplyBody::GreenCreated { id } = client.call(&RequestBody::CreateGreen {
+    name: name.to_owned(),
+    require_evidence,
+    base: None,
+  }) else {
+    panic!("create green {name}");
+  };
+  id
+}
+
+/// Reads `path` of `volume` at `at`: the bytes, or the refusal.
+fn read(
+  client: &mut Client,
+  volume: slates_ipc::protocol::VolumeId,
+  path: &str,
+  at: ReadAt,
+) -> Result<Vec<u8>, Refusal> {
+  match client.call(&RequestBody::Read {
+    volume,
+    path: path.to_owned(),
+    at,
+  }) {
+    ReplyBody::ReadBytes { bytes } => Ok(bytes),
+    ReplyBody::Refused { refusal } => Err(refusal),
+    other => panic!("read: {other:?}"),
+  }
+}
+
+/// The refusal a request gets, or a panic naming the reply that was not one.
+fn refusal_of(client: &mut Client, body: &RequestBody) -> Refusal {
+  match client.call(body) {
+    ReplyBody::Refused { refusal } => refusal,
+    other => panic!("{body:?} was not refused: {other:?}"),
+  }
+}
+
+/// Declares a splice on `work`'s `path` (any path, unlike [`edit_f`]).
+fn edit_at(
+  client: &mut Client,
+  work: slates_ipc::protocol::VolumeId,
+  path: &str,
+  at: u64,
+  delete_len: u64,
+  bytes: &[u8],
+) {
+  let reply = client.call(&RequestBody::Edit {
+    work,
+    path: path.to_owned(),
+    at,
+    delete_len,
+    bytes: bytes.to_vec(),
+  });
+  assert!(matches!(reply, ReplyBody::Edited), "edit {path}: {reply:?}");
+}
+
+/// Submits `work` with no evidence and asserts it was accepted as `version`.
+fn submit_accepted(client: &mut Client, work: slates_ipc::protocol::VolumeId, version: u64) {
+  let reply = client.call(&RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  });
+  match reply {
+    ReplyBody::Submitted {
+      version: Some(got),
+      conflicts,
+    } if got == version && conflicts.is_empty() => {}
+    other => panic!("submit expected version {version}: {other:?}"),
+  }
+}
+
+/// A `Submit` request with no evidence.
+fn submit_of(work: slates_ipc::protocol::VolumeId) -> RequestBody {
+  RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  }
+}
+
+/// An `Edit` request creating `f` on `work`.
+fn edit_on(work: slates_ipc::protocol::VolumeId) -> RequestBody {
+  RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"x".to_vec(),
+  }
+}
+
+/// Destroys `volume`, asserting the reply.
+fn destroy_ok(client: &mut Client, volume: slates_ipc::protocol::VolumeId) {
+  let reply = client.call(&RequestBody::Destroy { volume });
+  assert!(matches!(reply, ReplyBody::Destroyed), "destroy: {reply:?}");
+}
+
+/// Snapshots `volume`; the snapshot id.
+fn snapshot_of(
+  client: &mut Client,
+  volume: slates_ipc::protocol::VolumeId,
+) -> slates_ipc::protocol::SnapshotId {
+  let ReplyBody::Snapshotted { id } = client.call(&RequestBody::Snapshot { volume }) else {
+    panic!("snapshot");
+  };
+  id
+}
+
+/// Attaches a reader to `green`; the attachment id and the version it pins.
+fn attach_reader(client: &mut Client, green: slates_ipc::protocol::VolumeId) -> (u64, Option<u64>) {
+  let ReplyBody::Attached {
+    attachment,
+    version,
+    lease_epoch,
+    ..
+  } = client.call(&RequestBody::Attach {
+    volume: green,
+    snapshot: None,
+    intent: Intent::Read,
+  })
+  else {
+    panic!("attach");
+  };
+  assert_eq!(lease_epoch, None, "a reader takes no lease");
+  (attachment, version)
+}
+
+/// Advances `attachment` to `version` (or the head); the version pinned and the paths invalidated.
+fn advance(client: &mut Client, attachment: u64, version: Option<u64>) -> (u64, Vec<String>) {
+  let ReplyBody::Advanced {
+    version,
+    invalidated,
+  } = client.call(&RequestBody::Advance {
+    attachment,
+    version,
+  })
+  else {
+    panic!("advance");
+  };
+  (version, invalidated)
+}
+
+/// A green is written by nothing but its merge task: an edit, a declaration, a write attachment, a
+/// snapshot and a resize of it refuse `ReadOnlyVolume`.
+fn role_green_is_read_only_part(client: &mut Client, g: slates_ipc::protocol::VolumeId) {
+  assert_eq!(refusal_of(client, &edit_on(g)), Refusal::ReadOnlyVolume);
+  let declare_on_green = RequestBody::Declare {
+    work: g,
+    op: slates_ipc::protocol::WorkOp::Mkdir {
+      path: "d".to_owned(),
+    },
+  };
+  assert_eq!(
+    refusal_of(client, &declare_on_green),
+    Refusal::ReadOnlyVolume
+  );
+  let write_attach = RequestBody::Attach {
+    volume: g,
+    snapshot: None,
+    intent: Intent::Write,
+  };
+  assert_eq!(refusal_of(client, &write_attach), Refusal::ReadOnlyVolume);
+  assert_eq!(
+    refusal_of(client, &RequestBody::Snapshot { volume: g }),
+    Refusal::ReadOnlyVolume
+  );
+  let resize = RequestBody::Resize {
+    volume: g,
+    size: SizeClass::Dynamic { max: 1 << 20 },
+  };
+  assert_eq!(refusal_of(client, &resize), Refusal::ReadOnlyVolume);
+}
+
+/// A work verb on what is not a work is `NotWork`; a green verb on what is not a green is `NotGreen`.
+fn role_kind_mismatch_part(
+  client: &mut Client,
+  g: slates_ipc::protocol::VolumeId,
+  w: slates_ipc::protocol::VolumeId,
+  p: slates_ipc::protocol::VolumeId,
+) {
+  assert_eq!(refusal_of(client, &edit_on(p)), Refusal::NotWork);
+  assert_eq!(refusal_of(client, &submit_of(g)), Refusal::NotWork);
+  assert_eq!(
+    refusal_of(client, &RequestBody::Rebase { work: p }),
+    Refusal::NotWork
+  );
+  assert_eq!(
+    refusal_of(client, &RequestBody::Versions { green: w }),
+    Refusal::NotGreen
+  );
+  let changed_since_plain = RequestBody::ChangedSince {
+    green: p,
+    version: 0,
+  };
+  assert_eq!(refusal_of(client, &changed_since_plain), Refusal::NotGreen);
+  let work_over_plain = RequestBody::CreateWork {
+    green: p,
+    name: "over-plain".to_owned(),
+  };
+  assert_eq!(refusal_of(client, &work_over_plain), Refusal::NotGreen);
+}
+
+/// A store-backed verb a merge volume cannot serve is refused `Unsupported`, naming the verb.
+fn role_store_verbs_part(
+  client: &mut Client,
+  g: slates_ipc::protocol::VolumeId,
+  w: slates_ipc::protocol::VolumeId,
+) {
+  let clone = RequestBody::Clone {
+    volume: g,
+    snapshot: slates_ipc::protocol::SnapshotId::default(),
+    name: "c".to_owned(),
+  };
+  let Refusal::Unsupported { feature } = refusal_of(client, &clone) else {
+    panic!("clone of a green");
+  };
+  assert!(feature.contains("clone"), "{feature}");
+  let land = RequestBody::Land {
+    volume: g,
+    snapshot: None,
+    target: "/nonexistent".to_owned(),
+    filter: Filter::default(),
+    grant: None,
+  };
+  let Refusal::Unsupported { feature } = refusal_of(client, &land) else {
+    panic!("land of a green");
+  };
+  assert!(feature.contains("landing"), "{feature}");
+  let Refusal::Unsupported { feature } = refusal_of(client, &RequestBody::Snapshot { volume: w })
+  else {
+    panic!("snapshot of a work");
+  };
+  assert!(feature.contains("work"), "{feature}");
+}
+
+/// A merge volume reports status; a destroyed work is gone; a destroyed green makes its remaining
+/// work's submit `UnknownBase`.
+fn role_destroy_part(
+  client: &mut Client,
+  g: slates_ipc::protocol::VolumeId,
+  w: slates_ipc::protocol::VolumeId,
+) {
+  let ReplyBody::Status { report } = client.call(&RequestBody::Status { volume: g }) else {
+    panic!("status of a green");
+  };
+  assert_eq!(report.head.value, 0, "a fresh green's head version");
+  destroy_ok(client, w);
+  assert_eq!(refusal_of(client, &edit_on(w)), Refusal::NotFound);
+  let orphan = work_over(client, g, "orphan");
+  edit_f(client, orphan, 0, 0, b"hello");
+  destroy_ok(client, g);
+  assert_eq!(
+    refusal_of(client, &submit_of(orphan)),
+    Refusal::UnknownBase {
+      green: g,
+      version: 0
+    }
+  );
+}
+
+/// Evidence: required by the green, refused when absent, accepted when carried.
+fn role_evidence_part(client: &mut Client) {
+  let strict = green(client, "strict", true);
+  let sw = work_over(client, strict, "sw");
+  edit_f(client, sw, 0, 0, b"evidenced");
+  assert_eq!(
+    refusal_of(client, &submit_of(sw)),
+    Refusal::EvidenceRequired
+  );
+  let reply = client.call(&RequestBody::Submit {
+    work: sw,
+    evidence: vec![[7u8; 32]],
+  });
+  assert!(
+    matches!(
+      reply,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "{reply:?}"
+  );
+}
+
+/// AC-6.8 ("Green is written by nothing but the merge task: … SDK writes refuse"), §4.4's merge
+/// refusals: every client mutation of a green refuses `ReadOnlyVolume`; a verb that needs a work
+/// refuses `NotWork` on a plain volume; a verb that needs a green refuses `NotGreen` on a work or a
+/// plain volume; a store-backed verb a merge volume cannot serve refuses `Unsupported` naming it; a
+/// destroyed green makes its works' submits `UnknownBase`; a green that requires evidence refuses
+/// `EvidenceRequired`. Non-vacuous: every one of these answered `NotFound` before the roles were
+/// enforced at the service.
+fn merge_role_scenario() {
+  let (daemon, instance) = daemon("merge-roles");
+  let mut client = Client::connect(&instance);
+  let g = green(&mut client, "g", false);
+  let w = work_over(&mut client, g, "w");
+  let ReplyBody::Created { id: p } = client.call(&scratch("p")) else {
+    panic!("create plain");
+  };
+  role_green_is_read_only_part(&mut client, g);
+  role_kind_mismatch_part(&mut client, g, w, p);
+  role_store_verbs_part(&mut client, g, w);
+  role_destroy_part(&mut client, g, w);
+  role_evidence_part(&mut client);
+  daemon.stop();
+}
+
+/// Writes `text` into `path` on the host through the shell (a test's own disk write, outside slates).
+fn host_write(path: &str, text: &str) {
+  let wrote = std::process::Command::new("sh")
+    .arg("-c")
+    .arg(format!("printf '%s' '{text}' > '{path}'"))
+    .output()
+    .unwrap();
+  assert!(wrote.status.success(), "host write of {path}");
+}
+
+/// Creates an overlay volume over `dir`.
+fn overlay_over(client: &mut Client, name: &str, dir: &str) -> slates_ipc::protocol::VolumeId {
+  let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+    name: name.to_owned(),
+    size: SizeClass::Dynamic { max: 1 << 24 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: Some(dir.to_owned()),
+  }) else {
+    panic!("create overlay");
+  };
+  id
+}
+
+/// A green over the snapshot: the request.
+fn green_over(
+  name: &str,
+  volume: slates_ipc::protocol::VolumeId,
+  snapshot: slates_ipc::protocol::SnapshotId,
+) -> RequestBody {
+  RequestBody::CreateGreen {
+    name: name.to_owned(),
+    require_evidence: false,
+    base: Some(GreenBase { volume, snapshot }),
+  }
+}
+
+/// A snapshot still served live is refused as a base; the whole base pinned and snapshotted again
+/// is accepted, and the green's version 0 reads the pinned bytes.
+fn base_completeness_part(
+  client: &mut Client,
+  overlay: slates_ipc::protocol::VolumeId,
+) -> slates_ipc::protocol::VolumeId {
+  let live = snapshot_of(client, overlay);
+  assert_eq!(
+    refusal_of(client, &green_over("g-live", overlay, live)),
+    Refusal::ConsistentBaseUnavailable,
+    "a snapshot still served from the host directory is no immutable base"
+  );
+  let pinned = client.call(&RequestBody::Pin {
+    volume: overlay,
+    paths: None,
+  });
+  assert!(
+    matches!(pinned, ReplyBody::Pinned { entries: 1 }),
+    "{pinned:?}"
+  );
+  let complete = snapshot_of(client, overlay);
+  let ReplyBody::GreenCreated { id: g } = client.call(&green_over("g-base", overlay, complete))
+  else {
+    panic!("create green over a complete base");
+  };
+  assert_eq!(green_head(client, g), 0, "the origin is version 0");
+  assert_eq!(
+    read(client, g, "f.txt", ReadAt::Version { version: 0 }).unwrap(),
+    b"disk bytes"
+  );
+  g
+}
+
+/// The host moves on; no green version does, nor a work cloned from the green, and a merge on top
+/// of the origin leaves version 0 as it was.
+fn base_immutable_part(client: &mut Client, g: slates_ipc::protocol::VolumeId, dir: &str) {
+  host_write(&format!("{dir}/f.txt"), "HOST MOVED");
+  assert_eq!(
+    read(client, g, "f.txt", ReadAt::Head).unwrap(),
+    b"disk bytes",
+    "the green's head is the origin's bytes, not the disk's"
+  );
+  let w = work_over(client, g, "w");
+  assert_eq!(
+    read(client, w, "f.txt", ReadAt::Head).unwrap(),
+    b"disk bytes",
+    "a work clones the green version, never the disk"
+  );
+  edit_at(client, w, "f.txt", 0, 0, b"agent: ");
+  submit_accepted(client, w, 1);
+  assert_eq!(
+    read(client, g, "f.txt", ReadAt::Version { version: 0 }).unwrap(),
+    b"disk bytes",
+    "version 0 is immutable"
+  );
+  assert_eq!(
+    read(client, g, "f.txt", ReadAt::Version { version: 1 }).unwrap(),
+    b"agent: disk bytes"
+  );
+  assert_eq!(green_head(client, g), 1);
+}
+
+/// The A-9 integration requirement ("Green's immutable version chain starts from scratch or a
+/// complete immutable base, never an implicitly live host directory"; AC-6.13): a green over a
+/// snapshot of an overlay that is still served live is refused `ConsistentBaseUnavailable`; once
+/// the whole base is pinned and snapshotted the green is created with that snapshot as version 0;
+/// an edit of the host directory afterwards changes no green version, nor a work cloned from it.
+/// Non-vacuous: the host file is rewritten with different bytes of the same length, so a version
+/// that read the disk would show the new bytes.
+fn green_over_base_scenario() {
+  let (daemon, instance) = daemon("merge-base");
+  let mut client = Client::connect(&instance);
+  let dir = target_dir();
+  host_write(&format!("{}/f.txt", dir.path), "disk bytes");
+  let overlay = overlay_over(&mut client, "over", &dir.path);
+  let g = base_completeness_part(&mut client, overlay);
+  base_immutable_part(&mut client, g, &dir.path);
+  daemon.stop();
+}
+
+/// A reader pins the head at attach time and does not move when a merge lands a new head.
+fn attachment_pin_part(client: &mut Client, g: slates_ipc::protocol::VolumeId) -> u64 {
+  let a = work_over(client, g, "a");
+  edit_f(client, a, 0, 0, b"first");
+  submit_accepted(client, a, 1);
+  let (attachment, version) = attach_reader(client, g);
+  assert_eq!(
+    version,
+    Some(1),
+    "the attachment pins the head at attach time"
+  );
+  // A second agent lands version 2 (`f` grown, a new file `g`).
+  let b = work_over(client, g, "b");
+  edit_f(client, b, 5, 0, b"+second");
+  edit_at(client, b, "g", 0, 0, b"new");
+  submit_accepted(client, b, 2);
+  let pinned = ReadAt::Attachment { attachment };
+  assert_eq!(
+    read(client, g, "f", pinned).unwrap(),
+    b"first",
+    "the attached view did not move with the head"
+  );
+  assert_eq!(
+    read(client, g, "g", pinned),
+    Err(Refusal::NotFound),
+    "a file born after the pin is not in the attached view"
+  );
+  assert_eq!(read(client, g, "f", ReadAt::Head).unwrap(), b"first+second");
+  attachment
+}
+
+/// `advance` re-pins and names exactly the paths the span changed, forward and back; a version past
+/// the head is `UnknownBase`; a detached attachment reads nothing.
+fn attachment_advance_part(
+  client: &mut Client,
+  g: slates_ipc::protocol::VolumeId,
+  attachment: u64,
+) {
+  let pinned = ReadAt::Attachment { attachment };
+  let (version, invalidated) = advance(client, attachment, None);
+  assert_eq!(version, 2);
+  assert_eq!(invalidated, vec!["f".to_owned(), "g".to_owned()]);
+  assert_eq!(read(client, g, "f", pinned).unwrap(), b"first+second");
+  assert_eq!(read(client, g, "g", pinned).unwrap(), b"new");
+  let (version, invalidated) = advance(client, attachment, Some(1));
+  assert_eq!(
+    (version, invalidated.len()),
+    (1, 2),
+    "back to 1: the same span"
+  );
+  assert_eq!(read(client, g, "f", pinned).unwrap(), b"first");
+}
+
+/// A version past the head is `UnknownBase`; a detached attachment reads nothing.
+fn attachment_bounds_part(client: &mut Client, g: slates_ipc::protocol::VolumeId, attachment: u64) {
+  let pinned = ReadAt::Attachment { attachment };
+  let past = RequestBody::Advance {
+    attachment,
+    version: Some(9),
+  };
+  assert_eq!(
+    refusal_of(client, &past),
+    Refusal::UnknownBase {
+      green: g,
+      version: 9
+    }
+  );
+  let detached = client.call(&RequestBody::Detach { attachment });
+  assert!(matches!(detached, ReplyBody::Detached), "{detached:?}");
+  assert_eq!(read(client, g, "f", pinned), Err(Refusal::NotFound));
+}
+
+/// §4.16 "Attachments and versions" (AC-6.8: "an attachment's view never changes without
+/// `advance`"): a read attachment of a green pins the head at attach time; a merge that lands a new
+/// head leaves the attached view unchanged; `advance` re-pins and names exactly the paths the span
+/// changed; a version past the head is `UnknownBase`; a detached attachment reads nothing.
+fn green_attachment_scenario() {
+  let (daemon, instance) = daemon("merge-attach");
+  let mut client = Client::connect(&instance);
+  let g = green(&mut client, "g", false);
+  let attachment = attachment_pin_part(&mut client, g);
+  attachment_advance_part(&mut client, g, attachment);
+  attachment_bounds_part(&mut client, g, attachment);
+  daemon.stop();
+}
+
+/// A submit seals exactly the operations declared before it; a later edit is the next increment, and
+/// the accepted work equals the green at its new base.
+fn barrier_part(
+  client: &mut Client,
+  g: slates_ipc::protocol::VolumeId,
+) -> slates_ipc::protocol::VolumeId {
+  let w = work_over(client, g, "w");
+  edit_f(client, w, 0, 0, b"hello");
+  submit_accepted(client, w, 1);
+  edit_f(client, w, 5, 0, b" world");
+  assert_eq!(
+    read(client, g, "f", ReadAt::Version { version: 1 }).unwrap(),
+    b"hello",
+    "the sealed version holds only what was declared before the seal"
+  );
+  let ReplyBody::Submitted { version, conflicts } = client.call(&submit_of(w)) else {
+    panic!("second submit");
+  };
+  assert!(
+    conflicts.is_empty(),
+    "the later edit is a new increment, never a conflict with the work's own committed bytes: {conflicts:?}"
+  );
+  assert_eq!(version, Some(2));
+  assert_eq!(
+    read(client, g, "f", ReadAt::Version { version: 2 }).unwrap(),
+    b"hello world"
+  );
+  assert_eq!(
+    read(client, w, "f", ReadAt::Head).unwrap(),
+    b"hello world",
+    "the accepted work equals the green at its new base"
+  );
+  w
+}
+
+/// Another agent lands a disjoint file after the re-based work; destroying the work that produced
+/// versions 1 and 2 frees none of their inputs.
+fn retention_part(
+  client: &mut Client,
+  g: slates_ipc::protocol::VolumeId,
+  w: slates_ipc::protocol::VolumeId,
+) {
+  let other = work_over(client, g, "other");
+  edit_at(client, other, "h", 0, 0, b"other");
+  submit_accepted(client, other, 3);
+  destroy_ok(client, w);
+  assert_eq!(
+    read(client, g, "f", ReadAt::Version { version: 1 }).unwrap(),
+    b"hello"
+  );
+  assert_eq!(
+    read(client, g, "f", ReadAt::Version { version: 2 }).unwrap(),
+    b"hello world"
+  );
+  assert_eq!(read(client, g, "f", ReadAt::Head).unwrap(), b"hello world");
+}
+
+/// §4.16 "Submission" ("seal the work volume … the contributing attachment barrier") and the
+/// retention of every input to the verdict (the A-9 requirement): a submit seals exactly the
+/// operations declared before it — an edit after the seal lands in the *next* increment, never the
+/// sealed one — so the same work submits again cleanly with only its later edit; the accepted
+/// work's content is the green's at the new version; and the inputs of a committed version stay
+/// readable after the work that produced them is destroyed. Non-vacuous: before the accepted
+/// work's journal was consumed, its second submit re-declared the first edit against the old base
+/// and refused a create/create conflict with its own committed bytes
+/// (`docs/bugs/2026-09-13-work-resubmit-self-conflict.md`).
+fn submission_barrier_scenario() {
+  let (daemon, instance) = daemon("merge-barrier");
+  let mut client = Client::connect(&instance);
+  let g = green(&mut client, "g", false);
+  let w = barrier_part(&mut client, g);
+  retention_part(&mut client, g, w);
+  daemon.stop();
+}
+
+/// AC-6.8, AC-6.13/T-6.15 (§4.16 as a service): the roles at every verb, a green only from scratch
+/// or a complete immutable base, version-pinned attachments moved only by `advance`, and the
+/// submission barrier with every input retained — one daemon at a time, as the lifecycle umbrella.
+#[test]
+fn the_merge_service_enforces_roles_pins_versions_and_seals_behind_the_barrier() {
+  merge_role_scenario();
+  green_over_base_scenario();
+  green_attachment_scenario();
+  submission_barrier_scenario();
 }

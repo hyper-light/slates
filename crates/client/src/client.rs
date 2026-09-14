@@ -7,9 +7,10 @@ use std::os::windows::io::RawSocket;
 use std::time::Instant;
 
 use slates_ipc::protocol::{
-  AuditEntry, DaemonReport, Direction, Filter, GrantScope, GrantSummary, Intent, LandingOutcome,
-  LandingSummary, MergeWindow, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass, SnapshotId,
-  StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp, pack, unpack,
+  AuditEntry, DaemonReport, Direction, Filter, GrantScope, GrantSummary, GreenBase, Intent,
+  LandingOutcome, LandingSummary, MergeWindow, NamePolicy, ReadAt, ReplyBody, RequestBody, Scope,
+  SizeClass, SnapshotId, StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp, pack,
+  unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect_as};
 use slates_machine::{Derived, derived};
@@ -124,6 +125,18 @@ pub struct Attachment {
   pub lease_epoch: Option<u64>,
   /// The path a bridge publishes (none until a bridge exists).
   pub path: Option<String>,
+  /// The green version the attachment pins (§4.16), or none for a plain or work volume.
+  pub version: Option<u64>,
+}
+
+/// The result of an `advance` (§4.16 "Attachments and versions"): the version the attachment now
+/// pins and the paths the move invalidated — exactly those some version in the span changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Advanced {
+  /// The version now pinned.
+  pub version: u64,
+  /// The invalidated paths, sorted.
+  pub invalidated: Vec<String>,
 }
 
 /// The client.
@@ -273,6 +286,28 @@ fn extract_edited(body: ReplyBody) -> Result<bool, ClientError> {
   match body {
     ReplyBody::Edited => Ok(true),
     _ => Err(ClientError::UnexpectedReply { verb: "edit" }),
+  }
+}
+
+/// Extracts an advance's outcome (the pinned version and the invalidated paths), or a typed mismatch.
+fn extract_advanced(body: ReplyBody) -> Result<Advanced, ClientError> {
+  match body {
+    ReplyBody::Advanced {
+      version,
+      invalidated,
+    } => Ok(Advanced {
+      version,
+      invalidated,
+    }),
+    _ => Err(ClientError::UnexpectedReply { verb: "advance" }),
+  }
+}
+
+/// Extracts a read's bytes, or a typed mismatch.
+fn extract_read(body: ReplyBody) -> Result<Vec<u8>, ClientError> {
+  match body {
+    ReplyBody::ReadBytes { bytes } => Ok(bytes),
+    _ => Err(ClientError::UnexpectedReply { verb: "read" }),
   }
 }
 
@@ -802,7 +837,7 @@ impl Client {
     self.poll_as(word, extract_destroyed)
   }
 
-  /// Begins a create-green, returning its request id.
+  /// Begins a create-green from scratch, returning its request id.
   pub fn create_green_begin(
     &mut self,
     name: &str,
@@ -811,6 +846,21 @@ impl Client {
     self.begin(&RequestBody::CreateGreen {
       name: name.to_owned(),
       require_evidence,
+      base: None,
+    })
+  }
+
+  /// Begins a create-green over a complete immutable base (§4.16), returning its request id.
+  pub fn create_green_over_begin(
+    &mut self,
+    name: &str,
+    require_evidence: bool,
+    base: GreenBase,
+  ) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::CreateGreen {
+      name: name.to_owned(),
+      require_evidence,
+      base: Some(base),
     })
   }
 
@@ -882,9 +932,71 @@ impl Client {
     self.poll_as(word, extract_edited)
   }
 
-  /// Begins a submit of a work volume, returning its request id.
+  /// Begins a submit of a work volume with no evidence, returning its request id.
   pub fn submit_begin(&mut self, work: VolumeId) -> Result<RequestId, ClientError> {
-    self.begin(&RequestBody::Submit { work })
+    self.submit_with_evidence_begin(work, &[])
+  }
+
+  /// Begins a submit of a work volume carrying `evidence` references (§4.16), returning its request id.
+  pub fn submit_with_evidence_begin(
+    &mut self,
+    work: VolumeId,
+    evidence: &[[u8; 32]],
+  ) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::Submit {
+      work,
+      evidence: evidence.to_vec(),
+    })
+  }
+
+  /// Begins an advance of a green attachment (§4.16), returning its request id.
+  pub fn advance_begin(
+    &mut self,
+    attachment: u64,
+    version: Option<u64>,
+  ) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::Advance {
+      attachment,
+      version,
+    })
+  }
+
+  /// Takes an advance's outcome within `spin_ns`.
+  pub fn advance_spin(
+    &mut self,
+    id: RequestId,
+    spin_ns: u64,
+  ) -> Result<Option<Advanced>, ClientError> {
+    self.spin_as(id, spin_ns, extract_advanced)
+  }
+
+  /// Takes an advance's outcome by id word once the completion fd signals.
+  pub fn advance_poll(&mut self, word: u64) -> Result<Option<Advanced>, ClientError> {
+    self.poll_as(word, extract_advanced)
+  }
+
+  /// Begins a read of a file at a view (§4.12 `read`), returning its request id.
+  pub fn read_begin(
+    &mut self,
+    volume: VolumeId,
+    path: &str,
+    at: ReadAt,
+  ) -> Result<RequestId, ClientError> {
+    self.begin(&RequestBody::Read {
+      volume,
+      path: path.to_owned(),
+      at,
+    })
+  }
+
+  /// Takes a read's bytes within `spin_ns`.
+  pub fn read_spin(&mut self, id: RequestId, spin_ns: u64) -> Result<Option<Vec<u8>>, ClientError> {
+    self.spin_as(id, spin_ns, extract_read)
+  }
+
+  /// Takes a read's bytes by id word once the completion fd signals.
+  pub fn read_poll(&mut self, word: u64) -> Result<Option<Vec<u8>>, ClientError> {
+    self.poll_as(word, extract_read)
   }
 
   /// Takes a submit's outcome within `spin_ns`.
@@ -1142,21 +1254,68 @@ impl Client {
     }
   }
 
-  /// Creates a green volume — a shared merge target (§4.16); its id.
+  /// Creates a green volume from scratch — a shared merge target (§4.16); its id.
   pub fn create_green(
     &mut self,
     name: &str,
     require_evidence: bool,
   ) -> Result<VolumeId, ClientError> {
+    self.create_green_with(name, require_evidence, None)
+  }
+
+  /// Creates a green volume whose version 0 is a complete immutable base — a snapshot of a volume
+  /// (§4.16; refused `ConsistentBaseUnavailable` for a snapshot still served live from a host
+  /// directory); its id.
+  pub fn create_green_over(
+    &mut self,
+    name: &str,
+    require_evidence: bool,
+    base: GreenBase,
+  ) -> Result<VolumeId, ClientError> {
+    self.create_green_with(name, require_evidence, Some(base))
+  }
+
+  fn create_green_with(
+    &mut self,
+    name: &str,
+    require_evidence: bool,
+    base: Option<GreenBase>,
+  ) -> Result<VolumeId, ClientError> {
     match self.call(&RequestBody::CreateGreen {
       name: name.to_owned(),
       require_evidence,
+      base,
     })? {
       ReplyBody::GreenCreated { id } => Ok(id),
       _ => Err(ClientError::UnexpectedReply {
         verb: "create_green",
       }),
     }
+  }
+
+  /// Re-pins a green attachment to `version`, or to the head (§4.16 `advance`): the version now
+  /// pinned and the paths the move invalidated.
+  pub fn advance(
+    &mut self,
+    attachment: u64,
+    version: Option<u64>,
+  ) -> Result<Advanced, ClientError> {
+    let reply = self.call(&RequestBody::Advance {
+      attachment,
+      version,
+    })?;
+    extract_advanced(reply)
+  }
+
+  /// Reads a file's bytes at a view (§4.12 `read`): a green's head or named version, the version
+  /// an attachment pins, or a work's or plain volume's live tree.
+  pub fn read(&mut self, volume: VolumeId, path: &str, at: ReadAt) -> Result<Vec<u8>, ClientError> {
+    let reply = self.call(&RequestBody::Read {
+      volume,
+      path: path.to_owned(),
+      at,
+    })?;
+    extract_read(reply)
   }
 
   /// A green's head version (§4.16 merge chain).
@@ -1229,10 +1388,23 @@ impl Client {
     }
   }
 
-  /// Submits a work volume's declared operations to its green (§4.16): accepted at a new version, or
-  /// a conflict with windows to rebase.
+  /// Submits a work volume's declared operations to its green (§4.16) with no evidence: accepted at
+  /// a new version, or a conflict with windows to rebase.
   pub fn submit(&mut self, work: VolumeId) -> Result<Submitted, ClientError> {
-    match self.call(&RequestBody::Submit { work })? {
+    self.submit_with_evidence(work, &[])
+  }
+
+  /// Submits a work volume's declared operations carrying `evidence` references (§4.16: opaque to
+  /// slates; a green that requires evidence refuses `EvidenceRequired` without any).
+  pub fn submit_with_evidence(
+    &mut self,
+    work: VolumeId,
+    evidence: &[[u8; 32]],
+  ) -> Result<Submitted, ClientError> {
+    match self.call(&RequestBody::Submit {
+      work,
+      evidence: evidence.to_vec(),
+    })? {
       ReplyBody::Submitted {
         version: Some(v), ..
       } => Ok(Submitted::Accepted(v)),
@@ -1293,10 +1465,12 @@ impl Client {
         attachment,
         lease_epoch,
         path,
+        version,
       } => Ok(Attachment {
         attachment,
         lease_epoch,
         path,
+        version,
       }),
       _ => Err(ClientError::UnexpectedReply { verb: "attach" }),
     }

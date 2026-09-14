@@ -4165,3 +4165,298 @@ fn a_peer_whose_serve_socket_cannot_be_bound_is_counted_not_silently_skipped() {
     "the serve socket A could not bind is counted as a `fleet.bind` refusal in A's status"
   );
 }
+
+// ---------------------------------------------------------------------------------------------
+// The merge plane across the fleet (§4.16 "Commit", "Apply on holders"; §4.10 placed before
+// committed; D-27; AC-8.19/T-8.17): a green's merge record is issued only once the inputs it
+// names are placed, and every holder recomputes the version before it accepts the record.
+
+/// Shape: the window over which a merge record must be seen **not** to place while its inputs cannot
+/// — a couple of dozen coordinator periods, long enough that a record which was going to place would
+/// have (a two-node placement takes a few periods on loopback).
+const RECORD_HOLD_WINDOW: Duration = Duration::from_secs(2);
+
+/// A two-node `f = 1` fleet: A (the owner the client reaches) and B (the candidate holder).
+fn two_node_fleet() -> (Daemon, Daemon, String) {
+  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let pid = std::process::id();
+  let instance_a = format!("fleet-{}-{pid}", a.host.0);
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start(a, peer_of_a);
+  let daemon_b = start(b, peer_of_b);
+  let settle = Instant::now() + FORMATION_SETTLE;
+  while Instant::now() < settle {
+    std::thread::yield_now();
+  }
+  (daemon_a, daemon_b, instance_a)
+}
+
+/// Creates a green and a work over it on the owner, edits `f`, and submits: version 1. Returns the
+/// green and the work.
+fn submit_one_version(client: &mut Client) -> (VolumeId, VolumeId) {
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "work".to_owned(),
+  }) else {
+    panic!("create work");
+  };
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"hello".to_vec(),
+  });
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+  let submitted = client.call(&RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  });
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  (green, work)
+}
+
+/// AC-8.19/T-8.17 and §4.16 "Commit" ("committed at f+1 acknowledgements … issued only when every
+/// identity the version references is placed"; §4.10 placed-before-committed): in a two-node `f = 1`
+/// fleet the holder B is made to **refuse every content put** (an injected placement refusal). A green's
+/// version 0 — nothing to place — commits; version 1's merge record, which names the increment's inputs,
+/// is shown **not** to commit over a whole window while its inputs cannot place, the owner counting the
+/// wait (`merge.inputs_unplaced`, the non-vacuity counter) and the holder the refusals it caused. The
+/// work that produced the version is destroyed meanwhile — its inputs are retained by the chain, not
+/// the work. Once the refusal is lifted the inputs place, the record commits at the quorum, and B's
+/// replica recomputes version 1 from exactly the placed inputs. Non-vacuous: the record placed only
+/// after the lift, and the holder held version 0 alone before it.
+#[test]
+fn a_merge_record_is_issued_only_once_its_inputs_are_placed() {
+  let _serial = serialize_fleet_tests();
+  let (daemon_a, daemon_b, instance_a) = two_node_fleet();
+  assert!(
+    daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: true,
+      corrupt_next_inputs: false,
+    }),
+    "the fault installs on B"
+  );
+  let mut client = Client::connect(&instance_a);
+  let (green, work) = submit_one_version(&mut client);
+  let gate = observe_inputs_gate(&daemon_a, &daemon_b, &mut client, green, work);
+  daemon_a.stop();
+  daemon_b.stop();
+  assert_inputs_gate(&gate);
+}
+
+/// What the placed-before-reference run showed, before and after the placement refusal is lifted.
+struct InputsGate {
+  origin_placed: bool,
+  held: bool,
+  waits: u64,
+  refusals: u64,
+  holder_before: Option<slates_server::merge_service::HolderMergeState>,
+  destroyed: bool,
+  lifted: bool,
+  placed: bool,
+  holder_after: Option<slates_server::merge_service::HolderMergeState>,
+  awaited_placed: bool,
+}
+
+/// Observes version 0 placing, version 1 held back while B refuses puts (the counters on both sides,
+/// B's replica at 0, the work destroyed meanwhile), then lifts the fault and observes version 1 place
+/// and B's replica recompute it.
+fn observe_inputs_gate(
+  daemon_a: &Daemon,
+  daemon_b: &Daemon,
+  client: &mut Client,
+  green: VolumeId,
+  work: VolumeId,
+) -> InputsGate {
+  let both = [daemon_a, daemon_b];
+  let origin_placed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 0) == Some(true)
+  });
+  let held = holds_for(RECORD_HOLD_WINDOW, || {
+    daemon_a.merge_record_placed(green, 1) == Some(false)
+  });
+  let waits = refusal_count(daemon_a, "merge.inputs_unplaced");
+  let refusals = refusal_count(daemon_b, "merge.content_put_refused");
+  let holder_before = daemon_b.merge_holder_state(green);
+  let destroyed = matches!(
+    client.call(&RequestBody::Destroy { volume: work }),
+    ReplyBody::Destroyed
+  );
+  let lifted = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault::default());
+  let placed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 1) == Some(true)
+  });
+  let holder_after = daemon_b.merge_holder_state(green);
+  let awaited_placed = matches!(
+    client.call(&RequestBody::AwaitPlaced {
+      volume: green,
+      snapshot: None,
+      scope: Scope::Region,
+    }),
+    ReplyBody::Placed { placed: true, .. }
+  );
+  InputsGate {
+    origin_placed,
+    held,
+    waits,
+    refusals,
+    holder_before,
+    destroyed,
+    lifted,
+    placed,
+    holder_after,
+    awaited_placed,
+  }
+}
+
+/// The placed-before-reference assertions over one run: what held while the puts were refused, then
+/// what followed the lift.
+fn assert_inputs_gate(gate: &InputsGate) {
+  assert_gate_held(gate);
+  assert_gate_lifted(gate);
+}
+
+/// While B refused every content put: version 0 committed, version 1 never did, both sides counted.
+fn assert_gate_held(gate: &InputsGate) {
+  assert!(gate.origin_placed, "version 0 (nothing to place) commits");
+  assert!(
+    gate.held,
+    "version 1's record never commits while its inputs cannot place"
+  );
+  assert!(gate.waits > 0, "the owner counted the wait: {}", gate.waits);
+  assert!(
+    gate.refusals > 0,
+    "the holder counted its refusals: {}",
+    gate.refusals
+  );
+  assert_eq!(
+    gate.holder_before,
+    Some(slates_server::merge_service::HolderMergeState {
+      version: Some(0),
+      refused: false,
+    }),
+    "the holder recomputed version 0 alone before the lift"
+  );
+}
+
+/// After the lift: the destroyed work retained nothing the record needed, the inputs placed, the
+/// record committed, the holder recomputed version 1, and `await placed` says so.
+fn assert_gate_lifted(gate: &InputsGate) {
+  assert!(
+    gate.destroyed,
+    "the work is destroyed while its version waits"
+  );
+  assert!(gate.lifted, "the fault lifts on B");
+  assert!(
+    gate.placed,
+    "once the inputs place, the record commits at the quorum"
+  );
+  assert_eq!(
+    gate.holder_after,
+    Some(slates_server::merge_service::HolderMergeState {
+      version: Some(1),
+      refused: false,
+    }),
+    "the holder recomputed version 1 from the placed inputs (the destroyed work retained nothing)"
+  );
+  assert!(
+    gate.awaited_placed,
+    "await placed(green, region) answers from the merge records"
+  );
+}
+
+/// §4.16 "Apply on holders" ("recomputes the verdict and the manifest identity … before serving the
+/// version … mismatch refuses that version on that holder, fatal-and-loud"; D-27): in a two-node fleet
+/// the holder B's copy of a version's inputs is corrupted (the post-state a byte off — the ops document
+/// still decodes, the bytes it names differ). B recomputes version 1, its head identity does not match
+/// the record's, and it refuses: counted (`merge.recompute_mismatch`), the green refused on B for good,
+/// nothing of it served (no replica), and — at `f = 1` — the record cannot reach its quorum, so the owner
+/// reports version 1 unplaced (Degraded, never a false placement). Non-vacuous: version 0 commits and
+/// replicates first, so the refusal is the recomputation's, not a transport failure.
+#[test]
+fn a_holder_whose_recomputation_mismatches_refuses_the_version_loudly() {
+  let _serial = serialize_fleet_tests();
+  let (daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let both = [&daemon_a, &daemon_b];
+  assert!(
+    daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: false,
+      corrupt_next_inputs: true,
+    }),
+    "the fault installs on B"
+  );
+  let mut client = Client::connect(&instance_a);
+  let (green, _) = submit_one_version(&mut client);
+
+  let origin_placed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 0) == Some(true)
+  });
+  let refused = poll_until(&both, PLACEMENT_DEADLINE, || {
+    refusal_count(&daemon_b, "merge.recompute_mismatch") >= 1
+  });
+  let held = holds_for(RECORD_HOLD_WINDOW, || {
+    daemon_a.merge_record_placed(green, 1) == Some(false)
+  });
+  let holder = daemon_b.merge_holder_state(green);
+  let awaited = client.call(&RequestBody::AwaitPlaced {
+    volume: green,
+    snapshot: None,
+    scope: Scope::Region,
+  });
+  daemon_a.stop();
+  daemon_b.stop();
+
+  assert!(origin_placed, "version 0 commits and replicates");
+  assert!(
+    refused,
+    "the holder refused the mismatching recomputation, counted"
+  );
+  assert!(
+    held,
+    "a version one holder refused cannot reach the f = 1 quorum: never reported placed"
+  );
+  assert_eq!(
+    holder,
+    Some(slates_server::merge_service::HolderMergeState {
+      version: None,
+      refused: true,
+    }),
+    "the green is refused on the holder for good and nothing of it is served"
+  );
+  assert!(
+    matches!(awaited, ReplyBody::Placed { placed: false, .. }),
+    "the owner reports the version unplaced: {awaited:?}"
+  );
+}

@@ -80,7 +80,9 @@ use std::sync::mpsc::{TryRecvError, channel};
 
 use rustls::pki_types::CertificateDer;
 use slates_archive::Archive;
-use slates_cluster::content::{ContentMessage, fetch_content, is_content_stream, put_content};
+use slates_cluster::content::{
+  CONTENT_PUT_STREAM, ContentMessage, fetch_content, is_content_stream, put_content,
+};
 use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::fleet::{apply_peer_state, sync_peer};
 use slates_cluster::membership::{Liveness, MemberState};
@@ -1241,9 +1243,31 @@ async fn serve_peer_records(mut endpoint: Endpoint, local: HostId, roster: Vec<R
             .ok()
             .and_then(|prepare| state::with_state(|s| serve_held_promotion(s, &prepare)))
             .unwrap_or_default(),
-          stream if is_content_stream(stream) => {
-            state::with_state(|s| s.held_content.serve(local, &request)).unwrap_or_default()
-          }
+          stream if is_content_stream(stream) => state::with_state(|s| {
+            // A test's injected placement refusal (§4.16 placed-before-reference): a holder that
+            // refuses every content put, counted, so an owner's record is shown to wait on it.
+            if s.merge.fault.refuse_content_puts && stream == CONTENT_PUT_STREAM {
+              *s.refusals
+                .entry(crate::merge_service::CONTENT_PUT_REFUSED)
+                .or_insert(0) += 1;
+              return Vec::new();
+            }
+            s.held_content.serve(local, &request)
+          })
+          .unwrap_or_default(),
+          // A green's merge record (§4.16 "Apply on holders"): recomputed before it is accepted.
+          crate::merge_service::MERGE_RECORD_STREAM => Record::decode(&request)
+            .ok()
+            .and_then(|record| {
+              state::with_state(|s| {
+                let peer_host = s
+                  .learned_members
+                  .get(&peer_anchor)
+                  .map_or(seed, |learned| learned.host);
+                crate::merge_service::accept_merge_record(s, local, peer_host, &record)
+              })
+            })
+            .unwrap_or_default(),
           CONFIG_STREAM => state::with_state(|s| serve_council(s, &request)).unwrap_or_default(),
           CONFIG_FETCH_STREAM => {
             state::with_state(|s| serve_config_fetch(s, &request)).unwrap_or_default()
@@ -1312,7 +1336,7 @@ fn reconcile_held_authority(state: &mut ShardState) {
 /// it refreshes and retries (§4.8 the piggyback rule), and every other refusal is an empty reply the owner
 /// counts as no acknowledgement. A record naming a *newer* configuration than this node's flags a reactive
 /// refresh (this node is the one behind) before it is refused.
-fn accept_held_record(
+pub(crate) fn accept_held_record(
   state: &mut ShardState,
   local: HostId,
   peer_host: HostId,
@@ -2232,7 +2256,7 @@ const SERVE_REFUSED: &str = "fleet.serve";
 
 /// Counts a fleet-loop refusal in the shard's status refusal counts, so a peer the loop could not set up is
 /// visible to an operator (the mesh will not form to it) rather than a swallowed error (banned item 9).
-fn count_refusal(kind: &'static str) {
+pub(crate) fn count_refusal(kind: &'static str) {
   state::with_state(|s| *s.refusals.entry(kind).or_insert(0) += 1);
 }
 
@@ -2342,7 +2366,7 @@ async fn establish_record_link(identity: &'static Identity, dial: PeerDial) {
 /// replication or election round, a learner fetch. Bounded: the dispatches alive are at most the rounds a
 /// period makes times the periods a straggler may take, its request deadline
 /// ([`CommitBudget::max_deadline_ns`]).
-struct Dispatch {
+pub(crate) struct Dispatch {
   stragglers: Stragglers,
   outstanding: Vec<HostId>,
   late: LateReplies,
@@ -2355,7 +2379,7 @@ struct Dispatch {
 /// forever, which is how an elected leader with its sessions intact still never committed
 /// (`docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md`).
 #[derive(Clone, Copy)]
-enum LateReplies {
+pub(crate) enum LateReplies {
   /// A record commit or takeover promotion: the late reply is dropped — the round already resolved without
   /// it, and the record re-ships to that holder next period, idempotently, over its recovered session.
   Discard,
@@ -2390,7 +2414,7 @@ enum LateReplies {
 impl Dispatch {
   /// Records a dispatch over the `taken` holders, of which `reusable` came back at its return, and how a
   /// reply that comes back later is treated.
-  fn new(
+  pub(crate) fn new(
     taken: Vec<HostId>,
     reusable: &[(HostId, Endpoint)],
     stragglers: Stragglers,
@@ -3680,6 +3704,10 @@ async fn run_record_period(
   }
   // Record durably each seal whose content and head have both placed.
   let _ = run_on(origin, shard, record_placed_seals);
+  // The greens' merge records (§4.16 "Commit"): each green's lowest pending version — its inputs put
+  // while unplaced, its record shipped in order once they are.
+  crate::merge_service::run_merge_period(origin, shard, local, budget, owner_acceptor, in_flight)
+    .await;
 }
 
 /// Format: nanoseconds per second, for the archive header's creation time in Unix seconds.
@@ -3793,7 +3821,7 @@ fn record_acks_in(
 /// entry `None` (out on a dispatch — the link task leaves it alone) until [`return_sessions`] puts it back. A
 /// holder with no live session is skipped — the dispatch proceeds with the holders it can reach and the rest
 /// are retried next period.
-fn take_sessions(wanted: impl Fn(HostId) -> bool) -> Vec<(HostId, Endpoint)> {
+pub(crate) fn take_sessions(wanted: impl Fn(HostId) -> bool) -> Vec<(HostId, Endpoint)> {
   state::with_state(|s| {
     let mut taken = Vec::new();
     for (host, slot) in s.record_sessions.iter_mut() {
@@ -3810,7 +3838,7 @@ fn take_sessions(wanted: impl Fn(HostId) -> bool) -> Vec<(HostId, Endpoint)> {
 
 /// Returns borrowed sessions to the shard state after a dispatch. Only an existing (borrowed) entry is
 /// refilled: a peer retired meanwhile has had its entry removed by its link task, and its session is dropped.
-fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
+pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
   state::with_state(|s| {
     for (host, endpoint) in sessions {
       if let Some(slot) = s.record_sessions.get_mut(&host) {

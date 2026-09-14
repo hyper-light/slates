@@ -22,9 +22,9 @@
 use serde_json::{Value, json};
 use slates_client::{
   Attachment, CauseRecord, ChokepointReport, Client, ClientError, CreateSpec, DaemonReport, Filter,
-  Intent, Landing, LandingOutcome, LandingSummary, NamePolicy, Rebased, ShardReport, Signal,
-  SizeClass, SnapshotId, SpanRecord, StatusReport, Submitted, TelemetryReport, VolumeId,
-  VolumeSummary, WorkOp,
+  GreenBase, Intent, Landing, LandingOutcome, LandingSummary, NamePolicy, ReadAt, Rebased,
+  ShardReport, Signal, SizeClass, SnapshotId, SpanRecord, StatusReport, Submitted, TelemetryReport,
+  VolumeId, VolumeSummary, WorkOp,
 };
 
 pub mod http;
@@ -110,6 +110,8 @@ impl McpServer {
       "slates.merge.rebase" => self.rebase(&args),
       "slates.merge.versions" => self.versions(&args),
       "slates.merge.changed_since" => self.changed_since(&args),
+      "slates.merge.advance" => self.advance(&args),
+      "slates.fs.read" => self.read(&args),
       "slates.volume.create" => self.create_volume(&args),
       "slates.volume.list" => self.list_volumes(),
       "slates.volume.stat" => self.stat_volume(&args),
@@ -135,16 +137,28 @@ impl McpServer {
     Ok(tool_result(&structured))
   }
 
+  /// Creates a green from scratch, or over a complete immutable base when `base_volume` and
+  /// `base_snapshot` name a snapshot (§4.16; refused `ConsistentBaseUnavailable` for one still served
+  /// from a host directory).
   fn create_green(&mut self, args: &Value) -> Result<Value, McpError> {
     let name = string_arg(args, "name")?;
     let require_evidence = args
       .get("require_evidence")
       .and_then(Value::as_bool)
       .unwrap_or(false);
-    let green = self
-      .client
-      .create_green(&name, require_evidence)
-      .map_err(refusal)?;
+    let green = match args.get("base_volume") {
+      None => self.client.create_green(&name, require_evidence),
+      Some(_) => {
+        let base = GreenBase {
+          volume: volume_arg(args, "base_volume")?,
+          snapshot: SnapshotId {
+            value: u64_arg(args, "base_snapshot")?,
+          },
+        };
+        self.client.create_green_over(&name, require_evidence, base)
+      }
+    }
+    .map_err(refusal)?;
     Ok(json!({ "green": id_hex(green) }))
   }
 
@@ -184,14 +198,57 @@ impl McpServer {
     Ok(json!({ "declared": true }))
   }
 
+  /// Submits a work's increment, carrying the `evidence` references (hexadecimal BLAKE3 identities,
+  /// opaque to slates) when given (§4.16; a green that requires evidence refuses without any).
   fn submit(&mut self, args: &Value) -> Result<Value, McpError> {
     let work = volume_arg(args, "work")?;
-    Ok(match self.client.submit(work).map_err(refusal)? {
-      Submitted::Accepted(version) => json!({ "accepted": true, "version": version }),
-      Submitted::Conflict(windows) => {
-        json!({ "accepted": false, "conflicts": windows_json(&windows) })
-      }
-    })
+    let evidence = string_list(args, "evidence")
+      .iter()
+      .map(|text| hex_identity(text))
+      .collect::<Result<Vec<[u8; 32]>, McpError>>()?;
+    Ok(
+      match self
+        .client
+        .submit_with_evidence(work, &evidence)
+        .map_err(refusal)?
+      {
+        Submitted::Accepted(version) => json!({ "accepted": true, "version": version }),
+        Submitted::Conflict(windows) => {
+          json!({ "accepted": false, "conflicts": windows_json(&windows) })
+        }
+      },
+    )
+  }
+
+  /// Re-pins a green attachment to `version`, or to the head (§4.16 "Attachments and versions"): the
+  /// version now pinned and the paths the move invalidated.
+  fn advance(&mut self, args: &Value) -> Result<Value, McpError> {
+    let attachment = u64_arg(args, "attachment")?;
+    let version = args.get("version").and_then(Value::as_u64);
+    let advanced = self.client.advance(attachment, version).map_err(refusal)?;
+    Ok(json!({ "version": advanced.version, "invalidated": advanced.invalidated }))
+  }
+
+  /// Reads a file at a view (§4.12 `slates.fs.read`): a green's head, its `version`, or the version
+  /// the `attachment` pins; a work's or plain volume's live tree. The exact byte length and a lossy
+  /// UTF-8 text, as `read_base` reports.
+  fn read(&mut self, args: &Value) -> Result<Value, McpError> {
+    let volume = volume_arg(args, "volume")?;
+    let path = string_arg(args, "path")?;
+    let at = match (
+      args.get("version").and_then(Value::as_u64),
+      args.get("attachment").and_then(Value::as_u64),
+    ) {
+      (Some(version), _) => ReadAt::Version { version },
+      (None, Some(attachment)) => ReadAt::Attachment { attachment },
+      (None, None) => ReadAt::Head,
+    };
+    let bytes = self.client.read(volume, &path, at).map_err(refusal)?;
+    Ok(json!({
+      "path": path,
+      "len": bytes.len(),
+      "text": String::from_utf8_lossy(&bytes),
+    }))
   }
 
   fn rebase(&mut self, args: &Value) -> Result<Value, McpError> {
@@ -453,8 +510,9 @@ fn tool_list() -> Vec<Value> {
     ),
     tool(
       "slates.merge.create_green",
-      "Create a green volume (the shared target agents merge into).",
-      json!({ "name": string, "require_evidence": { "type": "boolean" } }),
+      "Create a green volume (the shared target agents merge into): from scratch, or over a complete \
+       immutable base — `base_volume`'s `base_snapshot` (pin the whole base first).",
+      json!({ "name": string, "require_evidence": { "type": "boolean" }, "base_volume": string, "base_snapshot": integer }),
       json!(["name"]),
     ),
     tool(
@@ -479,9 +537,24 @@ fn tool_list() -> Vec<Value> {
     ),
     tool(
       "slates.merge.submit",
-      "Submit a work's increment to its green: accepted at a new version, or the conflict windows.",
-      json!({ "work": string }),
+      "Submit a work's increment to its green: accepted at a new version, or the conflict windows. \
+       `evidence` lists opaque hexadecimal identities a green may require.",
+      json!({ "work": string, "evidence": { "type": "array", "items": string } }),
       json!(["work"]),
+    ),
+    tool(
+      "slates.merge.advance",
+      "Re-pin a green attachment to `version` (or the head): the version pinned and the paths \
+       invalidated. An attachment's view never moves otherwise.",
+      json!({ "attachment": integer, "version": integer }),
+      json!(["attachment"]),
+    ),
+    tool(
+      "slates.fs.read",
+      "Read a file's bytes (text and exact length) from a volume: a green's head, its `version`, or \
+       the version an `attachment` pins; a work's or plain volume's live tree.",
+      json!({ "volume": string, "path": string, "version": integer, "attachment": integer }),
+      json!(["volume", "path"]),
     ),
     tool(
       "slates.merge.rebase",
@@ -545,7 +618,8 @@ fn tool_list() -> Vec<Value> {
     ),
     tool(
       "slates.attach.attach",
-      "Attach to a volume for reading (or writing, taking its lease); the attachment id and lease.",
+      "Attach to a volume for reading (or writing, taking its lease); the attachment id and lease. \
+       A green attachment pins the green's head `version`, moved only by slates.merge.advance.",
       json!({ "volume": string, "snapshot": integer, "write": { "type": "boolean" } }),
       json!(["volume"]),
     ),
@@ -603,9 +677,11 @@ fn tool_list() -> Vec<Value> {
 
 /// The `slates.help` text.
 const HELP: &str = "slates merge over MCP: create_green -> create_work -> edit -> submit. \
-On a conflict, read the green's bytes for each window, rewrite your edit, then rebase and submit \
-again. versions and changed_since read the chain. No tool creates a landing grant (a grant is a \
-human-only act on the CLI).";
+On a conflict, read the green's bytes for each window (slates.fs.read at the version), rewrite \
+your edit, then rebase and submit again. versions and changed_since read the chain. A reader \
+attaches to a green (slates.attach.attach) and its view is pinned to that version until \
+slates.merge.advance moves it. No tool creates a landing grant (a grant is a human-only act on \
+the CLI).";
 
 /// A JSON-RPC success reply.
 fn reply(id: &Value, result: Value) -> Value {
@@ -766,7 +842,28 @@ pub fn attachment_json(a: &Attachment) -> Value {
     "attachment": a.attachment,
     "lease_epoch": a.lease_epoch,
     "path": a.path,
+    "version": a.version,
   })
+}
+
+/// Format: a BLAKE3 identity is 32 bytes, given as 64 hexadecimal characters (two per byte).
+const IDENTITY_HEX_CHARS: usize = 64;
+
+/// A 64-character hexadecimal identity (an evidence reference) as its bytes, or a typed argument error.
+fn hex_identity(text: &str) -> Result<[u8; 32], McpError> {
+  let bad = || McpError {
+    code: code::INVALID_PARAMS,
+    message: format!("evidence is not a 64-character hexadecimal identity: {text}"),
+  };
+  if text.len() != IDENTITY_HEX_CHARS || !text.is_ascii() {
+    return Err(bad());
+  }
+  let mut out = [0u8; 32];
+  for (index, pair) in text.as_bytes().chunks(2).enumerate() {
+    let hex = std::str::from_utf8(pair).map_err(|_| bad())?;
+    out[index] = u8::from_str_radix(hex, HEX_RADIX).map_err(|_| bad())?;
+  }
+  Ok(out)
 }
 
 /// The optional `paths` list of a base operation: `Some` of the given paths, or `None` (all paths)

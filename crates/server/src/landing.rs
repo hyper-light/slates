@@ -132,6 +132,12 @@ pub fn land_verb(
   filter: &slates_ipc::protocol::Filter,
   grant: Option<u64>,
 ) -> ReplyBody {
+  // A merge volume has no store-backed snapshot to land (§4.16; the extent-backed green is owed).
+  if let Some(reply) =
+    crate::merge_service::refuse_store_verb(state, volume, crate::merge_service::StoreVerb::Land)
+  {
+    return reply;
+  }
   #[cfg(unix)]
   {
     land_verb_unix(state, principal, volume, snapshot, target, filter, grant)

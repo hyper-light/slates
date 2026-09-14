@@ -2827,6 +2827,32 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > linearizable and the fast-path counter equal to the oracle's disjoint count
 > (`crates/merge/tests/shuttle_green.rs`).
 
+> **Status (2026-09-13).** The pure core is a green-volume *service* (`crates/server/src/merge_service.rs`;
+> GAP-A9-14): every verb enforces the catalog role — an edit, declaration, write attachment, snapshot or
+> resize of a green refuses `ReadOnlyVolume`, a work verb on a plain volume `NotWork`, a green verb on a
+> work or plain volume `NotGreen`, a destroyed green's works `UnknownBase`, a `require_evidence` green
+> `EvidenceRequired` — and a green's chain starts from scratch or from a complete immutable base:
+> `CreateGreen { base }` walks a snapshot the volume core certifies complete (every merged directory
+> listed into the frozen node, every base-backed file witnessed and pinned whole) into an `Origin` that
+> seeds version 0 and is recorded durably before the chain, refusing `ConsistentBaseUnavailable` for a
+> snapshot still served from the host directory (a host edit after the create changes no version, tested
+> by use). A read attachment of a green pins the head; `advance` re-pins and names exactly the paths the
+> span changed (`changed_between`, read off the per-dimension histories); `read` serves the head, a
+> version or the pin. A submit seals what was declared before it — an accepted submit moves the work to
+> the new version with its journal consumed (the resubmit self-conflict fixed) — and every input to the
+> verdict is retained by the `GreenAdvanced` record, not the work. In a fleet the merge record
+> (`MergeRecordValue`: version, increment identity, base, inputs identity, head identity, evidence) is
+> issued only once its inputs — the chain's own bytes as one archive — are placed at `f + 1` through the
+> §4.10 content exchange, then shipped on its own stream in order per holder and committed at `f + 1`;
+> every holder recomputes the version into its replica from the placed inputs and compares
+> `head_identity` with the record — a mismatch is counted, printed, and the green refused on that holder
+> for good — before it accepts. At `f = 0` the append is the placement (R8). The CLI (`green --base`,
+> `--require-evidence`, `submit --evidence`, `advance`, `read`) and MCP (`slates.merge.advance`,
+> `slates.fs.read`, base and evidence arguments) drive the flow by use. Owed: the mounted work and green
+> (a work is not a VFS volume; the VFS journal as the one declaration path, the bridge's `EROFS`), the
+> extent-backed green chain, cooperative slicing of the origin seed, pipelined and hedged merge records,
+> green takeover and a late holder's catch-up.
+
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an
 increment of declared operations; the green volume's merge task maps the increment through

@@ -120,13 +120,15 @@ slates volume clone ID SNAPSHOT NAME [--json]
 slates volume resize ID (--bounded SIZE | --dynamic MAX) [--json]
 slates volume destroy ID [--json]
 slates volume placed ID [--snapshot N] [--mirror] [--json]
-slates green NAME [--json]
+slates green NAME [--require-evidence] [--base VOLUME --snapshot N] [--json]
 slates versions GREEN [--json]
 slates changed-since GREEN VERSION [--json]
 slates work GREEN NAME [--json]
 slates edit WORK PATH AT DELETE TEXT [--json]
-slates submit WORK [--json]
+slates submit WORK [--evidence HEX] [--json]
 slates rebase WORK [--json]
+slates advance ATTACHMENT [VERSION] [--json]
+slates read VOLUME PATH [--version N | --attachment A]
 slates mount ID PATH
 slates unmount PATH
 slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
@@ -170,6 +172,17 @@ the text form prints and the MCP `slates.status` tool returns.
 `slates mount ID PATH` mounts the volume at an existing user-owned directory over the loopback
 NFS bridge; `slates unmount PATH` removes it. `slates mcp` serves the MCP tools over stdio, or
 loopback Streamable HTTP with `--http PORT`.
+
+The merge flow (§4.16): `green NAME` starts a green from scratch, or from a **complete immutable
+base** with `--base VOLUME --snapshot N` — a snapshot of a volume whose whole tree is in memory
+(`base pin VOLUME` first for an overlay; a snapshot still served from the host directory is refused
+`ConsistentBaseUnavailable`), and `--require-evidence` makes every submit carry an evidence reference
+(`submit WORK --evidence HEX`, refused `EvidenceRequired` without one). A green is written by nothing
+but its merge task: `edit`, a write `attach`, `volume snapshot` or `resize` on one refuse
+`ReadOnlyVolume`. `attach GREEN --read` pins the green's head version (the attachment's `version`);
+the attached view never moves until `advance ATTACHMENT [VERSION]`, which prints the version now
+pinned and the paths it invalidated. `read VOLUME PATH` streams a file's raw bytes at the head,
+`--version N` at a green version, `--attachment A` at the version an attachment pins.
 
 A fleet whose deployment manifest declares a `durability` policy (`accepted_loss`, `coincident_failures`)
 refuses a volume create, clone, snapshot or merge submit with `DurabilityUnmet { coincident_loss,

@@ -62,13 +62,17 @@ pub struct ClientCompletions {
   pub records: Vec<CompletionRecord>,
 }
 
-/// One green volume's merge chain as a snapshot carries it: the green and its increments in order.
+/// One green volume's merge chain as a snapshot carries it: the green, its origin when it was
+/// seeded from a complete base, and its increments in order.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct GreenChain {
   /// The green volume.
   pub green: VolumeId,
   /// The encoded increments, in commit order.
   pub increments: Vec<Vec<u8>>,
+  /// The encoded origin (§4.16), or none for a green that started from scratch. Appended for
+  /// append-only evolution.
+  pub origin: Option<Vec<u8>>,
 }
 
 /// The whole partition state as one canonical value: what a snapshot slot holds.
@@ -125,6 +129,9 @@ pub struct Partition {
   /// Each green volume's merge chain (§4.16): its accepted increments, encoded, in commit order, so
   /// recovery replays them to rebuild the green. Bounded by `green_chain_bytes` against the cap.
   green_chains: BTreeMap<VolumeId, Vec<Vec<u8>>>,
+  /// Each base-seeded green's origin (§4.16): its version-0 state, encoded, replayed before its
+  /// chain on recovery. Counted in `green_chain_bytes` against the same cap.
+  green_origins: BTreeMap<VolumeId, Vec<u8>>,
   /// The total bytes held across all green chains, so a new increment can be refused at the cap
   /// before it is appended (bounded growth; checkpointing to fold old chain entries is owed).
   green_chain_bytes: usize,
@@ -171,6 +178,7 @@ impl Partition {
       landings: BTreeMap::new(),
       audit: Vec::new(),
       green_chains: BTreeMap::new(),
+      green_origins: BTreeMap::new(),
       green_chain_bytes: 0,
     }
   }
@@ -184,6 +192,12 @@ impl Partition {
   /// for a green with no committed version and for any non-green volume.
   pub fn green_chain(&self, green: VolumeId) -> &[Vec<u8>] {
     self.green_chains.get(&green).map_or(&[], Vec::as_slice)
+  }
+
+  /// A green volume's encoded origin (§4.16), or `None` for a green that started from scratch
+  /// (and for any non-green volume).
+  pub fn green_origin(&self, green: VolumeId) -> Option<&[u8]> {
+    self.green_origins.get(&green).map(Vec::as_slice)
   }
 
   // ------------------------------------------------------------------ reads
@@ -462,6 +476,22 @@ impl Partition {
         }
         Ok(())
       }
+      Op::GreenOriginated { green, origin } => {
+        self.volume(*green).ok_or(DbError::NotFound)?;
+        // An origin is version 0: recorded once, and only before any increment — a chain that has
+        // advanced was based on whatever origin it had, so a later origin would rewrite history.
+        if self.green_origins.contains_key(green) || !self.green_chain(*green).is_empty() {
+          return Err(DbError::AlreadyExists {
+            existing: green.bytes,
+          });
+        }
+        if self.green_chain_bytes.saturating_add(origin.len()) > self.caps.green_chain_bytes {
+          return Err(DbError::Capacity {
+            table: "green_chains",
+          });
+        }
+        Ok(())
+      }
     }
   }
 
@@ -660,6 +690,11 @@ impl Partition {
           .push(increment.clone());
         Ok(())
       }
+      Op::GreenOriginated { green, origin } => {
+        self.green_chain_bytes = self.green_chain_bytes.saturating_add(origin.len());
+        self.green_origins.insert(*green, origin.clone());
+        Ok(())
+      }
     }
   }
 
@@ -713,6 +748,9 @@ impl Partition {
     if let Some(chain) = self.green_chains.remove(&id) {
       let bytes: usize = chain.iter().map(Vec::len).sum();
       self.green_chain_bytes = self.green_chain_bytes.saturating_sub(bytes);
+    }
+    if let Some(origin) = self.green_origins.remove(&id) {
+      self.green_chain_bytes = self.green_chain_bytes.saturating_sub(origin.len());
     }
     Ok(())
   }
@@ -815,14 +853,24 @@ impl Partition {
       landings: self.landings.values().cloned().collect(),
       audit: self.audit.clone(),
       consumers: self.consumers.values().cloned().collect(),
-      green_chains: self
-        .green_chains
-        .iter()
-        .map(|(green, increments)| GreenChain {
-          green: *green,
-          increments: increments.clone(),
-        })
-        .collect(),
+      green_chains: {
+        // Every green with a chain or an origin, in id order, so a base-seeded green with no
+        // increment yet is carried too.
+        let greens: std::collections::BTreeSet<VolumeId> = self
+          .green_chains
+          .keys()
+          .chain(self.green_origins.keys())
+          .copied()
+          .collect();
+        greens
+          .into_iter()
+          .map(|green| GreenChain {
+            green,
+            increments: self.green_chains.get(&green).cloned().unwrap_or_default(),
+            origin: self.green_origins.get(&green).cloned(),
+          })
+          .collect()
+      },
     }
   }
 
@@ -870,13 +918,28 @@ impl Partition {
     }
     p.audit = snapshot.audit.clone();
     for chain in &snapshot.green_chains {
-      let bytes: usize = chain.increments.iter().map(Vec::len).sum();
-      p.green_chain_bytes = p.green_chain_bytes.saturating_add(bytes);
-      p.green_chains.insert(chain.green, chain.increments.clone());
+      p.restore_green_chain(chain);
     }
     for c in &snapshot.consumers {
       p.consumers.insert(c.consumer, c.clone());
     }
     Ok(p)
+  }
+
+  /// Restores one green's chain and origin from a snapshot, charging both to the chain budget; a
+  /// green carried with no increment (a seeded green before its first merge) gets no empty chain
+  /// entry, so the restored tables equal the live ones.
+  fn restore_green_chain(&mut self, chain: &GreenChain) {
+    let bytes: usize = chain.increments.iter().map(Vec::len).sum();
+    self.green_chain_bytes = self.green_chain_bytes.saturating_add(bytes);
+    if !chain.increments.is_empty() {
+      self
+        .green_chains
+        .insert(chain.green, chain.increments.clone());
+    }
+    if let Some(origin) = &chain.origin {
+      self.green_chain_bytes = self.green_chain_bytes.saturating_add(origin.len());
+      self.green_origins.insert(chain.green, origin.clone());
+    }
   }
 }

@@ -27,6 +27,7 @@ pub mod algebra;
 pub mod base;
 pub mod clock;
 pub mod content;
+pub mod coverage;
 pub mod derive;
 pub mod dir;
 pub mod dirtree;

@@ -398,6 +398,14 @@ impl BasePlane {
     self.digest_stats.cached = 0;
     dropped
   }
+
+  /// The names the base listing of directory `no` found, or `None` when the listing has not been
+  /// read (the directory still shows the live disk). What [`crate::coverage`] checks a frozen node
+  /// against.
+  pub(crate) fn listed_names(&self, no: InodeNo) -> Option<Vec<Box<str>>> {
+    let entries = self.listings.get(&no)?.entries.as_ref()?;
+    Some(entries.iter().map(|entry| entry.name.clone()).collect())
+  }
 }
 
 fn host_refusal(e: HostError) -> VfsError {

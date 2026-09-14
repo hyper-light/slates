@@ -202,6 +202,19 @@ pub enum Op {
     /// The consumer.
     consumer: u64,
   },
+  /// A green volume's origin — its version-0 state, captured from a complete immutable base — was
+  /// recorded (§4.16 "the origin version from a snapshot"; the A-9 requirement that a chain starts
+  /// "from scratch or a complete immutable base"). The bytes are the merge crate's encoded origin;
+  /// the database stores them opaquely (it never parses a merge structure) and the server replays
+  /// them before the chain on recovery, so a green seeded from a base recovers to the same state as
+  /// one still running. Recorded once, before any increment; counted against the same byte budget
+  /// as the chain. Appended at the end of the operation set for append-only evolution.
+  GreenOriginated {
+    /// The green volume.
+    green: VolumeId,
+    /// The encoded origin.
+    origin: Vec<u8>,
+  },
 }
 
 impl Op {
@@ -236,6 +249,7 @@ impl Op {
       Op::LandingStateChanged { .. } => "landing_state_changed",
       Op::AuditAppended { .. } => "audit_appended",
       Op::GreenAdvanced { .. } => "green_advanced",
+      Op::GreenOriginated { .. } => "green_originated",
     }
   }
 }

@@ -145,6 +145,7 @@ enum Step {
   LandingState(usize, u8),
   Audit(u8),
   GreenAdvance(usize),
+  GreenOriginate(usize),
   Crash,
 }
 
@@ -172,6 +173,7 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..8usize, 0..10u8).prop_map(|(l, s)| Step::LandingState(l, s)),
     1 => (0..7u8).prop_map(Step::Audit),
     2 => (0..8usize).prop_map(Step::GreenAdvance),
+    1 => (0..8usize).prop_map(Step::GreenOriginate),
     1 => Just(Step::Crash),
   ]
 }
@@ -372,7 +374,8 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     | Step::Landing(..)
     | Step::LandingState(..)
     | Step::Audit(..)
-    | Step::GreenAdvance(..)) => return op_for_service(step, ids, now_ns),
+    | Step::GreenAdvance(..)
+    | Step::GreenOriginate(..)) => return op_for_service(step, ids, now_ns),
     Step::Crash => return None,
   })
 }
@@ -455,6 +458,12 @@ fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
       // The bytes are opaque to the database; a small deterministic value keeps the chain well under
       // its byte budget over a run so recovery, not the cap, is what the model exercises.
       increment: (*v as u64).to_le_bytes().to_vec(),
+    },
+    // An origin is recorded once and only before any increment (the partition's guard refuses a
+    // second or a late one; a refused step is never recorded, which is what the model checks).
+    Step::GreenOriginate(v) => Op::GreenOriginated {
+      green: vid(pick(&ids.live, *v)?),
+      origin: (*v as u64).to_be_bytes().to_vec(),
     },
     _ => return None,
   })

@@ -230,6 +230,9 @@ pub struct ShardState {
   /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
   /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.
   pub works: BTreeMap<VolumeId, WorkState>,
+  /// The merge plane's service state (§4.16, `crate::merge_service`): version-pinned green
+  /// attachments, and the fleet's pending merge records and holder replicas.
+  pub merge: crate::merge_service::MergeShardState,
   /// This shard's bounded telemetry ring (§4.14): the chokepoint spans emitted on the shard, held
   /// shed-first (the newest kept, the oldest dropped and counted), drained by the `Telemetry` verb
   /// (`crate::telemetry`) in batches bounded to one reply. Per-shard and thread-local, so it needs no
