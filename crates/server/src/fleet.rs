@@ -136,7 +136,7 @@ const FLEET_PACKET_OVERHEAD: usize = 80;
 /// trip. At the previous 16-byte cap a 68-byte record fragmented into five frames across a 64-byte window
 /// and needed ten credit-gated round trips, which lost the commit's deadline under core contention.
 /// Anchored to [`MIN_DATAGRAM_BYTES`] less [`FLEET_PACKET_OVERHEAD`].
-const FLEET_FRAME_CAP: usize = MIN_DATAGRAM_BYTES - FLEET_PACKET_OVERHEAD;
+pub const FLEET_FRAME_CAP: usize = MIN_DATAGRAM_BYTES - FLEET_PACKET_OVERHEAD;
 
 /// Derived: SWIM's infection factor rounded to a per-bit integer weight for `λ·ln(n+1)` (§4.8; SWIM §4.1).
 /// `λ·ln(x) = λ·ln(2)·log2(x)`, and the bit-length of `x` is `⌊log2(x)⌋+1`, so with SWIM's high-probability
@@ -216,8 +216,10 @@ struct PeerDial {
 
 /// Derived: the sessions a serve socket's demultiplexer holds per peer — the live one and the one a re-dial
 /// establishes to replace it (the old is closed once the new binds, so two suffice; a third dialer from
-/// the same peer is refused typed until one releases).
-const SESSIONS_PER_PEER: usize = 2;
+/// the same peer is refused typed until one releases). A session's slot is held until its serve task drops
+/// the session, so this also bounds the serve tasks alive per peer per plane — the accept side of the
+/// fleet's task share (`config::with_fleet`). Public so a test can size a burst past it.
+pub const SESSIONS_PER_PEER: usize = 2;
 
 /// A fleet peer as the serve side knows it: the certificate the handshake must present (mutual TLS admits
 /// only these), the **stable anchor** that certificate stands for, and the generation-0 **seed** id the
@@ -696,21 +698,16 @@ pub async fn run_membership(transport: FleetTransport, progress: &'static Atomic
   );
   state::with_state(|s| s.demuxes = vec![probe_demux, record_demux]);
   for demux in [probe_demux, record_demux] {
-    if let Ok(task) = futures::spawn(run_demux(demux)) {
-      let _ = futures::detach(task);
-    }
+    spawn_detached(run_demux(demux), LOOP_SPAWN_REFUSED);
   }
-  if let Ok(task) = futures::spawn(accept_probes(
-    probe_demux,
-    local,
-    neighbourhood,
-    roster.clone(),
-  )) {
-    let _ = futures::detach(task);
-  }
-  if let Ok(task) = futures::spawn(accept_records(record_demux, local, roster)) {
-    let _ = futures::detach(task);
-  }
+  spawn_detached(
+    accept_probes(probe_demux, local, neighbourhood, roster.clone()),
+    LOOP_SPAWN_REFUSED,
+  );
+  spawn_detached(
+    accept_records(record_demux, local, roster),
+    LOOP_SPAWN_REFUSED,
+  );
 
   for peer in peers {
     let FleetPeer {
@@ -736,26 +733,26 @@ pub async fn run_membership(transport: FleetTransport, progress: &'static Atomic
       address: record_address,
       certificate,
     };
-    if let Ok(task) = futures::spawn(probe_peer(
-      identity,
-      probe_dial,
-      local,
-      neighbourhood,
-      (probe_demux, record_demux),
-    )) {
-      let _ = futures::detach(task);
-    }
-    if let Ok(task) = futures::spawn(establish_record_link(identity, record_dial)) {
-      let _ = futures::detach(task);
-    }
+    spawn_detached(
+      probe_peer(
+        identity,
+        probe_dial,
+        local,
+        neighbourhood,
+        (probe_demux, record_demux),
+      ),
+      LOOP_SPAWN_REFUSED,
+    );
+    spawn_detached(
+      establish_record_link(identity, record_dial),
+      LOOP_SPAWN_REFUSED,
+    );
   }
 
   // One record-plane coordinator for all peers (§4.8 "records are sent to all candidates"): it borrows every
   // holder session the link tasks keep up, so it ships each head to all candidates in one commit and drives
   // each takeover over all surviving holders (the `f > 1` promotion a per-peer ship task could not reach).
-  if let Ok(task) = futures::spawn(run_record_plane(local, progress)) {
-    let _ = futures::detach(task);
-  }
+  spawn_detached(run_record_plane(local, progress), LOOP_SPAWN_REFUSED);
 }
 
 /// A serve socket's receive loop as a task, for the daemon's life: it routes every datagram to its session.
@@ -779,14 +776,14 @@ async fn accept_probes(
 ) {
   loop {
     let session = demux.accept().await;
-    if let Ok(task) = futures::spawn(serve_peer_probes(
-      session,
-      local,
-      neighbourhood,
-      roster.clone(),
-    )) {
-      let _ = futures::detach(task);
-    }
+    // A full task arena drops the accepted session here, explicitly — its slot goes back to the
+    // demultiplexer and the peer's next re-dial takes a fresh one — and counts it, never lost in
+    // silence (banned item 9). The fleet's share of the arena is sized for every session the
+    // demultiplexer can hold (`config::with_fleet`), so the count is a tripwire.
+    spawn_detached(
+      serve_peer_probes(session, local, neighbourhood, roster.clone()),
+      SERVE_SPAWN_REFUSED,
+    );
   }
 }
 
@@ -796,9 +793,10 @@ async fn accept_probes(
 async fn accept_records(demux: &'static Demux, local: HostId, roster: Vec<Rostered>) {
   loop {
     let session = demux.accept().await;
-    if let Ok(task) = futures::spawn(serve_peer_records(session, local, roster.clone())) {
-      let _ = futures::detach(task);
-    }
+    spawn_detached(
+      serve_peer_records(session, local, roster.clone()),
+      SERVE_SPAWN_REFUSED,
+    );
   }
 }
 
@@ -2342,6 +2340,30 @@ const BIND_REFUSED: &str = "fleet.bind";
 /// peer is not in the roster (never served).
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const ACCEPT_REFUSED: &str = "fleet.accept";
+/// An accepted session whose serve task the shard's arena refused (the fleet's task share, sized for
+/// every session the demultiplexer can hold, was exceeded): the session is dropped and the peer
+/// re-dials. A count here under a load the arena should carry is a sizing defect, not a peer's.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const SERVE_SPAWN_REFUSED: &str = "fleet.serve_spawn";
+/// A perpetual fleet loop the shard's arena refused at boot — its task budget spent before the fleet's own
+/// loops were admitted: a plane's receive or accept loop, a peer's probe or record link, or the
+/// coordinator. Counted, never silent (banned item 9); the node then runs without that loop, which the
+/// mesh's failure to form to it makes visible.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const LOOP_SPAWN_REFUSED: &str = "fleet.loop_spawn";
+
+/// Spawns a perpetual fleet task and detaches it (a joinable task stays in the arena after it ends, which
+/// would hold the shard's shutdown); a spawn the arena refuses is counted under `refused` — a refusal is
+/// counted, never swallowed (§4.14, banned item 9). Before this every fleet loop's spawn was `if let Ok`,
+/// so a refused loop left a node silently without a plane, a peer link or its coordinator.
+fn spawn_detached(future: impl std::future::Future<Output = ()> + 'static, refused: &'static str) {
+  match futures::spawn(future) {
+    Ok(task) => {
+      let _ = futures::detach(task);
+    }
+    Err(_) => count_refusal(refused),
+  }
+}
 
 /// The status refusal count under which the fleet loop records a serve socket whose receive loop ended
 /// because the socket refused — the node no longer accepts sessions on that plane.

@@ -161,6 +161,13 @@ pub static INIT_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub static HANDOFF_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Volumes the recovered catalog holds that a shard could not rebuild (a health signal).
 pub static RECOVERY_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The status refusal count under which the daemon records a perpetual loop of its own that the control
+/// shard's arena refused — the mount listener's serve loop, the anchor heartbeat — counted, never silent
+/// (banned item 9); a shard's serve and reap loops are a typed initialization failure instead
+/// (`init_shard`), since a shard without them serves nothing.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const LOOP_SPAWN_REFUSED: &str = "daemon.loop_spawn";
 /// Volumes skipped from a shard publish because they could not be imaged (an overlay with base-backed
 /// inodes, whose base recovery is its own gate); the rest of the shard still publishes (a health
 /// signal, §4.8).
@@ -375,8 +382,11 @@ impl Daemon {
           // Publish the port for a verb handler to report to a client (`slates mount`).
           NFS_PORT.store(u32::from(port), Ordering::Release);
           runtime.spawn_on(control, async move {
-            if let Ok(task) = futures::spawn(crate::nfs::serve(nfs_listener, port)) {
-              let _ = futures::detach(task);
+            match futures::spawn(crate::nfs::serve(nfs_listener, port)) {
+              Ok(task) => {
+                let _ = futures::detach(task);
+              }
+              Err(_) => crate::fleet::count_refusal(LOOP_SPAWN_REFUSED),
             }
           })?;
         }
@@ -643,6 +653,26 @@ impl Daemon {
   pub fn fleet_refusals(&self) -> Option<std::collections::BTreeMap<&'static str, u64>> {
     self.observe(self.shards.first().copied(), || {
       state::with_state(|s| s.refusals.clone())
+    })
+  }
+
+  /// The counters of this daemon's fleet demultiplexers — the probe plane's, then the record plane's
+  /// (§4.14): sessions opened for a new source, sessions replaced by their peer's re-dial, handshakes
+  /// refused for want of a session slot, and datagrams dropped. Empty for a laptop (no planes); `None`
+  /// when the control shard could not be observed.
+  pub fn fleet_demux_counters(&self) -> Option<Vec<slates_transport::demux::DemuxCounters>> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| s.demuxes.iter().map(|demux| demux.counters()).collect())
+    })
+  }
+
+  /// Live tasks in the control shard's arena (§4.14), the observation's own task among them. A test reads
+  /// it before and after a burst of work to prove the burst's tasks ended — the accept-side serve tasks a
+  /// peer's re-dials spawn, in particular, whose share of the arena is sized by `config::with_fleet`.
+  /// `None` when the control shard could not be observed.
+  pub fn live_tasks(&self) -> Option<usize> {
+    self.observe(self.shards.first().copied(), || {
+      slates_rt::registry::with_current(|shard| shard.live_tasks())
     })
   }
 
@@ -1528,12 +1558,12 @@ fn init_shard(
   state::install(state);
   // Detached: the loop lives as long as the shard; nothing joins it (a joinable task stays in
   // the arena after it ends, which would hold the shard's shutdown).
-  if let Ok(task) = futures::spawn(serve_loop()) {
-    let _ = futures::detach(task);
-  }
-  if let Ok(task) = futures::spawn(reap_loop()) {
-    let _ = futures::detach(task);
-  }
+  // A shard whose serve or reap loop the arena refuses serves nothing: a typed initialization failure
+  // (surfaced by the boot as `INIT_FAILURES`), never a silently loop-less shard (banned item 9).
+  let serve = futures::spawn(serve_loop()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(serve);
+  let reap = futures::spawn(reap_loop()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(reap);
   Ok(())
 }
 
@@ -1625,8 +1655,11 @@ async fn control_loop(
       )
     });
   }
-  if let Ok(task) = futures::spawn(heartbeat_loop(segment)) {
-    let _ = futures::detach(task);
+  match futures::spawn(heartbeat_loop(segment)) {
+    Ok(task) => {
+      let _ = futures::detach(task);
+    }
+    Err(_) => crate::fleet::count_refusal(LOOP_SPAWN_REFUSED),
   }
   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
   // by the daemon's client capacity, refused typed beyond it (AC-2.6). A client's shard is

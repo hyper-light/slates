@@ -166,6 +166,10 @@ accept-side handshakes.
 > (`adm_refused=4554`) with concurrent accept-side handshakes each held for their bounded retransmit budget
 > while their peer is starved — a bounded wait, not a leak, and absent at normal load. No product behaviour
 > changed; the additions are the per-period progress statistic, the per-shard pulse, and the harness trace.
+> **Resolved 2026-09-14:** the accept-side task budget left open above is now derived — `DaemonConfig::with_fleet`
+> adds the fleet's own share (per peer its two loops and the serve tasks of the sessions the demultiplexer
+> holds on each plane; the plane loops; the coordinator) to the shard's task arena, and a refused fleet spawn
+> is counted typed; `docs/bugs/2026-09-14-fleet-tasks-admitted-against-the-clients-budget.md`.
 
 ## Part 5 — the integrator's row sentences
 

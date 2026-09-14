@@ -50,6 +50,17 @@ const TASKS_PER_CLIENT: usize = 2;
 /// Shape: the shard's own perpetual tasks: the server loop, the reap loop, the control loop
 /// and the heartbeat, plus a spare for a shutdown message.
 const LOOP_TASKS_PER_SHARD: usize = 5;
+/// Shape: the fleet's perpetual tasks per peer on the control shard: the probe loop and the record
+/// link (`fleet::probe_peer`, `fleet::establish_record_link`).
+const FLEET_LOOPS_PER_PEER: usize = 2;
+/// Shape: the fleet's planes, each with its own socket, demultiplexer and accept loop: probes and
+/// records (§4.8).
+const FLEET_PLANES: usize = 2;
+/// Shape: the fleet's perpetual tasks per shard beyond the per-peer ones: one demultiplexer receive
+/// loop and one accept loop per plane (`fleet::run_demux`, `fleet::accept_probes`,
+/// `fleet::accept_records`), plus the one coordinator (`fleet::run_record_plane`, which also drives
+/// the configuration council and the root group in its period).
+const FLEET_LOOPS_PER_SHARD: usize = FLEET_PLANES * 2 + 1;
 /// Shape: the idle window as a multiple of the spin window (the measured wake cost): a shard
 /// keeps polling this long after its last work, so a client that pauses to think between
 /// requests finds it awake; ratified in GAPS §5 until the spin-to-park ratio is measured
@@ -642,6 +653,36 @@ impl DaemonConfig {
   /// group and owner acceptor are built over `membership` (its quorum and peers) at boot, rather than the
   /// solo degenerate. An operator sets this to deploy a fleet node; a laptop leaves it unset.
   pub fn with_fleet(mut self, membership: FleetMembership) -> DaemonConfig {
+    // The fleet's own tasks are a second population on the control shard beside the clients' (§4.3
+    // "every structure has a derived bound"): per peer, the probe loop and the record link, and the
+    // accept-side serve tasks — one per session the demultiplexer may hold for that peer on each
+    // plane (`fleet::SESSIONS_PER_PEER` × 2 planes: the live session and the one a re-dial is
+    // replacing; the demultiplexer holds a session's slot until its serve task drops it, so no more
+    // can exist) — plus the receive and accept loops of both planes and the coordinator. Sized here,
+    // once, from the peer count, so a burst of re-dials under
+    // load fills the fleet's share and never the clients' (2026-09-14: at ~3× oversubscription the
+    // shard's whole arena filled with accept-side handshakes each held for its bounded retransmit
+    // budget, `adm_refused` 4,554 — `docs/wip/fleet-under-load.md`).
+    let peers = membership.peers.len();
+    let fleet_tasks: Derived<usize> = derived!(
+      peers
+        .saturating_mul(FLEET_LOOPS_PER_PEER)
+        .saturating_add(peers.saturating_mul(crate::fleet::SESSIONS_PER_PEER * FLEET_PLANES))
+        .saturating_add(FLEET_LOOPS_PER_SHARD),
+      "peers × FLEET_LOOPS_PER_PEER + peers × SESSIONS_PER_PEER × FLEET_PLANES + FLEET_LOOPS_PER_SHARD",
+      ["fleet.peers"]
+    );
+    self
+      .derivations
+      .push(note("fleet_tasks_per_shard", &fleet_tasks));
+    self.runtime.tasks_per_shard = self
+      .runtime
+      .tasks_per_shard
+      .saturating_add(fleet_tasks.get());
+    self.runtime.timers_per_shard = self
+      .runtime
+      .timers_per_shard
+      .saturating_add(fleet_tasks.get());
     self.fleet = Some(membership);
     self
   }
@@ -872,6 +913,57 @@ mod tests {
     assert!(
       records >= class / 2,
       "at least half the class is left for records ({records} of {class}; slabs {slabs})"
+    );
+  }
+
+  /// §4.3 "every structure has a derived bound" for the fleet's own tasks: a fleet configuration
+  /// carries, per peer, the probe loop, the record link and one serve task per session the
+  /// demultiplexer may hold on each plane, plus the plane loops — derived from the peer count and
+  /// added to the shard's task budget, so a burst of peer re-dials fills the fleet's share and never
+  /// a client's. Do: derive with and without a five-peer fleet. Expect: the fleet form's task and
+  /// timer budgets exceed the solo form's by exactly the derived share, and the boot log names it
+  /// with its input. Non-vacuous: before the share existed the two budgets were equal, so the accept
+  /// loops admitted serve tasks against the clients' budget alone (`adm_refused` 4,554 at ~3×
+  /// oversubscription, `docs/wip/fleet-under-load.md`).
+  #[test]
+  fn a_fleet_configuration_derives_its_own_task_share_from_the_peer_count() {
+    let profile = MachineProfile::measure(ProfileOptions {
+      budget_per_probe: Duration::from_millis(1),
+      codecs: false,
+      core_matrix: false,
+    });
+    let solo = DaemonConfig::derive(&profile, "fleet-share-solo");
+    let peers: Vec<HostId> = (1..=5).map(HostId).collect();
+    let fleet = DaemonConfig::derive(&profile, "fleet-share-fleet").with_fleet(FleetMembership {
+      quorum: Quorum { f: 2 },
+      peers: peers.clone(),
+      host: HostId(0),
+      origin_anchor: HostId(0),
+      domains: BTreeMap::new(),
+      regions: BTreeMap::new(),
+      durability: None,
+      region_mirrors: BTreeMap::new(),
+    });
+    let share = peers.len() * FLEET_LOOPS_PER_PEER
+      + peers.len() * crate::fleet::SESSIONS_PER_PEER * FLEET_PLANES
+      + FLEET_LOOPS_PER_SHARD;
+    assert_eq!(
+      fleet.runtime.tasks_per_shard,
+      solo.runtime.tasks_per_shard + share,
+      "the fleet's task share is derived from the peer count and added to the shard's budget"
+    );
+    assert_eq!(
+      fleet.runtime.timers_per_shard,
+      solo.runtime.timers_per_shard + share,
+      "every fleet task may hold a timer"
+    );
+    assert!(
+      fleet
+        .derivations
+        .iter()
+        .any(|line| line.starts_with("fleet_tasks_per_shard")),
+      "the boot log names the share with its input: {:?}",
+      fleet.derivations
     );
   }
 

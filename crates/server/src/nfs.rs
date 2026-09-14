@@ -766,11 +766,21 @@ fn serve_root_listing(
 /// `GETPORT`.
 pub async fn serve(listener: TcpListener, port: u16) {
   while let Ok(stream) = listener.accept().await {
-    if let Ok(task) = futures::spawn(serve_one(stream, port)) {
-      let _ = futures::detach(task);
+    match futures::spawn(serve_one(stream, port)) {
+      Ok(task) => {
+        let _ = futures::detach(task);
+      }
+      // The arena refused the connection's serve task: the connection is dropped (the kernel client
+      // reconnects) and the refusal counted, never silent (banned item 9).
+      Err(_) => crate::fleet::count_refusal(SERVE_SPAWN_REFUSED),
     }
   }
 }
+
+/// The status refusal count under which the mount listener records a connection whose serve task the
+/// shard's arena refused.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const SERVE_SPAWN_REFUSED: &str = "nfs.serve_spawn";
 
 /// Produces the RPC reply payload for one parsed call, routing it locally, to a volume's owner shard
 /// over the bridge queue, or (a host-root listing) across every shard, all as `requester` (the
