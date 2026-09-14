@@ -516,6 +516,22 @@ impl ContentHold {
     Ok(identity)
   }
 
+  /// Forgets a held manifest: its record is dropped and each chunk it references loses one reference
+  /// (a chunk no other held manifest references is evicted, so the store's accounting stays exact).
+  /// Returns whether the manifest was held. This is what a holder's **content loss** looks like from
+  /// the owner's side — in a real deployment a restart (a RAM-only node holds nothing after one, §4.8
+  /// "Recovery"); in-process, a test's injection — the condition the healer repairs (§4.10
+  /// "anti-entropy … repairs only differing subtrees"). Nothing here is reachable from the wire.
+  pub fn forget_manifest(&mut self, identity: &[u8; 32]) -> bool {
+    let Some(record) = self.manifests.remove(identity) else {
+      return false;
+    };
+    for referenced in referenced_chunks(&record.manifest) {
+      self.store.release(&referenced);
+    }
+    true
+  }
+
   /// The whole archive for a held manifest — its header, manifest, and every referenced chunk in
   /// reference order — or `None` if the manifest is not held whole.
   pub fn archive_of(&self, identity: &[u8; 32]) -> Option<Archive> {
@@ -587,6 +603,12 @@ pub struct ContentPlaced {
   /// trigger is measured from (§4.8 "hedge delay = measured p95 put latency per class"). Empty when the
   /// round dispatched nothing (the owner's local hold at `f = 0`) or no holder acknowledged.
   pub latencies_ns: Vec<(HostId, u64)>,
+  /// The holders whose offer answer named chunks they **lacked** — bytes actually crossed the wire to
+  /// them this round. For a fresh seal that is every holder; for the healer's re-offer of placed content
+  /// (§4.10 "anti-entropy … repairs only differing subtrees") it is exactly the holders that had lost
+  /// something, the repairs. A holder that lacked nothing answers with an empty missing set and is put
+  /// zero chunks (it still verifies and acknowledges).
+  pub refilled: Vec<HostId>,
 }
 
 /// One request of a dispatch round: the holder, its session, and the request bytes.
@@ -643,9 +665,10 @@ fn puts_for(
   sequence: u64,
   manifest: &[u8; 32],
   offered: Vec<Reply>,
-) -> (Vec<HolderRequest>, Vec<(HostId, Endpoint)>) {
+) -> (Vec<HolderRequest>, Vec<(HostId, Endpoint)>, Vec<HostId>) {
   let mut puts = Vec::new();
   let mut reusable = Vec::new();
+  let mut refilled = Vec::new();
   for Reply(host, reply, endpoint) in offered {
     match ContentMessage::decode(&reply) {
       Ok(ContentMessage::Missing {
@@ -657,6 +680,9 @@ fn puts_for(
         && offered_sequence == sequence
         && offered_manifest == *manifest =>
       {
+        if !missing.is_empty() {
+          refilled.push(host);
+        }
         let wanted: BTreeSet<[u8; 32]> = missing.into_iter().collect();
         let partial = with_chunks(archive, chunks_for(archive, &wanted));
         let put = ContentMessage::Put {
@@ -670,7 +696,7 @@ fn puts_for(
       _ => reusable.push((host, *endpoint)),
     }
   }
-  (puts, reusable)
+  (puts, reusable, refilled)
 }
 
 /// Gathers every reply of a dispatch round until all its tasks have ended (the channel closes) or the
@@ -728,6 +754,7 @@ pub async fn put_content(
       reusable: Vec::new(),
       stragglers: Stragglers::none(),
       latencies_ns: Vec::new(),
+      refilled: Vec::new(),
     };
   }
   let deadline_ns = budget.max_deadline_ns();
@@ -756,12 +783,13 @@ pub async fn put_content(
         reusable: sessions_of(gather(&mut rx, budget).await),
         stragglers: Stragglers::none(),
         latencies_ns: Vec::new(),
+        refilled: Vec::new(),
       };
     }
   };
 
   // The put round: each holder that answered its offer gets the manifest and exactly its missing chunks.
-  let (puts, mut reusable) = puts_for(archive, object, sequence, &manifest, offered);
+  let (puts, mut reusable, refilled) = puts_for(archive, object, sequence, &manifest, offered);
   if puts.is_empty() {
     return ContentPlaced {
       outcome: Err(ClusterError::NotPlaced {
@@ -770,6 +798,7 @@ pub async fn put_content(
       reusable,
       stragglers: Stragglers::none(),
       latencies_ns: Vec::new(),
+      refilled: Vec::new(),
     };
   }
   // The put latency is timed from the put round's dispatch: the offer round before it is the holder
@@ -784,6 +813,7 @@ pub async fn put_content(
         reusable,
         stragglers: Stragglers::none(),
         latencies_ns: Vec::new(),
+        refilled: Vec::new(),
       };
     }
   };
@@ -821,6 +851,7 @@ pub async fn put_content(
     reusable,
     stragglers,
     latencies_ns,
+    refilled,
   }
 }
 

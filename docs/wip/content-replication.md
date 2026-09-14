@@ -93,6 +93,72 @@ and content. Only the content class hedges (records go to *all* candidates at on
 idempotently), so only its window drives a trigger; the record class's readings are gathered by the same
 collector and available when a record-plane hedge is designed.
 
-## Pieces 2 and 3
+## Piece 2 — anti-entropy and the healer at the measured put-failure rate (landed)
 
-Not yet started at the time of this record's first commit; see the sections appended below as they land.
+**The design's rule** (§4.10): *anti-entropy walks Merkle manifests between recorded holders and repairs
+only differing subtrees; the healer replays puts that never reached f+1 from the owner's `put_wal`*;
+(§4.8 "Derived constants"): *healer cadence from the measured put-failure rate*; (§4.8 "Recovery"): a
+restarted node *holds nothing for others until re-replication fills it*.
+
+**What the tree did before.** The replay half already existed in a different name: a seal whose content
+never reaches `f + 1` stays in `ShardState::seals` and is re-put every period until it places (that is the
+`put_wal` replay for content). What did not exist was any verification *after* placement: a placed seal is
+dropped with its archive, and a recorded holder that later loses the content (a restart) is never
+noticed — the head record names a holder that holds nothing, and a takeover successor fetching by identity
+would find it gone.
+
+**The failing test first.** `a_holder_that_lost_placed_content_is_repaired_by_the_healer`: three nodes,
+`f = 1`; seal to placed; the recorded holder **forgets** the manifest (`Daemon::drop_held_content` →
+`ContentHold::forget_manifest`, the in-process stand-in for a restart, injected for the same reason the
+rejoin test injects a death); the holder must hold it whole again *with no new seal* and the owner's
+repair count must move.
+
+```
+cargo test -p slates-server --test fleet a_holder_that_lost_placed_content_is_repaired_by_the_healer -- --exact
+```
+
+| Tree | Result |
+|---|---|
+| unchanged (the loss is never noticed) | FAILED 448.39 s — `repairs Some(0) → Some(0)`; the poll ran its 4000-period daemon-time budget out |
+| the healer (this piece) | ok **13.52 s** — the holder holds the manifest again, repairs 0 → 1 |
+
+**The change** — replace, don't layer: no second exchange and no second put path.
+- `heal_one_placed_snapshot` (`crates/server/src/fleet.rs`), one step per healer period at the end of
+  `advance_seals`: the next owned volume (in id order, wrapping — `HealerCursor`) whose head snapshot is
+  recorded `Placed` and has no seal in progress is re-opened as a **`healing` `SealJob`** seeded with the
+  owner as its only acknowledged holder. The ordinary content rounds then re-**offer** the archive to every
+  candidate: the `Offer → Missing` exchange *is* the Merkle diff (the manifest is a Merkle tree, `Node::
+  identity` names children by identity, so a differing subtree is a differing chunk set), a holder that
+  lost nothing answers with an empty missing set and is put **zero bytes** (it still verifies its whole
+  hold and acknowledges), a holder that lost content is put exactly what it lacks, and the placement is
+  re-recorded (`record_placed_seals`; the db guard accepts a re-placement). `sealable_head` keeps a healing
+  job past its "already placed" drop until its round has run.
+- `ContentPlaced::refilled` (`puts_for` reports the holders whose missing set was non-empty): for a
+  healing job, a refilled holder that then acknowledged is a **repair**, counted in `ShardState::repairs`
+  (`Daemon::fleet_repairs`, the test's non-vacuity counter — a fresh seal could also refill a holder; only
+  the healer moves this).
+- `PutOutcomes { placed, short }` — every content round's outcome, recorded on the owner shard; the
+  measured put-failure rate. `heal_period_ns` = `HEARTBEAT_NS × HEAL_PERIODS_AT_REST × placed / (placed +
+  short × HEAL_PERIODS_AT_REST)`: one snapshot per hundred periods while every round places (an idle fleet
+  spends one offer round trip per placed snapshot per ten seconds verifying what it placed), tightening in
+  proportion to the share of rounds that ended short until, when short rounds are as common as placed
+  ones, it is one snapshot per period — the fastest the coordinator runs; never below one period;
+  integer arithmetic. `HEAL_PERIODS_AT_REST` is anchored to the put-latency window's seal count so the
+  healer covers a window of seals in a window of periods.
+- Bounded work: one snapshot per step, one step per period at most; the walk is a cursor over the owned
+  volumes, so no per-period work grows with what is placed.
+
+**Measured on this box.** Loss injected → repaired and re-held: within the 13.52 s test (formation,
+seal, loss, one healer step at the at-rest cadence — the first step fires at once, before any reading —
+re-archive in slices, offer, put of the missing chunks, acknowledgement, re-record). The regressions on the
+same machinery: hedge test 6.00 s, seal test 3.85 s, takeover-content test 10.04 s (each `-- --exact`).
+
+**Probation** (the design's "puts a repeatedly late candidate on probation for the group to replace";
+threshold "late count over the measured window that exceeds the hedge rate's variance") is **not** in
+this piece: it is a configuration-group action (the council replaces the candidate), so it belongs with
+the council's membership reconcile, and its threshold needs the hedge rate's variance over the window the
+readings now exist for. Reported as the next owed step of §4.10, with the readings it needs in place.
+
+## Piece 3 — content-defined chunking and the compress-or-not cost model (D-17)
+
+See the section appended below when it lands.

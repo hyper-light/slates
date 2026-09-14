@@ -111,6 +111,11 @@ pub struct SealJob {
   /// round that is merely a little slow is not doubled up on, while one that has fallen into the tail is.
   /// `None` until the first round goes out.
   pub first_round_at_ns: Option<u64>,
+  /// Whether this job is the **healer's** re-offer of an already-placed snapshot (§4.10 "anti-entropy …
+  /// the healer") rather than a fresh seal: the snapshot's placement is already recorded, so the job is
+  /// kept past the "already placed" drop, and a holder that answers the offer with chunks it lacked is a
+  /// **repair**, counted. Its rounds are the ordinary content rounds — the same put, hedge and record path.
+  pub healing: bool,
 }
 
 #[cfg(test)]

@@ -2813,6 +2813,85 @@ fn a_slow_first_round_candidate_is_hedged_after_the_measured_p95() {
   );
 }
 
+/// AC (§4.10 "anti-entropy walks Merkle manifests between recorded holders and repairs only differing
+/// subtrees; the healer replays puts that never reached f+1"; §4.8 "Derived constants": "healer cadence from
+/// the measured put-failure rate"; §4.8 "Recovery": a restarted holder "holds nothing for others until
+/// re-replication fills it"): in a three-node `f = 1` fleet a sealed snapshot places on the owner and a
+/// recorded holder; the holder then **loses** that content (`drop_held_content` — the state a RAM-only
+/// holder is in after a restart, injected because an in-process daemon cannot restart). The owner's healer
+/// must re-offer the placed snapshot to its recorded holders, find the loss (the holder's missing set is
+/// non-empty), re-put exactly the missing chunks, and the holder must hold the manifest whole again — with
+/// no new seal taken. Non-vacuous three ways: the holder is shown to hold the content, then shown **not** to
+/// (the loss took hold), then shown to hold it again while the owner's repair count moved from zero (a fresh
+/// seal could refill a holder; only the healer moves that count).
+#[test]
+fn a_holder_that_lost_placed_content_is_repaired_by_the_healer() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let serve = mesh_serve_ports(n);
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let all: Vec<&Daemon> = daemons.iter().collect();
+
+  // Seal on A until the content places; find the recorded holder that holds the manifest.
+  let id = match seal_hello_on_owner(&instance_a, &daemons, "healed") {
+    Ok(id) => id,
+    Err(why) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("setup: {why}");
+    }
+  };
+  let object = ObjectId(id.bytes);
+  let manifest = daemons[0].fleet_head_manifest(object);
+  let holder_index = manifest.and_then(|manifest| {
+    (1..n).find(|index| daemons[*index].fleet_holder_content(manifest) == Some(true))
+  });
+  let (Some(manifest), Some(holder_index)) = (manifest, holder_index) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("the sealed content placed on a recorded holder: {manifest:?} {holder_index:?}");
+  };
+  let repairs_before = daemons[0].fleet_repairs(object);
+
+  // The holder loses the content; the loss is shown to have taken hold.
+  let forgotten = daemons[holder_index].drop_held_content(manifest);
+  let lost = daemons[holder_index].fleet_holder_content(manifest) == Some(false);
+
+  // The healer re-offers, finds the loss and re-puts: the holder holds the manifest whole again, and the
+  // owner's repair count moved.
+  let repaired = poll_until(&all, PLACEMENT_DEADLINE, || {
+    daemons[holder_index].fleet_holder_content(manifest) == Some(true)
+      && daemons[0]
+        .fleet_repairs(object)
+        .is_some_and(|repairs| repairs_before.is_some_and(|before| repairs > before))
+  });
+  let repairs_after = daemons[0].fleet_repairs(object);
+
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    forgotten && lost,
+    "the recorded holder lost the placed content (forgotten={forgotten}, lost={lost})"
+  );
+  assert!(
+    repaired,
+    "the healer re-put the lost content and the holder holds it whole again \
+     (repairs {repairs_before:?} → {repairs_after:?})"
+  );
+}
+
 /// AC (§4.8 "Promotion and takeover" — the successor "adopts the newest records, and serves"; §4.10
 /// clone-from-archive; R8 one code path): three daemons form an `f = 1` fleet; a file is written over NFS
 /// into a volume on A and sealed; its content places (A plus one content candidate) and its head reaches

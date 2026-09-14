@@ -64,8 +64,11 @@
 //! the seal walk and the head values run there, the archives and heads move here by value for the
 //! dispatch, and the acknowledgements and durable placements are recorded back there. The hedge to the
 //! remaining candidates fires on the **measured p95** of the content class's put latency ([`PutLatency`],
-//! [`hedge_delay_ns`]), one period before any reading. Owed: content-defined chunking and the
-//! compress-or-not cost model (D-17), anti-entropy and the healer.
+//! [`hedge_delay_ns`]), one period before any reading. **Anti-entropy and the healer** are one step per
+//! healer period ([`heal_one_placed_snapshot`]): a placed snapshot is re-offered to its candidates through
+//! the same rounds — a holder that lost content is put exactly what it lacks (a repair, counted), one that
+//! lost nothing is put no bytes — at a cadence derived from the measured put-failure rate
+//! ([`heal_period_ns`]). Owed: content-defined chunking and the compress-or-not cost model (D-17).
 //!
 //! The `FleetNode` lives in the shard state (the verbs read it for placement), so it is touched only
 //! through brief synchronous [`state::with_state`] — never held across an await. At `f = 0` (the laptop)
@@ -1199,7 +1202,16 @@ fn advance_seals(
       continue;
     };
     if !state.seals.contains_key(&object)
-      && !start_seal(state, local, object, handle, head, sequence, created_unix)
+      && !start_seal(
+        state,
+        local,
+        object,
+        handle,
+        head,
+        sequence,
+        created_unix,
+        false,
+      )
     {
       continue;
     }
@@ -1210,7 +1222,71 @@ fn advance_seals(
       work.push(item);
     }
   }
+  heal_one_placed_snapshot(state, local, created_unix);
   work
+}
+
+/// The healer's step (§4.10 "anti-entropy walks Merkle manifests between recorded holders and repairs only
+/// differing subtrees; the healer replays puts …"; §4.8 "Derived constants": "healer cadence from the
+/// measured put-failure rate"): once per healer period ([`heal_period_ns`]) it re-opens a seal job for the
+/// **next** owned volume whose head snapshot is recorded placed — a `healing` job, seeded with the owner as
+/// the only acknowledged holder — so the ordinary content rounds re-**offer** the archive to every candidate:
+/// a holder that lost nothing answers with an empty missing set and is put zero bytes (the Merkle identity
+/// diff finds no differing subtree), a holder that lost content is put exactly what it lacks and counts as
+/// a repair, and the placement is re-recorded. One snapshot per period, in volume-id order, wrapping: a
+/// bounded slice of the walk over everything this node has placed (§4.3 bounded work). Nothing to do while
+/// a seal for the volume is already in progress, on a laptop (nothing is placed remotely), or between steps.
+fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix: u64) {
+  let now = state.clock.monotonic_ns();
+  if state
+    .healer
+    .last_step_ns
+    .is_some_and(|last| now.saturating_sub(last) < heal_period_ns(&state.put_outcomes))
+  {
+    return;
+  }
+  let mut volumes: Vec<(DbVolumeId, slates_mem::Handle<crate::state::VolumeSlot>)> =
+    state.by_id.iter().map(|(id, h)| (*id, *h)).collect();
+  volumes.sort_unstable_by_key(|(id, _)| id.bytes);
+  // The next volume after the cursor, wrapping to the first: one step of a round-robin walk.
+  let start = state.healer.after.map_or(0, |after| {
+    volumes.partition_point(|(id, _)| id.bytes <= after.bytes)
+  });
+  let candidate = volumes
+    .iter()
+    .skip(start)
+    .chain(volumes.iter().take(start))
+    .find_map(|(id, handle)| {
+      let object = ObjectId(id.bytes);
+      let record = state.db.partition().volume(*id)?;
+      if record.epoch == 0 || state.seals.contains_key(&object) {
+        return None;
+      }
+      let snapshot = state.db.partition().snapshot(*id, record.head)?;
+      matches!(snapshot.placed, PlacementState::Placed { .. }).then_some((
+        *id,
+        *handle,
+        object,
+        record.head,
+        record.epoch,
+      ))
+    });
+  state.healer.last_step_ns = Some(now);
+  let Some((id, handle, object, head, sequence)) = candidate else {
+    state.healer.after = None;
+    return;
+  };
+  state.healer.after = Some(id);
+  start_seal(
+    state,
+    local,
+    object,
+    handle,
+    head,
+    sequence,
+    created_unix,
+    true,
+  );
 }
 
 /// The head snapshot of `id` that still needs sealing — its id and the head sequence — or `None` when the
@@ -1232,6 +1308,15 @@ fn sealable_head(
     .snapshot(id, head)
     .is_some_and(|snapshot| matches!(snapshot.placed, PlacementState::Placed { .. }));
   if placed {
+    // A finished seal is dropped — unless it is the healer's re-offer of this placed snapshot, which is
+    // kept until its round has run (§4.10 "the healer"); it is dropped when it re-records the placement.
+    if state
+      .seals
+      .get(&object)
+      .is_some_and(|job| job.healing && job.snapshot == head)
+    {
+      return Some((head, sequence));
+    }
     state.seals.remove(&object);
     return None;
   }
@@ -1247,7 +1332,9 @@ fn sealable_head(
 
 /// Starts the seal of `head` for `object`: the archive walk over the volume's snapshot, and the content
 /// placement with the owner already counted (it holds its own content) when it is a candidate. `false`,
-/// counted, if the snapshot cannot be walked.
+/// counted, if the snapshot cannot be walked. A `healing` seal is the healer's re-offer of an
+/// already-placed snapshot ([`heal_one_placed_snapshot`]).
+#[allow(clippy::too_many_arguments)]
 fn start_seal(
   state: &mut ShardState,
   local: HostId,
@@ -1256,6 +1343,7 @@ fn start_seal(
   head: DbSnapshotId,
   sequence: u64,
   created_unix: u64,
+  healing: bool,
 ) -> bool {
   let Ok(slot) = state.volumes.get(handle) else {
     return false;
@@ -1288,6 +1376,7 @@ fn start_seal(
       content,
       rounds: 0,
       first_round_at_ns: None,
+      healing,
     },
   );
   true
@@ -1376,6 +1465,65 @@ impl PutLatency {
     slates_machine::stats::Sample::new(self.readings_ns.iter().copied().collect())
       .percentile(slates_machine::stats::Percentile::P95)
   }
+}
+
+/// The measured put-failure rate of one owner shard's content class (§4.8 "Derived constants": "healer
+/// cadence from the measured put-failure rate"): content rounds that ended placed against rounds that
+/// ended short. Lifetime counters (monotonic, never reset) — the rate is their ratio, so a long quiet
+/// stretch dilutes an old burst of failures exactly as the design's "measured rate" intends.
+#[derive(Debug, Default)]
+pub struct PutOutcomes {
+  /// Content rounds whose placement reached the quorum.
+  pub placed: u64,
+  /// Content rounds that ended short of quorum — uncertain at the deadline, or every holder short.
+  pub short: u64,
+}
+
+impl PutOutcomes {
+  /// Records one content round's outcome.
+  pub fn record(&mut self, placed: bool) {
+    if placed {
+      self.placed = self.placed.saturating_add(1);
+    } else {
+      self.short = self.short.saturating_add(1);
+    }
+  }
+}
+
+/// Where the healer is in its walk over this node's placed content (§4.10 "the healer"): the volume it
+/// re-offers next (in volume-id order; `None` restarts the walk from the first), and when it last
+/// re-offered one, so one snapshot is walked per healer period.
+#[derive(Debug, Default)]
+pub struct HealerCursor {
+  /// The volume after which the next walk step starts (`None`: from the beginning).
+  pub after: Option<DbVolumeId>,
+  /// When the healer last re-offered a snapshot (the shard clock), or `None` before its first step.
+  pub last_step_ns: Option<u64>,
+}
+
+/// Derived: the healer walks one placed snapshot per this many coordinator periods when **no** put has
+/// ever failed — the slowest cadence, a hundred periods (ten seconds at the default beat), so an idle
+/// fleet spends one offer round trip per placed snapshot per hundred periods on verifying what it placed;
+/// as the measured put-failure rate rises the cadence quickens toward one snapshot per period
+/// ([`heal_period_ns`]). Anchored to the put-latency window's seal count ([`PUT_LATENCY_SEALS`]): the
+/// healer covers a window of seals in a window of periods.
+const HEAL_PERIODS_AT_REST: u64 = PUT_LATENCY_SEALS as u64;
+
+/// The healer's period (§4.8 "Derived constants": "healer cadence from the measured put-failure rate"):
+/// `HEARTBEAT_NS × HEAL_PERIODS_AT_REST × placed / (placed + short × HEAL_PERIODS_AT_REST)` — one
+/// snapshot per [`HEAL_PERIODS_AT_REST`] periods while every round places, tightening in proportion to
+/// the share of rounds that ended short until, when short rounds are as common as placed ones, it is one
+/// snapshot per period, the fastest the coordinator runs. Before any round (a fresh boot, the laptop) it
+/// is the at-rest cadence: nothing has failed. Integer arithmetic; never below one period.
+fn heal_period_ns(outcomes: &PutOutcomes) -> u64 {
+  let placed = outcomes.placed.max(1);
+  let weighted_short = outcomes.short.saturating_mul(HEAL_PERIODS_AT_REST);
+  let periods = HEAL_PERIODS_AT_REST
+    .saturating_mul(placed)
+    .checked_div(placed.saturating_add(weighted_short))
+    .unwrap_or(HEAL_PERIODS_AT_REST)
+    .max(1);
+  HEARTBEAT_NS.saturating_mul(periods)
 }
 
 /// The hedge delay (§4.8 "Derived constants": "hedge delay = measured p95 put latency per class"): how long
@@ -1483,8 +1631,8 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
   let holders = take_sessions(|host| targets.contains(&host));
   let dispatched_ns = futures::now_ns();
   let manifest = work.archive.manifest.identity();
-  let (placement, latencies_ns, dispatch) = if holders.is_empty() {
-    (None, Vec::new(), None)
+  let (placement, latencies_ns, refilled, dispatch) = if holders.is_empty() {
+    (None, Vec::new(), Vec::new(), None)
   } else {
     let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
     let placed = put_content(
@@ -1521,7 +1669,12 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
       }
       Err(_) => None,
     };
-    (placement, placed.latencies_ns, Some(dispatch))
+    (
+      placement,
+      placed.latencies_ns,
+      placed.refilled,
+      Some(dispatch),
+    )
   };
   // The seal lives on the owner shard: put the archive back, merge the round's acknowledgements, record
   // their latencies (the content class's readings the next hedge is sized from), and note when the first
@@ -1532,6 +1685,7 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     snapshot,
     archive,
     round,
+    quorum,
     ..
   } = work;
   let _ = run_on(origin, shard, move |s| {
@@ -1550,9 +1704,21 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     }
     if let Some(placement) = placement {
       job.rounds = job.rounds.saturating_add(1);
+      // A healing round that shipped bytes to a holder repaired it: that holder had lost content the
+      // placement recorded it as holding (§4.10 "repairs only differing subtrees").
+      if job.healing {
+        let repaired = refilled
+          .iter()
+          .filter(|host| placement.acked.contains(host))
+          .count();
+        s.repairs = s
+          .repairs
+          .saturating_add(u64::try_from(repaired).unwrap_or(u64::MAX));
+      }
       for host in placement.acked {
         fold_content_ack(job, host);
       }
+      s.put_outcomes.record(job.content.placed(quorum));
     }
   });
   dispatch
@@ -3514,6 +3680,76 @@ mod tests {
       slow.deadline_ns(),
       slow.rtt.pto(0),
       "above the floor the deadline is the estimator's probe timeout itself"
+    );
+  }
+
+  /// The hedge delay follows the design's law, by use: one period before any reading (the first seal of a
+  /// boot, the laptop); then the measured p95 of the content class's put latency — the reading nineteen in
+  /// twenty acknowledgements arrive within — and the window is bounded: the oldest reading leaves as the
+  /// newest arrives, so a load regime is forgotten within a window of seals.
+  #[test]
+  fn the_hedge_delay_is_the_measured_p95_over_a_bounded_window() {
+    let mut latency = PutLatency::default();
+    assert_eq!(
+      hedge_delay_ns(&latency),
+      HEARTBEAT_NS,
+      "before any reading: one period"
+    );
+    // Twenty prompt acknowledgements and one slow one: the p95 (nearest rank, the 20th of 21 sorted) is
+    // the slowest prompt reading, not the outlier — a single straggler does not become the trigger.
+    for _ in 0..20 {
+      latency.record(10 * MS);
+    }
+    latency.record(900 * MS);
+    assert_eq!(
+      hedge_delay_ns(&latency),
+      10 * MS,
+      "one slow acknowledgement in twenty-one does not move the p95"
+    );
+    // Fill the window with slow readings: the p95 follows the new regime, and the window stays bounded.
+    for _ in 0..PUT_LATENCY_WINDOW {
+      latency.record(50 * MS);
+    }
+    assert_eq!(latency.len(), PUT_LATENCY_WINDOW, "the window is bounded");
+    assert_eq!(
+      hedge_delay_ns(&latency),
+      50 * MS,
+      "the prompt regime was forgotten within one window"
+    );
+  }
+
+  /// The healer's cadence follows the measured put-failure rate, by use: the at-rest cadence while every
+  /// round places, tightening in proportion to the share of rounds that ended short, down to one period —
+  /// never below it — when short rounds are as common as placed ones.
+  #[test]
+  fn the_healer_cadence_tightens_with_the_measured_put_failure_rate() {
+    let mut outcomes = PutOutcomes::default();
+    assert_eq!(
+      heal_period_ns(&outcomes),
+      HEARTBEAT_NS * HEAL_PERIODS_AT_REST,
+      "before any round, and while none has failed: the at-rest cadence"
+    );
+    for _ in 0..HEAL_PERIODS_AT_REST {
+      outcomes.record(true);
+    }
+    assert_eq!(
+      heal_period_ns(&outcomes),
+      HEARTBEAT_NS * HEAL_PERIODS_AT_REST,
+      "a hundred placed rounds and no short one: still at rest"
+    );
+    outcomes.record(false);
+    let one_short = heal_period_ns(&outcomes);
+    assert!(
+      (HEARTBEAT_NS..HEARTBEAT_NS * HEAL_PERIODS_AT_REST).contains(&one_short),
+      "one short round in a hundred tightens the cadence: {one_short} ns"
+    );
+    for _ in 0..HEAL_PERIODS_AT_REST {
+      outcomes.record(false);
+    }
+    assert_eq!(
+      heal_period_ns(&outcomes),
+      HEARTBEAT_NS,
+      "short rounds as common as placed ones: one snapshot per period, the floor"
     );
   }
 }

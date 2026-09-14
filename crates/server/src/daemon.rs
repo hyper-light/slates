@@ -751,6 +751,44 @@ impl Daemon {
     })
   }
 
+  /// Test support: makes this node **forget** the content it holds for `manifest` as a candidate holder —
+  /// the manifest record and the chunks only it referenced — the state a RAM-only holder is in after a
+  /// restart (§4.8 "Recovery": it "holds nothing for others until re-replication fills it"), injected
+  /// deterministically because an in-process daemon cannot restart (its fleet sockets are leaked to the
+  /// process, the same reason `observe_peer_dead` injects a death). The healer (§4.10) must notice and
+  /// re-put it. Delivered like [`Self::observe_peer_dead`]: admission retried while the control channel is
+  /// full, the drop awaited, both within the observe budget; returns whether the manifest **was held and is
+  /// now forgotten** — `false` if it was not held, or the daemon could not be reached.
+  pub fn drop_held_content(&self, manifest: [u8; 32]) -> bool {
+    let Some(control) = self.shards.first().copied() else {
+      return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if !self.spawn_admitted(control, OBSERVE_BUDGET_NS, || {
+      let tx = tx.clone();
+      async move {
+        let forgotten =
+          state::with_state(|s| s.held_content.forget_manifest(&manifest)).unwrap_or(false);
+        let _ = tx.send(forgotten);
+      }
+    }) {
+      return false;
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(OBSERVE_BUDGET_NS))
+      .unwrap_or(false)
+  }
+
+  /// How many placed snapshots the shard owning `object` has **repaired** (§4.10 "the healer"): re-put to
+  /// a recorded holder that answered the healer's offer with chunks it lacked. The non-vacuity counter a
+  /// test reads — a holder shown to hold content again proves the repair only together with this count
+  /// having moved, since a holder could also be refilled by a fresh seal. `None` when the owner shard could
+  /// not be observed; `Some(0)` before any repair, and on a laptop.
+  pub fn fleet_repairs(&self, object: slates_db::register::ObjectId) -> Option<u64> {
+    self.observe(self.shard_of_object(object), || {
+      state::with_state(|s| s.repairs)
+    })
+  }
+
   /// The manifest identity of the head snapshot of the volume `object` names, once the content plane has
   /// archived it (§4.10; recorded durably as `SnapshotIdentified`), or `None` before then, for a volume
   /// with no snapshot, for one this node does not own, or when the owner shard could not be observed
@@ -1247,6 +1285,9 @@ fn init_shard(
     held_content: slates_cluster::content::ContentHold::new(),
     seals: std::collections::BTreeMap::new(),
     put_latency: crate::fleet::PutLatency::default(),
+    put_outcomes: crate::fleet::PutOutcomes::default(),
+    healer: crate::fleet::HealerCursor::default(),
+    repairs: 0,
     pending_materializations: std::collections::BTreeMap::new(),
   };
   let rebuilt = verbs::rebuild_recovered(&mut state);
