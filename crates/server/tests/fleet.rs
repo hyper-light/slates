@@ -1815,20 +1815,7 @@ fn a_loopback_fleet_derives_its_election_timing_at_the_measured_floor() {
     });
   let timings: Vec<Option<slates_cluster::timing::ElectionTiming>> =
     daemons.iter().map(Daemon::council_timing).collect();
-  // The same facts over the wire — what an operator's `slates status` prints (`fleet_council_*`): every
-  // node's `DaemonStatus` carries its control shard's council leadership and derived timing, so a status
-  // read on a pod reports what the in-process accessor reports.
-  let pid = std::process::id();
-  let reported: Vec<slates_ipc::protocol::GroupReport> = hosts
-    .iter()
-    .map(|host| {
-      let mut client = Client::connect(&format!("fleet3-{}-{pid}", host.0));
-      match client.call(&RequestBody::DaemonStatus) {
-        ReplyBody::DaemonStatus { report } => report.fleet.council.clone(),
-        other => panic!("status answers on every node: {other:?}"),
-      }
-    })
-    .collect();
+  let reported = council_reports_over_the_wire(&hosts);
   for daemon in daemons {
     daemon.stop();
   }
@@ -1849,12 +1836,38 @@ fn a_loopback_fleet_derives_its_election_timing_at_the_measured_floor() {
       "the derived timing is the floor on a loopback fleet: {timing:?}"
     );
   }
+  assert_status_carries_the_council(&reported, &floor);
+}
+
+/// The council block of every mesh node's `DaemonStatus`, read over the wire — what an operator's
+/// `slates status` prints (`fleet_council_*`): each node's control shard's council leadership and derived
+/// timing, so a status read on a pod reports what the in-process accessor reports.
+fn council_reports_over_the_wire(hosts: &[HostId]) -> Vec<slates_ipc::protocol::GroupReport> {
+  let pid = std::process::id();
+  hosts
+    .iter()
+    .map(|host| {
+      let mut client = Client::connect(&format!("fleet3-{}-{pid}", host.0));
+      match client.call(&RequestBody::DaemonStatus) {
+        ReplyBody::DaemonStatus { report } => report.fleet.council.clone(),
+        other => panic!("status answers on every node: {other:?}"),
+      }
+    })
+    .collect()
+}
+
+/// Exactly one node reports itself the leader over the wire, and every node's status carries measured
+/// samples and the derived timing at `floor`.
+fn assert_status_carries_the_council(
+  reported: &[slates_ipc::protocol::GroupReport],
+  floor: &slates_cluster::timing::ElectionTiming,
+) {
   assert_eq!(
     reported.iter().filter(|group| group.leads).count(),
     1,
     "exactly one node reports itself the council's leader over the wire: {reported:?}"
   );
-  for group in &reported {
+  for group in reported {
     assert!(
       group.samples > 0,
       "the status carries the measured samples, not the default: {reported:?}"
