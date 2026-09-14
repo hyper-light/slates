@@ -2997,6 +2997,127 @@ fn poll_survivors_retire(survivors: &[Daemon], dead: HostId) -> bool {
   )
 }
 
+/// Shape: the memory bound the lane's pod runs under (`deploy/kind/values-lane.yaml`, Guaranteed QoS
+/// `memory: 1Gi`): the cgroup bound the profile reports as `memory.limit`, from which the daemon derives its
+/// client and task budgets — the container's budgets, reproduced on this machine.
+const POD_MEMORY_BYTES: u64 = 1 << 30;
+
+/// AC-2.6 (admission stays within the task arena; refusals typed), §4.8 boot step 6: a fleet node under a
+/// container's memory bound admits its clients. The daemon derives its task budget from its client bound;
+/// the fleet's own tasks (two per peer to dial it, up to `SESSIONS_PER_PEER` serve tasks per plane per peer,
+/// and its loops) must be inside that budget, or the admission task that seats a client on its shard is
+/// refused by the arena and dropped unrun — the client's channel closes under it and `slates status` never
+/// answers. The KIND lane hit exactly this on 2026-09-14: one pod of a five-replica fleet (four peers) at
+/// 1 GiB never became Ready (`docs/bugs/2026-09-14-fleet-tasks-outside-the-task-budget-poison-client-admission.md`).
+/// Here, the pod's shape: node A under the pod's bound has one real peer, B, **which dials in** (A accepts
+/// B's sessions and holds a serve task for each — the tasks a peer adds to a node it reaches), plus as many
+/// silent peers as A's client-only task budget has slots (none answers; A's dial tasks to them alone fill an
+/// arena sized without the fleet). Once B's probe session to A is up, one client asks A for `status`.
+/// Non-vacuous: B's session formed (so A serves it) and the premise (A's peers exceed its client-only
+/// budget) are both asserted, and the answer counts the client seated on its shard.
+///
+/// Ignored until the fix lands (it fails today — and, with the arena full, the daemons' shutdown never
+/// completes, so it hangs rather than failing in the reply deadline); run it with `--ignored` to see it.
+#[test]
+#[ignore = "fails until the task-budget fix lands: docs/bugs/2026-09-14-fleet-tasks-outside-the-task-budget-poison-client-admission.md"]
+fn a_fleet_node_under_a_containers_memory_bound_still_admits_a_client() {
+  let pid = std::process::id();
+  let (mut profile_a, host_a, identity_a) = fleet_node("bounded-a");
+  profile_a.facts.memory.limit = Some(POD_MEMORY_BYTES);
+  let (profile_b, host_b, identity_b) = fleet_node("bounded-b");
+  let anchor_a = anchor_of(&profile_a);
+  let anchor_b = anchor_of(&profile_b);
+  let instance_a = format!("bounded-{}-{pid}", host_a.0);
+  let instance_b = format!("bounded-{}-{pid}", host_b.0);
+  // The budget A derives for its clients alone (no fleet joined yet): the silent peers are sized from it.
+  let client_only_budget = DaemonConfig::derive(&profile_a, &instance_a)
+    .with_shards(1)
+    .runtime
+    .tasks_per_shard;
+  let serve = mesh_serve_ports(2);
+  let cert_a = identity_a.certificate();
+  let cert_b = identity_b.certificate();
+  let ports = free_ports(2 * client_only_budget);
+  let mut peers_of_a = vec![fleet_peer_at(anchor_b, host_b, serve[1], &cert_b)];
+  peers_of_a.extend((0..client_only_budget).map(|index| {
+    let silent_anchor = HostId(u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1));
+    fleet_peer_at(
+      silent_anchor,
+      member_id(silent_anchor, 0),
+      (ports[2 * index], ports[2 * index + 1]),
+      &self_signed().certificate(),
+    )
+  }));
+  let peer_count = peers_of_a.len();
+  let peers_of_b = vec![fleet_peer_at(anchor_a, host_a, serve[0], &cert_a)];
+  let no_domains = std::collections::BTreeMap::new();
+  let config_a = fleet_config(
+    &profile_a,
+    &instance_a,
+    anchor_a,
+    host_a,
+    &peers_of_a,
+    &no_domains,
+  );
+  let config_b = fleet_config(
+    &profile_b,
+    &instance_b,
+    anchor_b,
+    host_b,
+    &peers_of_b,
+    &no_domains,
+  );
+  let daemon_a = start_fleet_node(
+    &profile_a,
+    config_a,
+    identity_a,
+    serve[0],
+    peers_of_a,
+    SegmentSource::Create {
+      name: format!("slates-seg-{instance_a}"),
+    },
+  );
+  let daemon_b = start_fleet_node(
+    &profile_b,
+    config_b,
+    identity_b,
+    serve[1],
+    peers_of_b,
+    SegmentSource::Create {
+      name: format!("slates-seg-{instance_b}"),
+    },
+  );
+  // B's probe session to A is up — A accepted it and serves it — before the client arrives.
+  let served_b = poll_until(&[&daemon_b], FORMATION_DEADLINE, || {
+    daemon_b.fleet_meshed() == Some(true)
+  });
+  let mut client = Client::connect(&instance_a);
+  let report = match client.call(&RequestBody::DaemonStatus) {
+    ReplyBody::DaemonStatus { report } => report,
+    other => panic!("status answers: {other:?}"),
+  };
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    served_b,
+    "B's probe session to A formed, so A holds a serve task for it"
+  );
+  assert!(
+    peer_count > client_only_budget,
+    "the premise: A's peers ({peer_count}) exceed its client-only task budget ({client_only_budget})"
+  );
+  assert_eq!(
+    report.shards.iter().map(|shard| shard.clients).sum::<u32>(),
+    1,
+    "the client is seated on its shard and counted"
+  );
+  assert!(
+    report.fleet.members.contains(&host_a.0),
+    "the node holds itself alive: {:?}",
+    report.fleet.members
+  );
+}
+
 /// A minimal client of a daemon's own rendezvous (as in the other daemon tests): connect and call verbs.
 struct Client {
   end: ClientEnd,
