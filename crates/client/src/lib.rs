@@ -33,11 +33,11 @@ pub use client::{
 pub use error::ClientError;
 pub use slates_ipc::protocol::{
   AbsenceIs, ActionCount, AttachRequest, AttachTransport, AttachmentCapability, AuditEntry,
-  CauseRecord, ChokepointReport, Conformance, DaemonReport, Established, Filter, FleetReport,
-  GrantScope, GrantSummary, HostMountEvidence, HostPathReason, Intent, KernelCache, LandingOutcome,
-  LandingSummary, NamePolicy, OciBinding, OciRuntime, PlacedState, ReadWritePolicy, Refusal,
-  RefusalCount, Residency, Scope, ShardReport, SharingSemantics, Signal, SizeClass, SnapshotId,
-  SpanRecord, StatusReport, TargetPathConstraint, TelemetryReport, TransportReport,
+  CauseRecord, ChokepointReport, Conformance, DaemonReport, DeleteWhileOpen, Established, Filter,
+  FleetReport, GrantScope, GrantSummary, HostMountEvidence, HostPathReason, Intent, KernelCache,
+  LandingOutcome, LandingSummary, NamePolicy, OciBinding, OciRuntime, PlacedState, ReadWritePolicy,
+  Refusal, RefusalCount, Residency, Scope, ShardReport, SharingSemantics, Signal, SizeClass,
+  SnapshotId, SpanRecord, StatusReport, TargetPathConstraint, TelemetryReport, TransportReport,
   UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
 };
 /// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async

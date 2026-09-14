@@ -26,8 +26,9 @@
 
 use slates_db::catalog::Rights;
 use slates_ipc::protocol::{
-  AttachTransport, AttachmentCapability, Conformance, KernelCache, OciRuntime, ReadWritePolicy,
-  Residency, SharingSemantics, TargetPathConstraint, TransportReport, UnsupportedReason,
+  AttachTransport, AttachmentCapability, Conformance, DeleteWhileOpen, KernelCache, OciRuntime,
+  ReadWritePolicy, Residency, SharingSemantics, TargetPathConstraint, TransportReport,
+  UnsupportedReason,
 };
 
 use crate::state::ShardState;
@@ -87,11 +88,16 @@ fn read_write(may_write: bool) -> ReadWritePolicy {
 }
 
 /// Every transport shares the one owning shard's view (D-7).
-const fn sharing(server_open_state: bool, cache: KernelCache) -> SharingSemantics {
+const fn sharing(
+  server_open_state: bool,
+  cache: KernelCache,
+  delete_while_open: DeleteWhileOpen,
+) -> SharingSemantics {
   SharingSemantics {
     one_owning_shard: true,
     server_open_state,
     cache,
+    delete_while_open,
   }
 }
 
@@ -144,7 +150,11 @@ pub(crate) fn root(situation: &Situation) -> AttachmentCapability {
     AttachTransport::Root,
     situation,
     TargetPathConstraint::RootMount,
-    sharing(false, KernelCache::NotEstablished),
+    sharing(
+      false,
+      KernelCache::NotEstablished,
+      DeleteWhileOpen::NoKernelClient,
+    ),
     Residency::DaemonRam,
     Conformance::VerbLifecycleTest,
   )
@@ -152,10 +162,15 @@ pub(crate) fn root(situation: &Situation) -> AttachmentCapability {
 
 /// The NFS loopback mount (§4.6 "macOS fallback"): the daemon's export, mounted by `slates mount`
 /// with `mount_nfs` at a user-owned directory and no privilege on macOS, exactly when the listener
-/// bound. Refused elsewhere: the Linux kernel refuses `nfs` in an unprivileged user namespace and
-/// slates never asks for the privilege (R10); Windows has no `mount_nfs`.
+/// bound; the macOS NFS client silly-renames a file deleted while open (Appendix C). Refused
+/// elsewhere: the Linux kernel refuses `nfs` in an unprivileged user namespace and slates never asks
+/// for the privilege (R10); Windows has no `mount_nfs`.
 fn nfs_loopback(situation: &Situation) -> AttachmentCapability {
-  let sharing = sharing(false, KernelCache::ClientTimeouts);
+  let sharing = sharing(
+    false,
+    KernelCache::ClientTimeouts,
+    DeleteWhileOpen::SillyRenamed,
+  );
   let residency = Residency::DaemonRamAndKernelCache;
   let target = TargetPathConstraint::UserOwnedExistingDirectory;
   match situation.platform {
@@ -226,7 +241,7 @@ fn fuse(situation: &Situation) -> AttachmentCapability {
     situation,
     Platform::Linux,
     TargetPathConstraint::UserOwnedExistingDirectory,
-    sharing(true, KernelCache::NotEstablished),
+    sharing(true, KernelCache::NotEstablished, DeleteWhileOpen::Unlinked),
   )
 }
 
@@ -238,7 +253,7 @@ fn fskit(situation: &Situation) -> AttachmentCapability {
     situation,
     Platform::MacOs,
     TargetPathConstraint::UserOwnedExistingDirectory,
-    sharing(true, KernelCache::NotEstablished),
+    sharing(true, KernelCache::NotEstablished, DeleteWhileOpen::Unlinked),
   )
 }
 
@@ -250,8 +265,18 @@ fn winfsp(situation: &Situation) -> AttachmentCapability {
     situation,
     Platform::Windows,
     TargetPathConstraint::DriveLetter,
-    sharing(true, KernelCache::NotEstablished),
+    sharing(true, KernelCache::NotEstablished, DeleteWhileOpen::Unlinked),
   )
+}
+
+/// What a delete of an open file does through a container bind: its host mount's rule — the macOS
+/// NFS client silly-renames, the Linux FUSE client unlinks; no host mount elsewhere.
+const fn container_delete_while_open(platform: Platform) -> DeleteWhileOpen {
+  match platform {
+    Platform::MacOs => DeleteWhileOpen::SillyRenamed,
+    Platform::Linux => DeleteWhileOpen::Unlinked,
+    Platform::Windows | Platform::Other => DeleteWhileOpen::NoKernelClient,
+  }
 }
 
 /// Where a container's bytes can reside: on macOS every OCI runtime hosts its containers in a Linux
@@ -276,7 +301,11 @@ pub(crate) const fn host_mount_offered(situation: &Situation) -> bool {
 /// container workload as its evidence; refused `HostMountRequired` where no host mount is offered and
 /// `HostPlatform` where none can be. The container's view is the host mount's.
 pub(crate) fn oci(situation: &Situation) -> AttachmentCapability {
-  let sharing = sharing(false, KernelCache::InheritedFromHostMount);
+  let sharing = sharing(
+    false,
+    KernelCache::InheritedFromHostMount,
+    container_delete_while_open(situation.platform),
+  );
   let residency = container_residency(situation.platform);
   if host_mount_offered(situation) {
     return offered(
@@ -442,6 +471,11 @@ mod tests {
     assert_eq!(nfs.conformance, Conformance::LiveKernelMountTest);
     assert_eq!(nfs.sharing.cache, KernelCache::ClientTimeouts);
     assert_eq!(
+      nfs.sharing.delete_while_open,
+      DeleteWhileOpen::SillyRenamed,
+      "Appendix C: .nfs temp files on delete-while-open"
+    );
+    assert_eq!(
       entry(&on(Platform::MacOs, false), AttachTransport::NfsLoopback).unsupported_reason,
       Some(UnsupportedReason::ListenerNotBound)
     );
@@ -468,6 +502,11 @@ mod tests {
     assert!(oci.supported, "a bind of the offered host mount");
     assert_eq!(oci.conformance, Conformance::ContainerWorkloadTest);
     assert_eq!(oci.residency, Residency::DaemonRamKernelCacheAndRuntimeVm);
+    assert_eq!(
+      oci.sharing.delete_while_open,
+      DeleteWhileOpen::SillyRenamed,
+      "the bind inherits the host mount's rule"
+    );
     assert_eq!(
       entry(&on(Platform::MacOs, false), AttachTransport::Oci).unsupported_reason,
       Some(UnsupportedReason::HostMountRequired),

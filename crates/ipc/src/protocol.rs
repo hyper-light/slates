@@ -988,6 +988,23 @@ pub enum KernelCache {
   InheritedFromHostMount,
 }
 
+/// What a delete of a file that some process still holds open does at the transport (§4.6 A-9
+/// "sharing/cache semantics"; Appendix C "macOS NFS fallback: `.nfs` temp files on
+/// delete-while-open"). Measured 2026-09-14 over the container bind on macOS: the runtime's share of
+/// the host path holds every file a container touched open beyond the container's lifetime, so a
+/// delete inside the container leaves a `.nfs.*` entry in the volume (not released within 150 s),
+/// which blocks `rmdir` of its directory and the unmount until the share lets go.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteWhileOpen {
+  /// No kernel client holds files open through this form (the record form).
+  NoKernelClient,
+  /// The name goes at once; the open file's inode lives until its last close (FUSE, a guest device).
+  Unlinked,
+  /// The kernel client renames the file to `.nfs.<id>` until its last close, then removes it: the
+  /// entry is visible in every view meanwhile and its directory cannot be removed.
+  SillyRenamed,
+}
+
 /// The sharing and cache semantics of a transport (§4.6 A-9).
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SharingSemantics {
@@ -997,6 +1014,8 @@ pub struct SharingSemantics {
   pub server_open_state: bool,
   /// The kernel-side cache.
   pub cache: KernelCache,
+  /// What a delete of an open file does; a container bind inherits its host mount's.
+  pub delete_while_open: DeleteWhileOpen,
 }
 
 /// Where the bytes can reside (§4.6 A-9 "residency boundary"; R1: never on a disk).

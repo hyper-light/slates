@@ -468,7 +468,7 @@ fn established_text(established: &Established) -> String {
 /// One transport's six facts on one `transport:` line (§4.6 A-9), in the vocabulary the JSON uses.
 fn capability_text(c: &slates_client::AttachmentCapability) -> String {
   format!(
-    "transport: {} supported={} reason={} target={} read_write={} cache={} open_state={} residency={} conformance={}\n",
+    "transport: {} supported={} reason={} target={} read_write={} cache={} open_state={} delete_while_open={} residency={} conformance={}\n",
     slates_mcp::transport_name(c.transport),
     c.supported,
     c.unsupported_reason
@@ -477,6 +477,7 @@ fn capability_text(c: &slates_client::AttachmentCapability) -> String {
     slates_mcp::read_write_name(c.read_write),
     slates_mcp::kernel_cache_text(c.sharing.cache),
     c.sharing.server_open_state,
+    slates_mcp::delete_while_open_name(c.sharing.delete_while_open),
     slates_mcp::residency_name(c.residency),
     slates_mcp::conformance_name(c.conformance),
   )

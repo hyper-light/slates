@@ -22,8 +22,8 @@
 use serde_json::{Value, json};
 use slates_client::{
   AttachRequest, AttachTransport, Attachment, AttachmentCapability, CauseRecord, ChokepointReport,
-  Client, ClientError, Conformance, CreateSpec, DaemonReport, Established, Filter, Intent,
-  KernelCache, Landing, LandingOutcome, LandingSummary, NamePolicy, OciBinding, OciRuntime,
+  Client, ClientError, Conformance, CreateSpec, DaemonReport, DeleteWhileOpen, Established, Filter,
+  Intent, KernelCache, Landing, LandingOutcome, LandingSummary, NamePolicy, OciBinding, OciRuntime,
   ReadWritePolicy, Rebased, Residency, ShardReport, Signal, SizeClass, SnapshotId, SpanRecord,
   StatusReport, Submitted, TargetPathConstraint, TelemetryReport, TransportReport,
   UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
@@ -799,6 +799,15 @@ pub fn conformance_name(conformance: Conformance) -> &'static str {
   }
 }
 
+/// A delete-while-open rule's name on both surfaces.
+pub fn delete_while_open_name(rule: DeleteWhileOpen) -> &'static str {
+  match rule {
+    DeleteWhileOpen::NoKernelClient => "no_kernel_client",
+    DeleteWhileOpen::Unlinked => "unlinked",
+    DeleteWhileOpen::SillyRenamed => "silly_renamed",
+  }
+}
+
 /// A kernel cache posture as text: its kind, and for a negotiated one what was negotiated.
 pub fn kernel_cache_text(cache: KernelCache) -> String {
   match cache {
@@ -860,6 +869,7 @@ pub fn capability_json(c: &AttachmentCapability) -> Value {
       "one_owning_shard": c.sharing.one_owning_shard,
       "server_open_state": c.sharing.server_open_state,
       "cache": kernel_cache_json(c.sharing.cache),
+      "delete_while_open": delete_while_open_name(c.sharing.delete_while_open),
     },
     "residency": residency_name(c.residency),
     "conformance": conformance_name(c.conformance),

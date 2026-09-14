@@ -11,10 +11,10 @@
 use std::time::{Duration, Instant};
 
 use slates_ipc::protocol::{
-  AttachRequest, AttachTransport, AttachmentCapability, Conformance, Direction, Established,
-  HostPathReason, Intent, KernelCache, NamePolicy, ReadWritePolicy, Refusal, ReplyBody,
-  RequestBody, SizeClass, StatusReport, TargetPathConstraint, TransportReport, UnsupportedReason,
-  VolumeId, pack, unpack,
+  AttachRequest, AttachTransport, AttachmentCapability, Conformance, DeleteWhileOpen, Direction,
+  Established, HostPathReason, Intent, KernelCache, NamePolicy, ReadWritePolicy, Refusal,
+  ReplyBody, RequestBody, SizeClass, StatusReport, TargetPathConstraint, TransportReport,
+  UnsupportedReason, VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
@@ -189,6 +189,11 @@ fn assert_macos_host_mounts(report: &StatusReport) {
     TargetPathConstraint::UserOwnedExistingDirectory
   );
   assert_eq!(nfs.sharing.cache, KernelCache::ClientTimeouts);
+  assert_eq!(
+    nfs.sharing.delete_while_open,
+    DeleteWhileOpen::SillyRenamed,
+    "Appendix C: the macOS NFS client's .nfs temp files on delete-while-open"
+  );
   assert_eq!(nfs.conformance, Conformance::LiveKernelMountTest);
   assert_eq!(
     entry(&report.transports, AttachTransport::Fuse).unsupported_reason,
