@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use slates_client::{Intent, NamePolicy, SizeClass};
+use slates_client::{GrantScope, Intent, NamePolicy, SizeClass};
 
 use crate::format::{parse_size, parse_snapshot, parse_volume_id};
 
@@ -40,6 +40,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   base pin ID [PATH ...] [--json]
   land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
   grants [--json]
+  grant LANDING MANIFEST [--session] [--term SECONDS] [--json]   approve a presented landing
   audit [--since N] [--json]
   exec --volume V --at PATH -- CMD [ARG ...]        run CMD with the volume at PATH
 ";
@@ -322,7 +323,24 @@ pub(crate) enum Verb {
     /// Every record at or after this sequence.
     since: u64,
   },
+  /// Issue a grant for a presented landing (`grant LANDING MANIFEST`): the human's approval of the
+  /// exact manifest `land` showed, proven under the anchor's issuer secret (§4.13).
+  Grant {
+    /// The presented landing's id.
+    landing: u64,
+    /// The manifest hash the human approves — the one `land` printed.
+    manifest: [u8; 32],
+    /// Once (the default), or every landing of the volume into the target for the session.
+    scope: GrantScope,
+    /// The grant's validity, nanoseconds from issue.
+    term_ns: u64,
+  },
 }
+
+/// Derived: a grant's default validity, in nanoseconds — one hour, the span §4.15's session scope
+/// names as the longest a human's single approval should stand without renewal (an agent that lands
+/// later than that re-presents its manifest for a fresh look). `--term SECONDS` overrides it.
+pub(crate) const GRANT_TERM_NS: u64 = 3_600 * 1_000_000_000;
 
 /// A client request: the instance and the verb.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -381,10 +399,19 @@ const VALUES: &[&str] = &[
   "--volume",
   "--at",
   "--http",
+  "--term",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
-  "--quick", "--json", "--fold", "--locked", "--read", "--write", "--drift", "--mirror",
+  "--quick",
+  "--json",
+  "--fold",
+  "--locked",
+  "--read",
+  "--write",
+  "--drift",
+  "--mirror",
+  "--session",
 ];
 
 /// Parses `exec --volume V --at PATH -- CMD ...`: the flags before `--`, the command after it.
@@ -576,6 +603,36 @@ fn volume(text: &str) -> Result<slates_client::VolumeId, ParseError> {
     what: "volume ID",
     reason,
   })
+}
+
+/// Format: a second in nanoseconds — `--term SECONDS` is the operator's unit, the wire's is nanoseconds.
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+/// Format: a manifest hash is 32 bytes (BLAKE3's output), printed by `land` as hexadecimal.
+const MANIFEST_BYTES: usize = 32;
+/// Format: hexadecimal — two characters per byte, radix sixteen.
+const HEX_CHARS_PER_BYTE: usize = 2;
+/// Format: see `HEX_CHARS_PER_BYTE`.
+const HEX_RADIX: u32 = 16;
+
+/// The manifest hash `land` printed, as hexadecimal characters back into its bytes — the human re-states
+/// exactly the hash they saw, so the approval binds that manifest and no other (§4.13).
+fn manifest_hash(text: &str) -> Result<[u8; MANIFEST_BYTES], ParseError> {
+  let bad = |reason: &str| ParseError::BadValue {
+    what: "MANIFEST",
+    reason: reason.to_owned(),
+  };
+  let bytes = text.as_bytes();
+  if bytes.len() != MANIFEST_BYTES * HEX_CHARS_PER_BYTE {
+    return Err(bad("64 hexadecimal characters"));
+  }
+  let mut out = [0u8; MANIFEST_BYTES];
+  let (pairs, _) = bytes.as_chunks::<HEX_CHARS_PER_BYTE>();
+  for (index, pair) in pairs.iter().enumerate() {
+    let hex = std::str::from_utf8(pair).map_err(|_| bad("hexadecimal"))?;
+    out[index] = u8::from_str_radix(hex, HEX_RADIX).map_err(|_| bad("hexadecimal"))?;
+  }
+  Ok(out)
 }
 
 fn snapshot(text: &str) -> Result<slates_client::SnapshotId, ParseError> {
@@ -791,6 +848,42 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
       taken.only(&NONE)?;
       Ok(client(&taken, Verb::Grants))
     }
+    ["grant", landing, manifest] => {
+      taken.only(&Spec {
+        values: &["--term"],
+        switches: &["--session"],
+      })?;
+      let landing = landing.parse::<u64>().map_err(|e| ParseError::BadValue {
+        what: "LANDING",
+        reason: e.to_string(),
+      })?;
+      let manifest = manifest_hash(manifest)?;
+      let scope = if taken.switch("--session") {
+        GrantScope::Session
+      } else {
+        GrantScope::Once
+      };
+      let term_ns = match taken.value("--term") {
+        Some(seconds) => seconds
+          .parse::<u64>()
+          .map_err(|e| ParseError::BadValue {
+            what: "--term",
+            reason: e.to_string(),
+          })?
+          .saturating_mul(NANOS_PER_SECOND),
+        None => GRANT_TERM_NS,
+      };
+      Ok(client(
+        &taken,
+        Verb::Grant {
+          landing,
+          manifest,
+          scope,
+          term_ns,
+        },
+      ))
+    }
+    ["grant", ..] => Err(ParseError::Missing("grant LANDING MANIFEST")),
     ["audit"] => {
       taken.only(&Spec {
         values: &["--since"],

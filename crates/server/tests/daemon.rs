@@ -11,7 +11,8 @@
 use std::time::{Duration, Instant};
 
 use slates_ipc::protocol::{
-  Direction, Intent, NamePolicy, Refusal, ReplyBody, RequestBody, SizeClass, pack, unpack,
+  Direction, Filter, GrantScope, Intent, NamePolicy, Refusal, ReplyBody, RequestBody, SizeClass,
+  pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
@@ -331,15 +332,170 @@ fn lease_scenario() {
   daemon.stop();
 }
 
-/// AC-2.8: the grant kind is refused on the ring with a typed refusal, and counted.
+/// A landing target on the host: a directory named with the process id (`mktemp -d`), owned by this
+/// user — what `OsLand::open_target` admits — and removed when dropped, even on a failed assertion
+/// (tests write only to a temp directory they name and remove, CLAUDE.md §4).
+struct TargetDir {
+  path: String,
+}
+
+impl Drop for TargetDir {
+  fn drop(&mut self) {
+    let _ = std::process::Command::new("rm")
+      .args(["-rf", &self.path])
+      .output();
+  }
+}
+
+fn target_dir() -> TargetDir {
+  let out = std::process::Command::new("mktemp")
+    .args(["-d", "-t", &format!("slates-grant-{}", std::process::id())])
+    .output()
+    .unwrap();
+  assert!(out.status.success(), "mktemp -d");
+  let made = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+  // The canonical path: a landing target is resolved component by component with `O_NOFOLLOW` (§4.13 —
+  // no symlink in the chain may redirect a write), and macOS's `/var` is a symlink to `/private/var`, so
+  // the path `mktemp` prints would be refused `NotDirectory` at the link; the landing is given the real
+  // directory. A read of the path, not a write.
+  let path = std::fs::canonicalize(&made)
+    .map(|p| p.to_string_lossy().into_owned())
+    .unwrap_or(made);
+  TargetDir { path }
+}
+
+/// AC-5.10 / T-5.12 and AC-2.8 (§4.13 "Grants"): a grant is accepted only with a **verified proof of
+/// issuer authority** bound to the exact presented landing, never by the channel it arrives on. A
+/// landing is presented (`GrantRequired`); an approval forged from the agent's own channel — the right
+/// landing and manifest, a proof under a secret the caller does not hold — is refused
+/// `GrantIssuerUnverified` and counted; the human surface, which maps the anchor and so holds the
+/// daemon's issuer secret, proves the unchanged manifest and the grant issues; the landing then runs under
+/// that grant and only its granted effect lands; `grants` lists it. Non-vacuous: the forged and the
+/// genuine approval differ only in the secret behind the proof.
 fn grant_scenario() {
   let (daemon, instance) = daemon("grant");
+  let target = target_dir();
   let mut client = Client::connect(&instance);
+  let (id, snapshot, landing, manifest) = present_landing(&mut client, &target.path);
+  forged_approval_is_refused(&mut client, landing, manifest);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let grant = verified_approval_issues(&mut client, &secret, landing, manifest);
+  // The landing runs under its grant, and `grants` lists it — across shards (the grant record lives on
+  // the volume's owner shard, not necessarily the client's).
   assert!(matches!(
-    client.call(&RequestBody::Grant { request: 1 }),
-    ReplyBody::Refused { refusal: Refusal::GrantChannelRefused { channel } } if channel == "ring"
+    client.call(&RequestBody::Land {
+      volume: id,
+      snapshot: Some(snapshot),
+      target: target.path.clone(),
+      filter: Filter::default(),
+      grant: Some(grant),
+    }),
+    ReplyBody::Landed { .. }
+  ));
+  assert!(matches!(
+    client.call(&RequestBody::Grants),
+    ReplyBody::Grants { grants } if grants.len() == 1 && grants[0].id == grant
   ));
   daemon.stop();
+}
+
+/// A grant request for `landing` under `proof`, scoped once for the test's deadline.
+fn grant_request(landing: u64, manifest: [u8; 32], proof: [u8; 32]) -> RequestBody {
+  RequestBody::Grant {
+    landing,
+    manifest,
+    scope: GrantScope::Once,
+    term_ns: DEADLINE_NS,
+    proof,
+  }
+}
+
+/// Creates a volume, snapshots it, and presents its landing into `target`: the plan is computed, no
+/// grant covers it, nothing is written. Returns the volume, the snapshot, the landing id and the
+/// manifest the human must approve.
+fn present_landing(
+  client: &mut Client,
+  target: &str,
+) -> (
+  slates_ipc::protocol::VolumeId,
+  slates_ipc::protocol::SnapshotId,
+  u64,
+  [u8; 32],
+) {
+  let ReplyBody::Created { id } = client.call(&scratch("granted")) else {
+    panic!("create");
+  };
+  let ReplyBody::Snapshotted { id: snapshot } = client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("snapshot");
+  };
+  let presented = client.call(&RequestBody::Land {
+    volume: id,
+    snapshot: Some(snapshot),
+    target: target.to_owned(),
+    filter: Filter::default(),
+    grant: None,
+  });
+  let ReplyBody::GrantRequired {
+    landing, manifest, ..
+  } = presented
+  else {
+    panic!("the landing was not presented: {presented:?}");
+  };
+  (id, snapshot, landing, manifest)
+}
+
+/// A forged approval — the agent knows the landing and its manifest but not the issuer secret — is
+/// refused as unverified authority and issues nothing.
+fn forged_approval_is_refused(client: &mut Client, landing: u64, manifest: [u8; 32]) {
+  let forged = slates_server::landing::grant_proof(
+    &[0u8; 32],
+    landing,
+    &manifest,
+    GrantScope::Once,
+    DEADLINE_NS,
+  );
+  let refused = client.call(&grant_request(landing, manifest, forged));
+  assert!(
+    matches!(
+      refused,
+      ReplyBody::Refused {
+        refusal: Refusal::GrantIssuerUnverified
+      }
+    ),
+    "a forged approval is refused as unverified authority, got {refused:?}"
+  );
+  assert!(
+    matches!(
+      client.call(&RequestBody::Grants),
+      ReplyBody::Grants { grants } if grants.is_empty()
+    ),
+    "a forged approval issued nothing"
+  );
+}
+
+/// The human surface — it maps the anchor segment and holds the secret the daemon minted — proves the
+/// unchanged manifest and the grant issues; the same proof over a modified plan does not verify.
+fn verified_approval_issues(
+  client: &mut Client,
+  secret: &[u8; 32],
+  landing: u64,
+  manifest: [u8; 32],
+) -> u64 {
+  let proof =
+    slates_server::landing::grant_proof(secret, landing, &manifest, GrantScope::Once, DEADLINE_NS);
+  let ReplyBody::Granted { grant } = client.call(&grant_request(landing, manifest, proof)) else {
+    panic!("the verified approval did not issue a grant");
+  };
+  let mut other = manifest;
+  other[0] ^= 1;
+  assert!(matches!(
+    client.call(&grant_request(landing, other, proof)),
+    ReplyBody::Refused {
+      refusal: Refusal::GrantIssuerUnverified
+    }
+  ));
+  grant
 }
 
 /// Landings and grants through the server (§4.15, task 8): a grant cannot be created on the
@@ -449,6 +605,14 @@ fn bulk_and_overlay_scenario() {
   daemon.stop();
 }
 
+/// AC-5.10 / T-5.12, AC-2.8: a human's grant is authenticated by a verified proof of issuer authority
+/// bound to the exact presented landing — a forged or modified-plan approval refuses before writing, the
+/// enrolled human surface's approval issues and lands. Its own test so it is observable on its own.
+#[test]
+fn a_grant_is_accepted_only_with_a_verified_proof_bound_to_the_presented_landing() {
+  grant_scenario();
+}
+
 /// The scenarios run one daemon at a time (each daemon runs shard threads that spin while a
 /// client is active; several at once would starve each other on one machine).
 #[test]
@@ -456,7 +620,6 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
   lifecycle_scenario();
   rifl_scenario();
   lease_scenario();
-  grant_scenario();
   landing_refusal_scenario();
   bulk_and_overlay_scenario();
   // §4.2/§4.5 version-slab reservation scenarios run here, one daemon at a time, for the same reason.

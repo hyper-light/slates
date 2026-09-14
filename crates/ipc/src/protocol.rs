@@ -243,11 +243,23 @@ pub enum RequestBody {
     /// The paths, or the whole base.
     paths: Option<Vec<String>>,
   },
-  /// A grant: refused on this channel by kind (§4.13, AC-2.8); the kind exists so the refusal
-  /// is typed and counted.
+  /// A grant for a presented landing (§4.15 step 3, §4.13 "Grants"): carries the human surface's
+  /// **proof of issuer authority** — `BLAKE3_keyed(issuer_secret, landing ‖ manifest ‖ scope ‖ term)` —
+  /// which the daemon recomputes against the secret it minted into the anchor segment. Without a
+  /// verifying proof the grant refuses `GrantIssuerUnverified` (AC-2.8: the kind arriving from an agent
+  /// channel — the MCP server and the SDKs carry no proof by construction — is refused and counted);
+  /// with one, the landing's grant is issued bound to that exact manifest.
   Grant {
-    /// The request the grant would cover.
-    request: u64,
+    /// The presented landing the grant covers.
+    landing: u64,
+    /// The manifest hash the human approved — must equal the presented landing's, or the plan changed.
+    manifest: [u8; 32],
+    /// Once, or the session.
+    scope: GrantScope,
+    /// The grant's validity, nanoseconds from issue.
+    term_ns: u64,
+    /// The proof of issuer authority.
+    proof: [u8; 32],
   },
   /// The daemon's own status (§4.14 `slates.status`: every shard's counters and health
   /// signals, and the anchor's view of the daemon as the segment holds it).
@@ -801,6 +813,19 @@ pub enum Refusal {
   /// A region-loss promotion (`PromoteRegion`) was issued on a node that is not the root leader, so it cannot
   /// propose the change (§4.8, D-14). The operator re-issues it on the root leader (`status` names it).
   NotRootLeader,
+  /// A grant whose proof of issuer authority did not verify (§4.13 "Grants": the daemon verifies the
+  /// authority and the exact manifest, target, consumer, scope and validity before accepting a grant; a
+  /// forged, replayed, retargeted or modified-plan approval refuses before writing). The proof is a keyed
+  /// hash over the landing under the issuer secret only the anchor-mapped human surface holds, so a
+  /// workload that invokes the CLI binary, or claims a channel, cannot mint it.
+  GrantIssuerUnverified,
+  /// The caller is not an enrolled consumer under its account, and this daemon requires enrollment for
+  /// the verb (§4.13 "Principals": per-request identity strings and the peer uid alone cannot establish
+  /// consumer identity; unsupported secure enrollment refuses instead of issuing an ambient channel).
+  ConsumerNotEnrolled,
+  /// The caller's consumer enrollment was revoked by a human; every later effect refuses (§4.13
+  /// "Refusals added"; revocation reaches a live session before its next protected verb).
+  ConsumerRevoked,
 }
 
 /// A reply body.
@@ -948,6 +973,11 @@ pub enum ReplyBody {
   Audit {
     /// The records.
     records: Vec<AuditEntry>,
+  },
+  /// A grant was issued for a presented landing (the reply to a verified `Grant`).
+  Granted {
+    /// The grant id the landing now carries (`land ... --grant N`).
+    grant: u64,
   },
 }
 

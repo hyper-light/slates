@@ -233,7 +233,9 @@ fn land_verb_unix(
     Err(refusal) => return refused(target_refusal(&refusal)),
   };
   let now = state.clock.monotonic_ns();
-  let landing_id = state.landing.next_landing;
+  // The id names its owner partition (`verbs::landing_id`), so the `Grant` that later covers it routes
+  // to this shard, where the presented record waits.
+  let landing_id = crate::verbs::landing_id(state.partition, state.landing.next_landing);
   let request = LandingRequest {
     landing_id,
     holder: session_of(principal),
@@ -419,9 +421,86 @@ fn finish(
   }
 }
 
-/// Issues a grant for a presented landing, binding its manifest (§4.15 step 3). Called from the
-/// control channel only (never the ring), so a grant a human did not make cannot exist. The
-/// grant is issued into the runtime grants and persisted as a `GrantRecord`; the landing's
+/// The proof of grant-issuer authority a `Grant` request carries (§4.13 "Grants": "the daemon verifies
+/// that authority and the exact manifest hash, target identity, intended consumer, scope and validity
+/// before accepting a grant"): the BLAKE3 **keyed** hash, under the issuer secret the daemon minted into
+/// the anchor segment, over the exact landing being approved — its id (which names the volume, target and
+/// intended consumer the presented record binds), the manifest hash the human saw, the scope and the term.
+/// A human surface that maps the anchor (the `slates grant` command running as the anchor's user) computes
+/// it; the daemon recomputes it. Every field the spec lists is in the hash, so a replayed proof for another
+/// landing, a retargeted or modified plan (a different manifest), a widened scope or a longer term all
+/// fail to verify — before anything is written. Pure, so it is unit-testable and the CLI and the daemon
+/// share one definition.
+pub fn grant_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  landing: u64,
+  manifest: &[u8; 32],
+  scope: GrantScope,
+  term_ns: u64,
+) -> [u8; 32] {
+  /// Format: the scope's byte in the proof — the wire enum's own variant index, so the proof and the
+  /// request agree without a second table.
+  fn scope_byte(scope: GrantScope) -> u8 {
+    match scope {
+      GrantScope::Once => 0,
+      GrantScope::Session => 1,
+    }
+  }
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(&landing.to_le_bytes());
+  hasher.update(manifest);
+  hasher.update(&[scope_byte(scope)]);
+  hasher.update(&term_ns.to_le_bytes());
+  *hasher.finalize().as_bytes()
+}
+
+/// Serves a `Grant` request (§4.13 "Grants", §4.15 step 3): verifies the proof of issuer authority against
+/// the secret this daemon published, and the approved manifest against the presented landing's, then
+/// issues the grant. Refuses `GrantIssuerUnverified` — counted `grant_issuer_unverified` — on a proof that
+/// does not verify (a forged, replayed or modified-plan approval, or one from a channel that carries no
+/// authority: the MCP server and the SDKs never hold the secret), `GrantMismatch` when the human approved
+/// a manifest other than the one presented (the plan changed under the approval), and `NotFound` for a
+/// landing not awaiting a grant (consumed, or never presented — a replay of a spent approval). The
+/// comparison of the proof is constant-time over its whole width so a wrong proof leaks nothing by timing.
+pub fn grant_verb(
+  state: &mut ShardState,
+  principal: &Principal,
+  landing_id: u64,
+  manifest: [u8; 32],
+  scope: GrantScope,
+  term_ns: u64,
+  proof: [u8; 32],
+) -> ReplyBody {
+  let Some(awaiting) = state.landing.awaiting.get(&landing_id).cloned() else {
+    return crate::verbs::refused(Refusal::NotFound);
+  };
+  let expected = grant_proof(&state.issuer_secret, landing_id, &manifest, scope, term_ns);
+  if !constant_time_eq(&expected, &proof) {
+    *state.refusals.entry("grant_issuer_unverified").or_insert(0) += 1;
+    return crate::verbs::refused(Refusal::GrantIssuerUnverified);
+  }
+  if awaiting.manifest != manifest {
+    return crate::verbs::refused(Refusal::GrantMismatch);
+  }
+  match issue_grant(state, principal, landing_id, scope, term_ns) {
+    Ok(grant) => ReplyBody::Granted { grant },
+    Err(refusal) => crate::verbs::refused(refusal),
+  }
+}
+
+/// Whether two proofs are equal, visiting every byte whatever the first difference (no early exit), so
+/// the comparison's time does not depend on how much of a forged proof happened to match.
+fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+  let mut difference = 0u8;
+  for (x, y) in a.iter().zip(b.iter()) {
+    difference |= x ^ y;
+  }
+  difference == 0
+}
+
+/// Issues a grant for a presented landing, binding its manifest (§4.15 step 3). Reached only through
+/// [`grant_verb`], whose proof of issuer authority has verified, so a grant a human did not make cannot
+/// exist. The grant is issued into the runtime grants and persisted as a `GrantRecord`; the landing's
 /// record gains the grant. Returns the grant id.
 pub fn issue_grant(
   state: &mut ShardState,

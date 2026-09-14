@@ -183,6 +183,24 @@ pub fn owner_of_attachment(id: u64) -> u16 {
   u16::try_from(id >> ATTACHMENT_PARTITION_SHIFT).unwrap_or(0)
 }
 
+/// A landing id carries its owner partition in the high 16 bits and a per-partition counter below — the
+/// same construction as an attachment id — so a `Grant` naming the landing routes to the partition that
+/// holds its presented record (§4.8 "Lookup": ids route to owners, no global index; the CLAUDE.md gotcha
+/// "a bare id needs the owner in its high bits"). A bare counter routed the grant to the client's own
+/// shard, where the landing was never awaiting, and every grant refused `NotFound`.
+/// Format: the partition's shift — the high 16 bits of the 64-bit id, as `ATTACHMENT_PARTITION_SHIFT`.
+const LANDING_PARTITION_SHIFT: u64 = 48;
+
+/// The landing id for a counter on `partition`.
+pub(crate) fn landing_id(partition: u16, counter: u64) -> u64 {
+  (u64::from(partition) << LANDING_PARTITION_SHIFT) | counter
+}
+
+/// The partition that owns a landing id.
+pub fn owner_of_landing(id: u64) -> u16 {
+  u16::try_from(id >> LANDING_PARTITION_SHIFT).unwrap_or(0)
+}
+
 /// The volume a request is about, when it is about one.
 fn volume_of(body: &RequestBody) -> Option<VolumeId> {
   match body {
@@ -675,6 +693,9 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   if let RequestBody::List = body {
     return scatter_list(state, client.index(), request.request, principal);
   }
+  if let RequestBody::Grants = body {
+    return scatter_grants(state, client.index(), request.request, principal);
+  }
   if let RequestBody::DaemonStatus = body {
     return scatter_status(state, client.index(), request.request);
   }
@@ -725,6 +746,9 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   let owner = match &body {
     RequestBody::Create { name, .. } => Some(owner_of_name(name, state.shards.len())),
     RequestBody::Detach { attachment } => Some(owner_of_attachment(*attachment)),
+    // A grant is served where its landing was presented: the volume's owner shard, which the landing id
+    // names — not the client's shard, where nothing is awaiting.
+    RequestBody::Grant { landing, .. } => Some(owner_of_landing(*landing)),
     other => volume_of(other).map(owner_of),
   };
   if let Some(owner) = owner
@@ -1040,6 +1064,77 @@ fn scatter_list(
     }
   }
   Served::Forwarded
+}
+
+/// The caller's grants are a scatter-gather like a listing: a grant record is written on the shard that
+/// presented its landing (the volume's owner), so every shard answers with the grants it holds for the
+/// principal and the origin merges when the last part arrives.
+fn scatter_grants(
+  state: &mut ShardState,
+  client_index: u32,
+  request: u64,
+  principal: Principal,
+) -> Served {
+  let others: Vec<u16> = state
+    .shards
+    .iter()
+    .copied()
+    .filter(|s| *s != state.shard)
+    .collect();
+  let mine = match crate::landing::grants_verb(state, &principal) {
+    ReplyBody::Grants { grants } => grants,
+    other => return Served::Reply(other),
+  };
+  if others.is_empty() {
+    return Served::Reply(ReplyBody::Grants { grants: mine });
+  }
+  state
+    .grant_scatters
+    .insert(request, (client_index, others.len(), mine));
+  let origin = state.shard;
+  for shard in others {
+    let principal = principal.clone();
+    let task = SpawnRequest::new(
+      Box::pin(async move {
+        let part = match crate::state::with_state(|s| crate::landing::grants_verb(s, &principal)) {
+          Some(ReplyBody::Grants { grants }) => grants,
+          _ => Vec::new(),
+        };
+        let back = SpawnRequest::new(
+          Box::pin(async move {
+            gather_grants(request, part);
+          }),
+          None,
+        );
+        let _ = slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)));
+      }),
+      None,
+    );
+    if slates_rt::registry::send_control(shard, Control::Spawn(Box::new(task))).is_err() {
+      gather_grants(request, Vec::new());
+    }
+  }
+  Served::Forwarded
+}
+
+/// Folds one shard's part of a `grants` read into the scatter and, on the last part, delivers the merged
+/// grants in id order.
+fn gather_grants(request: u64, part: Vec<slates_ipc::protocol::GrantSummary>) {
+  let done = crate::state::with_state(|s| {
+    let entry = s.grant_scatters.get_mut(&request)?;
+    entry.2.extend(part);
+    entry.1 = entry.1.saturating_sub(1);
+    if entry.1 == 0 {
+      s.grant_scatters.remove(&request)
+    } else {
+      None
+    }
+  })
+  .flatten();
+  if let Some((client_index, _, mut grants)) = done {
+    grants.sort_by_key(|g| g.id);
+    crate::state::deliver(client_index, request, ReplyBody::Grants { grants }, false);
+  }
 }
 
 /// The daemon's status is a scatter-gather like a listing: every shard reports its part and
@@ -1370,6 +1465,9 @@ fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::GrantInvalid => "grant_invalid",
     Refusal::HomedElsewhere { .. } => "homed_elsewhere",
     Refusal::NotRootLeader => "not_root_leader",
+    Refusal::GrantIssuerUnverified => "grant_issuer_unverified",
+    Refusal::ConsumerNotEnrolled => "consumer_not_enrolled",
+    Refusal::ConsumerRevoked => "consumer_revoked",
   }
 }
 
@@ -1495,12 +1593,13 @@ fn dispatch_inner(
       rewitness(state, principal, volume, paths.as_deref())
     }
     RequestBody::Pin { volume, paths } => pin(state, principal, volume, paths.as_deref()),
-    RequestBody::Grant { .. } => {
-      *state.refusals.entry("grant_kind_refused").or_insert(0) += 1;
-      refused(Refusal::GrantChannelRefused {
-        channel: "ring".to_owned(),
-      })
-    }
+    RequestBody::Grant {
+      landing,
+      manifest,
+      scope,
+      term_ns,
+      proof,
+    } => crate::landing::grant_verb(state, principal, landing, manifest, scope, term_ns, proof),
   }
 }
 
@@ -3437,8 +3536,11 @@ fn list(state: &mut ShardState, principal: &Principal) -> ReplyBody {
 
 fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32) -> ReplyBody {
   let now = state.clock.monotonic_ns();
-  // A local client acknowledges its own completions, keyed under this node's own host.
-  let origin = state.fleet.host().0;
+  // A local client acknowledges its own completions, keyed under this node's **stable anchor** — the key
+  // `serve` records them under (task #22: the ephemeral member id changes per boot; the anchor does not).
+  // Keyed under the member id, the windows were never pruned and a retry after acknowledgement executed
+  // again instead of meeting `DuplicateRequest` (`docs/bugs/2026-09-13-acknowledge-prunes-under-the-ephemeral-id.md`).
+  let origin = state.origin_anchor.0;
   match state.db.mutate(
     &mut state.segment,
     &Op::CompletionsAcknowledged {
@@ -3659,8 +3761,9 @@ fn retry_deferred(state: &mut ShardState) -> bool {
     } = entry;
     let id = RequestId::from_word(request);
     // A deferred reply is the local client's own (its shard is here), so its completion keys on this node's
-    // own host; a cross-node forward records on the owner under its authenticated origin instead.
-    let origin = state.fleet.host().0;
+    // **stable anchor** — the key `serve` looks completions up under; a cross-node forward records on the
+    // owner under its authenticated origin instead.
+    let origin = state.origin_anchor.0;
     let reply = if recorded {
       reply
     } else {

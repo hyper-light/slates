@@ -55,6 +55,20 @@ pub const SUP_RESTARTS: usize = 24;
 pub const SUP_STATE: usize = 32;
 /// Format: when the current daemon was started, the anchor's monotonic nanoseconds.
 pub const SUP_STARTED: usize = 40;
+/// Format: the daemon's **grant-issuer secret** (§4.13 "only an authenticated human confirmation surface
+/// holds grant-issuer authority"): [`ISSUER_SECRET_BYTES`] of random the daemon mints at every start and
+/// writes here, after the supervision words. The segment is mapped only by the supervising anchor, the
+/// daemon, and a `slates` command running as the anchor's own user, so the secret is "a capability
+/// delivered and retained outside other agents' reach" (§4.13): an agent driving the ring, the MCP server
+/// or an SDK never maps this page, and a workload that merely *invokes* the CLI binary presents no proof
+/// unless it also holds the anchor. A grant request proves possession by a keyed hash over the exact
+/// landing it approves; the daemon recomputes it (`slates_server::landing::grant_proof`).
+/// Format: the byte offset inside the supervision block — the first cache-line boundary past the six
+/// supervision words (48 bytes), so the secret shares no line with the heartbeat the daemon beats.
+pub const SUP_ISSUER: usize = 64;
+/// Format: the issuer secret's width — 32 bytes, a 256-bit random value, the width of the BLAKE3 key
+/// that proves it (BLAKE3 §2.3: a 256-bit key).
+pub const ISSUER_SECRET_BYTES: usize = 32;
 
 /// Format: a published payload's words (the profile, a snapshot slot, a landing slot): the
 /// generation (odd while a writer is inside) then the length, then the bytes.

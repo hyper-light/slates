@@ -153,6 +153,11 @@ pub struct ShardState {
   pub served: u64,
   /// Refusals by kind name.
   pub refusals: BTreeMap<&'static str, u64>,
+  /// The daemon's grant-issuer secret for this start (§4.13), read from the anchor's supervision block
+  /// at shard init — the key a `Grant` request's proof of authority is verified under
+  /// (`landing::grant_proof`). Every shard reads the same secret, so a grant verifies on whichever shard
+  /// serves the client; it is never sent on any channel.
+  pub issuer_secret: [u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
   /// Replies waiting for the client's ring (full, or the reply came from another shard), by
   /// client slot; `recorded` says the completion record already exists (at the owner
   /// partition of a forwarded verb), so this shard must not record it again.
@@ -162,6 +167,10 @@ pub struct ShardState {
   /// Listings in flight: by request word, the client slot, the shards still to answer, and
   /// the summaries so far (a scatter-gather over owners, §4.8 "Lookup").
   pub scatters: BTreeMap<u64, (u32, usize, Vec<slates_ipc::protocol::VolumeSummary>)>,
+  /// `grants` reads in flight: the caller's grants live on the shards that presented their landings (a
+  /// grant record is written where its landing was), so the read is a scatter-gather like a listing — by
+  /// request word, the client slot, the shards still to answer, and the summaries so far.
+  pub grant_scatters: BTreeMap<u64, (u32, usize, Vec<slates_ipc::protocol::GrantSummary>)>,
   /// Every shard of the daemon, for the scatter.
   pub shards: Vec<u16>,
   /// What the last start's recovery found (the status reports it).
