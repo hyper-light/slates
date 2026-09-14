@@ -377,3 +377,146 @@ fn a_green_chain_survives_a_daemon_restart() {
   second.stop();
   drop(segment);
 }
+
+/// A host directory a test writes into, removed when dropped (a test's own disk, outside slates).
+struct HostDir {
+  path: String,
+}
+
+impl Drop for HostDir {
+  fn drop(&mut self) {
+    let _ = std::process::Command::new("rm")
+      .args(["-rf", &self.path])
+      .output();
+  }
+}
+
+/// A fresh host directory named with the process id, holding `f.txt` = `disk bytes`.
+fn host_dir_with_file() -> HostDir {
+  let out = std::process::Command::new("mktemp")
+    .args(["-d", "-t", &format!("slates-origin-{}", std::process::id())])
+    .output()
+    .unwrap();
+  assert!(out.status.success(), "mktemp -d");
+  let path = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+  let wrote = std::process::Command::new("sh")
+    .arg("-c")
+    .arg(format!("printf '%s' 'disk bytes' > '{path}/f.txt'"))
+    .output()
+    .unwrap();
+  assert!(wrote.status.success(), "host write");
+  HostDir { path }
+}
+
+/// A green over a complete immutable base: an overlay over the host directory, pinned whole and
+/// snapshotted, then the green created over that snapshot and advanced once (`f.txt` prefixed).
+fn seed_green_over_base(client: &mut Client, dir: &str) -> slates_client::VolumeId {
+  let overlay = client
+    .create(&CreateSpec {
+      name: "over".to_owned(),
+      size: slates_client::SizeClass::Dynamic { max: 1 << 24 },
+      names: slates_client::NamePolicy::Exact,
+      require_locked: false,
+      base: Some(dir.to_owned()),
+    })
+    .unwrap();
+  assert_eq!(
+    client.pin(overlay, None).unwrap(),
+    1,
+    "the one base file pinned"
+  );
+  let snapshot = client.snapshot(overlay).unwrap();
+  let green = client
+    .create_green_over(
+      "g-base",
+      false,
+      slates_client::GreenBase {
+        volume: overlay,
+        snapshot,
+      },
+    )
+    .unwrap();
+  let (work, base) = client.create_work(green, "w0").unwrap();
+  assert_eq!(base, 0);
+  client.edit(work, "f.txt", 0, 0, b"agent: ").unwrap();
+  assert!(matches!(
+    client.submit(work).unwrap(),
+    Submitted::Accepted(1)
+  ));
+  green
+}
+
+/// After the restart the origin is version 0 again — re-seeded from its durable record before the
+/// chain replays over it — so version 0 reads the base bytes, version 1 the increment over them, and a
+/// new increment continues the chain at 2.
+fn assert_origin_recovered(client: &mut Client, green: slates_client::VolumeId) {
+  use slates_client::ReadAt;
+  assert_eq!(client.versions(green).unwrap(), 1, "the chain survived");
+  assert_eq!(
+    client
+      .read(green, "f.txt", ReadAt::Version { version: 0 })
+      .unwrap(),
+    b"disk bytes",
+    "version 0 is the origin, re-seeded before the chain replayed"
+  );
+  assert_eq!(
+    client
+      .read(green, "f.txt", ReadAt::Version { version: 1 })
+      .unwrap(),
+    b"agent: disk bytes"
+  );
+  let (work, base) = client.create_work(green, "w1").unwrap();
+  assert_eq!(base, 1);
+  client.edit(work, "f.txt", 0, 0, b"again: ").unwrap();
+  assert!(matches!(
+    client.submit(work).unwrap(),
+    Submitted::Accepted(2)
+  ));
+  assert_eq!(
+    client.read(green, "f.txt", ReadAt::Head).unwrap(),
+    b"again: agent: disk bytes"
+  );
+}
+
+/// A base-seeded green's origin is durable (§4.16 "the origin version from a snapshot"; A-9: a chain
+/// from "a complete immutable base"): the green is created over a pinned overlay snapshot and advanced
+/// once; after a daemon restart over the same segment, version 0 reads the origin's bytes and the chain
+/// replays over it. Non-vacuous: without the persisted origin the recovered green would replay its one
+/// increment over an empty version 0 — `f.txt` at version 0 would be `NotFound`, not the base bytes.
+#[test]
+fn a_base_seeded_greens_origin_survives_a_daemon_restart() {
+  let profile = profile();
+  let instance = format!("cl-origin-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let content_bytes = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX)
+    * 2
+    * usize::from(config.geometry.partitions.max(1));
+  let segment = AnchorSegment::create(
+    "slates-seg-cl-origin",
+    &profile.facts.identity,
+    config.geometry,
+  )
+  .unwrap()
+  .with_content("slates-con-cl-origin", content_bytes)
+  .unwrap();
+  let source = || {
+    let (handoff, len) = segment.handoff().unwrap();
+    let content = segment.content_handoff().unwrap();
+    SegmentSource::Handoff {
+      handoff,
+      len,
+      content,
+    }
+  };
+  let dir = host_dir_with_file();
+  let first = Daemon::start(&profile, config.clone(), source()).unwrap();
+  let mut client = connect(&instance);
+  let green = seed_green_over_base(&mut client, &dir.path);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source()).unwrap();
+  assert_origin_recovered(&mut client, green);
+  second.stop();
+  drop(segment);
+  drop(dir);
+}

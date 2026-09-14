@@ -107,6 +107,12 @@ init line, and one-line guards at the verbs):
   `version: Some(2)`.
 - Lifecycle umbrella `the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refusals`
   13.15 s; `-p slates-server --lib` 34; `-p slates-ipc --lib` 7.
+- Recovery of a base-seeded green, by use (`crates/client/tests/client.rs`,
+  `a_base_seeded_greens_origin_survives_a_daemon_restart`, `--exact`, 1.79 s): an overlay pinned whole
+  and snapshotted, a green over it advanced once, the daemon restarted over the same segment — version
+  0 reads the origin's bytes, version 1 the increment over them, a new increment lands as 2. Failing
+  first: with the origin replay in `rebuild_green` disabled the recovered head is 0 — the one increment
+  (an edit of an origin file) cannot replay over an empty version 0 at all.
 
 ### `f9e98dd` server: placed before referenced, recomputed by every holder
 
