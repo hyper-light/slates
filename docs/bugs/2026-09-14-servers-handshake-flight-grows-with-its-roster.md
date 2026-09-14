@@ -45,9 +45,11 @@ server's flight left intact; the fault was the dialer's.
   `establish_turns` returns `EndpointError::FlightTooLarge { bytes, cap }` before a byte leaves when a
   drained flight exceeds `DATAGRAM_BYTES` — one shared, documented constant now, for the endpoint's four
   receive buffers and the demultiplexer's (which each carried their own 2048).
-- Owed, the general form: fragmenting a handshake flight into minimum-size datagrams as CRYPTO frames with
-  offsets (RFC 9000 §19.6), which also ends the reliance on IP fragmentation for flights above the path
-  MTU; recorded under the transport's MTU item.
+- **The general form landed the same day:** a handshake flight is fragmented into path-floor datagrams
+  and reassembled by cumulative stream offset (`crates/transport/src/flight.rs`, RFC 9000 §19.6 in the
+  owned dialect), so a flight of any size up to `MAX_FLIGHT_BYTES` crosses without IP fragmentation and
+  `FlightTooLarge` now bounds the whole flight, not one datagram. Proven by use: a server with a wide
+  certificate (three fragments) serves a dialer.
 
 ## Tests
 

@@ -660,11 +660,13 @@ async fn recv_count<T>(rx: std::sync::mpsc::Receiver<T>, count: usize) -> Vec<T>
   out
 }
 
-/// What a serve task reports when its session ends: how many requests it served, and how.
+/// What a serve task reports when its session ends: how many requests it served, how, and how many
+/// handshake fragments it sent (a flight larger than a datagram sends more than one).
 #[derive(Debug)]
 struct Served {
   requests: u32,
   ended: String,
+  fragments_sent: u64,
 }
 
 /// Serves `session` for up to `max_requests` requests (or until it fails), replying to each with every
@@ -694,7 +696,11 @@ async fn serve_up_to(
     },
     Err(e) => format!("handshake: {e:?}"),
   };
-  let _ = report.send(Served { requests, ended });
+  let _ = report.send(Served {
+    requests,
+    ended,
+    fragments_sent: session.fragments_sent(),
+  });
 }
 
 /// Dials the server at the port that arrives on `port_rx`, handshakes, and returns the reply to each
@@ -915,6 +921,95 @@ fn a_server_admitting_a_large_roster_still_completes_a_dialers_handshake() {
     outcome.as_deref(),
     Ok(&[expected][..]),
     "the dialer handshook with a server admitting {LARGE_ROSTER} peers and was served"
+  );
+  let (counters, _live) = counters_rx.try_recv().expect("the server reported");
+  assert_eq!(counters.opened, 1, "one session: {counters:?}");
+  assert_eq!(counters.sessions_refused, 0, "{counters:?}");
+}
+
+/// Shape: how many subject-alternative names the wide certificate carries — enough that the server's
+/// Certificate message, and so its flight, spans more than one path-floor datagram (a name is a
+/// dozen-odd bytes; 120 of them add about two kilobytes to a 694-byte flight).
+const WIDE_CERTIFICATE_NAMES: usize = 120;
+
+/// A self-signed identity whose certificate is wide (many subject-alternative names), so a server
+/// presenting it sends a handshake flight larger than one datagram — what a real deployment's chain of a
+/// leaf and an intermediate looks like on the wire.
+fn wide_identity(name: &str) -> Identity {
+  let key = rcgen::KeyPair::generate().unwrap();
+  let names: Vec<String> = (0..WIDE_CERTIFICATE_NAMES)
+    .map(|i| format!("{name}-{i}.example"))
+    .chain(std::iter::once(name.to_owned()))
+    .collect();
+  let cert = rcgen::CertificateParams::new(names)
+    .unwrap()
+    .self_signed(&key)
+    .unwrap();
+  Identity::from_der(
+    cert.der().clone(),
+    PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+  )
+}
+
+/// §4.10a (RFC 9000 §19.6 CRYPTO frames), by use: a server whose handshake flight is **larger than one
+/// datagram** — a wide certificate here, a chain in a deployment — still completes a dialer's handshake:
+/// the flight crosses as fragments the dialer reassembles. Do: a server with a wide certificate; one
+/// client dials, handshakes and asks once. Expect: the reply; the server sent more than one fragment
+/// (non-vacuity — the flight really spanned datagrams); one session opened, none refused. Before
+/// fragmentation such a flight was refused typed at the sender (`FlightTooLarge`, 2026-09-14) and,
+/// before that, truncated at the receiver.
+#[test]
+fn a_server_flight_larger_than_a_datagram_crosses_as_fragments() {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+  let server_identity = wide_identity(NAME);
+  let server_cert = server_identity.certificate();
+  let dialer = self_signed(NAME);
+  let allowed = vec![dialer.certificate()];
+  let (port_tx, port_rx) = channel();
+  let (served_tx, served_rx) = channel();
+  let (done_tx, done_rx) = channel();
+  let (counters_tx, counters_rx) = channel();
+  let (result_tx, result_rx) = channel();
+  sim
+    .spawn_on(
+      id,
+      serve_shared_socket(ServerPlan {
+        identity: server_identity,
+        allowed,
+        max_sessions: 1,
+        sessions: vec![1],
+        add: 2,
+        port_txs: vec![port_tx],
+        served_tx,
+        done_rx,
+        clients: 1,
+        counters_tx,
+      }),
+    )
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let outcome = dial_and_request(dialer, server_cert, port_rx, vec![b"wide".to_vec()]).await;
+      let _ = result_tx.send(outcome);
+      let _ = done_tx.send(());
+    })
+    .unwrap();
+  sim.run_until_idle();
+
+  let outcome = result_rx.try_recv().expect("the dialer finished");
+  let expected: Vec<u8> = b"wide".iter().map(|b| b.wrapping_add(2)).collect();
+  assert_eq!(
+    outcome.as_deref(),
+    Ok(&[expected][..]),
+    "the dialer handshook with a server whose flight spans datagrams and was served"
+  );
+  let served: Vec<Served> = served_rx.try_iter().collect();
+  let fragments: u64 = served.iter().map(|s| s.fragments_sent).sum();
+  eprintln!("the wide server's handshake crossed as {fragments} fragments");
+  assert!(
+    fragments >= 2,
+    "the server's flight crossed as more than one fragment (non-vacuity): {served:?}"
   );
   let (counters, _live) = counters_rx.try_recv().expect("the server reported");
   assert_eq!(counters.opened, 1, "one session: {counters:?}");

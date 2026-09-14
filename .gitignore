@@ -13,3 +13,5 @@ docs/wip/models/*_TTrace_*.tla
 
 # Claude Code agent worktrees (scratch checkouts, each its own branch)
 .claude/worktrees/
+/target-*
+/node_modules

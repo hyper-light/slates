@@ -2263,6 +2263,8 @@ sets; auto-seal still runs (it bounds the archive's staleness and drives dedup);
 mirroring have no targets and their verbs refuse `Unsupported`.
 
 > **Status (2026-09-13).** The hedge, the healer and the cost model are built to the derived-constants
+
+> **Status (2026-09-14, handshake flights fragmented).** The session plane's handshake no longer rides one datagram per flight: a flight is split into fragments that each fit the path floor (`MIN_DATAGRAM_BYTES`) and reassembled at the peer by cumulative stream offset — one CRYPTO-style stream per direction (RFC 9000 §19.6), a flight placed by the count of bytes its sender had sent before it, so a retransmit of a consumed flight is recognized by offset and never re-fed, and a stale fragment of an earlier flight can never write into the next (`crates/transport/src/flight.rs`). Fragmentation is deterministic (a retransmit resends identical fragments), every receive-loop arm is bounded, and hostile fragments are dropped typed. Proven by an oracle over 2,000 random flights and orders with duplicates and by use on the simulated fabric: a server with a wide certificate — a 2.7 KiB flight, what a chain of a leaf and an intermediate looks like — serves a dialer, its flight crossing as three fragments. This closes the truncation the roster fix exposed (`docs/bugs/2026-09-14-servers-handshake-flight-grows-with-its-roster.md`); frame coalescing for the MTU item stays owed.
 > rule. A seal's content round is collected only until the measured p95 put latency and then hedged —
 > the coordinator free, a slow holder's acknowledgement folded later, never dropped. The healer walks
 > one placed snapshot per period derived from the measured put-failure rate, re-offering it through the
