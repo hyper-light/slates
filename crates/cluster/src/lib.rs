@@ -536,6 +536,34 @@ pub async fn commit_record(
   remote_holders: Vec<(HostId, Endpoint)>,
   budget: CommitBudget,
 ) -> Committed {
+  commit_record_on(
+    RECORD_STREAM,
+    owner,
+    owner_acceptor,
+    candidates,
+    record,
+    quorum,
+    remote_holders,
+    budget,
+  )
+  .await
+}
+
+/// [`commit_record`] over a chosen stream id, so a record class the holder must serve differently
+/// — a green's merge record (§4.16), which the holder recomputes before it accepts — is dispatched
+/// by its kind on the wire, never told apart from a head record by inspecting the value bytes. The
+/// commit rule is the same: the owner's hold, the dispatch, `f + 1` bound acknowledgements.
+#[allow(clippy::too_many_arguments)]
+pub async fn commit_record_on(
+  stream: u64,
+  owner: HostId,
+  owner_acceptor: &mut Acceptor,
+  candidates: &[HostId],
+  record: &Record,
+  quorum: Quorum,
+  remote_holders: Vec<(HostId, Endpoint)>,
+  budget: CommitBudget,
+) -> Committed {
   let mut acked: Vec<HostId> = Vec::new();
   // The owner's local hold — it is a candidate among the holders (§4.8 "the owner among them").
   if owner_acceptor.accept(record).is_ok() && candidates.contains(&owner) {
@@ -572,7 +600,7 @@ pub async fn commit_record(
       // Bounded by the collection loop's full span, and hands the endpoint back whatever the outcome, so a
       // straggler that never replies still returns its session rather than having it dropped when this task
       // is cancelled — the caller can then retry a load-timed-out commit over the same warm session.
-      let (reply, endpoint) = request_within(endpoint, RECORD_STREAM, &bytes, deadline_ns).await;
+      let (reply, endpoint) = request_within(endpoint, stream, &bytes, deadline_ns).await;
       let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     match spawned {

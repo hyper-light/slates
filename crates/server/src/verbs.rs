@@ -2585,6 +2585,8 @@ fn create_green(
     }
   };
   state.greens.insert(id, engine);
+  // Version 0's merge record — the origin, placed before the record names it (§4.16 "Commit").
+  crate::merge_service::enqueue_record(state, id, 0, [0u8; 32], 0, Vec::new());
   ReplyBody::GreenCreated {
     id: to_wire_volume(id),
   }
@@ -3036,6 +3038,16 @@ fn submit(
           .map(|(path, bytes)| (path.to_owned(), bytes.to_vec()))
           .collect();
       }
+      // The version's merge record, issued only once its inputs — the increment just appended — are
+      // placed (§4.16 "Commit"; at `f = 0` the append is the placement).
+      crate::merge_service::enqueue_record(
+        state,
+        green_id,
+        version,
+        inc.id,
+        inc.base,
+        inc.evidence,
+      );
       ReplyBody::Submitted {
         version: Some(version),
         conflicts: Vec::new(),
@@ -3757,6 +3769,10 @@ fn await_placed(
   snapshot: Option<SnapshotId>,
   scope: Scope,
 ) -> ReplyBody {
+  // A green's placement is its merge records' (§4.16 "Commit"), never a store snapshot's.
+  if let Some(reply) = crate::merge_service::await_placed_green(state, principal, volume, scope) {
+    return reply;
+  }
   let (_, record) = match find(state, volume) {
     Ok(x) => x,
     Err(r) => return *r,

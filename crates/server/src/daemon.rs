@@ -838,6 +838,61 @@ impl Daemon {
       .unwrap_or(false)
   }
 
+  /// Whether the merge record of `green`'s `version` has **placed** at `f + 1` candidate holders on
+  /// this owner (§4.16 "Commit": "committed at f+1 acknowledgements, … issued only when every identity
+  /// the version references is placed"). `Some(false)` while the record waits — on its inputs' placement,
+  /// or on its holders — or on a laptop before the version exists; `None` when the owner shard could not be
+  /// observed. Runs a one-shot query on the green's owner shard.
+  pub fn merge_record_placed(
+    &self,
+    green: slates_ipc::protocol::VolumeId,
+    version: u64,
+  ) -> Option<bool> {
+    let object = slates_db::register::ObjectId(green.bytes);
+    self.observe(self.shard_of_object(object), move || {
+      state::with_state(|s| {
+        crate::merge_service::placed_version(s, object).is_some_and(|placed| placed >= version)
+      })
+    })
+  }
+
+  /// What this node holds as a **candidate holder** of `green`'s merge chain (§4.16 "Apply on
+  /// holders"): the replica's head version once the owner's records reached and recomputed here, and
+  /// whether this holder refused the green for good after a recomputation mismatch. A test reads it as
+  /// the non-vacuity of holder recomputation: a holder holds nothing until a record it recomputed
+  /// arrived. Runs a one-shot query on the control shard; `None` when it could not be observed.
+  pub fn merge_holder_state(
+    &self,
+    green: slates_ipc::protocol::VolumeId,
+  ) -> Option<crate::merge_service::HolderMergeState> {
+    let object = slates_db::register::ObjectId(green.bytes);
+    self.observe(self.shards.first().copied(), move || {
+      state::with_state(|s| crate::merge_service::holder_state(s, object))
+    })
+  }
+
+  /// Test support: injects a merge-plane fault on this node's control shard (§4.16; never reachable
+  /// from the wire): refuse every content put while set, so an owner's merge record must wait for its
+  /// inputs to place; or corrupt the next inputs a record is recomputed from, so the recomputation
+  /// mismatches. Delivered like [`Self::observe_peer_dead`]; returns whether it was installed.
+  pub fn inject_merge_fault(&self, fault: crate::merge_service::MergeFault) -> bool {
+    let Some(control) = self.shards.first().copied() else {
+      return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if !self.spawn_admitted(control, OBSERVE_BUDGET_NS, || {
+      let tx = tx.clone();
+      async move {
+        let installed = state::with_state(|s| s.merge.fault = fault).is_some();
+        let _ = tx.send(installed);
+      }
+    }) {
+      return false;
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(OBSERVE_BUDGET_NS))
+      .unwrap_or(false)
+  }
+
   /// How many placed snapshots the shard owning `object` has **repaired** (§4.10 "the healer"): re-put to
   /// a recorded holder that answered the healer's offer with chunks it lacked. The non-vacuity counter a
   /// test reads — a holder shown to hold content again proves the repair only together with this count
