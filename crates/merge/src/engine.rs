@@ -109,8 +109,7 @@ impl Increment {
     let doc = OpsDoc::decode(reader.bytes(doc_len)?)?;
     let post_len = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
     let post_state = reader.bytes(post_len)?.to_vec();
-    let evidence_count =
-      usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
+    let evidence_count = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
     if evidence_count > reader.remaining() / EVIDENCE_BYTES {
       return Err(DocDecodeError::Truncated);
     }
@@ -250,6 +249,25 @@ fn history_at<T: Clone>(history: &[(u64, Option<T>)], version: u64) -> Option<T>
     .rev()
     .find(|(recorded, _)| *recorded <= version)
     .and_then(|(_, value)| value.clone())
+}
+
+/// Whether a per-version history has an entry at a version in `(from, to]`.
+fn history_touches<T>(history: &[(u64, T)], from: u64, to: u64) -> bool {
+  history
+    .iter()
+    .any(|(version, _)| *version > from && *version <= to)
+}
+
+/// The paths of a per-path history that changed at a version in `(from, to]`.
+fn paths_changed_in<T>(
+  histories: &BTreeMap<String, Vec<(u64, T)>>,
+  from: u64,
+  to: u64,
+) -> impl Iterator<Item = String> + '_ {
+  histories
+    .iter()
+    .filter(move |(_, history)| history_touches(history, from, to))
+    .map(|(path, _)| path.clone())
 }
 
 /// Whether a `(version, present)` history has the entity present at `version`: the last entry at or
@@ -493,38 +511,19 @@ impl Green {
   /// which hold every version a path changed at — not the last-changed index alone, which would
   /// miss a path changed inside the span and again after it. Sorted, each path once.
   pub fn changed_between(&self, from: u64, to: u64) -> Vec<String> {
-    let within = |version: u64| version > from && version <= to;
     let mut changed: BTreeSet<String> = BTreeSet::new();
-    for (path, history) in &self.content_history {
-      if history.iter().any(|(version, _)| within(*version)) {
-        changed.insert(path.clone());
-      }
-    }
-    for (path, history) in &self.dir_history {
-      if history.iter().any(|(version, _)| within(*version)) {
-        changed.insert(path.clone());
-      }
-    }
-    for (path, history) in &self.mode_history {
-      if history.iter().any(|(version, _)| within(*version)) {
-        changed.insert(path.clone());
-      }
-    }
-    for (path, history) in &self.symlink_history {
-      if history.iter().any(|(version, _)| within(*version)) {
-        changed.insert(path.clone());
-      }
-    }
-    for (path, history) in &self.hardlink_history {
-      if history.iter().any(|(version, _)| within(*version)) {
-        changed.insert(path.clone());
-      }
-    }
-    for ((path, _), history) in &self.xattr_history {
-      if history.iter().any(|(version, _)| within(*version)) {
-        changed.insert(path.clone());
-      }
-    }
+    changed.extend(paths_changed_in(&self.content_history, from, to));
+    changed.extend(paths_changed_in(&self.dir_history, from, to));
+    changed.extend(paths_changed_in(&self.mode_history, from, to));
+    changed.extend(paths_changed_in(&self.symlink_history, from, to));
+    changed.extend(paths_changed_in(&self.hardlink_history, from, to));
+    changed.extend(
+      self
+        .xattr_history
+        .iter()
+        .filter(|(_, history)| history_touches(history, from, to))
+        .map(|((path, _), _)| path.clone()),
+    );
     changed.into_iter().collect()
   }
 

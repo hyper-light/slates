@@ -99,10 +99,7 @@ fn an_overlays_snapshot_is_complete_only_once_the_whole_base_is_pinned_before_it
     "listed but unpinned files still depend on the host"
   );
 
-  let pinned = vol
-    .with_host(&mut host)
-    .pin(&mut store, None)
-    .unwrap();
+  let pinned = vol.with_host(&mut host).pin(&mut store, None).unwrap();
   assert_eq!(pinned, 2, "both files pinned");
   assert!(
     !vol.snapshot_is_complete(&store, listed).unwrap(),

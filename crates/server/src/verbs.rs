@@ -195,7 +195,7 @@ fn shard_of_partition(state: &ShardState, partition: u16) -> Option<u16> {
 const ATTACHMENT_PARTITION_SHIFT: u64 = 48;
 
 /// The attachment id for a counter on `partition`.
-fn attachment_id(partition: u16, counter: u64) -> u64 {
+pub(crate) fn attachment_id(partition: u16, counter: u64) -> u64 {
   (u64::from(partition) << ATTACHMENT_PARTITION_SHIFT) | counter
 }
 
@@ -232,7 +232,7 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::CreateWork { green: volume, .. }
     | RequestBody::Edit { work: volume, .. }
     | RequestBody::Declare { work: volume, .. }
-    | RequestBody::Submit { work: volume }
+    | RequestBody::Submit { work: volume, .. }
     | RequestBody::Rebase { work: volume }
     | RequestBody::Clone { volume, .. }
     | RequestBody::Attach { volume, .. }
@@ -243,9 +243,12 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::Rewitness { volume, .. }
     | RequestBody::Pin { volume, .. }
     | RequestBody::AwaitPlaced { volume, .. }
+    | RequestBody::Read { volume, .. }
     | RequestBody::Land { volume, .. } => Some(*volume),
+    // A green over a base is born on the base volume's owner shard, where the snapshot is walked.
+    RequestBody::CreateGreen { base, .. } => base.map(|b| b.volume),
     RequestBody::Create { .. }
-    | RequestBody::CreateGreen { .. }
+    | RequestBody::Advance { .. }
     | RequestBody::Detach { .. }
     | RequestBody::List
     | RequestBody::DaemonStatus
@@ -424,7 +427,10 @@ pub(crate) struct ForwardedRequest {
 fn is_forwardable_read(body: &RequestBody) -> bool {
   matches!(
     body,
-    RequestBody::Status { .. } | RequestBody::Versions { .. } | RequestBody::ChangedSince { .. }
+    RequestBody::Status { .. }
+      | RequestBody::Versions { .. }
+      | RequestBody::ChangedSince { .. }
+      | RequestBody::Read { .. }
   )
 }
 
@@ -803,7 +809,9 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   }
   let owner = match &body {
     RequestBody::Create { name, .. } => Some(owner_of_name(name, state.shards.len())),
-    RequestBody::Detach { attachment } => Some(owner_of_attachment(*attachment)),
+    RequestBody::Detach { attachment } | RequestBody::Advance { attachment, .. } => {
+      Some(owner_of_attachment(*attachment))
+    }
     // A grant is served where its landing was presented: the volume's owner shard, which the landing id
     // names — not the client's shard, where nothing is awaiting.
     RequestBody::Grant { landing, .. } => Some(owner_of_landing(*landing)),
@@ -1527,6 +1535,14 @@ fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::GrantIssuerUnverified => "grant_issuer_unverified",
     Refusal::ConsumerNotEnrolled => "consumer_not_enrolled",
     Refusal::ConsumerRevoked => "consumer_revoked",
+    Refusal::ReadOnlyVolume => "read_only_volume",
+    Refusal::NotGreen => "not_green",
+    Refusal::NotWork => "not_work",
+    Refusal::UnknownBase { .. } => "unknown_base",
+    Refusal::EvidenceRequired => "evidence_required",
+    Refusal::ConsistentBaseUnavailable => "consistent_base_unavailable",
+    Refusal::ContentUnavailable => "content_unavailable",
+    Refusal::StaleEpoch { .. } => "stale_epoch",
   }
 }
 
@@ -1631,7 +1647,8 @@ fn dispatch_inner(
     RequestBody::CreateGreen {
       name,
       require_evidence,
-    } => create_green(state, principal, &name, require_evidence),
+      base,
+    } => create_green(state, principal, &name, require_evidence, base),
     RequestBody::Versions { green } => versions(state, principal, green),
     RequestBody::ChangedSince { green, version } => changed_since(state, principal, green, version),
     RequestBody::CreateWork { green, name } => create_work(state, principal, green, &name),
@@ -1641,10 +1658,17 @@ fn dispatch_inner(
       at,
       delete_len,
       bytes,
-    } => edit(state, work, &path, at, delete_len, &bytes),
-    RequestBody::Declare { work, op } => declare(state, work, op),
-    RequestBody::Submit { work } => submit(state, work),
-    RequestBody::Rebase { work } => rebase(state, work),
+    } => edit(state, principal, work, &path, at, delete_len, &bytes),
+    RequestBody::Declare { work, op } => declare(state, principal, work, op),
+    RequestBody::Submit { work, evidence } => submit(state, principal, work, evidence),
+    RequestBody::Rebase { work } => rebase(state, principal, work),
+    RequestBody::Advance {
+      attachment,
+      version,
+    } => crate::merge_service::advance(state, principal, attachment, version),
+    RequestBody::Read { volume, path, at } => {
+      crate::merge_service::read(state, principal, volume, &path, at)
+    }
     RequestBody::Clone {
       volume,
       snapshot,
@@ -2406,7 +2430,8 @@ fn open_base(
 }
 
 fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> ReplyBody {
-  let (handle, record) = match find(state, volume) {
+  use crate::merge_service::{StoreVerb, find_store_backed};
+  let (handle, record) = match find_store_backed(state, volume, StoreVerb::Snapshot) {
     Ok(x) => x,
     Err(r) => return *r,
   };
@@ -2453,7 +2478,8 @@ fn destroy_snapshot_verb(
   volume: VolumeId,
   snapshot: SnapshotId,
 ) -> ReplyBody {
-  let (handle, record) = match find(state, volume) {
+  use crate::merge_service::{StoreVerb, find_store_backed};
+  let (handle, record) = match find_store_backed(state, volume, StoreVerb::Base) {
     Ok(x) => x,
     Err(r) => return *r,
   };
@@ -2493,12 +2519,23 @@ fn create_green(
   principal: &Principal,
   name: &str,
   require_evidence: bool,
+  base: Option<slates_ipc::protocol::GreenBase>,
 ) -> ReplyBody {
   if let Some(existing) = state.db.partition().volume_by_name(name) {
     return refused(Refusal::AlreadyExists {
       existing: to_wire_volume(existing.id),
     });
   }
+  // The chain starts from scratch or from a complete immutable base (§4.16; A-9): the base is
+  // walked into the origin before anything is recorded, so a refusal (an incomplete snapshot, a
+  // torn read) changes nothing.
+  let origin = match base {
+    None => None,
+    Some(base) => match crate::merge_service::seed_origin(state, principal, base) {
+      Ok(origin) => Some(origin),
+      Err(refusal) => return refused(refusal),
+    },
+  };
   let id = fresh_volume_id(state);
   let record = VolumeRecord {
     id,
@@ -2531,7 +2568,23 @@ fn create_green(
   {
     return refused(refusal_of_db(&e));
   }
-  state.greens.insert(id, slates_merge::engine::Green::new());
+  // A base-seeded green records its origin durably — guarded (the chain budget) before the engine
+  // is seeded, so a refused origin leaves no engine ahead of its log — and replays it before the
+  // chain on recovery (`rebuild_green`).
+  let engine = match origin {
+    None => slates_merge::engine::Green::new(),
+    Some(origin) => {
+      let record = Op::GreenOriginated {
+        green: id,
+        origin: origin.encode(),
+      };
+      if let Err(e) = state.db.mutate(&mut state.segment, &record, now) {
+        return refused(refusal_of_db(&e));
+      }
+      slates_merge::engine::Green::with_origin(&origin)
+    }
+  };
+  state.greens.insert(id, engine);
   ReplyBody::GreenCreated {
     id: to_wire_volume(id),
   }
@@ -2540,14 +2593,11 @@ fn create_green(
 /// A green's version chain (§4.16): its head version. The read side of the chain — `changed_since`
 /// and the per-version records follow. Answered by the green's owner shard, which holds the engine.
 fn versions(state: &ShardState, principal: &Principal, green: VolumeId) -> ReplyBody {
-  let id = to_db_volume(green);
-  let Some(record) = state.db.partition().volume(id) else {
-    return refused(Refusal::NotFound);
+  let record = match crate::merge_service::require_green(state, principal, green, "versions") {
+    Ok(record) => record,
+    Err(refusal) => return refused(refusal),
   };
-  if !rights_of(record, principal).read {
-    return forbidden("versions");
-  }
-  let Some(engine) = state.greens.get(&id) else {
+  let Some(engine) = state.greens.get(&record.id) else {
     return refused(Refusal::NotFound);
   };
   ReplyBody::Versions {
@@ -2563,14 +2613,11 @@ fn changed_since(
   green: VolumeId,
   version: u64,
 ) -> ReplyBody {
-  let id = to_db_volume(green);
-  let Some(record) = state.db.partition().volume(id) else {
-    return refused(Refusal::NotFound);
+  let record = match crate::merge_service::require_green(state, principal, green, "changed_since") {
+    Ok(record) => record,
+    Err(refusal) => return refused(refusal),
   };
-  if !rights_of(record, principal).read {
-    return forbidden("changed_since");
-  }
-  let Some(engine) = state.greens.get(&id) else {
+  let Some(engine) = state.greens.get(&record.id) else {
     return refused(Refusal::NotFound);
   };
   ReplyBody::ChangedSince {
@@ -2586,7 +2633,10 @@ fn create_work(
   green: VolumeId,
   name: &str,
 ) -> ReplyBody {
-  let green_id = to_db_volume(green);
+  let green_id = match crate::merge_service::require_green(state, principal, green, "create_work") {
+    Ok(record) => record.id,
+    Err(refusal) => return refused(refusal),
+  };
   let Some(engine) = state.greens.get(&green_id) else {
     return refused(Refusal::NotFound);
   };
@@ -2655,13 +2705,18 @@ fn create_work(
 /// increment on submit. A new path is created first.
 fn edit(
   state: &mut ShardState,
+  principal: &Principal,
   work: VolumeId,
   path: &str,
   at: u64,
   delete_len: u64,
   bytes: &[u8],
 ) -> ReplyBody {
-  let work_id = to_db_volume(work);
+  // A declared write: refused `ReadOnlyVolume` on a green, `NotWork` on a plain volume (§4.16, D-27).
+  let work_id = match crate::merge_service::require_work(state, principal, work, true, "edit") {
+    Ok((record, _)) => record.id,
+    Err(refusal) => return refused(refusal),
+  };
   let Some(w) = state.works.get_mut(&work_id) else {
     return refused(Refusal::NotFound);
   };
@@ -2711,8 +2766,11 @@ fn edit(
 /// or rename also keeps the work's content map consistent, so a later edit and the post-state seal
 /// see the right files; a symlink's target travels in the ops document's path table and an xattr's
 /// value in the journal, so neither needs a work-side store.
-fn declare(state: &mut ShardState, work: VolumeId, op: WorkOp) -> ReplyBody {
-  let work_id = to_db_volume(work);
+fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: WorkOp) -> ReplyBody {
+  let work_id = match crate::merge_service::require_work(state, principal, work, true, "declare") {
+    Ok((record, _)) => record.id,
+    Err(refusal) => return refused(refusal),
+  };
   let Some(w) = state.works.get_mut(&work_id) else {
     return refused(Refusal::NotFound);
   };
@@ -2825,15 +2883,23 @@ fn assemble_post_state(
 fn build_increment(
   state: &ShardState,
   work_id: DbVolumeId,
+  evidence: Vec<[u8; 32]>,
 ) -> Result<(DbVolumeId, slates_merge::engine::Increment), Refusal> {
   let Some(w) = state.works.get(&work_id) else {
     return Err(Refusal::NotFound);
   };
   let green_id = w.green;
   let base_version = w.base_version;
-  let Some(engine) = state.greens.get(&green_id) else {
-    return Err(Refusal::NotFound);
-  };
+  // The green is gone (destroyed), or the work's base is past the head it holds: the base names a
+  // version this green does not have (§4.16 failure matrix, `UnknownBase`).
+  let engine = state
+    .greens
+    .get(&green_id)
+    .filter(|engine| base_version <= engine.head())
+    .ok_or(Refusal::UnknownBase {
+      green: to_wire_volume(green_id),
+      version: base_version,
+    })?;
   let base = engine.base_at(base_version);
   let doc = match slates_merge::increment::compose_volume(&base, &w.journal) {
     Ok(doc) => doc,
@@ -2855,7 +2921,7 @@ fn build_increment(
       base: base_version,
       doc,
       post_state,
-      evidence: Vec::new(),
+      evidence,
     },
   ))
 }
@@ -2878,9 +2944,34 @@ fn merge_windows(
 /// Submits a work volume's declared operations to its green as an increment (§4.16): compose the
 /// declared operations into the canonical document, seal the post-state, hash the identity, and run
 /// the green's merge verdict — accepted with the new version, or the conflict windows to rebase.
-fn submit(state: &mut ShardState, work: VolumeId) -> ReplyBody {
-  let work_id = to_db_volume(work);
-  let (green_id, inc) = match build_increment(state, work_id) {
+fn submit(
+  state: &mut ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  evidence: Vec<[u8; 32]>,
+) -> ReplyBody {
+  let (work_id, green_id) =
+    match crate::merge_service::require_work(state, principal, work, false, "submit") {
+      Ok((record, green)) => (record.id, green),
+      Err(refusal) => return refused(refusal),
+    };
+  // A green that requires evidence refuses an increment without any (§4.16 `EvidenceRequired`),
+  // before the seal: nothing is composed for a submit that cannot be accepted.
+  if evidence.is_empty()
+    && matches!(
+      crate::merge_service::merge_role(state, green_id),
+      Some(crate::merge_service::MergeRole::Green {
+        require_evidence: true
+      })
+    )
+  {
+    return refused(Refusal::EvidenceRequired);
+  }
+  // The submission barrier (§4.16 "Submission": "seal the work volume"): the seal is taken here, in
+  // this verb, on the single-threaded owner shard — every declared operation before it is in the
+  // increment, and a write that arrives after it is a later verb that lands in the next increment,
+  // never this one.
+  let (green_id, inc) = match build_increment(state, work_id, evidence) {
     Ok(built) => built,
     Err(refusal) => return refused(refusal),
   };
@@ -2931,6 +3022,20 @@ fn submit(state: &mut ShardState, work: VolumeId) -> ReplyBody {
       if let Err(e) = state.db.mutate(&mut state.segment, &record, now) {
         return refused(refusal_of_db(&e));
       }
+      // The accepted work now equals the green at the new version: its journal is consumed (the
+      // increment holds it), its base moves to the version, and its content is the green's — so a
+      // later edit declares against what the green holds (§4.16 "Submission"; a work with `stream`
+      // submits at every auto-seal on exactly this footing). Without this a second submit would
+      // re-declare the already-merged operations against the old base.
+      if let (Some(engine), Some(w)) = (state.greens.get(&green_id), state.works.get_mut(&work_id))
+      {
+        w.base_version = version;
+        w.journal.clear();
+        w.content = engine
+          .files()
+          .map(|(path, bytes)| (path.to_owned(), bytes.to_vec()))
+          .collect();
+      }
       ReplyBody::Submitted {
         version: Some(version),
         conflicts: Vec::new(),
@@ -2948,9 +3053,12 @@ fn submit(state: &mut ShardState, work: VolumeId) -> ReplyBody {
 /// operation maps cleanly — move the work onto the head, restating its base, its content and its
 /// journal in head coordinates so a later submit composes with no further mapping. A conflict returns
 /// the windows and changes nothing. The green is never changed by a rebase.
-fn rebase(state: &mut ShardState, work: VolumeId) -> ReplyBody {
-  let work_id = to_db_volume(work);
-  let (green_id, inc) = match build_increment(state, work_id) {
+fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> ReplyBody {
+  let work_id = match crate::merge_service::require_work(state, principal, work, false, "rebase") {
+    Ok((record, _)) => record.id,
+    Err(refusal) => return refused(refusal),
+  };
+  let (green_id, inc) = match build_increment(state, work_id, Vec::new()) {
     Ok(built) => built,
     Err(refusal) => return refused(refusal),
   };
@@ -2989,7 +3097,8 @@ fn clone(
   snapshot: SnapshotId,
   name: &str,
 ) -> ReplyBody {
-  let (handle, record) = match find(state, volume) {
+  use crate::merge_service::{StoreVerb, find_store_backed};
+  let (handle, record) = match find_store_backed(state, volume, StoreVerb::Clone) {
     Ok(x) => x,
     Err(r) => return *r,
   };
@@ -3154,10 +3263,15 @@ fn attach(
   snapshot: Option<SnapshotId>,
   intent: Intent,
 ) -> ReplyBody {
-  let (_, record) = match find(state, volume) {
-    Ok(x) => x,
+  // A merge volume has no store slot: its record alone admits it. A green pins a version and
+  // refuses a write intent; a work attaches like a plain volume (its lease and epoch).
+  let record = match crate::merge_service::attachable_record(state, volume) {
+    Ok(record) => record,
     Err(r) => return *r,
   };
+  if matches!(record.policy.role, Role::Green { .. }) {
+    return crate::merge_service::attach_green(state, client_id, principal, &record, intent);
+  }
   let rights = rights_of(&record, principal);
   let now = state.clock.monotonic_ns();
   let lease_epoch = match intent {
@@ -3219,6 +3333,7 @@ fn attach(
     attachment,
     lease_epoch,
     path: None,
+    version: None,
   }
 }
 
@@ -3237,6 +3352,7 @@ fn detach(state: &mut ShardState, principal: &Principal, attachment: u64) -> Rep
   ) {
     return refused(refusal_of_db(&e));
   }
+  crate::merge_service::forget_attachment(state, attachment);
   // The last write attachment of the holder releases the lease.
   let holds_another = state
     .db
@@ -3306,7 +3422,8 @@ fn resize(
   volume: VolumeId,
   size: SizeClass,
 ) -> ReplyBody {
-  let (handle, record) = match find(state, volume) {
+  use crate::merge_service::{StoreVerb, find_store_backed};
+  let (handle, record) = match find_store_backed(state, volume, StoreVerb::Resize) {
     Ok(x) => x,
     Err(r) => return *r,
   };
@@ -3402,6 +3519,9 @@ fn resize(
 }
 
 fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> ReplyBody {
+  if let Some(reply) = crate::merge_service::destroy_merge_volume(state, principal, volume) {
+    return reply;
+  }
   let (handle, record) = match find(state, volume) {
     Ok(x) => x,
     Err(r) => return *r,
@@ -3510,6 +3630,9 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
 }
 
 fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> ReplyBody {
+  if let Some(reply) = crate::merge_service::status_merge_volume(state, principal, volume) {
+    return reply;
+  }
   let (handle, record) = match find(state, volume) {
     Ok(x) => x,
     Err(r) => return *r,
@@ -3603,7 +3726,7 @@ fn committed_placement(
 /// the volume's **epoch** being zero, never the head id being the default: the first snapshot a volume
 /// takes lands in slab slot 0 at generation 0, whose wire id is exactly the default — so a check on the id
 /// mistook every volume's first snapshot for none and reported the creation head's placement instead.
-fn placed_state(state: &ShardState, record: &VolumeRecord) -> PlacedState {
+pub(crate) fn placed_state(state: &ShardState, record: &VolumeRecord) -> PlacedState {
   let region = if record.epoch == 0 {
     // No snapshot yet: the catalog register itself is locally committed, so at `f = 0` the
     // head is placed (nothing to replicate until a seal). The placement object is the volume's full
@@ -3977,7 +4100,8 @@ fn base_of(
   verb: &str,
   write: bool,
 ) -> Result<Handle<VolumeSlot>, Box<ReplyBody>> {
-  let (handle, record) = find(state, volume)?;
+  use crate::merge_service::{StoreVerb, find_store_backed};
+  let (handle, record) = find_store_backed(state, volume, StoreVerb::Base)?;
   let rights = rights_of(&record, principal);
   if (write && !rights.write) || (!write && !rights.read) {
     return Err(Box::new(forbidden(verb)));
@@ -4460,7 +4584,24 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
 /// good version, logged, rather than presenting a wrong later state.
 fn rebuild_green(state: &mut ShardState, record: &VolumeRecord) {
   let chain: Vec<Vec<u8>> = state.db.partition().green_chain(record.id).to_vec();
-  let mut green = slates_merge::engine::Green::new();
+  // A base-seeded green re-seeds its origin (version 0) before the chain replays over it; a corrupt
+  // origin stops the rebuild there, logged, rather than replaying the chain over an empty version 0.
+  let mut green = match state.db.partition().green_origin(record.id) {
+    None => slates_merge::engine::Green::new(),
+    Some(bytes) => match slates_merge::origin::Origin::decode(bytes) {
+      Ok(origin) => slates_merge::engine::Green::with_origin(&origin),
+      Err(e) => {
+        eprintln!(
+          "slates-server: partition {}: green {} origin is corrupt, replay stops: {e}",
+          state.partition, record.name
+        );
+        state
+          .greens
+          .insert(record.id, slates_merge::engine::Green::new());
+        return;
+      }
+    },
+  };
   for (version, bytes) in chain.iter().enumerate() {
     match slates_merge::engine::Increment::decode(bytes) {
       Ok(inc) => {

@@ -918,19 +918,28 @@ impl Partition {
     }
     p.audit = snapshot.audit.clone();
     for chain in &snapshot.green_chains {
-      let bytes: usize = chain.increments.iter().map(Vec::len).sum();
-      p.green_chain_bytes = p.green_chain_bytes.saturating_add(bytes);
-      if !chain.increments.is_empty() {
-        p.green_chains.insert(chain.green, chain.increments.clone());
-      }
-      if let Some(origin) = &chain.origin {
-        p.green_chain_bytes = p.green_chain_bytes.saturating_add(origin.len());
-        p.green_origins.insert(chain.green, origin.clone());
-      }
+      p.restore_green_chain(chain);
     }
     for c in &snapshot.consumers {
       p.consumers.insert(c.consumer, c.clone());
     }
     Ok(p)
+  }
+
+  /// Restores one green's chain and origin from a snapshot, charging both to the chain budget; a
+  /// green carried with no increment (a seeded green before its first merge) gets no empty chain
+  /// entry, so the restored tables equal the live ones.
+  fn restore_green_chain(&mut self, chain: &GreenChain) {
+    let bytes: usize = chain.increments.iter().map(Vec::len).sum();
+    self.green_chain_bytes = self.green_chain_bytes.saturating_add(bytes);
+    if !chain.increments.is_empty() {
+      self
+        .green_chains
+        .insert(chain.green, chain.increments.clone());
+    }
+    if let Some(origin) = &chain.origin {
+      self.green_chain_bytes = self.green_chain_bytes.saturating_add(origin.len());
+      self.green_origins.insert(chain.green, origin.clone());
+    }
   }
 }

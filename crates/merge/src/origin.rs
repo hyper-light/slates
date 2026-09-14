@@ -64,7 +64,9 @@ impl Origin {
     dedup_by_key(&mut self.modes, |(path, _)| path.clone());
     dedup_by_key(&mut self.symlinks, |(path, _)| path.clone());
     dedup_by_key(&mut self.hardlinks, |(path, _)| path.clone());
-    dedup_by_key(&mut self.xattrs, |(path, name, _)| (path.clone(), name.clone()));
+    dedup_by_key(&mut self.xattrs, |(path, name, _)| {
+      (path.clone(), name.clone())
+    });
   }
 
   /// The canonical bytes: the magic and version, then each table as a count and its entries, every

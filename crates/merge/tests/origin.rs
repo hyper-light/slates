@@ -57,7 +57,10 @@ fn an_origin_encodes_canonically_and_round_trips() {
     fixed_origin_reversed().encode(),
     "declaration order does not reach the encoding"
   );
-  assert_eq!(fixed_origin().identity(), fixed_origin_reversed().identity());
+  assert_eq!(
+    fixed_origin().identity(),
+    fixed_origin_reversed().identity()
+  );
   let decoded = Origin::decode(&bytes).expect("decodes");
   let mut canonical = fixed_origin();
   canonical.canonicalize();
@@ -98,12 +101,11 @@ fn a_malformed_origin_is_refused_typed_at_every_cut() {
   );
 }
 
-/// A green seeded from an origin is at version 0 holding the origin's state; an increment based on
-/// version 0 that edits an origin file merges on the fast path (last changed at 0 ≤ base 0) and the
-/// origin reconstructs as `base_at(0)` after the head moved.
+/// A green seeded from an origin is at version 0 holding every dimension of the origin's state,
+/// with nothing changed after version 0.
 #[test]
-fn a_green_seeded_from_an_origin_is_at_version_zero_and_merges_on_the_fast_path() {
-  let mut green = Green::with_origin(&fixed_origin());
+fn a_green_seeded_from_an_origin_holds_it_at_version_zero() {
+  let green = Green::with_origin(&fixed_origin());
   assert_eq!(green.head(), 0, "the origin is not a delta");
   assert_eq!(green.content("README"), Some(b"hello\n".as_slice()));
   assert!(green.is_dir("src"));
@@ -112,7 +114,14 @@ fn a_green_seeded_from_an_origin_is_at_version_zero_and_merges_on_the_fast_path(
   assert_eq!(green.hardlink("alias"), Some("README"));
   assert_eq!(green.xattr("README", "user.k"), Some(b"v".as_slice()));
   assert!(green.changed_since(0).is_empty(), "nothing changed after 0");
+}
 
+/// An increment based on version 0 that edits an origin file merges on the fast path (last changed
+/// at 0 ≤ base 0), and the origin reconstructs as `base_at(0)` and `content_at(_, 0)` after the head
+/// moved.
+#[test]
+fn an_origin_file_merges_on_the_fast_path_and_version_zero_reconstructs() {
+  let mut green = Green::with_origin(&fixed_origin());
   let before = green.fast_path_hits();
   let outcome = green.submit(&Build::new().overwrite("README", 0, b"HELLO").at(1, 0));
   assert_eq!(outcome, Outcome::Accepted { version: 1 });
@@ -226,5 +235,8 @@ fn an_increments_evidence_round_trips_and_a_wild_count_is_refused() {
   );
   let mut padded = bytes;
   padded.push(0);
-  assert_eq!(Increment::decode(&padded), Err(DocDecodeError::TrailingBytes));
+  assert_eq!(
+    Increment::decode(&padded),
+    Err(DocDecodeError::TrailingBytes)
+  );
 }

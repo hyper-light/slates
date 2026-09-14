@@ -981,11 +981,7 @@ impl Client {
   }
 
   /// Takes a read's bytes within `spin_ns`.
-  pub fn read_spin(
-    &mut self,
-    id: RequestId,
-    spin_ns: u64,
-  ) -> Result<Option<Vec<u8>>, ClientError> {
+  pub fn read_spin(&mut self, id: RequestId, spin_ns: u64) -> Result<Option<Vec<u8>>, ClientError> {
     self.spin_as(id, spin_ns, extract_read)
   }
 

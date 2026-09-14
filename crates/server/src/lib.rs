@@ -30,6 +30,7 @@ pub mod error;
 pub mod fleet;
 pub mod head;
 pub mod landing;
+pub mod merge_service;
 // The NFS mount transport is the macOS/Linux mount path (Windows mounts through WinFsp); it rides the
 // Unix-only `slates_rt::tcp`, so it is gated off Windows. A Windows daemon serves IPC clients and lands
 // (both cross-platform) but does not serve NFS — the mount arrives with the WinFsp bridge.
