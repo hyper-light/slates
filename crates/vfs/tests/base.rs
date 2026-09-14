@@ -790,6 +790,86 @@ fn a_digest_computed_inside_the_racy_window_is_not_cached() {
   assert_eq!(stats(&vol).revalidated, 1);
 }
 
+/// §4.15 "watcher hints backed by revalidation" (T-1.21): a hint naming a directory makes the
+/// plane re-verify every digest kept beneath it against the disk — the hint triggers the check,
+/// the fingerprint decides — so an outsider's replacement is dropped and the next export hashes
+/// the new bytes, while the untouched neighbour survives the same hint and is reused; a later
+/// hint with nothing changed beneath the kept digests (an outsider created another file) re-checks
+/// and keeps them all. A hint alone never yields a digest.
+#[test]
+fn a_watcher_hint_revalidates_kept_digests_and_drops_only_the_changed() {
+  let mut host = SimHost::new();
+  host.mkdir("/d");
+  host.replace_file("/d/a", b"a one");
+  host.replace_file("/d/b", b"b one");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  digest_of(&mut vol, &mut host, &mut store, "/d/a").unwrap();
+  digest_of(&mut vol, &mut host, &mut store, "/d/b").unwrap();
+  assert_eq!(stats(&vol).cached, 2);
+  assert_hint_drops_only_the_replaced(&mut vol, &mut host, &mut store);
+  assert_hint_with_no_change_keeps(&mut vol, &mut host, &mut store);
+}
+
+/// An outsider replaces `a`: the watched directory hints; both kept digests beneath it are
+/// re-verified, only `a`'s is dropped, `a` is hashed again and `b` is reused.
+fn assert_hint_drops_only_the_replaced(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
+  host.replace_file("/d/a", b"a two");
+  host.advance_ns(2);
+  vol.with_host(host).status(store).unwrap();
+  assert_eq!(
+    stats(vol).hint_rechecked,
+    2,
+    "both digests beneath /d were re-verified"
+  );
+  assert_eq!(stats(vol).stale, 1, "only the replaced one was dropped");
+  assert_eq!(stats(vol).cached, 1);
+  let a = digest_of(vol, host, store, "/d/a").unwrap();
+  assert_eq!(a.identity, *blake3::hash(b"a two").as_bytes());
+  assert_eq!(stats(vol).computed, 3, "the replaced file was hashed again");
+  digest_of(vol, host, store, "/d/b").unwrap();
+  assert_eq!(stats(vol).revalidated, 1, "the neighbour was reused");
+  assert_eq!(stats(vol).cached, 2);
+}
+
+/// A hint with nothing changed beneath the kept digests (an outsider created `c`): both are
+/// re-verified and kept, and the next export is reused.
+fn assert_hint_with_no_change_keeps(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
+  host.replace_file("/d/c", b"c one");
+  host.advance_ns(2);
+  vol.with_host(host).status(store).unwrap();
+  assert_eq!(stats(vol).hint_rechecked, 4);
+  assert_eq!(stats(vol).stale, 1, "nothing beneath the hint had changed");
+  assert_eq!(stats(vol).cached, 2);
+  digest_of(vol, host, store, "/d/b").unwrap();
+  assert_eq!(stats(vol).revalidated, 2);
+}
+
+/// §4.15 "watcher overflow invalidates affected cache knowledge": on an overflow the watcher lost
+/// events, so every kept digest is dropped (counted) and returned to the shard, and the next
+/// export hashes again rather than trust knowledge the hints can no longer protect.
+#[test]
+fn a_watcher_overflow_drops_every_kept_digest() {
+  let mut host = SimHost::new();
+  host.replace_file("/a", b"a");
+  host.replace_file("/b", b"b");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  digest_of(&mut vol, &mut host, &mut store, "/a").unwrap();
+  digest_of(&mut vol, &mut host, &mut store, "/b").unwrap();
+  assert_eq!(stats(&vol).cached, 2);
+  host.watcher_overflow();
+  vol.with_host(&mut host).status(&mut store).unwrap();
+  assert_eq!(stats(&vol).dropped_on_overflow, 2);
+  assert_eq!(stats(&vol).cached, 0);
+  assert_eq!(store.digests.live(), 0, "every slot went back to the shard");
+  digest_of(&mut vol, &mut host, &mut store, "/a").unwrap();
+  assert_eq!(stats(&vol).computed, 3, "hashed again after the overflow");
+  assert_eq!(stats(&vol).revalidated, 0);
+}
+
 // ------------------------------------------------------------------ the oracle (T-1.10, AC-1.10)
 
 /// One step of a generated history: the agent's or an outsider's.

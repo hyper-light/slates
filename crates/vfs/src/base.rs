@@ -145,6 +145,12 @@ pub struct DigestStats {
   /// Digests not kept because they were computed inside the racy window (§4.5): a same-tick
   /// write could change the bytes without moving the fingerprint.
   pub racy_uncached: u64,
+  /// Kept digests re-verified against the disk because a watcher hint named their directory
+  /// (§4.15 "watcher hints backed by revalidation"); the stale ones count under `stale` too.
+  pub hint_rechecked: u64,
+  /// Kept digests dropped because the watcher overflowed (§4.15 "watcher overflow invalidates
+  /// affected cache knowledge").
+  pub dropped_on_overflow: u64,
   /// Digests held now.
   pub cached: u64,
 }
@@ -377,14 +383,17 @@ impl BasePlane {
     Ok(())
   }
 
-  /// Drops every kept digest (a destroy): every slot goes back to the shard.
-  pub(crate) fn drop_all_digests(&mut self, store: &mut Store) {
+  /// Drops every kept digest (a destroy, a watcher overflow): every slot goes back to the shard;
+  /// how many were dropped.
+  pub(crate) fn drop_all_digests(&mut self, store: &mut Store) -> u64 {
+    let dropped = u64::try_from(self.digests.len()).unwrap_or(u64::MAX);
     for _ in 0..self.digests.len() {
       store.digests.give();
     }
     self.digests.clear();
     self.digests_by_dir.clear();
     self.digest_stats.cached = 0;
+    dropped
   }
 }
 
@@ -781,8 +790,14 @@ impl Overlay<'_> {
     if let Some(f) = self.plane()?.descriptors.remove(&no) {
       self.host.close_file(f);
     }
-    // The listing says the disk moved beneath the entry: a digest kept for it is stale knowledge.
-    if self.plane()?.forget_digest(store, no) {
+    // A relist refreshes every untouched entry, changed or not; a kept digest is stale knowledge
+    // only when the listing's fingerprint no longer matches the one it was verified under.
+    let moved = self
+      .plane()?
+      .digests
+      .get(&no)
+      .is_some_and(|kept| kept.fingerprint != fp);
+    if moved && self.plane()?.forget_digest(store, no) {
       self.plane()?.digest_stats.stale += 1;
     }
     self.adopt_fingerprint(store, no, fp)
@@ -1878,6 +1893,49 @@ impl Overlay<'_> {
     refusal
   }
 
+  /// A watcher hint named a directory: every digest kept for a file homed there is re-verified
+  /// against the disk now — the hint triggers the check, the fingerprint decides (§4.15 "watcher
+  /// hints backed by revalidation"; "hints alone never prove a source unchanged") — and one the
+  /// disk no longer matches is dropped as stale. Bounded by the digests kept beneath the
+  /// directory, which the shard's budget bounds.
+  fn revalidate_digests_under(&mut self, store: &mut Store, dir_no: InodeNo) {
+    let kept: Vec<InodeNo> = self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|b| b.digests_by_dir.get(&dir_no))
+      .map(|homed| homed.iter().copied().collect())
+      .unwrap_or_default();
+    for no in kept {
+      let Some(cached) = self
+        .vol
+        .base
+        .as_ref()
+        .and_then(|b| b.digests.get(&no).copied())
+      else {
+        continue;
+      };
+      let now = self.fingerprint_at_path(store, no);
+      let Some(plane) = self.vol.base.as_mut() else {
+        return;
+      };
+      plane.digest_stats.hint_rechecked += 1;
+      if now != Some(cached.fingerprint) && plane.forget_digest(store, no) {
+        plane.digest_stats.stale += 1;
+      }
+    }
+  }
+
+  /// The fingerprint of the entry at its disk path right now, or `None` when the path no longer
+  /// holds a file the host can open.
+  fn fingerprint_at_path(&mut self, store: &Store, no: InodeNo) -> Option<Fingerprint> {
+    let (dir, name) = self.home_of(store, no).ok()?;
+    let file = self.host.open_file(dir, &name).ok()?;
+    let fingerprint = self.host.fstat(file).ok();
+    self.host.close_file(file);
+    fingerprint
+  }
+
   // ---------------------------------------------------------------- drift
 
   /// Re-checks a witnessed entry against the disk (§4.5): what the held descriptor serves is
@@ -2021,8 +2079,9 @@ impl Overlay<'_> {
     })
   }
 
-  /// Drains the watcher's hints: a changed directory invalidates its listing and re-checks
-  /// the witnessed entries homed there; an overflow invalidates everything and re-checks all.
+  /// Drains the watcher's hints: a changed directory invalidates its listing, re-checks the
+  /// witnessed entries homed there and re-verifies the digests kept beneath it; an overflow
+  /// invalidates everything, re-checks every witness and drops every kept digest (§4.15).
   pub fn process_hints(&mut self, store: &mut Store) -> Result<(), VfsError> {
     let hints = self.host.hints();
     let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
@@ -2067,6 +2126,14 @@ impl Overlay<'_> {
       .collect();
     for no in targets {
       let _ = self.check_drift(store, no);
+    }
+    if all {
+      let dropped = self.plane()?.drop_all_digests(store);
+      self.plane()?.digest_stats.dropped_on_overflow += dropped;
+    } else {
+      for dir_no in dirs {
+        self.revalidate_digests_under(store, dir_no);
+      }
     }
     Ok(())
   }

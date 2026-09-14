@@ -11,15 +11,40 @@ use std::path::PathBuf;
 use slates_base::OsHost;
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
-use slates_vfs::base::BaseConfig;
+use slates_vfs::base::{BaseConfig, DigestStats};
 use slates_vfs::clock::StepClock;
-use slates_vfs::host::{HostError, HostFs, HostKind, WatchState};
+use slates_vfs::error::VfsError;
+use slates_vfs::host::{HostDir, HostError, HostFacts, HostFs, HostKind, WatchState};
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::Quota;
 use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
 
 /// Format: the page size the tests build stores with.
 const PAGE: usize = 4096;
+
+/// An overlay volume over an opened host root, the fixture of the digest differentials.
+fn overlay_over(store: &mut Store, root: HostDir, facts: HostFacts) -> Volume {
+  Volume::create_overlay(
+    store,
+    VolumeConfig {
+      prefix: 7,
+      names: NameEquivalence::Exact,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 20,
+      clock: Box::new(StepClock::new(1_000_000_000, 1_000)),
+    },
+    BaseConfig {
+      root,
+      facts,
+      large_class_bytes: 1 << 16,
+    },
+  )
+  .unwrap()
+}
+
+fn digest_stats(vol: &Volume) -> DigestStats {
+  vol.base_plane().unwrap().digest_stats()
+}
 
 fn crates_dir() -> PathBuf {
   PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -182,6 +207,119 @@ fn an_overlay_over_the_workspace_tree_costs_one_open_and_reads_the_disk() {
       WatchState::Live
     }
   );
+}
+
+/// §4.15 on a real tree, the differential against the host filesystem (always on, read only): the
+/// digest of an untouched file under an overlay over `crates/` is the BLAKE3 of the bytes the
+/// standard library reads from the same file, with its length; a directory refuses as itself.
+#[test]
+fn an_overlay_over_the_workspace_tree_digests_a_file_as_the_disk_holds_it() {
+  let (mut host, root) = OsHost::open_root(&crates_dir()).unwrap();
+  let facts = host.facts(root).unwrap();
+  let mut store = store();
+  let mut vol = overlay_over(&mut store, root, facts);
+  let expected = std::fs::read(crates_dir().join("vfs/Cargo.toml")).unwrap();
+  let digest = vol
+    .with_host(&mut host)
+    .digest(&mut store, "/vfs/Cargo.toml")
+    .unwrap();
+  assert_eq!(digest.identity, *blake3::hash(&expected).as_bytes());
+  assert_eq!(digest.size, u64::try_from(expected.len()).unwrap());
+  assert_eq!(
+    vol.with_host(&mut host).digest(&mut store, "/vfs"),
+    Err(VfsError::IsDirectory)
+  );
+  assert_eq!(digest_stats(&vol).computed, 1);
+}
+
+/// Shape: the pause that lets a RAM filesystem's timestamp tick close so a digest may be kept
+/// (nanosecond granularity on tmpfs and APFS, a microsecond clock resolution on macOS): two
+/// milliseconds, far past both.
+#[cfg(unix)]
+const TICK: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Over a RAM-backed directory (skipped loudly without `SLATES_TEST_RAMDIR`), the watcher leg of
+/// §4.15 on a real filesystem: a kept digest follows the disk through the real watcher — a
+/// replacement by rename hints the directory, the hint's revalidation drops the kept digest, and
+/// the next export names the new bytes; a later change elsewhere in the directory hints again,
+/// re-verifies the kept digest and keeps it, and the export after it is reused.
+#[cfg(unix)]
+#[test]
+fn a_ram_directory_digest_follows_the_disk_through_the_watcher() {
+  let Some(base) = std::env::var_os("SLATES_TEST_RAMDIR") else {
+    println!("host: skipped — SLATES_TEST_RAMDIR is not set (name a RAM-backed directory)");
+    return;
+  };
+  let dir = PathBuf::from(base).join(format!("slates-digest-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir(&dir).unwrap();
+  std::fs::write(dir.join("f"), b"one").unwrap();
+  std::thread::sleep(TICK);
+
+  let (mut host, root) = OsHost::open_root(&dir).unwrap();
+  let facts = host.facts(root).unwrap();
+  let mut store = store();
+  let mut vol = overlay_over(&mut store, root, facts);
+  let first = vol.with_host(&mut host).digest(&mut store, "/f").unwrap();
+  assert_eq!(first.identity, *blake3::hash(b"one").as_bytes());
+  assert_eq!(digest_stats(&vol).cached, 1, "the tick had closed: kept");
+  let rechecks = assert_replacement_hint_drops_the_digest(&mut vol, &mut host, &mut store, &dir);
+  assert_unrelated_change_hint_keeps_the_digest(&mut vol, &mut host, &mut store, &dir, rechecks);
+  std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Replace `f` by rename (a new inode at the name): the real watcher hints the directory, the
+/// hint's revalidation drops the kept digest, and the next export names the new bytes. Returns
+/// the hint re-checks so far.
+#[cfg(unix)]
+fn assert_replacement_hint_drops_the_digest(
+  vol: &mut Volume,
+  host: &mut OsHost,
+  store: &mut Store,
+  dir: &std::path::Path,
+) -> u64 {
+  std::fs::write(dir.join("f.tmp"), b"two").unwrap();
+  std::fs::rename(dir.join("f.tmp"), dir.join("f")).unwrap();
+  vol.with_host(host).status(store).unwrap();
+  let after_hint = digest_stats(vol);
+  assert!(
+    after_hint.hint_rechecked >= 1,
+    "the hint re-verified the kept digest: {after_hint:?}"
+  );
+  assert_eq!(
+    after_hint.stale, 1,
+    "the replaced file's digest was dropped"
+  );
+  assert_eq!(after_hint.cached, 0);
+  let second = vol.with_host(host).digest(store, "/f").unwrap();
+  assert_eq!(second.identity, *blake3::hash(b"two").as_bytes());
+  after_hint.hint_rechecked
+}
+
+/// The tick closes and the digest is kept; a change elsewhere in the directory hints, the kept
+/// digest is re-verified and survives, and the next export reuses it.
+#[cfg(unix)]
+fn assert_unrelated_change_hint_keeps_the_digest(
+  vol: &mut Volume,
+  host: &mut OsHost,
+  store: &mut Store,
+  dir: &std::path::Path,
+  rechecks_before: u64,
+) {
+  std::thread::sleep(TICK);
+  vol.with_host(host).digest(store, "/f").unwrap();
+  assert_eq!(digest_stats(vol).cached, 1);
+  std::fs::write(dir.join("g"), b"other").unwrap();
+  vol.with_host(host).status(store).unwrap();
+  let rechecked = digest_stats(vol);
+  assert!(rechecked.hint_rechecked > rechecks_before, "{rechecked:?}");
+  assert_eq!(
+    rechecked.stale, 1,
+    "nothing beneath the kept digest changed"
+  );
+  assert_eq!(rechecked.cached, 1);
+  vol.with_host(host).digest(store, "/f").unwrap();
+  assert_eq!(digest_stats(vol).revalidated, 1, "reused after the hint");
 }
 
 /// Over a RAM-backed directory: a held descriptor keeps serving a file replaced beneath it, a
