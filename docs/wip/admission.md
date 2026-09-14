@@ -168,13 +168,26 @@ sparse writer: sixteen one-byte windows admitted, the seventeenth refused, the a
 the quota; a truncate returns the pages a window no longer takes) and the model oracle (7 passed,
 400 histories each) after the change.
 
+## 4b. The charge oracle (piece 1, third commit)
+
+`crates/vfs/tests/charge_oracle.rs`: 150 generated histories of 1–40 steps — writes of 1–48 pages
+at page offsets in the first four windows of three files, truncates to arbitrary lengths, edits
+(splices), unlinks, snapshots (three live at most) and snapshot destroys in every order — over a
+store holding a neighbour's reservation of three quarters of the shard and the volume's own eighth.
+After every step: `allocated_bytes == referenced_bytes + retained_bytes` (the arena holds exactly
+the head's charged blocks plus the retained ones — allocator rounding, chunk ownership and the
+retention charge agreeing to the byte); `committed == reservations + retained_bytes ≤ capacity`;
+every reserved byte not yet used is physically free; `retention_shortfall_bytes == 0`; a refused
+step changed nothing (accounting, arena, chunk count, ledger, retained bytes, and every file's
+bytes); every file reads back its shadow. At the end the neighbour writes its whole reservation in
+whole windows and every write lands. Unlike `model.rs`, these histories destroy snapshots, which is
+where a chunk freed twice or too early shows (the C1 defect's class). `cargo test -p slates-vfs
+--test charge_oracle`: 1 passed, 150 cases, 2.35 s.
+
 ## 5. Owed (this charter)
 
 1. ~~Allocator rounding in the write charge~~ — done (§4a).
-2. **The generated-history charge oracle** (proptest): writes, truncates, edits, unlinks, snapshots
-   and snapshot destroys over a store holding a neighbour's reservation; at every step the arena's
-   allocated bytes equal the head's charged blocks plus the retained bytes, every refusal changes
-   nothing, and the neighbour's whole entitlement lands.
+2. ~~The generated-history charge oracle~~ — done (§4b).
 3. **Metadata and transient bytes** (piece 1b): the per-volume journal (`journal_bytes`, a heap
    `VecDeque` bounded per volume) and the fixed per-volume record cost charged as part of the
    volume's claim against a metadata ledger; the client regions and guest request buffers
