@@ -14,6 +14,7 @@ use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
 use slates_vfs::clock::HostClock;
+use slates_vfs::error::VfsError;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::{BudgetGrowth, Quota};
 use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
@@ -374,6 +375,129 @@ fn open_handles_are_reused_so_memory_stays_bounded() {
     format!("{bridge:?}"),
     "open/release cycles reuse slots and leak no handles"
   );
+}
+
+/// A scratch volume with one closed file and the lent-in handle map (`attached`), whose occupancy
+/// and allocated slots the AC-3.12 tests observe from outside: `(store, volume, handles, root,
+/// the file's inode)`.
+fn lent_handles_fixture() -> (Store, Volume, slates_mem::Slab<u64>, u64, u64) {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut handles = slates_bridge_core::new_handle_store();
+  let cx = rw_cx();
+  let (root, ino) = {
+    let mut bridge = VolumeBridge::attached(
+      VolumeId { bytes: [0; 16] },
+      &mut vol,
+      &mut store,
+      &mut handles,
+      None,
+    );
+    let root = bridge.root(&cx).unwrap();
+    let (attr, fh) = bridge.create(oid(root), &cx, "h", 0o644, 0).unwrap();
+    bridge.release(oid(attr.ino), &cx, fh).unwrap();
+    (root, attr.ino)
+  };
+  (store, vol, handles, root, ino)
+}
+
+/// AC-3.12/T-3.15: open/close beyond the handle arena's capacity in *total operations* reuses
+/// generational slots with bounded memory — more cycles than the arena has slots leave one
+/// segment allocated (well under the capacity) and no handle open.
+#[test]
+fn open_close_beyond_the_arena_capacity_reuses_slots_with_bounded_memory() {
+  let (mut store, mut vol, mut handles, _root, ino) = lent_handles_fixture();
+  let capacity = handles.max_slots();
+  let cx = rw_cx();
+  {
+    let mut bridge = VolumeBridge::attached(
+      VolumeId { bytes: [0; 16] },
+      &mut vol,
+      &mut store,
+      &mut handles,
+      None,
+    );
+    for _ in 0..=capacity {
+      let fh = bridge.open(oid(ino), &cx, 0).unwrap();
+      bridge.release(oid(ino), &cx, fh).unwrap();
+    }
+  }
+  assert_eq!(handles.len(), 0, "nothing left open");
+  assert!(
+    handles.slots() < capacity,
+    "{} slots allocated for one concurrent open across {} operations: bounded memory",
+    handles.slots(),
+    capacity + 1
+  );
+}
+
+/// AC-3.12/T-3.15: a stale handle from a reused slot never acts on the slot's new holder — open
+/// A, release it, open B (the same slot, a new generation); releasing A's handle again must not
+/// drop B's open reference, which still keeps the inode alive across an unlink, and B's own
+/// release reclaims it.
+#[test]
+fn a_stale_handle_from_a_reused_slot_never_acts_on_the_slots_new_holder() {
+  let (mut store, mut vol, mut handles, root, ino) = lent_handles_fixture();
+  let cx = rw_cx();
+  let mut bridge = VolumeBridge::attached(
+    VolumeId { bytes: [0; 16] },
+    &mut vol,
+    &mut store,
+    &mut handles,
+    None,
+  );
+  let stale = bridge.open(oid(ino), &cx, 0).unwrap();
+  bridge.release(oid(ino), &cx, stale).unwrap();
+  let live = bridge.open(oid(ino), &cx, 0).unwrap();
+  assert_ne!(stale, live, "the reused slot carries a new generation");
+  bridge.release(oid(ino), &cx, stale).unwrap();
+  bridge.unlink(oid(root), &cx, "h").unwrap();
+  assert!(
+    bridge.getattr(oid(ino), &cx).is_ok(),
+    "the stale release touched nothing: the live open still pins the unlinked inode"
+  );
+  bridge.release(oid(ino), &cx, live).unwrap();
+  assert!(
+    bridge.getattr(oid(ino), &cx).is_err(),
+    "reclaimed by the live release"
+  );
+}
+
+/// AC-3.12/T-3.15: at the arena's bound the next open is a typed refusal (the FUSE edge's
+/// `EMFILE`), one release makes room for exactly one more, and releasing everything empties the
+/// map.
+#[test]
+fn an_open_past_the_handle_bound_is_a_typed_refusal_lifted_by_one_release() {
+  let (mut store, mut vol, mut handles, _root, ino) = lent_handles_fixture();
+  let capacity = handles.max_slots();
+  let cx = rw_cx();
+  {
+    let mut bridge = VolumeBridge::attached(
+      VolumeId { bytes: [0; 16] },
+      &mut vol,
+      &mut store,
+      &mut handles,
+      None,
+    );
+    let mut open = Vec::with_capacity(capacity);
+    while open.len() < capacity {
+      open.push(bridge.open(oid(ino), &cx, 0).unwrap());
+    }
+    assert!(
+      matches!(
+        bridge.open(oid(ino), &cx, 0),
+        Err(VfsError::Memory(slates_mem::MemError::SlabFull { .. }))
+      ),
+      "the open past the bound is a typed refusal"
+    );
+    let freed = open.pop().unwrap();
+    bridge.release(oid(ino), &cx, freed).unwrap();
+    open.push(bridge.open(oid(ino), &cx, 0).unwrap());
+    for fh in open.drain(..) {
+      bridge.release(oid(ino), &cx, fh).unwrap();
+    }
+  }
+  assert_eq!(handles.len(), 0);
 }
 
 /// A write under a read-only attachment is refused before any effect, though a read is allowed

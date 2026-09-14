@@ -15,7 +15,7 @@ slates-bridge-core = { workspace = true }
 slates-mem = { workspace = true }
 slates-base = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
 [dev-dependencies]

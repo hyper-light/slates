@@ -23,7 +23,7 @@ pub mod bridge;
 pub mod channel;
 pub mod error;
 pub mod init;
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod mount;
 pub mod notify;
 pub mod reply;
