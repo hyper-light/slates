@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use slates_ipc::protocol::{
   AttachRequest, AttachTransport, AttachmentCapability, Conformance, DeleteWhileOpen, Direction,
   Established, HostPathReason, Intent, KernelCache, NamePolicy, ReadWritePolicy, Refusal,
-  ReplyBody, RequestBody, SizeClass, StatusReport, TargetPathConstraint, TransportReport,
-  UnsupportedReason, VolumeId, pack, unpack,
+  ReplyBody, RequestBody, Residency, SizeClass, StatusReport, TargetPathConstraint,
+  TransportReport, UnsupportedReason, VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
@@ -435,6 +435,90 @@ fn the_container_bind_is_offered_exactly_when_a_host_mount_is() {
       Some(UnsupportedReason::HostMountRequired)
     );
   }
+  drop(client);
+  drop(daemon);
+}
+
+/// The refusal of a guest form requested over the ring, with the volume proven untouched afterwards.
+fn refused_guest(client: &mut Client, id: VolumeId, transport: AttachTransport) -> Refusal {
+  let ReplyBody::Refused { refusal } = client.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: Intent::Read,
+    form: AttachRequest::Guest { transport },
+  }) else {
+    panic!("a guest device was established over the ring");
+  };
+  let after = status(client, id);
+  assert_eq!(after.attachments, 0, "nothing recorded");
+  refusal
+}
+
+/// The guest entries carry the device's own facts: the in-process seam served — the guest mounts a
+/// tag, the bytes reach the guest's page cache, DAX is never mapped (AC-4.12), the evidence is the
+/// simulated guest driver until a live guest runs (AC-9.7) — and the inherited-descriptor binding
+/// refused with the device's own reason.
+fn assert_guest_entries(transports: &TransportReport) {
+  let in_process = entry(transports, AttachTransport::VirtioFsInProcess);
+  assert!(in_process.supported, "the in-process seam is served");
+  assert_eq!(in_process.target_path, TargetPathConstraint::GuestTag);
+  assert_eq!(in_process.conformance, Conformance::SimulatedGuestDriver);
+  assert_eq!(
+    in_process.residency,
+    Residency::DaemonRamAndGuestPageCache { dax_mapped: false },
+    "DAX is never advertised (AC-4.12)"
+  );
+  assert!(in_process.sharing.server_open_state);
+  assert_eq!(
+    in_process.sharing.delete_while_open,
+    DeleteWhileOpen::Unlinked
+  );
+  let inherited = entry(transports, AttachTransport::VirtioFsInheritedDescriptor);
+  assert_eq!(
+    inherited.unsupported_reason,
+    Some(UnsupportedReason::BindingNotBuilt),
+    "the device's own reason, carried through"
+  );
+}
+
+/// A guest form asked for over the ring is refused typed: no VMM seam accompanies a ring request
+/// (the harness hands it in-process), the unbuilt binding says so itself, and a transport that is
+/// not a guest's is a bad request.
+fn assert_guest_requests_refused(client: &mut Client, id: VolumeId) {
+  assert_eq!(
+    refused_guest(client, id, AttachTransport::VirtioFsInProcess),
+    Refusal::AttachmentUnsupported {
+      transport: AttachTransport::VirtioFsInProcess,
+      reason: UnsupportedReason::SeamNotOnWire,
+    }
+  );
+  assert_eq!(
+    refused_guest(client, id, AttachTransport::VirtioFsInheritedDescriptor),
+    Refusal::AttachmentUnsupported {
+      transport: AttachTransport::VirtioFsInheritedDescriptor,
+      reason: UnsupportedReason::BindingNotBuilt,
+    }
+  );
+  assert!(
+    matches!(
+      refused_guest(client, id, AttachTransport::Oci),
+      Refusal::BadRequest { .. }
+    ),
+    "a host transport is not a guest form"
+  );
+}
+
+/// The guest transports report the device's own facts (§4.6 A-9 "must be reported by `attach` and
+/// `status`"; the device half of GAP-A9-5, `crates/bridge-virtiofs`), and a guest form asked for
+/// over the ring is refused typed with nothing recorded.
+#[test]
+fn the_guest_transports_report_the_devices_own_facts_and_a_ring_request_is_refused_typed() {
+  let (daemon, instance) = single_shard_daemon("attach-forms-guest");
+  let mut client = Client::connect(&instance);
+  let id = create(&mut client, "forms");
+  let report = status(&mut client, id);
+  assert_guest_entries(&report.transports);
+  assert_guest_requests_refused(&mut client, id);
   drop(client);
   drop(daemon);
 }

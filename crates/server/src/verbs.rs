@@ -3384,12 +3384,13 @@ fn establish_form(
   intent: Intent,
   form: &AttachRequest,
 ) -> Result<Option<OciBinding>, Refusal> {
-  let AttachRequest::Oci {
-    source,
-    destination,
-  } = form
-  else {
-    return Ok(None);
+  let (source, destination) = match form {
+    AttachRequest::Root => return Ok(None),
+    AttachRequest::Guest { transport } => return Err(guest_over_the_ring(situation, *transport)),
+    AttachRequest::Oci {
+      source,
+      destination,
+    } => (source, destination),
   };
   if let Some(reason) = crate::transports::oci(situation).unsupported_reason {
     return Err(Refusal::AttachmentUnsupported {
@@ -3405,6 +3406,28 @@ fn establish_form(
   }
   let read_only = matches!(intent, Intent::Read);
   crate::oci::bind(&record.name, source, destination, read_only).map(Some)
+}
+
+/// Why a guest form asked for over the ring is refused (§4.6 A-9 "Requesting an unsupported form
+/// returns `AttachmentUnsupported{transport, reason}`"): a transport that is not a guest's is a bad
+/// request; a guest transport the device refuses carries the device's own reason; one it serves still
+/// cannot be established here, because the VMM seam is handed to the daemon in-process by the harness
+/// (`Daemon::attach_guest_device`) and no seam accompanies a ring request.
+fn guest_over_the_ring(
+  situation: &crate::transports::Situation,
+  transport: AttachTransport,
+) -> Refusal {
+  match crate::transports::guest(situation, transport) {
+    None => Refusal::BadRequest {
+      reason: format!("{transport:?} is not a guest transport"),
+    },
+    Some(entry) => Refusal::AttachmentUnsupported {
+      transport,
+      reason: entry
+        .unsupported_reason
+        .unwrap_or(UnsupportedReason::SeamNotOnWire),
+    },
+  }
 }
 
 /// Takes (or renews) the volume's write lease for `principal` (D-16): the holder renews at its

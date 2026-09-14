@@ -478,7 +478,7 @@ fn capability_text(c: &slates_client::AttachmentCapability) -> String {
     slates_mcp::kernel_cache_text(c.sharing.cache),
     c.sharing.server_open_state,
     slates_mcp::delete_while_open_name(c.sharing.delete_while_open),
-    slates_mcp::residency_name(c.residency),
+    slates_mcp::residency_text(c.residency),
     slates_mcp::conformance_name(c.conformance),
   )
 }

@@ -941,6 +941,12 @@ pub enum AttachTransport {
   /// OCI runtime (§4.6 A-9 "A host OCI runtime passes the established host attachment into the
   /// container mount namespace"); slates records the authorized binding and reports the `mounts` entry.
   Oci,
+  /// The virtio-fs guest device over the in-process VMM seam (§4.6 A-9; `crates/bridge-virtiofs`):
+  /// the harness runs the VM in the daemon's process and hands the seam in, the guest mounts a tag.
+  VirtioFsInProcess,
+  /// The virtio-fs guest device over inherited descriptors (vhost-user): the seam models it; the
+  /// binding is not built.
+  VirtioFsInheritedDescriptor,
 }
 
 /// Where a transport puts the volume (§4.6 A-9 "target-path constraints").
@@ -955,6 +961,9 @@ pub enum TargetPathConstraint {
   ContainerDestination,
   /// A drive letter (an object-namespace junction), never a directory (§4.6 "Windows").
   DriveLetter,
+  /// A tag the guest mounts (`mount -t virtiofs <tag>`), assigned when the device is attached; no
+  /// host path exists, no directory is created, no socket is placed on disk (§4.6 A-9).
+  GuestTag,
 }
 
 /// What the attachment's rights let a consumer do through the transport (§4.6 A-9 "read/write policy").
@@ -1028,6 +1037,12 @@ pub enum Residency {
   /// The daemon's RAM, the host kernel's cache, and the VM's page cache over its share of the host path
   /// — every OCI runtime on macOS hosts its containers in a Linux VM.
   DaemonRamKernelCacheAndRuntimeVm,
+  /// The daemon's RAM and the guest kernel's page cache, written back through the device (R1); and
+  /// whether host memory is mapped into the guest (DAX) — never, until its gate is met (AC-4.12).
+  DaemonRamAndGuestPageCache {
+    /// Whether DAX mappings are advertised to the guest.
+    dax_mapped: bool,
+  },
 }
 
 /// The evidence behind a transport's report (§4.6 A-9 "conformance evidence"; AC-9.7 "A skipped lane
@@ -1043,6 +1058,9 @@ pub enum Conformance {
   LiveKernelMountTest,
   /// The same filesystem workload inside a real container and on the host (T-4.13).
   ContainerWorkloadTest,
+  /// The simulated guest driver's differential oracle against direct FUSE dispatch
+  /// (`crates/bridge-virtiofs`); no live guest has run (AC-9.7).
+  SimulatedGuestDriver,
 }
 
 /// Why a transport is not offered here: the `reason` of [`Refusal::AttachmentUnsupported`] and of a
@@ -1062,6 +1080,17 @@ pub enum UnsupportedReason {
   HostMountRequired,
   /// The host mount presents the volume's live head, so a snapshot cannot be bound through it.
   SnapshotNotPresentedByHostMount,
+  /// A guest device needs its VMM seam, which the harness hands to the daemon in-process
+  /// (`Daemon::attach_guest_device`); no seam accompanies a ring request.
+  SeamNotOnWire,
+  /// The inherited-descriptor (vhost-user / libkrun) VMM binding is not built; the in-process seam
+  /// is the served form (the device's own reason, `crates/bridge-virtiofs`).
+  BindingNotBuilt,
+  /// DAX was requested; the baseline contract does not require it and it cannot be advertised until
+  /// mapping isolation, pinning and teardown are established for the VMM (§4.6 A-9, AC-4.12).
+  DaxNotEstablished,
+  /// A notification queue was requested; `VIRTIO_FS_F_NOTIFICATION` is not offered.
+  NotificationQueueNotOffered,
 }
 
 /// One transport's report (§4.6 A-9: "supported transport, target-path constraints, read/write policy,
@@ -1127,6 +1156,12 @@ pub enum AttachRequest {
     source: String,
     /// The path inside the container (the bind's `destination`).
     destination: String,
+  },
+  /// A guest device over a guest transport (`VirtioFsInProcess`, `VirtioFsInheritedDescriptor`).
+  /// Refused over the ring: the VMM seam is handed to the daemon in-process by the harness.
+  Guest {
+    /// The guest transport.
+    transport: AttachTransport,
   },
 }
 

@@ -747,6 +747,8 @@ pub fn transport_name(transport: AttachTransport) -> &'static str {
     AttachTransport::Fskit => "fskit",
     AttachTransport::WinFsp => "winfsp",
     AttachTransport::Oci => "oci",
+    AttachTransport::VirtioFsInProcess => "virtiofs_in_process",
+    AttachTransport::VirtioFsInheritedDescriptor => "virtiofs_inherited_descriptor",
   }
 }
 
@@ -759,6 +761,10 @@ pub fn unsupported_reason_name(reason: UnsupportedReason) -> &'static str {
     UnsupportedReason::BridgeNotWired => "bridge_not_wired",
     UnsupportedReason::HostMountRequired => "host_mount_required",
     UnsupportedReason::SnapshotNotPresentedByHostMount => "snapshot_not_presented_by_host_mount",
+    UnsupportedReason::SeamNotOnWire => "seam_not_on_wire",
+    UnsupportedReason::BindingNotBuilt => "binding_not_built",
+    UnsupportedReason::DaxNotEstablished => "dax_not_established",
+    UnsupportedReason::NotificationQueueNotOffered => "notification_queue_not_offered",
   }
 }
 
@@ -769,6 +775,7 @@ pub fn target_path_name(target: TargetPathConstraint) -> &'static str {
     TargetPathConstraint::UserOwnedExistingDirectory => "user_owned_existing_directory",
     TargetPathConstraint::ContainerDestination => "container_destination",
     TargetPathConstraint::DriveLetter => "drive_letter",
+    TargetPathConstraint::GuestTag => "guest_tag",
   }
 }
 
@@ -786,6 +793,27 @@ pub fn residency_name(residency: Residency) -> &'static str {
     Residency::DaemonRam => "daemon_ram",
     Residency::DaemonRamAndKernelCache => "daemon_ram_and_kernel_cache",
     Residency::DaemonRamKernelCacheAndRuntimeVm => "daemon_ram_kernel_cache_and_runtime_vm",
+    Residency::DaemonRamAndGuestPageCache { .. } => "daemon_ram_and_guest_page_cache",
+  }
+}
+
+/// A residency boundary as text: its name, and for a guest whether DAX is mapped.
+pub fn residency_text(residency: Residency) -> String {
+  match residency {
+    Residency::DaemonRamAndGuestPageCache { dax_mapped } => {
+      format!("{}(dax_mapped={dax_mapped})", residency_name(residency))
+    }
+    other => residency_name(other).to_owned(),
+  }
+}
+
+/// A residency boundary as JSON: `{ "kind" }`, and for a guest the DAX fact.
+fn residency_json(residency: Residency) -> Value {
+  match residency {
+    Residency::DaemonRamAndGuestPageCache { dax_mapped } => {
+      json!({ "kind": residency_name(residency), "dax_mapped": dax_mapped })
+    }
+    other => json!({ "kind": residency_name(other) }),
   }
 }
 
@@ -796,6 +824,7 @@ pub fn conformance_name(conformance: Conformance) -> &'static str {
     Conformance::VerbLifecycleTest => "verb_lifecycle_test",
     Conformance::LiveKernelMountTest => "live_kernel_mount_test",
     Conformance::ContainerWorkloadTest => "container_workload_test",
+    Conformance::SimulatedGuestDriver => "simulated_guest_driver",
   }
 }
 
@@ -871,7 +900,7 @@ pub fn capability_json(c: &AttachmentCapability) -> Value {
       "cache": kernel_cache_json(c.sharing.cache),
       "delete_while_open": delete_while_open_name(c.sharing.delete_while_open),
     },
-    "residency": residency_name(c.residency),
+    "residency": residency_json(c.residency),
     "conformance": conformance_name(c.conformance),
   })
 }

@@ -22,7 +22,11 @@
 //! `FS_USERNS_MOUNT`); the FUSE, FSKit and WinFsp bridges exist as crates the daemon does not serve
 //! yet; the container bind (`crate::oci`) is offered exactly where a host mount is — the bind is of
 //! that mount, and its evidence is T-4.13's container workload. The guest transports are §4.6's
-//! virtio-fs device (`crate::virtiofs`), reported in-process until wired here.
+//! virtio-fs device (`crate::virtiofs`): its own report (`slates_bridge_virtiofs::capability`) is
+//! translated here fact for fact — the in-process seam served, the inherited-descriptor binding
+//! refused with the device's reason, DAX never advertised, the simulated guest driver as the
+//! evidence — never restated; a guest form asked for over the ring is refused `SeamNotOnWire`, since
+//! the harness hands the VMM seam in-process (`Daemon::attach_guest_device`).
 
 use slates_db::catalog::Rights;
 use slates_ipc::protocol::{
@@ -331,16 +335,139 @@ pub(crate) fn oci(situation: &Situation) -> AttachmentCapability {
   )
 }
 
-/// Every transport, in a fixed order.
+/// The wire's name for a guest transport of the device's seam.
+#[cfg(unix)]
+const fn guest_transport_of(
+  transport: slates_bridge_virtiofs::admission::GuestTransport,
+) -> AttachTransport {
+  match transport {
+    slates_bridge_virtiofs::admission::GuestTransport::InProcess => {
+      AttachTransport::VirtioFsInProcess
+    }
+    slates_bridge_virtiofs::admission::GuestTransport::InheritedDescriptor => {
+      AttachTransport::VirtioFsInheritedDescriptor
+    }
+  }
+}
+
+/// The wire's reason for the device's own.
+#[cfg(unix)]
+const fn guest_reason_of(
+  reason: slates_bridge_virtiofs::admission::UnsupportedReason,
+) -> UnsupportedReason {
+  match reason {
+    slates_bridge_virtiofs::admission::UnsupportedReason::DaxNotEstablished => {
+      UnsupportedReason::DaxNotEstablished
+    }
+    slates_bridge_virtiofs::admission::UnsupportedReason::NotificationQueueNotOffered => {
+      UnsupportedReason::NotificationQueueNotOffered
+    }
+    slates_bridge_virtiofs::admission::UnsupportedReason::BindingNotBuilt => {
+      UnsupportedReason::BindingNotBuilt
+    }
+  }
+}
+
+/// The device's report for one guest transport, fact for fact, in the wire's vocabulary: supported
+/// or the device's reason; the tag as the target; the caller's policy; a guest kernel's open state
+/// and (before any guest negotiates through the wire form) no cache claimed; the guest's page cache
+/// with the device's DAX line; the device's evidence.
+#[cfg(unix)]
+pub(crate) fn translate_guest(
+  report: &slates_bridge_virtiofs::capability::TransportCapability,
+  situation: &Situation,
+) -> AttachmentCapability {
+  let transport = guest_transport_of(report.transport);
+  let sharing = sharing(true, KernelCache::NotEstablished, DeleteWhileOpen::Unlinked);
+  let residency = Residency::DaemonRamAndGuestPageCache {
+    dax_mapped: report.dax.advertised,
+  };
+  match report.unsupported_reason {
+    None => offered(
+      transport,
+      situation,
+      TargetPathConstraint::GuestTag,
+      sharing,
+      residency,
+      match report.conformance {
+        slates_bridge_virtiofs::capability::Conformance::SimulatedGuestDriver => {
+          Conformance::SimulatedGuestDriver
+        }
+      },
+    ),
+    Some(reason) => refused(
+      transport,
+      situation,
+      guest_reason_of(reason),
+      TargetPathConstraint::GuestTag,
+      sharing,
+      residency,
+    ),
+  }
+}
+
+/// The guest transports, from the device's own report (`crate::virtiofs`).
+#[cfg(unix)]
+fn guest_entries(situation: &Situation) -> Vec<AttachmentCapability> {
+  crate::virtiofs::guest_transport_capabilities()
+    .iter()
+    .map(|report| translate_guest(report, situation))
+    .collect()
+}
+
+/// A guest device rides the runtime's Unix descriptor readiness; there is none to serve here.
+#[cfg(not(unix))]
+fn guest_entries(situation: &Situation) -> Vec<AttachmentCapability> {
+  [
+    AttachTransport::VirtioFsInProcess,
+    AttachTransport::VirtioFsInheritedDescriptor,
+  ]
+  .into_iter()
+  .map(|transport| {
+    refused(
+      transport,
+      situation,
+      UnsupportedReason::HostPlatform,
+      TargetPathConstraint::GuestTag,
+      sharing(true, KernelCache::NotEstablished, DeleteWhileOpen::Unlinked),
+      Residency::DaemonRamAndGuestPageCache { dax_mapped: false },
+    )
+  })
+  .collect()
+}
+
+/// Every transport, in a fixed order: the host forms, then the guest transports.
 pub(crate) fn capabilities(situation: &Situation) -> Vec<AttachmentCapability> {
-  vec![
+  let mut entries = vec![
     root(situation),
     nfs_loopback(situation),
     fuse(situation),
     fskit(situation),
     winfsp(situation),
     oci(situation),
-  ]
+  ];
+  entries.extend(guest_entries(situation));
+  entries
+}
+
+/// The report's entry for a guest transport; `None` for a transport that is not a guest's.
+pub(crate) fn guest(
+  situation: &Situation,
+  transport: AttachTransport,
+) -> Option<AttachmentCapability> {
+  match transport {
+    AttachTransport::VirtioFsInProcess | AttachTransport::VirtioFsInheritedDescriptor => {
+      guest_entries(situation)
+        .into_iter()
+        .find(|entry| entry.transport == transport)
+    }
+    AttachTransport::Root
+    | AttachTransport::NfsLoopback
+    | AttachTransport::Fuse
+    | AttachTransport::Fskit
+    | AttachTransport::WinFsp
+    | AttachTransport::Oci => None,
+  }
 }
 
 /// Format: the OCI runtimes and the CLIs that drive one, in the order the report prefers them.
@@ -578,6 +705,37 @@ mod tests {
     for capability in capabilities(&on(Platform::MacOs, true)) {
       assert_eq!(capability.read_write, ReadWritePolicy::ReadWrite);
     }
+  }
+
+  /// The device's report is carried fact for fact: the in-process seam offered as a tag with the
+  /// guest's page cache, DAX not mapped and the simulated driver as evidence; the inherited-descriptor
+  /// binding refused with the device's own reason (`crates/bridge-virtiofs`).
+  #[cfg(unix)]
+  #[test]
+  fn the_guest_entries_carry_the_devices_report_fact_for_fact() {
+    use slates_bridge_virtiofs::admission::GuestTransport;
+    use slates_bridge_virtiofs::capability::host_capability;
+    let situation = on(Platform::MacOs, true);
+    let served = translate_guest(&host_capability(GuestTransport::InProcess), &situation);
+    assert_eq!(served.transport, AttachTransport::VirtioFsInProcess);
+    assert!(served.supported);
+    assert_eq!(served.target_path, TargetPathConstraint::GuestTag);
+    assert_eq!(served.conformance, Conformance::SimulatedGuestDriver);
+    assert_eq!(
+      served.residency,
+      Residency::DaemonRamAndGuestPageCache { dax_mapped: false }
+    );
+    let unbuilt = translate_guest(
+      &host_capability(GuestTransport::InheritedDescriptor),
+      &situation,
+    );
+    assert_eq!(
+      unbuilt.unsupported_reason,
+      Some(UnsupportedReason::BindingNotBuilt)
+    );
+    assert_eq!(unbuilt.conformance, Conformance::None);
+    assert!(guest(&situation, AttachTransport::Oci).is_none());
+    assert!(guest(&situation, AttachTransport::VirtioFsInProcess).is_some());
   }
 
   /// The runtime probe prefers a bare runtime over a CLI that drives one, and reports an empty
