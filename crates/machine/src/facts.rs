@@ -65,6 +65,55 @@ pub struct MemoryFacts {
   pub available: u64,
   /// The width of a user address, in bits.
   pub address_bits: u32,
+  /// The tightest bound an OS, job or cgroup sets on this process's memory, if any (§4.2
+  /// "effective capacity ... constrained by OS/job/cgroup/lock limits"): on Linux the smallest
+  /// `memory.max` (cgroup v2) or `memory.limit_in_bytes` (v1) up the process's cgroup path, and on
+  /// every Unix a finite `RLIMIT_AS` or `RLIMIT_DATA`; Windows reports none yet (the job object's
+  /// limit is owed). `None` when nothing binds; a bound above `total` is kept and clamped by
+  /// [`effective_capacity`]. Absent from a profile written before the field existed.
+  #[serde(default)]
+  pub limit: Option<u64>,
+}
+
+/// The effective capacity a host's admission is over (§4.2, D-12): its physical memory, clamped to
+/// the tightest OS/job/cgroup bound when one is set below it. Raw free memory never enters — it is
+/// a fluctuating snapshot (docs/bugs/2026-09-10-provisioning-budget-from-mlock-limit.md), whereas
+/// total and a configured bound are stable.
+pub fn effective_capacity(total: u64, limit: Option<u64>) -> u64 {
+  limit.map_or(total, |bound| bound.min(total))
+}
+
+/// A cgroup memory limit file's text as a bound: a decimal byte count, or none for `max` (v2's
+/// "unlimited"), an empty file, or anything else — a value that cannot be read is no bound, never
+/// a guessed one. Hostile text (a sign, a suffix, a number past `u64`) is refused the same way.
+pub fn parse_cgroup_limit(text: &str) -> Option<u64> {
+  let text = text.trim();
+  if text.is_empty() || text == "max" || !text.bytes().all(|b| b.is_ascii_digit()) {
+    return None;
+  }
+  text.parse::<u64>().ok()
+}
+
+/// The tightest of several optional bounds.
+fn tightest(bounds: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+  bounds.into_iter().flatten().min()
+}
+
+/// A finite `RLIMIT_AS` or `RLIMIT_DATA` on this process (the smaller), as a memory bound; none
+/// when both are unlimited or the query is refused.
+#[cfg(unix)]
+fn rlimit_bound() -> Option<u64> {
+  use rustix::process::{Resource, getrlimit};
+  tightest([
+    getrlimit(Resource::As).current,
+    getrlimit(Resource::Data).current,
+  ])
+}
+
+/// Windows has no rlimit; the job object's memory limit is the owed counterpart.
+#[cfg(not(unix))]
+fn rlimit_bound() -> Option<u64> {
+  None
 }
 
 /// The power state that gates re-measurement.
@@ -147,7 +196,8 @@ impl Facts {
     let page = platform::page(&mut notes);
     let cache_line = platform::cache_line(&mut notes);
     let cores = platform::cores(&mut notes);
-    let memory = platform::memory(&mut notes);
+    let mut memory = platform::memory(&mut notes);
+    memory.limit = tightest([platform::cgroup_bound(&mut notes), rlimit_bound()]);
     let power = platform::power(&mut notes);
     let (cpu, os) = platform::identity(&mut notes);
     let identity = Identity {
@@ -368,7 +418,13 @@ mod platform {
       total,
       available,
       address_bits: usize::BITS,
+      limit: None,
     }
+  }
+
+  /// macOS has no cgroups; the process's memory bound is its rlimits alone.
+  pub(super) fn cgroup_bound(_notes: &mut Vec<String>) -> Option<u64> {
+    None
   }
 
   // libc marks mach_host_self deprecated in favour of the mach2 crate; one declaration here
@@ -669,7 +725,56 @@ mod platform {
       total,
       available,
       address_bits: usize::BITS,
+      limit: None,
     }
+  }
+
+  /// The tightest cgroup memory limit over this process (§4.2 "OS/job/cgroup limits"): the
+  /// process's cgroup path from `/proc/self/cgroup`, then `memory.max` (v2) or
+  /// `memory.limit_in_bytes` (v1) at that cgroup and every ancestor up to the root — a parent's
+  /// limit binds its children — the smallest numeric value found. None when no controller limits
+  /// the process, or the files cannot be read (a query refused is no bound, never a guessed one).
+  pub(super) fn cgroup_bound(notes: &mut Vec<String>) -> Option<u64> {
+    let cgroup = read("/proc/self/cgroup")?;
+    let mut bounds = Vec::new();
+    for line in cgroup.lines() {
+      // Format: a `/proc/self/cgroup` line is `id:controllers:path`, three colon-separated fields
+      // (the path may itself hold no colon; the split is bounded to three so a hostile path cannot).
+      let mut fields = line.splitn(3, ':');
+      let (Some(_), Some(controllers), Some(path)) = (fields.next(), fields.next(), fields.next())
+      else {
+        continue;
+      };
+      let (root, file) = if controllers.is_empty() {
+        ("/sys/fs/cgroup", "memory.max")
+      } else if controllers.split(',').any(|c| c == "memory") {
+        ("/sys/fs/cgroup/memory", "memory.limit_in_bytes")
+      } else {
+        continue;
+      };
+      let mut dir = path.trim_end_matches('/').to_owned();
+      loop {
+        if let Some(bound) =
+          read(&format!("{root}{dir}/{file}")).and_then(|t| super::parse_cgroup_limit(&t))
+        {
+          bounds.push(bound);
+        }
+        match dir.rfind('/') {
+          Some(0) | None => break,
+          Some(cut) => dir.truncate(cut),
+        }
+      }
+      if let Some(bound) =
+        read(&format!("{root}/{file}")).and_then(|t| super::parse_cgroup_limit(&t))
+      {
+        bounds.push(bound);
+      }
+    }
+    let bound = bounds.into_iter().min();
+    if let Some(bytes) = bound {
+      notes.push(format!("cgroup memory limit {bytes} bytes"));
+    }
+    bound
   }
 
   /// Memory available to a new allocation without reclaim, as the kernel estimates it now
@@ -869,13 +974,20 @@ mod platform {
         total: 0,
         available: 0,
         address_bits: usize::BITS,
+        limit: None,
       };
     }
     MemoryFacts {
       total: status.ullTotalPhys,
       available: status.ullAvailPhys,
       address_bits: usize::BITS,
+      limit: None,
     }
+  }
+
+  /// Windows has no cgroups; the job object's memory limit is the owed bound.
+  pub(super) fn cgroup_bound(_notes: &mut Vec<String>) -> Option<u64> {
+    None
   }
 
   pub(super) fn power(notes: &mut Vec<String>) -> PowerState {
@@ -916,6 +1028,47 @@ mod platform {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A cgroup limit file's text becomes a bound only when it is a plain byte count; `max`, an empty
+  /// file and hostile text (signs, suffixes, spaces inside, a number past `u64`) are no bound at
+  /// all — never a guessed one (§4.2: a limit that cannot be read must not become a smaller or
+  /// larger reservation).
+  #[test]
+  fn a_cgroup_limit_is_a_bound_only_when_it_is_a_byte_count() {
+    assert_eq!(parse_cgroup_limit("2147483648\n"), Some(2_147_483_648));
+    assert_eq!(parse_cgroup_limit("  4096  "), Some(4096));
+    for hostile in [
+      "max",
+      "",
+      "\n",
+      "-1",
+      "+4096",
+      "4096k",
+      "40 96",
+      "18446744073709551616",
+      "0x1000",
+      "max\n4096",
+    ] {
+      assert_eq!(parse_cgroup_limit(hostile), None, "{hostile:?}");
+    }
+  }
+
+  /// The effective capacity is the physical memory clamped to a bound set below it; a bound above
+  /// it, or none, leaves the physical memory (§4.2 "effective capacity").
+  #[test]
+  fn the_effective_capacity_is_total_clamped_to_a_bound_below_it() {
+    assert_eq!(effective_capacity(1 << 37, Some(1 << 31)), 1 << 31);
+    assert_eq!(effective_capacity(1 << 37, Some(1 << 40)), 1 << 37);
+    assert_eq!(effective_capacity(1 << 37, None), 1 << 37);
+    assert_eq!(effective_capacity(1 << 37, Some(0)), 0);
+  }
+
+  /// The tightest of several optional bounds is the smallest present one; none present is none.
+  #[test]
+  fn the_tightest_bound_is_the_smallest_present() {
+    assert_eq!(tightest([None, Some(7), Some(3), None]), Some(3));
+    assert_eq!(tightest([None, None]), None);
+  }
 
   #[test]
   fn the_facts_are_queried_without_refusal_on_this_machine() {

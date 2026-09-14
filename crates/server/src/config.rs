@@ -55,9 +55,13 @@ const LOOP_TASKS_PER_SHARD: usize = 5;
 /// requests finds it awake; ratified in GAPS §5 until the spin-to-park ratio is measured
 /// against the histogram's parked form.
 pub const IDLE_WINDOW_RATIO: u64 = 100;
-/// Shape: the divisor between a shard's reserve and one table's slots: the reserve is split
-/// among the inode table, the directory table and content (three classes, §4.2), and each
-/// table keeps half of its class for growth headroom.
+/// The divisor between a shard's metadata class and one slab dimension's units. The class is split
+/// among the inode dimension (a version slot and a table slot per inode), the directory dimension
+/// (a node and a block per directory) and the volume records (journals and objects) — three parts
+/// — and each slab dimension keeps half of its part for growth headroom, so the slabs' maximum
+/// footprints sum to about a third of the class and the records' ledger holds the rest (§4.2 "the
+/// prepared arena layout"; `Store::set_metadata_class`).
+/// Shape: three parts, each slab part halved for headroom.
 const STORE_TABLE_DIVISOR: u64 = 6;
 /// Shape: the largest inline lifecycle request: a name and a base path, both under the OS
 /// path limit (Linux `PATH_MAX` 4096); one page each direction per slot.
@@ -82,6 +86,10 @@ pub struct StoreCaps {
   pub max_dir_blocks: usize,
   /// The small-directory cut-over.
   pub dir_cutover: usize,
+  /// Derived: the shard's metadata class in bytes (§4.2), the second of the three memory classes:
+  /// the slabs above grow into it up to their bounds, and the remainder is the ledger every
+  /// volume's records are reserved from (`Store::set_metadata_class`).
+  pub metadata_class_bytes: u64,
 }
 
 /// The fleet membership this node is configured to join (§4.8, boot step 6): the fault-tolerance
@@ -293,8 +301,21 @@ impl DaemonConfig {
     // is a lazy anonymous mapping — it costs no physical RAM until a volume stores bytes, so a virtual
     // ceiling over total is honest), and total is stable, whereas free memory is a fluctuating snapshot
     // that would make the ceiling — and whether the daemon can provision at all — depend on whatever
-    // else the machine is doing at boot (racy under a busy host or a parallel test suite).
-    let reserve = region_bytes(profile.facts.memory.total, shards, MEMORY_CLASSES);
+    // else the machine is doing at boot (racy under a busy host or a parallel test suite). Total is
+    // clamped to the tightest OS/job/cgroup bound on the process when one is set (§4.2 "effective
+    // capacity"): a container's `memory.max` or a finite `RLIMIT_AS` is a hard limit the OS enforces
+    // by killing or refusing, so admitting past it would be a promise the host cannot keep; like
+    // total, a configured bound is stable across the boot.
+    let effective: Derived<u64> = derived!(
+      slates_machine::facts::effective_capacity(
+        profile.facts.memory.total,
+        profile.facts.memory.limit
+      ),
+      "min(memory.total, the OS/job/cgroup bound when one is set)",
+      ["memory.total", "memory.limit"]
+    );
+    derivations.push(note("effective_capacity_bytes", &effective));
+    let reserve = region_bytes(effective.get(), shards, MEMORY_CLASSES);
     derivations.push(note("reserve_per_shard", &reserve));
     let page = profile.facts.page.base;
     let tables: Derived<u64> = derived!(
@@ -399,24 +420,29 @@ impl DaemonConfig {
       // a magic count. Checkpointing to fold old chain entries (the design's optimization) is owed.
       green_chain_bytes: usize::try_from(tables.get()).unwrap_or(usize::MAX),
     };
-    // The store's tables: the metadata share of the reserve over each record's size, the
-    // inodes and directories sharing it, chunks over the arena share.
-    let inode_bytes = u64::try_from(size_of::<slates_vfs::inode::Inode>()).unwrap_or(1);
-    let dir_bytes = u64::try_from(size_of::<slates_vfs::dir::DirNode>()).unwrap_or(1);
+    // The store's tables (§4.2 metadata dimension): each slab's bound is the metadata class — the
+    // shard's second memory class, one reserve — over the true slot cost of the dimension's unit
+    // (an inode is a version slot and a table slot; a directory a node and a block), so the slabs'
+    // maximum footprints are inside the class by construction and the remainder is the ledger the
+    // volumes' records are reserved from. Chunk records go one per page of the arena. The
+    // directory-block bound is the directory bound: every directory past the cut-over holds at
+    // least one block, and a large directory's extra blocks come out of the same unit count.
+    let inode_unit = u64::try_from(slates_vfs::volume::inode_unit_bytes()).unwrap_or(1);
+    let dir_unit = u64::try_from(slates_vfs::volume::directory_unit_bytes()).unwrap_or(1);
     let max_inodes: Derived<usize> = derived!(
-      usize::try_from(reserve.get() / inode_bytes.max(1) / STORE_TABLE_DIVISOR)
+      usize::try_from(reserve.get() / inode_unit.max(1) / STORE_TABLE_DIVISOR)
         .unwrap_or(usize::MAX)
         .max(1),
-      "reserve_per_shard / size_of::<Inode>() / STORE_TABLE_DIVISOR",
-      ["reserve_per_shard"]
+      "metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR",
+      ["reserve_per_shard", "vfs.inode_unit_bytes"]
     );
     derivations.push(note("max_inodes", &max_inodes));
     let max_dirs: Derived<usize> = derived!(
-      usize::try_from(reserve.get() / dir_bytes.max(1) / STORE_TABLE_DIVISOR)
+      usize::try_from(reserve.get() / dir_unit.max(1) / STORE_TABLE_DIVISOR)
         .unwrap_or(usize::MAX)
         .max(1),
-      "reserve_per_shard / size_of::<DirNode>() / STORE_TABLE_DIVISOR",
-      ["reserve_per_shard"]
+      "metadata_class / (Slot<DirNode> + Slot<DirBlock>) / STORE_TABLE_DIVISOR",
+      ["reserve_per_shard", "vfs.directory_unit_bytes"]
     );
     derivations.push(note("max_dirs", &max_dirs));
     let max_chunks: Derived<usize> = derived!(
@@ -427,12 +453,19 @@ impl DaemonConfig {
       ["reserve_per_shard", "page"]
     );
     derivations.push(note("max_chunks", &max_chunks));
+    let metadata_class: Derived<u64> = derived!(
+      reserve.get(),
+      "the shard's metadata class: one of the MEMORY_CLASSES shares of its RAM",
+      ["reserve_per_shard", "MEMORY_CLASSES"]
+    );
+    derivations.push(note("metadata_class_bytes", &metadata_class));
     let store = StoreCaps {
       max_inodes: max_inodes.get(),
       max_dirs: max_dirs.get(),
       max_chunks: max_chunks.get(),
       max_dir_blocks: max_dirs.get(),
       dir_cutover: DIR_CUTOVER,
+      metadata_class_bytes: metadata_class.get(),
     };
     let region = RegionGeometry {
       slots: slots.get(),
@@ -783,6 +816,99 @@ mod tests {
       strict.shortfall(&laptop),
       None,
       "a single copy has no coincident loss: the laptop is never short under any policy (R8)"
+    );
+  }
+
+  /// AC-0.10 (§4.2 metadata dimension): the derived slab bounds lay the metadata class out so that
+  /// every slab at its bound fits inside the class with room left for volume records — a store built
+  /// on the derived caps accepts its class and offers a positive records ledger. Non-vacuous: with
+  /// the directory-block bound tied to the directory count over the node's size alone, the blocks
+  /// alone were several times the class and the class was refused.
+  #[test]
+  fn the_derived_slab_bounds_lay_the_metadata_class_out_with_room_for_records() {
+    use slates_mem::arena::ChunkArena;
+    use slates_mem::region::Region;
+    use slates_vfs::volume::{Store, StoreConfig};
+    let profile = MachineProfile::measure(ProfileOptions {
+      budget_per_probe: Duration::from_millis(1),
+      codecs: false,
+      core_matrix: false,
+    });
+    let config = DaemonConfig::derive(&profile, "metadata-layout").with_shards(1);
+    let page = config.page;
+    let mut arena = ChunkArena::new(page);
+    arena
+      .add_region(Region::map(page, page, false).expect("one page maps"))
+      .expect("one region");
+    let mut store = Store::new(
+      &StoreConfig {
+        page,
+        cache_line: config.cache_line,
+        max_dirs: config.store.max_dirs,
+        max_inodes: config.store.max_inodes,
+        max_chunks: config.store.max_chunks,
+        max_dir_blocks: config.store.max_dir_blocks,
+        dir_cutover: config.store.dir_cutover,
+      },
+      arena,
+      0,
+    );
+    let slabs = store.slab_footprint_bytes();
+    let class = config.store.metadata_class_bytes;
+    let records = store
+      .set_metadata_class(class)
+      .expect("the derived layout fits its class");
+    assert_eq!(
+      slabs + records,
+      class,
+      "the class is the slabs plus the records"
+    );
+    assert!(
+      records >= class / 2,
+      "at least half the class is left for records ({records} of {class}; slabs {slabs})"
+    );
+  }
+
+  /// AC-0.10 (§4.2 "effective capacity ... constrained by OS/job/cgroup limits"): a bound set on
+  /// the process below its physical memory caps every shard's reserve, so the classes summed over
+  /// the shards never exceed what the host will let the process use; without a bound, or with one
+  /// above total, the reserve is the share of total 1f40689 chose. Non-vacuous: derived from total
+  /// alone, a quarter-of-total bound leaves the reserve four times what the bound allows.
+  #[test]
+  fn a_memory_bound_below_total_caps_the_reserve() {
+    let mut profile = MachineProfile::measure(ProfileOptions {
+      budget_per_probe: Duration::from_millis(1),
+      codecs: false,
+      core_matrix: false,
+    });
+    let total = profile.facts.memory.total;
+    profile.facts.memory.limit = None;
+    let unbounded = DaemonConfig::derive(&profile, "bound-none");
+    let shards = u64::from(unbounded.runtime.shards.max(1));
+    assert_eq!(
+      unbounded.reserve_per_shard,
+      total / shards / MEMORY_CLASSES,
+      "no bound: the reserve is the share of total"
+    );
+    profile.facts.memory.limit = Some(total / 4);
+    let bounded = DaemonConfig::derive(&profile, "bound-quarter");
+    assert_eq!(
+      bounded.reserve_per_shard,
+      total / 4 / shards / MEMORY_CLASSES,
+      "a quarter-of-total bound: the reserve is the share of the bound"
+    );
+    assert!(
+      bounded.reserve_per_shard * shards * MEMORY_CLASSES <= total / 4,
+      "the classes over every shard fit the bound ({} × {shards} × {MEMORY_CLASSES} ≤ {})",
+      bounded.reserve_per_shard,
+      total / 4
+    );
+    profile.facts.memory.limit = Some(total.saturating_mul(2));
+    let above = DaemonConfig::derive(&profile, "bound-above");
+    assert_eq!(
+      above.reserve_per_shard,
+      total / shards / MEMORY_CLASSES,
+      "a bound above total does not raise the reserve"
     );
   }
 }

@@ -1407,6 +1407,11 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     spans_held: u64::try_from(state.telemetry.len()).unwrap_or(u64::MAX),
     spans_dropped: state.telemetry.dropped(),
     peers_probed: u32::try_from(state.formed_probe_peers.len()).unwrap_or(u32::MAX),
+    retained_bytes: state.store.budget.retained(),
+    retained_versions: state.store.versions.retained(),
+    metadata_bytes: state.store.metadata.capacity(),
+    committed_metadata: state.store.metadata.committed(),
+    mapped_bytes: u64::try_from(state.store.content.mapped_bytes()).unwrap_or(u64::MAX),
   }
 }
 
@@ -2143,6 +2148,13 @@ fn quota_for(size: SizeClass) -> Quota {
   }
 }
 
+fn wire_names(names: DbNamePolicy) -> NamePolicy {
+  match names {
+    DbNamePolicy::Exact => NamePolicy::Exact,
+    DbNamePolicy::Fold => NamePolicy::Fold,
+  }
+}
+
 fn wire_size(size: DbSizeClass) -> SizeClass {
   match size {
     DbSizeClass::Bounded { limit } => SizeClass::Bounded { limit },
@@ -2203,6 +2215,7 @@ fn create(
         state,
         reservation,
         None,
+        None,
         Refusal::BudgetExceeded { available },
       );
     }
@@ -2211,11 +2224,21 @@ fn create(
         state,
         reservation,
         None,
+        None,
         Refusal::BadRequest {
           reason: e.to_string(),
         },
       );
     }
+  };
+  // The volume's records — its journal budget, its object, its snapshot slab's first segment — are
+  // reserved against the shard's metadata ledger before anything is allocated (§4.2 metadata
+  // dimension: "an uncharged heap allocation cannot sit outside the bound").
+  let quota = quota_for(size);
+  let journal_bytes = journal_bytes_for(state, &quota);
+  let metadata_credit = match reserve_metadata(state, journal_bytes) {
+    Ok(credit) => Some(credit),
+    Err(refusal) => return give_back(state, reservation, version_credit, None, refusal),
   };
   // A strict volume backs its content in locked RAM (§4.2, BUG-1): lock the shard's arena so its
   // content never swaps, refusing (as BudgetExceeded, the §4.2 lock-capacity refusal) if the OS
@@ -2230,25 +2253,47 @@ fn create(
       state,
       reservation,
       version_credit,
+      metadata_credit,
       Refusal::BudgetExceeded { available },
     );
   }
-  let quota = quota_for(size);
   let config = volume_config(state, names, quota);
   let (mut volume, host) = match base {
     None => match Volume::create(&mut state.store, config) {
       Ok(v) => (v, None),
-      Err(e) => return give_back(state, reservation, version_credit, refusal_of_vfs(&e)),
+      Err(e) => {
+        return give_back(
+          state,
+          reservation,
+          version_credit,
+          metadata_credit,
+          refusal_of_vfs(&e),
+        );
+      }
     },
     Some(path) => match open_base(state, path, config) {
       Ok(pair) => pair,
-      Err(reply) => return give_back(state, reservation, version_credit, reply_refusal(*reply)),
+      Err(reply) => {
+        return give_back(
+          state,
+          reservation,
+          version_credit,
+          metadata_credit,
+          reply_refusal(*reply),
+        );
+      }
     },
   };
   // Admit the volume's inode dimension (§4.2 resource vector): set the per-volume cap that
   // `next_no` enforces, to the same allowance already reserved against the version slab above.
   if let Err(e) = admit_dimensions(state, &mut volume, size) {
-    return give_back(state, reservation, version_credit, refusal_of_vfs(&e));
+    return give_back(
+      state,
+      reservation,
+      version_credit,
+      metadata_credit,
+      refusal_of_vfs(&e),
+    );
   }
   let id = fresh_volume_id(state);
   let record = VolumeRecord {
@@ -2280,23 +2325,33 @@ fn create(
     access: Vec::new(),
     created_ns: state.clock.monotonic_ns(),
   };
-  publish_created_volume(state, id, volume, host, reservation, version_credit, record)
+  publish_created_volume(
+    state,
+    id,
+    volume,
+    host,
+    (reservation, version_credit, metadata_credit),
+    record,
+  )
 }
 
 /// Records a freshly-created volume and moves it into the shard's registry, or gives its credits back
 /// and discards the volume (returning its slab slots) if the record cannot be written or the registry
 /// has no room. The registry room is checked before the insert, since a full registry's `insert`
 /// consumes and drops the slot.
-#[allow(clippy::too_many_arguments)]
 fn publish_created_volume(
   state: &mut ShardState,
   id: slates_db::catalog::VolumeId,
   volume: Volume,
   host: Option<OsHost>,
-  reservation: Option<slates_mem::budget::Reservation>,
-  version_credit: Option<slates_mem::budget::VersionCredit>,
+  credits: (
+    Option<slates_mem::budget::Reservation>,
+    Option<slates_mem::budget::VersionCredit>,
+    Option<slates_mem::budget::MetadataCredit>,
+  ),
   record: VolumeRecord,
 ) -> ReplyBody {
+  let (reservation, version_credit, metadata_credit) = credits;
   // Capture the mount name before the record is moved into the log op below; the slot lists the
   // volume under it in the host root (a client mounts `/<name>` or reaches it by `cd <name>`).
   let name = record.name.clone();
@@ -2306,7 +2361,13 @@ fn publish_created_volume(
     .mutate(&mut state.segment, &Op::VolumeCreated { record }, now)
   {
     let _ = volume.discard_partial(&mut state.store);
-    return give_back(state, reservation, version_credit, refusal_of_db(&e));
+    return give_back(
+      state,
+      reservation,
+      version_credit,
+      metadata_credit,
+      refusal_of_db(&e),
+    );
   }
   if !state.volumes.has_room() {
     let full = state.volumes.max_slots();
@@ -2315,6 +2376,7 @@ fn publish_created_volume(
       state,
       reservation,
       version_credit,
+      metadata_credit,
       Refusal::BadRequest {
         reason: format!("volume registry full at {full}"),
       },
@@ -2327,6 +2389,7 @@ fn publish_created_volume(
     host,
     reservation,
     version_credit,
+    metadata_credit,
   };
   match state.volumes.insert(slot) {
     Ok(h) => {
@@ -2340,6 +2403,7 @@ fn publish_created_volume(
       state,
       reservation,
       version_credit,
+      metadata_credit,
       Refusal::BadRequest {
         reason: e.to_string(),
       },
@@ -2360,6 +2424,7 @@ fn give_back(
   state: &mut ShardState,
   reservation: Option<slates_mem::budget::Reservation>,
   version: Option<slates_mem::budget::VersionCredit>,
+  metadata: Option<slates_mem::budget::MetadataCredit>,
   refusal: Refusal,
 ) -> ReplyBody {
   if let Some(r) = reservation {
@@ -2368,7 +2433,33 @@ fn give_back(
   if let Some(c) = version {
     state.store.versions.release(c);
   }
+  if let Some(m) = metadata {
+    state.store.metadata.release(m);
+  }
   refused(refusal)
+}
+
+/// Reserves a volume's records against the shard's metadata ledger (§4.2 metadata dimension) before
+/// the volume exists: its journal's whole retention budget, its object and its snapshot slab's first
+/// segment, whole or not at all, so the sum of every volume's metadata stays inside the class.
+fn reserve_metadata(
+  state: &mut ShardState,
+  journal_bytes: usize,
+) -> Result<slates_mem::budget::MetadataCredit, Refusal> {
+  let page = usize::try_from(state.config.geometry.page).unwrap_or(1);
+  match state
+    .store
+    .metadata
+    .reserve(Volume::metadata_footprint(journal_bytes, page))
+  {
+    Ok(credit) => Ok(credit),
+    Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
+      Err(Refusal::BudgetExceeded { available })
+    }
+    Err(e) => Err(Refusal::BadRequest {
+      reason: e.to_string(),
+    }),
+  }
 }
 
 /// Opens a base directory (read-only, `O_NOFOLLOW`) and creates the overlay over it.
@@ -3030,7 +3121,7 @@ fn clone(
   // divergence of the inherited inodes. If the slab cannot back it, the clone is refused.
   let inherited = match state.volumes.get(handle) {
     Ok(slot) => slot.volume.inode_usage().0,
-    Err(_) => return give_back(state, reservation, None, Refusal::NotFound),
+    Err(_) => return give_back(state, reservation, None, None, Refusal::NotFound),
   };
   let clone_allowance = inode_allowance(state, size).max(inherited);
   let version_credit = match state.store.versions.reserve(clone_allowance) {
@@ -3040,6 +3131,7 @@ fn clone(
         state,
         reservation,
         None,
+        None,
         Refusal::BudgetExceeded { available },
       );
     }
@@ -3048,18 +3140,21 @@ fn clone(
         state,
         reservation,
         None,
+        None,
         Refusal::BadRequest {
           reason: e.to_string(),
         },
       );
     }
   };
-  let names = match record.policy.names {
-    DbNamePolicy::Exact => NamePolicy::Exact,
-    DbNamePolicy::Fold => NamePolicy::Fold,
-  };
+  let names = wire_names(record.policy.names);
   let quota = quota_for(size);
   let config = volume_config(state, names, quota);
+  // The clone's records are reserved against the metadata ledger before it exists (§4.2).
+  let metadata_credit = match reserve_metadata(state, config.journal_bytes) {
+    Ok(credit) => Some(credit),
+    Err(refusal) => return give_back(state, reservation, version_credit, None, refusal),
+  };
   let cloned = match state.volumes.get_mut(handle) {
     Ok(slot) => Volume::clone_of(
       &state.store,
@@ -3067,11 +3162,27 @@ fn clone(
       core_snapshot(snapshot),
       config,
     ),
-    Err(_) => return give_back(state, reservation, version_credit, Refusal::NotFound),
+    Err(_) => {
+      return give_back(
+        state,
+        reservation,
+        version_credit,
+        metadata_credit,
+        Refusal::NotFound,
+      );
+    }
   };
   let mut volume_core = match cloned {
     Ok(v) => v,
-    Err(e) => return give_back(state, reservation, version_credit, refusal_of_vfs(&e)),
+    Err(e) => {
+      return give_back(
+        state,
+        reservation,
+        version_credit,
+        metadata_credit,
+        refusal_of_vfs(&e),
+      );
+    }
   };
   // Cap the clone's inode dimension at the same allowance already reserved above, so its per-volume
   // cap (`next_no`) and its version-slab reservation agree. A clone previously carried no inode cap.
@@ -3099,7 +3210,13 @@ fn clone(
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
       unpin_origin(state, handle, snapshot);
       let _ = volume_core.discard_partial(&mut state.store);
-      return give_back(state, reservation, version_credit, refusal_of_db(&e));
+      return give_back(
+        state,
+        reservation,
+        version_credit,
+        metadata_credit,
+        refusal_of_db(&e),
+      );
     }
   }
   // As in create: ensure the registry has room before moving the clone into a slot, discarding it
@@ -3113,6 +3230,7 @@ fn clone(
       state,
       reservation,
       version_credit,
+      metadata_credit,
       Refusal::BadRequest {
         reason: format!("volume registry full at {full}"),
       },
@@ -3125,6 +3243,7 @@ fn clone(
     host: None,
     reservation,
     version_credit,
+    metadata_credit,
   };
   match state.volumes.insert(slot) {
     Ok(h) => {
@@ -3138,6 +3257,7 @@ fn clone(
       state,
       reservation,
       version_credit,
+      metadata_credit,
       Refusal::BadRequest {
         reason: e.to_string(),
       },
@@ -3484,28 +3604,35 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
         );
       }
       if let Ok(slot) = state.volumes.remove(handle) {
-        if let Some(r) = slot.reservation {
-          state.store.budget.release(r);
-        }
-        // The volume's inode allowance was reserved against the version slab at create; give those
-        // slots back on teardown so the slab is never over-offered (§4.2 accounting through teardown).
-        if let Some(c) = slot.version_credit {
-          state.store.versions.release(c);
-        }
-        // A dynamic volume's growth was acquired from the shard budget as it wrote; give it back on
-        // teardown so the capacity returns to the one owner (§4.2 accounting through teardown).
-        let held = slot.volume.budget_hold();
-        if held > 0 {
-          state
-            .store
-            .budget
-            .release(slates_mem::budget::Reservation { bytes: held });
-        }
+        release_slot_credits(state, &slot);
       }
       state.by_id.remove(&id);
     }
   }
   any
+}
+
+/// Returns every credit a torn-down volume held to the shard's ledgers (§4.2 accounting through
+/// teardown): its byte reservation, its inode allowance (so the version slab is never
+/// over-offered), its records' metadata reservation, and the growth a dynamic volume acquired from
+/// the shard budget as it wrote.
+fn release_slot_credits(state: &mut ShardState, slot: &VolumeSlot) {
+  if let Some(r) = slot.reservation {
+    state.store.budget.release(r);
+  }
+  if let Some(c) = slot.version_credit {
+    state.store.versions.release(c);
+  }
+  if let Some(m) = slot.metadata_credit {
+    state.store.metadata.release(m);
+  }
+  let held = slot.volume.budget_hold();
+  if held > 0 {
+    state
+      .store
+      .budget
+      .release(slates_mem::budget::Reservation { bytes: held });
+  }
 }
 
 fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> ReplyBody {
@@ -3744,6 +3871,7 @@ pub(crate) fn materialize_taken_over(
         state,
         reservation,
         None,
+        None,
         Refusal::BudgetExceeded { available },
       )));
     }
@@ -3752,17 +3880,28 @@ pub(crate) fn materialize_taken_over(
         state,
         reservation,
         None,
+        None,
         Refusal::BadRequest {
           reason: e.to_string(),
         },
       )));
     }
   };
-  let names = match head.names {
-    DbNamePolicy::Exact => NamePolicy::Exact,
-    DbNamePolicy::Fold => NamePolicy::Fold,
-  };
+  let names = wire_names(head.names);
   let config = volume_config(state, names, quota_for(size));
+  // The taken-over volume's records are reserved against the metadata ledger before it exists (§4.2).
+  let metadata_credit = match reserve_metadata(state, config.journal_bytes) {
+    Ok(credit) => Some(credit),
+    Err(refusal) => {
+      return Err(Box::new(give_back(
+        state,
+        reservation,
+        version_credit,
+        None,
+        refusal,
+      )));
+    }
+  };
   let mut volume = match Volume::create(&mut state.store, config) {
     Ok(v) => v,
     Err(e) => {
@@ -3770,6 +3909,7 @@ pub(crate) fn materialize_taken_over(
         state,
         reservation,
         version_credit,
+        metadata_credit,
         refusal_of_vfs(&e),
       )));
     }
@@ -3780,6 +3920,7 @@ pub(crate) fn materialize_taken_over(
       state,
       reservation,
       version_credit,
+      metadata_credit,
       refusal_of_vfs(&e),
     )));
   }
@@ -3789,6 +3930,7 @@ pub(crate) fn materialize_taken_over(
       state,
       reservation,
       version_credit,
+      metadata_credit,
       refusal_of_vfs(&e),
     )));
   }
@@ -3815,8 +3957,14 @@ pub(crate) fn materialize_taken_over(
     access: Vec::new(),
     created_ns: now,
   };
-  let published =
-    publish_created_volume(state, id, volume, None, reservation, version_credit, record);
+  let published = publish_created_volume(
+    state,
+    id,
+    volume,
+    None,
+    (reservation, version_credit, metadata_credit),
+    record,
+  );
   if !matches!(published, ReplyBody::Created { .. }) {
     return Err(Box::new(published));
   }
@@ -4599,37 +4747,26 @@ fn release_recovered_bytes(
   }
 }
 
-/// Re-acquires a recovered volume's version-slab credits (§4.2 accounting through recovery): its
-/// logical inode allowance and its retained-version charge, both admitted before the restart. If the
-/// slab shrank below what the recovered state needs, recovery cannot represent it and fails, returning
-/// the byte reservation and re-grown hold so a refused recovery leaks neither.
+/// Re-acquires a recovered volume's version-slab credit (§4.2 accounting through recovery): its
+/// logical inode allowance, admitted before the restart. (Its retention — retained versions and
+/// bytes — is re-established by the rebuild itself, `Volume::from_image`.) If the slab shrank below
+/// what the recovered state needs, recovery cannot represent it and fails, returning the byte
+/// reservation and re-grown hold so a refused recovery leaks neither.
 fn recover_version_reservations(
   store: &mut slates_vfs::volume::Store,
-  volume: &Volume,
   allowance: u64,
   reservation: Option<slates_mem::budget::Reservation>,
   held: u64,
 ) -> Result<Option<slates_mem::budget::VersionCredit>, String> {
-  let version_credit = match store.versions.reserve(allowance) {
-    Ok(c) => Some(c),
+  match store.versions.reserve(allowance) {
+    Ok(c) => Ok(Some(c)),
     Err(e) => {
       release_recovered_bytes(store, reservation, held);
-      return Err(format!(
+      Err(format!(
         "recovered inode allowance exceeds the version slab: {e}"
-      ));
+      ))
     }
-  };
-  let retained = volume.retained_versions();
-  if store.versions.charge_retention(retained).is_err() {
-    if let Some(c) = version_credit {
-      store.versions.release(c);
-    }
-    release_recovered_bytes(store, reservation, held);
-    return Err(format!(
-      "recovered retained versions ({retained}) exceed the version slab"
-    ));
   }
-  Ok(version_credit)
 }
 
 fn rebuild_volume(
@@ -4664,6 +4801,8 @@ fn rebuild_volume(
   // teardown it is released through `budget_hold`, the same as a running volume's.
   let held = volume.budget_hold();
   if held > 0 && state.store.budget.grow(held).is_err() {
+    // The rebuilt volume returns its slots, blocks and retention rather than leaking them.
+    let _ = volume.discard_partial(&mut state.store);
     if let Some(r) = reservation {
       state.store.budget.release(r);
     }
@@ -4675,10 +4814,34 @@ fn rebuild_volume(
   let _ = volume.set_inode_allowance(allowance);
   let entries = entry_allowance(size).max(volume.entry_usage().0);
   let _ = volume.set_entry_allowance(entries);
-  // Re-acquire the version reservation and re-establish the retained-version charge (§4.2 accounting
-  // through recovery), giving back the byte reservation and re-grown hold if the slab shrank.
+  // Re-acquire the version reservation (§4.2 accounting through recovery), giving back the byte
+  // reservation and re-grown hold — and the rebuilt volume's slots, blocks and retention — if the
+  // slab shrank.
   let version_credit =
-    recover_version_reservations(&mut state.store, &volume, allowance, reservation, held)?;
+    match recover_version_reservations(&mut state.store, allowance, reservation, held) {
+      Ok(credit) => credit,
+      Err(reason) => {
+        let _ = volume.discard_partial(&mut state.store);
+        return Err(reason);
+      }
+    };
+  // Re-acquire the records' metadata reservation (§4.2 accounting through recovery), giving every
+  // other credit and the rebuilt volume back if the ledger cannot back it.
+  let journal_bytes = journal_bytes_for(state, &quota_for(size));
+  let metadata_credit = match reserve_metadata(state, journal_bytes) {
+    Ok(credit) => Some(credit),
+    Err(refusal) => {
+      let _ = volume.discard_partial(&mut state.store);
+      if let Some(c) = version_credit {
+        state.store.versions.release(c);
+      }
+      release_recovered_bytes(&mut state.store, reservation, held);
+      return Err(format!(
+        "recovered volume records exceed the metadata ledger: {}",
+        refusal_name(&refusal)
+      ));
+    }
+  };
   let slot = VolumeSlot {
     id: record.id,
     name: record.name.clone(),
@@ -4686,6 +4849,7 @@ fn rebuild_volume(
     host,
     reservation,
     version_credit,
+    metadata_credit,
   };
   let handle = state.volumes.insert(slot).map_err(|e| e.to_string())?;
   state.by_id.insert(record.id, handle);

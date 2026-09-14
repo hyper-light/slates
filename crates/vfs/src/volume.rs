@@ -8,11 +8,12 @@
 //! journal record. A refusal leaves nothing changed (T-1.1, T-1.9). The executable model in the
 //! tests is the specification this file must equal on every generated history.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use slates_machine::{Derived, derived};
+use slates_mem::MemError;
 use slates_mem::arena::ChunkArena;
-use slates_mem::budget::{ShardBudget, VersionBudget};
+use slates_mem::budget::{MetadataBudget, ShardBudget, VersionBudget};
 use slates_mem::{Handle, Slab};
 
 use crate::clock::Clock;
@@ -57,6 +58,26 @@ pub const LINK_MAX: u32 = 32_767;
 /// Anchor: the copy-up's atomicity on the single-threaded shard.
 const COPY_UP_VERSION_HEADROOM: u64 = 1;
 
+/// The metadata bytes one logical inode costs at its bound (§4.2 metadata dimension): a version
+/// slot and an inode-table slot, each at its slab's true slot cost. The admitting owner derives the
+/// shard's inode cap from its metadata class over this unit.
+pub fn inode_unit_bytes() -> usize {
+  Slab::<Inode>::slot_bytes().saturating_add(Slab::<TrieNode>::slot_bytes())
+}
+
+/// The metadata bytes one directory costs at its bound (§4.2 metadata dimension): a directory
+/// node and one block of entries (every directory past the cut-over holds at least one), each at
+/// its slab's true slot cost. The admitting owner derives the shard's directory and block caps from
+/// its metadata class over this unit.
+pub fn directory_unit_bytes() -> usize {
+  Slab::<DirNode>::slot_bytes().saturating_add(Slab::<DirBlock>::slot_bytes())
+}
+
+/// The metadata bytes one chunk record costs (§4.2 metadata dimension): a chunk slab slot.
+pub fn chunk_record_bytes() -> usize {
+  Slab::<crate::content::Chunk>::slot_bytes()
+}
+
 /// The shard's store: slabs and the chunk arena every volume on the shard allocates from.
 pub struct Store {
   /// Directory nodes.
@@ -84,6 +105,12 @@ pub struct Store {
   /// merely capped — no volume's advertised allowance can be un-backed capacity another volume also
   /// holds. It lives beside the slab it accounts, reached without a lock.
   pub versions: VersionBudget,
+  /// The shard's metadata ledger (§4.2 resource vector, the metadata dimension): the metadata class
+  /// less every slab's maximum footprint, from which each volume's records — its journal budget,
+  /// its volume object, its snapshot slab's first segment — are reserved at admission, so the heap
+  /// the shard's metadata may take is bounded by the class, not by the machine. Unbounded until the
+  /// admitting owner sets the class ([`Store::set_metadata_class`]), so fixtures are unaffected.
+  pub metadata: MetadataBudget,
 }
 
 impl std::fmt::Debug for Store {
@@ -144,7 +171,38 @@ impl Store {
         u64::try_from(config.max_inodes).unwrap_or(u64::MAX),
         COPY_UP_VERSION_HEADROOM,
       ),
+      metadata: MetadataBudget::new(u64::MAX),
     }
+  }
+
+  /// The most bytes the store's slabs can ever hold together — directory nodes, directory blocks,
+  /// inode versions, inode-table nodes and chunk records at their bounds, each slot at its true
+  /// cost (§4.2 "segment, slab and buddy geometry report usable capacity"). The part of the
+  /// metadata class the slabs may grow into; the rest is the volume records' ledger.
+  pub fn slab_footprint_bytes(&self) -> u64 {
+    let bytes = |footprint: usize| u64::try_from(footprint).unwrap_or(u64::MAX);
+    bytes(self.dirs.max_footprint_bytes())
+      .saturating_add(bytes(self.blocks.max_footprint_bytes()))
+      .saturating_add(bytes(self.inodes.max_footprint_bytes()))
+      .saturating_add(bytes(self.tries.max_footprint_bytes()))
+      .saturating_add(bytes(self.content.max_record_footprint_bytes()))
+  }
+
+  /// Sets the shard's metadata class (§4.2): the slabs' maximum footprint is taken off the top and
+  /// the remainder becomes the volume records' ledger, returned. Refused `BudgetExceeded` — nothing
+  /// changed — when the slabs alone would exceed the class, so a boot that laid the tables out past
+  /// its class learns it before serving rather than admitting records it cannot back.
+  pub fn set_metadata_class(&mut self, class_bytes: u64) -> Result<u64, MemError> {
+    let slabs = self.slab_footprint_bytes();
+    if slabs >= class_bytes {
+      return Err(MemError::BudgetExceeded {
+        requested: slabs,
+        available: class_bytes,
+      });
+    }
+    let records = class_bytes - slabs;
+    self.metadata = MetadataBudget::new(records);
+    Ok(records)
   }
 }
 
@@ -207,8 +265,10 @@ pub struct Volume {
   /// open.
   pub(crate) attachment_refs: BTreeMap<u64, BTreeMap<InodeNo, u32>>,
   /// Inodes that have left the namespace (`nlink == 0`) while still referenced, awaiting
-  /// reclamation at their last `unreference`. Bounded by open-unlinked files.
-  pub(crate) orphans: BTreeSet<InodeNo>,
+  /// reclamation at their last `unreference`, each with the retention bytes the unlink secured for
+  /// its content (§4.2: charged when the name went, because the last close cannot refuse; consumed
+  /// at the reclaim, any surplus returned then). Bounded by open-unlinked files.
+  pub(crate) orphans: BTreeMap<InodeNo, u64>,
   /// Live logical inodes the head reaches (§4.2 resource vector, the inode dimension): incremented
   /// as a number is issued, decremented as one is reclaimed. Bounds "arbitrarily many empty files",
   /// which the byte quota cannot.
@@ -229,6 +289,26 @@ pub struct Volume {
   /// and starving others; unbounded (`u64::MAX`) until the admitting owner sets it, so tests and
   /// non-admitting callers are unaffected. Checked against the drift-free [`Volume::retained_versions`].
   pub(crate) retention_allowance: u64,
+  /// The retention bytes an in-progress operation has secured from the shard budget for the chunks
+  /// it is about to retain (§4.2 retention, the byte dimension): charged before any mutation,
+  /// consumed as each retained chunk lands on a deadlist, and any surplus returned when the
+  /// operation ends. Zero between operations.
+  pub(crate) retention_prepaid: u64,
+  /// The retained content bytes this volume has charged to the shard budget and not yet credited
+  /// back — the credit authority: `destroy_snapshot` and `destroy` return at most this, so a volume
+  /// can never credit bytes it never charged (a rebuild refused midway, for one). Balanced against
+  /// the drift-free [`Volume::retained_bytes`] by the retention oracle.
+  pub(crate) retention_charged: u64,
+  /// The retained inode versions this volume has charged to the shard's version budget, the credit
+  /// authority of the inode dimension exactly as `retention_charged` is of the byte dimension.
+  pub(crate) versions_charged: u64,
+  /// Operations refused because the shard's unpromised capacity could not back the bytes they would
+  /// retain — the non-vacuity counter of the retention refusal path (T-2.13).
+  pub(crate) retention_refusals: u64,
+  /// Retained bytes a deadlist push found unsecured. The pre-charge walks the same extents the
+  /// mutation releases, so this is zero by construction; every byte that argument ever misses is
+  /// counted here — a bug signal, never a silent under-charge.
+  pub(crate) retention_shortfall: u64,
 }
 
 impl std::fmt::Debug for Volume {
@@ -294,6 +374,22 @@ pub(crate) struct VolumeSeed {
 }
 
 impl Volume {
+  /// The metadata bytes one volume's records take at their bound (§4.2 metadata dimension), for
+  /// the admitting owner to reserve from the shard's metadata ledger before the volume exists: its
+  /// journal's whole retention budget (`journal_bytes`, the records the op log keeps before the
+  /// oldest leave), its own object, and its snapshot slab's first segment (one page of snapshot
+  /// slots). The per-inode and per-directory structures are the slabs', already inside the class;
+  /// the open-reference maps are bounded by the bridge's handle slab and are not counted here.
+  pub fn metadata_footprint(journal_bytes: usize, page: usize) -> u64 {
+    let bytes = |count: usize| u64::try_from(count).unwrap_or(u64::MAX);
+    let snapshot_segment = crate::snapshot::initial_capacity(page)
+      .get()
+      .saturating_mul(Slab::<Snapshot>::slot_bytes());
+    bytes(journal_bytes)
+      .saturating_add(bytes(size_of::<Volume>()))
+      .saturating_add(bytes(snapshot_segment))
+  }
+
   /// Creates an empty scratch volume with a root directory.
   pub fn create(store: &mut Store, mut config: VolumeConfig) -> Result<Volume, VfsError> {
     let epoch = Epoch(0);
@@ -337,12 +433,17 @@ impl Volume {
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
-      orphans: BTreeSet::new(),
+      orphans: BTreeMap::new(),
       live_inodes: 1,
       inode_allowance: u64::MAX,
       live_entries: 0,
       entry_allowance: u64::MAX,
       retention_allowance: u64::MAX,
+      retention_prepaid: 0,
+      retention_charged: 0,
+      versions_charged: 0,
+      retention_refusals: 0,
+      retention_shortfall: 0,
     })
   }
 
@@ -395,12 +496,17 @@ impl Volume {
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
-      orphans: BTreeSet::new(),
+      orphans: BTreeMap::new(),
       live_inodes: origin.live_inodes,
       inode_allowance: u64::MAX,
       live_entries: origin.live_entries,
       entry_allowance: u64::MAX,
       retention_allowance: u64::MAX,
+      retention_prepaid: 0,
+      retention_charged: 0,
+      versions_charged: 0,
+      retention_refusals: 0,
+      retention_shortfall: 0,
     })
   }
 
@@ -454,12 +560,17 @@ impl Volume {
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
-      orphans: BTreeSet::new(),
+      orphans: BTreeMap::new(),
       live_inodes: 1,
       inode_allowance: u64::MAX,
       live_entries: 0,
       entry_allowance: u64::MAX,
       retention_allowance: u64::MAX,
+      retention_prepaid: 0,
+      retention_charged: 0,
+      versions_charged: 0,
+      retention_refusals: 0,
+      retention_shortfall: 0,
     })
   }
 
@@ -986,6 +1097,23 @@ impl Volume {
     if matches!(located.child, Child::Dir(_)) {
       return Err(VfsError::IsDirectory);
     }
+    // The last name of a file whose content a snapshot pins retains that content (§4.2 retention):
+    // secured before the entry goes, so a refusal changes nothing.
+    let retention = self.retention_of_drop(store, located.inode)?;
+    self.secure_retention(store, retention)?;
+    let unlinked = self.unlink_secured(store, dir, name, located);
+    self.settle_retention(store);
+    unlinked
+  }
+
+  /// The unlink proper, under a secured retention.
+  fn unlink_secured(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    located: Located,
+  ) -> Result<(), VfsError> {
     let dir = self.make_current_dir(store, dir)?;
     let now = self.clock.wall_ns();
     let path = self.path_of(store, dir, name);
@@ -1065,6 +1193,37 @@ impl Volume {
     } else if matches!(target.map(|t| t.child), Some(Child::Dir(_))) {
       return Err(VfsError::IsDirectory);
     }
+    // A replaced file's last name retains its content when a snapshot pins it (§4.2 retention):
+    // secured before anything moves, so a refusal changes nothing.
+    let retention = match target {
+      Some(t) if matches!(t.child, Child::File(_) | Child::Symlink(_)) => {
+        self.retention_of_drop(store, t.inode)?
+      }
+      _ => 0,
+    };
+    self.secure_retention(store, retention)?;
+    let renamed = self.rename_secured(
+      store,
+      (from_dir, from_name),
+      (to_dir, to_name),
+      source,
+      target,
+    );
+    self.settle_retention(store);
+    renamed
+  }
+
+  /// The rename proper, under a secured retention for the replaced target.
+  fn rename_secured(
+    &mut self,
+    store: &mut Store,
+    from: (Handle<DirNode>, &str),
+    to: (Handle<DirNode>, &str),
+    source: Located,
+    target: Option<Located>,
+  ) -> Result<(), VfsError> {
+    let (from_dir, from_name) = from;
+    let (to_dir, to_name) = to;
     let from_path = self.path_of(store, from_dir, from_name);
     let from_dir = self.make_current_dir(store, from_dir)?;
     let to_dir = self.make_current_dir(store, to_dir)?;
@@ -1146,17 +1305,37 @@ impl Volume {
     if kind == Kind::Dir {
       return Err(VfsError::IsDirectory);
     }
-    let old_size = self.inode(store, no)?.attrs.size;
     let charge = self.write_charge(store, no, off, end)?;
+    // The windows this write reopens retain their old chunks (§4.2 retention): secure those bytes
+    // from unpromised capacity before anything changes, then admit the quota, then mutate; what the
+    // reopen does not consume returns at the end.
+    let retention = self.retention_of_write(store, no, off, end)?;
+    self.secure_retention(store, retention)?;
+    let written = self.write_secured(store, no, off, charge, bytes);
+    self.settle_retention(store);
+    written
+  }
+
+  /// The write proper, under a secured retention: the quota admits the charge, the inode is made
+  /// current, the bytes apply, the record lands.
+  fn write_secured(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    charge: u64,
+    bytes: &[u8],
+  ) -> Result<usize, VfsError> {
     if !self
       .quota
       .admit(self.bytes.total(), charge, &mut store.budget)
     {
       return Err(VfsError::NoSpace);
     }
+    let end = off.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+    let old_size = self.inode(store, no)?.attrs.size;
     let handle = self.make_current_inode(store, no)?;
     let prev_version = store.inodes.get(handle)?.version;
-    let path_ino = no;
     self.apply_write(store, handle, off, bytes)?;
     let now = self.clock.wall_ns();
     let inode = store.inodes.get_mut(handle)?;
@@ -1175,7 +1354,7 @@ impl Volume {
         len: u64::try_from(bytes.len()).unwrap_or(0),
       }
     };
-    self.record(op, "", Some(path_ino), prev_version);
+    self.record(op, "", Some(no), prev_version);
     Ok(bytes.len())
   }
 
@@ -1185,6 +1364,17 @@ impl Volume {
     if self.kind(store, no)? == Kind::Dir {
       return Err(VfsError::IsDirectory);
     }
+    // The windows a truncate cuts away retain their chunks when a snapshot pins them (§4.2
+    // retention): secured before anything changes.
+    let retention = self.retention_of_truncate(store, no, len)?;
+    self.secure_retention(store, retention)?;
+    let truncated = self.truncate_secured(store, no, len);
+    self.settle_retention(store);
+    truncated
+  }
+
+  /// The truncate proper, under a secured retention.
+  fn truncate_secured(&mut self, store: &mut Store, no: InodeNo, len: u64) -> Result<(), VfsError> {
     let handle = self.make_current_inode(store, no)?;
     let prev_version = store.inodes.get(handle)?.version;
     self.apply_truncate(store, handle, len)?;
@@ -1553,12 +1743,38 @@ impl Volume {
       .and_then(|e| e.checked_add(u64::try_from(tail.len()).unwrap_or(u64::MAX)))
       .ok_or(VfsError::FileTooLarge)?;
     let charge = self.write_charge(store, no, at, end)?;
+    // The cut-away windows and the reopened window at `at` retain their chunks when a snapshot pins
+    // them (§4.2 retention): secured before anything changes, then the quota, then the splice.
+    let retention = self.retention_of_edit(store, no, at, !bytes.is_empty() || !tail.is_empty())?;
+    self.secure_retention(store, retention)?;
+    let edited = self.edit_secured(store, no, at, delete_len, bytes, &tail, charge);
+    self.settle_retention(store);
+    edited
+  }
+
+  /// The edit proper, under a secured retention: the quota admits the charge on the final length,
+  /// then the file is cut at `at`, the new bytes written, and the old tail rewritten after them.
+  #[allow(clippy::too_many_arguments)]
+  fn edit_secured(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    at: u64,
+    delete_len: u64,
+    bytes: &[u8],
+    tail: &[u8],
+    charge: u64,
+  ) -> Result<(), VfsError> {
     if !self
       .quota
       .admit(self.bytes.total(), charge, &mut store.budget)
     {
       return Err(VfsError::NoSpace);
     }
+    let inserted = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let end = at
+      .saturating_add(inserted)
+      .saturating_add(u64::try_from(tail.len()).unwrap_or(u64::MAX));
     let handle = self.make_current_inode(store, no)?;
     let prev_version = store.inodes.get(handle)?.version;
     self.apply_truncate(store, handle, at)?;
@@ -1567,7 +1783,7 @@ impl Volume {
       self.apply_write(store, handle, at, bytes)?;
     }
     if !tail.is_empty() {
-      self.apply_write(store, handle, at + inserted, &tail)?;
+      self.apply_write(store, handle, at + inserted, tail)?;
     }
     let now = self.clock.wall_ns();
     let inode = store.inodes.get_mut(handle)?;
@@ -1682,10 +1898,12 @@ impl Volume {
     let next = snap.next;
     let prev_epoch =
       previous.and_then(|p| self.snapshots.get(snapshot_handle(p)).ok().map(|s| s.epoch));
-    // The retained versions this destroy frees (not the ones it migrates to the previous snapshot)
-    // return their charge to the shard's version budget (§4.2). Measured as the drop in the drift-free
-    // retained count across the operation, so migration (which keeps a version retained) is neutral.
+    // The retained versions and bytes this destroy frees (not the ones it migrates to the previous
+    // snapshot) return their charge to the shard budgets (§4.2). Measured as the drop in the
+    // drift-free retained counts across the operation, so migration (which keeps an object retained)
+    // is neutral.
     let retained_before = self.retained_versions();
+    let bytes_before = self.retained_bytes(store);
     let removed = self
       .snapshots
       .remove(handle)
@@ -1721,9 +1939,9 @@ impl Volume {
         },
       }
     }
-    store
-      .versions
-      .credit_retention(retained_before.saturating_sub(self.retained_versions()));
+    let versions_freed = retained_before.saturating_sub(self.retained_versions());
+    let bytes_freed = bytes_before.saturating_sub(self.retained_bytes(store));
+    self.credit_retention(store, bytes_freed, versions_freed);
     Ok(())
   }
 
@@ -1734,10 +1952,22 @@ impl Volume {
       return Err(VfsError::Destroying);
     }
     self.state = VolumeState::Destroying;
-    // The whole volume's retained versions return their charge to the shard's version budget (§4.2):
-    // the budget accounting is settled here, at destroy, while `destroy_step` frees the slots in
-    // slices afterward. Idempotent against a re-entered destroy — the count is zero the second time.
-    store.versions.credit_retention(self.retained_versions());
+    // The whole volume's retention returns to the shard budgets (§4.2): settled here, at destroy,
+    // while `destroy_step` frees the objects in slices afterward; bounded by what this volume
+    // charged, so a re-entered destroy credits zero. The bytes secured for open-unlinked orphans
+    // (charged by their unlinks, never landed on a deadlist) and any in-flight surplus go with it.
+    let orphaned = self
+      .orphans
+      .values()
+      .fold(0u64, |acc, secured| acc.saturating_add(*secured));
+    self.orphans.clear();
+    let surplus = std::mem::take(&mut self.retention_prepaid);
+    store
+      .budget
+      .credit_retention(orphaned.saturating_add(surplus));
+    let bytes = self.retention_charged;
+    let versions = self.versions_charged;
+    self.credit_retention(store, bytes, versions);
     let mut queue = Vec::new();
     let snapshots: Vec<SnapshotId> = self
       .snapshots
@@ -1767,11 +1997,15 @@ impl Volume {
     for (block, born) in blocks {
       queue.push(Dead::DirBlock(block, born));
     }
+    // The head's chunks are listed on their own (a version's release never frees its chunks, since
+    // a retired version may share them with its successor); each carries its own birth epoch, so
+    // a clone's step skips the windows it still shares with its origin exactly as it skips nodes.
     let mut inodes = Vec::new();
     trie::walk_since(&store.tries, self.inode_root, since, &mut inodes);
     for h in inodes {
       if let Ok(inode) = store.inodes.get(h) {
         queue.push(Dead::Inode(h, inode.born));
+        queue.extend(body_chunks(store, &inode.body));
       }
     }
     let mut tries = Vec::new();
@@ -1924,9 +2158,11 @@ impl Volume {
   }
 
   /// The count of retained inode versions (§4.2 retention): inode versions the head has diverged
-  /// from that its snapshots still pin, held on their deadlists. This is the version-slab pressure a
-  /// volume's snapshots add beyond its live (logical) inodes. Computed from the deadlists — the
-  /// source of truth — so it cannot drift from a maintained counter.
+  /// from that its snapshots still pin, held on their deadlists, and that this volume owns (a
+  /// clone's deadlists may name versions born at or before its origin, which the origin's snapshot
+  /// holds at no cost to the clone). This is the version-slab pressure a volume's snapshots add
+  /// beyond its live (logical) inodes. Computed from the deadlists — the source of truth — so it
+  /// cannot drift from a maintained counter.
   pub fn retained_versions(&self) -> u64 {
     let count: usize = self
       .snapshots
@@ -1936,11 +2172,268 @@ impl Volume {
           .deadlist
           .items()
           .iter()
-          .filter(|dead| matches!(dead, Dead::Inode(_, _)))
+          .filter(|dead| matches!(dead, Dead::Inode(_, born) if self.owns(*born)))
           .count()
       })
       .sum();
     u64::try_from(count).unwrap_or(u64::MAX)
+  }
+
+  /// The retained content bytes (§4.2 retention, the byte dimension): the arena blocks of chunks
+  /// the head has overwritten, truncated or unlinked that its snapshots still pin, held on their
+  /// deadlists as `Dead::Chunk`, and that this volume owns (born after its clone origin). This is
+  /// the physical arena capacity a volume's snapshots hold beyond its head-reachable
+  /// `referenced_bytes` — charged at the block length the arena actually lost (allocator rounding
+  /// included, as `physical_used` must). Computed from the deadlists and the live chunk records —
+  /// the source of truth — so it cannot drift from a maintained counter.
+  pub fn retained_bytes(&self, store: &Store) -> u64 {
+    self
+      .snapshots
+      .iter()
+      .flat_map(|(_, snap)| snap.deadlist.items().iter())
+      .filter_map(|dead| match dead {
+        Dead::Chunk(handle, born) if self.owns(*born) => store.content.chunk(*handle),
+        _ => None,
+      })
+      .map(|chunk| u64::try_from(chunk.block.len).unwrap_or(u64::MAX))
+      .fold(0u64, u64::saturating_add)
+  }
+
+  /// Operations refused because the shard's unpromised capacity could not back the bytes they would
+  /// have retained (§4.2 retention): the non-vacuity counter of the byte-retention refusal path.
+  pub const fn retention_refusals(&self) -> u64 {
+    self.retention_refusals
+  }
+
+  /// Retained bytes that landed on a deadlist without having been secured first — zero by
+  /// construction (the pre-charge walks the extents the mutation releases); a move is a bug signal.
+  pub const fn retention_shortfall_bytes(&self) -> u64 {
+    self.retention_shortfall
+  }
+
+  /// Whether this volume owns an object born at `born`: born after its clone origin, if it has one.
+  /// A clone's deadlists may name its origin's objects (a copy-up of an inherited version lists the
+  /// version and, later, its windows), which the origin's pinned snapshot holds whatever the clone
+  /// does; they cost the clone nothing and are neither charged nor counted.
+  fn owns(&self, born: Epoch) -> bool {
+    !self.origin_epoch.is_some_and(|origin| born <= origin)
+  }
+
+  /// Whether an object born at `born` is retained by this volume when the head lets go of it: a
+  /// snapshot of this volume still reaches it (born at or before the last snapshot's epoch) and this
+  /// volume owns it. The one rule both retention dimensions charge and count by.
+  pub(crate) fn retains(&self, born: Epoch) -> bool {
+    self.last_snapshot_epoch().is_some_and(|snap| born <= snap) && self.owns(born)
+  }
+
+  /// The arena bytes the pieces of `no`'s content selected by `touched` (by file offset and
+  /// length) would retain if the head released them now: each such piece's block length, when this
+  /// volume retains its birth epoch. A piece is a sealed or base-pinned chunk, or the open extent —
+  /// which the copy-up every mutation begins with seals into a chunk born at the extent's own epoch
+  /// before anything is released, so it is retained exactly as a sealed chunk of that epoch would be.
+  fn retention_of_pieces(
+    &self,
+    store: &Store,
+    no: InodeNo,
+    touched: impl Fn(u64, u64) -> bool,
+  ) -> Result<u64, VfsError> {
+    let inode = self.inode(store, no)?;
+    let block_len = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
+    let mut retained = body_extents(&inode.body)
+      .iter()
+      .filter(|e| touched(e.off, e.len))
+      .filter_map(|e| match e.src {
+        ExtentSrc::Chunk { chunk, .. } => store.content.chunk(chunk),
+        ExtentSrc::Zero => None,
+      })
+      .filter(|chunk| self.retains(chunk.born))
+      .map(|chunk| block_len(chunk.block.len))
+      .fold(0u64, u64::saturating_add);
+    if let Body::Open { open, .. } = &inode.body
+      && open.len > 0
+      && touched(open.off, open.len)
+      && self.retains(open.born)
+    {
+      retained = retained.saturating_add(block_len(open.block.len));
+    }
+    Ok(retained)
+  }
+
+  /// The retention a write of `[off, end)` into `no` causes: every chunk window the write touches
+  /// that holds a chunk is reopened — its bytes copied into a fresh extent, the old chunk released
+  /// by the epoch rule — so each such retained chunk's block is charged. The same windows
+  /// `apply_write`'s cursor enters (`open_window`, once per window).
+  fn retention_of_write(
+    &self,
+    store: &Store,
+    no: InodeNo,
+    off: u64,
+    end: u64,
+  ) -> Result<u64, VfsError> {
+    let chunk = u64::try_from(store.content.chunk_bytes())
+      .unwrap_or(u64::MAX)
+      .max(1);
+    let (first, last) = (off / chunk, end.saturating_sub(1) / chunk);
+    self.retention_of_pieces(store, no, |piece, _| {
+      let window = piece / chunk;
+      window >= first && window <= last
+    })
+  }
+
+  /// The retention a truncate to `len` causes: every piece wholly past the cut is released
+  /// (`clip_extents`), and so is the chunk of a partly cut piece whose page count drops (the piece
+  /// is rebuilt at its new length); a partly cut piece that keeps its page count keeps its chunk.
+  fn retention_of_truncate(&self, store: &Store, no: InodeNo, len: u64) -> Result<u64, VfsError> {
+    if len >= self.inode(store, no)?.attrs.size {
+      return Ok(0);
+    }
+    let page = u64::try_from(store.content.page()).unwrap_or(1);
+    let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
+    self.retention_of_pieces(store, no, |piece, piece_len| {
+      piece >= len
+        || (piece + piece_len > len
+          && charged_window(len - piece, page, chunk) < charged_window(piece_len, page, chunk))
+    })
+  }
+
+  /// The retention an edit at `at` causes: the pieces past the cut, plus the piece holding `at`
+  /// when the edit writes anything (the write reopens that window). An edit that writes nothing
+  /// secures the window's bytes too and returns them unconsumed.
+  fn retention_of_edit(
+    &self,
+    store: &Store,
+    no: InodeNo,
+    at: u64,
+    writes: bool,
+  ) -> Result<u64, VfsError> {
+    let chunk = u64::try_from(store.content.chunk_bytes())
+      .unwrap_or(u64::MAX)
+      .max(1);
+    let page = u64::try_from(store.content.page()).unwrap_or(1);
+    let window_start = at - at % chunk;
+    self.retention_of_pieces(store, no, |piece, piece_len| {
+      piece >= at
+        || (piece == window_start
+          && (writes
+            || (piece + piece_len > at
+              && charged_window(at - piece, page, chunk) < charged_window(piece_len, page, chunk))))
+    })
+  }
+
+  /// The retention the whole content of `no` causes when the head lets go of it.
+  fn retention_of_content(&self, store: &Store, no: InodeNo) -> Result<u64, VfsError> {
+    self.retention_of_pieces(store, no, |_, _| true)
+  }
+
+  /// The retention dropping one link of `no` causes: its whole content, when this is the last name
+  /// of a file (a directory has no chunks; a remaining hard link keeps the content the head's).
+  pub(crate) fn retention_of_drop(&self, store: &Store, no: InodeNo) -> Result<u64, VfsError> {
+    let inode = self.inode(store, no)?;
+    if inode.kind == Kind::Dir || inode.attrs.nlink != 1 {
+      return Ok(0);
+    }
+    self.retention_of_content(store, no)
+  }
+
+  /// Secures `bytes` of retention from the shard budget before an operation mutates anything (§4.2:
+  /// "a new retained snapshot ... cannot use up a writer's promised future space"): drawn from
+  /// unpromised capacity — the arena less every reservation, every admitted growth and the
+  /// operation headroom — or refused `NoSpace` with nothing changed, as OpenZFS refuses a delete on
+  /// a full pool whose blocks a snapshot still holds [C: OpenZFS `zfs_remove`, ENOSPC at
+  /// `dmu_tx_assign`]. The secured bytes are consumed as the retained chunks land on a deadlist.
+  pub(crate) fn secure_retention(&mut self, store: &mut Store, bytes: u64) -> Result<(), VfsError> {
+    if bytes == 0 {
+      return Ok(());
+    }
+    if store.budget.charge_retention(bytes).is_err() {
+      self.retention_refusals = self.retention_refusals.saturating_add(1);
+      return Err(VfsError::NoSpace);
+    }
+    self.retention_prepaid = self.retention_prepaid.saturating_add(bytes);
+    Ok(())
+  }
+
+  /// Ends an operation's retention: whatever it secured and did not consume returns to the budget.
+  /// Operations do not nest (no secured operation calls another), so this settles exactly the one
+  /// in progress.
+  pub(crate) fn settle_retention(&mut self, store: &mut Store) {
+    let surplus = std::mem::take(&mut self.retention_prepaid);
+    store.budget.credit_retention(surplus);
+  }
+
+  /// Lands the objects the head let go of on the newest snapshot's deadlist (or nowhere, when no
+  /// snapshot of this volume reaches them), consuming the secured retention for each retained chunk:
+  /// from here on its block is this volume's retained bytes, charged, and credited back when freed.
+  fn retain_dead_list(&mut self, store: &mut Store, mut dead: Deadlist) {
+    for item in dead.take() {
+      if let Dead::Chunk(handle, born) = item
+        && self.retains(born)
+      {
+        let len = store
+          .content
+          .chunk(handle)
+          .map_or(0, |c| u64::try_from(c.block.len).unwrap_or(u64::MAX));
+        let covered = len.min(self.retention_prepaid);
+        self.retention_prepaid -= covered;
+        let mut charged = covered;
+        let short = len - covered;
+        if short > 0 {
+          // Unreachable by construction; counted, never silent, and charged when the budget can
+          // still take it so the ledger stays the physical truth.
+          self.retention_shortfall = self.retention_shortfall.saturating_add(short);
+          if store.budget.charge_retention(short).is_ok() {
+            charged += short;
+          }
+        }
+        self.retention_charged = self.retention_charged.saturating_add(charged);
+      }
+      if let Some(list) = self.deadlist_mut() {
+        list.push(item);
+      }
+    }
+  }
+
+  /// Returns freed retention to the shard budgets, never more than this volume charged (the credit
+  /// authority), so a volume cannot credit bytes or slots it never took.
+  fn credit_retention(&mut self, store: &mut Store, bytes: u64, versions: u64) {
+    let bytes = bytes.min(self.retention_charged);
+    self.retention_charged -= bytes;
+    store.budget.credit_retention(bytes);
+    let versions = versions.min(self.versions_charged);
+    self.versions_charged -= versions;
+    store.versions.credit_retention(versions);
+  }
+
+  /// Re-establishes this volume's retention charges after a rebuild (§4.2 accounting through
+  /// recovery): the bytes and inode versions its deadlists retain, and the bytes secured for each
+  /// open-unlinked orphan (charged by the unlink before the restart, consumed at the reclaim the
+  /// reacquired handle's last close performs). All or nothing: a shard whose arena or version slab
+  /// cannot back what was admitted before the restart refuses with `NoSpace` and charges nothing.
+  pub(crate) fn reestablish_retention(&mut self, store: &mut Store) -> Result<(), VfsError> {
+    let bytes = self.retained_bytes(store);
+    let versions = self.retained_versions();
+    let mut orphaned = Vec::with_capacity(self.orphans.len());
+    for no in self.orphans.keys().copied().collect::<Vec<_>>() {
+      orphaned.push((no, self.retention_of_content(store, no)?));
+    }
+    let secured = orphaned
+      .iter()
+      .fold(0u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
+    let all = bytes.saturating_add(secured);
+    store
+      .budget
+      .charge_retention(all)
+      .map_err(|_| VfsError::NoSpace)?;
+    if store.versions.charge_retention(versions).is_err() {
+      store.budget.credit_retention(all);
+      return Err(VfsError::NoSpace);
+    }
+    self.retention_charged = bytes;
+    self.versions_charged = versions;
+    for (no, bytes) in orphaned {
+      self.orphans.insert(no, bytes);
+    }
+    Ok(())
   }
 
   /// Sets the volume's namespace (entry) allowance (§4.2), refusing `NoSpace` if it is below the
@@ -2086,7 +2579,7 @@ impl Volume {
     // shared version slab. Unbounded by default (`u64::MAX`), so this never fires until an owner sets
     // it; the count is the drift-free `retained_versions`.
     if self.retention_allowance != u64::MAX
-      && self.last_snapshot_epoch().is_some_and(|snap| born <= snap)
+      && self.retains(born)
       && self.retained_versions() >= self.retention_allowance
     {
       return Err(VfsError::NoSpace);
@@ -2096,11 +2589,13 @@ impl Volume {
     // snapshot ... cannot use up a writer's promised future space"). Refused before the copy-up if no
     // unpromised capacity remains, so a snapshot-and-diverge never spends a bounded writer's reserved
     // slab. Credited back symmetrically as retained versions are freed in `destroy_snapshot`/`destroy`.
-    if self.last_snapshot_epoch().is_some_and(|snap| born <= snap) {
+    // A version this volume does not own (a clone's inherited one) costs it nothing and is not charged.
+    if self.retains(born) {
       store
         .versions
         .charge_retention(1)
         .map_err(|_| VfsError::NoSpace)?;
+      self.versions_charged = self.versions_charged.saturating_add(1);
     }
     let _ = kind;
     let mut copy = store.inodes.get(handle)?.clone();
@@ -2372,7 +2867,10 @@ impl Volume {
     // reference), keep its content and table entry alive as an orphan and reclaim at the last
     // `unreference` (POSIX unlink-while-open); otherwise reclaim now.
     if self.references.get(&no).is_some_and(|count| *count > 0) {
-      self.orphans.insert(no);
+      // The reclaim waits for the last close, which cannot refuse: the retention the operation
+      // secured for this content rides with the orphan record until then.
+      let secured = std::mem::take(&mut self.retention_prepaid);
+      self.orphans.insert(no, secured);
       Ok(())
     } else {
       self.reclaim_inode(store, no)
@@ -2434,16 +2932,24 @@ impl Volume {
       }
       None => 0,
     };
-    if remaining == 0 && self.orphans.contains(&no) {
+    if remaining == 0 && self.orphans.contains_key(&no) {
       // Reclaim only if the inode is still unlinked. A re-link — a future `LINK` /
       // `linkat(AT_EMPTY_PATH)` on the still-open inode — revives it with a name, and it must not
       // be reclaimed then. No operation can re-link a nameless orphan today, so this guards that
       // owed operation rather than fixing a reachable bug.
       let nlink = self.inode(store, no).map(|i| i.attrs.nlink).unwrap_or(0);
       if nlink == 0 {
-        // Reclaim before dropping the orphan record, so a failed reclamation retains the cleanup
-        // obligation (the orphan is retried) rather than leaking the inode.
-        self.reclaim_inode(store, no)?;
+        // The retention the unlink secured is consumed by this reclaim (§4.2 retention); a failed
+        // reclamation keeps the cleanup obligation — and the secured bytes — with the orphan record,
+        // so it is retried rather than leaked.
+        let secured = self.orphans.remove(&no).unwrap_or(0);
+        self.retention_prepaid = self.retention_prepaid.saturating_add(secured);
+        if let Err(e) = self.reclaim_inode(store, no) {
+          let kept = std::mem::take(&mut self.retention_prepaid);
+          self.orphans.insert(no, kept);
+          return Err(e);
+        }
+        self.settle_retention(store);
       }
       self.orphans.remove(&no);
     }
@@ -2573,19 +3079,17 @@ impl Volume {
       Body::Base(b) => release_extents(store, &b.pinned, last, &mut dead)?,
       _ => {}
     }
-    for d in dead.take() {
-      if let Some(list) = self.deadlist_mut() {
-        list.push(d);
-      }
-    }
+    self.retain_dead_list(store, dead);
     Ok(())
   }
 
-  /// The bytes a write will add to `referenced_bytes`: the materialized delta under the chunk
-  /// rule (§4.5, D-6). Content is materialized per chunk window: a write into a window
-  /// materializes the window from its start to the write's end, so `materialized(window) =
-  /// max(existing, end within window)`; inline content is materialized byte for byte until a
-  /// write ends past the inline threshold, when it spills into the first window.
+  /// The bytes a write will add to `referenced_bytes`: the charged delta under the chunk rule
+  /// (§4.5, D-6) with the allocator's rounding (§4.2). Content is materialized per chunk window: a
+  /// write into a window materializes the window from its start to the write's end, so
+  /// `materialized(window) = max(existing, end within window)`, and the window is charged its
+  /// arena block — the materialized length rounded up to the page ([`charged_window`]). Inline
+  /// content is charged byte for byte until a write ends past the inline threshold, when it spills
+  /// into the first window.
   pub(crate) fn write_charge(
     &self,
     store: &Store,
@@ -2595,16 +3099,19 @@ impl Volume {
   ) -> Result<u64, VfsError> {
     let inode = self.inode(store, no)?;
     let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
+    let page = u64::try_from(store.content.page()).unwrap_or(1);
     let inline = u64::try_from(store.inline_bytes).unwrap_or(0);
     let before = materialized_windows(&inode.body, chunk);
     let mut after = before.clone();
+    let mut inline_before = 0;
     if let Body::Inline(v) = &inode.body {
+      let len = u64::try_from(v.len()).unwrap_or(0);
       if end <= inline {
-        let len = u64::try_from(v.len()).unwrap_or(0);
         return Ok(end.saturating_sub(len));
       }
       // The inline bytes spill into the first window before the write applies.
-      after.insert(0, u64::try_from(v.len()).unwrap_or(0));
+      after.insert(0, len);
+      inline_before = len;
     }
     let mut cursor = off;
     while cursor < end {
@@ -2616,9 +3123,14 @@ impl Volume {
       *entry = (*entry).max(materialized);
       cursor = write_end;
     }
-    let total_before: u64 = before.values().sum();
-    let total_after: u64 = after.values().sum();
-    Ok(total_after.saturating_sub(total_before))
+    let charged = |windows: &std::collections::BTreeMap<u64, u64>| {
+      windows
+        .values()
+        .map(|m| charged_window(*m, page, chunk))
+        .fold(0u64, u64::saturating_add)
+    };
+    let total_before = charged(&before).saturating_add(inline_before);
+    Ok(charged(&after).saturating_sub(total_before))
   }
 
   pub(crate) fn apply_write(
@@ -2645,11 +3157,19 @@ impl Volume {
         Body::Inline(v)
       }
       Body::Inline(v) => {
-        // Spill the inline bytes into an open extent, then write.
-        let mut open =
-          store
-            .content
-            .open(0, usize::try_from(end.min(chunk)).unwrap_or(0), epoch)?;
+        // Spill the inline bytes into an open extent sized to what window 0 will hold — the inline
+        // bytes, extended by this write only when it lands in window 0 — then write. Sizing it to
+        // the write's end regardless gave a far write a whole-chunk block for a few inline bytes,
+        // which the physical charge (§4.2 allocator rounding) made visible as a phantom chunk.
+        let inline_len = u64::try_from(v.len()).unwrap_or(0);
+        let window_zero = if off < chunk {
+          end.min(chunk).max(inline_len)
+        } else {
+          inline_len
+        };
+        let mut open = store
+          .content
+          .open(0, usize::try_from(window_zero).unwrap_or(0), epoch)?;
         store.content.write_open(&mut open, 0, &v)?;
         let mut sealed = Vec::new();
         self.write_into(store, &mut open, &mut sealed, off, bytes)?
@@ -2717,11 +3237,7 @@ impl Volume {
       let last = self.last_snapshot_epoch();
       let mut dead = Deadlist::default();
       store.content.release_chunk(c, last, &mut dead)?;
-      for d in dead.take() {
-        if let Some(list) = self.deadlist_mut() {
-          list.push(d);
-        }
-      }
+      self.retain_dead_list(store, dead);
     }
     Ok(open)
   }
@@ -2776,6 +3292,7 @@ impl Volume {
       return Ok(());
     }
     let last = self.last_snapshot_epoch();
+    let epoch = self.epoch;
     let before = content_by_epoch(store, handle);
     let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
     let mut dead = Deadlist::default();
@@ -2785,36 +3302,32 @@ impl Volume {
         Body::Inline(v)
       }
       Body::Sealed(mut extents) => {
-        clip_extents(store, &mut extents, len, last, &mut dead)?;
+        clip_extents(store, &mut extents, len, last, epoch, &mut dead)?;
         Body::Sealed(extents)
       }
       Body::Open {
         mut open,
         mut sealed,
       } => {
-        clip_extents(store, &mut sealed, len, last, &mut dead)?;
+        clip_extents(store, &mut sealed, len, last, epoch, &mut dead)?;
         if open.off >= len {
           store.content.release_open(open)?;
           Body::Sealed(sealed)
         } else {
           let keep = len - open.off;
-          ChunkStore::truncate_open(&mut open, keep);
+          store.content.shrink_open(&mut open, keep)?;
           Body::Open { open, sealed }
         }
       }
       Body::Base(mut b) => {
-        clip_extents(store, &mut b.pinned, len, last, &mut dead)?;
+        clip_extents(store, &mut b.pinned, len, last, epoch, &mut dead)?;
         // Disk bytes past the cut are no longer the file's; a later extension is a hole.
         b.base_len = b.base_len.min(len);
         Body::Base(b)
       }
       other => other,
     };
-    for d in dead.take() {
-      if let Some(list) = self.deadlist_mut() {
-        list.push(d);
-      }
-    }
+    self.retain_dead_list(store, dead);
     store.inodes.get_mut(handle)?.body = new_body;
     self.reconcile(before, content_by_epoch(store, handle));
     Ok(())
@@ -2914,42 +3427,54 @@ impl ByEpoch {
   }
 }
 
-/// An inode's content bytes by birth epoch: inline bytes are born with the record, an extent's
-/// bytes with its chunk, an open extent's with the extent.
+/// An inode's content bytes by birth epoch — the bytes it is charged (§4.2 "physical_used
+/// includes allocator rounding"; D-13's `referenced` counts allocated bytes): inline bytes byte for
+/// byte, born with the record (they live in the inode); a chunk's whole arena block, born with the
+/// chunk; an open extent's whole block, born with the extent. A block is the buddy block its
+/// window's materialized length takes ([`charged_window`]), so the sum is exactly the arena the
+/// head holds.
 pub(crate) fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> Vec<(Epoch, u64)> {
   let Ok(inode) = store.inodes.get(handle) else {
     return Vec::new();
   };
-  let sealed_born = |e: &Extent| match e.src {
-    ExtentSrc::Chunk { chunk, .. } => store.content.chunk(chunk).map(|c| c.born),
+  let sealed_block = |e: &Extent| match e.src {
+    ExtentSrc::Chunk { chunk, .. } => store
+      .content
+      .chunk(chunk)
+      .map(|c| (c.born, u64::try_from(c.block.len).unwrap_or(u64::MAX))),
     ExtentSrc::Zero => None,
   };
   match &inode.body {
     Body::Inline(b) => vec![(inode.born, u64::try_from(b.len()).unwrap_or(0))],
-    Body::Sealed(extents) => extents
-      .iter()
-      .filter_map(|e| sealed_born(e).map(|born| (born, chunk_len(e))))
-      .collect(),
+    Body::Sealed(extents) => extents.iter().filter_map(sealed_block).collect(),
     Body::Open { open, sealed } => {
-      let mut out: Vec<(Epoch, u64)> = sealed
-        .iter()
-        .filter_map(|e| sealed_born(e).map(|born| (born, chunk_len(e))))
-        .collect();
-      out.push((open.born, open.len));
+      let mut out: Vec<(Epoch, u64)> = sealed.iter().filter_map(sealed_block).collect();
+      out.push((open.born, u64::try_from(open.block.len).unwrap_or(u64::MAX)));
       out
     }
-    Body::Base(b) => b
-      .pinned
-      .iter()
-      .filter_map(|e| sealed_born(e).map(|born| (born, chunk_len(e))))
-      .collect(),
+    Body::Base(b) => b.pinned.iter().filter_map(sealed_block).collect(),
     _ => Vec::new(),
   }
 }
 
+/// The bytes a window of `materialized` bytes is charged: its arena block — the smallest
+/// power-of-two number of pages holding the materialized length, at most a chunk, which is what
+/// the buddy arena hands out (§4.2 "physical_used includes allocator rounding"; §4.5
+/// "page-multiple growth from the buddy tree"). Zero for an empty window. The model oracle states
+/// the same rule (`crates/vfs/tests/model.rs`), and its first run under a bare page multiple found
+/// the buddy's rounding: a 15-page window takes 16.
+pub(crate) fn charged_window(materialized: u64, page: u64, chunk: u64) -> u64 {
+  if materialized == 0 {
+    return 0;
+  }
+  let page = page.max(1);
+  let pages = materialized.div_ceil(page).next_power_of_two();
+  pages.saturating_mul(page).min(chunk.max(1))
+}
+
 /// The materialized bytes per chunk window of a body: window index → bytes from the window's
 /// start (the chunk rule of §4.5: an extent covers its window from the window's start to the
-/// extent's end, at most one chunk).
+/// extent's end, at most one chunk). The charge is each window's [`charged_window`].
 fn materialized_windows(body: &Body, chunk: u64) -> std::collections::BTreeMap<u64, u64> {
   let mut map = std::collections::BTreeMap::new();
   let chunk = chunk.max(1);
@@ -2981,13 +3506,6 @@ pub(crate) fn stamp_all(attrs: &mut Attrs, now: i64) {
   attrs.mtime = now;
   attrs.ctime = now;
   attrs.btime = now;
-}
-
-pub(crate) fn chunk_len(e: &Extent) -> u64 {
-  match e.src {
-    ExtentSrc::Chunk { .. } => e.len,
-    ExtentSrc::Zero => 0,
-  }
 }
 
 /// Copies the overlap of `bytes` (at file offset `base`) into `out` (at file offset `off`).
@@ -3031,12 +3549,16 @@ pub(crate) fn insert_extent(list: &mut Vec<Extent>, e: Extent) {
   list.insert(at, e);
 }
 
-/// Clips extents to `len`, releasing the chunks fully beyond it; returns bytes freed.
+/// Clips extents to `len`, releasing the chunks fully beyond it; a partly cut extent whose block
+/// would shrink is rebuilt at its new length (the window's block is always the buddy block its
+/// materialized length takes, §4.2 "allocator rounding"), its old chunk released by the epoch rule
+/// like any window the head rewrites. Returns bytes freed.
 pub(crate) fn clip_extents(
   store: &mut Store,
   extents: &mut Vec<Extent>,
   len: u64,
   last: Option<Epoch>,
+  epoch: Epoch,
   dead: &mut Deadlist,
 ) -> Result<u64, VfsError> {
   let mut freed = 0u64;
@@ -3053,7 +3575,7 @@ pub(crate) fn clip_extents(
         src: e.src,
       };
       freed += e.len - clipped.len;
-      keep.push(clipped);
+      keep.push(rebuilt_if_smaller(store, clipped, last, epoch, dead)?);
     } else {
       keep.push(e);
     }
@@ -3062,15 +3584,39 @@ pub(crate) fn clip_extents(
   Ok(freed)
 }
 
+/// A clipped extent, rebuilt into a fresh chunk of its new length's page multiple when its old
+/// chunk's block is larger (the old chunk released by the epoch rule); the extent itself otherwise.
+fn rebuilt_if_smaller(
+  store: &mut Store,
+  clipped: Extent,
+  last: Option<Epoch>,
+  epoch: Epoch,
+  dead: &mut Deadlist,
+) -> Result<Extent, VfsError> {
+  let ExtentSrc::Chunk { chunk, .. } = clipped.src else {
+    return Ok(clipped);
+  };
+  let block = store.content.chunk(chunk).map_or(0, |c| c.block.len);
+  let need = usize::try_from(clipped.len).unwrap_or(usize::MAX);
+  if store.content.block_bytes(need) >= block {
+    return Ok(clipped);
+  }
+  let open = store.content.reopen(&clipped, epoch)?;
+  let rebuilt = store.content.seal(open)?.unwrap_or(clipped);
+  store.content.release_chunk(chunk, last, dead)?;
+  Ok(rebuilt)
+}
+
 /// Every directory node reachable from `root` and born after `since`; a node born at or before
 /// `since` is shared with the clone's origin and its subtree with it (a child's copy forces the
 /// parent's), so the walk visits only the volume's own nodes (§4.5, the clone destroy example).
 /// Every object a tree rooted at `dir_root`/`inode_root` reaches, as a deadlist (§4.8 recovery). A
 /// recovered snapshot's tree is independent (distinct handles from the head and other snapshots), so
 /// this is exactly what dropping the snapshot must reclaim — `destroy_snapshot` reclaims only from
-/// the deadlist, so a recovered snapshot needs one or it leaks its tree on drop. Chunks are freed
-/// with their inode versions (as [`Volume::destroy`]'s own walk relies on), so only nodes and inode
-/// versions are listed.
+/// the deadlist, so a recovered snapshot needs one or it leaks its tree on drop. A private version's
+/// chunks are listed as their own `Dead::Chunk`s (a version's release never frees its chunks, as
+/// [`Volume::destroy`]'s walk lists them too); a version shared with the head is the head's, chunks
+/// included.
 pub(crate) fn tree_deadlist_excluding(
   store: &Store,
   dir_root: Handle<DirNode>,
@@ -3099,6 +3645,9 @@ pub(crate) fn tree_deadlist_excluding(
         continue;
       }
       list.push(Dead::Inode(handle, inode.born));
+      for chunk in body_chunks(store, &inode.body) {
+        list.push(chunk);
+      }
     }
   }
   let mut tries = Vec::new();
@@ -3151,9 +3700,18 @@ fn block_segment_slots(page: usize) -> Derived<usize> {
 const BLOCK_SEGMENT_PAGES: usize = 64;
 
 /// Releases a dead object and returns the work units it cost, so a destroy slice's budget
-/// counts what is freed rather than how many handles it touched: an inode one unit per extent
-/// plus one, a directory node, a block, a trie node or a chunk one unit (their slots are
-/// vacated in place, never copied out).
+/// counts what is freed rather than how many handles it touched: a directory node, a block, a
+/// trie node, a chunk or an inode version one unit each, an open extent's block one more (their
+/// slots are vacated in place, never copied out).
+///
+/// An inode version's sealed chunks are never freed with it. A copy-up clones the body, so a
+/// retired version and the current version copied from it share every chunk until the head
+/// rewrites a window; freeing them here took the head's untouched windows with the snapshot
+/// (docs/bugs/2026-09-13-snapshot-destroy-frees-head-shared-chunks.md). A chunk is released
+/// exactly once, by the head, when the head stops reaching it (`ChunkStore::release_chunk`'s
+/// epoch rule: freed now, or the newest snapshot's own `Dead::Chunk`), or listed as its own
+/// `Dead::Chunk` by [`Volume::destroy`]'s walk of the head and by the recovery rebuild
+/// ([`tree_deadlist_excluding`]). Only an open extent's block belongs to the version alone.
 fn release_dead(store: &mut Store, dead: Dead) -> Result<usize, VfsError> {
   match dead {
     Dead::Dir(h, _) => {
@@ -3168,16 +3726,11 @@ fn release_dead(store: &mut Store, dead: Dead) -> Result<usize, VfsError> {
       let Ok(inode) = store.inodes.remove(h) else {
         return Ok(1);
       };
-      let extents = match inode.body {
-        Body::Sealed(extents) => free_extents(store, &extents),
-        Body::Open { open, sealed } => {
-          let _ = store.content.release_open(open);
-          free_extents(store, &sealed) + 1
-        }
-        Body::Base(b) => free_extents(store, &b.pinned),
-        _ => 0,
-      };
-      Ok(1 + extents)
+      if let Body::Open { open, .. } = inode.body {
+        let _ = store.content.release_open(open);
+        return Ok(2);
+      }
+      Ok(1)
     }
     Dead::Trie(h, _) => {
       let _ = store.tries.discard(h);
@@ -3190,12 +3743,28 @@ fn release_dead(store: &mut Store, dead: Dead) -> Result<usize, VfsError> {
   }
 }
 
-/// Frees the chunks of sealed extents; returns how many there were.
-fn free_extents(store: &mut Store, extents: &[Extent]) -> usize {
-  for e in extents {
-    if let ExtentSrc::Chunk { chunk, .. } = e.src {
-      let _ = store.content.free_chunk(chunk);
-    }
+/// The sealed extents a body holds: its sealed list, the sealed list beneath an open extent, or a
+/// base body's pinned windows; none for inline, symlink, directory and empty bodies.
+pub(crate) fn body_extents(body: &Body) -> &[Extent] {
+  match body {
+    Body::Sealed(extents) => extents,
+    Body::Open { sealed, .. } => sealed,
+    Body::Base(b) => &b.pinned,
+    _ => &[],
   }
-  extents.len()
+}
+
+/// The sealed chunks a body references, each paired with its birth epoch so a caller can list it
+/// as its own `Dead::Chunk`.
+pub(crate) fn body_chunks(store: &Store, body: &Body) -> Vec<Dead> {
+  body_extents(body)
+    .iter()
+    .filter_map(|e| match e.src {
+      ExtentSrc::Chunk { chunk, .. } => store
+        .content
+        .chunk(chunk)
+        .map(|c| Dead::Chunk(chunk, c.born)),
+      ExtentSrc::Zero => None,
+    })
+    .collect()
 }

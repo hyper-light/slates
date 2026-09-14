@@ -597,6 +597,22 @@ pub struct ShardReport {
   /// Fleet peers this shard has a formed probe session to (§4.8 "Membership"). The membership loop runs
   /// on the control shard, so only its part counts; the other shards form none. Zero on a laptop.
   pub peers_probed: u32,
+  /// The part of `committed_bytes` that is snapshot-retained content (§4.2 retention, the byte
+  /// dimension): arena blocks the heads have let go of that their snapshots still pin, charged from
+  /// unpromised capacity. Distinguishes bytes held for snapshots from promised entitlement.
+  pub retained_bytes: u64,
+  /// The part of `committed_versions` that is snapshot-retained inode versions (§4.2 retention,
+  /// the inode dimension).
+  pub retained_versions: u64,
+  /// The shard's metadata ledger (§4.2 metadata dimension): the metadata class less its slabs'
+  /// maximum footprint — what volume records (journal budgets, volume objects) may take.
+  pub metadata_bytes: u64,
+  /// Metadata bytes reserved for the records of the volumes the shard owns.
+  pub committed_metadata: u64,
+  /// The bytes the shard's content arena maps — its address space — of which `reserve_bytes` is
+  /// the usable (buddy-allocatable) part the budget admits against (§4.2 "segment, slab and buddy
+  /// geometry report usable capacity, not mapping length": both, so the difference is visible).
+  pub mapped_bytes: u64,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.

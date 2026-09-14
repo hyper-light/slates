@@ -865,7 +865,7 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   );
   for shard in &report.shards {
     out.push_str(&format!(
-      "shard {}: clients={} volumes={} served={} replayed={} replay_ns={} torn={} reserve={} committed={}\n",
+      "shard {}: clients={} volumes={} served={} replayed={} replay_ns={} torn={} mapped={} reserve={} committed={} retained={} retained_versions={} metadata={} committed_metadata={}\n",
       shard.partition,
       shard.clients,
       shard.volumes,
@@ -873,8 +873,13 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
       shard.replayed_records,
       shard.replay_ns,
       shard.torn_tail,
+      shard.mapped_bytes,
       shard.reserve_bytes,
-      shard.committed_bytes
+      shard.committed_bytes,
+      shard.retained_bytes,
+      shard.retained_versions,
+      shard.metadata_bytes,
+      shard.committed_metadata
     ));
     for refusal in &shard.refusals {
       out.push_str(&format!(

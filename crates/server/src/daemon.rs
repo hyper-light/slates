@@ -1142,7 +1142,7 @@ fn init_shard(
   // buddy-allocatable capacity), not the region's mapping length, so admission never promises quota
   // the arena cannot back (BUG-2), and it keeps the derived operation headroom free of every
   // admission. Living with the store, the write path reaches it without a lock.
-  let store = Store::new(
+  let mut store = Store::new(
     &StoreConfig {
       page: config.page,
       cache_line: config.cache_line,
@@ -1155,6 +1155,12 @@ fn init_shard(
     arena,
     headroom.get(),
   );
+  // The metadata class (§4.2 metadata dimension): the slabs' maximum footprint comes off the top and
+  // the remainder is the ledger every volume's records are reserved from; a layout whose slabs alone
+  // exceed the class is refused here, before serving, rather than admitting records it cannot back.
+  store
+    .set_metadata_class(config.store.metadata_class_bytes)
+    .map_err(ServerError::Memory)?;
   let shard = registry::current_shard().unwrap_or(partition);
   // The node's host id — what a recorded holder set and a volume id's creator-host bits name it by. A
   // fleet node's is the member id its manifest derives from its certificate (`crate::deploy`), so it is

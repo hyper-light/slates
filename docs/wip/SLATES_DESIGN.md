@@ -639,6 +639,7 @@ plan schedules.
 ### D-13 Accounting: `referenced_bytes` and `unique_bytes` per volume on the owner; O(1) ENOSPC; shared chunks charged in full per referencer; physical budget charged once
 - Evidence: ZFS `referenced`/`used` and deadlists; Btrfs qgroups `rfer`/`excl` [C: OpenZFS dsl_dataset.c; C: Btrfs qgroups]. (`research/cow-data-structures.md` §2.6)
 - Lost: fractional accounting (inexact, needs global knowledge).
+- Amended (A-16, 2026-09-13): the charge of a window is **physical** — the buddy block it takes, `min(chunk, page × next_pow2(ceil(materialized_length / page)))`, never its logical length — so `referenced_bytes`/`unique_bytes` are what the arena holds (ZFS `referenced` counts allocated bytes); a partly cut window is rebuilt when its block would shrink; and a snapshot-retained chunk is charged from unpromised capacity by the operation that retains it, refused `NoSpace` before any mutation (an unlink or truncate on a volume whose retention cannot be charged is refused, as OpenZFS refuses a delete on a full pool).
 
 ### D-14 Database and replication: Vertical Paxos II with copyset neighbourhoods; one quorum rule with hedged placement; configuration by consensus, never per write; owner-local live state; route by id; epoch-ordered mirroring with a per-operation durability scope; N=1 is the same code
 - The decision: every replicated object, sealed content or record, has 2f+1 candidate holders, the owner among them, drawn by rendezvous from the owner's neighbourhood, a fixed set of hosts across failure domains whose size (the scatter width) bounds the copyset count; a write commits at f+1 acknowledgements from any candidates and the acknowledging set is recorded in the object's head record; records are sent to all candidates at once, content to f+1 with hedged and tied requests to the rest after the measured p95, so a straggler never delays `placed`; every message carries the owner's host epoch and holders refuse lower epochs; volume heads, chain versions, landing leases and catalog entries are registers the owner writes under that epoch, never consensus entries; a regional consensus group (the hecate Raft dialect) holds only configuration: membership, neighbourhoods, host epochs, takeovers, and moved homes, with a root group across regions; takeover bumps the dead host's epoch, assigns each object to the surviving candidate that rendezvous ranks first, and each new owner runs one batched phase-one round per register class; lookups route by id to the current owner with no index; every committed record and its content is mirrored to the mirror region asynchronously in epoch order with an exposed lag, and the durability scope is chosen per operation with `await placed(region | mirror)`; live working state stays owner-local with auto-seal; ownership follows the writer.
@@ -808,6 +809,22 @@ Same code, zero modes.
 > establish the reservation below: `require_locked` is recorded without locking its store,
 > mapped length can exceed buddy-allocatable length, and dynamic pressure does not account
 > for competing claims. BUG-1–BUG-4 and GAP-A9-1 remain open.
+
+> **Status (2026-09-13).** The server establishes the reservation: the shard budget is over the
+> arena's buddy-usable capacity (BUG-2), a strict volume locks its arena or refuses (BUG-1), dynamic
+> growth is check-and-acquire against the one budget (BUG-3), and the charge is all-cost — a window
+> is charged the buddy block it takes, snapshot-retained chunks are charged from unpromised capacity
+> by the operation that retains them (a write's reopen, a truncate's cut, an edit, the last name of a
+> file; refused `NoSpace` before mutation, as OpenZFS refuses a delete on a full pool), and every
+> volume's records are reserved from a per-shard metadata ledger laid out against the metadata
+> class. The effective capacity is total RAM clamped to the tightest OS/job/cgroup bound; `slates
+> status` reports mapped, usable, committed, retained and metadata bytes per shard. Credits are
+> re-taken on recovery ahead of new claims; shrink refuses below use. Not yet: a pressure signal that
+> stops admission (the design: sample PSI / `MemAvailable` at the profile refresh cadence on the
+> control shard and apply a hold above `committed`, never below it), the Windows job-object bound,
+> guest request buffers and open-reference maps in the same ledger, and a boot-time refusal of a
+> hand-edited layout past the bound. GAP-A9-1's contract gaps (BUG-1–3, uncharged
+> metadata/transient/retained bytes) are closed; see `docs/wip/admission.md`.
 
 **Ownership and residency.** Each shard owns bounded generational slabs and chunk arenas;
 foreign frees are messages to the owner. Every allocation has a charge owner and a terminal
@@ -3194,8 +3211,9 @@ None`), bridges, IPC, database replication.
   directory; expect the POSIX errno the model predicts and no state change on failure.
 - T-1.2 (edge) Names that fold equal under the volume's policy (`README` vs `readme` on a
   case-fold volume; precomposed vs decomposed `é`); expect `EEXIST` and a single entry.
-- T-1.3 (edge) Sparse file: write at offset 10 GiB in a dynamic volume; expect one chunk charged,
-  holes read as zeros, `referenced_bytes` = one chunk.
+- T-1.3 (edge) Sparse file: write at offset 10 GiB in a dynamic volume; expect one window charged at
+  the buddy block it takes (one page for a one-byte write; at most a chunk — A-16), holes read as
+  zeros, `referenced_bytes` = `allocated_bytes` = one page.
 - T-1.4 (edge) Truncate to a non-page boundary then extend; expect the tail page zero-filled
   (the clang zero-fill reliance).
 - T-1.5 (error) Dynamic volume growth denied by the pressure source; expect `ENOSPC` with a
@@ -4700,3 +4718,13 @@ Applied in the same change to: §4.8 (Membership — a retired peer that returns
 - What it does not change: the rules R1–R10; the register protocol, its refusal taxonomy and the one-quorum rule; the configuration group as the membership authority (SWIM detects, the group decides); the N=1≡fleet degenerate (a laptop has no peers to retire or re-admit). Bounded scatter-width neighbourhoods and the configuration group live over the transport (the Meta-scale membership work) remain owed and are the next fleet pieces; enrollment (§4.13) and the rest of §4.10 remain owed.
 
 [`Membership::refute`]: the SWIM self-refutation in `crates/cluster/src/membership.rs`
+
+### A-16 (accepted 2026-09-13) — Admission is all-cost: the buddy-block charge, retention charged by the retaining operation, metadata reserved from a per-shard ledger, effective capacity clamped to the process bound
+Applied in the same change to: D-13 (charge rule), §4.2 (status), T-1.3, GAPS §1 (Machine/memory/runtime, GAP-A9-1), `docs/wip/admission.md`, `crates/mem` (`ShardBudget::charge_retention`/`credit_retention`, `MetadataBudget`), `crates/vfs` (the charge oracle, `edges.rs` T-1.3, `Store::set_metadata_class`), `crates/machine` (`MemoryFacts::limit`, `effective_capacity`), `crates/server` (config derivations, `ShardReport` fields), the CLI status render.
+- Authorization: Ada's "implement all" (2026-09-13); the decision on the two contract changes taken from principles (physical truth over logical convenience; one backing source per dimension; the OpenZFS precedent), recorded here so it can be reverted by name.
+- The charge rule (D-13): a window is charged the buddy block it takes — `min(chunk, page × next_pow2(ceil(materialized_length / page)))` — not its logical length. Evidence: §4.2 "physical_used includes allocator rounding"; ZFS `referenced` counts allocated bytes [C: OpenZFS dsl_dataset.c]. Without it a sparse writer held `page ×` its quota: sixteen one-byte windows now cap a sixteen-page quota (the model oracle states the rule and found the buddy's power-of-two rounding; 150 generated histories). T-1.3 now expects one page charged for a one-byte write at 10 GiB, `referenced_bytes == allocated_bytes == PAGE`. The rejected alternative: a separate rounding-excess ledger beside a logical charge (more state, the same physical truth).
+- Retention: a snapshot-retained chunk is charged from unpromised capacity by the operation that retains it (a write's reopen, a truncate's cut, an edit, the last name of a file), secured before the mutation and consumed at the deadlist push; a volume whose retention cannot be charged is refused `NoSpace` on unlink/truncate with nothing changed (OpenZFS refuses a delete on a full pool). The rejected alternative — backing retention from the volume's own entitlement — would give one dimension two backing sources; D-13 keeps `referenced`.
+- Metadata: every slab dimension is laid out against the metadata class over true slot costs (`Slab::<T>::slot_bytes`; the old `max_dir_blocks = max_dirs` over the node size alone made the block slab several times the class) and every volume's records are reserved from a per-shard `MetadataBudget` on create/clone/takeover/recovery, released on teardown.
+- Effective capacity: total RAM clamped to the tightest OS/job/cgroup bound (`MemoryFacts::limit`: cgroup v2/v1 from `/proc/self/cgroup`, a finite `RLIMIT_AS`/`RLIMIT_DATA`; the Windows job-object bound owed); `slates status` reports mapped, usable, committed, retained and metadata bytes per shard.
+- Found first, fixed first: a retired inode version freed the chunks its successor shared (`destroy_snapshot` after a partial overwrite returned the head's window as zeros — data loss; `docs/bugs/2026-09-13-snapshot-destroy-frees-head-shared-chunks.md`) and the inline spill sized window 0 to the write's end (`…-inline-spill-sizes-window-zero-to-the-write-end.md`).
+- What it does not change: the rules R1–R10; the entitlement invariant of §4.2 "Atomic admission" (this realizes it); the O(1) ENOSPC of D-13; the register protocol. Owed: the pressure hold (design given in `docs/wip/admission.md` §4e), the Windows job-object bound, guest and open-reference bytes in the same ledger, a boot-time refusal of a hand-edited layout past the bound.

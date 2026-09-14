@@ -35,10 +35,13 @@ enum Node {
 
 /// A file's bytes and what the chunk rule of §4.5 says is materialized: inline content is
 /// charged byte for byte until a write ends past the inline threshold; after that every chunk
-/// window touched by a write is charged from the window's start to the furthest write end in it,
-/// and extending by truncate charges nothing (a hole). Every materialized piece carries the
-/// epoch it was born in: a window is reborn when a write touches it after a snapshot (the
-/// copy-on-write reopen), inline content whenever the inode record is copied.
+/// window touched by a write is materialized from the window's start to the furthest write end in
+/// it and charged its arena block — the smallest power-of-two number of pages holding that length,
+/// at most a chunk (§4.2 "physical_used includes allocator rounding": the buddy's block) — and
+/// extending by truncate charges nothing (a hole). Every materialized piece carries the epoch it was born in: a window is reborn when a
+/// write touches it after a snapshot (the copy-on-write reopen) or when a truncate cuts it to a
+/// smaller page count (the window is rebuilt at its new length), inline content whenever the inode
+/// record is copied.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ModelFile {
   bytes: Vec<u8>,
@@ -51,17 +54,32 @@ struct ModelFile {
   windows: BTreeMap<u64, (u64, u64)>,
 }
 
+/// A window's charge: its arena block — the smallest power-of-two number of pages holding the
+/// materialized length (the buddy's block), at most a chunk.
+fn charged_window(materialized: u64, page: u64, chunk: u64) -> u64 {
+  if materialized == 0 {
+    0
+  } else {
+    (materialized.div_ceil(page).next_power_of_two() * page).min(chunk)
+  }
+}
+
 impl ModelFile {
-  fn materialized(&self) -> u64 {
+  /// The bytes the file is charged.
+  fn charged(&self, page: u64, chunk: u64) -> u64 {
     if self.inline {
       self.inline_len
     } else {
-      self.windows.values().map(|(m, _)| m).sum()
+      self
+        .windows
+        .values()
+        .map(|(m, _)| charged_window(*m, page, chunk))
+        .sum()
     }
   }
 
-  /// The bytes born after `last_snapshot`: what dropping the head would free.
-  fn unique(&self, last_snapshot: Option<u64>) -> u64 {
+  /// The charged bytes born after `last_snapshot`: what dropping the head would free.
+  fn unique(&self, last_snapshot: Option<u64>, page: u64, chunk: u64) -> u64 {
     let fresh = |born: u64| last_snapshot.is_none_or(|s| born > s);
     if self.inline {
       if fresh(self.inline_born) {
@@ -74,7 +92,7 @@ impl ModelFile {
         .windows
         .values()
         .filter(|(_, born)| fresh(*born))
-        .map(|(m, _)| m)
+        .map(|(m, _)| charged_window(*m, page, chunk))
         .sum()
     }
   }
@@ -118,6 +136,8 @@ struct Model {
   quota: u64,
   chunk: u64,
   inline: u64,
+  /// The base page: the allocation granule a window's charge rounds up to.
+  page: u64,
   policy: NameEquivalence,
   /// The head epoch: advanced by every snapshot.
   epoch: u64,
@@ -125,11 +145,12 @@ struct Model {
 }
 
 impl Model {
-  fn new(quota: u64, chunk: u64, inline: u64) -> Self {
+  fn new(quota: u64, chunk: u64, inline: u64, page: u64) -> Self {
     Self {
       quota,
       chunk,
       inline,
+      page,
       next_ino: 2,
       policy: NameEquivalence::Fold,
       ..Default::default()
@@ -137,14 +158,26 @@ impl Model {
   }
 
   fn referenced(&self) -> u64 {
-    self.files.values().map(ModelFile::materialized).sum()
+    self
+      .files
+      .values()
+      .map(|f| f.charged(self.page, self.chunk))
+      .sum()
   }
 
   fn unique(&self) -> u64 {
     self
       .files
       .values()
-      .map(|f| f.unique(self.last_snapshot))
+      .map(|f| f.unique(self.last_snapshot, self.page, self.chunk))
+      .sum()
+  }
+
+  /// The charge of a window map.
+  fn charged_windows(&self, windows: &BTreeMap<u64, (u64, u64)>) -> u64 {
+    windows
+      .values()
+      .map(|(m, _)| charged_window(*m, self.page, self.chunk))
       .sum()
   }
 
@@ -287,12 +320,11 @@ impl Model {
     let (off64, end64) = (u64::try_from(off).unwrap(), u64::try_from(end).unwrap());
     let epoch = self.epoch;
     let windows = file.windows_after(off64, end64, self.chunk, self.inline, epoch);
+    let charged = file.charged(self.page, self.chunk);
     let after = windows
       .as_ref()
-      .map_or(end64.max(file.materialized()), |w| {
-        w.values().map(|(m, _)| m).sum()
-      });
-    let added = after.saturating_sub(file.materialized());
+      .map_or(end64.max(charged), |w| self.charged_windows(w));
+    let added = after.saturating_sub(charged);
     if self.referenced() + added > self.quota {
       return Err(VfsError::NoSpace);
     }
@@ -334,10 +366,11 @@ impl Model {
       self.inline,
       epoch,
     );
-    let after = probe.as_ref().map_or(end.max(file.materialized()), |w| {
-      w.values().map(|(m, _)| m).sum()
-    });
-    if self.referenced() + after.saturating_sub(file.materialized()) > self.quota {
+    let charged = file.charged(self.page, self.chunk);
+    let after = probe
+      .as_ref()
+      .map_or(end.max(charged), |w| self.charged_windows(w));
+    if self.referenced() + after.saturating_sub(charged) > self.quota {
       return Err(VfsError::NoSpace);
     }
     self.truncate(ino, at)?;
@@ -363,8 +396,13 @@ impl Model {
     // The inode record is copied on every truncate, so its inline bytes are reborn.
     file.inline_born = epoch;
     file.windows.retain(|w, _| w * chunk < len64);
-    if let Some((w, (m, _))) = file.windows.iter_mut().next_back() {
-      *m = (*m).min(len64 - w * chunk);
+    if let Some((w, (m, born))) = file.windows.iter_mut().next_back() {
+      let cut = (*m).min(len64 - w * chunk);
+      // A window cut to a smaller page count is rebuilt at its new length, born now.
+      if charged_window(cut, self.page, chunk) < charged_window(*m, self.page, chunk) {
+        *born = epoch;
+      }
+      *m = cut;
     }
     Ok(())
   }
@@ -679,6 +717,7 @@ fn run(steps: Vec<Step>, quota: u64) {
     quota,
     u64::try_from(store.content.chunk_bytes()).unwrap(),
     u64::try_from(store.inline_bytes).unwrap(),
+    u64::try_from(store.content.page()).unwrap(),
   );
   for step in steps {
     let Some((real, expected)) = apply(&step, &mut vol, &mut store, &mut model) else {
