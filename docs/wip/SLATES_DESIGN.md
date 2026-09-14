@@ -1640,7 +1640,12 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 > tests, not rerun here. Direct adoption-value checks and message-level histories remain owed. Mirror simulation does not establish transport, byte placement or time lag.
 > Server wiring and local content recovery are wired and proven (GAP-A9-6 content half closed
 > 2026-09-14; base plane owed); regional configuration consensus and the acceptance gates below
-> remain open.
+> remain open. Formation under load (2026-09-14): a probe session whose dialer spent a whole
+> handshake budget against a peer not yet listening now resends its pending flight on every later
+> period (it was a local of one `establish` call, so the socket never sent again and the mesh stalled
+> forever — `docs/bugs/2026-09-14-handshake-retry-forgets-its-flight.md`); after two budgets it
+> dials afresh from a new port, and a formation failure names each node's formed sessions and
+> coordinator period count so a wedge and a non-convergence are told apart.
 > A-9 changes the required §4.8 contract; model refinement/revalidation remains explicitly owed
 > before closure. No checker, tool installation or new CI job is authorized by this amendment.
 >

@@ -106,7 +106,7 @@ use slates_rt::futures;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 use slates_rt::udp::UdpSocket;
 use slates_transport::demux::Demux;
-use slates_transport::endpoint::{Endpoint, MIN_DATAGRAM_BYTES};
+use slates_transport::endpoint::{Endpoint, EndpointError, MIN_DATAGRAM_BYTES};
 use slates_transport::handshake::Identity;
 use slates_transport::rtt::RttEstimator;
 use slates_vfs::clock::Clock;
@@ -763,11 +763,32 @@ async fn establish_session(
   match client {
     Some(mut endpoint) => match endpoint.establish().await {
       Ok(()) => (None, Some(endpoint)),
-      Err(_) => (Some(endpoint), None),
+      // The handshake ran out a budget with the peer silent: keep the socket and its pending flight for
+      // the next period's call, which resends the flight (`Endpoint::establish`), up to
+      // `ESTABLISH_BUDGETS_BEFORE_REDIAL` budgets. Past that — or on any protocol fault (a peer whose
+      // half-open state for this source is gone answers a resent flight with a fresh handshake this end
+      // cannot continue) — the endpoint is dropped, so the next period dials afresh from a new port (the
+      // demultiplexer replaces a peer's old session on a re-dial). Before this, an endpoint whose first
+      // budget ran out was kept forever and, its flight being a local of that first call, never sent
+      // another byte (`docs/bugs/2026-09-14-handshake-retry-forgets-its-flight.md`).
+      Err(EndpointError::NotReady)
+        if endpoint.handshake_budgets_spent() < ESTABLISH_BUDGETS_BEFORE_REDIAL =>
+      {
+        (Some(endpoint), None)
+      }
+      Err(_) => (None, None),
     },
     None => (client_for(identity, name, address, certificate), None),
   }
 }
+
+/// Shape: the handshake budgets a dialer spends on one socket before it dials afresh from a new port. The
+/// first budget covers a peer not yet listening when first dialed (a fleet forms as its nodes boot one
+/// after another); the second resends the pending flight through a whole budget once more, for a peer that
+/// was merely starved. A flight resent for a full budget with no reply means the peer's half-open state for
+/// this source is gone or the peer is down, and a fresh dial — a new source the demultiplexer opens a fresh
+/// session for — is the recovery.
+const ESTABLISH_BUDGETS_BEFORE_REDIAL: u32 = 2;
 
 /// The serve side: complete the accepted session's handshake and loop answering the peer's probes (§4.8),
 /// **re-admitting a peer that has come back**. A serve session's own detector builds the acknowledgement
