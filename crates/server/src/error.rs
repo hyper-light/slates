@@ -38,6 +38,10 @@ pub enum ServerError {
     /// The dotted names of the chokepoints that did not register (§4.14 roster order).
     missing: Vec<&'static str>,
   },
+  /// The grant-issuer secret could not be minted at start (§4.13): the crypto provider's secure random
+  /// refused. Fail-closed — a daemon with no issuer authority would make every landing un-grantable while
+  /// looking healthy — so the daemon does not start; the provider's reason is carried.
+  IssuerSecret(String),
 }
 
 impl fmt::Display for ServerError {
@@ -56,6 +60,9 @@ impl fmt::Display for ServerError {
         "observability incomplete: chokepoint spans not registered: {}",
         missing.join(", ")
       ),
+      Self::IssuerSecret(reason) => {
+        write!(f, "the grant-issuer secret could not be minted: {reason}")
+      }
     }
   }
 }

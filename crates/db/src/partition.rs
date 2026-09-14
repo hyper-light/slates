@@ -19,9 +19,9 @@ use slates_wire::request::{ClientWindow, Seen};
 
 use crate::Art;
 use crate::catalog::{
-  AttachmentRecord, AuditRecord, CompletionRecord, Consumer, GrantRecord, LandingLeaseRecord,
-  LandingRecord, LeaseRecord, LineageEdge, Principal, SnapshotId, SnapshotRecord, VolumeId,
-  VolumeRecord,
+  AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
+  LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, Principal, SnapshotId,
+  SnapshotRecord, VolumeId, VolumeRecord,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -96,6 +96,8 @@ pub struct PartitionSnapshot {
   pub audit: Vec<AuditRecord>,
   /// Each green volume's merge chain, by green order (§4.16; appended for append-only evolution).
   pub green_chains: Vec<GreenChain>,
+  /// The enrolled consumers, by id order (§4.13; appended for append-only evolution).
+  pub consumers: Vec<ConsumerRecord>,
 }
 
 /// The partition.
@@ -114,6 +116,9 @@ pub struct Partition {
   attachment_index: Art<Handle<AttachmentRecord>>,
   completions: BTreeMap<(u64, u32), ClientWindow<Vec<u8>>>,
   grants: BTreeMap<u64, GrantRecord>,
+  /// The enrolled consumers, by id (§4.13; bounded by the enrollments a human makes, one durable record
+  /// each — never grown by a workload).
+  consumers: BTreeMap<u64, ConsumerRecord>,
   landing_leases: Art<LandingLeaseRecord>,
   landings: BTreeMap<u64, LandingRecord>,
   audit: Vec<AuditRecord>,
@@ -161,6 +166,7 @@ impl Partition {
       attachment_index: Art::new(),
       completions: BTreeMap::new(),
       grants: BTreeMap::new(),
+      consumers: BTreeMap::new(),
       landing_leases: Art::new(),
       landings: BTreeMap::new(),
       audit: Vec::new(),
@@ -298,6 +304,21 @@ impl Partition {
     self.grants.get(&id)
   }
 
+  /// An enrolled consumer's record (§4.13), or `None` if no such consumer was ever enrolled.
+  pub fn consumer(&self, id: u64) -> Option<&ConsumerRecord> {
+    self.consumers.get(&id)
+  }
+}
+
+/// A consumer id in the 16-byte `existing` shape `AlreadyExists` carries (the id in the low eight
+/// bytes, little-endian), so a duplicate enrollment names the consumer it collided with.
+fn consumer_id_bytes(consumer: u64) -> [u8; 16] {
+  let mut out = [0u8; 16];
+  out[..8].copy_from_slice(&consumer.to_le_bytes());
+  out
+}
+
+impl Partition {
   /// The landing lease on a target.
   pub fn landing_lease(&self, target: &str) -> Option<&LandingLeaseRecord> {
     self.landing_leases.get(target.as_bytes())
@@ -401,6 +422,19 @@ impl Partition {
         Ok(())
       }
       Op::GrantStateChanged { id, .. } => self.grant(*id).map(|_| ()).ok_or(DbError::NotFound),
+      Op::ConsumerEnrolled { record } => {
+        if self.consumers.contains_key(&record.consumer) {
+          return Err(DbError::AlreadyExists {
+            existing: consumer_id_bytes(record.consumer),
+          });
+        }
+        Ok(())
+      }
+      Op::ConsumerRevoked { consumer } => self
+        .consumers
+        .get(consumer)
+        .map(|_| ())
+        .ok_or(DbError::NotFound),
       Op::LandingLeaseTaken { record } => self.check_landing_lease(record, now_ns),
       Op::LandingLeaseReleased { target } => self
         .landing_lease(target)
@@ -570,6 +604,18 @@ impl Partition {
       }
       Op::GrantStateChanged { id, state } => {
         self.grants.get_mut(id).ok_or(DbError::NotFound)?.state = *state;
+        Ok(())
+      }
+      Op::ConsumerEnrolled { record } => {
+        self.consumers.insert(record.consumer, record.clone());
+        Ok(())
+      }
+      Op::ConsumerRevoked { consumer } => {
+        self
+          .consumers
+          .get_mut(consumer)
+          .ok_or(DbError::NotFound)?
+          .revoked = true;
         Ok(())
       }
       Op::LandingLeaseTaken { record } => {
@@ -768,6 +814,7 @@ impl Partition {
       landing_leases: self.landing_leases.iter().map(|(_, l)| l.clone()).collect(),
       landings: self.landings.values().cloned().collect(),
       audit: self.audit.clone(),
+      consumers: self.consumers.values().cloned().collect(),
       green_chains: self
         .green_chains
         .iter()
@@ -826,6 +873,9 @@ impl Partition {
       let bytes: usize = chain.increments.iter().map(Vec::len).sum();
       p.green_chain_bytes = p.green_chain_bytes.saturating_add(bytes);
       p.green_chains.insert(chain.green, chain.increments.clone());
+    }
+    for c in &snapshot.consumers {
+      p.consumers.insert(c.consumer, c.clone());
     }
     Ok(p)
   }

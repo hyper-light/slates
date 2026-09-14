@@ -118,6 +118,7 @@ slates mount ID PATH
 slates unmount PATH
 slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
 slates grants [--json]
+slates grant LANDING MANIFEST [--session] [--term SECONDS] [--json]
 slates audit [--since N] [--json]
 slates exec --volume V --at PATH -- CMD [ARG ...]
 slates attach ID [--read | --write] [--snapshot N] [--json]
@@ -162,10 +163,16 @@ continue, and `status` counts the refusals under `durability_unmet`.
 Exit codes: 0 done; 1 the daemon refused (the refusal is named on stderr, e.g.
 `AlreadyExists`); 2 usage; 3 no daemon at the instance; 4 the command itself failed.
 
-There is no `slates grant` issuance verb yet. The server has grant records and a control
-transport, while the ring refuses the grant kind. Passing `--grant N` consumes an existing
-grant; it cannot create one. Do not treat a control-channel label or the caller's uid as
-proof of human approval; the protected issuer contract remains open (§4.13).
+`slates grant LANDING [--session] [--term SECONDS] [--json]` issues the grant a presented landing
+needs (§4.13, §4.15 step 3). It is the human's surface: the command runs as the user who started
+the daemon's anchor, reads the grant-issuer secret the daemon minted into the anchor segment at
+start, and proves it with a keyed hash over the exact landing — its id, the manifest hash the
+human saw, the scope and the term — which the daemon recomputes before issuing. A proof that does
+not verify (a forged, replayed or modified-plan approval) is refused `GrantIssuerUnverified` and
+counted; the MCP server and the SDKs carry no proof by construction and are refused by kind.
+Passing `--grant N` to `land` then consumes the grant; the landing must present the same manifest.
+Neither a control-channel label nor the caller's uid is proof of human approval — only the secret
+is, and only the anchor's user maps it.
 
 ## Planned interface corrections
 

@@ -38,6 +38,17 @@ pub enum Principal {
     /// The hash.
     hash: [u8; 32],
   },
+  /// An **enrolled consumer** under a host account (§4.13 "Principals": "a trusted enrollment
+  /// establishes `ConsumerId` and scoped rights for a workload under that account"): the workload
+  /// bound its channel at rendezvous with the capability its enrollment minted, so two agents sharing a
+  /// uid are two principals here, each with only the rights an access list names for it. Appended for
+  /// append-only wire evolution.
+  Consumer {
+    /// The host account (uid) the consumer was enrolled under.
+    account: u32,
+    /// The consumer's id, minted at enrollment.
+    consumer: u64,
+  },
 }
 
 impl Principal {
@@ -49,6 +60,8 @@ impl Principal {
     const KIND_SID: u8 = 2;
     /// Format: see `KIND_UID`.
     const KIND_CERTIFICATE: u8 = 3;
+    /// Format: see `KIND_UID`.
+    const KIND_CONSUMER: u8 = 4;
     let mut out = Vec::new();
     match self {
       Principal::Uid { uid } => {
@@ -63,9 +76,32 @@ impl Principal {
         out.push(KIND_CERTIFICATE);
         out.extend_from_slice(hash);
       }
+      Principal::Consumer { account, consumer } => {
+        out.push(KIND_CONSUMER);
+        out.extend_from_slice(&account.to_le_bytes());
+        out.extend_from_slice(&consumer.to_le_bytes());
+      }
     }
     out
   }
+}
+
+/// An enrolled consumer's durable record (§4.13): who enrolled it (the account), the secret capability
+/// it attests with, and whether a human has revoked it. Replayed with the log, so the binding a session
+/// resumes under is the one the human established. The capability lives in the anchor segment under the
+/// same trust boundary as the daemon's grant-issuer secret: mapped only by the supervisor, the daemon and
+/// the anchor's user — the workload proves *knowledge* of it over the ring (a keyed hash of its channel's
+/// client id), and the capability itself never crosses a channel after the one delivery to the human.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerRecord {
+  /// The consumer id.
+  pub consumer: u64,
+  /// The host account it was enrolled under.
+  pub account: u32,
+  /// The consumer's secret capability — the key its attestation proofs are made under.
+  pub secret: [u8; 32],
+  /// Revoked by a human: every later effect refuses.
+  pub revoked: bool,
 }
 
 /// Rights on a volume (§4.13).

@@ -248,6 +248,18 @@ impl Daemon {
     if let Ok(json) = profile.to_json() {
       segment.publish(RegionKind::Profile, json.as_bytes())?;
     }
+    // The grant-issuer secret (§4.13 "only an authenticated human confirmation surface holds grant-issuer
+    // authority"): minted fresh at every start from the TLS provider's secure random and published into the
+    // anchor's supervision block, which only the supervisor, this daemon and a `slates` command running as
+    // the anchor's user map — never a ring, MCP or SDK client. A `Grant` request proves possession by a keyed
+    // hash over the exact landing it approves (`landing::grant_proof`); a fresh secret per start means a
+    // proof minted against a previous daemon's authority does not verify against this one (no replay across
+    // restarts). Refused, never started, if the provider cannot mint it: a daemon with no issuer authority
+    // would silently make every landing un-grantable.
+    let mut issuer_secret = [0u8; slates_anchor::layout::ISSUER_SECRET_BYTES];
+    slates_transport::handshake::secure_random(&mut issuer_secret)
+      .map_err(|e| ServerError::IssuerSecret(e.to_string()))?;
+    segment.publish_issuer_secret(&issuer_secret)?;
     if let Some((was, now)) = limits::raise_descriptor_limit() {
       eprintln!("slates-server: descriptor limit raised from {was} to {now}");
     }
@@ -1253,11 +1265,16 @@ fn init_shard(
   // processes at most a ring of in-flight requests, so a ring's depth of recent spans covers the
   // current activity window; older spans are shed (and counted), telemetry being the shed-first class.
   let telemetry_capacity = usize::try_from(config.region.slots).unwrap_or(1).max(1);
+  // The grant-issuer secret this daemon minted at start (§4.13), read from the anchor's supervision block
+  // before the segment moves into the state; every shard reads the same value, so a `Grant` verifies on
+  // whichever shard serves the client.
+  let issuer_secret = segment.issuer_secret()?;
   let mut state = ShardState {
     shard,
     partition,
     config: config.clone(),
     segment,
+    issuer_secret,
     content,
     content_range,
     db,
@@ -1279,6 +1296,7 @@ fn init_shard(
     deferred: Vec::new(),
     server_task: None,
     scatters: std::collections::BTreeMap::new(),
+    grant_scatters: std::collections::BTreeMap::new(),
     shards: config_shards.to_vec(),
     recovered,
     booted_ns: now,
@@ -1495,6 +1513,7 @@ async fn control_loop(
                 pid,
                 last_seen_ns,
                 control,
+                revoked: false,
               }) {
                 eprintln!("slates-server: client {client_id} refused by the shard's table: {e}");
               }

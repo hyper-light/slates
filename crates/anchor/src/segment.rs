@@ -8,9 +8,10 @@ use slates_mem::{Handoff, SharedObject};
 use crate::error::AnchorError;
 use crate::layout::{
   AT_GENERATION, AT_GEOMETRY, AT_IDENTITY, AT_MAGIC, AT_TOTAL, AT_VERSION, GEOMETRY_BYTES,
-  Geometry, HEADER_BYTES, IDENTITY_BYTES, LAYOUT_VERSION, MAGIC, PAYLOAD_BYTES, PAYLOAD_GENERATION,
-  PAYLOAD_LEN, RING_CAPACITY, RING_HEAD, RING_SEQ_BASE, RING_TAIL, RegionKind, RegionSpec,
-  SUP_GENERATION, SUP_HEARTBEAT, SUP_PID, SUP_RESTARTS, SUP_STARTED, SUP_STATE, State,
+  Geometry, HEADER_BYTES, IDENTITY_BYTES, ISSUER_SECRET_BYTES, LAYOUT_VERSION, MAGIC,
+  PAYLOAD_BYTES, PAYLOAD_GENERATION, PAYLOAD_LEN, RING_CAPACITY, RING_HEAD, RING_SEQ_BASE,
+  RING_TAIL, RegionKind, RegionSpec, SUP_GENERATION, SUP_HEARTBEAT, SUP_ISSUER, SUP_PID,
+  SUP_RESTARTS, SUP_STARTED, SUP_STATE, State,
 };
 
 /// Format: the words at the head of a ring region: head, tail, capacity, sequence base.
@@ -382,6 +383,39 @@ impl AnchorSegment {
       state: self.word_at(spec, SUP_STATE)?,
       started: self.word_at(spec, SUP_STARTED)?,
     })
+  }
+
+  /// Publishes the daemon's grant-issuer secret into the supervision block (§4.13; `SUP_ISSUER`): the
+  /// daemon mints it at every start and writes it here, so a `slates grant` command running as the
+  /// anchor's own user — the only other mapper of this page besides the supervisor — can prove issuer
+  /// authority with a keyed hash the daemon recomputes. Written in one pass after the supervision
+  /// words; readers copy it out whole ([`issuer_secret`](AnchorSegment::issuer_secret)).
+  pub fn publish_issuer_secret(
+    &mut self,
+    secret: &[u8; ISSUER_SECRET_BYTES],
+  ) -> Result<(), AnchorError> {
+    let bytes = self.region_bytes_mut(RegionKind::Supervision)?;
+    if bytes.len() < SUP_ISSUER + ISSUER_SECRET_BYTES {
+      return Err(AnchorError::Layout {
+        reason: "the supervision block has no room for the issuer secret",
+      });
+    }
+    put(bytes, SUP_ISSUER, secret);
+    Ok(())
+  }
+
+  /// The daemon's published grant-issuer secret, copied out of the supervision block; all zero until a
+  /// daemon has started under this anchor (a fresh segment holds no authority, so no proof verifies).
+  pub fn issuer_secret(&self) -> Result<[u8; ISSUER_SECRET_BYTES], AnchorError> {
+    let bytes = self.region_bytes(RegionKind::Supervision)?;
+    let mut out = [0u8; ISSUER_SECRET_BYTES];
+    let Some(slice) = bytes.get(SUP_ISSUER..SUP_ISSUER + ISSUER_SECRET_BYTES) else {
+      return Err(AnchorError::Layout {
+        reason: "the supervision block has no room for the issuer secret",
+      });
+    };
+    out.copy_from_slice(slice);
+    Ok(out)
   }
 
   /// The bytes of a region, for its single owner.

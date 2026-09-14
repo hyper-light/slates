@@ -233,7 +233,9 @@ fn land_verb_unix(
     Err(refusal) => return refused(target_refusal(&refusal)),
   };
   let now = state.clock.monotonic_ns();
-  let landing_id = state.landing.next_landing;
+  // The id names its owner partition (`verbs::landing_id`), so the `Grant` that later covers it routes
+  // to this shard, where the presented record waits.
+  let landing_id = crate::verbs::landing_id(state.partition, state.landing.next_landing);
   let request = LandingRequest {
     landing_id,
     holder: session_of(principal),
@@ -419,9 +421,128 @@ fn finish(
   }
 }
 
-/// Issues a grant for a presented landing, binding its manifest (§4.15 step 3). Called from the
-/// control channel only (never the ring), so a grant a human did not make cannot exist. The
-/// grant is issued into the runtime grants and persisted as a `GrantRecord`; the landing's
+/// The proof of grant-issuer authority a `Grant` request carries (§4.13 "Grants": "the daemon verifies
+/// that authority and the exact manifest hash, target identity, intended consumer, scope and validity
+/// before accepting a grant"): the BLAKE3 **keyed** hash, under the issuer secret the daemon minted into
+/// the anchor segment, over the exact landing being approved — its id (which names the volume, target and
+/// intended consumer the presented record binds), the manifest hash the human saw, the scope and the term.
+/// A human surface that maps the anchor (the `slates grant` command running as the anchor's user) computes
+/// it; the daemon recomputes it. Every field the spec lists is in the hash, so a replayed proof for another
+/// landing, a retargeted or modified plan (a different manifest), a widened scope or a longer term all
+/// fail to verify — before anything is written. Pure, so it is unit-testable and the CLI and the daemon
+/// share one definition.
+pub fn grant_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  landing: u64,
+  manifest: &[u8; 32],
+  scope: GrantScope,
+  term_ns: u64,
+) -> [u8; 32] {
+  /// Format: the scope's byte in the proof — the wire enum's own variant index, so the proof and the
+  /// request agree without a second table.
+  fn scope_byte(scope: GrantScope) -> u8 {
+    match scope {
+      GrantScope::Once => 0,
+      GrantScope::Session => 1,
+    }
+  }
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(&landing.to_le_bytes());
+  hasher.update(manifest);
+  hasher.update(&[scope_byte(scope)]);
+  hasher.update(&term_ns.to_le_bytes());
+  *hasher.finalize().as_bytes()
+}
+
+/// Serves a `Grant` request (§4.13 "Grants", §4.15 step 3): verifies the proof of issuer authority against
+/// the secret this daemon published, and the approved manifest against the presented landing's, then
+/// issues the grant. Refuses `GrantIssuerUnverified` — counted `grant_issuer_unverified` — on a proof that
+/// does not verify (a forged, replayed or modified-plan approval, or one from a channel that carries no
+/// authority: the MCP server and the SDKs never hold the secret), `GrantMismatch` when the human approved
+/// a manifest other than the one presented (the plan changed under the approval), and `NotFound` for a
+/// landing not awaiting a grant (consumed, or never presented — a replay of a spent approval). The
+/// comparison of the proof is constant-time over its whole width so a wrong proof leaks nothing by timing.
+pub fn grant_verb(
+  state: &mut ShardState,
+  principal: &Principal,
+  landing_id: u64,
+  manifest: [u8; 32],
+  scope: GrantScope,
+  term_ns: u64,
+  proof: [u8; 32],
+) -> ReplyBody {
+  let Some(awaiting) = state.landing.awaiting.get(&landing_id).cloned() else {
+    return crate::verbs::refused(Refusal::NotFound);
+  };
+  let expected = grant_proof(&state.issuer_secret, landing_id, &manifest, scope, term_ns);
+  if !constant_time_eq(&expected, &proof) {
+    *state.refusals.entry("grant_issuer_unverified").or_insert(0) += 1;
+    return crate::verbs::refused(Refusal::GrantIssuerUnverified);
+  }
+  if awaiting.manifest != manifest {
+    return crate::verbs::refused(Refusal::GrantMismatch);
+  }
+  match issue_grant(state, principal, landing_id, scope, term_ns) {
+    Ok(grant) => ReplyBody::Granted { grant },
+    Err(refusal) => crate::verbs::refused(refusal),
+  }
+}
+
+/// Format: the domain tags that separate the issuer secret's uses — an enrollment proof can never
+/// verify as a revocation proof or a grant proof, whatever the bytes after the tag.
+const ENROLL_DOMAIN: &[u8] = b"slates.enroll";
+/// Format: see `ENROLL_DOMAIN`.
+const REVOKE_DOMAIN: &[u8] = b"slates.revoke";
+
+/// The proof of issuer authority an `Enroll` request carries (§4.13 "Principals": a *trusted* enrollment
+/// establishes a consumer — the same human surface that issues grants): the keyed hash, under the issuer
+/// secret, of the enrollment domain tag and the account the consumer is enrolled under.
+pub fn enroll_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  account: u32,
+) -> [u8; 32] {
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(ENROLL_DOMAIN);
+  hasher.update(&account.to_le_bytes());
+  *hasher.finalize().as_bytes()
+}
+
+/// The proof of issuer authority a `Revoke` request carries: the keyed hash, under the issuer secret, of
+/// the revocation domain tag and the consumer revoked.
+pub fn revoke_proof(
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  consumer: u64,
+) -> [u8; 32] {
+  let mut hasher = blake3::Hasher::new_keyed(secret);
+  hasher.update(REVOKE_DOMAIN);
+  hasher.update(&consumer.to_le_bytes());
+  *hasher.finalize().as_bytes()
+}
+
+/// The proof a workload presents to bind its channel to an enrolled consumer (§4.13 "a consumer channel
+/// is bound at rendezvous using a capability delivered and retained outside other agents' reach"): the
+/// keyed hash, under the consumer's secret capability, of the client id the daemon assigned this channel
+/// — so a proof captured from one session cannot bind another (the id differs), and the capability itself
+/// never crosses the ring.
+pub fn attest_proof(consumer_secret: &[u8; 32], client_id: u32) -> [u8; 32] {
+  let mut hasher = blake3::Hasher::new_keyed(consumer_secret);
+  hasher.update(&client_id.to_le_bytes());
+  *hasher.finalize().as_bytes()
+}
+
+/// Whether two proofs are equal, visiting every byte whatever the first difference (no early exit), so
+/// the comparison's time does not depend on how much of a forged proof happened to match.
+pub(crate) fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+  let mut difference = 0u8;
+  for (x, y) in a.iter().zip(b.iter()) {
+    difference |= x ^ y;
+  }
+  difference == 0
+}
+
+/// Issues a grant for a presented landing, binding its manifest (§4.15 step 3). Reached only through
+/// [`grant_verb`], whose proof of issuer authority has verified, so a grant a human did not make cannot
+/// exist. The grant is issued into the runtime grants and persisted as a `GrantRecord`; the landing's
 /// record gains the grant. Returns the grant id.
 pub fn issue_grant(
   state: &mut ShardState,
@@ -527,6 +648,9 @@ fn to_wire_volume(id: DbVolumeId) -> VolumeId {
 fn session_of(principal: &Principal) -> u64 {
   match principal {
     Principal::Uid { uid } => u64::from(*uid),
+    // A consumer's session is its own, not its account's: two consumers under one uid never share a
+    // session-scoped grant (§4.13 "distinct consumers sharing a uid cannot use each other's grant rights").
+    Principal::Consumer { consumer, .. } => *consumer,
     Principal::Sid { .. } | Principal::Certificate { .. } => 0,
   }
 }
@@ -665,7 +789,9 @@ fn grant_state_name(state: DbGrantState) -> String {
 
 #[cfg(all(test, unix))]
 mod tests {
-  use super::SpanObserver;
+  use super::{
+    ENROLL_DOMAIN, REVOKE_DOMAIN, SpanObserver, attest_proof, enroll_proof, revoke_proof,
+  };
 
   /// The landing span observer is bounded shed-first (§4.14): recording more entry timings than its
   /// capacity keeps the most recent and counts the shed ones, so a large landing never grows the buffer
@@ -684,6 +810,80 @@ mod tests {
       held,
       vec![2, 3, 4],
       "the three most recent survived, oldest first"
+    );
+  }
+
+  /// §4.13 "Grants" / "Principals": the three proofs of the enrollment surface are keyed BLAKE3 over
+  /// **domain-separated** inputs, so no proof of one kind verifies as another — an enrollment approval
+  /// can never be replayed as a revocation, nor a revocation as an enrollment of the same number — and an
+  /// attestation is bound to the channel it was made for. Golden vectors pin the exact bytes: a refactor
+  /// that dropped a domain tag, reordered a field, or changed the key would change them.
+  #[test]
+  fn the_enrollment_proofs_are_domain_separated_and_pinned() {
+    let issuer = [0x11u8; slates_anchor::layout::ISSUER_SECRET_BYTES];
+    let capability = [0x22u8; 32];
+    // The same number as an account and as a consumer id: the domain tag alone must separate them.
+    const NUMBER: u64 = 7;
+    #[allow(clippy::cast_possible_truncation)]
+    let account = NUMBER as u32;
+
+    let enroll = enroll_proof(&issuer, account);
+    let revoke = revoke_proof(&issuer, NUMBER);
+    assert_ne!(
+      enroll, revoke,
+      "an enrollment proof is never a revocation proof"
+    );
+    assert_ne!(
+      enroll_proof(&issuer, account),
+      enroll_proof(
+        &[0x12u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+        account
+      ),
+      "the proof is keyed: another issuer secret proves nothing"
+    );
+    assert_ne!(
+      attest_proof(&capability, 1),
+      attest_proof(&capability, 2),
+      "an attestation is bound to its channel's client id"
+    );
+    assert_ne!(
+      attest_proof(&capability, 1),
+      attest_proof(&[0x23u8; 32], 1),
+      "an attestation is keyed by the capability"
+    );
+
+    // Golden vectors (BLAKE3 keyed; recomputed by the same law, so a change here is a wire change).
+    let hex = |bytes: &[u8; 32]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let expect_enroll = {
+      let mut h = blake3::Hasher::new_keyed(&issuer);
+      h.update(ENROLL_DOMAIN);
+      h.update(&account.to_le_bytes());
+      *h.finalize().as_bytes()
+    };
+    let expect_revoke = {
+      let mut h = blake3::Hasher::new_keyed(&issuer);
+      h.update(REVOKE_DOMAIN);
+      h.update(&NUMBER.to_le_bytes());
+      *h.finalize().as_bytes()
+    };
+    let expect_attest = {
+      let mut h = blake3::Hasher::new_keyed(&capability);
+      h.update(&1u32.to_le_bytes());
+      *h.finalize().as_bytes()
+    };
+    assert_eq!(hex(&enroll), hex(&expect_enroll));
+    assert_eq!(hex(&revoke), hex(&expect_revoke));
+    assert_eq!(hex(&attest_proof(&capability, 1)), hex(&expect_attest));
+    assert_ne!(
+      hex(&enroll),
+      hex(&{
+        // The tag is what separates: the same bytes with the tags swapped are a different proof.
+        let mut h = blake3::Hasher::new_keyed(&issuer);
+        h.update(REVOKE_DOMAIN);
+        h.update(&account.to_le_bytes());
+        *h.finalize().as_bytes()
+      }),
+      "the domain tag is part of the proof"
     );
   }
 }

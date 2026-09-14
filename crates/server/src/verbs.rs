@@ -9,10 +9,10 @@ use slates_base::OsHost;
 use slates_db::DurabilityScope;
 use slates_db::Op;
 use slates_db::catalog::{
-  AccessEntry, AttachForm, AttachmentRecord, BaseRecord, CompletionRecord, Consumer, LeaseRecord,
-  LineageEdge, NamePolicy as DbNamePolicy, PlacementState, PolicyRecord, Principal, Rights, Role,
-  SizeClass as DbSizeClass, SnapshotId as DbSnapshotId, SnapshotRecord, VolumeId as DbVolumeId,
-  VolumeRecord, VolumeState,
+  AccessEntry, AttachForm, AttachmentRecord, BaseRecord, CompletionRecord, Consumer,
+  ConsumerRecord, LeaseRecord, LineageEdge, NamePolicy as DbNamePolicy, PlacementState,
+  PolicyRecord, Principal, Rights, Role, SizeClass as DbSizeClass, SnapshotId as DbSnapshotId,
+  SnapshotRecord, VolumeId as DbVolumeId, VolumeRecord, VolumeState,
 };
 use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration, rendezvous_first};
 use slates_ipc::protocol::{
@@ -56,6 +56,26 @@ pub(crate) fn to_db_volume(id: VolumeId) -> DbVolumeId {
 
 fn to_wire_volume(id: DbVolumeId) -> VolumeId {
   VolumeId { bytes: id.bytes }
+}
+
+/// A wire principal (as `share` names one) as the catalog's.
+fn to_db_principal(principal: &slates_ipc::protocol::Principal) -> Principal {
+  match principal {
+    slates_ipc::protocol::Principal::Uid { uid } => Principal::Uid { uid: *uid },
+    slates_ipc::protocol::Principal::Consumer { account, consumer } => Principal::Consumer {
+      account: *account,
+      consumer: *consumer,
+    },
+  }
+}
+
+/// Wire rights as the catalog's.
+fn to_db_rights(rights: slates_ipc::protocol::Rights) -> Rights {
+  Rights {
+    read: rights.read,
+    write: rights.write,
+    admin: rights.admin,
+  }
 }
 
 pub(crate) fn to_db_snapshot(id: SnapshotId) -> DbSnapshotId {
@@ -183,6 +203,24 @@ pub fn owner_of_attachment(id: u64) -> u16 {
   u16::try_from(id >> ATTACHMENT_PARTITION_SHIFT).unwrap_or(0)
 }
 
+/// A landing id carries its owner partition in the high 16 bits and a per-partition counter below — the
+/// same construction as an attachment id — so a `Grant` naming the landing routes to the partition that
+/// holds its presented record (§4.8 "Lookup": ids route to owners, no global index; the CLAUDE.md gotcha
+/// "a bare id needs the owner in its high bits"). A bare counter routed the grant to the client's own
+/// shard, where the landing was never awaiting, and every grant refused `NotFound`.
+/// Format: the partition's shift — the high 16 bits of the 64-bit id, as `ATTACHMENT_PARTITION_SHIFT`.
+const LANDING_PARTITION_SHIFT: u64 = 48;
+
+/// The landing id for a counter on `partition`.
+pub(crate) fn landing_id(partition: u16, counter: u64) -> u64 {
+  (u64::from(partition) << LANDING_PARTITION_SHIFT) | counter
+}
+
+/// The partition that owns a landing id.
+pub fn owner_of_landing(id: u64) -> u16 {
+  u16::try_from(id >> LANDING_PARTITION_SHIFT).unwrap_or(0)
+}
+
 /// The volume a request is about, when it is about one.
 fn volume_of(body: &RequestBody) -> Option<VolumeId> {
   match body {
@@ -214,8 +252,19 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::Grants
     | RequestBody::Audit { .. }
     | RequestBody::Acknowledge { .. }
-    | RequestBody::Grant { .. } => None,
+    | RequestBody::Grant { .. }
+    | RequestBody::Enroll { .. }
+    | RequestBody::Attest { .. }
+    | RequestBody::Revoke { .. } => None,
+    RequestBody::Share { volume, .. } => Some(*volume),
   }
+}
+
+/// The partition that owns a consumer id — the one its enrollment was recorded on (the id carries it
+/// exactly as a landing id does, `landing_id`), so a revocation routes to the record and an attestation
+/// reads it there (§4.8 "Lookup": ids route to owners).
+pub fn owner_of_consumer(id: u64) -> u16 {
+  owner_of_landing(id)
 }
 
 /// The region a `volume` is homed in, if it is **not** this node's own region — the cross-region redirect
@@ -672,8 +721,35 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       }
     }
   };
+  // A channel bound to a consumer the human has since revoked refuses every effect (§4.13), before any
+  // lookup or mutation, whatever the verb — one local read (the revocation was fanned to this slot).
+  if state.clients.get(client).is_ok_and(|slot| slot.revoked) {
+    *state.refusals.entry("consumer_revoked").or_insert(0) += 1;
+    return Served::Reply(record_completion(
+      state,
+      origin,
+      id,
+      refused(Refusal::ConsumerRevoked),
+    ));
+  }
+  if let RequestBody::Attest { consumer, proof } = body {
+    return attest_on_channel(
+      state,
+      client.index(),
+      request.request,
+      client_id,
+      consumer,
+      proof,
+    );
+  }
+  if let RequestBody::Revoke { consumer, proof } = body {
+    return revoke_on_channel(state, client.index(), request.request, consumer, proof);
+  }
   if let RequestBody::List = body {
     return scatter_list(state, client.index(), request.request, principal);
+  }
+  if let RequestBody::Grants = body {
+    return scatter_grants(state, client.index(), request.request, principal);
   }
   if let RequestBody::DaemonStatus = body {
     return scatter_status(state, client.index(), request.request);
@@ -725,6 +801,9 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   let owner = match &body {
     RequestBody::Create { name, .. } => Some(owner_of_name(name, state.shards.len())),
     RequestBody::Detach { attachment } => Some(owner_of_attachment(*attachment)),
+    // A grant is served where its landing was presented: the volume's owner shard, which the landing id
+    // names — not the client's shard, where nothing is awaiting.
+    RequestBody::Grant { landing, .. } => Some(owner_of_landing(*landing)),
     other => volume_of(other).map(owner_of),
   };
   if let Some(owner) = owner
@@ -1040,6 +1119,77 @@ fn scatter_list(
     }
   }
   Served::Forwarded
+}
+
+/// The caller's grants are a scatter-gather like a listing: a grant record is written on the shard that
+/// presented its landing (the volume's owner), so every shard answers with the grants it holds for the
+/// principal and the origin merges when the last part arrives.
+fn scatter_grants(
+  state: &mut ShardState,
+  client_index: u32,
+  request: u64,
+  principal: Principal,
+) -> Served {
+  let others: Vec<u16> = state
+    .shards
+    .iter()
+    .copied()
+    .filter(|s| *s != state.shard)
+    .collect();
+  let mine = match crate::landing::grants_verb(state, &principal) {
+    ReplyBody::Grants { grants } => grants,
+    other => return Served::Reply(other),
+  };
+  if others.is_empty() {
+    return Served::Reply(ReplyBody::Grants { grants: mine });
+  }
+  state
+    .grant_scatters
+    .insert(request, (client_index, others.len(), mine));
+  let origin = state.shard;
+  for shard in others {
+    let principal = principal.clone();
+    let task = SpawnRequest::new(
+      Box::pin(async move {
+        let part = match crate::state::with_state(|s| crate::landing::grants_verb(s, &principal)) {
+          Some(ReplyBody::Grants { grants }) => grants,
+          _ => Vec::new(),
+        };
+        let back = SpawnRequest::new(
+          Box::pin(async move {
+            gather_grants(request, part);
+          }),
+          None,
+        );
+        let _ = slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)));
+      }),
+      None,
+    );
+    if slates_rt::registry::send_control(shard, Control::Spawn(Box::new(task))).is_err() {
+      gather_grants(request, Vec::new());
+    }
+  }
+  Served::Forwarded
+}
+
+/// Folds one shard's part of a `grants` read into the scatter and, on the last part, delivers the merged
+/// grants in id order.
+fn gather_grants(request: u64, part: Vec<slates_ipc::protocol::GrantSummary>) {
+  let done = crate::state::with_state(|s| {
+    let entry = s.grant_scatters.get_mut(&request)?;
+    entry.2.extend(part);
+    entry.1 = entry.1.saturating_sub(1);
+    if entry.1 == 0 {
+      s.grant_scatters.remove(&request)
+    } else {
+      None
+    }
+  })
+  .flatten();
+  if let Some((client_index, _, mut grants)) = done {
+    grants.sort_by_key(|g| g.id);
+    crate::state::deliver(client_index, request, ReplyBody::Grants { grants }, false);
+  }
 }
 
 /// The daemon's status is a scatter-gather like a listing: every shard reports its part and
@@ -1371,6 +1521,9 @@ fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::HomedElsewhere { .. } => "homed_elsewhere",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::DurabilityUnmet { .. } => "durability_unmet",
+    Refusal::GrantIssuerUnverified => "grant_issuer_unverified",
+    Refusal::ConsumerNotEnrolled => "consumer_not_enrolled",
+    Refusal::ConsumerRevoked => "consumer_revoked",
   }
 }
 
@@ -1410,6 +1563,9 @@ fn mutates_shard_image(body: &RequestBody) -> bool {
       | RequestBody::Destroy { .. }
       | RequestBody::Snapshot { .. }
       | RequestBody::DestroySnapshot { .. }
+      | RequestBody::Share { .. }
+      | RequestBody::Enroll { .. }
+      | RequestBody::Revoke { .. }
   )
 }
 
@@ -1528,13 +1684,328 @@ fn dispatch_inner(
       rewitness(state, principal, volume, paths.as_deref())
     }
     RequestBody::Pin { volume, paths } => pin(state, principal, volume, paths.as_deref()),
-    RequestBody::Grant { .. } => {
-      *state.refusals.entry("grant_kind_refused").or_insert(0) += 1;
-      refused(Refusal::GrantChannelRefused {
-        channel: "ring".to_owned(),
-      })
+    RequestBody::Grant {
+      landing,
+      manifest,
+      scope,
+      term_ns,
+      proof,
+    } => crate::landing::grant_verb(state, principal, landing, manifest, scope, term_ns, proof),
+    RequestBody::Enroll { account, proof } => enroll(state, account, proof),
+    RequestBody::Share {
+      volume,
+      principal: subject,
+      rights,
+    } => share(state, principal, volume, &subject, rights),
+    // Served in `serve` as tasks that cross shards; neither reaches the dispatch.
+    RequestBody::Attest { .. } | RequestBody::Revoke { .. } => refused(Refusal::BadRequest {
+      reason: "attest and revoke are served on the channel".to_owned(),
+    }),
+  }
+}
+
+/// Enrolls a consumer under `account` (§4.13 "Principals"): the human surface's proof of issuer authority
+/// verifies, a consumer id and a secret capability are minted, the hash of the capability is recorded
+/// durably (never the capability), and the capability is returned once for the human to deliver to the
+/// workload through the trusted harness. Refused `GrantIssuerUnverified` — counted — when the proof does
+/// not verify: an agent cannot enroll itself.
+fn enroll(state: &mut ShardState, account: u32, proof: Capability) -> ReplyBody {
+  let expected = crate::landing::enroll_proof(&state.issuer_secret, account);
+  if !crate::landing::constant_time_eq(&expected, &proof) {
+    *state.refusals.entry("grant_issuer_unverified").or_insert(0) += 1;
+    return refused(Refusal::GrantIssuerUnverified);
+  }
+  let mut secret = [0u8; 32];
+  if slates_transport::handshake::secure_random(&mut secret).is_err() {
+    return refused(Refusal::Unsupported {
+      feature: "the crypto provider's secure random".to_owned(),
+    });
+  }
+  // The consumer id: this partition's next sequence, owner-tagged like a landing id, so two shards never
+  // mint the same id and the human's revocation names one consumer.
+  let consumer = landing_id(state.partition, state.db.next_seq());
+  let record = ConsumerRecord {
+    consumer,
+    account,
+    secret,
+    revoked: false,
+  };
+  let now = state.clock.monotonic_ns();
+  match state
+    .db
+    .mutate(&mut state.segment, &Op::ConsumerEnrolled { record }, now)
+  {
+    Ok(_) => ReplyBody::Enrolled { consumer, secret },
+    Err(e) => refused(refusal_of_db(&e)),
+  }
+}
+
+/// Revokes a consumer's enrollment (§4.13 "every later effect from a channel bound to it refuses
+/// `ConsumerRevoked`"). The proof of issuer authority is checked first, here, on the channel's own shard
+/// (every shard holds the issuer secret): a forged proof refuses `GrantIssuerUnverified`, counted, with no
+/// cross-shard work. A verified revocation runs as a task: it records the revocation durably on the
+/// partition the consumer id names, then marks every shard's slots bound to the consumer — each step a
+/// bounded [`crate::xshard::call_within`] — and **only then** delivers `Revoked`. "Later" means later than
+/// the acknowledged revocation: a `run_on` fan-out is a sent message the workload's next request can
+/// overtake (measured: the very next `Status` after `Revoked` was served), so the acknowledgement waits for
+/// every mark. A shard that does not answer within the liveness budget makes the revocation refuse
+/// `NotFound` rather than acknowledge a revocation not yet in force everywhere; the durable record stands,
+/// so the human retries and the retry is a no-op mark.
+fn revoke_on_channel(
+  state: &mut ShardState,
+  client_index: u32,
+  request: u64,
+  consumer: u64,
+  proof: Capability,
+) -> Served {
+  let expected = crate::landing::revoke_proof(&state.issuer_secret, consumer);
+  if !crate::landing::constant_time_eq(&expected, &proof) {
+    *state.refusals.entry("grant_issuer_unverified").or_insert(0) += 1;
+    return Served::Reply(refused(Refusal::GrantIssuerUnverified));
+  }
+  let origin = state.shard;
+  let Some(owner) = shard_of_partition(state, owner_of_consumer(consumer)) else {
+    return Served::Reply(refused(Refusal::NotFound));
+  };
+  let shards = state.shards.clone();
+  let task = SpawnRequest::new(
+    Box::pin(async move {
+      let reply = revoke_everywhere(origin, owner, &shards, consumer).await;
+      crate::state::deliver(client_index, request, reply, false);
+    }),
+    None,
+  );
+  if slates_rt::registry::send_control(origin, Control::Spawn(Box::new(task))).is_err() {
+    return Served::Reply(refused(Refusal::NotFound));
+  }
+  Served::Forwarded
+}
+
+/// The revocation's two bounded steps: the durable record on `owner`, then the mark on every shard.
+/// Returns the reply to deliver. Each call is bounded by the liveness budget; one that does not answer
+/// refuses `NotFound` (the record, if written, stands for the retry).
+async fn revoke_everywhere(origin: u16, owner: u16, shards: &[u16], consumer: u64) -> ReplyBody {
+  let recorded = crate::xshard::call_within(
+    origin,
+    owner,
+    move |s| {
+      let now = s.clock.monotonic_ns();
+      s.db
+        .mutate(&mut s.segment, &Op::ConsumerRevoked { consumer }, now)
+        .map(|_| ())
+        .map_err(|e| refusal_of_db(&e))
+    },
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await;
+  match recorded {
+    None => return refused(Refusal::NotFound),
+    Some(Err(refusal)) => return refused(refusal),
+    Some(Ok(())) => {}
+  }
+  for shard in shards.iter().copied() {
+    let marked = crate::xshard::call_within(
+      origin,
+      shard,
+      move |s| mark_revoked(s, consumer),
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await;
+    if marked.is_none() {
+      return refused(Refusal::NotFound);
     }
   }
+  ReplyBody::Revoked
+}
+
+/// Marks every slot on this shard bound to `consumer` revoked, so its next verb's gate — one local read
+/// in `serve` — refuses before any effect (banned item 10: no cross-shard call on a write path).
+fn mark_revoked(s: &mut ShardState, consumer: u64) {
+  let bound: Vec<Handle<ClientSlot>> = s
+    .clients
+    .iter()
+    .filter(|(_, slot)| matches!(slot.principal, Principal::Consumer { consumer: c, .. } if c == consumer))
+    .map(|(h, _)| h)
+    .collect();
+  for handle in bound {
+    if let Ok(slot) = s.clients.get_mut(handle) {
+      slot.revoked = true;
+    }
+  }
+}
+
+/// Sets `subject`'s rights on `volume` (§4.13 "Access lists": `admin` covers changing the list; the owner
+/// holds every right). All-false rights remove the entry; the owner's own rights are not an entry and
+/// cannot be reduced here.
+fn share(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  subject: &slates_ipc::protocol::Principal,
+  rights: slates_ipc::protocol::Rights,
+) -> ReplyBody {
+  let (_, record) = match find(state, volume) {
+    Ok(x) => x,
+    Err(r) => return *r,
+  };
+  if !rights_of(&record, principal).admin {
+    return forbidden("share");
+  }
+  let subject = to_db_principal(subject);
+  let rights = to_db_rights(rights);
+  let mut access: Vec<AccessEntry> = record
+    .access
+    .iter()
+    .filter(|entry| entry.principal != subject)
+    .cloned()
+    .collect();
+  if rights.read || rights.write || rights.admin {
+    access.push(AccessEntry {
+      principal: subject,
+      rights,
+    });
+  }
+  let now = state.clock.monotonic_ns();
+  match state.db.mutate(
+    &mut state.segment,
+    &Op::AccessChanged {
+      id: to_db_volume(volume),
+      access,
+    },
+    now,
+  ) {
+    Ok(_) => ReplyBody::Shared,
+    Err(e) => refused(refusal_of_db(&e)),
+  }
+}
+
+/// Format: a consumer's secret capability is a BLAKE3 key, the same width as the issuer secret
+/// ([`slates_anchor::layout::ISSUER_SECRET_BYTES`]) — one width for every keyed proof in §4.13.
+type Capability = [u8; slates_anchor::layout::ISSUER_SECRET_BYTES];
+
+/// What an attestation is checked against, read from the consumer's owner partition (§4.13): the
+/// account the consumer was enrolled under, the secret capability its proofs are keyed with, and whether
+/// a human has revoked it. `None` when no such consumer was ever enrolled there.
+type ConsumerFacts = Option<(u32, Capability, bool)>;
+
+/// The pure decision of an attestation (§4.13 "a consumer channel is bound at rendezvous using a
+/// capability delivered and retained outside other agents' reach"): the channel's principal must be the
+/// account the consumer was enrolled under (a consumer is a workload *within* an account, never a way
+/// across accounts), the consumer must not be revoked, and the proof — the capability keyed over this
+/// channel's client id — must verify, so a proof captured from another session does not bind this one.
+/// Cfg-free and side-effect-free, so it is tested on every host without a daemon.
+pub fn verify_attestation(
+  channel_principal: &Principal,
+  client_id: u32,
+  facts: ConsumerFacts,
+  proof: &Capability,
+) -> Result<u32, Refusal> {
+  let Some((account, secret, revoked)) = facts else {
+    return Err(Refusal::ConsumerNotEnrolled);
+  };
+  if revoked {
+    return Err(Refusal::ConsumerRevoked);
+  }
+  let same_account = matches!(channel_principal, Principal::Uid { uid } if *uid == account);
+  let expected = crate::landing::attest_proof(&secret, client_id);
+  if !same_account || !crate::landing::constant_time_eq(&expected, proof) {
+    return Err(Refusal::ConsumerNotEnrolled);
+  }
+  Ok(account)
+}
+
+/// The counter name a refusal of an attestation is counted under (§4.13 "refusals are counted, never
+/// logged with content").
+fn attest_refusal_counter(refusal: &Refusal) -> &'static str {
+  match refusal {
+    Refusal::ConsumerRevoked => "consumer_revoked",
+    _ => "consumer_not_enrolled",
+  }
+}
+
+/// Binds the channel at `client_index` to the enrolled consumer it attests (§4.13). The consumer's record
+/// lives on the partition its id names ([`owner_of_consumer`] — ids route to owners, D-14), so the check
+/// runs as a task on this shard that reads the record there ([`crate::xshard::call_within`], bounded by
+/// the liveness budget), decides ([`verify_attestation`]), binds the slot here, and delivers the reply —
+/// the shape of [`promote_region_on_root`]. No cross-shard call is on any later verb's path: after the
+/// bind, the channel's principal *is* the consumer and every right is checked locally against it.
+/// Refused `ConsumerNotEnrolled` or `ConsumerRevoked`, each counted where it was decided; an owner
+/// partition that does not answer within the budget refuses `NotFound` rather than binding blind.
+fn attest_on_channel(
+  state: &mut ShardState,
+  client_index: u32,
+  request: u64,
+  client_id: u32,
+  consumer: u64,
+  proof: Capability,
+) -> Served {
+  let origin = state.shard;
+  // The record's partition, mapped to the runtime shard that holds it in this process: `call_within`
+  // addresses shards, the id names a partition (the two differ — a shard id is the runtime's).
+  let Some(owner) = shard_of_partition(state, owner_of_consumer(consumer)) else {
+    return Served::Reply(refused(Refusal::NotFound));
+  };
+  let Some(channel_principal) = state
+    .clients
+    .iter()
+    .find(|(h, _)| h.index() == client_index)
+    .map(|(_, slot)| slot.principal.clone())
+  else {
+    return Served::Reply(refused(Refusal::NotFound));
+  };
+  let task = SpawnRequest::new(
+    Box::pin(async move {
+      let facts: Option<ConsumerFacts> = crate::xshard::call_within(
+        origin,
+        owner,
+        move |s| {
+          s.db
+            .partition()
+            .consumer(consumer)
+            .map(|r| (r.account, r.secret, r.revoked))
+        },
+        crate::daemon::LIVENESS_BUDGET_NS,
+      )
+      .await;
+      let reply = match facts {
+        None => refused(Refusal::NotFound),
+        Some(facts) => match verify_attestation(&channel_principal, client_id, facts, &proof) {
+          Ok(account) => {
+            // Bind the slot on the origin shard, by index: the channel's principal becomes the consumer.
+            let bound = crate::xshard::run_on(origin, origin, move |s| {
+              let handle = s
+                .clients
+                .iter()
+                .find(|(h, _)| h.index() == client_index)
+                .map(|(h, _)| h);
+              if let Some(slot) = handle.and_then(|h| s.clients.get_mut(h).ok()) {
+                slot.principal = Principal::Consumer { account, consumer };
+              }
+            })
+            .is_ok();
+            if bound {
+              ReplyBody::Attested
+            } else {
+              refused(Refusal::NotFound)
+            }
+          }
+          Err(refusal) => {
+            let counter = attest_refusal_counter(&refusal);
+            let _ = crate::xshard::run_on(origin, origin, move |s| {
+              *s.refusals.entry(counter).or_insert(0) += 1;
+            });
+            refused(refusal)
+          }
+        },
+      };
+      crate::state::deliver(client_index, request, reply, false);
+    }),
+    None,
+  );
+  if slates_rt::registry::send_control(origin, Control::Spawn(Box::new(task))).is_err() {
+    return Served::Reply(refused(Refusal::NotFound));
+  }
+  Served::Forwarded
 }
 
 /// The volume slot and its record, or the refusal.
@@ -4329,7 +4800,8 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
 #[cfg(test)]
 mod tests {
   use super::{
-    HostId, ObjectId, RegionId, VolumeId, home_redirect, owner_in_region, rendezvous_first,
+    HostId, ObjectId, Principal, Refusal, RegionId, VolumeId, home_redirect, owner_in_region,
+    rendezvous_first, verify_attestation,
   };
   use slates_db::register::RootConfiguration;
 
@@ -4495,6 +4967,59 @@ mod tests {
       owner_in_region(object, new_home, &node_regions, &none_in_home),
       creator,
       "an empty home-region view falls back to the creator so the caller re-routes"
+    );
+  }
+
+  /// §4.13 "Principals": an attestation binds a channel only when the consumer is enrolled, not revoked,
+  /// under the channel's own account, and the proof is the capability keyed over *this* channel's client
+  /// id — each of the four ways it can fail is its own typed refusal, and a proof from another session
+  /// (a different client id) is not this one's.
+  #[test]
+  fn an_attestation_verifies_only_the_enrolled_unrevoked_consumer_of_the_channels_own_account() {
+    const ACCOUNT: u32 = 501;
+    const OTHER_ACCOUNT: u32 = 502;
+    const CLIENT: u32 = 7;
+    const OTHER_CLIENT: u32 = 8;
+    let secret = [0x5Au8; 32];
+    let channel = Principal::Uid { uid: ACCOUNT };
+    let proof = crate::landing::attest_proof(&secret, CLIENT);
+
+    assert_eq!(
+      verify_attestation(&channel, CLIENT, Some((ACCOUNT, secret, false)), &proof),
+      Ok(ACCOUNT),
+      "enrolled, unrevoked, same account, this channel's proof: bound"
+    );
+    assert_eq!(
+      verify_attestation(&channel, CLIENT, None, &proof),
+      Err(Refusal::ConsumerNotEnrolled),
+      "no such consumer"
+    );
+    assert_eq!(
+      verify_attestation(&channel, CLIENT, Some((ACCOUNT, secret, true)), &proof),
+      Err(Refusal::ConsumerRevoked),
+      "revoked by a human"
+    );
+    assert_eq!(
+      verify_attestation(
+        &channel,
+        CLIENT,
+        Some((OTHER_ACCOUNT, secret, false)),
+        &proof
+      ),
+      Err(Refusal::ConsumerNotEnrolled),
+      "a consumer of another account is not a way across accounts"
+    );
+    let captured = crate::landing::attest_proof(&secret, OTHER_CLIENT);
+    assert_eq!(
+      verify_attestation(&channel, CLIENT, Some((ACCOUNT, secret, false)), &captured),
+      Err(Refusal::ConsumerNotEnrolled),
+      "a proof captured from another session does not bind this one"
+    );
+    let forged = crate::landing::attest_proof(&[0u8; 32], CLIENT);
+    assert_eq!(
+      verify_attestation(&channel, CLIENT, Some((ACCOUNT, secret, false)), &forged),
+      Err(Refusal::ConsumerNotEnrolled),
+      "a proof under a guessed capability does not verify"
     );
   }
 }

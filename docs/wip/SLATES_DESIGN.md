@@ -2357,6 +2357,17 @@ server, not inferred from command names.
 carried through §4.4's operation refusal taxonomy. A-9 adds these requirements without claiming
 that the current uid-based implementation enforces them.
 
+> **Status (2026-09-13).** Built for one host: the issuer secret and verified grants (`596bfb0`);
+> consumer enrollment, attestation, revocation and sharing (`e0d6877`). An attestation is decided by a
+> pure function over the consumer's durable record — read from the partition its id names, mapped to
+> the runtime shard that holds it — and binds the channel's principal; a revocation is acknowledged only
+> after every shard has marked its bound slots, so "every later effect refuses" holds by construction
+> rather than by scheduling (the first cut's `run_on` fan-out let the very next request through —
+> measured, then fixed). Every refusal is typed and counted. Owed: the `slates enroll`/`revoke`/`share`
+> verbs, the delegated consumer scope over the fleet transport, MCP servable roots against the access
+> list, and the harness-owned delivery of the capability (an inherited descriptor is the
+> recommendation). Record: `docs/wip/enrollment.md`.
+
 *Content identity and sharing.* A chunk hash proves bytes, not permission to read them or ask
 whether they exist. Missing-set exchange, caches, archives and dedup obey the consumer's
 sharing scope and reference authorization; cross-scope existence and timing must not reveal

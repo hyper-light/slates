@@ -59,10 +59,22 @@ Those commit messages' "starvation" attribution stands as *plausible but unprove
 carried the record were genuine passes, and the merges are correct, but the diagnosis in those messages
 should be read with this record beside it.
 
+## Recurrence (23:04, the same day)
+
+The directory rebuilt clean at 20:56 wedged again at 6/32 after three further merges (content
+replication, then enrollment) — **neither of which touched `crates/rt` or `crates/mem`**. Same
+signature (two shards of a finished test's daemons alive in `kevent`, the next test blocked on the
+serial lock, 18 tests over 60 s). The enrollment change was read for its own two ways of wedging a
+daemon (`ClientSlot.revoked` defaults `false` at both slot sites; every `call_within` is deadline
+bounded) and cleared; the same source in a fresh directory is the discriminator (result below). So the
+trigger is incremental churn across merges in general, not `rt`/`mem` changes specifically — the rule
+below is tightened accordingly.
+
 ## Rules kept
 
-- After merging anything that changes `crates/rt` or `crates/mem` (atomics ordering, parking, rings),
-  wipe `target/` before the validating suite run.
+- **Wipe `target/` before every validating suite run that follows a merge** — not only after `rt`/`mem`
+  changes: the recurrence came three non-runtime merges after a clean rebuild. A full workspace rebuild
+  is ~10 s on this box; a wedge costs 5–25 min and a false attribution.
 - A suite hang whose tests pass singly is compared against the same binary in a fresh
   `CARGO_TARGET_DIR` before any load attribution is written.
 - libtest's `--exact` accepts one name; several names with `--exact` filter to zero tests (a vacuous

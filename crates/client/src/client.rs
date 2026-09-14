@@ -7,7 +7,7 @@ use std::os::windows::io::RawSocket;
 use std::time::Instant;
 
 use slates_ipc::protocol::{
-  AuditEntry, DaemonReport, Direction, Filter, GrantSummary, Intent, LandingOutcome,
+  AuditEntry, DaemonReport, Direction, Filter, GrantScope, GrantSummary, Intent, LandingOutcome,
   LandingSummary, MergeWindow, NamePolicy, ReplyBody, RequestBody, Scope, SizeClass, SnapshotId,
   StatusReport, VolumeId, VolumeSummary, WorkOp, pack, unpack,
 };
@@ -1397,6 +1397,31 @@ impl Client {
         conflicts,
       }),
       _ => Err(ClientError::UnexpectedReply { verb: "land" }),
+    }
+  }
+
+  /// Issues the grant a presented landing needs, carrying the human surface's proof of issuer authority
+  /// (§4.13 "Grants"; the proof is `slates_server::landing::grant_proof` under the anchor's issuer
+  /// secret — only a caller that maps the anchor segment can make one). Returns the grant id `land`
+  /// then consumes. Refused `GrantIssuerUnverified` when the proof does not verify, `GrantMismatch` when
+  /// the approved manifest is not the presented one, `NotFound` when nothing awaits under `landing`.
+  pub fn grant(
+    &mut self,
+    landing: u64,
+    manifest: [u8; 32],
+    scope: GrantScope,
+    term_ns: u64,
+    proof: [u8; 32],
+  ) -> Result<u64, ClientError> {
+    match self.call(&RequestBody::Grant {
+      landing,
+      manifest,
+      scope,
+      term_ns,
+      proof,
+    })? {
+      ReplyBody::Granted { grant } => Ok(grant),
+      _ => Err(ClientError::UnexpectedReply { verb: "grant" }),
     }
   }
 

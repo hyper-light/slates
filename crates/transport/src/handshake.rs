@@ -74,6 +74,17 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
   Arc::new(rustls::crypto::ring::default_provider())
 }
 
+/// Fills `out` with bytes from the crypto provider's secure random — the one source of randomness the
+/// tree links (the TLS handshake's own; no second RNG crate). A secret minted here is what the daemon
+/// publishes as its grant-issuer authority (§4.13) and what enrollment derives a consumer's capability
+/// from; both are refused rather than minted if the provider cannot fill the buffer.
+pub fn secure_random(out: &mut [u8]) -> Result<(), HandshakeError> {
+  rustls::crypto::ring::default_provider()
+    .secure_random
+    .fill(out)
+    .map_err(|_| HandshakeError::Setup("the crypto provider's secure random refused".to_owned()))
+}
+
 /// A server config presenting `identity`, TLS 1.3 only, that **requires and pins the client's**
 /// enrolled certificate (mutual authentication): the client must present a certificate the server
 /// finds among `allowed_clients`, so the holder authenticates its caller's identity — server-cert

@@ -1,8 +1,8 @@
 //! The client verbs: one connection, one request, the reply printed in a stable plain form.
 
 use slates_client::{
-  AuditEntry, Client, ClientError, CreateSpec, DaemonReport, Deadlines, GrantSummary, Intent,
-  Landing, Rebased, Scope, SnapshotId, StatusReport, Submitted, VolumeId, VolumeSummary,
+  AuditEntry, Client, ClientError, CreateSpec, DaemonReport, Deadlines, GrantScope, GrantSummary,
+  Intent, Landing, Rebased, Scope, SnapshotId, StatusReport, Submitted, VolumeId, VolumeSummary,
 };
 use slates_db::replay::RECOVERY_BUDGET_NS;
 use slates_server::daemon::LIVENESS_BUDGET_NS;
@@ -44,6 +44,24 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
     return Ok(());
   }
   let mut client = connect(&request.instance)?;
+  // `grant` proves the human's authority from the anchor segment this command runs under, then asks the
+  // daemon to issue; its refusals are the anchor's (`Failure`), not the client's, so it is served here.
+  if let Verb::Grant {
+    landing,
+    manifest,
+    scope,
+    term_ns,
+  } = &request.verb
+  {
+    return emit_grant(
+      &mut client,
+      *landing,
+      *manifest,
+      *scope,
+      *term_ns,
+      request.json,
+    );
+  }
   // `mount` reads the volume's name and the daemon's NFS port through the client, then runs `mount_nfs`
   // to mount it over the loopback NFS bridge (§4.6) — no privilege, no kernel extension, no Apple
   // entitlement. Its failure is a `Failure` (a mount refusal, not a client error), so it is handled
@@ -633,8 +651,62 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     ),
     Verb::Grants => emit_grants(client, json)?,
     Verb::Audit { since } => emit_audit(client, *since, json)?,
+    // Served in `run`, before this: its authority comes from the anchor, not the client.
+    Verb::Grant { .. } => {}
   }
   Ok(())
+}
+
+/// `grant`: the human surface (§4.13 "Grants"). The command runs as the user who started the anchor and
+/// attaches the anchor segment from its environment — the handoff only the supervisor's children and its
+/// user's shell inherit — reads the issuer secret the daemon minted at start, proves the exact landing
+/// under it, and asks the daemon to issue. With no anchor in the environment there is no authority to
+/// prove, and the command refuses before asking: an agent driving the ring, the MCP server or an SDK
+/// never inherits the handoff, which is what makes this the human's surface and not theirs.
+fn emit_grant(
+  client: &mut Client,
+  landing: u64,
+  manifest: [u8; 32],
+  scope: GrantScope,
+  term_ns: u64,
+  json: bool,
+) -> Result<(), Failure> {
+  let secret = issuer_secret()?;
+  let proof = slates_server::landing::grant_proof(&secret, landing, &manifest, scope, term_ns);
+  let grant = client
+    .grant(landing, manifest, scope, term_ns, proof)
+    .map_err(|e| failure_of(e, "grant"))?;
+  if json {
+    println!("{}", serde_json::json!({ "grant": grant }));
+  } else {
+    println!("grant: {grant}");
+  }
+  Ok(())
+}
+
+/// The daemon's grant-issuer secret, read from the anchor segment this command runs under; refused
+/// typed when no anchor is in the environment (the command was not run by the anchor's user from the
+/// anchor's session) or the daemon has not published one yet (an all-zero secret is no authority).
+fn issuer_secret() -> Result<[u8; slates_anchor::layout::ISSUER_SECRET_BYTES], Failure> {
+  if std::env::var_os(slates_anchor::segment::ENV_HANDOFF).is_none() {
+    return Err(Failure::Failed(
+      "grant: no anchor in this environment — `slates grant` is the anchor user's surface; run it from \
+       the session that started the daemon (the MCP server and the SDKs cannot issue grants)"
+        .to_owned(),
+    ));
+  }
+  let identity = slates_machine::facts::Facts::query().identity;
+  let segment = slates_anchor::AnchorSegment::attach_from_env(&identity)
+    .map_err(|e| Failure::Failed(format!("grant: attaching the anchor: {e}")))?;
+  let secret = segment
+    .issuer_secret()
+    .map_err(|e| Failure::Failed(format!("grant: reading the issuer secret: {e}")))?;
+  if secret.iter().all(|byte| *byte == 0) {
+    return Err(Failure::Failed(
+      "grant: the daemon has published no issuer secret yet".to_owned(),
+    ));
+  }
+  Ok(secret)
 }
 
 /// Prints a landing's outcome, or the grant it needs.

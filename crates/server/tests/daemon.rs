@@ -11,7 +11,8 @@
 use std::time::{Duration, Instant};
 
 use slates_ipc::protocol::{
-  Direction, Intent, NamePolicy, Refusal, ReplyBody, RequestBody, SizeClass, pack, unpack,
+  Direction, Filter, GrantScope, Intent, NamePolicy, Refusal, ReplyBody, RequestBody, SizeClass,
+  VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
@@ -472,15 +473,170 @@ fn lease_scenario() {
   daemon.stop();
 }
 
-/// AC-2.8: the grant kind is refused on the ring with a typed refusal, and counted.
+/// A landing target on the host: a directory named with the process id (`mktemp -d`), owned by this
+/// user — what `OsLand::open_target` admits — and removed when dropped, even on a failed assertion
+/// (tests write only to a temp directory they name and remove, CLAUDE.md §4).
+struct TargetDir {
+  path: String,
+}
+
+impl Drop for TargetDir {
+  fn drop(&mut self) {
+    let _ = std::process::Command::new("rm")
+      .args(["-rf", &self.path])
+      .output();
+  }
+}
+
+fn target_dir() -> TargetDir {
+  let out = std::process::Command::new("mktemp")
+    .args(["-d", "-t", &format!("slates-grant-{}", std::process::id())])
+    .output()
+    .unwrap();
+  assert!(out.status.success(), "mktemp -d");
+  let made = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+  // The canonical path: a landing target is resolved component by component with `O_NOFOLLOW` (§4.13 —
+  // no symlink in the chain may redirect a write), and macOS's `/var` is a symlink to `/private/var`, so
+  // the path `mktemp` prints would be refused `NotDirectory` at the link; the landing is given the real
+  // directory. A read of the path, not a write.
+  let path = std::fs::canonicalize(&made)
+    .map(|p| p.to_string_lossy().into_owned())
+    .unwrap_or(made);
+  TargetDir { path }
+}
+
+/// AC-5.10 / T-5.12 and AC-2.8 (§4.13 "Grants"): a grant is accepted only with a **verified proof of
+/// issuer authority** bound to the exact presented landing, never by the channel it arrives on. A
+/// landing is presented (`GrantRequired`); an approval forged from the agent's own channel — the right
+/// landing and manifest, a proof under a secret the caller does not hold — is refused
+/// `GrantIssuerUnverified` and counted; the human surface, which maps the anchor and so holds the
+/// daemon's issuer secret, proves the unchanged manifest and the grant issues; the landing then runs under
+/// that grant and only its granted effect lands; `grants` lists it. Non-vacuous: the forged and the
+/// genuine approval differ only in the secret behind the proof.
 fn grant_scenario() {
   let (daemon, instance) = daemon("grant");
+  let target = target_dir();
   let mut client = Client::connect(&instance);
+  let (id, snapshot, landing, manifest) = present_landing(&mut client, &target.path);
+  forged_approval_is_refused(&mut client, landing, manifest);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let grant = verified_approval_issues(&mut client, &secret, landing, manifest);
+  // The landing runs under its grant, and `grants` lists it — across shards (the grant record lives on
+  // the volume's owner shard, not necessarily the client's).
   assert!(matches!(
-    client.call(&RequestBody::Grant { request: 1 }),
-    ReplyBody::Refused { refusal: Refusal::GrantChannelRefused { channel } } if channel == "ring"
+    client.call(&RequestBody::Land {
+      volume: id,
+      snapshot: Some(snapshot),
+      target: target.path.clone(),
+      filter: Filter::default(),
+      grant: Some(grant),
+    }),
+    ReplyBody::Landed { .. }
+  ));
+  assert!(matches!(
+    client.call(&RequestBody::Grants),
+    ReplyBody::Grants { grants } if grants.len() == 1 && grants[0].id == grant
   ));
   daemon.stop();
+}
+
+/// A grant request for `landing` under `proof`, scoped once for the test's deadline.
+fn grant_request(landing: u64, manifest: [u8; 32], proof: [u8; 32]) -> RequestBody {
+  RequestBody::Grant {
+    landing,
+    manifest,
+    scope: GrantScope::Once,
+    term_ns: DEADLINE_NS,
+    proof,
+  }
+}
+
+/// Creates a volume, snapshots it, and presents its landing into `target`: the plan is computed, no
+/// grant covers it, nothing is written. Returns the volume, the snapshot, the landing id and the
+/// manifest the human must approve.
+fn present_landing(
+  client: &mut Client,
+  target: &str,
+) -> (
+  slates_ipc::protocol::VolumeId,
+  slates_ipc::protocol::SnapshotId,
+  u64,
+  [u8; 32],
+) {
+  let ReplyBody::Created { id } = client.call(&scratch("granted")) else {
+    panic!("create");
+  };
+  let ReplyBody::Snapshotted { id: snapshot } = client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("snapshot");
+  };
+  let presented = client.call(&RequestBody::Land {
+    volume: id,
+    snapshot: Some(snapshot),
+    target: target.to_owned(),
+    filter: Filter::default(),
+    grant: None,
+  });
+  let ReplyBody::GrantRequired {
+    landing, manifest, ..
+  } = presented
+  else {
+    panic!("the landing was not presented: {presented:?}");
+  };
+  (id, snapshot, landing, manifest)
+}
+
+/// A forged approval — the agent knows the landing and its manifest but not the issuer secret — is
+/// refused as unverified authority and issues nothing.
+fn forged_approval_is_refused(client: &mut Client, landing: u64, manifest: [u8; 32]) {
+  let forged = slates_server::landing::grant_proof(
+    &[0u8; 32],
+    landing,
+    &manifest,
+    GrantScope::Once,
+    DEADLINE_NS,
+  );
+  let refused = client.call(&grant_request(landing, manifest, forged));
+  assert!(
+    matches!(
+      refused,
+      ReplyBody::Refused {
+        refusal: Refusal::GrantIssuerUnverified
+      }
+    ),
+    "a forged approval is refused as unverified authority, got {refused:?}"
+  );
+  assert!(
+    matches!(
+      client.call(&RequestBody::Grants),
+      ReplyBody::Grants { grants } if grants.is_empty()
+    ),
+    "a forged approval issued nothing"
+  );
+}
+
+/// The human surface — it maps the anchor segment and holds the secret the daemon minted — proves the
+/// unchanged manifest and the grant issues; the same proof over a modified plan does not verify.
+fn verified_approval_issues(
+  client: &mut Client,
+  secret: &[u8; 32],
+  landing: u64,
+  manifest: [u8; 32],
+) -> u64 {
+  let proof =
+    slates_server::landing::grant_proof(secret, landing, &manifest, GrantScope::Once, DEADLINE_NS);
+  let ReplyBody::Granted { grant } = client.call(&grant_request(landing, manifest, proof)) else {
+    panic!("the verified approval did not issue a grant");
+  };
+  let mut other = manifest;
+  other[0] ^= 1;
+  assert!(matches!(
+    client.call(&grant_request(landing, other, proof)),
+    ReplyBody::Refused {
+      refusal: Refusal::GrantIssuerUnverified
+    }
+  ));
+  grant
 }
 
 /// Landings and grants through the server (§4.15, task 8): a grant cannot be created on the
@@ -590,6 +746,174 @@ fn bulk_and_overlay_scenario() {
   daemon.stop();
 }
 
+/// AC-5.10 / T-5.12, AC-2.8: a human's grant is authenticated by a verified proof of issuer authority
+/// bound to the exact presented landing — a forged or modified-plan approval refuses before writing, the
+/// enrolled human surface's approval issues and lands. Its own test so it is observable on its own.
+#[test]
+fn a_grant_is_accepted_only_with_a_verified_proof_bound_to_the_presented_landing() {
+  grant_scenario();
+}
+
+/// AC-2.13 / T-2.15 (§4.13 "Principals", "Access lists"): distinct consumers sharing a uid cannot use
+/// each other's VFS or grant rights. The human surface enrolls a consumer under the account; a workload
+/// binds its channel to it with the capability (a forged capability refuses `ConsumerNotEnrolled`); the
+/// consumer sees nothing of the account's volume until the owner shares it (`Forbidden` before any
+/// lookup), then only the right shared (read, not write); a workload cannot mint enrollment authority
+/// (`GrantIssuerUnverified`); once the human revokes the consumer, its very next verb refuses
+/// `ConsumerRevoked` before any effect. Non-vacuous: the forged and the genuine capability differ only in
+/// the secret, and the shared and the unshared right differ only in the access entry. The daemon runs
+/// [`TEST_SHARDS`] shards and each client lands on its own, so the consumer's record is enrolled on one
+/// partition and attested from a channel on another — the routing an in-partition lookup cannot do.
+#[test]
+fn distinct_consumers_under_one_uid_hold_only_the_rights_shared_with_them_until_revoked() {
+  let (daemon, instance) = daemon("consumers");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let account = current_uid();
+  let mut owner = Client::connect(&instance);
+  let mut workload = Client::connect(&instance);
+
+  a_workload_cannot_mint_enrollment_authority(&mut workload, account);
+  let (consumer, capability) = enroll(&mut owner, &secret, account);
+  only_the_genuine_capability_binds_the_channel(&mut workload, consumer, &capability);
+  let id = the_consumer_holds_only_the_right_shared(&mut owner, &mut workload, account, consumer);
+  once_revoked_every_verb_refuses_before_any_effect(
+    &mut owner,
+    &mut workload,
+    &secret,
+    consumer,
+    id,
+  );
+  daemon.stop();
+}
+
+/// A forged proof of issuer authority refuses: an agent cannot enroll itself.
+fn a_workload_cannot_mint_enrollment_authority(workload: &mut Client, account: u32) {
+  let forged = slates_server::landing::enroll_proof(&[0u8; 32], account);
+  assert!(matches!(
+    workload.call(&RequestBody::Enroll {
+      account,
+      proof: forged
+    }),
+    ReplyBody::Refused {
+      refusal: Refusal::GrantIssuerUnverified
+    }
+  ));
+}
+
+/// A forged capability does not bind the channel; the genuine one does, and the channel's principal is
+/// then the consumer.
+fn only_the_genuine_capability_binds_the_channel(
+  workload: &mut Client,
+  consumer: u64,
+  capability: &[u8; 32],
+) {
+  let wrong = slates_server::landing::attest_proof(&[0u8; 32], workload.client);
+  assert!(matches!(
+    workload.call(&RequestBody::Attest {
+      consumer,
+      proof: wrong
+    }),
+    ReplyBody::Refused {
+      refusal: Refusal::ConsumerNotEnrolled
+    }
+  ));
+  let proof = slates_server::landing::attest_proof(capability, workload.client);
+  let attested = workload.call(&RequestBody::Attest { consumer, proof });
+  assert!(
+    matches!(attested, ReplyBody::Attested),
+    "the genuine capability binds the channel, got {attested:?}"
+  );
+}
+
+/// The account owns a volume the consumer, sharing the uid, sees none of until shared; shared read only,
+/// the consumer can read its status and not snapshot it. Returns the volume.
+fn the_consumer_holds_only_the_right_shared(
+  owner: &mut Client,
+  workload: &mut Client,
+  account: u32,
+  consumer: u64,
+) -> VolumeId {
+  let ReplyBody::Created { id } = owner.call(&scratch("private")) else {
+    panic!("create");
+  };
+  assert!(matches!(
+    workload.call(&RequestBody::Status { volume: id }),
+    ReplyBody::Refused {
+      refusal: Refusal::Forbidden { .. }
+    }
+  ));
+  assert!(matches!(
+    owner.call(&RequestBody::Share {
+      volume: id,
+      principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+      rights: slates_ipc::protocol::Rights {
+        read: true,
+        write: false,
+        admin: false
+      },
+    }),
+    ReplyBody::Shared
+  ));
+  assert!(matches!(
+    workload.call(&RequestBody::Status { volume: id }),
+    ReplyBody::Status { .. }
+  ));
+  assert!(matches!(
+    workload.call(&RequestBody::Snapshot { volume: id }),
+    ReplyBody::Refused {
+      refusal: Refusal::Forbidden { .. }
+    }
+  ));
+  id
+}
+
+/// The human revokes the consumer: its next verb refuses before any effect, and stays refused.
+fn once_revoked_every_verb_refuses_before_any_effect(
+  owner: &mut Client,
+  workload: &mut Client,
+  secret: &[u8; 32],
+  consumer: u64,
+  id: VolumeId,
+) {
+  let revoke = slates_server::landing::revoke_proof(secret, consumer);
+  assert!(matches!(
+    owner.call(&RequestBody::Revoke {
+      consumer,
+      proof: revoke
+    }),
+    ReplyBody::Revoked
+  ));
+  assert!(matches!(
+    workload.call(&RequestBody::Status { volume: id }),
+    ReplyBody::Refused {
+      refusal: Refusal::ConsumerRevoked
+    }
+  ));
+  assert!(matches!(
+    workload.call(&RequestBody::List),
+    ReplyBody::Refused {
+      refusal: Refusal::ConsumerRevoked
+    }
+  ));
+}
+
+/// The human surface enrolls a consumer under `account`, proving issuer authority with the daemon's
+/// secret; returns the consumer id and the capability shown once.
+fn enroll(client: &mut Client, secret: &[u8; 32], account: u32) -> (u64, [u8; 32]) {
+  let proof = slates_server::landing::enroll_proof(secret, account);
+  let ReplyBody::Enrolled { consumer, secret } =
+    client.call(&RequestBody::Enroll { account, proof })
+  else {
+    panic!("the human surface's enrollment was refused");
+  };
+  (consumer, secret)
+}
+
+/// This process's uid — the account every client of these tests rendezvouses as.
+fn current_uid() -> u32 {
+  rustix::process::getuid().as_raw()
+}
+
 /// The scenarios run one daemon at a time (each daemon runs shard threads that spin while a
 /// client is active; several at once would starve each other on one machine).
 #[test]
@@ -597,7 +921,6 @@ fn the_daemon_serves_the_lifecycle_verbs_exactly_once_with_leases_and_typed_refu
   lifecycle_scenario();
   rifl_scenario();
   lease_scenario();
-  grant_scenario();
   landing_refusal_scenario();
   bulk_and_overlay_scenario();
   // §4.2/§4.5 version-slab reservation scenarios run here, one daemon at a time, for the same reason.
