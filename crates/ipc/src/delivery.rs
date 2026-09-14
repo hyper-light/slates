@@ -211,20 +211,44 @@ impl Delivery {
   }
 
   /// Spawns `program args` as the consumer: the child inherits the read end and nothing else of this
-  /// process's descriptors beyond its standard three; its standard streams, working directory and
-  /// environment are this process's, with `environment` added (or replaced) and [`ENV_CONSUMER_FD`]
-  /// set. Consumes the delivery: the record is readable once, by this child.
+  /// process's descriptors beyond its standard three; its standard streams (the output as `output`
+  /// says), working directory and environment are this process's, with `environment` added (or
+  /// replaced) and [`ENV_CONSUMER_FD`] set. Consumes the delivery: the record is readable once, by
+  /// this child.
   pub fn spawn(
     self,
     program: &OsStr,
     args: &[OsString],
     environment: &[(&OsStr, &OsStr)],
+    output: Output,
   ) -> Result<ConsumerChild, IpcError> {
     self
       .carrier
-      .spawn(program, args, environment)
+      .spawn(program, args, environment, output)
       .map(|inner| ConsumerChild { inner })
   }
+}
+
+/// Where a spawned workload's standard output goes: this process's (a workload run in the open), or a
+/// channel the harness reads back with [`ConsumerChild::wait_with_output`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Output {
+  /// The child writes to this process's standard output.
+  Inherit,
+  /// The child's standard output is captured for the harness.
+  Captured,
+}
+
+/// Shape: the chunk one read of a captured output takes — a page, the pipe's own granularity; a
+/// larger chunk only sits unused for a workload that prints lines.
+const OUTPUT_CHUNK: usize = 4096;
+
+/// Appends `chunk` to `kept` while the total stays within `capacity`, counting every byte offered so
+/// an overflow is reported with the size the workload produced.
+fn keep_within(kept: &mut Vec<u8>, chunk: &[u8], capacity: usize, offered: &mut usize) {
+  *offered = offered.saturating_add(chunk.len());
+  let room = capacity.saturating_sub(kept.len());
+  kept.extend_from_slice(&chunk[..chunk.len().min(room)]);
 }
 
 /// A workload [`Delivery::spawn`] started: waited for, or killed, by the harness that owns it.
@@ -249,6 +273,14 @@ impl ConsumerChild {
   /// Waits for the child to end; its exit code, or `None` when a signal ended it (Unix).
   pub fn wait(&mut self) -> Result<Option<i32>, IpcError> {
     self.inner.wait()
+  }
+
+  /// Reads the captured output to its end and then waits for the child: its exit code and the bytes
+  /// (empty under [`Output::Inherit`]). The harness bounds what it holds: past `capacity` bytes the
+  /// rest is drained and dropped — so the child never blocks on a full pipe — and, once the child has
+  /// ended, the result is refused `PayloadTooLarge` with the size the workload produced.
+  pub fn wait_with_output(&mut self, capacity: usize) -> Result<(Option<i32>, Vec<u8>), IpcError> {
+    self.inner.wait_with_output(capacity)
   }
 
   /// Ends the child now.
@@ -292,12 +324,15 @@ mod platform {
   use std::ffi::{OsStr, OsString};
   use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
   use std::os::unix::process::CommandExt;
-  use std::process::Command;
+  use std::process::{Command, Stdio};
 
   use rustix::fs::{FileType, OFlags};
   use rustix::io::{Errno, FdFlags};
 
-  use super::{Delivered, DeliveryFault, ENV_CONSUMER_FD, RECORD_BYTES, decode, zero};
+  use super::{
+    Delivered, DeliveryFault, ENV_CONSUMER_FD, OUTPUT_CHUNK, Output, RECORD_BYTES, decode,
+    keep_within, zero,
+  };
   use crate::error::IpcError;
 
   fn refused(call: &'static str, e: Errno) -> IpcError {
@@ -363,6 +398,7 @@ mod platform {
       program: &OsStr,
       args: &[OsString],
       environment: &[(&OsStr, &OsStr)],
+      output: Output,
     ) -> Result<ConsumerChild, IpcError> {
       // The child's copy: a close-on-exec duplicate this call owns. Its number is what the child is
       // told, and only the forked child clears the flag on it — the parent's copies keep it.
@@ -376,6 +412,9 @@ mod platform {
         command.env(name, value);
       }
       command.env(ENV_CONSUMER_FD, inherited.as_raw_fd().to_string());
+      if output == Output::Captured {
+        command.stdout(Stdio::piped());
+      }
       // SAFETY: the closure runs in the forked child between `fork` and `exec` and does one thing —
       // `fcntl(F_SETFD, 0)` on the descriptor it owns: a single async-signal-safe syscall, no
       // allocation, no lock, no other shared state — which is what `pre_exec` requires. It clears
@@ -408,6 +447,30 @@ mod platform {
         .wait()
         .map(|status| status.code())
         .map_err(|e| refused_io("waitpid", &e))
+    }
+
+    pub(super) fn wait_with_output(
+      &mut self,
+      capacity: usize,
+    ) -> Result<(Option<i32>, Vec<u8>), IpcError> {
+      let mut kept = Vec::new();
+      let mut offered = 0usize;
+      if let Some(mut stdout) = self.child.stdout.take() {
+        let mut chunk = [0u8; OUTPUT_CHUNK];
+        loop {
+          match std::io::Read::read(&mut stdout, &mut chunk) {
+            Ok(0) => break,
+            Ok(got) => keep_within(&mut kept, &chunk[..got], capacity, &mut offered),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(refused_io("read", &e)),
+          }
+        }
+      }
+      let code = self.wait()?;
+      if offered > capacity {
+        return Err(IpcError::PayloadTooLarge { offered, capacity });
+      }
+      Ok((code, kept))
     }
 
     pub(super) fn kill(&mut self) -> Result<(), IpcError> {
@@ -513,7 +576,10 @@ mod platform {
     WaitForSingleObject,
   };
 
-  use super::{Delivered, DeliveryFault, ENV_CONSUMER_FD, RECORD_BYTES, decode, zero};
+  use super::{
+    Delivered, DeliveryFault, ENV_CONSUMER_FD, OUTPUT_CHUNK, Output, RECORD_BYTES, decode,
+    keep_within, zero,
+  };
   use crate::error::IpcError;
 
   /// The calling thread's last Win32 error, as the refusal's code.
@@ -718,6 +784,20 @@ mod platform {
     block
   }
 
+  /// An anonymous pipe, both ends non-inheritable: (read end, write end).
+  fn create_pipe() -> Result<(ClosedOnDrop, ClosedOnDrop), IpcError> {
+    let mut read: HANDLE = null_mut();
+    let mut write: HANDLE = null_mut();
+    // SAFETY: two out-pointers to locals the call fills; no security attributes (null) makes both
+    // ends non-inheritable — the default the delivery relies on; a size of zero is the system's
+    // default buffer, larger than one record.
+    let ok = unsafe { CreatePipe(&mut read, &mut write, null(), 0) };
+    if ok == 0 {
+      return Err(refused("CreatePipe"));
+    }
+    Ok((ClosedOnDrop(read), ClosedOnDrop(write)))
+  }
+
   /// The held read end.
   pub(super) struct Carrier {
     read_end: ClosedOnDrop,
@@ -725,17 +805,7 @@ mod platform {
 
   impl Carrier {
     pub(super) fn create(record: &[u8; RECORD_BYTES]) -> Result<Carrier, IpcError> {
-      let mut read: HANDLE = null_mut();
-      let mut write: HANDLE = null_mut();
-      // SAFETY: two out-pointers to locals the call fills; no security attributes (null) makes both
-      // ends non-inheritable — the default the delivery relies on; a size of zero is the system's
-      // default buffer, larger than one record.
-      let ok = unsafe { CreatePipe(&mut read, &mut write, null(), 0) };
-      if ok == 0 {
-        return Err(refused("CreatePipe"));
-      }
-      let read_end = ClosedOnDrop(read);
-      let write_end = ClosedOnDrop(write);
+      let (read_end, write_end) = create_pipe()?;
       let mut written = 0u32;
       // SAFETY: the buffer is the record, live for the call and of the length passed; the write
       // end is a live handle this function owns; a null OVERLAPPED makes the write synchronous.
@@ -765,6 +835,7 @@ mod platform {
       program: &OsStr,
       args: &[OsString],
       environment: &[(&OsStr, &OsStr)],
+      output: Output,
     ) -> Result<ConsumerChild, IpcError> {
       // The child's copy: an inheritable duplicate that exists for the length of this call only;
       // its value is what the child is told (inheritance keeps a handle's value). Between here and
@@ -772,7 +843,17 @@ mod platform {
       // would carry it along — the window Win32 leaves every handle list (Chen [D]).
       let inherited = duplicate_inheritable(self.read_end.0)?;
       let stdin = standard_handle_inheritable(STD_INPUT_HANDLE)?;
-      let stdout = standard_handle_inheritable(STD_OUTPUT_HANDLE)?;
+      // A captured output is a pipe whose write end the child inherits (as its standard output) and
+      // whose read end this process keeps; the parent's own copies of the write end close after the
+      // spawn, so the read end sees end of stream when the child ends.
+      let captured = match output {
+        Output::Captured => Some(create_pipe()?),
+        Output::Inherit => None,
+      };
+      let stdout = match &captured {
+        Some((_, write_end)) => Some(duplicate_inheritable(write_end.0)?),
+        None => standard_handle_inheritable(STD_OUTPUT_HANDLE)?,
+      };
       let stderr = standard_handle_inheritable(STD_ERROR_HANDLE)?;
       // SAFETY: a plain-data record every zero of which is a valid field value.
       let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
@@ -827,6 +908,10 @@ mod platform {
       drop(stderr);
       drop(inherited);
       drop(self);
+      let captured_read_end = captured.map(|(read_end, write_end)| {
+        drop(write_end);
+        read_end
+      });
       if let Some(error) = error {
         return Err(error);
       }
@@ -834,6 +919,7 @@ mod platform {
       Ok(ConsumerChild {
         process: ClosedOnDrop(information.hProcess),
         id: information.dwProcessId,
+        stdout: captured_read_end,
       })
     }
   }
@@ -842,11 +928,56 @@ mod platform {
   pub(super) struct ConsumerChild {
     process: ClosedOnDrop,
     id: u32,
+    /// The read end of the captured output, until it is read to its end.
+    stdout: Option<ClosedOnDrop>,
   }
 
   impl ConsumerChild {
     pub(super) fn id(&self) -> u32 {
       self.id
+    }
+
+    pub(super) fn wait_with_output(
+      &mut self,
+      capacity: usize,
+    ) -> Result<(Option<i32>, Vec<u8>), IpcError> {
+      let mut kept = Vec::new();
+      let mut offered = 0usize;
+      if let Some(stdout) = self.stdout.take() {
+        let mut chunk = [0u8; OUTPUT_CHUNK];
+        loop {
+          let mut got = 0u32;
+          // SAFETY: the buffer is live and of the length passed; the read end is a live handle this
+          // struct owns; a synchronous read on a pipe returns when bytes arrive or every writer is
+          // gone (ERROR_BROKEN_PIPE, the end of the stream).
+          let ok = unsafe {
+            ReadFile(
+              stdout.0,
+              chunk.as_mut_ptr(),
+              u32::try_from(OUTPUT_CHUNK).unwrap_or(u32::MAX),
+              &mut got,
+              null_mut(),
+            )
+          };
+          if ok == 0 {
+            // SAFETY: a thread-local read with no preconditions.
+            if unsafe { GetLastError() } == ERROR_BROKEN_PIPE {
+              break;
+            }
+            return Err(refused("ReadFile"));
+          }
+          let got = usize::try_from(got).unwrap_or(0);
+          if got == 0 {
+            break;
+          }
+          keep_within(&mut kept, &chunk[..got], capacity, &mut offered);
+        }
+      }
+      let code = self.wait()?;
+      if offered > capacity {
+        return Err(IpcError::PayloadTooLarge { offered, capacity });
+      }
+      Ok((code, kept))
     }
 
     pub(super) fn wait(&mut self) -> Result<Option<i32>, IpcError> {
@@ -970,7 +1101,7 @@ mod platform {
 
   use std::ffi::{OsStr, OsString};
 
-  use super::{Delivered, DeliveryFault, RECORD_BYTES};
+  use super::{Delivered, DeliveryFault, Output, RECORD_BYTES};
   use crate::error::IpcError;
 
   pub(super) struct Carrier;
@@ -991,6 +1122,7 @@ mod platform {
       _program: &OsStr,
       _args: &[OsString],
       _environment: &[(&OsStr, &OsStr)],
+      _output: Output,
     ) -> Result<ConsumerChild, IpcError> {
       Err(IpcError::Unsupported {
         feature: "capability delivery",
@@ -1006,6 +1138,15 @@ mod platform {
     }
 
     pub(super) fn wait(&mut self) -> Result<Option<i32>, IpcError> {
+      Err(IpcError::Unsupported {
+        feature: "capability delivery",
+      })
+    }
+
+    pub(super) fn wait_with_output(
+      &mut self,
+      _capacity: usize,
+    ) -> Result<(Option<i32>, Vec<u8>), IpcError> {
       Err(IpcError::Unsupported {
         feature: "capability delivery",
       })

@@ -13,7 +13,7 @@ use std::ffi::{OsStr, OsString};
 use std::process::Command;
 
 use slates_ipc::delivery::{
-  Capability, Delivery, DeliveryFault, ENV_CONSUMER_FD, delivered, take_named,
+  Capability, Delivery, DeliveryFault, ENV_CONSUMER_FD, Output, delivered, take_named,
 };
 
 /// Format: the environment variable selecting the child role, and the ones carrying what the consumer
@@ -185,6 +185,7 @@ fn a_consumer_child_takes_the_capability_from_the_one_inherited_descriptor_and_n
       &current_exe(),
       &role_args("delivery_consumer_child"),
       &environment,
+      Output::Inherit,
     )
     .unwrap();
   assert!(child.id() > 0);

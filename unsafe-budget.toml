@@ -45,7 +45,7 @@
 #   job object that ends the daemon with the anchor (`supervise.rs`, added 2026-09-05 with the
 #   CLI of Phase 2 task 5): create, the zeroed limit record, set the kill-on-close limit, assign
 #   the child, and the two closes (6), compiled only for Windows.
-# slates-ipc (33): the macOS wait-on-address and wake-by-address calls libc exposes without a
+# slates-ipc (35): the macOS wait-on-address and wake-by-address calls libc exposes without a
 #   safe wrapper (`wake.rs`), each on a live word of a shared mapping (2); the Linux rendezvous
 #   adopting the region descriptor it duplicated for the handoff before sending it (1) and
 #   borrowing the shard's leaked kick descriptor to duplicate it for the client (1); and the
@@ -63,7 +63,9 @@
 #   `UpdateProcThreadAttribute`, `DeleteProcThreadAttributeList` on drop, the two zeroed records
 #   (`STARTUPINFOEXW`, `PROCESS_INFORMATION`), `CreateProcessW` itself, `WaitForSingleObject`,
 #   `GetExitCodeProcess`, `TerminateProcess`, `SetHandleInformation`, `GetFileType`, `PeekNamedPipe`,
-#   `ReadFile`, and the three `GetLastError` reads beside them (22). The standard library's `Command` cannot
+#   `ReadFile` for the record, the `ReadFile` loop that drains a captured output with the
+#   `GetLastError` that tells its end of stream, and the three `GetLastError` reads beside the rest
+#   (24). The standard library's `Command` cannot
 #   restrict inheritance on Windows (the handle-list attribute is unstable on the pinned toolchain), so
 #   the spawn is made here like `slates-rt`'s AFD reactor: from the headers, each call with its
 #   invariant stated.
@@ -103,7 +105,7 @@ slates-vfs = 0
 slates-land = 3
 slates-anchor = 6
 slates-db = 0
-slates-ipc = 33
+slates-ipc = 35
 slates-server = 5
 slates-client = 0
 slates-cli = 4
