@@ -126,13 +126,18 @@ Two findings the measurement corrected in my own predictions:
    (59 in 180 s at the GEO profile), which the derived timing removes entirely. "Flap" as leader change did
    not occur; "elections per N periods" is the honest measure, and it is what the test asserts.
 
-The inter-region profile: 80 ms one way is the far side of a real inter-region pair — from memory, flagged
-for verification: AWS us-east-1 ↔ ap-southeast-1 is measured around 220–240 ms round trip and
-us-east-1 ↔ ap-northeast-1 around 150–170 ms by the public inter-region latency grids (cloudping.co;
-Azure's published round-trip table), i.e. 75–120 ms one way; the ± 20 ms jitter is a quarter of the delay.
-The GEO class: one geostationary hop is ~239 ms one way by geometry (2 × 35,786 km at c), so 500 ms one way
-is two hops or one hop with terrestrial backhaul — the profile at which the gap exceeds a one-second
-timeout, chosen to expose the timeout rule's cost, not as a deployment target.
+The inter-region profile is a real pair. Microsoft's published "Azure network round-trip latency
+statistics" (learn.microsoft.com/en-us/azure/networking/azure-network-latency, page dated 2026-07-30, the
+P50 round-trip time over the 30-day window ending 2026-07-30, directional, fetched 2026-09-14) gives
+**Japan East → East US 162 ms** (East US 2: 165 ms) — the 80 ms one way modelled here, ± 20 ms — beside
+West Europe → East US 85 ms, UK South → East US 78 ms, Southeast Asia → West US 170 ms, Australia East →
+East US 202 ms and Southeast Asia → East US 224 ms. So a three-region council spanning Tokyo, Virginia and
+Amsterdam sees exactly this profile on its slowest path, and a Singapore or Sydney member sits a third
+farther. The published figure is a median; the estimator's tail (`smoothed + 4·rttvar`) covers what a
+median cannot, which is why the derived base at this profile came out at 22–25 periods, not 16. The GEO
+class: one geostationary hop is ~239 ms one way by geometry (2 × 35,786 km at c), so 500 ms one way is two
+hops or one hop with terrestrial backhaul — the profile at which the gap exceeds a one-second timeout,
+chosen to expose the timeout rule's cost, not as a deployment target.
 
 ## 5. The daemon, by use (real loopback)
 

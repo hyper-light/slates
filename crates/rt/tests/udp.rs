@@ -131,8 +131,8 @@ fn a_simulated_udp_datagram_is_received() {
 
 // ── The fabric's latency model (§4.8 A-9: "independently delayed … messages") ────────────────────────
 
-/// Shape: the one-way delay of the modelled inter-region path — 80 ms, the far side of a real
-/// inter-region pair (see `docs/wip/wan-timeout.md` for the measured pairs it stands for).
+/// Shape: the one-way delay of the modelled inter-region path — 80 ms, half the 162 ms P50 round trip
+/// Microsoft publishes for Japan East → East US (30 days ending 2026-07-30; `docs/wip/wan-timeout.md`).
 const ONE_WAY_NS: u64 = 80_000_000;
 /// Shape: the path's jitter, ± 20 ms around the one-way delay — a quarter of it, the spread the
 /// WAN proof was asked for.

@@ -64,8 +64,9 @@ const COUNCIL_KIND: u64 = 7;
 /// is the transport's own bounded handshake; a healthy fabric needs one.
 const ESTABLISH_ATTEMPTS: u32 = 4;
 
-/// Shape: the inter-region path — 80 ms one way ± 20 ms, a far inter-region pair (the measured pairs it
-/// stands for are recorded in `docs/wip/wan-timeout.md`).
+/// Shape: the inter-region path — 80 ms one way ± 20 ms: Japan East → East US, published at a 162 ms P50
+/// round trip over the 30 days ending 2026-07-30 (Microsoft's "Azure network round-trip latency
+/// statistics"; the other pairs it stands beside are in `docs/wip/wan-timeout.md`).
 const INTER_REGION: SimDelay = SimDelay::in_order(80_000_000, 20_000_000);
 /// Shape: a geostationary-satellite class path — 500 ms one way ± 100 ms (two GEO hops; a single hop is
 /// ~250 ms one way from the 35,786 km orbit at the speed of light) — the profile at which a one-second
