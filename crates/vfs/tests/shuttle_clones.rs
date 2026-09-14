@@ -96,58 +96,101 @@ fn read_all(vol: &Volume, store: &Store, file: InodeNo) -> Vec<u8> {
   buf
 }
 
-/// An agent: clone, then a random number of write-and-create steps at its own offsets and names,
-/// then read the clone back and check it against its own record (the oracle of `tests/clones.rs`).
-fn agent(agent: usize, requests: SyncSender<Envelope>) {
-  let (reply, replies) = sync_channel::<Reply>(1);
-  let ask = |request: Request| {
-    requests
+/// An agent's line to the owner: one request out, its reply back (the client's discipline).
+struct Mailbox {
+  requests: SyncSender<Envelope>,
+  reply: SyncSender<Reply>,
+  replies: Receiver<Reply>,
+}
+
+impl Mailbox {
+  fn new(requests: SyncSender<Envelope>) -> Mailbox {
+    let (reply, replies) = sync_channel::<Reply>(1);
+    Mailbox {
+      requests,
+      reply,
+      replies,
+    }
+  }
+
+  fn ask(&self, request: Request) -> Reply {
+    self
+      .requests
       .send(Envelope {
         request,
-        reply: reply.clone(),
+        reply: self.reply.clone(),
       })
       .unwrap();
-    replies.recv().unwrap()
-  };
-  let mut rng = thread_rng();
-  let steps = rng.gen_range(1..=MAX_STEPS);
-  let tag = TAGS[agent];
-  assert!(matches!(ask(Request::Clone { agent }), Reply::Done));
-  let mut expected = BASE.to_vec();
-  let mut created = vec!["f".to_owned()];
+    self.replies.recv().unwrap()
+  }
+
+  /// Asks, expecting a bare acknowledgement.
+  fn ask_done(&self, request: Request) {
+    assert!(matches!(self.ask(request), Reply::Done));
+  }
+}
+
+/// The agent's record of its own clone (the oracle of `tests/clones.rs`): the file's bytes after
+/// its writes and the root's names after its creates, sorted.
+struct Expected {
+  bytes: Vec<u8>,
+  names: Vec<String>,
+}
+
+/// `steps` write-and-create steps at the agent's own offsets and names, recorded as the agent
+/// expects to read them back.
+fn write_and_create(mailbox: &Mailbox, agent: usize, tag: u8, steps: usize) -> Expected {
+  let mut bytes = BASE.to_vec();
+  let mut names = vec!["f".to_owned()];
   for step in 0..steps {
     let offset = u64::try_from(step).unwrap();
-    assert!(matches!(
-      ask(Request::Write {
-        agent,
-        offset,
-        byte: tag
-      }),
-      Reply::Done
-    ));
-    if expected.len() <= step {
-      expected.resize(step + 1, 0);
+    mailbox.ask_done(Request::Write {
+      agent,
+      offset,
+      byte: tag,
+    });
+    if bytes.len() <= step {
+      bytes.resize(step + 1, 0);
     }
-    expected[step] = tag;
+    bytes[step] = tag;
     let name = format!("c{step}");
-    assert!(matches!(
-      ask(Request::Create {
-        agent,
-        name: name.clone()
-      }),
-      Reply::Done
-    ));
-    created.push(name);
+    mailbox.ask_done(Request::Create {
+      agent,
+      name: name.clone(),
+    });
+    names.push(name);
   }
-  created.sort();
-  match ask(Request::View { agent }) {
+  names.sort();
+  Expected { bytes, names }
+}
+
+/// Reads the clone back through the owner and checks it against the agent's own record.
+fn check_view(mailbox: &Mailbox, agent: usize, expected: &Expected) {
+  match mailbox.ask(Request::View { agent }) {
     Reply::View { bytes, names } => {
-      assert_eq!(bytes, expected, "agent {agent}'s clone holds its own bytes");
-      assert_eq!(names, created, "agent {agent}'s clone lists its own names");
+      assert_eq!(
+        bytes, expected.bytes,
+        "agent {agent}'s clone holds its own bytes"
+      );
+      assert_eq!(
+        names, expected.names,
+        "agent {agent}'s clone lists its own names"
+      );
     }
     Reply::Done => panic!("a view was asked for"),
   }
-  ask(Request::Done);
+}
+
+/// An agent: clone, then a random number of write-and-create steps at its own offsets and names,
+/// then read the clone back and check it against its own record.
+fn agent(agent: usize, requests: SyncSender<Envelope>) {
+  let mailbox = Mailbox::new(requests);
+  let mut rng = thread_rng();
+  let steps = rng.gen_range(1..=MAX_STEPS);
+  mailbox.ask_done(Request::Clone { agent });
+  let expected = write_and_create(&mailbox, agent, TAGS[agent], steps);
+  check_view(&mailbox, agent, &expected);
+  mailbox.ask_done(Request::Done);
 }
 
 /// T-1.6: under every schedule shuttle draws, each clone's view is independent and the base is
