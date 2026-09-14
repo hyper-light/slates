@@ -133,9 +133,24 @@ must not change and every pod's reported `fleet_council_base_periods` must equal
 round trip), `wan-loss` (the same with 1 % loss), and `ceiling` (350 ms one way — above ~330 ms, the
 handshake retransmit ceilings the §4.8 WAN status flagged; formation is reported, not required).
 
-**Not run yet.** On 2026-09-14 the `all` sequence stopped at the scale step (Piece 5), which precedes
-`netem`; the profiles are built, lint-clean and driven by the lane, but carry no measurement. Owed with the
-first lane run after the defect-5 fix.
+**Measured 2026-09-14 18:24–18:47 CDT** (`cargo xtask kind all --keep` on main `0772228`, log
+`~/.claude/jobs/9fdd24ce/tmp/kind-all.log`, scratch `~/.cache/slates-kind-lane/23409`; the image built in
+26.6 s, 14 200 004 bytes; cluster up in 25.4 s; the whole lane 19 min 55 s wall). Each profile is a fresh
+3-replica install, a formation, then the three-minute watch (18 samples over 183 s):
+
+| profile | rolled out | formed | `base` periods (pods 0 / 1 / 2) | `rtt_tail` ms | spread ms | leader changes |
+|---|---|---|---|---|---|---|
+| `wan` (80 ms ± 20 ms, 0 % loss) | 9.6 s | 0.2 s | 20 / 20 / 13 | 195 / 200 / 124 | 47 / 46 / 39 | 0 |
+| `wan-loss` (the same, 1 % loss) | 7.5 s | 0.2 s | 25 / 24 / 14 | 245 / 232 / 139 | 83 / 63 / 55 | 0 |
+| `ceiling` (350 ms one way, no jitter) | 7.5 s | **4.9 s** | 79 / 77 / 36 | 785 / 763 / 357 | 83 / 61 / 4 | 0 |
+
+Read: the two netem'd pods (0 and 1) measure the ~160 ms round trip and derive a 20-period election base
+where the un-netem'd pod (2, whose paths to them are one-way delayed) derives 13; 1 % loss lifts the tails
+by ~40 ms and the base to 24–25; under the 350 ms ceiling the base reaches 77–79 periods on 760–785 ms
+tails — and the fleet still forms (in 4.9 s, the handshake retransmit ceilings crossed) and holds its
+leader for the whole window. No leader changed under any profile: the derived timing is stable on a real
+delayed, jittered and lossy path, which is what the §4.8 WAN status owed. The election-timing status
+paragraph of §4.8 carries these numbers.
 
 ## Piece 5 — scale (built; run under `scale`)
 
@@ -148,11 +163,14 @@ whole-pod restart hits the rejoin gap below (each reborn pod comes up on its gen
 view). Booting every pod together forms cleanly, so that is how the two sizes are measured; a live in-place
 scale onto a running fleet is owed with the rejoin fix.
 
-**Cut on 2026-09-14.** `helm upgrade --install … --set replicas=5` at 15:57:36 CDT: four pods Ready within
-seconds; `slates-4` never Ready inside the 300 s bound (16:02 CDT, 0 restarts, its daemon alive and meshed
-at `peers_probed 4` on its peers) — defect 5. The lane's not-Ready diagnostics (03ff718) captured the
-cause; the 3-replica reinstall and the netem profiles were not reached. No scale numbers yet; owed with
-the fix.
+**Cut on 2026-09-14 15:57** (`helm upgrade --install … --set replicas=5`: four pods Ready within seconds;
+`slates-4` never Ready inside the 300 s bound, 0 restarts, its daemon alive and meshed at `peers_probed 4`
+on its peers — defect 5, the fleet's tasks outside the task budget). **Measured 2026-09-14 18:24–18:47 CDT**
+on main `0772228`, with the task share (`5de244d`) and the roster-sized flight fix (`d94d1cc`) in the
+image: **5 replicas installed and formed in 7.5 s** — every pod Ready, `f = 2`, all five holding the same
+five members, `peers_probed 4` on every pod, one leader, `rtt_tail_ns` 10 µs–1.0 ms (the un-netem'd pod
+path); then the fresh 3-replica reinstall **installed and formed in 7.5 s**, formation 0.2 s. The
+five-replica node that could not admit a client at 1 GiB admits it now.
 
 ## The one gap left — a whole-pod restart does not rejoin (a Kubernetes design question)
 
@@ -200,10 +218,12 @@ deleting its cluster at the end).
   `slates status`. The KIND lane proves it on real multi-node pods: the fleet forms (every pod probes both
   peers, one council leader with measured timing), a volume places at f + 1 across pods, and the owner's
   pod deleted (SIGKILL) is retired by the survivors while the first-ranked successor serves the volume.
-  Owed: the task-budget fix (a fleet node's tasks outside `tasks_per_shard` left one pod of five unable
-  to admit a client — root-caused, failing test written), with it the five-replica scale and the netem
-  timing numbers; a whole-pod restart rejoining the mesh (the RAM-only same-seed-id restart, a design
-  question for Kubernetes); and a byte-level read-back through a mount inside a pod."*
+  Measured on main (2026-09-14 18:24–18:47): five replicas install and form in 7.5 s (`f = 2`, every pod
+  probing four peers), and under `tc netem` the derived election timing holds its leader for a
+  three-minute window on every profile (80 ms ± 20 ms: base 20 periods on 195–200 ms tails; with 1 % loss:
+  24–25 on 232–245 ms; 350 ms one way: 77–79 on 763–785 ms, the fleet still forming in 4.9 s), with zero
+  leader changes. Owed: a whole-pod restart rejoining the mesh (the RAM-only same-seed-id restart, a design
+  question for Kubernetes) and a byte-level read-back through a mount inside a pod."*
 - **§4.8 status paragraph (2026-09-14):** *"The KIND lane runs the fleet on real Linux pods over a real
   network, installed by the Helm chart — the WAN status owed exactly this. It proves the image, the chart
   and its render, per-pod DNS resolution, cross-node UDP, mutual-TLS session establishment on both planes,
@@ -217,9 +237,10 @@ deleting its cluster at the end).
   `5 + 6 × peers` fleet tasks), and a client admission the runtime refuses is dropped unrun, closing the
   client's channel and leaking its id until the node refuses every client — one pod of five never Ready —
   and built DNS-name dialing. The election-timing measurements the WAN status owes are built under `tc
-  netem` (80 ms ± 20 ms, with 1 % loss, and the 350 ms handshake ceiling) and not yet measured: the
-  2026-09-14 run was cut at the five-replica scale step by that defect. Owed: that fix with the scale and
-  netem numbers; a whole-pod restart rejoining (the RAM-only same-seed-id restart is a Kubernetes design
+  netem` (80 ms ± 20 ms, with 1 % loss, and the 350 ms handshake ceiling) — measured on main on 2026-09-14
+  once the task share landed: five replicas form in 7.5 s, and every profile holds its leader for 183 s
+  with the base derived from the measured tails (20 / 24–25 / 77–79 periods) and zero leader changes.
+  Owed: a whole-pod restart rejoining (the RAM-only same-seed-id restart is a Kubernetes design
   question — the seed is precomputable only at incarnation 0, while a restart wants an advancing
   incarnation, and a pod restart loses the anchor segment that would carry it); and a mount-read-back
   inside a pod."*
