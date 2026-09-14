@@ -33,7 +33,7 @@ use crate::error::FuseError;
 use crate::init::negotiate;
 use crate::notify::{EXPIRE_ONLY, inval_entry, inval_inode};
 use crate::request::Request;
-use slates_bridge_core::{AttachmentId, Attachments, Invalidation, InvalidationCursor};
+use slates_bridge_core::{AttachmentId, Attachments, Invalidation, InvalidationCursor, OpContext};
 
 /// Format: the device the kernel's FUSE client and the daemon exchange messages over.
 const FUSE_DEVICE: &str = "/dev/fuse";
@@ -201,11 +201,16 @@ impl FuseChannel {
 /// last request, read a request, dispatch it to `bridge`, write the reply, until the kernel
 /// unmounts. The io_uring command path replaces this on 6.14+; both drive the same [`dispatch`].
 /// A read shorter than a header is a malformed message the driver drops; a device error other
-/// than a disconnect is returned to the caller.
+/// than a disconnect is returned to the caller. Each request is admitted with
+/// [`Attachments::begin`] and ended with [`Attachments::end`] around its whole service, so a
+/// barrier over the volume (§4.6 "Writeback and snapshot barrier") sees exactly the requests
+/// the seam may still be applying — one at a time here — and a loop that dies mid-request
+/// leaves that request counted, which a barrier reports as incomplete until the owner's
+/// failed-consumer cleanup.
 pub fn serve_blocking(
   channel: &mut FuseChannel,
   bridge: &mut dyn Bridge,
-  attachments: &Attachments,
+  attachments: &mut Attachments,
   attachment: AttachmentId,
 ) -> Result<(), ChannelError> {
   let mut reply = vec![0u8; BUFFER_BYTES];
@@ -226,11 +231,11 @@ pub fn serve_blocking(
       // reply to a message with no header.
       continue;
     }
-    // Build the authenticated context from the mount's attachment before each effect, so a
-    // revoked or epoch-fenced attachment stops the mount rather than serving a request under
-    // stale authority (§4.8; per-request revalidation, the "checked before effects" rule). The
+    // Admit the request under the mount's attachment before each effect, so a revoked or
+    // epoch-fenced attachment stops the mount rather than serving a request under stale
+    // authority (§4.8; per-request revalidation, the "checked before effects" rule). The
     // registry's concurrent-revoke ownership is the async driver's design (owed).
-    let Ok(cx) = attachments.context(attachment) else {
+    let Ok(cx) = attachments.begin(attachment) else {
       return Ok(());
     };
     // `dispatch` needs a mutable reply buffer separate from the request buffer the channel
@@ -243,24 +248,53 @@ pub fn serve_blocking(
     {
       expire_only = negotiated.flags & flags::HAS_EXPIRE_ONLY != 0;
     }
-    // Everything that changed under the kernel's cache since this loop last looked is delivered
-    // before the request is served, so the reply never coexists with a stale cached name or
-    // attribute (§4.6). A seam refusal here leaves the cursor where it was, so the delivery is
-    // retried before the next request rather than lost.
-    let since = cursor.unwrap_or_else(|| bridge.seen(&cx));
-    if let Ok(next) = bridge.invalidations(&cx, since, &mut owed) {
-      cursor = Some(next);
-    }
-    for invalidation in owed.drain(..) {
-      channel.write_invalidation(&invalidation, expire_only)?;
-    }
-    let n = dispatch(&request, bridge, &cx, &mut reply);
-    if n > 0 {
-      channel.write_reply(&reply[..n])?;
-    }
-    // The request's own records are this kernel's own doing: take the cursor past them.
-    cursor = Some(bridge.seen(&cx));
+    let served = serve_one(
+      channel,
+      bridge,
+      &cx,
+      &request,
+      &mut reply,
+      &mut owed,
+      &mut cursor,
+      expire_only,
+    );
+    // The request is ended whatever happened to it: a transport error below ends the loop, and
+    // the mount's teardown (the owner's sweep) is the cleanup, not a phantom in-flight count.
+    attachments.end(attachment);
+    served?;
   }
+}
+
+/// Serves one admitted request: the owed invalidations first, then the dispatch and its reply.
+#[allow(clippy::too_many_arguments)] // one request's whole service: the channel, the seam, its context, the message, the buffers and the loop's state
+fn serve_one(
+  channel: &mut FuseChannel,
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  request: &[u8],
+  reply: &mut [u8],
+  owed: &mut Vec<Invalidation>,
+  cursor: &mut Option<InvalidationCursor>,
+  expire_only: bool,
+) -> Result<(), ChannelError> {
+  // Everything that changed under the kernel's cache since this loop last looked is delivered
+  // before the request is served, so the reply never coexists with a stale cached name or
+  // attribute (§4.6). A seam refusal here leaves the cursor where it was, so the delivery is
+  // retried before the next request rather than lost.
+  let since = cursor.unwrap_or_else(|| bridge.seen(cx));
+  if let Ok(next) = bridge.invalidations(cx, since, owed) {
+    *cursor = Some(next);
+  }
+  for invalidation in owed.drain(..) {
+    channel.write_invalidation(&invalidation, expire_only)?;
+  }
+  let n = dispatch(request, bridge, cx, reply);
+  if n > 0 {
+    channel.write_reply(&reply[..n])?;
+  }
+  // The request's own records are this kernel's own doing: take the cursor past them.
+  *cursor = Some(bridge.seen(cx));
+  Ok(())
 }
 
 impl FuseChannel {

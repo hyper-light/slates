@@ -54,6 +54,16 @@ pub enum VfsError {
   PolicyMismatch,
   /// A memory refusal beneath the volume (arena exhausted, slab full).
   Memory(slates_mem::MemError),
+  /// A snapshot, submit or detach barrier could not close an attachment's generation: a request
+  /// admitted into it is still in flight — a consumer lost mid-request, until its explicit
+  /// failed-consumer cleanup (§4.4 A-9 `BarrierIncomplete{attachment, generation}`; §4.6 "A
+  /// failed participant gives a typed incomplete barrier, not a clean snapshot").
+  BarrierIncomplete {
+    /// The attachment's process-local key (`AttachmentId::key`).
+    attachment: u64,
+    /// The generation that could not close.
+    generation: u64,
+  },
 }
 
 impl VfsError {
@@ -78,6 +88,7 @@ impl VfsError {
       Self::NotOverlay => "ENODEV",
       Self::PolicyMismatch => "EINVAL",
       Self::Memory(_) => "ENOMEM",
+      Self::BarrierIncomplete { .. } => "EBUSY",
     }
   }
 }
