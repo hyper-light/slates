@@ -3450,8 +3450,12 @@ fn list(state: &mut ShardState, principal: &Principal) -> ReplyBody {
 
 fn acknowledge(state: &mut ShardState, client_id: u32, up_to: u32) -> ReplyBody {
   let now = state.clock.monotonic_ns();
-  // A local client acknowledges its own completions, keyed under this node's own host.
-  let origin = state.fleet.host().0;
+  // A local client acknowledges its own completions, which are keyed under this node's **stable
+  // cert-anchor** — the same key `serve`/`record_completion` write and check under, not the ephemeral
+  // member id (`fleet.host()`), which changes per boot (§4.8 task #22). Keying the ack under the
+  // member id would never release the records (they are under the anchor), so they would grow
+  // unbounded and a post-ack retry would meet the stale reply instead of `DuplicateRequest`.
+  let origin = state.origin_anchor.0;
   match state.db.mutate(
     &mut state.segment,
     &Op::CompletionsAcknowledged {
@@ -3671,9 +3675,12 @@ fn retry_deferred(state: &mut ShardState) -> bool {
       read_ns,
     } = entry;
     let id = RequestId::from_word(request);
-    // A deferred reply is the local client's own (its shard is here), so its completion keys on this node's
-    // own host; a cross-node forward records on the owner under its authenticated origin instead.
-    let origin = state.fleet.host().0;
+    // A deferred reply is the local client's own (its shard is here), so its completion keys on this
+    // node's **stable cert-anchor** — the same key `serve`/`record_completion` and `acknowledge` use,
+    // not the ephemeral member id (§4.8 task #22), so the record it writes is the one a retry finds
+    // and an acknowledgement releases; a cross-node forward records on the owner under its
+    // authenticated origin instead.
+    let origin = state.origin_anchor.0;
     let reply = if recorded {
       reply
     } else {
@@ -3862,6 +3869,14 @@ pub struct Rebuilt {
   /// verb's publish and its completion record — dropped from the rebuilt volume, so no
   /// unacknowledged effect is partially present (AC-2.3).
   pub snapshots_trimmed: usize,
+  /// Volumes the catalog held as `Destroying` whose destroy this recovery completed: the old
+  /// process's cooperative slices never ran to their `VolumeDestroyed` record, and a fresh shard has
+  /// nothing of theirs to free, so the record is written here and their origins unpinned.
+  pub destroys_completed: usize,
+  /// Snapshot pins corrected to the catalog's live clones (the image carries the pins the old
+  /// process held; a destroy completing after the last publish, or a clone's record never
+  /// committing, leaves them ahead of the catalog).
+  pub pins_reconciled: usize,
   /// Merge volumes rebuilt (§4.16): greens with their persisted chain replayed, works reset to a
   /// fresh clone of their green's head (their scratch edits did not survive).
   pub merge_volumes: usize,
@@ -3934,7 +3949,91 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   // Hand out prefixes past every recovered one, so a new volume never collides with a recovered
   // volume's inode numbers (the prefixes came from the images, not from `next_prefix`).
   state.next_prefix = max_prefix;
+  rebuilt.destroys_completed = complete_recovered_destroys(state);
+  rebuilt.pins_reconciled = reconcile_clone_pins(state);
   rebuilt
+}
+
+/// Completes every destroy the catalog holds in flight (`Destroying`, §4.8): the old process marked
+/// the volume and was to free its tree in cooperative slices ending in a `VolumeDestroyed` record;
+/// the slices never ran, and a fresh shard holds nothing of the volume to free (it is not rebuilt),
+/// so the record is written now — each a recorded operation, so replay agrees — and the volume's
+/// lineage edge goes with it, which is what lets [`reconcile_clone_pins`] release its origin's pin.
+/// Returns how many were completed.
+fn complete_recovered_destroys(state: &mut ShardState) -> usize {
+  let destroying: Vec<DbVolumeId> = state
+    .db
+    .partition()
+    .volumes()
+    .into_iter()
+    .filter(|v| v.state == VolumeState::Destroying)
+    .map(|v| v.id)
+    .collect();
+  let now = state.clock.monotonic_ns();
+  let mut completed = 0;
+  for id in destroying {
+    if state
+      .db
+      .mutate(&mut state.segment, &Op::VolumeDestroyed { id }, now)
+      .is_ok()
+    {
+      completed += 1;
+    }
+  }
+  completed
+}
+
+/// Sets every rebuilt snapshot's clone pins to the catalog's live clones of it (§4.8, the catalog
+/// is the authority): the image carries the pins the old process held, which are ahead of the catalog
+/// when a clone's record never committed (a crash between its publish and its record) or when a
+/// clone's destroy completed after the last publish (the unpin is never published), and behind it
+/// when a clone's image predates... never — a clone is recorded only after its publish. A pin left
+/// ahead would refuse the snapshot's destroy forever; one left behind would free a clone's shared
+/// tree. Returns how many pins were changed.
+fn reconcile_clone_pins(state: &mut ShardState) -> usize {
+  // The catalog's live clones per (origin volume, origin snapshot).
+  let mut recorded: std::collections::BTreeMap<([u8; 16], u64), u32> =
+    std::collections::BTreeMap::new();
+  for record in state.db.partition().volumes() {
+    if matches!(
+      record.state,
+      VolumeState::Destroying | VolumeState::Destroyed
+    ) {
+      continue;
+    }
+    if let Some(edge) = state.db.partition().lineage(record.id) {
+      *recorded
+        .entry((edge.origin_volume.bytes, edge.origin_snapshot.value))
+        .or_insert(0) += 1;
+    }
+  }
+  let rebuilt: Vec<(DbVolumeId, Handle<VolumeSlot>)> =
+    state.by_id.iter().map(|(id, h)| (*id, *h)).collect();
+  let mut changed = 0;
+  for (id, handle) in rebuilt {
+    let Ok(slot) = state.volumes.get_mut(handle) else {
+      continue;
+    };
+    let snapshots: Vec<slates_vfs::ids::SnapshotId> = slot.volume.snapshot_ids().collect();
+    for snapshot in snapshots {
+      let wanted = recorded
+        .get(&(id.bytes, db_snapshot_value(snapshot)))
+        .copied()
+        .unwrap_or(0);
+      let Ok(mut held) = slot.volume.clone_pins(snapshot) else {
+        continue;
+      };
+      while held < wanted && slot.volume.pin(snapshot).is_ok() {
+        held += 1;
+        changed += 1;
+      }
+      while held > wanted && slot.volume.unpin(snapshot).is_ok() {
+        held -= 1;
+        changed += 1;
+      }
+    }
+  }
+  changed
 }
 
 /// Rebuilds a recovered green volume (§4.16, §4.8): a fresh merge engine with its persisted chain
@@ -4230,8 +4329,20 @@ fn build_recovered_volume(
     (BaseRecord::Scratch, Some(image)) => {
       let quota = quota_for(size);
       let journal = journal_bytes_for(state, &quota);
-      let volume = Volume::from_image(&mut state.store, image, Box::new(HostClock::new()), journal)
-        .map_err(|e| e.to_string())?;
+      let mut volume =
+        Volume::from_image(&mut state.store, image, Box::new(HostClock::new()), journal)
+          .map_err(|e| e.to_string())?;
+      // The catalog is the authority on the acknowledged size policy (§4.8, AC-2.3): a resize
+      // publishes its image before its record commits, so a crash between the two leaves the image
+      // carrying a quota no client was ever told about. The recovered volume takes the record's
+      // limit; one whose bytes exceed the acknowledged limit cannot be represented honestly and
+      // refuses rather than serving an unacknowledged capacity.
+      let acknowledged = quota.limit();
+      if volume.capacity_bytes() != acknowledged {
+        volume.resize(acknowledged).map_err(|e| {
+          format!("RecoveryIncomplete: the image's quota exceeds the acknowledged size policy: {e}")
+        })?;
+      }
       Ok((volume, None, image.prefix))
     }
     (BaseRecord::Scratch, None) if state.content.is_some() => {
