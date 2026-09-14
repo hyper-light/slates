@@ -753,23 +753,28 @@ fn fleet_config(
     })
 }
 
-/// An anchor segment on which the anchor has recorded one daemon start — `record_start` is what increments
-/// the generation before every daemon start — so the daemon that attaches it boots at generation one and
-/// derives `member_id(anchor, 1)` as its own id: the real restart path, the test playing the anchor (as the
-/// client restart oracle does). The start stamp is the anchor's clock reading, immaterial with no anchor to
-/// read it. Returns the handoff to start the daemon over, and the segment, which must outlive the daemon.
-fn generation_one_segment(
+/// An anchor segment on which the anchor has recorded **two** daemon starts, so the daemon that attaches it
+/// boots at ephemeral incarnation one and derives `member_id(anchor, 1)` as its own id: the real restart
+/// path, the test playing the anchor (as the client restart oracle does). `record_start` increments the
+/// supervision generation before every start, and the daemon reads that generation down by one (an anchor
+/// numbers its first start generation one, which is the manifest's precomputed gen-zero seed, so incarnation
+/// is the restart count). The first recorded start here is that seed start (generation one, incarnation
+/// zero); the second is the restart (generation two, incarnation one). The start stamp is the anchor's clock
+/// reading, immaterial with no anchor to read it. Returns the handoff to start the daemon over, and the
+/// segment, which must outlive the daemon.
+fn incarnation_one_segment(
   name: &str,
   profile: &MachineProfile,
   geometry: Geometry,
   pid: u32,
 ) -> (SegmentSource, AnchorSegment) {
   let segment = AnchorSegment::create(name, &profile.facts.identity, geometry)
-    .expect("the generation-one anchor segment");
-  segment
+    .expect("the incarnation-one anchor segment");
+  let supervision = segment
     .supervision()
-    .expect("the segment's supervision block")
-    .record_start(u64::from(pid), 0, false);
+    .expect("the segment's supervision block");
+  supervision.record_start(u64::from(pid), 0, false);
+  supervision.record_start(u64::from(pid), 0, true);
   let (handoff, len) = segment.handoff().expect("the segment hands off");
   (
     SegmentSource::Handoff {
@@ -809,8 +814,9 @@ fn start_fleet_node(
 /// generation on its first probe and is learned on contact — its new member id admitted and probed, its old
 /// id retired and its objects taken over — with nothing injected. Three nodes form (`f = 1`, so two
 /// survivors keep the council's majority); B seals a volume whose head A and C hold; B's process ends; a
-/// second daemon presents **B's certificate** at generation one — its anchor segment records the start, as
-/// the anchor does before every daemon start — on the address A and C dial for B, and probes them. A and C
+/// second daemon presents **B's certificate** at generation one — its anchor segment records a second start,
+/// the restart, the anchor recording one before every daemon start (so the daemon reads the generation down
+/// by one to its restart count) — on the address A and C dial for B, and probes them. A and C
 /// validate the announced id (`member_id(anchor_B, 1)`) against B's anchor, fold the old id dead and the new
 /// alive, and the council commits the takeover and the admission; the survivor rendezvous ranks first takes
 /// over B's volume and serves it. Non-vacuous: the new id is not the old (the id is ephemeral); the old is
@@ -1077,8 +1083,8 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
 }
 
 /// Restarts B: a second daemon with B's certificate attaches an anchor segment on which the anchor has
-/// recorded the start ([`generation_one_segment`]), so it derives `member_id(anchor_B, 1)` as its own id.
-/// The segment is returned so it outlives the daemon.
+/// recorded a second start ([`incarnation_one_segment`]), so it derives `member_id(anchor_B, 1)` as its own
+/// id. The segment is returned so it outlives the daemon.
 fn restart_b(fleet: &mut RestartFleet, pid: u32) -> (Daemon, AnchorSegment) {
   let peers = std::mem::take(&mut fleet.peers_of_b_again);
   let identity = fleet
@@ -1093,7 +1099,7 @@ fn restart_b(fleet: &mut RestartFleet, pid: u32) -> (Daemon, AnchorSegment) {
     &peers,
     &fleet.domains,
   );
-  let (source, segment) = generation_one_segment(
+  let (source, segment) = incarnation_one_segment(
     &format!("slates-seg-fleet3-again-{}-{pid}", fleet.host_b.0),
     &fleet.profile_b,
     config.geometry,
@@ -1217,8 +1223,9 @@ fn forged_anchor_of(anchor: HostId) -> HostId {
 /// ... [is] validated"; task #22, **over the wire**): an announcement whose generation is **stale**, or whose
 /// member id is not the one the announcer's certificate derives to (**forged**), is refused at the serve side
 /// — counted in the refusals `slates status` reports, never folded into membership, and never acknowledged.
-/// A and B form, B at generation one (its anchor segment recorded a start, as the anchor does before every
-/// daemon start), so A learns `member_id(anchor_B, 1)`. Then two more daemons present **B's certificate** to
+/// A and B form, B at generation one (its anchor segment recorded a second start — the restart — as the
+/// anchor records one before every daemon start, so the daemon reads that generation down by one), so A
+/// learns `member_id(anchor_B, 1)`. Then two more daemons present **B's certificate** to
 /// A: one on a fresh segment — generation zero, B's seed id: a stale or replayed boot — and one configured
 /// with an anchor that is not the one A's roster holds for B's certificate, so the id it announces is one
 /// B's certificate cannot derive — a forgery, from a holder of B's key, the strongest position a forger can
@@ -1256,7 +1263,7 @@ fn a_stale_or_forged_announcement_is_refused_and_counted() {
 struct RefusalFleet {
   daemon_a: Daemon,
   daemon_b: Daemon,
-  /// B's generation-one segment, which outlives its daemon.
+  /// B's incarnation-one segment (the anchor recorded a restart on it), which outlives its daemon.
   segment_b: AnchorSegment,
   host_a: HostId,
   anchor_a: HostId,
@@ -1271,7 +1278,8 @@ struct RefusalFleet {
   announcer_serve: Vec<(u16, u16)>,
 }
 
-/// Starts A on a fresh segment and B on a generation-one anchor segment, each dialing the other.
+/// Starts A on a fresh segment and B on an incarnation-one anchor segment (a recorded restart), each dialing
+/// the other.
 fn refusal_fleet_forms(pid: u32) -> RefusalFleet {
   let (profile_a, host_a, identity_a) = fleet_node("a");
   let (profile_b, host_b, _) = fleet_node("b");
@@ -1314,7 +1322,7 @@ fn refusal_fleet_forms(pid: u32) -> RefusalFleet {
       name: format!("slates-seg-{instance_a}"),
     },
   );
-  let (source_b, segment_b) = generation_one_segment(
+  let (source_b, segment_b) = incarnation_one_segment(
     &format!("slates-seg-{instance_b}"),
     &profile_b,
     config_b.geometry,
