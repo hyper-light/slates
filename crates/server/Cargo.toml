@@ -36,6 +36,9 @@ slates-bridge-nfs = { workspace = true }
 # Linux guest is hosted from a Linux or macOS host, so the daemon's guest transport (`crate::virtiofs`)
 # is Unix-only too.
 slates-bridge-virtiofs = { workspace = true }
+# The OCI attachment form (§4.6 A-9): a bind of the host mount (NFS loopback on macOS, FUSE on Linux)
+# verified against the kernel's mount table; there is no host mount on Windows to bind.
+slates-bridge-oci = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

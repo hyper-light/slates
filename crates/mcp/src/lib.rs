@@ -21,12 +21,12 @@
 
 use serde_json::{Value, json};
 use slates_client::{
-  AttachTransport, Attachment, AttachmentCapability, CauseRecord, ChokepointReport, Client,
-  ClientError, Conformance, CreateSpec, DaemonReport, Established, Filter, Intent, KernelCache,
-  Landing, LandingOutcome, LandingSummary, NamePolicy, OciRuntime, ReadWritePolicy, Rebased,
-  Residency, ShardReport, Signal, SizeClass, SnapshotId, SpanRecord, StatusReport, Submitted,
-  TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
-  VolumeSummary, WorkOp,
+  AttachRequest, AttachTransport, Attachment, AttachmentCapability, CauseRecord, ChokepointReport,
+  Client, ClientError, Conformance, CreateSpec, DaemonReport, Established, Filter, Intent,
+  KernelCache, Landing, LandingOutcome, LandingSummary, NamePolicy, OciBinding, OciRuntime,
+  ReadWritePolicy, Rebased, Residency, ShardReport, Signal, SizeClass, SnapshotId, SpanRecord,
+  StatusReport, Submitted, TargetPathConstraint, TelemetryReport, TransportReport,
+  UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
 };
 
 pub mod http;
@@ -291,9 +291,10 @@ impl McpServer {
     } else {
       Intent::Read
     };
+    let form = attach_form(args)?;
     let attached = self
       .client
-      .attach(volume, snapshot, intent)
+      .attach_with(volume, snapshot, intent, form)
       .map_err(refusal)?;
     Ok(attachment_json(&attached))
   }
@@ -547,8 +548,8 @@ fn tool_list() -> Vec<Value> {
     ),
     tool(
       "slates.attach.attach",
-      "Attach to a volume for reading (or writing, taking its lease); the attachment id and lease.",
-      json!({ "volume": string, "snapshot": integer, "write": { "type": "boolean" } }),
+      "Attach to a volume for reading (or writing, taking its lease); the attachment id, lease, what was established and the transport's capability. With oci_source (the host mount point, from `slates mount`) and oci_destination (a path inside the container), a container bind: the verified source and the runtime `mounts` entry to hand your OCI runtime (read-only unless write).",
+      json!({ "volume": string, "snapshot": integer, "write": { "type": "boolean" }, "oci_source": string, "oci_destination": string }),
       json!(["volume"]),
     ),
     tool(
@@ -757,6 +758,7 @@ pub fn unsupported_reason_name(reason: UnsupportedReason) -> &'static str {
     UnsupportedReason::MountNeedsPrivilege => "mount_needs_privilege",
     UnsupportedReason::BridgeNotWired => "bridge_not_wired",
     UnsupportedReason::HostMountRequired => "host_mount_required",
+    UnsupportedReason::SnapshotNotPresentedByHostMount => "snapshot_not_presented_by_host_mount",
   }
 }
 
@@ -874,10 +876,40 @@ pub fn transport_report_json(r: &TransportReport) -> Value {
   })
 }
 
-/// What an attach established, as JSON: its form.
+/// The runtime-specification `mounts` entry as JSON — exactly what the harness hands its OCI runtime
+/// (`destination`, `type`, `source`, `options`). Public so the CLI prints the same entry (§4.12).
+pub fn oci_mount_json(binding: &OciBinding) -> Value {
+  json!({
+    "destination": binding.destination,
+    "type": binding.mount_type,
+    "source": binding.source,
+    "options": binding.options,
+  })
+}
+
+/// A container binding as JSON: the verified source, the destination, the policy, the mount table's
+/// evidence, and the runtime entry.
+pub fn oci_binding_json(binding: &OciBinding) -> Value {
+  json!({
+    "source": binding.source,
+    "destination": binding.destination,
+    "read_only": binding.read_only,
+    "evidence": {
+      "fstype": binding.evidence.fstype,
+      "mount_source": binding.evidence.mount_source,
+      "names_volume": binding.evidence.names_volume,
+    },
+    "mount": oci_mount_json(binding),
+  })
+}
+
+/// What an attach established, as JSON: its form, and for a container bind the binding.
 pub fn established_json(established: &Established) -> Value {
   match established {
     Established::Record => json!({ "form": "record" }),
+    Established::OciBind { binding } => {
+      json!({ "form": "oci_bind", "binding": oci_binding_json(binding) })
+    }
   }
 }
 
@@ -928,6 +960,39 @@ fn paths_opt(args: &Value) -> Option<Vec<String>> {
       .filter_map(|v| v.as_str().map(str::to_owned))
       .collect()
   })
+}
+
+/// The attach tool's form: the record form, or — with both `oci_source` and `oci_destination` — a
+/// container bind whose source is resolved to the real path the kernel's mount table records (a read,
+/// never a write; the mcp crate may read host paths for its transport, and this is a `canonicalize`).
+/// One of the two alone is an invalid-params error naming the other.
+fn attach_form(args: &Value) -> Result<AttachRequest, McpError> {
+  let source = args.get("oci_source").and_then(Value::as_str);
+  let destination = args.get("oci_destination").and_then(Value::as_str);
+  match (source, destination) {
+    (Some(source), Some(destination)) => {
+      let source = std::fs::canonicalize(source)
+        .map_err(|e| McpError {
+          code: code::INVALID_PARAMS,
+          message: format!("oci_source {source}: {e}"),
+        })?
+        .to_string_lossy()
+        .into_owned();
+      Ok(AttachRequest::Oci {
+        source,
+        destination: destination.to_owned(),
+      })
+    }
+    (None, None) => Ok(AttachRequest::Root),
+    (Some(_), None) => Err(McpError {
+      code: code::INVALID_PARAMS,
+      message: "oci_source needs oci_destination (the container path)".to_owned(),
+    }),
+    (None, Some(_)) => Err(McpError {
+      code: code::INVALID_PARAMS,
+      message: "oci_destination needs oci_source (the host mount point)".to_owned(),
+    }),
+  }
 }
 
 /// A required-or-empty list-of-strings argument (e.g. a landing filter's includes).

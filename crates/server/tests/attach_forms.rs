@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 
 use slates_ipc::protocol::{
   AttachRequest, AttachTransport, AttachmentCapability, Conformance, Direction, Established,
-  Intent, KernelCache, NamePolicy, ReadWritePolicy, Refusal, ReplyBody, RequestBody, SizeClass,
-  StatusReport, TargetPathConstraint, TransportReport, UnsupportedReason, VolumeId, pack, unpack,
+  HostPathReason, Intent, KernelCache, NamePolicy, ReadWritePolicy, Refusal, ReplyBody,
+  RequestBody, SizeClass, StatusReport, TargetPathConstraint, TransportReport, UnsupportedReason,
+  VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
@@ -296,35 +297,102 @@ fn assert_root_attachments_report_their_policy(client: &mut Client, id: VolumeId
   detach(client, writer);
 }
 
-/// A container bind is not established by this daemon yet: refused typed, before any effect.
-fn assert_unbuilt_form_refused_with_nothing_recorded(client: &mut Client, id: VolumeId) {
+/// The refusal of a container bind request, with the volume proven untouched afterwards.
+fn refused_oci(
+  client: &mut Client,
+  id: VolumeId,
+  snapshot: Option<slates_ipc::protocol::SnapshotId>,
+  source: &str,
+  destination: &str,
+) -> Refusal {
   let ReplyBody::Refused { refusal } = client.call(&RequestBody::Attach {
     volume: id,
-    snapshot: None,
+    snapshot,
     intent: Intent::Write,
     form: AttachRequest::Oci {
-      source: "/".to_owned(),
-      destination: "/work".to_owned(),
+      source: source.to_owned(),
+      destination: destination.to_owned(),
     },
   }) else {
-    panic!("a container bind was established by a daemon that cannot");
+    panic!("a container bind of {source} was established");
   };
-  assert_eq!(
-    refusal,
-    Refusal::AttachmentUnsupported {
-      transport: AttachTransport::Oci,
-      reason: UnsupportedReason::BridgeNotWired,
-    }
-  );
   let after = status(client, id);
   assert_eq!(after.attachments, 0, "nothing recorded");
   assert_eq!(after.lease_epoch, None, "no lease taken");
+  refusal
+}
+
+/// A container bind is refused typed before any effect when the host path is not a mount point of
+/// this volume (§4.4 "Attach with a chosen path that cannot be honoured: Refused
+/// (`ChosenPathUnavailable{reason}`)"; §4.6 A-9 "A metadata record is insufficient evidence of a
+/// usable container path"): the root directory is a foreign filesystem, a directory that is no mount
+/// point is named as such, a relative path is refused before the table is read; and on a host with no
+/// offered host mount the form itself is refused `AttachmentUnsupported{Oci, HostMountRequired}`.
+fn assert_unbound_host_paths_are_refused_typed(client: &mut Client, id: VolumeId) {
+  let root = refused_oci(client, id, None, "/", "/work");
+  if cfg!(target_os = "macos") {
+    assert!(
+      matches!(
+        &root,
+        Refusal::ChosenPathUnavailable {
+          reason: HostPathReason::ForeignFilesystem { fstype }
+        } if fstype == "apfs"
+      ),
+      "the root is APFS, not a slates mount: {root:?}"
+    );
+    assert_eq!(
+      refused_oci(client, id, None, "/private", "/work"),
+      Refusal::ChosenPathUnavailable {
+        reason: HostPathReason::NotAMountPoint
+      },
+      "a directory that is not a mount point"
+    );
+  } else {
+    assert_eq!(
+      root,
+      Refusal::AttachmentUnsupported {
+        transport: AttachTransport::Oci,
+        reason: UnsupportedReason::HostMountRequired,
+      },
+      "no host mount transport is offered on this platform"
+    );
+  }
+  let relative = refused_oci(client, id, None, "work", "/work");
+  assert!(
+    matches!(
+      relative,
+      Refusal::ChosenPathUnavailable {
+        reason: HostPathReason::NotAbsolute
+      } | Refusal::AttachmentUnsupported { .. }
+    ),
+    "a relative source never reaches the mount table: {relative:?}"
+  );
+}
+
+/// The host mount presents the volume's live head, so a snapshot cannot be bound through it.
+fn assert_a_snapshot_cannot_be_bound(client: &mut Client, id: VolumeId) {
+  let ReplyBody::Snapshotted { id: snapshot } = client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("snapshot");
+  };
+  let refusal = refused_oci(client, id, Some(snapshot), "/", "/work");
+  assert!(
+    matches!(
+      refusal,
+      Refusal::AttachmentUnsupported {
+        transport: AttachTransport::Oci,
+        reason: UnsupportedReason::SnapshotNotPresentedByHostMount
+          | UnsupportedReason::HostMountRequired,
+      }
+    ),
+    "{refusal:?}"
+  );
 }
 
 /// `attach` reports the capability of the form it established: the record form under the root mount
-/// is read-only for a read intent and read-write (with the lease) for a write intent; a form the daemon
-/// does not establish is refused `AttachmentUnsupported{transport, reason}` before any effect, so
-/// nothing is recorded — no attachment, no lease.
+/// is read-only for a read intent and read-write (with the lease) for a write intent; a container
+/// bind whose host path is not a mount point of this volume, or whose form this host cannot offer, is
+/// refused typed before any effect, so nothing is recorded — no attachment, no lease.
 #[test]
 fn attach_reports_its_form_and_an_unsupported_form_is_refused_typed_with_nothing_recorded() {
   let (daemon, instance) = single_shard_daemon("attach-forms-attach");
@@ -333,8 +401,35 @@ fn attach_reports_its_form_and_an_unsupported_form_is_refused_typed_with_nothing
 
   assert_root_attachments_report_their_policy(&mut client, id);
   assert_eq!(status(&mut client, id).attachments, 0);
-  assert_unbuilt_form_refused_with_nothing_recorded(&mut client, id);
+  assert_unbound_host_paths_are_refused_typed(&mut client, id);
+  assert_a_snapshot_cannot_be_bound(&mut client, id);
 
+  drop(client);
+  drop(daemon);
+}
+
+/// The container bind is offered exactly when a host mount is (macOS with the listener bound), with
+/// the container workload as its evidence; where no host mount is offered it is refused
+/// `HostMountRequired` — never claimed from a table.
+#[test]
+fn the_container_bind_is_offered_exactly_when_a_host_mount_is() {
+  let (daemon, instance) = single_shard_daemon("attach-forms-oci-entry");
+  let mut client = Client::connect(&instance);
+  let id = create(&mut client, "forms");
+  let report = status(&mut client, id);
+  let oci = entry(&report.transports, AttachTransport::Oci);
+  let nfs = entry(&report.transports, AttachTransport::NfsLoopback);
+  if cfg!(target_os = "macos") {
+    assert_eq!(oci.supported, nfs.supported);
+    if oci.supported {
+      assert_eq!(oci.conformance, Conformance::ContainerWorkloadTest);
+    }
+  } else {
+    assert_eq!(
+      oci.unsupported_reason,
+      Some(UnsupportedReason::HostMountRequired)
+    );
+  }
   drop(client);
   drop(daemon);
 }

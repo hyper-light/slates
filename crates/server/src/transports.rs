@@ -20,7 +20,8 @@
 //! `crates/cli/tests/cli.rs` mounts a real kernel mount) and needs a privilege on Linux that slates
 //! never asks for (the kernel refuses an NFS mount in an unprivileged user namespace: `nfs` lacks
 //! `FS_USERNS_MOUNT`); the FUSE, FSKit and WinFsp bridges exist as crates the daemon does not serve
-//! yet; the container bind is not established by the daemon yet. The guest transports are §4.6's
+//! yet; the container bind (`crate::oci`) is offered exactly where a host mount is — the bind is of
+//! that mount, and its evidence is T-4.13's container workload. The guest transports are §4.6's
 //! virtio-fs device (`crate::virtiofs`), reported in-process until wired here.
 
 use slates_db::catalog::Rights;
@@ -264,17 +265,40 @@ const fn container_residency(platform: Platform) -> Residency {
   }
 }
 
-/// The container bind (§4.6 A-9): a bind of an established host mount into a container namespace by
-/// the host's OCI runtime. Not established by the daemon yet: refused `BridgeNotWired` with the
-/// constraints it will have — the container's view is the host mount's.
-fn oci(situation: &Situation) -> AttachmentCapability {
+/// Whether this host offers a host mount a container can be handed: the NFS loopback mount on macOS
+/// with the listener bound (the FUSE bridge is not served by the daemon yet, so Linux offers none).
+pub(crate) const fn host_mount_offered(situation: &Situation) -> bool {
+  matches!(situation.platform, Platform::MacOs) && situation.nfs_listener_bound
+}
+
+/// The container bind (§4.6 A-9): a bind of the established host mount into a container namespace
+/// by the host's OCI runtime (`crate::oci`). Offered exactly where a host mount is, with T-4.13's
+/// container workload as its evidence; refused `HostMountRequired` where no host mount is offered and
+/// `HostPlatform` where none can be. The container's view is the host mount's.
+pub(crate) fn oci(situation: &Situation) -> AttachmentCapability {
+  let sharing = sharing(false, KernelCache::InheritedFromHostMount);
+  let residency = container_residency(situation.platform);
+  if host_mount_offered(situation) {
+    return offered(
+      AttachTransport::Oci,
+      situation,
+      TargetPathConstraint::ContainerDestination,
+      sharing,
+      residency,
+      Conformance::ContainerWorkloadTest,
+    );
+  }
+  let reason = match situation.platform {
+    Platform::MacOs | Platform::Linux => UnsupportedReason::HostMountRequired,
+    Platform::Windows | Platform::Other => UnsupportedReason::HostPlatform,
+  };
   refused(
     AttachTransport::Oci,
     situation,
-    UnsupportedReason::BridgeNotWired,
+    reason,
     TargetPathConstraint::ContainerDestination,
-    sharing(false, KernelCache::InheritedFromHostMount),
-    container_residency(situation.platform),
+    sharing,
+    residency,
   )
 }
 
@@ -374,29 +398,36 @@ mod tests {
       .unwrap_or_else(|| panic!("{transport:?} is reported"))
   }
 
-  /// Every entry on every platform is supported exactly when it carries no reason, claims evidence only
-  /// when supported, and shares the one owning shard's view (D-7).
+  /// One entry's invariants: supported exactly when it carries no reason, evidence claimed only when
+  /// supported, and the one owning shard's view (D-7).
+  fn assert_entry_consistent(capability: &AttachmentCapability, situation: &Situation) {
+    assert_eq!(
+      capability.supported,
+      capability.unsupported_reason.is_none(),
+      "{situation:?}: {capability:?}"
+    );
+    assert!(
+      capability.supported || capability.conformance == Conformance::None,
+      "no evidence claimed for a refused transport: {capability:?}"
+    );
+    assert!(capability.sharing.one_owning_shard);
+  }
+
+  /// Every entry on every platform, listener bound or not, holds the entry invariants.
   #[test]
   fn every_entry_is_supported_exactly_when_it_carries_no_reason() {
-    for platform in [
+    let platforms = [
       Platform::MacOs,
       Platform::Linux,
       Platform::Windows,
       Platform::Other,
-    ] {
-      for bound in [false, true] {
-        for capability in capabilities(&on(platform, bound)) {
-          assert_eq!(
-            capability.supported,
-            capability.unsupported_reason.is_none(),
-            "{platform:?} bound={bound}: {capability:?}"
-          );
-          assert!(
-            capability.supported || capability.conformance == Conformance::None,
-            "no evidence claimed for a refused transport: {capability:?}"
-          );
-          assert!(capability.sharing.one_owning_shard);
-        }
+    ];
+    let situations = platforms
+      .iter()
+      .flat_map(|platform| [on(*platform, false), on(*platform, true)]);
+    for situation in situations {
+      for capability in capabilities(&situation) {
+        assert_entry_consistent(&capability, &situation);
       }
     }
   }
@@ -426,9 +457,21 @@ mod tests {
       entry(&bound, AttachTransport::WinFsp).unsupported_reason,
       Some(UnsupportedReason::HostPlatform)
     );
+  }
+
+  /// macOS: the container bind is offered exactly when the host mount is — a bind of it, with the
+  /// container workload as evidence and the runtime's VM in the residency boundary — and refused
+  /// `HostMountRequired` when the listener did not bind.
+  #[test]
+  fn macos_offers_the_container_bind_exactly_when_the_host_mount_is() {
+    let oci = entry(&on(Platform::MacOs, true), AttachTransport::Oci);
+    assert!(oci.supported, "a bind of the offered host mount");
+    assert_eq!(oci.conformance, Conformance::ContainerWorkloadTest);
+    assert_eq!(oci.residency, Residency::DaemonRamKernelCacheAndRuntimeVm);
     assert_eq!(
-      entry(&bound, AttachTransport::Oci).residency,
-      Residency::DaemonRamKernelCacheAndRuntimeVm
+      entry(&on(Platform::MacOs, false), AttachTransport::Oci).unsupported_reason,
+      Some(UnsupportedReason::HostMountRequired),
+      "no listener, no mount, nothing to bind"
     );
   }
 
@@ -446,9 +489,12 @@ mod tests {
         entry(&situation, AttachTransport::Fuse).unsupported_reason,
         Some(UnsupportedReason::BridgeNotWired)
       );
+      let oci = entry(&situation, AttachTransport::Oci);
+      assert_eq!(oci.residency, Residency::DaemonRamAndKernelCache);
       assert_eq!(
-        entry(&situation, AttachTransport::Oci).residency,
-        Residency::DaemonRamAndKernelCache
+        oci.unsupported_reason,
+        Some(UnsupportedReason::HostMountRequired),
+        "the FUSE bridge is not served, so there is no host mount to bind"
       );
     }
   }
@@ -463,6 +509,10 @@ mod tests {
       Some(UnsupportedReason::BridgeNotWired)
     );
     assert_eq!(winfsp.target_path, TargetPathConstraint::DriveLetter);
+    assert_eq!(
+      entry(&situation, AttachTransport::Oci).unsupported_reason,
+      Some(UnsupportedReason::HostPlatform)
+    );
     for other in [
       AttachTransport::NfsLoopback,
       AttachTransport::Fuse,

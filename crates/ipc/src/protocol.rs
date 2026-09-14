@@ -1041,6 +1041,8 @@ pub enum UnsupportedReason {
   BridgeNotWired,
   /// A container bind needs an established host mount, and no host mount transport is offered here.
   HostMountRequired,
+  /// The host mount presents the volume's live head, so a snapshot cannot be bound through it.
+  SnapshotNotPresentedByHostMount,
 }
 
 /// One transport's report (§4.6 A-9: "supported transport, target-path constraints, read/write policy,
@@ -1115,6 +1117,74 @@ pub enum AttachRequest {
 pub enum Established {
   /// The record under the root mount; no path of its own.
   Record,
+  /// An authorized container binding of a verified host mount (§4.6 A-9). Boxed: the binding's
+  /// strings would otherwise grow every reply's move; the wire bytes are the binding's own.
+  OciBind {
+    /// The binding.
+    binding: Box<OciBinding>,
+  },
+}
+
+/// What the kernel's mount table established about a host path — read as a query of the table, never
+/// by touching the mount (§4.6 A-9 "A metadata record is insufficient evidence of a usable container
+/// path": the table is the kernel's word that the path is a mount point of the named export; the
+/// container's view is then exactly the host mount's, which the live mount tests prove by use).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HostMountEvidence {
+  /// The filesystem type at the mount point (`nfs` for the loopback mount; `fuse.slates` for FUSE).
+  pub fstype: String,
+  /// The mount's source as the table records it (`localhost:/<name>` for the loopback mount).
+  pub mount_source: String,
+  /// Whether the source names this volume (the NFS export does; the FUSE source is `slates` for every
+  /// volume, so there the evidence is the slates filesystem type alone).
+  pub names_volume: bool,
+}
+
+/// The `mounts[]` entry the harness hands its OCI runtime (the OCI runtime specification's bind mount:
+/// `destination`, `type`, `source`, `options`), with what slates verified about the source. slates
+/// performs no namespace work: the runtime binds; the record carries the authorization.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct OciBinding {
+  /// The host mount point (the bind's `source`), as the mount table records it.
+  pub source: String,
+  /// The path inside the container (the bind's `destination`), created there by the runtime.
+  pub destination: String,
+  /// Whether the bind is read-only: a read attachment.
+  pub read_only: bool,
+  /// The entry's `type` (`bind`).
+  pub mount_type: String,
+  /// The entry's `options`: the recursive bind, then `ro` or `rw`.
+  pub options: Vec<String>,
+  /// What the kernel's mount table said about the source.
+  pub evidence: HostMountEvidence,
+}
+
+/// Why a chosen host path cannot be honoured (§4.4 "Attach with a chosen path that cannot be
+/// honoured: Refused (`ChosenPathUnavailable{reason}`)"). Append-only.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum HostPathReason {
+  /// The source is not an absolute path; nothing was consulted.
+  NotAbsolute,
+  /// The destination is not an absolute path (the runtime specification requires one).
+  DestinationNotAbsolute,
+  /// The kernel's mount table lists no mount at exactly this path (a directory inside a mount is not
+  /// the attachment; give the mount point's real path).
+  NotAMountPoint,
+  /// The mount at this path is another filesystem, not a slates export.
+  ForeignFilesystem {
+    /// The filesystem type the table records.
+    fstype: String,
+  },
+  /// The mount at this path is a slates export of another volume.
+  NotThisVolume {
+    /// The source the table records.
+    source: String,
+  },
+  /// The kernel's mount table could not be read (the errno), so nothing is claimed.
+  MountTableUnavailable {
+    /// The errno of the query; 0 when the table is malformed rather than refused.
+    errno: i32,
+  },
 }
 
 /// An action name and how many entries take it.
@@ -1339,6 +1409,11 @@ pub enum Refusal {
     transport: AttachTransport,
     /// What is missing.
     reason: UnsupportedReason,
+  },
+  /// The chosen host or container path cannot be honoured (§4.4); refused before any effect.
+  ChosenPathUnavailable {
+    /// Why.
+    reason: HostPathReason,
   },
 }
 
