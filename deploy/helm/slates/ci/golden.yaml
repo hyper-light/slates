@@ -73,19 +73,19 @@ data:
         {
           "address": "slates-0.slates.slates.svc.cluster.local:7000",
           "certificate": "slates-0.crt.der",
-          "key": "../keys/slates-0.key.der",
+          "key": "../keys/node.key.der",
           "node": "slates-0"
         },
         {
           "address": "slates-1.slates.slates.svc.cluster.local:7002",
           "certificate": "slates-1.crt.der",
-          "key": "../keys/slates-1.key.der",
+          "key": "../keys/node.key.der",
           "node": "slates-1"
         },
         {
           "address": "slates-2.slates.slates.svc.cluster.local:7004",
           "certificate": "slates-2.crt.der",
-          "key": "../keys/slates-2.key.der",
+          "key": "../keys/node.key.der",
           "node": "slates-2"
         }
       ]
@@ -143,7 +143,7 @@ spec:
       annotations:
         # The manifest is the fleet's membership: a change of it (a scale) restarts every pod on the new
         # manifest, the fleet re-forming — D-14's cold path, never a per-write concern.
-        checksum/fleet: 60e04e601787e6842e1d4769daecc9239e0e35206a1ecf9c13728487d64ace5e
+        checksum/fleet: 376ce02ca9808ea04056d236e356fce86df33511362eee579a37c6ff20ecd0da
     spec:
       # R10: no privilege. The daemon runs as the image's non-root user with every capability dropped and
       # a read-only root filesystem — a RAM-only service writes no file (R1), so any write it attempted
@@ -218,8 +218,11 @@ spec:
             - name: fleet
               mountPath: /etc/slates/fleet
               readOnly: true
+            # The pod's own key alone, at one fixed path every manifest entry names (`../keys/node.key.der`
+            # relative to the manifest): `subPathExpr` selects it by the pod's name from the projected volume
+            # of every pod's Secret (a mountPath is never expanded, a subPathExpr is).
             - name: identities
-              mountPath: /etc/slates/keys/$(POD_NAME).key.der
+              mountPath: /etc/slates/keys/node.key.der
               subPathExpr: $(POD_NAME).key.der
               readOnly: true
       volumes:
@@ -230,7 +233,9 @@ spec:
         # (secrets.yaml explains the shape).
         - name: identities
           projected:
-            defaultMode: 0400
+            # Owner and group read: the files are root-owned with the pod's fsGroup, and the daemon runs as
+            # that group's non-root user.
+            defaultMode: 0440
             sources:
               - secret:
                   name: slates-0-identity

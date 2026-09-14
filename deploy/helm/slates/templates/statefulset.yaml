@@ -135,8 +135,11 @@ spec:
             - name: fleet
               mountPath: /etc/slates/fleet
               readOnly: true
+            # The pod's own key alone, at one fixed path every manifest entry names (`../keys/node.key.der`
+            # relative to the manifest): `subPathExpr` selects it by the pod's name from the projected volume
+            # of every pod's Secret (a mountPath is never expanded, a subPathExpr is).
             - name: identities
-              mountPath: /etc/slates/keys/$(POD_NAME).key.der
+              mountPath: /etc/slates/keys/node.key.der
               subPathExpr: $(POD_NAME).key.der
               readOnly: true
       volumes:
@@ -147,7 +150,9 @@ spec:
         # (secrets.yaml explains the shape).
         - name: identities
           projected:
-            defaultMode: 0400
+            # Owner and group read: the files are root-owned with the pod's fsGroup, and the daemon runs as
+            # that group's non-root user.
+            defaultMode: 0440
             sources:
               {{- range $index := until (int .Values.replicas) }}
               {{- $pod := include "slates.podName" (dict "root" $ "index" $index) }}

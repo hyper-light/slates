@@ -78,16 +78,17 @@ Derived: basePort + 2N (one block of two ports per node, `slates_server::deploy`
 
 {{/*
 The shared fleet manifest (docs/cli.md), rendered once from `replicas`: every node by name, its per-pod
-DNS address and port block, its certificate file beside the manifest, and its key file in the pod's own
-key mount (`../keys/`, projected from the pod's Secret alone). Every pod reads this same file with its
-own `--node`, so every node computes the same member ids and socket map (`slates_server::deploy`).
+DNS address and port block, its certificate file beside the manifest, and its key at the one path every
+pod mounts its own key at (`../keys/node.key.der`: the pod's Secret alone, selected by the pod's name —
+statefulset.yaml). Every pod reads this same file with its own `--node`, and only its own key, so every
+node computes the same member ids and socket map (`slates_server::deploy`).
 */}}
 {{- define "slates.manifest" -}}
 {{- $root := . -}}
 {{- $nodes := list -}}
 {{- range $index := until (int .Values.replicas) -}}
 {{- $pod := include "slates.podName" (dict "root" $root "index" $index) -}}
-{{- $node := dict "node" $pod "address" (include "slates.podAddress" (dict "root" $root "index" $index)) "certificate" (printf "%s.crt.der" $pod) "key" (printf "../keys/%s.key.der" $pod) -}}
+{{- $node := dict "node" $pod "address" (include "slates.podAddress" (dict "root" $root "index" $index)) "certificate" (printf "%s.crt.der" $pod) "key" "../keys/node.key.der" -}}
 {{- $nodes = append $nodes $node -}}
 {{- end -}}
 {{- $manifest := dict "name" .Values.fleet.name "f" (include "slates.f" . | int) "nodes" $nodes -}}
