@@ -31,17 +31,43 @@ pub struct Slab<T> {
   free_head: Option<u32>,
   len: usize,
   max_slots: usize,
+  /// The generation a fresh slot starts at (§4.3 slot reuse): a slab that replaces another under the
+  /// same shard id starts every slot past the highest generation the old one issued, so a handle
+  /// minted for the old slab can never match a slot of this one. Zero for a first slab.
+  generation_base: u32,
 }
 
 impl<T> Slab<T> {
   /// A slab whose segments hold `segment_slots` slots and which never exceeds `max_slots`.
   pub fn new(segment_slots: usize, max_slots: usize) -> Self {
+    Self::with_generation_base(segment_slots, max_slots, 0)
+  }
+
+  /// [`Slab::new`] whose fresh slots start at `generation_base` (see the field).
+  pub fn with_generation_base(
+    segment_slots: usize,
+    max_slots: usize,
+    generation_base: u32,
+  ) -> Self {
     Self {
       slots: Segmented::new(segment_slots),
       free_head: None,
       len: 0,
       max_slots,
+      generation_base,
     }
+  }
+
+  /// One past the highest generation any slot of this slab has reached: what a successor slab under
+  /// the same shard id must start from so no handle of this slab names one of its slots.
+  pub fn generation_high(&self) -> u32 {
+    let mut high = self.generation_base;
+    for index in 0..self.slots.len() {
+      if let Some(slot) = self.slots.get(index) {
+        high = high.max(slot.generation.wrapping_add(1));
+      }
+    }
+    high
   }
 
   /// Pre-allocates `count` segments so that the next inserts allocate nothing.
@@ -117,15 +143,16 @@ impl<T> Slab<T> {
         capacity: self.max_slots,
       });
     }
+    let generation = self.generation_base;
     let index = self.slots.push(Slot {
-      generation: 0,
+      generation,
       body: Body::Occupied(value),
     });
     self.len += 1;
     let index = u32::try_from(index).map_err(|_| MemError::SlabFull {
       capacity: self.max_slots,
     })?;
-    Ok(Handle::new(index, 0))
+    Ok(Handle::new(index, generation))
   }
 
   /// Places `value` at exactly `index` with `generation` and returns the handle `(index,

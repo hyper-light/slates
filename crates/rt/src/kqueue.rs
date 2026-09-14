@@ -10,6 +10,8 @@
 //! events and a buffer with the capacity the call may fill.
 
 use std::os::fd::OwnedFd;
+
+use crate::driver::KickFd;
 use std::time::{Duration, Instant};
 
 use rustix::event::kqueue::{
@@ -28,7 +30,7 @@ const EVENTS_PER_WAIT: usize = 64;
 
 /// The driver.
 pub struct KqueueDriver {
-  kq: &'static OwnedFd,
+  kq: &'static KickFd,
   epoch: Instant,
   events: Vec<Event>,
   nops: Vec<u64>,
@@ -54,28 +56,32 @@ fn user_event(flags: UserFlags, event_flags: EventFlags) -> Event {
   )
 }
 
-/// Creates the queue and registers the kick event; the descriptor is leaked for the process.
-pub fn prepare() -> Result<&'static OwnedFd, RtError> {
-  let kq: &'static OwnedFd = Box::leak(Box::new(kqueue().map_err(|e| refused("kqueue", e))?));
+/// Creates the queue and registers the kick event; the descriptor is owned by the registry slot
+/// that the shard registers into (closed at unregistration, never leaked).
+pub fn prepare() -> Result<OwnedFd, RtError> {
+  let kq = kqueue().map_err(|e| refused("kqueue", e))?;
   let register = user_event(UserFlags::empty(), EventFlags::ADD | EventFlags::CLEAR);
   let mut none: Vec<Event> = Vec::new();
   // SAFETY: the change list is one valid event; the empty output vector receives nothing.
-  unsafe { kevent(kq, &[register], &mut none, None) }
+  unsafe { kevent(&kq, &[register], &mut none, None) }
     .map_err(|e| refused("kevent(EV_ADD EVFILT_USER)", e))?;
   Ok(kq)
 }
 
-/// Triggers the kick event on `kq`; safe from any thread.
-pub fn trigger(kq: &OwnedFd) {
-  let trigger = user_event(UserFlags::TRIGGER, EventFlags::empty());
-  let mut none: Vec<Event> = Vec::new();
-  // SAFETY: one valid change record on an open queue; a closed queue returns an error we ignore.
-  let _ = unsafe { kevent(kq, &[trigger], &mut none, None) };
+/// Triggers the kick event on `kq`; safe from any thread. A closed slot (the shard unregistered)
+/// makes it a no-op.
+pub fn trigger(kq: &KickFd) {
+  let _ = kq.with(|kq| {
+    let trigger = user_event(UserFlags::TRIGGER, EventFlags::empty());
+    let mut none: Vec<Event> = Vec::new();
+    // SAFETY: one valid change record on an open queue; a closed queue returns an error we ignore.
+    let _ = unsafe { kevent(kq, &[trigger], &mut none, None) };
+  });
 }
 
 impl KqueueDriver {
-  /// Builds the driver over a prepared queue, on the shard's thread.
-  pub fn from_prepared(kq: &'static OwnedFd) -> KqueueDriver {
+  /// Builds the driver over the slot's prepared queue, on the shard's thread.
+  pub fn from_prepared(kq: &'static KickFd) -> KqueueDriver {
     KqueueDriver {
       kq,
       epoch: Instant::now(),
@@ -111,8 +117,15 @@ impl Driver for KqueueDriver {
     // SAFETY: no changes; the output buffer is the vector's spare capacity, which the call fills
     // and marks initialized up to the count it returns.
     let outcome = unsafe {
+      let Some(kq) = self.kq.fd() else {
+        // The slot closed the queue: the shard unregistered, so there is nothing left to wait on.
+        return Err(refused(
+          "kevent(wait) on a closed queue",
+          rustix::io::Errno::BADF,
+        ));
+      };
       kevent(
-        self.kq,
+        kq,
         &[],
         rustix::buffer::spare_capacity(&mut self.events),
         timeout,
@@ -152,7 +165,14 @@ impl Driver for KqueueDriver {
     );
     let mut none: Vec<Event> = Vec::new();
     // SAFETY: one valid change record on the open queue; the empty output buffer receives nothing.
-    unsafe { kevent(self.kq, &[event], &mut none, None) }
+    let kq = self.kq.fd().ok_or_else(|| {
+      refused(
+        "kevent(EVFILT_READ) on a closed queue",
+        rustix::io::Errno::BADF,
+      )
+    })?;
+    // SAFETY: one valid change record on the open queue; the empty output buffer receives nothing.
+    unsafe { kevent(kq, &[event], &mut none, None) }
       .map_err(|e| refused("kevent(EVFILT_READ)", e))?;
     Ok(())
   }
@@ -168,7 +188,14 @@ impl Driver for KqueueDriver {
     );
     let mut none: Vec<Event> = Vec::new();
     // SAFETY: one valid change record on the open queue; the empty output buffer receives nothing.
-    unsafe { kevent(self.kq, &[event], &mut none, None) }
+    let kq = self.kq.fd().ok_or_else(|| {
+      refused(
+        "kevent(EVFILT_WRITE) on a closed queue",
+        rustix::io::Errno::BADF,
+      )
+    })?;
+    // SAFETY: one valid change record on the open queue; the empty output buffer receives nothing.
+    unsafe { kevent(kq, &[event], &mut none, None) }
       .map_err(|e| refused("kevent(EVFILT_WRITE)", e))?;
     Ok(())
   }

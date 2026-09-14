@@ -47,15 +47,18 @@ impl DriverKind {
   }
 }
 
-/// The thread-safe handle that wakes a driver from anywhere.
+/// The thread-safe handle that wakes a driver from anywhere. The descriptor forms hold their
+/// descriptor through a [`KickFd`] the registry slot owns and closes at unregistration, so a kick
+/// that outlives its shard writes to a closed descriptor (an error the kick ignores) and never to a
+/// descriptor number a later open reused.
 #[derive(Clone, Copy, Debug)]
 pub enum Kick {
   /// Write eight bytes to an eventfd (Linux; io_uring and epoll).
   #[cfg(target_os = "linux")]
-  Eventfd(&'static std::os::fd::OwnedFd),
+  Eventfd(&'static KickFd),
   /// Trigger the `EVFILT_USER` event on a kqueue (macOS / BSD).
   #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-  Kqueue(&'static std::os::fd::OwnedFd),
+  Kqueue(&'static KickFd),
   /// Post a completion packet to a port (Windows), by its exposed address.
   #[cfg(target_os = "windows")]
   Iocp(usize),
@@ -65,10 +68,95 @@ pub enum Kick {
   None,
 }
 
+/// A kick descriptor the registry slot owns: the eventfd or kqueue the driver waits on. It is closed
+/// by [`KickFd::close`] at unregistration (the raw descriptor is released and the number may be
+/// reused by a later `open`), after which every kick through it is a no-op — the `closed` flag is
+/// checked before the descriptor is touched, so a stale kick never writes to a reused number.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct KickFd {
+  fd: std::cell::UnsafeCell<Option<std::os::fd::OwnedFd>>,
+  closed: std::sync::atomic::AtomicBool,
+}
+
+// SAFETY: the descriptor is written exactly twice — at construction (before the value is shared)
+// and at `close` (by the unregistering thread, after the shard thread joined, with `closed` set
+// `Release` first so every later reader sees the flag before it could see the slot emptied); every
+// other access is a read of the `Option` guarded by an `Acquire` load of `closed`. The kick path
+// reads the descriptor number and issues one syscall; it never mutates.
+#[cfg(unix)]
+unsafe impl Sync for KickFd {}
+// SAFETY: as for `Sync`: the only owner-side mutation is `close`, ordered by the `closed` flag, and
+// an `OwnedFd` is `Send`; moving the `KickFd` to another thread moves the descriptor with it.
+#[cfg(unix)]
+unsafe impl Send for KickFd {}
+
+#[cfg(unix)]
+impl KickFd {
+  /// Owns `fd` for the slot.
+  pub fn new(fd: std::os::fd::OwnedFd) -> KickFd {
+    KickFd {
+      fd: std::cell::UnsafeCell::new(Some(fd)),
+      closed: std::sync::atomic::AtomicBool::new(false),
+    }
+  }
+
+  /// Runs `f` with the descriptor unless the slot closed it.
+  pub fn with<R>(&self, f: impl FnOnce(&std::os::fd::OwnedFd) -> R) -> Option<R> {
+    if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+      return None;
+    }
+    // SAFETY: `closed` is false, so `close` has not run; the value was written before the
+    // `KickFd` was shared and is not mutated while `closed` is false (see the `Sync` note).
+    unsafe { (*self.fd.get()).as_ref() }.map(f)
+  }
+
+  /// The descriptor for the shard's own driver (its thread; the slot closes it only after that
+  /// thread ended), `None` once closed.
+  pub fn fd(&self) -> Option<&std::os::fd::OwnedFd> {
+    if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+      return None;
+    }
+    // SAFETY: as in `with`: `closed` is false, so the value is present and unmutated.
+    unsafe { (*self.fd.get()).as_ref() }
+  }
+
+  /// The raw descriptor number, for a waiter that polls it (the anchor's doorbell); `None` once
+  /// closed.
+  pub fn raw(&self) -> Option<i32> {
+    use std::os::fd::AsRawFd;
+    self.with(|fd| fd.as_raw_fd())
+  }
+
+  /// Closes the descriptor: the flag first, then the value, so no kick observes a closed number.
+  /// Called once, by the unregistering thread, after the driver's thread has ended.
+  pub fn close(&self) {
+    if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+      return;
+    }
+    // SAFETY: `closed` was just set from false by this thread, so `with` returns `None` to every
+    // reader from now on and no reader is inside the value: `with` loads the flag before it borrows,
+    // and the shard thread that could borrow without the flag has ended (the caller joined it).
+    let fd = unsafe { (*self.fd.get()).take() };
+    drop(fd);
+  }
+}
+
 impl Kick {
   /// A kick that does nothing.
   pub const fn none() -> Kick {
     Kick::None
+  }
+
+  /// Closes the kick's descriptor, if it owns one (unregistration).
+  pub fn close(&self) {
+    match self {
+      #[cfg(target_os = "linux")]
+      Kick::Eventfd(fd) => fd.close(),
+      #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+      Kick::Kqueue(fd) => fd.close(),
+      _ => {}
+    }
   }
 
   /// Wakes the driver. Errors are ignored: a closed driver belongs to a shard that exited, and
@@ -77,7 +165,7 @@ impl Kick {
     match self {
       #[cfg(target_os = "linux")]
       Kick::Eventfd(fd) => {
-        let _ = rustix::io::write(fd, &1u64.to_ne_bytes());
+        let _ = fd.with(|fd| rustix::io::write(fd, &1u64.to_ne_bytes()));
       }
       #[cfg(any(target_os = "macos", target_os = "freebsd"))]
       Kick::Kqueue(kq) => crate::kqueue::trigger(kq),
@@ -139,15 +227,21 @@ pub trait Driver {
 
 /// What builds a driver on the shard's thread: a closure the runtime prepared with the OS
 /// resources the kick needs (created up front, so the kick is known before the thread exists).
-pub type DriverSeed = Box<dyn FnOnce() -> Result<Box<dyn Driver>, RtError> + Send>;
+pub type DriverSeed = Box<dyn FnOnce(Kick) -> Result<Box<dyn Driver>, RtError> + Send>;
 
 /// A prepared driver: the seed, the kick it will answer to, and the notes of the probe.
 pub struct Prepared {
-  /// Builds the driver on the shard's thread.
+  /// Builds the driver on the shard's thread, over the kick the registry slot handed the shard
+  /// (the slot owns the kick's descriptor).
   pub seed: DriverSeed,
-  /// The kick that wakes it.
-  pub kick: Kick,
-  /// Which driver and which flags the probe settled on.
+  /// The kick descriptor the slot takes ownership of (Unix: the eventfd or kqueue); `None` where the
+  /// kick is not a descriptor (Windows' completion port, the simulation).
+  #[cfg(unix)]
+  pub kick_fd: Option<std::os::fd::OwnedFd>,
+  /// Windows: no descriptor-owned kick; the port is the driver's.
+  #[cfg(not(unix))]
+  pub kick_fd: Option<()>,
+  /// What was probed and chosen.
   pub notes: Vec<String>,
 }
 
@@ -166,15 +260,29 @@ pub fn os_driver(ring_entries: u32) -> Result<Prepared, RtError> {
   let mut notes = Vec::new();
   let uring = crate::uring::probe(ring_entries, &mut notes);
   let seed: DriverSeed = if uring {
-    Box::new(move || {
-      Ok(Box::new(crate::uring::UringDriver::with_eventfd(efd, ring_entries)?) as Box<dyn Driver>)
+    Box::new(move |kick| match kick {
+      Kick::Eventfd(efd) => {
+        Ok(Box::new(crate::uring::UringDriver::with_eventfd(efd, ring_entries)?) as Box<dyn Driver>)
+      }
+      _ => Err(RtError::DriverRefused {
+        call: "io_uring driver without its eventfd",
+        code: None,
+      }),
     })
   } else {
-    Box::new(move || Ok(Box::new(crate::epoll::EpollDriver::with_eventfd(efd)?) as Box<dyn Driver>))
+    Box::new(|kick| match kick {
+      Kick::Eventfd(efd) => {
+        Ok(Box::new(crate::epoll::EpollDriver::with_eventfd(efd)?) as Box<dyn Driver>)
+      }
+      _ => Err(RtError::DriverRefused {
+        call: "epoll driver without its eventfd",
+        code: None,
+      }),
+    })
   };
   Ok(Prepared {
+    kick_fd: Some(efd),
     seed,
-    kick: Kick::Eventfd(efd),
     notes,
   })
 }
@@ -182,12 +290,17 @@ pub fn os_driver(ring_entries: u32) -> Result<Prepared, RtError> {
 /// Prepares the OS driver for this platform.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub fn os_driver(_ring_entries: u32) -> Result<Prepared, RtError> {
-  let kq = crate::kqueue::prepare()?;
   Ok(Prepared {
-    seed: Box::new(move || {
-      Ok(Box::new(crate::kqueue::KqueueDriver::from_prepared(kq)) as Box<dyn Driver>)
+    kick_fd: Some(crate::kqueue::prepare()?),
+    seed: Box::new(|kick| match kick {
+      Kick::Kqueue(kq) => {
+        Ok(Box::new(crate::kqueue::KqueueDriver::from_prepared(kq)) as Box<dyn Driver>)
+      }
+      _ => Err(RtError::DriverRefused {
+        call: "kqueue driver without its queue",
+        code: None,
+      }),
     }),
-    kick: Kick::Kqueue(kq),
     notes: Vec::new(),
   })
 }
@@ -197,10 +310,10 @@ pub fn os_driver(_ring_entries: u32) -> Result<Prepared, RtError> {
 pub fn os_driver(_ring_entries: u32) -> Result<Prepared, RtError> {
   let port = crate::iocp::prepare()?;
   Ok(Prepared {
-    seed: Box::new(move || {
+    kick_fd: None,
+    seed: Box::new(move |_kick| {
       Ok(Box::new(crate::iocp::IocpDriver::from_prepared(port)) as Box<dyn Driver>)
     }),
-    kick: Kick::Iocp(port),
     notes: Vec::new(),
   })
 }
@@ -223,12 +336,32 @@ pub(crate) fn refused(call: &'static str, e: rustix::io::Errno) -> RtError {
 mod tests {
   use super::*;
 
+  #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+  fn test_kick(fd: Option<std::os::fd::OwnedFd>) -> Kick {
+    fd.map_or(Kick::None, |fd| {
+      Kick::Kqueue(Box::leak(Box::new(KickFd::new(fd))))
+    })
+  }
+  #[cfg(target_os = "linux")]
+  fn test_kick(fd: Option<std::os::fd::OwnedFd>) -> Kick {
+    fd.map_or(Kick::None, |fd| {
+      Kick::Eventfd(Box::leak(Box::new(KickFd::new(fd))))
+    })
+  }
+  #[cfg(not(unix))]
+  fn test_kick(_fd: Option<()>) -> Kick {
+    Kick::None
+  }
+
   #[test]
   #[cfg_attr(miri, ignore)]
   fn the_os_driver_wakes_on_a_kick_and_delivers_a_nop() {
     let prepared = os_driver(64).unwrap();
     let notes = prepared.notes.clone();
-    let mut driver = (prepared.seed)().unwrap();
+    // The kick over the prepared descriptor, as the registry slot would mint it (leaked: a unit
+    // test's one-off, D-8's harness exception; in the runtime the slot owns and closes it).
+    let kick = test_kick(prepared.kick_fd);
+    let mut driver = (prepared.seed)(kick).unwrap();
     eprintln!("driver {} notes {notes:?}", driver.kind().name());
     let kick = driver.kick_handle();
     let mut out = Vec::new();

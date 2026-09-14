@@ -485,14 +485,18 @@ impl SimRuntime {
     let mut shared = Vec::new();
     for _ in 0..config.shards {
       let s: &'static SimShared = Box::leak(Box::new(SimShared::new(seed)));
-      let seed: DriverSeed = Box::new(move || {
+      let seed: DriverSeed = Box::new(move |_kick| {
         Ok(Box::new(SimDriver {
           shared: s,
           clock,
           nops: Vec::new(),
         }) as Box<dyn Driver>)
       });
-      seeds.push(ShardSeed::register(config, seed, Kick::Sim(s))?);
+      seeds.push(ShardSeed::register(
+        config,
+        seed,
+        crate::registry::RegisterKick::Kick(Kick::Sim(s)),
+      )?);
       shared.push(s);
     }
     crate::runtime::connect_pairs(&mut seeds)?;

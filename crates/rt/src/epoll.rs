@@ -21,7 +21,7 @@ const EVENTS_PER_WAIT: usize = 64;
 /// The driver.
 pub struct EpollDriver {
   epfd: OwnedFd,
-  efd: &'static OwnedFd,
+  efd: &'static crate::driver::KickFd,
   epoch: Instant,
   events: Vec<epoll::Event>,
   nops: Vec<u64>,
@@ -39,9 +39,15 @@ impl EpollDriver {
   /// Creates the instance over a prepared kick eventfd (leaked for the process so the registry's
   /// kick handle can name it after the driver is gone; a write into a reused descriptor number
   /// would otherwise be a fault in someone else's file).
-  pub fn with_eventfd(efd: &'static OwnedFd) -> Result<EpollDriver, RtError> {
+  pub fn with_eventfd(efd: &'static crate::driver::KickFd) -> Result<EpollDriver, RtError> {
     let epfd = epoll::create(CreateFlags::CLOEXEC).map_err(|e| refused("epoll_create1", e))?;
-    epoll::add(&epfd, efd, EventData::new_u64(KICK_TAG), EventFlags::IN)
+    let fd = efd.fd().ok_or_else(|| {
+      refused(
+        "epoll_ctl(ADD eventfd) on a closed slot",
+        rustix::io::Errno::BADF,
+      )
+    })?;
+    epoll::add(&epfd, fd, EventData::new_u64(KICK_TAG), EventFlags::IN)
       .map_err(|e| refused("epoll_ctl(ADD eventfd)", e))?;
     Ok(EpollDriver {
       epfd,
@@ -54,7 +60,7 @@ impl EpollDriver {
 
   fn drain_kick(&self) {
     let mut word = [0u8; size_of::<u64>()];
-    let _ = rustix::io::read(self.efd, &mut word);
+    let _ = self.efd.with(|efd| rustix::io::read(efd, &mut word));
   }
 }
 

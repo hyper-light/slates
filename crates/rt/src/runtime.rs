@@ -181,12 +181,40 @@ pub(crate) fn connect_pairs(seeds: &mut [ShardSeed]) -> Result<(), RtError> {
       if a == b {
         continue;
       }
-      let ring: &'static SpscRing = Box::leak(Box::new(SpscRing::new(entries)?));
+      // The ring is owned by the source shard's registry entry and lent to both contexts as
+      // `&'static`: the entry outlives every borrower (its slot is given back only after every
+      // thread of the runtime joined, and the entry itself is dropped only by the slot's next
+      // registration), so the lifetime is the slot protocol's promise, not a leak.
+      let ring: &'static SpscRing = registry::lend_pair_ring(ids[a], SpscRing::new(entries)?)
+        .ok_or(RtError::ShardGone { shard: ids[a] })?;
       seeds[a].set_outbound(ids[b], ring);
       seeds[b].set_inbound(ring);
     }
   }
   Ok(())
+}
+
+/// The slot's kick for an OS driver: its descriptor, owned by the slot (Unix), or none (Windows: the
+/// completion port is the driver's).
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
+fn register_kick(fd: Option<std::os::fd::OwnedFd>) -> registry::RegisterKick {
+  match fd {
+    Some(fd) => registry::RegisterKick::Descriptor(fd, Kick::Kqueue),
+    None => registry::RegisterKick::Kick(Kick::None),
+  }
+}
+
+#[cfg(target_os = "linux")]
+fn register_kick(fd: Option<std::os::fd::OwnedFd>) -> registry::RegisterKick {
+  match fd {
+    Some(fd) => registry::RegisterKick::Descriptor(fd, Kick::Eventfd),
+    None => registry::RegisterKick::Kick(Kick::None),
+  }
+}
+
+#[cfg(not(unix))]
+fn register_kick(_fd: Option<()>) -> registry::RegisterKick {
+  registry::RegisterKick::Kick(Kick::None)
 }
 
 /// The OS runtime: one thread per shard.
@@ -212,7 +240,11 @@ impl Runtime {
     for _ in 0..config.shards {
       let prepared = os_driver(u32::try_from(config.ring_entries).unwrap_or(u32::MAX))?;
       notes.extend(prepared.notes);
-      seeds.push(ShardSeed::register(config, prepared.seed, prepared.kick)?);
+      seeds.push(ShardSeed::register(
+        config,
+        prepared.seed,
+        register_kick(prepared.kick_fd),
+      )?);
     }
     connect_pairs(&mut seeds)?;
     let ids: Vec<ShardId> = seeds.iter().map(|s| ShardId(s.id)).collect();
@@ -284,11 +316,17 @@ impl Runtime {
     for id in &self.ids {
       let _ = registry::send_control(id.0, Control::Shutdown);
     }
-    self
+    let counters: Vec<Counters> = self
       .threads
       .into_iter()
       .map(|t| t.join().unwrap_or_default())
-      .collect()
+      .collect();
+    // Every thread has ended: give every slot back (the kick descriptors close, the slots are
+    // reusable). After every join, never before — a shard's pair rings are lent to its peers.
+    for id in &self.ids {
+      registry::unregister(id.0);
+    }
+    counters
   }
 }
 
@@ -306,12 +344,26 @@ impl std::fmt::Debug for LocalRuntime {
   }
 }
 
+impl Drop for LocalRuntime {
+  /// The shard ran on this thread and its loop has returned by the time the value drops (every
+  /// `run_until_*` returns before), so its slot is given back here: the kick descriptor closes and
+  /// the slot is reusable by the next runtime.
+  fn drop(&mut self) {
+    registry::note_arena_generation(self.ctx.id, self.ctx.arena_generation_high());
+    registry::unregister(self.ctx.id);
+  }
+}
+
 impl LocalRuntime {
   /// Builds the shard.
   pub fn new(config: &RuntimeConfig) -> Result<LocalRuntime, RtError> {
     let prepared = os_driver(u32::try_from(config.ring_entries).unwrap_or(u32::MAX))?;
     Ok(LocalRuntime {
-      ctx: ShardContext::build(ShardSeed::register(config, prepared.seed, prepared.kick)?)?,
+      ctx: ShardContext::build(ShardSeed::register(
+        config,
+        prepared.seed,
+        register_kick(prepared.kick_fd),
+      )?)?,
       notes: prepared.notes,
     })
   }
@@ -323,7 +375,11 @@ impl LocalRuntime {
     kick: Kick,
   ) -> Result<LocalRuntime, RtError> {
     Ok(LocalRuntime {
-      ctx: ShardContext::build(ShardSeed::register(config, driver, kick)?)?,
+      ctx: ShardContext::build(ShardSeed::register(
+        config,
+        driver,
+        registry::RegisterKick::Kick(kick),
+      )?)?,
       notes: Vec::new(),
     })
   }

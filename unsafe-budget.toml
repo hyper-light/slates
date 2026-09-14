@@ -99,7 +99,15 @@
 [budget]
 slates-machine = 43
 slates-mem = 16
-slates-rt = 49
+# 2026-09-14 (+11, registry slot reclamation — `docs/bugs/2026-09-14-shard-registry-leaks-every-slot-for-the-process-lifetime.md`):
+# `driver::KickFd` — the slot-owned kick descriptor: `Sync`/`Send` impls (2), `with`, `fd`, `close` (3
+# blocks reading or taking the `UnsafeCell` under the `closed` flag); `registry::register` (the previous
+# entry's drop after the generation moved past every reader; the `'static` borrow of the kick fd into
+# the boxed entry: 2), `registry::unregister` (the retired entry's borrow after the join: 1),
+# `registry::entry` (the live-or-retired entry deref under the generation check: 1),
+# `registry::lend_pair_ring` (the entry borrow and the ring's `'static` lend: 2). Each site's `SAFETY:`
+# names the slot protocol invariant it rests on; the loom lane's coverage of this crate is owed.
+slates-rt = 60
 slates-base = 6
 slates-vfs = 0
 slates-land = 3

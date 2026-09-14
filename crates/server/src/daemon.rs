@@ -1736,9 +1736,8 @@ async fn heartbeat_loop(segment: AnchorSegment) {
 
 #[cfg(target_os = "linux")]
 fn kick_fd_of(shard: ShardId) -> Option<i32> {
-  use std::os::fd::AsRawFd;
   match registry::entry(shard.0).map(|e| e.kick) {
-    Some(slates_rt::driver::Kick::Eventfd(fd)) => Some(fd.as_raw_fd()),
+    Some(slates_rt::driver::Kick::Eventfd(fd)) => fd.raw(),
     _ => None,
   }
 }

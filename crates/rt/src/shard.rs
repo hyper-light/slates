@@ -136,9 +136,10 @@ impl ShardSeed {
   pub fn register(
     config: &RuntimeConfig,
     driver: DriverSeed,
-    kick: Kick,
+    kick: registry::RegisterKick,
   ) -> Result<ShardSeed, RtError> {
     let (id, control) = registry::register(config.ring_entries, config.tasks_per_shard, kick)?;
+    let kick = registry::entry(id).map_or(Kick::None, |entry| entry.kick);
     Ok(ShardSeed {
       id,
       driver,
@@ -233,10 +234,14 @@ impl ShardContext {
   /// lets every reference to it be a plain `&'static` with no unsafe code.
   pub fn build(seed: ShardSeed) -> Result<&'static ShardContext, RtError> {
     let config = seed.config;
-    let driver = (seed.driver)()?;
-    let mut arena = Slab::new(
+    let driver = (seed.driver)(seed.kick)?;
+    // The arena's generations continue from where the slot's previous holder left them, so a wake
+    // word minted for that shard can never name a task of this one (registry slot reuse, §4.3).
+    let generation_base = registry::entry(seed.id).map_or(0, |entry| entry.generation_base);
+    let mut arena = Slab::with_generation_base(
       config.tasks_per_shard.min(config.segment_tasks()),
       config.tasks_per_shard,
+      generation_base,
     );
     arena.reserve_segments(
       config
@@ -317,6 +322,15 @@ impl ShardContext {
       .with_inner(|inner| inner.arena.generation_at(slot))
       .flatten()?;
     Encoded::pack(self.id, slot, generation).map(TaskId)
+  }
+
+  /// One past the highest task-arena generation this shard has issued: what the registry slot's
+  /// next holder starts from, so a wake word minted for this shard never names a task of the next
+  /// (slot reuse, §4.3).
+  pub fn arena_generation_high(&self) -> u32 {
+    self
+      .with_inner(|inner| inner.arena.generation_high())
+      .unwrap_or(0)
   }
 
   /// The counters.
@@ -536,6 +550,8 @@ impl ShardContext {
     loop {
       let outcome = self.step();
       if outcome.exit {
+        // The slot's next holder starts its task generations past this shard's (slot reuse).
+        registry::note_arena_generation(self.id, self.arena_generation_high());
         break;
       }
       if outcome.did_work {

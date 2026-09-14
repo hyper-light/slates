@@ -18,7 +18,7 @@ const KICK_TAG: u64 = u64::MAX;
 /// The driver.
 pub struct UringDriver {
   ring: IoUring,
-  efd: &'static OwnedFd,
+  efd: &'static crate::driver::KickFd,
   epoch: Instant,
   notes: Vec<String>,
   multishot: bool,
@@ -27,7 +27,7 @@ pub struct UringDriver {
 impl std::fmt::Debug for UringDriver {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("UringDriver")
-      .field("efd", &self.efd.as_raw_fd())
+      .field("efd", &self.efd.raw())
       .field("notes", &self.notes)
       .field("multishot", &self.multishot)
       .finish()
@@ -35,14 +35,12 @@ impl std::fmt::Debug for UringDriver {
 }
 
 /// Creates the kick eventfd, leaked for the process (see the epoll driver for why).
-pub fn prepare_eventfd() -> Result<&'static OwnedFd, RtError> {
-  Ok(Box::leak(Box::new(
-    rustix::event::eventfd(
-      0,
-      rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
-    )
-    .map_err(|e| refused("eventfd", e))?,
-  )))
+pub fn prepare_eventfd() -> Result<OwnedFd, RtError> {
+  rustix::event::eventfd(
+    0,
+    rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+  )
+  .map_err(|e| refused("eventfd", e))
 }
 
 /// Probes whether io_uring is available, recording which flags the kernel accepts; a refusal
@@ -89,7 +87,10 @@ fn build_ring(entries: u32) -> Result<(IoUring, &'static str), RtError> {
 
 impl UringDriver {
   /// Builds the driver over a prepared eventfd, on the shard's thread.
-  pub fn with_eventfd(efd: &'static OwnedFd, entries: u32) -> Result<UringDriver, RtError> {
+  pub fn with_eventfd(
+    efd: &'static crate::driver::KickFd,
+    entries: u32,
+  ) -> Result<UringDriver, RtError> {
     let (ring, flags) = build_ring(entries)?;
     let mut driver = UringDriver {
       ring,
@@ -109,7 +110,7 @@ impl UringDriver {
 
   fn arm_kick(&mut self) -> Result<(), RtError> {
     let poll = opcode::PollAdd::new(
-      Fd(self.efd.as_raw_fd()),
+      Fd(self.efd.raw().unwrap_or(-1)),
       u32::try_from(libc::POLLIN).unwrap_or(0),
     )
     .multi(self.multishot)
@@ -129,7 +130,7 @@ impl UringDriver {
 
   fn drain_kick(&self) {
     let mut word = [0u8; size_of::<u64>()];
-    let _ = rustix::io::read(self.efd, &mut word);
+    let _ = self.efd.with(|efd| rustix::io::read(efd, &mut word));
   }
 }
 
