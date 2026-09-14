@@ -668,6 +668,214 @@ fn the_verbs_emit_json_with_the_json_flag() {
   drop(anchor);
 }
 
+/// Starts the anchor with its stderr piped and reads the issuer-surface line it prints (the segment
+/// handoff a shell exports to run `grant`/`enroll`/`revoke`/`run`); the rest of its stderr is drained
+/// by a thread so the anchor never blocks on a full pipe. Waits for the daemon as `start_anchor` does.
+fn start_anchor_with_issuer_surface(instance: &str) -> (AnchorProcess, Vec<(String, String)>) {
+  use std::io::{BufRead, BufReader};
+  let mut child = slates()
+    .args([
+      "--instance",
+      instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut stderr = BufReader::new(child.stderr.take().unwrap());
+  let anchor = AnchorProcess { child };
+  let mut exports = Vec::new();
+  let mut line = String::new();
+  while exports.is_empty() {
+    line.clear();
+    assert!(
+      stderr.read_line(&mut line).unwrap() > 0,
+      "the anchor printed its issuer surface before ending"
+    );
+    if let Some(rest) = line
+      .trim()
+      .strip_prefix("slates anchor: issuer surface: export ")
+    {
+      exports = rest
+        .split(' ')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+    }
+  }
+  // Drain what the anchor says from here on (restarts, stops) so it never blocks writing.
+  std::thread::spawn(move || {
+    let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+  });
+  let started = Instant::now();
+  let mut streak = 0u32;
+  loop {
+    let (code, _, _) = run(instance, &["volume", "list"]);
+    streak = if code == 0 { streak + 1 } else { 0 };
+    if streak >= STABLE_STREAK {
+      return (anchor, exports);
+    }
+    assert!(started.elapsed() < START_WAIT, "the daemon came up: {code}");
+    pause();
+  }
+}
+
+/// Runs a client verb with the issuer surface's variables in its environment; (exit code, stdout,
+/// stderr).
+fn run_as_issuer(
+  instance: &str,
+  exports: &[(String, String)],
+  args: &[&str],
+) -> (i32, String, String) {
+  let output = slates()
+    .arg("--instance")
+    .arg(instance)
+    .args(args)
+    .envs(exports.iter().map(|(name, value)| (name, value)))
+    .output()
+    .unwrap();
+  (
+    output.status.code().unwrap_or(-1),
+    String::from_utf8_lossy(&output.stdout).into_owned(),
+    String::from_utf8_lossy(&output.stderr).into_owned(),
+  )
+}
+
+/// `slates run [--json] -- CMD` (§4.12, §4.13 — the harness verb): the command runs as a consumer
+/// enrolled for its lifetime with the capability delivered on an inherited descriptor: `run --json`
+/// announces `{"consumer":N}` first and then the workload's own output (here a `slates volume create
+/// --json`, itself a client that binds as the consumer); the volume it made is the consumer's, so the
+/// account's `status` on it is refused (exit 1, `Forbidden`); the workload's exit code is `run`'s
+/// (exit 1 from a refused verb inside passes through); `enroll --json` shows a consumer and its
+/// capability once, `share` gives it a right on a volume, `revoke` ends it; and without the anchor's
+/// variables the issuer verbs refuse (exit 4) before asking the daemon. Gated like the other process
+/// flows (`SLATES_TEST_CLI=1`); the issuer surface is a name on macOS and Windows and a descriptor
+/// only the anchor's children hold on Linux, where the flow skips loudly.
+#[test]
+fn slates_run_spawns_the_command_as_an_ephemeral_consumer() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the run/enroll flow: set SLATES_TEST_CLI=1 to run it (needs the machine to itself)"
+    );
+    return;
+  }
+  if cfg!(target_os = "linux") {
+    eprintln!(
+      "skipping the run/enroll flow: on Linux the anchor's segment is a descriptor only its children hold"
+    );
+    return;
+  }
+  let instance = format!("cli-run-{}", std::process::id());
+  let (anchor, exports) = start_anchor_with_issuer_surface(&instance);
+  let id = run_creates_a_volume_as_the_consumer(&instance, &exports);
+  run_passes_the_workloads_exit_through(&instance, &exports, &id);
+  enroll_share_and_revoke(&instance, &exports);
+  issuer_verbs_refuse_without_the_anchor(&instance);
+  drop(anchor);
+}
+
+/// `run --json -- slates volume create --json`: the consumer is announced first, the workload (the
+/// CLI itself, bound as the consumer) creates a volume, and the account is refused on it. Returns
+/// the volume's id.
+fn run_creates_a_volume_as_the_consumer(instance: &str, exports: &[(String, String)]) -> String {
+  let (code, out, err) = run_as_issuer(
+    instance,
+    exports,
+    &[
+      "run",
+      "--json",
+      "--",
+      env!("CARGO_BIN_EXE_slates"),
+      "--instance",
+      instance,
+      "volume",
+      "create",
+      "mine",
+      "--bounded",
+      "4MiB",
+      "--json",
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  let mut lines = out.lines();
+  let announced = lines.next().unwrap_or_default();
+  assert!(
+    announced.starts_with("{\"consumer\":"),
+    "the consumer is announced first: {out}"
+  );
+  let created = lines.next().unwrap_or_default();
+  let id = json_field(created, "id");
+  assert_eq!(id.len(), 32, "the workload created a volume: {out}");
+  let (code, _, err) = run(instance, &["status", &id]);
+  assert_eq!(
+    code, 1,
+    "the account is refused on the consumer's volume: {err}"
+  );
+  assert!(err.contains("Forbidden"), "{err}");
+  id
+}
+
+/// The workload's exit passes through: a refused verb inside (another consumer's volume, seen from
+/// a fresh consumer) exits 1, and so does `run`.
+fn run_passes_the_workloads_exit_through(instance: &str, exports: &[(String, String)], id: &str) {
+  let (code, _, err) = run_as_issuer(
+    instance,
+    exports,
+    &[
+      "run",
+      "--",
+      env!("CARGO_BIN_EXE_slates"),
+      "--instance",
+      instance,
+      "status",
+      id,
+    ],
+  );
+  assert_eq!(code, 1, "the workload's exit code is run's: {err}");
+}
+
+/// `enroll --json` shows a consumer and its capability once; `share` gives it a right on the
+/// account's volume; `revoke` ends it.
+fn enroll_share_and_revoke(instance: &str, exports: &[(String, String)]) {
+  let (code, out, err) = run_as_issuer(instance, exports, &["enroll", "--json"]);
+  assert_eq!(code, 0, "{err}");
+  let consumer = json_field(&out, "consumer");
+  assert_eq!(json_field(&out, "capability").len(), 64, "{out}");
+  let (code, out, err) = run(
+    instance,
+    &["volume", "create", "shared", "--bounded", "4MiB", "--json"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let shared = json_field(&out, "id");
+  let (code, out, err) = run(
+    instance,
+    &[
+      "share",
+      &shared,
+      &format!("consumer:{consumer}"),
+      "--read",
+      "--json",
+    ],
+  );
+  assert_eq!(code, 0, "{err}");
+  assert!(out.contains("\"ok\":true"), "{out}");
+  let (code, out, err) = run_as_issuer(instance, exports, &["revoke", &consumer, "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(out.contains("\"ok\":true"), "{out}");
+}
+
+/// Without the anchor's variables there is no issuer authority: refused (exit 4) before the daemon
+/// is asked.
+fn issuer_verbs_refuse_without_the_anchor(instance: &str) {
+  let (code, _, err) = run(instance, &["enroll"]);
+  assert_eq!(code, 4, "{err}");
+  assert!(err.contains("no anchor in this environment"), "{err}");
+}
+
 /// `slates profile --quick` prints the derived constants; `slates` alone prints the usage.
 #[test]
 fn the_profile_and_the_usage_print() {

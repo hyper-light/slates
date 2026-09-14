@@ -1,15 +1,20 @@
 //! The client verbs: one connection, one request, the reply printed in a stable plain form.
 
+use std::ffi::{OsStr, OsString};
+
 use slates_client::{
   AuditEntry, ChokepointReport, Client, ClientError, CreateSpec, DaemonReport, Deadlines, Digest,
-  GrantScope, GrantSummary, GreenBase, Intent, Landing, Rebased, Scope, SnapshotId, StatusReport,
-  Submitted, TelemetryReport, VolumeId, VolumeSummary,
+  GrantScope, GrantSummary, GreenBase, Intent, Landing, Principal, Rebased, Rights, Scope,
+  SnapshotId, StatusReport, Submitted, TelemetryReport, VolumeId, VolumeSummary,
 };
 use slates_db::replay::RECOVERY_BUDGET_NS;
+use slates_ipc::delivery::{Delivery, Output};
+use slates_ipc::rendezvous::ENV_ENDPOINT;
 use slates_server::daemon::LIVENESS_BUDGET_NS;
+use slates_server::landing::{enroll_proof, revoke_proof};
 
 use crate::Failure;
-use crate::args::{ClientRequest, ProfileOptions, Verb};
+use crate::args::{ClientRequest, ProfileOptions, RunRequest, SharePrincipal, Verb};
 use crate::format::volume_id_text;
 
 fn failure_of(e: ClientError, instance: &str) -> Failure {
@@ -45,8 +50,9 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
     return Ok(());
   }
   let mut client = connect(&request.instance)?;
-  // `grant` proves the human's authority from the anchor segment this command runs under, then asks the
-  // daemon to issue; its refusals are the anchor's (`Failure`), not the client's, so it is served here.
+  // `grant`, `enroll` and `revoke` prove the human's authority from the anchor segment this command runs
+  // under, then ask the daemon; their refusals are the anchor's (`Failure`), not the client's, so they
+  // are served here.
   if let Verb::Grant {
     landing,
     manifest,
@@ -62,6 +68,12 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
       *term_ns,
       request.json,
     );
+  }
+  if let Verb::Enroll { account } = &request.verb {
+    return emit_enroll(&mut client, *account, request.json);
+  }
+  if let Verb::Revoke { consumer } = &request.verb {
+    return emit_revoke(&mut client, *consumer, request.json);
   }
   // `mount` reads the volume's name and the daemon's NFS port through the client, then runs `mount_nfs`
   // to mount it over the loopback NFS bridge (§4.6) — no privilege, no kernel extension, no Apple
@@ -708,10 +720,208 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     ),
     Verb::Grants => emit_grants(client, json)?,
     Verb::Audit { since } => emit_audit(client, *since, json)?,
-    // Served in `run`, before this: its authority comes from the anchor, not the client.
-    Verb::Grant { .. } => {}
+    Verb::Share {
+      volume,
+      principal,
+      rights,
+    } => emit_share(client, *volume, principal, *rights, json)?,
+    // Served in `run`, before this: their authority comes from the anchor, not the client.
+    Verb::Grant { .. } | Verb::Enroll { .. } | Verb::Revoke { .. } => {}
   }
   Ok(())
+}
+
+/// This process's host account — the account an enrollment defaults to and a `consumer:N` principal
+/// is under: the uid.
+#[cfg(unix)]
+fn current_account() -> u32 {
+  rustix::process::getuid().as_raw()
+}
+
+/// On Windows the rendezvous authenticates by the section's DACL and reports the peer's account as
+/// zero (`slates_ipc::rendezvous`), so the same account is named here.
+#[cfg(not(unix))]
+fn current_account() -> u32 {
+  0
+}
+
+/// `enroll`: the human surface enrolls a consumer under the account (§4.13 "Principals"), proving
+/// issuer authority as `grant` does. The capability is shown once, here, and never again: a harness
+/// delivers it to the workload on an inherited descriptor (`slates run` does both in one step).
+fn emit_enroll(client: &mut Client, account: Option<u32>, json: bool) -> Result<(), Failure> {
+  let secret = issuer_secret()?;
+  let account = account.unwrap_or_else(current_account);
+  let (consumer, capability) = client
+    .enroll(account, enroll_proof(&secret, account))
+    .map_err(|e| failure_of(e, "enroll"))?;
+  if json {
+    println!(
+      "{}",
+      serde_json::json!({ "consumer": consumer, "account": account, "capability": hex32(&capability) })
+    );
+  } else {
+    println!("consumer: {consumer}");
+    println!("account: {account}");
+    println!("capability: {}", hex32(&capability));
+  }
+  Ok(())
+}
+
+/// `revoke CONSUMER`: the human surface revokes an enrollment; every later verb from a channel bound
+/// to it refuses `ConsumerRevoked`.
+fn emit_revoke(client: &mut Client, consumer: u64, json: bool) -> Result<(), Failure> {
+  let secret = issuer_secret()?;
+  client
+    .revoke(consumer, revoke_proof(&secret, consumer))
+    .map_err(|e| failure_of(e, "revoke"))?;
+  emit_ok("revoked", json);
+  Ok(())
+}
+
+/// `share ID PRINCIPAL [--read] [--write] [--admin]`: a principal's rights on a volume (§4.13
+/// "Access lists"); a `consumer:N` principal without an account is under this process's.
+fn emit_share(
+  client: &mut Client,
+  volume: VolumeId,
+  principal: &SharePrincipal,
+  rights: Rights,
+  json: bool,
+) -> Result<(), ClientError> {
+  let principal = match principal {
+    SharePrincipal::Uid(uid) => Principal::Uid { uid: *uid },
+    SharePrincipal::Consumer { account, consumer } => Principal::Consumer {
+      account: account.unwrap_or_else(current_account),
+      consumer: *consumer,
+    },
+  };
+  client.share(volume, principal, rights)?;
+  emit_ok("shared", json);
+  Ok(())
+}
+
+/// Shape: the bytes of a captured workload output the harness verb holds when a caller captures it
+/// (the tests; `run` itself hands the workload the terminal): a few tagged lines, far under this.
+const WORKLOAD_OUTPUT_CAP: usize = 1 << 20;
+
+/// What `run` spawns: the command, the instance its client will find, whether the enrollment
+/// outlives it, and where its output goes.
+struct Workload {
+  program: OsString,
+  args: Vec<OsString>,
+  instance: String,
+  keep: bool,
+  output: Output,
+}
+
+/// What a spawned workload came to: the consumer it ran as, its exit, its captured output.
+struct Ran {
+  consumer: u64,
+  exit: Option<i32>,
+  output: Vec<u8>,
+}
+
+/// The harness verb's core (§4.13 "the harness owns process isolation and capability delivery"):
+/// enroll a consumer under `account` with the issuer's proof, deliver its capability to the workload
+/// on an inherited descriptor — the capability is never printed, never in an argument, never in the
+/// environment — announce the consumer, spawn the workload with `SLATES_ENDPOINT` naming the
+/// instance, wait for it, and revoke the consumer unless the enrollment is kept. Volumes the workload
+/// created stay owned by the consumer; a kept enrollment is the human's to `revoke` later.
+fn spawn_as_ephemeral_consumer(
+  client: &mut Client,
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  account: u32,
+  workload: &Workload,
+  extra_environment: &[(&OsStr, &OsStr)],
+  announce: impl FnOnce(u64),
+) -> Result<Ran, Failure> {
+  let (consumer, capability) = client
+    .enroll(account, enroll_proof(secret, account))
+    .map_err(|e| failure_of(e, "run"))?;
+  let delivery = Delivery::prepare(consumer, &capability)
+    .map_err(|e| Failure::Failed(format!("run: preparing the delivery: {e}")))?;
+  announce(consumer);
+  let endpoint = OsString::from(&workload.instance);
+  let mut environment: Vec<(&OsStr, &OsStr)> =
+    vec![(OsStr::new(ENV_ENDPOINT), endpoint.as_os_str())];
+  environment.extend_from_slice(extra_environment);
+  let mut child = delivery
+    .spawn(
+      &workload.program,
+      &workload.args,
+      &environment,
+      workload.output,
+    )
+    .map_err(|e| {
+      Failure::Failed(format!(
+        "run: spawning {}: {e}",
+        workload.program.to_string_lossy()
+      ))
+    })?;
+  let (exit, output) = child
+    .wait_with_output(WORKLOAD_OUTPUT_CAP)
+    .map_err(|e| Failure::Failed(format!("run: waiting for the workload: {e}")))?;
+  if !workload.keep {
+    client
+      .revoke(consumer, revoke_proof(secret, consumer))
+      .map_err(|e| failure_of(e, "run"))?;
+  }
+  Ok(Ran {
+    consumer,
+    exit,
+    output,
+  })
+}
+
+/// Prints the consumer a workload runs as, before the workload starts, so a human can `share`
+/// volumes with it while it runs: a JSON object or a `consumer:` line, flushed ahead of the
+/// workload's own output on the same stream.
+fn announce_consumer(consumer: u64, json: bool) {
+  use std::io::Write;
+  if json {
+    println!("{}", serde_json::json!({ "consumer": consumer }));
+  } else {
+    println!("consumer: {consumer}");
+  }
+  let _ = std::io::stdout().flush();
+}
+
+/// `run [--keep] -- CMD [ARG ...]`: the harness verb of §4.13. The human's authority comes from the
+/// anchor segment this command runs under (as `grant` does); the command runs as a consumer enrolled
+/// for its lifetime, with the capability delivered on an inherited descriptor and nowhere else; its
+/// standard streams are this command's; its exit code is this command's.
+pub(crate) fn run_consumer(request: &RunRequest) -> Result<(), Failure> {
+  let secret = issuer_secret()?;
+  let mut client = connect(&request.instance)?;
+  let (program, args) = request
+    .command
+    .split_first()
+    .ok_or_else(|| Failure::Failed("run needs a command".to_owned()))?;
+  let workload = Workload {
+    program: OsString::from(program),
+    args: args.iter().map(OsString::from).collect(),
+    instance: request.instance.clone(),
+    keep: request.keep,
+    output: Output::Inherit,
+  };
+  let ran = spawn_as_ephemeral_consumer(
+    &mut client,
+    &secret,
+    current_account(),
+    &workload,
+    &[],
+    |consumer| announce_consumer(consumer, request.json),
+  )?;
+  // A captured output would be the caller's to hand on; the terminal was the workload's, so this is
+  // empty here and printed as is.
+  let _ = std::io::Write::write_all(&mut std::io::stdout(), &ran.output);
+  match ran.exit {
+    Some(0) => Ok(()),
+    Some(code) => Err(Failure::ChildExited { code }),
+    None => Err(Failure::Failed(format!(
+      "run: the command (consumer {}) was ended by a signal",
+      ran.consumer
+    ))),
+  }
 }
 
 /// `grant`: the human surface (§4.13 "Grants"). The command runs as the user who started the anchor and
@@ -741,26 +951,29 @@ fn emit_grant(
   Ok(())
 }
 
-/// The daemon's grant-issuer secret, read from the anchor segment this command runs under; refused
-/// typed when no anchor is in the environment (the command was not run by the anchor's user from the
-/// anchor's session) or the daemon has not published one yet (an all-zero secret is no authority).
+/// The daemon's issuer secret, read from the anchor segment this command runs under — the authority of
+/// `grant`, `enroll`, `revoke` and `run`; refused typed when no anchor is in the environment (the
+/// command was not run by the anchor's user from the anchor's session: the anchor prints the
+/// variables to export on macOS and Windows; on Linux only its children hold the descriptor) or the
+/// daemon has not published one yet (an all-zero secret is no authority).
 fn issuer_secret() -> Result<[u8; slates_anchor::layout::ISSUER_SECRET_BYTES], Failure> {
   if std::env::var_os(slates_anchor::segment::ENV_HANDOFF).is_none() {
     return Err(Failure::Failed(
-      "grant: no anchor in this environment — `slates grant` is the anchor user's surface; run it from \
-       the session that started the daemon (the MCP server and the SDKs cannot issue grants)"
+      "no anchor in this environment — grant, enroll, revoke and run are the anchor user's surface; \
+       run them from the session that started the daemon, with the variables `slates anchor` printed \
+       exported (the MCP server and the SDKs cannot issue grants or enrollments)"
         .to_owned(),
     ));
   }
   let identity = slates_machine::facts::Facts::query().identity;
   let segment = slates_anchor::AnchorSegment::attach_from_env(&identity)
-    .map_err(|e| Failure::Failed(format!("grant: attaching the anchor: {e}")))?;
+    .map_err(|e| Failure::Failed(format!("attaching the anchor: {e}")))?;
   let secret = segment
     .issuer_secret()
-    .map_err(|e| Failure::Failed(format!("grant: reading the issuer secret: {e}")))?;
+    .map_err(|e| Failure::Failed(format!("reading the issuer secret: {e}")))?;
   if secret.iter().all(|byte| *byte == 0) {
     return Err(Failure::Failed(
-      "grant: the daemon has published no issuer secret yet".to_owned(),
+      "the daemon has published no issuer secret yet".to_owned(),
     ));
   }
   Ok(secret)
@@ -1000,6 +1213,205 @@ pub(crate) fn profile(options: &ProfileOptions) -> Result<(), Failure> {
   );
   println!("ring_entries: {}", derived.ring_entries.get());
   Ok(())
+}
+
+#[cfg(test)]
+mod harness_tests {
+  //! The harness verb's core against an in-process daemon, with this test binary re-invoked as the
+  //! workload (the cross-process fixture pattern of `crates/anchor/tests/anchor.rs`).
+  #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+  use std::ffi::{OsStr, OsString};
+  use std::time::{Duration, Instant};
+
+  use slates_client::{
+    Client, ClientError, CreateSpec, Deadlines, NamePolicy, Refusal, SizeClass, VolumeId,
+  };
+  use slates_ipc::delivery::Output;
+  use slates_server::{Daemon, DaemonConfig, SegmentSource};
+
+  use super::{Workload, current_account, hex32, spawn_as_ephemeral_consumer};
+  use crate::format::{parse_volume_id, volume_id_text};
+
+  /// Format: the environment variable that turns this test binary into the workload the core spawns.
+  const WORKLOAD_ROLE: &str = "SLATES_CLI_TEST_WORKLOAD";
+  /// Shape: how long a client retries the rendezvous while the daemon starts.
+  const START_WAIT: Duration = Duration::from_secs(5);
+  /// Shape: the reply deadline of the test clients (nanoseconds): a fifth of a second.
+  const REPLY_NS: u64 = 200_000_000;
+  /// Shape: the reconnect budget of the test clients (nanoseconds): five seconds.
+  const RECONNECT_NS: u64 = 5_000_000_000;
+  /// Shape: shards per test daemon: two, so the consumer's record and the attesting channel differ.
+  const TEST_SHARDS: u16 = 2;
+
+  fn deadlines() -> Deadlines {
+    Deadlines {
+      reply_ns: REPLY_NS,
+      reconnect_ns: RECONNECT_NS,
+    }
+  }
+
+  fn connect_retrying(instance: &str) -> Client {
+    let started = Instant::now();
+    loop {
+      match Client::connect(instance, deadlines()) {
+        Ok(client) => return client,
+        Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
+          if started.elapsed() < START_WAIT =>
+        {
+          std::hint::spin_loop();
+        }
+        Err(e) => panic!("{e}"),
+      }
+    }
+  }
+
+  fn unhex32(text: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (index, byte) in out.iter_mut().enumerate() {
+      *byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).unwrap();
+    }
+    out
+  }
+
+  fn line_after<'a>(text: &'a str, tag: &str) -> &'a str {
+    text
+      .lines()
+      .find_map(|line| line.strip_prefix(tag))
+      .unwrap_or_else(|| panic!("no `{tag}` line in:\n{text}"))
+  }
+
+  /// The workload: `Client::connect` binds it to the consumer delivered on its inherited descriptor;
+  /// it prints its consumer, the capability (to the captured pipe the parent reads — the parent
+  /// proves the revocation with it) and a volume it made. Ignored so `cargo test` never runs it in
+  /// process; the parent runs it with `--ignored --exact`.
+  #[test]
+  #[ignore = "the workload child; run by run_spawns_the_workload_... with --ignored"]
+  fn consumer_workload_child() {
+    // The role variable carries the name of the volume to make (names are unique per daemon, so
+    // each run makes its own).
+    let Ok(name) = std::env::var(WORKLOAD_ROLE) else {
+      return;
+    };
+    let instance = slates_ipc::instance_from_env();
+    let mut client = Client::connect(&instance, deadlines()).unwrap();
+    let consumer = client.consumer().expect("spawned as a consumer");
+    let taken = slates_ipc::delivery::delivered().unwrap();
+    let volume = client
+      .create(&CreateSpec {
+        name,
+        size: SizeClass::Bounded { limit: 1 << 20 },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      })
+      .unwrap();
+    println!("consumer: {consumer}");
+    println!("capability: {}", hex32(&taken.capability));
+    println!("volume: {}", volume_id_text(volume));
+    std::process::exit(0);
+  }
+
+  fn workload(instance: &str, keep: bool) -> Workload {
+    Workload {
+      program: std::env::current_exe().unwrap().into_os_string(),
+      args: [
+        "--ignored",
+        "--exact",
+        "verbs::harness_tests::consumer_workload_child",
+        "--nocapture",
+      ]
+      .into_iter()
+      .map(OsString::from)
+      .collect(),
+      instance: instance.to_owned(),
+      keep,
+      output: Output::Captured,
+    }
+  }
+
+  /// Runs the core once and returns the consumer it announced, the workload's report, and the volume
+  /// the workload made, after checking its exit and that it ran as the announced consumer.
+  fn run_once(
+    client: &mut Client,
+    secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+    instance: &str,
+    keep: bool,
+  ) -> (u64, [u8; 32], VolumeId) {
+    let mut announced = None;
+    let ran = spawn_as_ephemeral_consumer(
+      client,
+      secret,
+      current_account(),
+      &workload(instance, keep),
+      &[(
+        OsStr::new(WORKLOAD_ROLE),
+        OsStr::new(if keep { "kept" } else { "mine" }),
+      )],
+      |consumer| announced = Some(consumer),
+    )
+    .unwrap();
+    let text = String::from_utf8_lossy(&ran.output).into_owned();
+    assert_eq!(ran.exit, Some(0), "the workload:\n{text}");
+    assert_eq!(announced, Some(ran.consumer), "announced before the spawn");
+    assert_eq!(
+      line_after(&text, "consumer: ").parse::<u64>().unwrap(),
+      ran.consumer,
+      "the workload ran as the consumer the core enrolled"
+    );
+    let capability = unhex32(line_after(&text, "capability: "));
+    let volume = parse_volume_id(line_after(&text, "volume: ")).unwrap();
+    (ran.consumer, capability, volume)
+  }
+
+  /// AC-2.13 / T-2.15 through the harness verb's core (§4.12 CLI, §4.13 "the harness owns process
+  /// isolation and capability delivery"): the core enrolls a consumer, delivers its capability to the
+  /// workload — this binary re-invoked — on the one inherited descriptor, announces it, waits, and
+  /// revokes it: the workload ran as that consumer (its own report), the volume it made is the
+  /// consumer's (the account is refused `Forbidden` on it), and the enrollment is gone afterwards (a
+  /// fresh client attesting with the workload's capability is refused `ConsumerRevoked`); with the
+  /// enrollment kept, the same attest binds.
+  #[test]
+  fn run_spawns_the_workload_as_an_ephemeral_consumer_and_revokes_it_after() {
+    let profile = crate::daemon::measure(true);
+    let instance = format!("cli-run-{}", std::process::id());
+    let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+    let daemon = Daemon::start(
+      &profile,
+      config,
+      SegmentSource::Create {
+        name: "slates-seg-cli-run".to_owned(),
+      },
+    )
+    .unwrap();
+    let secret = daemon.segment().issuer_secret().unwrap();
+    let mut human = connect_retrying(&instance);
+
+    let (consumer, capability, volume) = run_once(&mut human, &secret, &instance, false);
+    assert!(
+      matches!(
+        human.status(volume),
+        Err(ClientError::Refused(Refusal::Forbidden { .. }))
+      ),
+      "the workload's volume is the consumer's, not the account's"
+    );
+    let mut later = connect_retrying(&instance);
+    assert!(
+      matches!(
+        later.attest(consumer, &capability),
+        Err(ClientError::Refused(Refusal::ConsumerRevoked))
+      ),
+      "the ephemeral enrollment is revoked once the workload ends"
+    );
+
+    let (kept, capability, _) = run_once(&mut human, &secret, &instance, true);
+    assert_ne!(kept, consumer, "a fresh enrollment per run");
+    later
+      .attest(kept, &capability)
+      .expect("a kept enrollment outlives the workload");
+    assert_eq!(later.consumer(), Some(kept));
+    daemon.stop();
+  }
 }
 
 #[cfg(test)]

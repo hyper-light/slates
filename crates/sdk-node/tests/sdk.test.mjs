@@ -132,12 +132,15 @@ test('lifecycle round trip over a live daemon', async (t) => {
     // resize → a larger bound succeeds.
     client.resize(volume, 2 * VOLUME_BYTES);
 
-    // destroy → the volume is gone from a later list.
+    // destroy → the volume is gone from a later list. The teardown runs in slices after the reply
+    // (§4.4; measured 54–302 µs after it, 2026-09-14), so the list is polled within the startup
+    // budget, as the Rust client test does.
     client.destroy(volume);
-    assert.ok(
-      client.list().every((v) => v.id !== volume),
-      'the destroyed volume is gone from list',
-    );
+    const goneBy = Date.now() + STARTUP_MS;
+    while (client.list().some((v) => v.id === volume)) {
+      assert.ok(Date.now() < goneBy, 'the destroyed volume is gone from list');
+      await sleep(POLL_MS);
+    }
 
     // merge workflow (§4.16): a green, a work over it, a content edit, a clean submit.
     const green = client.createGreen('g-node-roundtrip');

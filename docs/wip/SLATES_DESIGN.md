@@ -2433,6 +2433,22 @@ that the current uid-based implementation enforces them.
 > list, and the harness-owned delivery of the capability (an inherited descriptor is the
 > recommendation). Record: `docs/wip/enrollment.md`.
 
+> **Status (2026-09-14).** The harness delivery channel is built, as the inherited descriptor
+> (`agent/consumer-capability`: `1e81737`, `2a9d2ac`, `762bc91`): a harness writes the consumer id and
+> the capability, under a magic and a CRC32C, into a pipe both of whose ends are close-on-exec and
+> spawns the workload so that this child alone inherits the read end (the flag cleared in the forked
+> child, never in the parent; on Windows a `CreateProcessW` handle list, since the standard library
+> cannot restrict inheritance); the child is told which descriptor by a number in `SLATES_CONSUMER_FD`,
+> takes the record exactly once (kind checked, read without blocking, checksum before decode, closed
+> and zeroed), and `Client::connect` binds the channel with `Attest` before any verb — a present but
+> unusable delivery refuses typed rather than falling to the account's authority; a client holding the
+> capability binds again by itself after a daemon restart before its retried verb. `slates run -- CMD`
+> is the harness verb (an enrollment for the command's lifetime, revoked after unless kept), with
+> `enroll`, `revoke` and `share`. Proven across real processes: the workload holds the capability in no
+> argument or environment value and owns what it creates; a sibling without the delivery is the
+> account; the Windows arm runs in the CI lanes. Owed: the SDKs' own spawn helpers, the fleet leg, MCP
+> roots, and the Linux issuer surface. Record: `docs/wip/enrollment.md` (2026-09-14 section).
+
 *Content identity and sharing.* A chunk hash proves bytes, not permission to read them or ask
 whether they exist. Missing-set exchange, caches, archives and dedup obey the consumer's
 sharing scope and reference authorization; cross-scope existence and timing must not reveal

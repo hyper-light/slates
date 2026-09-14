@@ -121,12 +121,16 @@ class SlatesAsyncRoundTrip(unittest.TestCase):
             # await resize → a larger bound; a unit verb resolves to None.
             self.assertIsNone(await client.resize(volume, 2 * VOLUME_BYTES))
 
-            # await destroy → the volume is gone from a later list; resolves to None.
+            # await destroy → the volume is gone from a later list; resolves to None. The teardown
+            # runs in slices after the reply (§4.4; measured 54–302 µs after it, 2026-09-14), so the
+            # list is polled within the startup budget, as the Rust client test does.
             self.assertIsNone(await client.destroy(volume))
-            after = await client.list()
-            self.assertTrue(
-                all(v["id"] != volume for v in after), "the destroyed volume is gone from the list"
-            )
+            gone_by = time.monotonic() + STARTUP_SECS
+            while any(v["id"] == volume for v in await client.list()):
+                self.assertLess(
+                    time.monotonic(), gone_by, "the destroyed volume is gone from the list"
+                )
+                await asyncio.sleep(POLL_SECS)
 
             # Concurrency: many creates awaited at once, each its own reply — the multiplexing an async
             # client relies on (one reader serves them all, replies matched to requests by id).

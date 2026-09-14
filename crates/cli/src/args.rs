@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use slates_client::{GrantScope, GreenBase, Intent, NamePolicy, ReadAt, SizeClass};
+use slates_client::{GrantScope, GreenBase, Intent, NamePolicy, ReadAt, Rights, SizeClass};
 
 use crate::format::{parse_size, parse_snapshot, parse_volume_id};
 
@@ -45,6 +45,10 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   grants [--json]
   grant LANDING MANIFEST [--session] [--term SECONDS] [--json]   approve a presented landing
   audit [--since N] [--json]
+  enroll [--account UID] [--json]                  enroll a consumer; its capability is shown once
+  revoke CONSUMER [--json]                         revoke a consumer's enrollment
+  share ID PRINCIPAL [--read] [--write] [--admin] [--json]   set a principal's rights on a volume
+  run [--keep] [--json] -- CMD [ARG ...]           run CMD as a consumer enrolled for its lifetime
   exec --volume V --at PATH -- CMD [ARG ...]        run CMD with the volume at PATH
 ";
 
@@ -52,7 +56,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
 pub(crate) const USAGE_NOTES: &str =
   "SIZE is bytes with a binary unit: 512MiB, 4GiB (B, KiB, MiB, GiB, TiB).
 The instance is --instance, else SLATES_ENDPOINT, else `default`.
-Exit codes: 0 done, 1 refused, 2 usage, 3 no daemon, 4 failed.
+Exit codes: 0 done, 1 refused, 2 usage, 3 no daemon, 4 failed; `run` exits as its command did.
+PRINCIPAL is uid:N, consumer:N (under your account) or consumer:ACCOUNT/N.
 --json emits machine-readable JSON on every client verb (the MCP schema), except `base read` which
 streams raw bytes. Ids come back as `{\"id\"}`, an outcome-only verb as `{\"ok\":true}`.";
 
@@ -365,6 +370,41 @@ pub(crate) enum Verb {
     /// The grant's validity, nanoseconds from issue.
     term_ns: u64,
   },
+  /// Enroll a consumer under an account (`enroll`): the human surface's verb, proven under the
+  /// anchor's issuer secret (§4.13 "Principals"); the capability is shown once.
+  Enroll {
+    /// The account, or the caller's own when none is given.
+    account: Option<u32>,
+  },
+  /// Revoke a consumer's enrollment (`revoke CONSUMER`): the human surface's verb.
+  Revoke {
+    /// The consumer.
+    consumer: u64,
+  },
+  /// Set a principal's rights on a volume (`share ID PRINCIPAL [--read] [--write] [--admin]`).
+  Share {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The principal.
+    principal: SharePrincipal,
+    /// The rights; all off removes the entry.
+    rights: Rights,
+  },
+}
+
+/// A principal as `share` names it: a host account (`uid:N`), or a consumer — under the caller's own
+/// account (`consumer:N`) or an explicit one (`consumer:ACCOUNT/N`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SharePrincipal {
+  /// A host account.
+  Uid(u32),
+  /// An enrolled consumer.
+  Consumer {
+    /// The account, or the caller's own when none is given.
+    account: Option<u32>,
+    /// The consumer id.
+    consumer: u64,
+  },
 }
 
 /// Derived: a grant's default validity, in nanoseconds — one hour, the span §4.15's session scope
@@ -395,11 +435,27 @@ pub(crate) struct ExecRequest {
   pub command: Vec<String>,
 }
 
+/// A `slates run` request: the harness verb (§4.13) — enroll a consumer, deliver its capability to
+/// the command on an inherited descriptor, wait, and revoke it unless kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RunRequest {
+  /// The instance the command's client will find (`SLATES_ENDPOINT` in its environment).
+  pub instance: String,
+  /// Keep the enrollment after the command ends (default: revoke it).
+  pub keep: bool,
+  /// Announce the consumer as JSON.
+  pub json: bool,
+  /// The command and its arguments.
+  pub command: Vec<String>,
+}
+
 /// The parsed command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Command {
   /// The launcher.
   Exec(ExecRequest),
+  /// The harness verb.
+  Run(RunRequest),
   /// The anchor.
   Anchor(ProcessOptions),
   /// The daemon.
@@ -433,6 +489,7 @@ const VALUES: &[&str] = &[
   "--evidence",
   "--version",
   "--attachment",
+  "--account",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
@@ -442,22 +499,45 @@ const SWITCHES: &[&str] = &[
   "--locked",
   "--read",
   "--write",
+  "--admin",
   "--drift",
   "--mirror",
   "--session",
   "--require-evidence",
+  "--keep",
 ];
 
-/// Parses `exec --volume V --at PATH -- CMD ...`: the flags before `--`, the command after it.
-fn parse_exec(rest: &[String]) -> Result<Command, ParseError> {
-  let split = rest.iter().position(|a| a == "--");
-  let (head, command) = match split {
-    Some(i) => (&rest[..i], rest[i + 1..].to_vec()),
-    None => return Err(ParseError::Missing("`--` then the command")),
+/// Splits `rest` at `--`: the flags before it, the command after it (`exec` and `run` share it).
+fn split_at_command(rest: &[String]) -> Result<(&[String], Vec<String>), ParseError> {
+  let Some(split) = rest.iter().position(|a| a == "--") else {
+    return Err(ParseError::Missing("`--` then the command"));
   };
+  let command = rest[split + 1..].to_vec();
   if command.is_empty() {
     return Err(ParseError::Missing("a command after `--`"));
   }
+  Ok((&rest[..split], command))
+}
+
+/// Parses `run [--keep] [--json] [--instance NAME] -- CMD ...`.
+fn parse_run(rest: &[String]) -> Result<Command, ParseError> {
+  let (head, command) = split_at_command(rest)?;
+  let taken = take(head)?;
+  taken.only(&Spec {
+    values: &[],
+    switches: &["--keep"],
+  })?;
+  Ok(Command::Run(RunRequest {
+    instance: taken.instance(),
+    keep: taken.switch("--keep"),
+    json: taken.json(),
+    command,
+  }))
+}
+
+/// Parses `exec --volume V --at PATH -- CMD ...`: the flags before `--`, the command after it.
+fn parse_exec(rest: &[String]) -> Result<Command, ParseError> {
+  let (head, command) = split_at_command(rest)?;
   let taken = take(head)?;
   taken.only(&Spec {
     values: &["--volume", "--at"],
@@ -683,6 +763,80 @@ fn number(text: &str) -> Result<u64, ParseError> {
   })
 }
 
+fn account(text: &str) -> Result<u32, ParseError> {
+  text.parse().map_err(|_| ParseError::BadValue {
+    what: "an account (uid)",
+    reason: text.to_owned(),
+  })
+}
+
+/// `uid:N`, `consumer:N` or `consumer:ACCOUNT/N`.
+fn share_principal(text: &str) -> Result<SharePrincipal, ParseError> {
+  let bad = || ParseError::BadValue {
+    what: "PRINCIPAL",
+    reason: format!("{text} (uid:N, consumer:N or consumer:ACCOUNT/N)"),
+  };
+  let (kind, value) = text.split_once(':').ok_or_else(bad)?;
+  match kind {
+    "uid" => Ok(SharePrincipal::Uid(account(value).map_err(|_| bad())?)),
+    "consumer" => match value.split_once('/') {
+      Some((owner, consumer)) => Ok(SharePrincipal::Consumer {
+        account: Some(account(owner).map_err(|_| bad())?),
+        consumer: number(consumer).map_err(|_| bad())?,
+      }),
+      None => Ok(SharePrincipal::Consumer {
+        account: None,
+        consumer: number(value).map_err(|_| bad())?,
+      }),
+    },
+    _ => Err(bad()),
+  }
+}
+
+/// The verbs of the enrollment surface (§4.13): `enroll`, `revoke`, `share`.
+fn parse_enrollment(taken: &Taken, words: &[&str]) -> Result<Option<Command>, ParseError> {
+  match words {
+    ["enroll"] => {
+      taken.only(&Spec {
+        values: &["--account"],
+        switches: &[],
+      })?;
+      let account = taken.value("--account").map(account).transpose()?;
+      Ok(Some(client(taken, Verb::Enroll { account })))
+    }
+    ["revoke", consumer] => {
+      taken.only(&NONE)?;
+      Ok(Some(client(
+        taken,
+        Verb::Revoke {
+          consumer: number(consumer)?,
+        },
+      )))
+    }
+    ["share", id, principal] => {
+      taken.only(&Spec {
+        values: &[],
+        switches: &["--read", "--write", "--admin"],
+      })?;
+      Ok(Some(client(
+        taken,
+        Verb::Share {
+          volume: volume(id)?,
+          principal: share_principal(principal)?,
+          rights: Rights {
+            read: taken.switch("--read"),
+            write: taken.switch("--write"),
+            admin: taken.switch("--admin"),
+          },
+        },
+      )))
+    }
+    ["revoke"] => Err(ParseError::Missing("CONSUMER")),
+    ["share", ..] => Err(ParseError::Missing("share ID PRINCIPAL")),
+    _ => Ok(None),
+  }
+}
+
 fn paths(words: &[String]) -> Option<Vec<String>> {
   if words.is_empty() {
     None
@@ -801,8 +955,14 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
   if arguments.first().map(String::as_str) == Some("exec") {
     return parse_exec(&arguments[1..]);
   }
+  if arguments.first().map(String::as_str) == Some("run") {
+    return parse_run(&arguments[1..]);
+  }
   let taken = take(arguments)?;
   let words: Vec<&str> = taken.words.iter().map(String::as_str).collect();
+  if let Some(command) = parse_enrollment(&taken, &words)? {
+    return Ok(command);
+  }
   match words.as_slice() {
     [] => Err(ParseError::Help),
     ["anchor" | "daemon"] => {
@@ -1083,7 +1243,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
     [verb, rest @ ..]
       if matches!(
         *verb,
-        "anchor" | "daemon" | "profile" | "mcp" | "attach" | "detach" | "status"
+        "anchor" | "daemon" | "profile" | "mcp" | "attach" | "detach" | "status" | "enroll"
       ) =>
     {
       Err(ParseError::Extra(
@@ -1550,6 +1710,96 @@ mod tests {
       Err(ParseError::Extra("extra".into()))
     );
     assert_eq!(parse(&[]), Err(ParseError::Help));
+  }
+
+  /// The verb a client-verb text parses to.
+  fn client_verb(text: &str) -> Verb {
+    let Command::Client(request) = parse(&args(text)).unwrap() else {
+      panic!("client");
+    };
+    request.verb
+  }
+
+  /// The enrollment surface (§4.13): `enroll` with or without an account, `revoke`, and `share` with
+  /// a principal in each of its three forms and any rights; a bad principal and a missing consumer
+  /// are refused.
+  #[test]
+  fn the_grammar_parses_the_enrollment_verbs() {
+    assert_eq!(client_verb("enroll"), Verb::Enroll { account: None });
+    assert_eq!(
+      client_verb("enroll --account 501 --json"),
+      Verb::Enroll { account: Some(501) }
+    );
+    assert_eq!(client_verb("revoke 7"), Verb::Revoke { consumer: 7 });
+    let id = "00000000000000000000000000000001";
+    let vid = parse_volume_id(id).unwrap();
+    let share = |principal: SharePrincipal, rights: Rights| Verb::Share {
+      volume: vid,
+      principal,
+      rights,
+    };
+    assert_eq!(
+      client_verb(&format!("share {id} consumer:7 --read")),
+      share(
+        SharePrincipal::Consumer {
+          account: None,
+          consumer: 7,
+        },
+        Rights {
+          read: true,
+          write: false,
+          admin: false,
+        },
+      )
+    );
+    assert_eq!(
+      client_verb(&format!("share {id} consumer:501/7 --write --admin")),
+      share(
+        SharePrincipal::Consumer {
+          account: Some(501),
+          consumer: 7,
+        },
+        Rights {
+          read: false,
+          write: true,
+          admin: true,
+        },
+      )
+    );
+    assert_eq!(
+      client_verb(&format!("share {id} uid:501")),
+      share(SharePrincipal::Uid(501), Rights::default())
+    );
+    assert!(matches!(
+      parse(&args(&format!("share {id} nobody:1"))),
+      Err(ParseError::BadValue {
+        what: "PRINCIPAL",
+        ..
+      })
+    ));
+    assert_eq!(parse(&args("revoke")), Err(ParseError::Missing("CONSUMER")));
+  }
+
+  /// `run` splits at `--` with its switches before it; a missing `--` or an empty command is refused.
+  #[test]
+  fn run_splits_the_switches_from_the_command() {
+    assert_eq!(
+      parse(&args("run --instance x --keep --json -- sh -c true")),
+      Ok(Command::Run(RunRequest {
+        instance: "x".into(),
+        keep: true,
+        json: true,
+        command: vec!["sh".into(), "-c".into(), "true".into()],
+      }))
+    );
+    assert!(matches!(
+      parse(&args("run -- ")),
+      Err(ParseError::Missing("a command after `--`"))
+    ));
+    assert!(matches!(
+      parse(&args("run sh")),
+      Err(ParseError::Missing("`--` then the command"))
+    ));
   }
 
   /// `exec` splits at `--`: the flags before it, the command after; a missing `--` or an empty

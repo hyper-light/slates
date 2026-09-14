@@ -17,7 +17,8 @@
 //!
 //! Modules: [`protocol`] (the bodies and their framing), [`slot`] (the slot and the ring), [`region`] (the client region's layout over a
 //! shared object), [`wake`] (the wake word per OS), [`rendezvous`] (per OS), [`endpoint`]
-//! (the daemon's and the client's ends), [`error`].
+//! (the daemon's and the client's ends), [`delivery`] (the harness delivery channel of a consumer's
+//! capability, §4.13: an inherited descriptor), [`error`].
 
 /// The client-side completion bridge for platforms whose rendezvous passes no completion fd (macOS
 /// and Windows): a thread that makes a client-local descriptor readable when an armed reply lands,
@@ -25,6 +26,7 @@
 /// Linux uses the rendezvous eventfd instead.
 #[cfg(any(target_os = "macos", windows))]
 pub mod completion;
+pub mod delivery;
 pub mod endpoint;
 pub mod error;
 pub mod protocol;
@@ -34,6 +36,7 @@ pub mod rendezvous;
 pub mod slot;
 pub mod wake;
 
+pub use delivery::{Capability, Delivered, Delivery, DeliveryFault};
 pub use endpoint::{ClientEnd, DaemonEnd, Reply, Request};
 pub use error::IpcError;
 pub use region::{ClientRegion, RegionGeometry};

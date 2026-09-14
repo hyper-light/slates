@@ -120,8 +120,33 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
       .unwrap_or(0),
     config.runtime.shards
   );
+  announce_issuer_surface(&supervisor);
   observe(&mut supervisor, &mut clock, now)
 }
+
+/// The issuer surface (§4.13 "Grants"; `slates grant`, `enroll`, `revoke`, `run`): a command that
+/// attaches this segment from its environment proves the human's authority under the issuer secret
+/// the daemon publishes there. On macOS and Windows the handoff is the object's name — the object's
+/// mode and per-user name are the authentication, so any process of this user may open it — and it is
+/// printed for the anchor's shell to export.
+#[cfg(not(target_os = "linux"))]
+fn announce_issuer_surface(supervisor: &Supervisor) {
+  if let Ok(handoff) = supervisor.segment().handoff_env() {
+    let exports: Vec<String> = handoff
+      .iter()
+      .map(|(name, value)| format!("{name}={value}"))
+      .collect();
+    eprintln!(
+      "slates anchor: issuer surface: export {}",
+      exports.join(" ")
+    );
+  }
+}
+
+/// On Linux the handoff is a descriptor (a memfd) only this process's children hold; there is
+/// nothing a shell could export, so nothing is printed.
+#[cfg(target_os = "linux")]
+fn announce_issuer_surface(_supervisor: &Supervisor) {}
 
 /// The observation loop.
 fn observe(

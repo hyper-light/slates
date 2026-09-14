@@ -541,12 +541,10 @@ pub fn revoke_proof(
 /// is bound at rendezvous using a capability delivered and retained outside other agents' reach"): the
 /// keyed hash, under the consumer's secret capability, of the client id the daemon assigned this channel
 /// — so a proof captured from one session cannot bind another (the id differs), and the capability itself
-/// never crosses the ring.
-pub fn attest_proof(consumer_secret: &[u8; 32], client_id: u32) -> [u8; 32] {
-  let mut hasher = blake3::Hasher::new_keyed(consumer_secret);
-  hasher.update(&client_id.to_le_bytes());
-  *hasher.finalize().as_bytes()
-}
+/// never crosses the ring. Defined once, beside the delivery channel the workload takes the capability
+/// from (`slates_ipc::delivery`), so the workload's proof and this daemon's check are one formula; the
+/// golden vector below pins it.
+pub use slates_ipc::delivery::attest_proof;
 
 /// Whether two proofs are equal, visiting every byte whatever the first difference (no early exit), so
 /// the comparison's time does not depend on how much of a forged proof happened to match.

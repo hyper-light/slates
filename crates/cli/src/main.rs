@@ -58,6 +58,7 @@ fn main() -> ExitCode {
   let json = match &command {
     Command::Client(request) => request.json,
     Command::Profile(options) => options.json,
+    Command::Run(request) => request.json,
     _ => false,
   };
   let outcome = match command {
@@ -67,6 +68,7 @@ fn main() -> ExitCode {
     Command::Mcp(options) => verbs::mcp(&options),
     Command::Client(request) => verbs::run(&request),
     Command::Exec(request) => run_exec(&request),
+    Command::Run(request) => verbs::run_consumer(&request),
   };
   match outcome {
     Ok(()) => ExitCode::SUCCESS,
@@ -79,10 +81,21 @@ fn main() -> ExitCode {
 /// prose on stderr — GAP-A9-10 "consistent JSON errors"); otherwise the plain `slates: …` text. The
 /// exit code — 1 refused, 3 no daemon, 4 failed — is the same either way, so a script can key on it.
 fn report_failure(failure: &Failure, json: bool) -> ExitCode {
+  // The workload's own exit is passed through as it was, and nothing is printed: its output was
+  // its own. A code no process exit carries on this platform is reported as a failure.
+  if let Failure::ChildExited { code } = failure {
+    return match u8::try_from(*code) {
+      Ok(code) => ExitCode::from(code),
+      Err(_) => {
+        eprintln!("slates: the command exited with code {code}");
+        ExitCode::from(EXIT_FAILED)
+      }
+    };
+  }
   let (code, kind) = match failure {
     Failure::Refused(_) => (EXIT_REFUSED, "refused"),
     Failure::Unavailable { .. } => (EXIT_UNAVAILABLE, "unavailable"),
-    Failure::Failed(_) => (EXIT_FAILED, "failed"),
+    Failure::Failed(_) | Failure::ChildExited { .. } => (EXIT_FAILED, "failed"),
   };
   if json {
     let message = match failure {
@@ -90,6 +103,7 @@ fn report_failure(failure: &Failure, json: bool) -> ExitCode {
       Failure::Unavailable { instance, cause } => {
         format!("no daemon at instance {instance}: {cause}")
       }
+      Failure::ChildExited { code } => format!("the command exited with code {code}"),
     };
     eprintln!(
       "{}",
@@ -104,6 +118,7 @@ fn report_failure(failure: &Failure, json: bool) -> ExitCode {
         );
       }
       Failure::Failed(text) => eprintln!("slates: {text}"),
+      Failure::ChildExited { code } => eprintln!("slates: the command exited with code {code}"),
     }
   }
   ExitCode::from(code)
@@ -139,4 +154,9 @@ pub(crate) enum Failure {
   },
   /// The command itself failed (the anchor or the daemon).
   Failed(String),
+  /// The workload `slates run` spawned ended with this code, which `run` exits with as it was.
+  ChildExited {
+    /// The workload's exit code.
+    code: i32,
+  },
 }

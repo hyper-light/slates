@@ -135,6 +135,10 @@ slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--
 slates grants [--json]
 slates grant LANDING MANIFEST [--session] [--term SECONDS] [--json]
 slates audit [--since N] [--json]
+slates enroll [--account UID] [--json]
+slates revoke CONSUMER [--json]
+slates share ID PRINCIPAL [--read] [--write] [--admin] [--json]
+slates run [--keep] [--json] -- CMD [ARG ...]
 slates exec --volume V --at PATH -- CMD [ARG ...]
 slates attach ID [--read | --write] [--snapshot N] [--json]
 slates detach ATTACHMENT [--json]
@@ -203,7 +207,26 @@ not verify (a forged, replayed or modified-plan approval) is refused `GrantIssue
 counted; the MCP server and the SDKs carry no proof by construction and are refused by kind.
 Passing `--grant N` to `land` then consumes the grant; the landing must present the same manifest.
 Neither a control-channel label nor the caller's uid is proof of human approval — only the secret
-is, and only the anchor's user maps it.
+is, and only the anchor's user maps it. `slates anchor` prints the variables to export for that
+(`slates anchor: issuer surface: export SLATES_ANCHOR=… SLATES_ANCHOR_LEN=…`) on macOS and Windows,
+where the segment is a named object of the user; on Linux it is a descriptor only the anchor's
+children hold.
+
+`slates run [--keep] [--json] -- CMD [ARG ...]` is the harness verb of §4.13: it runs `CMD` as a
+consumer enrolled for the command's lifetime. The command's own `slates` client (the CLI, an SDK, the
+MCP server) finds the capability on an inherited descriptor named by `SLATES_CONSUMER_FD` and binds its
+channel to the consumer before any verb — the capability is never in an argument, never in the
+environment, never printed — so what it creates is the consumer's, and the account (or another
+consumer) is refused on it until `share` says otherwise. `run` announces the consumer first
+(`consumer: N`, or `{"consumer": N}` under `--json`) so a human can `share` volumes with it while it
+runs, then hands the command the terminal and exits as the command exited; the enrollment is revoked
+when the command ends unless `--keep`. `slates enroll [--account UID]` enrolls a consumer and shows its
+capability once — for a harness that delivers it by its own means (`Delivery` in `slates-ipc`; the SDKs'
+`pass_fds`/`stdio`/`handle_list` spawns); `slates revoke CONSUMER` ends an enrollment (every later verb
+from its channels refuses `ConsumerRevoked`); `slates share ID PRINCIPAL [--read] [--write] [--admin]`
+sets a principal's rights on a volume (`uid:N`, `consumer:N` under your account, or
+`consumer:ACCOUNT/N`; no switch removes the entry). `enroll`, `revoke` and `run` are the anchor user's
+surface like `grant` and need its variables; `share` is the volume owner's.
 
 ## Planned interface corrections
 

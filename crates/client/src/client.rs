@@ -6,13 +6,14 @@ use std::os::fd::RawFd;
 use std::os::windows::io::RawSocket;
 use std::time::Instant;
 
+use slates_ipc::delivery::{Capability, Delivered, DeliveryFault, attest_proof};
 use slates_ipc::protocol::{
   AuditEntry, DaemonReport, Direction, Filter, GrantScope, GrantSummary, GreenBase, Intent,
-  LandingOutcome, LandingSummary, MergeWindow, NamePolicy, ReadAt, ReplyBody, RequestBody, Scope,
-  SizeClass, SnapshotId, StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp, pack,
-  unpack,
+  LandingOutcome, LandingSummary, MergeWindow, NamePolicy, Principal, ReadAt, ReplyBody,
+  RequestBody, Rights, Scope, SizeClass, SnapshotId, StatusReport, TelemetryReport, VolumeId,
+  VolumeSummary, WorkOp, pack, unpack,
 };
-use slates_ipc::{ClientEnd, IpcError, connect_as};
+use slates_ipc::{ClientEnd, Connected, IpcError, connect_as};
 use slates_machine::{Derived, derived};
 use slates_wire::request::RequestId;
 
@@ -161,6 +162,15 @@ pub struct Client {
   /// deferred verb) or unawaited (an acknowledgement) do not block another request's. Bounded — an
   /// overflow drops the oldest, which can only be an unawaited reply, never one still in flight.
   pending: Vec<(u64, ReplyBody)>,
+  /// The consumer this channel is bound to (§4.13) — taken from the harness's delivery at connect, or
+  /// attested by the caller — kept so the client binds again on its own after a daemon restart: a
+  /// reconnected channel is the account's until it attests, and a retried verb must never run as the
+  /// account.
+  consumer: Option<Delivered>,
+  /// Whether the current channel is bound to `consumer` (false right after a reconnect).
+  bound: bool,
+  /// Bindings made again after a reconnect (a non-vacuity counter for the restart tests).
+  rebinds: u64,
 }
 
 fn ack_every_of(end: &ClientEnd) -> u32 {
@@ -181,6 +191,8 @@ impl std::fmt::Debug for Client {
       .field("client_id", &self.client_id)
       .field("sequence", &self.sequence)
       .field("reconnects", &self.reconnects)
+      .field("consumer", &self.consumer.as_ref().map(|d| d.consumer))
+      .field("bound", &self.bound)
       .finish()
   }
 }
@@ -386,52 +398,115 @@ fn extract_landed(body: ReplyBody) -> Result<Landing, ClientError> {
   }
 }
 
+/// The capability the harness delivered to this process, if it was spawned as a consumer (§4.13;
+/// `slates_ipc::delivery`): none when the delivery variable is absent — the process is the account's
+/// own client — and a typed refusal when it is present but unusable, so a broken delivery never
+/// degrades into the account's ambient authority.
+fn delivered_capability() -> Result<Option<Delivered>, ClientError> {
+  match slates_ipc::delivery::delivered() {
+    Ok(delivered) => Ok(Some(delivered.clone())),
+    Err(IpcError::CapabilityNotDelivered {
+      fault: DeliveryFault::Absent,
+    }) => Ok(None),
+    Err(e) => Err(ClientError::Ipc(e)),
+  }
+}
+
 impl Client {
-  /// Connects to `instance` as a new client.
+  /// Connects to `instance` as a new client. A process spawned as a consumer — its capability
+  /// delivered on the inherited descriptor (§4.13, `slates_ipc::delivery`) — binds the channel to
+  /// that consumer before returning, so nothing runs on it as the account; a process without a
+  /// delivery is the account's client.
   pub fn connect(instance: &str, deadlines: Deadlines) -> Result<Client, ClientError> {
+    let delivered = delivered_capability()?;
     let connected = connect_as(instance, 0)?;
-    let client_id = connected.region.client_id();
-    let end = ClientEnd::connected(connected);
-    let ack_every = ack_every_of(&end);
-    Ok(Client {
-      instance: instance.to_owned(),
-      end,
-      client_id,
-      sequence: 0,
-      deadlines,
-      reconnects: 0,
-      acknowledged: 0,
-      ack_every,
-      pending: Vec::new(),
-    })
+    let mut client = Client::over(instance, connected, 0, deadlines);
+    client.bind_delivered(delivered)?;
+    Ok(client)
   }
 
   /// Resumes a session: connects under its client id (refused `SessionTaken` when a live
   /// client holds it) and continues its sequence, so a retry of what it had in flight meets
-  /// the completion record (§4.9).
+  /// the completion record (§4.9). A delivered capability binds the resumed channel as
+  /// [`Client::connect`] does — a restarted workload is spawned with its own delivery.
   pub fn resume(
     instance: &str,
     session: Session,
     deadlines: Deadlines,
   ) -> Result<Client, ClientError> {
+    let delivered = delivered_capability()?;
     let connected = connect_as(instance, session.client_id)?;
     let assigned = connected.region.client_id();
     if assigned != session.client_id {
       return Err(ClientError::SessionTaken { assigned });
     }
+    let mut client = Client::over(
+      instance,
+      connected,
+      session.next_sequence.saturating_sub(1),
+      deadlines,
+    );
+    client.bind_delivered(delivered)?;
+    Ok(client)
+  }
+
+  /// A client over a fresh rendezvous, its sequence at `sequence` (the last used).
+  fn over(instance: &str, connected: Connected, sequence: u32, deadlines: Deadlines) -> Client {
+    let client_id = connected.region.client_id();
     let end = ClientEnd::connected(connected);
     let ack_every = ack_every_of(&end);
-    Ok(Client {
+    Client {
       instance: instance.to_owned(),
       end,
-      client_id: session.client_id,
-      sequence: session.next_sequence.saturating_sub(1),
+      client_id,
+      sequence,
       deadlines,
       reconnects: 0,
       acknowledged: 0,
       ack_every,
       pending: Vec::new(),
-    })
+      consumer: None,
+      bound: false,
+      rebinds: 0,
+    }
+  }
+
+  /// Binds the channel to the delivered consumer, when there is one.
+  fn bind_delivered(&mut self, delivered: Option<Delivered>) -> Result<(), ClientError> {
+    match delivered {
+      Some(delivered) => self.attest(delivered.consumer, &delivered.capability),
+      None => Ok(()),
+    }
+  }
+
+  /// Binds this channel to `consumer` with its capability (§4.13 `Attest`): the proof is keyed over
+  /// this channel's client id, so nothing captured from another session binds it. On success the
+  /// channel's principal is the consumer for every later verb — and, holding the capability, the
+  /// client binds again by itself after a daemon restart, before any retried verb runs. Refused
+  /// `ConsumerNotEnrolled` (no such consumer, or the capability is wrong) or `ConsumerRevoked`.
+  pub fn attest(&mut self, consumer: u64, capability: &Capability) -> Result<(), ClientError> {
+    let proof = attest_proof(capability, self.client_id);
+    match self.call(&RequestBody::Attest { consumer, proof })? {
+      ReplyBody::Attested => {
+        self.consumer = Some(Delivered {
+          consumer,
+          capability: *capability,
+        });
+        self.bound = true;
+        Ok(())
+      }
+      _ => Err(ClientError::UnexpectedReply { verb: "attest" }),
+    }
+  }
+
+  /// The consumer this channel is bound to, if any (§4.13); the account's client has none.
+  pub fn consumer(&self) -> Option<u64> {
+    self.consumer.as_ref().map(|delivered| delivered.consumer)
+  }
+
+  /// Bindings made again after a reconnect so far (the non-vacuity counter of the restart path).
+  pub fn rebinds(&self) -> u64 {
+    self.rebinds
   }
 
   /// The client id the daemon bound to this principal.
@@ -499,35 +574,88 @@ impl Client {
     self.exchange(id, body)
   }
 
-  /// One request, one reply; a stalled reply from a gone daemon becomes a reconnect and a
-  /// resend under the same id.
+  /// One request, one reply; a stalled reply from a gone daemon becomes a reconnect — the fresh
+  /// channel bound again to the consumer first, when the client holds one — and a resend under the
+  /// same id.
   fn exchange(&mut self, id: RequestId, body: &RequestBody) -> Result<ReplyBody, ClientError> {
     loop {
-      self.send(id, body)?;
-      match self.end.wait(Some(self.deadlines.reply_ns)) {
-        Ok(reply) => {
-          if reply.request != id.word() {
-            return Err(ClientError::UnexpectedReply {
-              verb: "another request's reply",
-            });
-          }
-          let decoded: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
-          return match decoded {
-            ReplyBody::Refused { refusal } => Err(ClientError::Refused(refusal)),
-            other => Ok(other),
-          };
-        }
-        Err(IpcError::DeadlineExceeded) => {
-          if self.end.daemon_gone() {
-            self.reconnect()?;
-          } else {
-            return Err(ClientError::Stalled {
-              after_ns: self.deadlines.reply_ns,
-            });
-          }
-        }
-        Err(e) => return Err(ClientError::Ipc(e)),
+      self.rebind_if_needed()?;
+      if let Some(reply) = self.round_trip(id, body)? {
+        return resolved(reply);
       }
+    }
+  }
+
+  /// The binding a reconnected channel still needs: the consumer and the proof for this channel.
+  fn pending_bind(&self) -> Option<(u64, [u8; 32])> {
+    if self.bound {
+      return None;
+    }
+    self.consumer.as_ref().map(|delivered| {
+      (
+        delivered.consumer,
+        attest_proof(&delivered.capability, self.client_id),
+      )
+    })
+  }
+
+  /// After a reconnect the fresh channel's principal is the account's; a client holding a consumer
+  /// identity binds it again before any verb runs on the channel, so a retried verb never runs as
+  /// the account (§4.13). A refusal — the consumer revoked while the daemon was away — is final: the
+  /// verb is not sent.
+  fn rebind_if_needed(&mut self) -> Result<(), ClientError> {
+    while let Some((consumer, proof)) = self.pending_bind() {
+      let id = self.fresh_id();
+      match self.round_trip(id, &RequestBody::Attest { consumer, proof })? {
+        // The daemon went away again during the bind and the client reconnected: bind the newer channel.
+        None => {}
+        Some(ReplyBody::Attested) => {
+          self.bound = true;
+          self.rebinds += 1;
+        }
+        Some(ReplyBody::Refused { refusal }) => return Err(ClientError::Refused(refusal)),
+        Some(_) => return Err(ClientError::UnexpectedReply { verb: "attest" }),
+      }
+    }
+    Ok(())
+  }
+
+  /// The next request id.
+  fn fresh_id(&mut self) -> RequestId {
+    self.sequence = self.sequence.wrapping_add(1);
+    RequestId {
+      client: self.client_id,
+      sequence: self.sequence,
+    }
+  }
+
+  /// One send and one wait for `id`'s reply: the decoded reply, or `None` when the daemon was found
+  /// gone and the client reconnected instead (the caller binds and resends).
+  fn round_trip(
+    &mut self,
+    id: RequestId,
+    body: &RequestBody,
+  ) -> Result<Option<ReplyBody>, ClientError> {
+    if !self.send(id, body)? {
+      return Ok(None);
+    }
+    match self.end.wait(Some(self.deadlines.reply_ns)) {
+      Ok(reply) => {
+        if reply.request != id.word() {
+          return Err(ClientError::UnexpectedReply {
+            verb: "another request's reply",
+          });
+        }
+        Ok(Some(unpack(self.end.region(), reply.kind, &reply.payload)?))
+      }
+      Err(IpcError::DeadlineExceeded) if self.end.daemon_gone() => {
+        self.reconnect()?;
+        Ok(None)
+      }
+      Err(IpcError::DeadlineExceeded) => Err(ClientError::Stalled {
+        after_ns: self.deadlines.reply_ns,
+      }),
+      Err(e) => Err(ClientError::Ipc(e)),
     }
   }
 
@@ -547,13 +675,15 @@ impl Client {
   /// acknowledges by a sync [`Self::acknowledge`] between calls, or by `begin`-ing the ack body and
   /// dropping its reply.
   pub fn begin(&mut self, body: &RequestBody) -> Result<RequestId, ClientError> {
-    self.sequence = self.sequence.wrapping_add(1);
-    let id = RequestId {
-      client: self.client_id,
-      sequence: self.sequence,
-    };
-    self.send(id, body)?;
-    Ok(id)
+    let id = self.fresh_id();
+    loop {
+      // A reconnect on the way (the daemon found gone while the ring stayed full) leaves a fresh
+      // channel: bound again to the consumer, when the client holds one, before the request goes.
+      self.rebind_if_needed()?;
+      if self.send(id, body)? {
+        return Ok(id);
+      }
+    }
   }
 
   /// Takes the reply to `id` if it has arrived, without blocking. Replies for other requests drained
@@ -1142,8 +1272,9 @@ impl Client {
 
   /// Writes the request into the command ring, waiting on credit (the daemon drains the ring
   /// in microseconds; a ring that stays full past the reply deadline is a stalled or gone
-  /// daemon, handled as a stalled reply is).
-  fn send(&mut self, id: RequestId, body: &RequestBody) -> Result<(), ClientError> {
+  /// daemon, handled as a stalled reply is). `true` once written; `false` when the daemon was
+  /// found gone instead and the client reconnected (the caller binds and sends again).
+  fn send(&mut self, id: RequestId, body: &RequestBody) -> Result<bool, ClientError> {
     let started = Instant::now();
     loop {
       let index = self.end.next_request_index();
@@ -1155,7 +1286,7 @@ impl Client {
         body,
       )?;
       match self.end.send(&slot) {
-        Ok(()) => return Ok(()),
+        Ok(()) => return Ok(true),
         Err(IpcError::RingFull) => {
           if elapsed_ns(started) < self.deadlines.reply_ns {
             std::hint::spin_loop();
@@ -1163,11 +1294,11 @@ impl Client {
           }
           if self.end.daemon_gone() {
             self.reconnect()?;
-          } else {
-            return Err(ClientError::Stalled {
-              after_ns: self.deadlines.reply_ns,
-            });
+            return Ok(false);
           }
+          return Err(ClientError::Stalled {
+            after_ns: self.deadlines.reply_ns,
+          });
         }
         Err(e) => return Err(ClientError::Ipc(e)),
       }
@@ -1175,7 +1306,8 @@ impl Client {
   }
 
   /// Reconnects under the client's id inside the reconnect budget; refused when the budget
-  /// passes or a live client holds the id.
+  /// passes or a live client holds the id. The fresh channel is the account's until the client
+  /// binds it again (`rebind_if_needed`), which every send path does before sending.
   fn reconnect(&mut self) -> Result<(), ClientError> {
     let started = Instant::now();
     let budget = self.deadlines.reconnect_ns;
@@ -1189,6 +1321,7 @@ impl Client {
           }
           self.end = ClientEnd::connected(connected);
           self.reconnects += 1;
+          self.bound = false;
           return Ok(());
         }
         Err(IpcError::DaemonUnavailable { .. } | IpcError::RingFull) => {
@@ -1616,6 +1749,50 @@ impl Client {
     })? {
       ReplyBody::Granted { grant } => Ok(grant),
       _ => Err(ClientError::UnexpectedReply { verb: "grant" }),
+    }
+  }
+
+  /// Enrolls a consumer under `account` (§4.13 "Principals"): the human surface's verb, carrying its
+  /// proof of issuer authority (`slates_server::landing::enroll_proof` under the anchor's issuer
+  /// secret). Returns the consumer id and the capability, shown once — the caller delivers it to the
+  /// workload through `slates_ipc::delivery`, never through a channel other agents share. Refused
+  /// `GrantIssuerUnverified` when the proof does not verify (an agent cannot enroll itself).
+  pub fn enroll(
+    &mut self,
+    account: u32,
+    proof: [u8; 32],
+  ) -> Result<(u64, Capability), ClientError> {
+    match self.call(&RequestBody::Enroll { account, proof })? {
+      ReplyBody::Enrolled { consumer, secret } => Ok((consumer, secret)),
+      _ => Err(ClientError::UnexpectedReply { verb: "enroll" }),
+    }
+  }
+
+  /// Revokes a consumer's enrollment (§4.13): the human surface's verb with its proof of issuer
+  /// authority (`revoke_proof`); acknowledged only once every shard has marked the consumer's bound
+  /// channels, so every later verb from them refuses `ConsumerRevoked`.
+  pub fn revoke(&mut self, consumer: u64, proof: [u8; 32]) -> Result<(), ClientError> {
+    match self.call(&RequestBody::Revoke { consumer, proof })? {
+      ReplyBody::Revoked => Ok(()),
+      _ => Err(ClientError::UnexpectedReply { verb: "revoke" }),
+    }
+  }
+
+  /// Sets a principal's rights on a volume (§4.13 "Access lists"; `admin` on the volume is required;
+  /// rights all false remove the entry; the owner's rights are not an entry).
+  pub fn share(
+    &mut self,
+    volume: VolumeId,
+    principal: Principal,
+    rights: Rights,
+  ) -> Result<(), ClientError> {
+    match self.call(&RequestBody::Share {
+      volume,
+      principal,
+      rights,
+    })? {
+      ReplyBody::Shared => Ok(()),
+      _ => Err(ClientError::UnexpectedReply { verb: "share" }),
     }
   }
 
