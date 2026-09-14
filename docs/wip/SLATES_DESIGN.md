@@ -458,8 +458,10 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
   the launcher, and both SDKs.
 - **Python SDK** (`slates` on PyPI): PyO3 extension; `async` methods on any event loop through
   file-descriptor readiness; a sync facade.
-- **TypeScript SDK** (`@slates/sdk` on npm): napi-rs addon with platform packages; Promises and
-  async iterators; the TypeScript addon over the typed client.
+- **TypeScript SDK** (`@hyper-light/slates` on npm, with `@hyper-light/slates-<platform>` binary
+  packages; amended 2026-09-14 — the unscoped `slates` is an unrelated package on npm, so the SDK
+  lives under the organization's scope as vorpal's does): napi-rs addon with platform packages;
+  Promises and async iterators; the TypeScript addon over the typed client.
 - **MCP server** (`slates mcp`): the 2026-07-28 stateless protocol with dual-era support; tools,
   resources, and prompts; stdio and loopback Streamable HTTP.
 - **Skills**: one source tree of `SKILL.md` documents published raw (installed into
@@ -2311,6 +2313,39 @@ the format floor.
 > server-side grant records/control transport; same-uid human authority remains unestablished.
 > MCP, Python/TypeScript SDKs, generated surface parity and user-facing merge/guest flows are
 > planned. Descriptions below are required interfaces, not commands verified to work today.
+
+> **Status (2026-09-14, publish lane).** Both SDKs are publishable under the names §2.4 gives:
+> `slates` on PyPI (the wheel and the sdist; the name was free on 2026-09-14) and
+> `@hyper-light/slates` on npm with nine `@hyper-light/slates-<platform>` binary packages (the
+> unscoped `slates` on npm is an unrelated package, `slates@1.0.0-rc.23`, so §2.4 was amended from
+> `@slates/sdk` to the organization's scope, as vorpal's packages are). **One version:**
+> `[workspace.package] version` in `Cargo.toml` is the only hand-edited version; the wheel derives it
+> through maturin (`dynamic = ["version"]`), and the npm copies — the main package, the nine
+> platform packages, the nine `optionalDependencies` pins and the platform READMEs — are derived
+> by `cargo xtask version --write` and refused on any drift by `cargo xtask version` (part of
+> `cargo xtask check`, a CI gate on every push, and the shared `version-guard.yml` every tag lane
+> runs first with `--expect-tag`, so a tag that does not name the version publishes nothing).
+> **Lanes:** `publish-python.yml` builds cp39-abi3 wheels for manylinux and musllinux (x86_64,
+> aarch64), macOS (x86_64, arm64) and Windows (x64) plus the sdist, checks them with twine and
+> publishes through PyPI trusted publishing from the `pypi` environment (a pending publisher; no
+> token exists anywhere); `publish-node.yml` builds the addon for all nine `napi.targets` (musl in
+> `node:24-alpine`), refuses to publish if any platform package lacks its binary, and publishes
+> through npm trusted publishing from the `npm` environment — after the one-time 0.0.0 stub publish
+> of each name that npm requires before a trusted publisher can be attached (npm/cli#8544;
+> `cargo xtask npm-reserve` derives the ten stubs from the same manifests). CI's `sdk` job
+> installs the wheel into a fresh venv after `twine check --strict`, packs and installs the two npm
+> tarballs into a fresh project, and runs both SDK suites and the packaged smoke test over a live
+> daemon on Linux and macOS. **Proven by use on this host** (macOS 26.4.1, Apple M5 Max,
+> 2026-09-14; commands in `docs/publish.md`): the wheel and sdist built and twine-clean, the Python
+> suites 5/5 against the installed wheel, the sdist rebuilt from its own bytes; the addon built, the
+> Node suites 5/5, the two tarballs installed into a fresh project and the packaged smoke test 3/3
+> through the optional-dependency loader, dry-run publishes clean; the ten stubs packed and dry-run
+> clean. **Owed:** the stub publish and the two trusted-publisher registrations (a maintainer's
+> login), then the first tag; this section's `abi3-py312` and `cp314t` wheels (PyO3 0.22 has no
+> free-threaded build; the wheel is cp39-abi3 today); Windows arm64 and ia32 wheels (the napi lane
+> ships those platforms; maturin's Windows cross builds are not exercised); and the SDK surface
+> this section names beyond packaging (async iterators, `AbortSignal`, `memoryview` reads, the
+> typed exception hierarchy).
 
 **One operation contract.** A Rust descriptor per operation defines input/output types,
 authorization, side effects, replay class, cancellation, limits, refusals and documentation.
@@ -4869,3 +4904,10 @@ Applied in the same change to: D-13 (charge rule), §4.2 (status), T-1.3, GAPS �
 - Effective capacity: total RAM clamped to the tightest OS/job/cgroup bound (`MemoryFacts::limit`: cgroup v2/v1 from `/proc/self/cgroup`, a finite `RLIMIT_AS`/`RLIMIT_DATA`; the Windows job-object bound owed); `slates status` reports mapped, usable, committed, retained and metadata bytes per shard.
 - Found first, fixed first: a retired inode version freed the chunks its successor shared (`destroy_snapshot` after a partial overwrite returned the head's window as zeros — data loss; `docs/bugs/2026-09-13-snapshot-destroy-frees-head-shared-chunks.md`) and the inline spill sized window 0 to the write's end (`…-inline-spill-sizes-window-zero-to-the-write-end.md`).
 - What it does not change: the rules R1–R10; the entitlement invariant of §4.2 "Atomic admission" (this realizes it); the O(1) ENOSPC of D-13; the register protocol. Owed: the pressure hold (design given in `docs/wip/admission.md` §4e), the Windows job-object bound, guest and open-reference bytes in the same ledger, a boot-time refusal of a hand-edited layout past the bound.
+
+### A-17 (accepted 2026-09-14) — The Node SDK's npm name is `@hyper-light/slates` (the organization's scope), not `@slates/sdk`
+Applied in the same change to: §2.4, §4.12 (status), GAPS §1 (SDK publishing), `docs/publish.md`, `crates/sdk-node` (`package.json`, `npm/*`, `index.js`, README, `tests/packaged.test.mjs`), `.github/workflows/{publish-node,publish-python,version-guard}.yml`, `xtask/src/version.rs`.
+- Authorization: Ada's charter change of 2026-09-14 for the publish lane — the npm packages are created from the maintainer's machine first (npm attaches a trusted publisher only to a package that already exists, npm/cli#8544), under the organization's scope as vorpal's packages are.
+- Evidence: the unscoped `slates` on npm is an unrelated package (`slates@1.0.0-rc.23`; registry read 2026-09-14), so the earlier `package.json` name could never publish; `@hyper-light/*` is the organization's scope (`@hyper-light/vorpal-node`, maintainer `adalundhe`); `@slates/sdk` would need a `slates` organization whose availability could not be verified from here (npmjs.com refuses unauthenticated probes with 403). PyPI `slates` was free (404 on 2026-09-14), so the Python name stands.
+- Consequence: the binary packages are `@hyper-light/slates-<platform>` for the nine `napi.targets`; every copy of the name and the version is derived from the main package's `name` and the workspace version by `cargo xtask version --write`, and refused on drift by `cargo xtask version` (in `cargo xtask check`, CI, and the tag guard). The loader reads the name from its own manifest.
+- What it does not change: the SDK surface, R10 (neither SDK has a grant verb), the wire, the Python package.

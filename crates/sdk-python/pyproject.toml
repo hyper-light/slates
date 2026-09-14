@@ -14,13 +14,18 @@ classifiers = [
   "Programming Language :: Rust",
   "Programming Language :: Python :: 3",
   "Framework :: AsyncIO",
-  "Operating System :: POSIX",
+  "Operating System :: POSIX :: Linux",
   "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
 ]
+# The version is the workspace's (`[workspace.package] version` in the root Cargo.toml, inherited by
+# the crate manifest): maturin reads it from there, so there is no second copy to hand-edit here.
+# `cargo xtask version` refuses a static one (docs/publish.md).
 dynamic = ["version"]
 
 [project.urls]
 Repository = "https://github.com/hyper-light/slates"
+Documentation = "https://github.com/hyper-light/slates/blob/main/crates/sdk-python/README.md"
 
 [tool.maturin]
 # The compiled extension is imported as `slates` (the `#[pymodule]` name and the `[lib] name`).

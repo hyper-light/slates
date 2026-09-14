@@ -1,3 +1,3 @@
-# `slates-linux-x64-gnu`
+# `@hyper-light/slates-linux-x64-gnu`
 
-This is the **x86_64-unknown-linux-gnu** binary for `slates`
+This is the **x86_64-unknown-linux-gnu** binary for `@hyper-light/slates`

@@ -7,24 +7,27 @@ refusal from the daemon becomes a JS `Error`, volume ids cross as lowercase hex,
 that crosses is range-checked (a JS number is an `f64`; a value that would not round-trip is refused,
 not truncated).
 
-This is the **synchronous** base the design says the async form wraps (R6); the async form (over the
-completion descriptor, as Promises) is owed.
+Two clients over one daemon: `AsyncClient` is the **async-primary** form (R6) — every verb a Promise
+resolved by the completion descriptor's readiness, never blocking the event loop — and `Client` is
+the thin synchronous facade.
 
 ## Install
 
 ```
-npm install slates
+npm install @hyper-light/slates
 ```
 
-`slates` ships a prebuilt native addon per platform (macOS, Linux, Windows), resolved for your
-`process.platform`/`arch` as an `optionalDependency` — no build toolchain is needed to install. From
-a source checkout instead: `cargo build -p slates-sdk-node`, then `npm run build` (napi) produces the
-platform `.node`.
+`@hyper-light/slates` ships a prebuilt native addon per platform (macOS arm64/x64; Linux glibc and
+musl, x64/arm64; Windows x64/arm64/ia32), resolved for your `process.platform`/`arch` as an
+`optionalDependency` (`@hyper-light/slates-<platform>`) — no build toolchain is needed to install.
+Node 18 or newer. From a source checkout instead: `npm run build` (napi; needs a Rust toolchain)
+produces the platform `.node` next to `index.js`, which the loader prefers. How a release is cut and
+published is in `docs/publish.md`.
 
 ## Connect
 
 ```js
-import { Client, AsyncClient } from 'slates';
+import { Client, AsyncClient } from '@hyper-light/slates';
 
 // replyNs / reconnectNs are nanosecond deadlines a production caller derives from the machine's
 // budgets. The instance is the daemon `slates anchor --instance <name>` published.

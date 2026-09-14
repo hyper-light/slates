@@ -1,5 +1,5 @@
 {
-  "name": "slates-linux-arm64-musl",
+  "name": "@hyper-light/slates-linux-arm64-musl",
   "version": "0.1.0",
   "cpu": [
     "arm64"

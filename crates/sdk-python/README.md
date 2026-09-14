@@ -5,19 +5,28 @@ your Python agent drives a slates daemon through the *same* rings and completion
 client uses — never a parallel reimplementation. Every method is one client call; a typed refusal
 from the daemon becomes a `SlatesError`, and volume ids cross as lowercase hex.
 
-This is the **synchronous** base the design says the async form wraps (R6); the async form (over the
-completion descriptor) is owed.
+Two clients over one daemon: `AsyncClient` is the **async-primary** form (R6) — every verb an
+`async` method resolved on your running `asyncio` loop by the completion descriptor's readiness,
+never blocking the loop — and `Client` is the thin synchronous facade.
 
 ## Install
 
-Built with [maturin](https://www.maturin.rs):
+```
+pip install slates
+```
+
+Wheels are `cp39-abi3`: one wheel per platform serves every CPython 3.9 or newer, for manylinux and
+musllinux (x86_64, aarch64), macOS (x86_64, arm64) and Windows (x64); an sdist is published for
+anything else and builds with a Rust toolchain. From a source checkout instead, with
+[maturin](https://www.maturin.rs):
 
 ```
-maturin build -m crates/sdk-python/Cargo.toml   # a cp39-abi3 wheel in target/wheels/
+maturin build --release -m crates/sdk-python/Cargo.toml   # a cp39-abi3 wheel in target/wheels/
 pip install target/wheels/slates-*.whl
 ```
 
-or, for development, `maturin develop` into the active virtualenv.
+or, for development, `maturin develop` into the active virtualenv. How a release is cut and
+published is in `docs/publish.md`.
 
 ## Connect
 

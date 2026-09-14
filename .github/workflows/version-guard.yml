@@ -1,0 +1,33 @@
+# The release guard every tag-triggered lane runs first (docs/publish.md). The workspace version
+# (`[workspace.package] version` in Cargo.toml) is the one hand-edited version: the Rust crates
+# inherit it, the Python wheel derives it through maturin, and the npm packages are derived copies.
+# `cargo xtask version --expect-tag` refuses a tag that does not name that version, and refuses any
+# drift in the npm copies (the main package, its platform packages, the optionalDependencies pins),
+# so one tag can never publish a wheel and an npm package at two versions. On a branch (a
+# workflow_dispatch dry run) it only checks the copies. Called by release.yml, publish-python.yml and
+# publish-node.yml through `workflow_call`, so there is exactly one guard.
+name: Version guard
+
+on:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  guard:
+    name: tag names the workspace version; npm copies derived
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            cargo xtask version --expect-tag "${GITHUB_REF_NAME}"
+          else
+            cargo xtask version
+          fi

@@ -1,5 +1,5 @@
 {
-  "name": "slates",
+  "name": "@hyper-light/slates",
   "version": "0.1.0",
   "description": "The Node / TypeScript SDK for slates — a hermetic, RAM-only, copy-on-write VFS an agent provisions in under 50 µs. A napi-rs addon over the typed Rust client (sync Client) plus an async-primary AsyncClient resolved by the completion fd's readiness.",
   "author": "Ada Lundhe",
@@ -17,7 +17,8 @@
       "types": "./index.d.ts",
       "import": "./index.mjs",
       "require": "./index.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "index.js",
@@ -51,15 +52,15 @@
     ]
   },
   "optionalDependencies": {
-    "slates-darwin-arm64": "0.1.0",
-    "slates-darwin-x64": "0.1.0",
-    "slates-linux-x64-gnu": "0.1.0",
-    "slates-linux-arm64-gnu": "0.1.0",
-    "slates-linux-x64-musl": "0.1.0",
-    "slates-linux-arm64-musl": "0.1.0",
-    "slates-win32-x64-msvc": "0.1.0",
-    "slates-win32-arm64-msvc": "0.1.0",
-    "slates-win32-ia32-msvc": "0.1.0"
+    "@hyper-light/slates-darwin-arm64": "0.1.0",
+    "@hyper-light/slates-darwin-x64": "0.1.0",
+    "@hyper-light/slates-linux-x64-gnu": "0.1.0",
+    "@hyper-light/slates-linux-arm64-gnu": "0.1.0",
+    "@hyper-light/slates-linux-x64-musl": "0.1.0",
+    "@hyper-light/slates-linux-arm64-musl": "0.1.0",
+    "@hyper-light/slates-win32-x64-msvc": "0.1.0",
+    "@hyper-light/slates-win32-arm64-msvc": "0.1.0",
+    "@hyper-light/slates-win32-ia32-msvc": "0.1.0"
   },
   "engines": {
     "node": ">= 18"
@@ -69,8 +70,8 @@
     "access": "public"
   },
   "scripts": {
-    "build": "napi build --manifest-path Cargo.toml --platform --release",
-    "build:debug": "napi build --manifest-path Cargo.toml --platform",
+    "build": "napi build --manifest-path Cargo.toml --platform --release --no-js --dts ignore.d.ts",
+    "build:debug": "napi build --manifest-path Cargo.toml --platform --no-js --dts ignore.d.ts",
     "artifacts": "napi artifacts",
     "prepublishOnly": "napi prepublish -t npm --no-gh-release",
     "test": "node --test tests/sdk.test.mjs tests/sdk_async.test.mjs"
