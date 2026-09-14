@@ -18,23 +18,104 @@
 //!
 //! `name` is the TLS server name every certificate carries (its subject alternative name) and every peer
 //! verifies the session against; `f` is the fault tolerance (a write commits at `f + 1` acknowledgements);
-//! each node's `address` is the IP its peers dial and the base of the port block it serves them from (two
-//! ports per node in the manifest, in manifest order — `slates_server::deploy`); `certificate` and `key`
-//! are DER files, resolved against the manifest's own directory. Every certificate is read (they are what
-//! the peers pin, and what the member ids derive from); only this node's key is read. The reads are
-//! ordinary `std::fs` reads — this crate reads host paths (R1: it never writes one).
+//! each node's `address` is the IP **or DNS name** its peers dial and the base of the port block it serves
+//! them from (two ports per node in the manifest, in manifest order — `slates_server::deploy`); `certificate`
+//! and `key` are DER files, resolved against the manifest's own directory. Every certificate is read (they
+//! are what the peers pin, and what the member ids derive from); only this node's key is read. A name is
+//! resolved by the daemon at every dial (`slates_server::dns`), through the nameservers of this host's
+//! `/etc/resolv.conf`, which is read here once at boot when any node is named (a manifest of literal
+//! addresses reads nothing). The reads are ordinary `std::fs` reads — this crate reads host paths (R1: it
+//! never writes one).
 
-use core::net::SocketAddrV4;
+use core::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 
 use slates_db::register::{Quorum, RegionId};
-use slates_server::DurabilityBound;
 use slates_server::deploy::{
-  CertificateDer, FleetManifest, FleetNodeEntry, FleetPlan, PrivateKeyDer,
+  CertificateDer, FleetManifest, FleetNodeEntry, FleetPlan, NodeAddress, PrivateKeyDer,
 };
+use slates_server::{DurabilityBound, Resolver};
 
 use crate::Failure;
 use crate::args::FleetSelection;
+
+/// Format: where the operating system's resolver configuration lives (`resolv.conf(5)`).
+const RESOLV_CONF: &str = "/etc/resolv.conf";
+/// Format: the DNS port a nameserver listens on (RFC 1035 §4.2.1).
+const DNS_PORT: u16 = 53;
+/// Format: the per-query timeout when `options timeout:` is absent — `RES_TIMEOUT`, 5 seconds
+/// (`resolv.conf(5)`); the file's value is capped at 30 as the resolver caps it.
+const RESOLVER_TIMEOUT_DEFAULT_S: u64 = 5;
+/// Format: the resolver's cap on `options timeout:` (`RES_MAXRETRANS`, `resolv.conf(5)`).
+const RESOLVER_TIMEOUT_MAX_S: u64 = 30;
+/// Format: the attempts when `options attempts:` is absent — `RES_DFLRETRY`, 2 (`resolv.conf(5)`); the
+/// file's value is capped at 5 as the resolver caps it.
+const RESOLVER_ATTEMPTS_DEFAULT: u32 = 2;
+/// Format: the resolver's cap on `options attempts:` (`RES_MAXRETRY`, `resolv.conf(5)`).
+const RESOLVER_ATTEMPTS_MAX: u32 = 5;
+/// Format: how many `nameserver` lines the resolver honours (`MAXNS`, `resolv.conf(5)`); later ones are
+/// ignored as the resolver ignores them.
+const RESOLVER_MAX_NAMESERVERS: usize = 3;
+/// Format: nanoseconds per second, for the timeout.
+const NS_PER_S: u64 = 1_000_000_000;
+
+/// Parses `resolv.conf(5)` text: the first three `nameserver` lines that carry an IPv4 address (the fleet
+/// dials IPv4; an IPv6 nameserver is skipped, and a line with a bad address is ignored as the resolver
+/// ignores it), and `options timeout:N attempts:N` with the documented defaults and caps. `None` when no
+/// IPv4 nameserver is listed — the caller refuses a named manifest then.
+pub(crate) fn parse_resolv_conf(text: &str) -> Option<Resolver> {
+  let mut nameservers = Vec::new();
+  let mut timeout_s = RESOLVER_TIMEOUT_DEFAULT_S;
+  let mut attempts = RESOLVER_ATTEMPTS_DEFAULT;
+  for line in text.lines() {
+    // A comment starts with `#` or `;`; the rest of the line is words.
+    let line = line.split(['#', ';']).next().unwrap_or("").trim();
+    let mut words = line.split_whitespace();
+    match words.next() {
+      Some("nameserver") => {
+        if nameservers.len() < RESOLVER_MAX_NAMESERVERS
+          && let Some(address) = words.next().and_then(|word| word.parse::<Ipv4Addr>().ok())
+        {
+          nameservers.push(SocketAddrV4::new(address, DNS_PORT));
+        }
+      }
+      Some("options") => {
+        for option in words {
+          if let Some(value) = option.strip_prefix("timeout:")
+            && let Ok(value) = value.parse::<u64>()
+          {
+            timeout_s = value.min(RESOLVER_TIMEOUT_MAX_S);
+          }
+          if let Some(value) = option.strip_prefix("attempts:")
+            && let Ok(value) = value.parse::<u32>()
+          {
+            attempts = value.min(RESOLVER_ATTEMPTS_MAX);
+          }
+        }
+      }
+      _ => {}
+    }
+  }
+  if nameservers.is_empty() {
+    return None;
+  }
+  Some(Resolver {
+    nameservers,
+    timeout_ns: timeout_s.saturating_mul(NS_PER_S),
+    attempts: attempts.max(1),
+  })
+}
+
+/// The host's resolver configuration, read from [`RESOLV_CONF`]: `Read` when the file cannot be read,
+/// `Resolver` when it lists no IPv4 nameserver.
+fn read_resolver() -> Result<Resolver, ManifestError> {
+  let path = PathBuf::from(RESOLV_CONF);
+  let text = std::fs::read_to_string(&path).map_err(|e| ManifestError::Read {
+    path: path.clone(),
+    reason: e.to_string(),
+  })?;
+  parse_resolv_conf(&text).ok_or(ManifestError::Resolver { path })
+}
 
 /// Why a manifest did not load: which file, or which field, and what was expected of it.
 #[derive(Debug)]
@@ -65,6 +146,11 @@ enum ManifestError {
     /// The decoder's reason.
     reason: String,
   },
+  /// A node is addressed by a DNS name, but the host's resolver configuration lists no IPv4 nameserver.
+  Resolver {
+    /// The configuration read.
+    path: PathBuf,
+  },
   /// The manifest's values yield no plan for this node.
   Plan(slates_server::DeployError),
 }
@@ -78,6 +164,11 @@ impl std::fmt::Display for ManifestError {
       Self::Key { path, reason } => {
         write!(out, "{} is not a DER private key: {reason}", path.display())
       }
+      Self::Resolver { path } => write!(
+        out,
+        "a node is addressed by a DNS name, but {} lists no IPv4 nameserver to resolve it",
+        path.display()
+      ),
       Self::Plan(e) => write!(out, "{e}"),
     }
   }
@@ -86,7 +177,7 @@ impl std::fmt::Display for ManifestError {
 /// A node as the manifest states it, before any file but the manifest is read.
 struct NodeText {
   node: String,
-  address: SocketAddrV4,
+  address: NodeAddress,
   certificate: String,
   key: String,
   /// The node's failure domain, if the operator declared one (`DomainId` is a `u64`). Absent = the node is
@@ -135,12 +226,10 @@ fn string_field(
 fn node_text(entry: &serde_json::Value, index: usize) -> Result<NodeText, ManifestError> {
   let path = format!("nodes[{index}].");
   let address_text = string_field(entry, &path, "address")?;
-  let address = address_text
-    .parse::<SocketAddrV4>()
-    .map_err(|_| ManifestError::Field {
-      field: format!("{path}address"),
-      expected: "an IPv4 address with the base port, like `10.0.0.1:7000`",
-    })?;
+  let address = NodeAddress::parse(&address_text).map_err(|expected| ManifestError::Field {
+    field: format!("{path}address"),
+    expected,
+  })?;
   // `domain` is optional: present only for a real failure-domain topology, and then a non-negative integer.
   let domain = match entry.get("domain") {
     None => None,
@@ -276,6 +365,12 @@ fn load_plan(selection: &FleetSelection) -> Result<FleetPlan, ManifestError> {
   })?;
   let stated = parse(&text)?;
   let base = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+  // The host's resolver, when any node is addressed by name; a manifest of literal addresses reads nothing.
+  let resolver = if stated.nodes.iter().any(|node| node.address.is_named()) {
+    Some(read_resolver()?)
+  } else {
+    None
+  };
   let mut nodes = Vec::with_capacity(stated.nodes.len());
   let mut key = None;
   for node in &stated.nodes {
@@ -292,7 +387,7 @@ fn load_plan(selection: &FleetSelection) -> Result<FleetPlan, ManifestError> {
     }
     nodes.push(FleetNodeEntry {
       node: node.node.clone(),
-      address: node.address,
+      address: node.address.clone(),
       certificate,
       domain: node.domain,
       region: node.region.map(RegionId),
@@ -313,7 +408,8 @@ fn load_plan(selection: &FleetSelection) -> Result<FleetPlan, ManifestError> {
       },
     ));
   };
-  slates_server::deploy::plan(&manifest, &selection.node, key).map_err(ManifestError::Plan)
+  slates_server::deploy::plan(&manifest, &selection.node, key, resolver)
+    .map_err(ManifestError::Plan)
 }
 
 /// This node's deployment plan from `--fleet PATH --node NAME`, or why the manifest yields none — the
@@ -346,7 +442,11 @@ mod tests {
     assert_eq!(stated.nodes[1].node, "b");
     assert_eq!(
       stated.nodes[1].address,
-      "10.0.0.2:7000".parse::<SocketAddrV4>().expect("an address")
+      NodeAddress::Ip("10.0.0.2:7000".parse::<SocketAddrV4>().expect("an address"))
+    );
+    assert!(
+      !stated.nodes[1].address.is_named(),
+      "a literal address reads no resolver configuration"
     );
     assert_eq!(stated.nodes[1].certificate, "b.crt.der");
     assert_eq!(stated.nodes[1].key, "b.key.der");
@@ -463,6 +563,85 @@ mod tests {
       Err(ManifestError::Field { field, .. }) => assert_eq!(field, "mirrors.1"),
       other => panic!("expected a field error for a non-integer mirror, got {other:?}"),
     }
+  }
+
+  /// A node may be addressed by a DNS name with its base port (the Kubernetes deployment names each node
+  /// by its per-pod DNS name); a name that is not a hostname is named by its path.
+  #[test]
+  fn a_named_address_parses_and_a_bad_one_is_named() {
+    let named = MANIFEST.replace(
+      "10.0.0.1:7000",
+      "slates-0.slates.default.svc.cluster.local:7000",
+    );
+    let stated = parse(&named).expect("parses");
+    assert_eq!(
+      stated.nodes[0].address,
+      NodeAddress::Name {
+        host: "slates-0.slates.default.svc.cluster.local".to_owned(),
+        port: 7000
+      }
+    );
+    assert!(stated.nodes[0].address.is_named());
+
+    let bad = MANIFEST.replace("10.0.0.1:7000", "slates_0.local:7000");
+    match parse(&bad) {
+      Err(ManifestError::Field { field, .. }) => assert_eq!(field, "nodes[0].address"),
+      other => panic!("expected a field error for a bad hostname, got {other:?}"),
+    }
+    let no_port = MANIFEST.replace("10.0.0.1:7000", "slates-0.local");
+    match parse(&no_port) {
+      Err(ManifestError::Field { field, .. }) => assert_eq!(field, "nodes[0].address"),
+      other => panic!("expected a field error for a missing port, got {other:?}"),
+    }
+  }
+
+  /// `resolv.conf(5)` as a pod or a host writes it: the IPv4 nameservers (at most three, IPv6 skipped),
+  /// the timeout and attempts options with their documented defaults and caps, comments ignored; a file
+  /// with no IPv4 nameserver yields no resolver.
+  #[test]
+  fn resolv_conf_parses_to_the_resolver() {
+    let pod = "search default.svc.cluster.local svc.cluster.local cluster.local\nnameserver 10.96.0.10\noptions ndots:5\n";
+    assert_eq!(
+      parse_resolv_conf(pod),
+      Some(Resolver {
+        nameservers: vec![SocketAddrV4::new(Ipv4Addr::new(10, 96, 0, 10), DNS_PORT)],
+        timeout_ns: RESOLVER_TIMEOUT_DEFAULT_S * NS_PER_S,
+        attempts: RESOLVER_ATTEMPTS_DEFAULT,
+      })
+    );
+    let host = "# a comment\nnameserver fe80::1 ; ipv6 first\nnameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 9.9.9.9\nnameserver 4.4.4.4\noptions timeout:2 attempts:7 rotate\n";
+    let resolver = parse_resolv_conf(host).expect("a resolver");
+    assert_eq!(
+      resolver.nameservers,
+      vec![
+        SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), DNS_PORT),
+        SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), DNS_PORT),
+        SocketAddrV4::new(Ipv4Addr::new(9, 9, 9, 9), DNS_PORT),
+      ],
+      "the first three IPv4 nameservers, the IPv6 one skipped"
+    );
+    assert_eq!(resolver.timeout_ns, 2 * NS_PER_S);
+    assert_eq!(
+      resolver.attempts, RESOLVER_ATTEMPTS_MAX,
+      "attempts is capped as the resolver caps it"
+    );
+    assert_eq!(
+      parse_resolv_conf("options timeout:1\n"),
+      None,
+      "no nameserver: no resolver"
+    );
+    assert_eq!(
+      parse_resolv_conf("nameserver fe80::1\n"),
+      None,
+      "an IPv6-only file: no resolver the fleet can dial"
+    );
+    assert_eq!(
+      parse_resolv_conf("nameserver 10.0.0.1\noptions timeout:99\n")
+        .expect("a resolver")
+        .timeout_ns,
+      RESOLVER_TIMEOUT_MAX_S * NS_PER_S,
+      "the timeout is capped as the resolver caps it"
+    );
   }
 
   /// A missing or malformed field is named by its path into the document.

@@ -1201,6 +1201,20 @@ fn telemetry_text(batch: &TelemetryReport) -> String {
   out
 }
 
+/// A consensus group's lines of the status (§4.8): `fleet_<group>_leads`, the derived election timing in
+/// coordinator periods, the measured tail and spread it came from, and the samples behind it.
+fn group_text(group: &str, report: &slates_client::GroupReport) -> String {
+  format!(
+    "fleet_{group}_leads: {}\nfleet_{group}_base_periods: {}\nfleet_{group}_span_periods: {}\nfleet_{group}_rtt_tail_ns: {}\nfleet_{group}_rtt_spread_ns: {}\nfleet_{group}_samples: {}\n",
+    report.leads,
+    report.base_periods,
+    report.span_periods,
+    report.rtt_tail_ns,
+    report.rtt_spread_ns,
+    report.samples
+  )
+}
+
 /// The daemon's status: the daemon's lines, its place in the fleet (a laptop: `f` 0, itself the one
 /// member, no peers probed), then one block per shard with its health signals and its telemetry drain.
 fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> String {
@@ -1224,6 +1238,8 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     report.fleet.sessions_refused,
     report.fleet.replaced
   );
+  out.push_str(&group_text("council", &report.fleet.council));
+  out.push_str(&group_text("root", &report.fleet.root));
   for shard in &report.shards {
     out.push_str(&format!(
       "shard {}: clients={} volumes={} served={} replayed={} replay_ns={} torn={} mapped={} reserve={} committed={} retained={} retained_versions={} metadata={} committed_metadata={}\n",

@@ -115,6 +115,8 @@ use slates_vfs::clock::Clock;
 use slates_vfs::export::{Progress, SnapshotArchiver};
 
 use crate::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
+use crate::deploy::NodeAddress;
+use crate::dns::{self, Resolver};
 use crate::head::{HeadValue, PlacedHead, SealJob};
 use crate::state::{self, LearnedMember, ShardState};
 use crate::verbs;
@@ -175,12 +177,12 @@ pub struct FleetPeer {
   /// anchored daemon's first boot is already generation one).
   pub host: HostId,
   /// The peer's advertised probe address — where it accepts this node's SWIM probes, and where this node
-  /// dials it.
-  pub address: SocketAddrV4,
+  /// dials it: an IP, or a DNS name resolved at every fresh dial (`crate::dns`).
+  pub address: NodeAddress,
   /// The peer's advertised record address — where it accepts this node's register record commits (a separate
   /// socket from the probe one: the SWIM and register wire formats are not distinguished by content on a
   /// shared stream).
-  pub record_address: SocketAddrV4,
+  pub record_address: NodeAddress,
   /// The peer's operator-provisioned certificate, pinned for the mutual-TLS session.
   pub certificate: CertificateDer<'static>,
 }
@@ -201,17 +203,22 @@ pub struct FleetTransport {
   pub record_bind: SocketAddrV4,
   /// The peers this node probes and is probed by, each with its dial addresses.
   pub peers: Vec<FleetPeer>,
+  /// The host's resolver configuration, when any peer is addressed by a DNS name (the deployment plan
+  /// refuses a named peer without one); `None` for a fleet of literal addresses.
+  pub resolver: Option<Resolver>,
 }
 
 /// What this node dials to reach one peer on one plane: the peer's stable anchor and its seed member id (the
-/// task follows the peer's *current* id from there, task #22), the address on that plane, and the certificate
-/// to pin; `name` is the fleet's TLS name the session is verified under.
+/// task follows the peer's *current* id from there, task #22), the address on that plane, the certificate
+/// to pin, and the resolver for a named address; `name` is the fleet's TLS name the session is verified
+/// under.
 struct PeerDial {
   anchor: HostId,
   host: HostId,
   name: String,
-  address: SocketAddrV4,
+  address: NodeAddress,
   certificate: CertificateDer<'static>,
+  resolver: Option<&'static Resolver>,
 }
 
 /// Derived: the sessions a serve socket's demultiplexer holds per peer — the live one and the one a re-dial
@@ -613,6 +620,7 @@ pub async fn run_membership(transport: FleetTransport, progress: &'static Atomic
     probe_bind,
     record_bind,
     peers,
+    resolver,
   } = transport;
   if peers.is_empty() {
     // No peers — nothing to probe; the placement path still runs the `FleetNode`, degenerate (R8).
@@ -620,8 +628,10 @@ pub async fn run_membership(transport: FleetTransport, progress: &'static Atomic
   }
   // The identity is process-lifetime and shared by every serve session and client dial — it is not `Clone`
   // (it holds a private key), so it is leaked to `&'static` and each task borrows the one copy. One leak per
-  // daemon boot.
+  // daemon boot. The resolver is shared by every dial task the same way.
   let identity: &'static Identity = Box::leak(Box::new(identity));
+  let resolver: Option<&'static Resolver> =
+    resolver.map(|resolver| &*Box::leak(Box::new(resolver)));
   let neighbourhood = peers.len().saturating_add(1); // this node and its peers.
   let local = state::with_state(|s| s.fleet.host()).unwrap_or(HostId(0));
   // The boot line of the fleet's derived timing (R3: every derived value logged with its inputs). Nothing is
@@ -728,6 +738,7 @@ pub async fn run_membership(transport: FleetTransport, progress: &'static Atomic
       name: name.clone(),
       address,
       certificate: certificate.clone(),
+      resolver,
     };
     let record_dial = PeerDial {
       anchor,
@@ -735,6 +746,7 @@ pub async fn run_membership(transport: FleetTransport, progress: &'static Atomic
       name: name.clone(),
       address: record_address,
       certificate,
+      resolver,
     };
     if let Ok(task) = futures::spawn(probe_peer(
       identity,
@@ -807,24 +819,37 @@ async fn accept_records(demux: &'static Demux, local: HostId, roster: Vec<Roster
 /// peer's `accept` completes, rather than re-dialing from a fresh port. Retrying on one socket is what lets
 /// a handshake finish under contention: `accept` pins the first source it hears, so its half-open state
 /// waits for *this* source's next flight; a fresh-port re-dial is a new source it ignores, stranding the
-/// session (the record-plane cause of the takeover flaking under load). `None` if the runtime refuses the
-/// socket or endpoint.
-fn client_for(
+/// session (the record-plane cause of the takeover flaking under load). A peer addressed by a DNS name is
+/// resolved here, at this fresh dial, so a peer that moved (a rescheduled pod) is reached at its new address
+/// on the next re-dial; a name that does not resolve is counted (`fleet.resolve`) and the caller's next
+/// period dials again. The socket binds every interface: a peer on another host is dialed from the address
+/// the kernel routes to it (a loopback-bound socket cannot send off the host). `None` if the name did not
+/// resolve or the runtime refuses the socket or endpoint.
+async fn client_for(
   identity: &Identity,
   name: &str,
-  address: SocketAddrV4,
+  address: &NodeAddress,
   certificate: &CertificateDer<'static>,
+  resolver: Option<&'static Resolver>,
 ) -> Option<Endpoint> {
-  let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).ok()?;
-  Endpoint::client(
-    socket,
-    address,
-    identity,
-    certificate,
-    name,
-    FLEET_FRAME_CAP,
-  )
-  .ok()
+  let peer = match address {
+    NodeAddress::Ip(address) => *address,
+    NodeAddress::Name { host, port } => {
+      let Some(resolver) = resolver else {
+        count_refusal(RESOLVE_REFUSED);
+        return None;
+      };
+      match dns::lookup(resolver, host).await {
+        Ok(ip) => SocketAddrV4::new(ip, *port),
+        Err(_) => {
+          count_refusal(RESOLVE_REFUSED);
+          return None;
+        }
+      }
+    }
+  };
+  let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+  Endpoint::client(socket, peer, identity, certificate, name, FLEET_FRAME_CAP).ok()
 }
 
 /// Advances a session toward established, one handshake attempt per call (the probe and ship loops call it
@@ -838,8 +863,9 @@ async fn establish_session(
   session: Option<Endpoint>,
   identity: &Identity,
   name: &str,
-  address: SocketAddrV4,
+  address: &NodeAddress,
   certificate: &CertificateDer<'static>,
+  resolver: Option<&'static Resolver>,
 ) -> (Option<Endpoint>, Option<Endpoint>) {
   if session.is_some() {
     return (client, session);
@@ -862,7 +888,10 @@ async fn establish_session(
       }
       Err(_) => (None, None),
     },
-    None => (client_for(identity, name, address, certificate), None),
+    None => (
+      client_for(identity, name, address, certificate, resolver).await,
+      None,
+    ),
   }
 }
 
@@ -1176,6 +1205,7 @@ async fn probe_peer(
     name,
     address,
     certificate,
+    resolver,
   } = dial;
   // The peer's current member id, its seed until learned otherwise (task #22): the loop below follows it.
   let mut peer = ProbedPeer { anchor, host: seed };
@@ -1194,7 +1224,8 @@ async fn probe_peer(
   // is reused whatever a probe's outcome (see [`probe_once`]). The detector ticks only when a probe is
   // actually sent, so an as-yet-unestablished session never resolves as a missed probe and falsely ages the
   // peer.
-  let mut client: Option<Endpoint> = client_for(identity, &name, address, &certificate);
+  let mut client: Option<Endpoint> =
+    client_for(identity, &name, &address, &certificate, resolver).await;
   let mut session: Option<Endpoint> = None;
   let mut recorded_mesh = false;
   // A per-probe nonce the acknowledgement must echo: monotonic over this session, so every probe's nonce
@@ -1213,8 +1244,16 @@ async fn probe_peer(
       futures::sleep(HEARTBEAT_NS).await;
       continue;
     }
-    (client, session) =
-      establish_session(client, session, identity, &name, address, &certificate).await;
+    (client, session) = establish_session(
+      client,
+      session,
+      identity,
+      &name,
+      &address,
+      &certificate,
+      resolver,
+    )
+    .await;
     if session.is_some() && !recorded_mesh {
       // The direct probe session to this peer has formed — record it, so the daemon can tell the real mesh
       // is up (`fleet_meshed`) rather than trusting the membership's optimistically seeded alive set.
@@ -2348,6 +2387,12 @@ const ACCEPT_REFUSED: &str = "fleet.accept";
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const SERVE_REFUSED: &str = "fleet.serve";
 
+/// The status refusal count under which a dial task records a peer's DNS name that did not resolve (no
+/// resolver, a timeout, `NXDOMAIN` for a pod not yet created, a malformed reply): the dial is skipped this
+/// period and made again the next, so a count that keeps rising names a peer the fleet cannot reach by name.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const RESOLVE_REFUSED: &str = "fleet.resolve";
+
 /// Counts a fleet-loop refusal in the shard's status refusal counts, so a peer the loop could not set up is
 /// visible to an operator (the mesh will not form to it) rather than a swallowed error (banned item 9).
 pub(crate) fn count_refusal(kind: &'static str) {
@@ -2408,9 +2453,11 @@ async fn establish_record_link(identity: &'static Identity, dial: PeerDial) {
     name,
     address,
     certificate,
+    resolver,
   } = dial;
   let mut peer_host = seed;
-  let mut client: Option<Endpoint> = client_for(identity, &name, address, &certificate);
+  let mut client: Option<Endpoint> =
+    client_for(identity, &name, &address, &certificate, resolver).await;
   loop {
     // Follow the peer's current id (task #22): a restart is a new process, so the session to its previous
     // incarnation is dead by definition — drop it, and from here keep the link under the id the peer now
@@ -2439,8 +2486,16 @@ async fn establish_record_link(identity: &'static Identity, dial: PeerDial) {
     let absent =
       state::with_state(|s| !s.record_sessions.contains_key(&peer_host)).unwrap_or(false);
     if absent {
-      let (kept, session) =
-        establish_session(client, None, identity, &name, address, &certificate).await;
+      let (kept, session) = establish_session(
+        client,
+        None,
+        identity,
+        &name,
+        &address,
+        &certificate,
+        resolver,
+      )
+      .await;
       client = kept;
       if let Some(session) = session {
         state::with_state(|s| s.record_sessions.insert(peer_host, Some(session)));

@@ -270,10 +270,11 @@ fn start_with_policy(
     peers: vec![FleetPeer {
       anchor: peer.anchor,
       host: peer.host,
-      address: peer.address,
-      record_address: peer.record_address,
+      address: peer.address.into(),
+      record_address: peer.record_address.into(),
       certificate: peer.certificate,
     }],
+    resolver: None,
   };
   Daemon::start_with_fleet(
     &this.profile,
@@ -797,6 +798,7 @@ fn start_fleet_node(
     probe_bind: loopback(bind.0),
     record_bind: loopback(bind.1),
     peers,
+    resolver: None,
   };
   Daemon::start_with_fleet(profile, config, source, Some(transport))
     .expect("the fleet daemon starts")
@@ -928,8 +930,8 @@ fn fleet_peer_at(
   FleetPeer {
     anchor,
     host,
-    address: loopback(at.0),
-    record_address: loopback(at.1),
+    address: loopback(at.0).into(),
+    record_address: loopback(at.1).into(),
     certificate: certificate.clone(),
   }
 }
@@ -1605,8 +1607,8 @@ fn start_mesh_with(
         .map(|j| FleetPeer {
           anchor: anchors[j],
           host: hosts[j],
-          address: loopback(serve[j].0),
-          record_address: loopback(serve[j].1),
+          address: loopback(serve[j].0).into(),
+          record_address: loopback(serve[j].1).into(),
           certificate: certs[j].clone(),
         })
         .collect();
@@ -1630,6 +1632,7 @@ fn start_mesh_with(
         probe_bind: loopback(serve[i].0),
         record_bind: loopback(serve[i].1),
         peers,
+        resolver: None,
       };
       Daemon::start_with_fleet(
         &profile,
@@ -1812,6 +1815,20 @@ fn a_loopback_fleet_derives_its_election_timing_at_the_measured_floor() {
     });
   let timings: Vec<Option<slates_cluster::timing::ElectionTiming>> =
     daemons.iter().map(Daemon::council_timing).collect();
+  // The same facts over the wire — what an operator's `slates status` prints (`fleet_council_*`): every
+  // node's `DaemonStatus` carries its control shard's council leadership and derived timing, so a status
+  // read on a pod reports what the in-process accessor reports.
+  let pid = std::process::id();
+  let reported: Vec<slates_ipc::protocol::GroupReport> = hosts
+    .iter()
+    .map(|host| {
+      let mut client = Client::connect(&format!("fleet3-{}-{pid}", host.0));
+      match client.call(&RequestBody::DaemonStatus) {
+        ReplyBody::DaemonStatus { report } => report.fleet.council.clone(),
+        other => panic!("status answers on every node: {other:?}"),
+      }
+    })
+    .collect();
   for daemon in daemons {
     daemon.stop();
   }
@@ -1830,6 +1847,22 @@ fn a_loopback_fleet_derives_its_election_timing_at_the_measured_floor() {
       (timing.base_periods, timing.span_periods),
       (floor.base_periods, floor.span_periods),
       "the derived timing is the floor on a loopback fleet: {timing:?}"
+    );
+  }
+  assert_eq!(
+    reported.iter().filter(|group| group.leads).count(),
+    1,
+    "exactly one node reports itself the council's leader over the wire: {reported:?}"
+  );
+  for group in &reported {
+    assert!(
+      group.samples > 0,
+      "the status carries the measured samples, not the default: {reported:?}"
+    );
+    assert_eq!(
+      (group.base_periods, group.span_periods),
+      (floor.base_periods, floor.span_periods),
+      "the status carries the derived timing: {reported:?}"
     );
   }
 }

@@ -1666,7 +1666,7 @@ impl Client {
   /// The daemon's status (§4.14 `slates.status`).
   pub fn daemon_status(&mut self) -> Result<DaemonReport, ClientError> {
     match self.call(&RequestBody::DaemonStatus)? {
-      ReplyBody::DaemonStatus { report } => Ok(report),
+      ReplyBody::DaemonStatus { report } => Ok(*report),
       _ => Err(ClientError::UnexpectedReply {
         verb: "daemon_status",
       }),

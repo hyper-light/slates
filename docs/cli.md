@@ -61,9 +61,16 @@ slates anchor --fleet /etc/slates/fleet.json --node a
 - `f` is the fault tolerance: a write commits once `f + 1` nodes hold it, so a fleet of `2f + 1`
   keeps committing through `f` deaths. A manifest that could never commit (`fewer than f + 1`
   nodes) is refused.
-- `address` is the IP peers dial and the node's base port: it serves probes on that UDP port and
-  records on the next, every peer on the same two sockets, so open those two ports. Every node
-  computes the same map from the same file.
+- `address` is the IP **or DNS name** peers dial and the node's base port: it serves probes on that
+  UDP port and records on the next, every peer on the same two sockets, so open those two ports.
+  Every node computes the same map from the same file. A name
+  (`slates-0.slates.default.svc.cluster.local:7000` — the Kubernetes deployment of
+  [deploy.md](deploy.md) names each node by its per-pod DNS name) is resolved by the daemon at every
+  fresh dial through the nameservers of this host's `/etc/resolv.conf`, so a peer that came back
+  under a new address (a rescheduled pod) is reached on the next re-dial; a name that does not
+  resolve is counted under the `fleet.resolve` refusal in `status` and dialed again next period. A
+  named node binds its own two sockets on every interface. A manifest that names a node on a host
+  with no IPv4 nameserver in `/etc/resolv.conf` stops the boot naming the file.
 - `domain` and `region` are optional per-node non-negative integers, both unset by default and set
   only for a real topology. `domain` is the node's failure domain (a rack or zone id): placement forms
   each object's copyset across distinct domains, so nodes that share a `domain` are treated as
@@ -91,7 +98,15 @@ slates anchor --fleet /etc/slates/fleet.json --node a
 `slates status` on any node shows its place in the fleet: `fleet_host` (its member id),
 `fleet_f`, `fleet_host_epoch`, `fleet_members` (the members it holds alive) and
 `fleet_peers_probed` (peers with a formed session; the mesh is up when this is the member count
-less one). A single daemon shows the same lines, degenerate: `f` 0, itself the one member.
+less one); then the two consensus groups as this node drives them — `fleet_council_leads` (whether
+this node is the regional configuration council's elected leader), `fleet_council_base_periods` and
+`fleet_council_span_periods` (the election timeout it derived, in coordinator periods: base
+`⌈10 × max(broadcast RTT tail, heartbeat) / heartbeat⌉`, the span the same over the RTT variation),
+`fleet_council_rtt_tail_ns` and `fleet_council_rtt_spread_ns` (the measured tail and spread they
+came from; zero before any sample) and `fleet_council_samples` (the round trips behind them — a
+loopback fleet derives the ten-period floor from its samples, a WAN fleet a larger base), and the
+same six `fleet_root_*` lines for the root group across regions. A single daemon shows the same
+lines, degenerate: `f` 0, itself the one member, leading both groups at the floor with no sample.
 
 Then one block per shard: its counters (`shard N: clients=… volumes=… served=…`), its refusals by
 kind, its health signals (`shard N catalog.volumes: 3 (age 0 ns)` — a signal that is absent prints
