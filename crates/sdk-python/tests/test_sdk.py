@@ -80,6 +80,19 @@ def _connect_when_ready(instance):
             time.sleep(POLL_SECS)
 
 
+def _listed_until_gone(client, volume):
+    """Polls `list` until `volume` is no longer in it, within the startup budget: a destroy replies
+    first and the daemon tears the volume down in cooperative slices after (§4.4), so the very next
+    list can still show it — measured 54–302 µs after the reply here, 2026-09-14. Returns whether it
+    is gone; the Rust client test (`wait_until_listed`) waits the same way."""
+    deadline = time.monotonic() + STARTUP_SECS
+    while any(v["id"] == volume for v in client.list()):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(POLL_SECS)
+    return True
+
+
 class SlatesSdkSurface(unittest.TestCase):
     def test_module_exposes_the_client_surface(self):
         """The extension loads and exposes the Client class, the SlatesError exception, and a version."""
@@ -154,10 +167,11 @@ class SlatesSdkRoundTrip(unittest.TestCase):
             # resize → a larger bound succeeds.
             client.resize(volume, 2 * VOLUME_BYTES)
 
-            # destroy → the volume is gone from a later list.
+            # destroy → the volume is gone from a later list (the teardown runs in slices after the
+            # reply, so the list is polled within the budget).
             client.destroy(volume)
             self.assertTrue(
-                all(v["id"] != volume for v in client.list()),
+                _listed_until_gone(client, volume),
                 "the destroyed volume is gone from list",
             )
 

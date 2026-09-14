@@ -120,8 +120,13 @@ test('async lifecycle over a live daemon', async (t) => {
 
     // await destroy → the volume is gone from a later list; resolves to undefined.
     assert.equal(await client.destroy(volume), undefined);
-    const after = await client.list();
-    assert.ok(after.every((v) => v.id !== volume), 'the destroyed volume is gone from the list');
+    // The teardown runs in slices after the reply (§4.4; measured 54–302 µs after it, 2026-09-14),
+    // so the list is polled within the startup budget, as the Rust client test does.
+    const goneBy = Date.now() + STARTUP_MS;
+    while ((await client.list()).some((v) => v.id === volume)) {
+      assert.ok(Date.now() < goneBy, 'the destroyed volume is gone from the list');
+      await sleep(POLL_MS);
+    }
 
     // Concurrency: many creates awaited at once, each its own reply — the multiplexing an async client
     // relies on (one reader serves them all, replies matched to requests by id).
