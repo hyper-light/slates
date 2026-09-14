@@ -5,6 +5,7 @@ authors = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
 rust-version = { workspace = true }
+repository = "https://github.com/hyper-light/slates"
 description = "The TypeScript/Node SDK (§2.3, D-19; Phase 5): a napi-rs addon over the typed `slates-client`, exposing the lifecycle verbs and mapping typed refusals to JS errors. Async-primary: the `AsyncClient` JS wrapper (`async.mjs`) resolves each verb's Promise by the completion fd's readiness (a libuv-polled `net.Socket`, uv_poll, no tokio); the sync `Client` on the addon is the thin blocking facade."
 
 [lib]

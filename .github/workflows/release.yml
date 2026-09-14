@@ -1,6 +1,8 @@
 # The nine-target release lane (Appendix B.2). In Phase 0 this is a dry run: every target
 # builds the workspace in release mode; the binary and asset steps arrive with the `slates`
-# CLI in Phase 2. A `guard` job asserts the git tag equals the workspace version.
+# CLI in Phase 2. The shared `version-guard.yml` asserts the git tag names the workspace version
+# (and that the npm copies are derived from it); the SDK publish lanes (publish-python.yml,
+# publish-node.yml) run on the same tag with the same guard (docs/publish.md).
 name: Release
 
 on:
@@ -13,20 +15,11 @@ env:
 
 jobs:
   guard:
-    name: tag equals workspace version
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    steps:
-      - uses: actions/checkout@v4
-      - name: Compare
-        run: |
-          version=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-          test "v$version" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != v$version"; exit 1; }
+    uses: ./.github/workflows/version-guard.yml
 
   build:
     name: ${{ matrix.target }}
     needs: [guard]
-    if: always() && (needs.guard.result == 'success' || needs.guard.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:

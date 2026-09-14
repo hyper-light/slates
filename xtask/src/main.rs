@@ -13,7 +13,14 @@
 //!   fails with its file and line.
 //! - `cargo xtask unsafe [--tighten]` — the unsafe budget per crate (`unsafe-budget.toml`),
 //!   which only tightens.
-//! - `cargo xtask check` — structural, literals and the unsafe budget.
+//! - `cargo xtask version [--write | --expect-tag TAG]` — the one version and every package that
+//!   carries it (see `version.rs`): the workspace version is the only hand-edited one; the Python
+//!   wheel derives it through maturin; the Node main package, its platform packages and its
+//!   `optionalDependencies` pins must equal it and are re-derived by `--write`; `--expect-tag` is
+//!   the release guard (the tag must be `v` + the version).
+//! - `cargo xtask npm-reserve --out DIR` — the 0.0.0 stub packages a maintainer publishes once to
+//!   create each npm name, derived from the same manifests (see `version.rs`).
+//! - `cargo xtask check` — structural, literals, the unsafe budget and the version.
 //! - `cargo xtask ratchet [--record] [--tighten] [--reset] [--runs N]` — the performance
 //!   ratchet over the bench examples, keyed by machine identity (see `ratchet.rs`).
 //! - `cargo xtask conformance (plan | run --suite S | all | matrix [--write]) [--records DIR]
@@ -30,6 +37,7 @@ use std::process::{Command, ExitCode};
 mod conformance;
 mod ratchet;
 mod unsafe_budget;
+mod version;
 
 /// A task failure with a plain-English message; printed and turned into a non-zero exit code.
 #[derive(Debug)]
@@ -63,7 +71,23 @@ fn main() -> ExitCode {
       .and_then(|root| unsafe_budget::run(&root, args.iter().any(|a| a == "--tighten"))),
     "check" => structural::run()
       .and_then(|()| literals::run())
-      .and_then(|()| workspace_root().and_then(|root| unsafe_budget::run(&root, false))),
+      .and_then(|()| workspace_root().and_then(|root| unsafe_budget::run(&root, false)))
+      .and_then(|()| workspace_root().and_then(|root| version::run(&root, &version::Mode::Check))),
+    "version" => workspace_root().and_then(|root| {
+      let mode = version::mode_from(&args[1..])?;
+      version::run(&root, &mode)
+    }),
+    "npm-reserve" => workspace_root().and_then(|root| {
+      let out = args
+        .iter()
+        .position(|a| a == "--out")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+          Failure("npm-reserve needs `--out DIR` (a directory outside the tree)".to_owned())
+        })?;
+      version::reserve(&root, &out)
+    }),
     "ratchet" => workspace_root().and_then(|root| {
       let runs = args
         .iter()
@@ -83,7 +107,7 @@ fn main() -> ExitCode {
       conformance::run(&root, &options)
     }),
     other => Err(Failure(format!(
-      "unknown task `{other}`; tasks: structural, literals, unsafe, check, ratchet, conformance"
+      "unknown task `{other}`; tasks: structural, literals, unsafe, version, npm-reserve, check, ratchet, conformance"
     ))),
   };
   match outcome {

@@ -1,3 +1,3 @@
-# `slates-linux-arm64-musl`
+# `@hyper-light/slates-linux-arm64-musl`
 
-This is the **aarch64-unknown-linux-musl** binary for `slates`
+This is the **aarch64-unknown-linux-musl** binary for `@hyper-light/slates`

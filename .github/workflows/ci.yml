@@ -36,6 +36,11 @@ jobs:
       # R3: every numeric literal in a tuning position carries its derivation (AC-0.2).
       - name: Literal check
         run: cargo xtask literals
+      # The one version (docs/publish.md): the Python wheel derives it through maturin and the npm
+      # packages are derived copies of the workspace version; a drift fails here, on every push,
+      # not at tag time in the publish lanes.
+      - name: Version check
+        run: cargo xtask version
       # The daemon provisions from usable memory and degrades honestly when the OS grants little
       # lockable RAM (§4.2 D-12; docs/bugs/2026-09-10-provisioning-budget-from-mlock-limit.md), so the
       # tests run under the runner's default mlock limit — no `ulimit` bump, which the runners ignore.
@@ -116,6 +121,77 @@ jobs:
       # none); on a reference machine with an entry in ratchets.toml it fails on a regression.
       - name: Ratchet
         run: cargo xtask ratchet
+
+  # The two SDKs as a user installs them (§2.4; docs/publish.md), by use on Linux and macOS. The
+  # cp39-abi3 wheel maturin builds is installed into a fresh venv after twine checks its metadata
+  # (what PyPI would refuse fails here); the napi addon `npm run build` produces is packed into the
+  # main and platform tarballs, installed into a fresh project, and the packaged smoke test imports the
+  # package by name — the loader resolving the addon through the optionalDependencies platform package
+  # — over a live daemon. Both SDKs' own by-use suites (sync and async, over a live daemon) run against
+  # the installed wheel and the built addon. The publish lanes run only on a tag, so this is where a
+  # packaging defect is caught on every push. The toolchains are the SDKs' own build backends (maturin,
+  # the napi CLI pinned as in publish-node.yml) plus twine, the check PyPI applies.
+  sdk:
+    name: SDK packaging by use (wheel, sdist, addon, tarballs)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Outside a manylinux container the wheel is tagged for this Linux only; that is what a
+          # local install needs, and the publish lane builds the manylinux wheels in the containers.
+          - { os: ubuntu-latest, maturin_compatibility: "--compatibility linux" }
+          - { os: macos-latest, maturin_compatibility: "" }
+    runs-on: ${{ matrix.os }}
+    env:
+      NAPI_CLI_VERSION: 3.7.2 # keep in sync with publish-node.yml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: The daemon both SDK suites spawn
+        run: cargo build -p slates-cli
+      - name: Build the wheel and the sdist, check their metadata, install the wheel into a fresh venv
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet 'maturin>=1.5,<2' twine
+          "$RUNNER_TEMP/venv/bin/maturin" build --release --out "$RUNNER_TEMP/dist" -m crates/sdk-python/Cargo.toml ${{ matrix.maturin_compatibility }}
+          "$RUNNER_TEMP/venv/bin/maturin" sdist --out "$RUNNER_TEMP/dist" -m crates/sdk-python/Cargo.toml
+          "$RUNNER_TEMP/venv/bin/twine" check --strict "$RUNNER_TEMP"/dist/*
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet --no-index "$RUNNER_TEMP"/dist/slates-*.whl
+      - name: The Python suites (sync and async) against the installed wheel over a live daemon
+        run: SLATES_DAEMON="$PWD/target/debug/slates" "$RUNNER_TEMP/venv/bin/python" -m unittest discover -s crates/sdk-python/tests -v
+      - name: Build the napi addon and run the Node suites (sync and async) over a live daemon
+        run: |
+          set -euo pipefail
+          npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
+          (cd crates/sdk-node && npm run build)
+          addon=$(ls crates/sdk-node/slates.*.node)
+          SLATES_NODE_ADDON="$PWD/$addon" SLATES_DAEMON="$PWD/target/debug/slates" \
+            node --test crates/sdk-node/tests/sdk.test.mjs crates/sdk-node/tests/sdk_async.test.mjs
+      - name: Pack the main and platform packages, install them into a fresh project, run the packaged smoke test
+        run: |
+          set -euo pipefail
+          binary=$(basename "$(ls crates/sdk-node/slates.*.node)")
+          platform=${binary#slates.}
+          platform=${platform%.node}
+          cp "crates/sdk-node/$binary" "crates/sdk-node/npm/$platform/"
+          (cd "crates/sdk-node/npm/$platform" && npm pack --pack-destination "$RUNNER_TEMP")
+          (cd crates/sdk-node && npm pack --pack-destination "$RUNNER_TEMP")
+          mkdir "$RUNNER_TEMP/project"
+          cd "$RUNNER_TEMP/project"
+          npm init -y >/dev/null
+          npm install "$RUNNER_TEMP"/hyper-light-slates-*.tgz
+          cp "$GITHUB_WORKSPACE/crates/sdk-node/tests/packaged.test.mjs" .
+          SLATES_DAEMON="$GITHUB_WORKSPACE/target/debug/slates" node --test packaged.test.mjs
 
   # The Windows cfg branches (the Win32 rendezvous, the IOCP driver, the Win32 machine facts, the
   # WinFsp bridge) lint on a NATIVE Windows runner — each platform builds and lints on its own OS, so

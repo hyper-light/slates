@@ -1,0 +1,163 @@
+# The Node SDK's release lane (§2.4 "`@hyper-light/slates` on npm"; docs/publish.md). On a pushed tag
+# `v<version>`: build the napi addon `slates.<platform>.node` of crates/sdk-node for every target in
+# package.json `napi.targets` — natively per platform (glibc Linux, macOS, Windows, aarch64 on the
+# native arm64 runners, Windows arm64 and ia32 by MSVC's cross tools on the x64 runner) and musl
+# inside node:24-alpine — then publish the nine platform packages and the main package to npm through
+# TRUSTED PUBLISHING: OIDC from the `npm` environment's id-token; no NPM_TOKEN anywhere. npm attaches
+# a trusted publisher only to a package that already exists (npm/cli#8544 — no PyPI-style pending
+# publishers), so each of the ten names is created once by a maintainer's 0.0.0 stub publish
+# (`cargo xtask npm-reserve`), then given its trusted publisher on npmjs.com (org hyper-light, repo
+# slates, workflow publish-node.yml); tag runs then publish tokenless. workflow_dispatch is a
+# build-only dry run.
+#
+# The versions are the workspace's: `cargo xtask version --write` derives every package.json from it
+# and the shared guard refuses a tag on any drift.
+name: Publish Node SDK
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  NAPI_CLI_VERSION: 3.7.2 # keep in sync with ci.yml's sdk job and docs/publish.md
+
+jobs:
+  guard:
+    uses: ./.github/workflows/version-guard.yml
+
+  # Non-musl targets build natively (glibc Linux, macOS, Windows); aarch64 Linux on the native arm64
+  # runner, macOS x86_64 and the Windows arm64/ia32 pair by the host toolchain's cross targets —
+  # the same targets release.yml already builds the workspace for.
+  build:
+    name: napi ${{ matrix.target }}
+    needs: guard
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-latest }
+          - { target: i686-pc-windows-msvc, os: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: napi-${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install the napi CLI
+        run: npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
+      # The package.json `build` script, so CI and a laptop run the one command (it leaves the
+      # hand-maintained index.js and index.d.ts alone: --no-js, --dts ignore.d.ts).
+      - name: Build
+        working-directory: crates/sdk-node
+        run: npm run build -- --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: crates/sdk-node/slates.*.node
+          if-no-files-found: error
+
+  # musl .node files build inside the official node:24-alpine image, NATIVE per arch (x86_64 on x64,
+  # aarch64 on arm64). Alpine is musl, so its toolchain ships a musl libgcc and the dynamic cdylib
+  # links cleanly (Debian's musl-tools only carries glibc's libgcc — vorpal's finding); the cdylib
+  # gets -crt-static from .cargo/config.toml. The container is launched with `docker run`, not
+  # `container:`, so checkout and upload stay on the host.
+  build-musl:
+    name: napi ${{ matrix.target }}
+    needs: guard
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the .node in node:24-alpine (native musl)
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w node:24-alpine sh -c '
+            set -e
+            apk add --no-cache build-base curl
+            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --default-toolchain 1.98.0 --profile minimal
+            . "$HOME/.cargo/env"
+            rustup target add ${{ matrix.target }}
+            npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
+            cd crates/sdk-node
+            npm run build -- --target ${{ matrix.target }}
+          '
+          # The container wrote as root; the upload runs as the runner user.
+          sudo chown -R "$(id -u):$(id -g)" crates/sdk-node target
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: crates/sdk-node/slates.*.node
+          if-no-files-found: error
+
+  publish:
+    name: Publish @hyper-light/slates to npm (trusted publishing)
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, build-musl]
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      id-token: write # OIDC: npm trusted publishing — no token, no 2FA prompt
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+      - name: Ensure npm supports trusted publishing (>= 11.5.1)
+        run: npm install -g npm@latest
+      - name: Install the napi CLI
+        run: npm install -g @napi-rs/cli@${{ env.NAPI_CLI_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: crates/sdk-node/artifacts
+      - name: Move every binary into its platform package
+        working-directory: crates/sdk-node
+        run: napi artifacts
+      # `napi prepublish` skips a platform package whose binary is missing with a warning, which
+      # would publish a main package that cannot load on that platform; refuse instead.
+      - name: Every platform package must hold its binary
+        working-directory: crates/sdk-node
+        run: |
+          set -euo pipefail
+          missing=0
+          for dir in npm/*/; do
+            main=$(node -p "require('./${dir}package.json').main")
+            if [ ! -f "${dir}${main}" ]; then
+              echo "missing: ${dir}${main}"
+              missing=1
+            fi
+          done
+          test "$missing" = 0
+      # `npm publish` runs prepublishOnly (`napi prepublish -t npm --no-gh-release`), which publishes
+      # each platform package (skipping one already live), then publishes the main package. A main
+      # version already live is skipped, so a re-run after a moved tag is harmless.
+      - name: Publish (platform packages through prepublishOnly, then the main package)
+        working-directory: crates/sdk-node
+        run: |
+          name=$(node -p "require('./package.json').name")
+          ver=$(node -p "require('./package.json').version")
+          if npm view "$name@$ver" version >/dev/null 2>&1; then
+            echo "$name@$ver is already on the registry; skipping (a re-run after a moved tag)"
+          else
+            npm publish --access public
+          fi

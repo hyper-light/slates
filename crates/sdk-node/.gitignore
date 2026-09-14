@@ -1,2 +1,9 @@
 # napi build artifacts (built per-platform in CI, not committed)
 *.node
+# The type file `napi build --dts ignore.d.ts` generates from the Rust surface; `index.d.ts` is the
+# hand-maintained public one (it also types the AsyncClient wrapper), so the generated file is parked
+# here and never shipped (`files` in package.json names what ships).
+ignore.d.ts
+# `npm pack` output and the artifacts directory `napi artifacts` consumes in the publish lane.
+*.tgz
+artifacts/

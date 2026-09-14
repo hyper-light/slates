@@ -1,3 +1,3 @@
-# `slates-darwin-x64`
+# `@hyper-light/slates-darwin-x64`
 
-This is the **x86_64-apple-darwin** binary for `slates`
+This is the **x86_64-apple-darwin** binary for `@hyper-light/slates`
