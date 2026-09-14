@@ -947,6 +947,17 @@ cluster.
 > by use on the readiness-native driver: `crates/rt/tests/tcp.rs` runs an accept→read→write→read round
 > trip with both ends on the runtime's own sockets, `tests/udp.rs` the datagram path. The
 > completion-native socket path (io_uring, IOCP) stays owed.
+>
+> **Status (2026-09-13).** The ring and handle cores and the kick-if-parked protocol are model-checked
+> under loom (AC-0.7, T-0.3): the one-producer ring, two contending producers, a lapping producer, a
+> handle crossing threads against its slot's reuse, and one sender against one parking shard pass every
+> interleaving explored under a two-preemption bound and a 224-branch cap (`slates_mem::loom_bounds`;
+> 157 / 3,865 / 26 / 6 / 27 interleavings; `docs/wip/concurrency.md`). The parking protocol lives in one
+> seam (`crates/rt/src/parking.rs`) with a `SeqCst` fence between the write and the read on both sides:
+> loom found that the flag's `SeqCst` store and load alone let a foreign wake be lost when the ring's
+> `Release` publication sits outside that order, which x86's store buffer realizes
+> (`docs/bugs/2026-09-13-parked-shard-loses-a-foreign-wake.md`). shuttle runs T-1.6 and T-6.7 nightly
+> over the pure cores; TSan is owed.
 
 **Failure matrix.** Driver setup refused (seccomp): Masked (epoll). Task arena full: Refused
 (`TooManyTasks`, admission). A task exceeding the bounded-work rule (measured per-iteration budget
@@ -2723,7 +2734,10 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > not-yet-committed path). The fully general intra-increment coordination (a path both renamed away
 > and recreated in one increment), that shifting-op per-range identity, the checkpoint folding of the
 > canonical deltas, and the copy-on-write green chain are the rest of Phase 6; the fleet register,
-> mirror and reconfiguration protocols are now simulated (§4.8 status, GAPS §8h).
+> mirror and reconfiguration protocols are now simulated (§4.8 status, GAPS §8h). T-6.7 has its
+> shuttle form: sixteen agents through one green's owner, 200 seeded schedules, the commit order
+> linearizable and the fast-path counter equal to the oracle's disjoint count
+> (`crates/merge/tests/shuttle_green.rs`).
 
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an
