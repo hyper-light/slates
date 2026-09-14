@@ -15,9 +15,17 @@
 //! budget (R3); a budget below one unit of work still makes progress, so the walk always terminates.
 //!
 //! Chunking is fixed-size at the volume's chunk size (the copy-on-write unit, §4.5), so the same
-//! bytes at the same offsets cut into the same chunks and deduplicate across snapshots by identity;
-//! content-defined chunking (FastCDC) and the compress-or-not cost model are the codec pass's owed
-//! refinements (D-17), so chunks are stored raw here. A file's bytes are read **at the snapshot**
+//! bytes at the same offsets cut into the same chunks and deduplicate across snapshots by identity —
+//! the design's rule for large files ("page-multiple fixed chunks", research §2.4). Each chunk is
+//! stored under the **compress-or-not cost model** (D-17, §4.11; [`slates_archive::codec`]): the
+//! [`CodecPolicy`] the caller derives from the boot profile's measured codec points decides raw, LZ4 or
+//! a zstd level per chunk; the manifest identity is the BLAKE3 of the raw bytes and never depends on it.
+//! Content-defined chunking (FastCDC) is the design's *measured, per-volume* gate ("only for the class
+//! of files whose measured size exceeds a threshold and whose observed dedup gain … exceeds the
+//! measured hashing cost", research §2.4): the walk records the measurements that gate needs — the
+//! file-size distribution it walked and the bytes deduplication saved per byte hashed
+//! ([`Walked`]) — and the chunker itself is derived from them once they have data (owed until then; a
+//! fixed FastCDC regime would be a magic policy, R3). A file's bytes are read **at the snapshot**
 //! ([`Volume::read_in`]), never at the head. A symlink is carried as a file whose bytes are its
 //! target and whose mode carries the link type bits — the manifest has directory and file nodes
 //! only, and the mode's type bits ([`kind_of_mode`]) are what tell a restore the kind. A base-backed
@@ -35,7 +43,7 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use slates_archive::format::Chunk as ArchiveChunk;
-use slates_archive::{Archive, Entry, Extent, Node, NodeMeta};
+use slates_archive::{Archive, CodecPolicy, Entry, Extent, Node, NodeMeta};
 use slates_mem::Handle;
 
 use crate::dir::{Child, DirNode};
@@ -128,20 +136,70 @@ pub struct SnapshotArchiver {
   file: Option<FileCursor>,
   chunks: Vec<ArchiveChunk>,
   seen: BTreeSet<[u8; 32]>,
-  bytes_hashed: u64,
+  codec: CodecPolicy,
+  walked: Walked,
+}
+
+/// Format: the file-size histogram's classes are powers of two of bytes; a `u64` size falls in one of
+/// these many classes (bit length 0 through 64).
+const SIZE_CLASSES: usize = (u64::BITS + 1) as usize;
+
+/// What one walk **measured** about the volume it archived (§4.11, research §2.4): the inputs the
+/// content-defined-chunking gate is derived from — "FastCDC only for the class of files whose measured
+/// size exceeds a threshold and whose observed dedup gain (bytes saved per byte hashed, tracked per
+/// volume) exceeds the measured hashing cost; the FastCDC parameters … re-derived from the measured
+/// file-size distribution of the volume". Recorded per walk so the gate reads real numbers, never a
+/// fixed regime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Walked {
+  /// Every byte read from the snapshot and hashed (the walk's cost).
+  pub bytes_hashed: u64,
+  /// Bytes a chunk already seen in this walk would have occupied again — what fixed-size chunking
+  /// deduplicated within the snapshot (the dedup gain per byte hashed, against `bytes_hashed`).
+  pub bytes_saved_by_dedup: u64,
+  /// Raw bytes and stored bytes over every distinct chunk: what the cost model saved.
+  pub raw_bytes: u64,
+  /// The bytes the distinct chunks occupy as stored (compressed where the policy chose to).
+  pub stored_bytes: u64,
+  /// How many files fell in each power-of-two size class (index = bit length of the size), the
+  /// file-size distribution the chunking parameters are derived from.
+  pub file_sizes: [u64; SIZE_CLASSES],
+}
+
+impl Default for Walked {
+  fn default() -> Walked {
+    Walked {
+      bytes_hashed: 0,
+      bytes_saved_by_dedup: 0,
+      raw_bytes: 0,
+      stored_bytes: 0,
+      file_sizes: [0; SIZE_CLASSES],
+    }
+  }
+}
+
+impl Walked {
+  fn file(&mut self, size: u64) {
+    let class = usize::try_from(u64::BITS - size.leading_zeros()).unwrap_or(0);
+    self.file_sizes[class.min(SIZE_CLASSES - 1)] =
+      self.file_sizes[class.min(SIZE_CLASSES - 1)].saturating_add(1);
+  }
 }
 
 impl SnapshotArchiver {
   /// Starts the walk of `id` in `volume`, rooted at the snapshot's frozen root. `volume_id` is the
   /// informational volume identity the archive header carries (the caller's routing id) and
   /// `created_unix` its informational creation time (Unix seconds, the caller's clock — the walk
-  /// itself reads no clock, so it is pure and deterministic).
+  /// itself reads no clock, so it is pure and deterministic). `codec` is the compress-or-not policy
+  /// each chunk is stored under (D-17; the caller derives it from the boot profile's measured codec
+  /// points, or [`CodecPolicy::raw_only`] where none were measured).
   pub fn new(
     volume: &Volume,
     store: &Store,
     id: SnapshotId,
     volume_id: u64,
     created_unix: u64,
+    codec: CodecPolicy,
   ) -> Result<SnapshotArchiver, VfsError> {
     let snapshot = volume
       .snapshots
@@ -170,13 +228,21 @@ impl SnapshotArchiver {
       file: None,
       chunks: Vec::new(),
       seen: BTreeSet::new(),
-      bytes_hashed: 0,
+      codec,
+      walked: Walked::default(),
     })
   }
 
   /// The bytes hashed so far — the non-vacuity counter a test reads to know the walk did real work.
   pub fn bytes_hashed(&self) -> u64 {
-    self.bytes_hashed
+    self.walked.bytes_hashed
+  }
+
+  /// What the walk has measured so far ([`Walked`]): the dedup gain, the compression saving and the
+  /// file-size distribution — complete once [`advance`](SnapshotArchiver::advance) returns
+  /// [`Progress::Done`].
+  pub fn walked(&self) -> &Walked {
+    &self.walked
   }
 
   /// Does about `byte_budget` bytes of work (at least one unit, so the walk always progresses) and
@@ -275,6 +341,7 @@ impl SnapshotArchiver {
       return Err(VfsError::RecoveryIncomplete);
     }
     let size = inode.attrs.size;
+    self.walked.file(size);
     let meta = node_meta(next.inode, &inode.attrs, MODE_FILE);
     if size == 0 {
       self.push_entry(Entry {
@@ -384,16 +451,21 @@ impl SnapshotArchiver {
     }
   }
 
-  /// Records a raw chunk once by identity and returns that identity.
+  /// Records a chunk once by identity — stored under the cost model's verdict for its bytes
+  /// ([`Archive::chunk_with`]) — and returns that identity; a chunk already seen in this walk is
+  /// deduplicated (its bytes counted as saved) and not stored or compressed again.
   fn push_chunk(&mut self, bytes: Vec<u8>) -> [u8; 32] {
-    self.bytes_hashed = self
-      .bytes_hashed
-      .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-    let chunk = Archive::raw_chunk(bytes);
-    let identity = chunk.identity;
-    if self.seen.insert(identity) {
-      self.chunks.push(chunk);
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    self.walked.bytes_hashed = self.walked.bytes_hashed.saturating_add(len);
+    let identity = slates_archive::archive::hash_of(&bytes);
+    if !self.seen.insert(identity) {
+      self.walked.bytes_saved_by_dedup = self.walked.bytes_saved_by_dedup.saturating_add(len);
+      return identity;
     }
+    let chunk = Archive::chunk_with(bytes, &self.codec);
+    self.walked.raw_bytes = self.walked.raw_bytes.saturating_add(chunk.raw_len);
+    self.walked.stored_bytes = self.walked.stored_bytes.saturating_add(chunk.stored_len);
+    self.chunks.push(chunk);
     identity
   }
 
@@ -533,7 +605,15 @@ mod tests {
     id: SnapshotId,
     budget: u64,
   ) -> (Archive, u32) {
-    let mut archiver = SnapshotArchiver::new(volume, store, id, VOLUME_ID, CREATED_UNIX).unwrap();
+    let mut archiver = SnapshotArchiver::new(
+      volume,
+      store,
+      id,
+      VOLUME_ID,
+      CREATED_UNIX,
+      CodecPolicy::raw_only(),
+    )
+    .unwrap();
     let mut slices = 0;
     loop {
       slices += 1;
@@ -662,7 +742,15 @@ mod tests {
     populate(&mut volume, &mut store);
     let id = volume.snapshot(&mut store).unwrap();
     let budget = u64::try_from(PAGE * 16).unwrap();
-    let mut archiver = SnapshotArchiver::new(&volume, &store, id, VOLUME_ID, CREATED_UNIX).unwrap();
+    let mut archiver = SnapshotArchiver::new(
+      &volume,
+      &store,
+      id,
+      VOLUME_ID,
+      CREATED_UNIX,
+      CodecPolicy::raw_only(),
+    )
+    .unwrap();
     let mut before = 0;
     let mut slices = 0;
     let done = loop {

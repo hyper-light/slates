@@ -24,6 +24,7 @@
 //! work (owed).
 
 pub mod archive;
+pub mod codec;
 pub mod format;
 pub mod manifest;
 pub mod restore;
@@ -32,6 +33,7 @@ pub mod transfer;
 pub mod wire;
 
 pub use archive::Archive;
+pub use codec::{CodecPolicy, CodecRate, Verdict};
 pub use format::{ArchiveError, Chunk, Encoding};
 pub use manifest::{Entry, Extent, ManifestError, Node, NodeMeta};
 pub use restore::{Restored, restore};

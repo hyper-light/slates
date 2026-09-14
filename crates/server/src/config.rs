@@ -203,6 +203,19 @@ pub struct DaemonConfig {
   /// BLAKE3 throughput — so a seal (§4.10) is archived in bounded slices (§4.3) that never take the whole
   /// step from the clients.
   pub archive_slice_bytes: u64,
+  /// Derived: the compress-or-not cost model each sealed chunk is stored under (§4.11, D-17): the boot
+  /// profile's measured codec points (LZ4 and each zstd level's compress and decompress throughput and
+  /// ratio over the probe corpus) as the policy's candidates; a byte's neutral worth = its measured
+  /// memcpy cost; `E[reads] = 1` (a seal's archive is the replication copy, read about once per
+  /// re-attach or takeover: §4.11 "about one per re-attach for archived"); `value_of_byte` and
+  /// `value_of_cpu` at neutral. At neutral the model stores a chunk read once **raw** — moving a byte is
+  /// far cheaper than compressing it, the design's "hot volumes stay raw unless pressure raises
+  /// `value_of_byte`" — so what compresses is decided by the two value signals, both owed as
+  /// derivations, not literals: the archive class's `value_of_byte` (a placed byte occupies `f + 1`
+  /// holders' RAM for the snapshot's retention, so its worth is that retention over one memcpy time,
+  /// per copy — "archived volumes compress once") and the live memory-pressure and load signals. Raw-only
+  /// when the profile measured no codec.
+  pub codec: slates_archive::CodecPolicy,
   /// The fleet this node joins (§4.8, boot step 6), or `None` for the laptop (`f = 0`, solo — the
   /// degenerate of the same code path, R8). A single-host daemon leaves this `None` and every placement
   /// is local; a fleet node names its quorum and peers, and the placement authority, configuration group
@@ -295,6 +308,15 @@ impl DaemonConfig {
       ["hash.blake3_bytes_per_second", "rt.step_budget_ns"]
     );
     derivations.push(note("archive_slice_bytes", &archive_slice_bytes));
+    let codec = codec_policy(profile);
+    derivations.push(format!(
+      "codec = lz4 {}, zstd levels {:?}, byte worth {} scaled ns: the profile's measured codec points, a \
+       byte worth its memcpy cost at neutral value_of_byte and value_of_cpu, E[reads] = 1 (anchors \
+       [\"codecs\", \"memcpy.bytes_per_second\"])",
+      codec.lz4.is_some(),
+      codec.zstd.iter().map(|rate| rate.level).collect::<Vec<_>>(),
+      codec.byte_ns_scaled
+    ));
     let geometry = Geometry {
       partitions: runtime.shards.max(1),
       page,
@@ -429,6 +451,7 @@ impl DaemonConfig {
       // re-replication bandwidth (or the deferred network-empirical measurement supplies it).
       rereplication_bytes_per_second: 0,
       archive_slice_bytes: archive_slice_bytes.get(),
+      codec,
       // The laptop default: no fleet, `f = 0`, solo. An operator deploying a fleet sets this (with
       // `with_fleet`); the derivation from the machine profile is the same either way (R8).
       fleet: None,
@@ -487,6 +510,38 @@ impl DaemonConfig {
     self.fleet = Some(membership);
     self
   }
+}
+
+/// The cost model's policy from the profile's measured codec points (§4.11, D-17): the `lz4` point
+/// (the probe codec) and every `zstd` level point become the candidates, each with its measured
+/// compress and decompress cost and ratio; the value constants are neutral and `E[reads]` is one (see
+/// [`DaemonConfig::codec`]). A profile that measured no codec (the probe off, or the codecs not
+/// compiled in) yields the raw-only policy — the same decision path with no candidates (R8).
+fn codec_policy(profile: &MachineProfile) -> slates_archive::CodecPolicy {
+  let mut policy = slates_archive::CodecPolicy::raw_only();
+  // The neutral worth of a byte: the measured memcpy bandwidth at the largest probed size (the
+  // streaming rate a chunk moves at), so a codec pays when the bytes it saves would cost more to move
+  // than to compress and decompress.
+  let memcpy = profile
+    .memcpy
+    .iter()
+    .max_by_key(|point| point.bytes)
+    .map_or(0, |point| point.bytes_per_second);
+  policy.byte_ns_scaled = slates_archive::CodecPolicy::byte_worth_from_memcpy(memcpy);
+  for point in &profile.codecs {
+    let rate = slates_archive::CodecRate::from_throughput(
+      point.level,
+      point.compress_bytes_per_second,
+      point.decompress_bytes_per_second,
+      point.ratio_permille,
+    );
+    match point.codec.as_str() {
+      "lz4" => policy.lz4 = Some(rate),
+      "zstd" => policy.zstd.push(rate),
+      _ => {}
+    }
+  }
+  policy
 }
 
 fn note<T: std::fmt::Debug>(name: &str, d: &Derived<T>) -> String {

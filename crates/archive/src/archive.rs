@@ -83,7 +83,9 @@ pub struct Archive {
 }
 
 /// The BLAKE3 of `bytes`.
-fn hash_of(bytes: &[u8]) -> [u8; 32] {
+/// The content identity of `bytes` — the BLAKE3 of the raw bytes, the address every chunk is stored
+/// and verified under, whatever encoding it is stored in.
+pub fn hash_of(bytes: &[u8]) -> [u8; 32] {
   *blake3::hash(bytes).as_bytes()
 }
 
@@ -127,27 +129,74 @@ impl Archive {
     }
   }
 
-  /// A chunk record compressed with zstd (D-17's ratio-bearing codec), kept only when it is smaller
-  /// than the raw bytes (the format-derived floor); otherwise stored raw. The identity is always the
-  /// BLAKE3 of the raw bytes. Level 0 selects zstd's default level; the calibrated per-chunk level
-  /// and the LZ4-vs-zstd-vs-raw cost model are the rest of the codec pass (owed; GAPS §8g, they need
-  /// the boot profile so R3 forbids fixing them here). Behind the `zstd` feature (on by default).
+  /// A chunk record compressed with zstd (D-17's ratio-bearing codec) at the library's default level,
+  /// kept only when it is smaller than the raw bytes (the format-derived floor); otherwise stored raw.
+  /// The identity is always the BLAKE3 of the raw bytes. The calibrated per-chunk level is
+  /// [`chunk_with`](Archive::chunk_with)'s (the cost model); this is the default-level form a caller
+  /// without a policy uses. Behind the `zstd` feature (on by default).
   #[cfg(feature = "zstd")]
   pub fn zstd_chunk(bytes: Vec<u8>) -> Chunk {
+    // Format: zstd level 0 is the library's default level.
+    Self::zstd_chunk_at(bytes, 0)
+  }
+
+  /// A chunk record compressed with zstd at `level`, kept only when it is smaller than the raw bytes
+  /// (the format floor); otherwise stored raw. The level is recorded on the chunk (the format's `level`
+  /// byte; a level outside the byte is stored as its low byte — the reader needs no level to decode).
+  #[cfg(feature = "zstd")]
+  pub fn zstd_chunk_at(bytes: Vec<u8>, level: i32) -> Chunk {
     let identity = hash_of(&bytes);
     let raw_len = bytes.len() as u64;
-    // Format: zstd level 0 is the library's default level; the cost model chooses the real level.
-    match zstd::bulk::compress(&bytes, 0) {
+    match zstd::bulk::compress(&bytes, level) {
       Ok(compressed) if (compressed.len() as u64) < raw_len => Chunk {
         identity,
         raw_len,
         stored_len: compressed.len() as u64,
         encoding: Encoding::Zstd,
-        level: 0,
+        level: u8::try_from(level.max(0)).unwrap_or(u8::MAX),
         dictionary: [0u8; 32],
         payload: compressed,
       },
       _ => Self::raw_chunk(bytes),
+    }
+  }
+
+  /// A chunk record under the **cost model** (§4.11, D-17; [`crate::codec::decide`]): the sampler,
+  /// the LZ4 probe and the per-level prediction choose raw, LZ4 or a zstd level from the policy's
+  /// measured points; the chosen codec's output is kept only when it is smaller than the raw bytes (the
+  /// format floor, checked again on the real output — a prediction never stores a larger chunk). The
+  /// identity is always the BLAKE3 of the raw bytes, so the decision never touches a manifest identity.
+  /// A zstd verdict without the `zstd` feature falls to LZ4 (the probe's output, already computed).
+  pub fn chunk_with(bytes: Vec<u8>, policy: &crate::codec::CodecPolicy) -> Chunk {
+    let (verdict, probe) = crate::codec::decide(policy, &bytes);
+    match verdict {
+      crate::codec::Verdict::Raw => Self::raw_chunk(bytes),
+      crate::codec::Verdict::Lz4 => Self::lz4_chunk_from(bytes, probe),
+      #[cfg(feature = "zstd")]
+      crate::codec::Verdict::Zstd(level) => Self::zstd_chunk_at(bytes, level),
+      #[cfg(not(feature = "zstd"))]
+      crate::codec::Verdict::Zstd(_) => Self::lz4_chunk_from(bytes, probe),
+    }
+  }
+
+  /// An LZ4 chunk from the probe's output when the probe ran (so the bytes are not compressed twice),
+  /// else compressed here; raw when the output does not save space.
+  fn lz4_chunk_from(bytes: Vec<u8>, probe: Option<Vec<u8>>) -> Chunk {
+    let identity = hash_of(&bytes);
+    let raw_len = bytes.len() as u64;
+    let compressed = probe.unwrap_or_else(|| lz4_flex::block::compress(&bytes));
+    if (compressed.len() as u64) < raw_len {
+      Chunk {
+        identity,
+        raw_len,
+        stored_len: compressed.len() as u64,
+        encoding: Encoding::Lz4,
+        level: 0,
+        dictionary: [0u8; 32],
+        payload: compressed,
+      }
+    } else {
+      Self::raw_chunk(bytes)
     }
   }
 

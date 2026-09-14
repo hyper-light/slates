@@ -1354,6 +1354,7 @@ fn start_seal(
     verbs::core_snapshot(slates_ipc::protocol::SnapshotId { value: head.value }),
     object.local(),
     created_unix,
+    state.config.codec.clone(),
   );
   let Ok(archiver) = archiver else {
     *state.refusals.entry(SEAL_REFUSED).or_insert(0) += 1;

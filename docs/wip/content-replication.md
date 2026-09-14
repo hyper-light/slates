@@ -159,6 +159,95 @@ this piece: it is a configuration-group action (the council replaces the candida
 the council's membership reconcile, and its threshold needs the hedge rate's variance over the window the
 readings now exist for. Reported as the next owed step of §4.10, with the readings it needs in place.
 
-## Piece 3 — content-defined chunking and the compress-or-not cost model (D-17)
+## Piece 3 — the compress-or-not cost model (D-17), and the chunking gate's measurements (landed)
 
-See the section appended below when it lands.
+**The design's rule** (§4.11 "Cost model"): *inputs from the profile (codec throughput per level, hash
+throughput, memcpy bandwidth, free memory) and from the volume (… expected read count per chunk: high
+for attached, ~1 per re-attach for archived); per chunk: zero-detect → Btrfs-style sampled statistics →
+LZ4 probe with early exit → predicted savings per level → choose the encoding maximizing `bytes_saved ×
+value_of_byte(pressure) − (t_compress + E[reads] × t_decompress) × value_of_cpu(load)`, subject to the
+format floor. Hot volumes stay raw unless pressure raises `value_of_byte`; archived volumes compress
+once.* D-17 lost the fixed "save 12.5 %" rules. Chunking (research §2.4, ratified): *page-multiple fixed
+chunks for large files; FastCDC only for the class of files whose measured size exceeds a threshold and
+whose observed dedup gain (bytes saved per byte hashed, tracked per volume) exceeds the measured hashing
+cost; the FastCDC parameters … re-derived from the measured file-size distribution of the volume.*
+
+**What the tree did before.** The archiver stored every chunk raw (`Archive::raw_chunk`); the archive
+crate had `compressed_chunk` (LZ4 if smaller) and `zstd_chunk` (level 0) as unconnected constructors
+whose docs named the cost model as owed; the boot profile already measured every codec point
+(`CodecPoint`: compress and decompress throughput and ratio for LZ4 and zstd levels 1/3/9/19) and
+nothing read them.
+
+**The change** — the model as a pure decision, applied by the archiver under a policy derived at boot:
+- `crates/archive/src/codec.rs` (new, cfg-free, unit-tested with synthetic profile points): the Btrfs
+  sampler with its constants reproduced by name (`SAMPLING_READ_SIZE 16`, `SAMPLING_INTERVAL 256`,
+  `BYTE_SET_THRESHOLD 64`, `BYTE_CORE_SET_LOW/HIGH 64/200`, `ENTROPY_LVL_ACEPTABLE/HIGH 65/80`; the
+  entropy in integer fixed point); the LZ4 probe with early exit (OpenZFS early abort, Borg `auto`);
+  the per-level size prediction from the probe (the machine's own ratio points when both LZ4 and the
+  level were measured, else Silesia's 0.73 prior); the maximization; the format floor (a chunk record's
+  fixed fields, 82 bytes). Integer arithmetic throughout, so two hosts with one profile decide alike
+  and the archive bytes are deterministic under one policy.
+- `CodecPolicy { lz4, zstd: Vec<CodecRate>, byte_ns_scaled, value_of_byte_permille,
+  value_of_cpu_permille, expected_reads }`; `Archive::chunk_with(bytes, &policy)`;
+  `Archive::zstd_chunk_at(bytes, level)` records the chosen level on the chunk (the format's `level`
+  byte; the reader needs no level to decode).
+- `SnapshotArchiver::new(…, codec)` stores every distinct chunk through `chunk_with`;
+  `DaemonConfig::codec` is derived at boot from `profile.codecs` and logged, the byte's neutral worth
+  from `profile.memcpy` (largest probed size); `start_seal` passes it. A profile that measured no codec
+  yields `CodecPolicy::raw_only()` — the same path with no candidates (R8).
+- The **neutral exchange rate**, found by measurement: the objective compares bytes to nanoseconds, and
+  the first cut priced a byte at one scaled nanosecond — a dimensionless coincidence that made every
+  chunk raw. The derived rate: a byte is worth its measured memcpy cost (`byte_worth_from_memcpy`), so a
+  codec pays when the bytes it saves would have cost more to move than to compress and decompress.
+
+**Failing tests first and what they measured** (the archive crate; `cargo test -p slates-archive`):
+
+| Test / arm | Verdict | Why |
+|---|---|---|
+| 8 KiB structured text, neutral (byte = 1 memcpy at 10 GB/s = 0.1 ns; read once) | **Raw** | LZ4 saves ~4 KB ≈ 400 ns of moves; compressing costs 8192 × 1.76 ns ≈ 14 µs — ~50× more. The design's "hot volumes stay raw unless pressure raises `value_of_byte`", measured. |
+| the same text, `value_of_byte` = 100× | **LZ4** | the LZ4/zstd-1 crossover with these points: LZ4's speed and zstd-1's ratio tie within a few µs; LZ4 wins by a hair |
+| the same text, `value_of_byte` = 10 000× | **Zstd(level)** | the ratio codec's extra saving dwarfs every cost |
+| the same text, `value_of_byte` = 10⁶× | **Zstd(19)** | the strongest measured level when bytes are all that matter |
+| 8 KiB xorshift noise, any value | **Raw** | the sampler's core set ≥ 200: incompressible, no probe run |
+| all-zero 8 KiB | **Raw** (hole) | zero-detect first |
+| 40 bytes of `A`s | **Raw** | the format floor: no saving can exceed the record's 82 metadata bytes |
+
+The first assertion I wrote — "text under measured points is zstd at neutral" — was **wrong** and the
+model was right: at neutral a chunk read once is cheaper to move than to compress by ~50× with the
+profile-shaped points; the test now asserts the design's rule (raw at neutral, zstd when bytes are
+precious) as its non-vacuous contrast, and the by-use archive test (`crates/archive/tests/archive.rs`)
+does the same and shows the chosen level recorded on the chunk, the identity unchanged, a
+policy-built archive round-tripping, and two archives under one policy encoding identically.
+
+**Chunking.** The design gates FastCDC on two *measured per-volume* quantities nothing tracked:
+`Walked { bytes_hashed, bytes_saved_by_dedup, raw_bytes, stored_bytes, file_sizes[65] }` on the
+archiver now records them per walk (the dedup gain per byte hashed; the file-size distribution by
+power-of-two class). FastCDC itself is **not** built: deriving its threshold and parameters needs those
+measurements to have data over real volumes, and a fixed FastCDC regime would be a magic policy (R3).
+Fixed page-multiple chunks remain, which the design names as the rule for large files.
+
+**Owed, named from the measurement, not invented:** (1) the archive class's `value_of_byte` — a placed
+byte occupies `f + 1` holders' RAM for the snapshot's retention, so its worth is that retention over one
+memcpy time, per copy ("archived volumes compress once"), a derivation from the retention horizon and
+`f`; (2) the live `value_of_byte(pressure)` and `value_of_cpu(load)` signals (the reserve's headroom;
+the runtime's load) — until they are wired the daemon stores at neutral, i.e. raw, which is the design's
+rule for a copy read once; (3) FastCDC derived from `Walked` once volumes have been measured; (4) the
+regression's online update (zstd `--adapt`'s idea) — today the prior/point ratio is static per boot.
+
+**On the final tree** (2026-09-13 19:38–19:40, load 4.5–5.9): `cargo test -p slates-archive` 48 passed;
+`-p slates-vfs` 97 passed; `-p slates-server --lib` 22 passed; singly `-- --exact`: seal 3.96 s, hedge
+6.63 s, healer 14.50 s, takeover-content 9.22 s (the daemon archiving under its real profile's codec
+points at neutral); `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+`cargo xtask check` clean.
+
+## Benchmark for the integrator (a quiet box)
+
+Not run here (the box is shared). The cost model's per-chunk cost at the profile's own points:
+
+```
+cargo test -p slates-archive --release --lib codec -- --nocapture
+```
+
+and the seal-to-placed wall time with compression on versus `CodecPolicy::raw_only()` is the number
+to record in `BENCHMARKS.md` once the archive-class `value_of_byte` derivation lands (at neutral both
+store raw, so the A/B is not yet informative).
