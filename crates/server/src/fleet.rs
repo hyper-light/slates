@@ -94,7 +94,7 @@ use slates_cluster::root_group::root_representatives;
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once};
 use slates_cluster::{
   ClusterError, CommitBudget, DispatchWait, PROMOTE_STREAM, RECORD_STREAM, Reply, Stragglers,
-  commit_record, promote_record, request_within,
+  TimedReply, commit_record, promote_record, request_within,
 };
 use slates_db::Op;
 use slates_db::catalog::{
@@ -2443,8 +2443,8 @@ impl Dispatch {
         let mut recovered = Vec::with_capacity(arrived.len());
         let mut replies = Vec::new();
         for (host, reply, endpoint) in arrived {
-          if !reply.is_empty() {
-            replies.push(reply);
+          if !reply.bytes.is_empty() {
+            replies.push(reply.bytes);
           }
           recovered.push((host, endpoint));
         }
@@ -2715,7 +2715,7 @@ async fn broadcast(
   requests: Vec<(HostId, Vec<u8>, Endpoint)>,
   stream: u64,
   budget: CommitBudget,
-) -> (Vec<(HostId, Vec<u8>, Endpoint)>, Stragglers) {
+) -> (Vec<(HostId, TimedReply, Endpoint)>, Stragglers) {
   if requests.is_empty() {
     return (Vec::new(), Stragglers::none());
   }
@@ -2812,7 +2812,7 @@ async fn drive_council_replication(
   let mut recovered = kept;
   let mut replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
-    replies.push(reply);
+    replies.push(reply.bytes);
     recovered.push((host, endpoint));
   }
   state::with_state(|s| {
@@ -2865,7 +2865,7 @@ async fn drive_council_election(
   let mut sessions = Vec::with_capacity(replied.len());
   let mut pre_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
-    pre_replies.push(reply);
+    pre_replies.push(reply.bytes);
     sessions.push((host, endpoint));
   }
   // A voter whose pre-vote reply is late is settled by the coordinator: its session comes back then (the
@@ -2905,7 +2905,7 @@ async fn drive_council_election(
   let mut recovered = Vec::with_capacity(replied.len());
   let mut vote_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
-    vote_replies.push(reply);
+    vote_replies.push(reply.bytes);
     recovered.push((host, endpoint));
   }
   state::with_state(|s| {
@@ -3220,7 +3220,7 @@ async fn drive_root_replication(
   let mut recovered = kept;
   let mut replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
-    replies.push(reply);
+    replies.push(reply.bytes);
     recovered.push((host, endpoint));
   }
   state::with_state(|s| {
@@ -3267,7 +3267,7 @@ async fn drive_root_election(
   let mut sessions = Vec::with_capacity(replied.len());
   let mut pre_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
-    pre_replies.push(reply);
+    pre_replies.push(reply.bytes);
     sessions.push((host, endpoint));
   }
   // A voter whose pre-vote reply is late is settled by the coordinator: its session comes back then (the
@@ -3306,7 +3306,7 @@ async fn drive_root_election(
   let mut recovered = Vec::with_capacity(replied.len());
   let mut vote_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
-    vote_replies.push(reply);
+    vote_replies.push(reply.bytes);
     recovered.push((host, endpoint));
   }
   state::with_state(|s| {
@@ -3353,8 +3353,8 @@ async fn drive_root_learner_fetch(
   let mut recovered = Vec::with_capacity(replied.len());
   let mut fetched: Vec<Vec<u8>> = Vec::new();
   for (host, reply, endpoint) in replied {
-    if !reply.is_empty() {
-      fetched.push(reply);
+    if !reply.bytes.is_empty() {
+      fetched.push(reply.bytes);
     }
     recovered.push((host, endpoint));
   }
@@ -3407,8 +3407,8 @@ async fn drive_learner_fetch(
   let mut recovered = Vec::with_capacity(replied.len());
   let mut fetched: Vec<Vec<u8>> = Vec::new();
   for (host, reply, endpoint) in replied {
-    if !reply.is_empty() {
-      fetched.push(reply);
+    if !reply.bytes.is_empty() {
+      fetched.push(reply.bytes);
     }
     recovered.push((host, endpoint));
   }
@@ -3863,7 +3863,7 @@ pub(crate) async fn forward_over_leader_session(
   let (_, endpoint) = sessions.pop()?;
   let (reply, endpoint) = request_within(endpoint, FORWARD_STREAM, &request, deadline_ns).await;
   return_sessions(vec![(peer, endpoint)]);
-  Some(reply)
+  Some(reply.bytes)
 }
 
 /// The pending takeovers this node should drive: the objects it owes a takeover for

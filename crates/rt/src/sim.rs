@@ -214,7 +214,11 @@ impl SimFabric {
 
   /// Puts a datagram in `dest`'s mailbox; returns the waker word of a receiver waiting on it.
   fn deliver(&mut self, dest: u16, bytes: Vec<u8>, from: u16) -> Option<u64> {
-    self.mailboxes.entry(dest).or_default().push_back((bytes, from));
+    self
+      .mailboxes
+      .entry(dest)
+      .or_default()
+      .push_back((bytes, from));
     self.interests.remove(&dest)
   }
 

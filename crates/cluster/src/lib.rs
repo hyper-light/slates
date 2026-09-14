@@ -44,6 +44,7 @@ pub mod raft_wire;
 pub mod root_group;
 pub mod routing;
 pub mod swim;
+pub mod timing;
 
 use std::sync::mpsc::{TryRecvError, channel};
 
@@ -294,12 +295,27 @@ impl DispatchWait {
   }
 }
 
-/// What a dispatch task reports back to the owner's collection loop: a holder's reply bytes (empty if it
-/// refused) *and its endpoint returned boxed* (an endpoint is large), so the connection is reused across
-/// commits — its packet-number space stays continuous across a retry, RFC 9000 §12.3. The deadline is no
-/// longer a message: it is the collection loop's own progress-extension decision ([`DispatchWait`]), so a
-/// report is always a holder's reply.
-pub struct Reply(pub HostId, pub Vec<u8>, pub Box<Endpoint>);
+/// What one timed exchange produced ([`request_within`]): the peer's reply bytes — empty when it refused,
+/// the deadline won, or the transport failed — and the exchange's **round trip**: `Some(elapsed)` when the
+/// peer answered inside the deadline (a refusal included: it completed a round trip), `None` when the
+/// deadline won or the transport failed — Karn's rule, a timed-out exchange is no round-trip sample. The
+/// round trip is what the fleet's per-peer path estimate feeds on (`timing::PathRtt`, §4.8 "election
+/// timeout ≥ 10 × broadcast RTT p99"): a consensus round's replies, timely and late, each measure the
+/// path to the voter that answered.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TimedReply {
+  /// The reply bytes (empty on a refusal, a timeout, or a transport error).
+  pub bytes: Vec<u8>,
+  /// The exchange's round trip in nanoseconds when the peer answered inside the deadline.
+  pub round_trip_ns: Option<u64>,
+}
+
+/// What a dispatch task reports back to the owner's collection loop: a holder's timed reply (empty bytes
+/// if it refused; its round trip when it answered) *and its endpoint returned boxed* (an endpoint is
+/// large), so the connection is reused across commits — its packet-number space stays continuous across a
+/// retry, RFC 9000 §12.3. The deadline is no longer a message: it is the collection loop's own
+/// progress-extension decision ([`DispatchWait`]), so a report is always a holder's reply.
+pub struct Reply(pub HostId, pub TimedReply, pub Box<Endpoint>);
 
 /// The holder replies still in flight when a dispatch returned at quorum (or timed out): the receiving end
 /// of the dispatch's reply channel, kept open so each straggler task — bounded by the dispatch's full span
@@ -357,15 +373,16 @@ impl Stragglers {
   /// fold). Dropping such a reply at the round's progress-aware stop would cost a slow-but-live voter its
   /// acknowledgement every round — under sustained CPU starvation, forever. A record commit needs none of
   /// this (it re-ships idempotently) and uses `recover`. A straggler that timed out reports an empty reply
-  /// and still returns its session.
-  pub fn recover_replies(&mut self) -> (Vec<(HostId, Vec<u8>, Endpoint)>, bool) {
+  /// with no round trip and still returns its session; one that answered late reports its round trip,
+  /// the tail the path estimate must see.
+  pub fn recover_replies(&mut self) -> (Vec<(HostId, TimedReply, Endpoint)>, bool) {
     let mut recovered = Vec::new();
     let Some(replies) = self.replies.as_ref() else {
       return (recovered, true);
     };
     loop {
       match replies.try_recv() {
-        Ok(Reply(host, bytes, endpoint)) => recovered.push((host, bytes, *endpoint)),
+        Ok(Reply(host, reply, endpoint)) => recovered.push((host, reply, *endpoint)),
         Err(TryRecvError::Empty) => return (recovered, false),
         Err(TryRecvError::Disconnected) => {
           self.replies = None;
@@ -377,8 +394,9 @@ impl Stragglers {
 }
 
 /// Runs one request/reply on `endpoint` (its `request`), racing it against `deadline_ns`, and returns the
-/// reply bytes (empty on a timeout or a transport error) **together with the endpoint, kept whatever the
-/// outcome**. This is what lets a dispatch task *always* hand its holder's session back to the collection
+/// timed reply ([`TimedReply`]: the bytes, empty on a timeout or a transport error, and the round trip when
+/// the peer answered) **together with the endpoint, kept whatever the outcome**. This is what lets a
+/// dispatch task *always* hand its holder's session back to the collection
 /// loop — a straggler that never replies still returns its endpoint at the deadline rather than blocking
 /// until it is cancelled and its session dropped. A dropped session costs a fresh handshake to replace,
 /// so keeping it is what lets the caller retry a
@@ -393,7 +411,8 @@ pub async fn request_within(
   stream_id: u64,
   request: &[u8],
   deadline_ns: u64,
-) -> (Vec<u8>, Endpoint) {
+) -> (TimedReply, Endpoint) {
+  let sent_ns = now_ns();
   let reply = {
     let mut exchange = std::pin::pin!(endpoint.request(stream_id, request));
     let mut timer = std::pin::pin!(sleep(deadline_ns));
@@ -416,7 +435,16 @@ pub async fn request_within(
     // arriving on its own now-older stream id, is discarded below the next exchange's floor.
     endpoint.abandon_exchange();
   }
-  (reply.unwrap_or_default(), endpoint)
+  // The round trip is measured only for an exchange the peer answered (Karn's rule): a reply that came
+  // back is a sample of the path, however empty; a deadline or a transport error is not.
+  let round_trip_ns = reply.is_some().then(|| now_ns().saturating_sub(sent_ns));
+  (
+    TimedReply {
+      bytes: reply.unwrap_or_default(),
+      round_trip_ns,
+    },
+    endpoint,
+  )
 }
 
 /// Whether `acked` (distinct candidates) commits under `quorum` for `candidates`.
@@ -466,7 +494,7 @@ pub(crate) async fn collect_bound(
     match rx.try_recv() {
       Ok(Reply(host, reply, endpoint)) => {
         reusable.push((host, *endpoint));
-        if candidates.contains(&host) && !acked.contains(&host) && binds(host, &reply) {
+        if candidates.contains(&host) && !acked.contains(&host) && binds(host, &reply.bytes) {
           acked.push(host);
           latencies_ns.push((host, now_ns().saturating_sub(dispatched_ns)));
         }
@@ -796,7 +824,7 @@ async fn collect_promises(
     match rx.try_recv() {
       Ok(Reply(host, reply, endpoint)) => {
         reusable.push((host, *endpoint));
-        if let Ok(promise) = Promise::decode(&reply)
+        if let Ok(promise) = Promise::decode(&reply.bytes)
           && promise.holder == host
           && promise.binds(prepare)
           && candidates.contains(&host)
@@ -1075,7 +1103,7 @@ async fn collect_ledger_promises(
     match rx.try_recv() {
       Ok(Reply(host, reply, endpoint)) => {
         reusable.push((host, *endpoint));
-        if let Ok(promise) = LedgerPromise::decode(&reply)
+        if let Ok(promise) = LedgerPromise::decode(&reply.bytes)
           && promise.holder == host
           && promise.binds(prepare)
           && candidates.contains(&host)
