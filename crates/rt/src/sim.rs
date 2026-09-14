@@ -130,8 +130,6 @@ pub struct SimFabric {
   next_port: u16,
   mailboxes: BTreeMap<u16, VecDeque<(Vec<u8>, u16)>>,
   interests: BTreeMap<u16, u64>,
-  /// The simulation clock in-flight datagrams are timed against; `None` until a runtime installs one.
-  clock: Option<&'static SimShared>,
   /// The seeded generator the jitter is drawn from — the fabric's own stream, so a profile's draws never
   /// perturb the shards' generators and a run replays exactly from its seed.
   rng: Xorshift,
@@ -152,13 +150,12 @@ pub struct SimFabric {
 const FABRIC_SEED_SALT: u64 = 0xD1B5_4A32_D192_ED03;
 
 impl SimFabric {
-  fn new(clock: Option<&'static SimShared>, seed: u64) -> SimFabric {
+  fn new(seed: u64) -> SimFabric {
     SimFabric {
       // Ports start at 1 so 0 stays the "unspecified" address, as in the OS.
       next_port: 1,
       mailboxes: BTreeMap::new(),
       interests: BTreeMap::new(),
-      clock,
       rng: Xorshift::new(seed ^ FABRIC_SEED_SALT),
       default_delay: SimDelay::NONE,
       pair_delays: BTreeMap::new(),
@@ -175,9 +172,11 @@ impl SimFabric {
     port
   }
 
-  /// Virtual now on the installed clock, or zero without one.
+  /// Virtual now: the clock of the shard sending on this fabric (every send runs on a simulated shard,
+  /// whose driver holds the simulation clock), or zero off a shard. The fabric holds no clock of its
+  /// own, so it never outlives one: a simulation's clock is owned by its runtime.
   fn now_ns(&self) -> u64 {
-    self.clock.map_or(0, SimShared::now_ns)
+    crate::futures::now_ns()
   }
 
   /// Sends a datagram from `from` to `dest`: delivered now on the zero path (returning a waker word to
@@ -258,13 +257,13 @@ impl SimFabric {
 }
 
 thread_local! {
-  static SIM_FABRIC: RefCell<SimFabric> = RefCell::new(SimFabric::new(None, 0));
+  static SIM_FABRIC: RefCell<SimFabric> = RefCell::new(SimFabric::new(0));
 }
 
 /// Resets the thread's simulated UDP fabric for a fresh simulation: an empty network on the zero path,
-/// timed against `clock` and drawing its jitter from `seed`.
-pub(crate) fn sim_fabric_reset(clock: &'static SimShared, seed: u64) {
-  SIM_FABRIC.with(|f| *f.borrow_mut() = SimFabric::new(Some(clock), seed));
+/// drawing its jitter from `seed`.
+pub(crate) fn sim_fabric_reset(seed: u64) {
+  SIM_FABRIC.with(|f| *f.borrow_mut() = SimFabric::new(seed));
 }
 
 /// Sets the latency profile of every path on this thread's fabric that has no directed override — the
@@ -462,8 +461,10 @@ impl Driver for SimDriver {
 
 /// A set of simulated shards on the calling thread.
 pub struct SimRuntime {
-  clock: &'static SimShared,
+  /// The simulation clock, owned here: the drivers borrow it for the life of their contexts, which
+  /// this runtime frees in its `Drop` before the box goes (declared after `shards`, dropped after them).
   shards: Vec<&'static ShardContext>,
+  clock: Box<SimShared>,
   shared: Vec<&'static SimShared>,
 }
 
@@ -480,10 +481,9 @@ impl Drop for SimRuntime {
   /// before this drop. Each context is freed (`reclaim_context`, which also clears the thread's
   /// current-context cell a bare step left pointing at it) and its slot given back — before this, a
   /// simulation reclaimed nothing (its slots were never unregistered, so a test binary spent one of
-  /// the registry's slots per simulation for good). The shared clock and per-shard flags are still
-  /// leaked: a retired entry's `Kick::Sim` points at the flag and may be kicked by a stale waker
-  /// until the slot's next registration, so they must outlive the entry — the same treatment as the
-  /// kick descriptor is owed to them (recorded, small: a few atomics each).
+  /// the registry's slots per simulation for good). The per-shard flags are the slots' own (a retired
+  /// entry's `Kick::Sim` points at them and may be kicked by a stale waker until the slot's next
+  /// registration), and the clock is this runtime's box, dropped after the contexts.
   fn drop(&mut self) {
     for ctx in &self.shards {
       let id = ctx.id;
@@ -497,26 +497,43 @@ impl Drop for SimRuntime {
 impl SimRuntime {
   /// Builds `config.shards` simulated shards sharing one clock seeded by `seed`.
   pub fn new(config: &RuntimeConfig, seed: u64) -> Result<SimRuntime, RtError> {
-    let clock: &'static SimShared = Box::leak(Box::new(SimShared::new(seed)));
-    // A fresh simulation starts with an empty UDP fabric on this thread, timed against this clock.
-    sim_fabric_reset(clock, seed);
+    let clock_box = Box::new(SimShared::new(seed));
+    // SAFETY: extends the borrow to `'static` for the drivers: the box is owned by the runtime being
+    // built and dropped only after its `Drop` freed every context (and so every driver) — the field
+    // order below drops `shards` first, and `Drop::drop` reclaims them before any field drops — so no
+    // driver outlives the clock. Before 2026-09-14 the clock was leaked per simulation instead.
+    let clock: &'static SimShared = unsafe { &*std::ptr::from_ref(&*clock_box) };
+    // A fresh simulation starts with an empty UDP fabric on this thread.
+    sim_fabric_reset(seed);
     let mut seeds = Vec::new();
     let mut shared = Vec::new();
     for _ in 0..config.shards {
-      let s: &'static SimShared = Box::leak(Box::new(SimShared::new(seed)));
-      let seed: DriverSeed = Box::new(move |_kick| {
-        Ok(Box::new(SimDriver {
-          shared: s,
+      // The driver takes its flags from the kick the slot minted over them (the flags are the slot's,
+      // so a stale waker may still kick them after this simulation ends; see `registry::Entry`).
+      let driver: DriverSeed = Box::new(move |kick| match kick {
+        Kick::Sim(flags) => Ok(Box::new(SimDriver {
+          shared: flags,
           clock,
           nops: Vec::new(),
-        }) as Box<dyn Driver>)
+        }) as Box<dyn Driver>),
+        _ => Err(RtError::DriverRefused {
+          call: "a simulated shard registered without simulated flags",
+          code: None,
+        }),
       });
-      seeds.push(ShardSeed::register(
+      let registered = ShardSeed::register(
         config,
-        seed,
-        crate::registry::RegisterKick::Kick(Kick::Sim(s)),
-      )?);
-      shared.push(s);
+        driver,
+        crate::registry::RegisterKick::Sim(Box::new(SimShared::new(seed))),
+      )?;
+      let Some(Kick::Sim(flags)) = crate::registry::with_entry(registered.id, |entry| entry.kick)
+      else {
+        return Err(RtError::ShardGone {
+          shard: registered.id,
+        });
+      };
+      shared.push(flags);
+      seeds.push(registered);
     }
     crate::runtime::connect_pairs(&mut seeds)?;
     let shards = seeds
@@ -524,8 +541,8 @@ impl SimRuntime {
       .map(ShardContext::build)
       .collect::<Result<Vec<_>, _>>()?;
     Ok(SimRuntime {
-      clock,
       shards,
+      clock: clock_box,
       shared,
     })
   }

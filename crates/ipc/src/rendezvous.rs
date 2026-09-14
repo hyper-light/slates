@@ -238,6 +238,23 @@ pub fn connect_as(instance: &str, wanted: u32) -> Result<Connected, IpcError> {
   platform::connect(instance, wanted)
 }
 
+/// Format: the bound a refusal carries when the region was refused for a reason other than the client
+/// bound — no bound applies; the client reports the daemon unavailable with the reason.
+const NO_BOUND: usize = 0;
+
+/// The error a refusal with `limit` decodes to: the client bound when one was given, else a daemon that
+/// refused the claim for a reason of its own (counted and logged on its side).
+fn refusal_of(limit: usize, instance: &str) -> IpcError {
+  if limit == NO_BOUND {
+    IpcError::DaemonUnavailable {
+      endpoint: instance.to_owned(),
+      why: "the daemon refused the claim (its region could not be created; see its log)",
+    }
+  } else {
+    IpcError::TooManyClients { limit }
+  }
+}
+
 /// What a client holds after the rendezvous.
 pub struct Connected {
   /// The region.
@@ -331,8 +348,19 @@ pub mod platform {
   const HANDOFF_FDS: usize = 3;
   /// Format: the client id a refusal handoff names — never assigned (a hello of zero asks for a fresh
   /// id), so a handoff naming it carries no region: its length word is the client bound the connect
-  /// was refused at (`IpcError::TooManyClients`).
+  /// was refused at (`IpcError::TooManyClients`), or [`NO_BOUND`] for a region refused for another
+  /// reason.
   const REFUSED_CLIENT: u32 = 0;
+
+  /// Sends the typed refusal handoff to `peer`: client [`REFUSED_CLIENT`], `limit` in the length word,
+  /// no descriptors.
+  fn send_refusal(peer: &OwnedFd, limit: usize) -> Result<(), IpcError> {
+    let mut body = [0u8; HANDOFF_BYTES];
+    body[HANDOFF_AT_CLIENT..HANDOFF_AT_LEN].copy_from_slice(&REFUSED_CLIENT.to_le_bytes());
+    body[HANDOFF_AT_LEN..].copy_from_slice(&u64::try_from(limit).unwrap_or(u64::MAX).to_le_bytes());
+    rustix::net::send(peer, &body, SendFlags::empty()).map_err(|e| refused("send", e))?;
+    Ok(())
+  }
   /// Shape: the listen backlog (connections pending accept); the control shard drains them
   /// every loop, so the backlog only covers one loop of arrivals.
   const BACKLOG: i32 = 64;
@@ -471,14 +499,15 @@ pub mod platform {
         // with the bound in the length word and no descriptors — where before the socket was dropped
         // and the client read a short handoff it could not interpret (2026-09-14).
         Err(IpcError::TooManyClients { limit }) => {
-          let mut body = [0u8; HANDOFF_BYTES];
-          body[HANDOFF_AT_CLIENT..HANDOFF_AT_LEN].copy_from_slice(&REFUSED_CLIENT.to_le_bytes());
-          body[HANDOFF_AT_LEN..]
-            .copy_from_slice(&u64::try_from(limit).unwrap_or(u64::MAX).to_le_bytes());
-          rustix::net::send(&peer, &body, SendFlags::empty()).map_err(|e| refused("send", e))?;
+          send_refusal(&peer, limit)?;
           return Err(IpcError::TooManyClients { limit });
         }
-        Err(e) => return Err(e),
+        // Any other refusal of the region (one that could not be created): the client is told there is
+        // no region for it (a refusal with no bound), never left to read a closed socket.
+        Err(e) => {
+          send_refusal(&peer, NO_BOUND)?;
+          return Err(e);
+        }
       };
       // From here the client holds an id the daemon reserved: a failure is reported with that id so
       // the daemon gives it back (`IpcError::HandoffLost`), never a reservation held for a client that
@@ -578,9 +607,10 @@ pub mod platform {
       // came with it is closed with `control`).
       let mut limit_word = [0u8; size_of::<u64>()];
       limit_word.copy_from_slice(&body[HANDOFF_AT_LEN..HANDOFF_BYTES]);
-      return Err(IpcError::TooManyClients {
-        limit: usize::try_from(u64::from_le_bytes(limit_word)).unwrap_or(usize::MAX),
-      });
+      return Err(refusal_of(
+        usize::try_from(u64::from_le_bytes(limit_word)).unwrap_or(usize::MAX),
+        instance,
+      ));
     }
     let mut fds: Vec<OwnedFd> = Vec::new();
     for message in control.drain() {
@@ -668,10 +698,11 @@ pub mod platform {
   const READY: u32 = 2;
   /// Format: the client opened the region; the daemon reclaims the slot.
   const DONE: u32 = 3;
-  /// Format: the daemon refused the claim at its client bound: the bound is in the slot's length
-  /// word, no region is named; the client reads it typed (`IpcError::TooManyClients`) and marks the
-  /// slot `DONE`. Before 2026-09-14 a refused claim was left `CLAIMED` and the client waited out
-  /// its claim wait to report the daemon unavailable.
+  /// The daemon refused the claim: the client reads it typed and marks the slot `DONE`, where before a
+  /// refused claim was left `CLAIMED` and the client waited out its claim wait (2026-09-14). The slot's
+  /// length word carries the client bound (`IpcError::TooManyClients`), or `NO_BOUND` for a region
+  /// refused for another reason (the daemon unavailable, with the reason).
+  /// Format: the fourth slot state, after `FREE`/`CLAIMED`/`READY`/`DONE`.
   const REFUSED: u32 = 4;
   /// Shape: how long a client waits for the daemon to answer a claim before reporting it
   /// unavailable (nanoseconds): the control shard's loop is microseconds, so a second is a
@@ -829,7 +860,13 @@ pub mod platform {
             let client_id = assign(wanted);
             let Prepared { region, .. } = match make_region(client_id) {
               Ok(prepared) => prepared,
-              Err(IpcError::TooManyClients { limit }) => {
+              Err(e) => {
+                // The claim is answered whatever the refusal: the bound when that is the reason,
+                // else no bound — the client reports the daemon refused it — never left `CLAIMED`.
+                let limit = match &e {
+                  IpcError::TooManyClients { limit } => *limit,
+                  _ => super::NO_BOUND,
+                };
                 let at = slot_at(i);
                 self.object.bytes_mut()[at + AT_LEN..at + AT_LEN + 8]
                   .copy_from_slice(&u64::try_from(limit).unwrap_or(u64::MAX).to_le_bytes());
@@ -838,9 +875,8 @@ pub mod platform {
                 wake::wake_one(word)?;
                 #[cfg(windows)]
                 let _ = self.ready_event.signal();
-                return Err(IpcError::TooManyClients { limit });
+                return Err(e);
               }
-              Err(e) => return Err(e),
             };
             // From here the client holds an id the daemon reserved: a failure is reported with that
             // id so the daemon gives it back (`IpcError::HandoffLost`).
@@ -1003,9 +1039,10 @@ pub mod platform {
               .unwrap_or([0; 8]),
           );
           word.store(DONE, Ordering::Release);
-          return Err(IpcError::TooManyClients {
-            limit: usize::try_from(limit).unwrap_or(usize::MAX),
-          });
+          return Err(super::refusal_of(
+            usize::try_from(limit).unwrap_or(usize::MAX),
+            instance,
+          ));
         }
         let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         if elapsed >= CLAIM_WAIT_NS {

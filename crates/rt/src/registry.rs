@@ -68,6 +68,11 @@ pub struct Entry {
   /// outlives the shard and is dropped only by the slot's next registration.
   #[cfg(unix)]
   pub kick_fd: Option<KickFd>,
+  /// A simulated shard's driver flags (its kick word, its requested deadline, its wait count), owned by
+  /// this entry as the descriptor is: the kick points into it, and a stale waker may kick until the
+  /// slot's next registration, so it must outlive the shard. Before 2026-09-14 every simulation leaked
+  /// one per shard for the process lifetime.
+  pub sim_shared: Option<Box<crate::sim::SimShared>>,
   /// The single-producer rings this shard sends on, one per other shard of its runtime, owned here
   /// and lent as `&'static` to those shards' contexts; retired with the entry (every shard of a
   /// runtime unregisters after every thread of it joined, so no borrower outlives them).
@@ -278,6 +283,7 @@ pub fn register(
       kick: Kick::None,
       #[cfg(unix)]
       kick_fd: None,
+      sim_shared: None,
       pair_rings: Vec::new(),
       ring_full_events: AtomicU64::new(0),
       parking: Parking::new(),
@@ -297,6 +303,14 @@ pub fn register(
         // and never freed while any reader can observe it (the generation protocol in `entry`).
         let owned: &'static KickFd = unsafe { &*(owned as *const KickFd) };
         form(owned)
+      }
+      RegisterKick::Sim(shared) => {
+        let owned: &crate::sim::SimShared = entry.sim_shared.insert(shared);
+        // SAFETY: the same extension as the descriptor's: `owned` lives in the boxed entry, whose
+        // allocation is never moved and never freed while any reader can observe it.
+        let owned: &'static crate::sim::SimShared =
+          unsafe { &*(owned as *const crate::sim::SimShared) };
+        Kick::Sim(owned)
       }
     };
     // The previous holder's entry, if the slot was reused: retired at unregistration, dropped
@@ -335,6 +349,8 @@ pub enum RegisterKick {
   /// A descriptor the slot owns; the function mints the kick over the slot's owned form of it.
   #[cfg(unix)]
   Descriptor(std::os::fd::OwnedFd, fn(&'static KickFd) -> Kick),
+  /// A simulated shard's driver flags, owned by the slot; the kick is minted over them.
+  Sim(Box<crate::sim::SimShared>),
 }
 
 /// Records the highest task-arena generation a shard issued (the shard's own thread, at its loop's

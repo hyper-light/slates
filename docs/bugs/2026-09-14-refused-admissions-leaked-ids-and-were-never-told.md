@@ -81,9 +81,10 @@ warnings`, fmt and `cargo xtask check` clean. Validated on a wiped `target/` (20
 
 ## Sibling sweep
 
-- A `make_region` failure other than the bound (a region that cannot be created) still leaves the
-  macOS/Windows claim slot to the client's claim wait; it is counted and logged once on the daemon
-  (`ACCEPTS_FAILED`). A general refusal code in the slot is the next step if it is ever seen.
+- A `make_region` failure other than the bound (a region that cannot be created) is answered too
+  (closed the same day): the refusal carries no bound (`NO_BOUND`) on both paths, and the client reports
+  the daemon unavailable with the reason ("the daemon refused the claim") at once instead of waiting out
+  its claim; the daemon counts and logs it once (`ACCEPTS_FAILED`).
 - The runtime's general form — a `Control::Spawn` on a full arena drops the moved future without telling
   the sender — stands; the guard is the pattern for any future that owns a resource the sender must know
   about, and the fleet's task share keeps the arena from filling in the first place.

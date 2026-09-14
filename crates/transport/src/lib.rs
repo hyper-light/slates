@@ -41,6 +41,7 @@ pub mod connection;
 pub mod demux;
 pub mod endpoint;
 pub mod enrollment;
+pub mod flight;
 pub mod flow;
 pub mod handshake;
 pub mod packet_number;

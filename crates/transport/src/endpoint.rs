@@ -167,14 +167,14 @@ pub enum EndpointError {
   /// The demultiplexer closed this session: its peer established a new one (a re-dial after a loss),
   /// or the peer was retired. The reader ends its loop; nothing more arrives here.
   Closed,
-  /// This end's handshake flight exceeds the datagram either end reads ([`DATAGRAM_BYTES`]): sent, it
-  /// would be truncated at the peer and fault its handshake with no way to say why. Refused here,
-  /// typed, before a byte leaves — a certificate chain too long for one datagram, until flights are
-  /// fragmented into CRYPTO frames (the owed general form).
+  /// This end's handshake flight exceeds the largest flight the fragmenter carries
+  /// (`crate::flight::MAX_FLIGHT_BYTES`): a certificate chain beyond a generous bound. Refused here,
+  /// typed, before a byte leaves. Below that a flight of any size crosses as fragments each fitting the
+  /// path floor (`crate::flight`); this is the ceiling on the whole flight, not on one datagram.
   FlightTooLarge {
     /// The flight's size.
     bytes: usize,
-    /// The datagram bound.
+    /// The bound on a whole flight.
     cap: usize,
   },
 }
@@ -271,6 +271,15 @@ pub struct Endpoint {
   /// The handshake flight this end last sent and has not seen answered, kept across `establish` calls so
   /// the next call retransmits it (RFC 9002 §6.2); empty once established or before the first flight.
   pending_flight: Vec<u8>,
+  /// Reassembles the peer's handshake flights from their fragments (`crate::flight`): a flight larger
+  /// than one path-floor datagram arrives as several, so this holds the pieces until the whole flight is
+  /// present before it is fed to the TLS state. Kept across `establish` calls, as `pending_flight` is, so
+  /// fragments split across two calls still reassemble. `Reassembly::Repeat` from it is the flight-level
+  /// form of the old per-datagram dedup (a peer retransmit of a consumed flight is not re-fed).
+  reassembler: crate::flight::Reassembler,
+  /// Handshake fragments this end has sent (a non-vacuity counter: a test that forces a multi-fragment
+  /// flight asserts this passed one).
+  fragments_sent: u64,
   /// Handshake budgets spent without establishing (`establish` calls that ended `NotReady`); reset to zero
   /// on establishment.
   handshake_budgets_spent: u32,
@@ -337,6 +346,8 @@ impl Endpoint {
       send_times: BTreeMap::new(),
       final_flight: Vec::new(),
       pending_flight: Vec::new(),
+      reassembler: crate::flight::Reassembler::new(),
+      fragments_sent: 0,
       handshake_budgets_spent: 0,
       discarded: 0,
       pto_count: 0,
@@ -371,6 +382,8 @@ impl Endpoint {
       send_times: BTreeMap::new(),
       final_flight: Vec::new(),
       pending_flight: Vec::new(),
+      reassembler: crate::flight::Reassembler::new(),
+      fragments_sent: 0,
       handshake_budgets_spent: 0,
       discarded: 0,
       pto_count: 0,
@@ -408,6 +421,8 @@ impl Endpoint {
       send_times: BTreeMap::new(),
       final_flight: Vec::new(),
       pending_flight: Vec::new(),
+      reassembler: crate::flight::Reassembler::new(),
+      fragments_sent: 0,
       handshake_budgets_spent: 0,
       discarded: 0,
       pto_count: 0,
@@ -550,23 +565,16 @@ impl Endpoint {
   async fn establish_turns(&mut self, last_flight: &mut Vec<u8>) -> Result<(), EndpointError> {
     let mut buf = [0u8; DATAGRAM_BYTES];
     let mut sent_at: Option<u64> = None;
-    // The peer's flight this end last fed to `read_hs`. Retransmits that raced this end's reply arrive as
-    // an exact re-send of a flight already consumed; `read_hs` treats its input as an ordered byte stream
-    // and would fault on the repeat (a fresh `ClientHello` where it expects the client's `Finished`), so a
-    // datagram identical to this is skipped rather than fed. The aggressive early backoff makes such a
-    // raced duplicate common — the peer answers before this end's next retransmit would have fired — so
-    // this is what keeps the fast retransmit from corrupting an otherwise-healthy handshake.
-    let mut last_consumed: Vec<u8> = Vec::new();
+    // A flight arrives as fragments the endpoint's reassembler rebuilds; it also recognizes a peer's
+    // retransmit of a flight already consumed (`Reassembly::Repeat`) and does not re-feed it to
+    // `read_hs`, which would fault the ordered handshake stream. The reassembler is an endpoint field, so
+    // fragments split across two `establish` calls still rebuild one flight.
     for _ in 0..HANDSHAKE_TURN_CEILING {
       let out = self.drain_handshake();
       if !out.is_empty() {
-        if out.len() > DATAGRAM_BYTES {
-          return Err(EndpointError::FlightTooLarge {
-            bytes: out.len(),
-            cap: DATAGRAM_BYTES,
-          });
-        }
-        self.send(&out)?;
+        // Fragmented so a flight larger than the path floor still crosses (RFC 9000 §19.6); a flight
+        // past `MAX_FLIGHT_BYTES` is refused typed inside `send_flight`.
+        self.send_flight(&out)?;
         sent_at = Some(now_ns());
         *last_flight = out;
       }
@@ -597,25 +605,42 @@ impl Endpoint {
       // and doubling reaches a slow-to-listen peer within milliseconds while the ceiling keeps a peer that
       // never answers from being retried faster than the estimated round trip; the retransmit count still
       // bounds the whole wait (banned item 8: no unbounded wait).
-      let n = {
+      let received: Vec<u8> = {
         let mut attempts = 0u32;
         let mut backoff = GRANULARITY_NS;
         loop {
           let period = backoff.min(self.handshake_probe_ceiling());
           match self.recv_within(&mut buf, period).await? {
-            Some((rn, _from)) => {
-              // Skip an exact re-send of the flight already consumed (a peer retransmit that raced this
-              // end's reply): feeding it to `read_hs` would fault the handshake stream. It still counts
-              // against the bound, so a peer flooding duplicates cannot loop this forever (banned item 8).
-              if !last_consumed.is_empty() && buf[..rn] == last_consumed[..] {
+            Some((rn, _from)) => match self.reassembler.push(&buf[..rn]) {
+              // A whole flight this end has not consumed: feed it to `read_hs` below.
+              crate::flight::Reassembly::Flight(flight) => break flight,
+              // A fragment that does not yet complete a flight is progress — the peer is alive and
+              // sending — so keep receiving without counting a timeout, and reset the backoff so a
+              // long flight's later fragments are awaited at the fast interval, not a grown one.
+              crate::flight::Reassembly::Pending => {
+                backoff = GRANULARITY_NS;
+                continue;
+              }
+              // The peer retransmitted a flight this end already consumed (its reply raced this end's):
+              // it is still asking, so resend this end's flight; not re-fed to `read_hs`. Counted, so a
+              // flood cannot loop forever (banned item 8).
+              crate::flight::Reassembly::Repeat => {
                 attempts += 1;
                 if attempts > MAX_HANDSHAKE_RETRANSMITS {
                   return Err(EndpointError::NotReady);
                 }
+                if !last_flight.is_empty() {
+                  self.send_flight(last_flight.as_slice())?;
+                }
                 continue;
               }
-              break rn;
-            }
+              // A datagram that did not parse as a fragment (a stray, a corrupt one): dropped, counted,
+              // never a fault.
+              crate::flight::Reassembly::Malformed => {
+                self.discarded = self.discarded.saturating_add(1);
+                continue;
+              }
+            },
             None => {
               attempts += 1;
               if attempts > MAX_HANDSHAKE_RETRANSMITS {
@@ -630,7 +655,7 @@ impl Endpoint {
               // (2026-09-14). A reply to a retransmitted flight now samples from the first send: an
               // over-estimate when the first copy was lost, which only makes the seed more conservative.
               if !last_flight.is_empty() {
-                self.send(last_flight.as_slice())?;
+                self.send_flight(last_flight.as_slice())?;
               }
             }
           }
@@ -645,11 +670,9 @@ impl Endpoint {
       if let Some(flight) = sent_at.take() {
         self.rtt.on_sample(now_ns().saturating_sub(flight), 0);
       }
-      // Remember this flight so a later exact re-send of it (a peer retransmit) is recognized and skipped
-      // above rather than fed to `read_hs` a second time.
-      last_consumed.clear();
-      last_consumed.extend_from_slice(&buf[..n]);
-      self.quic.read_hs(&buf[..n])?;
+      // The reassembler remembers this flight, so a peer retransmit of it rebuilds to `Repeat` above
+      // rather than being fed to `read_hs` a second time.
+      self.quic.read_hs(&received)?;
     }
     Err(EndpointError::NotReady)
   }
@@ -692,7 +715,7 @@ impl Endpoint {
           // Otherwise a raw handshake retransmit (the server has not seen our final flight yet): resend
           // it at once. A received datagram is progress — the peer is alive and still asking — so it does
           // not count toward the give-up budget, which counts only silent timeouts.
-          self.send(last_flight)?;
+          self.send_flight(last_flight)?;
         }
         None => {
           retransmits += 1;
@@ -700,7 +723,7 @@ impl Endpoint {
             return Err(EndpointError::NotReady);
           }
           backoff = backoff.saturating_mul(2);
-          self.send(last_flight)?;
+          self.send_flight(last_flight)?;
         }
       }
     }
@@ -793,6 +816,29 @@ impl Endpoint {
     }
   }
 
+  /// Sends a handshake `flight`, fragmented so each datagram fits the path floor (`crate::flight`): a
+  /// flight larger than one datagram — a mutual-TLS server flight with a certificate chain — crosses as
+  /// several fragments the peer reassembles, rather than one oversized datagram that a router may drop or
+  /// the receiver truncate. A flight past `MAX_FLIGHT_BYTES` is refused typed (`FlightTooLarge`) before a
+  /// byte leaves. Deterministic, so a retransmit of the flight resends byte-identical fragments.
+  fn send_flight(&mut self, flight: &[u8]) -> Result<(), EndpointError> {
+    let fragments = crate::flight::fragment(flight).ok_or(EndpointError::FlightTooLarge {
+      bytes: flight.len(),
+      cap: crate::flight::MAX_FLIGHT_BYTES,
+    })?;
+    for fragment in &fragments {
+      self.send(fragment)?;
+      self.fragments_sent = self.fragments_sent.saturating_add(1);
+    }
+    Ok(())
+  }
+
+  /// Handshake fragments this end has sent (a non-vacuity counter: a test that forces a multi-fragment
+  /// flight asserts this passed one).
+  pub fn fragments_sent(&self) -> u64 {
+    self.fragments_sent
+  }
+
   /// Flushes every packet the connection currently wants to send: each `poll_transmit` gives a packet
   /// number (from the connection's continuous packet-number space) and its frames, which are protected
   /// under the local 1-RTT keys (the number sized against what the peer has acknowledged) and sent.
@@ -847,7 +893,7 @@ impl Endpoint {
       if self.quic.is_client() {
         if !self.final_flight.is_empty() {
           let flight = self.final_flight.clone();
-          self.send(&flight)?;
+          self.send_flight(&flight)?;
         }
       } else {
         self.send_confirm()?;

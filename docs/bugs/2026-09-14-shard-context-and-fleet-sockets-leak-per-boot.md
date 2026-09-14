@@ -88,10 +88,12 @@ the fleet suite **37/37 in 203.13 s** under the 300 s stall detector (`validate.
 
 ## Sibling sweep
 
-- `SimShared` (the simulation clock and per-shard flags) is still leaked per simulation: a retired
-  entry's `Kick::Sim` points at the flag and may be kicked by a stale waker until the slot's next
-  registration, so it must outlive the entry — the kick-descriptor treatment is owed to it (small: a
-  few atomics per simulation).
+- `SimShared` (the simulation clock and per-shard flags): **closed the same day.** The per-shard flags
+  are owned by the registry entry like the kick descriptor (`RegisterKick::Sim`; a stale waker may kick
+  them until the slot's next registration), the clock is the runtime's own box dropped after its
+  contexts, and the simulated fabric holds no clock (it reads the sending shard's). Measured
+  (`crates/rt/tests/sim_memory.rs`): 32 two-shard daemon-sized simulations grow the process **288 KiB**
+  against a **2,032 KiB** footprint, 66 contexts reclaimed (2026-09-14).
 - `driver.rs`'s `test_kick` and `parking.rs`'s loom model leak in test code only.
 - `xshard` pending-call tables and `state::install` are per-thread and taken down with the state.
 - The old restart tests keep dialing the restart at a fresh address pair on purpose (old B's last
