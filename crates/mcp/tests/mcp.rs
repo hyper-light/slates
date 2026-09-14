@@ -273,6 +273,27 @@ fn assert_attach_base(server: &mut McpServer) {
   assert!(
     call(server, "slates.base.rewitness", json!({ "volume": volume }))["rewitnessed"].is_array()
   );
+  // §4.15 the clean-file digest: the crate's own manifest is an untouched base file, so its digest
+  // is exported — a 32-byte BLAKE3 as hex and the file's length — and twice identically.
+  let digest = call(
+    server,
+    "slates.base.digest",
+    json!({ "volume": volume, "path": "/Cargo.toml" }),
+  );
+  let identity = digest["identity"].as_str().unwrap();
+  assert_eq!(identity.len(), 64, "a BLAKE3 as hex: {identity}");
+  assert!(identity.bytes().all(|b| b.is_ascii_hexdigit()));
+  assert!(digest["size"].as_u64().unwrap() > 0);
+  assert_eq!(digest["path"], "/Cargo.toml");
+  assert_eq!(
+    call(
+      server,
+      "slates.base.digest",
+      json!({ "volume": volume, "path": "/Cargo.toml" }),
+    ),
+    digest,
+    "two exports of unchanged content are identical"
+  );
   assert!(call(server, "slates.base.pin", json!({ "volume": volume }))["pinned"].is_number());
 }
 

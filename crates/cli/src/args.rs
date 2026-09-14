@@ -36,6 +36,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   status [--json]                                  the daemon's status
   status ID [--drift] [--json]
   base read ID PATH
+  base digest ID PATH [--json]                     a clean base file's verified content digest
   base rewitness ID [PATH ...] [--json]
   base pin ID [PATH ...] [--json]
   land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
@@ -283,6 +284,13 @@ pub(crate) enum Verb {
   },
   /// Read a base entry.
   ReadBase {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The path.
+    path: String,
+  },
+  /// A clean base file's verified content digest (§4.15).
+  Digest {
     /// The volume.
     volume: slates_client::VolumeId,
     /// The path.
@@ -1028,6 +1036,13 @@ fn parse_base(taken: &Taken, words: &[&str]) -> Result<Command, ParseError> {
         path: (*path).to_owned(),
       },
     )),
+    ["digest", id, path] => Ok(client(
+      taken,
+      Verb::Digest {
+        volume: volume(id)?,
+        path: (*path).to_owned(),
+      },
+    )),
     ["rewitness", id, rest @ ..] => Ok(client(
       taken,
       Verb::Rewitness {
@@ -1043,7 +1058,7 @@ fn parse_base(taken: &Taken, words: &[&str]) -> Result<Command, ParseError> {
       },
     )),
     [] => Err(ParseError::Missing("base subcommand")),
-    ["read", ..] => Err(ParseError::Missing("ID PATH")),
+    ["read" | "digest", ..] => Err(ParseError::Missing("ID PATH")),
     ["rewitness" | "pin"] => Err(ParseError::Missing("volume ID")),
     [other, ..] => Err(ParseError::UnknownCommand(format!("base {other}"))),
   }
@@ -1119,6 +1134,29 @@ mod tests {
         instance: "m".into(),
         http: Some(8787),
       }))
+    );
+  }
+
+  /// `base digest ID PATH` parses to the clean-file digest verb (§4.15); the path is required.
+  #[test]
+  fn the_grammar_parses_base_digest() {
+    let Command::Client(request) = parse(&args(
+      "base digest 00000000000000000000000000000001 /src/lib.rs --json",
+    ))
+    .unwrap() else {
+      panic!("client");
+    };
+    assert!(request.json);
+    assert_eq!(
+      request.verb,
+      Verb::Digest {
+        volume: parse_volume_id("00000000000000000000000000000001").unwrap(),
+        path: "/src/lib.rs".into(),
+      }
+    );
+    assert_eq!(
+      parse(&args("base digest 00000000000000000000000000000001")),
+      Err(ParseError::Missing("ID PATH"))
     );
   }
 

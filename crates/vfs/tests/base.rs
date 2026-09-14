@@ -466,6 +466,139 @@ fn a_watcher_overflow_rechecks_everything() {
   );
 }
 
+// ------------------------------------------------------------------ the clean-file digest (§4.15)
+
+/// Format: the BLAKE3 of the empty input, the published BLAKE3 test vector for `input_len` 0
+/// (BLAKE3 specification, `test_vectors.json`).
+const BLAKE3_EMPTY: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+/// Format: the BLAKE3 of the one-byte input `0x00`, the published test vector for `input_len` 1
+/// (the vectors' input is the byte sequence 0, 1, 2, …, so its one-byte prefix is `0x00`).
+const BLAKE3_ONE_ZERO_BYTE: &str =
+  "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213";
+
+fn hex(bytes: &[u8]) -> String {
+  bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn digest_of(
+  vol: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+  path: &str,
+) -> Result<slates_vfs::base::Digest, VfsError> {
+  vol.with_host(host).digest(store, path)
+}
+
+/// AC-1.17 / T-1.21 (§4.15: "a verified content digest ... names exactly the current immutable
+/// file bytes"): a clean base file exports the BLAKE3 of the bytes the disk holds and their
+/// length, and the export does not diverge the entry; the entry the agent edited refuses
+/// `DigestNotClean` rather than name bytes that are not the disk's; a directory and a missing
+/// path refuse as themselves.
+#[test]
+fn a_clean_base_file_exports_its_verified_digest_and_a_diverged_entry_refuses() {
+  let (mut host, mut store, mut vol, _) = worked_example();
+  let digest = digest_of(&mut vol, &mut host, &mut store, "/src/main.rs").unwrap();
+  assert_eq!(digest.identity, *blake3::hash(b"fn main() {}").as_bytes());
+  assert_eq!(digest.size, 12);
+  assert_eq!(
+    digest_of(&mut vol, &mut host, &mut store, "/src/lib.rs"),
+    Err(VfsError::DigestNotClean),
+    "the agent's edit is not the disk's bytes"
+  );
+  assert_eq!(
+    digest_of(&mut vol, &mut host, &mut store, "/src"),
+    Err(VfsError::IsDirectory)
+  );
+  assert_eq!(
+    digest_of(&mut vol, &mut host, &mut store, "/src/none.rs"),
+    Err(VfsError::NotFound)
+  );
+  assert_eq!(
+    vol.base_plane().unwrap().digest_stats().computed,
+    1,
+    "one digest was computed"
+  );
+  assert!(
+    vol
+      .diverged(&store)
+      .iter()
+      .all(|d| d.path != "/src/main.rs"),
+    "a digest does not diverge the entry"
+  );
+}
+
+/// §4.15 "missing or stale cache knowledge cannot produce a clean digest": an outsider replaces
+/// the file with a new inode, overwrites it in place in a later tick, overwrites it again in the
+/// same tick with the same length (a fingerprint that cannot tell), and removes it; every export
+/// names the disk as it is at that moment, never an earlier digest.
+#[test]
+fn a_digest_is_never_stale_beneath_outsider_edits() {
+  let mut host = SimHost::new();
+  host.replace_file("/f", b"one");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let first = digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(first.identity, *blake3::hash(b"one").as_bytes());
+  assert_eq!(first.size, 3);
+
+  host.advance_ns(5);
+  host.replace_file("/f", b"two");
+  let replaced = digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(replaced.identity, *blake3::hash(b"two").as_bytes());
+
+  host.write_in_place("/f", b"three", 5);
+  let rewritten = digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(rewritten.identity, *blake3::hash(b"three").as_bytes());
+  assert_eq!(rewritten.size, 5);
+
+  // Same inode, same length, same tick: only the bytes differ.
+  host.write_in_place("/f", b"3hree", 0);
+  let racy = digest_of(&mut vol, &mut host, &mut store, "/f").unwrap();
+  assert_eq!(racy.identity, *blake3::hash(b"3hree").as_bytes());
+
+  host.remove("/f");
+  assert_eq!(
+    digest_of(&mut vol, &mut host, &mut store, "/f"),
+    Err(VfsError::NotFound)
+  );
+}
+
+/// The determinism gate and the golden vectors (§4.15; the digest is hashed on the wire): an
+/// empty file and a one-byte file digest to the published BLAKE3 test vectors, a large-class file
+/// digested in bounded windows equals the whole-buffer hash (the byte oracle), and two exports of
+/// unchanged content are identical.
+#[test]
+fn a_digest_is_deterministic_and_matches_the_published_blake3_vectors() {
+  let mut host = SimHost::new();
+  host.replace_file("/empty", b"");
+  host.replace_file("/zero", &[0u8]);
+  let big: Vec<u8> = (0..(3 * LARGE))
+    .map(|i| u8::try_from(i % 251).unwrap())
+    .collect();
+  host.replace_file("/big", &big);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+
+  let empty = digest_of(&mut vol, &mut host, &mut store, "/empty").unwrap();
+  assert_eq!(hex(&empty.identity), BLAKE3_EMPTY);
+  assert_eq!(empty.size, 0);
+  let zero = digest_of(&mut vol, &mut host, &mut store, "/zero").unwrap();
+  assert_eq!(hex(&zero.identity), BLAKE3_ONE_ZERO_BYTE);
+  assert_eq!(zero.size, 1);
+  let large = digest_of(&mut vol, &mut host, &mut store, "/big").unwrap();
+  assert_eq!(
+    large.identity,
+    *blake3::hash(&big).as_bytes(),
+    "the windowed digest equals the whole-buffer hash"
+  );
+  assert_eq!(large.size, 3 * LARGE);
+  let again = digest_of(&mut vol, &mut host, &mut store, "/big").unwrap();
+  assert_eq!(
+    again, large,
+    "two exports of unchanged content are identical"
+  );
+}
+
 // ------------------------------------------------------------------ the oracle (T-1.10, AC-1.10)
 
 /// One step of a generated history: the agent's or an outsider's.

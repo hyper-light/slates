@@ -295,6 +295,15 @@ pub enum RequestBody {
     /// Every record at or after this sequence.
     since: u64,
   },
+  /// The verified content digest of a clean base file (§4.15 `digest`): the BLAKE3 of the bytes
+  /// the disk holds for an untouched entry, verified current at the export; an entry the volume
+  /// diverged refuses `DigestNotClean`, a file changing under the hash `DigestUnverified`. A read.
+  Digest {
+    /// The volume.
+    volume: VolumeId,
+    /// The path.
+    path: String,
+  },
 }
 
 /// What a health signal's absence means (§4.14, A-9): a missing sample is never silently read as
@@ -801,6 +810,13 @@ pub enum Refusal {
   /// A region-loss promotion (`PromoteRegion`) was issued on a node that is not the root leader, so it cannot
   /// propose the change (§4.8, D-14). The operator re-issues it on the root leader (`status` names it).
   NotRootLeader,
+  /// No clean digest exists for the entry (§4.15): it is not an untouched regular base file (the
+  /// volume created, copied up, pinned or lost it, or it is a symlink), so a digest would name
+  /// bytes that are not the disk's. Read and hash the bytes instead.
+  DigestNotClean,
+  /// The file changed on the disk while it was being digested (§4.15 "verified current"): nothing
+  /// stale is exported; retry.
+  DigestUnverified,
 }
 
 /// A reply body.
@@ -948,6 +964,13 @@ pub enum ReplyBody {
   Audit {
     /// The records.
     records: Vec<AuditEntry>,
+  },
+  /// A clean file's verified content digest (§4.15).
+  Digest {
+    /// BLAKE3 of the file's bytes as the disk holds them.
+    identity: [u8; 32],
+    /// The length digested, in bytes.
+    size: u64,
   },
 }
 

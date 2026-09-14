@@ -201,6 +201,7 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::Destroy { volume }
     | RequestBody::Status { volume }
     | RequestBody::ReadBase { volume, .. }
+    | RequestBody::Digest { volume, .. }
     | RequestBody::Rewitness { volume, .. }
     | RequestBody::Pin { volume, .. }
     | RequestBody::AwaitPlaced { volume, .. }
@@ -1370,6 +1371,8 @@ fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::GrantInvalid => "grant_invalid",
     Refusal::HomedElsewhere { .. } => "homed_elsewhere",
     Refusal::NotRootLeader => "not_root_leader",
+    Refusal::DigestNotClean => "digest_not_clean",
+    Refusal::DigestUnverified => "digest_unverified",
   }
 }
 
@@ -1491,6 +1494,7 @@ fn dispatch_inner(
     RequestBody::Audit { since } => crate::landing::audit_verb(state, since),
     RequestBody::Acknowledge { up_to } => acknowledge(state, client_id, up_to),
     RequestBody::ReadBase { volume, path } => read_base(state, principal, volume, &path),
+    RequestBody::Digest { volume, path } => digest(state, principal, volume, &path),
     RequestBody::Rewitness { volume, paths } => {
       rewitness(state, principal, volume, paths.as_deref())
     }
@@ -3494,6 +3498,33 @@ fn read_base(
   };
   match slot.volume.with_host(host).read_base(path) {
     Ok(bytes) => ReplyBody::BaseBytes { bytes },
+    Err(e) => refused(refusal_of_vfs(&e)),
+  }
+}
+
+/// `digest` (§4.15): a clean base file's verified content digest — a read, so the read right
+/// suffices; the volume core's refusals cross typed (`DigestNotClean`, `DigestUnverified`).
+fn digest(
+  state: &mut ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+  path: &str,
+) -> ReplyBody {
+  let handle = match base_of(state, principal, volume, "digest", false) {
+    Ok(h) => h,
+    Err(r) => return *r,
+  };
+  let Ok(slot) = state.volumes.get_mut(handle) else {
+    return refused(Refusal::NotFound);
+  };
+  let Some(host) = slot.host.as_mut() else {
+    return refused(Refusal::NotFound);
+  };
+  match slot.volume.with_host(host).digest(&mut state.store, path) {
+    Ok(digest) => ReplyBody::Digest {
+      identity: digest.identity,
+      size: digest.size,
+    },
     Err(e) => refused(refusal_of_vfs(&e)),
   }
 }

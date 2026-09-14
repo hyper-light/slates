@@ -106,6 +106,15 @@ pub enum Landing {
   },
 }
 
+/// What `digest` returns (§4.15): a clean base file's verified content digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Digest {
+  /// BLAKE3 of the file's bytes as the disk holds them.
+  pub identity: [u8; 32],
+  /// The length digested, in bytes.
+  pub size: u64,
+}
+
 /// What `attach` returns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attachment {
@@ -1448,6 +1457,20 @@ impl Client {
     })? {
       ReplyBody::BaseBytes { bytes } => Ok(bytes),
       _ => Err(ClientError::UnexpectedReply { verb: "read_base" }),
+    }
+  }
+
+  /// A clean base file's verified content digest (§4.15): the BLAKE3 of the bytes the disk holds
+  /// for an untouched entry and their length, verified current at the export. Refused
+  /// `DigestNotClean` for an entry the volume diverged (read and hash its bytes instead) and
+  /// `DigestUnverified` when the file changed under the hash (retry).
+  pub fn digest(&mut self, volume: VolumeId, path: &str) -> Result<Digest, ClientError> {
+    match self.call(&RequestBody::Digest {
+      volume,
+      path: path.to_owned(),
+    })? {
+      ReplyBody::Digest { identity, size } => Ok(Digest { identity, size }),
+      _ => Err(ClientError::UnexpectedReply { verb: "digest" }),
     }
   }
 

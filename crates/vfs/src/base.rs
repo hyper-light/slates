@@ -3,7 +3,10 @@
 //! first write copies an entry up and records the witnessed base (the stat fingerprint and the
 //! BLAKE3 of the bytes the edit was based on); deletes leave whiteouts; renamed base directories
 //! record their origin (a redirect); drift is detected by fingerprints under the racy rule and
-//! reported, never absorbed; watcher hints make reports prompt and are never the truth.
+//! reported, never absorbed; watcher hints make reports prompt and are never the truth. A clean
+//! file — an untouched base entry — exports a verified content digest ([`Overlay::digest`],
+//! §4.15): the BLAKE3 of the bytes the disk holds, verified current at the export by the file's
+//! identity and fingerprint, refused typed rather than ever stale.
 //!
 //! Ownership: the host is owned by whoever opened the base directory (the shard in Phase 2, the
 //! test here) and lent to each operation as `&mut dyn HostFs`; a volume holds only handles and
@@ -108,6 +111,27 @@ pub struct Diverged {
   pub kind: Divergence,
 }
 
+/// A clean file's verified content digest (§4.15): the BLAKE3 of the bytes the disk holds for an
+/// untouched base entry and their length, verified against the file's identity and fingerprint
+/// at the moment of export.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Digest {
+  /// BLAKE3 of the file's bytes.
+  pub identity: [u8; 32],
+  /// The length digested, in bytes.
+  pub size: u64,
+}
+
+/// The digest verb's counters (§4.15: "validated by a counter and a byte oracle"): every path
+/// the verb can take, so a test asserts the one it drove moved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DigestStats {
+  /// Digests computed by reading and hashing the file.
+  pub computed: u64,
+  /// Exports refused `DigestUnverified`: the file changed while it was being digested.
+  pub unverified: u64,
+}
+
 /// Entries a fresh listing lacks (by name) and unwitnessed files it still lists with their
 /// fingerprints.
 type Stale = (Vec<String>, Vec<(InodeNo, Fingerprint)>);
@@ -149,6 +173,8 @@ pub struct BasePlane {
   /// Directories whose listings a hint invalidated and whose witnessed entries want a check.
   recheck: BTreeSet<InodeNo>,
   recheck_all: bool,
+  /// The digest verb's counters.
+  digest_stats: DigestStats,
 }
 
 impl BasePlane {
@@ -178,6 +204,7 @@ impl BasePlane {
       watch: WatchState::Unavailable,
       recheck: BTreeSet::new(),
       recheck_all: false,
+      digest_stats: DigestStats::default(),
     }
   }
 
@@ -206,6 +233,11 @@ impl BasePlane {
   /// Whether the inode is witnessed.
   pub fn is_witnessed(&self, no: InodeNo) -> bool {
     self.witnesses.contains_key(&no)
+  }
+
+  /// The digest verb's counters, for the tests that must see a path move.
+  pub fn digest_stats(&self) -> DigestStats {
+    self.digest_stats
   }
 }
 
@@ -598,6 +630,16 @@ impl Overlay<'_> {
     if let Some(f) = self.plane()?.descriptors.remove(&no) {
       self.host.close_file(f);
     }
+    self.adopt_fingerprint(store, no, fp)
+  }
+
+  /// An untouched entry takes the disk's fingerprint: its attributes and its base length.
+  fn adopt_fingerprint(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    fp: Fingerprint,
+  ) -> Result<(), VfsError> {
     let handle = self.vol.make_current_inode(store, no)?;
     let inode = store.inodes.get_mut(handle)?;
     inode.attrs.size = fp.size;
@@ -1454,6 +1496,165 @@ impl Overlay<'_> {
         .reconcile(before, crate::volume::content_by_epoch(store, handle));
     }
     Ok(())
+  }
+
+  // ---------------------------------------------------------------- digests
+
+  /// `digest` (§4.15): the verified content digest of a clean file — an untouched base entry,
+  /// whose bytes are exactly the disk's. The path resolves through the overlay (an absent or
+  /// whiteouted name is `NotFound`, a directory `IsDirectory`); an entry the volume diverged, or
+  /// a symlink, refuses `DigestNotClean`; then the file is verified current (its listing
+  /// validated, the path opened afresh and matched by identity to the descriptor the volume
+  /// holds), hashed in bounded windows, and its fingerprint compared again after the read, so a
+  /// file changing under the hash refuses `DigestUnverified` rather than export a digest of torn
+  /// bytes. A read, never a mutation: nothing is journaled and the entry does not diverge.
+  pub fn digest(&mut self, store: &mut Store, path: &str) -> Result<Digest, VfsError> {
+    let located = self.resolve(store, path)?;
+    let no = match located.child {
+      Child::File(no) => no,
+      Child::Dir(_) => return Err(VfsError::IsDirectory),
+      Child::Symlink(_) => return Err(VfsError::DigestNotClean),
+      Child::Whiteout => return Err(VfsError::NotFound),
+    };
+    if !self.is_clean(store, no) {
+      return Err(VfsError::DigestNotClean);
+    }
+    let (file, fingerprint) = self.verify_current(store, no)?;
+    let identity = self.hash_file(store, file, fingerprint.size)?;
+    let after = self.host.fstat(file).map_err(host_refusal)?;
+    if after != fingerprint {
+      return Err(self.count_digest_refusal(VfsError::DigestUnverified));
+    }
+    self.plane()?.digest_stats.computed += 1;
+    Ok(Digest {
+      identity,
+      size: fingerprint.size,
+    })
+  }
+
+  /// Whether an entry is clean (§4.15): an untouched base file, so its bytes are exactly the
+  /// disk's — the complement of the diverged set for files: base-backed and unwitnessed.
+  fn is_clean(&self, store: &Store, no: InodeNo) -> bool {
+    let witnessed = self.vol.base.as_ref().is_some_and(|b| b.is_witnessed(no));
+    !witnessed
+      && matches!(
+        self.vol.inode(store, no).map(|i| &i.body),
+        Ok(Body::Base(_))
+      )
+  }
+
+  /// The descriptor and fingerprint of a clean file as the disk holds it right now (§4.15
+  /// "verified current"). The directory's listing is validated first (`follow_live_disk`); then
+  /// the path is opened afresh and its identity compared with the descriptor the volume holds,
+  /// because a file replaced beneath a held descriptor inside the directory's timestamp
+  /// granularity leaves the listing's fingerprint unchanged and the old inode alive behind the
+  /// descriptor — the one case the listing cannot tell. Two `fstat`s of one inode that disagree
+  /// mean it is changing now.
+  fn verify_current(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+  ) -> Result<(HostFile, Fingerprint), VfsError> {
+    self.follow_live_disk(store, no)?;
+    let (dir, name) = self.home_of(store, no)?;
+    let fresh = self.host.open_file(dir, &name).map_err(host_refusal)?;
+    let at_path = match self.host.fstat(fresh) {
+      Ok(fp) => fp,
+      Err(e) => {
+        self.host.close_file(fresh);
+        return Err(host_refusal(e));
+      }
+    };
+    let held = self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|b| b.descriptors.get(&no).copied());
+    let Some(held) = held else {
+      self.plane()?.descriptors.insert(no, fresh);
+      return Ok((fresh, at_path));
+    };
+    let served = match self.host.fstat(held) {
+      Ok(fp) => fp,
+      Err(e) => {
+        self.host.close_file(fresh);
+        return Err(host_refusal(e));
+      }
+    };
+    if (served.dev, served.ino) != (at_path.dev, at_path.ino) {
+      // The path holds another inode now: the descriptor serves a file the disk has replaced.
+      // An untouched entry shows the live disk, so the volume adopts the new inode and rereads
+      // the directory at its next use (its listing still names the old fingerprint).
+      self.host.close_file(held);
+      self.plane()?.descriptors.insert(no, fresh);
+      self.adopt_fingerprint(store, no, at_path)?;
+      self.invalidate_listing_of(store, no);
+      return Ok((fresh, at_path));
+    }
+    self.host.close_file(fresh);
+    if served != at_path {
+      return Err(self.count_digest_refusal(VfsError::DigestUnverified));
+    }
+    Ok((held, served))
+  }
+
+  /// Marks the listing of an entry's home directory for a reread at its next use.
+  fn invalidate_listing_of(&mut self, store: &Store, no: InodeNo) {
+    let Some(parent) = self
+      .vol
+      .inode(store, no)
+      .ok()
+      .and_then(|i| i.home)
+      .map(|h| h.parent)
+    else {
+      return;
+    };
+    if let Some(l) = self
+      .vol
+      .base
+      .as_mut()
+      .and_then(|b| b.listings.get_mut(&parent))
+    {
+      l.entries = None;
+    }
+  }
+
+  /// The BLAKE3 of an open file's first `size` bytes, read in windows of the store's chunk
+  /// size, so digesting a file costs one window of memory whatever its length (bounded work,
+  /// §4.3). A read that ends short of `size` means the file shrank under the hash:
+  /// `DigestUnverified`.
+  fn hash_file(&mut self, store: &Store, file: HostFile, size: u64) -> Result<[u8; 32], VfsError> {
+    let window = store.content.chunk_bytes().max(1);
+    let window_len = u64::try_from(window).unwrap_or(u64::MAX);
+    let mut buf = vec![0u8; usize::try_from(size.min(window_len)).unwrap_or(window)];
+    let mut hasher = blake3::Hasher::new();
+    let mut done: u64 = 0;
+    while done < size {
+      let want = usize::try_from((size - done).min(window_len)).unwrap_or(window);
+      let n = self
+        .host
+        .read_at(file, done, &mut buf[..want])
+        .map_err(host_refusal)?;
+      if n == 0 {
+        break;
+      }
+      hasher.update(&buf[..n]);
+      done = done.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+    }
+    if done != size {
+      return Err(self.count_digest_refusal(VfsError::DigestUnverified));
+    }
+    Ok(*hasher.finalize().as_bytes())
+  }
+
+  /// Counts a digest refusal on the path it names and hands it back.
+  fn count_digest_refusal(&mut self, refusal: VfsError) -> VfsError {
+    if let Some(plane) = self.vol.base.as_mut()
+      && refusal == VfsError::DigestUnverified
+    {
+      plane.digest_stats.unverified += 1;
+    }
+    refusal
   }
 
   // ---------------------------------------------------------------- drift
