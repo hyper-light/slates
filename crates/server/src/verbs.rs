@@ -16,10 +16,11 @@ use slates_db::catalog::{
 };
 use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration, rendezvous_first};
 use slates_ipc::protocol::{
-  DaemonReport, Direction, FleetReport, FreshnessBasis, HealthSignal, Intent, NamePolicy,
-  PlacedState, Refusal, RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal,
-  SizeClass, SnapshotId, StatusReport, VolumeId, VolumeSummary, WorkOp, decode_body, encode_body,
-  pack, unpack,
+  AttachRequest, AttachTransport, DaemonReport, Direction, Established, FleetReport,
+  FreshnessBasis, HealthSignal, Intent, NamePolicy, OciBinding, PlacedState, ReadWritePolicy,
+  Refusal, RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal, SizeClass, SnapshotId,
+  StatusReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp, decode_body, encode_body, pack,
+  unpack,
 };
 use slates_ipc::slot::SlotKind;
 use slates_ipc::{IpcError, Request};
@@ -1551,6 +1552,8 @@ fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::ConsistentBaseUnavailable => "consistent_base_unavailable",
     Refusal::ContentUnavailable => "content_unavailable",
     Refusal::StaleEpoch { .. } => "stale_epoch",
+    Refusal::AttachmentUnsupported { .. } => "attachment_unsupported",
+    Refusal::ChosenPathUnavailable { .. } => "chosen_path_unavailable",
   }
 }
 
@@ -1699,7 +1702,8 @@ fn dispatch_inner(
       volume,
       snapshot,
       intent,
-    } => attach(state, client_id, principal, volume, snapshot, intent),
+      form,
+    } => attach(state, client_id, principal, volume, snapshot, intent, form),
     RequestBody::Detach { attachment } => detach(state, principal, attachment),
     RequestBody::Resize { volume, size } => resize(state, principal, volume, size),
     RequestBody::Destroy { volume } => destroy(state, principal, volume),
@@ -3426,6 +3430,13 @@ fn clone(
   }
 }
 
+/// Attaches in the requested form (§4.4 `attach(volume|snapshot, consumer, transport, chosen_path?)`;
+/// §4.6 A-9), in the order that takes nothing before it is allowed: the rights for the intent first
+/// (§4.13: checked before any lookup or effect), then the form's establishment (a container bind is
+/// verified against the kernel's mount table before any effect, so "Refusal rolls back owned
+/// resources" holds by having taken none), then the write lease, then the record. The reply carries
+/// what was established and the transport's report for this attachment, narrowed to the intent (a
+/// reader on a volume it could write is still read-only through this attachment).
 fn attach(
   state: &mut ShardState,
   client_id: u32,
@@ -3433,6 +3444,7 @@ fn attach(
   volume: VolumeId,
   snapshot: Option<SnapshotId>,
   intent: Intent,
+  form: AttachRequest,
 ) -> ReplyBody {
   // A merge volume has no store slot: its record alone admits it. A green pins a version and
   // refuses a write intent; a work attaches like a plain volume (its lease and epoch).
@@ -3444,46 +3456,43 @@ fn attach(
     return crate::merge_service::attach_green(state, client_id, principal, &record, intent);
   }
   let rights = rights_of(&record, principal);
+  let allowed = match intent {
+    Intent::Read => rights.read,
+    Intent::Write => rights.write,
+  };
+  if !allowed {
+    return forbidden("attach");
+  }
+  let situation = crate::transports::situation(state, &rights);
+  let binding = match establish_form(&record, &situation, snapshot, intent, &form) {
+    Ok(binding) => binding,
+    Err(refusal) => return refused(refusal),
+  };
   let now = state.clock.monotonic_ns();
   let lease_epoch = match intent {
-    Intent::Read => {
-      if !rights.read {
-        return forbidden("attach");
-      }
-      None
-    }
-    Intent::Write => {
-      if !rights.write {
-        return forbidden("attach");
-      }
-      let epoch = match &record.lease {
-        Some(current) if &current.holder == principal => current.epoch,
-        Some(current) if current.expires_ns <= now => current.epoch.saturating_add(1),
-        Some(_) => 1,
-        None => 1,
-      };
-      let term = derived!(
-        state.config.failover_slo_ns,
-        "the operator's failover SLO (the renewal round trip is microseconds, so one term is the SLO)",
-        ["failover_slo_ns"]
-      );
-      let lease = LeaseRecord {
-        holder: principal.clone(),
-        epoch,
-        expires_ns: now.saturating_add(term.get()),
-      };
-      if let Err(e) = state.db.mutate(
-        &mut state.segment,
-        &Op::LeaseTaken {
-          volume: record.id,
-          lease,
-        },
-        now,
-      ) {
-        return refused(refusal_of_db(&e));
-      }
-      Some(epoch)
-    }
+    Intent::Read => None,
+    Intent::Write => match take_write_lease(state, &record, principal, now) {
+      Ok(epoch) => Some(epoch),
+      Err(refusal) => return refused(refusal),
+    },
+  };
+  let (db_form, established, mut capability) = match binding {
+    None => (
+      AttachForm::Root,
+      Established::Record,
+      crate::transports::root(&situation),
+    ),
+    Some(binding) => (
+      AttachForm::Oci {
+        source: binding.source.clone(),
+        destination: binding.destination.clone(),
+        read_only: binding.read_only,
+      },
+      Established::OciBind {
+        binding: Box::new(binding),
+      },
+      crate::transports::oci(&situation),
+    ),
   };
   let attachment = attachment_id(state.partition, state.next_attachment);
   state.next_attachment += 1;
@@ -3493,19 +3502,120 @@ fn attach(
       volume: record.id,
       consumer: Consumer::Sdk { client: client_id },
       snapshot: snapshot.map(to_db_snapshot),
-      form: AttachForm::Root,
+      form: db_form,
       principal: principal.clone(),
     },
   };
   if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
     return refused(refusal_of_db(&e));
   }
+  capability.read_write = match intent {
+    Intent::Read => ReadWritePolicy::ReadOnly,
+    Intent::Write => ReadWritePolicy::ReadWrite,
+  };
   ReplyBody::Attached {
     attachment,
     lease_epoch,
     path: None,
     version: None,
+    established,
+    capability,
   }
+}
+
+/// The form's establishment, before any effect: nothing for the record form; for a container bind,
+/// the transport must be offered on this host (the report's own reason otherwise), the view must be
+/// the live head the host mount presents (never a snapshot), and the host path must verify as this
+/// volume's mount point (`crate::oci::bind`).
+fn establish_form(
+  record: &VolumeRecord,
+  situation: &crate::transports::Situation,
+  snapshot: Option<SnapshotId>,
+  intent: Intent,
+  form: &AttachRequest,
+) -> Result<Option<OciBinding>, Refusal> {
+  let (source, destination) = match form {
+    AttachRequest::Root => return Ok(None),
+    AttachRequest::Guest { transport } => return Err(guest_over_the_ring(situation, *transport)),
+    AttachRequest::Oci {
+      source,
+      destination,
+    } => (source, destination),
+  };
+  if let Some(reason) = crate::transports::oci(situation).unsupported_reason {
+    return Err(Refusal::AttachmentUnsupported {
+      transport: AttachTransport::Oci,
+      reason,
+    });
+  }
+  if snapshot.is_some() {
+    return Err(Refusal::AttachmentUnsupported {
+      transport: AttachTransport::Oci,
+      reason: UnsupportedReason::SnapshotNotPresentedByHostMount,
+    });
+  }
+  let read_only = matches!(intent, Intent::Read);
+  crate::oci::bind(&record.name, source, destination, read_only).map(Some)
+}
+
+/// Why a guest form asked for over the ring is refused (§4.6 A-9 "Requesting an unsupported form
+/// returns `AttachmentUnsupported{transport, reason}`"): a transport that is not a guest's is a bad
+/// request; a guest transport the device refuses carries the device's own reason; one it serves still
+/// cannot be established here, because the VMM seam is handed to the daemon in-process by the harness
+/// (`Daemon::attach_guest_device`) and no seam accompanies a ring request.
+fn guest_over_the_ring(
+  situation: &crate::transports::Situation,
+  transport: AttachTransport,
+) -> Refusal {
+  match crate::transports::guest(situation, transport) {
+    None => Refusal::BadRequest {
+      reason: format!("{transport:?} is not a guest transport"),
+    },
+    Some(entry) => Refusal::AttachmentUnsupported {
+      transport,
+      reason: entry
+        .unsupported_reason
+        .unwrap_or(UnsupportedReason::SeamNotOnWire),
+    },
+  }
+}
+
+/// Takes (or renews) the volume's write lease for `principal` (D-16): the holder renews at its
+/// epoch, an expired lease passes to the next epoch, and the term is the operator's failover SLO.
+fn take_write_lease(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  principal: &Principal,
+  now: u64,
+) -> Result<u64, Refusal> {
+  let epoch = match &record.lease {
+    Some(current) if &current.holder == principal => current.epoch,
+    Some(current) if current.expires_ns <= now => current.epoch.saturating_add(1),
+    Some(_) => 1,
+    None => 1,
+  };
+  let term = derived!(
+    state.config.failover_slo_ns,
+    "the operator's failover SLO (the renewal round trip is microseconds, so one term is the SLO)",
+    ["failover_slo_ns"]
+  );
+  let lease = LeaseRecord {
+    holder: principal.clone(),
+    epoch,
+    expires_ns: now.saturating_add(term.get()),
+  };
+  state
+    .db
+    .mutate(
+      &mut state.segment,
+      &Op::LeaseTaken {
+        volume: record.id,
+        lease,
+      },
+      now,
+    )
+    .map_err(|e| refusal_of_db(&e))?;
+  Ok(epoch)
 }
 
 fn detach(state: &mut ShardState, principal: &Principal, attachment: u64) -> ReplyBody {
@@ -3815,9 +3925,11 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
     Ok(x) => x,
     Err(r) => return *r,
   };
-  if !rights_of(&record, principal).read {
+  let rights = rights_of(&record, principal);
+  if !rights.read {
     return forbidden("status");
   }
+  let transports = crate::transports::report(&crate::transports::situation(state, &rights));
   let Ok(slot) = state.volumes.get_mut(handle) else {
     return refused(Refusal::NotFound);
   };
@@ -3858,6 +3970,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
       nfs_port: u16::try_from(crate::daemon::NFS_PORT.load(std::sync::atomic::Ordering::Acquire))
         .ok()
         .filter(|port| *port != 0),
+      transports: Box::new(transports),
     },
   }
 }

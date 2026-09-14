@@ -396,11 +396,16 @@ pub(crate) fn attach_green(
       version,
     },
   );
+  // A green attachment is the record form (§4.4): no host mount presents a green, so what is
+  // established is the record and the capability is the record transport's (§4.6 A-9).
+  let situation = crate::transports::situation(state, &rights_of(record, principal));
   ReplyBody::Attached {
     attachment,
     lease_epoch: None,
     path: None,
     version: Some(version),
+    established: slates_ipc::protocol::Established::Record,
+    capability: crate::transports::root(&situation),
   }
 }
 
@@ -670,8 +675,14 @@ pub(crate) fn status_merge_volume(
   };
   let attachments = state.db.partition().attachments_of(id).len();
   let placed = crate::verbs::placed_state(state, &record);
+  // The transport report is the host's, the same for a green as for any volume (§4.6 A-9).
+  let transports = Box::new(crate::transports::report(&crate::transports::situation(
+    state,
+    &rights_of(&record, principal),
+  )));
   Some(ReplyBody::Status {
     report: slates_ipc::protocol::StatusReport {
+      transports,
       id: volume,
       name: record.name.clone(),
       referenced_bytes: bytes,

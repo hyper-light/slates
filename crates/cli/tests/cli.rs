@@ -258,7 +258,16 @@ struct MountPoint {
 
 impl Drop for MountPoint {
   fn drop(&mut self) {
-    let _ = Command::new("umount").arg(&self.path).output();
+    // A plain unmount first; forced if something (a container runtime's share of the path, measured
+    // 2026-09-14) still holds the mount point busy — a dead mount left behind is worse.
+    let unmounted = Command::new("umount")
+      .arg(&self.path)
+      .output()
+      .map(|o| o.status.success())
+      .unwrap_or(false);
+    if !unmounted {
+      let _ = Command::new("umount").args(["-f", &self.path]).output();
+    }
     let _ = Command::new("rmdir").arg(&self.path).output();
   }
 }
@@ -1377,4 +1386,477 @@ fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owner
 
   drop(daemons);
   drop(scratch);
+}
+
+// --- T-4.13: the OCI namespace handoff (§4.6 A-9; AC-4.11; RQ-20). ---
+
+/// Shape: how long one container run may take on a loaded box (the first emulated `linux/amd64`
+/// alpine run measured 2026-09-14 exceeded 90 s with the box at the memory wall).
+const CONTAINER_WAIT: Duration = Duration::from_secs(300);
+/// Shape: how long `docker info` may take to answer before the runtime is called unreachable.
+const DOCKER_INFO_WAIT: Duration = Duration::from_secs(60);
+/// Shape: how many polls `slates unmount` is retried while the runtime's share holds the mount
+/// point busy after the containers exited (measured 2026-09-14: the share holds every file a
+/// container touched open beyond the container's lifetime — not released within 150 s — so the
+/// plain unmount answers "Resource busy" and the guard's forced unmount ends the test).
+const UNMOUNT_TRIES: u32 = 100;
+/// Format: the image the container workload runs in — one small image (alpine 3.20, 12 MB).
+const CONTAINER_IMAGE: &str = "alpine:3.20";
+/// Format: the workload every side runs, as POSIX shell: `$1` is the root of the volume's view, `$2`
+/// the side's tag. Create, write, read back, make a directory, rename, delete, show the directory
+/// after the delete and remove it, list (without the AppleDouble `._*` sidecars the macOS NFS client
+/// writes for host files' extended attributes, which the runtime's share refuses to show), then
+/// read every other side's file and print every file's size.
+const WORKLOAD: &str = r#"
+set -e
+R="$1"; T="$2"
+printf 'hello from %s' "$T" > "$R/$T.txt"
+cat "$R/$T.txt"; echo
+mkdir "$R/dir-$T"
+printf 'inner' > "$R/dir-$T/inner.txt"
+mv "$R/dir-$T/inner.txt" "$R/dir-$T/renamed.txt"
+cat "$R/dir-$T/renamed.txt"; echo
+rm "$R/dir-$T/renamed.txt"
+echo "--- dir-after-delete"
+ls -1A "$R/dir-$T" || true
+rmdir "$R/dir-$T" 2>&1 && echo "rmdir ok"
+echo "--- listing"
+ls -1 "$R" | grep -v '^\._' || true
+echo "--- other"
+for f in "$R"/*.txt; do
+  case "$f" in *"/$T.txt") ;; *) printf '%s:' "$(basename "$f")"; cat "$f"; echo ;; esac
+done
+echo "--- sizes"
+for f in "$R"/*.txt; do printf '%s %s\n' "$(basename "$f")" "$(wc -c < "$f" | tr -d ' ')"; done
+"#;
+/// Format: what the container sees at its destination before the workload: the filesystem type the
+/// runtime mounted there (from the container's own mount table), recorded for the transport's record.
+const CONTAINER_VIEW: &str = r#"
+echo "--- view"
+awk -v m="$1" '$5 == m { for (i = 7; i <= NF; i++) if ($i == "-") { print $(i+1) " " $(i+2); break } }' /proc/self/mountinfo || true
+"#;
+/// Format: the read-only side's probe: list, then try a write, which the runtime's `ro` bind refuses.
+const READ_ONLY_PROBE: &str = r#"
+R="$1"
+echo "--- listing"
+ls -1 "$R" | grep -v '^\._' || true
+echo "--- write"
+( printf 'x' > "$R/from-ro.txt" ) 2>&1 || echo "write refused"
+"#;
+
+/// Runs a command to completion within `wait`, killing it past the bound: (exit code, stdout,
+/// stderr), or why it did not run.
+fn bounded(command: &mut Command, wait: Duration) -> Result<(i32, String, String), String> {
+  let mut child = command
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|e| format!("spawn: {e}"))?;
+  let started = Instant::now();
+  loop {
+    match child.try_wait() {
+      Ok(Some(_)) => break,
+      Ok(None) if started.elapsed() < wait => pause(),
+      Ok(None) => {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("timed out after {wait:?}"));
+      }
+      Err(e) => return Err(format!("wait: {e}")),
+    }
+  }
+  let output = child
+    .wait_with_output()
+    .map_err(|e| format!("output: {e}"))?;
+  Ok((
+    output.status.code().unwrap_or(-1),
+    String::from_utf8_lossy(&output.stdout).into_owned(),
+    String::from_utf8_lossy(&output.stderr).into_owned(),
+  ))
+}
+
+/// The container runtime's server, as `docker info` states it, or why it is unreachable.
+fn docker_server() -> Result<String, String> {
+  let (code, out, err) = bounded(
+    Command::new("docker").args([
+      "info",
+      "--format",
+      "{{.ServerVersion}} {{.OperatingSystem}} runtime={{.DefaultRuntime}}",
+    ]),
+    DOCKER_INFO_WAIT,
+  )?;
+  if code == 0 {
+    Ok(out.trim().to_owned())
+  } else {
+    Err(format!("docker info exited {code}: {}", err.trim()))
+  }
+}
+
+/// The gate: the live-mount flow's own (`SLATES_TEST_CLI=1`, `mount_nfs`) plus a reachable
+/// runtime; the runtime's server description when the test may run, else the loud skip was printed.
+fn container_leg_gate() -> Option<String> {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping T-4.13's container leg: set SLATES_TEST_CLI=1 to run it (a real kernel mount and a real container)"
+    );
+    return None;
+  }
+  if !mount_nfs_available() {
+    eprintln!("skipping T-4.13's container leg: mount_nfs is not on this host (macOS/BSD only)");
+    return None;
+  }
+  match docker_server() {
+    Ok(server) => Some(server),
+    Err(why) => {
+      eprintln!("skipping T-4.13's container leg: the container runtime is unreachable: {why}");
+      None
+    }
+  }
+}
+
+/// Runs `script` in a container over the runtime entry the daemon returned: the entry's source bound
+/// at its destination with the entry's read-only or read-write option, as the mounting user (the
+/// consumer, §4.13). The entry is passed exactly as the harness would pass it to its runtime.
+fn run_in_container(
+  entry: &serde_json::Value,
+  script: &str,
+  tag: &str,
+) -> Result<(i32, String, String), String> {
+  let source = entry["source"].as_str().unwrap();
+  let destination = entry["destination"].as_str().unwrap();
+  let read_only = entry["options"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .any(|o| o == "ro");
+  let access = if read_only { "ro" } else { "rw" };
+  let user = format!(
+    "{}:{}",
+    rustix::process::getuid().as_raw(),
+    rustix::process::getgid().as_raw()
+  );
+  let name = format!("slates-oci-{}-{tag}", std::process::id());
+  let bind = format!("{source}:{destination}:{access}");
+  let mut command = Command::new("docker");
+  command.args([
+    "run",
+    "--rm",
+    "--name",
+    &name,
+    "--user",
+    &user,
+    "-v",
+    &bind,
+    CONTAINER_IMAGE,
+    "sh",
+    "-c",
+    script,
+    "sh",
+    destination,
+    tag,
+  ]);
+  let result = bounded(&mut command, CONTAINER_WAIT);
+  if result.is_err() {
+    let _ = Command::new("docker").args(["rm", "-f", &name]).output();
+  }
+  result
+}
+
+/// The workload on the host path, through the shell (no `std::fs`, R1).
+fn run_on_host(root: &str, tag: &str) -> (i32, String, String) {
+  bounded(
+    Command::new("sh").args(["-c", WORKLOAD, "sh", root, tag]),
+    CONTAINER_WAIT,
+  )
+  .unwrap()
+}
+
+/// The lines of one `--- section` of a workload's output.
+fn section<'a>(output: &'a str, name: &str) -> Vec<&'a str> {
+  let header = format!("--- {name}");
+  output
+    .lines()
+    .skip_while(|line| *line != header)
+    .skip(1)
+    .take_while(|line| !line.starts_with("--- "))
+    .collect()
+}
+
+/// `attach ID --oci-source MOUNT --oci-destination /work [--read|--write] --json`: the parsed reply.
+fn attach_oci(instance: &str, id: &str, mount: &str, access: &str) -> serde_json::Value {
+  let (code, out, err) = run(
+    instance,
+    &[
+      "attach",
+      id,
+      access,
+      "--oci-source",
+      mount,
+      "--oci-destination",
+      "/work",
+      "--json",
+    ],
+  );
+  assert_eq!(code, 0, "attach in the OCI form: {err}");
+  serde_json::from_str(out.trim()).unwrap()
+}
+
+/// The verified binding of a write attachment: a recursive read-write bind of the mount point, whose
+/// evidence names the volume's export.
+fn assert_verified_binding(binding: &serde_json::Value, mount: &str, volume_name: &str) {
+  assert_eq!(binding["source"], mount, "the verified mount point");
+  assert_eq!(binding["destination"], "/work");
+  assert_eq!(binding["read_only"], false);
+  assert_eq!(binding["evidence"]["fstype"], "nfs");
+  assert_eq!(
+    binding["evidence"]["mount_source"],
+    format!("localhost:/{volume_name}")
+  );
+  assert_eq!(binding["evidence"]["names_volume"], true);
+  let entry = &binding["mount"];
+  assert_eq!(entry["type"], "bind");
+  assert_eq!(entry["options"], serde_json::json!(["rbind", "rw"]));
+}
+
+/// The transport's report on the reply: the bind offered read-write, with the host mount's
+/// delete-while-open rule (the macOS NFS client silly-renames) that the container then meets.
+fn assert_bind_capability(capability: &serde_json::Value) {
+  assert_eq!(capability["transport"], "oci");
+  assert_eq!(capability["supported"], true);
+  assert_eq!(capability["read_write"], "read_write");
+  assert_eq!(
+    capability["sharing"]["delete_while_open"], "silly_renamed",
+    "the report states the rule the container then meets"
+  );
+}
+
+/// The write attachment's reply: an established container bind, verified, with its report.
+fn assert_write_binding(attached: &serde_json::Value, mount: &str, volume_name: &str) {
+  assert_eq!(attached["established"]["form"], "oci_bind");
+  assert_verified_binding(&attached["established"]["binding"], mount, volume_name);
+  assert_bind_capability(&attached["capability"]);
+}
+
+/// The two workload outputs agree: the container read the host's file byte for byte, its top-level
+/// listing and sizes hold both sides' files, the host's own delete leaves nothing and its directory
+/// goes, and the container's delete meets the reported rule — the runtime's share still holds the
+/// file open, so the NFS client silly-renamed it to `.nfs.*` and the directory cannot be removed.
+fn assert_workload_outputs_agree(host_out: &str, container_out: &str) {
+  assert!(
+    host_out.contains("hello from host") && host_out.contains("inner"),
+    "the host workload: {host_out}"
+  );
+  assert!(
+    container_out.contains("hello from container") && container_out.contains("inner"),
+    "the container workload: {container_out}"
+  );
+  assert_eq!(
+    section(host_out, "dir-after-delete"),
+    vec!["rmdir ok"],
+    "a delete by the host alone leaves nothing behind"
+  );
+  let after_delete = section(container_out, "dir-after-delete");
+  assert!(
+    after_delete.len() == 2
+      && after_delete[0].starts_with(".nfs.")
+      && after_delete[1].contains("Directory not empty"),
+    "the container's delete met the silly-rename rule: {after_delete:?}"
+  );
+  assert_eq!(
+    section(container_out, "other"),
+    vec!["host.txt:hello from host"],
+    "the container read the host's bytes"
+  );
+  assert_eq!(
+    section(container_out, "listing"),
+    vec!["container.txt", "dir-container", "host.txt"]
+  );
+  assert_eq!(
+    section(container_out, "sizes"),
+    vec!["container.txt 20", "host.txt 15"]
+  );
+}
+
+/// The host lists the same names as the container did and reads the container's bytes — one copy.
+fn assert_host_view_agrees(mount: &str) {
+  let (code, host_view, _) = bounded(
+    Command::new("sh").args([
+      "-c",
+      "ls -1 \"$1\" | grep -v '^\\._'; printf '%s' \"$(cat \"$1/container.txt\")\"; echo; wc -c < \"$1/container.txt\" | tr -d ' '",
+      "sh",
+      mount,
+    ]),
+    CONTAINER_WAIT,
+  )
+  .unwrap();
+  assert_eq!(code, 0);
+  assert_eq!(
+    host_view.lines().collect::<Vec<_>>(),
+    vec![
+      "container.txt",
+      "dir-container",
+      "host.txt",
+      "hello from container",
+      "20"
+    ],
+    "the host lists the same names and reads the container's bytes"
+  );
+}
+
+/// The write attachment in the OCI form, the workload on the host path, then the same workload in
+/// a real container over the returned entry; the writer's reply, or `None` when the runtime's file
+/// sharing refused the mount point (the loud skip was printed).
+fn bind_and_run_workloads(instance: &str, id: &str, path: &str) -> Option<serde_json::Value> {
+  let writer = attach_oci(instance, id, path, "--write");
+  assert_write_binding(&writer, path, "oci");
+  let entry = writer["established"]["binding"]["mount"].clone();
+  let (code, host_out, host_err) = run_on_host(path, "host");
+  assert_eq!(code, 0, "the host workload: {host_err}");
+  let script = format!("{CONTAINER_VIEW}{WORKLOAD}");
+  let (code, container_out, container_err) = run_in_container(&entry, &script, "container")
+    .unwrap_or_else(|why| panic!("the container did not run: {why}"));
+  if code != 0 && (container_err.contains("Mounts denied") || container_err.contains("not shared"))
+  {
+    eprintln!(
+      "skipping T-4.13's container leg: the runtime's file sharing refused the mount point {path}: {}",
+      container_err.trim()
+    );
+    return None;
+  }
+  assert_eq!(code, 0, "the container workload: {container_err}");
+  eprintln!(
+    "the container's view of /work: {:?}",
+    section(&container_out, "view")
+  );
+  assert_workload_outputs_agree(&host_out, &container_out);
+  assert_host_view_agrees(path);
+  Some(writer)
+}
+
+/// A delete on the host is the container's view too (the name goes; the share's open handle keeps
+/// the bytes as a `.nfs.*` entry `ls -1` does not show), and a read attachment is a read-only bind the
+/// runtime enforces; the reader's reply.
+fn assert_read_only_bind(instance: &str, id: &str, path: &str) -> serde_json::Value {
+  let (code, _, err) = bounded(
+    Command::new("rm").arg(format!("{path}/host.txt")),
+    CONTAINER_WAIT,
+  )
+  .unwrap();
+  assert_eq!(code, 0, "{err}");
+  let reader = attach_oci(instance, id, path, "--read");
+  let read_only_entry = &reader["established"]["binding"]["mount"];
+  assert_eq!(
+    read_only_entry["options"],
+    serde_json::json!(["rbind", "ro"])
+  );
+  assert_eq!(reader["established"]["binding"]["read_only"], true);
+  let (code, probe_out, probe_err) =
+    run_in_container(read_only_entry, READ_ONLY_PROBE, "reader").unwrap();
+  assert_eq!(code, 0, "the read-only probe: {probe_err}");
+  assert_eq!(
+    section(&probe_out, "listing"),
+    vec!["container.txt", "dir-container"],
+    "the host's delete is the container's view"
+  );
+  let write = section(&probe_out, "write").join("\n");
+  assert!(
+    write.contains("Read-only file system") && write.contains("write refused"),
+    "the runtime enforces the read-only bind: {write}"
+  );
+  reader
+}
+
+/// A host path that is not the volume's mount point is refused typed, before any effect.
+fn assert_not_a_mount_point_refused(instance: &str, id: &str) {
+  let (code, _, err) = run(
+    instance,
+    &[
+      "attach",
+      id,
+      "--oci-source",
+      "/private",
+      "--oci-destination",
+      "/work",
+    ],
+  );
+  assert_eq!(code, 1, "a refusal: {err}");
+  assert!(
+    err.contains("ChosenPathUnavailable") && err.contains("NotAMountPoint"),
+    "{err}"
+  );
+}
+
+fn detach_all(instance: &str, attachments: &[u64]) {
+  for attachment in attachments {
+    let (code, _, err) = run(instance, &["detach", &attachment.to_string()]);
+    assert_eq!(code, 0, "detach: {err}");
+  }
+}
+
+/// `slates unmount` after the containers ran, retried while the runtime's share holds the point
+/// busy; whether the plain unmount succeeded within the bound (the guard forces it otherwise).
+fn unmount_after_container(instance: &str, path: &str) -> bool {
+  for _ in 0..UNMOUNT_TRIES {
+    let (code, _, _) = run(instance, &["unmount", path]);
+    if code == 0 {
+      return true;
+    }
+    pause();
+  }
+  false
+}
+
+/// T-4.13 (AC-4.11, §4.6 A-9): a volume attached on the host — a real `slates mount` — is handed
+/// to a real container by the host's OCI runtime as the bind the daemon's `attach --oci-source`
+/// returned; the same filesystem workload runs on the host path and inside the container (create,
+/// write, read back, rename, delete, list, a byte-identical read of the other side's file); the two
+/// views agree byte for byte and in names and sizes; an edit inside the container is the host's edit
+/// and a delete on the host is the container's (one copy, no third); a read attachment yields a
+/// read-only bind the runtime enforces (`Read-only file system`); a host path that is not the
+/// volume's mount point is refused typed (`ChosenPathUnavailable{NotAMountPoint}`); and the
+/// container meets exactly the sharing rule the report states — the runtime's share holds files open
+/// past the container's life, so a delete inside it silly-renames (`.nfs.*`) and blocks `rmdir` and
+/// the plain unmount. Gated like the live mount flow (`SLATES_TEST_CLI=1`, `mount_nfs`), skipping
+/// loudly where the runtime is unreachable or its file sharing refuses the mount point — saying
+/// exactly what it said.
+#[test]
+fn an_oci_container_consumes_the_host_attachment_through_the_runtime_bind() {
+  let Some(server) = container_leg_gate() else {
+    return;
+  };
+  eprintln!("T-4.13 over {server}");
+  let instance = format!("cli-oci-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(&instance, &["volume", "create", "oci", "--bounded", "8MiB"]);
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let path = mount_point.path.clone();
+  mount_and_check(&instance, &id, &path);
+
+  let attachments = bind_and_run_workloads(&instance, &id, &path).map(|writer| {
+    let reader = assert_read_only_bind(&instance, &id, &path);
+    assert_not_a_mount_point_refused(&instance, &id);
+    [
+      writer["attachment"].as_u64().unwrap(),
+      reader["attachment"].as_u64().unwrap(),
+    ]
+  });
+  if let Some(attachments) = attachments {
+    detach_all(&instance, &attachments);
+  }
+  let unmounted = unmount_after_container(&instance, &path);
+  eprintln!(
+    "plain unmount after the containers: {}",
+    if unmounted {
+      "succeeded"
+    } else {
+      "busy (the runtime's share holds the mount point); forcing"
+    }
+  );
+  drop(mount_point);
+  assert!(!is_mounted(&path), "the mount table no longer lists it");
+  drop(anchor);
 }

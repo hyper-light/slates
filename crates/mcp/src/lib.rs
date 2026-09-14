@@ -21,10 +21,12 @@
 
 use serde_json::{Value, json};
 use slates_client::{
-  Attachment, CauseRecord, ChokepointReport, Client, ClientError, CreateSpec, DaemonReport, Filter,
-  GreenBase, Intent, Landing, LandingOutcome, LandingSummary, NamePolicy, ReadAt, Rebased,
-  ShardReport, Signal, SizeClass, SnapshotId, SpanRecord, StatusReport, Submitted, TelemetryReport,
-  VolumeId, VolumeSummary, WorkOp,
+  AttachRequest, AttachTransport, Attachment, AttachmentCapability, CauseRecord, ChokepointReport,
+  Client, ClientError, Conformance, CreateSpec, DaemonReport, DeleteWhileOpen, Established, Filter,
+  GreenBase, Intent, KernelCache, Landing, LandingOutcome, LandingSummary, NamePolicy, OciBinding,
+  OciRuntime, ReadAt, ReadWritePolicy, Rebased, Residency, ShardReport, Signal, SizeClass,
+  SnapshotId, SpanRecord, StatusReport, Submitted, TargetPathConstraint, TelemetryReport,
+  TransportReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
 };
 
 pub mod http;
@@ -346,9 +348,10 @@ impl McpServer {
     } else {
       Intent::Read
     };
+    let form = attach_form(args)?;
     let attached = self
       .client
-      .attach(volume, snapshot, intent)
+      .attach_with(volume, snapshot, intent, form)
       .map_err(refusal)?;
     Ok(attachment_json(&attached))
   }
@@ -618,9 +621,8 @@ fn tool_list() -> Vec<Value> {
     ),
     tool(
       "slates.attach.attach",
-      "Attach to a volume for reading (or writing, taking its lease); the attachment id and lease. \
-       A green attachment pins the green's head `version`, moved only by slates.merge.advance.",
-      json!({ "volume": string, "snapshot": integer, "write": { "type": "boolean" } }),
+      "Attach to a volume for reading (or writing, taking its lease); the attachment id, lease, what was established and the transport's capability; a green attachment pins the green's head `version`, moved only by slates.merge.advance. With oci_source (the host mount point, from `slates mount`) and oci_destination (a path inside the container), a container bind: the verified source and the runtime `mounts` entry to hand your OCI runtime (read-only unless write).",
+      json!({ "volume": string, "snapshot": integer, "write": { "type": "boolean" }, "oci_source": string, "oci_destination": string }),
       json!(["volume"]),
     ),
     tool(
@@ -807,7 +809,222 @@ pub fn status_json(r: &StatusReport) -> Value {
       "host_epoch": r.placed.host_epoch,
       "mirror_age_ns": r.placed.mirror_age_ns,
     },
+    "transports": transport_report_json(&r.transports),
   })
+}
+
+/// A transport's name on both surfaces (§4.6 A-9; one vocabulary for the CLI text and the JSON).
+pub fn transport_name(transport: AttachTransport) -> &'static str {
+  match transport {
+    AttachTransport::Root => "root",
+    AttachTransport::NfsLoopback => "nfs_loopback",
+    AttachTransport::Fuse => "fuse",
+    AttachTransport::Fskit => "fskit",
+    AttachTransport::WinFsp => "winfsp",
+    AttachTransport::Oci => "oci",
+    AttachTransport::VirtioFsInProcess => "virtiofs_in_process",
+    AttachTransport::VirtioFsInheritedDescriptor => "virtiofs_inherited_descriptor",
+  }
+}
+
+/// A refusal reason's name on both surfaces.
+pub fn unsupported_reason_name(reason: UnsupportedReason) -> &'static str {
+  match reason {
+    UnsupportedReason::HostPlatform => "host_platform",
+    UnsupportedReason::ListenerNotBound => "listener_not_bound",
+    UnsupportedReason::MountNeedsPrivilege => "mount_needs_privilege",
+    UnsupportedReason::BridgeNotWired => "bridge_not_wired",
+    UnsupportedReason::HostMountRequired => "host_mount_required",
+    UnsupportedReason::SnapshotNotPresentedByHostMount => "snapshot_not_presented_by_host_mount",
+    UnsupportedReason::SeamNotOnWire => "seam_not_on_wire",
+    UnsupportedReason::BindingNotBuilt => "binding_not_built",
+    UnsupportedReason::DaxNotEstablished => "dax_not_established",
+    UnsupportedReason::NotificationQueueNotOffered => "notification_queue_not_offered",
+  }
+}
+
+/// A target-path constraint's name on both surfaces.
+pub fn target_path_name(target: TargetPathConstraint) -> &'static str {
+  match target {
+    TargetPathConstraint::RootMount => "root_mount",
+    TargetPathConstraint::UserOwnedExistingDirectory => "user_owned_existing_directory",
+    TargetPathConstraint::ContainerDestination => "container_destination",
+    TargetPathConstraint::DriveLetter => "drive_letter",
+    TargetPathConstraint::GuestTag => "guest_tag",
+  }
+}
+
+/// A read/write policy's name on both surfaces.
+pub fn read_write_name(policy: ReadWritePolicy) -> &'static str {
+  match policy {
+    ReadWritePolicy::ReadOnly => "read_only",
+    ReadWritePolicy::ReadWrite => "read_write",
+  }
+}
+
+/// A residency boundary's name on both surfaces.
+pub fn residency_name(residency: Residency) -> &'static str {
+  match residency {
+    Residency::DaemonRam => "daemon_ram",
+    Residency::DaemonRamAndKernelCache => "daemon_ram_and_kernel_cache",
+    Residency::DaemonRamKernelCacheAndRuntimeVm => "daemon_ram_kernel_cache_and_runtime_vm",
+    Residency::DaemonRamAndGuestPageCache { .. } => "daemon_ram_and_guest_page_cache",
+  }
+}
+
+/// A residency boundary as text: its name, and for a guest whether DAX is mapped.
+pub fn residency_text(residency: Residency) -> String {
+  match residency {
+    Residency::DaemonRamAndGuestPageCache { dax_mapped } => {
+      format!("{}(dax_mapped={dax_mapped})", residency_name(residency))
+    }
+    other => residency_name(other).to_owned(),
+  }
+}
+
+/// A residency boundary as JSON: `{ "kind" }`, and for a guest the DAX fact.
+fn residency_json(residency: Residency) -> Value {
+  match residency {
+    Residency::DaemonRamAndGuestPageCache { dax_mapped } => {
+      json!({ "kind": residency_name(residency), "dax_mapped": dax_mapped })
+    }
+    other => json!({ "kind": residency_name(other) }),
+  }
+}
+
+/// A conformance evidence class's name on both surfaces.
+pub fn conformance_name(conformance: Conformance) -> &'static str {
+  match conformance {
+    Conformance::None => "none",
+    Conformance::VerbLifecycleTest => "verb_lifecycle_test",
+    Conformance::LiveKernelMountTest => "live_kernel_mount_test",
+    Conformance::ContainerWorkloadTest => "container_workload_test",
+    Conformance::SimulatedGuestDriver => "simulated_guest_driver",
+  }
+}
+
+/// A delete-while-open rule's name on both surfaces.
+pub fn delete_while_open_name(rule: DeleteWhileOpen) -> &'static str {
+  match rule {
+    DeleteWhileOpen::NoKernelClient => "no_kernel_client",
+    DeleteWhileOpen::Unlinked => "unlinked",
+    DeleteWhileOpen::SillyRenamed => "silly_renamed",
+  }
+}
+
+/// A kernel cache posture as text: its kind, and for a negotiated one what was negotiated.
+pub fn kernel_cache_text(cache: KernelCache) -> String {
+  match cache {
+    KernelCache::NotEstablished => "not_established".to_owned(),
+    KernelCache::ClientTimeouts => "client_timeouts".to_owned(),
+    KernelCache::Negotiated {
+      writeback,
+      explicit_invalidation,
+    } => format!("negotiated(writeback={writeback},explicit_invalidation={explicit_invalidation})"),
+    KernelCache::InheritedFromHostMount => "inherited_from_host_mount".to_owned(),
+  }
+}
+
+/// A kernel cache posture as JSON: `{ "kind" }`, with the negotiated flags when negotiated.
+fn kernel_cache_json(cache: KernelCache) -> Value {
+  match cache {
+    KernelCache::NotEstablished => json!({ "kind": "not_established" }),
+    KernelCache::ClientTimeouts => json!({ "kind": "client_timeouts" }),
+    KernelCache::Negotiated {
+      writeback,
+      explicit_invalidation,
+    } => json!({
+      "kind": "negotiated",
+      "writeback": writeback,
+      "explicit_invalidation": explicit_invalidation,
+    }),
+    KernelCache::InheritedFromHostMount => json!({ "kind": "inherited_from_host_mount" }),
+  }
+}
+
+/// The OCI runtime probe as text: the command found, or the typed absence.
+pub fn oci_runtime_text(runtime: &OciRuntime) -> String {
+  match runtime {
+    OciRuntime::Found { name } => name.clone(),
+    OciRuntime::NoneOnPath => "absent/none_on_path".to_owned(),
+    OciRuntime::NotProbed => "absent/not_probed".to_owned(),
+  }
+}
+
+/// The OCI runtime probe as JSON: the command's name, or `null` with the typed absence beside it.
+fn oci_runtime_json(runtime: &OciRuntime) -> Value {
+  match runtime {
+    OciRuntime::Found { name } => json!({ "name": name, "absence": Value::Null }),
+    OciRuntime::NoneOnPath => json!({ "name": Value::Null, "absence": "none_on_path" }),
+    OciRuntime::NotProbed => json!({ "name": Value::Null, "absence": "not_probed" }),
+  }
+}
+
+/// One transport's capability as JSON: the six facts of §4.6 A-9 and the refusal reason when not
+/// supported. Public so the CLI's `--json` emits the same schema as the MCP surface (§4.12 parity).
+pub fn capability_json(c: &AttachmentCapability) -> Value {
+  json!({
+    "transport": transport_name(c.transport),
+    "supported": c.supported,
+    "unsupported_reason": c.unsupported_reason.map(unsupported_reason_name),
+    "target_path": target_path_name(c.target_path),
+    "read_write": read_write_name(c.read_write),
+    "sharing": {
+      "one_owning_shard": c.sharing.one_owning_shard,
+      "server_open_state": c.sharing.server_open_state,
+      "cache": kernel_cache_json(c.sharing.cache),
+      "delete_while_open": delete_while_open_name(c.sharing.delete_while_open),
+    },
+    "residency": residency_json(c.residency),
+    "conformance": conformance_name(c.conformance),
+  })
+}
+
+/// The host's transport report as JSON (§4.6 A-9). Public for the CLI's `--json status`.
+pub fn transport_report_json(r: &TransportReport) -> Value {
+  json!({
+    "os": r.os,
+    "kernel": r.kernel,
+    "oci_runtime": oci_runtime_json(&r.oci_runtime),
+    "capabilities": r.capabilities.iter().map(capability_json).collect::<Vec<_>>(),
+  })
+}
+
+/// The runtime-specification `mounts` entry as JSON — exactly what the harness hands its OCI runtime
+/// (`destination`, `type`, `source`, `options`). Public so the CLI prints the same entry (§4.12).
+pub fn oci_mount_json(binding: &OciBinding) -> Value {
+  json!({
+    "destination": binding.destination,
+    "type": binding.mount_type,
+    "source": binding.source,
+    "options": binding.options,
+  })
+}
+
+/// A container binding as JSON: the verified source, the destination, the policy, the mount table's
+/// evidence, and the runtime entry.
+pub fn oci_binding_json(binding: &OciBinding) -> Value {
+  json!({
+    "source": binding.source,
+    "destination": binding.destination,
+    "read_only": binding.read_only,
+    "evidence": {
+      "fstype": binding.evidence.fstype,
+      "mount_source": binding.evidence.mount_source,
+      "names_volume": binding.evidence.names_volume,
+    },
+    "mount": oci_mount_json(binding),
+  })
+}
+
+/// What an attach established, as JSON: its form, and for a container bind the binding.
+pub fn established_json(established: &Established) -> Value {
+  match established {
+    Established::Record => json!({ "form": "record" }),
+    Established::OciBind { binding } => {
+      json!({ "form": "oci_bind", "binding": oci_binding_json(binding) })
+    }
+  }
 }
 
 /// A landing's summary as JSON: entries per action, bytes to write, and entries the filter excluded.
@@ -834,15 +1051,18 @@ pub fn outcome_json(o: &LandingOutcome) -> Value {
   })
 }
 
-/// An attachment as JSON: its id (for detach), the lease epoch for a write attachment, and the path
-/// (none until a bridge exists). Public so the CLI's `--json attach` emits the same schema as the MCP
-/// surface (§4.12 schema parity — one definition, two surfaces).
+/// An attachment as JSON: its id (for detach), the lease epoch for a write attachment, the path
+/// (none until a bridge exists), what was established, and the transport's capability report (§4.6
+/// A-9). Public so the CLI's `--json attach` emits the same schema as the MCP surface (§4.12 schema
+/// parity — one definition, two surfaces).
 pub fn attachment_json(a: &Attachment) -> Value {
   json!({
     "attachment": a.attachment,
     "lease_epoch": a.lease_epoch,
     "path": a.path,
     "version": a.version,
+    "established": established_json(&a.established),
+    "capability": capability_json(&a.capability),
   })
 }
 
@@ -875,6 +1095,39 @@ fn paths_opt(args: &Value) -> Option<Vec<String>> {
       .filter_map(|v| v.as_str().map(str::to_owned))
       .collect()
   })
+}
+
+/// The attach tool's form: the record form, or — with both `oci_source` and `oci_destination` — a
+/// container bind whose source is resolved to the real path the kernel's mount table records (a read,
+/// never a write; the mcp crate may read host paths for its transport, and this is a `canonicalize`).
+/// One of the two alone is an invalid-params error naming the other.
+fn attach_form(args: &Value) -> Result<AttachRequest, McpError> {
+  let source = args.get("oci_source").and_then(Value::as_str);
+  let destination = args.get("oci_destination").and_then(Value::as_str);
+  match (source, destination) {
+    (Some(source), Some(destination)) => {
+      let source = std::fs::canonicalize(source)
+        .map_err(|e| McpError {
+          code: code::INVALID_PARAMS,
+          message: format!("oci_source {source}: {e}"),
+        })?
+        .to_string_lossy()
+        .into_owned();
+      Ok(AttachRequest::Oci {
+        source,
+        destination: destination.to_owned(),
+      })
+    }
+    (None, None) => Ok(AttachRequest::Root),
+    (Some(_), None) => Err(McpError {
+      code: code::INVALID_PARAMS,
+      message: "oci_source needs oci_destination (the container path)".to_owned(),
+    }),
+    (None, Some(_)) => Err(McpError {
+      code: code::INVALID_PARAMS,
+      message: "oci_destination needs oci_source (the host mount point)".to_owned(),
+    }),
+  }
 }
 
 /// A required-or-empty list-of-strings argument (e.g. a landing filter's includes).

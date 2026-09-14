@@ -3,9 +3,10 @@
 use std::ffi::{OsStr, OsString};
 
 use slates_client::{
-  AuditEntry, ChokepointReport, Client, ClientError, CreateSpec, DaemonReport, Deadlines, Digest,
-  GrantScope, GrantSummary, GreenBase, Intent, Landing, Principal, Rebased, Rights, Scope,
-  SnapshotId, StatusReport, Submitted, TelemetryReport, VolumeId, VolumeSummary,
+  AttachRequest, AuditEntry, ChokepointReport, Client, ClientError, CreateSpec, DaemonReport,
+  Deadlines, Digest, Established, GrantScope, GrantSummary, GreenBase, Intent, Landing, Principal,
+  Rebased, Rights, Scope, SnapshotId, StatusReport, Submitted, TelemetryReport, VolumeId,
+  VolumeSummary,
 };
 use slates_db::replay::RECOVERY_BUDGET_NS;
 use slates_ipc::delivery::{Delivery, Output};
@@ -86,6 +87,31 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
     let mounted = crate::mount::establish(&report, path)?;
     println!("mounted: {mounted}");
     return Ok(());
+  }
+  // A container bind names its host mount point by the real path the kernel records (`mount_nfs`
+  // resolves symlinks; `mktemp -d` on macOS hands out a symlinked `/var/folders` path), so the source
+  // is resolved here, in the client — a read, never a write — before the daemon compares it with its
+  // mount table. A path that does not exist is the command's failure, not a client error.
+  if let Verb::Attach {
+    volume,
+    snapshot,
+    intent,
+    form: AttachRequest::Oci {
+      source,
+      destination,
+    },
+  } = &request.verb
+  {
+    let source = std::fs::canonicalize(source)
+      .map_err(|e| Failure::Failed(format!("--oci-source {source}: {e}")))?
+      .to_string_lossy()
+      .into_owned();
+    let form = AttachRequest::Oci {
+      source,
+      destination: destination.clone(),
+    };
+    return emit_attach(&mut client, *volume, *snapshot, *intent, form, request.json)
+      .map_err(|e| failure_of(e, &request.instance));
   }
   let outcome = serve(&mut client, &request.verb, request.json);
   outcome.map_err(|e| failure_of(e, &request.instance))
@@ -448,16 +474,19 @@ fn emit_placed(
   Ok(())
 }
 
-/// `attach`: the attachment id, lease epoch and path, as text lines or JSON (the MCP
-/// `slates_mcp::attachment_json` schema — one definition for both surfaces, §4.12 parity).
+/// `attach`: the attachment id, lease epoch, path, what was established (for a container bind, the
+/// verified host mount, the policy, the evidence and the runtime's `mounts` entry) and the transport's
+/// capability, as text lines or JSON (the MCP `slates_mcp::attachment_json` schema — one definition
+/// for both surfaces, §4.12 parity).
 fn emit_attach(
   client: &mut Client,
   volume: VolumeId,
   snapshot: Option<SnapshotId>,
   intent: Intent,
+  form: AttachRequest,
   json: bool,
 ) -> Result<(), ClientError> {
-  let attached = client.attach(volume, snapshot, intent)?;
+  let attached = client.attach_with(volume, snapshot, intent, form)?;
   if json {
     println!("{}", slates_mcp::attachment_json(&attached));
   } else {
@@ -469,8 +498,46 @@ fn emit_attach(
         .path
         .unwrap_or_else(|| "(none until a bridge exists)".to_owned())
     );
+    print!("{}", established_text(&attached.established));
+    print!("{}", capability_text(&attached.capability));
   }
   Ok(())
+}
+
+/// What an attach established, as `key: value` lines; a container bind shows its verified source,
+/// destination, policy, the mount table's evidence, and the runtime's entry as one JSON line.
+fn established_text(established: &Established) -> String {
+  match established {
+    Established::Record => "established: record\n".to_owned(),
+    Established::OciBind { binding } => format!(
+      "established: oci_bind\noci_source: {}\noci_destination: {}\noci_read_only: {}\noci_evidence: fstype={} source={} names_volume={}\noci_mount: {}\n",
+      binding.source,
+      binding.destination,
+      binding.read_only,
+      binding.evidence.fstype,
+      binding.evidence.mount_source,
+      binding.evidence.names_volume,
+      slates_mcp::oci_mount_json(binding)
+    ),
+  }
+}
+
+/// One transport's six facts on one `transport:` line (§4.6 A-9), in the vocabulary the JSON uses.
+fn capability_text(c: &slates_client::AttachmentCapability) -> String {
+  format!(
+    "transport: {} supported={} reason={} target={} read_write={} cache={} open_state={} delete_while_open={} residency={} conformance={}\n",
+    slates_mcp::transport_name(c.transport),
+    c.supported,
+    c.unsupported_reason
+      .map_or("none", slates_mcp::unsupported_reason_name),
+    slates_mcp::target_path_name(c.target_path),
+    slates_mcp::read_write_name(c.read_write),
+    slates_mcp::kernel_cache_text(c.sharing.cache),
+    c.sharing.server_open_state,
+    slates_mcp::delete_while_open_name(c.sharing.delete_while_open),
+    slates_mcp::residency_text(c.residency),
+    slates_mcp::conformance_name(c.conformance),
+  )
 }
 
 /// `base rewitness`: the paths whose base drifted, one per text line or a JSON `{ "paths" }` (the key
@@ -683,7 +750,8 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       volume,
       snapshot,
       intent,
-    } => emit_attach(client, *volume, *snapshot, *intent, json)?,
+      form,
+    } => emit_attach(client, *volume, *snapshot, *intent, form.clone(), json)?,
     Verb::Detach { attachment } => {
       client.detach(*attachment)?;
       emit_ok("ok", json);
@@ -1063,7 +1131,21 @@ fn status_text(report: &StatusReport) -> String {
     report.placed.region,
     option_text(report.placed.mirror_age_ns),
     report.placed.host_epoch
-  )
+  ) + &transports_text(&report.transports)
+}
+
+/// The host's transport report as text (§4.6 A-9): the host facts, then one line per transport.
+fn transports_text(report: &slates_client::TransportReport) -> String {
+  let mut text = format!(
+    "os: {}\nkernel: {}\noci_runtime: {}\n",
+    report.os,
+    report.kernel.as_deref().unwrap_or("absent/not_stated"),
+    slates_mcp::oci_runtime_text(&report.oci_runtime)
+  );
+  for capability in &report.capabilities {
+    text.push_str(&capability_text(capability));
+  }
+  text
 }
 
 /// A health signal's value as text: the measured number, or `absent/<meaning>` when the signal has no
