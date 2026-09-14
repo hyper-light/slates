@@ -16,13 +16,15 @@
 #   the file-backed map of a memory object (1), the descriptor a child inherits (1), the two
 #   atomic views of mapped words (2), and the Windows section (create, open, view, drop, the two
 #   byte views and the lock: 8).
-# slates-rt (49): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
+# slates-rt (48): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
 #   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
 #   the IOCP calls are Win32 (6); the UDP readiness registration (§4.10a, added 2026-09-07): the
 #   kqueue read-filter `kevent` (unsafe by signature, one change record, 1) and the epoll
-#   `BorrowedFd::borrow_raw` of a live socket for one `epoll_ctl` (1); the TCP write-readiness
-#   registration (§4.6, added 2026-09-09 for the async loopback server): the kqueue write-filter
-#   `kevent` (1) and the epoll `BorrowedFd::borrow_raw` for the `EPOLLOUT` `epoll_ctl` (1).
+#   `BorrowedFd::borrow_raw` of a live socket for the `epoll_ctl` that arms either interest (1 — the
+#   readable and writable registrations share one helper since 2026-09-14, when the epoll re-add
+#   defect was fixed: docs/bugs/2026-09-14-epoll-readiness-re-add-eexist.md; 49 → 48); the TCP
+#   write-readiness registration (§4.6, added 2026-09-09 for the async loopback server): the kqueue
+#   write-filter `kevent` (1).
 #   The Windows socket stack (added 2026-09-09, compiled only for Windows — the daemon and the
 #   QUIC fleet transport run there; TCP stays macOS/Linux for the NFS mount): the **AFD readiness
 #   reactor** `afd.rs` that gives the completion-native IOCP driver edge readiness the way wepoll/mio
@@ -99,32 +101,76 @@
 #   by BLAKE3.
 
 [budget]
-slates-anchor = 6
-slates-archive = 0
+slates-machine = 44
+slates-mem = 16
+slates-rt = 48
 slates-base = 6
-slates-bridge-core = 0
-slates-bridge-fskit = 9
-slates-bridge-fuse = 0
-slates-bridge-nfs = 0
-slates-bridge-oci = 1
-slates-bridge-virtiofs = 0
-slates-bridge-winfsp = 86
-slates-cli = 4
-slates-client = 0
-slates-cluster = 0
-slates-conformance = 0
+slates-vfs = 0
+slates-land = 3
+slates-anchor = 6
 slates-db = 0
 slates-ipc = 35
-slates-land = 3
-slates-machine = 44
-slates-mcp = 0
-slates-mem = 16
-slates-merge = 0
-slates-rt = 48
-slates-sdk-node = 0
-slates-sdk-python = 0
 slates-server = 5
-slates-transport = 0
-slates-vfs = 0
+slates-client = 0
+slates-cli = 4
 slates-wire = 4
+# slates-bridge-core (0): the operation layer is the trait, neutral data structs and the
+# volume-core implementation; no syscalls, no unsafe.
+slates-bridge-core = 0
+slates-bridge-fuse = 0
+# slates-bridge-nfs (0): the XDR/RPC codec is bounds-checked byte slices; the blocking demo socket uses
+# safe std::net, and the production async server (`serve_connection_async`) uses the runtime's safe
+# `TcpStream` (the socket unsafe lives in slates-rt) — no unsafe in this crate.
+slates-bridge-nfs = 0
+slates-merge = 0
+# slates-transport (0): the control-datagram codec is byte slices read and written in field order
+# through a bounded reader, never a cast; the owned QUIC dialect and the AEAD seal (later slices, §4.10a)
+# will carry their own budgeted sites (the rt UDP driver's unsafe lives in slates-rt).
+slates-transport = 0
+# slates-mcp (0): the JSON-RPC dispatch is safe Rust over serde_json and the client SDK.
+slates-mcp = 0
+slates-archive = 0
 slates-wire-derive = 0
+# slates-cluster (0): the register-commit dispatch is safe Rust — spawned tasks, a channel, and the
+# db acceptance rules over the transport; no raw pointers.
+slates-cluster = 0
+# slates-sdk-python (0): the PyO3 bindings are safe Rust over the typed client; the FFI unsafety lives
+# in PyO3's macro-generated code, not this crate's own source (which has no `unsafe` block).
+slates-sdk-python = 0
+# slates-sdk-node (0): the napi-rs bindings are safe Rust over the typed client; the FFI unsafety lives
+# in napi's macro-generated code, not this crate's own source (which has no `unsafe` block).
+slates-sdk-node = 0
+# slates-bridge-fskit (9): the FSKit shim wire codec is safe Rust (bounds-checked byte slices onto the
+# Bridge trait, exactly like the NFS codec). The 9 sites are all in `src/ffi.rs`, the `test-harness`
+# in-process transport (§4.6): two `extern "C"` entries and the raw-pointer handling they need to hand
+# the Swift FSVolume handler a C ABI over `serve` — sanctioned FFI unsafe, each block with a SAFETY
+# note. The shipped crate (no `test-harness` feature) builds none of it; the count is a text scan.
+slates-bridge-fskit = 9
+# slates-bridge-winfsp (86): the VfsError->NTSTATUS refusal taxonomy stays safe Rust (lib.rs, 0). The
+# WinFsp mount host is Windows-only FFI, hand-transcribed from winfsp's headers (like the rt AFD
+# reactor from the WDK) and compiled only for Windows, each block with a `// SAFETY:` line (clippy
+# `undocumented_unsafe_blocks` enforces it): `ffi.rs` (18) declares the `FspFileSystem*` exports and
+# the `FSP_FILE_SYSTEM_INTERFACE` callback signatures; `host.rs` (68) is the mount driver — the 16
+# `FSP_FILE_SYSTEM_INTERFACE` trampolines that read WinFsp's raw pointers (the file system's
+# `UserContext` handler, the opaque `FileContext` open-files, UTF-16 path strings, the read/write
+# buffers) under WinFsp's COARSE operation guard that serializes them, plus `FspFileSystemCreate`/
+# `SetMountPoint`/`StartDispatcher`/`AddDirInfo`, the leaked `Handler`/`OpenFile` boxes, and the
+# `ConvertStringSecurityDescriptor…`/`GetSecurityDescriptorLength`/`LocalFree` for the reference
+# descriptor. All are Win32/WinFsp FFI without a safe wrapper; there is no `unsafe impl Send`/`Sync`
+# (the volume is owned by one thread and shared only over channels, R2/D-7).
+slates-bridge-winfsp = 86
+# slates-bridge-virtiofs (0): the virtqueue machine and the FUSE-over-virtio device read and write
+# guest memory only through the `GuestMemory` seam — bounded, checked copies into byte arrays, fields
+# decoded in order, never a cast or a pointer into the guest (the FUSE codec's discipline). The
+# simulated seams are `Vec<u8>` and `Cell`/`RefCell`; the doorbell descriptors are `rustix` reads and
+# writes on owned descriptors. A real shared mapping (the later VMM leg) will go through
+# `slates_mem::SharedObject`'s atomic views, whose unsafe already lives in slates-mem.
+slates-bridge-virtiofs = 0
+# slates-bridge-oci (1): the macOS `getfsstat(MNT_NOWAIT)` pair — the count query and the fill of a
+# buffer sized for exactly that count, plus the `set_len` to what the kernel wrote — in one block
+# (added 2026-09-14 for the OCI attachment form, §4.6 A-9): rustix has no mount-table query, and a
+# `statfs` of the path would touch the very mount the daemon serves. The Linux read of
+# `/proc/self/mountinfo` is safe rustix; the parser, verification and entry are pure.
+slates-bridge-oci = 1
+# slates-conformance (0): pure parsers and records; no FFI, no I/O.
+slates-conformance = 0
