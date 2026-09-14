@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use slates_ipc::protocol::{
   Direction, Filter, GrantScope, Intent, NamePolicy, Refusal, ReplyBody, RequestBody, SizeClass,
-  pack, unpack,
+  VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
@@ -620,7 +620,9 @@ fn a_grant_is_accepted_only_with_a_verified_proof_bound_to_the_presented_landing
 /// lookup), then only the right shared (read, not write); a workload cannot mint enrollment authority
 /// (`GrantIssuerUnverified`); once the human revokes the consumer, its very next verb refuses
 /// `ConsumerRevoked` before any effect. Non-vacuous: the forged and the genuine capability differ only in
-/// the secret, and the shared and the unshared right differ only in the access entry.
+/// the secret, and the shared and the unshared right differ only in the access entry. The daemon runs
+/// [`TEST_SHARDS`] shards and each client lands on its own, so the consumer's record is enrolled on one
+/// partition and attested from a channel on another — the routing an in-partition lookup cannot do.
 #[test]
 fn distinct_consumers_under_one_uid_hold_only_the_rights_shared_with_them_until_revoked() {
   let (daemon, instance) = daemon("consumers");
@@ -629,7 +631,22 @@ fn distinct_consumers_under_one_uid_hold_only_the_rights_shared_with_them_until_
   let mut owner = Client::connect(&instance);
   let mut workload = Client::connect(&instance);
 
-  // A workload cannot mint enrollment authority: a forged proof refuses.
+  a_workload_cannot_mint_enrollment_authority(&mut workload, account);
+  let (consumer, capability) = enroll(&mut owner, &secret, account);
+  only_the_genuine_capability_binds_the_channel(&mut workload, consumer, &capability);
+  let id = the_consumer_holds_only_the_right_shared(&mut owner, &mut workload, account, consumer);
+  once_revoked_every_verb_refuses_before_any_effect(
+    &mut owner,
+    &mut workload,
+    &secret,
+    consumer,
+    id,
+  );
+  daemon.stop();
+}
+
+/// A forged proof of issuer authority refuses: an agent cannot enroll itself.
+fn a_workload_cannot_mint_enrollment_authority(workload: &mut Client, account: u32) {
   let forged = slates_server::landing::enroll_proof(&[0u8; 32], account);
   assert!(matches!(
     workload.call(&RequestBody::Enroll {
@@ -640,10 +657,15 @@ fn distinct_consumers_under_one_uid_hold_only_the_rights_shared_with_them_until_
       refusal: Refusal::GrantIssuerUnverified
     }
   ));
-  // The human surface enrolls a consumer and receives its capability once.
-  let (consumer, capability) = enroll(&mut owner, &secret, account);
+}
 
-  // A forged capability does not bind the channel.
+/// A forged capability does not bind the channel; the genuine one does, and the channel's principal is
+/// then the consumer.
+fn only_the_genuine_capability_binds_the_channel(
+  workload: &mut Client,
+  consumer: u64,
+  capability: &[u8; 32],
+) {
   let wrong = slates_server::landing::attest_proof(&[0u8; 32], workload.client);
   assert!(matches!(
     workload.call(&RequestBody::Attest {
@@ -654,15 +676,22 @@ fn distinct_consumers_under_one_uid_hold_only_the_rights_shared_with_them_until_
       refusal: Refusal::ConsumerNotEnrolled
     }
   ));
-  // The genuine capability binds it; the channel's principal is now the consumer.
-  let proof = slates_server::landing::attest_proof(&capability, workload.client);
+  let proof = slates_server::landing::attest_proof(capability, workload.client);
   let attested = workload.call(&RequestBody::Attest { consumer, proof });
   assert!(
     matches!(attested, ReplyBody::Attested),
     "the genuine capability binds the channel, got {attested:?}"
   );
+}
 
-  // The account owns a volume; the consumer, sharing the uid, sees none of it until shared.
+/// The account owns a volume the consumer, sharing the uid, sees none of until shared; shared read only,
+/// the consumer can read its status and not snapshot it. Returns the volume.
+fn the_consumer_holds_only_the_right_shared(
+  owner: &mut Client,
+  workload: &mut Client,
+  account: u32,
+  consumer: u64,
+) -> VolumeId {
   let ReplyBody::Created { id } = owner.call(&scratch("private")) else {
     panic!("create");
   };
@@ -672,7 +701,6 @@ fn distinct_consumers_under_one_uid_hold_only_the_rights_shared_with_them_until_
       refusal: Refusal::Forbidden { .. }
     }
   ));
-  // The owner shares read only: the consumer can read its status, not write (snapshot).
   assert!(matches!(
     owner.call(&RequestBody::Share {
       volume: id,
@@ -695,9 +723,18 @@ fn distinct_consumers_under_one_uid_hold_only_the_rights_shared_with_them_until_
       refusal: Refusal::Forbidden { .. }
     }
   ));
+  id
+}
 
-  // The human revokes the consumer: its next verb refuses before any effect, and stays refused.
-  let revoke = slates_server::landing::revoke_proof(&secret, consumer);
+/// The human revokes the consumer: its next verb refuses before any effect, and stays refused.
+fn once_revoked_every_verb_refuses_before_any_effect(
+  owner: &mut Client,
+  workload: &mut Client,
+  secret: &[u8; 32],
+  consumer: u64,
+  id: VolumeId,
+) {
+  let revoke = slates_server::landing::revoke_proof(secret, consumer);
   assert!(matches!(
     owner.call(&RequestBody::Revoke {
       consumer,
@@ -717,14 +754,14 @@ fn distinct_consumers_under_one_uid_hold_only_the_rights_shared_with_them_until_
       refusal: Refusal::ConsumerRevoked
     }
   ));
-  daemon.stop();
 }
 
 /// The human surface enrolls a consumer under `account`, proving issuer authority with the daemon's
 /// secret; returns the consumer id and the capability shown once.
 fn enroll(client: &mut Client, secret: &[u8; 32], account: u32) -> (u64, [u8; 32]) {
   let proof = slates_server::landing::enroll_proof(secret, account);
-  let ReplyBody::Enrolled { consumer, secret } = client.call(&RequestBody::Enroll { account, proof })
+  let ReplyBody::Enrolled { consumer, secret } =
+    client.call(&RequestBody::Enroll { account, proof })
   else {
     panic!("the human surface's enrollment was refused");
   };

@@ -789,7 +789,9 @@ fn grant_state_name(state: DbGrantState) -> String {
 
 #[cfg(all(test, unix))]
 mod tests {
-  use super::SpanObserver;
+  use super::{
+    ENROLL_DOMAIN, REVOKE_DOMAIN, SpanObserver, attest_proof, enroll_proof, revoke_proof,
+  };
 
   /// The landing span observer is bounded shed-first (§4.14): recording more entry timings than its
   /// capacity keeps the most recent and counts the shed ones, so a large landing never grows the buffer
@@ -808,6 +810,80 @@ mod tests {
       held,
       vec![2, 3, 4],
       "the three most recent survived, oldest first"
+    );
+  }
+
+  /// §4.13 "Grants" / "Principals": the three proofs of the enrollment surface are keyed BLAKE3 over
+  /// **domain-separated** inputs, so no proof of one kind verifies as another — an enrollment approval
+  /// can never be replayed as a revocation, nor a revocation as an enrollment of the same number — and an
+  /// attestation is bound to the channel it was made for. Golden vectors pin the exact bytes: a refactor
+  /// that dropped a domain tag, reordered a field, or changed the key would change them.
+  #[test]
+  fn the_enrollment_proofs_are_domain_separated_and_pinned() {
+    let issuer = [0x11u8; slates_anchor::layout::ISSUER_SECRET_BYTES];
+    let capability = [0x22u8; 32];
+    // The same number as an account and as a consumer id: the domain tag alone must separate them.
+    const NUMBER: u64 = 7;
+    #[allow(clippy::cast_possible_truncation)]
+    let account = NUMBER as u32;
+
+    let enroll = enroll_proof(&issuer, account);
+    let revoke = revoke_proof(&issuer, NUMBER);
+    assert_ne!(
+      enroll, revoke,
+      "an enrollment proof is never a revocation proof"
+    );
+    assert_ne!(
+      enroll_proof(&issuer, account),
+      enroll_proof(
+        &[0x12u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+        account
+      ),
+      "the proof is keyed: another issuer secret proves nothing"
+    );
+    assert_ne!(
+      attest_proof(&capability, 1),
+      attest_proof(&capability, 2),
+      "an attestation is bound to its channel's client id"
+    );
+    assert_ne!(
+      attest_proof(&capability, 1),
+      attest_proof(&[0x23u8; 32], 1),
+      "an attestation is keyed by the capability"
+    );
+
+    // Golden vectors (BLAKE3 keyed; recomputed by the same law, so a change here is a wire change).
+    let hex = |bytes: &[u8; 32]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let expect_enroll = {
+      let mut h = blake3::Hasher::new_keyed(&issuer);
+      h.update(ENROLL_DOMAIN);
+      h.update(&account.to_le_bytes());
+      *h.finalize().as_bytes()
+    };
+    let expect_revoke = {
+      let mut h = blake3::Hasher::new_keyed(&issuer);
+      h.update(REVOKE_DOMAIN);
+      h.update(&NUMBER.to_le_bytes());
+      *h.finalize().as_bytes()
+    };
+    let expect_attest = {
+      let mut h = blake3::Hasher::new_keyed(&capability);
+      h.update(&1u32.to_le_bytes());
+      *h.finalize().as_bytes()
+    };
+    assert_eq!(hex(&enroll), hex(&expect_enroll));
+    assert_eq!(hex(&revoke), hex(&expect_revoke));
+    assert_eq!(hex(&attest_proof(&capability, 1)), hex(&expect_attest));
+    assert_ne!(
+      hex(&enroll),
+      hex(&{
+        // The tag is what separates: the same bytes with the tags swapped are a different proof.
+        let mut h = blake3::Hasher::new_keyed(&issuer);
+        h.update(REVOKE_DOMAIN);
+        h.update(&account.to_le_bytes());
+        *h.finalize().as_bytes()
+      }),
+      "the domain tag is part of the proof"
     );
   }
 }
