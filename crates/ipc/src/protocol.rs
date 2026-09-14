@@ -117,6 +117,37 @@ pub enum Intent {
   Write,
 }
 
+/// The complete immutable base a green starts from (§4.16, the A-9 integration requirement: "Green's
+/// immutable version chain starts from scratch or a complete immutable base, never an implicitly live
+/// host directory"): a snapshot of a volume. The daemon refuses `ConsistentBaseUnavailable` unless the
+/// snapshot covers its whole logical tree — a scratch volume's, or an overlay's whose base entries are
+/// all witnessed and pinned — so no green version ever depends on a live host directory.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GreenBase {
+  /// The volume the snapshot belongs to.
+  pub volume: VolumeId,
+  /// The snapshot: the green's version 0.
+  pub snapshot: SnapshotId,
+}
+
+/// Which view of a volume a [`RequestBody::Read`] reads (§4.16 "Attachments and versions"; §4.12
+/// `slates.fs.read`).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadAt {
+  /// The volume's head (a green's head version; a work's or a plain volume's live tree).
+  Head,
+  /// A green's named version.
+  Version {
+    /// The version.
+    version: u64,
+  },
+  /// The version an attachment pins — a view that moves only by `advance`.
+  Attachment {
+    /// The attachment.
+    attachment: u64,
+  },
+}
+
 /// A request body.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub enum RequestBody {
@@ -147,11 +178,15 @@ pub enum RequestBody {
     snapshot: SnapshotId,
   },
   /// Create a green volume — a shared merge target many work volumes submit increments into (§4.16).
+  /// Its chain starts from scratch, or from a complete immutable base (`base`), whose state becomes
+  /// version 0; served on the base volume's owner shard when a base is named.
   CreateGreen {
     /// The name.
     name: String,
     /// Whether an increment must carry evidence to be accepted.
     require_evidence: bool,
+    /// The complete immutable base, or none for a green that starts empty.
+    base: Option<GreenBase>,
   },
   /// A green's version chain: its head version (and, later, the records from `from`).
   Versions {
@@ -186,10 +221,14 @@ pub enum RequestBody {
     /// Bytes inserted at `at`.
     bytes: Vec<u8>,
   },
-  /// Submit a work volume's declared operations to its green as an increment (§4.16).
+  /// Submit a work volume's declared operations to its green as an increment (§4.16). The evidence
+  /// references are opaque BLAKE3 identities retained with the increment; a green created with
+  /// `require_evidence` refuses `EvidenceRequired` when none is given.
   Submit {
     /// The work volume.
     work: VolumeId,
+    /// The evidence references (opaque to slates), possibly none.
+    evidence: Vec<[u8; 32]>,
   },
   /// Declare a namespace or metadata operation on a work volume (§4.16): the counterpart to `Edit`'s
   /// content splice, for links, directories, modes and extended attributes.
@@ -383,6 +422,27 @@ pub enum RequestBody {
   Telemetry {
     /// The shard's partition, as `DaemonStatus` reports it.
     partition: u16,
+  },
+  /// Re-pin a green attachment to `version`, or to the head when none (§4.16 "Attachments and
+  /// versions": "no attachment's view changes without `advance`"). The reply names the paths the
+  /// move invalidates — exactly those some version in the span changed. Served on the attachment's
+  /// owner shard. Appended at the end for append-only evolution.
+  Advance {
+    /// The attachment.
+    attachment: u64,
+    /// The version to pin, or the head.
+    version: Option<u64>,
+  },
+  /// Read a file's bytes from a volume at a view (§4.12 `slates.fs.read`): a green's head or a named
+  /// version, the version an attachment pins, or a work's or plain volume's live tree. A read; never
+  /// recorded. Appended at the end for append-only evolution.
+  Read {
+    /// The volume.
+    volume: VolumeId,
+    /// The file.
+    path: String,
+    /// The view.
+    at: ReadAt,
   },
 }
 
@@ -1095,6 +1155,39 @@ pub enum Refusal {
   /// The caller's consumer enrollment was revoked by a human; every later effect refuses (§4.13
   /// "Refusals added"; revocation reaches a live session before its next protected verb).
   ConsumerRevoked,
+  /// The verb would write a green volume, which nothing but its merge task writes (§4.16, D-27; §4.4
+  /// "an SDK write is `ReadOnlyVolume`"): an edit or declaration on it, a write attachment, a snapshot
+  /// or resize of it. Merge through a work volume instead. Appended for append-only evolution.
+  ReadOnlyVolume,
+  /// The verb names a green (a work's creation, the chain reads, an advance) but the volume is not one
+  /// (§4.4 merge refusals).
+  NotGreen,
+  /// The verb names a work volume (an edit, a declaration, a submit, a rebase) but the volume is not one
+  /// — a plain volume, which declares nothing to merge (§4.4 merge refusals).
+  NotWork,
+  /// The increment's base names a version its green does not have — the green was destroyed, or the
+  /// version is another green's or past the head (§4.16 failure matrix).
+  UnknownBase {
+    /// The green.
+    green: VolumeId,
+    /// The version the work was based on.
+    version: u64,
+  },
+  /// The green requires evidence on every increment and the submit carried none (§4.16).
+  EvidenceRequired,
+  /// The base a green was asked to start from is not a complete immutable snapshot: an overlay's with
+  /// entries still served live from the host directory (A-9: never an implicitly live host directory).
+  /// Pin the whole base and snapshot again.
+  ConsistentBaseUnavailable,
+  /// An increment's inputs — its ops document and post-state — are not held where the verdict must
+  /// run (a holder asked to recompute a version whose inputs have not reached it); retryable (§4.16).
+  ContentUnavailable,
+  /// A merge record below the epoch a holder has already seen for the green's owner; the stale owner
+  /// drops the role (§4.16 failure matrix).
+  StaleEpoch {
+    /// The epoch the holder has seen.
+    current: u64,
+  },
 }
 
 /// A reply body. (`Eq` is not derived: a [`Refusal`] may carry measured probabilities.)
@@ -1165,6 +1258,8 @@ pub enum ReplyBody {
     lease_epoch: Option<u64>,
     /// The path a bridge publishes (none until a bridge exists).
     path: Option<String>,
+    /// The green version this attachment pins (§4.16), or none for a plain or work volume.
+    version: Option<u64>,
   },
   /// Detached.
   Detached,
@@ -1266,6 +1361,18 @@ pub enum ReplyBody {
   Telemetry {
     /// The batch.
     report: TelemetryReport,
+  },
+  /// A green attachment was re-pinned (§4.16 `advance`). Appended for append-only evolution.
+  Advanced {
+    /// The version the attachment now pins.
+    version: u64,
+    /// The paths the move invalidated — those some version in the span changed, sorted.
+    invalidated: Vec<String>,
+  },
+  /// A file's bytes at the requested view (§4.12 `read`). Appended for append-only evolution.
+  ReadBytes {
+    /// The bytes.
+    bytes: Vec<u8>,
   },
 }
 

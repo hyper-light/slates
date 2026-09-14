@@ -1451,6 +1451,7 @@ fn green_chain_scenario() {
   let ReplyBody::GreenCreated { id } = client.call(&RequestBody::CreateGreen {
     name: "g".to_owned(),
     require_evidence: false,
+    base: None,
   }) else {
     panic!("create green");
   };
@@ -1459,6 +1460,7 @@ fn green_chain_scenario() {
     client.call(&RequestBody::CreateGreen {
       name: "g".to_owned(),
       require_evidence: false,
+      base: None,
     }),
     ReplyBody::Refused {
       refusal: Refusal::AlreadyExists { .. }
@@ -1482,6 +1484,7 @@ fn merge_submit_scenario() {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
     name: "green".to_owned(),
     require_evidence: false,
+    base: None,
   }) else {
     panic!("create green");
   };
@@ -1513,7 +1516,7 @@ fn merge_submit_scenario() {
   declare(&mut client, b, b"world");
 
   // A merges on the fast path; the chain advances.
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit { work: a })
+  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit { work: a, evidence: Vec::new() })
   else {
     panic!("submit a");
   };
@@ -1545,7 +1548,7 @@ fn merge_submit_scenario() {
   );
 
   // B, still based on version 0, touched the same file — it conflicts rather than clobbering A.
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit { work: b })
+  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit { work: b, evidence: Vec::new() })
   else {
     panic!("submit b");
   };
@@ -1566,6 +1569,7 @@ fn merge_modify_scenario() {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
     name: "g2".to_owned(),
     require_evidence: false,
+    base: None,
   }) else {
     panic!("create green");
   };
@@ -1590,7 +1594,7 @@ fn merge_modify_scenario() {
   };
   edit(&mut client, seed, 0, 0, b"hello");
   assert!(matches!(
-    client.call(&RequestBody::Submit { work: seed }),
+    client.call(&RequestBody::Submit { work: seed, evidence: Vec::new() }),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -1606,7 +1610,7 @@ fn merge_modify_scenario() {
   assert_eq!(base, 1, "the work is based on the green's head, version 1");
   edit(&mut client, modw, 0, 5, b"world");
   let ReplyBody::Submitted { version, conflicts } =
-    client.call(&RequestBody::Submit { work: modw })
+    client.call(&RequestBody::Submit { work: modw, evidence: Vec::new() })
   else {
     panic!("submit");
   };
@@ -1627,6 +1631,7 @@ fn merge_lagging_scenario() {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
     name: "g3".to_owned(),
     require_evidence: false,
+    base: None,
   }) else {
     panic!("create green");
   };
@@ -1655,7 +1660,7 @@ fn merge_lagging_scenario() {
   let (seed, _) = work(&mut client, "seed");
   create_file(&mut client, seed, "base", b"x");
   assert!(matches!(
-    client.call(&RequestBody::Submit { work: seed }),
+    client.call(&RequestBody::Submit { work: seed, evidence: Vec::new() }),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -1669,14 +1674,14 @@ fn merge_lagging_scenario() {
   create_file(&mut client, b, "b", b"b-content");
   // B submits first, advancing the green to version 2; A now lags at base 1.
   assert!(matches!(
-    client.call(&RequestBody::Submit { work: b }),
+    client.call(&RequestBody::Submit { work: b, evidence: Vec::new() }),
     ReplyBody::Submitted {
       version: Some(2),
       ..
     }
   ));
   // A, based on version 1, touched a different file — it merges past version 2 as version 3.
-  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit { work: a })
+  let ReplyBody::Submitted { version, conflicts } = client.call(&RequestBody::Submit { work: a, evidence: Vec::new() })
   else {
     panic!("submit a");
   };
@@ -1748,7 +1753,7 @@ fn rebase_clean_part(client: &mut Client, green: slates_ipc::protocol::VolumeId)
   assert_eq!(green_head(client, green), 2, "a rebase commits nothing");
 
   let ReplyBody::Submitted { version, conflicts } =
-    client.call(&RequestBody::Submit { work: tail })
+    client.call(&RequestBody::Submit { work: tail, evidence: Vec::new() })
   else {
     panic!("submit");
   };
@@ -1768,7 +1773,7 @@ fn rebase_conflict_part(client: &mut Client, green: slates_ipc::protocol::Volume
   edit_f(client, winner, 0, 2, b"PP");
   edit_f(client, loser, 0, 2, b"QQ");
   assert!(matches!(
-    client.call(&RequestBody::Submit { work: winner }),
+    client.call(&RequestBody::Submit { work: winner, evidence: Vec::new() }),
     ReplyBody::Submitted {
       version: Some(4),
       ..
@@ -1801,6 +1806,7 @@ fn merge_rebase_scenario() {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
     name: "g5".to_owned(),
     require_evidence: false,
+    base: None,
   }) else {
     panic!("create green");
   };
@@ -1809,7 +1815,7 @@ fn merge_rebase_scenario() {
   let seed = work_over(&mut client, green, "seed");
   edit_f(&mut client, seed, 0, 0, b"0123456789");
   assert!(matches!(
-    client.call(&RequestBody::Submit { work: seed }),
+    client.call(&RequestBody::Submit { work: seed, evidence: Vec::new() }),
     ReplyBody::Submitted {
       version: Some(1),
       ..
@@ -1818,7 +1824,7 @@ fn merge_rebase_scenario() {
   let front = work_over(&mut client, green, "front");
   edit_f(&mut client, front, 0, 0, b"AB");
   assert!(matches!(
-    client.call(&RequestBody::Submit { work: front }),
+    client.call(&RequestBody::Submit { work: front, evidence: Vec::new() }),
     ReplyBody::Submitted {
       version: Some(2),
       ..
@@ -1871,7 +1877,7 @@ fn declare_metadata_part(client: &mut Client, green: slates_ipc::protocol::Volum
     },
   );
   let ReplyBody::Submitted { version, conflicts } =
-    client.call(&RequestBody::Submit { work: meta })
+    client.call(&RequestBody::Submit { work: meta, evidence: Vec::new() })
   else {
     panic!("submit meta");
   };
@@ -1910,7 +1916,7 @@ fn declare_xattr_part(client: &mut Client, green: slates_ipc::protocol::VolumeId
   let other = set(client, "xattr-c", b"BB");
 
   // The first sets the attribute; it advances the green to version 3, storing "AA".
-  let ReplyBody::Submitted { version, .. } = client.call(&RequestBody::Submit { work: first })
+  let ReplyBody::Submitted { version, .. } = client.call(&RequestBody::Submit { work: first, evidence: Vec::new() })
   else {
     panic!("submit xattr-a");
   };
@@ -1918,7 +1924,7 @@ fn declare_xattr_part(client: &mut Client, green: slates_ipc::protocol::VolumeId
 
   // The second, based on 2, sets a different value — it conflicts against the stored "AA".
   let ReplyBody::Submitted { version, conflicts } =
-    client.call(&RequestBody::Submit { work: other })
+    client.call(&RequestBody::Submit { work: other, evidence: Vec::new() })
   else {
     panic!("submit xattr-c");
   };
@@ -1941,6 +1947,7 @@ fn merge_declare_scenario() {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
     name: "g6".to_owned(),
     require_evidence: false,
+    base: None,
   }) else {
     panic!("create green");
   };
@@ -1948,7 +1955,7 @@ fn merge_declare_scenario() {
   let seed = work_over(&mut client, green, "seed");
   edit_f(&mut client, seed, 0, 0, b"hello");
   assert!(matches!(
-    client.call(&RequestBody::Submit { work: seed }),
+    client.call(&RequestBody::Submit { work: seed, evidence: Vec::new() }),
     ReplyBody::Submitted {
       version: Some(1),
       ..

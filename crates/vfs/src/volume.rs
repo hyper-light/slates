@@ -1373,7 +1373,28 @@ impl Volume {
         }
         copy_range(store.content.open_bytes(open), open.off, off, out);
       }
-      _ => {}
+      // A base-backed file as the snapshot froze it: the same rule as the head's `read` — its pinned
+      // extents serve, an unpinned range needs the host (a snapshot has none lent: `BaseUnavailable`),
+      // and a lost entry is `BaseDrift`, never zeros presented as content.
+      Body::Base(b) => {
+        if b.lost {
+          return Err(VfsError::BaseDrift);
+        }
+        let unpinned = off < b.base_len
+          && !b
+            .pinned
+            .iter()
+            .any(|e| e.off <= off && off + u64::try_from(want).unwrap_or(0) <= e.off + e.len);
+        if unpinned {
+          return Err(VfsError::BaseUnavailable(0));
+        }
+        for e in &b.pinned {
+          if let Some(bytes) = store.content.extent_bytes(e) {
+            copy_range(bytes, e.off, off, out);
+          }
+        }
+      }
+      Body::None | Body::Directory(_) | Body::Symlink(_) => {}
     }
     Ok(want)
   }
