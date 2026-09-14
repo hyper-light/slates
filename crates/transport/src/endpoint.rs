@@ -42,6 +42,25 @@ use crate::session::{Frame, decode_frames, encode_frames};
 /// Format: RFC 9000 §14.1 — the smallest datagram every QUIC path must carry (1200 bytes); the fleet's
 /// frame cap and a receive queue's sizing derive from it.
 pub const MIN_DATAGRAM_BYTES: usize = 1200;
+/// The low bits of a stream id carry the request **kind** the server dispatches on (a record commit, a
+/// promotion, a content put, a probe … each a small constant its caller names); the bits above carry a
+/// per-connection exchange sequence, so every exchange rides a **fresh** id (RFC 9000 §2.1: a stream id
+/// is never reused within a connection).
+/// Format: eight kind bits — the tree names eleven kinds, 256 leaves room, and the 56-bit sequence above
+/// them is more exchanges than any session could make.
+pub const STREAM_KIND_BITS: u32 = 8;
+
+/// The request kind a stream id carries — the low [`STREAM_KIND_BITS`] — the value a server dispatches on
+/// and a client passed to [`Endpoint::request`].
+pub fn stream_kind(stream_id: u64) -> u64 {
+  stream_id & ((1u64 << STREAM_KIND_BITS) - 1)
+}
+
+/// The stream id of the `sequence`-th exchange of `kind` on a connection: the kind in the low bits, the
+/// sequence above them. The sequence starts at one, so no exchange's id is ever the bare kind.
+pub fn exchange_stream_id(kind: u64, sequence: u64) -> u64 {
+  (sequence << STREAM_KIND_BITS) | stream_kind(kind)
+}
 /// Format: RFC 9000 §17.3 — bit 6 of a short-header first byte, always 1 ("fixed bit"); a packet with
 /// it clear is not a valid short header.
 const FIXED_BIT: u8 = 0x40;
@@ -103,6 +122,10 @@ const MAX_HANDSHAKE_RETRANSMITS: u32 = 32;
 /// Shape: a small tail-loss tolerance — on any path a client answers a live confirmation within one
 /// round trip, so a handful of silent timeouts is conclusive; the exact value is not performance-tuned.
 const HANDSHAKE_CONFIRM_SILENCE: u32 = 3;
+
+/// Format: the exchange sequence the first exchange on a connection takes — one, so no exchange's stream
+/// id is ever the bare kind (sequence zero would make `exchange_stream_id(kind, 0) == kind`).
+const FIRST_EXCHANGE: u64 = 1;
 
 /// Format: the most doublings the probe-timeout backoff applies — enough that a timeout of the timer
 /// granularity (RFC 9002 §6.1.2, one millisecond) climbs past any initial PTO (`1 ms × 2^12 ≈ 4 s`), the
@@ -227,6 +250,21 @@ pub struct Endpoint {
   /// microseconds, which would send thousands of retransmits a second into a dead port and starve the
   /// shard's live sessions. Reset to zero by the next acknowledgement.
   pto_count: u32,
+  /// The exchange sequence the next [`request`](Endpoint::request) takes — one past the last allocated,
+  /// so every exchange on this connection rides a fresh stream id ([`exchange_stream_id`]).
+  next_exchange: u64,
+  /// The stream id of the client exchange currently open (a request sent, its reply not yet complete),
+  /// if any — what [`abandon_exchange`](Endpoint::abandon_exchange) forgets.
+  open_exchange: Option<u64>,
+  /// The server side's receive floor: every stream id below it belongs to an exchange this end has
+  /// already served or the peer abandoned; frames arriving for them are late and are drained and
+  /// discarded ([`Connection::discard_streams_below`]), never served.
+  serve_floor: u64,
+  /// The server side's partial requests, kept **across** [`serve_once`](Endpoint::serve_once) calls: a
+  /// request whose bytes arrived while the previous reply was being acknowledged is served next, not lost
+  /// with the call that drained them. Bounded by the peer's flow-control window (a stream cannot carry
+  /// more than its credit) times the late-reply cap.
+  pending_requests: BTreeMap<u64, Vec<u8>>,
 }
 
 impl Drop for Endpoint {
@@ -265,6 +303,10 @@ impl Endpoint {
       final_flight: Vec::new(),
       discarded: 0,
       pto_count: 0,
+      next_exchange: FIRST_EXCHANGE,
+      open_exchange: None,
+      serve_floor: 0,
+      pending_requests: BTreeMap::new(),
     })
   }
 
@@ -293,6 +335,10 @@ impl Endpoint {
       final_flight: Vec::new(),
       discarded: 0,
       pto_count: 0,
+      next_exchange: FIRST_EXCHANGE,
+      open_exchange: None,
+      serve_floor: 0,
+      pending_requests: BTreeMap::new(),
     })
   }
 
@@ -324,6 +370,10 @@ impl Endpoint {
       final_flight: Vec::new(),
       discarded: 0,
       pto_count: 0,
+      next_exchange: FIRST_EXCHANGE,
+      open_exchange: None,
+      serve_floor: 0,
+      pending_requests: BTreeMap::new(),
     })
   }
 
@@ -851,59 +901,69 @@ impl Endpoint {
   }
 
   /// The client side of a **request/reply** exchange over the session (§4.8 "lookups route by id to
-  /// the current owner"): sends `request` reliably as stream `stream_id`, then receives the peer's
-  /// reply on the same stream id (the reply travels the other direction), returning its bytes. One
-  /// [`Connection`] carries both — the request as this end's send stream, the reply as its receive
-  /// stream — so a lost frame either way is recovered. The reply's completion is the exchange's
-  /// completion; the final acknowledgement of the reply rides the flush before this returns, so the
-  /// peer's [`serve_once`] finishes too. (Records ride the session plane per §4.10a §8; this is the
-  /// RPC seam register/placement (slice 5) will use — a to-ratify integration shape.)
+  /// the current owner"): sends `request` reliably on a **fresh** stream whose id carries `kind` in its
+  /// low bits and this connection's next exchange sequence above them ([`exchange_stream_id`]), then
+  /// receives the peer's reply on that same id (the reply travels the other direction), returning its
+  /// bytes. One [`Connection`] carries both — the request as this end's send stream, the reply as its
+  /// receive stream — so a lost frame either way is recovered. The reply's completion is the exchange's
+  /// completion; the final acknowledgement of the reply rides the flush before this returns, so the peer's
+  /// [`serve_once`] finishes too.
+  ///
+  /// A stream id is never reused within a connection (RFC 9000 §2.1). Before this, every exchange of a
+  /// kind reused one id, and an exchange abandoned at its caller's deadline collided with the next: at
+  /// the peer the next request's offset-0 frame was a duplicate of the abandoned request's completed
+  /// stream (deduplicated — never served) while the peer's reply to the abandoned one awaited an
+  /// acknowledgement that never came; at this end that late reply was read as the next exchange's. A
+  /// still-open exchange is abandoned first ([`abandon_exchange`](Endpoint::abandon_exchange)), and any
+  /// late reply to an earlier one arriving on its own, older id is drained below the floor and discarded
+  /// ([`Connection::discard_streams_below`]) — read, so its bytes are credited back, never mistaken.
+  /// (`docs/bugs/2026-09-13-reused-stream-id-collides-behind-an-unacked-reply.md`.)
   ///
   /// [`serve_once`]: Endpoint::serve_once
-  pub async fn request(
-    &mut self,
-    stream_id: u64,
-    request: &[u8],
-  ) -> Result<Vec<u8>, EndpointError> {
-    // Start from a clean stream: a caller that abandoned an earlier exchange on this id at its deadline
-    // (the fleet probe does) may have left that exchange's reply — arrived late, complete, unread — in the
-    // receive side, and this exchange would otherwise read *that* reply as its own and stay one reply
-    // behind on every exchange after it (a peer retired while answering every probe on time).
-    self.conn.forget_stream(stream_id);
+  pub async fn request(&mut self, kind: u64, request: &[u8]) -> Result<Vec<u8>, EndpointError> {
+    self.abandon_exchange();
+    let stream_id = exchange_stream_id(kind, self.next_exchange);
+    self.next_exchange = self.next_exchange.saturating_add(1);
+    self.open_exchange = Some(stream_id);
     self.conn.open(stream_id, request);
     let mut reply = Vec::new();
     loop {
-      // Drain the reply, then flush: the flush sends the request (opened above, still credited) and the
+      // Late replies to abandoned exchanges (older ids) are drained and discarded; this exchange's reply is
+      // drained, then flushed: the flush sends the request (opened above, still credited) and the
       // acknowledgement whose piggybacked credit reflects the reply bytes just read — so a reply larger
       // than one window keeps flowing. Flushing before the drain would advertise a round-stale window.
+      self.conn.discard_streams_below(stream_id);
       reply.extend_from_slice(&self.conn.read_stream(stream_id));
       self.flush()?;
       if self.conn.recv_stream_complete(stream_id) {
         self.conn.forget_stream(stream_id);
+        self.open_exchange = None;
         return Ok(reply);
       }
       self.receive_or_probe().await?;
     }
   }
 
-  /// Forgets `stream_id` on this session: drops any in-flight frames of an exchange abandoned mid-flight
-  /// and its receive state. A caller that races [`request`](Endpoint::request) against its own deadline
-  /// and keeps the session for reuse (the fleet's `request_within`) calls this when the deadline wins, so
-  /// the abandoned exchange's stream does not ride the next flush on the reused session — its stale bytes
-  /// would otherwise reach the peer alongside the next request and be folded into an unrelated exchange
-  /// (`docs/bugs/2026-09-10-abandoned-request-retransmit-lockstep.md`: the same discipline `request`
-  /// applies to its *own* stream, now available to the deadline-racing caller for the stream it abandons).
-  pub fn forget_stream(&mut self, stream_id: u64) {
-    self.conn.forget_stream(stream_id);
+  /// Abandons the client exchange currently open, if any: its request's in-flight frames are dropped
+  /// (never retransmitted) and its receive state released, so nothing of it rides the next flush on this
+  /// reused session. A caller that races [`request`](Endpoint::request) against its own deadline and keeps
+  /// the session for reuse (the fleet's `request_within`, the SWIM probe) calls this when the deadline
+  /// wins; [`request`](Endpoint::request) also calls it first, so a dropped exchange never lingers. The
+  /// abandoned exchange's reply, should it still arrive, does so on its own — now older — stream id and is
+  /// drained below the next exchange's floor and discarded; it can never be read as another's.
+  pub fn abandon_exchange(&mut self) {
+    if let Some(stream_id) = self.open_exchange.take() {
+      self.conn.forget_stream(stream_id);
+    }
   }
 
-  /// The server side of one request/reply exchange: receives a request stream, passes its stream id
-  /// and bytes to `handler`, and sends the reply back on the same stream id, returning once the reply
-  /// is acknowledged. The stream id is the request's **kind** on a session that carries several RPCs
-  /// (a record commit, a promotion, a content put each ride their own id), so a server dispatches on it
-  /// rather than guessing a message's kind from its bytes. Drives one [`Connection`]: phase one receives
-  /// and acknowledges the request until its `fin`; phase two frames the reply and completes when the
-  /// peer has acknowledged all of it.
+  /// The server side of one request/reply exchange: receives a request stream, passes its **kind**
+  /// ([`stream_kind`] of its stream id) and bytes to `handler`, and sends the reply back on the request's
+  /// own stream id, returning once the reply is acknowledged. The kind is what a session carrying several
+  /// RPCs dispatches on (a record commit, a promotion, a content put each name their own), so a server
+  /// never guesses a message's kind from its bytes. Drives one [`Connection`]: phase one receives and
+  /// acknowledges the request until its `fin`; phase two frames the reply and completes when the peer has
+  /// acknowledged all of it.
   pub async fn serve_once<H>(&mut self, handler: H) -> Result<(), EndpointError>
   where
     H: FnOnce(u64, Vec<u8>) -> Vec<u8>,
@@ -927,39 +987,44 @@ impl Endpoint {
   {
     // Phase one: receive one request in full, acknowledging and *draining* as it arrives — draining is
     // what slides the flow-control window forward, so a request larger than one window keeps flowing
-    // (without it the credit never grows past the initial window and the sender stalls). Each request
-    // **kind** rides its own stream id, and the bytes of each are kept apart in `pending` keyed by id: a
-    // peer that reused this session after abandoning an earlier exchange at its deadline (the fleet's
-    // `request_within` races `request` against a deadline and cancels it) may still have that exchange's
-    // stream half-open, and folding its stray bytes into an unrelated request would hand the handler a
-    // corrupt message. The first stream to reach its `fin` is this request; it is served with *its own*
-    // bytes, and any other stream's partial bytes stay buffered for the exchange they belong to.
-    let mut pending: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+    // (without it the credit never grows past the initial window and the sender stalls). Every exchange
+    // rides its own stream id, and the bytes of each are kept apart in `pending_requests` keyed by id and
+    // kept **across** calls: a request that completed while the previous reply was being acknowledged
+    // (the peer moved on to it) is found complete before any datagram is awaited, not left for the idle
+    // re-drive. The peer runs one exchange at a time, so when several are complete the **newest** is the
+    // live one — every older one was abandoned at the peer's deadline, and answering it would only send a
+    // reply the peer discards — so the newest is served and the floor raised past it, which drains and
+    // forgets the rest (their bytes credited back). Frames below the floor that arrive later are late
+    // retransmits of exchanges already served or abandoned and are discarded the same way, never served
+    // twice. (`docs/bugs/2026-09-13-reused-stream-id-collides-behind-an-unacked-reply.md`.)
     let (request_id, request) = loop {
-      self.receive_or_probe().await?;
-      let ids = self.conn.recv_stream_ids();
-      for &id in &ids {
-        let chunk = self.conn.read_stream(id);
-        if !chunk.is_empty() {
-          pending.entry(id).or_default().extend_from_slice(&chunk);
-        }
+      if let Some(id) = self.newest_complete_request() {
+        let request = self.pending_requests.remove(&id).unwrap_or_default();
+        self.serve_floor = id.saturating_add(1);
+        self.conn.discard_streams_below(self.serve_floor);
+        self
+          .pending_requests
+          .retain(|&pending_id, _| pending_id >= self.serve_floor);
+        break (id, request);
       }
+      self.receive_or_probe().await?;
+      self.drain_requests();
       // Flush *after* draining, so the acknowledgement advertises credit that reflects what was just
       // read — draining slides the flow-control window, and advertising before it would lag a round and
       // stall a request larger than one window at the window boundary (also carries the final ACK).
       self.flush()?;
-      if let Some(id) = ids
-        .into_iter()
-        .find(|&id| self.conn.recv_stream_complete(id))
-      {
-        break (id, pending.remove(&id).unwrap_or_default());
-      }
     };
 
-    // Phase two: send the reply on the same stream id until the peer has acknowledged it whole. This is an
-    // active exchange (a reply is in flight awaiting acknowledgement), so it carries the stall bound — a
-    // peer that stops acknowledging is abandoned rather than retransmitted into forever.
-    let reply = handler(request_id, request).await;
+    // Phase two: send the reply on the request's own stream id until the peer has acknowledged it whole.
+    // This is an active exchange (a reply is in flight awaiting acknowledgement), so it carries the stall
+    // bound — a peer that stops acknowledging is abandoned rather than retransmitted into forever. The
+    // peer runs one exchange at a time, so a **newer** request completing while this reply awaits its
+    // acknowledgement means the peer abandoned this exchange at its deadline and moved on: the reply is
+    // dropped (it would only be retransmitted into a peer that discards it, with the live request waiting
+    // behind it until the retransmits gave up) and this call returns, so the caller's serve loop re-enters
+    // and serves the newer request at once. The stream bytes that arrive meanwhile are drained so that
+    // newer request can complete here at all.
+    let reply = handler(stream_kind(request_id), request).await;
     self.conn.open(request_id, &reply);
     loop {
       self.flush()?;
@@ -968,7 +1033,46 @@ impl Endpoint {
         return Ok(());
       }
       self.receive_or_probe().await?;
+      self.drain_requests();
+      if self
+        .newest_complete_request()
+        .is_some_and(|newer| newer > request_id)
+      {
+        self.conn.forget_stream(request_id);
+        return Ok(());
+      }
     }
+  }
+
+  /// Drains every receive stream's newly contiguous bytes into the pending requests (each keyed by its
+  /// stream id), and discards what sits below the serve floor. Reading is what slides the flow-control
+  /// window forward, so a request larger than one window keeps flowing — and a request that arrives while
+  /// a reply is still awaiting its acknowledgement can complete.
+  fn drain_requests(&mut self) {
+    self.conn.discard_streams_below(self.serve_floor);
+    for id in self.conn.recv_stream_ids() {
+      let chunk = self.conn.read_stream(id);
+      if !chunk.is_empty() {
+        self
+          .pending_requests
+          .entry(id)
+          .or_default()
+          .extend_from_slice(&chunk);
+      }
+    }
+  }
+
+  /// The highest-numbered receive stream that has reached its `fin` at or above the serve floor — the
+  /// peer's live request, when several complete requests are waiting (see [`serve_once_async`]).
+  ///
+  /// [`serve_once_async`]: Endpoint::serve_once_async
+  fn newest_complete_request(&self) -> Option<u64> {
+    self
+      .conn
+      .recv_stream_ids()
+      .into_iter()
+      .filter(|&id| id >= self.serve_floor && self.conn.recv_stream_complete(id))
+      .max()
   }
 }
 

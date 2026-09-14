@@ -1649,10 +1649,18 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 > `three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node`; that attribution was **wrong** — the
 > hang was a holder acceptor born stale on a refused first record (fixed with the Raft membership work,
 > `docs/bugs/2026-09-13-holder-acceptor-born-stale-never-placed.md`). Re-measured on the fixed tree the
-> same test passes 3/3 at 11.3 s with the dilation, the starvation test at 8.8 s. A
-> fresh stream id per exchange (RFC 9000 §2.1) also stays owed: the id doubles as the server's dispatch
-> kind, the SWIM re-send compensates, and no repro of the reuse collision could be built on the simulated
-> fabric. Both are recorded in the ledger with their mechanism.
+> same test passes 3/3 at 11.3 s with the dilation, the starvation test at 8.8 s.
+> Same day (2026-09-13): every session-plane exchange now rides a fresh stream id (RFC 9000 §2.1) — the
+> request kind in the low eight bits, a per-connection exchange sequence above — so an exchange abandoned
+> at its deadline can neither be deduplicated against nor answered for the next: the server serves the
+> newest complete request, drops an abandoned reply the moment a newer request completes, and late replies
+> are drained below a floor so their bytes are credited back. The SWIM probe's re-send is gone with it, and
+> a suspected member whose probe is answered is not aged to death by the tick that credits it. A packet now
+> carries several frames up to a budget (RFC 9000 §12.2; one-frame callers unchanged). Path-MTU discovery
+> (RFC 8899) was built and proven sans-io but not landed: on the live session it stalled at 1350 and
+> exposed that, once packet budget and frame cap separate, the congestion gate must ask about the next
+> frame — recorded for the next attempt
+> (`docs/bugs/2026-09-13-reused-stream-id-collides-behind-an-unacked-reply.md`).
 > Same day: the durability policy now gates writes. `DurabilityBound::shortfall` answers
 > `within_loss_bound(ε, F)` with its numbers at every configuration install (boot, council commit,
 > cross-shard fan — every shard measures, one change counts once), and `verbs::dispatch` refuses a create,
