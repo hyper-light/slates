@@ -10,7 +10,6 @@ description = "The one transport-independent VFS operation layer (the Bridge tra
 
 [dependencies]
 slates-vfs = { workspace = true }
-slates-base = { workspace = true }
 slates-db = { workspace = true }
 slates-mem = { workspace = true }
 

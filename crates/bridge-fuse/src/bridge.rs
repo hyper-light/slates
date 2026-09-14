@@ -760,6 +760,7 @@ fn serve_setattr(
     gid: (s.valid & SetAttrIn::FATTR_GID != 0).then_some(s.gid),
     atime: (s.valid & SetAttrIn::FATTR_ATIME != 0).then_some(s.atime),
     mtime: (s.valid & SetAttrIn::FATTR_MTIME != 0).then_some(s.mtime),
+    ctime: (s.valid & SetAttrIn::FATTR_CTIME != 0).then_some(s.ctime),
   };
   let result = bridge.setattr(object, cx, changes).map(|n| AttrOut {
     attr_valid: CACHE_FOREVER,

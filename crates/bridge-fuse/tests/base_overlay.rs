@@ -115,7 +115,12 @@ fn a_base_file_is_read_through_the_bridge_byte_identical() {
     },
   )
   .unwrap();
-  let mut bridge = VolumeBridge::with_base(VolumeId { bytes: [0; 16] }, &mut vol, &mut store, host);
+  let mut bridge = VolumeBridge::with_base(
+    VolumeId { bytes: [0; 16] },
+    &mut vol,
+    &mut store,
+    Box::new(host),
+  );
   let mut out = vec![0u8; 1 << 20];
 
   // READDIR the root loads the base listing (a tool lists a directory before opening its
@@ -198,7 +203,12 @@ fn a_base_write_copies_up_and_leaves_the_disk_untouched() {
     },
   )
   .unwrap();
-  let mut bridge = VolumeBridge::with_base(VolumeId { bytes: [0; 16] }, &mut vol, &mut store, host);
+  let mut bridge = VolumeBridge::with_base(
+    VolumeId { bytes: [0; 16] },
+    &mut vol,
+    &mut store,
+    Box::new(host),
+  );
   let mut out = vec![0u8; 1 << 20];
 
   // Read the base file's original bytes from disk to compare against later.
@@ -292,7 +302,12 @@ fn a_base_file_is_found_by_direct_lookup_without_a_prior_readdir() {
     },
   )
   .unwrap();
-  let mut bridge = VolumeBridge::with_base(VolumeId { bytes: [0; 16] }, &mut vol, &mut store, host);
+  let mut bridge = VolumeBridge::with_base(
+    VolumeId { bytes: [0; 16] },
+    &mut vol,
+    &mut store,
+    Box::new(host),
+  );
   let mut out = vec![0u8; 1 << 20];
 
   // No READDIR first — a tool opening a file by path looks it up directly.

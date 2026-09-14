@@ -1905,4 +1905,137 @@ impl Overlay<'_> {
     }
     Ok(pinned)
   }
+
+  // ------------------------------------------------- metadata copy-ups and by-inode verbs
+
+  /// A read-only open of an untouched base file is answered from the daemon's descriptor on the
+  /// backing file (§4.6 "Base files"): the descriptor is opened now, through the entry's home,
+  /// so it keeps the inode's data alive if the name is unlinked or renamed over while the file is
+  /// open — unlink-while-open on a base file serves the bytes the opener saw, never `ENOENT`.
+  /// A witnessed, copied-up or non-base inode needs nothing here.
+  pub fn open_base(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+    let untouched = matches!(self.vol.inode(store, no)?.body, Body::Base(_))
+      && !self.vol.base.as_ref().is_some_and(|b| b.is_witnessed(no));
+    if !untouched {
+      return Ok(());
+    }
+    self.descriptor(store, no).map(|_| ())
+  }
+
+  /// `chown` with a metadata-only copy-up: the witness is recorded and nothing is pinned (§4.5
+  /// "Metadata-only changes copy up the witness and pin nothing"), so the landing has the base
+  /// the ownership change was made against.
+  pub fn chown(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    uid: u32,
+    gid: u32,
+  ) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Metadata)?;
+    self.vol.chown(store, no, uid, gid)
+  }
+
+  /// `set_times` with a metadata-only copy-up (the same rule as [`Overlay::chown`]).
+  pub fn set_times(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    atime: Option<i64>,
+    mtime: Option<i64>,
+    ctime: Option<i64>,
+  ) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Metadata)?;
+    self.vol.set_times(store, no, atime, mtime, ctime)
+  }
+
+  /// The by-inode-number forms of the base-aware namespace verbs, for the bridge (which speaks
+  /// inode numbers, not handles — the same shape as the plain `Volume::*_no` wrappers). Every
+  /// metadata mutation of a merged directory goes through these, never the plain verbs, so a
+  /// base name gets its whiteout (with the listing reloaded first), a base entry gets its witness,
+  /// and a name the base holds is refused (§4.6 "Base lookups and metadata mutations go through the
+  /// same overlay rules as reads and writes"; AC-1.17).
+  pub fn create_file_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    mode: u32,
+  ) -> Result<InodeNo, VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.create_file(store, dir, name, mode)
+  }
+
+  /// `mkdir` by inode number; the new directory's inode number (see [`Overlay::create_file_no`]).
+  pub fn mkdir_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    mode: u32,
+  ) -> Result<InodeNo, VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    let handle = self.mkdir(store, dir, name, mode)?;
+    Ok(store.dirs.get(handle)?.inode)
+  }
+
+  /// `symlink` by inode number (see [`Overlay::create_file_no`]).
+  pub fn symlink_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    target: &str,
+  ) -> Result<InodeNo, VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.symlink(store, dir, name, target)
+  }
+
+  /// `link` by inode number (see [`Overlay::create_file_no`]).
+  pub fn link_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    target: InodeNo,
+  ) -> Result<(), VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.link(store, dir, name, target)
+  }
+
+  /// `unlink` by inode number (see [`Overlay::create_file_no`]).
+  pub fn unlink_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+  ) -> Result<(), VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.unlink(store, dir, name)
+  }
+
+  /// `rmdir` by inode number (see [`Overlay::create_file_no`]).
+  pub fn rmdir_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+  ) -> Result<(), VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    self.rmdir(store, dir, name)
+  }
+
+  /// `rename` by inode numbers (see [`Overlay::create_file_no`]).
+  pub fn rename_no(
+    &mut self,
+    store: &mut Store,
+    from_dir_no: InodeNo,
+    from_name: &str,
+    to_dir_no: InodeNo,
+    to_name: &str,
+  ) -> Result<(), VfsError> {
+    let from = self.vol.current_dir(store, from_dir_no)?;
+    let to = self.vol.current_dir(store, to_dir_no)?;
+    self.rename(store, from, from_name, to, to_name)
+  }
 }

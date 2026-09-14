@@ -85,6 +85,11 @@ pub struct SetAttr {
   pub atime: Option<i64>,
   /// A new modification time (nanoseconds since the Unix epoch), if set.
   pub mtime: Option<i64>,
+  /// A new change time (nanoseconds since the Unix epoch), if set. Only a kernel flushing the
+  /// timestamps it kept under a writeback cache asks for this (FUSE `FATTR_CTIME`); NFSv3's `sattr3`
+  /// and FSKit carry no such field and leave it `None`, and the change time then advances to the
+  /// volume's clock as for any attribute change.
+  pub ctime: Option<i64>,
 }
 
 /// The `renameat2` flags a rename carries. The operation layer preserves them and an

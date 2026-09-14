@@ -126,9 +126,9 @@ impl ReadIn {
   }
 }
 
-/// The fields of a `SETATTR` body slates applies (`struct fuse_setattr_in`): a `valid`
-/// bitmask, then fh, size, and later mode. slates reads `valid`, `size` and `mode`; the mask
-/// says which the kernel set.
+/// The fields of a `SETATTR` body (`struct fuse_setattr_in`): a `valid` bitmask, then every
+/// settable field. The mask says which the kernel set; the edge applies each set field through the
+/// seam and never acknowledges one it ignored (§4.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SetAttrIn {
   /// Which fields the kernel set (the `FATTR_*` bits).
@@ -147,6 +147,9 @@ pub struct SetAttrIn {
   /// The new modification time in nanoseconds since the Unix epoch (when `valid` has
   /// [`SetAttrIn::FATTR_MTIME`]).
   pub mtime: i64,
+  /// The new change time in nanoseconds since the Unix epoch (when `valid` has
+  /// [`SetAttrIn::FATTR_CTIME`] — a kernel flushing the timestamps it kept under a writeback cache).
+  pub ctime: i64,
 }
 
 impl SetAttrIn {
@@ -162,14 +165,14 @@ impl SetAttrIn {
   pub const FATTR_ATIME: u32 = 1 << 4;
   /// Format: `FATTR_MTIME`, the `valid` bit for the modification time.
   pub const FATTR_MTIME: u32 = 1 << 5;
+  /// Format: `FATTR_CTIME`, the `valid` bit for the change time (`include/uapi/linux/fuse.h`).
+  pub const FATTR_CTIME: u32 = 1 << 10;
 
-  /// Reads the fields slates honors from `fuse_setattr_in`, in wire order. The struct is valid
-  /// (4), padding (4), fh (8), size (8), lock_owner (8), atime (8), mtime (8), ctime (8),
-  /// atimensec (4), mtimensec (4), ctimensec (4), mode (4), unused4 (4), uid (4), gid (4),
-  /// unused5 (4). Times are seconds plus a nanosecond part, combined into the volume core's
-  /// nanosecond form.
-  #[allow(clippy::type_complexity)]
-  fn parse_fields(body: &[u8]) -> Option<(u32, u64, i64, i64, u32, u32, u32)> {
+  /// Reads the fields from `fuse_setattr_in`, in wire order. The struct is valid (4), padding (4),
+  /// fh (8), size (8), lock_owner (8), atime (8), mtime (8), ctime (8), atimensec (4), mtimensec
+  /// (4), ctimensec (4), mode (4), unused4 (4), uid (4), gid (4), unused5 (4). Times are seconds
+  /// plus a nanosecond part, combined into the volume core's nanosecond form.
+  fn parse_fields(body: &[u8]) -> Option<SetAttrIn> {
     let mut r = Reader::new(body);
     let op = Opcode::SetAttr.to_wire();
     let valid = r.u32(op).ok()?;
@@ -178,41 +181,32 @@ impl SetAttrIn {
     r.skip(size_of::<u64>(), op).ok()?; // lock_owner
     let atime_sec = r.u64(op).ok()?;
     let mtime_sec = r.u64(op).ok()?;
-    r.skip(size_of::<u64>(), op).ok()?; // ctime
+    let ctime_sec = r.u64(op).ok()?;
     let atime_nsec = r.u32(op).ok()?;
     let mtime_nsec = r.u32(op).ok()?;
-    r.skip(size_of::<u32>(), op).ok()?; // ctimensec
+    let ctime_nsec = r.u32(op).ok()?;
     let mode = r.u32(op).ok()?;
     r.skip(size_of::<u32>(), op).ok()?; // unused4
     let uid = r.u32(op).ok()?;
     let gid = r.u32(op).ok()?;
-    Some((
+    Some(SetAttrIn {
       valid,
       size,
-      combine_time(atime_sec, atime_nsec),
-      combine_time(mtime_sec, mtime_nsec),
       mode,
       uid,
       gid,
-    ))
+      atime: combine_time(atime_sec, atime_nsec),
+      mtime: combine_time(mtime_sec, mtime_nsec),
+      ctime: combine_time(ctime_sec, ctime_nsec),
+    })
   }
 
   /// Parses a setattr body; refuses one too short for the fields.
   pub fn parse(body: &[u8]) -> Result<SetAttrIn, FuseError> {
-    let (valid, size, atime, mtime, mode, uid, gid) =
-      Self::parse_fields(body).ok_or(FuseError::ShortBody {
-        opcode: Opcode::SetAttr.to_wire(),
-        have: body.len(),
-        need: body.len().saturating_add(1),
-      })?;
-    Ok(SetAttrIn {
-      valid,
-      size,
-      mode,
-      uid,
-      gid,
-      atime,
-      mtime,
+    Self::parse_fields(body).ok_or(FuseError::ShortBody {
+      opcode: Opcode::SetAttr.to_wire(),
+      have: body.len(),
+      need: body.len().saturating_add(1),
     })
   }
 }

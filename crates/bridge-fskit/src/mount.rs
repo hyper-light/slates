@@ -48,7 +48,13 @@ impl MountSession {
     cx: &OpContext,
     request: &[u8],
   ) -> Result<Vec<u8>, ShimWireError> {
-    let mut bridge = VolumeBridge::attached(self.id, volume, store, &mut self.handles, host);
+    let mut bridge = VolumeBridge::attached(
+      self.id,
+      volume,
+      store,
+      &mut self.handles,
+      host.map(|host| host as &mut dyn slates_vfs::host::HostFs),
+    );
     serve(request, &mut bridge, cx)
   }
 }

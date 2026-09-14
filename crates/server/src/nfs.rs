@@ -67,6 +67,7 @@ use slates_rt::task::SpawnRequest;
 use slates_rt::tcp::{TcpListener, TcpStream};
 use slates_rt::{futures, registry};
 use slates_vfs::clock::Clock;
+use slates_vfs::host::HostFs;
 use slates_wire::observe::Chokepoint;
 use slates_wire::request::RequestId;
 
@@ -160,7 +161,7 @@ fn with_export<R>(
     &mut slot.volume,
     store,
     &mut handles,
-    slot.host.as_mut(),
+    slot.host.as_mut().map(|host| host as &mut dyn HostFs),
   );
   let mut export = Export::new(&mut bridge, volume, subject, rights).ok()?;
   export.set_owner_gid(owner_gid);

@@ -1314,7 +1314,6 @@ dependencies = [
 name = "slates-bridge-core"
 version = "0.1.0"
 dependencies = [
- "slates-base",
  "slates-db",
  "slates-mem",
  "slates-vfs",
