@@ -3,9 +3,12 @@
 //! at chunk granularity); holes read as zeros; hashing waits for the seal and dedup for Phase 7.
 //!
 //! Chunk bytes sit in the shard's buddy arena (`slates-mem`), addressed by extent, never by raw
-//! pointer. Each chunk is referenced by exactly one extent of one inode version, so a chunk is
-//! released by the birth-epoch rule alone: born after the last snapshot, free now; born before
-//! it, onto the snapshot's deadlist.
+//! pointer. A chunk may be referenced by several versions of one inode — a copy-up clones the
+//! body, so a retired version and its successor share every chunk until the head rewrites a
+//! window — and is released exactly once, by the head, by the birth-epoch rule alone when the
+//! head stops reaching it: born after the last snapshot, free now; born before it, onto the
+//! snapshot's deadlist as its own `Dead::Chunk`. A retired version's release never frees its
+//! chunks (`volume::release_dead`); a destroy or a recovery rebuild lists them itself.
 
 use slates_machine::{Derived, derived};
 use slates_mem::arena::{ChunkArena, Extent as Block};

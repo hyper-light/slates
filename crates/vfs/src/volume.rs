@@ -1767,11 +1767,15 @@ impl Volume {
     for (block, born) in blocks {
       queue.push(Dead::DirBlock(block, born));
     }
+    // The head's chunks are listed on their own (a version's release never frees its chunks, since
+    // a retired version may share them with its successor); each carries its own birth epoch, so
+    // a clone's step skips the windows it still shares with its origin exactly as it skips nodes.
     let mut inodes = Vec::new();
     trie::walk_since(&store.tries, self.inode_root, since, &mut inodes);
     for h in inodes {
       if let Ok(inode) = store.inodes.get(h) {
         queue.push(Dead::Inode(h, inode.born));
+        queue.extend(body_chunks(store, &inode.body));
       }
     }
     let mut tries = Vec::new();
@@ -3088,9 +3092,10 @@ pub(crate) fn clip_extents(
 /// Every object a tree rooted at `dir_root`/`inode_root` reaches, as a deadlist (§4.8 recovery). A
 /// recovered snapshot's tree is independent (distinct handles from the head and other snapshots), so
 /// this is exactly what dropping the snapshot must reclaim — `destroy_snapshot` reclaims only from
-/// the deadlist, so a recovered snapshot needs one or it leaks its tree on drop. Chunks are freed
-/// with their inode versions (as [`Volume::destroy`]'s own walk relies on), so only nodes and inode
-/// versions are listed.
+/// the deadlist, so a recovered snapshot needs one or it leaks its tree on drop. A private version's
+/// chunks are listed as their own `Dead::Chunk`s (a version's release never frees its chunks, as
+/// [`Volume::destroy`]'s walk lists them too); a version shared with the head is the head's, chunks
+/// included.
 pub(crate) fn tree_deadlist_excluding(
   store: &Store,
   dir_root: Handle<DirNode>,
@@ -3119,6 +3124,9 @@ pub(crate) fn tree_deadlist_excluding(
         continue;
       }
       list.push(Dead::Inode(handle, inode.born));
+      for chunk in body_chunks(store, &inode.body) {
+        list.push(chunk);
+      }
     }
   }
   let mut tries = Vec::new();
@@ -3171,9 +3179,18 @@ fn block_segment_slots(page: usize) -> Derived<usize> {
 const BLOCK_SEGMENT_PAGES: usize = 64;
 
 /// Releases a dead object and returns the work units it cost, so a destroy slice's budget
-/// counts what is freed rather than how many handles it touched: an inode one unit per extent
-/// plus one, a directory node, a block, a trie node or a chunk one unit (their slots are
-/// vacated in place, never copied out).
+/// counts what is freed rather than how many handles it touched: a directory node, a block, a
+/// trie node, a chunk or an inode version one unit each, an open extent's block one more (their
+/// slots are vacated in place, never copied out).
+///
+/// An inode version's sealed chunks are never freed with it. A copy-up clones the body, so a
+/// retired version and the current version copied from it share every chunk until the head
+/// rewrites a window; freeing them here took the head's untouched windows with the snapshot
+/// (docs/bugs/2026-09-13-snapshot-destroy-frees-head-shared-chunks.md). A chunk is released
+/// exactly once, by the head, when the head stops reaching it (`ChunkStore::release_chunk`'s
+/// epoch rule: freed now, or the newest snapshot's own `Dead::Chunk`), or listed as its own
+/// `Dead::Chunk` by [`Volume::destroy`]'s walk of the head and by the recovery rebuild
+/// ([`tree_deadlist_excluding`]). Only an open extent's block belongs to the version alone.
 fn release_dead(store: &mut Store, dead: Dead) -> Result<usize, VfsError> {
   match dead {
     Dead::Dir(h, _) => {
@@ -3188,16 +3205,11 @@ fn release_dead(store: &mut Store, dead: Dead) -> Result<usize, VfsError> {
       let Ok(inode) = store.inodes.remove(h) else {
         return Ok(1);
       };
-      let extents = match inode.body {
-        Body::Sealed(extents) => free_extents(store, &extents),
-        Body::Open { open, sealed } => {
-          let _ = store.content.release_open(open);
-          free_extents(store, &sealed) + 1
-        }
-        Body::Base(b) => free_extents(store, &b.pinned),
-        _ => 0,
-      };
-      Ok(1 + extents)
+      if let Body::Open { open, .. } = inode.body {
+        let _ = store.content.release_open(open);
+        return Ok(2);
+      }
+      Ok(1)
     }
     Dead::Trie(h, _) => {
       let _ = store.tries.discard(h);
@@ -3210,12 +3222,24 @@ fn release_dead(store: &mut Store, dead: Dead) -> Result<usize, VfsError> {
   }
 }
 
-/// Frees the chunks of sealed extents; returns how many there were.
-fn free_extents(store: &mut Store, extents: &[Extent]) -> usize {
-  for e in extents {
-    if let ExtentSrc::Chunk { chunk, .. } = e.src {
-      let _ = store.content.free_chunk(chunk);
-    }
-  }
-  extents.len()
+/// The sealed chunks a body references: its sealed extents, the sealed extents beneath an open
+/// extent, or a base body's pinned windows. Inline, symlink, directory and empty bodies reference
+/// none. Each is paired with its birth epoch so a caller can list it as its own `Dead::Chunk`.
+pub(crate) fn body_chunks(store: &Store, body: &Body) -> Vec<Dead> {
+  let extents: &[Extent] = match body {
+    Body::Sealed(extents) => extents,
+    Body::Open { sealed, .. } => sealed,
+    Body::Base(b) => &b.pinned,
+    _ => &[],
+  };
+  extents
+    .iter()
+    .filter_map(|e| match e.src {
+      ExtentSrc::Chunk { chunk, .. } => store
+        .content
+        .chunk(chunk)
+        .map(|c| Dead::Chunk(chunk, c.born)),
+      ExtentSrc::Zero => None,
+    })
+    .collect()
 }
