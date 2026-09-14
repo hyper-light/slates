@@ -1426,6 +1426,22 @@ content goes through the VFS write boundary so witness, journal, quota and lease
 The baseline contract does not require DAX; a requested DAX capability cannot be advertised
 until mapping isolation, pinning and teardown have been established for that VMM.
 
+> **Status (virtio-fs, 2026-09-13).** The owned FUSE-over-virtio device exists
+> (`crates/bridge-virtiofs`) and the daemon serves it on the volume's owning shard
+> (`crates/server/src/virtiofs.rs`): the split virtqueue is walked sans-io over a bounded
+> guest-memory seam with every check above made before any buffer access and a refusal faulting
+> the queue; the request cycle gathers the chain into the FUSE codec's `dispatch` onto the shared
+> `Bridge` and scatters the reply, byte-identical with direct dispatch; admission asks the seam for
+> the consumer before it reads the queues, maps the memory or publishes the tag, reads the
+> consumer's rights from the volume's access list only then, and charges every chain against
+> credits derived from the shard's admission limit and the §4.9 window; revocation is refused
+> before access and reclaimed under one owned terminal step; the loop is a task on `slates-rt`
+> woken by the seam's doorbell. DAX is not advertised and a DAX request is refused
+> `AttachmentUnsupported`. The seam models the in-process and inherited-descriptor forms; only the
+> in-process form is served (the libkrun and vhost-user bindings are owed), the guest form is not
+> yet on the `attach`/`status` wire, and the conformance evidence is the simulated guest driver
+> until a live Linux guest runs (AC-9.7). Record: `docs/wip/virtiofs.md`.
+
 **Writeback and snapshot barrier.** Kernel/guest cache negotiation changes when writes reach
 the owner. `snapshot`, `submit`, `advance`, clean `detach`, migration and archive must identify
 the set of contributing writable attachments, stop admission into the closing generation,
