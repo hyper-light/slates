@@ -1772,6 +1772,68 @@ fn three_daemons_elect_one_stable_council_leader_over_the_transport() {
   );
 }
 
+/// AC (§4.8 "Derived constants"; R8): on a loopback fleet the council's election timing is **derived at
+/// the floor** — every measured voter path sits inside one heartbeat, so the base and span are the ten
+/// periods the daemon always ran — and it is measured, not defaulted: each node's timing carries the round
+/// trips its probes and consensus rounds sampled (the non-vacuity witness), read through the daemon's
+/// observation accessor over the real loopback transport. The WAN case of the same law is proven on the
+/// fabric (`crates/cluster/tests/wan_election.rs`); this is the differential that a laptop or LAN fleet is
+/// unchanged by construction. The tail each node measured is in the failure message, so a loopback round
+/// trip that outgrew a heartbeat under load reads as the measurement it is.
+#[test]
+fn a_loopback_fleet_derives_its_election_timing_at_the_measured_floor() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let elected = poll_until(&observed, COUNCIL_ELECTION_DEADLINE, || {
+    daemons
+      .iter()
+      .filter(|d| d.council_leads() == Some(true))
+      .count()
+      == 1
+  });
+  // Every node has sampled its voter paths — its probes are acknowledged each period, and the leader's
+  // rounds answered — so its timing is a measurement, not the default.
+  let measured = elected
+    && poll_until(&observed, COUNCIL_HEARTBEAT_WINDOW, || {
+      daemons
+        .iter()
+        .all(|d| d.council_timing().is_some_and(|timing| timing.samples > 0))
+    });
+  let timings: Vec<Option<slates_cluster::timing::ElectionTiming>> =
+    daemons.iter().map(Daemon::council_timing).collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(elected, "the council elected one leader over loopback");
+  assert!(
+    measured,
+    "every node's council timing was derived from measured round trips: {timings:?}"
+  );
+  let floor = slates_cluster::timing::ElectionTiming::floor();
+  for timing in timings.iter().flatten() {
+    assert!(
+      timing.broadcast_rtt_tail_ns < slates_server::daemon::HEARTBEAT_NS,
+      "a loopback voter path's tail is inside one heartbeat: {timing:?}"
+    );
+    assert_eq!(
+      (timing.base_periods, timing.span_periods),
+      (floor.base_periods, floor.span_periods),
+      "the derived timing is the floor on a loopback fleet: {timing:?}"
+    );
+  }
+}
+
 /// AC (§4.8, D-14): the configuration council **commits a membership change over the real transport**, not
 /// just an election. Three daemons elect a leader; when a **follower** dies, the leader — once the death is in
 /// its SWIM view — proposes the retirement through the council log (`reconcile_alive`), and it commits at the

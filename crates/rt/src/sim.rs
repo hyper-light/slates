@@ -7,6 +7,12 @@
 //! shard's next wait fail with `DriverLost`, which the shard answers by cancelling every task
 //! with a terminal completion and exiting (T-0.7). The shared state is atomics behind leaked
 //! `&'static` references, so a kick is a plain `Copy` handle and nothing here is unsafe.
+//!
+//! The simulated UDP fabric below carries the fleet plane at N=1 and, since 2026-09-14, models a path's
+//! latency ([`SimDelay`]: a one-way delay with seeded jitter, in order per flow unless told otherwise) so
+//! the consensus timing rules of §4.8 — "election timeout ≥ 10 × broadcast RTT p99" — are provable on a
+//! WAN profile under this virtual clock rather than only on a loopback where every round trip sits inside
+//! one heartbeat (`docs/wip/wan-timeout.md`).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -26,24 +32,139 @@ use std::collections::{BTreeMap, VecDeque};
 
 use slates_mem::Encoded;
 
+/// The latency profile of a modelled path on the simulated fabric (§4.8 A-9's required evidence:
+/// "independently delayed … and reordered messages"): a one-way delay, a symmetric jitter around it drawn
+/// from the simulation's seeded generator, and whether the path may hand a later datagram of one flow to
+/// its receiver before an earlier one. The fabric's default is the zero path — no delay, no jitter — on
+/// which a datagram is delivered the instant it is sent, exactly as the fabric always did (the model is
+/// additive: every simulation that never sets a profile runs unchanged, R8). A profile is data describing
+/// the network under test, never a mode of the code that runs over it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SimDelay {
+  /// The one-way delay of the path, nanoseconds.
+  one_way_ns: u64,
+  /// The half-width of the jitter, nanoseconds: each datagram's flight is `one_way ± jitter`, uniform.
+  jitter_ns: u64,
+  /// Whether a datagram may overtake an earlier one on the same directed flow. `false` — the path queues
+  /// in order: an arrival is clamped to no earlier than the previous datagram's on that flow, so jitter
+  /// spreads the gaps but never reorders. `true` — the jitter alone decides, so a later datagram can land
+  /// first, the reordering a consumer's dedup and reorder paths are exercised against.
+  reorders: bool,
+}
+
+impl SimDelay {
+  /// The zero path: delivered at once (the fabric's default).
+  pub const NONE: SimDelay = SimDelay {
+    one_way_ns: 0,
+    jitter_ns: 0,
+    reorders: false,
+  };
+
+  /// A path of `one_way_ns ± jitter_ns` that keeps each flow in send order.
+  pub const fn in_order(one_way_ns: u64, jitter_ns: u64) -> SimDelay {
+    SimDelay {
+      one_way_ns,
+      jitter_ns,
+      reorders: false,
+    }
+  }
+
+  /// A path of `one_way_ns ± jitter_ns` whose jitter may reorder a flow.
+  pub const fn reordering(one_way_ns: u64, jitter_ns: u64) -> SimDelay {
+    SimDelay {
+      one_way_ns,
+      jitter_ns,
+      reorders: true,
+    }
+  }
+
+  /// The one-way delay this profile centres on.
+  pub fn one_way_ns(&self) -> u64 {
+    self.one_way_ns
+  }
+
+  /// The half-width of this profile's jitter.
+  pub fn jitter_ns(&self) -> u64 {
+    self.jitter_ns
+  }
+
+  /// One datagram's flight time: `one_way − jitter + U[0, 2·jitter]` from `rng` (uniform over the
+  /// symmetric span; saturating at zero), or exactly the one-way delay when there is no jitter — so a
+  /// jitter-free profile draws nothing and leaves the generator untouched.
+  fn draw(&self, rng: &mut Xorshift) -> u64 {
+    if self.jitter_ns == 0 {
+      return self.one_way_ns;
+    }
+    let span = self.jitter_ns.saturating_mul(2).saturating_add(1);
+    let offset = u64::try_from(rng.below(usize::try_from(span).unwrap_or(usize::MAX))).unwrap_or(0);
+    self
+      .one_way_ns
+      .saturating_sub(self.jitter_ns)
+      .saturating_add(offset)
+  }
+}
+
+/// A datagram the fabric holds until its arrival time.
+#[derive(Debug)]
+struct InFlight {
+  dest: u16,
+  bytes: Vec<u8>,
+  from: u16,
+}
+
 /// The simulated UDP fabric (§4.10a): a deterministic, in-memory datagram switch so the fleet plane
 /// is testable at N=1 without the OS network — the "sim arm first" the design's phasing calls for.
 /// It is a thread-local because the simulation runs on one thread (so no `Send`/`Sync`, no lock), and
 /// wakes a waiting receiver through the registry, the same path a real driver completion takes.
-#[derive(Debug, Default)]
+///
+/// Latency (§4.8 A-9): every send is timed against the simulation clock the runtime installs
+/// ([`sim_fabric_reset`]) and the path's [`SimDelay`] — the directed pair's override, else the fabric-wide
+/// profile. A datagram whose arrival is now (the zero path) goes straight to its mailbox; one whose arrival
+/// is later waits in flight, ordered by arrival, and the simulation loop hands it over — and wakes its
+/// receiver — once the clock reaches it ([`SimRuntime::run_until_idle`] also treats the earliest arrival
+/// as a deadline the clock may advance to, so a fleet whose only pending event is a datagram in flight
+/// proceeds). With no clock installed (a fabric used without a `SimRuntime`) "now" is zero and only the
+/// zero path delivers — the latency model needs the clock that drives it.
+#[derive(Debug)]
 pub struct SimFabric {
   next_port: u16,
   mailboxes: BTreeMap<u16, VecDeque<(Vec<u8>, u16)>>,
   interests: BTreeMap<u16, u64>,
+  /// The simulation clock in-flight datagrams are timed against; `None` until a runtime installs one.
+  clock: Option<&'static SimShared>,
+  /// The seeded generator the jitter is drawn from — the fabric's own stream, so a profile's draws never
+  /// perturb the shards' generators and a run replays exactly from its seed.
+  rng: Xorshift,
+  /// The profile of every path without a directed override.
+  default_delay: SimDelay,
+  /// Directed overrides, keyed `(from, dest)`.
+  pair_delays: BTreeMap<(u16, u16), SimDelay>,
+  /// Datagrams not yet arrived, keyed by arrival time then send sequence (so two arrivals at one instant
+  /// keep send order and never collide).
+  in_flight: BTreeMap<(u64, u64), InFlight>,
+  next_sequence: u64,
+  /// The latest arrival scheduled on each directed flow, the floor an in-order path clamps the next to.
+  last_arrival: BTreeMap<(u16, u16), u64>,
 }
 
+/// Format: the salt that separates the fabric's generator stream from the shards' (both are seeded from
+/// the runtime seed; `xorshift64*` seeded identically would draw identical words), a fixed odd word.
+const FABRIC_SEED_SALT: u64 = 0xD1B5_4A32_D192_ED03;
+
 impl SimFabric {
-  fn new() -> SimFabric {
+  fn new(clock: Option<&'static SimShared>, seed: u64) -> SimFabric {
     SimFabric {
       // Ports start at 1 so 0 stays the "unspecified" address, as in the OS.
       next_port: 1,
       mailboxes: BTreeMap::new(),
       interests: BTreeMap::new(),
+      clock,
+      rng: Xorshift::new(seed ^ FABRIC_SEED_SALT),
+      default_delay: SimDelay::NONE,
+      pair_delays: BTreeMap::new(),
+      in_flight: BTreeMap::new(),
+      next_sequence: 0,
+      last_arrival: BTreeMap::new(),
     }
   }
 
@@ -54,14 +175,72 @@ impl SimFabric {
     port
   }
 
-  /// Delivers a datagram to `dest`; returns a waker word to wake if a receiver was waiting on it.
+  /// Virtual now on the installed clock, or zero without one.
+  fn now_ns(&self) -> u64 {
+    self.clock.map_or(0, SimShared::now_ns)
+  }
+
+  /// Sends a datagram from `from` to `dest`: delivered now on the zero path (returning a waker word to
+  /// wake if a receiver was waiting), or scheduled for its drawn arrival on a delayed one.
   fn send(&mut self, dest: u16, bytes: &[u8], from: u16) -> Option<u64> {
+    let now = self.now_ns();
+    let profile = self
+      .pair_delays
+      .get(&(from, dest))
+      .copied()
+      .unwrap_or(self.default_delay);
+    let mut arrival = now.saturating_add(profile.draw(&mut self.rng));
+    if !profile.reorders
+      && let Some(previous) = self.last_arrival.get(&(from, dest))
+    {
+      arrival = arrival.max(*previous);
+    }
+    self.last_arrival.insert((from, dest), arrival);
+    if arrival <= now {
+      return self.deliver(dest, bytes.to_vec(), from);
+    }
+    let sequence = self.next_sequence;
+    self.next_sequence = self.next_sequence.saturating_add(1);
+    self.in_flight.insert(
+      (arrival, sequence),
+      InFlight {
+        dest,
+        bytes: bytes.to_vec(),
+        from,
+      },
+    );
+    None
+  }
+
+  /// Puts a datagram in `dest`'s mailbox; returns the waker word of a receiver waiting on it.
+  fn deliver(&mut self, dest: u16, bytes: Vec<u8>, from: u16) -> Option<u64> {
     self
       .mailboxes
       .entry(dest)
       .or_default()
-      .push_back((bytes.to_vec(), from));
+      .push_back((bytes, from));
     self.interests.remove(&dest)
+  }
+
+  /// Hands over every in-flight datagram whose arrival is at or before `now`, in arrival order, and
+  /// returns the waker words of the receivers waiting on them.
+  fn deliver_due(&mut self, now: u64) -> Vec<u64> {
+    let mut wakes = Vec::new();
+    while let Some(entry) = self.in_flight.first_entry() {
+      if entry.key().0 > now {
+        break;
+      }
+      let InFlight { dest, bytes, from } = entry.remove();
+      if let Some(word) = self.deliver(dest, bytes, from) {
+        wakes.push(word);
+      }
+    }
+    wakes
+  }
+
+  /// The earliest arrival still in flight, if any — a deadline the simulation clock may advance to.
+  fn earliest_arrival(&self) -> Option<u64> {
+    self.in_flight.keys().next().map(|(arrival, _)| *arrival)
   }
 
   fn recv(&mut self, port: u16) -> Option<(Vec<u8>, u16)> {
@@ -79,12 +258,42 @@ impl SimFabric {
 }
 
 thread_local! {
-  static SIM_FABRIC: RefCell<SimFabric> = RefCell::new(SimFabric::new());
+  static SIM_FABRIC: RefCell<SimFabric> = RefCell::new(SimFabric::new(None, 0));
 }
 
-/// Resets the thread's simulated UDP fabric (a fresh simulation starts with an empty network).
-pub(crate) fn sim_fabric_reset() {
-  SIM_FABRIC.with(|f| *f.borrow_mut() = SimFabric::new());
+/// Resets the thread's simulated UDP fabric for a fresh simulation: an empty network on the zero path,
+/// timed against `clock` and drawing its jitter from `seed`.
+pub(crate) fn sim_fabric_reset(clock: &'static SimShared, seed: u64) {
+  SIM_FABRIC.with(|f| *f.borrow_mut() = SimFabric::new(Some(clock), seed));
+}
+
+/// Sets the latency profile of every path on this thread's fabric that has no directed override — the
+/// whole modelled network at one profile (every node in its own region, the worst case for a council).
+/// Takes effect for datagrams sent from now on; call it after `SimRuntime::new` (which resets the fabric)
+/// and before the tasks that send.
+pub fn sim_udp_set_delay(delay: SimDelay) {
+  SIM_FABRIC.with(|f| f.borrow_mut().default_delay = delay);
+}
+
+/// Sets the latency profile of the directed path from port `from` to port `dest`, overriding the fabric's
+/// default for that pair only — a near pair inside a far fleet, or an asymmetric route.
+pub fn sim_udp_set_pair_delay(from: u16, dest: u16, delay: SimDelay) {
+  SIM_FABRIC.with(|f| {
+    f.borrow_mut().pair_delays.insert((from, dest), delay);
+  });
+}
+
+/// Hands over every in-flight datagram due by `now` and wakes the receivers waiting on them.
+fn sim_fabric_deliver_due(now: u64) {
+  let wakes = SIM_FABRIC.with(|f| f.borrow_mut().deliver_due(now));
+  for word in wakes {
+    crate::registry::wake(Encoded::from_word(word));
+  }
+}
+
+/// The earliest arrival still in flight on this thread's fabric.
+fn sim_fabric_earliest_arrival() -> Option<u64> {
+  SIM_FABRIC.with(|f| f.borrow().earliest_arrival())
 }
 
 /// Shape: the receive buffer a simulated datagram socket reports (`UdpSocket::recv_buffer_bytes`) — the
@@ -97,7 +306,9 @@ pub fn sim_udp_bind() -> u16 {
   SIM_FABRIC.with(|f| f.borrow_mut().bind())
 }
 
-/// Sends a simulated datagram, waking a waiting receiver through the registry.
+/// Sends a simulated datagram: on the zero path it is delivered at once and a waiting receiver is woken
+/// through the registry; on a delayed path it is scheduled for its drawn arrival and handed over by the
+/// simulation loop when the clock reaches it.
 pub fn sim_udp_send(dest: u16, bytes: &[u8], from: u16) {
   let wake = SIM_FABRIC.with(|f| f.borrow_mut().send(dest, bytes, from));
   if let Some(word) = wake {
@@ -267,9 +478,9 @@ impl std::fmt::Debug for SimRuntime {
 impl SimRuntime {
   /// Builds `config.shards` simulated shards sharing one clock seeded by `seed`.
   pub fn new(config: &RuntimeConfig, seed: u64) -> Result<SimRuntime, RtError> {
-    // A fresh simulation starts with an empty UDP fabric on this thread.
-    sim_fabric_reset();
     let clock: &'static SimShared = Box::leak(Box::new(SimShared::new(seed)));
+    // A fresh simulation starts with an empty UDP fabric on this thread, timed against this clock.
+    sim_fabric_reset(clock, seed);
     let mut seeds = Vec::new();
     let mut shared = Vec::new();
     for _ in 0..config.shards {
@@ -327,11 +538,14 @@ impl SimRuntime {
     Ok(())
   }
 
-  /// Steps every shard until none has work, advancing virtual time to the earliest deadline
-  /// whenever all are idle. Returns the number of steps taken.
+  /// Steps every shard until none has work, advancing virtual time to the earliest deadline —
+  /// a shard's timer or a datagram's arrival on the fabric — whenever all are idle. Datagrams due by
+  /// the current time are handed over (and their receivers woken) before each pass, so a delayed
+  /// datagram is received exactly at its arrival time. Returns the number of steps taken.
   pub fn run_until_idle(&mut self) -> u64 {
     let mut steps = 0u64;
     loop {
+      sim_fabric_deliver_due(self.clock.now_ns());
       let mut any_work = false;
       let mut earliest: Option<u64> = None;
       for index in 0..self.shards.len() {
@@ -356,6 +570,10 @@ impl SimRuntime {
       }
       if any_work {
         continue;
+      }
+      // A datagram in flight is a pending event too: the clock may advance to its arrival.
+      if let Some(arrival) = sim_fabric_earliest_arrival() {
+        earliest = Some(earliest.map_or(arrival, |e| e.min(arrival)));
       }
       match earliest {
         Some(deadline) => {

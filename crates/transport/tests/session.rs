@@ -151,6 +151,9 @@ fn a_stream_flows_over_a_live_session() {
 #[test]
 fn a_request_gets_a_reply_over_a_live_session() {
   let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  // A modelled half-millisecond each way, so the round trip the estimator must report is a known one
+  // millisecond on the virtual clock rather than "some positive number" — an oracle, not a smoke test.
+  slates_rt::sim::sim_udp_set_delay(slates_rt::sim::SimDelay::in_order(HALF_MS_NS, 0));
   let id = sim.shard_ids()[0];
 
   let request: Vec<u8> = (0..250u16)
@@ -235,12 +238,126 @@ fn a_request_gets_a_reply_over_a_live_session() {
         reply, expected_reply,
         "the reply arrived over the live session"
       );
+      // The path is one millisecond round trip on the virtual clock; the server's handler yields a
+      // microsecond before replying, which the acknowledgement riding the reply carries into the sample.
       assert!(
-        smoothed_rtt > 0,
-        "the client estimated the round-trip time from the request's acknowledgement"
+        (2 * HALF_MS_NS..=2 * HALF_MS_NS + HANDLER_YIELD_NS * 2).contains(&smoothed_rtt),
+        "the client estimated the path's round trip on the runtime clock: {smoothed_rtt} ns"
       );
     }
     other => panic!("the request/reply did not complete: {other:?}"),
+  }
+}
+
+/// Shape: half a millisecond one way — a modelled path whose round trip is a known one millisecond.
+const HALF_MS_NS: u64 = 500_000;
+/// Shape: the microsecond the served handler yields before replying, the processing delay the sample
+/// legitimately carries.
+const HANDLER_YIELD_NS: u64 = 1_000;
+/// Shape: the one-way delay of a modelled inter-region path, 80 ms (see `docs/wip/wan-timeout.md`).
+const WAN_ONE_WAY_NS: u64 = 80_000_000;
+/// Shape: that path's jitter, ± 20 ms.
+const WAN_JITTER_NS: u64 = 20_000_000;
+/// Shape: the exchanges the client makes over the far path — enough for the estimate to settle past its
+/// seeded first sample, few enough to keep the run short.
+const WAN_EXCHANGES: usize = 6;
+
+/// AC (§4.10a §8; RFC 9002 §5.1): an endpoint's round-trip estimate measures the **path** on the clock its
+/// timers run on — the runtime's, which the simulation makes virtual — so over a modelled 80 ms ± 20 ms path
+/// the smoothed RTT settles inside the path's 120–200 ms round-trip band and the probe timeout it arms sits
+/// above it. Before this the samples came from the wall clock while the timeouts ran on the runtime clock:
+/// under simulation a 160 ms path measured as microseconds, arming a millisecond probe timeout that
+/// retransmitted every exchange several times before its real reply could arrive
+/// (`docs/bugs/2026-09-14-transport-rtt-sampled-on-the-wall-clock.md`).
+#[test]
+fn an_endpoint_measures_the_paths_round_trip_on_the_runtime_clock() {
+  let mut sim = SimRuntime::new(&config(), 3).unwrap();
+  slates_rt::sim::sim_udp_set_delay(slates_rt::sim::SimDelay::in_order(
+    WAN_ONE_WAY_NS,
+    WAN_JITTER_NS,
+  ));
+  let id = sim.shard_ids()[0];
+  let server_identity = self_signed(NAME);
+  let client_identity = self_signed(NAME);
+  let server_cert = server_identity.certificate();
+  let client_cert = client_identity.certificate();
+  let (server_port_tx, server_port_rx) = channel();
+  let (client_port_tx, client_port_rx) = channel();
+  let (result_tx, result_rx) = channel();
+
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = server_port_tx.send(socket.local_addr().unwrap().port());
+      let client_port = recv_port(client_port_rx).await;
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, client_port);
+      let mut server = Endpoint::server(
+        socket,
+        peer,
+        &server_identity,
+        std::slice::from_ref(&client_cert),
+        FRAME_CAP,
+      )
+      .unwrap();
+      server.establish().await.unwrap();
+      for _ in 0..WAN_EXCHANGES {
+        server.serve_once(|_, req| req).await.unwrap();
+      }
+    })
+    .unwrap();
+
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = client_port_tx.send(socket.local_addr().unwrap().port());
+      let server_port = recv_port(server_port_rx).await;
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+      let outcome = async {
+        let mut client = Endpoint::client(
+          socket,
+          peer,
+          &client_identity,
+          &server_cert,
+          NAME,
+          FRAME_CAP,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        client.establish().await.map_err(|e| format!("{e:?}"))?;
+        let mut exchange_times = Vec::with_capacity(WAN_EXCHANGES);
+        for _ in 0..WAN_EXCHANGES {
+          let started = slates_rt::futures::now_ns();
+          client
+            .request(STREAM_ID, b"far")
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+          exchange_times.push(slates_rt::futures::now_ns() - started);
+        }
+        Ok::<_, String>((client.smoothed_rtt(), client.pto(), exchange_times))
+      }
+      .await;
+      let _ = result_tx.send(outcome);
+    })
+    .unwrap();
+
+  sim.run_until_idle();
+
+  let band = 2 * (WAN_ONE_WAY_NS - WAN_JITTER_NS)..=2 * (WAN_ONE_WAY_NS + WAN_JITTER_NS);
+  match result_rx.try_recv() {
+    Ok(Ok((smoothed_rtt, pto, exchange_times))) => {
+      assert!(
+        exchange_times.iter().all(|elapsed| band.contains(elapsed)),
+        "every exchange took its round trip on the virtual clock: {exchange_times:?} ns"
+      );
+      assert!(
+        band.contains(&smoothed_rtt),
+        "the smoothed RTT settled inside the path's round-trip band: {smoothed_rtt} ns"
+      );
+      assert!(
+        pto > smoothed_rtt,
+        "the probe timeout sits above the estimate: pto {pto} ns, smoothed {smoothed_rtt} ns"
+      );
+    }
+    other => panic!("the exchanges over the far path did not complete: {other:?}"),
   }
 }
 

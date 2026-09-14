@@ -44,6 +44,7 @@ pub mod raft_wire;
 pub mod root_group;
 pub mod routing;
 pub mod swim;
+pub mod timing;
 
 use std::sync::mpsc::{TryRecvError, channel};
 
@@ -294,12 +295,27 @@ impl DispatchWait {
   }
 }
 
-/// What a dispatch task reports back to the owner's collection loop: a holder's reply bytes (empty if it
-/// refused) *and its endpoint returned boxed* (an endpoint is large), so the connection is reused across
-/// commits — its packet-number space stays continuous across a retry, RFC 9000 §12.3. The deadline is no
-/// longer a message: it is the collection loop's own progress-extension decision ([`DispatchWait`]), so a
-/// report is always a holder's reply.
-pub struct Reply(pub HostId, pub Vec<u8>, pub Box<Endpoint>);
+/// What one timed exchange produced ([`request_within`]): the peer's reply bytes — empty when it refused,
+/// the deadline won, or the transport failed — and the exchange's **round trip**: `Some(elapsed)` when the
+/// peer answered inside the deadline (a refusal included: it completed a round trip), `None` when the
+/// deadline won or the transport failed — Karn's rule, a timed-out exchange is no round-trip sample. The
+/// round trip is what the fleet's per-peer path estimate feeds on (`timing::PathRtt`, §4.8 "election
+/// timeout ≥ 10 × broadcast RTT p99"): a consensus round's replies, timely and late, each measure the
+/// path to the voter that answered.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TimedReply {
+  /// The reply bytes (empty on a refusal, a timeout, or a transport error).
+  pub bytes: Vec<u8>,
+  /// The exchange's round trip in nanoseconds when the peer answered inside the deadline.
+  pub round_trip_ns: Option<u64>,
+}
+
+/// What a dispatch task reports back to the owner's collection loop: a holder's timed reply (empty bytes
+/// if it refused; its round trip when it answered) *and its endpoint returned boxed* (an endpoint is
+/// large), so the connection is reused across commits — its packet-number space stays continuous across a
+/// retry, RFC 9000 §12.3. The deadline is no longer a message: it is the collection loop's own
+/// progress-extension decision ([`DispatchWait`]), so a report is always a holder's reply.
+pub struct Reply(pub HostId, pub TimedReply, pub Box<Endpoint>);
 
 /// The holder replies still in flight when a dispatch returned at quorum (or timed out): the receiving end
 /// of the dispatch's reply channel, kept open so each straggler task — bounded by the dispatch's full span
@@ -357,15 +373,16 @@ impl Stragglers {
   /// fold). Dropping such a reply at the round's progress-aware stop would cost a slow-but-live voter its
   /// acknowledgement every round — under sustained CPU starvation, forever. A record commit needs none of
   /// this (it re-ships idempotently) and uses `recover`. A straggler that timed out reports an empty reply
-  /// and still returns its session.
-  pub fn recover_replies(&mut self) -> (Vec<(HostId, Vec<u8>, Endpoint)>, bool) {
+  /// with no round trip and still returns its session; one that answered late reports its round trip,
+  /// the tail the path estimate must see.
+  pub fn recover_replies(&mut self) -> (Vec<(HostId, TimedReply, Endpoint)>, bool) {
     let mut recovered = Vec::new();
     let Some(replies) = self.replies.as_ref() else {
       return (recovered, true);
     };
     loop {
       match replies.try_recv() {
-        Ok(Reply(host, bytes, endpoint)) => recovered.push((host, bytes, *endpoint)),
+        Ok(Reply(host, reply, endpoint)) => recovered.push((host, reply, *endpoint)),
         Err(TryRecvError::Empty) => return (recovered, false),
         Err(TryRecvError::Disconnected) => {
           self.replies = None;
@@ -377,8 +394,9 @@ impl Stragglers {
 }
 
 /// Runs one request/reply on `endpoint` (its `request`), racing it against `deadline_ns`, and returns the
-/// reply bytes (empty on a timeout or a transport error) **together with the endpoint, kept whatever the
-/// outcome**. This is what lets a dispatch task *always* hand its holder's session back to the collection
+/// timed reply ([`TimedReply`]: the bytes, empty on a timeout or a transport error, and the round trip when
+/// the peer answered) **together with the endpoint, kept whatever the outcome**. This is what lets a
+/// dispatch task *always* hand its holder's session back to the collection
 /// loop — a straggler that never replies still returns its endpoint at the deadline rather than blocking
 /// until it is cancelled and its session dropped. A dropped session costs a fresh handshake to replace,
 /// so keeping it is what lets the caller retry a
@@ -393,7 +411,8 @@ pub async fn request_within(
   stream_id: u64,
   request: &[u8],
   deadline_ns: u64,
-) -> (Vec<u8>, Endpoint) {
+) -> (TimedReply, Endpoint) {
+  let sent_ns = now_ns();
   let reply = {
     let mut exchange = std::pin::pin!(endpoint.request(stream_id, request));
     let mut timer = std::pin::pin!(sleep(deadline_ns));
@@ -416,7 +435,93 @@ pub async fn request_within(
     // arriving on its own now-older stream id, is discarded below the next exchange's floor.
     endpoint.abandon_exchange();
   }
-  (reply.unwrap_or_default(), endpoint)
+  // The round trip is measured only for an exchange the peer answered (Karn's rule): a reply that came
+  // back is a sample of the path, however empty; a deadline or a transport error is not.
+  let round_trip_ns = reply.is_some().then(|| now_ns().saturating_sub(sent_ns));
+  (
+    TimedReply {
+      bytes: reply.unwrap_or_default(),
+      round_trip_ns,
+    },
+    endpoint,
+  )
+}
+
+/// Ships each `(host, request)` to that host on `stream` over its borrowed session, concurrently — one
+/// child task per session, each bounded by the budget's full span and handing its timed reply and endpoint
+/// back whatever the outcome ([`request_within`]) — and returns the replies that arrived before the round's
+/// progress-aware stop, each with its endpoint, **and the round's [`Stragglers`]**: the still-open reply
+/// channel through which every child not yet reported hands its reply and endpoint when it finishes. The
+/// caller records both as a dispatch it settles each period, so a slow or dead voter never serializes the
+/// reachable ones, and a slow-but-live one costs neither its session nor its reply. This is the
+/// configuration council's and root group's fan-out in the daemon (a heartbeat to a dead follower must not
+/// delay the live ones, so it is the same concurrent, session-preserving shape as a record commit,
+/// [`commit_record`]) and the fabric harness's (`tests/wan_election.rs`), so the two prove one shape. Each
+/// child is detached once the round returns, so a per-period round never accumulates task slots (banned
+/// item 8): a reported child is already terminal, and an unreported one finishes at [`request_within`]'s
+/// deadline and self-reaps, having reported through the channel.
+///
+/// Collects **progress-aware**, not to the flat deadline ([`DispatchWait`], the policy the record commit
+/// uses): a round is done when every child has reported, or when it has *stalled* — no new reply within the
+/// stall window. Decisive under a membership change: a dead voter that is still a voter until the council
+/// retires it never replies, and waiting the full extended deadline for it every period would stall the
+/// very retirement that removes it (`docs/bugs/2026-09-12-broadcast-waits-out-dead-voter.md`). The stop
+/// must also leave a round time for its **first** reply: with a one-period base deadline every reply of a
+/// round to voters more than three quarters of a period away was still in flight at the stop — and since
+/// a late pre-vote reply is dropped, no such council could elect
+/// (`docs/bugs/2026-09-14-consensus-round-expires-inside-the-wan-rtt.md`); the caller derives the budget's
+/// base from the measured path ([`timing::round_budget`]).
+pub async fn broadcast(
+  requests: Vec<(HostId, Vec<u8>, Endpoint)>,
+  stream: u64,
+  budget: CommitBudget,
+) -> (Vec<(HostId, TimedReply, Endpoint)>, Stragglers) {
+  if requests.is_empty() {
+    return (Vec::new(), Stragglers::none());
+  }
+  let deadline_ns = budget.max_deadline_ns();
+  let (tx, rx) = channel::<Reply>();
+  let mut tasks = Vec::new();
+  for (host, request, endpoint) in requests {
+    let tx = tx.clone();
+    if let Ok(task) = spawn_child(async move {
+      let (reply, endpoint) = request_within(endpoint, stream, &request, deadline_ns).await;
+      let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
+    }) {
+      tasks.push(task);
+    }
+    // A spawn failure drops the cloned `tx` and the moved endpoint: that voter yields no reply, stays
+    // outstanding on the caller's dispatch and is marked lost when it settles, and the channel still
+    // disconnects once the rest end.
+  }
+  drop(tx); // so the channel disconnects when the last child has reported
+  let mut replies = Vec::with_capacity(tasks.len());
+  let mut wait = DispatchWait::new(budget, now_ns());
+  let mut all_reported = false;
+  loop {
+    loop {
+      match rx.try_recv() {
+        Ok(Reply(host, reply, endpoint)) => replies.push((host, reply, *endpoint)),
+        Err(TryRecvError::Empty) => break,
+        Err(TryRecvError::Disconnected) => {
+          all_reported = true;
+          break;
+        }
+      }
+    }
+    if all_reported || !wait.keep_waiting(replies.len()).await {
+      break;
+    }
+  }
+  // A child that has not reported is a voter replying late, or timing out at its own deadline. Do **not**
+  // join it here — that would wait out the very deadline the progress-aware stop exists to avoid. Detach
+  // every child (a reported one is already terminal; an unreported one self-reaps at its deadline) and keep
+  // the channel open as the round's stragglers: the late reply and its endpoint arrive there, and the
+  // caller's settle folds the one and returns the other. Nothing is dropped, so nothing is orphaned.
+  for task in tasks {
+    let _ = detach(task);
+  }
+  (replies, Stragglers::pending(rx))
 }
 
 /// Whether `acked` (distinct candidates) commits under `quorum` for `candidates`.
@@ -466,7 +571,7 @@ pub(crate) async fn collect_bound(
     match rx.try_recv() {
       Ok(Reply(host, reply, endpoint)) => {
         reusable.push((host, *endpoint));
-        if candidates.contains(&host) && !acked.contains(&host) && binds(host, &reply) {
+        if candidates.contains(&host) && !acked.contains(&host) && binds(host, &reply.bytes) {
           acked.push(host);
           latencies_ns.push((host, now_ns().saturating_sub(dispatched_ns)));
         }
@@ -796,7 +901,7 @@ async fn collect_promises(
     match rx.try_recv() {
       Ok(Reply(host, reply, endpoint)) => {
         reusable.push((host, *endpoint));
-        if let Ok(promise) = Promise::decode(&reply)
+        if let Ok(promise) = Promise::decode(&reply.bytes)
           && promise.holder == host
           && promise.binds(prepare)
           && candidates.contains(&host)
@@ -1075,7 +1180,7 @@ async fn collect_ledger_promises(
     match rx.try_recv() {
       Ok(Reply(host, reply, endpoint)) => {
         reusable.push((host, *endpoint));
-        if let Ok(promise) = LedgerPromise::decode(&reply)
+        if let Ok(promise) = LedgerPromise::decode(&reply.bytes)
           && promise.holder == host
           && promise.binds(prepare)
           && candidates.contains(&host)
