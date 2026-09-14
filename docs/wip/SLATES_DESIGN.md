@@ -4269,6 +4269,8 @@ tool run) with wall time recorded.
 |---|---|---|---|
 | AC-9.7 | T-9.1 | Advertised release guarantees have end-to-end evidence on every offered transport. | Run the required POSIX/workload, hermeticity, pressure and failure suites through native, OCI and virtio-fs attachments; trace zero writes outside granted targets, check residency within each claimed boundary, and publish capability-specific results. A skipped lane or pure simulation cannot close its transport guarantee. |
 
+> **Status (AC-9.7, 2026-09-14).** Partially evidenced (`docs/wip/conformance.md`, the doc-truth matrix). Native macOS NFS: fsx and fsstress RAN and pass; workloads RAN and differ by declared limits (AppleDouble sidecars, SQLite WAL); pjdfstest LIMITED (unprivileged, unreviewed); hermeticity wired (strace/`fs_usage` parsers, the grant flow) but SKIPPED here for privilege. Linux: LIMITED adapter, first lane run pending. Windows, virtio-fs, OCI, pressure, failure: SKIPPED with typed reasons. No transport guarantee is closed.
+
 ### Dependency and ordering summary
 
 Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 5 → Phase 6 → Phase 7 → Phase 8 →

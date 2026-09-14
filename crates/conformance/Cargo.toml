@@ -1,0 +1,17 @@
+[package]
+name = "slates-conformance"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+description = "The conformance evidence library (design §4.6, Part 6 'Conformance', 'Real workloads' and hermeticity example 8; AC-9.7/T-9.1; GAP-A9-15): typed run records per (transport × suite), the doc-truth evidence matrix, the reviewed expected-failure list that only shrinks, and the pure parsers of pjdfstest TAP, fsx, fsstress, strace and fs_usage output. No I/O: the harness that mounts, runs and traces is `cargo xtask conformance`."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+
+[lints]
+workspace = true

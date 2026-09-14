@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "suite": "pjdfstest",
+  "transport": "native-macos-nfs",
+  "host": {
+    "os": "macOS 26.4.1 (25E253)",
+    "kernel": "Darwin 25.4.0",
+    "arch": "arm64",
+    "privilege": "unprivileged"
+  },
+  "date": "2026-09-14",
+  "command": "sh <each of 238 tests/**/*.t of pjd/pjdfstest@85a8aea> in a directory inside the mount; binary <scratch>/tools/pjdfstest-85a8aea9e685999ef0540392fd80535f873d7ff7/pjdfstest",
+  "bound": "every test file at the pinned commit (238 files), 300s per file",
+  "outcome": {
+    "kind": "limited",
+    "adapter": "a non-root run",
+    "not_covered": "2007 cases that switch uid/gid or require root, counted as needs-root rather than run",
+    "counts": {
+      "suite": "pjdfstest",
+      "files": 238,
+      "cases": 8686,
+      "passed": 3348,
+      "failed": 3331,
+      "needs_root": 2007,
+      "todo": 0,
+      "expected_failures": 0,
+      "unexpected_failures": 3331,
+      "listed_now_passing": 0
+    }
+  },
+  "expected_failure_list": {
+    "path": "docs/wip/conformance/expected-failures/native-macos-nfs.unprivileged.pjdfstest.txt",
+    "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "entries": 0
+  },
+  "duration_ms": 214348,
+  "notes": [
+    "pjdfstest: pjd/pjdfstest@85a8aea (BSD-2-Clause), tarball sha256 2005cdd83b76204177cf136792b1f2058a7418b4fc5b203f51274a698547d754, built `cc -O2 -w -I. pjdfstest.c` over a config.h the harness probed (HAVE_: CHFLAGS FACCESSAT FCHFLAGS FCHMODAT FCHOWNAT FSTATAT LCHFLAGS LCHMOD LINKAT MKDIRAT MKFIFOAT MKNODAT OPENAT READLINKAT RENAMEAT SYMLINKAT UTIMENSAT STRUCT_STAT_ST_ATIMESPEC STRUCT_STAT_ST_BIRTHTIME STRUCT_STAT_ST_BIRTHTIMESPEC STRUCT_STAT_ST_CTIMESPEC STRUCT_STAT_ST_MTIMESPEC)",
+    "0 expected failures; 3331 unlisted failures (tests/chmod/00.t:22, tests/chmod/00.t:23, tests/chmod/00.t:24, tests/chmod/00.t:26, tests/chmod/00.t:27, tests/chmod/00.t:28, tests/chmod/00.t:31, tests/chmod/00.t:33 … and 3323 more); 0 listed now passing; 0 listed absent"
+  ]
+}

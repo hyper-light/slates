@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "suite": "fsx",
+  "transport": "native-windows-winfsp",
+  "host": {
+    "os": "macOS 26.4.1 (25E253)",
+    "kernel": "Darwin 25.4.0",
+    "arch": "arm64",
+    "privilege": "unprivileged"
+  },
+  "date": "2026-09-14",
+  "command": "",
+  "bound": "",
+  "outcome": {
+    "kind": "skipped",
+    "reason": {
+      "kind": "owed",
+      "reason": "the WinFsp fsx port (Phase 4 task 5) is not wired into the harness, and the harness has no WinFsp mount step"
+    }
+  },
+  "expected_failure_list": null,
+  "duration_ms": 0,
+  "notes": []
+}

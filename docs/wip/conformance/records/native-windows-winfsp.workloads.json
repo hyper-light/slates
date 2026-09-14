@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "suite": "workloads",
+  "transport": "native-windows-winfsp",
+  "host": {
+    "os": "macOS 26.4.1 (25E253)",
+    "kernel": "Darwin 25.4.0",
+    "arch": "arm64",
+    "privilege": "unprivileged"
+  },
+  "date": "2026-09-14",
+  "command": "",
+  "bound": "",
+  "outcome": {
+    "kind": "skipped",
+    "reason": {
+      "kind": "owed",
+      "reason": "the harness has no WinFsp mount step; the live WinFsp mount test (crates/bridge-winfsp/tests/mount.rs, gated WINFSP_TEST_MOUNT=1 on windows-latest) proves create/write/read/list/delete through the kernel and nothing more"
+    }
+  },
+  "expected_failure_list": null,
+  "duration_ms": 0,
+  "notes": []
+}

@@ -14,6 +14,17 @@ serde_json = { workspace = true }
 slates-machine = { workspace = true }
 # ratchets.toml is read and rewritten by the ratchet task.
 toml = { workspace = true }
+# The conformance harness: the pure records, parsers and matrix live in the crate; this tool
+# mounts, runs and traces (docs/wip/conformance.md).
+slates-conformance = { workspace = true }
+# The pinned upstream suite sources are verified by SHA-256 before they are built.
+sha2 = { workspace = true }
+# The workload manifests digest every file with BLAKE3.
+blake3 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# The Linux grant path reopens the anchor's memfd handoff and makes it inheritable.
+rustix = { workspace = true }
 
 # xtask is a development tool, not shipped code: it reads sources and runs cargo, so the
 # workspace lints that forbid std::fs and panics are relaxed here, with the reasons in main.rs.

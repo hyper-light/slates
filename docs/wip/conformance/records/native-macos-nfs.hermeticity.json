@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "suite": "hermeticity",
+  "transport": "native-macos-nfs",
+  "host": {
+    "os": "macOS 26.4.1 (25E253)",
+    "kernel": "Darwin 25.4.0",
+    "arch": "arm64",
+    "privilege": "unprivileged"
+  },
+  "date": "2026-09-14",
+  "command": "",
+  "bound": "",
+  "outcome": {
+    "kind": "skipped",
+    "reason": {
+      "kind": "privilege",
+      "reason": "fs_usage needs root for the kernel tracing facility it uses (its manual); macOS has no unprivileged filesystem-write tracer; this host has no passwordless sudo (`sudo -n true` was refused)"
+    }
+  },
+  "expected_failure_list": null,
+  "duration_ms": 0,
+  "notes": []
+}

@@ -1438,6 +1438,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-conformance"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "slates-db"
 version = "0.1.0"
 dependencies = [
@@ -2209,8 +2218,12 @@ dependencies = [
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "rustix",
  "serde",
  "serde_json",
+ "sha2",
+ "slates-conformance",
  "slates-machine",
  "toml 0.8.23",
 ]
