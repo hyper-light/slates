@@ -121,6 +121,9 @@ fn a_killed_client_is_reclaimed_and_its_lease_expires_by_its_term() {
     },
   )
   .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let mut observer = Client::connect(&instance, deadlines()).unwrap();
   let volume = observer
     .create(&slates_client::CreateSpec {

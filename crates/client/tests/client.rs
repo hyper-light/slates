@@ -158,6 +158,9 @@ fn the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed() {
     },
   )
   .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let mut client = connect(&instance);
   let id = create_snapshot_clone(&mut client);
   attach_status_detach(&mut client, id);
@@ -282,6 +285,9 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
     }
   };
   let first = Daemon::start(&profile, config.clone(), source()).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let mut client = connect(&instance);
   let kept = client.create(&scratch("kept")).unwrap();
   let create_id = client.last_request();
@@ -290,6 +296,9 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
   let session = client.session();
   first.stop();
   let second = Daemon::start(&profile, config, source()).unwrap();
+  second
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   assert_served_after_restart(&mut client, kept, session, snapshot);
   assert_retry_meets_record(&mut client, kept, create_id);
   // New work continues under the session's sequence.
@@ -367,12 +376,18 @@ fn a_green_chain_survives_a_daemon_restart() {
     }
   };
   let first = Daemon::start(&profile, config.clone(), source()).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let mut client = connect(&instance);
   let green = client.create_green("g", false).unwrap();
   seed_green_two_versions(&mut client, green);
   first.stop();
 
   let second = Daemon::start(&profile, config, source()).unwrap();
+  second
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   assert_green_recovered(&mut client, green);
   second.stop();
   drop(segment);
@@ -510,11 +525,17 @@ fn a_base_seeded_greens_origin_survives_a_daemon_restart() {
   };
   let dir = host_dir_with_file();
   let first = Daemon::start(&profile, config.clone(), source()).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let mut client = connect(&instance);
   let green = seed_green_over_base(&mut client, &dir.path);
   first.stop();
 
   let second = Daemon::start(&profile, config, source()).unwrap();
+  second
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   assert_origin_recovered(&mut client, green);
   second.stop();
   drop(segment);

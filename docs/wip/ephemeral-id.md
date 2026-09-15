@@ -1,5 +1,10 @@
 # Ephemeral member id — learn-on-contact (task #22)
 
+> Superseded on 2026-09-14 by [AUD-07](../bugs/2026-09-14-raft-voter-state-loss.md): the stable
+> anchor still authenticates contact, but a random per-start nonce replaces the supervision counter.
+> Manifest seeds never vote. Fresh members import the common prefix once, then join by consensus.
+> The text below records the earlier implementation and its evidence.
+
 Status 2026-09-13. Design: §4.8 "Recovery" — *"the node rejoins with a new ephemeral id (a restart is a
 join) and holds nothing for others until re-replication fills it; its owned objects are taken over by its
 neighbours"* (line 1851) and *"a restarted host rejoins as a new member and holds nothing until its generation

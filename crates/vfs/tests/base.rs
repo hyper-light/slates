@@ -82,6 +82,17 @@ fn populate(host: &mut SimHost, dirs: usize, files: usize) {
   }
 }
 
+/// AC-2.12 / T-2.14, AUD-05: image an overlay before its first lookup. The unwitnessed base
+/// must not disappear into an apparently complete empty recovery image.
+#[test]
+fn an_unvisited_overlay_cannot_publish_an_empty_recovery_image() {
+  let mut host = SimHost::new();
+  host.replace_file("/unvisited", b"must not disappear");
+  let mut store = store();
+  let vol = overlay(&mut host, &mut store);
+  assert_eq!(vol.to_image(&store), Err(VfsError::RecoveryIncomplete));
+}
+
 /// AC (§4.8): an overlay whose base has been touched holds a base-backed inode, which the recovery
 /// image cannot yet capture (base recovery is its own gate), so `to_image` refuses it with
 /// `RecoveryIncomplete` — while a scratch volume in the same store images fine. This is the failure a

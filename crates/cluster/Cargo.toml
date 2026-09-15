@@ -11,6 +11,8 @@ description = "The cluster plane (§4.8, D-14): the asynchronous dispatch that s
 [dependencies]
 # db owns synchronous acceptance and the register protocol (Record, Acceptor, Placement, Quorum).
 slates-db = { workspace = true }
+# Canonical encoding of consensus state transferred to fresh members (§4.8, AUD-07).
+slates-wire = { workspace = true }
 # the transport carries the authenticated request/reply the records ride.
 slates-transport = { workspace = true }
 # the runtime: bounded-concurrency dispatch (spawn/cancel) and the commit deadline (sleep).

@@ -942,6 +942,14 @@ Ownership: a task belongs to one shard for its whole life; a `Waker` is a `Copy`
 `clone`/`drop` are no-ops and `wake` from another shard enqueues (slot, generation) on the target's
 ring and kicks the driver; a stale generation is ignored.
 
+> **Status (2026-09-14, AUD-04/AUD-17).** Cross-shard calls own their pending registrations;
+> completion, timeout and cancellation release them on the owning thread. NFS uses that same call
+> with the existing liveness budget. Root listings share one deadline and refuse if any shard is
+> missing. Simulated request-arena and reply-arena exhaustion both return RPC system errors.
+> Attestation and revocation tasks are admitted directly on their existing shard, so admission
+> refusal is observed before the caller starts waiting. Evidence: the audit follow-up records the
+> failing regressions and the 71-test server unit run.
+
 **Loop.** Each iteration: drain the driver's completions (io_uring CQ / kqueue events / IOCP
 packets) into the run queue; drain inbound rings (client command rings, cross-shard rings, the
 bridge queue) up to a batch bound derived from the measured service time and the latency budget;
@@ -1385,6 +1393,12 @@ the verdict that every entry beneath still matches its listing fingerprint.
 > coverage (server-visible against client-flushed) and the writeback flush (`FUSE_NOTIFY_RETRIEVE`), the
 > owner fields of base entries (they report uid/gid 0), a ready-device attachment binding on the wire,
 > and `RENAME_EXCHANGE`. Record: `docs/wip/base-fuse.md`.
+
+> **Status (2026-09-14, AUD-03).** All three NFS receive loops use incremental record marking.
+> Payload and fragment count are independently bounded; the latter allows one fragment per maximum
+> payload byte plus an empty terminal marker. Consumed stream prefixes are discarded, so empty
+> fragments cannot grow a connection buffer or trigger repeated prefix scans. Fourteen wire tests
+> pass, including the previously failing empty-fragment attack and maximum byte fragmentation.
 
 **Role.** Present the root mount and every attached volume to the kernel; translate kernel
 requests into shard operations by handle; emit invalidations; read base files for overlay
@@ -1842,6 +1856,64 @@ struct Configuration /* consensus-replicated, one per region; a root group holds
                    host_epochs: Art<HostId, u64>, takeovers: Art<HostId, Takeover>, homes: Art<VolumeId, Region> /* moved volumes only */ }
 struct Neighbourhood { hosts: SmallVec<HostId> /* the scatter width S, across failure domains */, generation: u64 }
 ```
+> **Status (2026-09-14, AUD-10/AUD-12).** Record and takeover-prepare senders are bound to the
+> TLS-authenticated member before changing a fence or routing. `Acceptor::check` validates authority,
+> epoch and accepted position without mutation; merge holders run it before recomputation in the
+> same shard turn. A conflicting position no longer raises the promise as a side effect of refusal.
+> Database unit tests: 34 passed; daemon regressions cover forged records, forged prepares, stale
+> merge epochs and foreign generations. Raft restart and owner read leases remain open.
+
+> **Status (2026-09-14, AUD-05/AUD-09).** A recovery publication names the volumes actually
+> captured. Missing storage, an omitted touched volume or a refused image cannot produce a successful
+> control completion or stable NFS reply. The image format does not carry base witnesses and handles:
+> even an unvisited overlay refuses imaging, and recovery refuses missing images or base-dependent
+> volumes instead of rebuilding empty or reopening a changed path. Scratch-content and snapshot
+> restart remains byte-identical in the existing oracle. Overlay recovery remains owed.
+> The Raft core now requires a fresh context for each ReadIndex round, echoed by a quorum of distinct
+> current voters after a current-term commit; old contacts and earlier read replies cannot confirm it.
+> Leadership or configuration changes cancel the round. The append wire format carries the context.
+> This does not provide the separate service owner-lease gate (AUD-08).
+
+> **Status (2026-09-14, AUD-07; supersedes the counter-derived identity claims above).**
+> Every daemon start now has a random boot nonce and a fresh member id. Both configuration groups
+> start uninitialized; manifest seed ids never vote. Explicit local-account bootstrap names the
+> current member, so retrying across RAM loss refuses. A replacement imports the original group
+> base and retained prefix once and joins through joint consensus. Raft messages bind both their
+> immutable group and authenticated sender. The two-vote regression, 143 cluster tests and
+> 77 server unit tests pass; a three-voter replacement followed by a second loss commits in 9.81 s.
+> The stricter formation fixture also found an inherited-tail stall: both groups now append a
+> current-term election no-op, and a retiring leader continues driving until its removal commits.
+> [Exact commands and limitations](../bugs/2026-09-14-raft-voter-state-loss.md).
+
+**Consensus lifetime (AUD-07).** A node may reuse a voting identity only with its complete term,
+vote, log, snapshot and configuration retained. The live daemon currently retains none of that
+state across process restarts, so every restart uses a fresh identity, including when its anchor
+retains volume data. New members cannot vote or campaign before initialization. Join transfers
+the original application base and validated consensus prefix once; later fetches cannot erase
+votes. Ordinary startup cannot create a group. Explicit bootstrap is bound to the observed boot
+and cannot replace an initialized group. Separate group genesis identities never exchange Raft
+state. Both regional and root groups follow this rule, as does N=1.
+An initialized learner keeps a fetched read view separate from its Raft fold, so catching up
+cannot apply a takeover or home change twice. The view is dropped when replay reaches its version.
+Bootstrap installs the current durability-policy result on every shard. Its loss calculation
+counts at most the admitted hosts as copies and includes single-copy loss, so missing peers
+cannot make a newly bootstrapped group appear protected.
+
+Discovery and admission are deployment-independent (R8): local processes, bare-metal hosts, VMs
+and Kubernetes use the same protocol. Address discovery supplies candidates, authentication verifies
+identity, and Raft commits voting membership. Configured DNS peers are resolved on each fresh dial
+and join automatically after initial bootstrap. The current implementation pins the manifest's
+roster; discovery and trust enrollment of previously unlisted nodes remain unimplemented. No
+discovery answer, local absence of peers, or timeout authorizes an empty voting group.
+
+A surviving quorum is required independently for each group. No timeout, deployment manifest or
+session rejoin grants permission to reconstruct an empty voting group. Quorum-loss recovery is
+an explicit operator action with possible data loss; a new group is not recovery of the previous
+one. The current one-representative-per-region root has no voter redundancy within a single
+region. Preserving its state across warm restarts and providing complete compacted-state transfer
+remain owed. Live joins presently transfer whole retained logs; complete-message quotas remain in GAP-A9-11. The wrappers
+refuse snapshots because they do not yet publish a matching compacted application base.
+
 Ownership facts: a partition has one writer, its shard; a register has one legal writer, the
 owner host, under its current host epoch; a holder accepts a record or a content put only when
 its epoch is at least the highest it has seen for that host; the configuration is written only
@@ -2280,6 +2352,12 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 > attempt (`hedge_targets`); and a progress witness reported "progressing" for a stall window after
 > birth with nothing observed, granting a zero-acknowledgement round its extension — it now advances
 > only on a real advance (`docs/bugs/2026-09-13-hedge-keyed-on-placed-round-count-never-widens.md`).
+
+> **Status (2026-09-14, AUD-18).** Confirmation now shares one absolute deadline derived from
+> the initial PTO and existing retransmit ceiling, and one invalid-packet work budget derived from
+> the handshake fragment bound. Traffic cannot refresh either budget. Both endpoints refuse a flood
+> or paced invalid packets; the 12 simulated session tests still pass.
+
 
 ### 4.11 Compression, deduplication, hashing, archive (D-17)
 
@@ -2975,6 +3053,19 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 > (a work is not a VFS volume; the VFS journal as the one declaration path, the bridge's `EROFS`), the
 > extent-backed green chain, cooperative slicing of the origin seed, pipelined and hedged merge records,
 > green takeover and a late holder's catch-up.
+
+> **Status (2026-09-14, AUD-12).** Merge holders validate authenticated ownership, generation,
+> epoch, position and sequence/version agreement before recomputing. An unauthorized origin used
+> to publish a readable replica despite returning no acknowledgement; the regression now leaves no
+> replica, and stale or foreign-generation records cannot poison the green. This change does not
+> close the separate submit-commit, replica-progress, bounded-retention or takeover findings.
+
+> **Status (2026-09-14, AUD-13).** Replication selects the first missing version independently
+> for each holder from an ordered debt index. A silent candidate cannot keep the available quorum
+> at its old position; each holder still receives a contiguous chain. Input placement at quorum keeps
+> the remaining holders' input debt, so their catch-up transfers inputs before records. Selecting
+> work reads one position per holder rather than rescanning the retained chain. Transfer to a new
+> candidate set and full green takeover remain owed (AUD-14).
 
 **Role.** Let many agents work on clones of one shared volume and fold their work back into it
 with no locks, no last-writer-wins, and no inferred merge. Each agent's work becomes an
@@ -4917,3 +5008,18 @@ Applied in the same change to: §2.4, §4.12 (status), GAPS §1 (SDK publishing)
 - Evidence: the unscoped `slates` on npm is an unrelated package (`slates@1.0.0-rc.23`; registry read 2026-09-14), so the earlier `package.json` name could never publish; `@hyper-light/*` is the organization's scope (`@hyper-light/vorpal-node`, maintainer `adalundhe`); `@slates/sdk` would need a `slates` organization whose availability could not be verified from here (npmjs.com refuses unauthenticated probes with 403). PyPI `slates` was free (404 on 2026-09-14), so the Python name stands.
 - Consequence: the binary packages are `@hyper-light/slates-<platform>` for the nine `napi.targets`; every copy of the name and the version is derived from the main package's `name` and the workspace version by `cargo xtask version --write`, and refused on drift by `cargo xtask version` (in `cargo xtask check`, CI, and the tag guard). The loader reads the name from its own manifest.
 - What it does not change: the SDK surface, R10 (neither SDK has a grant verb), the wire, the Python package.
+
+### A-18 (2026-09-14) — Fresh voter identity whenever live Raft state is lost
+
+Applied in the same change to: §4.8 (lifetime and status), GAPS, the AUD-07 report, deployment
+instructions, `cluster/{raft,config_group,root_group,raft_wire,swim}`, `server/{daemon,state,deploy,
+fleet,consensus,verbs,nfs}`, `ipc/protocol`, `cli/{args,verbs}`, and affected startup fixtures.
+
+- Authorization: Ada requested the separate audit issue of unsafe Raft voter reuse after RAM loss
+  be fixed. The session-retirement fix does not satisfy consensus safety.
+- Evidence: Ongaro's dissertation §3.8; the actual daemon identity granted two candidates votes
+  in term 7 before the fix (1.61 s red). The replacement/admission/second-loss history is green
+  in 9.81 s; commands and machine are in the dated bug report.
+- Consequence: the random per-start identity replaces the resettable counter. Common-prefix join
+  and explicit boot-bound bootstrap replace manifest-derived empty voting groups. Warm consensus
+  retention is not implemented; quorum loss stays unavailable. Rules R1–R10 remain unchanged.

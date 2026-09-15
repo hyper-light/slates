@@ -134,6 +134,8 @@ class SlatesSdkRoundTrip(unittest.TestCase):
         )
         try:
             client = _connect_when_ready(instance)
+            subprocess.run([binary, "--instance", instance, "bootstrap", "root"],
+                           check=True, timeout=STARTUP_SECS)
 
             # create → a 32-hex volume id.
             volume = client.create("sdk-roundtrip", VOLUME_BYTES)

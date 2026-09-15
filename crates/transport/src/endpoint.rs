@@ -734,18 +734,32 @@ impl Endpoint {
     let mut buf = [0u8; DATAGRAM_BYTES];
     let mut retransmits = 0u32;
     let mut backoff = GRANULARITY_NS;
+    let deadline = self.confirmation_deadline();
+    let mut invalid = 0usize;
     loop {
-      let period = backoff.min(self.handshake_probe_ceiling());
+      let remaining = deadline.saturating_sub(slates_rt::futures::now_ns());
+      if remaining == 0 {
+        return Err(EndpointError::NotReady);
+      }
+      let period = backoff.min(self.handshake_probe_ceiling()).min(remaining);
       match self.recv_within(&mut buf, period).await? {
-        Some((n, _)) => {
+        Some((n, from)) => {
           // A packet that unprotects under the 1-RTT keys is the server's confirmation: it has its keys,
           // so it received our final flight, and the handshake is complete both ways.
-          if self.ingest(&buf[..n]).is_ok() {
+          if from == self.peer && self.ingest(&buf[..n]).is_ok() {
             return Ok(());
           }
+          invalid += 1;
+          self.discarded = self.discarded.saturating_add(1);
+          if invalid > MAX_PARTIAL_FRAGMENTS_PER_TURN {
+            return Err(EndpointError::NotReady);
+          }
+          if from != self.peer {
+            continue;
+          }
           // Otherwise a raw handshake retransmit (the server has not seen our final flight yet): resend
-          // it at once. A received datagram is progress — the peer is alive and still asking — so it does
-          // not count toward the give-up budget, which counts only silent timeouts.
+          // it at once. Every invalid datagram consumes the independent work budget above; neither
+          // traffic nor retransmission resets the absolute confirmation deadline.
           self.resend_flight(last_flight)?;
         }
         None => {
@@ -776,22 +790,36 @@ impl Endpoint {
   /// 160 ms path — once the estimate measured the path rather than the wall clock — it cost every
   /// session's first exchange one probe timeout, measured 429 ms against the path's 160 ms (2026-09-14,
   /// `docs/bugs/2026-09-14-transport-rtt-sampled-on-the-wall-clock.md`). Bounded overall by
-  /// `MAX_HANDSHAKE_RETRANSMITS` silent timeouts (banned item 8).
+  /// the absolute retry-time budget and the partial-fragment work budget (banned item 8).
   async fn confirm_as_server(&mut self) -> Result<(), EndpointError> {
     let mut buf = [0u8; DATAGRAM_BYTES];
     self.send_confirm()?;
     let mut silent = 0u32;
     let mut backoff = GRANULARITY_NS;
+    let deadline = self.confirmation_deadline();
+    let mut invalid = 0usize;
     loop {
-      let period = backoff.min(self.handshake_probe_ceiling());
+      let remaining = deadline.saturating_sub(slates_rt::futures::now_ns());
+      if remaining == 0 {
+        return Err(EndpointError::NotReady);
+      }
+      let period = backoff.min(self.handshake_probe_ceiling()).min(remaining);
       match self.recv_within(&mut buf, period).await? {
-        Some((n, _)) => {
+        Some((n, from)) => {
           // A datagram that unprotects under the 1-RTT keys is the client's own application traffic — it
           // has our confirmation and moved on, so the handshake is done. Ingest it, so the receive the
           // caller runs next finds it already in the connection rather than waiting a probe timeout for
           // the client's retransmit of it.
-          if self.ingest(&buf[..n]).is_ok() {
+          if from == self.peer && self.ingest(&buf[..n]).is_ok() {
             return Ok(());
+          }
+          invalid += 1;
+          self.discarded = self.discarded.saturating_add(1);
+          if invalid > MAX_PARTIAL_FRAGMENTS_PER_TURN {
+            return Err(EndpointError::NotReady);
+          }
+          if from != self.peer {
+            continue;
           }
           // A raw handshake retransmit: the client has not heard our confirmation. Resend it, and reset
           // the silence and its backoff — the client is still here and asking.
@@ -815,6 +843,16 @@ impl Endpoint {
         }
       }
     }
+  }
+
+  /// Derived: confirmation permits at most the existing retry count plus the first attempt,
+  /// each no longer than the initial PTO. Traffic cannot renew that absolute budget (AUD-18).
+  fn confirmation_deadline(&self) -> u64 {
+    slates_rt::futures::now_ns().saturating_add(
+      self
+        .handshake_probe_ceiling()
+        .saturating_mul(u64::from(MAX_HANDSHAKE_RETRANSMITS) + 1),
+    )
   }
 
   /// Sends one 1-RTT handshake-confirmation packet to the peer (see [`Connection::emit_confirm`]): a
@@ -1436,6 +1474,116 @@ mod tests {
       }
     }
     (client_keys.unwrap(), server_keys.unwrap())
+  }
+
+  /// T-0.3, §4.10a bounded handshakes; AUD-18: after TLS finishes, a peer sends only invalid
+  /// packets throughout confirmation. Neither endpoint may keep waiting because traffic is arriving.
+  #[test]
+  fn invalid_traffic_cannot_keep_handshake_confirmation_alive() {
+    use rustix::net::Ipv4Addr;
+    for (client_confirms, paced) in [(false, false), (true, false), (false, true), (true, true)] {
+      let mut runtime = slates_rt::sim::SimRuntime::new(
+        &slates_rt::runtime::RuntimeConfig {
+          shards: 1,
+          tasks_per_shard: 8,
+          timers_per_shard: 8,
+          ring_entries: 8,
+          step_budget_ns: 1_000_000_000,
+          timer_tick_ns: 100_000,
+          batch: 8,
+          pin: false,
+          cores: Vec::new(),
+          page_bytes: 4096,
+          spin_ns: 0,
+        },
+        18,
+      )
+      .unwrap();
+      let shard = runtime.shard_ids()[0];
+      let (sent, received) = std::sync::mpsc::sync_channel(1);
+      runtime
+        .spawn_on(shard, async move {
+          let identity = self_signed("slates-node");
+          let client_socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+          let server_socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+          let client_address = client_socket.local_addr().unwrap();
+          let mut client = Endpoint::client(
+            client_socket,
+            server_socket.local_addr().unwrap(),
+            &identity,
+            &identity.certificate(),
+            "slates-node",
+            MIN_DATAGRAM_BYTES,
+          )
+          .unwrap();
+          let mut server = Endpoint::server(
+            server_socket,
+            client_address,
+            &identity,
+            &[identity.certificate()],
+            MIN_DATAGRAM_BYTES,
+          )
+          .unwrap();
+          // Run the real TLS state machine synchronously to isolate confirmation from flight delivery.
+          for _ in 0..HANDSHAKE_TURN_CEILING {
+            let to_server = client.drain_handshake();
+            if !to_server.is_empty() {
+              server.quic.read_hs(&to_server).unwrap();
+            }
+            let to_client = server.drain_handshake();
+            if !to_client.is_empty() {
+              client.quic.read_hs(&to_client).unwrap();
+            }
+            if client.keys.is_some()
+              && server.keys.is_some()
+              && !client.quic.is_handshaking()
+              && !server.quic.is_handshaking()
+            {
+              break;
+            }
+          }
+          assert!(client.keys.is_some() && server.keys.is_some());
+          let (mut receiver, sender) = if client_confirms {
+            (client, server)
+          } else {
+            (server, client)
+          };
+          let interval = receiver.handshake_probe_ceiling() / 2;
+          let mut confirmation = std::pin::pin!(receiver.confirm_handshake(&[]));
+          // Every received datagram provokes another. Bound the fixture itself so the pre-fix failure
+          // is a fast assertion, never an infinite test. Confirmation must refuse before this count.
+          let count = MAX_PARTIAL_FRAGMENTS_PER_TURN + 1;
+          let mut result = None;
+          for _ in 0..count {
+            sender.send(&[0]).unwrap();
+            if paced {
+              slates_rt::futures::sleep(interval).await;
+            } else {
+              slates_rt::futures::yield_now().await;
+            }
+            result = std::future::poll_fn(|cx| {
+              Poll::Ready(match confirmation.as_mut().poll(cx) {
+                Poll::Ready(result) => Some(result),
+                Poll::Pending => None,
+              })
+            })
+            .await;
+            if result.is_some() {
+              break;
+            }
+          }
+          sent
+            .try_send(result.map(|result| matches!(result, Err(EndpointError::NotReady))))
+            .unwrap();
+        })
+        .unwrap();
+      runtime.run_until_idle();
+      assert_eq!(
+        received.try_recv().unwrap(),
+        Some(true),
+        "confirmation stayed alive; client: {client_confirms}, paced: {paced}"
+      );
+    }
   }
 
   /// The connection id the packet tests use — any eight bytes; the exporter derivation is tested on its

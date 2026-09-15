@@ -127,25 +127,70 @@ fn skip_auth(reader: &mut XdrReader<'_>) -> Result<(), RpcError> {
 /// the number of stream bytes it consumed. `Incomplete` means the stream does not yet hold the whole
 /// record (wait for more bytes); a fragment claiming more than the message cap is refused.
 pub fn read_record(bytes: &[u8]) -> Result<(Vec<u8>, usize), RpcError> {
-  let mut message = Vec::new();
-  let mut pos = 0usize;
-  loop {
-    let header = bytes
-      .get(pos..pos + size_of::<u32>())
-      .ok_or(RpcError::Incomplete)?;
-    let marker = u32::from_be_bytes(header.try_into().map_err(|_| RpcError::Malformed)?);
-    let last = marker & LAST_FRAGMENT != 0;
-    let len = usize::try_from(marker & FRAGMENT_LEN_MASK).unwrap_or(usize::MAX);
-    if len > MAX_MESSAGE || message.len().saturating_add(len) > MAX_MESSAGE {
-      return Err(RpcError::RecordTooLarge);
+  let (message, consumed) = RecordReader::default().read(bytes)?;
+  message
+    .map(|message| (message, consumed))
+    .ok_or(RpcError::Incomplete)
+}
+
+/// Derived: one fragment per allowed payload byte plus a possibly empty terminal fragment. This
+/// admits maximal byte fragmentation while bounding empty fragments independently of payload (AUD-03).
+const MAX_FRAGMENTS: usize = MAX_MESSAGE + 1;
+
+/// Incremental record marking (§4.6): each framing byte is examined once, including across TCP reads.
+/// Payload and fragment count have independent bounds; consumed bytes may be discarded immediately.
+#[derive(Default)]
+pub struct RecordReader {
+  marker: [u8; size_of::<u32>()],
+  marker_bytes: usize,
+  remaining: usize,
+  last: bool,
+  fragments: usize,
+  message: Vec<u8>,
+}
+
+impl RecordReader {
+  /// Consumes up to one complete message and returns the consumed prefix length. `None` asks for
+  /// more bytes without retaining the consumed stream prefix. Bytes after a completed record belong
+  /// to the next call. Refusal terminates the stream; no further input may be fed to that reader.
+  pub fn read(&mut self, bytes: &[u8]) -> Result<(Option<Vec<u8>>, usize), RpcError> {
+    let mut consumed = 0;
+    while consumed < bytes.len() {
+      if self.marker_bytes < self.marker.len() {
+        let count = (self.marker.len() - self.marker_bytes).min(bytes.len() - consumed);
+        self.marker[self.marker_bytes..self.marker_bytes + count]
+          .copy_from_slice(&bytes[consumed..consumed + count]);
+        self.marker_bytes += count;
+        consumed += count;
+        if self.marker_bytes < self.marker.len() {
+          break;
+        }
+        let marker = u32::from_be_bytes(self.marker);
+        self.remaining =
+          usize::try_from(marker & FRAGMENT_LEN_MASK).map_err(|_| RpcError::RecordTooLarge)?;
+        self.last = marker & LAST_FRAGMENT != 0;
+        if self.fragments == MAX_FRAGMENTS
+          || self.remaining > MAX_MESSAGE.saturating_sub(self.message.len())
+        {
+          return Err(RpcError::RecordTooLarge);
+        }
+        self.fragments += 1;
+      }
+      let count = self.remaining.min(bytes.len() - consumed);
+      self
+        .message
+        .extend_from_slice(&bytes[consumed..consumed + count]);
+      consumed += count;
+      self.remaining -= count;
+      if self.remaining == 0 {
+        self.marker_bytes = 0;
+        if self.last {
+          self.fragments = 0;
+          return Ok((Some(std::mem::take(&mut self.message)), consumed));
+        }
+      }
     }
-    let start = pos + size_of::<u32>();
-    let fragment = bytes.get(start..start + len).ok_or(RpcError::Incomplete)?;
-    message.extend_from_slice(fragment);
-    pos = start + len;
-    if last {
-      return Ok((message, pos));
-    }
+    Ok((None, consumed))
   }
 }
 

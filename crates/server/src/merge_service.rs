@@ -66,7 +66,7 @@ pub struct MergeShardState {
   /// The merge records this owner shard still owes its candidate holders, by green then version
   /// (§4.16 "Commit"): each waits for its inputs to place, then ships in order. Bounded by the
   /// chain (one entry per committed version not yet held everywhere; empty at `f = 0`).
-  pub pending: BTreeMap<ObjectId, BTreeMap<u64, PendingMergeRecord>>,
+  pub pending: BTreeMap<ObjectId, PendingGreen>,
   /// The highest version of each owned green whose merge record placed at `f + 1` (`await placed`
   /// answers from it; at `f = 0` every appended version).
   pub placed: BTreeMap<ObjectId, u64>,
@@ -711,8 +711,7 @@ pub(crate) fn status_merge_volume(
 // Owner side. Each accepted version (and the green's creation, version 0) is a pending record on
 // the green's owner shard: the version's head identity, the increment's identity, and the
 // placement of its inputs and of the record. The record plane (the control shard's coordinator,
-// `crate::fleet::run_record_period`) works one version per green per period, the lowest not yet
-// held by every candidate, in two steps that never reorder: while the version's inputs — the
+// `crate::fleet::run_record_period`) works each holder's first missing version per green per period, in two steps that never reorder: while the version's inputs — the
 // increment's ops document and post-state (or the origin) as one archive — are not placed at `f + 1`
 // candidates they are put through the same content exchange the seals use (§4.10, verified on
 // arrival, hedged to every candidate at once: the inputs are small); only then does the record ship,
@@ -815,6 +814,45 @@ impl MergeRecordValue {
     let mut input = bytes;
     let value = <MergeRecordValue as Wire>::decode(&mut input).ok()?;
     if input.is_empty() { Some(value) } else { None }
+  }
+}
+
+/// A green's outstanding replication (§4.16, AUD-13). The per-holder ordered positions index
+/// has one entry per missing acknowledgement, bounded by the pending records times their candidate
+/// count. Selecting the next shipment reads one position per holder, independent of chain length.
+#[derive(Default)]
+pub struct PendingGreen {
+  records: BTreeMap<u64, PendingMergeRecord>,
+  owed: BTreeMap<HostId, BTreeSet<u64>>,
+}
+
+impl PendingGreen {
+  /// Registers one new position and the holders still owed it. Re-enqueuing a position preserves
+  /// its acknowledgements; a pending position's identity never changes (§4.8 Continuity).
+  fn insert(&mut self, version: u64, record: PendingMergeRecord) {
+    if self.records.contains_key(&version) {
+      return;
+    }
+    for host in &record.record.candidates {
+      if !record.record.acked.contains(host) {
+        self.owed.entry(*host).or_default().insert(version);
+      }
+    }
+    self.records.insert(version, record);
+  }
+
+  /// One first missing position per remote holder, grouped into the record dispatches that may
+  /// share a quorum. A holder cannot skip its own prefix to follow a faster holder.
+  fn next(&self, local: HostId) -> BTreeMap<u64, Vec<HostId>> {
+    let mut selected = BTreeMap::<u64, Vec<HostId>>::new();
+    for (host, versions) in &self.owed {
+      if *host != local
+        && let Some(version) = versions.first()
+      {
+        selected.entry(*version).or_default().push(*host);
+      }
+    }
+    selected
   }
 }
 
@@ -1002,8 +1040,25 @@ pub(crate) fn await_placed_green(
   })
 }
 
-/// The one step of merge work a green owes this period: its lowest version not yet held by every
-/// candidate — the inputs put while they are unplaced, the record ship once they are.
+/// The holders ready for this record: the inputs are placed at quorum first, and each target
+/// itself holds them before recomputing (§4.16). Missing input holders remain catch-up work even
+/// after other holders placed the inputs; quorum placement never erases that debt.
+fn record_targets(pending: &PendingMergeRecord, targets: &[HostId], quorum: Quorum) -> Vec<HostId> {
+  if pending.value.inputs.is_none() {
+    return targets.to_vec();
+  }
+  if !pending.inputs.placed(quorum) {
+    return Vec::new();
+  }
+  targets
+    .iter()
+    .copied()
+    .filter(|host| pending.inputs.acked.contains(host))
+    .collect()
+}
+
+/// One position owed by at least one candidate this period: the inputs put while they are
+/// unplaced, the record ship once they are.
 pub(crate) enum MergeWork {
   /// Put the version's inputs to the candidates that do not hold them yet.
   PutInputs {
@@ -1041,86 +1096,77 @@ pub(crate) enum MergeWork {
   },
 }
 
-/// The merge work this shard's greens owe this period (read on the owner shard): per green, the
-/// lowest pending version, as inputs to put or a record to ship. A version whose inputs are still
-/// unplaced is counted as waiting.
+/// The merge work this shard's greens owe this period (§4.16): each candidate's first missing
+/// version, grouped by version so one dispatch can still reach a quorum. Each candidate appears in
+/// at most one dispatch per green; input placement precedes that version's record. A lagging holder
+/// cannot hold another holder at its own old position (AUD-13).
 pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<MergeWork> {
   let config = state.fleet.configuration().clone();
   let page = archive_page(state);
   let mut work = Vec::new();
   let objects: Vec<ObjectId> = state.merge.pending.keys().copied().collect();
   for object in objects {
-    let Some((version, pending)) = state
-      .merge
-      .pending
-      .get(&object)
-      .and_then(|versions| versions.iter().next())
-      .map(|(version, pending)| (*version, pending.clone()))
-    else {
+    let Some(pending_green) = state.merge.pending.get(&object) else {
       continue;
     };
-    let green = DbVolumeId { bytes: object.0 };
-    if pending.value.inputs.is_some() && !pending.inputs.placed(config.quorum) {
-      let Some(bytes) = inputs_of(state, green, version) else {
-        continue; // The chain no longer holds the entry (the green was destroyed): nothing to place.
+    let selected = pending_green.next(local);
+    for (version, targets) in selected {
+      let Some(pending) = state
+        .merge
+        .pending
+        .get(&object)
+        .and_then(|pending_green| pending_green.records.get(&version))
+        .cloned()
+      else {
+        continue;
       };
-      *state.refusals.entry(INPUTS_UNPLACED).or_insert(0) += 1;
-      work.push(MergeWork::PutInputs {
+      let green = DbVolumeId { bytes: object.0 };
+      let ready = record_targets(&pending, &targets, config.quorum);
+      if ready.len() < targets.len() {
+        let Some(bytes) = inputs_of(state, green, version) else {
+          continue; // The chain no longer holds the entry (the green was destroyed): nothing to place.
+        };
+        *state.refusals.entry(INPUTS_UNPLACED).or_insert(0) += 1;
+        work.push(MergeWork::PutInputs {
+          shard: state.shard,
+          object,
+          version,
+          archive: MergeShardState::inputs_archive(&bytes, 0, page),
+          candidates: pending.inputs.candidates.clone(),
+          acked: pending.inputs.acked.clone(),
+          quorum: config.quorum,
+        });
+      }
+      if ready.is_empty() {
+        continue;
+      }
+      // Each target is waiting for this version's first missing position. Another holder can be
+      // at a later position; a missing candidate therefore cannot stall an available commit quorum.
+      // The head is written at the host's epoch (a taken-over green's promotion epoch is owed with
+      // green takeover).
+      work.push(MergeWork::Ship {
         shard: state.shard,
         object,
         version,
-        archive: MergeShardState::inputs_archive(&bytes, 0, page),
-        candidates: pending.inputs.candidates.clone(),
-        acked: pending.inputs.acked.clone(),
+        record: Record {
+          owner: local,
+          object,
+          sequence: version,
+          epoch: config.host_epoch,
+          generation: config.version,
+          value: pending.value.to_record_bytes(),
+        },
+        targets: ready,
+        candidates: pending.record.candidates.clone(),
         quorum: config.quorum,
       });
-      continue;
     }
-    // In order per holder: a candidate gets version N only once it acknowledged N − 1 (an entry
-    // that already left the pending map was acknowledged by every candidate).
-    let prior_acked = |host: HostId| {
-      version == 0
-        || state
-          .merge
-          .pending
-          .get(&object)
-          .and_then(|versions| versions.get(&(version - 1)))
-          .is_none_or(|prior| prior.record.acked.contains(&host))
-    };
-    let targets: Vec<HostId> = pending
-      .record
-      .candidates
-      .iter()
-      .copied()
-      .filter(|host| *host != local && !pending.record.acked.contains(host) && prior_acked(*host))
-      .collect();
-    if targets.is_empty() {
-      continue;
-    }
-    // The head is written at the host's epoch (a taken-over green's promotion epoch is owed with
-    // green takeover).
-    work.push(MergeWork::Ship {
-      shard: state.shard,
-      object,
-      version,
-      record: Record {
-        owner: local,
-        object,
-        sequence: version,
-        epoch: config.host_epoch,
-        generation: config.version,
-        value: pending.value.to_record_bytes(),
-      },
-      targets,
-      candidates: pending.record.candidates.clone(),
-      quorum: config.quorum,
-    });
   }
   work
 }
 
 /// One period of the merge record plane for the greens `shard` owns, run on the control shard by
-/// [`crate::fleet::run_record_period`] after the seals and heads: each green's one step this
+/// [`crate::fleet::run_record_period`] after the seals and heads: each holder's first missing version this
 /// period is dispatched over the holders' borrowed sessions, and the acknowledgements are recorded
 /// back on the owner shard.
 pub(crate) async fn run_merge_period(
@@ -1237,7 +1283,7 @@ async fn put_inputs(
       .merge
       .pending
       .get_mut(&object)
-      .and_then(|versions| versions.get_mut(&version))
+      .and_then(|pending_green| pending_green.records.get_mut(&version))
     {
       for host in placement.acked {
         if !pending.inputs.acked.contains(&host) {
@@ -1312,15 +1358,21 @@ fn record_merge_acks(
   placement: Placement,
   quorum: Quorum,
 ) {
-  let Some(versions) = state.merge.pending.get_mut(&object) else {
+  let Some(pending_green) = state.merge.pending.get_mut(&object) else {
     return;
   };
-  let Some(pending) = versions.get_mut(&version) else {
+  let Some(pending) = pending_green.records.get_mut(&version) else {
     return;
   };
   for host in placement.acked {
-    if !pending.record.acked.contains(&host) {
+    if pending.record.candidates.contains(&host) && !pending.record.acked.contains(&host) {
       pending.record.acked.push(host);
+      if let Some(versions) = pending_green.owed.get_mut(&host) {
+        versions.remove(&version);
+        if versions.is_empty() {
+          pending_green.owed.remove(&host);
+        }
+      }
     }
   }
   let everyone = pending
@@ -1333,8 +1385,8 @@ fn record_merge_acks(
     *placed = (*placed).max(version);
   }
   if everyone {
-    versions.remove(&version);
-    if versions.is_empty() {
+    pending_green.records.remove(&version);
+    if pending_green.records.is_empty() {
       state.merge.pending.remove(&object);
     }
   }
@@ -1351,6 +1403,9 @@ pub(crate) fn accept_merge_record(
   peer_host: HostId,
   record: &Record,
 ) -> Vec<u8> {
+  if let Err(error) = crate::fleet::check_held_record(state, local, peer_host, record) {
+    return slates_db::register::encode_refusal(&error);
+  }
   let object = record.object;
   if state.merge.refused.contains(&object) {
     return Vec::new();
@@ -1359,6 +1414,10 @@ pub(crate) fn accept_merge_record(
     *state.refusals.entry(INPUTS_UNDECODABLE).or_insert(0) += 1;
     return Vec::new();
   };
+  if record.sequence != value.version {
+    *state.refusals.entry(OUT_OF_ORDER).or_insert(0) += 1;
+    return Vec::new();
+  }
   let next = state
     .merge
     .replicas
@@ -1492,6 +1551,135 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// AC-8.19 / T-8.17, AUD-13: a record's inputs reached quorum without C. Expect to ship
+  /// to B now and leave C waiting for inputs; after C holds them its record becomes dispatchable.
+  #[test]
+  fn quorum_input_placement_preserves_a_lagging_holders_input_debt() {
+    let (local, second, third) = (HostId(1), HostId(2), HostId(3));
+    let quorum = Quorum { f: 1 };
+    let candidates = vec![local, second, third];
+    let mut pending = PendingMergeRecord {
+      value: MergeRecordValue {
+        version: 1,
+        increment: [1; 32],
+        base: 0,
+        inputs: Some([2; 32]),
+        identity: [3; 32],
+        evidence: Vec::new(),
+      },
+      inputs: Placement {
+        candidates: candidates.clone(),
+        acked: vec![local, second],
+        mirror_acked: None,
+      },
+      record: Placement {
+        candidates,
+        acked: Vec::new(),
+        mirror_acked: None,
+      },
+    };
+    assert_eq!(
+      record_targets(&pending, &[second, third], quorum),
+      vec![second]
+    );
+    pending.inputs.acked.push(third);
+    assert_eq!(record_targets(&pending, &[third], quorum), vec![third]);
+  }
+
+  /// AC-6.3, §4.16 ordered holder replication; AUD-13: A and B place version 0 while C is
+  /// unavailable. Expect version 1 to be shipped to B while C's version 0 remains owed. Once C
+  /// acknowledges 0, its next shipment must be 1, preserving its contiguous chain.
+  #[test]
+  fn a_silent_candidate_does_not_block_the_next_versions_quorum() {
+    let (before, after, placed) = crate::daemon::audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let second = HostId(local.0 ^ 1);
+      let third = HostId(local.0 ^ 2);
+      let quorum = Quorum { f: 1 };
+      state.fleet = slates_cluster::fleet::FleetNode::new(local, quorum, &[second, third]);
+      let object = ObjectId([21; 16]);
+      let candidates = vec![local, second, third];
+      for version in 0..=1 {
+        state.merge.pending.entry(object).or_default().insert(
+          version,
+          PendingMergeRecord {
+            value: MergeRecordValue {
+              version,
+              increment: [1; 32],
+              base: 0,
+              inputs: Some([2; 32]),
+              identity: [3; 32],
+              evidence: Vec::new(),
+            },
+            inputs: Placement {
+              candidates: candidates.clone(),
+              acked: candidates.clone(),
+              mirror_acked: None,
+            },
+            record: Placement {
+              candidates: candidates.clone(),
+              acked: Vec::new(),
+              mirror_acked: None,
+            },
+          },
+        );
+      }
+      let placement = |acked| Placement {
+        candidates: candidates.clone(),
+        acked,
+        mirror_acked: None,
+      };
+      record_merge_acks(
+        state,
+        local,
+        object,
+        0,
+        placement(vec![local, second]),
+        quorum,
+      );
+      let shipments = |state: &mut ShardState| {
+        next_merge_work(state, local)
+          .into_iter()
+          .filter_map(|work| match work {
+            MergeWork::Ship {
+              version, targets, ..
+            } => Some((version, targets)),
+            _ => None,
+          })
+          .collect::<Vec<_>>()
+      };
+      let before = shipments(state);
+      record_merge_acks(
+        state,
+        local,
+        object,
+        1,
+        placement(vec![local, second]),
+        quorum,
+      );
+      let placed = placed_version(state, object);
+      record_merge_acks(state, local, object, 0, placement(vec![third]), quorum);
+      let after = shipments(state);
+      (before, after, placed)
+    });
+    assert!(
+      before.iter().any(|(version, _)| *version == 1),
+      "the available holder never received version 1: {before:?}"
+    );
+    assert!(
+      before.iter().any(|(version, _)| *version == 0),
+      "the missing holder still needs version 0"
+    );
+    assert_eq!(placed, Some(1));
+    assert_eq!(
+      after
+        .iter()
+        .map(|(version, _)| *version)
+        .collect::<Vec<_>>(),
+      vec![1]
+    );
+  }
 
   fn value() -> MergeRecordValue {
     MergeRecordValue {

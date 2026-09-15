@@ -83,14 +83,13 @@ impl std::fmt::Debug for VolumeSlot {
   }
 }
 
-/// What a fleet peer is currently known as (task #22 learn-on-contact): the daemon generation it last
-/// announced and the ephemeral member id that generation derives to (`deploy::member_id(anchor,
-/// generation)`). Kept per stable anchor in [`ShardState::learned_members`].
+/// The current authenticated member id and boot nonce for a stable certificate anchor (§4.8).
+/// This map learns identities from contact, never from a manifest's routing placeholders.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LearnedMember {
-  /// The daemon generation the peer announced (its anchor segment's start count).
-  pub generation: u64,
-  /// The member id at that generation — what membership, ownership and records name the peer by.
+  /// The random per-start nonce the peer announced.
+  pub boot_nonce: u64,
+  /// The member id at that boot_nonce — what membership, ownership and records name the peer by.
   pub host: slates_db::HostId,
 }
 
@@ -151,6 +150,15 @@ pub struct ShardState {
   /// (`crate::fleet::run_config_council`). A laptop runs a solo council that self-leads (R8). Only the
   /// control shard drives and serves it; other shards hold an inert copy of the same boot state.
   pub council: slates_cluster::config_group::RegionalCouncil,
+  /// This member has a committed regional admission and a root configuration (AUD-07).
+  /// Copied to owner shards when configuration changes; read without coordination per request.
+  pub consensus_ready: bool,
+  /// This start's explicit bootstrap, retained for idempotent retries without resetting Raft.
+  pub bootstrap_authorized: Option<bool>,
+  /// The regional group's immutable genesis identity; a separate bootstrap cannot replace its log.
+  pub council_group: Option<[u8; 32]>,
+  /// The root group's immutable genesis identity, distinct from its current voters.
+  pub root_group: Option<[u8; 32]>,
   /// The **root configuration group** across regions (§4.8, D-14 — "a root group across regions holds region
   /// membership and cross-region promotions"): the multi-voter Raft the control shard's config plane drives
   /// over the transport (among the region representatives) to agree on the `RootConfiguration` — which regions
@@ -274,19 +282,12 @@ pub struct ShardState {
   /// tell whether the fleet's direct mesh is up, which a formation observer must wait for rather than the
   /// seeded view. Empty on a laptop (no fleet loop runs).
   pub formed_probe_peers: std::collections::BTreeSet<slates_db::HostId>,
-  /// This node's own daemon **generation** (§4.8 "Recovery"; task #22): the anchor segment's start count
-  /// its runtime member id folds in (`member_id(origin_anchor, generation)`), announced on every SWIM ping
-  /// and acknowledgement so its peers validate the id it answers under. Zero on a laptop, an anchorless
-  /// daemon, or a fresh test segment (the manifest's precomputable generation-0 seed).
-  pub member_generation: u64,
-  /// The **current member id of every rostered fleet peer**, by the peer's stable anchor, with the daemon
-  /// generation that id was announced at (task #22 learn-on-contact; §4.8 "a restarted host rejoins as a
-  /// new member and holds nothing until its generation ... [is] validated"). Seeded by the membership loop
-  /// at boot with each peer's generation-0 id — the seed the manifest precomputes, a placeholder until the
-  /// peer's first contact — and replaced when a peer announces a **higher** generation (a restart: the old
-  /// id is folded dead and taken over, the new admitted); never moved backwards (a lower generation is a
-  /// stale or replayed boot, refused and counted). One entry per rostered peer, so it is bounded by the
-  /// roster. Only the control shard (which probes and serves the peers) consults it; empty on a laptop.
+  /// This start's random nonce, announced with its derived member id on SWIM contact (§4.8).
+  /// It changes even when an anchor survives: the daemon does not retain Raft state there yet.
+  pub member_boot_nonce: u64,
+  /// One authenticated identity per rostered certificate anchor, bounded by the roster.
+  /// A different nonce retires the previous id; nonces cannot establish numeric age order.
+  /// Only the control shard updates it. Empty before contact, and on a laptop.
   pub learned_members: BTreeMap<slates_db::HostId, LearnedMember>,
   /// The serve-socket demultiplexers the membership loop runs on this shard (the control shard's two
   /// planes; empty elsewhere and on a laptop), for the status report to read their counters.

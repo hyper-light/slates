@@ -270,14 +270,11 @@ pub static PUBLISH_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// Shard publishes refused outright — the image did not fit its content-object slot, or the slot
 /// could not be written — so nothing changed since the last committed image survives a restart until
 /// a publish succeeds (a health signal, §4.8). A data-plane barrier that meets this answers its
-/// client `NFS3ERR_IO`; a control verb's completion record is already committed with its effect, so
-/// the refusal is counted here and surfaced, never swallowed (the §4.2 admission sizing of the slot
-/// is the owed closure, docs/wip/recovery.md).
+/// client `NFS3ERR_IO`; a control verb records a refused completion (AUD-05). The effect can
+/// remain unacknowledged in memory; the client is never promised that it survives a restart.
 pub static PUBLISH_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Mount-transport mutations acknowledged as stable whose volume the committed recovery image does
-/// not carry (an overlay with base-backed inodes, whose recovery through its base is the owed gate,
-/// docs/wip/recovery.md): the acknowledgement is not backed by anchor-owned RAM, which this surfaces
-/// as a health signal rather than hides (§4.8, D-18).
+/// Mount-transport stability barriers refused because the image omitted the touched volume
+/// (§4.8, D-18; AUD-05). Counted alongside the `NFS3ERR_IO` reply, never a successful acknowledgement.
 pub static BARRIER_UNCAPTURED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Connects refused at the daemon's derived client bound (a health signal, AC-2.6).
 pub static CLIENTS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -332,6 +329,64 @@ fn boot_durability(
 }
 
 impl Daemon {
+  /// This start's fresh member identity. The instance name and certificate anchor remain stable.
+  pub fn member_identity(&self) -> Option<slates_db::HostId> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| s.fleet.host())
+    })
+  }
+
+  /// The regional voting set after its transition commits, or unknown while joining or changing.
+  pub fn council_voters(&self) -> Option<Vec<slates_db::HostId>> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| s.council.committed_voters()).flatten()
+    })
+  }
+
+  /// The root's committed voter configuration, absent during initialization or a joint change.
+  pub fn root_voters(&self) -> Option<Vec<slates_db::register::HostId>> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|state| state.root.committed_voters()).flatten()
+    })
+  }
+
+  /// The stable local rendezvous name, which does not change with a member incarnation.
+  pub fn instance(&self) -> &str {
+    &self.config.instance
+  }
+
+  /// Explicit first-time group creation by the process owning this daemon and its anchor.
+  /// Embeddings and fixtures name the current member just as the CLI does. Startup never calls it.
+  pub fn bootstrap(&self, root: bool) -> Result<(), slates_ipc::protocol::Refusal> {
+    use slates_ipc::protocol::{Refusal, ReplyBody};
+    let member = self
+      .member_identity()
+      .ok_or(Refusal::ConsensusNotInitialized)?
+      .0;
+    let (reply, publication) = self
+      .observe(self.shards.first().copied(), move || {
+        state::with_state(|state| {
+          let reply = crate::consensus::bootstrap(state, root, member);
+          (reply, crate::consensus::Publication::capture(state))
+        })
+      })
+      .ok_or(Refusal::ConsensusNotInitialized)?;
+    match reply {
+      ReplyBody::Acknowledged => {}
+      ReplyBody::Refused { refusal } => return Err(refusal),
+      _ => return Err(Refusal::ConsensusNotInitialized),
+    }
+    for shard in self.shards.iter().copied().skip(1) {
+      let publication = publication.clone();
+      self
+        .observe(Some(shard), move || {
+          state::with_state(|state| publication.apply(state))
+        })
+        .ok_or(Refusal::Overloaded { shard: shard.0 })?;
+    }
+    Ok(())
+  }
+
   /// Starts the daemon from a profile.
   pub fn start(
     profile: &MachineProfile,
@@ -746,7 +801,7 @@ impl Daemon {
 
   /// The refusals this daemon's control shard has counted, by kind — the same counts `slates status`
   /// reports (§4.14): a peer refused at a serve socket, a serve bind that failed, a membership announcement
-  /// whose generation was stale or whose member id did not derive from its certificate (task #22), and the
+  /// whose member id did not derive from its authenticated certificate (task #22), and the
   /// rest. A one-shot control-shard query ([`Self::observe`]); `None` when the daemon could not observe it.
   /// Exposed so a test proves a refusal was counted rather than silently absorbed (banned item 9).
   pub fn fleet_refusals(&self) -> Option<std::collections::BTreeMap<&'static str, u64>> {
@@ -1259,18 +1314,14 @@ pub fn host_id_of(identity: &Identity) -> u64 {
   ])
 }
 
-/// This boot's **ephemeral incarnation** — what the member id folds in (`member_id(anchor, incarnation)`,
-/// §4.8 "Recovery", task #22) — from the anchor's `SUP_GENERATION`. The design's invariant is that a **first
-/// boot is incarnation 0**, so its member id *is* the manifest's precomputed gen-0 seed and a fresh fleet
-/// forms with no learn-on-contact. `SUP_GENERATION` counts *starts* (the anchor's `record_start` increments
-/// it on every start, so a first boot reads 1), so the incarnation is one less — the number of *restarts*,
-/// zero on a first boot. A daemon run alone (no anchor, generation 0) is likewise incarnation 0. Before this
-/// was applied, an anchored first boot ran as `member_id(anchor, 1)` while its peers seeded and probed
-/// `member_id(anchor, 0)`, so no probe was ever credited and an anchored fleet could not form on a real
-/// deployment (`docs/bugs/2026-09-14-anchored-first-boot-generation-off-by-one.md`; the in-process tests run
-/// daemons with no anchor, generation 0, so they never exercised it).
-fn boot_incarnation(supervision_generation: u64) -> u64 {
-  supervision_generation.saturating_sub(1)
+/// This daemon's public boot nonce (§4.8, AUD-07), derived with a separate keyed-hash domain
+/// from the fresh secret minted once before its shards start. A reset supervision counter cannot
+/// repeat the old member identity. The secret itself never crosses the membership wire.
+fn boot_incarnation(secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES]) -> u64 {
+  let digest = blake3::keyed_hash(secret, b"slates/member-incarnation/v1");
+  let mut word = [0; size_of::<u64>()];
+  word.copy_from_slice(&digest.as_bytes()[..size_of::<u64>()]);
+  u64::from_le_bytes(word)
 }
 
 /// The content object's name for a segment named `seg_name`: the segment name with its `seg`
@@ -1319,55 +1370,9 @@ fn handoff_of(env: &[(String, String)]) -> Result<(Handoff, usize), ServerError>
   Ok((handoff, len))
 }
 
-/// A host's region, or the sole region `RegionId(0)` when the deployment declares none (§4.8, D-14 — the
-/// single-region default, which collapses the root group to the degenerate self-leading group, R8).
-fn region_of(
-  host: slates_db::HostId,
-  regions: &std::collections::BTreeMap<slates_db::HostId, slates_db::register::RegionId>,
-) -> slates_db::register::RegionId {
-  regions
-    .get(&host)
-    .copied()
-    .unwrap_or(slates_db::register::RegionId(0))
-}
-
-/// The regions the fleet spans (§4.8, D-14 — the root group's region membership): the distinct regions of
-/// `members`, sorted and de-duplicated so every node forms the same initial root configuration.
-fn fleet_regions(
-  members: &[slates_db::HostId],
-  regions: &std::collections::BTreeMap<slates_db::HostId, slates_db::register::RegionId>,
-) -> Vec<slates_db::register::RegionId> {
-  let mut out: Vec<slates_db::register::RegionId> = members
-    .iter()
-    .map(|host| region_of(*host, regions))
-    .collect();
-  out.sort_unstable_by_key(|region| region.0);
-  out.dedup();
-  out
-}
-
-/// The root group's voters at boot — one representative host per region (the lowest host id in each region,
-/// [`slates_cluster::root_group::root_representatives`]), the small elected set that carries the cross-region
-/// consensus (§4.8, D-14 — "a small set, one or a few per region"). Deterministic from the members and their
-/// regions, so every node derives the same voter set; thereafter the root leader keeps the voter set equal to
-/// the representatives of the regions still committed and alive (`fleet::alive_representatives`).
-fn root_voters(
-  members: &[slates_db::HostId],
-  regions: &std::collections::BTreeMap<slates_db::HostId, slates_db::register::RegionId>,
-) -> Vec<slates_db::HostId> {
-  let mut voters: Vec<slates_db::HostId> =
-    slates_cluster::root_group::root_representatives(members, regions)
-      .into_values()
-      .collect();
-  voters.sort_unstable_by_key(|host| host.0);
-  voters
-}
-
-/// Builds this node's root group and the host→region map it reconciles from (§4.8, D-14 — the root group
-/// across regions). A fleet with declared regions forms the regions its members span with one representative
-/// host per region as the voters; a fleet with none is a single region (id 0); a laptop is the sole region,
-/// its node the sole self-leading voter (R8). Extracted from [`init_shard`] to keep it within the complexity
-/// bound.
+/// Builds an uninitialized root participant and the manifest's region map (§4.8, AUD-07).
+/// A missing region declaration means region zero, including on a laptop. The manifest cannot
+/// initialize voters: that requires explicit bootstrap or a common-prefix join.
 fn build_root_group(
   config: &DaemonConfig,
   host: slates_db::HostId,
@@ -1376,28 +1381,28 @@ fn build_root_group(
   std::collections::BTreeMap<slates_db::HostId, slates_db::register::RegionId>,
   std::collections::BTreeMap<slates_db::register::RegionId, slates_db::register::RegionId>,
 ) {
-  match &config.fleet {
-    Some(membership) => {
-      let mut all_members = membership.peers.clone();
-      all_members.push(host);
-      let regions = fleet_regions(&all_members, &membership.regions);
-      let voters = root_voters(&all_members, &membership.regions);
-      (
-        slates_cluster::root_group::RootGroup::new(host, regions, voters),
-        membership.regions.clone(),
-        membership.region_mirrors.clone(),
-      )
-    }
-    None => (
-      slates_cluster::root_group::RootGroup::new(
-        host,
-        vec![slates_db::register::RegionId(0)],
-        vec![host],
-      ),
-      std::collections::BTreeMap::new(),
-      std::collections::BTreeMap::new(),
-    ),
+  let mut regions: std::collections::BTreeMap<_, _> = config
+    .fleet
+    .as_ref()
+    .map(|fleet| fleet.regions.clone())
+    .unwrap_or_default();
+  if let Some(fleet) = &config.fleet {
+    let region = regions
+      .get(&fleet.host)
+      .copied()
+      .unwrap_or(slates_db::register::RegionId(0));
+    regions.insert(host, region);
   }
+  let mirrors = config
+    .fleet
+    .as_ref()
+    .map(|fleet| fleet.region_mirrors.clone())
+    .unwrap_or_default();
+  (
+    slates_cluster::root_group::RootGroup::learner(host),
+    regions,
+    mirrors,
+  )
 }
 
 /// Runs on the shard: attaches the segment, recovers the partition, builds the store and
@@ -1461,27 +1466,15 @@ fn init_shard(
     .set_metadata_class(config.store.metadata_class_bytes)
     .map_err(ServerError::Memory)?;
   let shard = registry::current_shard().unwrap_or(partition);
-  // The node's host id — what a recorded holder set and a volume id's creator-host bits name it by. A
-  // fleet node's is the member id its manifest derives from its certificate (`crate::deploy`), so it is
-  // the id its peers know it by; a laptop (no fleet) takes the machine identity's hash, stable across
-  // restarts and distinct per machine. One host, `f = 0`, on a laptop.
-  // This node's two identities (§4.8 "Recovery"; task #22). The **stable cert-anchor** — derived from the
-  // certificate, unchanged across restarts — keys a client's completion record, so a retry meets its record
-  // even after the daemon restarts (exactly-once survives). The **ephemeral member id** folds in this boot's
-  // incarnation, so a restart holds a new id and is a new member whose old objects the group takes over;
-  // incarnation 0 (a first boot, or a fresh test segment) reproduces the manifest's precomputed gen-0 seed,
-  // so a fresh fleet forms with no learn-on-contact. A laptop uses the same derivations over its own identity
-  // (R8). `config.fleet.host` is that gen-0 seed and is ignored here in favour of this node's real incarnation.
+  // The stable anchor keys TLS authentication and completion origins (§4.8). A random
+  // per-start nonce derives the member id used for voting and ownership. The anchor's
+  // supervision counter cannot supply freshness after whole-pod RAM loss (AUD-07).
   let origin_anchor = config.fleet.as_ref().map_or_else(
     || slates_db::HostId(host_id_of(identity)),
     |m| m.origin_anchor,
   );
-  let incarnation = boot_incarnation(
-    segment
-      .supervision()
-      .map(|supervision| supervision.generation())
-      .unwrap_or(0),
-  );
+  let issuer_secret = segment.issuer_secret()?;
+  let incarnation = boot_incarnation(&issuer_secret);
   let host = crate::deploy::member_id(origin_anchor, incarnation);
   // The owner runtime this node takes part in a region as (§4.8, boot step 6): membership + the
   // configuration group + the owner's acceptor, composed by `slates-cluster`. Built from the configured
@@ -1490,51 +1483,21 @@ fn init_shard(
   // no peers)`, so it is the same code path a fleet runs (R8), not a branch in behaviour. The placement
   // authority the verbs read is `fleet.configuration()`; the live probe/gossip loop that folds
   // membership into it (and the cross-node commit) are the next fleet pieces.
-  // The regional configuration council (§4.8, D-14 — the "configuration master", one per region): the
-  // multi-voter Raft the fleet-loop config plane drives over the transport to agree on the region's
-  // configuration. Its voters and members are the fleet (the small-council degenerate of a large fleet, R8);
-  // a laptop runs a solo council that self-leads (`f = 0`). Each neighbourhood is bounded to the derived
-  // scatter width — the candidate floor unless the deployment stated a re-replication bandwidth recovery
-  // needs a wider one (§4.8, D-14) — and the failure-domain map places copysets across distinct domains
-  // (a host the manifest does not place stays unique-per-host).
-  let council = match &config.fleet {
-    Some(membership) => {
-      let mut members = membership.peers.clone();
-      members.push(host);
-      // The council votes with a **small** set (§4.8, D-14 — "a small elected council per region"): the
-      // members with the lowest ids up to the candidate floor `2f+1`, so it tolerates `f` voter failures
-      // while staying small even in a large region; the rest are learners that fetch the committed
-      // configuration. Deterministic from the members, so every node derives the same voter set.
-      let voters = slates_cluster::config_group::council_voters(&members, membership.quorum);
-      slates_cluster::config_group::RegionalCouncil::new(
-        host,
-        members,
-        voters,
-        membership.quorum,
-        membership.domains.clone(),
-        config.derived_scatter(membership.quorum),
-        false,
-      )
-    }
-    None => {
-      let quorum = slates_db::register::Quorum { f: 0 };
-      slates_cluster::config_group::RegionalCouncil::new(
-        host,
-        vec![host],
-        vec![host],
-        quorum,
-        std::collections::BTreeMap::new(),
-        config.derived_scatter(quorum),
-        false,
-      )
-    }
-  };
-  // The owner runtime (§2.6 boot step 6, D-14): the SWIM view, this node's current configuration, and its
-  // register acceptor. The **council is the authority** (D-14, one configuration group per region), so the
-  // node installs the council's committed `configuration_for(this host)` over the bootstrap the constructor
-  // built — placement then reads what the council agreed. A laptop's solo council self-leads, so its formed
-  // configuration is authoritative at once (R8); the record plane re-installs it each period as the council
-  // commits changes.
+  // The regional council starts uninitialized on every daemon boot (§4.8, AUD-07). Neither
+  // a deployment roster nor retained volume bytes restore a term, vote or log. An explicit
+  // first-time bootstrap or a validated join initializes it; writes wait for admission.
+  let quorum = config
+    .fleet
+    .as_ref()
+    .map_or(slates_db::register::Quorum { f: 0 }, |fleet| fleet.quorum);
+  let council = slates_cluster::config_group::RegionalCouncil::learner(
+    host,
+    quorum,
+    config.derived_scatter(quorum),
+    false,
+  );
+  // The discovery view holds manifest placeholders until authenticated contact. Placement
+  // becomes usable only after this fresh member has joined its committed regional group.
   let mut fleet = match &config.fleet {
     Some(membership) => {
       slates_cluster::fleet::FleetNode::new(host, membership.quorum, &membership.peers)
@@ -1624,7 +1587,7 @@ fn init_shard(
     last_drain_ns: now,
     placed_heads: std::collections::BTreeMap::new(),
     formed_probe_peers: std::collections::BTreeSet::new(),
-    member_generation: incarnation,
+    member_boot_nonce: incarnation,
     learned_members: std::collections::BTreeMap::new(),
     demuxes: Vec::new(),
     holder_records: std::collections::BTreeMap::new(),
@@ -1635,6 +1598,10 @@ fn init_shard(
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
     council,
+    consensus_ready: false,
+    bootstrap_authorized: None,
+    council_group: None,
+    root_group: None,
     root,
     node_regions,
     region_mirrors,
@@ -1994,9 +1961,320 @@ mod limits {
 }
 
 #[cfg(test)]
+pub(crate) use tests::audit_on_shard;
+
+#[cfg(test)]
 mod tests {
   use super::registered_chokepoints;
   use slates_wire::observe::Chokepoint;
+
+  /// Runs an audit history on the daemon's real owning shard (§4.8, §4.16). The daemon owns and
+  /// joins every task; only the result crosses back to the test thread.
+  pub(crate) fn audit_on_shard<T: Send + 'static>(
+    history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+  ) -> T {
+    let profile = slates_machine::MachineProfile::measure(slates_machine::ProfileOptions {
+      budget_per_probe: std::time::Duration::from_millis(5),
+      codecs: false,
+      core_matrix: false,
+    });
+    let instance = format!("audit-{}", std::process::id());
+    let config = crate::DaemonConfig::derive(&profile, &instance).with_shards(1);
+    let daemon = super::Daemon::start(
+      &profile,
+      config,
+      super::SegmentSource::Create { name: instance },
+    )
+    .expect("the audit daemon starts");
+    daemon
+      .bootstrap(true)
+      .expect("the audit explicitly creates its initial group");
+    let result = daemon.observe(daemon.shards.first().copied(), move || {
+      crate::state::with_state(history)
+    });
+    daemon.stop();
+    result.expect("the audit history completed")
+  }
+
+  /// AC-8.1, §4.8 restart-as-join; AUD-07: vote for B, lose the whole anchor, then receive C's
+  /// vote request in the same term. The two boots must not supply two votes under one voter id.
+  #[test]
+  fn a_ram_losing_boot_cannot_cast_its_predecessors_second_vote() {
+    use slates_cluster::config_group::RegionalCouncil;
+    use slates_cluster::raft::RequestVote;
+    use slates_cluster::raft_wire::RaftMessage;
+    use slates_db::register::{HostId, Quorum};
+    let vote = |candidate: HostId, voters: Option<Vec<HostId>>| {
+      audit_on_shard(move |state| {
+        let local = state.fleet.host();
+        let voters = voters.unwrap_or_else(|| vec![local, HostId(1), HostId(2)]);
+        let mut council = RegionalCouncil::new(
+          local,
+          voters.clone(),
+          voters.clone(),
+          Quorum { f: 1 },
+          Default::default(),
+          voters.len() as u64,
+          false,
+        );
+        let reply = council
+          .answer(RaftMessage::RequestVote(RequestVote {
+            term: 7,
+            candidate,
+            last_log_index: 0,
+            last_log_term: 0,
+          }))
+          .expect("a vote request has a reply");
+        let RaftMessage::VoteReply(reply) = reply else {
+          panic!("{reply:?}");
+        };
+        (voters, reply)
+      })
+    };
+    let (voters, before_loss) = vote(HostId(1), None);
+    assert!(
+      before_loss.granted,
+      "the predecessor supplied the first vote"
+    );
+    let (_, after_loss) = vote(HostId(2), Some(voters));
+    assert!(
+      !after_loss.granted || after_loss.voter != before_loss.voter,
+      "two candidates received the same voter's grant in term {}: {:?} then {:?}",
+      before_loss.term,
+      before_loss,
+      after_loss,
+    );
+  }
+
+  /// AC-8.1, §4.8, AUD-07: a separately bootstrapped group cannot alter this group's
+  /// term or prefix, even when its packet names the authenticated sender correctly.
+  #[test]
+  fn an_independent_group_cannot_supply_consensus_messages_or_join_state() {
+    use slates_cluster::raft::RequestVote;
+    use slates_cluster::raft_wire::{RaftMessage, RaftWireError};
+    use slates_wire::Wire;
+    let (peer, messages, fetches) = audit_on_shard(|state| {
+      let peer = state.fleet.host();
+      let request = RaftMessage::RequestVote(RequestVote {
+        term: u64::MAX,
+        candidate: peer,
+        last_log_index: 0,
+        last_log_term: 0,
+      });
+      let fetch = crate::consensus::Fetch {
+        group: None,
+        version: 0,
+      }
+      .to_bytes();
+      let messages =
+        [false, true].map(|root| crate::consensus::encode_message(state, root, &request).unwrap());
+      let fetches =
+        [false, true].map(|root| crate::consensus::serve_fetch(state, root, &fetch).unwrap());
+      (peer, messages, fetches)
+    });
+    audit_on_shard(move |state| {
+      for (root, (message, fetch)) in [false, true]
+        .into_iter()
+        .zip(messages.into_iter().zip(fetches))
+      {
+        assert_eq!(
+          crate::consensus::decode_message(state, root, peer, &message),
+          Err(RaftWireError::ForeignGroup)
+        );
+        assert!(!crate::consensus::adopt_fetch(state, root, peer, &fetch));
+      }
+      assert!(state.council.is_leader());
+      assert!(state.root.is_leader());
+    });
+  }
+
+  /// AC-2.5, §4.8 authority; AUD-10: accept the owner's first record, then submit another position
+  /// from a different authenticated peer claiming that owner. Expect refusal without fencing the
+  /// legitimate owner's next record or changing the object's routing owner.
+  #[test]
+  fn a_holder_binds_every_record_to_the_authenticated_peer() {
+    use slates_db::register::{Ack, HostEpoch, HostId, ObjectId, Record};
+    let (spoofed, legitimate, owner, routed) = audit_on_shard(|state| {
+      let owner = state.fleet.host();
+      let record = Record {
+        owner,
+        object: ObjectId([17; 16]),
+        sequence: 0,
+        epoch: HostEpoch(1),
+        generation: state.fleet.configuration().version,
+        value: b"first".to_vec(),
+      };
+      let first = crate::fleet::accept_held_record(state, owner, owner, &record);
+      assert!(Ack::decode(&first).is_ok());
+      let next = Record {
+        sequence: 1,
+        value: b"next".to_vec(),
+        ..record
+      };
+      let spoof = Record {
+        epoch: HostEpoch(2),
+        ..next.clone()
+      };
+      let spoofed = crate::fleet::accept_held_record(state, owner, HostId(owner.0 ^ 1), &spoof);
+      let legitimate = crate::fleet::accept_held_record(state, owner, owner, &next);
+      (
+        spoofed,
+        legitimate,
+        owner,
+        state.fleet.object_owner(next.object),
+      )
+    });
+    assert!(
+      spoofed.is_empty(),
+      "a different TLS peer cannot speak as the owner"
+    );
+    assert!(
+      Ack::decode(&legitimate).is_ok(),
+      "the forgery did not raise the fence"
+    );
+    assert_eq!(routed, Some(owner));
+  }
+
+  /// AC-6.3, §4.16 holder recomputation; AUD-12: submit an otherwise valid origin record through
+  /// an unauthorized peer. Expect no acknowledgement and no readable replica created by that record.
+  #[test]
+  fn an_unauthorized_merge_record_never_publishes_a_replica() {
+    use slates_db::register::{HostEpoch, HostId, ObjectId, Record};
+    let (reply, held) = audit_on_shard(|state| {
+      let owner = state.fleet.host();
+      let value = crate::merge_service::MergeRecordValue {
+        version: 0,
+        increment: [0; 32],
+        base: 0,
+        inputs: None,
+        identity: slates_merge::engine::Green::new().head_identity(),
+        evidence: Vec::new(),
+      };
+      let record = Record {
+        owner,
+        object: ObjectId([18; 16]),
+        sequence: 0,
+        epoch: HostEpoch(1),
+        generation: state.fleet.configuration().version,
+        value: value.to_record_bytes(),
+      };
+      let reply =
+        crate::merge_service::accept_merge_record(state, owner, HostId(owner.0 ^ 1), &record);
+      (
+        reply,
+        crate::merge_service::holder_state(state, record.object),
+      )
+    });
+    assert!(reply.is_empty());
+    assert_eq!(
+      held.version, None,
+      "a refused record must not create a readable replica"
+    );
+    assert!(
+      !held.refused,
+      "unauthorized traffic must not poison the green"
+    );
+  }
+
+  /// AC-2.5, §4.8 takeover; AUD-10 sibling: a forged prepare must not raise the promise. The
+  /// configuration-authorized successor can still prepare and commit after the refused forgery.
+  #[test]
+  fn a_takeover_prepare_binds_its_owner_to_the_authenticated_peer() {
+    use slates_db::register::{
+      Acceptor, Ack, Authority, HostEpoch, HostId, ObjectId, Prepare, Promise, Record,
+    };
+    let (spoofed, promised, committed) = audit_on_shard(|state| {
+      let owner = state.fleet.host();
+      let successor = HostId(owner.0 ^ 1);
+      let object = ObjectId([19; 16]);
+      let generation = state.fleet.configuration().version;
+      let mut acceptor = Acceptor::new(owner, Authority { generation, owner });
+      acceptor
+        .install_authority(Authority {
+          generation,
+          owner: successor,
+        })
+        .unwrap();
+      state.holder_records.insert(object, acceptor);
+      let prepare = Prepare {
+        owner: successor,
+        object,
+        epoch: HostEpoch(2),
+        generation,
+      };
+      let forgery = Prepare {
+        epoch: HostEpoch(3),
+        ..prepare
+      };
+      let spoofed = crate::fleet::serve_held_promotion(state, owner, &forgery);
+      let promised = crate::fleet::serve_held_promotion(state, successor, &prepare);
+      let record = Record {
+        owner: successor,
+        object,
+        sequence: 0,
+        epoch: prepare.epoch,
+        generation,
+        value: Vec::new(),
+      };
+      let committed = crate::fleet::accept_held_record(state, owner, successor, &record);
+      (spoofed, promised, committed)
+    });
+    assert!(spoofed.is_empty());
+    assert!(Promise::decode(&promised).is_ok());
+    assert!(Ack::decode(&committed).is_ok());
+  }
+
+  /// AC-6.3, §4.16; AUD-12: a stale epoch, foreign generation or conflicting accepted position
+  /// must refuse before holder recomputation. A later legitimate origin must still seed and serve.
+  #[test]
+  fn refused_merge_authority_leaves_the_replica_unchanged() {
+    use slates_db::register::{Acceptor, Ack, Authority, HostEpoch, ObjectId, Record};
+    let (after_refusals, committed, after_commit) = audit_on_shard(|state| {
+      let owner = state.fleet.host();
+      let object = ObjectId([20; 16]);
+      let generation = state.fleet.configuration().version;
+      let value = crate::merge_service::MergeRecordValue {
+        version: 0,
+        increment: [0; 32],
+        base: 0,
+        inputs: None,
+        identity: slates_merge::engine::Green::new().head_identity(),
+        evidence: Vec::new(),
+      };
+      let record = Record {
+        owner,
+        object,
+        sequence: 0,
+        epoch: HostEpoch(2),
+        generation,
+        value: value.to_record_bytes(),
+      };
+      let mut acceptor = Acceptor::new(owner, Authority { generation, owner });
+      acceptor.raise_fence(HostEpoch(2));
+      state.holder_records.insert(object, acceptor);
+      for refused in [
+        Record {
+          epoch: HostEpoch(1),
+          ..record.clone()
+        },
+        Record {
+          generation: generation + 1,
+          ..record.clone()
+        },
+      ] {
+        let reply = crate::merge_service::accept_merge_record(state, owner, owner, &refused);
+        assert!(Ack::decode(&reply).is_err());
+      }
+      let after_refusals = crate::merge_service::holder_state(state, object);
+      let committed = crate::merge_service::accept_merge_record(state, owner, owner, &record);
+      let after_commit = crate::merge_service::holder_state(state, object);
+      (after_refusals, committed, after_commit)
+    });
+    assert_eq!(after_refusals.version, None);
+    assert!(!after_refusals.refused);
+    assert!(Ack::decode(&committed).is_ok());
+    assert_eq!(after_commit.version, Some(0));
+  }
 
   /// Shape: a runtime for the admission guard's test — one shard, a few task slots.
   fn guard_runtime() -> slates_rt::runtime::LocalRuntime {
@@ -2064,46 +2342,6 @@ mod tests {
       "the seated admission's id stays live: {live:?}"
     );
     assert_eq!(lost, 1, "one lost handoff counted");
-  }
-
-  /// AC (§4.8 "Recovery", task #22; docs/bugs/2026-09-14-anchored-first-boot-generation-off-by-one.md): a
-  /// node's member id on a **first boot** is the manifest's precomputed gen-0 seed, whether it runs under an
-  /// anchor (whose `SUP_GENERATION` reads 1 on the first start) or alone (generation 0) — else its peers,
-  /// which seed and probe `member_id(anchor, 0)`, never credit a probe and an anchored fleet cannot form. A
-  /// **restart** (a higher start count) is a distinct member id (a new incarnation the group takes over).
-  #[test]
-  fn an_anchored_first_boot_holds_the_manifest_gen_zero_seed() {
-    use super::boot_incarnation;
-    use crate::deploy::member_id;
-    use slates_db::HostId;
-
-    let anchor = HostId(0x0123_4567_89ab_cdef);
-    let seed = member_id(anchor, 0);
-    assert_eq!(
-      boot_incarnation(0),
-      0,
-      "a daemon alone (no anchor) is incarnation 0"
-    );
-    assert_eq!(
-      boot_incarnation(1),
-      0,
-      "an anchored first boot (SUP_GENERATION 1) is incarnation 0"
-    );
-    assert_eq!(
-      member_id(anchor, boot_incarnation(1)),
-      seed,
-      "an anchored first boot's member id is the manifest's gen-0 seed"
-    );
-    assert_eq!(
-      boot_incarnation(2),
-      1,
-      "a first restart (start count 2) is incarnation 1"
-    );
-    assert_ne!(
-      member_id(anchor, boot_incarnation(2)),
-      seed,
-      "a restart is a distinct member id the group takes over"
-    );
   }
 
   /// The daemon declares every chokepoint span, so the observability gate opens and it serves (§2.6,

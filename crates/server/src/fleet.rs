@@ -83,10 +83,7 @@ use slates_cluster::content::{
 use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::fleet::{apply_peer_state, sync_peer};
 use slates_cluster::membership::{Liveness, MemberState};
-use slates_cluster::raft_wire::{
-  RaftMessage, decode_regional_configuration, decode_root_configuration,
-  encode_regional_configuration, encode_root_configuration,
-};
+use slates_cluster::raft_wire::RaftMessage;
 use slates_cluster::root_group::root_representatives;
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once};
 use slates_cluster::timing::{ElectionTimer, ElectionTiming, PathRtt, RoundAnchors, round_budget};
@@ -100,7 +97,7 @@ use slates_db::catalog::{
 };
 use slates_db::register::{
   Acceptor, Authority, DomainId, FIRST_EPOCH, HostEpoch, HostId, ObjectId, Placement, Prepare,
-  Quorum, Record, RegionId, candidates_for, encode_refusal,
+  Quorum, Record, RegionId, RegisterError, candidates_for, encode_refusal,
 };
 use slates_rt::futures;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
@@ -167,12 +164,11 @@ pub(crate) const POLL_PER_PERIOD: u64 = 10;
 pub struct FleetPeer {
   /// The peer's **stable anchor** — what its certificate stands for across restarts: the certificate's hash
   /// in a deployment (`deploy::host_id_of_certificate`), the machine identity's on an in-process fleet. Every
-  /// member id the peer ever holds derives from it (`deploy::member_id(anchor, generation)`), so an id it
+  /// member id the peer ever holds derives from it (`deploy::member_id(anchor, boot_nonce)`), so an id it
   /// announces is validated against this (task #22).
   pub anchor: HostId,
   /// The peer's generation-0 **seed** member id, `member_id(anchor, 0)` — the id the manifest precomputes and
-  /// this node knows the peer by until the peer announces its current one on contact (a placeholder: an
-  /// anchored daemon's first boot is already generation one).
+  /// this node uses to route discovery until authenticated contact announces the fresh member id.
   pub host: HostId,
   /// The peer's advertised probe address — where it accepts this node's SWIM probes, and where this node
   /// dials it: an IP, or a DNS name resolved at every fresh dial (`crate::dns`).
@@ -244,53 +240,44 @@ struct ProbedPeer {
   host: HostId,
 }
 
-/// Refused: a peer announced a member id that is not `member_id(anchor, generation)` for the certificate it
+/// Refused: a peer announced a member id that is not `member_id(anchor, boot_nonce)` for the certificate it
 /// presented — an id it could not have derived (a forgery, or a corrupted announcement). Counted in the
 /// status report's refusals, never folded.
 const MEMBER_ID_FORGED: &str = "fleet.member_id_forged";
-/// Refused: a peer announced a **lower** daemon generation than the one already learned for its anchor — a
-/// stale or replayed boot (§4.8 "a restarted host rejoins as a new member and holds nothing until its
-/// generation ... [is] validated"); the higher generation is the current incarnation, so this announcement is
-/// counted and never folded.
-const MEMBER_GENERATION_STALE: &str = "fleet.member_generation_stale";
-
 /// What learning an announced identity on contact concluded ([`classify_announced`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LearnedOutcome {
-  /// The id already known for this anchor at this generation — the ordinary contact.
+  /// The id already known for this anchor at this boot_nonce — the ordinary contact.
   Current,
-  /// A higher generation than known: the peer **restarted** and is a new member; `old` is the id it held
+  /// A different boot nonce: the peer **restarted** and is a new member; `old` is the id it held
   /// before (its seed, or its previous incarnation's id), to be retired and taken over.
   Restarted { old: HostId },
-  /// A lower generation than known: a stale or replayed boot, refused.
-  Stale,
-  /// The announced id is not the one its anchor and generation derive to, refused.
+  /// The announced id is not the one its anchor and boot_nonce derive to, refused.
   Forged,
 }
 
-/// The pure decision of learn-on-contact (task #22; §4.8 "a restarted host rejoins as a new member and holds
-/// nothing until its generation ... [is] validated"): given what is `known` for `anchor` — nothing yet, or
-/// the generation and id last learned — an announcement `(generation, announced)` is **forged** unless
-/// `announced == member_id(anchor, generation)` (the id is self-certifying against the anchor the
-/// authenticated certificate stands for), **stale** if its generation is below the known one, **current** if
-/// equal, and a **restart** if above. Pure and deterministic, so it is tested by use without a fleet.
+/// Validate the claimed id against the authenticated anchor and its random boot nonce (§4.8,
+/// AUD-07). Equal nonces denote current contact; different nonces denote different members.
+/// Numeric comparison cannot establish freshness after whole-anchor loss. Raft admission and
+/// the immutable group id determine voting authority independently of this discovery view.
 fn classify_announced(
   known: Option<&LearnedMember>,
   anchor: HostId,
-  generation: u64,
+  boot_nonce: u64,
   announced: HostId,
 ) -> LearnedOutcome {
-  if announced != crate::deploy::member_id(anchor, generation) {
+  if announced != crate::deploy::member_id(anchor, boot_nonce) {
     return LearnedOutcome::Forged;
   }
   match known {
-    Some(known) if generation < known.generation => LearnedOutcome::Stale,
-    Some(known) if generation == known.generation => LearnedOutcome::Current,
+    Some(known) if boot_nonce == known.boot_nonce => LearnedOutcome::Current,
     Some(known) => LearnedOutcome::Restarted { old: known.host },
     // An anchor never seen: nothing precedes this announcement, so nothing is retired — it is current from
     // here. Only a rostered certificate reaches this (the handshake admits no other), so this is a seed the
     // boot seeding has not yet written, never an unknown node.
-    None => LearnedOutcome::Current,
+    None => LearnedOutcome::Restarted {
+      old: crate::deploy::member_id(anchor, 0),
+    },
   }
 }
 
@@ -299,34 +286,31 @@ fn classify_announced(
 /// a restart, folds the old id **dead** at its current incarnation — the same incarnation-gated fold a
 /// detector's death takes, so the council leader's next reconcile takes it over, bumping its fencing epoch
 /// and retiring it — and the new id **alive**, so the leader admits it; and carries the peer's region over to
-/// the new id (the region is the node's, not the incarnation's). A stale or forged announcement is counted
+/// the new id (the region is the node's, not the incarnation's). A forged announcement is counted
 /// and folds nothing. Idempotent: a repeat of the same announcement is `Current`. Runs on the control shard,
 /// which alone keeps the learned map; the probe loop hands the old id's death to the other shards.
 fn learn_member(
   state: &mut ShardState,
   anchor: HostId,
-  generation: u64,
+  boot_nonce: u64,
   announced: HostId,
 ) -> LearnedOutcome {
   let outcome = classify_announced(
     state.learned_members.get(&anchor),
     anchor,
-    generation,
+    boot_nonce,
     announced,
   );
   match outcome {
     LearnedOutcome::Forged => {
       *state.refusals.entry(MEMBER_ID_FORGED).or_insert(0) += 1;
     }
-    LearnedOutcome::Stale => {
-      *state.refusals.entry(MEMBER_GENERATION_STALE).or_insert(0) += 1;
-    }
     LearnedOutcome::Current => {
       state
         .learned_members
         .entry(anchor)
         .or_insert(LearnedMember {
-          generation,
+          boot_nonce,
           host: announced,
         });
     }
@@ -334,7 +318,7 @@ fn learn_member(
       state.learned_members.insert(
         anchor,
         LearnedMember {
-          generation,
+          boot_nonce,
           host: announced,
         },
       );
@@ -370,7 +354,7 @@ fn learn_member(
 /// The failure domain the fleet configuration declares for the node behind member `host`, if any (§4.8, D-14
 /// — copysets form across distinct domains; `None` is unique-per-host). The declaration is keyed by each
 /// node's generation-0 seed id (the manifest precomputes `member_id(anchor, 0)` per node), so a member
-/// announced at a later generation — a restart, or an anchored daemon's first boot — is resolved to its node
+/// announced with a fresh boot nonce is resolved to its node
 /// through the anchor it was learned under (this node's own through its origin anchor) and looked up by that
 /// node's seed (task #22: the new id inherits the node's domain, since the domain is the node's, not the
 /// incarnation's). No fleet configuration, or no declaration for the node, is `None`.
@@ -392,6 +376,36 @@ fn declared_domain(state: &ShardState, host: HostId) -> Option<DomainId> {
     .domains
     .get(&crate::deploy::member_id(anchor, 0))
     .copied()
+}
+
+/// Only identities learned over authenticated contact may enter a voter configuration.
+/// Manifest seeds locate certificates and addresses; optimistic SWIM seeding is not admission.
+fn authenticated_alive(state: &ShardState) -> Vec<HostId> {
+  state
+    .fleet
+    .membership()
+    .alive()
+    .into_iter()
+    .filter(|host| {
+      *host == state.fleet.host()
+        || state
+          .learned_members
+          .values()
+          .any(|member| member.host == *host)
+    })
+    .collect()
+}
+
+/// The regional council serves only its declared region. Root traffic spans all regions.
+pub(crate) fn same_region(state: &ShardState, peer: HostId) -> bool {
+  let region = |host| {
+    state
+      .node_regions
+      .get(&host)
+      .copied()
+      .unwrap_or(RegionId(0))
+  };
+  region(state.fleet.host()) == region(peer)
 }
 
 /// The member id currently learned for `anchor` (task #22): the control shard's learned map, `None` off it
@@ -678,21 +692,6 @@ pub async fn run_membership(transport: FleetTransport) {
     .collect();
   let allowed: Vec<CertificateDer<'static>> =
     roster.iter().map(|peer| peer.certificate.clone()).collect();
-  // Seed learn-on-contact (task #22): each peer is known by its manifest seed — its generation-0 id — until it
-  // announces itself; a first contact at a higher generation (an anchored daemon's first boot is already
-  // generation one) replaces the seed exactly as a restart would, retiring the placeholder and admitting the
-  // id the peer really holds.
-  state::with_state(|s| {
-    for peer in &roster {
-      s.learned_members.insert(
-        peer.anchor,
-        LearnedMember {
-          generation: 0,
-          host: peer.seed,
-        },
-      );
-    }
-  });
   let max_sessions = peers.len().saturating_mul(SESSIONS_PER_PEER);
   // The demultiplexers are owned by this shard for its life and dropped with it (their sockets closed,
   // the ports free again — a restarted node binds the same addresses); a start refused here means this
@@ -970,10 +969,10 @@ async fn serve_peer_probes(
     return;
   }
   // Only a **rostered** certificate may move membership (auth): the anchor it stands for is what the prober's
-  // announced id and generation are validated against ([`learn_member`], task #22 learn-on-contact) — a
-  // restart's higher-generation id is admitted as a **new member** and its old id retired in that one fold; a
+  // announced id and boot_nonce are validated against ([`learn_member`], task #22 learn-on-contact) — a
+  // restart's higher-boot_nonce id is admitted as a **new member** and its old id retired in that one fold; a
   // stale or forged announcement is refused, counted, and not answered. An unrostered prober is answered but
-  // never folded (a ping's `from` is unauthenticated). This node's own generation rides every acknowledgement,
+  // never folded (a ping's `from` is unauthenticated). This node's own boot_nonce rides every acknowledgement,
   // so the prober validates this node the same way.
   let rostered_anchor = endpoint.peer_certificate().and_then(|presented| {
     roster
@@ -981,7 +980,7 @@ async fn serve_peer_probes(
       .find(|peer| peer.certificate == presented)
       .map(|peer| peer.anchor)
   });
-  let local_generation = state::with_state(|s| s.member_generation).unwrap_or(0);
+  let local_boot_nonce = state::with_state(|s| s.member_boot_nonce).unwrap_or(0);
   let timing = detector_timing(neighbourhood);
   let fanout = usize::try_from(timing.gossip_transmits).unwrap_or(1);
   let mut detector = Detector::new(local, timing);
@@ -994,7 +993,7 @@ async fn serve_peer_probes(
             detector.learn_coordinate(message.from(), coordinate.clone());
           }
           let mut gossip = detector.gossip(fanout);
-          if let (Some(anchor), Some(generation)) = (rostered_anchor, message.generation()) {
+          if let (Some(anchor), Some(boot_nonce)) = (rostered_anchor, message.boot_nonce()) {
             let peer = message.from();
             // Prefer the incarnation the prober asserts for itself (an A-15 refutation of a suspicion);
             // otherwise a fresh alive. The incarnation-gated merge (`FleetNode::observe`) leaves a *retired* id
@@ -1008,8 +1007,8 @@ async fn serve_peer_probes(
                 liveness: Liveness::Alive,
                 incarnation: 0,
               });
-            let admitted = state::with_state(|s| match learn_member(s, anchor, generation, peer) {
-              LearnedOutcome::Stale | LearnedOutcome::Forged => false,
+            let admitted = state::with_state(|s| match learn_member(s, anchor, boot_nonce, peer) {
+              LearnedOutcome::Forged => false,
               LearnedOutcome::Current | LearnedOutcome::Restarted { .. } => {
                 apply_peer_state(&mut s.fleet, peer, Some(asserted));
                 // Echo this node's belief about the prober so a peer this node believes dead learns of it and
@@ -1033,7 +1032,7 @@ async fn serve_peer_probes(
           SwimMessage::Ack {
             from: local,
             nonce: message.nonce().unwrap_or(0),
-            generation: local_generation,
+            boot_nonce: local_boot_nonce,
             gossip,
             coordinate: detector.coordinate(),
           }
@@ -1116,7 +1115,7 @@ async fn probe_and_apply(
   detector: &mut Detector,
   session: Option<Endpoint>,
   local: HostId,
-  local_generation: u64,
+  local_boot_nonce: u64,
   peer: &ProbedPeer,
   fanout: usize,
   nonce: u64,
@@ -1127,7 +1126,7 @@ async fn probe_and_apply(
   let ping = SwimMessage::Ping {
     from: local,
     nonce,
-    generation: local_generation,
+    boot_nonce: local_boot_nonce,
     // The buddy system: a ping to a peer this node suspects always carries that suspicion, so the peer
     // refutes it from this very probe rather than after the gossip budget is spent.
     gossip: detector.ping_gossip(peer.host, fanout),
@@ -1137,17 +1136,16 @@ async fn probe_and_apply(
       returned,
       ProbeOutcome::Acked {
         from,
-        generation,
+        boot_nonce,
         gossip,
         rtt_ns,
         coordinate,
       },
     )) => {
       // Learn-on-contact (task #22, §4.8 "Recovery"): credit the id probed only if the node still answers
-      // under it. A node answering under a **different** id is learned there and then: a valid higher
-      // generation is a restart, folded at once (its old id dead and taken over, the new alive and admitted)
-      // and picked up by [`probe_peer`], which switches this task to the new id next period; a stale or
-      // forged announcement is refused and counted, never credited. The gossip (other members' states) is
+      // under it. A different id must derive from the authenticated anchor and a new boot nonce.
+      // Learning it retires the old member; [`probe_peer`] follows the fresh id next period.
+      // A forged announcement is refused and counted. Raft admission is a separate transition. The gossip (other members' states) is
       // folded regardless.
       if from == peer.host {
         detector.on_ack(peer.host);
@@ -1163,7 +1161,7 @@ async fn probe_and_apply(
         // `follow_current_id` switches this task to the peer's current id next period. In steady state (no
         // restart) this never fires — on a first boot every node's id is its manifest gen-0 seed
         // (`daemon::boot_incarnation`), so a probe is credited to the id it was sent to.
-        let _ = state::with_state(|s| learn_member(s, peer.anchor, generation, from));
+        let _ = state::with_state(|s| learn_member(s, peer.anchor, boot_nonce, from));
       }
       detector.apply_gossip(&gossip);
       returned
@@ -1250,7 +1248,7 @@ async fn probe_peer(
   } = dial;
   // The peer's current member id, its seed until learned otherwise (task #22): the loop below follows it.
   let mut peer = ProbedPeer { anchor, host: seed };
-  let local_generation = state::with_state(|s| s.member_generation).unwrap_or(0);
+  let local_boot_nonce = state::with_state(|s| s.member_boot_nonce).unwrap_or(0);
   let mut probe_timing = ProbeTiming::new();
   let timing = detector_timing(neighbourhood);
   let fanout = usize::try_from(timing.gossip_transmits).unwrap_or(1);
@@ -1307,7 +1305,7 @@ async fn probe_peer(
         &mut detector,
         session.take(),
         local,
-        local_generation,
+        local_boot_nonce,
         &peer,
         fanout,
         probe_nonce,
@@ -1365,7 +1363,7 @@ fn probe_period_ns(health_multiplier: u32) -> u64 {
 /// answered from that same hold with a binding promise. Both are served here because the session plane
 /// carries both and `serve_once` hands the handler the raw request either way; the two never collide, a
 /// [`Prepare`] being a fixed 40 bytes and a [`Record`] always longer (its prefix alone exceeds that), so
-/// the length disambiguates. The acceptor authorizes the record's or prepare's owner and generation against
+/// the length disambiguates. The acceptor authorizes the record's or prepare's owner and configuration generation against
 /// the authority the takeover installed, fences the epoch, and refuses a stale writer. The peer is whoever
 /// the handshake authenticated — its certificate names it in `roster` (mutual TLS admits only roster
 /// certificates; one not found is counted, never served). A serve failure (the peer's connection dropped
@@ -1421,7 +1419,15 @@ async fn serve_peer_records(mut endpoint: Endpoint, local: HostId, roster: Vec<R
             .unwrap_or_default(),
           PROMOTE_STREAM => Prepare::decode(&request)
             .ok()
-            .and_then(|prepare| state::with_state(|s| serve_held_promotion(s, &prepare)))
+            .and_then(|prepare| {
+              state::with_state(|s| {
+                let peer_host = s
+                  .learned_members
+                  .get(&peer_anchor)
+                  .map_or(seed, |learned| learned.host);
+                serve_held_promotion(s, peer_host, &prepare)
+              })
+            })
             .unwrap_or_default(),
           stream if is_content_stream(stream) => state::with_state(|s| {
             // A test's injected placement refusal (§4.16 placed-before-reference): a holder that
@@ -1448,11 +1454,29 @@ async fn serve_peer_records(mut endpoint: Endpoint, local: HostId, roster: Vec<R
               })
             })
             .unwrap_or_default(),
-          CONFIG_STREAM => state::with_state(|s| serve_council(s, &request)).unwrap_or_default(),
+          CONFIG_STREAM => state::with_state(|s| {
+            serve_council(
+              s,
+              s.learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |member| member.host),
+              &request,
+            )
+          })
+          .unwrap_or_default(),
           CONFIG_FETCH_STREAM => {
             state::with_state(|s| serve_config_fetch(s, &request)).unwrap_or_default()
           }
-          ROOT_STREAM => state::with_state(|s| serve_root(s, &request)).unwrap_or_default(),
+          ROOT_STREAM => state::with_state(|s| {
+            serve_root(
+              s,
+              s.learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |member| member.host),
+              &request,
+            )
+          })
+          .unwrap_or_default(),
           ROOT_FETCH_STREAM => {
             state::with_state(|s| serve_root_fetch(s, &request)).unwrap_or_default()
           }
@@ -1474,7 +1498,14 @@ async fn serve_peer_records(mut endpoint: Endpoint, local: HostId, roster: Vec<R
 /// highest record this node holds for the object — and replies with the binding [`Promise`], or an empty
 /// reply if this node holds nothing for the object or the acceptor refuses (a foreign generation, an
 /// unauthorized owner, or an epoch below the fence), so the new owner counts nothing.
-fn serve_held_promotion(state: &mut ShardState, prepare: &Prepare) -> Vec<u8> {
+pub(crate) fn serve_held_promotion(
+  state: &mut ShardState,
+  peer_host: HostId,
+  prepare: &Prepare,
+) -> Vec<u8> {
+  if prepare.owner != peer_host {
+    return encode_refusal(&RegisterError::Unauthorized);
+  }
   match state.holder_records.get_mut(&prepare.object) {
     Some(acceptor) => match acceptor.prepare(prepare) {
       Ok(promise) => promise.encode(),
@@ -1522,15 +1553,10 @@ pub(crate) fn accept_held_record(
   peer_host: HostId,
   record: &Record,
 ) -> Vec<u8> {
-  let generation = state.fleet.configuration().version;
-  // The reactive piggyback, holder-behind direction (§4.8 "every fleet request carries the sender's
-  // configuration version"): a record naming a newer generation than this node's own is evidence this node's
-  // configuration is stale. Flag a refresh so the coordinator fetches the committed configuration from a
-  // voter next period; the record itself is still refused below (this holder cannot validate authority under
-  // a generation it has not installed), and the owner re-ships it once this node has caught up.
-  if record.generation > state.council.configuration().version {
-    state.config_refresh_wanted = true;
+  if let Err(error) = check_held_record(state, local, peer_host, record) {
+    return encode_refusal(&error);
   }
+  let generation = state.fleet.configuration().version;
   let accepted = match state.holder_records.get_mut(&record.object) {
     Some(acceptor) => acceptor.accept(record),
     None => {
@@ -1566,6 +1592,36 @@ pub(crate) fn accept_held_record(
     // version, so a stale sender refreshes and retries); every other refusal is an empty reply the sender
     // counts as no acknowledgement ([`encode_refusal`]).
     Err(error) => encode_refusal(&error),
+  }
+}
+
+/// Validates a record against both the transport principal and installed authority before any effect
+/// (§4.8, §4.16; AUD-10/AUD-12). The first record and all later records have the same peer binding.
+/// A merge holder calls this before recomputing, then accepts in the same synchronous shard turn.
+pub(crate) fn check_held_record(
+  state: &mut ShardState,
+  local: HostId,
+  peer_host: HostId,
+  record: &Record,
+) -> Result<(), RegisterError> {
+  if record.owner != peer_host {
+    return Err(RegisterError::Unauthorized);
+  }
+  // The authenticated owner knows a newer configuration (§4.8 piggyback). Refuse this attempt, and
+  // fetch that committed configuration before its retry; a forged owner cannot trigger this work.
+  if record.generation > state.council.configuration().version {
+    state.config_refresh_wanted = true;
+  }
+  match state.holder_records.get(&record.object) {
+    Some(acceptor) => acceptor.check(record),
+    None => Acceptor::new(
+      local,
+      Authority {
+        generation: state.fleet.configuration().version,
+        owner: peer_host,
+      },
+    )
+    .check(record),
   }
 }
 
@@ -2536,7 +2592,10 @@ pub(crate) fn keeps_direct_contact_with(state: &ShardState, peer: HostId) -> boo
     .state(peer)
     .is_some_and(|belief| belief.liveness == Liveness::Dead);
   !believed_dead
-    && (state.fleet.configuration().neighbourhood.contains(&peer)
+    && (!state.council.initialized()
+      || !state.root.initialized()
+      || !state.council.configuration().members.contains(&peer)
+      || state.fleet.configuration().neighbourhood.contains(&peer)
       || state.council.is_voter(peer)
       || state.root.is_voter(peer))
 }
@@ -2776,28 +2835,28 @@ fn fold_late_replies(late: LateReplies, replies: &[(HostId, TimedReply)]) {
     if matches!(late, LateReplies::Council | LateReplies::Root) {
       sample_voter_paths(s, replies);
     }
-    for (_, reply) in replies {
+    for (peer, reply) in replies {
       let bytes = &reply.bytes;
       match late {
         LateReplies::Discard => {}
         LateReplies::Council => {
-          if let Some(message) = late_raft_reply(bytes) {
+          if let Some(message) = late_raft_reply(s, false, bytes, *peer) {
             s.council.fold_reply(message);
           }
         }
         LateReplies::Root => {
-          if let Some(message) = late_raft_reply(bytes) {
+          if let Some(message) = late_raft_reply(s, true, bytes, *peer) {
             s.root.fold_reply(message);
           }
         }
         LateReplies::ConfigFetch => {
-          if let Ok(configuration) = decode_regional_configuration(bytes) {
-            s.council.adopt(configuration);
+          if !crate::consensus::adopt_fetch(s, false, *peer, bytes) {
+            *s.refusals.entry("consensus_join_refused").or_insert(0) += 1;
           }
         }
         LateReplies::RootFetch => {
-          if let Ok(configuration) = decode_root_configuration(bytes) {
-            s.root.adopt(configuration);
+          if !crate::consensus::adopt_fetch(s, true, *peer, bytes) {
+            *s.refusals.entry("consensus_join_refused").or_insert(0) += 1;
           }
         }
         // Folded on the seal's owner shard by [`fold_late_content`], outside this borrow.
@@ -2811,8 +2870,13 @@ fn fold_late_replies(late: LateReplies, replies: &[(HostId, TimedReply)]) {
 /// message and is exactly the acknowledgement a slow voter would otherwise cost. A late **pre-vote** reply
 /// is dropped: completing a pre-election here would owe follow-on vote requests a settle cannot ship, and
 /// the next campaign simply re-runs its pre-vote.
-fn late_raft_reply(bytes: &[u8]) -> Option<RaftMessage> {
-  match RaftMessage::decode(bytes) {
+fn late_raft_reply(
+  state: &ShardState,
+  root: bool,
+  bytes: &[u8],
+  peer: HostId,
+) -> Option<RaftMessage> {
+  match crate::consensus::decode_message(state, root, peer, bytes) {
     Ok(RaftMessage::PreVoteReply(_)) | Err(_) => None,
     Ok(message) => Some(message),
   }
@@ -2871,12 +2935,15 @@ const FORWARD_STREAM: u64 = 11;
 /// the regional configuration and refreshing this node's leader contact — and returns the reply to ship
 /// back. A reply-typed or malformed message is answered with nothing (the sender counts no reply). Runs
 /// synchronously inside `serve_once`, no await held across it.
-fn serve_council(state: &mut ShardState, request: &[u8]) -> Vec<u8> {
-  match RaftMessage::decode(request) {
+fn serve_council(state: &mut ShardState, peer: HostId, request: &[u8]) -> Vec<u8> {
+  if !same_region(state, peer) {
+    return Vec::new();
+  }
+  match crate::consensus::decode_message(state, false, peer, request) {
     Ok(message) => state
       .council
       .answer(message)
-      .map(|reply| reply.encode())
+      .and_then(|reply| crate::consensus::encode_message(state, false, &reply))
       .unwrap_or_default(),
     Err(_) => Vec::new(),
   }
@@ -2886,53 +2953,29 @@ fn serve_council(state: &mut ShardState, request: &[u8]) -> Vec<u8> {
 /// counterpart of [`serve_council`]: runs it through this node's [`RootGroup`](slates_cluster::root_group::RootGroup),
 /// returning the reply to ship back and applying whatever newly committed to the root configuration. A
 /// reply-typed or malformed message is answered with nothing.
-fn serve_root(state: &mut ShardState, request: &[u8]) -> Vec<u8> {
-  match RaftMessage::decode(request) {
+fn serve_root(state: &mut ShardState, peer: HostId, request: &[u8]) -> Vec<u8> {
+  match crate::consensus::decode_message(state, true, peer, request) {
     Ok(message) => state
       .root
       .answer(message)
-      .map(|reply| reply.encode())
+      .and_then(|reply| crate::consensus::encode_message(state, true, &reply))
       .unwrap_or_default(),
     Err(_) => Vec::new(),
   }
 }
 
-/// Answers a **root learner**'s fetch (§4.8, D-14) — the cross-region parallel of [`serve_config_fetch`]: the
-/// request carries the learner's root configuration version, and this root voter returns its committed root
-/// configuration only when it holds a newer one (a caught-up learner's fetch is then an empty reply, not a
-/// full transfer).
+/// Answers a root learner's fetch (§4.8, D-14), parallel to [`serve_config_fetch`]. A fresh
+/// member receives the common base and retained prefix; later fetches name the group and version.
 fn serve_root_fetch(state: &ShardState, request: &[u8]) -> Vec<u8> {
-  let learner_version = request
-    .get(..std::mem::size_of::<u64>())
-    .and_then(|bytes| <[u8; std::mem::size_of::<u64>()]>::try_from(bytes).ok())
-    .map(u64::from_le_bytes)
-    .unwrap_or(0);
-  let config = state.root.configuration();
-  if config.version > learner_version {
-    encode_root_configuration(config)
-  } else {
-    Vec::new()
-  }
+  crate::consensus::serve_fetch(state, true, request).unwrap_or_default()
 }
 
-/// Answers a **learner**'s configuration fetch on [`CONFIG_FETCH_STREAM`] (§4.8, D-14): a non-voter member
-/// asks this node for the committed regional configuration, sending its own current version; this returns
-/// the configuration encoded **only if this node's is newer**, else an empty reply. So a caught-up learner's
-/// periodic fetch costs an eight-byte request and an empty reply rather than a full-configuration transfer —
-/// most fetches are no-ops at the near-zero config-commit rate. A malformed or short request is treated as
-/// version zero (the full configuration is returned). Runs synchronously inside `serve_once`.
+/// Answers a learner's configuration fetch on [`CONFIG_FETCH_STREAM`] (§4.8, D-14). Initial
+/// admission transfers the common base and retained Raft prefix. An initialized learner names its
+/// group and applied version and receives only a newer configuration. Malformed or foreign-group
+/// requests receive no state. Runs synchronously inside `serve_once`.
 fn serve_config_fetch(state: &ShardState, request: &[u8]) -> Vec<u8> {
-  let learner_version = request
-    .get(..std::mem::size_of::<u64>())
-    .and_then(|bytes| <[u8; std::mem::size_of::<u64>()]>::try_from(bytes).ok())
-    .map(u64::from_le_bytes)
-    .unwrap_or(0);
-  let config = state.council.configuration();
-  if config.version > learner_version {
-    encode_regional_configuration(config)
-  } else {
-    Vec::new()
-  }
+  crate::consensus::serve_fetch(state, false, request).unwrap_or_default()
 }
 
 /// Drives one replication round as the council **leader**: ships each other voter the append it is owed (a
@@ -2954,9 +2997,10 @@ async fn drive_council_replication(
     sessions
       .iter()
       .filter_map(|(host, _)| {
-        s.council
-          .replication_for(*host)
-          .map(|append| (*host, RaftMessage::AppendEntries(append).encode()))
+        s.council.replication_for(*host).and_then(|append| {
+          crate::consensus::encode_message(s, false, &RaftMessage::AppendEntries(append))
+            .map(|bytes| (*host, bytes))
+        })
       })
       .collect()
   })
@@ -2980,8 +3024,8 @@ async fn drive_council_replication(
   }
   state::with_state(|s| {
     sample_voter_paths(s, &replies);
-    for (_, reply) in replies {
-      if let Ok(message) = RaftMessage::decode(&reply.bytes) {
+    for (peer, reply) in replies {
+      if let Ok(message) = crate::consensus::decode_message(s, false, peer, &reply.bytes) {
         s.council.fold_reply(message);
       }
     }
@@ -3019,7 +3063,9 @@ async fn drive_council_election(
     return;
   }
   // Phase one — the pre-vote round over the borrowed voter sessions.
-  let pre_bytes = pre_vote.encode();
+  let pre_bytes = state::with_state(|s| crate::consensus::encode_message(s, false, &pre_vote))
+    .flatten()
+    .unwrap_or_default();
   let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
     .into_iter()
     .map(|(host, endpoint)| (host, pre_bytes.clone(), endpoint))
@@ -3045,8 +3091,8 @@ async fn drive_council_election(
   let vote = state::with_state(|s| {
     sample_voter_paths(s, &pre_replies);
     let mut vote = None;
-    for (_, reply) in &pre_replies {
-      if let Ok(message) = RaftMessage::decode(&reply.bytes)
+    for (peer, reply) in &pre_replies {
+      if let Ok(message) = crate::consensus::decode_message(s, false, *peer, &reply.bytes)
         && let Some(request) = s.council.fold_reply(message).into_iter().next()
       {
         vote = Some(request);
@@ -3060,7 +3106,9 @@ async fn drive_council_election(
     return;
   };
   // Phase two — the real vote round over the same sessions.
-  let vote_bytes = vote.encode();
+  let vote_bytes = state::with_state(|s| crate::consensus::encode_message(s, false, &vote))
+    .flatten()
+    .unwrap_or_default();
   let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
     .into_iter()
     .map(|(host, endpoint)| (host, vote_bytes.clone(), endpoint))
@@ -3075,8 +3123,8 @@ async fn drive_council_election(
   }
   state::with_state(|s| {
     sample_voter_paths(s, &vote_replies);
-    for (_, reply) in vote_replies {
-      if let Ok(message) = RaftMessage::decode(&reply.bytes) {
+    for (peer, reply) in vote_replies {
+      if let Ok(message) = crate::consensus::decode_message(s, false, peer, &reply.bytes) {
         s.council.fold_reply(message);
       }
     }
@@ -3147,10 +3195,11 @@ async fn drive_config_council(
   // it learns a failed owner's retirement and its own reassignment only by installing the committed
   // configuration). The adopted configuration is installed into placement by `sync_config_from_council`,
   // exactly as a voter's committed one is.
-  if !is_voter {
-    let wanted =
-      state::with_state(|s| s.config_refresh_wanted || membership_diverges_from_config(s))
-        .unwrap_or(false);
+  if !is_voter && !is_leader {
+    let wanted = state::with_state(|s| {
+      !s.council.initialized() || s.config_refresh_wanted || membership_diverges_from_config(s)
+    })
+    .unwrap_or(false);
     if wanted {
       drive_learner_fetch(&voters, budget, in_flight).await;
       let _ = state::with_state(|s| s.config_refresh_wanted = false);
@@ -3170,11 +3219,9 @@ async fn drive_config_council(
     // detection need not. Each alive member is proposed with the failure domain its node declares, so an
     // admission — a restarted node's new id among them (task #22) — carries the domain into the configuration.
     state::with_state(|s| {
-      let alive: Vec<(HostId, Option<DomainId>)> = s
-        .fleet
-        .membership()
-        .alive()
+      let alive: Vec<(HostId, Option<DomainId>)> = authenticated_alive(s)
         .into_iter()
+        .filter(|host| same_region(s, *host))
         .map(|host| (host, declared_domain(s, host)))
         .collect();
       s.council.reconcile_alive(&alive);
@@ -3216,7 +3263,7 @@ async fn drive_config_council(
 /// assignment). The root leader moves the root voter set to the representatives of the committed regions
 /// (`RootGroup::reconcile_voters`), so a region whose representative died is carried by its next live host.
 fn alive_representatives(state: &ShardState) -> std::collections::BTreeMap<RegionId, HostId> {
-  root_representatives(&state.fleet.membership().alive(), &state.node_regions)
+  root_representatives(&authenticated_alive(state), &state.node_regions)
 }
 
 /// The regions currently **alive** as this node sees them (§4.8, D-14): the distinct regions of the SWIM
@@ -3224,10 +3271,7 @@ fn alive_representatives(state: &ShardState) -> std::collections::BTreeMap<Regio
 /// region `RegionId(0)`). The root group's leader reconciles the region membership against this — an alive
 /// host's region is an alive region, and a region with no alive host is retired.
 fn alive_regions(state: &ShardState) -> Vec<RegionId> {
-  let mut regions: Vec<RegionId> = state
-    .fleet
-    .membership()
-    .alive()
+  let mut regions: Vec<RegionId> = authenticated_alive(state)
     .into_iter()
     .map(|host| {
       state
@@ -3260,11 +3304,9 @@ fn root_diverges(state: &ShardState) -> bool {
 /// parallel (a third such consensus group would motivate factoring the shared Raft-drive shape). As the
 /// elected root master it reconciles the region membership from the regions currently alive
 /// ([`alive_regions`]) and replicates over the transport ([`ROOT_STREAM`]); the sole voter self-elects; a
-/// follower ages toward an election. A node that is **not** a root voter (not a region representative) does
-/// nothing here — the root **learner** that fetches the committed root configuration is the owed follow-on,
-/// so a non-representative host does not yet track the root configuration (nor does the verb path read it
-/// yet). `idle`, `seen_contact` and `attempt` are the root group's own persistent election-timer state,
-/// distinct from the council's.
+/// follower ages toward an election. A non-voter fetches the root's committed configuration;
+/// a retiring leader keeps replicating until its removal commits. The root election timer is
+/// independent of the council's timer.
 async fn drive_root_group(
   local: HostId,
   budget: CommitBudget,
@@ -3282,13 +3324,13 @@ async fn drive_root_group(
   }) else {
     return;
   };
-  if !is_voter {
+  if !is_voter && !is_leader {
     // A root learner (a region member that is not its region's representative): it does not drive the Raft.
     // It fetches the committed root configuration from a root voter and adopts the newest (§4.8, D-14) —
     // reactively, only when its own alive view of the regions diverges from the root configuration it holds
     // ([`root_diverges`]), so a converged learner sends nothing. The cross-region parallel of the config
     // learner's reactive fetch.
-    let wanted = state::with_state(|s| root_diverges(s)).unwrap_or(false);
+    let wanted = state::with_state(|s| !s.root.initialized() || root_diverges(s)).unwrap_or(false);
     if wanted {
       drive_root_learner_fetch(&voters, budget, in_flight).await;
     }
@@ -3353,9 +3395,10 @@ async fn drive_root_replication(
     sessions
       .iter()
       .filter_map(|(host, _)| {
-        s.root
-          .replication_for(*host)
-          .map(|append| (*host, RaftMessage::AppendEntries(append).encode()))
+        s.root.replication_for(*host).and_then(|append| {
+          crate::consensus::encode_message(s, true, &RaftMessage::AppendEntries(append))
+            .map(|bytes| (*host, bytes))
+        })
       })
       .collect()
   })
@@ -3378,8 +3421,8 @@ async fn drive_root_replication(
   }
   state::with_state(|s| {
     sample_voter_paths(s, &replies);
-    for (_, reply) in replies {
-      if let Ok(message) = RaftMessage::decode(&reply.bytes) {
+    for (peer, reply) in replies {
+      if let Ok(message) = crate::consensus::decode_message(s, true, peer, &reply.bytes) {
         s.root.fold_reply(message);
       }
     }
@@ -3411,7 +3454,9 @@ async fn drive_root_election(
     return;
   }
   // Phase one — the pre-vote round over the borrowed root-voter sessions.
-  let pre_bytes = pre_vote.encode();
+  let pre_bytes = state::with_state(|s| crate::consensus::encode_message(s, true, &pre_vote))
+    .flatten()
+    .unwrap_or_default();
   let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
     .into_iter()
     .map(|(host, endpoint)| (host, pre_bytes.clone(), endpoint))
@@ -3436,8 +3481,8 @@ async fn drive_root_election(
   let vote = state::with_state(|s| {
     sample_voter_paths(s, &pre_replies);
     let mut vote = None;
-    for (_, reply) in &pre_replies {
-      if let Ok(message) = RaftMessage::decode(&reply.bytes)
+    for (peer, reply) in &pre_replies {
+      if let Ok(message) = crate::consensus::decode_message(s, true, *peer, &reply.bytes)
         && let Some(request) = s.root.fold_reply(message).into_iter().next()
       {
         vote = Some(request);
@@ -3451,7 +3496,9 @@ async fn drive_root_election(
     return;
   };
   // Phase two — the real vote round over the same sessions.
-  let vote_bytes = vote.encode();
+  let vote_bytes = state::with_state(|s| crate::consensus::encode_message(s, true, &vote))
+    .flatten()
+    .unwrap_or_default();
   let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
     .into_iter()
     .map(|(host, endpoint)| (host, vote_bytes.clone(), endpoint))
@@ -3466,8 +3513,8 @@ async fn drive_root_election(
   }
   state::with_state(|s| {
     sample_voter_paths(s, &vote_replies);
-    for (_, reply) in vote_replies {
-      if let Ok(message) = RaftMessage::decode(&reply.bytes) {
+    for (peer, reply) in vote_replies {
+      if let Ok(message) = crate::consensus::decode_message(s, true, peer, &reply.bytes) {
         s.root.fold_reply(message);
       }
     }
@@ -3492,14 +3539,17 @@ async fn drive_root_learner_fetch(
   budget: CommitBudget,
   in_flight: &mut Vec<Dispatch>,
 ) {
-  let sessions = take_sessions(|host| voters.contains(&host));
+  let sessions = take_sessions(|host| voters.is_empty() || voters.contains(&host));
   if sessions.is_empty() {
     return;
   }
-  let request = state::with_state(|s| s.root.configuration().version)
-    .unwrap_or(0)
-    .to_le_bytes()
-    .to_vec();
+  let request = state::with_state(|s| {
+    slates_wire::Wire::to_bytes(&crate::consensus::Fetch {
+      group: s.root_group,
+      version: s.root.configuration().version,
+    })
+  })
+  .unwrap_or_default();
   let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
     .into_iter()
     .map(|(host, endpoint)| (host, request.clone(), endpoint))
@@ -3507,10 +3557,10 @@ async fn drive_root_learner_fetch(
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
   let (replied, stragglers) = broadcast(requests, ROOT_FETCH_STREAM, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
-  let mut fetched: Vec<Vec<u8>> = Vec::new();
+  let mut fetched = Vec::new();
   for (host, reply, endpoint) in replied {
     if !reply.bytes.is_empty() {
-      fetched.push(reply.bytes);
+      fetched.push((host, reply.bytes));
     }
     recovered.push((host, endpoint));
   }
@@ -3523,9 +3573,9 @@ async fn drive_root_learner_fetch(
   ));
   return_sessions(recovered);
   state::with_state(|s| {
-    for bytes in &fetched {
-      if let Ok(configuration) = decode_root_configuration(bytes) {
-        s.root.adopt(configuration);
+    for (peer, bytes) in &fetched {
+      if !crate::consensus::adopt_fetch(s, true, *peer, bytes) {
+        *s.refusals.entry("consensus_join_refused").or_insert(0) += 1;
       }
     }
   });
@@ -3544,16 +3594,29 @@ async fn drive_learner_fetch(
   budget: CommitBudget,
   in_flight: &mut Vec<Dispatch>,
 ) {
-  let sessions = take_sessions(|host| voters.contains(&host));
+  let regional_peers: Vec<HostId> = state::with_state(|s| {
+    s.record_sessions
+      .keys()
+      .copied()
+      .filter(|host| same_region(s, *host))
+      .collect()
+  })
+  .unwrap_or_default();
+  let sessions = take_sessions(|host| {
+    regional_peers.contains(&host) && (voters.is_empty() || voters.contains(&host))
+  });
   if sessions.is_empty() {
     return;
   }
   // The fetch carries this learner's current configuration version, so a voter returns the configuration
   // only when it has a newer one (a caught-up learner's fetch is then an empty reply, not a full transfer).
-  let request = state::with_state(|s| s.council.configuration().version)
-    .unwrap_or(0)
-    .to_le_bytes()
-    .to_vec();
+  let request = state::with_state(|s| {
+    slates_wire::Wire::to_bytes(&crate::consensus::Fetch {
+      group: s.council_group,
+      version: s.council.configuration().version,
+    })
+  })
+  .unwrap_or_default();
   let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
     .into_iter()
     .map(|(host, endpoint)| (host, request.clone(), endpoint))
@@ -3561,10 +3624,10 @@ async fn drive_learner_fetch(
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
   let (replied, stragglers) = broadcast(requests, CONFIG_FETCH_STREAM, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
-  let mut fetched: Vec<Vec<u8>> = Vec::new();
+  let mut fetched = Vec::new();
   for (host, reply, endpoint) in replied {
     if !reply.bytes.is_empty() {
-      fetched.push(reply.bytes);
+      fetched.push((host, reply.bytes));
     }
     recovered.push((host, endpoint));
   }
@@ -3579,9 +3642,9 @@ async fn drive_learner_fetch(
   // Adopt the newest fetched configuration (`adopt` only moves forward, so folding all replies leaves the
   // learner on the highest version any reachable voter returned).
   state::with_state(|s| {
-    for bytes in &fetched {
-      if let Ok(configuration) = decode_regional_configuration(bytes) {
-        s.council.adopt(configuration);
+    for (peer, bytes) in &fetched {
+      if !crate::consensus::adopt_fetch(s, false, *peer, bytes) {
+        *s.refusals.entry("consensus_join_refused").or_insert(0) += 1;
       }
     }
   });
@@ -3603,6 +3666,10 @@ fn sync_config_from_council(local: HostId) {
   // design makes a tripwire). The committed configuration reaches the node's other shards separately, every
   // period, through [`fan_configs_to_shards`], so a failed cross-shard dispatch self-heals.
   state::with_state(|s| {
+    s.consensus_ready = s.council.initialized()
+      && s.root.initialized()
+      && s.council.configuration().members.contains(&local);
+
     if s.council.configuration().version == s.fleet.configuration().version {
       return;
     }
@@ -3666,11 +3733,12 @@ fn sync_config_from_council(local: HostId) {
 /// and promotions), so the per-period cost is bounded at every scale. A non-control shard tracks no held
 /// object, so its `install_configuration` returns no reassignment to drive — takeover stays on this shard.
 fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
-  let Some((placement, members, root)) = state::with_state(|s| {
+  let Some((placement, members, root, ready)) = state::with_state(|s| {
     (
       s.fleet.configuration().clone(),
       s.fleet.members().to_vec(),
       s.root.configuration().clone(),
+      s.consensus_ready,
     )
   }) else {
     return;
@@ -3680,7 +3748,7 @@ fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
     let members = members.clone();
     let root = root.clone();
     let _ = run_on(origin, shard, move |s| {
-      if placement.version > s.fleet.configuration().version {
+      if !s.consensus_ready || placement.version > s.fleet.configuration().version {
         // This shard serves its own writes, so it measures the fanned configuration against the durability
         // policy for itself (the shortfall its writes are refused with); the control shard already counted
         // this change's breach, so the measurement here moves no signal.
@@ -3693,6 +3761,7 @@ fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
         let _ = s.fleet.install_configuration(placement, &members);
       }
       s.root.adopt(root);
+      s.consensus_ready = ready;
     });
   }
 }
@@ -4242,42 +4311,40 @@ mod tests {
     );
   }
 
-  /// Learn-on-contact's decision, by use (task #22, §4.8 "Recovery"): an announced id must derive from the
-  /// peer's anchor and generation; a higher generation than known is a restart naming the id to retire; an
-  /// equal one is the ordinary contact; a lower one is stale; and an anchor never seen is current from its
-  /// first announcement.
+  /// AC-8.1: authenticated announcements must derive from their anchor and nonce. A new
+  /// nonce changes the member in either numeric direction; malformed claims are refused.
   #[test]
-  fn an_announced_identity_is_current_restarted_stale_or_forged() {
+  fn an_announced_identity_is_current_restarted_or_forged() {
     let anchor = HostId(0xA11C);
     let seed = crate::deploy::member_id(anchor, 0);
     let next = crate::deploy::member_id(anchor, 1);
     let known = LearnedMember {
-      generation: 0,
+      boot_nonce: 0,
       host: seed,
     };
     assert_eq!(
       classify_announced(Some(&known), anchor, 0, seed),
       LearnedOutcome::Current,
-      "the seed at generation 0 is the ordinary contact"
+      "the seed at boot_nonce 0 is the ordinary contact"
     );
     assert_eq!(
       classify_announced(Some(&known), anchor, 1, next),
       LearnedOutcome::Restarted { old: seed },
-      "a higher generation is a restart, naming the seed as the id to retire"
+      "a different boot nonce is a restart, naming the seed as the id to retire"
     );
     let restarted = LearnedMember {
-      generation: 1,
+      boot_nonce: 1,
       host: next,
     };
     assert_eq!(
       classify_announced(Some(&restarted), anchor, 0, seed),
-      LearnedOutcome::Stale,
-      "the old generation announced after the new one is stale"
+      LearnedOutcome::Restarted { old: next },
+      "boot nonces have no numeric ordering"
     );
     assert_eq!(
       classify_announced(Some(&known), anchor, 1, seed),
       LearnedOutcome::Forged,
-      "the seed id is not what generation 1 derives to"
+      "the seed id is not what boot_nonce 1 derives to"
     );
     assert_eq!(
       classify_announced(Some(&known), anchor, 0, HostId(7)),
@@ -4286,8 +4353,8 @@ mod tests {
     );
     assert_eq!(
       classify_announced(None, anchor, 3, crate::deploy::member_id(anchor, 3)),
-      LearnedOutcome::Current,
-      "an anchor never seen is current from its first announcement"
+      LearnedOutcome::Restarted { old: seed },
+      "first contact retires the non-voting manifest placeholder"
     );
   }
 

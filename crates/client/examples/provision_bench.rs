@@ -231,6 +231,9 @@ fn main() {
     },
   )
   .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   println!(
     "provisioning histogram: {shards} shards, spin window {} ns, floor {PROVISION_FLOOR_NS} ns",
     daemon.config().region.spin_ns

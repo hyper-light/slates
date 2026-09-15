@@ -107,6 +107,9 @@ fn single_shard_daemon(name: &str) -> (Daemon, String) {
     },
   )
   .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   (daemon, instance)
 }
 
@@ -124,6 +127,9 @@ fn two_shard_daemon(name: &str) -> (Daemon, String) {
     },
   )
   .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   (daemon, instance)
 }
 

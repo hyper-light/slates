@@ -563,6 +563,11 @@ impl Volume {
   /// does not yet capture (a base-backed entry or a whiteout over one), so a base-backed volume is
   /// never imaged as if it were only its overlay (the base-plane recovery gate).
   pub fn to_image(&self, store: &Store) -> Result<VolumeImage, VfsError> {
+    // The image format has no base witnesses or retained host handles (§4.8, AUD-05). Even an
+    // unvisited overlay depends on its base; its empty materialized tree is not a complete image.
+    if self.base.is_some() {
+      return Err(VfsError::RecoveryIncomplete);
+    }
     let inodes = self.capture_tree(store, self.inode_root, None)?;
     let snapshots = self.capture_snapshots(store)?;
     let root_no = store

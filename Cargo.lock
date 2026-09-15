@@ -1435,6 +1435,7 @@ dependencies = [
  "slates-db",
  "slates-rt",
  "slates-transport",
+ "slates-wire",
 ]
 
 [[package]]

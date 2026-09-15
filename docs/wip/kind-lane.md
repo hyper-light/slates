@@ -1,5 +1,12 @@
 # The KIND fleet lane — the Helm chart and the fleet on real Linux pods
 
+> **AUD-07 lifecycle update (2026-09-14):** first-time formation now requires explicit
+> `slates bootstrap root` on one node; every replacement uses a fresh voting identity. The
+> fresh-deployment `all`, smoke, scale and netem fixtures bootstrap once in their setup; a plain
+> install/upgrade does not bootstrap an existing deployment. Do not put bootstrap in pod startup.
+> See [the voter-loss report](../bugs/2026-09-14-raft-voter-state-loss.md) for quorum-loss limits.
+> The measurements below predate this change; this task did not rerun the live KIND lane.
+
 > **Status (2026-09-14).** The fleet **forms and serves on real multi-node Linux pods**, installed by the
 > Helm chart. Formation (every pod probes both peers, one council leader elected with measured timing),
 > content placement at `f + 1` across pods, and the SIGKILL takeover (the owner's pod deleted, a survivor

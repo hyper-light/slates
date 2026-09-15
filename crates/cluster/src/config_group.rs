@@ -37,7 +37,7 @@ use std::mem::size_of;
 
 use slates_db::register::{DomainId, HostId, Quorum, RegionalConfiguration};
 
-use crate::raft::{AppendEntries, RaftNode};
+use crate::raft::{AppendEntries, RaftNode, RaftRecoveryError, SavedRaft};
 use crate::raft_wire::RaftMessage;
 
 /// A configuration change as it rides the Raft log — the command a committed [`LogEntry`](crate::raft::LogEntry)
@@ -191,10 +191,11 @@ pub fn council_voters(members: &[HostId], quorum: Quorum) -> Vec<HostId> {
 pub struct RegionalCouncil {
   raft: RaftNode,
   configuration: RegionalConfiguration,
-  /// The formed configuration every voter's fold starts from: the committed log is applied onto this, so a
-  /// learner promoted to voter — whose `configuration` is one it *adopted* from a fetch — re-folds the whole
-  /// log from the same base as every other voter, instead of applying the log's commands a second time on
-  /// top of the adopted state (a takeover's epoch bump would otherwise be doubled there).
+  /// A newer read view fetched while a learner. It is never the input to Raft replay:
+  /// applying its commands again would repeat epochs or home changes (§4.8, AUD-07).
+  learned: Option<RegionalConfiguration>,
+  /// The original common base of the committed Raft fold. A fetched learner view stays in
+  /// `learned`; replay advances `configuration` independently and applies each epoch change once.
   base: RegionalConfiguration,
   applied: u64,
   scatter: u64,
@@ -207,6 +208,66 @@ pub struct RegionalCouncil {
 }
 
 impl RegionalCouncil {
+  /// A fresh member with no authority to vote or campaign (§4.8, AUD-07). Its first state must
+  /// come from an existing group, or from the explicit first-time bootstrap operation.
+  pub fn learner(node: HostId, quorum: Quorum, scatter: u64, has_mirror: bool) -> RegionalCouncil {
+    let mut group = Self::new(
+      node,
+      Vec::new(),
+      Vec::new(),
+      quorum,
+      Default::default(),
+      scatter,
+      has_mirror,
+    );
+    group.configuration.version = 0;
+    group.base.version = 0;
+    group
+  }
+
+  /// Whether this node has received the group's common base and consensus prefix.
+  pub fn initialized(&self) -> bool {
+    !self.raft.all_voters().is_empty()
+  }
+
+  /// The consensus prefix and its common fold base for a fresh member. An uninitialized node
+  /// has no group state to offer. The transport authenticates the sender and bounds the frame.
+  pub fn join_state(&self) -> Option<(SavedRaft, RegionalConfiguration)> {
+    self
+      .initialized()
+      .then(|| (self.raft.saved(), self.base.clone()))
+  }
+
+  /// Installs the group's state once under this member's fresh identity. A later fetch cannot
+  /// erase a vote or replace the log: initialized nodes advance through Raft messages.
+  pub fn join_from(
+    &mut self,
+    mut saved: SavedRaft,
+    base: RegionalConfiguration,
+  ) -> Result<(), RaftRecoveryError> {
+    if self.initialized() {
+      return Err(RaftRecoveryError::AlreadyInitialized);
+    }
+    if saved.id == self.raft.id() {
+      return Err(RaftRecoveryError::ReusedIdentity);
+    }
+    // These group wrappers never compact their logs. Accepting a snapshot without its matching
+    // state-machine base would fold a different history; reject it before installing anything.
+    if saved.snapshot_index != 0 {
+      return Err(RaftRecoveryError::InvalidSnapshot);
+    }
+    saved.id = self.raft.id();
+    saved.voted_for = None;
+    let raft = RaftNode::restore(saved)?;
+    self.raft = raft;
+    self.configuration = base.clone();
+    self.learned = None;
+    self.base = base;
+    self.applied = 0;
+    self.apply_committed();
+    Ok(())
+  }
+
   /// A council on this `node` (one of the `voters`) holding the region's `members` at `quorum` and the
   /// failure `domains`, each neighbourhood bounded to `scatter`. A multi-voter council waits for an election
   /// over the transport (the drive loop); a **sole voter** self-elects at once (the `f = 0` laptop
@@ -230,20 +291,23 @@ impl RegionalCouncil {
     }
     let configuration =
       RegionalConfiguration::formed(members, quorum, domains, scatter, has_mirror);
-    RegionalCouncil {
+    let mut group = RegionalCouncil {
       raft,
       base: configuration.clone(),
       configuration,
+      learned: None,
       applied: 0,
       scatter,
       leader_contact: 0,
-    }
+    };
+    group.finish_election(false);
+    group
   }
 
   /// The regional configuration the council has agreed on so far — every node's placement view derives from
   /// it ([`RegionalConfiguration::configuration_for`]).
   pub fn configuration(&self) -> &RegionalConfiguration {
-    &self.configuration
+    self.learned.as_ref().unwrap_or(&self.configuration)
   }
 
   /// Whether this node leads the council (only the leader may propose).
@@ -258,6 +322,13 @@ impl RegionalCouncil {
     self.raft.replication_targets()
   }
 
+  /// The voting set after the membership transition and its log have committed. During
+  /// a joint change this is absent: observing application membership alone cannot prove admission.
+  pub fn committed_voters(&self) -> Option<Vec<HostId>> {
+    (self.initialized() && self.caught_up() && !self.raft.in_joint_configuration())
+      .then(|| self.raft.all_voters())
+  }
+
   /// The leader-contact count (see the field): the drive loop's election timer resets while this advances.
   pub fn leader_contact(&self) -> u64 {
     self.leader_contact
@@ -267,12 +338,25 @@ impl RegionalCouncil {
   /// ship to the other voters — asked *without inflating the term*, so a partitioned node cannot disrupt a
   /// healthy leader. A lone voter proceeds straight to leading with no messages (the `f = 0` degenerate).
   pub fn election_timeout(&mut self) -> Vec<RaftMessage> {
-    self
+    let was_leader = self.is_leader();
+    let messages = self
       .raft
       .on_election_timeout()
       .into_iter()
       .map(RaftMessage::PreVote)
-      .collect()
+      .collect();
+    self.finish_election(was_leader);
+    messages
+  }
+
+  /// A new leader appends a current-term no-op (Raft §5.4.2), so an inherited uncommitted
+  /// tail can commit before the caught-up reconfiguration gate is consulted. Empty commands
+  /// change no application state. A singleton applies its local majority immediately.
+  fn finish_election(&mut self, was_leader: bool) {
+    if !was_leader && self.is_leader() {
+      self.raft.append_command(Vec::new());
+      self.apply_committed();
+    }
   }
 
   /// The append the leader replicates to `follower` now (or a heartbeat), or `None` when not the leader.
@@ -295,6 +379,9 @@ impl RegionalCouncil {
   /// (a follower applies on the append). A reply (`VoteReply`/`PreVoteReply`/`AppendReply`) is not a request
   /// and is not answered here — its sender folds it with [`fold_reply`](RegionalCouncil::fold_reply).
   pub fn answer(&mut self, request: RaftMessage) -> Option<RaftMessage> {
+    if !self.initialized() {
+      return None;
+    }
     match request {
       RaftMessage::PreVote(pre) => Some(RaftMessage::PreVoteReply(self.raft.on_pre_vote(pre))),
       RaftMessage::RequestVote(vote) => {
@@ -339,7 +426,8 @@ impl RegionalCouncil {
   /// advanced only now); a vote reply or append reply yields none. Applies whatever newly committed to the
   /// regional configuration on an append reply (the leader once a majority acknowledges).
   pub fn fold_reply(&mut self, reply: RaftMessage) -> Vec<RaftMessage> {
-    match reply {
+    let was_leader = self.is_leader();
+    let messages = match reply {
       RaftMessage::PreVoteReply(reply) => self
         .raft
         .on_pre_vote_reply(reply)
@@ -357,7 +445,9 @@ impl RegionalCouncil {
       RaftMessage::PreVote(_) | RaftMessage::RequestVote(_) | RaftMessage::AppendEntries(_) => {
         Vec::new()
       }
-    }
+    };
+    self.finish_election(was_leader);
+    messages
   }
 
   /// Proposes a membership change on the leader **without waiting**: it commits — and applies to the
@@ -384,7 +474,11 @@ impl RegionalCouncil {
     if !would_change {
       return false;
     }
-    self.raft.append_command(command.encode())
+    let appended = self.raft.append_command(command.encode());
+    // A single-voter bootstrap already reached its majority. Apply any local commit here;
+    // waiting for a remote append reply would leave its membership frozen forever (AUD-07).
+    self.apply_committed();
+    appended
   }
 
   /// Whether the council's log is fully committed — nothing proposed is still in flight
@@ -473,18 +567,15 @@ impl RegionalCouncil {
   /// or the fetch raced a newer local view) is ignored, so adoption only moves forward. Only the drive
   /// loop's learner branch calls this; a voter's configuration is the deterministic fold of its Raft log.
   pub fn adopt(&mut self, configuration: RegionalConfiguration) -> bool {
-    if configuration.version <= self.configuration.version {
+    if configuration.version <= self.configuration().version {
       return false;
     }
-    self.configuration = configuration;
+    self.learned = Some(configuration);
     true
   }
 
-  /// Applies every committed but not-yet-applied command to the regional configuration, in commit order —
-  /// the deterministic fold every voter makes, so the configuration is the same on all of them. The fold
-  /// starts from the formed base: a node's first fold replaces whatever configuration it holds (a learner's
-  /// adopted one, once it is promoted to voter and the leader replicates the log to it) with the base, so
-  /// the log's commands are applied exactly once from the same starting point on every voter.
+  /// Applies each newly committed command once from the common base. A fetched read view
+  /// never feeds this fold and is discarded when replay reaches its version (§4.8, AUD-07).
   fn apply_committed(&mut self) {
     let committed = self.raft.committed_entries().to_vec();
     if self.applied == 0 && !committed.is_empty() {
@@ -495,6 +586,13 @@ impl RegionalCouncil {
         self.apply_regional(command);
       }
       self.applied = self.applied.saturating_add(1);
+    }
+    if self
+      .learned
+      .as_ref()
+      .is_some_and(|learned| learned.version <= self.configuration.version)
+    {
+      self.learned = None;
     }
   }
 
@@ -517,6 +615,90 @@ impl RegionalCouncil {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// AC-8.1, §4.8, AUD-07: a replacement imports the original fold base, becomes a voter
+  /// through joint consensus, then refuses an initial-state replay that would erase its vote.
+  #[test]
+  fn a_fresh_regional_member_joins_the_prefix_without_reusing_a_vote() {
+    let mut groups = councils(&[OWNER, A, B]);
+    elect_among(&mut groups, OWNER, &[OWNER, A]);
+    let leader = groups.get_mut(&OWNER).unwrap();
+    assert!(leader.propose(Reconfiguration::TakeOver(B)));
+    assert!(leader.propose(Reconfiguration::Admit {
+      host: C,
+      domain: None
+    }));
+    replicate_round(&mut groups, OWNER, &[OWNER, A]);
+    replicate_round(&mut groups, OWNER, &[OWNER, A]);
+    let (saved, base) = groups[&OWNER].join_state().unwrap();
+    let expected = groups[&OWNER].configuration().clone();
+    let mut joining = RegionalCouncil::learner(C, Quorum { f: 1 }, 3, false);
+    assert!(joining.election_timeout().is_empty());
+    joining.join_from(saved.clone(), base.clone()).unwrap();
+    assert_eq!(
+      joining.configuration(),
+      &expected,
+      "takeover is folded once from the original base"
+    );
+    assert!(!joining.is_voter(C));
+    let expected = fetch_ahead_of_regional_log(&mut groups, &mut joining);
+    groups.insert(C, joining);
+    // Two configuration entries (joint, then final), each delivered and committed in two rounds.
+    for _ in 0..(2 * 2) {
+      groups.get_mut(&OWNER).unwrap().reconcile_voters();
+      replicate_round(&mut groups, OWNER, &[OWNER, A, C]);
+    }
+    assert!(groups[&C].is_voter(C));
+    assert!(!groups[&C].is_voter(B));
+    assert_join_vote_retained(groups.get_mut(&C).unwrap(), saved, base, C);
+    assert_eq!(groups[&C].configuration(), &expected);
+  }
+
+  /// Fetch a later takeover without its log suffix; promotion must not apply it twice.
+  fn fetch_ahead_of_regional_log(
+    groups: &mut std::collections::BTreeMap<HostId, RegionalCouncil>,
+    joining: &mut RegionalCouncil,
+  ) -> RegionalConfiguration {
+    assert!(
+      groups
+        .get_mut(&OWNER)
+        .unwrap()
+        .propose(Reconfiguration::TakeOver(A))
+    );
+    replicate_round(groups, OWNER, &[OWNER, A]);
+    replicate_round(groups, OWNER, &[OWNER, A]);
+    let expected = groups[&OWNER].configuration().clone();
+    assert!(joining.adopt(expected.clone()));
+    expected
+  }
+
+  /// A late join response cannot erase an initialized member's first vote (AUD-07).
+  fn assert_join_vote_retained(
+    replacement: &mut RegionalCouncil,
+    saved: SavedRaft,
+    base: RegionalConfiguration,
+    replacement_id: HostId,
+  ) {
+    let (prefix, _) = replacement.join_state().unwrap();
+    let request = crate::raft::RequestVote {
+      term: prefix.term + 1,
+      candidate: OWNER,
+      last_log_index: prefix.log.len() as u64,
+      last_log_term: prefix.log.last().unwrap().term,
+    };
+    assert!(
+      matches!(replacement.answer(RaftMessage::RequestVote(request)),
+      Some(RaftMessage::VoteReply(reply)) if reply.granted && reply.voter == replacement_id)
+    );
+    assert_eq!(
+      replacement.join_from(saved, base),
+      Err(RaftRecoveryError::AlreadyInitialized)
+    );
+    assert!(
+      matches!(replacement.answer(RaftMessage::RequestVote(crate::raft::RequestVote { candidate: A, ..request })),
+      Some(RaftMessage::VoteReply(reply)) if !reply.granted)
+    );
+  }
 
   const OWNER: HostId = HostId(1);
   const A: HostId = HostId(2);
@@ -798,6 +980,7 @@ mod tests {
     let mut follower = council(A);
 
     elect(&mut leader, &mut follower);
+    replicate(&mut leader, &mut follower, 2); // commit the election no-op before reconfiguration
     assert!(leader.is_leader());
 
     // The region starts [OWNER, A]; host B has now joined the alive view, its node declaring a failure domain.
@@ -846,6 +1029,7 @@ mod tests {
     let mut leader = council(OWNER);
     let mut follower = council(A);
     elect(&mut leader, &mut follower);
+    replicate(&mut leader, &mut follower, 2); // commit the election no-op before reconfiguration
     assert!(leader.is_leader());
 
     let a_epoch_before = leader
@@ -1012,6 +1196,7 @@ mod tests {
     let mut councils = councils(&members);
     elect_among(&mut councils, OWNER, &members);
     assert!(councils[&OWNER].is_leader());
+    settle(&mut councils, OWNER, &[OWNER, A, B], 2);
 
     // B dies: the leader takes it over, and the survivors commit the takeover (two of three). The takeover
     // alone leaves the voter set untouched — the voter change follows.
@@ -1081,6 +1266,7 @@ mod tests {
     let learner_at_boot = !councils[&C].is_voter(C);
     elect_among(&mut councils, OWNER, &[OWNER, A, B]);
     assert!(councils[&OWNER].is_leader());
+    settle(&mut councils, OWNER, &[OWNER, A, B], 2);
 
     // B dies; the leader takes it over, committed by OWNER and A. The learner then fetches and adopts the
     // committed configuration, as the fleet's learner path does.

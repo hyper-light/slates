@@ -70,6 +70,30 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
       request.json,
     );
   }
+  if let Verb::Bootstrap { root } = request.verb {
+    let member = client
+      .daemon_status()
+      .map_err(|error| failure_of(error, "bootstrap status"))?
+      .fleet
+      .host;
+    let reply = client
+      .call(&slates_ipc::protocol::RequestBody::Bootstrap { root, member })
+      .map_err(|error| failure_of(error, "bootstrap"))?;
+    return match reply {
+      slates_ipc::protocol::ReplyBody::Acknowledged => {
+        println!(
+          "{}",
+          if request.json {
+            "{\"bootstrapped\":true}"
+          } else {
+            "bootstrapped"
+          }
+        );
+        Ok(())
+      }
+      _ => Err(Failure::Refused(format!("bootstrap refused: {reply:?}"))),
+    };
+  }
   if let Verb::Enroll { account } = &request.verb {
     return emit_enroll(&mut client, *account, request.json);
   }
@@ -794,7 +818,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       rights,
     } => emit_share(client, *volume, principal, *rights, json)?,
     // Served in `run`, before this: their authority comes from the anchor, not the client.
-    Verb::Grant { .. } | Verb::Enroll { .. } | Verb::Revoke { .. } => {}
+    Verb::Bootstrap { .. } | Verb::Grant { .. } | Verb::Enroll { .. } | Verb::Revoke { .. } => {}
   }
   Ok(())
 }
@@ -1483,6 +1507,9 @@ mod harness_tests {
       },
     )
     .unwrap();
+    daemon
+      .bootstrap(true)
+      .expect("the fixture explicitly creates its local consensus group");
     let secret = daemon.segment().issuer_secret().unwrap();
     let mut human = connect_retrying(&instance);
 

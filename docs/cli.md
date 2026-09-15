@@ -30,7 +30,37 @@ an anonymous shared segment alone does not establish locked residency or no swap
 
 `slates daemon` run alone measures a profile and serves without an anchor (development).
 
+## Creating the first consensus group
+
+After starting a new standalone daemon or the first node of a new fleet, run from another terminal:
+
+```
+slates --instance NAME bootstrap root
+```
+
+Run it once on one node of the first region. For each additional region, wait for the root to admit
+that region, then run `slates bootstrap region` once on one of its nodes. The authenticated local
+account may issue bootstrap; an enrolled consumer or forwarded fleet request cannot. The CLI binds
+the request to the current daemon member id, so automatic retries cannot bootstrap a replacement.
+
+Startup alone serves discovery and status but refuses writes until initialized and admitted.
+Every daemon restart currently loses its Raft state and uses a fresh member id. It joins through a
+surviving voting quorum. A standalone restart loses the sole quorum, requiring explicit new-group
+creation; that does not restore a lost consensus history. See [AUD-07](bugs/2026-09-14-raft-voter-state-loss.md).
+Never add bootstrap to a pod's recurring startup command or readiness probe.
+
 ## Deploying a fleet
+
+The discovery and admission protocol is the same for local processes, bare-metal hosts, VMs,
+and Kubernetes pods (R8). Use loopback addresses with distinct port pairs for a local fleet,
+or routable IPs/DNS names for separate hosts. There is no Kubernetes API call in the protocol.
+
+Configured peers discover each other's current addresses and boot identities automatically.
+DNS names are resolved again on reconnect; authenticated replacements fetch the existing
+group's state and join through Raft. Only creating the first group requires `bootstrap`.
+Discovery currently uses the manifest's pinned identities. Finding and enrolling previously
+unlisted nodes requires a discovery provider and a trust-enrollment protocol; those are not
+implemented. A discovery response alone cannot grant voting authority or create a new group.
 
 A fleet is several daemons on several machines that replicate each other's volume heads and
 content and take over for a dead member. Every node is started from **one shared manifest** with
@@ -55,11 +85,13 @@ slates anchor --fleet /etc/slates/fleet.json --node a
 - `name` is the TLS name every node's certificate carries (its subject alternative name); peers
   verify each other's sessions under it. Certificates and keys are DER files the operator
   provisions, named relative to the manifest; every certificate is read (peers pin them, and a
-  node's member id is derived from its certificate), only this node's key is read. Material the TLS
+  node's stable anchor is derived from its certificate), only this node's key is read. Its live
+  member id also includes a fresh boot nonce. Material the TLS
   stack cannot use (a key that does not match the certificate, a key shape it does not take) stops
   the boot naming the node.
-- `f` is the fault tolerance: a write commits once `f + 1` nodes hold it, so a fleet of `2f + 1`
-  keeps committing through `f` deaths. A manifest that could never commit (`fewer than f + 1`
+- `f` is the regional fault tolerance: a write commits once `f + 1` nodes hold it. Regional
+  consensus uses `2f + 1` voters; the separate root group must also retain a quorum (see
+  "Creating the first consensus group" above). A manifest that could never commit (`fewer than f + 1`
   nodes) is refused.
 - `address` is the IP **or DNS name** peers dial and the node's base port: it serves probes on that
   UDP port and records on the next, every peer on the same two sockets, so open those two ports.
@@ -106,7 +138,8 @@ this node is the regional configuration council's elected leader), `fleet_counci
 came from; zero before any sample) and `fleet_council_samples` (the round trips behind them — a
 loopback fleet derives the ten-period floor from its samples, a WAN fleet a larger base), and the
 same six `fleet_root_*` lines for the root group across regions. A single daemon shows the same
-lines, degenerate: `f` 0, itself the one member, leading both groups at the floor with no sample.
+lines, degenerate: `f` 0, itself the one member, leading both groups after explicit bootstrap,
+at the floor with no sample.
 
 Then one block per shard: its counters (`shard N: clients=… volumes=… served=…`), its refusals by
 kind, its health signals (`shard N catalog.volumes: 3 (age 0 ns)` — a signal that is absent prints

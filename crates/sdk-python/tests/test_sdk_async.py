@@ -93,6 +93,8 @@ class SlatesAsyncRoundTrip(unittest.TestCase):
         )
         try:
             client = await _connect_when_ready(instance)
+            subprocess.run([binary, "--instance", instance, "bootstrap", "root"],
+                           check=True, timeout=STARTUP_SECS)
             self.assertIsInstance(client.client_id(), int)
 
             # await create → a 32-hex volume id.

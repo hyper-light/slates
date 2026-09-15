@@ -455,6 +455,14 @@ pub enum RequestBody {
     /// The view.
     at: ReadAt,
   },
+  /// Explicitly create a configuration group through an authenticated local account (AUD-07).
+  /// Binding the request to this start prevents a client retry from resetting a replacement.
+  Bootstrap {
+    /// Also create the root group, on the first node of the first region only.
+    root: bool,
+    /// The fresh member id read from this daemon's status before the explicit request.
+    member: u64,
+  },
 }
 
 /// What a signal's absence means (§4.14, A-9): a missing sample is never silently read as "healthy".
@@ -1602,6 +1610,12 @@ pub enum Refusal {
     /// Why.
     reason: HostPathReason,
   },
+  /// This member has not joined an existing configuration group or been explicitly bootstrapped.
+  ConsensusNotInitialized,
+  /// Bootstrap would replace an existing group's consensus state.
+  ConsensusAlreadyInitialized,
+  /// This explicit bootstrap request names a different daemon start.
+  ConsensusBootstrapStale,
 }
 
 /// A reply body. (`Eq` is not derived: a [`Refusal`] may carry measured probabilities.)

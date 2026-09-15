@@ -161,6 +161,9 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
   let segment = anchor_segment("recover", &profile, &config);
 
   let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let mut client = connect(&instance);
   let kept = client.create(&scratch("kept")).unwrap();
   {
@@ -182,6 +185,9 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
   first.stop();
 
   let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  second
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let report = client.status(kept).unwrap();
   assert_eq!(
     client.reconnects(),
@@ -466,6 +472,9 @@ fn reference(profile: &MachineProfile) -> Observed {
   let config = DaemonConfig::derive(profile, &instance).with_shards(TEST_SHARDS);
   let segment = anchor_segment("crash-ref", profile, &config);
   let daemon = Daemon::start(profile, config, source_of(&segment)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let mut run = Run::new(connect(&instance));
   for k in 1..=STEPS {
     step(&mut run, &daemon, k, false);
@@ -529,6 +538,9 @@ fn run_crash_point(profile: &MachineProfile, reference: &Observed, k: usize, cra
   let partitions = config.geometry.partitions;
 
   let first = Daemon::start(profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let mut run = Run::new(connect(&instance));
   for j in 1..k {
     step(&mut run, &first, j, false);
@@ -545,6 +557,9 @@ fn run_crash_point(profile: &MachineProfile, reference: &Observed, k: usize, cra
   }
 
   let second = Daemon::start(profile, config, source_of(&segment)).unwrap();
+  second
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let done = crash == Crash::AfterRecord;
   assert_crash_state(&mut run, &second, k, done);
   step(&mut run, &second, k, done);
@@ -596,6 +611,9 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
   let mut segment = anchor_segment("pins", &profile, &config);
 
   let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let mut client = connect(&instance);
   let kept = client.create(&scratch("kept")).unwrap();
   let snapshot = client.snapshot(kept).unwrap();
@@ -605,6 +623,9 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
   // Restart 1: the clone's pin on the snapshot survived in the image and is reconciled to the recorded
   // clone, so the snapshot's destroy is refused (a lost pin would be the only reason it were allowed).
   let second = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  second
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   assert!(
     matches!(
       client.destroy_snapshot(kept, snapshot),
@@ -640,6 +661,9 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
   // Restart 2 over the `Destroying` state: recovery completes the destroy, unpinning the origin, so
   // the snapshot's destroy now succeeds.
   let third = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  third
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let started = Instant::now();
   loop {
     let listed: Vec<String> = client.list().unwrap().into_iter().map(|v| v.name).collect();

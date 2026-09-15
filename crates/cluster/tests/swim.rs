@@ -42,9 +42,9 @@ const PROBE_NONCE: u64 = 0xABCD;
 // A different nonce a stale acknowledgement carries — the redelivered reply of an earlier probe, which the
 // prober must reject rather than count as its current probe's answer.
 const STALE_NONCE: u64 = 0x1111;
-// Shape: the daemon generation the target announces on its acknowledgements — zero, a first boot (the wire
+// Shape: the boot nonce the target announces on its acknowledgements — zero in this fixture (the wire
 // carries it; validating it against an anchor is the daemon's, task #22).
-const TARGET_GENERATION: u64 = 0;
+const TARGET_BOOT_NONCE: u64 = 0;
 // Test values; a production caller derives the deadline from a measured RTT budget (owed).
 const DEADLINE_NS: u64 = 20_000_000;
 const POLL_NS: u64 = 1_000;
@@ -115,7 +115,7 @@ async fn serve_within(endpoint: &mut Endpoint, detector: &mut Detector, within_n
     endpoint,
     detector,
     TARGET,
-    TARGET_GENERATION,
+    TARGET_BOOT_NONCE,
     GOSSIP_FANOUT
   ));
   let mut deadline = std::pin::pin!(slates_rt::futures::sleep(within_ns));
@@ -222,7 +222,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
             &mut endpoint,
             &mut detector,
             TARGET,
-            TARGET_GENERATION,
+            TARGET_BOOT_NONCE,
             GOSSIP_FANOUT,
           )
           .await
@@ -238,7 +238,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
               SwimMessage::Ack {
                 from: TARGET,
                 nonce: STALE_NONCE,
-                generation: TARGET_GENERATION,
+                boot_nonce: TARGET_BOOT_NONCE,
                 gossip: vec![(
                   RUMOUR,
                   MemberState {
@@ -306,7 +306,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
         // The nonce the acknowledgement must echo for the probe to count as acked; the serve side echoes it,
         // so a live probe succeeds, while a stale reply carrying another nonce ([`STALE_NONCE`]) does not.
         nonce: PROBE_NONCE,
-        generation: 0,
+        boot_nonce: 0,
         gossip: detector.gossip(GOSSIP_FANOUT),
       };
       let (endpoint, outcome) = probe_once(endpoint, &ping, budget()).await.unwrap();
@@ -324,7 +324,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
         let second = SwimMessage::Ping {
           from: PROBER,
           nonce: SECOND_PROBE_NONCE,
-          generation: 0,
+          boot_nonce: 0,
           gossip: detector.gossip(GOSSIP_FANOUT),
         };
         let (_endpoint, outcome) = probe_once(endpoint.unwrap(), &second, budget())
@@ -338,7 +338,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
       let (timed_out, ack_gossip, rtt_ns) = match outcome {
         ProbeOutcome::Acked {
           from: _,
-          generation: _,
+          boot_nonce: _,
           gossip,
           rtt_ns,
           coordinate,

@@ -97,6 +97,8 @@ fn start_anchor(instance: &str) -> AnchorProcess {
     if code == 0 {
       streak += 1;
       if streak >= STABLE_STREAK {
+        let (code, _, error) = run(instance, &["bootstrap", "root"]);
+        assert_eq!(code, 0, "explicit first-time bootstrap: {error}");
         return anchor;
       }
     } else {

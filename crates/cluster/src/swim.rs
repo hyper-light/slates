@@ -43,11 +43,10 @@ pub enum SwimMessage {
     /// reliable transport redelivered on the reused probe stream) would pass for a fresh reply and keep a
     /// dead peer looking alive, so the survivor never retired it (`docs/bugs/2026-09-10-swim-stale-ack.md`).
     nonce: u64,
-    /// The prober's daemon **generation** (§4.8 "Recovery"; task #22): the anchor segment's start count its
-    /// ephemeral member id `from` folds in (`member_id(anchor, generation)`), so the receiver validates the
-    /// announced id against the certificate it authenticated and admits a *higher* generation as a restart
-    /// (a new member; the old id retired) — never a lower one (a stale or replayed boot, refused).
-    generation: u64,
+    /// The prober's random per-start nonce (§4.8, AUD-07), from which its member id derives
+    /// together with the authenticated certificate anchor. A different nonce identifies a
+    /// different member; its numeric value cannot establish an ordering between starts.
+    boot_nonce: u64,
     /// The membership updates piggybacked on this probe.
     gossip: Vec<(HostId, MemberState)>,
   },
@@ -59,9 +58,9 @@ pub enum SwimMessage {
     /// Echoes the probing [`Ping`]'s `nonce`, so the prober counts this acknowledgement only for the probe
     /// it is answering — never for an earlier one whose reply was redelivered.
     nonce: u64,
-    /// The acknowledging node's daemon generation — the same announcement a ping makes, so the prober
+    /// The acknowledging node's daemon boot_nonce — the same announcement a ping makes, so the prober
     /// validates the id its peer answers under exactly as the peer validates the prober's.
-    generation: u64,
+    boot_nonce: u64,
     /// The membership updates piggybacked on this acknowledgement.
     gossip: Vec<(HostId, MemberState)>,
     /// The acknowledging node's Vivaldi coordinate.
@@ -154,19 +153,19 @@ impl SwimMessage {
     }
   }
 
-  /// The sender's announced daemon generation: a [`Ping`](SwimMessage::Ping)'s or an
+  /// The sender's announced daemon boot_nonce: a [`Ping`](SwimMessage::Ping)'s or an
   /// [`Ack`](SwimMessage::Ack)'s (each is the sender's own announcement); `None` for a ping-request, which
   /// asks about a third party and announces nothing about its sender's identity.
-  pub fn generation(&self) -> Option<u64> {
+  pub fn boot_nonce(&self) -> Option<u64> {
     match self {
-      SwimMessage::Ping { generation, .. } | SwimMessage::Ack { generation, .. } => {
-        Some(*generation)
+      SwimMessage::Ping { boot_nonce, .. } | SwimMessage::Ack { boot_nonce, .. } => {
+        Some(*boot_nonce)
       }
       SwimMessage::PingReq { .. } => None,
     }
   }
 
-  /// The canonical little-endian bytes: the tag, the sender, the probe nonce and the sender's generation
+  /// The canonical little-endian bytes: the tag, the sender, the probe nonce and the sender's boot_nonce
   /// (a ping or an acknowledgement) or the target (a ping-request), then the gossip batch (its u32 count
   /// and each entry). Two hosts encode a message identically.
   pub fn encode(&self) -> Vec<u8> {
@@ -175,26 +174,26 @@ impl SwimMessage {
       SwimMessage::Ping {
         from,
         nonce,
-        generation,
+        boot_nonce,
         gossip,
       } => {
         out.push(TAG_PING);
         out.extend_from_slice(&from.0.to_le_bytes());
         out.extend_from_slice(&nonce.to_le_bytes());
-        out.extend_from_slice(&generation.to_le_bytes());
+        out.extend_from_slice(&boot_nonce.to_le_bytes());
         encode_gossip(&mut out, gossip);
       }
       SwimMessage::Ack {
         from,
         nonce,
-        generation,
+        boot_nonce,
         gossip,
         coordinate,
       } => {
         out.push(TAG_ACK);
         out.extend_from_slice(&from.0.to_le_bytes());
         out.extend_from_slice(&nonce.to_le_bytes());
-        out.extend_from_slice(&generation.to_le_bytes());
+        out.extend_from_slice(&boot_nonce.to_le_bytes());
         encode_gossip(&mut out, gossip);
         encode_coordinate(&mut out, coordinate);
       }
@@ -219,7 +218,7 @@ impl SwimMessage {
       TAG_PING => {
         let (from, rest) = take_host(rest)?;
         let (nonce, rest) = take_word(rest)?;
-        let (generation, rest) = take_word(rest)?;
+        let (boot_nonce, rest) = take_word(rest)?;
         let (gossip, leftover) = decode_gossip(rest)?;
         if !leftover.is_empty() {
           return Err(SwimWireError::GossipLengthMismatch);
@@ -227,20 +226,20 @@ impl SwimMessage {
         Ok(SwimMessage::Ping {
           from,
           nonce,
-          generation,
+          boot_nonce,
           gossip,
         })
       }
       TAG_ACK => {
         let (from, rest) = take_host(rest)?;
         let (nonce, rest) = take_word(rest)?;
-        let (generation, rest) = take_word(rest)?;
+        let (boot_nonce, rest) = take_word(rest)?;
         let (gossip, leftover) = decode_gossip(rest)?;
         let coordinate = decode_coordinate(leftover)?;
         Ok(SwimMessage::Ack {
           from,
           nonce,
-          generation,
+          boot_nonce,
           gossip,
           coordinate,
         })
@@ -453,14 +452,14 @@ pub enum ProbeOutcome {
   Acked {
     /// The member id the acknowledging node **announced** as its own (`Ack.from`). On a mutually-TLS
     /// authenticated session this rides back from the node the caller probed; the caller compares it to the
-    /// id it probed and, if they differ, the node has restarted under a new ephemeral member id (a higher
-    /// generation) — the caller stops crediting the old id (it ages out) and the node's new id is learned
+    /// id it probed and, if they differ, the node has restarted under a new ephemeral member id (a different
+    /// boot nonce) — the caller stops crediting the old id (it ages out) and the node's new id is learned
     /// from its own probes (§4.8 "Recovery"; task #22 learn-on-contact).
     from: HostId,
-    /// The daemon generation the acknowledging node announced with `from` — what the caller validates that
-    /// id against (`from` must be `member_id(anchor, generation)` for the certificate the session
-    /// authenticated), and what tells a restart (a higher generation) from a stale boot (a lower one).
-    generation: u64,
+    /// The daemon boot_nonce the acknowledging node announced with `from` — what the caller validates that
+    /// id against (`from` must be `member_id(anchor, boot_nonce)` for the certificate the session
+    /// authenticated), with no numeric age ordering between boot nonces.
+    boot_nonce: u64,
     /// The membership updates the acknowledgement carried.
     gossip: Vec<(HostId, MemberState)>,
     /// The measured round-trip time of this probe, in nanoseconds (the shard clock).
@@ -544,12 +543,12 @@ pub async fn probe_once(
       Ok(SwimMessage::Ack {
         from,
         nonce,
-        generation,
+        boot_nonce,
         gossip,
         coordinate,
       }) if Some(nonce) == expected => ProbeOutcome::Acked {
         from,
-        generation,
+        boot_nonce,
         gossip,
         rtt_ns: now_ns().saturating_sub(started_ns),
         coordinate,
@@ -564,14 +563,14 @@ pub async fn probe_once(
 /// Serves one SWIM probe on a node (§4.8): receives a peer's message over `endpoint`, folds its
 /// piggybacked gossip into `detector`, and replies with an acknowledgement carrying up to `gossip_fanout`
 /// of this node's own gossip — so a probe both proves this node alive and spreads the view — and this
-/// node's daemon `local_generation`, the announcement the prober validates `local` against (task #22). A
+/// node's daemon `local_boot_nonce`, the announcement the prober validates `local` against (task #22). A
 /// malformed message is answered with no reply (the prober counts nothing). The caller loops this to keep
 /// serving.
 pub async fn serve_probe(
   endpoint: &mut Endpoint,
   detector: &mut Detector,
   local: HostId,
-  local_generation: u64,
+  local_boot_nonce: u64,
   gossip_fanout: usize,
 ) -> Result<(), EndpointError> {
   endpoint
@@ -589,7 +588,7 @@ pub async fn serve_probe(
           // Echo the probe's nonce so the prober can tell this acknowledgement answers its current ping; a
           // message that carried none (not a ping) echoes zero, which a real probe's non-zero nonce rejects.
           nonce: message.nonce().unwrap_or(0),
-          generation: local_generation,
+          boot_nonce: local_boot_nonce,
           gossip,
           coordinate: detector.coordinate(),
         }
@@ -642,7 +641,7 @@ mod tests {
     let ack = SwimMessage::Ack {
       from: A,
       nonce: 42,
-      generation: 1,
+      boot_nonce: 1,
       gossip: sample_gossip(),
       coordinate: sample_coordinate(),
     };
@@ -656,7 +655,7 @@ mod tests {
     let mut hostile = vec![TAG_ACK];
     hostile.extend_from_slice(&7u64.to_le_bytes()); // from
     hostile.extend_from_slice(&0u64.to_le_bytes()); // nonce
-    hostile.extend_from_slice(&0u64.to_le_bytes()); // generation
+    hostile.extend_from_slice(&0u64.to_le_bytes()); // boot_nonce
     hostile.extend_from_slice(&0u32.to_le_bytes()); // empty gossip
     hostile.extend_from_slice(&u32::MAX.to_le_bytes()); // coordinate dims = huge
     assert_eq!(
@@ -673,13 +672,13 @@ mod tests {
       SwimMessage::Ping {
         from: A,
         nonce: 1,
-        generation: 3,
+        boot_nonce: 3,
         gossip: sample_gossip(),
       },
       SwimMessage::Ack {
         from: B,
         nonce: u64::MAX,
-        generation: u64::MAX,
+        boot_nonce: u64::MAX,
         gossip: Vec::new(),
         coordinate: sample_coordinate(),
       },
@@ -700,13 +699,13 @@ mod tests {
   }
 
   /// The encoding is fixed and little-endian — a golden vector pins it so a drift is caught (a Ping from
-  /// host 2 at daemon generation 7, carrying one gossip entry: host 3, Suspect, incarnation 1).
+  /// host 2 at daemon boot_nonce 7, carrying one gossip entry: host 3, Suspect, incarnation 1).
   #[test]
   fn ping_has_a_golden_encoding() {
     let message = SwimMessage::Ping {
       from: HostId(2),
       nonce: 5,
-      generation: 7,
+      boot_nonce: 7,
       gossip: vec![(
         HostId(3),
         MemberState {
@@ -740,7 +739,7 @@ mod tests {
       0,
       0,
       0,
-      0, // generation = 7
+      0, // boot_nonce = 7
       1,
       0,
       0,
@@ -781,20 +780,20 @@ mod tests {
       Err(SwimWireError::Truncated),
       "nonce cut"
     );
-    // Tag + full from + full nonce, but the generation word is missing.
+    // Tag + full from + full nonce, but the boot_nonce word is missing.
     let mut nonce_ok = vec![TAG_PING];
     nonce_ok.extend_from_slice(&2u64.to_le_bytes()); // from
     nonce_ok.extend_from_slice(&9u64.to_le_bytes()); // nonce
     assert_eq!(
       SwimMessage::decode(&nonce_ok),
       Err(SwimWireError::Truncated),
-      "generation cut"
+      "boot_nonce cut"
     );
-    // Tag + from + nonce + generation, but the gossip count word is missing.
-    let mut generation_ok = nonce_ok.clone();
-    generation_ok.extend_from_slice(&1u64.to_le_bytes()); // generation
+    // Tag + from + nonce + boot_nonce, but the gossip count word is missing.
+    let mut boot_nonce_ok = nonce_ok.clone();
+    boot_nonce_ok.extend_from_slice(&1u64.to_le_bytes()); // boot_nonce
     assert_eq!(
-      SwimMessage::decode(&generation_ok),
+      SwimMessage::decode(&boot_nonce_ok),
       Err(SwimWireError::Truncated),
       "gossip count cut"
     );
@@ -811,7 +810,7 @@ mod tests {
     let bytes = [
       TAG_PING, 2, 0, 0, 0, 0, 0, 0, 0, // from
       0, 0, 0, 0, 0, 0, 0, 0, // nonce
-      0, 0, 0, 0, 0, 0, 0, 0, // generation
+      0, 0, 0, 0, 0, 0, 0, 0, // boot_nonce
       1, 0, 0, 0, // count = 1
       3, 0, 0, 0, 0, 0, 0, 0, // subject
       5, // foreign liveness
@@ -831,7 +830,7 @@ mod tests {
     let mut bytes = vec![TAG_ACK];
     bytes.extend_from_slice(&7u64.to_le_bytes()); // from
     bytes.extend_from_slice(&0u64.to_le_bytes()); // nonce
-    bytes.extend_from_slice(&0u64.to_le_bytes()); // generation
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // boot_nonce
     bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // count = huge
     assert_eq!(
       SwimMessage::decode(&bytes),
@@ -842,7 +841,7 @@ mod tests {
     let mut short = vec![TAG_ACK];
     short.extend_from_slice(&7u64.to_le_bytes());
     short.extend_from_slice(&0u64.to_le_bytes()); // nonce
-    short.extend_from_slice(&0u64.to_le_bytes()); // generation
+    short.extend_from_slice(&0u64.to_le_bytes()); // boot_nonce
     short.extend_from_slice(&1u32.to_le_bytes());
     short.extend_from_slice(&[9, 9, 9]); // a partial entry
     assert_eq!(

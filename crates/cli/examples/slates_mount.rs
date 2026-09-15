@@ -67,14 +67,18 @@ fn quick_profile() -> MachineProfile {
 fn start_daemon(instance: &str) -> Daemon {
   let profile = quick_profile();
   let config = DaemonConfig::derive(&profile, instance).with_shards(1);
-  Daemon::start(
+  let daemon = Daemon::start(
     &profile,
     config,
     SegmentSource::Create {
       name: format!("slates-seg-example-{}", std::process::id()),
     },
   )
-  .unwrap()
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("explicit initial group for this example");
+  daemon
 }
 
 /// Connects a client to the daemon's rendezvous, retrying until it answers within the wait budget.

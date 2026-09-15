@@ -171,7 +171,7 @@ fn a_silent_peer_is_detected_dead_and_its_objects_are_taken_over() {
         let ping = SwimMessage::Ping {
           from: SURVIVOR,
           nonce: 1,
-          generation: 0,
+          boot_nonce: 0,
           gossip: detector.gossip(GOSSIP_FANOUT),
         };
         let (_endpoint, probe) = probe_once(endpoint, &ping, budget())

@@ -107,3 +107,11 @@ B, so the deadlock passed it. The new test asserts mutual membership across the 
 - A live KIND re-run to confirm the fix on real pods, and making the lane's rejoin a required gate
   (`xtask/src/kind.rs`), are owed — the reproduction here is the same-address in-process analog, since the
   fleet test harness has no DNS resolver to model a new-IP restart.
+
+## AUD-07 follow-up — 2026-09-14
+
+The voter-loss correction now gives every daemon start a fresh member id. The live retirement
+regression retains this report's same-certificate/session boundary but asserts discovery of the
+fresh replacement (`a_fresh_restart_keeps_its_serve_session_while_the_predecessor_retires`). The
+historical same-id reproduction above remains evidence for the certificate-keyed close defect.
+Safe voting admission is covered separately by the [three-voter RAM-loss history](2026-09-14-raft-voter-state-loss.md).

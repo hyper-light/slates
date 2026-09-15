@@ -105,6 +105,9 @@ fn the_async_core_drives_a_daemon_by_spin_and_completion_fd() {
     },
   )
   .unwrap();
+  _daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let mut client = connect(&instance);
 
   // Fast path: begin a create and take its reply within the spin window — no event loop, no fd.

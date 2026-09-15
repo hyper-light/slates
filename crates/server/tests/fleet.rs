@@ -319,11 +319,11 @@ fn four_free_ports() -> [u16; 4] {
 /// and its two advertised addresses (probe and record).
 struct Node {
   profile: MachineProfile,
-  /// This node's generation-0 member id (`member_id(origin_anchor, 0)`) — what the daemon computes for
-  /// itself on a fresh (generation-0) test segment, and what its peers seed it as (task #22).
+  /// This node's manifest routing placeholder (`member_id(origin_anchor, 0)`).
+  /// Tests observe the fresh voting identity from the started daemon.
   host: HostId,
   /// This node's stable anchor (`HostId(host_id_of(machine identity))`) — the daemon derives its runtime
-  /// member id `member_id(origin_anchor, generation)` from it and keys completion records on it.
+  /// member id `member_id(origin_anchor, boot_nonce)` from it and keys completion records on it.
   origin_anchor: HostId,
   identity: Identity,
   address: SocketAddrV4,
@@ -340,8 +340,7 @@ fn unique() -> u64 {
 fn node(name: &str, probe_port: u16, record_port: u16) -> Node {
   let mut profile = profile(name);
   profile.facts.identity.cpu = format!("{}-{}", profile.facts.identity.cpu, unique());
-  // The stable anchor is the machine-identity hash (a laptop's anchor); the member id folds in generation 0
-  // (a fresh test segment), matching what the daemon computes for itself and what peers seed it as (task #22).
+  // The machine identity supplies the stable anchor; nonce zero names its routing placeholder.
   let origin_anchor = HostId(host_id_of(&profile.facts.identity));
   let host = member_id(origin_anchor, 0);
   Node {
@@ -442,7 +441,6 @@ fn a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it() {
     "distinct machine identities give distinct host ids"
   );
 
-  let host_b = b.host;
   let peer_of_a = Peer {
     anchor: b.origin_anchor,
     host: b.host,
@@ -459,6 +457,7 @@ fn a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it() {
   };
   let daemon_a = start(a, peer_of_a);
   let daemon_b = start(b, peer_of_b);
+  let host_b = daemon_b.member_identity().unwrap();
 
   // Let the fleet form: the loops establish their sessions and exchange probes over the transport. The
   // test thread is not a runtime task, so it waits by yielding on the clock (as the other daemon tests do
@@ -636,6 +635,12 @@ fn settle() {
 /// that the mesh had formed, failed the rejoin test at load average 48 on 2026-09-14 (a formation that
 /// takes longer than two seconds under load is slow, not wrong): only the steadying is a fixed window.
 fn form_and_settle(daemons: &[&Daemon]) -> bool {
+  if let Some(first) = daemons.first() {
+    match first.bootstrap(true) {
+      Ok(()) | Err(slates_ipc::protocol::Refusal::ConsensusAlreadyInitialized) => {}
+      Err(_) => return false,
+    }
+  }
   let formed = poll_until(daemons, FORMATION_DEADLINE, || {
     daemons
       .iter()
@@ -662,7 +667,6 @@ fn a_falsely_retired_peer_rejoins_by_refutation() {
   let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
-  let host_b = b.host;
   let peer_of_a = Peer {
     anchor: b.origin_anchor,
     host: b.host,
@@ -679,6 +683,7 @@ fn a_falsely_retired_peer_rejoins_by_refutation() {
   };
   let daemon_a = start(a, peer_of_a);
   let daemon_b = start(b, peer_of_b);
+  let host_b = daemon_b.member_identity().unwrap();
 
   // Let the direct probe mesh form (polled, so a formation slowed by load is waited out) and then settle:
   // the seeded membership holds every peer alive from boot, so B must actually be probing A — and their
@@ -752,7 +757,6 @@ fn a_starved_but_live_peer_is_not_retired() {
   let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
-  let host_b = b.host;
   let peer_of_a = Peer {
     anchor: b.origin_anchor,
     host: b.host,
@@ -769,6 +773,7 @@ fn a_starved_but_live_peer_is_not_retired() {
   };
   let daemon_a = start(a, peer_of_a);
   let daemon_b = start(b, peer_of_b);
+  let host_b = daemon_b.member_identity().unwrap();
 
   // The direct probe mesh forms, then settles: a few answered probes seed A's measured round trip to B.
   let formed = poll_until(&[&daemon_a, &daemon_b], FORMATION_DEADLINE, || {
@@ -890,7 +895,7 @@ fn a_stopped_daemons_serve_ports_are_freed_so_its_restart_binds_the_same_address
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
   // The restart presents B's certificate again (the operator-provisioned identity does not change) at B's
-  // addresses; on a fresh test segment it is generation 0 like the first, so it rejoins under B's id.
+  // addresses; a fresh segment must still produce a distinct voting identity.
   let mut b_identities = same_identity(2).into_iter();
   let (Some(b_first), Some(b_again)) = (b_identities.next(), b_identities.next()) else {
     panic!("B's identity twice");
@@ -972,7 +977,6 @@ fn burst_fleet_forms(dials: usize, pid: u32) -> BurstFleet {
     identity: burst_identities.pop().unwrap(),
     ..node("b", pb_probe, pb_record)
   };
-  let host_b = b.host;
   let a_certificate = a.identity.certificate();
   let a_record_address = a.record_address;
   let instance_a = format!("fleet-{}-{pid}", a.host.0);
@@ -992,6 +996,7 @@ fn burst_fleet_forms(dials: usize, pid: u32) -> BurstFleet {
   };
   let daemon_a = start(a, peer_of_a);
   let daemon_b = start(b, peer_of_b);
+  let host_b = daemon_b.member_identity().unwrap();
   let formed = form_and_settle(&[&daemon_a, &daemon_b]);
   BurstFleet {
     daemon_a,
@@ -1222,27 +1227,18 @@ fn a_peers_re_dial_burst_is_held_to_its_session_slots_and_never_refuses_a_client
   assert_burst_bounded(&outcome, dials);
 }
 
-/// AC (§4.8 "Recovery"; task #22 — a restart is a join under a **new** ephemeral id): a peer that restarts
-/// comes back under a NEW member id (a higher daemon generation), and its OLD id is **retired**, not rejoined
-/// as its old self. A and B form; A knows B under its generation-0 member id. Then B's old process ends and
-/// its return under a new generation is **injected** into A (B's old id dead, its new id
-/// `member_id(B_anchor, 1)` alive — the fold the live learn-on-contact makes), which isolates the fold from
-/// the wire; the wire-level proof, a real second daemon presenting B's certificate at generation one and
-/// learned on contact, is [`a_restarted_peer_is_learned_on_contact_under_its_new_generation`]. A **admits
-/// B's new id** and **retires the old** — the design's "rejoins with a new ephemeral id", the contrast to the
-/// rejoin test above where a *falsely*-suspected peer (same generation, same id) refutes and keeps its id.
-/// Non-vacuous: B's old and new ids differ (the id is ephemeral), the old is shown known first, then retired,
-/// and the new admitted.
+/// AC-8.1, §4.8: inject a restart with a distinct identity into SWIM, then observe the
+/// old member retired and the new member present. The three-node wire test below covers
+/// actual admission after RAM loss; this test isolates the discovery fold.
 #[test]
 fn a_restarted_peer_rejoins_under_a_new_member_id_and_the_old_is_retired() {
   let _serial = serialize_fleet_tests();
   let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
-  let b_old = b.host; // B's generation-0 member id — what A seeds and knows it by.
   let b_new = member_id(b.origin_anchor, 1); // B's member id after one restart (generation 1).
   assert_ne!(
-    b_old, b_new,
+    b.host, b_new,
     "the member id is ephemeral — a restart holds a new id, not its old self"
   );
   let peer_of_a = Peer {
@@ -1261,8 +1257,11 @@ fn a_restarted_peer_rejoins_under_a_new_member_id_and_the_old_is_retired() {
   };
   let daemon_a = start(a, peer_of_a);
   let daemon_b = start(b, peer_of_b);
+  let b_old = daemon_b
+    .member_identity()
+    .expect("B has its fresh identity");
 
-  // Form (polled) + settle, then confirm A knows B under its old (generation-0) id.
+  // Form (polled) + settle, then confirm A knows B under its previous id.
   assert!(
     form_and_settle(&[&daemon_a, &daemon_b]),
     "the fleet's direct probe mesh formed before the test acts"
@@ -1293,11 +1292,11 @@ fn a_restarted_peer_rejoins_under_a_new_member_id_and_the_old_is_retired() {
   daemon_a.stop();
   assert!(
     knew_old,
-    "A knew B under its generation-0 member id before the restart"
+    "A knew B under its previous member id before the restart"
   );
   assert!(
     admitted_new,
-    "A admitted B's new (generation-1) member id — a restart is a join under a new id"
+    "A admitted B's new member id — a restart is a join under a new id"
   );
   assert!(
     retired_old,
@@ -1320,7 +1319,7 @@ fn same_identity(count: usize) -> Vec<Identity> {
 }
 
 /// One fleet node's configuration at `f = 1` on one shard: its `host` (the generation-0 seed the daemon
-/// overrides with its real generation), its stable `anchor`, its `peers` by their seed ids, and the failure
+/// overrides with its fresh identity), its stable `anchor`, its `peers` by their seed ids, and the failure
 /// `domains` the deployment declares by seed id (a node absent is unique-per-host).
 fn fleet_config(
   profile: &MachineProfile,
@@ -1344,15 +1343,9 @@ fn fleet_config(
     })
 }
 
-/// An anchor segment on which the anchor has recorded **two** daemon starts, so the daemon that attaches it
-/// boots at ephemeral incarnation one and derives `member_id(anchor, 1)` as its own id: the real restart
-/// path, the test playing the anchor (as the client restart oracle does). `record_start` increments the
-/// supervision generation before every start, and the daemon reads that generation down by one (an anchor
-/// numbers its first start generation one, which is the manifest's precomputed gen-zero seed, so incarnation
-/// is the restart count). The first recorded start here is that seed start (generation one, incarnation
-/// zero); the second is the restart (generation two, incarnation one). The start stamp is the anchor's clock
-/// reading, immaterial with no anchor to read it. Returns the handoff to start the daemon over, and the
-/// segment, which must outlive the daemon.
+/// An anchor segment with two recorded starts, exercising the handoff restart path.
+/// The supervision count is diagnostic; it does not derive voting identity (AUD-07).
+/// The returned segment must outlive its attached daemon.
 fn incarnation_one_segment(
   name: &str,
   profile: &MachineProfile,
@@ -1400,30 +1393,14 @@ fn start_fleet_node(
     .expect("the fleet daemon starts")
 }
 
-/// AC (§4.8 "Recovery" — "a restarted host rejoins as a new member and holds nothing until its generation
-/// ... [is] validated"; task #22, **over the wire**): a node that restarts announces a higher daemon
-/// generation on its first probe and is learned on contact — its new member id admitted and probed, its old
-/// id retired and its objects taken over — with nothing injected. Three nodes form (`f = 1`, so two
-/// survivors keep the council's majority); B seals a volume whose head A and C hold; B's process ends; a
-/// second daemon presents **B's certificate** at generation one — its anchor segment records a second start,
-/// the restart, the anchor recording one before every daemon start (so the daemon reads the generation down
-/// by one to its restart count) — on the address A and C dial for B, and probes them. A and C
-/// validate the announced id (`member_id(anchor_B, 1)`) against B's anchor, fold the old id dead and the new
-/// alive, and the council commits the takeover and the admission; the survivor rendezvous ranks first takes
-/// over B's volume and serves it. Non-vacuous: the new id is not the old (the id is ephemeral); the old is
-/// shown known before and retired after; the new is admitted, **committed** into the regional configuration,
-/// and **probed** (A's and C's meshes form to it, so a later death of the new incarnation is detectable, not
-/// merely believed from its own pings); and B's file reads back from the successor over NFS. The contrast
-/// is [`a_falsely_retired_peer_rejoins_by_refutation`]: the same generation refutes and keeps its id.
+/// AC-8.1, §4.8: restart a peer under its stable TLS certificate and a fresh member id.
+/// The surviving quorum retires its previous id, admits the replacement with the declared
+/// failure domain, and serves the predecessor's sealed content through takeover.
 #[test]
-fn a_restarted_peer_is_learned_on_contact_under_its_new_generation() {
+fn a_restarted_peer_is_learned_on_contact_under_its_fresh_identity() {
   let _serial = serialize_fleet_tests();
   let pid = std::process::id();
   let mut fleet = restart_fleet_forms_and_seals(pid);
-  assert_ne!(
-    fleet.host_b, fleet.b_new,
-    "the member id is ephemeral — a restart holds a new id, not its old self"
-  );
   let (daemon_b_again, segment) = restart_b(&mut fleet, pid);
   let observed: Vec<&Daemon> = vec![&fleet.survivors[0], &fleet.survivors[1], &daemon_b_again];
   let learned = observe_learned(&observed, &fleet, &daemon_b_again);
@@ -1445,11 +1422,11 @@ fn assert_restart_learned(formed: bool, knew_old: bool, learned: &Learned) {
   assert!(formed, "old B's mesh to A and C formed before it sealed");
   assert!(
     knew_old,
-    "A knew B under its generation-0 member id before the restart"
+    "A knew B under its previous member id before the restart"
   );
   assert!(
     learned.admitted_new,
-    "the survivors admitted B's generation-1 member id, learned from its own probes"
+    "the survivors admitted B's fresh member id, learned from its own probes"
   );
   assert!(
     learned.retired_old,
@@ -1496,7 +1473,6 @@ struct RestartFleet {
   host_a: HostId,
   host_c: HostId,
   host_b: HostId,
-  b_new: HostId,
   anchor_b: HostId,
   profile_b: MachineProfile,
   /// The restart's identity (B's certificate and key), taken by [`restart_b`] — an `Identity` holds a
@@ -1533,12 +1509,9 @@ fn fleet_peer_at(
   }
 }
 
-/// Starts A, C and old B, lets old B's mesh form, seals a volume on B whose head A and C hold, and ends B's
-/// process. A and C dial B at the pair its **restart** will serve on — a distinct pair, so old B's last
-/// datagrams in flight cannot reach the restart (a deployment's address is the manifest's and does not
-/// move; that a stopped daemon's ports are free again for a restart is proven by
-/// [`a_stopped_daemons_serve_ports_are_freed_so_its_restart_binds_the_same_addresses`]) — so their probes
-/// of B form only once the restart serves there.
+/// Starts A, C and B with reachable discovery addresses, commits their initial voter set,
+/// seals a volume on B, then ends B. Its replacement reuses the certificate and addresses
+/// with a fresh member id. Address-change discovery is a separate KIND lane proof.
 fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
   let (profile_a, host_a, identity_a) = fleet_node("a");
   let (profile_c, host_c, identity_c) = fleet_node("c");
@@ -1550,10 +1523,8 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
   let anchor_a = anchor_of(&profile_a);
   let anchor_b = anchor_of(&profile_b);
   let anchor_c = anchor_of(&profile_c);
-  let b_new = member_id(anchor_b, 1);
   let serve = mesh_serve_ports(3);
-  let again = free_ports(2);
-  let b_again_serve = (again[0], again[1]);
+  let b_again_serve = serve[1];
   let cert_a = identity_a.certificate();
   let cert_b = b_first.certificate();
   let cert_c = identity_c.certificate();
@@ -1576,7 +1547,7 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
   let instance_a = format!("fleet3-{}-{pid}", host_a.0);
   let instance_b = format!("fleet3-{}-{pid}", host_b.0);
   let instance_c = format!("fleet3-{}-{pid}", host_c.0);
-  let instance_b_again = format!("fleet3-{}-{pid}", b_new.0);
+  let instance_b_again = format!("fleet3-again-{}-{pid}", host_b.0);
   // The deployment declares B's node in a failure domain (by its seed id, as a manifest does); the restart's
   // new id must inherit it through its admission.
   let domains: std::collections::BTreeMap<HostId, DomainId> =
@@ -1632,11 +1603,20 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
     peers_of_b,
     fresh(host_b),
   );
+  let host_a = daemon_a.member_identity().expect("A's live member");
+  let host_c = daemon_c.member_identity().expect("C's live member");
+  let host_b = daemon_b.member_identity().expect("B's live member");
+  daemon_b.bootstrap(true).expect("explicit initial group");
   // Old B dials A and C, so its mesh forms; then it seals the volume the restart's takeover will move.
   let mut daemons = vec![daemon_b, daemon_a, daemon_c];
   let formed = poll_until(&[&daemons[0]], FORMATION_DEADLINE, || {
     daemons[0].fleet_meshed() == Some(true)
   });
+  let voters = vec![host_b, host_a, host_c];
+  assert!(
+    audit_wait(|| audit_voters_match(&daemons, &voters)),
+    "initial voters commit before sealing and restart"
+  );
   let knew_old = daemons[1]
     .fleet_members()
     .is_some_and(|members| members.contains(&host_b));
@@ -1657,7 +1637,6 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
     host_a,
     host_c,
     host_b,
-    b_new,
     anchor_b,
     profile_b,
     b_again: Some(b_again),
@@ -1675,9 +1654,8 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
   }
 }
 
-/// Restarts B: a second daemon with B's certificate attaches an anchor segment on which the anchor has
-/// recorded a second start ([`incarnation_one_segment`]), so it derives `member_id(anchor_B, 1)` as its own
-/// id. The segment is returned so it outlives the daemon.
+/// Restarts B over a handed-off anchor segment and observes its fresh member identity.
+/// The segment is returned so it outlives the daemon.
 fn restart_b(fleet: &mut RestartFleet, pid: u32) -> (Daemon, AnchorSegment) {
   let peers = std::mem::take(&mut fleet.peers_of_b_again);
   let identity = fleet
@@ -1706,6 +1684,7 @@ fn restart_b(fleet: &mut RestartFleet, pid: u32) -> (Daemon, AnchorSegment) {
     peers,
     source,
   );
+  assert_ne!(daemon.member_identity(), Some(fleet.host_b));
   (daemon, segment)
 }
 
@@ -1752,7 +1731,12 @@ fn all_domains(
 /// the regional configuration, the probe mesh formed to the new incarnation on every side, and the node's
 /// declared failure domain carried to the new id by its admission.
 fn observe_learned(observed: &[&Daemon], fleet: &RestartFleet, b_again: &Daemon) -> Learned {
-  let (host_b, b_new) = (fleet.host_b, fleet.b_new);
+  let (host_b, b_new) = (
+    fleet.host_b,
+    b_again
+      .member_identity()
+      .expect("the replacement has its fresh member id"),
+  );
   let survivors = &fleet.survivors;
   let admitted_new = poll_until(observed, REJOIN_DEADLINE, || {
     all_members(survivors, |members| members.contains(&b_new))
@@ -1803,7 +1787,6 @@ fn successor_serves(observed: &[&Daemon], fleet: &RestartFleet) -> (bool, bool, 
 
 /// The refusals the serve side counts for a membership announcement it will not fold (task #22), under the
 /// keys `Daemon::fleet_refusals` reports them — the same counts `slates status` prints.
-const STALE_GENERATION_REFUSAL: &str = "fleet.member_generation_stale";
 const FORGED_ID_REFUSAL: &str = "fleet.member_id_forged";
 
 /// Shape: the anchor the forged announcer is configured with — B's anchor with its lowest bit flipped, any
@@ -1812,22 +1795,10 @@ fn forged_anchor_of(anchor: HostId) -> HostId {
   HostId(anchor.0 ^ 1)
 }
 
-/// AC (§4.8 "Recovery" — "a restarted host rejoins as a new member and holds nothing until its generation
-/// ... [is] validated"; task #22, **over the wire**): an announcement whose generation is **stale**, or whose
-/// member id is not the one the announcer's certificate derives to (**forged**), is refused at the serve side
-/// — counted in the refusals `slates status` reports, never folded into membership, and never acknowledged.
-/// A and B form, B at generation one (its anchor segment recorded a second start — the restart — as the
-/// anchor records one before every daemon start, so the daemon reads that generation down by one), so A
-/// learns `member_id(anchor_B, 1)`. Then two more daemons present **B's certificate** to
-/// A: one on a fresh segment — generation zero, B's seed id: a stale or replayed boot — and one configured
-/// with an anchor that is not the one A's roster holds for B's certificate, so the id it announces is one
-/// B's certificate cannot derive — a forgery, from a holder of B's key, the strongest position a forger can
-/// hold. Non-vacuous: A's `fleet.member_generation_stale` and `fleet.member_id_forged` refusals both move;
-/// A's alive membership holds exactly {A, B at generation one} once both were counted — the stale seed and
-/// the forged id never enter it; and the two refused announcers, never acknowledged, age A to death in their
-/// own views — a refusal is silence, not an answer the announcer could count itself alive from.
+/// AC-8.1, §4.8: a member announcement that does not derive from its authenticated
+/// certificate anchor is refused, counted, and never admitted to discovery membership.
 #[test]
-fn a_stale_or_forged_announcement_is_refused_and_counted() {
+fn a_forged_announcement_is_refused_and_counted() {
   let _serial = serialize_fleet_tests();
   let pid = std::process::id();
   let mut fleet = refusal_fleet_forms(pid);
@@ -1835,22 +1806,20 @@ fn a_stale_or_forged_announcement_is_refused_and_counted() {
   let learned_new = poll_until(&[&fleet.daemon_a, &fleet.daemon_b], REJOIN_DEADLINE, || {
     knows_exactly(&fleet.daemon_a, &[host_a, b_new]) && fleet.daemon_a.fleet_meshed() == Some(true)
   });
-  let stale = announce_as_b(&mut fleet, anchor_b, pid);
   let forged = announce_as_b(&mut fleet, forged_anchor_of(anchor_b), pid);
-  let refused = observe_refused(&fleet, &stale, &forged);
-  stale.stop();
+  let refused = observe_refused(&fleet, &forged);
   forged.stop();
   fleet.daemon_b.stop();
   fleet.daemon_a.stop();
   drop(fleet.segment_b);
   assert!(
     learned_new,
-    "A learned B's generation-one id on contact and its mesh formed to it"
+    "A learned B's fresh id on contact and its mesh formed to it"
   );
   assert_refused(&refused);
 }
 
-/// The refusal scenario's fleet: A and B (B at generation one) running, and what the two announcers that
+/// The refusal scenario's fleet: A and B under their observed fresh ids running, and what the two announcers that
 /// present B's certificate need — its profile, two more copies of its identity, the entry for A they dial,
 /// and the serve pairs they bind.
 struct RefusalFleet {
@@ -1880,7 +1849,6 @@ fn refusal_fleet_forms(pid: u32) -> RefusalFleet {
   let identity_b = b_identities.pop().expect("B's identity three times");
   let anchor_a = anchor_of(&profile_a);
   let anchor_b = anchor_of(&profile_b);
-  let b_new = member_id(anchor_b, 1);
   let serve = mesh_serve_ports(4);
   let cert_a = identity_a.certificate();
   let cert_b = identity_b.certificate();
@@ -1888,7 +1856,7 @@ fn refusal_fleet_forms(pid: u32) -> RefusalFleet {
   let peers_of_b = vec![fleet_peer_at(anchor_a, host_a, serve[0], &cert_a)];
   let no_domains = std::collections::BTreeMap::new();
   let instance_a = format!("refusal-{}-{pid}", host_a.0);
-  let instance_b = format!("refusal-{}-{pid}", b_new.0);
+  let instance_b = format!("refusal-{}-{pid}", host_b.0);
   let config_a = fleet_config(
     &profile_a,
     &instance_a,
@@ -1924,6 +1892,9 @@ fn refusal_fleet_forms(pid: u32) -> RefusalFleet {
   let daemon_b = start_fleet_node(
     &profile_b, config_b, identity_b, serve[1], peers_of_b, source_b,
   );
+  let host_a = daemon_a.member_identity().expect("A's live member");
+  let b_new = daemon_b.member_identity().expect("B's live member");
+  daemon_a.bootstrap(true).expect("explicit initial group");
   RefusalFleet {
     daemon_a,
     daemon_b,
@@ -1940,10 +1911,8 @@ fn refusal_fleet_forms(pid: u32) -> RefusalFleet {
   }
 }
 
-/// Starts a daemon presenting **B's certificate** to A, configured with `anchor` and its generation-zero id
-/// on a fresh segment, dialing A. With B's own anchor it announces B's seed at generation zero — **stale**, A
-/// having learned generation one. With any other anchor it announces an id B's certificate does not derive
-/// to — **forged**.
+/// Presents B's certificate with a different configured anchor. The resulting member id
+/// cannot derive from B's authenticated identity and must be refused.
 fn announce_as_b(fleet: &mut RefusalFleet, anchor: HostId, pid: u32) -> Daemon {
   let host = member_id(anchor, 0);
   let identity = fleet.b_identities.pop().expect("an identity per announcer");
@@ -1995,22 +1964,17 @@ fn refusal_count(daemon: &Daemon, kind: &str) -> u64 {
 
 /// What A and the two announcers showed once both had announced.
 struct Refused {
-  stale_counted: bool,
   forged_counted: bool,
   membership_held: bool,
-  stale_unanswered: bool,
   forged_unanswered: bool,
 }
 
 /// Polls A until both refusals are counted, then holds its membership over a settle window, and waits for
 /// each announcer — never acknowledged — to age A to death in its own view.
-fn observe_refused(fleet: &RefusalFleet, stale: &Daemon, forged: &Daemon) -> Refused {
+fn observe_refused(fleet: &RefusalFleet, forged: &Daemon) -> Refused {
   let a = &fleet.daemon_a;
-  let observed: Vec<&Daemon> = vec![a, &fleet.daemon_b, stale, forged];
+  let observed: Vec<&Daemon> = vec![a, &fleet.daemon_b, forged];
   let (host_a, b_new) = (fleet.host_a, fleet.b_new);
-  let stale_counted = poll_until(&observed, REJOIN_DEADLINE, || {
-    refusal_count(a, STALE_GENERATION_REFUSAL) >= 1
-  });
   let forged_counted = poll_until(&observed, REJOIN_DEADLINE, || {
     refusal_count(a, FORGED_ID_REFUSAL) >= 1
   });
@@ -2022,13 +1986,10 @@ fn observe_refused(fleet: &RefusalFleet, stale: &Daemon, forged: &Daemon) -> Ref
         .is_some_and(|members| !members.contains(&host_a))
     })
   };
-  let stale_unanswered = aged_a(stale);
   let forged_unanswered = aged_a(forged);
   Refused {
-    stale_counted,
     forged_counted,
     membership_held,
-    stale_unanswered,
     forged_unanswered,
   }
 }
@@ -2037,20 +1998,12 @@ fn observe_refused(fleet: &RefusalFleet, stale: &Daemon, forged: &Daemon) -> Ref
 /// happen.
 fn assert_refused(refused: &Refused) {
   assert!(
-    refused.stale_counted,
-    "A counted the generation-zero announcement as `fleet.member_generation_stale`"
-  );
-  assert!(
     refused.forged_counted,
     "A counted the announcement from the wrong anchor as `fleet.member_id_forged`"
   );
   assert!(
     refused.membership_held,
-    "A's alive membership held exactly {{A, B at generation one}}: neither the stale seed nor the forged id was folded"
-  );
-  assert!(
-    refused.stale_unanswered,
-    "the stale announcer was never acknowledged — A aged to death in its view"
+    "A's alive membership still names only A and B; the forged id was never folded"
   );
   assert!(
     refused.forged_unanswered,
@@ -2076,15 +2029,13 @@ fn free_ports(count: usize) -> Vec<u16> {
 fn fleet_node(name: &str) -> (MachineProfile, HostId, Identity) {
   let mut profile = profile(name);
   profile.facts.identity.cpu = format!("{}-{}", profile.facts.identity.cpu, unique());
-  // The returned `HostId` is the generation-0 **member id** (`member_id(anchor, 0)`), what the daemon computes
-  // for itself on a fresh test segment; the stable anchor is recomputed from the profile where a
-  // `FleetMembership`'s `origin_anchor` needs it ([`anchor_of`]) (task #22).
+  // Return the routing seed; callers observe the actual id after starting the daemon.
   let host = member_id(anchor_of(&profile), 0);
   (profile, host, self_signed())
 }
 
 /// The stable anchor of a test node — the machine-identity hash the daemon uses as a laptop's anchor and from
-/// which it derives its runtime member id `member_id(origin_anchor, generation)` (task #22).
+/// which it derives its runtime member id `member_id(origin_anchor, boot_nonce)` (task #22).
 fn anchor_of(profile: &MachineProfile) -> HostId {
   HostId(host_id_of(&profile.facts.identity))
 }
@@ -2199,7 +2150,7 @@ fn start_mesh_with(
     .iter()
     .map(|(profile, _, _)| anchor_of(profile))
     .collect();
-  nodes
+  let daemons: Vec<Daemon> = nodes
     .into_iter()
     .enumerate()
     .map(|(i, (profile, host, identity))| {
@@ -2245,7 +2196,111 @@ fn start_mesh_with(
       )
       .expect("the fleet daemon starts")
     })
-    .collect()
+    .collect();
+  bootstrap_mesh(&daemons, hosts, regions);
+  settle_initial_consensus(&daemons, hosts, regions, Quorum { f });
+  daemons
+}
+
+/// A new test deployment explicitly creates the root and one council per declared region.
+/// Every remaining member joins those groups over the transport.
+fn bootstrap_mesh(
+  daemons: &[Daemon],
+  seeds: &[HostId],
+  regions: &std::collections::BTreeMap<HostId, RegionId>,
+) {
+  daemons[0]
+    .bootstrap(true)
+    .expect("explicit first-time root bootstrap");
+  let mut bootstrapped =
+    std::collections::BTreeSet::from([regions.get(&seeds[0]).copied().unwrap_or(RegionId(0))]);
+  for (daemon, seed) in daemons.iter().zip(seeds).skip(1) {
+    let region = regions.get(seed).copied().unwrap_or(RegionId(0));
+    if bootstrapped.insert(region) {
+      assert!(
+        audit_wait(|| daemon
+          .root_regions()
+          .is_some_and(|regions| regions.contains(&region))),
+        "the root admits the new region before its regional bootstrap"
+      );
+      daemon
+        .bootstrap(false)
+        .expect("explicit first-time regional bootstrap");
+    }
+  }
+}
+
+/// Initial membership is committed before a fixture may remove any voter. Probe formation
+/// alone cannot establish this precondition (§4.8, AUD-07).
+fn settle_initial_consensus(
+  daemons: &[Daemon],
+  seeds: &[HostId],
+  regions: &std::collections::BTreeMap<HostId, RegionId>,
+  quorum: Quorum,
+) {
+  let assigned: Vec<RegionId> = seeds
+    .iter()
+    .map(|seed| regions.get(seed).copied().unwrap_or(RegionId(0)))
+    .collect();
+  let mut regional = std::collections::BTreeMap::<RegionId, Vec<HostId>>::new();
+  for (daemon, region) in daemons.iter().zip(&assigned) {
+    regional
+      .entry(*region)
+      .or_default()
+      .push(daemon.member_identity().unwrap());
+  }
+  for members in regional.values_mut() {
+    members.sort_unstable();
+  }
+  let root_voters: Vec<HostId> = regional.values().map(|members| members[0]).collect();
+  let settled = audit_wait(|| {
+    daemons.iter().zip(&assigned).all(|(daemon, region)| {
+      let members = &regional[region];
+      let voters = slates_cluster::config_group::council_voters(members, quorum);
+      initial_member_committed(daemon, members, &voters, &root_voters)
+    })
+  });
+  assert!(
+    settled,
+    "initial membership did not commit: expected regions={regional:?} root={root_voters:?}; {}",
+    daemons
+      .iter()
+      .map(|daemon| format!(
+        "host={:?} council={:?} voters={:?} root={:?} leaders={:?}/{:?}",
+        daemon.member_identity(),
+        daemon.council_members(),
+        daemon.council_voters(),
+        daemon.root_voters(),
+        daemon.council_leads(),
+        daemon.root_leads()
+      ))
+      .collect::<Vec<_>>()
+      .join("; ")
+  );
+}
+
+fn initial_member_committed(
+  daemon: &Daemon,
+  members: &[HostId],
+  voters: &[HostId],
+  root_voters: &[HostId],
+) -> bool {
+  let host = daemon.member_identity().unwrap();
+  daemon
+    .council_members()
+    .is_some_and(|known| known == members)
+    && (!voters.contains(&host)
+      || daemon
+        .council_voters()
+        .is_some_and(|known| same_voters(&known, voters)))
+    && (!root_voters.contains(&host)
+      || daemon
+        .root_voters()
+        .is_some_and(|known| same_voters(&known, root_voters)))
+}
+
+fn same_voters(known: &[HostId], expected: &[HostId]) -> bool {
+  known.len() == expected.len() && expected.iter().all(|voter| known.contains(voter))
 }
 
 /// AC (§4.8, boot step 6, N-node): three daemons form the full **direct probe mesh** — each of the three
@@ -2326,6 +2381,10 @@ fn three_daemons_elect_one_stable_council_leader_over_the_transport() {
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
   let serve = mesh_serve_ports(n);
   let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
 
   // The council elects only over live record sessions, so wait for the direct mesh first (the record links
   // come up alongside the probe mesh), then for exactly one leader to emerge over the transport.
@@ -2396,6 +2455,10 @@ fn a_loopback_fleet_derives_its_election_timing_at_the_measured_floor() {
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
   let serve = mesh_serve_ports(n);
   let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
 
   assert_fleet_forms(&daemons, &hosts, &names);
   let observed: Vec<&Daemon> = daemons.iter().collect();
@@ -2416,7 +2479,7 @@ fn a_loopback_fleet_derives_its_election_timing_at_the_measured_floor() {
     });
   let timings: Vec<Option<slates_cluster::timing::ElectionTiming>> =
     daemons.iter().map(Daemon::council_timing).collect();
-  let reported = council_reports_over_the_wire(&hosts);
+  let reported = council_reports_over_the_wire(&daemons);
   for daemon in daemons {
     daemon.stop();
   }
@@ -2443,12 +2506,11 @@ fn a_loopback_fleet_derives_its_election_timing_at_the_measured_floor() {
 /// The council block of every mesh node's `DaemonStatus`, read over the wire — what an operator's
 /// `slates status` prints (`fleet_council_*`): each node's control shard's council leadership and derived
 /// timing, so a status read on a pod reports what the in-process accessor reports.
-fn council_reports_over_the_wire(hosts: &[HostId]) -> Vec<slates_ipc::protocol::GroupReport> {
-  let pid = std::process::id();
-  hosts
+fn council_reports_over_the_wire(daemons: &[Daemon]) -> Vec<slates_ipc::protocol::GroupReport> {
+  daemons
     .iter()
-    .map(|host| {
-      let mut client = Client::connect(&format!("fleet3-{}-{pid}", host.0));
+    .map(|daemon| {
+      let mut client = Client::connect(daemon.instance());
       match client.call(&RequestBody::DaemonStatus) {
         ReplyBody::DaemonStatus { report } => report.fleet.council.clone(),
         other => panic!("status answers on every node: {other:?}"),
@@ -2505,6 +2567,10 @@ fn a_council_commits_a_membership_retirement_over_the_transport() {
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
   let serve = mesh_serve_ports(n);
   let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
 
   assert_fleet_forms(&daemons, &hosts, &names);
   // Wait for the council to elect one leader, then kill a *follower* so the leader stays and reconciles.
@@ -2594,6 +2660,10 @@ fn a_committed_retirement_reaches_every_shards_placement_view() {
   // Two shards per daemon: the council runs on the control shard (index 0); shard index 1 is a non-control
   // shard that also owns volumes and answers the placement verbs.
   let mut daemons = start_mesh_with(nodes, &hosts, &certs, &serve, 1, 2, &regions, &mirrors);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
 
   assert_fleet_forms(&daemons, &hosts, &names);
   let elected = poll_until(
@@ -2706,6 +2776,10 @@ fn the_root_group_commits_a_region_retirement_over_the_transport() {
     .map(|(i, &host)| (host, RegionId(u64::try_from(i).unwrap_or(0))))
     .collect();
   let mut daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
 
   assert_fleet_forms(&daemons, &hosts, &names);
   // Wait for the root group to elect one leader, then kill a *follower* so the leader stays and reconciles.
@@ -2798,6 +2872,16 @@ fn a_root_learner_fetches_the_committed_region_membership_over_the_transport() {
   .into_iter()
   .collect();
   let daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
+  let seeds = hosts;
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  let regions: std::collections::BTreeMap<HostId, RegionId> = seeds
+    .iter()
+    .zip(&hosts)
+    .filter_map(|(seed, host)| regions.get(seed).map(|region| (*host, *region)))
+    .collect();
 
   assert_fleet_forms(&daemons, &hosts, &names);
   // Region 0's representative is its lowest-id host (a root voter); the other region-0 member is the learner.
@@ -2930,6 +3014,16 @@ fn an_operator_promotes_a_lost_regions_mirror_over_the_transport() {
       .collect();
   let daemons =
     start_mesh_with_regions_and_mirrors(nodes, &hosts, &certs, &serve, 1, &regions, &mirrors);
+  let seeds = hosts;
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  let regions: std::collections::BTreeMap<HostId, RegionId> = seeds
+    .iter()
+    .zip(&hosts)
+    .filter_map(|(seed, host)| regions.get(seed).map(|region| (*host, *region)))
+    .collect();
 
   assert_fleet_forms(&daemons, &hosts, &names);
   let mut survivors: Vec<(HostId, Daemon)> = hosts.iter().copied().zip(daemons).collect();
@@ -3025,7 +3119,6 @@ fn an_operator_promotes_a_lost_regions_mirror_over_the_transport() {
 #[test]
 fn a_client_on_a_follower_promotes_a_region_by_forwarding_to_the_leader() {
   let _serial = serialize_fleet_tests();
-  let pid = std::process::id();
   let names = ["a", "b", "c"];
   let n = names.len();
   let nodes: Vec<(MachineProfile, HostId, Identity)> =
@@ -3047,6 +3140,10 @@ fn a_client_on_a_follower_promotes_a_region_by_forwarding_to_the_leader() {
       .collect();
   let daemons =
     start_mesh_with_regions_and_mirrors(nodes, &hosts, &certs, &serve, 1, &regions, &mirrors);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
 
   assert_fleet_forms(&daemons, &hosts, &names);
   let daemons: Vec<(HostId, Daemon)> = hosts.iter().copied().zip(daemons).collect();
@@ -3072,10 +3169,10 @@ fn a_client_on_a_follower_promotes_a_region_by_forwarding_to_the_leader() {
   let follower = daemons
     .iter()
     .find(|(_, daemon)| daemon.root_leads() == Some(false))
-    .map(|(host, _)| *host);
+    .map(|(_, daemon)| daemon.instance().to_owned());
   let promoted = match (elected, follower) {
     (true, Some(follower)) => {
-      let mut client = Client::connect(&format!("fleet3-{}-{pid}", follower.0));
+      let mut client = Client::connect(&follower);
       poll_until(
         &daemons.iter().map(|(_, d)| d).collect::<Vec<_>>(),
         COUNCIL_RETIRE_DEADLINE,
@@ -3113,7 +3210,6 @@ fn a_client_on_a_follower_promotes_a_region_by_forwarding_to_the_leader() {
 #[test]
 fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
   let _serial = serialize_fleet_tests();
-  let pid = std::process::id();
   let names = ["a", "b", "c"];
   let n = names.len();
   let nodes: Vec<(MachineProfile, HostId, Identity)> =
@@ -3130,11 +3226,19 @@ fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
   .into_iter()
   .collect();
   let daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
 
   assert_fleet_forms(&daemons, &hosts, &names);
 
   // Create a volume on node a (region 0): it is owned by a, its creator.
-  let mut client_a = Client::connect(&format!("fleet3-{}-{pid}", hosts[0].0));
+  let mut client_a = Client::connect(&instances[0].clone());
   let created = client_a.call(&scratch("cross-region"));
   let id = match created {
     ReplyBody::Created { id } => id,
@@ -3149,7 +3253,7 @@ fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
   // A client on node b (region 1) reads the volume's Status. b forwards the read to a and relays the reply.
   // Polled: it turns from a transient refusal (the root configuration not yet formed on b, so the lookup guard
   // does not fire and b routes locally, or the b→a session not yet up) into the served Status.
-  let mut client_b = Client::connect(&format!("fleet3-{}-{pid}", hosts[1].0));
+  let mut client_b = Client::connect(&instances[1].clone());
   let served = poll_until(
     &daemons.iter().collect::<Vec<_>>(),
     COUNCIL_RETIRE_DEADLINE,
@@ -3185,7 +3289,6 @@ fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
 #[test]
 fn a_client_writes_a_cross_region_volume_by_forwarding_to_its_owner() {
   let _serial = serialize_fleet_tests();
-  let pid = std::process::id();
   let names = ["a", "b", "c"];
   let n = names.len();
   let nodes: Vec<(MachineProfile, HostId, Identity)> =
@@ -3202,11 +3305,19 @@ fn a_client_writes_a_cross_region_volume_by_forwarding_to_its_owner() {
   .into_iter()
   .collect();
   let daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
 
   assert_fleet_forms(&daemons, &hosts, &names);
 
   // Create a volume on node a (region 0): it is owned by a, its creator.
-  let mut client_a = Client::connect(&format!("fleet3-{}-{pid}", hosts[0].0));
+  let mut client_a = Client::connect(&instances[0].clone());
   let id = match client_a.call(&scratch("cross-region-write")) {
     ReplyBody::Created { id } => id,
     other => {
@@ -3220,7 +3331,7 @@ fn a_client_writes_a_cross_region_volume_by_forwarding_to_its_owner() {
   // A client on node b (region 1). Wait until a cross-region *read* is served — that proves the root
   // configuration has formed on b (the lookup guard fires) and the b→a session is up — so the write below is
   // not raced by the forming config. A read takes no snapshot, so this readiness poll is side-effect free.
-  let mut client_b = Client::connect(&format!("fleet3-{}-{pid}", hosts[1].0));
+  let mut client_b = Client::connect(&instances[1].clone());
   let ready = poll_until(
     &daemons.iter().collect::<Vec<_>>(),
     COUNCIL_RETIRE_DEADLINE,
@@ -3301,6 +3412,10 @@ fn a_committed_promotion_reaches_every_shards_lookup_view() {
   // Two shards per daemon: the record plane (and the root group) runs on the control shard (index 0); shard
   // index 1 is a non-control shard that also serves clients and answers the lookup guard.
   let daemons = start_mesh_with(nodes, &hosts, &certs, &serve, 1, 2, &regions, &mirrors);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
 
   assert_fleet_forms(&daemons, &hosts, &names);
   let daemons: Vec<(HostId, Daemon)> = hosts.iter().copied().zip(daemons).collect();
@@ -3376,6 +3491,10 @@ fn a_learner_fetches_the_councils_committed_configuration_over_the_transport() {
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
   let serve = mesh_serve_ports(n);
   let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
 
   assert_fleet_forms(&daemons, &hosts, &names);
   // The council votes with the three lowest-id members (the candidate floor 2f+1 = 3); the other two are
@@ -3486,6 +3605,14 @@ fn three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node() {
 
   let serve = mesh_serve_ports(n);
   let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
 
   assert_fleet_forms(&daemons, &hosts, &names);
 
@@ -3497,9 +3624,8 @@ fn three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node() {
   // provisioned on A now must still place — over B, the one remaining candidate — under the new generation.
   // Before the owner's acceptor followed the version, A's own hold refused its record `ForeignGeneration`
   // and nothing provisioned after a membership change ever placed; the head placing is the proof it does.
-  let pid = std::process::id();
   let placed_after_retirement = all_retired && {
-    let mut client = Client::connect(&format!("fleet3-{}-{pid}", hosts[0].0));
+    let mut client = Client::connect(&instances[0].clone());
     match client.call(&scratch("after-retirement")) {
       ReplyBody::Created { id } => poll_head_placed(
         &daemons.iter().collect::<Vec<_>>(),
@@ -3680,6 +3806,9 @@ fn a_fleet_node_under_a_containers_memory_bound_still_admits_a_client() {
       name: format!("slates-seg-{instance_b}"),
     },
   );
+  let host_a = daemon_a
+    .member_identity()
+    .expect("A has its fresh identity");
   // B's probe session to A is up — A accepted it and serves it — before the client arrives.
   let served_b = poll_until(&[&daemon_b], FORMATION_DEADLINE, || {
     daemon_b.fleet_meshed() == Some(true)
@@ -3918,7 +4047,6 @@ fn a_holder_durably_holds_the_owners_replicated_head() {
   let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
-  let host_a = a.host;
   let pid = std::process::id();
   let instance_a = format!("fleet-{}-{pid}", a.host.0);
   let peer_of_a = Peer {
@@ -3936,6 +4064,7 @@ fn a_holder_durably_holds_the_owners_replicated_head() {
     certificate: a.identity.certificate(),
   };
   let daemon_a = start(a, peer_of_a);
+  let host_a = daemon_a.member_identity().unwrap();
   let daemon_b = start(b, peer_of_b);
 
   // Let the fleet form (polled) before provisioning, as the replication test does.
@@ -4033,6 +4162,10 @@ fn three_daemons_take_over_a_dead_owners_head() {
   let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
   let serve = mesh_serve_ports(n);
   let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
 
   assert_fleet_forms(&daemons, &hosts, &names);
 
@@ -4137,6 +4270,10 @@ fn five_daemons_take_over_a_dead_owners_head_over_a_multi_holder_quorum() {
   let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
   let serve = mesh_serve_ports(n);
   let mut daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 2);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
 
   assert_fleet_forms(&daemons, &hosts, &names);
 
@@ -4421,6 +4558,11 @@ fn a_slow_first_round_candidate_is_hedged_after_the_measured_p95() {
   let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
   let serve = mesh_serve_ports(n);
   let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+
   assert_fleet_forms(&daemons, &hosts, &names);
   let all: Vec<&Daemon> = daemons.iter().collect();
 
@@ -4523,6 +4665,11 @@ fn a_holder_that_lost_placed_content_is_repaired_by_the_healer() {
   let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
   let serve = mesh_serve_ports(n);
   let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+
   assert_fleet_forms(&daemons, &hosts, &names);
   let all: Vec<&Daemon> = daemons.iter().collect();
 
@@ -4600,6 +4747,11 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
   let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
   let serve = mesh_serve_ports(n);
   let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+
   assert_fleet_forms(&daemons, &hosts, &names);
 
   // Provision, write and seal on A; wait for the content and head to place and for both survivors to
@@ -4628,7 +4780,7 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
   );
 
   // The successor serves the volume once it materialized it: its `status` answers instead of refusing.
-  let successor_instance = format!("fleet3-{}-{pid}", successor.0);
+  let successor_instance = daemons[successor_index].instance().to_owned();
   let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &successor_instance, id);
   let got = if served {
     Some(read_hello_over_nfs(&daemons[successor_index], "served"))
@@ -4790,9 +4942,7 @@ fn start_policed_pair(durability: DurabilityBound) -> (Daemon, Daemon, String) {
   };
   let daemon_a = start_with_policy(a, peer_of_a, TWO_SHARDS, Some(durability));
   let daemon_b = start_with_policy(b, peer_of_b, TWO_SHARDS, Some(durability));
-  let formed = poll_until(&[&daemon_a, &daemon_b], FORMATION_DEADLINE, || {
-    daemon_a.fleet_meshed() == Some(true) && daemon_b.fleet_meshed() == Some(true)
-  });
+  let formed = form_and_settle(&[&daemon_a, &daemon_b]);
   if !formed {
     daemon_a.stop();
     daemon_b.stop();
@@ -4934,6 +5084,11 @@ fn a_takeover_successor_serves_a_volume_on_a_non_control_shard() {
     &std::collections::BTreeMap::new(),
     &std::collections::BTreeMap::new(),
   );
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+
   assert_fleet_forms(&daemons, &hosts, &names);
 
   let name = name_on_partition("served2", OTHER_PARTITION, usize::from(TWO_SHARDS));
@@ -4961,7 +5116,7 @@ fn a_takeover_successor_serves_a_volume_on_a_non_control_shard() {
   );
   let served = poll_status_answers(
     &daemons.iter().collect::<Vec<_>>(),
-    &format!("fleet3-{}-{pid}", successor.0),
+    daemons[successor_index].instance(),
     id,
   );
   let got = if served {
@@ -5065,10 +5220,10 @@ fn two_node_fleet() -> (Daemon, Daemon, String) {
   };
   let daemon_a = start(a, peer_of_a);
   let daemon_b = start(b, peer_of_b);
-  let settle = Instant::now() + FORMATION_SETTLE;
-  while Instant::now() < settle {
-    std::thread::yield_now();
-  }
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the merge fixture explicitly forms its groups"
+  );
   (daemon_a, daemon_b, instance_a)
 }
 
@@ -5327,32 +5482,17 @@ fn a_holder_whose_recomputation_mismatches_refuses_the_version_loudly() {
   );
 }
 
-/// AC (§4.8 "Recovery", the KIND whole-pod-restart gap of 2026-09-14): a survivor **keeps** a same-id restart
-/// in its membership through its own retirement of the peer's previous incarnation — the rejoin survives the
-/// retirement race. A pod restart returns at generation 0 with the same manifest seed member id its
-/// predecessor held (a restart loses the RAM anchor segment, so the generation cannot advance, R1), so this
-/// is the same-id contrast to [`a_restarted_peer_is_learned_on_contact_under_its_new_generation`] (a higher
-/// generation admitted as a new member). B restarts at the same addresses under the same certificate and
-/// gen-0 id while A still holds its stale probe session to the dead predecessor; A ages that stale session
-/// out and retires B, and **at that moment** B's freshly authenticated serve session at A must not be torn
-/// down — it is what carries A's death belief back so B self-refutes and A re-admits it.
-///
-/// Before the fix (2026-09-14), retirement closed the peer's incoming sessions **by certificate**
-/// (`Demux::close_peer`), which cannot tell the dead predecessor's session from the replacement's under the
-/// same operator certificate: A closed B's new serve session, B's probes then fell on a connection id A no
-/// longer mapped (`unknown_id` climbing), B aged A out in turn, and the two idled in a circular wait — both
-/// reporting `fleet_meshed` **vacuously** (a retired peer is excluded from the mesh check), which is why the
-/// same-address restart test
-/// [`a_stopped_daemons_serve_ports_are_freed_so_its_restart_binds_the_same_addresses`] passed without proving
-/// rejoin. Non-vacuous here: the fleet is shown formed and A shown to know B before the restart, then across a
-/// window spanning a full retirement-and-rejoin cycle A must **keep** B a member and B must keep A.
+/// AC-8.1, §4.8, KIND retirement regression: restart B with the same certificate and
+/// addresses but a fresh member id. Retiring its predecessor must preserve the replacement's
+/// authenticated serve session and mutual discovery. A two-node loss cannot establish safe
+/// voter admission; the three-node test below separately requires that consensus transition.
+/// The original same-id failure and measurements remain in the dated retirement bug report.
 #[test]
-fn a_same_id_restart_survives_the_survivors_retirement_of_the_dead_incarnation() {
+fn a_fresh_restart_keeps_its_serve_session_while_the_predecessor_retires() {
   let _serial = serialize_fleet_tests();
   let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
-  let host_a = a.host;
   let host_b = b.host;
   let anchor_b = b.origin_anchor;
   let profile_b = b.profile.clone();
@@ -5362,8 +5502,7 @@ fn a_same_id_restart_survives_the_survivors_retirement_of_the_dead_incarnation()
     identity: b_first,
     ..b
   };
-  // The restart is the same machine (anchor), the same gen-0 member id, the same certificate, at the same
-  // addresses, on a fresh RAM segment — exactly a pod restart (R1: the anchor segment does not survive it).
+  // Same certificate and addresses, fresh RAM and voting identity; the manifest seed only routes contact.
   let b_again = Node {
     profile: profile_b,
     host: host_b,
@@ -5387,13 +5526,17 @@ fn a_same_id_restart_survives_the_survivors_retirement_of_the_dead_incarnation()
     certificate: a.identity.certificate(),
   };
   let daemon_a = start(a, peer_of_a);
+  let host_a = daemon_a.member_identity().unwrap();
   let daemon_b = start(b, peer_of_b.clone());
+  let host_b = daemon_b.member_identity().unwrap();
   let formed = form_and_settle(&[&daemon_a, &daemon_b]);
   let knew_b = daemon_a
     .fleet_members()
     .is_some_and(|members| members.contains(&host_b));
   daemon_b.stop();
   let daemon_b_again = start(b_again, peer_of_b);
+  let fresh_b = daemon_b_again.member_identity().unwrap();
+  assert_ne!(fresh_b, host_b);
 
   // The restart re-forms the mesh; then A ages out its stale probe session to the dead predecessor and
   // **transiently retires B** — the retirement whose cleanup used to close the restart's freshly-bound serve
@@ -5403,7 +5546,7 @@ fn a_same_id_restart_survives_the_survivors_retirement_of_the_dead_incarnation()
   let reformed = poll_until(&[&daemon_a, &daemon_b_again], FORMATION_DEADLINE, || {
     daemon_a
       .fleet_members()
-      .is_some_and(|m| m.contains(&host_b))
+      .is_some_and(|m| m.contains(&fresh_b))
   });
   // Non-vacuous: A actually retires B (the stale session ages out), so this exercises the retirement whose
   // cleanup held the bug — not merely a formation that never retired anything.
@@ -5418,7 +5561,7 @@ fn a_same_id_restart_survives_the_survivors_retirement_of_the_dead_incarnation()
   let rejoined = poll_until(&[&daemon_a, &daemon_b_again], REJOIN_DEADLINE, || {
     daemon_a
       .fleet_members()
-      .is_some_and(|m| m.contains(&host_b))
+      .is_some_and(|m| m.contains(&fresh_b))
       && daemon_b_again
         .fleet_members()
         .is_some_and(|m| m.contains(&host_a))
@@ -5427,7 +5570,7 @@ fn a_same_id_restart_survives_the_survivors_retirement_of_the_dead_incarnation()
     && holds_for(FORMATION_SETTLE, || {
       daemon_a
         .fleet_members()
-        .is_some_and(|m| m.contains(&host_b))
+        .is_some_and(|m| m.contains(&fresh_b))
         && daemon_b_again
           .fleet_members()
           .is_some_and(|m| m.contains(&host_a))
@@ -5439,7 +5582,7 @@ fn a_same_id_restart_survives_the_survivors_retirement_of_the_dead_incarnation()
   assert!(knew_b, "A knew B before the restart");
   assert!(
     reformed,
-    "the same-id restart re-formed the mesh (A knows B)"
+    "the fresh restart re-formed the mesh (A knows the replacement)"
   );
   assert!(
     retired,
@@ -5451,4 +5594,188 @@ fn a_same_id_restart_survives_the_survivors_retirement_of_the_dead_incarnation()
      death echo reached it and it self-refuted (the certificate-keyed close of the replacement is fixed)"
   );
   assert!(stable, "the re-admission held — the rejoin did not flap");
+}
+
+/// AC-8.1, §4.8, AUD-07: lose a whole anchor, rejoin through the surviving council under a
+/// fresh identity, then lose the leader and require the replacement's vote for the next election.
+#[test]
+fn a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let profiles: Vec<MachineProfile> = ["audit-voter-a", "audit-voter-b", "audit-voter-c"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<HostId> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<HostId> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<Vec<Identity>> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let ports = mesh_serve_ports(profiles.len());
+  let peers = |node: usize| -> Vec<FleetPeer> {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &format!("audit-voter-{node}-{pid}"),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  let mut daemons: Vec<Daemon> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        SegmentSource::Create {
+          name: format!("audit-voter-{node}-{pid}"),
+        },
+      )
+    })
+    .collect();
+  let before: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert!(
+    daemons
+      .iter()
+      .all(|daemon| daemon.council_leads() == Some(false) && daemon.root_leads() == Some(false)),
+    "startup cannot bootstrap from the manifest"
+  );
+  daemons[0]
+    .bootstrap(true)
+    .expect("the operator explicitly creates this test's new fleet");
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  assert!(
+    audit_wait(|| daemons.iter().all(|daemon| {
+      daemon
+        .council_members()
+        .is_some_and(|members| before.iter().all(|host| members.contains(host)))
+    })),
+    "the first bootstrap admits the live identities: {:?}",
+    daemons
+      .iter()
+      .map(Daemon::council_members)
+      .collect::<Vec<_>>()
+  );
+  // Keep the root's only voter alive: losing that sole copy must remain unavailable. This
+  // history exercises the regional group's f=1 tolerance and its fresh-member admission.
+  let replaced = daemons
+    .iter()
+    .position(|daemon| daemon.root_leads() == Some(false))
+    .unwrap();
+  let old = before[replaced];
+  daemons.remove(replaced).stop();
+  let replacement = start_fleet_node(
+    &profiles[replaced],
+    configs[replaced].clone(),
+    identities[replaced].pop().unwrap(),
+    ports[replaced],
+    peers(replaced),
+    SegmentSource::Create {
+      name: format!("audit-voter-replacement-{pid}"),
+    },
+  );
+  let fresh = replacement.member_identity().unwrap();
+  assert_ne!(
+    old, fresh,
+    "the same certificate with a new anchor is a different member"
+  );
+  assert_eq!(replacement.council_leads(), Some(false));
+  daemons.push(replacement);
+  assert!(
+    audit_wait(|| daemons
+      .iter()
+      .all(|daemon| daemon.council_members().is_some_and(|members| {
+        members.len() == profiles.len() && members.contains(&fresh) && !members.contains(&old)
+      }))),
+    "the surviving quorum admits the fresh member: {:?}",
+    daemons
+      .iter()
+      .map(Daemon::council_members)
+      .collect::<Vec<_>>()
+  );
+  let voters: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert!(
+    audit_wait(|| audit_voters_match(&daemons, &voters)),
+    "every replacement voter has received the committed membership transition: {:?}",
+    daemons
+      .iter()
+      .map(Daemon::council_voters)
+      .collect::<Vec<_>>()
+  );
+  assert!(audit_wait(|| daemons
+    .iter()
+    .filter(|daemon| daemon.council_leads() == Some(true))
+    .count()
+    == 1));
+  let victim = daemons
+    .iter()
+    .position(|daemon| {
+      daemon.council_leads() == Some(true) && daemon.member_identity() != Some(fresh)
+    })
+    .unwrap_or_else(|| {
+      daemons
+        .iter()
+        .position(|daemon| daemon.member_identity() != Some(fresh))
+        .unwrap()
+    });
+  let lost = daemons[victim].member_identity().unwrap();
+  daemons.remove(victim).stop();
+  let remaining: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert!(
+    audit_wait(|| audit_voters_match(&daemons, &remaining)),
+    "the surviving pair commits another membership change, which requires the fresh voter's acknowledgement; lost {lost:?}"
+  );
+  for daemon in daemons {
+    daemon.stop();
+  }
+}
+
+/// The audit run has a strict wall-clock bound, including when the normal fleet period budget
+/// would keep diagnosing a live but non-converging coordinator. The bound is the existing formation SLO.
+fn audit_wait(mut condition: impl FnMut() -> bool) -> bool {
+  let began = Instant::now();
+  while began.elapsed() < FORMATION_DEADLINE {
+    if condition() {
+      return true;
+    }
+    std::thread::yield_now();
+  }
+  false
+}
+
+/// Every node has received the same committed voter set, with no joint transition remaining.
+fn audit_voters_match(daemons: &[Daemon], voters: &[HostId]) -> bool {
+  daemons.iter().all(|daemon| {
+    daemon.council_voters().is_some_and(|current| {
+      current.len() == voters.len() && voters.iter().all(|voter| current.contains(voter))
+    })
+  })
 }

@@ -118,6 +118,9 @@ fn daemon(name: &str) -> (Daemon, String) {
     },
   )
   .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   (daemon, instance)
 }
 
@@ -131,17 +134,15 @@ fn scratch(name: &str) -> RequestBody {
   }
 }
 
-/// A daemon configured as a member of an `f = 1` fleet of three (itself and two peers it never reaches — no
-/// transport runs, so no probe, session or record plane is involved), under the operator's `durability`
-/// policy. The placement configuration is formed at boot from the declared members (§4.8, boot step 6), so
-/// what the policy allows is decided without a network; this is the smallest daemon that has a durability to
-/// fall short of.
+/// A freshly bootstrapped `f = 1` fleet under the operator's durability policy. Its two
+/// configured peers are unreachable, so only the bootstrap host is admitted. The durability
+/// calculation must not count those absent peers as replicas (§4.8, AUD-07).
 fn fleet_daemon(name: &str, durability: Option<DurabilityBound>) -> (Daemon, String) {
   let profile = profile();
   let instance = format!("srv-{name}-{}", std::process::id());
   let origin_anchor = slates_db::HostId(host_id_of(&profile.facts.identity));
   let host = member_id(origin_anchor, 0);
-  // The peers' ids only need to be distinct from this node's; the configuration is formed over all three.
+  // Discovery placeholders never enter the bootstrap configuration as voting members.
   let peers = vec![
     slates_db::HostId(host.0.wrapping_add(1)),
     slates_db::HostId(host.0.wrapping_add(2)),
@@ -166,20 +167,18 @@ fn fleet_daemon(name: &str, durability: Option<DurabilityBound>) -> (Daemon, Str
     },
   )
   .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   (daemon, instance)
 }
 
 /// AC (§4.8 "Placement" — "the operator's accepted ε and the coincident-failure size are the durability policy
 /// that gates a refusal"; D-14, D-18): a write that would commit a new head or seal is refused, **typed and
 /// with the measured shortfall**, while the fleet's configuration cannot hold it to the declared durability;
-/// within the policy it is accepted; and with no policy declared it is accepted as before. Three daemons of
-/// the same fleet shape (`f = 1`, three members) differ only in their policy: one that accepts no loss under
-/// two coincident failures — which an `f = 1` copyset cannot survive, so the configuration's loss is above ε
-/// — refuses `Create` with `DurabilityUnmet` carrying that loss, the ε and the failure count, counts it, and
-/// still serves reads (`List`, `DaemonStatus`); one that accepts no loss under a **single** failure (no
-/// `f = 1` copyset falls wholly inside one host) creates and snapshots; one with no policy does the same.
-/// Non-vacuous: the refusing daemon and an accepting one are the same code and fleet shape — only the ε and
-/// the failure count decide.
+/// within the policy it is accepted; and with no policy declared it is accepted. Each fixture has
+/// only its bootstrap host admitted. A zero-loss policy refuses; a policy accepting the measured
+/// risk permits create and snapshot. Reads continue while the durability refusal is counted.
 #[test]
 fn a_write_the_declared_durability_cannot_cover_is_refused_typed() {
   // The configuration cannot hold a write to this: any f = 1 copyset is lost when its two holders fail at
@@ -240,12 +239,12 @@ fn a_write_the_declared_durability_cannot_cover_is_refused_typed() {
   );
   strict.stop();
 
-  // Within the policy: a single failing host holds at most one of an f = 1 copyset's two copies, so the
-  // loss under one failure is zero — within an ε of zero. The same fleet shape creates and snapshots.
+  // The operator explicitly accepts the loss while only one host is admitted. This does
+  // not claim the snapshot is placed at f + 1; placement remains a separate operation.
   let (tolerant, tolerant_instance) = fleet_daemon(
     "durability-tolerant",
     Some(DurabilityBound {
-      accepted_loss: 0.0,
+      accepted_loss: 1.0,
       coincident_failures: 1,
     }),
   );
@@ -834,6 +833,17 @@ fn only_the_genuine_capability_binds_the_channel(
     matches!(attested, ReplyBody::Attested),
     "the genuine capability binds the channel, got {attested:?}"
   );
+  assert_eq!(
+    workload.call(&RequestBody::Bootstrap {
+      root: true,
+      member: 0
+    }),
+    ReplyBody::Refused {
+      refusal: Refusal::Forbidden {
+        verb: "bootstrap".to_owned()
+      }
+    }
+  );
 }
 
 /// The account owns a volume the consumer, sharing the uid, sees none of until shared; shared read only,
@@ -1046,6 +1056,9 @@ fn capped_daemon(name: &str, max_inodes: usize) -> (Daemon, String) {
     },
   )
   .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   (daemon, instance)
 }
 
@@ -1234,6 +1247,9 @@ fn telemetry_scenario() {
     },
   )
   .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let mut client = Client::connect(&instance);
 
   // One verb, then both rings drained: the request's spans across the shards, by its identity.
@@ -2104,6 +2120,9 @@ fn a_metadata_class_bounds_the_volume_records_a_shard_admits() {
     },
   )
   .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let mut client = Client::connect(&instance);
   let created = create_until_the_ledger_refuses(&mut client);
   assert!(
@@ -2846,6 +2865,9 @@ fn a_connect_past_the_client_bound_is_refused_typed_at_the_rendezvous() {
     },
   )
   .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let mut first = Client::connect(&instance);
   let asked = Instant::now();
   let second = connect(&instance).map(|_| ());
@@ -2872,5 +2894,59 @@ fn a_connect_past_the_client_bound_is_refused_typed_at_the_rendezvous() {
     refused_count,
     Some(1),
     "the daemon's status counts the refused connect"
+  );
+}
+
+/// AC-8.1, §4.8, AUD-07: a fresh anchor serves no writes before explicit bootstrap; the
+/// request naming a lost member cannot bootstrap its replacement through the client wire.
+#[test]
+fn bootstrap_is_explicit_and_its_request_cannot_reset_a_replacement() {
+  let profile = profile();
+  let instance = format!("bootstrap-member-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let start = || {
+    Daemon::start(
+      &profile,
+      config.clone(),
+      SegmentSource::Create {
+        name: format!("slates-seg-{instance}"),
+      },
+    )
+    .unwrap()
+  };
+  let first = start();
+  let mut client = Client::connect(&instance);
+  expect_bootstrap_required(&mut client);
+  let member = first.member_identity().unwrap().0;
+  assert_eq!(
+    client.call(&RequestBody::Bootstrap { root: true, member }),
+    ReplyBody::Acknowledged
+  );
+  assert!(matches!(
+    client.call(&scratch("bootstrapped")),
+    ReplyBody::Created { .. }
+  ));
+  drop(client);
+  first.stop();
+  let replacement = start();
+  let mut client = Client::connect(&instance);
+  assert_eq!(
+    client.call(&RequestBody::Bootstrap { root: true, member }),
+    ReplyBody::Refused {
+      refusal: slates_ipc::protocol::Refusal::ConsensusBootstrapStale
+    }
+  );
+  expect_bootstrap_required(&mut client);
+  drop(client);
+  replacement.stop();
+}
+
+/// A refusal must leave the daemon unable to acknowledge a new volume as initialized state.
+fn expect_bootstrap_required(client: &mut Client) {
+  assert_eq!(
+    client.call(&scratch("not-bootstrapped")),
+    ReplyBody::Refused {
+      refusal: slates_ipc::protocol::Refusal::ConsensusNotInitialized
+    }
   );
 }

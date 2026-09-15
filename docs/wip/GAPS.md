@@ -1159,7 +1159,41 @@ AUD-05–06 (GAP-A9-6); Raft restart, read authority and authenticated record ac
 AUD-07–10 (GAP-A9-7/-9); merge commit, holder fencing, quorum progress, ledger takeover and
 retention: AUD-11–14/-16 (GAP-A9-14/-1/-7); SWIM indirect probes, call cancellation and
 handshake bounds: AUD-15/-17/-18 (GAP-A9-7/-4/-11). These are source findings and proposed
-regression scenarios, not executed regressions or closure evidence. No fixes were made.
+regression scenarios at the audit baseline.
+
+**Implementation follow-up (2026-09-14):** AUD-03/-04/-05/-09/-10/-12/-13/-17/-18 have corrections
+in this change: bounded incremental RPC framing and handshake confirmation, deadline-bounded
+NFS routing and complete root gathers, publication coverage required before stability, fresh Raft read
+confirmation, authenticated record/prepare owners, authority checks before merge recomputation,
+independent ordered holder catch-up, and cancellation-owned cross-shard registrations. Commands and
+results are in the audit's follow-up. These corrections address nine findings; their broader GAP-A9
+rows remain open. In particular, overlays now refuse stability and recovery without retained base
+witnesses, rather than silently losing their base or private changes. At that stage nine findings remained open; AUD-07 is corrected below.
+
+**AUD-07 correction (2026-09-14):** every daemon start now uses a fresh voter id and begins
+uninitialized. Explicit bootstrap names the current boot; a replacement joins the common prefix
+once and is admitted through joint consensus. Group and authenticated sender checks fence Raft
+traffic. The three-voter whole-RAM replacement then second-loss commit passed in 9.81 s;
+143 cluster and 77 server tests passed. Ten audit findings now have corrections; eight remain open.
+The final admission regressions also reproduce and correct replay over a newer learner fetch:
+regional epoch 3 instead of 2, root version 5 instead of 3. Fetched read views now stay separate
+from each group's deterministic fold. Bootstrap recalculates durability on every shard; a sole
+admitted host cannot count absent replicas as protection (35 DB tests passed in 2.15 s).
+Complete Raft retention across warm restarts, compacted-prefix transfer and full-message quotas
+(GAP-A9-11), and operator recovery
+after quorum loss remain owed. A single-region root currently has one representative voter, so
+regional fault tolerance does not imply root-quorum survival. Details and exact commands:
+[the voter-loss report](../bugs/2026-09-14-raft-voter-state-loss.md).
+Configured DNS peers discover addresses and join automatically on local processes, bare-metal
+hosts, VMs and Kubernetes through the same protocol. Discovering and enrolling unlisted nodes
+still needs a bounded discovery-provider interface and a trust-enrollment protocol. The manifest
+is presently the pinned roster. Chart readiness also lacks a committed-admission barrier, so it
+cannot yet make rolling scale safe by waiting between replacements.
+
+The separate rejoin task reproduced the retirement/session race and added an in-process correction;
+a new-IP KIND run remains unproved here. AUD-07 now covers fresh-member voting safety; complete
+Raft retention across warm restarts remains owed. No mount or pod was run.
+
 
 Separate workspace work advanced HEAD through archive commit `540fb5b` and ledger fix
 `d9cb6e5` during this pass. BUG-12 is fixed there with recorded before/after regression evidence;

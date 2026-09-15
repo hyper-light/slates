@@ -36,6 +36,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   attach ID [--read | --write] [--snapshot N]
             [--oci-source HOST_PATH --oci-destination CONTAINER_PATH] [--json]
   detach ATTACHMENT [--json]
+  bootstrap (root | region) [--json]             explicitly create a new consensus group
   status [--json]                                  the daemon's status
   status ID [--drift] [--json]
   base read ID PATH
@@ -161,8 +162,12 @@ pub(crate) enum Verb {
   List,
   /// The daemon's status (`status` with no volume).
   DaemonStatus,
-  /// Promote a lost region's declared mirror on the root group (§4.8, D-14 — operator-initiated region-loss
-  /// promotion). Issued on the root leader, after the operator judges the region truly lost.
+  /// Explicitly create a consensus group bound to the daemon's current identity (§4.8, AUD-07).
+  Bootstrap {
+    /// Also create the root group, exactly once for a new fleet.
+    root: bool,
+  },
+  /// Promote a lost region's declared mirror through the root group (§4.8, D-14).
   PromoteRegion {
     /// The lost region's id.
     region: u64,
@@ -1080,6 +1085,14 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
       taken.only(&NONE)?;
       Ok(client(&taken, Verb::DaemonStatus))
     }
+    ["bootstrap", "root"] => {
+      taken.only(&NONE)?;
+      Ok(client(&taken, Verb::Bootstrap { root: true }))
+    }
+    ["bootstrap", "region"] => {
+      taken.only(&NONE)?;
+      Ok(client(&taken, Verb::Bootstrap { root: false }))
+    }
     ["promote-region", region] => {
       taken.only(&NONE)?;
       let region = region.parse::<u64>().map_err(|e| ParseError::BadValue {
@@ -1448,6 +1461,21 @@ mod tests {
 
   fn args(text: &str) -> Vec<String> {
     text.split_whitespace().map(str::to_owned).collect()
+  }
+
+  /// AC-8.1: bootstrap is an explicit local client verb; it is never a daemon startup flag.
+  #[test]
+  fn bootstrap_names_the_group_to_create() {
+    for (scope, root) in [("root", true), ("region", false)] {
+      let Command::Client(request) =
+        parse(&args(&format!("--instance fixture bootstrap {scope}"))).unwrap()
+      else {
+        panic!("bootstrap is a client request");
+      };
+      assert_eq!(request.verb, Verb::Bootstrap { root });
+    }
+    assert!(parse(&args("daemon --bootstrap")).is_err());
+    assert!(parse(&args("bootstrap")).is_err());
   }
 
   /// The grammar: a create with its flags in any order, a global instance before or after

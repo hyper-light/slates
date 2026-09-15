@@ -245,7 +245,8 @@ impl AnchorSegment {
     })
   }
 
-  /// Attaches from the environment the anchor gave the daemon.
+  /// Attaches the metadata and content objects from the environment the anchor gave the daemon.
+  /// Keeping both on the segment preserves the content handoff to its shard children (§4.8).
   pub fn attach_from_env(identity: &Identity) -> Result<AnchorSegment, AnchorError> {
     let handoff = std::env::var(ENV_HANDOFF).map_err(|_| AnchorError::Layout {
       reason: "no handoff in the environment",
@@ -260,7 +261,17 @@ impl AnchorSegment {
       Ok(fd) if cfg!(target_os = "linux") => Handoff::Descriptor(fd),
       _ => Handoff::Name(handoff),
     };
-    Self::attach(&handoff, len, identity)
+    let mut segment = Self::attach(&handoff, len, identity)?;
+    let content_env: Vec<(String, String)> = [ENV_CONTENT, ENV_CONTENT_LEN]
+      .into_iter()
+      .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_owned(), value)))
+      .collect();
+    if !content_env.is_empty() {
+      segment.adopt_content(Self::open_content(&content_env).ok_or(AnchorError::Layout {
+        reason: "incomplete content handoff in the environment",
+      })??);
+    }
+    Ok(segment)
   }
 
   /// The handoff and the length an attach in this process (or a child) needs.

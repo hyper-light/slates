@@ -23,6 +23,7 @@
 //! surfaces read, §4.14), [`error`].
 
 pub mod config;
+mod consensus;
 pub mod daemon;
 pub mod deploy;
 // Name resolution for a peer named by DNS in the manifest (the Kubernetes deployment): an asynchronous

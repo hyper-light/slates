@@ -56,12 +56,6 @@
 //! would not be it: both legs dispatch onto one `VolumeBridge`, so their agreement is tautological
 //! (R5: no vacuous oracle).
 
-use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll, Waker};
-
 use slates_bridge_core::{Rights, VolumeBridge, new_handle_store};
 use slates_bridge_nfs::mount::{MOUNT_PROGRAM, MOUNTPROC3_MNT};
 use slates_bridge_nfs::nfs::{Fattr3, Nfsfh3};
@@ -71,14 +65,13 @@ use slates_bridge_nfs::procedures::{
   NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK,
   NFSPROC3_WRITE, io_failure_reply, is_unstable, write_stable_how,
 };
+use slates_bridge_nfs::rpc::RecordReader;
 use slates_bridge_nfs::xdr::XdrReader;
 use slates_bridge_nfs::{
-  AcceptStatus, MultiExport, Nfsstat3, RpcError, VolumeSet, auth_sys_gid, auth_sys_uid, parse_call,
-  read_record, reply_bytes, request_volume, root_volume, serve_call, write_record,
+  AcceptStatus, MultiExport, Nfsstat3, VolumeSet, auth_sys_gid, auth_sys_uid, parse_call,
+  reply_bytes, request_volume, root_volume, serve_call, write_record,
 };
 use slates_db::catalog::{Principal, VolumeId};
-use slates_rt::control::Control;
-use slates_rt::task::SpawnRequest;
 use slates_rt::tcp::{TcpListener, TcpStream};
 use slates_rt::{futures, registry};
 use slates_vfs::clock::Clock;
@@ -130,6 +123,9 @@ impl VolumeSet for ShardVolumeSet {
     args: &mut XdrReader<'_>,
   ) -> Option<Vec<u8>> {
     state::with_state(|s| {
+      if !s.consensus_ready {
+        return Some(io_failure_reply(procedure));
+      }
       with_export(s, volume, subject, rights, owner_gid, |export| {
         export.serve_nfs(procedure, args)
       })
@@ -219,26 +215,34 @@ fn nfs_ok(results: &[u8]) -> bool {
 /// with `NFS3ERR_IO` (the effect is in the volume, not stable; the client is told so, never promised
 /// survival). A publish that committed without the touched `volume` (a volume the image cannot yet
 /// hold: an overlay with base-backed inodes, whose recovery is the owed base gate) is counted as an
-/// unbacked acknowledgement ([`crate::daemon::BARRIER_UNCAPTURED`]) and the reply stands, so an
-/// overlay keeps working over the mount while the gap is surfaced rather than hidden.
+/// refused barrier ([`crate::daemon::BARRIER_UNCAPTURED`]) and returns `NFS3ERR_IO`. No volume id
+/// or no publication also refuses: absence of a proof never becomes a stability guarantee.
 fn barrier(
   procedure: u32,
   volume: Option<VolumeId>,
   reply: (AcceptStatus, Vec<u8>),
 ) -> (AcceptStatus, Vec<u8>) {
   let outcome = state::with_state(crate::verbs::publish_shard);
-  match outcome {
-    Some(Ok(published)) => {
-      if volume.is_some_and(|touched| !published.captured(touched)) {
-        crate::daemon::BARRIER_UNCAPTURED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-      }
-      reply
+  publication_reply(procedure, volume, outcome, reply)
+}
+
+/// The barrier's observable reply, separated from publication so refusal paths can be exercised
+/// without a live mount (§4.8, AC-2.12).
+fn publication_reply(
+  procedure: u32,
+  volume: Option<VolumeId>,
+  outcome: Option<Result<crate::verbs::Published, slates_vfs::VfsError>>,
+  reply: (AcceptStatus, Vec<u8>),
+) -> (AcceptStatus, Vec<u8>) {
+  if let Some(Ok(published)) = outcome {
+    if volume.is_some_and(|touched| published.captured(touched)) {
+      return reply;
     }
-    // A refused publish, or no shard state on this thread (which cannot serve a mutation either).
-    _ => match io_failure_reply(procedure) {
-      Some(failed) => (AcceptStatus::Success, failed),
-      None => reply,
-    },
+    crate::daemon::BARRIER_UNCAPTURED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+  }
+  match io_failure_reply(procedure) {
+    Some(failed) => (AcceptStatus::Success, failed),
+    None => (AcceptStatus::SystemErr, Vec::new()),
   }
 }
 
@@ -455,112 +459,15 @@ async fn serve_remote(
   args: Vec<u8>,
   port: u16,
 ) -> (AcceptStatus, Vec<u8>) {
-  let call_id = register_pending();
-  let owner_task = SpawnRequest::new(
-    Box::pin(async move {
-      let outcome = serve_local(requester, xid, program, procedure, &args, port);
-      let back = SpawnRequest::new(
-        Box::pin(async move {
-          deliver_reply(call_id, outcome);
-        }),
-        None,
-      );
-      let _ = registry::send_control(origin, Control::Spawn(Box::new(back)));
-    }),
-    None,
-  );
-  if registry::send_control(owner, Control::Spawn(Box::new(owner_task))).is_err() {
-    cancel_pending(call_id);
+  let call = crate::xshard::call_on(origin, owner, move || {
+    Some(serve_local(requester, xid, program, procedure, &args, port))
+  });
+  let Ok(call) = call else {
     return (AcceptStatus::SystemErr, Vec::new());
-  }
-  BridgeCall { call_id }.await
-}
-
-// ------------------------------------------------------------------------- the per-shard pending map
-
-thread_local! {
-  /// Bridge calls this shard has sent to an owner and is awaiting the reply for, by call id; single
-  /// this shard's thread touches it, so it needs no lock (D-7: no locks on data paths).
-  static PENDING: RefCell<BTreeMap<u64, PendingReply>> = const { RefCell::new(BTreeMap::new()) };
-  /// The next bridge-call id this shard hands out.
-  static NEXT_CALL: Cell<u64> = const { Cell::new(1) };
-}
-
-/// A bridge call awaiting its reply: the reply once it lands, and the waker of the task awaiting it.
-struct PendingReply {
-  reply: Option<(AcceptStatus, Vec<u8>)>,
-  waker: Option<Waker>,
-}
-
-/// Registers a new pending bridge call and returns its id.
-fn register_pending() -> u64 {
-  let id = NEXT_CALL.with(|next| {
-    let id = next.get();
-    next.set(id.wrapping_add(1));
-    id
-  });
-  PENDING.with(|map| {
-    map.borrow_mut().insert(
-      id,
-      PendingReply {
-        reply: None,
-        waker: None,
-      },
-    )
-  });
-  id
-}
-
-/// Forgets a pending bridge call whose owner could not be reached.
-fn cancel_pending(id: u64) {
-  PENDING.with(|map| map.borrow_mut().remove(&id));
-}
-
-/// Hands a bridge call's reply to the awaiting task and wakes it (run on the origin shard, off the
-/// task the owner spawned back).
-fn deliver_reply(id: u64, outcome: (AcceptStatus, Vec<u8>)) {
-  PENDING.with(|map| {
-    if let Some(pending) = map.borrow_mut().get_mut(&id) {
-      pending.reply = Some(outcome);
-      if let Some(waker) = pending.waker.take() {
-        waker.wake();
-      }
-    }
-  });
-}
-
-/// The future a task awaits for a routed call's reply: ready when the reply lands in the pending map,
-/// otherwise pending with the task's waker recorded. A vanished entry (the owner was unreachable) is a
-/// system error, never a hang.
-struct BridgeCall {
-  call_id: u64,
-}
-
-impl Future for BridgeCall {
-  type Output = (AcceptStatus, Vec<u8>);
-
-  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    PENDING.with(|map| {
-      let mut map = map.borrow_mut();
-      let ready = match map.get_mut(&self.call_id) {
-        Some(pending) => match pending.reply.take() {
-          Some(outcome) => Some(outcome),
-          None => {
-            pending.waker = Some(cx.waker().clone());
-            None
-          }
-        },
-        None => return Poll::Ready((AcceptStatus::SystemErr, Vec::new())),
-      };
-      match ready {
-        Some(outcome) => {
-          map.remove(&self.call_id);
-          Poll::Ready(outcome)
-        }
-        None => Poll::Pending,
-      }
-    })
-  }
+  };
+  crate::xshard::within(call, crate::daemon::LIVENESS_BUDGET_NS)
+    .await
+    .unwrap_or((AcceptStatus::SystemErr, Vec::new()))
 }
 
 // ------------------------------------------------------- the host root's cross-shard listing
@@ -602,129 +509,32 @@ impl VolumeSet for GatheredVolumeSet {
   }
 }
 
-thread_local! {
-  /// Cross-shard entry gathers this shard is awaiting, by id; single this shard's thread touches it.
-  static PENDING_ENTRIES: RefCell<BTreeMap<u64, PendingEntries>> =
-    const { RefCell::new(BTreeMap::new()) };
+/// Gathers every owner's entries under one liveness budget (§4.8 lookup). Any failed admission,
+/// missing reply or timeout refuses the entire listing. Calls own their registrations, so early return
+/// or cancellation also releases the gathers still in flight (AUD-04/AUD-17).
+async fn gather_all_entries() -> Option<Vec<(String, VolumeId)>> {
+  let (origin, shards) = state::with_state(|s| (s.shard, s.shards.clone()))?;
+  gather_entries(origin, &shards).await
 }
 
-/// A gather of one shard's volume entries, awaiting its answer.
-struct PendingEntries {
-  entries: Option<Vec<(String, VolumeId)>>,
-  waker: Option<Waker>,
-}
-
-/// Registers a pending entry gather and returns its id (shares the bridge-call id space).
-fn register_entries() -> u64 {
-  let id = NEXT_CALL.with(|next| {
-    let id = next.get();
-    next.set(id.wrapping_add(1));
-    id
-  });
-  PENDING_ENTRIES.with(|map| {
-    map.borrow_mut().insert(
-      id,
-      PendingEntries {
-        entries: None,
-        waker: None,
-      },
-    )
-  });
-  id
-}
-
-/// Forgets a pending gather whose shard could not be reached.
-fn cancel_entries(id: u64) {
-  PENDING_ENTRIES.with(|map| map.borrow_mut().remove(&id));
-}
-
-/// Hands a gather's entries to the awaiting task and wakes it (run on the origin shard).
-fn deliver_entries(id: u64, entries: Vec<(String, VolumeId)>) {
-  PENDING_ENTRIES.with(|map| {
-    if let Some(pending) = map.borrow_mut().get_mut(&id) {
-      pending.entries = Some(entries);
-      if let Some(waker) = pending.waker.take() {
-        waker.wake();
-      }
-    }
-  });
-}
-
-/// The future a task awaits for one shard's gathered entries; an empty answer if the shard is gone.
-struct EntriesCall {
-  id: u64,
-}
-
-impl Future for EntriesCall {
-  type Output = Vec<(String, VolumeId)>;
-
-  fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    PENDING_ENTRIES.with(|map| {
-      let mut map = map.borrow_mut();
-      let ready = match map.get_mut(&self.id) {
-        Some(pending) => match pending.entries.take() {
-          Some(entries) => Some(entries),
-          None => {
-            pending.waker = Some(cx.waker().clone());
-            None
-          }
-        },
-        None => return Poll::Ready(Vec::new()),
-      };
-      match ready {
-        Some(entries) => {
-          map.remove(&self.id);
-          Poll::Ready(entries)
-        }
-        None => Poll::Pending,
-      }
-    })
-  }
-}
-
-/// Spawns a gather of one other `shard`'s volume entries over the bridge queue (the same spawn/back-spawn
-/// the bridge calls use), returning the pending call's id — or `None` if the shard is gone. It does not
-/// await, so a caller spawns every shard's gather before awaiting any and they run in parallel.
-fn spawn_gather(shard: u16, origin: u16) -> Option<u64> {
-  let id = register_entries();
-  let task = SpawnRequest::new(
-    Box::pin(async move {
-      let entries = ShardVolumeSet.entries();
-      let back = SpawnRequest::new(
-        Box::pin(async move {
-          deliver_entries(id, entries);
-        }),
-        None,
-      );
-      let _ = registry::send_control(origin, Control::Spawn(Box::new(back)));
-    }),
-    None,
-  );
-  if registry::send_control(shard, Control::Spawn(Box::new(task))).is_err() {
-    cancel_entries(id);
-    return None;
-  }
-  Some(id)
-}
-
-/// Gathers the volumes of every shard for the host root listing: this shard's directly, and every other
-/// shard's over the bridge queue — fanned out first so the gathers run in parallel, then collected.
-async fn gather_all_entries() -> Vec<(String, VolumeId)> {
-  let (mine, shards) =
-    state::with_state(|s| (s.partition, s.shards.clone())).unwrap_or((0, Vec::new()));
-  let origin = registry::current_shard().unwrap_or(0);
-  let mut all = ShardVolumeSet.entries();
-  let calls: Vec<u64> = shards
+async fn gather_entries(origin: u16, shards: &[u16]) -> Option<Vec<(String, VolumeId)>> {
+  let deadline = futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
+  let calls = shards
     .iter()
-    .enumerate()
-    .filter(|(partition, _)| *partition != usize::from(mine))
-    .filter_map(|(_, shard)| spawn_gather(*shard, origin))
-    .collect();
-  for id in calls {
-    let mut remote = EntriesCall { id }.await;
-    all.append(&mut remote);
+    .map(|shard| {
+      crate::xshard::call_on(origin, *shard, || {
+        state::with_state(|_| ())?;
+        Some(ShardVolumeSet.entries())
+      })
+    })
+    .collect::<Result<Vec<_>, _>>()
+    .ok()?;
+  let mut all = Vec::new();
+  for call in calls {
+    let remaining = deadline.saturating_sub(futures::now_ns());
+    all.extend(crate::xshard::within(call, remaining).await?);
   }
-  all
+  Some(all)
 }
 
 /// Whether a call is a `READDIR`/`READDIRPLUS` of the synthetic host root (which must list every
@@ -801,7 +611,9 @@ async fn reply_for(
   }
   if is_root_listing(program, procedure, &args) {
     // The host root lists every shard's volumes, gathered over the bridge queue.
-    let entries = gather_all_entries().await;
+    let Some(entries) = gather_all_entries().await else {
+      return reply_bytes(xid, AcceptStatus::SystemErr, &[]);
+    };
     let (status, results) = serve_root_listing(requester, procedure, &args, entries, port);
     return reply_bytes(xid, status, &results);
   }
@@ -819,13 +631,14 @@ async fn reply_for(
 async fn serve_one(stream: TcpStream, port: u16) {
   let this = registry::current_shard().unwrap_or(0);
   let mut buffer: Vec<u8> = Vec::new();
+  let mut records = RecordReader::default();
   let mut chunk = [0u8; RECORD_CHUNK];
   loop {
     // (xid, requester, program, procedure, args, consumed); a program of 0 marks a garbage call (no
     // real program is 0), whose xid is unknown so the reply carries 0. The requester is the mounting
     // user (subject and group), read from the one `AUTH_SYS` credential.
-    let parsed: Option<(u32, Requester, u32, u32, Vec<u8>, usize)> = match read_record(&buffer) {
-      Ok((body, consumed)) => match parse_call(&body) {
+    let parsed: Option<(u32, Requester, u32, u32, Vec<u8>, usize)> = match records.read(&buffer) {
+      Ok((Some(body), consumed)) => match parse_call(&body) {
         Ok((call, args)) => Some((
           call.xid,
           Requester::of(&body),
@@ -836,7 +649,10 @@ async fn serve_one(stream: TcpStream, port: u16) {
         )),
         Err(_) => Some((0, Requester::root(), 0, 0, Vec::new(), consumed)),
       },
-      Err(RpcError::Incomplete) => None,
+      Ok((None, consumed)) => {
+        buffer.drain(..consumed);
+        None
+      }
       Err(_) => return,
     };
     match parsed {
@@ -852,5 +668,136 @@ async fn serve_one(stream: TcpStream, port: u16) {
         Ok(count) => buffer.extend_from_slice(&chunk[..count]),
       },
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// AC-2.12 / T-2.14, AUD-05: omit a touched volume from a committed image. The NFS caller
+  /// must receive an error instead of a stable successful mutation; captured volumes still succeed.
+  #[test]
+  fn an_omitted_volume_cannot_receive_a_stable_reply() {
+    let omitted = VolumeId { bytes: [1; 16] };
+    let captured = VolumeId { bytes: [2; 16] };
+    let published = crate::verbs::Published {
+      volumes: vec![captured],
+      skipped: vec![omitted],
+      frame_bytes: 1,
+    };
+    let success = || {
+      (
+        AcceptStatus::Success,
+        (Nfsstat3::Ok as u32).to_be_bytes().to_vec(),
+      )
+    };
+    let (_, refused) = publication_reply(
+      NFSPROC3_COMMIT,
+      Some(omitted),
+      Some(Ok(published.clone())),
+      success(),
+    );
+    assert!(
+      !nfs_ok(&refused),
+      "an omitted volume was acknowledged as stable"
+    );
+    let (_, accepted) = publication_reply(
+      NFSPROC3_COMMIT,
+      Some(captured),
+      Some(Ok(published)),
+      success(),
+    );
+    assert!(nfs_ok(&accepted));
+  }
+
+  fn runtime() -> slates_rt::sim::SimRuntime {
+    slates_rt::sim::SimRuntime::new(
+      &slates_rt::runtime::RuntimeConfig {
+        shards: 2,
+        tasks_per_shard: 2,
+        timers_per_shard: 2,
+        ring_entries: 8,
+        step_budget_ns: 1_000_000,
+        timer_tick_ns: 100_000,
+        batch: 8,
+        pin: false,
+        cores: Vec::new(),
+        page_bytes: 4096,
+        spin_ns: 0,
+      },
+      17,
+    )
+    .unwrap()
+  }
+
+  /// T-4.3, AC-2.6, §4.3; AUD-04: the control queue admits a bridge request while either the
+  /// owner's or the reply's task arena is full. Expect an RPC system error within the caller's
+  /// budget, never a stuck call. Neither fault involves control-queue saturation.
+  #[test]
+  fn an_arena_refusal_completes_the_bridge_call_with_an_error() {
+    for refuse_owner in [true, false] {
+      let mut runtime = runtime();
+      let shards = runtime.shard_ids();
+      let origin = shards[0];
+      let owner = shards[1];
+      if refuse_owner {
+        for _ in 0..2 {
+          runtime.spawn_on(owner, std::future::pending()).unwrap();
+        }
+      } else {
+        runtime.spawn_on(origin, std::future::pending()).unwrap();
+      }
+      let (sent, received) = std::sync::mpsc::sync_channel(1);
+      runtime
+        .context(origin)
+        .unwrap()
+        .spawn_local(
+          Box::pin(async move {
+            let reply = serve_remote(
+              owner.0,
+              origin.0,
+              Requester::root(),
+              1,
+              NFS_PROGRAM,
+              0,
+              Vec::new(),
+              0,
+            )
+            .await;
+            sent.try_send(reply).unwrap();
+          }),
+          None,
+        )
+        .unwrap();
+      runtime.run_until_idle();
+      let (status, _) = received
+        .try_recv()
+        .expect("the bridge call completed despite refused task admission");
+      assert!(matches!(status, AcceptStatus::SystemErr));
+      assert!(runtime.now_ns() <= crate::daemon::LIVENESS_BUDGET_NS + 100_000);
+    }
+  }
+
+  /// T-4.3, §4.8 lookup; AUD-04: a root gather names a shard that has gone away. Expect refusal
+  /// of the whole gather, not a successful listing silently omitting that shard's volumes.
+  #[test]
+  fn a_missing_shard_refuses_the_whole_root_listing() {
+    let mut runtime = runtime();
+    let origin = runtime.shard_ids()[0];
+    let (sent, received) = std::sync::mpsc::sync_channel(1);
+    runtime
+      .context(origin)
+      .unwrap()
+      .spawn_local(
+        Box::pin(async move {
+          let entries = gather_entries(origin.0, &[u16::MAX]).await;
+          sent.try_send(entries).unwrap();
+        }),
+        None,
+      )
+      .unwrap();
+    runtime.run_until_idle();
+    assert_eq!(received.try_recv().unwrap(), None);
   }
 }

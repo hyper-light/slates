@@ -5,11 +5,12 @@
 //! node computes the same facts, so no node has to be told anything about the others that the others were
 //! not told about it:
 //!
-//! - **Member ids from certificates.** A node's fleet id ([`HostId`]) is the leading eight bytes of the
+//! - **Stable anchors from certificates.** A node's anchor ([`HostId`]) is the leading eight bytes of the
 //!   BLAKE3 hash of its DER certificate ([`host_id_of_certificate`]). The certificate is what every peer
 //!   pins for the mutual-TLS session, so it is the one fact about a node every other node holds, and the
-//!   id follows from it without a registry (D-14: ids route to owners, no global catalog). Two nodes
-//!   sharing a certificate would be one member; the plan refuses that (`DuplicateCertificate`).
+//!   anchor follows from it without a registry (D-14). The live member id adds a fresh boot nonce
+//!   (§4.8, AUD-07); manifest seeds only route discovery. Two manifest entries sharing a certificate
+//!   would claim one trusted node; the plan refuses that (`DuplicateCertificate`).
 //! - **The socket layout.** A node serves every peer on one socket per plane
 //!   (`slates_transport::demux`: sessions are told apart by the connection id in each packet), so it
 //!   advertises one base port and owns the next: it serves probes on `base` and records on `base + 1`
@@ -296,22 +297,15 @@ pub fn host_id_of_certificate(certificate: &CertificateDer<'_>) -> HostId {
   ]))
 }
 
-/// A node's **ephemeral member id** for the boot with daemon `generation`: the leading eight bytes of
-/// `BLAKE3(anchor ‖ generation)` (§4.8 "Recovery": *"the node rejoins with a new ephemeral id — a restart is a
-/// join"*). The **anchor** is the node's stable identity — `host_id_of_certificate` of the certificate its
-/// peers pin (a fleet), or the machine-identity hash (a laptop, `daemon::host_id_of`) — the thing that does
-/// not change across a restart, kept for authentication and the RIFL completion origin so a forwarded write
-/// stays exactly-once across a restart. The **generation** (the anchor segment's `SUP_GENERATION`, incremented
-/// at every daemon start) makes the id change per boot, so a restarted node is a **new member** whose old id's
-/// objects are taken over by neighbours — rather than rejoining as its old self and contending for objects the
-/// group is already reassigning. A peer recomputes this id from the anchor it authenticated (the certificate)
-/// and the generation the node announces, so it needs no registry (D-14). Generation 0 (a first boot, or a
-/// fresh segment) is the precomputable seed the manifest carries, so a fresh fleet forms with no exchange, and
-/// on a laptop it is one member id for the life of the process (R8).
-pub fn member_id(anchor: HostId, generation: u64) -> HostId {
+/// A fresh voting identity, derived from the stable certificate anchor and a random nonce per
+/// daemon start (§4.8, AUD-07). The stable anchor authenticates TLS and keys completion origins;
+/// the member id names ownership and consensus. Losing RAM never recreates the old voter.
+/// A peer checks the derivation on authenticated contact. Nonces have no numeric age ordering.
+/// `boot_nonce = 0` names a manifest routing placeholder, never an initial voting configuration.
+pub fn member_id(anchor: HostId, boot_nonce: u64) -> HostId {
   let mut hasher = blake3::Hasher::new();
   hasher.update(&anchor.0.to_le_bytes());
-  hasher.update(&generation.to_le_bytes());
+  hasher.update(&boot_nonce.to_le_bytes());
   let bytes = *hasher.finalize().as_bytes();
   HostId(u64::from_le_bytes([
     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
@@ -439,11 +433,8 @@ pub fn plan(
 ) -> Result<FleetPlan, DeployError> {
   let this = validate(manifest, node, resolver.as_ref())?;
   let entry = &manifest.nodes[this];
-  // The membership is seeded with each node's **generation-0 member id** — the id it holds on a first boot,
-  // precomputable from the certificate the manifest carries, so a fresh fleet forms with no exchange (§4.8).
-  // A node that has restarted holds a higher-generation id ([`member_id`]); the daemon overrides its own
-  // `host` with its anchor generation, and a peer's current id is learned on contact (task #22). The
-  // certificate stays the stable anchor for auth and the RIFL origin (`host_id_of_certificate`).
+  // Seed ids route discovery and retain each certificate's declared domain and region. They
+  // authorize no votes: every daemon announces a fresh id, then joins an initialized group.
   let origin_anchor = host_id_of_certificate(&entry.certificate);
   let host = member_id(origin_anchor, 0);
   let overflow = |node: &FleetNodeEntry| DeployError::PortBlockOverflows {
@@ -549,14 +540,10 @@ mod tests {
     )
   }
 
-  /// AC (§4.8 "Recovery", task #22 — the ephemeral member id): a node's member id changes with the daemon
-  /// generation, so a restart (a higher generation) is a **new member** (a join), while the certificate —
-  /// the stable anchor peers pin for auth and the RIFL completion origin — is unchanged. Two generations of
-  /// one certificate give two distinct ids; the member id is distinct from the stable cert anchor (the
-  /// two-id split); distinct certificates give distinct ids at one generation; and generation 0 (the solo /
-  /// first-boot degenerate) is deterministic.
+  /// AC-8.1, §4.8: distinct boot nonces derive distinct member ids over a stable certificate
+  /// anchor. Nonce zero is a deterministic routing seed, not a special voting lifetime.
   #[test]
-  fn the_member_id_is_ephemeral_per_generation_over_a_stable_certificate() {
+  fn the_member_id_is_ephemeral_per_boot_nonce_over_a_stable_certificate() {
     let (cert_a, _) = mint();
     let (cert_b, _) = mint();
     let anchor_a = host_id_of_certificate(&cert_a);
@@ -566,7 +553,7 @@ mod tests {
     let boot1 = member_id(anchor_a, 1);
     assert_ne!(
       boot0, boot1,
-      "a higher generation is a new member id (a restart is a join)"
+      "a different nonce is a new member id (a restart is a join)"
     );
     assert_ne!(
       boot0, anchor_a,
@@ -580,7 +567,7 @@ mod tests {
     assert_eq!(
       member_id(anchor_a, 0),
       boot0,
-      "generation 0 is deterministic (the precomputable seed / laptop degenerate)"
+      "nonce zero is deterministic (the manifest routing placeholder)"
     );
   }
 

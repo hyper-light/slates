@@ -113,6 +113,7 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
       existing: slates_ipc::protocol::VolumeId::default(),
     },
     VfsError::NoSpace => Refusal::NoSpace,
+    VfsError::RecoveryIncomplete => Refusal::ContentUnavailable,
     VfsError::InvalidName => Refusal::InvalidName,
     VfsError::Destroying => Refusal::Destroying,
     VfsError::Archived => Refusal::Archived,

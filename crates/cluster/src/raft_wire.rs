@@ -42,6 +42,14 @@ pub enum RaftMessage {
 /// A refusal to decode a Raft message from received bytes (the closed hostile-input taxonomy).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RaftWireError {
+  /// No consensus group has been installed on this fresh member.
+  Uninitialized,
+  /// A message belongs to another bootstrap's group, even if its certificate is rostered.
+  ForeignGroup,
+  /// The group envelope is malformed.
+  MalformedEnvelope,
+  /// The message claims a member other than the authenticated session's peer.
+  ForeignSender,
   /// The bytes are shorter than the message shape requires.
   Truncated,
   /// The leading tag byte is not a known message kind.
@@ -72,6 +80,28 @@ const TAG_PRE_VOTE_REPLY: u8 = 6;
 const MAX_ITEMS: usize = 1 << 20;
 
 impl RaftMessage {
+  /// The member claiming to send this message. The live transport must bind it to the peer
+  /// whose session delivered the bytes, including delayed replies from an earlier incarnation.
+  pub fn sender(&self) -> HostId {
+    match self {
+      Self::RequestVote(request) => request.candidate,
+      Self::PreVote(request) => request.candidate,
+      Self::AppendEntries(append) => append.leader,
+      Self::VoteReply(reply) => reply.voter,
+      Self::PreVoteReply(reply) => reply.voter,
+      Self::AppendReply(reply) => reply.follower,
+    }
+  }
+
+  /// Decodes a message only when its sender matches the authenticated member.
+  pub fn decode_from(bytes: &[u8], peer: HostId) -> Result<Self, RaftWireError> {
+    let message = Self::decode(bytes)?;
+    if message.sender() != peer {
+      return Err(RaftWireError::ForeignSender);
+    }
+    Ok(message)
+  }
+
   /// The canonical little-endian bytes.
   pub fn encode(&self) -> Vec<u8> {
     let mut out = Vec::new();
@@ -96,6 +126,7 @@ impl RaftMessage {
         put_u64(&mut out, append.prev_log_index);
         put_u64(&mut out, append.prev_log_term);
         put_u64(&mut out, append.leader_commit);
+        put_u64(&mut out, append.read_context);
         put_u32(
           &mut out,
           u32::try_from(append.entries.len()).unwrap_or(u32::MAX),
@@ -110,6 +141,7 @@ impl RaftMessage {
         put_u64(&mut out, reply.term);
         out.push(u8::from(reply.success));
         put_u64(&mut out, reply.match_index);
+        put_u64(&mut out, reply.read_context);
       }
       RaftMessage::PreVote(request) => {
         out.push(TAG_PRE_VOTE);
@@ -162,6 +194,7 @@ impl RaftMessage {
         let (prev_log_index, rest) = take_u64(rest)?;
         let (prev_log_term, rest) = take_u64(rest)?;
         let (leader_commit, rest) = take_u64(rest)?;
+        let (read_context, rest) = take_u64(rest)?;
         let (count, mut rest) = take_count(rest)?;
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
@@ -171,6 +204,7 @@ impl RaftMessage {
         }
         expect_end(rest)?;
         Ok(RaftMessage::AppendEntries(AppendEntries {
+          read_context,
           term,
           leader: HostId(leader),
           prev_log_index,
@@ -184,8 +218,10 @@ impl RaftMessage {
         let (term, rest) = take_u64(rest)?;
         let (success, rest) = take_bool(rest)?;
         let (match_index, rest) = take_u64(rest)?;
+        let (read_context, rest) = take_u64(rest)?;
         expect_end(rest)?;
         Ok(RaftMessage::AppendReply(AppendReply {
+          read_context,
           follower: HostId(follower),
           term,
           success,
@@ -612,6 +648,7 @@ mod tests {
 
   fn append_with_entries() -> RaftMessage {
     RaftMessage::AppendEntries(AppendEntries {
+      read_context: 42,
       term: 5,
       leader: A,
       prev_log_index: 3,
@@ -648,6 +685,7 @@ mod tests {
       }),
       append_with_entries(),
       RaftMessage::AppendReply(AppendReply {
+        read_context: 0,
         follower: B,
         term: 5,
         success: true,
@@ -667,6 +705,15 @@ mod tests {
     ];
     for message in messages {
       let bytes = message.encode();
+      assert_eq!(
+        RaftMessage::decode_from(&bytes, message.sender()),
+        Ok(message.clone())
+      );
+      assert_eq!(
+        RaftMessage::decode_from(&bytes, HostId(message.sender().0 ^ u64::MAX)),
+        Err(RaftWireError::ForeignSender),
+        "a session cannot speak for another voter"
+      );
       assert_eq!(
         RaftMessage::decode(&bytes),
         Ok(message),
@@ -689,8 +736,8 @@ mod tests {
   #[test]
   fn a_lying_entry_count_is_refused() {
     let mut bytes = vec![TAG_APPEND_ENTRIES];
-    for _ in 0..5 {
-      bytes.extend_from_slice(&0u64.to_le_bytes()); // term, leader, prev index/term, leader_commit
+    for _ in 0..6 {
+      bytes.extend_from_slice(&0u64.to_le_bytes()); // term, leader, prev index/term, commit, read context
     }
     bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // entry count = huge
     assert_eq!(

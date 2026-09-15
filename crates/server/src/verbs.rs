@@ -254,6 +254,7 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::Detach { .. }
     | RequestBody::List
     | RequestBody::DaemonStatus
+    | RequestBody::Bootstrap { .. }
     | RequestBody::PromoteRegion { .. }
     | RequestBody::Grants
     | RequestBody::Audit { .. }
@@ -308,6 +309,67 @@ fn home_redirect(
   let object = ObjectId(volume.bytes);
   let home = root.home_of(object, region_of(object.creator()));
   (home != region_of(own_host)).then_some(home.0)
+}
+
+/// Route bootstrap to the sole shard that drives consensus. The bounded call owns its reply
+/// registration through cancellation; an unavailable shard cannot produce a successful bootstrap.
+fn bootstrap_on_control(
+  state: &ShardState,
+  client_index: u32,
+  request: u64,
+  root: bool,
+  member: u64,
+) -> Served {
+  let Some(control) = state.shards.first().copied() else {
+    return Served::Reply(refused(Refusal::ConsensusNotInitialized));
+  };
+  let origin = state.shard;
+  let task = slates_rt::futures::spawn(async move {
+    let outcome = crate::xshard::call_within(
+      origin,
+      control,
+      move |state| {
+        let reply = crate::consensus::bootstrap(state, root, member);
+        (
+          reply,
+          crate::consensus::Publication::capture(state),
+          state.shards.clone(),
+        )
+      },
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await;
+    let reply = match outcome {
+      Some((ReplyBody::Acknowledged, publication, shards)) => {
+        let mut reply = ReplyBody::Acknowledged;
+        for shard in shards.into_iter().filter(|shard| *shard != control) {
+          let publication = publication.clone();
+          if crate::xshard::call_within(
+            origin,
+            shard,
+            move |state| publication.apply(state),
+            crate::daemon::LIVENESS_BUDGET_NS,
+          )
+          .await
+          .is_none()
+          {
+            reply = refused(Refusal::Overloaded { shard });
+            break;
+          }
+        }
+        reply
+      }
+      Some((reply, _, _)) => reply,
+      None => refused(Refusal::Overloaded { shard: control }),
+    };
+    crate::state::deliver(client_index, request, reply, false);
+  });
+  let Ok(task) = task else {
+    return Served::Reply(refused(Refusal::Overloaded { shard: origin }));
+  };
+  // Freshly admitted on the current shard; no await can retire its slot before detach.
+  let _ = slates_rt::futures::detach(task);
+  Served::Forwarded
 }
 
 /// Routes an operator's `PromoteRegion` to the **control shard**, where the root group is driven (§4.8, D-14 —
@@ -764,6 +826,12 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   }
   if let RequestBody::DaemonStatus = body {
     return scatter_status(state, client.index(), request.request);
+  }
+  if let RequestBody::Bootstrap { root, member } = body {
+    if !matches!(principal, Principal::Uid { .. } | Principal::Sid { .. }) {
+      return Served::Reply(forbidden("bootstrap"));
+    }
+    return bootstrap_on_control(state, client.index(), request.request, root, member);
   }
   if let RequestBody::PromoteRegion { region } = body {
     return promote_region_on_root(
@@ -1573,6 +1641,9 @@ fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::GrantInvalid => "grant_invalid",
     Refusal::HomedElsewhere { .. } => "homed_elsewhere",
     Refusal::NotRootLeader => "not_root_leader",
+    Refusal::ConsensusNotInitialized => "consensus_not_initialized",
+    Refusal::ConsensusAlreadyInitialized => "consensus_already_initialized",
+    Refusal::ConsensusBootstrapStale => "consensus_bootstrap_stale",
     Refusal::DurabilityUnmet { .. } => "durability_unmet",
     Refusal::GrantIssuerUnverified => "grant_issuer_unverified",
     Refusal::ConsumerNotEnrolled => "consumer_not_enrolled",
@@ -1641,6 +1712,10 @@ fn dispatch(
   body: RequestBody,
 ) -> ReplyBody {
   let republish = mutates_shard_image(&body);
+  if republish && !state.consensus_ready {
+    return refused(Refusal::ConsensusNotInitialized);
+  }
+  let touched = volume_of(&body).map(to_db_volume);
   // The durability gate (§4.8 "Placement" — the operator's ε and coincident-failure size "gate a refusal"):
   // a write that would commit a new head or seal is refused, with the measured shortfall, while the
   // installed configuration cannot hold it to the declared policy. A field read: the shortfall was measured
@@ -1656,23 +1731,24 @@ fn dispatch(
     });
   }
   let reply = dispatch_inner(state, client_id, principal, body);
-  // Publish the shard's recovery image after a successful volume-set or roots change, so a restart
-  // recovers it from anchor-owned RAM (§4.8). This runs inside the verb's completion transaction
-  // (`run_recorded`: `Db::begin` … `commit`), so the effect is published *before* the completion
-  // record commits: an acknowledged effect is always in the image, and a crash between the two
-  // leaves an image ahead of the catalog, which recovery trims back to the catalog's acknowledged
-  // state (`rebuild_recovered`). A refusal changed nothing, so it needs no publish. A refused publish
-  // is counted and surfaced (`PUBLISH_REFUSED`); the effect and its record still commit, because the
-  // database transaction has no undo — the §4.2 sizing that makes the slot always fit is the owed
-  // closure (docs/wip/recovery.md).
-  if republish
-    && !matches!(reply, ReplyBody::Refused { .. })
-    && let Err(e) = publish_shard(state)
-  {
-    eprintln!(
-      "slates-server: partition {}: a verb's effect was not published before its record: {e}",
-      state.partition
-    );
+  // The content image must precede a successful completion (§4.8, AUD-05). A refusal can leave
+  // an unacknowledged effect in memory, but neither this reply nor its retry may promise recovery.
+  if republish && !matches!(reply, ReplyBody::Refused { .. }) {
+    let touched = match &reply {
+      ReplyBody::Created { id } | ReplyBody::Cloned { id } => Some(to_db_volume(*id)),
+      _ => touched,
+    };
+    match publish_shard(state) {
+      Ok(published)
+        if touched.is_some_and(|volume| {
+          state.by_id.contains_key(&volume) && !published.captured(volume)
+        }) =>
+      {
+        return refused(refusal_of_vfs(&slates_vfs::VfsError::RecoveryIncomplete));
+      }
+      Ok(_) => {}
+      Err(error) => return refused(refusal_of_vfs(&error)),
+    }
   }
   reply
 }
@@ -1752,6 +1828,7 @@ fn dispatch_inner(
     // `serve` routes this to the control shard (`promote_region_on_root`) before dispatch; this defensive arm
     // proposes on whatever shard reached it — correct on the control shard, refused `NotRootLeader` otherwise.
     RequestBody::PromoteRegion { region } => propose_region_promotion(state, region),
+    RequestBody::Bootstrap { .. } => refused(Refusal::ConsensusNotInitialized),
     RequestBody::AwaitPlaced {
       volume,
       snapshot,
@@ -1857,16 +1934,15 @@ fn revoke_on_channel(
     return Served::Reply(refused(Refusal::NotFound));
   };
   let shards = state.shards.clone();
-  let task = SpawnRequest::new(
-    Box::pin(async move {
-      let reply = revoke_everywhere(origin, owner, &shards, consumer).await;
-      crate::state::deliver(client_index, request, reply, false);
-    }),
-    None,
-  );
-  if slates_rt::registry::send_control(origin, Control::Spawn(Box::new(task))).is_err() {
+  let task = slates_rt::futures::spawn(async move {
+    let reply = revoke_everywhere(origin, owner, &shards, consumer).await;
+    crate::state::deliver(client_index, request, reply, false);
+  });
+  let Ok(task) = task else {
     return Served::Reply(refused(Refusal::NotFound));
-  }
+  };
+  // Freshly admitted on this shard, with no await before detaching: the slot is still live.
+  let _ = slates_rt::futures::detach(task);
   Served::Forwarded
 }
 
@@ -2042,58 +2118,57 @@ fn attest_on_channel(
   else {
     return Served::Reply(refused(Refusal::NotFound));
   };
-  let task = SpawnRequest::new(
-    Box::pin(async move {
-      let facts: Option<ConsumerFacts> = crate::xshard::call_within(
-        origin,
-        owner,
-        move |s| {
-          s.db
-            .partition()
-            .consumer(consumer)
-            .map(|r| (r.account, r.secret, r.revoked))
-        },
-        crate::daemon::LIVENESS_BUDGET_NS,
-      )
-      .await;
-      let reply = match facts {
-        None => refused(Refusal::NotFound),
-        Some(facts) => match verify_attestation(&channel_principal, client_id, facts, &proof) {
-          Ok(account) => {
-            // Bind the slot on the origin shard, by index: the channel's principal becomes the consumer.
-            let bound = crate::xshard::run_on(origin, origin, move |s| {
-              let handle = s
-                .clients
-                .iter()
-                .find(|(h, _)| h.index() == client_index)
-                .map(|(h, _)| h);
-              if let Some(slot) = handle.and_then(|h| s.clients.get_mut(h).ok()) {
-                slot.principal = Principal::Consumer { account, consumer };
-              }
-            })
-            .is_ok();
-            if bound {
-              ReplyBody::Attested
-            } else {
-              refused(Refusal::NotFound)
+  let task = slates_rt::futures::spawn(async move {
+    let facts: Option<ConsumerFacts> = crate::xshard::call_within(
+      origin,
+      owner,
+      move |s| {
+        s.db
+          .partition()
+          .consumer(consumer)
+          .map(|r| (r.account, r.secret, r.revoked))
+      },
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await;
+    let reply = match facts {
+      None => refused(Refusal::NotFound),
+      Some(facts) => match verify_attestation(&channel_principal, client_id, facts, &proof) {
+        Ok(account) => {
+          // Bind the slot on the origin shard, by index: the channel's principal becomes the consumer.
+          let bound = crate::xshard::run_on(origin, origin, move |s| {
+            let handle = s
+              .clients
+              .iter()
+              .find(|(h, _)| h.index() == client_index)
+              .map(|(h, _)| h);
+            if let Some(slot) = handle.and_then(|h| s.clients.get_mut(h).ok()) {
+              slot.principal = Principal::Consumer { account, consumer };
             }
+          })
+          .is_ok();
+          if bound {
+            ReplyBody::Attested
+          } else {
+            refused(Refusal::NotFound)
           }
-          Err(refusal) => {
-            let counter = attest_refusal_counter(&refusal);
-            let _ = crate::xshard::run_on(origin, origin, move |s| {
-              *s.refusals.entry(counter).or_insert(0) += 1;
-            });
-            refused(refusal)
-          }
-        },
-      };
-      crate::state::deliver(client_index, request, reply, false);
-    }),
-    None,
-  );
-  if slates_rt::registry::send_control(origin, Control::Spawn(Box::new(task))).is_err() {
+        }
+        Err(refusal) => {
+          let counter = attest_refusal_counter(&refusal);
+          let _ = crate::xshard::run_on(origin, origin, move |s| {
+            *s.refusals.entry(counter).or_insert(0) += 1;
+          });
+          refused(refusal)
+        }
+      },
+    };
+    crate::state::deliver(client_index, request, reply, false);
+  });
+  let Ok(task) = task else {
     return Served::Reply(refused(Refusal::NotFound));
-  }
+  };
+  // Freshly admitted on this shard, with no await before detaching: the slot is still live.
+  let _ = slates_rt::futures::detach(task);
   Served::Forwarded
 }
 
@@ -5140,9 +5215,12 @@ fn recover_images(state: &ShardState) -> std::collections::BTreeMap<[u8; 16], Vo
 }
 
 /// What a shard publish committed (§4.8): the volumes the new image carries, and the ones it could
-/// not image and left to their own recovery path.
+/// not image. A mutation of an omitted volume must refuse its stability guarantee.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Published {
+  /// Volumes whose content the committed image actually carries. An absent volume is never
+  /// inferred captured from an empty omission list (AUD-05).
+  pub volumes: Vec<DbVolumeId>,
   /// Volumes skipped because they could not be imaged (an overlay with base-backed inodes, whose base
   /// recovery is its own gate); every other volume of the shard is in the committed image.
   pub skipped: Vec<DbVolumeId>,
@@ -5154,7 +5232,7 @@ impl Published {
   /// Whether the committed image carries `volume`: the barrier's question for the volume a
   /// data-plane mutation touched.
   pub fn captured(&self, volume: DbVolumeId) -> bool {
-    !self.skipped.contains(&volume)
+    self.volumes.contains(&volume)
   }
 }
 
@@ -5165,27 +5243,28 @@ impl Published {
 /// before its reply claims stability (`crate::nfs`). `Ok` names what the committed image carries;
 /// `Err` is a refused publish — the image did not fit its slot (`NoSpace`) or the slot could not be
 /// written — after which nothing changed since the last committed image survives a restart, so the
-/// caller must not acknowledge stability. Returns `Ok` with nothing published when the daemon has no
-/// content object (a degraded build with no anchor-backed recovery). Efficiency gate: it re-images
+/// caller must not acknowledge stability. Missing recovery storage refuses `RecoveryIncomplete`.
+/// Efficiency gate: it re-images
 /// every volume on each call; an incremental publish is the owed refinement (docs/wip/recovery.md).
 pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::VfsError> {
   let (start, end) = state.content_range;
   if state.content.is_none() || end <= start {
-    return Ok(Published::default());
+    return Err(slates_vfs::VfsError::RecoveryIncomplete);
   }
   let mut keyed = Vec::new();
   let mut published = Published::default();
   for (_, slot) in state.volumes.iter() {
     match slot.volume.to_image(&state.store) {
-      Ok(image) => keyed.push(KeyedImage {
-        key: slot.id.bytes,
-        image,
-      }),
-      // A volume the image cannot yet hold (an overlay with base-backed inodes, whose base recovery
-      // is its own gate) is *skipped*, not a refusal — publishing the rest of the shard, so one such
-      // volume never blocks every other volume's recovery. The skipped volume recovers by its own
-      // path (an overlay reopens its base); a scratch volume that could not be imaged refuses on
-      // recovery rather than presenting empty, which is contained to that volume.
+      Ok(image) => {
+        published.volumes.push(slot.id);
+        keyed.push(KeyedImage {
+          key: slot.id.bytes,
+          image,
+        });
+      }
+      // Publish unaffected volumes even when another cannot be captured. Callers must check the
+      // touched volume against the returned coverage; an omitted volume never receives a stable
+      // acknowledgement, and recovery refuses it instead of rebuilding empty (§4.8, AUD-05).
       Err(e) => {
         crate::daemon::PUBLISH_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         eprintln!(
@@ -5198,7 +5277,7 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   }
   let shard = ShardImage::new(keyed);
   let Some(object) = state.content.as_mut() else {
-    return Ok(Published::default());
+    return Err(slates_vfs::VfsError::RecoveryIncomplete);
   };
   let Some(slice) = object.bytes_mut().get_mut(start..end) else {
     return Err(slates_vfs::VfsError::NoSpace);
@@ -5262,10 +5341,8 @@ fn recover_version_reservations(
 /// caller advances `next_prefix` past it). A scratch volume is rebuilt from its recovery image when
 /// one is present (its content, tree, snapshots and prefix restored, §4.8); with a content object but
 /// no image the volume's content was lost, which refuses (`RecoveryIncomplete`) rather than
-/// presenting empty; without any content object (a degraded build with no anchor-backed recovery) it
-/// is recreated empty, the BUG-11 behaviour that build cannot better. An overlay re-opens its base
-/// from the recorded path (its untouched base entries are on disk; its diverged state in an image is
-/// the owed base gate). The volume's reservations — bytes, re-grown dynamic hold, inode and entry
+/// presenting empty. An overlay also refuses: the image format does not retain its base witnesses
+/// or host handles, and reopening its path would absorb outsider changes and lose private edits. The volume's reservations — bytes, re-grown dynamic hold, inode and entry
 /// allowances, version credits — are taken again (§4.2 accounting through recovery), and every one
 /// is given back if a later step refuses.
 fn rebuild_volume(
@@ -5356,18 +5433,14 @@ fn rebuild_volume(
 }
 
 /// Builds the recovered volume and reports its inode-number prefix. See [`rebuild_volume`] for the
-/// scratch-volume cases; a base-backed volume re-opens its base (its content is on the base, not in
-/// the image; base recovery through retained handles is its own gate, §4.8).
+/// scratch-volume cases; a base-backed volume refuses until recovery can restore its base witnesses
+/// and retained host handles (§4.8), never reopening an unrelated current path.
 fn build_recovered_volume(
   state: &mut ShardState,
   record: &VolumeRecord,
   image: Option<&VolumeImage>,
   size: SizeClass,
 ) -> Result<(Volume, Option<OsHost>, u16), String> {
-  let names = match record.policy.names {
-    DbNamePolicy::Exact => NamePolicy::Exact,
-    DbNamePolicy::Fold => NamePolicy::Fold,
-  };
   match (&record.base, image) {
     (BaseRecord::Scratch, Some(image)) => {
       let quota = quota_for(size);
@@ -5388,25 +5461,11 @@ fn build_recovered_volume(
       }
       Ok((volume, None, image.prefix))
     }
-    (BaseRecord::Scratch, None) if state.content.is_some() => {
+    (BaseRecord::Scratch, None) => {
       Err("RecoveryIncomplete: no content image for the volume".to_owned())
     }
-    (BaseRecord::Scratch, None) => {
-      let config = volume_config(state, names, quota_for(size));
-      let prefix = config.prefix;
-      Volume::create(&mut state.store, config)
-        .map(|v| (v, None, prefix))
-        .map_err(|e| e.to_string())
-    }
-    (BaseRecord::Path { path }, _) => {
-      let config = volume_config(state, names, quota_for(size));
-      let prefix = config.prefix;
-      open_base(state, path, config)
-        .map(|(v, h)| (v, h, prefix))
-        .map_err(|reply| match *reply {
-          ReplyBody::Refused { refusal } => refusal_name(&refusal).to_owned(),
-          _ => "refused".to_owned(),
-        })
+    (BaseRecord::Path { .. }, _) => {
+      Err("RecoveryIncomplete: the image has no retained base witnesses or host handles".to_owned())
     }
   }
 }
@@ -5544,6 +5603,84 @@ mod tests {
     rendezvous_first, verify_attestation,
   };
   use slates_db::register::RootConfiguration;
+
+  /// AC-2.12 / T-2.14, AUD-05: recovery has a catalog entry but no image or retained base
+  /// witnesses. Expect `RecoveryIncomplete`, never an empty scratch or a reopened live directory.
+  #[test]
+  fn recovery_without_content_or_base_witnesses_never_presents_empty() {
+    let (scratch, overlay) = crate::daemon::audit_on_shard(|state| {
+      let size = super::SizeClass::Bounded { limit: 1 << 20 };
+      let reply = super::dispatch(
+        state,
+        1,
+        &Principal::Uid { uid: 0 },
+        super::RequestBody::Create {
+          name: "recovery-proof".to_owned(),
+          size,
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      );
+      let super::ReplyBody::Created { id } = reply else {
+        panic!("{reply:?}");
+      };
+      let mut record = state
+        .db
+        .partition()
+        .volume(super::to_db_volume(id))
+        .unwrap()
+        .clone();
+      state.content = None;
+      let scratch = super::build_recovered_volume(state, &record, None, size).err();
+      record.base = super::BaseRecord::Path {
+        path: ".".to_owned(),
+      };
+      let overlay = super::build_recovered_volume(state, &record, None, size).err();
+      (scratch, overlay)
+    });
+    assert!(scratch.is_some_and(|reason| reason.contains("RecoveryIncomplete")));
+    assert!(overlay.is_some_and(|reason| reason.contains("RecoveryIncomplete")));
+  }
+
+  /// AC-2.12 / T-2.14, AUD-05: remove or exhaust the recovery image storage before a create.
+  /// Expect a refused completion, including the retry, rather than a success lost on restart.
+  #[test]
+  fn a_control_verb_cannot_acknowledge_an_unpublished_image() {
+    for absent in [false, true] {
+      let (first, retry) = crate::daemon::audit_on_shard(move |state| {
+        if absent {
+          state.content = None;
+        } else {
+          state.content_range = (0, 1);
+        }
+        let id = slates_wire::request::RequestId {
+          client: 1,
+          sequence: 1,
+        };
+        let request = super::RequestBody::Create {
+          name: "unpublished".to_owned(),
+          size: super::SizeClass::Bounded { limit: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        };
+        let first =
+          super::run_recorded(state, 1, id, 1, &Principal::Uid { uid: 0 }, request.clone());
+        let retry =
+          super::run_forwarded(state, 1, id, 1, &Principal::Uid { uid: 0 }, request, None);
+        (first, retry)
+      });
+      assert!(
+        matches!(first, super::ReplyBody::Refused { .. }),
+        "{first:?}"
+      );
+      assert_eq!(
+        retry, first,
+        "a retry must not turn a failed publish into success"
+      );
+    }
+  }
 
   /// AC (§4.8 "Lookup"): a volume homed in another region is redirected there (naming that region); a volume
   /// homed in this node's own region is served locally (`None`); and a single-region fleet always serves

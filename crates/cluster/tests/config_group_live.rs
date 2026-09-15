@@ -198,10 +198,10 @@ fn run_distributed_membership_change() -> Outcome {
 /// live voters must retire it and carry the council alone.
 const DEAD: HostId = HostId(4);
 /// Shape: the requests the live voter serves in the voter-removal round — the leader's sequence over the
-/// transport is one pre-vote and one vote (the election), then four two-round replications (the takeover,
-/// the joint configuration entry, `C_new`, and the further admission — each an entry round and a commit
+/// transport is one pre-vote and one vote (the election), then five two-round replications (the election
+/// no-op, takeover, joint configuration entry, `C_new`, and further admission — each an entry round and a commit
 /// heartbeat).
-const REMOVAL_SERVES: usize = 10;
+const REMOVAL_SERVES: usize = 2 + 2 * 5;
 
 /// A three-voter council on `node`, members and voters `[LEADER, VOTER, DEAD]` at f=1 (the candidate floor:
 /// every member votes).
@@ -322,6 +322,8 @@ fn run_voter_removal_over_the_transport() -> RemovalOutcome {
         }
       };
 
+      // Commit the election no-op before consulting the caught-up reconfiguration gate.
+      replicate(&mut leader, &mut endpoint).await;
       // The dead voter is taken over (committed by the live voter's acknowledgement: two of three).
       leader.reconcile_alive(&[(LEADER, None), (VOTER, None)]);
       replicate(&mut leader, &mut endpoint).await;

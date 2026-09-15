@@ -572,6 +572,9 @@ fn the_mcp_surface_serves_the_tools() {
     },
   )
   .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let mut server = McpServer::new(connect(&instance));
 
   assert_protocol(&mut server);

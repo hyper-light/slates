@@ -11,7 +11,7 @@
 //!   the rollout (readiness is `slates status` on every pod).
 //! - `prove` — the fleet proof: formation, a volume placed at `f + 1`, the owner's pod deleted (the
 //!   SIGKILL takeover), the successor serving; the replacement pod's rejoin is a best-effort observation
-//!   (the RAM-only same-seed-id restart gap, docs/wip/kind-lane.md), not a gate.
+//!   (the new-IP rejoin proof in docs/wip/kind-lane.md), not a gate.
 //! - `scale` — `replicas=5` and back to 3: the configuration group's membership change, re-forming each time.
 //! - `netem` — the WAN profiles of §4.8's owed measurement: 80 ms ± 20 ms, the same with 1 % loss, and
 //!   the handshake ceiling at 350 ms; each pod's council timing and the leader's stability over a window.
@@ -79,7 +79,7 @@ const PLACE_WAIT: Duration = Duration::from_secs(60);
 /// Lifeguard death is six backed-off misses (≈ 4 s at rest) and the takeover a phase-one round.
 const TAKEOVER_WAIT: Duration = Duration::from_secs(120);
 /// Shape: how long the replacement pod is watched for a rejoin — bounded, since the rejoin is a
-/// best-effort observation (the RAM-only same-seed-id restart gap, docs/wip/kind-lane.md), not a gate:
+/// best-effort observation (the new-IP proof in docs/wip/kind-lane.md), not a gate:
 /// long enough for a reschedule and boot, not the full retirement window.
 const REJOIN_WAIT: Duration = Duration::from_secs(120);
 /// Shape: the window the shaped fleet is watched over — minutes, not an hour, on this box (the charter's
@@ -581,6 +581,7 @@ fn smoke_in(name: &str) -> Result<(), Failure> {
       "kind: a one-node manifest is the solo degenerate (f 0, one member): {fleet}"
     )));
   }
+  must("docker", &["exec", name, "/slates", "bootstrap", "root"])?;
   // A verb through the same rendezvous: the node serves, not merely answers status.
   let created = must(
     "docker",
@@ -773,7 +774,7 @@ impl Lane {
         .install(self.replicas, self.netem.as_ref())
         .map(|elapsed| {
           eprintln!(
-            "kind: installed and rolled out in {:.1} s",
+            "kind: installed and rolled out in {:.1} s; for a new group, explicitly run /slates bootstrap root on one pod",
             elapsed.as_secs_f64()
           )
         }),
@@ -804,6 +805,7 @@ impl Lane {
       "kind: installed and rolled out {LANE_REPLICAS} replicas in {:.1} s",
       elapsed.as_secs_f64()
     );
+    self.bootstrap()?;
     self.prove()?;
     self.scale()?;
     self.netem_profiles()
@@ -977,10 +979,9 @@ impl Lane {
     Ok(out)
   }
 
-  /// Uninstalls the release and waits for every pod to be gone, so the next install boots the whole fleet
-  /// **together** (all pods created at once, not a rolling restart). Used by `scale` and `netem`: a
-  /// staggered (re)boot onto a running fleet hits the same-seed-id rejoin gap (docs/wip/kind-lane.md), so
-  /// each fleet size and each shaped profile is proven by a fresh simultaneous boot, which forms cleanly.
+  /// Uninstalls the release and waits for every pod to be gone. Each `scale` and `netem`
+  /// fixture then starts and explicitly bootstraps fresh groups. These histories measure
+  /// initial formation at each size and profile; rolling replacement is a separate proof.
   fn uninstall(&self) -> Result<(), Failure> {
     let context = format!("kind-{}", self.cluster);
     let _ = capture(
@@ -1019,7 +1020,21 @@ impl Lane {
     netem: Option<&(String, String, String)>,
   ) -> Result<Duration, Failure> {
     self.uninstall()?;
-    self.install(replicas, netem)
+    let elapsed = self.install(replicas, netem)?;
+    self.bootstrap()?;
+    Ok(elapsed)
+  }
+
+  /// Explicit creation for a fresh test deployment only. Upgrade and pod restart never invoke it.
+  fn bootstrap(&self) -> Result<(), Failure> {
+    let outcome = self.kubectl(&["exec", &self.pod(0), "--", "/slates", "bootstrap", "root"])?;
+    if outcome.code != 0 {
+      return Err(Failure(format!(
+        "kind: initial bootstrap refused: {}",
+        outcome.stderr.trim()
+      )));
+    }
+    Ok(())
   }
 
   fn pod(&self, index: u64) -> String {
@@ -1206,7 +1221,7 @@ impl Lane {
       Err(_) => {
         let views = self.views(&all)?;
         eprintln!(
-          "kind: the replacement {owner} did NOT rejoin the mesh within {REJOIN_WAIT:?} (the RAM-only same-seed-id restart gap, docs/wip/kind-lane.md); the takeover stands — {successor} serves the volume. Views:"
+          "kind: the replacement {owner} did NOT rejoin the mesh within {REJOIN_WAIT:?} (the new-IP proof in docs/wip/kind-lane.md); the takeover stands — {successor} serves the volume. Views:"
         );
         for view in views.iter().flatten() {
           eprintln!("kind:   {}", view.line());
@@ -1301,12 +1316,9 @@ impl Lane {
     }
   }
 
-  /// `scale`: the manifest ConfigMap re-renders `f` and the node list from the replica count, and the
-  /// fleet forms at each size — five replicas (f = 2) and back to three (f = 1). Each size is a **fresh**
-  /// install (uninstall + install, the whole fleet booting together), because an **in-place** rolling
-  /// `helm upgrade --set replicas=N` restarts pods one at a time onto the running fleet and hits the
-  /// same-seed-id rejoin gap (docs/wip/kind-lane.md); the in-place rolling scale is what that gap gates,
-  /// while the manifest's `f`-derivation and formation at each size are proven here.
+  /// `scale`: the manifest derives `f` and the node list at five replicas (f = 2), then three
+  /// (f = 1). Each size is a fresh install with explicit bootstrap. This proves formation and
+  /// the manifest's derivation at each size; it does not prove in-place rolling scale.
   fn scale(&self) -> Result<(), Failure> {
     let elapsed = self.fresh_install(SCALED_REPLICAS, None)?;
     eprintln!(

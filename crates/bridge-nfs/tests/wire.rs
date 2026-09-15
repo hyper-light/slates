@@ -106,6 +106,62 @@ fn rpc_oversized_record_is_refused() {
   assert_eq!(read_record(&marker), Err(RpcError::RecordTooLarge));
 }
 
+/// T-4.3, §4.6 hostile RPC framing; AUD-03: empty nonfinal fragments must consume a bounded
+/// framing budget even though they add no payload. A maximum-size byte-fragmented record fits.
+#[test]
+fn rpc_empty_fragments_cannot_extend_a_record_without_limit() {
+  // The published server message limit is 2 MiB. Allow one marker per payload byte and a terminal
+  // marker; one further marker must be refused even when no payload has arrived.
+  let payload_limit = 2 * 1024 * 1024;
+  let markers = vec![0; (payload_limit + 2) * size_of::<u32>()];
+  assert_eq!(read_record(&markers), Err(RpcError::RecordTooLarge));
+}
+
+/// T-4.3, §4.6 record marking; AUD-03: deliver a maximally byte-fragmented payload in irregular
+/// TCP chunks, then another record. Expect both bodies exactly once, including split markers.
+#[test]
+fn rpc_incremental_records_preserve_maximal_fragmentation_and_stream_boundaries() {
+  use slates_bridge_nfs::rpc::RecordReader;
+  let payload = vec![42; 2 * 1024 * 1024];
+  let mut wire = Vec::new();
+  for byte in &payload {
+    wire.extend_from_slice(&1u32.to_be_bytes());
+    wire.push(*byte);
+  }
+  wire.extend_from_slice(&0x8000_0000u32.to_be_bytes());
+  wire.extend_from_slice(&write_record(b"following record"));
+  let mut reader = RecordReader::default();
+  let mut messages = Vec::new();
+  for chunk in wire.chunks(4093) {
+    let mut rest = chunk;
+    while !rest.is_empty() {
+      let (message, consumed) = reader.read(rest).unwrap();
+      assert!(
+        consumed > 0,
+        "the incremental reader consumes every input prefix"
+      );
+      if let Some(message) = message {
+        messages.push(message);
+      }
+      rest = &rest[consumed..];
+    }
+  }
+  assert_eq!(messages, vec![payload, b"following record".to_vec()]);
+}
+
+/// T-4.3, §4.6; AUD-03: an empty-fragment attack split across reads must be refused at the same
+/// bound as one delivered all at once. Consuming a TCP chunk cannot reset the framing budget.
+#[test]
+fn rpc_fragment_budget_survives_tcp_read_boundaries() {
+  use slates_bridge_nfs::rpc::RecordReader;
+  let mut reader = RecordReader::default();
+  let fragments = 2 * 1024 * 1024 + 1;
+  for _ in 0..fragments {
+    assert_eq!(reader.read(&[0; 4]), Ok((None, 4)));
+  }
+  assert_eq!(reader.read(&[0; 4]), Err(RpcError::RecordTooLarge));
+}
+
 /// A NFSv3 NULL call header parses to its program, version and procedure.
 #[test]
 fn rpc_parses_a_call_header() {

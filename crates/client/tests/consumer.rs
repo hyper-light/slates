@@ -249,6 +249,9 @@ fn a_spawned_consumer_binds_through_the_inherited_capability_and_a_sibling_witho
     },
   )
   .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let secret = daemon.segment().issuer_secret().unwrap();
   let account = current_uid();
   let mut owner = connect(&instance);
@@ -341,6 +344,9 @@ fn a_client_holding_a_consumer_identity_binds_again_by_itself_after_a_daemon_res
   let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
   let segment = restart_segment("cl-rebind", &profile, &config);
   let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   let secret = first.segment().issuer_secret().unwrap();
   let account = current_uid();
   let mut owner = connect(&instance);
@@ -361,6 +367,9 @@ fn a_client_holding_a_consumer_identity_binds_again_by_itself_after_a_daemon_res
   first.stop();
 
   let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  second
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
   assert_served_as_the_consumer_after_the_restart(&mut workload, mine, consumer);
   assert_account_refused(&mut owner, mine, "after the restart");
   second.stop();

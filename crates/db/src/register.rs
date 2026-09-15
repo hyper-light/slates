@@ -21,6 +21,24 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HostId(pub u64);
 
+impl slates_wire::Wire for HostId {
+  /// Format: a host identity is one unsigned 64-bit word.
+  const SCHEMA: &'static str = "struct HostId{value:u64}";
+  /// Format: the named wrapper's schema includes its word's schema, as a derived struct does.
+  const SCHEMA_HASH: u64 = slates_wire::schema::mix(
+    slates_wire::schema::fnv64(Self::SCHEMA),
+    &[<u64 as slates_wire::Wire>::SCHEMA_HASH],
+  );
+
+  fn encode(&self, out: &mut Vec<u8>) {
+    self.0.encode(out);
+  }
+
+  fn decode(input: &mut &[u8]) -> Result<Self, slates_wire::WireError> {
+    u64::decode(input).map(HostId)
+  }
+}
+
 /// A region in the fleet (§4.8, D-14 — "a root group across regions holds region membership"). A region is
 /// one regional configuration group's domain; the **root group** agrees on which regions exist, where a
 /// moved volume is homed, and which region a lost region is promoted to. One region on a laptop (the sole
@@ -499,9 +517,10 @@ pub fn scatter_width(data_bytes: u64, bandwidth_bytes_per_s: u64, budget_ns: u64
 /// (Cidon et al. §3; the exact `copysets / C(hosts, copies)` is the `failed = copies` case). The binomial
 /// ratio is a product of `copies` fractions each below one, evaluated in `f64` (this is a cold-path
 /// durability check at a configuration change, never a data-path cost). Zero when fewer than `copies`
-/// nodes fail (no full copyset can be inside the failed set) or there is no redundancy (`copies ≤ 1`).
+/// nodes fail (no full copyset can be inside the failed set). One copy has the ordinary
+/// single-host loss probability; lack of redundancy never implies lack of risk.
 pub fn coincident_loss_probability(copysets: u64, hosts: u64, failed: u64, copies: u64) -> f64 {
-  if copies <= 1 || failed < copies || hosts < copies {
+  if copies == 0 || failed < copies || hosts < copies {
     return 0.0;
   }
   // C(failed, copies) / C(hosts, copies) = ∏_{i=0}^{copies-1} (failed - i) / (hosts - i).
@@ -1054,6 +1073,26 @@ impl Acceptor {
   /// ([`ForeignGeneration`](RegisterError::ForeignGeneration), naming its current generation) — and refreshes
   /// reactively, having now seen a request that carries a newer version.
   pub fn accept(&mut self, record: &Record) -> Result<Ack, RegisterError> {
+    self.check(record)?;
+    self.fence.accept(record.epoch)?;
+    // Store the accepted value and the raised promise before acknowledging.
+    self.accepted.insert(
+      (record.object, record.sequence),
+      (record.epoch, record.value.clone()),
+    );
+    Ok(Ack {
+      holder: self.id,
+      object: record.object,
+      sequence: record.sequence,
+      generation: record.generation,
+      identity: record.identity(),
+    })
+  }
+
+  /// Checks authority, epoch and position without changing the promise or accepted history (§4.8).
+  /// A holder uses this before recomputing a merge record: a refused record cannot mutate its replica.
+  /// The check and acceptance must run in the same owning-shard turn, with no intervening await.
+  pub fn check(&self, record: &Record) -> Result<(), RegisterError> {
     if record.generation < self.authority.generation {
       return Err(RegisterError::ConfigurationStale {
         version: self.authority.generation,
@@ -1067,24 +1106,18 @@ impl Acceptor {
     if record.owner != self.authority.owner {
       return Err(RegisterError::Unauthorized);
     }
-    self.fence.accept(record.epoch)?;
+    if record.epoch < self.fence.seen {
+      return Err(RegisterError::StaleEpoch {
+        current: self.fence.seen.0,
+      });
+    }
     let position = (record.object, record.sequence);
     if let Some((_, existing)) = self.accepted.get(&position)
       && existing != &record.value
     {
       return Err(RegisterError::ConflictingPosition);
     }
-    // Store the accepted value and the raised promise before acknowledging.
-    self
-      .accepted
-      .insert(position, (record.epoch, record.value.clone()));
-    Ok(Ack {
-      holder: self.id,
-      object: record.object,
-      sequence: record.sequence,
-      generation: record.generation,
-      identity: record.identity(),
-    })
+    Ok(())
   }
 
   /// Installs a new configuration authority — the holder applying the configuration update the regional
@@ -1372,7 +1405,8 @@ impl Configuration {
   pub fn coincident_loss(&self, failed: u64) -> f64 {
     let hosts = u64::try_from(self.neighbourhood.len()).unwrap_or(u64::MAX);
     let copysets = u64::try_from(self.copyset_count()).unwrap_or(u64::MAX);
-    let copies = u64::from(self.quorum.f).saturating_add(1);
+    // A bootstrapping configuration cannot claim protection from hosts not yet admitted.
+    let copies = u64::from(self.quorum.f).saturating_add(1).min(hosts);
     coincident_loss_probability(copysets, hosts, failed, copies)
   }
 
@@ -2319,6 +2353,27 @@ mod tests {
       !poor.within_loss_bound(0.0, 2),
       "a zero accepted-loss bound rejects a configuration that can lose data"
     );
+  }
+
+  /// AC-8.1, §4.8: losing the only host loses the object, both on a laptop and while a
+  /// newly bootstrapped fleet has not admitted its additional holders. Missing copies are
+  /// never counted as protection by the operator's durability check.
+  #[test]
+  fn a_single_host_cannot_report_zero_loss_by_counting_absent_copies() {
+    for quorum in [Quorum { f: 0 }, Quorum { f: 1 }] {
+      let configuration = Configuration {
+        version: 0,
+        owner: HostId(1),
+        host_epoch: FIRST_EPOCH,
+        neighbourhood: vec![HostId(1)],
+        domains: Default::default(),
+        quorum,
+        has_mirror: false,
+      };
+      assert!(configuration.within_loss_bound(0.0, 0));
+      assert!(!configuration.within_loss_bound(0.0, 1));
+      assert_eq!(configuration.coincident_loss(1), 1.0);
+    }
   }
 
   /// AC (§4.8, D-14): the regional configuration the council agrees on derives each owner's single-owner

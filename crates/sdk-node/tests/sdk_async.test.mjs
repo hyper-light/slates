@@ -10,7 +10,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { AsyncClient } from '../async.mjs';
 
 const require = createRequire(import.meta.url);
@@ -90,6 +90,10 @@ test('async lifecycle over a live daemon', async (t) => {
   });
   try {
     const client = await connectWhenReady(slates, instance);
+    const bootstrap = spawnSync(daemon, ['--instance', instance, 'bootstrap', 'root'], {
+      encoding: 'utf8', timeout: STARTUP_MS,
+    });
+    assert.equal(bootstrap.status, 0, bootstrap.stderr);
     assert.equal(typeof client.clientId(), 'number');
 
     // await create → a 32-hex volume id.

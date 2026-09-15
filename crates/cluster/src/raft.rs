@@ -127,7 +127,7 @@ pub struct VoteReply {
 
 /// A voter configuration (Raft §6): the base voter set and, during a membership change, the incoming
 /// set. A decision needs a majority of the base and — when `joint` is set — of the incoming set too.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(slates_wire::Wire, Clone, Debug, PartialEq, Eq)]
 pub struct VoterConfig {
   /// The base voter set.
   pub voters: Vec<HostId>,
@@ -140,7 +140,7 @@ pub struct VoterConfig {
 /// encoded configuration change — the Raft core does not interpret it). A **configuration entry** instead
 /// carries a [`VoterConfig`] that changes the Raft voter set; it takes effect the moment it is appended
 /// (§6), so the Raft core reads it directly rather than through the state machine.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(slates_wire::Wire, Clone, Debug, PartialEq, Eq)]
 pub struct LogEntry {
   /// The term in which the leader created this entry.
   pub term: u64,
@@ -176,6 +176,9 @@ impl LogEntry {
 /// at the previous position, so the logs converge (the log-matching property, §5.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppendEntries {
+  /// The current read-confirmation round, or zero when no read is pending. A follower echoes it
+  /// only after recognizing this term's leader, so old replies cannot confirm a later read.
+  pub read_context: u64,
   /// The leader's term.
   pub term: u64,
   /// The leader sending the entries.
@@ -195,6 +198,8 @@ pub struct AppendEntries {
 /// leader on, so the leader advances `match_index`/`next_index` for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppendReply {
+  /// The read context from the request this reply answers; zero is not a read confirmation.
+  pub read_context: u64,
   /// The follower replying.
   pub follower: HostId,
   /// The follower's current term.
@@ -235,6 +240,105 @@ pub struct InstallSnapshotReply {
   pub term: u64,
 }
 
+/// One outstanding ReadIndex round (§6.4): a read's start index and voter configuration, plus
+/// only the distinct voters that have answered that round. One round bounds pending read state.
+struct ReadRound {
+  context: u64,
+  term: u64,
+  index: u64,
+  config: VoterConfig,
+  confirmed: BTreeSet<HostId>,
+}
+
+/// The complete state retained with a voter identity (§4.8; Raft §3.8/§5). Term and vote cannot
+/// be recovered independently of the log, snapshot and configuration. The commit index is retained
+/// too, so the group's deterministic fold can resume without exposing a shorter committed prefix.
+#[derive(slates_wire::Wire, Clone, Debug, PartialEq, Eq)]
+pub struct SavedRaft {
+  /// The only voter identity this publication can recover.
+  pub id: HostId,
+  /// The configuration at the snapshot boundary, before the remaining log entries.
+  pub base: VoterConfig,
+  /// The greatest observed election term.
+  pub term: u64,
+  /// The vote already granted in that term.
+  pub voted_for: Option<HostId>,
+  /// All entries above the snapshot, including the uncommitted tail and configuration entries.
+  pub log: Vec<LogEntry>,
+  /// The last committed position.
+  pub commit_index: u64,
+  /// The last position folded into the state-machine snapshot.
+  pub snapshot_index: u64,
+  /// The term at that position, needed for log matching.
+  pub snapshot_term: u64,
+  /// The state-machine snapshot at that position.
+  pub snapshot_data: Vec<u8>,
+}
+
+/// A publication that cannot describe a legal recovered Raft state (§4.8). The caller refuses
+/// recovery; none of these errors permits constructing a fresh voter under the saved identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RaftRecoveryError {
+  /// Joining again would discard a term, vote or prefix this member has already observed.
+  AlreadyInitialized,
+  /// A join attempted to reuse the state donor's identity instead of a fresh member identity.
+  ReusedIdentity,
+  /// A voter set is empty or repeats an identity.
+  InvalidVoters,
+  /// The snapshot boundary disagrees with its term or carries state at index zero.
+  InvalidSnapshot,
+  /// A log entry's term decreases or exceeds the saved current term.
+  InvalidLogTerm,
+  /// The committed position is outside the retained snapshot and log.
+  InvalidCommitIndex,
+  /// A retained position cannot be represented by the protocol's index width.
+  IndexOverflow,
+}
+
+impl SavedRaft {
+  /// Validates the state before any recovered node is exposed. Framing and checksum verification
+  /// belong to the transport or publication reader, before this decoded value reaches the core.
+  fn validate(&self) -> Result<(), RaftRecoveryError> {
+    let valid_set = |voters: &[HostId]| {
+      !voters.is_empty() && voters.iter().copied().collect::<BTreeSet<_>>().len() == voters.len()
+    };
+    let valid_config = |config: &VoterConfig| {
+      valid_set(&config.voters) && config.joint.as_deref().is_none_or(valid_set)
+    };
+    if !valid_config(&self.base) {
+      return Err(RaftRecoveryError::InvalidVoters);
+    }
+    if (self.snapshot_index == 0 && (self.snapshot_term != 0 || !self.snapshot_data.is_empty()))
+      || (self.snapshot_index > 0 && self.snapshot_term == 0)
+      || self.snapshot_term > self.term
+    {
+      return Err(RaftRecoveryError::InvalidSnapshot);
+    }
+    let last_index = self
+      .snapshot_index
+      .checked_add(u64::try_from(self.log.len()).map_err(|_| RaftRecoveryError::IndexOverflow)?)
+      .ok_or(RaftRecoveryError::IndexOverflow)?;
+    if self.commit_index < self.snapshot_index || self.commit_index > last_index {
+      return Err(RaftRecoveryError::InvalidCommitIndex);
+    }
+    let mut previous_term = self.snapshot_term;
+    for entry in &self.log {
+      if entry.term == 0 || entry.term < previous_term || entry.term > self.term {
+        return Err(RaftRecoveryError::InvalidLogTerm);
+      }
+      if entry
+        .config
+        .as_ref()
+        .is_some_and(|config| !valid_config(config))
+      {
+        return Err(RaftRecoveryError::InvalidVoters);
+      }
+      previous_term = entry.term;
+    }
+    Ok(())
+  }
+}
+
 /// A Raft node's state: its identity, the voters it counts a majority against, the persistent term and
 /// vote (Raft's `currentTerm`/`votedFor`), its role, the votes gathered this election, the replicated
 /// `log` and how far it is committed, and — while leader — the per-follower `next_index`/`match_index`
@@ -255,6 +359,8 @@ pub struct RaftNode {
   /// lost its quorum.
   leader_hint: Option<HostId>,
   contacts: BTreeSet<HostId>,
+  read_context: u64,
+  read_round: Option<ReadRound>,
   log: Vec<LogEntry>,
   commit_index: u64,
   next_index: BTreeMap<HostId, u64>,
@@ -265,7 +371,9 @@ pub struct RaftNode {
 }
 
 impl RaftNode {
-  /// A fresh node: a follower at term zero with an empty log, among `voters` (which includes itself).
+  /// A fresh node at term zero with an empty log. It is a non-voting learner when `voters` does
+  /// not contain its id; only a replicated membership change may then admit it (§4.8, AUD-07).
+  /// The caller must never use this constructor to recreate a state-losing voter under its old id.
   pub fn new(id: HostId, voters: Vec<HostId>) -> RaftNode {
     RaftNode {
       id,
@@ -279,6 +387,8 @@ impl RaftNode {
       has_leader: false,
       leader_hint: None,
       contacts: BTreeSet::new(),
+      read_context: 0,
+      read_round: None,
       log: Vec::new(),
       commit_index: 0,
       next_index: BTreeMap::new(),
@@ -289,36 +399,39 @@ impl RaftNode {
     }
   }
 
-  /// A node recovered after a restart from its persisted term, vote and `log` (Raft persists
-  /// `currentTerm`, `votedFor` and the log before responding). It comes back a follower — a restart
-  /// never resumes as leader or candidate — with nothing yet known committed.
-  pub fn recovered(
-    id: HostId,
-    voters: Vec<HostId>,
-    current_term: u64,
-    voted_for: Option<HostId>,
-    log: Vec<LogEntry>,
-  ) -> RaftNode {
-    RaftNode {
-      id,
-      voters,
-      joint: None,
-      current_term,
-      voted_for,
-      role: Role::Follower,
-      votes: BTreeSet::new(),
-      pre_votes: BTreeSet::new(),
-      has_leader: false,
-      leader_hint: None,
-      contacts: BTreeSet::new(),
-      log,
-      commit_index: 0,
-      next_index: BTreeMap::new(),
-      match_index: BTreeMap::new(),
-      snapshot_index: 0,
-      snapshot_term: 0,
-      snapshot_data: Vec::new(),
+  /// The state to publish before acknowledging a changed term, vote, log or snapshot (§4.8).
+  /// Volatile leadership, read rounds, contact evidence and replication progress are excluded.
+  pub fn saved(&self) -> SavedRaft {
+    SavedRaft {
+      id: self.id,
+      base: VoterConfig {
+        voters: self.voters.clone(),
+        joint: self.joint.clone(),
+      },
+      term: self.current_term,
+      voted_for: self.voted_for,
+      log: self.log.clone(),
+      commit_index: self.commit_index,
+      snapshot_index: self.snapshot_index,
+      snapshot_term: self.snapshot_term,
+      snapshot_data: self.snapshot_data.clone(),
     }
+  }
+
+  /// Restores one validated publication as a follower, preserving its vote and committed prefix.
+  /// Unlike reconstructing from a term and a log alone, this also restores compacted membership.
+  pub fn restore(saved: SavedRaft) -> Result<RaftNode, RaftRecoveryError> {
+    saved.validate()?;
+    let mut node = RaftNode::new(saved.id, saved.base.voters);
+    node.joint = saved.base.joint;
+    node.current_term = saved.term;
+    node.voted_for = saved.voted_for;
+    node.log = saved.log;
+    node.commit_index = saved.commit_index;
+    node.snapshot_index = saved.snapshot_index;
+    node.snapshot_term = saved.snapshot_term;
+    node.snapshot_data = saved.snapshot_data;
+    Ok(node)
   }
 
   /// This node's id.
@@ -400,7 +513,8 @@ impl RaftNode {
   /// leader, the pre-vote's term is ahead of its own, and the candidate's log is at least as up-to-date.
   /// Because the term is never touched, a partitioned node's inflated term cannot force a step-down here.
   pub fn on_pre_vote(&self, request: PreVote) -> PreVoteReply {
-    let granted = !self.has_leader
+    let granted = self.is_voter(self.id)
+      && !self.has_leader
       && self.role != Role::Leader
       && request.term > self.current_term
       && self.candidate_log_is_current(request.last_log_index, request.last_log_term);
@@ -434,7 +548,11 @@ impl RaftNode {
   /// voter reaches its own majority here and becomes leader with no messages (the `f = 0` degenerate).
   /// Prefer [`on_election_timeout`](RaftNode::on_election_timeout), which runs the pre-vote round first.
   pub fn start_election(&mut self) -> Vec<RequestVote> {
+    if !self.is_voter(self.id) {
+      return Vec::new();
+    }
     self.current_term = self.current_term.saturating_add(1);
+    self.read_round = None;
     self.role = Role::Candidate;
     self.voted_for = Some(self.id);
     self.votes = BTreeSet::from([self.id]);
@@ -465,7 +583,8 @@ impl RaftNode {
     }
     let not_yet_voted_elsewhere =
       self.voted_for.is_none() || self.voted_for == Some(request.candidate);
-    let granted = request.term == self.current_term
+    let granted = self.is_voter(self.id)
+      && request.term == self.current_term
       && not_yet_voted_elsewhere
       && self.candidate_log_is_current(request.last_log_index, request.last_log_term);
     if granted {
@@ -505,6 +624,7 @@ impl RaftNode {
   fn step_down(&mut self, term: u64) {
     self.current_term = term;
     self.voted_for = None;
+    self.read_round = None;
     self.role = Role::Follower;
     self.leader_hint = None;
     self.votes.clear();
@@ -627,6 +747,7 @@ impl RaftNode {
     }
     let committed = self.committed_config();
     if committed.joint.is_none() && !committed.voters.contains(&self.id) {
+      self.read_round = None;
       self.role = Role::Follower;
       self.has_leader = false;
       self.leader_hint = None;
@@ -805,6 +926,7 @@ impl RaftNode {
     if request.term > self.current_term {
       self.step_down(request.term);
     }
+    self.read_round = None;
     self.role = Role::Follower;
     self.has_leader = true;
     self.leader_hint = Some(request.leader);
@@ -889,6 +1011,7 @@ impl RaftNode {
       .unwrap_or(usize::MAX);
     let entries = self.log.get(from..).unwrap_or(&[]).to_vec();
     Some(AppendEntries {
+      read_context: self.read_round.as_ref().map_or(0, |read| read.context),
       term: self.current_term,
       leader: self.id,
       prev_log_index,
@@ -905,13 +1028,14 @@ impl RaftNode {
   /// carrying on success the last index now matched.
   pub fn on_append_entries(&mut self, request: AppendEntries) -> AppendReply {
     if request.term < self.current_term {
-      return self.append_reply(false, 0);
+      return self.append_reply(false, 0, 0);
     }
     if request.term > self.current_term {
       self.step_down(request.term);
     }
     // A current-term append means a leader exists for our term — defer to it (a candidate steps down)
     // and note the contact, so we refuse pre-votes that would disrupt this leader (§9.6).
+    self.read_round = None;
     self.role = Role::Follower;
     self.has_leader = true;
     self.leader_hint = Some(request.leader);
@@ -920,7 +1044,7 @@ impl RaftNode {
     if request.prev_log_index > 0
       && self.entry_term(request.prev_log_index) != Some(request.prev_log_term)
     {
-      return self.append_reply(false, 0);
+      return self.append_reply(false, 0, request.read_context);
     }
 
     // Append, truncating the first conflicting entry and everything after it.
@@ -941,7 +1065,7 @@ impl RaftNode {
     if request.leader_commit > self.commit_index {
       self.commit_index = request.leader_commit.min(index);
     }
-    self.append_reply(true, index)
+    self.append_reply(true, index, request.read_context)
   }
 
   /// Handles a follower's [`AppendReply`] as the leader (Raft §5.3). A newer term steps us down. On
@@ -954,6 +1078,13 @@ impl RaftNode {
     }
     if self.role != Role::Leader || reply.term != self.current_term {
       return;
+    }
+    if self.all_voters().contains(&reply.follower)
+      && let Some(read) = self.read_round.as_mut()
+      && reply.read_context == read.context
+      && reply.term == read.term
+    {
+      read.confirmed.insert(reply.follower);
     }
     // Any same-term reply proves the follower is reachable this CheckQuorum window.
     self.contacts.insert(reply.follower);
@@ -980,6 +1111,7 @@ impl RaftNode {
     let mut reachable = self.contacts.clone();
     reachable.insert(self.id);
     if !self.is_majority(&reachable) {
+      self.read_round = None;
       self.role = Role::Follower;
       self.has_leader = false;
       self.leader_hint = None;
@@ -987,25 +1119,55 @@ impl RaftNode {
     self.contacts.clear();
   }
 
-  /// The linearizable read index (Raft §6.4): the commit index a read-only query may be served at
-  /// *without appending a log entry*, or `None` when this node cannot safely serve a linearizable read.
-  /// It is safe only when this node is the leader, has committed an entry **in its current term** (so its
-  /// commit index reflects its own term, not one blindly inherited from a predecessor — a fresh leader
-  /// must first commit a no-op), and is in contact with a majority this window (so no newer leader has
-  /// superseded it). The caller waits until it has applied at least this index, then serves the read.
-  pub fn read_index(&self) -> Option<u64> {
-    if self.role != Role::Leader {
+  /// Starts one ReadIndex round after a current-term commit (Raft §6.4; AUD-09). The next
+  /// replication/heartbeat to each voter carries this context. A second concurrent read is refused;
+  /// callers may share a pending round only for reads that started before that round was sent.
+  pub fn begin_read(&mut self) -> Option<u64> {
+    if self.role != Role::Leader
+      || self.entry_term(self.commit_index) != Some(self.current_term)
+      || self.read_round.is_some()
+    {
       return None;
     }
-    if self.entry_term(self.commit_index) != Some(self.current_term) {
+    self.read_context = self.read_context.checked_add(1)?;
+    self.read_round = Some(ReadRound {
+      context: self.read_context,
+      term: self.current_term,
+      index: self.commit_index,
+      config: self.effective_config(),
+      confirmed: BTreeSet::from([self.id]),
+    });
+    Some(self.read_context)
+  }
+
+  /// Completes `context` only after a majority has answered that read's round in the same term and
+  /// voter configuration. The caller applies through the returned index before answering the read.
+  /// The result is consumed: neither this context nor its old replies can authorize a later read.
+  pub fn read_index(&mut self, context: u64) -> Option<u64> {
+    let read = self.read_round.as_ref()?;
+    if read.context != context
+      || self.role != Role::Leader
+      || read.term != self.current_term
+      || read.config != self.effective_config()
+      || !self.is_majority(&read.confirmed)
+    {
       return None;
     }
-    let mut reachable = self.contacts.clone();
-    reachable.insert(self.id);
-    if !self.is_majority(&reachable) {
-      return None;
+    let index = read.index;
+    self.read_round = None;
+    Some(index)
+  }
+
+  /// Releases the single pending read after its caller times out or is cancelled (§4.3). A stale
+  /// cancellation cannot remove another caller's newer round.
+  pub fn cancel_read(&mut self, context: u64) {
+    if self
+      .read_round
+      .as_ref()
+      .is_some_and(|read| read.context == context)
+    {
+      self.read_round = None;
     }
-    Some(self.commit_index)
   }
 
   /// Begins a membership change to `new_voters` (Raft §6 joint consensus): the node enters a **joint
@@ -1024,6 +1186,7 @@ impl RaftNode {
     {
       return false;
     }
+    self.read_round = None;
     // Append the joint configuration `C_old,new` as a log entry — it takes effect on append (§6), so the
     // very next quorum check needs a majority of both sets. It replicates like any entry.
     self.log.push(LogEntry::configuration(
@@ -1052,6 +1215,7 @@ impl RaftNode {
     if self.role != Role::Leader || self.latest_config_index() > self.commit_index {
       return false;
     }
+    self.read_round = None;
     // Append the final configuration `C_new` (§6): the change is done once this commits.
     self.log.push(LogEntry::configuration(
       self.current_term,
@@ -1072,8 +1236,9 @@ impl RaftNode {
   }
 
   /// A follower's reply with this node's current term.
-  fn append_reply(&self, success: bool, match_index: u64) -> AppendReply {
+  fn append_reply(&self, success: bool, match_index: u64, read_context: u64) -> AppendReply {
     AppendReply {
+      read_context,
       follower: self.id,
       term: self.current_term,
       success,
@@ -1129,6 +1294,32 @@ mod tests {
   const D: HostId = HostId(4);
   const E: HostId = HostId(5);
 
+  /// A fixture with an explicitly uncommitted, uncompacted prefix. Production recovery takes
+  /// the complete SavedRaft value, including snapshot and commit position.
+  fn node_with_uncommitted_log(
+    id: HostId,
+    voters: Vec<HostId>,
+    term: u64,
+    voted_for: Option<HostId>,
+    log: Vec<LogEntry>,
+  ) -> RaftNode {
+    RaftNode::restore(SavedRaft {
+      id,
+      base: VoterConfig {
+        voters,
+        joint: None,
+      },
+      term,
+      voted_for,
+      log,
+      commit_index: 0,
+      snapshot_index: 0,
+      snapshot_term: 0,
+      snapshot_data: Vec::new(),
+    })
+    .expect("a valid fixture prefix")
+  }
+
   fn request_from(candidate: HostId, term: u64) -> RequestVote {
     RequestVote {
       term,
@@ -1176,8 +1367,128 @@ mod tests {
     false
   }
 
-  /// A single-voter group elects itself: an election reaches the majority of one at once, so the node is
-  /// leader for term 1 with no messages to send (the `f = 0` degenerate).
+  /// AC-8.1, §4.8, AUD-07: a damaged retained prefix cannot become a voter; a complete
+  /// wire round-trip preserves the vote and rejects a competing candidate in the same term.
+  #[test]
+  fn damaged_voter_publications_are_refused_before_voting() {
+    use slates_wire::Wire;
+    let mut voter = RaftNode::new(A, vec![A, B, C]);
+    assert!(
+      voter
+        .on_request_vote(RequestVote {
+          term: 7,
+          candidate: B,
+          last_log_index: 0,
+          last_log_term: 0,
+        })
+        .granted
+    );
+    let saved = voter.saved();
+    let bytes = saved.to_bytes();
+    for end in 0..bytes.len() {
+      assert!(SavedRaft::from_bytes(&bytes[..end]).is_err());
+    }
+    let mut recovered = RaftNode::restore(SavedRaft::from_bytes(&bytes).unwrap()).unwrap();
+    assert!(
+      !recovered
+        .on_request_vote(RequestVote {
+          term: 7,
+          candidate: C,
+          last_log_index: 0,
+          last_log_term: 0,
+        })
+        .granted
+    );
+    let mut damaged = saved.clone();
+    damaged.commit_index = 1;
+    assert_eq!(
+      RaftNode::restore(damaged).err(),
+      Some(RaftRecoveryError::InvalidCommitIndex)
+    );
+    let mut damaged = saved.clone();
+    damaged.base.voters.push(A);
+    assert_eq!(
+      RaftNode::restore(damaged).err(),
+      Some(RaftRecoveryError::InvalidVoters)
+    );
+    let mut damaged = saved.clone();
+    damaged.snapshot_index = 1;
+    assert_eq!(
+      RaftNode::restore(damaged).err(),
+      Some(RaftRecoveryError::InvalidSnapshot)
+    );
+    let mut damaged = saved;
+    damaged.log.push(LogEntry::command(8, vec![1]));
+    assert_eq!(
+      RaftNode::restore(damaged).err(),
+      Some(RaftRecoveryError::InvalidLogTerm)
+    );
+  }
+
+  /// AC-8.1, §4.8, AUD-07: retain a vote, compact a committed command and change membership.
+  /// Restore the prefix, snapshot and effective voters together, and refuse a competing vote.
+  #[test]
+  fn recovery_preserves_the_vote_snapshot_and_membership_with_the_log() {
+    let mut node = RaftNode::new(A, vec![A]);
+    node.start_election();
+    assert!(node.append_command(b"committed before restart".to_vec()));
+    assert!(node.compact(1, b"state at index one".to_vec()));
+    assert!(node.begin_membership_change(vec![A, B]));
+    let mut follower = RaftNode::new(B, vec![A]);
+    // Catch up from the compacted prefix before accepting the joint configuration.
+    let snapshot = node.install_snapshot_for(B).unwrap();
+    node.on_install_snapshot_reply(follower.on_install_snapshot(snapshot));
+    let append = node.replicate_to(B).unwrap();
+    node.on_append_reply(follower.on_append_entries(append));
+    let saved = node.saved();
+    let restored = RaftNode::restore(saved.clone()).unwrap();
+    assert_eq!(restored.saved(), saved);
+    assert_eq!(restored.role(), Role::Follower);
+    assert!(!restored.is_leader());
+    let mut restored = restored;
+    assert!(
+      !restored
+        .on_request_vote(RequestVote {
+          term: 1,
+          candidate: B,
+          last_log_index: 2,
+          last_log_term: 1,
+        })
+        .granted,
+      "the recovered self-vote must still exclude another candidate"
+    );
+    assert_eq!(restored.all_voters(), vec![A, B]);
+  }
+
+  /// AC-8.1, §4.8 restart-as-join; AUD-07: a fresh replacement is outside the existing voter
+  /// configuration. It may receive replication, but neither a vote request nor direct campaign
+  /// entrypoint may let it supply a vote before a membership entry admits it.
+  #[test]
+  fn a_learner_neither_grants_votes_nor_campaigns_before_admission() {
+    let mut learner = RaftNode::new(D, vec![A, B, C]);
+    let request = RequestVote {
+      term: 7,
+      candidate: A,
+      last_log_index: 0,
+      last_log_term: 0,
+    };
+    assert!(!learner.on_request_vote(request).granted);
+    assert!(
+      !learner
+        .on_pre_vote(PreVote {
+          term: 8,
+          candidate: A,
+          last_log_index: 0,
+          last_log_term: 0,
+        })
+        .granted
+    );
+    assert!(learner.start_election().is_empty());
+    assert_eq!(learner.role(), Role::Follower);
+  }
+
+  /// A single-voter group elects itself: its vote reaches a majority of one, so it becomes
+  /// leader for term 1 without sending messages (the `f = 0` degenerate).
   #[test]
   fn a_single_voter_elects_itself_leader() {
     let mut node = RaftNode::new(A, vec![A]);
@@ -1265,7 +1576,7 @@ mod tests {
   /// candidate learns it is behind.
   #[test]
   fn a_stale_term_request_is_denied() {
-    let mut node = RaftNode::recovered(A, vec![A, B, C], 5, None, Vec::new());
+    let mut node = node_with_uncommitted_log(A, vec![A, B, C], 5, None, Vec::new());
     let reply = node.on_request_vote(request_from(B, 3));
     assert!(!reply.granted, "a term-3 request is stale at term 5");
     assert_eq!(reply.term, 5, "the reply reports the current term");
@@ -1277,7 +1588,7 @@ mod tests {
   #[test]
   fn a_less_up_to_date_candidate_is_denied() {
     // Our last log entry is at index 3, term 2.
-    let mut node = RaftNode::recovered(A, vec![A, B, C], 2, None, log_of(&[1, 1, 2]));
+    let mut node = node_with_uncommitted_log(A, vec![A, B, C], 2, None, log_of(&[1, 1, 2]));
 
     // A candidate at the same term but a shorter log is denied.
     let behind = RequestVote {
@@ -1292,7 +1603,7 @@ mod tests {
     );
 
     // A fresh node at the same state grants a candidate with a later last-log term despite a shorter log.
-    let mut node = RaftNode::recovered(A, vec![A, B, C], 2, None, log_of(&[1, 1, 2]));
+    let mut node = node_with_uncommitted_log(A, vec![A, B, C], 2, None, log_of(&[1, 1, 2]));
     let ahead = RequestVote {
       term: 3,
       candidate: C,
@@ -1359,7 +1670,7 @@ mod tests {
   #[test]
   fn a_mismatched_follower_is_repaired_by_backing_up() {
     // A leader for a fresh term over a two-entry log, plus one new current-term entry.
-    let mut leader = RaftNode::recovered(A, vec![A, B, C], 3, None, log_of(&[3, 3]));
+    let mut leader = node_with_uncommitted_log(A, vec![A, B, C], 3, None, log_of(&[3, 3]));
     leader.start_election(); // term 4
     leader.on_vote_reply(VoteReply {
       voter: B,
@@ -1370,7 +1681,7 @@ mod tests {
     leader.append_command(b"cfg-new".to_vec()); // index 3, term 4
 
     // A follower with a single conflicting entry (term 1) at index 1.
-    let mut follower = RaftNode::recovered(B, vec![A, B, C], 1, None, log_of(&[1]));
+    let mut follower = node_with_uncommitted_log(B, vec![A, B, C], 1, None, log_of(&[1]));
 
     let first = leader.replicate_to(B).expect("append");
     let reply = follower.on_append_entries(first);
@@ -1402,7 +1713,7 @@ mod tests {
   #[test]
   fn an_earlier_term_entry_is_not_committed_by_count_alone() {
     // A leader for term 5 holding one entry left over from term 2 (index 1).
-    let mut leader = RaftNode::recovered(A, vec![A, B, C], 4, None, log_of(&[2]));
+    let mut leader = node_with_uncommitted_log(A, vec![A, B, C], 4, None, log_of(&[2]));
     leader.start_election(); // term 5
     leader.on_vote_reply(VoteReply {
       voter: B,
@@ -1412,7 +1723,7 @@ mod tests {
     assert!(leader.is_leader());
 
     // A majority replicates the old (term-2) entry — it must NOT be committed by count alone.
-    let mut follower = RaftNode::recovered(B, vec![A, B, C], 5, None, Vec::new());
+    let mut follower = node_with_uncommitted_log(B, vec![A, B, C], 5, None, Vec::new());
     let append = leader.replicate_to(B).expect("append");
     let reply = follower.on_append_entries(append);
     leader.on_append_reply(reply);
@@ -1453,6 +1764,7 @@ mod tests {
     let mut node = RaftNode::new(B, vec![A, B, C]);
     // B hears a heartbeat from leader A at term 1.
     node.on_append_entries(AppendEntries {
+      read_context: 0,
       term: 1,
       leader: A,
       prev_log_index: 0,
@@ -1510,7 +1822,7 @@ mod tests {
   #[test]
   fn a_behind_candidate_is_refused_a_pre_vote() {
     // A leaderless peer at term 5.
-    let node = RaftNode::recovered(A, vec![A, B, C], 5, None, Vec::new());
+    let node = node_with_uncommitted_log(A, vec![A, B, C], 5, None, Vec::new());
     let reply = node.on_pre_vote(PreVote {
       term: 3,
       candidate: B,
@@ -1558,6 +1870,7 @@ mod tests {
     let mut node = RaftNode::new(B, vec![A, B, C]);
     assert_eq!(node.leader(), None);
     node.on_append_entries(AppendEntries {
+      read_context: 0,
       term: 1,
       leader: A,
       prev_log_index: 0,
@@ -1585,6 +1898,7 @@ mod tests {
 
     // A follower replies within the new window, so the leader is in contact with a majority.
     leader.on_append_reply(AppendReply {
+      read_context: 0,
       follower: B,
       term: leader.term(),
       success: true,
@@ -1617,14 +1931,17 @@ mod tests {
   fn a_leader_serves_a_read_index_after_committing_in_its_term() {
     let mut leader = elected_leader(A, vec![A]);
     assert_eq!(
-      leader.read_index(),
+      leader.begin_read(),
       None,
       "no read before a current-term commit"
     );
 
     leader.append_command(b"cfg-1".to_vec()); // commits at once (f = 0)
+    let read = leader
+      .begin_read()
+      .expect("current-term commit starts a read");
     assert_eq!(
-      leader.read_index(),
+      leader.read_index(read),
       Some(1),
       "the read index is the current commit index"
     );
@@ -1633,8 +1950,107 @@ mod tests {
   /// A non-leader never provides a read index — only the leader may serve a linearizable read.
   #[test]
   fn a_non_leader_has_no_read_index() {
-    let follower = RaftNode::new(B, vec![A, B, C]);
-    assert_eq!(follower.read_index(), None);
+    let mut follower = RaftNode::new(B, vec![A, B, C]);
+    assert_eq!(follower.begin_read(), None);
+  }
+
+  /// AC-2.5, §4.8 ReadSafety; AUD-09: after A's commit, isolate A and elect B, then commit a
+  /// later value through B and C. A has not run CheckQuorum yet. Its old contacts must not authorize
+  /// a new read of the superseded value.
+  #[test]
+  fn historical_contacts_cannot_confirm_a_read_after_a_new_leader_commits() {
+    let mut old = elected_leader(A, vec![A, B, C]);
+    let mut successor = RaftNode::new(B, vec![A, B, C]);
+    let mut third = RaftNode::new(C, vec![A, B, C]);
+    old.append_command(b"old".to_vec());
+    old.on_append_reply(successor.on_append_entries(old.replicate_to(B).unwrap()));
+    let election = successor.start_election();
+    successor.on_vote_reply(third.on_request_vote(election[0]));
+    assert!(successor.is_leader());
+    successor.append_command(b"new".to_vec());
+    successor.on_append_reply(third.on_append_entries(successor.replicate_to(C).unwrap()));
+    successor.on_append_reply(third.on_append_entries(successor.replicate_to(C).unwrap()));
+    assert_eq!(successor.commit_index(), 2);
+    let read = old
+      .begin_read()
+      .expect("old leader has not stepped down yet");
+    assert_eq!(
+      old.read_index(read),
+      None,
+      "pre-read contacts cannot prove current read authority"
+    );
+  }
+
+  /// AC-2.5, §4.8 ReadSafety; AUD-09: old heartbeats and completed read rounds cannot confirm a
+  /// new read. The follower's reply must echo the new context; a result is consumed exactly once.
+  #[test]
+  fn each_read_needs_its_own_confirmation_round() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    let mut follower = RaftNode::new(B, vec![A, B, C]);
+    leader.append_command(b"value".to_vec());
+    let old = follower.on_append_entries(leader.replicate_to(B).unwrap());
+    leader.on_append_reply(old);
+    let first = leader.begin_read().unwrap();
+    assert_eq!(
+      leader.begin_read(),
+      None,
+      "one pending round is the admission bound"
+    );
+    leader.on_append_reply(old);
+    assert_eq!(leader.read_index(first), None);
+    let confirmed = follower.on_append_entries(leader.replicate_to(B).unwrap());
+    leader.on_append_reply(confirmed);
+    assert_eq!(leader.read_index(first), Some(1));
+    assert_eq!(
+      leader.read_index(first),
+      None,
+      "a proof cannot authorize another read"
+    );
+    let second = leader.begin_read().unwrap();
+    leader.on_append_reply(confirmed);
+    leader.cancel_read(first);
+    assert_eq!(
+      leader.read_index(second),
+      None,
+      "old replies and cancellation cannot complete the new round"
+    );
+    leader.on_append_reply(follower.on_append_entries(leader.replicate_to(B).unwrap()));
+    assert_eq!(leader.read_index(second), Some(1));
+  }
+
+  /// AC-2.5, §4.8 ReadSafety; AUD-09: two voters of five are a minority even with duplicate or
+  /// foreign replies. Changing the voter configuration cancels the pending proof.
+  #[test]
+  fn read_confirmation_counts_distinct_current_voters_and_cancels_on_reconfiguration() {
+    let voters = vec![A, B, C, D, E];
+    let mut leader = elected_leader(A, voters.clone());
+    leader.append_command(b"value".to_vec());
+    let mut second = RaftNode::new(B, voters.clone());
+    let mut third = RaftNode::new(C, voters);
+    leader.on_append_reply(second.on_append_entries(leader.replicate_to(B).unwrap()));
+    leader.on_append_reply(third.on_append_entries(leader.replicate_to(C).unwrap()));
+    let read = leader.begin_read().unwrap();
+    let reply = second.on_append_entries(leader.replicate_to(B).unwrap());
+    leader.on_append_reply(reply);
+    leader.on_append_reply(reply);
+    leader.on_append_reply(AppendReply {
+      follower: HostId(999),
+      ..reply
+    });
+    assert_eq!(leader.read_index(read), None);
+    assert!(leader.begin_membership_change(vec![A, B, C]));
+    leader.on_append_reply(third.on_append_entries(leader.replicate_to(C).unwrap()));
+    assert_eq!(
+      leader.read_index(read),
+      None,
+      "the old configuration's proof is cancelled"
+    );
+    let replacement = leader.begin_read().unwrap();
+    leader.cancel_read(replacement);
+    assert!(
+      leader.begin_read().is_some(),
+      "a cancelled caller releases the round"
+    );
   }
 
   /// The §6.4 safety: a leader that has only an inherited (earlier-term) commit index cannot serve a
@@ -1643,7 +2059,7 @@ mod tests {
   #[test]
   fn a_leader_without_a_current_term_commit_has_no_read_index() {
     // Elected at a fresh term over an old-term log; recovered resets the commit index to zero.
-    let mut leader = RaftNode::recovered(A, vec![A, B, C], 3, None, log_of(&[3]));
+    let mut leader = node_with_uncommitted_log(A, vec![A, B, C], 3, None, log_of(&[3]));
     leader.start_election(); // term 4
     leader.on_vote_reply(VoteReply {
       voter: B,
@@ -1652,14 +2068,14 @@ mod tests {
     });
     assert!(leader.is_leader());
     assert_eq!(
-      leader.read_index(),
+      leader.begin_read(),
       None,
       "no read until a term-4 entry commits"
     );
 
     // Commit a current-term entry with a majority (a follower that already holds the term-3 prefix).
     leader.append_command(b"cfg-4".to_vec());
-    let mut follower = RaftNode::recovered(B, vec![A, B, C], 4, None, log_of(&[3]));
+    let mut follower = node_with_uncommitted_log(B, vec![A, B, C], 4, None, log_of(&[3]));
     let append = leader.replicate_to(B).expect("append");
     let reply = follower.on_append_entries(append);
     assert!(
@@ -1667,8 +2083,13 @@ mod tests {
       "the follower with the matching prefix accepts the append"
     );
     leader.on_append_reply(reply);
+    let read = leader
+      .begin_read()
+      .expect("current-term commit starts a read");
+    assert_eq!(leader.read_index(read), None);
+    leader.on_append_reply(follower.on_append_entries(leader.replicate_to(B).unwrap()));
     assert_eq!(
-      leader.read_index(),
+      leader.read_index(read),
       Some(2),
       "a term-4 commit enables the read at index 2"
     );
@@ -1690,6 +2111,7 @@ mod tests {
     leader.append_command(b"x".to_vec());
     let term = leader.term();
     let reply = |follower| AppendReply {
+      read_context: 0,
       follower,
       term,
       success: true,
@@ -1727,6 +2149,7 @@ mod tests {
     let term = leader.term();
     for follower in [B, C, D] {
       leader.on_append_reply(AppendReply {
+        read_context: 0,
         follower,
         term,
         success: true,
@@ -1761,6 +2184,7 @@ mod tests {
     assert!(leader.begin_membership_change(vec![B, C]));
     let term = leader.term();
     let reply = |follower, match_index| AppendReply {
+      read_context: 0,
       follower,
       term,
       success: true,
@@ -1817,6 +2241,7 @@ mod tests {
     );
     let term = leader.term();
     let reply = |follower, match_index| AppendReply {
+      read_context: 0,
       follower,
       term,
       success: true,
@@ -1849,6 +2274,7 @@ mod tests {
     assert!(leader.begin_membership_change(vec![A, B]));
     let term = leader.term();
     let reply = |follower, match_index| AppendReply {
+      read_context: 0,
       follower,
       term,
       success: true,
@@ -1945,7 +2371,7 @@ mod tests {
   #[test]
   fn replication_works_across_a_snapshot_boundary() {
     // A three-node leader with a committed three-entry log (recovered so the log exists), elected fresh.
-    let mut leader = RaftNode::recovered(A, vec![A, B, C], 2, None, log_of(&[1, 1, 2]));
+    let mut leader = node_with_uncommitted_log(A, vec![A, B, C], 2, None, log_of(&[1, 1, 2]));
     leader.start_election(); // term 3
     leader.on_vote_reply(VoteReply {
       voter: B,
@@ -1956,7 +2382,7 @@ mod tests {
     leader.append_command(b"t3".to_vec()); // index 4, term 3
 
     // Commit index 4 by replicating to a follower that holds the term-1/term-2 prefix.
-    let mut follower = RaftNode::recovered(B, vec![A, B, C], 3, None, log_of(&[1, 1, 2]));
+    let mut follower = node_with_uncommitted_log(B, vec![A, B, C], 3, None, log_of(&[1, 1, 2]));
     let append = leader.replicate_to(B).expect("append");
     let reply = follower.on_append_entries(append);
     assert!(reply.success);
@@ -1989,7 +2415,7 @@ mod tests {
   #[test]
   fn a_follower_below_the_snapshot_is_caught_up_by_install_snapshot() {
     // A term-3 leader with a four-entry committed log, compacted up to index 3 with some snapshot state.
-    let mut leader = RaftNode::recovered(A, vec![A, B, C], 2, None, log_of(&[1, 1, 2]));
+    let mut leader = node_with_uncommitted_log(A, vec![A, B, C], 2, None, log_of(&[1, 1, 2]));
     leader.start_election(); // term 3
     leader.on_vote_reply(VoteReply {
       voter: B,
@@ -1997,7 +2423,7 @@ mod tests {
       granted: true,
     });
     leader.append_command(b"t3".to_vec()); // index 4, term 3
-    let mut follower_b = RaftNode::recovered(B, vec![A, B, C], 3, None, log_of(&[1, 1, 2]));
+    let mut follower_b = node_with_uncommitted_log(B, vec![A, B, C], 3, None, log_of(&[1, 1, 2]));
     let append = leader.replicate_to(B).expect("append");
     let reply = follower_b.on_append_entries(append);
     leader.on_append_reply(reply);
@@ -2063,6 +2489,7 @@ mod tests {
     // A conflicting entry at index 1 from a newer term truncates the configuration entry, reverting the
     // configuration to the base.
     let conflicting = AppendEntries {
+      read_context: 0,
       term: follower.term() + 1,
       leader: A,
       prev_log_index: 0,

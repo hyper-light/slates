@@ -7,8 +7,8 @@ fleet"). What it makes, and deliberately does not make:
 
 - **A StatefulSet, `podManagementPolicy: Parallel`, no `volumeClaimTemplates`.** slates has no on-disk
   database (R1: disk is written only inside a granted landing). A node's registers live in RAM,
-  replicated to `2f + 1` holders; a node that loses its RAM comes back, rejoins, and is re-filled. The
-  fleet forms as its pods come up in parallel — a peer not yet listening is dialed again each period.
+  replicated to `2f + 1` holders; a node that loses its RAM comes back, rejoins, and is re-filled. After explicit first-time bootstrap, peers join through the surviving consensus groups.
+  A peer not yet listening is dialed again each period.
 - **A headless Service** (`clusterIP: None`, not-ready addresses published) giving every pod its DNS
   name `<release>-N.<release>.<namespace>.svc.<clusterDomain>`, which is the manifest's address for node
   N. The daemon resolves it at every dial, so a rescheduled pod is found at its new IP. Nothing sits in
@@ -39,8 +39,8 @@ fleet"). What it makes, and deliberately does not make:
   builds `x86_64` and `aarch64` Linux). Push it, or for kind, `kind load docker-image`.
 - One identity per pod: a DER certificate carrying the fleet's TLS name (`fleet.name`, default
   `slates-fleet`) as a subject alternative name, and its DER private key (PKCS#8, SEC1 or PKCS#1). The
-  chart never generates one: an identity that changed on `helm upgrade` would change the node's member
-  id (derived from its certificate) and every peer's pin. Provision them from your own authority, or, for
+  chart never generates one: changing it on `helm upgrade` would change the node's stable anchor
+  and every peer's pin. Its live voting identity changes on every boot. Provision certificates from your own authority, or, for
   a test cluster, mint self-signed ones:
 
   ```
@@ -68,6 +68,7 @@ helm install slates deploy/helm/slates \
   --set replicas=3 --set resources.memory=4Gi --set resources.cpu=4 \
   -f identities.yaml
 kubectl -n slates rollout status statefulset/slates
+kubectl -n slates exec slates-0 -- /slates bootstrap root
 kubectl -n slates exec slates-0 -- /slates status
 ```
 
@@ -78,11 +79,25 @@ kubectl -n slates exec slates-0 -- /slates status
 `fleet.resolve` on a shard means a peer's DNS name did not resolve at that dial — a pod not yet created,
 or a name the cluster's DNS does not serve.
 
+Bootstrap once on one node of a **new** deployment. Do not place the command in pod startup,
+readiness, an init container or a recurring controller action. For a multi-region manifest,
+bootstrap the root in its first region, then run `slates bootstrap region` once in each additional
+region after root membership includes it. Replacement pods join automatically with fresh member
+ids when the relevant voting quorum survives. The CLI binds bootstrap to the member id it read;
+a restart during that operation refuses the old request.
+
+A successful `status` proves the daemon answers, not that consensus is initialized. Writes return
+`ConsensusNotInitialized` until regional admission. Raft state is currently process-local even
+when the anchor retains volume data. Losing a voter quorum requires explicit operator recovery;
+re-running bootstrap does not recover the previous group. The present root has one voter per
+region, so losing the sole representative in a single-region deployment loses its root quorum.
+See the [AUD-07 report](bugs/2026-09-14-raft-voter-state-loss.md) for tested scope and remaining limits.
+
 Values of note (`deploy/helm/slates/values.yaml` states each one's derivation or policy):
 
 | Value | Meaning |
 |---|---|
-| `replicas` | The fleet's size; `f` is derived from it. Three survive one death, five survive two. |
+| `replicas` | The fleet's size; `f` is derived from it. Three provide regional `f = 1`, five `f = 2`; root-quorum limits are described above. |
 | `resources.memory`, `resources.cpu` | Per-node bounds, requests equal to limits. The daemon derives its arenas and shard count from them. |
 | `fleet.basePort` | The first node's UDP base port; node N uses `basePort + 2N` and the next. |
 | `fleet.durability` | Optional: the operator's accepted coincident-loss probability under a stated failure count ([cli.md](cli.md)). |
@@ -97,15 +112,18 @@ helm upgrade slates deploy/helm/slates --reuse-values --set replicas=5 -f identi
 ```
 
 The manifest ConfigMap is re-rendered with five nodes at `f = 2` and every pod restarts on it (the
-StatefulSet's checksum annotation); the fleet re-forms as the pods come up. Scaling back to three retires
-the two removed members the same way. Every scale is a configuration-group membership change (D-14's
-cold path), never a per-write event.
+StatefulSet's checksum annotation). Each replacement must join and reach committed voter membership
+before the rollout loses another required voter. Pod readiness currently checks only `status` and
+does not enforce this barrier. The single-region root also has only one voter. Consequently this
+rolling-upgrade command is not yet a safe automated scale procedure; the KIND scale lane proves
+fresh installations at each size, not rolling consensus recovery. Do not use repeated bootstrap
+to conceal a lost quorum.
 
 ## What a pod restart means
 
 A pod that is deleted or rescheduled loses its RAM: its volumes' heads are taken over by the surviving
 holders (the SIGKILL takeover of §4.8) and served from there; it comes back under its name, is admitted
-by its peers on contact, and holds nothing until re-replication fills it. The KIND lane
+by its peers on contact when the relevant quorums survive, and holds nothing until re-replication fills it. The KIND lane
 ([wip/kind-lane.md](wip/kind-lane.md)) records this flow on real pods with its numbers.
 
 ## Not in the chart

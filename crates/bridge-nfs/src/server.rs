@@ -15,9 +15,9 @@ use crate::mount::{
 use crate::multi::NfsService;
 use crate::portmap::{PMAPPROC_GETPORT, PMAPPROC_NULL, PORTMAP_PROGRAM, getport_reply};
 use crate::procedures::NFS_PROGRAM;
-use crate::rpc::{AcceptStatus, RpcError, parse_call};
+use crate::rpc::{AcceptStatus, RecordReader, parse_call};
 use crate::xdr::{XdrReader, XdrWriter};
-use crate::{read_record, reply_bytes, write_record};
+use crate::{reply_bytes, write_record};
 
 use slates_rt::RtError;
 use slates_rt::tcp::TcpStream;
@@ -72,10 +72,11 @@ pub fn serve_call(
 /// risking a desynchronised stream.
 pub fn serve_connection<S: Read + Write>(stream: &mut S, service: &mut dyn NfsService, port: u16) {
   let mut buffer: Vec<u8> = Vec::new();
+  let mut records = RecordReader::default();
   let mut chunk = [0u8; RECORD_READ_CHUNK];
   loop {
-    match read_record(&buffer) {
-      Ok((body, consumed)) => {
+    match records.read(&buffer) {
+      Ok((Some(body), consumed)) => {
         let reply = match parse_call(&body) {
           Ok((call, mut args)) => {
             let (status, results) =
@@ -89,10 +90,13 @@ pub fn serve_connection<S: Read + Write>(stream: &mut S, service: &mut dyn NfsSe
         }
         buffer.drain(..consumed);
       }
-      Err(RpcError::Incomplete) => match stream.read(&mut chunk) {
-        Ok(0) | Err(_) => return,
-        Ok(n) => buffer.extend_from_slice(&chunk[..n]),
-      },
+      Ok((None, consumed)) => {
+        buffer.drain(..consumed);
+        match stream.read(&mut chunk) {
+          Ok(0) | Err(_) => return,
+          Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+        }
+      }
       Err(_) => return,
     }
   }
@@ -114,10 +118,11 @@ pub async fn serve_connection_async(
   port: u16,
 ) -> Result<(), RtError> {
   let mut buffer: Vec<u8> = Vec::new();
+  let mut records = RecordReader::default();
   let mut chunk = [0u8; RECORD_READ_CHUNK];
   loop {
-    match read_record(&buffer) {
-      Ok((body, consumed)) => {
+    match records.read(&buffer) {
+      Ok((Some(body), consumed)) => {
         let reply = match parse_call(&body) {
           Ok((call, mut args)) => {
             let (status, results) =
@@ -129,7 +134,8 @@ pub async fn serve_connection_async(
         stream.write_all(&write_record(&reply)).await?;
         buffer.drain(..consumed);
       }
-      Err(RpcError::Incomplete) => {
+      Ok((None, consumed)) => {
+        buffer.drain(..consumed);
         let read = stream.read(&mut chunk).await?;
         if read == 0 {
           return Ok(());

@@ -108,7 +108,16 @@ pub fn run_on(
 pub struct CrossShardCall<T> {
   id: Option<u64>,
   ready: Option<Option<T>>,
-  _result: PhantomData<fn() -> T>,
+  // The registration belongs to this thread; neither polling nor dropping may migrate it.
+  _thread: PhantomData<*const ()>,
+}
+
+impl<T> Drop for CrossShardCall<T> {
+  fn drop(&mut self) {
+    if let Some(id) = self.id.take() {
+      forget(id);
+    }
+  }
 }
 
 // The call holds no self-reference (an id, an optional ready value, a marker), so moving it is sound.
@@ -144,25 +153,26 @@ impl<T: 'static> Future for CrossShardCall<T> {
   }
 }
 
-/// Runs `work` on `shard`'s state and returns the future of its result on this shard (`origin`) — the
-/// closure runs directly when `shard` is this shard. The spawn is refused typed at the target's admission
+/// Runs `work` on `shard` and returns its result on this shard (`origin`). The closure borrows
+/// shard state only as needed; the NFS dispatcher may take several short borrows. On the same shard
+/// the closure runs directly. The spawn is refused typed at the target's admission
 /// bound; await the result through [`call_within`], which bounds the wait.
 pub fn call_on<T: Send + 'static>(
   origin: u16,
   shard: u16,
-  work: impl FnOnce(&mut ShardState) -> T + Send + 'static,
+  work: impl FnOnce() -> Option<T> + Send + 'static,
 ) -> Result<CrossShardCall<T>, RtError> {
   if shard == origin {
     return Ok(CrossShardCall {
       id: None,
-      ready: Some(state::with_state(work)),
-      _result: PhantomData,
+      ready: Some(work()),
+      _thread: PhantomData,
     });
   }
   let id = register();
   let task = SpawnRequest::new(
     Box::pin(async move {
-      let result: Option<T> = state::with_state(work);
+      let result = work();
       let back = SpawnRequest::new(
         Box::pin(async move {
           deliver(id, Box::new(result));
@@ -177,7 +187,7 @@ pub fn call_on<T: Send + 'static>(
     Ok(()) => Ok(CrossShardCall {
       id: Some(id),
       ready: None,
-      _result: PhantomData,
+      _thread: PhantomData,
     }),
     Err(error) => {
       forget(id);
@@ -195,13 +205,18 @@ pub async fn call_within<T: Send + 'static>(
   work: impl FnOnce(&mut ShardState) -> T + Send + 'static,
   deadline_ns: u64,
 ) -> Option<T> {
-  let Ok(call) = call_on(origin, shard, work) else {
+  let Ok(call) = call_on(origin, shard, move || state::with_state(work)) else {
     return None;
   };
-  let id = call.id;
+  within(call, deadline_ns).await
+}
+
+/// Awaits a registered call within the caller's remaining time budget (§4.3). Dropping this future
+/// cancels its registration even when neither the call nor its deadline has completed.
+pub async fn within<T: 'static>(call: CrossShardCall<T>, deadline_ns: u64) -> Option<T> {
   let mut call = std::pin::pin!(call);
   let mut timer = std::pin::pin!(sleep(deadline_ns));
-  let result = std::future::poll_fn(|cx| {
+  std::future::poll_fn(|cx| {
     if let Poll::Ready(result) = call.as_mut().poll(cx) {
       return Poll::Ready(result);
     }
@@ -210,11 +225,46 @@ pub async fn call_within<T: Send + 'static>(
     }
     Poll::Pending
   })
-  .await;
-  if result.is_none()
-    && let Some(id) = id
-  {
-    forget(id);
+  .await
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  struct Released(std::sync::mpsc::SyncSender<()>);
+
+  impl Drop for Released {
+    fn drop(&mut self) {
+      let _ = self.0.try_send(());
+    }
   }
-  result
+
+  /// T-0.3, §4.3 cancellation; AUD-17: drop a pending call before or after its reply arrives.
+  /// Expect the reply's owned resource to be released, including when a late delivery races cancellation.
+  #[test]
+  fn cancelling_a_call_releases_its_reply_before_or_after_delivery() {
+    for delivered_first in [false, true] {
+      let id = register();
+      let call = CrossShardCall::<Released> {
+        id: Some(id),
+        ready: None,
+        _thread: PhantomData,
+      };
+      let (sent, received) = std::sync::mpsc::sync_channel(1);
+      let reply = Box::new(Some(Released(sent)));
+      if delivered_first {
+        deliver(id, reply);
+        drop(call);
+      } else {
+        drop(call);
+        deliver(id, reply);
+      }
+      assert_eq!(
+        received.try_recv(),
+        Ok(()),
+        "cancelled call retained the reply; delivered first: {delivered_first}"
+      );
+    }
+  }
 }
