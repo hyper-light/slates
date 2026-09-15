@@ -278,15 +278,6 @@ impl Demux {
     Accept { demux: self }
   }
 
-  /// Closes the session established under `peer` (its certificate), if any: its reader gets
-  /// [`EndpointError::Closed`] and its slot is released when it drops. For a peer the fleet retired.
-  pub fn close_peer(&self, peer: &CertificateDer<'_>) {
-    let mut inner = self.inner.borrow_mut();
-    if let Some(slot) = inner.by_peer.remove(peer.as_ref()) {
-      inner.close(slot);
-    }
-  }
-
   /// Sends `datagram` to `peer` on the shared socket (every session sends through it directly).
   pub(crate) fn send_to(&self, datagram: &[u8], peer: SocketAddrV4) -> Result<(), EndpointError> {
     self

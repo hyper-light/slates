@@ -756,13 +756,7 @@ pub async fn run_membership(transport: FleetTransport) {
       resolver,
     };
     spawn_detached(
-      probe_peer(
-        identity,
-        probe_dial,
-        local,
-        neighbourhood,
-        (probe_demux, record_demux),
-      ),
+      probe_peer(identity, probe_dial, local, neighbourhood),
       LOOP_SPAWN_REFUSED,
     );
     spawn_detached(
@@ -1245,7 +1239,6 @@ async fn probe_peer(
   dial: PeerDial,
   local: HostId,
   neighbourhood: usize,
-  demuxes: (&'static Demux, &'static Demux),
 ) {
   let PeerDial {
     anchor,
@@ -1326,13 +1319,22 @@ async fn probe_peer(
     let retired = fold_peer_state(&detector, peer.host, origin, &shards);
     if retired {
       // The peer is retired and gone from the direct mesh. Its objects' phase-one recovery is now driven by
-      // the record-ship task (over the surviving candidate holders); the probe session is dropped and the
-      // sessions it dialed into this node are closed so their serve tasks end and free their slots. The task
-      // does **not** end — the top of the loop idles it until the peer rejoins, so a false retirement (or a
-      // restart) heals without a supervisor re-spawning anything.
+      // the record-ship task (over the surviving candidate holders); this node's **outgoing** probe session
+      // to the peer is dropped (below). The task does **not** end — the top of the loop idles it until the
+      // peer rejoins, so a false retirement (or a restart) heals without a supervisor re-spawning anything.
+      //
+      // The peer's **incoming** sessions to this node are deliberately left alone. They are owned by their
+      // serve tasks and reclaimed by the demultiplexer's authenticated-replacement mechanism: when the peer
+      // re-dials (a restart, or a refutation after a false death), its fresh handshake replaces its own prior
+      // session under its certificate (`Endpoint::connection_id` → `Demux::bind`), ending the stale one.
+      // Force-closing them here **by certificate** (`Demux::close_peer`) was the KIND whole-pod-restart bug
+      // (2026-09-14): a restart presents the same operator certificate, so a same-id replacement that had
+      // already re-dialed and bound its serve session was the session `close_peer` tore down — the very
+      // session carrying this node's death belief back for the peer to self-refute. The survivor and the
+      // restart then aged each other out into a circular wait, both `fleet_meshed` vacuously
+      // (`docs/bugs/2026-09-14-retirement-closes-the-same-id-restarts-serve-session.md`). A peer that never
+      // returns holds one idle serve slot per plane, bounded by the roster (banned item 8 holds).
       state::with_state(|s| s.formed_probe_peers.remove(&peer.host));
-      demuxes.0.close_peer(&certificate);
-      demuxes.1.close_peer(&certificate);
       session = None;
       recorded_mesh = false;
     }

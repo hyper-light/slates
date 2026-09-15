@@ -5326,3 +5326,129 @@ fn a_holder_whose_recomputation_mismatches_refuses_the_version_loudly() {
     "the owner reports the version unplaced: {awaited:?}"
   );
 }
+
+/// AC (§4.8 "Recovery", the KIND whole-pod-restart gap of 2026-09-14): a survivor **keeps** a same-id restart
+/// in its membership through its own retirement of the peer's previous incarnation — the rejoin survives the
+/// retirement race. A pod restart returns at generation 0 with the same manifest seed member id its
+/// predecessor held (a restart loses the RAM anchor segment, so the generation cannot advance, R1), so this
+/// is the same-id contrast to [`a_restarted_peer_is_learned_on_contact_under_its_new_generation`] (a higher
+/// generation admitted as a new member). B restarts at the same addresses under the same certificate and
+/// gen-0 id while A still holds its stale probe session to the dead predecessor; A ages that stale session
+/// out and retires B, and **at that moment** B's freshly authenticated serve session at A must not be torn
+/// down — it is what carries A's death belief back so B self-refutes and A re-admits it.
+///
+/// Before the fix (2026-09-14), retirement closed the peer's incoming sessions **by certificate**
+/// (`Demux::close_peer`), which cannot tell the dead predecessor's session from the replacement's under the
+/// same operator certificate: A closed B's new serve session, B's probes then fell on a connection id A no
+/// longer mapped (`unknown_id` climbing), B aged A out in turn, and the two idled in a circular wait — both
+/// reporting `fleet_meshed` **vacuously** (a retired peer is excluded from the mesh check), which is why the
+/// same-address restart test
+/// [`a_stopped_daemons_serve_ports_are_freed_so_its_restart_binds_the_same_addresses`] passed without proving
+/// rejoin. Non-vacuous here: the fleet is shown formed and A shown to know B before the restart, then across a
+/// window spanning a full retirement-and-rejoin cycle A must **keep** B a member and B must keep A.
+#[test]
+fn a_same_id_restart_survives_the_survivors_retirement_of_the_dead_incarnation() {
+  let _serial = serialize_fleet_tests();
+  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let host_a = a.host;
+  let host_b = b.host;
+  let anchor_b = b.origin_anchor;
+  let profile_b = b.profile.clone();
+  let mut b_identities = same_identity(2).into_iter();
+  let (b_first, b_again_id) = (b_identities.next().unwrap(), b_identities.next().unwrap());
+  let b = Node {
+    identity: b_first,
+    ..b
+  };
+  // The restart is the same machine (anchor), the same gen-0 member id, the same certificate, at the same
+  // addresses, on a fresh RAM segment — exactly a pod restart (R1: the anchor segment does not survive it).
+  let b_again = Node {
+    profile: profile_b,
+    host: host_b,
+    origin_anchor: anchor_b,
+    identity: b_again_id,
+    address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, pb_probe),
+    record_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, pb_record),
+  };
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start(a, peer_of_a);
+  let daemon_b = start(b, peer_of_b.clone());
+  let formed = form_and_settle(&[&daemon_a, &daemon_b]);
+  let knew_b = daemon_a
+    .fleet_members()
+    .is_some_and(|members| members.contains(&host_b));
+  daemon_b.stop();
+  let daemon_b_again = start(b_again, peer_of_b);
+
+  // The restart re-forms the mesh; then A ages out its stale probe session to the dead predecessor and
+  // **transiently retires B** — the retirement whose cleanup used to close the restart's freshly-bound serve
+  // session. That session must survive so A echoes its death belief and B self-refutes; A then re-admits B
+  // and the two settle. Mirror the false-death rejoin structure (retire → rejoin → stable), the difference
+  // being a natural retirement of a real restart rather than an injected false death.
+  let reformed = poll_until(&[&daemon_a, &daemon_b_again], FORMATION_DEADLINE, || {
+    daemon_a
+      .fleet_members()
+      .is_some_and(|m| m.contains(&host_b))
+  });
+  // Non-vacuous: A actually retires B (the stale session ages out), so this exercises the retirement whose
+  // cleanup held the bug — not merely a formation that never retired anything.
+  let retired = poll_until(&[&daemon_a, &daemon_b_again], RETIREMENT_DEADLINE, || {
+    daemon_a
+      .fleet_members()
+      .is_some_and(|m| !m.contains(&host_b))
+  });
+  // The restart is re-admitted through the death-echo/self-refutation path (its serve session survived), and
+  // A and B settle into stable mutual knowledge — the state the certificate-keyed close destroyed by tearing
+  // the restart's session down, leaving the two in a circular wait, both `fleet_meshed` vacuously.
+  let rejoined = poll_until(&[&daemon_a, &daemon_b_again], REJOIN_DEADLINE, || {
+    daemon_a
+      .fleet_members()
+      .is_some_and(|m| m.contains(&host_b))
+      && daemon_b_again
+        .fleet_members()
+        .is_some_and(|m| m.contains(&host_a))
+  });
+  let stable = rejoined
+    && holds_for(FORMATION_SETTLE, || {
+      daemon_a
+        .fleet_members()
+        .is_some_and(|m| m.contains(&host_b))
+        && daemon_b_again
+          .fleet_members()
+          .is_some_and(|m| m.contains(&host_a))
+    });
+
+  daemon_a.stop();
+  daemon_b_again.stop();
+  assert!(formed, "the fleet formed before the restart");
+  assert!(knew_b, "A knew B before the restart");
+  assert!(
+    reformed,
+    "the same-id restart re-formed the mesh (A knows B)"
+  );
+  assert!(
+    retired,
+    "A retired the dead incarnation (the natural retirement whose cleanup held the bug ran)"
+  );
+  assert!(
+    rejoined,
+    "A re-admitted the restart and B kept A — the restart's serve session survived A's retirement, so the \
+     death echo reached it and it self-refuted (the certificate-keyed close of the replacement is fixed)"
+  );
+  assert!(stable, "the re-admission held — the rejoin did not flap");
+}
