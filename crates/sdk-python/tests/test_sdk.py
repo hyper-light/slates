@@ -42,9 +42,12 @@ BOUND_VERBS = {
     "client_id",
     "reconnects",
 }
-# Test deadlines in nanoseconds; a production caller derives these from the machine's budgets.
-REPLY_NS = 5_000_000
-RECONNECT_NS = 10_000_000
+# Test deadlines in nanoseconds — generous on purpose. This is a functional round-trip that spawns a real
+# anchor+daemon on a shared, often-loaded CI runner, not a latency gate (the provisioning histogram is that);
+# a tight 5 ms reply deadline flaked with `Stalled` when a verb's reply crossed it under load. A production
+# caller derives these from the machine's budgets.
+REPLY_NS = 1_000_000_000
+RECONNECT_NS = 2_000_000_000
 # How long to wait for a freshly spawned anchor+daemon to answer, and the pause between polls.
 STARTUP_SECS = 20.0
 POLL_SECS = 0.02

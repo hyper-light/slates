@@ -19,8 +19,8 @@ import addon, { Client, AsyncClient } from '@hyper-light/slates';
 const require = createRequire(import.meta.url);
 
 // Test deadlines in nanoseconds; a production caller derives these from the machine's budgets.
-const REPLY_NS = 5_000_000;
-const RECONNECT_NS = 10_000_000;
+const REPLY_NS = 1_000_000_000;
+const RECONNECT_NS = 2_000_000_000;
 // How long to wait for a freshly spawned anchor+daemon to answer, and the pause between polls.
 const STARTUP_MS = 20_000;
 const POLL_MS = 20;

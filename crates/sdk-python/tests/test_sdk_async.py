@@ -25,8 +25,8 @@ ASYNC_VERBS = {
     "land",
 }
 # Test deadlines in nanoseconds; a production caller derives these from the machine's budgets.
-REPLY_NS = 5_000_000
-RECONNECT_NS = 10_000_000
+REPLY_NS = 1_000_000_000
+RECONNECT_NS = 2_000_000_000
 # How long to wait for a freshly spawned anchor+daemon to answer, and the pause between polls.
 STARTUP_SECS = 20.0
 POLL_SECS = 0.02
