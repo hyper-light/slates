@@ -172,28 +172,40 @@ five members, `peers_probed 4` on every pod, one leader, `rtt_tail_ns` 10 µs–
 path); then the fresh 3-replica reinstall **installed and formed in 7.5 s**, formation 0.2 s. The
 five-replica node that could not admit a client at 1 GiB admits it now.
 
-## The one gap left — a whole-pod restart does not rejoin (a Kubernetes design question)
+## The one gap left — a whole-pod restart does not rejoin (open; not the cause first recorded)
 
-When the owner's pod is deleted, the StatefulSet recreates it under the same name at a new IP. Because a
-whole-pod restart loses the **RAM anchor segment** (the anchor is PID 1, killed with the pod), the
-replacement boots at **incarnation 0** with the **same manifest seed member id** its retired predecessor
-held — RAM-only leaves no durable start count to advance across a pod restart (R1). The survivors, which
-retired that id, do not re-admit it: SWIM's two-id learn-on-contact (task #22) treats a same-generation
-id of a dead member as stale (a restart is expected to announce a *higher* generation = a new id), so the
-replacement's probes are not acknowledged and it forms a solo view (`fleet_members` = itself only). The
-takeover **stands** — the survivor serves the volume — but the replacement pod is isolated.
+When the owner's pod is deleted, the StatefulSet recreates it under the same name at a new IP. The
+replacement boots at incarnation 0 with the same manifest seed member id its predecessor held (a pod
+restart loses the RAM anchor segment, so there is no durable start count to advance, R1). It does **not**
+rejoin within the 120 s window: it holds a solo view (`peers_probed=0`, `fleet_members` = itself only)
+while the survivors hold each other (`peers_probed=1`). The takeover **stands** — the survivor serves the
+volume.
 
-This is the "restart = join" path for Kubernetes, and it is a genuine design tension, not a code slip: the
-design gets "a fresh fleet forms with no exchange" from a **precomputable seed** (incarnation 0), and
-"a restart is a new id" from an **advancing incarnation** — reconcilable when the anchor segment persists
-the generation across *daemon* restarts (a bare-metal deployment), but not across a *pod* restart, which
-loses it. Options for the fix owner, none free: derive the incarnation from a source that survives a pod
-restart (wall-clock boot time — but then the manifest cannot precompute the seed, so formation needs a
-first-contact exchange); or let a dead member be re-admitted by SWIM refutation at the same id (the
-replacement bumps its *SWIM incarnation* past the death it hears — A-15 — without a member-id change,
-which needs the learn-on-contact stale check to stop refusing a same-generation probe from a dead member).
-It needs Ada's call on which, as the charter flagged the in-pod mount as a design question. Recorded here;
-the lane's `prove` reports the rejoin as a best-effort observation, not a gate.
+**What the diagnostics show (2026-09-14, `prove` dumps the fleet logs and the Service endpoints on the
+no-rejoin path).** All three pods are published Service endpoints (`publishNotReadyAddresses: true`), the
+replacement's new IP among them. The replacement's `peers_probed=0` with **no fleet-error log lines**: it
+forms *no probe session at all* to its peers — the failure is at session formation, **below** the
+membership layer, not a membership refusal. One earlier run also showed a survivor's resolver time out on
+the replacement's name (`fleet: resolving slates-0…: no answer within the timeout`), but a second run did
+not reproduce that and still failed to rejoin, so the DNS timeout is a separate, transient flake, not the
+cause.
+
+**Correction to an earlier note in this file.** The failure was recorded here as the survivors refusing
+the replacement's id because "learn-on-contact treats a same-generation id of a dead member as stale."
+That is **wrong**: `server::fleet::classify_announced` returns `Current` for an equal generation, not
+`Stale`, and an in-process probe (`crates/server/tests/fleet.rs`, a retired node's replacement at
+generation 0 with the same identity) re-admits it once contact is made — the A-15 self-refutation
+(`Membership::apply` refutes a death about the local id, bumping the SWIM incarnation past it) is correct.
+So the incarnation scheme is not refusing the id; the mesh never gets far enough to exchange membership
+because the probe sessions do not form.
+
+**Owed: the session-formation diagnosis.** Why the replacement forms no probe session to peers that are up
+and resolvable needs session-level instrumentation on a live cluster — the candidates are the survivors'
+demultiplexer still holding the dead pod's session (keyed by its old source, on a plane the retirement path
+may not close) so the replacement's dial from the new IP is refused or unmatched, and the probe loop's
+re-dial of a returned peer at a possibly-new address. This is a fleet-transport diagnosis, not the
+incarnation design tension first recorded; scope it with the session-lifecycle owner. The lane's `prove`
+reports the rejoin as a best-effort observation, not a gate, so the lane stays green while it is open.
 
 The other item the charter names — a **byte-level read-back through a kernel mount inside a pod** after the
 takeover — needs `mount_nfs` in the image and the NFS-loopback mount inside a pod (the charter's own "design

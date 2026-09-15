@@ -1211,6 +1211,35 @@ impl Lane {
         for view in views.iter().flatten() {
           eprintln!("kind:   {}", view.line());
         }
+        // The replacement forms no probe session (`peers_probed=0`): dump the fleet log lines of the
+        // replacement and one survivor so a diagnosis sees *why* the handshakes do not complete (the
+        // debugging protocol's "logs first"). Best-effort — a failure to read logs is not the lane's.
+        let survivor = survivors
+          .first()
+          .map(String::as_str)
+          .unwrap_or(owner.as_str());
+        for pod in [owner.as_str(), survivor] {
+          if let Ok(logs) = self.kubectl(&["logs", pod, "--tail", "80"]) {
+            let fleet: Vec<&str> = logs
+              .stdout
+              .lines()
+              .filter(|l| l.contains("fleet:") && !l.contains("fleet timing"))
+              .collect();
+            eprintln!("kind: {pod} fleet log ({} lines):", fleet.len());
+            for line in fleet.iter().rev().take(20).rev() {
+              eprintln!("kind:     {line}");
+            }
+          }
+        }
+        // Pin the DNS/endpoint plumbing: does the Service list the recreated pod as an endpoint at all?
+        // A published endpoint the daemon's resolver still times out on points at the resolver or a
+        // CoreDNS-load drop; a missing endpoint points at the pod's readiness/DNS record.
+        if let Ok(ep) = self.kubectl(&["get", "endpoints", "-o", "wide"]) {
+          eprintln!("kind: endpoints:");
+          for line in ep.stdout.lines() {
+            eprintln!("kind:     {line}");
+          }
+        }
       }
     }
     Ok(())
