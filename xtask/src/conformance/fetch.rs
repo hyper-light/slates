@@ -159,14 +159,19 @@ pub(crate) struct Built {
 /// Fetches and builds fsx.
 pub(crate) fn build_fsx(dir: &Path) -> Result<Built, Failure> {
   fetch(&FSX_C, dir)?;
+  // `-include time.h` for `clock_gettime` (the FreeBSD copy omits it); `-include stdint.h` for
+  // `uintptr_t`, which fsx uses (lines 487/497) without including it — FreeBSD's `<sys/types.h>` pulls
+  // it in transitively, Linux glibc's does not, so on Linux it is an "unknown type name" without this.
   cc(
     dir,
-    &["-O2", "-w", "-include", "time.h", "-o", "fsx", FSX_C.name],
+    &[
+      "-O2", "-w", "-include", "time.h", "-include", "stdint.h", "-o", "fsx", FSX_C.name,
+    ],
   )?;
   Ok(Built {
     binary: dir.join("fsx"),
     note: format!(
-      "fsx: {} ({}), sha256 {}, built `cc -O2 -w -include time.h` unchanged",
+      "fsx: {} ({}), sha256 {}, built `cc -O2 -w -include time.h -include stdint.h` (source unchanged)",
       FSX_C.upstream, FSX_C.license, FSX_C.sha256
     ),
   })
@@ -320,9 +325,23 @@ fn pjdfstest_config_h(dir: &Path) -> Result<String, Failure> {
     String::from("/* slates conformance harness: configure.ac's checks, probed by cc */\n");
   config.push_str(SYSTEM_EXTENSIONS);
   for function in PJDFSTEST_FUNCTIONS {
-    // autoconf's `AC_CHECK_FUNC` shape: declare and *call* the function, so the link decides.
-    // (Comparing its address with zero is folded by clang without ever linking the symbol.)
-    let source = format!("char {function}();\nint main(void) {{ return {function}(); }}\n");
+    // autoconf's `AC_CHECK_FUNC` shape: declare and *call* the function, so the link decides (comparing
+    // its address with zero is folded by clang without ever linking the symbol). The `__stub_` guard is
+    // autoconf's too and is load-bearing on Linux: glibc provides a *linkable* stub for some functions it
+    // does not implement — `chflags` among them — that always fails `ENOSYS`, so a bare link test is a
+    // false positive. glibc marks such a stub with `__stub_<name>` (or `__stub___<name>`) in
+    // `<gnu/stubs.h>`, which `<limits.h>` pulls in; rejecting the probe when that macro is defined is
+    // exactly what real `AC_CHECK_FUNC` does. Without it, `HAVE_CHFLAGS` was defined on Linux and
+    // pjdfstest's `st_flags` block (guarded by it) failed to compile against a `struct stat` that has no
+    // `st_flags` member. On macOS (real `chflags`, no stub) the guard passes and the function is detected.
+    let source = format!(
+      "#include <limits.h>\n\
+       char {function}(void);\n\
+       #if defined __stub_{function} || defined __stub___{function}\n\
+       #error stub\n\
+       #endif\n\
+       int main(void) {{ return {function}(); }}\n"
+    );
     if probe(dir, &source, false)? {
       config.push_str(&format!("#define HAVE_{} 1\n", function.to_uppercase()));
     }
