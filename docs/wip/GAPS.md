@@ -1151,6 +1151,16 @@ points for the same N=1/fleet semantics, not proof that all integration work is 
 
 ## 8i. A-9 contract correction and open implementation gaps (2026-09-05)
 
+**Follow-up source audit (2026-09-14, `291907b`):**
+[2026-09-14_AUDIT.md](../bugs/2026-09-14_AUDIT.md) records 18 open findings (14 P1,
+4 P2) and one unconfirmed KIND rejoin explanation. Mount authorization/coherence and
+cross-shard service: AUD-01–04 (GAP-A9-3/-4/-9/-11); publication and transaction recovery:
+AUD-05–06 (GAP-A9-6); Raft restart, read authority and authenticated record acceptance:
+AUD-07–10 (GAP-A9-7/-9); merge commit, holder fencing, quorum progress, ledger takeover and
+retention: AUD-11–14/-16 (GAP-A9-14/-1/-7); SWIM indirect probes, call cancellation and
+handshake bounds: AUD-15/-17/-18 (GAP-A9-7/-4/-11). These are source findings and proposed
+regression scenarios, not executed regressions or closure evidence. No fixes were made.
+
 Separate workspace work advanced HEAD through archive commit `540fb5b` and ledger fix
 `d9cb6e5` during this pass. BUG-12 is fixed there with recorded before/after regression evidence;
 BUG-13's reachability restriction is removed, but direct adoption-value/message-level checks
