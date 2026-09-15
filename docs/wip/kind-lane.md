@@ -10,7 +10,8 @@
 > admit any client — whose fix is pending a free box (defect 5 below). Because of it the **five-replica
 > scale step was cut on 2026-09-14 at 16:02 CDT and the netem profiles never ran**: Pieces 4 and 5 carry
 > no numbers yet. One gap is left, precisely characterized: a **whole-pod restart** does not rejoin the
-> mesh (the RAM-only same-seed-id restart — a design question for Kubernetes, §"The one gap left").
+> mesh — the replacement forms no probe session to its peers, a session-formation failure below the
+> membership layer, not the incarnation scheme first recorded (§"The one gap left").
 
 Hardware: Apple silicon (arm64) laptop; Docker Desktop's Linux VM (`docker version` → `linux/arm64
 29.3.1`, 18 CPUs, 67 303 636 992 bytes). Tools: kind v0.33.0, kubectl 1.34, helm 4.3.0. Lane scratch is
@@ -234,8 +235,9 @@ deleting its cluster at the end).
   probing four peers), and under `tc netem` the derived election timing holds its leader for a
   three-minute window on every profile (80 ms ± 20 ms: base 20 periods on 195–200 ms tails; with 1 % loss:
   24–25 on 232–245 ms; 350 ms one way: 77–79 on 763–785 ms, the fleet still forming in 4.9 s), with zero
-  leader changes. Owed: a whole-pod restart rejoining the mesh (the RAM-only same-seed-id restart, a design
-  question for Kubernetes) and a byte-level read-back through a mount inside a pod."*
+  leader changes. Owed: a whole-pod restart rejoining the mesh (the replacement forms no probe session to
+  its peers — a session-formation failure below the membership layer) and a byte-level read-back through a
+  mount inside a pod."*
 - **§4.8 status paragraph (2026-09-14):** *"The KIND lane runs the fleet on real Linux pods over a real
   network, installed by the Helm chart — the WAN status owed exactly this. It proves the image, the chart
   and its render, per-pod DNS resolution, cross-node UDP, mutual-TLS session establishment on both planes,
@@ -252,7 +254,7 @@ deleting its cluster at the end).
   netem` (80 ms ± 20 ms, with 1 % loss, and the 350 ms handshake ceiling) — measured on main on 2026-09-14
   once the task share landed: five replicas form in 7.5 s, and every profile holds its leader for 183 s
   with the base derived from the measured tails (20 / 24–25 / 77–79 periods) and zero leader changes.
-  Owed: a whole-pod restart rejoining (the RAM-only same-seed-id restart is a Kubernetes design
-  question — the seed is precomputable only at incarnation 0, while a restart wants an advancing
-  incarnation, and a pod restart loses the anchor segment that would carry it); and a mount-read-back
-  inside a pod."*
+  Owed: a whole-pod restart rejoining — the lane's diagnostics show the replacement forms no probe session
+  to its peers though all three pods are published Service endpoints and its self-refutation is correct in
+  isolation, so this is a session-formation diagnosis (the demultiplexer's session lifecycle on a peer's IP
+  change), not the incarnation design question first recorded; and a mount-read-back inside a pod."*
