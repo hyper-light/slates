@@ -800,6 +800,10 @@ mod tests {
   /// is a failing assertion against the design text, not a footnote. Do: parse the design's roster
   /// sentence. Expect: its count word, names and `{dimension}` labels equal the registry's.
   #[test]
+  #[cfg_attr(
+    miri,
+    ignore = "reads the design document; the filesystem is unavailable under Miri's isolation"
+  )]
   fn the_span_roster_is_the_designs_and_its_count_word_is_true() {
     let (count_word, listed) = design_roster();
     assert_eq!(
@@ -845,6 +849,10 @@ mod tests {
   /// record. Expect: equality; a drift in either direction fails, and `--ignored
   /// regenerate_the_chokepoint_table` rewrites the block deliberately.
   #[test]
+  #[cfg_attr(
+    miri,
+    ignore = "reads docs/wip/observability.md; the filesystem is unavailable under Miri's isolation"
+  )]
   fn the_recorded_chokepoint_table_is_the_registry() {
     assert_eq!(
       recorded_table(),
