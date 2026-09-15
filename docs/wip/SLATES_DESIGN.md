@@ -1719,7 +1719,7 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 > reachability restriction; its commit reports a before/after regression and 40 passing DB
 > tests, not rerun here. Direct adoption-value checks and message-level histories remain owed. Mirror simulation does not establish transport, byte placement or time lag.
 > Server wiring and local content recovery are wired and proven (GAP-A9-6 content half closed
-> 2026-09-14; base plane owed); regional configuration consensus and the acceptance gates below
+> 2026-09-14; verified overlay image recovery added 2026-09-15); regional configuration consensus and the acceptance gates below
 > remain open. Formation under load (2026-09-14): a probe session whose dialer spent a whole
 > handshake budget against a peer not yet listening now resends its pending flight on every later
 > period (it was a local of one `establish` call, so the socket never sent again and the mesh stalled
@@ -1885,10 +1885,15 @@ struct Neighbourhood { hosts: SmallVec<HostId> /* the scatter width S, across fa
 > current-term election no-op, and a retiring leader continues driving until its removal commits.
 > [Exact commands and limitations](../bugs/2026-09-14-raft-voter-state-loss.md).
 
-**Consensus lifetime (AUD-07).** A node may reuse a voting identity only with its complete term,
-vote, log, snapshot and configuration retained. The live daemon currently retains none of that
-state across process restarts, so every restart uses a fresh identity, including when its anchor
-retains volume data. New members cannot vote or campaign before initialization. Join transfers
+**Consensus lifetime (AUD-07; warm retention added 2026-09-15).** A node may reuse a voting
+identity only with its complete term, vote, log, snapshot and configuration retained. The control
+shard publishes both groups, their replay bases and views, and the member identity into two
+bounded anchor slots before releasing a changed consensus transition's result. Complete but
+corrupt publications refuse startup; an unfinished replacement leaves the preceding completed
+publication usable. A capacity refusal closes the control shard. Warm restarts restore the voter;
+whole-anchor RAM loss still creates a fresh identity. The three-process warm-restart history
+recovers both quorums without bootstrap and commits another retirement (Linux: 16.75 s).
+New members cannot vote or campaign before initialization. Join transfers
 the original application base and validated consensus prefix once; later fetches cannot erase
 votes. Ordinary startup cannot create a group. Explicit bootstrap is bound to the observed boot
 and cannot replace an initialized group. Separate group genesis identities never exchange Raft
@@ -1902,16 +1907,28 @@ cannot make a newly bootstrapped group appear protected.
 Discovery and admission are deployment-independent (R8): local processes, bare-metal hosts, VMs
 and Kubernetes use the same protocol. Address discovery supplies candidates, authentication verifies
 identity, and Raft commits voting membership. Configured DNS peers are resolved on each fresh dial
-and join automatically after initial bootstrap. The current implementation pins the manifest's
-roster; discovery and trust enrollment of previously unlisted nodes remain unimplemented. No
+and join automatically after initial bootstrap. Explicit pins constrain configured seeds. Optional
+operator CA roots admit previously unlisted certificates carrying both the fleet TLS name and
+`r<region>.d<domain>.<fleet>` as signed DNS names. Certificate hashes identify stable anchors;
+address advertisements grant no voting authority. Each record session exchanges one bounded
+roster page per period, then only a generation check until the roster changes. New outbound
+sessions pin the exact advertised leaf, even when another leaf has the same issuer. Task and
+roster capacities derive from the machine's runtime budget. Validated peers survive warm restart
+in the consensus publication; revalidation does not truncate that retained roster. No
 discovery answer, local absence of peers, or timeout authorizes an empty voting group.
 
 A surviving quorum is required independently for each group. No timeout, deployment manifest or
 session rejoin grants permission to reconstruct an empty voting group. Quorum-loss recovery is
 an explicit operator action with possible data loss; a new group is not recovery of the previous
-one. The current one-representative-per-region root has no voter redundancy within a single
-region. Preserving its state across warm restarts and providing complete compacted-state transfer
-remain owed. Live joins presently transfer whole retained logs; complete-message quotas remain in GAP-A9-11. The wrappers
+one. `recovery-plan` binds the exact retained group, prefix, application view and optional target.
+`recover` requires that unchanged plan, a human proof and explicit fencing/loss acknowledgements.
+A selected copy reforms with a new genesis; regional fencing epochs advance. Other retained copies
+join only after separately approved plans, keeping their old state suspended until a complete,
+validated fetch arrives. A node-specific operator key supplied read-only via `SLATES_RECOVERY_KEY`
+authorizes recovery on any platform; otherwise the anchor's human issuer capability is required.
+This key does not authorize landing or consumer enrollment. No discovery or timeout invokes recovery.
+The current one-representative-per-region root has no voter redundancy within a single region.
+Warm state now survives in the anchor. Complete compacted-state transfer remains owed. Live joins presently transfer whole retained logs; complete-message quotas remain in GAP-A9-11. The wrappers
 refuse snapshots because they do not yet publish a matching compacted application base.
 
 Ownership facts: a partition has one writer, its shard; a register has one legal writer, the
@@ -1928,6 +1945,11 @@ retry must recover the same result and contents. Rebuilding a scratch volume fro
 and id loses acknowledged data. Live directory handles require an anchor handoff or validated
 reacquisition of the same source identity; reopening a path alone cannot substitute another
 base. Missing resources return `RecoveryIncomplete`/`BaseUnavailable`, never empty success.
+The version-2 volume image now preserves overlay source paths and full directory fingerprints,
+witnesses, whiteouts, redirects, metadata copy-ups and private large-file ranges, including snapshots.
+Recovery validates no-follow source acquisition before reinstating lazy reads and invalidates caches.
+Source replacement refuses; open descriptor handoff and independent overlay-clone host lifetime
+remain separate gaps. The two reported daemon overlay failures now pass on macOS and Linux.
 
 For each ledger position, distinguish a holder's promised epoch from its accepted
 `(epoch, value)`. Phase one consults an authorized quorum of distinct holders and adopts the
@@ -5023,3 +5045,21 @@ fleet,consensus,verbs,nfs}`, `ipc/protocol`, `cli/{args,verbs}`, and affected st
 - Consequence: the random per-start identity replaces the resettable counter. Common-prefix join
   and explicit boot-bound bootstrap replace manifest-derived empty voting groups. Warm consensus
   retention is not implemented; quorum loss stays unavailable. Rules R1–R10 remain unchanged.
+
+### A-19 (2026-09-15) — Retain warm voters and authorize explicit recovery and enrollment
+
+- §4.8 now distinguishes retained warm voters, fresh whole-anchor replacements and operator-approved
+  recovery after quorum loss. The complete Raft publication precedes responses; discovery grants
+  contact information and trust enrollment, while the surviving group commits voting membership.
+- Unlisted nodes use operator-issued certificates with signed region/domain scope, exact-leaf dial
+  authentication and bounded incremental exchange. Node-specific recovery keys work through a read-only
+  secret source on local hosts, bare metal, VMs and Kubernetes.
+- Version-2 content images preserve overlay state and validate reacquired source identities.
+- Evidence: [Raft Figure 2](https://raft.github.io/raft.pdf),
+  [etcd recovery](https://etcd.io/docs/v3.6/op-guide/recovery/),
+  [RFC 5280 SAN](https://www.rfc-editor.org/rfc/rfc5280#section-4.2.1.6), and the dated regressions below.
+- Applied in the same change to: anchor, cluster, server, transport, VFS, IPC and CLI implementation
+  and tests; §4.8 status and contracts; GAPS; `docs/cli.md`, `docs/deploy.md`; KIND gate;
+  `docs/bugs/2026-09-15-{consensus-recovery,unlisted-node-enrollment,overlay-recovery}.md`.
+- No model checker ran; the existing A-9 refinement gap remains open. No on-disk Raft state,
+  automatic disaster reset or per-write consensus is introduced. Rules R1–R10 remain unchanged.

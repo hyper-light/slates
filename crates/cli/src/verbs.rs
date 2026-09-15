@@ -36,6 +36,94 @@ fn failure_of(e: ClientError, instance: &str) -> Failure {
   }
 }
 
+fn emit_recovery_plan(
+  client: &mut Client,
+  root: bool,
+  target: Option<[u8; 32]>,
+  json: bool,
+) -> Result<(), Failure> {
+  use slates_ipc::protocol::{ReplyBody, RequestBody};
+  let reply = client
+    .call(&RequestBody::RecoveryPlan { root, target })
+    .map_err(|error| failure_of(error, "recovery-plan"))?;
+  let ReplyBody::RecoveryPlan { plan } = reply else {
+    return Err(Failure::Refused(format!(
+      "recovery-plan refused: {reply:?}"
+    )));
+  };
+  if json {
+    println!(
+      "{}",
+      serde_json::json!({
+        "member": plan.member, "previous_group": hex32(&plan.previous), "plan": hex32(&plan.digest),
+        "committed": plan.committed, "last_log": plan.last_log, "version": plan.version,
+        "voters": plan.voters, "target": plan.target.as_ref().map(hex32),
+        "fencing_required": true, "data_loss_possible": true,
+      })
+    );
+  } else {
+    println!(
+      "plan {}\nmember {}\nprevious group {}\ncommitted position {}\nlast log position {}\nconfiguration version {}\nknown former voters {:?}",
+      hex32(&plan.digest),
+      plan.member,
+      hex32(&plan.previous),
+      plan.committed,
+      plan.last_log,
+      plan.version,
+      plan.voters
+    );
+    if let Some(target) = plan.target {
+      println!("join group {}", hex32(&target));
+    }
+    println!(
+      "Compare the retained copies before choosing one. Fence the entire former group before recovery; unreachable copies may contain newer committed state. Confirm only after accepting that possible loss."
+    );
+  }
+  Ok(())
+}
+
+fn emit_recovery(
+  client: &mut Client,
+  root: bool,
+  target: Option<[u8; 32]>,
+  plan: [u8; 32],
+  json: bool,
+) -> Result<(), Failure> {
+  use slates_ipc::protocol::{ReplyBody, RequestBody};
+  let proof = match crate::recovery_key::load()? {
+    Some(key) => key.proof(&plan),
+    None => slates_server::recovery_proof(&issuer_secret()?, &plan),
+  };
+  let reply = client
+    .call(&RequestBody::Recover {
+      root,
+      target,
+      plan,
+      proof,
+    })
+    .map_err(|error| failure_of(error, "recover"))?;
+  let ReplyBody::RecoveryStarted { group, joining } = reply else {
+    return Err(Failure::Refused(format!("recovery refused: {reply:?}")));
+  };
+  if json {
+    println!(
+      "{}",
+      serde_json::json!({"group": hex32(&group), "joining": joining})
+    );
+  } else {
+    println!(
+      "{} {}",
+      if joining {
+        "joining recovery group"
+      } else {
+        "created recovery group"
+      },
+      hex32(&group)
+    );
+  }
+  Ok(())
+}
+
 fn connect(instance: &str) -> Result<Client, Failure> {
   let deadlines = Deadlines::derive(LIVENESS_BUDGET_NS, RECOVERY_BUDGET_NS).get();
   Client::connect(instance, deadlines).map_err(|e| failure_of(e, instance))
@@ -69,6 +157,12 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
       *term_ns,
       request.json,
     );
+  }
+  if let Verb::RecoveryPlan { root, target } = request.verb {
+    return emit_recovery_plan(&mut client, root, target, request.json);
+  }
+  if let Verb::Recover { root, target, plan } = request.verb {
+    return emit_recovery(&mut client, root, target, plan, request.json);
   }
   if let Verb::Bootstrap { root } = request.verb {
     let member = client
@@ -818,7 +912,12 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
       rights,
     } => emit_share(client, *volume, principal, *rights, json)?,
     // Served in `run`, before this: their authority comes from the anchor, not the client.
-    Verb::Bootstrap { .. } | Verb::Grant { .. } | Verb::Enroll { .. } | Verb::Revoke { .. } => {}
+    Verb::Bootstrap { .. }
+    | Verb::RecoveryPlan { .. }
+    | Verb::Recover { .. }
+    | Verb::Grant { .. }
+    | Verb::Enroll { .. }
+    | Verb::Revoke { .. } => {}
   }
   Ok(())
 }
@@ -1051,7 +1150,7 @@ fn emit_grant(
 fn issuer_secret() -> Result<[u8; slates_anchor::layout::ISSUER_SECRET_BYTES], Failure> {
   if std::env::var_os(slates_anchor::segment::ENV_HANDOFF).is_none() {
     return Err(Failure::Failed(
-      "no anchor in this environment — grant, enroll, revoke and run are the anchor user's surface; \
+      "no anchor in this environment — recover, grant, enroll, revoke and run are the anchor user's surface; \
        run them from the session that started the daemon, with the variables `slates anchor` printed \
        exported (the MCP server and the SDKs cannot issue grants or enrollments)"
         .to_owned(),

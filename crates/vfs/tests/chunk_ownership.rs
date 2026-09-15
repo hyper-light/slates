@@ -203,11 +203,17 @@ fn dropping_a_recovered_snapshot_frees_its_private_chunks_and_keeps_the_heads() 
   let chunk = source.content.chunk_bytes();
   let snap = vol.snapshot(&mut source).unwrap();
   vol.write(&mut source, f, 0, &vec![b'R'; chunk]).unwrap();
-  let image = vol.to_image(&source).unwrap();
+  let image = vol.to_image(&source, None).unwrap();
 
   let mut fresh = store();
-  let mut recovered =
-    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  let mut recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
   let with_snapshot = fresh.content.allocated_bytes();
   assert!(
     with_snapshot >= 4 * chunk,

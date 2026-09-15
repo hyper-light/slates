@@ -215,6 +215,9 @@ pub struct DurabilityShortfall {
 /// The daemon's configuration.
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
+  /// Operator-provisioned, node-specific quorum-recovery capability. When absent, the
+  /// anchor's human issuer capability is required. Neither is available to consumers.
+  pub recovery_key: Option<crate::RecoveryKey>,
   /// The runtime's configuration.
   pub runtime: RuntimeConfig,
   /// The segment's geometry.
@@ -274,6 +277,8 @@ pub struct DaemonConfig {
   /// is local; a fleet node names its quorum and peers, and the placement authority, configuration group
   /// and owner acceptor are built over them at boot.
   pub fleet: Option<FleetMembership>,
+  /// Derived: available fleet task slots divided by the tasks one peer requires; never below the seeds.
+  pub fleet_peer_capacity: usize,
   /// Derived: a guest device attachment's credits (§4.6 A-9, §4.9): the request credit is the shard's
   /// admission limit (`requests_in_flight_per_shard`), the byte credit the §4.9 window over the measured
   /// memcpy bandwidth and the wake p99 as the kick round trip, with one request's worst case as the frame.
@@ -556,6 +561,8 @@ impl DaemonConfig {
       // The laptop default: no fleet, `f = 0`, solo. An operator deploying a fleet sets this (with
       // `with_fleet`); the derivation from the machine profile is the same either way (R8).
       fleet: None,
+      recovery_key: None,
+      fleet_peer_capacity: 0,
       #[cfg(unix)]
       guest_credits,
       derivations,
@@ -660,7 +667,12 @@ impl DaemonConfig {
     // load fills the fleet's share and never the clients' (2026-09-14: at ~3× oversubscription the
     // shard's whole arena filled with accept-side handshakes each held for its bounded retransmit
     // budget, `adm_refused` 4,554 — `docs/wip/fleet-under-load.md`).
-    let peers = membership.peers.len();
+    let per_peer = FLEET_LOOPS_PER_PEER + crate::fleet::SESSIONS_PER_PEER * FLEET_PLANES;
+    let peers = membership
+      .peers
+      .len()
+      .max(self.runtime.tasks_per_shard / per_peer);
+    self.fleet_peer_capacity = peers;
     let fleet_tasks: Derived<usize> = derived!(
       peers
         .saturating_mul(FLEET_LOOPS_PER_PEER)
@@ -858,8 +870,12 @@ mod tests {
         .expect("the solo owner has a placement view");
     assert_eq!(
       strict.shortfall(&laptop),
-      None,
-      "a single copy has no coincident loss: the laptop is never short under any policy (R8)"
+      Some(DurabilityShortfall {
+        coincident_loss: 1.0,
+        accepted_loss: 0.0,
+        coincident_failures: 2,
+      }),
+      "losing the only admitted host loses the only copy; the laptop obeys the fleet's loss rule"
     );
   }
 
@@ -941,8 +957,8 @@ mod tests {
       durability: None,
       region_mirrors: BTreeMap::new(),
     });
-    let share = peers.len() * FLEET_LOOPS_PER_PEER
-      + peers.len() * crate::fleet::SESSIONS_PER_PEER * FLEET_PLANES
+    let share = fleet.fleet_peer_capacity * FLEET_LOOPS_PER_PEER
+      + fleet.fleet_peer_capacity * crate::fleet::SESSIONS_PER_PEER * FLEET_PLANES
       + FLEET_LOOPS_PER_SHARD;
     assert_eq!(
       fleet.runtime.tasks_per_shard,

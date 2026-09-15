@@ -37,6 +37,8 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
             [--oci-source HOST_PATH --oci-destination CONTAINER_PATH] [--json]
   detach ATTACHMENT [--json]
   bootstrap (root | region) [--json]             explicitly create a new consensus group
+  recovery-plan (root | region) [--join-group HASH] [--json]
+  recover (root | region) --confirm PLAN --fenced --accept-loss [--join-group HASH] [--json]
   status [--json]                                  the daemon's status
   status ID [--drift] [--json]
   base read ID PATH
@@ -166,6 +168,22 @@ pub(crate) enum Verb {
   Bootstrap {
     /// Also create the root group, exactly once for a new fleet.
     root: bool,
+  },
+  /// Inspect the retained copy and bind a proposed quorum-loss recovery.
+  RecoveryPlan {
+    /// Root or regional group.
+    root: bool,
+    /// Explicit replacement group to join, or none to recover this copy as its first voter.
+    target: Option<[u8; 32]>,
+  },
+  /// Authorize one reviewed recovery after fencing the former group and accepting possible loss.
+  Recover {
+    /// Root or regional group.
+    root: bool,
+    /// The replacement group to join.
+    target: Option<[u8; 32]>,
+    /// The exact reviewed plan.
+    plan: [u8; 32],
   },
   /// Promote a lost region's declared mirror through the root group (§4.8, D-14).
   PromoteRegion {
@@ -479,6 +497,8 @@ pub(crate) enum Command {
 
 /// Every flag that takes a value, across the verbs.
 const VALUES: &[&str] = &[
+  "--join-group",
+  "--confirm",
   "--instance",
   "--shards",
   "--fleet",
@@ -504,6 +524,8 @@ const VALUES: &[&str] = &[
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
+  "--fenced",
+  "--accept-loss",
   "--quick",
   "--json",
   "--fold",
@@ -1093,6 +1115,48 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
       taken.only(&NONE)?;
       Ok(client(&taken, Verb::Bootstrap { root: false }))
     }
+    ["recovery-plan", scope @ ("root" | "region")] => {
+      taken.only(&Spec {
+        values: &["--join-group"],
+        switches: &[],
+      })?;
+      Ok(client(
+        &taken,
+        Verb::RecoveryPlan {
+          root: *scope == "root",
+          target: taken.value("--join-group").map(manifest_hash).transpose()?,
+        },
+      ))
+    }
+    ["recover", scope @ ("root" | "region")] => {
+      taken.only(&Spec {
+        values: &["--join-group", "--confirm"],
+        switches: &["--fenced", "--accept-loss"],
+      })?;
+      if !taken.switch("--fenced") {
+        return Err(ParseError::Missing(
+          "--fenced (the former group must be fenced first)",
+        ));
+      }
+      if !taken.switch("--accept-loss") {
+        return Err(ParseError::Missing(
+          "--accept-loss (unavailable copies may hold newer committed state)",
+        ));
+      }
+      let plan = manifest_hash(
+        taken
+          .value("--confirm")
+          .ok_or(ParseError::Missing("--confirm PLAN from recovery-plan"))?,
+      )?;
+      Ok(client(
+        &taken,
+        Verb::Recover {
+          root: *scope == "root",
+          plan,
+          target: taken.value("--join-group").map(manifest_hash).transpose()?,
+        },
+      ))
+    }
     ["promote-region", region] => {
       taken.only(&NONE)?;
       let region = region.parse::<u64>().map_err(|e| ParseError::BadValue {
@@ -1461,6 +1525,34 @@ mod tests {
 
   fn args(text: &str) -> Vec<String> {
     text.split_whitespace().map(str::to_owned).collect()
+  }
+
+  /// AC-8.1, §4.8: recovery requires an exact plan and both explicit acknowledgements;
+  /// a read-only plan needs neither, and a join always names its replacement group.
+  #[test]
+  fn recovery_requires_a_reviewed_plan_fencing_and_acceptance_of_possible_loss() {
+    let digest = "01".repeat(32);
+    for scope in ["root", "region"] {
+      assert!(
+        parse(&args(&format!(
+          "recovery-plan {scope} --join-group {digest}"
+        )))
+        .is_ok()
+      );
+      assert!(
+        parse(&args(&format!(
+          "recover {scope} --confirm {digest} --fenced --accept-loss"
+        )))
+        .is_ok()
+      );
+      for missing in ["--fenced", "--accept-loss"] {
+        let command =
+          format!("recover {scope} --confirm {digest} --fenced --accept-loss").replace(missing, "");
+        assert!(parse(&args(&command)).is_err());
+      }
+      assert!(parse(&args(&format!("recover {scope} --fenced --accept-loss"))).is_err());
+    }
+    assert!(parse(&args("recover root --confirm wrong --fenced --accept-loss")).is_err());
   }
 
   /// AC-8.1: bootstrap is an explicit local client verb; it is never a daemon startup flag.

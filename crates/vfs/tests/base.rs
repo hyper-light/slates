@@ -82,56 +82,162 @@ fn populate(host: &mut SimHost, dirs: usize, files: usize) {
   }
 }
 
-/// AC-2.12 / T-2.14, AUD-05: image an overlay before its first lookup. The unwitnessed base
-/// must not disappear into an apparently complete empty recovery image.
+/// AC-2.12 / T-2.14: retain an unvisited overlay, then read its source after recovery.
+/// Omitting the host refuses instead of publishing an apparently empty scratch volume.
 #[test]
-fn an_unvisited_overlay_cannot_publish_an_empty_recovery_image() {
+fn an_unvisited_overlay_recovers_its_verified_source() {
   let mut host = SimHost::new();
   host.replace_file("/unvisited", b"must not disappear");
   let mut store = store();
   let vol = overlay(&mut host, &mut store);
-  assert_eq!(vol.to_image(&store), Err(VfsError::RecoveryIncomplete));
-}
-
-/// AC (§4.8): an overlay whose base has been touched holds a base-backed inode, which the recovery
-/// image cannot yet capture (base recovery is its own gate), so `to_image` refuses it with
-/// `RecoveryIncomplete` — while a scratch volume in the same store images fine. This is the failure a
-/// shard publish now *skips* rather than treats as a barrier (crates/server/src/verbs.rs
-/// `publish_shard`), so one overlay never blocks every other volume's recovery.
-#[test]
-fn an_overlay_with_a_base_inode_refuses_to_image_but_a_scratch_still_images() {
-  let mut host = SimHost::new();
-  host.replace_file("/f", b"base content");
-  let mut store = store();
-
-  // A scratch volume in the same store images cleanly.
-  let mut scratch = Volume::create(
+  assert_eq!(
+    vol.to_image(&store, None),
+    Err(VfsError::RecoveryIncomplete)
+  );
+  let image = vol.to_image(&store, Some(&mut host)).unwrap();
+  let root = host.root();
+  let mut recovered = Volume::from_image(
     &mut store,
-    VolumeConfig {
-      prefix: 8,
-      names: NameEquivalence::Exact,
-      quota: Quota::Bounded { limit: 1 << 30 },
-      journal_bytes: 1 << 20,
-      clock: Box::new(StepClock::new(0, 1)),
-    },
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 20,
+    Some((&mut host, root)),
   )
   .unwrap();
-  let root = scratch.root_inode(&store).unwrap();
-  let s = scratch
-    .create_file_no(&mut store, root, "s", 0o644)
-    .unwrap();
-  scratch.write(&mut store, s, 0, b"scratch bytes").unwrap();
-  assert!(
-    scratch.to_image(&store).is_ok(),
-    "a scratch volume images cleanly"
+  assert_eq!(
+    read_all(&mut recovered, &mut host, &mut store, "/unvisited").unwrap(),
+    b"must not disappear"
   );
+  host.advance_ns(2);
+  host.replace_file("/other", b"changed directory");
+  assert!(matches!(
+    Volume::from_image(
+      &mut store,
+      &image,
+      Box::new(StepClock::new(0, 1)),
+      1 << 20,
+      Some((&mut host, root))
+    ),
+    Err(VfsError::RecoveryIncomplete)
+  ));
+}
 
-  // An overlay whose base file has been read holds a base-backed inode, which cannot yet be imaged.
-  let mut ov = overlay(&mut host, &mut store);
-  let _ = read_all(&mut ov, &mut host, &mut store, "/f").unwrap();
-  assert!(
-    matches!(ov.to_image(&store), Err(VfsError::RecoveryIncomplete)),
-    "an overlay with a base-backed inode refuses to_image (base recovery is its own gate)"
+/// AC-2.12 / T-2.14, AC-1.11: recover redirected directories, whiteouts, a snapshot, metadata
+/// witnesses and partial private extents. Changed unpinned source bytes refuse; pinned bytes survive.
+#[test]
+fn an_overlay_recovers_its_private_state_and_refuses_source_drift() {
+  let mut host = SimHost::new();
+  host.mkdir("/source");
+  host.replace_file(
+    "/source/large",
+    &vec![b'a'; usize::try_from(LARGE * 3).unwrap()],
+  );
+  host.replace_file("/source/meta", b"metadata witness");
+  host.replace_file("/source/gone", b"hidden");
+  host.advance_ns(2);
+  let mut before = store();
+  let mut vol = overlay(&mut host, &mut before);
+  let large = vol
+    .with_host(&mut host)
+    .resolve(&mut before, "/source/large")
+    .unwrap()
+    .inode;
+  vol
+    .with_host(&mut host)
+    .write(&mut before, large, 10, b"private")
+    .unwrap();
+  let meta = vol
+    .with_host(&mut host)
+    .resolve(&mut before, "/source/meta")
+    .unwrap()
+    .inode;
+  vol
+    .with_host(&mut host)
+    .chmod(&mut before, meta, 0o600)
+    .unwrap();
+  let Child::Dir(source) = vol
+    .with_host(&mut host)
+    .resolve(&mut before, "/source")
+    .unwrap()
+    .child
+  else {
+    panic!("directory");
+  };
+  vol
+    .with_host(&mut host)
+    .unlink(&mut before, source, "gone")
+    .unwrap();
+  let root = vol.root();
+  vol
+    .with_host(&mut host)
+    .rename(&mut before, root, "source", root, "moved")
+    .unwrap();
+  let snapshot = vol.snapshot(&mut before).unwrap();
+  let expected = read_all(&mut vol, &mut host, &mut before, "/moved/large").unwrap();
+  let divergence = vol.diverged(&before);
+  let image = vol.to_image(&before, Some(&mut host)).unwrap();
+  let encoded = image.to_content();
+  let image = slates_vfs::recover::VolumeImage::from_content(&encoded).unwrap();
+  let mut after = store();
+  let root = host.root();
+  let mut recovered = Volume::from_image(
+    &mut after,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 20,
+    Some((&mut host, root)),
+  )
+  .unwrap();
+  assert_eq!(recovered.diverged(&after), divergence);
+  assert_eq!(
+    read_all(&mut recovered, &mut host, &mut after, "/moved/large").unwrap(),
+    expected
+  );
+  assert_eq!(
+    read_all(&mut recovered, &mut host, &mut after, "/moved/meta").unwrap(),
+    b"metadata witness"
+  );
+  assert_eq!(recovered.stat(&after, meta).unwrap().mode & 0o777, 0o600);
+  assert_eq!(
+    read_all(&mut recovered, &mut host, &mut after, "/moved/gone"),
+    Err(VfsError::NotFound)
+  );
+  assert_eq!(
+    read_all(&mut recovered, &mut host, &mut after, "/source/large"),
+    Err(VfsError::NotFound)
+  );
+  let mut frozen = [0; 7];
+  assert_eq!(
+    recovered
+      .read_in(&after, snapshot, large, 10, &mut frozen)
+      .unwrap(),
+    frozen.len()
+  );
+  assert_eq!(&frozen, b"private");
+  assert_recovered_drift(&mut recovered, &mut host, &mut after, large);
+}
+
+fn assert_recovered_drift(
+  volume: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+  large: slates_vfs::ids::InodeNo,
+) {
+  host.write_in_place("/source/large", b"replaced in place", 5_000_000_000);
+  let mut bytes = [0; 7];
+  assert_eq!(
+    volume
+      .with_host(host)
+      .read(store, large, 10, &mut bytes)
+      .unwrap(),
+    bytes.len()
+  );
+  assert_eq!(&bytes, b"private");
+  assert_eq!(
+    volume
+      .with_host(host)
+      .read(store, large, LARGE * 2, &mut bytes),
+    Err(VfsError::BaseDrift)
   );
 }
 

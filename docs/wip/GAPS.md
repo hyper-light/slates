@@ -1298,3 +1298,48 @@ different records for one sequence number (a model error, not a design error), a
 invariant was stronger than Paxos promises (a record partially acknowledged before a promotion may
 still complete; the correct property is Continuity: the successor's base is at least as new as any
 such record). Both are recorded so the implementer knows exactly what the models guarantee.
+
+
+### 2026-09-15: retained voters, explicit recovery, enrollment and overlay images
+
+AUD-07's warm-state gap is implemented: both Raft groups and their voter identity survive in
+bounded anchor publications, with changed state retained before a reply can escape. Complete
+corruption refuses; unfinished replacement keeps the last completed publication. Whole-anchor
+loss still requires a fresh voter identity and surviving quorum admission.
+
+Explicit quorum-loss recovery is implemented through a reviewed retained-copy digest, a human
+proof and fencing/loss acknowledgements. Recovery preserves the selected committed application
+view under a new genesis; separately authorized survivors retain their old copy suspended until
+validated replacement import. A node-specific read-only recovery key makes approval usable from
+an unrelated CLI process on every platform. It does not grant landing or consumer authority.
+
+Unlisted-node enrollment is implemented with optional operator CA roots, signed region/domain
+scope, exact-leaf outbound authentication, bounded roster pages and runtime-derived peer capacity.
+Configured DNS seeds continue resolving at each fresh dial. Retained discovery rosters survive
+warm restarts without partial republishing. Neither discovery nor an outage bootstraps a group.
+
+GAP-A9-6's overlay image slice is implemented: source-directory identity, witnesses, whiteouts,
+redirects, private large-file windows and snapshots survive validated reacquisition. Source changes
+refuse; source handles are released after failed reconstruction. Independent overlay-clone host
+ownership, client open-handle handoff and complete compacted Raft transfer/message quotas
+(GAP-A9-11) remain open. This entry does not close those broader gaps or the A-9 model refinement.
+
+Linux arm64: 85 server unit tests, 143 cluster tests, 69 VFS tests, 8 daemon tests, 3 recovery
+histories, 2 live fleet histories, 1 certificate-impersonation test and 1 portable recovery CLI test
+passed. `cargo check --offline --workspace --all-targets` passed in 29.60 s. macOS workspace
+Clippy with `-D warnings` passed in 7.52 s; structural, literal, unsafe and version gates passed.
+The cached Linux image has no Clippy component, so Linux compilation supplements host Clippy.
+
+Commands, red/green results and precise limits:
+[consensus recovery](../bugs/2026-09-15-consensus-recovery.md),
+[enrollment](../bugs/2026-09-15-unlisted-node-enrollment.md),
+[overlay recovery](../bugs/2026-09-15-overlay-recovery.md).
+The new-IP whole-pod gate and its result are in [the KIND record](kind-lane.md).
+
+KIND verification on 2026-09-15 passed: whole-pod replacement changed IP, retired the old voter,
+rejoined at 10.4 s, restored both probe peers and accepted a new volume creation without bootstrap.
+Takeover served at 10.2 s. Fresh five-node and three-node formations passed. The isolated cluster
+was deleted afterward. WAN netem and safe rolling-upgrade evidence remain separate gates.
+
+The additional warm-discovery refusal/restart regression passed on macOS in 0.79 s, proving
+that a failed one-peer-capacity restore does not erase the second retained peer.

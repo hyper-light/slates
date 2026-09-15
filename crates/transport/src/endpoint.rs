@@ -252,6 +252,8 @@ enum Link {
 /// cursor; `frame_cap` sizes each frame and the receive window. Completed streams are forgotten after
 /// each exchange so a long-lived connection does not accumulate them without bound.
 pub struct Endpoint {
+  /// The client's exact peer identity, verified in addition to its issuing trust anchor.
+  pinned: Option<CertificateDer<'static>>,
   link: Link,
   peer: SocketAddrV4,
   quic: Quic,
@@ -346,6 +348,7 @@ impl Endpoint {
       link: Link::Own(socket),
       peer,
       quic: Quic::Client(client),
+      pinned: Some(pinned.clone()),
       keys: None,
       cid: None,
       conn: Connection::new(initial_receive_window(frame_cap)),
@@ -383,6 +386,7 @@ impl Endpoint {
       link: Link::Own(socket),
       peer,
       quic: Quic::Server(server),
+      pinned: None,
       keys: None,
       cid: None,
       conn: Connection::new(initial_receive_window(frame_cap)),
@@ -423,6 +427,7 @@ impl Endpoint {
       link: Link::Shared { demux, slot },
       peer,
       quic: Quic::Server(server),
+      pinned: None,
       keys: None,
       cid: None,
       conn: Connection::new(initial_receive_window(frame_cap)),
@@ -590,6 +595,15 @@ impl Endpoint {
         *last_flight = out;
       }
       if !self.quic.is_handshaking() && self.keys.is_some() {
+        if let Some(pinned) = &self.pinned
+          && self.quic.peer_certificate().as_ref() != Some(pinned)
+        {
+          return Err(EndpointError::Handshake(HandshakeError::Tls(
+            rustls::Error::InvalidCertificate(
+              rustls::CertificateError::ApplicationVerificationFailure,
+            ),
+          )));
+        }
         // The TLS bytes are all exchanged, but TLS 1.3 leaves the two ends *asymmetrically* finished —
         // the client the moment it sends its final flight, the server only when it receives it — so a
         // dropped final flight would strand the server. Confirm delivery before returning (RFC 9001

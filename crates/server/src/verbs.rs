@@ -255,6 +255,8 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::List
     | RequestBody::DaemonStatus
     | RequestBody::Bootstrap { .. }
+    | RequestBody::RecoveryPlan { .. }
+    | RequestBody::Recover { .. }
     | RequestBody::PromoteRegion { .. }
     | RequestBody::Grants
     | RequestBody::Audit { .. }
@@ -313,12 +315,11 @@ fn home_redirect(
 
 /// Route bootstrap to the sole shard that drives consensus. The bounded call owns its reply
 /// registration through cancellation; an unavailable shard cannot produce a successful bootstrap.
-fn bootstrap_on_control(
+fn consensus_on_control(
   state: &ShardState,
   client_index: u32,
   request: u64,
-  root: bool,
-  member: u64,
+  operation: impl FnOnce(&mut ShardState) -> ReplyBody + Send + 'static,
 ) -> Served {
   let Some(control) = state.shards.first().copied() else {
     return Served::Reply(refused(Refusal::ConsensusNotInitialized));
@@ -329,7 +330,7 @@ fn bootstrap_on_control(
       origin,
       control,
       move |state| {
-        let reply = crate::consensus::bootstrap(state, root, member);
+        let reply = operation(state);
         (
           reply,
           crate::consensus::Publication::capture(state),
@@ -340,8 +341,12 @@ fn bootstrap_on_control(
     )
     .await;
     let reply = match outcome {
-      Some((ReplyBody::Acknowledged, publication, shards)) => {
-        let mut reply = ReplyBody::Acknowledged;
+      Some((
+        reply @ (ReplyBody::Acknowledged | ReplyBody::RecoveryStarted { .. }),
+        publication,
+        shards,
+      )) => {
+        let mut reply = reply;
         for shard in shards.into_iter().filter(|shard| *shard != control) {
           let publication = publication.clone();
           if crate::xshard::call_within(
@@ -739,9 +744,42 @@ fn propose_region_promotion(state: &mut ShardState, region: u64) -> ReplyBody {
   }
 }
 
-/// Serves one request for one client: the completion window first (a retry returns the
-/// retained reply; a stale retry is refused), then the verb here, on its owner shard, or
-/// across every shard; the completion is recorded when the reply is known.
+/// Sends authenticated human consensus operations to the control shard (§4.8).
+fn serve_consensus_control(
+  state: &mut ShardState,
+  client: u32,
+  request: u64,
+  principal: Principal,
+  body: RequestBody,
+) -> Served {
+  if !matches!(principal, Principal::Uid { .. } | Principal::Sid { .. }) {
+    let verb = if matches!(body, RequestBody::Bootstrap { .. }) {
+      "bootstrap"
+    } else {
+      "consensus recovery"
+    };
+    return Served::Reply(forbidden(verb));
+  }
+  consensus_on_control(state, client, request, move |state| match body {
+    RequestBody::Bootstrap { root, member } => crate::consensus::bootstrap(state, root, member),
+    RequestBody::RecoveryPlan { root, target } => {
+      match crate::consensus_recovery::plan(state, root, target) {
+        Ok(plan) => ReplyBody::RecoveryPlan { plan },
+        Err(refusal) => refused(refusal),
+      }
+    }
+    RequestBody::Recover {
+      root,
+      target,
+      plan,
+      proof,
+    } => crate::consensus_recovery::recover(state, root, target, plan, proof),
+    _ => refused(Refusal::ConsensusRecoveryUnavailable),
+  })
+}
+
+/// Serves a client request: recover a previous completion or dispatch the operation to its owner
+/// shard. Scatter operations record their completion after every shard has answered.
 pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Request) -> Served {
   let (client_id, principal) = match state.clients.get(client) {
     Ok(c) => (c.client_id, c.principal.clone()),
@@ -827,11 +865,11 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   if let RequestBody::DaemonStatus = body {
     return scatter_status(state, client.index(), request.request);
   }
-  if let RequestBody::Bootstrap { root, member } = body {
-    if !matches!(principal, Principal::Uid { .. } | Principal::Sid { .. }) {
-      return Served::Reply(forbidden("bootstrap"));
-    }
-    return bootstrap_on_control(state, client.index(), request.request, root, member);
+  if matches!(
+    &body,
+    RequestBody::Bootstrap { .. } | RequestBody::RecoveryPlan { .. } | RequestBody::Recover { .. }
+  ) {
+    return serve_consensus_control(state, client.index(), request.request, principal, body);
   }
   if let RequestBody::PromoteRegion { region } = body {
     return promote_region_on_root(
@@ -1644,6 +1682,8 @@ fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
     Refusal::ConsensusAlreadyInitialized => "consensus_already_initialized",
     Refusal::ConsensusBootstrapStale => "consensus_bootstrap_stale",
+    Refusal::ConsensusRecoveryStale => "consensus_recovery_stale",
+    Refusal::ConsensusRecoveryUnavailable => "consensus_recovery_unavailable",
     Refusal::DurabilityUnmet { .. } => "durability_unmet",
     Refusal::GrantIssuerUnverified => "grant_issuer_unverified",
     Refusal::ConsumerNotEnrolled => "consumer_not_enrolled",
@@ -1828,7 +1868,9 @@ fn dispatch_inner(
     // `serve` routes this to the control shard (`promote_region_on_root`) before dispatch; this defensive arm
     // proposes on whatever shard reached it — correct on the control shard, refused `NotRootLeader` otherwise.
     RequestBody::PromoteRegion { region } => propose_region_promotion(state, region),
-    RequestBody::Bootstrap { .. } => refused(Refusal::ConsensusNotInitialized),
+    RequestBody::Bootstrap { .. }
+    | RequestBody::RecoveryPlan { .. }
+    | RequestBody::Recover { .. } => refused(Refusal::ConsensusNotInitialized),
     RequestBody::AwaitPlaced {
       volume,
       snapshot,
@@ -5253,8 +5295,13 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   }
   let mut keyed = Vec::new();
   let mut published = Published::default();
-  for (_, slot) in state.volumes.iter() {
-    match slot.volume.to_image(&state.store) {
+  let handles: Vec<_> = state.volumes.iter().map(|(handle, _)| handle).collect();
+  for handle in handles {
+    let slot = state.volumes.get_mut(handle)?;
+    match slot.volume.to_image(
+      &state.store,
+      slot.host.as_mut().map(|host| host as &mut dyn HostFs),
+    ) {
       Ok(image) => {
         published.volumes.push(slot.id);
         keyed.push(KeyedImage {
@@ -5432,42 +5479,45 @@ fn rebuild_volume(
   Ok(prefix)
 }
 
-/// Builds the recovered volume and reports its inode-number prefix. See [`rebuild_volume`] for the
-/// scratch-volume cases; a base-backed volume refuses until recovery can restore its base witnesses
-/// and retained host handles (§4.8), never reopening an unrelated current path.
+/// Rebuilds an image against its catalog base (§4.8). An overlay reacquires each source directory
+/// without following links and verifies the retained fingerprint before serving any source bytes.
 fn build_recovered_volume(
   state: &mut ShardState,
   record: &VolumeRecord,
   image: Option<&VolumeImage>,
   size: SizeClass,
 ) -> Result<(Volume, Option<OsHost>, u16), String> {
-  match (&record.base, image) {
-    (BaseRecord::Scratch, Some(image)) => {
-      let quota = quota_for(size);
-      let journal = journal_bytes_for(state, &quota);
-      let mut volume =
-        Volume::from_image(&mut state.store, image, Box::new(HostClock::new()), journal)
-          .map_err(|e| e.to_string())?;
-      // The catalog is the authority on the acknowledged size policy (§4.8, AC-2.3): a resize
-      // publishes its image before its record commits, so a crash between the two leaves the image
-      // carrying a quota no client was ever told about. The recovered volume takes the record's
-      // limit; one whose bytes exceed the acknowledged limit cannot be represented honestly and
-      // refuses rather than serving an unacknowledged capacity.
-      let acknowledged = quota.limit();
-      if volume.capacity_bytes() != acknowledged {
-        volume.resize(acknowledged).map_err(|e| {
-          format!("RecoveryIncomplete: the image's quota exceeds the acknowledged size policy: {e}")
-        })?;
-      }
-      Ok((volume, None, image.prefix))
-    }
-    (BaseRecord::Scratch, None) => {
-      Err("RecoveryIncomplete: no content image for the volume".to_owned())
-    }
-    (BaseRecord::Path { .. }, _) => {
-      Err("RecoveryIncomplete: the image has no retained base witnesses or host handles".to_owned())
-    }
+  let image =
+    image.ok_or_else(|| "RecoveryIncomplete: no content image for the volume".to_owned())?;
+  let quota = quota_for(size);
+  let journal = journal_bytes_for(state, &quota);
+  let mut opened = match &record.base {
+    BaseRecord::Scratch => None,
+    BaseRecord::Path { path } => Some(
+      OsHost::open_root(std::path::Path::new(path))
+        .map_err(|error| format!("RecoveryIncomplete: cannot reacquire the base: {error}"))?,
+    ),
+  };
+  let source = opened
+    .as_mut()
+    .map(|(host, root)| (host as &mut dyn HostFs, *root));
+  let mut volume = Volume::from_image(
+    &mut state.store,
+    image,
+    Box::new(HostClock::new()),
+    journal,
+    source,
+  )
+  .map_err(|error| error.to_string())?;
+  // The catalog is the authority on the acknowledged size policy (§4.8, AC-2.3): a resize
+  // publishes its image before its record commits. Refuse content exceeding that policy.
+  let acknowledged = quota.limit();
+  if volume.capacity_bytes() != acknowledged {
+    volume.resize(acknowledged).map_err(|error| {
+      format!("RecoveryIncomplete: the image's quota exceeds the acknowledged size policy: {error}")
+    })?;
   }
+  Ok((volume, opened.map(|(host, _)| host), image.prefix))
 }
 
 /// Trims the rebuilt volume back to the catalog (§4.8, AC-2.3): a verb publishes its effect before

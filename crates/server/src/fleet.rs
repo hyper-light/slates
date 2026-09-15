@@ -188,6 +188,10 @@ pub struct FleetPeer {
 pub struct FleetTransport {
   /// This node's fleet TLS identity (operator-provisioned).
   pub identity: Identity,
+  /// The address this node publishes to authenticated peers.
+  pub advertise: NodeAddress,
+  /// Operator trust anchors for certificates of nodes absent from the seed manifest.
+  pub enrollment_roots: Vec<CertificateDer<'static>>,
   /// The TLS server name this node presents and its peers pin.
   pub name: String,
   /// This node's probe-serve address: the one socket every peer's SWIM probes arrive on.
@@ -230,7 +234,6 @@ pub const SESSIONS_PER_PEER: usize = 2;
 struct Rostered {
   certificate: CertificateDer<'static>,
   anchor: HostId,
-  seed: HostId,
 }
 
 /// The peer a probe task tracks: its stable anchor (fixed for the task's life) and its **current** member id,
@@ -629,6 +632,8 @@ fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
 /// Detached tasks: they live as long as the shard and are cancelled by the runtime's shutdown.
 pub async fn run_membership(transport: FleetTransport) {
   let FleetTransport {
+    advertise,
+    enrollment_roots,
     identity,
     name,
     probe_bind,
@@ -636,7 +641,7 @@ pub async fn run_membership(transport: FleetTransport) {
     peers,
     resolver,
   } = transport;
-  if peers.is_empty() {
+  if peers.is_empty() && enrollment_roots.is_empty() {
     // No peers — nothing to probe; the placement path still runs the `FleetNode`, degenerate (R8).
     return;
   }
@@ -644,14 +649,49 @@ pub async fn run_membership(transport: FleetTransport) {
   // holds a private key), so the control shard owns the one copy for its life (`ShardContext::keep`) and
   // each task borrows it as `&'static`; it is dropped with the shard's context, after every task. Before
   // 2026-09-14 it was leaked once per daemon boot. The resolver every dial task shares is kept the same way.
-  let Some(identity) = slates_rt::registry::with_current(|ctx| ctx.keep(identity)) else {
+  let Some(identity) = slates_rt::registry::with_current(|ctx| {
+    ctx.keep(identity.with_authorities(enrollment_roots.clone()))
+  }) else {
     count_refusal(BIND_REFUSED);
     return;
   };
   let resolver: Option<&'static Resolver> =
     resolver.and_then(|resolver| slates_rt::registry::with_current(|ctx| ctx.keep(resolver)));
-  let neighbourhood = peers.len().saturating_add(1); // this node and its peers.
+  let neighbourhood =
+    state::with_state(|state| state.config.fleet_peer_capacity.saturating_add(1)).unwrap_or(1);
   let local = state::with_state(|s| s.fleet.host()).unwrap_or(HostId(0));
+  let initialized = state::with_state(|state| {
+    state.discovery = Some(crate::discovery::Discovery::new(
+      state,
+      name.clone(),
+      enrollment_roots.clone(),
+      identity.certificate(),
+      advertise,
+      record_bind.port(),
+      &peers,
+    )?);
+    crate::discovery::restore(state)
+  });
+  let restored = match initialized {
+    Some(Ok(restored)) => restored,
+    Some(Err(refusal)) => {
+      count_refusal(refusal.counter());
+      return;
+    }
+    None => return,
+  };
+  let Some(driver) = slates_rt::registry::with_current(|context| {
+    context.keep(PeerDriver {
+      identity,
+      name: name.clone(),
+      resolver,
+      local,
+      neighbourhood,
+    })
+  }) else {
+    count_refusal(LOOP_SPAWN_REFUSED);
+    return;
+  };
   // The boot line of the fleet's derived timing (R3: every derived value logged with its inputs). Nothing is
   // measured yet, so every value is at its floor; each period re-derives it from the measured paths, and
   // `Daemon::council_timing` / `slates status` read the live values.
@@ -687,12 +727,16 @@ pub async fn run_membership(transport: FleetTransport) {
     .map(|peer| Rostered {
       certificate: peer.certificate.clone(),
       anchor: peer.anchor,
-      seed: peer.host,
     })
     .collect();
-  let allowed: Vec<CertificateDer<'static>> =
-    roster.iter().map(|peer| peer.certificate.clone()).collect();
-  let max_sessions = peers.len().saturating_mul(SESSIONS_PER_PEER);
+  let allowed: Vec<CertificateDer<'static>> = roster
+    .iter()
+    .map(|peer| peer.certificate.clone())
+    .chain(enrollment_roots)
+    .collect();
+  let max_sessions = neighbourhood
+    .saturating_sub(1)
+    .saturating_mul(SESSIONS_PER_PEER);
   // The demultiplexers are owned by this shard for its life and dropped with it (their sockets closed,
   // the ports free again — a restarted node binds the same addresses); a start refused here means this
   // loop is not on a shard thread, counted like a socket that would not bind.
@@ -724,50 +768,53 @@ pub async fn run_membership(transport: FleetTransport) {
     LOOP_SPAWN_REFUSED,
   );
   spawn_detached(
-    accept_records(record_demux, local, roster),
+    accept_records(record_demux, local, roster, driver),
     LOOP_SPAWN_REFUSED,
   );
 
-  for peer in peers {
-    let FleetPeer {
-      anchor,
-      host,
-      address,
-      record_address,
-      certificate,
-    } = peer;
-    // The client sides each keep their own session up — the probe task the peer's probe address, the record
-    // link task the record address — so a slow or not-yet-listening peer never blocks another peer's setup.
-    let probe_dial = PeerDial {
-      anchor,
-      host,
-      name: name.clone(),
-      address,
-      certificate: certificate.clone(),
-      resolver,
-    };
-    let record_dial = PeerDial {
-      anchor,
-      host,
-      name: name.clone(),
-      address: record_address,
-      certificate,
-      resolver,
-    };
-    spawn_detached(
-      probe_peer(identity, probe_dial, local, neighbourhood),
-      LOOP_SPAWN_REFUSED,
-    );
-    spawn_detached(
-      establish_record_link(identity, record_dial),
-      LOOP_SPAWN_REFUSED,
-    );
+  for peer in peers.into_iter().chain(restored) {
+    driver.start(peer);
   }
 
   // One record-plane coordinator for all peers (§4.8 "records are sent to all candidates"): it borrows every
   // holder session the link tasks keep up, so it ships each head to all candidates in one commit and drives
   // each takeover over all surviving holders (the `f > 1` promotion a per-peer ship task could not reach).
   spawn_detached(run_record_plane(local), LOOP_SPAWN_REFUSED);
+}
+
+/// Shared immutable dial inputs, owned by the control shard; each candidate owns its two tasks.
+struct PeerDriver {
+  identity: &'static Identity,
+  name: String,
+  resolver: Option<&'static Resolver>,
+  local: HostId,
+  neighbourhood: usize,
+}
+
+impl PeerDriver {
+  fn start(&'static self, peer: FleetPeer) {
+    let probe = PeerDial {
+      anchor: peer.anchor,
+      host: peer.host,
+      name: self.name.clone(),
+      address: peer.address,
+      certificate: peer.certificate.clone(),
+      resolver: self.resolver,
+    };
+    let record = PeerDial {
+      anchor: peer.anchor,
+      host: peer.host,
+      name: self.name.clone(),
+      address: peer.record_address,
+      certificate: peer.certificate,
+      resolver: self.resolver,
+    };
+    spawn_detached(
+      probe_peer(self.identity, probe, self.local, self.neighbourhood),
+      LOOP_SPAWN_REFUSED,
+    );
+    spawn_detached(establish_record_link(self, record), LOOP_SPAWN_REFUSED);
+  }
 }
 
 /// A serve socket's receive loop as a task, for the daemon's life: it routes every datagram to its session.
@@ -808,11 +855,16 @@ async fn accept_probes(
 /// Accepts every record session a peer dials on the record socket and serves it over this node's durable
 /// holds (§4.8): one serve task per session, which resolves the peer it authenticated through `roster`.
 /// Bounded as [`accept_probes`] is.
-async fn accept_records(demux: &'static Demux, local: HostId, roster: Vec<Rostered>) {
+async fn accept_records(
+  demux: &'static Demux,
+  local: HostId,
+  roster: Vec<Rostered>,
+  driver: &'static PeerDriver,
+) {
   loop {
     let session = demux.accept().await;
     spawn_detached(
-      serve_peer_records(session, local, roster.clone()),
+      serve_peer_records(session, local, roster.clone(), driver),
       SERVE_SPAWN_REFUSED,
     );
   }
@@ -832,10 +884,19 @@ async fn accept_records(demux: &'static Demux, local: HostId, roster: Vec<Roster
 async fn client_for(
   identity: &Identity,
   name: &str,
-  address: &NodeAddress,
+  address: (&NodeAddress, crate::deploy::Plane),
   certificate: &CertificateDer<'static>,
   resolver: Option<&'static Resolver>,
 ) -> Option<Endpoint> {
+  let (address, plane) = address;
+  let discovered = state::with_state(|state| {
+    state
+      .discovery
+      .as_ref()
+      .and_then(|discovery| discovery.address(certificate, plane))
+  })
+  .flatten();
+  let address = discovered.as_ref().unwrap_or(address);
   let peer = match address {
     NodeAddress::Ip(address) => *address,
     NodeAddress::Name { host, port } => {
@@ -883,10 +944,11 @@ async fn establish_session(
   session: Option<Endpoint>,
   identity: &Identity,
   name: &str,
-  address: &NodeAddress,
+  address: (&NodeAddress, crate::deploy::Plane),
   certificate: &CertificateDer<'static>,
   resolver: Option<&'static Resolver>,
 ) -> (Option<Endpoint>, Option<Endpoint>) {
+  let (address, plane) = address;
   if session.is_some() {
     return (client, session);
   }
@@ -923,7 +985,7 @@ async fn establish_session(
       }
     },
     None => (
-      client_for(identity, name, address, certificate, resolver).await,
+      client_for(identity, name, (address, plane), certificate, resolver).await,
       None,
     ),
   }
@@ -979,7 +1041,20 @@ async fn serve_peer_probes(
       .iter()
       .find(|peer| peer.certificate == presented)
       .map(|peer| peer.anchor)
+      .or_else(|| {
+        state::with_state(|state| {
+          state
+            .discovery
+            .as_ref()
+            .and_then(|discovery| discovery.recognizes(&presented))
+        })
+        .flatten()
+      })
   });
+  if rostered_anchor.is_none() {
+    count_refusal(ACCEPT_REFUSED);
+    return;
+  }
   let local_boot_nonce = state::with_state(|s| s.member_boot_nonce).unwrap_or(0);
   let timing = detector_timing(neighbourhood);
   let fanout = usize::try_from(timing.gossip_transmits).unwrap_or(1);
@@ -1263,8 +1338,14 @@ async fn probe_peer(
   // is reused whatever a probe's outcome (see [`probe_once`]). The detector ticks only when a probe is
   // actually sent, so an as-yet-unestablished session never resolves as a missed probe and falsely ages the
   // peer.
-  let mut client: Option<Endpoint> =
-    client_for(identity, &name, &address, &certificate, resolver).await;
+  let mut client: Option<Endpoint> = client_for(
+    identity,
+    &name,
+    (&address, crate::deploy::Plane::Probe),
+    &certificate,
+    resolver,
+  )
+  .await;
   let mut session: Option<Endpoint> = None;
   let mut recorded_mesh = false;
   // A per-probe nonce the acknowledgement must echo: monotonic over this session, so every probe's nonce
@@ -1288,7 +1369,7 @@ async fn probe_peer(
       session,
       identity,
       &name,
-      &address,
+      (&address, crate::deploy::Plane::Probe),
       &certificate,
       resolver,
     )
@@ -1368,7 +1449,12 @@ fn probe_period_ns(health_multiplier: u32) -> u64 {
 /// the handshake authenticated — its certificate names it in `roster` (mutual TLS admits only roster
 /// certificates; one not found is counted, never served). A serve failure (the peer's connection dropped
 /// when it died, or its session replaced by a re-dial) ends the loop.
-async fn serve_peer_records(mut endpoint: Endpoint, local: HostId, roster: Vec<Rostered>) {
+async fn serve_peer_records(
+  mut endpoint: Endpoint,
+  local: HostId,
+  roster: Vec<Rostered>,
+  driver: &'static PeerDriver,
+) {
   if let Err(e) = endpoint.establish().await {
     if count_refusal(ACCEPT_HANDSHAKE_REFUSED) == 1 {
       eprintln!("slates-server: fleet: a dialer's record-plane handshake did not complete: {e:?}");
@@ -1382,15 +1468,18 @@ async fn serve_peer_records(mut endpoint: Endpoint, local: HostId, roster: Vec<R
   // member id — what records and ownership key on — is whatever is currently learned for that anchor (its
   // seed until it announces itself; a restart moves it), resolved per request so a node that restarted
   // mid-session is served under the id it now writes as.
-  let Some((peer_anchor, seed)) = endpoint.peer_certificate().and_then(|presented| {
-    roster
-      .iter()
-      .find(|peer| peer.certificate == presented)
-      .map(|peer| (peer.anchor, peer.seed))
-  }) else {
+  let Some(certificate) = endpoint.peer_certificate() else {
     count_refusal(ACCEPT_REFUSED);
     return;
   };
+  let peer_anchor = roster
+    .iter()
+    .find(|peer| peer.certificate == certificate)
+    .map_or_else(
+      || crate::deploy::host_id_of_certificate(&certificate),
+      |peer| peer.anchor,
+    );
+  let seed = crate::deploy::member_id(peer_anchor, 0);
   // Serve the peer's commits and prepares against this node's **durable** per-object holds in the shard
   // state, so an accepted record survives past this task — the state a survivor's phase-one recovery reads
   // on a takeover — and a prepare is answered from it. The handler runs synchronously inside `serve_once` (a
@@ -1401,87 +1490,122 @@ async fn serve_peer_records(mut endpoint: Endpoint, local: HostId, roster: Vec<R
   // kind: a record commit, a phase-one prepare, a content exchange (§4.10), a consensus step, or a forwarded
   // verb — never a guess from the bytes.
   let control = state::with_state(|s| s.shard).unwrap_or_default();
+  let mut enrolled = false;
   loop {
+    if !enrolled {
+      enrolled = state::with_state(|state| {
+        state
+          .discovery
+          .as_ref()
+          .and_then(|discovery| discovery.recognizes(&certificate))
+      })
+      .flatten()
+      .is_some();
+    }
     let served = endpoint
-      .serve_once_async(|stream, request| async move {
-        match stream {
-          RECORD_STREAM => Record::decode(&request)
-            .ok()
-            .and_then(|record| {
-              state::with_state(|s| {
-                let peer_host = s
-                  .learned_members
-                  .get(&peer_anchor)
-                  .map_or(seed, |learned| learned.host);
-                accept_held_record(s, local, peer_host, &record)
+      .serve_once_async(|stream, request| {
+        let certificate = certificate.clone();
+        async move {
+          if stream == crate::discovery::STREAM {
+            let outcome =
+              state::with_state(|state| crate::discovery::serve(state, &certificate, &request));
+            return match outcome {
+              Some(Ok((reply, peer))) => {
+                if let Some(peer) = peer {
+                  driver.start(peer);
+                }
+                reply
+              }
+              Some(Err(refusal)) => {
+                count_refusal(refusal.counter());
+                Vec::new()
+              }
+              None => Vec::new(),
+            };
+          }
+          if !enrolled {
+            count_refusal(ACCEPT_REFUSED);
+            return Vec::new();
+          }
+          match stream {
+            RECORD_STREAM => Record::decode(&request)
+              .ok()
+              .and_then(|record| {
+                state::with_state(|s| {
+                  let peer_host = s
+                    .learned_members
+                    .get(&peer_anchor)
+                    .map_or(seed, |learned| learned.host);
+                  accept_held_record(s, local, peer_host, &record)
+                })
               })
+              .unwrap_or_default(),
+            PROMOTE_STREAM => Prepare::decode(&request)
+              .ok()
+              .and_then(|prepare| {
+                state::with_state(|s| {
+                  let peer_host = s
+                    .learned_members
+                    .get(&peer_anchor)
+                    .map_or(seed, |learned| learned.host);
+                  serve_held_promotion(s, peer_host, &prepare)
+                })
+              })
+              .unwrap_or_default(),
+            stream if is_content_stream(stream) => state::with_state(|s| {
+              // A test's injected placement refusal (§4.16 placed-before-reference): a holder that
+              // refuses every content put, counted, so an owner's record is shown to wait on it.
+              if s.merge.fault.refuse_content_puts && stream == CONTENT_PUT_STREAM {
+                *s.refusals
+                  .entry(crate::merge_service::CONTENT_PUT_REFUSED)
+                  .or_insert(0) += 1;
+                return Vec::new();
+              }
+              s.held_content.serve(local, &request)
             })
             .unwrap_or_default(),
-          PROMOTE_STREAM => Prepare::decode(&request)
-            .ok()
-            .and_then(|prepare| {
-              state::with_state(|s| {
-                let peer_host = s
-                  .learned_members
-                  .get(&peer_anchor)
-                  .map_or(seed, |learned| learned.host);
-                serve_held_promotion(s, peer_host, &prepare)
+            // A green's merge record (§4.16 "Apply on holders"): recomputed before it is accepted.
+            crate::merge_service::MERGE_RECORD_STREAM => Record::decode(&request)
+              .ok()
+              .and_then(|record| {
+                state::with_state(|s| {
+                  let peer_host = s
+                    .learned_members
+                    .get(&peer_anchor)
+                    .map_or(seed, |learned| learned.host);
+                  crate::merge_service::accept_merge_record(s, local, peer_host, &record)
+                })
               })
+              .unwrap_or_default(),
+            CONFIG_STREAM => state::with_state(|s| {
+              serve_council(
+                s,
+                s.learned_members
+                  .get(&peer_anchor)
+                  .map_or(seed, |member| member.host),
+                &request,
+              )
             })
             .unwrap_or_default(),
-          stream if is_content_stream(stream) => state::with_state(|s| {
-            // A test's injected placement refusal (§4.16 placed-before-reference): a holder that
-            // refuses every content put, counted, so an owner's record is shown to wait on it.
-            if s.merge.fault.refuse_content_puts && stream == CONTENT_PUT_STREAM {
-              *s.refusals
-                .entry(crate::merge_service::CONTENT_PUT_REFUSED)
-                .or_insert(0) += 1;
-              return Vec::new();
+            CONFIG_FETCH_STREAM => {
+              state::with_state(|s| serve_config_fetch(s, &request)).unwrap_or_default()
             }
-            s.held_content.serve(local, &request)
-          })
-          .unwrap_or_default(),
-          // A green's merge record (§4.16 "Apply on holders"): recomputed before it is accepted.
-          crate::merge_service::MERGE_RECORD_STREAM => Record::decode(&request)
-            .ok()
-            .and_then(|record| {
-              state::with_state(|s| {
-                let peer_host = s
-                  .learned_members
+            ROOT_STREAM => state::with_state(|s| {
+              serve_root(
+                s,
+                s.learned_members
                   .get(&peer_anchor)
-                  .map_or(seed, |learned| learned.host);
-                crate::merge_service::accept_merge_record(s, local, peer_host, &record)
-              })
+                  .map_or(seed, |member| member.host),
+                &request,
+              )
             })
             .unwrap_or_default(),
-          CONFIG_STREAM => state::with_state(|s| {
-            serve_council(
-              s,
-              s.learned_members
-                .get(&peer_anchor)
-                .map_or(seed, |member| member.host),
-              &request,
-            )
-          })
-          .unwrap_or_default(),
-          CONFIG_FETCH_STREAM => {
-            state::with_state(|s| serve_config_fetch(s, &request)).unwrap_or_default()
+            ROOT_FETCH_STREAM => {
+              state::with_state(|s| serve_root_fetch(s, &request)).unwrap_or_default()
+            }
+            FORWARD_STREAM => verbs::serve_forward(control, peer_anchor, &request).await,
+            _ => Vec::new(),
           }
-          ROOT_STREAM => state::with_state(|s| {
-            serve_root(
-              s,
-              s.learned_members
-                .get(&peer_anchor)
-                .map_or(seed, |member| member.host),
-              &request,
-            )
-          })
-          .unwrap_or_default(),
-          ROOT_FETCH_STREAM => {
-            state::with_state(|s| serve_root_fetch(s, &request)).unwrap_or_default()
-          }
-          FORWARD_STREAM => verbs::serve_forward(control, peer_anchor, &request).await,
-          _ => Vec::new(),
         }
       })
       .await;
@@ -2611,7 +2735,9 @@ pub(crate) fn keeps_direct_contact_with(state: &ShardState, peer: HostId) -> boo
 /// behind one slow link. Idles when the peer is retired from every set this node reaches it for — its
 /// neighbourhood and its consensus groups — dropping its session (a retired peer is never a candidate or a
 /// voter again under this configuration), so it is not an unbounded retry of a dead peer (banned item 8).
-async fn establish_record_link(identity: &'static Identity, dial: PeerDial) {
+async fn establish_record_link(driver: &'static PeerDriver, dial: PeerDial) {
+  let identity = driver.identity;
+  let mut discovery_cursor = crate::discovery::Cursor::default();
   let PeerDial {
     anchor,
     host: seed,
@@ -2621,20 +2747,19 @@ async fn establish_record_link(identity: &'static Identity, dial: PeerDial) {
     resolver,
   } = dial;
   let mut peer_host = seed;
-  let mut client: Option<Endpoint> =
-    client_for(identity, &name, &address, &certificate, resolver).await;
+  let mut client: Option<Endpoint> = client_for(
+    identity,
+    &name,
+    (&address, crate::deploy::Plane::Record),
+    &certificate,
+    resolver,
+  )
+  .await;
   loop {
     // Follow the peer's current id (task #22): a restart is a new process, so the session to its previous
     // incarnation is dead by definition — drop it, and from here keep the link under the id the peer now
     // writes as (dialed again once the council admits it, as any newly admitted member is).
-    if let Some(current) = current_member(anchor)
-      && current != peer_host
-    {
-      state::with_state(|s| {
-        s.record_sessions.remove(&peer_host);
-      });
-      peer_host = current;
-    }
+    peer_host = refresh_record_identity(anchor, peer_host);
     let retired = state::with_state(|s| !keeps_direct_contact_with(s, peer_host));
     if retired == Some(true) {
       // The peer is retired. Drop its record session and **idle** — this task does not end, so if the peer
@@ -2656,17 +2781,98 @@ async fn establish_record_link(identity: &'static Identity, dial: PeerDial) {
         None,
         identity,
         &name,
-        &address,
+        (&address, crate::deploy::Plane::Record),
         &certificate,
         resolver,
       )
       .await;
       client = kept;
-      if let Some(session) = session {
-        state::with_state(|s| s.record_sessions.insert(peer_host, Some(session)));
-      }
+      enroll_record_session(session, peer_host, anchor, &mut discovery_cursor, driver).await;
+    }
+    if !absent {
+      refresh_discovery(peer_host, anchor, &mut discovery_cursor, driver).await;
     }
     futures::sleep(HEARTBEAT_NS).await;
+  }
+}
+
+fn refresh_record_identity(anchor: HostId, previous: HostId) -> HostId {
+  let current = current_member(anchor).unwrap_or(previous);
+  if current != previous {
+    state::with_state(|state| state.record_sessions.remove(&previous));
+  }
+  current
+}
+
+async fn enroll_record_session(
+  session: Option<Endpoint>,
+  peer_host: HostId,
+  anchor: HostId,
+  cursor: &mut crate::discovery::Cursor,
+  driver: &'static PeerDriver,
+) {
+  let Some(mut session) = session else {
+    return;
+  };
+  *cursor = crate::discovery::Cursor::default();
+  if exchange_discovery(&mut session, anchor, cursor, driver).await {
+    state::with_state(|state| state.record_sessions.insert(peer_host, Some(session)));
+  }
+}
+
+async fn refresh_discovery(
+  peer_host: HostId,
+  anchor: HostId,
+  cursor: &mut crate::discovery::Cursor,
+  driver: &'static PeerDriver,
+) {
+  let session = state::with_state(|state| {
+    state
+      .record_sessions
+      .get_mut(&peer_host)
+      .and_then(Option::take)
+  })
+  .flatten();
+  if let Some(mut session) = session {
+    let kept = exchange_discovery(&mut session, anchor, cursor, driver).await;
+    state::with_state(|state| {
+      if kept {
+        state.record_sessions.insert(peer_host, Some(session));
+      } else {
+        state.record_sessions.remove(&peer_host);
+      }
+    });
+  }
+}
+
+async fn exchange_discovery(
+  session: &mut Endpoint,
+  anchor: HostId,
+  cursor: &mut crate::discovery::Cursor,
+  driver: &'static PeerDriver,
+) -> bool {
+  let Some(request) = state::with_state(|state| cursor.request(state)).flatten() else {
+    return false;
+  };
+  let reply = match session.request(crate::discovery::STREAM, &request).await {
+    Ok(reply) => reply,
+    Err(_) => {
+      count_refusal(ACCEPT_REFUSED);
+      return false;
+    }
+  };
+  match state::with_state(|state| cursor.receive(state, &reply, anchor)) {
+    Some(Ok(peers)) => {
+      for peer in peers {
+        driver.start(peer);
+      }
+      true
+    }
+    Some(Err(refusal)) => {
+      count_refusal(refusal.counter());
+      false
+    }
+    None => false,
   }
 }
 
@@ -3174,6 +3380,9 @@ async fn drive_config_council(
   in_flight: &mut Vec<Dispatch>,
 ) {
   let Some((is_voter, is_leader, contact, voters)) = state::with_state(|s| {
+    if s.recovery.council.is_some() {
+      return (false, false, s.council.leader_contact(), Vec::new());
+    }
     let voters = s.council.voters();
     (
       s.council.is_voter(local),
@@ -3197,7 +3406,10 @@ async fn drive_config_council(
   // exactly as a voter's committed one is.
   if !is_voter && !is_leader {
     let wanted = state::with_state(|s| {
-      !s.council.initialized() || s.config_refresh_wanted || membership_diverges_from_config(s)
+      s.recovery.council.is_some()
+        || !s.council.initialized()
+        || s.config_refresh_wanted
+        || membership_diverges_from_config(s)
     })
     .unwrap_or(false);
     if wanted {
@@ -3314,6 +3526,9 @@ async fn drive_root_group(
   in_flight: &mut Vec<Dispatch>,
 ) {
   let Some((is_voter, is_leader, contact, voters)) = state::with_state(|s| {
+    if s.recovery.root.is_some() {
+      return (false, false, s.root.leader_contact(), Vec::new());
+    }
     let voters = s.root.voters();
     (
       s.root.is_voter(local),
@@ -3330,7 +3545,9 @@ async fn drive_root_group(
     // reactively, only when its own alive view of the regions diverges from the root configuration it holds
     // ([`root_diverges`]), so a converged learner sends nothing. The cross-region parallel of the config
     // learner's reactive fetch.
-    let wanted = state::with_state(|s| !s.root.initialized() || root_diverges(s)).unwrap_or(false);
+    let wanted =
+      state::with_state(|s| s.recovery.root.is_some() || !s.root.initialized() || root_diverges(s))
+        .unwrap_or(false);
     if wanted {
       drive_root_learner_fetch(&voters, budget, in_flight).await;
     }
@@ -3545,7 +3762,11 @@ async fn drive_root_learner_fetch(
   }
   let request = state::with_state(|s| {
     slates_wire::Wire::to_bytes(&crate::consensus::Fetch {
-      group: s.root_group,
+      group: if s.recovery.root.is_some() {
+        None
+      } else {
+        s.root_group
+      },
       version: s.root.configuration().version,
     })
   })
@@ -3612,7 +3833,11 @@ async fn drive_learner_fetch(
   // only when it has a newer one (a caught-up learner's fetch is then an empty reply, not a full transfer).
   let request = state::with_state(|s| {
     slates_wire::Wire::to_bytes(&crate::consensus::Fetch {
-      group: s.council_group,
+      group: if s.recovery.council.is_some() {
+        None
+      } else {
+        s.council_group
+      },
       version: s.council.configuration().version,
     })
   })
@@ -3666,7 +3891,8 @@ fn sync_config_from_council(local: HostId) {
   // design makes a tripwire). The committed configuration reaches the node's other shards separately, every
   // period, through [`fan_configs_to_shards`], so a failed cross-shard dispatch self-heals.
   state::with_state(|s| {
-    s.consensus_ready = s.council.initialized()
+    s.consensus_ready = !s.recovery.joining()
+      && s.council.initialized()
       && s.root.initialized()
       && s.council.configuration().members.contains(&local);
 

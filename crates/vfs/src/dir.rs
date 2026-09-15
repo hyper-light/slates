@@ -76,7 +76,7 @@ pub struct EntryRef<'a> {
 }
 
 /// The base-plane state of a directory (§4.5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, slates_wire::Wire)]
 pub enum BaseDirState {
   /// No base beneath.
   None,

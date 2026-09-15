@@ -463,6 +463,46 @@ pub enum RequestBody {
     /// The fresh member id read from this daemon's status before the explicit request.
     member: u64,
   },
+  /// Inspect this member's retained state before an explicit quorum-loss recovery (§4.8).
+  RecoveryPlan {
+    /// Root or regional group.
+    root: bool,
+    /// Join this explicitly named replacement group instead of creating its first voter.
+    target: Option<[u8; 32]>,
+  },
+  /// Authorize exactly the reviewed recovery plan using the anchor's human capability.
+  Recover {
+    /// Root or regional group.
+    root: bool,
+    /// The replacement group to join, or none to recover this copy as its first voter.
+    target: Option<[u8; 32]>,
+    /// Digest returned by `RecoveryPlan`.
+    plan: [u8; 32],
+    /// The human surface's capability proof over the reviewed plan.
+    proof: [u8; 32],
+  },
+}
+
+/// A concrete quorum-loss recovery proposal (§4.8). It identifies the retained copy and the
+/// old voters the operator must fence; it cannot prove that an unreachable copy holds no newer data.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct ConsensusRecoveryPlan {
+  /// The member performing this operation.
+  pub member: u64,
+  /// The old consensus group.
+  pub previous: [u8; 32],
+  /// This exact proposal, bound to the daemon start and retained state.
+  pub digest: [u8; 32],
+  /// The last locally known committed Raft position.
+  pub committed: u64,
+  /// The retained log's last position, including its uncommitted tail.
+  pub last_log: u64,
+  /// The last locally known committed application version, including a learner's fetched view.
+  pub version: u64,
+  /// The old configuration's voters, including both sides of an unfinished joint change.
+  pub voters: Vec<u64>,
+  /// Explicitly approved destination, or none when creating the replacement group.
+  pub target: Option<[u8; 32]>,
 }
 
 /// What a signal's absence means (§4.14, A-9): a missing sample is never silently read as "healthy".
@@ -1616,6 +1656,10 @@ pub enum Refusal {
   ConsensusAlreadyInitialized,
   /// This explicit bootstrap request names a different daemon start.
   ConsensusBootstrapStale,
+  /// The reviewed state or daemon authority changed before recovery was authorized.
+  ConsensusRecoveryStale,
+  /// No complete group state is available, or its counters cannot advance safely.
+  ConsensusRecoveryUnavailable,
 }
 
 /// A reply body. (`Eq` is not derived: a [`Refusal`] may carry measured probabilities.)
@@ -1814,6 +1858,18 @@ pub enum ReplyBody {
   ReadBytes {
     /// The bytes.
     bytes: Vec<u8>,
+  },
+  /// The local copy and exact action proposed for operator-reviewed quorum-loss recovery.
+  RecoveryPlan {
+    /// The proposal.
+    plan: ConsensusRecoveryPlan,
+  },
+  /// The reviewed replacement was created or its bounded join was authorized.
+  RecoveryStarted {
+    /// The replacement consensus identity.
+    group: [u8; 32],
+    /// Whether this node still has to fetch and join that group.
+    joining: bool,
   },
 }
 

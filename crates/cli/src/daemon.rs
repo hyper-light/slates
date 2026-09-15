@@ -75,6 +75,7 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
     ),
   };
   let mut config = DaemonConfig::derive(&profile, &options.instance);
+  config.recovery_key = crate::recovery_key::load()?;
   if let Some(shards) = options.shards {
     config = config.with_shards(shards);
   }

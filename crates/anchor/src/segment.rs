@@ -512,9 +512,7 @@ impl AnchorSegment {
       return Ok(None);
     }
     if !before.is_multiple_of(2) {
-      return Err(AnchorError::Layout {
-        reason: "a writer is inside the payload",
-      });
+      return Err(AnchorError::PublicationInProgress);
     }
     let bytes = self.region_bytes(kind)?;
     let len = usize::try_from(read_u64(bytes, PAYLOAD_LEN)).map_err(|_| AnchorError::Layout {

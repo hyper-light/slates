@@ -61,18 +61,30 @@ fn pause() {
 /// behind.
 struct AnchorProcess {
   child: Child,
+  drain: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for AnchorProcess {
   fn drop(&mut self) {
     let _ = self.child.kill();
     let _ = self.child.wait();
+    if let Some(drain) = self.drain.take() {
+      let _ = drain.join();
+    }
   }
 }
 
 /// Starts the anchor and waits until a verb is answered.
 fn start_anchor(instance: &str) -> AnchorProcess {
+  start_anchor_with_environment(instance, &[])
+}
+
+fn start_anchor_with_environment(
+  instance: &str,
+  environment: &[(String, String)],
+) -> AnchorProcess {
   let child = slates()
+    .envs(environment.iter().cloned())
     .args([
       "--instance",
       instance,
@@ -85,7 +97,7 @@ fn start_anchor(instance: &str) -> AnchorProcess {
     .stderr(Stdio::inherit())
     .spawn()
     .unwrap();
-  let anchor = AnchorProcess { child };
+  let anchor = AnchorProcess { child, drain: None };
   let started = Instant::now();
   // The anchor restarts the daemon once at startup if its first heartbeat lapses (a known liveness
   // recovery, logged as "heartbeat lapsed; killing it"). Wait for several *consecutive* successes so
@@ -698,7 +710,7 @@ fn start_anchor_with_issuer_surface(instance: &str) -> (AnchorProcess, Vec<(Stri
     .spawn()
     .unwrap();
   let mut stderr = BufReader::new(child.stderr.take().unwrap());
-  let anchor = AnchorProcess { child };
+  let mut anchor = AnchorProcess { child, drain: None };
   let mut exports = Vec::new();
   let mut line = String::new();
   while exports.is_empty() {
@@ -719,9 +731,9 @@ fn start_anchor_with_issuer_surface(instance: &str) -> (AnchorProcess, Vec<(Stri
     }
   }
   // Drain what the anchor says from here on (restarts, stops) so it never blocks writing.
-  std::thread::spawn(move || {
+  anchor.drain = Some(std::thread::spawn(move || {
     let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-  });
+  }));
   let started = Instant::now();
   let mut streak = 0u32;
   loop {
@@ -1861,4 +1873,107 @@ fn an_oci_container_consumes_the_host_attachment_through_the_runtime_bind() {
   drop(mount_point);
   assert!(!is_mounted(&path), "the mount table no longer lists it");
   drop(anchor);
+}
+
+/// T-2.14 / AUD-07: review a recovery plan through the real CLI, refuse missing authority,
+/// then approve that exact plan through the anchor issuer and continue serving the retained catalog.
+#[test]
+fn recovery_approval_is_bound_to_the_reviewed_plan_and_anchor_issuer() {
+  if cfg!(target_os = "linux") {
+    eprintln!(
+      "skipping named anchor issuer surface on Linux: exercised by the provisioned recovery key test"
+    );
+    return;
+  }
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!("skipping recovery CLI flow: set SLATES_TEST_CLI=1");
+    return;
+  }
+  let instance = format!("cli-recover-{}", std::process::id());
+  let (_anchor, exports) = start_anchor_with_issuer_surface(&instance);
+  assert_eq!(run(&instance, &["bootstrap", "root"]).0, 0);
+  let (code, stdout, stderr) = run(&instance, &["recovery-plan", "root", "--json"]);
+  assert_eq!(code, 0, "{stderr}");
+  let plan: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+  let digest = plan["plan"].as_str().unwrap();
+  let args = [
+    "recover",
+    "root",
+    "--confirm",
+    digest,
+    "--fenced",
+    "--accept-loss",
+    "--json",
+  ];
+  assert_ne!(run(&instance, &args).0, 0, "no ambient authority");
+  let (code, stdout, stderr) = run_as_issuer(&instance, &exports, &args);
+  assert_eq!(code, 0, "{stderr}");
+  let recovered: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+  assert_ne!(recovered["group"], plan["previous_group"]);
+  assert_eq!(
+    run_as_issuer(&instance, &exports, &args).0,
+    0,
+    "idempotent approval"
+  );
+  assert_eq!(run(&instance, &["volume", "list"]).0, 0);
+}
+
+/// T-2.14 / AUD-07: a separately invoked CLI can approve recovery on every platform using
+/// a node-specific operator key; absence, a wrong key and malformed key bytes all refuse.
+#[test]
+#[allow(clippy::disallowed_methods)] // Operator fixtures live only in the explicitly supplied RAM directory.
+fn recovery_approval_uses_the_provisioned_node_key_across_processes() {
+  let Some(ram) = std::env::var_os("SLATES_TEST_RAM") else {
+    eprintln!("skipping portable recovery CLI flow: set SLATES_TEST_RAM to a RAM-backed directory");
+    return;
+  };
+  let path = std::path::PathBuf::from(ram).join(format!("slates-recovery-{}", std::process::id()));
+  std::fs::create_dir(&path).unwrap();
+  let _scratch = ScratchDir {
+    path: path.to_string_lossy().into_owned(),
+  };
+  let key_path = path.join("recovery.key");
+  std::fs::write(&key_path, [91u8; 32]).unwrap();
+  let environment = vec![(
+    "SLATES_RECOVERY_KEY".to_owned(),
+    key_path.to_string_lossy().into_owned(),
+  )];
+  let instance = format!("cli-node-recover-{}", std::process::id());
+  let _anchor = start_anchor_with_environment(&instance, &environment);
+  let (code, stdout, stderr) = run(&instance, &["recovery-plan", "root", "--json"]);
+  assert_eq!(code, 0, "{stderr}");
+  let plan: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+  let args = [
+    "recover",
+    "root",
+    "--confirm",
+    plan["plan"].as_str().unwrap(),
+    "--fenced",
+    "--accept-loss",
+    "--json",
+  ];
+  assert_ne!(run(&instance, &args).0, 0, "no ambient recovery authority");
+  std::fs::write(&key_path, [92u8; 32]).unwrap();
+  assert_ne!(
+    run_as_issuer(&instance, &environment, &args).0,
+    0,
+    "another node's key refuses"
+  );
+  std::fs::write(&key_path, [91u8; 33]).unwrap();
+  assert_ne!(
+    run_as_issuer(&instance, &environment, &args).0,
+    0,
+    "oversized key refuses"
+  );
+  std::fs::write(&key_path, [91u8; 32]).unwrap();
+  let (code, stdout, stderr) = run_as_issuer(&instance, &environment, &args);
+  assert_eq!(code, 0, "{stderr}");
+  let recovered: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+  assert_ne!(recovered["group"], plan["previous_group"]);
+  assert_eq!(
+    run_as_issuer(&instance, &environment, &args).0,
+    0,
+    "idempotent approval"
+  );
+  assert_eq!(run(&instance, &["volume", "list"]).0, 0);
 }

@@ -7,6 +7,15 @@ use slates_mem::MemError;
 /// A typed refusal from the anchor; never a panic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnchorError {
+  /// A process stopped while replacing a payload; a separate completed slot may be recovered.
+  PublicationInProgress,
+  /// The complete Raft publication exceeded its geometry-derived memory budget.
+  ConsensusCapacity {
+    /// Bytes in the attempted publication.
+    offered: usize,
+    /// Bytes available in one publication slot.
+    capacity: usize,
+  },
   /// The shared memory object refused.
   Memory(MemError),
   /// The segment's header is not one of ours, or is torn.
@@ -53,6 +62,11 @@ pub enum AnchorError {
 impl fmt::Display for AnchorError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
+      Self::PublicationInProgress => f.write_str("a payload publication is unfinished"),
+      Self::ConsensusCapacity { offered, capacity } => write!(
+        f,
+        "consensus publication of {offered} bytes exceeds its {capacity}-byte budget"
+      ),
       Self::Memory(e) => write!(f, "shared memory: {e}"),
       Self::Layout { reason } => write!(f, "segment layout: {reason}"),
       Self::Identity { cached, current } => {

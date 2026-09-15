@@ -45,7 +45,7 @@ fn image_with(content: &[u8]) -> VolumeImage {
   let root = vol.root_inode(&store).unwrap();
   let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
   vol.write(&mut store, f, 0, content).unwrap();
-  vol.to_image(&store).unwrap()
+  vol.to_image(&store, None).unwrap()
 }
 
 /// The inode image with number `no`; the walk yields each inode once, so this is unique.
@@ -61,7 +61,7 @@ fn inode(image: &VolumeImage, no: InodeNo) -> &InodeImage {
 
 /// The child number of `name` in a directory inode's entries.
 fn entry(image: &VolumeImage, dir: InodeNo, name: &str) -> u64 {
-  let BodyImage::Directory { entries } = &inode(image, dir).body else {
+  let BodyImage::Directory { entries, .. } = &inode(image, dir).body else {
     panic!("inode {dir:?} is a directory in the image");
   };
   entries
@@ -69,6 +69,7 @@ fn entry(image: &VolumeImage, dir: InodeNo, name: &str) -> u64 {
     .find(|e| e.name == name)
     .expect("the entry is present")
     .child
+    .expect("a visible inode")
 }
 
 /// A scratch volume with a small inline file, a multi-chunk file in a subdirectory, a symlink and a
@@ -99,7 +100,7 @@ fn built() -> Built {
   let link = vol.symlink_no(&mut store, root, "link", "dir/big").unwrap();
   // A second name for `small`, in another directory: a hard link.
   vol.link_no(&mut store, dir, "small_alias", small).unwrap();
-  let image = vol.to_image(&store).unwrap();
+  let image = vol.to_image(&store, None).unwrap();
   Built {
     image,
     root,
@@ -202,11 +203,17 @@ fn a_volume_rebuilt_from_its_image_is_faithful() {
   // "Restart": a fresh store, rebuild the volume from the published image bytes.
   let mut fresh = store();
   let image = VolumeImage::from_content(&original).unwrap();
-  let vol =
-    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  let vol = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
 
   // The rebuilt volume re-images byte-for-byte identically: nothing was lost or changed.
-  let rebuilt = vol.to_image(&fresh).unwrap().to_content();
+  let rebuilt = vol.to_image(&fresh, None).unwrap().to_content();
   assert_eq!(
     rebuilt, original,
     "the rebuilt volume re-images identically"
@@ -246,8 +253,14 @@ fn a_volume_survives_a_content_object_handoff() {
 
   // Rebuild and read the bytes written before the "restart" through their original inode number.
   let mut fresh = store();
-  let vol =
-    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  let vol = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
   let mut got = vec![0u8; b.big_bytes.len()];
   let n = vol.read(&fresh, b.big, 0, &mut got).unwrap();
   got.truncate(n);
@@ -256,7 +269,7 @@ fn a_volume_survives_a_content_object_handoff() {
     "bytes written before the content-object handoff read back after it"
   );
   assert_eq!(
-    vol.to_image(&fresh).unwrap(),
+    vol.to_image(&fresh, None).unwrap(),
     image,
     "the rebuilt volume is fully faithful"
   );
@@ -386,17 +399,23 @@ fn a_clone_recovers_inherited_and_diverged_content() {
     .unwrap();
   clone.write(&mut src, own, 0, b"from the clone").unwrap();
 
-  let image = clone.to_image(&src).unwrap();
+  let image = clone.to_image(&src, None).unwrap();
   assert!(
     image.origin_epoch.is_some(),
     "a clone records its origin epoch"
   );
 
   let mut fresh = store();
-  let recovered =
-    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  let recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
   assert_eq!(
-    recovered.to_image(&fresh).unwrap(),
+    recovered.to_image(&fresh, None).unwrap(),
     image,
     "the clone rebuilds faithfully"
   );
@@ -428,11 +447,11 @@ fn a_whole_shard_of_volumes_survives_a_content_object_handoff() {
   let shard = ShardImage::new(vec![
     KeyedImage {
       key: key_bytes(7),
-      image: a.to_image(&original).unwrap(),
+      image: a.to_image(&original, None).unwrap(),
     },
     KeyedImage {
       key: key_bytes(8),
-      image: b.to_image(&original).unwrap(),
+      image: b.to_image(&original, None).unwrap(),
     },
   ]);
   let mut object = SharedObject::create(&object_name("s"), CONTENT_LEN).unwrap();
@@ -459,10 +478,11 @@ fn a_whole_shard_of_volumes_survives_a_content_object_handoff() {
       &keyed.image,
       Box::new(StepClock::new(0, 1)),
       1 << 16,
+      None,
     )
     .unwrap();
     assert_eq!(
-      vol.to_image(&fresh).unwrap(),
+      vol.to_image(&fresh, None).unwrap(),
       keyed.image,
       "volume with key {:?} rebuilds faithfully",
       keyed.key
@@ -534,12 +554,18 @@ fn a_dynamic_volume_recovers_with_its_quota_and_growth() {
   let grown = vol.budget_hold();
   assert!(grown > 0, "the dynamic volume took growth from the budget");
 
-  let image = vol.to_image(&src).unwrap();
+  let image = vol.to_image(&src, None).unwrap();
   let mut fresh = store();
-  let recovered =
-    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  let recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
   assert_eq!(
-    recovered.to_image(&fresh).unwrap(),
+    recovered.to_image(&fresh, None).unwrap(),
     image,
     "the dynamic volume round-trips: max, granted and denied are preserved"
   );
@@ -670,14 +696,20 @@ fn an_unlinked_but_open_orphan_recovers_its_content() {
     "the orphan is still readable by number while open"
   );
 
-  let image = vol.to_image(&src).unwrap();
+  let image = vol.to_image(&src, None).unwrap();
   assert!(
     image.inodes.iter().any(|i| i.no == f.0),
     "the orphan inode is captured in the image (the walk covers the inode table, not just the tree)"
   );
   let mut fresh = store();
-  let mut recovered =
-    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  let mut recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
   let n = recovered.read(&fresh, f, 0, &mut buf).unwrap();
   assert_eq!(
     &buf[..n],
@@ -768,7 +800,7 @@ fn to_image_captures_a_snapshots_frozen_content() {
   let _snap = vol.snapshot(&mut store).unwrap();
   vol.write(&mut store, f, 0, b"after-the-snapshot").unwrap();
 
-  let image = vol.to_image(&store).unwrap();
+  let image = vol.to_image(&store, None).unwrap();
   assert_eq!(image.snapshots.len(), 1, "the snapshot is captured");
 
   let head = image.inodes.iter().find(|i| i.no == f.0).unwrap();
@@ -808,7 +840,7 @@ fn a_volume_with_a_snapshot_rebuilds_faithfully() {
   vol.write(&mut src, f, 0, b"v2-modified").unwrap();
   vol.create_file_no(&mut src, root, "g", 0o644).unwrap();
 
-  let original = vol.to_image(&src).unwrap();
+  let original = vol.to_image(&src, None).unwrap();
 
   let mut fresh = store();
   let recovered = Volume::from_image(
@@ -816,11 +848,12 @@ fn a_volume_with_a_snapshot_rebuilds_faithfully() {
     &original,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
+    None,
   )
   .unwrap();
 
   assert_eq!(
-    recovered.to_image(&fresh).unwrap(),
+    recovered.to_image(&fresh, None).unwrap(),
     original,
     "the volume with a snapshot re-images identically after rebuild"
   );
@@ -858,10 +891,16 @@ fn a_recovered_snapshot_id_survives_when_it_is_not_the_first_slot() {
   vol.write(&mut src, f, 0, b"head").unwrap();
   vol.destroy_snapshot(&mut src, snap_a).unwrap(); // frees slot zero; snap_b keeps slot one
 
-  let image = vol.to_image(&src).unwrap();
+  let image = vol.to_image(&src, None).unwrap();
   let mut fresh = store();
-  let recovered =
-    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  let recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
 
   let mut buf = vec![0u8; 16];
   let n = recovered.read_in(&fresh, snap_b, f, 0, &mut buf).unwrap();
@@ -888,10 +927,16 @@ fn dropping_a_recovered_snapshot_frees_its_tree() {
     .unwrap();
   let snap = vol.snapshot(&mut src).unwrap();
 
-  let image = vol.to_image(&src).unwrap();
+  let image = vol.to_image(&src, None).unwrap();
   let mut fresh = store();
-  let mut recovered =
-    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  let mut recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
 
   // The recovered snapshot is an independent tree (its own root and file inode), so dropping it must
   // free those inode slab slots. An empty deadlist (the bug) would free nothing.
@@ -926,10 +971,16 @@ fn dropping_a_recovered_snapshot_leaves_the_head_readable() {
   let snap = vol.snapshot(&mut src).unwrap();
   vol.write(&mut src, changed, 0, b"version-two").unwrap(); // longer, so it fully overwrites
 
-  let image = vol.to_image(&src).unwrap();
+  let image = vol.to_image(&src, None).unwrap();
   let mut fresh = store();
-  let mut recovered =
-    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  let mut recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
 
   recovered.destroy_snapshot(&mut fresh, snap).unwrap();
 
@@ -964,10 +1015,16 @@ fn a_recovered_snapshot_shares_unchanged_inodes_with_the_head() {
   let _snap = vol.snapshot(&mut src).unwrap();
   vol.write(&mut src, b, 0, b"v2-longer").unwrap(); // b differs; a is unchanged
 
-  let image = vol.to_image(&src).unwrap();
+  let image = vol.to_image(&src, None).unwrap();
   let mut fresh = store();
-  let _recovered =
-    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  let _recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
   assert_eq!(
     fresh.inodes.len(),
     5,
@@ -991,7 +1048,7 @@ fn a_snapshot_image_holds_a_delta_not_a_second_copy_of_the_head() {
   let _snap = vol.snapshot(&mut src).unwrap();
   vol.write(&mut src, diverged, 0, b"v2-longer").unwrap(); // b diverges; a stays shared
 
-  let image = vol.to_image(&src).unwrap();
+  let image = vol.to_image(&src, None).unwrap();
   let snap = &image.snapshots[0];
   assert!(
     snap
@@ -1031,7 +1088,7 @@ fn a_version_shared_across_snapshots_is_captured_once_and_recovers_shared() {
   let snap_b = vol.snapshot(&mut src).unwrap(); // f unchanged between a and b
   vol.write(&mut src, f, 0, b"edited-in-head").unwrap(); // f diverges from both snapshots
 
-  let image = vol.to_image(&src).unwrap();
+  let image = vol.to_image(&src, None).unwrap();
   let a = image
     .snapshots
     .iter()
@@ -1058,10 +1115,16 @@ fn a_version_shared_across_snapshots_is_captured_once_and_recovers_shared() {
   );
 
   let mut fresh = store();
-  let mut recovered =
-    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  let mut recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
   assert_eq!(
-    recovered.to_image(&fresh).unwrap(),
+    recovered.to_image(&fresh, None).unwrap(),
     image,
     "the deduplicated image round-trips: the rebuilt store re-captures to the same image"
   );
@@ -1116,10 +1179,16 @@ fn a_shared_version_survives_newest_first_drops_with_slot_reuse() {
   let s3 = vol.snapshot(&mut src).unwrap(); // f unchanged across all three
   vol.write(&mut src, f, 0, b"head-edit").unwrap(); // f diverges; all three share the frozen version
 
-  let image = vol.to_image(&src).unwrap();
+  let image = vol.to_image(&src, None).unwrap();
   let mut fresh = store();
-  let mut rec =
-    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  let mut rec = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
   assert_eq!(
     fresh.inodes.len(),
     6,
@@ -1185,7 +1254,7 @@ fn an_image_round_trips_through_its_content_bytes_unchanged() {
   vol.write(&mut store, f, 0, b"round trip").unwrap();
   vol.mkdir_no(&mut store, root, "d", 0o755).unwrap();
 
-  let image = vol.to_image(&store).unwrap();
+  let image = vol.to_image(&store, None).unwrap();
   let bytes = image.to_content();
   let back = VolumeImage::from_content(&bytes).expect("a well-formed image decodes");
   assert_eq!(
@@ -1206,8 +1275,8 @@ fn two_images_of_the_same_volume_are_byte_identical() {
     vol.write(&mut store, f, 0, name.as_bytes()).unwrap();
   }
 
-  let first = vol.to_image(&store).unwrap().to_content();
-  let second = vol.to_image(&store).unwrap().to_content();
+  let first = vol.to_image(&store, None).unwrap().to_content();
+  let second = vol.to_image(&store, None).unwrap().to_content();
   assert_eq!(first, second, "the image is deterministic");
 }
 
@@ -1229,7 +1298,7 @@ fn a_corrupt_or_foreign_image_is_refused_not_read_as_empty() {
   let root = vol.root_inode(&store).unwrap();
   let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
   vol.write(&mut store, f, 0, b"payload").unwrap();
-  let good = vol.to_image(&store).unwrap().to_content();
+  let good = vol.to_image(&store, None).unwrap().to_content();
 
   assert!(refused(&[]), "empty content");
   assert!(refused(&[0u8; 16]), "an all-zero (fresh) content object");
@@ -1300,18 +1369,24 @@ fn a_semantically_malformed_image_is_refused_by_the_rebuild() {
   // Craft a dangling reference: the root directory gains an entry naming an inode that does not exist.
   for inode in &mut image.inodes {
     if inode.no == root_no
-      && let BodyImage::Directory { entries } = &mut inode.body
+      && let BodyImage::Directory { entries, .. } = &mut inode.body
     {
       entries.push(EntryImage {
         name: "dangling".to_string(),
-        child: 999_999,
+        child: Some(999_999),
       });
     }
   }
   let mut fresh = store();
   assert!(
     matches!(
-      Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16),
+      Volume::from_image(
+        &mut fresh,
+        &image,
+        Box::new(StepClock::new(0, 1)),
+        1 << 16,
+        None
+      ),
       Err(VfsError::RecoveryIncomplete)
     ),
     "a dangling directory reference is refused by the rebuild, not panicked or half-built"

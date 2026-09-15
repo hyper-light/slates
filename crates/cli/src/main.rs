@@ -27,6 +27,7 @@ mod fleet;
 mod format;
 mod mount;
 mod parent;
+mod recovery_key;
 mod signal;
 mod verbs;
 

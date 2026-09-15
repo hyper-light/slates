@@ -2,9 +2,9 @@
 //! owned QUIC dialect keeps TLS 1.3 for the handshake and record protection (D-15, not hecate's
 //! Noise): `rustls::quic` runs the RFC 9001 handshake in CRYPTO frames and hands back the packet-
 //! protection keys per encryption level. Authentication is **mutual**: each node presents its
-//! **enrolled identity** — a self-signed certificate the peer pins — and the server likewise pins the
-//! client's, so a holder authenticates its caller (server-cert pinning alone does not, §4.13). There is
-//! no CA PKI. A term/epoch advance drops the session (fencing, D-16) — owed with membership.
+//! enrolled certificate. Configured peers pin the exact leaf; optional operator CA roots admit
+//! enrollment candidates. Subsequent dials still verify the exact advertised leaf, so sharing
+//! an issuer never permits impersonating another peer (§4.13).
 //!
 //! This module holds the **one `Arc` in slates**: `rustls::quic::{Client,Server}Connection::new`
 //! take `Arc<ClientConfig>`/`Arc<ServerConfig>` by signature (D-8 exception 2 — a foreign API that
@@ -51,6 +51,7 @@ impl From<rustls::Error> for HandshakeError {
 pub struct Identity {
   cert: CertificateDer<'static>,
   key: PrivateKeyDer<'static>,
+  authorities: Vec<CertificateDer<'static>>,
 }
 
 impl Identity {
@@ -58,7 +59,18 @@ impl Identity {
   /// distributes these — owed; this is the seam it fills). The self-signed test identities are minted
   /// with `rcgen` in the tests.
   pub fn from_der(cert: CertificateDer<'static>, key: PrivateKeyDer<'static>) -> Identity {
-    Identity { cert, key }
+    Identity {
+      cert,
+      key,
+      authorities: Vec::new(),
+    }
+  }
+
+  /// Trust anchors the operator supplied for issued peer certificates. The endpoint still pins
+  /// the exact presented leaf, so another certificate under this issuer cannot impersonate a peer.
+  pub fn with_authorities(mut self, authorities: Vec<CertificateDer<'static>>) -> Self {
+    self.authorities = authorities;
+    self
   }
 
   /// The peer-pinnable certificate (the identity to trust, as enrollment would distribute it).
@@ -95,6 +107,35 @@ pub fn server_config(
   identity: &Identity,
   allowed_clients: &[CertificateDer<'static>],
 ) -> Result<ServerConfig, HandshakeError> {
+  let verifier = client_verifier(allowed_clients)?;
+  // structural: allow — D-8 exception 2: `with_client_cert_verifier` takes `Arc` by signature.
+  let verifier = Arc::new(RosterVerifier { inner: verifier });
+  let mut config = ServerConfig::builder_with_provider(provider())
+    .with_protocol_versions(&[&rustls::version::TLS13])?
+    .with_client_cert_verifier(verifier)
+    .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())?;
+  config.send_tls13_tickets = 0;
+  Ok(config)
+}
+
+/// Verifies a relayed enrollment certificate with the same trust and expiry rules as TLS.
+/// Calling this does not prove possession; the later pinned TLS session proves that separately.
+pub fn verify_enrolled_certificate(
+  certificate: &CertificateDer<'static>,
+  authorities: &[CertificateDer<'static>],
+) -> Result<(), HandshakeError> {
+  client_verifier(authorities)?.verify_client_cert(
+    certificate,
+    &[],
+    rustls::pki_types::UnixTime::now(),
+  )?;
+  Ok(())
+}
+
+fn client_verifier(
+  allowed_clients: &[CertificateDer<'static>],
+  // structural: allow — D-8 exception 2: rustls returns this verifier as Arc; RosterVerifier and rustls own it.
+) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, HandshakeError> {
   let mut roots = RootCertStore::empty();
   for cert in allowed_clients {
     roots
@@ -106,14 +147,7 @@ pub fn server_config(
   let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider())
     .build()
     .map_err(|e| HandshakeError::Setup(e.to_string()))?;
-  // structural: allow — D-8 exception 2: `with_client_cert_verifier` takes `Arc` by signature.
-  let verifier = Arc::new(RosterVerifier { inner: verifier });
-  let mut config = ServerConfig::builder_with_provider(provider())
-    .with_protocol_versions(&[&rustls::version::TLS13])?
-    .with_client_cert_verifier(verifier)
-    .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())?;
-  config.send_tls13_tickets = 0;
-  Ok(config)
+  Ok(verifier)
 }
 
 /// The roster verifier: rustls's web-PKI client verifier over the admitted certificates, with **no
@@ -189,6 +223,11 @@ pub fn client_config(
   client_identity: &Identity,
 ) -> Result<ClientConfig, HandshakeError> {
   let mut roots = RootCertStore::empty();
+  for authority in &client_identity.authorities {
+    roots
+      .add(authority.clone())
+      .map_err(|error| HandshakeError::Setup(error.to_string()))?;
+  }
   roots
     .add(pinned_server)
     .map_err(|e| HandshakeError::Setup(e.to_string()))?;

@@ -38,6 +38,44 @@ After starting a new standalone daemon or the first node of a new fleet, run fro
 slates --instance NAME bootstrap root
 ```
 
+### Recovering a lost consensus quorum
+
+Warm daemon restarts recover both groups from anchor RAM automatically. Whole-anchor loss
+joins under a fresh member identity when each group still has a quorum.
+
+If a group has lost its quorum, compare `slates recovery-plan root --json` (or `region`) on
+the surviving nodes. The plan identifies the retained committed position, application version,
+uncommitted tail and former voters. Choose the most complete retained copy of the same group.
+Fence the entire former group and prevent its clients from continuing before recovery.
+Unreachable copies may contain newer committed state; recovery cannot rule out that loss.
+
+```sh
+slates recovery-plan root --json
+slates recover root --confirm PLAN --fenced --accept-loss --json
+```
+
+Before starting the anchor, operators on any platform can set `SLATES_RECOVERY_KEY` to a
+read-only file containing exactly 32 random bytes (not all zero), provisioned separately for that node.
+Set the same path in the recovery CLI's environment. A Kubernetes Secret mount, a VM secret
+mount or an operator-owned local file uses the same reader. Never share this key across nodes;
+it authorizes consensus recovery only. The daemon reads it at startup. An unreadable, zero or
+wrong-sized configured key refuses; restart with the new key to rotate it.
+
+With no configured recovery key, approval requires the anchor's human capability (the named
+issuer surface on macOS/Windows; Linux operators should provision the recovery key). The
+second command refuses if the reviewed state or recovery authority has changed. Its reply names the replacement `GROUP`. On each other
+survivor, explicitly authorize joining that group:
+
+```sh
+slates recovery-plan root --join-group GROUP --json
+slates recover root --join-group GROUP --confirm PLAN --fenced --accept-loss --json
+```
+
+A pending join stops voting and proposing in the old group but retains its state until the
+replacement validates. It survives a warm restart and refuses a replacement older than the
+node's known application version. Discovery cannot authorize recovery. Use `region` in the
+same commands when recovering a regional council.
+
 Run it once on one node of the first region. For each additional region, wait for the root to admit
 that region, then run `slates bootstrap region` once on one of its nodes. The authenticated local
 account may issue bootstrap; an enrolled consumer or forwarded fleet request cannot. The CLI binds

@@ -344,6 +344,8 @@ impl SavedRaft {
 /// `log` and how far it is committed, and — while leader — the per-follower `next_index`/`match_index`
 /// replication progress.
 pub struct RaftNode {
+  /// Changed persistent state, cleared only after its owner publishes it (§4.8).
+  retention_pending: bool,
   id: HostId,
   voters: Vec<HostId>,
   joint: Option<Vec<HostId>>,
@@ -376,6 +378,7 @@ impl RaftNode {
   /// The caller must never use this constructor to recreate a state-losing voter under its old id.
   pub fn new(id: HostId, voters: Vec<HostId>) -> RaftNode {
     RaftNode {
+      retention_pending: true,
       id,
       voters,
       joint: None,
@@ -432,6 +435,26 @@ impl RaftNode {
     node.snapshot_term = saved.snapshot_term;
     node.snapshot_data = saved.snapshot_data;
     Ok(node)
+  }
+
+  /// Whether a reply would depend on state not yet published by the owner (§4.8).
+  pub fn retention_pending(&self) -> bool {
+    self.retention_pending
+  }
+
+  /// Marks the complete state published. Call only after the anchor publication succeeds.
+  pub fn retained(&mut self) {
+    self.retention_pending = false;
+  }
+
+  /// Drops volatile authority while an operator-reviewed replacement is being fetched (§4.8).
+  /// The term, vote and log remain recoverable; the caller also stops elections and input RPCs.
+  pub fn suspend(&mut self) {
+    self.role = Role::Follower;
+    self.has_leader = false;
+    self.leader_hint = None;
+    self.read_round = None;
+    self.contacts.clear();
   }
 
   /// This node's id.
@@ -551,6 +574,7 @@ impl RaftNode {
     if !self.is_voter(self.id) {
       return Vec::new();
     }
+    self.retention_pending = true;
     self.current_term = self.current_term.saturating_add(1);
     self.read_round = None;
     self.role = Role::Candidate;
@@ -588,6 +612,7 @@ impl RaftNode {
       && not_yet_voted_elsewhere
       && self.candidate_log_is_current(request.last_log_index, request.last_log_term);
     if granted {
+      self.retention_pending |= self.voted_for != Some(request.candidate);
       self.voted_for = Some(request.candidate);
     }
     VoteReply {
@@ -622,6 +647,7 @@ impl RaftNode {
   /// Adopts `term` as the current term, reverting to a follower and forgetting this term's vote and any
   /// gathered votes.
   fn step_down(&mut self, term: u64) {
+    self.retention_pending |= self.current_term != term || self.voted_for.is_some();
     self.current_term = term;
     self.voted_for = None;
     self.read_round = None;
@@ -878,6 +904,7 @@ impl RaftNode {
       self.voters = config.voters;
       self.joint = config.joint;
     }
+    self.retention_pending = true;
     self.log.drain(0..discard);
     self.snapshot_index = up_to;
     self.snapshot_term = term;
@@ -932,6 +959,7 @@ impl RaftNode {
     self.leader_hint = Some(request.leader);
 
     if request.last_included_index > self.snapshot_index {
+      self.retention_pending = true;
       let keeps_suffix =
         self.entry_term(request.last_included_index) == Some(request.last_included_term);
       if keeps_suffix {
@@ -983,6 +1011,7 @@ impl RaftNode {
     if self.role != Role::Leader {
       return false;
     }
+    self.retention_pending = true;
     self.log.push(LogEntry::command(self.current_term, command));
     self.advance_leader_commit();
     true
@@ -1057,13 +1086,18 @@ impl RaftNode {
           self.truncate_from(index);
           self.log.push(entry);
         }
-        None => self.log.push(entry),
+        None => {
+          self.retention_pending = true;
+          self.log.push(entry);
+        }
       }
     }
 
     // Advance the commit index to the leader's, but no further than the entries we now hold.
     if request.leader_commit > self.commit_index {
-      self.commit_index = request.leader_commit.min(index);
+      let committed = request.leader_commit.min(index);
+      self.retention_pending |= self.commit_index != committed;
+      self.commit_index = committed;
     }
     self.append_reply(true, index, request.read_context)
   }
@@ -1189,6 +1223,7 @@ impl RaftNode {
     self.read_round = None;
     // Append the joint configuration `C_old,new` as a log entry — it takes effect on append (§6), so the
     // very next quorum check needs a majority of both sets. It replicates like any entry.
+    self.retention_pending = true;
     self.log.push(LogEntry::configuration(
       self.current_term,
       VoterConfig {
@@ -1217,6 +1252,7 @@ impl RaftNode {
     }
     self.read_round = None;
     // Append the final configuration `C_new` (§6): the change is done once this commits.
+    self.retention_pending = true;
     self.log.push(LogEntry::configuration(
       self.current_term,
       VoterConfig {
@@ -1232,6 +1268,7 @@ impl RaftNode {
   fn truncate_from(&mut self, index: u64) {
     let keep = usize::try_from(index.saturating_sub(self.snapshot_index).saturating_sub(1))
       .unwrap_or(usize::MAX);
+    self.retention_pending |= keep < self.log.len();
     self.log.truncate(keep);
   }
 
@@ -1264,6 +1301,7 @@ impl RaftNode {
           .filter(|voter| self.match_of(*voter) >= candidate)
           .collect();
         if self.is_majority(&holders) {
+          self.retention_pending = true;
           self.commit_index = candidate;
           self.step_down_if_removed();
           return;

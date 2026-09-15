@@ -401,6 +401,8 @@ fn start_with_policy(
     });
   let transport = FleetTransport {
     identity: this.identity,
+    advertise: this.address.into(),
+    enrollment_roots: Vec::new(),
     name: NAME.to_owned(),
     probe_bind: this.address,
     record_bind: this.record_address,
@@ -1384,6 +1386,8 @@ fn start_fleet_node(
   let transport = FleetTransport {
     identity,
     name: NAME.to_owned(),
+    advertise: loopback(bind.0).into(),
+    enrollment_roots: Vec::new(),
     probe_bind: loopback(bind.0),
     record_bind: loopback(bind.1),
     peers,
@@ -2181,6 +2185,8 @@ fn start_mesh_with(
       let transport = FleetTransport {
         identity,
         name: NAME.to_owned(),
+        advertise: loopback(serve[i].0).into(),
+        enrollment_roots: Vec::new(),
         probe_bind: loopback(serve[i].0),
         record_bind: loopback(serve[i].1),
         peers,
@@ -5758,6 +5764,227 @@ fn a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss
   }
 }
 
+/// AC-8.1 / T-2.14, §4.8: restart every process while its anchor retains RAM. Both groups
+/// must recover without bootstrap, then commit another retirement after one voter is lost.
+#[test]
+fn a_warm_fleet_restart_recovers_its_root_and_regional_quorums() {
+  let _serial = serialize_fleet_tests();
+  let pid = std::process::id();
+  let profiles: Vec<_> = ["warm-voter-a", "warm-voter-b", "warm-voter-c"]
+    .into_iter()
+    .map(profile)
+    .collect();
+  let anchors: Vec<_> = profiles.iter().map(anchor_of).collect();
+  let seeds: Vec<_> = anchors.iter().map(|anchor| member_id(*anchor, 0)).collect();
+  let mut identities: Vec<_> = profiles.iter().map(|_| same_identity(2)).collect();
+  let certificates: Vec<_> = identities
+    .iter()
+    .map(|pair| pair[0].certificate())
+    .collect();
+  let ports = mesh_serve_ports(profiles.len());
+  let peers = |node| {
+    profiles
+      .iter()
+      .enumerate()
+      .filter(|(peer, _)| *peer != node)
+      .map(|(peer, _)| fleet_peer_at(anchors[peer], seeds[peer], ports[peer], &certificates[peer]))
+      .collect::<Vec<_>>()
+  };
+  let configs: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      fleet_config(
+        profile,
+        &format!("warm-voter-{node}-{pid}"),
+        anchors[node],
+        seeds[node],
+        &peers(node),
+        &Default::default(),
+      )
+    })
+    .collect();
+  let segments: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      slates_anchor::AnchorSegment::create(
+        &format!("warm-voter-{node}-{pid}"),
+        &profile.facts.identity,
+        configs[node].geometry,
+      )
+      .unwrap()
+    })
+    .collect();
+  let source = |node: usize| {
+    let (handoff, len) = segments[node].handoff().unwrap();
+    SegmentSource::Handoff {
+      handoff,
+      len,
+      content: None,
+    }
+  };
+  let mut daemons: Vec<_> = profiles
+    .iter()
+    .enumerate()
+    .map(|(node, profile)| {
+      start_fleet_node(
+        profile,
+        configs[node].clone(),
+        identities[node].pop().unwrap(),
+        ports[node],
+        peers(node),
+        source(node),
+      )
+    })
+    .collect();
+  daemons[0].bootstrap(true).unwrap();
+  settle_initial_consensus(&daemons, &seeds, &Default::default(), Quorum { f: 1 });
+  let members: Vec<_> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  for daemon in daemons.drain(..) {
+    daemon.stop();
+  }
+  for (node, profile) in profiles.iter().enumerate() {
+    daemons.push(start_fleet_node(
+      profile,
+      configs[node].clone(),
+      identities[node].pop().unwrap(),
+      ports[node],
+      peers(node),
+      source(node),
+    ));
+  }
+  for (daemon, member) in daemons.iter().zip(&members) {
+    assert_eq!(
+      daemon.member_identity(),
+      Some(*member),
+      "a warm restart retains its voter"
+    );
+  }
+  assert!(
+    audit_wait(|| audit_voters_match(&daemons, &members)
+      && daemons
+        .iter()
+        .filter(|daemon| daemon.root_leads() == Some(true))
+        .count()
+        == 1
+      && daemons
+        .iter()
+        .filter(|daemon| daemon.council_leads() == Some(true))
+        .count()
+        == 1),
+    "both retained quorums recover without bootstrap"
+  );
+  let victim = daemons
+    .iter()
+    .position(|daemon| daemon.root_leads() == Some(true))
+    .unwrap();
+  daemons.remove(victim).stop();
+  let survivors: Vec<_> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert!(
+    audit_wait(|| audit_voters_match(&daemons, &survivors)),
+    "the restarted voters must commit a new retirement"
+  );
+  assert!(
+    daemons
+      .iter()
+      .all(|daemon| daemon.root_leads() == Some(false)),
+    "losing the root's only retained voter cannot trigger automatic bootstrap"
+  );
+  recover_root_from_survivors(&daemons);
+  let representative = *survivors.iter().min_by_key(|host| host.0).unwrap();
+  assert!(
+    audit_wait(|| daemons
+      .iter()
+      .all(|daemon| daemon.root_voters() == Some(vec![representative]))
+      && daemons
+        .iter()
+        .filter(|daemon| daemon.root_leads() == Some(true))
+        .count()
+        == 1),
+    "operator-reviewed recovery must admit the other survivor and commit the new representative"
+  );
+  for daemon in daemons {
+    daemon.stop();
+  }
+}
+
+/// Approve the most complete reachable root copy, then explicitly join the other survivors to it.
+fn recover_root_from_survivors(daemons: &[Daemon]) {
+  let mut clients: Vec<_> = daemons
+    .iter()
+    .map(|daemon| Client::connect(daemon.instance()))
+    .collect();
+  let plans: Vec<_> = clients
+    .iter_mut()
+    .map(|client| {
+      let reply = client.call(&RequestBody::RecoveryPlan {
+        root: true,
+        target: None,
+      });
+      let ReplyBody::RecoveryPlan { plan } = reply else {
+        panic!("{reply:?}");
+      };
+      plan
+    })
+    .collect();
+  let selected = plans
+    .iter()
+    .enumerate()
+    .max_by_key(|(_, plan)| plan.version)
+    .unwrap()
+    .0;
+  let proof = slates_server::recovery_proof(
+    &daemons[selected].segment().issuer_secret().unwrap(),
+    &plans[selected].digest,
+  );
+  let reply = clients[selected].call(&RequestBody::Recover {
+    root: true,
+    target: None,
+    plan: plans[selected].digest,
+    proof,
+  });
+  let ReplyBody::RecoveryStarted {
+    group,
+    joining: false,
+  } = reply
+  else {
+    panic!("{reply:?}");
+  };
+  for (node, client) in clients
+    .iter_mut()
+    .enumerate()
+    .filter(|(node, _)| *node != selected)
+  {
+    let reply = client.call(&RequestBody::RecoveryPlan {
+      root: true,
+      target: Some(group),
+    });
+    let ReplyBody::RecoveryPlan { plan } = reply else {
+      panic!("{reply:?}");
+    };
+    let proof = slates_server::recovery_proof(
+      &daemons[node].segment().issuer_secret().unwrap(),
+      &plan.digest,
+    );
+    assert!(matches!(
+      client.call(&RequestBody::Recover {
+        root: true,
+        target: Some(group),
+        plan: plan.digest,
+        proof
+      }),
+      ReplyBody::RecoveryStarted { joining: true, .. }
+    ));
+  }
+}
+
 /// The audit run has a strict wall-clock bound, including when the normal fleet period budget
 /// would keep diagnosing a live but non-converging coordinator. The bound is the existing formation SLO.
 fn audit_wait(mut condition: impl FnMut() -> bool) -> bool {
@@ -5778,4 +6005,120 @@ fn audit_voters_match(daemons: &[Daemon], voters: &[HostId]) -> bool {
       current.len() == voters.len() && voters.iter().all(|voter| current.contains(voter))
     })
   })
+}
+
+/// AC-8.18 / T-8.20: a third node absent from every running seed manifest enrolls under the
+/// operator's certificate authority, discovers peers through one seed and joins the existing quorum.
+#[test]
+fn an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum() {
+  let _serial = serialize_fleet_tests();
+  let issuer_key = rcgen::KeyPair::generate().unwrap();
+  let mut issuer_params = rcgen::CertificateParams::new(vec![NAME.to_owned()]).unwrap();
+  issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+  let issuer = issuer_params.self_signed(&issuer_key).unwrap();
+  let addresses = mesh_serve_ports(3);
+  let mut identities = Vec::new();
+  for domain in 0..addresses.len() {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let params =
+      rcgen::CertificateParams::new(vec![NAME.to_owned(), format!("r0.d{domain}.{NAME}")]).unwrap();
+    let cert = params.signed_by(&key, &issuer, &issuer_key).unwrap();
+    identities.push(Identity::from_der(
+      cert.der().clone(),
+      rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+    ));
+  }
+  let certificates: Vec<_> = identities.iter().map(Identity::certificate).collect();
+  let anchors: Vec<_> = certificates
+    .iter()
+    .map(slates_server::deploy::host_id_of_certificate)
+    .collect();
+  let mut daemons = Vec::new();
+  for (node, identity) in identities.into_iter().enumerate() {
+    let seed_nodes: Vec<usize> = if node == 0 {
+      Vec::new()
+    } else {
+      vec![node - 1]
+    };
+    let peers: Vec<_> = seed_nodes
+      .iter()
+      .map(|&seed| FleetPeer {
+        anchor: anchors[seed],
+        host: member_id(anchors[seed], 0),
+        address: loopback(addresses[seed].0).into(),
+        record_address: loopback(addresses[seed].1).into(),
+        certificate: certificates[seed].clone(),
+      })
+      .collect();
+    let profile = profile("unlisted");
+    let instance = format!("unlisted-{node}-{}", std::process::id());
+    let domains = anchors
+      .iter()
+      .enumerate()
+      .map(|(domain, anchor)| (member_id(*anchor, 0), u64::try_from(domain).unwrap()))
+      .collect();
+    let config = DaemonConfig::derive(&profile, &instance)
+      .with_shards(1)
+      .with_fleet(FleetMembership {
+        quorum: Quorum { f: 1 },
+        peers: peers.iter().map(|peer| peer.host).collect(),
+        host: member_id(anchors[node], 0),
+        origin_anchor: anchors[node],
+        domains,
+        regions: std::collections::BTreeMap::new(),
+        durability: None,
+        region_mirrors: std::collections::BTreeMap::new(),
+      });
+    let transport = FleetTransport {
+      identity,
+      name: NAME.to_owned(),
+      advertise: loopback(addresses[node].0).into(),
+      probe_bind: loopback(addresses[node].0),
+      record_bind: loopback(addresses[node].1),
+      peers,
+      resolver: None,
+      enrollment_roots: vec![issuer.der().clone()],
+    };
+    let daemon = Daemon::start_with_fleet(
+      &profile,
+      config,
+      SegmentSource::Create {
+        name: format!("slates-seg-{instance}"),
+      },
+      Some(transport),
+    )
+    .unwrap();
+    if node == 0 {
+      daemon.bootstrap(true).unwrap();
+    }
+    daemons.push(daemon);
+  }
+  let hosts: std::collections::BTreeSet<_> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  let started = Instant::now();
+  let joined = loop {
+    if daemons.iter().all(|daemon| {
+      daemon.council_voters().is_some_and(|voters| {
+        voters
+          .into_iter()
+          .collect::<std::collections::BTreeSet<_>>()
+          == hosts
+      }) && daemon.fleet_meshed() == Some(true)
+    }) {
+      break true;
+    }
+    if started.elapsed() >= FORMATION_DEADLINE {
+      break false;
+    }
+    std::thread::yield_now();
+  };
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    joined,
+    "unlisted peers never joined the existing three-voter group"
+  );
 }

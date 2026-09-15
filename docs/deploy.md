@@ -40,7 +40,7 @@ fleet"). What it makes, and deliberately does not make:
 - One identity per pod: a DER certificate carrying the fleet's TLS name (`fleet.name`, default
   `slates-fleet`) as a subject alternative name, and its DER private key (PKCS#8, SEC1 or PKCS#1). The
   chart never generates one: changing it on `helm upgrade` would change the node's stable anchor
-  and every peer's pin. Its live voting identity changes on every boot. Provision certificates from your own authority, or, for
+  and every peer's pin. Its voting identity survives a warm daemon restart in anchor RAM and changes after whole-anchor loss. Provision certificates from your own authority, or, for
   a test cluster, mint self-signed ones:
 
   ```
@@ -87,11 +87,11 @@ ids when the relevant voting quorum survives. The CLI binds bootstrap to the mem
 a restart during that operation refuses the old request.
 
 A successful `status` proves the daemon answers, not that consensus is initialized. Writes return
-`ConsensusNotInitialized` until regional admission. Raft state is currently process-local even
-when the anchor retains volume data. Losing a voter quorum requires explicit operator recovery;
+`ConsensusNotInitialized` until regional admission. Complete Raft state survives a daemon restart
+in anchor RAM. Losing a voter quorum requires explicit operator recovery;
 re-running bootstrap does not recover the previous group. The present root has one voter per
 region, so losing the sole representative in a single-region deployment loses its root quorum.
-See the [AUD-07 report](bugs/2026-09-14-raft-voter-state-loss.md) for tested scope and remaining limits.
+See the [recovery procedure](cli.md#recovering-a-lost-consensus-quorum) and [verification record](bugs/2026-09-15-consensus-recovery.md).
 
 Values of note (`deploy/helm/slates/values.yaml` states each one's derivation or policy):
 
@@ -130,3 +130,29 @@ by its peers on contact when the relevant quorums survive, and holds nothing unt
 
 A PersistentVolume of any kind; a Service with ports or a load balancer in front of the fleet; an
 Ingress; a liveness probe; a privileged container (outside the lane's `netem`); a generated certificate.
+
+## Discovery on local hosts, bare metal, VMs and Kubernetes
+
+The manifest supports a seed list plus optional `enrollment_roots`, an array of paths to DER
+issuer certificates. Explicitly listed seeds retain their exact certificate pins. An unlisted
+node needs an operator-issued certificate carrying the fleet TLS name and a signed scope DNS
+name, `r<region>.d<domain>.<fleet-name>`. Its manifest must explicitly declare the matching
+failure domain; its stable anchor is the certificate hash. The issuer authorizes this scope.
+
+For example, a fleet named `slates-fleet`, region 0 and domain 12 uses both `slates-fleet` and
+`r0.d12.slates-fleet` as certificate DNS names. Add `"enrollment_roots": ["issuer.crt.der"]`
+to each participating manifest and list at least one reachable seed on a joining node.
+Advertised addresses may be IP literals or DNS names; DNS is resolved again on a fresh dial.
+Peers exchange bounded roster pages and verify the exact leaf on each outbound connection.
+Trust enrollment supplies contact information; the surviving Raft quorum decides membership.
+An unreachable or absent seed never authorizes bootstrap or quorum-loss recovery.
+
+The packaged chart renders a complete pinned roster. Using CA enrollment requires supplying
+the manifest, issuer certificates and node secrets through your deployment's read-only mounts;
+the protocol and daemon are identical on all four deployment types. The runtime derives its
+peer capacity from the machine's task budget and reports enrollment capacity refusals explicitly.
+
+For recovery, provision a distinct 32-byte recovery key for each node and set
+`SLATES_RECOVERY_KEY` to its read-only secret path in both the anchor environment and the
+operator's recovery CLI. It grants no landing or consumer authority. The exact commands and
+required fencing acknowledgements are in [cli.md](cli.md#recovering-a-lost-consensus-quorum).

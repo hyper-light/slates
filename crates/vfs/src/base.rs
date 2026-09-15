@@ -22,6 +22,10 @@
 //! the read is `BaseDrift` and the entry is `lost` (AC-1.11); memory after `create` is one
 //! directory handle and empty tables (AC-1.9).
 
+#[path = "base_recovery.rs"]
+mod recovery;
+pub use recovery::BaseImage;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_mem::Handle;
@@ -60,6 +64,8 @@ pub struct BaseConfig {
 #[derive(Debug)]
 pub(crate) struct Listing {
   pub(crate) dir: HostDir,
+  /// The immutable source path below the base root, independent of overlay renames.
+  source: Vec<String>,
   fingerprint: Option<Fingerprint>,
   entries: Option<Vec<BaseEntry>>,
   /// The host's clock when the entries were read (`HostFs::now_ns`, the fingerprints' own
@@ -71,7 +77,7 @@ pub(crate) struct Listing {
 }
 
 /// What changed on disk beneath a witnessed entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, slates_wire::Wire)]
 pub enum DriftKind {
   /// Same inode, different bytes or attributes.
   Modified,
@@ -322,6 +328,7 @@ impl BasePlane {
       root_no,
       Listing {
         dir: config.root,
+        source: Vec::new(),
         fingerprint: None,
         entries: None,
         read_at_ns: 0,
@@ -1060,10 +1067,18 @@ impl Overlay<'_> {
         let handle = store.inodes.insert(inode)?;
         self.vol.table_set(store, no, handle)?;
         let plane = self.plane()?;
+        let mut source = plane
+          .listings
+          .get(&parent_no)
+          .ok_or(VfsError::RecoveryIncomplete)?
+          .source
+          .clone();
+        source.push(entry.name.to_string());
         plane.listings.insert(
           no,
           Listing {
             dir: opened,
+            source,
             fingerprint: None,
             entries: None,
             read_at_ns: 0,
@@ -2321,10 +2336,18 @@ impl Overlay<'_> {
             && let Some(parent) = plane.listings.get(&dir_no).map(|l| l.dir)
             && let Ok(opened) = self.host.open_dir(parent, name)
           {
+            let mut source = plane
+              .listings
+              .get(&dir_no)
+              .ok_or(VfsError::RecoveryIncomplete)?
+              .source
+              .clone();
+            source.push(name.to_owned());
             plane.listings.insert(
               no,
               Listing {
                 dir: opened,
+                source,
                 fingerprint: None,
                 entries: None,
                 read_at_ns: 0,

@@ -158,6 +158,8 @@ pub struct FleetNodeEntry {
 /// order (the order fixes the port layout, so every node must read the same manifest).
 #[derive(Clone, Debug)]
 pub struct FleetManifest {
+  /// Operator trust anchors for automatic enrollment beyond the seed nodes.
+  pub enrollment_roots: Vec<CertificateDer<'static>>,
   /// The TLS server name every node's certificate carries and every peer verifies the session against.
   pub name: String,
   /// The fault tolerance `f`: a write commits at `f + 1` acknowledgements of `2f + 1` candidates (§4.8).
@@ -344,7 +346,7 @@ fn validate(
     .ok()
     .and_then(|f| f.checked_add(1))
     .unwrap_or(usize::MAX);
-  if manifest.nodes.len() < needed_acks {
+  if manifest.enrollment_roots.is_empty() && manifest.nodes.len() < needed_acks {
     return Err(DeployError::QuorumUnreachable {
       nodes: manifest.nodes.len(),
       f: manifest.quorum.f,
@@ -493,6 +495,32 @@ pub fn plan(
         .map(|region| (member_id(host_id_of_certificate(&n.certificate), 0), region))
     })
     .collect();
+  if !manifest.enrollment_roots.is_empty() {
+    let checked = || -> Result<(), String> {
+      slates_transport::handshake::verify_enrolled_certificate(
+        &entry.certificate,
+        &manifest.enrollment_roots,
+      )
+      .map_err(|error| error.to_string())?;
+      let parsed = rustls::server::ParsedCertificate::try_from(&entry.certificate)
+        .map_err(|error| error.to_string())?;
+      let domain = entry
+        .domain
+        .ok_or_else(|| "automatic enrollment requires an explicit failure domain".to_owned())?;
+      let scope = crate::discovery::scope_name(
+        &manifest.name,
+        entry.region.map_or(0, |region| region.0),
+        domain,
+      );
+      let name =
+        rustls::pki_types::ServerName::try_from(scope).map_err(|error| error.to_string())?;
+      rustls::client::verify_server_name(&parsed, &name).map_err(|error| error.to_string())
+    };
+    checked().map_err(|reason| DeployError::Identity {
+      node: entry.node.clone(),
+      reason,
+    })?;
+  }
   let identity = Identity::from_der(entry.certificate.clone(), key);
   let pins: Vec<CertificateDer<'static>> = peers.iter().map(|p| p.certificate.clone()).collect();
   check_identity(&entry.node, &identity, &entry.certificate, &pins)?;
@@ -508,6 +536,8 @@ pub fn plan(
       region_mirrors: manifest.region_mirrors.clone(),
     },
     transport: FleetTransport {
+      advertise: entry.address.clone(),
+      enrollment_roots: manifest.enrollment_roots.clone(),
       identity,
       name: manifest.name.clone(),
       probe_bind,
@@ -594,6 +624,7 @@ mod tests {
       keys.push(key);
     }
     let manifest = FleetManifest {
+      enrollment_roots: Vec::new(),
       name: NAME.to_owned(),
       quorum: Quorum { f: 1 },
       durability: None,
@@ -900,6 +931,7 @@ mod tests {
       Some(DeployError::QuorumUnreachable { nodes: 3, f: 3 })
     );
     let empty = FleetManifest {
+      enrollment_roots: Vec::new(),
       name: "x".to_owned(),
       quorum: Quorum { f: 0 },
       durability: None,
@@ -937,6 +969,7 @@ mod tests {
   fn a_single_node_manifest_is_the_solo_degenerate() {
     let (cert, key) = mint();
     let solo = FleetManifest {
+      enrollment_roots: Vec::new(),
       name: NAME.to_owned(),
       quorum: Quorum { f: 0 },
       durability: None,

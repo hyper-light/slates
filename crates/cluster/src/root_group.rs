@@ -177,6 +177,8 @@ pub struct RootGroup {
   configuration: RootConfiguration,
   /// A newer read view fetched while a learner. It is never the input to Raft replay:
   /// applying its commands again would repeat epochs or home changes (§4.8, AUD-07).
+  /// A changed learner view must survive before it is published to serving shards.
+  view_pending: bool,
   learned: Option<RootConfiguration>,
   /// The formed configuration every voter's fold starts from (see the regional council's `base`): a node
   /// promoted to voter re-folds the whole log from this, never on top of an adopted configuration.
@@ -211,6 +213,59 @@ impl RootGroup {
     self
       .initialized()
       .then(|| (self.raft.saved(), self.base.clone()))
+  }
+
+  /// Creates the first voter of an explicitly authorized replacement group (§4.8).
+  /// The caller must fence the former group and bind approval to this recovered application
+  /// state. Ordinary bootstrap, startup and discovery never call this operation.
+  pub fn reform(node: HostId, configuration: RootConfiguration) -> Self {
+    let mut group = Self::new(node, configuration.regions.clone(), vec![node]);
+    group.base = configuration.clone();
+    group.configuration = configuration;
+    group.applied = 0;
+    group.apply_committed();
+    group
+  }
+
+  /// Restores this voter's complete retained state without clearing its vote (§4.8).
+  /// A sole voter runs the ordinary election rule; a fleet voter waits for its peers.
+  pub fn restore_from(
+    &mut self,
+    saved: SavedRaft,
+    base: RootConfiguration,
+  ) -> Result<(), RaftRecoveryError> {
+    if saved.id != self.raft.id() {
+      return Err(RaftRecoveryError::ReusedIdentity);
+    }
+    if saved.snapshot_index != 0 {
+      return Err(RaftRecoveryError::InvalidSnapshot);
+    }
+    self.raft = RaftNode::restore(saved)?;
+    self.configuration = base.clone();
+    self.base = base;
+    self.learned = None;
+    self.applied = 0;
+    self.apply_committed();
+    if self.raft.all_voters() == [self.raft.id()] {
+      self.election_timeout();
+    }
+    Ok(())
+  }
+
+  /// Whether a consensus transition still needs its anchor publication.
+  pub fn retention_pending(&self) -> bool {
+    self.view_pending || self.raft.retention_pending()
+  }
+
+  /// Stops proposing while an authorized replacement is fetched, retaining the old prefix.
+  pub fn suspend(&mut self) {
+    self.raft.suspend();
+  }
+
+  /// Records successful publication by the caller that owns the anchor.
+  pub fn retained(&mut self) {
+    self.view_pending = false;
+    self.raft.retained();
   }
 
   /// Installs the group's state once under this member's fresh identity. A later fetch cannot
@@ -260,6 +315,7 @@ impl RootGroup {
       base: configuration.clone(),
       configuration,
       learned: None,
+      view_pending: false,
       applied: 0,
       leader_contact: 0,
     };
@@ -547,6 +603,7 @@ impl RootGroup {
     if configuration.version <= self.configuration().version {
       return false;
     }
+    self.view_pending = true;
     self.learned = Some(configuration);
     true
   }

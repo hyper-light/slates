@@ -1,11 +1,66 @@
 # The KIND fleet lane — the Helm chart and the fleet on real Linux pods
 
+> **Verified 2026-09-15:** whole-pod replacement now rejoins at a new IP with a fresh voter
+> identity, all peers probed, and a new volume creation accepted. Takeover was observed at
+> **10.2 s** and rejoin at **10.4 s** after deletion. Five-node and three-node fresh formation
+> also passed. These results supersede the historical rejoin/scale gaps below. The WAN netem
+> profiles and safe rolling upgrades are separate, unproven gates.
+
+## 2026-09-15 verification
+
+Same Apple-silicon host and Docker Linux VM as the historical run below; Rust 1.98.0,
+`kindest/node:v1.37.0`, release image
+`sha256:ba9ec1ec3410a80c1071455a6f30697f1912efbfa4d462e88e8d85933e348eec`.
+Build concurrency was bounded to 2 jobs; release compilation took **23.74 s**. The initial
+build attempted to fetch a development component; it was cancelled and the Dockerfile now
+selects its installed toolchain explicitly. Existing `desktop` and `focal` clusters were not
+used. A separate kubeconfig and `slates-audit-0915` cluster isolated this run.
+
+Recorded commands (each `cargo` command used `RUSTUP_TOOLCHAIN=1.98.0 CARGO_BUILD_JOBS=2`):
+
+```sh
+docker build --build-arg CARGO_BUILD_JOBS=2 -t slates:lane .
+export KUBECONFIG=/private/tmp/slates-audit-kind-20260915.kubeconfig
+cargo xtask kind up --cluster slates-audit-0915
+cargo xtask kind install --cluster slates-audit-0915
+kubectl --context kind-slates-audit-0915 -n slates exec slates-0 -- /slates bootstrap root
+cargo xtask kind prove --cluster slates-audit-0915
+cargo xtask kind scale --cluster slates-audit-0915
+cargo xtask kind down --cluster slates-audit-0915
+```
+
+| Observation | Result |
+| --- | --- |
+| Isolated cluster creation / image loading | 24.9 s / 3.0 s |
+| Initial chart rollout | 7.6 s |
+| Initial formation observation / quorum snapshot placement | 0.2 s / 0.1 s |
+| Dead owner's retirement observed by both survivors | 1.2 s in the retirement poll |
+| Successor serves the volume, region-placed | 10.2 s after deletion |
+| Replacement rejoined with a fresh voter identity | 10.4 s after deletion |
+| Replacement pod IP | `10.244.2.2` → `10.244.2.3` |
+| Old / new owner member | `14260525359559396071` → `8698910852216202403` |
+| Rejoined views | Same three members, two probe peers per node, one council leader |
+| New stable creation on replacement | Succeeded, no repeated bootstrap |
+| Fresh five-node install / formation observation | 6.4 s / 0.3 s, four probe peers each |
+| Fresh three-node install / formation observation | 6.4 s / 0.2 s, two probe peers each |
+| Cleanup | All six test-cluster containers removed |
+
+The owner selection preserves both the bootstrap root node and the eventual lowest-id root
+representative. This tests replacement through a surviving quorum. The separate Linux
+[quorum-loss history](../bugs/2026-09-15-consensus-recovery.md) kills the root representative
+and requires explicit recovery. The scale fixture uninstalls and creates fresh groups at each
+size; it does not establish safe rolling replacement or a five-voter commit under a later loss.
+The takeover proof checks placement and service; it does not mount a kernel filesystem or run
+WAN shaping. The retained historical measurements below are not claims about this run.
+
+## Historical record (2026-09-14)
+
 > **AUD-07 lifecycle update (2026-09-14):** first-time formation now requires explicit
 > `slates bootstrap root` on one node; every replacement uses a fresh voting identity. The
 > fresh-deployment `all`, smoke, scale and netem fixtures bootstrap once in their setup; a plain
 > install/upgrade does not bootstrap an existing deployment. Do not put bootstrap in pod startup.
 > See [the voter-loss report](../bugs/2026-09-14-raft-voter-state-loss.md) for quorum-loss limits.
-> The measurements below predate this change; this task did not rerun the live KIND lane.
+> The measurements in this historical section predate this change; the 2026-09-15 run is recorded above.
 
 > **Status (2026-09-14).** The fleet **forms and serves on real multi-node Linux pods**, installed by the
 > Helm chart. Formation (every pod probes both peers, one council leader elected with measured timing),

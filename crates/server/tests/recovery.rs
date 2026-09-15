@@ -182,12 +182,15 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
     );
   }
   let snapshot = client.status(kept).unwrap().head;
+  let member = first.member_identity().unwrap();
   first.stop();
 
   let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
-  second
-    .bootstrap(true)
-    .expect("the fixture explicitly creates its local consensus group");
+  assert_eq!(
+    second.member_identity(),
+    Some(member),
+    "retained Raft state preserves the voter; a warm restart needs no bootstrap"
+  );
   let report = client.status(kept).unwrap();
   assert_eq!(
     client.reconnects(),
@@ -557,9 +560,6 @@ fn run_crash_point(profile: &MachineProfile, reference: &Observed, k: usize, cra
   }
 
   let second = Daemon::start(profile, config, source_of(&segment)).unwrap();
-  second
-    .bootstrap(true)
-    .expect("the fixture explicitly creates its local consensus group");
   let done = crash == Crash::AfterRecord;
   assert_crash_state(&mut run, &second, k, done);
   step(&mut run, &second, k, done);
@@ -623,9 +623,6 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
   // Restart 1: the clone's pin on the snapshot survived in the image and is reconciled to the recorded
   // clone, so the snapshot's destroy is refused (a lost pin would be the only reason it were allowed).
   let second = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
-  second
-    .bootstrap(true)
-    .expect("the fixture explicitly creates its local consensus group");
   assert!(
     matches!(
       client.destroy_snapshot(kept, snapshot),
@@ -661,9 +658,6 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
   // Restart 2 over the `Destroying` state: recovery completes the destroy, unpinning the origin, so
   // the snapshot's destroy now succeeds.
   let third = Daemon::start(&profile, config, source_of(&segment)).unwrap();
-  third
-    .bootstrap(true)
-    .expect("the fixture explicitly creates its local consensus group");
   let started = Instant::now();
   loop {
     let listed: Vec<String> = client.list().unwrap().into_iter().map(|v| v.name).collect();

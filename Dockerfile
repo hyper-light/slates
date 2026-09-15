@@ -16,13 +16,15 @@
 # syntax=docker/dockerfile:1.7
 FROM rust:1.98 AS build
 WORKDIR /work
+# The caller can bound build concurrency for a supervised validation run.
+ARG CARGO_BUILD_JOBS
 COPY . .
-# `--locked`: the lock file is the contract. The pinned toolchain (rust-toolchain.toml) is the image's own
-# 1.98.0; `miri` is not a stable component and rustup skips it with a warning, as on a laptop.
+# `--locked`: the lock file is the contract. Select the image's installed toolchain explicitly
+# so a release build does not download the development components in rust-toolchain.toml.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/work/target,sharing=locked \
-    cargo build --release --locked -p slates-cli \
+    RUSTUP_TOOLCHAIN=1.98.0 cargo build --release --locked -p slates-cli \
     && cp target/release/slates /slates
 
 # The runtime base is the builder's own Debian release (13, glibc 2.41): the binary links the builder's

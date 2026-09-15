@@ -59,7 +59,7 @@ pub struct BaseBody {
 }
 
 /// A witnessed base: the fingerprint and content identity the agent's edit was based on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, slates_wire::Wire)]
 pub struct Witness {
   /// The stat fingerprint at the witness.
   pub fingerprint: Fingerprint,
@@ -72,7 +72,7 @@ pub struct Witness {
 }
 
 /// A stat fingerprint (§4.4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, slates_wire::Wire)]
 pub struct Fingerprint {
   /// Device.
   pub dev: u64,

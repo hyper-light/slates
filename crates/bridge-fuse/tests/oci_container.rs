@@ -327,7 +327,7 @@ fn an_oci_container_consumes_a_fuse_host_mount_through_the_runtime_bind() {
   };
   eprintln!("T-4.13 (FUSE) over {server}");
   let scratch = scratch();
-  let mounted = match mount(&scratch.mount_point, &["allow_other"]) {
+  let mounted = match mount(&scratch.mount_point, &["allow_other"], CONTAINER_WAIT) {
     Ok(mounted) => mounted,
     Err(MountError::Helper { exit }) => {
       eprintln!(
@@ -358,7 +358,7 @@ fn an_oci_container_consumes_a_fuse_host_mount_through_the_runtime_bind() {
       )
       .unwrap();
     let mut bridge = VolumeBridge::new(volume_id, &mut volume, &mut store);
-    serve_blocking(mounted.channel(), &mut bridge, &attachments, attachment)
+    serve_blocking(mounted.channel(), &mut bridge, &mut attachments, attachment)
   });
 
   let (code, host_out, host_err) = bounded(

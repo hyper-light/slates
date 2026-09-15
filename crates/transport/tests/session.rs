@@ -1409,3 +1409,66 @@ fn a_dialer_that_outwaited_an_absent_peer_completes_the_handshake_once_the_peer_
     ),
   }
 }
+
+/// AC-8.18 / §4.13: two certificates under one trusted issuer remain distinct identities.
+/// A server presenting the other valid certificate cannot complete the client's pinned session.
+#[test]
+fn an_issued_certificate_cannot_impersonate_another_leaf_under_the_same_authority() {
+  let issuer_key = rcgen::KeyPair::generate().unwrap();
+  let mut params = rcgen::CertificateParams::new(vec![NAME.to_owned()]).unwrap();
+  params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+  let issuer = params.self_signed(&issuer_key).unwrap();
+  let mint = || {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec![NAME.to_owned()])
+      .unwrap()
+      .signed_by(&key, &issuer, &issuer_key)
+      .unwrap();
+    Identity::from_der(
+      cert.der().clone(),
+      PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+    )
+  };
+  let expected = mint().certificate();
+  let server_identity = mint();
+  let client_identity = mint().with_authorities(vec![issuer.der().clone()]);
+  let authority = issuer.der().clone();
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let shard = sim.shard_ids()[0];
+  let (server_port_tx, server_port_rx) = channel();
+  let (client_port_tx, client_port_rx) = channel();
+  let (result_tx, result_rx) = channel();
+  sim
+    .spawn_on(shard, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      server_port_tx
+        .send(socket.local_addr().unwrap().port())
+        .unwrap();
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(client_port_rx).await);
+      let mut endpoint =
+        Endpoint::server(socket, peer, &server_identity, &[authority], FRAME_CAP).unwrap();
+      let _ = endpoint.establish().await;
+    })
+    .unwrap();
+  sim
+    .spawn_on(shard, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      client_port_tx
+        .send(socket.local_addr().unwrap().port())
+        .unwrap();
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(server_port_rx).await);
+      let mut endpoint =
+        Endpoint::client(socket, peer, &client_identity, &expected, NAME, FRAME_CAP).unwrap();
+      result_tx.send(endpoint.establish().await).unwrap();
+    })
+    .unwrap();
+  sim.run_until_idle();
+  assert!(matches!(
+    result_rx.try_recv().unwrap(),
+    Err(EndpointError::Handshake(
+      slates_transport::handshake::HandshakeError::Tls(rustls::Error::InvalidCertificate(
+        rustls::CertificateError::ApplicationVerificationFailure
+      ))
+    ))
+  ));
+}

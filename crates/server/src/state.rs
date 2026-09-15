@@ -153,6 +153,12 @@ pub struct ShardState {
   /// This member has a committed regional admission and a root configuration (AUD-07).
   /// Copied to owner shards when configuration changes; read without coordination per request.
   pub consensus_ready: bool,
+  /// Last atomic anchor publication of both configuration groups (§4.8).
+  pub consensus_generation: u64,
+  /// Reviewed replacements and their explicit join destinations (§4.8).
+  pub(crate) recovery: crate::consensus_recovery::RecoveryState,
+  /// A retention failure closes the control shard before its next reply.
+  pub consensus_failure: Option<slates_anchor::AnchorError>,
   /// This start's explicit bootstrap, retained for idempotent retries without resetting Raft.
   pub bootstrap_authorized: Option<bool>,
   /// The regional group's immutable genesis identity; a separate bootstrap cannot replace its log.
@@ -283,14 +289,17 @@ pub struct ShardState {
   /// seeded view. Empty on a laptop (no fleet loop runs).
   pub formed_probe_peers: std::collections::BTreeSet<slates_db::HostId>,
   /// This start's random nonce, announced with its derived member id on SWIM contact (§4.8).
-  /// It changes even when an anchor survives: the daemon does not retain Raft state there yet.
+  /// It survives a warm restart with the complete retained Raft state; whole-anchor loss changes it.
   pub member_boot_nonce: u64,
   /// One authenticated identity per rostered certificate anchor, bounded by the roster.
   /// A different nonce retires the previous id; nonces cannot establish numeric age order.
   /// Only the control shard updates it. Empty before contact, and on a laptop.
   pub learned_members: BTreeMap<slates_db::HostId, LearnedMember>,
-  /// The serve-socket demultiplexers the membership loop runs on this shard (the control shard's two
-  /// planes; empty elsewhere and on a laptop), for the status report to read their counters.
+  /// The control shard's bounded candidate table and enrollment authority.
+  pub(crate) discovery: Option<crate::discovery::Discovery>,
+  /// Authenticated candidate addresses included in the anchor publication.
+  pub(crate) enrolled: Vec<crate::discovery::Announcement>,
+  /// The two shard-owned fleet socket demultiplexers.
   pub demuxes: Vec<&'static slates_transport::demux::Demux>,
   /// The register records this node holds as a **candidate holder** for other owners' objects (§4.8
   /// "records are sent to all candidates; committed at `f + 1`"): one durable [`Acceptor`] per object
@@ -493,7 +502,13 @@ pub fn take() -> Option<ShardState> {
 pub fn with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
   STATE.with(|cell| {
     let mut guard = cell.try_borrow_mut().ok()?;
-    guard.as_mut().map(f)
+    let state = guard.as_mut()?;
+    if state.consensus_failure.is_some() {
+      return None;
+    }
+    let result = f(state);
+    crate::retention::retain(state).ok()?;
+    Some(result)
   })
 }
 

@@ -24,8 +24,12 @@
 
 pub mod config;
 mod consensus;
+mod consensus_recovery;
+pub use consensus_recovery::{RecoveryKey, recovery_proof};
 pub mod daemon;
 pub mod deploy;
+pub mod discovery;
+mod retention;
 // Name resolution for a peer named by DNS in the manifest (the Kubernetes deployment): an asynchronous
 // A-record client over the runtime's UDP, resolved at every dial so a rescheduled peer is found.
 pub mod dns;

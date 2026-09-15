@@ -190,6 +190,7 @@ struct NodeText {
 
 /// The manifest as text values: what the JSON says, checked for shape.
 struct ManifestText {
+  enrollment_roots: Vec<String>,
   name: String,
   quorum: Quorum,
   durability: Option<DurabilityBound>,
@@ -280,7 +281,28 @@ fn parse(text: &str) -> Result<ManifestText, ManifestError> {
     .enumerate()
     .map(|(index, entry)| node_text(entry, index))
     .collect::<Result<Vec<NodeText>, ManifestError>>()?;
+  let enrollment_roots = match document.get("enrollment_roots") {
+    None => Vec::new(),
+    Some(value) => value
+      .as_array()
+      .ok_or_else(|| ManifestError::Field {
+        field: "enrollment_roots".to_owned(),
+        expected: "an array of DER certificate paths",
+      })?
+      .iter()
+      .map(|value| {
+        value
+          .as_str()
+          .map(str::to_owned)
+          .ok_or_else(|| ManifestError::Field {
+            field: "enrollment_roots".to_owned(),
+            expected: "a DER certificate path",
+          })
+      })
+      .collect::<Result<Vec<_>, _>>()?,
+  };
   Ok(ManifestText {
+    enrollment_roots,
     name,
     quorum: Quorum { f },
     durability: durability_text(&document)?,
@@ -366,7 +388,9 @@ fn load_plan(selection: &FleetSelection) -> Result<FleetPlan, ManifestError> {
   let stated = parse(&text)?;
   let base = manifest_path.parent().unwrap_or_else(|| Path::new("."));
   // The host's resolver, when any node is addressed by name; a manifest of literal addresses reads nothing.
-  let resolver = if stated.nodes.iter().any(|node| node.address.is_named()) {
+  let resolver = if !stated.enrollment_roots.is_empty()
+    || stated.nodes.iter().any(|node| node.address.is_named())
+  {
     Some(read_resolver()?)
   } else {
     None
@@ -393,7 +417,13 @@ fn load_plan(selection: &FleetSelection) -> Result<FleetPlan, ManifestError> {
       region: node.region.map(RegionId),
     });
   }
+  let enrollment_roots = stated
+    .enrollment_roots
+    .iter()
+    .map(|path| read_relative(base, path).map(CertificateDer::from))
+    .collect::<Result<Vec<_>, _>>()?;
   let manifest = FleetManifest {
+    enrollment_roots,
     name: stated.name,
     quorum: stated.quorum,
     durability: stated.durability,

@@ -3,7 +3,7 @@
 //! [B: io_uring_setup(2); D-9]. Kicks are an eventfd watched by a multishot poll on the ring, so
 //! any thread's write becomes a completion the waiting `io_uring_enter` returns for.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::time::Instant;
 
 use io_uring::types::{Fd, SubmitArgs, Timespec};

@@ -10,8 +10,8 @@
 //! - `install [--replicas N] [--netem DELAY JITTER LOSS]` — installs or upgrades the chart and waits for
 //!   the rollout (readiness is `slates status` on every pod).
 //! - `prove` — the fleet proof: formation, a volume placed at `f + 1`, the owner's pod deleted (the
-//!   SIGKILL takeover), the successor serving; the replacement pod's rejoin is a best-effort observation
-//!   (the new-IP rejoin proof in docs/wip/kind-lane.md), not a gate.
+//!   SIGKILL takeover), the successor serving; the replacement pod's fresh-identity rejoin
+//!   and a stable creation are required gates.
 //! - `scale` — `replicas=5` and back to 3: the configuration group's membership change, re-forming each time.
 //! - `netem` — the WAN profiles of §4.8's owed measurement: 80 ms ± 20 ms, the same with 1 % loss, and
 //!   the handshake ceiling at 350 ms; each pod's council timing and the leader's stability over a window.
@@ -79,7 +79,7 @@ const PLACE_WAIT: Duration = Duration::from_secs(60);
 /// Lifeguard death is six backed-off misses (≈ 4 s at rest) and the takeover a phase-one round.
 const TAKEOVER_WAIT: Duration = Duration::from_secs(120);
 /// Shape: how long the replacement pod is watched for a rejoin — bounded, since the rejoin is a
-/// best-effort observation (the new-IP proof in docs/wip/kind-lane.md), not a gate:
+/// required admission gate (the new-IP proof in docs/wip/kind-lane.md):
 /// long enough for a reschedule and boot, not the full retirement window.
 const REJOIN_WAIT: Duration = Duration::from_secs(120);
 /// Shape: the window the shaped fleet is watched over — minutes, not an hour, on this box (the charter's
@@ -1123,7 +1123,17 @@ impl Lane {
   fn prove(&self) -> Result<(), Failure> {
     let n = LANE_REPLICAS;
     let views = self.wait_formed(n, "the fleet formed")?;
-    let owner = self.pod(0);
+    // The root starts at pod 0 and reconciles to the lowest member id. Keep both alive
+    // so this history measures replacement through a surviving root quorum.
+    let minimum = views.iter().map(|view| view.host).min();
+    let owner = views
+      .iter()
+      .find(|view| view.pod != self.pod(0) && Some(view.host) != minimum)
+      .map(|view| view.pod.clone())
+      .ok_or_else(|| {
+        Failure("kind: no owner can fail while preserving the root representative".to_owned())
+      })?;
+    let previous_ip = self.pod_ip(&owner)?;
     let owner_host = views
       .iter()
       .find(|view| view.pod == owner)
@@ -1156,7 +1166,10 @@ impl Lane {
       "kind: volume {id} snapshot {snapshot} placed at f + 1 across pods in {:.1} s",
       placed_in.as_secs_f64()
     );
-    let survivors: Vec<String> = (1..n).map(|index| self.pod(index)).collect();
+    let survivors: Vec<String> = (0..n)
+      .map(|index| self.pod(index))
+      .filter(|pod| pod != &owner)
+      .collect();
     for survivor in &survivors {
       let stat = self.verb(survivor, &["volume", "stat", &id])?;
       if stat.code == 0 {
@@ -1182,9 +1195,9 @@ impl Lane {
       "the survivors retired the owner",
       |views| {
         views.iter().all(|view| {
-          view.as_ref().is_some_and(|view| {
-            count(&view.members) == n - 1 && !view.members.contains(&owner_host)
-          })
+          view
+            .as_ref()
+            .is_some_and(|view| !view.members.contains(&owner_host))
         })
       },
     )?;
@@ -1198,66 +1211,55 @@ impl Lane {
       served_in.as_secs_f64()
     );
 
-    // The replacement pod comes back under its name at a new IP. Whether it **rejoins** the mesh is
-    // reported, not required: a whole-pod restart loses the RAM anchor segment, so the replacement boots
-    // at incarnation 0 with the **same** manifest seed member id its retired predecessor held (RAM-only:
-    // there is no durable start count to advance across a pod restart, R1). Re-admitting that same id
-    // through SWIM refutation after the survivors retired it is the "restart = join" gap for Kubernetes,
-    // recorded in docs/wip/kind-lane.md — separate from the takeover proof above (the successor serves),
-    // which is the charter's assertion and which passed.
+    // The whole anchor is gone. The replacement must join with a fresh voter identity at its
+    // current DNS address; neither startup nor this history repeats bootstrap.
     let all: Vec<String> = (0..n).map(|index| self.pod(index)).collect();
-    match self.wait_views(&all, REJOIN_WAIT, "the replacement pod rejoined", |views| {
-      Self::formed_at(n, views)
-    }) {
-      Ok((views, rejoined_in)) => {
-        eprintln!(
-          "kind: the replacement {owner} rejoined; the fleet re-formed at {n} members {:.1} s after the delete:",
-          rejoined_in.as_secs_f64() + served_in.as_secs_f64()
-        );
-        for view in views.iter().flatten() {
-          eprintln!("kind:   {}", view.line());
-        }
-      }
-      Err(_) => {
-        let views = self.views(&all)?;
-        eprintln!(
-          "kind: the replacement {owner} did NOT rejoin the mesh within {REJOIN_WAIT:?} (the new-IP proof in docs/wip/kind-lane.md); the takeover stands — {successor} serves the volume. Views:"
-        );
-        for view in views.iter().flatten() {
-          eprintln!("kind:   {}", view.line());
-        }
-        // The replacement forms no probe session (`peers_probed=0`): dump the fleet log lines of the
-        // replacement and one survivor so a diagnosis sees *why* the handshakes do not complete (the
-        // debugging protocol's "logs first"). Best-effort — a failure to read logs is not the lane's.
-        let survivor = survivors
-          .first()
-          .map(String::as_str)
-          .unwrap_or(owner.as_str());
-        for pod in [owner.as_str(), survivor] {
-          if let Ok(logs) = self.kubectl(&["logs", pod, "--tail", "80"]) {
-            let fleet: Vec<&str> = logs
-              .stdout
-              .lines()
-              .filter(|l| l.contains("fleet:") && !l.contains("fleet timing"))
-              .collect();
-            eprintln!("kind: {pod} fleet log ({} lines):", fleet.len());
-            for line in fleet.iter().rev().take(20).rev() {
-              eprintln!("kind:     {line}");
-            }
-          }
-        }
-        // Pin the DNS/endpoint plumbing: does the Service list the recreated pod as an endpoint at all?
-        // A published endpoint the daemon's resolver still times out on points at the resolver or a
-        // CoreDNS-load drop; a missing endpoint points at the pod's readiness/DNS record.
-        if let Ok(ep) = self.kubectl(&["get", "endpoints", "-o", "wide"]) {
-          eprintln!("kind: endpoints:");
-          for line in ep.stdout.lines() {
-            eprintln!("kind:     {line}");
-          }
-        }
-      }
+    let (views, rejoined_in) =
+      self.wait_views(&all, REJOIN_WAIT, "the replacement pod rejoined", |views| {
+        Self::formed_at(n, views)
+          && views
+            .iter()
+            .flatten()
+            .all(|view| !view.members.contains(&owner_host))
+      })?;
+    eprintln!(
+      "kind: replacement {owner} rejoined with a fresh identity {:.1} s after deletion",
+      rejoined_in.as_secs_f64() + served_in.as_secs_f64()
+    );
+    for view in views.iter().flatten() {
+      eprintln!("kind:   {}", view.line());
+    }
+    let replacement_ip = self.pod_ip(&owner)?;
+    if replacement_ip == previous_ip {
+      return Err(Failure(format!(
+        "kind: replacement reused {previous_ip}; the new-IP rejoin was not exercised"
+      )));
+    }
+    eprintln!("kind: replacement IP changed from {previous_ip} to {replacement_ip}");
+    // Admission must permit a new stable effect on the replacement, not just SWIM probes.
+    let result = self.verb(
+      &owner,
+      &["volume", "create", "rejoined", "--bounded", "8MiB"],
+    )?;
+    if result.code != 0 {
+      return Err(Failure(format!(
+        "kind: replacement cannot create after joining: {}",
+        result.stderr
+      )));
     }
     Ok(())
+  }
+
+  fn pod_ip(&self, pod: &str) -> Result<String, Failure> {
+    let result = self.kubectl(&["get", "pod", pod, "-o", "jsonpath={.status.podIP}"])?;
+    let address = result.stdout.trim();
+    if result.code != 0 || address.is_empty() {
+      return Err(Failure(format!(
+        "kind: pod {pod} has no readable IP: {}",
+        result.stderr
+      )));
+    }
+    Ok(address.to_owned())
   }
 
   /// Polls `volume placed` on the owner until the snapshot is placed at f + 1 or the wait passes.

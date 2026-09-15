@@ -6,7 +6,7 @@
 /// Format: the segment's magic, `SLAN` in little-endian ASCII.
 pub const MAGIC: u32 = 0x4E41_4C53;
 /// Format: the layout version; bumped with any change to the header or the region shapes.
-pub const LAYOUT_VERSION: u32 = 1;
+pub const LAYOUT_VERSION: u32 = 2;
 /// Format: the header's size: magic (4), version (4), identity (32), generation (8), total
 /// length (8), then the encoded geometry (64), padded to two cache lines.
 pub const HEADER_BYTES: usize = 128;
@@ -147,6 +147,8 @@ pub enum RegionKind {
   Log(u16),
   /// A partition's snapshot slot (two per partition).
   Snapshot(u16, u8),
+  /// One of the two node-wide Raft publications, owned by the control shard.
+  Consensus(u8),
   /// The audit ring.
   Audit,
   /// A landing slot.
@@ -193,6 +195,14 @@ impl Geometry {
       push(RegionKind::Snapshot(p, 0), self.snapshot_bytes);
       push(RegionKind::Snapshot(p, 1), self.snapshot_bytes);
     }
+    // Derived: two configuration logs (regional and root) plus one application snapshot's
+    // metadata budget. Two slots preserve the previous publication during a process crash.
+    let consensus_bytes = self
+      .log_bytes
+      .saturating_mul(2)
+      .saturating_add(self.snapshot_bytes);
+    push(RegionKind::Consensus(0), consensus_bytes);
+    push(RegionKind::Consensus(1), consensus_bytes);
     push(RegionKind::Audit, self.audit_bytes);
     for slot in 0..self.landing_slots {
       push(RegionKind::Landing(slot), self.landing_slot_bytes);

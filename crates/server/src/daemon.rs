@@ -463,6 +463,7 @@ impl Daemon {
     if let Some((was, now)) = limits::raise_descriptor_limit() {
       eprintln!("slates-server: descriptor limit raised from {was} to {now}");
     }
+    let retained = crate::retention::load(&segment)?;
     let runtime = Runtime::start(&config.runtime)?;
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
     for (index, shard) in shards.iter().enumerate() {
@@ -471,8 +472,9 @@ impl Daemon {
       let identity = identity.clone();
       let partition = u16::try_from(index).unwrap_or(u16::MAX);
       let all: Vec<u16> = shards.iter().map(|s| s.0).collect();
+      let retained = retained.clone();
       runtime.spawn_on(*shard, async move {
-        if let Err(e) = init_shard(&config, &env, &identity, partition, &all) {
+        if let Err(e) = init_shard(&config, &env, &identity, partition, &all, retained) {
           INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
           eprintln!("slates-server: shard {partition} failed to initialize: {e}");
         }
@@ -1413,6 +1415,7 @@ fn init_shard(
   identity: &Identity,
   partition: u16,
   config_shards: &[u16],
+  retained: Option<crate::retention::Retained>,
 ) -> Result<(), ServerError> {
   let (handoff, len) = handoff_of(env)?;
   let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
@@ -1474,7 +1477,9 @@ fn init_shard(
     |m| m.origin_anchor,
   );
   let issuer_secret = segment.issuer_secret()?;
-  let incarnation = boot_incarnation(&issuer_secret);
+  let incarnation = retained
+    .as_ref()
+    .map_or_else(|| boot_incarnation(&issuer_secret), |record| record.nonce);
   let host = crate::deploy::member_id(origin_anchor, incarnation);
   // The owner runtime this node takes part in a region as (§4.8, boot step 6): membership + the
   // configuration group + the owner's acceptor, composed by `slates-cluster`. Built from the configured
@@ -1493,7 +1498,9 @@ fn init_shard(
   let council = slates_cluster::config_group::RegionalCouncil::learner(
     host,
     quorum,
-    config.derived_scatter(quorum),
+    retained
+      .as_ref()
+      .map_or_else(|| config.derived_scatter(quorum), |record| record.scatter()),
     false,
   );
   // The discovery view holds manifest placeholders until authenticated contact. Placement
@@ -1589,6 +1596,8 @@ fn init_shard(
     formed_probe_peers: std::collections::BTreeSet::new(),
     member_boot_nonce: incarnation,
     learned_members: std::collections::BTreeMap::new(),
+    discovery: None,
+    enrolled: Vec::new(),
     demuxes: Vec::new(),
     holder_records: std::collections::BTreeMap::new(),
     pending_takeovers: std::collections::BTreeSet::new(),
@@ -1599,6 +1608,9 @@ fn init_shard(
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
     council,
     consensus_ready: false,
+    consensus_generation: 0,
+    recovery: crate::consensus_recovery::RecoveryState::default(),
+    consensus_failure: None,
     bootstrap_authorized: None,
     council_group: None,
     root_group: None,
@@ -1613,6 +1625,10 @@ fn init_shard(
     repairs: 0,
     pending_materializations: std::collections::BTreeMap::new(),
   };
+  if let Some(retained) = retained {
+    retained.restore(&mut state)?;
+  }
+  crate::retention::retain(&mut state)?;
   let rebuilt = verbs::rebuild_recovered(&mut state);
   if rebuilt.skipped > 0 {
     RECOVERY_SKIPPED.fetch_add(
@@ -1961,7 +1977,7 @@ mod limits {
 }
 
 #[cfg(test)]
-pub(crate) use tests::audit_on_shard;
+pub(crate) use tests::{audit_on_shard, audit_on_shard_configured};
 
 #[cfg(test)]
 mod tests {
@@ -1973,13 +1989,23 @@ mod tests {
   pub(crate) fn audit_on_shard<T: Send + 'static>(
     history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
   ) -> T {
+    audit_on_shard_configured(history, |_| {})
+  }
+
+  /// A bounded audit fixture may reduce a geometry before mapping it, so a capacity test
+  /// fills a few pages rather than the machine's measured production-sized reserve.
+  pub(crate) fn audit_on_shard_configured<T: Send + 'static>(
+    history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+    configure: impl FnOnce(&mut crate::DaemonConfig),
+  ) -> T {
     let profile = slates_machine::MachineProfile::measure(slates_machine::ProfileOptions {
       budget_per_probe: std::time::Duration::from_millis(5),
       codecs: false,
       core_matrix: false,
     });
     let instance = format!("audit-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance).with_shards(1);
+    let mut config = crate::DaemonConfig::derive(&profile, &instance).with_shards(1);
+    configure(&mut config);
     let daemon = super::Daemon::start(
       &profile,
       config,
@@ -2044,6 +2070,111 @@ mod tests {
       before_loss,
       after_loss,
     );
+  }
+
+  /// AC-8.1 / T-2.14, §4.8: acknowledge a vote in both groups, restart over retained anchor
+  /// RAM, then ask for a different candidate in the same term. Both groups must refuse.
+  #[test]
+  fn a_warm_restart_preserves_both_groups_votes_before_their_replies_escape() {
+    use slates_anchor::AnchorSegment;
+    use slates_cluster::config_group::RegionalCouncil;
+    use slates_cluster::raft::RequestVote;
+    use slates_cluster::raft_wire::{
+      RaftMessage, encode_regional_configuration, encode_root_configuration,
+    };
+    use slates_cluster::root_group::RootGroup;
+    use slates_db::register::{HostId, Quorum, RegionId};
+    let profile = slates_machine::MachineProfile::measure(slates_machine::ProfileOptions {
+      budget_per_probe: std::time::Duration::from_millis(5),
+      codecs: false,
+      core_matrix: false,
+    });
+    let instance = format!("warm-votes-{}", std::process::id());
+    let config = crate::DaemonConfig::derive(&profile, &instance).with_shards(1);
+    let segment =
+      AnchorSegment::create(&instance, &profile.facts.identity, config.geometry).unwrap();
+    let source = || {
+      let (handoff, len) = segment.handoff().unwrap();
+      super::SegmentSource::Handoff {
+        handoff,
+        len,
+        content: None,
+      }
+    };
+    let first = super::Daemon::start(&profile, config.clone(), source()).unwrap();
+    let request = |candidate| {
+      RaftMessage::RequestVote(RequestVote {
+        term: 7,
+        candidate,
+        last_log_index: 0,
+        last_log_term: 0,
+      })
+    };
+    let before = first
+      .observe(first.shards.first().copied(), move || {
+        crate::state::with_state(|state| {
+          let local = state.fleet.host();
+          let voters = vec![local, HostId(1), HostId(2)];
+          state.council = RegionalCouncil::new(
+            local,
+            voters.clone(),
+            voters.clone(),
+            Quorum { f: 1 },
+            Default::default(),
+            3,
+            false,
+          );
+          state.root = RootGroup::new(local, vec![RegionId(0)], voters);
+          let (raft, base) = state.council.join_state().unwrap();
+          state.council_group = Some(crate::consensus::genesis(
+            false,
+            &raft,
+            &encode_regional_configuration(&base),
+          ));
+          let (raft, base) = state.root.join_state().unwrap();
+          state.root_group = Some(crate::consensus::genesis(
+            true,
+            &raft,
+            &encode_root_configuration(&base),
+          ));
+          [
+            state.council.answer(request(HostId(1))).unwrap(),
+            state.root.answer(request(HostId(1))).unwrap(),
+          ]
+        })
+      })
+      .unwrap();
+    first.stop();
+    let second = super::Daemon::start(&profile, config, source()).unwrap();
+    let after = second
+      .observe(second.shards.first().copied(), move || {
+        crate::state::with_state(|state| {
+          [
+            state.council.answer(request(HostId(2))).unwrap(),
+            state.root.answer(request(HostId(2))).unwrap(),
+          ]
+        })
+      })
+      .unwrap();
+    second.stop();
+    for (before, after) in before.into_iter().zip(after) {
+      let (RaftMessage::VoteReply(before), RaftMessage::VoteReply(after)) = (before, after) else {
+        panic!("both messages must be vote replies");
+      };
+      assert!(
+        before.granted,
+        "the first candidate received this voter's grant"
+      );
+      assert_eq!(
+        before.voter, after.voter,
+        "the retained identity was reused"
+      );
+      assert_eq!(before.term, after.term);
+      assert!(
+        !after.granted,
+        "restarting cannot grant a second vote in the same term"
+      );
+    }
   }
 
   /// AC-8.1, §4.8, AUD-07: a separately bootstrapped group cannot alter this group's

@@ -500,10 +500,18 @@ impl Drop for TargetDir {
 
 fn target_dir() -> TargetDir {
   let out = std::process::Command::new("mktemp")
-    .args(["-d", "-t", &format!("slates-grant-{}", std::process::id())])
+    .args([
+      "-d",
+      "-t",
+      &format!("slates-grant-{}.XXXXXX", std::process::id()),
+    ])
     .output()
     .unwrap();
-  assert!(out.status.success(), "mktemp -d");
+  assert!(
+    out.status.success(),
+    "mktemp -d: {}",
+    String::from_utf8_lossy(&out.stderr)
+  );
   let made = String::from_utf8_lossy(&out.stdout).trim().to_owned();
   // The canonical path: a landing target is resolved component by component with `O_NOFOLLOW` (§4.13 —
   // no symlink in the chain may redirect a write), and macOS's `/var` is a symlink to `/private/var`, so

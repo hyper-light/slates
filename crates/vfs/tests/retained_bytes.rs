@@ -418,11 +418,17 @@ fn recovery_re_establishes_the_retention_charge_including_an_orphans() {
     2 * chunk,
     "one retained window plus the orphan's secured window"
   );
-  let image = vol.to_image(&source).unwrap();
+  let image = vol.to_image(&source, None).unwrap();
 
   let mut fresh = store();
-  let mut recovered =
-    Volume::from_image(&mut fresh, &image, Box::new(StepClock::new(0, 1)), 1 << 16).unwrap();
+  let mut recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
   // The recovered snapshot holds private copies of what diverged from the head: f (two windows,
   // its bytes changed) and g (one window — its version diverged when its link count went to zero,
   // so recovery rebuilds it privately where the live volume's two versions shared one chunk). The

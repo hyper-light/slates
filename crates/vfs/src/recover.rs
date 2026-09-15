@@ -14,15 +14,12 @@
 //! a truncated body or a non-canonical value, so a corrupt image is a typed [`VfsError`], never a
 //! panic (the no-panic law) and never a silently-smaller volume ([`VfsError::RecoveryIncomplete`]).
 //!
-//! What this slice captures and what it does not: it captures a scratch volume in full (the case
-//! §4.8 step two asks for — "create a scratch volume, write bytes, kill the daemon, restart, read
-//! the same bytes"). It refuses, rather than silently drops, a base-backed body or a whiteout (the
-//! base-plane recovery gate: "reopening a path alone cannot substitute another base"). CoW
-//! snapshots, a dynamic quota's counters and referenced-but-unlinked orphans are all captured now:
-//! the inode walk covers the whole table, so an orphan's content is captured with every other
-//! inode's, and its orphan tracking travels in `orphans`, so a recovered orphan is reclaimed when
-//! its handle, reacquired through the anchor handoff, finally closes — not leaked. What remains for
-//! orphans is that handle handoff itself (restoring the open references), a separate §4.8 gate.
+//! Scratch and overlay images include CoW snapshots, quota counters and referenced-but-unlinked
+//! orphans. An overlay also retains source-directory identities, witnesses, whiteouts, redirects
+//! and private windows. Recovery reopens source components without following links and verifies
+//! their full fingerprints before restoring lazy reads; a changed or absent source refuses.
+//! Directory caches start invalid so external edits are rechecked. Restoring open client handles
+//! through anchor handoff remains a separate §4.8 gate.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::mem::Discriminant;
@@ -49,7 +46,7 @@ const IMAGE_MAGIC: u32 = u32::from_le_bytes(*b"SLR1");
 /// is never decoded as the other.
 const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// Format: the image layout version, bumped with any change to the types below.
-const IMAGE_VERSION: u16 = 1;
+const IMAGE_VERSION: u16 = 2;
 
 /// The name-equivalence policy in an image (§4.4 [`NameEquivalence`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
@@ -133,7 +130,7 @@ pub struct EntryImage {
   /// The entry name.
   pub name: String,
   /// The child's inode number.
-  pub child: u64,
+  pub child: Option<u64>,
 }
 
 /// An inode's body reduced to its recoverable content (§4.5 `Body`): a directory becomes its
@@ -148,17 +145,43 @@ pub enum BodyImage {
   Directory {
     /// The entries.
     entries: Vec<EntryImage>,
+    /// Whether the source directory shows through or the overlay is opaque.
+    base: crate::dir::BaseDirState,
+    /// The original base path of an overlay directory rename.
+    origin: Option<String>,
   },
   /// A file's bytes.
   File {
     /// The bytes.
     bytes: Vec<u8>,
   },
+  /// A live base-backed file and the ranges already owned by the overlay.
+  Base {
+    /// The original observed source, independent of later source changes.
+    witness: Option<crate::inode::Witness>,
+    /// Private ranges, in ascending non-overlapping order.
+    pinned: Vec<PinnedImage>,
+    /// Source length before private extensions or truncations.
+    base_len: u64,
+    /// Unpinned reads already lost their source witness.
+    lost: bool,
+  },
   /// A symlink's target.
   Symlink {
     /// The target path.
     target: String,
   },
+}
+
+/// One private base-file range; absent bytes represent an explicit zero extent.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct PinnedImage {
+  /// Offset within the file.
+  pub offset: u64,
+  /// Number of bytes represented.
+  pub len: u64,
+  /// Owned bytes, or an allocation-free zero range.
+  pub bytes: Option<Vec<u8>>,
 }
 
 /// One inode in an image: its identity, attributes, home and body. The number is the volume-wide
@@ -290,6 +313,8 @@ pub struct VolumeImage {
   /// table), so their content already survives; this restores the *tracking* so a recovered orphan is
   /// reclaimed when its handle, reacquired through the anchor handoff, finally closes — not leaked.
   pub orphans: Vec<u64>,
+  /// Source identities and the complete durable overlay plane.
+  pub base: Option<crate::base::BaseImage>,
 }
 
 /// One volume's image under the routing key its owner (the server) files it by — the volume id's
@@ -562,12 +587,16 @@ impl Volume {
   /// path, a symlink's target. It refuses with [`VfsError::RecoveryIncomplete`] a body this slice
   /// does not yet capture (a base-backed entry or a whiteout over one), so a base-backed volume is
   /// never imaged as if it were only its overlay (the base-plane recovery gate).
-  pub fn to_image(&self, store: &Store) -> Result<VolumeImage, VfsError> {
-    // The image format has no base witnesses or retained host handles (§4.8, AUD-05). Even an
-    // unvisited overlay depends on its base; its empty materialized tree is not a complete image.
-    if self.base.is_some() {
-      return Err(VfsError::RecoveryIncomplete);
-    }
+  pub fn to_image(
+    &self,
+    store: &Store,
+    host: Option<&mut dyn crate::host::HostFs>,
+  ) -> Result<VolumeImage, VfsError> {
+    let base = match (&self.base, host) {
+      (Some(plane), Some(host)) => Some(plane.image(host)?),
+      (Some(_), None) => return Err(VfsError::RecoveryIncomplete),
+      (None, _) => None,
+    };
     let inodes = self.capture_tree(store, self.inode_root, None)?;
     let snapshots = self.capture_snapshots(store)?;
     let root_no = store
@@ -589,6 +618,7 @@ impl Volume {
       inodes,
       snapshots,
       orphans: self.orphans.keys().map(|no| no.0).collect(),
+      base,
     })
   }
 
@@ -706,20 +736,55 @@ impl Volume {
     inode: &Inode,
     snapshot: Option<SnapshotId>,
   ) -> Result<InodeImage, VfsError> {
-    if matches!(inode.body, Body::Base(_)) {
-      return Err(VfsError::RecoveryIncomplete);
-    }
-    let body = match inode.kind {
-      Kind::Dir => BodyImage::Directory {
-        entries: self.dir_entries(store, inode)?,
-      },
-      Kind::Symlink => match &inode.body {
-        Body::Symlink(target) => BodyImage::Symlink {
-          target: target.to_string(),
+    let body = if let Body::Base(base) = &inode.body {
+      let pinned = base
+        .pinned
+        .iter()
+        .map(|extent| {
+          let bytes = match extent.src {
+            crate::content::ExtentSrc::Zero => None,
+            crate::content::ExtentSrc::Chunk { .. } => Some(
+              store
+                .content
+                .extent_bytes(extent)
+                .ok_or(VfsError::RecoveryIncomplete)?
+                .to_vec(),
+            ),
+          };
+          Ok(PinnedImage {
+            offset: extent.off,
+            len: extent.len,
+            bytes,
+          })
+        })
+        .collect::<Result<_, VfsError>>()?;
+      BodyImage::Base {
+        witness: base.witness,
+        pinned,
+        base_len: base.base_len,
+        lost: base.lost,
+      }
+    } else {
+      match inode.kind {
+        Kind::Dir => {
+          let Body::Directory(handle) = inode.body else {
+            return Err(VfsError::RecoveryIncomplete);
+          };
+          let directory = store.dirs.get(handle)?;
+          BodyImage::Directory {
+            entries: self.dir_entries(store, inode)?,
+            base: directory.base,
+            origin: directory.origin.as_ref().map(|path| path.to_string()),
+          }
+        }
+        Kind::Symlink => match &inode.body {
+          Body::Symlink(target) => BodyImage::Symlink {
+            target: target.to_string(),
+          },
+          _ => return Err(VfsError::RecoveryIncomplete),
         },
-        _ => return Err(VfsError::RecoveryIncomplete),
-      },
-      Kind::File => self.file_body(store, inode, snapshot)?,
+        Kind::File => self.file_body(store, inode, snapshot)?,
+      }
     };
     Ok(InodeImage {
       no: inode.no.0,
@@ -757,19 +822,19 @@ impl Volume {
     let mut entries = Vec::with_capacity(dir.len());
     for entry in dir.iter(&store.blocks) {
       let child = match entry.child {
-        Child::File(no) | Child::Symlink(no) => no,
-        Child::Dir(handle) => {
+        Child::File(no) | Child::Symlink(no) => Some(no),
+        Child::Dir(handle) => Some(
           store
             .dirs
             .get(handle)
             .map_err(|_| VfsError::StaleHandle)?
-            .inode
-        }
-        Child::Whiteout => return Err(VfsError::RecoveryIncomplete),
+            .inode,
+        ),
+        Child::Whiteout => None,
       };
       entries.push(EntryImage {
         name: entry.name.to_string(),
-        child: child.0,
+        child: child.map(|inode| inode.0),
       });
     }
     // Canonical order: by name. Names are distinct within a directory under the volume's policy, so
@@ -902,6 +967,7 @@ impl Volume {
     image: &VolumeImage,
     clock: Box<dyn Clock>,
     journal_bytes: usize,
+    source: Option<(&mut dyn crate::host::HostFs, crate::host::HostDir)>,
   ) -> Result<Volume, VfsError> {
     let policy = policy_from_image(image.policy);
     let quota = quota_from_image(image.quota)?;
@@ -917,57 +983,75 @@ impl Volume {
       quota,
     };
     let mut vol = Volume::recovery_shell(store, seed, clock, journal_bytes)?;
+    let mut source = source;
+    let outcome = (|| {
+      vol.base = match (&image.base, source.as_mut()) {
+        (Some(image), Some((host, root))) => Some(crate::base::BasePlane::recover(
+          image, *host, *root, root_no,
+        )?),
+        (None, None) => None,
+        _ => return Err(VfsError::RecoveryIncomplete),
+      };
 
-    // The head, into the shell's roots. Recovery places inodes by number (not `next_no`), so set the
-    // live-inode count (§4.2) to the recovered head's inode count directly.
-    vol.rebuild_passes(store, &image.inodes, root_no, epoch)?;
-    vol.live_inodes = u64::try_from(image.inodes.len()).unwrap_or(u64::MAX);
-    // The head's live-entry count (built by rebuild_entries); snapshot rebuilds below run through the
-    // same dir_insert and perturb it, so keep it and restore after (§4.2 namespace, head-reachable).
-    let head_entries = vol.live_entries;
-    // The head's accounting is head-reachable content only; keep it aside so the snapshot rebuilds
-    // (which write through the same counters) do not perturb it.
-    let head_bytes = vol.bytes.clone();
+      // The head, into the shell's roots. Recovery places inodes by number (not `next_no`), so set the
+      // live-inode count (§4.2) to the recovered head's inode count directly.
+      vol.rebuild_passes(store, &image.inodes, root_no, epoch)?;
+      vol.live_inodes = u64::try_from(image.inodes.len()).unwrap_or(u64::MAX);
+      // The head's live-entry count (built by rebuild_entries); snapshot rebuilds below run through the
+      // same dir_insert and perturb it, so keep it and restore after (§4.2 namespace, head-reachable).
+      let head_entries = vol.live_entries;
+      // The head's accounting is head-reachable content only; keep it aside so the snapshot rebuilds
+      // (which write through the same counters) do not perturb it.
+      let head_bytes = vol.bytes.clone();
 
-    // The head's inode table and each inode's image, so a snapshot can share an inode it holds
-    // unchanged with the head instead of rebuilding a private copy (§4.2 CoW-sharing efficiency).
-    let head_inode_root = vol.inode_root;
-    let head_images: BTreeMap<u64, &InodeImage> = image.inodes.iter().map(|i| (i.no, i)).collect();
-    // Each snapshot's own full inodes, keyed by (its id, number), so a later snapshot that
-    // deduplicated a byte-identical version against it can share that snapshot's rebuilt inode
-    // (§4.2 cross-snapshot dedup). Keyed by the id pair since `SnapshotRef` is not ordered.
-    let mut canonical_inode: BTreeMap<((u32, u32), u64), &InodeImage> = BTreeMap::new();
-    for snap in &image.snapshots {
-      for inode in &snap.inodes {
-        canonical_inode.insert(((snap.id.index, snap.id.generation), inode.no), inode);
+      // The head's inode table and each inode's image, so a snapshot can share an inode it holds
+      // unchanged with the head instead of rebuilding a private copy (§4.2 CoW-sharing efficiency).
+      let head_inode_root = vol.inode_root;
+      let head_images: BTreeMap<u64, &InodeImage> =
+        image.inodes.iter().map(|i| (i.no, i)).collect();
+      // Each snapshot's own full inodes, keyed by (its id, number), so a later snapshot that
+      // deduplicated a byte-identical version against it can share that snapshot's rebuilt inode
+      // (§4.2 cross-snapshot dedup). Keyed by the id pair since `SnapshotRef` is not ordered.
+      let mut canonical_inode: BTreeMap<((u32, u32), u64), &InodeImage> = BTreeMap::new();
+      for snap in &image.snapshots {
+        for inode in &snap.inodes {
+          canonical_inode.insert(((snap.id.index, snap.id.generation), inode.no), inode);
+        }
       }
-    }
-    let refs = SharingRefs {
-      head_inode_root,
-      head_images: &head_images,
-      canonical_inode: &canonical_inode,
-    };
+      let refs = SharingRefs {
+        head_inode_root,
+        head_images: &head_images,
+        canonical_inode: &canonical_inode,
+      };
 
-    // Each snapshot, into its own roots, in id order so a fresh slab reproduces its id and a
-    // cross-snapshot reference always resolves to an already-rebuilt canonical. Deadlists are left
-    // empty here and filled by one global pass below, once every tree (and its sharing) exists.
-    let mut snapshots: Vec<&SnapshotImage> = image.snapshots.iter().collect();
-    snapshots.sort_by_key(|s| (s.id.index, s.id.generation));
-    for snap in &snapshots {
-      vol.rebuild_snapshot(store, snap, root_no, &refs)?;
-    }
-    vol.rebuild_deadlists(store, &snapshots)?;
-    vol.bytes = head_bytes;
-    vol.live_entries = head_entries;
-    vol.last_snapshot = image.last_snapshot.map(to_snapshot_id);
-    // Restore the orphan tracking (§4.8): the inodes are already rebuilt with the rest, and marking
-    // them orphans again means a reacquired handle's last close reclaims them rather than leaking.
-    vol.orphans = image.orphans.iter().map(|no| (InodeNo(*no), 0)).collect();
-    // Re-establish the retention the rebuilt deadlists and orphans hold against the shard budgets
-    // (§4.2 accounting through recovery); a shard that cannot back what was admitted before the
-    // restart refuses, and the half-built volume returns its slots and blocks rather than leaking.
-    if let Err(refusal) = vol.reestablish_retention(store) {
-      let _ = vol.discard_partial(store);
+      // Each snapshot, into its own roots, in id order so a fresh slab reproduces its id and a
+      // cross-snapshot reference always resolves to an already-rebuilt canonical. Deadlists are left
+      // empty here and filled by one global pass below, once every tree (and its sharing) exists.
+      let mut snapshots: Vec<&SnapshotImage> = image.snapshots.iter().collect();
+      snapshots.sort_by_key(|s| (s.id.index, s.id.generation));
+      for snap in &snapshots {
+        vol.rebuild_snapshot(store, snap, root_no, &refs)?;
+      }
+      vol.rebuild_deadlists(store, &snapshots)?;
+      vol.bytes = head_bytes;
+      vol.live_entries = head_entries;
+      vol.last_snapshot = image.last_snapshot.map(to_snapshot_id);
+      // Restore the orphan tracking (§4.8): the inodes are already rebuilt with the rest, and marking
+      // them orphans again means a reacquired handle's last close reclaims them rather than leaking.
+      vol.orphans = image.orphans.iter().map(|no| (InodeNo(*no), 0)).collect();
+      // Re-establish the retention the rebuilt deadlists and orphans hold against the shard budgets
+      // (§4.2 accounting through recovery); a shard that cannot back what was admitted before the
+      // restart refuses, and the half-built volume returns its slots and blocks rather than leaking.
+      vol.reestablish_retention(store)?;
+      Ok(())
+    })();
+    if let Err(refusal) = outcome {
+      if let Some(base) = vol.base.take()
+        && let Some((host, _)) = source
+      {
+        base.release_sources(host);
+      }
+      vol.discard_partial(store)?;
       return Err(refusal);
     }
     Ok(vol)
@@ -1218,13 +1302,20 @@ impl Volume {
     dirs: &BTreeMap<u64, Handle<DirNode>>,
   ) -> Result<(), VfsError> {
     for image_inode in inodes {
-      let BodyImage::Directory { entries } = &image_inode.body else {
+      let BodyImage::Directory {
+        entries,
+        base,
+        origin,
+      } = &image_inode.body
+      else {
         continue;
       };
       let parent_no = InodeNo(image_inode.no);
       let parent = *dirs
         .get(&image_inode.no)
         .ok_or(VfsError::RecoveryIncomplete)?;
+      store.dirs.get_mut(parent)?.base = *base;
+      store.dirs.get_mut(parent)?.origin = origin.as_ref().map(|path| path.as_str().into());
       for e in entries {
         let child = child_for(store, e, parent_no, kinds, dirs)?;
         self.dir_insert(store, parent, &e.name, child)?;
@@ -1239,10 +1330,54 @@ impl Volume {
   /// snapshot's files shared with the head already hold the head's content).
   fn fill_content(&mut self, store: &mut Store, inodes: &[InodeImage]) -> Result<(), VfsError> {
     for image_inode in inodes {
+      if let BodyImage::Base { pinned, .. } = &image_inode.body {
+        self.fill_base_pins(store, image_inode, pinned)?;
+      }
       if let BodyImage::File { bytes } = &image_inode.body
         && !bytes.is_empty()
       {
         self.write(store, InodeNo(image_inode.no), 0, bytes)?;
+      }
+    }
+    Ok(())
+  }
+
+  fn fill_base_pins(
+    &mut self,
+    store: &mut Store,
+    inode: &InodeImage,
+    pinned: &[PinnedImage],
+  ) -> Result<(), VfsError> {
+    let no = InodeNo(inode.no);
+    let mut previous_end = 0;
+    for extent in pinned {
+      let end = extent
+        .offset
+        .checked_add(extent.len)
+        .ok_or(VfsError::RecoveryIncomplete)?;
+      if extent.len == 0 || extent.offset < previous_end || end > inode.attrs.size {
+        return Err(VfsError::RecoveryIncomplete);
+      }
+      previous_end = end;
+      match &extent.bytes {
+        Some(bytes) => {
+          if u64::try_from(bytes.len()).ok() != Some(extent.len) {
+            return Err(VfsError::RecoveryIncomplete);
+          }
+          self.write(store, no, extent.offset, bytes)?;
+        }
+        None => {
+          let handle =
+            trie::get(&store.tries, self.inode_root, no).ok_or(VfsError::RecoveryIncomplete)?;
+          let Body::Base(body) = &mut store.inodes.get_mut(handle)?.body else {
+            return Err(VfsError::RecoveryIncomplete);
+          };
+          body.pinned.push(crate::content::Extent {
+            off: extent.offset,
+            len: extent.len,
+            src: crate::content::ExtentSrc::Zero,
+          });
+        }
       }
     }
     Ok(())
@@ -1322,6 +1457,7 @@ fn body_crc(body: &BodyImage) -> u32 {
     BodyImage::Symlink { target } => crc32c(target.as_bytes()),
     BodyImage::Empty => crc32c(&[]),
     BodyImage::Directory { .. } => 0,
+    BodyImage::Base { .. } => crc32c(&body.to_bytes()),
   }
 }
 
@@ -1342,7 +1478,21 @@ fn body_for(
       BodyImage::Symlink { target } => Ok(Body::Symlink(target.as_str().into())),
       _ => Err(VfsError::RecoveryIncomplete),
     },
-    KindImage::File => Ok(Body::Inline(Vec::new())),
+    KindImage::File => match &image_inode.body {
+      BodyImage::Base {
+        witness,
+        base_len,
+        lost,
+        ..
+      } => Ok(Body::Base(crate::inode::BaseBody {
+        witness: *witness,
+        pinned: Vec::new(),
+        base_len: *base_len,
+        descriptor: None,
+        lost: *lost,
+      })),
+      _ => Ok(Body::Inline(Vec::new())),
+    },
   }
 }
 
@@ -1355,15 +1505,15 @@ fn child_for(
   kinds: &BTreeMap<u64, KindImage>,
   dirs: &BTreeMap<u64, Handle<DirNode>>,
 ) -> Result<Child, VfsError> {
-  let child_no = InodeNo(entry.child);
-  match kinds
-    .get(&entry.child)
-    .ok_or(VfsError::RecoveryIncomplete)?
-  {
+  let Some(child) = entry.child else {
+    return Ok(Child::Whiteout);
+  };
+  let child_no = InodeNo(child);
+  match kinds.get(&child).ok_or(VfsError::RecoveryIncomplete)? {
     KindImage::File => Ok(Child::File(child_no)),
     KindImage::Symlink => Ok(Child::Symlink(child_no)),
     KindImage::Dir => {
-      let handle = *dirs.get(&entry.child).ok_or(VfsError::RecoveryIncomplete)?;
+      let handle = *dirs.get(&child).ok_or(VfsError::RecoveryIncomplete)?;
       let node = store.dirs.get_mut(handle)?;
       node.parent = Some(parent_no);
       node.name = entry.name.as_str().into();

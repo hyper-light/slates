@@ -114,6 +114,9 @@ struct Fetched {
 }
 
 pub(crate) fn serve_fetch(state: &ShardState, root: bool, bytes: &[u8]) -> Option<Vec<u8>> {
+  if state.recovery.target(root).is_some() {
+    return None;
+  }
   let request = Fetch::from_bytes(bytes).ok()?;
   let (initialized, version) = if root {
     (state.root.initialized(), state.root.configuration().version)
@@ -169,7 +172,12 @@ pub(crate) fn adopt_fetch(state: &mut ShardState, root: bool, peer: HostId, byte
   let Ok(reply) = Fetched::from_bytes(bytes) else {
     return false;
   };
-  if group_id(state, root).is_some_and(|group| group != reply.group) {
+  let pending = state.recovery.target(root).cloned();
+  if pending
+    .as_ref()
+    .is_some_and(|target| target.group != reply.group)
+    || (pending.is_none() && group_id(state, root).is_some_and(|group| group != reply.group))
+  {
     return false;
   }
   if let Some(join) = &reply.join
@@ -181,7 +189,13 @@ pub(crate) fn adopt_fetch(state: &mut ShardState, root: bool, peer: HostId, byte
     let Ok(configuration) = decode_root_configuration(&reply.configuration) else {
       return false;
     };
-    if !state.root.initialized() {
+    if pending
+      .as_ref()
+      .is_some_and(|target| configuration.version < target.floor)
+    {
+      return false;
+    }
+    if pending.is_some() || !state.root.initialized() {
       let Some(join) = reply.join else {
         return false;
       };
@@ -191,10 +205,13 @@ pub(crate) fn adopt_fetch(state: &mut ShardState, root: bool, peer: HostId, byte
       let Ok(base) = decode_root_configuration(&join.base) else {
         return false;
       };
-      if state.root.join_from(join.raft, base).is_err() {
+      let mut replacement = RootGroup::learner(state.fleet.host());
+      if replacement.join_from(join.raft, base).is_err() {
         return false;
       }
+      state.root = replacement;
       state.root_group = Some(reply.group);
+      state.recovery.root = None;
     }
     if !state.root.is_voter(state.fleet.host()) {
       state.root.adopt(configuration);
@@ -203,7 +220,13 @@ pub(crate) fn adopt_fetch(state: &mut ShardState, root: bool, peer: HostId, byte
     let Ok(configuration) = decode_regional_configuration(&reply.configuration) else {
       return false;
     };
-    if !state.council.initialized() {
+    if pending
+      .as_ref()
+      .is_some_and(|target| configuration.version < target.floor)
+    {
+      return false;
+    }
+    if pending.is_some() || !state.council.initialized() {
       let Some(join) = reply.join else {
         return false;
       };
@@ -213,10 +236,18 @@ pub(crate) fn adopt_fetch(state: &mut ShardState, root: bool, peer: HostId, byte
       let Ok(base) = decode_regional_configuration(&join.base) else {
         return false;
       };
-      if state.council.join_from(join.raft, base).is_err() {
+      let mut replacement = RegionalCouncil::learner(
+        state.fleet.host(),
+        base.quorum,
+        state.council.scatter(),
+        base.has_mirror,
+      );
+      if replacement.join_from(join.raft, base).is_err() {
         return false;
       }
+      state.council = replacement;
       state.council_group = Some(reply.group);
+      state.recovery.council = None;
     }
     if !state.council.is_voter(state.fleet.host()) {
       state.council.adopt(configuration);
@@ -264,7 +295,7 @@ impl Publication {
 
 /// The genesis remains immutable as the log changes the voters. These wrappers do not compact,
 /// so the Raft base voter set and application base are exactly the initial group definition.
-fn genesis(root: bool, raft: &SavedRaft, base: &[u8]) -> [u8; 32] {
+pub(crate) fn genesis(root: bool, raft: &SavedRaft, base: &[u8]) -> [u8; 32] {
   let mut hash = blake3::Hasher::new();
   hash.update(b"slates/consensus-genesis/v1");
   hash.update(&[u8::from(root)]);
@@ -308,6 +339,9 @@ pub(crate) fn decode_message(
   peer: HostId,
   bytes: &[u8],
 ) -> Result<RaftMessage, RaftWireError> {
+  if state.recovery.target(root).is_some() {
+    return Err(RaftWireError::ForeignGroup);
+  }
   let group = group_id(state, root).ok_or(RaftWireError::Uninitialized)?;
   let envelope = Envelope::from_bytes(bytes).map_err(|_| RaftWireError::MalformedEnvelope)?;
   if envelope.group != group {
