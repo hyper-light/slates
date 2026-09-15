@@ -6,6 +6,10 @@
 //! the process's own resident size through `ps` (a read of the kernel's accounting, never a write).
 //! One test per binary, so no other test's allocations move the numbers.
 
+// The whole file measures resident size through `ps` (Unix), so it is a Unix-only test and the crate is
+// empty on Windows. Without this, `--all-targets` clippy on Windows flags the imports, `config` and
+// `CYCLES` as unused there — the only test that uses them is `#[cfg(unix)]`.
+#![cfg(unix)]
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

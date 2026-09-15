@@ -5,6 +5,10 @@
 //! cluster, db, vfs) build thousands of runtimes per process. One test per binary, so no other test's
 //! allocations move the resident-size numbers.
 
+// The whole file measures resident size through `ps` (Unix), so it is a Unix-only test and the crate is
+// empty on Windows. Without this, `--all-targets` clippy on Windows flags the imports, `config`, `CYCLES`
+// and `one_simulation` as unused there — the only test that uses them is `#[cfg(unix)]`.
+#![cfg(unix)]
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

@@ -4,4 +4,8 @@
 # `clippy -D warnings` gate unreproducible (vorpal learned this; Appendix B.1). Bump this file
 # and the matching pins in .github/workflows/ in one commit, after a local `cargo clippy` pass.
 channel = "1.98.0"
-components = ["rustfmt", "clippy", "miri"]
+# miri is nightly-only: it is unavailable for a stable channel, so listing it here makes every stable
+# `cargo` invocation warn ("skipping unavailable component miri") and, under a strict install (the KIND
+# lane's `rustup ... --locked` in Docker), fail. The miri CI job installs it from nightly explicitly
+# (`dtolnay/rust-toolchain@nightly` with `components: miri`), so the stable toolchain does not carry it.
+components = ["rustfmt", "clippy"]
