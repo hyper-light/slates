@@ -76,10 +76,20 @@ fn entry_of(root: &Path, path: &Path) -> Result<Entry, Failure> {
   } else {
     (EntryKind::Other, 0, String::new())
   };
+  // A symlink's permission bits are not meaningful (POSIX ignores them — access is through the target)
+  // and are not portable: Linux always reports 0o777, macOS reports the creation mode masked by the
+  // umask (so 0o755 for a default umask), and the NFS-loopback mount reports 0o777. Normalize a
+  // symlink's mode to the 0o777 convention so the comparison judges the tree, not a non-behavioural,
+  // fs-specific value; a regular file's or directory's mode is compared as measured.
+  let mode = if file_type.is_symlink() {
+    0o777
+  } else {
+    metadata.permissions().mode() & PERMISSION_MASK
+  };
   Ok(Entry {
     path: relative,
     kind,
-    mode: metadata.permissions().mode() & PERMISSION_MASK,
+    mode,
     size,
     digest,
   })

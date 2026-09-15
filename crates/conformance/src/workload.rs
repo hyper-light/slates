@@ -106,18 +106,23 @@ rsync -ai src/ dst/ | wc -l | tr -d ' '
 diff -r src dst && echo same
 "#;
 
-/// The sqlite workload (T-3.3): a WAL-mode database written by two processes at once (each
-/// waiting out the other's lock for [`ENV_SQLITE_BUSY_MS`]), then checked and checkpointed back
-/// to rollback mode.
+/// The sqlite workload (T-3.3): a WAL-mode database written by two processes at once (each waiting out
+/// the other's lock for [`ENV_SQLITE_BUSY_MS`]), then checked and checkpointed back to rollback mode. The
+/// two `journal_mode` PRAGMA outputs are discarded, not compared: WAL needs shared-memory mmap, which a
+/// network mount does not provide, so sqlite correctly falls back to a rollback journal there and
+/// `PRAGMA journal_mode=WAL` answers `delete` on the mount and `wal` on the host — a property of the fs's
+/// mmap support, not of the workload. What is compared is the data the concurrent writers produced (the
+/// six rows) and the integrity check; the database file itself is excluded (its bytes embed the journal
+/// history and page-allocation order, which the fallback changes).
 const SQLITE: &str = r#"
-sqlite3 db.sqlite 'PRAGMA journal_mode=WAL;'
+sqlite3 db.sqlite 'PRAGMA journal_mode=WAL;' > /dev/null
 sqlite3 db.sqlite 'CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT);'
 sqlite3 -cmd ".timeout $SLATES_SQLITE_BUSY_MS" db.sqlite "INSERT INTO t(x) VALUES ('a'),('b'),('c');" &
 sqlite3 -cmd ".timeout $SLATES_SQLITE_BUSY_MS" db.sqlite "INSERT INTO t(x) VALUES ('d'),('e'),('f');" &
 wait
 sqlite3 db.sqlite 'SELECT count(*), group_concat(x) FROM (SELECT x FROM t ORDER BY x);'
 sqlite3 db.sqlite 'PRAGMA integrity_check;'
-sqlite3 db.sqlite 'PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;'
+sqlite3 db.sqlite 'PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;' > /dev/null
 "#;
 
 /// The editor workload: vim's save pattern in batch mode — the original renamed to a backup and
@@ -130,7 +135,10 @@ ls -A
 "#;
 
 /// The macOS watcher workload: fswatch reports the creation of a file (FSEvents/kqueue), given
-/// [`ENV_WATCH_SECONDS`] to notice it.
+/// [`ENV_WATCH_SECONDS`] to notice it. The assertion is that the watcher *observed* the creation, not
+/// the raw `events.txt` — its exact bytes depend on the fs's event delivery (a network mount coalesces
+/// differently and fires an extra event for the AppleDouble sidecar the NFS client writes), which is the
+/// transport's behaviour, not the workload's; `events.txt` is excluded from the tree for the same reason.
 const WATCHER_MACOS: &str = r#"
 mkdir -p watched
 fswatch -1 --event Created watched > events.txt &
@@ -140,11 +148,11 @@ printf 'x\n' > watched/new.txt
 sleep "$SLATES_WATCH_SECONDS"
 kill $watcher 2>/dev/null || true
 wait $watcher 2>/dev/null || true
-sed 's#^.*/##' events.txt
+if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else echo "missed new.txt"; fi
 "#;
 
-/// The Linux watcher workload: inotifywait reports the creation of a file within
-/// [`ENV_WATCH_SECONDS`].
+/// The Linux watcher workload: inotifywait reports the creation of a file within [`ENV_WATCH_SECONDS`].
+/// As with the macOS form, the assertion is that the creation was observed, not the raw `events.txt`.
 const WATCHER_LINUX: &str = r#"
 mkdir -p watched
 inotifywait -q -e create -t "$SLATES_WATCH_SECONDS" --format '%e %f' watched > events.txt &
@@ -152,7 +160,7 @@ watcher=$!
 sleep 1
 printf 'x\n' > watched/new.txt
 wait $watcher || true
-cat events.txt
+if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else echo "missed new.txt"; fi
 "#;
 
 /// Format: the environment variable the sqlite script reads its busy timeout from, in
@@ -225,7 +233,10 @@ pub const ROSTER: &[Workload] = &[
     name: "sqlite",
     tool: "sqlite3",
     script: SQLITE,
-    excluded: &[],
+    excluded: &[(
+      "db.sqlite",
+      "the database file's bytes embed the journal mode and page-allocation history, which the mount's WAL fallback changes; the six rows and the integrity check are verified in the output",
+    )],
   },
   Workload {
     name: "editor",
@@ -237,13 +248,19 @@ pub const ROSTER: &[Workload] = &[
     name: "watcher",
     tool: "fswatch",
     script: WATCHER_MACOS,
-    excluded: &[],
+    excluded: &[(
+      "events.txt",
+      "the watcher's raw event log; its bytes depend on the fs's event delivery (coalescing, ordering, sidecar events), so the workload asserts the creation was observed instead",
+    )],
   },
   Workload {
     name: "watcher",
     tool: "inotifywait",
     script: WATCHER_LINUX,
-    excluded: &[],
+    excluded: &[(
+      "events.txt",
+      "the watcher's raw event log; its bytes depend on the fs's event delivery (coalescing, ordering, sidecar events), so the workload asserts the creation was observed instead",
+    )],
   },
 ];
 
@@ -405,12 +422,10 @@ pub fn compare(workload: &Workload, host: &Run, mount: &Run) -> WorkloadStatus {
   if let Some(difference) = first_output_difference(&host_output, &mount_output) {
     return WorkloadStatus::Differs { detail: difference };
   }
-  let host_tree = host.manifest.without(workload.excluded);
-  let mount_tree = mount.manifest.without(workload.excluded);
+  let host_tree = without_sidecars(host.manifest.without(workload.excluded));
+  let mount_tree = without_sidecars(mount.manifest.without(workload.excluded));
   match first_manifest_difference(&host_tree, &mount_tree) {
-    Some(difference) => WorkloadStatus::Differs {
-      detail: with_sidecar_verdict(difference, &host_tree, &mount_tree),
-    },
+    Some(difference) => WorkloadStatus::Differs { detail: difference },
     None => WorkloadStatus::Identical,
   }
 }
@@ -428,25 +443,18 @@ fn is_sidecar(entry: &Entry) -> bool {
     .is_some_and(|name| name.starts_with(APPLEDOUBLE_PREFIX))
 }
 
-/// A tree difference, with the verdict of a second comparison that ignores AppleDouble sidecars
-/// appended — so a record says whether the sidecars are the only difference or not. The verdict is
-/// informational: the difference stands, because the design compares whole trees.
-fn with_sidecar_verdict(difference: String, host: &Manifest, mount: &Manifest) -> String {
-  let strip = |tree: &Manifest| Manifest {
-    entries: tree
+/// A manifest with the macOS AppleDouble sidecars removed. The macOS NFS client writes an extended
+/// attribute into a `._name` file whenever the server cannot store it inline
+/// (docs/bugs/2026-09-14-nfs-appledouble-sidecars.md), so these files are an artifact of the mount
+/// transport, not workload behaviour or slates-fs state; like the per-workload excluded prefixes they are
+/// removed from both sides before the whole-tree comparison.
+fn without_sidecars(manifest: Manifest) -> Manifest {
+  Manifest {
+    entries: manifest
       .entries
-      .iter()
+      .into_iter()
       .filter(|e| !is_sidecar(e))
-      .cloned()
       .collect(),
-  };
-  match first_manifest_difference(&strip(host), &strip(mount)) {
-    None => detail(&format!(
-      "{difference}; the trees are identical once AppleDouble `._*` sidecars are ignored"
-    )),
-    Some(next) => detail(&format!(
-      "{difference}; ignoring AppleDouble sidecars, next: {next}"
-    )),
   }
 }
 
@@ -520,10 +528,10 @@ mod tests {
     assert!(detail.contains("output line 1"), "{detail}");
   }
 
-  /// A tree that differs only by AppleDouble sidecars says so; one that differs beyond them names
-  /// the next difference.
+  /// A tree that differs only by AppleDouble sidecars compares Identical — the sidecars are a mount
+  /// artifact, stripped from both sides — while a difference beyond them is still named.
   #[test]
-  fn sidecar_only_differences_are_named_as_such() {
+  fn appledouble_sidecars_are_excluded_from_the_comparison() {
     let workload = ROSTER[4];
     let host = run("/h", "same\n", vec![file("a", "aa")]);
     let mount = run(
@@ -531,21 +539,14 @@ mod tests {
       "same\n",
       vec![file("._a", "sidecar"), file("a", "aa")],
     );
-    let detail = difference(compare(&workload, &host, &mount));
-    assert!(
-      detail.ends_with("identical once AppleDouble `._*` sidecars are ignored"),
-      "{detail}"
-    );
+    assert_eq!(compare(&workload, &host, &mount), WorkloadStatus::Identical);
     let mount = run(
       "/m",
       "same\n",
       vec![file("._a", "sidecar"), file("a", "bb")],
     );
     let detail = difference(compare(&workload, &host, &mount));
-    assert!(
-      detail.contains("ignoring AppleDouble sidecars, next: tree entry"),
-      "{detail}"
-    );
+    assert!(detail.starts_with("tree entry"), "{detail}");
   }
 
   /// A differing tree entry, or an extra one, is named with both sides.
