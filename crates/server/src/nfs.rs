@@ -68,7 +68,7 @@ use slates_bridge_nfs::procedures::{
 use slates_bridge_nfs::rpc::RecordReader;
 use slates_bridge_nfs::xdr::XdrReader;
 use slates_bridge_nfs::{
-  AcceptStatus, MultiExport, Nfsstat3, VolumeSet, auth_sys_gid, auth_sys_uid, parse_call,
+  AcceptStatus, MultiExport, Nfsstat3, UnixGroups, VolumeSet, auth_sys_identity, parse_call,
   reply_bytes, request_volume, root_volume, serve_call, write_record,
 };
 use slates_db::catalog::{Principal, VolumeId};
@@ -118,7 +118,7 @@ impl VolumeSet for ShardVolumeSet {
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
-    owner_gid: Option<u32>,
+    groups: Option<UnixGroups>,
     procedure: u32,
     args: &mut XdrReader<'_>,
   ) -> Option<Vec<u8>> {
@@ -126,7 +126,7 @@ impl VolumeSet for ShardVolumeSet {
       if !s.consensus_ready {
         return Some(io_failure_reply(procedure));
       }
-      with_export(s, volume, subject, rights, owner_gid, |export| {
+      with_export(s, volume, subject, rights, groups, |export| {
         export.serve_nfs(procedure, args)
       })
     })
@@ -139,10 +139,10 @@ impl VolumeSet for ShardVolumeSet {
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
-    owner_gid: Option<u32>,
+    groups: Option<UnixGroups>,
   ) -> Option<(Nfsfh3, Fattr3)> {
     state::with_state(|s| {
-      with_export(s, volume, subject, rights, owner_gid, |export| {
+      with_export(s, volume, subject, rights, groups, |export| {
         export.root_object()
       })
     })
@@ -160,7 +160,7 @@ fn with_export<R>(
   volume: VolumeId,
   subject: Principal,
   rights: Rights,
-  owner_gid: Option<u32>,
+  groups: Option<UnixGroups>,
   f: impl FnOnce(&mut Export<'_>) -> R,
 ) -> Option<R> {
   let handle = *s.by_id.get(&volume)?;
@@ -176,7 +176,7 @@ fn with_export<R>(
     slot.host.as_mut().map(|host| host as &mut dyn HostFs),
   );
   let mut export = Export::new(&mut bridge, volume, subject, rights).ok()?;
-  export.set_owner_gid(owner_gid);
+  export.set_groups(groups);
   // The per-boot write verifier (§4.6, RFC 1813 §3.3.7): a client compares it across a restart to
   // learn its unstable writes were lost and re-send them.
   export.set_write_verifier(write_verifier);
@@ -255,49 +255,40 @@ fn mount_rights() -> Rights {
   }
 }
 
-/// The principal a call runs as: the uid its `AUTH_SYS` credential names (the mounting user, §4.13, set
-/// by the kernel on a loopback mount), or the machine root when the call carries no such credential
-/// (`AUTH_NONE`) — so a real `mount_nfs` runs as the mounting user, not always root.
-fn subject_of(body: &[u8]) -> Principal {
-  match auth_sys_uid(body) {
-    Some(uid) => Principal::Uid { uid },
-    None => Principal::Uid { uid: 0 },
-  }
-}
-
-/// The group a call's created objects take: the gid its `AUTH_SYS` credential names (the mounting
-/// user's primary group, set by the kernel on a loopback mount), or `None` when the call carries no
-/// such credential (`AUTH_NONE`) — a created object then inherits its parent directory's group. So a
-/// real `mount_nfs` stamps the mounting user's own group, not `wheel` (§4.13).
-fn owner_gid_of(body: &[u8]) -> Option<u32> {
-  auth_sys_gid(body)
-}
-
 /// The mounting user a request runs as: the authenticated `subject` (uid-only, §4.13) it authorizes
-/// as, and the `owner_gid` a created object takes (the `AUTH_SYS` group; `None` — parent-inherited —
-/// when the mount named none). Both are read from the one credential and ride together to a volume's
-/// owner shard, so they travel as one value rather than two parallel arguments through the routing.
+/// as, and its `groups` — the `AUTH_SYS` primary group a created object takes and, with the
+/// supplementary groups, the group class of every permission check; `None` when the mount named none
+/// (`AUTH_NONE`: a caller in no group whose created objects inherit the parent's group). Both are read
+/// from the one credential and ride together to a volume's owner shard, so they travel as one value
+/// rather than two parallel arguments through the routing.
 #[derive(Clone)]
 struct Requester {
   subject: Principal,
-  owner_gid: Option<u32>,
+  groups: Option<UnixGroups>,
 }
 
 impl Requester {
-  /// The mounting user a call runs as, from its `AUTH_SYS` credential (both uid and gid, §4.13).
+  /// The mounting user a call runs as, from its `AUTH_SYS` credential (uid and groups, §4.13, set by
+  /// the kernel on a loopback mount — so a real `mount_nfs` runs as the mounting user and stamps the
+  /// user's own group, not root:wheel), or the machine root when the call carries no such credential
+  /// (`AUTH_NONE`).
   fn of(body: &[u8]) -> Requester {
-    Requester {
-      subject: subject_of(body),
-      owner_gid: owner_gid_of(body),
+    match auth_sys_identity(body) {
+      Some(identity) => Requester {
+        subject: Principal::Uid { uid: identity.uid },
+        groups: Some(identity.groups),
+      },
+      None => Requester::root(),
     }
   }
 
-  /// The fallback requester for a call whose header would not parse (a garbage call): machine root,
-  /// parent-inherited group. Never authorizes anything a real credential would not.
+  /// The fallback requester for a call whose header would not parse (a garbage call), and for a call
+  /// with no credential: machine root, in no group (parent-inherited). Never authorizes anything a real
+  /// credential would not.
   fn root() -> Requester {
     Requester {
       subject: Principal::Uid { uid: 0 },
-      owner_gid: None,
+      groups: None,
     }
   }
 }
@@ -417,7 +408,7 @@ fn serve_local(
     ShardVolumeSet,
     requester.subject,
     mount_rights(),
-    requester.owner_gid,
+    requester.groups,
   );
   let served = serve_call(
     &mut service,
@@ -491,11 +482,11 @@ impl VolumeSet for GatheredVolumeSet {
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
-    owner_gid: Option<u32>,
+    groups: Option<UnixGroups>,
     procedure: u32,
     args: &mut XdrReader<'_>,
   ) -> Option<Vec<u8>> {
-    ShardVolumeSet.serve(volume, subject, rights, owner_gid, procedure, args)
+    ShardVolumeSet.serve(volume, subject, rights, groups, procedure, args)
   }
 
   fn root_object(
@@ -503,9 +494,9 @@ impl VolumeSet for GatheredVolumeSet {
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
-    owner_gid: Option<u32>,
+    groups: Option<UnixGroups>,
   ) -> Option<(Nfsfh3, Fattr3)> {
-    ShardVolumeSet.root_object(volume, subject, rights, owner_gid)
+    ShardVolumeSet.root_object(volume, subject, rights, groups)
   }
 }
 
@@ -558,7 +549,7 @@ fn serve_root_listing(
     GatheredVolumeSet { entries },
     requester.subject,
     mount_rights(),
-    requester.owner_gid,
+    requester.groups,
   );
   serve_call(
     &mut service,

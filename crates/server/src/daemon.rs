@@ -2003,7 +2003,16 @@ mod tests {
       codecs: false,
       core_matrix: false,
     });
-    let instance = format!("audit-{}", std::process::id());
+    // One instance name per fixture call, not per process: the name is the daemon's segment and
+    // rendezvous object, and libtest runs these tests in parallel — with only the pid in the name,
+    // two concurrent audits created the same segment and the second `Daemon::start` failed
+    // (twelve tests of a `--lib` run, all at the `expect` below, all passing serially, 2026-09-15).
+    static NEXT_AUDIT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let instance = format!(
+      "audit-{}-{}",
+      std::process::id(),
+      NEXT_AUDIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     let mut config = crate::DaemonConfig::derive(&profile, &instance).with_shards(1);
     configure(&mut config);
     let daemon = super::Daemon::start(

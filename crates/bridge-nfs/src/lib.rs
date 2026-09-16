@@ -17,6 +17,7 @@
 //! [`nfs`] (the NFSv3 core data types of RFC 1813 — status codes, file types, times, attributes and
 //! file handles), and [`handle`] (slates' private encoding of a volume object's durable identity into an opaque file handle: `(volume, inode, gen)`). [`mount`] (the NFSv3 MOUNT protocol, RFC 1813 Appendix I — the `MNT` request and the `mountres3` reply that hands a client the export's root handle) and [`portmap`] (the minimal portmap responder, RFC 1833) are the two helper RPC programs the server answers alongside NFS.
 
+pub mod access;
 pub mod handle;
 pub mod mount;
 pub mod multi;
@@ -27,6 +28,7 @@ pub mod rpc;
 pub mod server;
 pub mod xdr;
 
+pub use access::{Caller, Denial, UnixGroups, UnixIdentity, Want};
 pub use handle::{FileHandle, FileHandleError};
 pub use mount::{MountReply, Mountstat3};
 pub use multi::{
@@ -36,8 +38,8 @@ pub use nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3}
 pub use portmap::Mapping;
 pub use procedures::Export;
 pub use rpc::{
-  AcceptStatus, RpcCall, RpcError, auth_sys_creds, auth_sys_gid, auth_sys_uid, parse_call,
-  read_record, reply_bytes, write_record,
+  AUTH_SYS_MAX_GIDS, AcceptStatus, RpcCall, RpcError, auth_sys_creds, auth_sys_gid,
+  auth_sys_identity, auth_sys_uid, parse_call, read_record, reply_bytes, write_record,
 };
 pub use server::{serve_call, serve_connection, serve_connection_async};
 pub use xdr::{XdrError, XdrReader, XdrWriter};

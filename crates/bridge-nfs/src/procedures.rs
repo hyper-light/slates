@@ -12,8 +12,18 @@
 //! export or a foreign volume is refused before any effect, exactly as at the FUSE edge. The
 //! served set is the metadata path (MOUNT `MNT`, `NULL`, `GETATTR`, `SETATTR`, `LOOKUP`, `ACCESS`,
 //! `FSSTAT`, `FSINFO`), the file I/O path (`READ`, `WRITE`), and the namespace (`CREATE`, `MKDIR`,
-//! `SYMLINK`, `READLINK`, `REMOVE`, `RMDIR`, `RENAME`) — all over the shared inode-addressed
-//! interface. The directory-listing procedures (`READDIR`, `READDIRPLUS`) are owed.
+//! `SYMLINK`, `READLINK`, `REMOVE`, `RMDIR`, `RENAME`, `LINK`) and the listings (`READDIR`,
+//! `READDIRPLUS`) — all over the shared inode-addressed interface.
+//!
+//! **Access control.** Every procedure that reads, changes or names an object first applies the POSIX
+//! permission rules to the request's caller ([`crate::access`]: the uid the `AUTH_SYS` credential
+//! names and its groups): search on a directory to resolve a name, write and search on a directory to
+//! add, remove or rename an entry (the sticky bit deciding who may remove what), read or write on a
+//! file for its bytes, and the ownership rules for `SETATTR`. A refusal is typed (`NFS3ERR_ACCES` for a
+//! missing permission bit, `NFS3ERR_PERM` for an ownership rule) before any effect, and `ACCESS`
+//! reports the same verdict the procedures apply, so the client's own `open(2)` checks agree with the
+//! server. This is what `default_permissions` gives the FUSE mount from the kernel; an NFS server must
+//! do it itself (`docs/wip/EQUIVALENCE.md` §8).
 
 use slates_bridge_core::{
   AttachmentId, Attachments, Bridge, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, Rights,
@@ -23,6 +33,7 @@ use slates_db::catalog::{Principal, VolumeId};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
+use crate::access::{self, Caller, Denial, UnixGroups, Want};
 use crate::handle::{FileHandle, FileHandleError};
 use crate::mount::{MountReply, Mountstat3};
 use crate::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3};
@@ -122,12 +133,6 @@ const ACCESS3_EXTEND: u32 = 0x8;
 const ACCESS3_DELETE: u32 = 0x10;
 /// Format: ACCESS3_EXECUTE, execute a file or search a directory.
 const ACCESS3_EXECUTE: u32 = 0x20;
-/// Format: the owner read permission bit.
-const OWNER_READ: u32 = 0o400;
-/// Format: the owner write permission bit.
-const OWNER_WRITE: u32 = 0o200;
-/// Format: the owner execute permission bit.
-const OWNER_EXECUTE: u32 = 0o100;
 /// Format: `UNSTABLE` (`stable_how` = 0, RFC 1813 §3.3.7): the server may reply before the data is
 /// stable; the client keeps its copy until a COMMIT (or a later stable WRITE) answers with the same
 /// write verifier, and re-sends it when the verifier changed (the server restarted in between).
@@ -204,11 +209,13 @@ pub struct Export<'b> {
   attachments: Attachments,
   /// The attachment this export admitted for its mount. Every procedure builds its context from it.
   attachment: AttachmentId,
-  /// The mounting user's group (an `AUTH_SYS` gid), overlaid onto every request's [`OpContext`] so a
-  /// created object takes it; `None` when the mount's credential named none (`AUTH_NONE`), and a
-  /// created object then inherits its parent's group. Set after construction ([`Self::set_owner_gid`])
-  /// so `new`'s many call sites stay unchanged — the group is not part of the authenticated identity.
-  owner_gid: Option<u32>,
+  /// The caller every request runs as, for the POSIX permission rules ([`crate::access`]): the uid of
+  /// the enrolled subject, and the groups the `AUTH_SYS` credential named — the primary group also
+  /// overlaid onto every request's [`OpContext`] so a created object takes it. The groups are `None`
+  /// when the credential named none (`AUTH_NONE`, a caller in no group whose created objects inherit
+  /// the parent's group), set after construction ([`Self::set_groups`]) so `new`'s many call sites
+  /// stay unchanged — the groups are not part of the authenticated identity, only of its permissions.
+  caller: Caller,
   /// The write verifier (RFC 1813 `writeverf3`) every WRITE and COMMIT reply carries: eight bytes a
   /// client compares across calls to learn whether the server lost its unstable writes in between
   /// (a restart), in which case it re-sends them. The host that can restart sets it per boot
@@ -230,6 +237,12 @@ impl<'b> Export<'b> {
     subject: Principal,
     rights: Rights,
   ) -> Result<Export<'b>, VfsError> {
+    // The caller's uid is the enrolled subject's; a subject that is not a Unix user owns nothing and
+    // is judged by the other class of every object.
+    let caller_uid = match &subject {
+      Principal::Uid { uid } => *uid,
+      _ => access::INVALID_UID,
+    };
     let mut attachments = Attachments::new();
     let attachment = attachments.attach(volume, View::Current, subject, rights)?;
     let mut fsid = [0u8; size_of::<u64>()];
@@ -239,16 +252,20 @@ impl<'b> Export<'b> {
       volume,
       attachments,
       attachment,
-      owner_gid: None,
+      caller: Caller {
+        uid: caller_uid,
+        groups: None,
+      },
       write_verifier: fsid,
     })
   }
 
-  /// Sets the mounting user's group (from the call's `AUTH_SYS` credential), overlaid onto every
-  /// request's context so a created object takes it — the daemon's export path calls this per request
-  /// with the credential's gid; a mount with no such credential leaves it `None` (parent-inherited).
-  pub fn set_owner_gid(&mut self, gid: Option<u32>) {
-    self.owner_gid = gid;
+  /// Sets the caller's groups (from the call's `AUTH_SYS` credential): the primary group a created
+  /// object takes (overlaid onto every request's context), and with the supplementary groups the group
+  /// class of every permission check. The daemon's export path calls this per request; a mount with no
+  /// such credential leaves it `None` — a parent-inherited group, a caller in no group.
+  pub fn set_groups(&mut self, groups: Option<UnixGroups>) {
+    self.caller.groups = groups;
   }
 
   /// Sets the write verifier (RFC 1813 `writeverf3`) this export answers WRITE and COMMIT with: the
@@ -264,10 +281,28 @@ impl<'b> Export<'b> {
   /// no longer be established" case, which the caller maps to a `STALE`/`ACCES` NFS status.
   fn op_context(&self) -> Result<OpContext, VfsError> {
     let mut context = self.attachments.context(self.attachment)?;
-    // Overlay the mount's group onto the authenticated context: the attachment registry carries only
-    // the authenticated identity (uid-only), and the group is file ownership the export edge supplies.
-    context.owner_gid = self.owner_gid;
+    // Overlay the caller's primary group onto the authenticated context: the attachment registry
+    // carries only the authenticated identity (uid-only), and the group is file ownership the export
+    // edge supplies.
+    context.owner_gid = self.caller.groups.as_ref().map(|groups| groups.gid);
     Ok(context)
+  }
+
+  /// The attributes of the directory a namespace change (a create, remove, rename or link) names, once
+  /// the caller is allowed to change it — search and write permission (POSIX); `Acces` otherwise, the
+  /// directory's attributes carried either way for the reply's `wcc_data`.
+  fn writable_directory(
+    &mut self,
+    identity: &FileHandle,
+  ) -> Result<NodeAttr, (Nfsstat3, Option<Fattr3>)> {
+    let node = self.attrs_of(identity).map_err(|status| (status, None))?;
+    let attr = Some(self.fattr3(&node));
+    if !access::permits(&self.caller, &node, Want::Search)
+      || !access::permits(&self.caller, &node, Want::Write)
+    {
+      return Err((Nfsstat3::Acces, attr));
+    }
+    Ok(node)
   }
 
   /// The filesystem id the export reports: the leading 64 bits of the volume id, stable per volume.
@@ -464,6 +499,10 @@ impl<'b> Export<'b> {
       .attrs_of(&dir_identity)
       .map_err(|status| (status, None))?;
     let dir_attr = Some(self.fattr3(&dir_node));
+    // POSIX: resolving a name needs search permission on the directory.
+    if !access::permits(&self.caller, &dir_node, Want::Search) {
+      return Err((Nfsstat3::Acces, dir_attr));
+    }
     let cx = self.op_context().map_err(|e| (nfsstat_of(&e), dir_attr))?;
     let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
     let child = self
@@ -475,10 +514,10 @@ impl<'b> Export<'b> {
     Ok((handle, object, dir_attr))
   }
 
-  /// NFSPROC3_ACCESS: which requested operations the caller may perform. slates is not a sandbox
-  /// (a non-goal) — it serves the filesystem and leaves process isolation to the harness — so it
-  /// grants the access requested on an object the caller can already name; the reply carries the
-  /// object's attributes so the client caches them.
+  /// NFSPROC3_ACCESS: which requested operations the caller may perform on an object — the exact POSIX
+  /// class verdict for the request's caller ([`granted_access`]), which is what the client answers its
+  /// own `open(2)` and `access(2)` from; the reply carries the object's attributes so the client caches
+  /// them.
   pub fn access(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
     let mut writer = XdrWriter::new();
     match self.access_result(args) {
@@ -500,7 +539,10 @@ impl<'b> Export<'b> {
     let requested = args.u32().map_err(|_| Nfsstat3::Inval)?;
     let identity = self.resolve_handle(&handle)?;
     let node = self.attrs_of(&identity)?;
-    Ok((self.fattr3(&node), granted_access(node.mode, requested)))
+    Ok((
+      self.fattr3(&node),
+      granted_access(&self.caller, &node, requested),
+    ))
   }
 
   /// NFSPROC3_READ: read up to `count` bytes at `offset` from the file a handle names, over the
@@ -538,6 +580,11 @@ impl<'b> Export<'b> {
     // the size the end-of-file flag is computed against.
     let node = self.attrs_of(&identity).map_err(|s| (s, None))?;
     let post = self.fattr3(&node);
+    // POSIX: reading a file's bytes needs read permission (the owner reads its own file whatever the
+    // bits say — the I/O owner override, `crate::access`).
+    if !access::permits_io(&self.caller, &node, Want::Read) {
+      return Err((Nfsstat3::Acces, Some(post)));
+    }
     let cx = self
       .op_context()
       .map_err(|e| (nfsstat_of(&e), Some(post)))?;
@@ -597,12 +644,32 @@ impl<'b> Export<'b> {
       .map_err(|_| (Nfsstat3::Inval, None))?
       .to_vec();
     let identity = self.resolve_handle(&handle).map_err(|s| (s, None))?;
+    let node = self.attrs_of(&identity).map_err(|s| (s, None))?;
+    // POSIX: writing a file's bytes needs write permission (the owner writes its own file whatever the
+    // bits say — the I/O owner override, `crate::access`).
+    if !access::permits_io(&self.caller, &node, Want::Write) {
+      return Err((Nfsstat3::Acces, Some(self.fattr3(&node))));
+    }
     let cx = self.op_context().map_err(|e| (nfsstat_of(&e), None))?;
     let object = ObjectId::new(identity.inode, identity.generation);
     let written = self
       .bridge
       .write(object, &cx, offset, &data)
       .map_err(|e| (nfsstat_of(&e), None))?;
+    // POSIX `write(2)`: a write by a caller other than the superuser clears the file's set-user-id and
+    // set-group-id bits, so a privileged binary cannot be altered and keep its privilege.
+    if written > 0
+      && let Some(mode) = access::mode_after_write(&self.caller, &node)
+    {
+      let strip = SetAttr {
+        mode: Some(mode),
+        ..SetAttr::default()
+      };
+      self
+        .bridge
+        .setattr(object, &cx, strip)
+        .map_err(|e| (nfsstat_of(&e), None))?;
+    }
     // The post-op attributes reflect the file after the write (the wcc's post half).
     let node = self.attrs_of(&identity).map_err(|s| (s, None))?;
     let committed = if stable == UNSTABLE {
@@ -691,6 +758,17 @@ impl<'b> Export<'b> {
       .map_err(|status| (status, None))?;
     let cx = self.op_context().map_err(|e| (nfsstat_of(&e), None))?;
     let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
+    // POSIX: removing an entry needs write and search permission on the directory, and in a sticky
+    // directory only the entry's owner, the directory's owner or the superuser may remove it.
+    let dir_node = self.writable_directory(&dir_identity)?;
+    let dir_attr = Some(self.fattr3(&dir_node));
+    let entry = self
+      .bridge
+      .lookup(parent, &cx, &name)
+      .map_err(|e| (nfsstat_of(&e), dir_attr))?;
+    if access::sticky_forbids(&self.caller, &dir_node, &entry) {
+      return Err((Nfsstat3::Perm, dir_attr));
+    }
     let outcome = if is_dir {
       self.bridge.rmdir(parent, &cx, &name)
     } else {
@@ -756,6 +834,13 @@ impl<'b> Export<'b> {
     };
     let from_parent = ObjectId::new(from_identity.inode, from_identity.generation);
     let to_parent = ObjectId::new(to_identity.inode, to_identity.generation);
+    if let Err(status) =
+      self.rename_permission(&from_identity, &to_identity, &from_name, &to_name, &cx)
+    {
+      let from_post = self.attrs_of(&from_identity).ok().map(|n| self.fattr3(&n));
+      let to_post = self.attrs_of(&to_identity).ok().map(|n| self.fattr3(&n));
+      return (status, from_post, to_post);
+    }
     let outcome = self.bridge.rename(
       from_parent,
       to_parent,
@@ -771,6 +856,49 @@ impl<'b> Export<'b> {
       Err(e) => nfsstat_of(&e),
     };
     (status, from_post, to_post)
+  }
+
+  /// The POSIX permission rules of a rename, checked before any effect: write and search permission
+  /// on both directories; the sticky bit of the source directory for the entry moved (and of the
+  /// destination directory for an entry it replaces) — the entry's owner, the directory's owner or the
+  /// superuser only; and, for a directory moved to a new parent, write permission on the directory
+  /// itself, since its `..` entry is rewritten. `Acces` for a missing permission bit, `Perm` for a
+  /// sticky-bit refusal; a source that does not exist is `Noent`, as the rename itself would report.
+  fn rename_permission(
+    &mut self,
+    from_identity: &FileHandle,
+    to_identity: &FileHandle,
+    from_name: &str,
+    to_name: &str,
+    cx: &OpContext,
+  ) -> Result<(), Nfsstat3> {
+    let from_node = self
+      .writable_directory(from_identity)
+      .map_err(|(status, _)| status)?;
+    let to_node = self
+      .writable_directory(to_identity)
+      .map_err(|(status, _)| status)?;
+    let from_parent = ObjectId::new(from_identity.inode, from_identity.generation);
+    let to_parent = ObjectId::new(to_identity.inode, to_identity.generation);
+    let source = self
+      .bridge
+      .lookup(from_parent, cx, from_name)
+      .map_err(|e| nfsstat_of(&e))?;
+    if access::sticky_forbids(&self.caller, &from_node, &source) {
+      return Err(Nfsstat3::Perm);
+    }
+    if source.kind == Kind::Dir
+      && from_identity.inode != to_identity.inode
+      && !access::permits(&self.caller, &source, Want::Write)
+    {
+      return Err(Nfsstat3::Acces);
+    }
+    if let Ok(target) = self.bridge.lookup(to_parent, cx, to_name)
+      && access::sticky_forbids(&self.caller, &to_node, &target)
+    {
+      return Err(Nfsstat3::Perm);
+    }
+    Ok(())
   }
 
   /// NFSPROC3_SETATTR: set some of an object's attributes over the shared interface under the
@@ -793,8 +921,8 @@ impl<'b> Export<'b> {
       Ok(fh) => fh,
       Err(_) => return (Nfsstat3::Badhandle, None),
     };
-    let changes = match self.decode_sattr3(args) {
-      Ok(changes) => changes,
+    let (changes, explicit_times) = match self.decode_sattr3(args) {
+      Ok(decoded) => decoded,
       Err(status) => return (status, None),
     };
     // sattr_guard3: a bool, then (if set) the ctime the object must currently have.
@@ -824,6 +952,14 @@ impl<'b> Export<'b> {
     {
       return (Nfsstat3::NotSync, Some(self.fattr3(&node)));
     }
+    // The POSIX ownership and permission rules for each field the request sets: the mode and explicit
+    // times need ownership, the owner and group follow `_POSIX_CHOWN_RESTRICTED`, the size needs write
+    // permission — refused typed (`PERM`/`ACCES`) before any effect. An allowed change carries the
+    // set-id side effects a non-superuser's chown or chmod has (`crate::access`).
+    if let Some(denial) = access::setattr_denial(&self.caller, &node, &changes, explicit_times) {
+      return (status_of_denial(denial), Some(self.fattr3(&node)));
+    }
+    let changes = access::with_setid_side_effects(&self.caller, &node, changes);
     let cx = match self.op_context() {
       Ok(cx) => cx,
       Err(e) => return (nfsstat_of(&e), Some(self.fattr3(&node))),
@@ -841,7 +977,9 @@ impl<'b> Export<'b> {
   /// Decodes an `sattr3` (RFC 1813 §3.3.2) into the neutral [`SetAttr`]: each optional field becomes
   /// `Some` only when the caller asks to set it, and a `SET_TO_SERVER_TIME` time is resolved to the
   /// volume's wall clock now (AC-3.10), so the seam receives explicit values and never has to guess.
-  fn decode_sattr3(&mut self, args: &mut XdrReader<'_>) -> Result<SetAttr, Nfsstat3> {
+  /// The second value says whether a time was `SET_TO_CLIENT_TIME` — an explicit time, which POSIX
+  /// lets only the owner set, where "now" needs only write permission (`crate::access`).
+  fn decode_sattr3(&mut self, args: &mut XdrReader<'_>) -> Result<(SetAttr, bool), Nfsstat3> {
     let mode = decode_optional_u32(args)?;
     let uid = decode_optional_u32(args)?;
     let gid = decode_optional_u32(args)?;
@@ -872,16 +1010,20 @@ impl<'b> Export<'b> {
     } else {
       None
     };
-    Ok(SetAttr {
-      size,
-      mode,
-      uid,
-      gid,
-      atime: resolve_set_time(atime_how, atime_client, server_now)?,
-      mtime: resolve_set_time(mtime_how, mtime_client, server_now)?,
-      // An NFSv3 `sattr3` has no change time (RFC 1813 §2.3.5): it advances to the server clock.
-      ctime: None,
-    })
+    let explicit_times = atime_how == TIME_SET_TO_CLIENT || mtime_how == TIME_SET_TO_CLIENT;
+    Ok((
+      SetAttr {
+        size,
+        mode,
+        uid,
+        gid,
+        atime: resolve_set_time(atime_how, atime_client, server_now)?,
+        mtime: resolve_set_time(mtime_how, mtime_client, server_now)?,
+        // An NFSv3 `sattr3` has no change time (RFC 1813 §2.3.5): it advances to the server clock.
+        ctime: None,
+      },
+      explicit_times,
+    ))
   }
 
   /// NFSPROC3_CREATE: create a regular file in a directory over the shared interface under the
@@ -913,9 +1055,9 @@ impl<'b> Export<'b> {
       Ok(m) => m,
       Err(_) => return (Nfsstat3::Inval, None, None),
     };
-    let changes = match mode_kind {
+    let (changes, explicit_times) = match mode_kind {
       CREATE_UNCHECKED | CREATE_GUARDED => match self.decode_sattr3(args) {
-        Ok(c) => c,
+        Ok(decoded) => decoded,
         Err(status) => return (status, None, None),
       },
       // EXCLUSIVE's createverf3 is an 8-byte verifier slates does not yet persist to make the
@@ -932,36 +1074,52 @@ impl<'b> Export<'b> {
       Err(e) => return (nfsstat_of(&e), None, None),
     };
     let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
-    let mode = changes.mode.unwrap_or(DEFAULT_FILE_MODE);
-    let object = match self.bridge.create(parent, &cx, &name, mode, 0) {
-      Ok((node, fh)) => {
-        // NFS keeps no open state; drop the open reference the create took (the client's handle is
-        // identity-based, not this open handle). The lookup reference persists until the teardown
-        // sweep (owed), since NFSv3 has no FORGET.
-        let object = ObjectId::new(node.ino, node.generation);
-        let _ = self.bridge.release(object, &cx, fh);
-        object
-      }
-      Err(VfsError::AlreadyExists) if mode_kind == CREATE_UNCHECKED => {
-        // UNCHECKED succeeds on an existing name by opening it.
-        match self.bridge.lookup(parent, &cx, &name) {
-          Ok(node) => ObjectId::new(node.ino, node.generation),
+    // POSIX: resolving the name needs search permission on the directory; an existing name is then an
+    // open (UNCHECKED, no write permission on the directory needed) or a refusal (GUARDED, `EXIST`);
+    // creating a new one needs write permission on the directory too.
+    let dir_node = match self.attrs_of(&dir_identity) {
+      Ok(node) => node,
+      Err(status) => return (status, None, None),
+    };
+    let dir_post = Some(self.fattr3(&dir_node));
+    if !access::permits(&self.caller, &dir_node, Want::Search) {
+      return (Nfsstat3::Acces, None, dir_post);
+    }
+    let existing = match self.bridge.lookup(parent, &cx, &name) {
+      Ok(node) if mode_kind == CREATE_UNCHECKED => Some(ObjectId::new(node.ino, node.generation)),
+      Ok(_) => return (Nfsstat3::Exist, None, dir_post),
+      Err(VfsError::NotFound) => None,
+      Err(e) => return (nfsstat_of(&e), None, dir_post),
+    };
+    let object = match existing {
+      // UNCHECKED succeeds on an existing name by opening it.
+      Some(object) => object,
+      None => {
+        if !access::permits(&self.caller, &dir_node, Want::Write) {
+          return (Nfsstat3::Acces, None, dir_post);
+        }
+        let mode = changes.mode.unwrap_or(DEFAULT_FILE_MODE);
+        match self.bridge.create(parent, &cx, &name, mode, 0) {
+          Ok((node, fh)) => {
+            // NFS keeps no open state; drop the open reference the create took (the client's handle
+            // is identity-based, not this open handle). The lookup reference persists until the
+            // teardown sweep (owed), since NFSv3 has no FORGET.
+            let object = ObjectId::new(node.ino, node.generation);
+            let _ = self.bridge.release(object, &cx, fh);
+            object
+          }
           Err(e) => {
             let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
             return (nfsstat_of(&e), None, dir_post);
           }
         }
       }
-      Err(e) => {
-        let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
-        return (nfsstat_of(&e), None, dir_post);
-      }
     };
     let post_changes = SetAttr {
       mode: None,
       ..changes
     };
-    self.finish_create(object, &dir_identity, &cx, post_changes)
+    self.finish_create(object, &dir_identity, &cx, post_changes, explicit_times)
   }
 
   /// NFSPROC3_MKDIR: create a directory in a parent over the shared interface under the export's
@@ -986,8 +1144,8 @@ impl<'b> Export<'b> {
       Ok(n) => n.to_owned(),
       Err(_) => return (Nfsstat3::Inval, None, None),
     };
-    let changes = match self.decode_sattr3(args) {
-      Ok(c) => c,
+    let (changes, explicit_times) = match self.decode_sattr3(args) {
+      Ok(decoded) => decoded,
       Err(status) => return (status, None, None),
     };
     let dir_identity = match self.resolve_handle(&dir_fh) {
@@ -999,6 +1157,10 @@ impl<'b> Export<'b> {
       Err(e) => return (nfsstat_of(&e), None, None),
     };
     let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
+    // POSIX: adding an entry needs write and search permission on the directory.
+    if let Err((status, dir_post)) = self.writable_directory(&dir_identity) {
+      return (status, None, dir_post);
+    }
     let mode = changes.mode.unwrap_or(DEFAULT_DIR_MODE);
     let object = match self.bridge.mkdir(parent, &cx, &name, mode) {
       Ok(node) => ObjectId::new(node.ino, node.generation),
@@ -1013,7 +1175,7 @@ impl<'b> Export<'b> {
       size: None,
       ..changes
     };
-    self.finish_create(object, &dir_identity, &cx, post_changes)
+    self.finish_create(object, &dir_identity, &cx, post_changes, explicit_times)
   }
 
   /// NFSPROC3_SYMLINK: create a symbolic link in a directory over the shared interface under the
@@ -1040,8 +1202,8 @@ impl<'b> Export<'b> {
       Ok(n) => n.to_owned(),
       Err(_) => return (Nfsstat3::Inval, None, None),
     };
-    let changes = match self.decode_sattr3(args) {
-      Ok(c) => c,
+    let (changes, explicit_times) = match self.decode_sattr3(args) {
+      Ok(decoded) => decoded,
       Err(status) => return (status, None, None),
     };
     let target = match args.string(NFS_MAXPATHLEN) {
@@ -1057,6 +1219,10 @@ impl<'b> Export<'b> {
       Err(e) => return (nfsstat_of(&e), None, None),
     };
     let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
+    // POSIX: adding an entry needs write and search permission on the directory.
+    if let Err((status, dir_post)) = self.writable_directory(&dir_identity) {
+      return (status, None, dir_post);
+    }
     let object = match self.bridge.symlink(parent, &cx, &name, &target) {
       Ok(node) => ObjectId::new(node.ino, node.generation),
       Err(e) => {
@@ -1070,7 +1236,7 @@ impl<'b> Export<'b> {
       size: None,
       ..changes
     };
-    self.finish_create(object, &dir_identity, &cx, post_changes)
+    self.finish_create(object, &dir_identity, &cx, post_changes, explicit_times)
   }
 
   /// NFSPROC3_LINK: create a hard link (RFC 1813 §3.3.15) — a second name `new_name` in a directory
@@ -1120,8 +1286,15 @@ impl<'b> Export<'b> {
     };
     let target = ObjectId::new(file_identity.inode, file_identity.generation);
     let new_parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
-    // The directory's post-op attributes (its unchanged link count) go in the wcc either way.
-    let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
+    // POSIX: adding an entry needs write and search permission on the directory. The directory's
+    // post-op attributes (its unchanged link count) go in the wcc either way.
+    let dir_post = match self.writable_directory(&dir_identity) {
+      Ok(node) => Some(self.fattr3(&node)),
+      Err((status, dir_post)) => {
+        let file_attr = self.attrs_of(&file_identity).ok().map(|n| self.fattr3(&n));
+        return (status, file_attr, dir_post);
+      }
+    };
     match self.bridge.link(target, new_parent, &cx, &name) {
       // The bridge returns the target's attributes with the incremented link count.
       Ok(node) => (Nfsstat3::Ok, Some(self.fattr3(&node)), dir_post),
@@ -1273,6 +1446,10 @@ impl<'b> Export<'b> {
     let identity = self.resolve_handle(&dir_fh)?;
     let dir_node = self.attrs_of(&identity)?;
     let dir_attr = self.fattr3(&dir_node);
+    // POSIX: listing a directory needs read permission on it.
+    if !access::permits(&self.caller, &dir_node, Want::Read) {
+      return Err(Nfsstat3::Acces);
+    }
     let cx = self.op_context().map_err(|e| nfsstat_of(&e))?;
     let dir_object = ObjectId::new(identity.inode, identity.generation);
     // The cookieverf is the directory's monotonic change version (§4.5): a continuation (cookie
@@ -1339,20 +1516,38 @@ impl<'b> Export<'b> {
   }
 
   /// The shared tail of CREATE, MKDIR and SYMLINK: apply the `sattr3` fields the creation did not
-  /// set (the mode is set at creation), fetch the object's final attributes, mint its handle, and
-  /// gather the parent directory's post-op attributes for the wcc.
+  /// set (the mode is set at creation) under the same POSIX ownership rules a SETATTR has — the
+  /// creator owns the new object, so only a `uid`/`gid` it may not take (`_POSIX_CHOWN_RESTRICTED`) or
+  /// explicit times on an existing UNCHECKED-opened object of another owner refuse — then fetch the
+  /// object's final attributes, mint its handle, and gather the parent directory's post-op attributes
+  /// for the wcc.
   fn finish_create(
     &mut self,
     object: ObjectId,
     dir_identity: &FileHandle,
     cx: &OpContext,
     post_changes: SetAttr,
+    explicit_times: bool,
   ) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Option<Fattr3>) {
-    if post_changes != SetAttr::default()
-      && let Err(e) = self.bridge.setattr(object, cx, post_changes)
-    {
-      let dir_post = self.attrs_of(dir_identity).ok().map(|n| self.fattr3(&n));
-      return (nfsstat_of(&e), None, dir_post);
+    if post_changes != SetAttr::default() {
+      let node = match self.bridge.getattr(object, cx) {
+        Ok(node) => node,
+        Err(e) => {
+          let dir_post = self.attrs_of(dir_identity).ok().map(|n| self.fattr3(&n));
+          return (nfsstat_of(&e), None, dir_post);
+        }
+      };
+      if let Some(denial) =
+        access::setattr_denial(&self.caller, &node, &post_changes, explicit_times)
+      {
+        let dir_post = self.attrs_of(dir_identity).ok().map(|n| self.fattr3(&n));
+        return (status_of_denial(denial), None, dir_post);
+      }
+      let post_changes = access::with_setid_side_effects(&self.caller, &node, post_changes);
+      if let Err(e) = self.bridge.setattr(object, cx, post_changes) {
+        let dir_post = self.attrs_of(dir_identity).ok().map(|n| self.fattr3(&n));
+        return (nfsstat_of(&e), None, dir_post);
+      }
     }
     let attr = match self.bridge.getattr(object, cx) {
       Ok(node) => self.fattr3(&node),
@@ -1408,10 +1603,10 @@ impl<'b> Export<'b> {
   /// §3.3.20), reported from the volume's own policy rather than a fixed guess. The maximum name
   /// length and the case behaviour come from the volume through `statfs`; the link maximum is the
   /// `u32` link counter's range ([`PATHCONF_LINKMAX`]); an over-long name is refused, never truncated
-  /// (`no_trunc` true); ownership changes are not restricted to the superuser (`chown_restricted`
-  /// false — a write-authorized caller may `chown`, `Volume::chown` imposing no privilege check); and
-  /// case is always preserved. Without this a client's `pathconf` is `PROC_UNAVAIL` and it falls back
-  /// to conservative defaults.
+  /// (`no_trunc` true); ownership changes are restricted to the superuser (`chown_restricted` true —
+  /// `_POSIX_CHOWN_RESTRICTED`, the rule [`crate::access::may_chown`] applies to SETATTR); and case is
+  /// always preserved. Without this a client's `pathconf` is `PROC_UNAVAIL` and it falls back to
+  /// conservative defaults.
   pub fn pathconf(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
     let mut writer = XdrWriter::new();
     match self.pathconf_result(args) {
@@ -1421,7 +1616,7 @@ impl<'b> Export<'b> {
         writer.u32(PATHCONF_LINKMAX); // linkmax
         writer.u32(stat.namelen); // name_max
         writer.bool(true); // no_trunc: an over-long name is refused, never truncated
-        writer.bool(false); // chown_restricted: any write-authorized caller may chown
+        writer.bool(true); // chown_restricted: only the superuser changes an owner (POSIX)
         writer.bool(!stat.case_sensitive); // case_insensitive: the inverse of the volume's policy
         writer.bool(true); // case_preserving: the stored case is always kept
       }
@@ -1479,23 +1674,32 @@ impl<'b> Export<'b> {
   }
 }
 
-/// The access bits granted for a `mode`, intersected with the `requested` bits. slates checks the
-/// object's permissions instead of granting whatever is asked (audit-flagged); the per-principal
-/// check — a caller other than the owner, the `AUTH_SYS` credentials, the §4.13 rights model — is
-/// owed, so this reads the owner's permission bits, the common case since a slates volume is the
-/// provisioning agent's own.
-fn granted_access(mode: u32, requested: u32) -> u32 {
+/// The ACCESS bits granted to `caller` on `node`, intersected with the `requested` bits: the exact
+/// POSIX class verdict ([`access::permits`]) with the superuser's exemptions — so a client's own
+/// `open(2)` and `access(2)` checks, which it answers from this reply, are right for every user, not
+/// only the owner. (Before 2026-09-15 this read the owner's bits whoever asked, the per-principal
+/// check being owed; a caller other than the owner was then granted the owner's access.)
+fn granted_access(caller: &Caller, node: &NodeAttr, requested: u32) -> u32 {
   let mut granted = 0;
-  if mode & OWNER_READ != 0 {
+  if access::permits(caller, node, Want::Read) {
     granted |= ACCESS3_READ;
   }
-  if mode & OWNER_EXECUTE != 0 {
+  if access::permits(caller, node, Want::Search) {
     granted |= ACCESS3_LOOKUP | ACCESS3_EXECUTE;
   }
-  if mode & OWNER_WRITE != 0 {
+  if access::permits(caller, node, Want::Write) {
     granted |= ACCESS3_MODIFY | ACCESS3_EXTEND | ACCESS3_DELETE;
   }
   granted & requested
+}
+
+/// The NFSv3 status an ownership-rule refusal maps to: `NFS3ERR_PERM` for "not the owner",
+/// `NFS3ERR_ACCES` for a missing permission bit.
+fn status_of_denial(denial: Denial) -> Nfsstat3 {
+  match denial {
+    Denial::NotOwner => Nfsstat3::Perm,
+    Denial::NoAccess => Nfsstat3::Acces,
+  }
 }
 
 /// Encodes an NFSv3 `wcc_data`: the pre-operation attributes (slates keeps none, so absent) then

@@ -7,7 +7,9 @@
 // Test harness code: an unwrap here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use slates_bridge_core::{Attachments, Bridge, ObjectId, OpContext, Rights, View, VolumeBridge};
+use slates_bridge_core::{
+  Attachments, Bridge, ObjectId, OpContext, Rights, SetAttr, View, VolumeBridge,
+};
 use slates_bridge_nfs::mount::MountReply;
 use slates_bridge_nfs::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, PostOpAttr};
 use slates_bridge_nfs::procedures::{
@@ -18,7 +20,7 @@ use slates_bridge_nfs::procedures::{
   NFSPROC3_WRITE,
 };
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
-use slates_bridge_nfs::{MultiExport, NfsService, OwnedVolumeSet};
+use slates_bridge_nfs::{MultiExport, NfsService, OwnedVolumeSet, UnixGroups};
 use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
@@ -316,42 +318,17 @@ fn access_reflects_the_mode_not_the_request() {
   let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
   let cx = write_cx();
   let root_ino = bridge.root(&cx).unwrap();
-  bridge.create(oid(root_ino), &cx, "ro", 0o444, 0).unwrap();
-  let mut export = Export::new(
-    &mut bridge,
-    VolumeId { bytes: [0x11; 16] },
-    Principal::Uid { uid: 0 },
-    Rights {
-      read: true,
-      write: true,
-    },
-  )
-  .unwrap();
-  let root_fh = match export.mnt("/") {
-    MountReply::Ok { handle, .. } => handle,
-    MountReply::Err(status) => panic!("MNT failed: {status:?}"),
-  };
+  let (file, _) = bridge.create(oid(root_ino), &cx, "ro", 0o444, 0).unwrap();
+  // The file is the mounting user's own (uid 1000): the owner class applies. (The superuser is exempt
+  // from the class rule, so a root caller would be granted MODIFY whatever the bits say.)
+  chown(&mut bridge, &cx, file.ino, 1000, 1000);
+  let mut export = export_as(&mut bridge, 1000, 1000);
+  let root_fh = root_handle(&mut export);
+  let file_fh = lookup_fh(&mut export, &root_fh, "ro");
 
-  let mut la = XdrWriter::new();
-  root_fh.encode(&mut la);
-  la.opaque("ro".as_bytes());
-  let lreply = export.lookup(&mut XdrReader::new(la.as_slice()));
-  let mut lr = XdrReader::new(&lreply);
-  assert_eq!(lr.u32().unwrap(), Nfsstat3::Ok.wire());
-  let file_fh = Nfsfh3::decode(&mut lr).unwrap();
-
-  // Request READ | MODIFY; a 0o444 file grants only READ.
-  let mut aa = XdrWriter::new();
-  file_fh.encode(&mut aa);
-  aa.u32(0x1 | 0x4);
-  let areply = export
-    .serve_nfs(NFSPROC3_ACCESS, &mut XdrReader::new(aa.as_slice()))
-    .unwrap();
-  let mut ar = XdrReader::new(&areply);
-  assert_eq!(ar.u32().unwrap(), Nfsstat3::Ok.wire());
-  PostOpAttr::decode(&mut ar).unwrap();
+  // Request READ | MODIFY; a 0o444 file grants its owner only READ.
   assert_eq!(
-    ar.u32().unwrap(),
+    access_granted(&mut export, &file_fh, 0x1 | 0x4),
     0x1,
     "a read-only file grants READ but not MODIFY"
   );
@@ -1562,8 +1539,8 @@ fn pathconf_reports_the_volume_limits() {
   assert_eq!(r.u32().unwrap(), 255, "name_max is NAME_MAX");
   assert!(r.bool().unwrap(), "no_trunc: an over-long name is refused");
   assert!(
-    !r.bool().unwrap(),
-    "chown is not restricted to the superuser"
+    r.bool().unwrap(),
+    "chown is restricted to the superuser (_POSIX_CHOWN_RESTRICTED, the rule SETATTR applies)"
   );
   assert!(!r.bool().unwrap(), "an exact-name volume is case-sensitive");
   assert!(r.bool().unwrap(), "case is preserved");
@@ -1950,4 +1927,581 @@ fn every_procedure_refuses_hostile_input_without_panicking() {
       }
     }
   }
+}
+
+// ------------------------------------------------------------- POSIX access control (§4.6; EQUIVALENCE §8)
+
+/// An export whose requests run as the Unix user `uid` in primary group `gid` — the mounting user an
+/// `AUTH_SYS` credential names — over `bridge`.
+fn export_as(bridge: &mut dyn Bridge, uid: u32, gid: u32) -> Export<'_> {
+  let mut export = Export::new(
+    bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  export.set_groups(Some(UnixGroups {
+    gid,
+    supplementary: Vec::new(),
+  }));
+  export
+}
+
+/// Gives the object at `ino` to `uid:gid` directly through the bridge (the test's own setup, not a
+/// request the export judges).
+fn chown(bridge: &mut dyn Bridge, cx: &OpContext, ino: u64, uid: u32, gid: u32) {
+  bridge
+    .setattr(
+      oid(ino),
+      cx,
+      SetAttr {
+        uid: Some(uid),
+        gid: Some(gid),
+        ..SetAttr::default()
+      },
+    )
+    .unwrap();
+}
+
+/// Sets the mode of the object at `ino` directly through the bridge.
+fn chmod(bridge: &mut dyn Bridge, cx: &OpContext, ino: u64, mode: u32) {
+  bridge
+    .setattr(
+      oid(ino),
+      cx,
+      SetAttr {
+        mode: Some(mode),
+        ..SetAttr::default()
+      },
+    )
+    .unwrap();
+}
+
+/// The file handle of the object at `ino` (generation zero).
+fn fh_of(ino: u64) -> Nfsfh3 {
+  slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: ino,
+    generation: 0,
+  }
+  .to_fh()
+}
+
+/// The leading `nfsstat3` of a reply.
+fn status_of(reply: &[u8]) -> u32 {
+  XdrReader::new(reply).u32().unwrap()
+}
+
+/// LOOKUP `name` in `dir` through the export, asserting it succeeds, and the child's handle.
+fn lookup_fh(export: &mut Export<'_>, dir: &Nfsfh3, name: &str) -> Nfsfh3 {
+  let reply = lookup_reply(export, dir, name);
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "LOOKUP {name}");
+  Nfsfh3::decode(&mut r).unwrap()
+}
+
+fn lookup_reply(export: &mut Export<'_>, dir: &Nfsfh3, name: &str) -> Vec<u8> {
+  let mut args = XdrWriter::new();
+  dir.encode(&mut args);
+  args.opaque(name.as_bytes());
+  export.lookup(&mut XdrReader::new(args.as_slice()))
+}
+
+/// The ACCESS bits the export grants on `fh` among `requested`.
+fn access_granted(export: &mut Export<'_>, fh: &Nfsfh3, requested: u32) -> u32 {
+  let mut args = XdrWriter::new();
+  fh.encode(&mut args);
+  args.u32(requested);
+  let reply = export
+    .serve_nfs(NFSPROC3_ACCESS, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "ACCESS answers");
+  PostOpAttr::decode(&mut r).unwrap();
+  r.u32().unwrap()
+}
+
+/// A `sattr3` setting only `mode`, `uid` and `gid` as given, no size, times unchanged.
+fn sattr(args: &mut XdrWriter, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>) {
+  for field in [mode, uid, gid] {
+    match field {
+      Some(value) => {
+        args.bool(true);
+        args.u32(value);
+      }
+      None => args.bool(false),
+    }
+  }
+  args.bool(false); // size unset
+  args.u32(0); // atime DONT_CHANGE
+  args.u32(0); // mtime DONT_CHANGE
+}
+
+/// SETATTR through the export, returning the reply status.
+fn setattr_status(
+  export: &mut Export<'_>,
+  fh: &Nfsfh3,
+  mode: Option<u32>,
+  uid: Option<u32>,
+  gid: Option<u32>,
+) -> u32 {
+  let mut args = XdrWriter::new();
+  fh.encode(&mut args);
+  sattr(&mut args, mode, uid, gid);
+  args.bool(false); // guard unset
+  status_of(
+    &export
+      .serve_nfs(NFSPROC3_SETATTR, &mut XdrReader::new(args.as_slice()))
+      .unwrap(),
+  )
+}
+
+/// The mode GETATTR reports for `fh`.
+fn mode_of(export: &mut Export<'_>, fh: &Nfsfh3) -> u32 {
+  let mut args = XdrWriter::new();
+  fh.encode(&mut args);
+  let reply = export
+    .serve_nfs(NFSPROC3_GETATTR, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire());
+  Fattr3::decode(&mut r).unwrap().mode
+}
+
+/// REMOVE `name` from `dir` through the export, returning the reply status.
+fn remove_status(export: &mut Export<'_>, dir: &Nfsfh3, name: &str) -> u32 {
+  let mut args = XdrWriter::new();
+  dir.encode(&mut args);
+  args.opaque(name.as_bytes());
+  status_of(
+    &export
+      .serve_nfs(NFSPROC3_REMOVE, &mut XdrReader::new(args.as_slice()))
+      .unwrap(),
+  )
+}
+
+/// CREATE `name` in `dir` through the export (`mode_kind` 0 UNCHECKED, 1 GUARDED), mode 0o644.
+fn create_status(export: &mut Export<'_>, dir: &Nfsfh3, name: &str, mode_kind: u32) -> u32 {
+  let mut args = XdrWriter::new();
+  dir.encode(&mut args);
+  args.opaque(name.as_bytes());
+  args.u32(mode_kind);
+  sattr(&mut args, Some(0o644), None, None);
+  status_of(
+    &export
+      .serve_nfs(NFSPROC3_CREATE, &mut XdrReader::new(args.as_slice()))
+      .unwrap(),
+  )
+}
+
+/// MKDIR `name` in `dir` through the export, mode 0o755.
+fn mkdir_status(export: &mut Export<'_>, dir: &Nfsfh3, name: &str) -> u32 {
+  let mut args = XdrWriter::new();
+  dir.encode(&mut args);
+  args.opaque(name.as_bytes());
+  sattr(&mut args, Some(0o755), None, None);
+  status_of(
+    &export
+      .serve_nfs(NFSPROC3_MKDIR, &mut XdrReader::new(args.as_slice()))
+      .unwrap(),
+  )
+}
+
+/// READ four bytes at offset zero through the export.
+fn read_status(export: &mut Export<'_>, fh: &Nfsfh3) -> u32 {
+  let mut args = XdrWriter::new();
+  fh.encode(&mut args);
+  args.u64(0);
+  args.u32(4);
+  status_of(
+    &export
+      .serve_nfs(NFSPROC3_READ, &mut XdrReader::new(args.as_slice()))
+      .unwrap(),
+  )
+}
+
+/// WRITE `data` at offset zero, FILE_SYNC, through the export.
+fn write_status(export: &mut Export<'_>, fh: &Nfsfh3, data: &[u8]) -> u32 {
+  let mut args = XdrWriter::new();
+  fh.encode(&mut args);
+  args.u64(0);
+  args.u32(u32::try_from(data.len()).unwrap());
+  args.u32(2); // FILE_SYNC
+  args.opaque(data);
+  status_of(
+    &export
+      .serve_nfs(NFSPROC3_WRITE, &mut XdrReader::new(args.as_slice()))
+      .unwrap(),
+  )
+}
+
+/// READDIR of `dir` from the start with a generous count, through the export.
+fn readdir_status(export: &mut Export<'_>, dir: &Nfsfh3) -> u32 {
+  let mut args = XdrWriter::new();
+  dir.encode(&mut args);
+  args.u64(0); // cookie
+  args.fixed(&[0u8; 8]); // cookieverf
+  args.u32(4096); // count
+  status_of(
+    &export
+      .serve_nfs(NFSPROC3_READDIR, &mut XdrReader::new(args.as_slice()))
+      .unwrap(),
+  )
+}
+
+/// RENAME `from_dir/from` to `to_dir/to` through the export.
+fn rename_status(
+  export: &mut Export<'_>,
+  from_dir: &Nfsfh3,
+  from: &str,
+  to_dir: &Nfsfh3,
+  to: &str,
+) -> u32 {
+  let mut args = XdrWriter::new();
+  from_dir.encode(&mut args);
+  args.opaque(from.as_bytes());
+  to_dir.encode(&mut args);
+  args.opaque(to.as_bytes());
+  status_of(
+    &export
+      .serve_nfs(NFSPROC3_RENAME, &mut XdrReader::new(args.as_slice()))
+      .unwrap(),
+  )
+}
+
+/// ACCESS answers the *caller's* class, not the owner's: a 0o640 file owned by 1001:2000 grants its
+/// owner read and write, a member of group 2000 read only, anyone else nothing — and the superuser
+/// everything but execute, which no class has (POSIX; `crate::access`). Before 2026-09-15 every
+/// caller was answered from the owner's bits.
+#[test]
+fn access_answers_the_callers_class() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (file, _) = bridge.create(oid(root_ino), &cx, "f", 0o640, 0).unwrap();
+  chown(&mut bridge, &cx, file.ino, 1001, 2000);
+  let fh = fh_of(file.ino);
+  let all = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20;
+
+  let mut owner = export_as(&mut bridge, 1001, 1001);
+  assert_eq!(
+    access_granted(&mut owner, &fh, all),
+    0x1 | 0x4 | 0x8 | 0x10,
+    "the owner: read, modify, extend, delete"
+  );
+  drop(owner);
+  let mut member = export_as(&mut bridge, 1002, 2000);
+  assert_eq!(
+    access_granted(&mut member, &fh, all),
+    0x1,
+    "a group member: read"
+  );
+  drop(member);
+  let mut other = export_as(&mut bridge, 1003, 3000);
+  assert_eq!(
+    access_granted(&mut other, &fh, all),
+    0,
+    "anyone else: nothing"
+  );
+  drop(other);
+  let mut root = export_as(&mut bridge, 0, 0);
+  assert_eq!(
+    access_granted(&mut root, &fh, all),
+    0x1 | 0x4 | 0x8 | 0x10,
+    "the superuser: everything but execute, which no class grants"
+  );
+}
+
+/// Resolving a name needs search permission on the directory: `LOOKUP` in a 0o700 directory of another
+/// user is `NFS3ERR_ACCES`; its owner and the superuser resolve it.
+#[test]
+fn a_directory_without_search_permission_refuses_lookup() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let dir = bridge.mkdir(oid(root_ino), &cx, "private", 0o700).unwrap();
+  bridge
+    .create(oid(dir.ino), &cx, "secret", 0o644, 0)
+    .unwrap();
+  chown(&mut bridge, &cx, dir.ino, 1001, 1001);
+  let dir_fh = fh_of(dir.ino);
+
+  let mut other = export_as(&mut bridge, 1000, 1000);
+  assert_eq!(
+    status_of(&lookup_reply(&mut other, &dir_fh, "secret")),
+    Nfsstat3::Acces.wire(),
+    "no search permission for another user"
+  );
+  drop(other);
+  let mut owner = export_as(&mut bridge, 1001, 1001);
+  lookup_fh(&mut owner, &dir_fh, "secret");
+  drop(owner);
+  let mut root = export_as(&mut bridge, 0, 0);
+  lookup_fh(&mut root, &dir_fh, "secret");
+}
+
+/// `chmod` needs ownership (`NFS3ERR_PERM` otherwise) and `chown` is restricted: a non-owner changes
+/// nothing, the owner may not give the file away but may set its group to one of its own, and the
+/// superuser may do anything; a non-superuser's chown clears the file's set-id bits.
+#[test]
+fn chmod_needs_ownership_and_chown_is_restricted() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (file, _) = bridge.create(oid(root_ino), &cx, "f", 0o6755, 0).unwrap();
+  chown(&mut bridge, &cx, file.ino, 1001, 1001);
+  let fh = fh_of(file.ino);
+
+  let mut other = export_as(&mut bridge, 1000, 1000);
+  assert_eq!(
+    setattr_status(&mut other, &fh, Some(0o600), None, None),
+    Nfsstat3::Perm.wire(),
+    "a non-owner cannot chmod"
+  );
+  assert_eq!(
+    setattr_status(&mut other, &fh, None, None, Some(1000)),
+    Nfsstat3::Perm.wire(),
+    "a non-owner cannot chown"
+  );
+  drop(other);
+  let mut owner = export_as(&mut bridge, 1001, 1001);
+  assert_eq!(
+    setattr_status(&mut owner, &fh, None, Some(1000), None),
+    Nfsstat3::Perm.wire(),
+    "the owner cannot give the file away"
+  );
+  assert_eq!(
+    setattr_status(&mut owner, &fh, None, None, Some(1001)),
+    Nfsstat3::Ok.wire(),
+    "the owner sets the group to one of its own"
+  );
+  assert_eq!(
+    mode_of(&mut owner, &fh),
+    0o755,
+    "a non-superuser's chown clears the set-id bits"
+  );
+  assert_eq!(
+    setattr_status(&mut owner, &fh, Some(0o600), None, None),
+    Nfsstat3::Ok.wire(),
+    "the owner chmods"
+  );
+  drop(owner);
+  let mut root = export_as(&mut bridge, 0, 0);
+  assert_eq!(
+    setattr_status(&mut root, &fh, Some(0o6755), Some(1000), Some(1000)),
+    Nfsstat3::Ok.wire(),
+    "the superuser gives the file away and sets the set-id bits"
+  );
+  assert_eq!(
+    mode_of(&mut root, &fh),
+    0o6755,
+    "root's mode is applied as asked"
+  );
+}
+
+/// Removing an entry needs write and search permission on its directory (`NFS3ERR_ACCES`), and in a
+/// sticky directory only the entry's owner, the directory's owner or the superuser may (`NFS3ERR_PERM`).
+#[test]
+fn remove_needs_a_writable_directory_and_honours_the_sticky_bit() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let dir = bridge.mkdir(oid(root_ino), &cx, "d", 0o755).unwrap();
+  chown(&mut bridge, &cx, dir.ino, 1001, 1001);
+  let (file, _) = bridge.create(oid(dir.ino), &cx, "f", 0o644, 0).unwrap();
+  chown(&mut bridge, &cx, file.ino, 1001, 1001);
+  let dir_fh = fh_of(dir.ino);
+
+  let mut other = export_as(&mut bridge, 1000, 1000);
+  assert_eq!(
+    remove_status(&mut other, &dir_fh, "f"),
+    Nfsstat3::Acces.wire(),
+    "no write permission on the directory"
+  );
+  drop(other);
+  // World-writable and sticky: anyone may add, only the owners may remove.
+  chmod(&mut bridge, &cx, dir.ino, 0o1777);
+  let mut other = export_as(&mut bridge, 1000, 1000);
+  assert_eq!(
+    remove_status(&mut other, &dir_fh, "f"),
+    Nfsstat3::Perm.wire(),
+    "the sticky bit: not the entry's owner nor the directory's"
+  );
+  drop(other);
+  let mut owner = export_as(&mut bridge, 1001, 1001);
+  assert_eq!(
+    remove_status(&mut owner, &dir_fh, "f"),
+    Nfsstat3::Ok.wire(),
+    "the entry's owner removes it"
+  );
+  drop(owner);
+  let (again, _) = bridge.create(oid(dir.ino), &cx, "g", 0o644, 0).unwrap();
+  chown(&mut bridge, &cx, again.ino, 1001, 1001);
+  let mut root = export_as(&mut bridge, 0, 0);
+  assert_eq!(
+    remove_status(&mut root, &dir_fh, "g"),
+    Nfsstat3::Ok.wire(),
+    "the superuser removes anything"
+  );
+}
+
+/// Creating an entry needs write permission on the directory (`NFS3ERR_ACCES`), for a file and a
+/// directory alike; an UNCHECKED create of an *existing* name is an open, which needs only search.
+#[test]
+fn create_and_mkdir_need_write_permission_on_the_directory() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let dir = bridge.mkdir(oid(root_ino), &cx, "ro", 0o555).unwrap();
+  chown(&mut bridge, &cx, dir.ino, 1001, 1001);
+  let (existing, _) = bridge.create(oid(dir.ino), &cx, "x", 0o644, 0).unwrap();
+  chown(&mut bridge, &cx, existing.ino, 1001, 1001);
+  let dir_fh = fh_of(dir.ino);
+
+  let mut owner = export_as(&mut bridge, 1001, 1001);
+  assert_eq!(
+    create_status(&mut owner, &dir_fh, "new", 1),
+    Nfsstat3::Acces.wire(),
+    "even the owner cannot create in a read-only directory"
+  );
+  assert_eq!(
+    mkdir_status(&mut owner, &dir_fh, "sub"),
+    Nfsstat3::Acces.wire(),
+    "nor make a directory in it"
+  );
+  assert_eq!(
+    create_status(&mut owner, &dir_fh, "x", 0),
+    Nfsstat3::Ok.wire(),
+    "an UNCHECKED create of an existing name is an open, needing no write permission"
+  );
+  assert_eq!(
+    create_status(&mut owner, &dir_fh, "x", 1),
+    Nfsstat3::Exist.wire(),
+    "a GUARDED create of an existing name is EXIST"
+  );
+  drop(owner);
+  let mut root = export_as(&mut bridge, 0, 0);
+  assert_eq!(
+    create_status(&mut root, &dir_fh, "new", 1),
+    Nfsstat3::Ok.wire(),
+    "the superuser creates anywhere"
+  );
+}
+
+/// A file's bytes need read or write permission, with the owner override: the owner reads and writes
+/// its own file whatever the bits (an open descriptor survives a later chmod), anyone else is judged by
+/// the class rule, and the superuser is exempt. A non-superuser's write clears the set-id bits.
+#[test]
+fn read_and_write_honour_the_mode_with_the_owner_override() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (file, _) = bridge.create(oid(root_ino), &cx, "f", 0o000, 0).unwrap();
+  chown(&mut bridge, &cx, file.ino, 1001, 1001);
+  let (setid, _) = bridge.create(oid(root_ino), &cx, "s", 0o6755, 0).unwrap();
+  chown(&mut bridge, &cx, setid.ino, 1001, 1001);
+  let fh = fh_of(file.ino);
+  let setid_fh = fh_of(setid.ino);
+
+  let mut other = export_as(&mut bridge, 1000, 1000);
+  assert_eq!(read_status(&mut other, &fh), Nfsstat3::Acces.wire());
+  assert_eq!(
+    write_status(&mut other, &fh, b"nope"),
+    Nfsstat3::Acces.wire()
+  );
+  drop(other);
+  let mut owner = export_as(&mut bridge, 1001, 1001);
+  assert_eq!(
+    write_status(&mut owner, &fh, b"mine"),
+    Nfsstat3::Ok.wire(),
+    "the owner writes its 0o000 file (owner override)"
+  );
+  assert_eq!(read_status(&mut owner, &fh), Nfsstat3::Ok.wire());
+  assert_eq!(
+    write_status(&mut owner, &setid_fh, b"x"),
+    Nfsstat3::Ok.wire()
+  );
+  assert_eq!(
+    mode_of(&mut owner, &setid_fh),
+    0o755,
+    "a non-superuser's write clears the set-id bits"
+  );
+  drop(owner);
+  let mut root = export_as(&mut bridge, 0, 0);
+  assert_eq!(read_status(&mut root, &fh), Nfsstat3::Ok.wire());
+}
+
+/// Listing a directory needs read permission on it: `READDIR` of a 0o300 directory is `NFS3ERR_ACCES`
+/// even for its owner; the superuser lists it.
+#[test]
+fn readdir_needs_read_permission_on_the_directory() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let dir = bridge.mkdir(oid(root_ino), &cx, "wx", 0o300).unwrap();
+  chown(&mut bridge, &cx, dir.ino, 1001, 1001);
+  let dir_fh = fh_of(dir.ino);
+
+  let mut owner = export_as(&mut bridge, 1001, 1001);
+  assert_eq!(readdir_status(&mut owner, &dir_fh), Nfsstat3::Acces.wire());
+  drop(owner);
+  let mut root = export_as(&mut bridge, 0, 0);
+  assert_eq!(readdir_status(&mut root, &dir_fh), Nfsstat3::Ok.wire());
+}
+
+/// A rename needs write and search permission on both directories (`NFS3ERR_ACCES`), and the sticky
+/// bit of the source directory holds for the entry moved (`NFS3ERR_PERM`).
+#[test]
+fn rename_checks_both_directories_and_the_sticky_source() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let sticky = bridge.mkdir(oid(root_ino), &cx, "a", 0o1777).unwrap();
+  chown(&mut bridge, &cx, sticky.ino, 1001, 1001);
+  let (file, _) = bridge.create(oid(sticky.ino), &cx, "f", 0o644, 0).unwrap();
+  chown(&mut bridge, &cx, file.ino, 1001, 1001);
+  let open = bridge.mkdir(oid(root_ino), &cx, "b", 0o777).unwrap();
+  chown(&mut bridge, &cx, open.ino, 1001, 1001);
+  let closed = bridge.mkdir(oid(root_ino), &cx, "c", 0o555).unwrap();
+  chown(&mut bridge, &cx, closed.ino, 1001, 1001);
+  let (a, b, c) = (fh_of(sticky.ino), fh_of(open.ino), fh_of(closed.ino));
+
+  let mut other = export_as(&mut bridge, 1000, 1000);
+  assert_eq!(
+    rename_status(&mut other, &a, "f", &b, "g"),
+    Nfsstat3::Perm.wire(),
+    "the sticky source directory: not the entry's owner"
+  );
+  drop(other);
+  let mut owner = export_as(&mut bridge, 1001, 1001);
+  assert_eq!(
+    rename_status(&mut owner, &a, "f", &b, "g"),
+    Nfsstat3::Ok.wire(),
+    "the entry's owner moves it"
+  );
+  assert_eq!(
+    rename_status(&mut owner, &b, "g", &c, "h"),
+    Nfsstat3::Acces.wire(),
+    "no write permission on the destination directory"
+  );
 }

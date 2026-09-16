@@ -228,15 +228,23 @@ pub fn parse_call(body: &[u8]) -> Result<(RpcCall, XdrReader<'_>), RpcError> {
   ))
 }
 
+use crate::access::{UnixGroups, UnixIdentity};
+
 /// Format: the `AUTH_SYS` authentication flavor (RFC 5531): a credential carrying the caller's uid/gid.
 const AUTH_SYS: u32 = 1;
 
-/// The Unix `(uid, gid)` an `AUTH_SYS` credential on a call names — the identity the client mounted as
-/// — or `None` for `AUTH_NONE` or a credential this cannot read. On a loopback mount the kernel fills
-/// both from the mounting process (§4.13), so a served request can run as that user *and* stamp a
-/// created object with the user's own group, exactly as a native NFS server does, rather than owning
-/// everything root:wheel. Re-reads the call header (cheap) to reach the credential `parse_call` skips.
-pub fn auth_sys_creds(body: &[u8]) -> Option<(u32, u32)> {
+/// Format: the most supplementary groups an `AUTH_SYS` credential carries — `authsys_parms.gids` is
+/// declared `unsigned int gids<16>` (RFC 5531 Appendix A). A credential claiming more is malformed and
+/// refused before any group is read (a hostile length never sizes an allocation).
+pub const AUTH_SYS_MAX_GIDS: usize = 16;
+
+/// The Unix identity an `AUTH_SYS` credential on a call names — the uid the client mounted as and its
+/// primary and supplementary groups — or `None` for `AUTH_NONE` or a credential this cannot read. On a
+/// loopback mount the kernel fills all of it from the mounting process (§4.13), so a served request
+/// runs as that user, its permission checks see the user's groups, and a created object takes the
+/// user's own group, exactly as a native NFS server does, rather than owning everything root:wheel.
+/// Re-reads the call header (cheap) to reach the credential `parse_call` skips.
+pub fn auth_sys_identity(body: &[u8]) -> Option<UnixIdentity> {
   let mut reader = XdrReader::new(body);
   // The call header before the credential: xid, mtype, rpcvers, program, version, procedure.
   let _xid = reader.u32().ok()?;
@@ -250,13 +258,35 @@ pub fn auth_sys_creds(body: &[u8]) -> Option<(u32, u32)> {
   if flavor != AUTH_SYS {
     return None;
   }
-  // authsys_parms (RFC 5531 Appendix A): stamp, machinename, uid, gid, gids.
-  let mut credential = XdrReader::new(credential);
+  parse_authsys_parms(credential)
+}
+
+/// Decodes an `authsys_parms` (RFC 5531 Appendix A: stamp, machinename, uid, gid, `gids<16>`) into the
+/// identity it names; `None` for a truncated body or one claiming more groups than the bound.
+fn parse_authsys_parms(body: &[u8]) -> Option<UnixIdentity> {
+  let mut credential = XdrReader::new(body);
   let _stamp = credential.u32().ok()?;
   let _machinename = credential.opaque(MAX_AUTH_BODY).ok()?;
   let uid = credential.u32().ok()?;
   let gid = credential.u32().ok()?;
-  Some((uid, gid))
+  let count = usize::try_from(credential.u32().ok()?).ok()?;
+  if count > AUTH_SYS_MAX_GIDS {
+    return None;
+  }
+  let mut supplementary = Vec::with_capacity(count);
+  for _ in 0..count {
+    supplementary.push(credential.u32().ok()?);
+  }
+  Some(UnixIdentity {
+    uid,
+    groups: UnixGroups { gid, supplementary },
+  })
+}
+
+/// The Unix `(uid, gid)` an `AUTH_SYS` credential names — the uid and primary group of
+/// [`auth_sys_identity`] — or `None` for `AUTH_NONE` or a credential this cannot read.
+pub fn auth_sys_creds(body: &[u8]) -> Option<(u32, u32)> {
+  auth_sys_identity(body).map(|identity| (identity.uid, identity.groups.gid))
 }
 
 /// The Unix user id an `AUTH_SYS` credential names (the mounting user), or `None`. A thin projection of

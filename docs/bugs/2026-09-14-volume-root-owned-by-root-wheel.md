@@ -1,9 +1,19 @@
 # The volume's root directory lists as root:wheel through the mount
 
-Status: **open — a sibling of the fixed 2026-09-09 root:wheel bug, already noted as "minor
-remaining" in the GAPS.md Bridges (4.6) row; this record adds the live repro and the impact**
-(owner: the provisioning create path in `crates/server`/`crates/vfs`); seen while reproducing
-the conformance findings on 2026-09-14.
+Status: **fixed 2026-09-15** (the provisioning create path, `crates/server/src/verbs.rs`) — a sibling
+of the fixed 2026-09-09 root:wheel bug, seen while reproducing the conformance findings on 2026-09-14.
+It turned from cosmetic into a hard refusal the moment the NFS export began applying POSIX
+permissions (`docs/bugs/2026-09-15-nfs-export-enforces-no-posix-permissions.md`): a root-owned
+`rwxr-xr-x` volume root refused the mounting user its first `mkdir`, so the conformance harness could
+not even create its working directory. Fix: `stamp_root_owner` chowns the root at `volume create` to
+the client principal's uid and this process's effective gid (the rendezvous admits only the daemon's
+own uid, so the provisioning user and the daemon are one user and that is the user's primary group);
+a principal that is not a Unix user (a Windows SID) leaves the root as born. Proven by
+`verbs::tests::a_created_volumes_root_is_owned_by_its_provisioning_user` (in process, as uid 1234)
+and, live, by the CLI mount flow's new `mount_root_is_owned_by_the_mounting_user` check (`stat -f
+%u:%g` of the mount point equals the mounting user's, the check prescribed below). Owed: a volume a
+takeover successor rebuilds (`materialize_taken_over`) takes its root's ownership from the replicated
+head rather than this stamp; that path has no client principal and is to be verified on the lane.
 
 ## Description
 

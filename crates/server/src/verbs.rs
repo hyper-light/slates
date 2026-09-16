@@ -2481,6 +2481,19 @@ fn create(
       }
     },
   };
+  // The volume root is owned by its provisioning user (§4.13 "runs as the mounting user"; the
+  // root:wheel sibling, docs/bugs/2026-09-14-volume-root-owned-by-root-wheel.md): the volume core
+  // births it uid 0, gid 0, which a mount showed as root:wheel — and which the NFS export's POSIX
+  // permission checks would now refuse the mounting user its own volume's root.
+  if let Err(e) = stamp_root_owner(&mut state.store, &mut volume, principal) {
+    return give_back(
+      state,
+      reservation,
+      version_credit,
+      metadata_credit,
+      refusal_of_vfs(&e),
+    );
+  }
   // Admit the volume's inode dimension (§4.2 resource vector): set the per-volume cap that
   // `next_no` enforces, to the same allowance already reserved against the version slab above.
   if let Err(e) = admit_dimensions(state, &mut volume, size) {
@@ -5646,6 +5659,41 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
   (snapshots, attachments)
 }
 
+/// Stamps a freshly provisioned `volume`'s root directory with its provisioning user's identity:
+/// `principal`'s uid — a Unix user; another kind of principal (a Windows SID) leaves the root as born,
+/// ownership being security descriptors there — and this process's effective group
+/// ([`creator_gid`]). Without this the root keeps the volume core's born `uid 0, gid 0`
+/// (`Inode::new`) and lists as root:wheel through a mount, so tools that check their working
+/// directory's owner (git's `safe.directory`) refuse it and the NFS export's POSIX permission checks
+/// refuse the mounting user the root of its own volume.
+fn stamp_root_owner(
+  store: &mut slates_vfs::volume::Store,
+  volume: &mut Volume,
+  principal: &Principal,
+) -> Result<(), slates_vfs::error::VfsError> {
+  let Principal::Uid { uid } = principal else {
+    return Ok(());
+  };
+  let root = volume.root_inode(store)?;
+  volume.chown(store, root, *uid, creator_gid())
+}
+
+/// The group a provisioned volume's root takes: this process's effective gid. The rendezvous admits
+/// only the daemon's own uid (`crates/ipc/src/rendezvous.rs`, "refuses another uid"), so the
+/// provisioning client and the daemon are one user, and this is that user's primary group — the same
+/// group an object the user creates through the mount takes from its `AUTH_SYS` credential.
+#[cfg(unix)]
+fn creator_gid() -> u32 {
+  rustix::process::getegid().as_raw()
+}
+
+/// Windows: ownership is a security descriptor, not a gid; the root keeps the volume core's default
+/// group, which the WinFsp bridge never reports as a POSIX id.
+#[cfg(not(unix))]
+fn creator_gid() -> u32 {
+  0
+}
+
 #[cfg(test)]
 mod tests {
   use super::{
@@ -5653,6 +5701,42 @@ mod tests {
     rendezvous_first, verify_attestation,
   };
   use slates_db::register::RootConfiguration;
+
+  /// §4.13 (the root:wheel sibling, docs/bugs/2026-09-14-volume-root-owned-by-root-wheel.md): a
+  /// volume's root directory is owned by the user who provisioned it — the uid of the principal, the
+  /// gid this process's effective group — not the volume core's born root:wheel. Do: create a volume
+  /// as uid 1234. Expect: the root inode's uid is 1234 and its gid the process's own.
+  #[test]
+  fn a_created_volumes_root_is_owned_by_its_provisioning_user() {
+    let (uid, gid) = crate::daemon::audit_on_shard(|state| {
+      let reply = super::dispatch(
+        state,
+        1,
+        &Principal::Uid { uid: 1234 },
+        super::RequestBody::Create {
+          name: "owned".to_owned(),
+          size: super::SizeClass::Bounded { limit: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      );
+      let super::ReplyBody::Created { id } = reply else {
+        panic!("{reply:?}");
+      };
+      let handle = *state.by_id.get(&super::to_db_volume(id)).unwrap();
+      let slot = state.volumes.get(handle).unwrap();
+      let root = slot.volume.root_inode(&state.store).unwrap();
+      let attrs = slot.volume.stat(&state.store, root).unwrap();
+      (attrs.uid, attrs.gid)
+    });
+    assert_eq!(uid, 1234, "the root's owner is the provisioning principal");
+    assert_eq!(
+      gid,
+      super::creator_gid(),
+      "the root's group is the provisioning user's own"
+    );
+  }
 
   /// AC-2.12 / T-2.14, AUD-05: recovery has a catalog entry but no image or retained base
   /// witnesses. Expect `RecoveryIncomplete`, never an empty scratch or a reopened live directory.

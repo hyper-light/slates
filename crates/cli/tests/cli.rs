@@ -330,6 +330,63 @@ fn mount_and_check(instance: &str, id: &str, path: &str) {
   assert!(is_mounted(path), "the kernel mount table lists the mount");
 }
 
+/// The mount's root directory is owned by the mounting user, not root:wheel
+/// (docs/bugs/2026-09-14-volume-root-owned-by-root-wheel.md): `stat -f %u:%g` of the mount point is
+/// this process's uid and effective gid — what git's `safe.directory` check reads, and what the NFS
+/// export's POSIX permission checks judge the user's own volume by.
+fn mount_root_is_owned_by_the_mounting_user(path: &str) {
+  let stat = Command::new("stat")
+    .args(["-f", "%u:%g", path])
+    .output()
+    .unwrap();
+  assert!(
+    stat.status.success(),
+    "{}",
+    String::from_utf8_lossy(&stat.stderr)
+  );
+  let owner = String::from_utf8_lossy(&stat.stdout).trim().to_owned();
+  let me = format!(
+    "{}:{}",
+    rustix::process::getuid().as_raw(),
+    rustix::process::getegid().as_raw()
+  );
+  assert_eq!(owner, me, "the volume root is owned by the mounting user");
+}
+
+/// A sparse extension through the mount survives the daemon's barrier
+/// (docs/bugs/2026-09-15-recovery-image-materializes-a-sparse-files-holes.md): a file is extended to
+/// 999,999,999,999,999 bytes — pjdfstest's `truncate/12.t`, which took the daemon down while the
+/// recovery image materialized the hole — the size reads back through the mount, and the daemon
+/// still answers `status` after the barrier that publishes the image. `perl`'s `truncate` makes the
+/// extension (macOS ships no `truncate` command); a host without perl skips this step loudly.
+fn a_sparse_extension_through(instance: &str, path: &str) {
+  let file = format!("{path}/sparse.txt");
+  let extended = Command::new("sh")
+    .arg("-c")
+    .arg(format!(
+      "command -v perl >/dev/null || {{ echo SKIP; exit 0; }}; printf 'held' > '{file}' && \
+       perl -e 'truncate($ARGV[0], 999999999999999) or die \"$!\\n\"' '{file}' && stat -f %z '{file}'"
+    ))
+    .output()
+    .unwrap();
+  assert!(
+    extended.status.success(),
+    "extend through the mount: {}",
+    String::from_utf8_lossy(&extended.stderr)
+  );
+  let reported = String::from_utf8_lossy(&extended.stdout).trim().to_owned();
+  if reported == "SKIP" {
+    eprintln!("skipping the sparse extension step: perl is not on this host");
+    return;
+  }
+  assert_eq!(reported, "999999999999999", "the sparse size reads back");
+  let (code, _, err) = run(instance, &["status"]);
+  assert_eq!(
+    code, 0,
+    "the daemon answers after the barrier that imaged the sparse file: {err}"
+  );
+}
+
 /// A file written through the mount reads back byte for byte — the bytes travel host write → NFS →
 /// the slates volume → NFS → host read. The write side avoids `std::fs` (R1) through the shell; the
 /// read side is a separate `cat` process, a fresh READ across the mount rather than a page-cache echo.
@@ -398,7 +455,9 @@ fn slates_mount_establishes_a_real_kernel_mount_and_unmount_removes_it() {
     path: fresh_mount_point(),
   };
   mount_and_check(&instance, &id, &mount_point.path);
+  mount_root_is_owned_by_the_mounting_user(&mount_point.path);
   roundtrip_a_file_through(&mount_point.path);
+  a_sparse_extension_through(&instance, &mount_point.path);
   unmount_and_check(&instance, &mount_point.path);
 
   drop(mount_point);

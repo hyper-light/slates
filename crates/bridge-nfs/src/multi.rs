@@ -97,31 +97,32 @@ pub trait VolumeSet {
   fn entries(&self) -> Vec<(String, VolumeId)>;
 
   /// Serves one NFSv3 procedure against `volume` (routing has already chosen it), building a transient
-  /// bridge over the shared store under `subject`/`rights`, with `owner_gid` the mounting user's group
-  /// (from the call's `AUTH_SYS` credential) that a created object takes — `None` when the mount named
-  /// none, and a created object inherits its parent's group. `None` (the return) if the volume is not
-  /// in the set (the router then answers the handle `NFS3ERR_STALE`). `args` is positioned at the
+  /// bridge over the shared store under `subject`/`rights`, with `groups` the mounting user's groups
+  /// (from the call's `AUTH_SYS` credential): the primary group a created object takes, and with the
+  /// supplementary groups the group class of every permission check — `None` when the mount named
+  /// none, and a created object then inherits its parent's group. `None` (the return) if the volume is
+  /// not in the set (the router then answers the handle `NFS3ERR_STALE`). `args` is positioned at the
   /// procedure arguments.
   fn serve(
     &mut self,
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
-    owner_gid: Option<u32>,
+    groups: Option<crate::access::UnixGroups>,
     procedure: u32,
     args: &mut XdrReader<'_>,
   ) -> Option<Vec<u8>>;
 
   /// The root file handle and attributes of `volume`, for the synthetic root's `LOOKUP` and
   /// `READDIRPLUS` of the volume's name. `None` if the volume is not in the set or its root cannot be
-  /// established. Carries `subject`/`rights`/`owner_gid` as [`Self::serve`] does, though a root object
-  /// creates nothing, so the group only rides for uniformity.
+  /// established. Carries `subject`/`rights`/`groups` as [`Self::serve`] does, though a root object
+  /// creates nothing, so the groups only ride for uniformity.
   fn root_object(
     &mut self,
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
-    owner_gid: Option<u32>,
+    groups: Option<crate::access::UnixGroups>,
   ) -> Option<(Nfsfh3, Fattr3)>;
 }
 
@@ -153,20 +154,25 @@ pub struct MultiExport<V: VolumeSet> {
   set: V,
   subject: Principal,
   rights: Rights,
-  owner_gid: Option<u32>,
+  groups: Option<crate::access::UnixGroups>,
 }
 
 impl<V: VolumeSet> MultiExport<V> {
-  /// A service over `set`, whose requests run under `subject` with `rights`, and whose created objects
-  /// take `owner_gid` (the mounting user's `AUTH_SYS` group; `None` — parent-inherited — when the
-  /// mount named none). `subject` and `owner_gid` together are the mounting user's identity and group,
-  /// carried on every request the set serves.
-  pub fn new(set: V, subject: Principal, rights: Rights, owner_gid: Option<u32>) -> MultiExport<V> {
+  /// A service over `set`, whose requests run under `subject` with `rights` and the mounting user's
+  /// `groups` (its `AUTH_SYS` primary and supplementary groups; `None` when the mount named none — a
+  /// caller in no group whose created objects inherit the parent's group). `subject` and `groups`
+  /// together are the mounting user's identity, carried on every request the set serves.
+  pub fn new(
+    set: V,
+    subject: Principal,
+    rights: Rights,
+    groups: Option<crate::access::UnixGroups>,
+  ) -> MultiExport<V> {
     MultiExport {
       set,
       subject,
       rights,
-      owner_gid,
+      groups,
     }
   }
 
@@ -261,7 +267,7 @@ impl<V: VolumeSet> MultiExport<V> {
     writer.u32(PATHCONF_LINKMAX); // linkmax
     writer.u32(u32::try_from(NFS_MAXNAMELEN).unwrap_or(u32::MAX)); // name_max
     writer.bool(true); // no_trunc
-    writer.bool(false); // chown_restricted
+    writer.bool(true); // chown_restricted: only the superuser changes an owner (POSIX), as in a volume
     writer.bool(false); // case_insensitive: the root's names (volume ids) are case-sensitive
     writer.bool(true); // case_preserving
     writer.into_bytes()
@@ -309,9 +315,12 @@ impl<V: VolumeSet> MultiExport<V> {
       Err(_) => return lookup_failure(Nfsstat3::Inval, None),
     };
     let object = self.volume_of(&name).and_then(|volume| {
-      self
-        .set
-        .root_object(volume, self.subject.clone(), self.rights, self.owner_gid)
+      self.set.root_object(
+        volume,
+        self.subject.clone(),
+        self.rights,
+        self.groups.clone(),
+      )
     });
     match object {
       Some((handle, attr)) => {
@@ -352,9 +361,12 @@ impl<V: VolumeSet> MultiExport<V> {
     for (index, (name, volume)) in entries.iter().enumerate().skip(start) {
       let fileid = ROOT_ENTRY_FILEID_BASE.saturating_add(u64::try_from(index).unwrap_or(0));
       let plus_object = if plus {
-        self
-          .set
-          .root_object(*volume, self.subject.clone(), self.rights, self.owner_gid)
+        self.set.root_object(
+          *volume,
+          self.subject.clone(),
+          self.rights,
+          self.groups.clone(),
+        )
       } else {
         None
       };
@@ -434,9 +446,12 @@ impl<V: VolumeSet> NfsService for MultiExport<V> {
     }
     // A client may also mount a specific volume's subtree directly by its name.
     match self.volume_of(name).and_then(|volume| {
-      self
-        .set
-        .root_object(volume, self.subject.clone(), self.rights, self.owner_gid)
+      self.set.root_object(
+        volume,
+        self.subject.clone(),
+        self.rights,
+        self.groups.clone(),
+      )
     }) {
       Some((handle, _)) => MountReply::Ok {
         handle,
@@ -461,7 +476,7 @@ impl<V: VolumeSet> NfsService for MultiExport<V> {
             volume,
             self.subject.clone(),
             self.rights,
-            self.owner_gid,
+            self.groups.clone(),
             procedure,
             args,
           )
@@ -517,14 +532,14 @@ impl OwnedVolumeSet {
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
-    owner_gid: Option<u32>,
+    groups: Option<crate::access::UnixGroups>,
     f: impl FnOnce(&mut Export<'_>) -> R,
   ) -> Option<R> {
     let store = &mut self.store;
     let slot = self.volumes.iter_mut().find(|v| v.id == volume)?;
     let mut bridge = VolumeBridge::new(volume, &mut slot.volume, store);
     let mut export = Export::new(&mut bridge, volume, subject, rights).ok()?;
-    export.set_owner_gid(owner_gid);
+    export.set_groups(groups);
     Some(f(&mut export))
   }
 }
@@ -543,12 +558,12 @@ impl VolumeSet for OwnedVolumeSet {
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
-    owner_gid: Option<u32>,
+    groups: Option<crate::access::UnixGroups>,
     procedure: u32,
     args: &mut XdrReader<'_>,
   ) -> Option<Vec<u8>> {
     self
-      .with_export(volume, subject, rights, owner_gid, |export| {
+      .with_export(volume, subject, rights, groups, |export| {
         export.serve_nfs(procedure, args)
       })
       .flatten()
@@ -559,10 +574,10 @@ impl VolumeSet for OwnedVolumeSet {
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
-    owner_gid: Option<u32>,
+    groups: Option<crate::access::UnixGroups>,
   ) -> Option<(Nfsfh3, Fattr3)> {
     self
-      .with_export(volume, subject, rights, owner_gid, |export| {
+      .with_export(volume, subject, rights, groups, |export| {
         export.root_object()
       })
       .flatten()
