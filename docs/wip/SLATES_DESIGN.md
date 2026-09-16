@@ -972,9 +972,10 @@ cluster.
 
 > Status (2026-09-09): the driver readiness seam carries both directions. `Driver::register_readable`
 > and `register_writable` register one-shot interest in a descriptor's readability or writability with
-> the shard's driver (kqueue `EVFILT_READ`/`EVFILT_WRITE`, epoll `EPOLLIN`/`EPOLLOUT`, each re-armed
-> after the edge is consumed); the completion-native drivers (io_uring, IOCP) refuse both as owed with
-> a typed `RtError`, and the simulation refuses writability (its in-memory fabric sends never block).
+> the shard's driver (kqueue `EVFILT_READ`/`EVFILT_WRITE` and epoll `EPOLLIN`/`EPOLLOUT`, each re-armed
+> after the edge is consumed; io_uring a one-shot `PollAdd` on `POLLIN`/`POLLOUT` since 2026-09-16, the
+> shape its kick eventfd already used; Windows IOCP through its AFD reactor). The simulation carries
+> readability over its in-memory fabric and refuses only writability (its fabric sends never block).
 > Over that seam the runtime exposes two async sockets that share one readiness future
 > (`crates/rt/src/readiness.rs`, so neither duplicates the register-and-yield dance): `udp::UdpSocket`
 > (§4.10a, the fleet plane — a real `rustix` socket or the simulated fabric) and `tcp::{TcpListener,
@@ -982,8 +983,21 @@ cluster.
 > fabric). `TcpStream::write_all` awaits writability when the send buffer fills, so a write to a stalled
 > peer (a soft-mounted NFS client that stopped reading) yields the shard rather than blocking it. Proven
 > by use on the readiness-native driver: `crates/rt/tests/tcp.rs` runs an accept→read→write→read round
-> trip with both ends on the runtime's own sockets, `tests/udp.rs` the datagram path. The
-> completion-native socket path (io_uring, IOCP) stays owed.
+> trip with both ends on the runtime's own sockets, `tests/udp.rs` the datagram path.
+>
+> **Status (2026-09-16): every real driver carries socket readiness — the completion-native path is no
+> longer owed.** io_uring's `register_readable`/`register_writable` were stubs that returned a typed
+> `DriverRefused`, so the first time an async socket on that driver awaited readiness (a read that hit
+> `EAGAIN`, a full send buffer, an accept with no pending connection) the caller's loop ended: the
+> NFS-mount server (§4.6) and the UDP transport (§4.10a) were dead on any Linux host that selects
+> io_uring. It hid because every container the fleet was tested in blocks the io_uring syscalls under
+> its default seccomp profile (Docker `RuntimeDefault`, KIND) and fell back to epoll; GitHub's
+> `ubuntu-latest` runners have no such filter, so `bridge-nfs/tests/async_loopback.rs` failed there and
+> only there. Both now arm a one-shot `PollAdd`; verified in Docker with `seccomp=unconfined` (io_uring
+> live) at 0 of 100 failures, was 80/80 (`docs/bugs/2026-09-16-io-uring-driver-carries-no-socket-readiness.md`).
+> Windows IOCP already carried readiness through its AFD reactor (`crates/rt/src/afd.rs`). So kqueue,
+> epoll, io_uring and IOCP all carry it; the only refusal left is the simulation's writability, which is
+> a property of a fabric whose sends never block, not an unimplemented seam.
 >
 > **Status (2026-09-13).** The ring and handle cores and the kick-if-parked protocol are model-checked
 > under loom (AC-0.7, T-0.3): the one-producer ring, two contending producers, a lapping producer, a
