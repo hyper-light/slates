@@ -1,6 +1,7 @@
 //! Volume recovery images (§4.8, A-9): a faithful, handle-free image of a volume's durable state
 //! — every inode with its number, generation, birth epoch, POSIX attributes, home and body; every
-//! directory's entries by name and child number; every file's bytes; and the volume's roots
+//! directory's entries by name and child number; every file's held bytes, as runs at their offsets
+//! (a hole costs nothing in the volume and nothing here); and the volume's roots
 //! (prefix, name policy, epoch, inode counter, quota parameters). The image is canonical
 //! [`slates_wire::Wire`] bytes, so a running daemon publishes it into anchor-owned RAM (the content
 //! object) at a barrier and a restarted daemon rebuilds the volume from it, recovering the
@@ -37,7 +38,7 @@ use crate::names::NameEquivalence;
 use crate::quota::{BudgetGrowth, Quota};
 use crate::snapshot::{Dead, Deadlist, Snapshot};
 use crate::trie::{self, TrieNode};
-use crate::volume::{Store, Volume, VolumeSeed};
+use crate::volume::{Store, Volume, VolumeSeed, body_extents};
 
 /// Format: a volume image's magic (`"SLR1"` little-endian), so an all-zero or foreign content
 /// object decodes to a mismatch and is refused rather than read as a valid empty volume.
@@ -45,8 +46,9 @@ const IMAGE_MAGIC: u32 = u32::from_le_bytes(*b"SLR1");
 /// Format: a shard image's magic (`"SLS1"` little-endian), distinct from a single volume's so one
 /// is never decoded as the other.
 const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
-/// Format: the image layout version, bumped with any change to the types below.
-const IMAGE_VERSION: u16 = 2;
+/// Format: the image layout version, bumped with any change to the types below. 3 (2026-09-15): a
+/// file's body is its held runs at their offsets, not one vector of its logical length.
+const IMAGE_VERSION: u16 = 3;
 
 /// The name-equivalence policy in an image (§4.4 [`NameEquivalence`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
@@ -134,9 +136,10 @@ pub struct EntryImage {
 }
 
 /// An inode's body reduced to its recoverable content (§4.5 `Body`): a directory becomes its
-/// entries; a file becomes its bytes (whether they were inline, sealed in chunks or in an open
-/// extent — the read path serves them the same); a symlink becomes its target. `Empty` is a file
-/// with no content yet.
+/// entries; a file becomes the runs of bytes it holds, at their offsets (whether they were inline,
+/// sealed in chunks or in an open extent — the read path serves them the same), everything else
+/// up to its size being a hole; a symlink becomes its target. `Empty` is a file with no content
+/// yet.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub enum BodyImage {
   /// No content yet.
@@ -150,10 +153,15 @@ pub enum BodyImage {
     /// The original base path of an overlay directory rename.
     origin: Option<String>,
   },
-  /// A file's bytes.
+  /// A file's held bytes as runs at their offsets, ascending and non-overlapping; what no run
+  /// covers, up to the inode's size, is a hole (zeros). So a sparse file images as what it holds,
+  /// never as its logical length: before 2026-09-15 this was one vector of the whole length, and a
+  /// file extended to 999,999,999,999,999 bytes (pjdfstest `truncate/12.t`) sized a petabyte
+  /// allocation at the barrier and aborted the daemon
+  /// (`docs/bugs/2026-09-15-recovery-image-materializes-a-sparse-files-holes.md`).
   File {
-    /// The bytes.
-    bytes: Vec<u8>,
+    /// The runs.
+    runs: Vec<RunImage>,
   },
   /// A live base-backed file and the ranges already owned by the overlay.
   Base {
@@ -171,6 +179,15 @@ pub enum BodyImage {
     /// The target path.
     target: String,
   },
+}
+
+/// One run of a file's held bytes in an image: `bytes` at `offset`.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct RunImage {
+  /// The file offset.
+  pub offset: u64,
+  /// The bytes.
+  pub bytes: Vec<u8>,
 }
 
 /// One private base-file range; absent bytes represent an explicit zero extent.
@@ -844,35 +861,78 @@ impl Volume {
     Ok(entries)
   }
 
-  /// A file inode's bytes, read through the volume's own read path so inline, sealed and open bodies
-  /// are all captured the same, from `snapshot` when set (its frozen bytes) or the head. An empty
-  /// file (no content yet) images as `Empty`.
+  /// A file inode's held bytes as runs — its inline bytes, its chunk-backed sealed extents and its
+  /// open extent ([`held_spans`]) — each read through the volume's own read path so inline, sealed
+  /// and open bodies are captured the same, from `snapshot` when set (its frozen bytes) or the head.
+  /// A hole (a zero extent, or the span past the last held byte up to the inode's size) is captured
+  /// as nothing: it costs no bytes in the volume and none in the image, which is what bounds an
+  /// image by the bytes a file holds rather than its length. An empty file (no content yet) images
+  /// as `Empty`.
   fn file_body(
     &self,
     store: &Store,
     inode: &Inode,
     snapshot: Option<SnapshotId>,
   ) -> Result<BodyImage, VfsError> {
-    let size = usize::try_from(inode.attrs.size).map_err(|_| VfsError::FileTooLarge)?;
-    if size == 0 {
+    let mut runs = Vec::new();
+    for (offset, len) in held_spans(&inode.body) {
+      let len = usize::try_from(len).map_err(|_| VfsError::FileTooLarge)?;
+      let mut bytes = vec![0u8; len];
+      let mut read = 0;
+      while read < len {
+        let at = offset.saturating_add(u64::try_from(read).map_err(|_| VfsError::FileTooLarge)?);
+        let got = match snapshot {
+          Some(id) => self.read_in(store, id, inode.no, at, &mut bytes[read..])?,
+          None => self.read(store, inode.no, at, &mut bytes[read..])?,
+        };
+        if got == 0 {
+          break;
+        }
+        read += got;
+      }
+      bytes.truncate(read);
+      if !bytes.is_empty() {
+        runs.push(RunImage { offset, bytes });
+      }
+    }
+    if runs.is_empty() {
       return Ok(BodyImage::Empty);
     }
-    let mut bytes = vec![0u8; size];
-    let mut read = 0;
-    while read < size {
-      let at = u64::try_from(read).map_err(|_| VfsError::FileTooLarge)?;
-      let got = match snapshot {
-        Some(id) => self.read_in(store, id, inode.no, at, &mut bytes[read..])?,
-        None => self.read(store, inode.no, at, &mut bytes[read..])?,
-      };
-      if got == 0 {
-        break;
-      }
-      read += got;
-    }
-    bytes.truncate(read);
-    Ok(BodyImage::File { bytes })
+    Ok(BodyImage::File { runs })
   }
+}
+
+/// The spans `[offset, offset + len)` of a file body that hold bytes — its inline bytes, its
+/// chunk-backed sealed extents and its open extent — coalesced where they touch or overlap (the
+/// open extent shadows the sealed extents beneath it; the read path resolves which bytes are
+/// current, and one run per contiguous span keeps an identical file's image identical whatever its
+/// chunking), ascending by offset. A zero extent and the span past the last held byte are holes,
+/// and are not spans.
+fn held_spans(body: &Body) -> Vec<(u64, u64)> {
+  let mut spans: Vec<(u64, u64)> = match body {
+    Body::Inline(bytes) => vec![(0, u64::try_from(bytes.len()).unwrap_or(u64::MAX))],
+    body => body_extents(body)
+      .iter()
+      .filter(|extent| matches!(extent.src, crate::content::ExtentSrc::Chunk { .. }))
+      .map(|extent| (extent.off, extent.len))
+      .collect(),
+  };
+  if let Body::Open { open, .. } = body {
+    spans.push((open.off, open.len));
+  }
+  spans.retain(|(_, len)| *len > 0);
+  spans.sort_unstable();
+  let mut coalesced: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+  for (offset, len) in spans {
+    let end = offset.saturating_add(len);
+    match coalesced.last_mut() {
+      Some((last_offset, last_len)) if offset <= last_offset.saturating_add(*last_len) => {
+        *last_len = end.saturating_sub(*last_offset).max(*last_len);
+      }
+      _ => coalesced.push((offset, len)),
+    }
+  }
+  coalesced
 }
 
 /// The image reference for a snapshot id.
@@ -1333,11 +1393,37 @@ impl Volume {
       if let BodyImage::Base { pinned, .. } = &image_inode.body {
         self.fill_base_pins(store, image_inode, pinned)?;
       }
-      if let BodyImage::File { bytes } = &image_inode.body
-        && !bytes.is_empty()
-      {
-        self.write(store, InodeNo(image_inode.no), 0, bytes)?;
+      if let BodyImage::File { runs } = &image_inode.body {
+        self.fill_runs(store, image_inode, runs)?;
       }
+    }
+    Ok(())
+  }
+
+  /// Writes a file image's runs through the write path, refusing an image whose runs are empty,
+  /// out of order, overlapping or past the inode's size (a corrupt image is a typed refusal, never a
+  /// silently different file). The span past the last run up to the size is a hole, which the
+  /// inode's restored size carries: the write path keeps the larger of the size it finds and the
+  /// bytes it lands.
+  fn fill_runs(
+    &mut self,
+    store: &mut Store,
+    inode: &InodeImage,
+    runs: &[RunImage],
+  ) -> Result<(), VfsError> {
+    let no = InodeNo(inode.no);
+    let mut previous_end = 0u64;
+    for run in runs {
+      let len = u64::try_from(run.bytes.len()).map_err(|_| VfsError::RecoveryIncomplete)?;
+      let end = run
+        .offset
+        .checked_add(len)
+        .ok_or(VfsError::RecoveryIncomplete)?;
+      if len == 0 || run.offset < previous_end || end > inode.attrs.size {
+        return Err(VfsError::RecoveryIncomplete);
+      }
+      previous_end = end;
+      self.write(store, no, run.offset, &run.bytes)?;
     }
     Ok(())
   }
@@ -1453,7 +1539,9 @@ fn dead_key(dead: &Dead) -> (Discriminant<Dead>, u32, u32) {
 /// are deduped); the arm exists to keep the match exhaustive.
 fn body_crc(body: &BodyImage) -> u32 {
   match body {
-    BodyImage::File { bytes } => crc32c(bytes),
+    // The runs' offsets are part of the content (the same bytes at another offset are a different
+    // file), so the crc covers the body's canonical wire form, as for a base body.
+    BodyImage::File { .. } => crc32c(&body.to_bytes()),
     BodyImage::Symlink { target } => crc32c(target.as_bytes()),
     BodyImage::Empty => crc32c(&[]),
     BodyImage::Directory { .. } => 0,

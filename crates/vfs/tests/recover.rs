@@ -16,6 +16,7 @@ use slates_vfs::clock::StepClock;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::{BudgetGrowth, Quota};
+use slates_vfs::recover::RunImage;
 use slates_vfs::recover::{
   BodyImage, EntryImage, InodeImage, KeyedImage, KindImage, PolicyImage, ShardImage, SharedSource,
   VolumeImage,
@@ -156,7 +157,10 @@ fn to_image_captures_an_inline_files_bytes() {
   assert_eq!(
     small.body,
     BodyImage::File {
-      bytes: b"hello".to_vec()
+      runs: vec![RunImage {
+        offset: 0,
+        bytes: b"hello".to_vec()
+      }]
     }
   );
 }
@@ -170,9 +174,12 @@ fn to_image_captures_a_multi_chunk_files_bytes() {
   assert_eq!(
     big.body,
     BodyImage::File {
-      bytes: b.big_bytes.clone()
+      runs: vec![RunImage {
+        offset: 0,
+        bytes: b.big_bytes.clone()
+      }]
     },
-    "a chunked file's bytes are captured whole and in order"
+    "a chunked file's bytes are captured whole and in order, as one contiguous run"
   );
 }
 
@@ -201,7 +208,7 @@ fn a_volume_rebuilt_from_its_image_is_faithful() {
   let original = b.image.to_content();
 
   // "Restart": a fresh store, rebuild the volume from the published image bytes.
-  let mut fresh = store();
+  let mut fresh = common::store();
   let image = VolumeImage::from_content(&original).unwrap();
   let vol = Volume::from_image(
     &mut fresh,
@@ -252,7 +259,7 @@ fn a_volume_survives_a_content_object_handoff() {
     .expect("the published image is present after the handoff");
 
   // Rebuild and read the bytes written before the "restart" through their original inode number.
-  let mut fresh = store();
+  let mut fresh = common::store();
   let vol = Volume::from_image(
     &mut fresh,
     &image,
@@ -405,7 +412,7 @@ fn a_clone_recovers_inherited_and_diverged_content() {
     "a clone records its origin epoch"
   );
 
-  let mut fresh = store();
+  let mut fresh = common::store();
   let recovered = Volume::from_image(
     &mut fresh,
     &image,
@@ -471,7 +478,7 @@ fn a_whole_shard_of_volumes_survives_a_content_object_handoff() {
     "both volumes recovered, in key order"
   );
 
-  let mut fresh = store();
+  let mut fresh = common::store();
   for keyed in &recovered.volumes {
     let vol = Volume::from_image(
       &mut fresh,
@@ -555,7 +562,7 @@ fn a_dynamic_volume_recovers_with_its_quota_and_growth() {
   assert!(grown > 0, "the dynamic volume took growth from the budget");
 
   let image = vol.to_image(&src, None).unwrap();
-  let mut fresh = store();
+  let mut fresh = common::store();
   let recovered = Volume::from_image(
     &mut fresh,
     &image,
@@ -701,7 +708,7 @@ fn an_unlinked_but_open_orphan_recovers_its_content() {
     image.inodes.iter().any(|i| i.no == f.0),
     "the orphan inode is captured in the image (the walk covers the inode table, not just the tree)"
   );
-  let mut fresh = store();
+  let mut fresh = common::store();
   let mut recovered = Volume::from_image(
     &mut fresh,
     &image,
@@ -807,7 +814,10 @@ fn to_image_captures_a_snapshots_frozen_content() {
   assert_eq!(
     head.body,
     BodyImage::File {
-      bytes: b"after-the-snapshot".to_vec()
+      runs: vec![RunImage {
+        offset: 0,
+        bytes: b"after-the-snapshot".to_vec()
+      }]
     },
     "the head image holds the post-snapshot content"
   );
@@ -819,7 +829,10 @@ fn to_image_captures_a_snapshots_frozen_content() {
   assert_eq!(
     frozen.body,
     BodyImage::File {
-      bytes: b"before".to_vec()
+      runs: vec![RunImage {
+        offset: 0,
+        bytes: b"before".to_vec()
+      }]
     },
     "the snapshot image holds the content frozen at the snapshot"
   );
@@ -842,7 +855,7 @@ fn a_volume_with_a_snapshot_rebuilds_faithfully() {
 
   let original = vol.to_image(&src, None).unwrap();
 
-  let mut fresh = store();
+  let mut fresh = common::store();
   let recovered = Volume::from_image(
     &mut fresh,
     &original,
@@ -892,7 +905,7 @@ fn a_recovered_snapshot_id_survives_when_it_is_not_the_first_slot() {
   vol.destroy_snapshot(&mut src, snap_a).unwrap(); // frees slot zero; snap_b keeps slot one
 
   let image = vol.to_image(&src, None).unwrap();
-  let mut fresh = store();
+  let mut fresh = common::store();
   let recovered = Volume::from_image(
     &mut fresh,
     &image,
@@ -928,7 +941,7 @@ fn dropping_a_recovered_snapshot_frees_its_tree() {
   let snap = vol.snapshot(&mut src).unwrap();
 
   let image = vol.to_image(&src, None).unwrap();
-  let mut fresh = store();
+  let mut fresh = common::store();
   let mut recovered = Volume::from_image(
     &mut fresh,
     &image,
@@ -972,7 +985,7 @@ fn dropping_a_recovered_snapshot_leaves_the_head_readable() {
   vol.write(&mut src, changed, 0, b"version-two").unwrap(); // longer, so it fully overwrites
 
   let image = vol.to_image(&src, None).unwrap();
-  let mut fresh = store();
+  let mut fresh = common::store();
   let mut recovered = Volume::from_image(
     &mut fresh,
     &image,
@@ -1016,7 +1029,7 @@ fn a_recovered_snapshot_shares_unchanged_inodes_with_the_head() {
   vol.write(&mut src, b, 0, b"v2-longer").unwrap(); // b differs; a is unchanged
 
   let image = vol.to_image(&src, None).unwrap();
-  let mut fresh = store();
+  let mut fresh = common::store();
   let _recovered = Volume::from_image(
     &mut fresh,
     &image,
@@ -1114,7 +1127,7 @@ fn a_version_shared_across_snapshots_is_captured_once_and_recovers_shared() {
     "the later snapshot names the earlier as the source of the shared version"
   );
 
-  let mut fresh = store();
+  let mut fresh = common::store();
   let mut recovered = Volume::from_image(
     &mut fresh,
     &image,
@@ -1180,7 +1193,7 @@ fn a_shared_version_survives_newest_first_drops_with_slot_reuse() {
   vol.write(&mut src, f, 0, b"head-edit").unwrap(); // f diverges; all three share the frozen version
 
   let image = vol.to_image(&src, None).unwrap();
-  let mut fresh = store();
+  let mut fresh = common::store();
   let mut rec = Volume::from_image(
     &mut fresh,
     &image,
@@ -1377,7 +1390,7 @@ fn a_semantically_malformed_image_is_refused_by_the_rebuild() {
       });
     }
   }
-  let mut fresh = store();
+  let mut fresh = common::store();
   assert!(
     matches!(
       Volume::from_image(
@@ -1390,5 +1403,135 @@ fn a_semantically_malformed_image_is_refused_by_the_rebuild() {
       Err(VfsError::RecoveryIncomplete)
     ),
     "a dangling directory reference is refused by the rebuild, not panicked or half-built"
+  );
+}
+
+/// AC (§4.8; the barrier crash of 2026-09-15,
+/// docs/bugs/2026-09-15-recovery-image-materializes-a-sparse-files-holes.md): a sparse file images
+/// as the bytes it holds, never as its logical length. Do: hold four bytes at offset zero, then
+/// extend the file to 999,999,999,999,999 bytes (pjdfstest's `truncate/12.t`). Expect: the image
+/// carries one four-byte run and the size, and fits in a few hundred bytes (non-vacuity: a
+/// materialized hole would be a petabyte, and was — the daemon aborted on the allocation); a volume
+/// rebuilt from it serves the four bytes, reports the size, and reads zeros in the hole.
+#[test]
+fn a_sparse_file_images_as_its_held_runs_not_its_length() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol
+    .create_file_no(&mut store, root, "sparse", 0o644)
+    .unwrap();
+  vol.write(&mut store, f, 0, b"held").unwrap();
+  vol.truncate(&mut store, f, 999_999_999_999_999).unwrap();
+
+  let image = vol.to_image(&store, None).unwrap();
+  let sparse = image.inodes.iter().find(|i| i.no == f.0).unwrap();
+  assert_eq!(sparse.attrs.size, 999_999_999_999_999);
+  assert_eq!(
+    sparse.body,
+    BodyImage::File {
+      runs: vec![RunImage {
+        offset: 0,
+        bytes: b"held".to_vec()
+      }]
+    },
+    "the image holds the run held, and nothing for the hole"
+  );
+  let content = image.to_content();
+  assert!(
+    content.len() < 4096,
+    "the image is bounded by the bytes held, not the length: {} bytes",
+    content.len()
+  );
+
+  let mut fresh = common::store();
+  let image = VolumeImage::from_content(&content).unwrap();
+  let rebuilt = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
+  assert_eq!(
+    rebuilt.stat(&fresh, f).unwrap().size,
+    999_999_999_999_999,
+    "the rebuilt file keeps its size"
+  );
+  let mut head = [0u8; 4];
+  assert_eq!(rebuilt.read(&fresh, f, 0, &mut head).unwrap(), 4);
+  assert_eq!(&head, b"held");
+  let mut hole = [1u8; 16];
+  assert_eq!(
+    rebuilt
+      .read(&fresh, f, 999_999_999_999_000, &mut hole)
+      .unwrap(),
+    16
+  );
+  assert!(
+    hole.iter().all(|b| *b == 0),
+    "the hole reads as zeros after the rebuild"
+  );
+}
+
+/// A file with a hole in the middle images as two runs — the bytes on either side — and rebuilds
+/// with the hole intact, so an image is bounded by the bytes held, not by the span they lie in.
+#[test]
+fn a_file_with_a_middle_hole_images_as_two_runs() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol
+    .create_file_no(&mut store, root, "holey", 0o644)
+    .unwrap();
+  let far = 8u64 << 20;
+  vol.write(&mut store, f, 0, b"head").unwrap();
+  vol.write(&mut store, f, far, b"tail").unwrap();
+
+  let image = vol.to_image(&store, None).unwrap();
+  let holey = image.inodes.iter().find(|i| i.no == f.0).unwrap();
+  assert_eq!(
+    holey.body,
+    BodyImage::File {
+      runs: vec![
+        RunImage {
+          offset: 0,
+          bytes: b"head".to_vec()
+        },
+        RunImage {
+          offset: far,
+          bytes: b"tail".to_vec()
+        },
+      ]
+    },
+    "two runs, nothing for the hole between them"
+  );
+  let content = image.to_content();
+  assert!(
+    content.len() < 4096,
+    "eight megabytes of hole cost nothing: {} bytes",
+    content.len()
+  );
+
+  let mut fresh = common::store();
+  let image = VolumeImage::from_content(&content).unwrap();
+  let rebuilt = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
+  assert_eq!(rebuilt.stat(&fresh, f).unwrap().size, far + 4);
+  let mut tail = [0u8; 4];
+  assert_eq!(rebuilt.read(&fresh, f, far, &mut tail).unwrap(), 4);
+  assert_eq!(&tail, b"tail");
+  let mut middle = [1u8; 8];
+  assert_eq!(rebuilt.read(&fresh, f, far / 2, &mut middle).unwrap(), 8);
+  assert!(
+    middle.iter().all(|b| *b == 0),
+    "the middle hole reads as zeros"
   );
 }
