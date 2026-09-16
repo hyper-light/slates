@@ -408,8 +408,15 @@ impl Drop for HostDir {
 
 /// A fresh host directory named with the process id, holding `f.txt` = `disk bytes`.
 fn host_dir_with_file() -> HostDir {
+  // The template needs trailing `X`s: GNU mktemp (Linux) refuses one without them ("too few X's"),
+  // while BSD mktemp (macOS) tolerates their absence — so the bare prefix passed on macOS and failed
+  // the Linux lane. `<prefix>.XXXXXX` is the form the conformance harness already uses on both.
   let out = std::process::Command::new("mktemp")
-    .args(["-d", "-t", &format!("slates-origin-{}", std::process::id())])
+    .args([
+      "-d",
+      "-t",
+      &format!("slates-origin-{}.XXXXXX", std::process::id()),
+    ])
     .output()
     .unwrap();
   assert!(out.status.success(), "mktemp -d");
