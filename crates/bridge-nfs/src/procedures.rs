@@ -1286,16 +1286,18 @@ impl<'b> Export<'b> {
     };
     let target = ObjectId::new(file_identity.inode, file_identity.generation);
     let new_parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
-    // POSIX: adding an entry needs write and search permission on the directory. The directory's
-    // post-op attributes (its unchanged link count) go in the wcc either way.
-    let dir_post = match self.writable_directory(&dir_identity) {
-      Ok(node) => Some(self.fattr3(&node)),
-      Err((status, dir_post)) => {
-        let file_attr = self.attrs_of(&file_identity).ok().map(|n| self.fattr3(&n));
-        return (status, file_attr, dir_post);
-      }
-    };
-    match self.bridge.link(target, new_parent, &cx, &name) {
+    // POSIX: adding an entry needs write and search permission on the directory.
+    if let Err((status, dir_post)) = self.writable_directory(&dir_identity) {
+      let file_attr = self.attrs_of(&file_identity).ok().map(|n| self.fattr3(&n));
+      return (status, file_attr, dir_post);
+    }
+    let outcome = self.bridge.link(target, new_parent, &cx, &name);
+    // The directory's post-op attributes go in the wcc either way, and they are read *after* the
+    // link: the client caches them in place of a GETATTR, so the times before the link would keep
+    // `stat` of the directory a whole attribute-cache period behind (pjdfstest `link/00.t` through
+    // a live mount, 2026-09-15). REMOVE, RENAME, CREATE, MKDIR and SYMLINK read theirs after too.
+    let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
+    match outcome {
       // The bridge returns the target's attributes with the incremented link count.
       Ok(node) => (Nfsstat3::Ok, Some(self.fattr3(&node)), dir_post),
       Err(e) => {

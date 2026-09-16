@@ -1412,6 +1412,10 @@ fn a_link_over_the_export_makes_a_second_name() {
   }
   .to_fh();
 
+  let dir_before = getattr_of(&mut export, &root_fh);
+  // The wall clock must have moved past the directory's last change before the link, or the times
+  // could not tell the two apart (the test's clock is the host's): spin on the clock, never sleep.
+  wait_until_the_clock_passes(dir_before.ctime);
   // LINK3args: the existing file handle, then diropargs3 (the directory handle, the new name).
   let mut args = XdrWriter::new();
   file_fh.encode(&mut args);
@@ -1433,6 +1437,26 @@ fn a_link_over_the_export_makes_a_second_name() {
   assert_eq!(
     file_attr.nlink, 2,
     "the link count is two after a hard link"
+  );
+  // linkdir_wcc: no pre-op attributes, then the directory's post-op attributes — which must be the
+  // directory *after* the link (its new ctime and mtime), because the client caches them in place of
+  // a GETATTR; a stale set here keeps `stat .` behind for a whole attribute-cache period (found by
+  // pjdfstest `link/00.t` through a live mount, 2026-09-15).
+  assert!(!r.bool().unwrap(), "no pre-op attributes");
+  let dir_post = PostOpAttr::decode(&mut r)
+    .unwrap()
+    .0
+    .expect("directory post attrs");
+  let dir_after = getattr_of(&mut export, &root_fh);
+  assert_eq!(
+    (dir_post.ctime, dir_post.mtime),
+    (dir_after.ctime, dir_after.mtime),
+    "the wcc carries the directory's times after the link"
+  );
+  assert_ne!(
+    (dir_before.ctime, dir_before.mtime),
+    (dir_after.ctime, dir_after.mtime),
+    "adding an entry moved the directory's times, so the equality above is not vacuous"
   );
 
   // Both names now resolve to the same object.
@@ -2061,6 +2085,34 @@ fn setattr_status(
 }
 
 /// The mode GETATTR reports for `fh`.
+/// Spins until the host's wall clock is strictly past an NFS timestamp, so a stamp taken after
+/// the call cannot equal one taken before it. The clock's resolution is nanoseconds, so this
+/// returns at the next reading in practice.
+fn wait_until_the_clock_passes(stamp: slates_bridge_nfs::nfs::Nfstime3) {
+  loop {
+    let now = std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap();
+    let seconds = u32::try_from(now.as_secs()).unwrap();
+    if (seconds, now.subsec_nanos()) > (stamp.seconds, stamp.nseconds) {
+      return;
+    }
+    std::hint::spin_loop();
+  }
+}
+
+/// GETATTR of a handle, decoded.
+fn getattr_of(export: &mut Export<'_>, fh: &Nfsfh3) -> Fattr3 {
+  let mut args = XdrWriter::new();
+  fh.encode(&mut args);
+  let reply = export
+    .serve_nfs(NFSPROC3_GETATTR, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "GETATTR succeeded");
+  Fattr3::decode(&mut r).unwrap()
+}
+
 fn mode_of(export: &mut Export<'_>, fh: &Nfsfh3) -> u32 {
   let mut args = XdrWriter::new();
   fh.encode(&mut args);
