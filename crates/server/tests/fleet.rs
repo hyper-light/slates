@@ -41,7 +41,7 @@ use slates_server::{
 mod common;
 use std::net::TcpStream;
 
-use common::nfs::{create, lookup, mount, read, write};
+use common::nfs::{create, lookup, mount, owner_and_mode, read, write};
 use common::trace;
 use slates_server::fleet::{FLEET_FRAME_CAP, SESSIONS_PER_PEER};
 use slates_transport::endpoint::{Endpoint, EndpointError};
@@ -1408,7 +1408,7 @@ fn a_restarted_peer_is_learned_on_contact_under_its_fresh_identity() {
   let (daemon_b_again, segment) = restart_b(&mut fleet, pid);
   let observed: Vec<&Daemon> = vec![&fleet.survivors[0], &fleet.survivors[1], &daemon_b_again];
   let learned = observe_learned(&observed, &fleet, &daemon_b_again);
-  let (head_placed, served, got) = successor_serves(&observed, &fleet);
+  let served_by = successor_serves(&observed, &fleet);
 
   let (formed, knew_old) = (fleet.formed, fleet.knew_old);
   daemon_b_again.stop();
@@ -1417,7 +1417,7 @@ fn a_restarted_peer_is_learned_on_contact_under_its_fresh_identity() {
   }
   drop(segment);
   assert_restart_learned(formed, knew_old, &learned);
-  assert_successor_served(head_placed, served, got.as_deref());
+  assert_successor_served(&served_by, &fleet.origin_owners);
 }
 
 /// The membership half of the restart scenario's verdict: the pre-restart facts and what the survivors
@@ -1455,18 +1455,36 @@ fn assert_restart_learned(formed: bool, knew_old: bool, learned: &Learned) {
 const RESTARTED_NODE_DOMAIN: DomainId = 7;
 
 /// The takeover half of the restart scenario's verdict: the old id's volume placed on, served by, and read
-/// back from the survivor that took it over.
-fn assert_successor_served(head_placed: bool, served: bool, got: Option<&[u8]>) {
+/// back from the survivor that took it over, with the origin's ownership reproduced.
+fn assert_successor_served(served_by: &ServedBy, origin_owners: &Owners) {
   assert!(
-    head_placed,
+    served_by.head_placed,
     "the survivor rendezvous ranked first took over the volume the old incarnation owned"
   );
-  assert!(served, "the successor serves the taken-over volume");
+  assert!(
+    served_by.served,
+    "the successor serves the taken-over volume"
+  );
   assert_eq!(
-    got,
+    served_by.got.as_deref(),
     Some(CONTENT),
     "the file B sealed reads back byte for byte from the successor over NFS"
   );
+  assert_eq!(
+    served_by.owners.as_ref(),
+    Some(origin_owners),
+    "the successor's root and file carry the origin's mode and owner (the archive carries ownership, \
+     format minor 2): [root, hello.txt] as (mode, uid, gid)"
+  );
+}
+
+/// What the takeover successor showed: the head placed, `status` answering, the file's bytes, and the
+/// root's and file's (mode, uid, gid).
+struct ServedBy {
+  head_placed: bool,
+  served: bool,
+  got: Option<Vec<u8>>,
+  owners: Option<Owners>,
 }
 
 /// The restart scenario's fleet after old B has sealed its volume and ended: the two survivors (A, then C),
@@ -1495,6 +1513,8 @@ struct RestartFleet {
   name: String,
   formed: bool,
   knew_old: bool,
+  /// The root's and `hello.txt`'s (mode, uid, gid) as the origin served them before it died.
+  origin_owners: Owners,
 }
 
 /// A peer entry dialed at `at`, pinned to `certificate`, known by its `anchor` and seed `host`.
@@ -1634,10 +1654,12 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
       panic!("setup: formed={formed}, {why}");
     }
   };
+  let origin_owners = owners_over_nfs(&daemons[0], &name);
   let old_b = daemons.remove(0);
   old_b.stop();
   RestartFleet {
     survivors: daemons,
+    origin_owners,
     host_a,
     host_c,
     host_b,
@@ -1775,7 +1797,7 @@ fn observe_learned(observed: &[&Daemon], fleet: &RestartFleet, b_again: &Daemon)
 
 /// The old id's volume is taken over by the survivor rendezvous ranks first, which must serve it: whether the
 /// head placed there, whether `status` answers there, and the file read back over its NFS port.
-fn successor_serves(observed: &[&Daemon], fleet: &RestartFleet) -> (bool, bool, Option<Vec<u8>>) {
+fn successor_serves(observed: &[&Daemon], fleet: &RestartFleet) -> ServedBy {
   let successor =
     rendezvous_first(&[fleet.host_a, fleet.host_c], fleet.object).expect("a survivor takes over");
   let (daemon, instance) = if successor == fleet.host_a {
@@ -1786,7 +1808,13 @@ fn successor_serves(observed: &[&Daemon], fleet: &RestartFleet) -> (bool, bool, 
   let head_placed = poll_head_placed(observed, daemon, fleet.object);
   let served = poll_status_answers(observed, instance, fleet.id);
   let got = served.then(|| read_hello_over_nfs(daemon, &fleet.name));
-  (head_placed, served, got)
+  let owners = served.then(|| owners_over_nfs(daemon, &fleet.name));
+  ServedBy {
+    head_placed,
+    served,
+    got,
+    owners,
+  }
 }
 
 /// The refusals the serve side counts for a membership announcement it will not fold (task #22), under the
@@ -4362,6 +4390,24 @@ fn write_hello_over_nfs(daemon: &Daemon, name: &str) {
   write(&mut stream, &file_fh, CONTENT, 3);
 }
 
+/// The (mode, uid, gid) of a volume's root and of `hello.txt`, as an NFS client reads them.
+type Owners = [(u32, u32, u32); 2];
+
+/// The mode and owner (`mode, uid, gid`) of the volume's root and of `hello.txt`, read over `daemon`'s
+/// NFS port — what a takeover successor must reproduce from the replicated archive (format minor 2
+/// carries every node's owner and the root's own metadata; before it, a rebuilt tree came up `0:0`
+/// and the export's POSIX access control shut its owner out).
+fn owners_over_nfs(daemon: &Daemon, name: &str) -> Owners {
+  let port = daemon.nfs_port().expect("the daemon serves NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
+  let root_fh = mount(&mut stream, &format!("/{name}"), 1);
+  let file_fh = lookup(&mut stream, &root_fh, "hello.txt", 2);
+  [
+    owner_and_mode(&mut stream, &root_fh, 3),
+    owner_and_mode(&mut stream, &file_fh, 4),
+  ]
+}
+
 /// Reads `hello.txt` back from the volume mounted at `/<name>` on `daemon`'s NFS port.
 fn read_hello_over_nfs(daemon: &Daemon, name: &str) -> Vec<u8> {
   let port = daemon.nfs_port().expect("the daemon serves NFS");
@@ -4773,6 +4819,8 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
     }
   };
   let object = ObjectId(id.bytes);
+  // What the origin shows for the root's and the file's mode and owner, before it dies.
+  let origin_owners = owners_over_nfs(&daemons[0], "served");
 
   // A dies. The first-ranked survivor takes over the head, then serves the content.
   let owner = daemons.remove(0);
@@ -4788,11 +4836,7 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
   // The successor serves the volume once it materialized it: its `status` answers instead of refusing.
   let successor_instance = daemons[successor_index].instance().to_owned();
   let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &successor_instance, id);
-  let got = if served {
-    Some(read_hello_over_nfs(&daemons[successor_index], "served"))
-  } else {
-    None
-  };
+  let (got, successor_owners) = served_content(served, &daemons[successor_index], "served");
   // The successor goes on writing the object: a further seal on it places over the remaining holder.
   let resealed =
     served && reseal_places(&successor_instance, &daemons[successor_index], "served", id);
@@ -4810,11 +4854,29 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
     Some(CONTENT),
     "the file written on the dead owner reads back byte for byte over the successor's NFS port"
   );
+  assert_eq!(
+    successor_owners,
+    Some(origin_owners),
+    "the successor's root and file carry the origin's mode and owner (the archive carries ownership, \
+     format minor 2): [root, hello.txt] as (mode, uid, gid)"
+  );
   assert!(
     resealed,
     "a seal taken on the successor after the takeover places — its head written at the promotion \
      epoch the holders fenced the object at, not the successor's lower host epoch"
   );
+}
+
+/// What a successor serves once `status` answers there: the file's bytes and the root's and file's
+/// (mode, uid, gid) over its NFS port; nothing when it does not serve.
+fn served_content(served: bool, daemon: &Daemon, name: &str) -> (Option<Vec<u8>>, Option<Owners>) {
+  if !served {
+    return (None, None);
+  }
+  (
+    Some(read_hello_over_nfs(daemon, name)),
+    Some(owners_over_nfs(daemon, name)),
+  )
 }
 
 /// Writes a further file into `name` on `daemon` over NFS and seals it, then polls the snapshot's
@@ -6122,3 +6184,4 @@ fn an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum() {
     "unlisted peers never joined the existing three-voter group"
   );
 }
+

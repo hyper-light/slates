@@ -26,6 +26,7 @@
 //! identity over both. Restoring the metadata onto a host path is the landing engine's job under a
 //! grant (§4.15), not the archive's; the archive carries, hashes and round-trips it.
 
+use crate::archive::hash_of;
 use crate::wire::{Reader, Writer};
 
 /// Format: a directory node's kind byte.
@@ -68,6 +69,11 @@ pub struct NodeMeta {
   pub nlink: u32,
   /// Nonzero when the node has extended attributes.
   pub xattr_flags: u32,
+  /// The owner's uid, as the volume held it (POSIX ownership; a restore reproduces it, a granted
+  /// landing applies it where the grant allows). Format minor 2.
+  pub uid: u32,
+  /// The owning group's gid, as the volume held it. Format minor 2.
+  pub gid: u32,
 }
 
 /// One entry in a directory: a name, the child's metadata, and the child it points to.
@@ -147,6 +153,36 @@ fn write_meta(writer: &mut Writer, meta: &NodeMeta) {
   writer.u64(meta.size);
   writer.u32(meta.nlink);
   writer.u32(meta.xattr_flags);
+  writer.u32(meta.uid);
+  writer.u32(meta.gid);
+}
+
+/// The root directory's own metadata, as the manifest section carries it ahead of the tree (format
+/// minor 2): the tree's entries name every node but the root, and a clone or a takeover successor
+/// rebuilds the root's mode, owner and times from this.
+pub fn encode_root_meta(meta: &NodeMeta) -> Vec<u8> {
+  let mut writer = Writer::new();
+  write_meta(&mut writer, meta);
+  writer.finish()
+}
+
+/// Reads the root's metadata from the head of a manifest section, returning it and the tree bytes
+/// that follow.
+pub fn decode_root_meta(bytes: &[u8]) -> Result<(NodeMeta, &[u8]), ManifestError> {
+  let mut reader = Reader::new(bytes);
+  let meta = read_meta(&mut reader)?;
+  let consumed = usize::try_from(reader.position()).map_err(|_| ManifestError::Truncated)?;
+  Ok((meta, bytes.get(consumed..).unwrap_or_default()))
+}
+
+/// The identity the archive header pins for its manifest: the root's own metadata and the tree's
+/// Merkle identity, hashed together — so a change to the root's mode or owner changes the archive's
+/// identity exactly as a change to any entry's does.
+pub fn manifest_identity(root_meta: &NodeMeta, root: &Node) -> [u8; 32] {
+  let mut writer = Writer::new();
+  write_meta(&mut writer, root_meta);
+  writer.hash(&root.identity());
+  hash_of(writer.as_slice())
 }
 
 /// Reads an entry's metadata fields, refusing a truncated stream.
@@ -158,6 +194,8 @@ fn read_meta(reader: &mut Reader<'_>) -> Result<NodeMeta, ManifestError> {
   let size = reader.u64().map_err(|_| ManifestError::Truncated)?;
   let nlink = reader.u32().map_err(|_| ManifestError::Truncated)?;
   let xattr_flags = reader.u32().map_err(|_| ManifestError::Truncated)?;
+  let uid = reader.u32().map_err(|_| ManifestError::Truncated)?;
+  let gid = reader.u32().map_err(|_| ManifestError::Truncated)?;
   Ok(NodeMeta {
     ino,
     mode,
@@ -166,6 +204,8 @@ fn read_meta(reader: &mut Reader<'_>) -> Result<NodeMeta, ManifestError> {
     size,
     nlink,
     xattr_flags,
+    uid,
+    gid,
   })
 }
 

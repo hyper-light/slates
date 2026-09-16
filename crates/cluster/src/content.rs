@@ -445,6 +445,10 @@ fn with_chunks(archive: &Archive, chunks: Vec<Chunk>) -> Archive {
     snapshot_id: archive.snapshot_id,
     name_policy_id: archive.name_policy_id,
     unicode_version: archive.unicode_version,
+    // The root's own metadata is part of the manifest identity the holder's acknowledgement binds
+    // (format minor 2): a partial archive shipped without it would carry another identity than the
+    // owner's head names, and the head would never place.
+    root_meta: archive.root_meta,
     manifest: archive.manifest.clone(),
     chunks,
   }
@@ -507,7 +511,7 @@ impl ContentHold {
     if missing > 0 {
       return Err(ContentRefusal::Incomplete { missing });
     }
-    let identity = archive.manifest.identity();
+    let identity = archive.manifest_identity();
     let record = with_chunks(&archive, Vec::new());
     for chunk in archive.chunks {
       self.store.insert(chunk);
@@ -737,7 +741,7 @@ pub async fn put_content(
   remote_holders: Vec<(HostId, Endpoint)>,
   budget: CommitBudget,
 ) -> ContentPlaced {
-  let manifest = archive.manifest.identity();
+  let manifest = archive.manifest_identity();
   let mut acked: Vec<HostId> = if candidates.contains(&owner) {
     vec![owner]
   } else {
@@ -870,7 +874,7 @@ pub async fn fetch_content(
   let archive = match ContentMessage::decode(&reply.bytes) {
     Ok(ContentMessage::Have { archive }) => Archive::decode(&archive)
       .ok()
-      .filter(|archive| archive.manifest.identity() == manifest),
+      .filter(|archive| archive.manifest_identity() == manifest),
     _ => None,
   };
   (archive, endpoint)
@@ -917,6 +921,7 @@ mod tests {
       snapshot_id: 6,
       name_policy_id: 0,
       unicode_version: 0,
+      root_meta: NodeMeta::default(),
       manifest: Node::Directory(vec![Entry {
         name: "file".to_owned(),
         meta: NodeMeta::default(),
@@ -1051,7 +1056,7 @@ mod tests {
     assert_eq!(hold.chunk_count(), 0, "nothing stored on a refusal");
 
     let manifest = hold.hold(archive.clone()).unwrap();
-    assert_eq!(manifest, archive.manifest.identity());
+    assert_eq!(manifest, archive.manifest_identity());
     assert!(hold.holds_manifest(&manifest));
     assert_eq!(hold.chunk_count(), 2);
     assert!(hold.missing_of(&identities).is_empty());
@@ -1086,7 +1091,7 @@ mod tests {
     let offer = ContentMessage::Offer {
       object: OBJECT,
       sequence: SEQUENCE,
-      manifest: archive.manifest.identity(),
+      manifest: archive.manifest_identity(),
       chunks: archive.chunks.iter().map(|c| c.identity).collect(),
     };
     let Ok(ContentMessage::Missing { missing, .. }) =
@@ -1124,15 +1129,15 @@ mod tests {
     let Ok(ContentMessage::Ack(ack)) = ContentMessage::decode(&reply) else {
       panic!("a complete put is acknowledged");
     };
-    assert!(ack.binds(OBJECT, SEQUENCE, &archive.manifest.identity()));
-    assert!(!ack.binds(OBJECT, SEQUENCE + 1, &archive.manifest.identity()));
+    assert!(ack.binds(OBJECT, SEQUENCE, &archive.manifest_identity()));
+    assert!(!ack.binds(OBJECT, SEQUENCE + 1, &archive.manifest_identity()));
     assert_eq!(ack.holder, holder);
     assert_eq!(hold.chunk_count(), 2, "exactly the missing chunk was added");
 
     let fetched = hold.serve(
       holder,
       &ContentMessage::Fetch {
-        manifest: archive.manifest.identity(),
+        manifest: archive.manifest_identity(),
       }
       .encode(),
     );

@@ -36,6 +36,7 @@ fn archive_of(files: &[(&str, Vec<u8>)]) -> Archive {
     snapshot_id: 1,
     name_policy_id: 1,
     unicode_version: 15,
+    root_meta: NodeMeta::default(),
     manifest: Node::Directory(entries),
     chunks,
   }

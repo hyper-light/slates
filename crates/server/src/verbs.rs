@@ -4502,22 +4502,50 @@ fn populate_restored(
   for (path, bytes) in &restored.files {
     let (parent, name) = parent_of(&directories, path)?;
     let meta = restored.metadata.get(path).copied().unwrap_or_default();
-    match kind_of_mode(meta.mode) {
+    let no = match kind_of_mode(meta.mode) {
       Some(Kind::Symlink) => {
         let target = String::from_utf8_lossy(bytes);
-        volume.symlink(store, parent, &name, &target)?;
+        volume.symlink(store, parent, &name, &target)?
       }
       _ => {
         let no = volume.create_file(store, parent, &name, permissions_of_mode(meta.mode))?;
         if !bytes.is_empty() {
           volume.write(store, no, 0, bytes)?;
         }
-        let mtime = i64::try_from(meta.mtime_ns).unwrap_or(i64::MAX);
-        volume.set_times(store, no, Some(mtime), Some(mtime), None)?;
+        no
       }
+    };
+    restore_owner_and_times(store, volume, no, &meta)?;
+  }
+  // The directories' owners and times last: populating a directory moves its times, and a directory
+  // is only whole once its entries are in. Deepest first, so a parent's stamp follows its children's.
+  for path in restored.directories.iter().rev() {
+    if let (Some(handle), Some(meta)) = (directories.get(path), restored.metadata.get(path)) {
+      let no = store.dirs.get(*handle)?.inode;
+      restore_owner_and_times(store, volume, no, meta)?;
     }
   }
+  // The root has no entry naming it; its own metadata rides the archive's head (format minor 2), so
+  // the rebuilt volume's root carries the mode, owner and times the origin's did — which, under the
+  // export's POSIX access control, is what lets the owner into their taken-over volume at all.
+  let root = volume.root_inode(store)?;
+  volume.chmod(store, root, permissions_of_mode(restored.root.mode))?;
+  restore_owner_and_times(store, volume, root, &restored.root)?;
   Ok(())
+}
+
+/// Gives a restored node the owner and the times its archive metadata carries — the owner first,
+/// since a `chown` marks the change time, and the times last so the archived stamps win.
+fn restore_owner_and_times(
+  store: &mut slates_vfs::volume::Store,
+  volume: &mut Volume,
+  no: slates_vfs::ids::InodeNo,
+  meta: &slates_archive::NodeMeta,
+) -> Result<(), slates_vfs::VfsError> {
+  volume.chown(store, no, meta.uid, meta.gid)?;
+  let mtime = i64::try_from(meta.mtime_ns).unwrap_or(i64::MAX);
+  let ctime = i64::try_from(meta.ctime_ns).unwrap_or(i64::MAX);
+  volume.set_times(store, no, Some(mtime), Some(mtime), Some(ctime))
 }
 
 /// Format: POSIX `0755`, the mode a restored directory takes when the archive carries none for it.

@@ -28,6 +28,8 @@ pub struct Restored {
   pub directories: BTreeSet<String>,
   /// Each named node's metadata, by path (the root has no naming entry, so no entry for it).
   pub metadata: BTreeMap<String, NodeMeta>,
+  /// The root directory's own metadata (its mode, owner and times), from the archive's head.
+  pub root: NodeMeta,
 }
 
 /// A lookup from chunk identity to the chunk, built once from the archive's chunks so restore does
@@ -100,7 +102,10 @@ fn walk(
 /// from the manifest tree and the chunks. A missing or corrupt chunk is a typed refusal.
 pub fn restore(archive: &Archive) -> Result<Restored, ArchiveError> {
   let index = chunk_index(archive);
-  let mut restored = Restored::default();
+  let mut restored = Restored {
+    root: archive.root_meta,
+    ..Restored::default()
+  };
   walk(&index, "", &archive.manifest, &mut restored)?;
   Ok(restored)
 }

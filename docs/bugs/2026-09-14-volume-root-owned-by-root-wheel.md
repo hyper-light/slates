@@ -11,9 +11,11 @@ own uid, so the provisioning user and the daemon are one user and that is the us
 a principal that is not a Unix user (a Windows SID) leaves the root as born. Proven by
 `verbs::tests::a_created_volumes_root_is_owned_by_its_provisioning_user` (in process, as uid 1234)
 and, live, by the CLI mount flow's new `mount_root_is_owned_by_the_mounting_user` check (`stat -f
-%u:%g` of the mount point equals the mounting user's, the check prescribed below). Owed: a volume a
-takeover successor rebuilds (`materialize_taken_over`) takes its root's ownership from the replicated
-head rather than this stamp; that path has no client principal and is to be verified on the lane.
+%u:%g` of the mount point equals the mounting user's, the check prescribed below). A volume a takeover
+successor rebuilds (`materialize_taken_over`) takes its root's ownership — and every node's — from the
+replicated archive, which since format minor 2 (2026-09-15, amendment A-20) carries each node's owner and
+the root's own metadata; the takeover tests read both over the successor's NFS port and require the
+origin's values (`owners_over_nfs`, `crates/server/tests/fleet.rs`).
 
 ## Description
 

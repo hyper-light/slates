@@ -207,6 +207,15 @@ impl SnapshotArchiver {
       .map_err(|_| VfsError::StaleHandle)?;
     let root = snapshot.root;
     let pending = pending_of(volume, store, root)?;
+    // The root has no entry naming it in the tree, so its own metadata (mode, owner, times) rides
+    // the root frame to the archive's head (format minor 2).
+    let root_meta = meta_of(
+      volume,
+      store,
+      id,
+      store.dirs.get(root)?.inode,
+      MODE_DIRECTORY,
+    )?;
     let name_policy_id = match volume.policy {
       NameEquivalence::Exact => POLICY_EXACT,
       NameEquivalence::Fold => POLICY_FOLD,
@@ -221,7 +230,7 @@ impl SnapshotArchiver {
       frames: vec![Frame {
         dir: root,
         name: String::new(),
-        meta: NodeMeta::default(),
+        meta: root_meta,
         pending,
         built: Vec::new(),
       }],
@@ -304,7 +313,7 @@ impl SnapshotArchiver {
         });
         Ok(Step::Worked(cost))
       }
-      None => Ok(Step::Finished(self.finish(node))),
+      None => Ok(Step::Finished(self.finish(node, frame.meta))),
     }
   }
 
@@ -469,8 +478,9 @@ impl SnapshotArchiver {
     identity
   }
 
-  /// The finished archive: the header fields, the manifest and the chunks in walk order.
-  fn finish(&mut self, root: Node) -> Archive {
+  /// The finished archive: the header fields, the root's own metadata, the manifest and the chunks in
+  /// walk order.
+  fn finish(&mut self, root: Node, root_meta: NodeMeta) -> Archive {
     let chunk_size = u32::try_from(self.chunk_bytes).unwrap_or(u32::MAX);
     Archive {
       base_page_size: self.base_page_size,
@@ -482,6 +492,7 @@ impl SnapshotArchiver {
         | u64::from(self.snapshot.generation),
       name_policy_id: self.name_policy_id,
       unicode_version: UNICODE_VERSION_UNSPECIFIED,
+      root_meta,
       manifest: root,
       chunks: std::mem::take(&mut self.chunks),
     }
@@ -528,7 +539,8 @@ fn meta_of(
 
 /// Manifest metadata from a snapshot's attributes: the inode number (identity across renames), the
 /// permission bits under `type_bits`, the times as unsigned nanoseconds (a pre-epoch time clamps to
-/// zero), the size and link count. Extended attributes are not yet carried (owed with the xattr pass).
+/// zero), the size, the link count and the owner (uid, gid — format minor 2, so a clone or a takeover
+/// successor rebuilds ownership). Extended attributes are not yet carried (owed with the xattr pass).
 fn node_meta(no: InodeNo, attrs: &Attrs, type_bits: u32) -> NodeMeta {
   NodeMeta {
     ino: no.0,
@@ -538,6 +550,8 @@ fn node_meta(no: InodeNo, attrs: &Attrs, type_bits: u32) -> NodeMeta {
     size: attrs.size,
     nlink: attrs.nlink,
     xattr_flags: 0,
+    uid: attrs.uid,
+    gid: attrs.gid,
   }
 }
 
@@ -636,8 +650,25 @@ mod tests {
     volume.write(store, main, 0, &body).unwrap();
     volume.create_file(store, root, "empty", 0o600).unwrap();
     volume.symlink(store, root, "link", "src/main.rs").unwrap();
+    // Ownership travels too (format minor 2): a file owned by another user, and the root itself — which
+    // no entry names — given its own mode and owner.
+    volume.chown(store, main, MAIN_UID, MAIN_GID).unwrap();
+    let root_no = volume.root_inode(store).unwrap();
+    volume.chmod(store, root_no, ROOT_MODE).unwrap();
+    volume.chown(store, root_no, ROOT_UID, ROOT_GID).unwrap();
     body
   }
+
+  /// Shape: the owner [`populate`] gives `src/main.rs`, any uid and gid other than a fresh inode's `0:0`.
+  const MAIN_UID: u32 = 1234;
+  /// Shape: see [`MAIN_UID`].
+  const MAIN_GID: u32 = 4321;
+  /// Shape: the mode [`populate`] gives the root, not the `0755` a fresh volume's root has.
+  const ROOT_MODE: u32 = 0o750;
+  /// Shape: the owner [`populate`] gives the root.
+  const ROOT_UID: u32 = 1000;
+  /// Shape: see [`ROOT_UID`].
+  const ROOT_GID: u32 = 2000;
 
   /// AC-7.3 / §4.10: an export restores byte-identical — every file's bytes, the directories, the
   /// symlink (as a file under the link type bits) and each entry's mode round-trip through the
@@ -686,6 +717,30 @@ mod tests {
       }
     }
     assert_eq!(meta("src/main.rs").size, u64::try_from(body.len()).unwrap());
+    assert_restored_ownership(restored);
+  }
+
+  /// The ownership half of [`assert_restored_tree`] (format minor 2): the chowned file's owner, the
+  /// untouched entries' `0:0`, and the root's own mode and owner, which no entry names and the archive's
+  /// head carries.
+  fn assert_restored_ownership(restored: &slates_archive::Restored) {
+    let meta = |path: &str| restored.metadata.get(path).copied().unwrap();
+    assert_eq!(
+      (meta("src/main.rs").uid, meta("src/main.rs").gid),
+      (MAIN_UID, MAIN_GID),
+      "a chowned file's owner travels"
+    );
+    assert_eq!((meta("empty").uid, meta("empty").gid), (0, 0));
+    assert_eq!(kind_of_mode(restored.root.mode), Some(Kind::Dir));
+    assert_eq!(
+      (
+        permissions_of_mode(restored.root.mode),
+        restored.root.uid,
+        restored.root.gid
+      ),
+      (ROOT_MODE, ROOT_UID, ROOT_GID),
+      "the root's own mode and owner travel at the archive's head"
+    );
   }
 
   /// D-17 determinism gate: the same snapshot exports to the same archive bytes and manifest identity

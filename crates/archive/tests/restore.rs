@@ -39,6 +39,7 @@ fn archive_of(files: &[(&str, Vec<u8>)]) -> Archive {
     snapshot_id: 1,
     name_policy_id: 1,
     unicode_version: 15,
+    root_meta: NodeMeta::default(),
     manifest: Node::Directory(entries),
     chunks,
   }
@@ -66,6 +67,7 @@ fn a_hole_restores_as_zeros() {
     snapshot_id: 1,
     name_policy_id: 1,
     unicode_version: 15,
+    root_meta: NodeMeta::default(),
     manifest: Node::Directory(vec![Entry {
       name: "sparse".to_owned(),
       meta: NodeMeta::default(),
@@ -114,6 +116,7 @@ fn a_multi_extent_file_concatenates_its_chunks() {
     snapshot_id: 1,
     name_policy_id: 1,
     unicode_version: 15,
+    root_meta: NodeMeta::default(),
     manifest,
     chunks: vec![first, second],
   };
@@ -148,6 +151,7 @@ fn a_tree_restores_files_and_directories() {
     snapshot_id: 1,
     name_policy_id: 1,
     unicode_version: 15,
+    root_meta: NodeMeta::default(),
     manifest,
     chunks: vec![lib],
   };
@@ -181,6 +185,7 @@ fn a_missing_chunk_is_refused() {
     snapshot_id: 1,
     name_policy_id: 1,
     unicode_version: 15,
+    root_meta: NodeMeta::default(),
     manifest,
     chunks: Vec::new(),
   };
@@ -223,6 +228,7 @@ fn restore_decodes_compressed_chunks() {
     snapshot_id: 1,
     name_policy_id: 1,
     unicode_version: 15,
+    root_meta: NodeMeta::default(),
     manifest,
     chunks: vec![chunk],
   };
@@ -242,6 +248,8 @@ fn restore_surfaces_node_metadata() {
     size: 2,
     nlink: 1,
     xattr_flags: 0,
+    uid: 1234,
+    gid: 4321,
   };
   let manifest = Node::Directory(vec![Entry {
     name: "secret".to_owned(),
@@ -262,6 +270,7 @@ fn restore_surfaces_node_metadata() {
     snapshot_id: 1,
     name_policy_id: 1,
     unicode_version: 15,
+    root_meta: NodeMeta::default(),
     manifest,
     chunks: vec![chunk],
   };
@@ -275,4 +284,31 @@ fn restore_surfaces_node_metadata() {
     Some(&meta),
     "metadata survives the stream"
   );
+}
+
+/// Format minor 2: the root directory's own metadata (mode, owner, times) comes back from a restore,
+/// through the archive's byte stream, so a clone or a takeover successor rebuilds the root as the origin
+/// held it — the entries name every node but the root.
+#[test]
+fn the_roots_metadata_is_restored_through_the_byte_stream() {
+  let mut archive = archive_of(&[("f", b"x".to_vec())]);
+  archive.root_meta = NodeMeta {
+    ino: 1,
+    mode: 0o750,
+    mtime_ns: 11,
+    ctime_ns: 12,
+    size: 0,
+    nlink: 2,
+    xattr_flags: 0,
+    uid: 1000,
+    gid: 2000,
+  };
+  let decoded = Archive::decode(&archive.encode()).expect("the archive decodes");
+  assert_eq!(decoded.root_meta, archive.root_meta);
+  let restored = restore(&decoded).expect("restores");
+  assert_eq!(
+    restored.root, archive.root_meta,
+    "the root's metadata is restored"
+  );
+  assert_eq!(restored.files.get("f"), Some(&b"x".to_vec()));
 }

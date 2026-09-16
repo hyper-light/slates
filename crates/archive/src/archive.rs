@@ -22,7 +22,7 @@ use crate::format::{
   ArchiveError, Chunk, Encoding, FORMAT_MAJOR, FORMAT_MINOR, MAGIC, SEEK_TABLE_MAGIC,
   TRAILER_MAGIC, flag,
 };
-use crate::manifest::Node;
+use crate::manifest::{self, Node, NodeMeta};
 use crate::wire::{Reader, Writer};
 
 /// Format: the header is a fixed set of little-endian fields (major 1 has no variable-length
@@ -76,6 +76,9 @@ pub struct Archive {
   pub name_policy_id: u32,
   /// The Unicode version the policy used.
   pub unicode_version: u32,
+  /// The root directory's own metadata (its mode, owner, times): the tree's entries name every
+  /// node but the root (format minor 2).
+  pub root_meta: NodeMeta,
   /// The manifest tree (the snapshot's canonical, Merkle-hashed directory tree).
   pub manifest: Node,
   /// The chunks, in manifest order.
@@ -214,8 +217,9 @@ impl Archive {
   /// Encodes the archive to its byte stream. Deterministic: the same snapshot yields the same
   /// bytes on every platform (the identity gate).
   pub fn encode(&self) -> Vec<u8> {
-    let manifest_bytes = self.manifest.encode();
-    let manifest_hash = self.manifest.identity();
+    let mut manifest_bytes = manifest::encode_root_meta(&self.root_meta);
+    manifest_bytes.extend_from_slice(&self.manifest.encode());
+    let manifest_hash = self.manifest_identity();
     let raw_bytes: u64 = self.chunks.iter().map(|chunk| chunk.raw_len).sum();
     let stored_bytes: u64 = self.chunks.iter().map(|chunk| chunk.stored_len).sum();
 
@@ -299,8 +303,10 @@ impl Archive {
     let mut manifest_reader = Reader::at(bytes, sections.manifest_offset)?;
     let manifest_len = usize::try_from(manifest_reader.u64()?).unwrap_or(usize::MAX);
     let manifest_bytes = manifest_reader.raw(manifest_len)?;
-    let manifest = Node::decode(manifest_bytes).map_err(|_| ArchiveError::ManifestHashMismatch)?;
-    if manifest.identity() != header.manifest_hash {
+    let (root_meta, tree_bytes) =
+      manifest::decode_root_meta(manifest_bytes).map_err(|_| ArchiveError::ManifestHashMismatch)?;
+    let manifest = Node::decode(tree_bytes).map_err(|_| ArchiveError::ManifestHashMismatch)?;
+    if manifest::manifest_identity(&root_meta, &manifest) != header.manifest_hash {
       return Err(ArchiveError::ManifestHashMismatch);
     }
 
@@ -319,9 +325,16 @@ impl Archive {
       snapshot_id: header.snapshot_id,
       name_policy_id: header.name_policy_id,
       unicode_version: header.unicode_version,
+      root_meta,
       manifest,
       chunks,
     })
+  }
+
+  /// The identity the header pins for the manifest: the root's own metadata and the tree's Merkle
+  /// identity together ([`manifest::manifest_identity`]).
+  pub fn manifest_identity(&self) -> [u8; 32] {
+    manifest::manifest_identity(&self.root_meta, &self.manifest)
   }
 
   /// Reads one chunk by identity using the seek table, verifying its payload, without scanning the

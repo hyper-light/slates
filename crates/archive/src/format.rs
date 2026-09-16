@@ -21,8 +21,12 @@ pub const FORMAT_MAJOR: u16 = 1;
 
 /// Format: the format minor version. A reader accepts a newer minor of a known major, ignoring
 /// optional sections it does not know. Minor 1 added per-entry node metadata to the manifest
-/// (`manifest::NodeMeta`), which changes a tree's Merkle identity.
-pub const FORMAT_MINOR: u16 = 1;
+/// (`manifest::NodeMeta`), which changes a tree's Merkle identity. Minor 2 (2026-09-15) appended
+/// the owner (`uid`, `gid`) to that metadata and put the root directory's own metadata at the head
+/// of the manifest section, both covered by the header's manifest identity — so a clone or a
+/// takeover successor rebuilds ownership, not only modes and times. As with minor 1, the manifest
+/// of an older minor is not decoded: archives live in RAM within one fleet release.
+pub const FORMAT_MINOR: u16 = 2;
 
 /// Format: header flags. Bit 0 the manifest is compressed; bit 1 dictionaries are present; bit 2
 /// a seek table is present.

@@ -193,6 +193,8 @@ fn meta(mode: u32) -> NodeMeta {
     size: 100,
     nlink: 1,
     xattr_flags: 0,
+    uid: 501,
+    gid: 20,
   }
 }
 
@@ -242,7 +244,9 @@ fn metadata_changes_the_identity() {
 
 /// Golden vector: the sample tree hashes to a pinned Merkle root, so any change to the node
 /// encoding (including the per-node metadata) is caught across versions, not only within a run.
-/// Regenerate deliberately on a format change (the archive minor version tracks it).
+/// Regenerate deliberately on a format change (the archive minor version tracks it): minor 1 pinned
+/// `1a1634ff…`; minor 2 (2026-09-15, the owner appended to every node's metadata) pins the value
+/// below.
 #[test]
 fn the_manifest_identity_matches_its_golden_vector() {
   let hex: String = sample()
@@ -251,7 +255,66 @@ fn the_manifest_identity_matches_its_golden_vector() {
     .map(|b| format!("{b:02x}"))
     .collect();
   assert_eq!(
-    hex, "1a1634ffea3c563d1fe178b6495b5f17f12068db83944c5374ba9a72633b10d6",
+    hex, "34bfced9beaa46be0aa04514dc8b0d341ab98d229fde3ff80a62ff9fc60b27ef",
     "the manifest identity changed; regenerate the golden vector only for a deliberate format change"
+  );
+}
+
+/// Format minor 2: an entry's owner round-trips through the canonical encoding and, like every other
+/// metadata field, changes the tree's Merkle identity — a chown is a change the archive's
+/// self-verification sees.
+#[test]
+fn an_entrys_owner_round_trips_and_changes_the_identity() {
+  let owned = NodeMeta {
+    uid: 1234,
+    gid: 4321,
+    ..meta(0o644)
+  };
+  let tree = one_file_with_meta(owned);
+  let decoded = Node::decode(&tree.encode()).expect("decodes");
+  let Node::Directory(entries) = &decoded else {
+    panic!("expected a directory");
+  };
+  assert_eq!(entries[0].meta, owned, "the owner survives the round trip");
+  assert_ne!(
+    tree.identity(),
+    one_file_with_meta(meta(0o644)).identity(),
+    "another owner is another identity"
+  );
+}
+
+/// Format minor 2: the root directory's own metadata rides ahead of the tree and is covered by the
+/// manifest identity the header pins — so a root chown changes the archive's identity while the tree's
+/// Merkle root, which names no root, stays the same.
+#[test]
+fn the_roots_own_metadata_round_trips_and_is_in_the_manifest_identity() {
+  use slates_archive::manifest::{decode_root_meta, encode_root_meta, manifest_identity};
+  let root = NodeMeta {
+    mode: 0o750,
+    uid: 1000,
+    gid: 2000,
+    ..meta(0o750)
+  };
+  let tree = sample();
+  let mut section = encode_root_meta(&root);
+  section.extend_from_slice(&tree.encode());
+  let (decoded_root, tree_bytes) = decode_root_meta(&section).expect("the root's metadata decodes");
+  assert_eq!(decoded_root, root);
+  assert_eq!(
+    Node::decode(tree_bytes)
+      .expect("the tree follows")
+      .identity(),
+    tree.identity()
+  );
+  let other_root = NodeMeta { uid: 1001, ..root };
+  assert_ne!(
+    manifest_identity(&root, &tree),
+    manifest_identity(&other_root, &tree),
+    "the root's owner is part of the manifest identity"
+  );
+  assert_eq!(
+    decode_root_meta(&section[..8]),
+    Err(ManifestError::Truncated),
+    "a truncated root record is refused, typed"
   );
 }

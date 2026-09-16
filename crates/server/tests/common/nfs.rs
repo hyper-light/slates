@@ -83,6 +83,17 @@ pub(crate) fn lookup(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32
   read_opaque(&reply, 4).0
 }
 
+/// NFS GETATTR of `fh` → its `(mode, uid, gid)` — what `stat` shows through a kernel mount, and what a
+/// takeover successor must reproduce for the dead owner's tree (fattr3: type, mode, nlink, uid, gid, …).
+pub(crate) fn owner_and_mode(stream: &mut TcpStream, fh: &[u8], xid: u32) -> (u32, u32, u32) {
+  let mut args = Vec::new();
+  opaque(fh, &mut args);
+  let reply = call(stream, NFS_PROGRAM, 1, &args, xid);
+  assert_eq!(status(&reply), 0, "GETATTR");
+  let field = |at: usize| u32::from_be_bytes(reply[at..at + 4].try_into().unwrap());
+  (field(8), field(16), field(20))
+}
+
 /// NFS CREATE (UNCHECKED) `name` in `dir_fh` with mode 0644 → the new file's handle.
 pub(crate) fn create(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32) -> Vec<u8> {
   let mut args = Vec::new();

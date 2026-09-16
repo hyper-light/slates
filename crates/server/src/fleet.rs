@@ -100,8 +100,8 @@ use slates_db::register::{
   Quorum, Record, RegionId, RegisterError, candidates_for, encode_refusal,
 };
 use slates_rt::futures;
-use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 use slates_rt::udp::UdpSocket;
+use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 use slates_transport::demux::Demux;
 use slates_transport::endpoint::{Endpoint, EndpointError, MIN_DATAGRAM_BYTES};
 use slates_transport::handshake::Identity;
@@ -2117,7 +2117,7 @@ fn advance_seal(
   match archiver.advance(&slot.volume, &state.store, slice_bytes) {
     Ok(Progress::More) => false,
     Ok(Progress::Done(archive)) => {
-      job.manifest = Some(archive.manifest.identity());
+      job.manifest = Some(archive.manifest_identity());
       job.archive = Some(archive);
       job.archiver = None;
       true
@@ -2359,7 +2359,7 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
   let targets = hedge_targets(work.hedged, remote, hedge);
   let holders = take_sessions(|host| targets.contains(&host));
   let dispatched_ns = futures::now_ns();
-  let manifest = work.archive.manifest.identity();
+  let manifest = work.archive.manifest_identity();
   let (placement, latencies_ns, refilled, dispatch) = if holders.is_empty() {
     (None, Vec::new(), Vec::new(), None)
   } else {

@@ -904,6 +904,7 @@ impl MergeShardState {
       snapshot_id: 0,
       name_policy_id: 0,
       unicode_version: 0,
+      root_meta: NodeMeta::default(),
       manifest: Node::Directory(vec![Entry {
         name: INPUTS_ENTRY_NAME.to_owned(),
         meta: NodeMeta {

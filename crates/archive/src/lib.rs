@@ -1,6 +1,7 @@
 //! `slates-archive`: the archive format (D-17, §2.6 of `research/compression-archive-dedup.md`;
 //! Phase 7). An archive is one streamable, content-addressed, self-verifying byte sequence of a
-//! snapshot — a header, the chunk records in manifest order, the manifest tree, a seek table, and
+//! snapshot — a header, the chunk records in manifest order, the manifest tree (opened, from format
+//! minor 2, by the root directory's own metadata; every node's metadata carries its owner), a seek table, and
 //! a trailer. The same container is the replication and clone-from-archive format.
 //!
 //! Every chunk is addressed by the BLAKE3 of its bytes and verified against that identity before

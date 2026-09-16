@@ -673,6 +673,7 @@ plan schedules.
 ### D-17 Compression, dedup, hashing, archive: zstd (static contexts) and LZ4; per-class dictionaries trained from the volume's data; a boot-calibrated, online-updated cost model decides per chunk; BLAKE3 fixed in the format; the archive format of `research/compression-archive-dedup.md` §2.6 doubles as the replication and clone-from-archive format
 - Evidence: RFC 8878 and static allocation; lzbench curves; dictionary gains 2-5x on small records; Btrfs heuristic and OpenZFS early abort; whole-file dedup yield; BLAKE3 tree hashing [B; C; D; A as cited]. (`research/compression-archive-dedup.md`)
 - Lost: Brotli, xz, fixed "save 12.5%" rules (sector-rounding artefacts), SHA-256 (not fixed-cost across the matrix), CDC everywhere.
+- Amended (A-20, 2026-09-15): the manifest's per-node metadata carries the owner (uid, gid), and the root directory's own metadata (mode, owner, times) rides ahead of the tree in the manifest section — format minor 2, both covered by the header's manifest identity — so replication, clone-from-archive and a takeover successor's rebuild (`materialize_taken_over`) reproduce ownership, not only modes and times; under the NFS edge's POSIX access control a tree rebuilt as `0:0` would have shut its owner out (`docs/bugs/2026-09-14-volume-root-owned-by-root-wheel.md`).
 - Erasure coding: the format carries a fragment record kind from the first release: a chunk may be held as k data and m parity fragments (Reed-Solomon), each fragment with its own BLAKE3, the chunk's identity unchanged, so replication, archive and clone-from-archive all understand fragments from the first release; the policy that codes cold sealed content instead of replicating it is measured in Phase 8 (D-O6): the class boundary comes from measured read rates, the (k, m) from the failure-domain tree, and the reconstruction cost from the profile [A: Rashmi et al., EC-Cache, NSDI 2016; A: Muralidhar et al., f4, OSDI 2014; A: Huang et al., LRC, ATC 2012].
 
 ### D-18 Durability: explicit client, process, host and region boundaries
@@ -5065,3 +5066,24 @@ fleet,consensus,verbs,nfs}`, `ipc/protocol`, `cli/{args,verbs}`, and affected st
   `docs/bugs/2026-09-15-{consensus-recovery,unlisted-node-enrollment,overlay-recovery}.md`.
 - No model checker ran; the existing A-9 refinement gap remains open. No on-disk Raft state,
   automatic disaster reset or per-write consensus is introduced. Rules R1–R10 remain unchanged.
+
+### A-20 (2026-09-15) — The archive carries ownership: per-node owner and the root's own metadata (format minor 2)
+
+- D-17's archive format (`research/compression-archive-dedup.md` §2.6 item 4) listed a node's kind,
+  inode number, mode, times, size, link count and xattr flags, and named no node for the root. A
+  takeover successor rebuilt a taken-over volume from that archive with every node — the root
+  included — owned `0:0`, and once the NFS edge enforced POSIX access control (2026-09-15) that
+  shut the volume's owner out of their own taken-over volume.
+- The manifest's per-node metadata now carries the owner (`uid`, `gid`), and the root directory's
+  own metadata (mode, owner, times) rides ahead of the tree in the manifest section; the header's
+  manifest identity covers both, so a chown is a change the archive's self-verification sees. The
+  minor version is 2; as with minor 1, an older minor's manifest is not decoded (archives live in
+  RAM within one fleet release). `materialize_taken_over` restores every node's owner and times and
+  the root's mode, owner and times.
+- Evidence: the golden vector regenerated deliberately (`crates/archive/tests/manifest.rs`); the
+  archiver's export/restore round trip carries a chowned file and a chowned root
+  (`crates/vfs/src/export.rs`); the takeover tests read the root's and the file's owner over the
+  successor's NFS port and require the origin's values (`crates/server/tests/fleet.rs`).
+- Applied in the same change to: D-17, `research/compression-archive-dedup.md` §2.6, GAPS (Bridges
+  4.6 / §4.10), `docs/bugs/2026-09-14-volume-root-owned-by-root-wheel.md`, the archive, vfs,
+  cluster and server crates. Rules R1–R10 remain unchanged.
