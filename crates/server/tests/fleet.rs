@@ -1,4 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// These integration tests drive the daemon's NFS-loopback transport, the fleet's TCP
+// transport and rustix syscalls — all macOS/Linux; on Windows the daemon mounts through WinFsp and
+// the fleet transport is QUIC-over-UDP, so these particular tests are unix (as `virtiofs.rs` is).
+#![cfg(unix)]
 //! Daemons form a **live fleet** (§4.8 "Membership"; §2.6 boot step 6, R5). Each daemon is started with a
 //! `FleetTransport` naming its peers, and its control shard runs the membership loop: it dials each peer's
 //! advertised socket, accepts each peer on its own per-peer socket, probes over the transport each protocol

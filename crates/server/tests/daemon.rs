@@ -7,6 +7,10 @@
 //! acknowledgement releasing it.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// These integration tests drive the daemon's NFS-loopback transport, the fleet's TCP
+// transport and rustix syscalls — all macOS/Linux; on Windows the daemon mounts through WinFsp and
+// the fleet transport is QUIC-over-UDP, so these particular tests are unix (as `virtiofs.rs` is).
+#![cfg(unix)]
 
 use std::time::{Duration, Instant};
 
