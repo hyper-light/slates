@@ -182,6 +182,7 @@ pub(crate) fn run_workloads(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       status,
     });
   }
+  notes.extend(session.size_note.clone());
   drop(session);
   let ok = !tools
     .iter()

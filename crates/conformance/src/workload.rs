@@ -28,7 +28,11 @@ pub struct Workload {
 }
 
 /// The git workload: a repository with files, a directory, a symlink, a mode change and two
-/// commits; the tree hash proves byte-identical content and modes, `git status` must be clean.
+/// commits; the tree hash proves byte-identical content and modes, `git status` must be clean. The
+/// object count is compared, not `git count-objects`' kilobytes: those are `st_blocks`, the host
+/// filesystem's allocation unit (APFS rounds every loose object up to 4 KiB, the export reports the
+/// bytes held), a property of the filesystem under the repository, not of git (the CI macOS runner,
+/// 2026-09-16: "10 objects, 40 kilobytes" on the host, "10 objects, 5 kilobytes" on the mount).
 const GIT: &str = r#"
 git init -q .
 printf 'hello\n' > a.txt
@@ -46,7 +50,7 @@ git status --porcelain
 git log --format='%H %T %P'
 git ls-files -s
 git fsck --strict --no-progress
-git count-objects
+git count-objects -v | grep '^count:'
 "#;
 
 /// The cargo workload: a dependency-free crate built twice; the second build must report the

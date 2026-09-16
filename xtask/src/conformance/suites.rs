@@ -102,6 +102,7 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   if !verdict.ok {
     notes.push(format!("fsx output tail: {}", verdict.detail));
   }
+  notes.extend(session.size_note.clone());
   drop(session);
   Ok(SuiteResult {
     outcome: outcome_for(
@@ -162,6 +163,13 @@ pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   if !verdict.ok {
     notes.push(format!("fsstress output tail: {}", verdict.detail));
   }
+  if !alive {
+    notes.push(format!(
+      "the daemon stopped answering during the run; anchor log tail:\n{}",
+      session.anchor_log_tail()
+    ));
+  }
+  notes.extend(session.size_note.clone());
   drop(session);
   Ok(SuiteResult {
     outcome: outcome_for(
@@ -496,6 +504,14 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     }
     parsed.push(parse_file(&relative, &output, &runner));
   }
+  let alive = session.daemon_alive();
+  let daemon_note = (!alive).then(|| {
+    format!(
+      "the daemon stopped answering during the run; anchor log tail:\n{}",
+      session.anchor_log_tail()
+    )
+  });
+  let size_note = session.size_note.clone();
   drop(session);
   let tally = tally(&parsed);
   let (list, digest) = expected_list(run.root, run.transport, runner.privilege())?;
@@ -506,8 +522,10 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   for id in &judgement.listed_now_passing {
     println!("pjdfstest: listed but now passing {id}");
   }
-  let ok = judgement.acceptable() && tally.incomplete.is_empty() && timed_out.is_empty();
+  let ok = judgement.acceptable() && tally.incomplete.is_empty() && timed_out.is_empty() && alive;
   let mut notes = vec![tree.note, judgement.describe()];
+  notes.extend(daemon_note);
+  notes.extend(size_note);
   if tally.failed > 0 {
     notes.push(shape_note(&tally.cases));
   }

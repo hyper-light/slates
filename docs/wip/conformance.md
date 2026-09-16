@@ -123,7 +123,11 @@ will show whether its runs see sidecars. Harness gaps found and closed on the wa
 the transport: fsx's `-P` needs a relative file name; npm's timing line and `--install-links` made
 `npm ls` differ; the watcher's raw `events.txt` embeds the transport's event coalescing (the
 assertion is now that the creation was observed); and the harness itself had to `bootstrap root`
-before its first volume (the `ConsensusNotInitialized` refusal every fresh daemon gives).
+before its first volume (the `ConsensusNotInitialized` refusal every fresh daemon gives). The CI
+macOS runner's run of 2026-09-16 (no provenance tag there: every other tool identical) showed one
+more: git's `count-objects` kilobytes are `st_blocks`, the host filesystem's allocation unit (APFS
+rounds each loose object up to 4 KiB; the export reports the bytes held), so the roster compares
+git's object count and not the host's blocks.
 
 ### 3.4 pjdfstest — LIMITED (unprivileged): 2,429 passed, 2,220 failed, 4,037 needs-root
 
