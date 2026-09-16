@@ -151,6 +151,26 @@ pub(crate) fn refused(refusal: Refusal) -> ReplyBody {
   ReplyBody::Refused { refusal }
 }
 
+/// §4.14 / D-12: a daemon that refuses provisioning must say why residency cannot be established.
+/// The first byte-budget refusal in a process logs the store budget's whole breakdown once, so a
+/// `BudgetExceeded { available: 0 }` names whether the capacity collapsed or the operation headroom
+/// ate it — the evidence a boot profile does not carry, for the flaky macOS-runner refusal
+/// (2026-09-16). Counted once (a running daemon that is genuinely out of budget must not spam).
+fn report_first_budget_refusal(state: &crate::state::ShardState, requested: u64, available: u64) {
+  static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+  if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    return;
+  }
+  eprintln!(
+    "slates-server: volume byte-budget refused (first occurrence): requested={requested} \
+     available={available} store.budget[capacity={} committed={} retained={} headroom={}]",
+    state.store.budget.capacity(),
+    state.store.budget.committed(),
+    state.store.budget.retained(),
+    state.store.budget.headroom(),
+  );
+}
+
 /// What serving a request produced.
 pub enum Served {
   /// A reply for the client now.
@@ -2389,6 +2409,7 @@ fn create(
     SizeClass::Bounded { limit } => match state.store.budget.reserve(limit) {
       Ok(r) => Some(r),
       Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
+        report_first_budget_refusal(state, limit, available);
         return refused(Refusal::BudgetExceeded { available });
       }
       Err(e) => {
