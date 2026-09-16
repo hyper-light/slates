@@ -42,6 +42,11 @@
 #   field's move was a unique retag that invalidated the drivers' shared borrows under Stacked Borrows
 #   (Miri, the differential test); the `&'static` the drivers hold is derived from that pointer (1,
 #   the site the box version already had). 65 → 66.
+#   io_uring socket readiness (`uring.rs` `arm_poll`, 2026-09-16): one `unsafe` submission-queue push
+#   of a `PollAdd` SQE (no buffer; the fd is borrowed by number for the single submission), the same
+#   shape `arm_kick` already had. `register_readable`/`register_writable` were stubs returning
+#   `DriverRefused`, so async TCP and the UDP transport were dead the first time they awaited readiness
+#   on io_uring (docs/bugs/2026-09-16-io-uring-driver-carries-no-socket-readiness.md). 66 → 67.
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
 # slates-base (6): rustix marks kevent unsafe because the kernel fills the output list; one
@@ -130,7 +135,7 @@ slates-mem = 16
 # 2026-09-14 (−1, the KIND lane: the epoll one-shot re-arm — `docs/bugs/2026-09-14-epoll-readiness-re-add-eexist.md`):
 # the second `BorrowedFd::borrow_raw` of the readiness re-add is gone with the re-add itself (the
 # descriptor is re-armed with `EPOLL_CTL_MOD` through the one remaining borrow).
-slates-rt = 66
+slates-rt = 67
 slates-base = 6
 slates-vfs = 0
 slates-land = 3

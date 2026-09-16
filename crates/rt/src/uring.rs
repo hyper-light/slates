@@ -15,6 +15,13 @@ use crate::error::RtError;
 /// Format: the user word of the kick poll.
 const KICK_TAG: u64 = u64::MAX;
 
+/// Format: the poll mask for read readiness — a socket with data, or a listener with a connection to
+/// accept (`POLLIN`, io_uring `PollAdd`).
+const POLL_READABLE: u32 = libc::POLLIN as u32;
+/// Format: the poll mask for write readiness — a socket whose send buffer has space, or a connect
+/// that has completed (`POLLOUT`).
+const POLL_WRITABLE: u32 = libc::POLLOUT as u32;
+
 /// The driver.
 pub struct UringDriver {
   ring: IoUring,
@@ -106,6 +113,36 @@ impl UringDriver {
   /// The setup notes for the profile.
   pub fn notes(&self) -> &[String] {
     &self.notes
+  }
+
+  /// Arms a **one-shot** poll for `events` on `raw`, tagged with the waking task's `user_data`
+  /// (its waker word): when the fd becomes ready, the completion is delivered by [`Self::wait`] as a
+  /// `Completion { user_data }`, which the shard wakes the task by, so it re-polls its readiness
+  /// future and retries the non-blocking syscall (`readable`/`writable`, [`crate::readiness`]).
+  ///
+  /// One-shot, not multishot: the readiness future arms afresh on every await, and io_uring removes
+  /// a one-shot poll when it fires, so each await is an independent submission — no interest-list
+  /// dedup as epoll needs (which had to track ADD vs MOD, the `EEXIST` bug of 2026-09-14). This
+  /// closes the io_uring counterpart: `register_readable`/`register_writable` used to refuse, so an
+  /// async socket on this driver — the NFS-mount server's per-connection reads and writes (§4.6),
+  /// and any TCP on the runtime — died the first time it had to await readiness. Docker's default
+  /// seccomp blocks io_uring so CI fell back to epoll and never exercised this; a bare-metal or VM
+  /// Linux host with io_uring did (`docs/bugs/2026-09-16-io-uring-driver-carries-no-socket-readiness.md`).
+  fn arm_poll(&mut self, raw: i32, events: u32, user_data: u64) -> Result<(), RtError> {
+    let poll = opcode::PollAdd::new(Fd(raw), events)
+      .build()
+      .user_data(user_data);
+    // SAFETY: a poll entry carries no buffer, and the fd is borrowed by number for this one
+    // submission only (the caller owns it and awaits the completion before dropping it).
+    unsafe { self.ring.submission().push(&poll) }.map_err(|_| RtError::DriverRefused {
+      call: "sq push(poll readiness)",
+      code: None,
+    })?;
+    self.ring.submit().map_err(|e| RtError::DriverRefused {
+      call: "io_uring_enter(submit readiness)",
+      code: e.raw_os_error(),
+    })?;
+    Ok(())
   }
 
   fn arm_kick(&mut self) -> Result<(), RtError> {
@@ -214,22 +251,12 @@ impl Driver for UringDriver {
     Ok(())
   }
 
-  fn register_readable(&mut self, _raw: i32, _user_data: u64) -> Result<(), RtError> {
-    // Owed (§4.10a): this completion-native driver does not carry socket readiness yet; a
-    // typed refusal, never a silent drop. The readiness-native drivers (kqueue, epoll) do.
-    Err(RtError::DriverRefused {
-      call: "register_readable",
-      code: None,
-    })
+  fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
+    self.arm_poll(raw, POLL_READABLE, user_data)
   }
 
-  fn register_writable(&mut self, _raw: i32, _user_data: u64) -> Result<(), RtError> {
-    // Owed (§4.6): this completion-native driver does not carry socket write-readiness yet; a
-    // typed refusal, never a silent drop. The readiness-native drivers (kqueue, epoll) do.
-    Err(RtError::DriverRefused {
-      call: "register_writable",
-      code: None,
-    })
+  fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
+    self.arm_poll(raw, POLL_WRITABLE, user_data)
   }
 }
 
