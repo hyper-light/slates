@@ -1310,8 +1310,30 @@ impl Lane {
         }
       }
       if since.elapsed() > TAKEOVER_WAIT {
+        // Name why no survivor served, rather than only that none did: each survivor's `volume stat`
+        // refusal (a successor that never took over answers `NotFound`) and its daemon's counted
+        // refusals (`fleet.materialize` if `materialize_taken_over` refused — a budget or a malformed
+        // archive — so the next run reads the cause instead of a bare timeout).
+        let mut why = String::new();
+        for survivor in survivors {
+          let stat = self.verb(survivor, &["volume", "stat", id]);
+          let status = self.verb(survivor, &["status", id]);
+          why.push_str(&format!(
+            "\n  {survivor}: volume stat -> {}; status refusals -> {}",
+            stat.map_or_else(|e| e.0, |o| format!("exit {}: {}", o.code, o.stderr.trim())),
+            status.map_or_else(
+              |e| e.0,
+              |o| {
+                serde_json::from_str::<serde_json::Value>(&o.stdout)
+                  .ok()
+                  .and_then(|v| v.get("shards").cloned())
+                  .map_or_else(|| o.stderr.trim().to_owned(), |shards| shards.to_string())
+              }
+            )
+          ));
+        }
         return Err(Failure(format!(
-          "kind: no survivor served the volume within {TAKEOVER_WAIT:?} of the delete"
+          "kind: no survivor served the volume within {TAKEOVER_WAIT:?} of the delete:{why}"
         )));
       }
       pause(POLL_CLUSTER);

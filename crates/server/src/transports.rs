@@ -470,11 +470,16 @@ pub(crate) fn guest(
   }
 }
 
-/// Format: the OCI runtimes and the CLIs that drive one, in the order the report prefers them.
+/// Format: the OCI runtimes and the CLIs that drive one, in the order the report prefers them. Its
+/// only non-test consumer is the unix `PATH` probe (`probe_oci_runtime`); on Windows the probe is
+/// not built (the report says the `PATHEXT` probe is owed), so this and its classifier are compiled
+/// only where used — unix, or any test build (the pure classifier is unit-tested on every host).
+#[cfg(any(unix, test))]
 const OCI_RUNTIMES: [&str; 6] = ["runc", "crun", "youki", "docker", "podman", "nerdctl"];
 
 /// The first OCI runtime `command_exists` finds, in the preferred order. Pure over the injected
 /// predicate (the shape of `crates/cli/src/mount.rs::classify`), so every branch tests on every host.
+#[cfg(any(unix, test))]
 pub(crate) fn classify_oci_runtime(command_exists: impl Fn(&str) -> bool) -> OciRuntime {
   OCI_RUNTIMES
     .iter()
