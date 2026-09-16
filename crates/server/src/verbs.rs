@@ -174,8 +174,14 @@ fn report_first_budget_refusal(
   }
   eprintln!(
     "slates-server: {dimension} budget refuse-all (first occurrence): requested={requested} \
+     config[reserve_per_shard={} shards={} max_inodes={} max_chunks={} metadata_class={}] \
      bytes[capacity={} committed={} retained={} headroom={}] \
      versions[capacity={} committed={} retained={} headroom={}]",
+    state.config.reserve_per_shard,
+    state.config.runtime.shards,
+    state.config.store.max_inodes,
+    state.config.store.max_chunks,
+    state.config.store.metadata_class_bytes,
     state.store.budget.capacity(),
     state.store.budget.committed(),
     state.store.budget.retained(),
