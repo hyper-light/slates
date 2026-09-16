@@ -20,11 +20,13 @@
 //! (the daemon's and the client's ends), [`delivery`] (the harness delivery channel of a consumer's
 //! capability, §4.13: an inherited descriptor), [`error`].
 
-/// The client-side completion bridge for platforms whose rendezvous passes no completion fd (macOS
-/// and Windows): a thread that makes a client-local descriptor readable when an armed reply lands,
-/// for an async SDK event loop (§4.7, D-19) — a self-pipe on macOS, a loopback socket on Windows.
-/// Linux uses the rendezvous eventfd instead.
-#[cfg(any(target_os = "macos", windows))]
+/// The client-side completion bridge that gives an async SDK event loop a descriptor it can adopt as
+/// a stream (§4.7, D-19). macOS and Windows pass no completion fd (Mach and named sockets are refused,
+/// D-10), so a thread makes a client-local descriptor readable when an armed reply lands — a self-pipe
+/// on macOS, a loopback socket on Windows. Linux passes the rendezvous eventfd, which Python's asyncio
+/// polls directly with no bridge; the Linux arm exists only for an SDK that adopts the fd (Node's
+/// `net.Socket` refuses an eventfd), converting the eventfd's readability to a pollable self-pipe.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub mod completion;
 pub mod delivery;
 pub mod endpoint;

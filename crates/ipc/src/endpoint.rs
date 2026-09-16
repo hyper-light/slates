@@ -67,11 +67,13 @@ pub struct ClientEnd {
   /// has no completion channel yet. The fd is read-drained and the reply taken with [`Self::try_take`].
   #[cfg(unix)]
   completion: Option<OwnedFd>,
-  /// The macOS completion bridge (a self-pipe fed by a thread parking on the wake word), started on
-  /// demand by [`Self::enable_async_completion`]; `None` for a sync client and until the first async
-  /// use. macOS passes no shared completion fd (Mach and named sockets are refused, D-10), so the
-  /// async SDK polls this bridge's pipe; Linux uses [`Self::completion`] (the rendezvous eventfd).
-  #[cfg(target_os = "macos")]
+  /// The completion bridge (a self-pipe fed by a thread), started on demand for an SDK that adopts the
+  /// completion fd into a stream; `None` for a sync client and until the first such async use. On
+  /// macOS the thread parks on the wake word (macOS passes no shared completion fd, D-10) and both the
+  /// plain and dup async paths use it. On Linux it polls the rendezvous eventfd (`self.completion`):
+  /// Python's asyncio polls that eventfd directly and needs no bridge, so only the dup path (Node,
+  /// whose `net.Socket` refuses an eventfd) starts one, to convert the eventfd to a pollable pipe.
+  #[cfg(any(target_os = "macos", target_os = "linux"))]
   bridge: Option<crate::completion::CompletionBridge>,
   /// The Windows completion bridge (a loopback socket fed by a thread parking on the region's named
   /// Event), started on demand by [`Self::enable_async_completion`]; `None` for a sync client and
@@ -104,7 +106,7 @@ impl ClientEnd {
       replies: 0,
       #[cfg(unix)]
       completion: None,
-      #[cfg(target_os = "macos")]
+      #[cfg(any(target_os = "macos", target_os = "linux"))]
       bridge: None,
       #[cfg(windows)]
       bridge: None,
@@ -148,7 +150,9 @@ impl ClientEnd {
   /// drains it ([`Self::drain_completion`]), then takes the reply with [`Self::try_take`].
   #[cfg(unix)]
   pub fn completion_fd(&self) -> Option<RawFd> {
-    #[cfg(target_os = "macos")]
+    // Where a bridge was started (macOS always, Linux only for the fd-adopting dup path), it is the
+    // descriptor the loop polls; otherwise it is the raw completion fd (Linux's rendezvous eventfd).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(bridge) = &self.bridge {
       return Some(bridge.completion_fd());
     }
@@ -161,7 +165,9 @@ impl ClientEnd {
   /// no-op.
   #[cfg(unix)]
   pub fn drain_completion(&self) {
-    #[cfg(target_os = "macos")]
+    // A started bridge owns the descriptor the loop polls, so drain its pipe; otherwise drain the raw
+    // completion fd (Linux's eventfd, whose read resets its counter).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if let Some(bridge) = &self.bridge {
       bridge.drain();
       return;
@@ -200,17 +206,53 @@ impl ClientEnd {
   }
 
   /// Like [`Self::enable_async_completion`] but returns a **dup** the caller owns and must close — for
-  /// an SDK whose event loop closes the descriptor it polls (Node's `net.Socket` adopts and closes the
-  /// fd; `asyncio` only polls it, so it uses `enable_async_completion`). The dup and the client's own
-  /// fd refer to the same pipe/eventfd, so closing the dup leaves the client's intact — no double close.
+  /// an SDK whose event loop adopts and closes the descriptor it polls (Node's `net.Socket`; `asyncio`
+  /// only polls it, so it uses `enable_async_completion`). The dup and the client's own descriptor
+  /// refer to the same pipe, so closing the dup leaves the client's intact — no double close.
+  ///
+  /// On Linux this is also where the fd-adopting SDK diverges from the direct one: the rendezvous
+  /// eventfd is not adoptable as a Node stream (`net.Socket` refuses an eventfd, `ERR_INVALID_FD_TYPE`),
+  /// so this starts a [`crate::completion::CompletionBridge`] that converts the eventfd's readiness to
+  /// a pollable self-pipe and returns a dup of the pipe. The plain [`Self::enable_async_completion`]
+  /// still hands Python the raw eventfd, which its `asyncio` selector polls directly with no bridge.
   #[cfg(unix)]
   pub fn enable_async_completion_dup(&mut self) -> Result<RawFd, IpcError> {
     // Ensure the channel exists (starts the macOS bridge; Linux already holds the eventfd).
     self.enable_async_completion()?;
-    #[cfg(target_os = "macos")]
-    if let Some(bridge) = &self.bridge {
-      return Ok(bridge.dup_fd()?.into_raw_fd());
+    #[cfg(target_os = "linux")]
+    {
+      // Start the pipe bridge over a dup of the eventfd (the client keeps its own copy), then hand the
+      // caller a dup of the bridge's pipe read end — the descriptor Node's `net.Socket` can adopt.
+      if self.bridge.is_none() {
+        let eventfd = self.completion.as_ref().ok_or(IpcError::Unsupported {
+          feature: "async completion fd (the rendezvous passed no completion descriptor)",
+        })?;
+        let eventfd_dup = rustix::io::dup(eventfd).map_err(|error| IpcError::OsRefused {
+          call: "dup",
+          code: Some(error.raw_os_error()),
+        })?;
+        self.bridge = Some(crate::completion::CompletionBridge::start_from_eventfd(
+          eventfd_dup,
+        )?);
+      }
+      match &self.bridge {
+        Some(bridge) => Ok(bridge.dup_fd()?.into_raw_fd()),
+        None => Err(IpcError::Unsupported {
+          feature: "async completion fd (the completion bridge did not start)",
+        }),
+      }
     }
+    #[cfg(target_os = "macos")]
+    {
+      // The plain path already started the bridge; a dup of its pipe is the caller-owned descriptor.
+      match &self.bridge {
+        Some(bridge) => Ok(bridge.dup_fd()?.into_raw_fd()),
+        None => Err(IpcError::Unsupported {
+          feature: "async completion fd (the completion bridge did not start)",
+        }),
+      }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     match &self.completion {
       Some(fd) => Ok(
         rustix::io::dup(fd)
@@ -631,7 +673,7 @@ mod tests {
 
   /// Waits up to `timeout_ns` for `fd` to become readable without consuming it (a poll, not a read),
   /// so a test asserts readiness and drains separately. `true` if readable within the budget.
-  #[cfg(target_os = "macos")]
+  #[cfg(any(target_os = "macos", target_os = "linux"))]
   fn poll_readable(fd: RawFd, timeout_ns: u64) -> bool {
     use rustix::event::{PollFd, PollFlags, Timespec};
     // SAFETY: `fd` is the client's live completion fd, borrowed for one poll within the test.
@@ -691,6 +733,78 @@ mod tests {
     assert_eq!(reply.payload, b"two");
 
     // Clean shutdown: dropping the client joins the bridge thread; returning proves no hang.
+    drop(client);
+  }
+
+  /// On Linux the descriptor an fd-adopting SDK receives (`enable_async_completion_dup`) is a **pipe**
+  /// fed by a bridge over the completion eventfd, not the eventfd itself — Node's `net.Socket` refuses
+  /// an eventfd (`ERR_INVALID_FD_TYPE`, the bug of 2026-09-16), but adopts a pipe. Python's plain path
+  /// keeps the raw eventfd. Do: give the client a real completion eventfd, take the dup; reply to a
+  /// disarmed client (fast path) then an armed one (slow path). Expect: the dup is a FIFO (a pipe),
+  /// stays quiet for the fast-path reply, becomes readable for the armed one, both replies wait in the
+  /// ring, and dropping the client joins the bridge thread (the test returns rather than hanging).
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn the_linux_completion_dup_is_a_pollable_pipe_fed_by_the_eventfd() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    use rustix::event::{EventfdFlags, eventfd};
+    use rustix::fs::{FileType, fstat};
+
+    let region = ClientRegion::create("slates-endpoint-linux-bridge", 7, 0, geometry()).unwrap();
+    let (handoff, len) = region.handoff().unwrap();
+    let client_region = ClientRegion::open(&handoff, len).unwrap();
+    let mut daemon = DaemonEnd::new(region);
+    let mut client = ClientEnd::new(client_region);
+
+    // A real completion eventfd, the Linux primitive the rendezvous hands over: the daemon nudges a
+    // dup, the client holds the original. The daemon writes it only for a parked client.
+    let eventfd = eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap();
+    let daemon_fd = rustix::io::dup(&eventfd).unwrap();
+    daemon.set_completion(Some(daemon_fd));
+    client.set_completion(eventfd);
+
+    // The descriptor an fd-adopting SDK is handed: own it so the test closes it (net.Socket would).
+    // SAFETY: `enable_async_completion_dup` just returned this live dup fd; own it for the test.
+    let dup = unsafe { OwnedFd::from_raw_fd(client.enable_async_completion_dup().unwrap()) };
+    let poll_fd = dup.as_raw_fd();
+    assert_eq!(
+      FileType::from_raw_mode(fstat(&dup).unwrap().st_mode),
+      FileType::Fifo,
+      "the dup is a pipe (adoptable by Node's net.Socket), not the eventfd it refuses"
+    );
+
+    // Fast path: the client is not armed, so the daemon nudges nothing and the bridge stays quiet —
+    // the async fast path never wakes the event loop (§4.7).
+    client.send(&Slot::inline(1, b"hi").unwrap()).unwrap();
+    let request = daemon.try_take().unwrap().unwrap();
+    daemon
+      .reply(&Slot::inline(request.request, b"one").unwrap())
+      .unwrap();
+    assert!(
+      !poll_readable(poll_fd, 100_000_000),
+      "a disarmed (fast-path) reply does not wake the event loop"
+    );
+    assert_eq!(client.try_take().unwrap().unwrap().payload, b"one");
+
+    // Slow path: the client arms before it would yield, so the daemon nudges the eventfd and the
+    // bridge makes the pipe readable for the loop.
+    client.arm_async().unwrap();
+    client.send(&Slot::inline(2, b"hi").unwrap()).unwrap();
+    let request = daemon.try_take().unwrap().unwrap();
+    daemon
+      .reply(&Slot::inline(request.request, b"two").unwrap())
+      .unwrap();
+    assert!(
+      poll_readable(poll_fd, 2_000_000_000),
+      "an armed (slow-path) reply makes the completion pipe readable"
+    );
+    client.drain_completion();
+    client.disarm_async().unwrap();
+    assert_eq!(client.try_take().unwrap().unwrap().payload, b"two");
+
+    // Clean shutdown: dropping the client joins the bridge thread; returning proves no hang.
+    drop(dup);
     drop(client);
   }
 }

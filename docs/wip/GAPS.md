@@ -562,7 +562,14 @@ fd it wraps (unlike `asyncio`, which only polls it), so the addon hands it a **d
 (`ClientEnd::enable_async_completion_dup`, a safe dup of the bridge's owned read end) — the client's
 own fd is untouched, no double close. Proven by use on this macOS host
 (`crates/sdk-node/tests/sdk_async.test.mjs`, over a live daemon): the awaited create → snapshot →
-status lifecycle and eight `Promise.all`-ed creates, each a distinct id. The **full volume lifecycle
+status lifecycle and eight `Promise.all`-ed creates, each a distinct id. On Linux the completion fd
+the rendezvous passes is the shared eventfd, which Python's asyncio polls directly but Node's
+`net.Socket` cannot adopt (`ERR_INVALID_FD_TYPE`: libuv classifies an eventfd as `UV_UNKNOWN_HANDLE`),
+so `enable_async_completion_dup` on Linux starts a completion bridge that converts the eventfd's
+readiness to a pollable self-pipe (`completion.rs`'s Linux arm) — the plain path keeps handing Python
+the raw eventfd — closing the one platform where the Node async lane was dead, now proven over a live
+daemon under io_uring (`docs/bugs/2026-09-16-node-async-sdk-cannot-poll-the-linux-completion-eventfd.md`).
+The **full volume lifecycle
 is now async in both SDKs** — create/snapshot/status/**list/resize/destroy** — proven by use to the
 same shape as the sync suite (create → snapshot → status → list → resize → destroy → list-gone, then
 the concurrent creates); the unit verbs (resize/destroy) carry a `bool` "done" sentinel through the
