@@ -1192,7 +1192,12 @@ cannot yet make rolling scale safe by waiting between replacements.
 
 The separate rejoin task reproduced the retirement/session race and added an in-process correction;
 a new-IP KIND run remains unproved here. AUD-07 now covers fresh-member voting safety; complete
-Raft retention across warm restarts remains owed. No mount or pod was run.
+Raft retention across warm restarts remains owed. No mount or pod was run. The rejoin design's three
+further hardenings landed 2026-09-16 (`docs/bugs/2026-09-14-retirement-closes-the-same-id-restarts-serve-session.md`,
+sibling sweep): a terminal transport fault on the probe session is `ProbeOutcome::Broken` and releases
+the session (`fleet.probe.broken`), a dial still in its handshake is dropped at its peer's retirement
+(`fleet.dial.stale_dropped`; proven by the retire-mid-dial, return-at-new-addresses test), and the
+restart test asserts the returned node does not serve its predecessor's volume while the successor does.
 
 
 Separate workspace work advanced HEAD through archive commit `540fb5b` and ledger fix

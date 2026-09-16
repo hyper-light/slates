@@ -1409,6 +1409,12 @@ fn a_restarted_peer_is_learned_on_contact_under_its_fresh_identity() {
   let observed: Vec<&Daemon> = vec![&fleet.survivors[0], &fleet.survivors[1], &daemon_b_again];
   let learned = observe_learned(&observed, &fleet, &daemon_b_again);
   let served_by = successor_serves(&observed, &fleet);
+  // Rejoin design item 4 (2026-09-14): the returned node is a fresh member that holds nothing (R1: its
+  // RAM is gone), so it must not serve — or claim — the volume its predecessor owned; the completed
+  // takeover is undisturbed by the rejoin. Read once the successor serves, so the two views are
+  // contemporaneous.
+  let returned_serves_it =
+    served_by.served && status_answers_once(&fleet.instance_b_again, fleet.id);
 
   let (formed, knew_old) = (fleet.formed, fleet.knew_old);
   daemon_b_again.stop();
@@ -1418,6 +1424,19 @@ fn a_restarted_peer_is_learned_on_contact_under_its_fresh_identity() {
   drop(segment);
   assert_restart_learned(formed, knew_old, &learned);
   assert_successor_served(&served_by, &fleet.origin_owners);
+  assert!(
+    !returned_serves_it,
+    "the restarted node holds nothing and does not serve its predecessor's volume — the takeover stands"
+  );
+}
+
+/// Whether `status` for `volume` at `instance` answers with a report right now (one call, no polling).
+fn status_answers_once(instance: &str, volume: VolumeId) -> bool {
+  let mut client = Client::connect(instance);
+  matches!(
+    client.call(&RequestBody::Status { volume }),
+    ReplyBody::Status { .. }
+  )
 }
 
 /// The membership half of the restart scenario's verdict: the pre-restart facts and what the survivors
@@ -6185,3 +6204,85 @@ fn an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum() {
   );
 }
 
+/// Rejoin design item 3 (2026-09-14; `docs/bugs/2026-09-14-retirement-closes-the-same-id-restarts-serve-session.md`):
+/// a dial still in its handshake when its peer is retired is dropped with the probe session, so the
+/// peer's return is dialed **afresh** — at the address discovery holds for it by then, as a rescheduled
+/// pod's new IP is — instead of the pending flight being driven through the remaining handshake budgets
+/// at the stale address first. A starts with B named at addresses nobody serves, so its dial to B pends;
+/// B's death is injected (what a third node's gossip carries on a lane) and A retires B — the pending
+/// dial must be dropped, and is counted (`fleet.dial.stale_dropped`), the non-vacuity of this test; then
+/// B starts at **other** addresses under its certificate and announces them, and A must mesh to it under
+/// its fresh id. Whether A's first dial after the resume already finds the announced address or still
+/// the manifest's depends on which of B's first two exchanges lands first, so the re-dial count is not
+/// asserted; the drop is what the fix adds, and the mesh is what it must not break.
+#[test]
+fn a_retired_peers_pending_dial_is_dropped_and_its_return_at_new_addresses_is_meshed() {
+  let _serial = serialize_fleet_tests();
+  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let [pb_probe_again, pb_record_again, _, _] = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let mut b_identities = same_identity(2).into_iter();
+  let (Some(b_first), Some(b_again_identity)) = (b_identities.next(), b_identities.next()) else {
+    panic!("B's identity twice");
+  };
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b_first.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let b_seed = b.host;
+  let daemon_a = start(a, peer_of_a);
+  // Nothing serves B's manifest addresses: A's dial to B stays in its handshake. B's death arrives
+  // (injected) and A retires it — with the pending dial.
+  assert!(
+    daemon_a.observe_peer_dead(b_seed, FALSE_DEATH_INCARNATION),
+    "the injected death reached A's control shard and folded within the observe budget"
+  );
+  let dropped = poll_until(&[&daemon_a], RETIREMENT_DEADLINE, || {
+    refusal_count(&daemon_a, STALE_DIAL_DROPPED) >= 1
+  });
+  // B returns at other addresses (the same certificate, a fresh member id) and dials A, announcing
+  // its addresses over the record plane; A must mesh to it there.
+  let b_again = Node {
+    identity: b_again_identity,
+    address: loopback(pb_probe_again),
+    record_address: loopback(pb_record_again),
+    ..b
+  };
+  let daemon_b = start(b_again, peer_of_b);
+  let b_new = daemon_b
+    .member_identity()
+    .expect("the returned B has its fresh member id");
+  let meshed = poll_until(&[&daemon_a, &daemon_b], REJOIN_DEADLINE, || {
+    daemon_a
+      .fleet_members()
+      .is_some_and(|members| members.contains(&b_new))
+      && daemon_a.fleet_meshed() == Some(true)
+      && daemon_b.fleet_meshed() == Some(true)
+  });
+  let stale_dropped = refusal_count(&daemon_a, STALE_DIAL_DROPPED);
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    dropped,
+    "A dropped its pending dial to B when it retired B (counted {stale_dropped} × {STALE_DIAL_DROPPED})"
+  );
+  assert!(
+    meshed,
+    "A meshed to B's return at its new addresses under B's fresh member id"
+  );
+}
+
+/// The refusal key A counts when it drops a dial still in its handshake at its peer's retirement
+/// (`fleet::DIAL_STALE_DROPPED`), under the keys `Daemon::fleet_refusals` reports.
+const STALE_DIAL_DROPPED: &str = "fleet.dial.stale_dropped";

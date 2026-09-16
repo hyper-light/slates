@@ -1245,6 +1245,15 @@ async fn probe_and_apply(
       timing.missed();
       returned
     }
+    Ok((_, ProbeOutcome::Broken)) => {
+      // The session cannot carry another exchange (closed, or the socket refused): a miss for the
+      // detector, and the session released — `None` here makes the next period's `establish_session`
+      // dial afresh through `client_for`, re-resolving the peer's address — rather than re-probing a
+      // dead session every period until the suspicion window retires the peer (rejoin design item 2).
+      count_refusal(PROBE_BROKEN);
+      timing.missed();
+      None
+    }
     Err(_) => None,
   }
 }
@@ -1360,7 +1369,12 @@ async fn probe_peer(
   loop {
     follow_current_id(&mut detector, &mut peer, &mut probe_timing, origin, &shards);
     // Idle while this peer is retired; on the resume, the detector is realigned to the re-admitted belief.
+    // A retirement this task learns here — the shard's membership already says so, from another task's
+    // fold or an injected death — releases the probe session and any pending dial exactly as one its
+    // own fold finds below does; before, a task that went idle this way kept both, so the resume re-used
+    // a session to a process that was gone and drove a dial at an address the peer had left.
     if !resume_if_in_mesh(&mut detector, peer.host, &mut was_idle) {
+      release_probe_session(peer.host, &mut session, &mut client, &mut recorded_mesh);
       futures::sleep(HEARTBEAT_NS).await;
       continue;
     }
@@ -1413,12 +1427,33 @@ async fn probe_peer(
       // restart then aged each other out into a circular wait, both `fleet_meshed` vacuously
       // (`docs/bugs/2026-09-14-retirement-closes-the-same-id-restarts-serve-session.md`). A peer that never
       // returns holds one idle serve slot per plane, bounded by the roster (banned item 8 holds).
-      state::with_state(|s| s.formed_probe_peers.remove(&peer.host));
-      session = None;
-      recorded_mesh = false;
+      release_probe_session(peer.host, &mut session, &mut client, &mut recorded_mesh);
     }
     // The next probe waits one beat at full health, more as this node's own probes fail (Lifeguard).
     futures::sleep(probe_period_ns(detector.health_multiplier())).await;
+  }
+}
+
+/// What a probe task lets go of when its peer is retired, whichever path told it — its own fold at the
+/// bottom of a cycle or the shard's membership at the top: the direct mesh record, this node's
+/// **outgoing** probe session (the peer's incoming ones are the serve tasks' and the demultiplexer's,
+/// see [`probe_peer`]), and a dial still in its handshake (rejoin design item 3): that dial's socket
+/// points at the address the peer had, and driving its pending flight through the remaining handshake
+/// budgets after the peer returns would spend them on a stale address (a rescheduled pod's old IP)
+/// before `client_for` re-resolves; dropped now, the resume dials afresh — the discovered or resolved
+/// address — on its first period. The drop of a pending dial is counted (`fleet.dial.stale_dropped`),
+/// so the test that retires a peer mid-dial can see the pending dial was there.
+fn release_probe_session(
+  peer_host: HostId,
+  session: &mut Option<Endpoint>,
+  client: &mut Option<Endpoint>,
+  recorded_mesh: &mut bool,
+) {
+  state::with_state(|s| s.formed_probe_peers.remove(&peer_host));
+  *session = None;
+  *recorded_mesh = false;
+  if client.take().is_some() {
+    count_refusal(DIAL_STALE_DROPPED);
   }
 }
 
@@ -2652,6 +2687,12 @@ const SERVE_REFUSED: &str = "fleet.serve";
 /// `A` record, a malformed reply, the runtime refusing the socket: the dial is skipped this period and made
 /// again the next, so a count that keeps rising names a peer the fleet cannot reach by name and says why.
 /// Format: refusal names in the daemon's status report, alongside the verbs' refusal kinds.
+/// A probe session released on a terminal transport fault (`ProbeOutcome::Broken`): the next period
+/// dials afresh.
+const PROBE_BROKEN: &str = "fleet.probe.broken";
+/// A dial still in its handshake dropped at its peer's retirement, so the resume dials afresh at the
+/// peer's current address.
+const DIAL_STALE_DROPPED: &str = "fleet.dial.stale_dropped";
 const RESOLVE_REFUSED: &str = "fleet.resolve";
 const RESOLVE_NO_RESOLVER: &str = "fleet.resolve.no-resolver";
 const RESOLVE_TIMEOUT: &str = "fleet.resolve.timeout";

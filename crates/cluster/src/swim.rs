@@ -468,6 +468,14 @@ pub enum ProbeOutcome {
     /// (`detector.learn_coordinate`) so it can predict the RTT to the target thereafter.
     coordinate: NetworkCoordinate,
   },
+  /// The session cannot carry another exchange: the transport reported a terminal fault — the
+  /// demultiplexer closed the session (`EndpointError::Closed`: the peer established a new one, or this
+  /// end retired it) or the socket refused (`EndpointError::Io`). The endpoint is **released** (the
+  /// caller's session is `None` after this) so the next period dials afresh — re-resolving the peer's
+  /// address — instead of re-probing a dead session every period as a miss until the suspicion window
+  /// retires a peer that may be live. Counted as a miss for the detector all the same: no acknowledgement
+  /// came. (Ada's rejoin design, item 2, 2026-09-14.)
+  Broken,
   /// The deadline elapsed with no acknowledgement — a probe failure (the target may be down, or a packet
   /// lost). The caller does not acknowledge; the detector's next tick suspects, and the indirect probe or
   /// a later period clears or confirms it.
@@ -536,8 +544,9 @@ pub async fn probe_once(
     endpoint.abandon_exchange();
   }
 
-  // A reply counts only if it decodes as an acknowledgement echoing this probe's nonce; a request error, a
-  // wrong-nonce reply, or the deadline (`None`) is a probe failure — all keeping the endpoint.
+  // A reply counts only if it decodes as an acknowledgement echoing this probe's nonce; a wrong-nonce
+  // reply, a protocol fault on one packet, or the deadline (`None`) is a probe failure keeping the
+  // endpoint; a terminal transport fault releases it (`Broken`).
   let outcome = match received {
     Some(Ok(reply)) => match SwimMessage::decode(&reply) {
       Ok(SwimMessage::Ack {
@@ -555,9 +564,29 @@ pub async fn probe_once(
       },
       _ => ProbeOutcome::TimedOut,
     },
-    Some(Err(_)) | None => ProbeOutcome::TimedOut,
+    Some(Err(error)) => outcome_of_request_error(&error),
+    None => ProbeOutcome::TimedOut,
   };
+  if matches!(outcome, ProbeOutcome::Broken) {
+    return Ok((None, outcome));
+  }
   Ok((Some(endpoint), outcome))
+}
+
+/// How a request error on the probe session is judged: a fault that ends the session for good —
+/// closed by the demultiplexer, or a socket refusal — is [`ProbeOutcome::Broken`]; every other error
+/// (a packet that did not unprotect or decode, a flight the handshake layer refused) is one bad packet
+/// on a session that may still carry the next probe, a miss. Pure, so it is tested by itself.
+pub fn outcome_of_request_error(error: &EndpointError) -> ProbeOutcome {
+  match error {
+    EndpointError::Closed | EndpointError::Io(_) => ProbeOutcome::Broken,
+    EndpointError::Handshake(_)
+    | EndpointError::Tls(_)
+    | EndpointError::NotReady
+    | EndpointError::Header
+    | EndpointError::Frames(_)
+    | EndpointError::FlightTooLarge { .. } => ProbeOutcome::TimedOut,
+  }
 }
 
 /// Serves one SWIM probe on a node (§4.8): receives a peer's message over `endpoint`, folds its
@@ -848,5 +877,33 @@ mod tests {
       SwimMessage::decode(&short),
       Err(SwimWireError::GossipLengthMismatch)
     );
+  }
+
+  /// A terminal transport fault — the demultiplexer closed the session, or the socket refused — is
+  /// `Broken` (the session is released); a fault on one packet is a miss on a session kept for the next
+  /// probe, as the deadline is.
+  #[test]
+  fn a_closed_session_or_a_socket_refusal_is_broken_and_one_bad_packet_is_a_miss() {
+    assert!(matches!(
+      outcome_of_request_error(&EndpointError::Closed),
+      ProbeOutcome::Broken
+    ));
+    assert!(matches!(
+      outcome_of_request_error(&EndpointError::Io(slates_rt::error::RtError::DriverLost)),
+      ProbeOutcome::Broken
+    ));
+    for one_packet in [
+      EndpointError::NotReady,
+      EndpointError::Header,
+      EndpointError::FlightTooLarge { bytes: 1, cap: 0 },
+    ] {
+      assert!(
+        matches!(
+          outcome_of_request_error(&one_packet),
+          ProbeOutcome::TimedOut
+        ),
+        "{one_packet:?} keeps the session"
+      );
+    }
   }
 }

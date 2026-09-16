@@ -98,12 +98,20 @@ B, so the deadlock passed it. The new test asserts mutual membership across the 
 - The design's `serve_peer_probes` "How a return heals" note is correct and unchanged; the bug was that the
   retirement path tore down the session that note relies on.
 - Ada's fix design named three further hardenings that are **not required** for this deadlock and were left
-  for separate, tested changes so this fix stays minimal: (2) a terminal-transport-failure `ProbeOutcome`
-  distinct from a timeout, so a genuinely broken connection is released rather than retried forever as a
-  miss; (3) clearing a pending un-established client endpoint on retirement so the next dial re-resolves
-  immediately rather than spending a handshake budget on a stale address; (4) confirming the returning
-  same-id node's holds are fenced (host epoch) until it re-replicates, so a rejoin never disturbs the
-  completed takeover. Each is a distinct property with its own proof; recorded here as owed.
+  for separate, tested changes so this fix stays minimal. All three landed on 2026-09-16:
+  (2) a terminal-transport-failure `ProbeOutcome::Broken` distinct from a timeout (`crates/cluster/src/swim.rs`,
+  `outcome_of_request_error`: the demultiplexer's `Closed` and a socket refusal `Io` release the session, every
+  other error is one bad packet on a session kept for the next probe; unit-tested by itself), which `probe_and_apply`
+  counts as `fleet.probe.broken`, treats as a miss and answers with a fresh dial next period rather than re-probing a
+  dead session until the suspicion window retires the peer;
+  (3) a dial still in its handshake is dropped at its peer's retirement (`probe_peer`, counted as
+  `fleet.dial.stale_dropped`), so the resume dials afresh at the address discovery holds by then — proven by
+  `a_retired_peers_pending_dial_is_dropped_and_its_return_at_new_addresses_is_meshed` (A retires B mid-dial, B
+  returns at other addresses under its certificate and a fresh id, A meshes to it);
+  (4) under the ephemeral member id there is no same-id return to fence — a restart is a fresh member holding
+  nothing (R1) — and `a_restarted_peer_is_learned_on_contact_under_its_fresh_identity` now also asserts that the
+  returned node does **not** serve its predecessor's volume while the successor does, so a rejoin never disturbs
+  the completed takeover.
 - A live KIND re-run to confirm the fix on real pods, and making the lane's rejoin a required gate
   (`xtask/src/kind.rs`), are owed — the reproduction here is the same-address in-process analog, since the
   fleet test harness has no DNS resolver to model a new-IP restart.

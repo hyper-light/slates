@@ -351,6 +351,9 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
           detector.observe_rtt(TARGET, rtt_ns as f64);
           (false, gossip, rtt_ns)
         }
+        // A broken session is no acknowledgement either; the assertions below on the acknowledged
+        // exchange then fail, naming it (the target is live here, so this never happens).
+        ProbeOutcome::Broken => (true, Vec::new(), 0),
         ProbeOutcome::TimedOut => (true, Vec::new(), 0),
       };
       // Whether the measured RTT moved our coordinate off the origin.
