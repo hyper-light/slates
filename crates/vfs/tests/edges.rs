@@ -306,3 +306,47 @@ fn inode_numbers_are_never_reused_and_survive_snapshot_and_clone() {
   let next = vol.create_file(&mut store, root, "next", 0o644).unwrap();
   assert!(next.counter() > kept.counter());
 }
+
+/// POSIX `unlink()`: "if the file's link count is not 0, the last file status change timestamp of
+/// the file shall be marked for update" (POSIX.1-2024 XSH); the same inode change happens when a
+/// rename replaces one name of a file that keeps another. The link count is the inode's, so its
+/// ctime moves with it — as it already did when a link was *added*. Found by pjdfstest `unlink/00.t`
+/// and `rename/23.t` on 2026-09-15 (docs/bugs/2026-09-15-dropping-a-link-leaves-the-inodes-ctime.md).
+#[test]
+fn dropping_one_name_of_a_linked_file_advances_the_survivors_ctime() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 24);
+  let root = vol.root();
+  let file = vol.create_file(&mut store, root, "f", 0o644).unwrap();
+  vol.link(&mut store, root, "g", file).unwrap();
+  let before = vol.stat(&store, file).unwrap();
+  assert_eq!(before.nlink, 2);
+  vol.unlink(&mut store, root, "g").unwrap();
+  let after = vol.stat(&store, file).unwrap();
+  assert_eq!(after.nlink, 1, "one name is gone");
+  assert!(
+    after.ctime > before.ctime,
+    "unlinking one name marks the survivor's ctime: {} then {}",
+    before.ctime,
+    after.ctime
+  );
+
+  let target = vol.create_file(&mut store, root, "a", 0o644).unwrap();
+  vol.link(&mut store, root, "b", target).unwrap();
+  let before = vol.stat(&store, target).unwrap();
+  assert_eq!(before.nlink, 2);
+  vol.rename(&mut store, root, "f", root, "a").unwrap();
+  let after = vol.stat(&store, target).unwrap();
+  assert_eq!(after.nlink, 1, "the replaced name is gone, `b` remains");
+  assert!(
+    after.ctime > before.ctime,
+    "a rename over one name marks the survivor's ctime: {} then {}",
+    before.ctime,
+    after.ctime
+  );
+  assert_eq!(
+    vol.resolve(&store, "/a").unwrap().inode,
+    file,
+    "the renamed file took the name"
+  );
+}

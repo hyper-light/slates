@@ -2961,12 +2961,18 @@ impl Volume {
   }
 
   /// Drops one link; at zero the inode's content leaves the head's accounting and the version
-  /// is retired.
+  /// is retired. The link count is the inode's, so its change time moves with it (POSIX
+  /// `unlink()`: "if the file's link count is not 0, the last file status change timestamp of the
+  /// file shall be marked for update"; a rename that replaces one name of a file, and an
+  /// unlink-while-open that leaves it at zero, are the same inode change) — as `adjust_nlink`
+  /// already did for an added link.
   pub(crate) fn drop_link(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
     let handle = self.make_current_inode(store, no)?;
+    let now = self.clock.wall_ns();
     let nlink = {
       let inode = store.inodes.get_mut(handle)?;
       inode.attrs.nlink = inode.attrs.nlink.saturating_sub(1);
+      inode.attrs.ctime = now;
       inode.attrs.nlink
     };
     if nlink > 0 {
