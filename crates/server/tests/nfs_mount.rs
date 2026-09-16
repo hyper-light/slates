@@ -1,8 +1,3 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-// These integration tests drive the daemon's NFS-loopback transport, the fleet's TCP
-// transport and rustix syscalls — all macOS/Linux; on Windows the daemon mounts through WinFsp and
-// the fleet transport is QUIC-over-UDP, so these particular tests are unix (as `virtiofs.rs` is).
-#![cfg(unix)]
 //! The daemon serves a provisioned volume over NFS (§4.6, R5, AC-3.10/3.12 in spirit — with no kernel
 //! mount, so it runs in CI on any host): a single-shard daemon is started, a client provisions a volume
 //! through the real rendezvous, and then — over the daemon's own NFS loopback port — a client mounts the
@@ -10,6 +5,11 @@
 //! `ShardVolumeSet` → the shard's real volume and back, so this proves the daemon's NFS transport
 //! reaches the volumes it provisioned, not a demo volume. A real `mount_nfs localhost:PORT` would do the
 //! same over the kernel; the hand-rolled ONC RPC client here needs no privilege.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// These integration tests drive the daemon's NFS-loopback transport, the fleet's TCP
+// transport and rustix syscalls — all macOS/Linux; on Windows the daemon mounts through WinFsp and
+// the fleet transport is QUIC-over-UDP, so these particular tests are unix (as `virtiofs.rs` is).
+#![cfg(unix)]
 
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
