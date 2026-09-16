@@ -8,7 +8,7 @@
     "arch": "arm64",
     "privilege": "unprivileged"
   },
-  "date": "2026-09-14",
+  "date": "2026-09-16",
   "command": "sh -c '<roster script>' in <host scratch>/<tool> and <mount>/<tool>, per tool of crates/conformance/src/workload.rs ROSTER; trees compared by manifest",
   "bound": "8 tools run, one script each",
   "outcome": {
@@ -20,21 +20,19 @@
           "name": "git",
           "status": {
             "kind": "differs",
-            "detail": "exit code: host 0, mount 8; mount output tail: 100755 eeba437bfae228be7c57b36d3423fcb15eb3412a 0\td/._c.txt\n100755 cc628ccd10742baea8241c5924df992b5c019f71 0\td/c.txt\n120000 8d14cbf983b3fad683171c9418998d9f68340823 0\tlink\nerror: refs/._heads: badRefName: invalid refname format\nerror: refs/._heads: badRefContent: \nerror: refs/heads/._master: badRefName: invalid refname format\nerror: refs/heads/._master: badRefContent: \nerror: refs/._tags: badRefName: invalid refname format\nerror: refs/._tags: badRefContent: \nb…"
+            "detail": "exit code: host 0, mount 8; mount output tail: 100644 eeba437bfae228be7c57b36d3423fcb15eb3412a 0\t._link\n100644 2227cddb7f6318ea735a1c4adb52f5cd36c5783c 0\ta.txt\n100755 eeba437bfae228be7c57b36d3423fcb15eb3412a 0\td/._c.txt\n100755 cc628ccd10742baea8241c5924df992b5c019f71 0\td/c.txt\n120000 8d14cbf983b3fad683171c9418998d9f68340823 0\tlink\nerror: refs/._heads: badRefName: invalid refname format\nerror: refs/._heads: badRefContent: \nerror: refs/heads/._master: badRefName: invalid refname format\nerror: refs/heads/._mas…"
           }
         },
         {
           "name": "cargo",
           "status": {
-            "kind": "differs",
-            "detail": "tree entry: host mini (Directory, mode 755, 0 bytes, -), mount ._mini (File, mode 644, 4096 bytes, cce85747301c); the trees are identical once AppleDouble `._*` sidecars are ignored"
+            "kind": "identical"
           }
         },
         {
           "name": "npm",
           "status": {
-            "kind": "differs",
-            "detail": "tree entry: host app (Directory, mode 755, 0 bytes, -), mount ._app (File, mode 644, 4096 bytes, cce85747301c); ignoring AppleDouble sidecars, next: tree entry: host app/node_modules/slates-pkg (Symlink { target: \"../../pkg\" }, mode 755, 0 bytes, -), mount app/node_modules/slates-pkg (Symlink { target: \"../../pkg\" }, mode 777, 0 bytes, -)"
+            "kind": "identical"
           }
         },
         {
@@ -47,22 +45,20 @@
         {
           "name": "rg",
           "status": {
-            "kind": "differs",
-            "detail": "tree entry: host src (Directory, mode 755, 0 bytes, -), mount ._src (File, mode 644, 4096 bytes, cce85747301c); the trees are identical once AppleDouble `._*` sidecars are ignored"
+            "kind": "identical"
           }
         },
         {
           "name": "rsync",
           "status": {
             "kind": "differs",
-            "detail": "exit code: host 0, mount 1; mount output tail: 1\nOnly in dst: ._._link\nOnly in dst: ._._one.txt\nOnly in dst: ._._sub\nOnly in dst/sub: ._._two.txt"
+            "detail": "exit code: host 0, mount 1; mount output tail: 3\nOnly in dst: ._._link\nOnly in dst: ._._one.txt\nOnly in dst: ._._sub\nOnly in dst/sub: ._._two.txt"
           }
         },
         {
           "name": "sqlite",
           "status": {
-            "kind": "differs",
-            "detail": "output line 1: host \"wal\", mount \"delete\""
+            "kind": "identical"
           }
         },
         {
@@ -83,16 +79,12 @@
     }
   },
   "expected_failure_list": null,
-  "duration_ms": 4443,
+  "duration_ms": 34089,
   "notes": [
     "the volume was created with --fold=true to match the host scratch's name policy; git identity and dates fixed; sqlite busy timeout 5000 ms; watcher wait 3 s",
-    "git: exit code: host 0, mount 8; mount output tail: 100755 eeba437bfae228be7c57b36d3423fcb15eb3412a 0\td/._c.txt\n100755 cc628ccd10742baea8241c5924df992b5c019f71 0\td/c.txt\n120000 8d14cbf983b3fad683171c9418998d9f68340823 0\tlink\nerror: refs/._heads: badRefName: invalid refname format\nerror: refs/._heads: badRefContent: \nerror: refs/heads/._master: badRefName: invalid refname format\nerror: refs/heads/._master: badRefContent: \nerror: refs/._tags: badRefName: invalid refname format\nerror: refs/._tags: badRefContent: \nb…",
-    "cargo: tree entry: host mini (Directory, mode 755, 0 bytes, -), mount ._mini (File, mode 644, 4096 bytes, cce85747301c); the trees are identical once AppleDouble `._*` sidecars are ignored",
-    "npm: tree entry: host app (Directory, mode 755, 0 bytes, -), mount ._app (File, mode 644, 4096 bytes, cce85747301c); ignoring AppleDouble sidecars, next: tree entry: host app/node_modules/slates-pkg (Symlink { target: \"../../pkg\" }, mode 755, 0 bytes, -), mount app/node_modules/slates-pkg (Symlink { target: \"../../pkg\" }, mode 777, 0 bytes, -)",
+    "git: exit code: host 0, mount 8; mount output tail: 100644 eeba437bfae228be7c57b36d3423fcb15eb3412a 0\t._link\n100644 2227cddb7f6318ea735a1c4adb52f5cd36c5783c 0\ta.txt\n100755 eeba437bfae228be7c57b36d3423fcb15eb3412a 0\td/._c.txt\n100755 cc628ccd10742baea8241c5924df992b5c019f71 0\td/c.txt\n120000 8d14cbf983b3fad683171c9418998d9f68340823 0\tlink\nerror: refs/._heads: badRefName: invalid refname format\nerror: refs/._heads: badRefContent: \nerror: refs/heads/._master: badRefName: invalid refname format\nerror: refs/heads/._mas…",
     "python: output line 2: host \"{\\\"names\\\": [\\\"main.py\\\", \\\"out.json\\\", \\\"pkg\\\"]}\", mount \"{\\\"names\\\": [\\\"._main.py\\\", \\\"._out.json\\\", \\\"._pkg\\\", \\\"main.py\\\", \\\"out.json\\\", \\\"pkg\\\"]}\"",
-    "rg: tree entry: host src (Directory, mode 755, 0 bytes, -), mount ._src (File, mode 644, 4096 bytes, cce85747301c); the trees are identical once AppleDouble `._*` sidecars are ignored",
-    "rsync: exit code: host 0, mount 1; mount output tail: 1\nOnly in dst: ._._link\nOnly in dst: ._._one.txt\nOnly in dst: ._._sub\nOnly in dst/sub: ._._two.txt",
-    "sqlite: output line 1: host \"wal\", mount \"delete\"",
+    "rsync: exit code: host 0, mount 1; mount output tail: 3\nOnly in dst: ._._link\nOnly in dst: ._._one.txt\nOnly in dst: ._._sub\nOnly in dst/sub: ._._two.txt",
     "editor: output line 2: host \"note.txt\", mount \"._note.txt\""
   ]
 }

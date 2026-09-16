@@ -396,14 +396,25 @@ jobs:
       - name: Suite tools (macOS)
         if: runner.os == 'macOS'
         run: brew install ripgrep fswatch
+      # `--keep` leaves the scratch in place so pjdfstest's per-file TAP output survives the run: the
+      # expected-failure list's own header names this lane's root run as the review input, and the
+      # summary record cannot say which assertion failed with what. The output directory is uploaded
+      # below; the rest of the scratch (a cargo target, fsstress's tree) stays on the runner.
       - name: Plan, then run every suite this runner can (each verdict gates the step; records kept)
-        run: cargo xtask conformance all --records "$RUNNER_TEMP/conformance-records" --scratch "$RUNNER_TEMP/conformance-scratch"
+        run: cargo xtask conformance all --records "$RUNNER_TEMP/conformance-records" --scratch "$RUNNER_TEMP/conformance-scratch" --keep
       - name: Upload the records
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: conformance-records-${{ matrix.os }}
           path: ${{ runner.temp }}/conformance-records
+      - name: Upload pjdfstest's per-file output (the expected-failure review input)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pjdfstest-output-${{ matrix.os }}
+          path: ${{ runner.temp }}/conformance-scratch/pjdfstest-output
+          if-no-files-found: ignore
 
   # Part 6 "Concurrency", nightly: shuttle's randomized schedules over the pure cores — T-1.6 (two
   # agents clone-and-write on one base through the store's owner) and T-6.7 (sixteen agents submit

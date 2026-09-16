@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use slates_conformance::exerciser::{judge_fsstress, judge_fsx};
 use slates_conformance::expected::{ExpectedFailures, judge};
 use slates_conformance::record::{Counts, ListDigest, Outcome, Privilege};
-use slates_conformance::tap::{CaseStatus, TapCase, TapFile, parse_file};
+pub(crate) use slates_conformance::tap::Runner;
+use slates_conformance::tap::{CaseStatus, TapCase, TapFile, failures_by_file, parse_file, shapes};
 use slates_conformance::{Suite, Transport};
 
 use super::fetch;
@@ -256,6 +257,139 @@ fn run_test_file(file: &Path, work: &Path, as_root: bool) -> Result<(String, boo
   Ok(outcome)
 }
 
+/// Shape: how many failure shapes a record's note and the tally's print carry; the long tail is
+/// in the kept per-file outputs, which `tally` re-reads whole.
+const SHAPES_SHOWN: usize = 12;
+/// Shape: how many files the tally's print names by failure count.
+const FILES_SHOWN: usize = 10;
+
+/// The process's own identity as the suite's runner: root when the effective uid is 0, else the
+/// uid and every group (`getgroups(2)`, which the `AUTH_SYS` credential carries to the daemon).
+#[cfg(unix)]
+pub(crate) fn this_user() -> Runner {
+  let uid = rustix::process::geteuid().as_raw();
+  if uid == 0 {
+    return Runner::Root;
+  }
+  let mut groups = vec![rustix::process::getegid().as_raw()];
+  groups.extend(
+    rustix::process::getgroups()
+      .unwrap_or_default()
+      .into_iter()
+      .map(|g| g.as_raw()),
+  );
+  groups.sort_unstable();
+  groups.dedup();
+  Runner::Unprivileged { uid, groups }
+}
+
+/// pjdfstest is a POSIX suite; on a host without uids the harness never reaches this.
+#[cfg(not(unix))]
+pub(crate) fn this_user() -> Runner {
+  Runner::Root
+}
+
+/// The failures by shape: a heading and one line per shape, for a record's note (joined) and the
+/// tally's print (one per line).
+fn shape_lines(cases: &[TapCase]) -> (String, Vec<String>) {
+  let (rows, total) = shapes(cases, SHAPES_SHOWN);
+  let heading = format!(
+    "failures by shape ({} of {} shapes; names folded to N, inode numbers to <inode>)",
+    rows.len(),
+    total
+  );
+  let rows = rows
+    .iter()
+    .map(|(shape, count)| format!("{count} × {shape}"))
+    .collect();
+  (heading, rows)
+}
+
+/// The failures by shape as one note.
+fn shape_note(cases: &[TapCase]) -> String {
+  let (heading, rows) = shape_lines(cases);
+  format!("{heading}: {}", rows.join("; "))
+}
+
+/// `tally --outputs DIR [--privilege root|unprivileged]`: re-reads a kept `pjdfstest-output`
+/// directory (this host's `--keep` scratch, or the CI lane's uploaded artifact) and prints the
+/// counts, the judgement against the reviewed list, the failures by shape and by file — the
+/// review of a run that happened elsewhere, as a command rather than a grep.
+pub(crate) fn tally_outputs(
+  root: &Path,
+  transport: Transport,
+  outputs: &Path,
+  runner: &Runner,
+) -> Result<(), Failure> {
+  let mut names: Vec<PathBuf> = std::fs::read_dir(outputs)
+    .map_err(|e| Failure(format!("{}: {e}", outputs.display())))?
+    .filter_map(Result::ok)
+    .map(|entry| entry.path())
+    .filter(|path| path.extension().is_some_and(|x| x == "txt"))
+    .collect();
+  names.sort();
+  if names.is_empty() {
+    return Err(Failure(format!(
+      "{}: no kept pjdfstest outputs (`<file>.t.txt`) here",
+      outputs.display()
+    )));
+  }
+  let mut parsed = Vec::with_capacity(names.len());
+  for path in &names {
+    let stem = path
+      .file_name()
+      .and_then(|n| n.to_str())
+      .and_then(|n| n.strip_suffix(".txt"))
+      .unwrap_or_default();
+    let relative = stem.replace("__", "/");
+    let output =
+      std::fs::read_to_string(path).map_err(|e| Failure(format!("{}: {e}", path.display())))?;
+    parsed.push(parse_file(&relative, &output, runner));
+  }
+  let tally = tally(&parsed);
+  let (list, digest) = expected_list(root, transport, runner.privilege())?;
+  let judgement = judge(&list, &tally.cases);
+  println!(
+    "pjdfstest ({}, {} run): {} files, {} cases: {} passed, {} failed, {} needs-root, {} todo",
+    transport.slug(),
+    match runner {
+      Runner::Root => "root".to_owned(),
+      Runner::Unprivileged { uid, groups } => format!("uid {uid} in groups {groups:?}"),
+    },
+    tally.files,
+    tally.cases.len(),
+    tally.passed,
+    tally.failed,
+    tally.needs_root,
+    tally.todo
+  );
+  println!(
+    "against {} ({} entries, blake3 {}): {}",
+    digest.path,
+    digest.entries,
+    digest.blake3,
+    judgement.describe()
+  );
+  if !tally.incomplete.is_empty() {
+    println!(
+      "incomplete or malformed files: {}",
+      tally.incomplete.join("; ")
+    );
+  }
+  if tally.failed > 0 {
+    let (heading, rows) = shape_lines(&tally.cases);
+    println!("{heading}:");
+    for row in rows {
+      println!("  {row}");
+    }
+    println!("failures by file ({FILES_SHOWN} most):");
+    for (file, count) in failures_by_file(&tally.cases, FILES_SHOWN) {
+      println!("  {count:>5}  {file}");
+    }
+  }
+  Ok(())
+}
+
 /// The aggregate counts of the parsed files.
 struct Tally {
   files: u32,
@@ -335,10 +469,10 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let as_root = run.root_available
     && !matches!(run.privilege(), Privilege::Root)
     && super::sudo_without_prompt();
-  let privilege = if run.root_available {
-    Privilege::Root
+  let runner = if run.root_available {
+    Runner::Root
   } else {
-    Privilege::Unprivileged
+    this_user()
   };
   let files = test_files(&tree.root)?;
   // Every file's raw TAP output is kept in the scratch (`--keep`), so a failure can be reviewed by
@@ -360,11 +494,11 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     if hung {
       timed_out.push(relative.clone());
     }
-    parsed.push(parse_file(&relative, &output, privilege));
+    parsed.push(parse_file(&relative, &output, &runner));
   }
   drop(session);
   let tally = tally(&parsed);
-  let (list, digest) = expected_list(run.root, run.transport, privilege)?;
+  let (list, digest) = expected_list(run.root, run.transport, runner.privilege())?;
   let judgement = judge(&list, &tally.cases);
   for id in &judgement.unlisted_failures {
     println!("pjdfstest: unlisted failure {id}");
@@ -374,6 +508,9 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   }
   let ok = judgement.acceptable() && tally.incomplete.is_empty() && timed_out.is_empty();
   let mut notes = vec![tree.note, judgement.describe()];
+  if tally.failed > 0 {
+    notes.push(shape_note(&tally.cases));
+  }
   if !tally.incomplete.is_empty() {
     notes.push(format!(
       "incomplete or malformed files: {}",
@@ -392,7 +529,8 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     Some((
       "a non-root run".to_owned(),
       format!(
-        "{} cases that switch uid/gid or require root, counted as needs-root rather than run",
+        "{} cases only root could pass (a uid/gid switch, a device node, a chown to another owner, \
+         or an expectation of one), counted as needs-root rather than run",
         tally.needs_root
       ),
     ))

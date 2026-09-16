@@ -534,6 +534,14 @@ impl Session {
     let binary = SlatesBinary::build(run.root)?;
     let instance = format!("conf-{suite}-{}", std::process::id());
     let anchor = Anchor::start(&binary, &instance, run.scratch.path(), tracer)?;
+    // A fresh daemon serves no placement until its configuration group is bootstrapped (the
+    // fresh-voter correction of commit f9c0fe9: a first boot must be told it is the root group's first
+    // member, and `volume create` is refused `ConsensusNotInitialized` until then). The CLI and SDK
+    // suites make the same explicit first-time bootstrap; without it every suite here died at its
+    // first `volume create` on every host.
+    binary
+      .run(&instance, &["bootstrap", "root"])?
+      .expect_ok("bootstrap root")?;
     let volume_name = format!("{suite}-vol");
     let volume_id = create_volume(&binary, &instance, &volume_name, super::VOLUME_SIZE, fold)?;
     let mount = mount_volume(run, &binary, &instance, &volume_id, &volume_name)?;

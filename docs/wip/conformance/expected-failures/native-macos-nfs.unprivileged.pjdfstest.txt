@@ -5,9 +5,13 @@
 # One case per line: `tests/<dir>/<file>.t:<case>  <reviewed reason>`; the run fails on an
 # unlisted failure and on a listed case that passes (the list only shrinks).
 #
-# Nothing is listed yet. The 2026-09-14 run's 3,331 unexpected failures are categorized by cause
-# in docs/wip/conformance.md §3.4 rather than listed here, because the categories are either
-# consequences of running without root (the sticky-directory and chown suites) or one declared
-# transport limit (no fifos or sockets, docs/bugs/2026-09-14-nfs-special-files-refused-as-eio.md);
-# listing them case by case would make the unprivileged run look reviewed when it is the root
-# run that pjdfstest defines.
+# Nothing is listed yet. The 2026-09-16 (UTC) run's 2,220 unexpected failures are shaped by cause
+# in docs/wip/conformance.md §3.4 (and by `cargo xtask conformance tally --outputs DIR` over the
+# kept outputs) rather than listed here, because every shape is either a consequence of running
+# without root that the case's own line cannot show (a rename by a switched user that never
+# happened leaves the source in place; the ctime check after a root-only chown), or the one
+# declared transport limit (no fifos or sockets,
+# docs/bugs/2026-09-14-nfs-special-files-refused-as-eio.md) and its knock-ons; listing them case
+# by case would make the unprivileged run look reviewed when it is the root run that pjdfstest
+# defines. The cases root alone could pass — a uid/gid switch, a device node, a chown to another
+# owner, or an expectation of one — are counted needs-root by the classifier, not listed.

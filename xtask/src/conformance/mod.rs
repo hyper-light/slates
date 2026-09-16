@@ -10,8 +10,12 @@
 //! Subcommands: `plan` (write the skip records for every cell this host cannot run), `run
 //! --suite S` (run one suite over this host's native transport), `all` (plan, then every runnable
 //! suite, continuing past failures), `matrix [--write]` (render the matrix from the records;
-//! `--write` rewrites the document's generated block). Scratch lives outside the tree (`--scratch`,
-//! else a fresh `mktemp -d`) and is removed at the end unless `--keep`.
+//! `--write` rewrites the document's generated block), `tally --outputs DIR [--privilege
+//! root|unprivileged]` (re-read a kept `pjdfstest-output` directory — a `--keep` scratch here, or
+//! the CI lane's uploaded artifact — and print the counts, the judgement, and the failures by
+//! shape and by file, so a run that happened elsewhere is reviewed by a command). Scratch lives
+//! outside the tree (`--scratch`, else a fresh `mktemp -d`) and is removed at the end unless
+//! `--keep`.
 //!
 //! This is a development tool, not shipped code: it writes its scratch and its records with
 //! `std::fs`, each such site allowed in place with the reason, exactly as the ratchet task does.
@@ -65,7 +69,7 @@ const SUDO_PROBE: Duration = Duration::from_secs(5);
 /// The parsed command line.
 #[derive(Debug)]
 pub(crate) struct Options {
-  /// `plan`, `run`, `all` or `matrix`.
+  /// `plan`, `run`, `all`, `matrix` or `tally`.
   command: String,
   /// The records directory.
   records: PathBuf,
@@ -77,6 +81,11 @@ pub(crate) struct Options {
   suite: Option<Suite>,
   /// `matrix`: rewrite the document.
   write: bool,
+  /// `tally`: the kept `pjdfstest-output` directory to re-read.
+  outputs: Option<PathBuf>,
+  /// `tally`: who ran the outputs (`root` or `unprivileged`); this process's own identity when
+  /// absent.
+  privilege: Option<Privilege>,
   /// The exerciser bounds.
   bounds: Bounds,
 }
@@ -125,8 +134,18 @@ fn number<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> Resu
 /// Parses the arguments after `conformance`.
 pub(crate) fn parse(root: &Path, args: &[String]) -> Result<Options, Failure> {
   let command = args.first().cloned().ok_or_else(|| {
-    Failure("conformance: a subcommand is needed: plan, run, all, matrix".to_owned())
+    Failure("conformance: a subcommand is needed: plan, run, all, matrix, tally".to_owned())
   })?;
+  let privilege = match value_after(args, "--privilege") {
+    Some("root") => Some(Privilege::Root),
+    Some("unprivileged") => Some(Privilege::Unprivileged),
+    Some(other) => {
+      return Err(Failure(format!(
+        "--privilege takes root or unprivileged, got `{other}`"
+      )));
+    }
+    None => None,
+  };
   let defaults = Bounds::default();
   let suite = match value_after(args, "--suite") {
     Some(slug) => Some(Suite::parse(slug).ok_or_else(|| {
@@ -145,6 +164,8 @@ pub(crate) fn parse(root: &Path, args: &[String]) -> Result<Options, Failure> {
     keep: args.iter().any(|a| a == "--keep"),
     suite,
     write: args.iter().any(|a| a == "--write"),
+    outputs: value_after(args, "--outputs").map(PathBuf::from),
+    privilege,
     bounds: Bounds {
       fsx_operations: number(args, "--fsx-ops", defaults.fsx_operations)?,
       fsx_seed: number(args, "--fsx-seed", defaults.fsx_seed)?,
@@ -168,10 +189,34 @@ pub(crate) fn run(root: &Path, options: &Options) -> Result<(), Failure> {
     }
     "all" => all(root, options),
     "matrix" => render_matrix(root, options),
+    "tally" => tally(root, options),
     other => Err(Failure(format!(
-      "conformance: unknown subcommand `{other}`; plan, run, all, matrix"
+      "conformance: unknown subcommand `{other}`; plan, run, all, matrix, tally"
     ))),
   }
+}
+
+/// `tally --outputs DIR [--privilege root|unprivileged]`: review kept pjdfstest outputs.
+fn tally(root: &Path, options: &Options) -> Result<(), Failure> {
+  let outputs = options
+    .outputs
+    .as_deref()
+    .ok_or_else(|| Failure("conformance tally: --outputs DIR is needed".to_owned()))?;
+  let runner = match options.privilege {
+    Some(Privilege::Root) => suites::Runner::Root,
+    Some(Privilege::Unprivileged) => match suites::this_user() {
+      suites::Runner::Root => {
+        return Err(Failure(
+          "conformance tally: --privilege unprivileged, but this process is root; the classifier \
+           needs the uid and groups the run had"
+            .to_owned(),
+        ));
+      }
+      user => user,
+    },
+    None => suites::this_user(),
+  };
+  suites::tally_outputs(root, native_transport(host_os()?), outputs, &runner)
 }
 
 // --- the host ---------------------------------------------------------------------------------
