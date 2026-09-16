@@ -129,6 +129,58 @@ fn read_opaque(buf: &[u8], off: usize) -> (Vec<u8>, usize) {
   (data, start + len + (4 - len % 4) % 4)
 }
 
+/// [`call`], but on any socket error it drains the serve task's milestone channel (waiting briefly
+/// for the shard thread to post its last one) and panics with the request that broke and everything
+/// the server reported — so a CI failure names why the connection reset, not only that it did.
+fn call_or_diagnose(
+  stream: &mut TcpStream,
+  program: u32,
+  procedure: u32,
+  args: &[u8],
+  xid: u32,
+  serve_report: &std::sync::mpsc::Receiver<String>,
+) -> Vec<u8> {
+  match try_call(stream, program, procedure, args, xid) {
+    Ok(results) => results,
+    Err(e) => {
+      let mut milestones = Vec::new();
+      // Give the shard thread a moment to post its final milestone (accept/serve outcome).
+      while let Ok(line) = serve_report.recv_timeout(std::time::Duration::from_millis(500)) {
+        milestones.push(line);
+      }
+      panic!(
+        "RPC (program {program}, procedure {procedure}, xid {xid}) failed: {e}; server milestones: {milestones:?}"
+      );
+    }
+  }
+}
+
+/// The fallible core of [`call`]: an IO error is returned rather than unwrapped.
+fn try_call(
+  stream: &mut TcpStream,
+  program: u32,
+  procedure: u32,
+  args: &[u8],
+  xid: u32,
+) -> std::io::Result<Vec<u8>> {
+  let mut body = Vec::new();
+  for field in [xid, 0, 2, program, 3, procedure, 0, 0, 0, 0] {
+    body.extend_from_slice(&field.to_be_bytes());
+  }
+  body.extend_from_slice(args);
+  let marker = 0x8000_0000u32 | u32::try_from(body.len()).unwrap();
+  stream.write_all(&marker.to_be_bytes())?;
+  stream.write_all(&body)?;
+  let mut marker_buf = [0u8; 4];
+  stream.read_exact(&mut marker_buf)?;
+  let len = (u32::from_be_bytes(marker_buf) & 0x7fff_ffff) as usize;
+  let mut reply = vec![0u8; len];
+  stream.read_exact(&mut reply)?;
+  let verf_len = u32::from_be_bytes(reply[16..20].try_into().unwrap()) as usize;
+  let accept_off = 20 + verf_len + (4 - verf_len % 4) % 4;
+  Ok(reply[accept_off + 4..].to_vec())
+}
+
 /// Sends one RPC call (AUTH_NONE) and returns the accepted reply's results (after the RPC header).
 fn call(stream: &mut TcpStream, program: u32, procedure: u32, args: &[u8], xid: u32) -> Vec<u8> {
   let mut body = Vec::new();
@@ -171,6 +223,12 @@ fn a_client_mounts_and_reads_a_file_over_the_async_server() {
 
   let rt = Runtime::start(&config()).unwrap();
   let id = rt.shard_ids()[0];
+  // The serve task runs on the runtime's shard thread, whose stderr libtest does not capture, so its
+  // outcome (an accept error, a serve error) would be invisible on a CI failure. It reports each
+  // milestone back over this channel; the client drains it into its panic when an RPC breaks, so a
+  // failing run names what the server did rather than only that the connection reset (2026-09-16).
+  let (report, serve_report) = std::sync::mpsc::channel::<String>();
+  let report_outer = report.clone();
   rt.spawn_on(id, async move {
     // On the shard thread: spawn the non-`Send` serve loop locally (the daemon's own idiom).
     let spawned = futures::spawn(async move {
@@ -188,13 +246,26 @@ fn a_client_mounts_and_reads_a_file_over_the_async_server() {
         },
       )
       .unwrap();
+      let _ = report.send("serve task started; awaiting accept".to_owned());
       // Serve the one connection the test makes; it returns at end of stream.
-      if let Ok(mut stream) = listener.accept().await {
-        let _ = serve_connection_async(&mut stream, &mut export, port).await;
+      match listener.accept().await {
+        Ok(mut stream) => {
+          let _ = report.send("accepted a connection".to_owned());
+          let result = serve_connection_async(&mut stream, &mut export, port).await;
+          let _ = report.send(format!("serve_connection_async returned {result:?}"));
+        }
+        Err(e) => {
+          let _ = report.send(format!("accept failed: {e:?}"));
+        }
       }
     });
-    if let Ok(task) = spawned {
-      let _ = futures::detach(task);
+    match spawned {
+      Ok(task) => {
+        let _ = futures::detach(task);
+      }
+      Err(e) => {
+        let _ = report_outer.send(format!("inner futures::spawn failed: {e:?}"));
+      }
     }
   })
   .unwrap();
@@ -204,7 +275,7 @@ fn a_client_mounts_and_reads_a_file_over_the_async_server() {
   // MOUNT MNT "/" -> the root file handle (after the mountstat3 Ok status word).
   let mut mnt_args = Vec::new();
   opaque(b"/", &mut mnt_args);
-  let mnt = call(&mut stream, MOUNT_PROGRAM, 1, &mnt_args, 1);
+  let mnt = call_or_diagnose(&mut stream, MOUNT_PROGRAM, 1, &mnt_args, 1, &serve_report);
   assert_eq!(status(&mnt), 0, "MNT succeeded");
   let (root_fh, _) = read_opaque(&mnt, 4);
   assert!(!root_fh.is_empty(), "MNT returned a root handle");
