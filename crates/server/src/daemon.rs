@@ -1432,18 +1432,36 @@ fn init_shard(
   // The operation headroom (§4.2): the bounded temporary coexistence of in-flight operations, kept
   // free of every admission (reservation and dynamic growth alike). A write into a sealed chunk
   // copies it into a new open extent — copy-on-write at chunk granularity — so the source chunk and
-  // its destination coexist (two chunk windows) until the seal, and at most one such copy-up is in
-  // flight per client the shard serves. This is structural — the chunk window times the client count
-  // — not the measured burst the earlier placeholder stood in for.
+  // its destination coexist (two chunk windows) until the seal. A copy-up exists only while a write
+  // is IN FLIGHT, and a shard admits at most `requests_in_flight_per_shard` operations at once (its
+  // Little's-law admission limit, carried as `config.caps.attachments`), so the concurrent copy-ups
+  // are bounded by min(seatable clients, in-flight operations) — never one per seatable client. The
+  // earlier `× clients_per_shard` reserved a copy-up for every client the RAM could seat (hundreds),
+  // which on a large page (macOS arm64's 16 KiB) drove the headroom past the arena's own capacity and
+  // refused every volume with `BudgetExceeded { available: 0 }`
+  // (docs/bugs/2026-09-16-operation-headroom-exceeds-the-arena-capacity.md).
   let chunk_window =
     u64::try_from(slates_vfs::content::chunk_bytes(config.page).get()).unwrap_or(u64::MAX);
-  let concurrent_writers = u64::try_from(config.clients_per_shard).unwrap_or(1).max(1);
+  let in_flight = u64::try_from(config.caps.attachments).unwrap_or(1).max(1);
+  let concurrent_writers = u64::try_from(config.clients_per_shard)
+    .unwrap_or(1)
+    .max(1)
+    .min(in_flight);
+  // D-12 "degrade and keep serving": the headroom is a reserve *within* the arena's usable capacity,
+  // so it can never consume the whole arena — a shard whose operation headroom ≥ its capacity refuses
+  // every volume. Cap it to leave at least one chunk window admittable, whatever the machine.
+  let capacity = u64::try_from(arena.capacity()).unwrap_or(u64::MAX);
   let headroom = derived!(
     chunk_window
       .saturating_mul(2)
-      .saturating_mul(concurrent_writers),
-    "2 × chunk_bytes × clients_per_shard (a copy-up's source and destination chunk per concurrent writer)",
-    ["vfs.chunk_bytes", "clients_per_shard"]
+      .saturating_mul(concurrent_writers)
+      .min(capacity.saturating_sub(chunk_window)),
+    "2 × chunk_bytes × min(clients_per_shard, requests_in_flight_per_shard), capped to leave one chunk window admittable",
+    [
+      "vfs.chunk_bytes",
+      "clients_per_shard",
+      "requests_in_flight_per_shard"
+    ]
   );
   // The store owns the shard budget (§4.2): it is over what the arena can actually hand out (its
   // buddy-allocatable capacity), not the region's mapping length, so admission never promises quota
