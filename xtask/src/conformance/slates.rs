@@ -38,6 +38,14 @@ const ENV_HANDOFF_LEN: &str = "SLATES_ANCHOR_LEN";
 /// a high source port, soft with a short retry so a wedged export is escapable, and the same
 /// one-second attribute cache `slates mount` asks for (`crates/cli/src/mount.rs`).
 const LINUX_NFS_OPTIONS: &str = "vers=3,tcp,nolock,noresvport,soft,timeo=10,retrans=2,actimeo=1";
+/// Format: the server address the Linux mount targets — the IPv4 loopback literal, not `localhost`.
+/// The daemon's NFS listener binds IPv4 `127.0.0.1` only (`slates_rt::tcp` is `SocketAddrV4`), while
+/// `localhost` on a dual-stack host resolves to IPv6 `::1` first (RFC 3484), so `mount -t nfs
+/// localhost:/…` targets `[::1]:port` where nothing listens and the mount fails ("mount system call
+/// failed"). A GitHub `ubuntu-latest` runner has working IPv6 and hit this; a container with IPv6
+/// disabled falls back to IPv4 and hid it. Naming the IPv4 literal removes the dependency on the NFS
+/// client's address-family fallback (`docs/bugs/2026-09-16-linux-conformance-nfs-mount-localhost-ipv6.md`).
+const LINUX_NFS_SERVER: &str = "127.0.0.1";
 
 /// The built `slates` binary.
 #[derive(Clone)]
@@ -440,12 +448,16 @@ pub(crate) fn mount_volume(
       let options = format!("{LINUX_NFS_OPTIONS},port={port},mountport={port}");
       let output = Command::new("sudo")
         .args(["-n", "mount", "-t", "nfs", "-o", &options])
-        .arg(format!("localhost:/{name}"))
+        .arg(format!("{LINUX_NFS_SERVER}:/{name}"))
         .arg(&point)
         .output()?;
       if !output.status.success() {
+        // Name the exact target and both streams: `mount.nfs` prints "mount system call failed" with
+        // no cause of its own, so record the command and its whole output for the next diagnosis.
         return Err(Failure(format!(
-          "sudo mount -t nfs failed: {}",
+          "sudo mount -t nfs -o {options} {LINUX_NFS_SERVER}:/{name} failed ({}): {}{}",
+          output.status,
+          String::from_utf8_lossy(&output.stdout),
           String::from_utf8_lossy(&output.stderr)
         )));
       }
