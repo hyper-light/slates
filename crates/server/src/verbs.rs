@@ -152,22 +152,38 @@ pub(crate) fn refused(refusal: Refusal) -> ReplyBody {
 }
 
 /// §4.14 / D-12: a daemon that refuses provisioning must say why residency cannot be established.
-/// The first byte-budget refusal in a process logs the store budget's whole breakdown once, so a
-/// `BudgetExceeded { available: 0 }` names whether the capacity collapsed or the operation headroom
-/// ate it — the evidence a boot profile does not carry, for the flaky macOS-runner refusal
-/// (2026-09-16). Counted once (a running daemon that is genuinely out of budget must not spam).
-fn report_first_budget_refusal(state: &crate::state::ShardState, requested: u64, available: u64) {
+/// A **refuse-all** refusal (`available == 0`, the pathological case, not an ordinary "volume too
+/// big" refusal where `available > 0`) logs the store's whole breakdown once — both the byte budget
+/// and the version (inode) budget, each `capacity/committed/retained/headroom` — so a
+/// `BudgetExceeded { available: 0 }` names which dimension collapsed and whether it was the capacity
+/// or the operation headroom. The `available > 0` guard is why an earlier once-gate saw nothing: an
+/// intentional-too-big refusal consumed it. Evidence a boot profile does not carry, for the flaky
+/// macOS-runner refusal (2026-09-16). Counted once (a genuinely-full running daemon must not spam).
+fn report_first_budget_refusal(
+  state: &crate::state::ShardState,
+  dimension: &str,
+  requested: u64,
+  available: u64,
+) {
+  if available != 0 {
+    return;
+  }
   static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
   if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
     return;
   }
   eprintln!(
-    "slates-server: volume byte-budget refused (first occurrence): requested={requested} \
-     available={available} store.budget[capacity={} committed={} retained={} headroom={}]",
+    "slates-server: {dimension} budget refuse-all (first occurrence): requested={requested} \
+     bytes[capacity={} committed={} retained={} headroom={}] \
+     versions[capacity={} committed={} retained={} headroom={}]",
     state.store.budget.capacity(),
     state.store.budget.committed(),
     state.store.budget.retained(),
     state.store.budget.headroom(),
+    state.store.versions.capacity(),
+    state.store.versions.committed(),
+    state.store.versions.retained(),
+    state.store.versions.headroom(),
   );
 }
 
@@ -2409,7 +2425,7 @@ fn create(
     SizeClass::Bounded { limit } => match state.store.budget.reserve(limit) {
       Ok(r) => Some(r),
       Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
-        report_first_budget_refusal(state, limit, available);
+        report_first_budget_refusal(state, "bytes", limit, available);
         return refused(Refusal::BudgetExceeded { available });
       }
       Err(e) => {
@@ -2426,9 +2442,11 @@ fn create(
   // refusal here allocates nothing to leak (no root inode, trie or dir), giving back only the byte
   // reservation. Bounded and dynamic both reserve their whole logical allowance: the sacred claim
   // that backs divergence.
-  let version_credit = match state.store.versions.reserve(inode_allowance(state, size)) {
+  let inode_alloc = inode_allowance(state, size);
+  let version_credit = match state.store.versions.reserve(inode_alloc) {
     Ok(c) => Some(c),
     Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
+      report_first_budget_refusal(state, "versions", inode_alloc, available);
       return give_back(
         state,
         reservation,
