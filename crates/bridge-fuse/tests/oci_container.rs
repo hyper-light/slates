@@ -329,9 +329,11 @@ fn an_oci_container_consumes_a_fuse_host_mount_through_the_runtime_bind() {
   let scratch = scratch();
   let mounted = match mount(&scratch.mount_point, &["allow_other"], CONTAINER_WAIT) {
     Ok(mounted) => mounted,
-    Err(MountError::Helper { exit }) => {
+    Err(MountError::Helper { exit } | MountError::NoDevice { exit }) => {
+      // fusermount3 refuses `allow_other` before it opens /dev/fuse, so it hands back no descriptor
+      // (`NoDevice`), or after (`Helper`); either is the environment's refusal, printed by the helper.
       eprintln!(
-        "skipping T-4.13's FUSE container leg: fusermount3 refused `allow_other` (exit {exit:?}); the runtime's daemon and the container are other users to the mount, so /etc/fuse.conf needs `user_allow_other`"
+        "skipping T-4.13's FUSE container leg: fusermount3 refused `allow_other` or found no /dev/fuse (exit {exit:?}); the runtime's daemon and the container are other users to the mount, so /etc/fuse.conf needs `user_allow_other`"
       );
       return;
     }

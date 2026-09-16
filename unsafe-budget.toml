@@ -37,6 +37,11 @@
 #   `getsockname`/`recvfrom`/`sendto`, and the `S_addr` address-union read (14); and the IOCP driver's
 #   `iocp.rs` AFD wiring — associating the AFD device with the port, arming a poll, and reclaiming a
 #   delivered block (3). All are Win32/ntdll FFI without a safe wrapper, each with a `// SAFETY:` line.
+#   The simulation clock (`sim.rs`, 2026-09-16): the runtime holds the clock's allocation as a raw
+#   pointer and frees it in `Drop` with `Box::from_raw` after the contexts are reclaimed (1) — a `Box`
+#   field's move was a unique retag that invalidated the drivers' shared borrows under Stacked Borrows
+#   (Miri, the differential test); the `&'static` the drivers hold is derived from that pointer (1,
+#   the site the box version already had). 65 → 66.
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
 # slates-base (6): rustix marks kevent unsafe because the kernel fills the output list; one
@@ -125,7 +130,7 @@ slates-mem = 16
 # 2026-09-14 (−1, the KIND lane: the epoll one-shot re-arm — `docs/bugs/2026-09-14-epoll-readiness-re-add-eexist.md`):
 # the second `BorrowedFd::borrow_raw` of the readiness re-add is gone with the re-add itself (the
 # descriptor is re-armed with `EPOLL_CTL_MOD` through the one remaining borrow).
-slates-rt = 65
+slates-rt = 66
 slates-base = 6
 slates-vfs = 0
 slates-land = 3

@@ -23,7 +23,10 @@ use crate::Failure;
 
 /// Format: the system calls strace traces: every call taking a path (`%file`) plus the
 /// descriptor-based writes the structural test's syscall list names.
-const STRACE_TRACE: &str = "trace=%file,write,pwrite64,writev,pwritev,pwritev2,ftruncate,fchmod,fchown,fsync,fdatasync,fallocate,copy_file_range,sendfile,splice,vmsplice,futimens";
+const STRACE_TRACE: &str = "trace=%file,write,pwrite64,writev,pwritev,pwritev2,ftruncate,fchmod,fchown,fsync,fdatasync,fallocate,copy_file_range,sendfile,splice,vmsplice";
+// `futimens` is glibc's wrapper over `utimensat` (a %file syscall), not a syscall name: strace refused the
+// whole run with `invalid system call 'futimens'` and the daemon never came up under it (the Linux lane,
+// 2026-09-16).
 /// Format: the prefix of the landing engine's hidden siblings inside the target (`slates-land`).
 const HIDDEN_PREFIX: &str = ".slates-";
 /// Format: the files the traced workload leaves in the volume, relative paths, after its moves —
@@ -243,6 +246,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     ),
     format!("the granted target: {}", target.display()),
   ];
+  notes.extend(session.size_note.clone());
   if !unmatched.is_empty() {
     notes.push(format!(
       "inside-target paths not among the landed entries: {}",

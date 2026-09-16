@@ -101,7 +101,7 @@ use slates_db::register::{
 };
 use slates_rt::futures;
 use slates_rt::udp::UdpSocket;
-use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
+use slates_rt::udp::{Ipv4Addr, SocketAddrV4};
 use slates_transport::demux::Demux;
 use slates_transport::endpoint::{Endpoint, EndpointError, MIN_DATAGRAM_BYTES};
 use slates_transport::handshake::Identity;

@@ -13,7 +13,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import addon, { Client, AsyncClient } from '@hyper-light/slates';
 
 const require = createRequire(import.meta.url);
@@ -93,6 +93,12 @@ test('the packaged AsyncClient drives a live daemon end to end', async (t) => {
   try {
     const client = await connectWhenReady(instance);
     assert.equal(typeof client.clientId(), 'number');
+    // A fresh daemon refuses every volume verb `ConsensusNotInitialized` until its root group is
+    // bootstrapped — the explicit first-time step the SDK suites and the CLI flow take too.
+    const bootstrap = spawnSync(daemon, ['--instance', instance, 'bootstrap', 'root'], {
+      encoding: 'utf8',
+    });
+    assert.equal(bootstrap.status, 0, bootstrap.stderr);
 
     const volume = await client.create('packaged-roundtrip', VOLUME_BYTES);
     assert.equal(volume.length, 32, 'a volume id crosses as 32 hex characters');

@@ -461,10 +461,15 @@ impl Driver for SimDriver {
 
 /// A set of simulated shards on the calling thread.
 pub struct SimRuntime {
-  /// The simulation clock, owned here: the drivers borrow it for the life of their contexts, which
-  /// this runtime frees in its `Drop` before the box goes (declared after `shards`, dropped after them).
   shards: Vec<&'static ShardContext>,
-  clock: Box<SimShared>,
+  /// The simulation clock, read here and borrowed by the drivers for the life of their contexts.
+  clock: &'static SimShared,
+  /// The clock's allocation, owned here as a raw pointer and freed in `Drop` after every context is
+  /// reclaimed. A raw pointer, not a `Box`: moving a `Box` (into this struct, or this struct out of
+  /// `new`) is a unique retag of its allocation under Stacked Borrows, which invalidated the shared
+  /// borrows the drivers already held — Miri caught the drivers' next `now_ns` reading through a tag
+  /// no longer on the borrow stack (2026-09-16; `-p slates-rt --test differential`).
+  clock_allocation: std::ptr::NonNull<SimShared>,
   shared: Vec<&'static SimShared>,
 }
 
@@ -491,18 +496,23 @@ impl Drop for SimRuntime {
       crate::registry::reclaim_context(id);
       crate::registry::unregister(id);
     }
+    // SAFETY: the allocation was made by `Box::new` in `new` and is freed exactly once, here, after
+    // every context — and so every driver holding a `&'static` into it — was reclaimed above; nothing
+    // reads `self.clock` after this.
+    unsafe { drop(Box::from_raw(self.clock_allocation.as_ptr())) };
   }
 }
 
 impl SimRuntime {
   /// Builds `config.shards` simulated shards sharing one clock seeded by `seed`.
   pub fn new(config: &RuntimeConfig, seed: u64) -> Result<SimRuntime, RtError> {
-    let clock_box = Box::new(SimShared::new(seed));
-    // SAFETY: extends the borrow to `'static` for the drivers: the box is owned by the runtime being
-    // built and dropped only after its `Drop` freed every context (and so every driver) — the field
-    // order below drops `shards` first, and `Drop::drop` reclaims them before any field drops — so no
-    // driver outlives the clock. Before 2026-09-14 the clock was leaked per simulation instead.
-    let clock: &'static SimShared = unsafe { &*std::ptr::from_ref(&*clock_box) };
+    let clock_allocation = std::ptr::NonNull::from(Box::leak(Box::new(SimShared::new(seed))));
+    // SAFETY: the allocation lives until this runtime's `Drop` frees it, after every context (and so
+    // every driver borrowing it) was reclaimed, so no driver outlives the clock; and it is never moved
+    // through a `Box` again — the pointer is what the struct holds — so no unique retag invalidates
+    // these shared borrows while they are live. Before 2026-09-14 the clock was leaked per simulation;
+    // from then until 2026-09-16 it was a `Box` field, whose move invalidated the borrows (Miri).
+    let clock: &'static SimShared = unsafe { clock_allocation.as_ref() };
     // A fresh simulation starts with an empty UDP fabric on this thread.
     sim_fabric_reset(seed);
     let mut seeds = Vec::new();
@@ -542,7 +552,8 @@ impl SimRuntime {
       .collect::<Result<Vec<_>, _>>()?;
     Ok(SimRuntime {
       shards,
-      clock: clock_box,
+      clock,
+      clock_allocation,
       shared,
     })
   }

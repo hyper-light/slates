@@ -44,6 +44,12 @@ jobs:
       # The daemon provisions from usable memory and degrades honestly when the OS grants little
       # lockable RAM (§4.2 D-12; docs/bugs/2026-09-10-provisioning-budget-from-mlock-limit.md), so the
       # tests run under the runner's default mlock limit — no `ulimit` bump, which the runners ignore.
+      # T-4.13's FUSE container leg mounts with `allow_other` (the runtime's daemon and the container are
+      # other users to the mount), which fusermount3 refuses unless /etc/fuse.conf says
+      # `user_allow_other`; without this the leg skips loudly instead of running.
+      - name: FUSE for the container leg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y fuse3 && echo user_allow_other | sudo tee -a /etc/fuse.conf
       - name: Test
         run: cargo test --workspace
       - name: AC-1.1 model suite over 10^6 generated operations
@@ -414,6 +420,15 @@ jobs:
         with:
           name: pjdfstest-output-${{ matrix.os }}
           path: ${{ runner.temp }}/conformance-scratch/pjdfstest-output
+          if-no-files-found: ignore
+      # The anchor logs: a daemon that stopped answering mid-suite (the macOS runner's fsstress run of
+      # 2026-09-16) explains itself only there; the record carries their tail, the artifact the whole.
+      - name: Upload the suites' anchor logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-anchor-logs-${{ matrix.os }}
+          path: ${{ runner.temp }}/conformance-scratch/*.log
           if-no-files-found: ignore
 
   # Part 6 "Concurrency", nightly: shuttle's randomized schedules over the pure cores — T-1.6 (two

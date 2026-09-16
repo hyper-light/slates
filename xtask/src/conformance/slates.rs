@@ -206,6 +206,14 @@ impl Anchor {
     Ok(anchor)
   }
 
+  /// The last `lines` lines of the anchor's log.
+  pub(crate) fn log_tail(&self, lines: usize) -> String {
+    let text = std::fs::read_to_string(&self.log).unwrap_or_default();
+    let all: Vec<&str> = text.lines().collect();
+    let from = all.len().saturating_sub(lines);
+    all[from..].join("\n")
+  }
+
   fn wait_ready(&self, binary: &SlatesBinary) -> Result<(), Failure> {
     let started = Instant::now();
     let mut streak = 0u32;
@@ -263,22 +271,82 @@ impl Drop for Anchor {
   }
 }
 
-/// Provisions a bounded volume through the CLI and returns its id.
+/// What [`create_volume`] made: the id, and a note naming the admitted size when the requested one
+/// was refused.
+pub(crate) struct CreatedVolume {
+  pub(crate) id: String,
+  pub(crate) note: Option<String>,
+}
+
+/// Format: the CLI's binary unit for a volume size (`512MiB`).
+const MIB: u64 = 1 << 20;
+
+/// Provisions a bounded volume through the CLI. A `BudgetExceeded { available }` refusal — the
+/// daemon's shard cannot reserve `size` (the CI macOS runner's daemon had 484,442,112 bytes for a
+/// 512MiB request, 2026-09-16, so no suite there ever got a volume) — is answered by a second
+/// create at [`admitted_size`] of what the refusal named, and the record says so.
 pub(crate) fn create_volume(
   binary: &SlatesBinary,
   instance: &str,
   name: &str,
   size: &str,
   fold: bool,
-) -> Result<String, Failure> {
+) -> Result<CreatedVolume, Failure> {
+  let reply = run_create(binary, instance, name, size, fold)?;
+  if reply.code == 0 {
+    return Ok(CreatedVolume {
+      id: reply.value_of("id")?,
+      note: None,
+    });
+  }
+  let Some(available) = available_of_refusal(&reply.stderr) else {
+    return Err(Failure(format!(
+      "volume create exited {}: {}",
+      reply.code,
+      reply.stderr.trim()
+    )));
+  };
+  let admitted = admitted_size(available);
+  let retried = run_create(binary, instance, name, &admitted, fold)?.expect_ok("volume create")?;
+  Ok(CreatedVolume {
+    id: retried.value_of("id")?,
+    note: Some(format!(
+      "the suite volume is {admitted}: {size} was refused BudgetExceeded with {available} bytes available on the daemon's shard, so it was sized to three quarters of that"
+    )),
+  })
+}
+
+fn run_create(
+  binary: &SlatesBinary,
+  instance: &str,
+  name: &str,
+  size: &str,
+  fold: bool,
+) -> Result<Reply, Failure> {
   let mut args = vec!["volume", "create", name, "--bounded", size];
   if fold {
     args.push("--fold");
   }
-  binary
-    .run(instance, &args)?
-    .expect_ok("volume create")?
-    .value_of("id")
+  binary.run(instance, &args)
+}
+
+/// The `available` bytes a `BudgetExceeded { available: N }` refusal names, from the CLI's stderr
+/// (`slates: refused: BudgetExceeded { available: 484442112 }`); `None` for any other refusal.
+pub(crate) fn available_of_refusal(stderr: &str) -> Option<u64> {
+  let after = stderr.split("BudgetExceeded { available: ").nth(1)?;
+  after
+    .split(|c: char| !c.is_ascii_digit())
+    .next()?
+    .parse()
+    .ok()
+}
+
+/// Derived: three quarters of the bytes the daemon had available, in whole MiB (the CLI's size
+/// syntax), at least one — the rest is left for what the suite's own run allocates beside the
+/// volume (the D-18 image, the journal, a second volume the hermeticity lifecycle makes).
+pub(crate) fn admitted_size(available: u64) -> String {
+  let mib = (available / 4 * 3) / MIB;
+  format!("{}MiB", mib.max(1))
 }
 
 /// The daemon's NFS loopback port, from `status ID --json`.
@@ -341,7 +409,7 @@ fn is_mounted(path: &Path) -> bool {
 
 /// A fresh user-owned mount-point directory (`mktemp -d`), canonical.
 fn fresh_mount_point() -> Result<PathBuf, Failure> {
-  let made = stdout_of("mktemp", &["-d", "-t", "slates-mount"]);
+  let made = stdout_of("mktemp", &["-d", "-t", "slates-mount.XXXXXX"]);
   if made.is_empty() {
     return Err(Failure("mktemp -d failed for the mount point".to_owned()));
   }
@@ -514,10 +582,17 @@ pub(crate) struct Session {
   pub(crate) binary: SlatesBinary,
   pub(crate) instance: String,
   pub(crate) volume_id: String,
+  /// Why the volume is not the requested size (`VOLUME_SIZE`), when it is not — for the record's
+  /// notes, which name the admitted size.
+  pub(crate) size_note: Option<String>,
   pub(crate) mount: Mount,
   pub(crate) anchor: Anchor,
   base: PathBuf,
 }
+
+/// Shape: how many lines of the anchor's log a record carries when the daemon stopped answering —
+/// the abort or the refusal that ended it sits at the tail.
+const ANCHOR_LOG_TAIL_LINES: usize = 40;
 
 impl Session {
   /// Builds the binary, starts the anchor (under `tracer` when given), provisions a volume named
@@ -543,7 +618,8 @@ impl Session {
       .run(&instance, &["bootstrap", "root"])?
       .expect_ok("bootstrap root")?;
     let volume_name = format!("{suite}-vol");
-    let volume_id = create_volume(&binary, &instance, &volume_name, super::VOLUME_SIZE, fold)?;
+    let created = create_volume(&binary, &instance, &volume_name, super::VOLUME_SIZE, fold)?;
+    let volume_id = created.id;
     let mount = mount_volume(run, &binary, &instance, &volume_id, &volume_name)?;
     let base = mount
       .path()
@@ -553,10 +629,17 @@ impl Session {
       binary,
       instance,
       volume_id,
+      size_note: created.note,
       mount,
       anchor,
       base,
     })
+  }
+
+  /// The tail of the anchor's log — what a record carries when the daemon stopped answering, so the
+  /// abort or refusal that ended it is in the record and not only on the runner.
+  pub(crate) fn anchor_log_tail(&self) -> String {
+    self.anchor.log_tail(ANCHOR_LOG_TAIL_LINES)
   }
 
   /// A fresh working directory inside the mount.
@@ -572,5 +655,37 @@ impl Session {
       .binary
       .run(&self.instance, &["volume", "list"])
       .is_ok_and(|r| r.code == 0)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{admitted_size, available_of_refusal};
+
+  /// The refusal the CI macOS runner's daemon printed (2026-09-16) yields its available bytes; any
+  /// other refusal, or a malformed number, yields none — so only a budget refusal is answered with
+  /// a smaller volume.
+  #[test]
+  fn a_budget_refusal_names_its_available_bytes_and_nothing_else_does() {
+    assert_eq!(
+      available_of_refusal("slates: refused: BudgetExceeded { available: 484442112 }\n"),
+      Some(484_442_112)
+    );
+    assert_eq!(
+      available_of_refusal("slates: refused: ConsensusNotInitialized\n"),
+      None
+    );
+    assert_eq!(
+      available_of_refusal("slates: refused: BudgetExceeded { available: lots }"),
+      None
+    );
+  }
+
+  /// Three quarters of what was available, in whole MiB, never below one.
+  #[test]
+  fn the_admitted_size_is_three_quarters_in_whole_mib() {
+    assert_eq!(admitted_size(484_442_112), "346MiB");
+    assert_eq!(admitted_size(0), "1MiB");
+    assert_eq!(admitted_size(4 << 20), "3MiB");
   }
 }

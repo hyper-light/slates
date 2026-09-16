@@ -13,9 +13,9 @@
 //! closed taxonomy (relative paths, not a mount point, a foreign filesystem, another volume, an
 //! unreadable table).
 
-use slates_ipc::protocol::{
-  AttachTransport, HostMountEvidence, HostPathReason, OciBinding, Refusal, UnsupportedReason,
-};
+use slates_ipc::protocol::{AttachTransport, OciBinding, Refusal, UnsupportedReason};
+#[cfg(unix)]
+use slates_ipc::protocol::{HostMountEvidence, HostPathReason};
 
 /// The verified binding of `source` (a mount point of the volume named `volume_name`) at
 /// `destination`, read-only or not.

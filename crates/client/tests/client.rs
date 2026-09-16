@@ -524,6 +524,13 @@ fn a_base_seeded_greens_origin_survives_a_daemon_restart() {
     }
   };
   let dir = host_dir_with_file();
+  // Captured by the harness and shown only on failure: the CI macOS lane refused the base-seeded
+  // overlay `NoSpace` on 2026-09-16 where this host admits it, and the daemon's derived budget is the
+  // first thing that failure has to explain (§4.2 D-12 derives it from the runner's memory).
+  eprintln!(
+    "the fixture's daemon: reserve_per_shard {} bytes, content segment {content_bytes} bytes, {} shards; derivations: {:#?}",
+    config.reserve_per_shard, TEST_SHARDS, config.derivations
+  );
   let first = Daemon::start(&profile, config.clone(), source()).unwrap();
   first
     .bootstrap(true)

@@ -35,7 +35,7 @@
 pub use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use slates_db::HostId;
 use slates_db::register::{DomainId, Quorum, RegionId};
-use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
+use slates_rt::udp::{Ipv4Addr, SocketAddrV4};
 use slates_transport::handshake::Identity;
 
 use crate::config::{DurabilityBound, FleetMembership};
@@ -551,7 +551,7 @@ pub fn plan(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use slates_rt::tcp::Ipv4Addr;
+  use slates_rt::udp::Ipv4Addr;
 
   /// Shape: the fleet's TLS name in these tests; every minted certificate carries it.
   const NAME: &str = "slates-fleet";

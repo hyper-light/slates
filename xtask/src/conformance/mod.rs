@@ -376,7 +376,7 @@ impl Scratch {
         dir.clone()
       }
       None => {
-        let made = stdout_of("mktemp", &["-d", "-t", "slates-conformance"]);
+        let made = stdout_of("mktemp", &["-d", "-t", "slates-conformance.XXXXXX"]);
         if made.is_empty() {
           return Err(Failure("mktemp -d failed; pass --scratch DIR".to_owned()));
         }
