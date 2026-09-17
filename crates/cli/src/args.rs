@@ -540,8 +540,8 @@ const SWITCHES: &[&str] = &[
   "--keep",
 ];
 
-/// Splits `rest` at `--`: the flags before it, the command after it (`exec` and `run` share it).
-fn split_at_command(rest: &[String]) -> Result<(&[String], Vec<String>), ParseError> {
+/// Takes the untouched command after `--` (`exec` and `run` share this boundary).
+fn command_after(rest: &[String]) -> Result<Vec<String>, ParseError> {
   let Some(split) = rest.iter().position(|a| a == "--") else {
     return Err(ParseError::Missing("`--` then the command"));
   };
@@ -549,13 +549,13 @@ fn split_at_command(rest: &[String]) -> Result<(&[String], Vec<String>), ParseEr
   if command.is_empty() {
     return Err(ParseError::Missing("a command after `--`"));
   }
-  Ok((&rest[..split], command))
+  Ok(command)
 }
 
 /// Parses `run [--keep] [--json] [--instance NAME] -- CMD ...`.
-fn parse_run(rest: &[String]) -> Result<Command, ParseError> {
-  let (head, command) = split_at_command(rest)?;
-  let taken = take(head)?;
+fn parse_run(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError> {
+  let command = command_after(arguments)?;
+  refuse_extra_command_words(taken)?;
   taken.only(&Spec {
     values: &[],
     switches: &["--keep"],
@@ -569,9 +569,9 @@ fn parse_run(rest: &[String]) -> Result<Command, ParseError> {
 }
 
 /// Parses `exec --volume V --at PATH -- CMD ...`: the flags before `--`, the command after it.
-fn parse_exec(rest: &[String]) -> Result<Command, ParseError> {
-  let (head, command) = split_at_command(rest)?;
-  let taken = take(head)?;
+fn parse_exec(taken: &Taken, arguments: &[String]) -> Result<Command, ParseError> {
+  let command = command_after(arguments)?;
+  refuse_extra_command_words(taken)?;
   taken.only(&Spec {
     values: &["--volume", "--at"],
     switches: &[],
@@ -589,6 +589,14 @@ fn parse_exec(rest: &[String]) -> Result<Command, ParseError> {
     at,
     command,
   }))
+}
+
+/// Harness verbs have exactly one positional word before the command boundary: the verb itself.
+fn refuse_extra_command_words(taken: &Taken) -> Result<(), ParseError> {
+  match taken.words.get(1) {
+    Some(extra) => Err(ParseError::Extra(extra.clone())),
+    None => Ok(()),
+  }
 }
 
 /// The flags one verb takes: those with a value and the switches (the instance is every
@@ -985,14 +993,15 @@ fn parse_submit(taken: &Taken, work: &str) -> Result<Command, ParseError> {
 
 /// Parses the arguments (without the program name).
 pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
-  if arguments.first().map(String::as_str) == Some("exec") {
-    return parse_exec(&arguments[1..]);
-  }
-  if arguments.first().map(String::as_str) == Some("run") {
-    return parse_run(&arguments[1..]);
-  }
-  let taken = take(arguments)?;
+  let boundary = arguments.iter().position(|argument| argument == "--");
+  let taken = take(&arguments[..boundary.unwrap_or(arguments.len())])?;
   let words: Vec<&str> = taken.words.iter().map(String::as_str).collect();
+  match words.first().copied() {
+    Some("run") => return parse_run(&taken, arguments),
+    Some("exec") => return parse_exec(&taken, arguments),
+    _ if boundary.is_some() => return Err(ParseError::UnknownFlag("--".to_owned())),
+    _ => {}
+  }
   if let Some(command) = parse_enrollment(&taken, &words)? {
     return Ok(command);
   }
@@ -1975,6 +1984,70 @@ mod tests {
       parse(&args("run sh")),
       Err(ParseError::Missing("`--` then the command"))
     ));
+  }
+
+  /// §4.12/§4.13: global flags may precede the harness verb; everything after `--` belongs
+  /// to the child, including flags that are also meaningful to slates.
+  #[test]
+  fn global_flags_before_run_preserve_the_child_arguments() {
+    for arguments in [
+      "--instance outer run --keep --json -- child --instance inner --json --help --",
+      "--json --instance=outer run --keep -- child --instance inner --json --help --",
+      "run --instance outer --keep --json -- child --instance inner --json --help --",
+    ] {
+      assert_eq!(
+        parse(&args(arguments)),
+        Ok(Command::Run(RunRequest {
+          instance: "outer".into(),
+          keep: true,
+          json: true,
+          command: args("child --instance inner --json --help --"),
+        }))
+      );
+    }
+    assert_eq!(
+      parse(&args("--instance run status")),
+      Ok(Command::Client(ClientRequest {
+        instance: "run".into(),
+        json: false,
+        verb: Verb::DaemonStatus,
+      }))
+    );
+  }
+
+  /// §4.12: exec has the same command boundary as run, with global options before the verb.
+  #[test]
+  fn global_flags_before_exec_preserve_the_child_arguments() {
+    assert_eq!(
+      parse(&args(
+        "--instance outer exec --volume scratch --at /p -- child --volume inner --help"
+      )),
+      Ok(Command::Exec(ExecRequest {
+        volume: "scratch".into(),
+        at: "/p".into(),
+        command: args("child --volume inner --help"),
+      }))
+    );
+  }
+
+  /// §4.12: the command boundary belongs only to harness verbs; stray words and flags on
+  /// their slates side remain usage errors instead of being silently discarded.
+  #[test]
+  fn harness_boundaries_refuse_extra_words_and_foreign_flags() {
+    for verb in ["run", "exec --volume scratch --at /p"] {
+      assert_eq!(
+        parse(&args(&format!("--instance outer {verb} stray -- child"))),
+        Err(ParseError::Extra("stray".into()))
+      );
+      assert_eq!(
+        parse(&args(&format!("--instance outer {verb} --quick -- child"))),
+        Err(ParseError::UnknownFlag("--quick".into()))
+      );
+    }
+    assert_eq!(
+      parse(&args("status -- child")),
+      Err(ParseError::UnknownFlag("--".into()))
+    );
   }
 
   /// `exec` splits at `--`: the flags before it, the command after; a missing `--` or an empty

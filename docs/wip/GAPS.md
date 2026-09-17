@@ -1355,3 +1355,13 @@ was deleted afterward. WAN netem and safe rolling-upgrade evidence remain separa
 
 The additional warm-discovery refusal/restart regression passed on macOS in 0.79 s, proving
 that a failed one-peer-capacity restore does not erase the second retained peer.
+
+### 2026-09-17: CLI process gate
+
+The macOS process gate's two failures are corrected: global options before `run`/`exec`
+now preserve the child argument boundary, and the fresh consumer/fleet fixtures explicitly
+bootstrap. The fleet fixture distinguishes seed-link replacement from transport faults and
+keeps the root representative alive during owner loss. Consumer flow: 1.89 s; fleet
+formation, placement, takeover and mounted read-back: 8.90 s. This closes the two failures
+in job 105312670519, not the other jobs still running in that workflow.
+Evidence and commands: [CLI gate](../bugs/2026-09-17-cli-process-gate.md).

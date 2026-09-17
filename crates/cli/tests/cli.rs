@@ -799,6 +799,8 @@ fn start_anchor_with_issuer_surface(instance: &str) -> (AnchorProcess, Vec<(Stri
     let (code, _, _) = run(instance, &["volume", "list"]);
     streak = if code == 0 { streak + 1 } else { 0 };
     if streak >= STABLE_STREAK {
+      let (code, _, error) = run(instance, &["bootstrap", "root"]);
+      assert_eq!(code, 0, "explicit first-time bootstrap: {error}");
       return (anchor, exports);
     }
     assert!(started.elapsed() < START_WAIT, "the daemon came up: {code}");
@@ -1239,15 +1241,28 @@ fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
       u32::try_from(FLEET_NODES.len() - 1).unwrap(),
       "both peers probed: {views:?}"
     );
-    // A clean formation: the serve sockets routed every packet to its session, dropped nothing, refused
-    // no dialer, replaced no session — and the daemon refused nothing.
+    // Fresh identities replace the manifest's seed links. A replacement is a successful lifecycle
+    // transition, not a dropped packet; queue/capacity loss and unexpected refusals still fail here.
+    let (drops, _) = view.dropped.rsplit_once(' ').unwrap();
     assert_eq!(
-      view.dropped, "unknown_id=0 inbox_full=0 refused=0 replaced=0",
+      drops, "unknown_id=0 inbox_full=0 refused=0",
       "the serve sockets dropped nothing forming the fleet: {views:?}"
     );
     assert!(
-      view.refusals.is_empty(),
-      "nothing refused forming the fleet: {views:?}"
+      view
+        .refusals
+        .split(';')
+        .filter(|line| !line.trim().is_empty())
+        .all(|line| {
+          [
+            "fleet.discovery.invalidated:",
+            "fleet.link.stale_return:",
+            "fleet.accept.replaced:",
+          ]
+          .iter()
+          .any(|counter| line.split_whitespace().nth(3) == Some(counter))
+        }),
+      "only superseded link work may end during formation: {views:?}"
     );
   }
   let mut hosts: Vec<String> = formed.iter().map(|v| v.host.clone()).collect();
@@ -1281,11 +1296,25 @@ fn write_payload_through(path: &str) {
 /// `mount_nfs` exists (the mount is released before the owner dies, so no kernel client is left talking to
 /// a dead server), and seals it; returns the id and the snapshot.
 fn seal_on_owner(instance: &str, mountable: bool) -> (String, String) {
-  let (code, out, err) = run(
-    instance,
-    &["volume", "create", FLEET_VOLUME, "--bounded", "8MiB"],
-  );
-  assert_eq!(code, 0, "{err}");
+  // The mesh forms before a fresh learner imports the bootstrapped groups. The explicit refusal
+  // precedes any create effect, so only that refusal is retried, within the existing formation bound.
+  let deadline = Instant::now() + FLEET_WAIT;
+  let out = loop {
+    let (code, out, err) = run(
+      instance,
+      &["volume", "create", FLEET_VOLUME, "--bounded", "8MiB"],
+    );
+    if code == 1 && err.trim() == "slates: refused: ConsensusNotInitialized" {
+      assert!(
+        Instant::now() < deadline,
+        "the owner imported the bootstrapped groups: {err}"
+      );
+      pause();
+      continue;
+    }
+    assert_eq!(code, 0, "{err}");
+    break out;
+  };
   let id = value_of(&out, "id");
   if mountable {
     let mount_point = MountPoint {
@@ -1436,21 +1465,43 @@ fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owner
   }
 
   // Formation: one manifest, three processes, one fleet.
-  let hosts = assert_formed(&wait_fleet_views(
+  let views = wait_fleet_views(
     &instances,
     FLEET_NODES.len(),
     u32::try_from(FLEET_NODES.len() - 1).unwrap(),
-  ));
-  let owner_host = fleet_view(&instances[0]).unwrap().host;
+  );
+  let hosts = assert_formed(&views);
+  // Bootstrap once on the eventual root representative and keep it alive. The owner's crash then
+  // exercises regional takeover through a surviving quorum, not loss of the singleton root group.
+  let bootstrap = views
+    .iter()
+    .enumerate()
+    .min_by_key(|(_, view)| view.as_ref().unwrap().host.parse::<u64>().unwrap())
+    .map(|(index, _)| index)
+    .unwrap();
+  let (code, _, error) = run(&instances[bootstrap], &["bootstrap", "root"]);
+  assert_eq!(
+    code, 0,
+    "one explicit bootstrap of the fresh fleet: {error}"
+  );
+  let owner = (0..instances.len())
+    .find(|index| *index != bootstrap)
+    .unwrap();
+  let owner_host = views[owner].as_ref().unwrap().host.clone();
   assert!(hosts.contains(&owner_host));
 
   // Placement across processes, then the owner's death as a crash would deal it.
   let mountable = mount_nfs_available();
-  let (id, snapshot) = seal_on_owner(&instances[0], mountable);
-  wait_placed(&instances[0], &id, &snapshot);
-  let survivors = instances[1..].to_vec();
+  let (id, snapshot) = seal_on_owner(&instances[owner], mountable);
+  wait_placed(&instances[owner], &id, &snapshot);
+  let survivors: Vec<String> = instances
+    .iter()
+    .enumerate()
+    .filter(|(index, _)| *index != owner)
+    .map(|(_, instance)| instance.clone())
+    .collect();
   assert_not_served(&survivors, &id);
-  drop(daemons.remove(0));
+  drop(daemons.remove(owner));
 
   // Retirement, takeover, serve.
   assert_retired(&wait_fleet_views(&survivors, 2, 1), &owner_host);

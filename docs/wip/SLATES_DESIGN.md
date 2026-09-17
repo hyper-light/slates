@@ -2441,6 +2441,15 @@ the format floor.
 
 ### 4.12 Agent surfaces (D-19)
 
+> **Correction (2026-09-17, CLI process gate).** `run` and `exec` accept global flags before
+> their verb; the first `--` separates slates options from the child's untouched argument
+> vector. Dispatch uses parsed positional words, never the first raw argument. This repairs
+> `slates --instance NAME run -- CMD`, which rejected its separator. The consumer and fleet
+> process fixtures explicitly bootstrap their fresh groups; the fleet keeps its singleton
+> root representative alive while proving regional takeover. A handshake superseded by an
+> authenticated replacement is counted as `fleet.accept.replaced`, separately from actual
+> handshake failures. Evidence: [CLI gate](../bugs/2026-09-17-cli-process-gate.md).
+
 > **Status (A-9, 2026-09-05).** The Rust client and a CLI subset exist. `docs/cli.md`
 > documents the actual grammar. `attach` records metadata but does not establish a mounted
 > path; `exec` is Linux-specific and currently needs an externally supplied `SLATES_ROOT`.

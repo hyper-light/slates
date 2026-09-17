@@ -1050,9 +1050,7 @@ async fn serve_peer_probes(
   roster: Vec<Rostered>,
 ) {
   if let Err(e) = endpoint.establish().await {
-    if count_refusal(ACCEPT_HANDSHAKE_REFUSED) == 1 {
-      eprintln!("slates-server: fleet: a dialer's probe-plane handshake did not complete: {e:?}");
-    }
+    count_accept_failure(&e, "probe");
     return;
   }
   // Only a **rostered** certificate may move membership (auth): the anchor it stands for is what the prober's
@@ -1528,9 +1526,7 @@ async fn serve_peer_records(
   driver: &'static PeerDriver,
 ) {
   if let Err(e) = endpoint.establish().await {
-    if count_refusal(ACCEPT_HANDSHAKE_REFUSED) == 1 {
-      eprintln!("slates-server: fleet: a dialer's record-plane handshake did not complete: {e:?}");
-    }
+    count_accept_failure(&e, "record");
     return;
   }
   // Two ids for the authenticated peer (task #22 two-id model). `peer_anchor` is its **stable** anchor — the
@@ -2767,6 +2763,23 @@ const DIAL_FAULT: &str = "fleet.dial.fault";
 /// not complete (the dialer gave up, or its flight faulted); the log's first line says why.
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const ACCEPT_HANDSHAKE_REFUSED: &str = "fleet.accept.handshake";
+
+/// An accepted handshake superseded by the same authenticated peer's newer session (§4.10a).
+/// Kept apart from TLS and socket failures: learning a fresh boot identity can cancel a seed dial.
+const ACCEPT_REPLACED: &str = "fleet.accept.replaced";
+
+/// Classifies the transport's typed handshake result without hiding a real TLS or socket failure
+/// behind an expected replacement. Both serve planes use the same distinction.
+fn count_accept_failure(error: &EndpointError, plane: &str) {
+  let counter = if matches!(error, EndpointError::Closed) {
+    ACCEPT_REPLACED
+  } else {
+    ACCEPT_HANDSHAKE_REFUSED
+  };
+  if count_refusal(counter) == 1 {
+    eprintln!("slates-server: fleet: a dialer's {plane}-plane handshake ended: {error:?}");
+  }
+}
 
 /// Counts a fleet-loop refusal in the shard's status refusal counts, so a peer the loop could not set up is
 /// visible to an operator (the mesh will not form to it) rather than a swallowed error (banned item 9).
