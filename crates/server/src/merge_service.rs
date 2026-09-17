@@ -890,7 +890,10 @@ pub struct HolderMergeState {
 impl MergeShardState {
   /// The version-0 or version-N inputs of `green` as one archive: a manifest with one file named
   /// [`INPUTS_ENTRY_NAME`] over one raw chunk of the bytes (the chain's own entry). Deterministic:
-  /// the manifest identity depends on the bytes and the entry's name and size alone.
+  /// the manifest identity depends on the bytes, the entry's name and size, and the default root
+  /// metadata alone — and it is [`Archive::manifest_identity`], the one identity the put, the hold and
+  /// the record all name (the tree's own identity is not it since the root's metadata joined the
+  /// manifest, format minor 2).
   fn inputs_archive(bytes: &[u8], created_unix: u64, page: u32) -> Archive {
     let chunk = Archive::raw_chunk(bytes.to_vec());
     let len = chunk.raw_len;
@@ -920,6 +923,16 @@ impl MergeShardState {
       }]),
       chunks: vec![chunk],
     }
+  }
+
+  /// The identity a merge record names a version's inputs by: the inputs archive's manifest identity —
+  /// the root's metadata and the tree (format minor 2) — which is what the owner's put binds and the
+  /// holder's hold keys by (`ContentHold::hold`, `archive_of`), so a holder that acknowledged the put
+  /// finds the inputs when the record arrives. The tree's own identity is not it: a record naming that
+  /// named an archive no holder ever held, and waited `INPUTS_UNHELD` for good
+  /// (`docs/bugs/2026-09-16-merge-record-names-inputs-by-the-tree-only-identity.md`).
+  fn inputs_identity(bytes: &[u8], page: u32) -> [u8; 32] {
+    Self::inputs_archive(bytes, 0, page).manifest_identity()
   }
 }
 
@@ -962,11 +975,8 @@ pub(crate) fn enqueue_record(
     .get(&green)
     .map(Green::head_identity)
     .unwrap_or_default();
-  let inputs_identity = inputs_of(state, green, version).map(|bytes| {
-    MergeShardState::inputs_archive(&bytes, 0, archive_page(state))
-      .manifest
-      .identity()
-  });
+  let inputs_identity = inputs_of(state, green, version)
+    .map(|bytes| MergeShardState::inputs_identity(&bytes, archive_page(state)));
   let local_hold = Placement {
     candidates: candidates.clone(),
     acked: vec![local],
@@ -1735,8 +1745,45 @@ mod tests {
     let one = MergeShardState::inputs_archive(b"inputs", 0, 4096);
     let same = MergeShardState::inputs_archive(b"inputs", 99, 8192);
     let other = MergeShardState::inputs_archive(b"other!", 0, 4096);
-    assert_eq!(one.manifest.identity(), same.manifest.identity());
-    assert_ne!(one.manifest.identity(), other.manifest.identity());
+    assert_eq!(one.manifest_identity(), same.manifest_identity());
+    assert_ne!(one.manifest_identity(), other.manifest_identity());
+    assert_eq!(
+      MergeShardState::inputs_identity(b"inputs", 8192),
+      one.manifest_identity()
+    );
     assert_eq!(Archive::content(&one.chunks[0]).unwrap(), b"inputs");
+  }
+
+  /// §4.16 "Apply on holders" ("the holder finds the version's inputs in its content hold"): the
+  /// identity a merge record names its inputs by is the identity the content hold keys the shipped
+  /// archive by — put, hold and record agree — so a holder that acknowledged the put finds the inputs
+  /// when the record arrives, and recomputes from exactly those bytes. Non-vacuous: the tree's own
+  /// identity, which the record named until 2026-09-16, is not a key the hold has, and a record naming
+  /// it waited `INPUTS_UNHELD` every period for good
+  /// (`docs/bugs/2026-09-16-merge-record-names-inputs-by-the-tree-only-identity.md`).
+  #[test]
+  fn the_record_names_the_inputs_by_the_identity_the_hold_keys_by() {
+    let bytes = b"the increment's chain entry";
+    let named = MergeShardState::inputs_identity(bytes, 4096);
+    let mut hold = slates_cluster::content::ContentHold::new();
+    let held = hold
+      .hold(MergeShardState::inputs_archive(bytes, 0, 4096))
+      .expect("the inputs archive is whole and verifies");
+    assert_eq!(named, held, "the record names what the hold keys by");
+    let found = hold
+      .archive_of(&named)
+      .expect("the holder finds the inputs the record names");
+    assert_eq!(Archive::content(&found.chunks[0]).unwrap(), bytes);
+    let tree_only = MergeShardState::inputs_archive(bytes, 0, 4096)
+      .manifest
+      .identity();
+    assert_ne!(
+      tree_only, held,
+      "the tree's own identity is not the hold's key (format minor 2)"
+    );
+    assert!(
+      hold.archive_of(&tree_only).is_none(),
+      "a record naming the tree's identity finds nothing"
+    );
   }
 }
