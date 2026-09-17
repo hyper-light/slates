@@ -61,7 +61,9 @@ pub mod uring;
 
 pub use driver::{Driver, DriverKind};
 pub use error::RtError;
+pub use registry::SlotHolder;
 pub use runtime::{Runtime, RuntimeConfig};
 pub use shard::{ShardId, TaskId};
 pub use sim::SimRuntime;
 pub use task::Outcome;
+pub use task::{Admission, AdmissionReceipt};

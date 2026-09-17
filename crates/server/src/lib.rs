@@ -44,6 +44,7 @@ pub mod merge_service;
 // (both cross-platform) but does not serve NFS — the mount arrives with the WinFsp bridge.
 #[cfg(unix)]
 pub mod nfs;
+pub mod observe;
 // The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount
 // table and the runtime-specification entry; paired per platform inside, so it compiles everywhere.
 pub mod oci;

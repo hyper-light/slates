@@ -532,19 +532,58 @@ pub fn take() -> Option<ShardState> {
   STATE.with(|cell| cell.borrow_mut().take())
 }
 
-/// Borrows the state; `None` when the calling thread is not a shard with state, or the
-/// state is already borrowed (a nested borrow is a bug, counted by the caller).
-pub fn with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
+/// Why a borrow of the shard's state was refused ([`try_with_state`]): the four ways the state can be
+/// out of reach, kept apart because an observer must tell a shard whose state is gone from one that
+/// is merely busy or that answered and then failed its retention check (§4.14; `crate::observe`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StateAccess {
+  /// The state is already borrowed on this thread: a nested borrow, a bug the caller counts.
+  Borrowed,
+  /// This thread has no state: it runs no shard, or its shard's state was taken (shutdown).
+  Absent,
+  /// The shard is fenced: consensus recovery failed and it serves nothing (`consensus_failure`).
+  Fenced,
+  /// The borrow ran to its end, but the retention check every borrow closes with refused, so the
+  /// borrow's result was discarded; the check's own refusal.
+  Retention(slates_anchor::AnchorError),
+}
+
+impl std::fmt::Display for StateAccess {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      StateAccess::Borrowed => f.write_str("already borrowed on this thread (a nested borrow)"),
+      StateAccess::Absent => f.write_str("absent (this thread holds no shard state)"),
+      StateAccess::Fenced => f.write_str("fenced (consensus recovery failed on this shard)"),
+      StateAccess::Retention(refusal) => {
+        write!(
+          f,
+          "discarded by the retention check after the borrow: {refusal}"
+        )
+      }
+    }
+  }
+}
+
+/// Borrows the state, naming the refusal when it cannot: the calling thread has no state, the state is
+/// already borrowed (a nested borrow is a bug, counted by the caller), the shard is fenced, or the
+/// retention check that closes every borrow refused (the borrow ran; its result is discarded).
+pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, StateAccess> {
   STATE.with(|cell| {
-    let mut guard = cell.try_borrow_mut().ok()?;
-    let state = guard.as_mut()?;
+    let mut guard = cell.try_borrow_mut().map_err(|_| StateAccess::Borrowed)?;
+    let state = guard.as_mut().ok_or(StateAccess::Absent)?;
     if state.consensus_failure.is_some() {
-      return None;
+      return Err(StateAccess::Fenced);
     }
     let result = f(state);
-    crate::retention::retain(state).ok()?;
-    Some(result)
+    crate::retention::retain(state).map_err(StateAccess::Retention)?;
+    Ok(result)
   })
+}
+
+/// Borrows the state; `None` for any refusal [`try_with_state`] names — the form for a caller that
+/// acts the same whichever it was.
+pub fn with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
+  try_with_state(f).ok()
 }
 
 /// Whether any client ring on this thread holds a request (the poller's question).

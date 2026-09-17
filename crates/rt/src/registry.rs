@@ -688,6 +688,58 @@ fn send_control_to(entry: &Entry, target: u16, message: Control) -> Result<(), R
   }
 }
 
+/// A live shard named together with the registration that holds its slot: what a foreign submitter
+/// keeps when its work must reach *that* shard and never a later holder of the slot. A slot freed at
+/// unregistration is claimed by the next shard to register (the lowest free slot), so a message
+/// addressed by id alone after the shard exited would reach a stranger — an observation of one daemon
+/// landing on the next daemon to start. [`send_control_to_holder`] refuses `ShardGone` instead once
+/// the slot is free or held by a later registration. Read from a started runtime
+/// ([`crate::Runtime::holder_of`]): a registration in progress has claimed its generation before it
+/// published its entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SlotHolder {
+  shard: u16,
+  generation: u32,
+}
+
+impl SlotHolder {
+  /// The shard id.
+  pub fn shard(&self) -> u16 {
+    self.shard
+  }
+}
+
+/// The registration currently holding `shard`'s slot; `None` for a free slot.
+pub fn holder_of(shard: u16) -> Option<SlotHolder> {
+  let slot = SLOTS.get(usize::from(shard))?;
+  let generation = slot.generation.load(Ordering::Acquire);
+  (generation & 1 == 0).then_some(SlotHolder { shard, generation })
+}
+
+/// Sends a control message to the shard `holder` names, from any thread, and kicks it; refused
+/// `ShardGone` when the slot is free or held by a later registration (see [`SlotHolder`]) and
+/// `ControlFull` when the holder's control channel is full.
+pub fn send_control_to_holder(holder: SlotHolder, message: Control) -> Result<(), RtError> {
+  let Some(slot) = SLOTS.get(usize::from(holder.shard)) else {
+    return Err(RtError::ShardGone {
+      shard: holder.shard,
+    });
+  };
+  with_entry(holder.shard, |entry| {
+    // Compared under the reader count, so the entry the send reaches is the one the generation names:
+    // a registration that replaces it waits this reader out before freeing it.
+    if slot.generation.load(Ordering::Acquire) != holder.generation {
+      return Err(RtError::ShardGone {
+        shard: holder.shard,
+      });
+    }
+    send_control_to(entry, holder.shard, message)
+  })
+  .ok_or(RtError::ShardGone {
+    shard: holder.shard,
+  })?
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -815,6 +867,12 @@ mod tests {
     unregister(id);
   }
 
+  // Every registration below is given back at the test's end. A slot left registered with a ring
+  // nobody drains is a live holder to every other test in this binary: the interleaving stress test's
+  // neighbour wake to it fills the ring and then spins, as the protocol says it must for a live
+  // holder, for good — the binary hung 10 minutes that way on 2026-09-17 (the stress test's last
+  // thread in `send_as_shard`, the neighbour a leaked two-word ring).
+
   #[test]
   fn registration_hands_out_distinct_ids_and_entries() {
     let (a, _ra) = register(8, 4, RegisterKick::Kick(Kick::none())).unwrap();
@@ -823,6 +881,8 @@ mod tests {
     assert!(entry(a).is_some());
     assert!(entry(b).is_some());
     assert_eq!(entry(a).unwrap().inbound.capacity(), 8);
+    unregister(a);
+    unregister(b);
   }
 
   #[test]
@@ -833,6 +893,7 @@ mod tests {
     let mut consumer = entry(id).unwrap().inbound.consumer();
     assert_eq!(consumer.pop(), Some(word.word()));
     assert_eq!(current_shard(), None);
+    unregister(id);
   }
 
   #[test]
@@ -850,6 +911,7 @@ mod tests {
     filler.join().unwrap();
     assert_eq!(c.pop(), Some(2));
     assert_eq!(c.pop(), Some(3));
+    unregister(id);
   }
 
   #[test]
@@ -869,5 +931,31 @@ mod tests {
       send_control(u16::MAX, Control::Shutdown),
       Err(RtError::ShardGone { .. })
     ));
+    unregister(id);
+  }
+
+  /// A submission pinned to a slot's registration is refused as gone once the slot is free, and once
+  /// a later registration holds it — never delivered to the new holder.
+  #[test]
+  fn a_holder_pinned_send_is_refused_once_the_slot_changes_hands() {
+    let (id, _receiver) = register(2, 2, RegisterKick::Kick(Kick::none())).unwrap();
+    let holder = holder_of(id).unwrap();
+    assert_eq!(holder.shard(), id);
+    send_control_to_holder(holder, Control::Active(true)).unwrap();
+    unregister(id);
+    assert!(holder_of(id).is_none(), "a free slot has no holder");
+    assert!(matches!(
+      send_control_to_holder(holder, Control::Active(true)),
+      Err(RtError::ShardGone { .. })
+    ));
+    let (again, _receiver) = register(2, 2, RegisterKick::Kick(Kick::none())).unwrap();
+    if again == id {
+      assert!(matches!(
+        send_control_to_holder(holder, Control::Active(true)),
+        Err(RtError::ShardGone { .. })
+      ));
+      assert_ne!(holder_of(again), Some(holder));
+    }
+    unregister(again);
   }
 }

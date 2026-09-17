@@ -155,7 +155,7 @@ const LOCAL_HEALTH_CAP: u32 = 2;
 /// Derived: how many times the collection loop polls for a reply within one protocol period — ten, so the
 /// loop wakes within a tenth of a period of the acknowledgement (10 ms at the default cadence) without
 /// spinning. A finer value measured from the RTT is the owed refinement.
-pub(crate) const POLL_PER_PERIOD: u64 = 10;
+pub const POLL_PER_PERIOD: u64 = 10;
 
 /// A fleet peer this node probes and is probed by (§4.8): its host id, the two addresses this node dials to
 /// reach it (its probe and record sockets), and the operator-provisioned certificate the mutual-TLS session

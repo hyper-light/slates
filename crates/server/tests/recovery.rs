@@ -192,7 +192,7 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
   let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
   assert_eq!(
     second.member_identity(),
-    Some(member),
+    Ok(member),
     "retained Raft state preserves the voter; a warm restart needs no bootstrap"
   );
   let report = client.status(kept).unwrap();

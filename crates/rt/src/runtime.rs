@@ -13,7 +13,27 @@ use crate::driver::{DriverSeed, Kick, os_driver};
 use crate::error::RtError;
 use crate::registry;
 use crate::shard::{Counters, ShardContext, ShardId, ShardSeed, TaskId};
-use crate::task::SpawnRequest;
+use crate::task::{AdmissionReceipt, SpawnRequest};
+
+/// Submits a detached task to the shard `holder` names, from any thread and without a runtime handle
+/// (a submitter that may outlive the runtime — an observation still pending while its daemon stops),
+/// and returns the receipt of its admission; refused `ShardGone` when the slot is free or held by a
+/// later registration, `ControlFull` when the holder's control channel is full.
+pub fn submit_to_holder<F: Future<Output = ()> + Send + 'static>(
+  holder: registry::SlotHolder,
+  future: F,
+) -> Result<AdmissionReceipt, RtError> {
+  let (request, receipt) = SpawnRequest::with_receipt(Box::pin(future), None);
+  registry::send_control_to_holder(holder, Control::Spawn(Box::new(request)))?;
+  Ok(receipt)
+}
+
+/// Requests a task's cancellation from any thread without a runtime handle (the message
+/// [`Runtime::cancel`] sends); refused when the task's shard is gone or its control channel is full.
+/// A task that already ended is a stale word the shard ignores.
+pub fn cancel_task(task: TaskId) -> Result<(), RtError> {
+  registry::send_control(task.0.shard(), Control::Cancel(task.0))
+}
 
 /// The runtime's configuration; every number is derived or measured by the caller.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -297,7 +317,9 @@ impl Runtime {
   }
 
   /// Spawns a detached task on a shard from any thread; refused when the shard's control
-  /// channel is full (its admission limit) or the shard is gone.
+  /// channel is full (its admission limit) or the shard is gone. `Ok` is a **submission**: the request
+  /// is in the shard's control channel, and whether the shard admits it is answered only to a receipt
+  /// ([`Self::spawn_on_with_receipt`]).
   pub fn spawn_on<F: Future<Output = ()> + Send + 'static>(
     &self,
     shard: ShardId,
@@ -305,6 +327,26 @@ impl Runtime {
   ) -> Result<(), RtError> {
     let request = Box::new(SpawnRequest::new(Box::pin(future), None));
     registry::send_control(shard.0, Control::Spawn(request))
+  }
+
+  /// Spawns a detached task on a shard from any thread and returns the receipt of its admission
+  /// ([`AdmissionReceipt`]): refused here when the shard's control channel is full or the shard is gone;
+  /// otherwise the receipt reports, once the shard drains the request, whether the task was admitted
+  /// (and as which task), refused (the arena full), or terminated unadmitted (the shard shutting down).
+  pub fn spawn_on_with_receipt<F: Future<Output = ()> + Send + 'static>(
+    &self,
+    shard: ShardId,
+    future: F,
+  ) -> Result<AdmissionReceipt, RtError> {
+    let (request, receipt) = SpawnRequest::with_receipt(Box::pin(future), None);
+    registry::send_control(shard.0, Control::Spawn(Box::new(request)))?;
+    Ok(receipt)
+  }
+
+  /// The registration holding `shard`'s slot, for a submitter that must reach this runtime's shard and
+  /// never a later holder of its slot ([`submit_to_holder`]); `None` when the shard is gone.
+  pub fn holder_of(&self, shard: ShardId) -> Option<registry::SlotHolder> {
+    registry::holder_of(shard.0)
   }
 
   /// Tells a shard whether a client is active, which enables the idle spin before parking.
@@ -320,7 +362,15 @@ impl Runtime {
   /// Shuts every shard down (cancelling what runs) and joins the threads; returns the counters.
   pub fn shutdown(self) -> Vec<Counters> {
     for id in &self.ids {
-      let _ = registry::send_control(id.0, Control::Shutdown);
+      // A full control channel refuses the message; the shard drains its channel as it runs, so the
+      // send is retried until it lands or the shard is gone. Before 2026-09-17 the refusal was
+      // dropped, and the join below then waited for a shutdown the shard never received: a runtime
+      // shut down while a shard's channel was full (a burst of submissions behind a long poll) hung
+      // for good (`tests/admission.rs`). The wait is bounded by the shard's next drain — a shard that
+      // never drains again would hang the join just the same.
+      while let Err(RtError::ControlFull { .. }) = registry::send_control(id.0, Control::Shutdown) {
+        std::thread::yield_now();
+      }
     }
     let counters: Vec<Counters> = self
       .threads

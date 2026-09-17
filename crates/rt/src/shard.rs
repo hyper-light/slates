@@ -29,7 +29,7 @@ use crate::error::RtError;
 use crate::queue::LocalQueue;
 use crate::registry::{self, Entry, MAX_SHARDS};
 use crate::runtime::RuntimeConfig;
-use crate::task::{BoxedFuture, NO_LINK, Outcome, SpawnRequest, State, TaskSlot};
+use crate::task::{Admission, BoxedFuture, NO_LINK, Outcome, SpawnRequest, State, TaskSlot};
 use crate::timer::Wheel;
 use crate::waker::waker_for;
 
@@ -98,6 +98,10 @@ pub struct Counters {
   pub nested_borrows: u64,
   /// Admissions refused because the arena was full.
   pub admission_refused: u64,
+  /// Spawn requests drained after shutdown began and refused unadmitted (their receipts answered
+  /// `Terminated`, their futures dropped): a shard shutting down admits nothing new, so its arena
+  /// drains monotonically and the loop's exit is bounded by the tasks it already holds.
+  pub refused_at_shutdown: u64,
   /// Idle spins that ended with work arriving.
   pub spin_hits: u64,
   /// Pollers woken because their ring had something (client command rings).
@@ -512,11 +516,21 @@ impl ShardContext {
 
   // ------------------------------------------------------------------ admission
 
-  /// Admits a spawn request (from any thread's message, or the runtime): detached.
+  /// Admits a spawn request (from any thread's message, or the runtime): detached. The request's
+  /// receipt, if it carries one, is answered with the outcome.
   pub fn spawn_request(&self, request: SpawnRequest) -> Result<TaskId, RtError> {
-    let SpawnRequest { future, parent } = request;
+    let SpawnRequest {
+      future,
+      parent,
+      receipt,
+    } = request;
     let parent = parent.filter(|p| p.shard() == self.id).map(|p| p.slot());
-    self.admit(future, parent, false)
+    let admitted = self.admit(future, parent, false);
+    receipt.answer(match &admitted {
+      Ok(task) => Admission::Admitted(*task),
+      Err(refusal) => Admission::Refused(refusal.clone()),
+    });
+    admitted
   }
 
   /// Admits a local future under `parent`, joinable.
@@ -956,17 +970,28 @@ impl ShardContext {
     entry
       .control_pending
       .store(false, std::sync::atomic::Ordering::Release);
-    let mut any = false;
     let batch = inner.config.batch.max(1);
-    for _ in 0..batch {
+    let mut drained = 0;
+    while drained < batch {
       let Ok(message) = inner.control.try_recv() else {
         break;
       };
-      any = true;
+      drained += 1;
       inner.counters.controls += 1;
       self.handle_control(inner, message);
     }
-    any
+    if drained == batch {
+      // A whole batch drained may have left messages behind it: re-arm the flag, so the next step
+      // drains again. Before 2026-09-17 nothing did, and a burst larger than one batch — a flood of
+      // submissions behind a long poll — sat undrained until some later send happened to set the flag:
+      // a spawn queued behind it was never admitted, and a shutdown refused by the still-full channel
+      // was retried against a shard that had parked for good (`tests/burst.rs`,
+      // `docs/bugs/2026-09-17-control-drain-forgets-a-burst-past-one-batch.md`).
+      entry
+        .control_pending
+        .store(true, std::sync::atomic::Ordering::Release);
+    }
+    drained > 0
   }
 
   fn drain_inbound(&self, inner: &mut ShardInner) -> bool {
@@ -1057,7 +1082,18 @@ impl ShardContext {
   fn handle_control(&self, inner: &mut ShardInner, message: Control) {
     match message {
       Control::Spawn(request) => {
-        let SpawnRequest { future, parent } = *request;
+        let SpawnRequest {
+          future,
+          parent,
+          receipt,
+        } = *request;
+        if inner.shutting_down {
+          // A shard shutting down admits nothing new — its arena drains to empty and the loop exits
+          // — so the request is refused unadmitted: its receipt answered, its future dropped here.
+          inner.counters.refused_at_shutdown += 1;
+          receipt.answer(Admission::Terminated);
+          return;
+        }
         let parent = parent.filter(|p| p.shard() == self.id).map(|p| p.slot());
         match inner.arena.insert(TaskSlot::new(future, parent, false)) {
           Ok(handle) => {
@@ -1069,8 +1105,23 @@ impl ShardContext {
             }
             inner.counters.spawns += 1;
             self.local.push(handle.index());
+            receipt.answer(
+              match Encoded::pack(self.id, handle.index(), handle.generation()) {
+                Some(word) => Admission::Admitted(TaskId(word)),
+                None => Admission::Refused(RtError::TooManyTasks {
+                  capacity: inner.config.tasks_per_shard,
+                }),
+              },
+            );
           }
-          Err(_) => inner.counters.admission_refused += 1,
+          Err(slates_mem::MemError::SlabFull { capacity }) => {
+            inner.counters.admission_refused += 1;
+            receipt.answer(Admission::Refused(RtError::TooManyTasks { capacity }));
+          }
+          Err(e) => {
+            inner.counters.admission_refused += 1;
+            receipt.answer(Admission::Refused(RtError::Mem(e)));
+          }
         }
       }
       Control::Cancel(word) => {
