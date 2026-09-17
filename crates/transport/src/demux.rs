@@ -21,7 +21,11 @@
 //! for that shard's life (`ShardContext::keep`: one per socket per boot, handed to the shard's tasks as
 //! `&'static` and dropped with the shard's context after them, its socket closed and its port free
 //! again) — and its state is a `RefCell` on the one shard thread that runs it (no lock, no `Arc`). Sessions live in a slab of at most `max_sessions` slots
-//! (the caller derives it: the fleet passes two per peer — the live session and a re-dial replacing it),
+//! (the caller derives it — the fleet passes a **shared** pool of two slots per unit of its peer capacity,
+//! the live session a peer holds and the one its re-dial replaces it with; there is no per-peer quota: a
+//! slot is allotted to a *source* before its handshake authenticates it, and the certificate learned at
+//! establishment only replaces that peer's previous session — [`DemuxCounters::high_water`] against
+//! [`Demux::capacity`] reports the pool's use),
 //! named by generational [`Slot`]s so a stale handle is a typed miss. Each session's inbox holds as
 //! many datagrams as the socket's own kernel receive buffer would (`SO_RCVBUF` over the minimum datagram
 //! — the queue the per-peer socket it replaces had); past that a datagram is dropped and counted, and
@@ -107,12 +111,20 @@ pub struct DemuxCounters {
   pub unknown_id: u64,
   /// Datagrams dropped because their session's inbox was full.
   pub inbox_full: u64,
-  /// Handshakes from new sources refused because every session slot was taken.
+  /// Handshakes from new sources refused because every session slot was taken — **capacity** exhaustion
+  /// only; a session whose endpoint could not be built is [`setup_refused`](Self::setup_refused).
   pub sessions_refused: u64,
+  /// Handshakes from new sources refused because the session's endpoint could not be built (its TLS server
+  /// state, `EndpointError::Handshake` — a misconfigured identity or roster), the slot given back. Counted
+  /// apart from capacity so a setup fault never reads as a full pool, nor a full pool as a setup fault.
+  pub setup_refused: u64,
   /// Sessions closed because their peer established a new one (a re-dial after a loss).
   pub replaced: u64,
   /// Server sessions opened for a new source.
   pub opened: u64,
+  /// The most sessions ever held at once — opened and not yet released, a pending handshake and a
+  /// replaced-but-undropped session both counting — against [`Demux::capacity`]: the pool's high-water mark.
+  pub high_water: u64,
 }
 
 /// A session's inbox: its peer, the datagrams waiting for it, the waker of the task reading it, and
@@ -147,6 +159,9 @@ struct Inner {
   pending: VecDeque<Endpoint>,
   accept_waker: Option<Waker>,
   counters: DemuxCounters,
+  /// The most recent setup refusal's error, for whoever reads `setup_refused` climbing — one bounded
+  /// string, replaced by each later refusal, never a list.
+  last_setup_refusal: Option<String>,
 }
 
 /// The demultiplexer over one socket: see the module doc.
@@ -159,6 +174,8 @@ pub struct Demux {
   /// Derived: the datagrams one session's inbox holds — the socket's kernel receive buffer over the
   /// minimum datagram, the queue the per-peer socket this shares out used to give each peer.
   inbox_datagrams: usize,
+  /// The pool's size ([`Demux::capacity`]).
+  capacity: usize,
   inner: RefCell<Inner>,
 }
 
@@ -198,6 +215,7 @@ impl Demux {
       allowed,
       frame_cap,
       inbox_datagrams,
+      capacity: max_sessions,
       inner: RefCell::new(Inner {
         slots,
         generations: vec![0; max_sessions],
@@ -208,6 +226,7 @@ impl Demux {
         pending: VecDeque::new(),
         accept_waker: None,
         counters: DemuxCounters::default(),
+        last_setup_refusal: None,
       }),
     };
     let demux: &'static Demux = slates_rt::registry::with_current(|ctx| ctx.keep(demux)).ok_or(
@@ -243,7 +262,14 @@ impl Demux {
     self.inner.borrow().counters
   }
 
-  /// How many sessions are live (opened and not released).
+  /// The most recent setup refusal's error ([`DemuxCounters::setup_refused`]), if any — what an operator
+  /// reads to tell a misconfigured identity from a broken roster; the latest only, never a list.
+  pub fn last_setup_refusal(&self) -> Option<String> {
+    self.inner.borrow().last_setup_refusal.clone()
+  }
+
+  /// How many sessions are held right now (opened and not released — a pending handshake and a
+  /// replaced-but-undropped session both count), against [`Demux::capacity`].
   pub fn sessions(&self) -> usize {
     self
       .inner
@@ -252,6 +278,14 @@ impl Demux {
       .iter()
       .filter(|s| s.is_some())
       .count()
+  }
+
+  /// The pool's size — the most sessions this demultiplexer holds at once, every one counted from its
+  /// slot's allotment (before the handshake authenticates the source) to its endpoint's drop. The
+  /// caller's derivation (`max_sessions` at [`Demux::start`], at least one): the fleet sizes it from its
+  /// peer capacity, a shared pool, never a per-peer quota (the module doc).
+  pub fn capacity(&self) -> usize {
+    self.capacity
   }
 
   /// The receive loop: reads every datagram off the socket and routes it. Runs until the socket refuses;
@@ -365,15 +399,32 @@ impl Demux {
       inner.deliver(self.inbox_datagrams, slot, datagram);
       return;
     }
-    let Some(slot) = inner.open(self, from) else {
-      inner.counters.sessions_refused += 1;
-      return;
-    };
-    inner.deliver(self.inbox_datagrams, slot, datagram);
-    if let Some(waker) = inner.accept_waker.take() {
-      waker.wake();
+    // A source the pool cannot open a session for is refused under the reason's own category — capacity
+    // and a setup fault are never one count (a saturation proof must not pass on a broken roster, nor a
+    // roster fault read as a full pool).
+    match inner.open(self, from) {
+      Ok(slot) => {
+        inner.deliver(self.inbox_datagrams, slot, datagram);
+        if let Some(waker) = inner.accept_waker.take() {
+          waker.wake();
+        }
+      }
+      Err(OpenRefusal::Exhausted) => inner.counters.sessions_refused += 1,
+      Err(OpenRefusal::Setup(error)) => {
+        inner.counters.setup_refused += 1;
+        inner.last_setup_refusal = Some(format!("{error:?}"));
+      }
     }
   }
+}
+
+/// Why a server session could not be opened for a new source ([`Inner::open`]); [`Demux::route`] counts
+/// each under its own category.
+enum OpenRefusal {
+  /// Every slot of the pool is held — a pending handshake and a replaced-but-undropped session included.
+  Exhausted,
+  /// The session's endpoint could not be built (its TLS server state); the slot was given back.
+  Setup(EndpointError),
 }
 
 impl Inner {
@@ -411,18 +462,25 @@ impl Inner {
   }
 
   /// Opens a server session for a new source: takes a free slot, builds the un-established endpoint on
-  /// the shared link, and queues it for `accept`. `None` when no slot is free or the TLS server state
-  /// refused (counted by the caller).
-  fn open(&mut self, demux: &'static Demux, from: SocketAddrV4) -> Option<Slot> {
-    let index = self.free.pop()?;
-    let at = usize::try_from(index).ok()?;
-    let generation = self.generations.get(at).copied()?;
+  /// the shared link, and queues it for `accept`. Refused typed when no slot is free, or when the
+  /// endpoint could not be built (the slot given back) — the caller counts each under its own category.
+  fn open(&mut self, demux: &'static Demux, from: SocketAddrV4) -> Result<Slot, OpenRefusal> {
+    let index = self.free.pop().ok_or(OpenRefusal::Exhausted)?;
+    let Some((at, generation)) = usize::try_from(index)
+      .ok()
+      .and_then(|at| self.generations.get(at).map(|generation| (at, *generation)))
+    else {
+      // Unreachable for an index the pool minted (`start` numbers its slots from zero); the index is
+      // given back rather than lost, and the source refused as the pool being full.
+      self.free.push(index);
+      return Err(OpenRefusal::Exhausted);
+    };
     let slot = Slot { index, generation };
     let endpoint = match Endpoint::accepted(demux.id, slot, from, demux) {
       Ok(endpoint) => endpoint,
-      Err(_) => {
+      Err(error) => {
         self.free.push(index);
-        return None;
+        return Err(OpenRefusal::Setup(error));
       }
     };
     if let Some(entry) = self.slots.get_mut(at) {
@@ -436,7 +494,10 @@ impl Inner {
     self.by_source.insert(from, slot);
     self.pending.push_back(endpoint);
     self.counters.opened += 1;
-    Some(slot)
+    // The pool's high-water mark: every slot not on the free list is held, whatever its session's state.
+    let held = u64::try_from(self.slots.len().saturating_sub(self.free.len())).unwrap_or(u64::MAX);
+    self.counters.high_water = self.counters.high_water.max(held);
+    Ok(slot)
   }
 }
 

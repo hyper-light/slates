@@ -47,7 +47,7 @@ use std::net::TcpStream;
 
 use common::nfs::{create, lookup, mount, owner_and_mode, read, write};
 use common::trace;
-use slates_server::fleet::{FLEET_FRAME_CAP, SESSIONS_PER_PEER};
+use slates_server::fleet::FLEET_FRAME_CAP;
 use slates_transport::endpoint::{Endpoint, EndpointError};
 use slates_transport::handshake::Identity;
 use slates_wire::request::RequestId;
@@ -829,22 +829,31 @@ fn a_starved_but_live_peer_is_not_retired() {
 /// wide enough for every dialer of the burst to be served in turn under load, since each turn waits out a
 /// backed-off probe timeout before the next flight.
 const BURST_DIAL_ATTEMPTS: usize = 8;
+/// Derived: how often a dialer holding its established session looks for its release — a hundredth of the
+/// liveness budget (a tenth of the heartbeat, the tree's collection-loop cadence), so the release is seen
+/// within milliseconds without spinning the burst runtime's shard.
+const HOLD_POLL_NS: u64 = LIVENESS_BUDGET_NS / 100;
 
 /// One dialer of a re-dial burst: dials `address` (a daemon's record socket) from a fresh socket — what a
 /// node that re-dials after losing its session does — presenting `identity`, and drives the handshake as
 /// the daemon's own dialer does (`fleet::establish_session`): a handshake budget that ran out with the
 /// peer silent is retried on the same socket, its pending flight resent; any other failure dials afresh
-/// from a new port; [`BURST_DIAL_ATTEMPTS`] in all. Reports the dial's index and its outcome, then ends —
-/// the endpoint dropped, its session on the daemon left for the next dial to replace.
+/// from a new port; [`BURST_DIAL_ATTEMPTS`] in all. Reports the dial's index and its outcome, then — if it
+/// established — **holds** its session until `release` says so (or the test is gone), so every session of
+/// the burst is live on the daemon while the test serves its client through them: the overlap the burst
+/// exists to prove is by construction, not by timing. Released, the endpoint drops, its session on the
+/// daemon left for the next dial to replace or the daemon to close.
 async fn dial_record_socket(
   identity: Identity,
   certificate: rustls::pki_types::CertificateDer<'static>,
   address: SocketAddrV4,
   report: std::sync::mpsc::Sender<(usize, Result<(), String>)>,
+  release: std::sync::mpsc::Receiver<()>,
   index: usize,
 ) {
   let mut outcome: Result<(), String> = Err("never attempted".to_owned());
   let mut held: Option<Endpoint> = None;
+  let mut established: Option<Endpoint> = None;
   for _ in 0..BURST_DIAL_ATTEMPTS {
     let mut dialer = match held.take() {
       Some(dialer) => dialer,
@@ -874,6 +883,7 @@ async fn dial_record_socket(
     match dialer.establish().await {
       Ok(()) => {
         outcome = Ok(());
+        established = Some(dialer);
         break;
       }
       Err(EndpointError::NotReady) => {
@@ -884,6 +894,15 @@ async fn dial_record_socket(
     }
   }
   let _ = report.send((index, outcome));
+  if established.is_some() {
+    loop {
+      match release.try_recv() {
+        Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+        Err(std::sync::mpsc::TryRecvError::Empty) => slates_rt::futures::sleep(HOLD_POLL_NS).await,
+      }
+    }
+  }
+  drop(established);
 }
 
 /// §4.3 (a per-shard singleton is owned by its shard and dropped with it) by use, at the fleet: a
@@ -959,6 +978,11 @@ fn a_stopped_daemons_serve_ports_are_freed_so_its_restart_binds_the_same_address
 
 /// Shape: the index of the record plane in `Daemon::fleet_demux_counters` (the probe plane comes first).
 const RECORD_PLANE: usize = 1;
+/// Shape: the dials of the re-dial burst — three, the 2026-09-14 burst that overflowed that fixture's
+/// two-slot pool (`peers × 2`, one peer). Kept as the burst whose replacement, client availability and
+/// reclamation this proves; the enrollment-sized pool (thousands of slots per plane) admits it whole, and
+/// the exhaustion it once showed is proven at the transport seam (`crates/transport/tests/session.rs`).
+const BURST_DIALS: usize = 3;
 
 /// The two-node fleet a re-dial burst is run against: A (the target — its certificate, record address and
 /// instance name), B (whose certificate the burst presents), and the burst's own copies of B's identity.
@@ -1017,14 +1041,16 @@ fn burst_fleet_forms(dials: usize, pid: u32) -> BurstFleet {
   }
 }
 
-/// What the burst observed: each dial's outcome; the client's verbs and refusals while it ran; the
-/// demultiplexers' counters and A's live tasks before and after; whether the replaced sessions' serve
+/// What the burst observed: each dial's outcome; the client's verbs and refusals while the dials were in
+/// flight and, separately, while every dial held its established session (the by-construction overlap);
+/// the demultiplexers' counters and A's live tasks before and after; whether the replaced sessions' serve
 /// tasks ended; A's fleet refusal counts; and whether the fleet still held.
 #[derive(Debug)]
 struct BurstOutcome {
   burst_done: bool,
   reports: Vec<(usize, Result<(), String>)>,
   verbs_during_burst: u64,
+  verbs_while_held: u64,
   refused_during_burst: Vec<String>,
   before: Option<Vec<slates_transport::demux::DemuxCounters>>,
   after: Option<Vec<slates_transport::demux::DemuxCounters>>,
@@ -1045,7 +1071,9 @@ fn status_verb(client: &mut Client, volume: VolumeId, ran: &mut u64, refused: &m
 
 /// Runs the burst against A from a runtime of the test's own (one shard, the daemon's own derived
 /// configuration) so the dials run concurrently, while the test thread drives `client` through `Status`
-/// verbs on `volume`; then waits for the replaced sessions' serve tasks to end and the fleet to re-settle.
+/// verbs on `volume`; once every dial has established and holds its session, serves the client once more
+/// through them (the overlap, by construction), releases the dials, then waits for the replaced sessions'
+/// serve tasks to end and the fleet to re-settle.
 fn run_burst(
   fleet: &mut BurstFleet,
   client: &mut Client,
@@ -1063,7 +1091,10 @@ fn run_burst(
   let burst = slates_rt::runtime::Runtime::start(&burst_config).expect("the burst runtime starts");
   let burst_shard = burst.shard_ids()[0];
   let (report_tx, report_rx) = std::sync::mpsc::channel();
+  let mut releases = Vec::with_capacity(dials);
   for (index, identity) in identities.into_iter().enumerate() {
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    releases.push(release_tx);
     burst
       .spawn_on(
         burst_shard,
@@ -1072,6 +1103,7 @@ fn run_burst(
           fleet.a_certificate.clone(),
           fleet.a_record_address,
           report_tx.clone(),
+          release_rx,
           index,
         ),
       )
@@ -1094,7 +1126,19 @@ fn run_burst(
     reports.len() == dials
   });
   reports.sort_by_key(|(index, _)| *index);
+  // Every dial that established holds its session on A right now: the client is served through the
+  // burst's live sessions — the overlap the burst exists to prove, by construction rather than by timing.
+  let mut verbs_while_held = 0u64;
+  status_verb(
+    client,
+    volume,
+    &mut verbs_while_held,
+    &mut refused_during_burst,
+  );
   let after = fleet.daemon_a.fleet_demux_counters();
+  for release in releases {
+    let _ = release.send(());
+  }
   // The replaced sessions' serve tasks end as each replacement closes them: A's live tasks return to the
   // pre-burst level (the burst's last session stands in for B's record session, one serve task either way).
   let tasks_settled = poll_until(&daemons, FORMATION_DEADLINE, || {
@@ -1115,6 +1159,7 @@ fn run_burst(
     burst_done,
     reports,
     verbs_during_burst,
+    verbs_while_held,
     refused_during_burst,
     before,
     after,
@@ -1148,6 +1193,11 @@ fn assert_burst_dials_and_client(outcome: &BurstOutcome) {
     "the client ran verbs while the burst was in flight (non-vacuity)"
   );
   assert!(
+    outcome.verbs_while_held >= 1,
+    "the client was served while every dial of the burst held its established session on A (the overlap, \
+     by construction)"
+  );
+  assert!(
     outcome.refused_during_burst.is_empty(),
     "no client verb was refused during the burst ({} ran): {:?}",
     outcome.verbs_during_burst,
@@ -1163,18 +1213,28 @@ fn assert_burst_bounded(outcome: &BurstOutcome, dials: usize) {
     other => panic!("the demultiplexer counters were observed before and after: {other:?}"),
   };
   let refused = after.sessions_refused - before.sessions_refused;
+  let setup_refused = after.setup_refused - before.setup_refused;
   let replaced = after.replaced - before.replaced;
   if trace::enabled() {
     trace::record(format_args!(
-      "burst: {dials} dials, {} client verbs during it, record plane before {before:?} after {after:?}, \
-       live tasks before {:?} after {:?}, refusals {:?}",
-      outcome.verbs_during_burst, outcome.live_before, outcome.live_after, outcome.refusals
+      "burst: {dials} dials, {} client verbs during it and {} while held, record plane before {before:?} \
+       after {after:?}, live tasks before {:?} after {:?}, refusals {:?}",
+      outcome.verbs_during_burst,
+      outcome.verbs_while_held,
+      outcome.live_before,
+      outcome.live_after,
+      outcome.refusals
     ));
   }
-  assert!(
-    refused >= 1,
-    "the burst exceeded the record plane's session slots, so at least one handshake was refused for a slot \
-     (non-vacuity): before {before:?} after {after:?}"
+  assert_eq!(
+    refused, 0,
+    "the pool has room for the burst (`fleet_sessions_per_plane`, thousands of slots on any host since \
+     enrollment), so no dial was refused for capacity — exhaustion is proven at the transport seam, not \
+     here: before {before:?} after {after:?}"
+  );
+  assert_eq!(
+    setup_refused, 0,
+    "no dial failed at its session's setup: before {before:?} after {after:?}"
   );
   assert!(
     replaced >= u64::try_from(dials - 1).unwrap(),
@@ -1185,38 +1245,43 @@ fn assert_burst_bounded(outcome: &BurstOutcome, dials: usize) {
     "the replaced sessions' serve tasks ended: live tasks before {:?}, after {:?}",
     outcome.live_before, outcome.live_after
   );
-  let serve_spawn_refused = outcome
-    .refusals
-    .as_ref()
-    .and_then(|refusals| refusals.get("fleet.serve_spawn").copied())
-    .unwrap_or(0);
+  // The refusal counts must have been **observed**: an absent kind in an observed map is a zero count; a
+  // daemon that could not be observed is its own failure, never a zero.
+  let refusals = outcome.refusals.as_ref().expect(
+    "A's fleet refusal counts were observed after the burst (an unobservable daemon is not a zero count)",
+  );
+  let serve_spawn_refused = refusals.get("fleet.serve_spawn").copied().unwrap_or(0);
   assert_eq!(
     serve_spawn_refused, 0,
-    "no serve spawn was refused: the fleet's share of the arena carried the burst ({:?})",
-    outcome.refusals
+    "no serve spawn was refused: the fleet's share of the arena carried the burst ({refusals:?})"
   );
   assert!(outcome.still_formed, "the fleet holds after the burst");
 }
 
-/// §4.3 ("every structure has a derived bound") and §4.8 (the demultiplexer's session slots), by use: a
-/// peer that re-dials a daemon's record socket in a **burst** — one more concurrent dial than the slots one
-/// peer is allotted (`SESSIONS_PER_PEER`), every one of which completes in turn as each replaces the last —
-/// is held to those slots and to the fleet's own share of the control shard's task arena
-/// (`DaemonConfig::with_fleet`). Do: form a two-node fleet, then run the burst against A from a runtime of
-/// the test's own while a client of A runs `Status` verbs. Expect: every dial establishes; the client is
-/// never refused; the serve tasks of the replaced sessions end (A's live task count returns to its
-/// pre-burst level — one serve task per live session, never one per dial); no serve spawn is refused; and
-/// the fleet still holds. Non-vacuous on three counters: the record plane's `sessions_refused` (the burst
-/// exceeded the slots), its `replaced` (every later dial replaced an earlier session), and the verbs the
-/// client ran during the burst (at least one). Before the share existed the fleet's tasks were admitted
-/// against the clients' budget alone: at ~3× oversubscription the arena filled with accept-side handshakes
-/// and the shard refused spawns (`adm_refused` 4,554, `docs/wip/fleet-under-load.md`).
+/// §4.8 ("reconnection after a mid-run session loss") and §4.3 (the fleet's derived task share), by use: a
+/// peer that re-dials a daemon's record socket in a **burst** — several concurrent dials presenting one
+/// certificate, each replacing the last as it establishes — is served in turn, replaces its earlier
+/// sessions, never costs a client a verb, and leaves no serve task behind. Do: form a two-node fleet; run
+/// the burst against A from a runtime of the test's own while a client of A runs `Status` verbs; with every
+/// dial established and **holding** its session, serve the client once more through them; release. Expect:
+/// every dial establishes; the client is never refused, and was served at least once while the burst's
+/// sessions were all live (by construction); every later dial replaced an earlier session (`replaced`);
+/// **no** dial was refused for capacity or at setup — the pool is `SESSION_RESERVE_PER_PEER ×
+/// fleet_peer_capacity` slots per plane, thousands on any host since enrollment (`f50e939`), so a burst of
+/// three cannot exhaust it (the 2026-09-14 fixture's pool was two slots; this burst's overflow of it was
+/// read as a per-peer quota the demultiplexer never enforced — exhaustion is proven at the transport seam
+/// over the simulated fabric, `crates/transport/tests/session.rs`); the serve tasks of the replaced
+/// sessions end (A's live task count returns to its pre-burst level — one serve task per live session,
+/// never one per dial); no serve spawn is refused, the refusal counts **observed** and never assumed zero;
+/// and the fleet still holds. Before the task share existed the fleet's tasks were admitted against the
+/// clients' budget alone: at ~3× oversubscription the arena filled with accept-side handshakes and the
+/// shard refused spawns (`adm_refused` 4,554, `docs/wip/fleet-under-load.md`).
+/// `docs/bugs/2026-09-16-redial-burst-assumes-a-per-peer-session-limit.md`.
 #[test]
-fn a_peers_re_dial_burst_is_held_to_its_session_slots_and_never_refuses_a_client() {
+fn a_peers_re_dial_burst_replaces_its_sessions_and_never_refuses_a_client() {
   let _serial = serialize_fleet_tests();
   let pid = std::process::id();
-  // One more dial than the slots one peer holds: the smallest burst that exceeds the bound.
-  let dials = SESSIONS_PER_PEER + 1;
+  let dials = BURST_DIALS;
   let mut fleet = burst_fleet_forms(dials, pid);
   // The client's volume, provisioned before the burst; its `Status` is the verb the client runs throughout.
   let mut client = Client::connect(&fleet.instance_a);
@@ -3781,8 +3846,9 @@ const POD_MEMORY_BYTES: u64 = 1 << 30;
 
 /// AC-2.6 (admission stays within the task arena; refusals typed), §4.8 boot step 6: a fleet node under a
 /// container's memory bound admits its clients. The daemon derives its task budget from its client bound;
-/// the fleet's own tasks (two per peer to dial it, up to `SESSIONS_PER_PEER` serve tasks per plane per peer,
-/// and its loops) must be inside that budget, or the admission task that seats a client on its shard is
+/// the fleet's own tasks (two per unit of peer capacity to dial it, one serve task per slot of each plane's
+/// shared session pool — `config::SESSION_RESERVE_PER_PEER` slots per unit of peer capacity — and its
+/// loops) must be inside that budget, or the admission task that seats a client on its shard is
 /// refused by the arena and dropped unrun — the client's channel closes under it and `slates status` never
 /// answers. The KIND lane hit exactly this on 2026-09-14: one pod of a five-replica fleet (four peers) at
 /// 1 GiB never became Ready (`docs/bugs/2026-09-14-fleet-tasks-outside-the-task-budget-poison-client-admission.md`).

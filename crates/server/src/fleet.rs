@@ -219,13 +219,6 @@ struct PeerDial {
   resolver: Option<&'static Resolver>,
 }
 
-/// Derived: the sessions a serve socket's demultiplexer holds per peer — the live one and the one a re-dial
-/// establishes to replace it (the old is closed once the new binds, so two suffice; a third dialer from
-/// the same peer is refused typed until one releases). A session's slot is held until its serve task drops
-/// the session, so this also bounds the serve tasks alive per peer per plane — the accept side of the
-/// fleet's task share (`config::with_fleet`). Public so a test can size a burst past it.
-pub const SESSIONS_PER_PEER: usize = 2;
-
 /// A fleet peer as the serve side knows it: the certificate the handshake must present (mutual TLS admits
 /// only these), the **stable anchor** that certificate stands for, and the generation-0 **seed** id the
 /// manifest precomputed for it. The peer's *current* member id is not here: it is learned on contact and kept
@@ -761,9 +754,11 @@ pub async fn run_membership(transport: FleetTransport) {
     .map(|peer| peer.certificate.clone())
     .chain(enrollment_roots)
     .collect();
-  let max_sessions = neighbourhood
-    .saturating_sub(1)
-    .saturating_mul(SESSIONS_PER_PEER);
+  // The pool each plane's demultiplexer holds: the one derivation the task and timer budgets were sized
+  // from (`config::with_fleet`: `SESSION_RESERVE_PER_PEER` slots per unit of peer capacity), so admission
+  // and the serve-task reserve can never disagree. A shared pool, not a per-peer quota
+  // (`slates_transport::demux`; `docs/bugs/2026-09-16-redial-burst-assumes-a-per-peer-session-limit.md`).
+  let max_sessions = state::with_state(|state| state.config.fleet_sessions_per_plane).unwrap_or(0);
   // The demultiplexers are owned by this shard for its life and dropped with it (their sockets closed,
   // the ports free again — a restarted node binds the same addresses); a start refused here means this
   // loop is not on a shard thread, counted like a socket that would not bind.

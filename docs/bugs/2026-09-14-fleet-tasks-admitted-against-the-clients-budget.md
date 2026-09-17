@@ -104,3 +104,20 @@ KIND lane's cluster alive on the box): 20/20 fast suites, the three gates, and t
   futures::spawn' crates/*/src` is now empty.
 - `Daemon::observe` itself spawns a task per observation (its own admission is retried under
   `spawn_admitted`); a test's `live_tasks` reading includes that task, on both sides of a comparison.
+
+## Correction (2026-09-16): the session bound is a shared pool, not a per-peer quota
+
+The root cause and the by-use test above describe `SESSIONS_PER_PEER` as a bound the demultiplexer
+enforces "per peer per plane", and read the burst's `sessions_refused 0 → 9` as "the demultiplexer refuses
+a dial past a peer's slots". The demultiplexer never enforced that: `Demux` allots a slot to a *source*
+before the handshake authenticates it, from one free list, and the certificate learned at establishment
+only replaces that peer's previous session. The constant is a **reservation per unit of peer capacity** that
+sizes a shared pool (`fleet_sessions_per_plane = SESSION_RESERVE_PER_PEER × fleet_peer_capacity`,
+`DaemonConfig::with_fleet`, the one derivation the transport's admission and this task share both read);
+the accept-side population is bounded by the pool, `S = 2 × C` per plane, not by `2 × planes` per peer.
+The 2026-09-14 measurements stand: the fixture's pool was `peers × 2 = 2` slots (one peer), so three dials
+did overflow it and the counter moved. Once `f50e939` grew `C` to the enrollment capacity (2,824 slots per
+plane on this box), the same burst is admitted whole and the assertion failed on every host. The live test
+now proves replacement, client availability and reclamation with no capacity refusal; exhaustion, release
+and replaced-slot retention are proven at the transport seam over the simulated fabric
+(`crates/transport/tests/session.rs`). `docs/bugs/2026-09-16-redial-burst-assumes-a-per-peer-session-limit.md`.

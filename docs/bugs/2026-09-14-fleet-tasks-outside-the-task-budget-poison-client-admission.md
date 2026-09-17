@@ -119,3 +119,12 @@ and the netem profiles.
 - Runtime, the general form: `Control::Spawn` on a full arena drops a future handed by move without telling
   the sender (banned item 9). The drop guard is the local mitigation; a sender-notified refusal is the
   runtime-level fix to decide.
+
+## Correction (2026-09-16): "bounded by the demultiplexer at `SESSIONS_PER_PEER = 2` per peer per plane"
+
+The demand estimate above (`5 + 6 × peers`) is right; the wording of where the `2` comes from is not. The
+demultiplexer holds one **shared** pool of slots per plane, sized `SESSION_RESERVE_PER_PEER × fleet_peer_capacity`
+(`DaemonConfig::with_fleet`), and allots a slot to a source before its handshake authenticates it; there is
+no per-peer quota, only the pool's total. The task reserve per plane is therefore the pool's size, `S = 2 × C`,
+which at `C = peers` is the same number the estimate used.
+`docs/bugs/2026-09-16-redial-burst-assumes-a-per-peer-session-limit.md`.

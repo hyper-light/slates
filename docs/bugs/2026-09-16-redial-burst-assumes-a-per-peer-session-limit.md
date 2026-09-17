@@ -1,7 +1,7 @@
 # The re-dial burst assumes a per-peer limit that the demultiplexer does not enforce
 
 Date: 2026-09-16 (America/Chicago).
-Status: investigated; fix designed, not implemented.
+Status: implemented (2026-09-16, see "Implemented" and "Validation performed" below).
 Contracts: §4.3 (bounded tasks), §4.8 (fleet membership and reconnection), §4.10a
 (session demultiplexing), R5 (tests prove observable behaviour), R8 (one deployment path).
 
@@ -187,11 +187,47 @@ investigation does not claim that the current shared pool provides that guarante
 No production admission-policy change is justified merely to force this test's counter
 to increase.
 
-## Validation still required after implementation
+## Implemented (2026-09-16)
 
-Run the new simulated saturation/replacement histories first, then the exact live fleet
-test, the existing transport re-dial test, and the unlisted-node enrollment regression.
-The latter guards against accidentally shrinking capacity back to the manifest's seeds.
-Run the repository's required formatting, lint and structural checks for the resulting
-change. Linux and KIND were not run in this investigation. No fix or passing-fix claim
-is part of this report.
+1. **The admission contract.** `config::SESSION_RESERVE_PER_PEER` is the reservation per unit of peer
+   capacity; `DaemonConfig::with_fleet` derives `fleet_sessions_per_plane = SESSION_RESERVE_PER_PEER ×
+   fleet_peer_capacity` once (logged with its input) and `fleet::run_membership` sizes each plane's
+   `Demux` from it, so admission and the serve-task reserve read one number; `fleet::SESSIONS_PER_PEER`
+   is gone. The invariant (`S = 2 × C` accepted endpoints per plane; reserve `2C + 2S + 5`) is stated at
+   `with_fleet` and in §4.3's correction. `Demux::capacity()` and `DemuxCounters::high_water` expose the
+   pool's size and its peak occupancy (counted from a slot's allotment to its endpoint's drop).
+2. **The live test, synchronized.** `a_peers_re_dial_burst_replaces_its_sessions_and_never_refuses_a_client`:
+   each dialer holds its established session until released (`dial_record_socket`'s `release`), and the
+   client is served once more while every dial holds — the overlap by construction (`verbs_while_held`);
+   capacity and setup refusals are asserted **zero**; the refusal map must be **observed** (an absent kind
+   in an observed map is the only zero). Measured alone (load 5.9): ok in 22.92 s — 3 dials all
+   established; 16 verbs in flight and 1 while held, 0 refused; record plane `replaced 1 → 4`, `opened
+   2 → 7`, `sessions_refused 0 → 0`, `setup_refused 0 → 0`, `high_water 2 → 4`; live tasks 15 → 15;
+   refusals `{fleet.accept.handshake: 4}` (the replaced sessions' serve tasks ending, as on 2026-09-14).
+3. **Exhaustion at the seam.** `crates/transport/tests/session.rs`, over the simulated fabric with pools
+   the fixture sizes (17/17 in 0.44 s): `a_full_pool_refuses_the_next_dial_until_a_slot_is_released`
+   (`SMALL_POOL` = 2 held → the extra dial refused for capacity with the pool at its bound and nothing
+   opened, its handshake budget spent → one slot released → the retry admitted and served → every slot
+   back, high-water 2); `a_replaced_session_holds_its_slot_until_its_stale_owner_drops` (`replaced` = 1,
+   the pool holds both while the closed session is undropped, a third peer refused for capacity, the
+   stale drop returns the slot, the third admitted, X's second request still answered over the
+   replacement); `a_burst_within_the_pool_is_admitted_with_no_capacity_refusal` (`ROOMY_POOL` = 8, the
+   same three dials admitted whole, high-water 3); and
+   `a_roster_the_server_cannot_build_from_is_a_setup_refusal_not_capacity` (item 4's category).
+4. **The counter, unambiguous.** `Inner::open` returns `Result<Slot, OpenRefusal>` — `Exhausted` or
+   `Setup(EndpointError)` — and `route` counts each under its own category (`sessions_refused`,
+   `setup_refused`); the last setup refusal's error is kept (`Demux::last_setup_refusal`). A roster entry
+   that is not a certificate now counts `setup_refused ≥ 1`, `sessions_refused` 0, nothing opened.
+
+Docs: §4.3 and §4.8 corrections (the measurements kept, their interpretation corrected), the two
+2026-09-14 task-budget records, GAPS (the shared pool; per-peer fairness open).
+
+## Validation performed (2026-09-16)
+
+In the order prescribed: the four simulated histories (17/17, 0.44 s); the live fleet test (ok, 22.92 s,
+alone); the existing transport re-dial test (`a_peer_that_redials_replaces_its_old_session`, in the
+17); the unlisted-node enrollment regression (`an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum`,
+ok, 3.22 s, alone — the capacity was not shrunk back to the seeds); the config derivation test
+(`a_fleet_configuration_derives_its_own_task_share_from_the_peer_count`, ok, 0.75 s). `cargo xtask
+check` ok; the formatting and lint gates' final run is recorded in the commit. Linux and KIND run on
+the push.
