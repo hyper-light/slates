@@ -4188,7 +4188,7 @@ impl Client {
           }
           let client = connected.region.client_id();
           return Client {
-            end: ClientEnd::with_doorbell(connected.region, connected.doorbell),
+            end: ClientEnd::connected(connected),
             client,
             sequence: 0,
           };

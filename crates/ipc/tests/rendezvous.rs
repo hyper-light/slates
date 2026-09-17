@@ -40,7 +40,7 @@ fn rendezvous_client() {
     return;
   };
   let connected = connect(&instance).unwrap();
-  let mut client = ClientEnd::with_doorbell(connected.region, connected.doorbell);
+  let mut client = ClientEnd::connected(connected);
   client
     .send(&Slot::inline(0x0007_0000_0000_0001, b"hello").unwrap())
     .unwrap();

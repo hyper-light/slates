@@ -113,15 +113,10 @@ impl ClientEnd {
     }
   }
 
-  /// The client's end with the doorbell the rendezvous handed over.
-  pub fn with_doorbell(region: ClientRegion, doorbell: crate::rendezvous::Doorbell) -> ClientEnd {
-    let mut end = ClientEnd::new(region);
-    end.doorbell = Some(doorbell);
-    end
-  }
-
   /// The client's end over everything the rendezvous handed over: the region, the doorbell,
   /// the liveness check, and (where the platform has one) the completion fd an async SDK polls.
+  /// These resources must move together: on Linux the liveness handle owns the control socket;
+  /// dropping it while retaining the ring tells the daemon to reap a client that is still in use.
   // `connected` is mutated only to take the completion fd, which is a Unix concern; on Windows it is
   // read-only, so the `mut` is dead there.
   #[cfg_attr(windows, allow(unused_mut))]

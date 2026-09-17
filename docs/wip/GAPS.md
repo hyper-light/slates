@@ -1402,3 +1402,13 @@ reported 6202 unexpected pjdfstest failures out of 8798 cases, editor workload b
 output disagreement, and hermeticity startup timing out after 60 s while the anchor repeatedly
 reported a missed first heartbeat. Other eight workload comparisons were identical. These remain
 open; neither the CLI repair nor the scheduler proof claims to fix them.
+
+
+### 2026-09-17: Linux fixture connection lifetime corrected
+
+The Ubuntu holder-mismatch and inputs-placed client timeouts above are reproduced and fixed.
+The fixtures discarded Linux's liveness socket while retaining their request rings, so the daemon
+reaped them during their idle window. All six partial-constructor callers now retain the complete
+connection, and that constructor is removed. Before: both exact histories failed in 10.24 s;
+after: 6.24 s / 5.23 s, both formerly stuck requests below 1 ms. The separate takeover and
+conformance investigations continue. [Evidence](../bugs/2026-09-17-fixture-client-drops-its-liveness-handle.md).

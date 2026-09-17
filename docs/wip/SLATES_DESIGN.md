@@ -1690,6 +1690,14 @@ root-relative path as an explicit alternative; it does not report that the reque
 > waits in a bounded queue and past the clients' credit is refused `Overloaded`, and a shard
 > kicks another only when it is parked (a message to a spinning shard costs no syscall).
 
+> **Status (2026-09-17, rendezvous ownership).** A client endpoint constructed from a rendezvous
+> consumes the complete `Connected` value, retaining its liveness and completion resources with its
+> rings. The partial region/doorbell constructor is removed. Five server fixtures and the IPC
+> cross-process fixture dropped Linux's control socket with that partial constructor; the daemon
+> correctly reaped their idle clients, producing false `AwaitPlaced`/`Destroy` timeouts. The two
+> Linux regressions now pass in 6.24 s / 5.23 s; the timed-out verbs reply below 1 ms.
+> [Diagnosis](../bugs/2026-09-17-fixture-client-drops-its-liveness-handle.md).
+
 **Data model.**
 ```rust
 #[repr(C, align(64))] struct Slot { seq: AtomicU64, kind: u16, len: u16, payload: [u8; 44], pad: [u8; 4] }
