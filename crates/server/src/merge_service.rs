@@ -931,6 +931,7 @@ impl MergeShardState {
   /// finds the inputs when the record arrives. The tree's own identity is not it: a record naming that
   /// named an archive no holder ever held, and waited `INPUTS_UNHELD` for good
   /// (`docs/bugs/2026-09-16-merge-record-names-inputs-by-the-tree-only-identity.md`).
+  /// Format: the archive's 32-byte manifest identity (`Archive::manifest_identity`).
   fn inputs_identity(bytes: &[u8], page: u32) -> [u8; 32] {
     Self::inputs_archive(bytes, 0, page).manifest_identity()
   }
