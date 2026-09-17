@@ -5,8 +5,10 @@
 
 /// Format: the segment's magic, `SLAN` in little-endian ASCII.
 pub const MAGIC: u32 = 0x4E41_4C53;
-/// Format: the layout version; bumped with any change to the header or the region shapes.
-pub const LAYOUT_VERSION: u32 = 2;
+/// Format: the layout version; changed for header, region or timestamp semantics. Version 3 uses
+/// one host-wide monotonic origin for supervision and retained deadlines; version 2 reset clocks
+/// per instance and cannot be recovered safely by a version-3 daemon.
+pub const LAYOUT_VERSION: u32 = 3;
 /// Format: the header's size: magic (4), version (4), identity (32), generation (8), total
 /// length (8), then the encoded geometry (64), padded to two cache lines.
 pub const HEADER_BYTES: usize = 128;
@@ -45,7 +47,7 @@ const GEO_LANDING_SLOT_BYTES: usize = 56;
 
 /// Format: the supervision block's words, by offset inside its region: the daemon's pid.
 pub const SUP_PID: usize = 0;
-/// Format: the daemon's heartbeat, monotonic nanoseconds of its clock.
+/// Format: the daemon's heartbeat, monotonic nanoseconds in the host's common boot domain.
 pub const SUP_HEARTBEAT: usize = 8;
 /// Format: the daemon generation, incremented at every start.
 pub const SUP_GENERATION: usize = 16;
@@ -53,7 +55,7 @@ pub const SUP_GENERATION: usize = 16;
 pub const SUP_RESTARTS: usize = 24;
 /// Format: the supervision state word (`State`).
 pub const SUP_STATE: usize = 32;
-/// Format: when the current daemon was started, the anchor's monotonic nanoseconds.
+/// Format: when the current daemon was started, in the same host domain as its heartbeat.
 pub const SUP_STARTED: usize = 40;
 /// Format: the daemon's **grant-issuer secret** (§4.13 "only an authenticated human confirmation surface
 /// holds grant-issuer authority"): [`ISSUER_SECRET_BYTES`] of random the daemon mints at every start and

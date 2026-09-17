@@ -65,7 +65,7 @@ impl Supervision<'_> {
     self.pid.load(Ordering::Acquire)
   }
 
-  /// The daemon's last heartbeat, its monotonic nanoseconds.
+  /// The daemon's last heartbeat in the host's common monotonic clock domain.
   pub fn heartbeat_ns(&self) -> u64 {
     self.heartbeat.load(Ordering::Acquire)
   }
@@ -90,7 +90,7 @@ impl Supervision<'_> {
     State::from_word(self.state.load(Ordering::Acquire))
   }
 
-  /// When the current daemon started, the anchor's monotonic nanoseconds.
+  /// When the current daemon started, in the same host clock domain as its heartbeat.
   pub fn started_ns(&self) -> u64 {
     self.started.load(Ordering::Acquire)
   }
@@ -119,11 +119,11 @@ impl Supervision<'_> {
   }
 
   /// The health signal `daemon.alive` as the anchor observes it: running, and the heartbeat
-  /// no older than `budget_ns` by the daemon's clock reading `daemon_now_ns`; the freshness is
+  /// no older than `budget_ns` by the observer's host clock reading `now_ns`; the freshness is
   /// how old the heartbeat is.
-  pub fn alive(&self, daemon_now_ns: u64, budget_ns: u64) -> (bool, u64) {
+  pub fn alive(&self, now_ns: u64, budget_ns: u64) -> (bool, u64) {
     let beat = self.heartbeat_ns();
-    let age = daemon_now_ns.saturating_sub(beat);
+    let age = now_ns.saturating_sub(beat);
     (
       self.state() == State::Running && beat > 0 && age <= budget_ns,
       age,

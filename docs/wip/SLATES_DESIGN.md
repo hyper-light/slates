@@ -501,6 +501,15 @@ the measured wake cost before parking (the 2-competitive rule). The mount is nev
 
 ### 2.6 Boot order and self-observation
 
+> **Shared clock domain (2026-09-17).** HostClock now reads one OS monotonic boot/time domain
+> shared by the anchor, daemon, shards and warm restarts; constructing a clock never resets time.
+> Linux BOOTTIME, Darwin MONOTONIC and Windows precise interrupt time include suspend. Local
+> lease deadlines retain their meaning after recovery, and heartbeat freshness uses comparable
+> readings. Values are not comparable across hosts/time namespaces. Anchor format 3 refuses
+> format 2 before recovery because its timestamps used per-instance origins. Two supervised
+> child generations reproduce the old bug (0.12 s) and pass with the common clock. Record:
+> `docs/bugs/2026-09-17-heartbeats-use-different-clock-origins.md`.
+
 1. The anchor process starts (or is already running), maps or creates the shared segment, and
    loads or rebuilds the machine profile.
 2. The daemon starts, attaches the segment, and either replays the op logs into fresh in-memory
@@ -5162,3 +5171,14 @@ fleet,consensus,verbs,nfs}`, `ipc/protocol`, `cli/{args,verbs}`, and affected st
 - Applied in the same change to: D-17, `research/compression-archive-dedup.md` §2.6, GAPS (Bridges
   4.6 / §4.10), `docs/bugs/2026-09-14-volume-root-owned-by-root-wheel.md`, the archive, vfs,
   cluster and server crates. Rules R1–R10 remain unchanged.
+
+
+### A-21 (2026-09-17) — One host clock domain for supervision and retained deadlines
+
+- Replace per-instance monotonic origins with the OS boot/time-namespace clock. Local readings
+  remain comparable across shards and daemon generations and include suspend; remote hosts'
+  readings are never compared directly. Anchor format 3 refuses the incompatible old domain.
+- Evidence: the cross-process regression failed in 0.12 s with the child heartbeat preceding
+  its start. Shared-clock generations pass; the incompatible handoff is refused before recovery.
+- Applied in the same change to: §2.6 status, machine/clock, vfs/clock, anchor layout and tests,
+  unsafe-budget.toml (one Win32 FFI query), GAPS, and the dated heartbeat clock bug report.

@@ -32,6 +32,7 @@
 //! writes a host path (the structural test lists it under R1's allowed sites for that reason).
 
 pub mod bench;
+pub mod clock;
 pub mod derived;
 pub mod error;
 pub mod facts;

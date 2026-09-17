@@ -475,8 +475,7 @@ const UNIX_SCALE_NS: i64 = 1_700_000_000_000_000_000;
 
 /// The racy rule (§4.5) is a question about the filesystem's clock: a witness is racy only when
 /// the listing was read within the timestamp granularity of the file's last change *in the host's
-/// clock*. With the daemon's own clock (`HostClock`, monotonic nanoseconds since the clock was
-/// made) and a host whose timestamps sit at Unix scale, a file a whole second older than the
+/// clock*. With the daemon's own clock (`HostClock`, monotonic nanoseconds in the host boot domain) and a host whose timestamps sit at Unix scale, a file a whole second older than the
 /// listing is not racy; comparing the two clock domains called every such witness racy and
 /// re-hashed every drift check (docs/bugs/2026-09-14-racy-rule-compares-monotonic-with-wall-clock.md).
 #[test]

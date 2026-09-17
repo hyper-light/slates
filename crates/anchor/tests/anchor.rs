@@ -439,3 +439,103 @@ fn the_content_object_survives_a_daemon_restart_through_the_handoff() {
 
   let _ = segment; // the supervisor keeps the content object alive across the restart
 }
+
+/// T-2.4 / §2.6: the re-invoked daemon uses its own HostClock to publish real heartbeats. The
+/// parent kills and reaps it; this deadline also bounds it if the parent fails before cleanup.
+#[test]
+#[ignore = "heartbeat child; invoked by the supervision history"]
+fn host_clock_heartbeat_child() {
+  use slates_vfs::clock::{Clock, HostClock};
+  let segment = AnchorSegment::attach_from_env(&identity()).unwrap();
+  let mut clock = HostClock::new();
+  let start = Instant::now();
+  while start.elapsed() < Duration::from_millis(CHILD_WAIT_MS) {
+    segment.supervision().unwrap().beat(clock.monotonic_ns());
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_micros(POLL_US));
+  }
+}
+
+/// T-2.4 / §2.6 / §4.14: a long-lived anchor starts and restarts a child whose clock is newly
+/// constructed. Both generations' first heartbeats must follow their start and be live in the
+/// anchor's clock domain. Each sample is bounded by the parent's readings around the start/wait.
+#[test]
+fn a_delayed_child_and_its_restart_beat_in_the_anchors_clock_domain() {
+  use slates_vfs::clock::{Clock, HostClock};
+  /// Shape: the parent exists for this interval before either child starts; no product timeout changes.
+  const PARENT_AGE: Duration = Duration::from_millis(100);
+  let name = format!("slates-anchor-clock-{}", std::process::id());
+  let segment = AnchorSegment::create(&name, &identity(), geometry()).unwrap();
+  let exe = std::env::current_exe()
+    .unwrap()
+    .to_string_lossy()
+    .into_owned();
+  let args = vec![
+    "--ignored".into(),
+    "--exact".into(),
+    "host_clock_heartbeat_child".into(),
+  ];
+  let budget_ns = CHILD_WAIT_MS * 1_000_000;
+  let policy = RestartPolicy::derive(budget_ns, budget_ns).get();
+  let mut supervisor = Supervisor::new(segment, &exe, &args, policy);
+  let mut clock = HostClock::new();
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(PARENT_AGE);
+  let mut samples = Vec::new();
+  for _ in 0..2 {
+    let started = clock.monotonic_ns();
+    supervisor.start(started).unwrap();
+    let wait = Instant::now();
+    while supervisor.segment().supervision().unwrap().heartbeat_ns() == 0
+      && wait.elapsed() < Duration::from_millis(CHILD_WAIT_MS)
+    {
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(Duration::from_micros(POLL_US));
+    }
+    let beat = supervisor.segment().supervision().unwrap().heartbeat_ns();
+    let observed = clock.monotonic_ns();
+    let alive = supervisor
+      .segment()
+      .supervision()
+      .unwrap()
+      .alive(observed, budget_ns);
+    samples.push((started, beat, observed, alive));
+    supervisor.stop().unwrap();
+  }
+  eprintln!("clock-domain observations (start, beat, observed, alive/age): {samples:?}");
+  for (started, beat, observed, (alive, _)) in samples {
+    assert!(
+      beat >= started && beat <= observed,
+      "heartbeat {beat} must be inside {started}..={observed}"
+    );
+    assert!(
+      alive,
+      "the anchor sees the child's current heartbeat as live"
+    );
+  }
+}
+
+/// T-2.4 / §2.6: a segment with process-relative timestamps cannot be attached by a daemon
+/// using host-wide time. Reject the incompatible handoff before a heartbeat or lease is read.
+#[test]
+fn a_segment_with_process_relative_deadlines_is_refused_before_recovery() {
+  use slates_anchor::layout::AT_VERSION;
+  /// Format: layout 2 recorded timestamps relative to each constructing process/clock.
+  const PROCESS_RELATIVE_LAYOUT: u32 = 2;
+  let name = format!("slates-anchor-old-clock-{}", std::process::id());
+  let segment = AnchorSegment::create(&name, &identity(), geometry()).unwrap();
+  let (handoff, len) = handoff_of(&segment);
+  let mut mapping = slates_mem::SharedObject::open(&handoff, len).unwrap();
+  mapping.bytes_mut()[AT_VERSION..AT_VERSION + size_of::<u32>()]
+    .copy_from_slice(&PROCESS_RELATIVE_LAYOUT.to_le_bytes());
+  let result = AnchorSegment::attach(&handoff, len, &identity());
+  assert!(
+    matches!(
+      result,
+      Err(AnchorError::Layout {
+        reason: "wrong layout version"
+      })
+    ),
+    "an old clock domain is incompatible: {result:?}"
+  );
+}

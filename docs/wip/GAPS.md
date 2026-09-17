@@ -26,6 +26,16 @@ gaps. The TLA runs in §10 are historical, bounded model evidence, not a proof o
 > rerun or closure of the 6202 reported failures is claimed. No expected-failure list changed.
 > Record: `docs/bugs/2026-09-17-conformance-confuses-available-and-effective-root.md`.
 
+
+> **Shared clock domain (2026-09-17).** HostClock now reads one OS monotonic boot/time domain
+> shared by the anchor, daemon, shards and warm restarts; constructing a clock never resets time.
+> Linux BOOTTIME, Darwin MONOTONIC and Windows precise interrupt time include suspend. Local
+> lease deadlines retain their meaning after recovery, and heartbeat freshness uses comparable
+> readings. Values are not comparable across hosts/time namespaces. Anchor format 3 refuses
+> format 2 before recovery because its timestamps used per-instance origins. Two supervised
+> child generations reproduce the old bug (0.12 s) and pass with the common clock. Record:
+> `docs/bugs/2026-09-17-heartbeats-use-different-clock-origins.md`.
+
 ## 1. Component inventory
 
 | Subsystem (design §) | Current source status, 2026-09-05 | Open contract and acceptance |

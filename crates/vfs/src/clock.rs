@@ -1,4 +1,4 @@
-//! Time for the volume: a monotonic clock for the journal and a wall clock for POSIX timestamps,
+//! Time for the volume (§4.4) and host supervision (§2.6): a monotonic clock for the journal and a wall clock for POSIX timestamps,
 //! behind one trait so the simulation drives both deterministically and the tests never depend
 //! on the host's clock.
 
@@ -10,18 +10,15 @@ pub trait Clock {
   fn wall_ns(&mut self) -> i64;
 }
 
-/// The host's clocks.
+/// The host's clocks. Monotonic readings share one OS boot/time namespace across instances,
+/// shards and processes; warm recovery preserves deadlines. They cannot be compared across hosts.
 #[derive(Debug)]
-pub struct HostClock {
-  epoch: std::time::Instant,
-}
+pub struct HostClock {}
 
 impl HostClock {
-  /// A clock whose monotonic origin is now.
+  /// A clock using the host's common monotonic origin.
   pub fn new() -> Self {
-    Self {
-      epoch: std::time::Instant::now(),
-    }
+    Self {}
   }
 }
 
@@ -33,7 +30,7 @@ impl Default for HostClock {
 
 impl Clock for HostClock {
   fn monotonic_ns(&mut self) -> u64 {
-    u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    slates_machine::clock::monotonic_ns()
   }
 
   fn wall_ns(&mut self) -> i64 {
