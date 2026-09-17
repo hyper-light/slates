@@ -79,19 +79,29 @@ Command (bounded Linux container, quantum image): `docker run --rm --network=non
 
 ## 3. Additional concrete follow-ups found during this repair
 
-- [ ] **Terminal membership publication to other shards:** `fold_peer_state` ignores a refused
-  `run_on` and relies on another active probe to repeat the fold. A terminal death can instead
-  idle the probe forever. Establish a bounded, acknowledged/retried publication mechanism and
-  test full destination admission followed by recovery. The new owner lookup reads the control
-  shard, but that does not repair every other shard's stale membership copy.
-- [ ] **Identity announcements across overlapping sessions:** review whether a delayed old-boot
-  announcement can replace a newer learned identity. `classify_announced` treats a different
-  random nonce as a restart; it cannot derive age from numeric ordering. Current shared-gossip
-  filtering rejects a relayed alive report for a superseded identity, but that alone is not
-  evidence about authenticated old sessions. Reproduce before assigning a new defect.
-- [ ] Remove inaccurate comments claiming larger random boot nonces establish freshness,
-  unrostered probes are answered, or discarding third-member gossip is necessary to prevent
-  stale-alive flapping. Current authentication and incarnation ordering are the actual rules.
+- [x] **Terminal membership publication to other shards** — assessed, no correctness impact
+  (2026-09-17). `fold_peer_state` ignores a refused cross-shard `run_on`, so a terminal death's
+  fold can be dropped. But a review of every `.fleet.membership()` read shows **no off-control-shard
+  path consults the raw SWIM membership**: `verbs.rs` has zero membership reads; an owner shard
+  routes and admits from the committed **configuration** (`fleet.configuration()`, `object_owner`),
+  which `fan_configs_to_shards` re-fans every period (self-healing). So a dropped membership fold
+  leaves a copy nothing reads. A heavyweight retry mechanism is therefore unwarranted; the
+  inaccurate comments claiming `fold_peer_state` shares the config fan's self-healing discipline are
+  corrected, and the publish is documented best-effort (D-7 uniformity, not load-bearing). If a
+  future owner-shard path comes to read raw membership, add it to the periodic config fan.
+- [ ] **Identity announcements across overlapping sessions** — latent defect **confirmed**, complete
+  fix entangled with task #22 (2026-09-17). `classify_announced(known={A→N2}, boot_nonce=N1)` with a
+  delayed *old-nonce* announcement (N1, already superseded by N2) returns `Restarted{old: id2}` — it
+  would retire the newer id and revert to the older. Because boot nonces are random it cannot order
+  N1 before N2 from the nonces alone. A robust fix needs a monotonic generation (the anchor's
+  `SUP_GENERATION`, task #22 Piece 1 in the ephemeral-id plan) or a bounded per-anchor superseded-nonce
+  history; a single prior-nonce guard fails across multiple restarts. Not fixed here (needs the
+  generation work + a reproduction); no test currently hits the delayed-old-packet timing.
+- [x] Inaccurate comments corrected (2026-09-17): the serve-probe comment claimed a "higher"
+  boot_nonce marks a restart (a *different* nonce does; nonces cannot order) and that an unrostered
+  prober "is answered" (the gossip rewrite gives it no ack); the third claim (third-member gossip
+  discarded to prevent flap) was already corrected by the shared-gossip rewrite. The `fold_peer_state`
+  and `fan_configs_to_shards` comments no longer claim a shared self-healing discipline.
 
 ## 4. Audit findings still lacking recorded closure
 

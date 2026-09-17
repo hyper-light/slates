@@ -1116,10 +1116,13 @@ async fn serve_peer_probes(
   }
   // Only a **rostered** certificate may move membership (auth): the anchor it stands for is what the prober's
   // announced id and boot_nonce are validated against ([`learn_member`], task #22 learn-on-contact) — a
-  // restart's higher-boot_nonce id is admitted as a **new member** and its old id retired in that one fold; a
-  // stale or forged announcement is refused, counted, and not answered. An unrostered prober is answered but
-  // never folded (a ping's `from` is unauthenticated). This node's own boot_nonce rides every acknowledgement,
-  // so the prober validates this node the same way.
+  // restart announces a **different** boot_nonce (a random per-start value; nonces cannot establish numeric
+  // age order, so a different one, not a higher one, is what marks a restart), and its id is admitted as a
+  // **new member** while its old id is retired in that one fold; a stale or forged announcement is refused,
+  // counted, and not answered. An **unrostered or unauthenticated** prober receives no acknowledgement at all
+  // (the serve handler answers only after `learn_member` validates the presented certificate's anchor and
+  // boot_nonce), so authentication gates the reply, not only the fold. This node's own boot_nonce rides every
+  // acknowledgement, so the prober validates this node the same way.
   let rostered_anchor = endpoint.peer_certificate().and_then(|presented| {
     roster
       .iter()
@@ -1214,8 +1217,12 @@ fn resume_if_in_mesh(detector: &mut Detector, peer_host: HostId, was_idle: &mut 
 /// **failure view**; the configuration is the regional council's (D-14), so a death drives no takeover here
 /// — the council leader reconciles the retirement from the folded view and, when it commits, the record
 /// plane installs the new configuration and takes over what fell to this node ([`sync_config_from_council`]).
-/// The folded state is handed to every other shard's membership copy so all advance identically (D-7); a
-/// active probe repeats an idempotent fold on its next period. "Retired"
+/// The folded state is handed to every other shard's membership copy **best-effort**, so all advance
+/// identically (D-7): the cross-shard `run_on` is idempotent (incarnation-gated) but not retried, since no
+/// off-control-shard path reads the raw SWIM membership — an owner shard routes and admits from the committed
+/// configuration, which `fan_configs_to_shards` re-fans every period — so a fold dropped on a momentarily
+/// full control channel is harmless (it is not, unlike the configuration, load-bearing on another shard).
+/// "Retired"
 /// means no longer a peer this node keeps direct contact with ([`keeps_direct_contact_with`] — read from the
 /// committed configuration and the consensus voter sets, not from one detector's suspicion); the caller then
 /// closes the peer's sessions on both planes, so this must be the **same** predicate the link task and the
@@ -4362,10 +4369,14 @@ fn sync_config_from_council(local: HostId) {
 /// commits (`sync_config_from_council`, `drive_root_group`); every other shard holds a read-only copy fanned
 /// from here.
 ///
-/// **Re-fanned every period, not only on change** — the same idempotent-retry discipline [`fold_peer_state`]
-/// uses for the SWIM view: `run_on` is refused when a shard's control channel is momentarily full
-/// ([`RtError::ControlFull`]), and a fan dropped on the one period a configuration changed would otherwise
-/// leave that shard stale until the next change. Re-fanning heals it next period, and the receiving side is
+/// **Re-fanned every period, not only on change.** `run_on` is refused when a shard's control channel is
+/// momentarily full ([`RtError::ControlFull`]), and a fan dropped on the one period a configuration changed
+/// would otherwise leave that shard stale until the next change. Re-fanning heals it next period. This is the
+/// authoritative cross-shard state: an owner shard routes and admits from the **committed configuration**
+/// fanned here (`fleet.configuration()`, `object_owner`), never from the raw SWIM membership, which
+/// [`fold_peer_state`] publishes to the other shards **best-effort** for D-7 uniformity but which no
+/// off-control-shard path reads, so a membership fold dropped on a full channel is harmless where a dropped
+/// configuration fan would not be. The receiving side is
 /// version-gated (`install_configuration` installs only a newer version; `RootGroup::adopt` ignores an
 /// equal-or-older one), so a re-fan of an unchanged configuration is a no-op there. Both configurations ride
 /// **one** cross-shard message per shard, and both are bounded (a bounded neighbourhood; regions, moved homes
