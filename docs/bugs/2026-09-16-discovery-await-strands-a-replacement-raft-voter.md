@@ -286,6 +286,10 @@ cognitive-complexity gate) the full gate chain ran once more at 09:39–09:40, l
 clean; `cargo clippy -p slates-server --all-targets -- -D warnings` and the workspace clippy clean; the
 rebuilt history binary (its helper symbols present) **2/2** (14.04 s, 13.96 s; wall 15 s and 14 s, so the
 process exited with the verdict both times); server lib tests 88/88; `cargo xtask check` ok. One
-unexplained observation, kept: the first run of the earlier binary exited about 260 s after libtest's
-verdict (13.12 s), a delay none of the six later runs showed and the suite's wall time (268 s for
-267.45 s) does not contain. Linux and KIND run on the push.
+observation was first kept as unexplained — the first run of the earlier binary exited about 260 s after
+libtest's verdict (13.12 s), a delay none of the six later runs showed — and is explained later the same
+day: `pmset -g log` shows this laptop asleep 09:14:10–09:17:58 (228 s) and 09:26:11–09:30:33 (262 s)
+while that binary was running; libtest's clock is monotonic and stops during sleep, the shell's wall clock
+does not, so a process wall time on this box is not evidence of a stall until the power log has been
+read (the same reading explains a fleet suite that took 1,886 s of wall for 278.65 s of tests in the
+observation-hardening commit). Linux and KIND run on the push.
