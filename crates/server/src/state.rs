@@ -93,6 +93,30 @@ pub struct LearnedMember {
   pub host: slates_db::HostId,
 }
 
+/// One peer's record session as the control shard keeps it (§4.8): the session itself, `None` while it is
+/// out on a borrow — the record-plane coordinator's dispatch, or the link task's own discovery exchange —
+/// and, for the coordinator's borrows, **which** session is out: the borrowed session's connection id
+/// (unique per establishment), so a return refills the slot only with the session that left it. A late
+/// return of an older session finds the id changed — or the slot already holding a newer session — and is
+/// dropped, counted, never installed over the newer one
+/// (`docs/bugs/2026-09-16-discovery-await-strands-a-replacement-raft-voter.md`).
+pub struct RecordLink {
+  /// The session, or `None` while it is borrowed.
+  pub endpoint: Option<slates_transport::endpoint::Endpoint>,
+  /// The connection id of the session a dispatch borrowed, while it is out; `None` otherwise.
+  pub borrowed: Option<slates_transport::endpoint::ConnectionId>,
+}
+
+impl RecordLink {
+  /// A link whose session is up and lendable.
+  pub fn up(endpoint: slates_transport::endpoint::Endpoint) -> RecordLink {
+    RecordLink {
+      endpoint: Some(endpoint),
+      borrowed: None,
+    }
+  }
+}
+
 /// The shard's state.
 pub struct ShardState {
   /// The shard: the runtime's id, what messages are addressed to (process-local).
@@ -347,7 +371,18 @@ pub struct ShardState {
   /// absent entry means no session (never established, or lost — a borrow that ended without a return),
   /// which the link task re-establishes; a retired peer's entry is removed with it. Empty on a laptop (no
   /// fleet loop runs).
-  pub record_sessions: BTreeMap<slates_db::HostId, Option<slates_transport::endpoint::Endpoint>>,
+  pub record_sessions: BTreeMap<slates_db::HostId, RecordLink>,
+  /// The waker of the discovery exchange pending on each anchor's record link, if one is — at most one per
+  /// anchor (the link task drives one exchange at a time), bounded by the roster — so a peer change learned
+  /// on contact or folded by the detector wakes the exchange to re-check its link at once rather than at
+  /// its deadline (`crate::fleet::wake_link_waiter`). Registered by the exchange while it waits, removed by
+  /// it when it ends, whatever the outcome.
+  pub link_waiters: BTreeMap<slates_db::HostId, std::task::Waker>,
+  /// Test support (never reachable from the wire): while set, the record serve side holds every discovery
+  /// reply after its request arrived, so a peer's exchange to this node stays pending with its endpoint
+  /// borrowed — the interrupted-discovery restart the replacement-voter regression forces by stopping this
+  /// node while it holds (`Daemon::inject_discovery_fault`).
+  pub discovery_withhold_replies: bool,
   /// The measured **path** to each peer (§4.8 "Derived constants": "election timeout ≥ 10 × broadcast RTT
   /// p99"; `slates_cluster::timing::PathRtt`): the transport's RFC 9002 estimator over every round trip
   /// this node timed to that peer — its SWIM probe's acknowledgement each period, and every consensus

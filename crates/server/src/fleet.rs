@@ -318,6 +318,9 @@ fn learn_member(
           host: announced,
         },
       );
+      // A discovery exchange pending on this anchor's link addresses the old incarnation: woken now, it
+      // ends invalidated and releases its endpoint, so the link re-dials the new one this period.
+      wake_link_waiter(state, anchor);
       if let Some(region) = state.node_regions.get(&old).copied() {
         state.node_regions.insert(announced, region);
       }
@@ -1186,7 +1189,12 @@ fn resume_if_in_mesh(detector: &mut Detector, peer_host: HostId, was_idle: &mut 
 fn fold_peer_state(detector: &Detector, peer_host: HostId, origin: u16, shards: &[u16]) -> bool {
   let retired = state::with_state(|s| {
     sync_peer(detector.membership(), &mut s.fleet, peer_host);
-    !keeps_direct_contact_with(s, peer_host)
+    let retired = !keeps_direct_contact_with(s, peer_host);
+    if retired {
+      // A discovery exchange pending on this peer's link re-checks it now, not at its deadline.
+      wake_link_waiter_of(s, peer_host);
+    }
+    retired
   })
   .unwrap_or(false);
   let peer_state = detector.membership().state(peer_host);
@@ -1313,6 +1321,7 @@ fn follow_current_id(
     if s.formed_probe_peers.remove(&old) {
       s.formed_probe_peers.insert(current);
     }
+    wake_link_waiter_of(s, old);
   });
   for shard in shards.iter().copied().filter(|shard| *shard != origin) {
     let _ = run_on(origin, shard, move |s| {
@@ -1570,6 +1579,12 @@ async fn serve_peer_records(
         let certificate = certificate.clone();
         async move {
           if stream == crate::discovery::STREAM {
+            // Test support: a fault holds this reply after the request arrived (never reachable from the
+            // wire), so a peer's exchange is pending — its endpoint borrowed — while this node is then
+            // stopped: the interrupted-discovery restart the replacement-voter regression forces.
+            while state::with_state(|state| state.discovery_withhold_replies).unwrap_or(false) {
+              futures::sleep(HEARTBEAT_NS / POLL_PER_PERIOD).await;
+            }
             let outcome =
               state::with_state(|state| crate::discovery::serve(state, &certificate, &request));
             return match outcome {
@@ -2721,6 +2736,16 @@ const PROBE_BROKEN: &str = "fleet.probe.broken";
 /// A dial still in its handshake dropped at its peer's retirement, so the resume dials afresh at the
 /// peer's current address.
 const DIAL_STALE_DROPPED: &str = "fleet.dial.stale_dropped";
+/// A discovery exchange that reached its deadline unanswered: its session released, the link re-dials
+/// (`docs/bugs/2026-09-16-discovery-await-strands-a-replacement-raft-voter.md`).
+const DISCOVERY_DEADLINE: &str = "fleet.discovery.deadline";
+/// A discovery exchange invalidated while it waited: its peer's member id changed, or the peer was retired.
+const DISCOVERY_INVALIDATED: &str = "fleet.discovery.invalidated";
+/// A discovery exchange whose transport failed terminally.
+const DISCOVERY_TRANSPORT: &str = "fleet.discovery.transport";
+/// A record session returned to a slot that no longer expects it — a retired peer's, a slot re-established
+/// since, or a session other than the one borrowed — dropped rather than installed over a newer one.
+const LINK_STALE_RETURN: &str = "fleet.link.stale_return";
 const RESOLVE_REFUSED: &str = "fleet.resolve";
 const RESOLVE_NO_RESOLVER: &str = "fleet.resolve.no-resolver";
 const RESOLVE_TIMEOUT: &str = "fleet.resolve.timeout";
@@ -2828,7 +2853,7 @@ async fn establish_record_link(driver: &'static PeerDriver, dial: PeerDial) {
     // Follow the peer's current id (task #22): a restart is a new process, so the session to its previous
     // incarnation is dead by definition — drop it, and from here keep the link under the id the peer now
     // writes as (dialed again once the council admits it, as any newly admitted member is).
-    peer_host = refresh_record_identity(anchor, peer_host);
+    peer_host = refresh_record_identity(anchor, peer_host, &mut client, &mut discovery_cursor);
     let retired = state::with_state(|s| !keeps_direct_contact_with(s, peer_host));
     if retired == Some(true) {
       // The peer is retired. Drop its record session and **idle** — this task does not end, so if the peer
@@ -2865,14 +2890,29 @@ async fn establish_record_link(driver: &'static PeerDriver, dial: PeerDial) {
   }
 }
 
-fn refresh_record_identity(anchor: HostId, previous: HostId) -> HostId {
+/// The member id the link should address now (task #22). A change — the peer restarted — removes the
+/// previous member's record entry (the session to its previous incarnation is dead by definition), drops a
+/// dial still in its handshake (it points at the old incarnation's address and keys, so driving it on is
+/// not progress toward the new one; counted, as at a retirement) and restarts the discovery sweep.
+fn refresh_record_identity(
+  anchor: HostId,
+  previous: HostId,
+  client: &mut Option<Endpoint>,
+  cursor: &mut crate::discovery::Cursor,
+) -> HostId {
   let current = current_member(anchor).unwrap_or(previous);
   if current != previous {
     state::with_state(|state| state.record_sessions.remove(&previous));
+    if client.take().is_some() {
+      count_refusal(DIAL_STALE_DROPPED);
+    }
+    *cursor = crate::discovery::Cursor::default();
   }
   current
 }
 
+/// Enrolls a freshly established session: the first discovery page over it, then the session installed as
+/// the peer's record link. Any other outcome drops the fresh session here and the next period dials afresh.
 async fn enroll_record_session(
   session: Option<Endpoint>,
   peer_host: HostId,
@@ -2884,11 +2924,20 @@ async fn enroll_record_session(
     return;
   };
   *cursor = crate::discovery::Cursor::default();
-  if exchange_discovery(&mut session, anchor, cursor, driver).await {
-    state::with_state(|state| state.record_sessions.insert(peer_host, Some(session)));
+  if exchange_discovery(&mut session, anchor, peer_host, cursor, driver).await
+    == DiscoveryOutcome::Answered
+  {
+    state::with_state(|state| {
+      state
+        .record_sessions
+        .insert(peer_host, crate::state::RecordLink::up(session));
+    });
   }
 }
 
+/// One discovery page over the peer's installed record link, the session borrowed for it and put back
+/// **only into the entry it left** — an entry removed meanwhile (the peer replaced or retired) is never
+/// re-created by a late page; any outcome but an answer releases the session and the link re-dials.
 async fn refresh_discovery(
   peer_host: HostId,
   anchor: HostId,
@@ -2899,14 +2948,16 @@ async fn refresh_discovery(
     state
       .record_sessions
       .get_mut(&peer_host)
-      .and_then(Option::take)
+      .and_then(|link| link.endpoint.take())
   })
   .flatten();
   if let Some(mut session) = session {
-    let kept = exchange_discovery(&mut session, anchor, cursor, driver).await;
+    let outcome = exchange_discovery(&mut session, anchor, peer_host, cursor, driver).await;
     state::with_state(|state| {
-      if kept {
-        state.record_sessions.insert(peer_host, Some(session));
+      if outcome == DiscoveryOutcome::Answered {
+        if let Some(link) = state.record_sessions.get_mut(&peer_host) {
+          link.endpoint = Some(session);
+        }
       } else {
         state.record_sessions.remove(&peer_host);
       }
@@ -2914,20 +2965,135 @@ async fn refresh_discovery(
   }
 }
 
+/// How a discovery exchange with a peer ended (§4.8): typed, so a deadline, an invalidation, a transport
+/// fault and a protocol refusal are never one outcome — and a session is never silently kept or dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiscoveryOutcome {
+  /// The peer answered a page; the session is kept.
+  Answered,
+  /// The deadline passed unanswered: the exchange abandoned, the session released so the link re-dials.
+  Deadline,
+  /// The link was invalidated while the exchange waited — the peer's member id changed, or it was retired.
+  Invalidated,
+  /// The transport failed terminally.
+  Transport,
+  /// The reply, or the request itself, was refused by the discovery protocol.
+  Refused,
+}
+
+/// Why a discovery exchange ended without a reply (the race in [`exchange_discovery`]), with its counter.
+#[derive(Clone, Copy)]
+enum DiscoveryFault {
+  Deadline,
+  Invalidated,
+  Transport,
+}
+
+impl DiscoveryFault {
+  fn counter(self) -> &'static str {
+    match self {
+      DiscoveryFault::Deadline => DISCOVERY_DEADLINE,
+      DiscoveryFault::Invalidated => DISCOVERY_INVALIDATED,
+      DiscoveryFault::Transport => DISCOVERY_TRANSPORT,
+    }
+  }
+
+  fn outcome(self) -> DiscoveryOutcome {
+    match self {
+      DiscoveryFault::Deadline => DiscoveryOutcome::Deadline,
+      DiscoveryFault::Invalidated => DiscoveryOutcome::Invalidated,
+      DiscoveryFault::Transport => DiscoveryOutcome::Transport,
+    }
+  }
+}
+
+/// Whether the link to `anchor` still addresses `expected`: the anchor's learned member is still `expected`
+/// (or none was learned yet, the seed standing) and this node still keeps direct contact with it.
+fn link_valid(anchor: HostId, expected: HostId) -> bool {
+  state::with_state(|s| {
+    s.learned_members
+      .get(&anchor)
+      .is_none_or(|learned| learned.host == expected)
+      && keeps_direct_contact_with(s, expected)
+  })
+  .unwrap_or(false)
+}
+
+/// Wakes the discovery exchange pending on `anchor`'s record link, if one is, so it re-checks the link's
+/// validity at once — a replacement learned on contact, a retirement folded — rather than at its deadline.
+fn wake_link_waiter(state: &mut ShardState, anchor: HostId) {
+  if let Some(waker) = state.link_waiters.remove(&anchor) {
+    waker.wake();
+  }
+}
+
+/// [`wake_link_waiter`] for the anchor whose current member is `host` (a death is folded by member id).
+pub(crate) fn wake_link_waiter_of(state: &mut ShardState, host: HostId) {
+  let anchor = state
+    .learned_members
+    .iter()
+    .find(|(_, learned)| learned.host == host)
+    .map(|(anchor, _)| *anchor);
+  if let Some(anchor) = anchor {
+    wake_link_waiter(state, anchor);
+  }
+}
+
+/// One discovery page over `session`, **bounded**: raced against one deadline armed once at the measured
+/// control-plane round budget's full span ([`consensus_budget`] over the slowest measured path — the bound
+/// every other record-plane exchange runs under), and against the link's validity, re-checked whenever the
+/// exchange is woken (a reply, the timer, or [`wake_link_waiter`]). A peer that never answers — the process
+/// under the session gone, its replacement unable to read the old keys, which no datagram socket reports as
+/// a terminal error — therefore cannot hold the link task, and its endpoint, past the budget: before this
+/// bound a survivor refreshing discovery when the old process disappeared awaited its reply for good, and
+/// never returned to the loop that notices the replacement and re-dials it — the leader made 271
+/// replication attempts toward a replacement voter with no session and sent no append
+/// (`docs/bugs/2026-09-16-discovery-await-strands-a-replacement-raft-voter.md`). Validity is checked before
+/// a ready reply is accepted, so a reply and a replacement notification that become ready together never
+/// apply a page for a member the link no longer addresses. Partial packets, acknowledgements and
+/// retransmissions do not renew the deadline. Every outcome is typed and counted.
 async fn exchange_discovery(
   session: &mut Endpoint,
   anchor: HostId,
+  expected: HostId,
   cursor: &mut crate::discovery::Cursor,
   driver: &'static PeerDriver,
-) -> bool {
+) -> DiscoveryOutcome {
   let Some(request) = state::with_state(|state| cursor.request(state)).flatten() else {
-    return false;
+    return DiscoveryOutcome::Refused;
   };
-  let reply = match session.request(crate::discovery::STREAM, &request).await {
+  let span_ns = consensus_budget(slowest_path_tail_ns()).max_deadline_ns();
+  let exchanged = {
+    let mut exchange = std::pin::pin!(session.request(crate::discovery::STREAM, &request));
+    let mut timer = std::pin::pin!(futures::sleep(span_ns));
+    std::future::poll_fn(|cx| {
+      if !link_valid(anchor, expected) {
+        return std::task::Poll::Ready(Err(DiscoveryFault::Invalidated));
+      }
+      if let std::task::Poll::Ready(result) = std::future::Future::poll(exchange.as_mut(), cx) {
+        return std::task::Poll::Ready(result.map_err(|_| DiscoveryFault::Transport));
+      }
+      if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
+        return std::task::Poll::Ready(Err(DiscoveryFault::Deadline));
+      }
+      // At most one waiter per anchor: the link task drives one exchange at a time.
+      state::with_state(|s| {
+        s.link_waiters.insert(anchor, cx.waker().clone());
+      });
+      std::task::Poll::Pending
+    })
+    .await
+  };
+  state::with_state(|s| {
+    s.link_waiters.remove(&anchor);
+  });
+  let reply = match exchanged {
     Ok(reply) => reply,
-    Err(_) => {
-      count_refusal(ACCEPT_REFUSED);
-      return false;
+    Err(fault) => {
+      // The request future was dropped mid-exchange: abandoned, so its frames do not ride a later flush.
+      session.abandon_exchange();
+      count_refusal(fault.counter());
+      return fault.outcome();
     }
   };
   match state::with_state(|state| cursor.receive(state, &reply, anchor)) {
@@ -2935,13 +3101,13 @@ async fn exchange_discovery(
       for peer in peers {
         driver.start(peer);
       }
-      true
+      DiscoveryOutcome::Answered
     }
     Some(Err(refusal)) => {
       count_refusal(refusal.counter());
-      false
+      DiscoveryOutcome::Refused
     }
-    None => false,
+    None => DiscoveryOutcome::Refused,
   }
 }
 
@@ -4329,10 +4495,12 @@ fn record_acks_in(
 pub(crate) fn take_sessions(wanted: impl Fn(HostId) -> bool) -> Vec<(HostId, Endpoint)> {
   state::with_state(|s| {
     let mut taken = Vec::new();
-    for (host, slot) in s.record_sessions.iter_mut() {
+    for (host, link) in s.record_sessions.iter_mut() {
       if wanted(*host)
-        && let Some(endpoint) = slot.take()
+        && let Some(mut endpoint) = link.endpoint.take()
       {
+        // The borrow is tagged with the session's own identity, so only this session returns to the slot.
+        link.borrowed = endpoint.connection_id().ok();
         taken.push((*host, endpoint));
       }
     }
@@ -4341,13 +4509,22 @@ pub(crate) fn take_sessions(wanted: impl Fn(HostId) -> bool) -> Vec<(HostId, End
   .unwrap_or_default()
 }
 
-/// Returns borrowed sessions to the shard state after a dispatch. Only an existing (borrowed) entry is
-/// refilled: a peer retired meanwhile has had its entry removed by its link task, and its session is dropped.
+/// Returns borrowed sessions to the shard state after a dispatch. A slot is refilled only by the session
+/// that left it — the entry still there, its session out, and the returning session's connection id the
+/// one the borrow was tagged with. Anything else is a late return — a peer retired meanwhile (its entry
+/// removed by its link task), a slot the link task re-established since (holding a newer session, or
+/// lending it), or a session other than the one borrowed — dropped and counted (`fleet.link.stale_return`),
+/// never installed over a newer session.
 pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
   state::with_state(|s| {
-    for (host, endpoint) in sessions {
-      if let Some(slot) = s.record_sessions.get_mut(&host) {
-        *slot = Some(endpoint);
+    for (host, mut endpoint) in sessions {
+      let returned = endpoint.connection_id().ok();
+      match s.record_sessions.get_mut(&host) {
+        Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
+          link.endpoint = Some(endpoint);
+          link.borrowed = None;
+        }
+        _ => *s.refusals.entry(LINK_STALE_RETURN).or_insert(0) += 1,
       }
     }
   });

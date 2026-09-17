@@ -967,6 +967,7 @@ impl Daemon {
             incarnation,
           };
           let _ = slates_cluster::fleet::apply_peer_state(&mut s.fleet, peer, Some(dead));
+          crate::fleet::wake_link_waiter_of(s, peer);
         });
         let _ = tx.send(());
       }
@@ -1011,6 +1012,7 @@ impl Daemon {
               incarnation: death_incarnation,
             }),
           );
+          crate::fleet::wake_link_waiter_of(s, old);
           let _ = slates_cluster::fleet::apply_peer_state(
             &mut s.fleet,
             new,
@@ -1184,6 +1186,45 @@ impl Daemon {
     }
     rx.recv_timeout(std::time::Duration::from_nanos(OBSERVE_BUDGET_NS))
       .unwrap_or(false)
+  }
+
+  /// Test support: holds every discovery reply this node's record serve side would send (never reachable
+  /// from the wire) while `withhold` is set, so a peer's refresh exchange to this node stays pending with
+  /// its record endpoint borrowed by that exchange — the interrupted-discovery restart the
+  /// replacement-voter regression forces by stopping this node while it holds
+  /// (`docs/bugs/2026-09-16-discovery-await-strands-a-replacement-raft-voter.md`). Delivered like
+  /// [`Self::inject_merge_fault`]; returns whether it was installed.
+  pub fn inject_discovery_fault(&self, withhold: bool) -> bool {
+    let Some(control) = self.shards.first().copied() else {
+      return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if !self.spawn_admitted(control, OBSERVE_BUDGET_NS, || {
+      let tx = tx.clone();
+      async move {
+        let installed = state::with_state(|s| s.discovery_withhold_replies = withhold).is_some();
+        let _ = tx.send(installed);
+      }
+    }) {
+      return false;
+    }
+    rx.recv_timeout(std::time::Duration::from_nanos(OBSERVE_BUDGET_NS))
+      .unwrap_or(false)
+  }
+
+  /// This node's record links (§4.8, `ShardState::record_sessions`): each peer with an entry, and whether
+  /// its session is out on a borrow at the moment of the read — a dispatch's, or the link task's own
+  /// discovery exchange. A test reads it to prove an exchange is pending on a link before interrupting it,
+  /// and that a link to a fresh member exists after. `None` when the control shard could not be observed.
+  pub fn fleet_record_links(&self) -> Option<Vec<(slates_db::HostId, bool)>> {
+    self.observe(self.shards.first().copied(), || {
+      state::with_state(|s| {
+        s.record_sessions
+          .iter()
+          .map(|(host, link)| (*host, link.endpoint.is_none()))
+          .collect()
+      })
+    })
   }
 
   /// How many placed snapshots the shard owning `object` has **repaired** (§4.10 "the healer"): re-put to
@@ -1627,6 +1668,8 @@ fn init_shard(
     pending_takeovers: std::collections::BTreeSet::new(),
     config_refresh_wanted: false,
     record_sessions: std::collections::BTreeMap::new(),
+    link_waiters: std::collections::BTreeMap::new(),
+    discovery_withhold_replies: false,
     peer_paths: std::collections::BTreeMap::new(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),

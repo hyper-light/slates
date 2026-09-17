@@ -72,3 +72,17 @@ discovery::tests::refused_revalidation_keeps_the_complete_roster_for_the_next_re
 capacity, reloads the retained publication, and verifies both peers are discoverable when the
 next start has capacity. The first short exact filter selected zero tests; only this fully
 qualified execution counts as evidence.
+
+## Correction (2026-09-17): the discovery exchange was unbounded
+
+The enrollment and refresh exchanges this record added (`exchange_discovery`, over the record
+session) awaited `Endpoint::request` with no deadline; `Endpoint::request` deliberately has none —
+its caller owns the bound. A survivor refreshing discovery when the peer's process disappeared
+therefore held that peer's record endpoint, and the link task that alone notices a replacement,
+for good — a datagram socket reports no terminal error for a peer whose keys are gone — which is
+how a replacement voter received no append (271 attempts, 0 sent) while its admission committed
+around it. The exchange is now bounded by one deadline armed once at the measured control-plane
+round budget's full span and by the link's validity (re-checked whenever it is woken; a peer change
+wakes it), every outcome typed and counted, and a borrowed record session returns only to the slot
+it left: `docs/bugs/2026-09-16-discovery-await-strands-a-replacement-raft-voter.md`, §4.8 status
+2026-09-17.

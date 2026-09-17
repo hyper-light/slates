@@ -5756,6 +5756,16 @@ fn a_fresh_restart_keeps_its_serve_session_while_the_predecessor_retires() {
 
 /// AC-8.1, §4.8, AUD-07: lose a whole anchor, rejoin through the surviving council under a
 /// fresh identity, then lose the leader and require the replacement's vote for the next election.
+/// The loss is **forced into the interrupted-discovery phase**: the victim holds its discovery replies
+/// after their requests arrive (`Daemon::inject_discovery_fault`), so every survivor's refresh exchange to
+/// it is pending — its record endpoint borrowed by that exchange — when the victim dies. That is the shape
+/// whose unbounded wait stranded the replacement (a datagram socket reports no terminal error for a peer
+/// whose keys are gone; the link task that alone notices the replacement and re-dials never returned to its
+/// loop: 271 replication attempts, no append, the old voter set on the replacement —
+/// `docs/bugs/2026-09-16-discovery-await-strands-a-replacement-raft-voter.md`). Expect, before the voter
+/// set converges: each survivor's exchange ends typed (at its deadline, or invalidated by the replacement's
+/// identity), each survivor holds a record link to the fresh member, and the leader's appends reach it (its
+/// council contact climbs). Non-vacuous: the links to the victim are shown borrowed before it is stopped.
 #[test]
 fn a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss() {
   let _serial = serialize_fleet_tests();
@@ -5843,7 +5853,9 @@ fn a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss
     .position(|daemon| daemon.root_leads() == Some(false))
     .unwrap();
   let old = before[replaced];
+  hold_the_victims_discovery_replies(&daemons, replaced, old);
   daemons.remove(replaced).stop();
+  let survivors = daemons.len();
   let replacement = start_fleet_node(
     &profiles[replaced],
     configs[replaced].clone(),
@@ -5873,6 +5885,7 @@ fn a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss
       .map(Daemon::council_members)
       .collect::<Vec<_>>()
   );
+  assert_survivors_reach_the_replacement(&daemons, survivors, fresh);
   let voters: Vec<HostId> = daemons
     .iter()
     .map(|daemon| daemon.member_identity().unwrap())
@@ -6135,6 +6148,82 @@ fn recover_root_from_survivors(daemons: &[Daemon]) {
       ReplyBody::RecoveryStarted { joining: true, .. }
     ));
   }
+}
+
+/// Forces the interrupted-discovery phase on the whole-RAM history
+/// (`docs/bugs/2026-09-16-discovery-await-strands-a-replacement-raft-voter.md`): the victim at `replaced`
+/// holds its discovery replies after their requests arrive, and every survivor's record link to it (`old`)
+/// is shown **borrowed** by that pending exchange — the state the victim is then stopped in. Non-vacuous:
+/// before the exchange was bounded, that borrow held the endpoint and the link task for good.
+fn hold_the_victims_discovery_replies(daemons: &[Daemon], replaced: usize, old: HostId) {
+  assert!(
+    daemons[replaced].inject_discovery_fault(true),
+    "the withhold fault installs on the victim"
+  );
+  assert!(
+    audit_wait(|| daemons.iter().enumerate().all(|(node, daemon)| {
+      node == replaced
+        || daemon.fleet_record_links().is_some_and(|links| {
+          links
+            .iter()
+            .any(|(host, borrowed)| *host == old && *borrowed)
+        })
+    })),
+    "each survivor's record link to the victim is borrowed by a pending discovery exchange: {:?}",
+    daemons
+      .iter()
+      .map(Daemon::fleet_record_links)
+      .collect::<Vec<_>>()
+  );
+}
+
+/// Whether a daemon's interrupted discovery exchange ended typed — at its deadline, or invalidated.
+fn discovery_ended_typed(daemon: &Daemon) -> bool {
+  daemon.fleet_refusals().is_some_and(|refusals| {
+    refusals
+      .get("fleet.discovery.deadline")
+      .copied()
+      .unwrap_or(0)
+      + refusals
+        .get("fleet.discovery.invalidated")
+        .copied()
+        .unwrap_or(0)
+      >= 1
+  })
+}
+
+/// After the replacement (`daemons[survivors]`, admitted as `fresh`) is up: each survivor's interrupted
+/// exchange to the dead incarnation ended typed and released its endpoint, each survivor holds a record
+/// link to the fresh member, and the leader's appends reach it (its council contact climbs) — the
+/// deliveries the unbounded exchange had stranded (271 replication attempts, no append).
+fn assert_survivors_reach_the_replacement(daemons: &[Daemon], survivors: usize, fresh: HostId) {
+  assert!(
+    audit_wait(|| daemons[..survivors].iter().all(discovery_ended_typed)),
+    "each survivor's discovery exchange to the dead incarnation ended typed: {:?}",
+    daemons[..survivors]
+      .iter()
+      .map(Daemon::fleet_refusals)
+      .collect::<Vec<_>>()
+  );
+  assert!(
+    audit_wait(|| daemons[..survivors].iter().all(|daemon| {
+      daemon
+        .fleet_record_links()
+        .is_some_and(|links| links.iter().any(|(host, _)| *host == fresh))
+    })),
+    "each survivor holds a record link to the fresh member: {:?}",
+    daemons[..survivors]
+      .iter()
+      .map(Daemon::fleet_record_links)
+      .collect::<Vec<_>>()
+  );
+  let contact_at_admission = daemons[survivors].council_contact().unwrap_or(0);
+  assert!(
+    audit_wait(|| daemons[survivors]
+      .council_contact()
+      .is_some_and(|contact| contact > contact_at_admission)),
+    "the leader's appends reach the replacement: its council contact climbs past {contact_at_admission}"
+  );
 }
 
 /// The audit run has a strict wall-clock bound, including when the normal fleet period budget
