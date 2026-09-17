@@ -1377,3 +1377,28 @@ and rejoin in 2.2 s (takeover in 1.8 s). The older §4.8 wording calling this di
 is superseded. This is evidence from `a4fe23a`, before the fairness change above; it is not
 validation of later unpushed code. Safe rolling upgrade and mounted read-back in a pod
 remain separate items. [KIND record](kind-lane.md).
+
+
+### 2026-09-17: scheduler quantum exercised under OS pressure
+
+The previously owed live pressure history is built. An opt-in Linux quota test uses two finite,
+joined load threads and requires original membership samples, acknowledgements completed during
+load, and actual probe deadline/interval dilations. Two final runs passed in 16.15 s and 18.75 s
+with 899–964 ms measured scheduling delays. A separate fixed-floor build measured 926 ms delay
+and failed the dilation assertion with zero uses, while retaining membership. Active use is proven;
+preventing false retirement is still an unproven benefit. Consensus timing is unchanged.
+[Commands, all trials and limitations](../bugs/2026-09-16-fleet-detection-windows-use-a-fixed-scheduler-quantum.md).
+
+### 2026-09-17: additional CI failures observed, diagnosis open
+
+The repaired macOS CLI job is not the whole workflow. On the same `a4fe23a` run,
+[Ubuntu tests](https://github.com/hyper-light/slates/actions/runs/35253899553/job/105312670699)
+finished with 40/43 fleet histories passing in 2355.92 s: holder-mismatch timed out in client
+`AwaitPlaced`, inputs-placed in client `Destroy`, and fresh-identity restart failed takeover
+convergence. These signatures differ from the earlier merge-identity/observation diagnoses;
+no cause is assigned from the CI log alone.
+[Ubuntu conformance](https://github.com/hyper-light/slates/actions/runs/35253899553/job/105312670403)
+reported 6202 unexpected pjdfstest failures out of 8798 cases, editor workload backup-file
+output disagreement, and hermeticity startup timing out after 60 s while the anchor repeatedly
+reported a missed first heartbeat. Other eight workload comparisons were identical. These remain
+open; neither the CLI repair nor the scheduler proof claims to fix them.

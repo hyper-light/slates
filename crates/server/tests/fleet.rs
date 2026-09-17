@@ -974,6 +974,119 @@ fn a_starved_but_live_peer_is_not_retired() {
   assert!(meshed_after, "the mesh is whole again after B's starvation");
 }
 
+/// Shape: one competing runnable thread per daemon. In the opt-in Linux quota fixture their combined
+/// demand exceeds the CPU allocation; neither thread occupies a daemon's control-shard poll.
+#[cfg(target_os = "linux")]
+const PRESSURE_WORKERS: usize = 2;
+/// Derived: four of the existing three-liveness-budget starvation windows. Long enough to observe
+/// several Linux quota replenishments and probes while every worker remains runnable.
+#[cfg(target_os = "linux")]
+const PRESSURE_WINDOW: Duration = Duration::from_nanos(4 * STARVATION_NS);
+
+/// AC (§4.8 "Derived constants", R5): under OS CPU contention, a measured scheduling delay actually
+/// widens live probe windows while the original peers remain members in every observed sample and
+/// continue acknowledging probes. Run opt-in under a Linux CPU quota with a replenishment period above
+/// HEARTBEAT_NS; the recorded command and limits are in the scheduler-quantum bug report. This refuses
+/// a vacuous pass on an unconstrained host. The workers are finite and joined, even on a failed assertion.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_descheduled_observer_uses_its_quantum_and_keeps_its_live_peer() {
+  if std::env::var_os("SLATES_TEST_SCHEDULER_PRESSURE").as_deref()
+    != Some(std::ffi::OsStr::new("1"))
+  {
+    eprintln!(
+      "SKIP: set SLATES_TEST_SCHEDULER_PRESSURE=1 inside the documented Linux CPU quota fixture"
+    );
+    return;
+  }
+  let _serial = serialize_fleet_tests();
+  let (daemon_a, daemon_b, _) = two_node_fleet();
+  let host_a = daemon_a.member_identity().unwrap();
+  let host_b = daemon_b.member_identity().unwrap();
+  let before = [
+    daemon_a.fleet_probe_windows().unwrap(),
+    daemon_b.fleet_probe_windows().unwrap(),
+  ];
+  let mut during = before;
+  let mut samples = 0u64;
+  let mut largest_overrun_ns = 0;
+  let kept = std::thread::scope(|scope| {
+    let pressure_began = Instant::now();
+    let workers: Vec<_> = (0..PRESSURE_WORKERS)
+      .map(|_| {
+        scope.spawn(|| {
+          let began = Instant::now();
+          while began.elapsed() < PRESSURE_WINDOW {
+            std::hint::black_box(began.elapsed());
+          }
+        })
+      })
+      .collect();
+    let kept = holds_for(PRESSURE_WINDOW, || {
+      let a_kept_b = daemon_a.fleet_members()?.contains(&host_b);
+      let b_kept_a = daemon_b.fleet_members()?.contains(&host_a);
+      let windows = [
+        daemon_a.fleet_probe_windows()?,
+        daemon_b.fleet_probe_windows()?,
+      ];
+      // Only observations completed while the workers are still running prove progress under load;
+      // an acknowledgement after the workers finish must not rescue a vacuous pressure window.
+      if pressure_began.elapsed() < PRESSURE_WINDOW {
+        during = windows;
+        samples += 1;
+        for daemon in [&daemon_a, &daemon_b] {
+          for pulse in daemon.shard_pulses() {
+            largest_overrun_ns = largest_overrun_ns.max(pulse.scheduler_overrun_ns);
+          }
+        }
+      }
+      Ok(a_kept_b && b_kept_a)
+    });
+    for worker in workers {
+      worker.join().expect("the finite pressure worker completed");
+    }
+    kept
+  });
+  eprintln!(
+    "scheduler pressure: samples={samples} largest_overrun_ns={largest_overrun_ns} \
+     before={before:?} during={during:?}"
+  );
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    kept && samples > 1,
+    "both members held across observed samples"
+  );
+  let after = during;
+  assert!(
+    before
+      .iter()
+      .zip(&after)
+      .all(|(before, after)| after.acknowledged > before.acknowledged),
+    "both daemons acknowledged probes during the pressure window"
+  );
+  assert!(
+    before
+      .iter()
+      .zip(&after)
+      .any(|(before, after)| after.deadlines_dilated > before.deadlines_dilated),
+    "the measured quantum lengthened an actual probe deadline"
+  );
+  assert!(
+    before
+      .iter()
+      .zip(&after)
+      .any(|(before, after)| after.periods_dilated > before.periods_dilated),
+    "the measured quantum lengthened an actual sleep between probes"
+  );
+  assert!(
+    after
+      .iter()
+      .any(|windows| windows.largest_quantum_ns > HEARTBEAT_NS),
+    "OS descheduling exceeded the assumed heartbeat floor"
+  );
+}
+
 /// Shape: how many times one burst dialer drives its handshake before it gives up — as the daemon's own
 /// dialer, a budget that runs out with the peer silent is retried on the same socket (its pending flight
 /// resent), so a dialer the demultiplexer refused for want of a slot reaches the daemon once a slot frees;

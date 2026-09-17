@@ -925,6 +925,12 @@ impl Daemon {
     })
   }
 
+  /// Probe progress and timer decisions lengthened by this shard's measured scheduling delay (§4.8).
+  /// An unavailable observation is a typed refusal, never a zero count.
+  pub fn fleet_probe_windows(&self) -> Result<crate::fleet::ProbeWindows, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| s.probe_windows)
+  }
+
   /// Whether this daemon's regional configuration council (§4.8, D-14) currently believes itself the
   /// **leader** — the elected configuration master for the region. A one-shot question on the control
   /// shard ([`Self::observation`]); an observation the daemon could not make is its typed refusal, which
@@ -1776,6 +1782,7 @@ fn init_shard(
     link_waiters: std::collections::BTreeMap::new(),
     discovery_withhold_replies: false,
     peer_paths: std::collections::BTreeMap::new(),
+    probe_windows: crate::fleet::ProbeWindows::default(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
     council,

@@ -391,6 +391,9 @@ pub struct ShardState {
   /// round budget. Bounded by the roster: an entry per rostered peer, removed with a retired id. Empty on a
   /// laptop (no peers, no fleet loop).
   pub peer_paths: BTreeMap<slates_db::HostId, slates_cluster::timing::PathRtt>,
+  /// Completed probes and live uses of the measured scheduler floor (§4.8), observed through
+  /// `Daemon::fleet_probe_windows`. Fixed-size counters on their owning control shard.
+  pub probe_windows: crate::fleet::ProbeWindows,
   /// The configuration council's election timing as derived this period from the paths to its other
   /// voters (the floor with none measured): the base and span in coordinator periods, the tail and spread
   /// they came from, and the samples behind them — what `Daemon::council_timing` reports. Only the control

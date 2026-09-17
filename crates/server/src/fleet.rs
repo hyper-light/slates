@@ -452,9 +452,9 @@ fn detector_timing(neighbourhood: usize) -> DetectorTiming {
 /// - **Backed off on each consecutive miss**: doubled per miss (RFC 9002 §6.2.4's exponential backoff — the
 ///   miss produced no sample, so the wait must grow without one), so silence is probed at 1×, 2×, 4× … the
 ///   estimate, not at a fixed beat six times over.
-/// - **Capped at the liveness budget**: [`LIVENESS_BUDGET_NS`], the anchor's own definition of a live daemon
-///   (one that beats within it) — a peer that cannot acknowledge within it is not merely slow, so no probe
-///   waits longer, and a dead peer is still declared within a bounded span (six misses ≈ 4 s at rest).
+/// - **Capped at the larger of the liveness budget and measured quantum**: [`LIVENESS_BUDGET_NS`]
+///   bounds the backoff at rest; a measured scheduling delay above it raises the cap so the floor still
+///   holds. A dead peer is declared after a bounded number of misses (six misses ≈ 4 s at rest).
 ///
 /// The probe **period** the design names, `max(k × RTT p99, scheduler quantum)`, holds by construction: the
 /// probe task awaits each probe's outcome — its acknowledgement, or this deadline — before sleeping the
@@ -469,13 +469,28 @@ struct ProbeTiming {
   consecutive_misses: u32,
 }
 
+/// By-use evidence for the scheduler floor (§4.8): completed probes and live timer decisions whose
+/// measured quantum made them longer than the same decision at the heartbeat floor. Stored on the
+/// control shard, with no shared counter on a probe's path. The counts saturate for a long-lived node.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProbeWindows {
+  /// Probes acknowledged by the member they addressed; progress even while its host is descheduled.
+  pub acknowledged: u64,
+  /// Probe budgets longer than the identical path estimate and miss count at the heartbeat floor.
+  pub deadlines_dilated: u64,
+  /// Sleeps between probes longer than the identical Lifeguard health multiplier alone requires.
+  pub periods_dilated: u64,
+  /// Largest measured quantum that actually lengthened a probe budget or sleep, nanoseconds.
+  pub largest_quantum_ns: u64,
+}
+
 /// The control shard's scheduler quantum (§4.8 "SWIM period = max(k × RTT p99, scheduler quantum)"): the
 /// design's [`HEARTBEAT_NS`] floor raised to the shard's **measured** descheduling — how late its steps
 /// have run after the waits before them, reported by the runtime ([`futures::scheduler_overrun_ns`]).
 /// `HEARTBEAT_NS` alone is the design's *assumed* quantum, the finest cadence a control-shard task is
 /// scheduled at on a quiet host; but on an oversubscribed one (a CI runner running the whole suite on a
 /// few cores; a box at several times its core count) an idle shard is left off-CPU for far longer, and
-/// a fixed 100 ms quantum retires a live-but-descheduled peer and churns the configuration
+/// a fixed 100 ms quantum cannot account for that delay in its failure-detection windows
 /// (`docs/bugs/2026-09-16-fleet-detection-windows-use-a-fixed-scheduler-quantum.md`). It is measured off
 /// the shard's **waits** (only an idle shard parks or spins for its timer — a busy one never reaches
 /// either — so it is the OS descheduling, not the latency of serving this shard's own tasks), sits at
@@ -500,13 +515,19 @@ impl ProbeTiming {
   }
 
   /// This probe's deadline over the path's measured tail (`None` before any sample): `max(tail or the
-  /// initial probe timeout, HEARTBEAT_NS) × 2^misses`, capped at `LIVENESS_BUDGET_NS` (the derivation on
-  /// the type). The peer acknowledges inline, so no acknowledgement delay is added.
+  /// initial probe timeout, scheduler quantum) × 2^misses`, capped at the larger of
+  /// `LIVENESS_BUDGET_NS` and that quantum (the derivation on the type). The peer acknowledges inline,
+  /// so no acknowledgement delay is added.
   fn deadline_ns(&self, path_tail_ns: Option<u64>) -> u64 {
+    self.deadline_at_quantum(path_tail_ns, scheduler_quantum_ns())
+  }
+
+  /// The same deadline law at a supplied quantum, also used to measure whether the live scheduler
+  /// floor changed a probe's budget. This comparison never selects a second execution path.
+  fn deadline_at_quantum(&self, path_tail_ns: Option<u64>, quantum: u64) -> u64 {
     // Floored at the **measured** scheduler quantum, not the fixed heartbeat: on an oversubscribed host
     // a live peer answers late by the shard's own descheduling, and the cap rises with it so the wait
     // never expires inside the starvation this node itself observes.
-    let quantum = scheduler_quantum_ns();
     let base = path_tail_ns
       .unwrap_or_else(|| RttEstimator::new().initial_pto())
       .max(quantum);
@@ -522,10 +543,15 @@ impl ProbeTiming {
   /// The budget for this probe: its derived deadline, polled at the collection-loop cadence (a tenth of a
   /// period, [`POLL_PER_PERIOD`]).
   fn budget(&self, path_tail_ns: Option<u64>) -> CommitBudget {
-    CommitBudget::hard(
-      self.deadline_ns(path_tail_ns),
-      (HEARTBEAT_NS / POLL_PER_PERIOD).max(1),
-    )
+    let deadline = self.deadline_ns(path_tail_ns);
+    if deadline > self.deadline_at_quantum(path_tail_ns, HEARTBEAT_NS) {
+      let quantum = scheduler_quantum_ns();
+      let _ = state::with_state(|s| {
+        s.probe_windows.deadlines_dilated = s.probe_windows.deadlines_dilated.saturating_add(1);
+        s.probe_windows.largest_quantum_ns = s.probe_windows.largest_quantum_ns.max(quantum);
+      });
+    }
+    CommitBudget::hard(deadline, (HEARTBEAT_NS / POLL_PER_PERIOD).max(1))
   }
 
   /// The probe was acknowledged: the backoff resets (the round trip itself is the path estimate's sample,
@@ -1253,7 +1279,10 @@ async fn probe_and_apply(
         timing.acknowledged();
         // The acknowledged round trip samples the shared path to this peer — the estimate the next probe's
         // deadline, the election timing and the round budget are all derived from.
-        let _ = state::with_state(|s| sample_path(s, peer.host, rtt_ns));
+        let _ = state::with_state(|s| {
+          sample_path(s, peer.host, rtt_ns);
+          s.probe_windows.acknowledged = s.probe_windows.acknowledged.saturating_add(1);
+        });
         #[allow(clippy::cast_precision_loss)]
         detector.observe_rtt(peer.host, rtt_ns as f64);
         detector.learn_coordinate(peer.host, coordinate);
@@ -1500,9 +1529,15 @@ fn probe_period_ns(health_multiplier: u32) -> u64 {
   // whichever is longer — so a shard that is itself descheduled paces its probes no finer than it is
   // actually scheduled, and the suspicion window (this cadence × the probes it counts) dilates with the
   // observed starvation rather than a fixed 100 ms beat.
-  HEARTBEAT_NS
-    .saturating_mul(u64::from(health_multiplier))
-    .max(scheduler_quantum_ns())
+  let health_period = HEARTBEAT_NS.saturating_mul(u64::from(health_multiplier));
+  let quantum = scheduler_quantum_ns();
+  if quantum > health_period {
+    let _ = state::with_state(|s| {
+      s.probe_windows.periods_dilated = s.probe_windows.periods_dilated.saturating_add(1);
+      s.probe_windows.largest_quantum_ns = s.probe_windows.largest_quantum_ns.max(quantum);
+    });
+  }
+  health_period.max(quantum)
 }
 
 /// The record serve side (§4.8 "records are sent to all candidates"; "Promotion and takeover"): complete
