@@ -2497,11 +2497,13 @@ mod tests {
       Acceptor, Ack, Authority, HostEpoch, HostId, ObjectId, Prepare, Promise, Record,
     };
     let (spoofed, promised, committed) = audit_on_shard(|state| {
-      let owner = state.fleet.host();
-      let successor = HostId(owner.0 ^ 1);
+      // The sole surviving configured member takes over a departed peer's record. Its authority
+      // and its placement both name a real member; the forged transport principal is the old owner.
+      let successor = state.fleet.host();
+      let owner = HostId(successor.0 ^ 1);
       let object = ObjectId([19; 16]);
       let generation = state.fleet.configuration().version;
-      let mut acceptor = Acceptor::new(owner, Authority { generation, owner });
+      let mut acceptor = Acceptor::new(successor, Authority { generation, owner });
       acceptor
         .install_authority(Authority {
           generation,
@@ -2529,7 +2531,7 @@ mod tests {
         generation,
         value: Vec::new(),
       };
-      let committed = crate::fleet::accept_held_record(state, owner, successor, &record);
+      let committed = crate::fleet::accept_held_record(state, successor, successor, &record);
       (spoofed, promised, committed)
     });
     assert!(spoofed.is_empty());

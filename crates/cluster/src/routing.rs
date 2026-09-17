@@ -14,18 +14,38 @@
 //! owner's object falls to is agreed with no coordination (the worked example's "rendezvous ranks first
 //! among {B, C, D}"), and is always a host that held a copy. A single-generation takeover's fencing and
 //! the phase-one recovery of the dead owner's
-//! head live in [`crate::config_group`] and the register; this module answers only *which* objects.
+//! head live in [`crate::config_group`] and the register; this module remembers each accepted record's
+//! bounded candidate set and answers which surviving holder takes it over. The membership-change
+//! regression is recorded in docs/bugs/2026-09-17-takeover-ranks-an-empty-replacement.md.
 
 use std::collections::BTreeMap;
 
-use slates_db::register::{DomainId, HostId, ObjectId, Quorum, candidates_for, rendezvous_first};
+use slates_db::register::{HostId, ObjectId, Quorum, rendezvous_first};
 
 /// The objects this node holds a copy of, keyed to their current owner. Bounded by what this node
 /// actually holds (its own objects and the peers' it backs), not the region's whole object set.
 #[derive(Debug)]
 pub struct Routing {
   self_host: HostId,
-  owners: BTreeMap<ObjectId, HostId>,
+  owners: BTreeMap<ObjectId, HeldRoute>,
+}
+
+/// The placement under which a held record was accepted. Its candidate count is bounded by `2f+1`;
+/// the routing table has one entry per locally held object, never per object in the whole region.
+#[derive(Debug, Clone)]
+pub struct RecoveryCohort {
+  /// Configuration generation that selected these candidates.
+  pub generation: u64,
+  /// The original candidate set, including any candidates that have since retired.
+  pub candidates: Vec<HostId>,
+  /// The quorum that must answer phase one to intersect the record's original commit quorum.
+  pub quorum: Quorum,
+}
+
+#[derive(Debug)]
+struct HeldRoute {
+  owner: HostId,
+  cohort: RecoveryCohort,
 }
 
 /// One object a takeover moved: its id and the owner it now has (this node, for a `taken` object).
@@ -46,10 +66,24 @@ impl Routing {
     }
   }
 
-  /// Records that this node holds `object`, currently owned by `owner` (this node's own object, or a
-  /// peer's this node backs as a candidate). Idempotent; a later call updates the recorded owner.
-  pub fn track(&mut self, object: ObjectId, owner: HostId) {
-    self.owners.insert(object, owner);
+  /// Records an accepted object and the bounded placement under which it was accepted. A later
+  /// accepted record or completed adoption replaces both the owner and its recovery cohort.
+  pub fn track(&mut self, object: ObjectId, owner: HostId, cohort: RecoveryCohort) {
+    self.owners.insert(object, HeldRoute { owner, cohort });
+  }
+
+  /// Whether this object's routing already names this owner and placement generation. A retry does
+  /// not allocate or recompute its copyset. Only an accepted record may update the remembered cohort.
+  pub fn tracked_at(&self, object: ObjectId, owner: HostId, generation: u64) -> bool {
+    self
+      .owners
+      .get(&object)
+      .is_some_and(|held| held.owner == owner && held.cohort.generation == generation)
+  }
+
+  /// The original placement a takeover must recover through, retained across membership updates.
+  pub fn recovery_cohort(&self, object: ObjectId) -> Option<&RecoveryCohort> {
+    self.owners.get(&object).map(|held| &held.cohort)
   }
 
   /// Forgets `object` (destroyed, or no longer held here).
@@ -59,7 +93,7 @@ impl Routing {
 
   /// The current owner of `object` as this node sees it, or `None` if this node does not hold it.
   pub fn owner_of(&self, object: ObjectId) -> Option<HostId> {
-    self.owners.get(&object).copied()
+    self.owners.get(&object).map(|held| held.owner)
   }
 
   /// How many objects this node holds a copy of.
@@ -72,48 +106,35 @@ impl Routing {
     self.owners.is_empty()
   }
 
-  /// Folds a `dead` host leaving the `neighbourhood` (which still lists `dead`) into the routing view:
-  /// for each object this node holds that `dead` owned, the new owner is the survivor that rendezvous
-  /// ranks first **among the object's holders** — the copyset `candidates_for` placed it on (under `dead`
-  /// as owner, at `quorum`), minus `dead`. Every survivor runs the same computation, so all agree on who
-  /// takes each object, and the winner always held a copy: above the candidate floor a neighbourhood host
-  /// outside the object's copyset never held it and must never be named its owner. The recorded owner is
-  /// updated for every such object; the ones that fall to *this* node are returned as the takeovers this
-  /// node must drive (phase-one recovery then serving). An object whose every holder left with `dead` is
-  /// dropped (its last copy is gone).
-  pub fn take_over(
-    &mut self,
-    dead: HostId,
-    neighbourhood: &[HostId],
-    domains: &BTreeMap<HostId, DomainId>,
-    quorum: Quorum,
-  ) -> Vec<Reassignment> {
-    let affected: Vec<ObjectId> = self
-      .owners
-      .iter()
-      .filter(|(_, owner)| **owner == dead)
-      .map(|(object, _)| *object)
-      .collect();
+  /// Retires an owner using the cohort remembered when each record was accepted. A later join or
+  /// neighborhood reshuffle cannot make a host with no record a takeover candidate. All currently
+  /// retired candidates are excluded together, so simultaneous failures are independent of fold order.
+  /// The original cohort stays attached to the route until the adopted record is re-committed: its
+  /// quorum, not the newly selected placement quorum, must answer phase one.
+  pub fn take_over(&mut self, dead: HostId, members: &[HostId]) -> Vec<Reassignment> {
     let mut mine = Vec::new();
-    for object in affected {
-      // The object's surviving holders: its copyset under the dead owner, minus the dead host.
-      let survivors: Vec<HostId> = candidates_for(dead, neighbourhood, domains, object, quorum)
-        .into_iter()
-        .filter(|host| *host != dead)
+    self.owners.retain(|&object, held| {
+      if held.owner != dead {
+        return true;
+      }
+      let survivors: Vec<HostId> = held
+        .cohort
+        .candidates
+        .iter()
+        .copied()
+        .filter(|host| *host != dead && members.contains(host))
         .collect();
       match rendezvous_first(&survivors, object) {
         Some(new_owner) => {
-          self.owners.insert(object, new_owner);
+          held.owner = new_owner;
           if new_owner == self.self_host {
             mine.push(Reassignment { object, new_owner });
           }
+          true
         }
-        // No surviving holder — the object's every copy left with the dead host; this node cannot serve it.
-        None => {
-          self.owners.remove(&object);
-        }
+        None => false,
       }
-    }
+    });
     mine
   }
 }
@@ -123,6 +144,21 @@ mod tests {
   use std::collections::BTreeSet;
 
   use super::*;
+  use slates_db::register::{DomainId, candidates_for};
+
+  fn cohort(
+    owner: HostId,
+    object: ObjectId,
+    members: &[HostId],
+    domains: &BTreeMap<HostId, DomainId>,
+    quorum: Quorum,
+  ) -> RecoveryCohort {
+    RecoveryCohort {
+      generation: 0,
+      candidates: candidates_for(owner, members, domains, object, quorum),
+      quorum,
+    }
+  }
 
   const SELF: HostId = HostId(1);
   const PEER: HostId = HostId(2);
@@ -134,7 +170,11 @@ mod tests {
     let mut routing = Routing::new(SELF);
     assert!(routing.is_empty());
     let object = ObjectId::new(SELF, 0);
-    routing.track(object, SELF);
+    routing.track(
+      object,
+      SELF,
+      cohort(SELF, object, &[SELF], &BTreeMap::new(), Quorum { f: 0 }),
+    );
     assert_eq!(routing.owner_of(object), Some(SELF));
     assert_eq!(routing.len(), 1);
     routing.forget(object);
@@ -155,14 +195,22 @@ mod tests {
 
     // This node holds one of its own objects and backs many of the peer's.
     let own = ObjectId::new(SELF, 7);
-    routing.track(own, SELF);
+    routing.track(
+      own,
+      SELF,
+      cohort(SELF, own, &neighbourhood, &domains, Quorum { f: 1 }),
+    );
     let peer_objects: Vec<ObjectId> = (0..64u64).map(|i| ObjectId::new(PEER, i)).collect();
     for &object in &peer_objects {
-      routing.track(object, PEER);
+      routing.track(
+        object,
+        PEER,
+        cohort(PEER, object, &neighbourhood, &domains, Quorum { f: 1 }),
+      );
     }
 
     let taken: BTreeSet<ObjectId> = routing
-      .take_over(PEER, &neighbourhood, &domains, Quorum { f: 1 })
+      .take_over(PEER, &neighbourhood)
       .into_iter()
       .map(|r| r.object)
       .collect();
@@ -203,13 +251,12 @@ mod tests {
     // Neighbourhood is just the dead peer (a degenerate the guard must handle, not panic).
     let mut routing = Routing::new(SELF);
     let orphan = ObjectId::new(PEER, 0);
-    routing.track(orphan, PEER);
-    let taken = routing.take_over(
+    routing.track(
+      orphan,
       PEER,
-      &[PEER],
-      &std::collections::BTreeMap::new(),
-      Quorum { f: 1 },
+      cohort(PEER, orphan, &[PEER], &BTreeMap::new(), Quorum { f: 1 }),
     );
+    let taken = routing.take_over(PEER, &[PEER]);
     assert!(taken.is_empty());
     assert_eq!(
       routing.owner_of(orphan),
@@ -234,10 +281,14 @@ mod tests {
     let mut routing = Routing::new(SELF);
     let objects: Vec<ObjectId> = (0..128u64).map(|i| ObjectId::new(dead, i)).collect();
     for &object in &objects {
-      routing.track(object, dead);
+      routing.track(
+        object,
+        dead,
+        cohort(dead, object, &neighbourhood, &domains, quorum),
+      );
     }
 
-    routing.take_over(dead, &neighbourhood, &domains, quorum);
+    routing.take_over(dead, &neighbourhood);
 
     let mut owners = BTreeSet::new();
     let mut copysets = BTreeSet::new();

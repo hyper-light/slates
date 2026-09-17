@@ -2083,6 +2083,17 @@ reconnaissance because the touched partitions are named up front).
    cadence; a volume with policy `live-shipped` additionally ships its op log to f+1 of its
    candidates and is acknowledged at f+1.
 
+
+> **Takeover placement retention (2026-09-17).** Accepted held records retain their owner's bounded
+> candidate set and quorum. Retirement selects among those candidates still in committed membership,
+> never from a neighborhood rebuilt after a fresh replacement joined. Phase one uses that original
+> quorum; adoption commits under the successor's current placement and records that exact placement.
+> The deterministic counterexample chose an empty replacement (0.00 s before, passing after); the
+> Linux restart and five-node takeover histories pass. This corrects a specific placement defect and
+> does not close the broader AC-8.18 state-transfer obligation. Cross-region forwarding's independent
+> all-alive-members owner guess remains a separate routing defect. Record:
+> `docs/bugs/2026-09-17-takeover-ranks-an-empty-replacement.md`.
+
 **Promotion and takeover.** When SWIM declares a host dead, or an operator moves it, the regional
 group bumps the host's epoch and assigns each of its objects to the surviving candidate holder
 that rendezvous ranks first. Each new owner runs phase one in one batched round per register

@@ -1816,8 +1816,13 @@ pub(crate) fn accept_held_record(
   };
   match accepted {
     Ok(ack) => {
-      state.fleet.track_object(record.object, peer_host);
-      ack.encode()
+      match state
+        .fleet
+        .track_object(record.object, peer_host, state.council.configuration())
+      {
+        Ok(()) => ack.encode(),
+        Err(error) => encode_refusal(&error),
+      }
     }
     // A refusal the sender acts on rides back on the wire (a `ConfigurationStale` naming this node's newer
     // version, so a stale sender refreshes and retries); every other refusal is an empty reply the sender
@@ -1835,13 +1840,23 @@ pub(crate) fn check_held_record(
   peer_host: HostId,
   record: &Record,
 ) -> Result<(), RegisterError> {
-  if record.owner != peer_host {
+  if record.owner != peer_host || !state.council.configuration().members.contains(&peer_host) {
     return Err(RegisterError::Unauthorized);
   }
   // The authenticated owner knows a newer configuration (§4.8 piggyback). Refuse this attempt, and
   // fetch that committed configuration before its retry; a forged owner cannot trigger this work.
   if record.generation > state.council.configuration().version {
     state.config_refresh_wanted = true;
+    return Err(RegisterError::ForeignGeneration {
+      current: state.council.configuration().version,
+    });
+  }
+  // The placement remembered on acceptance must be the one this record names. The council can
+  // advance before the coordinator installs it into FleetNode; refuse that gap and let the sender retry.
+  if record.generation != state.council.configuration().version {
+    return Err(RegisterError::ConfigurationStale {
+      version: state.council.configuration().version,
+    });
   }
   match state.holder_records.get(&record.object) {
     Some(acceptor) => acceptor.check(record),
@@ -4658,6 +4673,7 @@ async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -
     }
     let quorum = config.quorum;
     let generation = config.version;
+    let recovery = s.fleet.recovery_cohort(object)?.clone();
     let mut acceptor = s.holder_records.remove(&object)?;
     // The new epoch: one above the highest this node holds for the object, so the promotion raises the
     // holders' fence above the epoch the dead owner committed under (§4.8 "serves under the bumped epoch").
@@ -4668,10 +4684,10 @@ async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -
       generation,
       owner: local,
     });
-    Some((acceptor, candidates, quorum, generation, epoch))
+    Some((acceptor, recovery, candidates, quorum, generation, epoch))
   })
   .flatten();
-  let Some((mut acceptor, candidates, quorum, generation, epoch)) = prepared else {
+  let Some((mut acceptor, recovery, candidates, quorum, generation, epoch)) = prepared else {
     return dispatches;
   };
 
@@ -4683,14 +4699,14 @@ async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -
   };
   // Phase one: promise locally through this node's hold and over every surviving candidate holder; adopt the
   // newest record across the quorum of promises.
-  let holders = take_sessions(|host| candidates.contains(&host));
+  let holders = take_sessions(|host| recovery.candidates.contains(&host));
   let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
   let promoted = promote_record(
     local,
     &mut acceptor,
-    &candidates,
+    &recovery.candidates,
     &prepare,
-    quorum,
+    recovery.quorum,
     holders,
     budget,
   )
@@ -4738,6 +4754,15 @@ async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -
   state::with_state(|s| {
     s.holder_records.insert(object, acceptor);
     if let Some((sequence, value, placement)) = placed {
+      s.fleet.record_adopted_placement(
+        object,
+        local,
+        slates_cluster::routing::RecoveryCohort {
+          generation,
+          candidates,
+          quorum,
+        },
+      );
       s.placed_heads.insert(
         object,
         PlacedHead {

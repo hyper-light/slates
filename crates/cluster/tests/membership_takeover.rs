@@ -160,8 +160,17 @@ fn a_silent_peer_is_detected_dead_and_its_objects_are_taken_over() {
 
         // The owner runtime: f=1 with the dead peer as its one neighbour, backing the peer's objects.
         let mut fleet = FleetNode::new(SURVIVOR, Quorum { f: 1 }, &[DEAD]);
+        let placement = slates_db::register::RegionalConfiguration::formed(
+          vec![SURVIVOR, DEAD],
+          Quorum { f: 1 },
+          std::collections::BTreeMap::new(),
+          u64::try_from(Quorum { f: 1 }.candidates()).unwrap(),
+          false,
+        );
         for i in 0..BACKED_OBJECTS {
-          fleet.track_object(ObjectId::new(DEAD, i), DEAD);
+          fleet
+            .track_object(ObjectId::new(DEAD, i), DEAD, &placement)
+            .unwrap();
         }
         let mut detector = Detector::new(SURVIVOR, timing());
         detector.join(DEAD);

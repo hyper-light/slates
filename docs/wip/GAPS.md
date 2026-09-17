@@ -36,6 +36,17 @@ gaps. The TLA runs in §10 are historical, bounded model evidence, not a proof o
 > child generations reproduce the old bug (0.12 s) and pass with the common clock. Record:
 > `docs/bugs/2026-09-17-heartbeats-use-different-clock-origins.md`.
 
+
+> **Takeover placement retention (2026-09-17).** Accepted held records retain their owner's bounded
+> candidate set and quorum. Retirement selects among those candidates still in committed membership,
+> never from a neighborhood rebuilt after a fresh replacement joined. Phase one uses that original
+> quorum; adoption commits under the successor's current placement and records that exact placement.
+> The deterministic counterexample chose an empty replacement (0.00 s before, passing after); the
+> Linux restart and five-node takeover histories pass. This corrects a specific placement defect and
+> does not close the broader AC-8.18 state-transfer obligation. Cross-region forwarding's independent
+> all-alive-members owner guess remains a separate routing defect. Record:
+> `docs/bugs/2026-09-17-takeover-ranks-an-empty-replacement.md`.
+
 ## 1. Component inventory
 
 | Subsystem (design §) | Current source status, 2026-09-05 | Open contract and acceptance |
