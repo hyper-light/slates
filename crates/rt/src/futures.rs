@@ -25,6 +25,16 @@ pub fn now_ns() -> u64 {
   registry::with_current(|ctx| ctx.now_ns()).unwrap_or(0)
 }
 
+/// The current shard's measured scheduler quantum in nanoseconds — how late its steps have been
+/// running after the waits before them, an exponentially-forgetting maximum
+/// ([`crate::shard::ShardContext::scheduler_overrun_ns`]: only an idle shard waits, so this is the
+/// operating system's descheduling of the shard, not the latency of its own tasks). Zero off a shard
+/// thread. The fleet's failure detector floors its windows at it (§4.8 "SWIM period = max(k × RTT
+/// p99, scheduler quantum)").
+pub fn scheduler_overrun_ns() -> u64 {
+  registry::with_current(|ctx| ctx.scheduler_overrun_ns()).unwrap_or(0)
+}
+
 /// The task being polled on this thread, if any.
 pub fn current_task() -> Option<TaskId> {
   registry::with_current(|ctx| ctx.current_task()).flatten()

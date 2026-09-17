@@ -473,6 +473,27 @@ struct ProbeTiming {
   consecutive_misses: u32,
 }
 
+/// The control shard's scheduler quantum (§4.8 "SWIM period = max(k × RTT p99, scheduler quantum)"): the
+/// design's [`HEARTBEAT_NS`] floor raised to the shard's **measured** descheduling — how late its steps
+/// have run after the waits before them, reported by the runtime ([`futures::scheduler_overrun_ns`]).
+/// `HEARTBEAT_NS` alone is the design's *assumed* quantum, the finest cadence a control-shard task is
+/// scheduled at on a quiet host; but on an oversubscribed one (a CI runner running the whole suite on a
+/// few cores; a box at several times its core count) an idle shard is left off-CPU for far longer, and
+/// a fixed 100 ms quantum retires a live-but-descheduled peer and churns the configuration
+/// (`docs/bugs/2026-09-16-fleet-detection-windows-use-a-fixed-scheduler-quantum.md`). It is measured off
+/// the shard's **waits** (only an idle shard parks or spins for its timer — a busy one never reaches
+/// either — so it is the OS descheduling, not the latency of serving this shard's own tasks), sits at
+/// `HEARTBEAT_NS` on a quiet host (a wait wakes within a tick, overrun ~0) — so every window that floors
+/// at it is unchanged there — and rises on an oversubscribed one. The failure detector's windows — the
+/// probe period, the probe deadline and its cap, and thereby the suspicion window — floor at it, so a
+/// node that is itself starved is slow to declare an equally-starved peer dead, in proportion to the
+/// starvation it observes. Only those: the node's own liveness signal — the record plane's council
+/// heartbeats and record ships, the re-dial cadences — keeps the heartbeat, since a starved node must
+/// announce itself as often as it can, not less often.
+fn scheduler_quantum_ns() -> u64 {
+  HEARTBEAT_NS.max(futures::scheduler_overrun_ns())
+}
+
 impl ProbeTiming {
   /// A fresh law: no misses. Before the path has a sample the deadline is the RFC 9002 §6.2.2 initial probe
   /// timeout (twice the initial RTT), conservative until the first acknowledgement seeds the estimate.
@@ -486,14 +507,20 @@ impl ProbeTiming {
   /// initial probe timeout, HEARTBEAT_NS) × 2^misses`, capped at `LIVENESS_BUDGET_NS` (the derivation on
   /// the type). The peer acknowledges inline, so no acknowledgement delay is added.
   fn deadline_ns(&self, path_tail_ns: Option<u64>) -> u64 {
+    // Floored at the **measured** scheduler quantum, not the fixed heartbeat: on an oversubscribed host
+    // a live peer answers late by the shard's own descheduling, and the cap rises with it so the wait
+    // never expires inside the starvation this node itself observes.
+    let quantum = scheduler_quantum_ns();
     let base = path_tail_ns
       .unwrap_or_else(|| RttEstimator::new().initial_pto())
-      .max(HEARTBEAT_NS);
+      .max(quantum);
     // A shift by the word width or more is already past the cap: saturate rather than overflow.
     let backoff = 1u64
       .checked_shl(self.consecutive_misses)
       .unwrap_or(u64::MAX);
-    base.saturating_mul(backoff).min(LIVENESS_BUDGET_NS)
+    base
+      .saturating_mul(backoff)
+      .min(LIVENESS_BUDGET_NS.max(quantum))
   }
 
   /// The budget for this probe: its derived deadline, polled at the collection-loop cadence (a tenth of a
@@ -1469,7 +1496,13 @@ fn release_probe_session(
 /// `docs/bugs/2026-09-13-holder-acceptor-born-stale-never-placed.md`); re-measured on the fixed tree the
 /// same test passes 3/3 at 11.3 s with the dilation and the starvation test at 8.8 s.
 fn probe_period_ns(health_multiplier: u32) -> u64 {
-  HEARTBEAT_NS.saturating_mul(u64::from(health_multiplier))
+  // The Lifeguard dilation (heartbeat × the health multiplier) OR the measured scheduler quantum,
+  // whichever is longer — so a shard that is itself descheduled paces its probes no finer than it is
+  // actually scheduled, and the suspicion window (this cadence × the probes it counts) dilates with the
+  // observed starvation rather than a fixed 100 ms beat.
+  HEARTBEAT_NS
+    .saturating_mul(u64::from(health_multiplier))
+    .max(scheduler_quantum_ns())
 }
 
 /// The record serve side (§4.8 "records are sent to all candidates"; "Promotion and takeover"): complete

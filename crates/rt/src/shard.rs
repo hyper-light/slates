@@ -106,7 +106,15 @@ pub struct Counters {
   pub spin_misses: u64,
   /// Idle spins ended by a timer falling due.
   pub spin_deadlines: u64,
+  /// The measured scheduler overrun, nanoseconds ([`ShardContext::scheduler_overrun_ns`]).
+  pub scheduler_overrun_ns: u64,
 }
+
+/// Shape: the exponential-forgetting shift of the measured scheduler overrun — a wait's overrun that
+/// is not renewed decays by `1/8` (`>> 3`) at each later wait, so a starvation spike lingers about
+/// eight waits (under a second of a fleet shard's timer-paced waits on a quiet host) and then
+/// recovers as the load lifts, rather than pinning detection windows open for good.
+const OVERRUN_FORGET_SHIFT: u32 = 3;
 
 /// What a shard is built from: everything is `Send`, so the runtime assembles seeds on its own
 /// thread and each shard thread builds its context from one.
@@ -216,6 +224,13 @@ pub struct ShardContext {
   active: Cell<bool>,
   pair_full_events: Cell<u64>,
   nested_borrows: Cell<u64>,
+  /// The absolute deadline the shard last waited for — parked in its driver, or idle-spinning — and
+  /// has not stepped since; the next [`step`](Self::step) takes it and measures how late it runs
+  /// against it ([`Self::scheduler_overrun_ns`]). `None` while running, or after an unbounded wait.
+  waited_for_ns: Cell<Option<u64>>,
+  /// The exponentially-forgetting maximum of how late a step ran after the wait before it, nanoseconds
+  /// (the measurement [`Self::scheduler_overrun_ns`] describes).
+  scheduler_overrun_ns: Cell<u64>,
   entry: Option<&'static Entry>,
   inner: RefCell<ShardInner>,
   /// Declared after `inner`, so it drops after the tasks: a task may hold a kept value.
@@ -287,6 +302,8 @@ impl ShardContext {
       active: Cell::new(false),
       pair_full_events: Cell::new(0),
       nested_borrows: Cell::new(0),
+      waited_for_ns: Cell::new(None),
+      scheduler_overrun_ns: Cell::new(0),
       entry: registry::entry(seed.id),
       inner: RefCell::new(ShardInner {
         arena,
@@ -393,7 +410,36 @@ impl ShardContext {
   pub fn counters(&self) -> Counters {
     let mut c = self.with_inner(|inner| inner.counters).unwrap_or_default();
     c.nested_borrows = self.nested_borrows.get();
+    c.scheduler_overrun_ns = self.scheduler_overrun_ns.get();
     c
+  }
+
+  /// This shard's **measured scheduler quantum** (§4.8 "SWIM period = max(k × RTT p99, scheduler
+  /// quantum)"), in nanoseconds: the exponentially-forgetting maximum of how far past a wait's
+  /// deadline the shard's next step ran. Only an idle shard waits — parked in its driver or spinning
+  /// for its timer ([`run`](Self::run)); a busy one never reaches either, and its late timers fire
+  /// from the step's expiry without passing here — so a step that runs late after a wait is time the
+  /// operating system left the shard off a core with nothing else to do: the descheduling the shard
+  /// suffers, not the latency of serving its own tasks. Roughly zero on a quiet host (a park wakes
+  /// within a tick), seconds on an oversubscribed one. Forgotten by [`OVERRUN_FORGET_SHIFT`] at each
+  /// later wait so a spike recovers once the load lifts. The fleet's failure detector reads it through
+  /// [`crate::futures::scheduler_overrun_ns`] to floor its windows at the starvation this node itself
+  /// observes; an observer on another thread reads the mirror in the registry pulse.
+  pub fn scheduler_overrun_ns(&self) -> u64 {
+    self.scheduler_overrun_ns.get()
+  }
+
+  /// Folds one finished wait into the measured scheduler overrun ([`Self::scheduler_overrun_ns`]):
+  /// the shard waited for the absolute `deadline_ns` and this step is the first to run after it.
+  fn note_wait_overrun(&self, inner: &ShardInner, deadline_ns: u64) {
+    let overrun = inner.driver.now_ns().saturating_sub(deadline_ns);
+    let held = self.scheduler_overrun_ns.get();
+    let forgotten = held.saturating_sub(held >> OVERRUN_FORGET_SHIFT);
+    let measured = forgotten.max(overrun);
+    self.scheduler_overrun_ns.set(measured);
+    if let Some(entry) = self.entry {
+      entry.pulse.record_scheduler_overrun(measured);
+    }
   }
 
   /// The driver's clock.
@@ -706,8 +752,12 @@ impl ShardContext {
         return true;
       }
       let now = self.now_ns();
-      if deadline_ns.is_some_and(|d| now >= d) {
+      if let Some(deadline) = deadline_ns
+        && now >= deadline
+      {
         self.with_inner(|inner| inner.counters.spin_deadlines += 1);
+        // The spin waited for this deadline as a park would have; the next step measures its lateness.
+        self.waited_for_ns.set(Some(deadline));
         return true;
       }
       if now >= spin_end {
@@ -777,6 +827,11 @@ impl ShardContext {
             inner.counters.longest_step_ns,
           );
         }
+        // The first step after a wait: how late it runs against the deadline the wait was for is the
+        // shard's measured scheduler overrun (`scheduler_overrun_ns`).
+        if let Some(deadline) = self.waited_for_ns.take() {
+          self.note_wait_overrun(inner, deadline);
+        }
         let mut work = self.drain_control(inner);
         work |= self.drain_inbound(inner);
         work |= self.expire_timers(inner);
@@ -820,6 +875,8 @@ impl ShardContext {
   /// look and here is seen now, and one that lands after sees the announcement and kicks (the
   /// protocol and its loom model: [`crate::parking`]).
   pub fn park(&'static self, deadline_ns: Option<u64>) {
+    // What this wait is for; the next step measures how late it runs against it (`scheduler_overrun_ns`).
+    self.waited_for_ns.set(deadline_ns);
     let mut lost = false;
     match self.entry {
       Some(entry) => {

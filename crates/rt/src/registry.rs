@@ -118,9 +118,25 @@ pub struct Pulse {
   /// count), bumped by the shard and read by an observer on any thread — kept on the entry so it
   /// needs no allocation of its own and outlives the shard as the entry does.
   progress: AtomicU64,
+  /// The shard's measured scheduler overrun (`ShardContext::scheduler_overrun_ns`), mirrored here at
+  /// each wait it folds in, so a stall diagnosis on another thread can tell a shard the operating
+  /// system is not scheduling (this climbs) from one held inside its own work (it does not).
+  scheduler_overrun_ns: AtomicU64,
 }
 
 impl Pulse {
+  /// The owning shard mirrors its measured scheduler overrun after folding a wait into it.
+  pub fn record_scheduler_overrun(&self, overrun_ns: u64) {
+    self
+      .scheduler_overrun_ns
+      .store(overrun_ns, Ordering::Relaxed);
+  }
+
+  /// The shard's measured scheduler overrun, nanoseconds (see [`Pulse::record_scheduler_overrun`]).
+  pub fn scheduler_overrun_ns(&self) -> u64 {
+    self.scheduler_overrun_ns.load(Ordering::Relaxed)
+  }
+
   /// The owning shard's application loop marks one period of forward progress.
   pub fn beat(&self) {
     self.progress.fetch_add(1, Ordering::Relaxed);

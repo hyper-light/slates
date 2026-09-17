@@ -120,6 +120,11 @@ pub struct ShardPulse {
   pub kicks_skipped: u64,
   /// Times a foreign sender found the shard's wake ring full and spun (a tripwire).
   pub ring_full_events: u64,
+  /// The shard's measured scheduler overrun, nanoseconds — how late its steps have run after the waits
+  /// before them (`slates_rt::shard::ShardContext::scheduler_overrun_ns`, §4.8 "scheduler quantum"):
+  /// a shard the operating system is not scheduling shows it climbing; one held inside its own work
+  /// does not (`longest_step_ns` climbs instead).
+  pub scheduler_overrun_ns: u64,
 }
 
 /// One doorbell flag per control shard, indexed by the shard's registry id: set by the daemon's doorbell
@@ -680,6 +685,7 @@ impl Daemon {
           parked: entry.parking.parked(),
           kicks_skipped: entry.parking.kicks_skipped(),
           ring_full_events: entry.ring_full_events.load(Ordering::Relaxed),
+          scheduler_overrun_ns: entry.pulse.scheduler_overrun_ns(),
         })
       })
       .collect()
