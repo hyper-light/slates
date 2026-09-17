@@ -105,6 +105,7 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   notes.extend(session.size_note.clone());
   drop(session);
   Ok(SuiteResult {
+    privilege: this_user().privilege(),
     outcome: outcome_for(
       run,
       Suite::Fsx,
@@ -172,6 +173,7 @@ pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   notes.extend(session.size_note.clone());
   drop(session);
   Ok(SuiteResult {
+    privilege: this_user().privilege(),
     outcome: outcome_for(
       run,
       Suite::Fsstress,
@@ -468,20 +470,21 @@ fn expected_list(
   Ok((list, digest))
 }
 
+/// The invocation and identity used to classify one pjdfstest run. Availability of root and the
+/// caller's effective identity are separate inputs: the invocation must agree with the reported identity.
+fn pjdfstest_runner(root_available: bool, current: Runner) -> (bool, Runner) {
+  let elevate = root_available && !matches!(current, Runner::Root);
+  let runner = if elevate { Runner::Root } else { current };
+  (elevate, runner)
+}
+
 /// pjdfstest over the mount, file by file, judged against the reviewed list.
 pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let tools = run.scratch.subdir("tools")?;
   let tree = fetch::build_pjdfstest(&tools)?;
   let session = Session::open(run, "pjdfstest", false, None)?;
   let work = session.workdir("pjd")?;
-  let as_root = run.root_available
-    && !matches!(run.privilege(), Privilege::Root)
-    && super::sudo_without_prompt();
-  let runner = if run.root_available {
-    Runner::Root
-  } else {
-    this_user()
-  };
+  let (as_root, runner) = pjdfstest_runner(run.root_available, this_user());
   let files = test_files(&tree.root)?;
   // Every file's raw TAP output is kept in the scratch (`--keep`), so a failure can be reviewed by
   // its own message before it is listed as expected.
@@ -541,7 +544,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       timed_out.join(", ")
     ));
   }
-  let reduced = if run.root_available {
+  let reduced = if matches!(runner, Runner::Root) {
     None
   } else {
     Some((
@@ -565,6 +568,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     listed_now_passing: u32::try_from(judgement.listed_now_passing.len()).unwrap_or(u32::MAX),
   };
   Ok(SuiteResult {
+    privilege: runner.privilege(),
     outcome: outcome_for(run, Suite::Pjdfstest, counts, reduced),
     command: format!(
       "{}sh <each of {} tests/**/*.t of {}> in a directory inside the mount; binary {}",
@@ -581,4 +585,59 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     notes,
     ok,
   })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{CaseStatus, Runner, parse_file, pjdfstest_runner};
+
+  /// AC-3.1: request the root-capable lane from an unprivileged process. The simulated child
+  /// exercises a root-only ownership change; its result and the reported runner must agree.
+  /// This tests dispatch without requiring root or sudo on the developer's machine.
+  #[test]
+  fn a_sudo_capable_caller_actually_elevates_the_root_cases_it_reports() {
+    let current = Runner::Unprivileged {
+      uid: 1001,
+      groups: vec![1001],
+    };
+    let (elevate, reported) = pjdfstest_runner(true, current.clone());
+    let executed = if elevate { Runner::Root } else { current };
+    let output = match executed {
+      Runner::Root => "1..1\nok 1\n",
+      Runner::Unprivileged { .. } => {
+        "1..1\nnot ok 1 - tried 'chown file 65534 65534', expected 0, got EPERM\n"
+      }
+    };
+    let observed = parse_file("tests/chown/00.t", output, &reported);
+    assert!(
+      observed
+        .cases
+        .iter()
+        .all(|case| matches!(case.status, CaseStatus::Pass)),
+      "a root-capable dispatch executes its root-only case: {observed:?}"
+    );
+    assert_eq!(reported, executed, "the record names the child's identity");
+  }
+
+  /// AC-3.1: a caller without elevation authority keeps its real identity, and an already-root
+  /// caller executes directly. Root-only TAP failures remain failures for the root invocation.
+  #[test]
+  fn dispatch_keeps_the_callers_identity_unless_elevation_is_needed() {
+    let unprivileged = Runner::Unprivileged {
+      uid: 1001,
+      groups: vec![1001],
+    };
+    for (available, current) in [(false, unprivileged), (true, Runner::Root)] {
+      let (elevate, reported) = pjdfstest_runner(available, current.clone());
+      assert!(!elevate);
+      assert_eq!(reported, current);
+      let observed = parse_file(
+        "tests/chown/00.t",
+        "1..1\nnot ok 1 - unexpected error\n",
+        &reported,
+      );
+      assert_eq!(observed.cases.len(), 1);
+      assert!(!matches!(observed.cases[0].status, CaseStatus::Pass));
+    }
+  }
 }

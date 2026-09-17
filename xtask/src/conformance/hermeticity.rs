@@ -274,6 +274,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   write_file(&kept, format!("{judged:#?}").as_bytes())?;
   let counts = judged.counts(matched, u32::try_from(unmatched.len()).unwrap_or(u32::MAX));
   Ok(SuiteResult {
+    privilege: super::suites::this_user().privilege(),
     outcome: match run.adapter(Suite::Hermeticity) {
       Some((adapter, not_covered)) => Outcome::Limited {
         adapter,

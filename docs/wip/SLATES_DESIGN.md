@@ -4501,6 +4501,16 @@ tool run) with wall time recorded.
 
 > **Status (AC-9.7, 2026-09-14).** Partially evidenced (`docs/wip/conformance.md`, the doc-truth matrix). Native macOS NFS: fsx and fsstress RAN and pass; workloads RAN and differ by declared limits (AppleDouble sidecars, SQLite WAL); pjdfstest LIMITED (unprivileged, unreviewed); hermeticity wired (strace/`fs_usage` parsers, the grant flow) but SKIPPED here for privilege. Linux: LIMITED adapter, first lane run pending. Windows, virtio-fs, OCI, pressure, failure: SKIPPED with typed reasons. No transport guarantee is closed.
 
+> **Runner identity correction (2026-09-17).** Ubuntu job 105312670403 ran pjdfstest as uid 1001
+> while reporting root: passwordless sudo availability was mistaken for the caller's effective
+> identity, suppressing elevation. The invocation now derives elevation from the actual caller,
+> and TAP classification, expected-failure selection and the result record use that invocation's
+> identity. Other suites report their workload's identity independently of mount/tracing helpers.
+> The dispatch regression fails before the fix and passes afterward; no native conformance
+> rerun or closure of the 6202 reported failures is claimed. No expected-failure list changed.
+> Record: `docs/bugs/2026-09-17-conformance-confuses-available-and-effective-root.md`.
+
+
 ### Dependency and ordering summary
 
 Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 5 → Phase 6 → Phase 7 → Phase 8 →

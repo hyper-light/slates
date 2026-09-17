@@ -565,15 +565,6 @@ impl Run<'_> {
     self.options.bounds
   }
 
-  /// The privilege the suite's own processes run with.
-  pub(crate) fn privilege(&self) -> Privilege {
-    if self.root_available {
-      Privilege::Root
-    } else {
-      Privilege::Unprivileged
-    }
-  }
-
   /// The adapter this lane must use, if any (recorded `LIMITED`).
   pub(crate) fn adapter(&self, suite: Suite) -> Option<(String, String)> {
     match availability(self.transport, suite) {
@@ -588,6 +579,9 @@ impl Run<'_> {
 
 /// What a suite run hands back for its record.
 pub(crate) struct SuiteResult {
+  /// The identity executing the tested workload, distinct from authority available to a mount broker
+  /// or tracer. Each suite derives this from the command it actually dispatches.
+  pub(crate) privilege: Privilege,
   pub(crate) outcome: Outcome,
   pub(crate) command: String,
   pub(crate) bound: String,
@@ -643,7 +637,7 @@ fn run_suite(root: &Path, options: &Options, suite: Suite) -> Result<(), Failure
     schema: SCHEMA,
     suite,
     transport,
-    host: host_facts(run.privilege()),
+    host: host_facts(result.privilege),
     date: today(),
     command: result.command.replace(&scratch_text, "<scratch>"),
     bound: result.bound,

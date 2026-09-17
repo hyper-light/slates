@@ -16,6 +16,16 @@ Sections §8a–§8h preserve dated implementation records. An earlier "gated" c
 to the named test and its original scope; it does not close the A-9 integration or correctness
 gaps. The TLA runs in §10 are historical, bounded model evidence, not a proof of current Rust.
 
+
+> **Runner identity correction (2026-09-17).** Ubuntu job 105312670403 ran pjdfstest as uid 1001
+> while reporting root: passwordless sudo availability was mistaken for the caller's effective
+> identity, suppressing elevation. The invocation now derives elevation from the actual caller,
+> and TAP classification, expected-failure selection and the result record use that invocation's
+> identity. Other suites report their workload's identity independently of mount/tracing helpers.
+> The dispatch regression fails before the fix and passes afterward; no native conformance
+> rerun or closure of the 6202 reported failures is claimed. No expected-failure list changed.
+> Record: `docs/bugs/2026-09-17-conformance-confuses-available-and-effective-root.md`.
+
 ## 1. Component inventory
 
 | Subsystem (design §) | Current source status, 2026-09-05 | Open contract and acceptance |

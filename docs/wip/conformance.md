@@ -210,6 +210,16 @@ child is in one log. Both parsers are tested against the documented row layouts 
 `fs_usage.c` `print_open`/`format_print`; `strace(1)` `-y`), with hostile input; a live run has
 not yet been read by either — the first lane run is the first.
 
+
+> **Runner identity correction (2026-09-17).** Ubuntu job 105312670403 ran pjdfstest as uid 1001
+> while reporting root: passwordless sudo availability was mistaken for the caller's effective
+> identity, suppressing elevation. The invocation now derives elevation from the actual caller,
+> and TAP classification, expected-failure selection and the result record use that invocation's
+> identity. Other suites report their workload's identity independently of mount/tracing helpers.
+> The dispatch regression fails before the fix and passes afterward; no native conformance
+> rerun or closure of the 6202 reported failures is claimed. No expected-failure list changed.
+> Record: `docs/bugs/2026-09-17-conformance-confuses-available-and-effective-root.md`.
+
 ## 4. The lanes and the other transports
 
 | Transport | How the lane drives it | Standing |

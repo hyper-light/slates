@@ -193,6 +193,7 @@ pub(crate) fn run_workloads(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     .count();
   let counts = Counts::Workloads { tools };
   Ok(SuiteResult {
+    privilege: super::suites::this_user().privilege(),
     outcome: match run.adapter(Suite::Workloads) {
       Some((adapter, not_covered)) => slates_conformance::Outcome::Limited {
         adapter,
