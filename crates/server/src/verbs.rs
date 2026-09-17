@@ -14,7 +14,7 @@ use slates_db::catalog::{
   PolicyRecord, Principal, Rights, Role, SizeClass as DbSizeClass, SnapshotId as DbSnapshotId,
   SnapshotRecord, VolumeId as DbVolumeId, VolumeRecord, VolumeState,
 };
-use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration, rendezvous_first};
+use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration};
 use slates_ipc::protocol::{
   AttachRequest, AttachTransport, DaemonReport, Direction, Established, FleetReport,
   FreshnessBasis, GroupReport, HealthSignal, Intent, NamePolicy, OciBinding, PlacedState,
@@ -590,6 +590,23 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
       feature: "forwarded verb".to_owned(),
     }));
   };
+  // A remembered route is only a hint. If this node has learned a different owner or home,
+  // refuse before dispatch (and before recording a forwarded completion), so the client can
+  // refresh its hint and retry its original request id without a speculative second write.
+  let redirect = crate::state::with_state(|state| {
+    let object = ObjectId(volume.bytes);
+    let local = state.fleet.host();
+    let superseded = state
+      .fleet
+      .object_owner(object)
+      .is_some_and(|owner| owner != local);
+    homed_elsewhere(state, volume)
+      .or_else(|| superseded.then(|| state.node_regions.get(&local).map_or(0, |region| region.0)))
+  })
+  .flatten();
+  if let Some(region) = redirect {
+    return encode_body(&refused(Refusal::HomedElsewhere { region }));
+  }
   let owner = owner_of(volume);
   let Some(shard) = crate::state::with_state(|s| shard_of_partition(s, owner)).flatten() else {
     return encode_body(&refused(Refusal::NotFound));
@@ -651,74 +668,28 @@ fn prune_forwarded(state: &mut ShardState, origin: u64, client: u32, up_to: u32)
   );
 }
 
-/// The node currently serving a volume homed in `home_region` (§4.8 "Lookup", D-14; task #30). It is the
-/// volume's **creator** while the creator is alive and still homes it — the un-moved, un-taken-over case that
-/// slice 1/2 handled ([`ObjectId::creator`]). Otherwise it is the **takeover successor**: the survivor that
-/// rendezvous-ranks first among the home region's *alive* hosts, exactly as that region's own takeover chose
-/// it (`rendezvous_first`, §4.8 "Promotion and takeover" — deterministic, so every node agrees with no global
-/// catalog, D-12). A moved home (the creator alive but its region no longer the home), a region-loss
-/// promotion (the creator's region gone), and a same-home-region takeover (the creator dead, a survivor in
-/// its region holds it) all fall to the successor — so a cross-region verb reaches the node that holds the
-/// volume *now*, never a dead or superseded creator. Falls back to the creator when the home region has no
-/// alive host this node can see (a transient view; the caller's `HomedElsewhere` reply then re-routes).
-fn current_owner_in_region(state: &ShardState, volume: VolumeId, home_region: u64) -> HostId {
-  owner_in_region(
-    ObjectId(volume.bytes),
-    home_region,
-    &state.node_regions,
-    &state.fleet.membership().alive(),
-  )
-}
-
-/// The pure owner resolution [`current_owner_in_region`] uses (see it for the rules): the creator while it is
-/// alive and its region is the home region, otherwise the survivor that rendezvous-ranks first among the home
-/// region's alive hosts, falling back to the creator when the home region has no alive host in view. Pure so
-/// it is unit-tested without a running fleet (the same shape as [`home_redirect`]).
-fn owner_in_region(
-  object: ObjectId,
-  home_region: u64,
-  node_regions: &std::collections::BTreeMap<HostId, RegionId>,
-  alive: &[HostId],
-) -> HostId {
-  let creator = object.creator();
-  let region_of = |host: HostId| node_regions.get(&host).map(|r| r.0).unwrap_or(0);
-  if region_of(creator) == home_region && alive.contains(&creator) {
-    return creator;
-  }
-  let survivors: Vec<HostId> = alive
-    .iter()
-    .copied()
-    .filter(|host| region_of(*host) == home_region)
-    .collect();
-  rendezvous_first(&survivors, object).unwrap_or(creator)
-}
-
-/// Forwards a read or write of a remotely-homed volume to its **current** owner node `owner` (resolved by
-/// [`current_owner_in_region`] — the creator while it is alive and still homes the volume, otherwise the
-/// takeover successor) over the fleet transport, and delivers the reply back to the client (§4.8 "Lookup").
-/// Runs in a task on the control shard — where the record sessions live — because the forward is an await:
-/// the owner serves the verb on its own owner shard ([`serve_forward`]) under the relayed principal and
-/// returns the reply, which is delivered to the client on its origin shard. A **write** carries the origin
-/// request id (so the owner's completion record makes a retried forward exactly-once) and the client's
-/// acknowledgement watermark (so the owner prunes this client's forwarded completions). An unreachable owner
-/// or an undecodable reply falls back to `HomedElsewhere` naming the home region, so the caller re-routes
-/// rather than seeing a wrong answer.
+/// Resolves a remotely homed volume by its creator, this client's cached route or a read-only
+/// location exchange, then forwards the verb once (§4.8 Lookup, §4.9 RIFL). Discovery never
+/// executes a write. A transport failure invalidates the hint and returns HomedElsewhere;
+/// retrying the original request id remains the caller's choice and meets its completion record.
 fn forward_to_owner(
   state: &mut ShardState,
-  client_index: u32,
+  client: Handle<ClientSlot>,
   request: u64,
   principal: Principal,
   region: u64,
-  owner: HostId,
+  volume: VolumeId,
   body: RequestBody,
 ) -> Served {
   let Some(control) = state.shards.first().copied() else {
     return Served::Reply(refused(Refusal::NotFound));
   };
+  let cached = state
+    .clients
+    .get(client)
+    .ok()
+    .and_then(|slot| slot.owner_route);
   let origin = state.shard;
-  // Relay the client's acknowledgement watermark (this node's own-anchor window for the client) so the owner
-  // prunes the forwarded completions the same way this node's acknowledgements prune the local ones. Keyed on
-  // the stable cert-anchor — the same id the local completion record uses (task #22) — not the ephemeral id.
   let ack_up_to = state
     .db
     .partition()
@@ -731,35 +702,100 @@ fn forward_to_owner(
   });
   let task = SpawnRequest::new(
     Box::pin(async move {
-      let reply = match crate::fleet::forward_over_leader_session(
-        owner,
-        request_bytes,
-        crate::daemon::LIVENESS_BUDGET_NS,
-      )
-      .await
-      {
-        Some(bytes) if !bytes.is_empty() => decode_body::<ReplyBody>(&bytes)
-          .unwrap_or_else(|_| refused(Refusal::HomedElsewhere { region })),
-        _ => refused(Refusal::HomedElsewhere { region }),
+      let resolved = crate::state::with_state(|state| {
+        let query = crate::owner_location::Query::new(state, ObjectId(volume.bytes), region);
+        (query, query.known_owner(state, cached))
+      });
+      let Some((query, known)) = resolved else {
+        return;
+      };
+      let owner = match known {
+        Some(owner) => {
+          crate::state::with_state(|state| {
+            *state
+              .refusals
+              .entry("fleet.owner_location.direct")
+              .or_insert(0) += 1;
+          });
+          Some(owner)
+        }
+        None => crate::owner_location::locate(query).await.ok(),
+      };
+      let bytes = match owner {
+        Some(owner) => {
+          crate::fleet::forward_over_leader_session(
+            owner,
+            request_bytes,
+            crate::daemon::LIVENESS_BUDGET_NS,
+          )
+          .await
+        }
+        None => None,
+      };
+      let reply = bytes
+        .and_then(|bytes| decode_body::<ReplyBody>(&bytes).ok())
+        .unwrap_or_else(|| refused(Refusal::HomedElsewhere { region }));
+      let route = if matches!(&reply, ReplyBody::Refused { .. }) {
+        None
+      } else {
+        owner.map(|owner| query.route(owner))
       };
       if origin == control {
-        crate::state::deliver(client_index, request, reply, false);
+        finish_owner_forward(client, request, reply, route);
       } else {
         let back = SpawnRequest::new(
           Box::pin(async move {
-            crate::state::deliver(client_index, request, reply, false);
+            finish_owner_forward(client, request, reply, route);
           }),
           None,
         );
-        let _ = slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)));
+        if let Err(error) =
+          slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)))
+        {
+          crate::state::with_state(|state| {
+            *state
+              .refusals
+              .entry("fleet.owner_location.delivery_refused")
+              .or_insert(0) += 1;
+          });
+          eprintln!("slates-server: owner reply delivery refused: {error}");
+        }
       }
     }),
     None,
   );
   if slates_rt::registry::send_control(control, Control::Spawn(Box::new(task))).is_err() {
-    return Served::Reply(refused(Refusal::NotFound));
+    return Served::Reply(refused(Refusal::HomedElsewhere { region }));
   }
   Served::Forwarded
+}
+
+/// A late lookup belongs to the original client generation. It cannot populate a reused slot's
+/// cache or deliver a predecessor's result to the client that now occupies that slot.
+fn finish_owner_forward(
+  client: Handle<ClientSlot>,
+  request: u64,
+  reply: ReplyBody,
+  route: Option<crate::owner_location::CachedRoute>,
+) {
+  let present = crate::state::with_state(|state| {
+    let Ok(slot) = state.clients.get_mut(client) else {
+      state.forwarded_rings.remove(&request);
+      *state
+        .refusals
+        .entry("fleet.owner_location.client_gone")
+        .or_insert(0) += 1;
+      return false;
+    };
+    slot.owner_route = route;
+    true
+  })
+  .unwrap_or(false);
+  if present {
+    // The executing owner owns the completion. In particular, a transient routing refusal
+    // must not become a permanent completion at the origin and prevent this id's retry.
+    crate::state::deliver(client.index(), request, reply, true);
+  }
 }
 
 /// Proposes a lost region's promotion to its declared mirror on this shard's root group (§4.8, D-14). Refuses
@@ -925,28 +961,20 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   if let RequestBody::Acknowledge { up_to } = body {
     return scatter_acknowledge(state, client.index(), request.request, client_id, up_to);
   }
-  // Cross-region routing (§4.8 "Lookup"): a request for a volume homed in another region — its creator's
-  // region, or one it was moved to, or the mirror a region-loss promotion failed it over to. A forwardable
-  // **read** or **write** is forwarded to the volume's **current** owner in that region — the creator while it
-  // is alive and still homes the volume, otherwise the takeover successor ([`current_owner_in_region`]) — over
-  // the fleet transport and served there, so a client reaches a cross-region volume without re-connecting and
-  // reaches the node that holds it *now*, not a dead or superseded creator (moved/promoted-owner routing, task
-  // #30). A write is exactly-once (its completion is recorded on the owner under the origin's authenticated
-  // identity). A non-forwardable verb is refused `HomedElsewhere` naming the home region, for the caller to
-  // re-route. A single-region fleet never reaches the map (the fast path in `homed_elsewhere`), so local and
-  // laptop deployments pay nothing.
+  // A foreign-home verb resolves its owner from the creator, a cached successful route or a
+  // read-only exchange with actual home-region holders. The write itself is forwarded once,
+  // carrying the original completion key. A single-region request keeps the local fast path.
   if let Some(volume) = volume_of(&body)
     && let Some(region) = homed_elsewhere(state, volume)
   {
     if is_forwardable_read(&body) || is_forwardable_write(&body) {
-      let owner = current_owner_in_region(state, volume, region);
       return forward_to_owner(
         state,
-        client.index(),
+        client,
         request.request,
         principal,
         region,
-        owner,
+        volume,
         body,
       );
     }
@@ -5770,8 +5798,7 @@ fn creator_gid() -> u32 {
 #[cfg(test)]
 mod tests {
   use super::{
-    HostId, ObjectId, Principal, Refusal, RegionId, VolumeId, home_redirect, owner_in_region,
-    rendezvous_first, verify_attestation,
+    HostId, ObjectId, Principal, Refusal, RegionId, VolumeId, home_redirect, verify_attestation,
   };
   use slates_db::register::RootConfiguration;
 
@@ -5947,110 +5974,6 @@ mod tests {
       home_redirect(&root, &node_regions, own_in_r0, volume),
       Some(1),
       "a volume created in the promoted-away region redirects to its mirror"
-    );
-  }
-
-  /// AC (§4.8 "Promotion and takeover", D-14 — owner resolution for cross-region forwarding): in a volume's
-  /// home region its owner is the creator while the creator is alive and lives in that region; once the
-  /// creator has failed, ownership passes to the survivor that rendezvous-ranks first among the home region's
-  /// alive hosts — the same successor takeover assigns — so a forwarded verb reaches the node that now holds
-  /// the shard, not a dead creator. Order-independent (rendezvous ranks, it does not enumerate).
-  #[test]
-  fn owner_in_region_is_the_creator_until_it_fails_then_its_takeover_successor() {
-    let home = 0u64;
-    let creator = HostId(2);
-    let object = ObjectId::new(creator, 7);
-    // The creator and three peers all live in the home region.
-    let peers = [HostId(10), HostId(11), HostId(12)];
-    let node_regions = std::collections::BTreeMap::from([
-      (creator, RegionId(home)),
-      (peers[0], RegionId(home)),
-      (peers[1], RegionId(home)),
-      (peers[2], RegionId(home)),
-    ]);
-
-    // Creator alive and homing the volume: it is the owner, whoever else is alive.
-    let all_alive = [creator, peers[0], peers[1], peers[2]];
-    assert_eq!(
-      owner_in_region(object, home, &node_regions, &all_alive),
-      creator,
-      "a live creator owns its own volume"
-    );
-
-    // Creator fails: ownership passes to the survivor rendezvous ranks first among the region's alive hosts.
-    let survivors = [peers[0], peers[1], peers[2]];
-    let successor = owner_in_region(object, home, &node_regions, &survivors);
-    assert!(
-      survivors.contains(&successor),
-      "a failed creator's volume is owned by a surviving peer"
-    );
-    assert_ne!(successor, creator, "not the dead creator");
-    assert_eq!(
-      successor,
-      rendezvous_first(&survivors, object).unwrap(),
-      "the successor is the rendezvous-first survivor"
-    );
-
-    // Order-independence: the same successor whatever order the alive set is enumerated in.
-    let reordered = [peers[2], peers[0], peers[1]];
-    assert_eq!(
-      owner_in_region(object, home, &node_regions, &reordered),
-      successor,
-      "owner resolution ranks; it does not depend on view enumeration order"
-    );
-
-    // Non-vacuity: with the successor also gone, ownership moves to a different survivor (the ranking is real).
-    let without_successor: Vec<HostId> = survivors
-      .iter()
-      .copied()
-      .filter(|h| *h != successor)
-      .collect();
-    let next = owner_in_region(object, home, &node_regions, &without_successor);
-    assert_ne!(
-      next, successor,
-      "a further failure hands over to the next survivor"
-    );
-    assert!(without_successor.contains(&next));
-  }
-
-  /// AC (§4.8 "region loss promotes the mirror", D-14): when a volume's home has moved to a region its creator
-  /// does not live in (a home move, or a region-loss promotion to the mirror), the owner is a host in the new
-  /// home region — never the creator, even though the creator is still alive in its old region. An empty
-  /// home-region view (no alive host seen there yet) falls back to the creator so the caller's `HomedElsewhere`
-  /// re-routes rather than dropping the request.
-  #[test]
-  fn owner_in_region_of_a_moved_volume_is_a_home_region_host_not_the_live_creator() {
-    let (old_region, new_home) = (0u64, 1u64);
-    let creator = HostId(2); // lives in the old region
-    let object = ObjectId::new(creator, 7);
-    let home_hosts = [HostId(20), HostId(21), HostId(22)]; // live in the new home region
-    let node_regions = std::collections::BTreeMap::from([
-      (creator, RegionId(old_region)),
-      (home_hosts[0], RegionId(new_home)),
-      (home_hosts[1], RegionId(new_home)),
-      (home_hosts[2], RegionId(new_home)),
-    ]);
-
-    // The creator is alive, but the volume's home is now the new region: ownership is a host there.
-    let alive = [creator, home_hosts[0], home_hosts[1], home_hosts[2]];
-    let owner = owner_in_region(object, new_home, &node_regions, &alive);
-    assert!(
-      home_hosts.contains(&owner),
-      "a moved volume is owned in its new home region"
-    );
-    assert_ne!(
-      owner, creator,
-      "not the creator, though it is still alive in its old region"
-    );
-    assert_eq!(owner, rendezvous_first(&home_hosts, object).unwrap());
-
-    // No alive host in the home region yet (a transient view): fall back to the creator for the caller to
-    // re-route, rather than dropping the request.
-    let none_in_home = [creator];
-    assert_eq!(
-      owner_in_region(object, new_home, &node_regions, &none_in_home),
-      creator,
-      "an empty home-region view falls back to the creator so the caller re-routes"
     );
   }
 

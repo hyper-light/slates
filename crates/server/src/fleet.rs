@@ -302,6 +302,7 @@ fn learn_member(
       *state.refusals.entry(MEMBER_ID_FORGED).or_insert(0) += 1;
     }
     LearnedOutcome::Current => {
+      state.authenticated_members.insert(announced);
       state
         .learned_members
         .entry(anchor)
@@ -311,6 +312,8 @@ fn learn_member(
         });
     }
     LearnedOutcome::Restarted { old } => {
+      state.authenticated_members.remove(&old);
+      state.authenticated_members.insert(announced);
       state.learned_members.insert(
         anchor,
         LearnedMember {
@@ -392,6 +395,54 @@ fn authenticated_alive(state: &ShardState) -> Vec<HostId> {
           .values()
           .any(|member| member.host == *host)
     })
+    .collect()
+}
+
+/// Advances the council death watch (`ShardState::council_death_watch`) one period: for each current council
+/// member, a member this node's own SWIM view holds **dead** ([`Liveness::Dead`]) has its consecutive-dead
+/// count incremented; a member seen as anything else — alive, suspect, or with no state — has its count
+/// reset (removed). A host no longer a member is forgotten. Run every period by every node (leader, voter
+/// and learner), so the count is monotonic for a genuinely dead member and a leader inherits the fleet-wide
+/// death history across an election, rather than restarting the confirmation window each time leadership
+/// moves. A suspected member never accumulates (it is not `Dead`), so it can never be retired.
+fn update_council_death_watch(state: &mut ShardState) {
+  let members: Vec<HostId> = state.council.configuration().members.clone();
+  state
+    .council_death_watch
+    .retain(|host, _| members.contains(host));
+  for member in members {
+    let dead = state
+      .fleet
+      .membership()
+      .state(member)
+      .is_some_and(|belief| belief.liveness == Liveness::Dead);
+    if dead {
+      let count = state.council_death_watch.entry(member).or_insert(0);
+      *count = count.saturating_add(1);
+    } else {
+      state.council_death_watch.remove(&member);
+    }
+  }
+}
+
+/// The council members this **leader** may retire now: those the death watch has held continuously **dead**
+/// for at least the death-confirmation window — the council's own election-timeout base
+/// (`ShardState::council_timing`, floored at [`slates_cluster::timing::ElectionTiming::floor`]). A death must
+/// outlast one election timeout — the longest transient membership disruption, a leader loss and its
+/// re-election — before the **irreversible** consensus retirement, so a live voter briefly declared dead
+/// while its sessions churn (a fresh joiner most of all) is refuted and reset before it can be retired, while
+/// a genuinely dead member crosses the window and is taken over (docs/bugs/2026-09-17-council-retires-a-suspected-voter.md).
+/// The members are this region's council by construction, so no region filter is needed.
+fn stable_dead_council_members(state: &ShardState) -> Vec<HostId> {
+  let window = state
+    .council_timing
+    .base_periods
+    .max(slates_cluster::timing::ElectionTiming::floor().base_periods);
+  state
+    .council_death_watch
+    .iter()
+    .filter(|(_, count)| **count >= window)
+    .map(|(host, _)| *host)
     .collect()
 }
 
@@ -1048,25 +1099,11 @@ async fn establish_session(
 /// session for — is the recovery.
 pub const ESTABLISH_BUDGETS_BEFORE_REDIAL: u32 = 2;
 
-/// The serve side: complete the accepted session's handshake and loop answering the peer's probes (§4.8),
-/// **re-admitting a peer that has come back**. A serve session's own detector builds the acknowledgement
-/// gossip as before; on top of that, the authenticated prober's own liveness is folded into the shared
-/// `FleetNode` and this node's belief *about the prober* is echoed in the reply — the SWIM rejoin path
-/// (hyperscale's `reset_peer_for_rejoin`, realized here without a separate death tracker or incarnation
-/// bump because [`Membership::refute`] already bumps past the death it hears). A serve failure ends this
-/// loop, but the peer's re-dial opens a fresh session the accept loop serves, so a returning peer is always
-/// answered.
-///
-/// **How a return heals.** This node retired peer B, so [`probe_peer`] idled and closed B's sessions. B is
-/// alive (a false suspicion) or restarted, and its own probe reaches this node here. This node believes B
-/// `Dead@N`, so the reply echoes `(B, Dead@N)`; B applies it to *itself*, refutes to `alive@N+1`
-/// ([`Membership::refute`], which uses the death incarnation it heard, so even a restarted B at incarnation
-/// zero jumps past `N`), and gossips that alive. B's next probe carries `(B, alive@N+1)`, which this fold
-/// adopts (a higher incarnation overrides the death), re-admitting B — after which the idled [`probe_peer`]
-/// sees B back in the neighbourhood and resumes. The fold is **scoped to the authenticated prober** (its own
-/// state only), so it can never re-admit or flap a *third* peer another detector retired — the [`sync_peer`]
-/// discipline. An unauthenticated prober (its certificate not in `roster`) is answered but never folded: a
-/// ping's `from` is unauthenticated, so only the certificate the handshake proved may move membership.
+/// Answers authenticated probes and shares adopted membership changes (§4.8). The prober's
+/// anchor and boot nonce are validated before any report is folded. A returning peer hears
+/// our death belief in the acknowledgement and refutes it from its shared local incarnation;
+/// its next alive report re-admits it. Reports about known third members disseminate onward,
+/// while strangers and superseded identities cannot enroll through gossip.
 async fn serve_peer_probes(
   mut endpoint: Endpoint,
   local: HostId,
@@ -1110,47 +1147,24 @@ async fn serve_peer_probes(
     let served = endpoint
       .serve_once(|_stream, request| match SwimMessage::decode(&request) {
         Ok(message) => {
-          detector.apply_gossip_from(message.from(), message.gossip());
-          if let Some(coordinate) = message.coordinate() {
-            detector.learn_coordinate(message.from(), coordinate.clone());
-          }
-          let mut gossip = detector.gossip(fanout);
-          if let (Some(anchor), Some(boot_nonce)) = (rostered_anchor, message.boot_nonce()) {
+          let Some(gossip) = state::with_state(|state| {
+            let anchor = rostered_anchor?;
+            let boot_nonce = message.boot_nonce()?;
             let peer = message.from();
-            // Prefer the incarnation the prober asserts for itself (an A-15 refutation of a suspicion);
-            // otherwise a fresh alive. The incarnation-gated merge (`FleetNode::observe`) leaves a *retired* id
-            // dead (alive@0 does not outrank a death) and folds an already-believed seed inertly.
-            let asserted = message
-              .gossip()
-              .iter()
-              .find(|(host, _)| *host == peer)
-              .map(|(_, state)| *state)
-              .unwrap_or(MemberState {
-                liveness: Liveness::Alive,
-                incarnation: 0,
-              });
-            let admitted = state::with_state(|s| match learn_member(s, anchor, boot_nonce, peer) {
-              LearnedOutcome::Forged => false,
-              LearnedOutcome::Current | LearnedOutcome::Restarted { .. } => {
-                apply_peer_state(&mut s.fleet, peer, Some(asserted));
-                // Echo this node's belief about the prober so a peer this node believes dead learns of it and
-                // self-refutes. Only when not already carried and not `Alive` (an alive belief needs no echo).
-                if let Some(belief) = s.fleet.membership().state(peer)
-                  && belief.liveness != Liveness::Alive
-                  && !gossip.iter().any(|(host, _)| *host == peer)
-                {
-                  gossip.push((peer, belief));
-                }
-                true
-              }
-            })
-            .unwrap_or(false);
-            if !admitted {
-              // A superseded or forged incarnation gets no acknowledgement: one would let it count itself
-              // alive. The refusal was counted for the status report.
-              return Vec::new();
+            if learn_member(state, anchor, boot_nonce, peer) == LearnedOutcome::Forged {
+              return None;
             }
-          }
+            receive_probe_gossip(state, &mut detector, peer, message.gossip());
+            if let Some(coordinate) = message.coordinate() {
+              detector.learn_coordinate(peer, coordinate.clone());
+            }
+            let belief = state.fleet.membership().state(peer);
+            Some(outgoing_probe_gossip(state, peer, belief, fanout))
+          })
+          .flatten() else {
+            // A forged identity may neither mutate membership nor receive credit.
+            return Vec::new();
+          };
           SwimMessage::Ack {
             from: local,
             nonce: message.nonce().unwrap_or(0),
@@ -1194,15 +1208,14 @@ fn resume_if_in_mesh(detector: &mut Detector, peer_host: HostId, was_idle: &mut 
 }
 
 /// Folds this peer's detector view into the shard's `FleetNode` membership and returns whether the peer is
-/// now **retired** (out of the configuration's neighbourhood). Peer-scoped ([`sync_peer`], not
-/// `sync_membership`): each peer has its own detector whose gossip carries other peers' states, so folding
-/// the whole view would let one detector re-join a peer another has retired and flap it — scoped to this
-/// peer, this node's belief about it sticks the moment its detector ages it out. This only advances the
+/// now **retired** (out of the configuration's neighbourhood). Each detector times only its
+/// actual peer; authenticated third-member reports separately enter the shared gossip view.
+/// Incarnation ordering rejects stale alive reports. This only advances the
 /// **failure view**; the configuration is the regional council's (D-14), so a death drives no takeover here
 /// — the council leader reconciles the retirement from the folded view and, when it commits, the record
 /// plane installs the new configuration and takes over what fell to this node ([`sync_config_from_council`]).
 /// The folded state is handed to every other shard's membership copy so all advance identically (D-7); a
-/// spawn refused at a shard's admission bound is retried next period (the fold is idempotent). "Retired"
+/// active probe repeats an idempotent fold on its next period. "Retired"
 /// means no longer a peer this node keeps direct contact with ([`keeps_direct_contact_with`] — read from the
 /// committed configuration and the consensus voter sets, not from one detector's suspicion); the caller then
 /// closes the peer's sessions on both planes, so this must be the **same** predicate the link task and the
@@ -1249,6 +1262,11 @@ async fn probe_and_apply(
   timing: &mut ProbeTiming,
 ) -> Option<Endpoint> {
   let open = session?;
+  if let Some(belief) =
+    state::with_state(|state| state.fleet.membership().state(peer.host)).flatten()
+  {
+    detector.apply(peer.host, belief);
+  }
   detector.tick();
   let ping = SwimMessage::Ping {
     from: local,
@@ -1256,7 +1274,14 @@ async fn probe_and_apply(
     boot_nonce: local_boot_nonce,
     // The buddy system: a ping to a peer this node suspects always carries that suspicion, so the peer
     // refutes it from this very probe rather than after the gossip budget is spent.
-    gossip: detector.ping_gossip(peer.host, fanout),
+    gossip: state::with_state(|state| {
+      outgoing_probe_gossip(
+        state,
+        peer.host,
+        detector.membership().state(peer.host),
+        fanout,
+      )
+    })?,
   };
   match probe_once(open, &ping, timing.budget(path_tail_ns(peer.host))).await {
     Ok((
@@ -1269,11 +1294,14 @@ async fn probe_and_apply(
         coordinate,
       },
     )) => {
-      // Learn-on-contact (task #22, §4.8 "Recovery"): credit the id probed only if the node still answers
-      // under it. A different id must derive from the authenticated anchor and a new boot nonce.
-      // Learning it retires the old member; [`probe_peer`] follows the fresh id next period.
-      // A forged announcement is refused and counted. Raft admission is a separate transition. The gossip (other members' states) is
-      // folded regardless.
+      // Validate the announced identity before accepting either liveness or relayed gossip.
+      let admitted = state::with_state(|state| {
+        learn_member(state, peer.anchor, boot_nonce, from) != LearnedOutcome::Forged
+      })
+      .unwrap_or(false);
+      if !admitted {
+        return None;
+      }
       if from == peer.host {
         detector.on_ack(peer.host);
         timing.acknowledged();
@@ -1286,14 +1314,8 @@ async fn probe_and_apply(
         #[allow(clippy::cast_precision_loss)]
         detector.observe_rtt(peer.host, rtt_ns as f64);
         detector.learn_coordinate(peer.host, coordinate);
-      } else {
-        // The peer answered under a **different** id than the one probed (a restart, task #22): learn it, so
-        // `follow_current_id` switches this task to the peer's current id next period. In steady state (no
-        // restart) this never fires — on a first boot every node's id is its manifest gen-0 seed
-        // (`daemon::boot_incarnation`), so a probe is credited to the id it was sent to.
-        let _ = state::with_state(|s| learn_member(s, peer.anchor, boot_nonce, from));
       }
-      detector.apply_gossip(&gossip);
+      state::with_state(|state| receive_probe_gossip(state, detector, from, &gossip));
       returned
     }
     Ok((returned, ProbeOutcome::TimedOut)) => {
@@ -1311,6 +1333,65 @@ async fn probe_and_apply(
     }
     Err(_) => None,
   }
+}
+
+/// Applies authenticated gossip to the shared failure view (§4.8). Third-member reports
+/// never enter this session's probe rotation. Unknown identities require enrollment; a
+/// superseded identity cannot regain membership through a relayed alive report.
+fn receive_probe_gossip(
+  state: &mut ShardState,
+  detector: &mut Detector,
+  sender: HostId,
+  gossip: &[(HostId, MemberState)],
+) {
+  let local = state.fleet.host();
+  for &(subject, update) in gossip {
+    if subject == local {
+      state.fleet.observe(local, update);
+      detector.apply(local, update);
+    } else if state.fleet.membership().state(subject).is_some() || subject == sender {
+      if update.liveness == Liveness::Alive && !state.authenticated_members.contains(&subject) {
+        continue;
+      }
+      if subject == sender {
+        detector.apply_gossip_from(sender, &[(subject, update)]);
+      }
+      if apply_peer_state(&mut state.fleet, subject, Some(update)) {
+        wake_link_waiter_of(state, subject);
+      }
+    }
+  }
+}
+
+/// One shared dissemination queue feeds every live session. Reserve payload entries for
+/// our own current incarnation and the target's buddy suspicion/death; the rest carries
+/// adopted changes. The existing derived fanout bounds the whole packet.
+fn outgoing_probe_gossip(
+  state: &mut ShardState,
+  peer: HostId,
+  belief: Option<MemberState>,
+  fanout: usize,
+) -> Vec<(HostId, MemberState)> {
+  let mut mandatory = Vec::new();
+  let local = state.fleet.host();
+  if let Some(own) = state.fleet.membership().state(local) {
+    mandatory.push((local, own));
+  }
+  if let Some(belief) = belief
+    && belief.liveness != Liveness::Alive
+  {
+    mandatory.push((peer, belief));
+  }
+  let reports = state.fleet.gossip(
+    fanout.saturating_sub(mandatory.len()),
+    u32::try_from(fanout).unwrap_or(u32::MAX),
+  );
+  for report in reports {
+    if !mandatory.iter().any(|(subject, _)| *subject == report.0) {
+      mandatory.push(report);
+    }
+  }
+  mandatory
 }
 
 /// Switches a probe task to the id its peer now holds (task #22): whichever side learned a restart since the
@@ -1711,6 +1792,18 @@ async fn serve_peer_records(
               state::with_state(|s| serve_root_fetch(s, &request)).unwrap_or_default()
             }
             FORWARD_STREAM => verbs::serve_forward(control, peer_anchor, &request).await,
+            crate::owner_location::STREAM => {
+              state::with_state(
+                |state| match crate::owner_location::serve(state, &request) {
+                  Ok(reply) => reply,
+                  Err(error) => {
+                    *state.refusals.entry(error.counter()).or_insert(0) += 1;
+                    Vec::new()
+                  }
+                },
+              )
+              .unwrap_or_default()
+            }
             _ => Vec::new(),
           }
         }
@@ -3655,7 +3748,7 @@ async fn drive_council_election(
 /// installed — the signal a learner uses to fetch the council's committed configuration reactively (§4.8 the
 /// piggyback rule). It compares this node's **alive** set against the configuration's **members**, which is
 /// exactly the predicate the council leader reconciles from ([`RegionalCouncil::reconcile_alive`] admits an
-/// alive non-member and takes over a member no longer alive), so a divergence means the council has — or, if
+/// alive non-member and takes over a member SWIM confirmed dead), so a divergence means the council has — or, if
 /// this node's view is ahead of the leader's, soon will have — a newer configuration this node must install:
 /// to admit a newcomer, retire a departed member, or take over a failed owner's objects (the quiescent
 /// successor's only cue, as it receives no records for the dead owner's objects). Equal in steady state, so a
@@ -3700,6 +3793,12 @@ async fn drive_config_council(
     return;
   };
 
+  // Advance the council death watch every period, on every node (leader, voter and learner alike), so the
+  // count is monotonic for a genuinely dead member and survives a leadership change — a fresh leader inherits
+  // the fleet-wide death history rather than restarting the window (which would strand a real retirement
+  // behind a re-election, docs/bugs/2026-09-17-council-retires-a-suspected-voter.md).
+  state::with_state(update_council_death_watch);
+
   // A learner (non-voter member): it does not drive the Raft. It fetches the committed configuration from a
   // voter and adopts the newest (§4.8, D-14) — but **reactively**, only when it has evidence its configuration
   // is behind the region (§4.8 the piggyback rule), never on a bare period, so an idle learner whose view
@@ -3742,7 +3841,15 @@ async fn drive_config_council(
         .filter(|host| same_region(s, *host))
         .map(|host| (host, declared_domain(s, host)))
         .collect();
-      s.council.reconcile_alive(&alive);
+      // Retire only members this node's own SWIM view has confirmed **dead** AND kept dead for the
+      // death-confirmation window — never one merely suspected, and never one declared dead only transiently.
+      // A live voter briefly unreachable during a leader loss's re-election (a fresh joiner's just-formed
+      // sessions churning most of all) can reach `Dead` for a period or two before its refutation arrives;
+      // retiring it there is an irreversible consensus action on a revocable belief, and it drops a live
+      // member — leaving a later loss's survivors short of a majority
+      // (docs/bugs/2026-09-17-council-retires-a-suspected-voter.md). The window lets the refutation land first.
+      let dead = stable_dead_council_members(s);
+      s.council.reconcile_alive(&alive, &dead);
       // The voter set follows the committed membership (Raft §6, one joint change at a time): a retired voter
       // leaves the consensus set — it stops counting toward every majority — and the next member in id order
       // is promoted in its place, so the council keeps tolerating `f` failures.
@@ -4796,6 +4903,160 @@ fn highest_held_epoch(acceptor: &Acceptor, object: ObjectId) -> HostEpoch {
 mod tests {
   use super::*;
   use slates_cluster::DispatchWait;
+
+  /// AC-8.1 / T-8.12: an authenticated neighbor reports the death of a known member this node
+  /// does not probe directly. The council's failure view must receive that death; old alive gossip
+  /// cannot resurrect it. Gossip about unknown identities must not enroll them.
+  #[test]
+  fn a_neighbors_gossip_retires_a_known_third_member_without_enrolling_strangers() {
+    let (lost_is_alive, stranger_is_known) = crate::daemon::audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let neighbor = HostId(local.0.wrapping_add(1));
+      let lost = HostId(local.0.wrapping_add(2));
+      let stranger = HostId(local.0.wrapping_add(3));
+      let alive = MemberState {
+        liveness: Liveness::Alive,
+        incarnation: 0,
+      };
+      state.fleet.observe(neighbor, alive);
+      state.fleet.observe(lost, alive);
+      state.authenticated_members.insert(lost);
+      let mut detector = Detector::new(local, detector_timing(3));
+      detector.join(neighbor);
+      let message = SwimMessage::Ping {
+        from: neighbor,
+        nonce: 1,
+        boot_nonce: 0,
+        gossip: vec![
+          (
+            lost,
+            MemberState {
+              liveness: Liveness::Dead,
+              incarnation: 1,
+            },
+          ),
+          (stranger, alive),
+        ],
+      };
+      let message = SwimMessage::decode(&message.encode()).unwrap();
+      receive_probe_gossip(state, &mut detector, neighbor, message.gossip());
+      receive_probe_gossip(state, &mut detector, neighbor, &[(lost, alive)]);
+      let outgoing = outgoing_probe_gossip(state, neighbor, Some(alive), 4);
+      let relayed = SwimMessage::Ping {
+        from: local,
+        nonce: 2,
+        boot_nonce: 0,
+        gossip: outgoing,
+      };
+      let relayed = SwimMessage::decode(&relayed.encode()).unwrap();
+      assert!(
+        relayed
+          .gossip()
+          .iter()
+          .any(|(subject, report)| { *subject == lost && report.liveness == Liveness::Dead }),
+        "a third member's death must travel to another live peer"
+      );
+      // Foreign alive reports must not add a second target to this session's detector.
+      let refuted = MemberState {
+        liveness: Liveness::Alive,
+        incarnation: 2,
+      };
+      receive_probe_gossip(state, &mut detector, neighbor, &[(lost, refuted)]);
+      assert!(state.fleet.membership().alive().contains(&lost));
+      for _ in 0..4 {
+        assert_eq!(detector.tick().map(|ping| ping.to), Some(neighbor));
+        detector.on_ack(neighbor);
+      }
+      receive_probe_gossip(
+        state,
+        &mut detector,
+        neighbor,
+        &[(
+          lost,
+          MemberState {
+            liveness: Liveness::Dead,
+            incarnation: 2,
+          },
+        )],
+      );
+      (
+        state.fleet.membership().alive().contains(&lost),
+        state.fleet.membership().state(stranger).is_some(),
+      )
+    });
+    assert!(
+      !lost_is_alive,
+      "a third member's death must reach the council's failure view"
+    );
+    assert!(!stranger_is_known, "gossip does not authorize enrollment");
+  }
+
+  /// AC-8.1 / T-8.12: shared self-refutation is visible on a different peer session, while
+  /// an authenticated restart prevents a neighbor's high-incarnation report reviving the old id.
+  #[test]
+  fn probe_gossip_shares_refutation_and_cannot_revive_a_replaced_identity() {
+    crate::daemon::audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let anchor = HostId(local.0.wrapping_add(1));
+      let old = crate::deploy::member_id(anchor, 1);
+      let current = crate::deploy::member_id(anchor, 2);
+      learn_member(state, anchor, 1, old);
+      learn_member(state, anchor, 2, current);
+      let mut detector = Detector::new(local, detector_timing(3));
+      detector.join(current);
+      receive_probe_gossip(
+        state,
+        &mut detector,
+        current,
+        &[
+          (
+            old,
+            MemberState {
+              liveness: Liveness::Alive,
+              incarnation: 10,
+            },
+          ),
+          (
+            local,
+            MemberState {
+              liveness: Liveness::Dead,
+              incarnation: 10,
+            },
+          ),
+        ],
+      );
+      let outgoing = outgoing_probe_gossip(state, current, None, 4);
+      assert!(!state.fleet.membership().alive().contains(&old));
+      assert!(outgoing.contains(&(
+        local,
+        MemberState {
+          liveness: Liveness::Alive,
+          incarnation: 11
+        }
+      )));
+      let mut other_session = Detector::new(local, detector_timing(3));
+      receive_probe_gossip(
+        state,
+        &mut other_session,
+        current,
+        &[(
+          local,
+          MemberState {
+            liveness: Liveness::Dead,
+            incarnation: 9,
+          },
+        )],
+      );
+      let outgoing = outgoing_probe_gossip(state, current, None, 4);
+      assert!(outgoing.contains(&(
+        local,
+        MemberState {
+          liveness: Liveness::Alive,
+          incarnation: 11
+        }
+      )));
+    });
+  }
 
   /// A millisecond in nanoseconds, so the samples read as round times.
   const MS: u64 = 1_000_000;

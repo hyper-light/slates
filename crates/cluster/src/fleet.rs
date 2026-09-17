@@ -39,6 +39,7 @@ use slates_db::register::{
 };
 use slates_transport::endpoint::Endpoint;
 
+use crate::gossip::Gossip;
 use crate::membership::{Liveness, MemberState, Membership};
 use crate::routing::{Reassignment, RecoveryCohort, Routing};
 use crate::{CommitBudget, Committed, commit_under_configuration};
@@ -56,6 +57,7 @@ use crate::{CommitBudget, Committed, commit_under_configuration};
 pub struct FleetNode {
   host: HostId,
   membership: Membership,
+  gossip: Gossip,
   configuration: Configuration,
   /// The region's members as of the last installed configuration — the whole region, not this node's
   /// neighbourhood. A takeover triggers on a member **leaving the region** (a retirement/death), read by
@@ -93,6 +95,7 @@ impl FleetNode {
     FleetNode {
       host,
       membership,
+      gossip: Gossip::default(),
       configuration,
       members,
       acceptor,
@@ -268,7 +271,18 @@ impl FleetNode {
   /// leader, so the view still drives the configuration through the same path (R8). It never removes this
   /// host — the owner is never retired.
   pub fn observe(&mut self, subject: HostId, update: MemberState) -> bool {
-    self.membership.apply(subject, update).is_some()
+    let changed = self.membership.apply(subject, update).is_some();
+    if changed && let Some(state) = self.membership.state(subject) {
+      self.gossip.record(subject, state);
+    }
+    changed
+  }
+
+  /// Drains adopted membership changes over any live peer session (§4.8). The caller derives
+  /// `transmits` from fleet size; the queue holds at most one report per known member.
+  /// Local refutations enqueue the resulting alive incarnation, never the reported death.
+  pub fn gossip(&mut self, max: usize, transmits: u32) -> Vec<(HostId, MemberState)> {
+    self.gossip.drain(max, transmits)
   }
 
   /// Commits one of this node's own heads through the register path under the current authority — the
@@ -330,11 +344,9 @@ pub fn sync_membership(view: &Membership, fleet: &mut FleetNode) -> bool {
 
 /// Folds only `peer`'s liveness from `view` into `fleet` — the same alive-joins-it, dead-retires-it,
 /// suspect-leaves-it rule as [`sync_membership`], but for the one peer the caller names rather than the
-/// whole view. This is the fold a node running **one detector per peer** must use: a per-peer detector's
-/// gossip carries the *other* peers' states too (SWIM disseminates the whole view), so if each detector
-/// folded the whole view with `sync_membership`, one detector would re-join a peer another has just retired
-/// — the two would flap it until every detector independently converged. Scoping the fold to the detector's
-/// own peer removes that coupling: each peer is joined and retired by its own detector alone. Returns
+/// whole view. A node running one detector per peer folds that peer's timed failure here;
+/// third-member gossip must separately reach the shared view through `observe`. Incarnation
+/// ordering prevents stale alive reports from reversing a death. Returns
 /// whether the membership changed (the takeovers a death produces come from
 /// [`install_configuration`](FleetNode::install_configuration) once the council commits the retirement).
 pub fn sync_peer(view: &Membership, fleet: &mut FleetNode, peer: HostId) -> bool {
@@ -382,6 +394,27 @@ mod tests {
       liveness: Liveness::Dead,
       incarnation,
     }
+  }
+
+  /// T-8.5: a report crosses two live neighbors, expires after its transmission budget,
+  /// and stale observations cannot perpetually refill it or resurrect the failed member.
+  #[test]
+  fn an_adopted_death_disseminates_through_the_shared_view_for_a_bounded_budget() {
+    let mut first = FleetNode::new(SELF, Quorum { f: 1 }, &[A, B]);
+    let mut second = FleetNode::new(A, Quorum { f: 1 }, &[SELF, B]);
+    first.observe(B, dead(1));
+    let batch = first.gossip(1, 2);
+    assert_eq!(batch, vec![(B, dead(1))]);
+    for (subject, update) in batch {
+      second.observe(subject, update);
+    }
+    assert_eq!(second.gossip(1, 2), vec![(B, dead(1))]);
+    first.observe(B, alive(0));
+    assert_eq!(first.gossip(1, 2), vec![(B, dead(1))]);
+    assert!(first.gossip(1, 2).is_empty());
+    first.observe(B, alive(2));
+    first.observe(B, dead(2));
+    assert_eq!(first.gossip(1, 2), vec![(B, dead(2))]);
   }
 
   /// A dedicated probe position the invariant helper writes, distinct from any object a test commits

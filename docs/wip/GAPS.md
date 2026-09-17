@@ -6,6 +6,28 @@ specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger i
 
 ## 0. The one global fact
 
+> **Current repair checkpoint (2026-09-17).** [TBD_FIXES.md](TBD_FIXES.md) collects the
+> remaining audit/CI fixes, unfinished validation and current uncommitted repairs. The shared-gossip
+> five-node takeover/location history passes in 11.36 s. Neither result closes the broader
+> configuration-transfer contract.
+>
+> **Whole-RAM replacement flake — FIXED (2026-09-17).** `a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss`
+> failed ~1 run in 8 on Linux at the second-loss commit. Root cause (committed council log): after the
+> loss the new leader retired the **live fresh voter** on a **transient** SWIM `Dead` belief (its
+> sessions churning through the re-election) instead of the actually-dead victim, leaving a voter set
+> with a dead member and no live majority — an irreversible consensus retirement on a revocable belief.
+> Fix: the council retires only members whose death is confirmed (`Dead`, never `Suspect`) and stable —
+> observed dead continuously for the election-timeout window (`ShardState::council_death_watch`, advanced
+> on every node every period). Linux 45/45 after the fix; the timeout was not raised.
+> Record: `docs/bugs/2026-09-17-council-retires-a-suspected-voter.md`.
+
+> **Editor workload (2026-09-17).** Vim's temporary-path backup exclusion caused the Ubuntu
+> host/mount discrepancy. The roster now fixes that policy explicitly and requires a readable
+> backup. A real-save regression checks both path classes and exact old/new bytes; its local
+> execution awaits supplied RAM scratch or authorization to create the requested RAM volume.
+> The full native conformance lane remains unrerun. Record:
+> `docs/bugs/2026-09-17-editor-backup-depends-on-scratch-path.md`.
+
 A-9, 2026-09-05: the system has substantial component source and historical tests, but it
 cannot yet offer the complete product contract. This status is based on read-only review of
 Slates `a1059ed` and Hecate `103c078`, not a new test run. Fourteen source findings and their
@@ -15,6 +37,17 @@ closure ledger. Design corrections are implemented in docs only. They do not fix
 Sections §8a–§8h preserve dated implementation records. An earlier "gated" claim applies only
 to the named test and its original scope; it does not close the A-9 integration or correctness
 gaps. The TLA runs in §10 are historical, bounded model evidence, not a proof of current Rust.
+
+
+> **Remote owner location (2026-09-17).** The foreign-home lookup no longer ranks every live
+> home-region member, which could select a node outside the object's actual copyset. A bounded
+> read-only exchange asks home-region peers for their held-object routes; one hint per live
+> client avoids rediscovery on ordinary requests. The executing owner retains the forwarded
+> completion; an origin-side routing refusal cannot poison a retry. The five-daemon history
+> failed remotely while the real successor served locally; the separate replay counter exposed
+> that the original retry proof never reached the owner. These fixes do not close the broader
+> lease, configuration state-transfer or native conformance gaps. Record:
+> `docs/bugs/2026-09-17-remote-lookup-guesses-outside-the-copyset.md`.
 
 
 > **Runner identity correction (2026-09-17).** Ubuntu job 105312670403 ran pjdfstest as uid 1001
@@ -44,7 +77,7 @@ gaps. The TLA runs in §10 are historical, bounded model evidence, not a proof o
 > The deterministic counterexample chose an empty replacement (0.00 s before, passing after); the
 > Linux restart and five-node takeover histories pass. This corrects a specific placement defect and
 > does not close the broader AC-8.18 state-transfer obligation. Cross-region forwarding's independent
-> all-alive-members owner guess remains a separate routing defect. Record:
+> all-alive-members owner guess is corrected by the owner-location exchange above. Record:
 > `docs/bugs/2026-09-17-takeover-ranks-an-empty-replacement.md`.
 
 ## 1. Component inventory

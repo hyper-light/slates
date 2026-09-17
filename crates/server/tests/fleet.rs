@@ -3612,6 +3612,271 @@ fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
   );
 }
 
+/// AC-8.1 / §4.8 Lookup: a home region has more members than an object's copyset. After its
+/// owner dies, a foreign client must reach the copyset successor, even when rendezvous over all
+/// live home-region members ranks an unrelated node first. The remote snapshot retry stays exactly-once.
+#[test]
+fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_live_peer() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "foreign"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let seeds: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let regions = seeds
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::from(index == names.len() - 1))))
+    .collect();
+  let serve = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh_with_regions(nodes, &seeds, &certs, &serve, 1, &regions);
+  let hosts: Vec<_> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let foreign_instance = daemons.last().unwrap().instance().to_owned();
+  // Keep the lowest-id regional representative alive, so the root quorum is undisturbed.
+  let owner_index = (0..names.len() - 1)
+    .max_by_key(|index| hosts[*index])
+    .unwrap();
+  let owner = hosts[owner_index];
+  let neighborhood = daemons[owner_index].placement_neighbourhood().unwrap();
+  let survivors: Vec<_> = hosts[..names.len() - 1]
+    .iter()
+    .copied()
+    .filter(|host| *host != owner)
+    .collect();
+  let (id, successor, unrelated) =
+    place_copyset_routing_case(&daemons, owner_index, owner, &neighborhood, &survivors);
+  trace::record(format_args!(
+    "owner-lookup selected owner={owner:?}, successor={successor:?}, unrelated={unrelated:?}, object={:?}",
+    ObjectId(id.bytes)
+  ));
+  let mut interrupted = Client::connect(&foreign_instance);
+  assert!(audit_wait(|| Ok(matches!(
+    interrupted.call(&RequestBody::Status { volume: id }),
+    ReplyBody::Status { .. }
+  ))));
+  daemons.remove(owner_index).stop();
+  let unavailable = interrupted.call(&RequestBody::Snapshot { volume: id });
+  assert!(
+    matches!(
+      unavailable,
+      ReplyBody::Refused {
+        refusal: Refusal::HomedElsewhere { .. }
+      }
+    ),
+    "a stopped owner cannot execute the forwarded write: {unavailable:?}"
+  );
+  let successor_daemon = daemons
+    .iter()
+    .find(|daemon| daemon.member_identity().unwrap() == successor)
+    .unwrap();
+  assert_copyset_adopted(&daemons, successor_daemon, ObjectId(id.bytes));
+  assert!(audit_wait(|| Ok(status_answers_once(
+    successor_daemon.instance(),
+    id
+  ))));
+  let mut foreign = Client::connect(&foreign_instance);
+  let mut last = ReplyBody::Refused {
+    refusal: Refusal::NotFound,
+  };
+  let served = audit_wait(|| {
+    last = foreign.call(&RequestBody::Status { volume: id });
+    Ok(matches!(last, ReplyBody::Status { .. }))
+  });
+  trace::record(format_args!("owner-lookup served={served}, last={last:?}"));
+  let foreign_daemon = daemons
+    .iter()
+    .find(|daemon| daemon.instance() == foreign_instance)
+    .unwrap();
+  let counters_before = foreign_daemon.fleet_refusals().unwrap();
+  let written = served.then(|| foreign.call(&RequestBody::Snapshot { volume: id }));
+  let retry = served.then(|| foreign.call_retry(&RequestBody::Snapshot { volume: id }));
+  let counters_after = foreign_daemon.fleet_refusals().unwrap();
+  let resumed = retry_snapshot_until_served(&mut interrupted, id);
+  let resumed_retry = interrupted.call_retry(&RequestBody::Snapshot { volume: id });
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    served,
+    "foreign lookup must reach the actual copyset successor: {last:?}"
+  );
+  assert_same_snapshot_reply(
+    written.expect("the forward path was available"),
+    retry.expect("the retry path was available"),
+  );
+  assert_same_snapshot_reply(resumed, resumed_retry);
+  assert!(
+    counters_before
+      .get("fleet.owner_location.round")
+      .copied()
+      .unwrap_or(0)
+      > 0,
+    "the remote client discovered the actual owner"
+  );
+  assert_eq!(
+    counters_before.get("fleet.owner_location.round"),
+    counters_after.get("fleet.owner_location.round"),
+    "the two writes reuse the client's route instead of repeating discovery"
+  );
+  assert!(
+    counters_after
+      .get("fleet.owner_location.direct")
+      .copied()
+      .unwrap_or(0)
+      > counters_before
+        .get("fleet.owner_location.direct")
+        .copied()
+        .unwrap_or(0),
+    "the cached route really forwarded a request"
+  );
+}
+
+/// Seal a volume that distinguishes a copyset successor from all-member ranking, and establish
+/// its real holds before stopping the owner. All selected candidates must hold the head.
+fn place_copyset_routing_case(
+  daemons: &[Daemon],
+  owner_index: usize,
+  owner: HostId,
+  neighborhood: &[HostId],
+  survivors: &[HostId],
+) -> (VolumeId, HostId, HostId) {
+  let mut local = Client::connect(daemons[owner_index].instance());
+  let (id, name, candidates, successor, unrelated) =
+    choose_copyset_routing_case(&mut local, owner, neighborhood, survivors);
+  write_hello_over_nfs(&daemons[owner_index], &name);
+  let ReplyBody::Snapshotted { id: snapshot } = local.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("seal the selected volume")
+  };
+  assert!(poll_snapshot_placed(
+    &daemons.iter().collect::<Vec<_>>(),
+    &mut local,
+    id,
+    snapshot
+  ));
+  let holders: Vec<_> = daemons
+    .iter()
+    .filter(|daemon| {
+      candidates.contains(&daemon.member_identity().unwrap())
+        && daemon.member_identity().unwrap() != owner
+    })
+    .collect();
+  let manifest = daemons[owner_index]
+    .fleet_head_manifest(ObjectId(id.bytes))
+    .unwrap()
+    .unwrap();
+  assert!(
+    audit_wait(|| all_hold(holders.iter().map(|daemon| {
+      daemon.fleet_holder_head(ObjectId(id.bytes)).map(|held| {
+        held
+          .and_then(|(_, bytes)| HeadValue::from_record_bytes(&bytes))
+          .is_some_and(|head| head.manifest == Some(manifest))
+      })
+    }))),
+    "every candidate holds the sealed head, not just its earlier creation record"
+  );
+  (id, successor, unrelated)
+}
+
+/// A routing refusal is temporary; retry the original write id after a successor is available.
+fn retry_snapshot_until_served(client: &mut Client, volume: VolumeId) -> ReplyBody {
+  let mut reply = ReplyBody::Refused {
+    refusal: Refusal::NotFound,
+  };
+  assert!(
+    audit_wait(|| {
+      reply = client.call_retry(&RequestBody::Snapshot { volume });
+      Ok(matches!(reply, ReplyBody::Snapshotted { .. }))
+    }),
+    "a routing refusal must not poison the write's completion: {reply:?}"
+  );
+  reply
+}
+
+fn assert_same_snapshot_reply(first: ReplyBody, retry: ReplyBody) {
+  let ReplyBody::Snapshotted { id: first } = first else {
+    panic!("write not served: {first:?}")
+  };
+  let ReplyBody::Snapshotted { id: retry } = retry else {
+    panic!("retry not served: {retry:?}")
+  };
+  assert_eq!(
+    first, retry,
+    "the resumed write executes once at its successor"
+  );
+}
+
+/// Distinguishes a failed takeover prerequisite from the routing exchange this history tests.
+fn assert_copyset_adopted(daemons: &[Daemon], successor_daemon: &Daemon, object: ObjectId) {
+  let adopted = audit_wait(|| successor_daemon.fleet_head_placed(object));
+  trace::record(format_args!("owner-lookup adopted={adopted}"));
+  if !adopted {
+    for daemon in daemons {
+      trace::record(format_args!(
+        "owner-lookup adoption host={:?} members={:?} council={:?} held={:?} refusals={:?}",
+        daemon.member_identity(),
+        daemon.fleet_members(),
+        daemon.council_members(),
+        daemon
+          .fleet_holder_head(object)
+          .map(|head| head.map(|(owner, _)| owner)),
+        daemon.fleet_refusals(),
+      ));
+    }
+  }
+  assert!(
+    adopted,
+    "the actual successor must adopt before testing remote lookup"
+  );
+}
+
+/// Selects a real provisioned id that distinguishes the record's copyset from all alive members.
+/// Non-selected volumes are destroyed; the finite shape budget spans rendezvous weights, not time.
+fn choose_copyset_routing_case(
+  local: &mut Client,
+  owner: HostId,
+  neighborhood: &[HostId],
+  survivors: &[HostId],
+) -> (VolumeId, String, Vec<HostId>, HostId, HostId) {
+  /// Shape: the same bounded object-history width as the copyset oracle in slates-cluster.
+  const OBJECTS: usize = 128;
+  for sequence in 0..OBJECTS {
+    let name = format!("copyset-route-{sequence}");
+    let ReplyBody::Created { id } = local.call(&scratch(&name)) else {
+      panic!("create routing candidate")
+    };
+    let object = ObjectId(id.bytes);
+    let candidates = candidates_for(
+      owner,
+      neighborhood,
+      &std::collections::BTreeMap::new(),
+      object,
+      Quorum { f: 1 },
+    );
+    let surviving_candidates: Vec<_> = candidates
+      .iter()
+      .copied()
+      .filter(|host| survivors.contains(host))
+      .collect();
+    let successor = rendezvous_first(&surviving_candidates, object).unwrap();
+    let unrelated = rendezvous_first(survivors, object).unwrap();
+    if successor != unrelated {
+      return (id, name, candidates, successor, unrelated);
+    }
+    assert!(matches!(
+      local.call(&RequestBody::Destroy { volume: id }),
+      ReplyBody::Destroyed
+    ));
+  }
+  panic!("the routing history must include a non-holder ranked before its copyset successor")
+}
+
 /// AC (§4.8 "Lookup", slice 2 — writes; task #29): a client on one region issues a **write** to a volume
 /// homed in another region; it is forwarded to the owner, executed there, and is **exactly-once** on retry.
 /// Three daemons, each its own region; a volume is created on node a (region 0). A client on node b (region 1)
@@ -3695,7 +3960,9 @@ fn a_client_writes_a_cross_region_volume_by_forwarding_to_its_owner() {
     },
   );
   // A further retry of the same id must return the recorded reply.
+  let forwards_before = daemons[1].fleet_refusals().unwrap();
   let retry = client_b.call_retry(&RequestBody::Snapshot { volume: id });
+  let forwards_after = daemons[1].fleet_refusals().unwrap();
 
   for daemon in daemons {
     daemon.stop();
@@ -3712,6 +3979,18 @@ fn a_client_writes_a_cross_region_volume_by_forwarding_to_its_owner() {
     snap1, snap2,
     "the retried forwarded write returned the owner's recorded reply (the same snapshot id), not a second \
      snapshot — the forwarded write is exactly-once under the globally-unique completion key"
+  );
+  assert_eq!(
+    forwards_after
+      .get("fleet.owner_location.direct")
+      .copied()
+      .unwrap_or(0),
+    forwards_before
+      .get("fleet.owner_location.direct")
+      .copied()
+      .unwrap_or(0)
+      + 1,
+    "the retry reaches the owner: an origin-side completion cannot mask a broken owner replay"
   );
 }
 
@@ -6156,18 +6435,63 @@ fn a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss
         .unwrap()
     });
   let lost = daemons[victim].member_identity().unwrap();
+  let lost_was_leader = daemons[victim].council_leads() == Ok(true);
   daemons.remove(victim).stop();
   let remaining: Vec<HostId> = daemons
     .iter()
     .map(|daemon| daemon.member_identity().unwrap())
     .collect();
-  assert!(
-    audit_wait(|| audit_voters_match(&daemons, &remaining)),
-    "the surviving pair commits another membership change, which requires the fresh voter's acknowledgement; lost {lost:?}"
-  );
+  // Targeted capture: on failure, dump every survivor's council and SWIM state before stopping them, so a
+  // stalled second-loss commit names its stage (detection, election, or replication) instead of a bare
+  // timeout (docs/wip/TBD_FIXES.md §1).
+  let committed = audit_wait(|| audit_voters_match(&daemons, &remaining));
+  let snapshot = council_snapshot(&daemons);
   for daemon in daemons {
     daemon.stop();
   }
+  assert!(
+    committed,
+    "the surviving pair commits another membership change, which requires the fresh voter's \
+     acknowledgement; lost {lost:?} (was_leader={lost_was_leader}), fresh {fresh:?}, remaining \
+     {remaining:?}\n{snapshot}"
+  );
+}
+
+/// A per-daemon dump of council and SWIM state for a membership-commit diagnosis: the committed voter set
+/// (`council_voters`), the applied regional members, the SWIM alive view (does it still see a lost peer?),
+/// leadership, the leader-contact counter (whether appends are flowing), the mesh, the record links, and the
+/// non-zero refusal counts. Every field is the typed observation, so an unreachable shard shows as its error
+/// rather than a default.
+fn council_snapshot(daemons: &[Daemon]) -> String {
+  daemons
+    .iter()
+    .map(|daemon| {
+      let refusals = daemon.fleet_refusals().map(|counts| {
+        counts
+          .into_iter()
+          .filter(|(_, count)| *count > 0)
+          .collect::<std::collections::BTreeMap<_, _>>()
+      });
+      format!(
+        "  {}: id={:?} leads={:?} voters={:?} members={:?} alive={:?} contact={:?} meshed={:?} \
+         links={:?} refusals={:?}\n      raft={}",
+        daemon.instance(),
+        daemon.member_identity(),
+        daemon.council_leads(),
+        daemon.council_voters(),
+        daemon.council_members(),
+        daemon.fleet_members(),
+        daemon.council_contact(),
+        daemon.fleet_meshed(),
+        daemon.fleet_record_links(),
+        refusals,
+        daemon
+          .council_debug()
+          .unwrap_or_else(|error| format!("<unobserved: {error}>")),
+      )
+    })
+    .collect::<Vec<_>>()
+    .join("\n")
 }
 
 /// AC-8.1 / T-2.14, §4.8: restart every process while its anchor retains RAM. Both groups

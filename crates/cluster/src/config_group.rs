@@ -403,6 +403,39 @@ impl RegionalCouncil {
     self.leader_contact
   }
 
+  /// A diagnostic dump of the council's Raft and applied state, for a membership-commit failure (never on a
+  /// normal path): the role and term, the voter set and whether a joint change is in flight, the commit and
+  /// last-log indexes, the applied member set and its version, and the committed log's configuration entries
+  /// — each config command (admit / retire / takeover) or voter-configuration entry, with its term — so a
+  /// stalled reconfiguration names what was proposed and committed, and when, not merely the outcome.
+  pub fn debug_state(&self) -> String {
+    let log: Vec<String> = self
+      .raft
+      .committed_entries()
+      .iter()
+      .map(
+        |entry| match (&entry.config, ConfigCommand::decode(&entry.command)) {
+          (Some(config), _) => format!("t{} cfg{config:?}", entry.term),
+          (None, Some(command)) => format!("t{} {command:?}", entry.term),
+          (None, None) => format!("t{} noop", entry.term),
+        },
+      )
+      .collect();
+    format!(
+      "role={:?} term={} voters={:?} joint={} commit={} last_log={} applied={} members={:?} v{} log=[{}]",
+      self.raft.role(),
+      self.raft.term(),
+      self.raft.all_voters(),
+      self.raft.in_joint_configuration(),
+      self.raft.commit_index(),
+      self.raft.last_log_index(),
+      self.applied,
+      self.configuration.members,
+      self.configuration.version,
+      log.join(" | ")
+    )
+  }
+
   /// **DRIVE**: begins a **pre-election** on an election timeout (Raft §9.6), returning the [`PreVote`]s to
   /// ship to the other voters — asked *without inflating the term*, so a partitioned node cannot disrupt a
   /// healthy leader. A lone voter proceeds straight to leading with no messages (the `f = 0` degenerate).
@@ -563,17 +596,27 @@ impl RegionalCouncil {
     self.raft.last_log_index() == self.raft.commit_index()
   }
 
-  /// Reconciles the regional membership with a SWIM `alive` set **as the leader** (§4.8 "the configuration
-  /// master decides membership"): proposes admitting every alive host not yet a member and retiring every
-  /// member no longer alive, each through the council log so it commits at a majority over the transport and
-  /// applies on every voter. Returns whether anything was proposed. A non-leader proposes nothing — the
-  /// leader is the one configuration master and decides from its own SWIM view (it probes every member), so
-  /// a follower's own detection need not propose. Gated on [`caught_up`](RegionalCouncil::caught_up) so a
-  /// change in flight is not re-proposed; a member already present, or already gone, is not proposed either
-  /// (`propose`'s own `would_change` gate), so the log grows only for real changes. Each alive host comes
-  /// with the failure domain its node declares, if any, so an admission carries it into the configuration
+  /// Reconciles the regional membership with this leader's SWIM view **as the leader** (§4.8 "the
+  /// configuration master decides membership"): proposes admitting every `alive` host not yet a member, and
+  /// taking over — an epoch bump plus a retirement — every `dead` host still a member, each through the
+  /// council log so it commits at a majority over the transport and applies on every voter. Each alive host
+  /// comes with the failure domain its node declares, so an admission carries it into the configuration
   /// (task #22: a restarted node's new id inherits its node's domain this way).
-  pub fn reconcile_alive(&mut self, alive: &[(HostId, Option<DomainId>)]) -> bool {
+  ///
+  /// A member SWIM has only **suspected** — a probe unanswered, its death not yet confirmed — is in neither
+  /// set, so it is left in the configuration until its suspicion resolves to death (retire) or is refuted
+  /// (kept). This is the suspicion window applied to the council: a single missed probe, routine under load
+  /// and likeliest against a fresh joiner, must not retire a live voter — retiring it there discards a live
+  /// member and can leave the survivors of a later loss unable to reach a majority
+  /// (`docs/bugs/2026-09-17-council-retires-a-suspected-voter.md`). The caller passes only members whose
+  /// death it has **confirmed**, never merely suspected.
+  ///
+  /// Returns whether anything was proposed. A non-leader proposes nothing — the leader is the one
+  /// configuration master and decides from its own SWIM view, so a follower's own detection need not
+  /// propose. Gated on [`caught_up`](RegionalCouncil::caught_up) so a change in flight is not re-proposed; a
+  /// host already a member (admit) or no longer one (takeover) is not proposed either (`propose`'s own
+  /// `would_change` gate), so the log grows only for real changes.
+  pub fn reconcile_alive(&mut self, alive: &[(HostId, Option<DomainId>)], dead: &[HostId]) -> bool {
     if !self.is_leader() || !self.caught_up() {
       return false;
     }
@@ -581,16 +624,10 @@ impl RegionalCouncil {
     for &(host, domain) in alive {
       proposed |= self.propose(Reconfiguration::Admit { host, domain });
     }
-    let stale: Vec<HostId> = self
-      .configuration
-      .members
-      .iter()
-      .copied()
-      .filter(|member| !alive.iter().any(|(host, _)| host == member))
-      .collect();
-    for host in stale {
-      // A member no longer alive **failed** (SWIM confirmed its death), so take it over — bump its fencing
-      // epoch and retire it (§4.8 line 1730 "Host failure increments the host epoch"), not a clean retire.
+    for &host in dead {
+      // A member SWIM confirmed **dead** failed, so take it over — bump its fencing epoch and retire it
+      // (§4.8 line 1730 "Host failure increments the host epoch"), not a clean retire. A host that is not a
+      // current member is a no-op (`propose`'s `would_change` gate), so a confirmed-dead non-member is safe.
       proposed |= self.propose(Reconfiguration::TakeOver(host));
     }
     proposed
@@ -1056,15 +1093,15 @@ mod tests {
     // The region starts [OWNER, A]; host B has now joined the alive view, its node declaring a failure domain.
     let alive = vec![(OWNER, None), (A, None), (B, Some(DECLARED_DOMAIN))];
     assert!(
-      !follower.reconcile_alive(&alive),
+      !follower.reconcile_alive(&alive, &[]),
       "a non-leader proposes nothing — only the leader is the configuration master"
     );
     assert!(
-      leader.reconcile_alive(&alive),
+      leader.reconcile_alive(&alive, &[]),
       "the leader proposes admitting the new member"
     );
     assert!(
-      !leader.reconcile_alive(&alive),
+      !leader.reconcile_alive(&alive, &[]),
       "a change still in flight is not re-proposed (the caught-up gate — no duplicate log entry)"
     );
 
@@ -1084,8 +1121,44 @@ mod tests {
       "the admission carried B's declared failure domain to every voter (task #22)"
     );
     assert!(
-      !leader.reconcile_alive(&alive),
+      !leader.reconcile_alive(&alive, &[]),
       "the settled membership reconciles to a no-op — the log grows only for real changes"
+    );
+  }
+
+  /// AC (§4.8, D-14; the suspicion window): the council retires a voter only once SWIM has **confirmed** its
+  /// death, never while it is merely **suspected**. A single missed probe suspects a live voter; retiring it
+  /// there discards a live member, and a later loss can then leave the survivors unable to reach a majority
+  /// (`docs/bugs/2026-09-17-council-retires-a-suspected-voter.md` — the Linux whole-RAM regression). Two
+  /// voters {OWNER, A}; A is absent from the alive view but its death is not confirmed: the leader proposes
+  /// nothing and A stays a member. Once A is confirmed dead, the leader takes it over.
+  #[test]
+  fn a_suspected_voter_is_not_retired_until_its_death_is_confirmed() {
+    let mut leader = council(OWNER);
+    let mut follower = council(A);
+    elect(&mut leader, &mut follower);
+    replicate(&mut leader, &mut follower, 2); // commit the election no-op before reconfiguration
+    assert!(leader.is_leader());
+
+    // A is only SUSPECTED — absent from the alive view, but its death is not confirmed (an empty dead set).
+    assert!(
+      !leader.reconcile_alive(&[(OWNER, None)], &[]),
+      "a suspected member is not retired — the suspicion window must resolve to death first"
+    );
+    assert!(
+      leader.configuration().members.contains(&A),
+      "the suspected member stays in the configuration"
+    );
+
+    // A is now CONFIRMED dead: the leader takes it over, and it retires.
+    assert!(
+      leader.reconcile_alive(&[(OWNER, None)], &[A]),
+      "a confirmed-dead member is taken over"
+    );
+    replicate(&mut leader, &mut follower, 2);
+    assert!(
+      !leader.configuration().members.contains(&A),
+      "the confirmed-dead member is retired"
     );
   }
 
@@ -1109,9 +1182,9 @@ mod tests {
       .copied()
       .expect("A is a member");
 
-    // A is no longer alive: the leader proposes its takeover (an epoch bump plus a retirement).
+    // A is confirmed dead: the leader proposes its takeover (an epoch bump plus a retirement).
     assert!(
-      leader.reconcile_alive(&[(OWNER, None)]),
+      leader.reconcile_alive(&[(OWNER, None)], &[A]),
       "the leader proposes the failed member's takeover"
     );
     replicate(&mut leader, &mut follower, 2);
@@ -1275,7 +1348,7 @@ mod tests {
       survivors.iter().map(|host| (*host, None)).collect();
     let proposed = councils
       .get_mut(&OWNER)
-      .is_some_and(|leader| leader.reconcile_alive(&alive));
+      .is_some_and(|leader| leader.reconcile_alive(&alive, &[B]));
     settle(&mut councils, OWNER, &survivors, 2);
     assert_eq!(
       (
@@ -1345,7 +1418,7 @@ mod tests {
       alive.iter().map(|host| (*host, None)).collect();
     let proposed = councils
       .get_mut(&OWNER)
-      .is_some_and(|leader| leader.reconcile_alive(&declared));
+      .is_some_and(|leader| leader.reconcile_alive(&declared, &[B]));
     settle(&mut councils, OWNER, &alive, 2);
     let fetched = councils[&OWNER].configuration().clone();
     let adopted = councils

@@ -34,6 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use slates_db::register::HostId;
 
 use crate::coordinates::{CoordinateEngine, NetworkCoordinate};
+use crate::gossip::Gossip;
 use crate::membership::{Change, Liveness, MemberState, Membership};
 
 /// A ping to send to `to` — probe it this period.
@@ -109,7 +110,7 @@ pub struct Detector {
   acked: bool,
   suspicion: BTreeMap<HostId, u32>,
   confirmations: BTreeMap<HostId, BTreeSet<HostId>>,
-  gossip: BTreeMap<HostId, (MemberState, u32)>,
+  gossip: Gossip,
   health: u32,
   shuffler: RandomizedOrder,
   coordinates: CoordinateEngine,
@@ -176,7 +177,7 @@ impl Detector {
       acked: false,
       suspicion: BTreeMap::new(),
       confirmations: BTreeMap::new(),
-      gossip: BTreeMap::new(),
+      gossip: Gossip::default(),
       health: 0,
       shuffler: RandomizedOrder::seeded(local),
       coordinates: CoordinateEngine::new(),
@@ -274,9 +275,7 @@ impl Detector {
     let change = self.membership.apply(subject, update);
     match change {
       Some(Change::Adopted { member, state }) => {
-        self
-          .gossip
-          .insert(member, (state, self.timing.gossip_transmits));
+        self.gossip.record(member, state);
       }
       Some(Change::Refuted { incarnation }) => {
         // A peer suspected us: our acknowledgements are not reaching the fleet, so we look unhealthy —
@@ -287,9 +286,7 @@ impl Detector {
           liveness: Liveness::Alive,
           incarnation,
         };
-        self
-          .gossip
-          .insert(self.local, (state, self.timing.gossip_transmits));
+        self.gossip.record(self.local, state);
       }
       None => {}
     }
@@ -301,24 +298,7 @@ impl Detector {
   /// exhausted — so the buffer is bounded and each change spreads a fixed number of times (§4.8; SWIM
   /// infection-style dissemination).
   pub fn gossip(&mut self, max: usize) -> Vec<(HostId, MemberState)> {
-    let mut ranked: Vec<(HostId, MemberState, u32)> = self
-      .gossip
-      .iter()
-      .map(|(&subject, &(state, remaining))| (subject, state, remaining))
-      .collect();
-    // Most remaining transmits first — freshest changes propagate soonest.
-    ranked.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.0.cmp(&b.0.0)));
-    let mut batch = Vec::new();
-    for (subject, state, _) in ranked.into_iter().take(max) {
-      batch.push((subject, state));
-      if let Some((_, remaining)) = self.gossip.get_mut(&subject) {
-        *remaining -= 1;
-        if *remaining == 0 {
-          self.gossip.remove(&subject);
-        }
-      }
-    }
-    batch
+    self.gossip.drain(max, self.timing.gossip_transmits)
   }
 
   /// The gossip batch to piggyback on a direct ping to `target`: the ordinary batch

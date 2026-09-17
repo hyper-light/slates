@@ -42,6 +42,8 @@ pub struct ClientSlot {
   /// revocation is fanned to every shard's slots when it commits — so the per-verb gate is one read,
   /// never a cross-shard call on a write path (banned item 10).
   pub revoked: bool,
+  /// The last successful remote route, released with this client. One slot, no global catalog.
+  pub(crate) owner_route: Option<crate::owner_location::CachedRoute>,
 }
 
 impl std::fmt::Debug for ClientSlot {
@@ -319,6 +321,15 @@ pub struct ShardState {
   /// A different nonce retires the previous id; nonces cannot establish numeric age order.
   /// Only the control shard updates it. Empty before contact, and on a laptop.
   pub learned_members: BTreeMap<slates_db::HostId, LearnedMember>,
+  /// Reverse index of the current authenticated identities, bounded by learned_members.
+  /// Relayed alive gossip may refute a failure, but cannot revive a superseded RAM identity.
+  pub authenticated_members: std::collections::BTreeSet<slates_db::HostId>,
+  /// Consecutive coordinator periods each council member has been observed **dead**, while this node
+  /// leads the council: the death-confirmation window before an irreversible retirement. A member seen
+  /// alive again is removed (its count reset), so a transient false death — a live member briefly
+  /// unreachable during a re-election or session churn — never reaches the window. Bounded by the council
+  /// membership; only the leader writes it (`fleet::stable_dead_council_members`).
+  pub(crate) council_death_watch: BTreeMap<slates_db::HostId, u32>,
   /// The control shard's bounded candidate table and enrollment authority.
   pub(crate) discovery: Option<crate::discovery::Discovery>,
   /// Authenticated candidate addresses included in the anchor publication.

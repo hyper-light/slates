@@ -966,6 +966,14 @@ impl Daemon {
     self.observe(self.shards.first().copied(), |s| s.root_timing)
   }
 
+  /// A diagnostic dump of this daemon's regional council Raft and applied state
+  /// ([`slates_cluster::config_group::RegionalCouncil::debug_state`]) — the committed configuration-change
+  /// log with terms, the voter set, the joint-change flag and the commit indexes — for diagnosing a stalled
+  /// membership commit. A one-shot control-shard observation.
+  pub fn council_debug(&self) -> Result<String, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| s.council.debug_state())
+  }
+
   /// The **regional membership** this daemon's configuration council has committed and applied so far
   /// (§4.8, D-14) — the members of the `RegionalConfiguration`, the region the council masters. A one-shot
   /// control-shard question ([`Self::observation`]); an observation the daemon could not make is its typed
@@ -1772,6 +1780,8 @@ fn init_shard(
     formed_probe_peers: std::collections::BTreeSet::new(),
     member_boot_nonce: incarnation,
     learned_members: std::collections::BTreeMap::new(),
+    authenticated_members: std::collections::BTreeSet::new(),
+    council_death_watch: std::collections::BTreeMap::new(),
     discovery: None,
     enrolled: Vec::new(),
     demuxes: Vec::new(),
@@ -2044,6 +2054,7 @@ async fn control_loop(
                 last_seen_ns,
                 control,
                 revoked: false,
+                owner_route: None,
               }) {
                 Ok(_) => admission.seat(),
                 Err(e) => {

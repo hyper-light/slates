@@ -101,6 +101,14 @@ native 64-bit ones and `O_DIRECT` is defined 0, so the two direct-I/O operations
 
 ### 3.3 Workloads — four identical, four differ only by AppleDouble sidecars; two declared limits
 
+> **Ubuntu editor correction (2026-09-17).** Job 105312670403 reported eight identical tools
+> and a missing mounted `note.txt~`. The roster now clears Vim's temporary-path `backupskip`
+> exclusion and reads the backup into the compared output; missing backups fail the script.
+> The real-save regression checks exact new and backup bytes inside and outside TMPDIR, gated
+> on supplied RAM scratch and Vim. Local real-save execution awaits RAM-volume authorization;
+> no native conformance rerun is claimed. Record:
+> `docs/bugs/2026-09-17-editor-backup-depends-on-scratch-path.md`.
+
 Nine roster tools (`crates/conformance/src/workload.rs`): git, cargo, npm, python3, rg, rsync,
 sqlite3, vim (the editor save pattern), and a watcher (`fswatch` on macOS, absent on this host —
 SKIPPED naming it). Each ran once in a host directory and once inside the mount under one fixed

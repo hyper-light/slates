@@ -131,10 +131,13 @@ sqlite3 db.sqlite 'PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;'
 
 /// The editor workload: vim's save pattern in batch mode — the original renamed to a backup and
 /// a new file written (`backupcopy=no`), the write-new-then-rename shape editors use.
+/// Clear the temporary-path exclusion so both roots exercise backup creation; reading the backup
+/// makes a missing backup fail even when both roots would otherwise skip it (T-3.3).
 const EDITOR: &str = r#"
 printf 'draft\n' > note.txt
-vim -u NONE -N -i NONE -es -c 'set backup backupdir=. writebackup backupcopy=no' -c 'normal! ihello ' -c 'wq' note.txt
+vim -u NONE -N -i NONE -es -c 'set backup backupdir=. writebackup backupcopy=no backupskip=' -c 'normal! ihello ' -c 'wq' note.txt
 cat note.txt
+cat note.txt~
 ls -A
 "#;
 
