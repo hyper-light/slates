@@ -173,6 +173,8 @@ pub enum EndpointError {
   /// The demultiplexer closed this session: its peer established a new one (a re-dial after a loss),
   /// or the peer was retired. The reader ends its loop; nothing more arrives here.
   Closed,
+  /// The authenticated peer exceeded its session reservation, or admission capacity is invalid.
+  Admission(crate::demux::SessionRefusal),
   /// This end's handshake flight exceeds the largest flight the fragmenter carries
   /// (`crate::flight::MAX_FLIGHT_BYTES`): a certificate chain beyond a generous bound. Refused here,
   /// typed, before a byte leaves. Below that a flight of any size crosses as fragments each fitting the
@@ -475,11 +477,11 @@ impl Endpoint {
       return Err(EndpointError::NotReady);
     }
     let cid = self.quic.export_connection_id()?;
-    self.cid = Some(cid);
     if let Link::Shared { demux, slot } = &self.link {
       let peer = self.quic.peer_certificate().map(|c| c.as_ref().to_vec());
-      with_demux(*demux, |d| d.bind(*slot, cid, peer)).ok_or(EndpointError::Closed)?;
+      with_demux(*demux, |d| d.bind(*slot, cid, peer)).ok_or(EndpointError::Closed)??;
     }
+    self.cid = Some(cid);
     Ok(cid)
   }
 

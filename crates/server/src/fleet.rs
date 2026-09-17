@@ -757,11 +757,9 @@ pub async fn run_membership(transport: FleetTransport) {
     .map(|peer| peer.certificate.clone())
     .chain(enrollment_roots)
     .collect();
-  // The pool each plane's demultiplexer holds: the one derivation the task and timer budgets were sized
-  // from (`config::with_fleet`: `SESSION_RESERVE_PER_PEER` slots per unit of peer capacity), so admission
-  // and the serve-task reserve can never disagree. A shared pool, not a per-peer quota
-  // (`slates_transport::demux`; `docs/bugs/2026-09-16-redial-burst-assumes-a-per-peer-session-limit.md`).
-  let max_sessions = state::with_state(|state| state.config.fleet_sessions_per_plane).unwrap_or(0);
+  // Both planes use the same peer capacity and transport-owned session multiplier as the task/timer
+  // budget: one pending handshake plus the authenticated live/replacement pair per capacity unit.
+  let peer_capacity = state::with_state(|state| state.config.fleet_peer_capacity).unwrap_or(0);
   // The demultiplexers are owned by this shard for its life and dropped with it (their sockets closed,
   // the ports free again — a restarted node binds the same addresses); a start refused here means this
   // loop is not on a shard thread, counted like a socket that would not bind.
@@ -771,14 +769,14 @@ pub async fn run_membership(transport: FleetTransport) {
       identity,
       allowed.clone(),
       FLEET_FRAME_CAP,
-      max_sessions,
+      peer_capacity,
     ),
     Demux::start(
       record_socket,
       identity,
       allowed,
       FLEET_FRAME_CAP,
-      max_sessions,
+      peer_capacity,
     ),
   ) else {
     count_refusal(BIND_REFUSED);
@@ -1022,7 +1020,7 @@ async fn establish_session(
 /// was merely starved. A flight resent for a full budget with no reply means the peer's half-open state for
 /// this source is gone or the peer is down, and a fresh dial — a new source the demultiplexer opens a fresh
 /// session for — is the recovery.
-const ESTABLISH_BUDGETS_BEFORE_REDIAL: u32 = 2;
+pub const ESTABLISH_BUDGETS_BEFORE_REDIAL: u32 = 2;
 
 /// The serve side: complete the accepted session's handshake and loop answering the peer's probes (§4.8),
 /// **re-admitting a peer that has come back**. A serve session's own detector builds the acknowledgement
@@ -2768,13 +2766,23 @@ const ACCEPT_HANDSHAKE_REFUSED: &str = "fleet.accept.handshake";
 /// Kept apart from TLS and socket failures: learning a fresh boot identity can cancel a seed dial.
 const ACCEPT_REPLACED: &str = "fleet.accept.replaced";
 
+/// A certificate still owns its live and replaced endpoints; its next authentication is refused.
+const ACCEPT_PEER_SESSIONS: &str = "fleet.accept.peer_sessions";
+/// Every authenticated peer reservation is held; a new identity cannot be admitted yet.
+const ACCEPT_PEER_CAPACITY: &str = "fleet.accept.peer_capacity";
+
 /// Classifies the transport's typed handshake result without hiding a real TLS or socket failure
 /// behind an expected replacement. Both serve planes use the same distinction.
 fn count_accept_failure(error: &EndpointError, plane: &str) {
-  let counter = if matches!(error, EndpointError::Closed) {
-    ACCEPT_REPLACED
-  } else {
-    ACCEPT_HANDSHAKE_REFUSED
+  let counter = match error {
+    EndpointError::Closed => ACCEPT_REPLACED,
+    EndpointError::Admission(slates_transport::demux::SessionRefusal::PeerSessions) => {
+      ACCEPT_PEER_SESSIONS
+    }
+    EndpointError::Admission(slates_transport::demux::SessionRefusal::PeerCapacity) => {
+      ACCEPT_PEER_CAPACITY
+    }
+    _ => ACCEPT_HANDSHAKE_REFUSED,
   };
   if count_refusal(counter) == 1 {
     eprintln!("slates-server: fleet: a dialer's {plane}-plane handshake ended: {error:?}");

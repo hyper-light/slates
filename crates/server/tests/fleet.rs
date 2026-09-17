@@ -1039,7 +1039,10 @@ async fn dial_record_socket(
       }
       Err(EndpointError::NotReady) => {
         outcome = Err("NotReady".to_owned());
-        held = Some(dialer);
+        if dialer.handshake_budgets_spent() < slates_server::fleet::ESTABLISH_BUDGETS_BEFORE_REDIAL
+        {
+          held = Some(dialer);
+        }
       }
       Err(e) => outcome = Err(format!("{e:?}")),
     }
@@ -1360,7 +1363,6 @@ fn assert_burst_bounded(outcome: &BurstOutcome, dials: usize) {
     (Ok(before), Ok(after)) => (before[RECORD_PLANE], after[RECORD_PLANE]),
     other => panic!("the demultiplexer counters were observed before and after: {other:?}"),
   };
-  let refused = after.sessions_refused - before.sessions_refused;
   let setup_refused = after.setup_refused - before.setup_refused;
   let replaced = after.replaced - before.replaced;
   if trace::enabled() {
@@ -1374,12 +1376,8 @@ fn assert_burst_bounded(outcome: &BurstOutcome, dials: usize) {
       outcome.refusals
     ));
   }
-  assert_eq!(
-    refused, 0,
-    "the pool has room for the burst (`fleet_sessions_per_plane`, thousands of slots on any host since \
-     enrollment), so no dial was refused for capacity — exhaustion is proven at the transport seam, not \
-     here: before {before:?} after {after:?}"
-  );
+  // Pending handshakes and authenticated identities now have separate reservations. Either may
+  // refuse a burst temporarily; admission.rs proves those exact bounds and release/retry by use.
   assert_eq!(
     setup_refused, 0,
     "no dial failed at its session's setup: before {before:?} after {after:?}"
@@ -1414,11 +1412,9 @@ fn assert_burst_bounded(outcome: &BurstOutcome, dials: usize) {
 /// dial established and **holding** its session, serve the client once more through them; release. Expect:
 /// every dial establishes; the client is never refused, and was served at least once while the burst's
 /// sessions were all live (by construction); every later dial replaced an earlier session (`replaced`);
-/// **no** dial was refused for capacity or at setup — the pool is `SESSION_RESERVE_PER_PEER ×
-/// fleet_peer_capacity` slots per plane, thousands on any host since enrollment (`f50e939`), so a burst of
-/// three cannot exhaust it (the 2026-09-14 fixture's pool was two slots; this burst's overflow of it was
-/// read as a per-peer quota the demultiplexer never enforced — exhaustion is proven at the transport seam
-/// over the simulated fabric, `crates/transport/tests/session.rs`); the serve tasks of the replaced
+/// no dial fails at setup. Pending-capacity or per-certificate saturation may refuse a dial until a
+/// serve task releases its endpoint; those exact bounds are driven in `transport/tests/admission.rs`.
+/// The serve tasks of replaced
 /// sessions end (A's live task count returns to its pre-burst level — one serve task per live session,
 /// never one per dial); no serve spawn is refused, the refusal counts **observed** and never assumed zero;
 /// and the fleet still holds. Before the task share existed the fleet's tasks were admitted against the
@@ -3943,7 +3939,7 @@ const POD_MEMORY_BYTES: u64 = 1 << 30;
 /// AC-2.6 (admission stays within the task arena; refusals typed), §4.8 boot step 6: a fleet node under a
 /// container's memory bound admits its clients. The daemon derives its task budget from its client bound;
 /// the fleet's own tasks (two per unit of peer capacity to dial it, one serve task per slot of each plane's
-/// shared session pool — `config::SESSION_RESERVE_PER_PEER` slots per unit of peer capacity — and its
+/// shared session pool — `slates_transport::demux::SESSION_SLOTS_PER_PEER` slots per unit of peer capacity — and its
 /// loops) must be inside that budget, or the admission task that seats a client on its shard is
 /// refused by the arena and dropped unrun — the client's channel closes under it and `slates status` never
 /// answers. The KIND lane hit exactly this on 2026-09-14: one pod of a five-replica fleet (four peers) at

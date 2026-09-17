@@ -6,6 +6,20 @@
 > also passed. These results supersede the historical rejoin/scale gaps below. The WAN netem
 > profiles and safe rolling upgrades are separate, unproven gates.
 
+## 2026-09-17 CI confirmation
+
+[Job 105312670637](https://github.com/hyper-light/slates/actions/runs/35253899553/job/105312670637)
+on `a4fe23a` passed `cargo xtask kind all`. At 17:42:56 UTC, the replacement had rejoined
+in **2.2 s** with a fresh identity, all three views agreeing and two probe peers each;
+its IP changed **10.244.1.2 → 10.244.1.3**. Takeover served at **1.8 s**. Thus the
+historical session-formation diagnosis below is closed, as the September 15 verification
+already records. No additional restart mechanism is required by that old report.
+
+The separate unbounded record-discovery wait found on September 16 was fixed in `8a55bcf`
+and is included in this CI revision. It stranded a fresh voter's Raft replication after
+contact, unlike the original zero-probe-session gap. Fairness changes made after `a4fe23a`
+are not covered by this CI result.
+
 ## 2026-09-15 verification
 
 Same Apple-silicon host and Docker Linux VM as the historical run below; Rust 1.98.0,

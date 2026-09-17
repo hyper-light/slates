@@ -3,6 +3,7 @@
 
 use slates_anchor::Geometry;
 use slates_db::partition::PartitionCaps;
+use slates_transport::demux::SESSION_SLOTS_PER_PEER;
 use std::collections::BTreeMap;
 
 use slates_db::register::{Configuration, DomainId, HostId, Quorum, RegionId, scatter_width};
@@ -56,15 +57,6 @@ const FLEET_LOOPS_PER_PEER: usize = 2;
 /// Shape: the fleet's planes, each with its own socket, demultiplexer and accept loop: probes and
 /// records (§4.8).
 const FLEET_PLANES: usize = 2;
-/// Shape: the session slots each plane's demultiplexer reserves in its **shared** pool per unit of peer
-/// capacity: the live session a peer holds and the one its re-dial establishes to replace it (the old is
-/// closed once the new binds; its slot returns when its serve task drops it). It sizes the pool —
-/// `fleet_sessions_per_plane = SESSION_RESERVE_PER_PEER × fleet_peer_capacity` — and is **not** a per-peer
-/// quota: the demultiplexer allots a slot to a source before its handshake authenticates it, so any peer
-/// may hold any free slot, and the certificate learned at establishment only replaces that peer's previous
-/// session (`slates_transport::demux`). Until 2026-09-16 it was documented as a per-peer bound the
-/// demultiplexer never enforced (`docs/bugs/2026-09-16-redial-burst-assumes-a-per-peer-session-limit.md`).
-pub const SESSION_RESERVE_PER_PEER: usize = 2;
 /// Shape: the fleet's perpetual tasks per shard beyond the per-peer ones: one demultiplexer receive
 /// loop and one accept loop per plane (`fleet::run_demux`, `fleet::accept_probes`,
 /// `fleet::accept_records`), plus the one coordinator (`fleet::run_record_plane`, which also drives
@@ -288,10 +280,9 @@ pub struct DaemonConfig {
   pub fleet: Option<FleetMembership>,
   /// Derived: available fleet task slots divided by the tasks one peer requires; never below the seeds.
   pub fleet_peer_capacity: usize,
-  /// Derived: the session slots each plane's demultiplexer holds — one shared pool per plane,
-  /// `SESSION_RESERVE_PER_PEER × fleet_peer_capacity` — the one derivation both the transport's admission
-  /// (`fleet::run_membership` sizes each `Demux` from it) and the task and timer budgets (`with_fleet`
-  /// reserves a serve task per slot) read, so the two can never disagree. Zero on a laptop.
+  /// Derived: `SESSION_SLOTS_PER_PEER × fleet_peer_capacity` accepted endpoints per plane.
+  /// The transport owns the multiplier: one pending handshake plus a live/replaced authenticated
+  /// pair. Admission and task/timer budgeting use the same peer capacity and shape. Zero on a laptop.
   pub fleet_sessions_per_plane: usize,
   /// Derived: a guest device attachment's credits (§4.6 A-9, §4.9): the request credit is the shard's
   /// admission limit (`requests_in_flight_per_shard`), the byte credit the §4.9 window over the measured
@@ -675,24 +666,24 @@ impl DaemonConfig {
     // The fleet's own tasks are a second population on the control shard beside the clients' (§4.3
     // "every structure has a derived bound"): per unit of peer capacity, the probe loop and the record
     // link; per plane, one accept-side serve task for every slot of the demultiplexer's **shared** session
-    // pool (`SESSION_RESERVE_PER_PEER` per unit of capacity — the live session a peer holds and the one its
-    // re-dial replaces it with; a slot is held from its allotment until its serve task drops the session,
+    // pool (`SESSION_SLOTS_PER_PEER` per unit of capacity — one pending handshake and the authenticated
+    // live/replacement pair; a slot is held from its allotment until its serve task drops the session,
     // so no more serve tasks can exist than slots); plus the receive and accept loops of both planes and
-    // the coordinator. The pool is sized here, once, and the transport's admission reads the same number
-    // (`fleet_sessions_per_plane`), so a burst of re-dials under load fills the fleet's share and never the
+    // the coordinator. Admission uses this capacity and the same transport-owned multiplier, so a burst
+    // of re-dials under load fills the fleet's share and never the
     // clients' (2026-09-14: at ~3× oversubscription the shard's whole arena filled with accept-side
     // handshakes each held for its bounded retransmit budget, `adm_refused` 4,554 —
-    // `docs/wip/fleet-under-load.md`). The invariant, per plane: accepted endpoints ≤ S = 2 × C; the
+    // `docs/wip/fleet-under-load.md`). The invariant, per plane: accepted endpoints ≤ S = 3 × C; the
     // fleet's reserve = 2C + 2S + 5.
-    let per_peer = FLEET_LOOPS_PER_PEER + SESSION_RESERVE_PER_PEER * FLEET_PLANES;
+    let per_peer = FLEET_LOOPS_PER_PEER + SESSION_SLOTS_PER_PEER * FLEET_PLANES;
     let peers = membership
       .peers
       .len()
       .max(self.runtime.tasks_per_shard / per_peer);
     self.fleet_peer_capacity = peers;
     let sessions_per_plane: Derived<usize> = derived!(
-      peers.saturating_mul(SESSION_RESERVE_PER_PEER),
-      "SESSION_RESERVE_PER_PEER × fleet_peer_capacity",
+      peers.saturating_mul(SESSION_SLOTS_PER_PEER),
+      "SESSION_SLOTS_PER_PEER × fleet_peer_capacity",
       ["fleet.peers"]
     );
     self
@@ -985,7 +976,7 @@ mod tests {
     });
     assert_eq!(
       fleet.fleet_sessions_per_plane,
-      fleet.fleet_peer_capacity * SESSION_RESERVE_PER_PEER,
+      fleet.fleet_peer_capacity * SESSION_SLOTS_PER_PEER,
       "the shared session pool is one reservation per unit of peer capacity, per plane"
     );
     let share = fleet.fleet_peer_capacity * FLEET_LOOPS_PER_PEER

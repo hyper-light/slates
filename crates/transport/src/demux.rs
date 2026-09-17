@@ -21,11 +21,11 @@
 //! for that shard's life (`ShardContext::keep`: one per socket per boot, handed to the shard's tasks as
 //! `&'static` and dropped with the shard's context after them, its socket closed and its port free
 //! again) — and its state is a `RefCell` on the one shard thread that runs it (no lock, no `Arc`). Sessions live in a slab of at most `max_sessions` slots
-//! (the caller derives it — the fleet passes a **shared** pool of two slots per unit of its peer capacity,
-//! the live session a peer holds and the one its re-dial replaces it with; there is no per-peer quota: a
-//! slot is allotted to a *source* before its handshake authenticates it, and the certificate learned at
-//! establishment only replaces that peer's previous session — [`DemuxCounters::high_water`] against
-//! [`Demux::capacity`] reports the pool's use),
+//! (three per unit of peer capacity: one pending handshake, a live authenticated session and its
+//! replacement). Pending work cannot consume the authenticated reservation. Authentication checks the
+//! distinct-peer bound and the certificate's two-slot bound before replacing a connection. A closed
+//! endpoint retains its charge until drop. Addresses never identify peers: NAT and pod movement do not
+//! change the certificate's quota. See `docs/bugs/2026-09-17-authenticated-session-fairness.md`.
 //! named by generational [`Slot`]s so a stale handle is a typed miss. Each session's inbox holds as
 //! many datagrams as the socket's own kernel receive buffer would (`SO_RCVBUF` over the minimum datagram
 //! — the queue the per-peer socket it replaces had); past that a datagram is dropped and counted, and
@@ -51,6 +51,23 @@ use crate::endpoint::{
   is_short_header,
 };
 use crate::handshake::{HandshakeError, Identity, server_connection};
+
+/// Shape: one live authenticated session and the endpoint its replacement has closed but not yet dropped.
+pub const AUTHENTICATED_SESSIONS_PER_PEER: usize = 2;
+/// Derived: each unit of peer capacity reserves its authenticated pair plus one pending handshake.
+/// Both the transport and the fleet's serve-task budget use this total (§4.3, §4.10a).
+pub const SESSION_SLOTS_PER_PEER: usize = AUTHENTICATED_SESSIONS_PER_PEER + 1;
+
+/// Admission refused before a new authenticated connection could replace the current one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionRefusal {
+  /// The requested slab size cannot be represented by its generational handles, or is empty.
+  InvalidCapacity,
+  /// Every admitted identity's reservation is occupied.
+  PeerCapacity,
+  /// This certificate still owns both its live and replaced endpoints.
+  PeerSessions,
+}
 
 /// A demultiplexer's id in this shard's table (see the module doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,13 +128,17 @@ pub struct DemuxCounters {
   pub unknown_id: u64,
   /// Datagrams dropped because their session's inbox was full.
   pub inbox_full: u64,
-  /// Handshakes from new sources refused because every session slot was taken — **capacity** exhaustion
-  /// only; a session whose endpoint could not be built is [`setup_refused`](Self::setup_refused).
+  /// New sources refused because the pending-handshake reservation is full — capacity only.
+  /// Authenticated peer limits and endpoint setup faults have separate counters below.
   pub sessions_refused: u64,
   /// Handshakes from new sources refused because the session's endpoint could not be built (its TLS server
   /// state, `EndpointError::Handshake` — a misconfigured identity or roster), the slot given back. Counted
   /// apart from capacity so a setup fault never reads as a full pool, nor a full pool as a setup fault.
   pub setup_refused: u64,
+  /// Authenticated dials refused because this certificate still owns both generations.
+  pub peer_sessions_refused: u64,
+  /// Authenticated identities refused because the peer reservation is full.
+  pub peers_refused: u64,
   /// Sessions closed because their peer established a new one (a re-dial after a loss).
   pub replaced: u64,
   /// Server sessions opened for a new source.
@@ -134,6 +155,15 @@ struct Inbox {
   queue: VecDeque<Vec<u8>>,
   waker: Option<Waker>,
   closed: bool,
+  /// Set only after admission; remains charged after routing is closed, until endpoint drop.
+  certificate: Option<Vec<u8>>,
+  connection_id: Option<ConnectionId>,
+}
+
+/// A certificate's current route and all its still-owned endpoints, including replaced ones.
+struct PeerSessions {
+  current: Option<Slot>,
+  held: usize,
 }
 
 impl Inbox {
@@ -154,7 +184,8 @@ struct Inner {
   /// Every established session by its connection id.
   by_id: BTreeMap<ConnectionId, Slot>,
   /// Every established session by the peer certificate it authenticated with.
-  by_peer: BTreeMap<Vec<u8>, Slot>,
+  by_peer: BTreeMap<Vec<u8>, PeerSessions>,
+  pending_handshakes: usize,
   /// Server sessions opened for a new source, awaiting [`Demux::accept`].
   pending: VecDeque<Endpoint>,
   accept_waker: Option<Waker>,
@@ -176,11 +207,13 @@ pub struct Demux {
   inbox_datagrams: usize,
   /// The pool's size ([`Demux::capacity`]).
   capacity: usize,
+  /// Derived: one pending handshake and one authenticated reservation per enrolled peer-capacity unit.
+  peer_capacity: usize,
   inner: RefCell<Inner>,
 }
 
 impl Demux {
-  /// Takes ownership of `socket` and serves up to `max_sessions` peers on it, presenting `identity` and
+  /// Takes ownership of `socket` and serves up to `peer_capacity` identities on it, presenting `identity` and
   /// requiring each dialer's certificate among `allowed` (mutual TLS — the same trust a single-peer
   /// server enforces). Owned by the calling shard for its life (`ShardContext::keep`) and handed out
   /// as `&'static` to that shard's tasks; dropped — the socket closed, its port free again — when the
@@ -192,9 +225,12 @@ impl Demux {
     identity: &'static Identity,
     allowed: Vec<CertificateDer<'static>>,
     frame_cap: usize,
-    max_sessions: usize,
+    peer_capacity: usize,
   ) -> Result<&'static Demux, EndpointError> {
-    let max_sessions = max_sessions.max(1);
+    let max_sessions = peer_capacity
+      .checked_mul(SESSION_SLOTS_PER_PEER)
+      .filter(|slots| *slots != 0 && u32::try_from(*slots).is_ok())
+      .ok_or(EndpointError::Admission(SessionRefusal::InvalidCapacity))?;
     let mut slots = Vec::with_capacity(max_sessions);
     slots.resize_with(max_sessions, || None);
     let free: Vec<u32> = (0..max_sessions)
@@ -216,6 +252,7 @@ impl Demux {
       frame_cap,
       inbox_datagrams,
       capacity: max_sessions,
+      peer_capacity,
       inner: RefCell::new(Inner {
         slots,
         generations: vec![0; max_sessions],
@@ -223,6 +260,7 @@ impl Demux {
         by_source: BTreeMap::new(),
         by_id: BTreeMap::new(),
         by_peer: BTreeMap::new(),
+        pending_handshakes: 0,
         pending: VecDeque::new(),
         accept_waker: None,
         counters: DemuxCounters::default(),
@@ -282,8 +320,8 @@ impl Demux {
 
   /// The pool's size — the most sessions this demultiplexer holds at once, every one counted from its
   /// slot's allotment (before the handshake authenticates the source) to its endpoint's drop. The
-  /// caller's derivation (`max_sessions` at [`Demux::start`], at least one): the fleet sizes it from its
-  /// peer capacity, a shared pool, never a per-peer quota (the module doc).
+  /// caller's peer capacity times [`SESSION_SLOTS_PER_PEER`], shared by the separately bounded
+  /// pending and authenticated populations (the module doc).
   pub fn capacity(&self) -> usize {
     self.capacity
   }
@@ -333,13 +371,13 @@ impl Demux {
     let Some(inbox) = inner.inbox_mut(slot) else {
       return Poll::Ready(Err(EndpointError::Closed));
     };
+    if inbox.closed {
+      return Poll::Ready(Err(EndpointError::Closed));
+    }
     if let Some(datagram) = inbox.queue.pop_front() {
       let n = datagram.len().min(buf.len());
       buf[..n].copy_from_slice(&datagram[..n]);
       return Poll::Ready(Ok((n, inbox.peer)));
-    }
-    if inbox.closed {
-      return Poll::Ready(Err(EndpointError::Closed));
     }
     inbox.waker = Some(cx.waker().clone());
     Poll::Pending
@@ -348,19 +386,46 @@ impl Demux {
   /// Records an established session's connection id and peer certificate so 1-RTT packets route to it,
   /// and **replaces** the session previously established under the same certificate (the peer
   /// re-dialed after losing its session: the old one is closed, its serve loop ends).
-  pub(crate) fn bind(&self, slot: Slot, id: ConnectionId, peer: Option<Vec<u8>>) {
+  pub(crate) fn bind(
+    &self,
+    slot: Slot,
+    id: ConnectionId,
+    peer: Option<Vec<u8>>,
+  ) -> Result<(), EndpointError> {
     let mut inner = self.inner.borrow_mut();
-    if inner.inbox_mut(slot).is_none() {
-      return;
+    let inbox = inner.inbox_mut(slot).ok_or(EndpointError::Closed)?;
+    if inbox.closed {
+      return Err(EndpointError::Closed);
     }
+    if inbox.certificate.is_some() {
+      return Ok(());
+    }
+    let peer = peer.ok_or(EndpointError::NotReady)?;
+    if let Some(held) = inner.by_peer.get(&peer) {
+      if held.held >= AUTHENTICATED_SESSIONS_PER_PEER {
+        inner.counters.peer_sessions_refused += 1;
+        return Err(EndpointError::Admission(SessionRefusal::PeerSessions));
+      }
+    } else if inner.by_peer.len() >= self.peer_capacity {
+      inner.counters.peers_refused += 1;
+      return Err(EndpointError::Admission(SessionRefusal::PeerCapacity));
+    }
+    if let Some(inbox) = inner.inbox_mut(slot) {
+      inbox.certificate = Some(peer.clone());
+      inbox.connection_id = Some(id);
+    }
+    inner.pending_handshakes -= 1;
     inner.by_id.insert(id, slot);
-    if let Some(peer) = peer
-      && let Some(previous) = inner.by_peer.insert(peer, slot)
-      && previous != slot
-    {
+    let reservation = inner.by_peer.entry(peer).or_insert(PeerSessions {
+      current: None,
+      held: 0,
+    });
+    reservation.held += 1;
+    if let Some(previous) = reservation.current.replace(slot) {
       inner.counters.replaced += 1;
       inner.close(previous);
     }
+    Ok(())
   }
 
   /// Releases a session's slot (its endpoint dropped): every route to it is forgotten and the slot
@@ -371,11 +436,22 @@ impl Demux {
       return;
     }
     let index = usize::try_from(slot.index).unwrap_or(usize::MAX);
-    inner.by_source.retain(|_, s| *s != slot);
-    inner.by_id.retain(|_, s| *s != slot);
-    inner.by_peer.retain(|_, s| *s != slot);
-    if let Some(entry) = inner.slots.get_mut(index) {
-      *entry = None;
+    inner.close(slot);
+    let Some(inbox) = inner.slots.get_mut(index).and_then(Option::take) else {
+      return;
+    };
+    if let Some(certificate) = inbox.certificate {
+      if let Some(reservation) = inner.by_peer.get_mut(&certificate) {
+        reservation.held -= 1;
+        if reservation.current == Some(slot) {
+          reservation.current = None;
+        }
+        if reservation.held == 0 {
+          inner.by_peer.remove(&certificate);
+        }
+      }
+    } else {
+      inner.pending_handshakes -= 1;
     }
     if let Some(generation) = inner.generations.get_mut(index) {
       *generation = generation.wrapping_add(1);
@@ -421,7 +497,7 @@ impl Demux {
 /// Why a server session could not be opened for a new source ([`Inner::open`]); [`Demux::route`] counts
 /// each under its own category.
 enum OpenRefusal {
-  /// Every slot of the pool is held — a pending handshake and a replaced-but-undropped session included.
+  /// The pending-handshake reservation is held; authenticated slots cannot be borrowed for it.
   Exhausted,
   /// The session's endpoint could not be built (its TLS server state); the slot was given back.
   Setup(EndpointError),
@@ -453,11 +529,20 @@ impl Inner {
   /// Closes a session: its reader is woken with `Closed` and every route to it is forgotten (the slot
   /// itself is released when the endpoint drops).
   fn close(&mut self, slot: Slot) {
-    self.by_source.retain(|_, s| *s != slot);
-    self.by_id.retain(|_, s| *s != slot);
-    if let Some(inbox) = self.inbox_mut(slot) {
-      inbox.closed = true;
-      inbox.wake();
+    let Some(inbox) = self.inbox_mut(slot) else {
+      return;
+    };
+    inbox.closed = true;
+    inbox.queue.clear();
+    inbox.wake();
+    let (source, connection) = (inbox.peer, inbox.connection_id);
+    if self.by_source.get(&source) == Some(&slot) {
+      self.by_source.remove(&source);
+    }
+    if let Some(connection) = connection
+      && self.by_id.get(&connection) == Some(&slot)
+    {
+      self.by_id.remove(&connection);
     }
   }
 
@@ -465,6 +550,9 @@ impl Inner {
   /// the shared link, and queues it for `accept`. Refused typed when no slot is free, or when the
   /// endpoint could not be built (the slot given back) — the caller counts each under its own category.
   fn open(&mut self, demux: &'static Demux, from: SocketAddrV4) -> Result<Slot, OpenRefusal> {
+    if self.pending_handshakes >= demux.peer_capacity {
+      return Err(OpenRefusal::Exhausted);
+    }
     let index = self.free.pop().ok_or(OpenRefusal::Exhausted)?;
     let Some((at, generation)) = usize::try_from(index)
       .ok()
@@ -489,10 +577,13 @@ impl Inner {
         queue: VecDeque::new(),
         waker: None,
         closed: false,
+        certificate: None,
+        connection_id: None,
       });
     }
     self.by_source.insert(from, slot);
     self.pending.push_back(endpoint);
+    self.pending_handshakes += 1;
     self.counters.opened += 1;
     // The pool's high-water mark: every slot not on the free list is held, whatever its session's state.
     let held = u64::try_from(self.slots.len().saturating_sub(self.free.len())).unwrap_or(u64::MAX);

@@ -579,7 +579,9 @@ pub async fn probe_once(
 /// on a session that may still carry the next probe, a miss. Pure, so it is tested by itself.
 pub fn outcome_of_request_error(error: &EndpointError) -> ProbeOutcome {
   match error {
-    EndpointError::Closed | EndpointError::Io(_) => ProbeOutcome::Broken,
+    EndpointError::Closed | EndpointError::Io(_) | EndpointError::Admission(_) => {
+      ProbeOutcome::Broken
+    }
     EndpointError::Handshake(_)
     | EndpointError::Tls(_)
     | EndpointError::NotReady
