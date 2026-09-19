@@ -4257,6 +4257,101 @@ fn three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node() {
   );
 }
 
+/// Shape: how many of A's fleet-coordinator periods B must survive with A's direct path to it lost — well
+/// past the six backed-off misses (≈ 4 s at rest, some forty coordinator periods) a peer whose probes all go
+/// unanswered takes to be declared dead, so a direct-only implementation would have retired B inside it.
+const INDIRECT_HOLD_PERIODS: u64 = 100;
+
+/// AC (§4.8 "direct probe → k indirect proxies → SUSPECT → DEAD"; AUD-15): the live SWIM path runs the
+/// **indirect** stage. A cannot reach B directly (B leaves A's probes unanswered — an asymmetric path
+/// loss, injected at B's serve side so the transport is untouched), but A reaches C and C reaches B. A's
+/// direct probe times out, A asks C to reach B, C's probe of B is acknowledged and C carries that answer
+/// back, and A credits it before the suspicion verdict — so B stays a member of A's fleet across a hold far
+/// longer than a direct-only detector needs to retire a silent peer. Non-vacuous on both sides: A counted a
+/// relayed answer credited (`fleet.probe.indirect.acked`) and C counted itself relaying one
+/// (`fleet.probe.indirect.relayed`), so a direct-only implementation cannot pass by B happening to answer.
+/// Then B goes silent to C as well — both paths lost — and the fleet **retires** B: the relay stage does
+/// not weaken eventual detection, it only spares a peer one path can still reach.
+#[test]
+fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losing_both_paths_retires_it()
+ {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let (a, b, c) = (&daemons[0], &daemons[1], &daemons[2]);
+  let (host_a, host_b, host_c) = (hosts[0], hosts[1], hosts[2]);
+  let observed = [a, b, c];
+
+  // B stops answering A's direct probes — and only A's. C's probes of B, and everything relayed, still
+  // work.
+  b.inject_probe_deafness(&[host_a])
+    .expect("the asymmetric loss is installed at B");
+
+  // A's direct probes of B now time out; the relay stage must run — A asks C, C reaches B, A credits it.
+  let relayed = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    Ok(
+      refusal_count(a, "fleet.probe.indirect.acked")? >= 1
+        && refusal_count(c, "fleet.probe.indirect.relayed")? >= 1,
+    )
+  });
+
+  // Hold: across INDIRECT_HOLD_PERIODS of A's own periods B must stay a member of A's fleet. The wait ends
+  // early if A retires B (a failure the assertion below then names), else at the period budget.
+  let start = a.fleet_progress();
+  let held = poll_until(&observed, RETIREMENT_DEADLINE, || {
+    let still_member = a.fleet_members()?.contains(&host_b);
+    Ok(!still_member || a.fleet_progress() >= start + INDIRECT_HOLD_PERIODS)
+  });
+  let kept = a
+    .fleet_members()
+    .is_ok_and(|members| members.contains(&host_b));
+  let acked_on_a = refusal_count(a, "fleet.probe.indirect.acked").unwrap_or(0);
+  let relayed_by_c = refusal_count(c, "fleet.probe.indirect.relayed").unwrap_or(0);
+  let requested_by_a = refusal_count(a, "fleet.probe.indirect.requested").unwrap_or(0);
+
+  // Now B goes silent to C too: no path reaches it, and the fleet must retire it.
+  b.inject_probe_deafness(&[host_a, host_c])
+    .expect("the total loss is installed at B");
+  let survivors = [&daemons[0], &daemons[2]];
+  let retired = poll_until(&survivors, RETIREMENT_DEADLINE, || {
+    all_hold(survivors.iter().map(|survivor| {
+      survivor
+        .fleet_members()
+        .map(|members| !members.contains(&host_b))
+    }))
+  });
+
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    relayed,
+    "A's direct probes of B timed out and the indirect stage ran: A credited a relayed answer \
+     (acked={acked_on_a}, requested={requested_by_a}) and C relayed one (relayed={relayed_by_c})"
+  );
+  assert!(
+    held && kept,
+    "B stayed a member of A's fleet for {INDIRECT_HOLD_PERIODS} of A's periods with A's direct path lost \
+     (acked={acked_on_a}, relayed={relayed_by_c}, requested={requested_by_a})"
+  );
+  assert!(
+    retired,
+    "with both paths lost, A and C retired B (the relay stage does not weaken eventual detection)"
+  );
+}
+
 /// Polls until every daemon's **direct probe mesh** has formed — each node has a live probe session to
 /// each of its peers ([`Daemon::fleet_meshed`]) — or fails at the formation deadline naming who is still
 /// unmeshed. It waits for the real mesh, not the membership's optimistically seeded alive set (every

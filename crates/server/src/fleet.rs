@@ -80,12 +80,13 @@ use slates_archive::Archive;
 use slates_cluster::content::{
   CONTENT_PUT_STREAM, ContentMessage, fetch_content, is_content_stream, put_content,
 };
+use slates_cluster::coordinates::{CoordinateEngine, NetworkCoordinate};
 use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::fleet::{apply_peer_state, sync_peer};
 use slates_cluster::membership::{Liveness, MemberState};
 use slates_cluster::raft_wire::RaftMessage;
 use slates_cluster::root_group::root_representatives;
-use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once};
+use slates_cluster::swim::{Delivery, ProbeOutcome, SwimMessage, deliver_once, probe_once};
 use slates_cluster::timing::{ElectionTimer, ElectionTiming, PathRtt, RoundAnchors, round_budget};
 use slates_cluster::{
   ClusterError, CommitBudget, PROMOTE_STREAM, RECORD_STREAM, Stragglers, TimedReply, broadcast,
@@ -472,16 +473,37 @@ fn current_member(anchor: HostId) -> Option<HostId> {
 /// indirect proxies to gather more, so the window is not held open waiting for confirmations that cannot
 /// arrive.
 fn detector_timing(neighbourhood: usize) -> DetectorTiming {
-  // The bit-length of `n+1` (`⌊log2(n+1)⌋+1`): the word width less its leading zeros. `neighbourhood` is a
-  // `usize`, so its width is `usize::BITS`; `saturating_sub` keeps the degenerate `n+1 = 1` at one bit.
-  let bits = usize::BITS.saturating_sub(neighbourhood.saturating_add(1).leading_zeros());
   DetectorTiming {
     suspicion_periods: SUSPICION_PERIODS,
-    gossip_transmits: bits.saturating_mul(GOSSIP_PER_BIT).max(1),
+    gossip_transmits: neighbourhood_bits(neighbourhood)
+      .saturating_mul(GOSSIP_PER_BIT)
+      .max(1),
     health_max: LOCAL_HEALTH_CAP,
     suspicion_min: SUSPICION_PERIODS,
-    confirmations_expected: 1,
+    // The `K` of the Lifeguard confirmation curve is the number of relays asked (§4.8); with `suspicion_min
+    // == suspicion_periods` the curve is switched off, so this sets no timing today.
+    confirmations_expected: u32::try_from(indirect_fanout(neighbourhood)).unwrap_or(u32::MAX),
   }
+}
+
+/// The bit-length of `n+1` (`⌊log2(n+1)⌋+1`) for a neighbourhood of `n` peers: the word width less its
+/// leading zeros; `saturating_sub` keeps the degenerate `n+1 = 1` at one bit. The size term every
+/// `O(log n)` SWIM budget is derived from — the gossip rebroadcasts ([`GOSSIP_PER_BIT`]) and the indirect
+/// fan-out ([`indirect_fanout`]).
+fn neighbourhood_bits(neighbourhood: usize) -> u32 {
+  usize::BITS.saturating_sub(neighbourhood.saturating_add(1).leading_zeros())
+}
+
+/// Derived: `k`, how many relays a prober asks to reach a target its direct probe could not (§4.8 "direct
+/// probe → k indirect proxies → SUSPECT"; SWIM §4.1's `k` ping-requests) — the bit-length of `n+1`, the same
+/// size term the gossip budget uses, so the number of independent relay paths tried grows with the log of
+/// the neighbourhood as SWIM's constants do (n = 2 → 2 relays, n = 1000 → 10) and never exceeds the peers
+/// that exist: the caller takes at most the alive relays it holds sessions to. At least one, so a
+/// two-peer neighbourhood still tries its one relay.
+fn indirect_fanout(neighbourhood: usize) -> usize {
+  usize::try_from(neighbourhood_bits(neighbourhood))
+    .unwrap_or(usize::MAX)
+    .max(1)
 }
 
 /// The probe's timing law for one peer (§4.8 "Derived constants": "detection timeout for membership from
@@ -534,6 +556,146 @@ pub struct ProbeWindows {
   /// Largest measured quantum that actually lengthened a probe budget or sleep, nanoseconds.
   pub largest_quantum_ns: u64,
 }
+
+/// The indirect-probe stage's traffic between this node's per-peer probe tasks and its probe serve side
+/// (§4.8 "direct probe → k indirect proxies → SUSPECT"; SWIM §4.1; AUD-15). One detector runs per peer
+/// and each probe task owns the session to its peer, so the stage is a hand-off between tasks over these
+/// bounded queues rather than one detector's method calls:
+///
+/// - a **requester** whose direct probe of `target` timed out posts a ping-request for each chosen relay
+///   under `outgoing[relay]` and wakes the relay's probe task, which sends it on its session
+///   ([`carry_indirect_traffic`]);
+/// - the **relay**'s serve side, receiving a ping-request from an authenticated requester, posts the ask
+///   under `asks[target]` and wakes the target's probe task, which probes the target at once; an
+///   acknowledgement moves the ask to `results[requester]` and wakes the requester's probe task, which
+///   carries the answer back as an [`SwimMessage::IndirectAck`];
+/// - the **requester**'s serve side records a relayed answer under `acks[target]` and wakes the target's
+///   probe task, which credits it to its detector before the next tick ([`Detector::on_indirect_ack`]) —
+///   so the target is not suspected on a lost direct packet.
+///
+/// Every key is an authenticated member this node keeps direct contact with (a request naming another is
+/// refused and counted), so each map is bounded by the neighbourhood and the whole by its square; a newer
+/// request for the same pair replaces the older, so no queue grows with time. `coordinates` holds the
+/// coordinate each peer last announced, so relays are ranked nearest the target (the design's Vivaldi
+/// selection). `wakers` parks each probe task between probes ([`sleep_or_wake`]) so traffic is carried
+/// within a round trip rather than a period.
+#[derive(Default)]
+pub(crate) struct IndirectProbes {
+  /// Ping-requests this node has posted, by relay: the target and the requester's probe nonce.
+  pub outgoing: std::collections::BTreeMap<HostId, std::collections::BTreeMap<HostId, u64>>,
+  /// Asks this node received as a relay, by target: the requester and its probe nonce.
+  pub asks: std::collections::BTreeMap<HostId, std::collections::BTreeMap<HostId, u64>>,
+  /// Answers this node owes as a relay, by requester: the target reached and the requester's nonce.
+  pub results: std::collections::BTreeMap<HostId, std::collections::BTreeMap<HostId, u64>>,
+  /// Relayed acknowledgements of this node's own probes, by target: the latest nonce a relay reached it for.
+  pub acks: std::collections::BTreeMap<HostId, u64>,
+  /// The coordinate each peer last announced on an acknowledgement.
+  pub coordinates: std::collections::BTreeMap<HostId, NetworkCoordinate>,
+  /// The waker of each probe task parked between probes.
+  pub wakers: std::collections::BTreeMap<HostId, std::task::Waker>,
+}
+
+impl IndirectProbes {
+  /// Whether traffic awaits the probe task of `peer`: a ping-request to send it, an answer to carry to it,
+  /// an ask to probe it for, or a relayed acknowledgement to credit.
+  fn traffic_pending_for(&self, peer: HostId) -> bool {
+    self
+      .outgoing
+      .get(&peer)
+      .is_some_and(|queue| !queue.is_empty())
+      || self
+        .results
+        .get(&peer)
+        .is_some_and(|queue| !queue.is_empty())
+      || self.asks.get(&peer).is_some_and(|queue| !queue.is_empty())
+      || self.acks.contains_key(&peer)
+  }
+
+  /// Forgets everything about `peer` — its queues, its coordinate, its parked waker — when its probe task
+  /// releases it (retired): a request for a retired peer is refused thereafter, never queued.
+  fn forget(&mut self, peer: HostId) {
+    self.outgoing.remove(&peer);
+    self.asks.remove(&peer);
+    self.results.remove(&peer);
+    self.acks.remove(&peer);
+    self.coordinates.remove(&peer);
+    self.wakers.remove(&peer);
+  }
+}
+
+/// Wakes the probe task of `peer` if it is parked between probes ([`sleep_or_wake`]), so it carries the
+/// traffic just posted for it at once.
+fn wake_probe_task(state: &mut ShardState, peer: HostId) {
+  if let Some(waker) = state.indirect.wakers.remove(&peer) {
+    waker.wake();
+  }
+}
+
+/// The probe task's wait between probes of `peer`: the derived period, cut short the moment indirect-probe
+/// traffic is posted for this task ([`wake_probe_task`]), so a relay probes its target, and a requester
+/// credits a relayed answer, within a round trip of the request rather than up to a period later — the
+/// latency that keeps the indirect stage inside the suspicion window. Re-checks the queues before parking
+/// (a post that landed between the check and the park is not missed) and drops its waker on the way out.
+async fn sleep_or_wake(period_ns: u64, peer: HostId) {
+  let mut timer = std::pin::pin!(futures::sleep(period_ns));
+  std::future::poll_fn(|cx| {
+    if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
+      return std::task::Poll::Ready(());
+    }
+    let pending = state::with_state(|s| {
+      if s.indirect.traffic_pending_for(peer) {
+        return true;
+      }
+      s.indirect.wakers.insert(peer, cx.waker().clone());
+      false
+    })
+    .unwrap_or(true);
+    if pending {
+      return std::task::Poll::Ready(());
+    }
+    std::task::Poll::Pending
+  })
+  .await;
+  state::with_state(|s| {
+    s.indirect.wakers.remove(&peer);
+  });
+}
+
+/// The relays a requester asks to reach `target` (up to `fanout`, [`indirect_fanout`]): the alive peers it
+/// holds a formed probe session to, other than the target, ranked **nearest the target** in coordinate
+/// space when both coordinates are known (the design's Vivaldi selection — a near proxy is the likeliest
+/// to reach it, so a slow far peer is not mistaken for a failed near one; the same ordering
+/// [`Detector::request_indirect`] uses inside one detector), an unknown distance sorting last, ties in id
+/// order for determinism. Mirrors that pure method over the **shared** view, since each per-peer detector
+/// knows only its own peer.
+fn indirect_relays(state: &ShardState, target: HostId, fanout: usize) -> Vec<HostId> {
+  let alive = state.fleet.membership().alive();
+  let mut relays: Vec<HostId> = state
+    .formed_probe_peers
+    .iter()
+    .copied()
+    .filter(|peer| *peer != target && alive.contains(peer))
+    .collect();
+  let distance = |relay: HostId| -> Option<f64> {
+    let from = state.indirect.coordinates.get(&relay)?;
+    let to = state.indirect.coordinates.get(&target)?;
+    Some(CoordinateEngine::estimate_rtt(from, to))
+  };
+  relays.sort_by(|a, b| match (distance(*a), distance(*b)) {
+    (Some(x), Some(y)) => x.total_cmp(&y).then(a.0.cmp(&b.0)),
+    (Some(_), None) => std::cmp::Ordering::Less,
+    (None, Some(_)) => std::cmp::Ordering::Greater,
+    (None, None) => a.0.cmp(&b.0),
+  });
+  relays.truncate(fanout);
+  relays
+}
+
+/// Derived: how many of a requester's own probes a relayed acknowledgement may lag and still be credited —
+/// the suspicion window ([`SUSPICION_PERIODS`]): a relay's answer about a probe older than the window is
+/// no longer evidence against the suspicion the window would have declared, so it is dropped rather than
+/// credited to a later probe.
+const INDIRECT_ACK_LAG_PROBES: u64 = SUSPICION_PERIODS as u64;
 
 /// The control shard's scheduler quantum (§4.8 "SWIM period = max(k × RTT p99, scheduler quantum)"): the
 /// design's [`HEARTBEAT_NS`] floor raised to the shard's **measured** descheduling — how late its steps
@@ -1149,6 +1311,30 @@ async fn serve_peer_probes(
   loop {
     let served = endpoint
       .serve_once(|_stream, request| match SwimMessage::decode(&request) {
+        // A ping-request announces no boot_nonce (it asks about a third party), so it is validated by the
+        // authenticated session it arrived on instead: its sender must be the member the session's anchor
+        // currently announces, and its target a member this node keeps direct contact with. Accepted, the
+        // ask is posted for the target's probe task — woken to probe at once — and the exchange is answered
+        // empty; the answer itself travels back on this node's own probe session to the requester.
+        Ok(SwimMessage::PingReq {
+          from,
+          target,
+          nonce,
+          gossip,
+        }) => {
+          state::with_state(|state| {
+            receive_ping_request(
+              state,
+              &mut detector,
+              rostered_anchor,
+              from,
+              target,
+              nonce,
+              &gossip,
+            );
+          });
+          Vec::new()
+        }
         Ok(message) => {
           let Some(gossip) = state::with_state(|state| {
             let anchor = rostered_anchor?;
@@ -1157,9 +1343,21 @@ async fn serve_peer_probes(
             if learn_member(state, anchor, boot_nonce, peer) == LearnedOutcome::Forged {
               return None;
             }
+            // Test support: a peer this node is deaf to gets no acknowledgement of its **direct** probe —
+            // the asymmetric path loss the indirect-probe regression imposes. Its gossip is not folded
+            // either (the packet is treated as lost), and the exchange is answered empty, which the prober
+            // reads as a timed-out probe.
+            if matches!(message, SwimMessage::Ping { .. }) && state.probe_deaf_to.contains(&peer) {
+              return None;
+            }
             receive_probe_gossip(state, &mut detector, peer, message.gossip());
             if let Some(coordinate) = message.coordinate() {
               detector.learn_coordinate(peer, coordinate.clone());
+            }
+            // A relay's answer for one of this node's own probes: recorded for the target's probe task,
+            // which is woken to credit it before its next tick.
+            if let SwimMessage::IndirectAck { target, nonce, .. } = &message {
+              receive_indirect_ack(state, *target, *nonce);
             }
             let belief = state.fleet.membership().state(peer);
             Some(outgoing_probe_gossip(state, peer, belief, fanout))
@@ -1184,6 +1382,56 @@ async fn serve_peer_probes(
       return;
     }
   }
+}
+
+/// A ping-request received on an authenticated probe session (this node is the relay): accepted when its
+/// sender `from` is the member the session's `anchor` currently announces (the requester's identity is the
+/// session's, since the request carries no boot_nonce) and its `target` is a member this node keeps direct
+/// contact with — the bound on the ask queue, so no authenticated peer can name arbitrary targets into it.
+/// Accepted, the requester's gossip is folded (an authenticated sender), the ask is posted under the
+/// target and the target's probe task is woken to probe it now; an acknowledgement answers every ask for
+/// that target ([`answer_relay_asks`]). Refused and counted otherwise.
+fn receive_ping_request(
+  state: &mut ShardState,
+  detector: &mut Detector,
+  anchor: Option<HostId>,
+  from: HostId,
+  target: HostId,
+  nonce: u64,
+  gossip: &[(HostId, MemberState)],
+) {
+  let requester = anchor.and_then(|anchor| {
+    state
+      .learned_members
+      .get(&anchor)
+      .map(|learned| learned.host)
+  });
+  if requester != Some(from) || !keeps_direct_contact_with(state, target) || target == from {
+    count_refusal_in(state, PROBE_INDIRECT_REFUSED);
+    return;
+  }
+  receive_probe_gossip(state, detector, from, gossip);
+  state
+    .indirect
+    .asks
+    .entry(target)
+    .or_default()
+    .insert(from, nonce);
+  wake_probe_task(state, target);
+}
+
+/// A relay's answer received on its authenticated probe session (this node is the requester, its sender
+/// already validated by [`learn_member`]): recorded under the `target` it reached — a peer this node
+/// probes, else refused and counted — with the requester's own probe `nonce` echoed, and that target's
+/// probe task woken to credit it before its next tick ([`probe_and_apply`]).
+fn receive_indirect_ack(state: &mut ShardState, target: HostId, nonce: u64) {
+  if !keeps_direct_contact_with(state, target) {
+    count_refusal_in(state, PROBE_INDIRECT_REFUSED);
+    return;
+  }
+  let latest = state.indirect.acks.entry(target).or_insert(nonce);
+  *latest = (*latest).max(nonce);
+  wake_probe_task(state, target);
 }
 
 /// At the top of a probe cycle, decides whether to probe this peer or idle. Returns `false` when the peer is
@@ -1274,6 +1522,7 @@ async fn probe_and_apply(
   {
     detector.apply(peer.host, belief);
   }
+  credit_relayed_answer(detector, peer.host, nonce);
   detector.tick();
   let ping = SwimMessage::Ping {
     from: local,
@@ -1317,6 +1566,11 @@ async fn probe_and_apply(
         let _ = state::with_state(|s| {
           sample_path(s, peer.host, rtt_ns);
           s.probe_windows.acknowledged = s.probe_windows.acknowledged.saturating_add(1);
+          // The peer's announced coordinate, shared so relays can be ranked nearest a target.
+          s.indirect.coordinates.insert(peer.host, coordinate.clone());
+          // This node, as a relay: every requester that asked it to reach this peer is answered — the ask
+          // moves to the requester's queue and the requester's probe task is woken to carry it back.
+          answer_relay_asks(s, peer.host);
         });
         #[allow(clippy::cast_precision_loss)]
         detector.observe_rtt(peer.host, rtt_ns as f64);
@@ -1327,6 +1581,7 @@ async fn probe_and_apply(
     }
     Ok((returned, ProbeOutcome::TimedOut)) => {
       timing.missed();
+      begin_indirect_stage(peer.host, nonce);
       returned
     }
     Ok((_, ProbeOutcome::Broken)) => {
@@ -1340,6 +1595,164 @@ async fn probe_and_apply(
     }
     Err(_) => None,
   }
+}
+
+/// One probe cycle over an established session: the indirect stage's traffic for this peer first — the
+/// ping-requests this node asks it to relay, the answers this node owes it ([`carry_indirect_traffic`]) —
+/// then this node's own probe of it ([`probe_and_apply`]). Returns the session to carry forward, `None`
+/// when either released it.
+#[allow(clippy::too_many_arguments)]
+async fn probe_cycle(
+  detector: &mut Detector,
+  session: Option<Endpoint>,
+  local: HostId,
+  local_boot_nonce: u64,
+  peer: &ProbedPeer,
+  fanout: usize,
+  nonce: u64,
+  timing: &mut ProbeTiming,
+) -> Option<Endpoint> {
+  let session =
+    carry_indirect_traffic(session, local, local_boot_nonce, peer, fanout, timing).await;
+  probe_and_apply(
+    detector,
+    session,
+    local,
+    local_boot_nonce,
+    peer,
+    fanout,
+    nonce,
+    timing,
+  )
+  .await
+}
+
+/// Credits a relay's answer about this node's probe of `peer_host` that last went unanswered, **before**
+/// the tick resolves that probe (§4.8 "direct probe → k indirect proxies → SUSPECT"): the tick then counts
+/// it answered, so the peer is not suspected on a lost direct packet. `nonce` is the probe about to be
+/// sent; an answer about a probe older than the suspicion window ([`INDIRECT_ACK_LAG_PROBES`]) is stale
+/// and dropped. Counted when credited (`fleet.probe.indirect.acked`).
+fn credit_relayed_answer(detector: &mut Detector, peer_host: HostId, nonce: u64) {
+  let relayed = state::with_state(|state| state.indirect.acks.remove(&peer_host)).flatten();
+  if relayed.is_some_and(|relayed| nonce.saturating_sub(relayed) <= INDIRECT_ACK_LAG_PROBES) {
+    detector.on_indirect_ack(peer_host);
+    count_refusal(PROBE_INDIRECT_ACKED);
+  }
+}
+
+/// The direct probe of `peer_host` (nonce `nonce`) went unanswered: begins the indirect stage — asks up to
+/// `k` relays nearest the peer ([`indirect_relays`], [`indirect_fanout`]) to reach it on this node's
+/// behalf before the next tick would suspect it. The ping-requests are posted for the relays' probe tasks
+/// (each owns the session to its relay) and those tasks are woken to send them now. Counted per relay
+/// asked (`fleet.probe.indirect.requested`).
+fn begin_indirect_stage(peer_host: HostId, nonce: u64) {
+  let _ = state::with_state(|state| {
+    let fanout = indirect_fanout(state.fleet.members().len());
+    for relay in indirect_relays(state, peer_host, fanout) {
+      state
+        .indirect
+        .outgoing
+        .entry(relay)
+        .or_default()
+        .insert(peer_host, nonce);
+      count_refusal_in(state, PROBE_INDIRECT_REQUESTED);
+      wake_probe_task(state, relay);
+    }
+  });
+}
+
+/// This node, as a relay, has just heard `target` acknowledge its probe: every requester that asked it to
+/// reach `target` gets its answer posted (`results[requester]`, the requester's own probe nonce echoed) and
+/// its probe task woken to carry it back. Counted per answer (`fleet.probe.indirect.relayed`).
+fn answer_relay_asks(state: &mut ShardState, target: HostId) {
+  let Some(asks) = state.indirect.asks.remove(&target) else {
+    return;
+  };
+  for (requester, nonce) in asks {
+    state
+      .indirect
+      .results
+      .entry(requester)
+      .or_default()
+      .insert(target, nonce);
+    count_refusal_in(state, PROBE_INDIRECT_RELAYED);
+    wake_probe_task(state, requester);
+  }
+}
+
+/// Counts one refusal or event of `kind` on a shard state already borrowed (the in-closure form of
+/// [`count_refusal`], which borrows the state itself).
+fn count_refusal_in(state: &mut ShardState, kind: &'static str) {
+  let count = state.refusals.entry(kind).or_insert(0);
+  *count = count.saturating_add(1);
+}
+
+/// Carries this node's pending indirect-probe traffic for `peer` over the probe session its task owns,
+/// before that task's own probe: the ping-requests this node posted for `peer` to relay (this node is the
+/// requester, `peer` the relay), and the answers this node owes `peer` as a relay (`peer` is the
+/// requester). Each is one bounded exchange under the probe budget ([`deliver_once`]); an undelivered one
+/// is counted and dropped — the requester's next direct miss asks again — and a terminal fault releases the
+/// session exactly as a probe's would. Returns the session for the probe that follows.
+async fn carry_indirect_traffic(
+  session: Option<Endpoint>,
+  local: HostId,
+  local_boot_nonce: u64,
+  peer: &ProbedPeer,
+  fanout: usize,
+  timing: &ProbeTiming,
+) -> Option<Endpoint> {
+  let mut open = session?;
+  let (requests, answers) = state::with_state(|s| {
+    (
+      s.indirect.outgoing.remove(&peer.host).unwrap_or_default(),
+      s.indirect.results.remove(&peer.host).unwrap_or_default(),
+    )
+  })
+  .unwrap_or_default();
+  if requests.is_empty() && answers.is_empty() {
+    return Some(open);
+  }
+  let budget = timing.budget(path_tail_ns(peer.host));
+  let gossip = || {
+    state::with_state(|s| {
+      let belief = s.fleet.membership().state(peer.host);
+      outgoing_probe_gossip(s, peer.host, belief, fanout)
+    })
+    .unwrap_or_default()
+  };
+  let mut messages: Vec<SwimMessage> = Vec::with_capacity(requests.len() + answers.len());
+  for (target, nonce) in requests {
+    messages.push(SwimMessage::PingReq {
+      from: local,
+      target,
+      nonce,
+      gossip: gossip(),
+    });
+  }
+  for (target, nonce) in answers {
+    messages.push(SwimMessage::IndirectAck {
+      from: local,
+      target,
+      nonce,
+      boot_nonce: local_boot_nonce,
+      gossip: gossip(),
+    });
+  }
+  for message in &messages {
+    let (returned, delivery) = deliver_once(open, message, budget).await;
+    match delivery {
+      Delivery::Delivered => {}
+      Delivery::Undelivered => {
+        count_refusal(PROBE_INDIRECT_UNDELIVERED);
+      }
+      Delivery::Broken => {
+        count_refusal(PROBE_BROKEN);
+        return None;
+      }
+    }
+    open = returned?;
+  }
+  Some(open)
 }
 
 /// Applies authenticated gossip to the shared failure view (§4.8). Third-member reports
@@ -1540,7 +1953,7 @@ async fn probe_peer(
     }
     if session.is_some() {
       probe_nonce += 1;
-      session = probe_and_apply(
+      session = probe_cycle(
         &mut detector,
         session.take(),
         local,
@@ -1573,8 +1986,10 @@ async fn probe_peer(
       // returns holds one idle serve slot per plane, bounded by the roster (banned item 8 holds).
       release_probe_session(peer.host, &mut session, &mut client, &mut recorded_mesh);
     }
-    // The next probe waits one beat at full health, more as this node's own probes fail (Lifeguard).
-    futures::sleep(probe_period_ns(detector.health_multiplier())).await;
+    // The next probe waits one beat at full health, more as this node's own probes fail (Lifeguard) — cut
+    // short the moment indirect-probe traffic is posted for this task, so a relay probes its target, and a
+    // requester credits a relayed answer, within a round trip rather than a period.
+    sleep_or_wake(probe_period_ns(detector.health_multiplier()), peer.host).await;
   }
 }
 
@@ -1593,7 +2008,12 @@ fn release_probe_session(
   client: &mut Option<Endpoint>,
   recorded_mesh: &mut bool,
 ) {
-  state::with_state(|s| s.formed_probe_peers.remove(&peer_host));
+  state::with_state(|s| {
+    s.formed_probe_peers.remove(&peer_host);
+    // A retired peer relays nothing and is asked about nothing: its indirect-probe queues are dropped, so a
+    // request naming it is refused thereafter rather than queued for a task that idles.
+    s.indirect.forget(peer_host);
+  });
   *session = None;
   *recorded_mesh = false;
   if client.take().is_some() {
@@ -2877,6 +3297,21 @@ const SERVE_REFUSED: &str = "fleet.serve";
 /// A probe session released on a terminal transport fault (`ProbeOutcome::Broken`): the next period
 /// dials afresh.
 const PROBE_BROKEN: &str = "fleet.probe.broken";
+/// A ping-request posted for a relay after a direct probe timed out (one per relay asked) — the indirect
+/// stage began (§4.8; AUD-15).
+const PROBE_INDIRECT_REQUESTED: &str = "fleet.probe.indirect.requested";
+/// This node, as a relay, reached a target on a requester's behalf and posted the answer — the relay path
+/// carried a real acknowledgement (the non-vacuity the indirect-probe regression asserts on the relay).
+const PROBE_INDIRECT_RELAYED: &str = "fleet.probe.indirect.relayed";
+/// A relayed acknowledgement was credited to this node's own probe of the target before the suspicion
+/// verdict — a lost direct packet did not suspect a live peer (the non-vacuity asserted on the requester).
+const PROBE_INDIRECT_ACKED: &str = "fleet.probe.indirect.acked";
+/// An indirect-probe message refused at the serve side: a ping-request whose sender is not the session's
+/// learned member, or one naming a target this node keeps no direct contact with (the bound on the
+/// queues), or a relayed acknowledgement for a peer this node does not probe.
+const PROBE_INDIRECT_REFUSED: &str = "fleet.probe.indirect.refused";
+/// An indirect-probe message that did not reach its peer within the probe budget (the session kept).
+const PROBE_INDIRECT_UNDELIVERED: &str = "fleet.probe.indirect.undelivered";
 /// A dial still in its handshake dropped at its peer's retirement, so the resume dials afresh at the
 /// peer's current address.
 const DIAL_STALE_DROPPED: &str = "fleet.dial.stale_dropped";

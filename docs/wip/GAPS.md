@@ -1232,6 +1232,12 @@ retention: AUD-11–14/-16 (GAP-A9-14/-1/-7); SWIM indirect probes, call cancell
 handshake bounds: AUD-15/-17/-18 (GAP-A9-7/-4/-11). These are source findings and proposed
 regression scenarios at the audit baseline.
 
+**Implementation follow-up (2026-09-18, AUD-15 closed):** the live SWIM path now runs the indirect
+stage — a timed-out direct probe asks up to `k` (derived) relays nearest the target, the relay's answer
+returns as an `IndirectAck` and is credited before the suspicion tick; bounded per-member queues,
+probe tasks woken on traffic. By-use regression with a negative control (relays disabled → fails with
+`acked=0`): `docs/bugs/2026-09-18-swim-indirect-probes-not-wired.md`.
+
 **Implementation follow-up (2026-09-14):** AUD-03/-04/-05/-09/-10/-12/-13/-17/-18 have corrections
 in this change: bounded incremental RPC framing and handshake confirmation, deadline-bounded
 NFS routing and complete root gathers, publication coverage required before stability, fresh Raft read

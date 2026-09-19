@@ -1348,6 +1348,20 @@ impl Daemon {
     })
   }
 
+  /// Test support: makes this node's probe serve side leave the **direct** probes of `peers` unanswered
+  /// (an empty reply, which the prober reads as a timed-out probe), so a prober among them cannot reach this
+  /// node directly while every other peer still can — the asymmetric path loss the indirect-probe stage
+  /// exists for (§4.8 "direct probe → k indirect proxies"; AUD-15). Replaces any earlier set; an empty
+  /// `peers` restores full service. Relayed traffic is unaffected: a relay's own probe of this node, and
+  /// the ping-requests and indirect acknowledgements it carries, are answered as usual. Delivered like
+  /// [`Self::inject_discovery_fault`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_probe_deafness(&self, peers: &[slates_db::HostId]) -> Result<(), ObserveError> {
+    let deaf_to: std::collections::BTreeSet<slates_db::HostId> = peers.iter().copied().collect();
+    self.observe(self.shards.first().copied(), move |s| {
+      s.probe_deaf_to = deaf_to;
+    })
+  }
+
   /// This node's record links (§4.8, `ShardState::record_sessions`): each peer with an entry, and whether
   /// its session is out on a borrow at the moment of the read — a dispatch's, or the link task's own
   /// discovery exchange. A test reads it to prove an exchange is pending on a link before interrupting it,
@@ -1793,6 +1807,8 @@ fn init_shard(
     discovery_withhold_replies: false,
     peer_paths: std::collections::BTreeMap::new(),
     probe_windows: crate::fleet::ProbeWindows::default(),
+    indirect: crate::fleet::IndirectProbes::default(),
+    probe_deaf_to: std::collections::BTreeSet::new(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
     council,

@@ -66,13 +66,38 @@ pub enum SwimMessage {
     /// The acknowledging node's Vivaldi coordinate.
     coordinate: NetworkCoordinate,
   },
-  /// A request from `from` to probe `target` on its behalf (the indirect probe).
+  /// A request from `from` to probe `target` on its behalf (the indirect probe, SWIM §4.1: the `k`
+  /// ping-requests a prober sends when its direct ping goes unanswered, so a lost packet is retried through
+  /// relays before the target is suspected).
   PingReq {
     /// The requesting node.
     from: HostId,
     /// The node to probe indirectly.
     target: HostId,
+    /// The requester's probe nonce for the direct ping that went unanswered: the relay echoes it in its
+    /// [`SwimMessage::IndirectAck`], so the requester credits the relayed answer to *that* probe (and
+    /// rejects one echoing a probe older than its suspicion window), exactly as a direct acknowledgement
+    /// is correlated by nonce.
+    nonce: u64,
     /// The membership updates piggybacked on this request.
+    gossip: Vec<(HostId, MemberState)>,
+  },
+  /// A relay's answer to a [`SwimMessage::PingReq`]: `from` (the relay) reached `target` on the
+  /// requester's behalf — its own probe of the target was acknowledged — and reports that back, echoing the
+  /// requester's probe `nonce`. Carried on the relay's own probe session to the requester (the relay's
+  /// serve side cannot answer the request inline: the relay's probe of the target is driven by the task
+  /// that owns that target's session), so it announces the relay's `boot_nonce` like any message the relay
+  /// originates, and the requester validates the relay's identity before crediting it.
+  IndirectAck {
+    /// The relay that reached the target.
+    from: HostId,
+    /// The member the relay reached.
+    target: HostId,
+    /// The requester's probe nonce the relay was asked about.
+    nonce: u64,
+    /// The relay's daemon boot_nonce — its own identity announcement.
+    boot_nonce: u64,
+    /// The membership updates piggybacked on this answer.
     gossip: Vec<(HostId, MemberState)>,
   },
 }
@@ -104,6 +129,7 @@ pub enum SwimWireError {
 const TAG_PING: u8 = 1;
 const TAG_ACK: u8 = 2;
 const TAG_PING_REQ: u8 = 3;
+const TAG_INDIRECT_ACK: u8 = 4;
 
 /// Format: a liveness is one byte in a gossip entry; these are its values (the detector's three states).
 const LIVENESS_ALIVE: u8 = 0;
@@ -121,7 +147,8 @@ impl SwimMessage {
     match self {
       SwimMessage::Ping { from, .. }
       | SwimMessage::Ack { from, .. }
-      | SwimMessage::PingReq { from, .. } => *from,
+      | SwimMessage::PingReq { from, .. }
+      | SwimMessage::IndirectAck { from, .. } => *from,
     }
   }
 
@@ -130,7 +157,8 @@ impl SwimMessage {
     match self {
       SwimMessage::Ping { gossip, .. }
       | SwimMessage::Ack { gossip, .. }
-      | SwimMessage::PingReq { gossip, .. } => gossip,
+      | SwimMessage::PingReq { gossip, .. }
+      | SwimMessage::IndirectAck { gossip, .. } => gossip,
     }
   }
 
@@ -138,30 +166,47 @@ impl SwimMessage {
   pub fn coordinate(&self) -> Option<&NetworkCoordinate> {
     match self {
       SwimMessage::Ack { coordinate, .. } => Some(coordinate),
-      SwimMessage::Ping { .. } | SwimMessage::PingReq { .. } => None,
+      SwimMessage::Ping { .. } | SwimMessage::PingReq { .. } | SwimMessage::IndirectAck { .. } => {
+        None
+      }
     }
   }
 
-  /// The probe token: a [`Ping`](SwimMessage::Ping)'s nonce, or the value an [`Ack`](SwimMessage::Ack)
-  /// echoes back; `None` for a ping-request (which carries no probe token — its target's acknowledgement
-  /// is correlated by the relay's own ping). The prober compares its ping's nonce to the acknowledgement's
-  /// to reject a stale reply.
+  /// The probe token: a [`Ping`](SwimMessage::Ping)'s nonce, the value an [`Ack`](SwimMessage::Ack)
+  /// echoes back, the requester's probe nonce a [`PingReq`](SwimMessage::PingReq) asks about, or the one
+  /// an [`IndirectAck`](SwimMessage::IndirectAck) echoes. The prober compares its ping's nonce to the
+  /// acknowledgement's — direct or relayed — to reject a stale reply.
   pub fn nonce(&self) -> Option<u64> {
     match self {
-      SwimMessage::Ping { nonce, .. } | SwimMessage::Ack { nonce, .. } => Some(*nonce),
+      SwimMessage::Ping { nonce, .. }
+      | SwimMessage::Ack { nonce, .. }
+      | SwimMessage::PingReq { nonce, .. }
+      | SwimMessage::IndirectAck { nonce, .. } => Some(*nonce),
+    }
+  }
+
+  /// The sender's announced daemon boot_nonce: a [`Ping`](SwimMessage::Ping)'s, an
+  /// [`Ack`](SwimMessage::Ack)'s or an [`IndirectAck`](SwimMessage::IndirectAck)'s (each is the sender's
+  /// own announcement); `None` for a ping-request, which asks about a third party and announces nothing
+  /// about its sender's identity (the requester is identified by the authenticated session it arrives on).
+  pub fn boot_nonce(&self) -> Option<u64> {
+    match self {
+      SwimMessage::Ping { boot_nonce, .. }
+      | SwimMessage::Ack { boot_nonce, .. }
+      | SwimMessage::IndirectAck { boot_nonce, .. } => Some(*boot_nonce),
       SwimMessage::PingReq { .. } => None,
     }
   }
 
-  /// The sender's announced daemon boot_nonce: a [`Ping`](SwimMessage::Ping)'s or an
-  /// [`Ack`](SwimMessage::Ack)'s (each is the sender's own announcement); `None` for a ping-request, which
-  /// asks about a third party and announces nothing about its sender's identity.
-  pub fn boot_nonce(&self) -> Option<u64> {
+  /// The third member an indirect exchange is about: a [`PingReq`](SwimMessage::PingReq)'s target, or the
+  /// member an [`IndirectAck`](SwimMessage::IndirectAck) reports reached; `None` for a direct probe or its
+  /// acknowledgement.
+  pub fn target(&self) -> Option<HostId> {
     match self {
-      SwimMessage::Ping { boot_nonce, .. } | SwimMessage::Ack { boot_nonce, .. } => {
-        Some(*boot_nonce)
+      SwimMessage::PingReq { target, .. } | SwimMessage::IndirectAck { target, .. } => {
+        Some(*target)
       }
-      SwimMessage::PingReq { .. } => None,
+      SwimMessage::Ping { .. } | SwimMessage::Ack { .. } => None,
     }
   }
 
@@ -200,11 +245,27 @@ impl SwimMessage {
       SwimMessage::PingReq {
         from,
         target,
+        nonce,
         gossip,
       } => {
         out.push(TAG_PING_REQ);
         out.extend_from_slice(&from.0.to_le_bytes());
         out.extend_from_slice(&target.0.to_le_bytes());
+        out.extend_from_slice(&nonce.to_le_bytes());
+        encode_gossip(&mut out, gossip);
+      }
+      SwimMessage::IndirectAck {
+        from,
+        target,
+        nonce,
+        boot_nonce,
+        gossip,
+      } => {
+        out.push(TAG_INDIRECT_ACK);
+        out.extend_from_slice(&from.0.to_le_bytes());
+        out.extend_from_slice(&target.0.to_le_bytes());
+        out.extend_from_slice(&nonce.to_le_bytes());
+        out.extend_from_slice(&boot_nonce.to_le_bytes());
         encode_gossip(&mut out, gossip);
       }
     }
@@ -247,6 +308,7 @@ impl SwimMessage {
       TAG_PING_REQ => {
         let (from, rest) = take_host(rest)?;
         let (target, rest) = take_host(rest)?;
+        let (nonce, rest) = take_word(rest)?;
         let (gossip, leftover) = decode_gossip(rest)?;
         if !leftover.is_empty() {
           return Err(SwimWireError::GossipLengthMismatch);
@@ -254,6 +316,24 @@ impl SwimMessage {
         Ok(SwimMessage::PingReq {
           from,
           target,
+          nonce,
+          gossip,
+        })
+      }
+      TAG_INDIRECT_ACK => {
+        let (from, rest) = take_host(rest)?;
+        let (target, rest) = take_host(rest)?;
+        let (nonce, rest) = take_word(rest)?;
+        let (boot_nonce, rest) = take_word(rest)?;
+        let (gossip, leftover) = decode_gossip(rest)?;
+        if !leftover.is_empty() {
+          return Err(SwimWireError::GossipLengthMismatch);
+        }
+        Ok(SwimMessage::IndirectAck {
+          from,
+          target,
+          nonce,
+          boot_nonce,
           gossip,
         })
       }
@@ -517,32 +597,7 @@ pub async fn probe_once(
   let bytes = probe.encode();
   let expected = probe.nonce();
   let started_ns = now_ns();
-
-  // Drive the request inline, racing it against the deadline. On the deadline the request future is dropped
-  // (releasing the borrow of `endpoint`); the endpoint is still owned here, so the exchange is abandoned on
-  // it and it is returned for reuse — the reliable exchange is not self-bounded, so this deadline is the
-  // caller-owned bound it relies on.
-  let received = {
-    let mut request = std::pin::pin!(endpoint.request(PROBE_STREAM, &bytes));
-    let mut deadline = std::pin::pin!(sleep(budget.deadline_ns));
-    std::future::poll_fn(|cx| {
-      // Prefer a delivered reply over the deadline when both are ready, so a probe that just made it is not
-      // traded for a timeout.
-      if let std::task::Poll::Ready(result) = std::future::Future::poll(request.as_mut(), cx) {
-        return std::task::Poll::Ready(Some(result));
-      }
-      if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
-        return std::task::Poll::Ready(None);
-      }
-      std::task::Poll::Pending
-    })
-    .await
-  };
-  if received.is_none() {
-    // The deadline won mid-exchange: abandon it, so nothing of it rides the next probe's flush and its late
-    // reply, if any, is discarded below the next exchange's floor.
-    endpoint.abandon_exchange();
-  }
+  let received = race_reply(&mut endpoint, &bytes, budget).await;
 
   // A reply counts only if it decodes as an acknowledgement echoing this probe's nonce; a wrong-nonce
   // reply, a protocol fault on one packet, or the deadline (`None`) is a probe failure keeping the
@@ -571,6 +626,73 @@ pub async fn probe_once(
     return Ok((None, outcome));
   }
   Ok((Some(endpoint), outcome))
+}
+
+/// One request on the probe stream raced against the caller's deadline: `Some(result)` when the exchange
+/// completed (a reply, or a transport error), `None` when the deadline won. Driven inline; on the deadline
+/// the request future is dropped (releasing the borrow of `endpoint`) and the exchange is **abandoned** on
+/// the still-owned endpoint, so nothing of it rides the next exchange's flush and its late reply, if any,
+/// is discarded below the next exchange's floor — the reliable exchange is not self-bounded, so this
+/// deadline is the caller-owned bound it relies on. A delivered reply is preferred over the deadline when
+/// both are ready, so an exchange that just made it is not traded for a timeout. Shared by the direct probe
+/// ([`probe_once`]) and the indirect-probe traffic ([`deliver_once`]).
+async fn race_reply(
+  endpoint: &mut Endpoint,
+  bytes: &[u8],
+  budget: CommitBudget,
+) -> Option<Result<Vec<u8>, EndpointError>> {
+  let received = {
+    let mut request = std::pin::pin!(endpoint.request(PROBE_STREAM, bytes));
+    let mut deadline = std::pin::pin!(sleep(budget.deadline_ns));
+    std::future::poll_fn(|cx| {
+      if let std::task::Poll::Ready(result) = std::future::Future::poll(request.as_mut(), cx) {
+        return std::task::Poll::Ready(Some(result));
+      }
+      if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+        return std::task::Poll::Ready(None);
+      }
+      std::task::Poll::Pending
+    })
+    .await
+  };
+  if received.is_none() {
+    endpoint.abandon_exchange();
+  }
+  received
+}
+
+/// How one indirect-probe message fared over a probe session ([`deliver_once`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delivery {
+  /// The peer received it and answered the exchange (with anything: the message needs no reply body).
+  Delivered,
+  /// The exchange did not complete within the budget, or one bad packet ended it; the session is kept.
+  Undelivered,
+  /// The session cannot carry another exchange; released.
+  Broken,
+}
+
+/// Sends one indirect-probe message — a [`SwimMessage::PingReq`] to a relay, or a
+/// [`SwimMessage::IndirectAck`] back to the requester — over an existing probe `endpoint`, **bounded** by the
+/// caller's `budget` exactly as a direct probe is ([`probe_once`]; the same race, the same abandonment on
+/// the deadline), returning the endpoint for reuse whatever the outcome short of a terminal fault. The
+/// message needs no reply body (the peer's serve side records it and answers the exchange with whatever it
+/// answers — an acknowledgement or nothing), so any completed exchange is [`Delivery::Delivered`]; the
+/// peer's *answer* to what was asked travels back on its own probe session, not on this exchange.
+pub async fn deliver_once(
+  mut endpoint: Endpoint,
+  message: &SwimMessage,
+  budget: CommitBudget,
+) -> (Option<Endpoint>, Delivery) {
+  let bytes = message.encode();
+  match race_reply(&mut endpoint, &bytes, budget).await {
+    Some(Ok(_)) => (Some(endpoint), Delivery::Delivered),
+    Some(Err(error)) => match outcome_of_request_error(&error) {
+      ProbeOutcome::Broken => (None, Delivery::Broken),
+      _ => (Some(endpoint), Delivery::Undelivered),
+    },
+    None => (Some(endpoint), Delivery::Undelivered),
+  }
 }
 
 /// How a request error on the probe session is judged: a fault that ends the session for good —
@@ -716,6 +838,14 @@ mod tests {
       SwimMessage::PingReq {
         from: A,
         target: B,
+        nonce: 9,
+        gossip: sample_gossip(),
+      },
+      SwimMessage::IndirectAck {
+        from: B,
+        target: A,
+        nonce: 9,
+        boot_nonce: 11,
         gossip: sample_gossip(),
       },
     ];
@@ -726,6 +856,66 @@ mod tests {
         Ok(message),
         "round-trip is identity"
       );
+    }
+  }
+
+  /// The indirect-acknowledgement encoding is fixed and little-endian — a golden vector pins it (a relay,
+  /// host 4 at daemon boot_nonce 7, reporting it reached host 3 for the requester's probe nonce 5, with no
+  /// gossip), so a drift in the tag or field order is caught.
+  #[test]
+  fn indirect_ack_has_a_golden_encoding() {
+    let message = SwimMessage::IndirectAck {
+      from: HostId(4),
+      target: HostId(3),
+      nonce: 5,
+      boot_nonce: 7,
+      gossip: Vec::new(),
+    };
+    let mut expected = vec![TAG_INDIRECT_ACK];
+    expected.extend_from_slice(&4u64.to_le_bytes()); // from = 4
+    expected.extend_from_slice(&3u64.to_le_bytes()); // target = 3
+    expected.extend_from_slice(&5u64.to_le_bytes()); // nonce = 5
+    expected.extend_from_slice(&7u64.to_le_bytes()); // boot_nonce = 7
+    expected.extend_from_slice(&0u32.to_le_bytes()); // gossip count = 0
+    assert_eq!(message.encode(), expected, "the byte layout is fixed");
+    assert_eq!(
+      SwimMessage::decode(&expected),
+      Ok(message),
+      "and decodes back"
+    );
+  }
+
+  /// A ping-request and an indirect acknowledgement cut short anywhere inside their fixed header — after
+  /// the sender, after the target, inside the nonce — are each refused `Truncated`, never read past the
+  /// bytes that arrived.
+  #[test]
+  fn a_truncated_indirect_message_is_refused() {
+    let full = SwimMessage::IndirectAck {
+      from: HostId(4),
+      target: HostId(3),
+      nonce: 5,
+      boot_nonce: 7,
+      gossip: Vec::new(),
+    }
+    .encode();
+    let request = SwimMessage::PingReq {
+      from: HostId(4),
+      target: HostId(3),
+      nonce: 5,
+      gossip: Vec::new(),
+    }
+    .encode();
+    for bytes in [&full, &request] {
+      // Every prefix short of the gossip count is a truncated header; the count itself is checked by the
+      // gossip decoder.
+      for cut in 1..(bytes.len() - GOSSIP_COUNT_BYTES) {
+        assert_eq!(
+          SwimMessage::decode(&bytes[..cut]),
+          Err(SwimWireError::Truncated),
+          "a message cut at byte {cut} of {} is refused, not read past its end",
+          bytes.len()
+        );
+      }
     }
   }
 

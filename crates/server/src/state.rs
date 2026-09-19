@@ -405,6 +405,20 @@ pub struct ShardState {
   /// Completed probes and live uses of the measured scheduler floor (§4.8), observed through
   /// `Daemon::fleet_probe_windows`. Fixed-size counters on their owning control shard.
   pub probe_windows: crate::fleet::ProbeWindows,
+  /// The indirect-probe stage's traffic between this node's per-peer probe tasks and its serve side (§4.8
+  /// "direct probe → k indirect proxies → SUSPECT"; AUD-15): the ping-requests a requester posted for its
+  /// relays' tasks to send, the asks a relay received for its target's task to answer, the results awaiting
+  /// return, the relayed acknowledgements awaiting credit, the peers' announced coordinates that rank
+  /// relays nearest a target, and the parked probe tasks' wakers. Every map is keyed by authenticated
+  /// member ids this node keeps direct contact with (a request naming any other member is refused and
+  /// counted), so the whole is bounded by the roster squared and in practice by the neighbourhood times
+  /// the fan-out. Only the control shard touches it; empty on a laptop.
+  pub(crate) indirect: crate::fleet::IndirectProbes,
+  /// Test support (never reachable from the wire): peers whose **direct** probes this node's serve side
+  /// leaves unanswered — the asymmetric path loss the indirect-probe regression imposes (A cannot reach B,
+  /// but a relay can), without touching the transport. Empty in production
+  /// (`Daemon::inject_probe_deafness`).
+  pub probe_deaf_to: std::collections::BTreeSet<slates_db::HostId>,
   /// The configuration council's election timing as derived this period from the paths to its other
   /// voters (the floor with none measured): the base and span in coordinator periods, the tail and spread
   /// they came from, and the samples behind them — what `Daemon::council_timing` reports. Only the control
