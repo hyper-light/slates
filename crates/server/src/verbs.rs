@@ -1062,7 +1062,17 @@ fn run_recorded(
   );
   let reply = match state.db.commit(&mut state.segment) {
     Ok(_) => reply,
-    Err(e) => refused(refusal_of_db(&e)),
+    Err(e) => {
+      // Nothing of the verb is durable and the partition has been rolled back to its durable state —
+      // the effects and the completion record gone together (`Db::commit`, AC-2.3; AUD-06). What the
+      // verb built outside the partition for a record that no longer exists is released with it, so a
+      // client retrying into a segment that cannot publish leaks nothing per attempt. The refusal is
+      // counted here (it is deliberately *not* recorded as a completion: a retry must re-execute).
+      let refusal = refusal_of_db(&e);
+      *state.refusals.entry(refusal_name(&refusal)).or_insert(0) += 1;
+      reconcile_unpublished_effects(state);
+      refused(refusal)
+    }
   };
   let end_ns = state.clock.monotonic_ns();
   state.current_span = outer;
@@ -1742,6 +1752,7 @@ fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::TooManyClients => "too_many_clients",
     Refusal::Overloaded { .. } => "overloaded",
     Refusal::BadRequest { .. } => "bad_request",
+    Refusal::Unpublished { .. } => "unpublished",
     Refusal::TargetUnavailable { .. } => "target_unavailable",
     Refusal::LandingConflict { .. } => "landing_conflict",
     Refusal::LandingLeaseHeld { .. } => "landing_lease_held",
@@ -4067,6 +4078,45 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
     return refused(refusal_of_vfs(&e));
   }
   ReplyBody::Destroyed
+}
+
+/// After a rolled-back publication (`Db::commit` re-derived the partition from durable state;
+/// AUD-06): every in-memory object a verb created for a catalog record that no longer exists is
+/// released — a volume whose `VolumeCreated` was never published (its slot removed, its content
+/// returned to the store, its credits returned to the shard's ledgers exactly as a completed destroy
+/// returns them), and a green or work state keyed by a volume the catalog does not hold. The
+/// volume is at most one verb old — a fresh create is empty and a fresh clone has not diverged —
+/// so its destroy completes within the destroy slice budget the cooperative path uses; the loop is
+/// bounded by that volume's own extent. Returns how many volumes were released.
+fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
+  let orphans: Vec<(DbVolumeId, Handle<VolumeSlot>)> = state
+    .by_id
+    .iter()
+    .filter(|(id, _)| state.db.partition().volume(**id).is_none())
+    .map(|(id, h)| (*id, *h))
+    .collect();
+  let budget = state
+    .config
+    .runtime
+    .step_budget_ns
+    .saturating_mul(DESTROY_SLICE_PERMILLE)
+    / PERMILLE;
+  for (id, handle) in &orphans {
+    if let Ok(mut slot) = state.volumes.remove(*handle) {
+      if slot.volume.destroy(&mut state.store).is_ok() {
+        while !matches!(
+          slot.volume.destroy_step(&mut state.store, budget.max(1)),
+          Ok(DestroyProgress::Done) | Err(_)
+        ) {}
+      }
+      release_slot_credits(state, &slot);
+    }
+    state.by_id.remove(id);
+  }
+  let partition = state.db.partition();
+  state.greens.retain(|id, _| partition.volume(*id).is_some());
+  state.works.retain(|id, _| partition.volume(*id).is_some());
+  orphans.len()
 }
 
 /// One cooperative destroy slice per destroying volume; a finished one leaves the tables.

@@ -1232,6 +1232,14 @@ retention: AUD-11–14/-16 (GAP-A9-14/-1/-7); SWIM indirect probes, call cancell
 handshake bounds: AUD-15/-17/-18 (GAP-A9-7/-4/-11). These are source findings and proposed
 regression scenarios at the audit baseline.
 
+**Implementation follow-up (2026-09-18, AUD-06 closed):** a transaction whose record cannot be
+made durable is rolled back — the partition re-derived from the segment's durable state, so the
+effects and the completion record are gone together and a same-id retry re-executes instead of
+reading a success from memory — and refused with the new typed `Refusal::Unpublished`; a maintenance
+snapshot failing after a durable append is deferred and counted, the commit stands. Database and
+by-use regressions (a restart over the same segment agrees):
+`docs/bugs/2026-09-18-unpublished-transaction-served-from-memory.md`.
+
 **Implementation follow-up (2026-09-18, AUD-15 closed):** the live SWIM path now runs the indirect
 stage — a timed-out direct probe asks up to `k` (derived) relays nearest the target, the relay's answer
 returns as an `IndirectAck` and is credited before the suspicion tick; bounded per-member queues,

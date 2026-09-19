@@ -94,6 +94,21 @@ impl std::fmt::Debug for Daemon {
   }
 }
 
+/// One shard's publication counters (`Daemon::db_publication_counters`; AUD-06): how its database has
+/// fared making transactions durable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicationCounters {
+  /// The shard.
+  pub shard: u16,
+  /// Transactions rolled back because their record could not be made durable — the effects and the
+  /// completion record gone together, the verb refused `Unpublished`.
+  pub rollbacks: u64,
+  /// Maintenance snapshots that failed after a durable append and were deferred to a later commit.
+  pub maintenance_failures: u64,
+  /// Snapshots the database has published since recovery.
+  pub snapshots_taken: u64,
+}
+
 /// The wire refusal a bootstrap reports for an observation it could not make on `shard`: a shard merely
 /// starved past the observe budget is **overloaded** (the caller may retry); a shard the daemon can never
 /// reach — gone, terminated, its state absent — leaves the group **not initialized**.
@@ -1346,6 +1361,39 @@ impl Daemon {
     self.observe(self.shards.first().copied(), move |s| {
       s.discovery_withhold_replies = withhold;
     })
+  }
+
+  /// Test support: the next publication on **every** shard's database fails as `fault` names, once
+  /// (`Db::inject_publication_fault`; `None` clears) — before the record's append, so the transaction
+  /// rolls back, or after it, so the maintenance snapshot is deferred (§4.8 transactions, AC-2.3;
+  /// AUD-06). Installed on every shard so a test need not know which shard a verb routes to; the
+  /// shard that runs the next verb consumes its fault and the rest keep theirs until cleared.
+  /// `Ok` once installed everywhere, else the first shard's typed refusal.
+  pub fn inject_publication_fault(
+    &self,
+    fault: Option<slates_db::replay::PublicationFault>,
+  ) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| s.db.inject_publication_fault(fault))?;
+    }
+    Ok(())
+  }
+
+  /// Per shard: transactions rolled back because their record could not be made durable, and
+  /// maintenance snapshots deferred after a durable append (`Db::rollbacks`,
+  /// `Db::maintenance_failures`; AUD-06) — the non-vacuity counters the publication-failure
+  /// regression asserts. An observation a shard could not answer is its typed refusal.
+  pub fn db_publication_counters(&self) -> Result<Vec<PublicationCounters>, ObserveError> {
+    let mut counters = Vec::with_capacity(self.shards.len());
+    for shard in self.shards.iter().copied() {
+      counters.push(self.observe(Some(shard), move |s| PublicationCounters {
+        shard: shard.0,
+        rollbacks: s.db.rollbacks(),
+        maintenance_failures: s.db.maintenance_failures(),
+        snapshots_taken: s.db.snapshots_taken(),
+      })?);
+    }
+    Ok(counters)
   }
 
   /// Test support: makes this node's probe serve side leave the **direct** probes of `peers` unanswered

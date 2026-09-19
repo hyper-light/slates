@@ -1537,6 +1537,15 @@ pub enum Refusal {
     /// What was wrong.
     reason: String,
   },
+  /// The verb ran but its record could not be made durable in anchor-owned RAM, so its effects and
+  /// its completion record were rolled back together — nothing of it exists, in memory or in the
+  /// segment (§4.8 transactions, AC-2.3; AUD-06). The request was not completed and may be retried
+  /// under the same id (it re-executes; it is never answered from memory). `reason` names what
+  /// stopped the publication (the log full and its snapshot unpublishable, the segment refusing).
+  Unpublished {
+    /// What stopped the publication.
+    reason: String,
+  },
   /// The landing target directory cannot be opened, or escapes containment (§4.15 step 4).
   TargetUnavailable {
     /// What was wrong.

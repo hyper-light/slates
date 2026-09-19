@@ -95,6 +95,140 @@ fn scratch(name: &str) -> CreateSpec {
   }
 }
 
+/// AC-2.3 (§4.8 transactions; AUD-06): a verb whose record cannot be made durable is refused **typed**
+/// (`Unpublished`), its effects and its completion record are rolled back together, a retry under the
+/// same id **re-executes** (it is never answered a success from memory — there is none), and a restart
+/// over the same segment agrees with the live daemon: the volume the retry created is there, once, and
+/// the retried id still meets its completion record. Non-vacuous: the shard's rollback counter moved,
+/// and the refusal is the typed one. The failure is injected at the database's publication (the
+/// segment refusing the record) so the whole recorded-verb path above it — dispatch, the completion
+/// record, the commit, the reply — runs exactly as it would on a segment that cannot publish.
+#[test]
+fn an_unpublished_verb_is_refused_typed_a_retry_re_executes_and_a_restart_agrees() {
+  let profile = profile();
+  let instance = format!("srv-unpublished-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let segment = anchor_segment("unpublished", &profile, &config);
+
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let durable = client.create(&scratch("durable")).unwrap();
+
+  let create_id = refused_unpublished_create(&first, &mut client);
+
+  // The retry under the same id re-executes — the volume is created now, durably — rather than
+  // reading a success that was never published.
+  let retried = retry_create(&mut client, create_id, "unpublished");
+  let ReplyBody::Created { id: created } = retried else {
+    panic!("the retry re-executes the create: {retried:?}");
+  };
+  assert_ne!(created, durable, "a distinct volume");
+  assert_eq!(
+    names_listed(&mut client),
+    vec!["durable".to_owned(), "unpublished".to_owned()]
+  );
+
+  // The restart over the same segment agrees: the effect and its completion survived together.
+  let member = first.member_identity().unwrap();
+  first.stop();
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  assert_eq!(second.member_identity(), Ok(member), "a warm restart");
+  assert_eq!(
+    names_listed(&mut client),
+    vec!["durable".to_owned(), "unpublished".to_owned()],
+    "the retried create is durable: present once after the restart"
+  );
+  assert_eq!(
+    retry_create(&mut client, create_id, "unpublished"),
+    ReplyBody::Created { id: created },
+    "after the restart the id meets the completion record the retry published — the same volume, no \
+     second create"
+  );
+  assert_eq!(
+    rollbacks_of(&second),
+    0,
+    "the restarted daemon rolled nothing back"
+  );
+  second.stop();
+}
+
+/// The refused phase: the next publication on whichever shard runs the create is refused before its
+/// record is appended, so the create of "unpublished" comes back typed `Unpublished`, the shard
+/// counts one rollback, and nothing of the verb is listed. Returns the refused request's id, for the
+/// retry. Clears the faults still pending on the other shards.
+fn refused_unpublished_create(daemon: &Daemon, client: &mut Client) -> RequestId {
+  daemon
+    .inject_publication_fault(Some(slates_db::replay::PublicationFault::BeforeAppend))
+    .expect("the fault is installed");
+  let refused = client.create(&scratch("unpublished"));
+  assert!(
+    matches!(
+      refused,
+      Err(ClientError::Refused(
+        slates_ipc::protocol::Refusal::Unpublished { .. }
+      ))
+    ),
+    "the verb is refused typed as unpublished, not served: {refused:?}"
+  );
+  let create_id = client.last_request();
+  assert_eq!(
+    rollbacks_of(daemon),
+    1,
+    "the shard rolled the transaction back (counted)"
+  );
+  daemon
+    .inject_publication_fault(None)
+    .expect("the faults still pending on the other shards are cleared");
+  assert_eq!(
+    names_listed(client),
+    vec!["durable".to_owned()],
+    "nothing of the refused verb is visible: the rolled-back volume is not listed"
+  );
+  create_id
+}
+
+/// The volume names the daemon lists, sorted.
+fn names_listed(client: &mut Client) -> Vec<String> {
+  let mut names: Vec<String> = client
+    .list()
+    .unwrap()
+    .iter()
+    .map(|v| v.name.clone())
+    .collect();
+  names.sort();
+  names
+}
+
+/// Retries the scratch create of `name` under `id` — the daemon answers from its completion record
+/// when it served the id, else serves it now.
+fn retry_create(client: &mut Client, id: RequestId, name: &str) -> ReplyBody {
+  client
+    .retry(
+      id,
+      &RequestBody::Create {
+        name: name.to_owned(),
+        size: SizeClass::Bounded { limit: 1 << 20 },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      },
+    )
+    .unwrap()
+}
+
+/// Transactions rolled back across every shard of `daemon` (`Daemon::db_publication_counters`).
+fn rollbacks_of(daemon: &Daemon) -> u64 {
+  daemon
+    .db_publication_counters()
+    .unwrap()
+    .iter()
+    .map(|c| c.rollbacks)
+    .sum()
+}
+
 /// The anchor's segment and content object for a test: the content object is [`PUBLISH_SLOTS`]
 /// reserve-sized slots per shard times the partitions (lazily backed, so the unused tail costs no RAM).
 fn anchor_segment(name: &str, profile: &MachineProfile, config: &DaemonConfig) -> AnchorSegment {

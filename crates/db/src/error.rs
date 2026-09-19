@@ -51,6 +51,17 @@ pub enum DbError {
     /// Which table.
     table: &'static str,
   },
+  /// A transaction could not be made durable — its record was not appended and the snapshot that
+  /// would have carried its effects was not published — so the partition was **rolled back** to its
+  /// durable state: the applied effects and the completion record are gone, exactly as a restart
+  /// would leave them (§4.8 transactions, AC-2.3; AUD-06). A retry of the same request re-executes
+  /// it; it is never answered from memory. `cause` is the refusal that stopped the publication.
+  Unpublished {
+    /// The sequence the record would have taken.
+    seq: u64,
+    /// What stopped the publication.
+    cause: Box<DbError>,
+  },
   /// The encoding refused.
   Wire(WireError),
   /// The segment refused.
@@ -75,6 +86,12 @@ impl fmt::Display for DbError {
       Self::LogFull { needed, free } => write!(f, "log full: {needed} bytes needed, {free} free"),
       Self::Corrupt { seq, reason } => write!(f, "record {seq} corrupt: {reason}"),
       Self::Capacity { table } => write!(f, "{table} at capacity"),
+      Self::Unpublished { seq, cause } => {
+        write!(
+          f,
+          "record {seq} not published, transaction rolled back: {cause}"
+        )
+      }
       Self::Wire(e) => write!(f, "encoding: {e}"),
       Self::Anchor(e) => write!(f, "segment: {e}"),
       Self::Memory(e) => write!(f, "memory: {e}"),

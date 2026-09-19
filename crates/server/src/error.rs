@@ -146,6 +146,16 @@ pub fn refusal_of_db(e: &DbError) -> Refusal {
     DbError::Capacity { table } => Refusal::BadRequest {
       reason: format!("{table} at capacity"),
     },
+    // Nothing of the verb is durable — the transaction was rolled back (`Unpublished`), or a record
+    // could not be appended for want of log space a snapshot did not release (`LogFull` reaching
+    // here), or the segment refused the publication outright (`Anchor`). A durability failure is not
+    // a malformed request: it is typed as such so a client retries under the same id rather than
+    // treating its request as wrong.
+    unpublished @ (DbError::Unpublished { .. } | DbError::LogFull { .. } | DbError::Anchor(_)) => {
+      Refusal::Unpublished {
+        reason: format!("{unpublished}"),
+      }
+    }
     other => Refusal::BadRequest {
       reason: format!("{other}"),
     },

@@ -1694,7 +1694,15 @@ root-relative path as an explicit alternative; it does not report that the reque
 > the 1/8/64 histogram and a parked form are recorded and ratcheted (the floor is held on the
 > single-client latency; the concurrency tails are contention on shared owner shards). A verb's
 > effects and its completion record are one log record (`Db::begin` … `commit`), so a crash
-> leaves both or neither (AC-2.3). Admission is bounded (AC-2.6): a connect past the derived
+> leaves both or neither (AC-2.3). **Since 2026-09-18 (AUD-06) a publication that fails is the
+> same:** a record that cannot be made durable — the append refused, or the log full and the
+> snapshot that would carry the effects not published — rolls the transaction back (the partition
+> re-derived from the segment's durable state, the effects and the completion record gone together,
+> the verb refused with the typed `Unpublished` and the objects it built for the vanished record
+> released), so a same-id retry re-executes rather than reading a success from memory that the next
+> restart would lose; a maintenance snapshot that fails *after* a durable append is deferred and
+> counted, and the commit stands (`docs/bugs/2026-09-18-unpublished-transaction-served-from-memory.md`).
+> Admission is bounded (AC-2.6): a connect past the derived
 > per-daemon client bound is refused `TooManyClients`, a forward to a saturated owner shard
 > waits in a bounded queue and past the clients' credit is refused `Overloaded`, and a shard
 > kicks another only when it is parked (a message to a spinning shard costs no syscall).
