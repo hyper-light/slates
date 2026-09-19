@@ -1340,6 +1340,31 @@ impl Daemon {
     })
   }
 
+  /// The chain of `green` as the shard that serves it holds it: each version's increment identity in
+  /// order (§4.16; AUD-14) — what a test compares between the departed owner and its successor to prove
+  /// the full ledger prefix and the original results were preserved through the takeover. Empty for a
+  /// green this daemon does not serve; the typed refusal when the shard could not be observed.
+  pub fn merge_chain_identities(
+    &self,
+    green: slates_ipc::protocol::VolumeId,
+  ) -> Result<Vec<(u64, [u8; 32])>, ObserveError> {
+    let object = slates_db::register::ObjectId(green.bytes);
+    let volume = slates_db::catalog::VolumeId { bytes: green.bytes };
+    self.observe(self.shard_of_object(object), move |s| {
+      s.db
+        .partition()
+        .green_chain(volume)
+        .iter()
+        .enumerate()
+        .filter_map(|(index, bytes)| {
+          slates_merge::engine::Increment::decode(bytes)
+            .ok()
+            .map(|increment| (u64::try_from(index).unwrap_or(u64::MAX) + 1, increment.id))
+        })
+        .collect()
+    })
+  }
+
   /// How many submits of `green` are waiting for their version's merge record to commit at the quorum
   /// before they are answered (§4.16 "Commit"; AUD-11) — the non-vacuity a test asserts while it
   /// withholds a holder's inputs or acknowledgements. Runs a one-shot question on the green's owner
@@ -1913,6 +1938,7 @@ fn init_shard(
     healer: crate::fleet::HealerCursor::default(),
     repairs: 0,
     pending_materializations: std::collections::BTreeMap::new(),
+    pending_green_materializations: std::collections::BTreeMap::new(),
   };
   if let Some(retained) = retained {
     retained.restore(&mut state)?;
@@ -2573,6 +2599,9 @@ mod tests {
         inputs: None,
         identity: slates_merge::engine::Green::new().head_identity(),
         evidence: Vec::new(),
+        name: String::new(),
+        require_evidence: false,
+        owner: slates_db::catalog::Principal::Uid { uid: 0 },
       };
       let record = Record {
         owner,
@@ -2666,6 +2695,9 @@ mod tests {
         inputs: None,
         identity: slates_merge::engine::Green::new().head_identity(),
         evidence: Vec::new(),
+        name: String::new(),
+        require_evidence: false,
+        owner: slates_db::catalog::Principal::Uid { uid: 0 },
       };
       let record = Record {
         owner,

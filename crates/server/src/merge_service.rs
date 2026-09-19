@@ -975,6 +975,12 @@ pub struct MergeRecordValue {
   pub identity: [u8; 32],
   /// The evidence references the submitter attached (opaque).
   pub evidence: Vec<[u8; 32]>,
+  /// The green's mount name, so a successor materializes it under the same name (AUD-14).
+  pub name: String,
+  /// Whether the green requires evidence on every submit (`Role::Green { require_evidence }`).
+  pub require_evidence: bool,
+  /// The owning principal, so a successor enforces the same rights.
+  pub owner: Principal,
 }
 
 impl MergeRecordValue {
@@ -1156,6 +1162,25 @@ pub(crate) fn enqueue_record(
     .unwrap_or_default();
   let inputs_identity = inputs_of(state, green, version)
     .map(|bytes| MergeShardState::inputs_identity(&bytes, archive_page(state)));
+  // What a successor needs to materialize the green under the same name, policy and rights (AUD-14).
+  let (name, require_evidence, owner) = state
+    .db
+    .partition()
+    .volume(green)
+    .map(|record| {
+      (
+        record.name.clone(),
+        matches!(
+          record.policy.role,
+          slates_db::catalog::Role::Green {
+            require_evidence: true,
+            ..
+          }
+        ),
+        record.owner.clone(),
+      )
+    })
+    .unwrap_or_else(|| (String::new(), false, Principal::Uid { uid: 0 }));
   let local_hold = Placement {
     candidates: candidates.clone(),
     acked: vec![local],
@@ -1177,6 +1202,9 @@ pub(crate) fn enqueue_record(
         inputs: inputs_identity,
         identity,
         evidence,
+        name,
+        require_evidence,
+        owner,
       },
       inputs: local_hold,
       record: Placement {
@@ -1332,8 +1360,20 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
       }
       // Each target is waiting for this version's first missing position. Another holder can be
       // at a later position; a missing candidate therefore cannot stall an available commit quorum.
-      // The head is written at the host's epoch (a taken-over green's promotion epoch is owed with
-      // green takeover).
+      // The record is written at the host's epoch — or, for a green this node **took over**, at the
+      // takeover's promotion epoch (`placed_heads`, moved here with the green; AUD-14): the holders
+      // raised their fence for the departed owner's bumped epoch, and a record below it is refused
+      // `StaleEpoch`, which is what left a taken-over green's next version unable to commit.
+      let epoch = state
+        .placed_heads
+        .get(&object)
+        .map_or(config.host_epoch, |placed| {
+          if placed.epoch.0 > config.host_epoch.0 {
+            placed.epoch
+          } else {
+            config.host_epoch
+          }
+        });
       work.push(MergeWork::Ship {
         shard: state.shard,
         object,
@@ -1342,7 +1382,7 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
           owner: local,
           object,
           sequence: version,
-          epoch: config.host_epoch,
+          epoch,
           generation: config.version,
           value: pending.value.to_record_bytes(),
         },
@@ -1888,6 +1928,77 @@ fn recompute(
   Ok(())
 }
 
+/// What a successor rebuilds a taken-over green from (AUD-14): the catalog facts the adopted record
+/// carries, the origin bytes for version 0 (none for a scratch green), the increments' bytes in
+/// version order, the adopted head and its identity — every input this node itself holds.
+#[derive(Clone, Debug)]
+pub(crate) struct GreenRecovery {
+  /// The green's mount name.
+  pub name: String,
+  /// Whether every submit must carry evidence.
+  pub require_evidence: bool,
+  /// The owning principal.
+  pub owner: Principal,
+  /// The origin's bytes (version 0), or none for a scratch green.
+  pub origin: Option<Vec<u8>>,
+  /// The increments' bytes, version 1 first.
+  pub chain: Vec<Vec<u8>>,
+  /// The adopted head version.
+  pub head: u64,
+  /// The adopted head's identity, which the rebuilt engine must reproduce.
+  pub identity: [u8; 32],
+}
+
+/// Gathers a taken-over green's chain from this node's **own accepted merge records** for `object`
+/// (its holder acceptor's persisted positions, one per version it recomputed) and the inputs it
+/// holds for each (the origin for version 0, the increment for every later version), up to the
+/// adopted record's version — which must be the next after, or within, this node's accepted prefix,
+/// else `None` (the general ledger-prefix transfer, GAP-A9-7, is owed; the green stays pending,
+/// counted). `None` also when any input is not held: nothing is rebuilt from a partial chain.
+pub(crate) fn recover_green_inputs(
+  state: &mut ShardState,
+  object: ObjectId,
+  adopted: &MergeRecordValue,
+) -> Option<GreenRecovery> {
+  let mut values: BTreeMap<u64, MergeRecordValue> = state
+    .holder_records
+    .get(&object)?
+    .persisted()
+    .1
+    .into_iter()
+    .filter(|(held, _, _, _)| *held == object)
+    .filter_map(|(_, sequence, _, bytes)| {
+      MergeRecordValue::from_record_bytes(&bytes).map(|value| (sequence, value))
+    })
+    .collect();
+  values.insert(adopted.version, adopted.clone());
+  // The prefix must be complete: every version from 0 to the adopted head, each with its inputs held.
+  let mut origin = None;
+  let mut chain = Vec::with_capacity(usize::try_from(adopted.version).unwrap_or(0));
+  for version in 0..=adopted.version {
+    let value = values.get(&version)?;
+    let inputs = match value.inputs {
+      None if version == 0 => None,
+      None => return None,
+      Some(manifest) => Some(held_inputs(state, &manifest)?),
+    };
+    match (version, inputs) {
+      (0, bytes) => origin = bytes,
+      (_, Some(bytes)) => chain.push(bytes),
+      (_, None) => return None,
+    }
+  }
+  Some(GreenRecovery {
+    name: adopted.name.clone(),
+    require_evidence: adopted.require_evidence,
+    owner: adopted.owner.clone(),
+    origin,
+    chain,
+    head: adopted.version,
+    identity: adopted.identity,
+  })
+}
+
 /// A holder's view of `object`'s replica, for a test.
 pub(crate) fn holder_state(state: &ShardState, object: ObjectId) -> HolderMergeState {
   HolderMergeState {
@@ -1924,6 +2035,9 @@ mod tests {
         inputs: Some([2; 32]),
         identity: [3; 32],
         evidence: Vec::new(),
+        name: String::new(),
+        require_evidence: false,
+        owner: Principal::Uid { uid: 0 },
       },
       inputs: Placement {
         candidates: candidates.clone(),
@@ -1968,6 +2082,9 @@ mod tests {
               inputs: Some([2; 32]),
               identity: [3; 32],
               evidence: Vec::new(),
+              name: String::new(),
+              require_evidence: false,
+              owner: Principal::Uid { uid: 0 },
             },
             inputs: Placement {
               candidates: candidates.clone(),
@@ -2046,6 +2163,9 @@ mod tests {
       inputs: Some([9u8; 32]),
       identity: [7u8; 32],
       evidence: vec![[1u8; 32]],
+      name: "green".to_owned(),
+      require_evidence: true,
+      owner: Principal::Uid { uid: 1000 },
     }
   }
 
@@ -2062,6 +2182,9 @@ mod tests {
       inputs: None,
       identity: [7u8; 32],
       evidence: Vec::new(),
+      name: String::new(),
+      require_evidence: false,
+      owner: Principal::Uid { uid: 0 },
     };
     assert_eq!(
       MergeRecordValue::from_record_bytes(&origin_only.to_record_bytes()),

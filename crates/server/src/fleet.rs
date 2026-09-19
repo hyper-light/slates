@@ -3197,6 +3197,81 @@ async fn materialize_pending(origin: u16, budget: CommitBudget) {
   }
 }
 
+/// One period's materialization of everything this node took over: the plain volumes whose heads it
+/// adopted ([`materialize_pending`]), then the greens whose newest merge records it adopted
+/// ([`materialize_pending_greens`]).
+async fn materialize_adopted_objects(origin: u16, budget: CommitBudget) {
+  materialize_pending(origin, budget).await;
+  materialize_pending_greens(origin).await;
+}
+
+/// Materializes each taken-over **green** whose newest merge record this node adopted (§4.16
+/// owner-loss recovery; AUD-14) into an owned green **on the shard its id routes to**: the chain is
+/// gathered on this control shard from the node's own accepted merge records and the inputs it holds
+/// (`merge_service::recover_green_inputs`), moved by value to the owner shard, and there re-recorded
+/// durably and replayed into a fresh engine whose head identity must equal the adopted record's
+/// (`verbs::materialize_taken_over_green`). A green whose inputs are not all held, or whose adopted
+/// version lies beyond this node's accepted prefix (the general ledger-prefix transfer, GAP-A9-7, is
+/// still owed), is counted and stays pending; a mismatch is fatal-and-loud for the green here.
+async fn materialize_pending_greens(origin: u16) {
+  let pending: Vec<(ObjectId, crate::merge_service::MergeRecordValue)> = state::with_state(|s| {
+    s.pending_green_materializations
+      .iter()
+      .map(|(object, adopted)| (*object, adopted.clone()))
+      .collect()
+  })
+  .unwrap_or_default();
+  for (object, adopted) in pending {
+    let recovery =
+      state::with_state(|s| crate::merge_service::recover_green_inputs(s, object, &adopted))
+        .flatten();
+    let Some(recovery) = recovery else {
+      count_refusal(GREEN_TAKEOVER_INCOMPLETE);
+      continue;
+    };
+    let id = DbVolumeId { bytes: object.0 };
+    let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
+    // The takeover's placement of the adopted record (its promotion epoch and acknowledging holders),
+    // recorded where the promotion ran; it moves to the owner shard with the green, as a head's does,
+    // so the successor's record plane writes the green's next versions at the promotion epoch.
+    let Some((target, placed)) = state::with_state(|s| {
+      let target = s.shards.get(usize::from(partition)).copied()?;
+      let placed = s.placed_heads.get(&object).cloned()?;
+      Some((target, placed))
+    })
+    .flatten() else {
+      continue;
+    };
+    let served = call_within(
+      origin,
+      target,
+      move |s| {
+        let served = verbs::materialize_taken_over_green(s, id, recovery).is_ok();
+        if served {
+          s.placed_heads.insert(object, placed);
+        }
+        served
+      },
+      HEARTBEAT_NS,
+    )
+    .await;
+    state::with_state(|s| {
+      if served == Some(true) {
+        s.pending_green_materializations.remove(&object);
+      } else {
+        *s.refusals.entry(GREEN_TAKEOVER_REFUSED).or_insert(0) += 1;
+      }
+    });
+  }
+}
+
+/// A taken-over green whose chain could not be gathered this period (an input not held, or the adopted
+/// version beyond this node's accepted prefix); it stays pending and is retried.
+const GREEN_TAKEOVER_INCOMPLETE: &str = "merge.takeover_incomplete";
+/// A taken-over green the owner shard refused to materialize (a recomputed identity that does not
+/// match the adopted record's, or a catalog refusal); it stays pending, counted.
+const GREEN_TAKEOVER_REFUSED: &str = "merge.takeover_refused";
+
 /// Materializes one taken-over volume from the content this node holds for its head (see
 /// [`materialize_pending`]) **on the shard the volume's id routes to** — the partition its id names is
 /// where every verb for it will run (`verbs::owner_of`), so that is where it must live. The archive and
@@ -4945,7 +5020,7 @@ async fn run_record_plane(local: HostId) {
     }
     // Serve the content of each adopted head, from what this node holds or a recorded holder, on the
     // shard the taken-over id routes to.
-    materialize_pending(origin, budget).await;
+    materialize_adopted_objects(origin, budget).await;
     futures::sleep(HEARTBEAT_NS).await;
   }
 }
@@ -5327,6 +5402,11 @@ async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -
       s.pending_takeovers.remove(&object);
       if let Some(head) = HeadValue::from_record_bytes(&value) {
         s.pending_materializations.insert(object, head);
+      } else if let Some(merge) = crate::merge_service::MergeRecordValue::from_record_bytes(&value)
+      {
+        // A green: its newest merge record was adopted; the owned green is rebuilt from this node's
+        // accepted chain and held inputs on the shard its id routes to (AUD-14).
+        s.pending_green_materializations.insert(object, merge);
       }
     }
   });

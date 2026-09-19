@@ -1232,6 +1232,15 @@ retention: AUD-11–14/-16 (GAP-A9-14/-1/-7); SWIM indirect probes, call cancell
 handshake bounds: AUD-15/-17/-18 (GAP-A9-7/-4/-11). These are source findings and proposed
 regression scenarios at the audit baseline.
 
+**Implementation follow-up (2026-09-18, AUD-14 closed):** a taken-over green is materialized on
+the successor from its own accepted merge records and held inputs — the catalog record (the record
+value now names the green, its evidence policy and its owner), the origin and chain re-recorded
+durably, the engine rebuilt and its head identity verified against the adopted record — so every
+version reads, new work submits and retries meet their records through the public client on the
+successor. A successor whose accepted prefix is shorter than the adopted head stays pending and
+counted until the ledger-prefix transfer (GAP-A9-7):
+`docs/bugs/2026-09-18-green-takeover-left-no-servable-chain.md`.
+
 **Implementation follow-up (2026-09-18, AUD-11 closed):** at `f > 0` a submit's acceptance
 waits for its version's merge record to commit at the quorum — the verb commits its effects but
 records no completion and sends no reply until `resolve_accepted` runs for the placed version; a

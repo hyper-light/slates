@@ -4555,6 +4555,127 @@ const CREATION_HEAD_SEQUENCE: u64 = 0;
 /// capacity refuses `BudgetExceeded` rather than over-committing; a mount name already taken locally is
 /// `AlreadyExists` (names are per host, §4.4); a malformed archive is a `BadRequest` naming the reader's
 /// refusal. Any refusal leaves nothing behind (the credits go back, the partial volume is discarded).
+/// Materializes a taken-over **green** on the shard its id routes to (§4.16 owner-loss recovery;
+/// AUD-14): records its catalog entry under the adopted record's name, evidence policy and owner
+/// (guard-then-apply, refused typed when the name is taken or the chain budget cannot hold it),
+/// re-records its origin and every increment of the recovered chain durably — so a restart of this
+/// node rebuilds the same green — replays them into a fresh engine (`rebuild_green`: the same
+/// derivation a restart runs, with the rejected-cache budget and retention settled), and verifies the
+/// rebuilt head identity against the adopted record's: a mismatch is fatal-and-loud for the green
+/// here (the catalog record stays but the engine is not installed, counted). On success the adopted
+/// head is placed (its records committed at the quorum under the departed owner, the adoption under
+/// this node's epoch), so `await placed`, `versions`, reads at any version and new submits serve.
+/// Idempotent: a green this shard already holds is left alone.
+pub(crate) fn materialize_taken_over_green(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  recovery: crate::merge_service::GreenRecovery,
+) -> Result<(), Box<ReplyBody>> {
+  use crate::merge_service::MergeRole;
+  if state.greens.contains_key(&id) {
+    return Ok(());
+  }
+  if state.db.partition().volume(id).is_none() {
+    if let Some(existing) = state.db.partition().volume_by_name(&recovery.name) {
+      return Err(Box::new(refused(Refusal::AlreadyExists {
+        existing: to_wire_volume(existing.id),
+      })));
+    }
+    let record = VolumeRecord {
+      id,
+      name: recovery.name.clone(),
+      owner_shard: state.partition,
+      policy: PolicyRecord {
+        size: db_size(SizeClass::Dynamic { max: 0 }),
+        names: DbNamePolicy::Exact,
+        require_locked: false,
+        role: Role::Green {
+          require_evidence: recovery.require_evidence,
+          head_version: recovery.head,
+        },
+      },
+      base: BaseRecord::Scratch,
+      head: DbSnapshotId::default(),
+      epoch: 0,
+      referenced_bytes: 0,
+      unique_bytes: 0,
+      state: VolumeState::Live,
+      lease: None,
+      owner: recovery.owner.clone(),
+      access: Vec::new(),
+      created_ns: state.clock.monotonic_ns(),
+    };
+    let now = state.clock.monotonic_ns();
+    if let Err(e) = state
+      .db
+      .mutate(&mut state.segment, &Op::VolumeCreated { record }, now)
+    {
+      return Err(Box::new(refused(refusal_of_db(&e))));
+    }
+  }
+  debug_assert!(matches!(
+    crate::merge_service::merge_role(state, id),
+    Some(MergeRole::Green { .. })
+  ));
+  // The chain, durably, in order — each entry guarded before it is applied.
+  let now = state.clock.monotonic_ns();
+  let already = state.db.partition().green_chain(id).len();
+  if already == 0
+    && state.db.partition().green_origin(id).is_none()
+    && let Some(origin) = &recovery.origin
+  {
+    let op = Op::GreenOriginated {
+      green: id,
+      origin: origin.clone(),
+    };
+    if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
+      return Err(Box::new(refused(refusal_of_db(&e))));
+    }
+  }
+  for increment in recovery.chain.iter().skip(already) {
+    let op = Op::GreenAdvanced {
+      green: id,
+      increment: increment.clone(),
+    };
+    if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
+      return Err(Box::new(refused(refusal_of_db(&e))));
+    }
+  }
+  let Some(record) = state.db.partition().volume(id).cloned() else {
+    return Err(Box::new(refused(Refusal::NotFound)));
+  };
+  rebuild_green(state, &record);
+  let rebuilt = state
+    .greens
+    .get(&id)
+    .map(|engine| (engine.head(), engine.head_identity()));
+  if rebuilt != Some((recovery.head, recovery.identity)) {
+    // The chain this node held does not reproduce the adopted head: refuse the green here, loudly,
+    // rather than serve versions the quorum did not commit.
+    state.greens.remove(&id);
+    crate::merge_service::release_green_retention(state, id);
+    *state.refusals.entry(GREEN_TAKEOVER_MISMATCH).or_insert(0) += 1;
+    eprintln!(
+      "slates-server: partition {}: taken-over green {} rebuilt to {:?}, the adopted record names version {} with another identity; refused",
+      state.partition,
+      record.name,
+      rebuilt.map(|(head, _)| head),
+      recovery.head
+    );
+    return Err(Box::new(refused(Refusal::BadRequest {
+      reason: "taken-over green does not reproduce its adopted head".to_owned(),
+    })));
+  }
+  let object = ObjectId(id.bytes);
+  let placed = state.merge.placed.entry(object).or_insert(recovery.head);
+  *placed = (*placed).max(recovery.head);
+  Ok(())
+}
+
+/// A taken-over green whose recovered chain did not reproduce the adopted head's identity: refused on
+/// this node, fatal-and-loud (§4.16 D-27).
+const GREEN_TAKEOVER_MISMATCH: &str = "merge.takeover_mismatch";
+
 pub(crate) fn materialize_taken_over(
   state: &mut ShardState,
   id: DbVolumeId,

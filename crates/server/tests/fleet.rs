@@ -4617,6 +4617,27 @@ impl Client {
     Ok(unpack(self.end.region(), reply.kind, &reply.payload).unwrap())
   }
 
+  /// Re-sends the **same** request id as the last call (a retry, like [`call_retry`](Self::call_retry))
+  /// and waits at most `deadline_ns` for its reply, returning the typed error instead of panicking.
+  fn try_retry(&mut self, body: &RequestBody, deadline_ns: u64) -> Result<ReplyBody, IpcError> {
+    let id = RequestId {
+      client: self.client,
+      sequence: self.sequence,
+    };
+    let index = self.end.next_request_index();
+    let slot = pack(
+      self.end.region_mut(),
+      Direction::Request,
+      index,
+      id.word(),
+      body,
+    )
+    .unwrap();
+    self.end.send(&slot)?;
+    let reply = self.end.wait(Some(deadline_ns))?;
+    Ok(unpack(self.end.region(), reply.kind, &reply.payload).unwrap())
+  }
+
   /// Discards every reply already in the ring (the late reply to a [`try_call`](Self::try_call) that
   /// timed out), so the next call reads its own reply.
   fn drain(&mut self) {
@@ -7361,4 +7382,316 @@ fn assert_gate_committed(gate: &CommitGate) {
     "the retry meets the committed result: {:?}",
     gate.retried
   );
+}
+
+/// AC (§4.16 owner-loss recovery, "adopts the newest records, and serves"; AUD-14): in a three-node
+/// `f = 1` fleet a green advances three versions on its owner, each committed at the quorum and
+/// recomputed on both holders; the owner dies; the survivor rendezvous ranks first takes the green over
+/// and **materializes a servable green** from its own accepted merge records and held inputs — the
+/// chain's increment identities on the successor equal the owner's (the full ledger prefix and the
+/// original results preserved), and through the public client on the successor every version reads
+/// back (version 1 and the head), a new work submits the next version — committed at the quorum with
+/// the remaining holder and recomputed there — and a retry of that submit meets its completion record.
+/// Non-vacuous: before the death the successor holds the green only as a replica (no owned engine, no
+/// placed version reported), and the seeded configuration would never reassign ownership.
+#[test]
+fn a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  // Three versions on the owner A, each committed at the quorum (the reply waits for it, AUD-11).
+  let mut client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut client, "taken-over-green");
+  commit_three_versions(&mut client, work);
+  let owner_chain = daemons[0].merge_chain_identities(green).unwrap();
+  let object = ObjectId(green.bytes);
+  let (both_caught_up, successor_unowned_before) = holders_before_owner_death(&daemons, green);
+
+  // A dies; the survivor rendezvous ranks first for the green takes it over.
+  daemons.remove(0).stop();
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  let successor_index = usize::from(successor_host != hosts[1]);
+  let other_index = 1 - successor_index;
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let materialized = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    daemons[successor_index].merge_record_placed(green, 3)
+  });
+  let successor_chain = daemons[successor_index].merge_chain_identities(green);
+  let served = observe_taken_over_green(&daemons[successor_index], green);
+  // The next version, submitted on the successor, commits with the remaining holder and is recomputed
+  // there; its retry meets the completion record.
+  let next = submit_next_on_successor(&daemons, successor_index, other_index, green);
+
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    both_caught_up,
+    "both holders recomputed version 3 before the owner died"
+  );
+  assert!(
+    successor_unowned_before,
+    "before the death neither holder owned the green (no placed version reported)"
+  );
+  assert!(
+    materialized,
+    "the successor materialized the taken-over green at version 3"
+  );
+  assert_eq!(
+    successor_chain,
+    Ok(owner_chain.clone()),
+    "the successor's chain carries the owner's increment identities, in order"
+  );
+  assert_eq!(owner_chain.len(), 3, "three versions were committed");
+  assert_eq!(
+    served,
+    TakenOverGreenView {
+      head: Ok(3),
+      at_one: Ok(b"hello".to_vec()),
+      at_head: Ok(b"hello world!".to_vec()),
+    },
+    "the successor serves the head version, version 1 and the head's bytes"
+  );
+  assert!(
+    next,
+    "the successor accepted the next version at the quorum and its retry met the record"
+  );
+}
+
+/// A green and a work over it, created through `client` on the owner.
+fn green_with_work(client: &mut Client, name: &str) -> (VolumeId, VolumeId) {
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: name.to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: format!("{name}-work"),
+  }) else {
+    panic!("create work");
+  };
+  (green, work)
+}
+
+/// Submits three versions from `work` on its owner: each acceptance resolves within the placement
+/// deadline once the version commits at the quorum (AUD-11) and answers the expected version.
+fn commit_three_versions(client: &mut Client, work: VolumeId) {
+  for (version, (at, bytes)) in [(0u64, "hello"), (5, " world"), (11, "!")]
+    .into_iter()
+    .enumerate()
+  {
+    edit_work(client, work, at, bytes);
+    let started = Instant::now();
+    let submitted = client
+      .try_call(
+        &RequestBody::Submit {
+          work,
+          evidence: Vec::new(),
+        },
+        u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap_or(u64::MAX),
+      )
+      .expect("the acceptance resolves once the version commits at the quorum");
+    let expected = u64::try_from(version).unwrap() + 1;
+    assert!(
+      started.elapsed() < PLACEMENT_DEADLINE,
+      "version {expected}'s acceptance resolved within the placement deadline"
+    );
+    assert!(
+      matches!(submitted, ReplyBody::Submitted { version: Some(v), .. } if v == expected),
+      "version {expected}: {submitted:?}"
+    );
+  }
+}
+
+/// Before the owner dies: whether both holders recomputed version 3 (the successor's own prefix is
+/// what it rebuilds from; the general prefix transfer is owed separately), and whether neither holder
+/// reports a placed version — the green is held there, not owned.
+fn holders_before_owner_death(daemons: &[Daemon], green: VolumeId) -> (bool, bool) {
+  let both_caught_up = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    PLACEMENT_DEADLINE,
+    || {
+      all_hold(daemons[1..].iter().map(|holder| {
+        holder
+          .merge_holder_state(green)
+          .map(|state| state.version == Some(3))
+      }))
+    },
+  );
+  let unowned = daemons[1..]
+    .iter()
+    .all(|holder| holder.merge_record_placed(green, 1) == Ok(false));
+  (both_caught_up, unowned)
+}
+
+/// Declares an insertion of `bytes` at `at` on `work`'s file `f`.
+fn edit_work(client: &mut Client, work: VolumeId, at: u64, bytes: &str) {
+  let edited = client.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at,
+    delete_len: 0,
+    bytes: bytes.as_bytes().to_vec(),
+  });
+  assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
+}
+
+/// What a successor serves of a taken-over green through the public client; a refusal or a missed
+/// deadline is kept as the reply it produced, so the assertion names it.
+#[derive(Debug, PartialEq)]
+struct TakenOverGreenView {
+  /// The head version `Versions` answers.
+  head: Result<u64, Box<ReplyBody>>,
+  /// The bytes of `f` at version 1.
+  at_one: Result<Vec<u8>, Box<ReplyBody>>,
+  /// The bytes of `f` at the head.
+  at_head: Result<Vec<u8>, Box<ReplyBody>>,
+}
+
+/// Observes the taken-over green on `successor`: the head version, the bytes of `f` at version 1,
+/// and at the head.
+fn observe_taken_over_green(successor: &Daemon, green: VolumeId) -> TakenOverGreenView {
+  let mut client = Client::connect(successor.instance());
+  let head = match client
+    .try_call(&RequestBody::Versions { green }, DEADLINE_NS)
+    .unwrap_or_else(|e| refused_placeholder(&e))
+  {
+    ReplyBody::Versions { head } => Ok(head),
+    other => Err(Box::new(other)),
+  };
+  let at_one = read_green_file(
+    &mut client,
+    green,
+    slates_ipc::protocol::ReadAt::Version { version: 1 },
+  );
+  let at_head = read_green_file(&mut client, green, slates_ipc::protocol::ReadAt::Head);
+  TakenOverGreenView {
+    head,
+    at_one,
+    at_head,
+  }
+}
+
+/// Reads `f` of `green` at `at` through `client`.
+fn read_green_file(
+  client: &mut Client,
+  green: VolumeId,
+  at: slates_ipc::protocol::ReadAt,
+) -> Result<Vec<u8>, Box<ReplyBody>> {
+  match client
+    .try_call(
+      &RequestBody::Read {
+        volume: green,
+        path: "f".to_owned(),
+        at,
+      },
+      DEADLINE_NS,
+    )
+    .unwrap_or_else(|e| refused_placeholder(&e))
+  {
+    ReplyBody::ReadBytes { bytes } => Ok(bytes),
+    other => Err(Box::new(other)),
+  }
+}
+
+/// Submits version 4 from a new work on the successor: accepted at the quorum (with the remaining
+/// holder, which recomputes it), placed, and the retry of the same request answered from the record.
+fn submit_next_on_successor(
+  survivors: &[Daemon],
+  successor_index: usize,
+  other_index: usize,
+  green: VolumeId,
+) -> bool {
+  let mut client = Client::connect(survivors[successor_index].instance());
+  let created = client
+    .try_call(
+      &RequestBody::CreateWork {
+        green,
+        name: "successor-work".to_owned(),
+      },
+      DEADLINE_NS,
+    )
+    .unwrap_or_else(|e| refused_placeholder(&e));
+  let ReplyBody::WorkCreated { id: work, base } = created else {
+    eprintln!("create work on the successor: {created:?}");
+    return false;
+  };
+  if base != 3 {
+    return false;
+  }
+  edit_work(&mut client, work, 12, "?");
+  let submit = RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  };
+  let submitted = client
+    .try_call(
+      &submit,
+      u64::try_from(PLACEMENT_DEADLINE.as_nanos()).unwrap_or(u64::MAX),
+    )
+    .unwrap_or_else(|e| refused_placeholder(&e));
+  let accepted = matches!(
+    submitted,
+    ReplyBody::Submitted {
+      version: Some(4),
+      ..
+    }
+  );
+  if !accepted {
+    eprintln!(
+      "successor submit: {submitted:?}; awaiting: {:?}; placed(4): {:?}; successor refusals: {:?}; other holder: {:?}",
+      survivors[successor_index].merge_awaiting(green),
+      survivors[successor_index].merge_record_placed(green, 4),
+      survivors[successor_index].fleet_refusals(),
+      survivors[other_index].merge_holder_state(green),
+    );
+  }
+  let retried = client
+    .try_retry(&submit, DEADLINE_NS)
+    .unwrap_or_else(|e| refused_placeholder(&e));
+  let same = retried == submitted;
+  let observed: Vec<&Daemon> = survivors.iter().collect();
+  let placed = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    survivors[successor_index].merge_record_placed(green, 4)
+  });
+  let recomputed = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    survivors[other_index]
+      .merge_holder_state(green)
+      .map(|state| state.version == Some(4))
+  });
+  if !(same && placed && recomputed) {
+    eprintln!(
+      "successor next version: accepted={accepted} same={same} placed={placed} recomputed={recomputed}; \
+       retried: {retried:?}; other holder: {:?}",
+      survivors[other_index].merge_holder_state(green)
+    );
+  }
+  accepted && same && placed && recomputed
+}
+
+/// The reply shape a bounded call that got no reply stands in for, so the observation records the
+/// refusal (the deadline, a ring fault) rather than panicking mid-history.
+fn refused_placeholder(error: &IpcError) -> ReplyBody {
+  ReplyBody::Refused {
+    refusal: Refusal::BadRequest {
+      reason: error.to_string(),
+    },
+  }
 }
