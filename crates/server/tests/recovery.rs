@@ -157,6 +157,61 @@ fn an_unpublished_verb_is_refused_typed_a_retry_re_executes_and_a_restart_agrees
   second.stop();
 }
 
+/// AC-2.3 (AUD-06's contract, as the CI Linux lane broke it): a verb refused `Unpublished` stays
+/// retryable **across the client's acknowledgements**. The client acknowledges its received replies
+/// every `slots / 2` requests (§4.9, so the daemon's retained records stay bounded); on a runner whose
+/// ring is small that acknowledgement fell between the refusal and the retry, took the refused
+/// sequence with it, and the retry was answered `DuplicateRequest` — the contract's "retry under the
+/// same id" lost to the bookkeeping. Here the acknowledgement is forced right after the refusal: the
+/// retry must still re-execute, so the client's watermark must stop below an unpublished id until it
+/// is retried. Non-vacuous: before the fix the retry was refused `DuplicateRequest`.
+#[test]
+fn an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement() {
+  let profile = profile();
+  let instance = format!("srv-unpublished-ack-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let segment = anchor_segment("unpublished-ack", &profile, &config);
+
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let durable = client.create(&scratch("durable")).unwrap();
+  let create_id = refused_unpublished_create(&daemon, &mut client);
+
+  // The client acknowledges everything it has received — the refusal included, were it naive.
+  client
+    .acknowledge_all()
+    .expect("the acknowledgement is served");
+  assert!(
+    client.acknowledged() < create_id.sequence,
+    "the watermark stops below the unpublished id ({} < {})",
+    client.acknowledged(),
+    create_id.sequence
+  );
+
+  let retried = retry_create(&mut client, create_id, "unpublished");
+  let ReplyBody::Created { id: created } = retried else {
+    panic!("the retry re-executes the create after the acknowledgement: {retried:?}");
+  };
+  assert_ne!(created, durable, "a distinct volume");
+  // Retried and answered, the id no longer holds the watermark back.
+  client
+    .acknowledge_all()
+    .expect("the acknowledgement is served");
+  assert!(
+    client.acknowledged() >= create_id.sequence,
+    "once retried the id is acknowledged like any other"
+  );
+  assert_eq!(
+    names_listed(&mut client),
+    vec!["durable".to_owned(), "unpublished".to_owned()]
+  );
+  daemon.stop();
+  drop(segment);
+}
+
 /// The refused phase: the next publication on whichever shard runs the create is refused before its
 /// record is appended, so the create of "unpublished" comes back typed `Unpublished`, the shard
 /// counts one rollback, and nothing of the verb is listed. Returns the refused request's id, for the

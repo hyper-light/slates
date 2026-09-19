@@ -164,6 +164,19 @@ pub struct Client {
   /// ring's slots, so the daemon retains at most one ring of records per client while the
   /// acknowledgement costs one request in that many.
   ack_every: u32,
+  /// The sequences answered `Unpublished` and not yet retried (AC-2.3; AUD-06): the daemon rolled
+  /// those verbs back and asked for a retry under the same id, so the acknowledgement watermark
+  /// stops below the lowest of them — an acknowledged sequence's record is released, and its retry
+  /// would be refused `DuplicateRequest` (the CI Linux lane's failure: a small ring acknowledged
+  /// between the refusal and the retry). A retry answered anything else releases the id. Numeric
+  /// order: sequences wrap after 2^32 requests.
+  unpublished: std::collections::BTreeSet<u32>,
+  /// Derived: the bound on unpublished ids kept retryable — the ring's slots (`region.slots`), the
+  /// client's own in-flight bound; past it the oldest is forgotten and counted, a caller that never
+  /// retries having chosen so.
+  unpublished_cap: usize,
+  /// Unpublished ids forgotten at the bound.
+  unpublished_forgotten: u64,
   /// Replies drained from the completion ring while looking for another request's reply, held by
   /// their request-id word until their own [`Client::poll_reply`] takes them. The async path drains
   /// the ring on a completion-fd signal and matches by id, so replies that arrive out of order (a
@@ -463,6 +476,7 @@ impl Client {
     let client_id = connected.region.client_id();
     let end = ClientEnd::connected(connected);
     let ack_every = ack_every_of(&end);
+    let unpublished_cap = end.region().cmd().slots().max(1);
     Client {
       instance: instance.to_owned(),
       end,
@@ -472,6 +486,9 @@ impl Client {
       reconnects: 0,
       acknowledged: 0,
       ack_every,
+      unpublished: std::collections::BTreeSet::new(),
+      unpublished_cap,
+      unpublished_forgotten: 0,
       pending: Vec::new(),
       consumer: None,
       bound: false,
@@ -558,12 +575,52 @@ impl Client {
   /// Sends `body` as the next request and returns the reply body, refusals typed.
   pub fn call(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
     // Every `ack_every` replies, the client acknowledges them first (one request), so the
-    // daemon's retained records stay bounded without the caller's help (§4.9).
-    if self.sequence.wrapping_sub(self.acknowledged) >= self.ack_every {
-      let up_to = self.sequence;
+    // daemon's retained records stay bounded without the caller's help (§4.9) — up to the
+    // watermark, which an unpublished id not yet retried holds back.
+    let up_to = self.ack_watermark();
+    if up_to.wrapping_sub(self.acknowledged) >= self.ack_every {
       self.acknowledge(up_to)?;
     }
     self.call_plain(body)
+  }
+
+  /// The highest sequence the client may acknowledge now: everything it has received, unless a verb
+  /// answered `Unpublished` awaits its retry — then the sequence just below the lowest such id, so
+  /// the daemon keeps the ids above it new and the retry re-executes rather than meeting
+  /// `DuplicateRequest` (AC-2.3; AUD-06).
+  fn ack_watermark(&self) -> u32 {
+    self
+      .unpublished
+      .first()
+      .map_or(self.sequence, |&lowest| lowest.wrapping_sub(1))
+  }
+
+  /// Notes what `word`'s reply means for the retryable set: an `Unpublished` refusal keeps the id
+  /// retryable (bounded, the oldest forgotten and counted past the ring's slots); any other answer
+  /// to a retried id releases it.
+  fn note_reply(&mut self, word: u64, body: &ReplyBody) {
+    let sequence = RequestId::from_word(word).sequence;
+    if matches!(
+      body,
+      ReplyBody::Refused {
+        refusal: slates_ipc::protocol::Refusal::Unpublished { .. }
+      }
+    ) {
+      if self.unpublished.len() >= self.unpublished_cap
+        && let Some(oldest) = self.unpublished.pop_first()
+      {
+        self.unpublished_forgotten = self.unpublished_forgotten.saturating_add(1);
+        let _ = oldest;
+      }
+      self.unpublished.insert(sequence);
+    } else {
+      self.unpublished.remove(&sequence);
+    }
+  }
+
+  /// Unpublished ids forgotten at the retryable bound (a caller that never retried them).
+  pub fn unpublished_forgotten(&self) -> u64 {
+    self.unpublished_forgotten
   }
 
   /// One request under the next sequence, without the automatic acknowledgement.
@@ -589,6 +646,7 @@ impl Client {
     loop {
       self.rebind_if_needed()?;
       if let Some(reply) = self.round_trip(id, body)? {
+        self.note_reply(id.word(), &reply);
         return resolved(reply);
       }
     }
@@ -706,11 +764,13 @@ impl Client {
   pub fn poll_reply_word(&mut self, word: u64) -> Result<Option<ReplyBody>, ClientError> {
     if let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) {
       let (_, body) = self.pending.remove(pos);
+      self.note_reply(word, &body);
       return resolved(body).map(Some);
     }
     while let Some(reply) = self.end.try_take()? {
       let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
       if reply.request == word {
+        self.note_reply(word, &body);
         return resolved(body).map(Some);
       }
       self.buffer(reply.request, body);
@@ -839,8 +899,8 @@ impl Client {
   /// sync path, without a blocking round trip on the event loop. The acknowledged mark advances
   /// optimistically; a lost ack only means the daemon holds a little more until the next one.
   pub fn begin_ack_if_due(&mut self) -> Result<(), ClientError> {
-    if self.sequence.wrapping_sub(self.acknowledged) >= self.ack_every {
-      let up_to = self.sequence;
+    let up_to = self.ack_watermark();
+    if up_to.wrapping_sub(self.acknowledged) >= self.ack_every {
       self.begin(&RequestBody::Acknowledge { up_to })?;
       self.acknowledged = self.acknowledged.max(up_to);
     }
@@ -1854,8 +1914,10 @@ impl Client {
     }
   }
 
-  /// Acknowledges every completion up to `up_to` (releases their records).
+  /// Acknowledges every completion up to `up_to` (releases their records) — held below an
+  /// unpublished id awaiting its retry, whatever `up_to` asks (AC-2.3; AUD-06).
   pub fn acknowledge(&mut self, up_to: u32) -> Result<(), ClientError> {
+    let up_to = up_to.min(self.ack_watermark());
     match self.call_plain(&RequestBody::Acknowledge { up_to })? {
       ReplyBody::Acknowledged => {
         self.acknowledged = self.acknowledged.max(up_to);
@@ -1872,9 +1934,10 @@ impl Client {
     self.acknowledged
   }
 
-  /// Acknowledges everything this client has received so far.
+  /// Acknowledges everything this client has received so far — short of an unpublished id awaiting
+  /// its retry.
   pub fn acknowledge_all(&mut self) -> Result<(), ClientError> {
-    let up_to = self.sequence;
+    let up_to = self.ack_watermark();
     self.acknowledge(up_to)
   }
 
