@@ -960,6 +960,16 @@ ring and kicks the driver; a stale generation is ignored.
 > refusal is observed before the caller starts waiting. Evidence: the audit follow-up records the
 > failing regressions and the 71-test server unit run.
 
+> **Status (2026-09-19, startup and kick lifetime):** Unix kicks carry a registration
+> generation and borrow the entry's immutable descriptor under the existing reader count.
+> Retirement removes the entry from lookup, waits for existing readers, drops the entry,
+> then publishes the free generation. A copied kick cannot address a replacement shard.
+> Simulation kicks follow the same rule, with all contexts cancelled before their pair
+> rings retire. The forced-overlap regression reproduces the former close-during-borrow.
+> Fixed-capacity timer slabs reserve their exact bound in one segment: CI's 1,617,130-timer
+> geometry takes four allocator calls rather than 25,271, and use/renewal/expiry allocate
+> nothing. These corrections supersede the older delayed-entry-retirement description.
+
 **Loop.** Each iteration: drain the driver's completions (io_uring CQ / kqueue events / IOCP
 packets) into the run queue; drain inbound rings (client command rings, cross-shard rings, the
 bridge queue) up to a batch bound derived from the measured service time and the latency budget;
@@ -1735,6 +1745,13 @@ Ownership: the daemon creates the region (memfd / shm_open object / pagefile sec
 and hands it to one client; the client writes only `cmd` slots and the `parked` flag; the daemon
 writes only `cpl` slots and the wake word; large payloads (archive streams, big reads through the
 SDK) travel through a per-client bulk region referenced by offset from a slot.
+
+> **Status (2026-09-19, Linux rendezvous):** the control shard drains the listener and
+> awaits its next one-shot driver readiness. Connections already queued or arriving during
+> registration remain readable. No Linux doorbell thread polls a pending connection and
+> repeatedly kicks every shard. Other platforms retain their shared-memory word watcher.
+> The local delayed-accept regression fails before and passes after the change; the traced
+> startup assertion remains unchanged. See the dated startup/kick-retirement bug report.
 
 **Rendezvous.** Linux: connect to the abstract-namespace socket `@slates/<uid>/<instance>`, the
 daemon checks `SO_PEERCRED`, sends the region fd with `SCM_RIGHTS`, and both sides close the
@@ -5323,3 +5340,17 @@ fleet,consensus,verbs,nfs}`, `ipc/protocol`, `cli/{args,verbs}`, and affected st
 - Applied in the same change to: §4.8 Lookup/status, server owner_location/state/daemon/fleet/verbs,
   fleet regressions, GAPS, and the dated remote-lookup bug report. No consensus algorithm or model
   is changed; A-9's lease and configuration state-transfer refinement obligations remain open.
+
+
+### A-23 (2026-09-19) — Pin kick borrows and await Linux rendezvous readiness
+
+- Unix and simulated kicks name a registry generation. Retirement waits for existing
+  borrowers before closing/freeing resources and allows slot reuse only afterward.
+- Linux rendezvous uses the control shard's one-shot driver registration. Timer storage
+  reserves a fixed admission bound without one allocation per 64 possible timers.
+- Evidence: forced-overlap retirement, delayed acceptance, and counting-allocator regressions
+  each fail on their old behavior. The FUSE fixture also follows production's ownership
+  stamp; its real mount fails before and passes after as an ordinary Linux user.
+- Applied in the same change to: §4.3 and §4.7 status; mem/rt/server code and regressions;
+  FUSE fixtures and ownership regression; GAPS; TBD_FIXES; the two dated bug reports.
+  No consensus rule or model changes. Windows IOCP ownership is separately ledgered.

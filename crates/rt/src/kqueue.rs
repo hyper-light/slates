@@ -3,7 +3,7 @@
 //! sockets by readiness through the same `wait`.
 //!
 //! The queue is created and its kick event registered by [`prepare`] on whatever thread builds
-//! the shard's seed (the descriptor is leaked so the registry's kick can name it for the process);
+//! the shard's seed (the registry owns the descriptor and pins each foreign borrow);
 //! the driver itself, which holds an event buffer of raw kernel records, is built on the shard's
 //! own thread by [`KqueueDriver::from_prepared`]. rustix marks `kevent` unsafe because the
 //! output buffer is filled by the kernel; the three calls here pass a change list of valid
@@ -30,7 +30,7 @@ const EVENTS_PER_WAIT: usize = 64;
 
 /// The driver.
 pub struct KqueueDriver {
-  kq: &'static KickFd,
+  kq: KickFd,
   epoch: Instant,
   events: Vec<Event>,
   nops: Vec<u64>,
@@ -81,7 +81,7 @@ pub fn trigger(kq: &KickFd) {
 
 impl KqueueDriver {
   /// Builds the driver over the slot's prepared queue, on the shard's thread.
-  pub fn from_prepared(kq: &'static KickFd) -> KqueueDriver {
+  pub fn from_prepared(kq: KickFd) -> KqueueDriver {
     KqueueDriver {
       kq,
       epoch: Instant::now(),
@@ -114,23 +114,20 @@ impl Driver for KqueueDriver {
       timeout = Some(Duration::ZERO);
     }
     self.events.clear();
-    // SAFETY: no changes; the output buffer is the vector's spare capacity, which the call fills
-    // and marks initialized up to the count it returns.
-    let outcome = unsafe {
-      let Some(kq) = self.kq.fd() else {
-        // The slot closed the queue: the shard unregistered, so there is nothing left to wait on.
-        return Err(refused(
-          "kevent(wait) on a closed queue",
-          rustix::io::Errno::BADF,
-        ));
-      };
-      kevent(
-        kq,
-        &[],
-        rustix::buffer::spare_capacity(&mut self.events),
-        timeout,
-      )
-    };
+    let outcome = self
+      .kq
+      .with(|kq| {
+        // SAFETY: no changes; the output buffer is the vector's spare capacity.
+        unsafe {
+          kevent(
+            kq,
+            &[],
+            rustix::buffer::spare_capacity(&mut self.events),
+            timeout,
+          )
+        }
+      })
+      .ok_or(RtError::DriverLost)?;
     if let Err(e) = outcome {
       return match e {
         rustix::io::Errno::INTR => Ok(()),
@@ -164,15 +161,13 @@ impl Driver for KqueueDriver {
       core::ptr::without_provenance_mut(usize::try_from(user_data).unwrap_or(usize::MAX)),
     );
     let mut none: Vec<Event> = Vec::new();
-    // SAFETY: one valid change record on the open queue; the empty output buffer receives nothing.
-    let kq = self.kq.fd().ok_or_else(|| {
-      refused(
-        "kevent(EVFILT_READ) on a closed queue",
-        rustix::io::Errno::BADF,
-      )
-    })?;
-    // SAFETY: one valid change record on the open queue; the empty output buffer receives nothing.
-    unsafe { kevent(kq, &[event], &mut none, None) }
+    self
+      .kq
+      .with(|kq| {
+        // SAFETY: one valid change record on the open queue; the output buffer receives nothing.
+        unsafe { kevent(kq, &[event], &mut none, None) }
+      })
+      .ok_or(RtError::DriverLost)?
       .map_err(|e| refused("kevent(EVFILT_READ)", e))?;
     Ok(())
   }
@@ -187,15 +182,13 @@ impl Driver for KqueueDriver {
       core::ptr::without_provenance_mut(usize::try_from(user_data).unwrap_or(usize::MAX)),
     );
     let mut none: Vec<Event> = Vec::new();
-    // SAFETY: one valid change record on the open queue; the empty output buffer receives nothing.
-    let kq = self.kq.fd().ok_or_else(|| {
-      refused(
-        "kevent(EVFILT_WRITE) on a closed queue",
-        rustix::io::Errno::BADF,
-      )
-    })?;
-    // SAFETY: one valid change record on the open queue; the empty output buffer receives nothing.
-    unsafe { kevent(kq, &[event], &mut none, None) }
+    self
+      .kq
+      .with(|kq| {
+        // SAFETY: one valid change record on the open queue; the output buffer receives nothing.
+        unsafe { kevent(kq, &[event], &mut none, None) }
+      })
+      .ok_or(RtError::DriverLost)?
       .map_err(|e| refused("kevent(EVFILT_WRITE)", e))?;
     Ok(())
   }

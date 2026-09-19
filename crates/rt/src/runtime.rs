@@ -217,7 +217,7 @@ pub(crate) fn connect_pairs(seeds: &mut [ShardSeed]) -> Result<(), RtError> {
 /// The slot's kick for an OS driver: its descriptor, owned by the slot (Unix), or none (Windows: the
 /// completion port is the driver's).
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-fn register_kick(fd: Option<std::os::fd::OwnedFd>) -> registry::RegisterKick {
+pub(crate) fn register_kick(fd: Option<std::os::fd::OwnedFd>) -> registry::RegisterKick {
   match fd {
     Some(fd) => registry::RegisterKick::Descriptor(fd, Kick::Kqueue),
     None => registry::RegisterKick::Kick(Kick::None),
@@ -225,7 +225,7 @@ fn register_kick(fd: Option<std::os::fd::OwnedFd>) -> registry::RegisterKick {
 }
 
 #[cfg(target_os = "linux")]
-fn register_kick(fd: Option<std::os::fd::OwnedFd>) -> registry::RegisterKick {
+pub(crate) fn register_kick(fd: Option<std::os::fd::OwnedFd>) -> registry::RegisterKick {
   match fd {
     Some(fd) => registry::RegisterKick::Descriptor(fd, Kick::Eventfd),
     None => registry::RegisterKick::Kick(Kick::None),
@@ -233,7 +233,7 @@ fn register_kick(fd: Option<std::os::fd::OwnedFd>) -> registry::RegisterKick {
 }
 
 #[cfg(not(unix))]
-fn register_kick(_fd: Option<()>) -> registry::RegisterKick {
+pub(crate) fn register_kick(_fd: Option<()>) -> registry::RegisterKick {
   registry::RegisterKick::Kick(Kick::None)
 }
 

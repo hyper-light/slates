@@ -5,8 +5,9 @@
 //! turn; when all are idle it advances the clock to the earliest deadline any shard asked for,
 //! and stops when no shard has a deadline or a message. Fault injection: `kill_driver` makes a
 //! shard's next wait fail with `DriverLost`, which the shard answers by cancelling every task
-//! with a terminal completion and exiting (T-0.7). The shared state is atomics behind leaked
-//! `&'static` references, so a kick is a plain `Copy` handle and nothing here is unsafe.
+//! with a terminal completion and exiting (T-0.7). The registry owns each shard's flags.
+//! Kicks carry a registration generation and pin the flags for their borrow; the owning
+//! driver borrows them until its context ends. The runtime owns the shared clock.
 //!
 //! The simulated UDP fabric below carries the fleet plane at N=1 and, since 2026-09-14, models a path's
 //! latency ([`SimDelay`]: a one-way delay with seeded jitter, in order per flow unless told otherwise) so
@@ -380,6 +381,7 @@ impl SimShared {
 /// The simulation driver of one shard.
 #[derive(Debug)]
 pub struct SimDriver {
+  kick: Kick,
   shared: &'static SimShared,
   clock: &'static SimShared,
   nops: Vec<u64>,
@@ -391,7 +393,7 @@ impl Driver for SimDriver {
   }
 
   fn kick_handle(&self) -> Kick {
-    Kick::Sim(self.shared)
+    self.kick
   }
 
   fn now_ns(&self) -> u64 {
@@ -487,13 +489,16 @@ impl Drop for SimRuntime {
   /// current-context cell a bare step left pointing at it) and its slot given back — before this, a
   /// simulation reclaimed nothing (its slots were never unregistered, so a test binary spent one of
   /// the registry's slots per simulation for good). The per-shard flags are the slots' own (a retired
-  /// entry's `Kick::Sim` points at them and may be kicked by a stale waker until the slot's next
-  /// registration), and the clock is this runtime's box, dropped after the contexts.
+  /// entry is reclaimed after the last counted kick borrow), and the clock is this runtime's
+  /// allocation, dropped after the contexts.
   fn drop(&mut self) {
+    let ids: Vec<_> = self.shards.iter().map(|context| context.id).collect();
     for ctx in &self.shards {
-      let id = ctx.id;
-      crate::registry::note_arena_generation(id, ctx.arena_generation_high());
-      crate::registry::reclaim_context(id);
+      crate::registry::note_arena_generation(ctx.id, ctx.arena_generation_high());
+      crate::registry::reclaim_context(ctx.id);
+    }
+    // Cancellation can wake another shard. Keep every pair ring until all contexts ended.
+    for id in ids {
       crate::registry::unregister(id);
     }
     // SAFETY: the allocation was made by `Box::new` in `new` and is freed exactly once, here, after
@@ -521,11 +526,21 @@ impl SimRuntime {
       // The driver takes its flags from the kick the slot minted over them (the flags are the slot's,
       // so a stale waker may still kick them after this simulation ends; see `registry::Entry`).
       let driver: DriverSeed = Box::new(move |kick| match kick {
-        Kick::Sim(flags) => Ok(Box::new(SimDriver {
-          shared: flags,
-          clock,
-          nops: Vec::new(),
-        }) as Box<dyn Driver>),
+        Kick::Sim(holder) => {
+          // The owning thread borrows the entry until its context is reclaimed. Foreign
+          // kicks carry only the holder and borrow under the registry's reader pin.
+          let flags = crate::registry::entry(holder.shard())
+            .and_then(|entry| entry.sim_shared.as_deref())
+            .ok_or(RtError::ShardGone {
+              shard: holder.shard(),
+            })?;
+          Ok(Box::new(SimDriver {
+            kick,
+            shared: flags,
+            clock,
+            nops: Vec::new(),
+          }) as Box<dyn Driver>)
+        }
         _ => Err(RtError::DriverRefused {
           call: "a simulated shard registered without simulated flags",
           code: None,
@@ -536,12 +551,11 @@ impl SimRuntime {
         driver,
         crate::registry::RegisterKick::Sim(Box::new(SimShared::new(seed))),
       )?;
-      let Some(Kick::Sim(flags)) = crate::registry::with_entry(registered.id, |entry| entry.kick)
-      else {
-        return Err(RtError::ShardGone {
+      let flags = crate::registry::entry(registered.id)
+        .and_then(|entry| entry.sim_shared.as_deref())
+        .ok_or(RtError::ShardGone {
           shard: registered.id,
-        });
-      };
+        })?;
       shared.push(flags);
       seeds.push(registered);
     }

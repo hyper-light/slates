@@ -4,11 +4,11 @@
 //!
 //! Phase 0 carries the seam itself, the kick, the wait with a deadline, a pending check, and a
 //! no-op operation whose completion proves the path; sockets, files and the bridge queues arrive
-//! with their phases and use the same `wait`. The descriptors a kick names are leaked for the
-//! process, so a kick is a `Copy` of a `&'static` handle and needs no unsafe code.
+//! with their phases and use the same `wait`. Unix kicks carry a registry generation, not a
+//! borrowed descriptor. The registry pins each borrow until its syscall finishes (§4.3).
 
 use crate::error::RtError;
-use crate::sim::SimShared;
+use crate::registry::SlotHolder;
 
 /// A finished operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,98 +47,51 @@ impl DriverKind {
   }
 }
 
-/// The thread-safe handle that wakes a driver from anywhere. The descriptor forms hold their
-/// descriptor through a [`KickFd`] the registry slot owns and closes at unregistration, so a kick
-/// that outlives its shard writes to a closed descriptor (an error the kick ignores) and never to a
-/// descriptor number a later open reused.
+/// The thread-safe handle that wakes a driver from anywhere. Unix descriptors and simulation
+/// flags are reached by registry generation, under a reader pin. Retirement waits for existing
+/// borrows, and a copied kick cannot address a later registration in the same slot.
 #[derive(Clone, Copy, Debug)]
 pub enum Kick {
   /// Write eight bytes to an eventfd (Linux; io_uring and epoll).
   #[cfg(target_os = "linux")]
-  Eventfd(&'static KickFd),
+  Eventfd(KickFd),
   /// Trigger the `EVFILT_USER` event on a kqueue (macOS / BSD).
   #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-  Kqueue(&'static KickFd),
+  Kqueue(KickFd),
   /// Post a completion packet to a port (Windows), by its exposed address.
   #[cfg(target_os = "windows")]
   Iocp(usize),
   /// Set the simulation's kicked flag.
-  Sim(&'static SimShared),
+  Sim(SlotHolder),
   /// No driver to kick (registry entries in tests).
   None,
 }
 
-/// A kick descriptor the registry slot owns: the eventfd or kqueue the driver waits on. It is closed
-/// by [`KickFd::close`] at unregistration (the raw descriptor is released and the number may be
-/// reused by a later `open`), after which every kick through it is a no-op — the `closed` flag is
-/// checked before the descriptor is touched, so a stale kick never writes to a reused number.
+/// A copyable, generational name for a registry-owned descriptor (§4.3, D-8).
+/// Each borrow is counted by the registry; retirement removes the entry from lookup,
+/// waits out existing borrowers, and only then closes the descriptor. No reference escapes.
 #[cfg(unix)]
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct KickFd {
-  fd: std::cell::UnsafeCell<Option<std::os::fd::OwnedFd>>,
-  closed: std::sync::atomic::AtomicBool,
+  holder: SlotHolder,
 }
-
-// SAFETY: the descriptor is written exactly twice — at construction (before the value is shared)
-// and at `close` (by the unregistering thread, after the shard thread joined, with `closed` set
-// `Release` first so every later reader sees the flag before it could see the slot emptied); every
-// other access is a read of the `Option` guarded by an `Acquire` load of `closed`. The kick path
-// reads the descriptor number and issues one syscall; it never mutates.
-#[cfg(unix)]
-unsafe impl Sync for KickFd {}
-// SAFETY: as for `Sync`: the only owner-side mutation is `close`, ordered by the `closed` flag, and
-// an `OwnedFd` is `Send`; moving the `KickFd` to another thread moves the descriptor with it.
-#[cfg(unix)]
-unsafe impl Send for KickFd {}
 
 #[cfg(unix)]
 impl KickFd {
-  /// Owns `fd` for the slot.
-  pub fn new(fd: std::os::fd::OwnedFd) -> KickFd {
-    KickFd {
-      fd: std::cell::UnsafeCell::new(Some(fd)),
-      closed: std::sync::atomic::AtomicBool::new(false),
-    }
+  pub(crate) fn new(holder: SlotHolder) -> Self {
+    Self { holder }
   }
 
-  /// Runs `f` with the descriptor unless the slot closed it.
+  /// Runs `f` while this registration's descriptor is pinned. A stale kick is a typed miss.
   pub fn with<R>(&self, f: impl FnOnce(&std::os::fd::OwnedFd) -> R) -> Option<R> {
-    if self.closed.load(std::sync::atomic::Ordering::Acquire) {
-      return None;
-    }
-    // SAFETY: `closed` is false, so `close` has not run; the value was written before the
-    // `KickFd` was shared and is not mutated while `closed` is false (see the `Sync` note).
-    unsafe { (*self.fd.get()).as_ref() }.map(f)
+    crate::registry::with_holder(self.holder, |entry| entry.kick_fd.as_ref().map(f)).flatten()
   }
 
-  /// The descriptor for the shard's own driver (its thread; the slot closes it only after that
-  /// thread ended), `None` once closed.
-  pub fn fd(&self) -> Option<&std::os::fd::OwnedFd> {
-    if self.closed.load(std::sync::atomic::Ordering::Acquire) {
-      return None;
-    }
-    // SAFETY: as in `with`: `closed` is false, so the value is present and unmutated.
-    unsafe { (*self.fd.get()).as_ref() }
-  }
-
-  /// The raw descriptor number, for a waiter that polls it (the anchor's doorbell); `None` once
-  /// closed.
+  /// The owning runtime may hand this number to its driver or IPC while its shards live.
+  /// Foreign callers that need a descriptor beyond this call must duplicate it inside `with`.
   pub fn raw(&self) -> Option<i32> {
     use std::os::fd::AsRawFd;
     self.with(|fd| fd.as_raw_fd())
-  }
-
-  /// Closes the descriptor: the flag first, then the value, so no kick observes a closed number.
-  /// Called once, by the unregistering thread, after the driver's thread has ended.
-  pub fn close(&self) {
-    if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
-      return;
-    }
-    // SAFETY: `closed` was just set from false by this thread, so `with` returns `None` to every
-    // reader from now on and no reader is inside the value: `with` loads the flag before it borrows,
-    // and the shard thread that could borrow without the flag has ended (the caller joined it).
-    let fd = unsafe { (*self.fd.get()).take() };
-    drop(fd);
   }
 }
 
@@ -146,17 +99,6 @@ impl Kick {
   /// A kick that does nothing.
   pub const fn none() -> Kick {
     Kick::None
-  }
-
-  /// Closes the kick's descriptor, if it owns one (unregistration).
-  pub fn close(&self) {
-    match self {
-      #[cfg(target_os = "linux")]
-      Kick::Eventfd(fd) => fd.close(),
-      #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-      Kick::Kqueue(fd) => fd.close(),
-      _ => {}
-    }
   }
 
   /// Wakes the driver. Errors are ignored: a closed driver belongs to a shard that exited, and
@@ -171,7 +113,13 @@ impl Kick {
       Kick::Kqueue(kq) => crate::kqueue::trigger(kq),
       #[cfg(target_os = "windows")]
       Kick::Iocp(port) => crate::iocp::post_kick(*port),
-      Kick::Sim(shared) => shared.set_kicked(),
+      Kick::Sim(holder) => {
+        let _ = crate::registry::with_holder(*holder, |entry| {
+          if let Some(shared) = &entry.sim_shared {
+            shared.set_kicked();
+          }
+        });
+      }
       Kick::None => {}
     }
   }
@@ -336,31 +284,15 @@ pub(crate) fn refused(call: &'static str, e: rustix::io::Errno) -> RtError {
 mod tests {
   use super::*;
 
-  #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-  fn test_kick(fd: Option<std::os::fd::OwnedFd>) -> Kick {
-    fd.map_or(Kick::None, |fd| {
-      Kick::Kqueue(Box::leak(Box::new(KickFd::new(fd))))
-    })
-  }
-  #[cfg(target_os = "linux")]
-  fn test_kick(fd: Option<std::os::fd::OwnedFd>) -> Kick {
-    fd.map_or(Kick::None, |fd| {
-      Kick::Eventfd(Box::leak(Box::new(KickFd::new(fd))))
-    })
-  }
-  #[cfg(not(unix))]
-  fn test_kick(_fd: Option<()>) -> Kick {
-    Kick::None
-  }
-
   #[test]
   #[cfg_attr(miri, ignore)]
   fn the_os_driver_wakes_on_a_kick_and_delivers_a_nop() {
     let prepared = os_driver(64).unwrap();
     let notes = prepared.notes.clone();
-    // The kick over the prepared descriptor, as the registry slot would mint it (leaked: a unit
-    // test's one-off, D-8's harness exception; in the runtime the slot owns and closes it).
-    let kick = test_kick(prepared.kick_fd);
+    // Exercise the real registration and retirement protocol, including the foreign kick.
+    let (shard, _control) =
+      crate::registry::register(2, 1, crate::runtime::register_kick(prepared.kick_fd)).unwrap();
+    let kick = crate::registry::with_entry(shard, |entry| entry.kick).unwrap();
     let mut driver = (prepared.seed)(kick).unwrap();
     eprintln!("driver {} notes {notes:?}", driver.kind().name());
     let kick = driver.kick_handle();
@@ -377,5 +309,7 @@ mod tests {
     let before = driver.now_ns();
     driver.wait(Some(2_000_000), &mut out).unwrap();
     assert!(driver.now_ns() - before >= 1_000_000);
+    drop(driver);
+    crate::registry::unregister(shard);
   }
 }

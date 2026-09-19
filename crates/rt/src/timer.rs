@@ -53,8 +53,10 @@ impl Wheel {
   /// A wheel with `tick_ns` per tick, room for `max_timers` timers, starting at `now_ns`.
   pub fn new(tick_ns: u64, max_timers: usize, now_ns: u64) -> Self {
     let tick_ns = tick_ns.max(1);
-    let mut entries = Slab::new(SLOTS_PER_LEVEL, max_timers);
-    entries.reserve_segments(max_timers.div_ceil(SLOTS_PER_LEVEL));
+    // The wheel's bucket count is unrelated to its storage geometry. Reserve the bounded
+    // slab once; one allocation per bucket-sized segment made empty partitions expensive
+    // to start (25,271 allocations at CI's 1,617,130-timer bound, 2026-09-19).
+    let entries = Slab::preallocated(max_timers);
     Self {
       tick_ns,
       now_tick: now_ns / tick_ns,

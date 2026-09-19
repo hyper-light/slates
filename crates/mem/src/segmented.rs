@@ -31,6 +31,16 @@ impl<T> Segmented<T> {
     }
   }
 
+  /// One reserved segment for a slab with a fixed admission bound (§4.2). The slab must
+  /// refuse growth past `capacity`: the final segment may be shorter than the index stride.
+  /// Reserve exactly the admitted slots, without rounding the backing allocation up.
+  pub(crate) fn preallocated(capacity: usize) -> Self {
+    let mut storage = Self::new(capacity);
+    storage.segments = Vec::with_capacity(1);
+    storage.reserve = vec![Vec::with_capacity(capacity)];
+    storage
+  }
+
   /// Elements per segment.
   pub const fn segment_len(&self) -> usize {
     self.segment_len
@@ -48,7 +58,11 @@ impl<T> Segmented<T> {
 
   /// Elements the array can hold before it needs another segment.
   pub fn capacity(&self) -> usize {
-    self.segments.len().saturating_mul(self.segment_len)
+    self.segments.last().map_or(0, |last| {
+      (self.segments.len() - 1)
+        .saturating_mul(self.segment_len)
+        .saturating_add(last.capacity().min(self.segment_len))
+    })
   }
 
   /// Pre-allocates `count` segments for later growth (the cold path, run in idle time).

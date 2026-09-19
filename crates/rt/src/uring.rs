@@ -25,7 +25,7 @@ const POLL_WRITABLE: u32 = libc::POLLOUT as u32;
 /// The driver.
 pub struct UringDriver {
   ring: IoUring,
-  efd: &'static crate::driver::KickFd,
+  efd: crate::driver::KickFd,
   epoch: Instant,
   notes: Vec<String>,
   multishot: bool,
@@ -94,10 +94,7 @@ fn build_ring(entries: u32) -> Result<(IoUring, &'static str), RtError> {
 
 impl UringDriver {
   /// Builds the driver over a prepared eventfd, on the shard's thread.
-  pub fn with_eventfd(
-    efd: &'static crate::driver::KickFd,
-    entries: u32,
-  ) -> Result<UringDriver, RtError> {
+  pub fn with_eventfd(efd: crate::driver::KickFd, entries: u32) -> Result<UringDriver, RtError> {
     let (ring, flags) = build_ring(entries)?;
     let mut driver = UringDriver {
       ring,

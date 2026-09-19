@@ -179,7 +179,7 @@ impl Listener {
     self.inner.doorbell_waiter()
   }
 
-  /// The listening socket's descriptor (Linux), for the doorbell thread's readiness wait.
+  /// The listening socket's descriptor (Linux), for the owning control shard's readiness wait.
   pub fn raw_fd(&self) -> Option<i32> {
     self.inner.raw_fd()
   }
@@ -524,8 +524,9 @@ pub mod platform {
       };
       let kick = match kick_fd {
         Some(fd) => rustix::io::dup(
-          // SAFETY: the number names the shard's kick eventfd, a descriptor the runtime
-          // leaked for the process; borrowing it for the duplicate is sound.
+          // SAFETY: the caller's control shard is completing this handoff. The runtime
+          // keeps every shard's kick descriptor until all its shard threads have joined,
+          // so the eventfd stays open throughout this duplicate.
           unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) },
         )
         .map_err(|e| lost(refused("dup", e)))?,

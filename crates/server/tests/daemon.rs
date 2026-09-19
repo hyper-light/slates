@@ -138,6 +138,92 @@ fn scratch(name: &str) -> RequestBody {
   }
 }
 
+/// AC-2.6, §4.7: hold both shards, queue a real Linux rendezvous connection, then release
+/// them. The pending listener must not ring an unrelated shard's eventfd, and connections
+/// arriving before and after readiness is rearmed must still complete.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_pending_rendezvous_does_not_repeatedly_kick_the_shards() {
+  use rustix::event::{PollFd, PollFlags, Timespec};
+  use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+  use slates_rt::{control::Control, driver::Kick, registry, task::SpawnRequest};
+  use std::sync::mpsc::sync_channel;
+
+  let (daemon, instance) = daemon("pending-rendezvous");
+  let mut releases = Vec::new();
+  for shard in daemon.shards() {
+    let (entered, held) = sync_channel(0);
+    let (release, released) = sync_channel(0);
+    registry::send_control(
+      shard.0,
+      Control::Spawn(Box::new(SpawnRequest::new(
+        Box::pin(async move {
+          entered.send(()).unwrap();
+          released.recv_timeout(CREDIT_WAIT).unwrap();
+        }),
+        None,
+      ))),
+    )
+    .unwrap();
+    held.recv_timeout(CREDIT_WAIT).unwrap();
+    releases.push(release);
+  }
+  let Kick::Eventfd(observer) =
+    registry::with_entry(daemon.shards()[1].0, |entry| entry.kick).unwrap()
+  else {
+    panic!("Linux shard has an eventfd")
+  };
+  // Consume the kick that admitted the hold. Both shards are now held and cannot drain
+  // their descriptors, so even one unwanted kick is observable without timing a busy loop.
+  observer
+    .with(|fd| {
+      let mut word = [0; size_of::<u64>()];
+      match rustix::io::read(fd, &mut word) {
+        Ok(_) | Err(rustix::io::Errno::AGAIN) => {}
+        Err(error) => panic!("draining the admission kick: {error}"),
+      }
+    })
+    .unwrap();
+  let peer = rustix::net::socket_with(
+    AddressFamily::UNIX,
+    SocketType::STREAM,
+    SocketFlags::CLOEXEC,
+    None,
+  )
+  .unwrap();
+  let uid = rustix::process::getuid().as_raw();
+  let address =
+    SocketAddrUnix::new_abstract_name(format!("slates-rv-{instance}/{uid}").as_bytes()).unwrap();
+  rustix::net::connect(&peer, &address).unwrap();
+  rustix::io::write(&peer, &0u32.to_le_bytes()).unwrap();
+  let kicked = observer
+    .with(|fd| {
+      let mut poll = [PollFd::new(fd, PollFlags::IN)];
+      // Derived: one normal heartbeat period in which the old watcher would spin.
+      let timeout =
+        Timespec::try_from(Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS)).unwrap();
+      rustix::event::poll(&mut poll, Some(&timeout)).unwrap() != 0
+    })
+    .unwrap();
+  for release in releases {
+    release.send(()).unwrap();
+  }
+  // Closing the queued peer lets the accept round finish even if it has not sent its handoff.
+  drop(peer);
+  assert!(
+    !kicked,
+    "a pending connection woke an unrelated, held shard"
+  );
+  for _ in 0..TEST_SHARDS {
+    let mut client = Client::connect(&instance);
+    assert!(matches!(
+      client.call(&RequestBody::List),
+      ReplyBody::Listed { .. }
+    ));
+  }
+  drop(daemon);
+}
+
 /// A freshly bootstrapped `f = 1` fleet under the operator's durability policy. Its two
 /// configured peers are unreachable, so only the bootstrap host is admitted. The durability
 /// calculation must not count those absent peers as replicas (§4.8, AUD-07).

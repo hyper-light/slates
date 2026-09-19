@@ -137,14 +137,18 @@ slates-mem = 16
 # 2026-09-14 (−1, the KIND lane: the epoll one-shot re-arm — `docs/bugs/2026-09-14-epoll-readiness-re-add-eexist.md`):
 # the second `BorrowedFd::borrow_raw` of the readiness re-add is gone with the re-add itself (the
 # descriptor is re-armed with `EPOLL_CTL_MOD` through the one remaining borrow).
-slates-rt = 67
+# 2026-09-19 (-8): generational Unix/simulation kicks remove KickFd's UnsafeCell,
+# unsafe Send/Sync, escaping descriptor borrows, and self-references. Registry retirement
+# pins foreign borrows before closing. Forced-overlap regression fails before and passes after.
+slates-rt = 59
 slates-base = 6
 slates-vfs = 0
 slates-land = 3
 slates-anchor = 6
 slates-db = 0
 slates-ipc = 35
-slates-server = 5
+# 2026-09-19 (-1): Linux rendezvous awaits driver readiness; no raw-fd polling thread.
+slates-server = 4
 slates-client = 0
 slates-cli = 4
 slates-wire = 4

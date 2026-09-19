@@ -79,24 +79,30 @@ Command (bounded Linux container, quantum image): `docker run --rm --network=non
 
 ## 3. Additional concrete follow-ups found during this repair
 
-- [ ] **Rendezvous wake amplification (2026-09-19).** A pending Linux listen socket remains
-  level-readable until the control shard accepts it. `doorbell::run` immediately polls again
-  and kicks every shard, even when its pending flag is already set. CI recorded about 8,000
-  eventfd writes before the first heartbeat kill. Coalesce readiness with an acknowledgement
-  or drain/rearm protocol that cannot lose a connection and does not busy-spin. Prove delayed
-  accept, a new connection during rearm, and prompt owned shutdown.
-- [ ] **Lease timer reservation at boot (2026-09-19).** `Partition::new` creates a wheel sized
-  for every possible volume; `Wheel::new` separately allocates every 64-entry segment. The
-  traced fixture derives 1,145,554 potential volumes per shard before any exist. Rework
-  reservation geometry or bounded preparation without moving allocation onto lease renewal;
-  preserve stale-handle refusal, cancellation and expiry. Record allocation counts and startup
-  cost. The conformance tracer repair does not fix this product cost.
-- [ ] **Kick descriptor close/borrow race (source review, 2026-09-19).** `KickFd::with` can read
-  `closed == false` before `close` sets it and mutates the `UnsafeCell<Option<OwnedFd>>`.
-  Joining the shard does not join arbitrary foreign kick callers. The flag alone neither
-  protects the borrow nor prevents a syscall on a reused descriptor. Remove the unsupported
-  unsafe Send/Sync ownership claim through a lifetime-safe design, and add a forced overlapping
-  close/kick regression. This review found the interleaving; it has not reproduced the race.
+- [x] **Rendezvous wake amplification (2026-09-19).** Linux now drains and rearms the
+  listener through the control shard's one-shot driver readiness. There is no Linux watcher
+  thread. Holding both real shards and queuing a connection reproduces the old unrelated
+  eventfd kick locally; the new path passes and accepts subsequent clients (0.22 s).
+- [x] **Lease timer reservation at boot (2026-09-19).** The bounded timer slab reserves its
+  exact capacity in one backing allocation. The counting-allocator regression reduces total
+  construction calls from 25,271 to four at CI's 1,617,130 slots, with no allocations while
+  filling, renewing, cancelling stale handles, refusing overflow or expiring timers.
+- [x] **Unix kick descriptor close/borrow race (2026-09-19).** A generational kick resolves an
+  immutable owned descriptor under the registry's reader pin. Retirement removes lookup,
+  waits for borrowers, frees the entry and only then frees the slot. The forced-overlap
+  regression fails before and passes after. Unsafe Send/Sync and the mutable descriptor cell
+  are gone. Simulated kicks also carry generations. Evidence for these three repairs:
+  `docs/bugs/2026-09-19-startup-wakes-and-kick-retirement.md`.
+- [x] **FUSE mounted fixture ownership (2026-09-19).** The volume root now belongs to the
+  mounting uid/gid, matching real provisioning. A saved pre-fix binary fails locally as uid
+  65534 with CI's `Permission denied`; the fixed real mount passes in 0.13 s. A cfg-free
+  bridge-attribute regression catches the mistake even under root. Record:
+  `docs/bugs/2026-09-19-fuse-coherence-fixture-root-owner.md`.
+- [ ] **Windows completion-port kick ownership (sibling review, 2026-09-19).** Unix and
+  simulation kicks now retire safely; `Kick::Iocp` still carries a raw port address whose
+  driver closes it. Also verify Windows registration: `register_kick(None)` publishes
+  `Kick::None` rather than the driver's port. Add a real Windows wake/shutdown/reuse regression
+  before changing port ownership. This finding has not been reproduced on Windows.
 
 - [x] **Terminal membership publication to other shards** — assessed, no correctness impact
   (2026-09-17). `fold_peer_state` ignores a refused cross-shard `run_on`, so a terminal death's

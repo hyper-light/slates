@@ -28,16 +28,9 @@ use slates_bridge_fuse::channel::serve_blocking;
 use slates_bridge_fuse::mount::{MountError, mount};
 use slates_bridge_fuse::volume_bridge::VolumeBridge;
 use slates_db::catalog::{Principal, VolumeId};
-use slates_mem::arena::ChunkArena;
-use slates_mem::region::Region;
-use slates_vfs::clock::HostClock;
-use slates_vfs::names::NameEquivalence;
-use slates_vfs::quota::Quota;
-use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
+mod common;
+use common::{store, volume_for_owner};
 
-/// Shape: the page and a small arena for the test volume (as `tests/volume_bridge.rs`).
-const PAGE: usize = 4096;
-const REGION_PAGES: usize = 4096;
 /// Shape: how long one container run may take on a loaded runner.
 const CONTAINER_WAIT: Duration = Duration::from_secs(300);
 /// Shape: how long `docker info` may take before the runtime is called unreachable.
@@ -90,40 +83,6 @@ fn pause() {
   // The test harness paces its polls; shipped code parks on its driver (D-9).
   #[allow(clippy::disallowed_methods)]
   std::thread::sleep(Duration::from_millis(POLL_MS));
-}
-
-fn store() -> Store {
-  let mut arena = ChunkArena::new(PAGE);
-  arena
-    .add_region(Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
-    .unwrap();
-  Store::new(
-    &StoreConfig {
-      page: PAGE,
-      cache_line: 128,
-      max_dirs: 64,
-      max_inodes: 256,
-      max_chunks: REGION_PAGES,
-      max_dir_blocks: 64,
-      dir_cutover: 16,
-    },
-    arena,
-    0,
-  )
-}
-
-fn volume(store: &mut Store) -> Volume {
-  Volume::create(
-    store,
-    VolumeConfig {
-      prefix: 1,
-      names: NameEquivalence::Exact,
-      quota: Quota::Bounded { limit: 1 << 30 },
-      journal_bytes: 1 << 16,
-      clock: Box::new(HostClock::default()),
-    },
-  )
-  .unwrap()
 }
 
 /// Runs a command to completion within `wait`, killing it past the bound.
@@ -340,12 +299,13 @@ fn an_oci_container_consumes_a_fuse_host_mount_through_the_runtime_bind() {
     Err(other) => panic!("the FUSE mount did not come up: {other:?}"),
   };
   let uid = rustix::process::getuid().as_raw();
+  let gid = rustix::process::getgid().as_raw();
   // The serve loop owns the mount and the volume (a volume is not `Send`, so it is made here); it
   // ends when the mount point is unmounted below.
   let server_thread = std::thread::spawn(move || {
     let mut mounted = mounted;
     let mut store = store();
-    let mut volume = volume(&mut store);
+    let mut volume = volume_for_owner(&mut store, uid, gid);
     let volume_id = VolumeId { bytes: [7; 16] };
     let mut attachments = Attachments::new();
     let attachment = attachments

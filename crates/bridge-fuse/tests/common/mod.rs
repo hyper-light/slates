@@ -59,6 +59,14 @@ pub(crate) fn volume(store: &mut Store) -> Volume {
   .unwrap()
 }
 
+/// A mounted fixture follows the daemon's provisioning ownership rule (§4.6, R10).
+pub(crate) fn volume_for_owner(store: &mut Store, uid: u32, gid: u32) -> Volume {
+  let mut volume = volume(store);
+  let root = volume.root_inode(store).unwrap();
+  volume.chown(store, root, uid, gid).unwrap();
+  volume
+}
+
 /// A seam that serves every operation through `inner` and refuses the next `refuse_gathers`
 /// invalidation gathers (AUD-02's injected collection failure): what a transport sees when the
 /// seam cannot answer what changed — the round must be retried, never skipped.

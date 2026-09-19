@@ -28,7 +28,7 @@ use slates_bridge_fuse::volume_bridge::VolumeBridge;
 use slates_db::catalog::{Principal, VolumeId};
 
 mod common;
-use common::{FailingGather, store, volume};
+use common::{FailingGather, store, volume_for_owner};
 
 /// Shape: how long the helper may take to hand back the device, and a report to arrive.
 const MOUNT_WAIT: Duration = Duration::from_secs(60);
@@ -130,9 +130,10 @@ fn serve(
   reports: Sender<Report>,
 ) -> Result<(), slates_bridge_fuse::channel::ChannelError> {
   let mut store = store();
-  let mut volume = volume(&mut store);
-  let mut attachments = Attachments::new();
   let uid = rustix::process::getuid().as_raw();
+  let gid = rustix::process::getgid().as_raw();
+  let mut volume = volume_for_owner(&mut store, uid, gid);
+  let mut attachments = Attachments::new();
   let rights = Rights {
     read: true,
     write: true,
@@ -262,34 +263,37 @@ fn a_change_through_another_attachment_reaches_the_kernel_without_a_request_and_
     eprintln!("skipping the mounted coherence proof: fusermount3 is not on this host");
     return;
   }
-  let scratch = scratch();
-  let mounted = match mount(&scratch.mount_point, &[], MOUNT_WAIT) {
-    Ok(mounted) => mounted,
-    Err(MountError::NoDevice { exit } | MountError::Helper { exit }) => {
-      eprintln!(
-        "skipping the mounted coherence proof: fusermount3 refused the mount or found no /dev/fuse (exit {exit:?})"
-      );
-      return;
-    }
-    Err(other) => panic!("the FUSE mount did not come up: {other:?}"),
-  };
-  let signal = ChangeSignal::new().unwrap();
-  let notifier = signal.notifier().unwrap();
-  let (asks, ask_end) = channel();
-  let (report_end, reports) = channel();
-  let server = std::thread::spawn(move || serve(mounted, signal, ask_end, report_end));
-  let control = Loop {
-    asks,
-    notifier,
-    reports,
-  };
-  let mount_point = scratch.mount_point.clone();
-  let cached = warm_and_prove_cached(&control, &mount_point);
-  let told = a_change_is_seen_without_a_request(&control, &mount_point, cached);
-  a_refused_gather_is_retried(&control, &mount_point, told);
+  // The scratch unmounts during unwind before the scope joins its server.
+  std::thread::scope(|scope| {
+    let scratch = scratch();
+    let mounted = match mount(&scratch.mount_point, &[], MOUNT_WAIT) {
+      Ok(mounted) => mounted,
+      Err(MountError::NoDevice { exit } | MountError::Helper { exit }) => {
+        eprintln!(
+          "skipping the mounted coherence proof: fusermount3 refused the mount or found no /dev/fuse (exit {exit:?})"
+        );
+        return;
+      }
+      Err(other) => panic!("the FUSE mount did not come up: {other:?}"),
+    };
+    let signal = ChangeSignal::new().unwrap();
+    let notifier = signal.notifier().unwrap();
+    let (asks, ask_end) = channel();
+    let (report_end, reports) = channel();
+    let server = scope.spawn(move || serve(mounted, signal, ask_end, report_end));
+    let control = Loop {
+      asks,
+      notifier,
+      reports,
+    };
+    let mount_point = scratch.mount_point.clone();
+    let cached = warm_and_prove_cached(&control, &mount_point);
+    let told = a_change_is_seen_without_a_request(&control, &mount_point, cached);
+    a_refused_gather_is_retried(&control, &mount_point, told);
 
-  drop(scratch);
-  server.join().unwrap().unwrap();
+    drop(scratch);
+    server.join().unwrap().unwrap();
+  });
 }
 
 /// Warms the kernel's cache through the mount (a write, a stat), and proves it warm and unbounded: a

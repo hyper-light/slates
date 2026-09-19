@@ -1222,6 +1222,24 @@ points for the same N=1/fleet semantics, not proof that all integration work is 
 
 ## 8i. A-9 contract correction and open implementation gaps (2026-09-05)
 
+**Local CI regressions (2026-09-19, §4.3/§4.7 and AUD-02):** the Linux listener now uses
+one-shot readiness on the control shard, eliminating the level-readable watcher loop.
+A delayed-accept test fails on the old watcher and passes on the replacement; it also
+serves later connections and shuts down. A timer-allocation regression reports 25,271
+construction allocations before and four after for CI's 1,617,130 possible timers;
+renewal, cancellation and expiry remain allocation-free. Unix descriptor kicks and
+simulation kicks carry registry generations; foreign borrows are pinned through their
+syscalls and retirement waits before closing/freeing. The forced-overlap regression
+reproduces the former close-during-borrow. Windows IOCP ownership remains a separately
+ledgered source finding. Record: `docs/bugs/2026-09-19-startup-wakes-and-kick-retirement.md`.
+
+The FUSE coherence fixture omitted production's root-ownership stamp. It now uses the
+mounting uid/gid. The old binary reproduces CI's `Permission denied` as uid 65534 locally;
+the fixed mounted scenario passes in 0.13 s on the same kernel. Its cfg-free ownership
+regression runs even in root-owned containers. The earlier root-run proof did not establish
+ordinary-user access. Record: `docs/bugs/2026-09-19-fuse-coherence-fixture-root-owner.md`.
+
+
 **Follow-up source audit (2026-09-14, `291907b`):**
 [2026-09-14_AUDIT.md](../bugs/2026-09-14_AUDIT.md) records 18 open findings (14 P1,
 4 P2) and one unconfirmed KIND rejoin explanation. Mount authorization/coherence and

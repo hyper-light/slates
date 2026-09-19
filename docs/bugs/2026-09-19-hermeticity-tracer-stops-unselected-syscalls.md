@@ -73,3 +73,14 @@ alone in 1.37 s. Clippy passes on Linux and macOS; formatting and the structural
 unsafe-budget and version checks pass. The CI conformance job now runs both targeted regressions
 before its mounted suites. Full mounted conformance remains pending; these local tests need
 no privileged mount.
+
+
+## Follow-up: the tracer filter alone did not close CI startup (2026-09-19)
+
+Job 105969406090 still failed after this change. Its 60-second log has 54 first-heartbeat
+kills. The local filtered-tracer proof did not establish that the product could start under
+CI's scheduling and memory geometry. The remaining eager timer allocations and level-triggered
+rendezvous kick loop are now reproduced independently and corrected; see
+`2026-09-19-startup-wakes-and-kick-retirement.md`. The unchanged conformance harness regressions
+pass as uid 65534 in Linux 6.12.76-linuxkit (seven tests, 0.53 s; unrelated Vim case skipped).
+That is local validation, not a fresh CI result or a full mounted conformance run.

@@ -51,6 +51,8 @@ pub const MAX_SHARDS: usize = 1024;
 /// A registered shard: its foreign wake ring, its control channel and its kick.
 #[derive(Debug)]
 pub struct Entry {
+  /// The registration that owns this entry; checked under the reader pin.
+  holder: SlotHolder,
   /// The wake ring foreign threads push to.
   pub inbound: MpscRing,
   /// The control channel's sending end.
@@ -62,16 +64,13 @@ pub struct Entry {
   /// Set by a sender, cleared by the shard once the channel is drained: the shard polls the
   /// channel only when this says something was sent, one atomic load per step otherwise.
   pub control_pending: AtomicBool,
-  /// The kick that wakes the shard's driver (its descriptor form points at `kick_fd` below).
+  /// The generational kick that wakes this registration's driver.
   pub kick: Kick,
-  /// The kick's descriptor, owned by this entry and closed at unregistration (Unix); the entry
-  /// outlives the shard and is dropped only by the slot's next registration.
+  /// The kick descriptor, closed after the owning contexts and foreign borrows end (Unix).
   #[cfg(unix)]
-  pub kick_fd: Option<KickFd>,
-  /// A simulated shard's driver flags (its kick word, its requested deadline, its wait count), owned by
-  /// this entry as the descriptor is: the kick points into it, and a stale waker may kick until the
-  /// slot's next registration, so it must outlive the shard. Before 2026-09-14 every simulation leaked
-  /// one per shard for the process lifetime.
+  pub(crate) kick_fd: Option<std::os::fd::OwnedFd>,
+  /// A simulated shard's flags, owned until its contexts and foreign kick borrows end.
+  /// A copied kick carries the registration, never a reference to these flags.
   pub sim_shared: Option<Box<crate::sim::SimShared>>,
   /// The single-producer rings this shard sends on, one per other shard of its runtime, owned here
   /// and lent as `&'static` to those shards' contexts; retired with the entry (every shard of a
@@ -206,8 +205,8 @@ impl Pulse {
 /// One registry slot: its generation word and the entry it currently holds. The generation is odd
 /// while the slot is free (initially 1) and even while a shard holds it; claiming a slot is one
 /// `compare_exchange` from its free value to that value plus one, so two registrations never take
-/// one slot. The entry is published under the same word: written before the even generation is
-/// stored (`Release`), read after it is loaded (`Acquire`).
+/// one slot. Claiming precedes publication; the entry pointer stays null until initialization
+/// finishes, then is published with Release and read under a counted borrow.
 /// Shape: one slot per cache line (the largest line we target, Apple silicon's 128 bytes): the
 /// generation and the reader count are written by every foreign waker of that shard, so two shards'
 /// slots on one line would bounce it between their wakers (vorpal measured four global atomics doubling
@@ -215,9 +214,8 @@ impl Pulse {
 #[repr(align(128))]
 struct Slot {
   generation: AtomicU32,
-  /// Foreign readers inside [`with_entry`] right now. A registration that replaces the slot's entry
-  /// frees the previous one only once this is zero (see `register`), so a reader descheduled while it
-  /// holds the entry never sees it freed.
+  /// Foreign readers inside [`with_entry`]. Retirement clears the pointer, then waits for
+  /// zero before freeing the entry, including when a borrower was descheduled.
   readers: AtomicU32,
   entry: std::sync::atomic::AtomicPtr<Entry>,
   /// The shard's context, owned here from its build until its owning thread reclaims it at the
@@ -291,7 +289,12 @@ pub fn register(
         return Err(e.into());
       }
     };
+    let holder = SlotHolder {
+      shard: id,
+      generation: live,
+    };
     let mut entry = Box::new(Entry {
+      holder,
       inbound,
       control,
       generation_base: slot.arena_generation.load(Ordering::Acquire),
@@ -306,51 +309,21 @@ pub fn register(
       pulse: Pulse::default(),
       exited: AtomicBool::new(false),
     });
-    // The kick's descriptor form points into this very box: the box's address is stable for the
-    // entry's life, and the entry is dropped only after the slot's generation moved past every
-    // reader (see `entry`). So the `&'static` is a promise the slot protocol keeps, not a leak.
     entry.kick = match kick {
       RegisterKick::Kick(kick) => kick,
       #[cfg(unix)]
       RegisterKick::Descriptor(fd, form) => {
-        let owned: &KickFd = entry.kick_fd.insert(KickFd::new(fd));
-        // SAFETY: extends the borrow to `'static`: `owned` lives in the boxed entry, whose
-        // allocation is never moved (it is reached only through the raw pointer stored in the slot)
-        // and never freed while any reader can observe it (the generation protocol in `entry`).
-        let owned: &'static KickFd = unsafe { &*(owned as *const KickFd) };
-        form(owned)
+        entry.kick_fd = Some(fd);
+        form(KickFd::new(holder))
       }
       RegisterKick::Sim(shared) => {
-        let owned: &crate::sim::SimShared = entry.sim_shared.insert(shared);
-        // SAFETY: the same extension as the descriptor's: `owned` lives in the boxed entry, whose
-        // allocation is never moved and never freed while any reader can observe it.
-        let owned: &'static crate::sim::SimShared =
-          unsafe { &*(owned as *const crate::sim::SimShared) };
-        Kick::Sim(owned)
+        entry.sim_shared = Some(shared);
+        Kick::Sim(holder)
       }
     };
-    // The previous holder's entry, if the slot was reused: retired at unregistration, dropped
-    // here — but only once no foreign reader holds it. A reader (`with_entry`) counts itself on the
-    // slot, then loads the pointer; this side swaps the pointer, then reads the count. With a
-    // sequentially consistent fence on each side, one of the two must see the other: either this
-    // side sees the reader and waits it out, or the reader loaded the new pointer and never touches
-    // the previous entry (the parking protocol's discipline, `parking.rs`). The wait is bounded by
-    // a reader's span — a ring push and a kick — so it is a spin with a yield, on a cold path.
-    // Before 2026-09-14 the drop followed the swap at once: a reader descheduled between its pointer
-    // load and its push dereferenced freed memory (the registry stress test crashed on a null load
-    // in the freed ring's head word).
-    let previous = slot.entry.swap(Box::into_raw(entry), Ordering::SeqCst);
-    fence(Ordering::SeqCst);
-    if !previous.is_null() {
-      while slot.readers.load(Ordering::SeqCst) != 0 {
-        std::thread::yield_now();
-      }
-      // SAFETY: `previous` was produced by `Box::into_raw` in an earlier `register` of this slot and
-      // retired by `unregister` (the generation went odd) before this claim moved it even again; the
-      // slot's pointer now names the new entry, and the reader count was observed zero after the
-      // swap under the fence protocol above, so no reader holds `previous`.
-      drop(unsafe { Box::from_raw(previous) });
-    }
+    // Unregistration clears the pointer and waits out readers before publishing a free slot.
+    // Store only the raw pointer: moving the Box after lending fields would invalidate borrows.
+    slot.entry.store(Box::into_raw(entry), Ordering::Release);
     return Ok((id, receiver));
   }
   Err(RtError::TooManyShards { max })
@@ -364,7 +337,7 @@ pub enum RegisterKick {
   Kick(Kick),
   /// A descriptor the slot owns; the function mints the kick over the slot's owned form of it.
   #[cfg(unix)]
-  Descriptor(std::os::fd::OwnedFd, fn(&'static KickFd) -> Kick),
+  Descriptor(std::os::fd::OwnedFd, fn(KickFd) -> Kick),
   /// A simulated shard's driver flags, owned by the slot; the kick is minted over them.
   Sim(Box<crate::sim::SimShared>),
 }
@@ -392,8 +365,7 @@ pub(crate) fn attach_context(shard: u16, context: *mut ShardContext) {
 /// arena is empty (the loop exits only once every task, including the cancelled ones, is dropped), and
 /// nothing foreign ever dereferences a context — a waker carries a packed word and routes by shard id
 /// through the entry, and cross-shard rings are owned by entries, not contexts. The entry itself is
-/// untouched here (it is retired by [`unregister`] and freed by the slot's next registration, since a
-/// stale waker may still read *it*). Idempotent: a slot with no attached context is a no-op. Before
+/// untouched here (retirement waits for foreign readers in [`unregister`]). Idempotent: a slot with no attached context is a no-op. Before
 /// 2026-09-14 every build leaked its context for the process lifetime — a task arena, run queue and
 /// timer wheel each sized to the shard's task budget, per shard, per runtime start.
 pub fn reclaim_context(shard: u16) {
@@ -433,25 +405,28 @@ pub fn contexts_reclaimed() -> u64 {
   CONTEXTS_RECLAIMED.load(Ordering::Relaxed)
 }
 
-/// Gives a shard's slot back once its thread has ended (the runtime calls this after the join):
-/// closes the kick's descriptor and marks the slot free (its generation goes odd). The entry stays allocated — a waker that outlives
-/// the shard may still read it under a stale generation and must find valid memory — and is dropped
-/// by the next registration of the slot.
+/// Retires a shard after all of its runtime's contexts have ended. Remove the entry from
+/// lookup, wait for foreign borrowers, then drop its resources and publish the free generation.
+/// A new registration cannot claim the slot before retirement has finished (§4.3).
 pub fn unregister(shard: u16) {
   let Some(slot) = SLOTS.get(usize::from(shard)) else {
     return;
   };
   let live = slot.generation.load(Ordering::Acquire);
   if live & 1 == 1 {
-    return; // already free
+    return;
   }
-  let entry = slot.entry.load(Ordering::Acquire);
-  if !entry.is_null() {
-    // SAFETY: the pointer came from `Box::into_raw` in `register` and is dropped only by a later
-    // `register` of this slot, which cannot run before the generation goes odd below; the shard's
-    // own thread has ended (the caller joined it), so this is the one live borrow.
-    let entry = unsafe { &*entry };
-    entry.kick.close();
+  note_exited(shard);
+  let retired = slot.entry.swap(std::ptr::null_mut(), Ordering::SeqCst);
+  fence(Ordering::SeqCst);
+  if !retired.is_null() {
+    while slot.readers.load(Ordering::SeqCst) != 0 {
+      std::thread::yield_now();
+    }
+    // SAFETY: this pointer came from Box::into_raw in register. All owning contexts ended,
+    // and the swap/fence/readers protocol excludes every foreign borrow of the retired entry.
+    // New readers see null. The generation remains claimed until the resources are dropped.
+    drop(unsafe { Box::from_raw(retired) });
   }
   slot
     .generation
@@ -460,8 +435,8 @@ pub fn unregister(shard: u16) {
 
 /// Runs `f` on the live entry of `shard` — the form every **foreign** reader uses (a wake or a control
 /// message from another thread, an observer reading the pulse or copying the kick): the slot counts the
-/// reader for the call's span, and a registration that replaces the slot's entry frees the previous
-/// one only once no reader is counted, so `f` never sees freed memory however long its thread is
+/// reader for the call's span. Unregistration frees an entry only after its pointer was removed
+/// and no reader is counted, so `f` never sees freed memory however long its thread is
 /// descheduled. `None` for a free slot (a wake to it is stale). The shard's own context holds an
 /// unguarded reference to its entry instead ([`entry`]): its slot cannot be re-registered while it
 /// lives, since unregistration follows its thread's join.
@@ -469,9 +444,24 @@ pub fn with_entry<R>(shard: u16, f: impl FnOnce(&Entry) -> R) -> Option<R> {
   let slot = SLOTS.get(usize::from(shard))?;
   slot.readers.fetch_add(1, Ordering::SeqCst);
   fence(Ordering::SeqCst);
-  let result = read_counted(slot, f);
-  slot.readers.fetch_sub(1, Ordering::SeqCst);
-  result
+  let _reader = Reader(&slot.readers);
+  read_counted(slot, f)
+}
+
+/// Release the reader pin even when a test callback unwinds.
+struct Reader<'a>(&'a AtomicU32);
+impl Drop for Reader<'_> {
+  fn drop(&mut self) {
+    self.0.fetch_sub(1, Ordering::SeqCst);
+  }
+}
+
+/// A pinned read of one particular registration, never a replacement in the same slot.
+pub(crate) fn with_holder<R>(holder: SlotHolder, f: impl FnOnce(&Entry) -> R) -> Option<R> {
+  with_entry(holder.shard, |entry| {
+    (entry.holder == holder).then(|| f(entry))
+  })
+  .flatten()
 }
 
 /// The counted read itself: the generation check, the pointer load and the call, between the reader
@@ -480,13 +470,13 @@ fn read_counted<R>(slot: &Slot, f: impl FnOnce(&Entry) -> R) -> Option<R> {
   if slot.generation.load(Ordering::Acquire) & 1 == 1 {
     return None;
   }
-  let entry = slot.entry.load(Ordering::Acquire);
+  let entry = slot.entry.load(Ordering::SeqCst);
   if entry.is_null() {
     return None;
   }
   // SAFETY: a non-null entry pointer was produced by `Box::into_raw` in `register` and is freed only
-  // by a later `register` of the same slot, which waits until the slot's reader count is zero after
-  // swapping the pointer; this reader was counted before the pointer load, under the fence protocol
+  // by `unregister`, which waits until the slot's reader count is zero after clearing
+  // the pointer; this reader was counted before the pointer load, under the fence protocol
   // described at that wait, so the entry it loaded is valid for the span of `f`.
   Some(f(unsafe { &*entry }))
 }
@@ -506,15 +496,13 @@ pub fn entry(shard: u16) -> Option<&'static Entry> {
   if slot.generation.load(Ordering::Acquire) & 1 == 1 {
     return None;
   }
-  let entry = slot.entry.load(Ordering::Acquire);
+  let entry = slot.entry.load(Ordering::SeqCst);
   if entry.is_null() {
     return None;
   }
-  // SAFETY: a non-null entry pointer was produced by `Box::into_raw` in `register` and is freed only
-  // by a later `register` of the same slot; that `register` runs only after `unregister` turned the
-  // generation odd, and we read an even generation just above — a shard that unregisters and a new
-  // one that re-registers between our two loads leaves a valid (retired or fresh) entry either way,
-  // because the swap in `register` frees the *previous* entry only after installing the new one.
+  // SAFETY: the caller is the owning shard or its bootstrap thread (the contract above).
+  // Unregistration cannot run until all owning contexts ended, so this entry outlives its
+  // own shard's reference. Foreign threads must use with_entry, which pins reclamation.
   Some(unsafe { &*entry })
 }
 
@@ -528,7 +516,7 @@ pub fn lend_pair_ring(
   if slot.generation.load(Ordering::Acquire) & 1 == 1 {
     return None;
   }
-  let entry = slot.entry.load(Ordering::Acquire);
+  let entry = slot.entry.load(Ordering::SeqCst);
   if entry.is_null() {
     return None;
   }
@@ -711,28 +699,14 @@ impl SlotHolder {
 
 /// The registration currently holding `shard`'s slot; `None` for a free slot.
 pub fn holder_of(shard: u16) -> Option<SlotHolder> {
-  let slot = SLOTS.get(usize::from(shard))?;
-  let generation = slot.generation.load(Ordering::Acquire);
-  (generation & 1 == 0).then_some(SlotHolder { shard, generation })
+  with_entry(shard, |entry| entry.holder)
 }
 
 /// Sends a control message to the shard `holder` names, from any thread, and kicks it; refused
 /// `ShardGone` when the slot is free or held by a later registration (see [`SlotHolder`]) and
 /// `ControlFull` when the holder's control channel is full.
 pub fn send_control_to_holder(holder: SlotHolder, message: Control) -> Result<(), RtError> {
-  let Some(slot) = SLOTS.get(usize::from(holder.shard)) else {
-    return Err(RtError::ShardGone {
-      shard: holder.shard,
-    });
-  };
-  with_entry(holder.shard, |entry| {
-    // Compared under the reader count, so the entry the send reaches is the one the generation names:
-    // a registration that replaces it waits this reader out before freeing it.
-    if slot.generation.load(Ordering::Acquire) != holder.generation {
-      return Err(RtError::ShardGone {
-        shard: holder.shard,
-      });
-    }
+  with_holder(holder, |entry| {
     send_control_to(entry, holder.shard, message)
   })
   .ok_or(RtError::ShardGone {
@@ -743,6 +717,70 @@ pub fn send_control_to_holder(holder: SlotHolder, message: Control) -> Result<()
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// AC-0.7: pause a foreign descriptor borrow, then retire its shard. Retirement must
+  /// wait for that borrow, and a copied kick must refuse access after retirement and reuse.
+  #[cfg(unix)]
+  #[test]
+  fn retirement_waits_for_a_foreign_kick_borrow() {
+    use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
+
+    let (descriptor, _write) = rustix::pipe::pipe().unwrap();
+    #[cfg(target_os = "linux")]
+    let form = Kick::Eventfd;
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    let form = Kick::Kqueue;
+    let (shard, _control) = register(2, 1, RegisterKick::Descriptor(descriptor, form)).unwrap();
+    let kick = with_entry(shard, |entry| entry.kick).unwrap();
+    let descriptor = match kick {
+      #[cfg(target_os = "linux")]
+      Kick::Eventfd(descriptor) => descriptor,
+      #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+      Kick::Kqueue(descriptor) => descriptor,
+      _ => panic!("registered descriptor"),
+    };
+    let (entered, borrowing) = sync_channel(0);
+    let (release, released) = sync_channel(0);
+    let (retiring, retirement_started) = sync_channel(0);
+    let (retired, retirement_done) = sync_channel(1);
+    let closed_during_borrow = std::thread::scope(|scope| {
+      let borrower = scope.spawn(move || {
+        descriptor.with(|_| {
+          entered.send(()).unwrap();
+          released.recv().unwrap();
+        })
+      });
+      borrowing.recv().unwrap();
+      let owner = scope.spawn(move || {
+        retiring.send(()).unwrap();
+        unregister(shard);
+        retired.send(()).unwrap();
+      });
+      retirement_started.recv().unwrap();
+      // Shape: a scheduler observation window only; channels force the borrow to span
+      // retirement. This does not tune the runtime or delay a production operation.
+      let closed = retirement_done
+        .recv_timeout(Duration::from_millis(50))
+        .is_ok();
+      release.send(()).unwrap();
+      assert_eq!(borrower.join().unwrap(), Some(()));
+      owner.join().unwrap();
+      closed
+    });
+    assert!(
+      !closed_during_borrow,
+      "unregistration closed a borrowed descriptor"
+    );
+    assert_eq!(descriptor.with(|_| ()), None);
+    let (replacement, _control) = register(2, 1, RegisterKick::Kick(Kick::None)).unwrap();
+    assert_eq!(
+      descriptor.with(|_| ()),
+      None,
+      "a stale kick cannot borrow a replacement"
+    );
+    unregister(replacement);
+  }
 
   /// Sends `word` to `target` as a shard does: one turn at a time, draining this thread's own ring
   /// (`own`) while the target's is full, so a producer that is also a consumer keeps consuming.

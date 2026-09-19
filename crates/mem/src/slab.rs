@@ -43,6 +43,20 @@ impl<T> Slab<T> {
     Self::with_generation_base(segment_slots, max_slots, 0)
   }
 
+  /// Reserves the entire admission bound in one allocation (§4.2, AC-0.4). Slots are
+  /// initialized only on insertion and never move; the last segment holds exactly the bound,
+  /// so power-of-two indexing does not double the reserved memory. Use for a fixed-capacity
+  /// arena that must never allocate during insertion, such as the runtime's timer wheel.
+  pub fn preallocated(max_slots: usize) -> Self {
+    Self {
+      slots: Segmented::preallocated(max_slots),
+      free_head: None,
+      len: 0,
+      max_slots,
+      generation_base: 0,
+    }
+  }
+
   /// [`Slab::new`] whose fresh slots start at `generation_base` (see the field).
   pub fn with_generation_base(
     segment_slots: usize,

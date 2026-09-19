@@ -549,15 +549,13 @@ impl Daemon {
       .iter()
       .filter_map(|s| registry::with_entry(s.0, |e| e.kick))
       .collect();
-    let waits = match listener.doorbell_waiter()? {
-      Some((object, offset)) => Waits::Word { object, offset },
-      None => Waits::Socket(listener.raw_fd().unwrap_or(-1)),
-    };
-    let doorbell = DoorbellThread::start(
-      waits,
-      kicks,
-      doorbell_flag(shards.first().map_or(0, |shard| shard.0)),
-    );
+    let doorbell = listener.doorbell_waiter()?.map(|(object, offset)| {
+      DoorbellThread::start(
+        Waits::Word { object, offset },
+        kicks,
+        doorbell_flag(shards.first().map_or(0, |shard| shard.0)),
+      )
+    });
     let control_config = config.clone();
     let control_env = segment.handoff_env()?;
     let control_identity = identity.clone();
@@ -620,7 +618,7 @@ impl Daemon {
     Ok(Daemon {
       runtime: Some(runtime),
       segment,
-      doorbell: Some(doorbell),
+      doorbell,
       config,
       shards,
       nfs_port,
@@ -2134,7 +2132,9 @@ async fn control_loop(
   };
   // This loop runs on the control shard, the first of `shards`; its doorbell flag is that shard's.
   let control = shards.first().map_or(0, |shard| shard.0);
-  if let Some(task) = futures::current_task() {
+  if listener.raw_fd().is_none()
+    && let Some(task) = futures::current_task()
+  {
     let _ = registry::with_current(|ctx| {
       ctx.register_poller(
         task,
@@ -2285,8 +2285,27 @@ async fn control_loop(
         let _ = registry::send_control(shard.0, Control::Active(true));
       }
     }
-    futures::idle().await;
+    if let Err(error) = wait_for_rendezvous(&listener).await {
+      ACCEPTS_FAILED.fetch_add(1, Ordering::AcqRel);
+      eprintln!("slates-server: rendezvous readiness failed: {error}");
+      return;
+    }
   }
+}
+
+/// Register only after draining the accept queue. One-shot readiness observes connections
+/// already queued and those arriving during registration, without a polling thread (§4.7).
+#[cfg(target_os = "linux")]
+async fn wait_for_rendezvous(listener: &Listener) -> Result<(), slates_rt::RtError> {
+  let raw = listener.raw_fd().ok_or(slates_rt::RtError::DriverLost)?;
+  slates_rt::readiness::readable(raw).await
+}
+
+/// Shared-memory rendezvous is driven by the word doorbell's registered poller (§4.7).
+#[cfg(not(target_os = "linux"))]
+async fn wait_for_rendezvous(_listener: &Listener) -> Result<(), slates_rt::RtError> {
+  futures::idle().await;
+  Ok(())
 }
 
 /// The heartbeat: the anchor's `daemon.alive` input, beaten at a cadence inside its budget.

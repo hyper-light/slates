@@ -10,8 +10,8 @@
 //! when any of its clients' rings holds a request, and it serves each request inline on the
 //! shard (one step, no awaits inside, as §4.8 "Transactions" says); a new client reaches its
 //! shard as a spawned task that moves the daemon end into that state (sharing by move, D-8).
-//! The control shard's task drains the rendezvous every time the doorbell thread ([`doorbell`])
-//! kicks it, or when a client is already talking to it. Nothing here touches a host path but
+//! The control shard drains Linux rendezvous connections through its driver's one-shot
+//! readiness; other platforms use the shared-memory word watcher ([`doorbell`]). Nothing here touches a host path but
 //! the read-only base of an overlay volume; nothing writes a disk.
 //!
 //! Modules: [`config`] (the daemon's derivations from the profile), [`state`] (the shard's

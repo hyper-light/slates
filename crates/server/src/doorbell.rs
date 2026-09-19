@@ -1,9 +1,7 @@
-//! The doorbell thread (§4.7 "a parked shard is woken by the driver kick the client sends
-//! through the control fd"): on Linux a client writes the shard's kick eventfd itself and this
-//! thread only watches the rendezvous socket for new connections; on macOS and Windows a
-//! client rings the daemon-wide word of the bootstrap object, and this thread waits on that
-//! word and kicks every shard. One thread per daemon, owned by it, stopped and joined at
-//! shutdown (no fire-and-forget).
+//! The shared-memory doorbell watcher (§4.7): on macOS and Windows a client rings
+//! the bootstrap object's word. This owned thread waits on that word and kicks each shard;
+//! shutdown wakes and joins it. Linux clients write eventfds directly, and the control shard
+//! awaits rendezvous readiness through its driver, so Linux starts no watcher thread.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -37,8 +35,6 @@ pub enum Waits {
     /// The word's offset.
     offset: usize,
   },
-  /// A listening socket's readiness, by raw descriptor (Linux).
-  Socket(i32),
 }
 
 impl DoorbellThread {
@@ -52,7 +48,6 @@ impl DoorbellThread {
         .ok()
         .and_then(|h| slates_mem::SharedObject::open(&h, object.len()).ok())
         .map(|o| (o, *offset)),
-      Waits::Socket(_) => None,
     };
     let handle = std::thread::Builder::new()
       .name("slates-doorbell".to_owned())
@@ -101,7 +96,6 @@ fn run(waits: Waits, kicks: Vec<Kick>, stop: &Receiver<()>, rang_flag: &'static 
       .atomic_u32(*offset)
       .map(|w| w.load(Ordering::Acquire))
       .unwrap_or(0),
-    Waits::Socket(_) => 0,
   };
   while !stopped(stop) {
     let rang = match &waits {
@@ -115,7 +109,6 @@ fn run(waits: Waits, kicks: Vec<Kick>, stop: &Receiver<()>, rang_flag: &'static 
         }
         Err(_) => return,
       },
-      Waits::Socket(fd) => platform::socket_readable(*fd),
     };
     if stopped(stop) {
       break;
@@ -129,35 +122,7 @@ fn run(waits: Waits, kicks: Vec<Kick>, stop: &Receiver<()>, rang_flag: &'static 
   }
 }
 
-#[cfg(target_os = "linux")]
 mod platform {
-  /// Shape: the wait's upper bound so a stop is seen within it (the thread otherwise blocks
-  /// on readiness); a second, far above any rendezvous cadence.
+  /// Shape: the word wait's upper bound so a stop is seen even if the wake syscall fails.
   pub(super) const POLL_NS: u64 = 1_000_000_000;
-  /// Format: nanoseconds per second.
-  const NS_PER_S: u64 = 1_000_000_000;
-
-  /// Blocks until the listening socket is readable (a connection pending) or the bound.
-  pub(super) fn socket_readable(fd: i32) -> bool {
-    use rustix::event::{PollFd, PollFlags};
-    // SAFETY: the number names the daemon's listening socket, which lives as long as the
-    // daemon and is borrowed here for one poll.
-    let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-    let mut fds = [PollFd::new(&borrowed, PollFlags::IN)];
-    let timeout = rustix::event::Timespec {
-      tv_sec: i64::try_from(POLL_NS / NS_PER_S).unwrap_or(1),
-      tv_nsec: 0,
-    };
-    rustix::event::poll(&mut fds, Some(&timeout)).is_ok_and(|n| n > 0)
-  }
-}
-
-#[cfg(not(target_os = "linux"))]
-mod platform {
-  /// Shape: the wait's upper bound so a stop is seen within it; a second.
-  pub(super) const POLL_NS: u64 = 1_000_000_000;
-
-  pub(super) fn socket_readable(_fd: i32) -> bool {
-    false
-  }
 }

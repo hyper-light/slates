@@ -21,7 +21,7 @@ const EVENTS_PER_WAIT: usize = 64;
 /// The driver.
 pub struct EpollDriver {
   epfd: OwnedFd,
-  efd: &'static crate::driver::KickFd,
+  efd: crate::driver::KickFd,
   epoch: Instant,
   events: Vec<epoll::Event>,
   nops: Vec<u64>,
@@ -36,18 +36,13 @@ impl std::fmt::Debug for EpollDriver {
 }
 
 impl EpollDriver {
-  /// Creates the instance over a prepared kick eventfd (leaked for the process so the registry's
-  /// kick handle can name it after the driver is gone; a write into a reused descriptor number
-  /// would otherwise be a fault in someone else's file).
-  pub fn with_eventfd(efd: &'static crate::driver::KickFd) -> Result<EpollDriver, RtError> {
+  /// Creates the instance over its registry-owned eventfd. The owning runtime retires the
+  /// descriptor after this driver and all foreign kick borrows have ended.
+  pub fn with_eventfd(efd: crate::driver::KickFd) -> Result<EpollDriver, RtError> {
     let epfd = epoll::create(CreateFlags::CLOEXEC).map_err(|e| refused("epoll_create1", e))?;
-    let fd = efd.fd().ok_or_else(|| {
-      refused(
-        "epoll_ctl(ADD eventfd) on a closed slot",
-        rustix::io::Errno::BADF,
-      )
-    })?;
-    epoll::add(&epfd, fd, EventData::new_u64(KICK_TAG), EventFlags::IN)
+    efd
+      .with(|fd| epoll::add(&epfd, fd, EventData::new_u64(KICK_TAG), EventFlags::IN))
+      .ok_or(RtError::DriverLost)?
       .map_err(|e| refused("epoll_ctl(ADD eventfd)", e))?;
     Ok(EpollDriver {
       epfd,
