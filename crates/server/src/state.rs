@@ -297,6 +297,20 @@ pub struct ShardState {
   /// unambiguous; `None` between requests, and for work whose cause crossed a boundary that carried
   /// none (the span then declares its cause missing).
   pub current_span: Option<slates_wire::observe::SpanContext>,
+  /// Where the verb now running would reply (§4.16 "Commit"; AUD-11): the shard and ring slot the
+  /// reply is written to, set by the serve path or the forward task before the verb runs and cleared
+  /// after it, so a verb whose acceptance must wait for a fleet commit (`submit` at `f > 0`) can hand
+  /// its reply to the merge plane to deliver once the record is placed. `None` for a verb forwarded
+  /// from another node (its reply travels back on the fleet exchange that carried it).
+  pub(crate) reply_route: Option<crate::merge_service::ReplyRoute>,
+  /// The completion key of the recorded verb now running — its origin (the requesting node's stable
+  /// anchor) and request id — set by `run_recorded` for the verb's duration, so a verb that defers its
+  /// acceptance (AUD-11) records the completion under the same key later. `None` between verbs.
+  pub(crate) current_request: Option<(u64, slates_wire::request::RequestId)>,
+  /// Set by a verb that deferred its reply and its completion record to a later commit (AUD-11), read
+  /// and cleared by `run_recorded`: the verb's effects commit now, its completion is recorded when the
+  /// deferred reply resolves, and no reply is written for it now.
+  pub(crate) acceptance_deferred: bool,
   /// The `ring.request` spans of requests this shard forwarded to another shard, or scattered, by request
   /// word (§4.14): opened at the slot read, ended when the reply comes back through `deliver` and is
   /// written, so a forwarded reply's ring span is timed from read to reply like a local one. Bounded by

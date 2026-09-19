@@ -4593,6 +4593,36 @@ impl Client {
     self.send_at(self.sequence, body)
   }
 
+  /// Sends `body` as the next request and waits at most `deadline_ns` for its reply, returning the
+  /// typed error instead of panicking when none came — for a verb whose reply is **expected** to wait
+  /// (a submit whose acceptance waits for a fleet commit, AUD-11). A reply that arrives after the
+  /// deadline sits in the ring; [`drain`](Self::drain) discards it before the next call.
+  fn try_call(&mut self, body: &RequestBody, deadline_ns: u64) -> Result<ReplyBody, IpcError> {
+    self.sequence += 1;
+    let id = RequestId {
+      client: self.client,
+      sequence: self.sequence,
+    };
+    let index = self.end.next_request_index();
+    let slot = pack(
+      self.end.region_mut(),
+      Direction::Request,
+      index,
+      id.word(),
+      body,
+    )
+    .unwrap();
+    self.end.send(&slot)?;
+    let reply = self.end.wait(Some(deadline_ns))?;
+    Ok(unpack(self.end.region(), reply.kind, &reply.payload).unwrap())
+  }
+
+  /// Discards every reply already in the ring (the late reply to a [`try_call`](Self::try_call) that
+  /// timed out), so the next call reads its own reply.
+  fn drain(&mut self) {
+    while self.end.wait(Some(DRAIN_NS)).is_ok() {}
+  }
+
   fn send_at(&mut self, sequence: u32, body: &RequestBody) -> ReplyBody {
     let id = RequestId {
       client: self.client,
@@ -6014,8 +6044,11 @@ fn two_node_fleet() -> (Daemon, Daemon, String) {
   (daemon_a, daemon_b, instance_a)
 }
 
-/// Creates a green and a work over it on the owner, edits `f`, and submits: version 1. Returns the
-/// green and the work.
+/// Creates a green and a work over it on the owner, edits `f`, and submits: version 1 is committed on
+/// the owner, but its **acceptance waits** for the version's merge record to commit at the quorum
+/// (§4.16 "Commit"; AUD-11) — and every caller has installed a fault on the holder that withholds
+/// that commit — so the bounded wait returns without a reply; the version's record and the client's
+/// eventual answer are what the callers then observe. Returns the green and the work.
 fn submit_one_version(client: &mut Client) -> (VolumeId, VolumeId) {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
     name: "green".to_owned(),
@@ -6038,19 +6071,16 @@ fn submit_one_version(client: &mut Client) -> (VolumeId, VolumeId) {
     bytes: b"hello".to_vec(),
   });
   assert!(matches!(edited, ReplyBody::Edited), "{edited:?}");
-  let submitted = client.call(&RequestBody::Submit {
-    work,
-    evidence: Vec::new(),
-  });
+  let submitted = client.try_call(
+    &RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    },
+    u64::try_from(RECORD_HOLD_WINDOW.as_nanos()).unwrap_or(u64::MAX),
+  );
   assert!(
-    matches!(
-      submitted,
-      ReplyBody::Submitted {
-        version: Some(1),
-        ..
-      }
-    ),
-    "{submitted:?}"
+    submitted.is_err(),
+    "the acceptance waits for the commit the holder withholds; no reply within the hold: {submitted:?}"
   );
   (green, work)
 }
@@ -6072,6 +6102,7 @@ fn a_merge_record_is_issued_only_once_its_inputs_are_placed() {
   let installed = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault {
     refuse_content_puts: true,
     corrupt_next_inputs: false,
+    refuse_records: false,
   });
   assert!(installed.is_ok(), "the fault installs on B: {installed:?}");
   let mut client = Client::connect(&instance_a);
@@ -6125,6 +6156,9 @@ fn observe_inputs_gate(
     daemon_a.merge_record_placed(green, 1)
   });
   let holder_after = daemon_b.merge_holder_state(green);
+  // The commit answered the submit that waited: its late reply is discarded so the next call reads its
+  // own (the acceptance is answered exactly once the version commits — AUD-11).
+  client.drain();
   let awaited_placed = matches!(
     client.call(&RequestBody::AwaitPlaced {
       volume: green,
@@ -6228,6 +6262,7 @@ fn a_holder_whose_recomputation_mismatches_refuses_the_version_loudly() {
   let installed = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault {
     refuse_content_puts: false,
     corrupt_next_inputs: true,
+    refuse_records: false,
   });
   assert!(installed.is_ok(), "the fault installs on B: {installed:?}");
   let mut client = Client::connect(&instance_a);
@@ -7121,3 +7156,209 @@ fn a_retired_peers_pending_dial_is_dropped_and_its_return_at_new_addresses_is_me
 /// The refusal key A counts when it drops a dial still in its handshake at its peer's retirement
 /// (`fleet::DIAL_STALE_DROPPED`), under the keys `Daemon::fleet_refusals` reports.
 const STALE_DIAL_DROPPED: &str = "fleet.dial.stale_dropped";
+
+/// Shape: how long [`Client::drain`] waits for one more stale reply before deciding the ring is empty —
+/// a tenth of a second, several serve periods, so a reply the daemon is about to write is caught and an
+/// empty ring costs little.
+const DRAIN_NS: u64 = 100_000_000;
+
+/// AC (§4.16 "Commit": "committed at f+1 acknowledgements … issued only when every identity the version
+/// references is placed"; AUD-11): a submit's **acceptance** is answered only once its version's merge
+/// record is committed at the quorum — never from the owner's local append alone. In a two-node `f = 1`
+/// fleet the holder B first refuses every content put (the inputs cannot place), then, with the inputs
+/// placing, withholds every merge record's acknowledgement; under neither can the submit resolve: the
+/// client's bounded wait times out, the owner reports one acceptance waiting, the version unplaced, and
+/// the holder counts what it withheld. Once both are lifted the record commits at the quorum, the wait
+/// resolves (counted), the version is placed and recomputed on the holder, and a retry of the same
+/// request meets the completion record the commit wrote — the same committed result, never a success
+/// the quorum had not held.
+#[test]
+fn a_submit_is_answered_only_once_its_record_commits_at_the_quorum() {
+  let _serial = serialize_fleet_tests();
+  let (daemon_a, daemon_b, instance_a) = two_node_fleet();
+  daemon_b
+    .inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: true,
+      corrupt_next_inputs: false,
+      refuse_records: false,
+    })
+    .expect("the inputs fault installs on B");
+  let mut client = Client::connect(&instance_a);
+  let (green, submit) = edited_work_to_submit(&mut client);
+  let gate = observe_commit_gate(&daemon_a, &daemon_b, &mut client, green, &submit);
+  daemon_a.stop();
+  daemon_b.stop();
+  assert_commit_gate(&gate);
+}
+
+/// A green, a work over it with one edit declared, and the submit request that would advance it.
+fn edited_work_to_submit(client: &mut Client) -> (VolumeId, RequestBody) {
+  let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("create green");
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "work".to_owned(),
+  }) else {
+    panic!("create work");
+  };
+  assert!(matches!(
+    client.call(&RequestBody::Edit {
+      work,
+      path: "f".to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: b"hello".to_vec(),
+    }),
+    ReplyBody::Edited
+  ));
+  (
+    green,
+    RequestBody::Submit {
+      work,
+      evidence: Vec::new(),
+    },
+  )
+}
+
+/// What the commit gate showed: with the inputs withheld, with the acknowledgements withheld, and once
+/// both were lifted.
+struct CommitGate {
+  withheld_inputs: Result<ReplyBody, IpcError>,
+  waiting_on_inputs: Result<usize, ObserveError>,
+  unplaced_on_inputs: Result<bool, ObserveError>,
+  held_on_records: bool,
+  withheld_records: Result<u64, ObserveError>,
+  placed: bool,
+  resolved: bool,
+  holder: Result<slates_server::merge_service::HolderMergeState, ObserveError>,
+  retried: ReplyBody,
+}
+
+/// Runs the three phases: the submit's bounded wait under withheld inputs (B refusing content puts), a
+/// hold under withheld acknowledgements (B refusing records), then both lifted — the commit, the
+/// resolution, the holder's recomputation and the retry of the same request.
+fn observe_commit_gate(
+  daemon_a: &Daemon,
+  daemon_b: &Daemon,
+  client: &mut Client,
+  green: VolumeId,
+  submit: &RequestBody,
+) -> CommitGate {
+  let both = [daemon_a, daemon_b];
+  // Inputs withheld: the submit does not resolve within the hold window; one acceptance waits.
+  let withheld_inputs = client.try_call(
+    submit,
+    u64::try_from(RECORD_HOLD_WINDOW.as_nanos()).unwrap_or(u64::MAX),
+  );
+  let waiting_on_inputs = daemon_a.merge_awaiting(green);
+  let unplaced_on_inputs = daemon_a.merge_record_placed(green, 1);
+
+  // Acknowledgements withheld instead: the inputs place, the record still cannot commit.
+  daemon_b
+    .inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: false,
+      corrupt_next_inputs: false,
+      refuse_records: true,
+    })
+    .expect("the record fault installs on B");
+  let held_on_records = holds_for(RECORD_HOLD_WINDOW, || {
+    Ok(!daemon_a.merge_record_placed(green, 1)? && daemon_a.merge_awaiting(green)? == 1)
+  });
+  let withheld_records = refusal_count(daemon_b, "merge.record_withheld");
+
+  // Both lifted: the record commits at the quorum and the waiting acceptance resolves.
+  daemon_b
+    .inject_merge_fault(slates_server::merge_service::MergeFault::default())
+    .expect("the faults lift on B");
+  let placed = poll_until(&both, PLACEMENT_DEADLINE, || {
+    daemon_a.merge_record_placed(green, 1)
+  });
+  let resolved = poll_until(&both, PLACEMENT_DEADLINE, || {
+    Ok(
+      daemon_a.merge_awaiting(green)? == 0
+        && refusal_count(daemon_a, "merge.acceptance_resolved")? >= 1,
+    )
+  });
+  let holder = daemon_b.merge_holder_state(green);
+  // The retry of the same request meets the completion record the commit wrote.
+  client.drain();
+  let retried = client.call_retry(submit);
+  CommitGate {
+    withheld_inputs,
+    waiting_on_inputs,
+    unplaced_on_inputs,
+    held_on_records,
+    withheld_records,
+    placed,
+    resolved,
+    holder,
+    retried,
+  }
+}
+
+/// The commit-gate assertions over one run: what held while a fault was in place, then what
+/// followed the lift.
+fn assert_commit_gate(gate: &CommitGate) {
+  assert_gate_withheld(gate);
+  assert_gate_committed(gate);
+}
+
+/// While the holder withheld the inputs, then the acknowledgements: no acceptance resolved, the
+/// version stayed unplaced, the owner reported the wait and the holder counted what it withheld.
+fn assert_gate_withheld(gate: &CommitGate) {
+  assert!(
+    gate.withheld_inputs.is_err(),
+    "with the inputs withheld the submit does not resolve within the hold: {:?}",
+    gate.withheld_inputs
+  );
+  assert_eq!(
+    (&gate.waiting_on_inputs, &gate.unplaced_on_inputs),
+    (&Ok(1), &Ok(false)),
+    "one acceptance waits on the owner and the version is not placed"
+  );
+  assert!(
+    gate.held_on_records,
+    "with the acknowledgements withheld the version stays unplaced and the acceptance keeps waiting"
+  );
+  assert!(
+    matches!(gate.withheld_records, Ok(count) if count > 0),
+    "the holder counted the acknowledgements it withheld: {:?}",
+    gate.withheld_records
+  );
+}
+
+/// After both faults lifted: the record committed at the quorum, the wait resolved, the holder
+/// recomputed the version, and the retry met the committed result.
+fn assert_gate_committed(gate: &CommitGate) {
+  assert!(
+    gate.placed && gate.resolved,
+    "once both are lifted the record commits at the quorum (placed={}) and the waiting acceptance \
+     resolves, counted (resolved={})",
+    gate.placed,
+    gate.resolved
+  );
+  assert_eq!(
+    gate.holder,
+    Ok(slates_server::merge_service::HolderMergeState {
+      version: Some(1),
+      refused: false,
+    }),
+    "the holder recomputed version 1"
+  );
+  assert!(
+    matches!(
+      gate.retried,
+      ReplyBody::Submitted {
+        version: Some(1),
+        ..
+      }
+    ),
+    "the retry meets the committed result: {:?}",
+    gate.retried
+  );
+}

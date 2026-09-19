@@ -622,7 +622,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     )
     .await
   } else if is_forwardable_write(&body) {
-    crate::xshard::call_within(
+    let forwarded = crate::xshard::call_within(
       control,
       shard,
       move |s| {
@@ -634,13 +634,62 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
       },
       crate::daemon::LIVENESS_BUDGET_NS,
     )
-    .await
+    .await;
+    match forwarded {
+      Some(Some(reply)) => Some(reply),
+      // The verb deferred its acceptance to a fleet commit (AUD-11): this exchange waits for the
+      // completion record the commit writes, within the same liveness budget.
+      Some(None) => await_deferred_completion(control, shard, origin_host, id).await,
+      None => None,
+    }
   } else {
     Some(refused(Refusal::Unsupported {
       feature: "forwarded verb".to_owned(),
     }))
   };
   encode_body(&reply.unwrap_or_else(|| refused(Refusal::NotFound)))
+}
+
+/// A cross-node forwarded verb whose acceptance was deferred to a fleet commit (AUD-11): polls the
+/// owner shard's completion window each period until the commit records the reply, within the
+/// liveness budget the exchange runs under. Past the budget the request is refused **retryable**
+/// (`Overloaded` names the owner shard): the acceptance still waits on the owner, and the origin's
+/// retry meets the completion record once the version commits — never a success the quorum has
+/// not committed.
+async fn await_deferred_completion(
+  control: u16,
+  shard: u16,
+  origin_host: u64,
+  id: RequestId,
+) -> Option<ReplyBody> {
+  let deadline = slates_rt::futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
+  loop {
+    slates_rt::futures::sleep(crate::daemon::HEARTBEAT_NS).await;
+    let recorded = crate::xshard::call_within(
+      control,
+      shard,
+      move |s| match s
+        .db
+        .partition()
+        .completion(origin_host, id.client, id.sequence)
+      {
+        Seen::Completed(bytes) => Some(bytes),
+        Seen::Acknowledged | Seen::New => None,
+      },
+      crate::daemon::LIVENESS_BUDGET_NS,
+    )
+    .await;
+    match recorded {
+      Some(Some(bytes)) => {
+        return Some(
+          ReplyBody::from_bytes(&bytes).unwrap_or_else(|_| refused(Refusal::DuplicateRequest)),
+        );
+      }
+      Some(None) if slates_rt::futures::now_ns() < deadline => {}
+      Some(None) => return Some(refused(Refusal::Overloaded { shard })),
+      None => return None,
+    }
+  }
 }
 
 /// Prunes a forwarded client's completions on this (owner) node up to the acknowledgement watermark the
@@ -869,6 +918,12 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   // member id changes per boot; the anchor does not — task #22). A forwarded verb keys on its authenticated
   // origin's anchor instead (see `record_completion`, `serve_forward`).
   let origin = state.origin_anchor.0;
+  // Where this request's reply is written — kept for a verb that must answer later (AUD-11).
+  state.reply_route = Some(crate::merge_service::ReplyRoute {
+    shard: state.shard,
+    client_index: client.index(),
+    request: request.request,
+  });
   match state
     .db
     .partition()
@@ -880,7 +935,13 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       );
     }
     Seen::Acknowledged => return Served::Reply(refused(Refusal::DuplicateRequest)),
-    Seen::New => {}
+    Seen::New => {
+      // A retry of a submit whose acceptance still waits for its commit joins the wait: it is answered
+      // with the committed result when the version places, never a success from memory.
+      if crate::merge_service::join_awaiting(state, origin, id) {
+        return Served::Forwarded;
+      }
+    }
   }
   let body: RequestBody = {
     let Ok(c) = state.clients.get(client) else {
@@ -1018,7 +1079,11 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       shard,
     );
   }
-  Served::Reply(run_recorded(state, origin, id, client_id, &principal, body))
+  match run_recorded(state, origin, id, client_id, &principal, body) {
+    Some(reply) => Served::Reply(reply),
+    // The verb deferred its reply to a fleet commit (AUD-11): it comes back through `deliver`.
+    None => Served::Forwarded,
+  }
 }
 
 /// Runs a verb on this shard with its effects and its completion record in one durable step
@@ -1030,7 +1095,7 @@ fn run_recorded(
   client_id: u32,
   principal: &Principal,
   body: RequestBody,
-) -> ReplyBody {
+) -> Option<ReplyBody> {
   // Two chokepoint spans measure one verb (§4.14): `shard.op` over the whole verb (one verb on its
   // owner shard, no awaits inside), and `log.append` over the durable `Db::commit` within it (one
   // op-log record appended and published). Each opens *within* the span that caused it — `shard.op`
@@ -1053,8 +1118,20 @@ fn run_recorded(
   // The verb's own span is the cause of everything deeper in it (a `merge.verdict`, a `land.entry`).
   let outer = state.current_span.replace(op.context());
   state.db.begin();
+  state.current_request = Some((origin, id));
   let reply = dispatch(state, client_id, principal, body);
-  let reply = record_completion(state, origin, id, reply);
+  state.current_request = None;
+  state.reply_route = None;
+  // A verb that deferred its acceptance to a fleet commit (`submit` at `f > 0`; AUD-11) commits its
+  // effects now but records no completion and gets no reply here: both follow the commit at the
+  // quorum (`merge_service::resolve_accepted`), so a retry meanwhile joins the wait, never reads a
+  // success the quorum has not committed.
+  let deferred = std::mem::take(&mut state.acceptance_deferred);
+  let reply = if deferred {
+    reply
+  } else {
+    record_completion(state, origin, id, reply)
+  };
   let append = state.tracer.open_within(
     &op.context(),
     Chokepoint::LogAppend,
@@ -1079,12 +1156,16 @@ fn run_recorded(
   let partition_label = u32::from(state.partition);
   crate::telemetry::emit(state, op.end(label, end_ns));
   crate::telemetry::emit(state, append.end(partition_label, end_ns));
-  reply
+  if deferred && !matches!(reply, ReplyBody::Refused { .. }) {
+    None
+  } else {
+    Some(reply)
+  }
 }
 
 /// The owner's side of a forwarded verb: its own completion window first (a retry of a
 /// verb this partition already ran answers from the record), then the verb and its record
-/// in one step.
+/// in one step. `None` when the verb deferred its reply to a fleet commit (AUD-11).
 fn run_forwarded(
   state: &mut ShardState,
   origin: u64,
@@ -1093,17 +1174,24 @@ fn run_forwarded(
   principal: &Principal,
   body: RequestBody,
   cause: Option<SpanContext>,
-) -> ReplyBody {
+) -> Option<ReplyBody> {
   match state
     .db
     .partition()
     .completion(origin, id.client, id.sequence)
   {
     Seen::Completed(bytes) => {
-      return ReplyBody::from_bytes(&bytes).unwrap_or_else(|_| refused(Refusal::DuplicateRequest));
+      return Some(
+        ReplyBody::from_bytes(&bytes).unwrap_or_else(|_| refused(Refusal::DuplicateRequest)),
+      );
     }
-    Seen::Acknowledged => return refused(Refusal::DuplicateRequest),
-    Seen::New => {}
+    Seen::Acknowledged => return Some(refused(Refusal::DuplicateRequest)),
+    Seen::New => {
+      // A retry of a submit whose acceptance still waits for its commit joins the wait.
+      if crate::merge_service::join_awaiting(state, origin, id) {
+        return None;
+      }
+    }
   }
   // The origin's `ring.request` span context, when the forward carried one (a same-node shard), is the
   // cause of this verb's `shard.op` (§4.14); a cross-node forward carries none yet, and the span says so.
@@ -1212,12 +1300,22 @@ fn send_forward(
       let id = RequestId::from_word(request);
       let reply = crate::state::with_state(|s| {
         s.last_work_ns = s.clock.monotonic_ns();
+        // Where the reply goes — the origin shard's client ring — kept for a verb that answers later.
+        s.reply_route = Some(crate::merge_service::ReplyRoute {
+          shard: origin,
+          client_index,
+          request,
+        });
         // A same-node cross-shard forward serves a local client, so its completion keys on this node's stable
         // cert-anchor (the same id the local `serve` path uses — task #22), not the ephemeral member id.
         let origin = s.origin_anchor.0;
         run_forwarded(s, origin, id, client_id, &principal, body, cause)
       })
-      .unwrap_or_else(|| refused(Refusal::NotFound));
+      .unwrap_or_else(|| Some(refused(Refusal::NotFound)));
+      // A verb that deferred its reply to a fleet commit (AUD-11) answers through the merge plane.
+      let Some(reply) = reply else {
+        return;
+      };
       let back = SpawnRequest::new(
         Box::pin(async move {
           crate::state::deliver(client_index, request, reply, true);
@@ -3417,8 +3515,13 @@ fn submit(
   match outcome {
     slates_merge::engine::Outcome::Accepted { version } => {
       // The pre-check passed and the shard is single-threaded, so this append fits the budget; a
-      // segment-full failure refuses like any other verb and a resubmit records the (idempotent) accept.
-      if let Err(e) = state.db.mutate(&mut state.segment, &record, now) {
+      // segment-full failure refuses like any other verb. A resubmit the engine answered from its
+      // idempotent accept names a version the chain already holds: nothing is appended twice.
+      let chain_len =
+        u64::try_from(state.db.partition().green_chain(green_id).len()).unwrap_or(u64::MAX);
+      if chain_len < version
+        && let Err(e) = state.db.mutate(&mut state.segment, &record, now)
+      {
         return refused(refusal_of_db(&e));
       }
       // The accepted work now equals the green at the new version: its journal is consumed (the
@@ -3449,6 +3552,16 @@ fn submit(
       // to it and true the retention charge up to what the commit retained (the secured surplus credited).
       // A settle after an accept only credits: nothing was retained beyond what was secured.
       let _ = crate::merge_service::settle_green_retention(state, green_id);
+      // The acceptance is published only once the version's merge record is **committed at the
+      // quorum** (§4.16 "Commit": "committed at f+1 acknowledgements … issued only when every identity
+      // the version references is placed"; AUD-11). At `f = 0` the append was the commit and the reply
+      // goes now; at `f > 0` the reply and the completion record wait for the record plane
+      // (`merge_service::resolve_accepted`), so a client is never told a version a surviving quorum
+      // may not hold.
+      let object = ObjectId(green_id.bytes);
+      if crate::merge_service::placed_version(state, object).is_none_or(|placed| placed < version) {
+        crate::merge_service::defer_acceptance(state, green_id, version);
+      }
       ReplyBody::Submitted {
         version: Some(version),
         conflicts: Vec::new(),
@@ -5998,7 +6111,7 @@ mod tests {
         (first, retry)
       });
       assert!(
-        matches!(first, super::ReplyBody::Refused { .. }),
+        matches!(first, Some(super::ReplyBody::Refused { .. })),
         "{first:?}"
       );
       assert_eq!(

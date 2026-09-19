@@ -1232,6 +1232,14 @@ retention: AUD-11–14/-16 (GAP-A9-14/-1/-7); SWIM indirect probes, call cancell
 handshake bounds: AUD-15/-17/-18 (GAP-A9-7/-4/-11). These are source findings and proposed
 regression scenarios at the audit baseline.
 
+**Implementation follow-up (2026-09-18, AUD-11 closed):** at `f > 0` a submit's acceptance
+waits for its version's merge record to commit at the quorum — the verb commits its effects but
+records no completion and sends no reply until `resolve_accepted` runs for the placed version; a
+retry meanwhile joins the wait; a cross-node forward polls the completion within the liveness
+budget. Regression with inputs and acknowledgements withheld separately:
+`docs/bugs/2026-09-18-submit-acceptance-before-fleet-commit.md`. The owner-loss retry lands with
+AUD-14.
+
 **Implementation follow-up (2026-09-18, AUD-16 closed):** the merge engine's rejected-result
 cache is bounded in bytes by the derived green-chain cap (oldest evicted first, counted; an evicted
 retry is judged again), its retained content history is accounted, folded oldest-first only as far as the retention

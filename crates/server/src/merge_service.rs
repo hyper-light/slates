@@ -49,6 +49,7 @@ use slates_vfs::dir::Child;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::inode::Kind;
 use slates_vfs::volume::{Store, Volume};
+use slates_wire::request::RequestId;
 
 use crate::error::{refusal_of_db, refusal_of_vfs};
 use crate::state::ShardState;
@@ -78,6 +79,14 @@ pub struct MergeShardState {
   pub refused: BTreeSet<ObjectId>,
   /// Faults a test injects on this holder; never set from the wire.
   pub fault: MergeFault,
+  /// Submits whose acceptance waits for their version's merge record to commit at the quorum
+  /// (§4.16 "Commit"; AUD-11), by green and version: where each replies and the completion key it
+  /// is recorded under when it does. Bounded by the clients' credit (one entry per request in
+  /// flight; a retry joins its entry). Empty at `f = 0`, where the append is the commit.
+  pub awaiting: BTreeMap<(ObjectId, u64), Vec<AwaitingAcceptance>>,
+  /// The waiting requests by completion key (origin, client, sequence), so a retry of one joins its
+  /// entry instead of running the verb again.
+  pub awaiting_by_request: BTreeMap<(u64, u32, u32), (ObjectId, u64)>,
 }
 
 /// A green attachment's pin: the green and the version its view is fixed at.
@@ -1041,6 +1050,10 @@ pub struct MergeFault {
   pub refuse_content_puts: bool,
   /// Corrupt the next inputs recomputed from, once.
   pub corrupt_next_inputs: bool,
+  /// Withhold every merge record's acknowledgement while set (the record is neither recomputed nor
+  /// accepted; the owner counts no acknowledgement), so a version whose inputs placed still cannot
+  /// commit at the quorum (AUD-11).
+  pub refuse_records: bool,
 }
 
 /// What a holder holds of a green's replica, for a test to observe.
@@ -1557,9 +1570,11 @@ fn record_merge_acks(
     .candidates
     .iter()
     .all(|host| *host == local || pending.record.acked.contains(host));
+  let mut newly_placed = None;
   if pending.record.placed(quorum) {
     let placed = state.merge.placed.entry(object).or_insert(version);
     *placed = (*placed).max(version);
+    newly_placed = Some(*placed);
   }
   if everyone {
     pending_green.records.remove(&version);
@@ -1567,7 +1582,167 @@ fn record_merge_acks(
       state.merge.pending.remove(&object);
     }
   }
+  // The version is committed at the quorum: every submit whose acceptance waited on it is answered
+  // now — its completion recorded, its reply delivered (§4.16 "Commit"; AUD-11).
+  if let Some(placed) = newly_placed {
+    resolve_accepted(state, object, placed);
+  }
 }
+
+/// Where a deferred reply is written (AUD-11): the shard whose client ring holds the request, the
+/// client's slot index there, and the request word — what `crate::state::deliver` needs, kept so the
+/// merge plane can answer a submit once its record commits. A verb forwarded from another node has
+/// none (its reply travels back on the fleet exchange that carried it, which polls the completion).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplyRoute {
+  /// The shard the client is served on.
+  pub shard: u16,
+  /// The client's slot index on that shard.
+  pub client_index: u32,
+  /// The request word (the request id).
+  pub request: u64,
+}
+
+/// One submit whose acceptance waits for its version's merge record to commit at the quorum
+/// (§4.16 "Commit"; AUD-11): where to reply, and the completion key to record the reply under on
+/// this owner partition when it does. Bounded by the clients' credit: one entry per request in
+/// flight, and a retry of a waiting request joins its entry rather than adding a version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AwaitingAcceptance {
+  /// Where to write the reply; `None` for a request forwarded from another node.
+  pub route: Option<ReplyRoute>,
+  /// The completion key's origin (the requesting node's stable anchor).
+  pub origin: u64,
+  /// The request id.
+  pub id: RequestId,
+}
+
+/// Registers the acceptance of `version` of `green` as **waiting** for its record to commit at the
+/// quorum (AUD-11): the reply is not written and the completion not recorded until
+/// [`resolve_accepted`] runs for that version. Marks the running verb deferred so `run_recorded`
+/// commits its effects without a completion or a reply.
+pub(crate) fn defer_acceptance(state: &mut ShardState, green: DbVolumeId, version: u64) {
+  let Some((origin, id)) = state.current_request else {
+    // No recorded request is running (a rebuild's replay): nothing waits, nothing is deferred.
+    return;
+  };
+  let object = ObjectId(green.bytes);
+  let route = state.reply_route.take();
+  state
+    .merge
+    .awaiting
+    .entry((object, version))
+    .or_default()
+    .push(AwaitingAcceptance { route, origin, id });
+  state
+    .merge
+    .awaiting_by_request
+    .insert((origin, id.client, id.sequence), (object, version));
+  state.acceptance_deferred = true;
+  *state.refusals.entry(ACCEPTANCE_DEFERRED).or_insert(0) += 1;
+}
+
+/// A retry of a request whose acceptance is still waiting joins the waiting entry — it will be
+/// answered with the same reply when the version commits — rather than running the verb again.
+/// Returns whether the request was waiting.
+pub(crate) fn join_awaiting(state: &mut ShardState, origin: u64, id: RequestId) -> bool {
+  let Some(key) = state
+    .merge
+    .awaiting_by_request
+    .get(&(origin, id.client, id.sequence))
+    .copied()
+  else {
+    return false;
+  };
+  let route = state.reply_route.take();
+  if let Some(waiting) = state.merge.awaiting.get_mut(&key)
+    && route.is_some()
+  {
+    waiting.push(AwaitingAcceptance { route, origin, id });
+  }
+  true
+}
+
+/// Answers every submit waiting on a version of `object` at or below `placed` (AUD-11): the
+/// acceptance is recorded as the request's completion on this owner partition — one durable step,
+/// so a retry after this meets the record — and the reply delivered to where the request came from
+/// (a task on that shard, so the delivery never holds this shard's state); a delivery the target's
+/// admission refuses is counted, and the completion record answers the client's retry. Forwarded
+/// requests have no route: their fleet exchange polls the completion record.
+fn resolve_accepted(state: &mut ShardState, object: ObjectId, placed: u64) {
+  let versions: Vec<u64> = state
+    .merge
+    .awaiting
+    .range((object, 0)..=(object, placed))
+    .map(|((_, version), _)| *version)
+    .collect();
+  for version in versions {
+    let Some(waiting) = state.merge.awaiting.remove(&(object, version)) else {
+      continue;
+    };
+    let reply = ReplyBody::Submitted {
+      version: Some(version),
+      conflicts: Vec::new(),
+    };
+    for entry in waiting {
+      state
+        .merge
+        .awaiting_by_request
+        .remove(&(entry.origin, entry.id.client, entry.id.sequence));
+      state.db.begin();
+      let recorded = crate::verbs::record_completion(state, entry.origin, entry.id, reply.clone());
+      if state.db.commit(&mut state.segment).is_err() {
+        // The completion could not be made durable (rolled back, AUD-06): the client's retry will run
+        // the verb again and meet the engine's idempotent accept. Nothing is delivered from memory.
+        *state.refusals.entry(ACCEPTANCE_UNRECORDED).or_insert(0) += 1;
+        continue;
+      }
+      *state.refusals.entry(ACCEPTANCE_RESOLVED).or_insert(0) += 1;
+      let Some(route) = entry.route else {
+        continue;
+      };
+      let delivery = slates_rt::task::SpawnRequest::new(
+        Box::pin(async move {
+          crate::state::deliver(route.client_index, route.request, recorded, true);
+        }),
+        None,
+      );
+      if slates_rt::registry::send_control(
+        route.shard,
+        slates_rt::control::Control::Spawn(Box::new(delivery)),
+      )
+      .is_err()
+      {
+        *state.refusals.entry(ACCEPTANCE_UNDELIVERED).or_insert(0) += 1;
+      }
+    }
+  }
+}
+
+/// How many submits of `green` are waiting for a version to commit (`Daemon::merge_awaiting`).
+pub(crate) fn awaiting_count(state: &ShardState, green: DbVolumeId) -> usize {
+  let object = ObjectId(green.bytes);
+  state
+    .merge
+    .awaiting
+    .range((object, 0)..=(object, u64::MAX))
+    .map(|(_, waiting)| waiting.len())
+    .sum()
+}
+
+/// Format: refusal and event names the merge plane counts for the deferred acceptance (§4.14).
+/// A submit's acceptance was deferred to its version's commit at the quorum.
+const ACCEPTANCE_DEFERRED: &str = "merge.acceptance_deferred";
+/// A deferred acceptance resolved: the version committed, the completion recorded, the reply sent.
+const ACCEPTANCE_RESOLVED: &str = "merge.acceptance_resolved";
+/// A resolved acceptance whose completion record could not be made durable (rolled back); the
+/// client's retry re-executes and meets the idempotent accept.
+const ACCEPTANCE_UNRECORDED: &str = "merge.acceptance_unrecorded";
+/// A resolved acceptance whose delivery task the client's shard refused at its admission bound; the
+/// completion record answers the client's retry.
+const ACCEPTANCE_UNDELIVERED: &str = "merge.acceptance_undelivered";
+/// A holder withheld a merge record's acknowledgement (the injected fault).
+const RECORD_WITHHELD: &str = "merge.record_withheld";
 
 /// Serves one merge record on a holder (§4.16 "Apply on holders"): the inputs must be held, the
 /// replica must be at the version before, the recomputation must reproduce the record's identity;
@@ -1585,6 +1760,11 @@ pub(crate) fn accept_merge_record(
   }
   let object = record.object;
   if state.merge.refused.contains(&object) {
+    return Vec::new();
+  }
+  if state.merge.fault.refuse_records {
+    // Test support: the acknowledgement is withheld, so the owner's version cannot commit here.
+    *state.refusals.entry(RECORD_WITHHELD).or_insert(0) += 1;
     return Vec::new();
   }
   let Some(value) = MergeRecordValue::from_record_bytes(&record.value) else {

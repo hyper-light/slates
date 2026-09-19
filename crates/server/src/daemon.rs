@@ -1340,6 +1340,21 @@ impl Daemon {
     })
   }
 
+  /// How many submits of `green` are waiting for their version's merge record to commit at the quorum
+  /// before they are answered (§4.16 "Commit"; AUD-11) — the non-vacuity a test asserts while it
+  /// withholds a holder's inputs or acknowledgements. Runs a one-shot question on the green's owner
+  /// shard; the typed refusal when it could not be observed.
+  pub fn merge_awaiting(
+    &self,
+    green: slates_ipc::protocol::VolumeId,
+  ) -> Result<usize, ObserveError> {
+    let object = slates_db::register::ObjectId(green.bytes);
+    let volume = slates_db::catalog::VolumeId { bytes: green.bytes };
+    self.observe(self.shard_of_object(object), move |s| {
+      crate::merge_service::awaiting_count(s, volume)
+    })
+  }
+
   /// What `green` holds in memory beyond its durable chain and what it has charged the shard's budget
   /// for it (§4.2 all-cost admission, §4.16; AUD-16): the current files, the content history retained
   /// for reconstruction (as the engine's running total and recounted from the histories — the balance a
@@ -1852,6 +1867,9 @@ fn init_shard(
     // span id it mints is distinct across the daemon and the fleet without coordination (§4.14).
     tracer: slates_wire::observe::Tracer::new(host.0, partition),
     current_span: None,
+    reply_route: None,
+    current_request: None,
+    acceptance_deferred: false,
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,
