@@ -185,12 +185,17 @@ fn a_kernel_offering_every_bit_negotiates_only_the_named_flags() {
     | flags::DONT_MASK
     | flags::DO_READDIRPLUS
     | flags::READDIRPLUS_AUTO
-    | flags::WRITEBACK_CACHE
     | flags::PARALLEL_DIROPS
     | flags::EXPLICIT_INVAL_DATA
     | flags::INIT_EXT
     | flags::HAS_EXPIRE_ONLY;
   assert_eq!(n.flags & !named, 0, "no foreign bit leaks: {:#x}", n.flags);
+  assert_eq!(
+    n.flags & flags::WRITEBACK_CACHE,
+    0,
+    "writeback cache is refused however the kernel offers it: the kernel would own a regular file's \
+     size and times, which a volume changed through other attachments cannot allow"
+  );
   assert_eq!(
     n.flags & (flags::INIT_EXT | flags::HAS_EXPIRE_ONLY),
     flags::INIT_EXT | flags::HAS_EXPIRE_ONLY,
@@ -236,8 +241,8 @@ fn the_init_reply_has_the_headers_layout() {
   );
   assert_eq!(
     u64::from(u32_at(&reply, 12)) & (flags::WRITEBACK_CACHE | flags::INIT_EXT),
-    flags::WRITEBACK_CACHE | flags::INIT_EXT,
-    "flags: the low word, INIT_EXT echoed so the kernel reads flags2"
+    flags::INIT_EXT,
+    "flags: the low word, INIT_EXT echoed so the kernel reads flags2, writeback cache refused"
   );
   assert_eq!(u32_at(&reply, 20), 256 * 1024, "max_write");
   assert_eq!(u32_at(&reply, 24), 1, "time_gran: one nanosecond");

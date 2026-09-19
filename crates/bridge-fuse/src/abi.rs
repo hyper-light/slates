@@ -133,9 +133,12 @@ impl Opcode {
 /// The `FUSE_INIT` flags slates negotiates (a subset; the connection keeps the intersection of
 /// what it asks and what the kernel offers, §4.6 "Cache posture").
 pub mod flags {
-  /// Format: FUSE_WRITEBACK_CACHE — the kernel holds dirty pages and writes them back in bulk. The
-  /// Linux ABI bit is `1 << 16` (`<linux/fuse.h>`); `1 << 8` is `FUSE_SPLICE_MOVE`, so the old value
-  /// advertised the wrong capability and never negotiated writeback (source audit BUG-6, 2026-09-05).
+  /// Format: FUSE_WRITEBACK_CACHE — the kernel holds dirty pages and writes them back in bulk, and
+  /// owns a regular file's size and times while it does. The Linux ABI bit is `1 << 16`
+  /// (`<linux/fuse.h>`); `1 << 8` is `FUSE_SPLICE_MOVE`, so the old value advertised the wrong
+  /// capability and never negotiated writeback (source audit BUG-6, 2026-09-05). Since 2026-09-19 it
+  /// is deliberately **not requested** (`init::wanted`): the kernel's ownership of the size defeats
+  /// the invalidation of a change made through another attachment.
   pub const WRITEBACK_CACHE: u64 = 1 << 16;
   /// Format: FUSE_PARALLEL_DIROPS — several directory operations may be in flight at once.
   pub const PARALLEL_DIROPS: u64 = 1 << 18;

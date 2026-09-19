@@ -187,12 +187,45 @@ fn fuse_attr(node: &NodeAttr) -> Attr {
     mtime: split_ns(node.mtime),
     ctime: split_ns(node.ctime),
     atime: split_ns(node.atime),
-    mode: node.mode,
+    mode: wire_mode(node.kind, node.mode),
     nlink: node.nlink,
     uid: node.uid,
     gid: node.gid,
     blksize: BLKSIZE,
   }
+}
+
+/// Format: `S_IFREG`, the `<sys/stat.h>` file-type bits of `st_mode` for a regular file.
+const S_IFREG: u32 = 0o100_000;
+/// Format: `S_IFDIR`, the file-type bits for a directory.
+const S_IFDIR: u32 = 0o040_000;
+/// Format: `S_IFLNK`, the file-type bits for a symbolic link.
+const S_IFLNK: u32 = 0o120_000;
+/// Format: the permission bits below the type bits (`07777`: the permission triads and the set-id
+/// and sticky bits).
+const PERMISSION_BITS: u32 = 0o7777;
+
+/// The `st_mode` the FUSE wire carries for an object: its type bits from `kind` and its permission
+/// bits — the seam reports the two apart (`NodeAttr::kind` and the permission-bits `mode` the volume
+/// keeps, as the NFS edge's `ftype3`/`mode` do), while the kernel validates every attribute reply's
+/// mode for a file type it knows (`fs/fuse/dir.c` `fuse_invalid_attr` → `fuse_valid_type`) and marks
+/// the inode **bad** — `EIO` on everything after — when there is none. Before, the reply carried the
+/// permission bits alone, so the root's first `GETATTR` made the mount unusable on a real kernel
+/// (`docs/bugs/2026-09-19-fuse-attribute-replies-carry-no-file-type-bits.md`).
+fn wire_mode(kind: Kind, permissions: u32) -> u32 {
+  let kind_bits = match kind {
+    Kind::File => S_IFREG,
+    Kind::Dir => S_IFDIR,
+    Kind::Symlink => S_IFLNK,
+  };
+  kind_bits | (permissions & PERMISSION_BITS)
+}
+
+/// The permission bits of a mode the kernel sent (`fuse_create_in.mode` carries `S_IFREG`, a
+/// `FATTR_MODE` the inode's type bits): the volume keeps permission bits alone, so the type bits are
+/// the wire's and stop here.
+fn permission_bits(mode: u32) -> u32 {
+  mode & PERMISSION_BITS
 }
 
 /// Format: the set-user-id, set-group-id and group-execute mode bits (`<sys/stat.h>` `S_ISUID`,
@@ -537,11 +570,11 @@ fn serve_create(
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   }
   let flags = u32::from_le_bytes(req.body[0..size_of::<u32>()].try_into().unwrap_or_default());
-  let mode = u32::from_le_bytes(
+  let mode = permission_bits(u32::from_le_bytes(
     req.body[size_of::<u32>()..2 * size_of::<u32>()]
       .try_into()
       .unwrap_or_default(),
-  );
+  ));
   let Ok(name) = parse_name(&req.body[HEAD..]) else {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   };
@@ -667,7 +700,9 @@ fn serve_mkdir(
   if req.body.len() < HEAD {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   }
-  let mode = u32::from_le_bytes(req.body[..size_of::<u32>()].try_into().unwrap_or_default());
+  let mode = permission_bits(u32::from_le_bytes(
+    req.body[..size_of::<u32>()].try_into().unwrap_or_default(),
+  ));
   let Ok(name) = parse_name(&req.body[HEAD..]) else {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   };
@@ -867,7 +902,9 @@ fn setattr_changes(
   } else {
     None
   };
-  let mut mode = set(SetAttrIn::FATTR_MODE).then_some(s.mode);
+  // The kernel's requested mode carries the inode's type bits (`ia_mode`); the volume keeps the
+  // permission bits alone.
+  let mut mode = set(SetAttrIn::FATTR_MODE).then_some(permission_bits(s.mode));
   if set(SetAttrIn::FATTR_KILL_SUIDGID) {
     let current = match mode {
       Some(mode) => mode,

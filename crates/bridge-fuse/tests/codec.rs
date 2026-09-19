@@ -200,14 +200,21 @@ fn init_body(major: u32, offered: u64) -> Vec<u8> {
 }
 
 /// FUSE_INIT keeps the intersection of the flags slates wants and the kernel offers, and
-/// bounds the minor version to the lesser of the two.
+/// bounds the minor version to the lesser of the two. Writeback cache is offered here and refused:
+/// under it the kernel owns a regular file's size and times, so a change made through another
+/// attachment stays invisible to `stat` even after an accepted invalidation
+/// (`docs/bugs/2026-09-19-writeback-cache-made-the-kernel-the-size-authority.md`).
 #[test]
 fn init_negotiates_the_intersection_of_flags() {
   let offered = flags::WRITEBACK_CACHE | flags::DO_READDIRPLUS | (1u64 << 20);
   let n = negotiate(&init_body(7, offered)).unwrap();
   assert_eq!(n.major, 7);
   assert_eq!(n.minor, 31, "bounded to slates' floor");
-  assert!(n.flags & flags::WRITEBACK_CACHE != 0);
+  assert_eq!(
+    n.flags & flags::WRITEBACK_CACHE,
+    0,
+    "writeback cache is refused though offered"
+  );
   assert!(n.flags & flags::DO_READDIRPLUS != 0);
   assert_eq!(n.flags & (1u64 << 20), 0, "an unwanted flag is dropped");
   assert!(!n.version_mismatch);
@@ -225,9 +232,11 @@ fn init_handles_a_version_mismatch_and_a_short_body() {
 }
 
 /// FUSE_WRITEBACK_CACHE must use the Linux kernel ABI bit `1 << 16` (`<linux/fuse.h>`), not
-/// `1 << 8` (which is FUSE_SPLICE_MOVE). Driven by an independent kernel vector: a kernel that
-/// offers the real writeback bit must have it negotiated. With the wrong value the intersection
-/// dropped it and writeback never turned on (source audit BUG-6).
+/// `1 << 8` (`FUSE_SPLICE_MOVE`): the old value advertised the wrong capability (source audit
+/// BUG-6). The bit is right, and a kernel offering it is now **refused** it on purpose: under
+/// writeback cache the kernel owns a regular file's size and times, which a volume changed through
+/// other attachments cannot allow
+/// (`docs/bugs/2026-09-19-writeback-cache-made-the-kernel-the-size-authority.md`).
 #[test]
 fn writeback_cache_uses_the_kernel_abi_bit() {
   const KERNEL_WRITEBACK_CACHE: u64 = 1 << 16; // FUSE_WRITEBACK_CACHE in <linux/fuse.h>
@@ -237,8 +246,9 @@ fn writeback_cache_uses_the_kernel_abi_bit() {
     "the advertised bit must match the kernel ABI"
   );
   let negotiated = negotiate(&init_body(7, KERNEL_WRITEBACK_CACHE)).unwrap();
-  assert!(
-    negotiated.flags & KERNEL_WRITEBACK_CACHE != 0,
-    "a kernel offering the real writeback bit negotiates it"
+  assert_eq!(
+    negotiated.flags & KERNEL_WRITEBACK_CACHE,
+    0,
+    "a kernel offering the real writeback bit is refused it"
   );
 }

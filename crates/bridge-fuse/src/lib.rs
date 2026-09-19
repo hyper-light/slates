@@ -21,6 +21,7 @@ pub mod abi;
 pub mod bridge;
 #[cfg(target_os = "linux")]
 pub mod channel;
+pub mod coherence;
 pub mod error;
 pub mod init;
 #[cfg(unix)]

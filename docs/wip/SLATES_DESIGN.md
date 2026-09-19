@@ -1461,10 +1461,14 @@ invalidates exactly the paths the manifest diff names.
 using the OS-installed broker for privileged mount establishment; the daemon itself never
 requires `CAP_SYS_ADMIN`, root or a Slates-owned setuid helper. Namespace attachment capability
 is checked by the launcher and refused when unavailable; it is not a daemon prerequisite. Options: `default_permissions`, `allow_other` only
-if `user_allow_other` is set and the operator asked; `FUSE_INIT` negotiates writeback cache,
-splice, readdirplus, `EXPLICIT_INVAL_DATA`, `EXPIRE_ONLY`, parallel dirops, and `OVER_IO_URING`
-when the kernel offers it; one channel per shard (`FUSE_DEV_IOC_CLONE`, or io_uring per-core
-queues). Cache posture: only negotiated, tested features may be advertised. Infinite cache
+if `user_allow_other` is set and the operator asked; `FUSE_INIT` negotiates splice, readdirplus,
+`EXPLICIT_INVAL_DATA`, `EXPIRE_ONLY`, parallel dirops, and `OVER_IO_URING` when the kernel offers
+it, and **refuses writeback cache** (corrected 2026-09-19: under `FUSE_WRITEBACK_CACHE` the kernel
+owns a regular file's size and times and ignores the daemon's, so a change made through another
+attachment stays invisible to `stat` even after an accepted invalidation — measured on Linux 6.12,
+`docs/bugs/2026-09-19-writeback-cache-made-the-kernel-the-size-authority.md`; write-through also
+keeps every `write`'s bytes in the daemon before the call returns, D-18); one channel per shard
+(`FUSE_DEV_IOC_CLONE`, or io_uring per-core queues). Cache posture: only negotiated, tested features may be advertised. Infinite cache
 lifetimes require proven invalidation delivery and recovery for every mutation source; a
 notifier encoder alone cannot justify them. Unsupported semantics are explicitly refused.
 Live source names/attributes/content cannot have an indefinite kernel cache lifetime:
@@ -1591,10 +1595,16 @@ until mapping isolation, pinning and teardown have been established for that VMM
 > runtime-specification `mounts` entry (`type: bind`, `rbind` + `ro`/`rw` by the attachment's policy)
 > with the table's evidence; the runtime binds; an unbound path is refused
 > `ChosenPathUnavailable{reason}`. T-4.13 is proven by use on macOS over Docker Desktop's share of the
-> NFS-loopback mount (`crates/cli/tests/cli.rs`) with a CI Linux variant over a real FUSE mount
-> (`crates/bridge-fuse/tests/oci_container.rs`): the same workload on the host path and in the
+> NFS-loopback mount (`crates/cli/tests/cli.rs`): the same workload on the host path and in the
 > container agrees byte for byte and in names and sizes, an edit on either side is the other's view,
-> the read-only bind refuses a write. Measured and reported typed (`SharingSemantics.delete_while_open`):
+> the read-only bind refuses a write. Its Linux variant over a real FUSE mount
+> (`crates/bridge-fuse/tests/oci_container.rs`) is gated on `fusermount3` accepting `allow_other`
+> (`user_allow_other` in `/etc/fuse.conf`), which the CI runner does not set, so it skips there and
+> has not run against a real kernel; **correction (2026-09-19):** the earlier wording here claimed it
+> as the proof of the Linux leg, and it was not — the FUSE serve loop's first real-kernel run was the
+> mounted coherence test of AUD-02 (`crates/bridge-fuse/tests/coherence_mount.rs`, needing no
+> `allow_other`), which found every attribute reply lacking the file-type bits a kernel validates
+> (`docs/bugs/2026-09-19-fuse-attribute-replies-carry-no-file-type-bits.md`, fixed). Measured and reported typed (`SharingSemantics.delete_while_open`):
 > the runtime's share holds every file a container touched open beyond the container's lifetime, so an
 > in-container delete over the NFS mount is silly-renamed to `.nfs.*` by the macOS NFS client
 > (Appendix C), blocking `rmdir` and the plain unmount until the share lets go. A guest form requested
@@ -3850,8 +3860,9 @@ fd handoff through the anchor, `slates exec`, the conformance and workload harne
 
 **Ordered tasks.**
 1. The driver: request framing, reply writes, notifications; `FUSE_DEV_IOC_CLONE` per shard;
-   the io_uring command path with fallback; negotiation of writeback cache, splice, readdirplus,
-   `EXPLICIT_INVAL_DATA`, `EXPIRE_ONLY`, `INC_EPOCH`.
+   the io_uring command path with fallback; negotiation of splice, readdirplus,
+   `EXPLICIT_INVAL_DATA`, `EXPIRE_ONLY`, `INC_EPOCH` (writeback cache refused: the kernel would own
+   sizes and times a volume changes through other attachments, §4.6 "Linux", 2026-09-19).
 2. Mount establishment with the new mount API when permitted, `fusermount3` otherwise; the fd
    held by the anchor; restart handoff.
 3. The `Bridge` trait implementation in the core; inode `(no, gen)`; invalidation on every
@@ -3910,7 +3921,8 @@ fd handoff through the anchor, `slates exec`, the conformance and workload harne
 - T-3.3 (workload) sqlite WAL-mode database inside the volume with two processes; expect
   correct results and no corruption (locks through FUSE).
 - T-3.4 (edge) mmap a file shared between two processes on the host; expect coherent writes
-  (writeback cache, no direct_io).
+  (one shared page cache per inode under write-through, no direct_io; writeback cache is refused,
+  §4.6 "Linux").
 - T-3.5 (fault) Kill the daemon while a process holds an open file and is writing; expect
   `ENOTCONN` errors during the window, then recovery with every acknowledged write present.
 - T-3.6 (error) `allow_other` requested without `user_allow_other`; expect a typed refusal

@@ -37,14 +37,20 @@ pub struct InitNegotiation {
 }
 
 /// The flags slates asks for (the connection keeps whatever the kernel also offers). Each is a
-/// capability slates implements completely: readdirplus has its handler, writeback its flush
-/// through `setattr`, explicit data invalidation and expire-only entries their notifications.
-/// `INIT_EXT` is echoed so the kernel reads the reply's second word at all (`process_init_reply`
-/// takes `flags2` only from a reply whose `flags` carry `FUSE_INIT_EXT`); without it no
-/// second-word capability reaches the kernel however the intersection came out.
+/// capability slates implements completely: readdirplus has its handler, explicit data invalidation
+/// and expire-only entries their notifications. `INIT_EXT` is echoed so the kernel reads the reply's
+/// second word at all (`process_init_reply` takes `flags2` only from a reply whose `flags` carry
+/// `FUSE_INIT_EXT`); without it no second-word capability reaches the kernel however the intersection
+/// came out. **Writeback cache is never asked for** (§4.6 "Cache posture": a transport that cannot
+/// implement the requested coherence refuses that guarantee): under `FUSE_WRITEBACK_CACHE` the kernel
+/// owns a regular file's size, mtime and ctime (`fs/fuse/dir.c` `fuse_get_cache_mask`) and neither
+/// re-fetches them nor takes the daemon's, so a change made through another attachment — the SDK, a
+/// second mount, an outsider beneath a base — stays invisible to `stat` even after an accepted
+/// `FUSE_NOTIFY_INVAL_INODE`; measured on Linux 6.12 (2026-09-19,
+/// `docs/bugs/2026-09-19-writeback-cache-made-the-kernel-the-size-authority.md`). Write-through
+/// also keeps a `write`'s bytes in the daemon before the call returns (D-18).
 fn wanted() -> u64 {
-  flags::WRITEBACK_CACHE
-    | flags::PARALLEL_DIROPS
+  flags::PARALLEL_DIROPS
     | flags::DO_READDIRPLUS
     | flags::READDIRPLUS_AUTO
     | flags::EXPLICIT_INVAL_DATA

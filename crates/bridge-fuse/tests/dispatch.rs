@@ -34,6 +34,8 @@ struct Mock {
   last_setattr: Option<SetAttr>,
   rename_calls: u64,
   last_rename: Option<RenameFlags>,
+  /// The mode the last `create` reached the seam with (what the volume would keep).
+  last_create_mode: Option<u32>,
 }
 
 /// Format: the file mode of a regular file, and of a directory.
@@ -169,9 +171,10 @@ impl Bridge for Mock {
     _parent: ObjectId,
     _cx: &OpContext,
     _name: &str,
-    _mode: u32,
+    mode: u32,
     _flags: u32,
   ) -> Result<(NodeAttr, u64), VfsError> {
+    self.last_create_mode = Some(mode);
     Ok((
       NodeAttr {
         ino: 3,
@@ -354,7 +357,76 @@ fn mock() -> Mock {
     last_setattr: None,
     rename_calls: 0,
     last_rename: None,
+    last_create_mode: None,
   }
+}
+
+/// A `fuse_create_in` body as the kernel sends it: flags, mode, umask, open_flags, then the name.
+fn create_body(mode: u32, name: &str) -> Vec<u8> {
+  let mut b = vec![0u8; 16];
+  b[4..8].copy_from_slice(&mode.to_le_bytes());
+  b.extend_from_slice(name.as_bytes());
+  b.push(0);
+  b
+}
+
+/// Format: where `fuse_attr.mode` sits in a `fuse_attr_out` reply body: after `attr_valid` (8),
+/// `attr_valid_nsec` (4), `dummy` (4), and `fuse_attr`'s ino, size, blocks, atime, mtime, ctime (6 × 8)
+/// and the three nanosecond parts (3 × 4).
+const ATTR_OUT_MODE_AT: usize = 16 + 6 * 8 + 3 * 4;
+/// Format: `S_IFREG | 0644` — a regular file's `st_mode` as the kernel sends and expects it — and the
+/// permission bits alone, as the volume keeps them.
+const KERNEL_FILE_MODE: u32 = 0o100_644;
+const FILE_PERMISSIONS: u32 = 0o644;
+
+/// An attribute reply composes the wire `st_mode` from the seam's kind and its permission bits: the
+/// volume keeps permission bits alone (`Attrs::mode`), and a real kernel validates every reply's mode
+/// for a file type it knows, marking the inode bad (`EIO` after) when there is none. Failed before
+/// the fix: the reply carried `0644` (`docs/bugs/2026-09-19-fuse-attribute-replies-carry-no-file-type-bits.md`).
+#[test]
+fn an_attribute_reply_carries_the_file_type_bits_over_the_seams_permission_bits() {
+  let mut m = mock();
+  m.mode = FILE_PERMISSIONS;
+  let mut out = [0u8; 256];
+  let n = dispatch(
+    &message(Opcode::GetAttr.to_wire(), 1, 2, &[0u8; 16]),
+    &mut m,
+    &mut out,
+  );
+  assert!(
+    n > OUT_HEADER_LEN + ATTR_OUT_MODE_AT + 4,
+    "an attribute reply"
+  );
+  let at = OUT_HEADER_LEN + ATTR_OUT_MODE_AT;
+  let mode = u32::from_le_bytes(out[at..at + 4].try_into().unwrap());
+  assert_eq!(
+    mode, KERNEL_FILE_MODE,
+    "S_IFREG from the seam's kind, the permission bits from its mode"
+  );
+}
+
+/// A `CREATE` the kernel sends with `S_IFREG | 0644` reaches the seam as the permission bits alone:
+/// the type bits are the wire's, and the volume never keeps them. Failed before the fix (the seam
+/// received `0100644`).
+#[test]
+fn a_create_reaches_the_seam_with_the_permission_bits_alone() {
+  let mut m = mock();
+  let mut out = [0u8; 512];
+  dispatch(
+    &message(
+      Opcode::Create.to_wire(),
+      1,
+      1,
+      &create_body(KERNEL_FILE_MODE, "new"),
+    ),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(
+    m.last_create_mode,
+    Some(FILE_PERMISSIONS),
+    "the kernel's S_IFREG stops at the edge"
+  );
 }
 
 /// A `fuse_setattr_in` body (88 bytes) with the given `valid` mask and the kernel-filled fields:

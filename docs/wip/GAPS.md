@@ -1250,6 +1250,29 @@ crash point) and the live kernel-mount CLI flow.
 `docs/bugs/2026-09-19-nfs-bypasses-consumer-and-volume-authorization.md`,
 `docs/bugs/2026-09-19-mount-capability-attachment-dies-with-its-client-and-the-daemon.md`.
 
+**Implementation follow-up (2026-09-19, AUD-02 closed; GAP-A9-3/-4's FUSE-coherence leg):** the
+FUSE serve loop delivers kernel invalidations at every wake — a kernel request or a `ChangeSignal`
+another mutation source notifies (an `eventfd` the loop `poll`s beside the device) — so a change made
+while the kernel answers from its unbounded cache is told without waiting for a request; and the
+delivery is a pure discipline (`crates/bridge-fuse/src/coherence.rs`) whose cursor advances only past
+what was gathered and written, a refused gather keeping it (counted) for the next wake and the
+transport's own request moving it only after a whole round. Proven on every host with a recording
+sink and on Linux over a real `fusermount3` mount (the cache proven warm by a `GETATTR` count, another
+attachment's truncate seen through `stat` with no request, an injected gather refusal retried).
+`docs/bugs/2026-09-19-fuse-invalidations-wait-for-a-kernel-request-and-a-refused-gather-loses-changes.md`.
+Found by that mounted test on its first run — the FUSE serve loop's first run against a real kernel:
+every attribute reply carried the volume's permission bits with no `S_IFMT` type bits, which a kernel
+validates and answers by marking the inode bad (`EIO` on everything after), so every FUSE mount was
+dead on its first operation; the wire mode is now composed from the seam's kind and permission bits,
+and the kernel's type bits are stripped from `CREATE`/`MKDIR`/`FATTR_MODE` before the volume
+(`docs/bugs/2026-09-19-fuse-attribute-replies-carry-no-file-type-bits.md`). And with the mount
+working, the same test showed a delivered, accepted invalidation ignored: `FUSE_INIT` asked for
+writeback cache, under which the kernel owns a regular file's size and times and neither re-fetches
+nor takes the daemon's — a change through another attachment stayed invisible to `stat`; writeback
+cache is now refused at negotiation, §4.6's list corrected
+(`docs/bugs/2026-09-19-writeback-cache-made-the-kernel-the-size-authority.md`). The T-4.13 Linux
+leg's status in §4.6 is corrected in the same change: it skips on the CI runner (`allow_other`).
+
 **Implementation follow-up (2026-09-19, a recovery sibling of AUD-01):** the landing counter
 (`LandingState::next_landing`) restarted at 1 on every boot while landing records are durable and
 guarded against a duplicate id, so after a restart the next `land` was refused `AlreadyExists` once

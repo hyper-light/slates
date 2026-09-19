@@ -9,13 +9,19 @@
 //! path and the per-shard `FUSE_DEV_IOC_CLONE` channels are the driver's next pieces (owed), and
 //! the mount establishment (the new mount API, or `fusermount3`) is [`crate::mount`].
 //!
-//! Kernel coherence (§4.6 "Cache posture"): before each request is served, the loop asks the seam
-//! for every invalidation owed since it last looked — a change through the SDK or another
-//! attachment, or an outsider's change beneath a base directory — and writes each to the device
-//! as an unsolicited notification, so the kernel never answers a lookup or a stat from a cache
-//! newer than the daemon's view. The loop's own request needs no invalidation in its own kernel,
-//! so the cursor is taken again after it. What the kernel negotiated at `INIT` decides whether an
-//! entry is expired (`FUSE_EXPIRE_ONLY`, the live-source case) or dropped.
+//! Kernel coherence (§4.6 "Cache posture"; AUD-02): the loop runs one delivery round
+//! ([`crate::coherence`]) at **every wake** — a kernel request, or a change another mutation source
+//! signalled through a [`ChangeSignal`] — asking the seam for every invalidation owed since the
+//! cursor (a change through the SDK or another attachment, an outsider's change beneath a base
+//! directory) and writing each to the device as an unsolicited notification, so the kernel never
+//! answers a lookup or a stat from a cache newer than the daemon's view, and a change while the
+//! kernel is answering from its cache is told without waiting for a request. The loop's own request
+//! needs no invalidation in its own kernel, so the cursor is taken again after it — only when the
+//! round before it was delivered whole; a refused gather keeps the cursor so the round is retried
+//! rather than lost. What the kernel negotiated at `INIT` decides whether an entry is expired
+//! (`FUSE_EXPIRE_ONLY`, the live-source case) or dropped. The wait is a `poll` over the device and
+//! the signal; the owner that interleaves other work (a shard serving verbs) drives [`wait`] and
+//! [`serve_step`] itself, and [`serve_blocking`] is the loop over them.
 //!
 //! No `unsafe`: the device is opened, read and written through rustix's I/O-safe wrappers over
 //! an owned descriptor.
@@ -24,16 +30,18 @@
 
 use std::os::fd::{AsFd, OwnedFd};
 
+use rustix::event::{EventfdFlags, PollFd, PollFlags};
 use rustix::fs::{Mode, OFlags};
 
 use crate::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode, flags};
 use crate::bridge::Bridge;
+use crate::coherence::{Coherence, Delivered};
 use crate::dispatch;
 use crate::error::FuseError;
 use crate::init::negotiate;
 use crate::notify::{EXPIRE_ONLY, inval_entry, inval_inode};
 use crate::request::Request;
-use slates_bridge_core::{AttachmentId, Attachments, Invalidation, InvalidationCursor, OpContext};
+use slates_bridge_core::{AttachmentId, Attachments, Invalidation};
 
 /// Format: the device the kernel's FUSE client and the daemon exchange messages over.
 const FUSE_DEVICE: &str = "/dev/fuse";
@@ -197,104 +205,318 @@ impl FuseChannel {
   }
 }
 
-/// The blocking serve loop (the fallback path, §4.6): deliver the invalidations owed since the
-/// last request, read a request, dispatch it to `bridge`, write the reply, until the kernel
-/// unmounts. The io_uring command path replaces this on 6.14+; both drive the same [`dispatch`].
-/// A read shorter than a header is a malformed message the driver drops; a device error other
-/// than a disconnect is returned to the caller. Each request is admitted with
-/// [`Attachments::begin`] and ended with [`Attachments::end`] around its whole service, so a
-/// barrier over the volume (§4.6 "Writeback and snapshot barrier") sees exactly the requests
-/// the seam may still be applying — one at a time here — and a loop that dies mid-request
-/// leaves that request counted, which a barrier reports as incomplete until the owner's
-/// failed-consumer cleanup.
+/// Format: the eventfd counter's width — one native-endian `u64` per read or write (`eventfd(2)`).
+const EVENTFD_WORD: usize = size_of::<u64>();
+
+/// A change signal (§4.6 "Cache posture"; AUD-02): the descriptor the serve loop waits on beside the
+/// device, so a change another mutation source made — the SDK or another attachment on the volume,
+/// an outsider's change beneath a base directory the watcher reported — wakes the loop to deliver
+/// the owed invalidations without waiting for the kernel's next request. An `eventfd`: a counter the
+/// notifiers add to and the wait drains, never blocking either side.
+pub struct ChangeSignal {
+  fd: OwnedFd,
+}
+
+impl std::fmt::Debug for ChangeSignal {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ChangeSignal").finish()
+  }
+}
+
+impl ChangeSignal {
+  /// A fresh signal, unsignalled.
+  pub fn new() -> Result<ChangeSignal, ChannelError> {
+    let fd =
+      rustix::event::eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).map_err(|e| {
+        ChannelError::Device {
+          call: "eventfd",
+          code: Some(e.raw_os_error()),
+        }
+      })?;
+    Ok(ChangeSignal { fd })
+  }
+
+  /// A notifier of this signal for another party (another thread's mutation source): its own
+  /// descriptor over the same counter, so it may outlive the borrow and cross threads.
+  pub fn notifier(&self) -> Result<ChangeNotifier, ChannelError> {
+    let fd = self.fd.try_clone().map_err(|e| ChannelError::Device {
+      call: "dup",
+      code: e.raw_os_error(),
+    })?;
+    Ok(ChangeNotifier { fd })
+  }
+
+  /// Takes the pending signals (the counter, in one read); a counter already at zero is nothing.
+  fn drain(&self) {
+    let mut word = [0u8; EVENTFD_WORD];
+    let _ = rustix::io::read(&self.fd, &mut word);
+  }
+}
+
+/// The signalling end of a [`ChangeSignal`]: held by a mutation source, which calls
+/// [`ChangeNotifier::notify`] after changing something the transport's kernel may hold cached.
+pub struct ChangeNotifier {
+  fd: OwnedFd,
+}
+
+impl std::fmt::Debug for ChangeNotifier {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ChangeNotifier").finish()
+  }
+}
+
+impl ChangeNotifier {
+  /// Signals a change. A counter already at its ceiling (`EAGAIN`) is already signalled, so that
+  /// is not a failure; any other refusal is the descriptor's.
+  pub fn notify(&self) -> Result<(), ChannelError> {
+    match rustix::io::write(&self.fd, &1u64.to_ne_bytes()) {
+      Ok(_) | Err(rustix::io::Errno::AGAIN) => Ok(()),
+      Err(e) => Err(ChannelError::Device {
+        call: "notify",
+        code: Some(e.raw_os_error()),
+      }),
+    }
+  }
+}
+
+/// What a wait observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wake {
+  /// The device has a request to read (or the connection ended: the read tells which).
+  Request,
+  /// The change signal fired: the owed invalidations are to be delivered, with no request.
+  Change,
+}
+
+/// Blocks until the device has a request or the change `signal` fires, whichever first (both:
+/// the request, since serving it delivers the owed round first anyway). An interrupted wait is
+/// resumed; the signal's counter is drained before `Change` is reported, so a level-triggered
+/// descriptor does not report the same change again.
+pub fn wait(channel: &FuseChannel, signal: Option<&ChangeSignal>) -> Result<Wake, ChannelError> {
+  loop {
+    let device = channel.device.as_fd();
+    let interest = PollFlags::IN;
+    let mut fds = [
+      PollFd::new(&device, interest),
+      match signal {
+        Some(signal) => PollFd::new(&signal.fd, interest),
+        None => PollFd::new(&device, interest),
+      },
+    ];
+    let polled = if signal.is_some() { 2 } else { 1 };
+    match rustix::event::poll(&mut fds[..polled], None) {
+      Ok(_) => {}
+      Err(rustix::io::Errno::INTR) => continue,
+      Err(e) => {
+        return Err(ChannelError::Device {
+          call: "poll",
+          code: Some(e.raw_os_error()),
+        });
+      }
+    }
+    // A hung-up or erroring device is a request to read: the read reports the disconnect.
+    if fds[0]
+      .revents()
+      .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR)
+    {
+      return Ok(Wake::Request);
+    }
+    if let Some(signal) = signal
+      && fds[1].revents().intersects(PollFlags::IN)
+    {
+      signal.drain();
+      return Ok(Wake::Change);
+    }
+  }
+}
+
+/// The serve loop's state across steps: the reply buffer, what the kernel negotiated, and the
+/// kernel's coherence (the cursor and what is owed).
+pub struct ServeState {
+  reply: Vec<u8>,
+  /// Whether the kernel honours FUSE_EXPIRE_ONLY, learned from its INIT (the negotiation is pure,
+  /// so re-running it here agrees with the reply the dispatch sends).
+  expire_only: bool,
+  /// Where the kernel's cache stands and what it is owed (AUD-02).
+  pub coherence: Coherence,
+}
+
+impl std::fmt::Debug for ServeState {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ServeState")
+      .field("expire_only", &self.expire_only)
+      .field("coherence", &self.coherence)
+      .finish()
+  }
+}
+
+impl ServeState {
+  /// The state at mount time: nothing negotiated, nothing in the kernel's cache.
+  pub fn new() -> ServeState {
+    ServeState {
+      reply: vec![0u8; BUFFER_BYTES],
+      expire_only: false,
+      coherence: Coherence::new(),
+    }
+  }
+}
+
+impl Default for ServeState {
+  fn default() -> ServeState {
+    ServeState::new()
+  }
+}
+
+/// What one step did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+  /// A kernel request was served — its opcode, or `None` for one slates does not serve — after the
+  /// owed round was delivered.
+  Request {
+    /// The request's opcode.
+    opcode: Option<Opcode>,
+    /// The round delivered before it.
+    delivered: Delivered,
+    /// The reply's errno (the kernel's convention: zero for success, else the positive errno the
+    /// reply carried negated), or zero for a request that takes no reply.
+    error: i32,
+  },
+  /// A change was signalled and the owed round delivered; no request.
+  Change(Delivered),
+  /// A read shorter than a header — a message the kernel never sends — dropped.
+  Dropped,
+  /// The mount ended: the kernel disconnected, or the attachment admits no more requests.
+  Ended,
+}
+
+/// One step of the serve loop after `wake`: a signalled change delivers the owed round; a request
+/// is read, the owed round delivered, the request dispatched to `bridge` and its reply written.
+/// Each step is admitted with [`Attachments::begin`] and ended with [`Attachments::end`] around its
+/// whole service, so a barrier over the volume (§4.6 "Writeback and snapshot barrier") sees exactly
+/// the requests the seam may still be applying — one at a time here — and a loop that dies
+/// mid-request leaves that request counted, which a barrier reports as incomplete until the owner's
+/// failed-consumer cleanup. A revoked or epoch-fenced attachment ends the mount rather than serving
+/// under stale authority (§4.8; per-request revalidation). A device error other than a disconnect is
+/// returned to the caller.
+pub fn serve_step(
+  channel: &mut FuseChannel,
+  bridge: &mut dyn Bridge,
+  attachments: &mut Attachments,
+  attachment: AttachmentId,
+  state: &mut ServeState,
+  wake: Wake,
+) -> Result<Step, ChannelError> {
+  if wake == Wake::Change {
+    let Ok(cx) = attachments.begin(attachment) else {
+      return Ok(Step::Ended);
+    };
+    let delivered = deliver_owed(channel, bridge, &cx, state);
+    attachments.end(attachment);
+    return delivered.map(Step::Change);
+  }
+  let request = match channel.read_request() {
+    Ok(r) => r,
+    Err(ChannelError::Disconnected) => return Ok(Step::Ended),
+    Err(e) => return Err(e),
+  };
+  if request.len() < IN_HEADER_LEN {
+    // A truncated read: the kernel never sends one, so drop it rather than reply to a message
+    // with no header.
+    return Ok(Step::Dropped);
+  }
+  let Ok(cx) = attachments.begin(attachment) else {
+    return Ok(Step::Ended);
+  };
+  // `dispatch` needs a mutable reply buffer separate from the request buffer the channel owns,
+  // so the request is copied out (one memcpy of a small message; the io_uring path avoids it
+  // with registered buffers, owed).
+  let request = channel.take_request();
+  let opcode = Request::parse(&request).ok().and_then(|parsed| {
+    if parsed.opcode == Some(Opcode::Init)
+      && let Ok(negotiated) = negotiate(parsed.body)
+    {
+      state.expire_only = negotiated.flags & flags::HAS_EXPIRE_ONLY != 0;
+    }
+    parsed.opcode
+  });
+  let served = serve_request(channel, bridge, &cx, &request, state);
+  // The request is ended whatever happened to it: a transport error ends the loop, and the mount's
+  // teardown (the owner's sweep) is the cleanup, not a phantom in-flight count.
+  attachments.end(attachment);
+  served.map(|(delivered, error)| Step::Request {
+    opcode,
+    delivered,
+    error,
+  })
+}
+
+/// Delivers the round owed to the kernel: every invalidation since the cursor, written as an
+/// unsolicited notification (a seam refusal keeps the cursor for the next wake; a device refusal is
+/// the transport's).
+fn deliver_owed(
+  channel: &FuseChannel,
+  bridge: &mut dyn Bridge,
+  cx: &slates_bridge_core::OpContext,
+  state: &mut ServeState,
+) -> Result<Delivered, ChannelError> {
+  let expire_only = state.expire_only;
+  state
+    .coherence
+    .deliver(bridge, cx, &mut |invalidation: &Invalidation| {
+      channel.write_invalidation(invalidation, expire_only)
+    })
+}
+
+/// Serves one admitted request: the owed round first, so the reply never coexists with a stale
+/// cached name or attribute (§4.6), then the dispatch and its reply; then the cursor moves past the
+/// request's own records — only when the round was delivered whole ([`Coherence::served_own_request`]).
+fn serve_request(
+  channel: &mut FuseChannel,
+  bridge: &mut dyn Bridge,
+  cx: &slates_bridge_core::OpContext,
+  request: &[u8],
+  state: &mut ServeState,
+) -> Result<(Delivered, i32), ChannelError> {
+  let delivered = deliver_owed(channel, bridge, cx, state)?;
+  let n = dispatch(request, bridge, cx, &mut state.reply);
+  let error = reply_error(&state.reply[..n]);
+  if n > 0 {
+    channel.write_reply(&state.reply[..n])?;
+  }
+  state.coherence.served_own_request(bridge, cx, delivered);
+  Ok((delivered, error))
+}
+
+/// The errno a reply carries (`fuse_out_header.error`, negated on the wire), as a positive number;
+/// zero for success or for no reply.
+fn reply_error(reply: &[u8]) -> i32 {
+  /// Format: `fuse_out_header`: `len` (u32) then `error` (i32) — the errno field's offset.
+  const ERROR_AT: usize = size_of::<u32>();
+  reply
+    .get(ERROR_AT..ERROR_AT + size_of::<i32>())
+    .and_then(|bytes| bytes.try_into().ok())
+    .map_or(0, |bytes| i32::from_le_bytes(bytes).saturating_neg())
+}
+
+/// The blocking serve loop (the fallback path, §4.6): [`wait`] for a request or a signalled change,
+/// then [`serve_step`], until the kernel unmounts or the attachment admits no more. The io_uring
+/// command path replaces this on 6.14+; both drive the same [`dispatch`]. An owner that interleaves
+/// other work with the mount (a shard serving verbs) drives `wait` and `serve_step` itself, applying
+/// its own changes between them and signalling `signal` so they are delivered.
 pub fn serve_blocking(
   channel: &mut FuseChannel,
   bridge: &mut dyn Bridge,
   attachments: &mut Attachments,
   attachment: AttachmentId,
+  signal: Option<&ChangeSignal>,
 ) -> Result<(), ChannelError> {
-  let mut reply = vec![0u8; BUFFER_BYTES];
-  let mut owed: Vec<Invalidation> = Vec::new();
-  // Whether the kernel honours FUSE_EXPIRE_ONLY, learned from its INIT (the negotiation is pure,
-  // so re-running it here agrees with the reply the dispatch sends).
-  let mut expire_only = false;
-  // Where the kernel's cache stands: nothing before the mount's first request can be in it.
-  let mut cursor: Option<InvalidationCursor> = None;
+  let mut state = ServeState::new();
   loop {
-    let request = match channel.read_request() {
-      Ok(r) => r,
-      Err(ChannelError::Disconnected) => return Ok(()),
-      Err(e) => return Err(e),
-    };
-    if request.len() < IN_HEADER_LEN {
-      // A truncated read: the kernel never sends one, so drop it and read again rather than
-      // reply to a message with no header.
-      continue;
-    }
-    // Admit the request under the mount's attachment before each effect, so a revoked or
-    // epoch-fenced attachment stops the mount rather than serving a request under stale
-    // authority (§4.8; per-request revalidation, the "checked before effects" rule). The
-    // registry's concurrent-revoke ownership is the async driver's design (owed).
-    let Ok(cx) = attachments.begin(attachment) else {
+    let wake = wait(channel, signal)?;
+    if serve_step(channel, bridge, attachments, attachment, &mut state, wake)? == Step::Ended {
       return Ok(());
-    };
-    // `dispatch` needs a mutable reply buffer separate from the request buffer the channel
-    // owns, so the request is copied out (one memcpy of a small message; the io_uring path
-    // avoids it with registered buffers, owed).
-    let request = channel.take_request();
-    if let Ok(parsed) = Request::parse(&request)
-      && parsed.opcode == Some(Opcode::Init)
-      && let Ok(negotiated) = negotiate(parsed.body)
-    {
-      expire_only = negotiated.flags & flags::HAS_EXPIRE_ONLY != 0;
     }
-    let served = serve_one(
-      channel,
-      bridge,
-      &cx,
-      &request,
-      &mut reply,
-      &mut owed,
-      &mut cursor,
-      expire_only,
-    );
-    // The request is ended whatever happened to it: a transport error below ends the loop, and
-    // the mount's teardown (the owner's sweep) is the cleanup, not a phantom in-flight count.
-    attachments.end(attachment);
-    served?;
   }
-}
-
-/// Serves one admitted request: the owed invalidations first, then the dispatch and its reply.
-#[allow(clippy::too_many_arguments)] // one request's whole service: the channel, the seam, its context, the message, the buffers and the loop's state
-fn serve_one(
-  channel: &mut FuseChannel,
-  bridge: &mut dyn Bridge,
-  cx: &OpContext,
-  request: &[u8],
-  reply: &mut [u8],
-  owed: &mut Vec<Invalidation>,
-  cursor: &mut Option<InvalidationCursor>,
-  expire_only: bool,
-) -> Result<(), ChannelError> {
-  // Everything that changed under the kernel's cache since this loop last looked is delivered
-  // before the request is served, so the reply never coexists with a stale cached name or
-  // attribute (§4.6). A seam refusal here leaves the cursor where it was, so the delivery is
-  // retried before the next request rather than lost.
-  let since = cursor.unwrap_or_else(|| bridge.seen(cx));
-  if let Ok(next) = bridge.invalidations(cx, since, owed) {
-    *cursor = Some(next);
-  }
-  for invalidation in owed.drain(..) {
-    channel.write_invalidation(&invalidation, expire_only)?;
-  }
-  let n = dispatch(request, bridge, cx, reply);
-  if n > 0 {
-    channel.write_reply(&reply[..n])?;
-  }
-  // The request's own records are this kernel's own doing: take the cursor past them.
-  *cursor = Some(bridge.seen(cx));
-  Ok(())
 }
 
 impl FuseChannel {
