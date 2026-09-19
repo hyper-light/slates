@@ -349,6 +349,12 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
           snapshot: None,
           form: AttachForm::Root,
           principal: principal(*c),
+          rights: slates_db::catalog::Rights {
+            read: true,
+            write: true,
+            admin: false,
+          },
+          token: [0u8; 16],
         },
       }
     }

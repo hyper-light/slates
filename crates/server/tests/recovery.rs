@@ -262,10 +262,19 @@ fn nfs_stream(daemon: &Daemon) -> TcpStream {
   TcpStream::connect(("127.0.0.1", port)).unwrap()
 }
 
+/// The NFS mount path carrying an owner mount capability for the volume named `name` on `daemon`
+/// (§4.13; AUD-01): a name alone reaches nothing.
+fn capability_path(daemon: &Daemon, name: &str) -> String {
+  daemon
+    .mount_capability(name)
+    .expect("the name's owner shard answers")
+    .expect("a volume by that name is served there")
+}
+
 /// The bytes of `/<volume>/<file>` read through a fresh NFS connection to `daemon`.
 fn read_file(daemon: &Daemon, volume: &str, file: &str) -> Vec<u8> {
   let mut stream = nfs_stream(daemon);
-  let root = mount(&mut stream, &format!("/{volume}"), 1);
+  let root = mount(&mut stream, &capability_path(daemon, volume), 1);
   let file = lookup(&mut stream, &root, file, 2);
   read(&mut stream, &file, 3)
 }
@@ -306,7 +315,7 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
   let kept = client.create(&scratch("kept")).unwrap();
   {
     let mut stream = nfs_stream(&first);
-    let root = mount(&mut stream, "/kept", 1);
+    let root = mount(&mut stream, &capability_path(&first, "kept"), 1);
     let file = create(&mut stream, &root, "f", 2);
     write(&mut stream, &file, BEFORE, 3);
     let snapshot = client.snapshot(kept).unwrap();
@@ -482,7 +491,7 @@ impl Run {
 fn mount_volume(run: &mut Run, daemon: &Daemon, volume: &str) -> (TcpStream, Vec<u8>) {
   let mut stream = nfs_stream(daemon);
   let xid = run.xid();
-  let root = mount(&mut stream, &format!("/{volume}"), xid);
+  let root = mount(&mut stream, &capability_path(daemon, volume), xid);
   (stream, root)
 }
 

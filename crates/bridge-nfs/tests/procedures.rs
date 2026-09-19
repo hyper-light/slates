@@ -179,6 +179,8 @@ fn a_foreign_or_malformed_handle_is_refused() {
     volume: VolumeId { bytes: [0x22; 16] },
     inode: 1,
     generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
   }
   .to_fh();
   let mut args = XdrWriter::new();
@@ -223,6 +225,8 @@ fn a_missing_name_is_noent() {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: root_ino,
     generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
   }
   .to_fh();
 
@@ -359,6 +363,8 @@ fn a_stale_generation_handle_is_refused() {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: root_ino,
     generation: 1,
+    attachment: 0,
+    token: [0u8; 16],
   }
   .to_fh();
   let mut args = XdrWriter::new();
@@ -402,6 +408,8 @@ fn a_handle_to_a_reclaimed_inode_is_stale() {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: gone_ino,
     generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
   }
   .to_fh();
   let mut args = XdrWriter::new();
@@ -432,6 +440,8 @@ fn a_handle_survives_copy_on_write_of_its_object() {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: file_ino,
     generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
   }
   .to_fh();
   bridge
@@ -498,6 +508,8 @@ fn a_write_then_read_round_trips_over_the_export() {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: file_ino,
     generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
   }
   .to_fh();
 
@@ -573,6 +585,8 @@ fn a_commit_over_the_export_reports_the_write_stable() {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: file_ino,
     generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
   }
   .to_fh();
 
@@ -687,6 +701,8 @@ fn a_write_through_a_read_only_export_is_refused() {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: file_ino,
     generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
   }
   .to_fh();
 
@@ -926,6 +942,8 @@ fn a_setattr_over_the_export_chmods() {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: file_ino,
     generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
   }
   .to_fh();
 
@@ -986,6 +1004,8 @@ fn a_setattr_sets_client_and_server_times() {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: file_ino,
     generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
   }
   .to_fh();
 
@@ -1042,6 +1062,8 @@ fn a_setattr_guard_mismatch_is_not_sync() {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: file_ino,
     generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
   }
   .to_fh();
 
@@ -1349,6 +1371,8 @@ fn a_readlink_returns_the_target_and_refuses_a_non_symlink() {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: link_ino,
     generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
   }
   .to_fh();
   let mut args = XdrWriter::new();
@@ -1367,6 +1391,8 @@ fn a_readlink_returns_the_target_and_refuses_a_non_symlink() {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: root_ino,
     generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
   }
   .to_fh();
   let mut da = XdrWriter::new();
@@ -1409,6 +1435,8 @@ fn a_link_over_the_export_makes_a_second_name() {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: file_ino,
     generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
   }
   .to_fh();
 
@@ -2011,6 +2039,8 @@ fn fh_of(ino: u64) -> Nfsfh3 {
     volume: VolumeId { bytes: [0x11; 16] },
     inode: ino,
     generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
   }
   .to_fh()
 }

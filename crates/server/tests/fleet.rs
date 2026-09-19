@@ -5107,11 +5107,21 @@ const PLACEMENT_DEADLINE: Duration = Duration::from_secs(60);
 /// the takeover, a possible fetch from the recorded holder, and the restore. Generous headroom for load.
 const SERVE_DEADLINE: Duration = Duration::from_secs(60);
 
+/// The NFS mount path carrying an owner mount capability for the volume named `name` on `daemon`
+/// (§4.13; AUD-01): `/<name>@<attachment_hex>.<token_hex>` — every mount presents one, since a name
+/// alone reaches nothing.
+fn capability_path(daemon: &Daemon, name: &str) -> String {
+  daemon
+    .mount_capability(name)
+    .expect("the name's owner shard answers")
+    .expect("a volume by that name is served there")
+}
+
 /// Writes [`CONTENT`] as `hello.txt` into the volume mounted at `/<name>` on `daemon`'s NFS port.
 fn write_hello_over_nfs(daemon: &Daemon, name: &str) {
   let port = daemon.nfs_port().expect("the daemon serves NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
-  let root_fh = mount(&mut stream, &format!("/{name}"), 1);
+  let root_fh = mount(&mut stream, &capability_path(daemon, name), 1);
   let file_fh = create(&mut stream, &root_fh, "hello.txt", 2);
   write(&mut stream, &file_fh, CONTENT, 3);
 }
@@ -5126,7 +5136,7 @@ type Owners = [(u32, u32, u32); 2];
 fn owners_over_nfs(daemon: &Daemon, name: &str) -> Owners {
   let port = daemon.nfs_port().expect("the daemon serves NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
-  let root_fh = mount(&mut stream, &format!("/{name}"), 1);
+  let root_fh = mount(&mut stream, &capability_path(daemon, name), 1);
   let file_fh = lookup(&mut stream, &root_fh, "hello.txt", 2);
   [
     owner_and_mode(&mut stream, &root_fh, 3),
@@ -5138,7 +5148,7 @@ fn owners_over_nfs(daemon: &Daemon, name: &str) -> Owners {
 fn read_hello_over_nfs(daemon: &Daemon, name: &str) -> Vec<u8> {
   let port = daemon.nfs_port().expect("the daemon serves NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
-  let root_fh = mount(&mut stream, &format!("/{name}"), 1);
+  let root_fh = mount(&mut stream, &capability_path(daemon, name), 1);
   let file_fh = lookup(&mut stream, &root_fh, "hello.txt", 2);
   read(&mut stream, &file_fh, 3)
 }
@@ -5656,7 +5666,7 @@ fn served_content(served: bool, daemon: &Daemon, name: &str) -> (Option<Vec<u8>>
 fn reseal_places(instance: &str, daemon: &Daemon, name: &str, volume: VolumeId) -> bool {
   let port = daemon.nfs_port().expect("the daemon serves NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
-  let root_fh = mount(&mut stream, &format!("/{name}"), 1);
+  let root_fh = mount(&mut stream, &capability_path(daemon, name), 1);
   let file_fh = create(&mut stream, &root_fh, "again.txt", 2);
   write(&mut stream, &file_fh, CONTENT, 3);
   drop(stream);

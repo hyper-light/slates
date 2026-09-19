@@ -6,7 +6,6 @@
 use std::sync::atomic::Ordering;
 
 use slates_base::OsHost;
-use slates_db::DurabilityScope;
 use slates_db::Op;
 use slates_db::catalog::{
   AccessEntry, AttachForm, AttachmentRecord, BaseRecord, CompletionRecord, Consumer,
@@ -15,6 +14,7 @@ use slates_db::catalog::{
   SnapshotRecord, VolumeId as DbVolumeId, VolumeRecord, VolumeState,
 };
 use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration};
+use slates_db::{DbError, DurabilityScope, Partition};
 use slates_ipc::protocol::{
   AttachRequest, AttachTransport, DaemonReport, Direction, Established, FleetReport,
   FreshnessBasis, GroupReport, HealthSignal, Intent, NamePolicy, OciBinding, PlacedState, ReadAt,
@@ -240,6 +240,20 @@ const ATTACHMENT_PARTITION_SHIFT: u64 = 48;
 /// The attachment id for a counter on `partition`.
 pub(crate) fn attachment_id(partition: u16, counter: u64) -> u64 {
   (u64::from(partition) << ATTACHMENT_PARTITION_SHIFT) | counter
+}
+
+/// Format: the low 48 bits of an attachment id — its per-partition counter (the bits below
+/// `ATTACHMENT_PARTITION_SHIFT`).
+const ATTACHMENT_COUNTER_MASK: u64 = (1 << ATTACHMENT_PARTITION_SHIFT) - 1;
+
+/// The attachment counter a shard boots with: one past the highest counter among the partition's
+/// recovered attachments — a host mount's survives a restart (AUD-01) — or 1 for a partition holding
+/// none. Without this a restarted daemon minted from 1 again and its next attach met a kept record's
+/// id, refused `AlreadyExists` on every attach until the counter had passed it.
+pub(crate) fn next_attachment_counter(partition: &Partition) -> u64 {
+  partition
+    .highest_attachment()
+    .map_or(1, |id| (id & ATTACHMENT_COUNTER_MASK).saturating_add(1))
 }
 
 /// The partition that owns an attachment id.
@@ -3917,7 +3931,7 @@ fn attach(
     Err(r) => return *r,
   };
   if matches!(record.policy.role, Role::Green { .. }) {
-    return crate::merge_service::attach_green(state, client_id, principal, &record, intent);
+    return crate::merge_service::attach_green(state, client_id, principal, &record, intent, &form);
   }
   let rights = rights_of(&record, principal);
   let allowed = match intent {
@@ -3927,6 +3941,10 @@ fn attach(
   if !allowed {
     return forbidden("attach");
   }
+  // Whose the attachment is (§4.6, §4.13; AUD-01): a host kernel mount's is the bridge's — it outlives
+  // this ring client and the daemon, ending with the kernel's `UMNT` — while every other form is this
+  // client's, reclaimed with it (`reap_client`) and at recovery (`reconcile_lost`).
+  let consumer = consumer_of(&form, client_id);
   let situation = crate::transports::situation(state, &rights);
   let binding = match establish_form(&record, &situation, snapshot, intent, &form) {
     Ok(binding) => binding,
@@ -3960,14 +3978,25 @@ fn attach(
   };
   let attachment = attachment_id(state.partition, state.next_attachment);
   state.next_attachment += 1;
+  // The mount capability token (§4.6, §4.13; AUD-01): a random secret bound to this attachment, returned
+  // to the authorized consumer and presented at the NFS mount so the loopback edge authorizes the
+  // connection as this consumer with the granted `rights`. Refused (never a weak token) if the platform's
+  // secure random is unavailable, the same discipline the daemon applies to its issuer secret.
+  let Some(token) = mint_mount_token() else {
+    return refused(Refusal::BadRequest {
+      reason: "secure random unavailable for the mount capability token".to_owned(),
+    });
+  };
   let op = Op::AttachmentAdded {
     record: AttachmentRecord {
       id: attachment,
       volume: record.id,
-      consumer: Consumer::Sdk { client: client_id },
+      consumer,
       snapshot: snapshot.map(to_db_snapshot),
       form: db_form,
       principal: principal.clone(),
+      rights: granted_rights(rights, intent),
+      token,
     },
   };
   if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
@@ -3984,6 +4013,45 @@ fn attach(
     version: None,
     established,
     capability,
+    token: Some(token),
+  }
+}
+
+/// Mints a fresh 16-byte mount capability token from the platform's secure random (§4.13; AUD-01) — the
+/// same source the daemon's grant-issuer secret uses, so a token is unpredictable and cannot be guessed
+/// from an attachment id (which is a routable counter). `None` if the provider cannot mint one, so the
+/// attach refuses rather than issue a guessable token.
+pub(crate) fn mint_mount_token() -> Option<[u8; 16]> {
+  let mut token = [0u8; 16];
+  slates_transport::handshake::secure_random(&mut token).ok()?;
+  Some(token)
+}
+
+/// The consumer an attachment in `form` belongs to (§4.6, §4.13; AUD-01), which is its lifetime: a
+/// host kernel mount's attachment is the OS filesystem bridge's (`Consumer::Bridge`) — it outlives the
+/// ring client that requested it (`slates mount` exits after `mount_nfs`) and the daemon (the anchor
+/// keeps the listener across a restart), ending with the kernel's `UMNT`, a `detach`, or the volume's
+/// destroy; every other form is the requesting ring client's (`Consumer::Sdk`), reclaimed when that
+/// client is found gone (`reap_client`) and at recovery (`reconcile_lost`).
+pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Consumer {
+  match form {
+    AttachRequest::HostMount => Consumer::Bridge,
+    AttachRequest::Root | AttachRequest::Oci { .. } | AttachRequest::Guest { .. } => {
+      Consumer::Sdk { client: client_id }
+    }
+  }
+}
+
+/// The rights an attachment records (§4.13 "Access lists"; AUD-01): the principal's rights on the volume
+/// bounded by the attachment's intent — an attach-for-read records no write right, so its mount
+/// capability presents a read-only view whatever the principal could otherwise do (the NFS edge maps
+/// the record's rights, never the principal's). `admin` is never an attachment's: the admin verbs act on
+/// the volume by principal, not through an attachment.
+fn granted_rights(rights: Rights, intent: Intent) -> Rights {
+  Rights {
+    read: rights.read,
+    write: rights.write && intent == Intent::Write,
+    admin: false,
   }
 }
 
@@ -3999,7 +4067,10 @@ fn establish_form(
   form: &AttachRequest,
 ) -> Result<Option<OciBinding>, Refusal> {
   let (source, destination) = match form {
-    AttachRequest::Root => return Ok(None),
+    // The record forms: nothing to establish — the SDK's record, and the host mount the requesting
+    // process establishes itself with the capability the reply carries (`mount_nfs`, R10: no privilege
+    // and nothing of the daemon's touches the mount table).
+    AttachRequest::Root | AttachRequest::HostMount => return Ok(None),
     AttachRequest::Guest { transport } => return Err(guest_over_the_ring(situation, *transport)),
     AttachRequest::Oci {
       source,
@@ -4089,28 +4160,41 @@ fn detach(state: &mut ShardState, principal: &Principal, attachment: u64) -> Rep
   if &record.principal != principal {
     return forbidden("detach");
   }
-  let now = state.clock.monotonic_ns();
-  if let Err(e) = state.db.mutate(
-    &mut state.segment,
-    &Op::AttachmentRemoved { id: attachment },
-    now,
-  ) {
-    return refused(refusal_of_db(&e));
+  match end_attachment(state, &record) {
+    Ok(()) => ReplyBody::Detached,
+    Err(e) => refused(refusal_of_db(&e)),
   }
-  crate::merge_service::forget_attachment(state, attachment);
+}
+
+/// Ends an attachment on its owner shard — the `detach` verb's effect, and the kernel's `UMNT` of a host
+/// mount's (§4.6, §4.13; AUD-01): the record removed as a recorded operation, a green pin dropped, and,
+/// when it was the holder's last attachment of the volume and the holder holds the write lease, the
+/// lease released (D-16). The caller has authorized the end — the verb by the principal, the `UMNT` by
+/// the mount capability. The typed database refusal when the removal could not be recorded.
+pub(crate) fn end_attachment(
+  state: &mut ShardState,
+  record: &AttachmentRecord,
+) -> Result<(), DbError> {
+  let now = state.clock.monotonic_ns();
+  state.db.mutate(
+    &mut state.segment,
+    &Op::AttachmentRemoved { id: record.id },
+    now,
+  )?;
+  crate::merge_service::forget_attachment(state, record.id);
   // The last write attachment of the holder releases the lease.
   let holds_another = state
     .db
     .partition()
     .attachments_of(record.volume)
     .iter()
-    .any(|a| &a.principal == principal);
+    .any(|a| a.principal == record.principal);
   let lease_is_ours = state
     .db
     .partition()
     .volume(record.volume)
     .and_then(|v| v.lease.as_ref())
-    .is_some_and(|l| &l.holder == principal);
+    .is_some_and(|l| l.holder == record.principal);
   if !holds_another && lease_is_ours {
     let _ = state.db.mutate(
       &mut state.segment,
@@ -4120,7 +4204,7 @@ fn detach(state: &mut ShardState, principal: &Principal, attachment: u64) -> Rep
       now,
     );
   }
-  ReplyBody::Detached
+  Ok(())
 }
 
 /// Grows a volume's version reservation for a resize by `new − old` slots, whole or not at all (a
@@ -6092,8 +6176,11 @@ fn recovered_snapshot(
 /// is destroyed and, if it was the head, the head is reset — its content did not reach anchor-owned
 /// RAM before the crash (an image that could not be published), so the catalog must not claim it;
 /// one the image *did* rebuild is kept, its content and the head that points at it surviving the
-/// restart. A placed snapshot (durably held elsewhere) is never dropped here. Attachments are
-/// removed (their clients attach again). Returns the (snapshots, attachments) reconciled out, so the
+/// restart. A placed snapshot (durably held elsewhere) is never dropped here. A ring client's
+/// attachments are removed (the client's ring did not survive the process; it attaches again), while a
+/// host mount's — the bridge's, `Consumer::Bridge` — is kept: the kernel mount outlives the daemon (the
+/// anchor keeps the listener, §4.6) and its handles carry the attachment's capability, which nothing
+/// can re-mint for the kernel (AUD-01). Returns the (snapshots, attachments) reconciled out, so the
 /// caller reports exactly that.
 fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usize) {
   let now = state.clock.monotonic_ns();
@@ -6136,6 +6223,7 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
     .partition()
     .attachments_of(record.id)
     .iter()
+    .filter(|a| matches!(a.consumer, Consumer::Sdk { .. }))
     .map(|a| a.id)
     .collect();
   let mut attachments = 0;

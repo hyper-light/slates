@@ -132,6 +132,10 @@ pub struct Attachment {
   pub established: Established,
   /// The transport's report for this attachment: the six facts of §4.6 A-9.
   pub capability: AttachmentCapability,
+  /// The mount capability token, for an attachment that establishes a host mount (§4.6, §4.13; AUD-01):
+  /// the secret the client presents at the NFS mount so the loopback edge authorizes it. `None` for an
+  /// attachment that establishes no host mount (an SDK record form, a green pin).
+  pub token: Option<[u8; 16]>,
 }
 
 /// The result of an `advance` (§4.16 "Attachments and versions"): the version the attachment now
@@ -1596,6 +1600,20 @@ impl Client {
     self.attach_with(volume, snapshot, intent, AttachRequest::Root)
   }
 
+  /// Attaches for a host kernel mount of `volume` (§4.6, §4.13; the `slates mount` flow): the attachment
+  /// is the **mount's** — it outlives this client and the daemon, ending with the kernel's `UMNT` of the
+  /// mount, a `detach`, or the volume's destroy — and the reply's `token` is the capability the mount
+  /// presents (`/<name>@<attachment_hex>.<token_hex>`). A write intent takes the volume's write lease as
+  /// any write attachment does (D-16; refused `LeaseHeld` while another principal holds it unexpired);
+  /// a read intent records a read-only attachment, whose capability presents a read-only view.
+  pub fn attach_mount(
+    &mut self,
+    volume: VolumeId,
+    intent: Intent,
+  ) -> Result<Attachment, ClientError> {
+    self.attach_with(volume, None, intent, AttachRequest::HostMount)
+  }
+
   /// Attaches in `form` (§4.4 `attach(volume|snapshot, consumer, transport, chosen_path?)`; §4.6
   /// A-9): the daemon establishes the form and reports it with the transport's capability, or refuses
   /// the form typed (`Refusal::AttachmentUnsupported{transport, reason}`) before any effect.
@@ -1619,6 +1637,7 @@ impl Client {
         version,
         established,
         capability,
+        token,
       } => Ok(Attachment {
         attachment,
         lease_epoch,
@@ -1626,6 +1645,7 @@ impl Client {
         version,
         established,
         capability,
+        token,
       }),
       _ => Err(ClientError::UnexpectedReply { verb: "attach" }),
     }

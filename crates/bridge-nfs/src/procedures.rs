@@ -222,6 +222,12 @@ pub struct Export<'b> {
   /// ([`Self::set_write_verifier`]); a standalone export, which has no restart to survive, keeps the
   /// volume-derived default.
   write_verifier: [u8; size_of::<u64>()],
+  /// The mount capability every handle this export mints carries (§4.13; AUD-01): the attachment id
+  /// and its token the daemon validated for this request, so a client's later request self-authorizes
+  /// through the handle it holds — the root handle at `MNT`, and every child handle a `LOOKUP`,
+  /// `CREATE` or `READDIRPLUS` returns. `(0, [0; 16])` for a standalone export (the daemon sets it,
+  /// [`Self::set_capability`]).
+  capability: (u64, [u8; 16]),
 }
 
 impl<'b> Export<'b> {
@@ -257,7 +263,15 @@ impl<'b> Export<'b> {
         groups: None,
       },
       write_verifier: fsid,
+      capability: (0, [0u8; 16]),
     })
+  }
+
+  /// Sets the mount capability every handle this export mints carries (§4.13; AUD-01): the daemon
+  /// validated `(attachment, token)` for the request being served, and stamps it here so the root
+  /// handle a `MNT` returns and every child handle derived from it self-authorize on later requests.
+  pub fn set_capability(&mut self, capability: (u64, [u8; 16])) {
+    self.capability = capability;
   }
 
   /// Sets the caller's groups (from the call's `AUTH_SYS` credential): the primary group a created
@@ -312,12 +326,15 @@ impl<'b> Export<'b> {
     u64::from_be_bytes(eight)
   }
 
-  /// Mints a file handle for an inode of this export's volume.
+  /// Mints a file handle for an inode of this export's volume, carrying the export's mount capability
+  /// (§4.13; AUD-01) so the handle self-authorizes on the client's later requests.
   fn handle_for(&self, ino: u64, generation: u64) -> Nfsfh3 {
     FileHandle {
       volume: self.volume,
       inode: ino,
       generation,
+      attachment: self.capability.0,
+      token: self.capability.1,
     }
     .to_fh()
   }
@@ -402,6 +419,8 @@ impl<'b> Export<'b> {
       volume: self.volume,
       inode: root,
       generation: 0,
+      attachment: self.capability.0,
+      token: self.capability.1,
     };
     let node = self.attrs_of(&identity).ok()?;
     Some((self.handle_for(root, 0), self.fattr3(&node)))

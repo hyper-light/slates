@@ -2760,6 +2760,37 @@ that the current uid-based implementation enforces them.
 > account; the Windows arm runs in the CI lanes. Owed: the SDKs' own spawn helpers, the fleet leg, MCP
 > roots, and the Linux issuer surface. Record: `docs/wip/enrollment.md` (2026-09-14 section).
 
+> **Status (2026-09-19, AUD-01 — the NFS edge is authorized by the mount capability alone).** The
+> loopback mount serves **every** volume only through a mount capability: the attachment id and a
+> random 16-byte token the access-list-checked `attach` (and a green's `attach_green`) mints, stores on
+> the `AttachmentRecord` with the rights the attachment was granted — bounded by its intent, so an
+> attach-for-read yields a read-only capability — and returns (`Attached.token`). A mount presents it
+> in the `MNT` path `/<name>@<attachment_hex>.<token_hex>`, or `/@<capability>` for the host root scoped
+> to that capability; the daemon stamps it into the root handle and every handle derived from it (file
+> handle v2: version, volume, inode, generation, attachment, token) and validates it on the volume's
+> owner shard on **every request** against the attachment record, so a handle self-authorizes on any
+> connection and the edge keeps no per-connection state. The `AUTH_SYS` uid is never authority — it
+> sets only the POSIX subject: a bare `/` lists nothing and enters nothing, a name without its
+> capability is `MNT3ERR_NOENT`, a handle whose capability does not authorize its volume is
+> `NFS3ERR_ACCES`, and an unbound client, a forged uid and a wrong token are refused alike. The
+> attachment a host mount rides on is the **mount's** (`Consumer::Bridge`): it outlives the process
+> that attached (the reaper reclaims only ring clients' attachments) and a daemon restart (recovery
+> keeps a bridge's, and the attachment counter is seeded past recovered records, so the kernel's
+> handles keep validating), and it ends with the kernel's `UMNT` of the mount path, a `detach`, or the
+> volume's destroy — the record removed and the holder's last write attachment releasing the lease.
+> `slates mount ID PATH [--read-only]` attaches as a host mount (`Client::attach_mount`; a write mount
+> takes the write lease, D-16, refused `LeaseHeld` while another principal holds it, the read-only
+> mount being the remedy) and mounts under the capability; `slates unmount PATH` unmounts and the
+> kernel's `UMNT` ends the attachment. Proven over the real NFS socket
+> (`crates/server/tests/nfs_mount.rs`: the refusals, the cross-connection read, the scoped root, the
+> `UMNT` lifecycle), by the recovery crash sweep (a handle minted before a crash resolves after every
+> crash point), by the handle and capability-parser hostile-input tests, and by the live kernel-mount
+> CLI flow (`SLATES_TEST_CLI=1`: one attachment while mounted, the mount serving after its command's
+> client was reaped, none after `umount`). The token is a bearer capability visible in the mounting
+> user's own `mount` table — the user's own view on a per-user daemon; the FSKit app-group path carries
+> it out of band. Records: `docs/bugs/2026-09-19-nfs-bypasses-consumer-and-volume-authorization.md`,
+> `docs/bugs/2026-09-19-mount-capability-attachment-dies-with-its-client-and-the-daemon.md`.
+
 *Content identity and sharing.* A chunk hash proves bytes, not permission to read them or ask
 whether they exist. Missing-set exchange, caches, archives and dedup obey the consumer's
 sharing scope and reference authorization; cross-scope existence and timing must not reveal

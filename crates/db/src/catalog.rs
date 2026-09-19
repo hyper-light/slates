@@ -355,6 +355,17 @@ pub struct AttachmentRecord {
   pub form: AttachForm,
   /// The principal.
   pub principal: Principal,
+  /// The rights this attachment was granted, from the volume's access list at attach time (§4.13; AUD-01):
+  /// what the attachment authorizes at a host mount, so an NFS request served through it runs under these
+  /// rights — never the unconditional read/write the edge used to fabricate. The owner holds every right.
+  pub rights: Rights,
+  /// The attachment's **mount capability token** (§4.6, §4.13; AUD-01): a random secret minted when the
+  /// attachment is created, returned to the authorized consumer by `attach`, and presented at the NFS
+  /// mount so the edge authorizes the connection as this attachment's consumer with its `rights` — the
+  /// bearer capability the loopback edge needs, since a supplied `AUTH_SYS` uid and loopback reachability
+  /// are not consumer authority. Zero for an attachment that establishes no host mount (an SDK record form,
+  /// a green pin), which the NFS edge never authorizes.
+  pub token: [u8; 16],
 }
 
 /// A completion record (RIFL, §4.9). The idempotency key is **globally unique**: `origin` is the host whose

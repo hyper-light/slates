@@ -557,7 +557,12 @@ fn a_guest_writes_a_file_into_a_daemon_volume_that_the_host_reads_back_over_nfs(
 
   let port = daemon.nfs_port().expect("the daemon is serving NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-  let root = mount(&mut stream, "/guest", 1);
+  // Every mount presents a capability (AUD-01); the daemon mints the owner's for the test.
+  let capability = daemon
+    .mount_capability("guest")
+    .expect("the owner shard answers")
+    .expect("the guest volume is served");
+  let root = mount(&mut stream, &capability, 1);
   let file = lookup(&mut stream, &root, "from-guest.txt", 2);
   let got = read(&mut stream, &file, 3);
   assert_eq!(

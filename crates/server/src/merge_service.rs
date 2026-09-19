@@ -38,8 +38,7 @@
 use std::collections::BTreeMap;
 
 use slates_db::catalog::{
-  AttachForm, AttachmentRecord, Consumer, Principal, Role, VolumeId as DbVolumeId, VolumeRecord,
-  VolumeState,
+  AttachForm, AttachmentRecord, Principal, Role, VolumeId as DbVolumeId, VolumeRecord, VolumeState,
 };
 use slates_db::op::Op;
 use slates_ipc::protocol::{GreenBase, Intent, ReadAt, Refusal, ReplyBody, SnapshotId, VolumeId};
@@ -522,6 +521,7 @@ pub(crate) fn attach_green(
   principal: &Principal,
   record: &VolumeRecord,
   intent: Intent,
+  form: &slates_ipc::protocol::AttachRequest,
 ) -> ReplyBody {
   if intent == Intent::Write {
     return refused(Refusal::ReadOnlyVolume);
@@ -533,6 +533,14 @@ pub(crate) fn attach_green(
     return refused(Refusal::NotFound);
   };
   let version = engine.head();
+  // A green pins a version and is read-only (§4.16, D-27): its attachment carries read only, and the
+  // mount capability token that lets the consumer mount that pinned view over NFS read-only (§4.13;
+  // AUD-01). Refused, never a weak token, if the platform's secure random is unavailable.
+  let Some(token) = crate::verbs::mint_mount_token() else {
+    return refused(Refusal::BadRequest {
+      reason: "secure random unavailable for the mount capability token".to_owned(),
+    });
+  };
   let attachment = attachment_id(state.partition, state.next_attachment);
   state.next_attachment += 1;
   let now = state.clock.monotonic_ns();
@@ -540,10 +548,17 @@ pub(crate) fn attach_green(
     record: AttachmentRecord {
       id: attachment,
       volume: record.id,
-      consumer: Consumer::Sdk { client: client_id },
+      // A host mount of the green is the bridge's attachment, as a plain volume's is (AUD-01).
+      consumer: crate::verbs::consumer_of(form, client_id),
       snapshot: None,
       form: AttachForm::Root,
       principal: principal.clone(),
+      rights: slates_db::catalog::Rights {
+        read: true,
+        write: false,
+        admin: false,
+      },
+      token,
     },
   };
   if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
@@ -566,6 +581,7 @@ pub(crate) fn attach_green(
     version: Some(version),
     established: slates_ipc::protocol::Established::Record,
     capability: crate::transports::root(&situation),
+    token: Some(token),
   }
 }
 

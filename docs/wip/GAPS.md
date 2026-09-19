@@ -1232,6 +1232,24 @@ retention: AUD-11–14/-16 (GAP-A9-14/-1/-7); SWIM indirect probes, call cancell
 handshake bounds: AUD-15/-17/-18 (GAP-A9-7/-4/-11). These are source findings and proposed
 regression scenarios at the audit baseline.
 
+**Implementation follow-up (2026-09-19, AUD-01 closed; GAP-A9-9's NFS-authority leg closed):** every
+volume is served over the loopback **only through a mount capability** — the attachment id and a
+random 16-byte token the access-list-checked `verbs::attach` (and the green's `attach_green`) mints,
+stores on the `AttachmentRecord` with the rights the attachment was granted (bounded by its intent),
+and returns (`Attached.token`). The mount presents it in the `MNT` path
+`/<name>@<attachment_hex>.<token_hex>` (or `/@<capability>` for the host root scoped to it); the daemon
+stamps it into the root handle and every derived handle (file handle v2) and validates it on the owner
+shard on every request against the record, so a handle self-authorizes on any connection and no state
+is kept per connection (`crates/server/src/nfs.rs`). The `AUTH_SYS` uid is never authority: a bare `/`
+lists nothing, a name without a capability mounts nothing, and an unbound client, a forged uid and a
+wrong token are refused at `MNT`. The attachment is the mount's (`Consumer::Bridge`): it outlives the
+attaching process and a daemon restart, and ends with the kernel's `UMNT`, a `detach`, or the volume's
+destroy. `slates mount ID PATH [--read-only]` attaches as a host mount and mounts under the capability.
+Proven by the NFS-socket regression, the recovery crash sweep (a pre-crash handle resolves after every
+crash point) and the live kernel-mount CLI flow.
+`docs/bugs/2026-09-19-nfs-bypasses-consumer-and-volume-authorization.md`,
+`docs/bugs/2026-09-19-mount-capability-attachment-dies-with-its-client-and-the-daemon.md`.
+
 **Implementation follow-up (2026-09-19, AUD-08 closed):** latest-state service is now fenced by a
 confirmed **owner lease** (`crates/server/src/lease.rs`). An owner serves an object's live head,
 head version, status, change list or mounted tree only while `f` of the object's other candidate

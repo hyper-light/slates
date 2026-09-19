@@ -19,18 +19,29 @@ use crate::nfs::Nfsfh3;
 
 /// Format: the file-handle format version this daemon writes and accepts. A handle whose leading
 /// byte is not this value is refused, not decoded, so a format change across builds cannot route
-/// a call to the wrong object.
-const FH_VERSION: u8 = 1;
+/// a call to the wrong object. Version 2 carries the mount capability (§4.13; AUD-01) after the
+/// `(volume, inode, gen)` a version-1 handle held.
+const FH_VERSION: u8 = 2;
 
-/// Format: the length in bytes of a version-1 file handle — the version byte, the volume id, the
-/// inode number and the generation, in that order. Derived from the field sizes so it cannot
-/// drift from the layout; comfortably within [`crate::nfs::MAX_FH`] (the 64-byte `NFS3_FHSIZE`).
-const FH_LEN: usize = size_of::<u8>() + size_of::<VolumeId>() + size_of::<u64>() + size_of::<u64>();
+/// Format: the length in bytes of a version-2 file handle — the version byte, the volume id, the
+/// inode number, the generation, then the mount capability (the attachment id and its 16-byte
+/// token), in that order. Derived from the field sizes so it cannot drift from the layout;
+/// comfortably within [`crate::nfs::MAX_FH`] (the 64-byte `NFS3_FHSIZE`): 1 + 16 + 8 + 8 + 8 + 16 = 57.
+const FH_LEN: usize = size_of::<u8>()
+  + size_of::<VolumeId>()
+  + size_of::<u64>()
+  + size_of::<u64>()
+  + size_of::<u64>()
+  + size_of::<[u8; 16]>();
 
-/// The decoded contents of an NFSv3 file handle: the durable identity of a volume object, exactly
-/// the `(volume, inode no, gen)` every bridge request carries (§4.6). The generation makes a
-/// reused inode number a distinct handle, so a stale handle to a freed inode is refused rather
-/// than answered from whatever now occupies that number.
+/// The decoded contents of an NFSv3 file handle: the durable identity of a volume object — the
+/// `(volume, inode no, gen)` every bridge request carries (§4.6) — and the **mount capability**
+/// under which it is served (§4.13; AUD-01). The generation makes a reused inode number a distinct
+/// handle, so a stale handle to a freed inode is refused rather than answered from whatever now
+/// occupies that number. The capability (an attachment id and its token) is the bearer authority the
+/// daemon validates on every request, so a handle self-authorizes across connections and restarts
+/// with no server-side session; it is `(0, [0; 16])` for a volume served without one (a uid-owned
+/// volume, the synthetic host root).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileHandle {
   /// The volume the object lives in.
@@ -39,6 +50,10 @@ pub struct FileHandle {
   pub inode: u64,
   /// The inode's generation: a reused number with a new generation is a different handle.
   pub generation: u64,
+  /// The attachment whose mount capability serves this handle (§4.13; AUD-01), or `0` for none.
+  pub attachment: u64,
+  /// The mount capability token, or `[0; 16]` for a handle served without one.
+  pub token: [u8; 16],
 }
 
 /// Why a byte string is not a file handle this daemon minted.
@@ -60,6 +75,8 @@ impl FileHandle {
     bytes.extend_from_slice(&self.volume.bytes);
     bytes.extend_from_slice(&self.inode.to_be_bytes());
     bytes.extend_from_slice(&self.generation.to_be_bytes());
+    bytes.extend_from_slice(&self.attachment.to_be_bytes());
+    bytes.extend_from_slice(&self.token);
     Nfsfh3(bytes)
   }
 
@@ -83,10 +100,17 @@ impl FileHandle {
     let inode = read_u64(&bytes[at..at + size_of::<u64>()])?;
     at += size_of::<u64>();
     let generation = read_u64(&bytes[at..at + size_of::<u64>()])?;
+    at += size_of::<u64>();
+    let attachment = read_u64(&bytes[at..at + size_of::<u64>()])?;
+    at += size_of::<u64>();
+    let mut token = [0u8; 16];
+    token.copy_from_slice(&bytes[at..at + size_of::<[u8; 16]>()]);
     Ok(FileHandle {
       volume,
       inode,
       generation,
+      attachment,
+      token,
     })
   }
 }

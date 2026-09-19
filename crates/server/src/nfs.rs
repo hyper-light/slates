@@ -19,11 +19,19 @@
 //!   through a per-shard pending map. No new runtime primitive — the cross-shard spawn is the one the
 //!   daemon already uses; the pending map is thread-local, so it needs no lock.
 //!
-//! The whole browse spans shards: `mount /<name>` (or `/` for the host root), `ls /` (a `READDIR` of
-//! the host root scatters an entry-gather to every shard and lists every volume by its friendly name),
-//! `cd <name>` (a root `LOOKUP` routes across shards by `owner_of_name`), read/write. Each request runs
-//! as the mounting user ([`subject_of`] reads the uid from the `AUTH_SYS` credential, §4.13; `AUTH_NONE`
-//! falls back to root).
+//! The whole browse spans shards: `mount /<name>@<capability>` (or `/@<capability>` for the host root
+//! scoped to that capability), `ls /` (a `READDIR` of the host root scatters an entry-gather to every
+//! shard and lists the volume the capability authorizes by its friendly name), `cd <name>` (a root
+//! `LOOKUP` routes across shards by `owner_of_name`), read/write. Each request runs as the mounting user
+//! ([`subject_of`] reads the uid from the `AUTH_SYS` credential, §4.13; `AUTH_NONE` falls back to root)
+//! for the POSIX permission rules — but **authorization is the mount capability, never the uid**
+//! (§4.13; AUD-01): a supplied uid and loopback reachability identify no consumer, so every volume is
+//! served only through the capability `attach` returned — `<attachment_hex>.<token_hex>` in the mount
+//! path, stamped into the root handle and every handle derived from it, and validated against the
+//! attachment record on every request. A bare `/` lists nothing and enters nothing. The attachment a
+//! host mount rides on is the **mount's** (`Consumer::Bridge`): it outlives the client that attached
+//! and a daemon restart (the kernel's handles must keep validating), and it ends with the kernel's
+//! `UMNT` of the mount path ([`unmount_capability`]), a `detach`, or the volume's destroy.
 //!
 //! A volume appears under its **provisioned name** (§4.6 "Chosen path"): the slot carries the name
 //! ([`crate::state::VolumeSlot`]), [`ShardVolumeSet::entries`] lists it, and a root `LOOKUP`/`MNT` of a
@@ -57,7 +65,7 @@
 //! (R5: no vacuous oracle).
 
 use slates_bridge_core::{Rights, VolumeBridge, new_handle_store};
-use slates_bridge_nfs::mount::{MOUNT_PROGRAM, MOUNTPROC3_MNT};
+use slates_bridge_nfs::mount::{MOUNT_PROGRAM, MOUNTPROC3_MNT, MOUNTPROC3_UMNT};
 use slates_bridge_nfs::nfs::{Fattr3, Nfsfh3};
 use slates_bridge_nfs::procedures::{
   Export, NFS_MAXNAMELEN, NFS_PROGRAM, NFSPROC3_COMMIT, NFSPROC3_CREATE, NFSPROC3_LINK,
@@ -66,7 +74,7 @@ use slates_bridge_nfs::procedures::{
   NFSPROC3_WRITE, io_failure_reply, is_unstable, status_failure_reply, write_stable_how,
 };
 use slates_bridge_nfs::rpc::RecordReader;
-use slates_bridge_nfs::xdr::XdrReader;
+use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_bridge_nfs::{
   AcceptStatus, MultiExport, Nfsstat3, UnixGroups, VolumeSet, auth_sys_identity, parse_call,
   reply_bytes, request_volume, root_volume, serve_call, write_record,
@@ -89,23 +97,44 @@ use crate::verbs::{owner_of, owner_of_name};
 const RECORD_CHUNK: usize = 1 << 16;
 /// Format: the largest mount path the router reads before deciding a route (RFC 1813 `MNTPATHLEN`).
 const MNT_PATH_MAX: usize = 1024;
+/// Format: the radix of the hexadecimal digits a mount capability is written in (`<attachment_hex>` and
+/// the 32-digit `<token_hex>` of a capability mount path).
+const HEX_RADIX: u32 = 16;
 
 // ---------------------------------------------------------------------------- the shard's volumes
 
+/// A mount capability as a request presents it (§4.13; AUD-01): the attachment id and the 16-byte token
+/// `attach` returned to the authorized consumer — in the `MNT` path for the mount itself, and in the file
+/// handle of every later request (the root handle a `MNT` returns and every handle derived from it carry
+/// it). The owner shard validates it against the attachment record on every request, so a handle
+/// self-authorizes with no per-connection state: the loopback edge's substitute for peer-credential
+/// identity, since a supplied `AUTH_SYS` uid and loopback reachability are not consumer authority.
+type MountCapability = (u64, [u8; 16]);
+
 /// The shard's volumes as an NFS [`VolumeSet`]: resolved through [`state::with_state`], each served by
-/// a transient bridge over the shard's store and the routed volume's slot. A zero-size handle — the
-/// state it reads is the current shard's, so it stays thread-local. On the owner shard of a routed
-/// request (reached over the bridge queue), `with_state` is the owner's state, which holds the volume.
-struct ShardVolumeSet;
+/// a transient bridge over the shard's store and the routed volume's slot. The state it reads is the
+/// current shard's, so it stays thread-local. On the owner shard of a routed request (reached over the
+/// bridge queue), `with_state` is the owner's state, which holds the volume. It carries the mount
+/// capability the request presented, so the owner-shard authorization validates it and the export stamps
+/// it into every handle it mints (AUD-01).
+#[derive(Clone, Copy, Default)]
+struct ShardVolumeSet {
+  capability: Option<MountCapability>,
+}
 
 impl VolumeSet for ShardVolumeSet {
   fn entries(&self) -> Vec<(String, VolumeId)> {
+    let capability = self.capability;
     state::with_state(|s| {
-      // List each volume under its provisioned mount name (its slot's `name`), so `ls /` shows
-      // friendly names and `cd <name>`/`mount /<name>` resolve by matching it (`MultiExport`).
+      // List each volume under its provisioned mount name (its slot's `name`), so `ls /` shows friendly
+      // names and `cd <name>` resolves by matching it (`MultiExport`) — but only the volume the presented
+      // mount capability authorizes (§4.13; AUD-01). Without a capability nothing is listed: a volume
+      // cannot be discovered by an unbound or unrelated caller and then reached by handle.
       let mut out = Vec::with_capacity(s.by_id.len());
       for (id, &handle) in &s.by_id {
-        if let Ok(slot) = s.volumes.get(handle) {
+        if let Ok(slot) = s.volumes.get(handle)
+          && listable(s, *id, capability)
+        {
           out.push((slot.name.clone(), *id));
         }
       }
@@ -114,15 +143,20 @@ impl VolumeSet for ShardVolumeSet {
     .unwrap_or_default()
   }
 
+  fn capability(&self) -> MountCapability {
+    self.capability.unwrap_or((0, [0u8; 16]))
+  }
+
   fn serve(
     &mut self,
     volume: VolumeId,
     subject: Principal,
-    rights: Rights,
+    _rights: Rights,
     groups: Option<UnixGroups>,
     procedure: u32,
     args: &mut XdrReader<'_>,
   ) -> Option<Vec<u8>> {
+    let capability = self.capability;
     state::with_state(|s| {
       if !s.consensus_ready {
         return Some(io_failure_reply(procedure));
@@ -136,7 +170,16 @@ impl VolumeSet for ShardVolumeSet {
       if crate::verbs::lease_unconfirmed(s, ObjectId(volume.bytes)).is_some() {
         return Some(Some(status_failure_reply(Nfsstat3::Jukebox, procedure)));
       }
-      with_export(s, volume, subject, rights, groups, |export| {
+      // The authorization gate (§4.13; AUD-01): the request runs under the rights its mount capability
+      // was granted — the attachment `attach` created after checking the volume's access list for the
+      // caller's principal — validated here against the attachment record for *this* volume. A request
+      // with no capability, a wrong or forged one, or one for another volume — an unbound TCP client, a
+      // wrong consumer, any uid — is refused `NFS3ERR_ACCES` before any effect, where the edge used to
+      // fabricate unconditional read/write from the uid alone.
+      let Some((capability, rights)) = authorized_rights(s, volume, capability) else {
+        return Some(Some(status_failure_reply(Nfsstat3::Acces, procedure)));
+      };
+      with_export(s, volume, subject, rights, groups, capability, |export| {
         export.serve_nfs(procedure, args)
       })
     })
@@ -148,11 +191,16 @@ impl VolumeSet for ShardVolumeSet {
     &mut self,
     volume: VolumeId,
     subject: Principal,
-    rights: Rights,
+    _rights: Rights,
     groups: Option<UnixGroups>,
   ) -> Option<(Nfsfh3, Fattr3)> {
+    let capability = self.capability;
     state::with_state(|s| {
-      with_export(s, volume, subject, rights, groups, |export| {
+      // Establishing the volume's root at `MNT`/`LOOKUP` is itself gated (AUD-01): a caller without the
+      // volume's capability gets no root handle, so no volume can be mounted or entered without it. The
+      // root handle returned carries the capability, so every later request self-authorizes.
+      let (capability, rights) = authorized_rights(s, volume, capability)?;
+      with_export(s, volume, subject, rights, groups, capability, |export| {
         export.root_object()
       })
     })
@@ -161,16 +209,53 @@ impl VolumeSet for ShardVolumeSet {
   }
 }
 
+/// The mount capability and the rights an NFS request runs under for `volume`, or `None` if the caller
+/// may not touch it (§4.13; AUD-01): the presented `(attachment, token)` must name an attachment record
+/// on this shard whose token matches and whose volume is `volume`, and the rights are those the attachment
+/// was granted from the volume's access list when `attach` admitted it — the owner's every right for the
+/// owner, exactly what was shared for a shared consumer or uid, read only for a green pin. Nothing else
+/// authorizes: not the `AUTH_SYS` uid, not loopback reachability, not a capability for another volume.
+fn authorized_rights(
+  s: &ShardState,
+  volume: VolumeId,
+  capability: Option<MountCapability>,
+) -> Option<(MountCapability, Rights)> {
+  let (attachment, token) = capability?;
+  if token == [0u8; 16] {
+    return None;
+  }
+  let record = s.db.partition().attachment(attachment)?;
+  if record.token != token || record.volume != volume {
+    return None;
+  }
+  // The attachment's granted rights (catalog read/write/admin) map to the mount edge's read/write.
+  let rights = Rights {
+    read: record.rights.read,
+    write: record.rights.write,
+  };
+  rights.read.then_some(((attachment, token), rights))
+}
+
+/// Whether a request may see `volume` in a root `ls /` (§4.13; AUD-01): only under a mount capability
+/// that authorizes that volume, so a volume cannot be discovered by an unbound or unrelated caller and
+/// then reached by handle.
+fn listable(s: &ShardState, volume: VolumeId, capability: Option<MountCapability>) -> bool {
+  authorized_rights(s, volume, capability).is_some()
+}
+
 /// Builds a transient export for `volume` over the shard's store and the volume's slot, and runs `f`
 /// with it; `None` if the shard does not hold the volume or its attachment cannot be admitted. The
 /// handle slab is fresh per request — NFS keeps no open state across requests — and the volume's base
-/// host (for an overlay) is lent from the slot, both through [`VolumeBridge::attached`].
+/// host (for an overlay) is lent from the slot, both through [`VolumeBridge::attached`]. The validated
+/// mount `capability` is stamped into every handle the export mints (AUD-01), so the client's later
+/// requests carry it.
 fn with_export<R>(
   s: &mut ShardState,
   volume: VolumeId,
   subject: Principal,
   rights: Rights,
   groups: Option<UnixGroups>,
+  capability: MountCapability,
   f: impl FnOnce(&mut Export<'_>) -> R,
 ) -> Option<R> {
   let handle = *s.by_id.get(&volume)?;
@@ -190,6 +275,7 @@ fn with_export<R>(
   // The per-boot write verifier (§4.6, RFC 1813 §3.3.7): a client compares it across a restart to
   // learn its unstable writes were lost and re-send them.
   export.set_write_verifier(write_verifier);
+  export.set_capability(capability);
   Some(f(&mut export))
 }
 
@@ -275,18 +361,24 @@ fn mount_rights() -> Rights {
 struct Requester {
   subject: Principal,
   groups: Option<UnixGroups>,
+  /// The mount capability this request presented (§4.13; AUD-01): from the `MNT` path for a mount, from
+  /// the leading file handle for every other call. Rides to the volume's owner shard, which validates it
+  /// against the attachment record — the loopback edge's substitute for a peer credential. `None` when
+  /// the call presented none; a call's `AUTH_SYS` uid never sets it.
+  capability: Option<MountCapability>,
 }
 
 impl Requester {
   /// The mounting user a call runs as, from its `AUTH_SYS` credential (uid and groups, §4.13, set by
   /// the kernel on a loopback mount — so a real `mount_nfs` runs as the mounting user and stamps the
   /// user's own group, not root:wheel), or the machine root when the call carries no such credential
-  /// (`AUTH_NONE`).
+  /// (`AUTH_NONE`). The call's mount capability is folded in by the serve loop.
   fn of(body: &[u8]) -> Requester {
     match auth_sys_identity(body) {
       Some(identity) => Requester {
         subject: Principal::Uid { uid: identity.uid },
         groups: Some(identity.groups),
+        capability: None,
       },
       None => Requester::root(),
     }
@@ -299,7 +391,15 @@ impl Requester {
     Requester {
       subject: Principal::Uid { uid: 0 },
       groups: None,
+      capability: None,
     }
+  }
+
+  /// Folds the mount capability this call presented into the requester, so it rides to the owner
+  /// shard's authorization (§4.13; AUD-01).
+  fn with_capability(mut self, capability: Option<MountCapability>) -> Requester {
+    self.capability = capability;
+    self
   }
 }
 
@@ -375,7 +475,9 @@ fn root_mount_name(program: u32, procedure: u32, args: &[u8]) -> Option<String> 
       let _dir = Nfsfh3::decode(&mut reader).ok()?;
       Some(reader.string(NFS_MAXNAMELEN).ok()?.to_owned())
     }
-    MOUNT_PROGRAM if procedure == MOUNTPROC3_MNT => {
+    // A `MNT` and the kernel's `UMNT` of the same path both route to the name's owner: the mount is served
+    // there, and the unmount ends the mount's attachment there (AUD-01).
+    MOUNT_PROGRAM if is_mount_request(program, procedure) => {
       let path = XdrReader::new(args).string(MNT_PATH_MAX).ok()?;
       let name = path.trim_matches('/');
       if name.is_empty() {
@@ -386,6 +488,101 @@ fn root_mount_name(program: u32, procedure: u32, args: &[u8]) -> Option<String> 
     }
     _ => None,
   }
+}
+
+/// Whether a call is a `MOUNT` `MNT` or `UMNT` — the calls whose path presents a mount capability
+/// (§4.13; AUD-01): the mount to be served under it, the unmount to end its attachment.
+fn is_mount_request(program: u32, procedure: u32) -> bool {
+  program == MOUNT_PROGRAM && (procedure == MOUNTPROC3_MNT || procedure == MOUNTPROC3_UMNT)
+}
+
+/// The kernel's `UMNT` of `/<name>@<capability>` ends the mount's attachment (§4.6, §4.13; AUD-01), the
+/// way `slates unmount` (an `umount`) ends the mount: on the name's owner shard, the capability must name
+/// an attachment whose token matches and whose volume is the named one; then the attachment ends as a
+/// `detach` would (`verbs::end_attachment`: the record removed, a green pin dropped, the holder's last
+/// write attachment releasing the lease). A `UMNT` of the capability-scoped root (an empty name) ends
+/// nothing — the root is a browse over the capability, not the attachment's mount — and a capability
+/// that does not validate ends nothing, counted as a refusal on the shard (`nfs.unmount_refused`).
+/// `UMNT` has no status in the protocol (RFC 1813 §5.2.3), so the reply is void either way; `args` is the
+/// bare `/<name>` the capability was stripped from.
+fn unmount_capability(capability: Option<MountCapability>, args: &[u8]) {
+  let Some((attachment, token)) = capability else {
+    return;
+  };
+  let Ok(path) = XdrReader::new(args).string(MNT_PATH_MAX) else {
+    return;
+  };
+  let name = path.trim_matches('/').to_owned();
+  if name.is_empty() {
+    return;
+  }
+  let _ = state::with_state(|s| {
+    let record = s.db.partition().attachment(attachment).cloned();
+    let named = s.db.partition().volume_by_name(&name).map(|v| v.id);
+    let ended = match record {
+      Some(record)
+        if token != [0u8; 16] && record.token == token && named == Some(record.volume) =>
+      {
+        crate::verbs::end_attachment(s, &record).is_ok()
+      }
+      _ => false,
+    };
+    if !ended {
+      *s.refusals.entry("nfs.unmount_refused").or_insert(0) += 1;
+    }
+  });
+}
+
+/// Splits a mount path of the form `<name>@<attachment_hex>.<token_hex>` — or `@<attachment_hex>.<token_hex>`
+/// for the host root scoped to that capability — into the volume name (empty for the root) and the mount
+/// capability it presents (§4.13; AUD-01): the attachment id (a routable counter) and its 16-byte secret
+/// token. `None` when the path carries no capability (a plain `<name>` or `/`, which mounts nothing but
+/// an empty root), or when the capability is malformed. The token is 32 lowercase hex digits; the
+/// attachment id is hex. The `@` and `.` are outside a volume name's character set, so they cannot occur
+/// in a real name.
+fn split_mount_capability(args: &[u8]) -> Option<(String, MountCapability)> {
+  let path = XdrReader::new(args).string(MNT_PATH_MAX).ok()?;
+  let path = path.trim_matches('/');
+  let (name, capability) = path.rsplit_once('@')?;
+  let (attachment_hex, token_hex) = capability.split_once('.')?;
+  let attachment = u64::from_str_radix(attachment_hex, HEX_RADIX).ok()?;
+  let hex = token_hex.as_bytes();
+  if hex.len() != size_of::<[u8; 16]>() * 2 {
+    return None;
+  }
+  let mut token = [0u8; 16];
+  for (index, byte) in token.iter_mut().enumerate() {
+    let hi = (hex[index * 2] as char).to_digit(HEX_RADIX)?;
+    let lo = (hex[index * 2 + 1] as char).to_digit(HEX_RADIX)?;
+    *byte = u8::try_from(hi * HEX_RADIX + lo).ok()?;
+  }
+  Some((name.to_owned(), (attachment, token)))
+}
+
+/// Encodes a bare volume name (or the empty root) as the `MNT` call's `dirpath` argument (an XDR string),
+/// so the capability stripped from the path (`split_mount_capability`) leaves the routing and the mount
+/// serving `<name>` exactly as an ordinary `MNT /<name>` would (§4.13; AUD-01).
+fn encode_mount_path(name: &str) -> Vec<u8> {
+  let mut writer = XdrWriter::new();
+  writer.opaque(format!("/{name}").as_bytes());
+  writer.into_bytes()
+}
+
+/// The mount capability one call presents (§4.13; AUD-01): a `MNT`'s from its path, every other call's
+/// from the leading file handle it names — the handle the daemon minted with the capability stamped in.
+/// For a `MNT` with a capability the path is rewritten to the bare name, so the routing and the mount
+/// serve it as an ordinary `MNT /<name>`; the returned root handle then carries the capability.
+fn presented_capability(
+  program: u32,
+  procedure: u32,
+  args: &mut Vec<u8>,
+) -> Option<MountCapability> {
+  if is_mount_request(program, procedure) {
+    let (name, capability) = split_mount_capability(args)?;
+    *args = encode_mount_path(&name);
+    return Some(capability);
+  }
+  slates_bridge_nfs::request_capability(&XdrReader::new(args))
 }
 
 /// Serves one call locally, on this shard's volumes and synthetic root, as `requester` (the mounting
@@ -414,8 +611,15 @@ fn serve_local(
     s.tracer
       .open_root(request, Chokepoint::BridgeRequest, start_ns)
   });
+  // The kernel's unmount ends the mount's attachment here, on the name's owner shard (AUD-01); the
+  // bridge then answers the void `UMNT` reply.
+  if program == MOUNT_PROGRAM && procedure == MOUNTPROC3_UMNT {
+    unmount_capability(requester.capability, args);
+  }
   let mut service = MultiExport::new(
-    ShardVolumeSet,
+    ShardVolumeSet {
+      capability: requester.capability,
+    },
     requester.subject,
     mount_rights(),
     requester.groups,
@@ -480,11 +684,17 @@ async fn serve_remote(
 /// routes across shards (built). Only the listing needs this; every other root op is unchanged.
 struct GatheredVolumeSet {
   entries: Vec<(String, VolumeId)>,
+  /// The mount capability the request presented, carried so a served entry authorizes under it (AUD-01).
+  capability: Option<MountCapability>,
 }
 
 impl VolumeSet for GatheredVolumeSet {
   fn entries(&self) -> Vec<(String, VolumeId)> {
     self.entries.clone()
+  }
+
+  fn capability(&self) -> MountCapability {
+    self.capability.unwrap_or((0, [0u8; 16]))
   }
 
   fn serve(
@@ -496,7 +706,10 @@ impl VolumeSet for GatheredVolumeSet {
     procedure: u32,
     args: &mut XdrReader<'_>,
   ) -> Option<Vec<u8>> {
-    ShardVolumeSet.serve(volume, subject, rights, groups, procedure, args)
+    ShardVolumeSet {
+      capability: self.capability,
+    }
+    .serve(volume, subject, rights, groups, procedure, args)
   }
 
   fn root_object(
@@ -506,26 +719,36 @@ impl VolumeSet for GatheredVolumeSet {
     rights: Rights,
     groups: Option<UnixGroups>,
   ) -> Option<(Nfsfh3, Fattr3)> {
-    ShardVolumeSet.root_object(volume, subject, rights, groups)
+    ShardVolumeSet {
+      capability: self.capability,
+    }
+    .root_object(volume, subject, rights, groups)
   }
 }
 
 /// Gathers every owner's entries under one liveness budget (§4.8 lookup). Any failed admission,
 /// missing reply or timeout refuses the entire listing. Calls own their registrations, so early return
 /// or cancellation also releases the gathers still in flight (AUD-04/AUD-17).
-async fn gather_all_entries() -> Option<Vec<(String, VolumeId)>> {
+async fn gather_all_entries(
+  capability: Option<MountCapability>,
+) -> Option<Vec<(String, VolumeId)>> {
   let (origin, shards) = state::with_state(|s| (s.shard, s.shards.clone()))?;
-  gather_entries(origin, &shards).await
+  gather_entries(origin, &shards, capability).await
 }
 
-async fn gather_entries(origin: u16, shards: &[u16]) -> Option<Vec<(String, VolumeId)>> {
+async fn gather_entries(
+  origin: u16,
+  shards: &[u16],
+  capability: Option<MountCapability>,
+) -> Option<Vec<(String, VolumeId)>> {
   let deadline = futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
   let calls = shards
     .iter()
     .map(|shard| {
-      crate::xshard::call_on(origin, *shard, || {
+      // Each shard filters its own entries to what the presented mount capability authorizes (AUD-01).
+      crate::xshard::call_on(origin, *shard, move || {
         state::with_state(|_| ())?;
-        Some(ShardVolumeSet.entries())
+        Some(ShardVolumeSet { capability }.entries())
       })
     })
     .collect::<Result<Vec<_>, _>>()
@@ -556,7 +779,10 @@ fn serve_root_listing(
   port: u16,
 ) -> (AcceptStatus, Vec<u8>) {
   let mut service = MultiExport::new(
-    GatheredVolumeSet { entries },
+    GatheredVolumeSet {
+      entries,
+      capability: requester.capability,
+    },
     requester.subject,
     mount_rights(),
     requester.groups,
@@ -611,8 +837,9 @@ async fn reply_for(
     return reply_bytes(0, AcceptStatus::GarbageArgs, &[]);
   }
   if is_root_listing(program, procedure, &args) {
-    // The host root lists every shard's volumes, gathered over the bridge queue.
-    let Some(entries) = gather_all_entries().await else {
+    // The host root lists the volume the presented capability authorizes, gathered over the bridge queue
+    // (AUD-01: nothing is listed to a caller with no capability).
+    let Some(entries) = gather_all_entries(requester.capability).await else {
       return reply_bytes(xid, AcceptStatus::SystemErr, &[]);
     };
     let (status, results) = serve_root_listing(requester, procedure, &args, entries, port);
@@ -657,7 +884,14 @@ async fn serve_one(stream: TcpStream, port: u16) {
       Err(_) => return,
     };
     match parsed {
-      Some((xid, requester, program, procedure, args, consumed)) => {
+      Some((xid, requester, program, procedure, mut args, consumed)) => {
+        // The call's mount capability (AUD-01): a `MNT`'s from its path (`<name>@<attachment>.<token>`,
+        // rewritten to the bare name for the routing), every other call's from the file handle it names.
+        // It rides to the owner shard, which validates it against the attachment record; no state is
+        // kept per connection, so the kernel's later requests — on this connection or any other —
+        // self-authorize through the handles the mount returned.
+        let capability = presented_capability(program, procedure, &mut args);
+        let requester = requester.with_capability(capability);
         let reply = reply_for(this, xid, requester, program, procedure, args, port).await;
         if stream.write_all(&write_record(&reply)).await.is_err() {
           return;
@@ -675,6 +909,59 @@ async fn serve_one(stream: TcpStream, port: u16) {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Encodes a `MNT` `dirpath` argument (an XDR string) for a test.
+  fn mnt_args(path: &str) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    writer.opaque(path.as_bytes());
+    writer.into_bytes()
+  }
+
+  /// A well-formed capability token, as 32 lowercase hex digits.
+  fn sample_token_hex() -> String {
+    [0xABu8; 16].iter().map(|b| format!("{b:02x}")).collect()
+  }
+
+  /// The mount-capability parser reads a well-formed `<name>@<attachment_hex>.<token_hex>`, and the
+  /// host root scoped to a capability (`/@<capability>`, an empty name).
+  #[test]
+  fn the_mount_capability_parser_reads_a_capability() {
+    let token_hex = sample_token_hex();
+    let parsed = split_mount_capability(&mnt_args(&format!("/vol@1a.{token_hex}")));
+    assert_eq!(parsed, Some(("vol".to_owned(), (0x1a, [0xABu8; 16]))));
+    assert_eq!(
+      split_mount_capability(&mnt_args(&format!("/@1a.{token_hex}"))),
+      Some((String::new(), (0x1a, [0xABu8; 16])))
+    );
+  }
+
+  /// The parser refuses a path with no capability, a short or long token, a non-hex attachment or
+  /// token, an empty token, a missing `.` separator, and truncated XDR — never panicking on a hostile
+  /// mount path (AUD-01; a parser of external bytes).
+  #[test]
+  fn the_mount_capability_parser_refuses_malformed_paths() {
+    let token_hex = sample_token_hex();
+    let non_hex: String = std::iter::repeat_n('g', 32).collect();
+    let malformed = [
+      "/vol".to_owned(),                // a plain name: no capability
+      "/".to_owned(),                   // the bare root: no capability
+      "/vol@1a.abcd".to_owned(),        // a short token
+      format!("/vol@1a.{token_hex}ff"), // a long token
+      format!("/vol@zz.{token_hex}"),   // a non-hex attachment id
+      format!("/vol@1a.{non_hex}"),     // a non-hex token
+      "/vol@1a.".to_owned(),            // an empty token
+      "/vol@1a".to_owned(),             // no `.` separator
+    ];
+    for path in malformed {
+      assert_eq!(
+        split_mount_capability(&mnt_args(&path)),
+        None,
+        "{path} is refused"
+      );
+    }
+    // Truncated XDR (not a valid string) is refused, not panicked.
+    assert_eq!(split_mount_capability(&[0xff, 0xff, 0xff, 0xff]), None);
+  }
 
   /// AC-2.12 / T-2.14, AUD-05: omit a touched volume from a committed image. The NFS caller
   /// must receive an error instead of a stable successful mutation; captured volumes still succeed.
@@ -792,7 +1079,7 @@ mod tests {
       .unwrap()
       .spawn_local(
         Box::pin(async move {
-          let entries = gather_entries(origin.0, &[u16::MAX]).await;
+          let entries = gather_entries(origin.0, &[u16::MAX], None).await;
           sent.try_send(entries).unwrap();
         }),
         None,

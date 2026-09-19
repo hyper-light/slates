@@ -197,12 +197,17 @@ pub(crate) enum Verb {
     /// Drifted entries only.
     drift: bool,
   },
-  /// Mount a volume at a path over the loopback NFS bridge (`mount ID PATH`).
+  /// Mount a volume at a path over the loopback NFS bridge (`mount ID PATH [--read-only]`): a mount
+  /// attachment under the volume's mount capability (§4.13), writable — taking the write lease — unless
+  /// `--read-only`.
   Mount {
     /// The volume.
     volume: slates_client::VolumeId,
     /// The mount point: an existing user-owned directory.
     path: String,
+    /// A read-only mount: a read attachment (no write lease taken, a read-only capability) and a
+    /// read-only kernel mount.
+    read_only: bool,
   },
   /// Unmount a loopback bridge mount at a path (`unmount PATH`).
   Unmount {
@@ -531,6 +536,7 @@ const SWITCHES: &[&str] = &[
   "--fold",
   "--locked",
   "--read",
+  "--read-only",
   "--write",
   "--admin",
   "--drift",
@@ -1175,16 +1181,20 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
       Ok(client(&taken, Verb::PromoteRegion { region }))
     }
     ["mount", id, path] => {
-      taken.only(&NONE)?;
+      taken.only(&Spec {
+        values: &[],
+        switches: &["--read-only"],
+      })?;
       Ok(client(
         &taken,
         Verb::Mount {
           volume: volume(id)?,
           path: (*path).to_owned(),
+          read_only: taken.switch("--read-only"),
         },
       ))
     }
-    ["mount", ..] => Err(ParseError::Missing("mount ID PATH")),
+    ["mount", ..] => Err(ParseError::Missing("mount ID PATH [--read-only]")),
     ["unmount", path] => {
       taken.only(&NONE)?;
       Ok(client(

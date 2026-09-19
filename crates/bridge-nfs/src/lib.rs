@@ -32,7 +32,8 @@ pub use access::{Caller, Denial, UnixGroups, UnixIdentity, Want};
 pub use handle::{FileHandle, FileHandleError};
 pub use mount::{MountReply, Mountstat3};
 pub use multi::{
-  MultiExport, NfsService, OwnedVolume, OwnedVolumeSet, VolumeSet, request_volume, root_volume,
+  MultiExport, NfsService, OwnedVolume, OwnedVolumeSet, VolumeSet, request_capability,
+  request_volume, root_volume,
 };
 pub use nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3};
 pub use portmap::Mapping;

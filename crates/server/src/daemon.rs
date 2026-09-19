@@ -1484,6 +1484,47 @@ impl Daemon {
     })
   }
 
+  /// Test support: the NFS mount path that carries a **mount capability** for the volume named `name`
+  /// (§4.13; AUD-01) — `/<name>@<attachment_hex>.<token_hex>`. Mints an attachment for the volume on its
+  /// owner shard **as the volume's owner** with the owner's full rights (the durable record the real
+  /// `attach` verb writes, through the same `Op::AttachmentAdded`), so a test mounts and reads the volume
+  /// over the daemon's loopback port the way a consumer that called `attach` would, and every request's
+  /// file handle is validated against that record. In-process only (`Daemon` is the embedding handle,
+  /// not a wire surface); the typed refusal when the name's owner shard could not be observed, `Ok(None)`
+  /// when no volume has that name there or the secure random could not mint a token.
+  pub fn mount_capability(&self, name: &str) -> Result<Option<String>, ObserveError> {
+    let partition = verbs::owner_of_name(name, self.shards.len());
+    let name = name.to_owned();
+    self.observe(self.shards.get(usize::from(partition)).copied(), move |s| {
+      let record = s.db.partition().volume_by_name(&name)?.clone();
+      let token = verbs::mint_mount_token()?;
+      let attachment = verbs::attachment_id(s.partition, s.next_attachment);
+      s.next_attachment += 1;
+      let now = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
+      let op = slates_db::Op::AttachmentAdded {
+        record: slates_db::catalog::AttachmentRecord {
+          id: attachment,
+          volume: record.id,
+          // The mount's own attachment (the bridge's, AUD-01): it outlives any client and a restart.
+          consumer: slates_db::catalog::Consumer::Bridge,
+          snapshot: None,
+          form: slates_db::catalog::AttachForm::Root,
+          principal: record.owner.clone(),
+          rights: verbs::rights_of(&record, &record.owner),
+          token,
+        },
+      };
+      // One durable transaction, as the verb path writes it (`Db::begin` … `commit`, AC-2.3): the
+      // record is published into anchor-owned RAM, so a handle minted under it still validates on a
+      // daemon that restarted over the segment; a commit that could not publish rolls it back.
+      s.db.begin();
+      s.db.mutate(&mut s.segment, &op, now).ok()?;
+      s.db.commit(&mut s.segment).ok()?;
+      let token_hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
+      Some(format!("/{name}@{attachment:x}.{token_hex}"))
+    })
+  }
+
   /// This node's record links (§4.8, `ShardState::record_sessions`): each peer with an entry, and whether
   /// its session is out on a borrow at the moment of the read — a dispatch's, or the link task's own
   /// discovery exchange. A test reads it to prove an exchange is pending on a link before interrupting it,
@@ -1865,6 +1906,9 @@ fn init_shard(
   // before the segment moves into the state; every shard reads the same value, so a `Grant` verifies on
   // whichever shard serves the client.
   let issuer_secret = segment.issuer_secret()?;
+  // The attachment counter starts past every attachment recovered with the partition — a host mount's
+  // survives a restart (AUD-01) — so a fresh mint never meets a kept record's id.
+  let next_attachment = verbs::next_attachment_counter(db.partition());
   let mut state = ShardState {
     shard,
     partition,
@@ -1886,7 +1930,7 @@ fn init_shard(
     next_prefix: partition
       .saturating_mul(u16::try_from(config.caps.segment_slots).unwrap_or(u16::MAX))
       .max(1),
-    next_attachment: 1,
+    next_attachment,
     clock,
     served: 0,
     refusals: std::collections::BTreeMap::new(),

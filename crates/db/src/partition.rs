@@ -276,6 +276,12 @@ impl Partition {
       .collect()
   }
 
+  /// The highest attachment id the partition holds, or `None` when it holds none (a walk of the table,
+  /// bounded by its cap; asked once at boot, so a fresh counter never re-mints a recovered id).
+  pub fn highest_attachment(&self) -> Option<u64> {
+    self.attachments.iter().map(|(_, a)| a.id).max()
+  }
+
   /// An attachment.
   pub fn attachment(&self, id: u64) -> Option<&AttachmentRecord> {
     let h = *self.attachment_index.get(&id.to_be_bytes())?;

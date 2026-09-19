@@ -15,7 +15,8 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use slates_ipc::protocol::{
-  Direction, NamePolicy, ReplyBody, RequestBody, SizeClass, pack, unpack,
+  AttachRequest, Direction, Intent, NamePolicy, ReplyBody, RequestBody, SizeClass, VolumeId, pack,
+  unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
@@ -23,7 +24,10 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 use slates_wire::request::RequestId;
 
 mod common;
-use common::nfs::{create, lookup, mount, read, readdirplus, write};
+use common::nfs::{
+  MOUNT_PROGRAM, call, create, lookup, mount, opaque, read, read_status, readdirplus, status, umnt,
+  write,
+};
 
 /// Shape: the probe budget of the quick profile (milliseconds); an input to derivations, not a gate.
 const PROBE_MS: u64 = 5;
@@ -31,6 +35,12 @@ const PROBE_MS: u64 = 5;
 const DEADLINE_NS: u64 = 5_000_000_000;
 /// Shape: how long a client waits for the daemon or a full ring before giving up.
 const CREDIT_WAIT: Duration = Duration::from_secs(5);
+/// Format: `MNT3ERR_NOENT` (RFC 1813 §5.1.5) — what a `MNT` of a path the caller's capability does not
+/// make visible answers (AUD-01: a name without its capability is no entry, so nothing is disclosed).
+const MNT3ERR_NOENT: u32 = 2;
+/// Format: `NFS3ERR_ACCES` (RFC 1813 §2.6) — what a request through a handle whose capability does not
+/// authorize the volume answers (AUD-01).
+const NFS3ERR_ACCES: u32 = 13;
 
 fn profile() -> MachineProfile {
   MachineProfile::measure(ProfileOptions {
@@ -159,8 +169,8 @@ fn the_daemon_serves_a_provisioned_volume_over_nfs() {
   let port = daemon.nfs_port().expect("the daemon is serving NFS");
 
   let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-  // Mount the volume by its provisioned friendly name, not its id.
-  let root_fh = mount(&mut stream, "/vol", 1);
+  // Mount the volume by its provisioned friendly name under its mount capability (AUD-01), not its id.
+  let root_fh = mount(&mut stream, &capability_path(&daemon, "vol"), 1);
   let file_fh = create(&mut stream, &root_fh, "hello.txt", 2);
   let payload = b"written through the NFS mount into a daemon-provisioned volume\n";
   write(&mut stream, &file_fh, payload, 3);
@@ -200,8 +210,9 @@ fn the_daemon_serves_a_volume_on_another_shard_over_nfs() {
 
   let port = daemon.nfs_port().expect("the daemon is serving NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-  // Mount the remote volume by its friendly name; the MNT routes across shards by `owner_of_name`.
-  let root_fh = mount(&mut stream, &format!("/{name}"), 1);
+  // Mount the remote volume by its friendly name under its capability; the MNT routes across shards by
+  // `owner_of_name`, and the capability is validated on the owning shard.
+  let root_fh = mount(&mut stream, &capability_path(&daemon, &name), 1);
   let file_fh = create(&mut stream, &root_fh, "remote.txt", 2);
   let payload = b"served from a volume on another shard, over the cross-shard bridge queue\n";
   write(&mut stream, &file_fh, payload, 3);
@@ -263,9 +274,10 @@ fn a_client_mounts_the_host_root_and_reaches_a_remote_volume_by_name() {
   let port = daemon.nfs_port().expect("the daemon is serving NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
 
-  // Mount the host root, then LOOKUP the remote volume by its name — the root LOOKUP routes across
-  // shards by `owner_of_name`, and the owning shard resolves the name against its own volumes.
-  let root_fh = mount(&mut stream, "/", 1);
+  // Mount the host root scoped to the remote volume's capability, then LOOKUP the volume by its name —
+  // the root LOOKUP routes across shards by `owner_of_name`, and the owning shard resolves the name
+  // against its own volumes and validates the capability the root handle carries (AUD-01).
+  let root_fh = mount(&mut stream, &root_capability_path(&daemon, &name), 1);
   let volume_root = lookup(&mut stream, &root_fh, &name, 2);
   let file_fh = create(&mut stream, &volume_root, "byname.txt", 3);
   let payload = b"reached a remote volume by cd-ing into it from the single host root\n";
@@ -311,19 +323,381 @@ fn the_host_root_listing_gathers_volumes_from_every_shard() {
 
   let port = daemon.nfs_port().expect("the daemon is serving NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-  let root_fh = mount(&mut stream, "/", 1);
-  let names = readdirplus(&mut stream, &root_fh, 2);
-  // The host root lists each volume under its friendly (provisioned) name.
-  assert!(
-    names.contains(&local),
-    "the host root lists the control-shard volume by name: {names:?}"
+  // The host root scoped to the other-shard volume's capability lists that volume — gathered over the
+  // bridge queue from its owning shard — and nothing else (AUD-01: a listing shows only what the
+  // presented capability authorizes); scoped to the control-shard volume's, only that one; a bare `/`
+  // lists nothing.
+  let remote_root = mount(&mut stream, &root_capability_path(&daemon, &remote), 1);
+  let remote_names = readdirplus(&mut stream, &remote_root, 2);
+  let local_root = mount(&mut stream, &root_capability_path(&daemon, &local), 3);
+  let local_names = readdirplus(&mut stream, &local_root, 4);
+  let bare_root = mount(&mut stream, "/", 5);
+  let bare_names = readdirplus(&mut stream, &bare_root, 6);
+  assert_eq!(
+    remote_names,
+    vec![remote.clone()],
+    "the root scoped to the other-shard volume lists exactly it (gathered over the bridge queue)"
+  );
+  assert_eq!(
+    local_names,
+    vec![local.clone()],
+    "the root scoped to the control-shard volume lists exactly it"
   );
   assert!(
-    names.contains(&remote),
-    "the host root lists the other-shard volume by name (gathered over the bridge queue): {names:?}"
+    bare_names.is_empty(),
+    "a bare `/` with no capability lists nothing: {bare_names:?}"
   );
 
   drop(stream);
   drop(client);
   drop(daemon);
+}
+
+/// The NFS mount path carrying an owner mount capability for the volume named `name` on `daemon`
+/// (§4.13; AUD-01): `/<name>@<attachment_hex>.<token_hex>`.
+fn capability_path(daemon: &Daemon, name: &str) -> String {
+  daemon
+    .mount_capability(name)
+    .expect("the name's owner shard answers")
+    .expect("a volume by that name is provisioned there")
+}
+
+/// The host-root mount path scoped to the capability of the volume named `name`: `/@<attachment>.<token>`.
+fn root_capability_path(daemon: &Daemon, name: &str) -> String {
+  let path = capability_path(daemon, name);
+  let (_, capability) = path.rsplit_once('@').expect("a capability path");
+  format!("/@{capability}")
+}
+
+/// AC (§4.13; AUD-01): a volume private to an enrolled consumer is served over NFS only through the
+/// consumer's mount capability. An unbound TCP client (no token), a forged `AUTH_SYS` uid and a wrong
+/// token are all refused at `MNT`, and the private volume is hidden from an unbound `ls /`; the mount
+/// presenting the attachment's token is served, a file written through it reads back on a connection
+/// that presented no token (the handle carries the capability), and the root scoped to the capability
+/// lists exactly that volume. The mount's attachment is the mount's: it holds the write lease, survives
+/// a `UMNT` of the scoped root, and ends with the kernel's `UMNT` of the mount path — the handle refused,
+/// the attachment gone, the lease released. Non-vacuous: this same private volume serves once the
+/// capability is presented, and stops once the mount is unmounted.
+#[test]
+fn a_consumer_private_volume_is_served_over_nfs_only_through_its_attachment_capability() {
+  let (daemon, instance) = single_shard_daemon("aud01");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let account = rustix::process::getuid().as_raw();
+  let mut owner = Client::connect(&instance); // the human surface: enrolls the consumer
+  let mut workload = Client::connect(&instance); // the consumer's own channel
+  enroll_consumer(&mut owner, &mut workload, &secret, account);
+
+  // The consumer creates a volume it owns — private to it (owner is a `Consumer` principal).
+  let ReplyBody::Created { id: private } = workload.call(&scratch("private")) else {
+    panic!("the consumer's volume was not created");
+  };
+  assert!(
+    matches!(
+      owner.call(&RequestBody::Status { volume: private }),
+      ReplyBody::Refused {
+        refusal: slates_ipc::protocol::Refusal::Forbidden { .. }
+      }
+    ),
+    "the volume is private to the consumer even from the account's own uid channel"
+  );
+
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let (attachment, token) = attach_host_mount(&mut workload, private);
+  let capability_path = format!("/private@{attachment:x}.{}", hex16(&token));
+
+  let Unauthorized {
+    refused_no_token,
+    listed_unbound,
+    refused_forged_uid,
+    refused_wrong_token,
+  } = unauthorized_probes(port, account, attachment);
+  let payload = b"through the consumer's capability\n";
+  let Authorized {
+    got,
+    listed: listed_authorized,
+    file,
+  } = authorized_round_trip(port, &capability_path, payload);
+  let unmounted = unmount_lifetime(port, &mut workload, private, &capability_path, &file);
+
+  daemon.stop();
+  assert_unmounted(&unmounted);
+  assert_eq!(
+    refused_no_token, MNT3ERR_NOENT,
+    "an unbound TCP client cannot mount the consumer-private volume"
+  );
+  assert!(
+    listed_unbound.is_empty(),
+    "an unbound `ls /` lists nothing, the consumer-private volume least of all: {listed_unbound:?}"
+  );
+  assert_eq!(
+    refused_forged_uid, MNT3ERR_NOENT,
+    "a forged AUTH_SYS uid cannot mount the consumer-private volume"
+  );
+  assert_eq!(
+    refused_wrong_token, MNT3ERR_NOENT,
+    "a wrong capability token cannot mount the consumer-private volume"
+  );
+  assert_eq!(
+    got, payload,
+    "reads and writes go through the capability mount, the read on a connection that presented no token"
+  );
+  assert_eq!(
+    listed_authorized,
+    vec!["private".to_owned()],
+    "the root scoped to the capability lists exactly the consumer's volume"
+  );
+}
+
+/// Enrolls a consumer through the human surface (`owner`, proving the anchor's issuer secret) and binds
+/// the `workload` channel to it with the enrollment's capability (§4.13).
+fn enroll_consumer(
+  owner: &mut Client,
+  workload: &mut Client,
+  secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  account: u32,
+) {
+  let ReplyBody::Enrolled {
+    consumer,
+    secret: capability,
+  } = owner.call(&RequestBody::Enroll {
+    account,
+    proof: slates_server::landing::enroll_proof(secret, account),
+  })
+  else {
+    panic!("the human surface's enrollment was refused");
+  };
+  let proof = slates_server::landing::attest_proof(&capability, workload.client);
+  assert!(
+    matches!(
+      workload.call(&RequestBody::Attest { consumer, proof }),
+      ReplyBody::Attested
+    ),
+    "the genuine capability binds the workload channel to the consumer"
+  );
+}
+
+/// The consumer attaches `volume` for a writable host mount (§4.6, §4.13) and receives the attachment id
+/// and the capability token the mount presents.
+fn attach_host_mount(workload: &mut Client, volume: VolumeId) -> (u64, [u8; 16]) {
+  let ReplyBody::Attached {
+    attachment,
+    token: Some(token),
+    ..
+  } = workload.call(&RequestBody::Attach {
+    volume,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::HostMount,
+  })
+  else {
+    panic!("the consumer's host-mount attachment was refused");
+  };
+  (attachment, token)
+}
+
+/// What every caller without the consumer's capability observes (AUD-01).
+struct Unauthorized {
+  /// The `MNT` status an unbound TCP client (no capability) gets for the private volume.
+  refused_no_token: u32,
+  /// What an unbound `ls /` lists.
+  listed_unbound: Vec<String>,
+  /// The `MNT` status a caller forging the account's uid in `AUTH_SYS` gets.
+  refused_forged_uid: u32,
+  /// The `MNT` status a caller presenting the right attachment id with a wrong token gets.
+  refused_wrong_token: u32,
+}
+
+/// Probes the private volume as an unbound TCP client, as a caller forging the account's uid, and as a
+/// caller with a wrong token for the real attachment id — none of which holds the capability.
+fn unauthorized_probes(port: u16, account: u32, attachment: u64) -> Unauthorized {
+  let mut unbound = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let refused_no_token = mount_status(&mut unbound, "/private", 1);
+  let root_fh = mount(&mut unbound, "/", 2);
+  let listed_unbound = readdirplus(&mut unbound, &root_fh, 3);
+  let refused_forged_uid = mount_status_as(&mut unbound, "/private", account, 4);
+  let mut wrong = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let refused_wrong_token = mount_status(
+    &mut wrong,
+    &format!("/private@{attachment:x}.{}", hex16(&[0x11; 16])),
+    1,
+  );
+  Unauthorized {
+    refused_no_token,
+    listed_unbound,
+    refused_forged_uid,
+    refused_wrong_token,
+  }
+}
+
+/// What the consumer's capability serves (AUD-01).
+struct Authorized {
+  /// The bytes read back through the mount's handle on a connection that presented no token.
+  got: Vec<u8>,
+  /// What the host root scoped to the capability lists.
+  listed: Vec<String>,
+  /// The file's handle, carrying the capability — what a kernel keeps across the mount's life.
+  file: Vec<u8>,
+}
+
+/// Mounts the private volume under its capability, writes `payload` into `f`, reads it back on a
+/// **second connection that never presented the token in a path** (the handle alone authorizes it: the
+/// capability rides in the handle, robust across a mount's connection topology), and lists the host root
+/// scoped to the capability.
+fn authorized_round_trip(port: u16, capability_path: &str, payload: &[u8]) -> Authorized {
+  let mut authorized = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut authorized, capability_path, 1);
+  let file = create(&mut authorized, &root, "f", 2);
+  write(&mut authorized, &file, payload, 3);
+  let mut other_connection = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let got = read(&mut other_connection, &file, 1);
+  let (_, capability) = capability_path.rsplit_once('@').expect("a capability path");
+  let host_root = mount(&mut authorized, &format!("/@{capability}"), 4);
+  let listed = readdirplus(&mut authorized, &host_root, 5);
+  Authorized { got, listed, file }
+}
+
+/// How the mount's attachment ends (AUD-01): with the kernel's `UMNT` of the mount path, not before.
+struct Unmounted {
+  /// The volume's attachment count and write-lease epoch while mounted.
+  attachments_mounted: u32,
+  lease_mounted: Option<u64>,
+  /// The READ status through the mount's handle after a `UMNT` of the capability-scoped root.
+  read_after_root_umnt: u32,
+  /// The READ status through the mount's handle after the `UMNT` of the volume's mount path.
+  read_after_umnt: u32,
+  /// The volume's attachment count and lease after that `UMNT`.
+  attachments_after_umnt: u32,
+  lease_after_umnt: Option<u64>,
+}
+
+/// The volume's attachment count and write-lease epoch, as its consumer's `status` reports them.
+fn attachments_and_lease(consumer: &mut Client, volume: VolumeId) -> (u32, Option<u64>) {
+  let ReplyBody::Status { report } = consumer.call(&RequestBody::Status { volume }) else {
+    panic!("the consumer's status of its own volume was refused");
+  };
+  (report.attachments, report.lease_epoch)
+}
+
+/// Sends the kernel's unmount signals the way `umount` does — first for the capability-scoped root
+/// (a browse, which ends nothing), then for the volume's mount path (which ends the attachment) — and
+/// reads through the mount's handle after each, with the volume's status around them.
+fn unmount_lifetime(
+  port: u16,
+  consumer: &mut Client,
+  volume: VolumeId,
+  capability_path: &str,
+  file: &[u8],
+) -> Unmounted {
+  let (attachments_mounted, lease_mounted) = attachments_and_lease(consumer, volume);
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let (_, capability) = capability_path.rsplit_once('@').expect("a capability path");
+  umnt(&mut stream, &format!("/@{capability}"), 1);
+  let read_after_root_umnt = read_status(&mut stream, file, 2);
+  umnt(&mut stream, capability_path, 3);
+  let read_after_umnt = read_status(&mut stream, file, 4);
+  let (attachments_after_umnt, lease_after_umnt) = attachments_and_lease(consumer, volume);
+  Unmounted {
+    attachments_mounted,
+    lease_mounted,
+    read_after_root_umnt,
+    read_after_umnt,
+    attachments_after_umnt,
+    lease_after_umnt,
+  }
+}
+
+/// The mount's attachment is the mount's: one attachment holding the write lease while mounted, still
+/// serving after the root browse is unmounted, and ended — the handle refused, the attachment gone, the
+/// lease released — by the `UMNT` of the mount path.
+fn assert_unmounted(unmounted: &Unmounted) {
+  assert_eq!(
+    unmounted.attachments_mounted, 1,
+    "the mount is the volume's one attachment"
+  );
+  assert!(
+    unmounted.lease_mounted.is_some(),
+    "a write mount holds the volume's write lease (D-16)"
+  );
+  assert_eq!(
+    unmounted.read_after_root_umnt, 0,
+    "a UMNT of the capability-scoped root ends nothing: the mount's handle still serves"
+  );
+  assert_eq!(
+    unmounted.read_after_umnt, NFS3ERR_ACCES,
+    "after the UMNT of the mount path the handle's capability authorizes nothing"
+  );
+  assert_eq!(
+    unmounted.attachments_after_umnt, 0,
+    "the kernel's UMNT ended the mount's attachment"
+  );
+  assert_eq!(
+    unmounted.lease_after_umnt, None,
+    "the holder's last write attachment released the lease"
+  );
+}
+
+/// The `MNT` status of `path` on `stream` under an `AUTH_SYS` credential claiming `uid` (no groups),
+/// without asserting success — the forged-uid probe of the authorization gate (AUD-01).
+fn mount_status_as(stream: &mut TcpStream, path: &str, uid: u32, xid: u32) -> u32 {
+  let mut args = Vec::new();
+  opaque(path.as_bytes(), &mut args);
+  status(&call_as(stream, MOUNT_PROGRAM, 1, &args, xid, uid))
+}
+
+/// One RPC call under an `AUTH_SYS` credential (RFC 5531 §8.2: stamp, machine name, uid, gid, no
+/// supplementary gids) claiming `uid`, returning the accepted reply's result bytes. The credential is
+/// client-supplied — exactly why it authorizes nothing at the mount edge.
+fn call_as(
+  stream: &mut TcpStream,
+  program: u32,
+  procedure: u32,
+  args: &[u8],
+  xid: u32,
+  uid: u32,
+) -> Vec<u8> {
+  use std::io::{Read, Write};
+  let mut credential = Vec::new();
+  credential.extend_from_slice(&0u32.to_be_bytes()); // stamp
+  credential.extend_from_slice(&0u32.to_be_bytes()); // machine name: empty
+  credential.extend_from_slice(&uid.to_be_bytes());
+  credential.extend_from_slice(&uid.to_be_bytes()); // gid
+  credential.extend_from_slice(&0u32.to_be_bytes()); // no supplementary gids
+  let mut body = Vec::new();
+  for field in [xid, 0, 2, program, 3, procedure, 1 /* AUTH_SYS */] {
+    body.extend_from_slice(&field.to_be_bytes());
+  }
+  body.extend_from_slice(&u32::try_from(credential.len()).unwrap().to_be_bytes());
+  body.extend_from_slice(&credential);
+  body.extend_from_slice(&0u32.to_be_bytes()); // verifier: AUTH_NONE
+  body.extend_from_slice(&0u32.to_be_bytes());
+  body.extend_from_slice(args);
+  let marker = 0x8000_0000u32 | u32::try_from(body.len()).unwrap();
+  stream.write_all(&marker.to_be_bytes()).unwrap();
+  stream.write_all(&body).unwrap();
+  let mut marker_buf = [0u8; 4];
+  stream.read_exact(&mut marker_buf).unwrap();
+  let len = (u32::from_be_bytes(marker_buf) & 0x7fff_ffff) as usize;
+  let mut reply = vec![0u8; len];
+  stream.read_exact(&mut reply).unwrap();
+  let verf_len = u32::from_be_bytes(reply[16..20].try_into().unwrap()) as usize;
+  let accept_off = 20 + verf_len + (4 - verf_len % 4) % 4;
+  assert_eq!(
+    u32::from_be_bytes(reply[accept_off..accept_off + 4].try_into().unwrap()),
+    0,
+    "RPC accepted"
+  );
+  reply[accept_off + 4..].to_vec()
+}
+
+/// The `MNT` status of `path` on `stream`, without asserting success — so a refused mount (a
+/// consumer-private volume without the capability, AUD-01) is observed, not panicked.
+fn mount_status(stream: &mut TcpStream, path: &str, xid: u32) -> u32 {
+  let mut args = Vec::new();
+  opaque(path.as_bytes(), &mut args);
+  status(&call(stream, MOUNT_PROGRAM, 1, &args, xid))
+}
+
+/// Sixteen bytes as 32 lowercase hex digits — the mount capability token in a capability mount path.
+fn hex16(bytes: &[u8; 16]) -> String {
+  bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

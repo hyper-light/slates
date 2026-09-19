@@ -194,15 +194,41 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
   if let Verb::Revoke { consumer } = &request.verb {
     return emit_revoke(&mut client, *consumer, request.json);
   }
-  // `mount` reads the volume's name and the daemon's NFS port through the client, then runs `mount_nfs`
-  // to mount it over the loopback NFS bridge (§4.6) — no privilege, no kernel extension, no Apple
-  // entitlement. Its failure is a `Failure` (a mount refusal, not a client error), so it is handled
-  // here rather than in [`serve`].
-  if let Verb::Mount { volume, path } = &request.verb {
+  // `mount` reads the volume's name and the daemon's NFS port through the client, **attaches** for the
+  // host mount — the access-list-checked `attach` returns the mount capability the loopback edge
+  // authorizes every request's file handle against (§4.13; AUD-01: a supplied uid and loopback
+  // reachability are not authority, the capability is) — then runs `mount_nfs` to mount it over the
+  // loopback NFS bridge (§4.6) with that capability in the export path: no privilege, no kernel
+  // extension, no Apple entitlement. Its failure is a `Failure` (a mount refusal, not a client error),
+  // so it is handled here rather than in [`serve`].
+  if let Verb::Mount {
+    volume,
+    path,
+    read_only,
+  } = &request.verb
+  {
     let report = client
       .status(*volume)
       .map_err(|e| failure_of(e, &request.instance))?;
-    let mounted = crate::mount::establish(&report, path)?;
+    // The mount's own attachment (§4.6, §4.13): it outlives this process and a daemon restart, and
+    // ends with the kernel's `UMNT` when the mount is removed. A write mount takes the write lease
+    // (D-16); `--read-only` takes none and gets a read-only capability.
+    let intent = if *read_only {
+      Intent::Read
+    } else {
+      Intent::Write
+    };
+    let attachment = client
+      .attach_mount(*volume, intent)
+      .map_err(|e| failure_of(e, &request.instance))?;
+    let Some(token) = attachment.token else {
+      return Err(Failure::Refused(
+        "the daemon issued no mount capability for this attachment; the volume cannot be mounted"
+          .to_owned(),
+      ));
+    };
+    let mounted =
+      crate::mount::establish(&report, (attachment.attachment, token), path, *read_only)?;
     println!("mounted: {mounted}");
     return Ok(());
   }

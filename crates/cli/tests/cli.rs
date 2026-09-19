@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 /// Shape: how long the anchor and its daemon get to come up (a quick profile plus two
 /// starts), and how long the daemon gets to leave after its anchor dies.
 const START_WAIT: Duration = Duration::from_secs(20);
+/// Shape: how long a live-mount check waits for the daemon's reaper and the kernel's `UMNT` to show in
+/// `status` — ten liveness budgets (`LIVENESS_BUDGET_NS`, 1 s; a client is asked about once silent for
+/// one budget, so a death shows within two).
+const WAIT_FOR: Duration = Duration::from_secs(10);
 /// Shape: the pause between polls of a starting or stopping daemon.
 const POLL_MS: u64 = 20;
 /// Shape: shards for the test daemon.
@@ -412,12 +416,69 @@ fn roundtrip_a_file_through(path: &str) {
 }
 
 /// `slates unmount DIR` removes the mount (a pure `umount`, no daemon needed).
-fn unmount_and_check(instance: &str, path: &str) {
+fn unmount_and_check(instance: &str, id: &str, path: &str) {
   let (code, _out, err) = run(instance, &["unmount", path]);
   assert_eq!(code, 0, "slates unmount failed: {err}");
   assert!(
     !is_mounted(path),
     "the kernel mount table no longer lists it"
+  );
+  // The kernel's own `UMNT` ended the mount's attachment (AUD-01): the volume reports none.
+  assert!(
+    wait_for(|| attachments_of(instance, id) == "0"),
+    "the kernel's UMNT ended the mount's attachment: {}",
+    attachments_of(instance, id)
+  );
+}
+
+/// The volume's attachment count as `slates status ID` reports it.
+fn attachments_of(instance: &str, id: &str) -> String {
+  let (code, out, err) = run(instance, &["status", id]);
+  assert_eq!(code, 0, "{err}");
+  value_of(&out, "attachments")
+}
+
+/// Polls `holds` at the test's pace until it holds or the deadline passes; whether it held.
+fn wait_for(mut holds: impl FnMut() -> bool) -> bool {
+  let deadline = Instant::now() + WAIT_FOR;
+  while Instant::now() < deadline {
+    if holds() {
+      return true;
+    }
+    pause();
+  }
+  holds()
+}
+
+/// The mount outlives the process that attached it (AUD-01; §4.6): `slates mount` exited the moment it
+/// mounted, the daemon reaps that process's client — `clients_reaped` moves, the non-vacuity counter —
+/// and the mount keeps serving under the attachment the kernel holds, the volume's one attachment.
+fn mount_outlives_the_process_that_attached(instance: &str, id: &str, path: &str) {
+  let reaped = |instance: &str| {
+    let (code, out, err) = run(instance, &["status"]);
+    assert_eq!(code, 0, "{err}");
+    value_of(&out, "clients_reaped")
+      .parse::<u64>()
+      .expect("a count")
+  };
+  assert!(
+    wait_for(|| reaped(instance) > 0),
+    "the daemon reaped the exited command's client: clients_reaped = {}",
+    reaped(instance)
+  );
+  let readback = Command::new("cat")
+    .arg(format!("{path}/roundtrip.txt"))
+    .output()
+    .unwrap();
+  assert_eq!(
+    String::from_utf8_lossy(&readback.stdout),
+    "written through a real slates kernel mount",
+    "the mount still serves after its command's client was reaped"
+  );
+  assert_eq!(
+    attachments_of(instance, id),
+    "1",
+    "the mount's attachment survived the reap of the client that made it"
   );
 }
 
@@ -455,10 +516,16 @@ fn slates_mount_establishes_a_real_kernel_mount_and_unmount_removes_it() {
     path: fresh_mount_point(),
   };
   mount_and_check(&instance, &id, &mount_point.path);
+  assert_eq!(
+    attachments_of(&instance, &id),
+    "1",
+    "the mount is the volume's one attachment (AUD-01)"
+  );
   mount_root_is_owned_by_the_mounting_user(&mount_point.path);
   roundtrip_a_file_through(&mount_point.path);
   a_sparse_extension_through(&instance, &mount_point.path);
-  unmount_and_check(&instance, &mount_point.path);
+  mount_outlives_the_process_that_attached(&instance, &id, &mount_point.path);
+  unmount_and_check(&instance, &id, &mount_point.path);
 
   drop(mount_point);
   drop(anchor);
@@ -1322,7 +1389,7 @@ fn seal_on_owner(instance: &str, mountable: bool) -> (String, String) {
     };
     mount_and_check(instance, &id, &mount_point.path);
     write_payload_through(&mount_point.path);
-    unmount_and_check(instance, &mount_point.path);
+    unmount_and_check(instance, &id, &mount_point.path);
   } else {
     eprintln!(
       "mount_nfs is not on this host: the fleet flow seals an empty volume (the content read-back runs on macOS/BSD)"
@@ -1423,7 +1490,7 @@ fn read_on_successor(instance: &str, id: &str, mountable: bool) {
     FLEET_PAYLOAD,
     "the file written on the dead owner reads back byte for byte through the successor's mount"
   );
-  unmount_and_check(instance, &mount_point.path);
+  unmount_and_check(instance, id, &mount_point.path);
 }
 
 /// AC (§2.6 boot step 6 "multi-process deployment"; §4.8 "Membership", "Promotion and takeover"; §4.10;

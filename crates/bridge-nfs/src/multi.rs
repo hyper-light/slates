@@ -96,6 +96,14 @@ pub trait VolumeSet {
   /// The mounted volumes as `(mount name, id)`, in listing order — the root directory's entries.
   fn entries(&self) -> Vec<(String, VolumeId)>;
 
+  /// The mount capability the request being served presented (§4.13; AUD-01) — the attachment id and
+  /// token the synthetic root's own handle carries, so a scoped browse (`mount /@<capability>`) lists
+  /// and enters only what that capability authorizes. `(0, [0; 16])` when none was presented: a bare
+  /// `/` lists nothing and enters nothing, since loopback reachability is not authority.
+  fn capability(&self) -> (u64, [u8; 16]) {
+    (0, [0u8; 16])
+  }
+
   /// Serves one NFSv3 procedure against `volume` (routing has already chosen it), building a transient
   /// bridge over the shared store under `subject`/`rights`, with `groups` the mounting user's groups
   /// (from the call's `AUTH_SYS` credential): the primary group a created object takes, and with the
@@ -438,9 +446,11 @@ impl<V: VolumeSet> NfsService for MultiExport<V> {
   fn serve_mount(&mut self, path: &str) -> MountReply {
     let name = path.trim_matches('/');
     if name.is_empty() {
-      // The host root: a client mounts `/` and browses the volumes as subdirectories.
+      // The host root: a client mounts `/` and browses the volumes as subdirectories — those the
+      // presented mount capability authorizes (§4.13; AUD-01), which the root's own handle carries so
+      // the listing and each `LOOKUP` into a volume stay scoped to it on every later request.
       return MountReply::Ok {
-        handle: root_handle(),
+        handle: root_handle_with(self.set.capability()),
         auth_flavors: vec![AUTH_SYS, AUTH_NONE],
       };
     }
@@ -584,12 +594,15 @@ impl VolumeSet for OwnedVolumeSet {
   }
 }
 
-/// The file handle of the synthetic root directory.
-fn root_handle() -> Nfsfh3 {
+/// The file handle of the synthetic root directory, carrying the mount capability the browse is scoped
+/// to (§4.13; AUD-01).
+fn root_handle_with(capability: (u64, [u8; 16])) -> Nfsfh3 {
   FileHandle {
     volume: ROOT_VOLUME,
     inode: ROOT_INODE,
     generation: 0,
+    attachment: capability.0,
+    token: capability.1,
   }
   .to_fh()
 }
@@ -602,6 +615,18 @@ fn peek_handle_volume(args: &XdrReader<'_>) -> Option<VolumeId> {
   FileHandle::from_fh(&handle)
     .ok()
     .map(|decoded| decoded.volume)
+}
+
+/// The mount capability the leading file handle of a request carries (§4.13; AUD-01) — the attachment
+/// id and token the daemon validates the request under — read through a fresh reader so the original is
+/// untouched; `None` if no valid handle leads the request (a `MNT` presents its capability in the path
+/// instead).
+pub fn request_capability(args: &XdrReader<'_>) -> Option<(u64, [u8; 16])> {
+  let mut peek = XdrReader::new(args.rest());
+  let handle = Nfsfh3::decode(&mut peek).ok()?;
+  FileHandle::from_fh(&handle)
+    .ok()
+    .map(|decoded| (decoded.attachment, decoded.token))
 }
 
 /// The volume id a request's leading file handle names (every served NFSv3 procedure begins with one),

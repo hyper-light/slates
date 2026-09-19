@@ -1311,6 +1311,12 @@ pub enum AttachRequest {
     /// The guest transport.
     transport: AttachTransport,
   },
+  /// A host kernel mount the daemon's OS filesystem bridge serves (§4.6, §4.13; the `slates mount`
+  /// flow): the attachment is the **mount's**, recorded under the bridge consumer, so it outlives the
+  /// process that requested it (the CLI exits after `mount_nfs`) and the daemon (the anchor keeps the
+  /// listener across a restart), and ends only with the kernel's `UMNT` of the mount, an explicit
+  /// `detach`, or the volume's destroy. The reply's `token` is the capability the mount presents.
+  HostMount,
 }
 
 /// What an attach established (§4.4 "establish the path or device, then publish `Bound`").
@@ -1757,6 +1763,12 @@ pub enum ReplyBody {
     established: Established,
     /// The transport's report for this attachment (§4.6 A-9 "must be reported by `attach`").
     capability: AttachmentCapability,
+    /// The attachment's **mount capability token** (§4.6, §4.13; AUD-01): a secret returned to the
+    /// authorized consumer for an attachment that establishes a host mount, presented at the NFS mount so
+    /// the loopback edge authorizes the connection as this consumer with the attachment's rights. `None`
+    /// for an attachment that establishes no host mount (an SDK record form, a green pin). Appended for
+    /// append-only evolution.
+    token: Option<[u8; 16]>,
   },
   /// Detached.
   Detached,

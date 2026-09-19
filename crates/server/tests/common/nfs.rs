@@ -73,6 +73,25 @@ pub(crate) fn mount(stream: &mut TcpStream, path: &str, xid: u32) -> Vec<u8> {
   read_opaque(&reply, 4).0
 }
 
+/// MOUNT UMNT `path` — what the kernel sends when a mount is removed (`umount`); a void reply (RFC 1813
+/// §5.2.3), so nothing to assert on but its arrival.
+pub(crate) fn umnt(stream: &mut TcpStream, path: &str, xid: u32) {
+  let mut args = Vec::new();
+  opaque(path.as_bytes(), &mut args);
+  let reply = call(stream, MOUNT_PROGRAM, 3, &args, xid);
+  assert!(reply.is_empty(), "UMNT {path} is void");
+}
+
+/// The NFS status of a READ of up to 400 bytes at offset zero from `file_fh` — without asserting it
+/// succeeded, so a refusal (a capability that no longer authorizes the handle) is what the test reads.
+pub(crate) fn read_status(stream: &mut TcpStream, file_fh: &[u8], xid: u32) -> u32 {
+  let mut args = Vec::new();
+  opaque(file_fh, &mut args);
+  args.extend_from_slice(&0u64.to_be_bytes()); // offset
+  args.extend_from_slice(&400u32.to_be_bytes()); // count
+  status(&call(stream, NFS_PROGRAM, 6, &args, xid))
+}
+
 /// NFS LOOKUP `name` in `dir_fh` → the child's file handle.
 pub(crate) fn lookup(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32) -> Vec<u8> {
   let mut args = Vec::new();

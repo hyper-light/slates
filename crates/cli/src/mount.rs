@@ -66,29 +66,58 @@ pub(crate) fn backend() -> MountBackend {
 }
 
 /// The `mount_nfs` arguments to mount the volume named `name`, served on the daemon's loopback `port`,
-/// at `path`: the design's options (§4.6 — NFSv3 over TCP, the explicit `port`/`mountport` so no
-/// portmap query is needed, `soft,intr` so a wedged mount is escapable, `locallocks`, `nosuid`,
-/// `rdirplus`), plus `noresvport` for the unprivileged mount (R10) and the derived attribute-cache
-/// timeout. slates serves NFS and MOUNT on one port, so `port` and `mountport` are the same. The
-/// export is `localhost:/<name>`, the volume's provisioned name under the synthetic host root.
-fn mount_args(port: u16, name: &str, path: &str) -> Vec<String> {
+/// at `path`, under the mount `capability` (§4.13; AUD-01 — the attachment id and token `attach`
+/// returned, the bearer authority the daemon validates every request's file handle against; a mount
+/// path with no capability reaches nothing): the design's options (§4.6 — NFSv3 over TCP, the explicit
+/// `port`/`mountport` so no portmap query is needed, `soft,intr` so a wedged mount is escapable,
+/// `locallocks`, `nosuid`, `rdirplus`), plus `noresvport` for the unprivileged mount (R10) and the
+/// derived attribute-cache timeout, and `rdonly` for a read-only mount (the kernel refuses writes at the
+/// mount, as the daemon does under the read-only capability). slates serves NFS and MOUNT on one port,
+/// so `port` and `mountport` are the same. The export is
+/// `localhost:/<name>@<attachment_hex>.<token_hex>`, the volume's provisioned name under the synthetic
+/// host root with its capability.
+fn mount_args(
+  port: u16,
+  name: &str,
+  capability: MountCapability,
+  path: &str,
+  read_only: bool,
+) -> Vec<String> {
+  let access = if read_only { ",rdonly" } else { "" };
   let options = format!(
     "vers=3,tcp,port={port},mountport={port},noresvport,soft,intr,locallocks,nosuid,rdirplus,\
-     actimeo={ATTR_CACHE_SECONDS}"
+     actimeo={ATTR_CACHE_SECONDS}{access}"
   );
   vec![
     "-o".to_owned(),
     options,
-    format!("localhost:/{name}"),
+    format!("localhost:{}", export_path(name, capability)),
     path.to_owned(),
   ]
 }
 
-/// Runs `mount_nfs` to mount the volume `report` names at the existing user-owned `path`, returning the
-/// mounted path. Refuses first (like sylk's `strictExecutionProbe`, naming what is missing) if the host
-/// has no loopback mount mechanism or the daemon is not serving NFS; then a typed failure if `mount_nfs`
-/// refuses (a missing mount point, a busy path).
-pub(crate) fn establish(report: &StatusReport, path: &str) -> Result<String, Failure> {
+/// Format: a mount capability as `attach` returns it — the attachment id and its 16-byte secret token
+/// (§4.13; AUD-01), the bearer authority the daemon validates every request's file handle against.
+pub(crate) type MountCapability = (u64, [u8; 16]);
+
+/// The export path a capability mount presents: `/<name>@<attachment_hex>.<token_hex>` (§4.13; AUD-01).
+pub(crate) fn export_path(name: &str, capability: MountCapability) -> String {
+  let (attachment, token) = capability;
+  let token_hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
+  format!("/{name}@{attachment:x}.{token_hex}")
+}
+
+/// Runs `mount_nfs` to mount the volume `report` names at the existing user-owned `path` under the mount
+/// `capability` its attachment returned (`read_only` for a read-only mount), returning the mounted path.
+/// Refuses first (like sylk's `strictExecutionProbe`, naming what is missing) if the host has no loopback
+/// mount mechanism or the daemon is not serving NFS; then a typed failure if `mount_nfs` refuses (a
+/// missing mount point, a busy path).
+pub(crate) fn establish(
+  report: &StatusReport,
+  capability: MountCapability,
+  path: &str,
+  read_only: bool,
+) -> Result<String, Failure> {
   if backend() == MountBackend::Unsupported {
     return Err(Failure::Failed(
       "cannot mount here: `mount_nfs` is not on the PATH — slates's loopback mount needs it (it is \
@@ -102,14 +131,15 @@ pub(crate) fn establish(report: &StatusReport, path: &str) -> Result<String, Fai
       "the daemon is not serving NFS (its loopback listener did not bind); cannot mount".to_owned(),
     )
   })?;
-  let args = mount_args(port, &report.name, path);
+  let args = mount_args(port, &report.name, capability, path, read_only);
   let status = Command::new("mount_nfs")
     .args(&args)
     .status()
     .map_err(|e| Failure::Failed(format!("running mount_nfs: {e}")))?;
   if !status.success() {
+    // The failure names the volume, never its capability token (a secret).
     return Err(Failure::Failed(format!(
-      "mount_nfs localhost:/{} {path} failed ({status})",
+      "mount_nfs localhost:/{}@… {path} failed ({status})",
       report.name
     )));
   }
@@ -136,12 +166,48 @@ pub(crate) fn unmount(path: &str) -> Result<(), Failure> {
 mod tests {
   use super::{MountBackend, classify, mount_args};
 
+  /// A read-only mount asks the kernel for `rdonly` (with the daemon refusing writes under the
+  /// read-only capability too); a writable mount does not.
+  #[test]
+  fn a_read_only_mount_asks_the_kernel_for_rdonly() {
+    let writable = mount_args(
+      54321,
+      "myproject",
+      (0x1f, [0xab; 16]),
+      "/Users/me/mnt",
+      false,
+    );
+    assert!(
+      !writable[1].contains("rdonly"),
+      "a writable mount is not read-only: {}",
+      writable[1]
+    );
+    let read_only = mount_args(
+      54321,
+      "myproject",
+      (0x1f, [0xab; 16]),
+      "/Users/me/mnt",
+      true,
+    );
+    assert!(
+      read_only[1].ends_with(",rdonly"),
+      "a read-only mount asks the kernel for rdonly: {}",
+      read_only[1]
+    );
+  }
+
   /// The mount arguments carry the daemon's loopback port for both NFS and MOUNT, the unprivileged
   /// `noresvport`, NFSv3, the derived attribute-cache timeout, and the export named by the volume's
   /// provisioned name at the chosen path — the command `slates mount` runs.
   #[test]
   fn the_mount_arguments_target_the_daemon_port_and_the_named_export() {
-    let args = mount_args(54321, "myproject", "/Users/me/mnt");
+    let args = mount_args(
+      54321,
+      "myproject",
+      (0x1f, [0xab; 16]),
+      "/Users/me/mnt",
+      false,
+    );
     assert_eq!(args[0], "-o");
     let options = &args[1];
     assert!(options.contains("port=54321"), "the NFS port: {options}");
@@ -159,8 +225,9 @@ mod tests {
       "the derived attribute-cache timeout: {options}"
     );
     assert_eq!(
-      args[2], "localhost:/myproject",
-      "the export is the volume's provisioned name"
+      args[2],
+      format!("localhost:/myproject@1f.{}", "ab".repeat(16)),
+      "the export is the volume's provisioned name with its mount capability (AUD-01)"
     );
     assert_eq!(args[3], "/Users/me/mnt", "the chosen mount point");
   }
