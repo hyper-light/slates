@@ -152,6 +152,18 @@ impl FleetNode {
       .iter()
       .flat_map(|dead| self.routing.take_over(*dead, members))
       .collect();
+    // This node's **own** fencing epoch advanced: the council took this host over while it was away
+    // (retired, then re-admitted under the same id — a false death, or an isolation that healed). Every
+    // object it holds a routing entry for and still names itself the owner of was reassigned by the
+    // survivors exactly as a dead host's are, so its routing yields them the same way — to the survivor
+    // rendezvous ranks first among each object's remembered candidates — and later lookups forward there
+    // rather than serving its stale copy (§4.8 "Leases and reads", AUD-08; "Authority scope": the bumped
+    // epoch fences every object owned by that host). The owner-lease gate refuses the stale copy's latest
+    // state in the meantime; forwarding an owned volume with no routing entry to its successor is the
+    // broader ledger-transfer contract (GAP-A9-7).
+    if configuration.host_epoch.0 > self.configuration.host_epoch.0 {
+      let _ = self.routing.take_over(self.host, members);
+    }
     self.members = members.to_vec();
     self.configuration = configuration;
     let _ = self

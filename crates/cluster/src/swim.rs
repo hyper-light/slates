@@ -47,6 +47,10 @@ pub enum SwimMessage {
     /// together with the authenticated certificate anchor. A different nonce identifies a
     /// different member; its numeric value cannot establish an ordering between starts.
     boot_nonce: u64,
+    /// The newest regional configuration version the prober has installed or seen (§4.8 "Leases and
+    /// reads"; AUD-08): a holder learns from it that a retired owner has seen its retirement, which opens
+    /// the promotion of that owner's objects at once rather than after the membership horizon.
+    configuration_version: u64,
     /// The membership updates piggybacked on this probe.
     gossip: Vec<(HostId, MemberState)>,
   },
@@ -61,6 +65,11 @@ pub enum SwimMessage {
     /// The acknowledging node's daemon boot_nonce — the same announcement a ping makes, so the prober
     /// validates the id its peer answers under exactly as the peer validates the prober's.
     boot_nonce: u64,
+    /// The newest regional configuration version the acknowledging node has installed or seen (§4.8
+    /// "Leases and reads"; AUD-08): the prober credits this answer toward its owner lease only when it
+    /// equals the version the prober itself has installed — "a majority observation must belong to the
+    /// relevant authority generation" — and a newer one tells the prober its authority is superseded.
+    configuration_version: u64,
     /// The membership updates piggybacked on this acknowledgement.
     gossip: Vec<(HostId, MemberState)>,
     /// The acknowledging node's Vivaldi coordinate.
@@ -198,6 +207,23 @@ impl SwimMessage {
     }
   }
 
+  /// The newest regional configuration version the sender announced: a [`Ping`](SwimMessage::Ping)'s or
+  /// an [`Ack`](SwimMessage::Ack)'s (the owner-lease evidence, §4.8 "Leases and reads"); `None` for the
+  /// indirect messages, which announce none.
+  pub fn configuration_version(&self) -> Option<u64> {
+    match self {
+      SwimMessage::Ping {
+        configuration_version,
+        ..
+      }
+      | SwimMessage::Ack {
+        configuration_version,
+        ..
+      } => Some(*configuration_version),
+      SwimMessage::PingReq { .. } | SwimMessage::IndirectAck { .. } => None,
+    }
+  }
+
   /// The third member an indirect exchange is about: a [`PingReq`](SwimMessage::PingReq)'s target, or the
   /// member an [`IndirectAck`](SwimMessage::IndirectAck) reports reached; `None` for a direct probe or its
   /// acknowledgement.
@@ -220,18 +246,21 @@ impl SwimMessage {
         from,
         nonce,
         boot_nonce,
+        configuration_version,
         gossip,
       } => {
         out.push(TAG_PING);
         out.extend_from_slice(&from.0.to_le_bytes());
         out.extend_from_slice(&nonce.to_le_bytes());
         out.extend_from_slice(&boot_nonce.to_le_bytes());
+        out.extend_from_slice(&configuration_version.to_le_bytes());
         encode_gossip(&mut out, gossip);
       }
       SwimMessage::Ack {
         from,
         nonce,
         boot_nonce,
+        configuration_version,
         gossip,
         coordinate,
       } => {
@@ -239,6 +268,7 @@ impl SwimMessage {
         out.extend_from_slice(&from.0.to_le_bytes());
         out.extend_from_slice(&nonce.to_le_bytes());
         out.extend_from_slice(&boot_nonce.to_le_bytes());
+        out.extend_from_slice(&configuration_version.to_le_bytes());
         encode_gossip(&mut out, gossip);
         encode_coordinate(&mut out, coordinate);
       }
@@ -280,6 +310,7 @@ impl SwimMessage {
         let (from, rest) = take_host(rest)?;
         let (nonce, rest) = take_word(rest)?;
         let (boot_nonce, rest) = take_word(rest)?;
+        let (configuration_version, rest) = take_word(rest)?;
         let (gossip, leftover) = decode_gossip(rest)?;
         if !leftover.is_empty() {
           return Err(SwimWireError::GossipLengthMismatch);
@@ -288,6 +319,7 @@ impl SwimMessage {
           from,
           nonce,
           boot_nonce,
+          configuration_version,
           gossip,
         })
       }
@@ -295,12 +327,14 @@ impl SwimMessage {
         let (from, rest) = take_host(rest)?;
         let (nonce, rest) = take_word(rest)?;
         let (boot_nonce, rest) = take_word(rest)?;
+        let (configuration_version, rest) = take_word(rest)?;
         let (gossip, leftover) = decode_gossip(rest)?;
         let coordinate = decode_coordinate(leftover)?;
         Ok(SwimMessage::Ack {
           from,
           nonce,
           boot_nonce,
+          configuration_version,
           gossip,
           coordinate,
         })
@@ -540,6 +574,9 @@ pub enum ProbeOutcome {
     /// id against (`from` must be `member_id(anchor, boot_nonce)` for the certificate the session
     /// authenticated), with no numeric age ordering between boot nonces.
     boot_nonce: u64,
+    /// The newest regional configuration version the acknowledging node announced (§4.8 "Leases and
+    /// reads"): the caller credits the answer toward its owner lease only at its own installed version.
+    configuration_version: u64,
     /// The membership updates the acknowledgement carried.
     gossip: Vec<(HostId, MemberState)>,
     /// The measured round-trip time of this probe, in nanoseconds (the shard clock).
@@ -608,11 +645,13 @@ pub async fn probe_once(
         from,
         nonce,
         boot_nonce,
+        configuration_version,
         gossip,
         coordinate,
       }) if Some(nonce) == expected => ProbeOutcome::Acked {
         from,
         boot_nonce,
+        configuration_version,
         gossip,
         rtt_ns: now_ns().saturating_sub(started_ns),
         coordinate,
@@ -742,6 +781,8 @@ pub async fn serve_probe(
           // message that carried none (not a ping) echoes zero, which a real probe's non-zero nonce rejects.
           nonce: message.nonce().unwrap_or(0),
           boot_nonce: local_boot_nonce,
+          // A standalone detector places under no regional configuration (version zero, the formed one).
+          configuration_version: 0,
           gossip,
           coordinate: detector.coordinate(),
         }
@@ -795,6 +836,7 @@ mod tests {
       from: A,
       nonce: 42,
       boot_nonce: 1,
+      configuration_version: 6,
       gossip: sample_gossip(),
       coordinate: sample_coordinate(),
     };
@@ -809,6 +851,7 @@ mod tests {
     hostile.extend_from_slice(&7u64.to_le_bytes()); // from
     hostile.extend_from_slice(&0u64.to_le_bytes()); // nonce
     hostile.extend_from_slice(&0u64.to_le_bytes()); // boot_nonce
+    hostile.extend_from_slice(&0u64.to_le_bytes()); // configuration_version
     hostile.extend_from_slice(&0u32.to_le_bytes()); // empty gossip
     hostile.extend_from_slice(&u32::MAX.to_le_bytes()); // coordinate dims = huge
     assert_eq!(
@@ -826,12 +869,14 @@ mod tests {
         from: A,
         nonce: 1,
         boot_nonce: 3,
+        configuration_version: 4,
         gossip: sample_gossip(),
       },
       SwimMessage::Ack {
         from: B,
         nonce: u64::MAX,
         boot_nonce: u64::MAX,
+        configuration_version: u64::MAX,
         gossip: Vec::new(),
         coordinate: sample_coordinate(),
       },
@@ -920,13 +965,15 @@ mod tests {
   }
 
   /// The encoding is fixed and little-endian — a golden vector pins it so a drift is caught (a Ping from
-  /// host 2 at daemon boot_nonce 7, carrying one gossip entry: host 3, Suspect, incarnation 1).
+  /// host 2 at daemon boot_nonce 7 announcing configuration version 9, carrying one gossip entry: host 3,
+  /// Suspect, incarnation 1).
   #[test]
   fn ping_has_a_golden_encoding() {
     let message = SwimMessage::Ping {
       from: HostId(2),
       nonce: 5,
       boot_nonce: 7,
+      configuration_version: 9,
       gossip: vec![(
         HostId(3),
         MemberState {
@@ -961,6 +1008,14 @@ mod tests {
       0,
       0,
       0, // boot_nonce = 7
+      9,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0, // configuration_version = 9
       1,
       0,
       0,
@@ -1010,11 +1065,19 @@ mod tests {
       Err(SwimWireError::Truncated),
       "boot_nonce cut"
     );
-    // Tag + from + nonce + boot_nonce, but the gossip count word is missing.
+    // Tag + from + nonce + boot_nonce, but the configuration version word is missing.
     let mut boot_nonce_ok = nonce_ok.clone();
     boot_nonce_ok.extend_from_slice(&1u64.to_le_bytes()); // boot_nonce
     assert_eq!(
       SwimMessage::decode(&boot_nonce_ok),
+      Err(SwimWireError::Truncated),
+      "configuration version cut"
+    );
+    // Tag + from + nonce + boot_nonce + configuration version, but the gossip count word is missing.
+    let mut version_ok = boot_nonce_ok.clone();
+    version_ok.extend_from_slice(&3u64.to_le_bytes()); // configuration_version
+    assert_eq!(
+      SwimMessage::decode(&version_ok),
       Err(SwimWireError::Truncated),
       "gossip count cut"
     );
@@ -1032,6 +1095,7 @@ mod tests {
       TAG_PING, 2, 0, 0, 0, 0, 0, 0, 0, // from
       0, 0, 0, 0, 0, 0, 0, 0, // nonce
       0, 0, 0, 0, 0, 0, 0, 0, // boot_nonce
+      0, 0, 0, 0, 0, 0, 0, 0, // configuration_version
       1, 0, 0, 0, // count = 1
       3, 0, 0, 0, 0, 0, 0, 0, // subject
       5, // foreign liveness
@@ -1052,6 +1116,7 @@ mod tests {
     bytes.extend_from_slice(&7u64.to_le_bytes()); // from
     bytes.extend_from_slice(&0u64.to_le_bytes()); // nonce
     bytes.extend_from_slice(&0u64.to_le_bytes()); // boot_nonce
+    bytes.extend_from_slice(&0u64.to_le_bytes()); // configuration_version
     bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // count = huge
     assert_eq!(
       SwimMessage::decode(&bytes),
@@ -1063,6 +1128,7 @@ mod tests {
     short.extend_from_slice(&7u64.to_le_bytes());
     short.extend_from_slice(&0u64.to_le_bytes()); // nonce
     short.extend_from_slice(&0u64.to_le_bytes()); // boot_nonce
+    short.extend_from_slice(&0u64.to_le_bytes()); // configuration_version
     short.extend_from_slice(&1u32.to_le_bytes());
     short.extend_from_slice(&[9, 9, 9]); // a partial entry
     assert_eq!(

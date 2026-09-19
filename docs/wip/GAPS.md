@@ -1232,6 +1232,19 @@ retention: AUD-11–14/-16 (GAP-A9-14/-1/-7); SWIM indirect probes, call cancell
 handshake bounds: AUD-15/-17/-18 (GAP-A9-7/-4/-11). These are source findings and proposed
 regression scenarios at the audit baseline.
 
+**Implementation follow-up (2026-09-19, AUD-08 closed):** latest-state service is now fenced by a
+confirmed **owner lease** (`crates/server/src/lease.rs`). An owner serves an object's live head,
+head version, status, change list or mounted tree only while `f` of the object's other candidate
+holders acknowledged its SWIM probes within the horizon-derived bound — measured on the
+suspend-inclusive host clock from the probe's send time, less twice RFC 5905's clock tolerance,
+under the installed configuration version — and no peer announced a newer version. Probes/acks
+carry the announced version; the confirmation is fanned to every owner shard each period; the gate
+refuses `LeaseUnconfirmed` (`NFS3ERR_JUKEBOX` at the mount), pinned immutable reads exempt. A
+holder defers a departed owner's promotion until that owner's lease can have lapsed (quorum
+intersection). Owed: forwarding a node's own volumes to successors after a same-id re-admission is
+GAP-A9-7; the A-9 `FencedRegister` revalidation stands.
+`docs/bugs/2026-09-19-latest-state-served-without-a-confirmed-owner-lease.md`.
+
 **Implementation follow-up (2026-09-18, AUD-14 closed):** a taken-over green is materialized on
 the successor from its own accepted merge records and held inputs — the catalog record (the record
 value now names the green, its evidence policy and its owner), the origin and chain re-recorded

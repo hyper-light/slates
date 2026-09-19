@@ -440,6 +440,26 @@ pub struct ShardState {
   /// but a relay can), without touching the transport. Empty in production
   /// (`Daemon::inject_probe_deafness`).
   pub probe_deaf_to: std::collections::BTreeSet<slates_db::HostId>,
+  /// This node's owner-lease evidence (§4.8 "Leases and reads"; AUD-08): each peer's latest direct
+  /// acknowledgement that reported this node alive under the installed configuration version, and any
+  /// newer version a peer announced. Written on the control shard by the probe tasks
+  /// (`fleet::probe_and_apply`), fanned to every shard each period with the configuration
+  /// (`fleet::fan_configs_to_shards`), read per request by the verbs (`verbs::dispatch`) and the mount
+  /// bridge (`crate::nfs`) against the host clock. Bounded by the members; empty on a laptop, where
+  /// `f = 0` needs no confirmation.
+  pub lease: crate::lease::OwnerLease,
+  /// The holder side of the owner lease (§4.8; AUD-08): when this node last answered each peer's direct
+  /// probe reporting it alive, and the newest configuration version each announced — the evidence that
+  /// gates a successor's promotion of a departed owner's objects at this holder
+  /// (`fleet::serve_held_promotion`, `fleet::drive_takeover`). Only the control shard writes it; bounded
+  /// by the members.
+  pub answers_given: crate::lease::AnswersGiven,
+  /// The held objects whose owner a committed configuration retired and whose successor has not yet
+  /// promoted them here: the departed owner and the version that retired it, so the promotion gate knows
+  /// whom this node answered and what that owner must have seen. Set at the configuration install
+  /// (`fleet::sync_config_from_council`), removed when the promotion is answered or the object forgotten.
+  /// Bounded by the held objects; only the control shard touches it.
+  pub departed_owners: BTreeMap<ObjectId, crate::lease::DepartedOwner>,
   /// The configuration council's election timing as derived this period from the paths to its other
   /// voters (the floor with none measured): the base and span in coordinator periods, the tail and spread
   /// they came from, and the samples behind them — what `Daemon::council_timing` reports. Only the control

@@ -63,7 +63,7 @@ use slates_bridge_nfs::procedures::{
   Export, NFS_MAXNAMELEN, NFS_PROGRAM, NFSPROC3_COMMIT, NFSPROC3_CREATE, NFSPROC3_LINK,
   NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_MKNOD, NFSPROC3_READDIR, NFSPROC3_READDIRPLUS,
   NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK,
-  NFSPROC3_WRITE, io_failure_reply, is_unstable, write_stable_how,
+  NFSPROC3_WRITE, io_failure_reply, is_unstable, status_failure_reply, write_stable_how,
 };
 use slates_bridge_nfs::rpc::RecordReader;
 use slates_bridge_nfs::xdr::XdrReader;
@@ -72,6 +72,7 @@ use slates_bridge_nfs::{
   reply_bytes, request_volume, root_volume, serve_call, write_record,
 };
 use slates_db::catalog::{Principal, VolumeId};
+use slates_db::register::ObjectId;
 use slates_rt::tcp::{TcpListener, TcpStream};
 use slates_rt::{futures, registry};
 use slates_vfs::clock::Clock;
@@ -125,6 +126,15 @@ impl VolumeSet for ShardVolumeSet {
     state::with_state(|s| {
       if !s.consensus_ready {
         return Some(io_failure_reply(procedure));
+      }
+      // The owner-lease gate (§4.8 "Leases and reads"; AUD-08): the mount serves the volume's **live tree**
+      // — its latest state — so while this node's authority over the object is unconfirmed (cut off, paused
+      // past the lease bound, or superseded by a newer configuration) every procedure answers `NFS3ERR_JUKEBOX`,
+      // the retry-later status, rather than a stale view a successor may have advanced. This runs on the
+      // owner shard (`with_export` serves only a volume this shard holds), so the lease read here is the
+      // owner's; a client mounting elsewhere reaches this owner through `serve_remote`.
+      if crate::verbs::lease_unconfirmed(s, ObjectId(volume.bytes)).is_some() {
+        return Some(Some(status_failure_reply(Nfsstat3::Jukebox, procedure)));
       }
       with_export(s, volume, subject, rights, groups, |export| {
         export.serve_nfs(procedure, args)

@@ -7472,6 +7472,160 @@ fn a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor
   );
 }
 
+/// AC (§4.8 "Leases and reads"; AUD-08): in a three-node `f = 1` fleet a green advances three versions on
+/// its owner, then the owner is **isolated** on the probe plane (both directions) — it is not stopped, its
+/// client connection stays open. Its owner lease lapses by the host clock (measured across a scheduling
+/// pause of its control shard, so the lapse is by the clock, not by a loop running), and every read of the
+/// green's **latest state** on that connection — the head version, a head read, a status — refuses
+/// `LeaseUnconfirmed`, while an explicitly pinned immutable read (version 1) is still served. Meanwhile the
+/// surviving quorum retires the isolated owner, the successor rendezvous ranks first materializes the green
+/// and a new work advances it to version 4 — the new committed write the isolated owner must not serve
+/// stale. Non-vacuous: before the isolation the owner served all three of those reads; the successor's
+/// lease holds (a holder confirms it) so it serves version 4.
+#[test]
+fn an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the_green() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(n);
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  // Owner A (index 0) commits three versions; both holders catch up.
+  let mut client = Client::connect(daemons[0].instance());
+  let (green, work) = green_with_work(&mut client, "leased-green");
+  commit_three_versions(&mut client, work);
+  let object = ObjectId(green.bytes);
+  let (both_caught_up, _) = holders_before_owner_death(&daemons, green);
+
+  // Before isolation the owner serves its green's latest state on this very connection.
+  let before = observe_taken_over_green(&daemons[0], green);
+
+  // Isolate A on the probe plane, both directions: A no longer answers B/C (so the council retires it),
+  // and B/C no longer answer A (so A gathers no lease confirmation and its authority becomes uncertain).
+  isolate_owner_on_the_probe_plane(&daemons, &hosts);
+
+  // A scheduling pause across expiry: A's control shard runs nothing for two lease bounds. Its lease is
+  // measured against the suspend-inclusive host clock, so it lapses *during* the pause — by the clock, not
+  // because a loop iterated. Waiting the pause out here (`.answer()` blocks the test thread) is the "pause
+  // across expiry" the audit asks for; B and C keep probing A throughout, so the council retires it meanwhile.
+  let paused_ns = daemons[0]
+    .starve_control_shard(2 * slates_server::lease::lease_bound_ns())
+    .and_then(|done| done.answer());
+
+  // A has resumed; its lease has lapsed (no holder confirmed it during or before the pause).
+  let a_lease_lapsed = poll_until(&[&daemons[0]], RETIREMENT_DEADLINE, || {
+    daemons[0].fleet_lease_holds(object).map(|holds| !holds)
+  });
+
+  // The surviving quorum retires A; the successor rendezvous ranks first takes the green over.
+  let successor_host =
+    rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over the green");
+  let successor_index = if successor_host == hosts[1] { 1 } else { 2 };
+  let other_index = if successor_index == 1 { 2 } else { 1 };
+  let survivors = [&daemons[successor_index], &daemons[other_index]];
+  let materialized = poll_until(&survivors, PLACEMENT_DEADLINE, || {
+    daemons[successor_index].merge_record_placed(green, 3)
+  });
+  // A new work on the successor commits version 4 — the new committed write A must not serve stale.
+  let advanced = submit_next_on_successor(&daemons, successor_index, other_index, green);
+  // The isolated owner's latest-state reads now refuse `LeaseUnconfirmed`; its pinned version-1 read serves.
+  let after = observe_taken_over_green(&daemons[0], green);
+  // The successor serves the advanced green.
+  let successor_view = observe_taken_over_green(&daemons[successor_index], green);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    both_caught_up,
+    "both holders recomputed version 3 before the isolation"
+  );
+  assert!(
+    paused_ns
+      .as_ref()
+      .is_ok_and(|&held| held >= slates_server::lease::lease_bound_ns()),
+    "A's control shard was paused past a lease bound ({paused_ns:?})"
+  );
+  assert!(
+    a_lease_lapsed,
+    "the isolated owner's lease lapsed (no holder confirms it any longer)"
+  );
+  assert!(
+    materialized && advanced,
+    "the successor took over the green and advanced it to version 4 (materialized={materialized} advanced={advanced})"
+  );
+  assert_isolated_owner_lease(&before, &after, &successor_view);
+}
+
+/// Isolates the owner (daemon 0) from its two peers on the probe plane, both directions, so the council
+/// retires it and it gathers no lease confirmation (§4.8 "Leases and reads"; AUD-08).
+fn isolate_owner_on_the_probe_plane(daemons: &[Daemon], hosts: &[HostId]) {
+  daemons[0]
+    .inject_probe_deafness(&[hosts[1], hosts[2]])
+    .expect("A is isolated from B and C");
+  daemons[1]
+    .inject_probe_deafness(&[hosts[0]])
+    .expect("B stops answering A");
+  daemons[2]
+    .inject_probe_deafness(&[hosts[0]])
+    .expect("C stops answering A");
+}
+
+/// The owner-lease contract on the isolated owner (§4.8 "Leases and reads"; AUD-08): before isolation it
+/// served the green's latest state; after, its head version and head read refuse `LeaseUnconfirmed` while
+/// its pinned version-1 read still serves; the successor serves the advanced head.
+fn assert_isolated_owner_lease(
+  before: &TakenOverGreenView,
+  after: &TakenOverGreenView,
+  successor_view: &TakenOverGreenView,
+) {
+  assert_eq!(
+    before,
+    &TakenOverGreenView {
+      head: Ok(3),
+      at_one: Ok(b"hello".to_vec()),
+      at_head: Ok(b"hello world!".to_vec()),
+    },
+    "before isolation the owner served the green's latest state on this connection"
+  );
+  assert!(
+    refuses_lease(&after.head) && refuses_lease(&after.at_head),
+    "the isolated owner refuses the head version and a head read with LeaseUnconfirmed: {after:?}"
+  );
+  assert_eq!(
+    after.at_one,
+    Ok(b"hello".to_vec()),
+    "the isolated owner still serves the pinned immutable version-1 read (its separate contract)"
+  );
+  assert_eq!(
+    successor_view.head,
+    Ok(4),
+    "the successor serves the advanced green at version 4"
+  );
+}
+
+/// Whether an observed reply is the `LeaseUnconfirmed` refusal (§4.8 "Leases and reads"; AUD-08).
+fn refuses_lease<T>(reply: &Result<T, Box<ReplyBody>>) -> bool {
+  matches!(
+    reply,
+    Err(boxed) if matches!(
+      boxed.as_ref(),
+      ReplyBody::Refused {
+        refusal: Refusal::LeaseUnconfirmed { .. }
+      }
+    )
+  )
+}
+
 /// A green and a work over it, created through `client` on the owner.
 fn green_with_work(client: &mut Client, name: &str) -> (VolumeId, VolumeId) {
   let ReplyBody::GreenCreated { id: green } = client.call(&RequestBody::CreateGreen {

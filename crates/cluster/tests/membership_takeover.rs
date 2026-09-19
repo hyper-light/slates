@@ -181,6 +181,7 @@ fn a_silent_peer_is_detected_dead_and_its_objects_are_taken_over() {
           from: SURVIVOR,
           nonce: 1,
           boot_nonce: 0,
+          configuration_version: 0,
           gossip: detector.gossip(GOSSIP_FANOUT),
         };
         let (_endpoint, probe) = probe_once(endpoint, &ping, budget())

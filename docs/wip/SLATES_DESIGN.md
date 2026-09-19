@@ -1952,7 +1952,8 @@ struct Neighbourhood { hosts: SmallVec<HostId> /* the scatter width S, across fa
 > The Raft core now requires a fresh context for each ReadIndex round, echoed by a quorum of distinct
 > current voters after a current-term commit; old contacts and earlier read replies cannot confirm it.
 > Leadership or configuration changes cancel the round. The append wire format carries the context.
-> This does not provide the separate service owner-lease gate (AUD-08).
+> The separate service owner-lease gate is now built (AUD-08, 2026-09-19); see the "Leases and reads"
+> status below.
 
 > **Status (2026-09-14, AUD-07; supersedes the counter-derived identity claims above).**
 > Every daemon start now has a random boot nonce and a fresh member id. Both configuration groups
@@ -2136,6 +2137,25 @@ conservatively bounded lease may serve the latest head locally. Expiry/uncertain
 reads before a takeover can make them stale. Membership heartbeat arrival is not a lease grant;
 a majority observation must belong to the relevant authority generation. Immutable complete
 snapshot reads need no latest-head lease but still require read rights and verified content.
+
+> **Status (2026-09-19, AUD-08).** The owner lease is built (`crates/server/src/lease.rs`). An owner
+> serves an object's latest state — a `Read` at `Head`, `Versions`, `Status`, `ChangedSince`, and the
+> mount's live tree — only while `f` of the object's other candidate holders have acknowledged this
+> node's SWIM probes within the horizon-derived bound, under the installed configuration version, and
+> no peer has announced a newer version. The bound is the detector's membership horizon less twice
+> RFC 5905's 500 ppm clock tolerance, measured from the probe's *send* time on the suspend-inclusive
+> host monotonic clock, so a paused owner's lease lapses by the clock. Probes and acks carry the
+> announced configuration version; the confirmation is recorded on the probe reply, fanned to every
+> owner shard each period as absolute times, and read per request. The gate refuses
+> `LeaseUnconfirmed` (`NFS3ERR_JUKEBOX` at the mount); a pinned immutable read is exempt. A holder
+> defers a successor's promotion of a departed owner's object until that owner's lease can have
+> lapsed (the `f + 1` promotion quorum intersects any `f` fresh confirmations), so no stale read is
+> possible while a lease holds. A bounded startup allowance (the horizon after a configuration
+> install) spares a reachable just-formed owner a false refusal; `f = 0` (laptop) needs no
+> confirmation. Regression `an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the_green`
+> and the `lease.rs` unit tests. Owed: forwarding a node's own created volumes to their successors
+> after a same-id re-admission is the broader ledger transfer (GAP-A9-7); the A-9 `FencedRegister`
+> TLA+ revalidation still stands separately.
 
 **Authority scope.** Host failure increments the host epoch and fences every object owned by
 that host. Moving one volume changes that object's ownership generation, recorded in the

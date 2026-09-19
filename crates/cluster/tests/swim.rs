@@ -239,6 +239,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
                 from: TARGET,
                 nonce: STALE_NONCE,
                 boot_nonce: TARGET_BOOT_NONCE,
+                configuration_version: 0,
                 gossip: vec![(
                   RUMOUR,
                   MemberState {
@@ -307,6 +308,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
         // so a live probe succeeds, while a stale reply carrying another nonce ([`STALE_NONCE`]) does not.
         nonce: PROBE_NONCE,
         boot_nonce: 0,
+        configuration_version: 0,
         gossip: detector.gossip(GOSSIP_FANOUT),
       };
       let (endpoint, outcome) = probe_once(endpoint, &ping, budget()).await.unwrap();
@@ -325,6 +327,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
           from: PROBER,
           nonce: SECOND_PROBE_NONCE,
           boot_nonce: 0,
+          configuration_version: 0,
           gossip: detector.gossip(GOSSIP_FANOUT),
         };
         let (_endpoint, outcome) = probe_once(endpoint.unwrap(), &second, budget())
@@ -339,6 +342,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
         ProbeOutcome::Acked {
           from: _,
           boot_nonce: _,
+          configuration_version: _,
           gossip,
           rtt_ns,
           coordinate,

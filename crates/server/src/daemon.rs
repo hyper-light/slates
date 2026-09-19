@@ -1467,6 +1467,23 @@ impl Daemon {
     })
   }
 
+  /// Whether this node's **owner lease** over `object` holds right now (§4.8 "Leases and reads"; AUD-08):
+  /// `f` of the object's other candidate holders confirmed this node alive under the installed
+  /// configuration within the lease bound (or the bounded startup allowance is still open), and it is not
+  /// superseded — so a read of the object's latest state serves rather than refusing `LeaseUnconfirmed`.
+  /// A test reads it to see the lease **lapse** on an isolated owner (the non-vacuity witness the refusal
+  /// pairs with) and **hold** again on the successor. Runs on the object's owner shard
+  /// ([`Self::shard_of_object`]); the typed refusal when that shard could not be observed. `Ok(true)` on a
+  /// laptop (`f = 0` needs no confirmation).
+  pub fn fleet_lease_holds(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<bool, ObserveError> {
+    self.observe(self.shard_of_object(object), move |s| {
+      crate::verbs::lease_unconfirmed(s, object).is_none()
+    })
+  }
+
   /// This node's record links (§4.8, `ShardState::record_sessions`): each peer with an entry, and whether
   /// its session is out on a borrow at the moment of the read — a dispatch's, or the link task's own
   /// discovery exchange. A test reads it to prove an exchange is pending on a link before interrupting it,
@@ -1917,6 +1934,15 @@ fn init_shard(
     probe_windows: crate::fleet::ProbeWindows::default(),
     indirect: crate::fleet::IndirectProbes::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),
+    // The owner lease starts its bounded startup allowance at boot (§4.8 "Leases and reads", AUD-08): the
+    // node has just installed its initial configuration, so within the first membership horizon it serves
+    // its objects while its first probe acks accumulate, and no takeover can yet have committed.
+    lease: crate::lease::OwnerLease {
+      configuration_installed_ns: Some(now),
+      ..crate::lease::OwnerLease::default()
+    },
+    answers_given: crate::lease::AnswersGiven::default(),
+    departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),

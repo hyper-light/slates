@@ -1759,6 +1759,39 @@ pub fn io_failure_reply(procedure: u32) -> Option<Vec<u8>> {
   Some(writer.into_bytes())
 }
 
+/// The reply refusing any procedure with `status` before it touched the volume, in the procedure's
+/// RFC 1813 `resfail` shape with every attribute absent: nothing for NULL; the bare status for GETATTR;
+/// a `post_op_attr` for LOOKUP, ACCESS, READLINK, READ, READDIR, READDIRPLUS, FSSTAT, FSINFO and
+/// PATHCONF; a `wcc_data` for SETATTR, WRITE, CREATE, MKDIR, SYMLINK, MKNOD, REMOVE, RMDIR and COMMIT;
+/// two `wcc_data` for RENAME; a `post_op_attr` and a `wcc_data` for LINK. An unknown procedure gets the
+/// bare status. The owner-lease gate answers `NFS3ERR_JUKEBOX` through this (§4.8 "Leases and reads",
+/// AUD-08) and a volume whose owner moved `NFS3ERR_STALE`.
+pub fn status_failure_reply(status: Nfsstat3, procedure: u32) -> Vec<u8> {
+  let mut writer = XdrWriter::new();
+  status.encode(&mut writer);
+  match procedure {
+    NFSPROC3_LOOKUP | NFSPROC3_ACCESS | NFSPROC3_READLINK | NFSPROC3_READ | NFSPROC3_READDIR
+    | NFSPROC3_READDIRPLUS | NFSPROC3_FSSTAT | NFSPROC3_FSINFO | NFSPROC3_PATHCONF => {
+      PostOpAttr(None).encode(&mut writer);
+    }
+    NFSPROC3_SETATTR | NFSPROC3_WRITE | NFSPROC3_CREATE | NFSPROC3_MKDIR | NFSPROC3_SYMLINK
+    | NFSPROC3_MKNOD | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_COMMIT => {
+      encode_wcc(&mut writer, None);
+    }
+    NFSPROC3_RENAME => {
+      encode_wcc(&mut writer, None);
+      encode_wcc(&mut writer, None);
+    }
+    NFSPROC3_LINK => {
+      PostOpAttr(None).encode(&mut writer);
+      encode_wcc(&mut writer, None);
+    }
+    NFSPROC3_NULL => return Vec::new(),
+    _ => {}
+  }
+  writer.into_bytes()
+}
+
 /// Encodes a CREATE/MKDIR/SYMLINK reply (they share the shape, RFC 1813 §3.3.8-10): on success the
 /// new object's `post_op_fh3` and `post_op_attr` then the parent's `wcc_data`; on failure just the
 /// parent's `wcc_data`.

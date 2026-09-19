@@ -1669,6 +1669,18 @@ pub enum Refusal {
   ConsensusRecoveryStale,
   /// No complete group state is available, or its counters cannot advance safely.
   ConsensusRecoveryUnavailable,
+  /// The owner's authority over the object's **latest state** is not confirmed right now (§4.8 "Leases
+  /// and reads"; AUD-08): within the lease bound, too few of the object's candidate holders answered this
+  /// node's probes reporting it alive under the configuration version it has installed — the node is cut
+  /// off, was paused past the bound, or has learned of a newer configuration than it holds (it may have
+  /// been retired and its objects taken over). A read at the head, the head version, a status, an
+  /// enumeration and every write of live state refuse; an explicitly pinned immutable read (a green's
+  /// named version, an attachment's pinned view) is served. Retry after the bound, or through the id's
+  /// current owner. Appended for append-only evolution.
+  LeaseUnconfirmed {
+    /// The configuration version the refusing node has installed.
+    version: u64,
+  },
 }
 
 /// A reply body. (`Eq` is not derived: a [`Refusal`] may carry measured probabilities.)

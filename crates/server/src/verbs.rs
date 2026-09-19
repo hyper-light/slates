@@ -17,7 +17,7 @@ use slates_db::catalog::{
 use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration};
 use slates_ipc::protocol::{
   AttachRequest, AttachTransport, DaemonReport, Direction, Established, FleetReport,
-  FreshnessBasis, GroupReport, HealthSignal, Intent, NamePolicy, OciBinding, PlacedState,
+  FreshnessBasis, GroupReport, HealthSignal, Intent, NamePolicy, OciBinding, PlacedState, ReadAt,
   ReadWritePolicy, Refusal, RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal,
   SizeClass, SnapshotId, StatusReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
   decode_body, encode_body, pack, unpack,
@@ -531,6 +531,56 @@ pub(crate) struct ForwardedRequest {
   /// completions the way a local client's are pruned by its acknowledgements (§4.9 RIFL; banned item 8).
   /// `None` before the client has acknowledged anything.
   pub ack_up_to: Option<u32>,
+}
+
+/// The volume whose **latest state** a verb serves, so it requires a confirmed owner lease (§4.8 "Leases
+/// and reads"; AUD-08): a read at the live head, the current version list, a status, or a since-a-version
+/// query. A read explicitly pinned to an immutable point — a green's named version, an attachment's pinned
+/// view — returns `None`: it keeps its separate contract (verified content and read rights, no latest-head
+/// lease). Control queries, creations of new objects, and writes (gated by durability and the merge-commit
+/// wait instead) return `None` too.
+fn serves_latest_state(body: &RequestBody) -> Option<VolumeId> {
+  match body {
+    RequestBody::Read {
+      volume,
+      at: ReadAt::Head,
+      ..
+    } => Some(*volume),
+    RequestBody::Read {
+      at: ReadAt::Version { .. } | ReadAt::Attachment { .. },
+      ..
+    } => None,
+    RequestBody::Versions { green } | RequestBody::ChangedSince { green, .. } => Some(*green),
+    RequestBody::Status { volume } => Some(*volume),
+    _ => None,
+  }
+}
+
+/// Whether this node's authority over `object`'s latest state is **not** confirmed right now, and the
+/// configuration version it would refuse with (§4.8 "Leases and reads"; AUD-08). Reads the fanned owner
+/// lease against the object's candidate holders under the installed configuration and the host clock, so a
+/// paused shard's lease has already lapsed by the clock when it resumes. `None` — confirmed, serve — when
+/// `f` of the other candidates confirmed within the lease bound (or within the bounded startup allowance),
+/// and on a laptop (`f = 0`, no other candidate needed). Read by the verb gate ([`dispatch`]) and the mount
+/// bridge ([`crate::nfs`]).
+pub(crate) fn lease_unconfirmed(state: &ShardState, object: ObjectId) -> Option<u64> {
+  let config = state.fleet.configuration();
+  let candidates = slates_db::register::candidates_for(
+    config.owner,
+    &config.neighbourhood,
+    &config.domains,
+    object,
+    config.quorum,
+  );
+  let now = slates_machine::clock::monotonic_ns();
+  let holds = state.lease.holds(
+    now,
+    config.owner,
+    config.version,
+    config.quorum,
+    &candidates,
+  );
+  (!holds).then_some(config.version)
 }
 
 /// Whether a verb is a **read** safe to forward to a volume's owner without a completion record: a
@@ -1863,6 +1913,7 @@ fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::ConsensusBootstrapStale => "consensus_bootstrap_stale",
     Refusal::ConsensusRecoveryStale => "consensus_recovery_stale",
     Refusal::ConsensusRecoveryUnavailable => "consensus_recovery_unavailable",
+    Refusal::LeaseUnconfirmed { .. } => "lease_unconfirmed",
     Refusal::DurabilityUnmet { .. } => "durability_unmet",
     Refusal::GrantIssuerUnverified => "grant_issuer_unverified",
     Refusal::ConsumerNotEnrolled => "consumer_not_enrolled",
@@ -1935,6 +1986,20 @@ fn dispatch(
     return refused(Refusal::ConsensusNotInitialized);
   }
   let touched = volume_of(&body).map(to_db_volume);
+  // The owner-lease gate (§4.8 "Leases and reads"; AUD-08): a read of an owned object's **latest state** —
+  // its live head, its version list, its status, a since-a-version query — is refused `LeaseUnconfirmed`
+  // while this node's authority over that object is not currently confirmed (it is cut off, was paused past
+  // the lease bound, or has learned of a newer configuration than it holds). Runs on the object's owner
+  // shard (a forwardable read was routed here), so the fanned lease and configuration read here are the
+  // owner's. An explicitly pinned immutable read (a green's named version, an attachment's pinned view)
+  // is **not** gated (`serves_latest_state` returns `None`) — it keeps its separate contract. Placement
+  // writes are separately gated by durability and, at `f > 0`, do not publish acceptance until the record
+  // commits at the quorum (AUD-11), so they cannot return a stale success.
+  if let Some(volume) = serves_latest_state(&body)
+    && let Some(version) = lease_unconfirmed(state, ObjectId(volume.bytes))
+  {
+    return refused(Refusal::LeaseUnconfirmed { version });
+  }
   // The durability gate (§4.8 "Placement" — the operator's ε and coincident-failure size "gate a refusal"):
   // a write that would commit a new head or seal is refused, with the measured shortfall, while the
   // installed configuration cannot hold it to the declared policy. A field read: the shortfall was measured

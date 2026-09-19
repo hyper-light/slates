@@ -146,12 +146,12 @@ const GOSSIP_PER_BIT: u32 = 2;
 /// Lifeguard"; SWIM §4.2 uses a small multiple of the period so a lost acknowledgement is retried by the
 /// next period before a member is suspected). Two periods: one to miss, one to confirm the miss, before the
 /// aging declares death; the Lifeguard multiplier dilates it when this node itself looks unhealthy.
-const SUSPICION_PERIODS: u32 = 2;
+pub(crate) const SUSPICION_PERIODS: u32 = 2;
 
 /// Derived: the Lifeguard local-health multiplier cap minus one — a 3× cap (§4.8 "bounded local-health
 /// multiplier"; the raw `(LHM+1)` reaches 9× at the paper's saturation, which pushes timers off a cliff, so
 /// hyperscale softened it to a 3× cap). A small integer keeps the dilation determinism-clean.
-const LOCAL_HEALTH_CAP: u32 = 2;
+pub(crate) const LOCAL_HEALTH_CAP: u32 = 2;
 
 /// Derived: how many times the collection loop polls for a reply within one protocol period — ten, so the
 /// loop wakes within a tenth of a period of the acknowledgement (10 ms at the default cadence) without
@@ -1336,7 +1336,7 @@ async fn serve_peer_probes(
           Vec::new()
         }
         Ok(message) => {
-          let Some(gossip) = state::with_state(|state| {
+          let Some((gossip, configuration_version)) = state::with_state(|state| {
             let anchor = rostered_anchor?;
             let boot_nonce = message.boot_nonce()?;
             let peer = message.from();
@@ -1359,8 +1359,28 @@ async fn serve_peer_probes(
             if let SwimMessage::IndirectAck { target, nonce, .. } = &message {
               receive_indirect_ack(state, *target, *nonce);
             }
+            // The holder side of the owner lease (§4.8 "Leases and reads"; AUD-08): this node is about to
+            // answer `peer`'s direct probe, a lease-confirming acknowledgement that feeds `peer`'s lease
+            // over its own objects (this node is one of its candidate holders). Record when, and the
+            // configuration version `peer` announces — the two facts that gate whether this node may later
+            // answer a successor's promotion of `peer`'s objects: it must stay silent for the membership
+            // horizon (so any lease it fed has expired) unless `peer` has announced it saw its retirement.
+            if let SwimMessage::Ping {
+              configuration_version,
+              ..
+            } = &message
+            {
+              let now = slates_machine::clock::monotonic_ns();
+              state.answers_given.answered_alive(peer, now);
+              state.answers_given.announced(peer, *configuration_version);
+            }
             let belief = state.fleet.membership().state(peer);
-            Some(outgoing_probe_gossip(state, peer, belief, fanout))
+            Some((
+              outgoing_probe_gossip(state, peer, belief, fanout),
+              state
+                .lease
+                .known_version(state.fleet.configuration().version),
+            ))
           })
           .flatten() else {
             // A forged identity may neither mutate membership nor receive credit.
@@ -1370,6 +1390,7 @@ async fn serve_peer_probes(
             from: local,
             nonce: message.nonce().unwrap_or(0),
             boot_nonce: local_boot_nonce,
+            configuration_version,
             gossip,
             coordinate: detector.coordinate(),
           }
@@ -1524,20 +1545,31 @@ async fn probe_and_apply(
   }
   credit_relayed_answer(detector, peer.host, nonce);
   detector.tick();
-  let ping = SwimMessage::Ping {
-    from: local,
-    nonce,
-    boot_nonce: local_boot_nonce,
-    // The buddy system: a ping to a peer this node suspects always carries that suspicion, so the peer
-    // refutes it from this very probe rather than after the gossip budget is spent.
-    gossip: state::with_state(|state| {
+  // The newest configuration version this node knows (installed, or a supersession a peer announced): so a
+  // holder receiving this probe learns at once when a retired owner has seen its retirement (§4.8 "Leases
+  // and reads"; AUD-08). Sent with the probe below; the sent time is captured before the send.
+  let (ping_gossip, announced_version) = state::with_state(|state| {
+    (
+      // The buddy system: a ping to a peer this node suspects always carries that suspicion, so the peer
+      // refutes it from this very probe rather than after the gossip budget is spent.
       outgoing_probe_gossip(
         state,
         peer.host,
         detector.membership().state(peer.host),
         fanout,
-      )
-    })?,
+      ),
+      state
+        .lease
+        .known_version(state.fleet.configuration().version),
+    )
+  })?;
+  let sent_ns = slates_machine::clock::monotonic_ns();
+  let ping = SwimMessage::Ping {
+    from: local,
+    nonce,
+    boot_nonce: local_boot_nonce,
+    configuration_version: announced_version,
+    gossip: ping_gossip,
   };
   match probe_once(open, &ping, timing.budget(path_tail_ns(peer.host))).await {
     Ok((
@@ -1545,6 +1577,7 @@ async fn probe_and_apply(
       ProbeOutcome::Acked {
         from,
         boot_nonce,
+        configuration_version,
         gossip,
         rtt_ns,
         coordinate,
@@ -1571,6 +1604,16 @@ async fn probe_and_apply(
           // This node, as a relay: every requester that asked it to reach this peer is answered — the ask
           // moves to the requester's queue and the requester's probe task is woken to carry it back.
           answer_relay_asks(s, peer.host);
+          // The owner lease (§4.8 "Leases and reads"; AUD-08): this peer, a candidate holder of this node's
+          // objects, has answered a probe reporting this node alive. Credit it toward the lease at the
+          // version the peer announced — measured from the probe's send time, before the peer formed its
+          // answer. A version newer than this node's installed one means this node's authority is
+          // superseded (a retirement or takeover it has not applied): every object's lease voids until it
+          // installs that version.
+          s.lease.confirm(peer.host, sent_ns, configuration_version);
+          if configuration_version > s.fleet.configuration().version {
+            s.lease.supersede(configuration_version);
+          }
         });
         #[allow(clippy::cast_precision_loss)]
         detector.observe_rtt(peer.host, rtt_ns as f64);
@@ -4850,8 +4893,32 @@ fn sync_config_from_council(local: HostId) {
         .as_ref()
         .and_then(|membership| membership.durability),
     );
+    // The owner each held object had *before* this install, and the version that is retiring some of them,
+    // so a takeover this install produces records who departed and when — the holder-side promotion gate
+    // (§4.8 "Leases and reads", AUD-08) reads it to keep a successor from promoting an object before the
+    // departed owner's lease can have expired.
+    let since_version = configuration.version;
+    let pre_owners: std::collections::BTreeMap<ObjectId, HostId> = s
+      .holder_records
+      .keys()
+      .filter_map(|object| s.fleet.object_owner(*object).map(|owner| (*object, owner)))
+      .collect();
+    // This node installed a newer configuration: any supersession it learned is resolved at or below it,
+    // so its own lease can hold again once holders confirm it under the new version; the bounded startup
+    // allowance restarts from now (a takeover under this version cannot yet have committed).
+    s.lease
+      .installed(configuration.version, slates_machine::clock::monotonic_ns());
     for reassignment in s.fleet.install_configuration(configuration, &members) {
       s.pending_takeovers.insert(reassignment.object);
+      if let Some(&owner) = pre_owners.get(&reassignment.object) {
+        s.departed_owners.insert(
+          reassignment.object,
+          crate::lease::DepartedOwner {
+            owner,
+            since_version,
+          },
+        );
+      }
     }
     // Raise the fence for every held object to its owner's committed fencing epoch (§4.8 "every holder
     // raises its fence for that host to the new epoch"). A failed owner's epoch was bumped by the council's
@@ -4893,12 +4960,20 @@ fn sync_config_from_council(local: HostId) {
 /// and promotions), so the per-period cost is bounded at every scale. A non-control shard tracks no held
 /// object, so its `install_configuration` returns no reassignment to drive — takeover stays on this shard.
 fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
-  let Some((placement, members, root, ready)) = state::with_state(|s| {
+  let Some((placement, members, root, ready, lease)) = state::with_state(|s| {
+    // Prune the owner-lease ledgers to the current members each period (a restarted peer's retired id
+    // leaves; §4.8 "Leases and reads", AUD-08), then fan this node's lease evidence to every owner shard —
+    // the verb gate (`verbs::dispatch`) and the mount (`crate::nfs`) run there and must read the same
+    // confirmation the control shard's probe tasks collected. `answers_given` and `departed_owners` stay on
+    // the control shard (only the takeover drive reads them), so they are not fanned.
+    s.lease.retain_members(&members_snapshot(s));
+    s.answers_given.retain_members(&members_snapshot(s));
     (
       s.fleet.configuration().clone(),
       s.fleet.members().to_vec(),
       s.root.configuration().clone(),
       s.consensus_ready,
+      s.lease.clone(),
     )
   }) else {
     return;
@@ -4907,6 +4982,7 @@ fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
     let placement = placement.clone();
     let members = members.clone();
     let root = root.clone();
+    let lease = lease.clone();
     let _ = run_on(origin, shard, move |s| {
       if !s.consensus_ready || placement.version > s.fleet.configuration().version {
         // This shard serves its own writes, so it measures the fanned configuration against the durability
@@ -4922,8 +4998,18 @@ fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
       }
       s.root.adopt(root);
       s.consensus_ready = ready;
+      // The owner lease is authoritative on the control shard; every other shard reads the fanned copy.
+      // The confirmations carry absolute send times on the shared host clock, so a fan a full channel
+      // dropped only shortens the lease on that shard until the next period re-fans it (never lengthens it).
+      s.lease = lease;
     });
   }
+}
+
+/// The current fleet members as a plain vector — the argument the lease pruners take. A brief read used
+/// twice in one borrow, factored so neither call clones the membership through a longer path.
+fn members_snapshot(state: &ShardState) -> Vec<HostId> {
+  state.fleet.members().to_vec()
 }
 
 /// The record-plane coordinator (§4.8 "records are sent to all candidates; committed at `f + 1`"; "Promotion
@@ -5250,11 +5336,17 @@ pub(crate) async fn forward_over_leader_session(
 /// The pending takeovers this node should drive: the objects it owes a takeover for
 /// ([`ShardState::pending_takeovers`]) whose surviving candidate set — computed the same way every node
 /// computes placement ([`candidates_for`] over the current neighbourhood) — contains this node, the new owner
-/// `sync_peer` reassigned them to. The coordinator drives each over **all** of the object's surviving
-/// candidate holders, so the `f > 1` promotion quorum (this node plus `f` holders) is reached over the
-/// several sessions it owns. Read under `with_state`.
+/// `sync_peer` reassigned them to, **and** whose departed owner's lease can no longer hold (§4.8 "Leases and
+/// reads", AUD-08): the holder-side promotion gate ([`AnswersGiven::promotion_open`]) — this node has not
+/// answered the departed owner's probe for the membership horizon (so any lease it fed has expired) or the
+/// owner has announced it saw the retiring configuration (so it refuses its own clients now). Without a
+/// recorded departed owner the gate is open (a re-driven takeover whose record has been cleared; the council's
+/// own death-confirmation window already exceeds the horizon). The coordinator drives each object over **all**
+/// its surviving candidate holders, so the `f > 1` promotion quorum (this node plus `f` holders) is reached
+/// over the several sessions it owns. Read under `with_state`.
 fn takeovers(state: &ShardState, local: HostId) -> Vec<ObjectId> {
   let config = state.fleet.configuration();
+  let now = slates_machine::clock::monotonic_ns();
   state
     .pending_takeovers
     .iter()
@@ -5268,6 +5360,13 @@ fn takeovers(state: &ShardState, local: HostId) -> Vec<ObjectId> {
         config.quorum,
       )
       .contains(&local)
+    })
+    .filter(|object| {
+      state.departed_owners.get(object).is_none_or(|departed| {
+        state
+          .answers_given
+          .promotion_open(departed.owner, departed.since_version, now)
+      })
     })
     .collect()
 }
@@ -5400,6 +5499,8 @@ async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -
         },
       );
       s.pending_takeovers.remove(&object);
+      // The object is owned here now; its departed-owner promotion gate has served its purpose.
+      s.departed_owners.remove(&object);
       if let Some(head) = HeadValue::from_record_bytes(&value) {
         s.pending_materializations.insert(object, head);
       } else if let Some(merge) = crate::merge_service::MergeRecordValue::from_record_bytes(&value)
@@ -5453,6 +5554,7 @@ mod tests {
         from: neighbor,
         nonce: 1,
         boot_nonce: 0,
+        configuration_version: 0,
         gossip: vec![
           (
             lost,
@@ -5472,6 +5574,7 @@ mod tests {
         from: local,
         nonce: 2,
         boot_nonce: 0,
+        configuration_version: 0,
         gossip: outgoing,
       };
       let relayed = SwimMessage::decode(&relayed.encode()).unwrap();
