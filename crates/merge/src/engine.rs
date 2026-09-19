@@ -237,8 +237,88 @@ pub struct Green {
   symlink_changed: BTreeMap<String, u64>,
   hardlink_changed: BTreeMap<String, u64>,
   xattr_changed: BTreeMap<(String, String), u64>,
-  seen: BTreeMap<[u8; 32], Outcome>,
+  /// Every accepted increment's identity and the version it committed: the idempotency record a
+  /// retry of an accepted submit is answered from. Bounded by the chain (one entry per committed
+  /// version), which the partition caps in bytes; recovery rebuilds it by replaying the chain.
+  accepted: BTreeMap<[u8; 32], u64>,
+  /// The **rejected-result cache** (§4.16; AUD-16): the conflict windows of increments that were
+  /// refused, kept so a retry of the same increment is answered without re-judging — but a conflict
+  /// is not in the chain, so nothing else bounds this; it is bounded here by `rejected_budget` bytes,
+  /// the oldest entries evicted first (`rejected_order`). A retry of an evicted conflict is simply
+  /// judged again: the verdict is deterministic in the increment, its base and the head, so the
+  /// answer is the same while the head stands and honestly newer once it moved.
+  rejected: BTreeMap<[u8; 32], Vec<ConflictWindow>>,
+  /// The rejected identities in insertion order — the eviction order.
+  rejected_order: std::collections::VecDeque<[u8; 32]>,
+  /// The bytes the rejected cache holds ([`window_bytes`] per window, plus the identity).
+  rejected_bytes: usize,
+  /// The bytes the rejected cache may hold; zero keeps no rejected result (every conflict retry is
+  /// judged again). Set by the service from its derived merge budget (`set_rejected_budget`).
+  rejected_budget: usize,
+  /// Rejected results evicted or never retained for want of budget — the non-vacuity counter the
+  /// bound's regression asserts.
+  rejected_evicted: u64,
+  /// The bytes the content history retains beyond the current files — every earlier value of every
+  /// path still held for reconstruction (`content_at`, `base_at`) — kept as a running total so the
+  /// service can charge it as retention without walking the histories.
+  history_bytes: usize,
+  /// The version below which the histories have been **folded** (`fold_history_before`): values
+  /// recorded before it survive only as the one entry in effect at it, so a version below the floor
+  /// is no longer reconstructible. The service keeps the floor at the oldest version any live reader
+  /// — a work's base, a pinned attachment — can still name.
+  folded_below: u64,
   fast_path_hits: u64,
+}
+
+/// The bytes a retained conflict window costs the rejected-result cache: its path, its range and
+/// its class — what the cache actually holds for it.
+fn window_bytes(window: &ConflictWindow) -> usize {
+  window.path.len() + size_of::<Range>() + size_of::<MergeConflictClass>()
+}
+
+/// The bytes a rejected result costs: its identity plus its windows.
+fn rejected_entry_bytes(windows: &[ConflictWindow]) -> usize {
+  size_of::<[u8; 32]>() + windows.iter().map(window_bytes).sum::<usize>()
+}
+
+/// What a green holds in memory beyond its durable chain (§4.2 all-cost admission; AUD-16): the
+/// current files, the history retained for reconstructing earlier versions, and the rejected-result
+/// cache. The service charges `history` and `rejected` as retention against the shard's budget.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RetainedBytes {
+  /// The current files' bytes.
+  pub content: usize,
+  /// The earlier values retained in the content history for reconstruction.
+  pub history: usize,
+  /// The rejected-result cache's bytes.
+  pub rejected: usize,
+}
+
+/// Folds one `(version, value)` history below `floor`: drops every entry recorded before `floor`
+/// except the last of them (the value in effect at `floor`), so lookups at or above the floor are
+/// unchanged. `cost` prices an entry's value; the sum over the dropped entries is returned (the
+/// bytes released). Entries are in version order, as the histories keep them.
+fn fold_entries<T>(history: &mut Vec<(u64, T)>, floor: u64, cost: impl Fn(&T) -> usize) -> usize {
+  let below = history
+    .iter()
+    .take_while(|(version, _)| *version < floor)
+    .count();
+  // Every entry below the floor can go when one is recorded exactly at it (that one is the value at
+  // the floor); otherwise the last entry below the floor is the value in effect there and stays.
+  let at_floor = history
+    .get(below)
+    .is_some_and(|(version, _)| *version == floor);
+  let drop = if at_floor {
+    below
+  } else {
+    below.saturating_sub(1)
+  };
+  if drop == 0 {
+    return 0;
+  }
+  let dropped: usize = history[..drop].iter().map(|(_, value)| cost(value)).sum();
+  history.drain(..drop);
+  dropped
 }
 
 /// The value of a `(version, Option<value>)` history at `version`: the last entry recorded at or
@@ -1331,7 +1411,10 @@ impl Green {
       }
     }
     for path in removed_content {
-      self.content.remove(&path);
+      // A removed file's last value stays in the history for reconstruction: retained, and charged.
+      if let Some(previous) = self.content.remove(&path) {
+        self.history_bytes = self.history_bytes.saturating_add(previous.len());
+      }
       self.last_changed.insert(path.clone(), version);
       self
         .content_history
@@ -1340,7 +1423,11 @@ impl Green {
         .push((version, None));
     }
     for (path, bytes, ops) in set_content {
-      self.content.insert(path.clone(), bytes.clone());
+      // The value this one supersedes becomes retained history: charged to the running total the
+      // service accounts for as retention (the current value is charged as content).
+      if let Some(previous) = self.content.insert(path.clone(), bytes.clone()) {
+        self.history_bytes = self.history_bytes.saturating_add(previous.len());
+      }
       self.last_changed.insert(path.clone(), version);
       self
         .content_history
@@ -1354,21 +1441,184 @@ impl Green {
 
   /// Submits an increment: idempotent by identity, decides every dimension of its ops document, and
   /// commits a new version when all accept, or returns the conflict windows and changes nothing.
+  /// An accepted increment's outcome is remembered for good (it is in the chain); a rejected one's
+  /// windows are kept in the bounded rejected-result cache, from which a retry is answered while the
+  /// entry survives and judged again once it was evicted.
   pub fn submit(&mut self, inc: &Increment) -> Outcome {
-    if let Some(outcome) = self.seen.get(&inc.id) {
-      return outcome.clone();
+    if let Some(version) = self.accepted.get(&inc.id) {
+      return Outcome::Accepted { version: *version };
+    }
+    if let Some(windows) = self.rejected.get(&inc.id) {
+      return Outcome::Conflict {
+        windows: windows.clone(),
+      };
     }
     let resolved = Green::resolve(inc);
-    let outcome = match self.decide(inc, &resolved) {
+    match self.decide(inc, &resolved) {
       Ok(effects) => {
         let version = self.head() + 1;
         self.commit(effects, version);
+        self.accepted.insert(inc.id, version);
         Outcome::Accepted { version }
       }
-      Err(windows) => Outcome::Conflict { windows },
+      Err(windows) => {
+        self.retain_rejected(inc.id, &windows);
+        Outcome::Conflict { windows }
+      }
+    }
+  }
+
+  /// Keeps a rejected result within the cache's byte budget: entries are evicted oldest-first until
+  /// this one fits; one that cannot fit even an empty cache is not retained. Every eviction and every
+  /// unretained result is counted (`rejected_evicted`), and the running byte total moves with each.
+  fn retain_rejected(&mut self, id: [u8; 32], windows: &[ConflictWindow]) {
+    let needed = rejected_entry_bytes(windows);
+    if needed > self.rejected_budget {
+      self.rejected_evicted = self.rejected_evicted.saturating_add(1);
+      return;
+    }
+    while self.rejected_bytes.saturating_add(needed) > self.rejected_budget {
+      let Some(oldest) = self.rejected_order.pop_front() else {
+        break;
+      };
+      if let Some(evicted) = self.rejected.remove(&oldest) {
+        self.rejected_bytes = self
+          .rejected_bytes
+          .saturating_sub(rejected_entry_bytes(&evicted));
+        self.rejected_evicted = self.rejected_evicted.saturating_add(1);
+      }
+    }
+    self.rejected.insert(id, windows.to_vec());
+    self.rejected_order.push_back(id);
+    self.rejected_bytes = self.rejected_bytes.saturating_add(needed);
+  }
+
+  /// Sets the rejected-result cache's byte budget (the service derives it from the merge budget of
+  /// §4.2), evicting oldest-first whatever no longer fits. Zero keeps no rejected result.
+  pub fn set_rejected_budget(&mut self, bytes: usize) {
+    self.rejected_budget = bytes;
+    while self.rejected_bytes > self.rejected_budget {
+      let Some(oldest) = self.rejected_order.pop_front() else {
+        break;
+      };
+      if let Some(evicted) = self.rejected.remove(&oldest) {
+        self.rejected_bytes = self
+          .rejected_bytes
+          .saturating_sub(rejected_entry_bytes(&evicted));
+        self.rejected_evicted = self.rejected_evicted.saturating_add(1);
+      }
+    }
+  }
+
+  /// Drops one rejected result from the cache (the service does this when the shard's budget cannot
+  /// cover its retention: the verdict was still returned; a retry is judged again), returning the
+  /// bytes released and counting it as evicted. Zero when the identity was not retained.
+  pub fn forget_rejected(&mut self, id: &[u8; 32]) -> usize {
+    let Some(windows) = self.rejected.remove(id) else {
+      return 0;
     };
-    self.seen.insert(inc.id, outcome.clone());
-    outcome
+    self.rejected_order.retain(|kept| kept != id);
+    let released = rejected_entry_bytes(&windows);
+    self.rejected_bytes = self.rejected_bytes.saturating_sub(released);
+    self.rejected_evicted = self.rejected_evicted.saturating_add(1);
+    released
+  }
+
+  /// The rejected-result cache: entries held, bytes held, and results evicted or never retained.
+  pub fn rejected_cache(&self) -> (usize, usize, u64) {
+    (
+      self.rejected.len(),
+      self.rejected_bytes,
+      self.rejected_evicted,
+    )
+  }
+
+  /// What the green holds in memory beyond its durable chain ([`RetainedBytes`]): read off running
+  /// totals, never a walk.
+  pub fn retained_bytes(&self) -> RetainedBytes {
+    RetainedBytes {
+      content: self.content.values().map(Vec::len).sum(),
+      history: self.history_bytes,
+      rejected: self.rejected_bytes,
+    }
+  }
+
+  /// The content history's retained bytes **recounted** from the histories themselves — the oracle
+  /// the running total is checked against (balanced accounting): every earlier value of every path,
+  /// the current value excluded.
+  pub fn history_bytes_recounted(&self) -> usize {
+    self
+      .content_history
+      .values()
+      .map(|history| {
+        history
+          .iter()
+          .rev()
+          .skip(1)
+          .map(|(_, bytes)| bytes.as_ref().map_or(0, Vec::len))
+          .sum::<usize>()
+      })
+      .sum()
+  }
+
+  /// The version below which the histories are folded.
+  pub fn folded_below(&self) -> u64 {
+    self.folded_below
+  }
+
+  /// Folds the histories **oldest-first, only as far as the retention budget needs** (§4.16 "delta
+  /// retention before folding … capped by the delta memory budget"; AUD-16): while the retained
+  /// history exceeds `budget` bytes, the floor rises one version at a time — never past
+  /// `reachable_floor`, the oldest version a live reader still names — folding what lies below it
+  /// ([`fold_history_before`](Self::fold_history_before)). Under an ample budget nothing folds, so a
+  /// reader may still re-pin any earlier version; under pressure the oldest unreachable history goes
+  /// first, and a version below the floor is thereafter refused rather than reconstructed wrongly.
+  /// Returns the bytes released. A reachable floor at or below the current one is a no-op.
+  pub fn fold_history_to_budget(&mut self, reachable_floor: u64, budget: usize) -> usize {
+    let mut released = 0usize;
+    while self.history_bytes > budget && self.folded_below < reachable_floor {
+      let next = self.folded_below.saturating_add(1);
+      released = released.saturating_add(self.fold_history_before(next));
+    }
+    released
+  }
+
+  /// **Folds** every history below `floor` (§4.16 "delta retention before folding"; AUD-16): of the
+  /// entries recorded before `floor`, only the last — the value in effect at `floor` — survives, so
+  /// `content_at`, `base_at` and `changed_between` answer exactly as before for every version at or
+  /// above the floor, and a version below it is no longer reconstructible. The service calls this
+  /// with the oldest version a live reader can still name (a work's base, a pinned attachment), so
+  /// nothing reachable is lost, and a file rewritten many times by small edits no longer keeps a
+  /// full copy per edit past what any reader needs. Returns the content bytes released. Idempotent;
+  /// a floor below the current one is a no-op.
+  pub fn fold_history_before(&mut self, floor: u64) -> usize {
+    if floor <= self.folded_below {
+      return 0;
+    }
+    self.folded_below = floor;
+    let mut released = 0usize;
+    for history in self.content_history.values_mut() {
+      released = released.saturating_add(fold_entries(history, floor, |bytes| {
+        bytes.as_ref().map_or(0, Vec::len)
+      }));
+    }
+    for history in self.mode_history.values_mut() {
+      fold_entries(history, floor, |_| 0);
+    }
+    for history in self.symlink_history.values_mut() {
+      fold_entries(history, floor, |_| 0);
+    }
+    for history in self.hardlink_history.values_mut() {
+      fold_entries(history, floor, |_| 0);
+    }
+    for history in self.xattr_history.values_mut() {
+      fold_entries(history, floor, |_| 0);
+    }
+    for history in self.dir_history.values_mut() {
+      fold_entries(history, floor, |_| 0);
+    }
+    self.history_bytes = self.history_bytes.saturating_sub(released);
+    released
   }
 
   /// Rebases a work's increment onto the green's head (§4.16 "Rebase, the only corrective path"):

@@ -2945,6 +2945,8 @@ fn create_green(
       slates_merge::engine::Green::with_origin(&origin)
     }
   };
+  let mut engine = engine;
+  engine.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
   state.greens.insert(id, engine);
   // Version 0's merge record — the origin, placed before the record names it (§4.16 "Commit").
   crate::merge_service::enqueue_record(state, id, 0, [0u8; 32], 0, Vec::new());
@@ -3373,6 +3375,18 @@ fn submit(
   if let Err(e) = state.db.partition().check(&record, now) {
     return refused(refusal_of_db(&e));
   }
+  // The retention an accept can add — the values its content sets supersede, kept in the history for
+  // reconstruction — is at most the sealed post-state the increment carries; that much is **secured**
+  // against the shard's budget before the verdict (§4.2 all-cost admission, A-16: charged by the
+  // retaining operation before it mutates anything; AUD-16), refused typed when the budget cannot
+  // cover it, and trued up to what the commit actually retained by the settle below.
+  let secured = u64::try_from(inc.post_state.len()).unwrap_or(u64::MAX);
+  // Make room first: fold whatever the retention budget allows (never a live reader's version).
+  let _ = crate::merge_service::settle_green_retention(state, green_id);
+  if let Err(available) = crate::merge_service::secure_green_retention(state, green_id, secured) {
+    report_first_budget_refusal(state, "retention", secured, available);
+    return refused(Refusal::BudgetExceeded { available });
+  }
   let verdict_start = state.clock.monotonic_ns();
   let outcome = {
     let Some(engine) = state.greens.get_mut(&green_id) else {
@@ -3431,15 +3445,35 @@ fn submit(
         inc.base,
         inc.evidence,
       );
+      // The work's base moved to the version, so the reachable floor may have risen: fold the histories
+      // to it and true the retention charge up to what the commit retained (the secured surplus credited).
+      // A settle after an accept only credits: nothing was retained beyond what was secured.
+      let _ = crate::merge_service::settle_green_retention(state, green_id);
       ReplyBody::Submitted {
         version: Some(version),
         conflicts: Vec::new(),
       }
     }
-    slates_merge::engine::Outcome::Conflict { windows } => ReplyBody::Submitted {
-      version: None,
-      conflicts: merge_windows(&windows),
-    },
+    slates_merge::engine::Outcome::Conflict { windows } => {
+      settle_after_conflict(state, green_id, &inc.id);
+      ReplyBody::Submitted {
+        version: None,
+        conflicts: merge_windows(&windows),
+      }
+    }
+  }
+}
+
+/// The retention settle after a refused submit: nothing was retained but the rejected result, so the
+/// bytes secured before the verdict are credited back and the cache's growth charged in their place;
+/// a budget that cannot cover even that drops the result from the cache (the verdict stands; a retry
+/// is judged again) and counts it as an eviction, then settles to what remains.
+fn settle_after_conflict(state: &mut ShardState, green_id: DbVolumeId, increment: &[u8; 32]) {
+  if crate::merge_service::settle_green_retention(state, green_id).is_err() {
+    if let Some(engine) = state.greens.get_mut(&green_id) {
+      engine.forget_rejected(increment);
+    }
+    let _ = crate::merge_service::settle_green_retention(state, green_id);
   }
 }
 
@@ -3473,6 +3507,9 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
         w.content = files;
         w.journal = journal;
       }
+      // The work's base rose, so the reachable floor may have: fold the green's histories to it and
+      // credit the retention released (a settle after a rise only credits).
+      let _ = crate::merge_service::settle_green_retention(state, green_id);
       ReplyBody::Rebased {
         version: Some(version),
         conflicts: Vec::new(),
@@ -5365,7 +5402,12 @@ fn rebuild_green(state: &mut ShardState, record: &VolumeRecord) {
       }
     }
   }
+  green.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
   state.greens.insert(record.id, green);
+  // The replay rebuilt every history in full; the recovered works are reset to the head and a green's
+  // attachments are reconciled out at boot, so nothing reachable lies below the head: fold to it and
+  // re-take the retention the remaining histories hold, ahead of new claims (§4.2 recovery order).
+  let _ = crate::merge_service::settle_green_retention(state, record.id);
 }
 
 /// Rebuilds a recovered work volume as a fresh clone of its green's current head (§4.16): a work's

@@ -1232,6 +1232,14 @@ retention: AUD-11–14/-16 (GAP-A9-14/-1/-7); SWIM indirect probes, call cancell
 handshake bounds: AUD-15/-17/-18 (GAP-A9-7/-4/-11). These are source findings and proposed
 regression scenarios at the audit baseline.
 
+**Implementation follow-up (2026-09-18, AUD-16 closed):** the merge engine's rejected-result
+cache is bounded in bytes by the derived green-chain cap (oldest evicted first, counted; an evicted
+retry is judged again), its retained content history is accounted, folded oldest-first only as far as the retention
+budget needs (never past the oldest version a live reader names) and charged to the shard's
+budget as retention — secured before the verdict,
+refused typed, settled after — with `charged == history + rejected` asserted by use:
+`docs/bugs/2026-09-18-merge-rejected-results-and-retained-copies-unbounded.md`.
+
 **Implementation follow-up (2026-09-18, AUD-06 closed):** a transaction whose record cannot be
 made durable is rolled back — the partition re-derived from the segment's durable state, so the
 effects and the completion record are gone together and a same-id retry re-executes instead of

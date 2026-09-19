@@ -1340,6 +1340,23 @@ impl Daemon {
     })
   }
 
+  /// What `green` holds in memory beyond its durable chain and what it has charged the shard's budget
+  /// for it (§4.2 all-cost admission, §4.16; AUD-16): the current files, the content history retained
+  /// for reconstruction (as the engine's running total and recounted from the histories — the balance a
+  /// test asserts), the rejected-result cache's bytes, entries and evictions, the retention charge, and
+  /// the fold floor. Runs a one-shot question on the green's owner shard; the typed refusal when it
+  /// could not be observed.
+  pub fn merge_retention(
+    &self,
+    green: slates_ipc::protocol::VolumeId,
+  ) -> Result<crate::merge_service::MergeRetention, ObserveError> {
+    let object = slates_db::register::ObjectId(green.bytes);
+    let volume = slates_db::catalog::VolumeId { bytes: green.bytes };
+    self.observe(self.shard_of_object(object), move |s| {
+      crate::merge_service::merge_retention(s, volume)
+    })
+  }
+
   /// Test support: injects a merge-plane fault on this node's control shard (§4.16; never reachable
   /// from the wire): refuse every content put while set, so an owner's merge record must wait for its
   /// inputs to place; or corrupt the next inputs a record is recomputed from, so the recomputation
@@ -1857,6 +1874,7 @@ fn init_shard(
     probe_windows: crate::fleet::ProbeWindows::default(),
     indirect: crate::fleet::IndirectProbes::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),
+    green_retention: std::collections::BTreeMap::new(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
     council,

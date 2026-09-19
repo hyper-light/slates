@@ -270,6 +270,13 @@ pub struct ShardState {
   /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
   /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.
   pub works: BTreeMap<VolumeId, WorkState>,
+  /// The bytes each green's **retention** — its content history beyond the current files and its
+  /// rejected-result cache (`Green::retained_bytes`) — has charged to the shard's budget
+  /// (`ShardBudget::charge_retention`; §4.2 all-cost admission; AUD-16). The credit authority: a
+  /// green never credits more than it charged, and the settle after every submit, fold, pin move and
+  /// work retirement moves this to exactly what the engine holds. Balanced by construction; bounded
+  /// by the greens.
+  pub green_retention: BTreeMap<VolumeId, u64>,
   /// The merge plane's service state (§4.16, `crate::merge_service`): version-pinned green
   /// attachments, and the fleet's pending merge records and holder replicas.
   pub merge: crate::merge_service::MergeShardState,

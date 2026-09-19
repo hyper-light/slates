@@ -6,6 +6,8 @@
 //! identical, namespace changes (create, unlink, mkdir, rmdir, mode, symlink, hard link, rename,
 //! xattr) merge per path with their conflict classes, several dimensions merge on one path in one
 //! increment, a directory move merges as its child ops, and retries are idempotent by identity.
+// Test harness code: an unwrap or a panic in a helper is a failed test, which is what it should be.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod common;
 
@@ -842,4 +844,223 @@ proptest! {
       prop_assert_eq!(volume.content("f").unwrap(), expected.as_slice());
     }
   }
+}
+
+/// Shape: a large file the small-edit history amplification is measured on — 64 KiB, so each edit's
+/// retained full copy is visible in whole kibibytes against the few bytes the edit itself carries.
+const LARGE_FILE_BYTES: usize = 64 * 1024;
+/// Shape: how many small edits are applied to it.
+const SMALL_EDITS: u64 = 8;
+/// Shape: the rejected-result cache budget the conflict flood is bounded by — room for a few
+/// windows on a short path, so the flood reaches the bound in a handful of submissions.
+const REJECTED_BUDGET_BYTES: usize = 256;
+/// Shape: how many distinct conflicting increments the flood submits, several times the budget's worth.
+const CONFLICT_FLOOD: u8 = 40;
+
+/// A distinct increment identity for the `n`th conflicting submission.
+fn flood_id(n: u8) -> [u8; 32] {
+  let mut id = [0xC0u8; 32];
+  id[0] = n;
+  id
+}
+
+/// §4.2 bounded growth, §4.16 (AUD-16): a flood of distinct increments that all conflict against an
+/// old base grows the rejected-result cache only to its byte budget — the oldest results are evicted
+/// first, every eviction is counted, the running byte total never exceeds the budget and is balanced
+/// (each retained entry's bytes are what the cache holds) — while the accepted history stays fixed
+/// (the head does not move). A retry of a result still retained is served from the cache; a retry of
+/// an evicted one is judged again and reaches the same verdict. Non-vacuous: evictions happened.
+#[test]
+fn a_conflict_flood_reaches_the_rejected_result_bound_with_balanced_accounting() {
+  let mut green = Green::new();
+  green.set_rejected_budget(REJECTED_BUDGET_BYTES);
+  green.submit(&Build::new().create("f", b"....................").at(1, 0));
+  // Version 2 changes the range every flood increment will also change, from the old base 1.
+  assert_eq!(
+    green.submit(&Build::new().overwrite("f", 0, b"AAAA").at(2, 1)),
+    Outcome::Accepted { version: 2 }
+  );
+  let head = green.head();
+  let first = flood_conflicts(&mut green);
+  let (entries, bytes, evicted) = green.rejected_cache();
+  assert!(
+    evicted >= 1 && u64::from(CONFLICT_FLOOD) == u64::try_from(entries).unwrap() + evicted,
+    "the flood was bounded by eviction: {entries} retained + {evicted} evicted = {CONFLICT_FLOOD}"
+  );
+  assert_eq!(
+    (green.head(), green.retained_bytes().rejected),
+    (head, bytes),
+    "the accepted history is fixed (nothing was committed) and the one running total is reported consistently"
+  );
+  assert_retry_semantics(&mut green, &first);
+}
+
+/// The flood increment `n`: the same four-byte overwrite of the range version 2 changed, from the
+/// old base 1, under its own identity.
+fn flood_increment(n: u8) -> slates_merge::engine::Increment {
+  Build::new()
+    .overwrite("f", 0, &[b'B' + (n % 20), b'x', b'y', b'z'])
+    .with_id(flood_id(n), 1)
+}
+
+/// Submits the whole conflict flood, asserting after each that it conflicted and that the cache stayed
+/// within its budget with at least one entry; returns the first conflict's outcome.
+fn flood_conflicts(green: &mut Green) -> Outcome {
+  let mut first = None;
+  for n in 0..CONFLICT_FLOOD {
+    let outcome = green.submit(&flood_increment(n));
+    assert!(
+      matches!(outcome, Outcome::Conflict { .. }),
+      "flood increment {n} conflicts with version 2: {outcome:?}"
+    );
+    let (entries, bytes, _) = green.rejected_cache();
+    assert!(
+      bytes <= REJECTED_BUDGET_BYTES && entries >= 1,
+      "after {n}: {entries} entries, {bytes} bytes within the {REJECTED_BUDGET_BYTES}-byte budget"
+    );
+    first.get_or_insert(outcome);
+  }
+  first.expect("the flood submitted at least one increment")
+}
+
+/// The retry semantics after the flood: the oldest result was evicted, so its retry is judged again
+/// (the same deterministic verdict) and re-enters the bounded cache; the newest is still retained,
+/// so its retry is served from the cache with the cache unchanged.
+fn assert_retry_semantics(green: &mut Green, first: &Outcome) {
+  let (before_entries, _, before_evicted) = green.rejected_cache();
+  assert_eq!(
+    &green.submit(&flood_increment(0)),
+    first,
+    "the same deterministic verdict"
+  );
+  let (after_entries, _, after_evicted) = green.rejected_cache();
+  assert!(
+    after_evicted >= before_evicted && after_entries <= before_entries.max(1),
+    "re-judging the evicted result re-entered the bounded cache (evicting the oldest again if full)"
+  );
+  let cache_before = green.rejected_cache();
+  let _ = green.submit(&flood_increment(CONFLICT_FLOOD - 1));
+  assert_eq!(
+    green.rejected_cache(),
+    cache_before,
+    "a retained result is served from the cache: nothing evicted, nothing added"
+  );
+}
+
+/// §4.2 all-cost admission, §4.16 "delta retention before folding" (AUD-16): small edits to a large
+/// file retain a full copy of the file per edit — **measured** here: after `SMALL_EDITS` four-byte
+/// overwrites of a 64 KiB file the content history holds one 64 KiB copy per superseded version, the
+/// engine's running total equals the recount, and every version still reconstructs. Folding the
+/// histories to the head releases every copy no reader can name (the running total and the recount
+/// agree at zero), keeps the current file exactly, and keeps a version at or above the floor
+/// reconstructible; folding to a lower floor keeps the one copy in effect there.
+#[test]
+fn small_edits_to_a_large_file_are_charged_as_retained_history_and_fold_below_the_floor() {
+  let mut green = Green::new();
+  let large = vec![b'.'; LARGE_FILE_BYTES];
+  green.submit(&Build::new().create("big", &large).at(1, 0));
+  assert_eq!(
+    green.retained_bytes().history,
+    0,
+    "the current file is content, not history"
+  );
+  apply_small_edits(&mut green);
+  assert_amplified(&green);
+  let head = green.head();
+  assert_fold_bounded_by_the_reachable_floor(&mut green, head);
+  assert_fold_to_head(&mut green, head);
+}
+
+/// Folding is budget-driven and floor-bounded: under an ample budget nothing folds (an earlier
+/// version can still be re-pinned); under a budget of five copies with a live reader at version 3 the
+/// oldest copies go one version at a time until the floor binds — six copies remain, balanced, and
+/// versions at or above 3 still reconstruct.
+fn assert_fold_bounded_by_the_reachable_floor(green: &mut Green, head: u64) {
+  let copies = usize::try_from(SMALL_EDITS).unwrap();
+  assert_eq!(
+    (
+      green.fold_history_to_budget(3, copies * LARGE_FILE_BYTES),
+      green.folded_below()
+    ),
+    (0, 0),
+    "an ample budget folds nothing: every version stays reconstructible"
+  );
+  let released = green.fold_history_to_budget(3, (copies - 3) * LARGE_FILE_BYTES);
+  assert_eq!(
+    (
+      released,
+      green.folded_below(),
+      green.retained_bytes().history
+    ),
+    (2 * LARGE_FILE_BYTES, 3, (copies - 2) * LARGE_FILE_BYTES),
+    "the two copies below the reader's version were released, then the floor bound the fold above \
+     the budget"
+  );
+  assert_eq!(
+    green.retained_bytes().history,
+    green.history_bytes_recounted(),
+    "balanced after the fold"
+  );
+  let at_three = green.content_at("big", 3).expect("the floor reconstructs");
+  assert_eq!(&at_three[..16], b"EDIT....EDIT....");
+  assert_eq!(
+    green.content_at("big", head).as_deref(),
+    green.content("big")
+  );
+}
+
+/// Applies `SMALL_EDITS` four-byte overwrites to `big`, each based on the head it found, each accepted.
+fn apply_small_edits(green: &mut Green) {
+  for edit in 0..SMALL_EDITS {
+    let base = green.head();
+    let outcome = green.submit(
+      &Build::new()
+        .overwrite("big", edit * 8, b"EDIT")
+        .with_id(flood_id(u8::try_from(edit).unwrap()), base),
+    );
+    assert_eq!(outcome, Outcome::Accepted { version: base + 1 });
+  }
+}
+
+/// The measured amplification: one full copy of the superseded file per small edit, the running
+/// total equal to the recount, the current file held once, and an early version reconstructing.
+fn assert_amplified(green: &Green) {
+  let retained = green.retained_bytes();
+  assert_eq!(
+    (retained.history, retained.content),
+    (
+      usize::try_from(SMALL_EDITS).unwrap() * LARGE_FILE_BYTES,
+      LARGE_FILE_BYTES
+    ),
+    "each small edit retained a full copy of the superseded file (the measured amplification); the \
+     current file once"
+  );
+  assert_eq!(
+    retained.history,
+    green.history_bytes_recounted(),
+    "the running total is what the histories hold"
+  );
+  let at_two = green.content_at("big", 2).expect("version 2 reconstructs");
+  assert_eq!(
+    &at_two[..8],
+    b"EDIT....",
+    "version 2 holds the first edit only"
+  );
+}
+
+/// With no reader below the head and no budget at all, folding releases every retained copy, keeps
+/// the current file exactly, and is idempotent.
+fn assert_fold_to_head(green: &mut Green, head: u64) {
+  let released = green.fold_history_to_budget(head, 0);
+  assert!(released > 0, "something was left to release");
+  assert_eq!(
+    (
+      green.retained_bytes().history,
+      green.history_bytes_recounted(),
+      green.content("big").map(|bytes| bytes.len())
+    ),
+    (0, 0, Some(LARGE_FILE_BYTES)),
+    "nothing is retained beyond the current file, which is untouched"
+  );
+  assert_eq!(green.fold_history_to_budget(head, 0), 0, "idempotent");
 }

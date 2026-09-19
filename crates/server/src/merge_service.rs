@@ -89,6 +89,157 @@ pub struct PinnedAttachment {
   pub version: u64,
 }
 
+/// Derived: the bytes a green's **rejected-result cache** may hold (§4.16; AUD-16) — the partition's
+/// green-chain byte cap (`PartitionCaps::green_chain_bytes`), the one merge byte bound §4.2's
+/// admission gives a shard: the cache of refused verdicts may hold at most what the durable chain of
+/// accepted ones may, so a conflict flood is bounded by the same derived number that bounds the chain
+/// and never by a second constant. Set on the engine when a green is created and when it is rebuilt.
+pub(crate) fn rejected_cache_budget(state: &ShardState) -> usize {
+  state.db.partition().caps().green_chain_bytes
+}
+
+/// The oldest version a live reader of `green` can still name — a work's base (it composes and
+/// rebases against that version) or a pinned attachment (it reads at it) — or the head when there is
+/// none: the floor the engine's histories are folded to (§4.16 "delta retention before folding").
+/// Never past the head.
+pub(crate) fn reachable_floor(state: &ShardState, green: DbVolumeId) -> u64 {
+  let head = state.greens.get(&green).map_or(0, Green::head);
+  let work_bases = state
+    .works
+    .values()
+    .filter(|work| work.green == green)
+    .map(|work| work.base_version);
+  let pins = state
+    .merge
+    .attachments
+    .values()
+    .filter(|pin| pin.green == green)
+    .map(|pin| pin.version);
+  work_bases.chain(pins).min().unwrap_or(head).min(head)
+}
+
+/// Folds `green`'s histories to the reachable floor and **settles** its retention charge to exactly
+/// what the engine then holds beyond its current files — the content history and the rejected-result
+/// cache (`Green::retained_bytes`) — against the shard's budget (§4.2 all-cost admission: retention
+/// charged by the retaining operation; AUD-16). The difference from what the green last charged is
+/// charged (`ShardBudget::charge_retention`) or credited (`credit_retention`); the green's charge
+/// (`ShardState::green_retention`) is the credit authority, so the accounting balances by
+/// construction. `Err(available)` when the budget cannot cover a charge — nothing is then changed
+/// but the fold, which only releases.
+pub(crate) fn settle_green_retention(state: &mut ShardState, green: DbVolumeId) -> Result<(), u64> {
+  let floor = reachable_floor(state, green);
+  let budget = rejected_cache_budget(state);
+  let Some(engine) = state.greens.get_mut(&green) else {
+    return Ok(());
+  };
+  // Oldest-first, only as far as the retention budget needs (the same derived cap the rejected
+  // cache is bounded by: one merge byte bound per green), never past a live reader's version.
+  engine.fold_history_to_budget(floor, budget);
+  let retained = engine.retained_bytes();
+  let wanted =
+    u64::try_from(retained.history.saturating_add(retained.rejected)).unwrap_or(u64::MAX);
+  let charged = state.green_retention.get(&green).copied().unwrap_or(0);
+  if wanted > charged {
+    state
+      .store
+      .budget
+      .charge_retention(wanted - charged)
+      .map_err(|e| match e {
+        slates_mem::MemError::BudgetExceeded { available, .. } => available,
+        _ => 0,
+      })?;
+  } else if wanted < charged {
+    state.store.budget.credit_retention(charged - wanted);
+  }
+  state.green_retention.insert(green, wanted);
+  Ok(())
+}
+
+/// Secures `bytes` of retention for `green` ahead of a verdict (A-16: the charge is taken **before**
+/// the mutation, so a refused charge changes nothing): charged to the shard's budget and recorded on
+/// the green's charge, which the settle after the verdict trues up — crediting what the commit did
+/// not retain. `Err(available)` when the budget cannot cover it.
+pub(crate) fn secure_green_retention(
+  state: &mut ShardState,
+  green: DbVolumeId,
+  bytes: u64,
+) -> Result<(), u64> {
+  if bytes == 0 {
+    return Ok(());
+  }
+  // The green's own retention cap (the derived merge byte bound) is the first gate: what the settle
+  // could not fold under it — history live readers still name — plus this claim must fit, else the
+  // claim is refused with the room left. The shard's budget is the second.
+  let cap = u64::try_from(rejected_cache_budget(state)).unwrap_or(u64::MAX);
+  let charged = state.green_retention.get(&green).copied().unwrap_or(0);
+  if charged.saturating_add(bytes) > cap {
+    return Err(cap.saturating_sub(charged));
+  }
+  state
+    .store
+    .budget
+    .charge_retention(bytes)
+    .map_err(|e| match e {
+      slates_mem::MemError::BudgetExceeded { available, .. } => available,
+      _ => 0,
+    })?;
+  let charged = state.green_retention.entry(green).or_insert(0);
+  *charged = charged.saturating_add(bytes);
+  Ok(())
+}
+
+/// Credits everything `green` charged as retention (its destroy): the budget gets the bytes back and
+/// the green's charge is forgotten.
+pub(crate) fn release_green_retention(state: &mut ShardState, green: DbVolumeId) {
+  if let Some(charged) = state.green_retention.remove(&green) {
+    state.store.budget.credit_retention(charged);
+  }
+}
+
+/// What a green holds in memory beyond its durable chain and what it has charged for it
+/// (`Daemon::merge_retention`; AUD-16): the engine's retained bytes, the charge on the shard's budget,
+/// the fold floor, and the rejected-result cache's entries and evictions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MergeRetention {
+  /// The current files' bytes.
+  pub content: u64,
+  /// The content history retained beyond the current files, as the engine's running total.
+  pub history: u64,
+  /// The same, recounted from the histories (the balance check).
+  pub history_recounted: u64,
+  /// The rejected-result cache's bytes.
+  pub rejected: u64,
+  /// The bytes the green has charged to the shard's budget as retention.
+  pub charged: u64,
+  /// The version below which the histories are folded.
+  pub folded_below: u64,
+  /// The rejected-result cache's entries.
+  pub rejected_entries: u64,
+  /// Rejected results evicted or never retained for want of budget.
+  pub rejected_evicted: u64,
+}
+
+/// [`MergeRetention`] of `green` on this shard; the default (all zero) for a green this shard does not
+/// own.
+pub(crate) fn merge_retention(state: &ShardState, green: DbVolumeId) -> MergeRetention {
+  let Some(engine) = state.greens.get(&green) else {
+    return MergeRetention::default();
+  };
+  let retained = engine.retained_bytes();
+  let (entries, _, evicted) = engine.rejected_cache();
+  let as_u64 = |bytes: usize| u64::try_from(bytes).unwrap_or(u64::MAX);
+  MergeRetention {
+    content: as_u64(retained.content),
+    history: as_u64(retained.history),
+    history_recounted: as_u64(engine.history_bytes_recounted()),
+    rejected: as_u64(retained.rejected),
+    charged: state.green_retention.get(&green).copied().unwrap_or(0),
+    folded_below: engine.folded_below(),
+    rejected_entries: as_u64(entries),
+    rejected_evicted: evicted,
+  }
+}
+
 /// A volume's merge role as the catalog records it (§4.4 `Role`); `None` for a plain volume or
 /// one with no record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -411,7 +562,11 @@ pub(crate) fn attach_green(
 
 /// Drops the pin an attachment held (its detach, or a destroy of its green).
 pub(crate) fn forget_attachment(state: &mut ShardState, attachment: u64) {
-  state.merge.attachments.remove(&attachment);
+  if let Some(pin) = state.merge.attachments.remove(&attachment) {
+    // The pin may have been the oldest reachable version: fold the green's histories to the new
+    // floor and credit what that releases (a settle after a pin goes only credits).
+    let _ = settle_green_retention(state, pin.green);
+  }
 }
 
 /// `advance(attachment, version?)` (§4.16): re-pins a green attachment to `version`, or to the
@@ -442,7 +597,10 @@ pub(crate) fn advance(
     });
   };
   let target = version.unwrap_or_else(|| engine.head());
-  if target > engine.head() {
+  // Past the head, or below the fold floor — a version whose history no live reader could name, so
+  // it was folded away (§4.16 "delta retention before folding"; AUD-16) — is not reconstructible:
+  // refused as an unknown base rather than served from the value in effect at the floor.
+  if target > engine.head() || target < engine.folded_below() {
     return refused(Refusal::UnknownBase {
       green: wire_id(pin.green),
       version: target,
@@ -461,6 +619,8 @@ pub(crate) fn advance(
       version: target,
     },
   );
+  // A move up may raise the reachable floor: fold and credit what that releases.
+  let _ = settle_green_retention(state, pin.green);
   ReplyBody::Advanced {
     version: target,
     invalidated,
@@ -635,9 +795,14 @@ pub(crate) fn destroy_merge_volume(
       return Some(refused(refusal_of_db(&e)));
     }
   }
-  state.works.remove(&id);
+  // A retired work may have held the oldest reachable version of its green: fold and credit. A
+  // destroyed green credits everything it charged as retention.
+  if let Some(work) = state.works.remove(&id) {
+    let _ = settle_green_retention(state, work.green);
+  }
   if state.greens.remove(&id).is_some() {
     state.merge.attachments.retain(|_, pin| pin.green != id);
+    release_green_retention(state, id);
   }
   Some(ReplyBody::Destroyed)
 }

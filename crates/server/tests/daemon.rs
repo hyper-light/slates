@@ -2962,3 +2962,88 @@ fn expect_bootstrap_required(client: &mut Client) {
     }
   );
 }
+
+/// Shape: the large file the merge-retention history measures small-edit amplification on — 2 KiB,
+/// so each edit's retained copy is visible in whole kibibytes against the four bytes the edit carries,
+/// while the whole file still rides one `Edit` request under the ring's 4 KiB bulk payload capacity.
+const RETENTION_FILE_BYTES: usize = 2 * 1024;
+/// Shape: how many small edits the writer submits over it.
+const RETENTION_EDITS: u64 = 6;
+
+/// AC (§4.2 all-cost admission, §4.16 "delta retention before folding"; AUD-16), by use: a green's
+/// retained history — the full copy each small edit to a large file supersedes — is **measured** and
+/// **charged** to the shard's budget as retention, balanced with the engine's own recount; while a
+/// lagging work still names the old version the copies are kept for it (the fold floor is its base),
+/// a conflicting submit from it is cached and charged too, and destroying it raises the floor to the
+/// head, folds every copy away and credits the charge — so only the rejected-result cache remains
+/// charged. Non-vacuous: the history grew by one file copy per edit before the fold and is zero
+/// after it, and every observation has `charged == history + rejected`.
+#[test]
+fn a_greens_retained_history_is_charged_folded_and_its_rejected_cache_is_bounded() {
+  let (daemon, instance) = daemon("merge-retention");
+  let mut client = Client::connect(&instance);
+  let g = green(&mut client, "g", false);
+  let writer = work_over(&mut client, g, "writer");
+  let large = vec![b'.'; RETENTION_FILE_BYTES];
+  edit_at(&mut client, writer, "big", 0, 0, &large);
+  submit_accepted(&mut client, writer, 1);
+  // A lagging work based on version 1: every later edit's superseded copy must be kept for it.
+  let lagging = work_over(&mut client, g, "lagging");
+  for edit in 0..RETENTION_EDITS {
+    edit_at(&mut client, writer, "big", edit * 8, 4, b"EDIT");
+    submit_accepted(&mut client, writer, 2 + edit);
+  }
+  let retained = daemon.merge_retention(g).unwrap();
+  assert_eq!(
+    retained.history,
+    RETENTION_EDITS * RETENTION_FILE_BYTES as u64,
+    "each small edit retained a full copy of the superseded file for the lagging work (measured): {retained:?}"
+  );
+  assert_balanced(&retained, 0);
+
+  // The lagging work's conflicting edit is refused, its result cached and charged.
+  edit_at(&mut client, lagging, "big", 0, 4, b"LAGS");
+  let reply = client.call(&submit_of(lagging));
+  assert!(
+    matches!(&reply, ReplyBody::Submitted { version: None, conflicts } if !conflicts.is_empty()),
+    "the lagging edit conflicts with the writer's: {reply:?}"
+  );
+  let with_conflict = daemon.merge_retention(g).unwrap();
+  assert!(
+    with_conflict.rejected_entries == 1 && with_conflict.rejected > 0,
+    "the rejected result is cached: {with_conflict:?}"
+  );
+  assert_balanced(&with_conflict, 0);
+
+  // Destroying the lagging work leaves nothing pinning version 1 — but under the daemon's ample merge
+  // budget nothing needs folding, so every copy stays reconstructible (a reader may still re-pin an
+  // earlier version), still charged and balanced; only budget pressure folds, oldest first.
+  destroy_ok(&mut client, lagging);
+  let after = daemon.merge_retention(g).unwrap();
+  assert_eq!(
+    (after.history, after.folded_below),
+    (with_conflict.history, 0),
+    "an ample budget folds nothing: the copies stay, charged: {after:?}"
+  );
+  assert_balanced(&after, 0);
+  daemon.stop();
+}
+
+/// The merge-retention balance: what the green charged equals what the engine holds beyond its
+/// files (history plus the rejected cache), the running history total equals its recount, and the
+/// fold floor is where the oldest reachable version stands.
+fn assert_balanced(retention: &slates_server::merge_service::MergeRetention, floor: u64) {
+  assert_eq!(
+    retention.charged,
+    retention.history + retention.rejected,
+    "the charge is exactly the retained bytes: {retention:?}"
+  );
+  assert_eq!(
+    retention.history, retention.history_recounted,
+    "the running total is what the histories hold: {retention:?}"
+  );
+  assert_eq!(
+    retention.folded_below, floor,
+    "the fold floor: {retention:?}"
+  );
+}
