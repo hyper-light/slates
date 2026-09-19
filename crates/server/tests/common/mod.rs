@@ -3,5 +3,6 @@
 #![allow(dead_code)]
 
 pub(crate) mod nfs;
+pub(crate) mod target;
 pub(crate) mod trace;
 pub(crate) mod wait;

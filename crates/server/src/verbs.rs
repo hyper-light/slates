@@ -279,6 +279,22 @@ pub fn owner_of_landing(id: u64) -> u16 {
   u16::try_from(id >> LANDING_PARTITION_SHIFT).unwrap_or(0)
 }
 
+/// Format: the low 48 bits of a landing id — its per-partition counter (the bits below
+/// `LANDING_PARTITION_SHIFT`).
+const LANDING_COUNTER_MASK: u64 = (1 << LANDING_PARTITION_SHIFT) - 1;
+
+/// The landing counter a shard boots with: one past the highest counter among the partition's recovered
+/// landing records (durable, §4.8; the guard refuses a duplicate id), or 1 for a partition holding none.
+/// Without this a restarted daemon minted from 1 again, and the next `land` after the restart met a
+/// recovered record's id and was refused `AlreadyExists` — once per recovered landing, since each
+/// refusal still advanced the counter
+/// (`docs/bugs/2026-09-19-landing-counter-restarts-at-one-after-a-restart.md`).
+pub(crate) fn next_landing_counter(partition: &Partition) -> u64 {
+  partition
+    .highest_landing()
+    .map_or(1, |id| (id & LANDING_COUNTER_MASK).saturating_add(1))
+}
+
 /// The volume a request is about, when it is about one.
 fn volume_of(body: &RequestBody) -> Option<VolumeId> {
   match body {

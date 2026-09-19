@@ -1250,6 +1250,14 @@ crash point) and the live kernel-mount CLI flow.
 `docs/bugs/2026-09-19-nfs-bypasses-consumer-and-volume-authorization.md`,
 `docs/bugs/2026-09-19-mount-capability-attachment-dies-with-its-client-and-the-daemon.md`.
 
+**Implementation follow-up (2026-09-19, a recovery sibling of AUD-01):** the landing counter
+(`LandingState::next_landing`) restarted at 1 on every boot while landing records are durable and
+guarded against a duplicate id, so after a restart the next `land` was refused `AlreadyExists` once
+per recovered record. The counter now boots past the partition's recovered landings
+(`verbs::next_landing_counter`), as the attachment counter does; proven failing-first across a restart
+over one anchor segment (`crates/server/tests/recovery.rs`).
+`docs/bugs/2026-09-19-landing-counter-restarts-at-one-after-a-restart.md`.
+
 **Implementation follow-up (2026-09-19, AUD-08 closed):** latest-state service is now fenced by a
 confirmed **owner lease** (`crates/server/src/lease.rs`). An owner serves an object's live head,
 head version, status, change list or mounted tree only while `f` of the object's other candidate

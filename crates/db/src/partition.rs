@@ -349,6 +349,13 @@ impl Partition {
     self.landings.get(&id)
   }
 
+  /// The highest landing id the partition holds, or `None` when it holds none — asked once at boot, so
+  /// a fresh counter never re-mints a recovered landing's id (the records are durable and the guard
+  /// refuses a duplicate).
+  pub fn highest_landing(&self) -> Option<u64> {
+    self.landings.keys().next_back().copied()
+  }
+
   /// The audit records retained in memory (the ring is the durable stream).
   pub fn audit(&self) -> &[AuditRecord] {
     &self.audit

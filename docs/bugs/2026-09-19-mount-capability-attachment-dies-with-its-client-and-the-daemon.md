@@ -95,3 +95,7 @@ a mount).
   restarted daemon's next attach mints an id an attachment kept across the restart may already hold;
   the guard refuses it typed (`AlreadyExists`) instead of minting past it. Fixed here: the counter is
   seeded past every recovered attachment of the partition at boot.
+- The landing counter (`LandingState::next_landing`) had the same shape — landing records are durable
+  and guarded, the counter restarted at 1 — so after a restart the next landings were refused, one per
+  recovered record. Found here, fixed as its own change:
+  `2026-09-19-landing-counter-restarts-at-one-after-a-restart.md`.

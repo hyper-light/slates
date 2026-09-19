@@ -2010,6 +2010,9 @@ fn init_shard(
     pending_materializations: std::collections::BTreeMap::new(),
     pending_green_materializations: std::collections::BTreeMap::new(),
   };
+  // The landing counter starts past every landing recovered with the partition (its records are
+  // durable and the guard refuses a duplicate id), as the attachment counter does.
+  state.landing.next_landing = verbs::next_landing_counter(state.db.partition());
   if let Some(retained) = retained {
     retained.restore(&mut state)?;
   }

@@ -22,8 +22,10 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use slates_anchor::{AnchorSegment, RegionKind};
-use slates_client::{Client, ClientError, CreateSpec, Deadlines, NamePolicy, SizeClass, VolumeId};
-use slates_ipc::protocol::{ReplyBody, RequestBody};
+use slates_client::{
+  Client, ClientError, CreateSpec, Deadlines, NamePolicy, SizeClass, SnapshotId, VolumeId,
+};
+use slates_ipc::protocol::{Filter, ReplyBody, RequestBody};
 use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 use slates_wire::request::RequestId;
@@ -728,6 +730,63 @@ fn run_crash_point(profile: &MachineProfile, reference: &Observed, k: usize, cra
   drop(stream);
   second.stop();
   drop(segment);
+}
+
+// ----------------------------------------------------------- the landing counter across a restart
+
+/// AC-2.12 (§4.8 recovery; §4.15 landings): a landing presented before a restart does not block the
+/// first landing after it. The first daemon presents a landing (no grant — `GrantRequired`, its record
+/// durable); a second daemon over the same segment presents another — it must be `GrantRequired` under
+/// a **new** landing id, not refused: the landing counter boots past the recovered records
+/// (`docs/bugs/2026-09-19-landing-counter-restarts-at-one-after-a-restart.md`). Non-vacuous: before
+/// the fix the second present re-minted the recovered record's id and was refused `AlreadyExists`.
+#[test]
+fn a_landing_presented_before_a_restart_does_not_block_the_first_landing_after_it() {
+  let profile = profile();
+  let instance = format!("srv-landctr-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let segment = anchor_segment("landctr", &profile, &config);
+  let target = common::target::target_dir();
+
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let kept = client.create(&scratch("kept")).unwrap();
+  let snapshot = client.snapshot(kept).unwrap();
+  let before = present_landing(&mut client, kept, snapshot, &target.path);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let after = present_landing(&mut client, kept, snapshot, &target.path);
+  assert_ne!(
+    after, before,
+    "the landing presented after the restart is a new landing, past the recovered record"
+  );
+  second.stop();
+  drop(target);
+  drop(segment);
+}
+
+/// Presents a landing of `snapshot` into `target` with no grant and returns its landing id — the
+/// `GrantRequired` reply; anything else (a refusal) is the failure the test names.
+fn present_landing(
+  client: &mut Client,
+  volume: VolumeId,
+  snapshot: SnapshotId,
+  target: &str,
+) -> u64 {
+  match client.call(&RequestBody::Land {
+    volume,
+    snapshot: Some(snapshot),
+    target: target.to_owned(),
+    filter: Filter::default(),
+    grant: None,
+  }) {
+    Ok(ReplyBody::GrantRequired { landing, .. }) => landing,
+    other => panic!("the landing was not presented: {other:?}"),
+  }
 }
 
 // ------------------------------------------------ clone pins and destroy completion across a restart
