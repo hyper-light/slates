@@ -1250,6 +1250,18 @@ crash point) and the live kernel-mount CLI flow.
 `docs/bugs/2026-09-19-nfs-bypasses-consumer-and-volume-authorization.md`,
 `docs/bugs/2026-09-19-mount-capability-attachment-dies-with-its-client-and-the-daemon.md`.
 
+**Conformance follow-up (2026-09-19, AUD-01 / GAP-A9-15):** the Linux root-NFS adapter now
+obtains a durable host-mount attachment and supplies its capability, matching the CLI. The
+adapter's actual export succeeds over the real daemon's NFS socket; teardown and an abandoned
+mount leave no attachment, and the old capability is refused. The regression passes on macOS
+(0.88 s) and Linux arm64 (1.13 s). The separate hermeticity startup failure is also reproduced:
+ordinary strace stopped the daemon even on unselected allocator calls. The same write filter
+with `--seccomp-bpf` allows startup; the live regression proves no startup restart and retained
+observation of real file mutations. Both regressions run in the Linux conformance lane before
+the mounted suites. Full mounted conformance remains pending. Records:
+`docs/bugs/2026-09-19-linux-conformance-mount-authority.md`,
+`docs/bugs/2026-09-19-hermeticity-tracer-stops-unselected-syscalls.md`.
+
 **Implementation follow-up (2026-09-19, AUD-02 closed; GAP-A9-3/-4's FUSE-coherence leg):** the
 FUSE serve loop delivers kernel invalidations at every wake — a kernel request or a `ChangeSignal`
 another mutation source notifies (an `eventfd` the loop `poll`s beside the device) — so a change made

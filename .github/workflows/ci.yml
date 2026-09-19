@@ -396,6 +396,11 @@ jobs:
       - name: Suite tools (macOS)
         if: runner.os == 'macOS'
         run: brew install ripgrep fswatch
+      - name: Linux mount authority and traced startup regressions
+        if: runner.os == 'Linux'
+        run: |
+          cargo build -p slates-cli
+          SLATES_TEST_BINARY="$GITHUB_WORKSPACE/target/debug/slates" cargo test -p xtask conformance:: -- --test-threads=1 --nocapture
       # `--keep` leaves the scratch in place so pjdfstest's per-file TAP output survives the run: the
       # expected-failure list's own header names this lane's root run as the review input, and the
       # summary record cannot say which assertion failed with what. The output directory is uploaded

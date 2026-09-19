@@ -36,9 +36,15 @@ const LANDED_ENTRIES: &[&str] = &["d", "d/f2", "f3", "link"];
 const MOUNT_WORKLOAD: &str = "printf 'one\\n' > f1 && mkdir d && printf 'two\\n' > d/f2 && ln -s f3 link && mv f1 f3 && chmod u=rw,go=r f3 && printf 'gone\\n' > tmp && rm tmp";
 
 /// The tracer's command prefix for the anchor on Linux.
-fn strace_prefix(log: &Path) -> Vec<String> {
+pub(super) fn strace_prefix(log: &Path) -> Vec<String> {
   vec![
     "strace".to_owned(),
+    // Select ptrace stops as well as output: stopping at every allocator syscall starved the
+    // first heartbeat in CI. The traced write set below remains unchanged (strace(1)).
+    "--seccomp-bpf".to_owned(),
+    // Anchor owns this tracer child. Its exit must end the anchor and daemon it supervises,
+    // including if the kernel cannot install the syscall filter (strace(1), PTRACE_O_EXITKILL).
+    "--kill-on-exit".to_owned(),
     "-f".to_owned(),
     "-y".to_owned(),
     "-qq".to_owned(),
@@ -285,7 +291,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     },
     command: match run.os {
       HostOs::Linux => format!(
-        "strace -f -y -qq -s 0 -o trace.log -e {STRACE_TRACE} -- slates --instance <i> anchor --quick --shards 2; then create, mount, `sh -c '{MOUNT_WORKLOAD}'`, snapshot, land, grant, land --grant"
+        "strace --seccomp-bpf --kill-on-exit -f -y -qq -s 0 -o trace.log -e {STRACE_TRACE} -- slates --instance <i> anchor --quick --shards 2; then create, mount, `sh -c '{MOUNT_WORKLOAD}'`, snapshot, land, grant, land --grant"
       ),
       _ => format!(
         "sudo fs_usage -w -f filesys -f network <daemon pid>; slates anchor/volume create/mount, `sh -c '{MOUNT_WORKLOAD}'`, snapshot, land, grant, land --grant"

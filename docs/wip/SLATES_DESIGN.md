@@ -2801,6 +2801,13 @@ that the current uid-based implementation enforces them.
 > it out of band. Records: `docs/bugs/2026-09-19-nfs-bypasses-consumer-and-volume-authorization.md`,
 > `docs/bugs/2026-09-19-mount-capability-attachment-dies-with-its-client-and-the-daemon.md`.
 
+> **Conformance adapter repair (2026-09-19).** The Linux root-NFS adapter also uses
+> `Client::attach_mount` and presents the returned capability. Its guard owns attachment
+> cleanup on both mount failure and unmount, and redacts helper errors. The socket regression
+> proves the adapter's source mounts and its revoked source is refused on both macOS and Linux;
+> this is authorization evidence, not a new claim of kernel-mount conformance. Record:
+> `docs/bugs/2026-09-19-linux-conformance-mount-authority.md`.
+
 *Content identity and sharing.* A chunk hash proves bytes, not permission to read them or ask
 whether they exist. Missing-set exchange, caches, archives and dedup obey the consumer's
 sharing scope and reference authorization; cross-scope existence and timing must not reveal
@@ -4728,6 +4735,12 @@ with the injection list; the benchmark write-up in the
    exceptions (the one-time mount-point directory on macOS; install-time files; entries inside a
    granted landing target while that landing runs, each matched to a `Written` outcome in the
    audit log).
+   **Harness status (2026-09-19):** the Linux conformance adapter uses
+   `strace --seccomp-bpf --kill-on-exit -f -y` with its existing filesystem-write syscall set.
+   Selective stops avoid pausing the daemon on unselected allocator calls before its first
+   heartbeat. A real-process regression checks startup without a restart and that file creates,
+   writes, renames and unlinks remain visible. This is not a replacement for the full mounted
+   lifecycle verdict (`docs/bugs/2026-09-19-hermeticity-tracer-stops-unselected-syscalls.md`).
 9. *Landing, concurrency.* Land a 500-entry delta into a tree while an outsider rewrites 50 of
    the targets at random moments. Expect: every outsider write that happened after validation is
    still on disk afterwards, every such entry is reported `Conflict(TargetInUse)` and remains in

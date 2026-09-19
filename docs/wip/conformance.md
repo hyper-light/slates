@@ -1,5 +1,17 @@
 # Transport conformance evidence (AC-9.7 / T-9.1; GAP-A9-15)
 
+> **Repair (2026-09-19).** The Linux root-NFS adapter now acquires a durable host-mount
+> attachment through `Client::attach_mount`, as the macOS CLI already does, and presents its
+> capability in the export path (§4.13, AUD-01). Its guard detaches after unmount or a failed
+> mount attempt; helper errors redact the token. The real-daemon socket regression passes on
+> macOS and Linux without a privileged mount. The failing CI job's separate traced-startup
+> timeout was caused by ptrace stops on unselected allocator syscalls. The tracer now uses
+> `--seccomp-bpf` with the same filesystem-write selection and explicit `--kill-on-exit`.
+> Its live Linux regression proves startup without a restart and observes real file mutations;
+> the Linux conformance lane runs both regressions before its mounted suites. Full mounted
+> results remain pending. Records: `docs/bugs/2026-09-19-linux-conformance-mount-authority.md`,
+> `docs/bugs/2026-09-19-hermeticity-tracer-stops-unselected-syscalls.md`.
+
 > **Status (2026-09-14).** The evidence surface exists and every cell of the matrix below has a
 > record: the harness (`cargo xtask conformance`, the I/O half) drives the real `slates` binary —
 > anchor, daemon, a provisioned volume, a real kernel mount — runs one named suite inside a bounded

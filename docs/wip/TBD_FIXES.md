@@ -79,6 +79,25 @@ Command (bounded Linux container, quantum image): `docker run --rm --network=non
 
 ## 3. Additional concrete follow-ups found during this repair
 
+- [ ] **Rendezvous wake amplification (2026-09-19).** A pending Linux listen socket remains
+  level-readable until the control shard accepts it. `doorbell::run` immediately polls again
+  and kicks every shard, even when its pending flag is already set. CI recorded about 8,000
+  eventfd writes before the first heartbeat kill. Coalesce readiness with an acknowledgement
+  or drain/rearm protocol that cannot lose a connection and does not busy-spin. Prove delayed
+  accept, a new connection during rearm, and prompt owned shutdown.
+- [ ] **Lease timer reservation at boot (2026-09-19).** `Partition::new` creates a wheel sized
+  for every possible volume; `Wheel::new` separately allocates every 64-entry segment. The
+  traced fixture derives 1,145,554 potential volumes per shard before any exist. Rework
+  reservation geometry or bounded preparation without moving allocation onto lease renewal;
+  preserve stale-handle refusal, cancellation and expiry. Record allocation counts and startup
+  cost. The conformance tracer repair does not fix this product cost.
+- [ ] **Kick descriptor close/borrow race (source review, 2026-09-19).** `KickFd::with` can read
+  `closed == false` before `close` sets it and mutates the `UnsafeCell<Option<OwnedFd>>`.
+  Joining the shard does not join arbitrary foreign kick callers. The flag alone neither
+  protects the borrow nor prevents a syscall on a reused descriptor. Remove the unsupported
+  unsafe Send/Sync ownership claim through a lifetime-safe design, and add a forced overlapping
+  close/kick regression. This review found the interleaving; it has not reproduced the race.
+
 - [x] **Terminal membership publication to other shards** — assessed, no correctness impact
   (2026-09-17). `fold_peer_state` ignores a refused cross-shard `run_on`, so a terminal death's
   fold can be dropped. But a review of every `.fleet.membership()` read shows **no off-control-shard
@@ -159,10 +178,12 @@ can lag subsequent implementations; use their acceptance criteria and current so
   job reported **6202 unexpected pjdfstest failures / 8798 cases**; correcting sudo invocation
   does not prove all failures were caused by it. Diagnose residual failures without widening
   expected-failure lists to hide them.
-- [ ] Rerun hermeticity startup/tracing with the shared boot clock. The original lane repeatedly
-  missed the first heartbeat and timed out after 60 s. The cross-process clock regression is
-  green, but the corrected full tracer run is still owed. Anchor format 3 intentionally rejects
-  incompatible format-2 retained state; record the upgrade constraint.
+- [ ] Rerun full mounted hermeticity after the 2026-09-19 tracer repair. The shared boot clock
+  alone did not fix startup: ordinary strace stopped even unselected allocator syscalls.
+  `--seccomp-bpf` retains the filesystem trace selection and permits first-heartbeat startup;
+  explicit `--kill-on-exit` ties tracee lifetime to the harness. The live Linux startup and
+  write-observation regression passes (1.37 s). Full mounted/landing evidence remains owed.
+  Anchor format 3 intentionally rejects incompatible format-2 retained state.
 - [ ] Rerun affected CI on the final committed source. Local Linux compilation and targeted
   histories supplement, but do not replace, platform-specific mounted/driver gates.
 - [ ] Rerun KIND whole-pod replacement on the final changes, including fresh IP, fresh voter,

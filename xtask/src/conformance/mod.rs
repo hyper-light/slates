@@ -25,6 +25,7 @@
 
 mod fetch;
 mod hermeticity;
+mod mount;
 mod slates;
 mod suites;
 mod workloads;

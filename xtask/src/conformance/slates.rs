@@ -26,7 +26,17 @@ const STABLE_STREAK: u32 = 10;
 /// Shape: shards for the harness's daemon, as the CLI test.
 const SHARDS: &str = "2";
 /// Shape: how long a mount gets to appear in the mount table.
-const MOUNT_WAIT: Duration = Duration::from_secs(20);
+pub(super) const MOUNT_WAIT: Duration = Duration::from_secs(20);
+
+/// Derived: mount control calls share the kernel-mount wait budget; reconnect may also span
+/// the harness's startup budget. Both are operational bounds already owned by this harness.
+pub(super) fn mount_deadlines() -> slates_client::Deadlines {
+  slates_client::Deadlines::derive(
+    u64::try_from(MOUNT_WAIT.as_nanos()).unwrap_or(u64::MAX),
+    u64::try_from(START_WAIT.as_nanos()).unwrap_or(u64::MAX),
+  )
+  .get()
+}
 /// Format: the anchor's stderr line naming the daemon it started.
 const DAEMON_PID_MARK: &str = "daemon pid ";
 /// Format: the environment variables carrying the anchor handoff (`slates_anchor::segment`).
@@ -381,6 +391,7 @@ enum MountMethod {
 pub(crate) struct Mount {
   path: PathBuf,
   method: MountMethod,
+  export: Option<super::mount::MountExport>,
 }
 
 impl Mount {
@@ -403,6 +414,7 @@ impl Drop for Mount {
           .output();
       }
     }
+    drop(self.export.take());
     let _ = Command::new("rmdir").arg(&self.path).output();
   }
 }
@@ -441,30 +453,41 @@ pub(crate) fn mount_volume(
       Mount {
         path: point,
         method: MountMethod::Slates,
+        export: None,
       }
     }
     HostOs::Linux => {
+      // Own cleanup before invoking the helper: a failed mount must not leave its durable
+      // attachment (or its write lease) behind. UMNT may already have detached it on success.
+      let mut mount = Mount {
+        path: point,
+        method: MountMethod::LinuxRoot,
+        export: None,
+      };
       let port = nfs_port(binary, instance, id)?;
+      let export = mount.export.insert(super::mount::MountExport::attach(
+        instance,
+        id,
+        name,
+        LINUX_NFS_SERVER,
+        mount_deadlines(),
+      )?);
       let options = format!("{LINUX_NFS_OPTIONS},port={port},mountport={port}");
       let output = Command::new("sudo")
         .args(["-n", "mount", "-t", "nfs", "-o", &options])
-        .arg(format!("{LINUX_NFS_SERVER}:/{name}"))
-        .arg(&point)
+        .arg(export.source())
+        .arg(&mount.path)
         .output()?;
       if !output.status.success() {
-        // Name the exact target and both streams: `mount.nfs` prints "mount system call failed" with
-        // no cause of its own, so record the command and its whole output for the next diagnosis.
+        // Keep the helper's diagnosis, redacting the bearer capability it may echo.
         return Err(Failure(format!(
           "sudo mount -t nfs -o {options} {LINUX_NFS_SERVER}:/{name} failed ({}): {}{}",
           output.status,
-          String::from_utf8_lossy(&output.stdout),
-          String::from_utf8_lossy(&output.stderr)
+          export.redact(&output.stdout),
+          export.redact(&output.stderr)
         )));
       }
-      Mount {
-        path: point,
-        method: MountMethod::LinuxRoot,
-      }
+      mount
     }
     HostOs::Windows => return Err(Failure("the harness has no WinFsp mount step".to_owned())),
   };
@@ -699,5 +722,100 @@ mod tests {
     assert_eq!(admitted_size(484_442_112), "346MiB");
     assert_eq!(admitted_size(0), "1MiB");
     assert_eq!(admitted_size(4 << 20), "3MiB");
+  }
+
+  /// AC-4.5/T-9.1: the hermeticity tracer permits the real daemon to reach its first heartbeat
+  /// and serve clients, and still records the RAM-object writes made during startup.
+  #[cfg(target_os = "linux")]
+  #[test]
+  #[allow(clippy::unwrap_used)]
+  #[allow(clippy::disallowed_methods)] // owned test scratch, verified tmpfs before creating it
+  fn the_hermeticity_tracer_allows_startup_and_observes_writes() {
+    use super::*;
+    use slates_conformance::trace::{Policy, judge, parse_strace_with_cwd};
+
+    let Some(binary) = std::env::var_os("SLATES_TEST_BINARY") else {
+      eprintln!(
+        "SKIP: set SLATES_TEST_BINARY to a built slates CLI for the real strace regression"
+      );
+      return;
+    };
+    if !tool_on_path("strace") {
+      eprintln!("SKIP: the hermeticity startup regression requires strace");
+      return;
+    }
+    let root = Path::new("/dev/shm");
+    // Format: TMPFS_MAGIC from Linux uapi/linux/magic.h; refuse a disk-backed test root.
+    assert_eq!(rustix::fs::statfs(root).unwrap().f_type, 0x0102_1994);
+    let instance = format!("conf-trace-test-{}", std::process::id());
+    let scratch = root.join(&instance);
+    std::fs::create_dir(&scratch).unwrap();
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+      fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+          eprintln!("trace regression scratch cleanup: {error}");
+        }
+      }
+    }
+    let scratch = Scratch(scratch);
+    let trace = scratch.0.join("trace.log");
+    let prefix = super::super::hermeticity::strace_prefix(&trace);
+    let binary = SlatesBinary {
+      path: binary.into(),
+    };
+    let anchor = Anchor::start(&binary, &instance, &scratch.0, Some(&prefix)).unwrap();
+    let log = std::fs::read_to_string(&anchor.log).unwrap();
+    assert!(
+      !log.contains("killing it"),
+      "startup did not require a restart: {log}"
+    );
+    anchor.stop();
+    let text = std::fs::read_to_string(&trace).unwrap();
+    let cwd = scratch.0.to_str().unwrap();
+    let events = parse_strace_with_cwd(&text, cwd);
+    let judged = judge(
+      &events,
+      &Policy {
+        target: "",
+        working_directory: cwd,
+      },
+    );
+    assert!(
+      judged.ram_only > 0,
+      "startup's memory-object writes were traced"
+    );
+    assert!(
+      judged.standard_streams > 0,
+      "the daemon's diagnostic writes were traced"
+    );
+
+    // The same prefix must also observe ordinary file effects, not merely the allowed kernel
+    // objects above. The fixture writes only in the verified RAM directory, through a separate
+    // child, so the trace goes through the same follow-forks path as the supervised daemon.
+    let output = Command::new(&prefix[0])
+      .args(&prefix[1..])
+      .args([
+        "sh",
+        "-c",
+        "printf proof > before; mv before after; rm after",
+      ])
+      .current_dir(&scratch.0)
+      .output()
+      .unwrap();
+    assert!(
+      output.status.success(),
+      "{}",
+      String::from_utf8_lossy(&output.stderr)
+    );
+    let text = std::fs::read_to_string(&trace).unwrap();
+    let events = parse_strace_with_cwd(&text, cwd);
+    for call in ["openat", "write", "rename", "unlink"] {
+      assert!(
+        events.iter().any(|event| event.call.starts_with(call)
+          && (event.path.ends_with("/before") || event.path.ends_with("/after"))),
+        "the live trace retained {call} effects: {events:?}"
+      );
+    }
   }
 }
