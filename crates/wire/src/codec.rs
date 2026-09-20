@@ -274,16 +274,31 @@ mod tests {
     let decoded_scalars = BYTE_DECODINGS.get();
     assert_eq!(encoded, expected);
     assert_eq!(decoded, bytes);
-    assert_eq!(encoded_scalars, 0, "encoding bulk bytes used the scalar loop");
-    assert_eq!(decoded_scalars, 0, "decoding bulk bytes used the scalar loop");
+    assert_eq!(
+      encoded_scalars, 0,
+      "encoding bulk bytes used the scalar loop"
+    );
+    assert_eq!(
+      decoded_scalars, 0,
+      "decoding bulk bytes used the scalar loop"
+    );
 
     let scalar = 7u8.to_bytes();
     assert_eq!(u8::from_bytes(&scalar).unwrap(), 7);
     assert_eq!(BYTE_ENCODINGS.get(), 1, "the scalar probe must count work");
     assert_eq!(BYTE_DECODINGS.get(), 1, "the scalar probe must count work");
-    assert_eq!(Vec::<u8>::from_bytes(&[0, 0, 0, 0]).unwrap(), Vec::<u8>::new());
-    assert!(matches!(Vec::<u8>::from_bytes(&[2, 0, 0, 0, 7]), Err(WireError::Truncated { .. })));
-    assert!(matches!(Vec::<u8>::from_bytes(&[0, 0, 0, 0, 7]), Err(WireError::TrailingBytes { .. })));
+    assert_eq!(
+      Vec::<u8>::from_bytes(&[0, 0, 0, 0]).unwrap(),
+      Vec::<u8>::new()
+    );
+    assert!(matches!(
+      Vec::<u8>::from_bytes(&[2, 0, 0, 0, 7]),
+      Err(WireError::Truncated { .. })
+    ));
+    assert!(matches!(
+      Vec::<u8>::from_bytes(&[0, 0, 0, 0, 7]),
+      Err(WireError::TrailingBytes { .. })
+    ));
   }
 
   #[test]

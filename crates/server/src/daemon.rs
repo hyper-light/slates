@@ -2311,12 +2311,10 @@ async fn wait_for_rendezvous(_listener: &Listener) -> Result<(), slates_rt::RtEr
 /// The heartbeat: the anchor's `daemon.alive` input, beaten at a cadence inside its budget.
 async fn heartbeat_loop(segment: AnchorSegment) {
   let mut clock = HostClock::new();
-  let diagnostic_start = std::time::Instant::now();
   loop {
     let now = slates_vfs::clock::Clock::monotonic_ns(&mut clock);
     if let Ok(sup) = segment.supervision() {
       sup.beat(now);
-      eprintln!("[DEBUG-fsstress] heartbeat elapsed_us={}", diagnostic_start.elapsed().as_micros());
     }
     futures::sleep(HEARTBEAT_NS).await;
   }

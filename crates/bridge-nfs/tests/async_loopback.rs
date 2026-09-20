@@ -255,7 +255,9 @@ fn queued_calls_yield_between_replies() {
   let address = listener.local_addr().unwrap();
   let mut client = TcpStream::connect(address).unwrap();
   client
-    .set_read_timeout(Some(std::time::Duration::from_nanos(config().step_budget_ns)))
+    .set_read_timeout(Some(std::time::Duration::from_nanos(
+      config().step_budget_ns,
+    )))
     .unwrap();
   let mut requests = Vec::new();
   for xid in [1u32, 2] {
@@ -278,10 +280,17 @@ fn queued_calls_yield_between_replies() {
     &mut bridge,
     VOL_ID,
     Principal::Uid { uid: 0 },
-    Rights { read: true, write: true },
+    Rights {
+      read: true,
+      write: true,
+    },
   )
   .unwrap();
-  let mut server = std::pin::pin!(serve_connection_async(&mut stream, &mut export, address.port()));
+  let mut server = std::pin::pin!(serve_connection_async(
+    &mut stream,
+    &mut export,
+    address.port()
+  ));
   for xid in [1u32, 2] {
     assert!(server.as_mut().poll(&mut context).is_pending());
     let expected = write_record(&reply_bytes(xid, AcceptStatus::Success, &[]));
@@ -289,8 +298,14 @@ fn queued_calls_yield_between_replies() {
     client.read_exact(&mut received).unwrap();
     assert_eq!(received, expected);
     client.set_nonblocking(true).unwrap();
-    assert_eq!(client.peek(&mut [0]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+      client.peek(&mut [0]).unwrap_err().kind(),
+      std::io::ErrorKind::WouldBlock
+    );
     client.set_nonblocking(false).unwrap();
   }
-  assert!(matches!(server.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
+  assert!(matches!(
+    server.as_mut().poll(&mut context),
+    Poll::Ready(Ok(()))
+  ));
 }

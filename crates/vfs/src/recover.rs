@@ -389,10 +389,7 @@ impl ShardImage {
   /// interrupted or torn publish preserves it. Refuses [`VfsError::NoSpace`] if a slot cannot hold
   /// the frame (and leaves the committed slot untouched).
   pub fn write_to(&self, buf: &mut [u8]) -> Result<usize, VfsError> {
-    let diagnostic_start = std::time::Instant::now();
-    let content = self.to_content();
-    eprintln!("[DEBUG-fsstress] encoded bytes={} elapsed_us={}", content.len(), diagnostic_start.elapsed().as_micros());
-    publish_committed(buf, &content)
+    publish_committed(buf, &self.to_content())
   }
 
   /// Reads the last committed shard image back from a double-buffered content-object buffer (§4.8):
