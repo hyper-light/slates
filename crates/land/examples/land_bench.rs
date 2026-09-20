@@ -92,8 +92,6 @@ fn request(id: u64) -> LandingRequest {
     cores: 2,
     max_depth: 8,
     variance_permille: 100,
-    costs: None,
-    target_entries: None,
   }
 }
 
@@ -205,7 +203,6 @@ fn sim_rows() {
     let target = LandingTarget {
       dir: host.root(),
       key: "/".into(),
-      parent: None,
     };
     let started = Instant::now();
     let manifest =

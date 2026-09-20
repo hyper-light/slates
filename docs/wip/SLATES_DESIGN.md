@@ -737,7 +737,7 @@ plan schedules.
 - The decision: `materialize(snapshot, target)` is the only verb in the system that writes a host path. It plans a landing manifest (work proportional to diverged entries), obtains a grant bound to the manifest's hash from a human through the CLI or a confirmation surface (never through MCP or the SDKs), takes the single-holder landing lease on the canonical target, validates every entry by the verdict (witnessed base versus disk now versus overlay now: apply, skip, accept by identity, conflict), refuses while any conflict is unresolved, writes the delta with per-file compare-and-swap, syncs data then directories, advances the witnessed bases to what was written, clears those overlay entries, and records grant, manifest and outcome in the audit log.
 - Evidence: hecate's landing engine ("three-way against the shared baseline; identical hashes short-circuit; single-side files land by reference; only doubly-touched files proceed"; "emitting conflict values on intersection, never interleaving"; "no automatic resolution of concurrent code edits, anywhere") and its receipts on structural mergers silently missing real conflicts [C: hecate SESSIONS.md:89-125; C: hecate ADR-0005]; its review gate ("materialization to a real target defaults to prompt, always, and requires zero unresolved conflict values") and its single-holder materialization lease (slates' landing lease) with a fencing generation [C: hecate SESSIONS.md:23-25, 128-133, 222, 229]; optimistic concurrency control (read phase, validation, write phase) [A: Kung & Robinson TODS 1981]; the diff3 pathologies that make inferred merges unsafe [A: Khanna, Kunal & Pierce FSTTCS 2007]; sylk's flusher as the shape to avoid (whole-overlay flush, union confirmations, `ResetOverlay`) [C: survey-sylk-vfs.md §1.7, §8.2]; vorpal's rule that a confirmation must never travel through the agent's own channel [C: survey-vorpal.md §6.1]; the swap primitives (`renameat2` with `RENAME_EXCHANGE` since Linux 3.15 and `EINVAL` where unsupported; `O_TMPFILE` since 3.11 with `linkat`; `renamex_np` with `RENAME_SWAP` advertised by `VOL_CAP_INT_RENAME_SWAP`; `FILE_RENAME_POSIX_SEMANTICS` with `REPLACE_IF_EXISTS`, "Existing handles to the replaced file continue to be valid") [B: rename(2); B: open(2); B: macOS rename(2); B: Microsoft ntifs `FILE_RENAME_INFORMATION`]; reflinks (`FICLONE` since 4.5; `clonefile` with `VOL_CAP_INT_CLONE`; `FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS) [B]; `F_BARRIERFSYNC` versus `F_FULLFSYNC` [B: macOS fcntl(2)]; `openat2` with `RESOLVE_BENEATH` since 5.6 [B: openat2(2)]. (`research/disk-source-of-truth.md` §1-§5)
 - Lost: automatic three-way text merge at landing (silent interleaves of code nobody reviewed; hecate's one law); writing the whole tree (sylk); a grant by path rather than by manifest (the human would approve a plan that later changed); grants over MCP or the SDKs (the agent would answer its own question); advisory locks against outsiders on POSIX (editors and git ignore them); rename-over without verification (a silent loss window); a disk probe at boot (a write outside a grant).
-- Measure: the online concurrency ramp inside each landing; exchange support per target filesystem; time per entry for plan, validate, write and sync; reflink availability and gain; the stage-and-exchange break-even; crash-resume cost.
+- Measure: the online concurrency ramp inside each landing; exchange support per target filesystem; time per entry for plan, validate, write and sync; reflink availability and gain; per-entry exchange and verification costs; crash-resume cost.
 - Consequence: every byte that reaches a disk is traceable to a human decision; the landing crate is the only crate that links write-capable file syscalls; the hermeticity tracer gains "zero writes outside granted targets".
 
 ### D-27 The merge engine: green volumes written only by a merge task; increments as constant-size descriptors of declared operations; canonical rebase by position mapping; a pure two-pass verdict (accept, accept-identical, conflict) with no inference; splice by extent surgery; merge records as fenced pointers; holders recompute; byte-exact conflict windows; rebase as the only corrective path; streaming submission (hecate's merge architecture adapted)
@@ -970,6 +970,16 @@ ring and kicks the driver; a stale generation is ignored.
 > geometry takes four allocator calls rather than 25,271, and use/renewal/expiry allocate
 > nothing. These corrections supersede the older delayed-entry-retirement description.
 
+> **Follow-up (2026-09-19, driver retirement and test attribution):** io_uring close
+> schedules kernel cleanup; pending polls can retain a listener after the shard joins.
+> Driver retirement cancels submitted requests and waits for a drain completion before
+> closing the ring. The probe requires synchronous cancellation support. Threaded and
+> calling-thread rebind regressions exercise actual socket ownership, and Linux CI requires
+> io_uring so an epoll result cannot silently replace its coverage. Allocation oracles in
+> `mem` and `rt` count on the allocating thread; a controlled foreign allocation proves that
+> libtest reporting cannot contaminate either the capacity comparison or the zero-call gate.
+> Evidence and local validation: the two 2026-09-19 driver-retirement/allocation-counter reports.
+
 **Loop.** Each iteration: drain the driver's completions (io_uring CQ / kqueue events / IOCP
 packets) into the run queue; drain inbound rings (client command rings, cross-shard rings, the
 bridge queue) up to a batch bound derived from the measured service time and the latency budget;
@@ -981,7 +991,8 @@ cancel-safe by construction; a cancellation request is a message that guarantees
 completion.
 
 **Drivers.** Linux: io_uring with `SINGLE_ISSUER|DEFER_TASKRUN` when the kernel is ≥ 6.1 and
-io_uring is permitted (probed at boot: a refused `io_uring_setup` selects epoll); registered
+io_uring is permitted (probed at boot: setup or synchronous-cancellation refusal selects epoll);
+plain rings require cancellation support from 6.0. Registered
 buffers for ring and chunk pages; FUSE-over-io_uring per-shard queues on ≥ 6.14; eventfd for
 cross-shard kicks. macOS: kqueue with `EVFILT_USER` kicks and non-blocking socket I/O for the NFS
 server. Windows: IOCP with `PostQueuedCompletionStatus` kicks; WinFsp requests arrive on WinFsp's
@@ -2919,6 +2930,13 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 
 ### 4.15 Disk as the source of truth: the base plane and landing under grant (D-25, D-26)
 
+> **Containment correction (2026-09-19).** Scratch directories created by inode operations
+> belong in the diverged set even without a base. Whole-target staging is removed: its hidden
+> sibling and parent-directory sync escaped the grant. Step 10 now requires every write inside
+> the stable target. The mounted hermeticity gate checks the landed bytes, symlink and parent
+> directories as well as tracing writes; a zero-entry landing fails. See
+> `docs/bugs/2026-09-19-linux-conformance-first-complete-run.md` for failing evidence and validation.
+
 > **Status (A-9, 2026-09-05).** The read-only base seam and landing engine exist, as do
 > server records, plan/refusal handling and Unix control transport/write integration. The CLI
 > has `land`, grant listing and audit reads, but no `slates grant` issuance verb. Human issuer
@@ -3098,14 +3116,12 @@ entry either old or new, never torn).
    the target. Entries that failed stay in the overlay with their outcome. Record
    `LandingFinished{Done | Partial}`, release the lease, consume the grant, and reply with the
    report.
-10. *Stage-and-exchange (measured alternative).* When the target is empty, or when the manifest's
-    entry count exceeds the measured break-even (staging cost = total entries × measured link or
-    reflink cost + delta bytes × write cost + one exchange; in-place cost = delta entries × (swap
-    + verify cost) + delta bytes × write cost), the landing builds the whole tree in a hidden
-    sibling directory and exchanges it with the target in one `RENAME_EXCHANGE` / `RENAME_SWAP`
-    (Windows: two POSIX-semantics renames, the window reported), then removes the displaced tree
-    after verifying it against the witnessed bases. Never the default for a populated target,
-    because it changes the directory's inode and every path's identity.
+10. *Containment of every write.* The target directory is the grant boundary and retains its
+    identity throughout the landing. Create each temporary inside that boundary and use the
+    per-entry exchange in step 6. Never build a sibling beside the target or replace the target
+    itself: those operations modify the ungranted parent, including its directory sync. This
+    replaces the former whole-target stage-and-exchange alternative, whose parent writes
+    violated R1 even for an empty target.
 11. *Crash and resume.* Every written entry is old or new, never torn (a temporary is linked or
     exchanged only after its data sync). A crashed landing's manifest is in the anchor segment;
     the next landing of the same snapshot into the same target re-plans, skips entries whose
@@ -3148,7 +3164,6 @@ during a landing: `Aborted` with every finished entry listed.
 | In-flight entries per landing | online ramp: start at pool cores; double while throughput rises by more than its variance and latency p99 holds; back off otherwise | per-entry latency and throughput samples inside the landing |
 | Landing pool size (macOS thread pool) | the settled in-flight depth, bounded by measured free cores | the ramp; the profile's core classes |
 | Directory sync strategy (Linux) | per-directory `fsync` unless directories × measured per-directory cost > measured `syncfs` cost | the first directory syncs of the landing |
-| Stage-and-exchange break-even | staging cost < in-place cost by the formulas in step 10 | measured link, reflink, write, swap and verify costs from the landing's first entries |
 | Racy window | filesystem timestamp granularity (cited table by filesystem type) + measured clock resolution | `statfs` type; `clock_getres` |
 | Landing lease term | measured landing duration p99 × k, renewed by keepalive while entries are in flight | landing duration histogram |
 | Grant term | the session's lifetime for session grants; the measured plan-to-grant interval p99 × k for single-use grants | audit log intervals |
@@ -3632,7 +3647,7 @@ None`), bridges, IPC, database replication.
     exhaustive table test; the landing state machine; the per-OS entry writer (temporary, swap,
     verify, undo; reflink where probed; sparse and preallocation; timestamps); ordering by class;
     the online concurrency ramp; sync strategies; advance; crash resume and sibling sweep; the
-    stage-and-exchange alternative with its measured break-even; the exchange fallback with the
+    target-contained per-entry writer; the exchange fallback with the
     reported window. Grants and leases are stubbed by an in-process record in this phase and
     become database records in Phase 2.
 12. The landing oracle: an executable model of (disk, overlay, witnesses) whose verdicts and
@@ -4803,7 +4818,7 @@ head reads served by non-owners; the copyset count against its bound.
 **Must measure per landing (feeds the ramp and the strategy choices; never at boot).** Per-entry
 latency and throughput at each in-flight depth; swap, verify, link and reflink cost; data-sync
 and directory-sync cost and the `syncfs` break-even; exchange and clone support of the target
-filesystem; the stage-and-exchange break-even.
+filesystem; per-entry exchange and verification costs.
 
 **Open questions (decided by the plan's phases, not by guessing).**
 1. macOS: the FSKit spike's go/no-go and the 15.x block-resource path (Phase 4); whether an
@@ -5079,7 +5094,7 @@ requested form. The virtio-fs backend, device residency and mapping matrix are P
 | macOS arm64 | 16 KiB pages; no superpages; `os_sync_wait_on_address` needs 14.4 (minimum version); thread affinity is a hint; QoS steers P/E |
 | macOS FSKit | 15.4+ for the framework; URL resources 26+ (15.x needs a block resource); one-time user enablement; sandboxed extension (app-group IPC only); Swift entry point; Operations (15.4–26) and Handler (27+) protocol generations; app-bundle packaging and signing |
 | macOS NFS fallback | no xattrs by default; no "forget"; weak close-to-open; `.nfs` temp files on delete-while-open; documented Degraded cells |
-| Linux kernel floors | 5.10 baseline; io_uring modes 5.19/6.1; FUSE io_uring 6.14; MADV_POPULATE 5.14; futex_waitv 5.16; user namespaces may be restricted by AppArmor (Ubuntu 23.10+) |
+| Linux kernel floors | 5.10 baseline through epoll; io_uring requires synchronous cancellation (6.0), with single-issuer deferred work on 6.1; FUSE io_uring 6.14; MADV_POPULATE 5.14; futex_waitv 5.16; user namespaces may be restricted by AppArmor (Ubuntu 23.10+) |
 | Windows | `WaitOnAddress` process-local (named Events across processes); asyncio needs sockets; AF_UNIX creates NTFS reparse points (not used); directory mounts are reparse points (refused); large pages need `SeLockMemoryPrivilege` |
 | Stable Rust 1.98 | no nightly features; `RawWakerVTable` encodings; `std::thread::scope`; `OnceLock` |
 | Containers | io_uring may be blocked by seccomp: epoll fallback is first-class; `mlock` may be limited: probed and reported |
@@ -5354,3 +5369,30 @@ fleet,consensus,verbs,nfs}`, `ipc/protocol`, `cli/{args,verbs}`, and affected st
 - Applied in the same change to: §4.3 and §4.7 status; mem/rt/server code and regressions;
   FUSE fixtures and ownership regression; GAPS; TBD_FIXES; the two dated bug reports.
   No consensus rule or model changes. Windows IOCP ownership is separately ledgered.
+
+### A-24 (2026-09-19) — Complete kernel requests before retiring an io_uring driver
+
+- Retirement cancels pending requests and waits for a drain completion; closing the ring
+  alone queues asynchronous kernel cleanup and cannot promise immediate address reuse.
+- Probe cancellation support before selecting io_uring. Baseline Linux continues through
+  the existing epoll driver when that capability is unavailable.
+- Linux CI requires the io_uring backend in the rebind regressions. Allocation measurements
+  belong to their allocating thread, including the existing allocator oracle's sibling counter.
+- Registry stress fixtures own every slot they address in their process; driver wait tests
+  permit valid unrelated kicks and retain their absolute deadline across those wakes.
+- Applied in the same change to: §4.3 and the kernel-floor table; the io_uring driver;
+  runtime and memory regressions; the CI coverage guard; GAPS; TBD_FIXES; the three dated
+  runtime/allocation bug reports.
+  No consensus rule or model changes.
+
+### A-25 — Landing containment and a non-vacuous mounted tracer (2026-09-19)
+
+The first complete Linux conformance trace proved that the former §4.15 step 10 wrote outside
+its grant. Remove whole-target staging and parent-directory authority; retain the per-entry
+writer inside the stable target. Include scratch directories in the landing manifest. Require
+the traced workload's actual bytes, symlink and all parent directories on disk before accepting
+its trace. Exact evidence and validation are in `docs/bugs/2026-09-19-linux-conformance-first-complete-run.md`.
+
+Applied in the same change to: §4.15 status and steps 1/10, its measurement references and
+Phase 1 requirement; `crates/vfs/src/base.rs`, the landing engine, target opener, callers and
+oracle/OS tests; the conformance tracer harness and matrix wording; GAPS §8c and TBD_FIXES.

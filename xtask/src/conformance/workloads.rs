@@ -144,7 +144,7 @@ fn execute(
 pub(crate) fn run_workloads(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let host_root = run.scratch.subdir("workloads-host")?;
   let fold = folds_names(&host_root);
-  let session = Session::open(run, "workloads", fold, None)?;
+  let session = Session::open(run, "workloads", super::VOLUME_SIZE, fold, None)?;
   let mount_root = session.workdir("workloads")?;
   let mut tools = Vec::new();
   let mut notes = vec![format!(

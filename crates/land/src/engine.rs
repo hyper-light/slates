@@ -26,9 +26,9 @@
 //! run one at a time, and the ramp records the depth the policy would have chosen; bytes are
 //! read from the volume into a buffer and written through the seam (arena pages through
 //! io_uring in Phase 4); grants, leases and the audit log are the in-process records of
-//! [`crate::grant`] and [`Audit`]; the stage-and-exchange alternative runs for an empty target
-//! (the populated-target case needs a hard-link verb the seam gains with its measured cost,
-//! GAPS §8c); reflinks are not used (the probe is recorded as `false`).
+//! [`crate::grant`] and [`Audit`]. Every temporary stays inside the granted directory; replacing
+//! the target itself would write its ungranted parent (R1, §4.15 step 10). Reflinks are not used
+//! (the probe is recorded as `false`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
@@ -49,8 +49,6 @@ use crate::verdict::{ConflictClass, DiskState, Verdict, verdict};
 /// Format: the prefix of every hidden sibling a landing creates inside the granted target; the
 /// landing id follows, then a per-landing counter, so a sweep recognizes its own names.
 const HIDDEN_PREFIX: &str = ".slates-";
-/// Format: the name of the staging directory's counter slot.
-const STAGE_SUFFIX: &str = "stage";
 /// Format: `EEXIST` on Linux and macOS (the seam reports it as `Unavailable(17)`).
 const ERRNO_EXIST: i32 = 17;
 /// Format: `EINVAL` on Linux and macOS: a filesystem without `RENAME_EXCHANGE` reports it.
@@ -65,8 +63,8 @@ const ERRNO_NOSPC: i32 = 28;
 const ERRNO_DQUOT_LINUX: i32 = 122;
 /// Format: `EDQUOT` on macOS.
 const ERRNO_DQUOT_MACOS: i32 = 69;
-/// Format: the mode of a staging directory before the target's own mode is applied: owner
-/// only, so a half-built tree is never readable by others.
+/// Format: the mode of a temporary directory before the entry's own mode is applied: owner
+/// only, so a half-built replacement is never readable by others.
 const STAGE_MODE: u32 = 0o700;
 /// Format: the read buffer for hashing a file the verdict must identify; one page's worth of
 /// slots keeps the loop bounded per call (the design's chunk window is 64 KiB; hashing reads
@@ -182,8 +180,8 @@ pub struct Durability {
   pub dir_sync_ns: u64,
 }
 
-/// Costs measured by a landing, remembered by the caller per target filesystem for the
-/// stage-and-exchange break-even (§4.15 step 10) and the sync strategy.
+/// Costs measured by a landing, remembered by the caller per target filesystem for
+/// throughput and sync-strategy measurements (§4.15 steps 7–8).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LandingCosts {
   /// Linking or renaming one entry into place, nanoseconds (median of the landing's samples).
@@ -198,31 +196,6 @@ pub struct LandingCosts {
   pub dir_sync_ns: u64,
   /// Samples behind the numbers.
   pub samples: u64,
-}
-
-impl LandingCosts {
-  /// Whether staging beats in-place for a delta of `delta_entries` and `delta_bytes` into a
-  /// target of `target_entries` (§4.15 step 10's formulas). Unknown costs (no samples) never
-  /// choose staging.
-  pub fn prefers_staging(&self, target_entries: u64, delta_entries: u64, delta_bytes: u64) -> bool {
-    if self.samples == 0 {
-      return false;
-    }
-    /// Format: bytes per KiB.
-    const KIB: u64 = 1024;
-    let write = delta_bytes
-      .div_ceil(KIB)
-      .saturating_mul(self.write_ns_per_kib);
-    let staging = target_entries
-      .saturating_add(delta_entries)
-      .saturating_mul(self.link_ns)
-      .saturating_add(write)
-      .saturating_add(self.exchange_ns);
-    let in_place = delta_entries
-      .saturating_mul(self.exchange_ns.saturating_add(self.verify_ns))
-      .saturating_add(write);
-    staging < in_place
-  }
 }
 
 /// The report of a landing.
@@ -250,17 +223,13 @@ pub struct LandingReport {
   pub durability: Durability,
   /// The Degraded cells hit.
   pub degraded: Vec<Degradation>,
-  /// Whether the landing was staged and exchanged.
-  pub staged: bool,
   /// The depth the concurrency ramp settled on (recorded; Phase 1 runs one entry at a time).
   pub ramp_depth: u32,
   /// The costs measured.
   pub costs: LandingCosts,
   /// Hidden siblings of an earlier landing swept before this one ran.
   pub swept: usize,
-  /// The target directory handle valid after the landing: the caller's, unless the landing
-  /// was staged and exchanged, which gives the target a new inode (§4.15 step 10) and so a new
-  /// handle; the caller then closes its old one.
+  /// The caller's target directory handle, whose identity the landing preserves.
   pub target: HostDir,
 }
 
@@ -364,16 +333,13 @@ impl Audit {
 }
 
 /// The target directory, opened by the caller with containment (§4.15 step 4): its handle,
-/// its canonical key (the lease's name), and its parent with the name inside it when the
-/// caller could open that (needed only for stage-and-exchange).
+/// and its canonical key (the lease's name). The grant conveys no authority over its parent.
 #[derive(Clone, Debug)]
 pub struct LandingTarget {
   /// The target directory.
   pub dir: HostDir,
   /// The canonical target the lease names.
   pub key: Box<str>,
-  /// The parent and the target's name in it.
-  pub parent: Option<(HostDir, Box<str>)>,
 }
 
 /// One landing's request.
@@ -401,11 +367,6 @@ pub struct LandingRequest {
   pub max_depth: u32,
   /// Measured: the sample variance the ramp treats as noise, parts per thousand.
   pub variance_permille: u64,
-  /// Costs remembered from earlier landings into this filesystem, for the break-even.
-  pub costs: Option<LandingCosts>,
-  /// The target's entry count when the caller knows it (from its base listings), for the
-  /// break-even; unknown means in-place unless the target is empty.
-  pub target_entries: Option<u64>,
 }
 
 /// What the caller may run before each entry's write: the oracle injects outsider edits here
@@ -470,15 +431,12 @@ impl CostSamples {
 struct Landing<'a, H: LandFs> {
   host: &'a mut H,
   request: &'a LandingRequest,
-  /// The root the entries' paths are relative to: the target, or the staging directory.
+  /// The granted target that every entry's path is relative to.
   root: HostDir,
-  /// The target's parent and its name there, when the caller could open it (staging needs it).
-  stage_parent: Option<(HostDir, Box<str>)>,
   /// Directories opened beneath the root, by volume path (`"/"` is the root itself).
   dirs: BTreeMap<Box<str>, HostDir>,
   /// Directories a write touched (synced at the end).
   touched: BTreeSet<Box<str>>,
-  caps: LandCapabilities,
   /// Whether the exchange path is still believed to work (flipped by the first `EINVAL`).
   exchange: bool,
   hidden_counter: u64,
@@ -1592,11 +1550,9 @@ impl<'a, H: LandFs> Landing<'a, H> {
       host,
       request,
       root: target.dir,
-      stage_parent: target.parent.clone(),
       dirs: BTreeMap::new(),
       touched: BTreeSet::new(),
       exchange: caps.exchange,
-      caps,
       hidden_counter: 0,
       bytes_written: 0,
       widest_window_ns: 0,
@@ -1608,7 +1564,7 @@ impl<'a, H: LandFs> Landing<'a, H> {
   }
 }
 
-/// Everything after the lease: validate, sweep, write (in place or staged), sync, advance.
+/// Everything after the lease: validate, sweep, write inside the target, sync, advance.
 #[allow(clippy::too_many_arguments)]
 fn land_under_lease<H: LandFs>(
   host: &mut H,
@@ -1650,7 +1606,6 @@ fn land_under_lease<H: LandFs>(
     return Err(LandingRefusal::Conflict(reports));
   }
   let swept = landing.sweep(manifest).unwrap_or(0);
-  let staged = landing.stage_if_better(manifest, &reports);
   landing.write_all(
     manifest,
     &mut reports,
@@ -1662,13 +1617,8 @@ fn land_under_lease<H: LandFs>(
       audit,
     },
   );
-  // Directory syncs run where the entries were written (the stage's directories when staged),
-  // before any exchange makes them visible at the target.
-  let mut durability = landing.sync_all();
-  let (staged, target_dir) = match staged {
-    Some(stage) => landing.finish_stage(target, stage, &mut durability),
-    None => (false, target.dir),
-  };
+  let durability = landing.sync_all();
+  let target_dir = target.dir;
   if let Some(errno) = landing.crashed {
     landing.degraded.push(Degradation::Crashed { errno });
   }
@@ -1752,7 +1702,6 @@ fn land_under_lease<H: LandFs>(
     bytes_written: landing.bytes_written,
     durability,
     degraded: landing.degraded,
-    staged,
     ramp_depth: landing.ramp.depth,
     costs,
     swept,
@@ -1786,94 +1735,5 @@ fn terminal_state(reports: &[EntryReport], crashed: bool) -> LandingState {
     LandingState::Done
   } else {
     LandingState::Partial
-  }
-}
-
-/// A staging directory in flight: the hidden sibling beside the target.
-struct Stage {
-  parent: HostDir,
-  name: Box<str>,
-  target_name: Box<str>,
-}
-
-impl<H: LandFs> Landing<'_, H> {
-  /// Stage-and-exchange when the target is empty (no entry to link) or the remembered costs
-  /// say staging wins (§4.15 step 10); returns the stage the entries are then written into.
-  fn stage_if_better(&mut self, manifest: &Manifest, reports: &[EntryReport]) -> Option<Stage> {
-    let (parent, target_name) = self.stage_parent.clone()?;
-    if !self.caps.exchange || !self.exchange {
-      return None;
-    }
-    let empty = self
-      .host
-      .list(self.root)
-      .map(|l| l.is_empty())
-      .unwrap_or(false);
-    let all_apply = reports.iter().all(|r| r.verdict == Some(Verdict::Apply));
-    let by_costs = match (self.request.costs, self.request.target_entries) {
-      (Some(costs), Some(total)) => costs.prefers_staging(
-        total,
-        u64::try_from(manifest.entries.len()).unwrap_or(u64::MAX),
-        manifest.summary.bytes,
-      ),
-      _ => false,
-    };
-    // The populated-target case needs every existing entry linked into the stage, a seam verb
-    // that waits on its measured cost (GAPS §8c); until then only an empty target stages.
-    if !(empty && all_apply) || by_costs && !empty {
-      return None;
-    }
-    let name: Box<str> = format!(
-      "{HIDDEN_PREFIX}{:016x}-{STAGE_SUFFIX}",
-      self.request.landing_id
-    )
-    .into();
-    self.host.mkdir(parent, &name, STAGE_MODE).ok()?;
-    let stage = self.host.open_dir(parent, &name).ok()?;
-    self.root = stage;
-    Some(Stage {
-      parent,
-      name,
-      target_name,
-    })
-  }
-
-  /// Exchanges the built stage with the (empty) target and removes the displaced directory;
-  /// on any failure the stage is removed and the target left as it was.
-  fn finish_stage(
-    &mut self,
-    target: &LandingTarget,
-    stage: Stage,
-    durability: &mut Durability,
-  ) -> (bool, HostDir) {
-    self.close_dirs();
-    let ok = self.crashed.is_none()
-      && self
-        .host
-        .exchange(stage.parent, &stage.name, &stage.target_name)
-        .is_ok();
-    // Whatever now sits at the hidden name goes: the built tree on failure, the displaced
-    // empty target on success. The parent then syncs so the exchange is durable.
-    let _ = self.remove_named_tree(stage.parent, &stage.name);
-    self.host.close_dir(self.root);
-    // The exchanged target is a new inode: a fresh handle names it (the caller's names the
-    // displaced one on a real host).
-    let target_dir = if ok {
-      self
-        .host
-        .open_dir(stage.parent, &stage.target_name)
-        .unwrap_or(target.dir)
-    } else {
-      target.dir
-    };
-    self.root = target_dir;
-    self.touched.clear();
-    let started = Instant::now();
-    if self.host.sync_dir(stage.parent).is_err() {
-      durability.dirs_synced = false;
-    }
-    durability.dirs += 1;
-    durability.dir_sync_ns = durability.dir_sync_ns.saturating_add(elapsed_ns(started));
-    (ok, target_dir)
   }
 }

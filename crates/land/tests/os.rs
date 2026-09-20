@@ -232,11 +232,12 @@ fn a_target_path_that_escapes_is_refused() {
   assert!(OsLand::open_target(&ws.path.join("real")).is_ok());
 }
 
-/// A scratch volume into an empty directory takes the stage-and-exchange path; the parent
-/// handle names the exchanged directory after.
+/// AC-1.10 / R1: a scratch landing preserves the real target directory and writes its tree
+/// beneath that directory, without leaving a sibling outside the grant.
 #[test]
-fn a_scratch_volume_into_an_empty_real_directory_is_staged() {
-  let Some(ram) = ram_dir("a_scratch_volume_into_an_empty_real_directory_is_staged") else {
+fn a_scratch_volume_into_an_empty_real_directory_preserves_the_target() {
+  let Some(ram) = ram_dir("a_scratch_volume_into_an_empty_real_directory_preserves_the_target")
+  else {
     return;
   };
   let ws = Workspace::new(&ram, "stage");
@@ -266,7 +267,11 @@ fn a_scratch_volume_into_an_empty_real_directory_is_staged() {
   };
   let report = setup.land(request(2)).unwrap();
   assert_eq!(report.state, LandingState::Done, "{report:?}");
-  assert!(report.staged);
+  let (mut reopened, current) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  assert_eq!(
+    host.fingerprint_dir(target.dir).unwrap().ino,
+    reopened.fingerprint_dir(current.dir).unwrap().ino
+  );
   assert_eq!(report.written, 104);
   assert_eq!(read(&ws.path.join("out/d2/f3")).unwrap(), b"2/3");
   assert!(!names_in(&ws.path).iter().any(|n| n.starts_with(".slates-")));

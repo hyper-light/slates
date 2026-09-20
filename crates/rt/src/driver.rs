@@ -284,6 +284,18 @@ pub(crate) fn refused(call: &'static str, e: rustix::io::Errno) -> RtError {
 mod tests {
   use super::*;
 
+  /// The slot outlives its driver and retires even when an assertion unwinds. Otherwise
+  /// the parallel registry stress test can fill its abandoned ring and wait forever.
+  struct RegisteredDriverSlot(u16);
+
+  impl Drop for RegisteredDriverSlot {
+    fn drop(&mut self) {
+      crate::registry::unregister(self.0);
+    }
+  }
+
+  /// AC-0.6: the real driver wakes for a kick, delivers a no-op, and supports a timed wait
+  /// despite another kick arriving before its deadline. All registered resources are retired.
   #[test]
   #[cfg_attr(miri, ignore)]
   fn the_os_driver_wakes_on_a_kick_and_delivers_a_nop() {
@@ -292,24 +304,40 @@ mod tests {
     // Exercise the real registration and retirement protocol, including the foreign kick.
     let (shard, _control) =
       crate::registry::register(2, 1, crate::runtime::register_kick(prepared.kick_fd)).unwrap();
+    let registration = RegisteredDriverSlot(shard);
     let kick = crate::registry::with_entry(shard, |entry| entry.kick).unwrap();
     let mut driver = (prepared.seed)(kick).unwrap();
     eprintln!("driver {} notes {notes:?}", driver.kind().name());
     let kick = driver.kick_handle();
     let mut out = Vec::new();
     // A kick from another thread ends an unbounded wait.
-    let t = std::thread::spawn(move || kick.kick());
-    driver.wait(None, &mut out).unwrap();
-    t.join().unwrap();
-    // A no-op completes on the next wait with its word.
+    std::thread::scope(|scope| {
+      let kicker = scope.spawn(move || kick.kick());
+      driver.wait(None, &mut out).unwrap();
+      kicker.join().unwrap();
+    });
+    // A wait can return another kick before the no-op. Its deadline belongs to the whole
+    // observation, not to one driver call (the same contract the shard loop uses).
     driver.submit_nop(0xABCD).unwrap();
-    driver.wait(Some(1_000_000_000), &mut out).unwrap();
+    let deadline = driver.now_ns() + 1_000_000_000;
+    while !out.iter().any(|completion| completion.user_data == 0xABCD) && driver.now_ns() < deadline
+    {
+      driver
+        .wait(Some(deadline.saturating_sub(driver.now_ns())), &mut out)
+        .unwrap();
+    }
     assert!(out.iter().any(|c| c.user_data == 0xABCD), "{out:?}");
-    // A bounded wait with nothing pending returns at the deadline.
+    // Force the extra kick that the parallel registry stress test may deliver. A timed
+    // wait may return early for it; continue toward the same absolute deadline.
+    kick.kick();
     let before = driver.now_ns();
-    driver.wait(Some(2_000_000), &mut out).unwrap();
-    assert!(driver.now_ns() - before >= 1_000_000);
+    let deadline = before + 2_000_000;
+    while driver.now_ns() < deadline {
+      driver
+        .wait(Some(deadline.saturating_sub(driver.now_ns())), &mut out)
+        .unwrap();
+    }
     drop(driver);
-    crate::registry::unregister(shard);
+    drop(registration);
   }
 }

@@ -135,6 +135,9 @@ pub fn classify(event: &WriteEvent, policy: &Policy<'_>) -> Placement {
     return Placement::StandardStream;
   }
   let path = event.path.as_str();
+  if inside(path, policy.target) {
+    return Placement::InsideTarget;
+  }
   if KERNEL_OBJECT_PREFIXES.iter().any(|p| path.starts_with(p)) {
     return Placement::RamOnly("kernel object (socket, pipe, anon inode, memfd, shm)");
   }
@@ -152,9 +155,6 @@ pub fn classify(event: &WriteEvent, policy: &Policy<'_>) -> Placement {
   }
   if path.starts_with(UNRESOLVED_PREFIX) {
     return Placement::Unresolved;
-  }
-  if inside(path, policy.target) {
-    return Placement::InsideTarget;
   }
   Placement::Outside
 }
@@ -371,6 +371,9 @@ fn octal_char(first: char, chars: &mut std::iter::Peekable<std::str::Chars<'_>>)
 
 /// A descriptor argument: its number and its decoration (`5</path>` → `(5, Some("/path"))`).
 fn descriptor(arg: &str) -> (Option<i64>, Option<String>) {
+  // strace can put the deletion annotation after the closing decoration bracket. It is
+  // metadata about the descriptor, not part of its path or an exemption from containment.
+  let arg = arg.strip_suffix("(deleted)").unwrap_or(arg);
   let digits = arg.len()
     - arg
       .trim_start_matches(|c: char| c.is_ascii_digit() || c == '-')
@@ -391,6 +394,32 @@ fn descriptor_path(arg: &str) -> (Option<i64>, String) {
   }
 }
 
+/// Descriptor paths returned by successful `O_TMPFILE` opens. These unnamed inodes belong
+/// to their containing directory, but have no manifest name until `linkat` publishes them.
+/// A `#number` basename alone never proves that a path is an unnamed temporary.
+pub fn strace_unnamed_paths(log: &str) -> Vec<String> {
+  joined_lines(log)
+    .into_iter()
+    .filter_map(|(_, body)| {
+      let (name, args) = call_and_args(&body)?;
+      let flags = match name {
+        "open" => args.get(1)?,
+        "openat" | "openat2" => args.get(2)?,
+        _ => return None,
+      };
+      if !flags
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| word == "O_TMPFILE")
+      {
+        return None;
+      }
+      let (_, returned) = body.rsplit_once(") = ")?;
+      let (number, path) = descriptor(returned);
+      number.filter(|number| *number >= 0).and(path)
+    })
+    .collect()
+}
+
 /// A path relative to a directory descriptor (`AT_FDCWD` → the working directory).
 fn at_path(dirfd: &str, path: Option<&str>, cwd: &str) -> String {
   let (_, base) = if dirfd == "AT_FDCWD" {
@@ -400,7 +429,7 @@ fn at_path(dirfd: &str, path: Option<&str>, cwd: &str) -> String {
   };
   match path {
     Some(p) if p.starts_with('/') => p.to_owned(),
-    Some("") | None => base,
+    Some("" | ".") | None => base,
     Some(p) => format!("{}/{p}", base.trim_end_matches('/')),
   }
 }
@@ -849,6 +878,51 @@ mod tests {
       vec![".slates-tmp-1".to_owned(), "a.txt".to_owned()]
     );
     assert_eq!(judged.unresolved, 0);
+  }
+
+  /// AC-9.4 / T-9.1: RAM-backed landing targets still need observable, matched writes.
+  /// The kernel's unnamed inode is temporary only because an O_TMPFILE open returned it.
+  #[test]
+  fn an_unnamed_landing_file_is_attributed_to_its_ram_backed_target() {
+    let log = "91 openat(4</dev/shm/target>, \".\", O_WRONLY|O_TMPFILE, 0600) = 5</dev/shm/target/#9>(deleted)\n\
+      91 pwrite64(5</dev/shm/target/#9>(deleted), \"x\", 1, 0) = 1\n\
+      91 linkat(AT_FDCWD, \"/proc/self/fd/5\", 4</dev/shm/target>, \"file\", AT_SYMLINK_FOLLOW) = 0\n";
+    let policy = Policy {
+      target: "/dev/shm/target",
+      working_directory: "/scratch",
+    };
+    let judged = judge(&parse_strace(log), &policy);
+    assert_eq!(judged.inside_target, 3);
+    assert_eq!(judged.written_inside, ["#9", "file"]);
+    assert_eq!(strace_unnamed_paths(log), ["/dev/shm/target/#9"]);
+    assert!(
+      strace_unnamed_paths(
+        "91 openat(4</target>, \"#9\", O_WRONLY, 0600) = 5</target/#9>(deleted)\n"
+      )
+      .is_empty()
+    );
+  }
+
+  /// AC-9.4 / T-9.1: replay the deleted-descriptor form emitted by the Linux CI tracer.
+  /// A deleted memfd remains RAM-only; deletion never exempts a disk file from its grant.
+  #[test]
+  fn deleted_descriptor_annotations_preserve_the_write_destination() {
+    let events = parse_strace(
+      "77040 ftruncate(82</memfd:slates-segment>(deleted), 536576) = 0\n\
+       77040 ftruncate(83</outside/file>(deleted), 0) = 0\n\
+       77040 ftruncate(84</scratch/land-target/file>(deleted), 0) = 0\n\
+       77040 ftruncate(85</unknown>unrecognized, 0) = 0\n",
+    );
+    let judged = judge(&events, &policy());
+    assert_eq!(judged.write_calls, 4);
+    assert_eq!(judged.ram_only, 1);
+    assert_eq!(judged.inside_target, 1);
+    assert_eq!(judged.outside, 1);
+    assert_eq!(judged.violations[0].path, "/outside/file");
+    assert_eq!(
+      judged.unresolved, 1,
+      "unknown decorations still fail closed"
+    );
   }
 
   /// A read-only open is not a write; an undecorated descriptor is unresolved, not trusted.

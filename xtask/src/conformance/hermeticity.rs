@@ -15,7 +15,9 @@ use std::process::{Child, Command, Stdio};
 use slates_conformance::Suite;
 use slates_conformance::capability::HostOs;
 use slates_conformance::record::Outcome;
-use slates_conformance::trace::{Policy, judge, parse_fs_usage, parse_strace_with_cwd};
+use slates_conformance::trace::{
+  Policy, judge, parse_fs_usage, parse_strace_with_cwd, strace_unnamed_paths,
+};
 
 use super::slates::{Session, grant};
 use super::{Run, SuiteResult, pause, write_file};
@@ -169,6 +171,34 @@ fn land_under_grant(run: &Run<'_>, session: &Session, target: &Path) -> Result<u
   })
 }
 
+/// The mounted workload must reach disk, including its scratch-volume parents. A trace with
+/// no outside writes proves nothing if the landing silently skipped every entry (AC-4.5).
+fn verify_landing(target: &Path, work: &str) -> Result<(), Failure> {
+  let directory = target.join(work);
+  for relative in ["", "d"] {
+    let path = directory.join(relative);
+    if !std::fs::symlink_metadata(&path)?.is_dir() {
+      return Err(Failure(format!(
+        "landed directory has the wrong kind: {}",
+        path.display()
+      )));
+    }
+  }
+  for (relative, expected) in [("f3", b"one\n"), ("d/f2", b"two\n")] {
+    let path = directory.join(relative);
+    if !std::fs::symlink_metadata(&path)?.is_file() || std::fs::read(&path)? != expected {
+      return Err(Failure(format!(
+        "landed file has the wrong kind or bytes: {}",
+        path.display()
+      )));
+    }
+  }
+  if std::fs::read_link(directory.join("link"))? != Path::new("f3") {
+    return Err(Failure("landed symlink does not name f3".to_owned()));
+  }
+  Ok(())
+}
+
 /// Runs the traced lifecycle and judges the log.
 pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let log = run.scratch.path().join("trace.log");
@@ -177,7 +207,13 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     HostOs::Macos => None,
     HostOs::Windows => return Err(Failure("no Windows tracer".to_owned())),
   };
-  let session = Session::open(run, "hermeticity", false, tracer.as_deref())?;
+  // The trace creates four surviving entries, their two parents, the root and one temporary
+  // file. Reserve those eight inodes by the admission formula (§4.2), leaving the shard's
+  // unpromised versions available for the snapshot taken before landing. The general stress
+  // volume's byte quota can reserve the entire inode slab and legitimately refuse retention.
+  let inode_count = LANDED_ENTRIES.len() + 2 + 1 + 1;
+  let size = (inode_count * std::mem::size_of::<slates_vfs::inode::Inode>()).to_string();
+  let session = Session::open(run, "hermeticity", &size, false, tracer.as_deref())?;
   let fs_usage = match run.os {
     HostOs::Macos => Some(FsUsage::start(session.anchor.daemon_pid()?, &log)?),
     _ => None,
@@ -196,6 +232,13 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let target = run.scratch.subdir("land-target")?;
   let target = std::fs::canonicalize(&target)?;
   let written = land_under_grant(run, &session, &target)?;
+  let parent = format!("conformance-{}", std::process::id());
+  let work = format!("{parent}/traced");
+  let expected = std::iter::once(parent)
+    .chain(std::iter::once(work.clone()))
+    .chain(LANDED_ENTRIES.iter().map(|entry| format!("{work}/{entry}")))
+    .collect::<Vec<_>>();
+  let verified = verify_landing(&target, &work);
   let Session { mount, anchor, .. } = session;
   drop(mount);
   anchor.stop();
@@ -217,29 +260,30 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     working_directory: &cwd,
   };
   let judged = judge(&events, &policy);
-  let prefix = format!("conformance-{}/traced/", std::process::id());
+  let unnamed = strace_unnamed_paths(&text);
   let mut matched = 0u32;
   let mut unmatched = Vec::new();
   let mut hidden = 0u32;
   for path in &judged.written_inside {
-    let inside_workdir = path.strip_prefix(&prefix).unwrap_or(path);
-    if path
-      .rsplit('/')
-      .next()
-      .is_some_and(|name| name.starts_with(HIDDEN_PREFIX))
+    if unnamed
+      .iter()
+      .any(|unnamed| unnamed == &format!("{}/{path}", target.display()))
+      || path
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name.starts_with(HIDDEN_PREFIX))
     {
       hidden += 1;
-    } else if LANDED_ENTRIES.contains(&inside_workdir)
-      || LANDED_ENTRIES
-        .iter()
-        .any(|e| inside_workdir.ends_with(&format!("/{e}")))
-    {
+    } else if expected.contains(path) {
       matched += 1;
     } else {
       unmatched.push(path.clone());
     }
   }
-  let ok = judged.outside == 0 && unmatched.is_empty();
+  let complete = usize::try_from(written).ok() == Some(expected.len())
+    && usize::try_from(matched).ok() == Some(expected.len())
+    && verified.is_ok();
+  let ok = complete && judged.outside == 0 && judged.unresolved == 0 && unmatched.is_empty();
   let mut notes = vec![
     format!(
       "tracer: {}; {} events parsed from {} log lines; landing reported {written} written; {hidden} hidden siblings ({HIDDEN_PREFIX}*) seen inside the target",
@@ -251,6 +295,11 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       text.lines().count()
     ),
     format!("the granted target: {}", target.display()),
+    format!("volume quota: {size} bytes, derived from {inode_count} workload inodes"),
+    format!(
+      "landing completeness: {written}/{} entries reported; disk verification: {verified:?}",
+      expected.len()
+    ),
   ];
   notes.extend(session.size_note.clone());
   if !unmatched.is_empty() {
@@ -297,7 +346,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
         "sudo fs_usage -w -f filesys -f network <daemon pid>; slates anchor/volume create/mount, `sh -c '{MOUNT_WORKLOAD}'`, snapshot, land, grant, land --grant"
       ),
     },
-    bound: "one lifecycle: one volume, one mount, one landing of four entries".to_owned(),
+    bound: "one lifecycle: one volume, one mount, four workload entries and their two parent directories landed and verified".to_owned(),
     expected_failure_list: None,
     notes,
     ok,

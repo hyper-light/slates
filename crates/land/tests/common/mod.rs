@@ -81,8 +81,6 @@ pub(crate) fn request(landing_id: u64) -> LandingRequest {
     cores: 2,
     max_depth: 8,
     variance_permille: 100,
-    costs: None,
-    target_entries: None,
   }
 }
 

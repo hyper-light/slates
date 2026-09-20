@@ -2230,6 +2230,7 @@ dependencies = [
  "slates-conformance",
  "slates-machine",
  "slates-server",
+ "slates-vfs",
  "toml 0.8.23",
 ]
 

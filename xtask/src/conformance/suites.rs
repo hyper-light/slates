@@ -75,7 +75,7 @@ fn outcome_for(
 pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let tools = run.scratch.subdir("tools")?;
   let built = fetch::build_fsx(&tools)?;
-  let session = Session::open(run, "fsx", false, None)?;
+  let session = Session::open(run, "fsx", super::VOLUME_SIZE, false, None)?;
   let work = session.workdir("fsx")?;
   let logs = run.scratch.subdir("fsx-logs")?;
   let bounds = run.bounds();
@@ -135,7 +135,7 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
 pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let tools = run.scratch.subdir("tools")?.join("ltp");
   let built = fetch::build_fsstress(&tools, run.os)?;
-  let session = Session::open(run, "fsstress", false, None)?;
+  let session = Session::open(run, "fsstress", super::VOLUME_SIZE, false, None)?;
   let work = session.workdir("fsstress")?;
   let bounds = run.bounds();
   let mut args: Vec<String> = vec![
@@ -154,6 +154,10 @@ pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     args.push(format!("{operation}=0"));
   }
   let (success, output) = run_capturing(&built.built.binary, &args, run.scratch.path())?;
+  super::write_file(
+    &run.scratch.path().join("fsstress-output.txt"),
+    output.as_bytes(),
+  )?;
   let verdict = judge_fsstress(success, &output);
   let alive = session.daemon_alive();
   let ok = verdict.ok && alive;
@@ -482,7 +486,7 @@ fn pjdfstest_runner(root_available: bool, current: Runner) -> (bool, Runner) {
 pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let tools = run.scratch.subdir("tools")?;
   let tree = fetch::build_pjdfstest(&tools)?;
-  let session = Session::open(run, "pjdfstest", false, None)?;
+  let session = Session::open(run, "pjdfstest", super::VOLUME_SIZE, false, None)?;
   let work = session.workdir("pjd")?;
   let (as_root, runner) = pjdfstest_runner(run.root_available, this_user());
   let files = test_files(&tree.root)?;

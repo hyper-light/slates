@@ -79,6 +79,32 @@ Command (bounded Linux container, quantum image): `docker run --rm --network=non
 
 ## 3. Additional concrete follow-ups found during this repair
 
+- [ ] **Full Linux conformance run (2026-09-19).** Job `105974090627` reaches every suite:
+  fsx and workloads pass; fsstress loses the daemon to repeated heartbeat kills; pjdfstest
+  has 3,595 failures requiring a capability/correctness review; hermeticity finds four writes
+  outside the target and a zero-write landing its harness did not reject. Reproduce each
+  through the real Linux NFS adapter with io_uring available. Also cover strace's actual
+  deleted-descriptor annotation. Record:
+  `docs/bugs/2026-09-19-linux-conformance-first-complete-run.md`.
+- [x] **Runtime test isolation (2026-09-19).** The registry contention fixture sent wakes to
+  unrelated unit-test rings, and a driver test assumed its timed wait could receive no other
+  kicks. The stress history now owns its integration-test process; timed waits retain one
+  absolute deadline across valid wakes, with registry and worker cleanup on assertion failure.
+  Record: `docs/bugs/2026-09-19-driver-test-assumes-no-foreign-kicks.md`.
+- [ ] **io_uring retirement verification (2026-09-19).** A local io_uring regression
+  reproduces the warm-restart bind failure. Cancellation plus a drain barrier is implemented;
+  complete the real Linux execution loop before claiming closure. CI now requires its
+  intended backend. Record: `docs/bugs/2026-09-19-io-uring-retains-listener-after-shutdown.md`.
+- [x] **Allocation counter attribution (2026-09-19).** `rt` and `mem` test counters included
+  libtest's other threads. A controlled foreign allocation fails both counters before the
+  change; thread-local counters pass without relaxing either allocation gate. Record:
+  `docs/bugs/2026-09-19-timer-allocation-counter-includes-libtest.md`.
+- [ ] **Readiness cancellation during a live runtime (source review, 2026-09-19).**
+  `Ready` has no per-registration cancellation and accepts a second poll as readiness even
+  after a spurious wake. Driver retirement now ends all pending requests; separately test
+  abandoned waits while the driver stays alive, including descriptor reuse and multiple
+  waits from one task. This broader lifetime issue is not established by shutdown tests.
+
 - [x] **Rendezvous wake amplification (2026-09-19).** Linux now drains and rearms the
   listener through the control shard's one-shot driver readiness. There is no Linux watcher
   thread. Holding both real shards and queuing a connection reproduces the old unrelated

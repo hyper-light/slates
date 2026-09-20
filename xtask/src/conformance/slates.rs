@@ -617,7 +617,7 @@ pub(crate) struct Session {
   pub(crate) binary: SlatesBinary,
   pub(crate) instance: String,
   pub(crate) volume_id: String,
-  /// Why the volume is not the requested size (`VOLUME_SIZE`), when it is not — for the record's
+  /// Why the volume is not the requested size, when it is not — for the record's
   /// notes, which name the admitted size.
   pub(crate) size_note: Option<String>,
   pub(crate) mount: Mount,
@@ -635,6 +635,7 @@ impl Session {
   pub(crate) fn open(
     run: &Run<'_>,
     suite: &str,
+    size: &str,
     fold: bool,
     tracer: Option<&[String]>,
   ) -> Result<Session, Failure> {
@@ -653,7 +654,7 @@ impl Session {
       .run(&instance, &["bootstrap", "root"])?
       .expect_ok("bootstrap root")?;
     let volume_name = format!("{suite}-vol");
-    let created = create_volume(&binary, &instance, &volume_name, super::VOLUME_SIZE, fold)?;
+    let created = create_volume(&binary, &instance, &volume_name, size, fold)?;
     let volume_id = created.id;
     let mount = mount_volume(run, &binary, &instance, &volume_id, &volume_name)?;
     let base = mount

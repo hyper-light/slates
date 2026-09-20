@@ -164,7 +164,7 @@ pub fn summary(counts: &Counts) -> String {
        matched to Written, {written_unmatched} unmatched), {ram_only} RAM-only objects, {standard_streams} \
        standard streams, {unresolved} unresolved, {outside} outside — {}",
       if *outside == 0 {
-        "zero violations"
+        "no outside writes"
       } else {
         "VIOLATIONS"
       }

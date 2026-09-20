@@ -19,7 +19,7 @@
 //! user (`TargetNotOwned`). `TargetIsVolume` waits on the mount table of Phase 3 (GAPS §8c).
 
 use std::collections::BTreeMap;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::{Component, Path};
 
 use rustix::fs::{AtFlags, Mode, OFlags};
@@ -97,7 +97,7 @@ fn dir_flags() -> OFlags {
 
 impl OsLand {
   /// Opens an absolute target path with containment and the ownership check, and returns the
-  /// writer with the target (its parent opened too, for stage-and-exchange).
+  /// writer with the target. Ancestor descriptors used to resolve it are closed on the way.
   pub fn open_target(path: &Path) -> Result<(Self, LandingTarget), TargetRefusal> {
     let mut components = path.components();
     if components.next() != Some(Component::RootDir) {
@@ -105,7 +105,6 @@ impl OsLand {
     }
     let mut current = rustix::fs::open("/", dir_flags(), Mode::empty())
       .map_err(|e| TargetRefusal::Unavailable(refusal(e)))?;
-    let mut parent: Option<(OwnedFd, Box<str>)> = None;
     let mut key = String::new();
     for component in components {
       let name = match component {
@@ -120,7 +119,6 @@ impl OsLand {
         })?;
       key.push('/');
       key.push_str(name);
-      parent = Some((current, name.into()));
       current = next;
     }
     let st = rustix::fs::fstat(&current).map_err(|e| TargetRefusal::Unavailable(refusal(e)))?;
@@ -129,7 +127,6 @@ impl OsLand {
     }
     let (mut host, _) = OsHost::open_root(Path::new("/")).map_err(TargetRefusal::Unavailable)?;
     let dir = host.adopt_dir(current);
-    let parent = parent.map(|(fd, name)| (host.adopt_dir(fd), name));
     let target = LandingTarget {
       dir,
       key: if key.is_empty() {
@@ -137,7 +134,6 @@ impl OsLand {
       } else {
         key.into()
       },
-      parent,
     };
     Ok((
       Self {

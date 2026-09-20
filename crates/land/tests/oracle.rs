@@ -45,7 +45,6 @@ fn root_target(host: &mut SimHost) -> LandingTarget {
   LandingTarget {
     dir: host.root(),
     key: "/".into(),
-    parent: None,
   }
 }
 
@@ -744,7 +743,92 @@ fn t_1_12_a_removed_and_recreated_directory_plans_one_clear_and_two_creates() {
   );
 }
 
-// ---------------------------------------------------------------- staging
+// ---------------------------------------------------------------- scratch landings
+
+/// Checks the public host namespace while each entry is written, not just after cleanup has
+/// hidden an out-of-target stage. This observer permits exactly the granted `/out` subtree.
+struct ContainedWrites {
+  checked: usize,
+}
+
+impl Observer<SimHost> for ContainedWrites {
+  fn before_write(&mut self, host: &mut SimHost, _entry: &LandingEntry) {
+    self.checked += 1;
+    for (path, _) in host.paths() {
+      assert!(
+        path == "/" || path == "/out" || path.starts_with("/out/"),
+        "the target grant did not authorize {path}"
+      );
+    }
+  }
+}
+
+/// AC-9.4 / T-9.1, R1: grant a landing into an empty child directory. Its parent is available
+/// for resolving the target, but no stage may appear beside that target while writing.
+#[test]
+fn a_target_grant_keeps_the_landing_inside_its_directory() {
+  let mut host = SimHost::new();
+  host.mkdir("/out");
+  let root = host.root();
+  let target = LandingTarget {
+    dir: host.open_dir(root, "out").unwrap(),
+    key: "/out".into(),
+  };
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  write_file(&mut vol, &mut host, &mut store, "/file", b"granted");
+  let mut session = Session::new();
+  let mut observed = ContainedWrites { checked: 0 };
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land_with(request(1), &mut observed)
+  .unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(observed.checked, 1, "the actual write was observed");
+  assert_eq!(host.bytes("/out/file").unwrap(), b"granted");
+}
+
+/// AC-1.10 / T-9.1: create a nested scratch tree through the inode-based operations used by
+/// native mounts, then grant its landing. Every directory and the file must reach the target;
+/// the overlay-aware fixture helpers must not hide a missing scratch-directory declaration.
+#[test]
+fn a_scratch_tree_created_by_inode_lands_its_parent_directories_and_file() {
+  let mut host = SimHost::new();
+  let target = root_target(&mut host);
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  let outer = vol.mkdir_no(&mut store, root, "outer", 0o755).unwrap();
+  let inner = vol.mkdir_no(&mut store, outer, "inner", 0o755).unwrap();
+  let file = vol
+    .create_file_no(&mut store, inner, "file", 0o644)
+    .unwrap();
+  vol.write(&mut store, file, 0, b"landed").unwrap();
+  let snapshot = vol.snapshot(&mut store).unwrap();
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(1)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(report.written, 3, "both parents and their file: {report:?}");
+  assert_eq!(setup.host.bytes("/outer/inner/file").unwrap(), b"landed");
+  assert!(setup.present(&request(2)).manifest.entries.is_empty());
+  let mut preserved = Volume::clone_of(setup.store, setup.vol, snapshot, config()).unwrap();
+  assert_eq!(
+    read_through(&mut preserved, setup.host, setup.store, "/outer/inner/file"),
+    b"landed"
+  );
+}
 
 /// Ten directories of a hundred files each in a scratch volume.
 fn scratch_tree(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
@@ -762,11 +846,10 @@ fn scratch_tree(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
   }
 }
 
-/// A scratch volume into an empty target: built in a hidden sibling and exchanged in one
-/// step; the volume becomes an overlay over the target; a second landing plans nothing; reads
-/// then come from the disk and follow it.
+/// AC-1.10 / R1: land a scratch tree inside an empty target without replacing its identity;
+/// the volume becomes an overlay, a second landing plans nothing, and reads follow the disk.
 #[test]
-fn a_scratch_volume_into_an_empty_target_is_staged_and_exchanged() {
+fn a_scratch_volume_into_an_empty_target_preserves_the_target() {
   let mut host = SimHost::new();
   host.mkdir("/out");
   let root = host.root();
@@ -774,7 +857,6 @@ fn a_scratch_volume_into_an_empty_target_is_staged_and_exchanged() {
   let target = LandingTarget {
     dir,
     key: "/out".into(),
-    parent: Some((root, "out".into())),
   };
   let mut store = store();
   let mut vol = scratch(&mut store);
@@ -789,7 +871,12 @@ fn a_scratch_volume_into_an_empty_target_is_staged_and_exchanged() {
   };
   let report = setup.land(request(8)).unwrap();
   assert_eq!(report.state, LandingState::Done, "{report:?}");
-  assert!(report.staged, "an empty target is staged and exchanged");
+  let reopened = setup.host.open_dir(root, "out").unwrap();
+  assert_eq!(
+    setup.host.fingerprint_dir(target.dir).unwrap().ino,
+    setup.host.fingerprint_dir(reopened).unwrap().ino
+  );
+  setup.host.close_dir(reopened);
   assert_eq!(report.written, 1_010);
   let presented = setup.present(&request(8));
   assert!(presented.manifest.entries.is_empty());
@@ -866,7 +953,6 @@ fn a_scratch_volume_into_a_populated_target_lands_in_place() {
   .land(request(10))
   .unwrap();
   assert_eq!(report.state, LandingState::Done, "{report:?}");
-  assert!(!report.staged);
   assert_eq!(host.bytes("/fresh").unwrap(), b"fresh");
 }
 

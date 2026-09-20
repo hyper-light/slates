@@ -47,6 +47,45 @@ fn open_descriptors() -> usize {
   std::fs::read_dir("/dev/fd").map_or(0, |dir| dir.count())
 }
 
+/// A local or CI run can require the backend it intends to cover. Docker's default policy
+/// selects epoll, which cannot establish that io_uring releases its pending file references.
+#[cfg(target_os = "linux")]
+fn verify_linux_driver(notes: &[String]) {
+  let selection = notes
+    .iter()
+    .find(|note| note.starts_with("io_uring = "))
+    .expect("the runtime reports its Linux driver probe");
+  let driver = if selection.ends_with("using epoll") {
+    "epoll"
+  } else {
+    "io_uring"
+  };
+  eprintln!("listener retirement driver: {driver}; {notes:?}");
+  if let Some(expected) = std::env::var_os("SLATES_TEST_DRIVER") {
+    assert_eq!(
+      expected, driver,
+      "the requested Linux backend must be exercised"
+    );
+  }
+}
+
+#[cfg(target_os = "linux")]
+fn bind_abstract_listener(address: &rustix::net::SocketAddrUnix) -> std::os::fd::OwnedFd {
+  use rustix::net::{AddressFamily, SocketFlags, SocketType};
+
+  let socket = rustix::net::socket_with(
+    AddressFamily::UNIX,
+    SocketType::STREAM,
+    SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+    None,
+  )
+  .unwrap();
+  rustix::net::bind(&socket, address).unwrap();
+  // The fixture admits no connections; a one-connection backlog suffices for listening.
+  rustix::net::listen(&socket, 1).unwrap();
+  socket
+}
+
 /// Do: start and shut down one more runtime than the registry has slots, one shard each. Expect:
 /// every start succeeds — a shut-down runtime's slot is reclaimed, so the bound is on *live*
 /// shards, not on shards ever created. Before the fix the 1025th start refused `TooManyShards`.
@@ -81,6 +120,85 @@ fn a_shut_down_runtime_closes_every_descriptor_it_opened() {
     after <= baseline,
     "descriptors leaked across 64 two-shard cycles: {baseline} before, {after} after"
   );
+}
+
+/// AC-0.6 / T-2.14, §4.3: shut down with a listener awaiting readiness, then bind its
+/// abstract address immediately. Joining the shard must release the kernel's references too;
+/// counting open descriptors alone cannot detect a pending poll retaining the old listener.
+#[cfg(target_os = "linux")]
+#[test]
+fn shutdown_releases_a_listener_with_an_armed_readiness_wait() {
+  use std::future::{Future, poll_fn};
+  use std::os::fd::AsRawFd;
+  use std::task::Poll;
+
+  use rustix::net::SocketAddrUnix;
+
+  let _serial = serial();
+  let name = format!("slates-shutdown-readiness-{}", std::process::id());
+  let address = SocketAddrUnix::new_abstract_name(name.as_bytes()).unwrap();
+  let listener = bind_abstract_listener(&address);
+  let runtime = Runtime::start(&config(1)).unwrap();
+  verify_linux_driver(runtime.notes());
+  let (armed, received) = std::sync::mpsc::sync_channel(1);
+  runtime
+    .spawn_on(runtime.shard_ids()[0], async move {
+      let mut readiness = std::pin::pin!(slates_rt::readiness::readable(listener.as_raw_fd()));
+      let mut armed = Some(armed);
+      poll_fn(|context| {
+        let result = readiness.as_mut().poll(context);
+        if result.is_pending()
+          && let Some(armed) = armed.take()
+        {
+          armed.send(()).unwrap();
+        }
+        assert!(matches!(result, Poll::Pending), "no client connects");
+        result
+      })
+      .await
+      .unwrap();
+    })
+    .unwrap();
+  let observed = received.recv_timeout(std::time::Duration::from_secs(5));
+  let counters = runtime.shutdown();
+  observed.expect("the listener's readiness wait was armed before shutdown");
+  assert_eq!(counters[0].cancelled, 1, "shutdown cancelled the listener");
+  drop(bind_abstract_listener(&address));
+}
+
+/// AC-0.6 / T-2.14, §4.3: retire a local runtime with more pending listener polls
+/// than fit in one completion batch. No shard-thread exit may hide asynchronous
+/// cleanup: every address must rebind on this thread without a delay or retry.
+#[cfg(target_os = "linux")]
+#[test]
+fn dropping_a_local_runtime_releases_a_polled_listener_before_returning() {
+  use rustix::net::SocketAddrUnix;
+  use std::os::fd::AsRawFd;
+
+  let _serial = serial();
+  let config = config(1);
+  // io_uring's default CQ holds twice its SQ entries. One more listener, plus the kick
+  // and drain, forces retirement to consume completions across the CQ overflow boundary.
+  let addresses: Vec<_> = (0..config.ring_entries * 2 + 1)
+    .map(|listener| {
+      let name = format!("slates-local-readiness-{}-{listener}", std::process::id());
+      SocketAddrUnix::new_abstract_name(name.as_bytes()).unwrap()
+    })
+    .collect();
+  let listeners: Vec<_> = addresses.iter().map(bind_abstract_listener).collect();
+  let runtime = slates_rt::runtime::LocalRuntime::new(&config).unwrap();
+  verify_linux_driver(runtime.notes());
+  for listener in &listeners {
+    runtime
+      .context()
+      .register_readable(listener.as_raw_fd(), 0xABCD)
+      .unwrap();
+  }
+  drop(listeners);
+  drop(runtime);
+  for address in addresses {
+    drop(bind_abstract_listener(&address));
+  }
 }
 
 /// Do: spawn a task on a runtime and keep its wake word; shut the runtime down; start a new runtime

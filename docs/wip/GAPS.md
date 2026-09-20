@@ -187,7 +187,7 @@ are retained with their scope; no documentation edit is an implementation accept
 - Drift checks per second exceeding the measured `stat` capacity of a base (stat storms) → reopen the check cadence in §4.5 (hint-driven checks only, or a coarser listing fingerprint).
 - Watcher overflow rate above the operator SLO on a base → reopen the watcher strategy (fanotify mount marks on Linux; the USN journal on Windows).
 - Large-class copy-up cost or descriptor use beyond its derived budget → reopen the copy-up class boundary (D-6, §4.5).
-- Landings falling back to rename-over (no exchange) above a measured fraction → reopen D-O15 (staging-directory strategy).
+- Landings falling back to rename-over (no exchange) above a measured fraction → revisit D-O15 within the granted target; replacing its ungranted parent is forbidden.
 - Merged listing cost on the largest base directories above the readdir latency budget → reopen the listing cache (§4.5).
 - Any write by a slates process outside a granted target in the tracer → stop the release; it is a rule violation, not a tripwire.
 - `StaleEpoch` refusals outside an observed takeover or migration → a fencing or membership bug; fatal in CI, alarm in production (never a tripwire to tune).
@@ -399,12 +399,12 @@ instructions over a delta with every action class: every path old or new after e
 resume with the same landing id sweeps the siblings, reaches the reference disk, and a
 further plan is empty); T-1.16 (no exchange: verify-then-rename, the window in the outcome,
 `NoExchange` reported, an outsider edit still refused at the verify); T-1.12 (the 40k-entry
-directory: one `Clear` and two creates, exactly two entries after); stage-and-exchange for an
-empty target (1,010 entries in a hidden sibling, one exchange, the scratch volume an overlay
-after, reads then following the disk); a populated target in place with `CreateCreate`;
+directory: one `Clear` and two creates, exactly two entries after); a scratch landing into an
+empty target (1,010 entries, the scratch volume an overlay after, reads then following the disk;
+whole-target staging removed on 2026-09-19 because it wrote outside the grant); a populated target in place with `CreateCreate`;
 grant mismatch, held lease, consumed and session grants, the audit log. Over a real
 directory (`crates/land/tests/os.rs`, Linux lane on `/dev/shm`, loud skip elsewhere): the
-worked example's shape on the disk, containment refusals, staging, and T-1.15's real `kill -9`
+worked example's shape on the disk, containment refusals, stable target identity, and T-1.15's real `kill -9`
 (a child lands round after round until killed; every file is a whole round; the parent resumes
 with the child's landing id and sweeps). Baselines in BENCHMARKS.md (Phase 1 baseline: the
 landing).
@@ -427,10 +427,11 @@ Deviations and owed items from tasks 11–13:
   the report). Concurrent entries arrive with the runtime's pool in Phase 2; the linked
   io_uring chains and arena-page writes with Phase 4's Linux bridge (bytes are read from the
   volume into a buffer and written through the seam until then).
-- Stage-and-exchange runs for an empty target only. A populated target needs every existing
-  entry linked into the stage, a hard-link verb the seam gains with its measured cost (the
-  break-even policy `LandingCosts::prefers_staging` is written and tested against the
-  formula; the remembered costs come from each landing's report).
+- Whole-target stage-and-exchange is rejected (2026-09-19): the CI tracer observed four
+  writes outside the granted target. The writer now receives no parent-directory authority.
+  Per-entry exchange remains inside the target, whose identity is preserved. The scratch
+  directory omission and the zero-write hermeticity false pass have dedicated regressions;
+  validation is recorded in `docs/bugs/2026-09-19-linux-conformance-first-complete-run.md`.
 - Reflinks are not used (`LandCapabilities.reflink` is probed as `false`); `FICLONE` and
   `clonefile` arrive with the manifest's own hash index of identical files.
 - The directory sync strategy is one `fsync` per touched directory; the `syncfs` alternative
@@ -1222,6 +1223,24 @@ points for the same N=1/fleet semantics, not proof that all integration work is 
 
 ## 8i. A-9 contract correction and open implementation gaps (2026-09-05)
 
+**CI follow-up (2026-09-19, §4.3):** a real io_uring rebind regression reproduces
+`EADDRINUSE` after runtime shutdown; descriptor closure did not wait for pending kernel
+polls to release their listeners. Retirement now cancels and drains requests, with the
+required cancellation capability checked at boot. Linux CI asserts its intended driver.
+The macOS timer-allocation failure counted other threads' work; controlled foreign
+allocations reproduce the same defect in both `rt/tests/timer_allocations.rs` and
+`mem/tests/no_alloc.rs`. Their counters are now thread-local and their original allocation
+assertions are unchanged. Exact validation and limits are recorded in
+`docs/bugs/2026-09-19-io-uring-retains-listener-after-shutdown.md` and
+`docs/bugs/2026-09-19-timer-allocation-counter-includes-libtest.md`.
+
+The full local workspace run also exposed interference between runtime test fixtures. A
+registry stress test deliberately sent wakes to adjacent global slots owned by other tests,
+which could fill their rings before their consumers started. It now owns a separate test
+process with the same concurrent history. The driver test permits valid kicks during a timed
+wait and releases its registration and worker on unwind. Record:
+`docs/bugs/2026-09-19-driver-test-assumes-no-foreign-kicks.md`.
+
 **Local CI regressions (2026-09-19, §4.3/§4.7 and AUD-02):** the Linux listener now uses
 one-shot readiness on the control shard, eliminating the level-readable watcher loop.
 A delayed-accept test fails on the old watcher and passes on the replacement; it also
@@ -1279,6 +1298,13 @@ observation of real file mutations. Both regressions run in the Linux conformanc
 the mounted suites. Full mounted conformance remains pending. Records:
 `docs/bugs/2026-09-19-linux-conformance-mount-authority.md`,
 `docs/bugs/2026-09-19-hermeticity-tracer-stops-unselected-syscalls.md`.
+
+**First complete Linux adapter run (2026-09-19, GAP-A9-15 still open):** job `105974090627`
+passes fsx and all nine workloads. Fsstress loses daemon service to repeated heartbeat kills;
+pjdfstest reports 3,595 unexpected failures; hermeticity observes four writes outside its
+granted target, 20 unresolved descriptor annotations and a zero-write landing. Startup success
+did not establish the full lifecycle. The separate reproductions and required assertions are
+recorded in `docs/bugs/2026-09-19-linux-conformance-first-complete-run.md`.
 
 **Implementation follow-up (2026-09-19, AUD-02 closed; GAP-A9-3/-4's FUSE-coherence leg):** the
 FUSE serve loop delivers kernel invalidations at every wake — a kernel request or a `ChangeSignal`

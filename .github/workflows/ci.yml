@@ -45,6 +45,10 @@ jobs:
       # lockable RAM (§4.2 D-12; docs/bugs/2026-09-10-provisioning-budget-from-mlock-limit.md), so the
       # tests run under the runner's default mlock limit — no `ulimit` bump, which the runners ignore.
       - name: Test
+        env:
+          # An epoll pass cannot validate io_uring teardown. The Linux rebind regressions
+          # require the intended backend; local container runs also cover epoll explicitly.
+          SLATES_TEST_DRIVER: ${{ runner.os == 'Linux' && 'io_uring' || '' }}
         run: cargo test --workspace
       - name: AC-1.1 model suite over 10^6 generated operations
         run: cargo test -p slates-vfs --release --test model -- --ignored ac_1_1

@@ -266,8 +266,6 @@ fn land_verb_unix(
     cores: 1,
     max_depth: 1,
     variance_permille: 0,
-    costs: None,
-    target_entries: None,
   };
   let slot = match state.volumes.get_mut(handle) {
     Ok(s) => s,

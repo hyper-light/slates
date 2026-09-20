@@ -545,7 +545,7 @@ impl Volume {
                   path: path.clone(),
                   kind: Divergence::Redirect,
                 });
-              } else if child.base == BaseDirState::Opaque {
+              } else if matches!(child.base, BaseDirState::None | BaseDirState::Opaque) {
                 out.push(Diverged {
                   path: path.clone(),
                   kind: Divergence::Created,

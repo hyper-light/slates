@@ -595,6 +595,7 @@ fn serve_local(
   args: &[u8],
   port: u16,
 ) -> (AcceptStatus, Vec<u8>) {
+  eprintln!("[DEBUG-fsstress] xid={xid} procedure={procedure} begin");
   // The `bridge.request` chokepoint span (§4.14): one NFS bridge call from arrival to reply, served on
   // this shard's volumes, opened as a root — the kernel's call is the entry point of its trace. Its
   // request identity for replay is the RPC transaction id under the mount's port (an NFS client
@@ -631,6 +632,7 @@ fn serve_local(
     &mut XdrReader::new(args),
     port,
   );
+  eprintln!("[DEBUG-fsstress] xid={xid} procedure={procedure} served");
   // The barrier (§4.8, D-18): a mutation's effect is published into anchor-owned RAM before its
   // reply leaves this shard, so the reply's stability claim is true for daemon-restart survival.
   let result = if matches!(served.0, AcceptStatus::Success)
@@ -640,6 +642,7 @@ fn serve_local(
   } else {
     served
   };
+  eprintln!("[DEBUG-fsstress] xid={xid} procedure={procedure} durable");
   if let Some(open) = open {
     let _ = state::with_state(|s| {
       let end_ns = s.clock.monotonic_ns();

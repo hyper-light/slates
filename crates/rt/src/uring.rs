@@ -2,18 +2,24 @@
 //! them, plain setup when it does not, and a refusal (seccomp, an old kernel) that selects epoll
 //! [B: io_uring_setup(2); D-9]. Kicks are an eventfd watched by a multishot poll on the ring, so
 //! any thread's write becomes a completion the waiting `io_uring_enter` returns for.
+//! Retirement cancels requests and waits for a drain completion before closing the ring (§4.3):
+//! Linux otherwise releases pending polls' socket references asynchronously, after shutdown returns
+//! (`docs/bugs/2026-09-19-io-uring-retains-listener-after-shutdown.md`).
 
 use std::os::fd::OwnedFd;
 use std::time::Instant;
 
-use io_uring::types::{Fd, SubmitArgs, Timespec};
-use io_uring::{IoUring, opcode};
+use io_uring::types::{CancelBuilder, Fd, SubmitArgs, Timespec};
+use io_uring::{IoUring, opcode, squeue};
 
 use crate::driver::{Completion, Driver, DriverKind, Kick, nanos_since, refused};
 use crate::error::RtError;
 
 /// Format: the user word of the kick poll.
 const KICK_TAG: u64 = u64::MAX;
+/// Format: the retirement barrier's word, adjacent to the kick's reserved word and outside
+/// the registry's shard-id range. No live task receives a completion after retirement begins.
+const RETIRE_TAG: u64 = KICK_TAG - 1;
 
 /// Format: the poll mask for read readiness — a socket with data, or a listener with a connection to
 /// accept (`POLLIN`, io_uring `PollAdd`).
@@ -41,7 +47,7 @@ impl std::fmt::Debug for UringDriver {
   }
 }
 
-/// Creates the kick eventfd, leaked for the process (see the epoll driver for why).
+/// Creates the kick eventfd; the registry owns it until every shard driver has retired.
 pub fn prepare_eventfd() -> Result<OwnedFd, RtError> {
   rustix::event::eventfd(
     0,
@@ -67,7 +73,7 @@ pub fn probe(entries: u32, notes: &mut Vec<String>) -> bool {
 
 fn build_ring(entries: u32) -> Result<(IoUring, &'static str), RtError> {
   let entries = entries.max(1).next_power_of_two();
-  match IoUring::builder()
+  let (ring, flags) = match IoUring::builder()
     .setup_single_issuer()
     .setup_defer_taskrun()
     .build(entries)
@@ -88,6 +94,27 @@ fn build_ring(entries: u32) -> Result<(IoUring, &'static str), RtError> {
     Err(e) => Err(RtError::DriverRefused {
       call: "io_uring_setup",
       code: e.raw_os_error(),
+    }),
+  }?;
+  // A usable driver must be able to release a pending poll before shutdown returns. Probe the
+  // cancellation operation on the empty ring too; unsupported kernels or seccomp policies
+  // refuse this driver before it owns any socket, through the existing OS-driver selection.
+  cancel_pending(&ring)?;
+  Ok((ring, flags))
+}
+
+/// Cancels submitted requests. An empty ring has nothing to cancel; other refusals retain
+/// their syscall and errno. Only poll and no-op requests are issued by this driver.
+fn cancel_pending(ring: &IoUring) -> Result<(), RtError> {
+  match ring
+    .submitter()
+    .register_sync_cancel(None, CancelBuilder::any())
+  {
+    Ok(()) => Ok(()),
+    Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+    Err(error) => Err(RtError::DriverRefused {
+      call: "io_uring_register(sync cancel)",
+      code: error.raw_os_error(),
     }),
   }
 }
@@ -129,17 +156,7 @@ impl UringDriver {
     let poll = opcode::PollAdd::new(Fd(raw), events)
       .build()
       .user_data(user_data);
-    // SAFETY: a poll entry carries no buffer, and the fd is borrowed by number for this one
-    // submission only (the caller owns it and awaits the completion before dropping it).
-    unsafe { self.ring.submission().push(&poll) }.map_err(|_| RtError::DriverRefused {
-      call: "sq push(poll readiness)",
-      code: None,
-    })?;
-    self.ring.submit().map_err(|e| RtError::DriverRefused {
-      call: "io_uring_enter(submit readiness)",
-      code: e.raw_os_error(),
-    })?;
-    Ok(())
+    self.submit_entry(poll)
   }
 
   fn arm_kick(&mut self) -> Result<(), RtError> {
@@ -150,9 +167,16 @@ impl UringDriver {
     .multi(self.multishot)
     .build()
     .user_data(KICK_TAG);
-    // SAFETY: the eventfd outlives the ring (it is leaked, see Drop) and the entry is valid.
-    unsafe { self.ring.submission().push(&poll) }.map_err(|_| RtError::DriverRefused {
-      call: "sq push(poll)",
+    self.submit_entry(poll)
+  }
+
+  /// Submits only the buffer-free poll and no-op entries built in this module. Polls acquire
+  /// their own kernel file reference; retirement cancels and completes them before returning.
+  fn submit_entry(&mut self, entry: squeue::Entry) -> Result<(), RtError> {
+    // SAFETY: every caller supplies a poll or no-op with no borrowed userspace buffer. The
+    // kernel acquires a poll's file reference during submission and releases it at completion.
+    unsafe { self.ring.submission().push(&entry) }.map_err(|_| RtError::DriverRefused {
+      call: "sq push",
       code: None,
     })?;
     self.ring.submit().map_err(|e| RtError::DriverRefused {
@@ -162,9 +186,68 @@ impl UringDriver {
     Ok(())
   }
 
+  /// The ring's close queues asynchronous cleanup in Linux. Cancel first, then wait for an
+  /// IO_DRAIN no-op: its completion follows every earlier request, including deferred poll
+  /// cancellations. The finite set is closed to new submissions while this driver is dropped.
+  fn retire(&mut self) -> Result<(), RtError> {
+    // A refused earlier submit can leave an entry in the SQ. Cancellation only covers
+    // submitted requests: publish that finite remainder before cancelling, or the drain
+    // could submit a fresh poll after cancellation and then wait for it forever.
+    while !self.ring.submission().is_empty() {
+      let submitted = self.ring.submit().map_err(|error| RtError::DriverRefused {
+        call: "io_uring_enter(retire submit)",
+        code: error.raw_os_error(),
+      })?;
+      if submitted == 0 {
+        return Err(RtError::DriverRefused {
+          call: "io_uring_enter(retire made no submission progress)",
+          code: None,
+        });
+      }
+    }
+    cancel_pending(&self.ring)?;
+    self.submit_entry(
+      opcode::Nop::new()
+        .build()
+        .flags(squeue::Flags::IO_DRAIN)
+        .user_data(RETIRE_TAG),
+    )?;
+    loop {
+      self
+        .ring
+        .submit_and_wait(1)
+        .map_err(|error| RtError::DriverRefused {
+          call: "io_uring_enter(retire)",
+          code: error.raw_os_error(),
+        })?;
+      for completion in self.ring.completion() {
+        if completion.user_data() == RETIRE_TAG {
+          return if completion.result() >= 0 {
+            Ok(())
+          } else {
+            Err(RtError::DriverRefused {
+              call: "io_uring drain",
+              code: completion.result().checked_neg(),
+            })
+          };
+        }
+      }
+    }
+  }
+
   fn drain_kick(&self) {
     let mut word = [0u8; size_of::<u64>()];
     let _ = self.efd.with(|efd| rustix::io::read(efd, &mut word));
+  }
+}
+
+impl Drop for UringDriver {
+  fn drop(&mut self) {
+    if let Err(error) = self.retire() {
+      // Drop cannot return a refusal. Report the typed error before the ring's own cleanup;
+      // never silently present an interrupted retirement as proof that its sockets are free.
+      eprintln!("slates: io_uring retirement failed: {error}");
+    }
   }
 }
 
@@ -236,16 +319,7 @@ impl Driver for UringDriver {
 
   fn submit_nop(&mut self, user_data: u64) -> Result<(), RtError> {
     let nop = opcode::Nop::new().build().user_data(user_data);
-    // SAFETY: a no-op entry has no buffers.
-    unsafe { self.ring.submission().push(&nop) }.map_err(|_| RtError::DriverRefused {
-      call: "sq push(nop)",
-      code: None,
-    })?;
-    self.ring.submit().map_err(|e| RtError::DriverRefused {
-      call: "io_uring_enter(submit)",
-      code: e.raw_os_error(),
-    })?;
-    Ok(())
+    self.submit_entry(nop)
   }
 
   fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
