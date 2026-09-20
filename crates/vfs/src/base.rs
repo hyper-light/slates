@@ -111,6 +111,18 @@ pub enum Divergence {
   Redirect,
 }
 
+/// A moved base directory retains its origin; a directory with no live base is created.
+/// Scratch directories use `None`, while overlay replacements use `Opaque` (AC-1.10).
+fn directory_divergence(node: &DirNode) -> Option<Divergence> {
+  if node.origin.is_some() {
+    Some(Divergence::Redirect)
+  } else if matches!(node.base, BaseDirState::None | BaseDirState::Opaque) {
+    Some(Divergence::Created)
+  } else {
+    None
+  }
+}
+
 /// One diverged entry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diverged {
@@ -540,15 +552,10 @@ impl Volume {
           }),
           Child::Dir(h) => {
             if let Ok(child) = store.dirs.get(h) {
-              if child.origin.is_some() {
+              if let Some(kind) = directory_divergence(child) {
                 out.push(Diverged {
                   path: path.clone(),
-                  kind: Divergence::Redirect,
-                });
-              } else if matches!(child.base, BaseDirState::None | BaseDirState::Opaque) {
-                out.push(Diverged {
-                  path: path.clone(),
-                  kind: Divergence::Created,
+                  kind,
                 });
               }
               stack.push((path, h));

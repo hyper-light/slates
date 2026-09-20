@@ -55,7 +55,38 @@ are live. The mounted history remains the acceptance test for the combined chang
 
 ## Validation and remaining scope
 
-Rerun the reduced regression, the NFS transport tests and the original mounted 500 × four
-history. Whole-image publication itself remains synchronous and scales with retained bytes;
-the full history must establish whether bounding requests alone resolves the observed lane.
-This report does not establish that arbitrary image sizes fit one cooperative step.
+The queued-RPC regression is red without the yield and green with it. The byte-vector
+regression is red before the bulk operations (256 scalar encodes for 256 bytes) and green
+afterward; the final wire unit suite passes 32 tests with one ignored. Both regressions finish in
+0.00 s. A sibling real-socket regression drives `bridge-nfs::serve_connection_async`.
+
+The original mounted history passes with both changes: 500 operations × four processes,
+seed 1, all 2,000 logged, daemon alive afterward, zero heartbeat kills. The instrumented
+run observed 1,559 publications; the largest frame was 50,538,682 bytes, the slowest
+publication was 109,277 µs, and the maximum heartbeat gap was 293,805 µs. At about 20 MB,
+encoding took 1,463 µs instead of about 442 ms at 19 MB before the bulk path. These are
+single-run debug-build diagnostic timings, not a release benchmark or a performance floor.
+The suite record reports 120,636 ms including setup, upstream build and teardown.
+
+Command: `/build/debug/xtask conformance run --suite fsstress --fsstress-ops 500
+--fsstress-procs 4 --records /scratch/slates-records --scratch /scratch/slates-scratch --keep`.
+Container: `slates-ci-local:20260919`, Rust 1.98.0, Debian 13, aarch64 Linux
+6.12.76-linuxkit, four CPUs and 4 GiB, executable RAM scratch, no concurrent test/build.
+Record date UTC 2026-09-20, local 2026-09-19. Evidence:
+`/private/tmp/slates-mounted-fsstress-bulk.log`,
+`/private/tmp/slates-mounted-evidence/fsstress-bulk-timing.tar.gz`,
+`/private/tmp/slates-byte-codec-{red,green}.log`.
+
+The diagnostics are removed. The second, uninstrumented mounted history passes all 2,000
+operations in 93,309 ms with the daemon still responsive. The final Linux workspace passes
+1,506 tests, zero failed, 14 ignored (183 result groups), including all 49 fleet histories,
+the six recovery histories, both queued-RPC proofs and the real FUSE coherence test.
+Strict workspace/all-target Clippy and `cargo xtask check` pass on Linux and macOS.
+Evidence: `/private/tmp/slates-ci-conformance-retry.log`,
+`/private/tmp/slates-linux-workspace-current.log`, `/private/tmp/slates-final-host-clippy.log`.
+The container uses the explicitly required io_uring backend. Twenty isolated rounds each of
+the five reclamation tests and warm-voter vote-preservation history pass; the epoll retirement
+leg also passes five tests. Pjdfstest remains red at the same 3,595 cases as CI and is recorded
+separately in `2026-09-19-pjdfstest-special-files-and-nfs-limits.md`. Whole-image publication remains synchronous
+and scales with retained bytes; this does not establish that arbitrary image sizes fit one
+cooperative step. Incremental retained storage and cooperative publication remain owed.

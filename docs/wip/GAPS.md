@@ -1223,6 +1223,20 @@ points for the same N=1/fleet semantics, not proof that all integration work is 
 
 ## 8i. A-9 contract correction and open implementation gaps (2026-09-05)
 
+**Mounted conformance follow-up (2026-09-19, §4.3/§4.6/§4.9):** the 500 × four-process
+fsstress history now passes all 2,000 logged operations with zero daemon heartbeat kills.
+Async NFS connections yield between replies; recovery byte vectors copy in bulk instead of
+calling the scalar codec once per byte. The instrumented debug run's maximum publication
+was 109 ms and maximum heartbeat gap 294 ms. Reduced regressions fail before each change.
+The uninstrumented full command passes fsx (10,000 operations), all nine workloads and
+hermeticity (six manifest paths matched, zero outside/unresolved writes); source-download
+failures initially prevented fsstress and pjdfstest; the retry passes fsstress again and
+reproduces CI's 3,595 pjdfstest failures exactly. The full Linux io_uring workspace passes
+1,506 tests with 14 ignored; strict Clippy and `xtask check` pass on Linux and macOS.
+This does not close pjdfstest, native FUSE conformance, or cooperative/incremental recovery
+publication. The separate real FUSE coherence regression passes; it is not POSIX conformance.
+Record: `docs/bugs/2026-09-19-nfs-ready-connection-starves-heartbeat.md`.
+
 **CI follow-up (2026-09-19, §4.3):** a real io_uring rebind regression reproduces
 `EADDRINUSE` after runtime shutdown; descriptor closure did not wait for pending kernel
 polls to release their listeners. Retirement now cancels and drains requests, with the

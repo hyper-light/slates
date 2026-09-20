@@ -980,6 +980,15 @@ ring and kicks the driver; a stale generation is ignored.
 > libtest reporting cannot contaminate either the capacity comparison or the zero-call gate.
 > Evidence and local validation: the two 2026-09-19 driver-retirement/allocation-counter reports.
 
+> **Follow-up (2026-09-19, busy NFS connections):** both async NFS loops yield after
+> each reply, and the daemon accept loop yields after each connection. Ready socket operations
+> alone do not return control to the executor. Two queued RPCs reproduce the old one-poll
+> drain. The full Linux fsstress history also exposed per-byte recovery serialization;
+> the bulk byte codec below plus these boundaries passes all 2,000 operations without a
+> heartbeat kill. Whole-image publication still scales with retained bytes and needs its
+> separately tracked incremental/cooperative refinement. Evidence:
+> `docs/bugs/2026-09-19-nfs-ready-connection-starves-heartbeat.md`.
+
 **Loop.** Each iteration: drain the driver's completions (io_uring CQ / kqueue events / IOCP
 packets) into the run queue; drain inbound rings (client command rings, cross-shard rings, the
 bridge queue) up to a batch bound derived from the measured service time and the latency budget;
@@ -2352,6 +2361,15 @@ the mirror does not exist and `await placed(mirror)` is refused `Unsupported`, a
 window is the process-restart window (zero, thanks to the anchor). Same code, zero modes.
 
 ### 4.9 Wire protocol (D-15)
+
+> **Status (2026-09-19, byte sequences):** `Wire` dispatches a sequence operation to
+> its element type. `u8` copies the canonical payload in bulk; structured elements encode
+> and decode each field. Length prefixes, schema hashes and bytes are unchanged, and lengths
+> are checked before allocation. Scalar-call counters and byte oracles guard both paths.
+> The mounted fsstress trace found scalar encoding taking 442 ms of a 487 ms publication;
+> bulk encoding took about 1.5 ms for a comparable image in the same debug-build environment.
+> This fixes a measured source of heartbeat starvation; it is not a bound on arbitrary
+> recovery image sizes. Record: the 2026-09-19 NFS heartbeat report.
 
 **Framing.** A 32-byte header: magic (4), major (2), minor (2), flags (4), channel/class (2),
 kind (2), length (4), checksum (4), request id (8); then the body. All little-endian, 8-byte

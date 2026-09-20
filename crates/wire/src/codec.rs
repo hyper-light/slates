@@ -287,6 +287,11 @@ mod tests {
     assert_eq!(u8::from_bytes(&scalar).unwrap(), 7);
     assert_eq!(BYTE_ENCODINGS.get(), 1, "the scalar probe must count work");
     assert_eq!(BYTE_DECODINGS.get(), 1, "the scalar probe must count work");
+  }
+
+  /// §4.9: empty byte sequences round-trip, while incomplete and trailing payloads refuse.
+  #[test]
+  fn byte_vector_boundaries_preserve_decode_refusals() {
     assert_eq!(
       Vec::<u8>::from_bytes(&[0, 0, 0, 0]).unwrap(),
       Vec::<u8>::new()

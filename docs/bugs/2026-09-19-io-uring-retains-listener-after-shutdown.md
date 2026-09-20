@@ -53,4 +53,24 @@ Add both a threaded shutdown regression and a calling-thread retirement case.
 The latter prevents thread-exit cleanup from hiding delayed driver retirement.
 Keep the original warm-vote assertions unchanged.
 
-Validation and sibling findings are recorded after the local CI loop completes.
+## Validation
+
+On 2026-09-19 local / 2026-09-20 UTC, the authorized four-CPU, 4 GiB disposable container
+(Rust 1.98.0, Debian 13, aarch64 Linux 6.12.76-linuxkit) passes:
+
+- Twenty consecutive `cargo test -p slates-rt --test reclaim -- --nocapture` runs:
+  five tests each, zero failures; each verifies `SINGLE_ISSUER | DEFER_TASKRUN`.
+- Twenty consecutive runs of the original warm-voter vote-preservation regression:
+  zero failures, typically 0.11 s each.
+- The same five reclamation tests under Docker's default seccomp policy, with
+  `SLATES_TEST_DRIVER=epoll`, pass in 0.07 s; the test proves the selected backend.
+- `cargo test --workspace` with `SLATES_TEST_DRIVER=io_uring`: 1,506 passed,
+  zero failed, 14 ignored, including all 49 fleet histories.
+- Strict Linux workspace/all-target Clippy and `cargo xtask check` pass.
+
+Commands and output: `/private/tmp/slates-run-final-linux-checks.sh`,
+`/private/tmp/slates-final-linux-checks.log`, `/private/tmp/slates-epoll-reclaim-final.log`,
+`/private/tmp/slates-run-linux-workspace-current.sh`,
+`/private/tmp/slates-linux-workspace-current.log`. Each run is serial and time-bounded;
+there were no concurrent builds during the repeated histories. The two removed duplicate
+SQ-push unsafe sites reduce the runtime's actual count from 59 to 57.

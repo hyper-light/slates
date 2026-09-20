@@ -86,7 +86,12 @@ Command (bounded Linux container, quantum image): `docker run --rm --network=non
   through the real Linux NFS adapter with io_uring available. Also cover strace's actual
   deleted-descriptor annotation. The mounted hermeticity leg now passes with six entries
   verified and traced, zero outside/unresolved/unmatched calls; fsstress reproduces locally
-  at 500 × four processes while its 50-operation prefix passes. Record:
+  at 500 × four processes while its 50-operation prefix passes. The completed fix yields
+  between RPCs and copies recovery byte vectors in bulk; the full history now passes twice
+  (all 2,000 logged operations). Fsx and all nine workloads pass locally. Pjdfstest exactly
+  reproduces CI's 3,595 failures; its special-file gaps and two inherent NFS limits are in
+  `docs/bugs/2026-09-19-pjdfstest-special-files-and-nfs-limits.md`. No list was expanded.
+  Record:
   `docs/bugs/2026-09-19-linux-conformance-first-complete-run.md`.
 - [ ] **Landing advancement and snapshot authority (2026-09-19).** A saturated inode
   reservation can refuse retention during `land_advance` after disk writes and syncs, returning
@@ -100,9 +105,11 @@ Command (bounded Linux container, quantum image): `docker run --rm --network=non
   kicks. The stress history now owns its integration-test process; timed waits retain one
   absolute deadline across valid wakes, with registry and worker cleanup on assertion failure.
   Record: `docs/bugs/2026-09-19-driver-test-assumes-no-foreign-kicks.md`.
-- [ ] **io_uring retirement verification (2026-09-19).** A local io_uring regression
+- [x] **io_uring retirement verification (2026-09-19).** A local io_uring regression
   reproduces the warm-restart bind failure. Cancellation plus a drain barrier is implemented;
-  complete the real Linux execution loop before claiming closure. CI now requires its
+  twenty rounds of both the five-test reclamation suite and the original warm-voter
+  history pass with real io_uring. The epoll leg passes five tests too. The full Linux
+  workspace passes 1,506 tests; strict Clippy and `xtask check` pass. CI requires its
   intended backend. Record: `docs/bugs/2026-09-19-io-uring-retains-listener-after-shutdown.md`.
 - [x] **Allocation counter attribution (2026-09-19).** `rt` and `mem` test counters included
   libtest's other threads. A controlled foreign allocation fails both counters before the

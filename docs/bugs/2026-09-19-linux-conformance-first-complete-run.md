@@ -107,4 +107,30 @@ The pinned 50 × four-process seed-1 prefix passes (200 logged operations). The 
 workers block while successive recovered daemons consume a CPU and lapse again. The run
 was stopped after preserving its anchor log instead of waiting for CI's 42-minute failure.
 `/private/tmp/slates-fsstress-live-diagnosis.log` records the process and restart evidence;
-`/private/tmp/slates-mounted-evidence/fsstress-500.tar.gz` keeps its scratch. Diagnosis continues.
+`/private/tmp/slates-mounted-evidence/fsstress-500.tar.gz` keeps its scratch. The cause and repair are recorded in
+`2026-09-19-nfs-ready-connection-starves-heartbeat.md`: missing RPC yield boundaries and
+scalar byte-vector recovery encoding. The combined fix passes all 2,000 logged operations,
+with zero heartbeat kills and a live daemon afterward.
+
+### Uninstrumented complete command
+
+`/private/tmp/slates-run-ci-conformance.sh` ran the exact `conformance all` command over
+ordinary-user daemons in the same disposable Linux environment. Fsx passes 10,000 operations;
+all nine workloads match; hermeticity sees 200 write-capable calls, 22 inside the target,
+six matched manifest paths, 90 RAM objects, 88 standard-stream calls, zero unresolved and
+zero outside. Fsstress and pjdfstest did not execute: source downloads failed with TLS EOF
+and DNS errors, respectively. The run correctly exits one. Their rerun reuses the verified
+pinned fsstress sources and retries pjdfstest; no expected-failure list has been broadened.
+Evidence: `/private/tmp/slates-ci-conformance-current.log` and
+`/private/tmp/slates-mounted-evidence/conformance-current.tar.gz`.
+
+### Retried suites and final regression check
+
+The uninstrumented retry passes fsstress again (2,000 logged operations, 93,309 ms,
+daemon alive), using the same SHA-256-verified source files from the prior run. Pjdfstest
+then downloads successfully and reproduces CI exactly: 5,175 passed, 3,595 failed,
+28 TODO, 173,791 ms. Its scope and per-file tally are in
+`2026-09-19-pjdfstest-special-files-and-nfs-limits.md`; the expected-failure list remains empty.
+The full Linux io_uring workspace passes 1,506 tests with 14 ignored, strict Clippy and
+`xtask check` pass, and the real FUSE coherence regression passes as an ordinary user.
+This verifies the repaired legs, not an all-green conformance verdict.
